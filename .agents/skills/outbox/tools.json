@@ -1,0 +1,21 @@
+{
+  "name": "queue_outbox_message",
+  "description": "Queue an asynchronous message for delivery to another Discord channel without blocking active execution.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "channel": {
+        "type": "string",
+        "enum": ["general", "signals", "staff-comms", "agent-chat", "lounge", "zero-chat"],
+        "description": "Target bare channel name"
+      },
+      "content": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4000,
+        "description": "Message content to send"
+      }
+    },
+    "required": ["channel", "content"]
+  }
+}
