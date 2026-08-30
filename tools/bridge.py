@@ -320,6 +320,8 @@ class PersistentTurnQueue:
         return self.queue.empty() and len(self.pending_items) == 0
 
 BEACON_FILE = DATA_DIR / "liveness_beacon.json"
+BOT_STATUS_FILE = DATA_DIR / "bot_status.json"
+_last_bot_status_mtime = 0.0
 
 def update_beacon(state: str = "IDLE", prompt: str = ""):
     try:
@@ -335,6 +337,46 @@ def update_beacon(state: str = "IDLE", prompt: str = ""):
         tmp.replace(BEACON_FILE)
     except Exception:
         pass
+
+async def apply_bot_presence(custom_activity: str = None, status_override: str = None):
+    """Update Discord bot rich presence and custom activity string."""
+    try:
+        if custom_activity is not None:
+            activity = discord.CustomActivity(name=custom_activity[:128])
+            st = discord.Status.dnd if status_override == "dnd" else (
+                discord.Status.idle if status_override == "idle" else discord.Status.online
+            )
+            await bot.change_presence(activity=activity, status=st)
+            return
+
+        from tools.set_status import get_status
+        data = get_status()
+        act_text = data.get("activity_text", "Zero is online and ready.")[:128]
+        act_type = str(data.get("activity_type", "custom")).lower()
+        st_str = str(data.get("status", "online")).lower()
+
+        st_map = {
+            "online": discord.Status.online,
+            "idle": discord.Status.idle,
+            "dnd": discord.Status.dnd,
+            "invisible": discord.Status.invisible
+        }
+        st = st_map.get(st_str, discord.Status.online)
+
+        if act_type == "playing":
+            activity = discord.Game(name=act_text)
+        elif act_type == "watching":
+            activity = discord.Activity(type=discord.ActivityType.watching, name=act_text)
+        elif act_type == "listening":
+            activity = discord.Activity(type=discord.ActivityType.listening, name=act_text)
+        elif act_type == "competing":
+            activity = discord.Activity(type=discord.ActivityType.competing, name=act_text)
+        else:
+            activity = discord.CustomActivity(name=act_text)
+
+        await bot.change_presence(activity=activity, status=st)
+    except Exception as e:
+        print(f"[Bridge] Error setting bot presence: {e}")
 
 PROCESSED_INTERACTIONS = set()
 
@@ -871,6 +913,37 @@ class KarakosScheduler:
                                         await ch.send(f"⚠️ **Wedge Alert:** Agent has been silent for >{int(silence/60)}m without output. Prompt: `{bdata.get('prompt')}`")
                     except Exception:
                         pass
+
+                # Bot Presence & Custom Status Monitor
+                global _last_bot_status_mtime
+                if BOT_STATUS_FILE.exists():
+                    try:
+                        mtime = BOT_STATUS_FILE.stat().st_mtime
+                        if mtime > _last_bot_status_mtime:
+                            _last_bot_status_mtime = mtime
+                            busy = (
+                                (active_proc is not None and active_proc.returncode is None) or
+                                (ext_active_proc is not None and ext_active_proc.returncode is None)
+                            )
+                            if not busy:
+                                await apply_bot_presence()
+                    except Exception:
+                        pass
+
+                # Outbox Queue Flusher (Cross-Channel Asynchronous Dispatch)
+                try:
+                    from tools.outbox import flush_pending_messages
+                    pending_outbox = flush_pending_messages()
+                    for omsg in pending_outbox:
+                        target_cid = omsg.get("channel_id")
+                        if target_cid:
+                            target_channel = bot.get_channel(target_cid) or await bot.fetch_channel(target_cid)
+                            if target_channel:
+                                await target_channel.send(omsg.get("content", ""))
+                                print(f"[Outbox] Dispatched message {omsg.get('id')} to #{omsg.get('channel')} ({target_cid})")
+                except Exception as oe:
+                    print(f"[Bridge] Error flushing outbox queue: {oe}")
+
                 # Zero-downtime bridge reload trigger
                 reload_flag = DATA_DIR / "reload_bridge.flag"
                 if reload_flag.exists():
@@ -1310,6 +1383,13 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
         if mode == "home":
             update_beacon("PROCESSING", prompt)
 
+        ch_title = getattr(reply_target.channel, "name", "") if (reply_target and hasattr(reply_target, "channel")) else ""
+        turn_text = f"Crunching in #{ch_title}..." if ch_title else "Processing task..."
+        try:
+            await apply_bot_presence(custom_activity=turn_text, status_override="dnd")
+        except Exception:
+            pass
+
         output_chunks = []
         auth_detected = False
         last_status_edit = time.time()
@@ -1531,6 +1611,11 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
                     pass
             else:
                 ext_active_proc = None
+
+            try:
+                await apply_bot_presence()
+            except Exception:
+                pass
 
         if is_steering:
             # Turn was aborted early by steering; status message will be updated by the steer turn
@@ -1895,6 +1980,7 @@ async def on_ready():
     global queue_worker_task, ext_queue_worker_task, scheduler, has_notified_ready
     sync_credentials()
     update_beacon("IDLE", "")
+    await apply_bot_presence()
     print(f"[Antigravity] Logged in as {bot.user} (ID: {bot.user.id})")
 
     # Clean up any zombie in-flight turn from an interrupted restart

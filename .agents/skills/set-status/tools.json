@@ -1,0 +1,25 @@
+{
+  "name": "set_bot_status",
+  "description": "Set live Discord presence and custom activity string so peers and users know current operating state.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "activity": {
+        "type": "string",
+        "description": "Custom activity or status text (e.g. 'Investigating memory leak in #agent-chat')",
+        "maxLength": 128
+      },
+      "status": {
+        "type": "string",
+        "enum": ["online", "idle", "dnd", "invisible"],
+        "description": "Discord presence status (default: online)"
+      },
+      "activity_type": {
+        "type": "string",
+        "enum": ["custom", "playing", "watching", "listening", "competing"],
+        "description": "Type of activity (default: custom)"
+      }
+    },
+    "required": ["activity"]
+  }
+}
