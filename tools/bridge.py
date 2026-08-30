@@ -102,6 +102,77 @@ def get_runtime_rules() -> dict:
             pass
     return defaults
 
+SESSION_METADATA_FILE = DATA_DIR / "session_metadata.json"
+
+def get_session_metadata(sess_key: str) -> dict:
+    if SESSION_METADATA_FILE.exists():
+        try:
+            with open(SESSION_METADATA_FILE) as f:
+                d = json.load(f)
+                return d.get(sess_key, {})
+        except Exception:
+            pass
+    return {}
+
+def set_session_metadata(sess_key: str, data: dict):
+    try:
+        d = {}
+        if SESSION_METADATA_FILE.exists():
+            try:
+                with open(SESSION_METADATA_FILE) as f:
+                    d = json.load(f)
+            except Exception:
+                d = {}
+        cur = d.get(sess_key, {})
+        cur.update(data)
+        d[sess_key] = cur
+        tmp = SESSION_METADATA_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=2)
+        tmp.replace(SESSION_METADATA_FILE)
+    except Exception as e:
+        print(f"[Bridge] Failed saving session metadata: {e}")
+
+def increment_session_turn(sess_key: str) -> int:
+    meta = get_session_metadata(sess_key)
+    turns = meta.get("turns", 0) + 1
+    set_session_metadata(sess_key, {"turns": turns, "last_active": int(time.time())})
+    return turns
+
+def reset_session_meta(sess_key: str):
+    set_session_metadata(sess_key, {"turns": 0, "last_compacted": int(time.time())})
+
+def check_compaction_needed(conv_id: str | None, current_turns: int) -> tuple[bool, str]:
+    """Evaluate whether a session should be compacted based on turns, transcript size, step count, or age."""
+    if current_turns >= 25:
+        return True, f"turn count reached {current_turns}/25"
+    
+    if not conv_id:
+        return False, ""
+        
+    brain_dir = Path("/root/.gemini/antigravity-cli/brain") / conv_id / ".system_generated" / "logs"
+    transcript_path = brain_dir / "transcript.jsonl"
+    
+    if transcript_path.exists():
+        try:
+            st = transcript_path.stat()
+            size_mb = st.st_size / (1024 * 1024)
+            if size_mb >= 2.0:
+                return True, f"transcript size ({size_mb:.2f} MB) exceeds 2.0 MB ceiling"
+            
+            if st.st_size > 250_000:
+                with open(transcript_path, "rb") as f:
+                    line_count = sum(1 for _ in f)
+                if line_count >= 200:
+                    return True, f"transcript steps ({line_count}) exceeds 200-step ceiling"
+            
+            if (time.time() - st.st_mtime) > 86400:
+                return True, "session age exceeds 24 hours"
+        except Exception as e:
+            print(f"[Bridge] Error checking transcript compaction metrics: {e}")
+            
+    return False, ""
+
 def get_channel_session_id(channel_id: int | str, mode: str) -> str | None:
     if SESSIONS_FILE.exists():
         try:
@@ -130,15 +201,16 @@ def set_channel_session_id(channel_id: int | str, mode: str, conv_id: str):
                 json.dump(d, f, indent=2)
             tmp.replace(SESSIONS_FILE)
             print(f"[Bridge] Persisted session mapping: {key} -> {conv_id}")
+            set_session_metadata(key, {"conv_id": conv_id, "last_active": int(time.time())})
     except Exception as e:
         print(f"[Bridge] Failed persisting session mapping: {e}")
 
 def clear_channel_session_id(channel_id: int | str, mode: str):
     try:
+        key = "home" if (mode == "home" and int(channel_id) == TARGET_CHANNEL_ID) else str(channel_id)
         if SESSIONS_FILE.exists():
             with open(SESSIONS_FILE) as f:
                 d = json.load(f)
-            key = "home" if (mode == "home" and int(channel_id) == TARGET_CHANNEL_ID) else str(channel_id)
             if key in d:
                 del d[key]
                 tmp = SESSIONS_FILE.with_suffix(".tmp")
@@ -146,6 +218,7 @@ def clear_channel_session_id(channel_id: int | str, mode: str):
                     json.dump(d, f, indent=2)
                 tmp.replace(SESSIONS_FILE)
                 print(f"[Bridge] Cleared session mapping for: {key}")
+        reset_session_meta(key)
     except Exception as e:
         print(f"[Bridge] Failed clearing session mapping: {e}")
 
@@ -1118,21 +1191,22 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
 
         if mode == "home":
             sess_key = "home" if int(channel_id) == TARGET_CHANNEL_ID else str(channel_id)
-            current_turns = session_turn_counts.get(sess_key, 0) + 1
-            session_turn_counts[sess_key] = current_turns
+            current_turns = increment_session_turn(sess_key)
+            should_compact, compact_reason = check_compaction_needed(conv_id, current_turns)
 
-            # Auto-compact every 25 turns or on manual !reset to guarantee <2s prefill latency
-            if current_turns >= 25 or reset_session:
+            # Auto-compact on turn limit, file size, step ceiling, age, or manual !reset
+            if should_compact or reset_session:
                 reset_session = False
-                session_turn_counts[sess_key] = 0
+                reset_session_meta(sess_key)
                 clear_channel_session_id(channel_id, "home")
                 conv_id = None
                 try:
-                    from tools.session_summarizer import get_carryforward_context
+                    from tools.session_summarizer import generate_summary, get_carryforward_context
+                    generate_summary()
                     carry_ctx = get_carryforward_context()
                     if carry_ctx:
                         prompt = f"[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\n{carry_ctx}\n\n[CURRENT USER PROMPT]: {prompt}"
-                        print(f"[Bridge] 🔄 Auto-compacted session for {sess_key} ({current_turns} turns) and injected carry-forward context.")
+                        print(f"[Bridge] 🔄 Auto-compacted session for {sess_key} ({compact_reason or 'manual reset'}) and injected carry-forward context.")
                 except Exception as e:
                     print(f"[Bridge] Error injecting carry-forward context: {e}")
 
@@ -1150,15 +1224,15 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
         else:
             # External mode (Crab Cavern & multi-agent shared threads)
             sess_key = str(channel_id)
-            current_turns = session_turn_counts.get(sess_key, 0) + 1
-            session_turn_counts[sess_key] = current_turns
+            current_turns = increment_session_turn(sess_key)
+            should_compact, compact_reason = check_compaction_needed(conv_id, current_turns)
 
-            # Auto-compact external channel sessions every 25 turns
-            if current_turns >= 25:
-                session_turn_counts[sess_key] = 0
+            # Auto-compact external channel sessions on turn limit, file size, or step ceiling
+            if should_compact:
+                reset_session_meta(sess_key)
                 clear_channel_session_id(channel_id, "external")
                 conv_id = None
-                print(f"[Bridge] 🔄 Auto-compacted external session for channel {sess_key} ({current_turns} turns).")
+                print(f"[Bridge] 🔄 Auto-compacted external session for channel {sess_key} ({compact_reason}).")
 
             if conv_id:
                 cmd.append(f"--conversation={conv_id}")
