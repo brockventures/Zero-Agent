@@ -1212,8 +1212,7 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
 
             if conv_id:
                 cmd.append(f"--conversation={conv_id}")
-            else:
-                cmd.append("-c")
+            # If conv_id is None, omit --conversation/-c to let agy create a fresh, isolated conversation session
 
             cmd.extend([
                 f"-p={prompt}",
@@ -1245,8 +1244,7 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
 
             if conv_id:
                 cmd.append(f"--conversation={conv_id}")
-            else:
-                cmd.append("-c")
+            # If conv_id is None, omit --conversation/-c to let agy create a fresh, isolated conversation session
 
             channel_ctx_block = ""
             try:
@@ -1420,7 +1418,12 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
                                     elif ev_name == "result":
                                         res_cid = ev.get("result", {}).get("conversation_id")
                                         if res_cid:
-                                            set_channel_session_id(channel_id, mode, res_cid)
+                                            if escalated_to_thread and 'thread' in locals() and hasattr(thread, 'id'):
+                                                set_channel_session_id(thread.id, mode, res_cid)
+                                                clear_channel_session_id(TARGET_CHANNEL_ID, "home")
+                                                print(f"[Bridge] 🧵 Bound session {res_cid} to migrated thread {thread.id} and freed root channel.")
+                                            else:
+                                                set_channel_session_id(channel_id, mode, res_cid)
                                         current_action = "Finalizing output..."
                                 except Exception:
                                     pass
