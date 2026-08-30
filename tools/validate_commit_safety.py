@@ -66,8 +66,8 @@ def main():
             current_file = line[6:]
             continue
         
-        # Skip scanning the validator itself to prevent regex definitions from triggering false positives
-        if "validate_commit_safety.py" in current_file:
+        # Skip scanning the validator itself and security scanner scripts to prevent regex definitions from triggering false positives
+        if "validate_commit_safety.py" in current_file or "scan_secrets_and_pii.py" in current_file:
             continue
 
         # Only inspect newly added or modified lines
