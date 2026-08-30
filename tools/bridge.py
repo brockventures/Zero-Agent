@@ -1228,11 +1228,20 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
             should_compact, compact_reason = check_compaction_needed(conv_id, current_turns)
 
             # Auto-compact external channel sessions on turn limit, file size, or step ceiling
+            eng_carry_block = ""
             if should_compact:
                 reset_session_meta(sess_key)
                 clear_channel_session_id(channel_id, "external")
                 conv_id = None
-                print(f"[Bridge] 🔄 Auto-compacted external session for channel {sess_key} ({compact_reason}).")
+                try:
+                    from tools.session_summarizer import generate_summary, get_engineering_carryforward_context
+                    generate_summary()
+                    eng_ctx = get_engineering_carryforward_context()
+                    if eng_ctx:
+                        eng_carry_block = f"\n[PREVIOUS SESSION ENGINEERING DELTA]:\n{eng_ctx}\n\n"
+                    print(f"[Bridge] 🔄 Auto-compacted external session for channel {sess_key} ({compact_reason}) and generated engineering carry-forward.")
+                except Exception as ce:
+                    print(f"[Bridge] Error injecting external carry-forward: {ce}")
 
             if conv_id:
                 cmd.append(f"--conversation={conv_id}")
@@ -1248,14 +1257,27 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
             except Exception as ce:
                 print(f"[Bridge] Warning formatting channel context: {ce}")
 
+            manifest_block = ""
+            try:
+                from tools.session_summarizer import get_architecture_manifest
+                manifest_block = get_architecture_manifest()
+            except Exception as me:
+                print(f"[Bridge] Warning generating architecture manifest: {me}")
+
             author_tag = f" from {author_name}" if author_name else ""
             rules = get_runtime_rules()
             tmpl = rules.get("external_system_prompt")
             if tmpl:
                 try:
-                    ext_prompt = tmpl.replace("{channel_context}", channel_ctx_block).replace("{author_tag}", author_tag).replace("{prompt}", prompt)
+                    ext_prompt = (tmpl
+                        .replace("{channel_context}", channel_ctx_block)
+                        .replace("{author_tag}", author_tag)
+                        .replace("{prompt}", prompt)
+                        .replace("{architecture_manifest}", manifest_block)
+                        .replace("{engineering_carryforward}", eng_carry_block)
+                    )
                 except Exception:
-                    ext_prompt = f"{channel_ctx_block}[INBOUND MESSAGE{author_tag}]: {prompt}"
+                    ext_prompt = f"{manifest_block}\n\n{channel_ctx_block}[INBOUND MESSAGE{author_tag}]: {prompt}"
             else:
                 ext_prompt = (
                     "[CRAB CAVERN MULTI-AGENT COLLABORATION ENVIRONMENT]\n"
@@ -1423,10 +1445,8 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
                                 escalated_to_thread = True
                                 clean_title = generate_concise_thread_title(prompt)
                                 thread = await reply_target.create_thread(name=f"🧵 {clean_title}", auto_archive_duration=1440)
-                                await reply_target.reply(f"🧵 *Task execution exceeded 60s — migrated live progress to {thread.mention}. `#zero-chat` is now available for new tasks.*")
-                                clean_action = re.sub(r"\x1b(?:\[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", current_action)
-                                migrated_status = await thread.send(f"⏳ *{clean_action}*")
-                                status_msg = migrated_status
+                                await reply_target.reply(f"🧵 *Task execution exceeded 60s — migrating deliverable to {thread.mention}. `#zero-chat` remains free.*")
+                                status_msg = None
                                 delivery_target = thread
                                 notify_root_channel = getattr(reply_target, "channel", None)
                                 thread_jump_url = thread.jump_url
