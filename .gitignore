@@ -1,0 +1,114 @@
+# ==============================================================================
+# ZERO AGENT DEFENSE-IN-DEPTH .GITIGNORE
+# Default-Deny Architecture for Open-Source / Crab Cavern Sharing
+# ==============================================================================
+
+# 1. Environment & Credentials (NEVER commit live tokens or keys)
+.env
+.env.*
+!.env.example
+*.env
+secrets/
+/secrets/
+banana_credentials.json
+*credentials*.json
+*token*.json
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# 2. Config & OAuth Secrets
+config/*
+!config/*.example
+!config/*.json.example
+!config/runtime_rules.json
+*.oauth.json
+google_oauth.json
+youtube_oauth.json
+
+# 3. Personal Memory & PII (Strictly local on NAS)
+memory/
+memory/**
+.agents/memory/
+.agents/memory/**
+
+# 4. Personal Data, Exports, Databases & Address Books
+data/
+data/**
+car_monitor_data/
+car_monitor_data/**
+*.xlsx
+*.xls
+*.csv
+*.zip
+*.tar.gz
+*.7z
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.vdf
+
+# 5. Local Runtime State, Databases & Logs
+*.db
+*.sqlite
+*.sqlite3
+*.jsonl
+*.log
+*.log.*
+*.pid
+*.bak
+*.bak-*
+*.tmp
+*.temp
+/tmp/
+scratch/
+.tempmediaStorage/
+turn_queue.json
+external_turn_queue.json
+in_flight_turn.json
+channel_history.json
+sessions.json
+schedule.json
+tasks.json
+reminders.json
+liveness_beacon.json
+
+# 6. Python Artifacts & Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# 7. Agent Brain & Runtime Logs
+.gemini/
+.agent_state/
+brain/
+
+# 8. OS & Editor Artifacts
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.swp
+*.swo
+*.swn
+*~
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
