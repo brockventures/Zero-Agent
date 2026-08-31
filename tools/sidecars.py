@@ -1,13 +1,27 @@
 #!/usr/bin/env python3
-"""Comprehensive Sidecar Execution Engine for Ivy-AG.
+"""Comprehensive Sidecar Execution Engine for Zero (Ivy-AG).
 
 Implements all scheduled maintenance and monitoring jobs:
 1. Heartbeat Sweep (every 2 hours)
-2. Nightly Triage & Agenda Briefing (daily @ 20:00 PT)
-3. NAS Log Review (nightly @ 23:30 PT)
+2. Nightly Triage & Agenda Briefing (daily @ 23:30 PT)
+3. NAS Log Review (nightly @ 22:00 PT)
 4. Plex Transcode Session Cleanup (nightly @ 03:00 PT)
 5. Dated Reminders (daily @ 09:00 PT)
 6. Used EV9 Listing Monitor (daily capture, Sunday digest @ 08:15 PT)
+7. Promotional Email Marketing Sweep (biweekly Sunday @ 22:35 PT)
+8. Memory Doctor Audit (weekly Sunday @ 03:00 PT)
+9. Dreaming Memory Consolidation (nightly @ 01:45 PT)
+10. Low Battery Check (weekly Monday @ 10:00 AM PT)
+11. NAS Storage & RAID Check (weekly Wednesday @ 10:00 AM PT)
+12. HA Stability Update Check (weekly Friday @ 10:30 AM PT)
+13. Dockhand Image Check (weekly Sunday @ 11:00 AM PT)
+14. Antigravity CLI Release Check (daily @ 10:00 AM PT)
+
+Unified Execution Wrapper:
+- Tracks start, end, duration, exit status ('ok', 'warning', 'error'), and output summaries.
+- Durably persists execution history to /workspace/data/sidecar_execution_log.json.
+- Maintains per-job latest status in /workspace/data/sidecar_status.json.
+- Surfaces recent failures and degraded jobs automatically in the Nightly Briefing.
 """
 
 import json
@@ -16,9 +30,11 @@ import re
 import socket
 import subprocess
 import sys
+import time
+import traceback
 import urllib.parse
-from pathlib import Path
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -81,6 +97,10 @@ HOST_1_IP, HOST_2_IP, SSH_PORT = _resolve_nas_config()
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+EXECUTION_LOG_FILE = DATA_DIR / "sidecar_execution_log.json"
+EXECUTION_STATUS_FILE = DATA_DIR / "sidecar_status.json"
+MAX_LOG_ENTRIES = 200
+
 # --------------------------------------------------------------------------
 # Allowlists & Constants
 # --------------------------------------------------------------------------
@@ -125,7 +145,7 @@ DATED_REMINDERS = [
 ]
 
 # --------------------------------------------------------------------------
-# Helper: SSH Execution
+# Helper: SSH & TCP Execution
 # --------------------------------------------------------------------------
 def _ssh_cmd(host: str, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run([
@@ -145,6 +165,231 @@ def check_tcp_port(host: str, port: int, timeout: float = 3.0) -> bool:
         return False
     finally:
         s.close()
+
+# --------------------------------------------------------------------------
+# Unified Execution Engine & Logger
+# --------------------------------------------------------------------------
+def _atomic_write_json(file_path: Path, data: any):
+    """Write data to a JSON file atomically via a temporary file."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = file_path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2)
+        tmp_path.replace(file_path)
+    except Exception as e:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        print(f"[Sidecars] Error persisting {file_path}: {e}")
+
+def log_execution(job_id: str, name: str, status: str, duration_sec: float, summary: str = "", error: str = "", extra: dict | None = None) -> dict:
+    """Durably log job execution to EXECUTION_LOG_FILE and update EXECUTION_STATUS_FILE."""
+    now_pt = datetime.now(PT)
+    entry = {
+        "job_id": job_id,
+        "name": name,
+        "status": status,  # 'ok', 'warning', 'error'
+        "duration_seconds": round(duration_sec, 2),
+        "timestamp_iso": now_pt.isoformat(),
+        "timestamp_epoch": int(now_pt.timestamp()),
+        "timestamp_pt": now_pt.strftime("%Y-%m-%d %I:%M %p PT"),
+        "summary": summary[:400] if summary else "",
+        "error": error[:600] if error else ""
+    }
+    if extra:
+        entry["extra"] = extra
+
+    # 1. Update execution log
+    entries = []
+    if EXECUTION_LOG_FILE.exists():
+        try:
+            with open(EXECUTION_LOG_FILE, "r") as f:
+                entries = json.load(f)
+        except Exception:
+            entries = []
+    entries.insert(0, entry)
+    if len(entries) > MAX_LOG_ENTRIES:
+        entries = entries[:MAX_LOG_ENTRIES]
+    _atomic_write_json(EXECUTION_LOG_FILE, entries)
+
+    # 2. Update latest status map
+    status_map = {}
+    if EXECUTION_STATUS_FILE.exists():
+        try:
+            with open(EXECUTION_STATUS_FILE, "r") as f:
+                status_map = json.load(f)
+        except Exception:
+            status_map = {}
+    status_map[job_id] = entry
+    _atomic_write_json(EXECUTION_STATUS_FILE, status_map)
+
+    return entry
+
+def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> tuple[bool, str, any]:
+    """Unified execution wrapper for any scheduled sidecar job.
+    
+    Measures duration, handles and records unhandled exceptions, persists status,
+    and returns (ok: bool, message: str, extra: any).
+    """
+    start_ts = time.time()
+    try:
+        res = func(*args, **kwargs)
+        duration = time.time() - start_ts
+
+        ok = True
+        message = ""
+        extra = None
+
+        if isinstance(res, tuple):
+            if len(res) == 2:
+                ok, message = res
+            elif len(res) >= 3:
+                ok, message = res[0], res[1]
+                extra = res[2]
+        elif isinstance(res, str):
+            ok = True
+            message = res
+        elif isinstance(res, dict):
+            ok = res.get("ok", True)
+            message = res.get("message", res.get("digest", str(res)))
+            extra = res
+        elif res is None:
+            ok = True
+            message = ""
+        else:
+            ok = bool(res)
+            message = str(res)
+
+        # Domain-aware status classification
+        if job_id == "reminders":
+            # (has_due, msg): having 0 reminders due is normal healthy operation
+            has_due = ok
+            ok = True
+            status = "ok"
+            extra = {"has_due": has_due}
+        elif job_id == "ev9":
+            # (has_digest, msg, plot): daily silent capture is normal healthy operation
+            if message and any(err_tag in message for err_tag in ("⚠️", "🚨", "Error", "Exception")):
+                ok = False
+                status = "error"
+            else:
+                ok = True
+                status = "ok"
+        elif job_id == "marketing":
+            if message and any(err_tag in message for err_tag in ("⚠️", "🚨", "Could not")):
+                ok = False
+                status = "warning"
+            else:
+                ok = True
+                status = "ok"
+        elif job_id == "heartbeat":
+            status = "ok" if ok else "warning"
+        elif job_id == "nas_logs":
+            status = "ok" if ok else "warning"
+        elif job_id == "plex":
+            status = "ok" if ok else "warning"
+        else:
+            status = "ok" if ok else "warning"
+
+        summary = message[:400] if message else ("(clean run / silent)" if ok else "(degraded)")
+        log_execution(job_id=job_id, name=name, status=status, duration_sec=duration, summary=summary, error="" if ok else summary, extra=extra if isinstance(extra, dict) else None)
+        return ok, message, extra
+
+    except Exception as e:
+        duration = time.time() - start_ts
+        tb_str = traceback.format_exc()
+        err_msg = f"Exception: {e}"
+        log_execution(job_id=job_id, name=name, status="error", duration_sec=duration, summary=err_msg, error=tb_str)
+        print(f"[Sidecars] Unhandled exception in {name} ({job_id}): {e}\n{tb_str}")
+        return False, f"🚨 **{name} Exception**: {e}", None
+
+def get_execution_history(limit: int = 50, since_hours: float | None = None) -> list[dict]:
+    """Retrieve recent execution history entries."""
+    if not EXECUTION_LOG_FILE.exists():
+        return []
+    try:
+        with open(EXECUTION_LOG_FILE, "r") as f:
+            entries = json.load(f)
+        if since_hours is not None:
+            cutoff = time.time() - (since_hours * 3600)
+            entries = [e for e in entries if e.get("timestamp_epoch", 0) >= cutoff]
+        return entries[:limit]
+    except Exception as e:
+        print(f"[Sidecars] Error reading execution log: {e}")
+        return []
+
+def get_recent_job_failures(since_hours: float = 24.0) -> list[dict]:
+    """Retrieve all failed, degraded, or errored jobs within the last N hours."""
+    entries = get_execution_history(limit=MAX_LOG_ENTRIES, since_hours=since_hours)
+    return [e for e in entries if e.get("status") in ("warning", "error")]
+
+def get_sidecar_health_summary(since_hours: float = 24.0) -> dict:
+    """Calculate summary metrics for sidecars executed within the last N hours."""
+    entries = get_execution_history(limit=MAX_LOG_ENTRIES, since_hours=since_hours)
+    total = len(entries)
+    ok_count = sum(1 for e in entries if e.get("status") == "ok")
+    warn_count = sum(1 for e in entries if e.get("status") == "warning")
+    err_count = sum(1 for e in entries if e.get("status") == "error")
+    failures = [e for e in entries if e.get("status") in ("warning", "error")]
+
+    # Fetch latest status per job
+    latest_map = {}
+    if EXECUTION_STATUS_FILE.exists():
+        try:
+            with open(EXECUTION_STATUS_FILE, "r") as f:
+                latest_map = json.load(f)
+        except Exception:
+            latest_map = {}
+
+    return {
+        "total_runs": total,
+        "ok_count": ok_count,
+        "warning_count": warn_count,
+        "error_count": err_count,
+        "failures": failures,
+        "latest_by_job": latest_map,
+        "all_healthy": total > 0 and len(failures) == 0
+    }
+
+def format_sidecar_status_summary() -> str:
+    """Format human-readable sidecar execution status."""
+    summary = get_sidecar_health_summary(since_hours=24.0)
+    now_str = datetime.now(PT).strftime("%Y-%m-%d %I:%M %p PT")
+    lines = [
+        f"⚙️ **Sidecar Execution Status** [{now_str}]",
+        f"- **Runs (Last 24h)**: `{summary['total_runs']}` total (`{summary['ok_count']}` ok, `{summary['warning_count']}` warnings, `{summary['error_count']}` errors)",
+        ""
+    ]
+
+    latest = summary.get("latest_by_job", {})
+    if not latest:
+        lines.append("*(No sidecar jobs recorded yet)*")
+    else:
+        lines.append("### 📊 Latest Status by Job")
+        for jid, entry in sorted(latest.items()):
+            status = entry.get("status", "unknown")
+            icon = "🟢" if status == "ok" else ("⚠️" if status == "warning" else "❌")
+            name = entry.get("name", jid)
+            ts = entry.get("timestamp_pt", "unknown")
+            dur = entry.get("duration_seconds", 0)
+            lines.append(f"- {icon} **{name}** (`{jid}`): `{status.upper()}` in `{dur}s` — *{ts}*")
+            if status != "ok" and entry.get("summary"):
+                snip = entry['summary'].splitlines()[0][:100]
+                lines.append(f"  -# *Detail:* `{snip}`")
+
+    if summary["failures"]:
+        lines.extend([
+            "",
+            "### ⚠️ Failures / Warnings (Last 24h)"
+        ])
+        for f in summary["failures"][:10]:
+            icon = "❌" if f.get("status") == "error" else "⚠️"
+            lines.append(f"- {icon} **{f.get('name')}** (*{f.get('timestamp_pt')}*): `{f.get('summary', '')[:120]}`")
+
+    return "\n".join(lines)
 
 # --------------------------------------------------------------------------
 # 1. Heartbeat Sweep
@@ -203,6 +448,16 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
     except Exception:
         pass
 
+    # 6. Persistent MCP Daemon Health
+    try:
+        from tools.mcp_daemon import get_status
+        mcp_stat = get_status()
+        if not mcp_stat.get("healthy"):
+            failures.append(f"Persistent MCP Daemon degraded or stopped: {mcp_stat.get('servers')}")
+    except Exception as me:
+        failures.append(f"Persistent MCP Daemon check failed: {me}")
+
+
     if not failures:
         return True, f"🟢 **Heartbeat Sweep Healthy** — {now_str}\nAll containers, ports, Home Assistant, and external monitors healthy across `.82` and `.84`."
 
@@ -212,7 +467,7 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
     return False, "\n".join(report)
 
 # --------------------------------------------------------------------------
-# 2. Nightly Triage Briefing
+# 2. Nightly Triage Briefing (with Automated Failure Surfacing)
 # --------------------------------------------------------------------------
 def run_nightly_triage() -> str:
     now_pt = datetime.now(PT)
@@ -284,7 +539,18 @@ def run_nightly_triage() -> str:
     if not inbox_lines:
         inbox_lines.append("- *(Inbox clean / zero priority unread items)*")
 
-    # 3. Infra & Homelab Posture
+    # 3. Scheduled Sidecar Job Failure Check (Automated Surfacing)
+    health = get_sidecar_health_summary(since_hours=24.0)
+    failure_lines = []
+    if health["failures"]:
+        for f in health["failures"]:
+            icon = "❌" if f.get("status") == "error" else "⚠️"
+            sum_snip = f.get("summary", "").splitlines()[0] if f.get("summary") else "Degraded or errored run"
+            if len(sum_snip) > 80:
+                sum_snip = sum_snip[:77] + "..."
+            failure_lines.append(f"- {icon} **{f.get('name')}** (*{f.get('timestamp_pt', 'last 24h')}*): `{sum_snip}`")
+
+    # 4. Infra & Homelab Posture
     infra_ok, _ = run_heartbeat_sweep()
     infra_note = "All containers & network ports reporting healthy." if infra_ok else "Degraded containers detected (see alert)."
 
@@ -297,6 +563,15 @@ def run_nightly_triage() -> str:
     # Baseball pipeline refresh timestamp
     bb_res = _ssh_cmd(HOST_2_IP, "cat /docker/baseball/shiny_app/data/last_refresh.txt 2>/dev/null || echo 'unavailable'")
     bb_ts = bb_res.stdout.strip() if bb_res.returncode == 0 and bb_res.stdout.strip() else "unavailable"
+
+    # Sidecar summary line
+    if health["total_runs"] > 0:
+        if health["all_healthy"]:
+            sidecar_note = f"All {health['total_runs']} scheduled runs succeeded in last 24h. ✅"
+        else:
+            sidecar_note = f"⚠️ {health['ok_count']}/{health['total_runs']} runs passed ({len(health['failures'])} flagged/failed in last 24h)"
+    else:
+        sidecar_note = "No runs logged in last 24h."
 
     date_header = tomorrow_pt.strftime("%A, %B %-d")
     report = [
@@ -316,10 +591,18 @@ def run_nightly_triage() -> str:
             *proposed_calendar
         ])
 
+    if failure_lines:
+        report.extend([
+            "",
+            "### ⚠️ Scheduled Job Warnings & Failures (Last 24h)",
+            *failure_lines
+        ])
+
     report.extend([
         "",
         "### 🖥️ Homelab Posture",
         f"- **Infra Health**: {infra_note}",
+        f"- **Scheduled Sidecars**: {sidecar_note}",
         f"- **Active Containers**: Host1 ({HOST_1_IP}): `{sb_up}` up | Host2 ({HOST_2_IP}): `{bs2_up}` up",
         f"- **Baseball Pipeline Refresh**: `{bb_ts}`"
     ])
@@ -576,42 +859,115 @@ def run_marketing_sweep(force: bool = False) -> tuple[bool, str]:
     return True, msg
 
 # --------------------------------------------------------------------------
+# 8-14. Additional Maintenance Tasks
+# --------------------------------------------------------------------------
+def run_ha_battery_check(threshold: float = 15.0) -> tuple[bool, str]:
+    """Check IoT sensor battery levels via ha_battery_check."""
+    try:
+        res = subprocess.run(["python3", "/workspace/tools/ha_battery_check.py", f"--threshold={threshold}"], capture_output=True, text=True, timeout=20)
+        out = res.stdout.strip()
+        if "Low Battery Alert" in out:
+            return False, out
+        return True, out or "✅ All IoT sensors healthy."
+    except Exception as e:
+        return False, f"⚠️ Low battery check failed: {e}"
+
+def run_nas_storage_check() -> tuple[bool, str]:
+    """Check NAS volume storage and RAID status."""
+    try:
+        res = subprocess.run(["python3", "/workspace/tools/nas_storage_check.py"], capture_output=True, text=True, timeout=30)
+        out = res.stdout.strip()
+        if "ALERT" in out.upper() or "DEGRADED" in out.upper():
+            return False, out
+        return True, out or "✅ NAS storage and RAID healthy."
+    except Exception as e:
+        return False, f"⚠️ NAS storage check failed: {e}"
+
+def run_ha_update_check() -> tuple[bool, str]:
+    """Check for stable mature Home Assistant updates."""
+    try:
+        res = subprocess.run(["python3", "/workspace/tools/ha_update_check.py", "--quiet"], capture_output=True, text=True, timeout=30)
+        out = res.stdout.strip()
+        return True, out
+    except Exception as e:
+        return False, f"⚠️ HA update check failed: {e}"
+
+def run_dockhand_update_check() -> tuple[bool, str]:
+    """Check Dockhand image updates."""
+    try:
+        res = subprocess.run(["python3", "/workspace/tools/dockhand_update.py", "check", "--quiet"], capture_output=True, text=True, timeout=30)
+        out = res.stdout.strip()
+        return True, out
+    except Exception as e:
+        return False, f"⚠️ Dockhand update check failed: {e}"
+
+def run_antigravity_check() -> tuple[bool, str]:
+    """Check Antigravity CLI release updates."""
+    try:
+        res = subprocess.run(["python3", "/workspace/tools/update_antigravity.py", "check", "--quiet"], capture_output=True, text=True, timeout=30)
+        out = res.stdout.strip()
+        return True, out
+    except Exception as e:
+        return False, f"⚠️ Antigravity CLI check failed: {e}"
+
+# --------------------------------------------------------------------------
 # CLI Dispatcher
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "heartbeat"
     if action == "heartbeat":
-        ok, rep = run_heartbeat_sweep()
+        ok, rep, _ = run_sidecar_job("heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
         print(rep)
     elif action == "triage":
-        print(run_nightly_triage())
+        ok, rep, _ = run_sidecar_job("triage", "Nightly Triage & Briefing", run_nightly_triage)
+        print(rep)
     elif action == "nas_logs":
-        ok, rep = run_nas_log_review()
+        ok, rep, _ = run_sidecar_job("nas_logs", "NAS Log Review", run_nas_log_review)
         print(rep)
     elif action == "plex":
-        ok, rep = run_plex_session_cleanup()
+        ok, rep, _ = run_sidecar_job("plex", "Plex Session Cleanup", run_plex_session_cleanup)
         if rep.strip():
             print(rep)
     elif action == "reminders":
-        ok, rep = run_dated_reminders()
+        ok, rep, _ = run_sidecar_job("reminders", "Dated Reminders", run_dated_reminders)
         print(rep or "(no reminders due today)")
     elif action == "ev9":
         force = "--force" in sys.argv or "-f" in sys.argv
-        ok, rep, plot = run_ev9_monitor(force_digest=force)
+        ok, rep, plot = run_sidecar_job("ev9", "EV9 Listing Monitor", run_ev9_monitor, force_digest=force)
         if rep:
             print(rep)
         if plot:
             print(f"\n[Trend plot generated: {plot}]")
     elif action == "marketing":
-        ok, rep = run_marketing_sweep(force=True)
+        ok, rep, _ = run_sidecar_job("marketing", "Marketing Email Sweep", run_marketing_sweep, force=True)
         print(rep)
     elif action == "doctor":
         from tools.memory_manager import run_memory_doctor
-        ok, rep = run_memory_doctor()
+        ok, rep, _ = run_sidecar_job("doctor", "Memory Doctor Audit", run_memory_doctor)
         print(rep)
     elif action == "dream":
         from tools.memory_manager import run_dreaming_consolidation
-        ok, rep = run_dreaming_consolidation()
+        ok, rep, _ = run_sidecar_job("dream", "Dreaming Consolidation", run_dreaming_consolidation)
         print(rep)
+    elif action == "battery":
+        ok, rep, _ = run_sidecar_job("ha_battery", "HA Battery Check", run_ha_battery_check)
+        print(rep)
+    elif action == "storage":
+        ok, rep, _ = run_sidecar_job("nas_storage", "NAS Storage Check", run_nas_storage_check)
+        print(rep)
+    elif action == "ha_update":
+        ok, rep, _ = run_sidecar_job("ha_update_check", "HA Update Check", run_ha_update_check)
+        print(rep or "HA up to date.")
+    elif action == "dockhand":
+        ok, rep, _ = run_sidecar_job("dockhand_check", "Dockhand Image Check", run_dockhand_update_check)
+        print(rep or "Dockhand up to date.")
+    elif action == "antigravity":
+        ok, rep, _ = run_sidecar_job("update_antigravity", "Antigravity CLI Check", run_antigravity_check)
+        print(rep or "Antigravity up to date.")
+    elif action == "status":
+        print(format_sidecar_status_summary())
+    elif action == "history":
+        entries = get_execution_history(limit=20)
+        print(json.dumps(entries, indent=2))
     else:
         print(f"Unknown action: {action}")

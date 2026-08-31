@@ -188,6 +188,7 @@ Things that look like problems but are expected behavior:
 - **HA `forecast_solar` errors after sundown** — Upstream library behavior, self-recovers at sunrise.
 - **Matter Node 2 timeouts** — SwitchBot Hub 2 drops its session every 30–90 min and self-recovers.
 - **`docker logs kometa` hangs without `--tail`** — Always bound log commands with `--tail <N>`.
+- **Server-wide / root grep hangs & crashes container runtime** — NEVER call `grep_search` or `find_by_name` on root `/`, `/workspace`, or `/workspace/data` (which holds >20GB of bulk takeout archives). Always scope search tools to specific subdirectories (e.g. `/workspace/tools`, `/workspace/config`) and supply `Includes` filters (e.g. `["*.py"]`). Bound all bash searches with `-maxdepth` and output limits.
 
 ---
 

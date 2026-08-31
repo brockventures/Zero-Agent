@@ -25,6 +25,21 @@ def _handle_sigterm(signum, frame):
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
+def _handle_sigchld(signum, frame):
+    """Reap orphaned child processes (e.g. terminated MCP servers or subcommands) to prevent zombies."""
+    while True:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+            if pid <= 0:
+                break
+        except (ChildProcessError, OSError):
+            break
+
+try:
+    signal.signal(signal.SIGCHLD, _handle_sigchld)
+except Exception as e:
+    print(f"[Bridge] Warning setting SIGCHLD reaper: {e}")
+
 if "/workspace" not in sys.path:
     sys.path.insert(0, "/workspace")
 
@@ -1014,8 +1029,8 @@ async def dispatch_scheduled_prompt(prompt: str, job_name: str = "Sidecar"):
     # Heartbeat sweep: silent execution unless degraded
     if job_name == "Heartbeat Sweep" or "sidecars.py heartbeat" in prompt:
         try:
-            from tools.sidecars import run_heartbeat_sweep
-            healthy, report = run_heartbeat_sweep()
+            from tools.sidecars import run_sidecar_job, run_heartbeat_sweep
+            healthy, report, _ = run_sidecar_job("heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
             if not healthy:
                 ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
                 if ch:
@@ -1027,8 +1042,8 @@ async def dispatch_scheduled_prompt(prompt: str, job_name: str = "Sidecar"):
     # Dated reminders: silent execution unless a reminder is due today
     if job_name == "Dated Reminders" or "sidecars.py reminders" in prompt:
         try:
-            from tools.sidecars import run_dated_reminders
-            has_due, rep = run_dated_reminders()
+            from tools.sidecars import run_sidecar_job, run_dated_reminders
+            has_due, rep, _ = run_sidecar_job("reminders", "Dated Reminders", run_dated_reminders)
             if has_due and rep:
                 ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
                 if ch:
@@ -1042,8 +1057,8 @@ async def dispatch_scheduled_prompt(prompt: str, job_name: str = "Sidecar"):
     # EV9 listing monitor: silent execution on Mon-Sat; only posts Sunday digest
     if job_name == "EV9 Listing Monitor" or "sidecars.py ev9" in prompt:
         try:
-            from tools.sidecars import run_ev9_monitor
-            has_digest, rep, plot_path = run_ev9_monitor(force_digest=False)
+            from tools.sidecars import run_sidecar_job, run_ev9_monitor
+            has_digest, rep, plot_path = run_sidecar_job("ev9", "EV9 Listing Monitor", run_ev9_monitor, force_digest=False)
             if has_digest and rep:
                 ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
                 if ch:
@@ -1058,9 +1073,9 @@ async def dispatch_scheduled_prompt(prompt: str, job_name: str = "Sidecar"):
     # Antigravity CLI update check: silent execution unless a new version is available
     if "update_antigravity.py" in prompt or job_name == "Antigravity CLI Check":
         try:
-            res = subprocess.run(["python3", "/workspace/tools/update_antigravity.py", "check", "--quiet"], capture_output=True, text=True)
-            out = res.stdout.strip()
-            if out:
+            from tools.sidecars import run_sidecar_job, run_antigravity_check
+            ok, out, _ = run_sidecar_job("update_antigravity", "Antigravity CLI Check", run_antigravity_check)
+            if out and out.strip():
                 ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out)
@@ -1077,9 +1092,9 @@ async def dispatch_scheduled_prompt(prompt: str, job_name: str = "Sidecar"):
     # Dockhand container image check: silent execution unless an update is available
     if "dockhand_update.py" in prompt or job_name == "Dockhand Image Check":
         try:
-            res = subprocess.run(["python3", "/workspace/tools/dockhand_update.py", "check", "--quiet"], capture_output=True, text=True)
-            out = res.stdout.strip()
-            if out:
+            from tools.sidecars import run_sidecar_job, run_dockhand_update_check
+            ok, out, _ = run_sidecar_job("dockhand_check", "Dockhand Image Check", run_dockhand_update_check)
+            if out and out.strip():
                 ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out)
@@ -2050,6 +2065,16 @@ async def on_ready():
     await apply_bot_presence()
     print(f"[Antigravity] Logged in as {bot.user} (ID: {bot.user.id})")
 
+    # Ensure Persistent MCP Daemon is active
+    try:
+        from tools.mcp_daemon import ensure_mcp_daemon_running, get_status
+        ensure_mcp_daemon_running()
+        mcp_status = get_status()
+        print(f"[Antigravity] Persistent MCP Daemon active (PID: {mcp_status.get('pid')}, healthy: {mcp_status.get('healthy')}).")
+    except Exception as me:
+        print(f"[Bridge] Warning initializing MCP daemon: {me}")
+
+
     # Clean up any zombie in-flight turn from an interrupted restart
     if IN_FLIGHT_FILE.exists():
         try:
@@ -2514,7 +2539,11 @@ async def on_message(msg: discord.Message):
         "!projects": ("⏳ *Fetching project and task tracker...*", "Show active projects and tasks using /workspace/tools/task_manager.py summary."),
         "/projects": ("⏳ *Fetching project and task tracker...*", "Show active projects and tasks using /workspace/tools/task_manager.py summary."),
         "!schedule": ("⏳ *Fetching sidecar schedule...*", "Show the current sidecar schedule using /workspace/tools/scheduler_tool.py summary."),
-        "/schedule": ("⏳ *Fetching sidecar schedule...*", "Show the current sidecar schedule using /workspace/tools/scheduler_tool.py summary.")
+        "/schedule": ("⏳ *Fetching sidecar schedule...*", "Show the current sidecar schedule using /workspace/tools/scheduler_tool.py summary."),
+        "!sidecars": ("⏳ *Fetching sidecar execution health...*", "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status."),
+        "/sidecars": ("⏳ *Fetching sidecar execution health...*", "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status."),
+        "!mcp": ("⏳ *Checking MCP daemon status...*", "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status."),
+        "/mcp": ("⏳ *Checking MCP daemon status...*", "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status.")
     }
 
     cmd_key = content.lower().split()[0] if content else ""
