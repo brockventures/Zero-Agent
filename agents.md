@@ -149,6 +149,15 @@ Zero's memory is structurally partitioned into two distinct tiers:
 - **`nas_storage_check.py`:** Monitors `/volume1` capacity (>85% alert) and `/proc/mdstat` for RAID degradation across both servers. (Wednesdays at 10:00 AM PT).
 - **`plex_weekly_digest.py`:** Queries Tautulli API for media added in the last 7 days. Posts clean summary of new movies, full seasons, and new airing episodes with `@everyone` tag to `#server-updates`. (Fridays at 4:00 PM PT).
 
+### 4. Post-Modification Lifecycle Advisory (Proactive Restart Invariant)
+- **Mandatory Lifecycle Assessment:** Whenever modifying `/app/bridge.py`, persistent background daemons (e.g. `/workspace/tools/mcp_daemon.py`), imported Python modules, package dependencies, or container compose files, Zero **MUST** conclude the turn with an explicit restart advisory.
+- **Required Advisory Elements:**
+  1. **Impact State:** State clearly whether the change is live immediately (e.g. `schedule.json`, dynamic runtime rules, standalone scripts) or held in memory by PID 1 / long-running daemons.
+  2. **Queue Safety Check:** Confirm both `#zero-chat` and Crab Cavern threads are completely idle before suggesting execution.
+  3. **Actionable Proposal:** Provide the exact detached SSH command and interactive Discord UI buttons:  
+     `[CHOICES: Restart Container Now | Postpone Restart]`
+- **Never wait for Ryan to ask:** If code or dependencies were changed that require a reload to take effect, flagging it immediately is an absolute requirement.
+
 ---
 
 ## Google Workspace & Web Tools
