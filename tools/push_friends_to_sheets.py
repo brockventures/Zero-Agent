@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create and populate Google Spreadsheet with Master Friends & Family Dataset."""
+"""Create, populate, and format Google Spreadsheet with Master Friends & Family Dataset using Sheets API v4."""
 
 import csv
 import json
@@ -12,11 +12,24 @@ if not os.path.exists(SECRETS_PATH) and os.path.exists("/workspace/config/google
     SECRETS_PATH = "/workspace/config/google_oauth.json"
 
 CSV_PATH = os.environ.get("FRIENDS_CSV_PATH", "/workspace/data/friends_and_family_master.csv")
+DEFAULT_SHEET_ID = os.environ.get("FRIENDS_SHEET_ID", "1ZAhET8stLzHTR3tsRWZVB9UAgIIEWH1Gs_9Nw3KQBv8")
 
-def push_to_google_sheets():
-    with open(SECRETS_PATH) as f:
-        creds = json.load(f)
+def load_credentials(path):
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        creds = {}
+        for line in content.splitlines():
+            line = line.strip().rstrip(",")
+            if ":" in line:
+                k, v = line.split(":", 1)
+                creds[k.strip().strip("\"").strip("'")] = v.strip().strip("\"").strip("'")
+        return creds
 
+def get_access_token():
+    creds = load_credentials(SECRETS_PATH)
     data = urllib.parse.urlencode({
         "client_id": creds["client_id"],
         "client_secret": creds["client_secret"],
@@ -26,45 +39,422 @@ def push_to_google_sheets():
 
     req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
     with urllib.request.urlopen(req) as resp:
-        tok = json.loads(resp.read().decode())["access_token"]
+        return json.loads(resp.read().decode())["access_token"]
 
-    # 1. Create Spreadsheet
-    sheet_body = {
-        "properties": {
-            "title": "Private Network: Friends, Family & Neighbors Master"
-        }
-    }
-    s_req = urllib.request.Request(
-        "https://sheets.googleapis.com/v4/spreadsheets",
-        data=json.dumps(sheet_body).encode("utf-8"),
-        headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(s_req) as s_resp:
-        sheet_info = json.loads(s_resp.read().decode())
-        sheet_id = sheet_info["spreadsheetId"]
-        sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
-        print(f"✅ Created Google Spreadsheet! ID: {sheet_id}")
-        print(f"🔗 URL: {sheet_url}")
+def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
+    token = get_access_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # 2. Ingest CSV data
-    rows = []
+    # 1. Read CSV data
     with open(CSV_PATH, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            rows.append(row)
+        csv_rows = list(csv.reader(f))
 
-    # 3. Populate rows via valueRange
-    append_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/A1:append?valueInputOption=USER_ENTERED"
-    val_body = {"values": rows}
-    a_req = urllib.request.Request(
-        append_url,
-        data=json.dumps(val_body).encode("utf-8"),
-        headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+    num_rows = len(csv_rows)
+    num_cols = len(csv_rows[0]) if num_rows > 0 else 9
+
+    # 2. Get spreadsheet metadata to find sheetId and tab title
+    meta_req = urllib.request.Request(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}",
+        headers={"Authorization": f"Bearer {token}"}
     )
-    with urllib.request.urlopen(a_req) as a_resp:
-        res = json.loads(a_resp.read().decode())
-        print(f"✅ Populated {len(rows)} rows into Google Sheet!")
+    with urllib.request.urlopen(meta_req) as resp:
+        meta = json.loads(resp.read().decode())
 
+    first_sheet = meta["sheets"][0]
+    tab_sheet_id = first_sheet["properties"]["sheetId"]
+    tab_title = first_sheet["properties"]["title"]
+
+    # 3. Clear existing values and update with formatted CSV data
+    escaped_clear_range = urllib.parse.quote(f"{tab_title}!A1:Z500")
+    clear_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{escaped_clear_range}:clear"
+    clear_req = urllib.request.Request(clear_url, data=b"{}", headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(clear_req) as resp:
+            pass
+    except Exception:
+        pass
+
+    escaped_update_range = urllib.parse.quote(f"{tab_title}!A1")
+    update_vals_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{escaped_update_range}?valueInputOption=USER_ENTERED"
+    vals_body = json.dumps({"values": csv_rows}).encode("utf-8")
+    u_req = urllib.request.Request(update_vals_url, data=vals_body, headers=headers, method="PUT")
+    with urllib.request.urlopen(u_req) as resp:
+        pass
+
+    # 4. Construct batchUpdate requests for professional formatting
+    requests = []
+
+    # Update Spreadsheet tab properties (freeze header row + first column)
+    requests.append({
+        "updateSheetProperties": {
+            "properties": {
+                "sheetId": tab_sheet_id,
+                "title": "Friends & Family Master",
+                "gridProperties": {
+                    "frozenRowCount": 1,
+                    "frozenColumnCount": 1,
+                    "hideGridlines": False
+                }
+            },
+            "fields": "title,gridProperties.frozenRowCount,gridProperties.frozenColumnCount,gridProperties.hideGridlines"
+        }
+    })
+
+    # Clear existing banded ranges if any
+    for banded in first_sheet.get("bandedRanges", []):
+        requests.append({
+            "deleteBanding": {
+                "bandedRangeId": banded["bandedRangeId"]
+            }
+        })
+
+    # Add Banding (Zebra striping)
+    requests.append({
+        "addBanding": {
+            "bandedRange": {
+                "range": {
+                    "sheetId": tab_sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": num_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols
+                },
+                "rowProperties": {
+                    "headerColor": {"red": 0.11, "green": 0.21, "blue": 0.34, "alpha": 1.0},
+                    "firstBandColor": {"red": 1.0, "green": 1.0, "blue": 1.0, "alpha": 1.0},
+                    "secondBandColor": {"red": 0.96, "green": 0.97, "blue": 0.99, "alpha": 1.0}
+                }
+            }
+        }
+    })
+
+    # Header Row Styling: Navy, Bold, White Text, Middle Align
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 0,
+                "endRowIndex": 1,
+                "startColumnIndex": 0,
+                "endColumnIndex": num_cols
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": {"red": 0.11, "green": 0.21, "blue": 0.34},
+                    "horizontalAlignment": "CENTER",
+                    "verticalAlignment": "MIDDLE",
+                    "wrapStrategy": "CLIP",
+                    "textFormat": {
+                        "fontFamily": "Roboto",
+                        "fontSize": 10,
+                        "bold": True,
+                        "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}
+                    }
+                }
+            },
+            "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,wrapStrategy,textFormat)"
+        }
+    })
+
+    # Data Rows Base Font & Vertical Alignment
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 0,
+                "endColumnIndex": num_cols
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "verticalAlignment": "MIDDLE",
+                    "textFormat": {
+                        "fontFamily": "Roboto",
+                        "fontSize": 10
+                    }
+                }
+            },
+            "fields": "userEnteredFormat(verticalAlignment,textFormat)"
+        }
+    })
+
+    # Col 0: Name (Left, Bold)
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 0,
+                "endColumnIndex": 1
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "horizontalAlignment": "LEFT",
+                    "textFormat": {
+                        "fontFamily": "Roboto",
+                        "fontSize": 10,
+                        "bold": True,
+                        "foregroundColor": {"red": 0.08, "green": 0.15, "blue": 0.25}
+                    }
+                }
+            },
+            "fields": "userEnteredFormat(horizontalAlignment,textFormat)"
+        }
+    })
+
+    # Col 1: Circle / Group (Center)
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 1,
+                "endColumnIndex": 2
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "horizontalAlignment": "CENTER"
+                }
+            },
+            "fields": "userEnteredFormat.horizontalAlignment"
+        }
+    })
+
+    # Col 2: Relationship (Left)
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 2,
+                "endColumnIndex": 3
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "horizontalAlignment": "LEFT"
+                }
+            },
+            "fields": "userEnteredFormat.horizontalAlignment"
+        }
+    })
+
+    # Col 3: Birthday (Center)
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 3,
+                "endColumnIndex": 4
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "horizontalAlignment": "CENTER"
+                }
+            },
+            "fields": "userEnteredFormat.horizontalAlignment"
+        }
+    })
+
+    # Col 4: Phone (Center)
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 4,
+                "endColumnIndex": 5
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "horizontalAlignment": "CENTER"
+                }
+            },
+            "fields": "userEnteredFormat.horizontalAlignment"
+        }
+    })
+
+    # Col 5: Email (Left)
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 5,
+                "endColumnIndex": 6
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "horizontalAlignment": "LEFT"
+                }
+            },
+            "fields": "userEnteredFormat.horizontalAlignment"
+        }
+    })
+
+    # Col 6: Physical Address (Left, Wrap)
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 6,
+                "endColumnIndex": 7
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "horizontalAlignment": "LEFT",
+                    "wrapStrategy": "WRAP"
+                }
+            },
+            "fields": "userEnteredFormat(horizontalAlignment,wrapStrategy)"
+        }
+    })
+
+    # Col 7: Screen Names / Handles (Left)
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 7,
+                "endColumnIndex": 8
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "horizontalAlignment": "LEFT"
+                }
+            },
+            "fields": "userEnteredFormat.horizontalAlignment"
+        }
+    })
+
+    # Col 8: Notes & Connections (Left, Wrap)
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 8,
+                "endColumnIndex": 9
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "horizontalAlignment": "LEFT",
+                    "wrapStrategy": "WRAP"
+                }
+            },
+            "fields": "userEnteredFormat(horizontalAlignment,wrapStrategy)"
+        }
+    })
+
+    # Set Column Widths
+    col_widths = [
+        (0, 1, 200),  # Name
+        (1, 2, 170),  # Circle / Group
+        (2, 3, 170),  # Relationship
+        (3, 4, 110),  # Birthday
+        (4, 5, 140),  # Phone Number
+        (5, 6, 230),  # Email Address
+        (6, 7, 300),  # Physical Address
+        (7, 8, 180),  # Screen Names / Handles
+        (8, 9, 400),  # Notes & Connections
+    ]
+    for start_c, end_c, px in col_widths:
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": tab_sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": start_c,
+                    "endIndex": end_c
+                },
+                "properties": {
+                    "pixelSize": px
+                },
+                "fields": "pixelSize"
+            }
+        })
+
+    # Set Header Row Height
+    requests.append({
+        "updateDimensionProperties": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "dimension": "ROWS",
+                "startIndex": 0,
+                "endIndex": 1
+            },
+            "properties": {
+                "pixelSize": 38
+            },
+            "fields": "pixelSize"
+        }
+    })
+
+    # Set Grid Borders
+    thin_border = {
+        "style": "SOLID",
+        "color": {"red": 0.85, "green": 0.88, "blue": 0.92}
+    }
+    requests.append({
+        "updateBorders": {
+            "range": {
+                "sheetId": tab_sheet_id,
+                "startRowIndex": 0,
+                "endRowIndex": num_rows,
+                "startColumnIndex": 0,
+                "endColumnIndex": num_cols
+            },
+            "top": thin_border,
+            "bottom": thin_border,
+            "left": thin_border,
+            "right": thin_border,
+            "innerHorizontal": thin_border,
+            "innerVertical": thin_border
+        }
+    })
+
+    # Clear existing filter first if any, then set Basic Filter
+    requests.append({
+        "clearBasicFilter": {
+            "sheetId": tab_sheet_id
+        }
+    })
+    requests.append({
+        "setBasicFilter": {
+            "filter": {
+                "range": {
+                    "sheetId": tab_sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": num_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols
+                }
+            }
+        }
+    })
+
+    # 5. Execute batchUpdate
+    batch_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}:batchUpdate"
+    batch_body = json.dumps({"requests": requests}).encode("utf-8")
+    b_req = urllib.request.Request(batch_url, data=batch_body, headers=headers, method="POST")
+    with urllib.request.urlopen(b_req) as resp:
+        res = json.loads(resp.read().decode())
+
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+    print(f"✅ Google Spreadsheet formatted & synchronized! ID: {sheet_id}")
+    print(f"🔗 URL: {sheet_url}")
     return sheet_url
 
 if __name__ == "__main__":

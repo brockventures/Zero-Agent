@@ -1,9 +1,27 @@
 import json
+import os
 import urllib.request
 import urllib.parse
 
-with open("/workspace/config/google_oauth.json") as f:
-    creds = json.load(f)
+SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_PATH", os.environ.get("GOOGLE_OAUTH_CREDENTIALS", "/secrets/google_oauth.json"))
+if not os.path.exists(SECRETS_PATH) and os.path.exists("/workspace/config/google_oauth.json"):
+    SECRETS_PATH = "/workspace/config/google_oauth.json"
+
+def load_credentials(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        creds = {}
+        for line in content.splitlines():
+            line = line.strip().rstrip(",")
+            if ":" in line:
+                k, v = line.split(":", 1)
+                creds[k.strip().strip("\"").strip("'")] = v.strip().strip("\"").strip("'")
+        return creds
+
+creds = load_credentials(SECRETS_PATH)
 
 data = urllib.parse.urlencode({
     "client_id": creds["client_id"],

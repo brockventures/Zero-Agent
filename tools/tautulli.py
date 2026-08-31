@@ -11,16 +11,36 @@ import requests
 
 log = logging.getLogger("tautulli")
 
+import json
+import urllib.parse
+
 API_KEY = os.environ.get("TAUTULLI_API_KEY", "")
-if not API_KEY and os.path.exists("/secrets/env.json"):
+HOST_1_IP = os.environ.get("NAS_HOST_1_IP", "")
+
+if os.path.exists("/secrets/env.json"):
     try:
-        import json
         with open("/secrets/env.json") as f:
-            API_KEY = json.load(f).get("TAUTULLI_API_KEY", "")
+            d = json.load(f)
+            if not API_KEY:
+                API_KEY = d.get("TAUTULLI_API_KEY", "")
+            if not HOST_1_IP:
+                if d.get("NAS_HOST_1_IP"):
+                    HOST_1_IP = d["NAS_HOST_1_IP"]
+                elif d.get("HA_BASE_URL"):
+                    HOST_1_IP = urllib.parse.urlparse(d["HA_BASE_URL"]).hostname
     except Exception:
         pass
 
-HOST_1_IP = os.environ.get("NAS_HOST_1_IP", "127.0.0.1")
+if not HOST_1_IP and os.path.exists("/secrets/ha.json"):
+    try:
+        with open("/secrets/ha.json") as f:
+            d = json.load(f)
+            if d.get("url"):
+                HOST_1_IP = urllib.parse.urlparse(d["url"]).hostname
+    except Exception:
+        pass
+
+HOST_1_IP = HOST_1_IP or "127.0.0.1"
 URL = os.environ.get("TAUTULLI_URL", f"http://{HOST_1_IP}:8181/api/v2")
 TIMEOUT = 10
 

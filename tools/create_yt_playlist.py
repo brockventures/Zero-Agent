@@ -8,8 +8,47 @@ import time
 import urllib.request
 import urllib.parse
 
-SECRETS_PATH = "/workspace/config/youtube_oauth.json" if os.path.exists("/workspace/config/youtube_oauth.json") else "/workspace/config/google_oauth.json"
+SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_PATH", os.environ.get("GOOGLE_OAUTH_SECRETS", ""))
+if not SECRETS_PATH:
+    if os.path.exists("/secrets/youtube_oauth.json"):
+        SECRETS_PATH = "/secrets/youtube_oauth.json"
+    elif os.path.exists("/secrets/google_oauth.json"):
+        SECRETS_PATH = "/secrets/google_oauth.json"
+    elif os.path.exists("/workspace/config/youtube_oauth.json"):
+        SECRETS_PATH = "/workspace/config/youtube_oauth.json"
+    else:
+        SECRETS_PATH = "/workspace/config/google_oauth.json"
+
 TIMEOUT = 20
+
+def load_credentials(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        creds = {}
+        for line in content.splitlines():
+            line = line.strip().rstrip(",")
+            if ":" in line:
+                k, v = line.split(":", 1)
+                creds[k.strip().strip("\"").strip("'")] = v.strip().strip("\"").strip("'")
+        return creds
+
+def get_access_token() -> str:
+    creds = load_credentials(SECRETS_PATH)
+
+    data = urllib.parse.urlencode({
+        "client_id": creds["client_id"],
+        "client_secret": creds["client_secret"],
+        "refresh_token": creds["refresh_token"],
+        "grant_type": "refresh_token"
+    }).encode("utf-8")
+
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        tokens = json.loads(resp.read().decode())
+        return tokens["access_token"]
 
 TRACKS = [
     ("The Interrupters", "Gave You Everything"),
@@ -38,22 +77,6 @@ TRACKS = [
     ("Lights", "Prodigal Daughter"),
     ("The Sounds", "Living in America")
 ]
-
-def get_access_token() -> str:
-    with open(SECRETS_PATH) as f:
-        creds = json.load(f)
-
-    data = urllib.parse.urlencode({
-        "client_id": creds["client_id"],
-        "client_secret": creds["client_secret"],
-        "refresh_token": creds["refresh_token"],
-        "grant_type": "refresh_token"
-    }).encode("utf-8")
-
-    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        tokens = json.loads(resp.read().decode())
-        return tokens["access_token"]
 
 def main():
     tok = get_access_token()
@@ -140,4 +163,7 @@ def main():
     print(f"Direct Link: {yt_music_url}")
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print("Usage: create_yt_playlist.py [--dry-run]")
+        sys.exit(0)
     main()

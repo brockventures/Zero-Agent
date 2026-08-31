@@ -16,7 +16,35 @@ import sys
 import urllib.parse
 import urllib.request
 
-HOST_2_IP = os.environ.get("NAS_HOST_2_IP", "127.0.0.1")
+def _resolve_host_2():
+    host_2 = os.environ.get("NAS_HOST_2_IP")
+    if not host_2 and os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json") as f:
+                d = json.load(f)
+                if d.get("NAS_HOST_2_IP"):
+                    return d["NAS_HOST_2_IP"]
+                elif d.get("HA_BASE_URL"):
+                    h1 = urllib.parse.urlparse(d["HA_BASE_URL"]).hostname
+                    parts = h1.split(".")
+                    if len(parts) == 4 and parts[-1] == "82":
+                        return ".".join(parts[:3] + ["84"])
+        except Exception:
+            pass
+    if not host_2 and os.path.exists("/secrets/ha.json"):
+        try:
+            with open("/secrets/ha.json") as f:
+                d = json.load(f)
+                if d.get("url"):
+                    h1 = urllib.parse.urlparse(d["url"]).hostname
+                    parts = h1.split(".")
+                    if len(parts) == 4 and parts[-1] == "82":
+                        return ".".join(parts[:3] + ["84"])
+        except Exception:
+            pass
+    return host_2 or "127.0.0.1"
+
+HOST_2_IP = _resolve_host_2()
 BROWSERLESS_URL = os.environ.get("BROWSERLESS_URL", f"http://{HOST_2_IP}:3000")
 TIMEOUT = 45
 

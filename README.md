@@ -15,7 +15,7 @@ Zero is a production-grade, stateful, autonomous Discord agent architecture powe
                   ▼                                                             ▼
        [ Private Home Turf ]                                         [ Crab Cavern / External ]
        • Full tool access (SSH, HA, NAS)                             • Multi-agent scoping & Banana mutex
-       • 2-Stage dynamic thread namer                                • In-flight peer turn steering
+       • 5-6 Word semantic thread namer                              • In-flight peer turn steering
        • 25-turn rolling auto-compactor                              • Default-Deny privacy boundary
                   │                                                             │
                   └──────────────────────────────┬──────────────────────────────┘
@@ -32,9 +32,8 @@ Zero is a production-grade, stateful, autonomous Discord agent architecture powe
    DOM-to-PDP resolver      Silent health sweeps            --output-format=stream  Choice selection
 ```
 
-### 1. 🧵 2-Stage Dynamic Semantic Thread Naming
-* **Stage 1 (Pre-Turn):** Instantly analyzes inbound user intent, strips conversational filler, and establishes a clean 3–5 word semantic thread title.
-* **Stage 2 (Post-Turn Auto-Healing):** Dynamically inspects the agent's deliverables and refines the thread title from the generated Markdown headers.
+### 1. 🧵 5–6 Word Semantic Thread Naming
+* **Set Once at Creation:** Instantly analyzes inbound user intent, strips conversational filler, and establishes a clean, synthesized 5–6 word semantic thread title anchored to the original conversation topic. Never overwritten mid-turn.
 
 ### 2. 🌐 Self-Hosted Headless Browser Integration (Browserless)
 * Integrated with headless Browserless Chromium for zero-API dynamic JavaScript DOM evaluation.
