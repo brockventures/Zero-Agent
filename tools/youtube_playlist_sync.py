@@ -12,12 +12,35 @@ import time
 import urllib.request
 import urllib.parse
 
-SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_SECRETS", "/secrets/google_oauth.json")
+SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_PATH", os.environ.get("GOOGLE_OAUTH_SECRETS", ""))
+if not SECRETS_PATH:
+    if os.path.exists("/secrets/youtube_oauth.json"):
+        SECRETS_PATH = "/secrets/youtube_oauth.json"
+    elif os.path.exists("/secrets/google_oauth.json"):
+        SECRETS_PATH = "/secrets/google_oauth.json"
+    elif os.path.exists("/workspace/config/youtube_oauth.json"):
+        SECRETS_PATH = "/workspace/config/youtube_oauth.json"
+    else:
+        SECRETS_PATH = "/workspace/config/google_oauth.json"
+
 TIMEOUT = 20
 
+def load_credentials(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        creds = {}
+        for line in content.splitlines():
+            line = line.strip().rstrip(",")
+            if ":" in line:
+                k, v = line.split(":", 1)
+                creds[k.strip().strip("\"").strip("'")] = v.strip().strip("\"").strip("'")
+        return creds
+
 def get_access_token() -> str:
-    with open(SECRETS_PATH) as f:
-        creds = json.load(f)
+    creds = load_credentials(SECRETS_PATH)
 
     data = urllib.parse.urlencode({
         "client_id": creds["client_id"],

@@ -29,12 +29,9 @@ def generate_weekly_digest() -> str:
     now_pt = datetime.now(PT)
     date_header = now_pt.strftime("%A, %B %d, %Y")
     
-    HOST_1_IP = os.environ.get("NAS_HOST_1_IP", "127.0.0.1")
-    HOST_2_IP = os.environ.get("NAS_HOST_2_IP", "127.0.0.1")
-
     # 1. Homelab Infrastructure & Maintenance
-    host1_ps = json.loads(nas_docker("compose_ps", host=HOST_1_IP, compose_dir="/docker"))
-    host2_ps = json.loads(nas_docker("compose_ps", host=HOST_2_IP, compose_dir="/docker/discord-agy-agent"))
+    host1_ps = json.loads(nas_docker("compose_ps", host="host1", compose_dir="/docker"))
+    host2_ps = json.loads(nas_docker("compose_ps", host="host2", compose_dir=os.environ.get("HOST_AGENT_DIR", "/docker/discord-agy-agent")))
     ha_status = json.loads(ha_ping())
     
     infra_lines = []

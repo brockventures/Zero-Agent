@@ -21,11 +21,14 @@ import urllib.parse
 from datetime import datetime
 from collections import Counter
 
-SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_SECRETS", "/docker/discord-agy-agent/secrets/google_oauth.json")
-ENV_PATH = os.environ.get("ENV_PATH", "/docker/discord-agy-agent/.env")
-STATE_DIR = "/docker/discord-agy-agent/data"
+SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_PATH", os.environ.get("GOOGLE_OAUTH_SECRETS", "/secrets/google_oauth.json"))
+if not os.path.exists(SECRETS_PATH) and os.path.exists("/workspace/config/google_oauth.json"):
+    SECRETS_PATH = "/workspace/config/google_oauth.json"
+
+ENV_PATH = os.environ.get("ENV_PATH", "/workspace/.env")
+STATE_DIR = os.environ.get("DATA_DIR", "/workspace/data")
 SEEN_FILE = os.path.join(STATE_DIR, "seen_zero_emails.json")
-LOG_FILE = "/docker/discord-agy-agent/zero_mail_listener.log"
+LOG_FILE = os.environ.get("ZERO_MAIL_LOG", os.path.join(STATE_DIR, "zero_mail_listener.log"))
 
 POLL_INTERVAL = 15  # seconds
 TIMEOUT = 15
@@ -47,6 +50,7 @@ def log(msg: str):
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
@@ -66,6 +70,20 @@ def sanitize_text(text: str, max_len: int = 150) -> str:
         text = text[:max_len-3] + "..."
     return text
 
+def load_credentials(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        creds = {}
+        for line in content.splitlines():
+            line = line.strip().rstrip(",")
+            if ":" in line:
+                k, v = line.split(":", 1)
+                creds[k.strip().strip("\"").strip("'")] = v.strip().strip("\"").strip("'")
+        return creds
+
 def load_env() -> dict:
     env = {}
     if os.path.exists(ENV_PATH):
@@ -75,6 +93,15 @@ def load_env() -> dict:
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip().strip("'").strip('"')
+    if os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json") as f:
+                env.update(json.load(f))
+        except Exception:
+            pass
+    for k, v in os.environ.items():
+        if k not in env or env[k] == "":
+            env[k] = v
     return env
 
 _cached_token = None
@@ -86,8 +113,7 @@ def get_access_token() -> str:
     if _cached_token and now < _token_expiry - 60:
         return _cached_token
     
-    with open(SECRETS_PATH) as f:
-        creds = json.load(f)
+    creds = load_credentials(SECRETS_PATH)
 
     data = urllib.parse.urlencode({
         "client_id": creds["client_id"],

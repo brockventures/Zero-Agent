@@ -28,12 +28,21 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 if "/workspace" not in sys.path:
     sys.path.insert(0, "/workspace")
 
-def find_new_artifacts(start_time: float) -> list[Path]:
+def find_new_artifacts(start_time: float, conv_id: str | None = None) -> list[Path]:
     """Find newly created artifact files in the brain conversation directory."""
     try:
         brain_root = Path("/root/.gemini/antigravity-cli/brain")
         if not brain_root.exists():
             return []
+        if conv_id:
+            target_dir = brain_root / conv_id
+            if target_dir.exists() and target_dir.is_dir():
+                artifacts = []
+                for item in target_dir.iterdir():
+                    if item.is_file() and not item.name.startswith("."):
+                        if item.stat().st_mtime >= start_time - 1.0:
+                            artifacts.append(item)
+                return artifacts
         conv_dirs = [d for d in brain_root.iterdir() if d.is_dir() and not d.name.startswith(".")]
         if not conv_dirs:
             return []
@@ -91,6 +100,8 @@ def get_runtime_rules() -> dict:
         "bot_word_floor": 4,
         "ambient_classifier_enabled": True,
         "ambient_relevance_threshold": 0.80,
+        "auto_thread_escalation_enabled": True,
+        "auto_thread_escalation_seconds": 180.0,
         "external_system_prompt": None
     }
     if RUNTIME_RULES_FILE.exists():
@@ -249,9 +260,9 @@ active_master_fd = None
 active_proc = None
 active_turn_task = None
 active_status_msg = None
-is_steering = False
+steering_channels = set()        # set of channel/thread IDs actively being steered
+reset_session_keys = set()       # set of session_keys (e.g. "home" or thread_id) to reset on next turn
 is_ext_steering = False
-reset_session = False
 ext_active_proc = None
 ext_active_master_fd = None
 channel_last_bot_reply = {}
@@ -969,7 +980,7 @@ LAST_SCHEDULED_DISPATCH = {}
 
 async def dispatch_scheduled_prompt(prompt: str, job_name: str = "Sidecar"):
     """Inject a scheduled sidecar prompt into the message queue with anti-storm guard."""
-    global reset_session
+    global reset_session_keys
 
     # Anti-storm guard: prevent any job from dispatching more than once per 5 minutes
     now_ts = time.time()
@@ -983,19 +994,21 @@ async def dispatch_scheduled_prompt(prompt: str, job_name: str = "Sidecar"):
         # Generate carry-forward summary BEFORE resetting session
         try:
             from tools.session_summarizer import generate_summary
-            generate_summary()
+            home_cid = get_channel_session_id(TARGET_CHANNEL_ID, "home")
+            if home_cid:
+                generate_summary(conv_id=home_cid, sess_key="home")
             print("[Scheduler] Generated carry-forward summary before session rollover.")
         except Exception as e:
             print(f"[Scheduler] Error generating rollover summary: {e}")
 
-        reset_session = True
+        reset_session_keys.add("home")
         ch = bot.get_channel(TARGET_CHANNEL_ID)
         if ch:
             try:
                 await ch.send("🌙 **Daily Session Rollover (2:00 AM PT)**: Conversation context refreshed with carry-forward context preserved.")
             except Exception:
                 pass
-        print("[Scheduler] Executed daily session rollover at 2:00 AM PT (reset_session=True).")
+        print("[Scheduler] Executed daily session rollover at 2:00 AM PT (reset_session_keys added 'home').")
         return
 
     # Heartbeat sweep: silent execution unless degraded
@@ -1096,22 +1109,87 @@ async def dispatch_scheduled_prompt(prompt: str, job_name: str = "Sidecar"):
         "is_steer": False
     })
 
+_SCRUB_TARGETS = None
+
+def _get_scrub_targets() -> set[str]:
+    global _SCRUB_TARGETS
+    if _SCRUB_TARGETS is not None:
+        return _SCRUB_TARGETS
+
+    targets = set()
+    env_keys = [
+        "DISCORD_BOT_TOKEN", "HA_ACCESS_TOKEN", "TAUTULLI_API_KEY",
+        "MARKETCHECK_API_KEY", "CLOUDFLARE_API_TOKEN", "UPTIMEROBOT_API_KEY",
+        "SERPAPI_API_KEY", "ATT_WIFI_PASSWORD", "ATT_ACCESS_CODE",
+        "ZERO_EMAIL_PASSWORD"
+    ]
+    for k in env_keys:
+        val = os.getenv(k, "").strip()
+        if val and len(val) >= 6:
+            targets.add(val)
+
+    if os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json") as f:
+                d = json.load(f)
+                for v in d.values():
+                    if isinstance(v, str) and len(v.strip()) >= 6 and not v.startswith("http"):
+                        targets.add(v.strip())
+        except Exception:
+            pass
+
+    if os.path.exists("/secrets/ha.json"):
+        try:
+            with open("/secrets/ha.json") as f:
+                d = json.load(f)
+                tok = d.get("token", "")
+                if tok and len(tok) >= 6:
+                    targets.add(tok.strip())
+        except Exception:
+            pass
+
+    if os.path.exists("/workspace/.env"):
+        try:
+            with open("/workspace/.env") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        _, v = line.split("=", 1)
+                        v_clean = v.strip().strip("'").strip('"')
+                        if len(v_clean) >= 6:
+                            targets.add(v_clean)
+        except Exception:
+            pass
+
+    for oauth_path in ["/secrets/google_oauth.json", "/secrets/youtube_oauth.json"]:
+        if os.path.exists(oauth_path):
+            try:
+                with open(oauth_path) as f:
+                    content = f.read()
+                for line in content.splitlines():
+                    line = line.strip().rstrip(",")
+                    if ":" in line:
+                        _, v = line.split(":", 1)
+                        v_clean = v.strip().strip('"').strip("'")
+                        if len(v_clean) >= 12 and not v_clean.startswith("http"):
+                            targets.add(v_clean)
+            except Exception:
+                pass
+
+    _SCRUB_TARGETS = targets
+    return _SCRUB_TARGETS
+
 def scrub_credentials(text: str) -> str:
     """Scrub internal tokens, passwords, API keys, and homelab private IPs from outbound text."""
     if not text:
         return text
 
-    env_keys = [
-        "DISCORD_BOT_TOKEN", "HA_ACCESS_TOKEN", "TAUTULLI_API_KEY",
-        "MARKETCHECK_API_KEY", "CLOUDFLARE_API_TOKEN", "UPTIMEROBOT_API_KEY",
-        "SERPAPI_API_KEY"
-    ]
-    for k in env_keys:
-        val = os.getenv(k, "").strip()
-        if val and len(val) >= 8 and val in text:
+    for val in _get_scrub_targets():
+        if val in text:
             text = text.replace(val, "[REDACTED_SECRET]")
 
     # Redact common credential patterns
+    text = re.sub(r"ya29\.[A-Za-z0-9_-]+", "[REDACTED_OAUTH_TOKEN]", text)
     text = re.sub(r"[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}", "[REDACTED_TOKEN]", text)
     text = re.sub(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "[REDACTED_JWT]", text)
     text = re.sub(r"\b192\.168\.1\.\d{1,3}\b", "[internal-ip]", text)
@@ -1178,10 +1256,10 @@ def clean_discord_latex(text: str) -> str:
 
     return text
 
-def generate_concise_thread_title(prompt: str, max_words: int = 4) -> str:
-    """Generate a clean, concise, 2-4 word semantic thread title from user prompt."""
+def generate_concise_thread_title(prompt: str, target_words: int = 6) -> str:
+    """Generate a clean, synthesized 5-6 word semantic thread title from the original prompt subject."""
     if not prompt:
-        return "Task Execution"
+        return "General Task Execution"
     
     clean = re.sub(r"^(thread:|parallel:|\/goal|\/plan|\/deep-research)\s*", "", prompt, flags=re.IGNORECASE).strip()
     clean = re.sub(r"\[Attached file\(s\)[^\]]+\]", "", clean).strip()
@@ -1189,43 +1267,43 @@ def generate_concise_thread_title(prompt: str, max_words: int = 4) -> str:
     clean = re.sub(r"\[CURRENT USER PROMPT\]:\s*", "", clean).strip()
     clean = re.sub(r"[#*_`~]", "", clean).strip()
 
-    low = clean.lower()
-    
-    # 1. High-Confidence Domain Intent Mappings
-    if any(k in low for k in ["birthday", "birthdays", "bday", "sheet", "family list", "friends list"]):
-        return "Friends & Family Birthdays"
-    elif any(k in low for k in ["ev9", "kia ev9", "marketcheck"]):
-        return "EV9 Market Monitor"
-    elif any(k in low for k in ["compaction", "rolling context", "context size", "wedged", "turn counter", "prefill"]):
-        return "Context Compaction & Speed"
-    elif any(k in low for k in ["tautulli", "plex status", "transcode", "plex down", "pms"]):
-        return "Plex Alerts & Transcoding"
-    elif any(k in low for k in ["sonarr", "radarr", "prowlarr", "indexer", "rate limit", "429"]):
-        return "Indexer & Server Alerts"
-    elif any(k in low for k in ["youtube", "playlist", "prime416", "liked songs", "music"]):
-        return "YouTube Music Discovery"
-    elif any(k in low for k in ["google sheet", "google drive", "google_oauth", "workspace auth"]):
-        return "Google Workspace Integration"
-    elif any(k in low for k in ["openmessage", "sms", "rcs", "google message"]):
-        return "Google Messages Integration"
-    elif any(k in low for k in ["d&d", "dungeons", "taz", "tabletop", "campaign", "kothar"]):
-        return "D&D Campaign Lore"
-    elif any(k in low for k in ["doctor", "audit", "sidecar", "health check", "orphan"]):
-        return "Memory Store Audit"
-    elif any(k in low for k in ["reboot", "restart", "beacon", "in-flight"]):
-        return "Bridge Lifecycle & Restart"
-    elif any(k in low for k in ["baseball", "big board", "stat blast", "scrapegurus"]):
-        return "Baseball Analytics & Big Board"
-    elif any(k in low for k in ["thread naming", "naming", "auto-rename"]):
-        return "Thread Naming Engine"
-
-    # 2. Conversational Intent Cleaner
+    # Conversational Intent Cleaner
     clean_stripped = re.sub(
-        r"^(we talked about|i'm concerned because|immediately some of those are|can you|could you|please|i need|i want|how do we|why would|what about|did we get|hey also|ok so)\s+",
+        r"^(we talked about|i'm concerned because|immediately some of those are|can you|could you|please|i need|i want to|i want|how do we|why would|what about|did we get|hey also|ok so|let's|lets|can we|we should|i think|is there a way to)\s+",
         "",
         clean,
         flags=re.IGNORECASE
     ).strip()
+
+    low = clean_stripped.lower()
+    
+    # 1. High-Confidence Domain Intent Mappings (5-6 words)
+    if any(k in low for k in ["birthday", "birthdays", "bday", "friends and family", "friends & family"]):
+        return "Friends and Family Contacts and Birthdays"
+    elif any(k in low for k in ["ev9", "kia ev9", "marketcheck"]):
+        return "Kia EV9 Dealership Listings Market Monitor"
+    elif any(k in low for k in ["compaction", "rolling context", "context size", "wedged", "turn counter", "prefill"]):
+        return "Context Compaction and Rolling Memory Architecture"
+    elif any(k in low for k in ["tautulli", "plex status", "plex transcode", "plex down", "pms"]):
+        return "Plex Media Server Alerts and Transcoding"
+    elif any(k in low for k in ["sonarr", "radarr", "prowlarr", "indexer", "rate limit", "429"]):
+        return "Arr Media Indexer and Server Alerts"
+    elif any(k in low for k in ["youtube music", "liked songs", "music playlist", "prime416"]):
+        return "YouTube Music Playlist Sync and Discovery"
+    elif any(k in low for k in ["google sheet", "sheets api", "push friends to sheets"]):
+        return "Google Sheets Friends and Family Sync"
+    elif any(k in low for k in ["openmessage", "sms", "rcs", "google message"]):
+        return "Google Messages RCS and SMS Integration"
+    elif any(k in low for k in ["d&d", "dungeons and dragons", "tabletop", "campaign lore"]):
+        return "Dungeons and Dragons Lore and Notes"
+    elif any(k in low for k in ["memory doctor", "doctor audit", "audit sidecar"]):
+        return "Homelab Memory Store Health and Audit"
+    elif any(k in low for k in ["reboot", "restart", "beacon", "in-flight"]):
+        return "Bridge Lifecycle and Restart Architecture Engine"
+    elif any(k in low for k in ["baseball", "big board", "stat blast", "scrapegurus"]):
+        return "Baseball Analytics and Big Board Scraping"
+    elif any(k in low for k in ["thread naming", "naming triggers", "auto-rename", "threaded convos"]):
+        return "Thread Naming and Escalation Timeout Tuning"
 
     stopwords = {
         "ok", "so", "heres", "here", "a", "an", "the", "new", "issue", "problem",
@@ -1237,23 +1315,26 @@ def generate_concise_thread_title(prompt: str, max_words: int = 4) -> str:
         "when", "why", "how", "what", "which", "who", "run", "perform", "check",
         "analyze", "generate", "build", "investigate", "test", "minor", "comment",
         "wrong", "right", "good", "bad", "too", "also", "much", "many", "really",
-        "still", "got", "get", "tried", "try", "seeing", "see", "think", "give"
+        "still", "got", "get", "tried", "try", "seeing", "see", "think", "give",
+        "want", "need", "make", "take", "using", "use"
     }
 
     words = [w for w in re.findall(r"[a-zA-Z0-9]+", clean_stripped) if len(w) > 1]
     meaningful = [w.capitalize() for w in words if w.lower() not in stopwords]
 
-    if len(meaningful) >= 2:
-        return " ".join(meaningful[:max_words])
+    if len(meaningful) >= 4:
+        return " ".join(meaningful[:target_words])
     elif meaningful:
-        return meaningful[0] + " Task"
+        context_words = [w.capitalize() for w in words if len(w) > 1 and w.capitalize() not in meaningful]
+        combined = meaningful + context_words
+        return " ".join(combined[:target_words])
     elif words:
-        return " ".join([w.capitalize() for w in words[:max_words]])
-    return "Task Execution"
+        return " ".join([w.capitalize() for w in words[:target_words]])
+    return "General Task Execution"
 
 async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_target: discord.Message, attachments: list[str], mode: str = "home", channel_id: int = TARGET_CHANNEL_ID, author_name: str = ""):
     """Execute a single agy CLI turn with streaming status and output delivery."""
-    global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session, is_steering, is_ext_steering, ACTIVE_MODEL
+    global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session_keys, is_ext_steering, ACTIVE_MODEL
 
     max_retries = 2
     for attempt in range(max_retries + 1):
@@ -1268,20 +1349,23 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
             should_compact, compact_reason = check_compaction_needed(conv_id, current_turns)
 
             # Auto-compact on turn limit, file size, step ceiling, age, or manual !reset
-            if should_compact or reset_session:
-                reset_session = False
+            if should_compact or (sess_key in reset_session_keys):
+                if sess_key in reset_session_keys:
+                    reset_session_keys.remove(sess_key)
+                old_conv_id = conv_id
                 reset_session_meta(sess_key)
                 clear_channel_session_id(channel_id, "home")
                 conv_id = None
-                try:
-                    from tools.session_summarizer import generate_summary, get_carryforward_context
-                    generate_summary()
-                    carry_ctx = get_carryforward_context()
-                    if carry_ctx:
-                        prompt = f"[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\n{carry_ctx}\n\n[CURRENT USER PROMPT]: {prompt}"
-                        print(f"[Bridge] 🔄 Auto-compacted session for {sess_key} ({compact_reason or 'manual reset'}) and injected carry-forward context.")
-                except Exception as e:
-                    print(f"[Bridge] Error injecting carry-forward context: {e}")
+                if old_conv_id:
+                    try:
+                        from tools.session_summarizer import generate_summary, get_carryforward_context
+                        generate_summary(conv_id=old_conv_id, sess_key=sess_key)
+                        carry_ctx = get_carryforward_context(sess_key=sess_key)
+                        if carry_ctx:
+                            prompt = f"[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\n{carry_ctx}\n\n[CURRENT USER PROMPT]: {prompt}"
+                            print(f"[Bridge] 🔄 Auto-compacted session for {sess_key} ({compact_reason or 'manual reset'}) and injected carry-forward context.")
+                    except Exception as e:
+                        print(f"[Bridge] Error injecting carry-forward context: {e}")
 
             if conv_id:
                 cmd.append(f"--conversation={conv_id}")
@@ -1301,19 +1385,23 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
 
             # Auto-compact external channel sessions on turn limit, file size, or step ceiling
             eng_carry_block = ""
-            if should_compact:
+            if should_compact or (sess_key in reset_session_keys):
+                if sess_key in reset_session_keys:
+                    reset_session_keys.remove(sess_key)
+                old_conv_id = conv_id
                 reset_session_meta(sess_key)
                 clear_channel_session_id(channel_id, "external")
                 conv_id = None
-                try:
-                    from tools.session_summarizer import generate_summary, get_engineering_carryforward_context
-                    generate_summary()
-                    eng_ctx = get_engineering_carryforward_context()
-                    if eng_ctx:
-                        eng_carry_block = f"\n[PREVIOUS SESSION ENGINEERING DELTA]:\n{eng_ctx}\n\n"
-                    print(f"[Bridge] 🔄 Auto-compacted external session for channel {sess_key} ({compact_reason}) and generated engineering carry-forward.")
-                except Exception as ce:
-                    print(f"[Bridge] Error injecting external carry-forward: {ce}")
+                if old_conv_id:
+                    try:
+                        from tools.session_summarizer import generate_summary, get_engineering_carryforward_context
+                        generate_summary(conv_id=old_conv_id, sess_key=sess_key)
+                        eng_ctx = get_engineering_carryforward_context(sess_key=sess_key)
+                        if eng_ctx:
+                            eng_carry_block = f"\n[PREVIOUS SESSION ENGINEERING DELTA]:\n{eng_ctx}\n\n"
+                        print(f"[Bridge] 🔄 Auto-compacted external session for channel {sess_key} ({compact_reason}) and generated engineering carry-forward.")
+                    except Exception as ce:
+                        print(f"[Bridge] Error injecting external carry-forward: {ce}")
 
             if conv_id:
                 cmd.append(f"--conversation={conv_id}")
@@ -1431,12 +1519,17 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
             delivery_target = reply_target
             notify_root_channel = None
             thread_jump_url = None
+            rules = get_runtime_rules()
+            escalation_seconds = float(rules.get("auto_thread_escalation_seconds", 180.0))
+            escalation_enabled = rules.get("auto_thread_escalation_enabled", True)
             is_root_eligible = (
                 mode == "home" and
                 channel_id == TARGET_CHANNEL_ID and
                 reply_target is not None and
                 hasattr(reply_target, "create_thread") and
-                not isinstance(getattr(reply_target, "channel", None), discord.Thread)
+                not isinstance(getattr(reply_target, "channel", None), discord.Thread) and
+                escalation_enabled and
+                escalation_seconds > 0
             )
     
             while True:
@@ -1522,13 +1615,13 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
                             except Exception:
                                 pass
 
-                        # Dynamic 60-Second Escalation to Discord Thread (#zero-chat root only)
-                        if is_root_eligible and not escalated_to_thread and (now - turn_start_time) >= 60.0:
+                        # Dynamic Escalation to Discord Thread (#zero-chat root only)
+                        if is_root_eligible and not escalated_to_thread and (now - turn_start_time) >= escalation_seconds:
                             try:
                                 escalated_to_thread = True
                                 clean_title = generate_concise_thread_title(prompt)
                                 thread = await reply_target.create_thread(name=f"🧵 {clean_title}", auto_archive_duration=1440)
-                                await reply_target.reply(f"🧵 *Task execution exceeded 60s — migrating deliverable to {thread.mention}. `#zero-chat` remains free.*")
+                                await reply_target.reply(f"🧵 *Task execution exceeded {int(escalation_seconds)}s — migrating deliverable to {thread.mention}. `#zero-chat` remains free.*")
                                 status_msg = None
                                 delivery_target = thread
                                 notify_root_channel = getattr(reply_target, "channel", None)
@@ -1617,9 +1710,9 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
             except Exception:
                 pass
 
-        if is_steering:
+        if channel_id in steering_channels:
             # Turn was aborted early by steering; status message will be updated by the steer turn
-            is_steering = False
+            steering_channels.discard(channel_id)
             for fpath in attachments:
                 try:
                     os.unlink(fpath)
@@ -1746,7 +1839,8 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
     sync_credentials()
 
     # Look for new artifacts generated during this turn
-    new_artifacts = find_new_artifacts(turn_start_time)
+    active_cid = get_channel_session_id(channel_id, mode) or conv_id
+    new_artifacts = find_new_artifacts(turn_start_time, conv_id=active_cid)
     artifact_files = []
     for art in new_artifacts:
         try:
@@ -1843,33 +1937,6 @@ async def execute_agy_turn(prompt: str, status_msg: discord.Message, reply_targe
                 await target_dest.send(content=footer, files=artifact_files)
         except Exception:
             pass
-
-    # Auto-refine thread title from deliverable markdown header (Stage 2 Auto-Healing)
-    target_thread = None
-    if isinstance(target_dest, discord.Thread):
-        target_thread = target_dest
-    elif isinstance(getattr(reply_target, "channel", None), discord.Thread):
-        target_thread = reply_target.channel
-    elif isinstance(reply_target, discord.Thread):
-        target_thread = reply_target
-
-    if target_thread and final_text:
-        try:
-            h_match = re.search(r"^[#]+\s*([^\n\r]+)", final_text, re.MULTILINE)
-            if h_match:
-                raw_h = h_match.group(1).strip()
-                clean_h = re.sub(r"^[^\w\s]+|\b\d+\.\s*", "", raw_h).strip()
-                clean_h = re.sub(r"[:*`_#~]", "", clean_h).strip()
-                if len(clean_h) >= 4 and not clean_h.lower().startswith(("task", "output", "step", "summary")):
-                    words = clean_h.split()
-                    if len(words) > 5:
-                        clean_h = " ".join(words[:4])
-                    new_thread_name = f"🧵 {clean_h[:50]}"
-                    if target_thread.name != new_thread_name and not target_thread.name.startswith(f"🧵 {clean_h[:15]}"):
-                        await target_thread.edit(name=new_thread_name)
-                        print(f"[Bridge] 🏷️ Auto-refined thread title: {new_thread_name}")
-        except Exception as re_err:
-            print(f"[Bridge] Warning auto-refining thread title: {re_err}")
 
     # Post root channel completion notification if escalated to thread
     if escalated_to_thread and notify_root_channel and thread_jump_url:
@@ -2120,7 +2187,7 @@ async def on_button_interaction(interaction: discord.Interaction):
 
 @bot.event
 async def on_message(msg: discord.Message):
-    global active_master_fd, reset_session, active_proc, is_steering
+    global active_master_fd, reset_session, active_proc, is_steering, is_ext_steering
 
     # Never reply to ourselves
     if bot.user and msg.author.id == bot.user.id:
@@ -2364,8 +2431,10 @@ async def on_message(msg: discord.Message):
 
     # Handle session reset commands
     if content.lower() in ("!reset", "/reset", "!new", "/new"):
-        reset_session = True
-        await msg.reply("🔄 Conversation session reset. Your next message will start a new session.")
+        sess_key = "home" if (msg.channel.id == TARGET_CHANNEL_ID) else str(msg.channel.id)
+        clear_channel_session_id(msg.channel.id, "home")
+        reset_session_keys.discard(sess_key)
+        await msg.reply("🔄 Conversation session reset for this channel/thread. Your next message will start a fresh session.")
         return
 
     if content.lower() in ("!reload", "/reload"):
@@ -2529,7 +2598,7 @@ async def on_message(msg: discord.Message):
     # Active Steering Check: If a turn is running in THIS specific channel/thread, steer it
     target_proc = channel_active_procs.get(msg.channel.id)
     if target_proc is not None and target_proc.returncode is None:
-        is_steering = True
+        steering_channels.add(msg.channel.id)
         try:
             target_proc.send_signal(signal.SIGINT)
         except Exception as se:

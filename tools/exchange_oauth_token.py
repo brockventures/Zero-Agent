@@ -7,6 +7,56 @@ import urllib.parse
 
 NAS_SECRETS_PATH = os.environ.get("NAS_OAUTH_SECRETS_PATH", "/docker/discord-agy-agent/secrets/google_oauth.json")
 WORKSPACE_SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_PATH", "/secrets/google_oauth.json")
+if not os.path.exists(WORKSPACE_SECRETS_PATH) and os.path.exists("/workspace/config/google_oauth.json"):
+    WORKSPACE_SECRETS_PATH = "/workspace/config/google_oauth.json"
+
+def _resolve_nas_config():
+    ssh_port = os.environ.get("NAS_SSH_PORT", "22")
+    host_1 = os.environ.get("NAS_HOST_1_IP")
+    host_2 = os.environ.get("NAS_HOST_2_IP")
+
+    if not host_1 and os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json") as f:
+                d = json.load(f)
+                if d.get("NAS_HOST_1_IP"):
+                    host_1 = d["NAS_HOST_1_IP"]
+                elif d.get("HA_BASE_URL"):
+                    host_1 = urllib.parse.urlparse(d["HA_BASE_URL"]).hostname
+        except Exception:
+            pass
+
+    if not host_2 and os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json") as f:
+                d = json.load(f)
+                if d.get("NAS_HOST_2_IP"):
+                    host_2 = d["NAS_HOST_2_IP"]
+        except Exception:
+            pass
+
+    if host_1 and not host_2:
+        parts = host_1.split(".")
+        if len(parts) == 4 and parts[-1] == "82":
+            host_2 = ".".join(parts[:3] + ["84"])
+
+    return host_1 or "127.0.0.1", host_2 or "127.0.0.1", ssh_port
+
+def parse_credentials(content: str) -> dict:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        creds = {}
+        for line in content.splitlines():
+            line = line.strip().rstrip(",")
+            if ":" in line:
+                k, v = line.split(":", 1)
+                creds[k.strip().strip("\"").strip("'")] = v.strip().strip("\"").strip("'")
+        return creds
+
+def load_credentials(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return parse_credentials(f.read())
 
 def exchange(raw_input: str):
     raw_input = raw_input.strip()
@@ -20,26 +70,18 @@ def exchange(raw_input: str):
     else:
         code = raw_input
 
+    ssh_key = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
+    ssh_user = os.environ.get("NAS_SSH_USER", "Brock")
+    _, host_2, ssh_port = _resolve_nas_config()
+
     # Read client credentials
     if os.path.exists(WORKSPACE_SECRETS_PATH):
-        with open(WORKSPACE_SECRETS_PATH) as f:
-            creds = json.load(f)
+        creds = load_credentials(WORKSPACE_SECRETS_PATH)
     else:
         import subprocess
-        ssh_key = os.environ.get("NAS_SSH_KEY", "/root/.ssh/id_ed25519")
-        ssh_port = os.environ.get("NAS_SSH_PORT", "22")
-        ssh_user = os.environ.get("NAS_SSH_USER", "Brock")
-        host_2 = os.environ.get("NAS_HOST_2_IP", "127.0.0.1")
-
         cmd = f'ssh -i {ssh_key} -p {ssh_port} -o BatchMode=yes -o StrictHostKeyChecking=no {ssh_user}@{host_2} "cat {NAS_SECRETS_PATH}"'
         res = subprocess.check_output(cmd, shell=True).decode()
-        try:
-            creds = json.loads(res)
-        except Exception:
-            import re
-            client_id = re.search(r'client_id[:\s]+([^\s,]+)', res).group(1).strip('"\'')
-            client_secret = re.search(r'client_secret[:\s]+([^\s,]+)', res).group(1).strip('"\'')
-            creds = {"client_id": client_id, "client_secret": client_secret}
+        creds = parse_credentials(res)
 
     data = urllib.parse.urlencode({
         "client_id": creds["client_id"],

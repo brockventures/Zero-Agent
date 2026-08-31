@@ -96,10 +96,41 @@ def perform_upgrade(target_version: str = None):
 
         # Update Dockerfile on host for immutability
         try:
-            ssh_key = os.environ.get("NAS_SSH_KEY", "/root/.ssh/id_ed25519")
-            ssh_port = os.environ.get("NAS_SSH_PORT", "22")
+            def _resolve_nas_config():
+                ssh_port = os.environ.get("NAS_SSH_PORT", "22")
+                host_1 = os.environ.get("NAS_HOST_1_IP")
+                host_2 = os.environ.get("NAS_HOST_2_IP")
+
+                if not host_1 and os.path.exists("/secrets/env.json"):
+                    try:
+                        with open("/secrets/env.json") as f:
+                            d = json.load(f)
+                            if d.get("NAS_HOST_1_IP"):
+                                host_1 = d["NAS_HOST_1_IP"]
+                            elif d.get("HA_BASE_URL"):
+                                host_1 = urllib.parse.urlparse(d["HA_BASE_URL"]).hostname
+                    except Exception:
+                        pass
+
+                if not host_2 and os.path.exists("/secrets/env.json"):
+                    try:
+                        with open("/secrets/env.json") as f:
+                            d = json.load(f)
+                            if d.get("NAS_HOST_2_IP"):
+                                host_2 = d["NAS_HOST_2_IP"]
+                    except Exception:
+                        pass
+
+                if host_1 and not host_2:
+                    parts = host_1.split(".")
+                    if len(parts) == 4 and parts[-1] == "82":
+                        host_2 = ".".join(parts[:3] + ["84"])
+
+                return host_1 or "127.0.0.1", host_2 or "127.0.0.1", ssh_port
+
+            _, host_2, ssh_port = _resolve_nas_config()
+            ssh_key = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
             ssh_user = os.environ.get("NAS_SSH_USER", "Brock")
-            host_2 = os.environ.get("NAS_HOST_2_IP", "127.0.0.1")
             host_agent_dir = os.environ.get("HOST_AGENT_DIR", "/docker/discord-agy-agent")
 
             update_dockerfile_cmd = [

@@ -15,7 +15,9 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from mcp.server.mcpserver import MCPServer
 
-SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_CREDENTIALS", "/secrets/google_oauth.json")
+SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_PATH", os.environ.get("GOOGLE_OAUTH_CREDENTIALS", "/secrets/google_oauth.json"))
+if not os.path.exists(SECRETS_PATH) and os.path.exists("/workspace/config/google_oauth.json"):
+    SECRETS_PATH = "/workspace/config/google_oauth.json"
 ACCOUNT = os.environ.get("GOOGLE_ACCOUNT", "user@example.com")
 PT = ZoneInfo("America/Los_Angeles")
 TIMEOUT = 30
@@ -28,6 +30,20 @@ _token_expiry = 0
 
 server = MCPServer("google-workspace")
 
+def load_credentials(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        creds = {}
+        for line in content.splitlines():
+            line = line.strip().rstrip(",")
+            if ":" in line:
+                k, v = line.split(":", 1)
+                creds[k.strip().strip("\"").strip("'")] = v.strip().strip("\"").strip("'")
+        return creds
+
 def _get_access_token() -> str:
     global _cached_token, _token_expiry
     now = time.time()
@@ -37,8 +53,7 @@ def _get_access_token() -> str:
     if not os.path.exists(SECRETS_PATH):
         raise FileNotFoundError(f"OAuth credentials not found at {SECRETS_PATH}")
 
-    with open(SECRETS_PATH) as f:
-        creds = json.load(f)
+    creds = load_credentials(SECRETS_PATH)
 
     data = urllib.parse.urlencode({
         "client_id": creds["client_id"],
