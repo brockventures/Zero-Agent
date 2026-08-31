@@ -177,4 +177,15 @@ def ha_call_service(domain: str, service: str, entity_id: str = "", data_json: s
         return json.dumps({"ok": False, "error": str(e)})
 
 if __name__ == "__main__":
-    server.run(transport="stdio")
+    import sys
+    port = 8766
+    for arg in sys.argv[1:]:
+        if arg.startswith("--port="):
+            port = int(arg.split("=")[1])
+        elif arg == "--port" and sys.argv.index(arg) + 1 < len(sys.argv):
+            port = int(sys.argv[sys.argv.index(arg) + 1])
+    if "--sse" in sys.argv:
+        server.run(transport="sse", host="127.0.0.1", port=port)
+    else:
+        server.run(transport="stdio")
+
