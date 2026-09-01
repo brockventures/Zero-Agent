@@ -725,7 +725,7 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str]:
                 report.append(f"  `{s[:120]}`")
             report.append("")
 
-    return False, "\n".join(report)
+    return True, "\n".join(report), {"tier1_count": len(tier1_flagged), "tier2_count": len(tier2_flagged)}
 
 # --------------------------------------------------------------------------
 # 4. Plex Transcode Session Cleanup
