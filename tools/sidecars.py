@@ -347,14 +347,20 @@ def get_sidecar_health_summary(since_hours: float = 24.0) -> dict:
         except Exception:
             latest_map = {}
 
+    active_failures = [
+        entry for entry in latest_map.values()
+        if entry.get("status") in ("warning", "error")
+    ]
+
     return {
         "total_runs": total,
         "ok_count": ok_count,
         "warning_count": warn_count,
         "error_count": err_count,
         "failures": failures,
+        "active_failures": active_failures,
         "latest_by_job": latest_map,
-        "all_healthy": total > 0 and len(failures) == 0
+        "all_healthy": len(active_failures) == 0
     }
 
 def format_sidecar_status_summary() -> str:
@@ -539,16 +545,17 @@ def run_nightly_triage() -> str:
     if not inbox_lines:
         inbox_lines.append("- *(Inbox clean / zero priority unread items)*")
 
-    # 3. Scheduled Sidecar Job Failure Check (Automated Surfacing)
+    # 3. Scheduled Sidecar Job Failure Check (Automated Surfacing of Active Unresolved Issues)
     health = get_sidecar_health_summary(since_hours=24.0)
     failure_lines = []
-    if health["failures"]:
-        for f in health["failures"]:
+    active_failures = health.get("active_failures", [])
+    if active_failures:
+        for f in active_failures:
             icon = "❌" if f.get("status") == "error" else "⚠️"
             sum_snip = f.get("summary", "").splitlines()[0] if f.get("summary") else "Degraded or errored run"
             if len(sum_snip) > 80:
                 sum_snip = sum_snip[:77] + "..."
-            failure_lines.append(f"- {icon} **{f.get('name')}** (*{f.get('timestamp_pt', 'last 24h')}*): `{sum_snip}`")
+            failure_lines.append(f"- {icon} **{f.get('name')}** (*{f.get('timestamp_pt', 'recent')}*): `{sum_snip}`")
 
     # 4. Infra & Homelab Posture
     infra_ok, _ = run_heartbeat_sweep()
@@ -564,14 +571,13 @@ def run_nightly_triage() -> str:
     bb_res = _ssh_cmd(HOST_2_IP, "cat /docker/baseball/shiny_app/data/last_refresh.txt 2>/dev/null || echo 'unavailable'")
     bb_ts = bb_res.stdout.strip() if bb_res.returncode == 0 and bb_res.stdout.strip() else "unavailable"
 
-    # Sidecar summary line
-    if health["total_runs"] > 0:
-        if health["all_healthy"]:
-            sidecar_note = f"All {health['total_runs']} scheduled runs succeeded in last 24h. ✅"
-        else:
-            sidecar_note = f"⚠️ {health['ok_count']}/{health['total_runs']} runs passed ({len(health['failures'])} flagged/failed in last 24h)"
+    # Sidecar summary line based on active registered jobs
+    total_jobs = len(health.get("latest_by_job", {}))
+    failing_count = len(active_failures)
+    if failing_count == 0:
+        sidecar_note = f"All {total_jobs} registered sidecars operational & healthy. ✅" if total_jobs > 0 else "All scheduled sidecars healthy. ✅"
     else:
-        sidecar_note = "No runs logged in last 24h."
+        sidecar_note = f"⚠️ {total_jobs - failing_count}/{total_jobs} sidecars operational ({failing_count} currently degraded/failing)"
 
     date_header = tomorrow_pt.strftime("%A, %B %-d")
     report = [
@@ -594,7 +600,7 @@ def run_nightly_triage() -> str:
     if failure_lines:
         report.extend([
             "",
-            "### ⚠️ Scheduled Job Warnings & Failures (Last 24h)",
+            "### ⚠️ Active Sidecar Warnings & Failures",
             *failure_lines
         ])
 
