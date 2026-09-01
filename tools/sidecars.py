@@ -568,7 +568,8 @@ def run_nightly_triage() -> str:
     bs2_up = sum(1 for line in (bs2_res.get("output") or "").splitlines() if "\t" in line and "Up" in line)
 
     # Baseball pipeline refresh timestamp
-    bb_res = _ssh_cmd(HOST_2_IP, "cat /docker/baseball/shiny_app/data/last_refresh.txt 2>/dev/null || echo 'unavailable'")
+    bb_path = os.environ.get("BASEBALL_REFRESH_PATH", "/docker/baseball/shiny_app/data/last_refresh.txt")
+    bb_res = _ssh_cmd(HOST_2_IP, f"cat {bb_path} 2>/dev/null || echo 'unavailable'")
     bb_ts = bb_res.stdout.strip() if bb_res.returncode == 0 and bb_res.stdout.strip() else "unavailable"
 
     # Sidecar summary line based on active registered jobs
