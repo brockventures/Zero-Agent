@@ -64,24 +64,15 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
     tab_sheet_id = first_sheet["properties"]["sheetId"]
     tab_title = first_sheet["properties"]["title"]
 
-    # 3. Clear existing values and update with formatted CSV data
-    escaped_clear_range = urllib.parse.quote(f"{tab_title}!A1:Z500")
-    clear_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{escaped_clear_range}:clear"
-    clear_req = urllib.request.Request(clear_url, data=b"{}", headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(clear_req) as resp:
-            pass
-    except Exception:
-        pass
-
-    escaped_update_range = urllib.parse.quote(f"{tab_title}!A1")
+    # 3. Update values within the exact range without wiping outside columns
+    escaped_update_range = urllib.parse.quote(f"{tab_title}!A1:I{num_rows}")
     update_vals_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{escaped_update_range}?valueInputOption=USER_ENTERED"
     vals_body = json.dumps({"values": csv_rows}).encode("utf-8")
     u_req = urllib.request.Request(update_vals_url, data=vals_body, headers=headers, method="PUT")
     with urllib.request.urlopen(u_req) as resp:
         pass
 
-    # 4. Construct batchUpdate requests for professional formatting
+    # 4. Construct batchUpdate requests for formatting
     requests = []
 
     # Update Spreadsheet tab properties (freeze header row + first column)
@@ -89,7 +80,7 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
         "updateSheetProperties": {
             "properties": {
                 "sheetId": tab_sheet_id,
-                "title": "Friends & Family Master",
+                "title": tab_title,
                 "gridProperties": {
                     "frozenRowCount": 1,
                     "frozenColumnCount": 1,
@@ -204,7 +195,7 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
         }
     })
 
-    # Col 1: Circle / Group (Center)
+    # Col 1: Core (Center)
     requests.append({
         "repeatCell": {
             "range": {
@@ -223,7 +214,7 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
         }
     })
 
-    # Col 2: Relationship (Left)
+    # Col 2: Out of Town (Center)
     requests.append({
         "repeatCell": {
             "range": {
@@ -235,7 +226,7 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
             },
             "cell": {
                 "userEnteredFormat": {
-                    "horizontalAlignment": "LEFT"
+                    "horizontalAlignment": "CENTER"
                 }
             },
             "fields": "userEnteredFormat.horizontalAlignment"
@@ -261,7 +252,7 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
         }
     })
 
-    # Col 4: Phone (Center)
+    # Col 4: Last Seen (Center, Date Format)
     requests.append({
         "repeatCell": {
             "range": {
@@ -273,14 +264,18 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
             },
             "cell": {
                 "userEnteredFormat": {
-                    "horizontalAlignment": "CENTER"
+                    "horizontalAlignment": "CENTER",
+                    "numberFormat": {
+                        "type": "DATE",
+                        "pattern": "yyyy-mm-dd"
+                    }
                 }
             },
-            "fields": "userEnteredFormat.horizontalAlignment"
+            "fields": "userEnteredFormat(horizontalAlignment,numberFormat)"
         }
     })
 
-    # Col 5: Email (Left)
+    # Col 5: Phone (Center)
     requests.append({
         "repeatCell": {
             "range": {
@@ -292,14 +287,14 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
             },
             "cell": {
                 "userEnteredFormat": {
-                    "horizontalAlignment": "LEFT"
+                    "horizontalAlignment": "CENTER"
                 }
             },
             "fields": "userEnteredFormat.horizontalAlignment"
         }
     })
 
-    # Col 6: Physical Address (Left, Wrap)
+    # Col 6: Email (Left)
     requests.append({
         "repeatCell": {
             "range": {
@@ -311,15 +306,14 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
             },
             "cell": {
                 "userEnteredFormat": {
-                    "horizontalAlignment": "LEFT",
-                    "wrapStrategy": "WRAP"
+                    "horizontalAlignment": "LEFT"
                 }
             },
-            "fields": "userEnteredFormat(horizontalAlignment,wrapStrategy)"
+            "fields": "userEnteredFormat.horizontalAlignment"
         }
     })
 
-    # Col 7: Screen Names / Handles (Left)
+    # Col 7: Physical Address (Left, Wrap)
     requests.append({
         "repeatCell": {
             "range": {
@@ -331,10 +325,11 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
             },
             "cell": {
                 "userEnteredFormat": {
-                    "horizontalAlignment": "LEFT"
+                    "horizontalAlignment": "LEFT",
+                    "wrapStrategy": "WRAP"
                 }
             },
-            "fields": "userEnteredFormat.horizontalAlignment"
+            "fields": "userEnteredFormat(horizontalAlignment,wrapStrategy)"
         }
     })
 
@@ -361,14 +356,14 @@ def push_to_google_sheets(sheet_id=DEFAULT_SHEET_ID):
     # Set Column Widths
     col_widths = [
         (0, 1, 200),  # Name
-        (1, 2, 170),  # Circle / Group
-        (2, 3, 170),  # Relationship
-        (3, 4, 110),  # Birthday
-        (4, 5, 140),  # Phone Number
-        (5, 6, 230),  # Email Address
-        (6, 7, 300),  # Physical Address
-        (7, 8, 180),  # Screen Names / Handles
-        (8, 9, 400),  # Notes & Connections
+        (1, 2, 80),   # Core
+        (2, 3, 110),  # Out of Town
+        (3, 4, 100),  # Birthday
+        (4, 5, 110),  # Last Seen
+        (5, 6, 140),  # Phone Number
+        (6, 7, 230),  # Email Address
+        (7, 8, 300),  # Physical Address
+        (8, 9, 380),  # Notes & Connections
     ]
     for start_c, end_c, px in col_widths:
         requests.append({

@@ -56,10 +56,12 @@ def _resolve_nas_config():
     host_1 = os.environ.get("NAS_HOST_1_IP")
     host_2 = os.environ.get("NAS_HOST_2_IP")
 
-    if not host_1 and os.path.exists("/secrets/env.json"):
+    if os.path.exists("/secrets/env.json"):
         try:
             with open("/secrets/env.json") as f:
                 d = json.load(f)
+                if d.get("NAS_SSH_PORT"):
+                    ssh_port = str(d["NAS_SSH_PORT"])
                 if d.get("NAS_HOST_1_IP"):
                     host_1 = d["NAS_HOST_1_IP"]
                 elif d.get("HA_BASE_URL"):
@@ -109,11 +111,12 @@ SERVERBROCK_STOPPED_ALLOWLIST = {
     "baseball_shiny_app", "baseball_shiny_pro", "baseball_shiny_dev", "baseball-scraper-1"
 }
 
-BROCKSERVER2_EXPECTED_CONTAINERS = {
+SERVERBROCK2_EXPECTED_CONTAINERS = {
     "baseball_db", "baseball_shiny_app", "baseball_shiny_pro",
     "baseball_shiny_dev", "baseball-scraper-1", "dockhand",
     "dozzle-agent", "discord-antigravity-agent"
 }
+BROCKSERVER2_EXPECTED_CONTAINERS = SERVERBROCK2_EXPECTED_CONTAINERS
 
 REMINDER_SKIP_SENDER_PATTERNS = (
     "user@example.com", "work@example.com", "kings swim",
@@ -418,7 +421,7 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
         failures.append(f"Host2 ({HOST_2_IP}) Docker unreachable: {bs2_res.get('error')}")
     else:
         running = {line.split("\t")[0].strip() for line in bs2_res.get("output", "").splitlines() if "\t" in line and "Up" in line}
-        missing = BROCKSERVER2_EXPECTED_CONTAINERS - running
+        missing = SERVERBROCK2_EXPECTED_CONTAINERS - running
         if missing:
             failures.append(f"Host2 ({HOST_2_IP}) missing expected containers: {sorted(missing)}")
 
@@ -517,10 +520,7 @@ def run_nightly_triage() -> str:
                 continue
 
             sender_clean = re.sub(r"<.*?>", "", sender).strip() or sender
-            snip_display = snippet
-            if len(snip_display) > 85:
-                snip_display = snip_display[:82] + "..."
-            inbox_lines.append(f"- **{sender_clean}**: *\"{subj}\"*\n  -# {snip_display}")
+            inbox_lines.append(f"- **{sender_clean}**: *\"{subj}\"*")
 
             # Intelligent Calendar Proposal Detection
             if "redwood barber" in s_low or "appointment is reserved" in sub_low:
@@ -613,14 +613,54 @@ def run_nightly_triage() -> str:
 # --------------------------------------------------------------------------
 def run_nas_log_review(since: str = "24h") -> tuple[bool, str]:
     now_pt = datetime.now(PT).strftime("%A %b %d %Y, %I:%M %p PT")
-    flagged = []
+    tier1_flagged = []
+    tier2_flagged = []
     scanned = 0
 
     # Noise filter regex
     noise_re = re.compile(
-        r"(libusb_init failed|TaskCanceledException|TVDb convert warning|OpenSubtitles|forecast_solar|Matter Node 2|connection reset by peer|socket\.timeout|\[EnvUpdateCheck\]|DNSSD packet parsing)",
+        r"("
+        r"libusb_init failed|"
+        r"TaskCanceledException|"
+        r"TVDb convert warning|"
+        r"OpenSubtitles|"
+        r"forecast_solar|"
+        r"Matter Node 2|"
+        r"connection reset by peer|"
+        r"socket\.timeout|"
+        r"\[EnvUpdateCheck\]|"
+        r"DNSSD packet parsing|"
+        r"\"error\":\s*0|"
+        r"\"error\":0|"
+        r"images.*\/error\/|"
+        r"Failed to load resource.*status of 503|"
+        r"Transient Google auth\/eligibility error|"
+        r"Warmed channel history|"
+        r"Generated new chapter thumbnails|"
+        r"closing transport|"
+        r"TimeoutNegativeWarning|"
+        r"\[Nest\] API observe: error|"
+        r"unsupported method: GET|"
+        r"UptimeRobot|"
+        r"Dozzle-Agent|"
+        r"upstream timed out|"
+        r"<httpProxy>|"
+        r"credentialedProxyHandler|"
+        r"connect EHOSTUNREACH|"
+        r"Error calling http:\/\/192\.168\.1\.218|"
+        r"octoprint.*192\.168\.1\.218|"
+        r"android_ip_webcam.*192\.168\.1\.164"
+        r")",
         re.IGNORECASE
     )
+
+    # Tier 1 keywords: Hard crashes, segfaults, OOM, syntax/unhandled exceptions, database locks, subprocess errors
+    tier1_re = re.compile(
+        r"(panic|fatal|segfault|oom|killed|database is locked|unhandled exception|syntaxerror|calledprocesserror|traceback|pydantic\.dev|literal_error|critical|nullpointerexception|uncaught)",
+        re.IGNORECASE
+    )
+
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
     for host, label in [(HOST_1_IP, f"Host1 ({HOST_1_IP})"), (HOST_2_IP, f"Host2 ({HOST_2_IP})")]:
         ps_res = json.loads(nas_docker("ps", host))
@@ -640,27 +680,51 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str]:
                     res = _ssh_cmd(host, cmd, timeout=20)
                     out = res.stdout.strip()
                     if out:
-                        # Apply noise filtering
-                        real_errors = [l for l in out.splitlines() if not noise_re.search(l)]
+                        # Apply noise filtering with ANSI escape stripping
+                        real_errors = []
+                        for l in out.splitlines():
+                            clean_l = ansi_escape.sub('', l).strip()
+                            if clean_l and not noise_re.search(clean_l):
+                                real_errors.append(clean_l)
+
                         if real_errors:
-                            flagged.append({
+                            entry = {
                                 "host": label,
                                 "container": cname,
                                 "count": len(real_errors),
                                 "sample": real_errors[-3:]
-                            })
+                            }
+                            if any(tier1_re.search(l) for l in real_errors):
+                                tier1_flagged.append(entry)
+                            else:
+                                tier2_flagged.append(entry)
                 except Exception:
                     pass
 
-    if not flagged:
-        return True, f"🗄️ **NAS Log Review** — {now_pt}\nScanned the last {since} of logs for {scanned} running containers across `{HOST_1_IP}` and `{HOST_2_IP}` — no actionable errors or panics. ✅"
+    total_issues = len(tier1_flagged) + len(tier2_flagged)
+    if total_issues == 0:
+        return True, f"🗄️ **NAS Log Review** — {now_pt}\nScanned the last {since} of logs for {scanned} running containers across `{HOST_1_IP}` and `{HOST_2_IP}` — all systems healthy with zero actionable errors. ✅"
 
-    report = [f"🗄️ **NAS Log Review — Flagged Issues** [{now_pt}]", f"Scanned {scanned} containers; found issues in {len(flagged)}:\n"]
-    for f in flagged:
-        report.append(f"**{f['container']}** ({f['host']}) — {f['count']} error line(s):")
-        for s in f["sample"]:
-            report.append(f"  `{s[:120]}`")
-        report.append("")
+    report = [
+        f"🗄️ **NAS Log Review — Flagged Issues** [{now_pt}]",
+        f"Scanned {scanned} containers across Host1 (`{HOST_1_IP}`) and Host2 (`{HOST_2_IP}`). Found issues in {total_issues}:\n"
+    ]
+    if tier1_flagged:
+        report.append(f"🔴 **Tier 1: Actionable Failures** ({len(tier1_flagged)} container(s))")
+        for f in tier1_flagged:
+            report.append(f"* **{f['container']}** ({f['host']}) — {f['count']} error line(s):")
+            for s in f["sample"]:
+                report.append(f"  `{s[:120]}`")
+            report.append("")
+
+    if tier2_flagged:
+        report.append(f"🟡 **Tier 2: Flapping / Transient Degradations** ({len(tier2_flagged)} container(s))")
+        for f in tier2_flagged:
+            report.append(f"* **{f['container']}** ({f['host']}) — {f['count']} error line(s):")
+            for s in f["sample"]:
+                report.append(f"  `{s[:120]}`")
+            report.append("")
+
     return False, "\n".join(report)
 
 # --------------------------------------------------------------------------
@@ -910,6 +974,34 @@ def run_antigravity_check() -> tuple[bool, str]:
     except Exception as e:
         return False, f"⚠️ Antigravity CLI check failed: {e}"
 
+def run_birthday_reminders(date_str: str | None = None) -> tuple[bool, str]:
+    """Check for friend & family birthdays today and format interactive text reminder."""
+    try:
+        from tools.birthday_reminder import check_birthdays
+        has_bday, msg, _ = check_birthdays(date_str)
+        return has_bday, msg if has_bday else ""
+    except Exception as e:
+        return False, f"⚠️ Birthday reminder check failed: {e}"
+
+def run_social_last_seen_review(days: int = 7) -> tuple[bool, str]:
+    """Review past week of calendar & communications for social gatherings and proposed Last Seen updates."""
+    try:
+        from tools.social_last_seen_review import identify_social_updates, format_review_message
+        updates = identify_social_updates(days=days)
+        has_events, msg = format_review_message(updates)
+        return has_events, msg if has_events else ""
+    except Exception as e:
+        return False, f"⚠️ Social review check failed: {e}"
+
+def run_core_friends_reminder(weeks: int = 8, as_of_date: str | None = None) -> tuple[bool, str]:
+    """Monthly check for local Core friends not seen in >= 8 weeks."""
+    try:
+        from tools.core_friends_reminder import check_core_friends_unseen
+        has_friends, msg, _ = check_core_friends_unseen(weeks=weeks, as_of_date=as_of_date)
+        return has_friends, msg if has_friends else ""
+    except Exception as e:
+        return False, f"⚠️ Core friends reminder check failed: {e}"
+
 # --------------------------------------------------------------------------
 # CLI Dispatcher
 # --------------------------------------------------------------------------
@@ -931,6 +1023,21 @@ if __name__ == "__main__":
     elif action == "reminders":
         ok, rep, _ = run_sidecar_job("reminders", "Dated Reminders", run_dated_reminders)
         print(rep or "(no reminders due today)")
+    elif action == "birthdays":
+        date_arg = sys.argv[2] if len(sys.argv) > 2 else None
+        ok, rep, _ = run_sidecar_job("daily_birthday_reminder", "Daily Birthday Reminder", run_birthday_reminders, date_str=date_arg)
+        if rep:
+            print(rep)
+    elif action == "social_review":
+        days_arg = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 7
+        ok, rep, _ = run_sidecar_job("weekly_social_review", "Weekly Social & Last Seen Review", run_social_last_seen_review, days=days_arg)
+        if rep:
+            print(rep)
+    elif action in ("core_friends", "core_reconnect"):
+        weeks_arg = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 8
+        ok, rep, _ = run_sidecar_job("monthly_core_friends_reminder", "Monthly Core Friends Social Reminder", run_core_friends_reminder, weeks=weeks_arg)
+        if rep:
+            print(rep)
     elif action == "ev9":
         force = "--force" in sys.argv or "-f" in sys.argv
         ok, rep, plot = run_sidecar_job("ev9", "EV9 Listing Monitor", run_ev9_monitor, force_digest=force)

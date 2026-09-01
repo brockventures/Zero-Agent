@@ -3,13 +3,13 @@ import sys, json, time, urllib.request, requests
 
 import os
 
-HOST_1_IP = os.environ.get("NAS_HOST_1_IP", "127.0.0.1")
-TAUTULLI_API_URL = os.environ.get("TAUTULLI_URL", f"http://{HOST_1_IP}:8181/api/v2")
+import urllib.parse
 
 API_KEY = os.environ.get("TAUTULLI_API_KEY", "")
 WEBHOOK_URL = os.environ.get("DISCORD_PLEX_WEBHOOK_URL", "")
+HOST_1_IP = os.environ.get("NAS_HOST_1_IP", "")
 
-if (not API_KEY or not WEBHOOK_URL) and os.path.exists("/secrets/env.json"):
+if os.path.exists("/secrets/env.json"):
     try:
         with open("/secrets/env.json") as f:
             _env_data = json.load(f)
@@ -17,8 +17,25 @@ if (not API_KEY or not WEBHOOK_URL) and os.path.exists("/secrets/env.json"):
                 API_KEY = _env_data.get("TAUTULLI_API_KEY", "")
             if not WEBHOOK_URL:
                 WEBHOOK_URL = _env_data.get("DISCORD_PLEX_WEBHOOK_URL", "")
+            if not HOST_1_IP:
+                if _env_data.get("NAS_HOST_1_IP"):
+                    HOST_1_IP = _env_data["NAS_HOST_1_IP"]
+                elif _env_data.get("HA_BASE_URL"):
+                    HOST_1_IP = urllib.parse.urlparse(_env_data["HA_BASE_URL"]).hostname
     except Exception:
         pass
+
+if not HOST_1_IP and os.path.exists("/secrets/ha.json"):
+    try:
+        with open("/secrets/ha.json") as f:
+            _ha_data = json.load(f)
+            if _ha_data.get("url"):
+                HOST_1_IP = urllib.parse.urlparse(_ha_data["url"]).hostname
+    except Exception:
+        pass
+
+HOST_1_IP = HOST_1_IP or "127.0.0.1"
+TAUTULLI_API_URL = os.environ.get("TAUTULLI_URL", f"http://{HOST_1_IP}:8181/api/v2")
 
 def generate_digest(days: int = 7, tag_all: bool = False) -> str:
     url = f"{TAUTULLI_API_URL}?apikey={API_KEY}&cmd=get_recently_added&count=100"

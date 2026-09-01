@@ -42,7 +42,7 @@ if not HOST_1_IP and os.path.exists("/secrets/ha.json"):
 
 HOST_1_IP = HOST_1_IP or "127.0.0.1"
 URL = os.environ.get("TAUTULLI_URL", f"http://{HOST_1_IP}:8181/api/v2")
-TIMEOUT = 10
+TIMEOUT = 25
 
 CMDS = {"get_activity", "get_history", "get_users", "get_user_player_stats",
         "server_status"}
@@ -64,11 +64,18 @@ def tautulli(cmd: str, user: str = "", length: int = 10) -> dict:
     if user:
         params["user"] = user
 
-    try:
-        r = requests.get(URL, params=params, timeout=TIMEOUT)
-        if r.status_code != 200:
-            return {"ok": False, "status": r.status_code, "error": r.text[:300]}
-        data = r.json()
-        return {"ok": True, "data": data.get("response", {}).get("data", {})}
-    except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": repr(e)}
+    last_err = ""
+    for attempt in range(2):
+        try:
+            r = requests.get(URL, params=params, timeout=TIMEOUT)
+            if r.status_code != 200:
+                return {"ok": False, "status": r.status_code, "error": r.text[:300]}
+            data = r.json()
+            return {"ok": True, "data": data.get("response", {}).get("data", {})}
+        except Exception as e:  # noqa: BLE001
+            last_err = repr(e)
+            if attempt == 0:
+                import time
+                time.sleep(1)
+
+    return {"ok": False, "error": last_err}

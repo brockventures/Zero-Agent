@@ -15,10 +15,12 @@ def _resolve_nas_config():
     host_1 = os.environ.get("NAS_HOST_1_IP")
     host_2 = os.environ.get("NAS_HOST_2_IP")
 
-    if not host_1 and os.path.exists("/secrets/env.json"):
+    if os.path.exists("/secrets/env.json"):
         try:
             with open("/secrets/env.json") as f:
                 d = json.load(f)
+                if d.get("NAS_SSH_PORT"):
+                    ssh_port = str(d["NAS_SSH_PORT"])
                 if d.get("NAS_HOST_1_IP"):
                     host_1 = d["NAS_HOST_1_IP"]
                 elif d.get("HA_BASE_URL"):
@@ -100,10 +102,18 @@ def exchange(raw_input: str):
             if new_refresh:
                 creds["refresh_token"] = new_refresh
             
-            # Save to /secrets/ or configured path
-            os.makedirs(os.path.dirname(WORKSPACE_SECRETS_PATH), exist_ok=True)
-            with open(WORKSPACE_SECRETS_PATH, "w") as f:
-                json.dump(creds, f, indent=2)
+            # Save to /workspace/config/google_oauth.json and try WORKSPACE_SECRETS_PATH
+            local_configs = ["/workspace/config/google_oauth.json"]
+            if WORKSPACE_SECRETS_PATH not in local_configs:
+                local_configs.append(WORKSPACE_SECRETS_PATH)
+            for p in local_configs:
+                try:
+                    os.makedirs(os.path.dirname(p), exist_ok=True)
+                    with open(p, "w") as f:
+                        json.dump(creds, f, indent=2)
+                    print(f"Saved token to {p}")
+                except Exception as se:
+                    print(f"Note: local {p} write failed: {se}")
             
             # Save to NAS host directly over SSH
             json_str = json.dumps(creds, indent=2)

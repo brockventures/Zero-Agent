@@ -165,6 +165,17 @@ def rebuild_indexes():
     uni_lines.extend(priv_lines[1:])
     MEMORY_INDEX.write_text("\n".join(uni_lines) + "\n", encoding="utf-8")
 
+    # Sync SQLite FTS5 Index
+    try:
+        if "/workspace" not in sys.path:
+            sys.path.insert(0, "/workspace")
+        from tools.transcript_index import TranscriptIndexer
+        indexer = TranscriptIndexer()
+        indexer.sync_all()
+        indexer.close()
+    except Exception as e:
+        log.warning(f"Failed to sync SQLite FTS5 index: {e}")
+
 def run_memory_doctor() -> tuple[bool, str]:
     """Audit both memory tiers for orphaned files, broken links, and security compliance."""
     if not MEMORY_DIR.exists():

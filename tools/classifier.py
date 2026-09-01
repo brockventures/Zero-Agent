@@ -1,11 +1,28 @@
-#!/usr/bin/env python0
+#!/usr/bin/env python3
 import subprocess
 import re
 import sys
 
+PEER_OR_OTHER_TAGS = [
+    r"<@1468012353206354197>",  # Amos
+    r"<@1492043459618537492>",  # Marvin
+    r"<@1210466877835313155>",  # Mike / Arbiter
+    r"<@453030589914939393>",   # Ian / Moon Problem
+    r"\b@?amos\b",
+    r"\b@?marvin\b",
+    r"\b@?arbiter\b",
+    r"\b@?ian\b"
+]
+ZERO_TAGS = [
+    r"<@1542285964213358633>",
+    r"<@!1542285964213358633>",
+    r"<@&1543462881624858624>",  # Team role
+    r"\b@?zero\b"
+]
+
 CLASSIFY_PROMPT = '''Analyze this inbound message in a shared multi-agent engineering channel with Zero (systems engineer, SWE, Linux, Docker, Python), Amos, and Marvin.
 Rules:
-1. If the message is explicitly addressed to someone else (e.g. '@Amos', 'Marvin:', 'Ryan:'), relevance to Zero MUST be 0.0.
+1. If the message is explicitly addressed to someone else (e.g. '@Amos', 'Marvin:', 'Ryan:', '@Ian'), relevance to Zero MUST be 0.0.
 2. If it is trivial casual chatter, greetings, or off-topic, relevance MUST be 0.0.
 3. If it is an unaddressed engineering problem, technical discussion, or systems question where Zero's input would be genuinely valuable, score between 0.70 and 1.0.
 4. Output ONLY a single float number between 0.0 and 1.0 (e.g. 0.0 or 0.85).
@@ -21,7 +38,12 @@ def score_relevance(content: str, author: str = "user") -> float:
     if len(words) < 4 and "?" not in content_clean and "```" not in content_clean:
         return 0.0
 
-    # if directed to Amos or Marvin explicitly, drop immediately
+    # If directed to peer or other human explicitly and does not include Zero or team role, drop immediately
+    has_other_target = any(re.search(p, content_clean, re.I) for p in PEER_OR_OTHER_TAGS)
+    has_zero_target = any(re.search(p, content_clean, re.I) for p in ZERO_TAGS)
+    if has_other_target and not has_zero_target:
+        return 0.0
+
     if re.search(r"^(hey\s+)?@(amos|marvin)\b", content_clean, re.I) or re.search(r"^(amos|marvin):", content_clean, re.I):
         return 0.0
 
