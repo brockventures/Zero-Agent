@@ -61,6 +61,8 @@ def extract_recent_dialogue(conv_id: str | None = None, sess_key: str | None = N
                     d = json.loads(line)
                     ttype = d.get("type")
                     if ttype in ("USER_INPUT", "PLANNER_RESPONSE"):
+                        if ttype == "PLANNER_RESPONSE" and d.get("tool_calls"):
+                            continue
                         cnt = (d.get("content") or "").strip()
                         cnt = re.sub(r"</?[A-Z_]+>", "", cnt).strip()
                         cnt = re.sub(r"\[CHOICES:[^\]]+\]", "", cnt).strip()

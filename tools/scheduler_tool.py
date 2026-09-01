@@ -126,6 +126,40 @@ DEFAULT_JOBS = [
         "minute_pt": 35,
         "prompt": "Run the promotional email marketing sweep using /workspace/tools/sidecars.py marketing.",
         "catchup_if_missed": False
+    },
+    {
+        "id": "daily_birthday_reminder",
+        "name": "Daily Birthday Reminder",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 7,
+        "minute_pt": 0,
+        "prompt": "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py --quiet. If someone has a birthday today, post the reminder with the interactive text button.",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 14400
+    },
+    {
+        "id": "weekly_social_last_seen_review",
+        "name": "Weekly Social & Last Seen Review",
+        "enabled": True,
+        "schedule_type": "weekly",
+        "day_of_week": 6,  # Sunday
+        "hour_pt": 20,
+        "minute_pt": 30,
+        "prompt": "Review the past week's social events, calendar, and text messages using /workspace/tools/social_last_seen_review.py --quiet. Post only if qualifying social events or interactions are identified, and ask for confirmation before updating Last Seen.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "monthly_core_friends_reconnect",
+        "name": "Monthly Core Friends Social Planning Reminder",
+        "enabled": True,
+        "schedule_type": "monthly",
+        "day_of_month": 1,
+        "hour_pt": 9,
+        "minute_pt": 0,
+        "prompt": "Check for local Core friends we have not seen in at least 8 weeks using /workspace/tools/core_friends_reminder.py --quiet. Post the reminder to help plan social gatherings.",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 86400
     }
 ]
 
@@ -157,6 +191,21 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
         target = now_pt.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=days_ahead)
         if target <= now_pt:
             target += timedelta(days=7)
+        return target.timestamp()
+
+    elif stype == "monthly":
+        dom = job.get("day_of_month", 1)
+        h = job.get("hour_pt", 9)
+        m = job.get("minute_pt", 0)
+        try:
+            target = now_pt.replace(day=dom, hour=h, minute=m, second=0, microsecond=0)
+        except ValueError:
+            target = now_pt.replace(day=1, hour=h, minute=m, second=0, microsecond=0)
+        if target <= now_pt:
+            # Advance to 1st of next month
+            new_year = now_pt.year + (1 if now_pt.month == 12 else 0)
+            new_month = 1 if now_pt.month == 12 else now_pt.month + 1
+            target = target.replace(year=new_year, month=new_month, day=dom)
         return target.timestamp()
 
     elif stype == "one_shot":

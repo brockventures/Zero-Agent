@@ -6,10 +6,12 @@ def _resolve_nas_config():
     host_1 = os.environ.get("NAS_HOST_1_IP")
     host_2 = os.environ.get("NAS_HOST_2_IP")
 
-    if not host_1 and os.path.exists("/secrets/env.json"):
+    if os.path.exists("/secrets/env.json"):
         try:
             with open("/secrets/env.json") as f:
                 d = json.load(f)
+                if d.get("NAS_SSH_PORT"):
+                    ssh_port = str(d["NAS_SSH_PORT"])
                 if d.get("NAS_HOST_1_IP"):
                     host_1 = d["NAS_HOST_1_IP"]
                 elif d.get("HA_BASE_URL"):

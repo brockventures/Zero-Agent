@@ -72,6 +72,30 @@ def queue_outbox_message(channel: str, content: str, source_turn: str = "zero") 
 
     return msg_record
 
+def dispatch_proposal_notice(
+    subject: str,
+    agreed_with: str,
+    action_type: str,
+    details: str,
+    task_id: int | None = None
+) -> dict:
+    """
+    Format and queue an informational proposal/consensus notice to #zero-chat.
+    Ensures post-consensus decisions from Crab Cavern are visible to Ryan immediately.
+    """
+    is_shipped = action_type.lower() in ("shipped", "deployed", "completed", "live")
+    header = "📦 **Crab Cavern Deliverable Shipped**" if is_shipped else "📋 **Crab Cavern Engineering Commitment**"
+    task_line = f"\n• **Durable Task:** Task #{task_id}" if task_id else ""
+    msg = (
+        f"{header}\n"
+        f"• **Subject:** `{subject}`\n"
+        f"• **Collaborators:** {agreed_with}\n"
+        f"• **Status:** {action_type}{task_line}\n"
+        f"• **Summary:** {details}\n\n"
+        f"_Flagged for visibility. Let me know in `#zero-chat` if you want to steer or adjust._"
+    )
+    return queue_outbox_message("zero-chat", msg, source_turn="crab-cavern-consensus")
+
 def get_pending_messages() -> list[dict]:
     """Read all pending messages in outbox queue."""
     if not PENDING_FILE.exists():
