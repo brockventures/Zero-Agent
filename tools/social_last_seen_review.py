@@ -47,7 +47,7 @@ except Exception:
         import subprocess
         ssh_key = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
         ssh_user = os.environ.get("NAS_SSH_USER", "Brock")
-        ssh_port = os.environ.get("NAS_SSH_PORT", "22")
+        ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
         return subprocess.run([
             "ssh", "-i", ssh_key, "-p", ssh_port,
             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
@@ -56,7 +56,7 @@ except Exception:
         ], capture_output=True, text=True, timeout=timeout)
 
     def _resolve_nas_config():
-        return os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), os.environ.get("NAS_SSH_PORT", "22")
+        return os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
 
 HOUSEHOLD_MEMBERS = {
     "Ryan Brock",

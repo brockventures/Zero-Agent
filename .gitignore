@@ -75,6 +75,7 @@ schedule.json
 tasks.json
 reminders.json
 liveness_beacon.json
+tools/promote_memory.py
 
 # 6. Python Artifacts & Environments
 __pycache__/

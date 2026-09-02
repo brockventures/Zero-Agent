@@ -65,9 +65,12 @@ def claim(subject: str = "") -> dict:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         body = json.loads(e.read().decode()) if e.headers.get_content_type() == "application/json" else {}
-        if e.code == 409 and body.get("code") == "blocked":
-            raise BananaBlockedError(body.get("holder", "unknown"), body.get("state", {}))
-        raise BananaError(f"HTTP {e.code}: {body.get('error') or body.get('code') or e.reason}")
+        err = body.get("error") if isinstance(body.get("error"), dict) else {}
+        code = body.get("code") or err.get("code")
+        if e.code == 409 and code == "blocked":
+            holder = body.get("holder") or err.get("holder") or (body.get("state") or {}).get("holder") or "unknown"
+            raise BananaBlockedError(holder, body.get("state", {}))
+        raise BananaError(f"HTTP {e.code}: {err.get('message') or body.get('error') or body.get('code') or e.reason}")
 
 def release() -> dict:
     """Release the floor when done. Returns dict."""

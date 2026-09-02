@@ -12,9 +12,11 @@ Decomposed into isolated, testable modules:
 import asyncio
 import os
 import signal
+import subprocess
 import sys
 import time
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -66,6 +68,7 @@ from tools.bridge_state import (
     set_active_model,
     is_reload_intent,
     sync_credentials,
+    clear_channel_session_id,
     PT_TZ,
 )
 from tools.bridge_formatting import (
@@ -205,6 +208,12 @@ async def _start_scheduler():
 
 @bot.event
 async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f"[Bridge] Successfully synced {len(synced)} slash commands with Discord.")
+    except Exception as se:
+        print(f"[Bridge] Warning syncing application command tree: {se}")
+
     await handle_on_ready(
         bot=bot,
         turn_queue=home_turn_queue,
@@ -213,6 +222,242 @@ async def on_ready():
         start_scheduler_fn=_start_scheduler,
         presence_fn=_apply_presence,
     )
+
+
+# --------------------------------------------------------------------------
+# Discord Slash Commands (Application Commands)
+# --------------------------------------------------------------------------
+
+@bot.tree.command(name="new", description="Start a new threaded conversation with Zero")
+@app_commands.describe(prompt="Initial prompt or task for the new thread (optional)")
+async def slash_new(interaction: discord.Interaction, prompt: str = ""):
+    """Spawn a new thread and begin a fresh conversation session."""
+    await interaction.response.defer()
+    clean_prompt = prompt.strip()
+    task_title = generate_concise_thread_title(clean_prompt) if clean_prompt else "New Conversation"
+
+    ch = interaction.channel
+    is_home = (ch.id == TARGET_CHANNEL_ID) or (isinstance(ch, discord.Thread) and getattr(ch, "parent_id", None) == TARGET_CHANNEL_ID)
+    selected_queue = home_turn_queue if is_home else ext_turn_queue
+    mode = "home" if is_home else "external"
+
+    if isinstance(ch, discord.Thread):
+        clear_channel_session_id(ch.id, mode)
+        reset_session_keys.discard(str(ch.id))
+        if clean_prompt:
+            await interaction.followup.send(f"🔄 Reset session for this thread. Starting task: **{clean_prompt}**")
+            await selected_queue.put({
+                "prompt": clean_prompt,
+                "status_msg": None,
+                "reply_target": ch,
+                "attachments": [],
+                "is_steer": False,
+                "mode": mode,
+                "channel_id": ch.id,
+                "is_thread_task": True
+            })
+        else:
+            await interaction.followup.send("🔄 Reset session for this thread. Send your next message to start fresh.")
+        return
+
+    try:
+        if clean_prompt:
+            resp = await interaction.followup.send(f"🧵 Starting new thread for: **{clean_prompt}**...")
+        else:
+            resp = await interaction.followup.send(f"🧵 Starting new threaded conversation...")
+
+        thread = await resp.create_thread(name=f"🧵 {task_title}", auto_archive_duration=1440)
+        await resp.edit(content=f"🧵 *Spawned new conversation thread:* {thread.mention} *(#{getattr(ch, 'name', 'chat')} remains free for other tasks)*")
+
+        clear_channel_session_id(thread.id, mode)
+
+        if clean_prompt:
+            await selected_queue.put({
+                "prompt": clean_prompt,
+                "status_msg": None,
+                "reply_target": thread,
+                "attachments": [],
+                "is_steer": False,
+                "mode": mode,
+                "channel_id": thread.id,
+                "is_thread_task": True
+            })
+        else:
+            await thread.send("👋 Started a fresh conversation thread. What would you like to work on?")
+    except Exception as e:
+        print(f"[Bridge] Error creating slash command thread: {e}")
+        await interaction.followup.send(f"⚠️ Failed to create thread: {e}")
+
+
+@bot.tree.command(name="reset", description="Reset the conversation session for the current channel or thread")
+async def slash_reset(interaction: discord.Interaction):
+    ch_id = interaction.channel_id
+    is_home = (ch_id == TARGET_CHANNEL_ID) or (isinstance(interaction.channel, discord.Thread) and getattr(interaction.channel, "parent_id", None) == TARGET_CHANNEL_ID)
+    mode = "home" if is_home else "external"
+    clear_channel_session_id(ch_id, mode)
+    sess_key = "home" if (ch_id == TARGET_CHANNEL_ID) else str(ch_id)
+    reset_session_keys.discard(sess_key)
+    await interaction.response.send_message("🔄 Conversation session reset for this channel/thread. Your next message will start a fresh session.")
+
+
+@bot.tree.command(name="model", description="View or switch the active AI model")
+@app_commands.describe(model_name="Model name or alias (e.g. 3.7, pro, sonnet, opus, flash-low)")
+async def slash_model(interaction: discord.Interaction, model_name: str = ""):
+    current_model = _get_active_model()
+    if not model_name:
+        models_help = (
+            f"🤖 **Current Active Model:** `{current_model}`\n\n"
+            "**Available Models & Aliases:**\n"
+            "• `3.8` or `flash` → `gemini-3.8-flash-high` *(Default, fast & smart)*\n"
+            "• `3.8-med` or `3.8-medium` → `gemini-3.8-flash-medium`\n"
+            "• `3.8-lite`, `3.8-low` or `flash-low` → `gemini-3.8-flash-low` *(Lightweight & fast)*\n"
+            "• `3.7` or `3.7-flash` → `gemini-3.7-flash-high`\n"
+            "• `3.7-lite` or `3.7-low` → `gemini-3.7-flash-low`\n"
+            "• `3.6` or `3.6-flash` → `gemini-3.6-flash-high`\n"
+            "• `3.1-pro` or `pro` → `gemini-3.1-pro-high`\n"
+            "• `sonnet` or `claude` → `claude-sonnet-4-6`\n"
+            "• `opus` → `claude-opus-4-6-thinking`\n"
+            "• `gpt` → `gpt-oss-120b-medium`\n"
+        )
+        await interaction.response.send_message(models_help)
+        return
+
+    aliases = {
+        "3.8": "gemini-3.8-flash-high",
+        "flash": "gemini-3.8-flash-high",
+        "3.8-flash": "gemini-3.8-flash-high",
+        "3.8-flash-high": "gemini-3.8-flash-high",
+        "3.8-med": "gemini-3.8-flash-medium",
+        "3.8-medium": "gemini-3.8-flash-medium",
+        "3.8-lite": "gemini-3.8-flash-low",
+        "3.8-low": "gemini-3.8-flash-low",
+        "3.8-flash-low": "gemini-3.8-flash-low",
+        "3.7": "gemini-3.7-flash-high",
+        "3.7-flash": "gemini-3.7-flash-high",
+        "3.7-flash-high": "gemini-3.7-flash-high",
+        "3.7-med": "gemini-3.7-flash-medium",
+        "3.7-medium": "gemini-3.7-flash-medium",
+        "3.7-lite": "gemini-3.7-flash-low",
+        "3.7-low": "gemini-3.7-flash-low",
+        "3.7-flash-low": "gemini-3.7-flash-low",
+        "flash-low": "gemini-3.8-flash-low",
+        "3.5-lite": "gemini-3.7-flash-low",
+        "3.5-flash-low": "gemini-3.7-flash-low",
+        "3.5": "gemini-3.7-flash-medium",
+        "3.6": "gemini-3.6-flash-high",
+        "3.6-flash": "gemini-3.6-flash-high",
+        "3.6-lite": "gemini-3.6-flash-low",
+        "3.6-low": "gemini-3.6-flash-low",
+        "3.1-pro": "gemini-3.1-pro-high",
+        "pro": "gemini-3.1-pro-high",
+        "3.1-pro-low": "gemini-3.1-pro-low",
+        "sonnet": "claude-sonnet-4-6",
+        "claude": "claude-sonnet-4-6",
+        "opus": "claude-opus-4-6-thinking",
+        "gpt": "gpt-oss-120b-medium",
+        "gpt-oss": "gpt-oss-120b-medium"
+    }
+    resolved = aliases.get(model_name.lower().strip(), model_name.strip())
+    _set_active_model(resolved)
+    await interaction.response.send_message(f"🔄 Switched active model to **`{resolved}`** for subsequent turns (persisted across restarts).")
+
+
+@bot.tree.command(name="logs", description="Run on-demand NAS log review across containers")
+@app_commands.describe(since="Time range to scan logs for (default: 24h)")
+async def slash_logs(interaction: discord.Interaction, since: str = "24h"):
+    await interaction.response.defer()
+    try:
+        from tools.sidecars import run_sidecar_job, run_nas_log_review
+        ok, rep, _ = run_sidecar_job("nas_logs", "NAS Log Review", run_nas_log_review, since=since)
+        chunks = chunk_text(rep, limit=1950)
+        for i, c in enumerate(chunks):
+            if i == 0:
+                await interaction.followup.send(c)
+            else:
+                await interaction.channel.send(c)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error running NAS log review: {e}")
+
+
+@bot.tree.command(name="triage", description="Run on-demand nightly agenda & inbox triage briefing")
+async def slash_triage(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        from tools.sidecars import run_sidecar_job, run_nightly_triage
+        ok, rep, _ = run_sidecar_job("triage", "Nightly Triage & Briefing", run_nightly_triage)
+        chunks = chunk_text(rep, limit=1950)
+        for i, c in enumerate(chunks):
+            if i == 0:
+                await interaction.followup.send(c)
+            else:
+                await interaction.channel.send(c)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error running triage briefing: {e}")
+
+
+@bot.tree.command(name="heartbeat", description="Run infrastructure heartbeat check")
+async def slash_heartbeat(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        from tools.sidecars import run_sidecar_job, run_heartbeat_sweep
+        ok, rep, _ = run_sidecar_job("heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
+        chunks = chunk_text(rep, limit=1950)
+        for i, c in enumerate(chunks):
+            if i == 0:
+                await interaction.followup.send(c)
+            else:
+                await interaction.channel.send(c)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error running heartbeat sweep: {e}")
+
+
+@bot.tree.command(name="tasks", description="Show active projects and task tracker")
+async def slash_tasks(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        res = subprocess.run(["python3", "/workspace/tools/task_manager.py", "summary"], capture_output=True, text=True, timeout=15)
+        out = res.stdout.strip() or res.stderr.strip() or "No tasks found."
+        chunks = chunk_text(out, limit=1950)
+        for i, c in enumerate(chunks):
+            if i == 0:
+                await interaction.followup.send(c)
+            else:
+                await interaction.channel.send(c)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error querying tasks: {e}")
+
+
+@bot.tree.command(name="sidecars", description="Show sidecar execution health and recent status")
+async def slash_sidecars(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        from tools.sidecars import format_sidecar_status_report
+        rep = format_sidecar_status_report()
+        chunks = chunk_text(rep, limit=1950)
+        for i, c in enumerate(chunks):
+            if i == 0:
+                await interaction.followup.send(c)
+            else:
+                await interaction.channel.send(c)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error querying sidecars: {e}")
+
+
+@bot.tree.command(name="title", description="Rename the current Discord thread")
+@app_commands.describe(new_title="New title for the thread")
+async def slash_title(interaction: discord.Interaction, new_title: str):
+    ch = interaction.channel
+    if not isinstance(ch, discord.Thread):
+        await interaction.response.send_message("⚠️ `/title` can only be used inside a Discord Thread.", ephemeral=True)
+        return
+    clean_name = new_title.strip()
+    if not clean_name.startswith("🧵"):
+        clean_name = f"🧵 {clean_name}"
+    try:
+        await ch.edit(name=clean_name[:100])
+        await interaction.response.send_message(f"✅ Renamed thread to: **{clean_name}**")
+    except Exception as e:
+        await interaction.response.send_message(f"⚠️ Failed to rename thread: {e}", ephemeral=True)
 
 
 @bot.listen("on_interaction")

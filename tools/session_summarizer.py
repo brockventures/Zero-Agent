@@ -87,7 +87,7 @@ def get_architecture_manifest() -> str:
         "  - Recent turns stay verbatim; older context checkpoints to /workspace/memory/.\n"
         "  - Per-thread sessions.json keys strictly isolate memory spaces across concurrent threads.\n"
         "• Multi-Agent Coordination: Banana mutex client (tools/banana.py) enforces turn claiming before shared Discord posts.\n"
-        "• Ambient Filtering: 2-tier classifier (tools/classifier.py via gemini-3.5-flash-low) fast-filters unaddressed chatter; threshold = 0.80.\n"
+        "• Ambient Filtering: 2-tier classifier (tools/classifier.py via agy) fast-filters unaddressed chatter; threshold = 0.80.\n"
         "• Memory Architecture: Dual-Tier Partitioned Memory (/workspace/memory/public/ vs /workspace/memory/private/).\n"
         "  - Public engineering scars & architecture are air-gapped from homelab/personal PII.\n"
         "• Safety & Git Guardrails: Pre-commit scanner (validate_commit_safety.py) blocks private IPs (192.168.1.x), SSH ports, and tokens.\n"

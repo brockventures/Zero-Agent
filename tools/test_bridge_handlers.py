@@ -103,6 +103,68 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["prompt"], "Run diagnostic sweep")
         self.assertEqual(item["mode"], "home")
 
+    async def test_robot_tag_addressing(self):
+        # Verify classifier recognizes @robot and role tag
+        from tools.classifier import ZERO_TAGS
+        import re
+        self.assertTrue(any(re.search(p, "hey @robot can you check this?", re.I) for p in ZERO_TAGS))
+        self.assertTrue(any(re.search(p, "hey <@&1542294519914037341> what is up?", re.I) for p in ZERO_TAGS))
+        self.assertTrue(any(re.search(p, "@robot status report", re.I) for p in ZERO_TAGS))
+
+        # Verify message routing treats @robot and role tag as addressed
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        # Message in Crab Cavern with @robot
+        mock_msg = MagicMock()
+        mock_msg.channel.id = 1534436119888793750  # agent-chat
+        mock_msg.channel.name = "agent-chat"
+        mock_msg.author.id = 1210466877835313155
+        mock_msg.author.bot = False
+        mock_msg.author.display_name = "Arbiter"
+        mock_msg.content = "@robot what are the system specs?"
+        mock_msg.created_at.timestamp.return_value = time.time()
+        mock_msg.role_mentions = []
+        mock_msg.mentions = []
+        mock_msg.reference = None
+
+        turn_queue = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={"ambient_classifier_enabled": False}):
+            await bh.handle_message(mock_msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+            call_args = turn_queue.put.call_args[0][0]
+            self.assertIn("what are the system specs?", call_args["prompt"])
+            self.assertEqual(call_args["mode"], "external")
+
+        # Message in Crab Cavern with role tag
+        mock_msg2 = MagicMock()
+        mock_msg2.channel.id = 1534436119888793750  # agent-chat
+        mock_msg2.channel.name = "agent-chat"
+        mock_msg2.author.id = 1210466877835313155
+        mock_msg2.author.bot = False
+        mock_msg2.author.display_name = "Arbiter"
+        mock_msg2.content = "<@&1542294519914037341> what are the system specs?"
+        mock_msg2.created_at.timestamp.return_value = time.time()
+        mock_msg2.role_mentions = []
+        mock_msg2.mentions = []
+        mock_msg2.reference = None
+
+        turn_queue2 = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={"ambient_classifier_enabled": False}):
+            await bh.handle_message(mock_msg2, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue2)
+            turn_queue2.put.assert_awaited_once()
+            call_args2 = turn_queue2.put.call_args[0][0]
+            self.assertIn("what are the system specs?", call_args2["prompt"])
+            self.assertEqual(call_args2["mode"], "external")
+
+    def test_slash_commands_registration(self):
+        """Verify that native Discord Slash Commands are registered in bot.tree."""
+        from tools.bridge import bot
+        cmd_names = {cmd.name for cmd in bot.tree.get_commands()}
+        expected_commands = {"new", "reset", "model", "logs", "triage", "heartbeat", "tasks", "sidecars", "title"}
+        for exp in expected_commands:
+            self.assertIn(exp, cmd_names, f"Expected slash command '/{exp}' to be registered on bot.tree")
+
 
 if __name__ == "__main__":
     unittest.main()

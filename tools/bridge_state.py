@@ -217,7 +217,7 @@ def clear_channel_session_id(channel_id: int | str, mode: str, target_channel_id
 
 
 # Active model selection persistence
-ACTIVE_MODEL = os.getenv("AGY_MODEL", "gemini-3.7-flash-high")
+ACTIVE_MODEL = os.getenv("AGY_MODEL", "gemini-3.8-flash-high")
 if CONFIG_FILE.exists():
     try:
         with open(CONFIG_FILE) as f:
@@ -230,6 +230,14 @@ if CONFIG_FILE.exists():
 
 def get_active_model() -> str:
     global ACTIVE_MODEL
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+                if cfg.get("model"):
+                    ACTIVE_MODEL = cfg["model"]
+        except Exception:
+            pass
     return ACTIVE_MODEL
 
 

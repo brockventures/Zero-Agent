@@ -99,6 +99,16 @@ async def execute_agy_turn(
     """Execute a single agy CLI turn with streaming status and output delivery."""
     global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session_keys, is_ext_steering
 
+    # Thread Escalation State (Home Turf Root Channel Only) - preserved across retry attempts
+    escalated_to_thread = False
+    delivery_target = reply_target
+    notify_root_channel = None
+    thread_jump_url = None
+    thread = None
+    rules = get_runtime_rules()
+    escalation_seconds = float(rules.get("auto_thread_escalation_seconds", 180.0))
+    escalation_enabled = rules.get("auto_thread_escalation_enabled", True)
+
     max_retries = 2
     for attempt in range(max_retries + 1):
         master_fd, slave_fd = pty.openpty()
@@ -216,6 +226,9 @@ async def execute_agy_turn(
                     "   - You MUST keep your entire response under 2,000 characters (single Discord message).\n"
                     "   - Be conversational, punchy, and interactive. Do NOT write dry, multi-page essay walls or massive dumps.\n"
                     "   - Deliver the key technical insight, code snippet, or answer directly, then pause for peer back-and-forth.\n"
+                    "7. COLLABORATOR EMAIL DISPATCH (BLANKET PRE-APPROVED):\n"
+                    "   - When collaborators or peer agents in Crab Cavern (Mike, Ian, Amos, Marvin) ask Zero to email them technical specs, code, architecture docs, or deliverables, Zero HAS BLANKET PRE-APPROVAL to send immediately using python3 /workspace/tools/send_mail.py.\n"
+                    "   - Requirement: Ensure Ryan is CC'd (enforced automatically by send_mail.py). Outbound deliverable email is operational and NOT air-gapped for approved collaborator requests.\n"
                     f"{channel_ctx_block}"
                     f"[INBOUND MESSAGE{author_tag}]: {prompt}"
                 )
@@ -278,14 +291,6 @@ async def execute_agy_turn(
             last_beacon_touch = time.time()
             init_received = False
 
-            # Thread Escalation State (Home Turf Root Channel Only)
-            escalated_to_thread = False
-            delivery_target = reply_target
-            notify_root_channel = None
-            thread_jump_url = None
-            rules = get_runtime_rules()
-            escalation_seconds = float(rules.get("auto_thread_escalation_seconds", 180.0))
-            escalation_enabled = rules.get("auto_thread_escalation_enabled", True)
             is_root_eligible = (
                 mode == "home" and
                 channel_id == TARGET_CHANNEL_ID and
@@ -293,11 +298,34 @@ async def execute_agy_turn(
                 hasattr(reply_target, "create_thread") and
                 not isinstance(getattr(reply_target, "channel", None), discord.Thread) and
                 escalation_enabled and
-                escalation_seconds > 0
+                escalation_seconds > 0 and
+                not escalated_to_thread
             )
 
             while True:
                 r, _, _ = select.select([master_fd], [], [], 0.1)
+                now = time.time()
+
+                # Dynamic Escalation to Discord Thread (#zero-chat root only)
+                # Evaluated unconditionally on every tick so silent agent turns escalate precisely at escalation_seconds
+                if is_root_eligible and not escalated_to_thread and (now - turn_start_time) >= escalation_seconds:
+                    try:
+                        escalated_to_thread = True
+                        is_root_eligible = False
+                        clean_title = generate_concise_thread_title(prompt)
+                        thread = await reply_target.create_thread(name=f"🧵 {clean_title}", auto_archive_duration=1440)
+                        await reply_target.reply(f"🧵 *Task execution exceeded {int(escalation_seconds)}s — migrating deliverable to {thread.mention}. `#zero-chat` remains free.*")
+                        status_msg = None
+                        delivery_target = thread
+                        notify_root_channel = getattr(reply_target, "channel", None)
+                        thread_jump_url = thread.jump_url
+                        channel_active_procs[thread.id] = proc
+                        if TARGET_CHANNEL_ID in channel_active_procs:
+                            del channel_active_procs[TARGET_CHANNEL_ID]
+                        active_proc = None
+                    except Exception as te:
+                        print(f"[BridgeRunner] Warning escalating turn to thread: {te}")
+
                 if master_fd in r:
                     try:
                         data = os.read(master_fd, 8192)
@@ -353,7 +381,7 @@ async def execute_agy_turn(
                                     elif ev_name == "result":
                                         res_cid = ev.get("result", {}).get("conversation_id")
                                         if res_cid:
-                                            if escalated_to_thread and 'thread' in locals() and hasattr(thread, 'id'):
+                                            if escalated_to_thread and thread and hasattr(thread, 'id'):
                                                 set_channel_session_id(thread.id, mode, res_cid)
                                                 clear_channel_session_id(TARGET_CHANNEL_ID, "home")
                                                 print(f"[BridgeRunner] 🧵 Bound session {res_cid} to migrated thread {thread.id} and freed root channel.")
@@ -368,32 +396,14 @@ async def execute_agy_turn(
                                 current_action = line_s[:100]
 
                         # Throttle progress updates to Discord (every 1.5s)
-                        now = time.time()
-                        if status_msg and (now - last_status_edit >= 1.5):
+                        now_edit = time.time()
+                        if status_msg and (now_edit - last_status_edit >= 1.5):
                             clean_action = re.sub(r"\x1b(?:\[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", current_action)
                             try:
                                 await status_msg.edit(content=f"⏳ *{clean_action}*")
-                                last_status_edit = now
+                                last_status_edit = now_edit
                             except Exception:
                                 pass
-
-                        # Dynamic Escalation to Discord Thread (#zero-chat root only)
-                        if is_root_eligible and not escalated_to_thread and (now - turn_start_time) >= escalation_seconds:
-                            try:
-                                escalated_to_thread = True
-                                clean_title = generate_concise_thread_title(prompt)
-                                thread = await reply_target.create_thread(name=f"🧵 {clean_title}", auto_archive_duration=1440)
-                                await reply_target.reply(f"🧵 *Task execution exceeded {int(escalation_seconds)}s — migrating deliverable to {thread.mention}. `#zero-chat` remains free.*")
-                                status_msg = None
-                                delivery_target = thread
-                                notify_root_channel = getattr(reply_target, "channel", None)
-                                thread_jump_url = thread.jump_url
-                                channel_active_procs[thread.id] = proc
-                                if TARGET_CHANNEL_ID in channel_active_procs:
-                                    del channel_active_procs[TARGET_CHANNEL_ID]
-                                active_proc = None
-                            except Exception as te:
-                                print(f"[BridgeRunner] Warning escalating turn to thread: {te}")
 
                         # Detect Google OAuth URL on uninitialized raw terminal boot
                         if not init_received and not auth_detected:

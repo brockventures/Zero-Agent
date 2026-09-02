@@ -129,19 +129,64 @@ def gmail_get_thread(thread_id: str) -> str:
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)})
 
+def _get_email_defaults() -> tuple[str, str]:
+    sender = os.environ.get("ZERO_SENDER_EMAIL", os.environ.get("ZERO_EMAIL", ""))
+    notify = os.environ.get("ZERO_NOTIFICATION_EMAIL", os.environ.get("OWNER_EMAIL", ""))
+    if not sender or not notify:
+        env_path = Path("/workspace/.env")
+        if env_path.exists():
+            try:
+                for line in env_path.read_text().splitlines():
+                    if line.startswith("ZERO_EMAIL=") and not sender:
+                        sender = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    elif line.startswith("OWNER_EMAIL=") and not notify:
+                        notify = line.split("=", 1)[1].strip().strip('"').strip("'")
+            except Exception:
+                pass
+    if not notify:
+        try:
+            priv_prof = Path("/workspace/memory/private/user_ryan.md")
+            if priv_prof.exists():
+                m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", priv_prof.read_text())
+                if m:
+                    notify = m.group(0)
+        except Exception:
+            pass
+    from_header = f"Zero <{sender}>" if sender and "<" not in sender else sender
+    return from_header, notify
+
+DEFAULT_FROM, DEFAULT_CC = _get_email_defaults()
+
 @server.tool()
-def gmail_create_draft(to: str, subject: str, body: str, thread_id: str = "", from_email: str = "Zero <zero@example.com>") -> str:
+def gmail_create_draft(to: str, subject: str, body: str, thread_id: str = "", from_email: str = DEFAULT_FROM, cc: str = "", attachments: list[str] = None) -> str:
     """Create a draft email in Gmail (safe default: does not send without confirmation)."""
     if not to or not subject:
         return json.dumps({"ok": False, "error": "to and subject required"})
     try:
         import base64
+        import mimetypes
+        from pathlib import Path
         from email.message import EmailMessage
         msg = EmailMessage()
         msg["To"] = to
+        effective_cc = cc.strip() if cc else ""
+        if DEFAULT_CC not in effective_cc and DEFAULT_CC not in to:
+            effective_cc = f"{effective_cc}, {DEFAULT_CC}".strip(", ") if effective_cc else DEFAULT_CC
+        if effective_cc:
+            msg["Cc"] = effective_cc
         msg["Subject"] = subject
-        msg["From"] = from_email or "Zero <zero@example.com>"
-        msg.set_content(body)
+        msg["From"] = from_email or DEFAULT_FROM
+        msg.set_content(body or "")
+
+        if attachments:
+            for item in attachments:
+                path = Path(item)
+                if path.is_file():
+                    ctype, encoding = mimetypes.guess_type(str(path))
+                    if ctype is None or encoding is not None:
+                        ctype = "text/x-python" if path.suffix == ".py" else ("text/markdown" if path.suffix == ".md" else "application/octet-stream")
+                    maintype, subtype = ctype.split("/", 1)
+                    msg.add_attachment(path.read_bytes(), maintype=maintype, subtype=subtype, filename=path.name)
 
         msg_payload = {"raw": ""}
         if thread_id:
@@ -172,18 +217,35 @@ def gmail_create_draft(to: str, subject: str, body: str, thread_id: str = "", fr
         return json.dumps({"ok": False, "error": str(e)})
 
 @server.tool()
-def gmail_send_message(to: str, subject: str, body: str, thread_id: str = "", from_email: str = "Zero <zero@example.com>") -> str:
+def gmail_send_message(to: str, subject: str, body: str, thread_id: str = "", from_email: str = DEFAULT_FROM, cc: str = "", attachments: list[str] = None) -> str:
     """Send an email directly via Gmail."""
     if not to or not subject:
         return json.dumps({"ok": False, "error": "to and subject required"})
     try:
         import base64
+        import mimetypes
+        from pathlib import Path
         from email.message import EmailMessage
         msg = EmailMessage()
         msg["To"] = to
+        effective_cc = cc.strip() if cc else ""
+        if DEFAULT_CC not in effective_cc and DEFAULT_CC not in to:
+            effective_cc = f"{effective_cc}, {DEFAULT_CC}".strip(", ") if effective_cc else DEFAULT_CC
+        if effective_cc:
+            msg["Cc"] = effective_cc
         msg["Subject"] = subject
-        msg["From"] = from_email or "Zero <zero@example.com>"
-        msg.set_content(body)
+        msg["From"] = from_email or DEFAULT_FROM
+        msg.set_content(body or "")
+
+        if attachments:
+            for item in attachments:
+                path = Path(item)
+                if path.is_file():
+                    ctype, encoding = mimetypes.guess_type(str(path))
+                    if ctype is None or encoding is not None:
+                        ctype = "text/x-python" if path.suffix == ".py" else ("text/markdown" if path.suffix == ".md" else "application/octet-stream")
+                    maintype, subtype = ctype.split("/", 1)
+                    msg.add_attachment(path.read_bytes(), maintype=maintype, subtype=subtype, filename=path.name)
 
         msg_payload = {}
         if thread_id:

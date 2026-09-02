@@ -24,6 +24,7 @@ Unified Execution Wrapper:
 - Surfaces recent failures and degraded jobs automatically in the Nightly Briefing.
 """
 
+import html
 import json
 import os
 import re
@@ -52,7 +53,7 @@ SSH_KEY = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists(
 SSH_USER = os.environ.get("NAS_SSH_USER", "Brock")
 
 def _resolve_nas_config():
-    ssh_port = os.environ.get("NAS_SSH_PORT", "22")
+    ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
     host_1 = os.environ.get("NAS_HOST_1_IP")
     host_2 = os.environ.get("NAS_HOST_2_IP")
 
@@ -118,9 +119,12 @@ SERVERBROCK2_EXPECTED_CONTAINERS = {
 }
 BROCKSERVER2_EXPECTED_CONTAINERS = SERVERBROCK2_EXPECTED_CONTAINERS
 
+SELF_SENDER_PATTERNS = (
+    "ryan brock", "ryan.", "ryanbrock", "rqb@"
+)
+
 REMINDER_SKIP_SENDER_PATTERNS = (
-    "user@example.com", "work@example.com", "kings swim",
-    "kingsswimacademy", "clipper", "garden route", "gardenrouteco",
+    "kings swim", "kingsswimacademy", "clipper", "garden route", "gardenrouteco",
     "dawn engel", "dawnengel", "faraci"
 )
 REMINDER_SKIP_SUBJECT_PATTERNS = (
@@ -229,6 +233,27 @@ def log_execution(job_id: str, name: str, status: str, duration_sec: float, summ
     status_map[job_id] = entry
     _atomic_write_json(EXECUTION_STATUS_FILE, status_map)
 
+    # 3. Synchronize schedule.json if KarakosScheduler tracks this sidecar
+    try:
+        from scheduler_tool import SIDECAR_ALIASES, load_schedule, save_schedule, calculate_next_run
+        sched_file = DATA_DIR / "schedule.json"
+        if sched_file.exists():
+            jobs = load_schedule()
+            aliases = SIDECAR_ALIASES.get(job_id, [job_id])
+            s_updated = False
+            now_epoch = int(now_pt.timestamp())
+            for j in jobs:
+                jid = j.get("id", "")
+                if jid == job_id or jid in aliases or job_id in SIDECAR_ALIASES.get(jid, []):
+                    j["last_run_ts"] = now_epoch
+                    j["last_run_at"] = now_pt.strftime("%Y-%m-%d %I:%M %p PT")
+                    j["next_run_ts"] = calculate_next_run(j, from_ts=now_epoch)
+                    s_updated = True
+            if s_updated:
+                save_schedule(jobs)
+    except Exception:
+        pass
+
     return entry
 
 def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> tuple[bool, str, any]:
@@ -267,12 +292,12 @@ def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> 
             message = str(res)
 
         # Domain-aware status classification
-        if job_id == "reminders":
-            # (has_due, msg): having 0 reminders due is normal healthy operation
-            has_due = ok
+        if job_id in ("reminders", "daily_birthday_reminder", "weekly_social_review", "monthly_core_friends_reminder"):
+            # (has_items, msg): having 0 items/birthdays due is normal healthy silent operation
+            has_items = ok
             ok = True
             status = "ok"
-            extra = {"has_due": has_due}
+            extra = {"has_items": has_items, "has_due": has_items}
         elif job_id == "ev9":
             # (has_digest, msg, plot): daily silent capture is normal healthy operation
             if message and any(err_tag in message for err_tag in ("⚠️", "🚨", "Error", "Exception")):
@@ -503,47 +528,99 @@ def run_nightly_triage() -> str:
     else:
         agenda_lines.append("- *(No events scheduled for tomorrow)*")
 
-    # 2. Gmail Triage (inbox-only with intentional reminder filter)
-    gmail_res = json.loads(gmail_search("in:inbox is:unread", 20))
+    # 2. Gmail Triage (Categorized executive inbox triage)
+    gmail_res = json.loads(gmail_search("in:inbox is:unread", 30))
     messages = gmail_res.get("messages", [])
 
-    inbox_lines = []
+    priority_lines = []
+    newsletter_lines = []
+    transactional_lines = []
     proposed_calendar = []
+    self_filtered_count = 0
+    vendor_filtered_count = 0
 
     if messages:
         for m in messages:
             sender = m.get("from", "")
-            subj = m.get("subject", "")
-            snippet = m.get("snippet", "")
+            subj = m.get("subject", "").strip()
+            snippet = m.get("snippet", "").strip()
             s_low = sender.lower()
             sub_low = subj.lower()
             snip_low = snippet.lower()
 
-            # Skip intentional self-reminders
-            if any(p in s_low for p in REMINDER_SKIP_SENDER_PATTERNS):
-                continue
-            if any(p in sub_low for p in REMINDER_SKIP_SUBJECT_PATTERNS):
+            # 1. Skip Self-Sent Emails (links, bookmarks, notes to self)
+            if any(p in s_low for p in SELF_SENDER_PATTERNS):
+                self_filtered_count += 1
                 continue
 
-            sender_clean = re.sub(r"<.*?>", "", sender).strip() or sender
-            inbox_lines.append(f"- **{sender_clean}**: *\"{subj}\"*")
+            # 2. Skip Intentional Vendor / Token Lingering Reminders
+            if any(p in s_low for p in REMINDER_SKIP_SENDER_PATTERNS) or any(p in sub_low for p in REMINDER_SKIP_SUBJECT_PATTERNS):
+                vendor_filtered_count += 1
+                continue
 
-            # Intelligent Calendar Proposal Detection
-            if "redwood barber" in s_low or "appointment is reserved" in sub_low:
-                time_match = re.search(r"(\d{1,2}:\d{2}\s*(?:AM|PM))\s+on\s+([A-Za-z]+,\s*[A-Za-z]+\s*\d{1,2})", snippet, re.IGNORECASE)
-                if time_match:
-                    proposed_calendar.append(f"- **{time_match.group(2)} @ {time_match.group(1)}** — *Haircut with Javier* (Redwood Barber Co.)")
-                else:
-                    proposed_calendar.append("- **Mon, Aug 31 @ 9:00 AM** — *Haircut with Javier* (Redwood Barber Co.)")
-            elif "makeup token" in sub_low or "swim lesson" in snip_low:
+            # Clean sender name
+            sender_clean = re.sub(r"<.*?>", "", sender).strip()
+            sender_clean = re.sub(r"^\"|\"$", "", sender_clean).strip()
+            if not sender_clean:
+                sender_clean = sender
+
+            # 3. Detect Calendar Proposals & Expiration Deadlines
+            if "makeup token" in sub_low or "swim lesson" in snip_low:
                 exp_match = re.search(r"Expiration:\s*(\d{2}/\d{2}/\d{4})", snippet)
                 if exp_match:
                     proposed_calendar.append(f"- **By {exp_match.group(1)}** — *Rosie Swim Lesson Makeup Token Expiration* (King's Swim Academy)")
+            elif "redwood barber" in s_low or "appointment is reserved" in sub_low:
+                time_match = re.search(r"(\d{1,2}:\d{2}\s*(?:AM|PM))\s+on\s+([A-Za-z]+,\s*[A-Za-z]+\s*\d{1,2})", snippet, re.IGNORECASE)
+                if time_match:
+                    proposed_calendar.append(f"- **{time_match.group(2)} @ {time_match.group(1)}** — *Haircut with Javier* (Redwood Barber Co.)")
             elif "estimate" in sub_low and ("wednesday 9/9" in snip_low or "tuesday 9/8" in snip_low):
                 proposed_calendar.append("- **Wed, Sep 9 (Proposed)** — *Heat Pump / AC Installation Window* (EM Energy & Air)")
 
-    if not inbox_lines:
-        inbox_lines.append("- *(Inbox clean / zero priority unread items)*")
+            # 4. Semantic Categorization & Context Extraction
+            clean_snip = html.unescape(snippet).replace("\n", " ").strip()
+            clean_snip = re.sub(r"\s+", " ", clean_snip)
+            if len(clean_snip) > 85:
+                clean_snip = clean_snip[:82] + "..."
+
+            # Newsletters & Daily Digests
+            if any(kw in s_low or kw in sub_low for kw in ["newsletter", "chronicle", "digest", "projections report", "bb pro", "daily fantasy"]):
+                newsletter_lines.append(f"- **{sender_clean}**: *\"{subj}\"*")
+            # Transactional / E-commerce / System Dogfood
+            elif any(kw in s_low or kw in sub_low for kw in ["amazon", "order", "delivery", "shipping", "receipt", "dogfood", "stardust"]):
+                transactional_lines.append(f"- **{sender_clean}**: *\"{subj}\"*")
+            # Actionable Priority / Direct Human Inbound
+            else:
+                if clean_snip and subj and clean_snip.lower() != subj.lower():
+                    priority_lines.append(f"- **{sender_clean}**: *\"{subj}\"*\n  `{clean_snip}`")
+                else:
+                    priority_lines.append(f"- **{sender_clean}**: *\"{subj or clean_snip}\"*")
+
+    inbox_lines = []
+    if priority_lines:
+        inbox_lines.extend(priority_lines)
+    else:
+        inbox_lines.append("- *(No urgent human action items)*")
+
+    if newsletter_lines or transactional_lines:
+        inbox_lines.append("")
+        inbox_lines.append("*Digests & Low-Priority:*")
+        if newsletter_lines:
+            inbox_lines.append(f"- 📰 **Newsletters ({len(newsletter_lines)})**:")
+            for nl in newsletter_lines:
+                inbox_lines.append(f"  {nl}")
+        if transactional_lines:
+            inbox_lines.append(f"- 📦 **Orders & System Updates ({len(transactional_lines)})**:")
+            for tl in transactional_lines:
+                inbox_lines.append(f"  {tl}")
+
+    filter_note = []
+    if self_filtered_count > 0:
+        filter_note.append(f"{self_filtered_count} self-sent note(s)/link(s)")
+    if vendor_filtered_count > 0:
+        filter_note.append(f"{vendor_filtered_count} lingering reminder(s)")
+    if filter_note:
+        joined_note = " and ".join(filter_note)
+        inbox_lines.append(f"\n*({joined_note} filtered)*")
 
     # 3. Scheduled Sidecar Job Failure Check (Automated Surfacing of Active Unresolved Issues)
     health = get_sidecar_health_summary(since_hours=24.0)
@@ -580,6 +657,20 @@ def run_nightly_triage() -> str:
     else:
         sidecar_note = f"⚠️ {total_jobs - failing_count}/{total_jobs} sidecars operational ({failing_count} currently degraded/failing)"
 
+    # 5. Open P0 / P1 Critical Issues & Tasks
+    high_pri_lines = []
+    try:
+        from tools.task_manager import task_manage
+        t_data = task_manage("list")
+        for t in t_data.get("tasks", []):
+            pri = str(t.get("priority", "")).lower()
+            stat = str(t.get("status", "")).lower()
+            if pri in ("p0", "p1") and stat != "completed":
+                badge = "🔴 P0" if pri == "p0" else "🔥 P1"
+                high_pri_lines.append(f"- {badge} `#{t.get('id')}` **{t.get('title')}** (*{t.get('status')}*)")
+    except Exception as e:
+        log.warning(f"Failed to fetch tasks for nightly triage: {e}")
+
     date_header = tomorrow_pt.strftime("%A, %B %-d")
     report = [
         f"📋 **Nightly Assistant** — For {date_header}",
@@ -590,6 +681,13 @@ def run_nightly_triage() -> str:
         "### 📬 Priority Inbox Triage",
         *inbox_lines,
     ]
+
+    if high_pri_lines:
+        report.extend([
+            "",
+            "### 🚨 Open P0/P1 Priority Issues",
+            *high_pri_lines
+        ])
 
     if proposed_calendar:
         report.extend([
@@ -605,11 +703,14 @@ def run_nightly_triage() -> str:
             *failure_lines
         ])
 
+    p0_p1_note = f"🚨 {len(high_pri_lines)} active issue(s)" if high_pri_lines else "None open ✅"
+
     report.extend([
         "",
         "### 🖥️ Homelab Posture",
         f"- **Infra Health**: {infra_note}",
         f"- **Scheduled Sidecars**: {sidecar_note}",
+        f"- **Open P0/P1 Issues**: {p0_p1_note}",
         f"- **Active Containers**: Host1 ({HOST_1_IP}): `{sb_up}` up | Host2 ({HOST_2_IP}): `{bs2_up}` up",
         f"- **Baseball Pipeline Refresh**: `{bb_ts}`"
     ])
@@ -618,7 +719,53 @@ def run_nightly_triage() -> str:
 # --------------------------------------------------------------------------
 # 3. NAS Log Review
 # --------------------------------------------------------------------------
-def run_nas_log_review(since: str = "24h") -> tuple[bool, str]:
+def _diagnose_container_errors(cname: str, errors: list[str]) -> tuple[int, str, str]:
+    """Analyze filtered container errors and return (tier, plain_english_explanation, proposed_next_step)."""
+    joined = " \n ".join(errors)
+
+    # 1. Database errors
+    if re.search(r"database is locked|sqlite3\.OperationalError", joined, re.I):
+        return 1, "SQLite database encountered write contention and locked.", "Check for concurrent background tasks or restart the container to clear stale locks."
+    if re.search(r"Npgsql\.NpgsqlException|TimeoutException.*queue", joined, re.I):
+        return 1, "Database stream connection timed out while querying the queue API.", "Monitor queue responsiveness; restart the container if UI operations stall."
+    if re.search(r"UNIQUE constraint failed", joined, re.I):
+        return 2, "Database constraint collision occurred during metadata caching.", "Scheduled cache maintenance will resolve key duplicates automatically."
+
+    # 2. Discord bot commands
+    if re.search(r"CommandNotFound: Application command", joined, re.I):
+        m = re.search(r"Application command '([^']+)' not found", joined)
+        cmd_name = f"/{m.group(1)}" if m else "slash command"
+        return 1, f"Discord client received an unregistered slash command ({cmd_name}).", "Sync application command definitions with Discord API."
+
+    # 3. Subprocess / Dockhand
+    if re.search(r"Go worker error.*list containers|Failed to send.*notification", joined, re.I):
+        return 2, "Worker encountered errors polling container states and sending webhook notifications.", "Verify Docker socket permissions or restart Dockhand if dashboard stats stall."
+
+    # 4. Media & Metadata (TMDb / Subtitles / Indexers)
+    if re.search(r"TMDb Error:.*404|No Episode found for TMDb", joined, re.I):
+        return 2, "Metadata lookup returned 404 Not Found for missing episodes on TMDb.", "Add affected TV series/specials to the exclude list if metadata is not on TMDb."
+    if re.search(r"check_update.*Error trying to get releases from GitHub", joined, re.I):
+        return 2, "GitHub release check timed out or hit API rate limiting.", "No action needed; automated updater will retry on the next check."
+    if re.search(r"Path does not exist", joined, re.I):
+        return 2, "Media indexer attempted to access an unmounted or missing file path.", "Check container volume mounts and root folder mappings."
+    if re.search(r"HttpClient\.HandleFailure|SocketException.*Resource temporarily unavailable", joined, re.I):
+        return 2, "Outbound HTTP or socket connection to external indexer or download client timed out.", "Automated retry will recover on the next scheduled refresh."
+
+    # 5. Smart Home / IoT
+    if re.search(r"pychromecast.*(Heartbeat timeout|Failed to connect)", joined, re.I):
+        return 2, "Chromecast integration lost connection during heartbeat check to cast devices.", "Normal when TVs or Chromecasts are in standby; verify device power if unresponsive."
+    if re.search(r"Nest API.*ECONNRESET|TLSSocket", joined, re.I):
+        return 2, "Nest cloud event stream disconnected unexpectedly.", "Plugin reconnects automatically; check HomeKit status if accessories show No Response."
+    if re.search(r"CASESession timed out|Setup for node failed", joined, re.I):
+        return 2, "Matter device secure communication timed out.", "Verify physical power and wireless mesh connectivity to the Matter node."
+
+    # 6. Generic Fallbacks
+    if re.search(r"panic|fatal|segfault|oom|killed|unhandled exception|syntaxerror", joined, re.I):
+        return 1, f"Critical application error or unhandled crash in {cname}.", "Inspect detailed container logs with docker logs and verify configuration."
+    else:
+        return 2, f"Transient operational warning or non-critical error in {cname}.", "Monitor on subsequent health checks; investigate if error recurs continuously."
+
+def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     now_pt = datetime.now(PT).strftime("%A %b %d %Y, %I:%M %p PT")
     tier1_flagged = []
     tier2_flagged = []
@@ -654,22 +801,20 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str]:
         r"<httpProxy>|"
         r"credentialedProxyHandler|"
         r"connect EHOSTUNREACH|"
-        r"Error calling http:\/\/192\.168\.1\.218|"
-        r"octoprint.*192\.168\.1\.218|"
-        r"android_ip_webcam.*192\.168\.1\.164"
+        r"Error calling http:\/\/\d+\.\d+\.\d+\.\d+|"
+        r"octoprint.*|"
+        r"android_ip_webcam.*|"
+        r"failed to sufficiently increase receive buffer size|"
+        r"Frame rx failed, error:Duplicated|"
+        r"CASESession timed out while waiting for a response from peer <0000000000000002|"
+        r"Stopped reading data from server error=.*EOF"
         r")",
-        re.IGNORECASE
-    )
-
-    # Tier 1 keywords: Hard crashes, segfaults, OOM, syntax/unhandled exceptions, database locks, subprocess errors
-    tier1_re = re.compile(
-        r"(panic|fatal|segfault|oom|killed|database is locked|unhandled exception|syntaxerror|calledprocesserror|traceback|pydantic\.dev|literal_error|critical|nullpointerexception|uncaught)",
         re.IGNORECASE
     )
 
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
-    for host, label in [(HOST_1_IP, f"Host1 ({HOST_1_IP})"), (HOST_2_IP, f"Host2 ({HOST_2_IP})")]:
+    for host in [HOST_1_IP, HOST_2_IP]:
         ps_res = json.loads(nas_docker("ps", host))
         if not ps_res.get("ok"):
             continue
@@ -695,13 +840,13 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str]:
                                 real_errors.append(clean_l)
 
                         if real_errors:
+                            tier, explanation, next_step = _diagnose_container_errors(cname, real_errors)
                             entry = {
-                                "host": label,
                                 "container": cname,
-                                "count": len(real_errors),
-                                "sample": real_errors[-3:]
+                                "explanation": explanation,
+                                "next_step": next_step
                             }
-                            if any(tier1_re.search(l) for l in real_errors):
+                            if tier == 1:
                                 tier1_flagged.append(entry)
                             else:
                                 tier2_flagged.append(entry)
@@ -710,29 +855,32 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str]:
 
     total_issues = len(tier1_flagged) + len(tier2_flagged)
     if total_issues == 0:
-        return True, f"🗄️ **NAS Log Review** — {now_pt}\nScanned the last {since} of logs for {scanned} running containers across `{HOST_1_IP}` and `{HOST_2_IP}` — all systems healthy with zero actionable errors. ✅"
+        return True, f"🗄️ **NAS Log Review** — {now_pt}\nScanned the last {since} of logs for {scanned} running containers across NAS clusters — all systems healthy with zero actionable errors. ✅", {"tier1_count": 0, "tier2_count": 0}
 
+    c_word = "container" if total_issues == 1 else "containers"
     report = [
         f"🗄️ **NAS Log Review — Flagged Issues** [{now_pt}]",
-        f"Scanned {scanned} containers across Host1 (`{HOST_1_IP}`) and Host2 (`{HOST_2_IP}`). Found issues in {total_issues}:\n"
+        f"Scanned {scanned} running containers across NAS clusters. Found issues in {total_issues} {c_word}:\n"
     ]
     if tier1_flagged:
-        report.append(f"🔴 **Tier 1: Actionable Failures** ({len(tier1_flagged)} container(s))")
+        t1_word = "container" if len(tier1_flagged) == 1 else "containers"
+        report.append(f"🔴 **Tier 1: Actionable Failures** ({len(tier1_flagged)} {t1_word})")
         for f in tier1_flagged:
-            report.append(f"* **{f['container']}** ({f['host']}) — {f['count']} error line(s):")
-            for s in f["sample"]:
-                report.append(f"  `{s[:120]}`")
-            report.append("")
+            report.append(f"* **{f['container']}**")
+            report.append(f"  * **Issue:** {f['explanation']}")
+            report.append(f"  * **Proposed Next Step:** {f['next_step']}")
+        report.append("")
 
     if tier2_flagged:
-        report.append(f"🟡 **Tier 2: Flapping / Transient Degradations** ({len(tier2_flagged)} container(s))")
+        t2_word = "container" if len(tier2_flagged) == 1 else "containers"
+        report.append(f"🟡 **Tier 2: Flapping / Transient Degradations** ({len(tier2_flagged)} {t2_word})")
         for f in tier2_flagged:
-            report.append(f"* **{f['container']}** ({f['host']}) — {f['count']} error line(s):")
-            for s in f["sample"]:
-                report.append(f"  `{s[:120]}`")
-            report.append("")
+            report.append(f"* **{f['container']}**")
+            report.append(f"  * **Issue:** {f['explanation']}")
+            report.append(f"  * **Proposed Next Step:** {f['next_step']}")
+        report.append("")
 
-    return True, "\n".join(report), {"tier1_count": len(tier1_flagged), "tier2_count": len(tier2_flagged)}
+    return True, "\n".join(report).strip(), {"tier1_count": len(tier1_flagged), "tier2_count": len(tier2_flagged)}
 
 # --------------------------------------------------------------------------
 # 4. Plex Transcode Session Cleanup
@@ -1009,6 +1157,15 @@ def run_core_friends_reminder(weeks: int = 8, as_of_date: str | None = None) -> 
     except Exception as e:
         return False, f"⚠️ Core friends reminder check failed: {e}"
 
+def run_token_report() -> tuple[bool, str]:
+    """Daily token and compute budget report."""
+    try:
+        from tools.token_reporter import generate_report
+        report = generate_report()
+        return True, report
+    except Exception as e:
+        return False, f"⚠️ Token report calculation failed: {e}"
+
 # --------------------------------------------------------------------------
 # CLI Dispatcher
 # --------------------------------------------------------------------------
@@ -1078,6 +1235,13 @@ if __name__ == "__main__":
     elif action == "antigravity":
         ok, rep, _ = run_sidecar_job("update_antigravity", "Antigravity CLI Check", run_antigravity_check)
         print(rep or "Antigravity up to date.")
+    elif action in ("token_report", "tokens"):
+        ok, rep, _ = run_sidecar_job("daily_token_budget_report", "Daily Token & AI Ultra Budget Report", run_token_report)
+        print(rep)
+    elif action == "morning":
+        from tools.morning_dispatcher import dispatch_morning_topic
+        ok, rep, _ = run_sidecar_job("morning_topic_rotation", "Crab Cavern Morning Topic Rotation", dispatch_morning_topic)
+        print(rep)
     elif action == "status":
         print(format_sidecar_status_summary())
     elif action == "history":

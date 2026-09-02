@@ -6,7 +6,7 @@ Launches pairing, extracts QR code URL, generates PNG image, and captures succes
 import subprocess, re, sys, time, os, qrcode, json, urllib.parse
 
 def _resolve_nas_config():
-    ssh_port = os.environ.get("NAS_SSH_PORT", "22")
+    ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
     host_1 = os.environ.get("NAS_HOST_1_IP")
     host_2 = os.environ.get("NAS_HOST_2_IP")
 

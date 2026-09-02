@@ -1,6 +1,8 @@
 ---
 name: repo-evaluator
-description: Discovers, audits, and forensically ranks GitHub repositories, skills, and open-source packages. Gathers quantitative metrics (stars, forks, commit recency, release cadence, issue resolution ratios), qualitative health checks (test coverage, CI/CD, dependency tree, security/CVEs, licensing), and community consensus to evaluate candidates.
+description: >-
+  Use this skill whenever evaluating, comparing, or ranking GitHub repositories, agent skills, libraries, or open-source packages.
+  Gathers quantitative health metrics (commits, stars, release cadence), qualitative audits (CI/CD, licensing, security/CVEs), and community sentiment.
 ---
 
 # 🔍 Repo Evaluator & Quality Ranker Skill

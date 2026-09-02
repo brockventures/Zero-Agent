@@ -51,6 +51,11 @@ SERVERS_CONFIG = {
         "module": "nas_docker_mcp",
         "description": "Multi-Host NAS Docker & SSH",
     },
+    "amazon-search": {
+        "port": 8768,
+        "module": "amazon_serpapi",
+        "description": "Amazon Search & Product Intelligence",
+    },
 }
 
 def sync_mcp_config_json() -> bool:
@@ -130,23 +135,27 @@ def get_daemon_pid() -> int | None:
         return None
 
 async def run_servers_async():
-    """Run all 3 MCP servers concurrently inside one asyncio event loop."""
+    """Run all MCP servers concurrently inside one asyncio event loop."""
     import uvicorn
     from workspace_mcp import server as ws_server
     from ha_mcp import server as ha_server
     from nas_docker_mcp import server as nas_server
+    from amazon_serpapi import server as amazon_server
 
     app_ws = ws_server.sse_app()
     app_ha = ha_server.sse_app()
     app_nas = nas_server.sse_app()
+    app_amazon = amazon_server.sse_app()
 
     cfg_ws = uvicorn.Config(app_ws, host="127.0.0.1", port=SERVERS_CONFIG["google-workspace"]["port"], log_level="warning")
     cfg_ha = uvicorn.Config(app_ha, host="127.0.0.1", port=SERVERS_CONFIG["home-assistant"]["port"], log_level="warning")
     cfg_nas = uvicorn.Config(app_nas, host="127.0.0.1", port=SERVERS_CONFIG["nas-docker"]["port"], log_level="warning")
+    cfg_amazon = uvicorn.Config(app_amazon, host="127.0.0.1", port=SERVERS_CONFIG["amazon-search"]["port"], log_level="warning")
 
     srv_ws = uvicorn.Server(cfg_ws)
     srv_ha = uvicorn.Server(cfg_ha)
     srv_nas = uvicorn.Server(cfg_nas)
+    srv_amazon = uvicorn.Server(cfg_amazon)
 
     loop = asyncio.get_running_loop()
 
@@ -155,9 +164,11 @@ async def run_servers_async():
         srv_ws.should_exit = True
         srv_ha.should_exit = True
         srv_nas.should_exit = True
+        srv_amazon.should_exit = True
         srv_ws.force_exit = True
         srv_ha.force_exit = True
         srv_nas.force_exit = True
+        srv_amazon.force_exit = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -165,12 +176,12 @@ async def run_servers_async():
         except NotImplementedError:
             pass
 
-
-    print("[MCP Daemon] Starting persistent MCP SSE servers on ports 8765, 8766, 8767...", flush=True)
+    print("[MCP Daemon] Starting persistent MCP SSE servers on ports 8765, 8766, 8767, 8768...", flush=True)
     await asyncio.gather(
         srv_ws.serve(),
         srv_ha.serve(),
-        srv_nas.serve()
+        srv_nas.serve(),
+        srv_amazon.serve()
     )
     print("[MCP Daemon] All servers stopped cleanly.", flush=True)
 

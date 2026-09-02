@@ -1,6 +1,8 @@
 ---
 name: outbox
-description: Decoupled asynchronous cross-channel message spooling and dispatch. Allows Zero to queue messages destined for other Discord channels (#lounge, #agent-chat, #zero-chat) without blocking active turn execution or coupling delivery to the active thread.
+description: >-
+  Use this skill whenever queuing, broadcasting, or asynchronously spooling messages destined for other Discord channels (#lounge, #agent-chat, #zero-chat).
+  Enables decoupled background dispatch without blocking active execution or thread state.
 ---
 
 # 📦 Outbox Skill (Cross-Channel Asynchronous Dispatch)
