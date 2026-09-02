@@ -44,6 +44,32 @@ def is_free() -> bool:
     except Exception:
         return False
 
+STATE_FILE = Path("/workspace/data/banana_session_state.json")
+DEFAULT_LEASE_TTL_SECONDS = 120
+
+def _load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_state(state: dict) -> None:
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+def _clear_state() -> None:
+    try:
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+    except Exception:
+        pass
+
 def claim(subject: str = "") -> dict:
     """Claim the floor before posting. Returns dict or raises BananaBlockedError."""
     creds = load_credentials()
@@ -51,7 +77,10 @@ def claim(subject: str = "") -> dict:
     token = creds.get("token")
     holder = creds.get("holder", "zero")
 
-    data = json.dumps({"holder": holder, "subject": subject}).encode("utf-8")
+    saved_state = _load_state()
+    effective_subject = subject or saved_state.get("subject", "")
+
+    data = json.dumps({"holder": holder, "subject": effective_subject}).encode("utf-8")
     req = urllib.request.Request(
         f"{endpoint}/claim",
         data=data,
@@ -62,7 +91,13 @@ def claim(subject: str = "") -> dict:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
+            body = json.loads(resp.read().decode())
+            # Extract generation fencing token
+            state = body.get("state") if isinstance(body.get("state"), dict) else {}
+            gen = body.get("generation") or state.get("id") or body.get("id")
+            ret_subj = body.get("subject") or effective_subject
+            _save_state({"generation": gen, "subject": ret_subj})
+            return body
     except urllib.error.HTTPError as e:
         body = json.loads(e.read().decode()) if e.headers.get_content_type() == "application/json" else {}
         err = body.get("error") if isinstance(body.get("error"), dict) else {}
@@ -79,7 +114,12 @@ def release() -> dict:
     token = creds.get("token")
     holder = creds.get("holder", "zero")
 
-    data = json.dumps({"holder": holder}).encode("utf-8")
+    saved_state = _load_state()
+    payload = {"holder": holder}
+    if saved_state.get("generation") is not None:
+        payload["generation"] = saved_state["generation"]
+
+    data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{endpoint}/release",
         data=data,
@@ -90,7 +130,9 @@ def release() -> dict:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
+            body = json.loads(resp.read().decode())
+            _clear_state()
+            return body
     except urllib.error.HTTPError as e:
         body = json.loads(e.read().decode()) if e.headers.get_content_type() == "application/json" else {}
         raise BananaError(f"HTTP {e.code}: {body.get('error') or body.get('code') or e.reason}")
