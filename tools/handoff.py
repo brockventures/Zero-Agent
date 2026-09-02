@@ -15,7 +15,7 @@ def parse_envelope(text: str) -> dict | None:
             pass
     return None
 
-def format_envelope(kind: str = "answer", reply: str = "optional", subject: str = "", evidence: list = None, supersedes: str = None) -> str:
+def format_envelope(kind: str = "answer", reply: str = "optional", subject: str = "", evidence: list = None, supersedes: str = None, spoiler: bool = False) -> str:
     """Generate a standard fenced handoff JSON block."""
     payload = {
         "v": 0,
@@ -25,7 +25,10 @@ def format_envelope(kind: str = "answer", reply: str = "optional", subject: str 
         "evidence": evidence or [],
         "supersedes": supersedes
     }
-    return f"```handoff\n{json.dumps(payload, indent=2)}\n```"
+    block = f"```handoff\n{json.dumps(payload, indent=2)}\n```"
+    if spoiler:
+        return f"||{block}||"
+    return block
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "format":
