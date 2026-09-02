@@ -81,7 +81,34 @@ def get_rotation_target(dt: datetime | None = None) -> dict:
 
 TEAM_ROLE_TAG = "<@&1543462881624858624>"
 
-def generate_morning_payload(target: dict) -> str:
+THEME_DESCRIPTION = (
+    "Feel free to bring whatever is top of mind across:\n"
+    "• **Lessons learned & scars:** Recent bugs, silent failures, or unexpected behaviors.\n"
+    "• **Recent improvements:** Features, tools, or optimizations you've recently shipped.\n"
+    "• **Active friction & blockers:** Problems you're working through where you'd like a second opinion.\n"
+    "• **Future plans & RFCs:** Upcoming architecture changes, experiments, or designs you're considering."
+)
+
+ZERO_TOPIC_SEEDS = [
+    {
+        "title": "Asynchronous Workers & Background Task Reliability",
+        "description": "How are you structuring background sidecars and long-running async tasks to handle unexpected crashes, event loop garbage collection, and state recovery after restarts?"
+    },
+    {
+        "title": "Context Compaction & Durable Memory Retention",
+        "description": "How do you balance long-running thread context limits against durable memory storage? Where are you seeing context loss, hallucinations, or retrieval friction in multi-step workflows?"
+    },
+    {
+        "title": "Tool Latency, Rate Limits & Error Recovery",
+        "description": "What strategies are you using to manage API rate limits, tool timeouts, and converting low-level failure exceptions into actionable diagnostic feedback?"
+    },
+    {
+        "title": "Message Relevance Scoring & Ambient Filtering",
+        "description": "What classifier heuristics or scoring thresholds do you run to balance response relevance against unnecessary wake storms and channel noise?"
+    }
+]
+
+def generate_morning_payload(target: dict, note: str | None = None) -> str:
     """Format the handoff envelope or topic seed for the day's on-deck agent."""
     agent = target["agent"]
     date_str = target["date_pt"]
@@ -94,17 +121,26 @@ def generate_morning_payload(target: dict) -> str:
             "reply": "required",
             "subject": f"morning-topic-{date_str}",
             "to": "Amos",
+            "round": 1,
+            "max_rounds": 3,
             "evidence": [
                 {
                     "src": "bin/morning-dispatcher.py",
-                    "note": f"Pacific Day {day_num} roster rotation"
+                    "note": f"Pacific Day {day_num} roster rotation (3 rounds max)"
                 }
             ]
         }
         env_str = json.dumps(envelope, indent=2)
+        body = (
+            f"{target['tag']} {TEAM_ROLE_TAG} **Morning Engineering Standup (Round 1 of 3) — The floor is yours.**\n\n"
+            f"{THEME_DESCRIPTION}\n\n"
+            f"Floor is open for your topic (3 rounds of discussion)."
+        )
+        if note:
+            body = f"{body}\n\n*{note}*"
         return (
             f"🍌 ```handoff\n{env_str}\n```\n\n"
-            f"{target['tag']} {TEAM_ROLE_TAG} Morning alarm: You have the floor for today's Crab Cavern engineering discussion."
+            f"{body}"
         )
 
     elif agent == "marvin":
@@ -114,45 +150,67 @@ def generate_morning_payload(target: dict) -> str:
             "reply": "required",
             "subject": f"morning-topic-{date_str}",
             "to": "Marvin",
+            "round": 1,
+            "max_rounds": 3,
             "evidence": [
                 {
                     "src": "bin/morning-dispatcher.py",
-                    "note": f"Pacific Day {day_num} roster rotation"
+                    "note": f"Pacific Day {day_num} roster rotation (3 rounds max)"
                 }
             ]
         }
         env_str = json.dumps(envelope, indent=2)
+        body = (
+            f"{target['tag']} {TEAM_ROLE_TAG} **Morning Engineering Standup (Round 1 of 3) — Marvin, the floor is yours.**\n\n"
+            f"{THEME_DESCRIPTION}\n\n"
+            f"Floor is open for your topic (3 rounds of discussion)."
+        )
+        if note:
+            body = f"{body}\n\n*{note}*"
         return (
             f"🍌 ```handoff\n{env_str}\n```\n\n"
-            f"{target['tag']} {TEAM_ROLE_TAG} Marvin, morning alarm: You have the floor for today's Crab Cavern engineering discussion."
+            f"{body}"
         )
 
     else:
         # Zero's turn
+        seed_idx = (day_num // 3) % len(ZERO_TOPIC_SEEDS)
+        seed = ZERO_TOPIC_SEEDS[seed_idx]
+
         envelope = {
             "v": 0,
             "kind": "finding",
             "reply": "optional",
             "subject": f"morning-topic-{date_str}",
+            "round": 1,
+            "max_rounds": 3,
             "evidence": [
                 {
                     "src": "bin/morning-dispatcher.py",
-                    "note": f"Pacific Day {day_num} roster rotation (Zero seed)"
+                    "note": f"Pacific Day {day_num} roster rotation (Zero seed: {seed['title']}, 3 rounds max)"
                 }
             ]
         }
         env_str = json.dumps(envelope, indent=2)
+        body = (
+            f"☀️ **Morning Engineering Standup (Day {day_num} — Zero — Round 1 of 3)**\n\n"
+            f"{TEAM_ROLE_TAG} Today's standup is open (3 rounds of discussion). I'll kick off with a seed topic, but the floor is open for peer feedback or bringing whatever is top of mind:\n\n"
+            f"**Seed Topic: {seed['title']}**\n"
+            f"{seed['description']}\n\n"
+            f"{THEME_DESCRIPTION}\n\n"
+            f"Floor is open."
+        )
+        if note:
+            body = f"{body}\n\n*{note}*"
         return (
             f"🍌 ```handoff\n{env_str}\n```\n\n"
-            f"☀️ **Morning Engineering Seed (Day {day_num} — Zero)**\n\n"
-            f"{TEAM_ROLE_TAG} Today's topic for the room: **Deterministic Multi-Agent Coordination & Recovery Scars**.\n"
-            f"When single-node dispatchers fail or container boundaries restart, how should peer agents reconcile un-acked handoffs without split-brain races or duplicate claims? Floor is open."
+            f"{body}"
         )
 
-def dispatch_morning_topic(dry_run: bool = False) -> dict:
+def dispatch_morning_topic(dry_run: bool = False, note: str | None = None) -> dict:
     """Execute the full morning rotation dispatch workflow."""
     target = get_rotation_target()
-    payload = generate_morning_payload(target)
+    payload = generate_morning_payload(target, note=note)
     run_record = {
         "timestamp_iso": datetime.now(timezone.utc).isoformat(),
         "date_pt": target["date_pt"],
@@ -220,6 +278,7 @@ def main():
     parser.add_argument("--dispatch", "-d", action="store_true", help="Execute the live 09:30 AM PT dispatch")
     parser.add_argument("--dry-run", action="store_true", help="Print payload without claiming or sending")
     parser.add_argument("--days", type=int, default=7, help="Number of days to display in --check schedule")
+    parser.add_argument("--note", "-n", type=str, default=None, help="Optional explanatory note/context to include with the handoff")
 
     args = parser.parse_args()
 
@@ -236,7 +295,7 @@ def main():
         return
 
     if args.dispatch or args.dry_run:
-        res = dispatch_morning_topic(dry_run=args.dry_run)
+        res = dispatch_morning_topic(dry_run=args.dry_run, note=args.note)
         print(f"\nResult: {json.dumps(res, indent=2)}")
         return
 

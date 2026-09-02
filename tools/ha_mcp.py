@@ -179,6 +179,24 @@ def ha_call_service(domain: str, service: str, entity_id: str = "", data_json: s
 if __name__ == "__main__":
     import sys
     port = 8766
+    cli_args = [a for a in sys.argv[1:] if not a.startswith("--")]
+
+    if cli_args:
+        action = cli_args[0].lower()
+        if action == "ping":
+            print(ha_ping())
+        elif action in ("state", "get") and len(cli_args) > 1:
+            print(ha_get_state(entity_id=cli_args[1]))
+        elif action == "search" and len(cli_args) > 1:
+            print(ha_search_entities(query=cli_args[1]))
+        else:
+            # If passed single entity_id without explicit 'state'
+            if "." in action:
+                print(ha_get_state(entity_id=action))
+            else:
+                print(json.dumps({"ok": False, "error": f"Unknown CLI action '{action}'. Usage: ha_mcp.py [ping | state <entity_id> | search <query>]"}))
+        sys.exit(0)
+
     for arg in sys.argv[1:]:
         if arg.startswith("--port="):
             port = int(arg.split("=")[1])
@@ -188,4 +206,5 @@ if __name__ == "__main__":
         server.run(transport="sse", host="127.0.0.1", port=port)
     else:
         server.run(transport="stdio")
+
 

@@ -212,7 +212,7 @@ def run_memory_doctor() -> tuple[bool, str]:
     return False, report
 
 def run_dreaming_consolidation(dry_run: bool = False) -> tuple[bool, str]:
-    """Nightly dreaming pass: consolidates today's operational learning into memory."""
+    """Nightly dreaming pass: consolidates today's operational learning and promotes engineering memories."""
     now_pt = datetime.now(PT).strftime("%Y-%m-%d %I:%M %p PT")
     consolidated_items = []
     
@@ -225,6 +225,19 @@ def run_dreaming_consolidation(dry_run: bool = False) -> tuple[bool, str]:
         for tf in tools_dir.glob("*.py"):
             if (datetime.now(PT) - datetime.fromtimestamp(tf.stat().st_mtime, tz=PT)).total_seconds() < 86400:
                 consolidated_items.append(f"Tool enhancements in `{tf.name}`")
+
+    # Automated Promotion Pass: Scan recently modified private memory files for engineering candidates
+    try:
+        import promote_memory
+        for cand in promote_memory.find_candidates():
+            if (datetime.now(PT) - datetime.fromtimestamp(cand.stat().st_mtime, tz=PT)).total_seconds() < 86400:
+                dest_file = PUB_DIR / cand.name
+                if not dest_file.exists() or cand.stat().st_mtime > dest_file.stat().st_mtime:
+                    ok, msg = promote_memory.promote_file(cand, dry_run=dry_run)
+                    if ok:
+                        consolidated_items.append(f"Promoted engineering scar: `{cand.name}` -> `public/{cand.name}`")
+    except Exception as e:
+        log.warning(f"Dreaming promotion scan error: {e}")
 
     if not consolidated_items:
         return False, "Dream pass complete: no new long-term memories required consolidation."

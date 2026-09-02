@@ -47,6 +47,17 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertIn("• **Server 1** ($100): Online", converted)
         self.assertIn("• **Server 2** ($200): Standby", converted)
 
+    def test_convert_comparison_markdown_tables(self):
+        table = (
+            "| Feature | Chest Freezer | Upright Freezer |\n"
+            "|---|---|---|\n"
+            "| Defrost Type | Manual (-10°F) | Auto (32°F) |\n"
+            "| Power Outage | 48+ hours | 12-24 hours |\n"
+        )
+        converted = convert_markdown_tables(table)
+        self.assertIn("• **Defrost Type**:\n  - *Chest Freezer*: Manual (-10°F)\n  - *Upright Freezer*: Auto (32°F)", converted)
+        self.assertIn("• **Power Outage**:\n  - *Chest Freezer*: 48+ hours\n  - *Upright Freezer*: 12-24 hours", converted)
+
     def test_format_for_discord_file_links(self):
         text = "Check [bridge.py](file:///workspace/tools/bridge.py) and [`test.py`](file:///workspace/tools/test.py)."
         formatted = format_for_discord(text)

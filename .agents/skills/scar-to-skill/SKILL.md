@@ -1,6 +1,8 @@
 ---
 name: scar-to-skill
-description: Conservative debugging scar-to-skill transformation engine with anti-slop filters and automated periodic janitor. Converts recurring operational failure modes and forensic debugging breakthroughs into permanent, executable skills only when meeting strict utility thresholds; proposes pruning of stale or unused skills.
+description: >-
+  Use this skill after solving complex debugging incidents or operational breakdowns to evaluate whether to codify the solution into a permanent executable skill.
+  Enforces strict anti-slop filters (recurrence >= 3, deterministic automation, high blast radius) and audits existing skills for pruning.
 ---
 
 # 🧠 Conservative Scar-to-Skill Transformation & Skill Janitor

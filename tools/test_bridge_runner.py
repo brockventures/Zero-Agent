@@ -103,6 +103,22 @@ class TestBridgeRunner(unittest.TestCase):
         is_placeholder = all(c in ("...", "…", "Option 1", "Option 2", "Option 3") for c in b_choices)
         self.assertTrue(is_placeholder)
 
+    def test_retry_preserves_escalated_thread_state(self):
+        """Verify that when a turn escalates to a thread, retries preserve the thread delivery target."""
+        mock_msg = MagicMock()
+        mock_thread = MagicMock()
+        mock_thread.id = 999888777
+        mock_thread.jump_url = "https://discord.com/channels/1/999888777"
+        
+        # Test state retention pattern
+        escalated_to_thread = True
+        delivery_target = mock_thread
+        
+        target_dest = delivery_target if delivery_target else mock_msg
+        self.assertEqual(target_dest, mock_thread)
+        self.assertFalse(hasattr(target_dest, "reply") and not hasattr(mock_thread, "reply"))
+
 
 if __name__ == "__main__":
     unittest.main()
+

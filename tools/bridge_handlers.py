@@ -300,7 +300,7 @@ async def run_thread_turn_worker(item, bot: discord.Client, presence_fn=None, bu
         except Exception:
             pass
     finally:
-        tid = getattr(reply_target, "id", None) or channel_id
+        tid = getattr(getattr(reply_target, "channel", None), "id", None) or getattr(reply_target, "id", None) or channel_id
         if tid in thread_active_tasks:
             del thread_active_tasks[tid]
 
@@ -319,7 +319,7 @@ async def queue_worker(home_turn_queue, bot: discord.Client, presence_fn=None, b
 
         if is_thread_task:
             t_task = asyncio.create_task(run_thread_turn_worker(item, bot, presence_fn, button_choice_fn, quick_choice_view_cls))
-            tid = getattr(reply_target, "id", None) or channel_id
+            tid = getattr(getattr(reply_target, "channel", None), "id", None) or getattr(reply_target, "id", None) or channel_id
             thread_active_tasks[tid] = t_task
             home_turn_queue.task_done(item)
             continue
@@ -445,6 +445,24 @@ async def handle_on_ready(
         print(f"[Antigravity] Persistent MCP Daemon active (PID: {mcp_status.get('pid')}, healthy: {mcp_status.get('healthy')}).")
     except Exception as me:
         print(f"[Bridge] Warning initializing MCP daemon: {me}")
+
+    # Ensure Inbound Email Listener Daemon is active
+    try:
+        from tools.zero_mail_listener import ensure_mail_listener_running, get_status as get_mail_status
+        ensure_mail_listener_running()
+        mail_status = get_mail_status()
+        print(f"[Antigravity] Inbound Email Listener active (PID: {mail_status.get('pid')}, target: {mail_status.get('target')}).")
+    except Exception as mle:
+        print(f"[Bridge] Warning initializing email listener: {mle}")
+
+    # Ensure Zero Health Check HTTP Server is active (for zero.brock.ventures)
+    try:
+        from tools.zero_health_server import ensure_health_server_running, get_status as get_health_status
+        ensure_health_server_running()
+        health_status = get_health_status()
+        print(f"[Antigravity] Zero Health Server active (PID: {health_status.get('pid')}, port: {health_status.get('port')}).")
+    except Exception as hse:
+        print(f"[Bridge] Warning initializing health server: {hse}")
 
     # Clean up any zombie in-flight turn from an interrupted restart
     if IN_FLIGHT_FILE.exists():
@@ -654,14 +672,21 @@ async def handle_message(
         channel_tag_requirements = rules.get("channel_tag_requirements", {})
         req_tag = channel_tag_requirements.get(str(msg.channel.id))
         is_tagged_role = False
+        role_ids = [str(r.id) for r in getattr(msg, "role_mentions", [])]
+        is_robot_tagged = (
+            "<@&1542294519914037341>" in content or
+            "1542294519914037341" in role_ids or
+            re.search(r"(?:^|[\s,;])(?:hey\s+)?@?robot(?:\b|[!?:,])", content, re.IGNORECASE) is not None
+        )
+
         if req_tag:
             bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
-            role_ids = [str(r.id) for r in getattr(msg, "role_mentions", [])]
             tag_str = f"<@&{req_tag}>"
             is_direct_bot_ping = (
                 (bot.user and bot.user in msg.mentions) or
                 f"<@{bot_id}>" in content or
-                f"<@!{bot_id}>" in content
+                f"<@!{bot_id}>" in content or
+                is_robot_tagged
             )
             if tag_str not in content and str(req_tag) not in role_ids and not is_direct_bot_ping:
                 print(f"[Bridge] Message in channel {msg.channel.id} ignored: missing required tag {tag_str}")
@@ -684,7 +709,8 @@ async def handle_message(
             (bot.user and bot.user in msg.mentions) or
             bot_mention_1 in content or
             bot_mention_2 in content or
-            re.search(r"(?:^|[\s,;])(?:hey\s+)?@?zero(?:\b|[!?:,])", content, re.IGNORECASE) is not None or
+            is_robot_tagged or
+            re.search(r"(?:^|[\s,;/])(?:hey\s+)?@?zero(?:\b|[!?:,/])", content, re.IGNORECASE) is not None or
             is_reply_to_zero or
             handoff_for_zero
         )
@@ -709,7 +735,10 @@ async def handle_message(
         # Clean mentions from prompt
         cleaned = re.sub(rf"<@!?{bot_id}>", "", content)
         cleaned = re.sub(r"<@&[0-9]+>", "", cleaned)
-        cleaned = re.sub(r"^(hey\s+)?zero[:,\s]*", "", cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r"^(hey\s+)?zero[:,\s]*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(hey\s+)?robot[:,\s]*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"@robot\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"@zero\b", "", cleaned, flags=re.IGNORECASE).strip()
         if not cleaned:
             await msg.reply("What's up? Give me something interesting to work on.")
             return
@@ -823,29 +852,56 @@ async def handle_message(
             models_help = (
                 f"🤖 **Current Active Model:** `{current_model}`\n\n"
                 "**Available Models & Aliases:**\n"
-                "• `3.7` or `flash` → `gemini-3.7-flash-high` *(Default, fast & smart)*\n"
-                "• `3.5-lite` or `3.5-flash-low` → `gemini-3.5-flash-low` *(Lightweight & cheap)*\n"
-                "• `3.5` → `gemini-3.5-flash-medium`\n"
+                "• `3.8` or `flash` → `gemini-3.8-flash-high` *(Default, fast & smart)*\n"
+                "• `3.8-med` or `3.8-medium` → `gemini-3.8-flash-medium`\n"
+                "• `3.8-lite`, `3.8-low` or `flash-low` → `gemini-3.8-flash-low` *(Lightweight & fast)*\n"
+                "• `3.7` or `3.7-flash` → `gemini-3.7-flash-high`\n"
+                "• `3.7-lite` or `3.7-low` → `gemini-3.7-flash-low`\n"
+                "• `3.6` or `3.6-flash` → `gemini-3.6-flash-high`\n"
                 "• `3.1-pro` or `pro` → `gemini-3.1-pro-high` *(Deep reasoning / complex refactors)*\n"
                 "• `sonnet` or `claude` → `claude-sonnet-4-6` *(Claude Thinking model)*\n"
-                "• `opus` → `claude-opus-4-6-thinking` *(Claude Opus Thinking)*\n\n"
-                "*Switch model with:* `!model <name>` (e.g. `!model 3.5-lite` or `!model pro`)"
+                "• `opus` → `claude-opus-4-6-thinking` *(Claude Opus Thinking)*\n"
+                "• `gpt` → `gpt-oss-120b-medium`\n\n"
+                "*Switch model with:* `!model <name>` (e.g. `!model 3.8`, `!model pro`, `!model flash-low`)"
             )
             await msg.reply(models_help)
             return
 
         target_m = parts[1].strip()
         aliases = {
+            "3.8": "gemini-3.8-flash-high",
+            "flash": "gemini-3.8-flash-high",
+            "3.8-flash": "gemini-3.8-flash-high",
+            "3.8-flash-high": "gemini-3.8-flash-high",
+            "3.8-med": "gemini-3.8-flash-medium",
+            "3.8-medium": "gemini-3.8-flash-medium",
+            "3.8-lite": "gemini-3.8-flash-low",
+            "3.8-low": "gemini-3.8-flash-low",
+            "3.8-flash-low": "gemini-3.8-flash-low",
             "3.7": "gemini-3.7-flash-high",
-            "flash": "gemini-3.7-flash-high",
-            "3.5-lite": "gemini-3.5-flash-low",
-            "3.5-flash-low": "gemini-3.5-flash-low",
-            "3.5": "gemini-3.5-flash-medium",
+            "3.7-flash": "gemini-3.7-flash-high",
+            "3.7-flash-high": "gemini-3.7-flash-high",
+            "3.7-med": "gemini-3.7-flash-medium",
+            "3.7-medium": "gemini-3.7-flash-medium",
+            "3.7-lite": "gemini-3.7-flash-low",
+            "3.7-low": "gemini-3.7-flash-low",
+            "3.7-flash-low": "gemini-3.7-flash-low",
+            "flash-low": "gemini-3.8-flash-low",
+            "3.5-lite": "gemini-3.7-flash-low",
+            "3.5-flash-low": "gemini-3.7-flash-low",
+            "3.5": "gemini-3.7-flash-medium",
+            "3.6": "gemini-3.6-flash-high",
+            "3.6-flash": "gemini-3.6-flash-high",
+            "3.6-lite": "gemini-3.6-flash-low",
+            "3.6-low": "gemini-3.6-flash-low",
             "3.1-pro": "gemini-3.1-pro-high",
             "pro": "gemini-3.1-pro-high",
+            "3.1-pro-low": "gemini-3.1-pro-low",
             "sonnet": "claude-sonnet-4-6",
             "claude": "claude-sonnet-4-6",
-            "opus": "claude-opus-4-6-thinking"
+            "opus": "claude-opus-4-6-thinking",
+            "gpt": "gpt-oss-120b-medium",
+            "gpt-oss": "gpt-oss-120b-medium"
         }
         resolved = aliases.get(target_m.lower(), target_m)
         if active_model_setter:
@@ -884,7 +940,15 @@ async def handle_message(
         "!sidecars": ("⏳ *Fetching sidecar execution health...*", "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status."),
         "/sidecars": ("⏳ *Fetching sidecar execution health...*", "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status."),
         "!mcp": ("⏳ *Checking MCP daemon status...*", "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status."),
-        "/mcp": ("⏳ *Checking MCP daemon status...*", "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status.")
+        "/mcp": ("⏳ *Checking MCP daemon status...*", "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status."),
+        "!mail": ("⏳ *Checking inbound mail listener status...*", "Show inbound email listener status using /workspace/tools/zero_mail_listener.py status."),
+        "/mail": ("⏳ *Checking inbound mail listener status...*", "Show inbound email listener status using /workspace/tools/zero_mail_listener.py status."),
+        "!morning": ("⏳ *Running Crab Cavern morning rotation dispatcher...*", "Run the Crab Cavern morning rotation dispatcher using /workspace/tools/morning_dispatcher.py --dispatch."),
+        "/morning": ("⏳ *Running Crab Cavern morning rotation dispatcher...*", "Run the Crab Cavern morning rotation dispatcher using /workspace/tools/morning_dispatcher.py --dispatch."),
+        "!birthdays": ("⏳ *Checking birthdays today...*", "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py. Post any birthdays."),
+        "/birthdays": ("⏳ *Checking birthdays today...*", "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py. Post any birthdays."),
+        "!tokens": ("⏳ *Generating token budget report...*", "Run the daily token & Google AI Ultra compute budget usage report using /workspace/tools/sidecars.py token_report."),
+        "/tokens": ("⏳ *Generating token budget report...*", "Run the daily token & Google AI Ultra compute budget usage report using /workspace/tools/sidecars.py token_report.")
     }
 
     cmd_key = content.lower().split()[0] if content else ""

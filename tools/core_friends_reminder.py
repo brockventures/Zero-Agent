@@ -7,7 +7,8 @@ Scans friends_and_family_master.csv for friends marked:
   - Out of Town == FALSE
   - Last Seen >= 8 weeks ago (or never recorded)
 Excludes immediate household members.
-Formats a clean reminder listing elapsed time and contact context to prompt social planning.
+Pairs partners/couples into a single consolidated line.
+Formats a clean reminder listing elapsed time to prompt social planning.
 """
 
 import argparse
@@ -66,6 +67,86 @@ def parse_last_seen_date(last_seen_str: str) -> date | None:
             pass
     return None
 
+def find_partner(person: dict, all_contacts: list[dict]) -> dict | None:
+    """Identify if the person has a partner or spouse in the contacts database."""
+    notes = person.get("Notes & Connections", "")
+    pname = person.get("Name", "").strip()
+    paddr = person.get("Physical Address", "").strip()
+
+    patterns = [
+        r"married to ([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
+        r"partner to ([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
+        r"partner ([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
+    ]
+
+    # 1. Partner in person's notes
+    for pat in patterns:
+        m = re.search(pat, notes, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            candidate = re.sub(r"\(.*?\)", "", candidate).strip()
+            for c in all_contacts:
+                cname = c.get("Name", "").strip()
+                if cname == pname:
+                    continue
+                cname_clean = re.sub(r"\(.*?\)", "", cname).strip()
+                if candidate.lower() == cname_clean.lower():
+                    return c
+                if len(candidate) > 2 and (candidate.lower() in cname_clean.lower() or cname_clean.lower() in candidate.lower()):
+                    return c
+                if candidate.split() and candidate.split()[0].lower() == cname.split()[0].lower():
+                    if paddr and paddr == c.get("Physical Address", "").strip():
+                        return c
+
+    # 2. Check if another contact lists this person as spouse / partner
+    for c in all_contacts:
+        cname = c.get("Name", "").strip()
+        if cname == pname:
+            continue
+        cnotes = c.get("Notes & Connections", "")
+        for pat in patterns:
+            m = re.search(pat, cnotes, re.IGNORECASE)
+            if m:
+                candidate = m.group(1).strip()
+                candidate = re.sub(r"\(.*?\)", "", candidate).strip()
+                pname_clean = re.sub(r"\(.*?\)", "", pname).strip()
+                if candidate.lower() == pname_clean.lower() or candidate.lower() in pname_clean.lower():
+                    return c
+                if candidate.split() and candidate.split()[0].lower() == pname.split()[0].lower():
+                    if paddr and paddr == c.get("Physical Address", "").strip():
+                        return c
+
+    return None
+
+def format_couple_display_name(person: dict, partner: dict | None) -> str:
+    """Format single name or combined couple name."""
+    name1 = person.get("Name", "").strip()
+    if not partner:
+        return re.sub(r"\(.*?\)", "", name1).strip()
+
+    name2 = partner.get("Name", "").strip()
+    c1 = re.sub(r"\(.*?\)", "", name1).strip()
+    c2 = re.sub(r"\(.*?\)", "", name2).strip()
+    c1 = re.sub(r"\s+", " ", c1)
+    c2 = re.sub(r"\s+", " ", c2)
+
+    parts1 = c1.split()
+    parts2 = c2.split()
+
+    first1 = parts1[0] if parts1 else ""
+    first2 = parts2[0] if parts2 else ""
+    last1 = parts1[-1] if len(parts1) > 1 else ""
+    last2 = parts2[-1] if len(parts2) > 1 else ""
+
+    if last1 and last2 and last1.lower() == last2.lower():
+        if len(parts2) > 2:
+            middle2 = " ".join(parts2[1:-1])
+            if middle2 and middle2.lower() not in ("yee",):
+                return f"{first1} & {first2} {middle2} {last1}"
+        return f"{first1} & {first2} {last1}"
+    else:
+        return f"{c1} & {c2}"
+
 def check_core_friends_unseen(weeks: int = 8, as_of_date: str | None = None) -> tuple[bool, str, list[dict]]:
     """Identify Core local friends who have not been seen in >= weeks.
     
@@ -81,10 +162,11 @@ def check_core_friends_unseen(weeks: int = 8, as_of_date: str | None = None) -> 
     cutoff_date = ref_date - timedelta(days=cutoff_days)
 
     qualifying = []
+    seen_names = set()
 
     for person in contacts:
         name = person.get("Name", "").strip()
-        if not name or name in HOUSEHOLD_MEMBERS:
+        if not name or name in HOUSEHOLD_MEMBERS or name in seen_names:
             continue
 
         core = str(person.get("Core", "")).strip().upper() == "TRUE"
@@ -94,15 +176,33 @@ def check_core_friends_unseen(weeks: int = 8, as_of_date: str | None = None) -> 
         if not core or out_of_town:
             continue
 
+        partner = find_partner(person, contacts)
+        partner_name = partner.get("Name", "").strip() if partner else ""
+
+        # Mark both as seen so we don't duplicate
+        seen_names.add(name)
+        if partner_name:
+            seen_names.add(partner_name)
+
         raw_last_seen = person.get("Last Seen", "").strip()
         ls_date = parse_last_seen_date(raw_last_seen)
 
+        # If partner has a newer or recorded date, use that if person has None
+        if partner:
+            p_last_seen = partner.get("Last Seen", "").strip()
+            p_ls_date = parse_last_seen_date(p_last_seen)
+            if ls_date is None and p_ls_date is not None:
+                ls_date = p_ls_date
+                raw_last_seen = p_last_seen
+
+        display_name = format_couple_display_name(person, partner)
+
         if ls_date is None:
             # Never seen or no date recorded
-            days_ago = None
-            weeks_ago = None
             qualifying.append({
                 "name": name,
+                "partner_name": partner_name,
+                "display_name": display_name,
                 "last_seen_raw": raw_last_seen or "-",
                 "last_seen_date": None,
                 "days_ago": 9999,
@@ -120,6 +220,8 @@ def check_core_friends_unseen(weeks: int = 8, as_of_date: str | None = None) -> 
             time_str = f"`{ls_date.isoformat()}` (~{int(weeks_ago)} weeks / {days_ago} days ago)"
             qualifying.append({
                 "name": name,
+                "partner_name": partner_name,
+                "display_name": display_name,
                 "last_seen_raw": raw_last_seen,
                 "last_seen_date": ls_date.isoformat(),
                 "days_ago": days_ago,
@@ -145,36 +247,14 @@ def check_core_friends_unseen(weeks: int = 8, as_of_date: str | None = None) -> 
     ]
 
     for i, p in enumerate(qualifying, 1):
-        loc_str = ""
-        if p["address"]:
-            # Extract city/state if present
-            m = re.search(r",\s*([^,]+,\s*[A-Z]{2}(?:\s*\d{5})?)", p["address"])
-            if m:
-                loc_str = f" ({m.group(1).strip()})"
-            else:
-                loc_str = f" ({p['address'][:35]})"
-
-        lines.append(f"{i}. **{p['name']}**{loc_str}")
-        lines.append(f"   • **Last Seen:** {p['time_str']}")
-        if p["notes"]:
-            notes_snip = p['notes']
-            if len(notes_snip) > 100:
-                notes_snip = notes_snip[:97] + "..."
-            lines.append(f"   • **Notes:** _{notes_snip}_")
-        
-        contact_bits = []
-        if p["phone"]:
-            contact_bits.append(p["phone"])
-        if p["email"]:
-            contact_bits.append(f"`{p['email']}`")
-        if contact_bits:
-            lines.append(f"   • **Contact:** {' · '.join(contact_bits)}")
-        lines.append("")
+        disp = p.get("display_name") or p["name"]
+        lines.append(f"{i}. **{disp}**")
+        lines.append(f"   • **Last Seen:** {p['time_str']}\n")
 
     lines.append("_Consider reaching out to organize dinner, drinks, playdates, or weekend plans!_")
     lines.append("\n[CHOICES: View Full Friends Sheet | Remind Me in 2 Weeks | Dismiss]")
 
-    return True, "\n".join(lines), qualifying
+    return True, "\n".join(lines).strip(), qualifying
 
 def main():
     parser = argparse.ArgumentParser(description="Zero Monthly Core Friends Reconnect Reminder")

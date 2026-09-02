@@ -17,7 +17,7 @@ SSH_KEY = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists(
 SSH_USER = os.environ.get("NAS_SSH_USER", "Brock")
 
 def _resolve_nas_config():
-    ssh_port = os.environ.get("NAS_SSH_PORT", "22")
+    ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
     host_1 = os.environ.get("NAS_HOST_1_IP")
     host_2 = os.environ.get("NAS_HOST_2_IP")
 
@@ -101,9 +101,11 @@ def _validate_dir(compose_dir: str) -> str:
     if not compose_dir:
         raise ValueError("compose_dir is required for compose_* actions")
     clean = os.path.normpath(compose_dir.strip())
-    if not clean.startswith(COMPOSE_ROOT):
-        raise ValueError(f"compose_dir must be an absolute path under {COMPOSE_ROOT}")
+    allowed_roots = tuple(p.strip() for p in os.environ.get("ALLOWED_DOCKER_ROOTS", "/docker/").split(","))
+    if not any(clean.startswith(r) for r in allowed_roots) and not re.match(r"^/vol\w+/docker/", clean):
+        raise ValueError(f"compose_dir must be an absolute path under authorized docker roots ({allowed_roots})")
     return clean
+
 
 @server.tool()
 def nas_docker(action: str, host: str = None, compose_dir: str = "", service: str = "", tail: int = 80) -> str:
@@ -227,6 +229,27 @@ def nas_docker(action: str, host: str = None, compose_dir: str = "", service: st
 if __name__ == "__main__":
     import sys
     port = 8767
+    cli_args = [a for a in sys.argv[1:] if not a.startswith("--")]
+
+    if cli_args:
+        action = cli_args[0].lower()
+        if action in ("list", "ls"):
+            action = "ps"
+        service = cli_args[1] if len(cli_args) > 1 else ""
+        compose_dir = cli_args[2] if len(cli_args) > 2 else ""
+        host = None
+        tail = 80
+        for a in sys.argv[1:]:
+            if a.startswith("--host="):
+                host = a.split("=", 1)[1]
+            elif a.startswith("--tail="):
+                try:
+                    tail = int(a.split("=", 1)[1])
+                except ValueError:
+                    pass
+        print(nas_docker(action=action, host=host, compose_dir=compose_dir, service=service, tail=tail))
+        sys.exit(0)
+
     for arg in sys.argv[1:]:
         if arg.startswith("--port="):
             port = int(arg.split("=")[1])
@@ -236,4 +259,5 @@ if __name__ == "__main__":
         server.run(transport="sse", host="127.0.0.1", port=port)
     else:
         server.run(transport="stdio")
+
 

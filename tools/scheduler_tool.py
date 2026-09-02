@@ -15,9 +15,10 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import tools.bridge_state as bs
 
 PT = ZoneInfo("America/Los_Angeles")
-DATA_DIR = Path("/workspace/data")
+DATA_DIR = bs.DATA_DIR
 SCHEDULE_FILE = DATA_DIR / "schedule.json"
 
 log = logging.getLogger("scheduler_tool")
@@ -160,6 +161,102 @@ DEFAULT_JOBS = [
         "prompt": "Check for local Core friends we have not seen in at least 8 weeks using /workspace/tools/core_friends_reminder.py --quiet. Post the reminder to help plan social gatherings.",
         "catchup_if_missed": True,
         "catchup_window_seconds": 86400
+    },
+    {
+        "id": "morning_topic_rotation",
+        "name": "Crab Cavern Morning Topic Rotation",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 9,
+        "minute_pt": 30,
+        "prompt": "Run the Crab Cavern morning rotation dispatcher using /workspace/tools/morning_dispatcher.py --dispatch.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "antigravity_check",
+        "name": "Antigravity CLI Check",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 10,
+        "minute_pt": 0,
+        "prompt": "Check for Antigravity CLI updates using /workspace/tools/update_antigravity.py.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "ha_battery_check",
+        "name": "Home Assistant IoT Battery Watchdog",
+        "enabled": True,
+        "schedule_type": "weekly",
+        "day_of_week": 0,  # Monday
+        "hour_pt": 10,
+        "minute_pt": 0,
+        "prompt": "Run the Home Assistant IoT battery watchdog check using /workspace/tools/ha_battery_check.py.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "nas_storage_check",
+        "name": "Synology Storage & Array Health Check",
+        "enabled": True,
+        "schedule_type": "weekly",
+        "day_of_week": 2,  # Wednesday
+        "hour_pt": 10,
+        "minute_pt": 0,
+        "prompt": "Run the Synology storage & array health check using /workspace/tools/nas_storage_check.py.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "ha_update_check",
+        "name": "Home Assistant Stable Update Check",
+        "enabled": True,
+        "schedule_type": "weekly",
+        "day_of_week": 4,  # Friday
+        "hour_pt": 10,
+        "minute_pt": 30,
+        "prompt": "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "dockhand_update",
+        "name": "Dockhand Image Check",
+        "enabled": True,
+        "schedule_type": "weekly",
+        "day_of_week": 6,  # Sunday
+        "hour_pt": 11,
+        "minute_pt": 0,
+        "prompt": "Run the Dockhand container image check using /workspace/tools/dockhand_update.py.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "weekly_proactive_digest",
+        "name": "Option B Weekly Proactive Digest",
+        "enabled": True,
+        "schedule_type": "weekly",
+        "day_of_week": 6,  # Sunday
+        "hour_pt": 8,
+        "minute_pt": 0,
+        "prompt": "Run the Option B weekly proactive digest using /workspace/tools/weekly_digest.py.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "plex_weekly_digest",
+        "name": "Plex Weekly New Media Digest",
+        "enabled": True,
+        "schedule_type": "weekly",
+        "day_of_week": 6,  # Sunday
+        "hour_pt": 9,
+        "minute_pt": 0,
+        "prompt": "Run the Plex weekly new media digest using /workspace/tools/plex_weekly_digest.py.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "daily_token_budget_report",
+        "name": "Daily Token & AI Ultra Budget Report",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 23,
+        "minute_pt": 59,
+        "prompt": "Run the daily token & Google AI Ultra compute budget usage report using /workspace/tools/sidecars.py token_report.",
+        "catchup_if_missed": False
     }
 ]
 
@@ -213,37 +310,122 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
 
     return now_pt.timestamp() + 3600
 
+SIDECAR_ALIASES = {
+    "heartbeat_sweep": ["heartbeat", "heartbeat_sweep"],
+    "nightly_triage": ["triage", "nightly_triage"],
+    "nas_logs": ["nas_logs"],
+    "dreaming": ["dream", "dreaming"],
+    "session_rollover": ["session_rollover"],
+    "plex_cleanup": ["plex", "plex_cleanup"],
+    "dated_reminders": ["reminders", "dated_reminders"],
+    "ev9_monitor": ["ev9", "ev9_monitor"],
+    "marketing_sweep": ["marketing", "marketing_sweep"],
+    "memory_doctor": ["doctor", "memory_doctor"],
+    "daily_birthday_reminder": ["daily_birthday_reminder", "birthday_reminder", "birthdays"],
+    "weekly_social_last_seen_review": ["weekly_social_review", "social_review", "weekly_social_last_seen_review"],
+    "monthly_core_friends_reconnect": ["monthly_core_friends_reminder", "core_friends", "monthly_core_friends_reconnect"],
+    "morning_topic_rotation": ["morning_topic_rotation", "morning_dispatcher"],
+    "antigravity_check": ["update_antigravity", "antigravity_check"],
+    "ha_battery_check": ["ha_battery", "ha_battery_check"],
+    "nas_storage_check": ["nas_storage", "nas_storage_check"],
+    "ha_update_check": ["ha_update_check"],
+    "dockhand_update": ["dockhand_check", "dockhand_update"],
+    "weekly_proactive_digest": ["weekly_digest", "weekly_proactive_digest"],
+    "plex_weekly_digest": ["plex_weekly_digest"],
+    "daily_token_budget_report": ["daily_token_report", "token_report", "daily_token_budget_report"]
+}
+
+def get_last_execution_for_job(job_info: str | dict) -> tuple[float | None, str | None]:
+    """Retrieve the latest known execution timestamp and formatted PT string for a job across all sources."""
+    job_id = job_info.get("id", job_info) if isinstance(job_info, dict) else str(job_info)
+    aliases = list(SIDECAR_ALIASES.get(job_id, [job_id]))
+    if job_id not in aliases:
+        aliases.insert(0, job_id)
+
+    status_file = bs.DATA_DIR / "sidecar_status.json"
+    latest_epoch = None
+    latest_pt = None
+
+    if status_file.exists():
+        try:
+            with open(status_file, "r") as f:
+                smap = json.load(f)
+            for a in aliases:
+                if a in smap:
+                    entry = smap[a]
+                    epoch = entry.get("timestamp_epoch")
+                    pt_str = entry.get("timestamp_pt")
+                    if epoch and (latest_epoch is None or epoch > latest_epoch):
+                        latest_epoch = epoch
+                        latest_pt = pt_str
+        except Exception:
+            pass
+
+    if isinstance(job_info, dict):
+        sched_epoch = job_info.get("last_run_ts")
+        sched_pt = job_info.get("last_run_at")
+        if sched_epoch and (latest_epoch is None or sched_epoch > latest_epoch):
+            latest_epoch = sched_epoch
+            latest_pt = sched_pt
+
+    return latest_epoch, latest_pt
+
 def load_schedule() -> list[dict]:
-    """Load schedule.json, seeding defaults if missing."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not SCHEDULE_FILE.exists():
-        save_schedule(DEFAULT_JOBS)
-        return DEFAULT_JOBS
+    """Load schedule.json, seeding defaults if missing and reconciling with sidecar_status.json."""
+    bs.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    sched_file = bs.DATA_DIR / "schedule.json"
+    if not sched_file.exists():
+        jobs = [dict(d) for d in DEFAULT_JOBS]
+        for j in jobs:
+            last_epoch, last_pt = get_last_execution_for_job(j)
+            if last_epoch:
+                j["last_run_ts"] = last_epoch
+                j["last_run_at"] = last_pt
+            j["next_run_ts"] = calculate_next_run(j)
+        save_schedule(jobs)
+        return jobs
 
     try:
-        with open(SCHEDULE_FILE, "r") as f:
+        with open(sched_file, "r") as f:
             jobs = json.load(f)
-            # Ensure any new defaults exist
-            existing_ids = {j["id"] for j in jobs}
-            updated = False
-            for d in DEFAULT_JOBS:
-                if d["id"] not in existing_ids:
-                    jobs.append(d)
-                    updated = True
-            if updated:
-                save_schedule(jobs)
-            return jobs
+        
+        # Ensure any new defaults exist
+        existing_ids = {j["id"] for j in jobs}
+        updated = False
+        for d in DEFAULT_JOBS:
+            if d["id"] not in existing_ids:
+                job_entry = dict(d)
+                last_epoch, last_pt = get_last_execution_for_job(job_entry)
+                if last_epoch:
+                    job_entry["last_run_ts"] = last_epoch
+                    job_entry["last_run_at"] = last_pt
+                job_entry["next_run_ts"] = calculate_next_run(job_entry)
+                jobs.append(job_entry)
+                updated = True
+
+        # Reconcile historical executions from sidecar_status.json
+        for j in jobs:
+            last_epoch, last_pt = get_last_execution_for_job(j)
+            if last_epoch and (not j.get("last_run_ts") or last_epoch > j.get("last_run_ts", 0)):
+                j["last_run_ts"] = last_epoch
+                j["last_run_at"] = last_pt
+                updated = True
+
+        if updated:
+            save_schedule(jobs)
+        return jobs
     except Exception as e:
-        log.error("Failed reading %s: %s — using defaults", SCHEDULE_FILE, e)
+        log.error("Failed reading schedule.json: %s — using defaults", e)
         return DEFAULT_JOBS
 
 def save_schedule(jobs: list[dict]):
     """Persist schedule safely with an atomic write."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = SCHEDULE_FILE.with_suffix(".tmp")
+    bs.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    sched_file = bs.DATA_DIR / "schedule.json"
+    tmp = sched_file.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(jobs, f, indent=2)
-    tmp.replace(SCHEDULE_FILE)
+    tmp.replace(sched_file)
 
 def format_schedule_summary() -> str:
     """Format upcoming schedule in clean Option 3 inline bullets."""

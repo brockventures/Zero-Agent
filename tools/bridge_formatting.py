@@ -44,7 +44,7 @@ def convert_markdown_tables(text: str) -> str:
         line = lines[i]
         # Detect markdown table header followed by separator (|---|---|)
         if line.strip().startswith("|") and i + 1 < len(lines) and re.match(r"^\s*\|?\s*[-:]+[-| :]*$", lines[i + 1]):
-            headers = [c.strip() for c in line.strip().strip("|").split("|")]
+            headers = [re.sub(r"^\*\*|\*\*$", "", c).strip() for c in line.strip().strip("|").split("|")]
             i += 2  # skip header and separator
             table_rows = []
             while i < len(lines) and lines[i].strip().startswith("|"):
@@ -52,23 +52,43 @@ def convert_markdown_tables(text: str) -> str:
                 table_rows.append(cells)
                 i += 1
 
+            # Detect if this is a comparison or complex multi-column table
+            is_comparison = False
+            if len(headers) >= 3:
+                h0 = headers[0].lower()
+                if h0 in ("feature", "attribute", "metric", "criteria", "aspect", "comparison", "spec", "parameter", "vs"):
+                    is_comparison = True
+                elif any(len(r) > 1 and (len(r[1]) > 25 or "(" in r[1]) for r in table_rows):
+                    is_comparison = True
+                elif any(len(r) > 2 and (len(r[2]) > 25 or "(" in r[2]) for r in table_rows):
+                    is_comparison = True
+
             for row in table_rows:
                 if not row or not any(row):
                     continue
                 first = re.sub(r"^\*\*|\*\*$", "", row[0]).strip()
-                second = row[1] if len(row) > 1 else ""
-                notes = " · ".join(c for c in row[2:] if c) if len(row) > 2 else ""
 
-                if second and notes:
-                    line_formatted = f"• **{first}** ({second}): {notes}"
-                elif second:
-                    line_formatted = f"• **{first}** ({second})"
-                elif notes:
-                    line_formatted = f"• **{first}**: {notes}"
+                if is_comparison and len(headers) >= 3:
+                    out.append(f"• **{first}**:")
+                    for col_idx in range(1, len(headers)):
+                        if col_idx < len(row) and row[col_idx]:
+                            clean_col = re.sub(r"^\*\*|\*\*$", "", headers[col_idx]).strip()
+                            val = row[col_idx]
+                            out.append(f"  - *{clean_col}*: {val}")
+                elif len(row) == 2 or (len(headers) == 2 and len(row) >= 2):
+                    val = row[1].strip()
+                    out.append(f"• **{first}**: {val}")
                 else:
-                    line_formatted = f"• **{first}**"
-
-                out.append(line_formatted)
+                    second = row[1] if len(row) > 1 else ""
+                    notes = " · ".join(c for c in row[2:] if c) if len(row) > 2 else ""
+                    if second and notes:
+                        out.append(f"• **{first}** ({second}): {notes}")
+                    elif second:
+                        out.append(f"• **{first}** ({second})")
+                    elif notes:
+                        out.append(f"• **{first}**: {notes}")
+                    else:
+                        out.append(f"• **{first}**")
             continue
         out.append(line)
         i += 1

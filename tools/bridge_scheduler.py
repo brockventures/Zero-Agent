@@ -317,6 +317,80 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Crab Cavern morning rotation dispatch error: {e}")
         return
 
+    # Daily birthday reminder: silent execution unless someone has a birthday today
+    if "birthday_reminder.py" in prompt or job_name in ("Daily Birthday Reminder", "Birthday Reminder") or "sidecars.py birthdays" in prompt:
+        try:
+            from tools.sidecars import run_sidecar_job, run_birthday_reminders
+            ok, out, extra = run_sidecar_job("daily_birthday_reminder", "Daily Birthday Reminder", run_birthday_reminders)
+            has_bday = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
+            if has_bday and out and out.strip() and bot:
+                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                if ch:
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    if choice_view:
+                        await ch.send(clean_content, view=choice_view)
+                    else:
+                        await ch.send(clean_content)
+            else:
+                print("[Scheduler] Daily birthday reminder checked: 0 birthdays today (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Daily birthday reminder execution error: {e}")
+        return
+
+    # Weekly social & last seen review: silent execution unless qualifying events found
+    if "social_last_seen_review.py" in prompt or job_name in ("Weekly Social & Last Seen Review", "Weekly Social Review") or "sidecars.py social_review" in prompt:
+        try:
+            from tools.sidecars import run_sidecar_job, run_social_last_seen_review
+            ok, out, extra = run_sidecar_job("weekly_social_review", "Weekly Social & Last Seen Review", run_social_last_seen_review)
+            has_events = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
+            if has_events and out and out.strip() and bot:
+                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                if ch:
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    if choice_view:
+                        await ch.send(clean_content, view=choice_view)
+                    else:
+                        await ch.send(clean_content)
+            else:
+                print("[Scheduler] Weekly social review checked: 0 updates (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Weekly social review execution error: {e}")
+        return
+
+    # Monthly core friends reconnect reminder: silent execution unless unseen core friends found
+    if "core_friends_reminder.py" in prompt or job_name in ("Monthly Core Friends Social Planning Reminder", "Monthly Core Friends Social Reminder", "Core Friends Reminder") or "sidecars.py core_friends" in prompt:
+        try:
+            from tools.sidecars import run_sidecar_job, run_core_friends_reminder
+            ok, out, extra = run_sidecar_job("monthly_core_friends_reminder", "Monthly Core Friends Social Reminder", run_core_friends_reminder)
+            has_friends = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
+            if has_friends and out and out.strip() and bot:
+                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                if ch:
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    if choice_view:
+                        await ch.send(clean_content, view=choice_view)
+                    else:
+                        await ch.send(clean_content)
+            else:
+                print("[Scheduler] Monthly core friends reminder checked: all caught up (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Monthly core friends reminder execution error: {e}")
+        return
+
+    # Daily token & AI Ultra compute budget report
+    if "token_report" in prompt or job_name in ("Daily Token & AI Ultra Budget Report", "Daily Token Budget Report", "Token Report"):
+        try:
+            from tools.sidecars import run_sidecar_job, run_token_report
+            ok, rep, _ = run_sidecar_job("daily_token_report", "Daily Token Budget Report", run_token_report)
+            if rep and bot:
+                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                if ch:
+                    for chunk in chunk_text(rep):
+                        await ch.send(chunk)
+        except Exception as e:
+            print(f"[Scheduler] Token report execution error: {e}")
+        return
+
     if bot and turn_queue:
         ch = bot.get_channel(TARGET_CHANNEL_ID)
         if not ch:
@@ -337,6 +411,56 @@ async def dispatch_scheduled_prompt(
         })
 
 
+def should_run_job(job: dict, now_ts: float) -> tuple[bool, str]:
+    """
+    Evaluates whether a scheduled job that has reached or exceeded its next_run_ts
+    should execute right now, checking ground-truth execution history across all logs.
+
+    Returns:
+        (should_run: bool, reason: str)
+    """
+    if not job.get("enabled", True):
+        return False, "disabled"
+
+    next_ts = job.get("next_run_ts")
+    if not next_ts:
+        return False, "missing_next_run_ts"
+
+    if now_ts < next_ts:
+        return False, "not_due"
+
+    # Query ground-truth execution time from sidecar_status.json and schedule.json
+    try:
+        from tools.scheduler_tool import get_last_execution_for_job
+        last_run, _ = get_last_execution_for_job(job)
+    except Exception:
+        last_run = job.get("last_run_ts", 0)
+
+    last_run = last_run or 0
+    stype = job.get("schedule_type", "daily")
+    window = job.get("catchup_window_seconds", 7200)
+    min_period = 86400 * 0.7 if stype == "daily" else (7 * 86400 * 0.7 if stype == "weekly" else window)
+
+    # 1. Guard against double-running if it already ran for this slot or in the current schedule period
+    if (last_run >= next_ts - 300) or (last_run and (now_ts - last_run) < min_period):
+        return False, f"already ran in current period (last_run_ts={last_run})"
+
+    overdue = now_ts - next_ts
+
+    # 2. If within normal scheduler loop interval jitter (within 60s)
+    if overdue <= 60:
+        return True, "on_time"
+
+    # 3. Job is overdue (>60s past scheduled next_run_ts, e.g. due to restart/offline downtime)
+    if not job.get("catchup_if_missed", False):
+        return False, f"overdue ({overdue:.0f}s late) with catchup_if_missed=False"
+
+    if overdue > window:
+        return False, f"overdue ({overdue:.0f}s late) exceeding catchup window ({window}s)"
+
+    return True, f"catchup within window ({overdue:.0f}s late <= {window}s)"
+
+
 class KarakosScheduler:
     """Karakos-style persistent JSON-backed background scheduler for sidecars."""
     def __init__(
@@ -355,32 +479,64 @@ class KarakosScheduler:
         self._running = False
         self._task = None
 
-    async def start(self):
-        self._running = True
-        # Check for missed jobs on startup (e.g. catchup if container was briefly offline)
+    async def _evaluate_and_dispatch_jobs(self, is_startup: bool = False):
+        """Evaluate all jobs in schedule.json, strictly enforcing catchup window rules and persistence."""
         try:
             from tools.scheduler_tool import load_schedule, save_schedule, calculate_next_run
             jobs = load_schedule()
             now_ts = time.time()
+            jobs_to_dispatch = []
+            updated = False
+
             for j in jobs:
                 if not j.get("enabled", True):
                     continue
-                next_ts = j.get("next_run_ts", 0)
-                if next_ts and now_ts > next_ts:
-                    window = j.get("catchup_window_seconds", 7200)
-                    if j.get("catchup_if_missed") and (now_ts - next_ts) <= window:
-                        print(f"[KarakosScheduler] Catching up missed job: {j['name']}")
-                        await self.dispatch_fn(j["prompt"], job_name=j['name'])
-                    j["last_run_ts"] = now_ts
+
+                next_ts = j.get("next_run_ts")
+                if not next_ts:
+                    j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
+                    updated = True
+                    continue
+
+                if now_ts >= next_ts:
+                    should_run, reason = should_run_job(j, now_ts)
+
+                    # Advance next_run_ts to future occurrence regardless of run or skip
                     if j.get("schedule_type") == "one_shot":
                         j["enabled"] = False
                         j["next_run_ts"] = None
                     else:
                         j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
-            save_schedule(jobs)
-        except Exception as e:
-            print(f"[KarakosScheduler] Startup catchup error: {e}")
 
+                    prefix = "[KarakosScheduler Startup]" if is_startup else "[KarakosScheduler]"
+                    if should_run:
+                        j["last_run_ts"] = now_ts
+                        j["last_run_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
+                        print(f"{prefix} Triggering {j['name']} ({reason}, next: {j['next_run_ts']})")
+                        jobs_to_dispatch.append((j["prompt"], j["name"]))
+                    else:
+                        print(f"{prefix} Skipping {j['name']} ({reason}, advanced next to: {j['next_run_ts']})")
+
+                    updated = True
+
+            # CRITICAL: Persist schedule to disk BEFORE dispatching
+            if updated:
+                save_schedule(jobs)
+
+            # Dispatch all eligible jobs
+            for prompt, name in jobs_to_dispatch:
+                try:
+                    await self.dispatch_fn(prompt, job_name=name)
+                except Exception as de:
+                    print(f"[KarakosScheduler] Error dispatching {name}: {de}")
+
+        except Exception as e:
+            print(f"[KarakosScheduler] Error evaluating jobs: {e}")
+
+    async def start(self):
+        self._running = True
+        # Evaluate missed/due jobs on startup
+        await self._evaluate_and_dispatch_jobs(is_startup=True)
         self._task = asyncio.create_task(self._loop())
 
     async def stop(self):
@@ -392,36 +548,8 @@ class KarakosScheduler:
         global _last_bot_status_mtime
         while self._running:
             try:
-                from tools.scheduler_tool import load_schedule, save_schedule, calculate_next_run
-                jobs = load_schedule()
                 now_ts = time.time()
-                updated = False
-
-                for j in jobs:
-                    if not j.get("enabled", True):
-                        continue
-                    next_ts = j.get("next_run_ts")
-                    if not next_ts:
-                        j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
-                        updated = True
-                        continue
-
-                    if now_ts >= next_ts:
-                        j["last_run_ts"] = now_ts
-                        j["last_run_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
-                        if j.get("schedule_type") == "one_shot":
-                            j["enabled"] = False
-                            j["next_run_ts"] = None
-                        else:
-                            j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
-                        print(f"[KarakosScheduler] Triggering job: {j['name']} (advanced next_run_ts to {j['next_run_ts']})")
-                        # CRITICAL: Persist updated next_run_ts to disk BEFORE dispatching
-                        # so any downstream failure or crash can NEVER cause an infinite retry loop
-                        save_schedule(jobs)
-                        try:
-                            await self.dispatch_fn(j["prompt"], job_name=j['name'])
-                        except Exception as de:
-                            print(f"[KarakosScheduler] Error dispatching {j['name']}: {de}")
+                await self._evaluate_and_dispatch_jobs(is_startup=False)
 
                 # Liveness Beacon & Wedge Check (Karakos Pattern: >420s unbroken silence while PROCESSING)
                 if BEACON_FILE.exists():

@@ -1,6 +1,8 @@
 ---
 name: transcript-search
-description: Fast SQLite FTS5 search across historical agent session transcripts, long-term memory documents, and Discord channel message history. Use to recall past debugging steps, decisions, tool parameters, or incidents.
+description: >-
+  Use this skill whenever searching historical agent session transcripts, durable memory documents (/workspace/memory/), or Discord channel history.
+  Executes fast SQLite FTS5 BM25-ranked full-text search to recall past debugging steps, decisions, tool parameters, or past user discussions.
 ---
 
 # 🔍 Transcript & Memory FTS5 Search Skill

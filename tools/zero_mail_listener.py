@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Zero Dedicated Inbound Email Listener Daemon (Hardened with Anti-Flood / Anti-DDoS Circuit Breaker).
 
-Maintains a fast polling loop against Gmail for emails addressed to zero@example.com.
+Maintain a fast polling loop against Gmail for emails addressed to Zero's address.
 Features:
 - Prompt injection & zero-width character sanitization.
 - Flood / DDoS Circuit Breaker (collapses surges > 5 emails/min into a single digest).
@@ -15,6 +15,8 @@ import sys
 import time
 import re
 import html
+import signal
+import subprocess
 import unicodedata
 import urllib.request
 import urllib.parse
@@ -32,6 +34,21 @@ LOG_FILE = os.environ.get("ZERO_MAIL_LOG", os.path.join(STATE_DIR, "zero_mail_li
 
 POLL_INTERVAL = 15  # seconds
 TIMEOUT = 15
+
+def _resolve_target_email() -> str:
+    target = os.environ.get("ZERO_TARGET_EMAIL", os.environ.get("ZERO_EMAIL", ""))
+    if not target and os.path.exists(ENV_PATH):
+        try:
+            with open(ENV_PATH) as f:
+                for line in f:
+                    if line.startswith("ZERO_EMAIL="):
+                        target = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+        except Exception:
+            pass
+    return target or "zero@example.com"
+
+TARGET_EMAIL = _resolve_target_email()
 
 # Anti-Flood & Rate Limiting Thresholds
 MAX_INDIVIDUAL_PER_CYCLE = 3   # Max individual Discord alerts per 15s tick
@@ -163,140 +180,301 @@ def post_discord(bot_token: str, channel_id: str, content: str):
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
         return resp.status in (200, 201)
 
-def main():
-    log("Starting Zero Inbound Email Listener Daemon (Anti-Flood Guard Active)...")
-    env = load_env()
-    bot_token = env.get("DISCORD_BOT_TOKEN")
-    channel_id = env.get("DISCORD_CHANNEL_ID", "1542081375287640084")
+PID_FILE = os.path.join(STATE_DIR, "zero_mail_listener.pid")
 
-    if not bot_token:
-        log("ERROR: DISCORD_BOT_TOKEN missing in .env. Exiting.")
-        sys.exit(1)
+_running = True
 
-    seen_ids = load_seen()
-    is_initial_sync = (len(seen_ids) == 0)
+def _handle_exit_signal(signum, frame):
+    global _running
+    log(f"Received signal {signum}, stopping email listener cleanly...")
+    _running = False
 
-    if is_initial_sync:
-        log("Initial run: Seeding existing zero@example.com emails...")
-        try:
-            tok = get_access_token()
-            query = urllib.parse.quote("to:zero@example.com")
-            url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={query}&maxResults=30"
-            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-                data = json.loads(resp.read().decode())
-                for m in data.get("messages", []):
-                    seen_ids.add(m["id"])
-            save_seen(seen_ids)
-            log(f"Seeded {len(seen_ids)} existing messages. Now listening for new mail.")
-        except Exception as e:
-            log(f"Error during seeding: {e}")
+def is_process_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
 
-    log(f"Listener active (polling every {POLL_INTERVAL}s for 'to:zero@example.com is:unread')...")
+def get_listener_pid() -> int | None:
+    if not os.path.exists(PID_FILE):
+        return None
+    try:
+        with open(PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        if is_process_running(pid):
+            return pid
+        else:
+            try:
+                os.unlink(PID_FILE)
+            except OSError:
+                pass
+            return None
+    except Exception:
+        return None
 
-    while True:
-        try:
-            tok = get_access_token()
-            query = urllib.parse.quote("to:zero@example.com is:unread")
-            url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={query}&maxResults=20"
-            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
-            
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-                data = json.loads(resp.read().decode())
-                messages = data.get("messages", [])
+def get_status() -> dict:
+    pid = get_listener_pid()
+    return {
+        "running": pid is not None,
+        "pid": pid,
+        "log_file": LOG_FILE,
+        "poll_interval": POLL_INTERVAL,
+        "target": TARGET_EMAIL,
+        "seen_file": SEEN_FILE
+    }
 
-            # Filter out already seen IDs
-            new_msgs = [m for m in messages if m["id"] not in seen_ids]
+def run_loop():
+    global _running
+    signal.signal(signal.SIGTERM, _handle_exit_signal)
+    signal.signal(signal.SIGINT, _handle_exit_signal)
 
-            if new_msgs:
-                log(f"Detected {len(new_msgs)} new unread email(s) for Zero.")
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
 
-                # CIRCUIT BREAKER: Surge / Flood Detection
-                if len(new_msgs) >= FLOOD_SURGE_THRESHOLD:
-                    log(f"⚠️ SURGE DETECTED: {len(new_msgs)} emails in single tick. Collapsing into flood digest.")
-                    
-                    # Fetch metadata for summary
-                    senders = []
-                    for m in new_msgs:
-                        mid = m["id"]
-                        seen_ids.add(mid)
+    try:
+        log("Starting Zero Inbound Email Listener Daemon (Anti-Flood Guard Active)...")
+        env = load_env()
+        bot_token = env.get("DISCORD_BOT_TOKEN")
+        channel_id = env.get("DISCORD_CHANNEL_ID", "1542081375287640084")
+
+        if not bot_token:
+            log("ERROR: DISCORD_BOT_TOKEN missing in .env. Exiting.")
+            return
+
+        seen_ids = load_seen()
+        is_initial_sync = (len(seen_ids) == 0)
+
+        if is_initial_sync:
+            log(f"Initial run: Seeding existing read {TARGET_EMAIL} emails...")
+            try:
+                tok = get_access_token()
+                query = urllib.parse.quote(f"to:{TARGET_EMAIL} -is:unread")
+                url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={query}&maxResults=50"
+                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                    data = json.loads(resp.read().decode())
+                    for m in data.get("messages", []):
+                        seen_ids.add(m["id"])
+                save_seen(seen_ids)
+                log(f"Seeded {len(seen_ids)} existing read messages. Now listening for new mail.")
+            except Exception as e:
+                log(f"Error during seeding: {e}")
+
+        log(f"Listener active (polling every {POLL_INTERVAL}s for 'to:{TARGET_EMAIL} is:unread')...")
+
+        while _running:
+            try:
+                tok = get_access_token()
+                query = urllib.parse.quote(f"to:{TARGET_EMAIL} is:unread")
+                url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={query}&maxResults=20"
+                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+                
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                    data = json.loads(resp.read().decode())
+                    messages = data.get("messages", [])
+
+                # Filter out already seen IDs
+                new_msgs = [m for m in messages if m["id"] not in seen_ids]
+
+                if new_msgs:
+                    log(f"Detected {len(new_msgs)} new unread email(s) for Zero.")
+
+                    # CIRCUIT BREAKER: Surge / Flood Detection
+                    if len(new_msgs) >= FLOOD_SURGE_THRESHOLD:
+                        log(f"⚠️ SURGE DETECTED: {len(new_msgs)} emails in single tick. Collapsing into flood digest.")
+                        
+                        # Fetch metadata for summary
+                        senders = []
+                        for m in new_msgs:
+                            mid = m["id"]
+                            seen_ids.add(mid)
+                            try:
+                                m_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=metadata"
+                                m_req = urllib.request.Request(m_url, headers={"Authorization": f"Bearer {tok}"})
+                                with urllib.request.urlopen(m_req, timeout=TIMEOUT) as m_resp:
+                                    m_data = json.loads(m_resp.read().decode())
+                                    headers = {h["name"].lower(): h["value"] for h in m_data.get("payload", {}).get("headers", [])}
+                                    senders.append(sanitize_text(headers.get("from", "Unknown"), 40))
+                            except Exception:
+                                pass
+
+                        save_seen(seen_ids)
+
+                        # Tally top senders
+                        top_senders = Counter(senders).most_common(3)
+                        senders_str = ", ".join([f"`{s}` ({cnt})" for s, cnt in top_senders])
+
+                        surge_msg = (
+                            f"🛡️ **Inbound Email Surge Suppressed (`{TARGET_EMAIL}`)**\n"
+                            f"• **Volume:** `{len(new_msgs)}` new emails received in last {POLL_INTERVAL}s.\n"
+                            f"• **Top Senders:** {senders_str}\n"
+                            f"• **Action Taken:** Individual alert cards suppressed to protect Discord channel. Details preserved for Nightly Assistant.\n\n"
+                            f"-# 🔒 *Anti-DDoS Circuit Breaker Active.*"
+                        )
                         try:
+                            post_discord(bot_token, channel_id, surge_msg)
+                        except Exception as de:
+                            log(f"Failed to post surge digest: {de}")
+
+                    else:
+                        # Normal volume: post individual cards (capped at MAX_INDIVIDUAL_PER_CYCLE)
+                        for m in new_msgs[:MAX_INDIVIDUAL_PER_CYCLE]:
+                            mid = m["id"]
                             m_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=metadata"
                             m_req = urllib.request.Request(m_url, headers={"Authorization": f"Bearer {tok}"})
                             with urllib.request.urlopen(m_req, timeout=TIMEOUT) as m_resp:
                                 m_data = json.loads(m_resp.read().decode())
-                                headers = {h["name"].lower(): h["value"] for h in m_data.get("payload", {}).get("headers", [])}
-                                senders.append(sanitize_text(headers.get("from", "Unknown"), 40))
-                        except Exception:
-                            pass
 
-                    save_seen(seen_ids)
+                            snippet = m_data.get("snippet", "")
+                            headers = {h["name"].lower(): h["value"] for h in m_data.get("payload", {}).get("headers", [])}
+                            sender = headers.get("from", "Unknown")
+                            subject = headers.get("subject", "(No Subject)")
+                            to_addr = headers.get("to", "").lower()
+                            cc_addr = headers.get("cc", "").lower()
+                            delivered = headers.get("delivered-to", "").lower()
+                            x_fwd = headers.get("x-forwarded-to", "").lower()
+                            all_recipients = f"{to_addr} {cc_addr} {delivered} {x_fwd}"
 
-                    # Tally top senders
-                    top_senders = Counter(senders).most_common(3)
-                    senders_str = ", ".join([f"`{s}` ({cnt})" for s, cnt in top_senders])
+                            if TARGET_EMAIL.lower() not in all_recipients:
+                                seen_ids.add(mid)
+                                continue
 
-                    surge_msg = (
-                        f"🛡️ **Inbound Email Surge Suppressed (`zero@example.com`)**\n"
-                        f"• **Volume:** `{len(new_msgs)}` new emails received in last {POLL_INTERVAL}s.\n"
-                        f"• **Top Senders:** {senders_str}\n"
-                        f"• **Action Taken:** Individual alert cards suppressed to protect Discord channel. Details preserved for Nightly Assistant.\n\n"
-                        f"-# 🔒 *Anti-DDoS Circuit Breaker Active.*"
-                    )
-                    try:
-                        post_discord(bot_token, channel_id, surge_msg)
-                    except Exception as de:
-                        log(f"Failed to post surge digest: {de}")
+                            clean_sender = sanitize_text(sender, 50)
+                            clean_subj = sanitize_text(subject, 70)
+                            clean_snippet = sanitize_text(snippet, 120)
 
-                else:
-                    # Normal volume: post individual cards (capped at MAX_INDIVIDUAL_PER_CYCLE)
-                    for m in new_msgs[:MAX_INDIVIDUAL_PER_CYCLE]:
-                        mid = m["id"]
-                        m_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=metadata"
-                        m_req = urllib.request.Request(m_url, headers={"Authorization": f"Bearer {tok}"})
-                        with urllib.request.urlopen(m_req, timeout=TIMEOUT) as m_resp:
-                            m_data = json.loads(m_resp.read().decode())
+                            log(f"New email from {clean_sender}: '{clean_subj}'")
 
-                        snippet = m_data.get("snippet", "")
-                        headers = {h["name"].lower(): h["value"] for h in m_data.get("payload", {}).get("headers", [])}
-                        sender = headers.get("from", "Unknown")
-                        subject = headers.get("subject", "(No Subject)")
-                        to_addr = headers.get("to", "")
+                            msg_body = (
+                                f"📬 **New Email Received for Zero** (`{TARGET_EMAIL}`)\n"
+                                f"• **From:** `{clean_sender}`\n"
+                                f"• **Subject:** *\"{clean_subj}\"*\n"
+                                f"• **Preview:** {clean_snippet}\n\n"
+                                f"-# 🔒 *Operational Guardrail Active: Presented for human review. No autonomous actions taken.*"
+                            )
 
-                        delivered = headers.get("delivered-to", "").lower()
-                        if "zero@example.com" not in to_addr.lower() and "zero@example.com" not in delivered:
+                            try:
+                                post_discord(bot_token, channel_id, msg_body)
+                                log(f"Discord notification posted for message {mid}")
+                            except Exception as de:
+                                log(f"Failed to post to Discord: {de}")
+
                             seen_ids.add(mid)
-                            continue
+                            time.sleep(DISCORD_POST_DELAY)
 
-                        clean_sender = sanitize_text(sender, 50)
-                        clean_subj = sanitize_text(subject, 70)
-                        clean_snippet = sanitize_text(snippet, 120)
+                        save_seen(seen_ids)
 
-                        log(f"New email from {clean_sender}: '{clean_subj}'")
+            except Exception as e:
+                log(f"Polling loop exception: {e}")
 
-                        msg_body = (
-                            f"📬 **New Email Received for Zero** (`zero@example.com`)\n"
-                            f"• **From:** `{clean_sender}`\n"
-                            f"• **Subject:** *\"{clean_subj}\"*\n"
-                            f"• **Preview:** {clean_snippet}\n\n"
-                            f"-# 🔒 *Operational Guardrail Active: Presented for human review. No autonomous actions taken.*"
-                        )
+            for _ in range(POLL_INTERVAL):
+                if not _running:
+                    break
+                time.sleep(1)
 
-                        try:
-                            post_discord(bot_token, channel_id, msg_body)
-                            log(f"Discord notification posted for message {mid}")
-                        except Exception as de:
-                            log(f"Failed to post to Discord: {de}")
+    finally:
+        try:
+            if os.path.exists(PID_FILE):
+                os.unlink(PID_FILE)
+        except OSError:
+            pass
+        log("Zero Inbound Email Listener stopped cleanly.")
 
-                        seen_ids.add(mid)
-                        time.sleep(DISCORD_POST_DELAY)
+def start_daemon_background() -> bool:
+    """Start listener in detached background process."""
+    pid = get_listener_pid()
+    if pid:
+        log(f"Email listener already running (PID {pid}).")
+        return True
 
-                    save_seen(seen_ids)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    log_fp = open(LOG_FILE, "a")
+    proc = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "run"],
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        cwd="/workspace"
+    )
 
-        except Exception as e:
-            log(f"Polling loop exception: {e}")
+    # Verify process started
+    for _ in range(20):
+        if proc.poll() is not None:
+            print(f"[Email Listener] ERROR: Process exited prematurely with code {proc.returncode}.", file=sys.stderr)
+            return False
+        if get_listener_pid() is not None:
+            print(f"[Email Listener] Successfully started inbound email listener (PID {proc.pid}).")
+            return True
+        time.sleep(0.1)
 
-        time.sleep(POLL_INTERVAL)
+    print(f"[Email Listener] Spawned process (PID {proc.pid}).")
+    return True
+
+def stop_daemon() -> bool:
+    """Stop the running email listener process."""
+    pid = get_listener_pid()
+    if not pid:
+        print("[Email Listener] Listener is not running.")
+        return True
+
+    print(f"[Email Listener] Stopping email listener (PID {pid})...")
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(25):
+            if not is_process_running(pid):
+                break
+            time.sleep(0.1)
+        if is_process_running(pid):
+            print(f"[Email Listener] Process {pid} did not exit gracefully, sending SIGKILL...")
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(0.2)
+    except Exception as e:
+        print(f"[Email Listener] Error while stopping PID {pid}: {e}")
+
+    try:
+        if os.path.exists(PID_FILE):
+            os.unlink(PID_FILE)
+    except OSError:
+        pass
+    print("[Email Listener] Stopped.")
+    return True
+
+def ensure_mail_listener_running() -> bool:
+    """Helper for bridge orchestrator and startup hooks."""
+    pid = get_listener_pid()
+    if pid:
+        return True
+    return start_daemon_background()
 
 if __name__ == "__main__":
-    main()
+    cmd = sys.argv[1].lower() if len(sys.argv) > 1 else "status"
+    if cmd == "run":
+        run_loop()
+    elif cmd == "start":
+        ok = start_daemon_background()
+        sys.exit(0 if ok else 1)
+    elif cmd == "stop":
+        ok = stop_daemon()
+        sys.exit(0 if ok else 1)
+    elif cmd == "restart":
+        stop_daemon()
+        time.sleep(0.5)
+        ok = start_daemon_background()
+        sys.exit(0 if ok else 1)
+    elif cmd == "status":
+        st = get_status()
+        status_str = "🟢 RUNNING" if st["running"] else "🔴 STOPPED"
+        print(f"**Zero Inbound Email Listener**: {status_str}")
+        if st["pid"]:
+            print(f"• **PID**: `{st['pid']}`")
+        print(f"• **Target**: `{st['target']}`")
+        print(f"• **Poll Interval**: `{st['poll_interval']}s`")
+        print(f"• **Log File**: `{st['log_file']}`")
+    elif cmd == "json":
+        print(json.dumps(get_status(), indent=2))
+    else:
+        print(f"Usage: {sys.argv[0]} [run|start|stop|restart|status|json]")
+        sys.exit(1)

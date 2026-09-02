@@ -1,6 +1,7 @@
 ---
 name: set-status
-description: Sets live Discord presence, custom activity messages, and status states (online, idle, dnd, custom, watching, playing) so peer bots and users know the active operating state in real time.
+description: >-
+  Use this skill whenever updating Zero's live Discord presence, custom activity message, or state string (online, idle, dnd, watching, playing) to broadcast active task focus to peer agents and users.
 ---
 
 # 🟢 Set-Status Skill (Discord Bot Presence & Activity)

@@ -11,7 +11,7 @@ if not os.path.exists(WORKSPACE_SECRETS_PATH) and os.path.exists("/workspace/con
     WORKSPACE_SECRETS_PATH = "/workspace/config/google_oauth.json"
 
 def _resolve_nas_config():
-    ssh_port = os.environ.get("NAS_SSH_PORT", "22")
+    ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
     host_1 = os.environ.get("NAS_HOST_1_IP")
     host_2 = os.environ.get("NAS_HOST_2_IP")
 

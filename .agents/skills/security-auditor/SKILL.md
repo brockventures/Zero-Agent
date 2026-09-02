@@ -1,6 +1,8 @@
 ---
 name: security-auditor
-description: Specialized security architecture audit skill. Performs deep automated scanning for hardcoded secrets, tokens, private IPs, and personal PII; validates git staging & .gitignore segregation defense; audits Indirect Prompt Injection (IPI) boundaries and container isolation.
+description: >-
+  Use this skill prior to committing code, sharing repositories, or publishing artifacts to scan for hardcoded secrets, private tokens, private IPs, and personal PII.
+  Also audits Indirect Prompt Injection (IPI) boundaries, multi-tenant agent permissions, and container isolation.
 ---
 
 # 🛡️ Security Auditor & Exfiltration Defense Skill
