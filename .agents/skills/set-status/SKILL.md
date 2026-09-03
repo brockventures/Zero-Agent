@@ -6,7 +6,7 @@ description: >-
 
 # 🟢 Set-Status Skill (Discord Bot Presence & Activity)
 
-The **Set-Status** skill enables Zero (and autonomous sidecars) to update Discord bot activity and presence strings in real time. In multi-bot channels (#agent-chat, Crab Cavern), knowing an agent's current state (e.g. *Crunching in #agent-chat*, *Auditing Git Commits*, *Idle | Ready*) prevents crosstalk, informs users, and provides visibility without noisy chat polling.
+The **Set-Status** skill enables Zero (and autonomous sidecars) to update Discord bot activity and presence strings in real time. In multi-bot channels (#the-banana-stand, Crab Cavern), knowing an agent's current state (e.g. *Crunching in #the-banana-stand*, *Auditing Git Commits*, *Idle | Ready*) prevents crosstalk, informs users, and provides visibility without noisy chat polling.
 
 ---
 
@@ -22,7 +22,7 @@ The **Set-Status** skill enables Zero (and autonomous sidecars) to update Discor
 
 ### 1. Update Custom Activity String
 ```bash
-python3 /workspace/tools/set_status.py "Investigating memory leak in #agent-chat"
+python3 /workspace/tools/set_status.py "Investigating memory leak in #the-banana-stand"
 ```
 
 ### 2. Set Status State (online, idle, dnd) with Activity Type
@@ -66,7 +66,7 @@ reset_status()
 | Status | Activity Type | Example Display in Discord |
 |---|---|---|
 | `online` | `custom` | *Zero is online and ready.* |
-| `dnd` | `custom` | *Crunching in #agent-chat...* |
+| `dnd` | `custom` | *Crunching in #the-banana-stand...* |
 | `online` | `watching` | *Watching: Docker containers* |
 | `online` | `listening` | *Listening to: Plex Transcode Stream* |
 | `online` | `playing` | *Playing: D&D 5e Combat Tracker* |

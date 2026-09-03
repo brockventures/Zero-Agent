@@ -10,6 +10,7 @@ Ensures all scheduled sidecars follow the 5-layer lifecycle protocol:
 """
 
 import argparse
+import ast
 import importlib.util
 import json
 import os
@@ -50,36 +51,57 @@ def extract_sidecar_action(prompt: str) -> str | None:
 
 
 def get_sidecars_py_actions() -> set[str]:
-    """Parse supported actions handled in tools/sidecars.py."""
+    """Parse supported actions handled in tools/sidecars.py using AST analysis."""
     actions = set()
     if not SIDECARS_FILE.exists():
         return actions
     try:
-        content = SIDECARS_FILE.read_text()
-        matches = re.findall(r'elif\s+action\s*(?:==|\bin\b)\s*\(?([\'"][a-zA-Z0-9_\-]+[\'"](?:\s*,\s*[\'"][a-zA-Z0-9_\-]+[\'"])*)\)?', content)
-        for group in matches:
-            for act in re.findall(r'[\'"]([a-zA-Z0-9_\-]+)[\'"]', group):
-                actions.add(act)
-        if re.search(r'if\s+action\s*==\s*[\'"]([a-zA-Z0-9_\-]+)[\'"]', content):
-            first = re.search(r'if\s+action\s*==\s*[\'"]([a-zA-Z0-9_\-]+)[\'"]', content).group(1)
-            actions.add(first)
+        tree = ast.parse(SIDECARS_FILE.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                # Is action on left?
+                if isinstance(node.left, ast.Name) and node.left.id == "action":
+                    for op, comparator in zip(node.ops, node.comparators):
+                        if isinstance(op, ast.Eq):
+                            if isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
+                                actions.add(comparator.value)
+                        elif isinstance(op, ast.In):
+                            if isinstance(comparator, (ast.Tuple, ast.List, ast.Set)):
+                                for elt in comparator.elts:
+                                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                        actions.add(elt.value)
+                # Is action on right? (e.g. "foo" == action)
+                for op, comparator in zip(node.ops, node.comparators):
+                    if isinstance(comparator, ast.Name) and comparator.id == "action":
+                        if isinstance(op, ast.Eq):
+                            if isinstance(node.left, ast.Constant) and isinstance(node.left.value, str):
+                                actions.add(node.left.value)
+            elif isinstance(node, ast.Match):
+                if isinstance(node.subject, ast.Name) and node.subject.id == "action":
+                    for case in node.cases:
+                        if isinstance(case.pattern, ast.MatchValue) and isinstance(case.pattern.value, ast.Constant):
+                            if isinstance(case.pattern.value.value, str):
+                                actions.add(str(case.pattern.value.value))
     except Exception as e:
-        print(f"[Auditor] Error reading sidecars.py: {e}", file=sys.stderr)
+        print(f"[Auditor] Error reading sidecars.py AST: {e}", file=sys.stderr)
     return actions
 
 
 def get_bridge_triggers() -> set[str]:
-    """Parse on-demand command triggers from tools/bridge_handlers.py."""
+    """Parse on-demand command triggers from tools/bridge_handlers.py using AST analysis."""
     triggers = set()
     if not HANDLERS_FILE.exists():
         return triggers
     try:
-        content = HANDLERS_FILE.read_text()
-        matches = re.findall(r'["\'](![a-zA-Z0-9_\-]+)["\']\s*:', content)
-        for t in matches:
-            triggers.add(t.lstrip("!"))
+        tree = ast.parse(HANDLERS_FILE.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for k in node.keys:
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                        if k.value.startswith("!") or k.value.startswith("/"):
+                            triggers.add(k.value.lstrip("!/"))
     except Exception as e:
-        print(f"[Auditor] Error reading bridge_handlers.py: {e}", file=sys.stderr)
+        print(f"[Auditor] Error reading bridge_handlers.py AST: {e}", file=sys.stderr)
     return triggers
 
 
@@ -325,10 +347,12 @@ def test_job(job_id: str, timeout: int = 45):
         return 1
 
     print(f"⏳ Running test for '{job_id}' ({script_path}) with {timeout}s timeout...")
+    act = extract_sidecar_action(prompt)
+    cmd_args = [act] if act else ["--test"]
     start = time.time()
     try:
         res = subprocess.run(
-            [sys.executable, str(script_path), "--test"],
+            [sys.executable, str(script_path)] + cmd_args,
             capture_output=True,
             text=True,
             timeout=timeout

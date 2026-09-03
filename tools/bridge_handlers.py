@@ -47,6 +47,7 @@ from tools.bridge_state import (
     is_reload_intent,
     sync_credentials,
     PT_TZ,
+    is_home_channel,
 )
 from tools.bridge_formatting import (
     format_command_preview,
@@ -76,6 +77,30 @@ channel_last_bot_reply = {}
 active_turn_task = None
 active_status_msg = None
 has_notified_ready = False
+
+# Multi-Channel Concurrency State
+channel_queues = {}             # channel_id -> asyncio.Queue
+channel_active_tasks = {}       # channel_id -> asyncio.Task
+channel_active_status_msgs = {} # channel_id -> discord.Message
+channel_concurrency_semaphore = None
+
+
+def get_channel_queue(channel_id: int | str) -> asyncio.Queue:
+    """Get or create dedicated FIFO queue for a specific channel or thread."""
+    cid = int(channel_id) if str(channel_id).isdigit() else channel_id
+    if cid not in channel_queues:
+        channel_queues[cid] = asyncio.Queue()
+    return channel_queues[cid]
+
+
+def get_concurrency_semaphore() -> asyncio.Semaphore:
+    """Shared concurrency limiter for background/secondary channels."""
+    global channel_concurrency_semaphore
+    if channel_concurrency_semaphore is None:
+        rules = get_runtime_rules()
+        max_workers = int(rules.get("max_parallel_workers", 3))
+        channel_concurrency_semaphore = asyncio.Semaphore(max_workers)
+    return channel_concurrency_semaphore
 
 
 class ChoiceButton(discord.ui.Button):
@@ -191,6 +216,16 @@ def is_bridge_busy(home_queue=None, ext_queue=None) -> list[str]:
         busy.append("#zero-chat")
     if ext_busy:
         busy.append("Crab Cavern")
+    for cid, t in channel_active_tasks.items():
+        if t and not t.done():
+            ch_name = "#zero-chat" if cid == TARGET_CHANNEL_ID else f"channel:{cid}"
+            if ch_name not in busy:
+                busy.append(ch_name)
+    for cid, q in channel_queues.items():
+        if not q.empty():
+            ch_name = "#zero-chat" if cid == TARGET_CHANNEL_ID else f"channel:{cid}"
+            if ch_name not in busy:
+                busy.append(ch_name)
     return busy
 
 
@@ -305,68 +340,141 @@ async def run_thread_turn_worker(item, bot: discord.Client, presence_fn=None, bu
             del thread_active_tasks[tid]
 
 
-async def queue_worker(home_turn_queue, bot: discord.Client, presence_fn=None, button_choice_fn=None, quick_choice_view_cls=QuickChoiceView, reload_fn=None):
-    """Sequential worker processing queued turns for #zero-chat and home operations."""
+async def run_channel_turn_worker(
+    channel_id: int,
+    ch_queue: asyncio.Queue,
+    bot: discord.Client,
+    presence_fn=None,
+    button_choice_fn=None,
+    quick_choice_view_cls=QuickChoiceView,
+    reload_fn=None
+):
+    """Dedicated worker processing turns for a specific channel sequentially."""
     global active_turn_task, active_status_msg
-    while True:
-        item = await home_turn_queue.get()
-        prompt = item["prompt"]
-        status_msg = item["status_msg"]
-        reply_target = item["reply_target"]
-        attachments = item["attachments"]
-        channel_id = item.get("channel_id", TARGET_CHANNEL_ID)
-        is_thread_task = item.get("is_thread_task", False) or (reply_target and isinstance(getattr(reply_target, "channel", None), discord.Thread))
+    is_home_root = (channel_id == TARGET_CHANNEL_ID)
+    sem = get_concurrency_semaphore()
 
-        if is_thread_task:
-            t_task = asyncio.create_task(run_thread_turn_worker(item, bot, presence_fn, button_choice_fn, quick_choice_view_cls))
-            tid = getattr(getattr(reply_target, "channel", None), "id", None) or getattr(reply_target, "id", None) or channel_id
-            thread_active_tasks[tid] = t_task
+    try:
+        while not ch_queue.empty():
+            try:
+                item = ch_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            prompt = item["prompt"]
+            status_msg = item.get("status_msg")
+            reply_target = item.get("reply_target")
+            attachments = item.get("attachments", [])
+
+            if is_home_root:
+                active_turn_task = asyncio.current_task()
+                active_status_msg = status_msg
+            if status_msg:
+                channel_active_status_msgs[channel_id] = status_msg
+
+            try:
+                async def _exec():
+                    if reply_target and hasattr(reply_target, "channel") and hasattr(reply_target.channel, "typing"):
+                        async with reply_target.channel.typing():
+                            await execute_agy_turn(
+                                prompt, status_msg, reply_target, attachments,
+                                mode="home", channel_id=channel_id,
+                                apply_presence_fn=presence_fn,
+                                button_choice_fn=button_choice_fn,
+                                quick_choice_view_cls=quick_choice_view_cls
+                            )
+                    elif reply_target and hasattr(reply_target, "typing"):
+                        async with reply_target.typing():
+                            await execute_agy_turn(
+                                prompt, status_msg, reply_target, attachments,
+                                mode="home", channel_id=channel_id,
+                                apply_presence_fn=presence_fn,
+                                button_choice_fn=button_choice_fn,
+                                quick_choice_view_cls=quick_choice_view_cls
+                            )
+                    else:
+                        await execute_agy_turn(
+                            prompt, status_msg, reply_target, attachments,
+                            mode="home", channel_id=channel_id,
+                            apply_presence_fn=presence_fn,
+                            button_choice_fn=button_choice_fn,
+                            quick_choice_view_cls=quick_choice_view_cls
+                        )
+
+                # Priority Fast-Lane: #zero-chat runs immediately without semaphore gating.
+                # Background channels acquire the concurrency semaphore.
+                if is_home_root:
+                    await _exec()
+                else:
+                    async with sem:
+                        await _exec()
+
+            except Exception as e:
+                print(f"[Channel Worker {channel_id}] Error in turn execution: {e}")
+                try:
+                    if hasattr(reply_target, "reply"):
+                        await reply_target.reply(f"⚠️ **Error executing task:** {e}")
+                    elif hasattr(reply_target, "send"):
+                        await reply_target.send(f"⚠️ **Error executing task:** {e}")
+                except Exception:
+                    pass
+            finally:
+                if is_home_root:
+                    active_turn_task = None
+                    active_status_msg = None
+                channel_active_status_msgs.pop(channel_id, None)
+                ch_queue.task_done()
+
+            # Immediate post-turn check for reload flag
+            reload_flag = DATA_DIR / "reload_bridge.flag"
+            if reload_flag.exists():
+                try:
+                    reload_flag.unlink()
+                except Exception:
+                    pass
+                print(f"[Channel Worker {channel_id}] Post-turn reload flag detected. Executing in-place reload...")
+                if reload_fn:
+                    await reload_fn(None, initiator="agent", force=True, reason="Post-turn in-place reload flag")
+                else:
+                    await execute_bridge_reload(bot, None, initiator="agent", force=True, reason="Post-turn in-place reload flag")
+
+    finally:
+        channel_active_tasks.pop(channel_id, None)
+
+
+async def queue_worker(home_turn_queue, bot: discord.Client, presence_fn=None, button_choice_fn=None, quick_choice_view_cls=QuickChoiceView, reload_fn=None):
+    """Central home dispatcher routing turns to parallel per-channel workers."""
+    try:
+        while True:
+            item = await home_turn_queue.get()
+            reply_target = item.get("reply_target")
+            channel_id = item.get("channel_id", TARGET_CHANNEL_ID)
+            is_thread_task = item.get("is_thread_task", False) or (reply_target and isinstance(getattr(reply_target, "channel", None), discord.Thread))
+
+            if is_thread_task:
+                t_task = asyncio.create_task(run_thread_turn_worker(item, bot, presence_fn, button_choice_fn, quick_choice_view_cls))
+                tid = getattr(getattr(reply_target, "channel", None), "id", None) or getattr(reply_target, "id", None) or channel_id
+                thread_active_tasks[tid] = t_task
+                home_turn_queue.task_done(item)
+                continue
+
+            cid = int(channel_id) if str(channel_id).isdigit() else channel_id
+            q = get_channel_queue(cid)
+            await q.put(item)
             home_turn_queue.task_done(item)
-            continue
 
-        active_turn_task = asyncio.current_task()
-        active_status_msg = status_msg
-        try:
-            if reply_target and hasattr(reply_target, "channel"):
-                async with reply_target.channel.typing():
-                    await execute_agy_turn(
-                        prompt, status_msg, reply_target, attachments,
-                        mode="home", channel_id=channel_id,
-                        apply_presence_fn=presence_fn,
-                        button_choice_fn=button_choice_fn,
-                        quick_choice_view_cls=quick_choice_view_cls
+            existing_task = channel_active_tasks.get(cid)
+            if existing_task is None or existing_task.done():
+                t = asyncio.create_task(
+                    run_channel_turn_worker(
+                        cid, q, bot, presence_fn, button_choice_fn, quick_choice_view_cls, reload_fn
                     )
-            else:
-                await execute_agy_turn(
-                    prompt, status_msg, reply_target, attachments,
-                    mode="home", channel_id=channel_id,
-                    apply_presence_fn=presence_fn,
-                    button_choice_fn=button_choice_fn,
-                    quick_choice_view_cls=quick_choice_view_cls
                 )
-        except Exception as e:
-            print(f"[Queue Worker] Error in turn execution: {e}")
-            try:
-                await reply_target.reply(f"⚠️ **Error executing task:** {e}")
-            except Exception:
-                pass
-        finally:
-            active_turn_task = None
-            active_status_msg = None
-            home_turn_queue.task_done(item)
-
-        # Immediate post-turn check for reload flag
-        reload_flag = DATA_DIR / "reload_bridge.flag"
-        if reload_flag.exists():
-            try:
-                reload_flag.unlink()
-            except Exception:
-                pass
-            print("[Queue Worker] Post-turn reload flag detected. Executing in-place reload...")
-            if reload_fn:
-                await reload_fn(None, initiator="agent", force=True, reason="Post-turn in-place reload flag")
-            else:
-                await execute_bridge_reload(bot, None, initiator="agent", force=True, reason="Post-turn in-place reload flag")
+                channel_active_tasks[cid] = t
+    finally:
+        for cid, t in list(channel_active_tasks.items()):
+            if t and not t.done():
+                t.cancel()
 
 
 async def external_queue_worker(ext_turn_queue, bot: discord.Client, presence_fn=None, button_choice_fn=None, quick_choice_view_cls=QuickChoiceView, reload_fn=None):
@@ -593,8 +701,7 @@ async def handle_message(
 
     content = msg.content.strip()
     is_thread_channel = isinstance(msg.channel, discord.Thread)
-    is_home_thread = is_thread_channel and (getattr(msg.channel, "parent_id", None) == TARGET_CHANNEL_ID)
-    is_home = (msg.channel.id == TARGET_CHANNEL_ID) or is_home_thread
+    is_home = is_home_channel(msg.channel)
 
     # Always record message in channel history buffer for multi-agent situational awareness
     try:
@@ -734,11 +841,16 @@ async def handle_message(
                                 last_content = last_msg.get("content", "")
                                 asked_question = ("?" in last_content[-400:]) or ('"reply": "optional"' in last_content) or ('"floor": "open"' in last_content)
                                 is_action_or_affirmative = bool(re.search(
-                                    r"^(?:yep|yeah|yes|sure|go ahead|sounds good|do it|proceed|approved|lgtm|update|check|push|fix|please|pls|thanks|thank you|can you|could you|what about|how about|also|no|nope|wait)\b",
+                                    r"^(?:yep|yeah|yes|sure|go ahead|sounds good|do it|proceed|approved|lgtm|update|check|push|fix|please|pls|thanks|thank you|can you|could you|what about|how about|also|no|nope|wait|try|use|make|let|revert|rollback|deploy|show|tell|why|explain|see|look|run|stop|start|restart|reload|clean|add|remove|delete|set|get|test|verify|option|choice|step)\b",
                                     content.strip(),
                                     re.IGNORECASE
                                 ))
-                                if asked_question or is_action_or_affirmative:
+                                is_direct_query = bool(re.search(
+                                    r"^(?:done|status|ready|finished|how'?s|is\s+it|did\s+it|any\s+update|which|where|what)\b",
+                                    content.strip(),
+                                    re.IGNORECASE
+                                )) or ("?" in content and len(content.split()) <= 15)
+                                if asked_question or is_action_or_affirmative or is_direct_query:
                                     is_conversational_follow_up = True
                                     print(f"[Bridge] Conversational follow-up to Zero detected from {author_name} ({elapsed:.1f}s after Zero's turn) in channel {msg.channel.id}")
             except Exception as fe:
@@ -773,9 +885,13 @@ async def handle_message(
                 print(f"[Bridge] Buffered message from {author_name} in channel {msg.channel.id} (passive observer mode)")
                 return
 
-        # Clean mentions from prompt
+        # Clean mentions from prompt (only bot user and configured bot role mentions)
+        target_role_ids = {"1543462881624858624", "1542294519914037341"}
+        if req_tag:
+            target_role_ids.add(str(req_tag))
         cleaned = re.sub(rf"<@!?{bot_id}>", "", content)
-        cleaned = re.sub(r"<@&[0-9]+>", "", cleaned)
+        for rid in target_role_ids:
+            cleaned = re.sub(rf"<@&{rid}>", "", cleaned)
         cleaned = re.sub(r"^(hey\s+)?zero[:,\s]*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"^(hey\s+)?robot[:,\s]*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"@robot\b", "", cleaned, flags=re.IGNORECASE)
@@ -993,7 +1109,11 @@ async def handle_message(
         "!standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
         "/standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
         "!market_standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
-        "/market_standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch.")
+        "/market_standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
+        "!code_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics."),
+        "/code_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics."),
+        "!hardcode_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics."),
+        "/hardcode_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics.")
     }
 
     cmd_key = content.lower().split()[0] if content else ""
@@ -1082,12 +1202,15 @@ async def handle_message(
         except Exception as se:
             print(f"[Bridge] Warning sending SIGINT for steering in {msg.channel.id}: {se}")
 
-        if active_status_msg and not is_thread_channel:
+        target_st_msg = channel_active_status_msgs.get(msg.channel.id) or (active_status_msg if msg.channel.id == TARGET_CHANNEL_ID else None)
+        if target_st_msg and not is_thread_channel:
             try:
-                await active_status_msg.edit(content="~~⏳ [Task paused by new directive below]~~")
+                await target_st_msg.edit(content="~~⏳ [Task paused by new directive below]~~")
             except Exception as e:
                 print(f"[Bridge] Failed to edit old status message: {e}")
-            active_status_msg = None
+            if msg.channel.id == TARGET_CHANNEL_ID:
+                active_status_msg = None
+            channel_active_status_msgs.pop(msg.channel.id, None)
 
         try:
             await msg.channel.typing()

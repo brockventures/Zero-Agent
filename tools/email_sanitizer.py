@@ -16,6 +16,29 @@ HTML_TAG_RE = re.compile(r"<[^>]+>")
 # Discord format disarming regex
 DISCORD_PING_RE = re.compile(r"@(everyone|here|&[0-9]+|[0-9]+)")
 
+def strip_html_safely(raw_html: str) -> str:
+    """Safely strip HTML while preserving mathematical inequalities, shell syntax, and plaintext."""
+    if not raw_html or ("<" not in raw_html and "&" not in raw_html):
+        return raw_html
+
+    try:
+        from bs4 import BeautifulSoup, Comment
+        soup = BeautifulSoup(raw_html, "html.parser")
+        for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
+            comment.extract()
+        for tag in soup(["script", "style", "iframe", "object", "embed"]):
+            tag.decompose()
+        for tag in soup.find_all(style=re.compile(r"display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0|opacity\s*:\s*0", re.I)):
+            tag.decompose()
+        return soup.get_text(separator=" ")
+    except Exception:
+        # Fallback: strip tags BEFORE unescaping entities so &lt; / &gt; in technical text are not eaten
+        text = HTML_COMMENT_RE.sub("", raw_html)
+        text = SCRIPT_STYLE_RE.sub("", text)
+        text = HIDDEN_STYLE_RE.sub("", text)
+        text = HTML_TAG_RE.sub(" ", text)
+        return html.unescape(text)
+
 def sanitize_email_text(raw_text: str, max_length: int = 4000) -> str:
     """Sanitize inbound email text against hidden text, injection, and formatting exploits."""
     if not raw_text:
@@ -25,20 +48,14 @@ def sanitize_email_text(raw_text: str, max_length: int = 4000) -> str:
     text = unicodedata.normalize("NFKC", raw_text)
     text = INVISIBLE_CHARS_RE.sub("", text)
     
-    # 2. Strip dangerous HTML elements and hidden blocks
-    text = HTML_COMMENT_RE.sub("", text)
-    text = SCRIPT_STYLE_RE.sub("", text)
-    text = HIDDEN_STYLE_RE.sub("", text)
+    # 2. Safely parse and strip HTML without eating mathematical expressions or shell redirects
+    text = strip_html_safely(text)
     
-    # 3. Unescape HTML entities, then strip remaining tags
-    text = html.unescape(text)
-    text = HTML_TAG_RE.sub(" ", text)
-    
-    # 4. Collapse whitespace
+    # 3. Collapse whitespace
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     
-    # 5. Length ceiling truncation
+    # 4. Length ceiling truncation
     if len(text) > max_length:
         text = text[: max_length - 3] + "..."
         

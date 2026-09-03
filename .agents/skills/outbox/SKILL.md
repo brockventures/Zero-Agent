@@ -1,7 +1,7 @@
 ---
 name: outbox
 description: >-
-  Use this skill whenever queuing, broadcasting, or asynchronously spooling messages destined for other Discord channels (#lounge, #agent-chat, #zero-chat).
+  Use this skill whenever queuing, broadcasting, or asynchronously spooling messages destined for other Discord channels (#lounge, #the-banana-stand, #zero-chat).
   Enables decoupled background dispatch without blocking active execution or thread state.
 ---
 
@@ -12,7 +12,7 @@ The **Outbox** skill provides an atomic, file-backed message queue (`/workspace/
 ---
 
 ## 🎯 When to Activate This Skill
-* **Multi-Audience Summary Dispatch:** When an engineering decision or deep debate in `#agent-chat` needs an executive summary mirrored to `#lounge` or `#zero-chat`.
+* **Multi-Audience Summary Dispatch:** When an engineering decision or deep debate in `#the-banana-stand` needs an executive summary mirrored to `#lounge` or `#zero-chat`.
 * **Asynchronous Notifications:** Queuing status notifications for external channels without breaking the conversational flow of the current thread.
 * **Crash-Resilient Delivery:** Messages placed in the outbox survive timeouts, subagent crashes, or container reloads, and are dispatched by the bridge background worker.
 
@@ -22,7 +22,7 @@ The **Outbox** skill provides an atomic, file-backed message queue (`/workspace/
 
 ### 1. Queue a Message for Another Channel
 ```bash
-python3 /workspace/tools/outbox.py --channel lounge --message "🍌 Executive Summary: RFC-12 ratified in #agent-chat."
+python3 /workspace/tools/outbox.py --channel lounge --message "🍌 Executive Summary: RFC-12 ratified in #the-banana-stand."
 ```
 
 ### 2. Inspect Pending Outbox Queue
@@ -55,6 +55,11 @@ queue_outbox_message(
 
 | Bare Channel Name | Discord Channel ID | Target Audience |
 |---|---|---|
-| `agent-chat` | `1534436119888793750` | Autonomous peer agents (Zero, Amos, Marvin) |
+| `the-banana-stand` (alias: `agent-chat`) | `1534436119888793750` | Autonomous peer agents (Zero, Amos, Marvin) |
 | `lounge` | `1534452820995080192` | Shared human/bot lounge (Arbiter, Arcane, Ryan) |
 | `zero-chat` | `1542081375287640084` | Ryan's private co-pilot home channel |
+| `finances` | `1544955532765560924` | Dedicated financial operations & modeling workspace |
+| `homelab` | `1544955535722545253` | Dedicated Host1, NAS & container operations workspace |
+| `shopping` | `1544955538033348618` | Dedicated product research & deals workspace |
+| `steam-deck` | `1544953277592899615` | Dedicated Steam Deck & emulation operations workspace |
+| `home-assistant` | `1544953275877556334` | Dedicated Home Assistant operations workspace |

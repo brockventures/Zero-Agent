@@ -28,7 +28,7 @@ class TestChannelHistoryCrossChannel(unittest.TestCase):
         self.assertNotIn("CROSS-CHANNEL AWARENESS", ctx)
 
     def test_linked_channels_cross_awareness(self):
-        """Messages in lounge should include agent-chat cross-awareness, and vice versa."""
+        """Messages in lounge should include the-banana-stand cross-awareness, and vice versa."""
         lounge_id = "1534452820995080192"
         agent_chat_id = "1534436119888793750"
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -37,18 +37,18 @@ class TestChannelHistoryCrossChannel(unittest.TestCase):
             {"id": 10, "channel_id": lounge_id, "channel_name": "lounge", "author": "Ryan", "is_bot": False, "content": "Lounge topic", "timestamp": now_str}
         ])
         ch._history_store[agent_chat_id] = deque([
-            {"id": 20, "channel_id": agent_chat_id, "channel_name": "agent-chat", "author": "Amos", "is_bot": True, "content": "Robot banter", "timestamp": now_str}
+            {"id": 20, "channel_id": agent_chat_id, "channel_name": "the-banana-stand", "author": "Amos", "is_bot": True, "content": "Robot banter", "timestamp": now_str}
         ])
 
         # Formatted from lounge
         lounge_ctx = ch.format_channel_context(lounge_id, limit=5, peer_limit=5)
         self.assertIn("RECENT CHANNEL HISTORY (#lounge", lounge_ctx)
-        self.assertIn("CROSS-CHANNEL AWARENESS (#agent-chat", lounge_ctx)
+        self.assertIn("CROSS-CHANNEL AWARENESS (#the-banana-stand", lounge_ctx)
         self.assertIn("Robot banter", lounge_ctx)
 
-        # Formatted from agent-chat
+        # Formatted from the-banana-stand
         ac_ctx = ch.format_channel_context(agent_chat_id, limit=5, peer_limit=5)
-        self.assertIn("RECENT CHANNEL HISTORY (#agent-chat", ac_ctx)
+        self.assertIn("RECENT CHANNEL HISTORY (#the-banana-stand", ac_ctx)
         self.assertIn("CROSS-CHANNEL AWARENESS (#lounge", ac_ctx)
         self.assertIn("Lounge topic", ac_ctx)
 
@@ -64,7 +64,7 @@ class TestChannelHistoryCrossChannel(unittest.TestCase):
             {"id": 1, "channel_id": lounge_id, "channel_name": "lounge", "author": "Ryan", "is_bot": False, "content": "Recent lounge", "timestamp": recent_time}
         ])
         ch._history_store[agent_chat_id] = deque([
-            {"id": 2, "channel_id": agent_chat_id, "channel_name": "agent-chat", "author": "Amos", "is_bot": True, "content": "Ancient history", "timestamp": old_time}
+            {"id": 2, "channel_id": agent_chat_id, "channel_name": "the-banana-stand", "author": "Amos", "is_bot": True, "content": "Ancient history", "timestamp": old_time}
         ])
 
         ctx = ch.format_channel_context(lounge_id, limit=5, max_peer_age_seconds=3600)
@@ -72,7 +72,7 @@ class TestChannelHistoryCrossChannel(unittest.TestCase):
         self.assertNotIn("CROSS-CHANNEL AWARENESS", ctx)
 
     def test_thread_parent_channel_resolution(self):
-        """A thread under lounge should identify agent-chat as a peer via parent_channel_id."""
+        """A thread under lounge should identify the-banana-stand as a peer via parent_channel_id."""
         lounge_id = "1534452820995080192"
         thread_id = "999888777666"
         agent_chat_id = "1534436119888793750"
@@ -82,12 +82,12 @@ class TestChannelHistoryCrossChannel(unittest.TestCase):
             {"id": 100, "channel_id": thread_id, "channel_name": "thread-task", "author": "Ryan", "is_bot": False, "content": "Thread message", "timestamp": now_str}
         ])
         ch._history_store[agent_chat_id] = deque([
-            {"id": 200, "channel_id": agent_chat_id, "channel_name": "agent-chat", "author": "Amos", "is_bot": True, "content": "Peer activity", "timestamp": now_str}
+            {"id": 200, "channel_id": agent_chat_id, "channel_name": "the-banana-stand", "author": "Amos", "is_bot": True, "content": "Peer activity", "timestamp": now_str}
         ])
 
         ctx = ch.format_channel_context(thread_id, limit=5, peer_limit=5, parent_channel_id=lounge_id)
         self.assertIn("RECENT CHANNEL HISTORY (#thread-task", ctx)
-        self.assertIn("CROSS-CHANNEL AWARENESS (#agent-chat", ctx)
+        self.assertIn("CROSS-CHANNEL AWARENESS (#the-banana-stand", ctx)
         self.assertIn("Peer activity", ctx)
 
     def test_pt_timestamp_conversion(self):

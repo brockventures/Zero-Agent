@@ -44,8 +44,7 @@ def evaluate(title: str, recurrence: int, has_automation: bool, blast_radius: st
     print("=" * 60)
     print(f"• Overall Qualification Score: {score}/100")
     print(f"• Status: {'🎉 APPROVED FOR SKILL CREATION' if approved else '🚫 REJECTED (Store in /workspace/memory/ instead)'}")
-    print("
-Detailed Breakdown:")
+    print("\nDetailed Breakdown:")
     for r in reasons:
         print(f"  {r}")
     print("=" * 60)

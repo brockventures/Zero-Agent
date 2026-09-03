@@ -52,13 +52,31 @@ Rules:
 
 Message from {author}: "{content}"'''
 
+def extract_classifier_score(output: str) -> float | None:
+    """Extract relevance score float safely without matching token counts or metadata numbers."""
+    if not output:
+        return None
+    lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
+    # 1. Look for score on a line by itself or prefixed with 'score:' (starting from bottom)
+    for line in reversed(lines):
+        m = re.search(r"^(?:score:?\s*)?(0(?:\.\d+)?|1(?:\.0+)?)$", line, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+    # 2. Look for trailing score at the end of a line
+    for line in reversed(lines):
+        m = re.search(r"(?:^|[\s:])\b(0(?:\.\d+)?|1(?:\.0+)?)\s*$", line, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+    return None
+
 def score_relevance(content: str, author: str = "user") -> float:
     """Score message relevance for Zero using ambient classifier."""
     content_clean = content.strip()
     words = content_clean.split()
 
     # Pre-filtering heuristics to save model calls:
-    if len(words) < 4 and "?" not in content_clean and "```" not in content_clean:
+    is_directive = bool(re.search(r"^(?:ship|run|deploy|push|update|test|proceed|rollback|revert|fix|merge|build|restart|reload|check|verify|clean|sync|retry|stop|start|cancel|go ahead|lgtm|approved|do it)\b", content_clean, re.I))
+    if len(words) < 4 and "?" not in content_clean and "```" not in content_clean and not is_directive:
         return 0.0
 
     # Parse handoff envelope if present
@@ -109,9 +127,8 @@ def score_relevance(content: str, author: str = "user") -> float:
             text=True,
             timeout=15
         )
-        m = re.search(r"([0-1]\.\d+|0|1)", res.stdout)
-        if m:
-            val = float(m.group(1))
+        val = extract_classifier_score(res.stdout)
+        if val is not None:
             if is_open_optional_question and val >= 0.50:
                 return max(val, 0.85)
             return val

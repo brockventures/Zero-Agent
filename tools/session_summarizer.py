@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -64,7 +65,7 @@ def extract_recent_dialogue(conv_id: str | None = None, sess_key: str | None = N
                         if ttype == "PLANNER_RESPONSE" and d.get("tool_calls"):
                             continue
                         cnt = (d.get("content") or "").strip()
-                        cnt = re.sub(r"</?[A-Z_]+>", "", cnt).strip()
+                        cnt = re.sub(r"</?(?:USER_REQUEST|SYSTEM_MESSAGE|ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|SYSTEM|TASK_OUTPUT)(?:\s+[^>]*)?>", "", cnt).strip()
                         cnt = re.sub(r"\[CHOICES:[^\]]+\]", "", cnt).strip()
                         if cnt and not cnt.startswith("<Action:"):
                             speaker = "Ryan" if ttype == "USER_INPUT" else "Zero"
@@ -96,10 +97,67 @@ def get_architecture_manifest() -> str:
     )
     return manifest
 
+def synthesize_session_milestones(dialogue: list[dict], sess_key: str) -> tuple[str, str, str]:
+    """Synthesize dynamic milestones, directives, and engineering deltas using LLM with deterministic fallback."""
+    if not dialogue:
+        milestones = "- Session Initialized: Fresh conversation thread with baseline homelab context."
+        directives = "- Standby: Ready for new user directives."
+        eng_delta = "- Initialized: Nominal baseline state."
+        return milestones, directives, eng_delta
+
+    dialogue_text = "\n".join([f"{t['speaker']}: {t['content'][:300]}" for t in dialogue[-8:]])
+    prompt = (
+        f"You are Zero, synthesizing session carry-forward context for session '{sess_key}'.\n"
+        f"Recent dialogue turns:\n{dialogue_text}\n\n"
+        f"Return ONLY valid JSON matching this schema:\n"
+        f"{{\n"
+        f"  \"milestones\": [\"- <1-sentence key achievement, decision, or deliverable completed>\"],\n"
+        f"  \"directives\": [\"- <1-sentence active focus, in-flight directive, or standing preference>\"],\n"
+        f"  \"eng_delta\": [\"- <1-sentence technical architecture/code delta completed>\"]\n"
+        f"}}"
+    )
+    try:
+        res = subprocess.run(
+            ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={prompt}"],
+            capture_output=True, text=True, timeout=15
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            m_json = re.search(r"\{[\s\S]*\}", res.stdout)
+            if m_json:
+                data = json.loads(m_json.group(0))
+                ms = "\n".join(data.get("milestones", []))
+                dr = "\n".join(data.get("directives", []))
+                ed = "\n".join(data.get("eng_delta", []))
+                if ms and dr:
+                    return ms, dr, ed or ms
+    except Exception as e:
+        print(f"[Summarizer] LLM synthesis fallback: {e}")
+
+    # Fallback to extracting recent user asks and delivered fixes
+    recent_ryan = [t['content'][:120] for t in dialogue if t['speaker'] == 'Ryan']
+    recent_zero = [t['content'][:120] for t in dialogue if t['speaker'] == 'Zero']
+
+    ms_list = []
+    if recent_zero:
+        ms_list.append(f"- Recent Deliverables: {recent_zero[-1]}")
+    if len(recent_zero) > 1:
+        ms_list.append(f"- Earlier Completed: {recent_zero[-2]}")
+    if not ms_list:
+        ms_list.append("- Active Session: Conversational pairing in flight.")
+
+    dr_list = []
+    if recent_ryan:
+        dr_list.append(f"- Active Directive: {recent_ryan[-1]}")
+    dr_list.append("- Personality & Discipline: Deadpan, forensic clarity, PT timezone, verified tests.")
+
+    ed_list = [f"- Code Delta: {ms_list[0].replace('- Recent Deliverables: ', '')}"]
+    return "\n".join(ms_list), "\n".join(dr_list), "\n".join(ed_list)
+
+
 def generate_summary(conv_id: str | None = None, sess_key: str = "home", dry_run: bool = False) -> str:
     """Generate smart rolling compaction specifically for the session identified by conv_id / sess_key."""
     recent_dialogue = extract_recent_dialogue(conv_id=conv_id, sess_key=sess_key, limit=10)
-    
+
     dialogue_formatted = []
     for turn in recent_dialogue:
         text = turn['content'].replace('\n\n', '\n').strip()
@@ -112,28 +170,24 @@ def generate_summary(conv_id: str | None = None, sess_key: str = "home", dry_run
     summary_file = DATA_DIR / f"summary_{sess_key}.md"
     eng_summary_file = DATA_DIR / f"eng_summary_{sess_key}.md"
 
+    milestones_block, directives_block, eng_delta_block = synthesize_session_milestones(recent_dialogue, sess_key)
+
     # 1. Thread-Isolated Private Summary
     summary = (
         f"<!-- Smart Rolling Compaction Generated {datetime.now(PT).strftime('%Y-%m-%d %I:%M %p PT')} [Session: {sess_key}] -->\n"
         "## 1. Compacted Earlier Session History (Milestones)\n"
-        "- Google Takeout & Profile: Deep synthesis completed for finances, family, routines, shopping, and podcasts (/workspace/memory/private/).\n"
-        "- Memory Architecture: Upgraded to Dual-Tier Partitioned Memory (/workspace/memory/public/ and /workspace/memory/private/).\n"
-        "- Operational Safeguards: Thread-isolated memory boundaries active; Crab Cavern Banana mutex active; pre-commit safety scanner deployed.\n\n"
+        f"{milestones_block}\n\n"
         "## 2. Recent Verbatim Dialogue (Line-by-Line Context)\n"
         f"{dialogue_block}\n\n"
         "## 3. Active Directives & Current Focus\n"
-        "- Context Optimization: Dual-tier memory synchronization and thread-isolated rolling compaction live.\n"
-        "- Personality: Zero persona live with deadpan, forensic clarity, and no baseball metaphors.\n"
-        "- Restarts: Never reload while a task is in flight in either #zero-chat or Crab Cavern.\n"
+        f"{directives_block}\n"
     )
 
     # 2. Sanitized Engineering Summary (for Crab Cavern)
     eng_summary = (
         f"<!-- Engineering Delta Carry-Forward {datetime.now(PT).strftime('%Y-%m-%d %I:%M %p PT')} [Session: {sess_key}] -->\n"
         "## Engineering State & Architecture Delta\n"
-        "- Architecture: Dual-tier memory (/workspace/memory/public/ vs /workspace/memory/private/) with pre-commit air-gap scanner.\n"
-        "- Session Compaction: Thread-isolated rolling compaction with per-session carry-forward deltas active in bridge.py.\n"
-        "- Multi-Agent: Banana mutex (tools/banana.py) and 2-tier ambient classifier (tools/classifier.py) verified in production.\n"
+        f"{eng_delta_block}\n"
     )
 
     if not dry_run:

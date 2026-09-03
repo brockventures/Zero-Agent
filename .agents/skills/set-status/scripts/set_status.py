@@ -52,7 +52,7 @@ def set_status(
     """
     Set and persist Discord bot status and activity.
     
-    :param activity: Status / activity text (e.g. 'Investigating memory leak in #agent-chat')
+    :param activity: Status / activity text (e.g. 'Investigating memory leak in #the-banana-stand')
     :param status: 'online', 'idle', 'dnd', or 'invisible'
     :param activity_type: 'custom', 'playing', 'watching', 'listening', 'competing'
     :param is_custom: True if set explicitly by user/agent, False if system idle default
@@ -109,7 +109,7 @@ def main():
         description="Set or inspect Zero's Discord presence status and activity string.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  python3 tools/set_status.py "Investigating memory leak in #agent-chat"
+  python3 tools/set_status.py "Investigating memory leak in #the-banana-stand"
   python3 tools/set_status.py "Docker containers" --type watching --status dnd
   python3 tools/set_status.py --status idle
   python3 tools/set_status.py --reset

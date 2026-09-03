@@ -6,7 +6,7 @@
     "properties": {
       "channel": {
         "type": "string",
-        "enum": ["general", "signals", "staff-comms", "agent-chat", "lounge", "zero-chat"],
+        "enum": ["general", "signals", "staff-comms", "the-banana-stand", "agent-chat", "lounge", "zero-chat", "steam-deck", "home-assistant", "finances", "homelab", "shopping"],
         "description": "Target bare channel name"
       },
       "content": {

@@ -257,6 +257,18 @@ DEFAULT_JOBS = [
         "minute_pt": 59,
         "prompt": "Run the daily token & Google AI Ultra compute budget usage report using /workspace/tools/sidecars.py token_report.",
         "catchup_if_missed": False
+    },
+    {
+        "id": "monthly_hardcode_regex_audit",
+        "name": "Monthly Hardcoded Rule & Regex Audit",
+        "enabled": True,
+        "schedule_type": "monthly",
+        "day_of_month": 1,
+        "hour_pt": 4,
+        "minute_pt": 30,
+        "prompt": "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics.",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 86400
     }
 ]
 
@@ -332,7 +344,8 @@ SIDECAR_ALIASES = {
     "dockhand_update": ["dockhand_check", "dockhand_update"],
     "weekly_proactive_digest": ["weekly_digest", "weekly_proactive_digest"],
     "plex_weekly_digest": ["plex_weekly_digest"],
-    "daily_token_budget_report": ["daily_token_report", "token_report", "daily_token_budget_report"]
+    "daily_token_budget_report": ["daily_token_report", "token_report", "daily_token_budget_report"],
+    "monthly_hardcode_regex_audit": ["monthly_hardcode_regex_audit", "code_audit", "hardcode_audit", "regex_audit"]
 }
 
 def get_last_execution_for_job(job_info: str | dict) -> tuple[float | None, str | None]:

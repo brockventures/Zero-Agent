@@ -36,19 +36,16 @@ def audit():
         else:
             healthy_skills.append((s.name, len(scripts), age_days))
             
-    print("
-📦 ACTIVE & HEALTHY SKILLS:")
+    print("\n📦 ACTIVE & HEALTHY SKILLS:")
     for name, num_scripts, age in healthy_skills:
         print(f"  • ✅ {name:<20} ({num_scripts} scripts | Modified {age:.1f}d ago)")
         
     if stale_candidates:
-        print("
-⚠️ PRUNING RECOMMENDATIONS (Stale / Low Utility):")
+        print("\n⚠️ PRUNING RECOMMENDATIONS (Stale / Low Utility):")
         for name, reason, age in stale_candidates:
             print(f"  • 🗑️ Propose Remove: {name} (Reason: {reason})")
     else:
-        print("
-✨ All installed skills meet quality and utility thresholds. Zero slop detected!")
+        print("\n✨ All installed skills meet quality and utility thresholds. Zero slop detected!")
     print("=" * 60)
 
 if __name__ == "__main__":

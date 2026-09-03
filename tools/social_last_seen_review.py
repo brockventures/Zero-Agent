@@ -71,7 +71,9 @@ HOUSEHOLD_MEMBERS = {
 ROUTINE_SKIP_KEYWORDS = [
     "orthodontist", "dentist", "doctor", "ob-gyn", "transfer of care",
     "consultation", "pickup", "dropoff", "swimming lesson", "solo", "workout",
-    "pt session", "meeting", "1:1", "sync", "standup"
+    "pt session", "meeting", "1:1", "sync", "standup", "interview", "review",
+    "plumber", "contractor", "invoice", "oil change", "repair", "service",
+    "checkup", "exam", "vet", "physician", "pediatrician"
 ]
 
 def normalize_phone(phone_str: str) -> str:
@@ -411,9 +413,10 @@ def format_review_message(updates: list[dict]) -> tuple[bool, str]:
     for i, u in enumerate(updates, 1):
         loc_str = f" at {u['location']}" if u.get('location') else ""
         src_str = f" `[{u.get('source', 'Interaction')}]`" if u.get('source') else ""
+        qualifier = " *(Digital Contact)*" if u.get("source") == "Text Message" else " *(In-Person)*"
         lines.append(f"{i}. **{u['name']}**")
         lines.append(f"   • **Interaction:** _{u['event_summary']}_{loc_str} on `{u['event_date']}`{src_str}")
-        lines.append(f"   • **Proposed Update:** `{u['current_last_seen']}` ➔ `{u['proposed_last_seen']}`\n")
+        lines.append(f"   • **Proposed Update:** `{u['current_last_seen']}` ➔ `{u['proposed_last_seen']}`{qualifier}\n")
 
     lines.append("_Please confirm accuracy before I write these updates to the master dataset and Google Sheet._")
     lines.append("\n[CHOICES: Confirm & Apply Last Seen Updates | Ignore Last Seen Updates]")

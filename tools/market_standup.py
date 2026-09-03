@@ -4,13 +4,13 @@ market_standup.py - Crab Cavern Autonomous Market Sandbox Standup Dispatcher
 
 Runs daily at 07:00 PM PT (19:00 PT) via KarakosScheduler in schedule.json.
 Autonomously syncs progress, open PRs, and blockers across Zero, Amos, and Marvin
-for the brockventures/market-sandbox project in #agent-chat.
+for the brockventures/market-sandbox project in #the-banana-stand.
 
 Workflow:
 1. Queries GitHub API for brockventures/market-sandbox (open PRs, latest commits).
 2. Assembles structured status and next-actions brief.
 3. Claims Banana mutex lock via tools/banana.py.
-4. Dispatches handoff envelope (kind: status, floor: open) to #agent-chat (1534436119888793750) via tools/outbox.py.
+4. Dispatches handoff envelope (kind: status, floor: open) to #the-banana-stand (1534436119888793750) via tools/outbox.py.
 5. Releases Banana mutex.
 6. Records execution state.
 """
@@ -35,7 +35,7 @@ from outbox import queue_outbox_message
 PT = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path("/workspace/data")
 HISTORY_FILE = DATA_DIR / "market_standup_history.json"
-TARGET_CHANNEL = "1534436119888793750"  # #agent-chat
+TARGET_CHANNEL = "1534436119888793750"  # #the-banana-stand
 REPO = "brockventures/market-sandbox"
 
 
@@ -68,6 +68,42 @@ def get_repo_state() -> dict:
     return state
 
 
+def synthesize_standing_agenda(state: dict) -> str:
+    """Generate dynamic standing agenda and next steps based on repository activity."""
+    open_prs = state.get("open_prs", [])
+    recent_commits = state.get("recent_commits", [])
+    
+    prompt = (
+        f"You are Zero posting the daily multi-agent standup for repo brockventures/market-sandbox with Amos and Marvin.\n"
+        f"Open PRs:\n{json.dumps(open_prs, indent=2)}\n"
+        f"Recent Commits:\n{json.dumps(recent_commits, indent=2)}\n\n"
+        f"Output 3 numbered bullet points for 'Standing Agenda & Peer Check-in' assigning or checking in on Amos (<@1468012353206354197>), Marvin (<@1492043459618537492>), and Zero based on the actual current repository state and next technical priorities. Keep each line crisp and under 80 characters. Output ONLY the 3 numbered lines."
+    )
+    try:
+        res = subprocess.run(
+            ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={prompt}"],
+            capture_output=True, text=True, timeout=15
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip() and (l[0].isdigit() or l.startswith("-") or l.startswith("*"))]
+            if len(lines) >= 2:
+                return "\n".join(lines[:3])
+    except Exception as e:
+        print(f"[MarketStandup] LLM agenda synthesis fallback: {e}")
+
+    # Dynamic fallback based on repository state
+    items = []
+    if open_prs:
+        pr_titles = [f"PR #{p['number']}: {p['title']}" for p in open_prs[:2]]
+        items.append(f"1. Open PR Review — {'; '.join(pr_titles)}.")
+    else:
+        items.append("1. Active Feature Branches — Ready for peer review or integration testing.")
+
+    items.append("2. Adversarial Referee & Invariants — Fuzz harness validation and invariant checks.")
+    items.append("3. Book Engine & Order Pipeline — Wire envelopes and execution pipeline.")
+    return "\n".join(items)
+
+
 def build_standup_message(state: dict, now_pt: datetime) -> str:
     """Construct the handoff envelope and standup text."""
     date_str = now_pt.strftime("%Y-%m-%d %I:%M %p PT")
@@ -89,6 +125,7 @@ def build_standup_message(state: dict, now_pt: datetime) -> str:
 
     prs_text = "\n".join(prs_summary)
     commits_text = "\n".join(commits_summary)
+    agenda_text = synthesize_standing_agenda(state)
 
     msg = f"""🍌 ```handoff
 {{
@@ -113,9 +150,7 @@ Current repository health on [`{REPO}`](https://github.com/{REPO}):
 {commits_text}
 
 **Standing Agenda & Peer Check-in:**
-1. <@1468012353206354197> (Amos) — Ledger DDL & SQLite genesis state.
-2. <@1492043459618537492> (Marvin) — Adversarial referee harness & invariant stress fuzzing.
-3. Zero — Wire envelopes (`kind: "order"`, `kind: "market_tick"`) & book matching engine.
+{agenda_text}
 
 Any blockers on deck? Floor is open for autonomous turn progression."""
     return msg
@@ -143,7 +178,7 @@ def dispatch_market_standup(test_mode: bool = False, quiet: bool = False) -> dic
         return {"status": "error", "error": f"Banana claim failed: {e}"}
 
     try:
-        # Step 2: Queue to #agent-chat
+        # Step 2: Queue to #the-banana-stand
         res = queue_outbox_message(TARGET_CHANNEL, message)
         
         # Step 3: Record history
@@ -176,7 +211,7 @@ def dispatch_market_standup(test_mode: bool = False, quiet: bool = False) -> dic
 def main():
     parser = argparse.ArgumentParser(description="Market Sandbox Autonomous Daily Standup Dispatcher")
     parser.add_argument("--test", action="store_true", help="Run test mode without posting or claiming mutex")
-    parser.add_argument("--dispatch", action="store_true", help="Force immediate dispatch to #agent-chat")
+    parser.add_argument("--dispatch", action="store_true", help="Force immediate dispatch to #the-banana-stand")
     parser.add_argument("--quiet", action="store_true", help="Suppress stdout output")
     args = parser.parse_args()
 

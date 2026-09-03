@@ -25,7 +25,7 @@ MAX_HISTORY_PER_CHANNEL = 40
 LINKED_CHANNEL_GROUPS = [
     {
         "1534452820995080192": "lounge",
-        "1534436119888793750": "agent-chat",
+        "1534436119888793750": "the-banana-stand",
     }
 ]
 
@@ -135,7 +135,7 @@ def format_channel_context(
     parent_channel_id: int | str | None = None
 ) -> str:
     """Format recent channel history into a clean, chronological context block for LLM turns,
-    including linked peer channels (e.g. #lounge <-> #agent-chat) when configured."""
+    including linked peer channels (e.g. #lounge <-> #the-banana-stand) when configured."""
     recent = get_recent_messages(channel_id, limit=limit, exclude_msg_id=exclude_msg_id)
     active_block = ""
     if recent:

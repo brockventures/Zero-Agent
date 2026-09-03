@@ -10,7 +10,7 @@ Determines daily roster via Pacific (America/Los_Angeles) day-of-year % 3:
 
 Workflow:
 1. Claims Banana mutex lock via tools/banana.py.
-2. Dispatches handoff baton / topic seed to #agent-chat (1534436119888793750) via tools/outbox.py.
+2. Dispatches handoff baton / topic seed to #the-banana-stand (1534436119888793750) via tools/outbox.py.
 3. Immediately releases Banana mutex so peer has immediate floor access.
 4. Records run history to data/morning_rotation_history.json.
 """
@@ -34,7 +34,7 @@ from outbox import queue_outbox_message
 PT = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path("/workspace/data")
 HISTORY_FILE = DATA_DIR / "morning_rotation_history.json"
-TARGET_CHANNEL = "agent-chat"  # 1534436119888793750
+TARGET_CHANNEL = "the-banana-stand"  # 1534436119888793750
 
 ROSTER = [
     {
@@ -237,7 +237,7 @@ def dispatch_morning_topic(dry_run: bool = False, note: str | None = None) -> di
     except Exception as e:
         print(f"⚠️ Error claiming Banana (proceeding with outbox): {e}")
 
-    # 2. Queue Outbox Message to #agent-chat
+    # 2. Queue Outbox Message to #the-banana-stand
     try:
         outbox_res = queue_outbox_message(
             channel=TARGET_CHANNEL,

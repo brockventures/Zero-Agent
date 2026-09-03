@@ -9,13 +9,57 @@ import os
 import json
 import time
 import re
+import subprocess
 import urllib.request
 import urllib.parse
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
+PT = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path("/workspace/data")
 TOPICS_FILE = DATA_DIR / "active_topics.json"
 MEM_DECISIONS = Path("/workspace/memory/crab_cavern/decisions.md")
+
+def _summarize_resolution(clean_text: str, subject: str, author_name: str) -> str:
+    """Extract or synthesize a concise technical resolution summary using LLM when appropriate."""
+    lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
+    if not lines:
+        return "(No textual content in resolution payload)"
+
+    # Fast path for very short messages
+    if len(clean_text) <= 150:
+        return " ".join(lines)
+
+    # Use LLM model to synthesize a crisp durable memory bullet
+    prompt = (
+        f"Synthesize this resolution from {author_name} regarding '{subject}' into a concise 1-2 sentence "
+        f"technical takeaway for durable engineering memory. Do not include introductory fluff or filler.\n\n"
+        f"Text:\n{clean_text[:1500]}"
+    )
+    try:
+        res = subprocess.run(
+            [
+                "agy",
+                "--model=gemini-3.8-flash-low",
+                "--disable-slash-commands",
+                f"-p={prompt}"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            # Return cleaned output
+            out = res.stdout.strip()
+            out = re.sub(r"^([*•\-\s]+)", "", out)
+            return out
+    except Exception as e:
+        print(f"[TopicTracker] LLM summarization fallback: {e}")
+
+    # Fallback to key lines
+    snippet = " ".join(lines[:4])
+    return snippet[:350] + ("..." if len(snippet) > 350 else "")
 
 def _load_topics() -> dict:
     if TOPICS_FILE.exists():
@@ -89,13 +133,13 @@ def check_and_resolve_topic(envelope: dict, content: str, author_name: str, mess
     # 2. Append to durable memory in /workspace/memory/crab_cavern/decisions.md
     try:
         clean_text = re.sub(r"```handoff.*?```", "", content, flags=re.DOTALL).strip()
-        lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
-        snippet = " ".join(lines[:10])
+        summary_text = _summarize_resolution(clean_text, subject or "general-finding", author_name)
+        now_pt_str = datetime.now(PT).strftime("%Y-%m-%d %I:%M:%S %p PT")
 
-        entry = f"\n\n### Resolution: `{subject or 'general-finding'}` ({time.strftime('%Y-%m-%d %H:%M:%S PT')})\n"
+        entry = f"\n\n### Resolution: `{subject or 'general-finding'}` ({now_pt_str})\n"
         entry += f"* **Author**: {author_name}\n"
         entry += f"* **Kind**: `{kind}`\n"
-        entry += f"* **Summary**: {snippet[:300]}\n"
+        entry += f"* **Summary**: {summary_text}\n"
 
 
         MEM_DECISIONS.parent.mkdir(parents=True, exist_ok=True)

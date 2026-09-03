@@ -24,6 +24,7 @@ Unified Execution Wrapper:
 - Surfaces recent failures and degraded jobs automatically in the Nightly Briefing.
 """
 
+import email.utils
 import html
 import json
 import os
@@ -503,6 +504,109 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
 # --------------------------------------------------------------------------
 # 2. Nightly Triage Briefing (with Automated Failure Surfacing)
 # --------------------------------------------------------------------------
+def _triage_unread_emails(messages: list[dict]) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Triage unread emails dynamically using LLM reasoning with robust heuristic fallback."""
+    proposed_calendar = []
+    priority_lines = []
+    newsletter_lines = []
+    transactional_lines = []
+
+    if not messages:
+        return proposed_calendar, priority_lines, newsletter_lines, transactional_lines
+
+    candidates = []
+    for m in messages:
+        sender = m.get("from", "")
+        subj = m.get("subject", "").strip()
+        s_low = sender.lower()
+        sub_low = subj.lower()
+        if any(p in s_low for p in SELF_SENDER_PATTERNS):
+            continue
+        if any(p in s_low for p in REMINDER_SKIP_SENDER_PATTERNS) or any(p in sub_low for p in REMINDER_SKIP_SUBJECT_PATTERNS):
+            continue
+        candidates.append(m)
+
+    if not candidates:
+        return proposed_calendar, priority_lines, newsletter_lines, transactional_lines
+
+    summary_input = []
+    for m in candidates[:12]:
+        sender_name, sender_addr = email.utils.parseaddr(m.get("from", ""))
+        sender_clean = sender_name.strip().strip('"').strip("'") or sender_addr
+        summary_input.append({
+            "from": sender_clean,
+            "subject": m.get("subject", ""),
+            "snippet": m.get("snippet", "")[:160]
+        })
+
+    prompt = (
+        f"You are Zero, an executive systems engineer and assistant triaging Ryan's unread inbox.\n"
+        f"Unread emails:\n{json.dumps(summary_input, indent=2)}\n\n"
+        f"Return ONLY valid JSON matching this schema:\n"
+        f"{{\n"
+        f"  \"calendar_proposals\": [\"- **<Date/Time or Deadline>** — *<Title>* (<Sender/Vendor>)\"],\n"
+        f"  \"priority\": [\"- **<Sender>**: *\\\"<Subject>\\\"* (<1-sentence key takeaway>)\"],\n"
+        f"  \"newsletters\": [\"- **<Sender>**: *\\\"<Subject>\\\"*\"],\n"
+        f"  \"transactional\": [\"- **<Sender>**: *\\\"<Subject>\\\"*\"]\n"
+        f"}}"
+    )
+    try:
+        res = subprocess.run(
+            ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={prompt}"],
+            capture_output=True, text=True, timeout=15
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            m_json = re.search(r"\{[\s\S]*\}", res.stdout)
+            if m_json:
+                data = json.loads(m_json.group(0))
+                proposed_calendar = data.get("calendar_proposals", [])
+                priority_lines = data.get("priority", [])
+                newsletter_lines = data.get("newsletters", [])
+                transactional_lines = data.get("transactional", [])
+                return proposed_calendar, priority_lines, newsletter_lines, transactional_lines
+    except Exception as e:
+        print(f"[Triage] LLM inbox triage fallback: {e}")
+
+    for m in candidates:
+        sender = m.get("from", "")
+        subj = m.get("subject", "").strip()
+        snippet = m.get("snippet", "").strip()
+        s_low = sender.lower()
+        sub_low = subj.lower()
+        snip_low = snippet.lower()
+
+        sender_name, sender_addr = email.utils.parseaddr(sender)
+        sender_clean = sender_name.strip().strip('"').strip("'") or sender_addr
+
+        exp_match = re.search(r"(?:expiration|expires|valid until|due by|exp(?:ire)?s?):\s*(\d{1,2}/\d{1,2}/\d{2,4})", snippet, re.IGNORECASE)
+        time_match = re.search(r"(\d{1,2}:\d{2}\s*(?:AM|PM))\s+(?:on\s+)?([A-Za-z]+,?\s+[A-Za-z]+\s+\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4})", snippet, re.IGNORECASE)
+        if exp_match:
+            proposed_calendar.append(f"- **By {exp_match.group(1)}** — *{subj}* ({sender_clean})")
+        elif time_match:
+            proposed_calendar.append(f"- **{time_match.group(2)} @ {time_match.group(1)}** — *{subj}* ({sender_clean})")
+        elif any(k in sub_low or k in snip_low for k in ["appointment", "reservation", "confirmed for", "booking confirmed", "installation window", "estimate"]):
+            date_m = re.search(r"\b([A-Za-z]+,\s*[A-Za-z]+\s*\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4})\b", snippet)
+            d_str = date_m.group(1) if date_m else "Upcoming"
+            proposed_calendar.append(f"- **{d_str} (Proposed)** — *{subj}* ({sender_clean})")
+
+        clean_snip = html.unescape(snippet).replace("\n", " ").strip()
+        clean_snip = re.sub(r"\s+", " ", clean_snip)
+        if len(clean_snip) > 85:
+            clean_snip = clean_snip[:82] + "..."
+
+        if any(kw in s_low or kw in sub_low for kw in ["newsletter", "chronicle", "digest", "projections report", "bb pro", "daily fantasy", "roundup", "weekly"]):
+            newsletter_lines.append(f"- **{sender_clean}**: *\"{subj}\"*")
+        elif any(kw in s_low or kw in sub_low for kw in ["amazon", "order", "delivery", "shipping", "receipt", "invoice", "dogfood", "stardust", "payment received", "tracking"]):
+            transactional_lines.append(f"- **{sender_clean}**: *\"{subj}\"*")
+        else:
+            if clean_snip and subj and clean_snip.lower() != subj.lower():
+                priority_lines.append(f"- **{sender_clean}**: *\"{subj}\"*\n  `{clean_snip}`")
+            else:
+                priority_lines.append(f"- **{sender_clean}**: *\"{subj or clean_snip}\"*")
+
+    return proposed_calendar, priority_lines, newsletter_lines, transactional_lines
+
+
 def run_nightly_triage() -> str:
     now_pt = datetime.now(PT)
     tomorrow_pt = now_pt + timedelta(days=1)
@@ -539,61 +643,7 @@ def run_nightly_triage() -> str:
     self_filtered_count = 0
     vendor_filtered_count = 0
 
-    if messages:
-        for m in messages:
-            sender = m.get("from", "")
-            subj = m.get("subject", "").strip()
-            snippet = m.get("snippet", "").strip()
-            s_low = sender.lower()
-            sub_low = subj.lower()
-            snip_low = snippet.lower()
-
-            # 1. Skip Self-Sent Emails (links, bookmarks, notes to self)
-            if any(p in s_low for p in SELF_SENDER_PATTERNS):
-                self_filtered_count += 1
-                continue
-
-            # 2. Skip Intentional Vendor / Token Lingering Reminders
-            if any(p in s_low for p in REMINDER_SKIP_SENDER_PATTERNS) or any(p in sub_low for p in REMINDER_SKIP_SUBJECT_PATTERNS):
-                vendor_filtered_count += 1
-                continue
-
-            # Clean sender name
-            sender_clean = re.sub(r"<.*?>", "", sender).strip()
-            sender_clean = re.sub(r"^\"|\"$", "", sender_clean).strip()
-            if not sender_clean:
-                sender_clean = sender
-
-            # 3. Detect Calendar Proposals & Expiration Deadlines
-            if "makeup token" in sub_low or "swim lesson" in snip_low:
-                exp_match = re.search(r"Expiration:\s*(\d{2}/\d{2}/\d{4})", snippet)
-                if exp_match:
-                    proposed_calendar.append(f"- **By {exp_match.group(1)}** — *Rosie Swim Lesson Makeup Token Expiration* (King's Swim Academy)")
-            elif "redwood barber" in s_low or "appointment is reserved" in sub_low:
-                time_match = re.search(r"(\d{1,2}:\d{2}\s*(?:AM|PM))\s+on\s+([A-Za-z]+,\s*[A-Za-z]+\s*\d{1,2})", snippet, re.IGNORECASE)
-                if time_match:
-                    proposed_calendar.append(f"- **{time_match.group(2)} @ {time_match.group(1)}** — *Haircut with Javier* (Redwood Barber Co.)")
-            elif "estimate" in sub_low and ("wednesday 9/9" in snip_low or "tuesday 9/8" in snip_low):
-                proposed_calendar.append("- **Wed, Sep 9 (Proposed)** — *Heat Pump / AC Installation Window* (EM Energy & Air)")
-
-            # 4. Semantic Categorization & Context Extraction
-            clean_snip = html.unescape(snippet).replace("\n", " ").strip()
-            clean_snip = re.sub(r"\s+", " ", clean_snip)
-            if len(clean_snip) > 85:
-                clean_snip = clean_snip[:82] + "..."
-
-            # Newsletters & Daily Digests
-            if any(kw in s_low or kw in sub_low for kw in ["newsletter", "chronicle", "digest", "projections report", "bb pro", "daily fantasy"]):
-                newsletter_lines.append(f"- **{sender_clean}**: *\"{subj}\"*")
-            # Transactional / E-commerce / System Dogfood
-            elif any(kw in s_low or kw in sub_low for kw in ["amazon", "order", "delivery", "shipping", "receipt", "dogfood", "stardust"]):
-                transactional_lines.append(f"- **{sender_clean}**: *\"{subj}\"*")
-            # Actionable Priority / Direct Human Inbound
-            else:
-                if clean_snip and subj and clean_snip.lower() != subj.lower():
-                    priority_lines.append(f"- **{sender_clean}**: *\"{subj}\"*\n  `{clean_snip}`")
-                else:
-                    priority_lines.append(f"- **{sender_clean}**: *\"{subj or clean_snip}\"*")
+    proposed_calendar, priority_lines, newsletter_lines, transactional_lines = _triage_unread_emails(messages)
 
     inbox_lines = []
     if priority_lines:
@@ -759,7 +809,28 @@ def _diagnose_container_errors(cname: str, errors: list[str]) -> tuple[int, str,
     if re.search(r"CASESession timed out|Setup for node failed", joined, re.I):
         return 2, "Matter device secure communication timed out.", "Verify physical power and wireless mesh connectivity to the Matter node."
 
-    # 6. Generic Fallbacks
+    # 6. Novel, Unhandled, or Critical Errors (Attempt LLM diagnosis before generic fallback)
+    prompt = (
+        f"Container '{cname}' emitted these log errors:\n{joined[:1200]}\n\n"
+        f"Provide a 1-sentence plain-English root cause explanation and a 1-sentence recommended next step.\n"
+        f"Format strictly as: Explanation: <sentence> | Next Step: <sentence>"
+    )
+    try:
+        res = subprocess.run(
+            ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={prompt}"],
+            capture_output=True, text=True, timeout=12
+        )
+        if res.returncode == 0 and "Explanation:" in res.stdout:
+            parts = res.stdout.strip().split("|")
+            expl = parts[0].replace("Explanation:", "").strip()
+            step = parts[1].replace("Next Step:", "").strip() if len(parts) > 1 else "Inspect container logs."
+            tier = 1 if re.search(r"panic|fatal|segfault|oom|killed|unhandled exception|syntaxerror", joined, re.I) else 2
+            if expl:
+                return tier, expl, step
+    except Exception:
+        pass
+
+    # Generic Fallbacks
     if re.search(r"panic|fatal|segfault|oom|killed|unhandled exception|syntaxerror", joined, re.I):
         return 1, f"Critical application error or unhandled crash in {cname}.", "Inspect detailed container logs with docker logs and verify configuration."
     else:
@@ -1047,9 +1118,9 @@ def run_marketing_sweep(force: bool = False) -> tuple[bool, str]:
         s_low = sender.lower()
         if any(p in s_low for p in MARKETING_PROTECTED_SENDERS):
             continue
-        addr_match = re.search(r"<([^>]+)>", sender)
-        addr = addr_match.group(1).lower() if addr_match else sender.lower()
-        name = re.sub(r"<.*?>", "", sender).strip() or addr
+        parsed_name, parsed_addr = email.utils.parseaddr(sender)
+        addr = parsed_addr.lower().strip() if parsed_addr else sender.lower().strip()
+        name = parsed_name.strip().strip('"').strip("'") or addr
         entry = counts.setdefault(addr, {"name": name, "email": addr, "count": 0})
         entry["count"] += 1
 
@@ -1166,6 +1237,17 @@ def run_token_report() -> tuple[bool, str]:
     except Exception as e:
         return False, f"⚠️ Token report calculation failed: {e}"
 
+def run_hardcode_regex_audit() -> tuple[bool, str]:
+    """Monthly codebase audit for hardcoded rules and brittle regex heuristics."""
+    try:
+        from tools.hardcode_regex_auditor import CodebaseAuditor, format_audit_report
+        auditor = CodebaseAuditor(TOOLS_DIR)
+        findings = auditor.run_audit()
+        report = format_audit_report(findings, TOOLS_DIR)
+        return True, report
+    except Exception as e:
+        return False, f"⚠️ Hardcoded rule & regex audit failed: {e}"
+
 # --------------------------------------------------------------------------
 # CLI Dispatcher
 # --------------------------------------------------------------------------
@@ -1245,6 +1327,9 @@ if __name__ == "__main__":
     elif action in ("market_standup", "standup"):
         from tools.market_standup import dispatch_market_standup
         ok, rep, _ = run_sidecar_job("market_standup", "Market Sandbox Autonomous Daily Standup", dispatch_market_standup)
+        print(rep)
+    elif action in ("hardcode_audit", "regex_audit", "code_audit"):
+        ok, rep, _ = run_sidecar_job("monthly_hardcode_regex_audit", "Monthly Hardcoded Rule & Regex Audit", run_hardcode_regex_audit)
         print(rep)
     elif action == "status":
         print(format_sidecar_status_summary())
