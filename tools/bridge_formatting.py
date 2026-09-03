@@ -183,13 +183,13 @@ def format_for_discord(text: str) -> str:
 
 
 def sanitize_reaction_gifs(text: str) -> str:
-    """Probe Tenor links in Discord output. If a Tenor GIF returns HTTP 404,
-    replace it with a live fallback GIF or strip the line so Discord never renders broken previews."""
-    if not text or "tenor.com/view/" not in text:
+    """Probe Tenor and Giphy links in Discord output. If a reaction GIF returns HTTP 404,
+    replace it with a live dynamic GIF or strip the line so Discord never renders broken previews."""
+    if not text or ("tenor.com/view/" not in text and "giphy.com/gifs/" not in text):
         return text
 
-    tenor_urls = re.findall(r"https?://(?:www\.)?tenor\.com/view/[a-zA-Z0-9_\-]+", text)
-    for url in set(tenor_urls):
+    gif_urls = re.findall(r"https?://(?:www\.)?(?:tenor\.com/view/[a-zA-Z0-9_\-]+|giphy\.com/gifs/[a-zA-Z0-9_\-]+)", text)
+    for url in set(gif_urls):
         is_ok = False
         try:
             req = urllib.request.Request(
@@ -207,7 +207,10 @@ def sanitize_reaction_gifs(text: str) -> str:
             try:
                 from tools.gif_tool import get_contextual_gif
                 fallback = get_contextual_gif("shrug")
-                text = text.replace(url, fallback["url"])
+                if fallback and fallback.get("url"):
+                    text = text.replace(url, fallback["url"])
+                else:
+                    text = re.sub(rf"(?:^|\n)[^\n]*{re.escape(url)}[^\n]*(?:\n|$)", "\n", text)
             except Exception:
                 text = re.sub(rf"(?:^|\n)[^\n]*{re.escape(url)}[^\n]*(?:\n|$)", "\n", text)
 
