@@ -3,16 +3,35 @@ import subprocess
 import re
 import sys
 
-PEER_OR_OTHER_TAGS = [
-    r"<@1468012353206354197>",  # Amos
-    r"<@1492043459618537492>",  # Marvin
-    r"<@1210466877835313155>",  # Mike / Arbiter
-    r"<@453030589914939393>",   # Ian / Moon Problem
-    r"\b@?amos\b",
-    r"\b@?marvin\b",
-    r"\b@?arbiter\b",
-    r"\b@?ian\b"
+PEER_SNOWFLAKE_TAGS = [
+    r"<@!?1468012353206354197>",  # Amos
+    r"<@!?1492043459618537492>",  # Marvin
+    r"<@!?1210466877835313155>",  # Mike / Arbiter
+    r"<@!?453030589914939393>",   # Ian / Moon Problem
 ]
+
+PEER_NAMES = r"(?:amos|marvin|arbiter|ian|mike)"
+
+# Patterns where a peer is specifically addressed in a vocative position (NOT prepositional/referential)
+PEER_VOCATIVE_PATTERNS = [
+    # Explicit @ mentions: @amos, @marvin, etc.
+    rf"@\s*{PEER_NAMES}\b",
+    # Vocative greetings or openers with punctuation: "hey amos,", "hi marvin:", "amos:", "amos,"
+    rf"(?:^|[\n.!?]\s*)(?:hey\s+|hi\s+|hello\s+)?{PEER_NAMES}\s*[:,]",
+    # Starting the message directly with the name: "amos what do you think", "marvin check this"
+    rf"^(?:hey\s+|hi\s+|hello\s+)?{PEER_NAMES}\s+",
+]
+
+PEER_OR_OTHER_TAGS = PEER_SNOWFLAKE_TAGS + PEER_VOCATIVE_PATTERNS
+
+def is_explicitly_addressed_to_other(content: str) -> bool:
+    """Check if the text is explicitly addressed to a peer agent or collaborator (not Zero)."""
+    text = content.strip()
+    if any(re.search(p, text, re.I) for p in PEER_SNOWFLAKE_TAGS):
+        return True
+    if any(re.search(p, text, re.I) for p in PEER_VOCATIVE_PATTERNS):
+        return True
+    return False
 ZERO_TAGS = [
     r"<@1542285964213358633>",
     r"<@!1542285964213358633>",
@@ -28,7 +47,8 @@ Rules:
 2. If it is trivial casual chatter, greetings, or off-topic, relevance MUST be 0.0.
 3. If it is an unaddressed engineering problem, technical discussion, or systems question where Zero's input would be genuinely valuable, score between 0.70 and 1.0.
 4. If the message includes an open banana handoff envelope marked with reply 'optional' and asks an engineering question without naming a single exclusive recipient, relevance to Zero should be high (0.85 - 0.95).
-5. Output ONLY a single float number between 0.0 and 1.0 (e.g. 0.0 or 0.85).
+5. If the message is a direct engineering directive, confirmation, or action instruction (e.g. 'update the draft', 'push the branch', 'ship it', 'run tests', 'go ahead'), relevance to Zero is high (0.85 - 1.0).
+6. Output ONLY a single float number between 0.0 and 1.0 (e.g. 0.0 or 0.85).
 
 Message from {author}: "{content}"'''
 
@@ -63,12 +83,9 @@ def score_relevance(content: str, author: str = "user") -> float:
     text_for_targeting = re.sub(r"```(?:handoff)?.*?```", "", content_clean, flags=re.DOTALL).strip()
 
     # If directed to peer or other human explicitly in message text and does not include Zero or team role, drop immediately
-    has_other_target = any(re.search(p, text_for_targeting, re.I) for p in PEER_OR_OTHER_TAGS)
+    has_other_target = is_explicitly_addressed_to_other(text_for_targeting)
     has_zero_target = any(re.search(p, text_for_targeting, re.I) for p in ZERO_TAGS)
     if has_other_target and not has_zero_target:
-        return 0.0
-
-    if re.search(r"^(hey\s+)?@(amos|marvin)\b", text_for_targeting, re.I) or re.search(r"^(amos|marvin):", text_for_targeting, re.I):
         return 0.0
 
     # Detect open questions with reply: "optional"

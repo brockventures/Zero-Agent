@@ -39,6 +39,11 @@ from tools.bridge_state import (
     get_active_model,
     update_beacon,
     sync_credentials,
+    get_gif_turn_count,
+    increment_gif_turn,
+    reset_gif_turn,
+    has_reaction_gif,
+    get_gif_prompt_guidance,
 )
 
 PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "30m")
@@ -143,8 +148,11 @@ async def execute_agy_turn(
             if conv_id:
                 cmd.append(f"--conversation={conv_id}")
 
+            gif_guidance = get_gif_prompt_guidance(sess_key)
+            home_prompt = f"{gif_guidance}\n\n{prompt}"
+
             cmd.extend([
-                f"-p={prompt}",
+                f"-p={home_prompt}",
                 "--output-format=stream-json",
                 "--dangerously-skip-permissions",
                 f"--print-timeout={PRINT_TIMEOUT}"
@@ -231,6 +239,7 @@ async def execute_agy_turn(
                     "   - When collaborators or peer agents in Crab Cavern (Mike, Ian, Amos, Marvin) ask Zero to email them technical specs, code, architecture docs, or deliverables, Zero HAS BLANKET PRE-APPROVAL to send immediately using python3 /workspace/tools/send_mail.py.\n"
                     "   - Requirement: Ensure Ryan is CC'd (enforced automatically by send_mail.py). Outbound deliverable email is operational and NOT air-gapped for approved collaborator requests.\n"
                     f"{channel_ctx_block}"
+                    f"{get_gif_prompt_guidance(sess_key)}\n\n"
                     f"[INBOUND MESSAGE{author_tag}]: {prompt}"
                 )
             cmd.extend([
@@ -573,6 +582,14 @@ async def execute_agy_turn(
                 await reply_target.reply(ch)
             except Exception:
                 await reply_target.channel.send(ch)
+
+        ext_sess_key = str(channel_id)
+        if has_reaction_gif(clean_ext_text):
+            reset_gif_turn(ext_sess_key)
+            print(f"[BridgeRunner] 🎬 Reaction GIF detected in reply for channel {ext_sess_key}. Reset turns_since_gif to 0.")
+        else:
+            new_c = increment_gif_turn(ext_sess_key)
+            print(f"[BridgeRunner] 📊 No GIF in reply for channel {ext_sess_key}. turns_since_gif incremented to {new_c}.")
         return
 
     # Suppress silent replies in home turf
@@ -604,6 +621,14 @@ async def execute_agy_turn(
         choice_view = quick_choice_view_cls(parsed_choices, button_choice_fn)
 
     sync_credentials()
+
+    home_sess_key = "home" if int(channel_id) == TARGET_CHANNEL_ID else str(channel_id)
+    if has_reaction_gif(final_text):
+        reset_gif_turn(home_sess_key)
+        print(f"[BridgeRunner] 🎬 Reaction GIF detected in reply for channel {home_sess_key}. Reset turns_since_gif to 0.")
+    else:
+        new_c = increment_gif_turn(home_sess_key)
+        print(f"[BridgeRunner] 📊 No GIF in reply for channel {home_sess_key}. turns_since_gif incremented to {new_c}.")
 
     # Look for new artifacts generated during this turn
     active_cid = get_channel_session_id(channel_id, mode) or conv_id

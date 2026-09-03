@@ -157,6 +157,69 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
             self.assertIn("what are the system specs?", call_args2["prompt"])
             self.assertEqual(call_args2["mode"], "external")
 
+    async def test_conversational_follow_up_without_direct_tag(self):
+        """Verify that an untagged human reply following Zero's question is routed as a conversational follow-up."""
+        from datetime import datetime, timezone
+        from tools.channel_history import record_message
+
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        ch_id = 1534436119888793750
+        now = time.time()
+        past_ts = datetime.fromtimestamp(now - 30, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Zero previously asked a question
+        record_message(
+            channel_id=ch_id,
+            channel_name="agent-chat",
+            author_name="Zero",
+            is_bot=True,
+            content="Want me to push the 0.80 threshold bump and #lounge mention-gate to the branch next?",
+            msg_id=1111111111,
+            timestamp=past_ts
+        )
+
+        # Ryan replies without explicit @Zero tag
+        mock_msg = MagicMock()
+        mock_msg.id = 2222222222
+        mock_msg.channel.id = ch_id
+        mock_msg.channel.name = "agent-chat"
+        mock_msg.author.id = 1210466877835313155
+        mock_msg.author.bot = False
+        mock_msg.author.display_name = "Ryan"
+        mock_msg.content = "Yep update the draft. Then pass it to Amos for review"
+        mock_msg.created_at.timestamp.return_value = now
+        mock_msg.role_mentions = []
+        mock_msg.mentions = []
+        mock_msg.reference = None
+
+        turn_queue = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={"ambient_classifier_enabled": False}):
+            await bh.handle_message(mock_msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+            call_args = turn_queue.put.call_args[0][0]
+            self.assertEqual(call_args["prompt"], "Yep update the draft. Then pass it to Amos for review")
+            self.assertEqual(call_args["mode"], "external")
+
+    def test_peer_address_vs_referential_mentions(self):
+        """Verify is_explicitly_addressed_to_other distinguishes addressees from references."""
+        from tools.classifier import is_explicitly_addressed_to_other
+
+        # Prepositional / referential mentions should NOT count as addressed to peer
+        self.assertFalse(is_explicitly_addressed_to_other("Yep update the draft. Then pass it to Amos for review"))
+        self.assertFalse(is_explicitly_addressed_to_other("Can we check with Amos?"))
+        self.assertFalse(is_explicitly_addressed_to_other("What does Amos think about rate limits?"))
+        self.assertFalse(is_explicitly_addressed_to_other("Did Ian approve the PR?"))
+        self.assertFalse(is_explicitly_addressed_to_other("Let's review Marvin's logs"))
+
+        # Actual addressees should count as True
+        self.assertTrue(is_explicitly_addressed_to_other("@amos can you check this?"))
+        self.assertTrue(is_explicitly_addressed_to_other("<@1468012353206354197> your turn"))
+        self.assertTrue(is_explicitly_addressed_to_other("Amos: what do you think?"))
+        self.assertTrue(is_explicitly_addressed_to_other("Hey Marvin, thoughts?"))
+        self.assertTrue(is_explicitly_addressed_to_other("Marvin check this out"))
+
     def test_slash_commands_registration(self):
         """Verify that native Discord Slash Commands are registered in bot.tree."""
         from tools.bridge import bot
@@ -168,3 +231,4 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
