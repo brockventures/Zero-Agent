@@ -2,7 +2,7 @@
 """
 outbox.py - Decoupled Cross-Channel Asynchronous Message Dispatch
 Implements Marvin's atomic JSONL queue pattern (data/outbox/pending.jsonl)
-so Zero can dispatch messages to other channels (#lounge, #agent-chat, #zero-chat)
+so Zero can dispatch messages to other channels (#lounge, #the-banana-stand, #zero-chat)
 without blocking the active turn or coupling delivery to the current execution thread.
 """
 
@@ -19,9 +19,17 @@ OUTBOX_DIR = DATA_DIR / "outbox"
 PENDING_FILE = OUTBOX_DIR / "pending.jsonl"
 
 KNOWN_CHANNELS = {
-    "agent-chat": 1534436119888793750,
+    "the-banana-stand": 1534436119888793750,
+    "agent-chat": 1534436119888793750,  # alias for backward compatibility
     "lounge": 1534452820995080192,
     "zero-chat": 1542081375287640084,
+    "steam-deck": 1544953277592899615,
+    "home-assistant": 1544953275877556334,
+    "finances": 1544955532765560924,
+    "homelab": 1544955535722545253,
+    "shopping": 1544955538033348618,
+    "zero-ops": 1544953279664889888,
+    "harness-management": 1544953279664889888,
     "general": 1534452820995080192,  # alias to lounge or main
     "signals": 1534436119888793750,
     "staff-comms": 1534436119888793750,
@@ -128,12 +136,12 @@ def main():
         description="Zero Cross-Channel Outbox Queue Manager",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  python3 tools/outbox.py --channel lounge --message "Executive summary from #agent-chat debate"
+  python3 tools/outbox.py --channel lounge --message "Executive summary from #the-banana-stand debate"
   python3 tools/outbox.py --list
   python3 tools/outbox.py --flush
 """
     )
-    parser.add_argument("--channel", "-c", help="Target channel name or ID (e.g. lounge, agent-chat, zero-chat)")
+    parser.add_argument("--channel", "-c", help="Target channel name or ID (e.g. lounge, the-banana-stand, zero-chat)")
     parser.add_argument("--message", "-m", help="Message content to queue for cross-channel delivery")
     parser.add_argument("--list", "-l", action="store_true", help="List all currently queued pending messages")
     parser.add_argument("--flush", "-f", action="store_true", help="Drain and print all pending messages")

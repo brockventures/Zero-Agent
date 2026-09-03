@@ -73,13 +73,23 @@ def log(msg: str):
     except Exception:
         pass
 
+try:
+    from tools.email_sanitizer import sanitize_discord_display
+except ImportError:
+    try:
+        from email_sanitizer import sanitize_discord_display
+    except ImportError:
+        sanitize_discord_display = None
+
 def sanitize_text(text: str, max_len: int = 150) -> str:
     if not text:
         return ""
+    if sanitize_discord_display:
+        return sanitize_discord_display(text, max_len=max_len)
     text = unicodedata.normalize("NFKC", text)
     text = INVISIBLE_CHARS_RE.sub("", text)
-    text = html.unescape(text)
     text = HTML_TAG_RE.sub(" ", text)
+    text = html.unescape(text)
     text = DISCORD_PING_RE.sub(r"@-\1", text)
     text = text.replace("`", "'")
     text = re.sub(r"[ \t]+", " ", text).strip()

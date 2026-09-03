@@ -163,7 +163,7 @@ class TestBridgeEndToEndStress(unittest.IsolatedAsyncioTestCase):
         mock_bot = MagicMock()
         mock_bot.user.id = 1542285964213358633
 
-        ext_channel_id = 1534436119888793750  # #agent-chat
+        ext_channel_id = 1534436119888793750  # #the-banana-stand (formerly agent-chat)
         bh.channel_last_bot_reply.clear()
 
         # Case A: Silence narration from peer bot -> dropped
@@ -174,7 +174,7 @@ class TestBridgeEndToEndStress(unittest.IsolatedAsyncioTestCase):
         msg_silence.author.display_name = "Amos"
         msg_silence.author.id = 111111111111111111
         msg_silence.channel.id = ext_channel_id
-        msg_silence.channel.name = "agent-chat"
+        msg_silence.channel.name = "the-banana-stand"
         msg_silence.content = "Remaining silent per room boundaries."
         msg_silence.attachments = []
         msg_silence.reference = None
@@ -190,7 +190,7 @@ class TestBridgeEndToEndStress(unittest.IsolatedAsyncioTestCase):
         msg_short.author.display_name = "Amos"
         msg_short.author.id = 111111111111111111
         msg_short.channel.id = ext_channel_id
-        msg_short.channel.name = "agent-chat"
+        msg_short.channel.name = "the-banana-stand"
         msg_short.content = "Ok sounds good"
         msg_short.attachments = []
         msg_short.reference = None
@@ -206,7 +206,7 @@ class TestBridgeEndToEndStress(unittest.IsolatedAsyncioTestCase):
         msg_handoff.author.display_name = "Amos"
         msg_handoff.author.id = 111111111111111111
         msg_handoff.channel.id = ext_channel_id
-        msg_handoff.channel.name = "agent-chat"
+        msg_handoff.channel.name = "the-banana-stand"
         msg_handoff.content = '```handoff\n{"to": "Zero", "task": "Check HA battery voltages"}\n```'
         msg_handoff.attachments = []
         msg_handoff.reference = None
@@ -247,7 +247,7 @@ class TestBridgeEndToEndStress(unittest.IsolatedAsyncioTestCase):
              patch("tools.outbox.flush_pending_messages", return_value=[{
                  "id": "outbox-test-1",
                  "channel_id": 1534436119888793750,
-                 "channel": "agent-chat",
+                 "channel": "the-banana-stand",
                  "content": "Banana mutex test message"
              }]), \
              patch("tools.banana.claim") as mock_claim, \

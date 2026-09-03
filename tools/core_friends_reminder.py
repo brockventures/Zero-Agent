@@ -74,9 +74,9 @@ def find_partner(person: dict, all_contacts: list[dict]) -> dict | None:
     paddr = person.get("Physical Address", "").strip()
 
     patterns = [
-        r"married to ([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
-        r"partner to ([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
-        r"partner ([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
+        r"(?:married to|married/partner to|spouse(?:\s+to|\s+is)?|husband(?:\s+to|\s+is)?|wife(?:\s+to|\s+is)?|life partner(?:\s+to|\s+is)?)\s+([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
+        r"(?:partner to)\s+([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
+        r"(?<!business\s)(?<!managing\s)(?<!equity\s)(?<!law\s)(?<!senior\s)(?<!junior\s)(?<!founding\s)(?<!practice\s)(?<!trading\s)\bpartner[:\s]+([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
     ]
 
     # 1. Partner in person's notes
@@ -139,10 +139,6 @@ def format_couple_display_name(person: dict, partner: dict | None) -> str:
     last2 = parts2[-1] if len(parts2) > 1 else ""
 
     if last1 and last2 and last1.lower() == last2.lower():
-        if len(parts2) > 2:
-            middle2 = " ".join(parts2[1:-1])
-            if middle2 and middle2.lower() not in ("yee",):
-                return f"{first1} & {first2} {middle2} {last1}"
         return f"{first1} & {first2} {last1}"
     else:
         return f"{c1} & {c2}"

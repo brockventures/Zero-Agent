@@ -46,7 +46,10 @@ DEFAULT_HOME_CHANNELS = {
     TARGET_CHANNEL_ID,
     1544953275877556334,  # #home-assistant
     1544953277592899615,  # #steam-deck
-    1544953279664889888,  # #harness-management
+    1544953279664889888,  # #zero-ops / #harness-management
+    1544955532765560924,  # #finances
+    1544955535722545253,  # #homelab
+    1544955538033348618,  # #shopping
 }
 RETITLED_THREADS_FILE = DATA_DIR / "retitled_threads.json"
 
@@ -126,15 +129,95 @@ def record_restart_intent(reason: str, initiator: str = "user"):
         print(f"[BridgeState] Error recording restart intent: {e}")
 
 
+def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, status_msg_id: int = None):
+    """Atomically record an in-flight turn for a channel to survive crashes/restarts."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if IN_FLIGHT_FILE.exists():
+            try:
+                with open(IN_FLIGHT_FILE) as f:
+                    raw = json.load(f)
+                    if isinstance(raw, dict):
+                        if "channel_id" in raw and "prompt" in raw and not any(isinstance(v, dict) for v in raw.values()):
+                            data[str(raw.get("channel_id", TARGET_CHANNEL_ID))] = raw
+                        else:
+                            data = raw
+            except Exception:
+                data = {}
+        cid_str = str(channel_id)
+        data[cid_str] = {
+            "conv_id": conv_id,
+            "status_msg_id": status_msg_id,
+            "channel_id": int(channel_id) if str(channel_id).isdigit() else channel_id,
+            "prompt": prompt,
+            "ts": time.time()
+        }
+        # Maintain top-level fields for legacy callers/tests checking single dict
+        data["prompt"] = prompt
+        data["channel_id"] = int(channel_id) if str(channel_id).isdigit() else channel_id
+        data["conv_id"] = conv_id
+        data["ts"] = time.time()
+        data["status_msg_id"] = status_msg_id
+
+        tmp = IN_FLIGHT_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        tmp.replace(IN_FLIGHT_FILE)
+    except Exception as e:
+        print(f"[BridgeState] Error recording in-flight: {e}")
+
+
+def clear_in_flight(channel_id: int | str = None):
+    """Atomically clear in-flight turn for a channel, unlinking if all cleared."""
+    try:
+        if not IN_FLIGHT_FILE.exists():
+            return
+        if channel_id is None:
+            try:
+                IN_FLIGHT_FILE.unlink()
+            except Exception:
+                pass
+            return
+        with open(IN_FLIGHT_FILE) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            cid_str = str(channel_id)
+            if cid_str in data:
+                del data[cid_str]
+            # Check remaining channels
+            rem = [k for k, v in data.items() if isinstance(v, dict) and "prompt" in v]
+            if not rem:
+                try:
+                    IN_FLIGHT_FILE.unlink()
+                except Exception:
+                    pass
+            else:
+                first = data[rem[0]]
+                data["prompt"] = first["prompt"]
+                data["channel_id"] = first["channel_id"]
+                data["conv_id"] = first["conv_id"]
+                data["ts"] = first["ts"]
+                data["status_msg_id"] = first.get("status_msg_id")
+                tmp = IN_FLIGHT_FILE.with_suffix(".tmp")
+                with open(tmp, "w") as f:
+                    json.dump(data, f, indent=2)
+                tmp.replace(IN_FLIGHT_FILE)
+    except Exception as e:
+        print(f"[BridgeState] Error clearing in-flight: {e}")
+
+
 def get_runtime_rules() -> dict:
     """Dynamically fetch runtime rules and prompts without requiring container restarts."""
     defaults = {
         "external_char_limit": 1950,
         "anti_cascade_delay_seconds": 4.0,
         "bot_word_floor": 4,
+        "worker_memory_cap_mb": 2048,
+        "max_parallel_workers": 3,
         "ambient_classifier_enabled": True,
         "ambient_relevance_threshold": 0.80,
-        "auto_thread_escalation_enabled": True,
+        "auto_thread_escalation_enabled": False,
         "auto_thread_escalation_seconds": 180.0,
         "external_system_prompt": None
     }

@@ -602,8 +602,8 @@ class KarakosScheduler:
                         if target_cid and self.bot:
                             target_channel = self.bot.get_channel(target_cid) or await self.bot.fetch_channel(target_cid)
                             if target_channel:
-                                is_agent_chat = (target_cid == 1534436119888793750 or str(omsg.get("channel")) == "agent-chat")
-                                if is_agent_chat:
+                                is_banana_stand = (target_cid == 1534436119888793750 or str(omsg.get("channel")) in ("the-banana-stand", "agent-chat"))
+                                if is_banana_stand:
                                     try:
                                         from tools.banana import claim, release
                                         claim(subject=omsg.get("id", "outbox-dispatch"))

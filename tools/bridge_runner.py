@@ -50,6 +50,8 @@ from tools.bridge_state import (
     get_gif_prompt_guidance,
     is_thread_retitled,
     mark_thread_retitled,
+    record_in_flight,
+    clear_in_flight,
 )
 
 PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "30m")
@@ -265,12 +267,14 @@ async def execute_agy_turn(
                     "   - Be conversational, punchy, and interactive. Do NOT write dry, multi-page essay walls or massive dumps.\n"
                     "   - Deliver the key technical insight, code snippet, or answer directly, then pause for peer back-and-forth.\n"
                     "7. COLLABORATOR EMAIL DISPATCH (BLANKET PRE-APPROVED):\n"
-                    "   - When collaborators or peer agents in Crab Cavern (Mike, Ian, Amos, Marvin) ask Zero to email them technical specs, code, architecture docs, or deliverables, Zero HAS BLANKET PRE-APPROVAL to send immediately using python3 /workspace/tools/send_mail.py.\n"
+                    "   - When collaborators or peer agents in Crab Cavern (Mike, Dr. Coley, Amos, Marvin) ask Zero to email them technical specs, code, architecture docs, or deliverables, Zero HAS BLANKET PRE-APPROVAL to send immediately using python3 /workspace/tools/send_mail.py.\n"
                     "   - Requirement: Ensure Ryan is CC'd (enforced automatically by send_mail.py). Outbound deliverable email is operational and NOT air-gapped for approved collaborator requests.\n"
-                    "8. PACIFIC TIMEZONE & LOCAL TIME CONVERSION:\n"
+                    "8. HUMAN ADDRESSING DISCIPLINE:\n"
+                    "   - Always address and refer to human developers by their real names: Mike (Arbiter), Dr. Coley (per his explicit decree; never refer to him as 'Ian' or 'Moon Problem'), Alex (Arcane), and Ryan.\n"
+                    "9. PACIFIC TIMEZONE & LOCAL TIME CONVERSION:\n"
                     "   - Ryan Brock and all Crab Cavern operations are based on Pacific Time (America/Los_Angeles, PT).\n"
                     "   - Always convert UTC timestamps to Pacific Time before referencing time of day (e.g. 04:00 UTC = 9:00 PM PT previous day during PDT, UTC-7). NEVER quote raw UTC timestamps or refer to 04:00 UTC as '4 AM'.\n"
-                    "9. REACTION GIF PROTOCOL (NO BROKEN LINKS):\n"
+                    "10. REACTION GIF PROTOCOL (NO BROKEN LINKS):\n"
                     "   - Always use python3 /workspace/tools/gif_tool.py \"<query>\". Never hallucinate Tenor URLs or use web search for GIFs.\n"
                     f"{channel_ctx_block}"
                     f"{time_block}\n\n"
@@ -307,16 +311,12 @@ async def execute_agy_turn(
 
         # Record in-flight turn for restart recovery
         if mode == "home":
-            try:
-                with open(IN_FLIGHT_FILE, "w") as f:
-                    json.dump({
-                        "status_msg_id": status_msg.id if status_msg else None,
-                        "channel_id": status_msg.channel.id if status_msg else None,
-                        "prompt": prompt,
-                        "ts": time.time()
-                    }, f, indent=2)
-            except Exception:
-                pass
+            record_in_flight(
+                channel_id=channel_id,
+                prompt=prompt,
+                conv_id=conv_id,
+                status_msg_id=status_msg.id if status_msg else None
+            )
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -511,14 +511,16 @@ async def execute_agy_turn(
             if mode == "home":
                 if channel_id == TARGET_CHANNEL_ID:
                     active_proc = None
-                update_beacon("IDLE", "")
                 try:
-                    if IN_FLIGHT_FILE.exists():
-                        IN_FLIGHT_FILE.unlink()
+                    clear_in_flight(channel_id)
                 except Exception:
                     pass
             else:
                 ext_active_proc = None
+
+            # Only switch beacon to IDLE if no running processes remain across all channels
+            if not any(p and p.returncode is None for p in channel_active_procs.values()):
+                update_beacon("IDLE", "")
 
             if apply_presence_fn:
                 try:

@@ -89,6 +89,51 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertNotIn("Checking database", res)
         self.assertIn("Database check complete.", res)
 
+    def test_extract_agent_response_with_result_concatenation(self):
+        # agy concatenates all intermediate turn responses into result.response
+        raw_stream = (
+            '{"event":"init","conversation_id":"c-999"}\n'
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Checking database...\\n"}}\n'
+            '{"event":"step_update","step_update":{"step_type":"tool","tool_name":"view_file","tool_info":{"parameters":{"AbsolutePath":"/workspace/test"}}}}\n'
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Database check complete.\\n"}}\n'
+            '{"event":"result","result":{"conversation_id":"c-999","status":"DONE","response":"Checking database...\\nDatabase check complete.\\n"}}\n'
+        )
+        res = extract_agent_response(raw_stream)
+        self.assertNotIn("Checking database", res)
+        self.assertEqual(res, "Database check complete.")
+
+    def test_extract_agent_response_with_background_task(self):
+        # Background task lifecycle: tool -> agent_response wait chatter -> system_message -> final response
+        raw_stream = (
+            '{"event":"init","conversation_id":"c-ha-scan"}\n'
+            '{"event":"step_update","step_update":{"step_type":"tool","tool_name":"run_command"}}\n'
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Scanning vacuum automations in the background...\\n"}}\n'
+            '{"event":"step_update","step_update":{"step_type":"system_message"}}\n'
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"Here is the full automation audit.\\n"}}\n'
+            '{"event":"result","result":{"conversation_id":"c-ha-scan","status":"DONE","response":"Scanning vacuum automations in the background...\\nHere is the full automation audit.\\n"}}\n'
+        )
+        res = extract_agent_response(raw_stream)
+        self.assertNotIn("Scanning vacuum automations in the background", res)
+        self.assertEqual(res, "Here is the full automation audit.")
+
+    def test_extract_agent_response_preserves_legitimate_background_text(self):
+        # Verify legitimate prose mentioning "in the background" is preserved
+        raw_stream = (
+            '{"event":"init","conversation_id":"c-legit"}\n'
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"We run Plex in the background on Host1 to stream media.\\n"}}\n'
+            '{"event":"result","result":{"conversation_id":"c-legit","status":"DONE","response":"We run Plex in the background on Host1 to stream media.\\n"}}\n'
+        )
+        res = extract_agent_response(raw_stream)
+        self.assertEqual(res, "We run Plex in the background on Host1 to stream media.")
+
+    def test_extract_agent_response_non_streaming_fallback(self):
+        # Non-streaming JSON mode where only result.response is present
+        raw_stream = (
+            '{"event":"result","result":{"conversation_id":"c-fallback","status":"DONE","response":"Standard non-streaming reply."}}\n'
+        )
+        res = extract_agent_response(raw_stream)
+        self.assertEqual(res, "Standard non-streaming reply.")
+
     def test_chunk_text_basic_and_boundary(self):
         short_text = "Hello world"
         self.assertEqual(chunk_text(short_text, 100), ["Hello world"])

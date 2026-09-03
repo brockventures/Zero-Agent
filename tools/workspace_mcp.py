@@ -149,9 +149,20 @@ def _get_email_defaults() -> tuple[str, str]:
         try:
             priv_prof = Path("/workspace/memory/private/user_ryan.md")
             if priv_prof.exists():
-                m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", priv_prof.read_text())
+                text = priv_prof.read_text()
+                m = re.search(
+                    r"(?:primary(?:\s+email|\s+account)?|notification\s+email|ryan's\s+primary\s+account|email):\s*[`'\"]?([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)[`'\"]?",
+                    text,
+                    re.IGNORECASE,
+                )
+                if not m:
+                    m = re.search(
+                        r"(?:primary\s+account|ryan's\s+email)[^`\n]*[`\(]([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)[`\)]",
+                        text,
+                        re.IGNORECASE,
+                    )
                 if m:
-                    notify = m.group(0)
+                    notify = m.group(1)
         except Exception:
             pass
     from_header = f"Zero <{sender}>" if sender and "<" not in sender else sender

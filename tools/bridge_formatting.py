@@ -144,10 +144,9 @@ def format_for_discord(text: str) -> str:
         flags=re.DOTALL | re.IGNORECASE,
     )
     text = re.sub(
-        r"An asynchronous task has completed:\s*[^\n]+\s*\(State:\s*[^\)]+\)\s*Result payload:\s*\d+\s*Task output:.*?(?=\n\n(?:[A-Z#•*-]|\Z)|\Z)",
+        r"An asynchronous task has completed:\s*[^\n]+\s*\(State:\s*[^\)]+\)(?:\s*Result payload:\s*\d+)?(?:\s*Task output:\s*(?:\[[^\]\r\n]*\]|[^\r\n]*))?",
         "",
         text,
-        flags=re.DOTALL,
     )
     text = re.sub(
         r"Tool is running as a background task with task id:\s*[^\n]+(?:\nTask Description:[^\n]+)?(?:\nTask logs are available at:[^\n]+)?(?:\nYOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS:[^\n]+)?(?:\n\s*DO NOTHING ELSE\.)?",
@@ -264,12 +263,14 @@ def extract_agent_response(raw_text: str) -> str:
                         step = event.get("step_update", {})
                         if isinstance(step, dict):
                             stype = step.get("step_type")
-                            if stype == "tool" or step.get("tool_name") or "tool_info" in step:
-                                # Discard intermediate thought/narration emitted before tool execution
+                            if stype in ("tool", "system_message", "system") or step.get("tool_name") or "tool_info" in step:
+                                # Discard intermediate thought/narration emitted before tool execution or task completion
                                 accumulated_content.clear()
-                            elif stype == "agent_response" and step.get("text_delta"):
-                                accumulated_content.append(step["text_delta"])
-                    elif ev_type in ("tool", "tool_call", "tool_use"):
+                            elif stype == "agent_response":
+                                delta = step.get("text_delta") or step.get("text") or step.get("content")
+                                if delta and isinstance(delta, str):
+                                    accumulated_content.append(delta)
+                    elif ev_type in ("tool", "tool_call", "tool_use", "system_message", "system"):
                         accumulated_content.clear()
                     elif ev_type in ("content", "message", "text", "delta"):
                         content = event.get("content") or event.get("text") or event.get("delta")
@@ -278,12 +279,13 @@ def extract_agent_response(raw_text: str) -> str:
             except Exception:
                 pass
 
+    clean_accumulated = "".join(accumulated_content).strip()
+    if clean_accumulated:
+        return format_for_discord(clean_accumulated)
     if final_result_response:
         return format_for_discord(final_result_response)
     if error_response:
         return format_for_discord(error_response)
-    if accumulated_content:
-        return format_for_discord("".join(accumulated_content))
 
     # Fallback filter for JSON metadata lines
     clean_lines = []
@@ -643,7 +645,7 @@ def generate_concise_thread_title(prompt: str, target_words: int = 6) -> str:
         return "Context Compaction and Rolling Memory Architecture"
     elif any(k in low for k in ["tautulli", "plex status", "plex transcode", "plex down", "pms"]):
         return "Plex Media Server Alerts and Transcoding"
-    elif any(k in low for k in ["sonarr", "radarr", "prowlarr", "indexer", "rate limit", "429"]):
+    elif any(k in low for k in ["sonarr", "radarr", "prowlarr", "indexer"]):
         return "Arr Media Indexer and Server Alerts"
     elif any(k in low for k in ["youtube music", "liked songs", "music playlist", "prime416"]):
         return "YouTube Music Playlist Sync and Discovery"

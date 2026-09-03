@@ -127,8 +127,8 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
 
         # Message in Crab Cavern with @robot
         mock_msg = MagicMock()
-        mock_msg.channel.id = 1534436119888793750  # agent-chat
-        mock_msg.channel.name = "agent-chat"
+        mock_msg.channel.id = 1534436119888793750  # the-banana-stand (formerly agent-chat)
+        mock_msg.channel.name = "the-banana-stand"
         mock_msg.author.id = 1210466877835313155
         mock_msg.author.bot = False
         mock_msg.author.display_name = "Arbiter"
@@ -148,8 +148,8 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
 
         # Message in Crab Cavern with role tag
         mock_msg2 = MagicMock()
-        mock_msg2.channel.id = 1534436119888793750  # agent-chat
-        mock_msg2.channel.name = "agent-chat"
+        mock_msg2.channel.id = 1534436119888793750  # the-banana-stand (formerly agent-chat)
+        mock_msg2.channel.name = "the-banana-stand"
         mock_msg2.author.id = 1210466877835313155
         mock_msg2.author.bot = False
         mock_msg2.author.display_name = "Arbiter"
@@ -182,7 +182,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         # Zero previously asked a question
         record_message(
             channel_id=ch_id,
-            channel_name="agent-chat",
+            channel_name="the-banana-stand",
             author_name="Zero",
             is_bot=True,
             content="Want me to push the 0.80 threshold bump and #lounge mention-gate to the branch next?",
@@ -194,7 +194,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         mock_msg = MagicMock()
         mock_msg.id = 2222222222
         mock_msg.channel.id = ch_id
-        mock_msg.channel.name = "agent-chat"
+        mock_msg.channel.name = "the-banana-stand"
         mock_msg.author.id = 1210466877835313155
         mock_msg.author.bot = False
         mock_msg.author.display_name = "Ryan"
@@ -229,6 +229,111 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(is_explicitly_addressed_to_other("Amos: what do you think?"))
         self.assertTrue(is_explicitly_addressed_to_other("Hey Marvin, thoughts?"))
         self.assertTrue(is_explicitly_addressed_to_other("Marvin check this out"))
+
+    async def test_home_turf_channel_routing_without_mention(self):
+        """Verify that channels in DEFAULT_HOME_CHANNELS (e.g. steam-deck) are routed to home_turn_queue without @Zero."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        mock_msg = MagicMock()
+        mock_msg.id = 3333333333
+        mock_msg.channel.id = 1544953277592899615  # #steam-deck
+        mock_msg.channel.name = "steam-deck"
+        mock_msg.author.id = 1210466877835313155
+        mock_msg.author.bot = False
+        mock_msg.author.display_name = "Ryan"
+        mock_msg.content = "Done now?"
+        mock_msg.created_at.timestamp.return_value = time.time()
+        mock_msg.role_mentions = []
+        mock_msg.mentions = []
+        mock_msg.reference = None
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+        await bh.handle_message(mock_msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_awaited_once()
+        call_args = home_queue.put.call_args[0][0]
+        self.assertEqual(call_args["prompt"], "Done now?")
+        self.assertEqual(call_args["mode"], "home")
+        self.assertEqual(call_args["channel_id"], 1544953277592899615)
+        ext_queue.put.assert_not_awaited()
+
+    async def test_dedicated_operations_channels_route_to_home(self):
+        """Verify that #finances, #homelab, and #shopping are routed to home_turn_queue without @Zero."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        for cid, cname in [
+            (1544955532765560924, "finances"),
+            (1544955535722545253, "homelab"),
+            (1544955538033348618, "shopping")
+        ]:
+            mock_msg = MagicMock()
+            mock_msg.id = 7777777777
+            mock_msg.channel.id = cid
+            mock_msg.channel.name = cname
+            mock_msg.channel.category_id = 1544953274363412533
+            mock_msg.author.id = 1210466877835313155
+            mock_msg.author.bot = False
+            mock_msg.author.display_name = "Ryan"
+            mock_msg.content = f"Status update in #{cname}?"
+            mock_msg.created_at.timestamp.return_value = time.time()
+            mock_msg.role_mentions = []
+            mock_msg.mentions = []
+            mock_msg.reference = None
+
+            home_queue = AsyncMock()
+            ext_queue = AsyncMock()
+            await bh.handle_message(mock_msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+            home_queue.put.assert_awaited_once()
+            call_args = home_queue.put.call_args[0][0]
+            self.assertEqual(call_args["mode"], "home")
+            self.assertEqual(call_args["channel_id"], cid)
+            ext_queue.put.assert_not_awaited()
+
+    async def test_conversational_follow_up_direct_query(self):
+        """Verify that short questions like 'Done now?' are recognized as conversational follow-ups in external channels."""
+        from datetime import datetime, timezone
+        from tools.channel_history import record_message
+
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        ch_id = 1534436119888793750  # external channel
+        now = time.time()
+        past_ts = datetime.fromtimestamp(now - 45, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Zero spoke 45 seconds ago (without ending with a ?)
+        record_message(
+            channel_id=ch_id,
+            channel_name="the-banana-stand",
+            author_name="Zero",
+            is_bot=True,
+            content="I'll ping you the second Ratchet & Clank finishes flushing to flash so you can pull the trigger.",
+            msg_id=4444444444,
+            timestamp=past_ts
+        )
+
+        mock_msg = MagicMock()
+        mock_msg.id = 5555555555
+        mock_msg.channel.id = ch_id
+        mock_msg.channel.name = "the-banana-stand"
+        mock_msg.author.id = 1210466877835313155
+        mock_msg.author.bot = False
+        mock_msg.author.display_name = "Ryan"
+        mock_msg.content = "Done now?"
+        mock_msg.created_at.timestamp.return_value = now
+        mock_msg.role_mentions = []
+        mock_msg.mentions = []
+        mock_msg.reference = None
+
+        turn_queue = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={"ambient_classifier_enabled": False}):
+            await bh.handle_message(mock_msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+            call_args = turn_queue.put.call_args[0][0]
+            self.assertEqual(call_args["prompt"], "Done now?")
+            self.assertEqual(call_args["mode"], "external")
 
     def test_slash_commands_registration(self):
         """Verify that native Discord Slash Commands are registered in bot.tree."""
