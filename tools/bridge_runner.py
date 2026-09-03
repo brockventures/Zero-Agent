@@ -181,7 +181,8 @@ async def execute_agy_turn(
             try:
                 from tools.channel_history import format_channel_context
                 target_msg_id = getattr(reply_target, "id", None)
-                ch_ctx = format_channel_context(channel_id, limit=15, exclude_msg_id=target_msg_id)
+                parent_cid = getattr(reply_target, "parent_id", None) if reply_target else None
+                ch_ctx = format_channel_context(channel_id, limit=15, exclude_msg_id=target_msg_id, parent_channel_id=parent_cid)
                 if ch_ctx:
                     channel_ctx_block = f"\n{ch_ctx}\n\n"
             except Exception as ce:
