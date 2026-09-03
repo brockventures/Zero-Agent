@@ -17,10 +17,25 @@ CURATED_FALLBACKS = {
     "nod": "https://tenor.com/view/robert-redford-robert-redford-agreed-nod-gif-6882050326903489161",
     "facepalm": "https://tenor.com/view/star-trek-gif-12095420689275725462",
     "popcorn": "https://tenor.com/view/popcorn-micaheljackson-jackson-thriller-gif-7723623",
-    "cheers": "https://tenor.com/view/great-gatsby-cheers-leonardo-dicaprio-toast-gif-7901048",
+    "cheers": "https://tenor.com/view/boss-gatsby-cheers-leonardo-di-caprio-great-gatsby-gif-5071053",
     "mic_drop": "https://tenor.com/view/drop-the-mic-obama-mic-drop-gif-13109295",
     "smug": "https://tenor.com/view/the-unbearable-weight-of-massive-gif-27604173"
 }
+
+def is_valid_gif_url(url: str, timeout: float = 2.5) -> bool:
+    """Fast HTTP HEAD probe to verify a Tenor GIF URL returns HTTP 200 OK before delivering."""
+    if not url or not url.startswith("http"):
+        return False
+    req = urllib.request.Request(
+        url,
+        method="HEAD",
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
 
 def load_history() -> list[str]:
     if HISTORY_FILE.exists():
@@ -75,8 +90,8 @@ def search_tenor(query: str, limit: int = 6) -> list[dict]:
 def get_contextual_gif(query: str) -> dict:
     """
     Primary Dynamic Picker:
-    Searches Tenor for the specific conversational context, filters out
-    recently used GIFs to eliminate repeats, and selects from top candidates.
+    Searches Tenor for conversational context, filters out recently used GIFs,
+    validates candidate URLs via HTTP HEAD to eliminate 404s, and selects from top candidates.
     """
     history = set(load_history())
     candidates = search_tenor(query, limit=8)
@@ -85,9 +100,16 @@ def get_contextual_gif(query: str) -> dict:
     fresh_candidates = [c for c in candidates if c["url"] not in history]
     pool = fresh_candidates if fresh_candidates else candidates
 
-    if pool:
-        # Pick randomly from the top 3 fresh candidates for organic variety
-        pick = random.choice(pool[:3])
+    # Validate that URLs actually return 200 OK to eliminate broken links
+    valid_pool = []
+    for c in pool:
+        if is_valid_gif_url(c["url"]):
+            valid_pool.append(c)
+        if len(valid_pool) >= 3:
+            break
+
+    if valid_pool:
+        pick = random.choice(valid_pool)
         record_history(pick["url"])
         return {
             "title": pick["title"],
@@ -95,9 +117,11 @@ def get_contextual_gif(query: str) -> dict:
             "source": "dynamic_search"
         }
 
-    # Emergency fallback only if search fails completely
+    # Verified fallback only if search fails completely or returns dead links
     fallback_key = "shrug" if "shrug" in query.lower() else "eye_roll"
     fb_url = CURATED_FALLBACKS.get(fallback_key, CURATED_FALLBACKS["eye_roll"])
+    if not is_valid_gif_url(fb_url):
+        fb_url = CURATED_FALLBACKS["shrug"]
     record_history(fb_url)
     return {
         "title": fallback_key.replace("_", " ").title(),
