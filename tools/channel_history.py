@@ -18,6 +18,14 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 CHANNEL_HISTORY_FILE = DATA_DIR / "channel_history.json"
 MAX_HISTORY_PER_CHANNEL = 40
 
+# Linked channel groups for cross-room awareness (e.g., Crab Cavern)
+LINKED_CHANNEL_GROUPS = [
+    {
+        "1534452820995080192": "lounge",
+        "1534436119888793750": "agent-chat",
+    }
+]
+
 # In-memory deque store: channel_id (str) -> deque of message dicts
 _history_store: dict[str, deque] = {}
 _last_save_time = 0.0
@@ -105,34 +113,89 @@ def format_channel_context(
     channel_id: int | str,
     limit: int = 15,
     exclude_msg_id: int | None = None,
-    max_chars: int = 4000
+    max_chars: int = 4000,
+    include_linked_channels: bool = True,
+    peer_limit: int = 10,
+    max_peer_age_seconds: int = 3600,
+    parent_channel_id: int | str | None = None
 ) -> str:
-    """Format recent channel history into a clean, chronological context block for LLM turns."""
+    """Format recent channel history into a clean, chronological context block for LLM turns,
+    including linked peer channels (e.g. #lounge <-> #agent-chat) when configured."""
     recent = get_recent_messages(channel_id, limit=limit, exclude_msg_id=exclude_msg_id)
-    if not recent:
-        return ""
+    active_block = ""
+    if recent:
+        lines = []
+        total_len = 0
+        # Walk newest to oldest to enforce max_chars budget, then reverse
+        for m in reversed(recent):
+            ts = m.get("timestamp", "").split(" ")[1] if " " in m.get("timestamp", "") else m.get("timestamp", "")
+            author_label = f"{m.get('author', 'Unknown')}" + (" (bot)" if m.get("is_bot") else "")
+            content = m.get("content", "").strip()
+            # Truncate individual overly long message snippets if needed
+            if len(content) > 600:
+                content = content[:590] + "... [truncated]"
+            line = f"[{ts}] {author_label}: {content}"
+            if total_len + len(line) > max_chars:
+                break
+            lines.append(line)
+            total_len += len(line)
 
-    lines = []
-    total_len = 0
-    # Walk newest to oldest to enforce max_chars budget, then reverse
-    for m in reversed(recent):
-        ts = m.get("timestamp", "").split(" ")[1] if " " in m.get("timestamp", "") else m.get("timestamp", "")
-        author_label = f"{m.get('author', 'Unknown')}" + (" (bot)" if m.get("is_bot") else "")
-        content = m.get("content", "").strip()
-        # Truncate individual overly long message snippets if needed
-        if len(content) > 600:
-            content = content[:590] + "... [truncated]"
-        line = f"[{ts}] {author_label}: {content}"
-        if total_len + len(line) > max_chars:
-            break
-        lines.append(line)
-        total_len += len(line)
+        lines.reverse()
+        ch_name = recent[-1].get("channel_name", "")
+        header = f"--- RECENT CHANNEL HISTORY (#{ch_name or channel_id}, last {len(lines)} messages) ---"
+        footer = "--- END RECENT CHANNEL HISTORY ---"
+        active_block = f"{header}\n" + "\n".join(lines) + f"\n{footer}"
 
-    lines.reverse()
-    ch_name = recent[-1].get("channel_name", "")
-    header = f"--- RECENT CHANNEL HISTORY (#{ch_name or channel_id}, last {len(lines)} messages) ---"
-    footer = "--- END RECENT CHANNEL HISTORY ---"
-    return f"{header}\n" + "\n".join(lines) + f"\n{footer}"
+    peer_blocks = []
+    if include_linked_channels:
+        ch_key = str(channel_id)
+        p_key = str(parent_channel_id) if parent_channel_id else None
+        now_ts = datetime.now(timezone.utc)
+        for group in LINKED_CHANNEL_GROUPS:
+            if ch_key in group or (p_key and p_key in group):
+                for peer_id, peer_name in group.items():
+                    if peer_id == ch_key or (p_key and peer_id == p_key):
+                        continue
+                    peer_msgs = get_recent_messages(peer_id, limit=peer_limit)
+                    if not peer_msgs:
+                        continue
+
+                    valid_peer_msgs = []
+                    for pm in peer_msgs:
+                        raw_ts = pm.get("timestamp")
+                        if raw_ts and max_peer_age_seconds > 0:
+                            try:
+                                msg_dt = datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+                                if (now_ts - msg_dt).total_seconds() > max_peer_age_seconds:
+                                    continue
+                            except Exception:
+                                pass
+                        valid_peer_msgs.append(pm)
+
+                    if not valid_peer_msgs:
+                        continue
+
+                    p_lines = []
+                    p_len = 0
+                    for pm in reversed(valid_peer_msgs):
+                        ts = pm.get("timestamp", "").split(" ")[1] if " " in pm.get("timestamp", "") else pm.get("timestamp", "")
+                        author_label = f"{pm.get('author', 'Unknown')}" + (" (bot)" if pm.get("is_bot") else "")
+                        content = pm.get("content", "").strip()
+                        if len(content) > 600:
+                            content = content[:590] + "... [truncated]"
+                        line = f"[{ts}] {author_label}: {content}"
+                        if p_len + len(line) > 2500:
+                            break
+                        p_lines.append(line)
+                        p_len += len(line)
+
+                    p_lines.reverse()
+                    p_header = f"--- CROSS-CHANNEL AWARENESS (#{peer_name or peer_id}, last {len(p_lines)} messages) ---"
+                    p_footer = f"--- END CROSS-CHANNEL AWARENESS (#{peer_name or peer_id}) ---"
+                    peer_blocks.append(f"{p_header}\n" + "\n".join(p_lines) + f"\n{p_footer}")
+
+    blocks = [b for b in [active_block] + peer_blocks if b]
+    return "\n\n".join(blocks)
 
 def is_handoff_addressed_to_zero(content: str) -> bool:
     """
