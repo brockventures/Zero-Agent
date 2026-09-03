@@ -1242,6 +1242,10 @@ if __name__ == "__main__":
         from tools.morning_dispatcher import dispatch_morning_topic
         ok, rep, _ = run_sidecar_job("morning_topic_rotation", "Crab Cavern Morning Topic Rotation", dispatch_morning_topic)
         print(rep)
+    elif action in ("market_standup", "standup"):
+        from tools.market_standup import dispatch_market_standup
+        ok, rep, _ = run_sidecar_job("market_standup", "Market Sandbox Autonomous Daily Standup", dispatch_market_standup)
+        print(rep)
     elif action == "status":
         print(format_sidecar_status_summary())
     elif action == "history":

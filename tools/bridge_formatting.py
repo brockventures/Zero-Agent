@@ -690,6 +690,68 @@ def generate_concise_thread_title(prompt: str, target_words: int = 6) -> str:
     return "General Task Execution"
 
 
+def parse_thread_title_tag(text: str) -> tuple[str, str | None]:
+    """Parse [THREAD_TITLE: ...] tag from text and return (cleaned_text, title)."""
+    match = re.search(r"\[THREAD_TITLE:\s*([^\]]+)\]", text, flags=re.IGNORECASE)
+    if match:
+        clean_text = re.sub(r"\[THREAD_TITLE:\s*([^\]]+)\]", "", text, flags=re.IGNORECASE).strip()
+        title = match.group(1).strip()
+        return clean_text, title
+    return text, None
+
+
+def synthesize_thread_title(prompt: str, response: str, max_words: int = 6) -> str:
+    """
+    Synthesize a sharp 4-6 word semantic thread title from the agent's answer/solution.
+    Prioritizes explicit [THREAD_TITLE: ...] tags, leading headers/bold summaries from response,
+    and falls back to synthesized response-prompt semantics.
+    """
+    if not response:
+        return generate_concise_thread_title(prompt, target_words=max_words)
+
+    # 1. Explicit tag
+    _, explicit_tag = parse_thread_title_tag(response)
+    if explicit_tag:
+        clean_tag = re.sub(r"[#*_`~]", "", explicit_tag).strip()
+        words = clean_tag.split()
+        if words:
+            return " ".join(words[:max_words])
+
+    # 2. Extract leading bold text or markdown headers from response (ignoring generic status)
+    status_prefixes = (
+        "zero is online", "what was just deployed", "restart briefing", "task execution",
+        "migrating deliverable", "online and ready", "lead with the result"
+    )
+
+    lines = [l.strip() for l in response.split("\n") if l.strip()]
+    candidate = None
+
+    for line in lines[:8]:
+        # Markdown heading ### Header
+        h_match = re.match(r"^#{1,3}\s+(?:\d+[\.\)]\s+)?([^\n]+)", line)
+        if h_match:
+            cand_text = re.sub(r"[#*_`~]", "", h_match.group(1)).strip()
+            if not any(sp in cand_text.lower() for sp in status_prefixes) and len(cand_text.split()) >= 2:
+                candidate = cand_text
+                break
+
+        # Leading bold **Header/Title**
+        b_match = re.match(r"^\*\*(?:\d+[\.\)]\s+)?([^\*]+)\*\*", line)
+        if b_match:
+            cand_text = re.sub(r"[#*_`~]", "", b_match.group(1)).strip()
+            if not any(sp in cand_text.lower() for sp in status_prefixes) and len(cand_text.split()) >= 2:
+                candidate = cand_text
+                break
+
+    if candidate:
+        words = [w for w in re.findall(r"[a-zA-Z0-9_-]+", candidate) if len(w) > 1]
+        if len(words) >= 3:
+            return " ".join([w.capitalize() for w in words[:max_words]])
+
+    # 3. Fall back to clean prompt generator
+    return generate_concise_thread_title(prompt, target_words=max_words)
+
+
 def parse_interactive_choices(text: str, quick_choice_view_cls=None, button_choice_fn=None) -> tuple[str, any]:
     """Parse [CHOICES: opt1 | opt2] tag from text and return (cleaned_text, choice_view)."""
     matches = list(re.finditer(r"\[CHOICES:\s*([^\]]+)\]", text))

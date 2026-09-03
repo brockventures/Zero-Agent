@@ -41,6 +41,75 @@ READONLY_NOTIFICATION_CHANNELS = {
 TARGET_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "1542081375287640084"))
 OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "1210466877294518272"))
 
+OPERATIONS_CATEGORY_ID = 1544953274363412533
+DEFAULT_HOME_CHANNELS = {
+    TARGET_CHANNEL_ID,
+    1544953275877556334,  # #home-assistant
+    1544953277592899615,  # #steam-deck
+    1544953279664889888,  # #harness-management
+}
+RETITLED_THREADS_FILE = DATA_DIR / "retitled_threads.json"
+
+
+def is_home_channel(channel) -> bool:
+    """Check if a Discord channel or thread belongs to Zero's home turf."""
+    if not channel:
+        return False
+
+    rules = get_runtime_rules()
+    ops_cat_id = rules.get("operations_category_id", OPERATIONS_CATEGORY_ID)
+    home_ch_ids = set(rules.get("home_channel_ids", DEFAULT_HOME_CHANNELS))
+
+    ch_id = getattr(channel, "id", None)
+    if ch_id in home_ch_ids:
+        return True
+
+    cat_id = getattr(channel, "category_id", None)
+    if cat_id == ops_cat_id:
+        return True
+
+    parent_id = getattr(channel, "parent_id", None)
+    if parent_id and parent_id in home_ch_ids:
+        return True
+
+    parent = getattr(channel, "parent", None)
+    if parent and getattr(parent, "category_id", None) == ops_cat_id:
+        return True
+
+    return False
+
+
+def is_thread_retitled(thread_id: int | str) -> bool:
+    """Check if a thread has already received its post-turn retitle."""
+    if RETITLED_THREADS_FILE.exists():
+        try:
+            with open(RETITLED_THREADS_FILE) as f:
+                d = json.load(f)
+                return str(thread_id) in d
+        except Exception:
+            pass
+    return False
+
+
+def mark_thread_retitled(thread_id: int | str):
+    """Record that a thread has received its post-turn retitle."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        d = {}
+        if RETITLED_THREADS_FILE.exists():
+            try:
+                with open(RETITLED_THREADS_FILE) as f:
+                    d = json.load(f)
+            except Exception:
+                pass
+        d[str(thread_id)] = time.time()
+        if len(d) > 500:
+            d = dict(sorted(d.items(), key=lambda x: x[1])[-500:])
+        with open(RETITLED_THREADS_FILE, "w") as f:
+            json.dump(d, f)
+    except Exception as e:
+        print(f"[BridgeState] Error recording retitled thread: {e}")
+
 
 def record_restart_intent(reason: str, initiator: str = "user"):
     """Persist reason for restart before rebooting to enable rich startup briefings."""

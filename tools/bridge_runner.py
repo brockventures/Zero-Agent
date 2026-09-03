@@ -25,6 +25,8 @@ from tools.bridge_formatting import (
     scrub_credentials,
     clean_discord_latex,
     generate_concise_thread_title,
+    synthesize_thread_title,
+    parse_thread_title_tag,
 )
 from tools.bridge_state import (
     DATA_DIR,
@@ -46,6 +48,8 @@ from tools.bridge_state import (
     reset_gif_turn,
     has_reaction_gif,
     get_gif_prompt_guidance,
+    is_thread_retitled,
+    mark_thread_retitled,
 )
 
 PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "30m")
