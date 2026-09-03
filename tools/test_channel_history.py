@@ -90,5 +90,16 @@ class TestChannelHistoryCrossChannel(unittest.TestCase):
         self.assertIn("CROSS-CHANNEL AWARENESS (#agent-chat", ctx)
         self.assertIn("Peer activity", ctx)
 
+    def test_pt_timestamp_conversion(self):
+        """UTC timestamps must be converted to Pacific Time (PT) in channel context."""
+        ch_id = "1534452820995080192"
+        # 04:12:11 UTC on Sep 3 = 09:12:11 PM PT on Sep 2 (PDT = UTC-7)
+        ch._history_store[ch_id] = deque([
+            {"id": 55, "channel_id": ch_id, "channel_name": "lounge", "author": "Zero", "is_bot": True, "content": "Checking time", "timestamp": "2026-09-03 04:12:11 UTC"}
+        ])
+        ctx = ch.format_channel_context(ch_id, limit=1)
+        self.assertIn("[09:12:11 PM PT] Zero (bot): Checking time", ctx)
+        self.assertIn("PT timezone", ctx)
+
 if __name__ == "__main__":
     unittest.main()

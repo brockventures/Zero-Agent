@@ -11,7 +11,10 @@ import time
 import re
 from pathlib import Path
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from collections import deque
+
+PT_TZ = ZoneInfo("America/Los_Angeles")
 
 DATA_DIR = Path("/workspace/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -109,6 +112,18 @@ def get_recent_messages(channel_id: int | str, limit: int = 15, exclude_msg_id: 
         msgs = [m for m in msgs if m.get("id") != exclude_msg_id]
     return msgs[-limit:]
 
+def format_ts_pt(raw_ts: str | None) -> str:
+    """Convert raw 'YYYY-MM-DD HH:MM:SS UTC' timestamp to clean 'hh:mm:ss AM/PM PT'."""
+    if not raw_ts:
+        return ""
+    try:
+        if "UTC" in raw_ts:
+            dt = datetime.strptime(raw_ts, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+            return dt.astimezone(PT_TZ).strftime("%I:%M:%S %p PT")
+    except Exception:
+        pass
+    return raw_ts.split(" ")[1] if " " in raw_ts else raw_ts
+
 def format_channel_context(
     channel_id: int | str,
     limit: int = 15,
@@ -128,7 +143,7 @@ def format_channel_context(
         total_len = 0
         # Walk newest to oldest to enforce max_chars budget, then reverse
         for m in reversed(recent):
-            ts = m.get("timestamp", "").split(" ")[1] if " " in m.get("timestamp", "") else m.get("timestamp", "")
+            ts = format_ts_pt(m.get("timestamp", ""))
             author_label = f"{m.get('author', 'Unknown')}" + (" (bot)" if m.get("is_bot") else "")
             content = m.get("content", "").strip()
             # Truncate individual overly long message snippets if needed
@@ -142,7 +157,7 @@ def format_channel_context(
 
         lines.reverse()
         ch_name = recent[-1].get("channel_name", "")
-        header = f"--- RECENT CHANNEL HISTORY (#{ch_name or channel_id}, last {len(lines)} messages) ---"
+        header = f"--- RECENT CHANNEL HISTORY (#{ch_name or channel_id}, last {len(lines)} messages, PT timezone) ---"
         footer = "--- END RECENT CHANNEL HISTORY ---"
         active_block = f"{header}\n" + "\n".join(lines) + f"\n{footer}"
 
@@ -178,7 +193,7 @@ def format_channel_context(
                     p_lines = []
                     p_len = 0
                     for pm in reversed(valid_peer_msgs):
-                        ts = pm.get("timestamp", "").split(" ")[1] if " " in pm.get("timestamp", "") else pm.get("timestamp", "")
+                        ts = format_ts_pt(pm.get("timestamp", ""))
                         author_label = f"{pm.get('author', 'Unknown')}" + (" (bot)" if pm.get("is_bot") else "")
                         content = pm.get("content", "").strip()
                         if len(content) > 600:
@@ -190,7 +205,7 @@ def format_channel_context(
                         p_len += len(line)
 
                     p_lines.reverse()
-                    p_header = f"--- CROSS-CHANNEL AWARENESS (#{peer_name or peer_id}, last {len(p_lines)} messages) ---"
+                    p_header = f"--- CROSS-CHANNEL AWARENESS (#{peer_name or peer_id}, last {len(p_lines)} messages, PT timezone) ---"
                     p_footer = f"--- END CROSS-CHANNEL AWARENESS (#{peer_name or peer_id}) ---"
                     peer_blocks.append(f"{p_header}\n" + "\n".join(p_lines) + f"\n{p_footer}")
 

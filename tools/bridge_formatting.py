@@ -8,6 +8,7 @@ import html
 import json
 import os
 import re
+import urllib.request
 from pathlib import Path
 
 
@@ -175,7 +176,42 @@ def format_for_discord(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
+    # 7. Sanitize reaction GIFs: verify Tenor links are live (HTTP 200) and replace 404s with working fallbacks
+    text = sanitize_reaction_gifs(text)
+
     return text.strip()
+
+
+def sanitize_reaction_gifs(text: str) -> str:
+    """Probe Tenor links in Discord output. If a Tenor GIF returns HTTP 404,
+    replace it with a live fallback GIF or strip the line so Discord never renders broken previews."""
+    if not text or "tenor.com/view/" not in text:
+        return text
+
+    tenor_urls = re.findall(r"https?://(?:www\.)?tenor\.com/view/[a-zA-Z0-9_\-]+", text)
+    for url in set(tenor_urls):
+        is_ok = False
+        try:
+            req = urllib.request.Request(
+                url,
+                method="HEAD",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if resp.status == 200:
+                    is_ok = True
+        except Exception:
+            is_ok = False
+
+        if not is_ok:
+            try:
+                from tools.gif_tool import get_contextual_gif
+                fallback = get_contextual_gif("shrug")
+                text = text.replace(url, fallback["url"])
+            except Exception:
+                text = re.sub(rf"(?:^|\n)[^\n]*{re.escape(url)}[^\n]*(?:\n|$)", "\n", text)
+
+    return text
 
 
 def extract_agent_response(raw_text: str) -> str:

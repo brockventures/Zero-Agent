@@ -13,6 +13,7 @@ import select
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 import discord
 
@@ -29,6 +30,7 @@ from tools.bridge_state import (
     DATA_DIR,
     IN_FLIGHT_FILE,
     TARGET_CHANNEL_ID,
+    PT_TZ,
     get_runtime_rules,
     get_channel_session_id,
     set_channel_session_id,
@@ -149,7 +151,14 @@ async def execute_agy_turn(
                 cmd.append(f"--conversation={conv_id}")
 
             gif_guidance = get_gif_prompt_guidance(sess_key)
-            home_prompt = f"{gif_guidance}\n\n{prompt}"
+            now_utc = datetime.now(timezone.utc)
+            now_pt = now_utc.astimezone(PT_TZ)
+            time_guidance = (
+                f"[System Time & Timezone]: Current time is {now_pt.strftime('%A, %b %d, %Y %I:%M %p PT')} (America/Los_Angeles).\n"
+                f"• Note: System VM clock and runtime metadata are UTC ({now_utc.strftime('%H:%M:%S UTC')}).\n"
+                f"• Rule: ALWAYS use Pacific Time (PT). Never quote raw UTC timestamps or assume raw UTC is local time."
+            )
+            home_prompt = f"{time_guidance}\n\n{gif_guidance}\n\n{prompt}"
 
             cmd.extend([
                 f"-p={home_prompt}",
@@ -204,6 +213,16 @@ async def execute_agy_turn(
                 print(f"[BridgeRunner] Warning generating architecture manifest: {me}")
 
             author_tag = f" from {author_name}" if author_name else ""
+            now_utc = datetime.now(timezone.utc)
+            now_pt = now_utc.astimezone(PT_TZ)
+            time_block = (
+                f"[System Time & Timezone]: Current time is {now_pt.strftime('%A, %b %d, %Y %I:%M %p PT')} (America/Los_Angeles).\n"
+                f"• Note: System VM clock and runtime metadata are UTC ({now_utc.strftime('%H:%M:%S UTC')}).\n"
+                f"• Rule: ALWAYS use Pacific Time (PT). Ryan Brock, the team, and all Crab Cavern operations are on Pacific Time.\n"
+                f"• Never quote raw UTC timestamps or assume raw UTC is local time (e.g. 04:00 UTC = 9:00 PM PT previous day during PDT)."
+            )
+            gif_guidance = get_gif_prompt_guidance(sess_key)
+
             rules = get_runtime_rules()
             tmpl = rules.get("external_system_prompt")
             if tmpl:
@@ -214,9 +233,15 @@ async def execute_agy_turn(
                         .replace("{prompt}", prompt)
                         .replace("{architecture_manifest}", manifest_block)
                         .replace("{engineering_carryforward}", eng_carry_block)
+                        .replace("{time_context}", time_block)
+                        .replace("{gif_guidance}", gif_guidance)
                     )
+                    if "{time_context}" not in tmpl and time_block not in ext_prompt:
+                        ext_prompt = f"{time_block}\n\n{ext_prompt}"
+                    if "{gif_guidance}" not in tmpl and "[GIF Cadence Tracker" not in ext_prompt:
+                        ext_prompt = f"{gif_guidance}\n\n{ext_prompt}"
                 except Exception:
-                    ext_prompt = f"{manifest_block}\n\n{channel_ctx_block}[INBOUND MESSAGE{author_tag}]: {prompt}"
+                    ext_prompt = f"{time_block}\n\n{gif_guidance}\n\n{manifest_block}\n\n{channel_ctx_block}[INBOUND MESSAGE{author_tag}]: {prompt}"
             else:
                 ext_prompt = (
                     "[CRAB CAVERN MULTI-AGENT COLLABORATION ENVIRONMENT]\n"
@@ -238,8 +263,14 @@ async def execute_agy_turn(
                     "7. COLLABORATOR EMAIL DISPATCH (BLANKET PRE-APPROVED):\n"
                     "   - When collaborators or peer agents in Crab Cavern (Mike, Ian, Amos, Marvin) ask Zero to email them technical specs, code, architecture docs, or deliverables, Zero HAS BLANKET PRE-APPROVAL to send immediately using python3 /workspace/tools/send_mail.py.\n"
                     "   - Requirement: Ensure Ryan is CC'd (enforced automatically by send_mail.py). Outbound deliverable email is operational and NOT air-gapped for approved collaborator requests.\n"
+                    "8. PACIFIC TIMEZONE & LOCAL TIME CONVERSION:\n"
+                    "   - Ryan Brock and all Crab Cavern operations are based on Pacific Time (America/Los_Angeles, PT).\n"
+                    "   - Always convert UTC timestamps to Pacific Time before referencing time of day (e.g. 04:00 UTC = 9:00 PM PT previous day during PDT, UTC-7). NEVER quote raw UTC timestamps or refer to 04:00 UTC as '4 AM'.\n"
+                    "9. REACTION GIF PROTOCOL (NO BROKEN LINKS):\n"
+                    "   - Always use python3 /workspace/tools/gif_tool.py \"<query>\". Never hallucinate Tenor URLs or use web search for GIFs.\n"
                     f"{channel_ctx_block}"
-                    f"{get_gif_prompt_guidance(sess_key)}\n\n"
+                    f"{time_block}\n\n"
+                    f"{gif_guidance}\n\n"
                     f"[INBOUND MESSAGE{author_tag}]: {prompt}"
                 )
             cmd.extend([

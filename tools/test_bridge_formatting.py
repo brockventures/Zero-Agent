@@ -139,6 +139,14 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertTrue(len(title3.split()) >= 3)
         self.assertNotIn("analyze", title3.lower())
 
+    def test_sanitize_reaction_gifs(self):
+        # 404 URL that previously broke in Crab Cavern
+        broken_url = "https://tenor.com/view/arrested-development-lucille-bluth-jessica-walter-lock-the-door-gif-26514757"
+        text = f"Here is your reaction:\n{broken_url}\nEnjoy!"
+        cleaned = format_for_discord(text)
+        self.assertNotIn(broken_url, cleaned)
+        self.assertIn("https://tenor.com/view/", cleaned)
+
 
 if __name__ == "__main__":
     unittest.main()
