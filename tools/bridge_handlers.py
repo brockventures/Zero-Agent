@@ -989,7 +989,11 @@ async def handle_message(
         "!birthdays": ("⏳ *Checking birthdays today...*", "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py. Post any birthdays."),
         "/birthdays": ("⏳ *Checking birthdays today...*", "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py. Post any birthdays."),
         "!tokens": ("⏳ *Generating token budget report...*", "Run the daily token & Google AI Ultra compute budget usage report using /workspace/tools/sidecars.py token_report."),
-        "/tokens": ("⏳ *Generating token budget report...*", "Run the daily token & Google AI Ultra compute budget usage report using /workspace/tools/sidecars.py token_report.")
+        "/tokens": ("⏳ *Generating token budget report...*", "Run the daily token & Google AI Ultra compute budget usage report using /workspace/tools/sidecars.py token_report."),
+        "!standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
+        "/standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
+        "!market_standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
+        "/market_standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch.")
     }
 
     cmd_key = content.lower().split()[0] if content else ""
