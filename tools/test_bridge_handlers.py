@@ -32,6 +32,12 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         self.orig_in_flight = bs.IN_FLIGHT_FILE
         self.orig_restart_intent = bs.RESTART_INTENT_FILE
 
+        import tools.channel_history as ch
+        self.orig_history_file = ch.CHANNEL_HISTORY_FILE
+        self.orig_history_store = {k: v.copy() for k, v in ch._history_store.items()}
+        ch.CHANNEL_HISTORY_FILE = self.temp_path / "channel_history.json"
+        ch._history_store.clear()
+
         bs.DATA_DIR = self.temp_path
         bh.ATTACHMENTS_DIR = self.temp_path / "attachments"
         bh.ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,6 +45,10 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         bs.RESTART_INTENT_FILE = self.temp_path / "restart_intent.json"
 
     def tearDown(self):
+        import tools.channel_history as ch
+        ch.CHANNEL_HISTORY_FILE = self.orig_history_file
+        ch._history_store = self.orig_history_store
+
         bs.DATA_DIR = self.orig_data_dir
         bh.ATTACHMENTS_DIR = self.orig_attachments_dir
         bs.IN_FLIGHT_FILE = self.orig_in_flight

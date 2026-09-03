@@ -9,18 +9,6 @@ from pathlib import Path
 
 HISTORY_FILE = Path("/workspace/data/gif_history.json")
 
-CURATED_FALLBACKS = {
-    "eye_roll": "https://tenor.com/view/april-parks-and-rec-sass-no-ew-gif-9121879",
-    "shrug": "https://tenor.com/view/jordan-shrug-shrugging-michael-jordan-mj-gif-4923836",
-    "stare": "https://tenor.com/view/jim-halpert-camera-stare-jim-look-jim-stare-the-office-gif-14191171665883802076",
-    "disbelief": "https://tenor.com/view/in-disbelief-gif-13763291379473080094",
-    "nod": "https://tenor.com/view/robert-redford-robert-redford-agreed-nod-gif-6882050326903489161",
-    "facepalm": "https://tenor.com/view/star-trek-gif-12095420689275725462",
-    "popcorn": "https://tenor.com/view/popcorn-micaheljackson-jackson-thriller-gif-7723623",
-    "cheers": "https://tenor.com/view/boss-gatsby-cheers-leonardo-di-caprio-great-gatsby-gif-5071053",
-    "mic_drop": "https://tenor.com/view/drop-the-mic-obama-mic-drop-gif-13109295",
-    "smug": "https://tenor.com/view/the-unbearable-weight-of-massive-gif-27604173"
-}
 
 def is_valid_gif_url(url: str, timeout: float = 2.5) -> bool:
     """Fast HTTP HEAD probe to verify a Tenor GIF URL returns HTTP 200 OK before delivering."""
@@ -87,46 +75,93 @@ def search_tenor(query: str, limit: int = 6) -> list[dict]:
         print(f"[GIF] Search error: {e}", file=sys.stderr)
     return results
 
+def search_giphy(query: str, limit: int = 6) -> list[dict]:
+    clean_q = re.sub(r"[^a-zA-Z0-9\s]", "", query).strip()
+    slug = urllib.parse.quote(clean_q.replace(" ", "-"))
+    url = f"https://giphy.com/search/{slug}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    )
+    results = []
+    try:
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+            matches = re.findall(r"https://giphy\.com/gifs/([a-zA-Z0-9_-]+)", html)
+            seen = set()
+            for m in matches:
+                full_url = f"https://giphy.com/gifs/{m}"
+                if full_url in seen:
+                    continue
+                seen.add(full_url)
+                slug_part = re.sub(r"-[a-zA-Z0-9]+$", "", m)
+                title = slug_part.replace("-", " ") if slug_part else m
+                results.append({
+                    "title": title,
+                    "url": full_url
+                })
+                if len(results) >= limit:
+                    break
+    except Exception as e:
+        print(f"[GIF] Giphy search error: {e}", file=sys.stderr)
+    return results
+
 def get_contextual_gif(query: str) -> dict:
     """
-    Primary Dynamic Picker:
-    Searches Tenor for conversational context, filters out recently used GIFs,
-    validates candidate URLs via HTTP HEAD to eliminate 404s, and selects from top candidates.
+    Dynamic GIF Picker:
+    1. Primary: Searches Tenor, filters against history, verifies HTTP 200.
+    2. Fallback: Searches Giphy, filters against history, verifies HTTP 200.
+    3. Skip: If both providers return no valid links, returns None (no hardcoded URLs).
     """
     history = set(load_history())
-    candidates = search_tenor(query, limit=8)
 
-    # Filter out anything used recently
-    fresh_candidates = [c for c in candidates if c["url"] not in history]
-    pool = fresh_candidates if fresh_candidates else candidates
+    # Tier 1: Dynamic Tenor search
+    tenor_candidates = search_tenor(query, limit=8)
+    tenor_fresh = [c for c in tenor_candidates if c["url"] not in history]
+    tenor_pool = tenor_fresh if tenor_fresh else tenor_candidates
 
-    # Validate that URLs actually return 200 OK to eliminate broken links
-    valid_pool = []
-    for c in pool:
+    valid_tenor = []
+    for c in tenor_pool:
         if is_valid_gif_url(c["url"]):
-            valid_pool.append(c)
-        if len(valid_pool) >= 3:
+            valid_tenor.append(c)
+        if len(valid_tenor) >= 3:
             break
 
-    if valid_pool:
-        pick = random.choice(valid_pool)
+    if valid_tenor:
+        pick = random.choice(valid_tenor)
         record_history(pick["url"])
         return {
             "title": pick["title"],
             "url": pick["url"],
-            "source": "dynamic_search"
+            "source": "dynamic_tenor"
         }
 
-    # Verified fallback only if search fails completely or returns dead links
-    fallback_key = "shrug" if "shrug" in query.lower() else "eye_roll"
-    fb_url = CURATED_FALLBACKS.get(fallback_key, CURATED_FALLBACKS["eye_roll"])
-    if not is_valid_gif_url(fb_url):
-        fb_url = CURATED_FALLBACKS["shrug"]
-    record_history(fb_url)
+    # Tier 2: Dynamic Giphy fallback
+    giphy_candidates = search_giphy(query, limit=8)
+    giphy_fresh = [c for c in giphy_candidates if c["url"] not in history]
+    giphy_pool = giphy_fresh if giphy_fresh else giphy_candidates
+
+    valid_giphy = []
+    for c in giphy_pool:
+        if is_valid_gif_url(c["url"]):
+            valid_giphy.append(c)
+        if len(valid_giphy) >= 3:
+            break
+
+    if valid_giphy:
+        pick = random.choice(valid_giphy)
+        record_history(pick["url"])
+        return {
+            "title": pick["title"],
+            "url": pick["url"],
+            "source": "dynamic_giphy"
+        }
+
+    # Tier 3: Graceful skip (no hardcoded static URLs)
     return {
-        "title": fallback_key.replace("_", " ").title(),
-        "url": fb_url,
-        "source": "fallback"
+        "title": None,
+        "url": None,
+        "source": "skip"
     }
 
 if __name__ == "__main__":
