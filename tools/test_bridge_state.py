@@ -150,6 +150,41 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(b_data["state"], "PROCESSING")
         self.assertIn("Running heavy task", b_data["prompt"])
 
+    def test_gif_turn_tracking_and_guidance(self):
+        # 1. Defaults to 0
+        self.assertEqual(bs.get_gif_turn_count("chan_a"), 0)
+
+        # 2. Increment per-channel
+        c1 = bs.increment_gif_turn("chan_a")
+        self.assertEqual(c1, 1)
+        c2 = bs.increment_gif_turn("chan_a")
+        self.assertEqual(c2, 2)
+
+        # 3. Channel isolation
+        self.assertEqual(bs.get_gif_turn_count("chan_b"), 0)
+
+        # 4. Reset counter
+        bs.reset_gif_turn("chan_a")
+        self.assertEqual(bs.get_gif_turn_count("chan_a"), 0)
+
+        # 5. has_reaction_gif regex detection
+        self.assertTrue(bs.has_reaction_gif("Check this out\nhttps://tenor.com/view/youre-busted-man-gif-4979634115261473598"))
+        self.assertTrue(bs.has_reaction_gif("https://giphy.com/gifs/funny-cat-123"))
+        self.assertTrue(bs.has_reaction_gif("https://cdn.example.com/reactions/laugh.gif"))
+        self.assertFalse(bs.has_reaction_gif("Here is the technical diagnosis without visual media."))
+        self.assertFalse(bs.has_reaction_gif(""))
+
+        # 6. Prompt guidance formatting & overrides
+        guidance_low = bs.get_gif_prompt_guidance("chan_a")
+        self.assertIn("Nominal (0/5-7 turns)", guidance_low)
+        self.assertIn("Serious / Critical Override", guidance_low)
+        self.assertIn("Social / Banter Override", guidance_low)
+
+        for _ in range(5):
+            bs.increment_gif_turn("chan_a")
+        guidance_due = bs.get_gif_prompt_guidance("chan_a")
+        self.assertIn("⚠️ DUE (>=5 turns without GIF)", guidance_due)
+
 
 if __name__ == "__main__":
     unittest.main()

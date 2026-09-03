@@ -704,6 +704,46 @@ async def handle_message(
             if hasattr(ref, "author") and bot.user and ref.author.id == bot.user.id:
                 is_reply_to_zero = True
 
+        # Conversational follow-up detection:
+        # If a human responds in the channel shortly after Zero spoke (within 300s)
+        # without explicitly addressing another peer/user, check if it is a follow-up turn.
+        is_conversational_follow_up = False
+        if not msg.author.bot and not is_reply_to_zero:
+            try:
+                from tools.classifier import is_explicitly_addressed_to_other
+                if not is_explicitly_addressed_to_other(content):
+                    from tools.channel_history import get_recent_messages
+                    from datetime import datetime, timezone
+                    prev_msgs = get_recent_messages(msg.channel.id, limit=5, exclude_msg_id=msg.id)
+                    if prev_msgs:
+                        last_msg = prev_msgs[-1]
+                        last_author = str(last_msg.get("author", "")).lower()
+                        if last_author == "zero" or (last_msg.get("is_bot") and "zero" in last_author):
+                            now_ts = msg.created_at.timestamp() if hasattr(msg, "created_at") else time.time()
+                            last_ts_str = last_msg.get("timestamp")
+                            last_msg_ts = 0.0
+                            if last_ts_str:
+                                try:
+                                    last_dt = datetime.strptime(last_ts_str, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+                                    last_msg_ts = last_dt.timestamp()
+                                except Exception:
+                                    pass
+
+                            elapsed = (now_ts - last_msg_ts) if last_msg_ts > 0 else 0
+                            if 0 <= elapsed <= 300:
+                                last_content = last_msg.get("content", "")
+                                asked_question = ("?" in last_content[-400:]) or ('"reply": "optional"' in last_content) or ('"floor": "open"' in last_content)
+                                is_action_or_affirmative = bool(re.search(
+                                    r"^(?:yep|yeah|yes|sure|go ahead|sounds good|do it|proceed|approved|lgtm|update|check|push|fix|please|pls|thanks|thank you|can you|could you|what about|how about|also|no|nope|wait)\b",
+                                    content.strip(),
+                                    re.IGNORECASE
+                                ))
+                                if asked_question or is_action_or_affirmative:
+                                    is_conversational_follow_up = True
+                                    print(f"[Bridge] Conversational follow-up to Zero detected from {author_name} ({elapsed:.1f}s after Zero's turn) in channel {msg.channel.id}")
+            except Exception as fe:
+                print(f"[Bridge] Warning evaluating conversational follow-up: {fe}")
+
         is_mentioned = (
             is_tagged_role or
             (bot.user and bot.user in msg.mentions) or
@@ -712,7 +752,8 @@ async def handle_message(
             is_robot_tagged or
             re.search(r"(?:^|[\s,;/])(?:hey\s+)?@?zero(?:\b|[!?:,/])", content, re.IGNORECASE) is not None or
             is_reply_to_zero or
-            handoff_for_zero
+            handoff_for_zero or
+            is_conversational_follow_up
         )
         if not is_mentioned:
             if rules.get("ambient_classifier_enabled", False):

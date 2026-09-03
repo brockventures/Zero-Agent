@@ -125,6 +125,52 @@ def reset_session_meta(sess_key: str):
     set_session_metadata(sess_key, {"turns": 0, "last_compacted": int(time.time())})
 
 
+def get_gif_turn_count(sess_key: str) -> int:
+    """Retrieve number of turns since last reaction GIF was sent in this session/channel."""
+    meta = get_session_metadata(sess_key)
+    return meta.get("turns_since_gif", 0)
+
+
+def increment_gif_turn(sess_key: str) -> int:
+    """Increment the turns_since_gif counter for this session/channel."""
+    meta = get_session_metadata(sess_key)
+    count = meta.get("turns_since_gif", 0) + 1
+    set_session_metadata(sess_key, {"turns_since_gif": count})
+    return count
+
+
+def reset_gif_turn(sess_key: str):
+    """Reset the turns_since_gif counter for this session/channel to 0."""
+    set_session_metadata(sess_key, {"turns_since_gif": 0})
+
+
+def has_reaction_gif(text: str) -> bool:
+    """Check if text contains a Tenor, Giphy, or direct image reaction GIF link."""
+    if not text:
+        return False
+    return bool(
+        re.search(
+            r"https?://(?:www\.)?(?:tenor\.com/(?:view/|.*?-\d+)|giphy\.com/gifs/|\S+\.gif\b)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def get_gif_prompt_guidance(sess_key: str) -> str:
+    """Generate prompt guidance block for GIF cadence and contextual overrides."""
+    count = get_gif_turn_count(sess_key)
+    status_str = "⚠️ DUE (>=5 turns without GIF)" if count >= 5 else f"Nominal ({count}/5-7 turns)"
+    return (
+        f"[GIF Cadence Tracker (Channel: {sess_key})]: {count} message(s) since last reaction GIF in this channel.\n"
+        f"• Target Cadence: ~1 in 5-7 messages (use: python3 /workspace/tools/gif_tool.py \"<query>\").\n"
+        f"• Status: {status_str}.\n"
+        f"• Contextual Overrides:\n"
+        f"  - Serious / Critical Override: If the message/topic is serious, urgent, an outage, data entry, or sensitive, override and SKIP the GIF regardless of count.\n"
+        f"  - Social / Banter Override: If the exchange is particularly social, humorous, or banter-laden, you may include a GIF even if count < 5."
+    )
+
+
 def check_compaction_needed(
     conv_id: str | None,
     current_turns: int,
