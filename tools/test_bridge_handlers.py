@@ -420,6 +420,58 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
             mock_exec.assert_awaited_once()
             self.assertEqual(mock_exec.call_args[0][1], mock_placeholder)
 
+    async def test_channel_tag_requirements_plain_text_name_mention(self):
+        """Verify that mentioning 'Zero' in plain text passes channel-specific tag gating (e.g. in #lounge)."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        lounge_id = 1534452820995080192
+        now = time.time()
+
+        # 1. Plain text mention of "Zero" in #lounge -> should be accepted
+        msg_named = MagicMock()
+        msg_named.id = 100001
+        msg_named.channel.id = lounge_id
+        msg_named.channel.name = "lounge"
+        msg_named.author.id = 1210466877294518272
+        msg_named.author.bot = False
+        msg_named.author.display_name = "Ryan"
+        msg_named.content = "Zero, what do you think of this?"
+        msg_named.created_at.timestamp.return_value = now
+        msg_named.role_mentions = []
+        msg_named.mentions = []
+        msg_named.reference = None
+
+        turn_queue = AsyncMock()
+        rules = {
+            "channel_tag_requirements": {str(lounge_id): "1543285916506783799"},
+            "ambient_classifier_enabled": False
+        }
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
+            await bh.handle_message(msg_named, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+            call_args = turn_queue.put.call_args[0][0]
+            self.assertEqual(call_args["prompt"], "what do you think of this?")
+
+        # 2. Unaddressed message without "Zero" or role tag in #lounge -> should be ignored
+        msg_unaddressed = MagicMock()
+        msg_unaddressed.id = 100002
+        msg_unaddressed.channel.id = lounge_id
+        msg_unaddressed.channel.name = "lounge"
+        msg_unaddressed.author.id = 1210466877294518272
+        msg_unaddressed.author.bot = False
+        msg_unaddressed.author.display_name = "Ryan"
+        msg_unaddressed.content = "Just general ambient chatter in lounge."
+        msg_unaddressed.created_at.timestamp.return_value = now
+        msg_unaddressed.role_mentions = []
+        msg_unaddressed.mentions = []
+        msg_unaddressed.reference = None
+
+        turn_queue_ignored = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
+            await bh.handle_message(msg_unaddressed, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue_ignored)
+            turn_queue_ignored.put.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -814,10 +814,12 @@ async def handle_message(
         if req_tag:
             bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
             tag_str = f"<@&{req_tag}>"
+            is_zero_named = bool(re.search(r"(?:^|[\s,;/])(?:hey\s+)?@?zero(?:\b|[!?:,/])", content, re.IGNORECASE))
             is_direct_bot_ping = (
                 (bot.user and bot.user in msg.mentions) or
                 f"<@{bot_id}>" in content or
                 f"<@!{bot_id}>" in content or
+                is_zero_named or
                 is_robot_tagged
             )
             if tag_str not in content and str(req_tag) not in role_ids and not is_direct_bot_ping:

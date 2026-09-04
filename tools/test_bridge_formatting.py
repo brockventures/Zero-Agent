@@ -116,6 +116,19 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertNotIn("Scanning vacuum automations in the background", res)
         self.assertEqual(res, "Here is the full automation audit.")
 
+    def test_extract_agent_response_preserves_substantive_response_when_followed_by_no_reply(self):
+        raw_stream = (
+            '{"event":"init","conversation_id":"c-bench"}\n'
+            '{"event":"step_update","step_update":{"step_type":"tool","tool_name":"run_command"}}\n'
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"gemini-3.8-flash-low is our fastest model. Sonnet is heavy."}}\n'
+            '{"event":"step_update","step_update":{"step_type":"system_message"}}\n'
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"[NO_REPLY]"}}\n'
+            '{"event":"result","result":{"conversation_id":"c-bench","status":"DONE","response":"gemini-3.8-flash-low is our fastest model. Sonnet is heavy.\\n[NO_REPLY]"}}\n'
+        )
+        res = extract_agent_response(raw_stream)
+        self.assertIn("gemini-3.8-flash-low is our fastest model", res)
+        self.assertNotIn("[NO_REPLY]", res)
+
     def test_extract_agent_response_preserves_legitimate_background_text(self):
         # Verify legitimate prose mentioning "in the background" is preserved
         raw_stream = (

@@ -234,8 +234,23 @@ def extract_agent_response(raw_text: str) -> str:
 
     # Parse JSON if events are present
     accumulated_content = []
+    last_substantive_response = ""
     final_result_response = ""
     error_response = ""
+
+    def _save_substantive():
+        nonlocal last_substantive_response
+        curr_text = "".join(accumulated_content).strip()
+        is_wait_chatter = bool(
+            len(curr_text) < 120 and re.search(
+                r"(?:running|scanning|checking|evaluating|processing|waiting|initiated|started|spawned)[^\n]+(?:in the background|for it to finish)",
+                curr_text,
+                re.IGNORECASE
+            )
+        )
+        is_silence = curr_text.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none", "")
+        if curr_text and not is_wait_chatter and not is_silence:
+            last_substantive_response = curr_text
 
     for line in text.splitlines():
         line_str = line.strip()
@@ -264,13 +279,15 @@ def extract_agent_response(raw_text: str) -> str:
                         if isinstance(step, dict):
                             stype = step.get("step_type")
                             if stype in ("tool", "system_message", "system") or step.get("tool_name") or "tool_info" in step:
-                                # Discard intermediate thought/narration emitted before tool execution or task completion
+                                # Save substantive response before discarding intermediate wait narration
+                                _save_substantive()
                                 accumulated_content.clear()
                             elif stype == "agent_response":
                                 delta = step.get("text_delta") or step.get("text") or step.get("content")
                                 if delta and isinstance(delta, str):
                                     accumulated_content.append(delta)
                     elif ev_type in ("tool", "tool_call", "tool_use", "system_message", "system"):
+                        _save_substantive()
                         accumulated_content.clear()
                     elif ev_type in ("content", "message", "text", "delta"):
                         content = event.get("content") or event.get("text") or event.get("delta")
@@ -280,10 +297,28 @@ def extract_agent_response(raw_text: str) -> str:
                 pass
 
     clean_accumulated = "".join(accumulated_content).strip()
+    if clean_accumulated.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
+        clean_accumulated = ""
+    else:
+        clean_accumulated = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", clean_accumulated, flags=re.IGNORECASE).strip()
+
+    if not clean_accumulated and last_substantive_response:
+        clean_accumulated = last_substantive_response
+
     if clean_accumulated:
         return format_for_discord(clean_accumulated)
+
     if final_result_response:
-        return format_for_discord(final_result_response)
+        frr = final_result_response.strip()
+        if frr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
+            frr = ""
+        else:
+            frr = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", frr, flags=re.IGNORECASE).strip()
+        if frr:
+            return format_for_discord(frr)
+        if last_substantive_response:
+            return format_for_discord(last_substantive_response)
+
     if error_response:
         return format_for_discord(error_response)
 
