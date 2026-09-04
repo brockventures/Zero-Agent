@@ -154,7 +154,7 @@ def _is_busy() -> list[str]:
     return is_bridge_busy(home_turn_queue, ext_turn_queue)
 
 
-async def _dispatch_scheduled(prompt: str, job_name: str = "Sidecar"):
+async def _dispatch_scheduled(prompt: str, job_name: str = "Sidecar", channel_id: int | None = None):
     await dispatch_scheduled_prompt(
         prompt=prompt,
         job_name=job_name,
@@ -163,6 +163,7 @@ async def _dispatch_scheduled(prompt: str, job_name: str = "Sidecar"):
         apply_presence_fn=_apply_presence,
         quick_choice_view_cls=QuickChoiceView,
         button_choice_fn=_button_choice_callback,
+        channel_id=channel_id,
     )
 
 

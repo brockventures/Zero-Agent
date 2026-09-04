@@ -15,6 +15,10 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
+
 import tools.bridge_state as bs
 
 PT = ZoneInfo("America/Los_Angeles")
@@ -72,6 +76,7 @@ DEFAULT_JOBS = [
         "schedule_type": "daily",
         "hour_pt": 22,
         "minute_pt": 0,
+        "channel_id": 1544955535722545253,
         "prompt": "Run the nightly NAS log review using /workspace/tools/sidecars.py nas_logs. Review container errors across Host1 (.82) and Host2 (.84) and report cleanly.",
         "catchup_if_missed": True,
         "catchup_window_seconds": 7200

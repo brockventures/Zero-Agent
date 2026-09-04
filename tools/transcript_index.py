@@ -14,6 +14,7 @@ import json
 import time
 import sqlite3
 import argparse
+from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 DB_PATH = os.environ.get("TRANSCRIPT_INDEX_DB", "/workspace/data/transcript_index.db")
@@ -141,6 +142,11 @@ class TranscriptIndexer:
 
         # 3. Sync Channel History
         self._sync_channel_history(force, stats)
+
+        # 4. Prune Missing Files
+        prune_stats = self.prune_missing()
+        stats["transcripts_pruned"] = prune_stats["transcripts_pruned"]
+        stats["memory_pruned"] = prune_stats["memory_pruned"]
 
         # Update meta timestamp
         with self.con:
@@ -358,6 +364,39 @@ class TranscriptIndexer:
             """, (CHANNEL_HISTORY_PATH, mtime, size, len(messages)))
 
         stats["channel_messages_indexed"] = len(messages)
+
+    def prune_missing(self) -> dict:
+        """Purge indexed transcripts and memory files that no longer exist on disk."""
+        stats = {"transcripts_pruned": 0, "memory_pruned": 0}
+        cursor = self.con.cursor()
+
+        # 1. Check transcripts
+        cursor.execute("SELECT path FROM indexed_files WHERE path LIKE '%transcript.jsonl'")
+        for (p,) in cursor.fetchall():
+            if not os.path.exists(p):
+                parts = Path(p).parts
+                conv_id = None
+                for i, part in enumerate(parts):
+                    if part == "brain" and i + 1 < len(parts):
+                        conv_id = parts[i + 1]
+                        break
+                with self.con:
+                    self.con.execute("DELETE FROM indexed_files WHERE path = ?", (p,))
+                    if conv_id:
+                        self.con.execute("DELETE FROM conversations WHERE conversation_id = ?", (conv_id,))
+                        self.con.execute("DELETE FROM transcript_fts WHERE conversation_id = ?", (conv_id,))
+                stats["transcripts_pruned"] += 1
+
+        # 2. Check memory files
+        cursor.execute("SELECT path FROM indexed_files WHERE path LIKE '%.md'")
+        for (p,) in cursor.fetchall():
+            if not os.path.exists(p):
+                with self.con:
+                    self.con.execute("DELETE FROM indexed_files WHERE path = ?", (p,))
+                    self.con.execute("DELETE FROM memory_fts WHERE file_path = ?", (p,))
+                stats["memory_pruned"] += 1
+
+        return stats
 
     def search(self, query: str, target: str = "all", limit: int = 10) -> Dict[str, Any]:
         results = {

@@ -46,6 +46,99 @@ def find_transcript(conv_id: str | None = None, sess_key: str | None = None) -> 
 
     return None
 
+def clean_dialogue_content(cnt: str, is_user: bool) -> str:
+    """Clean dialogue text by removing XML tags, injected metadata wrappers, and tool chatter."""
+    if not cnt:
+        return ""
+
+    # Strip system metadata and settings blocks along with their content
+    cnt = re.sub(
+        r"<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|SYSTEM_MESSAGE|TASK_OUTPUT)(?:\s+[^>]*)?>.*?</(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|SYSTEM_MESSAGE|TASK_OUTPUT)>",
+        "",
+        cnt,
+        flags=re.DOTALL,
+    ).strip()
+
+    # Strip XML tags
+    cnt = re.sub(
+        r"</?(?:USER_REQUEST|SYSTEM)(?:\s+[^>]*)?>",
+        "",
+        cnt,
+    ).strip()
+
+    if is_user:
+        # Check for mid-turn steering update wrapper
+        steering_match = re.search(
+            r'The user provided new instructions while you were in the middle of executing:\s*"(.*?)"\s*(?:CRITICAL INSTRUCTIONS|$)',
+            cnt,
+            re.DOTALL,
+        )
+        if steering_match:
+            cnt = steering_match.group(1).strip()
+
+        # If [CURRENT USER PROMPT]: is present, extract everything after it
+        if "[CURRENT USER PROMPT]:" in cnt:
+            cnt = cnt.split("[CURRENT USER PROMPT]:", 1)[1].strip()
+
+        # If [INBOUND MESSAGE...] is present (external mode)
+        inbound_match = re.search(r"\[INBOUND MESSAGE[^\]]*\]:\s*(.*)", cnt, re.DOTALL)
+        if inbound_match:
+            cnt = inbound_match.group(1).strip()
+
+        # Strip [System Time & Timezone]: block and bullet points
+        cnt = re.sub(
+            r"\[System Time & Timezone\]:[^\n]*(?:\n\s*[•\-\*][^\n]*)*\n*",
+            "",
+            cnt,
+        ).strip()
+
+        # Strip [GIF Cadence Tracker...]: block and bullet points
+        cnt = re.sub(
+            r"\[GIF Cadence Tracker[^\n]*\n(?:\s*(?:[•\-\*]|\s{2,})[^\n]*\n*)*",
+            "",
+            cnt,
+        ).strip()
+
+        # Strip [PREVIOUS SESSION CARRY-FORWARD CONTEXT]: if any lingered
+        cnt = re.sub(
+            r"\[PREVIOUS SESSION CARRY-FORWARD CONTEXT\]:.*?(?=\n\n[A-Z]|\Z)",
+            "",
+            cnt,
+            flags=re.DOTALL,
+        ).strip()
+
+        # Strip architecture manifest if injected
+        cnt = re.sub(
+            r"=== ZERO LIVE ARCHITECTURE & CAPABILITIES MANIFEST ===.*?=======================================================",
+            "",
+            cnt,
+            flags=re.DOTALL,
+        ).strip()
+
+        # Strip [CRAB CAVERN MULTI-AGENT COLLABORATION ENVIRONMENT]
+        cnt = re.sub(
+            r"\[CRAB CAVERN MULTI-AGENT COLLABORATION ENVIRONMENT\][^\n]*\n*",
+            "",
+            cnt,
+        ).strip()
+
+        # Strip trailing system context if present
+        cnt = re.sub(
+            r"\[System Context\].*$",
+            "",
+            cnt,
+            flags=re.DOTALL,
+        ).strip()
+
+    else:
+        # Zero's response
+        cnt = re.sub(r"\[CHOICES:[^\]]+\]", "", cnt).strip()
+        cnt = re.sub(r"<Action:[^>]+>", "", cnt).strip()
+        cnt = re.sub(r"\[System Context\].*$", "", cnt, flags=re.DOTALL).strip()
+
+    return cnt.strip()
+
+
 def extract_recent_dialogue(conv_id: str | None = None, sess_key: str | None = None, limit: int = 10) -> list[dict]:
     """Extract recent chronological dialogue turns (Ryan and Zero) specifically for the target session."""
     transcript_path = find_transcript(conv_id=conv_id, sess_key=sess_key)
@@ -65,11 +158,10 @@ def extract_recent_dialogue(conv_id: str | None = None, sess_key: str | None = N
                         if ttype == "PLANNER_RESPONSE" and d.get("tool_calls"):
                             continue
                         cnt = (d.get("content") or "").strip()
-                        cnt = re.sub(r"</?(?:USER_REQUEST|SYSTEM_MESSAGE|ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|SYSTEM|TASK_OUTPUT)(?:\s+[^>]*)?>", "", cnt).strip()
-                        cnt = re.sub(r"\[CHOICES:[^\]]+\]", "", cnt).strip()
-                        if cnt and not cnt.startswith("<Action:"):
+                        cleaned = clean_dialogue_content(cnt, is_user=(ttype == "USER_INPUT"))
+                        if cleaned and not cleaned.startswith("<Action:"):
                             speaker = "Ryan" if ttype == "USER_INPUT" else "Zero"
-                            dialogue.append({"speaker": speaker, "content": cnt, "time": d.get("created_at")})
+                            dialogue.append({"speaker": speaker, "content": cleaned, "time": d.get("created_at")})
                 except Exception:
                     continue
     except Exception as e:
@@ -105,7 +197,7 @@ def synthesize_session_milestones(dialogue: list[dict], sess_key: str) -> tuple[
         eng_delta = "- Initialized: Nominal baseline state."
         return milestones, directives, eng_delta
 
-    dialogue_text = "\n".join([f"{t['speaker']}: {t['content'][:300]}" for t in dialogue[-8:]])
+    dialogue_text = "\n".join([f"{t['speaker']}: {t['content'][:500]}" for t in dialogue[-8:]])
     prompt = (
         f"You are Zero, synthesizing session carry-forward context for session '{sess_key}'.\n"
         f"Recent dialogue turns:\n{dialogue_text}\n\n"
@@ -134,8 +226,8 @@ def synthesize_session_milestones(dialogue: list[dict], sess_key: str) -> tuple[
         print(f"[Summarizer] LLM synthesis fallback: {e}")
 
     # Fallback to extracting recent user asks and delivered fixes
-    recent_ryan = [t['content'][:120] for t in dialogue if t['speaker'] == 'Ryan']
-    recent_zero = [t['content'][:120] for t in dialogue if t['speaker'] == 'Zero']
+    recent_ryan = [t['content'][:250] for t in dialogue if t['speaker'] == 'Ryan']
+    recent_zero = [t['content'][:250] for t in dialogue if t['speaker'] == 'Zero']
 
     ms_list = []
     if recent_zero:
@@ -161,8 +253,8 @@ def generate_summary(conv_id: str | None = None, sess_key: str = "home", dry_run
     dialogue_formatted = []
     for turn in recent_dialogue:
         text = turn['content'].replace('\n\n', '\n').strip()
-        if len(text) > 400:
-            text = text[:400] + "..."
+        if len(text) > 600:
+            text = text[:600] + "..."
         dialogue_formatted.append(f"• **{turn['speaker']}:** {text}")
 
     dialogue_block = "\n".join(dialogue_formatted) if dialogue_formatted else "*(No recent turns recorded for this thread)*"

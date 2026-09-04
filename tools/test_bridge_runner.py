@@ -4,6 +4,7 @@ Unit test suite for bridge_runner.py (Process Execution & PTY Engine).
 """
 
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -117,6 +118,39 @@ class TestBridgeRunner(unittest.TestCase):
         target_dest = delivery_target if delivery_target else mock_msg
         self.assertEqual(target_dest, mock_thread)
         self.assertFalse(hasattr(target_dest, "reply") and not hasattr(mock_thread, "reply"))
+
+    def test_harvest_transcript_response(self):
+        """Verify that harvest_transcript_response extracts the last completed PLANNER_RESPONSE."""
+        conv_id = "test-conv-harvest-456"
+        log_dir = self.temp_path / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript_full.jsonl"
+
+        steps = [
+            {"type": "USER_INPUT", "content": "What is the capital of France?"},
+            {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command"}]},
+            {"type": "GENERIC", "content": "Command finished"},
+            {"type": "PLANNER_RESPONSE", "content": "The capital of France is Paris."}
+        ]
+        with open(transcript_file, "w") as f:
+            for s in steps:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_runner.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            recovered = br.harvest_transcript_response(conv_id)
+            self.assertEqual(recovered, "The capital of France is Paris.")
+
+    def test_kill_process_tree(self):
+        """Verify that kill_process_tree signals the process group via os.killpg."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 4321
+        mock_proc.returncode = None
+
+        with patch("os.getpgid", return_value=4321) as mock_getpgid, \
+             patch("os.killpg") as mock_killpg:
+            br.kill_process_tree(mock_proc, sig=br.signal.SIGTERM)
+            mock_getpgid.assert_called_once_with(4321)
+            mock_killpg.assert_called_once_with(4321, br.signal.SIGTERM)
 
 
 if __name__ == "__main__":

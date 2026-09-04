@@ -6,7 +6,7 @@ import sys
 PEER_SNOWFLAKE_TAGS = [
     r"<@!?1468012353206354197>",  # Amos
     r"<@!?1492043459618537492>",  # Marvin
-    r"<@!?1210466877835313155>",  # Mike / Arbiter
+    r"<@!?93420059858305024>",    # Mike / Arbiter
     r"<@!?453030589914939393>",   # Ian / Moon Problem
 ]
 
@@ -41,14 +41,29 @@ ZERO_TAGS = [
     r"\b@?robot\b"
 ]
 
-CLASSIFY_PROMPT = '''Analyze this inbound message in a shared multi-agent engineering channel with Zero (systems engineer, SWE, Linux, Docker, Python), Amos, and Marvin.
-Rules:
-1. If the message is explicitly addressed to someone else (e.g. '@Amos', 'Marvin:', 'Ryan:', '@Ian'), relevance to Zero MUST be 0.0.
-2. If it is trivial casual chatter, greetings, or off-topic, relevance MUST be 0.0.
-3. If it is an unaddressed engineering problem, technical discussion, or systems question where Zero's input would be genuinely valuable, score between 0.70 and 1.0.
-4. If the message includes an open banana handoff envelope marked with reply 'optional' and asks an engineering question without naming a single exclusive recipient, relevance to Zero should be high (0.85 - 0.95).
-5. If the message is a direct engineering directive, confirmation, or action instruction (e.g. 'update the draft', 'push the branch', 'ship it', 'run tests', 'go ahead'), relevance to Zero is high (0.85 - 1.0).
-6. Output ONLY a single float number between 0.0 and 1.0 (e.g. 0.0 or 0.85).
+CLASSIFY_PROMPT = '''You are evaluating inbound chat messages in a shared multi-agent engineering channel (Crab Cavern) with Zero (systems engineer, SWE, Linux, Docker, Python), Amos, and Marvin.
+
+Evaluate the relevance score (0.0 to 1.0) of this message to Zero based on:
+1. TOPICAL ALIGNMENT (0.0 - 0.4):
+   - 0.0: Casual social banter, personal jokes, food/greetings, off-topic.
+   - 0.1 - 0.2: Tangential dev talk, unrelated repos, or peer bots discussing their own internal configs.
+   - 0.3 - 0.4: Directly involves Zero's core stack (Docker, Linux, Python, backend state, repo architecture, bridge, AGORA market sandbox).
+2. CONVERSATIONAL OBLIGATION / TARGETING (0.0 - 0.4):
+   - 0.0: Addressed exclusively to someone else (e.g. '@Amos', 'Marvin:', human-to-human) with no ambiguity.
+   - 0.1 - 0.2: Addressed to another entity, BUT mentions or questions systems/code that Zero specifically owns or built.
+   - 0.3 - 0.4: Addressed to the open room/channel, or an unassigned engineering question/blocker.
+3. ACTIONABILITY / URGENCY (0.0 - 0.2):
+   - 0.0: Passive observation, generic acknowledgment ("nice", "noted"), or informational progress statement.
+   - 0.1: Discussion or design debate seeking consensus.
+   - 0.2: Active blocker, error/outage report, direct question, or call to execute.
+
+Score Guidance:
+- 0.0 - 0.2: Social noise, peer-only internal banter, or pure chatter.
+- 0.3 - 0.5: Topical discussions that are either addressed to others or purely informational updates.
+- 0.6 - 0.7: Open architectural/technical discussions affecting the shared codebase.
+- 0.8 - 1.0: Actionable technical questions, broken builds, or blockers where Zero's input is needed.
+
+Output ONLY a single float between 0.0 and 1.0 (e.g. 0.35, 0.65, 0.85).
 
 Message from {author}: "{content}"'''
 
@@ -88,23 +103,17 @@ def score_relevance(content: str, author: str = "user") -> float:
         pass
 
     if envelope:
-        # Rule: reply: "none" is an unconditional drop
-        if envelope.get("reply") == "none":
-            return 0.0
-
         target = str(envelope.get("to") or envelope.get("target") or envelope.get("recipient") or "").lower()
         if target and "zero" not in target:
+            return 0.0
+
+        floor_state = str(envelope.get("floor") or "").lower()
+        if envelope.get("reply") == "none" and floor_state not in ("open", "free", "any") and "zero" not in target:
             return 0.0
 
     # Strip handoff envelopes and code blocks when evaluating recipient targeting,
     # so that sender signatures (e.g. "holder": "amos") don't trip peer targeting regexes
     text_for_targeting = re.sub(r"```(?:handoff)?.*?```", "", content_clean, flags=re.DOTALL).strip()
-
-    # If directed to peer or other human explicitly in message text and does not include Zero or team role, drop immediately
-    has_other_target = is_explicitly_addressed_to_other(text_for_targeting)
-    has_zero_target = any(re.search(p, text_for_targeting, re.I) for p in ZERO_TAGS)
-    if has_other_target and not has_zero_target:
-        return 0.0
 
     # Detect open questions with reply: "optional"
     is_open_optional_question = False
@@ -125,12 +134,10 @@ def score_relevance(content: str, author: str = "user") -> float:
             ],
             capture_output=True,
             text=True,
-            timeout=15
+            timeout=25
         )
         val = extract_classifier_score(res.stdout)
         if val is not None:
-            if is_open_optional_question and val >= 0.50:
-                return max(val, 0.85)
             return val
     except Exception as e:
         print(f"[Classifier] Error: {e}", file=sys.stderr)

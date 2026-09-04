@@ -4,6 +4,7 @@ Unit test suite for bridge_handlers.py (Discord Bot Event Handlers, Routing & Di
 """
 
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -42,6 +43,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         bh.ATTACHMENTS_DIR = self.temp_path / "attachments"
         bh.ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
         bs.IN_FLIGHT_FILE = self.temp_path / "in_flight_turn.json"
+        bh.IN_FLIGHT_FILE = self.temp_path / "in_flight_turn.json"
         bs.RESTART_INTENT_FILE = self.temp_path / "restart_intent.json"
 
     def tearDown(self):
@@ -52,6 +54,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         bs.DATA_DIR = self.orig_data_dir
         bh.ATTACHMENTS_DIR = self.orig_attachments_dir
         bs.IN_FLIGHT_FILE = self.orig_in_flight
+        bh.IN_FLIGHT_FILE = self.orig_in_flight
         bs.RESTART_INTENT_FILE = self.orig_restart_intent
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
@@ -342,6 +345,80 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         expected_commands = {"new", "reset", "model", "logs", "triage", "heartbeat", "tasks", "sidecars", "title"}
         for exp in expected_commands:
             self.assertIn(exp, cmd_names, f"Expected slash command '/{exp}' to be registered on bot.tree")
+
+    async def test_in_flight_retry_circuit_breaker_on_ready(self):
+        """Verify that repeated in-flight failures (attempts >= 2) trigger the hang circuit breaker on startup."""
+        in_flight_data = {
+            "channel_id": 12345,
+            "status_msg_id": 99999,
+            "prompt": "Hang prompt",
+            "attempts": 2
+        }
+        with open(bs.IN_FLIGHT_FILE, "w") as f:
+            json.dump(in_flight_data, f)
+
+        mock_msg = AsyncMock()
+        mock_channel = MagicMock()
+        mock_channel.fetch_message = AsyncMock(return_value=mock_msg)
+
+        mock_bot = MagicMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_bot.tree.sync = AsyncMock()
+
+        # Call handle_on_ready with mocked background helpers
+        with patch("tools.mcp_daemon.ensure_mcp_daemon_running"), \
+             patch("tools.zero_mail_listener.ensure_mail_listener_running"), \
+             patch("tools.zero_health_server.ensure_health_server_running"), \
+             patch("tools.bridge_daemons.daemon_manager.start_all"):
+            await bh.handle_on_ready(
+                mock_bot,
+                turn_queue=AsyncMock(),
+                ext_turn_queue=AsyncMock(),
+                start_workers_fn=MagicMock(),
+                start_scheduler_fn=AsyncMock()
+            )
+
+        # Assert status message was updated with circuit breaker warning
+        mock_msg.edit.assert_awaited_once()
+        edit_content = mock_msg.edit.call_args[1].get("content") or mock_msg.edit.call_args[0][0]
+        self.assertIn("prevent an execution loop", edit_content)
+        self.assertFalse(bs.IN_FLIGHT_FILE.exists())
+
+    async def test_live_status_ticker_placeholder_suppression(self):
+        """Verify that synthetic status placeholders are suppressed when live_status_ticker_enabled is False."""
+        mock_target = AsyncMock()
+        mock_target.reply = AsyncMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.typing = MagicMock()
+        mock_target.typing = MagicMock()
+
+        item = {
+            "prompt": "Test ops command",
+            "status_msg": None,
+            "reply_target": mock_target,
+            "attachments": [],
+            "channel_id": 1544953279664889888, # #zero-ops
+            "mode": "home"
+        }
+
+        # 1. Thread worker: ticker disabled -> no reply placeholder
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={"live_status_ticker_enabled": False}), \
+             patch("tools.bridge_handlers.execute_agy_turn") as mock_exec:
+            await bh.run_thread_turn_worker(item, MagicMock())
+            mock_target.reply.assert_not_awaited()
+            mock_exec.assert_awaited_once()
+            self.assertIsNone(mock_exec.call_args[0][1])  # status_msg is None
+
+        # 2. Thread worker: ticker enabled -> reply placeholder spawned
+        mock_target.reply.reset_mock()
+        mock_placeholder = AsyncMock()
+        mock_target.reply.return_value = mock_placeholder
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={"live_status_ticker_enabled": True}), \
+             patch("tools.bridge_handlers.execute_agy_turn") as mock_exec:
+            await bh.run_thread_turn_worker(item, MagicMock())
+            mock_target.reply.assert_awaited_once_with("⏳ *Processing task...*")
+            mock_exec.assert_awaited_once()
+            self.assertEqual(mock_exec.call_args[0][1], mock_placeholder)
 
 
 if __name__ == "__main__":

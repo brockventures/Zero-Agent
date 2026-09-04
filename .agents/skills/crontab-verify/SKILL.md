@@ -31,6 +31,9 @@ In this architecture, **writing a standalone `.py` script is only Layer 1**. A p
 | **4. On-Demand Discord Hook** | `/workspace/tools/bridge_handlers.py` | Mapped in `triggers` (`!<action>` and `/<action>`). Enables Ryan or peers to test or trigger the job on-demand in `#zero-chat`. |
 | **5. Contention & Alignment** | `schedule.json` & `sidecar_audit.py` | Pacific Time (`hour_pt`/`minute_pt`) alignment and collision check. Stagger jobs by at least 15 minutes to prevent queue starvation and SQLite lock contention. |
 
+> [!CAUTION]
+> **Never invoke the runtime `schedule` tool during Discord bridge turns.** The builtin `schedule` tool spawns a local background cron in the CLI runtime (`agy`), keeping stdout open and causing `bridge_runner.py` to hang on `proc.wait()` until hitting the 30-minute timeout (`PRINT_TIMEOUT=30m`). Always register recurring sidecars in `schedule.json` (Layer 3).
+
 ---
 
 ## 🛠️ Automated Verification Tools

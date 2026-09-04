@@ -309,21 +309,21 @@ class TestBridgeEndToEndStress(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[CHOICES:", clean_text)
 
     def test_06_compaction_guard_and_session_state(self):
-        """Stress test: verify 25-turn auto-compaction guard threshold and carry-forward resetting."""
+        """Stress test: verify 15-turn auto-compaction guard threshold and carry-forward resetting."""
         sess_key = "home"
-        for i in range(24):
+        for i in range(14):
             t = bs.increment_session_turn(sess_key)
             self.assertEqual(t, i + 1)
 
-        needed, reason = bs.check_compaction_needed("conv-123", current_turns=24)
+        needed, reason = bs.check_compaction_needed("conv-123", current_turns=14)
         self.assertFalse(needed)
 
-        # 25th turn breaches threshold
+        # 15th turn breaches threshold
         t = bs.increment_session_turn(sess_key)
-        self.assertEqual(t, 25)
-        needed, reason = bs.check_compaction_needed("conv-123", current_turns=25)
+        self.assertEqual(t, 15)
+        needed, reason = bs.check_compaction_needed("conv-123", current_turns=15)
         self.assertTrue(needed)
-        self.assertIn("turn count reached 25/25", reason)
+        self.assertIn("turn count reached 15/15", reason)
 
         # Reset session
         bs.reset_session_meta(sess_key)
