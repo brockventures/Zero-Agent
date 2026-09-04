@@ -773,7 +773,7 @@ async def execute_agy_turn(
         return
 
     # Suppress silent replies in home turf
-    if final_text.strip().lower() in ("reply:none", "reply: none", "none", ""):
+    if final_text.strip().lower() in ("reply:none", "reply: none", "none", "", "[no_reply]", "no_reply", "[no_op]", "no_op"):
         print(f"[BridgeRunner] Suppressed silent reply '{final_text.strip()}' from being sent to Discord.")
         if status_msg:
             try:
