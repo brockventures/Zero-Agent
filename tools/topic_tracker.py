@@ -117,18 +117,7 @@ def check_and_resolve_topic(envelope: dict, content: str, author_name: str, mess
     if not is_resolution:
         return False
 
-    # 1. Place non-waking acknowledgment reaction on Discord
-    token = os.getenv("DISCORD_BOT_TOKEN")
-    if token and message_id and channel_id:
-        try:
-            emoji = urllib.parse.quote("✅")
-            url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me"
-            req = urllib.request.Request(url, headers={"Authorization": f"Bot {token}", "User-Agent": "DiscordBot (Zero, 1.0)"}, method="PUT")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                pass
-            print(f"[TopicTracker] Placed ✅ reaction on message {message_id}")
-        except Exception as re_err:
-            print(f"[TopicTracker] Warning: Failed adding reaction: {re_err}")
+    # Internalize resolution cleanly without posting synthetic emoji reactions
 
     # 2. Append to durable memory in /workspace/memory/crab_cavern/decisions.md
     try:

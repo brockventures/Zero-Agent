@@ -29,6 +29,7 @@ QUEUE_FILE = DATA_DIR / "turn_queue.json"
 EXT_QUEUE_FILE = DATA_DIR / "external_turn_queue.json"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 SESSION_METADATA_FILE = DATA_DIR / "session_metadata.json"
+RESET_SESSION_KEYS_FILE = DATA_DIR / "reset_session_keys.json"
 BEACON_FILE = DATA_DIR / "liveness_beacon.json"
 BOT_STATUS_FILE = DATA_DIR / "bot_status.json"
 RUNTIME_RULES_FILE = Path("/workspace/config/runtime_rules.json")
@@ -42,13 +43,14 @@ TARGET_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "1542081375287640084"))
 OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "1210466877294518272"))
 
 OPERATIONS_CATEGORY_ID = 1544953274363412533
+HOMELAB_CHANNEL_ID = 1544955535722545253
 DEFAULT_HOME_CHANNELS = {
     TARGET_CHANNEL_ID,
     1544953275877556334,  # #home-assistant
     1544953277592899615,  # #steam-deck
     1544953279664889888,  # #zero-ops / #harness-management
     1544955532765560924,  # #finances
-    1544955535722545253,  # #homelab
+    HOMELAB_CHANNEL_ID,    # #homelab
     1544955538033348618,  # #shopping
 }
 RETITLED_THREADS_FILE = DATA_DIR / "retitled_threads.json"
@@ -146,17 +148,24 @@ def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, st
             except Exception:
                 data = {}
         cid_str = str(channel_id)
+        prev = data.get(cid_str) or {}
+        attempts = 1
+        if isinstance(prev, dict) and prev.get("prompt") == prompt:
+            attempts = prev.get("attempts", 1) + 1
+
         data[cid_str] = {
             "conv_id": conv_id,
             "status_msg_id": status_msg_id,
             "channel_id": int(channel_id) if str(channel_id).isdigit() else channel_id,
             "prompt": prompt,
+            "attempts": attempts,
             "ts": time.time()
         }
         # Maintain top-level fields for legacy callers/tests checking single dict
         data["prompt"] = prompt
         data["channel_id"] = int(channel_id) if str(channel_id).isdigit() else channel_id
         data["conv_id"] = conv_id
+        data["attempts"] = attempts
         data["ts"] = time.time()
         data["status_msg_id"] = status_msg_id
 
@@ -277,6 +286,77 @@ def reset_session_meta(sess_key: str):
     set_session_metadata(sess_key, {"turns": 0, "last_compacted": int(time.time())})
 
 
+def get_reset_session_keys() -> set[str]:
+    """Retrieve the set of session keys flagged for reset on next turn."""
+    if RESET_SESSION_KEYS_FILE.exists():
+        try:
+            with open(RESET_SESSION_KEYS_FILE) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return set(str(x) for x in data)
+        except Exception:
+            pass
+    return set()
+
+
+def add_reset_session_key(key: str | int):
+    """Persist a session key to be reset on next turn."""
+    try:
+        keys = get_reset_session_keys()
+        keys.add(str(key))
+        tmp = RESET_SESSION_KEYS_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(sorted(list(keys)), f, indent=2)
+        tmp.replace(RESET_SESSION_KEYS_FILE)
+    except Exception as e:
+        print(f"[BridgeState] Error adding reset session key: {e}")
+
+
+def remove_reset_session_key(key: str | int):
+    """Remove a session key from the pending reset list."""
+    try:
+        keys = get_reset_session_keys()
+        keys.discard(str(key))
+        tmp = RESET_SESSION_KEYS_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(sorted(list(keys)), f, indent=2)
+        tmp.replace(RESET_SESSION_KEYS_FILE)
+    except Exception as e:
+        print(f"[BridgeState] Error removing reset session key: {e}")
+
+
+def clear_reset_session_keys():
+    """Clear all pending reset session keys."""
+    try:
+        if RESET_SESSION_KEYS_FILE.exists():
+            RESET_SESSION_KEYS_FILE.unlink()
+    except Exception as e:
+        print(f"[BridgeState] Error clearing reset session keys: {e}")
+
+
+class PersistentSessionKeySet(set):
+    """A set of session keys that automatically synchronizes additions and removals to disk."""
+
+    def add(self, element):
+        s_elem = str(element)
+        super().add(s_elem)
+        add_reset_session_key(s_elem)
+
+    def remove(self, element):
+        s_elem = str(element)
+        super().discard(s_elem)
+        remove_reset_session_key(s_elem)
+
+    def discard(self, element):
+        s_elem = str(element)
+        super().discard(s_elem)
+        remove_reset_session_key(s_elem)
+
+    def clear(self):
+        super().clear()
+        clear_reset_session_keys()
+
+
 def get_gif_turn_count(sess_key: str) -> int:
     """Retrieve number of turns since last reaction GIF was sent in this session/channel."""
     meta = get_session_metadata(sess_key)
@@ -329,8 +409,13 @@ def check_compaction_needed(
     brain_root: Path = Path("/root/.gemini/antigravity-cli/brain")
 ) -> tuple[bool, str]:
     """Evaluate whether a session should be compacted based on turns, transcript size, step count, or age."""
-    if current_turns >= 25:
-        return True, f"turn count reached {current_turns}/25"
+    rules = get_runtime_rules()
+    max_turns = int(rules.get("compaction_max_turns", 15))
+    max_steps = int(rules.get("compaction_max_steps", 1500))
+    max_mb = float(rules.get("compaction_max_mb", 2.0))
+
+    if current_turns >= max_turns:
+        return True, f"turn count reached {current_turns}/{max_turns}"
 
     if not conv_id:
         return False, ""
@@ -342,14 +427,13 @@ def check_compaction_needed(
         try:
             st = transcript_path.stat()
             size_mb = st.st_size / (1024 * 1024)
-            if size_mb >= 2.0:
-                return True, f"transcript size ({size_mb:.2f} MB) exceeds 2.0 MB ceiling"
+            if size_mb >= max_mb:
+                return True, f"transcript size ({size_mb:.2f} MB) exceeds {max_mb:.1f} MB ceiling"
 
-            if st.st_size > 250_000:
-                with open(transcript_path, "rb") as f:
-                    line_count = sum(1 for _ in f)
-                if line_count >= 200:
-                    return True, f"transcript steps ({line_count}) exceeds 200-step ceiling"
+            with open(transcript_path, "rb") as f:
+                line_count = sum(1 for _ in f)
+            if line_count >= max_steps:
+                return True, f"transcript steps ({line_count}) exceeds {max_steps}-step ceiling"
 
             if (time.time() - st.st_mtime) > 86400:
                 return True, "session age exceeds 24 hours"
@@ -516,14 +600,15 @@ class PersistentTurnQueue:
         return self.queue.empty() and len(self.pending_items) == 0
 
 
-def update_beacon(state: str = "IDLE", prompt: str = ""):
+def update_beacon(state: str = "IDLE", prompt: str = "", channel_id: int | str = None):
     """Update liveness beacon timestamp and state for watchdog monitoring."""
     try:
         data = {
             "state": state,
             "ts": time.time(),
             "time_pt": datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M:%S %p PT"),
-            "prompt": prompt[:80] if prompt else ""
+            "prompt": prompt[:80] if prompt else "",
+            "channel_id": int(channel_id) if str(channel_id).isdigit() else channel_id
         }
         tmp = BEACON_FILE.with_suffix(".tmp")
         with open(tmp, "w") as f:

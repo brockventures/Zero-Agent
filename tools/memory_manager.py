@@ -13,8 +13,9 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,6 +26,9 @@ PRIV_DIR = MEMORY_DIR / "private"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 MEMORY_PUB_INDEX = MEMORY_DIR / "MEMORY_PUBLIC.md"
 MEMORY_PRIV_INDEX = MEMORY_DIR / "MEMORY_PRIVATE.md"
+CHANNEL_HISTORY_PATH = Path("/workspace/data/channel_history.json")
+CC_DECISIONS_FILE = MEMORY_DIR / "crab_cavern" / "decisions.md"
+USER_RYAN_FILE = PRIV_DIR / "user_ryan.md"
 
 log = logging.getLogger("memory_manager")
 
@@ -211,26 +215,253 @@ def run_memory_doctor() -> tuple[bool, str]:
     report = "🩺 **Memory Doctor Audit**:\n" + "\n".join(issues)
     return False, report
 
-def run_dreaming_consolidation(dry_run: bool = False) -> tuple[bool, str]:
-    """Nightly dreaming pass: consolidates today's operational learning and promotes engineering memories."""
-    now_pt = datetime.now(PT).strftime("%Y-%m-%d %I:%M %p PT")
+IGNORED_CHANNELS = {
+    "1210466877835313155",  # seerr-notifications
+    "1330447543477338202",  # server-updates
+}
+
+PUBLIC_CHANNELS = {
+    "1534436119888793750",  # the-banana-stand
+    "1534452820995080192",  # lounge
+}
+
+SCORING_PROMPT = """You are the Memory Consolidation Evaluator for Zero (autonomous AI engineer).
+Evaluate the importance (1-10) of this conversation episode for long-term durable memory retention.
+
+IMPORTANCE RUBRIC:
+- 9-10 (Critical / Durable System Knowledge):
+  * Permanent architectural decisions, ratified protocol specs (e.g. AGORA market pricing rules, tunnel ingress).
+  * Explicit core user preference corrections / operational invariants (e.g. "Don't self-narrate", "Always Pacific Time").
+  * System outage post-mortems / root-cause debugging scars (e.g. SQLite concurrency deadlock, CLI process hang).
+- 7-8 (Substantive Architecture & Decisions):
+  * Clarifications of system harness internals (e.g. ephemeral worker vs daemon lifecycle).
+  * Major feature/tool enhancements (e.g. new classification rubric, dreaming pipeline redesign).
+  * Homelab hardware/device topology changes.
+- 5-6 (Routine Work in Progress / Minor Technical Chat):
+  * Active task coordination, standard debugging iterations, test pass/fail reports with no systemic takeaways.
+- 3-4 (Minor Updates / Informational):
+  * Brief acknowledgments, routine cron outputs, simple status checks.
+- 1-2 (Noise / Casual Banter):
+  * Greetings, social jokes, reaction GIFs, "sounds good", "lgtm".
+
+Conversation Excerpt ({channel_name} | {tier}):
+{transcript}
+
+Task:
+1. Score from 1 to 10.
+2. If score >= 7, specify CATEGORY, TITLE (3-6 words), and SUMMARY (1-3 clear sentences of the durable takeaway).
+   Categories:
+   - PUBLIC_DECISION (ratified multi-agent, protocol, or open engineering decisions)
+   - PRIVATE_PREFERENCE (Ryan's explicit feedback, directives, habits, communication rules)
+   - PRIVATE_SCAR (homelab debugging post-mortem, tricky root causes, system fixes)
+3. If score < 7, specify CATEGORY: DISCARD and SUMMARY: <short reason>.
+
+Format strictly as:
+SCORE: <number>
+CATEGORY: <DISCARD | PUBLIC_DECISION | PRIVATE_PREFERENCE | PRIVATE_SCAR>
+TITLE: <title>
+SUMMARY: <distilled memory takeaway or discard reason>
+"""
+
+def _parse_msg_ts(m: dict) -> datetime | None:
+    ts_str = m.get("timestamp")
+    if not ts_str:
+        return None
+    try:
+        if "UTC" in ts_str:
+            return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _segment_channel_messages(messages: list[dict], max_gap_seconds: int = 300) -> list[list[dict]]:
+    episodes = []
+    curr = []
+    last_ts = None
+    sorted_msgs = sorted([m for m in messages if _parse_msg_ts(m)], key=lambda x: _parse_msg_ts(x))
+    for m in sorted_msgs:
+        ts = _parse_msg_ts(m)
+        if last_ts and (ts - last_ts).total_seconds() > max_gap_seconds:
+            if curr:
+                episodes.append(curr)
+                curr = []
+        curr.append(m)
+        last_ts = ts
+    if curr:
+        episodes.append(curr)
+    return episodes
+
+def _evaluate_episode_llm(ep: list[dict], ch_name: str, is_public: bool) -> dict:
+    transcript_lines = []
+    for m in ep[:20]:
+        author = m.get("author", "Unknown")
+        content = m.get("content", "").strip()
+        content_clean = re.sub(r"```(?:handoff)?\n.*?\n```", "[HANDOFF_ENVELOPE]", content, flags=re.DOTALL)
+        if content_clean:
+            transcript_lines.append(f"{author}: {content_clean[:350]}")
+    
+    transcript_text = "\n".join(transcript_lines)
+    tier = "PUBLIC" if is_public else "PRIVATE"
+    prompt = SCORING_PROMPT.format(channel_name=ch_name, tier=tier, transcript=transcript_text)
+    
+    try:
+        res = subprocess.run([
+            "agy",
+            "--model=gemini-3.8-flash-low",
+            "--disable-slash-commands",
+            f"-p={prompt}"
+        ], capture_output=True, text=True, timeout=35)
+        out = res.stdout.strip()
+    except Exception as e:
+        return {"score": 0.0, "category": "ERROR", "title": "", "summary": str(e)}
+
+    score = 0.0
+    category = "DISCARD"
+    title = ""
+    summary = ""
+
+    m_score = re.search(r"SCORE:\s*([0-9]+(?:\.[0-9]+)?)", out)
+    if m_score:
+        score = float(m_score.group(1))
+
+    m_cat = re.search(r"CATEGORY:\s*([A-Z_]+)", out)
+    if m_cat:
+        category = m_cat.group(1).strip()
+
+    m_title = re.search(r"TITLE:\s*([^\n]+)", out)
+    if m_title:
+        title = m_title.group(1).strip()
+
+    m_sum = re.search(r"SUMMARY:\s*([\s\S]+)$", out)
+    if m_sum:
+        summary = m_sum.group(1).strip()
+
+    return {"score": score, "category": category, "title": title, "summary": summary}
+
+def _to_slug(text: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", text.strip().lower()).strip("_")
+    return slug[:40]
+
+def run_dreaming_consolidation(dry_run: bool = False, hours_back: int = 24) -> tuple[bool, str]:
+    """3-Stage Dreaming Pass:
+    Stage 1: Public stream (Crab Cavern) -> extracts decisions/specs -> memory/public/
+    Stage 2: Private stream (Home turf) -> extracts preferences/scars -> memory/private/
+    Stage 3: Cross-tier promotion & FTS5 index synchronization.
+    """
+    now_dt = datetime.now(PT)
+    now_pt = now_dt.strftime("%Y-%m-%d %I:%M %p PT")
     consolidated_items = []
     
+    # 1. Ingest Channel History
+    if CHANNEL_HISTORY_PATH.exists():
+        try:
+            with open(CHANNEL_HISTORY_PATH, "r", encoding="utf-8") as f:
+                history = json.load(f)
+
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+            episodes_to_eval = []
+
+            for cid, msgs in history.items():
+                if cid in IGNORED_CHANNELS:
+                    continue
+                
+                recent_msgs = [m for m in msgs if _parse_msg_ts(m) and _parse_msg_ts(m) >= cutoff]
+                if not recent_msgs:
+                    continue
+
+                ch_name = recent_msgs[0].get("channel_name", cid)
+                is_thread = ch_name.startswith("🧵")
+                is_public = (cid in PUBLIC_CHANNELS) or ("banana" in ch_name.lower()) or ("lounge" in ch_name.lower())
+
+                if is_thread and len(recent_msgs) <= 25:
+                    total_len = sum(len(m.get("content", "")) for m in recent_msgs)
+                    if total_len > 150:
+                        episodes_to_eval.append((recent_msgs, ch_name, is_public))
+                else:
+                    eps = _segment_channel_messages(recent_msgs, max_gap_seconds=300)
+                    for ep in eps:
+                        total_len = sum(len(m.get("content", "")) for m in ep)
+                        if len(ep) >= 2 and total_len > 150:
+                            episodes_to_eval.append((ep, ch_name, is_public))
+
+            log.info(f"Dreaming evaluating {len(episodes_to_eval)} substantive episodes over past {hours_back}h")
+
+            for ep, ch_name, is_public in episodes_to_eval:
+                res = _evaluate_episode_llm(ep, ch_name, is_public)
+                score = res.get("score", 0.0)
+                category = res.get("category", "DISCARD")
+                title = res.get("title", "")
+                summary = res.get("summary", "")
+
+                if score < 7.0 or category == "DISCARD" or not summary:
+                    continue
+
+                slug = _to_slug(title) or f"item_{int(datetime.now().timestamp())}"
+                t0_str = _parse_msg_ts(ep[0]).astimezone(PT).strftime("%Y-%m-%d %I:%M %p PT")
+
+                # Stage 1: Public Decision
+                if category == "PUBLIC_DECISION" and is_public:
+                    if CC_DECISIONS_FILE.exists():
+                        dec_content = CC_DECISIONS_FILE.read_text(encoding="utf-8", errors="replace")
+                        if slug not in dec_content and title.lower() not in dec_content.lower():
+                            block = f"""
+---
+
+### Resolution: `{slug}` ({t0_str})
+* **Author**: Zero (consolidated via dreaming)
+* **Kind**: `decision` / `architecture`
+* **Title**: {title}
+* **Summary**: 🍌 {summary}
+"""
+                            if not dry_run:
+                                CC_DECISIONS_FILE.write_text(dec_content.rstrip() + block + "\n", encoding="utf-8")
+                            consolidated_items.append(f"Public Decision logged: `{title}` (Crab Cavern)")
+                    else:
+                        if not dry_run:
+                            memory_write(f"arch_{slug}.md", title, summary[:100], "architecture", summary, tier="public")
+                        consolidated_items.append(f"Public Architecture created: `arch_{slug}.md`")
+
+                # Stage 2: Private Preference or Scar
+                elif category == "PRIVATE_PREFERENCE":
+                    if USER_RYAN_FILE.exists():
+                        u_content = USER_RYAN_FILE.read_text(encoding="utf-8", errors="replace")
+                        if title.lower() not in u_content.lower() and slug not in u_content.lower():
+                            rule_bullet = f"\n- **{title} ({t0_str}):** {summary}"
+                            if not dry_run:
+                                USER_RYAN_FILE.write_text(u_content.rstrip() + rule_bullet + "\n", encoding="utf-8")
+                            consolidated_items.append(f"Ryan Preference updated: `{title}`")
+                    else:
+                        if not dry_run:
+                            memory_write(f"user_pref_{slug}.md", title, summary[:100], "user", summary, tier="private")
+                        consolidated_items.append(f"Private Preference created: `user_pref_{slug}.md`")
+
+                elif category == "PRIVATE_SCAR":
+                    scar_name = f"scar_{slug}.md"
+                    scar_path = PRIV_DIR / scar_name
+                    if not scar_path.exists():
+                        if not dry_run:
+                            memory_write(scar_name, title, summary[:100], "scar", summary, tier="private")
+                        consolidated_items.append(f"Private Debugging Scar logged: `{scar_name}`")
+
+        except Exception as e:
+            log.warning(f"Error during episode dreaming evaluation: {e}")
+
+    # File Modifications Check
     for target in [Path("/workspace/agents.md"), Path("/workspace/memory/private/user_ryan.md")]:
-        if target.exists() and (datetime.now(PT) - datetime.fromtimestamp(target.stat().st_mtime, tz=PT)).total_seconds() < 86400:
+        if target.exists() and (datetime.now(PT) - datetime.fromtimestamp(target.stat().st_mtime, tz=PT)).total_seconds() < (hours_back * 3600):
             consolidated_items.append(f"Rules/Preferences updated in `{target.name}`")
 
     tools_dir = Path("/workspace/tools")
     if tools_dir.exists():
         for tf in tools_dir.glob("*.py"):
-            if (datetime.now(PT) - datetime.fromtimestamp(tf.stat().st_mtime, tz=PT)).total_seconds() < 86400:
+            if (datetime.now(PT) - datetime.fromtimestamp(tf.stat().st_mtime, tz=PT)).total_seconds() < (hours_back * 3600):
                 consolidated_items.append(f"Tool enhancements in `{tf.name}`")
 
-    # Automated Promotion Pass: Scan recently modified private memory files for engineering candidates
+    # Stage 3: Automated Promotion Pass
     try:
         import promote_memory
         for cand in promote_memory.find_candidates():
-            if (datetime.now(PT) - datetime.fromtimestamp(cand.stat().st_mtime, tz=PT)).total_seconds() < 86400:
+            if (datetime.now(PT) - datetime.fromtimestamp(cand.stat().st_mtime, tz=PT)).total_seconds() < (hours_back * 3600):
                 dest_file = PUB_DIR / cand.name
                 if not dest_file.exists() or cand.stat().st_mtime > dest_file.stat().st_mtime:
                     ok, msg = promote_memory.promote_file(cand, dry_run=dry_run)
@@ -239,14 +470,17 @@ def run_dreaming_consolidation(dry_run: bool = False) -> tuple[bool, str]:
     except Exception as e:
         log.warning(f"Dreaming promotion scan error: {e}")
 
+    if not dry_run:
+        rebuild_indexes()
+
     if not consolidated_items:
-        return False, "Dream pass complete: no new long-term memories required consolidation."
+        return False, f"Dream pass complete ({hours_back}h window): no new long-term memories required consolidation."
 
     report = (
-        f"💭 **Nightly Memory Consolidation (Dreaming)** — {now_pt}\n"
-        f"Consolidated the day's lessons into durable memory:\n"
+        f"💭 **Memory Consolidation (Dreaming)** — {now_pt} (Window: {hours_back}h)\n"
+        f"Consolidated learnings into durable memory:\n"
         + "\n".join(f"- {it}" for it in sorted(set(consolidated_items)))
-        + "\nContext ready for session rollover."
+        + "\nMemory indexes rebuilt and synced with SQLite FTS5."
     )
     return True, report
 
@@ -256,7 +490,12 @@ if __name__ == "__main__":
         ok, msg = run_memory_doctor()
         print(msg)
     elif action == "dream":
-        ok, msg = run_dreaming_consolidation()
+        hours = int(sys.argv[2]) if len(sys.argv) > 2 else 24
+        ok, msg = run_dreaming_consolidation(hours_back=hours)
+        print(msg)
+    elif action == "catchup":
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+        ok, msg = run_dreaming_consolidation(hours_back=days * 24)
         print(msg)
     elif action == "rebuild":
         rebuild_indexes()

@@ -1248,12 +1248,82 @@ def run_hardcode_regex_audit() -> tuple[bool, str]:
     except Exception as e:
         return False, f"⚠️ Hardcoded rule & regex audit failed: {e}"
 
+def run_arr_queue_watchdog(auto_fix: bool = True, force: bool = False) -> tuple[bool, str]:
+    """Audit Radarr & Sonarr queues for import errors and permission snags."""
+    try:
+        from tools.arr_queue_watchdog import run_watchdog
+        has_activity, summary, _ = run_watchdog(auto_fix=auto_fix, force_dispatch=force)
+        return True, summary if has_activity else "(nominal - 0 import failures)"
+    except Exception as e:
+        return False, f"⚠️ Arr queue watchdog failed: {e}"
+
+def run_ha_reauth_watchdog(force: bool = False) -> tuple[bool, str]:
+    """Audit Home Assistant integrations for re-auth and setup failures."""
+    try:
+        from tools.ha_reauth_watchdog import check_ha_integrations
+        has_activity, summary, _ = check_ha_integrations(force=force)
+        return True, summary if has_activity else "(nominal - 0 HA integration failures)"
+    except Exception as e:
+        return False, f"⚠️ Home Assistant re-auth watchdog failed: {e}"
+
+def run_prowlarr_watchdog(force: bool = False) -> tuple[bool, str]:
+    """Audit Prowlarr indexers for disabled state, backoffs, and health errors."""
+    try:
+        from tools.prowlarr_watchdog import check_prowlarr
+        has_activity, summary, _ = check_prowlarr(force=force)
+        return True, summary if has_activity else "(nominal - 0 Prowlarr failures)"
+    except Exception as e:
+        return False, f"⚠️ Prowlarr watchdog failed: {e}"
+
+def run_sabnzbd_watchdog(force: bool = False) -> tuple[bool, str]:
+    """Audit SABnzbd queue, disk space, and failed unpacks."""
+    try:
+        from tools.sabnzbd_watchdog import check_sabnzbd
+        has_activity, summary, _ = check_sabnzbd(force=force)
+        return True, summary if has_activity else "(nominal - 0 SABnzbd failures)"
+    except Exception as e:
+        return False, f"⚠️ SABnzbd watchdog failed: {e}"
+
+def run_kometa_audit(force: bool = False) -> tuple[bool, str]:
+    """Audit Kometa post-run logs for critical errors and missing TMDb IDs."""
+    try:
+        from tools.kometa_run_auditor import audit_kometa_log
+        has_issues, summary, _ = audit_kometa_log(force=force)
+        return True, summary if has_issues else "(nominal - Kometa run clean)"
+    except Exception as e:
+        return False, f"⚠️ Kometa log audit failed: {e}"
+
 # --------------------------------------------------------------------------
 # CLI Dispatcher
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "heartbeat"
-    if action == "heartbeat":
+    if action in ("arr_queue", "arr_watchdog", "queue"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        ok, rep, _ = run_sidecar_job("arr_queue_watchdog", "Arr Queue Watchdog", run_arr_queue_watchdog, force=force)
+        if rep and rep != "(nominal - 0 import failures)":
+            print(rep)
+    elif action in ("ha_reauth", "reauth"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        ok, rep, _ = run_sidecar_job("ha_reauth_watchdog", "HA Re-Auth Watchdog", run_ha_reauth_watchdog, force=force)
+        if rep and rep != "(nominal - 0 HA integration failures)":
+            print(rep)
+    elif action in ("prowlarr", "indexers"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        ok, rep, _ = run_sidecar_job("prowlarr_watchdog", "Prowlarr Indexer Watchdog", run_prowlarr_watchdog, force=force)
+        if rep and rep != "(nominal - 0 Prowlarr failures)":
+            print(rep)
+    elif action in ("sabnzbd", "sab"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        ok, rep, _ = run_sidecar_job("sabnzbd_watchdog", "SABnzbd Watchdog", run_sabnzbd_watchdog, force=force)
+        if rep and rep != "(nominal - 0 SABnzbd failures)":
+            print(rep)
+    elif action in ("kometa_audit", "kometa"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        ok, rep, _ = run_sidecar_job("kometa_audit", "Kometa Post-Run Audit", run_kometa_audit, force=force)
+        if rep and rep != "(nominal - Kometa run clean)":
+            print(rep)
+    elif action == "heartbeat":
         ok, rep, _ = run_sidecar_job("heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
         print(rep)
     elif action == "triage":
@@ -1330,6 +1400,14 @@ if __name__ == "__main__":
         print(rep)
     elif action in ("hardcode_audit", "regex_audit", "code_audit"):
         ok, rep, _ = run_sidecar_job("monthly_hardcode_regex_audit", "Monthly Hardcoded Rule & Regex Audit", run_hardcode_regex_audit)
+        print(rep)
+    elif action in ("agora_steering", "steering"):
+        from tools.agora_steering import dispatch_agora_steering
+        ok, rep, _ = run_sidecar_job("agora_steering", "AGORA Daily Steering Briefing", dispatch_agora_steering)
+        print(rep)
+    elif action in ("rollover", "session_rollover"):
+        from tools.session_rollover import run_daily_session_rollover
+        ok, rep, _ = run_sidecar_job("session_rollover", "Daily Multi-Channel Session Rollover", run_daily_session_rollover)
         print(rep)
     elif action == "status":
         print(format_sidecar_status_summary())

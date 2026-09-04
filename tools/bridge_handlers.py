@@ -174,7 +174,13 @@ async def execute_bridge_reload(bot: discord.Client = None, channel=None, initia
         except Exception:
             pass
 
-    # Terminate active procs cleanly so they don't linger
+    # Terminate persistent daemons and active procs cleanly so they don't linger
+    try:
+        from tools.bridge_daemons import daemon_manager
+        await daemon_manager.shutdown_all()
+    except Exception as dse:
+        print(f"[Bridge] Warning shutting down persistent daemons: {dse}")
+
     for cid, proc in list(channel_active_procs.items()):
         if proc and proc.returncode is None:
             try:
@@ -298,6 +304,16 @@ async def run_thread_turn_worker(item, bot: discord.Client, presence_fn=None, bu
     reply_target = item["reply_target"]
     attachments = item["attachments"]
     channel_id = item.get("channel_id", TARGET_CHANNEL_ID)
+    rules = get_runtime_rules()
+    ticker_enabled = rules.get("live_status_ticker_enabled", False)
+    if ticker_enabled and not status_msg and reply_target:
+        try:
+            if hasattr(reply_target, "reply"):
+                status_msg = await reply_target.reply("⏳ *Processing task...*")
+            elif hasattr(reply_target, "send"):
+                status_msg = await reply_target.send("⏳ *Processing task...*")
+        except Exception:
+            pass
     try:
         if reply_target and hasattr(reply_target, "typing"):
             async with reply_target.typing():
@@ -366,6 +382,22 @@ async def run_channel_turn_worker(
             reply_target = item.get("reply_target")
             attachments = item.get("attachments", [])
 
+            turn_mode = item.get("mode", "home" if is_home_root else "external")
+            author_name = item.get("author_name", "")
+
+            # If live_status_ticker_enabled is False, do not spawn synthetic placeholder messages in home channels.
+            # Secondary home channels remain silent with native typing indicators, exactly like #zero-chat.
+            rules = get_runtime_rules()
+            ticker_enabled = rules.get("live_status_ticker_enabled", False)
+            if ticker_enabled and not status_msg and reply_target and not is_home_root and turn_mode == "home":
+                try:
+                    if hasattr(reply_target, "reply"):
+                        status_msg = await reply_target.reply("⏳ *Processing task...*")
+                    elif hasattr(reply_target, "send"):
+                        status_msg = await reply_target.send("⏳ *Processing task...*")
+                except Exception as se:
+                    print(f"[Channel Worker {channel_id}] Notice creating status placeholder: {se}")
+
             if is_home_root:
                 active_turn_task = asyncio.current_task()
                 active_status_msg = status_msg
@@ -378,7 +410,7 @@ async def run_channel_turn_worker(
                         async with reply_target.channel.typing():
                             await execute_agy_turn(
                                 prompt, status_msg, reply_target, attachments,
-                                mode="home", channel_id=channel_id,
+                                mode=turn_mode, channel_id=channel_id, author_name=author_name,
                                 apply_presence_fn=presence_fn,
                                 button_choice_fn=button_choice_fn,
                                 quick_choice_view_cls=quick_choice_view_cls
@@ -387,7 +419,7 @@ async def run_channel_turn_worker(
                         async with reply_target.typing():
                             await execute_agy_turn(
                                 prompt, status_msg, reply_target, attachments,
-                                mode="home", channel_id=channel_id,
+                                mode=turn_mode, channel_id=channel_id, author_name=author_name,
                                 apply_presence_fn=presence_fn,
                                 button_choice_fn=button_choice_fn,
                                 quick_choice_view_cls=quick_choice_view_cls
@@ -395,15 +427,16 @@ async def run_channel_turn_worker(
                     else:
                         await execute_agy_turn(
                             prompt, status_msg, reply_target, attachments,
-                            mode="home", channel_id=channel_id,
+                            mode=turn_mode, channel_id=channel_id, author_name=author_name,
                             apply_presence_fn=presence_fn,
                             button_choice_fn=button_choice_fn,
                             quick_choice_view_cls=quick_choice_view_cls
                         )
 
-                # Priority Fast-Lane: #zero-chat runs immediately without semaphore gating.
-                # Background channels acquire the concurrency semaphore.
-                if is_home_root:
+                # Priority Fast-Lane: Dedicated persistent channels (#zero-chat, #the-banana-stand, #lounge)
+                # run immediately without semaphore gating. Secondary background channels acquire semaphore.
+                from tools.bridge_daemons import is_dedicated_channel
+                if is_home_root or is_dedicated_channel(channel_id):
                     await _exec()
                 else:
                     async with sem:
@@ -478,55 +511,23 @@ async def queue_worker(home_turn_queue, bot: discord.Client, presence_fn=None, b
 
 
 async def external_queue_worker(ext_turn_queue, bot: discord.Client, presence_fn=None, button_choice_fn=None, quick_choice_view_cls=QuickChoiceView, reload_fn=None):
-    """Independent worker processing queued turns for Crab Cavern & external channels."""
+    """External dispatcher routing turns to parallel per-channel workers."""
     while True:
         item = await ext_turn_queue.get()
-        prompt = item["prompt"]
-        status_msg = item["status_msg"]
-        reply_target = item["reply_target"]
-        attachments = item["attachments"]
         channel_id = item.get("channel_id", 0)
-        author_name = item.get("author_name", "")
+        cid = int(channel_id) if str(channel_id).isdigit() else channel_id
+        q = get_channel_queue(cid)
+        await q.put(item)
+        ext_turn_queue.task_done(item)
 
-        try:
-            if reply_target and hasattr(reply_target, "channel"):
-                async with reply_target.channel.typing():
-                    await execute_agy_turn(
-                        prompt, status_msg, reply_target, attachments,
-                        mode="external", channel_id=channel_id, author_name=author_name,
-                        apply_presence_fn=presence_fn,
-                        button_choice_fn=button_choice_fn,
-                        quick_choice_view_cls=quick_choice_view_cls
-                    )
-            else:
-                await execute_agy_turn(
-                    prompt, status_msg, reply_target, attachments,
-                    mode="external", channel_id=channel_id, author_name=author_name,
-                    apply_presence_fn=presence_fn,
-                    button_choice_fn=button_choice_fn,
-                    quick_choice_view_cls=quick_choice_view_cls
+        existing_task = channel_active_tasks.get(cid)
+        if existing_task is None or existing_task.done():
+            t = asyncio.create_task(
+                run_channel_turn_worker(
+                    cid, q, bot, presence_fn, button_choice_fn, quick_choice_view_cls, reload_fn
                 )
-        except Exception as e:
-            print(f"[External Queue Worker] Error in turn execution: {e}")
-            try:
-                await reply_target.reply(f"⚠️ **Error:** {e}")
-            except Exception:
-                pass
-        finally:
-            ext_turn_queue.task_done(item)
-
-        # Immediate post-turn check for reload flag (external)
-        reload_flag = DATA_DIR / "reload_bridge.flag"
-        if reload_flag.exists():
-            try:
-                reload_flag.unlink()
-            except Exception:
-                pass
-            print("[External Queue Worker] Post-turn reload flag detected. Executing in-place reload...")
-            if reload_fn:
-                await reload_fn(None, initiator="agent", force=True, reason="Post-turn in-place reload flag (external)")
-            else:
-                await execute_bridge_reload(bot, None, initiator="agent", force=True, reason="Post-turn in-place reload flag (external)")
+            )
+            channel_active_tasks[cid] = t
 
 
 async def handle_on_ready(
@@ -572,19 +573,35 @@ async def handle_on_ready(
     except Exception as hse:
         print(f"[Bridge] Warning initializing health server: {hse}")
 
+    # Ensure Dedicated Persistent Channel Daemons are warmed up (#zero-chat, #the-banana-stand, #lounge)
+    try:
+        from tools.bridge_daemons import warmup_persistent_daemons
+        print("[Antigravity] Warming up dedicated persistent daemons...")
+        await warmup_persistent_daemons()
+        print("[Antigravity] Dedicated persistent daemons warmed up.")
+    except Exception as dme:
+        print(f"[Bridge] Warning initializing persistent daemons: {dme}")
+
     # Clean up any zombie in-flight turn from an interrupted restart
+    interrupted_prompt = None
+    interrupted_attempts = 1
     if IN_FLIGHT_FILE.exists():
         try:
             with open(IN_FLIGHT_FILE) as f:
                 info = json.load(f)
             ch_id = info.get("channel_id") or TARGET_CHANNEL_ID
             msg_id = info.get("status_msg_id")
+            interrupted_prompt = info.get("prompt")
+            interrupted_attempts = info.get("attempts", 1)
             ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
             if ch and msg_id:
                 try:
                     msg = await ch.fetch_message(msg_id)
                     if msg:
-                        await msg.edit(content="⚠️ *Turn was interrupted by a system restart. Recovered and ready.*")
+                        if interrupted_attempts >= 2:
+                            await msg.edit(content="⚠️ *Turn timed out or was interrupted repeatedly and was cleared from queue to prevent an execution loop. Ready.*")
+                        else:
+                            await msg.edit(content="⚠️ *Turn was interrupted by a system restart. Recovered and ready.*")
                 except Exception:
                     pass
             IN_FLIGHT_FILE.unlink()
@@ -623,16 +640,6 @@ async def handle_on_ready(
             except Exception:
                 pass
 
-        interrupted_prompt = None
-        if IN_FLIGHT_FILE.exists():
-            try:
-                with open(IN_FLIGHT_FILE) as f:
-                    info = json.load(f)
-                    interrupted_prompt = info.get("prompt")
-                IN_FLIGHT_FILE.unlink()
-            except Exception:
-                pass
-
         host_name = os.environ.get("NAS_HOST_2_NAME", "Host2")
         startup_prompt = (
             "[SYSTEM REBOOT & STARTUP EVENT]\n"
@@ -640,7 +647,10 @@ async def handle_on_ready(
             f"• Restart Reason: {restart_reason} {'(Planned Feature Deploy/Update)' if is_intentional else '(System/Container Boot)'}\n"
         )
         if interrupted_prompt:
-            startup_prompt += f"• Interrupted Task Prior to Reboot: \"{interrupted_prompt[:150]}\"\n"
+            if interrupted_attempts >= 2:
+                startup_prompt += f"• Interrupted Task Prior to Reboot: \"{interrupted_prompt[:150]}\" (cleared after {interrupted_attempts} attempts to prevent hang loop)\n"
+            else:
+                startup_prompt += f"• Interrupted Task Prior to Reboot: \"{interrupted_prompt[:150]}\"\n"
 
         startup_prompt += (
             "\nDeliver a sharp, confident, and proactive restart briefing to Ryan in #zero-chat:\n"
@@ -666,21 +676,33 @@ async def handle_on_ready(
             except Exception as e:
                 print(f"[Bridge] Failed to queue startup briefing: {e}")
 
-    # Warm channel history for active sessions so Zero starts with recent context
+    # Warm channel history for active sessions and all home domain channels so Zero starts with recent context
+    channels_to_warm = set()
     if SESSIONS_FILE.exists():
         try:
             with open(SESSIONS_FILE) as f:
                 s_map = json.load(f)
             for ch_key in s_map:
-                if ch_key != "home" and ch_key.isdigit():
-                    try:
-                        ext_ch = bot.get_channel(int(ch_key)) or await bot.fetch_channel(int(ch_key))
-                        if ext_ch:
-                            asyncio.create_task(warm_channel_history(ext_ch, limit=25))
-                    except Exception as e:
-                        print(f"[Bridge] Could not fetch channel {ch_key} for history warming: {e}")
+                if ch_key != "home" and str(ch_key).isdigit():
+                    channels_to_warm.add(int(ch_key))
         except Exception as e:
-            print(f"[Bridge] Error warming channel history on startup: {e}")
+            print(f"[Bridge] Error reading sessions for history warming: {e}")
+
+    # Ensure all configured home channels and root #zero-chat are warmed
+    rules = get_runtime_rules()
+    for hc_id in rules.get("home_channel_ids", []):
+        if str(hc_id).isdigit():
+            channels_to_warm.add(int(hc_id))
+    channels_to_warm.add(TARGET_CHANNEL_ID)
+
+    for ch_id in channels_to_warm:
+        try:
+            target_ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+            if target_ch:
+                asyncio.create_task(warm_channel_history(target_ch, limit=25))
+        except Exception as e:
+            print(f"[Bridge] Could not fetch channel {ch_id} for history warming: {e}")
+
 
 
 async def handle_message(
@@ -753,7 +775,10 @@ async def handle_message(
                 import tools.topic_tracker
                 importlib.reload(tools.topic_tracker)
                 tools.topic_tracker.check_and_resolve_topic(envelope, content, author_name, msg.id, msg.channel.id)
-                return
+                floor_state = str(envelope.get("floor") or "").lower()
+                is_floor_open = floor_state in ("open", "free", "any")
+                if not handoff_for_zero and not is_floor_open:
+                    return
         except Exception as te:
             print(f"[Bridge] Error checking topic resolution: {te}")
 
@@ -1094,6 +1119,18 @@ async def handle_message(
         "/projects": ("⏳ *Fetching project and task tracker...*", "Show active projects and tasks using /workspace/tools/task_manager.py summary."),
         "!schedule": ("⏳ *Fetching sidecar schedule...*", "Show the current sidecar schedule using /workspace/tools/scheduler_tool.py summary."),
         "/schedule": ("⏳ *Fetching sidecar schedule...*", "Show the current sidecar schedule using /workspace/tools/scheduler_tool.py summary."),
+        "!arr_queue": ("⏳ *Checking Radarr & Sonarr queues...*", "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly."),
+        "/arr_queue": ("⏳ *Checking Radarr & Sonarr queues...*", "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly."),
+        "!queue": ("⏳ *Checking Radarr & Sonarr queues...*", "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly."),
+        "/queue": ("⏳ *Checking Radarr & Sonarr queues...*", "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly."),
+        "!reauth": ("⏳ *Auditing Home Assistant integration auth & setup...*", "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth --force. Report status."),
+        "/reauth": ("⏳ *Auditing Home Assistant integration auth & setup...*", "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth --force. Report status."),
+        "!prowlarr": ("⏳ *Checking Prowlarr indexer health & backoffs...*", "Run the Prowlarr indexer health check using /workspace/tools/sidecars.py prowlarr --force. Report status."),
+        "/prowlarr": ("⏳ *Checking Prowlarr indexer health & backoffs...*", "Run the Prowlarr indexer health check using /workspace/tools/sidecars.py prowlarr --force. Report status."),
+        "!sabnzbd": ("⏳ *Checking SABnzbd queue & recent history...*", "Run the SABnzbd downloader check using /workspace/tools/sidecars.py sabnzbd --force. Report status."),
+        "/sabnzbd": ("⏳ *Checking SABnzbd queue & recent history...*", "Run the SABnzbd downloader check using /workspace/tools/sidecars.py sabnzbd --force. Report status."),
+        "!kometa_audit": ("⏳ *Auditing recent Kometa run logs...*", "Run the Kometa post-run log audit using /workspace/tools/sidecars.py kometa_audit --force. Report status."),
+        "/kometa_audit": ("⏳ *Auditing recent Kometa run logs...*", "Run the Kometa post-run log audit using /workspace/tools/sidecars.py kometa_audit --force. Report status."),
         "!sidecars": ("⏳ *Fetching sidecar execution health...*", "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status."),
         "/sidecars": ("⏳ *Fetching sidecar execution health...*", "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status."),
         "!mcp": ("⏳ *Checking MCP daemon status...*", "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status."),
@@ -1110,10 +1147,32 @@ async def handle_message(
         "/standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
         "!market_standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
         "/market_standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
+        "!steering": ("⏳ *Running AGORA Steering briefing dispatcher...*", "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch."),
+        "/steering": ("⏳ *Running AGORA Steering briefing dispatcher...*", "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch."),
+        "!agora_steering": ("⏳ *Running AGORA Steering briefing dispatcher...*", "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch."),
+        "/agora_steering": ("⏳ *Running AGORA Steering briefing dispatcher...*", "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch."),
         "!code_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics."),
         "/code_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics."),
         "!hardcode_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics."),
-        "/hardcode_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics.")
+        "/hardcode_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics."),
+        "!weekly_social_last_seen_review": ("⏳ *Reviewing social events and last seen updates...*", "Review the past week's social events, calendar, and text messages using /workspace/tools/social_last_seen_review.py."),
+        "/weekly_social_last_seen_review": ("⏳ *Reviewing social events and last seen updates...*", "Review the past week's social events, calendar, and text messages using /workspace/tools/social_last_seen_review.py."),
+        "!social_review": ("⏳ *Reviewing social events and last seen updates...*", "Review the past week's social events, calendar, and text messages using /workspace/tools/social_last_seen_review.py."),
+        "/social_review": ("⏳ *Reviewing social events and last seen updates...*", "Review the past week's social events, calendar, and text messages using /workspace/tools/social_last_seen_review.py."),
+        "!monthly_core_friends_reconnect": ("⏳ *Checking core friends reconnect list...*", "Check for local Core friends we have not seen in at least 8 weeks using /workspace/tools/core_friends_reminder.py."),
+        "/monthly_core_friends_reconnect": ("⏳ *Checking core friends reconnect list...*", "Check for local Core friends we have not seen in at least 8 weeks using /workspace/tools/core_friends_reminder.py."),
+        "!core_friends": ("⏳ *Checking core friends reconnect list...*", "Check for local Core friends we have not seen in at least 8 weeks using /workspace/tools/core_friends_reminder.py."),
+        "/core_friends": ("⏳ *Checking core friends reconnect list...*", "Check for local Core friends we have not seen in at least 8 weeks using /workspace/tools/core_friends_reminder.py."),
+        "!antigravity_check": ("⏳ *Checking for Antigravity updates...*", "Check for Antigravity CLI updates using /workspace/tools/update_antigravity.py."),
+        "/antigravity_check": ("⏳ *Checking for Antigravity updates...*", "Check for Antigravity CLI updates using /workspace/tools/update_antigravity.py."),
+        "!ha_battery_check": ("⏳ *Running Home Assistant IoT battery check...*", "Run the Home Assistant IoT battery watchdog check using /workspace/tools/ha_battery_check.py."),
+        "/ha_battery_check": ("⏳ *Running Home Assistant IoT battery check...*", "Run the Home Assistant IoT battery watchdog check using /workspace/tools/ha_battery_check.py."),
+        "!nas_storage_check": ("⏳ *Checking Synology NAS storage and array health...*", "Run the Synology storage & array health check using /workspace/tools/nas_storage_check.py."),
+        "/nas_storage_check": ("⏳ *Checking Synology NAS storage and array health...*", "Run the Synology storage & array health check using /workspace/tools/nas_storage_check.py."),
+        "!ha_update_check": ("⏳ *Checking for Home Assistant updates...*", "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py."),
+        "/ha_update_check": ("⏳ *Checking for Home Assistant updates...*", "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py."),
+        "!dockhand_update": ("⏳ *Checking Dockhand container updates...*", "Run the Dockhand container image check using /workspace/tools/dockhand_update.py."),
+        "/dockhand_update": ("⏳ *Checking Dockhand container updates...*", "Run the Dockhand container image check using /workspace/tools/dockhand_update.py.")
     }
 
     cmd_key = content.lower().split()[0] if content else ""

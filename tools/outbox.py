@@ -88,20 +88,26 @@ def dispatch_proposal_notice(
     task_id: int | None = None
 ) -> dict:
     """
-    Format and queue an informational proposal/consensus notice to #zero-chat.
-    Ensures post-consensus decisions from Crab Cavern are visible to Ryan immediately.
+    Format and queue a synthesized proposal/consensus executive notice to #zero-chat.
+    Ensures post-consensus decisions from Crab Cavern are readable and context-rich.
     """
     is_shipped = action_type.lower() in ("shipped", "deployed", "completed", "live")
-    header = "📦 **Crab Cavern Deliverable Shipped**" if is_shipped else "📋 **Crab Cavern Engineering Commitment**"
-    task_line = f"\n• **Durable Task:** Task #{task_id}" if task_id else ""
-    msg = (
-        f"{header}\n"
-        f"• **Subject:** `{subject}`\n"
-        f"• **Collaborators:** {agreed_with}\n"
-        f"• **Status:** {action_type}{task_line}\n"
-        f"• **Summary:** {details}\n\n"
-        f"_Flagged for visibility. Let me know in `#zero-chat` if you want to steer or adjust._"
-    )
+    clean_title = subject.replace("-", " ").replace("_", " ").title()
+    header = f"📦 **Crab Cavern: {clean_title} Shipped**" if is_shipped else f"📋 **Crab Cavern Decision: {clean_title}**"
+    
+    parts = [header, details.strip()]
+    metadata_bits = []
+    if task_id:
+        metadata_bits.append(f"Task #{task_id}")
+    if agreed_with:
+        metadata_bits.append(f"Aligned with {agreed_with}")
+    if action_type and action_type.lower() not in ("consensus_reached", "shipped", "approved"):
+        metadata_bits.append(f"Status: {action_type}")
+        
+    if metadata_bits:
+        parts.append(f"*(Tracking: {', '.join(metadata_bits)})*")
+        
+    msg = "\n\n".join(parts)
     return queue_outbox_message("zero-chat", msg, source_turn="crab-cavern-consensus")
 
 def get_pending_messages() -> list[dict]:

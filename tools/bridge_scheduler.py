@@ -19,6 +19,7 @@ from tools.bridge_state import (
     BEACON_FILE,
     BOT_STATUS_FILE,
     TARGET_CHANNEL_ID,
+    HOMELAB_CHANNEL_ID,
     PT_TZ,
     update_beacon,
     get_channel_session_id,
@@ -41,6 +42,7 @@ async def dispatch_scheduled_prompt(
     apply_presence_fn = None,
     quick_choice_view_cls = None,
     button_choice_fn = None,
+    channel_id: int | None = None,
 ):
     """Inject a scheduled sidecar prompt into the message queue with anti-storm guard."""
     global LAST_SCHEDULED_DISPATCH
@@ -53,28 +55,31 @@ async def dispatch_scheduled_prompt(
         return
     LAST_SCHEDULED_DISPATCH[job_name] = now_ts
 
-    if prompt == "[INTERNAL_SESSION_ROLLOVER]" or job_name in ("Session Rollover", "Daily Session Rollover"):
-        # Generate carry-forward summary BEFORE resetting session
-        err_msg = None
+    async def get_dest_channel(default_cid: int = TARGET_CHANNEL_ID):
+        if not bot:
+            return None
+        dest_id = channel_id or default_cid
         try:
-            from tools.session_summarizer import generate_summary
-            home_cid = get_channel_session_id(TARGET_CHANNEL_ID, "home")
-            if home_cid:
-                generate_summary(conv_id=home_cid, sess_key="home")
-            print("[Scheduler] Generated carry-forward summary before session rollover.")
+            return bot.get_channel(dest_id) or await bot.fetch_channel(dest_id)
         except Exception as e:
-            err_msg = f"⚠️ **Daily Session Rollover Error**: Failed generating carry-forward summary: {e}"
-            print(f"[Scheduler] Error generating rollover summary: {e}")
+            print(f"[Scheduler] Could not fetch channel {dest_id}: {e}")
+            return None
 
-        br.reset_session_keys.add("home")
-        if err_msg and bot:
-            ch = bot.get_channel(TARGET_CHANNEL_ID)
-            if ch:
-                try:
-                    await ch.send(err_msg)
-                except Exception:
-                    pass
-        print("[Scheduler] Executed daily session rollover at 2:00 AM PT (silent on success, reset_session_keys added 'home').")
+    if prompt == "[INTERNAL_SESSION_ROLLOVER]" or job_name in ("Session Rollover", "Daily Session Rollover"):
+        try:
+            from tools.session_rollover import run_daily_session_rollover
+            ok, rep, details = run_daily_session_rollover(bot=bot, dry_run=False)
+            if not ok and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(rep)
+            print(f"[Scheduler] Executed daily multi-channel session rollover at 2:00 AM PT (ok={ok}, rolled_over={len(details.get('rolled_over', []))}).")
+        except Exception as e:
+            print(f"[Scheduler] Error executing daily multi-channel session rollover: {e}")
+            if bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(f"⚠️ **Daily Session Rollover Error**: {e}")
         return
 
     # Heartbeat sweep: silent execution unless degraded
@@ -83,7 +88,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_heartbeat_sweep
             healthy, report, _ = run_sidecar_job("heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
             if not healthy and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     await ch.send(report)
         except Exception as e:
@@ -96,7 +101,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_dated_reminders
             has_due, rep, _ = run_sidecar_job("reminders", "Dated Reminders", run_dated_reminders)
             if has_due and rep and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     await ch.send(rep)
             else:
@@ -111,7 +116,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_ev9_monitor
             has_digest, rep, plot_path = run_sidecar_job("ev9", "EV9 Listing Monitor", run_ev9_monitor, force_digest=False)
             if has_digest and rep and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     file = discord.File(plot_path) if plot_path and os.path.exists(plot_path) else None
                     await ch.send(rep, file=file)
@@ -127,7 +132,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_marketing_sweep
             should_post, rep, _ = run_sidecar_job("marketing", "Marketing Email Sweep", run_marketing_sweep, force=False)
             if should_post and rep and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     await ch.send(rep)
         except Exception as e:
@@ -140,7 +145,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_nightly_triage
             ok, rep, _ = run_sidecar_job("triage", "Nightly Triage & Briefing", run_nightly_triage)
             if rep and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     for chunk in chunk_text(rep):
                         await ch.send(chunk)
@@ -154,7 +159,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_nas_log_review
             ok, rep, _ = run_sidecar_job("nas_logs", "NAS Log Review", run_nas_log_review)
             if rep and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
                     for chunk in chunk_text(rep):
                         await ch.send(chunk)
@@ -168,7 +173,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_plex_session_cleanup
             ok, rep, _ = run_sidecar_job("plex", "Plex Transcode Cleanup", run_plex_session_cleanup)
             if not ok and rep and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     await ch.send(rep)
         except Exception as e:
@@ -193,7 +198,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job
             ok, rep, _ = run_sidecar_job("doctor", "Memory Doctor Audit", run_memory_doctor)
             if rep and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     for chunk in chunk_text(rep):
                         await ch.send(chunk)
@@ -207,7 +212,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_antigravity_check
             ok, out, _ = run_sidecar_job("update_antigravity", "Antigravity CLI Check", run_antigravity_check)
             if out and out.strip() and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
                     if choice_view:
@@ -226,7 +231,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_dockhand_update_check
             ok, out, _ = run_sidecar_job("dockhand_check", "Dockhand Image Check", run_dockhand_update_check)
             if out and out.strip() and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
                     if choice_view:
@@ -245,7 +250,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_ha_update_check
             ok, out, _ = run_sidecar_job("ha_update_check", "HA Update Check", run_ha_update_check)
             if out and out.strip() and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
                     if choice_view:
@@ -262,7 +267,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_ha_battery_check
             ok, out, _ = run_sidecar_job("ha_battery", "HA Battery Check", run_ha_battery_check)
             if not ok and out and out.strip() and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     await ch.send(out)
         except Exception as e:
@@ -275,7 +280,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_nas_storage_check
             ok, out, _ = run_sidecar_job("nas_storage", "NAS Storage Check", run_nas_storage_check)
             if not ok and out and out.strip() and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     await ch.send(out)
         except Exception as e:
@@ -288,7 +293,7 @@ async def dispatch_scheduled_prompt(
             res = subprocess.run(["python3", "/workspace/tools/weekly_digest.py"], capture_output=True, text=True, timeout=60)
             out = res.stdout.strip()
             if out and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     for chunk in chunk_text(out):
                         await ch.send(chunk)
@@ -324,7 +329,7 @@ async def dispatch_scheduled_prompt(
             ok, out, extra = run_sidecar_job("daily_birthday_reminder", "Daily Birthday Reminder", run_birthday_reminders)
             has_bday = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
             if has_bday and out and out.strip() and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
                     if choice_view:
@@ -344,7 +349,7 @@ async def dispatch_scheduled_prompt(
             ok, out, extra = run_sidecar_job("weekly_social_review", "Weekly Social & Last Seen Review", run_social_last_seen_review)
             has_events = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
             if has_events and out and out.strip() and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
                     if choice_view:
@@ -364,7 +369,7 @@ async def dispatch_scheduled_prompt(
             ok, out, extra = run_sidecar_job("monthly_core_friends_reminder", "Monthly Core Friends Social Reminder", run_core_friends_reminder)
             has_friends = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
             if has_friends and out and out.strip() and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
                     if choice_view:
@@ -383,7 +388,7 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_sidecar_job, run_token_report
             ok, rep, _ = run_sidecar_job("daily_token_report", "Daily Token Budget Report", run_token_report)
             if rep and bot:
-                ch = bot.get_channel(TARGET_CHANNEL_ID) or await bot.fetch_channel(TARGET_CHANNEL_ID)
+                ch = await get_dest_channel()
                 if ch:
                     for chunk in chunk_text(rep):
                         await ch.send(chunk)
@@ -392,13 +397,11 @@ async def dispatch_scheduled_prompt(
         return
 
     if bot and turn_queue:
-        ch = bot.get_channel(TARGET_CHANNEL_ID)
+        target_cid = channel_id or TARGET_CHANNEL_ID
+        ch = await get_dest_channel()
         if not ch:
-            try:
-                ch = await bot.fetch_channel(TARGET_CHANNEL_ID)
-            except Exception as e:
-                print(f"[Scheduler] Could not fetch channel {TARGET_CHANNEL_ID}: {e}")
-                return
+            print(f"[Scheduler] Could not fetch channel {target_cid}")
+            return
         status_msg = await ch.send(f"⏱️ **[Scheduled: {job_name}]** *Starting execution...*")
         await turn_queue.put({
             "prompt": prompt,
@@ -407,7 +410,7 @@ async def dispatch_scheduled_prompt(
             "attachments": [],
             "is_steer": False,
             "mode": "home",
-            "channel_id": TARGET_CHANNEL_ID
+            "channel_id": target_cid
         })
 
 
@@ -513,7 +516,7 @@ class KarakosScheduler:
                         j["last_run_ts"] = now_ts
                         j["last_run_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
                         print(f"{prefix} Triggering {j['name']} ({reason}, next: {j['next_run_ts']})")
-                        jobs_to_dispatch.append((j["prompt"], j["name"]))
+                        jobs_to_dispatch.append((j["prompt"], j["name"], j.get("channel_id")))
                     else:
                         print(f"{prefix} Skipping {j['name']} ({reason}, advanced next to: {j['next_run_ts']})")
 
@@ -524,8 +527,12 @@ class KarakosScheduler:
                 save_schedule(jobs)
 
             # Dispatch all eligible jobs
-            for prompt, name in jobs_to_dispatch:
+            for item in jobs_to_dispatch:
+                prompt, name = item[0], item[1]
+                cid = item[2] if len(item) > 2 else None
                 try:
+                    await self.dispatch_fn(prompt, job_name=name, channel_id=cid)
+                except TypeError:
                     await self.dispatch_fn(prompt, job_name=name)
                 except Exception as de:
                     print(f"[KarakosScheduler] Error dispatching {name}: {de}")
@@ -559,7 +566,8 @@ class KarakosScheduler:
                         if bdata.get("state") == "PROCESSING":
                             has_running_proc = (
                                 (br.active_proc is not None and br.active_proc.returncode is None) or
-                                (br.ext_active_proc is not None and br.ext_active_proc.returncode is None)
+                                (br.ext_active_proc is not None and br.ext_active_proc.returncode is None) or
+                                any(p is not None and getattr(p, "returncode", None) is None for p in getattr(br, "channel_active_procs", {}).values())
                             )
                             if not has_running_proc:
                                 # Stale beacon from before restart or completed turn: reset silently
@@ -572,7 +580,13 @@ class KarakosScheduler:
                                     with open(BEACON_FILE, "w") as bf:
                                         json.dump(bdata, bf)
                                     if self.bot:
-                                        ch = self.bot.get_channel(TARGET_CHANNEL_ID)
+                                        target_cid = bdata.get("channel_id") or TARGET_CHANNEL_ID
+                                        ch = self.bot.get_channel(target_cid)
+                                        if not ch:
+                                            try:
+                                                ch = await self.bot.fetch_channel(target_cid)
+                                            except Exception:
+                                                ch = self.bot.get_channel(TARGET_CHANNEL_ID)
                                         if ch:
                                             await ch.send(f"⚠️ **Wedge Alert:** Agent has been silent for >{int(silence/60)}m without output. Prompt: `{bdata.get('prompt')}`")
                     except Exception:
@@ -586,7 +600,8 @@ class KarakosScheduler:
                             _last_bot_status_mtime = mtime
                             busy = (
                                 (br.active_proc is not None and br.active_proc.returncode is None) or
-                                (br.ext_active_proc is not None and br.ext_active_proc.returncode is None)
+                                (br.ext_active_proc is not None and br.ext_active_proc.returncode is None) or
+                                any(p is not None and getattr(p, "returncode", None) is None for p in getattr(br, "channel_active_procs", {}).values())
                             )
                             if not busy and self.presence_fn:
                                 await self.presence_fn()

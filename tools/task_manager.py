@@ -20,7 +20,7 @@ TASKS_FILE = DATA_DIR / "tasks.json"
 
 log = logging.getLogger("task_manager")
 
-def task_manage(action: str = "list", title: str = "", priority: str = "p2", status: str = "pending", task_id: int | None = None) -> dict:
+def task_manage(action: str = "list", title: str = "", priority: str | None = None, status: str | None = None, task_id: int | None = None) -> dict:
     """Manage lightweight task tracker.
     action: 'list' | 'add' | 'update' | 'delete' | 'clear_completed'
     """
@@ -44,8 +44,8 @@ def task_manage(action: str = "list", title: str = "", priority: str = "p2", sta
         new_task = {
             "id": new_id,
             "title": title.strip(),
-            "priority": priority.lower(),
-            "status": status.lower(),
+            "priority": (priority or "p2").lower(),
+            "status": (status or "pending").lower(),
             "updated": datetime.now(PT).strftime("%Y-%m-%d %H:%M"),
         }
         tasks.append(new_task)
@@ -60,9 +60,9 @@ def task_manage(action: str = "list", title: str = "", priority: str = "p2", sta
             if t.get("id") == task_id:
                 if title:
                     t["title"] = title.strip()
-                if priority:
+                if priority is not None:
                     t["priority"] = priority.lower()
-                if status:
+                if status is not None:
                     t["status"] = status.lower()
                 t["updated"] = datetime.now(PT).strftime("%Y-%m-%d %H:%M")
                 with open(TASKS_FILE, "w") as f:

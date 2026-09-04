@@ -30,12 +30,14 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         self.orig_session_metadata_file = bs.SESSION_METADATA_FILE
         self.orig_config_file = bs.CONFIG_FILE
         self.orig_beacon_file = bs.BEACON_FILE
+        self.orig_in_flight = bs.IN_FLIGHT_FILE
 
         bs.DATA_DIR = self.temp_path
         bs.SESSIONS_FILE = self.temp_path / "sessions.json"
         bs.SESSION_METADATA_FILE = self.temp_path / "session_metadata.json"
         bs.CONFIG_FILE = self.temp_path / "runtime_config.json"
         bs.BEACON_FILE = self.temp_path / "liveness_beacon.json"
+        bs.IN_FLIGHT_FILE = self.temp_path / "in_flight_turn.json"
 
     def tearDown(self):
         bs.DATA_DIR = self.orig_data_dir
@@ -43,6 +45,7 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         bs.SESSION_METADATA_FILE = self.orig_session_metadata_file
         bs.CONFIG_FILE = self.orig_config_file
         bs.BEACON_FILE = self.orig_beacon_file
+        bs.IN_FLIGHT_FILE = self.orig_in_flight
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_session_metadata_lifecycle(self):
@@ -75,13 +78,13 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(bs.get_channel_session_id(ext_ch, "external"))
 
     def test_compaction_thresholds(self):
-        # 1. Turns threshold >= 25
-        needed, reason = bs.check_compaction_needed("conv-1", 25)
+        # 1. Turns threshold >= 15
+        needed, reason = bs.check_compaction_needed("conv-1", 15)
         self.assertTrue(needed)
         self.assertIn("turn count", reason)
 
         # 2. No conv_id and low turns
-        needed, _ = bs.check_compaction_needed(None, 10)
+        needed, _ = bs.check_compaction_needed(None, 5)
         self.assertFalse(needed)
 
         # 3. Brain directory size check
@@ -97,6 +100,17 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         needed, reason = bs.check_compaction_needed("conv-mock", 5, brain_root=brain_temp)
         self.assertTrue(needed)
         self.assertIn("transcript size", reason)
+
+        # 4. Transcript step count ceiling (1500 steps) triggers even on small files
+        transcript_steps = conv_dir / "transcript_steps" / ".system_generated" / "logs"
+        transcript_steps.mkdir(parents=True, exist_ok=True)
+        t_file = transcript_steps / "transcript.jsonl"
+        with open(t_file, "w") as f:
+            for i in range(1505):
+                f.write(f'{{"step": {i}}}\n')
+        needed, reason = bs.check_compaction_needed("transcript_steps", 2, brain_root=conv_dir)
+        self.assertTrue(needed)
+        self.assertIn("transcript steps (1505) exceeds 1500-step ceiling", reason)
 
     async def test_persistent_turn_queue(self):
         q_file = self.temp_path / "test_queue.json"
@@ -184,6 +198,32 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
             bs.increment_gif_turn("chan_a")
         guidance_due = bs.get_gif_prompt_guidance("chan_a")
         self.assertIn("⚠️ DUE (>=5 turns without GIF)", guidance_due)
+
+    def test_in_flight_turn_lifecycle_and_attempts(self):
+        # 1. First recording has attempts = 1
+        bs.record_in_flight(12345, "First prompt test", conv_id="conv-1")
+        self.assertTrue(bs.IN_FLIGHT_FILE.exists())
+        with open(bs.IN_FLIGHT_FILE) as f:
+            d = json.load(f)
+        self.assertEqual(d["12345"]["attempts"], 1)
+        self.assertEqual(d["attempts"], 1)
+
+        # 2. Re-recording the exact same prompt increments attempts
+        bs.record_in_flight(12345, "First prompt test", conv_id="conv-1")
+        with open(bs.IN_FLIGHT_FILE) as f:
+            d2 = json.load(f)
+        self.assertEqual(d2["12345"]["attempts"], 2)
+        self.assertEqual(d2["attempts"], 2)
+
+        # 3. Recording a different prompt resets attempts to 1
+        bs.record_in_flight(12345, "Different prompt", conv_id="conv-2")
+        with open(bs.IN_FLIGHT_FILE) as f:
+            d3 = json.load(f)
+        self.assertEqual(d3["12345"]["attempts"], 1)
+
+        # 4. Clear in-flight
+        bs.clear_in_flight(12345)
+        self.assertFalse(bs.IN_FLIGHT_FILE.exists())
 
 
 if __name__ == "__main__":

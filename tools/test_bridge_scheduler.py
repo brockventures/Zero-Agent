@@ -201,6 +201,64 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(should_run)
         self.assertIn("already ran in current period", reason)
 
+    async def test_nas_logs_dispatch_targets_homelab_channel(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🗄️ NAS Log Review OK", {})):
+            await bshed.dispatch_scheduled_prompt(
+                "Run the nightly NAS log review using /workspace/tools/sidecars.py nas_logs.",
+                "NAS Log Review",
+                bot=mock_bot
+            )
+            # Must route to HOMELAB_CHANNEL_ID (1544955535722545253)
+            mock_bot.get_channel.assert_called_with(bs.HOMELAB_CHANNEL_ID)
+            mock_channel.send.assert_called_once_with("🗄️ NAS Log Review OK")
+
+    async def test_nas_logs_dispatch_respects_explicit_channel_id(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        custom_channel_id = 9876543210
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🗄️ NAS Log Review Custom", {})):
+            await bshed.dispatch_scheduled_prompt(
+                "Run the nightly NAS log review using /workspace/tools/sidecars.py nas_logs.",
+                "NAS Log Review",
+                bot=mock_bot,
+                channel_id=custom_channel_id
+            )
+            # Must route to custom_channel_id
+            mock_bot.get_channel.assert_called_with(custom_channel_id)
+            mock_channel.send.assert_called_once_with("🗄️ NAS Log Review Custom")
+
+    async def test_evaluate_and_dispatch_forwards_channel_id(self):
+        dispatch_mock = AsyncMock()
+        scheduler = bshed.KarakosScheduler(dispatch_fn=dispatch_mock)
+        test_job = {
+            "id": "nas_logs",
+            "name": "NAS Log Review",
+            "enabled": True,
+            "schedule_type": "daily",
+            "hour_pt": 22,
+            "minute_pt": 0,
+            "channel_id": bs.HOMELAB_CHANNEL_ID,
+            "next_run_ts": 1000.0,
+            "prompt": "Run the nightly NAS log review"
+        }
+        with patch("tools.scheduler_tool.load_schedule", return_value=[test_job]), \
+             patch("tools.bridge_scheduler.should_run_job", return_value=(True, "on_time")), \
+             patch("tools.scheduler_tool.save_schedule"):
+            await scheduler._evaluate_and_dispatch_jobs()
+            dispatch_mock.assert_called_once_with(
+                "Run the nightly NAS log review",
+                job_name="NAS Log Review",
+                channel_id=bs.HOMELAB_CHANNEL_ID
+            )
+
     async def test_scheduler_lifecycle(self):
         dispatch_mock = AsyncMock()
         scheduler = bshed.KarakosScheduler(dispatch_fn=dispatch_mock)
