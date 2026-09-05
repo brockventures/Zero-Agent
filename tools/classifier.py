@@ -6,11 +6,13 @@ import sys
 PEER_SNOWFLAKE_TAGS = [
     r"<@!?1468012353206354197>",  # Amos
     r"<@!?1492043459618537492>",  # Marvin
+    r"<@!?1542035925603713086>",  # Aerial
     r"<@!?93420059858305024>",    # Mike / Arbiter
     r"<@!?453030589914939393>",   # Ian / Moon Problem
+    r"<@!?169260920550195200>",   # Alex / Arcane
 ]
 
-PEER_NAMES = r"(?:amos|marvin|arbiter|ian|mike)"
+PEER_NAMES = r"(?:amos|marvin|aerial|arbiter|ian|mike|alex|arcane)"
 
 # Patterns where a peer is specifically addressed in a vocative position (NOT prepositional/referential)
 PEER_VOCATIVE_PATTERNS = [

@@ -390,12 +390,35 @@ def has_reaction_gif(text: str) -> bool:
 
 
 def get_gif_prompt_guidance(sess_key: str) -> str:
-    """Generate prompt guidance block for GIF cadence and contextual overrides."""
+    """Generate prompt guidance block for GIF cadence, diversity, and contextual overrides."""
     count = get_gif_turn_count(sess_key)
     status_str = "⚠️ DUE (>=5 turns without GIF)" if count >= 5 else f"Nominal ({count}/5-7 turns)"
+
+    diversity_lines = []
+    try:
+        from tools.gif_tool import get_cooldown_summary
+        summary = get_cooldown_summary()
+        cds = summary.get("cooldowns", {})
+        if cds:
+            cd_items = [
+                f"{v['display_name']} (BLOCKED - {v['distance']}/{v['threshold']})"
+                for v in cds.values()
+            ]
+            diversity_lines.append(f"• Active Franchise Cooldown(s): [{', '.join(cd_items)}].")
+        eligible = summary.get("eligible", [])
+        if eligible:
+            diversity_lines.append(f"• Comedic Rotation: {', '.join(eligible[:6])}.")
+        if cds:
+            diversity_lines.append("• Diversity Rule: Do NOT query cooled-down franchises. Rotate across eligible comedic universes.")
+    except Exception:
+        pass
+
+    diversity_block = ("\n" + "\n".join(diversity_lines)) if diversity_lines else ""
+
     return (
         f"[GIF Cadence Tracker (Channel: {sess_key})]: {count} message(s) since last reaction GIF in this channel.\n"
-        f"• Target Cadence: ~1 in 5-7 messages (use: python3 /workspace/tools/gif_tool.py \"<query>\").\n"
+        f"• Target Cadence: ~1 in 5-7 messages (use: python3 /workspace/tools/gif_tool.py \"<query>\")."
+        f"{diversity_block}\n"
         f"• Status: {status_str}.\n"
         f"• Contextual Overrides:\n"
         f"  - Serious / Critical Override: If the message/topic is serious, urgent, an outage, data entry, or sensitive, override and SKIP the GIF regardless of count.\n"
@@ -603,11 +626,21 @@ class PersistentTurnQueue:
 def update_beacon(state: str = "IDLE", prompt: str = "", channel_id: int | str = None):
     """Update liveness beacon timestamp and state for watchdog monitoring."""
     try:
+        clean_prompt = prompt or ""
+        if "[CURRENT USER PROMPT]:" in clean_prompt:
+            clean_prompt = clean_prompt.split("[CURRENT USER PROMPT]:", 1)[1].strip()
+        elif "[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:" in clean_prompt:
+            clean_prompt = re.sub(r"\[PREVIOUS SESSION CARRY-FORWARD CONTEXT\]:.*?(?=\n\n|\Z)", "", clean_prompt, flags=re.DOTALL).strip()
+        clean_prompt = re.sub(r"<[^>]+>", "", clean_prompt).strip()
+        clean_prompt = re.sub(r"\[System Time & Timezone\]:[^\n]*(?:\n\s*[•\-\*][^\n]*)*\n*", "", clean_prompt).strip()
+        clean_prompt = re.sub(r"\[GIF Cadence Tracker[^\n]*(?:\n\s*[•\-\*][^\n]*)*\n*", "", clean_prompt).strip()
+        clean_prompt = clean_prompt.strip()
+
         data = {
             "state": state,
             "ts": time.time(),
             "time_pt": datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M:%S %p PT"),
-            "prompt": prompt[:80] if prompt else "",
+            "prompt": clean_prompt[:120] if clean_prompt else "",
             "channel_id": int(channel_id) if str(channel_id).isdigit() else channel_id
         }
         tmp = BEACON_FILE.with_suffix(".tmp")

@@ -77,6 +77,7 @@ reminders.json
 liveness_beacon.json
 tools/promote_memory.py
 tools/pack_shard.py
+market-sandbox/
 
 # 6. Python Artifacts & Environments
 __pycache__/

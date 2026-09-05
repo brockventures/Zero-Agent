@@ -147,6 +147,16 @@ class TestBridgeFormatting(unittest.TestCase):
         res = extract_agent_response(raw_stream)
         self.assertEqual(res, "Standard non-streaming reply.")
 
+    def test_extract_agent_response_pure_silence_sentinel(self):
+        # Explicit silence request without substantive content returns sentinel [NO_REPLY]
+        raw_stream = (
+            '{"event":"init","conversation_id":"c-silent"}\n'
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"[NO_REPLY]"}}\n'
+            '{"event":"result","result":{"conversation_id":"c-silent","status":"DONE","response":"[NO_REPLY]"}}\n'
+        )
+        res = extract_agent_response(raw_stream)
+        self.assertEqual(res, "[NO_REPLY]")
+
     def test_chunk_text_basic_and_boundary(self):
         short_text = "Hello world"
         self.assertEqual(chunk_text(short_text, 100), ["Hello world"])
@@ -197,13 +207,33 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertTrue(len(title3.split()) >= 3)
         self.assertNotIn("analyze", title3.lower())
 
-    def test_sanitize_reaction_gifs(self):
-        # 404 URL that previously broke in Crab Cavern
+    @unittest.mock.patch("urllib.request.urlopen")
+    def test_sanitize_reaction_gifs(self, mock_urlopen):
+        # 1. 404 URL that previously broke in Crab Cavern gets replaced or stripped
+        mock_urlopen.side_effect = Exception("404 Not Found")
         broken_url = "https://tenor.com/view/arrested-development-lucille-bluth-jessica-walter-lock-the-door-gif-26514757"
         text = f"Here is your reaction:\n{broken_url}\nEnjoy!"
         cleaned = format_for_discord(text)
         self.assertNotIn(broken_url, cleaned)
-        self.assertIn("https://tenor.com/view/", cleaned)
+
+        # 2. Valid bare GIF URL gets wrapped into titled markdown link
+        mock_resp = unittest.mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.side_effect = None
+        mock_urlopen.return_value = mock_resp
+
+        bare_url = "https://tenor.com/view/ive-made-a-huge-mistake-12345"
+        text2 = f"Here is your reaction:\n{bare_url}\nEnjoy!"
+        cleaned2 = format_for_discord(text2)
+        self.assertIn("[I've Made A Huge Mistake](https://tenor.com/view/ive-made-a-huge-mistake-12345)", cleaned2)
+
+        # 3. Already wrapped markdown link is NOT double-wrapped
+        wrapped_url = "[My Custom Title](https://tenor.com/view/ive-made-a-huge-mistake-12345)"
+        text3 = f"Here is your reaction:\n{wrapped_url}\nEnjoy!"
+        cleaned3 = format_for_discord(text3)
+        self.assertIn("[My Custom Title](https://tenor.com/view/ive-made-a-huge-mistake-12345)", cleaned3)
+        self.assertNotIn("[[", cleaned3)
 
 
 if __name__ == "__main__":
