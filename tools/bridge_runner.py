@@ -766,6 +766,7 @@ async def execute_agy_turn(
         else:
             final_text = f"⚠️ **Turn Incomplete:** Agent process exited after {elapsed_sec}s ({pid_str}) without generating output or a recoverable transcript."
 
+    final_text = format_for_discord(final_text)
     final_text = clean_discord_latex(final_text)
 
     if mode == "external":
