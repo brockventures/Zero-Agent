@@ -5,6 +5,7 @@ Comprehensive test suite for bridge_formatting.py
 
 import sys
 import unittest
+from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 WORKSPACE = Path("/workspace")
@@ -59,11 +60,19 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertIn("• **Power Outage**:\n  - *Chest Freezer*: 48+ hours\n  - *Upright Freezer*: 12-24 hours", converted)
 
     def test_format_for_discord_file_links(self):
-        text = "Check [bridge.py](file:///workspace/tools/bridge.py) and [`test.py`](file:///workspace/tools/test.py)."
+        text = "Check [bridge.py](file:///workspace/tools/bridge.py) and [`test.py`](file:///workspace/tools/test.py) and bare file:///workspace/tools/run.py."
         formatted = format_for_discord(text)
         self.assertIn("`bridge.py`", formatted)
         self.assertIn("`test.py`", formatted)
+        self.assertIn("`/workspace/tools/run.py`", formatted)
         self.assertNotIn("file://", formatted)
+
+    def test_format_for_discord_subagent_boilerplate(self):
+        text = "Subagent execution in progress...\nSubagents or tasks are still running. Pausing execution until next message.\nWait for notifications from:\n- task-123\nIf you call a tool now, you will not wait for the task to finish.\n\nActual substantive response."
+        formatted = format_for_discord(text)
+        self.assertNotIn("Subagent execution in progress", formatted)
+        self.assertNotIn("task-123", formatted)
+        self.assertEqual(formatted, "Actual substantive response.")
 
     def test_format_for_discord_github_alerts(self):
         text = "> [!NOTE]\n> This is a note.\n\n> [!WARNING]\n> High load."
@@ -207,7 +216,7 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertTrue(len(title3.split()) >= 3)
         self.assertNotIn("analyze", title3.lower())
 
-    @unittest.mock.patch("urllib.request.urlopen")
+    @patch("urllib.request.urlopen")
     def test_sanitize_reaction_gifs(self, mock_urlopen):
         # 1. 404 URL that previously broke in Crab Cavern gets replaced or stripped
         mock_urlopen.side_effect = Exception("404 Not Found")
@@ -217,7 +226,7 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertNotIn(broken_url, cleaned)
 
         # 2. Valid bare GIF URL gets wrapped into titled markdown link
-        mock_resp = unittest.mock.MagicMock()
+        mock_resp = MagicMock()
         mock_resp.status = 200
         mock_resp.__enter__.return_value = mock_resp
         mock_urlopen.side_effect = None

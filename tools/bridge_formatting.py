@@ -107,7 +107,7 @@ def format_for_discord(text: str) -> str:
     if not text:
         return ""
 
-    # 1. Clean file:/// links: [`/path`](file:///path) -> `/path`, [path](file:///path) -> `path`
+    # 1. Clean file:/// links: [`/path`](file:///path) -> `/path`, [path](file:///path) -> `path`, bare file:///path -> `/path`
     def clean_file_link(m):
         inner = m.group(1).strip()
         if inner.startswith("`") and inner.endswith("`"):
@@ -115,6 +115,7 @@ def format_for_discord(text: str) -> str:
         return f"`{inner}`"
 
     text = re.sub(r"\[([^\]]+)\]\(file://[^\)]*\)", clean_file_link, text)
+    text = re.sub(r"(?<![\w`\(])file://(/[^\s\)\>]+?)(?=[.,;:?!]?(?:\s|$|\)))", r"`\1`", text)
 
     # 2. Strip internal action/progress pseudo-tags (e.g. <Action: ...>)
     text = re.sub(r"<\s*action:[^>]+>", "", text, flags=re.IGNORECASE)
@@ -153,6 +154,12 @@ def format_for_discord(text: str) -> str:
         "",
         text,
         flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"Subagent execution in progress\.\.\.[\s\S]*?(?:If you call a tool now[^\n]*|wait for tasks or subagents\.\.?|DO NOTHING ELSE\.?)",
+        "",
+        text,
+        flags=re.IGNORECASE,
     )
 
     # 6. Strip intermediate background task wait and launch self-narration chatter
@@ -256,10 +263,15 @@ def extract_agent_response(raw_text: str) -> str:
         nonlocal last_substantive_response
         curr_text = "".join(accumulated_content).strip()
         is_wait_chatter = bool(
-            len(curr_text) < 120 and re.search(
+            (len(curr_text) < 120 and re.search(
                 r"(?:running|scanning|checking|evaluating|processing|waiting|initiated|started|spawned)[^\n]+(?:in the background|for it to finish)",
                 curr_text,
                 re.IGNORECASE
+            )) or (
+                "Subagent execution in progress" in curr_text or
+                "Subagents or tasks are still running" in curr_text or
+                "Wait for notifications from:" in curr_text or
+                "wait for tasks or subagents" in curr_text
             )
         )
         is_silence = curr_text.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none", "")
