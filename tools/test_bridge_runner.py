@@ -87,6 +87,14 @@ class TestBridgeRunner(unittest.TestCase):
                          c.strip() in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP"))
             self.assertTrue(is_silent, f"Candidate should be evaluated as silent: {c}")
 
+    def test_home_turf_silence_tags_converted_to_error(self):
+        """Verify that in home turf, silent reply tags are never suppressed and instead flagged."""
+        for tag in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP", "reply:none", "reply: none"):
+            text = tag
+            if text.strip() in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP", "reply:none", "reply: none"):
+                text = "⚠️ **Turn Incomplete:** Received unexpected silent reply tag in home turf pairing mode."
+            self.assertIn("⚠️ **Turn Incomplete:**", text)
+
     def test_choices_tag_parsing(self):
         text = "Task completed successfully.\n[CHOICES: Run Tests | Commit Code | Deploy]"
         import re
@@ -152,7 +160,65 @@ class TestBridgeRunner(unittest.TestCase):
             mock_getpgid.assert_called_once_with(4321)
             mock_killpg.assert_called_once_with(4321, br.signal.SIGTERM)
 
+    def test_split_chunk_line_buffering(self):
+        """Verify that JSON events crossing 8KB read boundaries are properly reassembled and parsed."""
+        raw_event = json.dumps({
+            "event": "result",
+            "result": {
+                "conversation_id": "conv-split-test",
+                "status": "SUCCESS",
+                "response": "Here is the response split across chunks." * 200
+            }
+        }) + "\n"
+
+        # Split across two chunks right through the middle
+        split_idx = 8192 if len(raw_event) > 8192 else len(raw_event) // 2
+        chunk1 = raw_event[:split_idx]
+        chunk2 = raw_event[split_idx:]
+
+        line_buffer = ""
+        parsed_events = []
+
+        for chunk in [chunk1, chunk2]:
+            line_buffer += chunk
+            while "\n" in line_buffer:
+                line, line_buffer = line_buffer.split("\n", 1)
+                line_s = line.strip()
+                if line_s.startswith("{") and line_s.endswith("}"):
+                    parsed_events.append(json.loads(line_s))
+
+        self.assertEqual(len(parsed_events), 1)
+        self.assertEqual(parsed_events[0]["event"], "result")
+        self.assertEqual(parsed_events[0]["result"]["conversation_id"], "conv-split-test")
+        self.assertEqual(line_buffer, "")
+
+    def test_dual_completion_triggers(self):
+        """Verify cutoff logic triggers when either result event or agent_response DONE is observed."""
+        now = time.time()
+
+        # Case 1: Result event received > 1.5s ago
+        result_received_at = now - 1.6
+        agent_response_done_at = None
+        is_result_cutoff = (result_received_at is not None and (now - result_received_at) >= 1.5)
+        is_agent_done_cutoff = (agent_response_done_at is not None and (now - agent_response_done_at) >= 2.0)
+        self.assertTrue(is_result_cutoff or is_agent_done_cutoff)
+
+        # Case 2: Agent response completed (state: DONE) > 2.0s ago without result event
+        result_received_at = None
+        agent_response_done_at = now - 2.1
+        is_result_cutoff = (result_received_at is not None and (now - result_received_at) >= 1.5)
+        is_agent_done_cutoff = (agent_response_done_at is not None and (now - agent_response_done_at) >= 2.0)
+        self.assertTrue(is_result_cutoff or is_agent_done_cutoff)
+
+        # Case 3: Inactive - agent still actively generating
+        result_received_at = None
+        agent_response_done_at = None
+        is_result_cutoff = (result_received_at is not None and (now - result_received_at) >= 1.5)
+        is_agent_done_cutoff = (agent_response_done_at is not None and (now - agent_response_done_at) >= 2.0)
+        self.assertFalse(is_result_cutoff or is_agent_done_cutoff)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

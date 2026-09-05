@@ -154,7 +154,11 @@ async def execute_agy_turn(
     author_name: str = "",
     apply_presence_fn = None,
     button_choice_fn = None,
-    quick_choice_view_cls = None
+    quick_choice_view_cls = None,
+    is_last_word: bool = False,
+    last_word_bot_id: str = None,
+    last_word_bot_name: str = None,
+    last_word_streak: int = 0,
 ):
     """Execute a single agy CLI turn with streaming status and output delivery."""
     global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session_keys, is_ext_steering
@@ -174,6 +178,10 @@ async def execute_agy_turn(
                     apply_presence_fn=apply_presence_fn,
                     button_choice_fn=button_choice_fn,
                     quick_choice_view_cls=quick_choice_view_cls,
+                    is_last_word=is_last_word,
+                    last_word_bot_id=last_word_bot_id,
+                    last_word_bot_name=last_word_bot_name,
+                    last_word_streak=last_word_streak,
                 )
             except Exception as pe:
                 print(f"[BridgeRunner] ⚠️ Persistent daemon turn error in channel {channel_id}: {pe}. Ensuring worker recycled & falling back to dynamic execution...")
@@ -372,7 +380,7 @@ async def execute_agy_turn(
             cmd.append(f"--model={active_model}")
 
         if mode == "home":
-            update_beacon("PROCESSING", prompt)
+            update_beacon("PROCESSING", prompt, channel_id=channel_id)
 
         ch_title = getattr(reply_target.channel, "name", "") if (reply_target and hasattr(reply_target, "channel")) else ""
         turn_text = f"Crunching in #{ch_title}..." if ch_title else "Processing task..."
@@ -415,9 +423,13 @@ async def execute_agy_turn(
                 ext_active_proc = proc
 
             last_beacon_touch = time.time()
+            last_activity_time = time.time()
             init_received = False
             result_received_at = None
-            turn_timeout_seconds = float(rules.get("turn_watchdog_seconds", 300.0))
+            agent_response_done_at = None
+            had_substantive_delta = False
+            line_buffer = ""
+            turn_timeout_seconds = float(rules.get("turn_watchdog_seconds", 600.0))
             timed_out = False
 
             is_root_eligible = (
@@ -435,10 +447,14 @@ async def execute_agy_turn(
                 r, _, _ = select.select([master_fd], [], [], 0.1)
                 now = time.time()
 
-                # Post-result drain cutoff: if the CLI emitted the terminal 'result' event
-                # but continues running (e.g. background task holding stdio open), terminate and harvest.
-                if result_received_at is not None and (now - result_received_at) >= 2.0:
-                    print(f"[BridgeRunner] ⏱️ Result received >2s ago, but process PID {proc.pid} still running. Terminating to drain output...")
+                # Post-result & completion drain cutoff:
+                # Trigger 1: Terminal 'result' event emitted >= 1.5s ago
+                # Trigger 2: Agent completed final response step (state: DONE) >= 2.0s ago without subsequent tool calls
+                is_result_cutoff = (result_received_at is not None and (now - result_received_at) >= 1.5)
+                is_agent_done_cutoff = (agent_response_done_at is not None and (now - agent_response_done_at) >= 2.0)
+                if is_result_cutoff or is_agent_done_cutoff:
+                    trigger_label = "Result event" if is_result_cutoff else "Agent response DONE"
+                    print(f"[BridgeRunner] ⏱️ {trigger_label} cutoff reached (>1.5-2s), but PTY held open (PID {proc.pid}). Terminating to drain output...")
                     kill_process_tree(proc, signal.SIGTERM)
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=1.0)
@@ -450,9 +466,12 @@ async def execute_agy_turn(
                             pass
                     break
 
-                # Bridge-level turn watchdog (enforces hard deadline so we never hang for 10m)
-                if (now - turn_start_time) >= turn_timeout_seconds:
-                    print(f"[BridgeRunner] ⏱️ Turn watchdog exceeded ({int(turn_timeout_seconds)}s) for PID {proc.pid} in channel {channel_id}. Terminating...")
+                # Bridge-level turn watchdog: enforces hard inactivity timeout so silent hangs are killed,
+                # while active turns actively streaming output are permitted up to absolute ceiling (2x).
+                max_turn_ceiling = turn_timeout_seconds * 2.0
+                if (now - last_activity_time) >= turn_timeout_seconds or (now - turn_start_time) >= max_turn_ceiling:
+                    reason = f"{int(turn_timeout_seconds)}s idle" if (now - last_activity_time) >= turn_timeout_seconds else f"{int(max_turn_ceiling)}s hard ceiling"
+                    print(f"[BridgeRunner] ⏱️ Turn watchdog exceeded ({reason}) for PID {proc.pid} in channel {channel_id}. Terminating...")
                     timed_out = True
                     kill_process_tree(proc, signal.SIGTERM)
                     try:
@@ -492,21 +511,24 @@ async def execute_agy_turn(
                             break
                         text = data.decode("utf-8", errors="replace")
                         output_chunks.append(text)
+                        last_activity_time = time.time()
+                        line_buffer += text
 
                         # Touch liveness beacon so long active turns never trip false wedge alerts
                         if mode == "home":
                             now_touch = time.time()
                             if (now_touch - last_beacon_touch) >= 10:
-                                update_beacon("PROCESSING", prompt)
+                                update_beacon("PROCESSING", prompt, channel_id=channel_id)
                                 last_beacon_touch = now_touch
 
-                        # Extract current progress/action from stream-json or raw text
-                        for line in text.splitlines():
+                        # Extract current progress/action from stream-json or raw text using robust line buffering
+                        while "\n" in line_buffer:
+                            line, line_buffer = line_buffer.split("\n", 1)
                             line_s = line.strip()
                             if line_s.startswith("{") and line_s.endswith("}"):
                                 try:
                                     ev = json.loads(line_s)
-                                    ev_name = ev.get("event")
+                                    ev_name = ev.get("event") or ev.get("type")
                                     if ev_name == "init":
                                         init_received = True
                                         new_cid = ev.get("conversation_id")
@@ -516,7 +538,8 @@ async def execute_agy_turn(
                                         step = ev.get("step_update", {})
                                         stype = step.get("step_type")
                                         tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
-                                        if stype == "tool" and tname:
+                                        if stype in ("tool", "system_message", "system") or tname:
+                                            agent_response_done_at = None
                                             tinfo = step.get("tool_info", {})
                                             params = tinfo.get("parameters", {})
                                             if tname == "run_command" and "CommandLine" in params:
@@ -535,12 +558,18 @@ async def execute_agy_turn(
                                             else:
                                                 current_action = f"Calling tool: {tname}..."
                                         elif stype == "agent_response":
-                                            if step.get("text_delta"):
+                                            delta = step.get("text_delta") or step.get("text") or step.get("content")
+                                            if delta and isinstance(delta, str) and delta.strip():
+                                                had_substantive_delta = True
                                                 current_action = "Drafting response..."
-                                    elif ev_name == "result":
+                                            if step.get("state") == "DONE" and had_substantive_delta:
+                                                if agent_response_done_at is None:
+                                                    agent_response_done_at = time.time()
+                                    elif ev_name == "result" or "result" in ev:
                                         if result_received_at is None:
                                             result_received_at = time.time()
-                                        res_cid = ev.get("result", {}).get("conversation_id")
+                                        res_data = ev.get("result", {}) if isinstance(ev.get("result"), dict) else ev
+                                        res_cid = res_data.get("conversation_id")
                                         if res_cid:
                                             if escalated_to_thread and thread and hasattr(thread, 'id'):
                                                 set_channel_session_id(thread.id, mode, res_cid)
@@ -584,12 +613,27 @@ async def execute_agy_turn(
                                         )
                     except OSError:
                         break
+                    if proc.returncode is not None:
+                        break
                 else:
                     if proc.returncode is not None:
                         break
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=0.05)
                     except asyncio.TimeoutError:
+                        pass
+
+            # Parse any remaining line fragment in line_buffer
+            if line_buffer.strip():
+                line_s = line_buffer.strip()
+                if line_s.startswith("{") and line_s.endswith("}"):
+                    try:
+                        ev = json.loads(line_s)
+                        if ev.get("event") == "result":
+                            res_cid = ev.get("result", {}).get("conversation_id")
+                            if res_cid:
+                                set_channel_session_id(channel_id, mode, res_cid)
+                    except Exception:
                         pass
 
             if not auth_detected:
@@ -608,8 +652,9 @@ async def execute_agy_turn(
                     os.close(master_fd)
                 except OSError:
                     pass
+                kill_process_tree(proc, signal.SIGTERM)
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    await asyncio.wait_for(proc.wait(), timeout=1.5)
                 except (asyncio.TimeoutError, Exception):
                     kill_process_tree(proc, signal.SIGKILL)
                     try:
@@ -704,14 +749,14 @@ async def execute_agy_turn(
     active_cid = get_channel_session_id(channel_id, mode) or conv_id
 
     # Fallback to on-disk transcript if stdout was empty, cut off, or returned default placeholder
-    if not final_text or final_text.startswith("*(") or len(final_text.strip()) == 0:
+    if (not final_text or final_text.startswith("*(") or len(final_text.strip()) == 0) and final_text != "[NO_REPLY]":
         harvested = harvest_transcript_response(active_cid)
         if harvested:
             print(f"[BridgeRunner] 🌾 Harvested response from on-disk transcript for session {active_cid} ({len(harvested)} chars).")
             final_text = f"⚠️ *(Recovered from session transcript following process cutoff)*\n\n{harvested}"
 
     # If STILL no substantive response, emit explicit error beacon (NEVER fail silently)
-    if not final_text or final_text.startswith("*(") or len(final_text.strip()) == 0:
+    if (not final_text or final_text.startswith("*(") or len(final_text.strip()) == 0) and final_text != "[NO_REPLY]":
         elapsed_sec = int(time.time() - turn_start_time)
         pid_str = f"PID {proc.pid}" if proc else "unknown PID"
         if timed_out:
@@ -728,14 +773,28 @@ async def execute_agy_turn(
         clean_ext_text = scrub_credentials(clean_ext_text)
         clean_ext_text = clean_discord_latex(clean_ext_text)
 
-        is_explicit_no_reply = clean_ext_text in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP")
-        if is_explicit_no_reply and not timed_out and (proc is None or proc.returncode in (0, None)):
+        is_explicit_no_reply = clean_ext_text in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP", "*(No output from agent)*")
+        if (is_explicit_no_reply or not clean_ext_text) and not timed_out and (proc is None or proc.returncode in (0, None)):
+            if is_last_word and (last_word_bot_id or last_word_bot_name):
+                try:
+                    from tools.last_word_protocol import pause_bot
+                    rules = get_runtime_rules()
+                    pause_sec = float(rules.get("last_word_pause_minutes", 3)) * 60.0
+                    pause_bot(
+                        channel_id=channel_id,
+                        bot_id=last_word_bot_id,
+                        bot_name=last_word_bot_name,
+                        duration_seconds=pause_sec,
+                        reason=f"Last Word Protocol triggered after {last_word_streak} uninterrupted messages"
+                    )
+                except Exception as lwe:
+                    print(f"[BridgeRunner] Error setting Last Word pause on NO_REPLY: {lwe}")
             if status_msg:
                 try:
                     await status_msg.delete()
                 except Exception:
                     pass
-            print(f"[BridgeRunner] Agent evaluated turn and decided silent NO_REPLY in channel {channel_id}")
+            print(f"[BridgeRunner] Suppressed empty, [NO_REPLY], or placeholder in external channel {channel_id}")
             return
 
         try:
@@ -746,8 +805,14 @@ async def execute_agy_turn(
             print(f"[BridgeRunner] Error recording Zero reply to channel history: {re_err}")
 
         chunks = chunk_text(clean_ext_text, 1900)
-        if not chunks:
-            chunks = ["*(No output from agent)*"]
+        if not chunks or (len(chunks) == 1 and chunks[0] == "*(No output from agent)*"):
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            print(f"[BridgeRunner] Suppressed empty chunks in external channel {channel_id}")
+            return
 
         try:
             if status_msg:
@@ -763,6 +828,23 @@ async def execute_agy_turn(
             except Exception:
                 await reply_target.channel.send(ch)
 
+        # Trigger Last Word Protocol cooldown once response is delivered
+        if is_last_word and (last_word_bot_id or last_word_bot_name):
+            try:
+                from tools.last_word_protocol import pause_bot
+                rules = get_runtime_rules()
+                pause_sec = float(rules.get("last_word_pause_minutes", 3)) * 60.0
+                pause_bot(
+                    channel_id=channel_id,
+                    bot_id=last_word_bot_id,
+                    bot_name=last_word_bot_name,
+                    duration_seconds=pause_sec,
+                    reason=f"Last Word Protocol triggered after {last_word_streak} uninterrupted messages"
+                )
+                print(f"[BridgeRunner] Last Word Protocol: paused responses to {last_word_bot_name} ({last_word_bot_id}) in channel {channel_id} for {pause_sec/60:.0f}m.")
+            except Exception as lwe:
+                print(f"[BridgeRunner] Error triggering Last Word Protocol pause: {lwe}")
+
         ext_sess_key = str(channel_id)
         if has_reaction_gif(clean_ext_text):
             reset_gif_turn(ext_sess_key)
@@ -772,15 +854,9 @@ async def execute_agy_turn(
             print(f"[BridgeRunner] 📊 No GIF in reply for channel {ext_sess_key}. turns_since_gif incremented to {new_c}.")
         return
 
-    # Suppress silent replies in home turf
-    if final_text.strip().lower() in ("reply:none", "reply: none", "none", "", "[no_reply]", "no_reply", "[no_op]", "no_op"):
-        print(f"[BridgeRunner] Suppressed silent reply '{final_text.strip()}' from being sent to Discord.")
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-        return
+    # In Home Turf, silence tags are invalid - flag as incomplete turn so Ryan is never ghosted
+    if final_text.strip() in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP", "reply:none", "reply: none"):
+        final_text = "⚠️ **Turn Incomplete:** Received unexpected silent reply tag in home turf pairing mode."
 
     # Parse [CHOICES: ...] interactive buttons
     choice_view = None

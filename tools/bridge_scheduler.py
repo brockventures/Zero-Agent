@@ -287,6 +287,81 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] NAS storage check execution error: {e}")
         return
 
+    # Prowlarr indexer health check: silent unless indexers disabled or throttling
+    if "prowlarr" in prompt or job_name in ("Prowlarr Indexer Health Watchdog", "Prowlarr Watchdog"):
+        try:
+            from tools.sidecars import run_sidecar_job, run_prowlarr_watchdog
+            ok, out, _ = run_sidecar_job("prowlarr_watchdog", "Prowlarr Indexer Watchdog", run_prowlarr_watchdog)
+            if out and out != "(nominal - 0 Prowlarr failures)" and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] Prowlarr indexers checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Prowlarr watchdog execution error: {e}")
+        return
+
+    # SABnzbd downloader & unpack check: silent unless issues found
+    if "sabnzbd" in prompt or job_name in ("SABnzbd Downloader & Unpack Watchdog", "SABnzbd Watchdog"):
+        try:
+            from tools.sidecars import run_sidecar_job, run_sabnzbd_watchdog
+            ok, out, _ = run_sidecar_job("sabnzbd_watchdog", "SABnzbd Watchdog", run_sabnzbd_watchdog)
+            if out and out != "(nominal - 0 SABnzbd failures)" and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] SABnzbd checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] SABnzbd watchdog execution error: {e}")
+        return
+
+    # Arr queue & import check: silent unless import issues found
+    if "arr_queue" in prompt or job_name in ("Arr Queue & Import Watchdog", "Arr Queue Watchdog"):
+        try:
+            from tools.sidecars import run_sidecar_job, run_arr_queue_watchdog
+            ok, out, _ = run_sidecar_job("arr_queue_watchdog", "Arr Queue Watchdog", run_arr_queue_watchdog)
+            if out and out != "(nominal - 0 import failures)" and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] Arr queue checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Arr queue watchdog execution error: {e}")
+        return
+
+    # Home Assistant integration & re-auth check: silent unless integrations fail
+    if "ha_reauth" in prompt or job_name in ("HA Integration & Re-Auth Watchdog", "HA Re-Auth Watchdog"):
+        try:
+            from tools.sidecars import run_sidecar_job, run_ha_reauth_watchdog
+            ok, out, _ = run_sidecar_job("ha_reauth_watchdog", "HA Re-Auth Watchdog", run_ha_reauth_watchdog)
+            if out and out != "(nominal - 0 HA integration failures)" and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] HA re-auth checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] HA re-auth watchdog execution error: {e}")
+        return
+
+    # Kometa post-run audit: silent unless critical issues found
+    if "kometa" in prompt or job_name in ("Kometa Post-Run Audit", "Kometa Audit"):
+        try:
+            from tools.sidecars import run_sidecar_job, run_kometa_audit
+            ok, out, _ = run_sidecar_job("kometa_audit", "Kometa Post-Run Audit", run_kometa_audit)
+            if out and out != "(nominal - Kometa run clean)" and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] Kometa audit checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Kometa audit execution error: {e}")
+        return
+
     # Option B Weekly Proactive Digest
     if "weekly_digest.py" in prompt or job_name in ("Option B Weekly Proactive Digest", "Weekly Proactive Digest"):
         try:
@@ -394,6 +469,40 @@ async def dispatch_scheduled_prompt(
                         await ch.send(chunk)
         except Exception as e:
             print(f"[Scheduler] Token report execution error: {e}")
+        return
+
+    # Market Sandbox Autonomous Daily Standup
+    if "market_standup.py" in prompt or job_name in ("Market Sandbox Autonomous Daily Standup", "Market Standup"):
+        try:
+            from tools.market_standup import dispatch_market_standup
+            res = dispatch_market_standup(dry_run=False)
+            print(f"[Scheduler] Market Sandbox standup dispatched: status={res.get('status')}")
+        except Exception as e:
+            print(f"[Scheduler] Market Sandbox standup dispatch error: {e}")
+        return
+
+    # AGORA Daily Steering Briefing
+    if "agora_steering.py" in prompt or job_name in ("AGORA Daily Steering Briefing", "AGORA Steering"):
+        try:
+            from tools.agora_steering import dispatch_agora_steering
+            res = dispatch_agora_steering(dry_run=False)
+            print(f"[Scheduler] AGORA steering briefing dispatched: status={res.get('status')}")
+        except Exception as e:
+            print(f"[Scheduler] AGORA steering briefing dispatch error: {e}")
+        return
+
+    # Monthly Hardcoded Rule & Regex Audit
+    if "code_audit" in prompt or "hardcode_regex_audit" in prompt or job_name in ("Monthly Hardcoded Rule & Regex Audit", "Hardcode Regex Audit"):
+        try:
+            from tools.sidecars import run_sidecar_job, run_hardcode_regex_audit
+            ok, rep, _ = run_sidecar_job("monthly_hardcode_regex_audit", "Monthly Hardcoded Rule & Regex Audit", run_hardcode_regex_audit)
+            if rep and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    for chunk in chunk_text(rep):
+                        await ch.send(chunk)
+        except Exception as e:
+            print(f"[Scheduler] Monthly hardcoded rule audit execution error: {e}")
         return
 
     if bot and turn_queue:
@@ -564,23 +673,30 @@ class KarakosScheduler:
                         with open(BEACON_FILE) as bf:
                             bdata = json.load(bf)
                         if bdata.get("state") == "PROCESSING":
-                            has_running_proc = (
-                                (br.active_proc is not None and br.active_proc.returncode is None) or
-                                (br.ext_active_proc is not None and br.ext_active_proc.returncode is None) or
-                                any(p is not None and getattr(p, "returncode", None) is None for p in getattr(br, "channel_active_procs", {}).values())
-                            )
+                            target_cid = bdata.get("channel_id") or TARGET_CHANNEL_ID
+                            target_proc = getattr(br, "channel_active_procs", {}).get(target_cid)
+                            if target_proc is None and target_cid == TARGET_CHANNEL_ID:
+                                target_proc = br.active_proc
+                            has_running_proc = target_proc is not None and getattr(target_proc, "returncode", None) is None
                             if not has_running_proc:
-                                # Stale beacon from before restart or completed turn: reset silently
+                                # Stale beacon from completed turn: reset silently
                                 update_beacon("IDLE", "")
                             else:
-                                silence = now_ts - bdata.get("ts", now_ts)
+                                beacon_ts = bdata.get("ts")
+                                if not isinstance(beacon_ts, (int, float)) or beacon_ts <= 0:
+                                    update_beacon("IDLE", "")
+                                    continue
+                                silence = now_ts - beacon_ts
+                                if silence < 0 or silence > 3600:
+                                    print(f"[WedgeCheck] Stale/invalid beacon timestamp (silence={silence:.0f}s). Resetting to IDLE.")
+                                    update_beacon("IDLE", "")
+                                    continue
                                 if silence > 420 and not bdata.get("alerted"):
-                                    print(f"[WedgeCheck] Agent silent for {silence:.0f}s during active turn!")
+                                    print(f"[WedgeCheck] Agent silent for {silence:.0f}s during active turn in channel {target_cid}!")
                                     bdata["alerted"] = True
                                     with open(BEACON_FILE, "w") as bf:
                                         json.dump(bdata, bf)
                                     if self.bot:
-                                        target_cid = bdata.get("channel_id") or TARGET_CHANNEL_ID
                                         ch = self.bot.get_channel(target_cid)
                                         if not ch:
                                             try:
@@ -588,7 +704,8 @@ class KarakosScheduler:
                                             except Exception:
                                                 ch = self.bot.get_channel(TARGET_CHANNEL_ID)
                                         if ch:
-                                            await ch.send(f"⚠️ **Wedge Alert:** Agent has been silent for >{int(silence/60)}m without output. Prompt: `{bdata.get('prompt')}`")
+                                            p_text = bdata.get('prompt') or '(empty)'
+                                            await ch.send(f"⚠️ **Wedge Alert:** Agent has been silent for >{int(silence/60)}m without output. Prompt: `{p_text}`")
                     except Exception:
                         pass
 

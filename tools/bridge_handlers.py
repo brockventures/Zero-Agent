@@ -406,32 +406,26 @@ async def run_channel_turn_worker(
 
             try:
                 async def _exec():
+                    kwargs = {
+                        "mode": turn_mode,
+                        "channel_id": channel_id,
+                        "author_name": author_name,
+                        "apply_presence_fn": presence_fn,
+                        "button_choice_fn": button_choice_fn,
+                        "quick_choice_view_cls": quick_choice_view_cls,
+                        "is_last_word": item.get("is_last_word", False),
+                        "last_word_bot_id": item.get("last_word_bot_id"),
+                        "last_word_bot_name": item.get("last_word_bot_name"),
+                        "last_word_streak": item.get("last_word_streak", 0),
+                    }
                     if reply_target and hasattr(reply_target, "channel") and hasattr(reply_target.channel, "typing"):
                         async with reply_target.channel.typing():
-                            await execute_agy_turn(
-                                prompt, status_msg, reply_target, attachments,
-                                mode=turn_mode, channel_id=channel_id, author_name=author_name,
-                                apply_presence_fn=presence_fn,
-                                button_choice_fn=button_choice_fn,
-                                quick_choice_view_cls=quick_choice_view_cls
-                            )
+                            await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
                     elif reply_target and hasattr(reply_target, "typing"):
                         async with reply_target.typing():
-                            await execute_agy_turn(
-                                prompt, status_msg, reply_target, attachments,
-                                mode=turn_mode, channel_id=channel_id, author_name=author_name,
-                                apply_presence_fn=presence_fn,
-                                button_choice_fn=button_choice_fn,
-                                quick_choice_view_cls=quick_choice_view_cls
-                            )
+                            await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
                     else:
-                        await execute_agy_turn(
-                            prompt, status_msg, reply_target, attachments,
-                            mode=turn_mode, channel_id=channel_id, author_name=author_name,
-                            apply_presence_fn=presence_fn,
-                            button_choice_fn=button_choice_fn,
-                            quick_choice_view_cls=quick_choice_view_cls
-                        )
+                        await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
 
                 # Priority Fast-Lane: Dedicated persistent channels (#zero-chat, #the-banana-stand, #lounge)
                 # run immediately without semaphore gating. Secondary background channels acquire semaphore.
@@ -784,6 +778,16 @@ async def handle_message(
 
         # 1. Loop prevention for peer bots (Amos, Marvin, etc.)
         if msg.author.bot:
+            # Check Last Word Protocol active cooldown or in-flight turn
+            try:
+                from tools.last_word_protocol import is_bot_paused, is_last_word_in_flight
+                paused, rem, rec = is_bot_paused(msg.channel.id, msg.author.id, author_name)
+                if paused or is_last_word_in_flight(msg.channel.id, str(msg.author.id)) or is_last_word_in_flight(msg.channel.id, author_name):
+                    print(f"[Bridge] Suppressed message from bot {author_name} ({msg.author.id}) in channel {msg.channel.id}: paused under Last Word Protocol ({rem:.0f}s remaining)")
+                    return
+            except Exception as pe:
+                print(f"[Bridge] Error checking bot cooldown: {pe}")
+
             if re.search(r"\b(staying silent|remaining silent|stay silent|no ask|nothing outstanding|standing by|room quiet|silence boundaries|no-op)\b", content, re.IGNORECASE):
                 print(f"[Bridge] Dropped bot status/silence narration message from {author_name} in channel {msg.channel.id}")
                 return
@@ -808,18 +812,17 @@ async def handle_message(
         is_robot_tagged = (
             "<@&1542294519914037341>" in content or
             "1542294519914037341" in role_ids or
-            re.search(r"(?:^|[\s,;])(?:hey\s+)?@?robot(?:\b|[!?:,])", content, re.IGNORECASE) is not None
+            re.search(r"(?:^|[\s,;])@robot\b", content, re.IGNORECASE) is not None or
+            re.search(r"^(?:hey\s+)?robot[:,\s]", content, re.IGNORECASE) is not None
         )
 
         if req_tag:
             bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
             tag_str = f"<@&{req_tag}>"
-            is_zero_named = bool(re.search(r"(?:^|[\s,;/])(?:hey\s+)?@?zero(?:\b|[!?:,/])", content, re.IGNORECASE))
             is_direct_bot_ping = (
                 (bot.user and bot.user in msg.mentions) or
                 f"<@{bot_id}>" in content or
                 f"<@!{bot_id}>" in content or
-                is_zero_named or
                 is_robot_tagged
             )
             if tag_str not in content and str(req_tag) not in role_ids and not is_direct_bot_ping:
@@ -932,6 +935,41 @@ async def handle_message(
             await msg.reply("🔄 Session reset for this channel.")
             return
 
+        # Operator command: pause / unpause responses to a bot in this channel
+        pause_match = re.search(
+            r"^(?:!pause|/pause|pause\s+responses?\s+to|pause\s+responding\s+to|pause)\s+([a-zA-Z0-9_-]+)(?:\s+(?:for\s+)?(\d+)\s*(?:m|min|mins|minutes)?)?$",
+            cleaned,
+            re.IGNORECASE
+        )
+        if pause_match:
+            target_bot = pause_match.group(1).strip()
+            mins = int(pause_match.group(2)) if pause_match.group(2) else int(rules.get("last_word_pause_minutes", 3))
+            from tools.last_word_protocol import pause_bot
+            rec = pause_bot(
+                channel_id=msg.channel.id,
+                bot_id=target_bot if target_bot.isdigit() else None,
+                bot_name=target_bot if not target_bot.isdigit() else None,
+                duration_seconds=mins * 60.0,
+                reason=f"Operator command from {author_name}"
+            )
+            await msg.reply(f"⏸️ Responses to **{rec.get('bot_name', target_bot)}** in <#{msg.channel.id}> paused for {mins} minutes (until {rec.get('pause_until_pt')}).")
+            return
+
+        unpause_match = re.search(
+            r"^(?:!unpause|/unpause|resume\s+responses?\s+to|resume\s+responding\s+to|unpause)\s+([a-zA-Z0-9_-]+)$",
+            cleaned,
+            re.IGNORECASE
+        )
+        if unpause_match:
+            target_bot = unpause_match.group(1).strip()
+            from tools.last_word_protocol import unpause_bot
+            removed = unpause_bot(msg.channel.id, target_bot)
+            if removed:
+                await msg.reply(f"▶️ Responses to **{target_bot}** in <#{msg.channel.id}> resumed.")
+            else:
+                await msg.reply(f"ℹ️ **{target_bot}** was not currently paused in <#{msg.channel.id}>.")
+            return
+
         if is_reload_intent(cleaned):
             if msg.author.id != OWNER_USER_ID:
                 await msg.reply("⚠️ Administrative bridge commands are restricted to the bot owner.")
@@ -959,13 +997,15 @@ async def handle_message(
             pass
         author_name = msg.author.display_name or msg.author.name
 
-        # Group Chat Mid-Turn Steering Check
-        if br.ext_active_proc is not None and br.ext_active_proc.returncode is None:
+        # Group Chat Mid-Turn Steering Check (Channel-scoped)
+        target_proc = channel_active_procs.get(msg.channel.id)
+        if target_proc is not None and target_proc.returncode is None:
+            steering_channels.add(msg.channel.id)
             br.is_ext_steering = True
             try:
-                br.ext_active_proc.send_signal(signal.SIGINT)
+                target_proc.send_signal(signal.SIGINT)
             except Exception as se:
-                print(f"[Bridge] Warning sending SIGINT for external group steering: {se}")
+                print(f"[Bridge] Warning sending SIGINT for external group steering in channel {msg.channel.id}: {se}")
 
             steer_prompt = (
                 f"[MID-TURN GROUP CONVERSATION UPDATE]\n"
@@ -989,6 +1029,26 @@ async def handle_message(
             })
             return
 
+        is_last_word = False
+        last_word_streak = 0
+        if msg.author.bot and rules.get("last_word_protocol_enabled", True):
+            lw_channels = rules.get("last_word_channels", [1534452820995080192])
+            if not lw_channels or msg.channel.id in lw_channels:
+                try:
+                    from tools.last_word_protocol import check_last_word_condition, build_last_word_prompt_injection, mark_last_word_in_flight
+                    lw_thresh = int(rules.get("last_word_threshold", 4))
+                    is_last_word, last_word_streak = check_last_word_condition(
+                        msg.channel.id, msg.author.id, author_name, threshold=lw_thresh
+                    )
+                    if is_last_word:
+                        lw_mins = int(rules.get("last_word_pause_minutes", 30))
+                        cleaned += build_last_word_prompt_injection(author_name, last_word_streak, lw_mins)
+                        mark_last_word_in_flight(msg.channel.id, str(msg.author.id))
+                        mark_last_word_in_flight(msg.channel.id, author_name)
+                        print(f"[Bridge] Last Word Protocol engaged for {author_name} in channel {msg.channel.id} (streak: {last_word_streak}, pause: {lw_mins}m)")
+                except Exception as lwe:
+                    print(f"[Bridge] Error checking Last Word Protocol condition: {lwe}")
+
         await ext_turn_queue.put({
             "prompt": cleaned,
             "status_msg": None,
@@ -997,7 +1057,11 @@ async def handle_message(
             "is_steer": False,
             "mode": "external",
             "channel_id": msg.channel.id,
-            "author_name": author_name
+            "author_name": author_name,
+            "is_last_word": is_last_word,
+            "last_word_bot_id": str(msg.author.id) if msg.author.bot else None,
+            "last_word_bot_name": author_name if msg.author.bot else None,
+            "last_word_streak": last_word_streak,
         })
         return
 
@@ -1019,6 +1083,55 @@ async def handle_message(
         clear_channel_session_id(msg.channel.id, "home")
         br.reset_session_keys.discard(sess_key)
         await msg.reply("🔄 Conversation session reset for this channel/thread. Your next message will start a fresh session.")
+        return
+
+    # Operator command: pause / unpause responses to a bot (default: #lounge)
+    pause_match = re.search(
+        r"^(?:!pause|/pause|pause\s+responses?\s+to|pause\s+responding\s+to|pause)\s+([a-zA-Z0-9_-]+)(?:\s+(?:for\s+)?(\d+)\s*(?:m|min|mins|minutes)?)?(?:\s+(?:in\s+)?(?:channel\s+)?([a-zA-Z0-9_-]+))?$",
+        content,
+        re.IGNORECASE
+    )
+    if pause_match:
+        target_bot = pause_match.group(1).strip()
+        mins = int(pause_match.group(2)) if pause_match.group(2) else int(get_runtime_rules().get("last_word_pause_minutes", 3))
+        target_ch_str = pause_match.group(3)
+        target_ch = 1534452820995080192  # Default to #lounge
+        if target_ch_str and target_ch_str.isdigit():
+            target_ch = int(target_ch_str)
+        elif target_ch_str and "banana" in target_ch_str.lower():
+            target_ch = 1534436119888793750
+
+        from tools.last_word_protocol import pause_bot
+        rec = pause_bot(
+            channel_id=target_ch,
+            bot_id=target_bot if target_bot.isdigit() else None,
+            bot_name=target_bot if not target_bot.isdigit() else None,
+            duration_seconds=mins * 60.0,
+            reason=f"Operator command from {author_name}"
+        )
+        await msg.reply(f"⏸️ Responses to **{rec.get('bot_name', target_bot)}** in <#{target_ch}> paused for {mins} minutes (until {rec.get('pause_until_pt')}).")
+        return
+
+    unpause_match = re.search(
+        r"^(?:!unpause|/unpause|resume\s+responses?\s+to|resume\s+responding\s+to|unpause)\s+([a-zA-Z0-9_-]+)(?:\s+(?:in\s+)?(?:channel\s+)?([a-zA-Z0-9_-]+))?$",
+        content,
+        re.IGNORECASE
+    )
+    if unpause_match:
+        target_bot = unpause_match.group(1).strip()
+        target_ch_str = unpause_match.group(2)
+        target_ch = 1534452820995080192
+        if target_ch_str and target_ch_str.isdigit():
+            target_ch = int(target_ch_str)
+        elif target_ch_str and "banana" in target_ch_str.lower():
+            target_ch = 1534436119888793750
+
+        from tools.last_word_protocol import unpause_bot
+        removed = unpause_bot(target_ch, target_bot)
+        if removed:
+            await msg.reply(f"▶️ Responses to **{target_bot}** in <#{target_ch}> resumed.")
+        else:
+            await msg.reply(f"ℹ️ **{target_bot}** was not currently paused in <#{target_ch}>.")
         return
 
     if is_reload_intent(content):

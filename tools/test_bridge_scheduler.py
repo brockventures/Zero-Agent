@@ -269,6 +269,41 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(scheduler._running)
 
 
+    async def test_prowlarr_watchdog_silent(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_queue = MagicMock()
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "(nominal - 0 Prowlarr failures)", None)) as mock_sidecar:
+            await bshed.dispatch_scheduled_prompt(
+                "Run the Prowlarr indexer health check using /workspace/tools/sidecars.py prowlarr.",
+                job_name="Prowlarr Indexer Health Watchdog",
+                bot=mock_bot,
+                turn_queue=mock_queue
+            )
+            mock_sidecar.assert_called_once()
+            # Must NOT queue an LLM turn or create status message
+            mock_queue.put.assert_not_called()
+
+    async def test_prowlarr_watchdog_alert(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_bot.fetch_channel = AsyncMock(return_value=mock_channel)
+        mock_queue = MagicMock()
+        with patch("tools.sidecars.run_sidecar_job", return_value=(False, "⚠️ 1 indexer failing", None)) as mock_sidecar:
+            await bshed.dispatch_scheduled_prompt(
+                "Run the Prowlarr indexer health check using /workspace/tools/sidecars.py prowlarr.",
+                job_name="Prowlarr Indexer Health Watchdog",
+                channel_id=12345,
+                bot=mock_bot,
+                turn_queue=mock_queue
+            )
+            mock_sidecar.assert_called_once()
+            mock_channel.send.assert_awaited_once_with("⚠️ 1 indexer failing")
+            mock_queue.put.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
 

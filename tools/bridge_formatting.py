@@ -183,7 +183,8 @@ def format_for_discord(text: str) -> str:
 
 def sanitize_reaction_gifs(text: str) -> str:
     """Probe Tenor and Giphy links in Discord output. If a reaction GIF returns HTTP 404,
-    replace it with a live dynamic GIF or strip the line so Discord never renders broken previews."""
+    replace it with a live dynamic GIF or strip the line so Discord never renders broken previews.
+    Also ensures all bare GIF URLs are formatted as properly titled markdown hyperlinks."""
     if not text or ("tenor.com/view/" not in text and "giphy.com/gifs/" not in text):
         return text
 
@@ -208,10 +209,23 @@ def sanitize_reaction_gifs(text: str) -> str:
                 fallback = get_contextual_gif("shrug")
                 if fallback and fallback.get("url"):
                     text = text.replace(url, fallback["url"])
+                    url = fallback["url"]
                 else:
                     text = re.sub(rf"(?:^|\n)[^\n]*{re.escape(url)}[^\n]*(?:\n|$)", "\n", text)
+                    continue
             except Exception:
                 text = re.sub(rf"(?:^|\n)[^\n]*{re.escape(url)}[^\n]*(?:\n|$)", "\n", text)
+                continue
+
+        # Format bare GIF URL as properly titled markdown hyperlink if not already linked
+        try:
+            from tools.gif_tool import clean_slug_title
+            slug = url.split("/")[-1]
+            title = clean_slug_title(slug)
+            pattern = rf"(^|[^]\(\<\[]){re.escape(url)}"
+            text = re.sub(pattern, rf"\1[{title}]({url})", text)
+        except Exception:
+            pass
 
     return text
 
@@ -296,11 +310,11 @@ def extract_agent_response(raw_text: str) -> str:
             except Exception:
                 pass
 
-    clean_accumulated = "".join(accumulated_content).strip()
+    raw_acc = "".join(accumulated_content).strip()
+    is_explicit_silence = raw_acc.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none")
+    clean_accumulated = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", raw_acc, flags=re.IGNORECASE).strip()
     if clean_accumulated.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
         clean_accumulated = ""
-    else:
-        clean_accumulated = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", clean_accumulated, flags=re.IGNORECASE).strip()
 
     if not clean_accumulated and last_substantive_response:
         clean_accumulated = last_substantive_response
@@ -309,15 +323,20 @@ def extract_agent_response(raw_text: str) -> str:
         return format_for_discord(clean_accumulated)
 
     if final_result_response:
-        frr = final_result_response.strip()
+        frr_raw = final_result_response.strip()
+        frr_silence = frr_raw.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none")
+        frr = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", frr_raw, flags=re.IGNORECASE).strip()
         if frr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
             frr = ""
-        else:
-            frr = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", frr, flags=re.IGNORECASE).strip()
         if frr:
             return format_for_discord(frr)
         if last_substantive_response:
             return format_for_discord(last_substantive_response)
+        if frr_silence:
+            return "[NO_REPLY]"
+
+    if is_explicit_silence:
+        return "[NO_REPLY]"
 
     if error_response:
         return format_for_discord(error_response)

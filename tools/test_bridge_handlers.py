@@ -229,9 +229,13 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         # Actual addressees should count as True
         self.assertTrue(is_explicitly_addressed_to_other("@amos can you check this?"))
         self.assertTrue(is_explicitly_addressed_to_other("<@1468012353206354197> your turn"))
+        self.assertTrue(is_explicitly_addressed_to_other("<@1542035925603713086> status?"))
+        self.assertTrue(is_explicitly_addressed_to_other("Aerial: what do you think?"))
+        self.assertTrue(is_explicitly_addressed_to_other("Hey Aerial, did you see this?"))
         self.assertTrue(is_explicitly_addressed_to_other("Amos: what do you think?"))
         self.assertTrue(is_explicitly_addressed_to_other("Hey Marvin, thoughts?"))
         self.assertTrue(is_explicitly_addressed_to_other("Marvin check this out"))
+        self.assertTrue(is_explicitly_addressed_to_other("Alex check this out"))
 
     async def test_home_turf_channel_routing_without_mention(self):
         """Verify that channels in DEFAULT_HOME_CHANNELS (e.g. steam-deck) are routed to home_turn_queue without @Zero."""
@@ -420,15 +424,15 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
             mock_exec.assert_awaited_once()
             self.assertEqual(mock_exec.call_args[0][1], mock_placeholder)
 
-    async def test_channel_tag_requirements_plain_text_name_mention(self):
-        """Verify that mentioning 'Zero' in plain text passes channel-specific tag gating (e.g. in #lounge)."""
+    async def test_channel_tag_requirements_plain_text_name_ignored(self):
+        """Verify that mentioning 'Zero' in plain text is ignored under channel-specific tag gating (e.g. in #lounge)."""
         mock_bot = MagicMock()
         mock_bot.user.id = 1542285964213358633
 
         lounge_id = 1534452820995080192
         now = time.time()
 
-        # 1. Plain text mention of "Zero" in #lounge -> should be accepted
+        # 1. Plain text mention of "Zero" in #lounge without role tag -> should be ignored
         msg_named = MagicMock()
         msg_named.id = 100001
         msg_named.channel.id = lounge_id
@@ -449,13 +453,32 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         }
         with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
             await bh.handle_message(msg_named, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
-            turn_queue.put.assert_awaited_once()
-            call_args = turn_queue.put.call_args[0][0]
-            self.assertEqual(call_args["prompt"], "what do you think of this?")
+            turn_queue.put.assert_not_awaited()
 
-        # 2. Unaddressed message without "Zero" or role tag in #lounge -> should be ignored
+        # 2. Tagged with required role -> should be accepted
+        msg_tagged = MagicMock()
+        msg_tagged.id = 100002
+        msg_tagged.channel.id = lounge_id
+        msg_tagged.channel.name = "lounge"
+        msg_tagged.author.id = 1210466877294518272
+        msg_tagged.author.bot = False
+        msg_tagged.author.display_name = "Ryan"
+        msg_tagged.content = "<@&1543285916506783799> what do you think of this?"
+        msg_tagged.created_at.timestamp.return_value = now
+        role_mock = MagicMock()
+        role_mock.id = 1543285916506783799
+        msg_tagged.role_mentions = [role_mock]
+        msg_tagged.mentions = []
+        msg_tagged.reference = None
+
+        turn_queue_tagged = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
+            await bh.handle_message(msg_tagged, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue_tagged)
+            turn_queue_tagged.put.assert_awaited_once()
+
+        # 3. Unaddressed message without "Zero" or role tag in #lounge -> should be ignored
         msg_unaddressed = MagicMock()
-        msg_unaddressed.id = 100002
+        msg_unaddressed.id = 100003
         msg_unaddressed.channel.id = lounge_id
         msg_unaddressed.channel.name = "lounge"
         msg_unaddressed.author.id = 1210466877294518272
@@ -471,6 +494,44 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
             await bh.handle_message(msg_unaddressed, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue_ignored)
             turn_queue_ignored.put.assert_not_awaited()
+
+        # 4. Casual sentence containing noun "robot" in #lounge -> should be ignored
+        msg_casual_robot = MagicMock()
+        msg_casual_robot.id = 100004
+        msg_casual_robot.channel.id = lounge_id
+        msg_casual_robot.channel.name = "lounge"
+        msg_casual_robot.author.id = 1210466877294518272
+        msg_casual_robot.author.bot = False
+        msg_casual_robot.author.display_name = "Ryan"
+        msg_casual_robot.content = "I don't know if either robot really knows what is going on."
+        msg_casual_robot.created_at.timestamp.return_value = now
+        msg_casual_robot.role_mentions = []
+        msg_casual_robot.mentions = []
+        msg_casual_robot.reference = None
+
+        turn_queue_casual = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
+            await bh.handle_message(msg_casual_robot, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue_casual)
+            turn_queue_casual.put.assert_not_awaited()
+
+        # 5. Explicit @robot tag in #lounge -> should be accepted
+        msg_explicit_robot = MagicMock()
+        msg_explicit_robot.id = 100005
+        msg_explicit_robot.channel.id = lounge_id
+        msg_explicit_robot.channel.name = "lounge"
+        msg_explicit_robot.author.id = 1210466877294518272
+        msg_explicit_robot.author.bot = False
+        msg_explicit_robot.author.display_name = "Ryan"
+        msg_explicit_robot.content = "@robot what is the latest status?"
+        msg_explicit_robot.created_at.timestamp.return_value = now
+        msg_explicit_robot.role_mentions = []
+        msg_explicit_robot.mentions = []
+        msg_explicit_robot.reference = None
+
+        turn_queue_explicit = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
+            await bh.handle_message(msg_explicit_robot, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue_explicit)
+            turn_queue_explicit.put.assert_awaited_once()
 
 
 if __name__ == "__main__":
