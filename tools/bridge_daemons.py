@@ -43,6 +43,8 @@ from tools.bridge_formatting import (
     format_command_preview,
     format_for_discord,
     extract_agent_response,
+    harvest_transcript_response,
+    AgyStreamParser,
     chunk_text,
     scrub_credentials,
     clean_discord_latex,
@@ -87,303 +89,12 @@ def is_persistent_daemons_enabled() -> bool:
     rules = get_runtime_rules()
     return bool(rules.get("persistent_daemons_enabled", True))
 
-
-def prepare_turn_prompt(
-    prompt: str,
-    mode: str,
-    channel_id: int,
-    sess_key: str,
-    author_name: str = "",
-    reply_target: discord.Message | discord.TextChannel | discord.Thread | None = None,
-    eng_carry_block: str = "",
-) -> str:
-    """Format prompt with time context, gif cadence guidance, channel context, and air-gapped system prompts."""
-    now_utc = datetime.now(timezone.utc)
-    now_pt = now_utc.astimezone(PT_TZ)
-    gif_guidance = get_gif_prompt_guidance(sess_key)
-
-    if mode == "home":
-        time_guidance = (
-            f"[System Time & Timezone]: Current time is {now_pt.strftime('%A, %b %d, %Y %I:%M %p PT')} (America/Los_Angeles).\n"
-            f"• Note: System VM clock and runtime metadata are UTC ({now_utc.strftime('%H:%M:%S UTC')}).\n"
-            f"• Rule: ALWAYS use Pacific Time (PT). Never quote raw UTC timestamps or assume raw UTC is local time."
-        )
-        return f"{time_guidance}\n\n{gif_guidance}\n\n{prompt}"
-
-    # External mode (Crab Cavern & multi-agent shared channels)
-    channel_ctx_block = ""
-    try:
-        from tools.channel_history import format_channel_context
-        target_msg_id = getattr(reply_target, "id", None)
-        parent_cid = getattr(reply_target, "parent_id", None) if reply_target else None
-        ch_ctx = format_channel_context(channel_id, limit=15, exclude_msg_id=target_msg_id, parent_channel_id=parent_cid)
-        if ch_ctx:
-            channel_ctx_block = f"\n{ch_ctx}\n\n"
-    except Exception as ce:
-        print(f"[BridgeDaemon] Warning formatting channel context: {ce}")
-
-    manifest_block = ""
-    try:
-        from tools.session_summarizer import get_architecture_manifest
-        manifest_block = get_architecture_manifest()
-    except Exception as me:
-        print(f"[BridgeDaemon] Warning generating architecture manifest: {me}")
-
-    author_tag = f" from {author_name}" if author_name else ""
-    time_block = (
-        f"[System Time & Timezone]: Current time is {now_pt.strftime('%A, %b %d, %Y %I:%M %p PT')} (America/Los_Angeles).\n"
-        f"• Note: System VM clock and runtime metadata are UTC ({now_utc.strftime('%H:%M:%S UTC')}).\n"
-        f"• Rule: ALWAYS use Pacific Time (PT). Ryan Brock, the team, and all Crab Cavern operations are on Pacific Time.\n"
-        f"• Never quote raw UTC timestamps or assume raw UTC is local time (e.g. 04:00 UTC = 9:00 PM PT previous day during PDT)."
-    )
-
-    rules = get_runtime_rules()
-    tmpl = rules.get("external_system_prompt")
-    if tmpl:
-        try:
-            ext_prompt = (
-                tmpl.replace("{channel_context}", channel_ctx_block)
-                .replace("{author_tag}", author_tag)
-                .replace("{prompt}", prompt)
-                .replace("{architecture_manifest}", manifest_block)
-                .replace("{engineering_carryforward}", eng_carry_block)
-                .replace("{time_context}", time_block)
-                .replace("{gif_guidance}", gif_guidance)
-            )
-            if "{time_context}" not in tmpl and time_block not in ext_prompt:
-                ext_prompt = f"{time_block}\n\n{ext_prompt}"
-            if "{gif_guidance}" not in tmpl and "[GIF Cadence Tracker" not in ext_prompt:
-                ext_prompt = f"{gif_guidance}\n\n{ext_prompt}"
-            return ext_prompt
-        except Exception:
-            return f"{time_block}\n\n{gif_guidance}\n\n{manifest_block}\n\n{channel_ctx_block}[INBOUND MESSAGE{author_tag}]: {prompt}"
-    else:
-        return (
-            "[CRAB CAVERN MULTI-AGENT COLLABORATION ENVIRONMENT]\n"
-            "You are Zero, an autonomous systems engineering co-pilot collaborating with peer AI agents (Amos, Marvin) and developers in Crab Cavern.\n\n"
-            f"{channel_ctx_block}"
-            f"{time_block}\n\n"
-            f"{gif_guidance}\n\n"
-            f"[INBOUND MESSAGE{author_tag}]: {prompt}"
-        )
-
-
-async def deliver_turn_output(
-    output_text: str,
-    status_msg: discord.Message | None,
-    reply_target: discord.Message | discord.TextChannel | discord.Thread,
-    mode: str,
-    channel_id: int,
-    conv_id: str | None,
-    turn_start_time: float,
-    button_choice_fn=None,
-    quick_choice_view_cls=None,
-    delivery_target: discord.Message | discord.TextChannel | discord.Thread | None = None,
-    escalated_to_thread: bool = False,
-    notify_root_channel=None,
-    thread_jump_url: str | None = None,
-    is_last_word: bool = False,
-    last_word_bot_id: str | None = None,
-    last_word_bot_name: str | None = None,
-    last_word_streak: int = 0,
-):
-    """Unified Discord response delivery engine across persistent daemons and dynamic turns."""
-    from tools.bridge_runner import find_new_artifacts
-
-    final_text = clean_discord_latex(output_text or "*(No output from agent)*")
-
-    if mode == "external":
-        clean_ext_text = re.sub(r"\[CHOICES:\s*[^\]]+\]", "", final_text).strip()
-        clean_ext_text = scrub_credentials(clean_ext_text)
-        clean_ext_text = clean_discord_latex(clean_ext_text)
-
-        if clean_ext_text in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP", "*(No output from agent)*") or not clean_ext_text:
-            if is_last_word and (last_word_bot_id or last_word_bot_name):
-                try:
-                    from tools.last_word_protocol import pause_bot
-                    rules = get_runtime_rules()
-                    pause_sec = float(rules.get("last_word_pause_minutes", 3)) * 60.0
-                    pause_bot(
-                        channel_id=channel_id,
-                        bot_id=last_word_bot_id,
-                        bot_name=last_word_bot_name,
-                        duration_seconds=pause_sec,
-                        reason=f"Last Word Protocol triggered after {last_word_streak} uninterrupted messages"
-                    )
-                except Exception as lwe:
-                    print(f"[BridgeDaemon] Error setting Last Word pause on NO_REPLY: {lwe}")
-            if status_msg:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-            print(f"[BridgeDaemon] Suppressed empty, [NO_REPLY], or placeholder in external channel {channel_id}")
-            return
-
-        try:
-            from tools.channel_history import record_message
-            ch_name = getattr(reply_target.channel, 'name', '') if (reply_target and hasattr(reply_target, 'channel')) else ''
-            record_message(channel_id, ch_name, "Zero", is_bot=True, content=clean_ext_text)
-        except Exception as re_err:
-            print(f"[BridgeDaemon] Error recording Zero reply to channel history: {re_err}")
-
-        chunks = chunk_text(clean_ext_text, 1900)
-        if not chunks or (len(chunks) == 1 and chunks[0] == "*(No output from agent)*"):
-            if status_msg:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-            print(f"[BridgeDaemon] Suppressed empty chunks in external channel {channel_id}")
-            return
-
-        target_dest = delivery_target if delivery_target else reply_target
-        try:
-            if status_msg:
-                await status_msg.edit(content=chunks[0])
-            else:
-                await target_dest.reply(chunks[0])
-        except Exception:
-            await target_dest.reply(chunks[0])
-
-        for ch in chunks[1:]:
-            try:
-                await target_dest.reply(ch)
-            except Exception:
-                await target_dest.channel.send(ch)
-
-        # Trigger Last Word Protocol cooldown once response is delivered
-        if is_last_word and (last_word_bot_id or last_word_bot_name):
-            try:
-                from tools.last_word_protocol import pause_bot
-                rules = get_runtime_rules()
-                pause_sec = float(rules.get("last_word_pause_minutes", 3)) * 60.0
-                pause_bot(
-                    channel_id=channel_id,
-                    bot_id=last_word_bot_id,
-                    bot_name=last_word_bot_name,
-                    duration_seconds=pause_sec,
-                    reason=f"Last Word Protocol triggered after {last_word_streak} uninterrupted messages"
-                )
-                print(f"[BridgeDaemon] Last Word Protocol: paused responses to {last_word_bot_name} ({last_word_bot_id}) in channel {channel_id} for {pause_sec/60:.0f}m.")
-            except Exception as lwe:
-                print(f"[BridgeDaemon] Error triggering Last Word Protocol pause: {lwe}")
-
-        ext_sess_key = str(channel_id)
-        if has_reaction_gif(clean_ext_text):
-            reset_gif_turn(ext_sess_key)
-            print(f"[BridgeDaemon] 🎬 Reaction GIF detected in reply for channel {ext_sess_key}. Reset turns_since_gif to 0.")
-        else:
-            new_c = increment_gif_turn(ext_sess_key)
-            print(f"[BridgeDaemon] 📊 No GIF in reply for channel {ext_sess_key}. turns_since_gif incremented to {new_c}.")
-        return
-
-    # In Home Turf, silence tags are invalid - flag as incomplete turn so Ryan is never ghosted
-    if final_text.strip() in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP", "reply:none", "reply: none"):
-        final_text = "⚠️ **Turn Incomplete:** Received unexpected silent reply tag in home turf pairing mode."
-
-    # Parse [CHOICES: ...] interactive buttons
-    choice_view = None
-    matches = list(re.finditer(r"\[CHOICES:\s*([^\]]+)\]", final_text))
-    valid_match = None
-    parsed_choices = []
-    for m in reversed(matches):
-        raw_choices = m.group(1).strip()
-        delim = "|" if "|" in raw_choices else ","
-        choices = [c.strip() for c in raw_choices.split(delim) if c.strip()]
-        if choices and not all(c in ("...", "…", "Option 1", "Option 2", "Option 3") for c in choices):
-            valid_match = m
-            parsed_choices = choices
-            break
-
-    if valid_match and parsed_choices and quick_choice_view_cls and button_choice_fn:
-        final_text = re.sub(r"\[CHOICES:\s*([^\]]+)\]", "", final_text).strip()
-        choice_view = quick_choice_view_cls(parsed_choices, button_choice_fn)
-
-    sync_credentials()
-
-    home_sess_key = "home" if int(channel_id) == TARGET_CHANNEL_ID else str(channel_id)
-    if has_reaction_gif(final_text):
-        reset_gif_turn(home_sess_key)
-        print(f"[BridgeDaemon] 🎬 Reaction GIF detected in reply for channel {home_sess_key}. Reset turns_since_gif to 0.")
-    else:
-        new_c = increment_gif_turn(home_sess_key)
-        print(f"[BridgeDaemon] 📊 No GIF in reply for channel {home_sess_key}. turns_since_gif incremented to {new_c}.")
-
-    # Look for new artifacts generated during this turn
-    active_cid = get_channel_session_id(channel_id, mode) or conv_id
-    new_artifacts = find_new_artifacts(turn_start_time, conv_id=active_cid)
-    artifact_files = []
-    for art in new_artifacts:
-        try:
-            artifact_files.append(discord.File(str(art), filename=art.name))
-        except Exception as e:
-            print(f"[BridgeDaemon] Failed to attach artifact {art}: {e}")
-
-    chunks = chunk_text(final_text, 1900)
-    target_dest = delivery_target if delivery_target else reply_target
-    dest_cid = getattr(getattr(target_dest, "channel", None), "id", None) or getattr(target_dest, "id", None) or channel_id
-    is_banana_stand = (int(dest_cid) == BANANA_STAND_CHANNEL_ID) if str(dest_cid).isdigit() else False
-    held_turn_banana = False
-
-    if is_banana_stand:
-        try:
-            from tools.banana import claim
-            claim(subject="zero-external-turn")
-            held_turn_banana = True
-        except Exception as be:
-            print(f"[BridgeDaemon] Banana claim notice for the-banana-stand turn: {be}")
-
-    try:
-        if chunks:
-            if status_msg:
-                try:
-                    await status_msg.edit(content=chunks[0], view=choice_view if len(chunks) == 1 else None)
-                except Exception:
-                    if hasattr(target_dest, "reply"):
-                        await target_dest.reply(chunks[0], view=choice_view if len(chunks) == 1 else None)
-                    else:
-                        await target_dest.send(chunks[0], view=choice_view if len(chunks) == 1 else None)
-            else:
-                if hasattr(target_dest, "reply"):
-                    await target_dest.reply(chunks[0], view=choice_view if len(chunks) == 1 else None)
-                else:
-                    await target_dest.send(chunks[0], view=choice_view if len(chunks) == 1 else None)
-
-            if len(chunks) > 1:
-                for ch in chunks[1:-1]:
-                    if hasattr(target_dest, "reply"):
-                        await target_dest.reply(ch)
-                    else:
-                        await target_dest.send(ch)
-
-                if hasattr(target_dest, "reply"):
-                    await target_dest.reply(chunks[-1], view=choice_view)
-                else:
-                    await target_dest.send(chunks[-1], view=choice_view)
-
-        if artifact_files:
-            try:
-                if hasattr(target_dest, "reply"):
-                    await target_dest.reply(content="📎 **Artifact(s) generated during this turn:**", files=artifact_files)
-                else:
-                    await target_dest.send(content="📎 **Artifact(s) generated during this turn:**", files=artifact_files)
-            except Exception:
-                pass
-    finally:
-        if held_turn_banana:
-            try:
-                from tools.banana import release
-                release()
-            except Exception as err:
-                print(f"[BridgeDaemon] Banana release warning for external turn: {err}")
-
-    if escalated_to_thread and notify_root_channel and thread_jump_url:
-        try:
-            await notify_root_channel.send(f"✅ **Task Completed in Thread:** [View Full Results in Thread]({thread_jump_url})")
-        except Exception as ne:
-            print(f"[BridgeDaemon] Warning posting thread completion notice: {ne}")
-
+from tools.bridge_pipeline import (
+    TurnTimer,
+    prepare_turn_prompt,
+    deliver_turn_output,
+    find_new_artifacts,
+)
 
 class PersistentChannelWorker:
     """A dedicated, 24/7 warm agy CLI instance bound to a specific Discord channel."""
@@ -516,6 +227,7 @@ class PersistentChannelWorker:
         last_word_bot_id: str | None = None,
         last_word_bot_name: str | None = None,
         last_word_streak: int = 0,
+        queued_at: float | None = None,
     ):
         """Execute a conversational turn on the persistent warm worker via stdin/stdout streaming."""
         from tools.bridge_runner import (
@@ -525,8 +237,15 @@ class PersistentChannelWorker:
         )
         import tools.bridge_runner as br
 
+        timer = TurnTimer(
+            channel_id=self.channel_id,
+            channel_name=self.name,
+            queued_at=queued_at,
+        )
+
         async with self.lock:
             # 1. Compaction / Reset Check
+            timer.mark_compaction_start()
             current_turns = increment_session_turn(self.sess_key)
             should_compact, compact_reason = check_compaction_needed(self.conv_id, current_turns)
             eng_carry_block = ""
@@ -556,19 +275,33 @@ class PersistentChannelWorker:
                             eng_ctx = get_engineering_carryforward_context(sess_key=self.sess_key)
                             if eng_ctx:
                                 eng_carry_block = f"\n[PREVIOUS SESSION ENGINEERING DELTA]:\n{eng_ctx}\n\n"
-                                print(f"[BridgeDaemon] 🔄 Auto-compacted external worker #{self.name} ({compact_reason or 'manual reset'}).")
                         except Exception as ce:
                             print(f"[BridgeDaemon] Error generating external carry-forward context: {ce}")
+            timer.mark_compaction_end()
 
-            # Option B: Pre-turn Tool Output Scrubbing hook
-            if self.conv_id:
-                try:
-                    from tools.transcript_scrubber import scrub_transcript_tool_outputs
-                    scrub_transcript_tool_outputs(self.conv_id)
-                except Exception as se:
-                    print(f"[BridgeDaemon] Warning scrubbing transcript for {self.conv_id}: {se}")
+            # Ingest any pending carry-forward summaries from overnight rollover if not already injected
+            if "[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:" not in prompt and "[PREVIOUS SESSION ENGINEERING DELTA]:" not in prompt:
+                if self.mode == "home":
+                    try:
+                        from tools.session_summarizer import get_carryforward_context
+                        carry_ctx = get_carryforward_context(sess_key=self.sess_key)
+                        if carry_ctx:
+                            prompt = f"[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\n{carry_ctx}\n\n[CURRENT USER PROMPT]: {prompt}"
+                            print(f"[BridgeDaemon] 📥 Injected pending carry-forward context for #{self.name} from overnight rollover.")
+                    except Exception as e:
+                        print(f"[BridgeDaemon] Error checking pending carry-forward context: {e}")
+                else:
+                    try:
+                        from tools.session_summarizer import get_engineering_carryforward_context
+                        eng_ctx = get_engineering_carryforward_context(sess_key=self.sess_key)
+                        if eng_ctx:
+                            eng_carry_block = f"\n[PREVIOUS SESSION ENGINEERING DELTA]:\n{eng_ctx}\n\n"
+                            print(f"[BridgeDaemon] 📥 Injected pending engineering carry-forward delta for #{self.name} from overnight rollover.")
+                    except Exception as ce:
+                        print(f"[BridgeDaemon] Error checking pending engineering carry-forward context: {ce}")
 
             # 2. Ensure worker is running & responsive
+            timer.mark_boot_start()
             if not self.is_ready or self.proc is None or self.proc.returncode is not None:
                 await self.start()
 
@@ -583,8 +316,10 @@ class PersistentChannelWorker:
                             print(f"[BridgeDaemon] 🧹 Drained {discarded_len} residual bytes from #{self.name} stdout buffer.")
                 except Exception as de:
                     print(f"[BridgeDaemon] Warning draining residual stdout buffer: {de}")
+            timer.mark_boot_end()
 
             # 3. Format Prompt
+            timer.mark_ctx_start()
             prepared_prompt = prepare_turn_prompt(
                 prompt=prompt,
                 mode=self.mode,
@@ -594,6 +329,7 @@ class PersistentChannelWorker:
                 reply_target=reply_target,
                 eng_carry_block=eng_carry_block,
             )
+            timer.mark_ctx_end()
 
             # 4. Set global process hooks for mid-turn steering and presence
             channel_active_procs[self.channel_id] = self.proc
@@ -620,12 +356,16 @@ class PersistentChannelWorker:
             turn_start_time = time.time()
             last_status_edit = time.time()
             last_beacon_touch = time.time()
+            last_activity_time = time.time()
+            last_probe_time = time.time()
             current_action = "Processing..."
             output_response = None
+            wedged_diagnostic = None
 
             # Thread Escalation State (#zero-chat root only)
             rules = get_runtime_rules()
             watchdog_timeout = float(rules.get("turn_watchdog_seconds", 300.0))
+            max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 1800.0))
             escalation_seconds = float(rules.get("auto_thread_escalation_seconds", 180.0))
             escalation_enabled = rules.get("auto_thread_escalation_enabled", True)
             escalated_to_thread = False
@@ -647,10 +387,13 @@ class PersistentChannelWorker:
             try:
                 # 5. Send NDJSON user message on stdin
                 payload = {"event": "user", "message": {"content": prepared_prompt}}
+                timer.mark_send()
                 self.proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
                 await self.proc.stdin.drain()
 
                 # 6. Stream events from stdout
+                stream_parser = AgyStreamParser(conv_id=self.conv_id)
+                output_response = ""
                 while True:
                     now = time.time()
                     if (
@@ -678,18 +421,64 @@ class PersistentChannelWorker:
                         except Exception as te:
                             print(f"[BridgeDaemon] Warning escalating turn to thread: {te}")
 
-                    try:
-                        line_bytes = await asyncio.wait_for(
-                            self.proc.stdout.readline(), timeout=watchdog_timeout
-                        )
-                    except asyncio.TimeoutError:
-                        print(
-                            f"[BridgeDaemon] ⚠️ Watchdog timeout: #{self.name} worker exceeded {watchdog_timeout}s without output. Recycling worker..."
-                        )
-                        await self.recycle()
-                        raise TimeoutError(
-                            f"Turn watchdog timeout ({watchdog_timeout}s) exceeded in #{self.name}"
-                        )
+                    line_bytes = None
+                    while line_bytes is None:
+                        try:
+                            line_bytes = await asyncio.wait_for(
+                                self.proc.stdout.readline(), timeout=5.0
+                            )
+                            last_activity_time = time.time()
+                        except asyncio.TimeoutError:
+                            now_wait = time.time()
+                            silence_dur = now_wait - last_activity_time
+
+                            # Check for wedged interactive subprocess at >= 45s of silence
+                            if silence_dur >= 45.0 and (now_wait - last_probe_time) >= 10.0 and self.proc and self.proc.pid:
+                                last_probe_time = now_wait
+                                try:
+                                    from tools.process_probe import diagnose_process_tree
+                                    diag = diagnose_process_tree(self.proc.pid)
+                                    if diag.get("is_interactive_stdin"):
+                                        print(
+                                            f"[BridgeDaemon] 🚨 Wedged interactive subprocess detected for #{self.name} "
+                                            f"(PID {self.proc.pid}): {diag['summary']}. Aborting turn early..."
+                                        )
+                                        wedged_diagnostic = diag
+                                        culprit = diag.get("culprit") or {}
+                                        c_name = culprit.get("name") or culprit.get("cmdline") or f"PID {self.proc.pid}"
+                                        c_wchan = culprit.get("wchan") or "unknown"
+                                        c_pid = culprit.get("pid") or self.proc.pid
+                                        output_response = (
+                                            f"⚠️ **Subprocess Wedged on Interactive Input:**\n\n"
+                                            f"{diag['summary']}\n\n"
+                                            f"• **Culprit:** `{c_name}` (PID {c_pid})\n"
+                                            f"• **Kernel Wait Channel:** `{c_wchan}`\n"
+                                            f"• **Diagnostic:** A tool spawned an interactive command without automated flags. Subprocess was terminated after {int(now_wait - turn_start_time)}s of silence to prevent an indefinite hang."
+                                        )
+                                        await self.recycle()
+                                        break
+                                except Exception as pe:
+                                    print(f"[BridgeDaemon] Error probing process tree: {pe}")
+
+                            # Activity-based watchdog check:
+                            # 1. Idle silence timeout (no output/tool events for watchdog_timeout seconds)
+                            # 2. Hard absolute ceiling (max_turn_ceiling) to catch indefinite loops
+                            if silence_dur >= watchdog_timeout or (now_wait - turn_start_time) >= max_turn_ceiling:
+                                reason = (
+                                    f"silence/inactivity limit of {int(watchdog_timeout)}s"
+                                    if silence_dur >= watchdog_timeout
+                                    else f"hard ceiling of {int(max_turn_ceiling)}s"
+                                )
+                                print(
+                                    f"[BridgeDaemon] ⚠️ Watchdog timeout: #{self.name} worker exceeded {reason}. Recycling worker..."
+                                )
+                                await self.recycle()
+                                raise TimeoutError(
+                                    f"Turn watchdog timeout ({reason}) exceeded in #{self.name}"
+                                )
+
+                    if wedged_diagnostic is not None:
+                        break
 
                     if not line_bytes:
                         print(f"[BridgeDaemon] ⚠️ Persistent worker for #{self.name} exited unexpectedly.")
@@ -705,12 +494,14 @@ class PersistentChannelWorker:
                     if line_s.startswith("{") and line_s.endswith("}"):
                         try:
                             ev = json.loads(line_s)
+                            stream_parser.process_event(ev)
                             ev_name = ev.get("event")
                             if ev_name == "step_update":
                                 step = ev.get("step_update", {})
                                 stype = step.get("step_type")
                                 tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
                                 if stype == "tool" and tname:
+                                    timer.mark_event(tool_name=tname)
                                     tinfo = step.get("tool_info", {})
                                     params = tinfo.get("parameters", {})
                                     if tname == "run_command" and "CommandLine" in params:
@@ -730,10 +521,14 @@ class PersistentChannelWorker:
                                         current_action = f"Calling tool: {tname}..."
                                 elif stype == "agent_response":
                                     if step.get("text_delta"):
+                                        timer.mark_event(is_token=True)
                                         current_action = "Drafting response..."
                             elif ev_name == "result":
+                                timer.mark_result()
                                 res_data = ev.get("result", {})
-                                output_response = res_data.get("response", "")
+                                output_response = stream_parser.get_final_response(
+                                    fallback_result=res_data.get("response", "")
+                                )
                                 res_cid = res_data.get("conversation_id")
                                 if res_cid:
                                     if escalated_to_thread and thread and hasattr(thread, "id"):
@@ -770,6 +565,7 @@ class PersistentChannelWorker:
                         last_beacon_touch = now_touch
 
             except Exception as te:
+                timer.finish(f"FAILED: {te}")
                 print(f"[BridgeDaemon] ⚠️ Turn execution failed in #{self.name}: {te}. Recycling worker to purge pipe state...")
                 try:
                     await self.recycle()
@@ -817,6 +613,23 @@ class PersistentChannelWorker:
                 print(f"[BridgeDaemon] Mid-turn steering executed in #{self.name}. Discarding stale turn response.")
                 return
 
+            # Fallback to on-disk transcript if output was empty or default placeholder and not explicit silence
+            active_cid = self.conv_id or (
+                thread.id
+                if (escalated_to_thread and "thread" in locals() and thread and hasattr(thread, "id"))
+                else None
+            )
+            if (
+                (not output_response or output_response.startswith("*(") or len(output_response.strip()) == 0)
+                and output_response != "[NO_REPLY]"
+            ):
+                harvested = harvest_transcript_response(active_cid)
+                if harvested:
+                    print(
+                        f"[BridgeDaemon] 🌾 Harvested response from on-disk transcript for session {active_cid} ({len(harvested)} chars)."
+                    )
+                    output_response = f"⚠️ *(Recovered from session transcript following process cutoff)*\n\n{harvested}"
+
             self.turn_count += 1
             self.last_turn_at = time.time()
 
@@ -839,6 +652,7 @@ class PersistentChannelWorker:
                 last_word_bot_id=last_word_bot_id,
                 last_word_bot_name=last_word_bot_name,
                 last_word_streak=last_word_streak,
+                timer=timer,
             )
 
 
@@ -893,6 +707,32 @@ class PersistentDaemonManager:
         """Recycle all persistent workers (e.g. after model switch)."""
         tasks = [w.recycle() for w in self.workers.values()]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def proactive_nightly_recycle(self):
+        """Proactively recycle and re-warm all persistent workers overnight (e.g. during 2:00 AM PT rollover).
+
+        Immediately terminates yesterday's workers, boots fresh warm sessions, and evicts
+        their session keys from pending reset_session_keys so the first morning turns incur 0ms reset penalty.
+        """
+        from tools.bridge_state import reset_session_meta, remove_reset_session_key
+        import tools.bridge_runner as br
+
+        async def _recycle_one(w):
+            try:
+                old_cid = w.conv_id
+                reset_session_meta(w.sess_key)
+                await w.recycle(new_conv_id=None)
+                # Ensure reset_session_keys is cleared for this persistent worker
+                if hasattr(br, "reset_session_keys"):
+                    br.reset_session_keys.discard(w.sess_key)
+                remove_reset_session_key(w.sess_key)
+                print(f"[BridgeDaemon] 🌙 Proactively recycled & warmed worker #{w.name} overnight (old_conv={old_cid}, new_conv={w.conv_id}).")
+            except Exception as err:
+                print(f"[BridgeDaemon] ⚠️ Error recycling worker #{w.name} during overnight rollover: {err}")
+
+        tasks = [_recycle_one(w) for w in self.workers.values()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # Global singleton daemon manager

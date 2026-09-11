@@ -297,7 +297,7 @@ class TestBridgeEndToEndStress(unittest.IsolatedAsyncioTestCase):
         self.assertIn("E = mc^2", formatted)
 
         # 3. Table cards formatted
-        self.assertIn("• **Host1** (UP): 12% · 4.2 GB", formatted)
+        self.assertIn("- **Host1** (UP): 12% · 4.2 GB", formatted)
 
         # 4. Choices parsed
         clean_text, view = bf.parse_interactive_choices(formatted, quick_choice_view_cls=bh.QuickChoiceView)

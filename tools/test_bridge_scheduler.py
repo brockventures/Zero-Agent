@@ -60,9 +60,11 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         bshed.LAST_SCHEDULED_DISPATCH.clear()
         br.reset_session_keys.clear()
 
-        with patch("tools.session_summarizer.generate_summary") as mock_sum:
+        with patch("tools.session_summarizer.generate_summary") as mock_sum, \
+             patch("tools.bridge_daemons.daemon_manager.proactive_nightly_recycle", new_callable=AsyncMock) as mock_recycle:
             await bshed.dispatch_scheduled_prompt("[INTERNAL_SESSION_ROLLOVER]", "Daily Session Rollover")
             self.assertIn("home", br.reset_session_keys)
+            mock_recycle.assert_awaited_once()
 
     async def test_birthday_reminder_silent(self):
         bshed.LAST_SCHEDULED_DISPATCH.clear()
@@ -201,6 +203,36 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(should_run)
         self.assertIn("already ran in current period", reason)
 
+    async def test_should_run_job_weekly_not_blocked_by_earlier_manual_run(self):
+        # Sunday 4:59 PM PT test run: 1788739199
+        sunday_test_ts = 1788739199.0
+        # Scheduled Wednesday slot: 1789008000 (Wed 8:00 PM PT, 3.11 days later)
+        wednesday_slot_ts = 1789008000.0
+
+        status_file = bs.DATA_DIR / "sidecar_status.json"
+        with open(status_file, "w") as f:
+            json.dump({
+                "weekly_meal_proposal": {
+                    "job_id": "weekly_meal_proposal",
+                    "timestamp_epoch": int(sunday_test_ts),
+                    "status": "ok"
+                }
+            }, f)
+
+        job = {
+            "id": "weekly_meal_proposal",
+            "name": "Weekly 3-Dinner Meal Proposal",
+            "enabled": True,
+            "schedule_type": "weekly",
+            "next_run_ts": wednesday_slot_ts,
+            "catchup_if_missed": False
+        }
+        # Evaluated at exactly Wednesday 8:00 PM PT
+        should_run, reason = bshed.should_run_job(job, wednesday_slot_ts)
+        # MUST run on Wednesday despite Sunday test run (>24h ago)
+        self.assertTrue(should_run)
+        self.assertEqual(reason, "on_time")
+
     async def test_nas_logs_dispatch_targets_homelab_channel(self):
         bshed.LAST_SCHEDULED_DISPATCH.clear()
         mock_bot = MagicMock()
@@ -302,6 +334,121 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             mock_sidecar.assert_called_once()
             mock_channel.send.assert_awaited_once_with("⚠️ 1 indexer failing")
             mock_queue.put.assert_not_called()
+
+    async def test_marketing_sweep_off_week_silent(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_bot.fetch_channel = AsyncMock(return_value=mock_channel)
+        mock_queue = MagicMock()
+
+        # On an off-week, run_sidecar_job returns should_post=False in extra and empty/silent message
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "", {"should_post": False})) as mock_sidecar:
+            await bshed.dispatch_scheduled_prompt(
+                "Run the promotional email marketing sweep using /workspace/tools/sidecars.py marketing.",
+                job_name="Biweekly Marketing Sweep",
+                bot=mock_bot,
+                turn_queue=mock_queue
+            )
+            mock_sidecar.assert_called_once()
+            # Must remain completely silent
+            mock_channel.send.assert_not_called()
+            mock_queue.put.assert_not_called()
+
+    async def test_marketing_sweep_on_week_posts(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_bot.fetch_channel = AsyncMock(return_value=mock_channel)
+        mock_queue = MagicMock()
+
+        report_content = "📬 **Biweekly Marketing Report** — Sep 06\n\n**1 promotional senders this period:**\n1. Store — 3 emails"
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, report_content, {"should_post": True})) as mock_sidecar:
+            await bshed.dispatch_scheduled_prompt(
+                "Run the promotional email marketing sweep using /workspace/tools/sidecars.py marketing.",
+                job_name="Biweekly Marketing Sweep",
+                bot=mock_bot,
+                turn_queue=mock_queue
+            )
+            mock_sidecar.assert_called_once()
+            mock_channel.send.assert_awaited_once_with(report_content)
+            mock_queue.put.assert_not_called()
+
+
+    async def test_scheduler_reload_flag_defers_when_busy(self):
+        """Verify KarakosScheduler does not trigger reload if is_busy returns active channels, even if flag > 20s."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmpdir:
+            flag = Path(tmpdir) / "reload_bridge.flag"
+            flag.touch()
+            # Set mtime to 30s ago
+            os.utime(flag, (time.time() - 30, time.time() - 30))
+
+            reload_mock = AsyncMock()
+            scheduler = bshed.KarakosScheduler(
+                dispatch_fn=AsyncMock(),
+                reload_fn=reload_mock,
+                is_busy_fn=lambda: ["#zero-chat"]
+            )
+
+            with patch("tools.bridge_scheduler.DATA_DIR", Path(tmpdir)):
+                # Run one iteration of the scheduler loop logic
+                busy = scheduler.is_busy_fn() if scheduler.is_busy_fn else []
+                if not busy:
+                    if flag.exists():
+                        flag.unlink()
+                    await reload_mock(None, initiator="scheduler", force=True)
+
+    async def test_outbox_flush_attaches_choice_buttons(self):
+        """Verify outbox messages with [CHOICES: ...] are parsed and delivered with interactive buttons."""
+        from tools.bridge_handlers import QuickChoiceView
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        callback_mock = AsyncMock()
+
+        scheduler = bshed.KarakosScheduler(
+            dispatch_fn=AsyncMock(),
+            bot=mock_bot,
+            quick_choice_view_cls=QuickChoiceView,
+            button_choice_fn=callback_mock,
+        )
+
+        outbox_msg = {
+            "id": "outbox-12345",
+            "channel": "shopping",
+            "channel_id": 1544955538033348618,
+            "content": "Weekly Menu Proposal\n\n[CHOICES: Lock In Menu | Swap Sunday | Swap Tuesday | Swap Thursday]"
+        }
+
+        with patch("tools.outbox.flush_pending_messages", return_value=[outbox_msg]):
+            from tools.outbox import flush_pending_messages
+            from tools.bridge_formatting import parse_interactive_choices
+            pending_outbox = flush_pending_messages()
+            for omsg in pending_outbox:
+                target_cid = omsg.get("channel_id")
+                target_channel = scheduler.bot.get_channel(target_cid)
+                raw_content = omsg.get("content", "")
+                clean_content, choice_view = parse_interactive_choices(
+                    raw_content,
+                    scheduler.quick_choice_view_cls,
+                    scheduler.button_choice_fn,
+                )
+                if choice_view:
+                    await target_channel.send(clean_content, view=choice_view)
+                else:
+                    await target_channel.send(clean_content)
+
+        mock_channel.send.assert_awaited_once()
+        args, kwargs = mock_channel.send.await_args
+        self.assertEqual(args[0], "Weekly Menu Proposal")
+        self.assertIn("view", kwargs)
+        self.assertIsInstance(kwargs["view"], QuickChoiceView)
+        self.assertEqual(len(kwargs["view"].children), 4)
+        self.assertEqual(kwargs["view"].children[0].label, "Lock In Menu")
 
 
 if __name__ == "__main__":

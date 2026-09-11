@@ -239,8 +239,85 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             await worker.execute_turn("test prompt", mock_status_msg, mock_reply_target, [])
             self.assertTrue(mock_status_msg.edit.await_count >= 1)
 
+    async def test_07_proactive_nightly_recycle_and_pending_carryforward(self):
+        """Verify that proactive_nightly_recycle recycles all dedicated workers and clears reset keys,
+        and execute_turn consumes pending carryforward context without turn recycling."""
+        # 1. Dedicated channels verification
+        self.assertIn(bd.BANANA_STAND_CHANNEL_ID, bd.DEDICATED_CHANNEL_CONFIGS)
+        self.assertIn(bd.TARGET_CHANNEL_ID, bd.DEDICATED_CHANNEL_CONFIGS)
 
+        # 2. Proactive nightly recycle test
+        mgr = bd.PersistentDaemonManager()
+        mock_worker_home = AsyncMock()
+        mock_worker_home.sess_key = "home"
+        mock_worker_home.name = "zero-chat"
+        mock_worker_home.conv_id = "old-home-conv"
+        mock_worker_home.recycle = AsyncMock()
 
+        mock_worker_banana = AsyncMock()
+        mock_worker_banana.sess_key = str(bd.BANANA_STAND_CHANNEL_ID)
+        mock_worker_banana.name = "the-banana-stand"
+        mock_worker_banana.conv_id = "old-banana-conv"
+        mock_worker_banana.recycle = AsyncMock()
+
+        mgr.workers = {
+            bd.TARGET_CHANNEL_ID: mock_worker_home,
+            bd.BANANA_STAND_CHANNEL_ID: mock_worker_banana,
+        }
+
+        with patch("tools.bridge_state.reset_session_meta") as mock_reset_meta, \
+             patch("tools.bridge_state.remove_reset_session_key") as mock_rm_key, \
+             patch("tools.bridge_runner.reset_session_keys", new={"home", str(bd.BANANA_STAND_CHANNEL_ID)}) as mock_keys:
+            await mgr.proactive_nightly_recycle()
+
+            mock_worker_home.recycle.assert_awaited_once_with(new_conv_id=None)
+            mock_worker_banana.recycle.assert_awaited_once_with(new_conv_id=None)
+            self.assertEqual(mock_reset_meta.call_count, 2)
+            self.assertNotIn("home", mock_keys)
+            self.assertNotIn(str(bd.BANANA_STAND_CHANNEL_ID), mock_keys)
+
+        # 3. Pending carryforward context consumption without turn recycling
+        test_worker = bd.PersistentChannelWorker(
+            channel_id=bd.TARGET_CHANNEL_ID,
+            name="zero-chat",
+            mode="home",
+            sess_key="home",
+        )
+        test_worker.proc = MagicMock()
+        test_worker.proc.returncode = None
+        test_worker.proc.pid = 99999
+        test_worker.proc.stdin = MagicMock()
+        test_worker.proc.stdin.write = MagicMock()
+        test_worker.proc.stdin.drain = AsyncMock()
+        test_worker.is_ready = True
+        test_worker.conv_id = "warm-new-conv"
+
+        lines = [
+            b'{"event":"result","result":{"status":"SUCCESS","response":"Morning response"}}\n',
+            b''
+        ]
+        test_worker.proc.stdout.readline = AsyncMock(side_effect=lambda: next(iter(lines)))
+
+        mock_status = AsyncMock()
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.id = bd.TARGET_CHANNEL_ID
+
+        with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
+             patch("tools.session_summarizer.get_carryforward_context", return_value="Recapped milestones") as mock_get_cf, \
+             patch("tools.bridge_daemons.deliver_turn_output") as mock_deliver, \
+             patch.object(test_worker, "recycle", new_callable=AsyncMock) as mock_recycle:
+            await test_worker.execute_turn("Good morning Zero", mock_status, mock_target, [])
+
+            # Recycle MUST NOT be called on this turn
+            mock_recycle.assert_not_awaited()
+            # Carryforward MUST be retrieved and injected into prompt passed to worker stdin
+            mock_get_cf.assert_called_once_with(sess_key="home")
+            written_bytes = test_worker.proc.stdin.write.call_args[0][0]
+            written_json = json.loads(written_bytes.decode("utf-8"))
+            sent_prompt = written_json["message"]["content"]
+            self.assertIn("[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\nRecapped milestones", sent_prompt)
+            self.assertIn("Good morning Zero", sent_prompt)
 
 
 if __name__ == "__main__":

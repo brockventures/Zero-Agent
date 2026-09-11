@@ -148,6 +148,26 @@ class TestBridgeRunner(unittest.TestCase):
             recovered = br.harvest_transcript_response(conv_id)
             self.assertEqual(recovered, "The capital of France is Paris.")
 
+    def test_harvest_transcript_response_skips_placeholder_sentinel(self):
+        """Verify that harvest_transcript_response ignores 'No content generated yet.' sentinels."""
+        conv_id = "test-conv-harvest-sentinel"
+        log_dir = self.temp_path / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript_full.jsonl"
+
+        steps = [
+            {"type": "USER_INPUT", "content": "What is the status?"},
+            {"type": "PLANNER_RESPONSE", "content": "Initial scan complete."},
+            {"type": "PLANNER_RESPONSE", "content": "No content generated yet."}
+        ]
+        with open(transcript_file, "w") as f:
+            for s in steps:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_runner.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            recovered = br.harvest_transcript_response(conv_id)
+            self.assertEqual(recovered, "Initial scan complete.")
+
     def test_kill_process_tree(self):
         """Verify that kill_process_tree signals the process group via os.killpg."""
         mock_proc = MagicMock()
@@ -216,6 +236,41 @@ class TestBridgeRunner(unittest.TestCase):
         is_result_cutoff = (result_received_at is not None and (now - result_received_at) >= 1.5)
         is_agent_done_cutoff = (agent_response_done_at is not None and (now - agent_response_done_at) >= 2.0)
         self.assertFalse(is_result_cutoff or is_agent_done_cutoff)
+
+    def test_wedged_diagnostic_formatting(self):
+        """Verify that when a wedged diagnostic is present, bridge_runner formats a forensic report."""
+        wedged_diagnostic = {
+            "root_pid": 1234,
+            "exists": True,
+            "is_wedged": True,
+            "is_interactive_stdin": True,
+            "summary": "Subprocess 'npx nxapi auth' (PID 1235) is wedged waiting on interactive STDIN (n_tty_read).",
+            "prompt": "Paste the link here:",
+            "culprit": {
+                "pid": 1235,
+                "name": "node",
+                "cmdline": "node /usr/local/bin/nxapi nso auth",
+                "wchan": "n_tty_read",
+                "diagnosis": "Blocked on interactive STDIN read in kernel (n_tty_read)",
+            }
+        }
+        elapsed_sec = 47
+        pid_str = "PID 1234"
+        culprit = wedged_diagnostic.get("culprit") or {}
+        c_name = culprit.get("name") or culprit.get("cmdline") or pid_str
+        c_wchan = culprit.get("wchan") or "unknown"
+        c_pid = culprit.get("pid") or 1234
+        final_text = (
+            f"⚠️ **Subprocess Wedged on Interactive Input:**\n\n"
+            f"{wedged_diagnostic['summary']}\n\n"
+            f"• **Culprit:** `{c_name}` (PID {c_pid})\n"
+            f"• **Kernel Wait Channel:** `{c_wchan}`\n"
+            f"• **Diagnostic:** A tool spawned an interactive command without automated flags. The subprocess was terminated after {elapsed_sec}s of silence to prevent an indefinite hang."
+        )
+        self.assertIn("Subprocess Wedged on Interactive Input", final_text)
+        self.assertIn("n_tty_read", final_text)
+        self.assertIn("PID 1235", final_text)
+        self.assertIn("47s of silence", final_text)
 
 
 if __name__ == "__main__":

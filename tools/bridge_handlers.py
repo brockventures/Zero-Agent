@@ -13,7 +13,7 @@ import signal
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import discord
@@ -45,9 +45,12 @@ from tools.bridge_state import (
     save_runtime_config,
     update_beacon,
     is_reload_intent,
+    is_container_restart_intent,
     sync_credentials,
     PT_TZ,
     is_home_channel,
+    BROCK_GUILD_ID,
+    is_brock_guild,
 )
 from tools.bridge_formatting import (
     format_command_preview,
@@ -72,7 +75,9 @@ from tools.bridge_runner import (
 import tools.bridge_runner as br
 
 BOT_BOOT_TIME = time.time()
+BANANA_WATCHER_BOT_ID = 1545924520236290198
 PROCESSED_INTERACTIONS = set()
+PROCESSED_BACKLOG_MSG_IDS = set()
 channel_last_bot_reply = {}
 active_turn_task = None
 active_status_msg = None
@@ -210,24 +215,74 @@ async def execute_bridge_reload(bot: discord.Client = None, channel=None, initia
             await bot.close()
         except Exception:
             pass
+
+    # Ensure /app/bridge.py stays synchronized with /workspace/tools/bridge.py before execv
+    try:
+        ws_bridge = Path("/workspace/tools/bridge.py")
+        app_bridge = Path("/app/bridge.py")
+        if ws_bridge.exists() and app_bridge.exists():
+            ws_bytes = ws_bridge.read_bytes()
+            if app_bridge.read_bytes() != ws_bytes:
+                app_bridge.write_bytes(ws_bytes)
+                print("[Bridge] Synchronized /workspace/tools/bridge.py -> /app/bridge.py before reload")
+    except Exception as se:
+        print(f"[Bridge] Notice checking /app/bridge.py sync: {se}")
+
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-def is_bridge_busy(home_queue=None, ext_queue=None) -> list[str]:
+async def execute_container_restart(channel=None, initiator: str = "user", reason: str = "Manual Docker container restart requested"):
+    """Execute detached Docker container restart on Host 2 via SSH."""
+    from tools.bridge_state import record_restart_intent
+    record_restart_intent(reason, initiator=initiator)
+    if channel:
+        try:
+            await channel.send("🔄 **Restarting Zero Docker container on Host 2 over SSH...**\n• Full cgroup wipe & clean PID 1 reinitialization.")
+        except Exception:
+            pass
+
+    import subprocess
+    ssh_key = "/secrets/id_ed25519"
+    ssh_port = os.getenv("NAS_SSH_PORT", "22")
+    ssh_user = os.getenv("NAS_USER", "root")
+    host_2 = os.getenv("NAS_HOST_2_IP", "127.0.0.1")
+
+    restart_cmd = [
+        "ssh", "-i", ssh_key, "-p", ssh_port, "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+        f"{ssh_user}@{host_2}",
+        "nohup sh -c 'sleep 3 && docker restart discord-antigravity-agent' >/dev/null 2>&1 &"
+    ]
+    try:
+        subprocess.run(restart_cmd, timeout=10, check=True)
+        print(f"[Bridge] Detached Docker container restart dispatched to {host_2}:{ssh_port}")
+    except Exception as e:
+        print(f"[Bridge] Error dispatching detached container restart: {e}")
+        if channel:
+            try:
+                await channel.send(f"⚠️ **Failed to dispatch container restart:** `{e}`")
+            except Exception:
+                pass
+
+
+def is_bridge_busy(home_queue=None, ext_queue=None, exclude_channel_id: int | None = None) -> list[str]:
     """Check if any task is actively running or queued across home and external channels."""
     home_busy = (br.active_proc is not None and br.active_proc.returncode is None) or (home_queue is not None and not home_queue.empty())
     ext_busy = (br.ext_active_proc is not None and br.ext_active_proc.returncode is None) or (ext_queue is not None and not ext_queue.empty())
     busy = []
-    if home_busy:
+    if home_busy and exclude_channel_id != TARGET_CHANNEL_ID:
         busy.append("#zero-chat")
     if ext_busy:
         busy.append("Crab Cavern")
     for cid, t in channel_active_tasks.items():
+        if cid == exclude_channel_id:
+            continue
         if t and not t.done():
             ch_name = "#zero-chat" if cid == TARGET_CHANNEL_ID else f"channel:{cid}"
             if ch_name not in busy:
                 busy.append(ch_name)
     for cid, q in channel_queues.items():
+        if cid == exclude_channel_id and q.empty():
+            continue
         if not q.empty():
             ch_name = "#zero-chat" if cid == TARGET_CHANNEL_ID else f"channel:{cid}"
             if ch_name not in busy:
@@ -235,8 +290,16 @@ def is_bridge_busy(home_queue=None, ext_queue=None) -> list[str]:
     return busy
 
 
-async def warm_channel_history(channel, limit: int = 25):
-    """Prefetch recent messages from Discord channel to initialize history buffer."""
+async def warm_channel_history(
+    channel,
+    limit: int = 25,
+    bot: discord.Client = None,
+    turn_queue = None,
+    ext_turn_queue = None,
+    reload_fn = None,
+):
+    """Prefetch recent messages from Discord channel to initialize history buffer and recover unhandled turns."""
+    global PROCESSED_BACKLOG_MSG_IDS
     if not channel or not hasattr(channel, "history"):
         return
     try:
@@ -259,6 +322,27 @@ async def warm_channel_history(channel, limit: int = 25):
                 timestamp=m.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if hasattr(m, "created_at") else None
             )
         print(f"[Bridge] Warmed channel history for #{getattr(channel, 'name', channel.id)}: {len(msgs)} messages loaded.")
+
+        # Backlog Recovery Guard: Check for unhandled user messages in home channels sent during reconnect or downtime
+        if is_home_channel(channel) and bot and turn_queue and msgs:
+            now_ts = time.time()
+            last_msg = msgs[-1]
+            if not last_msg.author.bot and last_msg.content.strip():
+                msg_age = (now_ts - last_msg.created_at.timestamp()) if hasattr(last_msg, "created_at") else 0
+                if 0 <= msg_age <= 900:  # sent within the last 15 minutes
+                    if last_msg.id not in PROCESSED_BACKLOG_MSG_IDS:
+                        PROCESSED_BACKLOG_MSG_IDS.add(last_msg.id)
+                        author_name = last_msg.author.display_name or last_msg.author.name
+                        print(f"[Bridge] 🔄 Recovered unhandled home message from {author_name} sent during downtime/reconnect ({last_msg.id}): \"{last_msg.content[:80]}\"")
+                        asyncio.create_task(
+                            handle_message(
+                                msg=last_msg,
+                                bot=bot,
+                                home_turn_queue=turn_queue,
+                                ext_turn_queue=ext_turn_queue,
+                                reload_fn=reload_fn,
+                            )
+                        )
     except Exception as e:
         print(f"[Bridge] Error warming channel history for {channel.id}: {e}")
 
@@ -272,13 +356,53 @@ async def handle_button_choice(choice_text: str, interaction: discord.Interactio
         PROCESSED_INTERACTIONS.clear()
         PROCESSED_INTERACTIONS.add(interaction.id)
 
-    # Intercept restart button choices directly
+    # Intercept container restart button choices directly
+    if is_container_restart_intent(choice_text):
+        await interaction.channel.send(f"🔘 **Selected:** `{choice_text}`")
+        await execute_container_restart(interaction.channel, initiator=interaction.user.display_name or interaction.user.name, reason=f"Choice button '{choice_text}' selected")
+        return
+
+    # Intercept in-place reload button choices directly
     if is_reload_intent(choice_text):
         await interaction.channel.send(f"🔘 **Selected:** `{choice_text}`")
         if reload_fn:
             await reload_fn(interaction.channel, initiator=interaction.user.display_name or interaction.user.name, force=True, reason=f"Choice button '{choice_text}' selected")
         else:
             await execute_bridge_reload(interaction.client, interaction.channel, initiator=interaction.user.display_name or interaction.user.name, force=True, reason=f"Choice button '{choice_text}' selected")
+        return
+
+    # Intercept Meal Planning choices directly (Fast-Path deterministic execution)
+    choice_lower = choice_text.strip().lower()
+    if choice_lower in ("lock in menu", "lock in", "lock menu"):
+        await interaction.channel.send(f"🔘 **Selected:** `{choice_text}`")
+        try:
+            from tools.meal_planner_proposal import lock_in_menu
+            ok, rep = await asyncio.to_thread(lock_in_menu)
+            await interaction.channel.send(rep)
+        except Exception as me:
+            await interaction.channel.send(f"⚠️ Failed to lock in menu: {me}")
+        return
+
+    if choice_lower in ("swap sunday", "swap tuesday", "swap thursday"):
+        await interaction.channel.send(f"🔘 **Selected:** `{choice_text}`")
+        slot = choice_lower.split()[1]
+        try:
+            from tools.meal_planner_proposal import swap_slot
+            ok, rep = await asyncio.to_thread(swap_slot, slot)
+            if ok:
+                clean_rep, choice_view = parse_interactive_choices(
+                    rep,
+                    quick_choice_view_cls=QuickChoiceView,
+                    button_choice_fn=None,
+                )
+                if choice_view:
+                    await interaction.channel.send(clean_rep, view=choice_view)
+                else:
+                    await interaction.channel.send(clean_rep)
+            else:
+                await interaction.channel.send(rep)
+        except Exception as se:
+            await interaction.channel.send(f"⚠️ Failed to swap {slot}: {se}")
         return
 
     try:
@@ -293,7 +417,8 @@ async def handle_button_choice(choice_text: str, interaction: discord.Interactio
         "attachments": [],
         "is_steer": False,
         "mode": "home",
-        "channel_id": interaction.channel_id
+        "channel_id": interaction.channel_id,
+        "queued_at": time.perf_counter(),
     })
 
 
@@ -315,32 +440,22 @@ async def run_thread_turn_worker(item, bot: discord.Client, presence_fn=None, bu
         except Exception:
             pass
     try:
+        kwargs = {
+            "mode": "home",
+            "channel_id": channel_id,
+            "apply_presence_fn": presence_fn,
+            "button_choice_fn": button_choice_fn,
+            "quick_choice_view_cls": quick_choice_view_cls,
+            "queued_at": item.get("queued_at"),
+        }
         if reply_target and hasattr(reply_target, "typing"):
             async with reply_target.typing():
-                await execute_agy_turn(
-                    prompt, status_msg, reply_target, attachments,
-                    mode="home", channel_id=channel_id,
-                    apply_presence_fn=presence_fn,
-                    button_choice_fn=button_choice_fn,
-                    quick_choice_view_cls=quick_choice_view_cls
-                )
-        elif reply_target and hasattr(reply_target, "channel"):
+                await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
+        elif reply_target and hasattr(reply_target, "channel") and hasattr(reply_target.channel, "typing"):
             async with reply_target.channel.typing():
-                await execute_agy_turn(
-                    prompt, status_msg, reply_target, attachments,
-                    mode="home", channel_id=channel_id,
-                    apply_presence_fn=presence_fn,
-                    button_choice_fn=button_choice_fn,
-                    quick_choice_view_cls=quick_choice_view_cls
-                )
+                await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
         else:
-            await execute_agy_turn(
-                prompt, status_msg, reply_target, attachments,
-                mode="home", channel_id=channel_id,
-                apply_presence_fn=presence_fn,
-                button_choice_fn=button_choice_fn,
-                quick_choice_view_cls=quick_choice_view_cls
-            )
+            await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
     except Exception as e:
         print(f"[Thread Worker] Error in thread turn execution: {e}")
         try:
@@ -417,6 +532,7 @@ async def run_channel_turn_worker(
                         "last_word_bot_id": item.get("last_word_bot_id"),
                         "last_word_bot_name": item.get("last_word_bot_name"),
                         "last_word_streak": item.get("last_word_streak", 0),
+                        "queued_at": item.get("queued_at"),
                     }
                     if reply_target and hasattr(reply_target, "channel") and hasattr(reply_target.channel, "typing"):
                         async with reply_target.channel.typing():
@@ -452,18 +568,22 @@ async def run_channel_turn_worker(
                 channel_active_status_msgs.pop(channel_id, None)
                 ch_queue.task_done()
 
-            # Immediate post-turn check for reload flag
+            # Immediate post-turn check for reload flag (defer if neighbor channels are busy)
             reload_flag = DATA_DIR / "reload_bridge.flag"
             if reload_flag.exists():
-                try:
-                    reload_flag.unlink()
-                except Exception:
-                    pass
-                print(f"[Channel Worker {channel_id}] Post-turn reload flag detected. Executing in-place reload...")
-                if reload_fn:
-                    await reload_fn(None, initiator="agent", force=True, reason="Post-turn in-place reload flag")
+                other_busy = is_bridge_busy(exclude_channel_id=channel_id)
+                if other_busy:
+                    print(f"[Channel Worker {channel_id}] Post-turn reload flag detected, but bridge channels are busy ({other_busy}). Deferring reload.")
                 else:
-                    await execute_bridge_reload(bot, None, initiator="agent", force=True, reason="Post-turn in-place reload flag")
+                    try:
+                        reload_flag.unlink()
+                    except Exception:
+                        pass
+                    print(f"[Channel Worker {channel_id}] Post-turn reload flag detected (all channels idle). Executing in-place reload...")
+                    if reload_fn:
+                        await reload_fn(None, initiator="agent", force=True, reason="Post-turn in-place reload flag")
+                    else:
+                        await execute_bridge_reload(bot, None, initiator="agent", force=True, reason="Post-turn in-place reload flag")
 
     finally:
         channel_active_tasks.pop(channel_id, None)
@@ -530,7 +650,8 @@ async def handle_on_ready(
     ext_turn_queue,
     start_workers_fn,
     start_scheduler_fn,
-    presence_fn=None
+    presence_fn=None,
+    reload_fn=None,
 ):
     """Handle bot startup, presence restoration, credential syncing, and reboot briefings."""
     global has_notified_ready
@@ -566,6 +687,15 @@ async def handle_on_ready(
         print(f"[Antigravity] Zero Health Server active (PID: {health_status.get('pid')}, port: {health_status.get('port')}).")
     except Exception as hse:
         print(f"[Bridge] Warning initializing health server: {hse}")
+
+    # Ensure Banana Watcher Daemon is running in #the-banana-stand
+    try:
+        from tools.banana_watcher import ensure_banana_watcher_running, get_daemon_status as get_bw_status
+        ensure_banana_watcher_running()
+        bw_status = get_bw_status()
+        print(f"[Antigravity] Banana Watcher active (PID: {bw_status.get('pid')}).")
+    except Exception as bwe:
+        print(f"[Bridge] Warning initializing Banana Watcher: {bwe}")
 
     # Ensure Dedicated Persistent Channel Daemons are warmed up (#zero-chat, #the-banana-stand, #lounge)
     try:
@@ -606,13 +736,38 @@ async def handle_on_ready(
             except Exception:
                 pass
 
+    # Check for pending external auth state across restart (e.g. Nintendo Switch nxapi)
+    try:
+        pending_auth_files = list(DATA_DIR.glob("*_pending_auth.json"))
+        for p_file in pending_auth_files:
+            try:
+                mtime = p_file.stat().st_mtime
+                if (time.time() - mtime) < 1800:
+                    service_name = p_file.stem.replace("_pending_auth", "").upper()
+                    print(f"[Bridge] 🔑 Detected active {service_name} pending auth from before restart ({p_file.name}). State preserved.")
+            except Exception:
+                pass
+    except Exception as pae:
+        print(f"[Bridge] Warning scanning pending auth files: {pae}")
+
     if start_workers_fn:
         start_workers_fn()
 
-    # Clear any stale queued turns from disk on startup to avoid zombie replays
-    turn_queue.load_persisted()
-    turn_queue.pending_items = []
-    turn_queue._persist()
+    # On initial boot, load persisted turns; on gateway reconnect, preserve active in-memory queue
+    if not has_notified_ready:
+        if hasattr(turn_queue, "load_persisted"):
+            try:
+                res = turn_queue.load_persisted()
+                if asyncio.iscoroutine(res):
+                    res = await res
+                if isinstance(res, list):
+                    for item in res:
+                        if isinstance(item, dict) and item.get("prompt"):
+                            q_ts = item.get("queued_at", 0)
+                            if (time.time() - q_ts) < 900:
+                                asyncio.create_task(turn_queue.put(item))
+            except Exception as pe:
+                print(f"[Bridge] Error loading persisted turn queue: {pe}")
 
     if start_scheduler_fn:
         await start_scheduler_fn()
@@ -664,7 +819,8 @@ async def handle_on_ready(
                     "attachments": [],
                     "is_steer": False,
                     "mode": "home",
-                    "channel_id": TARGET_CHANNEL_ID
+                    "channel_id": TARGET_CHANNEL_ID,
+                    "queued_at": time.perf_counter(),
                 })
                 print("[Bridge] Successfully queued agentic reboot briefing turn.")
             except Exception as e:
@@ -693,7 +849,16 @@ async def handle_on_ready(
         try:
             target_ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
             if target_ch:
-                asyncio.create_task(warm_channel_history(target_ch, limit=25))
+                asyncio.create_task(
+                    warm_channel_history(
+                        target_ch,
+                        limit=25,
+                        bot=bot,
+                        turn_queue=turn_queue,
+                        ext_turn_queue=ext_turn_queue,
+                        reload_fn=reload_fn,
+                    )
+                )
         except Exception as e:
             print(f"[Bridge] Could not fetch channel {ch_id} for history warming: {e}")
 
@@ -709,13 +874,14 @@ async def handle_message(
     active_model_setter=None,
 ):
     """Main routing engine for incoming Discord messages across Home and Crab Cavern."""
-    global channel_last_bot_reply, active_status_msg
+    global channel_last_bot_reply, active_status_msg, PROCESSED_BACKLOG_MSG_IDS
 
-    # Never reply to ourselves
-    if bot.user and msg.author.id == bot.user.id:
-        return
+    if hasattr(msg, "id"):
+        PROCESSED_BACKLOG_MSG_IDS.add(msg.id)
+        if len(PROCESSED_BACKLOG_MSG_IDS) > 1000:
+            PROCESSED_BACKLOG_MSG_IDS = set(list(PROCESSED_BACKLOG_MSG_IDS)[-500:])
 
-    content = msg.content.strip()
+    content = msg.content.strip() if hasattr(msg, "content") else ""
     is_thread_channel = isinstance(msg.channel, discord.Thread)
     is_home = is_home_channel(msg.channel)
 
@@ -736,9 +902,22 @@ async def handle_message(
             timestamp=msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if hasattr(msg, "created_at") else None
         )
         if len(get_recent_messages(msg.channel.id, limit=5)) <= 1:
-            asyncio.create_task(warm_channel_history(msg.channel, limit=25))
+            asyncio.create_task(
+                warm_channel_history(
+                    msg.channel,
+                    limit=25,
+                    bot=bot,
+                    turn_queue=home_turn_queue,
+                    ext_turn_queue=ext_turn_queue,
+                    reload_fn=reload_fn,
+                )
+            )
     except Exception as e:
-        print(f"[Bridge] Error recording message to channel history: {e}")
+        print(f"[Bridge] Warning recording message to history: {e}")
+
+    # Never reply to ourselves
+    if bot.user and msg.author.id == bot.user.id:
+        return
 
     if is_home:
         # Home Turf (#zero-chat): strictly 1-on-1 pairing with Ryan; ignore other bots
@@ -747,10 +926,140 @@ async def handle_message(
 
     # Ignore messages sent prior to current process startup (avoids replaying stale backlog on restart)
     msg_ts = msg.created_at.timestamp() if hasattr(msg, "created_at") else time.time()
-    if msg_ts < (BOT_BOOT_TIME - 3.0):
-        return
+    now_ts = time.time()
+    if is_home:
+        # For home channels (#zero-chat, #zero-ops), never drop recent user commands
+        # Only drop if older than 15 minutes across extended outages
+        if (now_ts - msg_ts) > 900.0:
+            print(f"[Bridge] Dropping stale home message from {author_name} ({now_ts - msg_ts:.1f}s old)")
+            return
+    else:
+        # For external channels, ignore messages older than 5 minutes or sent prior to startup
+        if msg_ts < (BOT_BOOT_TIME - 5.0) or (now_ts - msg_ts) > 300.0:
+            return
 
     if not is_home:
+        # Public channels in Brock Discord (e.g. #seerr-requests-and-chat, #server-updates, #seerr-notifications)
+        # Strict Rule: Only respond to messages directly from Ryan Brock (owner), explicitly tagging Zero.
+        if is_brock_guild(msg):
+            if msg.author.bot:
+                return
+
+            is_owner = (msg.author.id == OWNER_USER_ID)
+            bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
+            is_tagged = (
+                (bot.user and bot.user in msg.mentions) or
+                f"<@{bot_id}>" in content or
+                f"<@!{bot_id}>" in content or
+                re.search(r"(?:^|[\s,;/])(?:hey\s+)?@?zero(?:\b|[!?:,/])", content, re.IGNORECASE) is not None
+            )
+
+            if not (is_owner and is_tagged):
+                return
+
+            # Ryan explicitly invoked Zero in a public Brock Discord channel
+            cleaned = content
+            cleaned = re.sub(rf"<@!?{bot_id}>", "", cleaned)
+            cleaned = re.sub(r"^(hey\s+)?zero[:,\s]*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"@zero\b", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"^(hey\s+)?robot[:,\s]*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"@robot\b", "", cleaned, flags=re.IGNORECASE)
+            cleaned = cleaned.strip()
+
+            saved_attachments = []
+            if msg.attachments:
+                for att in msg.attachments:
+                    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", att.filename)
+                    dest = ATTACHMENTS_DIR / f"{uuid.uuid4().hex[:8]}_{safe_name}"
+                    try:
+                        await att.save(dest)
+                        saved_attachments.append(str(dest))
+                    except Exception as e:
+                        print(f"[Bridge] Failed saving attachment: {e}")
+
+            if cleaned.lower() in ("!reset", "/reset", "!new", "/new"):
+                clear_channel_session_id(msg.channel.id, "home")
+                await msg.reply("🔄 Conversation session reset for this channel.")
+                return
+
+            if is_container_restart_intent(cleaned):
+                ch_name = getattr(msg.channel, "name", str(msg.channel.id))
+                await execute_container_restart(msg.channel, initiator=author_name, reason=f"Manual Docker container restart requested via #{ch_name}")
+                return
+
+            if is_reload_intent(cleaned):
+                ch_name = getattr(msg.channel, "name", str(msg.channel.id))
+                if reload_fn:
+                    await reload_fn(msg.channel, initiator=author_name, force=True, reason=f"Manual in-place bridge reload requested via #{ch_name}")
+                else:
+                    await execute_bridge_reload(bot, msg.channel, initiator=author_name, force=True, reason=f"Manual in-place bridge reload requested via #{ch_name}")
+                return
+
+            prompt_content = cleaned
+            is_lazy = bool(
+                not prompt_content or
+                re.fullmatch(r"[\^\s\.\?!]+", prompt_content) or
+                prompt_content.lower() in ("^", "^^", "^^^", "this", "look", "see", "what?", "check this")
+            )
+            if is_lazy and not saved_attachments:
+                prompt_content = (
+                    "[OPERATIONAL DIRECTIVE - LAZY TYPER ADDRESSING]:\n"
+                    f"The user sent a minimal prompt ('{content.strip()}').\n"
+                    "Humans are lazy typers: review recent conversation/channel history to identify the topic, question, or task at hand and address it directly."
+                )
+
+            if saved_attachments:
+                image_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+                has_images = any(Path(p).suffix.lower() in image_exts for p in saved_attachments)
+                image_directive = (
+                    "\n\n[CRITICAL IMAGE INPUT INVARIANT]:\n"
+                    "One or more images are attached to this message. You MUST parse and inspect every image (using view_file) and understand its visual contents, error traces, screenshots, or diagrams as part of the primary input, EVEN IF the accompanying text message made no mention of the image."
+                    if has_images else ""
+                )
+                hint = "\n\n[Attached file(s) available via view_file tool]:\n" + "\n".join(f"- {p}" for p in saved_attachments)
+                if is_lazy:
+                    prompt_content = (
+                        f"[OPERATIONAL DIRECTIVE - LAZY TYPER & ATTACHMENT ADDRESSING]:\n"
+                        f"The user sent an attachment with a minimal prompt ('{content.strip()}').\n"
+                        "Humans are lazy typers: review the attached image/file(s) and recent conversation history to address the active topic directly."
+                    )
+                prompt_content = (prompt_content or "Please inspect the attached file(s) and assist.") + hint + image_directive
+
+            if not prompt_content:
+                return
+
+            ch_name = getattr(msg.channel, "name", str(msg.channel.id))
+            ch_ctx_block = ""
+            try:
+                from tools.channel_history import format_channel_context
+                ch_ctx = format_channel_context(msg.channel.id, limit=10, exclude_msg_id=msg.id)
+                if ch_ctx:
+                    ch_ctx_block = f"\n{ch_ctx}\n\n"
+            except Exception:
+                pass
+
+            public_prompt = (
+                f"[OPERATIONAL DIRECTIVE - BROCK DISCORD PUBLIC CHANNEL #{ch_name}]:\n"
+                f"You are responding directly to Ryan in a public channel on Brock Discord.\n"
+                f"• Be direct, concise, and helpful (single Discord message, max 2000 characters).\n"
+                f"• Public-Safe Etiquette: Do NOT reveal sensitive credentials, tokens, private IPs, or personal family information.\n\n"
+                f"{ch_ctx_block}"
+                f"{prompt_content}"
+            )
+
+            await home_turn_queue.put({
+                "prompt": public_prompt,
+                "status_msg": None,
+                "reply_target": msg,
+                "attachments": saved_attachments,
+                "is_steer": False,
+                "mode": "home",
+                "channel_id": msg.channel.id,
+                "author_name": author_name,
+                "queued_at": time.perf_counter(),
+            })
+            return
+
         # Ignore automated notification / webhook channels unless directly tagged
         ch_name = getattr(msg.channel, "name", "").lower()
         if (msg.channel.id in READONLY_NOTIFICATION_CHANNELS or ch_name in ("server-updates", "downloads")) and not (bot.user and bot.user in msg.mentions):
@@ -760,24 +1069,46 @@ async def handle_message(
         from tools.channel_history import is_handoff_addressed_to_zero
         handoff_for_zero = is_handoff_addressed_to_zero(content)
 
-        # Global envelope short-circuit per v0 spec: reply: "none" NEVER wakes text reply
+        is_banana_watcher = (
+            getattr(msg.author, "id", None) == BANANA_WATCHER_BOT_ID or
+            str(getattr(msg.author, "id", "")) == str(BANANA_WATCHER_BOT_ID) or
+            "banana watcher" in author_name.lower()
+        )
+        is_banana_summary_prompt = bool(
+            is_banana_watcher and
+            re.search(r"🍌 \*\*Discussion Concluded\*\*: Topic `(?P<subject>[^`]+)` has reached resolution", content)
+        )
+        is_banana_stall_prompt = bool(
+            is_banana_watcher and
+            re.search(r"🍌 \*\*Topic Stalled\*\*: Topic `(?P<subject>[^`]+)`", content)
+        )
+        is_banana_loop_prompt = bool(
+            is_banana_watcher and
+            re.search(r"🍌 \*\*Loop Warning\*\*: Topic `(?P<subject>[^`]+)`", content)
+        )
+        if is_banana_summary_prompt or is_banana_stall_prompt or is_banana_loop_prompt:
+            handoff_for_zero = True
+
+        # Envelope evaluation & topic resolution
         try:
             from tools.handoff import parse_envelope
             envelope = parse_envelope(content)
-            if envelope and envelope.get("reply") == "none":
+            if envelope:
                 import importlib
                 import tools.topic_tracker
                 importlib.reload(tools.topic_tracker)
                 tools.topic_tracker.check_and_resolve_topic(envelope, content, author_name, msg.id, msg.channel.id)
                 floor_state = str(envelope.get("floor") or "").lower()
-                is_floor_open = floor_state in ("open", "free", "any")
-                if not handoff_for_zero and not is_floor_open:
+                # floor: closed is the explicit state indicating "do not reply"
+                if floor_state == "closed" and not handoff_for_zero:
+                    print(f"[Bridge] Suppressed turn: floor is closed per envelope from {author_name}")
                     return
         except Exception as te:
             print(f"[Bridge] Error checking topic resolution: {te}")
 
         # 1. Loop prevention for peer bots (Amos, Marvin, etc.)
-        if msg.author.bot:
+        # Banana Watcher is an automated channel watchdog/referee, exempt from Last Word Protocol and cascade cooldown
+        if msg.author.bot and not is_banana_watcher:
             # Check Last Word Protocol active cooldown or in-flight turn
             try:
                 from tools.last_word_protocol import is_bot_paused, is_last_word_in_flight
@@ -810,23 +1141,38 @@ async def handle_message(
         is_tagged_role = False
         role_ids = [str(r.id) for r in getattr(msg, "role_mentions", [])]
         is_robot_tagged = (
+            "<@&1543285916506783799>" in content or
+            "1543285916506783799" in role_ids or
             "<@&1542294519914037341>" in content or
             "1542294519914037341" in role_ids or
             re.search(r"(?:^|[\s,;])@robot\b", content, re.IGNORECASE) is not None or
             re.search(r"^(?:hey\s+)?robot[:,\s]", content, re.IGNORECASE) is not None
         )
+        is_team_tagged = (
+            "<@&1543462881624858624>" in content or
+            "1543462881624858624" in role_ids or
+            re.search(r"(?:^|[\s,;])@team\b", content, re.IGNORECASE) is not None or
+            re.search(r"^(?:hey\s+)?team[:,\s]", content, re.IGNORECASE) is not None
+        )
 
         if req_tag:
             bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
-            tag_str = f"<@&{req_tag}>"
+            allowed_tags = req_tag if isinstance(req_tag, list) else [req_tag]
+            allowed_tag_strs = [f"<@&{t}>" for t in allowed_tags]
+            has_required_tag = (
+                any(t_str in content for t_str in allowed_tag_strs) or
+                any(str(t) in role_ids for t in allowed_tags)
+            )
             is_direct_bot_ping = (
                 (bot.user and bot.user in msg.mentions) or
                 f"<@{bot_id}>" in content or
                 f"<@!{bot_id}>" in content or
-                is_robot_tagged
+                re.search(r"(?:^|[\s,;])@zero\b", content, re.IGNORECASE) is not None or
+                is_robot_tagged or
+                is_team_tagged
             )
-            if tag_str not in content and str(req_tag) not in role_ids and not is_direct_bot_ping:
-                print(f"[Bridge] Message in channel {msg.channel.id} ignored: missing required tag {tag_str}")
+            if not has_required_tag and not is_direct_bot_ping:
+                print(f"[Bridge] Message in channel {msg.channel.id} ignored: missing required tag(s) {allowed_tag_strs}")
                 return
             is_tagged_role = True
 
@@ -850,7 +1196,6 @@ async def handle_message(
                 from tools.classifier import is_explicitly_addressed_to_other
                 if not is_explicitly_addressed_to_other(content):
                     from tools.channel_history import get_recent_messages
-                    from datetime import datetime, timezone
                     prev_msgs = get_recent_messages(msg.channel.id, limit=5, exclude_msg_id=msg.id)
                     if prev_msgs:
                         last_msg = prev_msgs[-1]
@@ -892,6 +1237,7 @@ async def handle_message(
             bot_mention_1 in content or
             bot_mention_2 in content or
             is_robot_tagged or
+            is_team_tagged or
             re.search(r"(?:^|[\s,;/])(?:hey\s+)?@?zero(?:\b|[!?:,/])", content, re.IGNORECASE) is not None or
             is_reply_to_zero or
             handoff_for_zero or
@@ -916,19 +1262,115 @@ async def handle_message(
                 return
 
         # Clean mentions from prompt (only bot user and configured bot role mentions)
-        target_role_ids = {"1543462881624858624", "1542294519914037341"}
+        target_role_ids = {"1543462881624858624", "1543285916506783799", "1542294519914037341"}
         if req_tag:
-            target_role_ids.add(str(req_tag))
-        cleaned = re.sub(rf"<@!?{bot_id}>", "", content)
+            if isinstance(req_tag, list):
+                target_role_ids.update(str(t) for t in req_tag)
+            else:
+                target_role_ids.add(str(req_tag))
+
+        # Check if other entities/bots are also mentioned in the message
+        other_mentions = [
+            m for m in re.findall(r"<@!?([0-9]+)>", content)
+            if m != bot_id
+        ]
+
+        is_banana_directive = is_banana_summary_prompt or is_banana_stall_prompt or is_banana_loop_prompt
+
+        if other_mentions:
+            # Preserve @Zero so multi-agent scope parsing sees that Zero was directly addressed
+            cleaned = re.sub(rf"<@!?{bot_id}>", "@Zero", content)
+        elif is_banana_directive:
+            # Preserve @Zero so LLM knows Zero is explicitly addressed by Banana Watcher
+            cleaned = re.sub(rf"<@!?{bot_id}>", "@Zero", content)
+        else:
+            cleaned = re.sub(rf"<@!?{bot_id}>", "", content)
+
+        # Strip leading addressing role mentions
+        for rid in target_role_ids:
+            cleaned = re.sub(rf"^\s*<@&{rid}>\s*", "", cleaned)
+        # Convert inline role mentions to readable names rather than stripping to empty strings
+        cleaned = re.sub(r"<@&1543462881624858624>", "@team", cleaned)
+        cleaned = re.sub(r"<@&1543285916506783799>", "@robot", cleaned)
+        cleaned = re.sub(r"<@&1542294519914037341>", "@robot", cleaned)
         for rid in target_role_ids:
             cleaned = re.sub(rf"<@&{rid}>", "", cleaned)
-        cleaned = re.sub(r"^(hey\s+)?zero[:,\s]*", "", cleaned, flags=re.IGNORECASE)
+
+        # In multi-mention messages or Banana Watcher prompts, preserve explicit @Zero; only strip leading zero callout when sole addressee
+        if not other_mentions and not is_banana_directive:
+            cleaned = re.sub(r"^(hey\s+)?zero[:,\s]*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"@zero\b", "", cleaned, flags=re.IGNORECASE)
+        elif is_banana_directive:
+            cleaned = re.sub(r"@Zero\s*\(@Zero\):?", "@Zero:", cleaned, flags=re.IGNORECASE)
+
         cleaned = re.sub(r"^(hey\s+)?robot[:,\s]*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"@robot\b", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"@zero\b", "", cleaned, flags=re.IGNORECASE).strip()
-        if not cleaned:
-            await msg.reply("What's up? Give me something interesting to work on.")
-            return
+
+        # Convert peer mentions to human-readable names for LLM scope parsing
+        try:
+            from tools.handoff import TARGET_MENTIONS
+            for name, mention_str in TARGET_MENTIONS.items():
+                if name not in ("zero", "robot", "team"):
+                    m_id = mention_str.strip("<@!>")
+                    cleaned = re.sub(rf"<@!?{m_id}>", f"@{name.title()}", cleaned)
+        except Exception:
+            pass
+
+        cleaned = cleaned.strip()
+
+        if is_banana_summary_prompt:
+            m_subj = re.search(r"🍌 \*\*Discussion Concluded\*\*: Topic `(?P<subject>[^`]+)` has reached resolution", content)
+            concluded_subj = m_subj.group("subject") if m_subj else "concluded-topic"
+            cleaned += (
+                f"\n\n[CRITICAL OPERATIONAL DIRECTIVE - RULE 7 CONCLUDED DISCUSSION EXECUTIVE SUMMARY]:\n"
+                f"Banana Watcher has officially declared topic `{concluded_subj}` concluded in #the-banana-stand.\n"
+                f"In accordance with Crab Cavern Ratified Peer Operating Rule 7, you MUST execute the following:\n"
+                f"1. Review recent channel context to understand the problem, debate, and final consensus reached on `{concluded_subj}`.\n"
+                f"2. Synthesize a concise executive summary (strictly under 250 words) structured as:\n"
+                f"   • Problem / Motivation\n"
+                f"   • Resolution / Ratified Consensus\n"
+                f"   • Shipped Artifacts & PR/Code references\n"
+                f"   CRITICAL STYLE REQUIREMENT: Write strictly in plain language, without overly complex industry lingo, dense academic jargon, or acronym walls.\n"
+                f"3. Dispatch the executive summary directly to #lounge (<#1534452820995080192>) via outbox:\n"
+                f"   python3 /workspace/tools/outbox.py --channel lounge --message \"<summary_text>\"\n"
+                f"4. If durable decisions or architecture were agreed upon, log the resolution to /workspace/memory/crab_cavern/decisions.md.\n"
+                f"5. Acknowledge in #the-banana-stand with STRICTLY and ONLY '🍌' (a single banana emoji).\n"
+                f"   CRITICAL: Do NOT output the summary text body into #the-banana-stand!"
+            )
+
+        if is_banana_stall_prompt:
+            m_subj = re.search(r"🍌 \*\*Topic Stalled\*\*: Topic `(?P<subject>[^`]+)`", content)
+            stalled_subj = m_subj.group("subject") if m_subj else "stalled-topic"
+            cleaned += (
+                f"\n\n[CRITICAL OPERATIONAL DIRECTIVE - BANANA WATCHER TOPIC STALLED NUDGE]:\n"
+                f"Banana Watcher has flagged that topic `{stalled_subj}` has stalled without resolution in #the-banana-stand.\n"
+                f"In accordance with Crab Cavern Ratified Peer Operating Rule 6 ('Ship it or track it: never let agreed proposals drop on the floor'):\n"
+                f"1. Review recent channel context on `{stalled_subj}`.\n"
+                f"2. If the discussion concluded, reached consensus, or should be parked:\n"
+                f"   Reply directly in #the-banana-stand with: '🍌 Parking `{stalled_subj}`, Banana Watcher: <brief reason>' with handoff envelope (kind: 'resolution', floor: 'closed', reply: 'none').\n"
+                f"3. If there is an actionable proposal or pending task agreed upon, record a task ticket in /workspace/data/tasks.json, log to /workspace/memory/crab_cavern/decisions.md, and post the ticket details.\n"
+                f"4. You MUST respond to Banana Watcher. NEVER emit [NO_REPLY] to a Banana Watcher nudge."
+            )
+
+        if is_banana_loop_prompt:
+            m_subj = re.search(r"🍌 \*\*Loop Warning\*\*: Topic `(?P<subject>[^`]+)`", content)
+            loop_subj = m_subj.group("subject") if m_subj else "loop-topic"
+            cleaned += (
+                f"\n\n[CRITICAL OPERATIONAL DIRECTIVE - BANANA WATCHER LOOP WARNING]:\n"
+                f"Banana Watcher has flagged topic `{loop_subj}` for excessive turns without consensus.\n"
+                f"Clamp the loop immediately: synthesize a terminal conclusion, close the floor (`floor: 'closed'`), or park the topic.\n"
+                f"You MUST respond to Banana Watcher. NEVER emit [NO_REPLY] to a Banana Watcher prompt."
+            )
+        saved_attachments = []
+        if msg.attachments:
+            for att in msg.attachments:
+                safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", att.filename)
+                dest = ATTACHMENTS_DIR / f"{uuid.uuid4().hex[:8]}_{safe_name}"
+                try:
+                    await att.save(dest)
+                    saved_attachments.append(str(dest))
+                except Exception as e:
+                    print(f"[Bridge] Failed saving attachment: {e}")
 
         if cleaned.lower() in ("!reset", "/reset", "!new", "/new"):
             clear_channel_session_id(msg.channel.id, "external")
@@ -970,6 +1412,28 @@ async def handle_message(
                 await msg.reply(f"ℹ️ **{target_bot}** was not currently paused in <#{msg.channel.id}>.")
             return
 
+        # Operator emergency kill switch: !halt / !resume for Station Agora trading
+        agora_halt_match = re.search(r"^(?:!halt|/halt|!stop|/stop)(?:\s+(.*))?$", cleaned.strip(), re.IGNORECASE)
+        if agora_halt_match:
+            from tools.agora_kill_switch import trigger_kill_switch
+            res = trigger_kill_switch(initiator=author_name, action="halt", channel_id=msg.channel.id)
+            await msg.reply(res["message"])
+            return
+
+        agora_resume_match = re.search(r"^(?:!resume|/resume|!start|/start)(?:\s+(.*))?$", cleaned.strip(), re.IGNORECASE)
+        if agora_resume_match:
+            from tools.agora_kill_switch import trigger_kill_switch
+            res = trigger_kill_switch(initiator=author_name, action="resume", channel_id=msg.channel.id)
+            await msg.reply(res["message"])
+            return
+
+        if is_container_restart_intent(cleaned):
+            if msg.author.id != OWNER_USER_ID:
+                await msg.reply("⚠️ Administrative container restart commands are restricted to the bot owner.")
+                return
+            await execute_container_restart(msg.channel, initiator=author_name, reason="Manual Docker container restart requested via Discord (external channel)")
+            return
+
         if is_reload_intent(cleaned):
             if msg.author.id != OWNER_USER_ID:
                 await msg.reply("⚠️ Administrative bridge commands are restricted to the bot owner.")
@@ -980,16 +1444,39 @@ async def handle_message(
                 await execute_bridge_reload(bot, msg.channel, initiator=author_name, force=True, reason="Manual in-place bridge reload requested via Discord (external channel)")
             return
 
-        saved_attachments = []
-        if msg.attachments:
-            for att in msg.attachments:
-                safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", att.filename)
-                dest = ATTACHMENTS_DIR / f"{uuid.uuid4().hex[:8]}_{safe_name}"
-                try:
-                    await att.save(dest)
-                    saved_attachments.append(str(dest))
-                except Exception as e:
-                    print(f"[Bridge] Failed saving attachment: {e}")
+        # Check for minimal / lazy pings (e.g. role mentions only, ^, ^^, or short pointer phrases)
+        is_lazy_pointer = bool(
+            not cleaned or
+            re.fullmatch(r"[\^\s\.\?!]+", cleaned) or
+            cleaned.lower() in ("^", "^^", "^^^", "this", "look", "see", "what?", "check this")
+        )
+        if is_lazy_pointer and not saved_attachments:
+            cleaned = (
+                f"[OPERATIONAL DIRECTIVE - LAZY TYPER ADDRESSING]:\n"
+                f"The user sent a minimal ping ('{content.strip()}').\n"
+                f"Humans are lazy typers: you MUST read back up the recent messages in Discord channel context to identify and address the active topic, question, problem, link, or proposal at hand immediately."
+            )
+
+        if saved_attachments:
+            image_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+            has_images = any(Path(p).suffix.lower() in image_exts for p in saved_attachments)
+            image_directive = (
+                "\n\n[CRITICAL IMAGE INPUT INVARIANT]:\n"
+                "One or more images are attached to this message. You MUST parse and inspect every image (using view_file) and understand its visual contents, error traces, screenshots, or diagrams as part of the primary input, EVEN IF the accompanying text message made no mention of the image."
+                if has_images else ""
+            )
+            hint = "\n\n[Attached file(s) available via view_file tool]:\n" + "\n".join(f"- {p}" for p in saved_attachments)
+            if is_lazy_pointer:
+                cleaned = (
+                    f"[OPERATIONAL DIRECTIVE - LAZY TYPER & ATTACHMENT ADDRESSING]:\n"
+                    f"The user sent an attachment with a minimal prompt ('{content.strip()}').\n"
+                    f"Humans are lazy typers: review the attached image/file(s) and recent channel context to address the active topic directly."
+                )
+            cleaned = (cleaned or "Please inspect the attached file(s) and assist.") + hint + image_directive
+
+        if not cleaned:
+            await msg.reply("What's up? Give me something interesting to work on.")
+            return
 
         try:
             await msg.channel.typing()
@@ -1001,7 +1488,6 @@ async def handle_message(
         target_proc = channel_active_procs.get(msg.channel.id)
         if target_proc is not None and target_proc.returncode is None:
             steering_channels.add(msg.channel.id)
-            br.is_ext_steering = True
             try:
                 target_proc.send_signal(signal.SIGINT)
             except Exception as se:
@@ -1025,13 +1511,14 @@ async def handle_message(
                 "is_steer": True,
                 "mode": "external",
                 "channel_id": msg.channel.id,
-                "author_name": author_name
+                "author_name": author_name,
+                "queued_at": time.perf_counter(),
             })
             return
 
         is_last_word = False
         last_word_streak = 0
-        if msg.author.bot and rules.get("last_word_protocol_enabled", True):
+        if msg.author.bot and not is_banana_watcher and rules.get("last_word_protocol_enabled", True):
             lw_channels = rules.get("last_word_channels", [1534452820995080192])
             if not lw_channels or msg.channel.id in lw_channels:
                 try:
@@ -1062,6 +1549,7 @@ async def handle_message(
             "last_word_bot_id": str(msg.author.id) if msg.author.bot else None,
             "last_word_bot_name": author_name if msg.author.bot else None,
             "last_word_streak": last_word_streak,
+            "queued_at": time.perf_counter(),
         })
         return
 
@@ -1134,11 +1622,74 @@ async def handle_message(
             await msg.reply(f"ℹ️ **{target_bot}** was not currently paused in <#{target_ch}>.")
         return
 
+    # Operator emergency kill switch: !halt / !resume for Station Agora trading
+    agora_halt_match = re.search(r"^(?:!halt|/halt|!stop|/stop)(?:\s+(.*))?$", content.strip(), re.IGNORECASE)
+    if agora_halt_match:
+        from tools.agora_kill_switch import trigger_kill_switch
+        res = trigger_kill_switch(initiator=author_name, action="halt", channel_id=msg.channel.id)
+        await msg.reply(res["message"])
+        return
+
+    agora_resume_match = re.search(r"^(?:!resume|/resume|!start|/start)(?:\s+(.*))?$", content.strip(), re.IGNORECASE)
+    if agora_resume_match:
+        from tools.agora_kill_switch import trigger_kill_switch
+        res = trigger_kill_switch(initiator=author_name, action="resume", channel_id=msg.channel.id)
+        await msg.reply(res["message"])
+        return
+
+    if is_container_restart_intent(content):
+        ch_name = getattr(msg.channel, "name", "zero-chat")
+        await execute_container_restart(msg.channel, initiator=author_name, reason=f"Manual Docker container restart requested via #{ch_name}")
+        return
+
     if is_reload_intent(content):
+        ch_name = getattr(msg.channel, "name", "zero-chat")
         if reload_fn:
-            await reload_fn(msg.channel, initiator=author_name, force=True, reason="Manual in-place bridge reload requested via #zero-chat")
+            await reload_fn(msg.channel, initiator=author_name, force=True, reason=f"Manual in-place bridge reload requested via #{ch_name}")
         else:
-            await execute_bridge_reload(bot, msg.channel, initiator=author_name, force=True, reason="Manual in-place bridge reload requested via #zero-chat")
+            await execute_bridge_reload(bot, msg.channel, initiator=author_name, force=True, reason=f"Manual in-place bridge reload requested via #{ch_name}")
+        return
+
+    # Handle BananaWatcher commands
+    if content.lower().startswith("!bananawatcher") or content.lower().startswith("!banana-watcher") or content.lower().startswith("/bananawatcher"):
+        from tools.banana_watcher import get_daemon_status, load_state, check_channel_and_evaluate, start_daemon, stop_daemon
+        parts = content.split(maxsplit=1)
+        subcmd = parts[1].strip().lower() if len(parts) > 1 else "status"
+        if subcmd == "status":
+            st = get_daemon_status()
+            state = load_state()
+            last_check_str = "Never"
+            if state.get("last_check_ts"):
+                ago = int(time.time() - state["last_check_ts"])
+                last_check_str = f"{ago}s ago"
+            await msg.reply(
+                f"🍌 **BananaWatcher Status:**\n"
+                f"• **Daemon Running:** `{st['running']}` (PID: `{st['pid']}`)\n"
+                f"• **Channel:** <#1534436119888793750> (`#the-banana-stand`)\n"
+                f"• **Last Evaluation:** `{last_check_str}`\n"
+                f"• **Tracked Stalls:** {len(state.get('nudged_stalls', {}))}\n"
+                f"• **Tracked Auto-Closes:** {len(state.get('autoclosed_topics', {}))}\n"
+                f"• **Tracked Handoffs:** {len(state.get('nudged_handoffs', {}))}\n"
+                f"• **Tracked Contradictions:** {len(state.get('warned_contradictions', {}))}\n"
+                f"• **Tracked Summaries:** {len(state.get('summarized_subjects', {}))}"
+            )
+        elif subcmd == "start":
+            st = get_daemon_status()
+            if st["running"]:
+                await msg.reply(f"🍌 **BananaWatcher** is already running with PID `{st['pid']}`.")
+            else:
+                res = start_daemon()
+                await msg.reply(f"🚀 Started **BananaWatcher** daemon (PID: `{res.get('pid')}`).")
+        elif subcmd == "stop":
+            st = get_daemon_status()
+            if not st["running"]:
+                await msg.reply("ℹ️ **BananaWatcher** is not currently running.")
+            else:
+                stop_daemon()
+                await msg.reply(f"🛑 Stopped **BananaWatcher** (PID `{st['pid']}`).")
+        elif subcmd in ("run-once", "check"):
+            actions = check_channel_and_evaluate(dry_run=True)
+            await msg.reply(f"🍌 **BananaWatcher Dry Run:** Actions triggered: `{actions or 'None'}`")
         return
 
     # Handle model query & switching commands
@@ -1214,8 +1765,8 @@ async def handle_message(
         "/heartbeat": ("⏳ *Running on-demand Heartbeat Sweep...*", "Run the infrastructure heartbeat check using /workspace/tools/sidecars.py heartbeat. Report the status cleanly."),
         "!triage": ("⏳ *Running on-demand Nightly Triage & Briefing...*", "Run the nightly agenda & inbox triage briefing using /workspace/tools/sidecars.py triage. Present tomorrow's calendar agenda and priority unread emails."),
         "/triage": ("⏳ *Running on-demand Nightly Triage & Briefing...*", "Run the nightly agenda & inbox triage briefing using /workspace/tools/sidecars.py triage. Present tomorrow's calendar agenda and priority unread emails."),
-        "!logs": ("⏳ *Running on-demand NAS Log Review...*", "Run the NAS log review using /workspace/tools/sidecars.py nas_logs. Report findings cleanly."),
-        "/logs": ("⏳ *Running on-demand NAS Log Review...*", "Run the NAS log review using /workspace/tools/sidecars.py nas_logs. Report findings cleanly."),
+        "!logs": ("⏳ *Running on-demand NAS Log Review...*", "Run the autonomous NAS log review and triage using /workspace/tools/nas_log_triage.py. If issues are found, investigate root causes, apply safe code/config fixes autonomously, and present one-click options for any needed approvals. If clean, report the crisp one-liner."),
+        "/logs": ("⏳ *Running on-demand NAS Log Review...*", "Run the autonomous NAS log review and triage using /workspace/tools/nas_log_triage.py. If issues are found, investigate root causes, apply safe code/config fixes autonomously, and present one-click options for any needed approvals. If clean, report the crisp one-liner."),
         "!plex": ("⏳ *Running on-demand Plex Transcode Cleanup...*", "Run the Plex transcode cache cleanup using /workspace/tools/sidecars.py plex. Report status."),
         "/plex": ("⏳ *Running on-demand Plex Transcode Cleanup...*", "Run the Plex transcode cache cleanup using /workspace/tools/sidecars.py plex. Report status."),
         "!reminders": ("⏳ *Checking dated reminders...*", "Check dated one-shot reminders using /workspace/tools/sidecars.py reminders. Report any due reminders."),
@@ -1230,6 +1781,8 @@ async def handle_message(
         "/digest": ("⏳ *Generating Option B Weekly Digest...*", "Generate and post the Option B Weekly Proactive Digest using /workspace/tools/weekly_digest.py. Present upcoming maintenance, 30-day renewals, and cash-flow deltas cleanly."),
         "!tasks": ("⏳ *Fetching project and task tracker...*", "Show active projects and tasks using /workspace/tools/task_manager.py summary."),
         "/tasks": ("⏳ *Fetching project and task tracker...*", "Show active projects and tasks using /workspace/tools/task_manager.py summary."),
+        "!tasks-sync": ("⏳ *Syncing tasks with Google Tasks...*", "Run two-way task sync with Google Tasks using /workspace/tools/sidecars.py tasks_sync. Report any changes cleanly."),
+        "/tasks-sync": ("⏳ *Syncing tasks with Google Tasks...*", "Run two-way task sync with Google Tasks using /workspace/tools/sidecars.py tasks_sync. Report any changes cleanly."),
         "!projects": ("⏳ *Fetching project and task tracker...*", "Show active projects and tasks using /workspace/tools/task_manager.py summary."),
         "/projects": ("⏳ *Fetching project and task tracker...*", "Show active projects and tasks using /workspace/tools/task_manager.py summary."),
         "!schedule": ("⏳ *Fetching sidecar schedule...*", "Show the current sidecar schedule using /workspace/tools/scheduler_tool.py summary."),
@@ -1246,6 +1799,8 @@ async def handle_message(
         "/sabnzbd": ("⏳ *Checking SABnzbd queue & recent history...*", "Run the SABnzbd downloader check using /workspace/tools/sidecars.py sabnzbd --force. Report status."),
         "!kometa_audit": ("⏳ *Auditing recent Kometa run logs...*", "Run the Kometa post-run log audit using /workspace/tools/sidecars.py kometa_audit --force. Report status."),
         "/kometa_audit": ("⏳ *Auditing recent Kometa run logs...*", "Run the Kometa post-run log audit using /workspace/tools/sidecars.py kometa_audit --force. Report status."),
+        "!cubs": ("⏳ *Checking Cubs game schedule...*", "Check the Chicago Cubs game schedule using /workspace/tools/sidecars.py cubs --test. Present matchup, start time, and streaming options."),
+        "/cubs": ("⏳ *Checking Cubs game schedule...*", "Check the Chicago Cubs game schedule using /workspace/tools/sidecars.py cubs --test. Present matchup, start time, and streaming options."),
         "!sidecars": ("⏳ *Fetching sidecar execution health...*", "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status."),
         "/sidecars": ("⏳ *Fetching sidecar execution health...*", "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status."),
         "!mcp": ("⏳ *Checking MCP daemon status...*", "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status."),
@@ -1256,8 +1811,6 @@ async def handle_message(
         "/morning": ("⏳ *Running Crab Cavern morning rotation dispatcher...*", "Run the Crab Cavern morning rotation dispatcher using /workspace/tools/morning_dispatcher.py --dispatch."),
         "!birthdays": ("⏳ *Checking birthdays today...*", "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py. Post any birthdays."),
         "/birthdays": ("⏳ *Checking birthdays today...*", "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py. Post any birthdays."),
-        "!tokens": ("⏳ *Generating token budget report...*", "Run the daily token & Google AI Ultra compute budget usage report using /workspace/tools/sidecars.py token_report."),
-        "/tokens": ("⏳ *Generating token budget report...*", "Run the daily token & Google AI Ultra compute budget usage report using /workspace/tools/sidecars.py token_report."),
         "!standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
         "/standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
         "!market_standup": ("⏳ *Running Market Sandbox autonomous standup dispatcher...*", "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch."),
@@ -1287,7 +1840,13 @@ async def handle_message(
         "!ha_update_check": ("⏳ *Checking for Home Assistant updates...*", "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py."),
         "/ha_update_check": ("⏳ *Checking for Home Assistant updates...*", "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py."),
         "!dockhand_update": ("⏳ *Checking Dockhand container updates...*", "Run the Dockhand container image check using /workspace/tools/dockhand_update.py."),
-        "/dockhand_update": ("⏳ *Checking Dockhand container updates...*", "Run the Dockhand container image check using /workspace/tools/dockhand_update.py.")
+        "/dockhand_update": ("⏳ *Checking Dockhand container updates...*", "Run the Dockhand container image check using /workspace/tools/dockhand_update.py."),
+        "!meals": ("⏳ *Generating 3-dinner meal proposal...*", "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons."),
+        "/meals": ("⏳ *Generating 3-dinner meal proposal...*", "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons."),
+        "!mealplan": ("⏳ *Generating 3-dinner meal proposal...*", "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons."),
+        "/mealplan": ("⏳ *Generating 3-dinner meal proposal...*", "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons."),
+        "!grocery": ("⏳ *Compiling weekly Whole Foods delivery cart...*", "Run the weekly Whole Foods grocery staging using /workspace/tools/sidecars.py grocery_staging. Ingest pending items from Home Assistant ('todo.shopping_list') and due recurring staples, then post the 1-click cart link."),
+        "/grocery": ("⏳ *Compiling weekly Whole Foods delivery cart...*", "Run the weekly Whole Foods grocery staging using /workspace/tools/sidecars.py grocery_staging. Ingest pending items from Home Assistant ('todo.shopping_list') and due recurring staples, then post the 1-click cart link.")
     }
 
     cmd_key = content.lower().split()[0] if content else ""
@@ -1320,7 +1879,8 @@ async def handle_message(
             "attachments": [],
             "is_steer": False,
             "mode": "home",
-            "channel_id": msg.channel.id
+            "channel_id": msg.channel.id,
+            "queued_at": time.perf_counter(),
         })
         return
 
@@ -1352,17 +1912,70 @@ async def handle_message(
                     "is_steer": False,
                     "mode": "home",
                     "channel_id": thread.id,
-                    "is_thread_task": True
+                    "is_thread_task": True,
+                    "queued_at": time.perf_counter(),
                 })
                 return
             except Exception as te:
                 print(f"[Bridge] Error creating explicit thread: {te}")
 
     # Build prompt content
-    prompt_content = content
+    prompt_content = (content or "").strip()
+    words = prompt_content.split()
+    low_content = prompt_content.lower().rstrip(".?! ")
+    is_lazy_home = bool(
+        not prompt_content or
+        re.fullmatch(r"[\^\s\.\?!]+", prompt_content) or
+        low_content in (
+            "^", "^^", "^^^", "this", "look", "see", "what?", "check this",
+            "investigate", "check", "troubleshoot", "status", "why", "what happened",
+            "fix", "fix this", "help", "update", "audit", "thoughts", "look into this"
+        ) or
+        (len(words) <= 2 and low_content.startswith(("check", "why", "investigate", "fix", "look", "what", "audit")))
+    )
+    if is_lazy_home and not saved_attachments:
+        recent_ctx = ""
+        try:
+            from tools.channel_history import format_channel_context
+            hist = format_channel_context(msg.channel.id, limit=5, include_linked_channels=False)
+            if hist and hist.strip():
+                recent_ctx = f"\n\n[RECENT DISCORD CHANNEL CONTEXT (Preceding messages in this channel)]:\n{hist.strip()}"
+        except Exception as e:
+            print(f"[Bridge] Warning formatting channel history for lazy prompt: {e}")
+
+        lazy_context = (
+            "[OPERATIONAL DIRECTIVE - LAZY TYPER ADDRESSING]:\n"
+            f"The user sent a minimal prompt ('{content.strip()}').\n"
+            "Humans are lazy typers: review the preceding Discord channel history below and recent conversation context to identify the topic, alert, question, or task at hand and address it directly with full technical rigor."
+            f"{recent_ctx}"
+        )
+        prompt_content = f"{lazy_context}\n\n{prompt_content}".strip()
+
     if saved_attachments:
+        image_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+        has_images = any(Path(p).suffix.lower() in image_exts for p in saved_attachments)
+        image_directive = (
+            "\n\n[CRITICAL IMAGE INPUT INVARIANT]:\n"
+            "One or more images are attached to this message. You MUST parse and inspect every image (using view_file) and understand its visual contents, error traces, screenshots, or diagrams as part of the primary input, EVEN IF the accompanying text message made no mention of the image."
+            if has_images else ""
+        )
         hint = "\n\n[Attached file(s) available via view_file tool]:\n" + "\n".join(f"- {p}" for p in saved_attachments)
-        prompt_content = (prompt_content or "Please inspect the attached file(s) and assist.") + hint
+        if is_lazy_home:
+            recent_ctx = ""
+            try:
+                from tools.channel_history import format_channel_context
+                hist = format_channel_context(msg.channel.id, limit=5, include_linked_channels=False)
+                if hist and hist.strip():
+                    recent_ctx = f"\n\n[RECENT DISCORD CHANNEL CONTEXT (Preceding messages in this channel)]:\n{hist.strip()}"
+            except Exception:
+                pass
+            prompt_content = (
+                f"[OPERATIONAL DIRECTIVE - LAZY TYPER & ATTACHMENT ADDRESSING]:\n"
+                f"The user sent an attachment with a minimal prompt ('{content.strip()}').\n"
+                "Humans are lazy typers: review the attached image/file(s) and preceding Discord channel history to address the active topic directly."
+                f"{recent_ctx}"
+            )
+        prompt_content = (prompt_content or "Please inspect the attached file(s) and assist.") + hint + image_directive
 
     if not prompt_content:
         return
@@ -1407,7 +2020,8 @@ async def handle_message(
             "is_steer": True,
             "mode": "home",
             "channel_id": msg.channel.id,
-            "is_thread_task": is_thread_channel
+            "is_thread_task": is_thread_channel,
+            "queued_at": time.perf_counter(),
         })
         return
 
@@ -1423,5 +2037,6 @@ async def handle_message(
         "is_steer": False,
         "mode": "home",
         "channel_id": msg.channel.id,
-        "is_thread_task": is_thread_channel
+        "is_thread_task": is_thread_channel,
+        "queued_at": time.perf_counter(),
     })
