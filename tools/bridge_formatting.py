@@ -53,43 +53,58 @@ def convert_markdown_tables(text: str) -> str:
                 table_rows.append(cells)
                 i += 1
 
-            # Detect if this is a comparison or complex multi-column table
+            # Detect if this is a true comparison table
+            # True comparison: header 0 is Feature/Criteria/VS AND header 1..N are product/option names (not attribute words)
             is_comparison = False
+            attr_words = {
+                "count", "status", "notes", "note", "details", "detail", "description",
+                "value", "val", "cost", "price", "port", "host", "ip", "url", "link",
+                "date", "time", "type", "size", "action", "result", "finding", "resolution",
+                "state", "reason", "error", "percent", "percentage", "progress", "metric", "unit"
+            }
             if len(headers) >= 3:
                 h0 = headers[0].lower()
-                if h0 in ("feature", "attribute", "metric", "criteria", "aspect", "comparison", "spec", "parameter", "vs"):
-                    is_comparison = True
-                elif any(len(r) > 1 and (len(r[1]) > 25 or "(" in r[1]) for r in table_rows):
-                    is_comparison = True
-                elif any(len(r) > 2 and (len(r[2]) > 25 or "(" in r[2]) for r in table_rows):
-                    is_comparison = True
+                other_headers = [h.lower().strip() for h in headers[1:]]
+                if h0 in ("feature", "criteria", "aspect", "comparison", "vs", "versus"):
+                    if not any(oh in attr_words for oh in other_headers):
+                        is_comparison = True
 
             for row in table_rows:
                 if not row or not any(row):
                     continue
                 first = re.sub(r"^\*\*|\*\*$", "", row[0]).strip()
+                if not first:
+                    continue
 
                 if is_comparison and len(headers) >= 3:
-                    out.append(f"• **{first}**:")
+                    out.append(f"- **{first}**:")
                     for col_idx in range(1, len(headers)):
-                        if col_idx < len(row) and row[col_idx]:
+                        if col_idx < len(row):
+                            val = row[col_idx].strip()
                             clean_col = re.sub(r"^\*\*|\*\*$", "", headers[col_idx]).strip()
-                            val = row[col_idx]
-                            out.append(f"  - *{clean_col}*: {val}")
-                elif len(row) == 2 or (len(headers) == 2 and len(row) >= 2):
-                    val = row[1].strip()
-                    out.append(f"• **{first}**: {val}")
+                            if val and val not in ("—", "-"):
+                                out.append(f"  - *{clean_col}*: {val}")
+                elif len(headers) == 2 or len(row) == 2:
+                    val = row[1].strip() if len(row) > 1 else ""
+                    out.append(f"- **{first}**: {val}")
                 else:
-                    second = row[1] if len(row) > 1 else ""
-                    notes = " · ".join(c for c in row[2:] if c) if len(row) > 2 else ""
+                    second = row[1].strip() if len(row) > 1 else ""
+                    if second in ("—", "-"):
+                        second = ""
+                    notes_parts = [c.strip() for c in row[2:] if c.strip() and c.strip() not in ("—", "-")]
+                    notes = " · ".join(notes_parts)
+
                     if second and notes:
-                        out.append(f"• **{first}** ({second}): {notes}")
+                        if "(" not in second and len(second) <= 25:
+                            out.append(f"- **{first}** ({second}): {notes}")
+                        else:
+                            out.append(f"- **{first}**: {second} · {notes}")
                     elif second:
-                        out.append(f"• **{first}** ({second})")
+                        out.append(f"- **{first}** ({second})")
                     elif notes:
-                        out.append(f"• **{first}**: {notes}")
+                        out.append(f"- **{first}**: {notes}")
                     else:
-                        out.append(f"• **{first}**")
+                        out.append(f"- **{first}**")
             continue
         out.append(line)
         i += 1
@@ -117,6 +132,46 @@ def format_for_discord(text: str) -> str:
     text = re.sub(r"\[([^\]]+)\]\(file://[^\)]*\)", clean_file_link, text)
     text = re.sub(r"(?<![\w`\(])file://(/[^\s\)\>]+?)(?=[.,;:?!]?(?:\s|$|\)))", r"`\1`", text)
 
+    # 1b. Normalize Discord hyperlinks:
+    # Discord breaks when bold/italics wrap the outside of brackets (**[label](url)**)
+    # or when emojis are inside brackets. Also, raw URLs with underscores inside parentheses
+    # can trigger italic markdown unless wrapped in angle brackets (< >).
+    def normalize_discord_links(m):
+        prefix_outer = m.group(1) or ""
+        label = m.group(2).strip()
+        raw_url = m.group(3).strip()
+        clean_url = raw_url.strip("<>").strip()
+
+        # Preserve Tenor/Giphy links so Discord media player can embed them
+        if "tenor.com/view/" in clean_url or "giphy.com/gifs/" in clean_url:
+            return f"[{label}]({clean_url})"
+
+        # If label starts with an emoji, move it outside the bracket for clean parsing
+        emoji_match = re.match(r"^([\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50]+|\:\w+\:)\s*(.*)$", label)
+        if emoji_match and emoji_match.group(2).strip():
+            lead_emoji = emoji_match.group(1)
+            inner_label = emoji_match.group(2).strip()
+        else:
+            lead_emoji = ""
+            inner_label = label
+
+        # Discord's link parser requires plain text inside brackets ([]).
+        # Any bold (**), italic (*), or backtick (`) formatting inside or outside brackets breaks the link.
+        clean_inner = inner_label.strip("*_`").strip()
+
+        # If label is identical to the target URL, collapse redundant [url](<url>) into clean <url>
+        if clean_inner.lower() == clean_url.lower() or clean_inner.lower().rstrip("/") == clean_url.lower().rstrip("/"):
+            return f"<{clean_url}>"
+
+        link_str = f"[{clean_inner}](<{clean_url}>)"
+
+        if lead_emoji:
+            return f"{lead_emoji} {link_str}"
+        return link_str
+
+    pattern = r"(\*\*|\*)?\[([^\]]+)\]\(<?(https?://[^\)>]+)>?\)(?:\1)?"
+    text = re.sub(pattern, normalize_discord_links, text)
+
     # 2. Strip internal action/progress pseudo-tags (e.g. <Action: ...>)
     text = re.sub(r"<\s*action:[^>]+>", "", text, flags=re.IGNORECASE)
 
@@ -137,12 +192,25 @@ def format_for_discord(text: str) -> str:
     # 4. Convert markdown pipe tables to clean Discord mobile cards
     text = convert_markdown_tables(text)
 
+    # 4b. Normalize literal Unicode bullets (•) to native Discord markdown list syntax (-)
+    # Discord treats literal • as plain paragraph text, breaking mobile hanging indents and creating blank line gaps before sublists.
+    text = re.sub(r"^([ \t]*(?:>[ \t]*)*)•[ \t]*", r"\1- ", text, flags=re.MULTILINE)
+
+    # 4c. Tighten loose lists where a parent list item is followed by an empty line before its sub-bullets
+    text = re.sub(r"(^[ \t]*(?:[-*]|\d+\.)\s+[^\n]+)\n\n+([ \t]{2,}(?:[-*]|\d+\.)\s+)", r"\1\n\2", text, flags=re.MULTILINE)
+
     # 5. Strip internal agent task lifecycle envelopes and echoed system progress headers
     text = re.sub(
-        r"<SYSTEM_MESSAGE>[\s\S]*?</SYSTEM_MESSAGE>",
+        r"(?:The following is a\s+)?<SYSTEM_MESSAGE>[\s\S]*?</SYSTEM_MESSAGE>",
         "",
         text,
         flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?:^|\n+)\s*The following is a\s*(?=\n|$)",
+        "",
+        text,
+        flags=re.IGNORECASE,
     )
     text = re.sub(
         r"An asynchronous task has completed:\s*[^\n]+\s*\(State:\s*[^\)]+\)(?:\s*Result payload:\s*\d+)?(?:\s*Task output:\s*(?:\[[^\]\r\n]*\]|[^\r\n]*))?",
@@ -162,21 +230,53 @@ def format_for_discord(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
+    # 5b. Strip Antigravity CLI internal placeholder sentinels
+    text = re.sub(
+        r"^\s*(?:No content generated yet\.?\s*)+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?:^|\n+)\s*No content generated yet\.?\s*(?=\n|$)",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
+
     # 6. Strip intermediate background task wait and launch self-narration chatter
     text = re.sub(
-        r"(?:^|\n+)(?:I (?:have\s+)?(?:initiated|launched|started|spawned|triggered)[^\n]+?(?:as soon as the (?:background\s+)?task\s+(?:completes|finishes)|when the (?:command|task)\s+finishes|and (?:will\s+)?wait for it to finish|waiting for PID 1 to consume)[^\n]*\.?)",
+        r"(?:^|\n+|\.\s+)\s*I (?:have\s+)?(?:initiated|launched|started|spawned|triggered)[^\n]+?(?:as soon as the (?:background\s+)?task\s+(?:completes|finishes)|when the (?:command|task)\s+finishes|and (?:will\s+)?wait for it to finish|the moment it completes|waiting for PID 1 to consume)[^\n]*\.?",
         "",
         text,
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"(?:^|\n+)(?:I will (?:review|inspect|check|analyze) the results (?:as soon as|when|once) the (?:background\s+)?task (?:completes|finishes)\.?)",
+        r"(?:^|\n+|\.\s+)\s*I will (?:review|inspect|check|analyze) the results (?:as soon as|when|once|the moment) the (?:background\s+)?task (?:completes|finishes)[^\n]*\.?",
         "",
         text,
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"(?:^|\n+)(?:I have launched [^\n]+? and will wait for it to finish\.?)",
+        r"(?:^|\n+|\.\s+)\s*I am pausing tool calls to allow [^\n]+? to complete in the background[^\n]*\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?:^|\n+|\.\s+)\s*The system will resume execution automatically once [^\n]+\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?:^|\n+|\.\s+)\s*I have launched [^\n]+? and will wait for it to finish[^\n]*\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?:^|\n+)\s*Waiting for task-\d+ to complete\.\.\.?",
         "",
         text,
         flags=re.IGNORECASE,
@@ -185,17 +285,26 @@ def format_for_discord(text: str) -> str:
     # 7. Sanitize reaction GIFs: verify Tenor links are live (HTTP 200) and replace 404s with working fallbacks
     text = sanitize_reaction_gifs(text)
 
+    # 8. Ensure handoff envelopes include physical Discord mentions for peer bots
+    try:
+        from tools.handoff import ensure_handoff_mentions
+        text = ensure_handoff_mentions(text)
+    except Exception:
+        pass
+
     return text.strip()
 
 
 def sanitize_reaction_gifs(text: str) -> str:
     """Probe Tenor and Giphy links in Discord output. If a reaction GIF returns HTTP 404,
     replace it with a live dynamic GIF or strip the line so Discord never renders broken previews.
-    Also ensures all bare GIF URLs are formatted as properly titled markdown hyperlinks."""
+    Normalizes all GIF links to [GIF](url) format and repositions the GIF hyperlink to the
+    very end of the message (immediately before any [CHOICES: ...] / [OPTIONS: ...] block)."""
     if not text or ("tenor.com/view/" not in text and "giphy.com/gifs/" not in text):
         return text
 
-    gif_urls = re.findall(r"https?://(?:www\.)?(?:tenor\.com/view/[a-zA-Z0-9_\-]+|giphy\.com/gifs/[a-zA-Z0-9_\-]+)", text)
+    gif_url_pattern = r"https?://(?:www\.)?(?:tenor\.com/view/[a-zA-Z0-9_\-]+|giphy\.com/gifs/[a-zA-Z0-9_\-]+)"
+    gif_urls = re.findall(gif_url_pattern, text)
     for url in set(gif_urls):
         is_ok = False
         try:
@@ -224,21 +333,264 @@ def sanitize_reaction_gifs(text: str) -> str:
                 text = re.sub(rf"(?:^|\n)[^\n]*{re.escape(url)}[^\n]*(?:\n|$)", "\n", text)
                 continue
 
-        # Format bare GIF URL as properly titled markdown hyperlink if not already linked
-        try:
-            from tools.gif_tool import clean_slug_title
-            slug = url.split("/")[-1]
-            title = clean_slug_title(slug)
-            pattern = rf"(^|[^]\(\<\[]){re.escape(url)}"
-            text = re.sub(pattern, rf"\1[{title}]({url})", text)
-        except Exception:
-            pass
+    # Find remaining valid URLs
+    remaining_urls = re.findall(gif_url_pattern, text)
+    if not remaining_urls:
+        return text.strip()
 
-    return text
+    # Deduplicate while preserving original appearance order
+    unique_urls = list(dict.fromkeys(remaining_urls))
+
+    # Regex matching markdown links, angle-bracketed URLs, or bare GIF URLs
+    full_gif_re = re.compile(
+        r"\[[^\]]*\]\(\s*<?" + gif_url_pattern + r">?\s*\)|"
+        r"<" + gif_url_pattern + r">|"
+        r"(?<!\(|<|\[)" + gif_url_pattern
+    )
+
+    # Strip existing GIF links from lines
+    lines = text.split("\n")
+    cleaned_lines = []
+    for line in lines:
+        line_stripped = line.strip()
+        if full_gif_re.fullmatch(line_stripped):
+            continue
+        cleaned_line = full_gif_re.sub("", line).rstrip()
+        if cleaned_line.strip() or not line_stripped:
+            cleaned_lines.append(cleaned_line)
+
+    raw_body = "\n".join(cleaned_lines)
+    collapsed_body = re.sub(r"\n{3,}", "\n\n", raw_body).strip()
+    gif_block = "\n".join(f"[GIF]({u})" for u in unique_urls)
+
+    # Place GIF immediately before trailing [CHOICES: ...] or [OPTIONS: ...] block, or at the end
+    choices_pattern = re.compile(r"(\n*\s*\[(?:CHOICES|OPTIONS):\s*[^\]]+\]\s*)$", re.IGNORECASE)
+    choices_match = choices_pattern.search(collapsed_body)
+    if choices_match:
+        content_before = collapsed_body[:choices_match.start()].rstrip()
+        choice_block = choices_match.group(1).strip()
+        if content_before:
+            return f"{content_before}\n\n{gif_block}\n\n{choice_block}"
+        else:
+            return f"{gif_block}\n\n{choice_block}"
+    else:
+        if collapsed_body:
+            return f"{collapsed_body}\n\n{gif_block}"
+        else:
+            return gif_block
 
 
-def extract_agent_response(raw_text: str) -> str:
+def strip_reaction_gifs(text: str) -> str:
+    """Completely remove all Tenor, Giphy, and reaction GIF links from text,
+    stripping orphan lines and collapsing surplus whitespace."""
+    if not text or ("tenor.com" not in text and "giphy.com" not in text and ".gif" not in text.lower()):
+        return text.strip()
+
+    gif_url_pattern = r"https?://(?:www\.)?(?:tenor\.com/(?:view/)?[a-zA-Z0-9_\-]+|media\.tenor\.com/[a-zA-Z0-9_\-/]+|giphy\.com/gifs/[a-zA-Z0-9_\-]+|[^\s\)\>\]]+\.gif\b)"
+    full_gif_re = re.compile(
+        r"\[[^\]]*\]\(\s*<?" + gif_url_pattern + r">?\s*\)|"
+        r"<" + gif_url_pattern + r">|"
+        r"(?<!\(|<|\[)" + gif_url_pattern,
+        re.IGNORECASE,
+    )
+
+    lines = text.split("\n")
+    cleaned_lines = []
+    for line in lines:
+        line_stripped = line.strip()
+        if full_gif_re.fullmatch(line_stripped):
+            continue
+        cleaned_line = full_gif_re.sub("", line).rstrip()
+        if cleaned_line.strip() or not line_stripped:
+            cleaned_lines.append(cleaned_line)
+
+    raw_body = "\n".join(cleaned_lines)
+    return re.sub(r"\n{3,}", "\n\n", raw_body).strip()
+
+
+def harvest_transcript_response(conv_id: str | None) -> str | None:
+    """Harvest completed response from transcript files if stdout was truncated or cut off."""
+    try:
+        from tools.bridge_runner import harvest_transcript_response as _htr
+        return _htr(conv_id)
+    except Exception:
+        return None
+
+
+class AgyStreamParser:
+    """Deterministic state-machine parser for agy stream-json output."""
+
+    def __init__(self, conv_id: str | None = None):
+        self.conv_id = conv_id
+        self.accumulated_segment: list[str] = []
+        self.last_substantive_response: str = ""
+        self.final_result_response: str = ""
+        self.error_response: str = ""
+        self.is_explicit_silence: bool = False
+
+    @staticmethod
+    def _is_silence_or_placeholder(text: str) -> bool:
+        cleaned = text.strip().lower()
+        if cleaned in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none", ""):
+            return True
+        if cleaned.rstrip(".") == "no content generated yet":
+            return True
+        return False
+
+    def process_event(self, event: dict) -> None:
+        if not isinstance(event, dict):
+            return
+
+        ev_type = event.get("event") or event.get("type")
+
+        # 1. Init event: extract conversation_id if present
+        if ev_type == "init" or "conversation_id" in event:
+            cid = event.get("conversation_id")
+            if cid:
+                self.conv_id = cid
+
+        # 2. Result event: contains overall turn summary
+        if ev_type == "result" or "result" in event:
+            res = event.get("result", {})
+            if isinstance(res, dict):
+                if res.get("response"):
+                    self.final_result_response = res["response"]
+                if res.get("error"):
+                    self.error_response = f"Error: {res.get('error')}"
+                if res.get("conversation_id"):
+                    self.conv_id = res["conversation_id"]
+            elif isinstance(event.get("response"), str):
+                self.final_result_response = event["response"]
+
+        # 3. Step update event
+        elif ev_type == "step_update" or "step_update" in event:
+            step = event.get("step_update", {})
+            if not isinstance(step, dict):
+                return
+
+            stype = step.get("step_type")
+            tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
+
+            if stype in ("tool",) or tname:
+                # Tool execution: clear pre-tool narration
+                self.accumulated_segment.clear()
+
+            elif stype in ("system_message", "system"):
+                # Asynchronous system event: preserve substantive content generated prior
+                curr = "".join(self.accumulated_segment).strip()
+                if curr and not self._is_silence_or_placeholder(curr):
+                    self.last_substantive_response = curr
+                self.accumulated_segment.clear()
+
+            elif stype == "agent_response":
+                delta = step.get("text_delta") or step.get("text") or step.get("content")
+                if delta and isinstance(delta, str):
+                    self.accumulated_segment.append(delta)
+
+                if step.get("state") == "DONE":
+                    curr = "".join(self.accumulated_segment).strip()
+                    if curr:
+                        if self._is_silence_or_placeholder(curr):
+                            if curr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
+                                self.is_explicit_silence = True
+                        else:
+                            self.last_substantive_response = curr
+
+        elif ev_type in ("tool", "tool_call", "tool_use"):
+            self.accumulated_segment.clear()
+
+        elif ev_type in ("system_message", "system"):
+            curr = "".join(self.accumulated_segment).strip()
+            if curr and not self._is_silence_or_placeholder(curr):
+                self.last_substantive_response = curr
+            self.accumulated_segment.clear()
+
+        elif ev_type in ("content", "message", "text", "delta"):
+            content = event.get("content") or event.get("text") or event.get("delta")
+            if content and isinstance(content, str):
+                self.accumulated_segment.append(content)
+
+    def process_line(self, line: str) -> bool:
+        line_s = line.strip()
+        if not line_s:
+            return False
+
+        # Find JSON boundaries
+        start = line_s.find("{")
+        end = line_s.rfind("}") + 1
+        if start != -1 and end > start:
+            json_substr = line_s[start:end]
+            try:
+                ev = json.loads(json_substr)
+                self.process_event(ev)
+                return True
+            except Exception:
+                decoder = json.JSONDecoder()
+                idx = start
+                parsed_any = False
+                while idx < len(line_s):
+                    while idx < len(line_s) and line_s[idx] != "{":
+                        idx += 1
+                    if idx >= len(line_s):
+                        break
+                    try:
+                        ev, end_idx = decoder.raw_decode(line_s, idx)
+                        self.process_event(ev)
+                        parsed_any = True
+                        idx = end_idx
+                    except Exception:
+                        idx += 1
+                return parsed_any
+        return False
+
+    def get_final_response(self, fallback_result: str = "") -> str:
+        curr = "".join(self.accumulated_segment).strip()
+
+        # Check if the current segment is an explicit silence request
+        if curr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
+            if not self.last_substantive_response or self._is_silence_or_placeholder(self.last_substantive_response):
+                return "[NO_REPLY]"
+
+        # 1. Check current segment after last tool
+        if curr and not self._is_silence_or_placeholder(curr):
+            clean = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", curr, flags=re.IGNORECASE).strip()
+            if clean and not self._is_silence_or_placeholder(clean):
+                return clean
+
+        # 2. Check last substantive response before an asynchronous system message
+        if self.last_substantive_response and not self._is_silence_or_placeholder(self.last_substantive_response):
+            clean = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", self.last_substantive_response, flags=re.IGNORECASE).strip()
+            if clean and not self._is_silence_or_placeholder(clean):
+                return clean
+
+        # 3. Check final result response from agy
+        frr = self.final_result_response.strip() or fallback_result.strip()
+        if frr:
+            if frr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
+                if not self.last_substantive_response or self._is_silence_or_placeholder(self.last_substantive_response):
+                    return "[NO_REPLY]"
+            clean_frr = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", frr, flags=re.IGNORECASE).strip()
+            if clean_frr and not self._is_silence_or_placeholder(clean_frr):
+                return clean_frr
+
+        if self.is_explicit_silence:
+            return "[NO_REPLY]"
+
+        if self.error_response:
+            return self.error_response
+
+        return ""
+
+
+def extract_agent_response(raw_text: str, conv_id: str | None = None) -> str:
     """Extract clean response text from agy output, supporting plain text, json, or stream-json."""
+    if not raw_text:
+        if conv_id:
+            harvested = harvest_transcript_response(conv_id)
+            if harvested:
+                return format_for_discord(harvested)
+        return "*(Response completed, but no text output was generated)*"
+
     # Thoroughly strip ANSI escape codes and terminal controls
     text = re.sub(r"\x1b(?:\[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", raw_text)
 
@@ -253,107 +605,26 @@ def extract_agent_response(raw_text: str) -> str:
     if not has_json:
         return format_for_discord(text)
 
-    # Parse JSON if events are present
-    accumulated_content = []
-    last_substantive_response = ""
-    final_result_response = ""
-    error_response = ""
-
-    def _save_substantive():
-        nonlocal last_substantive_response
-        curr_text = "".join(accumulated_content).strip()
-        is_wait_chatter = bool(
-            (len(curr_text) < 120 and re.search(
-                r"(?:running|scanning|checking|evaluating|processing|waiting|initiated|started|spawned)[^\n]+(?:in the background|for it to finish)",
-                curr_text,
-                re.IGNORECASE
-            )) or (
-                "Subagent execution in progress" in curr_text or
-                "Subagents or tasks are still running" in curr_text or
-                "Wait for notifications from:" in curr_text or
-                "wait for tasks or subagents" in curr_text
-            )
-        )
-        is_silence = curr_text.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none", "")
-        if curr_text and not is_wait_chatter and not is_silence:
-            last_substantive_response = curr_text
-
+    parser = AgyStreamParser(conv_id=conv_id)
     for line in text.splitlines():
-        line_str = line.strip()
-        if not line_str:
-            continue
-        start = line_str.find("{")
-        end = line_str.rfind("}") + 1
-        if start != -1 and end > start:
-            json_substr = line_str[start:end]
-            try:
-                event = json.loads(json_substr)
-                if isinstance(event, dict):
-                    if "response" in event and event["response"]:
-                        final_result_response = event["response"]
+        parser.process_line(line)
 
-                    ev_type = event.get("event") or event.get("type")
-                    if ev_type == "result" or "result" in event:
-                        res = event.get("result", {})
-                        if isinstance(res, dict):
-                            if "response" in res and res["response"]:
-                                final_result_response = res["response"]
-                            elif "error" in res and res.get("error", ""):
-                                error_response = f"Error: {res.get('error', '')}"
-                    elif ev_type == "step_update" or "step_update" in event:
-                        step = event.get("step_update", {})
-                        if isinstance(step, dict):
-                            stype = step.get("step_type")
-                            if stype in ("tool", "system_message", "system") or step.get("tool_name") or "tool_info" in step:
-                                # Save substantive response before discarding intermediate wait narration
-                                _save_substantive()
-                                accumulated_content.clear()
-                            elif stype == "agent_response":
-                                delta = step.get("text_delta") or step.get("text") or step.get("content")
-                                if delta and isinstance(delta, str):
-                                    accumulated_content.append(delta)
-                    elif ev_type in ("tool", "tool_call", "tool_use", "system_message", "system"):
-                        _save_substantive()
-                        accumulated_content.clear()
-                    elif ev_type in ("content", "message", "text", "delta"):
-                        content = event.get("content") or event.get("text") or event.get("delta")
-                        if content and isinstance(content, str):
-                            accumulated_content.append(content)
-            except Exception:
-                pass
+    final_resp = parser.get_final_response()
 
-    raw_acc = "".join(accumulated_content).strip()
-    is_explicit_silence = raw_acc.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none")
-    clean_accumulated = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", raw_acc, flags=re.IGNORECASE).strip()
-    if clean_accumulated.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
-        clean_accumulated = ""
-
-    if not clean_accumulated and last_substantive_response:
-        clean_accumulated = last_substantive_response
-
-    if clean_accumulated:
-        return format_for_discord(clean_accumulated)
-
-    if final_result_response:
-        frr_raw = final_result_response.strip()
-        frr_silence = frr_raw.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none")
-        frr = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", frr_raw, flags=re.IGNORECASE).strip()
-        if frr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
-            frr = ""
-        if frr:
-            return format_for_discord(frr)
-        if last_substantive_response:
-            return format_for_discord(last_substantive_response)
-        if frr_silence:
-            return "[NO_REPLY]"
-
-    if is_explicit_silence:
+    if final_resp == "[NO_REPLY]":
         return "[NO_REPLY]"
 
-    if error_response:
-        return format_for_discord(error_response)
+    if final_resp:
+        return format_for_discord(final_resp)
 
-    # Fallback filter for JSON metadata lines
+    # Fallback to on-disk transcript if conv_id is known
+    target_cid = conv_id or parser.conv_id
+    if target_cid:
+        harvested = harvest_transcript_response(target_cid)
+        if harvested:
+            return format_for_discord(harvested)
+
+    # Fallback filter for plain text outside JSON lines
     clean_lines = []
     for l in text.splitlines():
         l_str = l.strip()
@@ -608,9 +879,9 @@ def scrub_credentials(text: str) -> str:
             text = text.replace(val, "[REDACTED_SECRET]")
 
     # Redact common credential patterns
-    text = re.sub(r"gh[pousr]_[A-Za-z0-9_-]{20,}", "[REDACTED_GITHUB_TOKEN]", text)
-    text = re.sub(r"sk-[A-Za-z0-9_-]{20,}", "[REDACTED_API_KEY]", text)
-    text = re.sub(r"ya29\.[A-Za-z0-9_-]+", "[REDACTED_OAUTH_TOKEN]", text)
+    text = re.sub(r"\bgh[pousr]_[A-Za-z0-9_-]{20,}", "[REDACTED_GITHUB_TOKEN]", text)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{20,}", "[REDACTED_API_KEY]", text)
+    text = re.sub(r"\bya29\.[A-Za-z0-9_-]+", "[REDACTED_OAUTH_TOKEN]", text)
     text = re.sub(r"[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}", "[REDACTED_TOKEN]", text)
     text = re.sub(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "[REDACTED_JWT]", text)
 

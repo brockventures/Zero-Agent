@@ -199,6 +199,16 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         guidance_due = bs.get_gif_prompt_guidance("chan_a")
         self.assertIn("⚠️ DUE (>=5 turns without GIF)", guidance_due)
 
+        # 7. Disabled channel GIF policy guidance
+        self.assertTrue(bs.is_gif_disabled_for_channel("1534436119888793750"))
+        self.assertTrue(bs.is_gif_disabled_for_channel("the-banana-stand"))
+        self.assertTrue(bs.is_gif_disabled_for_channel("random", channel_id=1534436119888793750))
+        self.assertFalse(bs.is_gif_disabled_for_channel("home", channel_id=1542081375287640084))
+
+        banana_guidance = bs.get_gif_prompt_guidance("1534436119888793750")
+        self.assertIn("Reaction GIFs are STRICTLY DISABLED", banana_guidance)
+        self.assertNotIn("⚠️ DUE", banana_guidance)
+
     def test_in_flight_turn_lifecycle_and_attempts(self):
         # 1. First recording has attempts = 1
         bs.record_in_flight(12345, "First prompt test", conv_id="conv-1")

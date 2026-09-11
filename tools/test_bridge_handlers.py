@@ -101,6 +101,19 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         reload_mock.assert_awaited_once()
         turn_queue.put.assert_not_awaited()
 
+    @patch("tools.bridge_handlers.execute_container_restart", new_callable=AsyncMock)
+    async def test_handle_button_choice_container_restart_interception(self, mock_container_restart):
+        mock_interaction = MagicMock()
+        mock_interaction.id = 54321
+        mock_interaction.user.display_name = "Ryan"
+        mock_interaction.channel.send = AsyncMock()
+
+        turn_queue = AsyncMock()
+
+        await bh.handle_button_choice("Restart Docker Container", mock_interaction, turn_queue, reload_fn=None)
+        mock_container_restart.assert_awaited_once()
+        turn_queue.put.assert_not_awaited()
+
     async def test_handle_button_choice_turn_enqueue(self):
         mock_interaction = MagicMock()
         mock_interaction.id = 99999
@@ -169,6 +182,63 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
             call_args2 = turn_queue2.put.call_args[0][0]
             self.assertIn("what are the system specs?", call_args2["prompt"])
             self.assertEqual(call_args2["mode"], "external")
+
+    async def test_lazy_typer_minimal_role_mention(self):
+        """Verify that minimal role mentions (e.g. <@&1542294519914037341> ^) trigger lazy typer directive."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        mock_msg = MagicMock()
+        mock_msg.channel.id = 1534436119888793750  # the-banana-stand
+        mock_msg.channel.name = "the-banana-stand"
+        mock_msg.author.id = 1210466877835313155
+        mock_msg.author.bot = False
+        mock_msg.author.display_name = "Ryan"
+        mock_msg.content = "<@&1542294519914037341> ^"
+        mock_msg.created_at.timestamp.return_value = time.time()
+        mock_msg.role_mentions = []
+        mock_msg.mentions = []
+        mock_msg.attachments = []
+        mock_msg.reference = None
+
+        turn_queue = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={"ambient_classifier_enabled": False}):
+            await bh.handle_message(mock_msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+            call_args = turn_queue.put.call_args[0][0]
+            self.assertIn("[OPERATIONAL DIRECTIVE - LAZY TYPER ADDRESSING]", call_args["prompt"])
+            self.assertIn("Humans are lazy typers", call_args["prompt"])
+
+    async def test_unprompted_image_attachment_handling(self):
+        """Verify that image attachments without text mention inject the image input invariant."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        mock_att = AsyncMock()
+        mock_att.filename = "terminal_error.png"
+        mock_att.save = AsyncMock()
+
+        mock_msg = MagicMock()
+        mock_msg.channel.id = 1534436119888793750
+        mock_msg.channel.name = "the-banana-stand"
+        mock_msg.author.id = 1210466877835313155
+        mock_msg.author.bot = False
+        mock_msg.author.display_name = "Ryan"
+        mock_msg.content = "<@&1542294519914037341>"
+        mock_msg.created_at.timestamp.return_value = time.time()
+        mock_msg.role_mentions = []
+        mock_msg.mentions = []
+        mock_msg.attachments = [mock_att]
+        mock_msg.reference = None
+
+        turn_queue = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={"ambient_classifier_enabled": False}):
+            await bh.handle_message(mock_msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+            call_args = turn_queue.put.call_args[0][0]
+            self.assertIn("[CRITICAL IMAGE INPUT INVARIANT]", call_args["prompt"])
+            self.assertIn("view_file", call_args["prompt"])
+            self.assertIn("terminal_error.png", call_args["prompt"])
 
     async def test_conversational_follow_up_without_direct_tag(self):
         """Verify that an untagged human reply following Zero's question is routed as a conversational follow-up."""
@@ -532,6 +602,494 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
             await bh.handle_message(msg_explicit_robot, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue_explicit)
             turn_queue_explicit.put.assert_awaited_once()
+
+        # 6. Explicit team role tag <@&1543462881624858624> in #lounge -> should be accepted
+        msg_team_role = MagicMock()
+        msg_team_role.id = 100006
+        msg_team_role.channel.id = lounge_id
+        msg_team_role.channel.name = "lounge"
+        msg_team_role.author.id = 1210466877294518272
+        msg_team_role.author.bot = False
+        msg_team_role.author.display_name = "Ryan"
+        msg_team_role.content = "<@&1543462881624858624> team, it's time for our art competition"
+        msg_team_role.created_at.timestamp.return_value = now
+        team_role_mock = MagicMock()
+        team_role_mock.id = 1543462881624858624
+        msg_team_role.role_mentions = [team_role_mock]
+        msg_team_role.mentions = []
+        msg_team_role.reference = None
+
+        turn_queue_team = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
+            await bh.handle_message(msg_team_role, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue_team)
+            turn_queue_team.put.assert_awaited_once()
+            call_args = turn_queue_team.put.call_args[0][0]
+            self.assertEqual(call_args["prompt"], "team, it's time for our art competition")
+
+        # 7. Explicit @team in #lounge -> should be accepted
+        msg_team_word = MagicMock()
+        msg_team_word.id = 100007
+        msg_team_word.channel.id = lounge_id
+        msg_team_word.channel.name = "lounge"
+        msg_team_word.author.id = 1210466877294518272
+        msg_team_word.author.bot = False
+        msg_team_word.author.display_name = "Ryan"
+        msg_team_word.content = "@team check this out"
+        msg_team_word.created_at.timestamp.return_value = now
+        msg_team_word.role_mentions = []
+        msg_team_word.mentions = []
+        msg_team_word.reference = None
+
+        turn_queue_word = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
+            await bh.handle_message(msg_team_word, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue_word)
+            turn_queue_word.put.assert_awaited_once()
+
+        # 8. Inline team role mention preserved rather than stripped to empty string
+        msg_inline_team = MagicMock()
+        msg_inline_team.id = 100008
+        msg_inline_team.channel.id = lounge_id
+        msg_inline_team.channel.name = "lounge"
+        msg_inline_team.author.id = 1210466877294518272
+        msg_inline_team.author.bot = False
+        msg_inline_team.author.display_name = "Ryan"
+        msg_inline_team.content = "fix your responsiveness to the <@&1543462881624858624> tag"
+        msg_inline_team.created_at.timestamp.return_value = now
+        msg_inline_team.role_mentions = [team_role_mock]
+        msg_inline_team.mentions = []
+        msg_inline_team.reference = None
+
+        turn_queue_inline = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
+            await bh.handle_message(msg_inline_team, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue_inline)
+            turn_queue_inline.put.assert_awaited_once()
+            call_args = turn_queue_inline.put.call_args[0][0]
+            self.assertEqual(call_args["prompt"], "fix your responsiveness to the @team tag")
+
+    async def test_multi_mention_preserves_zero_and_peer_names(self):
+        """Verify that multi-recipient mentions preserve @Zero and resolve peer bot IDs to names."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        lounge_id = 1534452820995080192
+        now = time.time()
+
+        msg = MagicMock()
+        msg.id = 100009
+        msg.channel.id = lounge_id
+        msg.channel.name = "lounge"
+        msg.author.id = 1210466877294518272
+        msg.author.bot = False
+        msg.author.display_name = "Ryan"
+        msg.content = "<@1542285964213358633> <@1492043459618537492> <@1468012353206354197> can you each download v0.6 and put it in place on your respective harnesses"
+        msg.created_at.timestamp.return_value = now
+        msg.role_mentions = []
+        msg.mentions = [mock_bot.user]
+        msg.reference = None
+
+        turn_queue = AsyncMock()
+        rules = {
+            "channel_tag_requirements": {str(lounge_id): "1543285916506783799"},
+            "ambient_classifier_enabled": False
+        }
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
+            await bh.handle_message(msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+            call_args = turn_queue.put.call_args[0][0]
+            self.assertEqual(
+                call_args["prompt"],
+                "@Zero @Marvin @Amos can you each download v0.6 and put it in place on your respective harnesses"
+            )
+
+    async def test_home_message_not_dropped_when_sent_prior_to_boot(self):
+        """Verify that recent human messages in home channels are not dropped by BOT_BOOT_TIME."""
+        mock_bot = MagicMock()
+        mock_bot.user = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        now = time.time()
+        msg = MagicMock()
+        msg.id = 100010
+        msg.channel.id = 1544953279664889888  # zero-ops
+        msg.channel.name = "zero-ops"
+        msg.author.id = 1210466877294518272
+        msg.author.bot = False
+        msg.author.display_name = "Ryan"
+        msg.content = "Check all scripts for localhost instances"
+        # Sent 60 seconds before BOT_BOOT_TIME
+        msg.created_at.timestamp.return_value = bh.BOT_BOOT_TIME - 60.0
+        msg.reference = None
+
+        home_queue = AsyncMock()
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=AsyncMock())
+        home_queue.put.assert_awaited_once()
+        call_args = home_queue.put.call_args[0][0]
+        self.assertEqual(call_args["prompt"], "Check all scripts for localhost instances")
+
+    async def test_warm_channel_history_recovers_unhandled_home_turn(self):
+        """Verify that warm_channel_history detects unhandled user messages from downtime and triggers them."""
+        mock_bot = MagicMock()
+        mock_bot.user = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        now = time.time()
+        # Create mock message from Ryan sent 30 seconds ago
+        unhandled_msg = MagicMock()
+        unhandled_msg.id = 999999
+        unhandled_msg.channel.id = 1544953279664889888
+        unhandled_msg.channel.name = "zero-ops"
+        unhandled_msg.author.id = 1210466877294518272
+        unhandled_msg.author.bot = False
+        unhandled_msg.author.display_name = "Ryan"
+        unhandled_msg.content = "Ok can you check all of our scripts"
+        unhandled_msg.created_at.timestamp.return_value = now - 30.0
+        unhandled_msg.reference = None
+
+        mock_channel = MagicMock()
+        mock_channel.id = 1544953279664889888
+        mock_channel.name = "zero-ops"
+
+        # Mock channel.history iterator
+        async def mock_history(limit=25):
+            yield unhandled_msg
+
+        mock_channel.history = mock_history
+
+        home_queue = AsyncMock()
+        bh.PROCESSED_BACKLOG_MSG_IDS.clear()
+
+        with patch("tools.bridge_handlers.handle_message", new_callable=AsyncMock) as mock_handle:
+            await bh.warm_channel_history(
+                channel=mock_channel,
+                limit=25,
+                bot=mock_bot,
+                turn_queue=home_queue,
+                ext_turn_queue=AsyncMock()
+            )
+            # Give created tasks a chance to run
+            await asyncio.sleep(0.05)
+            mock_handle.assert_awaited_once()
+            self.assertEqual(mock_handle.call_args[1]["msg"].id, 999999)
+
+    async def test_envelope_floor_closed_suppresses_turn(self):
+        """Verify that an envelope with floor: closed suppresses turn execution unless addressed to Zero."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+        lounge_id = 1534452820995080192
+
+        msg = MagicMock()
+        msg.id = 200001
+        msg.channel.id = lounge_id
+        msg.channel.name = "lounge"
+        msg.author.id = 1468012353206354197
+        msg.author.bot = True
+        msg.author.display_name = "Amos"
+        msg.content = '```handoff\n{"kind": "status", "reply": "none", "floor": "closed", "to": "team"}\n```\nAll done here.'
+        msg.created_at.timestamp.return_value = time.time()
+        msg.role_mentions = []
+        msg.mentions = []
+        msg.reference = None
+
+        turn_queue = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={}):
+            await bh.handle_message(msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_not_awaited()
+
+    async def test_envelope_reply_none_does_not_short_circuit(self):
+        """Verify that reply: none with an open or unclosed floor does not short-circuit before evaluation."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+        lounge_id = 1534452820995080192
+
+        msg = MagicMock()
+        msg.id = 200002
+        msg.channel.id = lounge_id
+        msg.channel.name = "lounge"
+        msg.author.id = 1210466877294518272
+        msg.author.bot = False
+        msg.author.display_name = "Ryan"
+        msg.content = '<@1542285964213358633> ```handoff\n{"kind": "status", "reply": "none", "floor": "open"}\n```\nFYI on the new metrics.'
+        msg.created_at.timestamp.return_value = time.time()
+        msg.role_mentions = []
+        msg.mentions = [mock_bot.user]
+        msg.reference = None
+
+        turn_queue = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={}):
+            await bh.handle_message(msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+
+    async def test_banana_watcher_concluded_summary_prompt_routing(self):
+        """Verify that Banana Watcher Discussion Concluded prompts bypass 4s bot cascade cooldown, preserve @Zero, and inject Rule 7 directive."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+        banana_stand_id = 1534436119888793750
+
+        msg = MagicMock()
+        msg.id = 300001
+        msg.channel.id = banana_stand_id
+        msg.channel.name = "the-banana-stand"
+        msg.author.id = 1545924520236290198
+        msg.author.bot = True
+        msg.author.name = "Banana Watcher"
+        msg.author.display_name = "Banana Watcher"
+        msg.content = (
+            "🍌 **Discussion Concluded**: Topic `banana-protocol-pr-11` has reached resolution.\n"
+            "<@1542285964213358633> (@Zero): Please synthesize and deliver a concise summary of this discussion to <#1534452820995080192> (no more than 250 words)."
+        )
+        msg.created_at.timestamp.return_value = time.time()
+        msg.role_mentions = []
+        msg.mentions = [mock_bot.user]
+        msg.reference = None
+
+        # Simulate another bot spoke 0.5s ago (triggering cascade cooldown for normal bots)
+        bh.channel_last_bot_reply[banana_stand_id] = time.time()
+
+        turn_queue = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={"last_word_protocol_enabled": True}):
+            await bh.handle_message(msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+
+            item = turn_queue.put.call_args[0][0]
+            prompt = item["prompt"]
+            # Must preserve @Zero (never strip into "():")
+            self.assertIn("@Zero:", prompt)
+            self.assertNotIn("():", prompt)
+            # Must inject explicit Rule 7 Executive Summary directive
+            self.assertIn("RULE 7 CONCLUDED DISCUSSION EXECUTIVE SUMMARY", prompt)
+            self.assertIn("banana-protocol-pr-11", prompt)
+            self.assertIn("python3 /workspace/tools/outbox.py --channel lounge", prompt)
+            # Must not engage Last Word Protocol
+            self.assertFalse(item.get("is_last_word"))
+
+    async def test_banana_watcher_stalled_topic_prompt_routing(self):
+        """Verify that Banana Watcher Topic Stalled prompts inject the stalled topic directive and bypass cooldown."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+        banana_stand_id = 1534436119888793750
+
+        msg = MagicMock()
+        msg.id = 300002
+        msg.channel.id = banana_stand_id
+        msg.channel.name = "the-banana-stand"
+        msg.author.id = 1545924520236290198
+        msg.author.bot = True
+        msg.author.name = "Banana Watcher"
+        msg.author.display_name = "Banana Watcher"
+        msg.content = (
+            "🍌 **Topic Stalled**: Topic `outbound-redaction-mechanism` has been quiet for 10m without a resolution or ticket.\n"
+            "<@&1543285916506783799> (@robot): Is this ready to land in a PR/task, or are we parking it?"
+        )
+        msg.created_at.timestamp.return_value = time.time()
+        msg.role_mentions = []
+        msg.mentions = []
+        msg.reference = None
+
+        turn_queue = AsyncMock()
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value={"last_word_protocol_enabled": True}):
+            await bh.handle_message(msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+
+            item = turn_queue.put.call_args[0][0]
+            prompt = item["prompt"]
+            self.assertIn("BANANA WATCHER TOPIC STALLED NUDGE", prompt)
+            self.assertIn("outbound-redaction-mechanism", prompt)
+            self.assertIn("NEVER emit [NO_REPLY]", prompt)
+
+    def test_is_bridge_busy_exclude_channel(self):
+        """Verify is_bridge_busy properly honors exclude_channel_id parameter."""
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+
+        bh.channel_active_tasks[111] = mock_task
+        bh.channel_active_tasks[222] = mock_task
+
+        try:
+            # Without exclude, both are reported
+            busy_all = bh.is_bridge_busy()
+            self.assertIn("channel:111", busy_all)
+            self.assertIn("channel:222", busy_all)
+
+            # Excluding 111 reports only 222
+            busy_ex_111 = bh.is_bridge_busy(exclude_channel_id=111)
+            self.assertNotIn("channel:111", busy_ex_111)
+            self.assertIn("channel:222", busy_ex_111)
+
+            # If 222 is done, excluding 111 reports empty
+            mock_task.done.return_value = True
+            self.assertEqual(bh.is_bridge_busy(exclude_channel_id=111), [])
+        finally:
+            bh.channel_active_tasks.pop(111, None)
+            bh.channel_active_tasks.pop(222, None)
+
+    async def test_brock_public_channel_non_owner_ignored(self):
+        """Messages in Brock Discord public channels from non-owners must be ignored even if tagging Zero."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        msg = MagicMock()
+        msg.id = 400001
+        msg.guild.id = 1210466877294518272  # Brock Discord
+        msg.channel.id = 1453427860793463000  # #seerr-requests-and-chat
+        msg.channel.name = "seerr-requests-and-chat"
+        msg.channel.category_id = 1210466877835313153  # Primary Server Category (not Agent Zero)
+        msg.channel.parent_id = None
+        msg.channel.parent = None
+        msg.author.id = 999999999999999999  # NOT Ryan
+        msg.author.bot = False
+        msg.author.name = "OtherUser"
+        msg.author.display_name = "OtherUser"
+        msg.content = "<@1542285964213358633> can you download Dune 2?"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = [mock_bot.user]
+        msg.role_mentions = []
+        msg.reference = None
+        msg.attachments = []
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_not_called()
+        ext_queue.put.assert_not_called()
+
+    async def test_brock_public_channel_owner_untagged_ignored(self):
+        """Messages in Brock Discord public channels from owner WITHOUT @Zero tag must be ignored."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        msg = MagicMock()
+        msg.id = 400002
+        msg.guild.id = 1210466877294518272  # Brock Discord
+        msg.channel.id = 1453427860793463000  # #seerr-requests-and-chat
+        msg.channel.name = "seerr-requests-and-chat"
+        msg.channel.category_id = 1210466877835313153  # Primary Server Category (not Agent Zero)
+        msg.channel.parent_id = None
+        msg.channel.parent = None
+        msg.author.id = 179407724335988736  # Ryan Brock (owner)
+        msg.author.bot = False
+        msg.author.name = "Ryan"
+        msg.author.display_name = "Ryan"
+        msg.content = "Just approved the latest request on Overseerr"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = []
+        msg.role_mentions = []
+        msg.reference = None
+        msg.attachments = []
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_not_called()
+        ext_queue.put.assert_not_called()
+
+    async def test_brock_public_channel_owner_tagged_dispatched_to_home_queue(self):
+        """Messages in Brock Discord public channels from owner WITH @Zero tag must be dispatched to home_turn_queue."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        msg = MagicMock()
+        msg.id = 400003
+        msg.guild.id = 1210466877294518272  # Brock Discord
+        msg.channel.id = 1453427860793463000  # #seerr-requests-and-chat
+        msg.channel.name = "seerr-requests-and-chat"
+        msg.channel.category_id = 1210466877835313153  # Primary Server Category (not Agent Zero)
+        msg.channel.parent_id = None
+        msg.channel.parent = None
+        msg.author.id = 179407724335988736  # Ryan Brock (owner)
+        msg.author.bot = False
+        msg.author.name = "Ryan"
+        msg.author.display_name = "Ryan"
+        msg.content = "<@1542285964213358633> check why Dune 2 failed to import"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = [mock_bot.user]
+        msg.role_mentions = []
+        msg.reference = None
+        msg.attachments = []
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        ext_queue.put.assert_not_called()
+        home_queue.put.assert_awaited_once()
+
+        item = home_queue.put.call_args[0][0]
+        self.assertEqual(item["mode"], "home")
+        self.assertEqual(item["channel_id"], 1453427860793463000)
+        self.assertIn("BROCK DISCORD PUBLIC CHANNEL #seerr-requests-and-chat", item["prompt"])
+        self.assertIn("check why Dune 2 failed to import", item["prompt"])
+        self.assertNotIn("<@1542285964213358633>", item["prompt"])
+
+    async def test_lazy_typer_home_minimal_prompt_expansion(self):
+        """Verify that a minimal prompt like 'Investigate' triggers lazy typer context injection with channel history."""
+        from collections import deque
+        from tools.channel_history import record_message, _history_store
+        ch_id = 1542081375287640084 # #zero-chat
+        _history_store[str(ch_id)] = deque(maxlen=20)
+        record_message(
+            channel_id=ch_id,
+            channel_name="zero-chat",
+            author_name="Zero",
+            is_bot=True,
+            content="⚠️ BB refresh_stats failed steps (Thu Sep 10 6:49 AM): Step 1 empty",
+            msg_id=111222
+        )
+
+        mock_bot = MagicMock()
+        mock_bot.user = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        msg = MagicMock()
+        msg.id = 111223
+        msg.channel.id = ch_id
+        msg.channel.name = "zero-chat"
+        msg.author.id = 179407724335988736  # Ryan
+        msg.author.bot = False
+        msg.content = "Investigate"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.reference = None
+        msg.attachments = []
+
+        home_queue = AsyncMock()
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=AsyncMock())
+        home_queue.put.assert_awaited_once()
+        queued_item = home_queue.put.call_args[0][0]
+        prompt = queued_item["prompt"]
+
+        self.assertIn("OPERATIONAL DIRECTIVE - LAZY TYPER ADDRESSING", prompt)
+        self.assertIn("RECENT DISCORD CHANNEL CONTEXT", prompt)
+        self.assertIn("BB refresh_stats failed steps", prompt)
+        self.assertIn("Investigate", prompt)
+
+    async def test_record_message_captures_bot_messages(self):
+        """Verify that alerts posted by the bot user itself are recorded to channel history before returning."""
+        from collections import deque
+        from tools.channel_history import get_recent_messages, _history_store
+        ch_id = 1542081375287640084
+        _history_store[str(ch_id)] = deque(maxlen=20)
+
+        mock_bot = MagicMock()
+        mock_bot.user = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        alert_msg = MagicMock()
+        alert_msg.id = 888999
+        alert_msg.channel.id = ch_id
+        alert_msg.channel.name = "zero-chat"
+        alert_msg.author.id = 1542285964213358633  # Sent via bot token
+        alert_msg.author.bot = True
+        alert_msg.author.display_name = "Zero"
+        alert_msg.content = "⚠️ BB refresh_stats alert"
+        alert_msg.created_at.timestamp.return_value = time.time()
+        alert_msg.reference = None
+
+        home_queue = AsyncMock()
+        await bh.handle_message(alert_msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=AsyncMock())
+        # Should not trigger a reply turn
+        home_queue.put.assert_not_called()
+
+        # But MUST be recorded in channel history
+        recent = get_recent_messages(ch_id, limit=5)
+        self.assertTrue(any("BB refresh_stats alert" in m.get("content", "") for m in recent))
 
 
 if __name__ == "__main__":

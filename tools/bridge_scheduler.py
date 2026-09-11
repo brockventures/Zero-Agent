@@ -34,6 +34,12 @@ LAST_SCHEDULED_DISPATCH = {}
 _last_bot_status_mtime = 0.0
 
 
+async def _run_sidecar_job_async(job_id: str, job_name: str, func, *args, **kwargs):
+    """Run synchronous sidecar jobs in a worker thread to keep the asyncio event loop unblocked."""
+    from tools.sidecars import run_sidecar_job
+    return await asyncio.to_thread(run_sidecar_job, job_id, job_name, func, *args, **kwargs)
+
+
 async def dispatch_scheduled_prompt(
     prompt: str,
     job_name: str = "Sidecar",
@@ -74,6 +80,14 @@ async def dispatch_scheduled_prompt(
                 if ch:
                     await ch.send(rep)
             print(f"[Scheduler] Executed daily multi-channel session rollover at 2:00 AM PT (ok={ok}, rolled_over={len(details.get('rolled_over', []))}).")
+
+            # Proactively recycle and re-warm all persistent worker daemons overnight
+            try:
+                from tools.bridge_daemons import daemon_manager
+                await daemon_manager.proactive_nightly_recycle()
+                print("[Scheduler] 🟢 Proactively recycled and re-warmed all persistent worker daemons.")
+            except Exception as de:
+                print(f"[Scheduler] Warning proactively recycling persistent daemons: {de}")
         except Exception as e:
             print(f"[Scheduler] Error executing daily multi-channel session rollover: {e}")
             if bot:
@@ -85,8 +99,8 @@ async def dispatch_scheduled_prompt(
     # Heartbeat sweep: silent execution unless degraded
     if job_name == "Heartbeat Sweep" or "sidecars.py heartbeat" in prompt:
         try:
-            from tools.sidecars import run_sidecar_job, run_heartbeat_sweep
-            healthy, report, _ = run_sidecar_job("heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
+            from tools.sidecars import run_heartbeat_sweep
+            healthy, report, _ = await _run_sidecar_job_async("heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
             if not healthy and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -98,8 +112,8 @@ async def dispatch_scheduled_prompt(
     # Dated reminders: silent execution unless a reminder is due today
     if job_name == "Dated Reminders" or "sidecars.py reminders" in prompt:
         try:
-            from tools.sidecars import run_sidecar_job, run_dated_reminders
-            has_due, rep, _ = run_sidecar_job("reminders", "Dated Reminders", run_dated_reminders)
+            from tools.sidecars import run_dated_reminders
+            has_due, rep, _ = await _run_sidecar_job_async("reminders", "Dated Reminders", run_dated_reminders)
             if has_due and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -113,8 +127,8 @@ async def dispatch_scheduled_prompt(
     # EV9 listing monitor: silent execution on Mon-Sat; only posts Sunday digest
     if job_name == "EV9 Listing Monitor" or "sidecars.py ev9" in prompt:
         try:
-            from tools.sidecars import run_sidecar_job, run_ev9_monitor
-            has_digest, rep, plot_path = run_sidecar_job("ev9", "EV9 Listing Monitor", run_ev9_monitor, force_digest=False)
+            from tools.sidecars import run_ev9_monitor
+            has_digest, rep, plot_path = await _run_sidecar_job_async("ev9", "EV9 Listing Monitor", run_ev9_monitor, force_digest=False)
             if has_digest and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -129,12 +143,15 @@ async def dispatch_scheduled_prompt(
     # Marketing email sweep: biweekly promotional sweep
     if job_name in ("Biweekly Marketing Sweep", "Marketing Email Sweep") or "sidecars.py marketing" in prompt:
         try:
-            from tools.sidecars import run_sidecar_job, run_marketing_sweep
-            should_post, rep, _ = run_sidecar_job("marketing", "Marketing Email Sweep", run_marketing_sweep, force=False)
-            if should_post and rep and bot:
+            from tools.sidecars import run_marketing_sweep
+            ok, rep, extra = await _run_sidecar_job_async("marketing", "Marketing Email Sweep", run_marketing_sweep, force=False)
+            should_post = extra.get("should_post", False) if isinstance(extra, dict) else (ok and bool(rep and rep.strip()))
+            if should_post and rep and rep.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
                     await ch.send(rep)
+            else:
+                print("[Scheduler] Marketing sweep: off-week or not due yet (silent).")
         except Exception as e:
             print(f"[Scheduler] Marketing sweep execution error: {e}")
         return
@@ -142,8 +159,8 @@ async def dispatch_scheduled_prompt(
     # Nightly triage & agenda briefing
     if job_name in ("Nightly Triage & Briefing", "Nightly Triage") or "sidecars.py triage" in prompt:
         try:
-            from tools.sidecars import run_sidecar_job, run_nightly_triage
-            ok, rep, _ = run_sidecar_job("triage", "Nightly Triage & Briefing", run_nightly_triage)
+            from tools.sidecars import run_nightly_triage
+            ok, rep, _ = await _run_sidecar_job_async("triage", "Nightly Triage & Briefing", run_nightly_triage)
             if rep and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -153,25 +170,53 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Nightly triage execution error: {e}")
         return
 
-    # Nightly NAS log review
-    if job_name in ("NAS Log Review", "NAS Log Review Check") or "sidecars.py nas_logs" in prompt:
+    # Nightly NAS log review: autonomous closed-loop triage
+    if job_name in ("NAS Log Review", "NAS Log Review Check") or "sidecars.py nas_logs" in prompt or "nas_log_triage" in prompt:
         try:
-            from tools.sidecars import run_sidecar_job, run_nas_log_review
-            ok, rep, _ = run_sidecar_job("nas_logs", "NAS Log Review", run_nas_log_review)
-            if rep and bot:
-                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
-                if ch:
-                    for chunk in chunk_text(rep):
-                        await ch.send(chunk)
+            from tools.nas_log_triage import run_nas_log_review, format_autonomous_triage_prompt
+            ok, rep, extra = await _run_sidecar_job_async("nas_logs", "NAS Log Review", run_nas_log_review)
+            total_issues = extra.get("total_issues", 0) if isinstance(extra, dict) else 0
+
+            ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
+            if total_issues == 0:
+                # Nominal state: Crisp 1-line confirmation (or silent if empty)
+                if rep and bot and ch:
+                    await ch.send(rep)
+                print(f"[Scheduler] NAS log review: 0 actionable errors across all containers (nominal).")
+                return
+
+            # Candidate issues flagged: hand off to Zero for autonomous forensic investigation & safe remediation
+            if bot and turn_queue:
+                target_cid = HOMELAB_CHANNEL_ID
+                dest_ch = await get_dest_channel(target_cid)
+                if not dest_ch:
+                    print(f"[Scheduler] Could not fetch channel {target_cid}")
+                    return
+
+                triage_prompt = format_autonomous_triage_prompt(extra)
+                status_msg = await dest_ch.send("🗄️ **[Nightly NAS Log Review]** *Candidate issues flagged across containers — initiating autonomous Zero triage & remediation...*")
+                await turn_queue.put({
+                    "prompt": triage_prompt,
+                    "status_msg": status_msg,
+                    "reply_target": status_msg,
+                    "attachments": [],
+                    "is_steer": False,
+                    "mode": "home",
+                    "channel_id": target_cid
+                })
+            elif rep and bot and ch:
+                for chunk in chunk_text(rep):
+                    await ch.send(chunk)
         except Exception as e:
             print(f"[Scheduler] NAS log review execution error: {e}")
         return
 
+
     # Plex transcode cache cleanup: silent unless warning/error
     if job_name == "Plex Transcode Cleanup" or "sidecars.py plex" in prompt:
         try:
-            from tools.sidecars import run_sidecar_job, run_plex_session_cleanup
-            ok, rep, _ = run_sidecar_job("plex", "Plex Transcode Cleanup", run_plex_session_cleanup)
+            from tools.sidecars import run_plex_session_cleanup
+            ok, rep, _ = await _run_sidecar_job_async("plex", "Plex Transcode Cleanup", run_plex_session_cleanup)
             if not ok and rep and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -184,8 +229,7 @@ async def dispatch_scheduled_prompt(
     if job_name in ("Dreaming Memory Consolidation", "Dreaming Consolidation") or "sidecars.py dream" in prompt:
         try:
             from tools.memory_manager import run_dreaming_consolidation
-            from tools.sidecars import run_sidecar_job
-            ok, rep, _ = run_sidecar_job("dream", "Dreaming Consolidation", run_dreaming_consolidation)
+            ok, rep, _ = await _run_sidecar_job_async("dream", "Dreaming Consolidation", run_dreaming_consolidation)
             print(f"[Scheduler] Dreaming memory consolidation completed: ok={ok}")
         except Exception as e:
             print(f"[Scheduler] Dreaming consolidation execution error: {e}")
@@ -195,8 +239,7 @@ async def dispatch_scheduled_prompt(
     if job_name in ("Memory Doctor Audit", "Memory Doctor") or "sidecars.py doctor" in prompt:
         try:
             from tools.memory_manager import run_memory_doctor
-            from tools.sidecars import run_sidecar_job
-            ok, rep, _ = run_sidecar_job("doctor", "Memory Doctor Audit", run_memory_doctor)
+            ok, rep, _ = await _run_sidecar_job_async("doctor", "Memory Doctor Audit", run_memory_doctor)
             if rep and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -209,8 +252,8 @@ async def dispatch_scheduled_prompt(
     # Antigravity CLI update check: silent execution unless a new version is available
     if "update_antigravity.py" in prompt or job_name == "Antigravity CLI Check" or job_name == "Antigravity Release Check":
         try:
-            from tools.sidecars import run_sidecar_job, run_antigravity_check
-            ok, out, _ = run_sidecar_job("update_antigravity", "Antigravity CLI Check", run_antigravity_check)
+            from tools.sidecars import run_antigravity_check
+            ok, out, _ = await _run_sidecar_job_async("update_antigravity", "Antigravity CLI Check", run_antigravity_check)
             if out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -228,8 +271,8 @@ async def dispatch_scheduled_prompt(
     # Dockhand container image check: silent execution unless an update is available
     if "dockhand_update.py" in prompt or job_name in ("Dockhand Image Check", "Dockhand Image Update Check"):
         try:
-            from tools.sidecars import run_sidecar_job, run_dockhand_update_check
-            ok, out, _ = run_sidecar_job("dockhand_check", "Dockhand Image Check", run_dockhand_update_check)
+            from tools.sidecars import run_dockhand_update_check
+            ok, out, _ = await _run_sidecar_job_async("dockhand_check", "Dockhand Image Check", run_dockhand_update_check)
             if out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -247,8 +290,8 @@ async def dispatch_scheduled_prompt(
     # Home Assistant stable update check
     if "ha_update_check.py" in prompt or job_name in ("Home Assistant Stable Update Check", "HA Update Check"):
         try:
-            from tools.sidecars import run_sidecar_job, run_ha_update_check
-            ok, out, _ = run_sidecar_job("ha_update_check", "HA Update Check", run_ha_update_check)
+            from tools.sidecars import run_ha_update_check
+            ok, out, _ = await _run_sidecar_job_async("ha_update_check", "HA Update Check", run_ha_update_check)
             if out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -264,9 +307,9 @@ async def dispatch_scheduled_prompt(
     # Home Assistant IoT battery watchdog: silent unless low battery (<15%)
     if "ha_battery_check.py" in prompt or job_name in ("Home Assistant IoT Battery Watchdog", "HA Battery Check"):
         try:
-            from tools.sidecars import run_sidecar_job, run_ha_battery_check
-            ok, out, _ = run_sidecar_job("ha_battery", "HA Battery Check", run_ha_battery_check)
-            if not ok and out and out.strip() and bot:
+            from tools.sidecars import run_ha_battery_check
+            ok, out, _ = await _run_sidecar_job_async("ha_battery", "HA Battery Check", run_ha_battery_check)
+            if (("Low Battery Alert" in out) or not ok) and out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
                     await ch.send(out)
@@ -277,8 +320,8 @@ async def dispatch_scheduled_prompt(
     # Synology storage & RAID health check: silent unless volume >85% or RAID degraded
     if "nas_storage_check.py" in prompt or job_name in ("Synology Storage & Array Health Check", "NAS Storage Check"):
         try:
-            from tools.sidecars import run_sidecar_job, run_nas_storage_check
-            ok, out, _ = run_sidecar_job("nas_storage", "NAS Storage Check", run_nas_storage_check)
+            from tools.sidecars import run_nas_storage_check
+            ok, out, _ = await _run_sidecar_job_async("nas_storage", "NAS Storage Check", run_nas_storage_check)
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -290,8 +333,8 @@ async def dispatch_scheduled_prompt(
     # Prowlarr indexer health check: silent unless indexers disabled or throttling
     if "prowlarr" in prompt or job_name in ("Prowlarr Indexer Health Watchdog", "Prowlarr Watchdog"):
         try:
-            from tools.sidecars import run_sidecar_job, run_prowlarr_watchdog
-            ok, out, _ = run_sidecar_job("prowlarr_watchdog", "Prowlarr Indexer Watchdog", run_prowlarr_watchdog)
+            from tools.sidecars import run_prowlarr_watchdog
+            ok, out, _ = await _run_sidecar_job_async("prowlarr_watchdog", "Prowlarr Indexer Watchdog", run_prowlarr_watchdog)
             if out and out != "(nominal - 0 Prowlarr failures)" and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -305,8 +348,8 @@ async def dispatch_scheduled_prompt(
     # SABnzbd downloader & unpack check: silent unless issues found
     if "sabnzbd" in prompt or job_name in ("SABnzbd Downloader & Unpack Watchdog", "SABnzbd Watchdog"):
         try:
-            from tools.sidecars import run_sidecar_job, run_sabnzbd_watchdog
-            ok, out, _ = run_sidecar_job("sabnzbd_watchdog", "SABnzbd Watchdog", run_sabnzbd_watchdog)
+            from tools.sidecars import run_sabnzbd_watchdog
+            ok, out, _ = await _run_sidecar_job_async("sabnzbd_watchdog", "SABnzbd Watchdog", run_sabnzbd_watchdog)
             if out and out != "(nominal - 0 SABnzbd failures)" and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -320,8 +363,8 @@ async def dispatch_scheduled_prompt(
     # Arr queue & import check: silent unless import issues found
     if "arr_queue" in prompt or job_name in ("Arr Queue & Import Watchdog", "Arr Queue Watchdog"):
         try:
-            from tools.sidecars import run_sidecar_job, run_arr_queue_watchdog
-            ok, out, _ = run_sidecar_job("arr_queue_watchdog", "Arr Queue Watchdog", run_arr_queue_watchdog)
+            from tools.sidecars import run_arr_queue_watchdog
+            ok, out, _ = await _run_sidecar_job_async("arr_queue_watchdog", "Arr Queue Watchdog", run_arr_queue_watchdog)
             if out and out != "(nominal - 0 import failures)" and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -335,8 +378,8 @@ async def dispatch_scheduled_prompt(
     # Home Assistant integration & re-auth check: silent unless integrations fail
     if "ha_reauth" in prompt or job_name in ("HA Integration & Re-Auth Watchdog", "HA Re-Auth Watchdog"):
         try:
-            from tools.sidecars import run_sidecar_job, run_ha_reauth_watchdog
-            ok, out, _ = run_sidecar_job("ha_reauth_watchdog", "HA Re-Auth Watchdog", run_ha_reauth_watchdog)
+            from tools.sidecars import run_ha_reauth_watchdog
+            ok, out, _ = await _run_sidecar_job_async("ha_reauth_watchdog", "HA Re-Auth Watchdog", run_ha_reauth_watchdog)
             if out and out != "(nominal - 0 HA integration failures)" and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -350,8 +393,8 @@ async def dispatch_scheduled_prompt(
     # Kometa post-run audit: silent unless critical issues found
     if "kometa" in prompt or job_name in ("Kometa Post-Run Audit", "Kometa Audit"):
         try:
-            from tools.sidecars import run_sidecar_job, run_kometa_audit
-            ok, out, _ = run_sidecar_job("kometa_audit", "Kometa Post-Run Audit", run_kometa_audit)
+            from tools.sidecars import run_kometa_audit
+            ok, out, _ = await _run_sidecar_job_async("kometa_audit", "Kometa Post-Run Audit", run_kometa_audit)
             if out and out != "(nominal - Kometa run clean)" and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -362,10 +405,74 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Kometa audit execution error: {e}")
         return
 
-    # Option B Weekly Proactive Digest
-    if "weekly_digest.py" in prompt or job_name in ("Option B Weekly Proactive Digest", "Weekly Proactive Digest"):
+    # Cubs game day notifier: silent unless game starting within ~10-15m
+    if "cubs_game" in prompt or "cubs_notifier" in prompt or job_name in ("Cubs Game Day Notifier", "Cubs Game Alert"):
         try:
-            res = subprocess.run(["python3", "/workspace/tools/weekly_digest.py"], capture_output=True, text=True, timeout=60)
+            from tools.sidecars import run_cubs_game_notifier
+            ok, out, _ = await _run_sidecar_job_async("cubs_game_notifier", "Cubs Game Day Notifier", run_cubs_game_notifier)
+            if out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    if choice_view:
+                        await ch.send(clean_content, view=choice_view)
+                    else:
+                        await ch.send(clean_content)
+            else:
+                print("[Scheduler] Cubs game notifier checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Cubs game notifier execution error: {e}")
+        return
+
+    # Google Tasks two-way sync: silent unless tasks updated or error
+    if "tasks_sync" in prompt or "google_tasks" in prompt or job_name in ("Google Tasks Two-Way Sync", "Google Tasks Sync"):
+        try:
+            from tools.sidecars import run_tasks_sync
+            ok, out, _ = await _run_sidecar_job_async("google_tasks_sync", "Google Tasks Two-Way Sync", run_tasks_sync)
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] Google Tasks sync checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Google Tasks sync execution error: {e}")
+        return
+
+    # Plex Weekly New Media Digest
+    if "plex_weekly_digest.py" in prompt or job_name == "Plex Weekly New Media Digest":
+        try:
+            res = await asyncio.to_thread(subprocess.run, ["python3", "/workspace/tools/plex_weekly_digest.py", "post", "--tag-all"], capture_output=True, text=True, timeout=60)
+            out = res.stdout.strip()
+            if out:
+                print(f"[Scheduler] Plex weekly digest executed: {out[:100]}")
+        except Exception as e:
+            print(f"[Scheduler] Plex weekly digest execution error: {e}")
+        return
+
+    # Weekly 3-Dinner Meal Proposal
+    if "meal_proposal" in prompt or "meal_planner" in prompt or job_name in ("Weekly 3-Dinner Meal Proposal", "Weekly Meal Proposal"):
+        try:
+            from tools.sidecars import run_weekly_meal_proposal
+            ok, out, _ = await _run_sidecar_job_async("weekly_meal_proposal", "Weekly 3-Dinner Meal Proposal", run_weekly_meal_proposal)
+            if out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    if choice_view:
+                        await ch.send(clean_content, view=choice_view)
+                    else:
+                        await ch.send(clean_content)
+            else:
+                print("[Scheduler] Weekly meal proposal checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Weekly meal proposal execution error: {e}")
+        return
+
+    # Option B Weekly Proactive Digest
+    if ("weekly_digest.py" in prompt and "plex_weekly_digest" not in prompt) or job_name in ("Option B Weekly Proactive Digest", "Weekly Proactive Digest"):
+        try:
+            res = await asyncio.to_thread(subprocess.run, ["python3", "/workspace/tools/weekly_digest.py"], capture_output=True, text=True, timeout=60)
             out = res.stdout.strip()
             if out and bot:
                 ch = await get_dest_channel()
@@ -376,22 +483,12 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Weekly digest execution error: {e}")
         return
 
-    # Plex Weekly New Media Digest
-    if "plex_weekly_digest.py" in prompt or job_name == "Plex Weekly New Media Digest":
-        try:
-            res = subprocess.run(["python3", "/workspace/tools/plex_weekly_digest.py", "post", "--tag-all"], capture_output=True, text=True, timeout=60)
-            out = res.stdout.strip()
-            if out:
-                print(f"[Scheduler] Plex weekly digest executed: {out[:100]}")
-        except Exception as e:
-            print(f"[Scheduler] Plex weekly digest execution error: {e}")
-        return
 
     # Crab Cavern Morning Topic Rotation
     if "morning_dispatcher.py" in prompt or job_name in ("Crab Cavern Morning Topic Rotation", "Morning Topic Rotation"):
         try:
             from tools.morning_dispatcher import dispatch_morning_topic
-            res = dispatch_morning_topic(dry_run=False)
+            res = await asyncio.to_thread(dispatch_morning_topic, dry_run=False)
             print(f"[Scheduler] Crab Cavern morning rotation dispatched: status={res.get('status')}, outbox_id={res.get('outbox_id')}")
         except Exception as e:
             print(f"[Scheduler] Crab Cavern morning rotation dispatch error: {e}")
@@ -400,8 +497,8 @@ async def dispatch_scheduled_prompt(
     # Daily birthday reminder: silent execution unless someone has a birthday today
     if "birthday_reminder.py" in prompt or job_name in ("Daily Birthday Reminder", "Birthday Reminder") or "sidecars.py birthdays" in prompt:
         try:
-            from tools.sidecars import run_sidecar_job, run_birthday_reminders
-            ok, out, extra = run_sidecar_job("daily_birthday_reminder", "Daily Birthday Reminder", run_birthday_reminders)
+            from tools.sidecars import run_birthday_reminders
+            ok, out, extra = await _run_sidecar_job_async("daily_birthday_reminder", "Daily Birthday Reminder", run_birthday_reminders)
             has_bday = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
             if has_bday and out and out.strip() and bot:
                 ch = await get_dest_channel()
@@ -420,8 +517,8 @@ async def dispatch_scheduled_prompt(
     # Weekly social & last seen review: silent execution unless qualifying events found
     if "social_last_seen_review.py" in prompt or job_name in ("Weekly Social & Last Seen Review", "Weekly Social Review") or "sidecars.py social_review" in prompt:
         try:
-            from tools.sidecars import run_sidecar_job, run_social_last_seen_review
-            ok, out, extra = run_sidecar_job("weekly_social_review", "Weekly Social & Last Seen Review", run_social_last_seen_review)
+            from tools.sidecars import run_social_last_seen_review
+            ok, out, extra = await _run_sidecar_job_async("weekly_social_review", "Weekly Social & Last Seen Review", run_social_last_seen_review)
             has_events = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
             if has_events and out and out.strip() and bot:
                 ch = await get_dest_channel()
@@ -440,8 +537,8 @@ async def dispatch_scheduled_prompt(
     # Monthly core friends reconnect reminder: silent execution unless unseen core friends found
     if "core_friends_reminder.py" in prompt or job_name in ("Monthly Core Friends Social Planning Reminder", "Monthly Core Friends Social Reminder", "Core Friends Reminder") or "sidecars.py core_friends" in prompt:
         try:
-            from tools.sidecars import run_sidecar_job, run_core_friends_reminder
-            ok, out, extra = run_sidecar_job("monthly_core_friends_reminder", "Monthly Core Friends Social Reminder", run_core_friends_reminder)
+            from tools.sidecars import run_core_friends_reminder
+            ok, out, extra = await _run_sidecar_job_async("monthly_core_friends_reminder", "Monthly Core Friends Social Reminder", run_core_friends_reminder)
             has_friends = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
             if has_friends and out and out.strip() and bot:
                 ch = await get_dest_channel()
@@ -457,25 +554,11 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Monthly core friends reminder execution error: {e}")
         return
 
-    # Daily token & AI Ultra compute budget report
-    if "token_report" in prompt or job_name in ("Daily Token & AI Ultra Budget Report", "Daily Token Budget Report", "Token Report"):
-        try:
-            from tools.sidecars import run_sidecar_job, run_token_report
-            ok, rep, _ = run_sidecar_job("daily_token_report", "Daily Token Budget Report", run_token_report)
-            if rep and bot:
-                ch = await get_dest_channel()
-                if ch:
-                    for chunk in chunk_text(rep):
-                        await ch.send(chunk)
-        except Exception as e:
-            print(f"[Scheduler] Token report execution error: {e}")
-        return
-
     # Market Sandbox Autonomous Daily Standup
     if "market_standup.py" in prompt or job_name in ("Market Sandbox Autonomous Daily Standup", "Market Standup"):
         try:
             from tools.market_standup import dispatch_market_standup
-            res = dispatch_market_standup(dry_run=False)
+            res = await asyncio.to_thread(dispatch_market_standup, dry_run=False)
             print(f"[Scheduler] Market Sandbox standup dispatched: status={res.get('status')}")
         except Exception as e:
             print(f"[Scheduler] Market Sandbox standup dispatch error: {e}")
@@ -485,7 +568,7 @@ async def dispatch_scheduled_prompt(
     if "agora_steering.py" in prompt or job_name in ("AGORA Daily Steering Briefing", "AGORA Steering"):
         try:
             from tools.agora_steering import dispatch_agora_steering
-            res = dispatch_agora_steering(dry_run=False)
+            res = await asyncio.to_thread(dispatch_agora_steering, dry_run=False)
             print(f"[Scheduler] AGORA steering briefing dispatched: status={res.get('status')}")
         except Exception as e:
             print(f"[Scheduler] AGORA steering briefing dispatch error: {e}")
@@ -494,8 +577,8 @@ async def dispatch_scheduled_prompt(
     # Monthly Hardcoded Rule & Regex Audit
     if "code_audit" in prompt or "hardcode_regex_audit" in prompt or job_name in ("Monthly Hardcoded Rule & Regex Audit", "Hardcode Regex Audit"):
         try:
-            from tools.sidecars import run_sidecar_job, run_hardcode_regex_audit
-            ok, rep, _ = run_sidecar_job("monthly_hardcode_regex_audit", "Monthly Hardcoded Rule & Regex Audit", run_hardcode_regex_audit)
+            from tools.sidecars import run_hardcode_regex_audit
+            ok, rep, _ = await _run_sidecar_job_async("monthly_hardcode_regex_audit", "Monthly Hardcoded Rule & Regex Audit", run_hardcode_regex_audit)
             if rep and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -551,10 +634,23 @@ def should_run_job(job: dict, now_ts: float) -> tuple[bool, str]:
     last_run = last_run or 0
     stype = job.get("schedule_type", "daily")
     window = job.get("catchup_window_seconds", 7200)
-    min_period = 86400 * 0.7 if stype == "daily" else (7 * 86400 * 0.7 if stype == "weekly" else window)
+
+    if stype == "daily":
+        min_period = 86400 * 0.7
+        double_run_guard = (last_run >= next_ts - 300)
+    elif stype == "weekly":
+        min_period = 86400  # 24h guard: prevents same-day double runs without blocking scheduled runs after weekend tests
+        double_run_guard = (last_run >= next_ts - 300)
+    elif stype == "interval":
+        interval = job.get("interval_seconds", 3600)
+        min_period = interval * 0.7
+        double_run_guard = (last_run >= next_ts)
+    else:
+        min_period = window
+        double_run_guard = (last_run >= next_ts - 300)
 
     # 1. Guard against double-running if it already ran for this slot or in the current schedule period
-    if (last_run >= next_ts - 300) or (last_run and (now_ts - last_run) < min_period):
+    if double_run_guard or (last_run and (now_ts - last_run) < min_period):
         return False, f"already ran in current period (last_run_ts={last_run})"
 
     overdue = now_ts - next_ts
@@ -581,13 +677,17 @@ class KarakosScheduler:
         bot: discord.Client = None,
         is_busy_fn = None,
         reload_fn = None,
-        presence_fn = None
+        presence_fn = None,
+        quick_choice_view_cls = None,
+        button_choice_fn = None,
     ):
         self.dispatch_fn = dispatch_fn
         self.bot = bot
         self.is_busy_fn = is_busy_fn
         self.reload_fn = reload_fn
         self.presence_fn = presence_fn
+        self.quick_choice_view_cls = quick_choice_view_cls
+        self.button_choice_fn = button_choice_fn
         self._running = False
         self._task = None
 
@@ -749,7 +849,16 @@ class KarakosScheduler:
                                         except Exception as err:
                                             print(f"[Outbox] Warning releasing Banana: {err}")
                                 else:
-                                    await target_channel.send(omsg.get("content", ""))
+                                    raw_content = omsg.get("content", "")
+                                    clean_content, choice_view = parse_interactive_choices(
+                                        raw_content,
+                                        self.quick_choice_view_cls,
+                                        self.button_choice_fn,
+                                    )
+                                    if choice_view:
+                                        await target_channel.send(clean_content, view=choice_view)
+                                    else:
+                                        await target_channel.send(clean_content)
                                 print(f"[Outbox] Dispatched message {omsg.get('id')} to #{omsg.get('channel')} ({target_cid})")
                 except Exception as oe:
                     print(f"[Bridge] Error flushing outbox queue: {oe}")
@@ -764,14 +873,16 @@ class KarakosScheduler:
                     except Exception:
                         pass
                     busy = self.is_busy_fn() if self.is_busy_fn else []
-                    if not busy or flag_age > 20.0:
+                    if not busy:
                         try:
                             reload_flag.unlink()
                         except Exception:
                             pass
-                        print(f"[Bridge] Reload flag detected (age={flag_age:.1f}s, busy={busy}). Executing in-place reload...")
+                        print(f"[Bridge] Reload flag detected (age={flag_age:.1f}s, bridge idle). Executing in-place reload...")
                         if self.reload_fn:
                             await self.reload_fn(None, initiator="scheduler", force=True, reason="Scheduler reload flag trigger")
+                    else:
+                        print(f"[Bridge] Reload flag detected (age={flag_age:.1f}s), but bridge is busy ({busy}). Deferring reload until idle...")
             except Exception as e:
                 print(f"[KarakosScheduler] Error in loop: {e}")
 

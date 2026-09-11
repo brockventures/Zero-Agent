@@ -40,7 +40,9 @@ READONLY_NOTIFICATION_CHANNELS = {
 }
 
 TARGET_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "1542081375287640084"))
-OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "1210466877294518272"))
+BROCK_GUILD_ID = int(os.getenv("DISCORD_BROCK_GUILD_ID", "1210466877294518272"))
+OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
+BANANA_STAND_CHANNEL_ID = 1534436119888793750
 
 OPERATIONS_CATEGORY_ID = 1544953274363412533
 HOMELAB_CHANNEL_ID = 1544955535722545253
@@ -81,6 +83,21 @@ def is_home_channel(channel) -> bool:
     if parent and getattr(parent, "category_id", None) == ops_cat_id:
         return True
 
+    return False
+
+
+def is_brock_guild(obj) -> bool:
+    """Check if a message, channel, or thread belongs to the Brock Discord guild."""
+    if not obj:
+        return False
+    guild = getattr(obj, "guild", None)
+    if not guild and hasattr(obj, "channel"):
+        guild = getattr(obj.channel, "guild", None)
+    if isinstance(guild, (int, str)) and str(guild).isdigit():
+        return int(guild) == BROCK_GUILD_ID
+    guild_id = getattr(guild, "id", None)
+    if isinstance(guild_id, (int, str)) and str(guild_id).isdigit():
+        return int(guild_id) == BROCK_GUILD_ID
     return False
 
 
@@ -389,41 +406,58 @@ def has_reaction_gif(text: str) -> bool:
     )
 
 
-def get_gif_prompt_guidance(sess_key: str) -> str:
-    """Generate prompt guidance block for GIF cadence, diversity, and contextual overrides."""
+def is_gif_disabled_for_channel(sess_key: str | int | None, channel_id: int | str | None = None) -> bool:
+    """Check if reaction GIFs are disabled for a given channel or session key."""
+    if sess_key is None and channel_id is None:
+        return False
+
+    candidates = set()
+    if sess_key is not None:
+        candidates.add(str(sess_key).strip().lower())
+    if channel_id is not None:
+        candidates.add(str(channel_id).strip().lower())
+
+    # Hardcoded protection for #the-banana-stand
+    banana_ids = {str(BANANA_STAND_CHANNEL_ID), "the-banana-stand", "banana-stand", "agent-chat"}
+    if candidates.intersection(banana_ids):
+        return True
+
+    # Check configurable runtime rules
+    rules = get_runtime_rules()
+    disabled = rules.get("gif_disabled_channels", [])
+    for item in disabled:
+        if str(item).strip().lower() in candidates:
+            return True
+
+    return False
+
+
+def get_gif_prompt_guidance(sess_key: str, channel_id: int | str | None = None) -> str:
+    """Generate prompt guidance block for GIF cadence and contextual overrides."""
+    if is_gif_disabled_for_channel(sess_key, channel_id):
+        channel_label = "the-banana-stand" if str(sess_key) in (str(BANANA_STAND_CHANNEL_ID), "the-banana-stand", "banana-stand") else sess_key
+        return (
+            f"[GIF Policy (Channel: {channel_label})]: Reaction GIFs are STRICTLY DISABLED in this channel.\n"
+            f"• Do NOT query gif_tool.py or include any reaction GIFs, Tenor links, or images.\n"
+            f"• Keep responses focused strictly on technical analysis, code, and direct answers."
+        )
+
     count = get_gif_turn_count(sess_key)
     status_str = "⚠️ DUE (>=5 turns without GIF)" if count >= 5 else f"Nominal ({count}/5-7 turns)"
 
-    diversity_lines = []
-    try:
-        from tools.gif_tool import get_cooldown_summary
-        summary = get_cooldown_summary()
-        cds = summary.get("cooldowns", {})
-        if cds:
-            cd_items = [
-                f"{v['display_name']} (BLOCKED - {v['distance']}/{v['threshold']})"
-                for v in cds.values()
-            ]
-            diversity_lines.append(f"• Active Franchise Cooldown(s): [{', '.join(cd_items)}].")
-        eligible = summary.get("eligible", [])
-        if eligible:
-            diversity_lines.append(f"• Comedic Rotation: {', '.join(eligible[:6])}.")
-        if cds:
-            diversity_lines.append("• Diversity Rule: Do NOT query cooled-down franchises. Rotate across eligible comedic universes.")
-    except Exception:
-        pass
-
-    diversity_block = ("\n" + "\n".join(diversity_lines)) if diversity_lines else ""
-
     return (
         f"[GIF Cadence Tracker (Channel: {sess_key})]: {count} message(s) since last reaction GIF in this channel.\n"
-        f"• Target Cadence: ~1 in 5-7 messages (use: python3 /workspace/tools/gif_tool.py \"<query>\")."
-        f"{diversity_block}\n"
+        f"• Target Cadence: ~1 in 5-7 messages.\n"
+        f"• Situational Query Strategy: Describe the situation or vibe of your upcoming message (use: python3 /workspace/tools/gif_tool.py \"<situation or vibe description>\"). Matches against curated situation and vibe metadata in canonical_gifs.json.\n"
         f"• Status: {status_str}.\n"
         f"• Contextual Overrides:\n"
         f"  - Serious / Critical Override: If the message/topic is serious, urgent, an outage, data entry, or sensitive, override and SKIP the GIF regardless of count.\n"
-        f"  - Social / Banter Override: If the exchange is particularly social, humorous, or banter-laden, you may include a GIF even if count < 5."
+        f"  - Social / Banter Override: If the exchange is particularly social, humorous, or banter-laden, you may include a GIF even if count < 5.\n"
+        f"  - Fast-Fail & Single-Shot Rule: GIF queries are strictly single-shot. If 404s or fails, bail out immediately and emit text—never inspect tool code or retry.\n"
+        f"  - Formatting & Placement: Hyperlink text MUST strictly say 'GIF' (e.g. [GIF](<url>) or [GIF](url)). Always place the [GIF](<url>) link at the VERY END of your message (immediately before any [CHOICES: ...] block, never at the beginning).\n"
+        f"  - Diagnostic Ping Override: If prompt is a latency/ping check ('ping', 'respond pong'), skip tool calls entirely."
     )
+
 
 
 def check_compaction_needed(
@@ -598,6 +632,8 @@ class PersistentTurnQueue:
             print(f"[TurnQueue] Persist error: {e}")
 
     async def put(self, item: dict):
+        if isinstance(item, dict):
+            item.setdefault("queued_at", time.perf_counter())
         self.pending_items.append(item)
         self._persist()
         await self.queue.put(item)
@@ -651,10 +687,35 @@ def update_beacon(state: str = "IDLE", prompt: str = "", channel_id: int | str =
         pass
 
 
-def is_reload_intent(text: str) -> bool:
-    """Detect explicit commands or natural language requests to restart/reload the bot/bridge."""
+def is_container_restart_intent(text: str) -> bool:
+    """Detect explicit commands or natural language requests to restart the Docker container via SSH."""
     clean = text.strip().lower()
     if not clean:
+        return False
+
+    if clean in (
+        "restart docker container", "restart container", "restart container now",
+        "reboot docker container", "reboot container", "docker restart",
+        "restart the docker container", "restart the container",
+        "reboot the container", "reboot the docker container"
+    ):
+        return True
+
+    pattern = r"^(hey\s+zero[,:\s]*)?(please\s+)?(can\s+you\s+)?(do\s+(a\s+)?)?(restart|reboot)\s+(the\s+)?(docker\s+container|container)(\s+now)?[.!?]*$"
+    if re.match(pattern, clean, re.IGNORECASE):
+        return True
+
+    return False
+
+
+def is_reload_intent(text: str) -> bool:
+    """Detect explicit commands or natural language requests to restart/reload the bot/bridge in-place."""
+    clean = text.strip().lower()
+    if not clean:
+        return False
+
+    # Container restarts take precedence and are distinct
+    if is_container_restart_intent(text):
         return False
 
     # Exact slash/bang commands
@@ -666,7 +727,7 @@ def is_reload_intent(text: str) -> bool:
         return True
 
     # Common natural language phrases
-    pattern = r"^(hey\s+zero[,:\s]*)?(please\s+)?(can\s+you\s+)?(do\s+(a\s+)?)?(restart|reload|reboot)(\s+(yourself|the\s+bridge|the\s+container|container|now|zero|bridge))?(\s+(now|in-place|in\s+place))?[.!?]*$"
+    pattern = r"^(hey\s+zero[,:\s]*)?(please\s+)?(can\s+you\s+)?(do\s+(a\s+)?)?(restart|reload|reboot)(\s+(yourself|the\s+bridge|bridge|now|zero))?(\s+(now|in-place|in\s+place))?[.!?]*$"
     if re.match(pattern, clean, re.IGNORECASE):
         return True
 
@@ -674,11 +735,11 @@ def is_reload_intent(text: str) -> bool:
     if clean in (
         "yes restart", "yes reload", "yes reboot",
         "restart please", "reload please",
-        "restart container now", "restart bridge now",
+        "restart bridge now",
         "reload bridge now", "restart now", "reload now",
-        "reboot now", "restart the container", "reload the bridge",
+        "reboot now", "reload the bridge",
         "restart the bridge", "restart yourself please",
-        "reboot yourself", "reboot the container",
+        "reboot yourself",
         "reload bridge in-place", "reload bridge in place",
         "restart bridge in-place", "restart bridge in place",
         "reload in-place", "reload in place"

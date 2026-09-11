@@ -67,6 +67,7 @@ from tools.bridge_state import (
     get_active_model,
     set_active_model,
     is_reload_intent,
+    is_container_restart_intent,
     sync_credentials,
     clear_channel_session_id,
     PT_TZ,
@@ -96,6 +97,7 @@ from tools.bridge_handlers import (
     QuickChoiceView,
     apply_bot_presence,
     execute_bridge_reload,
+    execute_container_restart,
     is_bridge_busy,
     warm_channel_history,
     handle_button_choice,
@@ -202,6 +204,8 @@ async def _start_scheduler():
             is_busy_fn=_is_busy,
             reload_fn=_execute_reload,
             presence_fn=_apply_presence,
+            quick_choice_view_cls=QuickChoiceView,
+            button_choice_fn=_button_choice_callback,
         )
         await scheduler.start()
         print("[Antigravity] Karakos-style persistent JSON scheduler initialized.")
@@ -222,6 +226,7 @@ async def on_ready():
         start_workers_fn=_start_queue_workers,
         start_scheduler_fn=_start_scheduler,
         presence_fn=_apply_presence,
+        reload_fn=_execute_reload,
     )
 
 
@@ -255,7 +260,8 @@ async def slash_new(interaction: discord.Interaction, prompt: str = ""):
                 "is_steer": False,
                 "mode": mode,
                 "channel_id": ch.id,
-                "is_thread_task": True
+                "is_thread_task": True,
+                "queued_at": time.perf_counter(),
             })
         else:
             await interaction.followup.send("🔄 Reset session for this thread. Send your next message to start fresh.")
@@ -281,7 +287,8 @@ async def slash_new(interaction: discord.Interaction, prompt: str = ""):
                 "is_steer": False,
                 "mode": mode,
                 "channel_id": thread.id,
-                "is_thread_task": True
+                "is_thread_task": True,
+                "queued_at": time.perf_counter(),
             })
         else:
             await thread.send("👋 Started a fresh conversation thread. What would you like to work on?")

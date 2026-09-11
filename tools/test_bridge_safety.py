@@ -12,14 +12,14 @@ from pathlib import Path
 WORKSPACE = Path("/workspace")
 sys.path.insert(0, str(WORKSPACE))
 
-from tools.bridge import is_reload_intent, format_for_discord, extract_agent_response
+from tools.bridge import is_reload_intent, is_container_restart_intent, format_for_discord, extract_agent_response
 from tools.session_summarizer import extract_recent_dialogue
 
 
 class TestBridgeSafety(unittest.TestCase):
 
     def test_reload_intent_recognition(self):
-        """Test exact and natural language reload/restart intents."""
+        """Test exact and natural language in-place reload/restart intents."""
         positive_cases = [
             "!reload",
             "/reload",
@@ -35,7 +35,6 @@ class TestBridgeSafety(unittest.TestCase):
             "can you restart?",
             "do a restart",
             "hey zero, please reload the bridge",
-            "Restart Container Now",
             "restart bridge now",
             "reload now",
             "reboot yourself",
@@ -59,12 +58,53 @@ class TestBridgeSafety(unittest.TestCase):
             "test",
             "tell me about reboot procedures in linux",
             "we had a restart yesterday",
+            "Restart Container Now",
+            "Restart Docker Container",
+            "restart container",
         ]
         for text in negative_cases:
             with self.subTest(text=text):
                 self.assertFalse(
                     is_reload_intent(text),
                     f"Expected '{text}' NOT to match reload intent",
+                )
+
+    def test_container_restart_intent_recognition(self):
+        """Test exact and natural language Docker container restart intents."""
+        positive_cases = [
+            "Restart Docker Container",
+            "restart docker container",
+            "Restart Container Now",
+            "restart container now",
+            "restart container",
+            "reboot container",
+            "docker restart",
+            "restart the container",
+            "restart the docker container",
+            "reboot the container",
+            "hey zero, please restart the container",
+        ]
+        for text in positive_cases:
+            with self.subTest(text=text):
+                self.assertTrue(
+                    is_container_restart_intent(text),
+                    f"Expected '{text}' to match container restart intent",
+                )
+
+        negative_cases = [
+            "!reload",
+            "/reload",
+            "Reload Bridge In-Place",
+            "reload bridge",
+            "restart bridge",
+            "what is a container?",
+            "how do containers restart?",
+        ]
+        for text in negative_cases:
+            with self.subTest(text=text):
+                self.assertFalse(
+                    is_container_restart_intent(text),
+                    f"Expected '{text}' NOT to match container restart intent",
                 )
 
     def test_task_envelope_scrubbing(self):
@@ -146,6 +186,21 @@ class TestBridgeSafety(unittest.TestCase):
         )
         extracted = extract_agent_response(raw_stream)
         self.assertEqual(extracted, "Hello Ryan, all systems are green.")
+
+
+    def test_no_module_shadowing_in_exception_handlers(self):
+        """Ensure no standard module names (re, os, sys, json, etc.) are shadowed in except handlers."""
+        shadowed_modules = {"re", "os", "sys", "json", "time", "asyncio", "discord"}
+        target_files = [
+            WORKSPACE / "tools" / "bridge_runner.py",
+            WORKSPACE / "tools" / "bridge_daemons.py",
+            WORKSPACE / "tools" / "bridge_handlers.py",
+        ]
+        for fpath in target_files:
+            tree = ast.parse(fpath.read_text(encoding="utf-8"), filename=str(fpath))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ExceptHandler) and node.name in shadowed_modules:
+                    self.fail(f"Found shadowed module name '{node.name}' in exception handler in {fpath.name}:{node.lineno}")
 
 
 if __name__ == "__main__":
