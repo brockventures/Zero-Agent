@@ -123,20 +123,14 @@ def strip_internal_cli_chatter(text: str) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"(?m)^\s*<\s*SYSTEM_MESSAGE\s*>[\s\S]*?<\s*/\s*SYSTEM_MESSAGE\s*>\s*\n?",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"(?m)^\s*<\s*RECEIVED_TASK_NOTIFICATION\s*>[\s\S]*?<\s*/\s*RECEIVED_TASK_NOTIFICATION\s*>\s*\n?",
+        r"(?m)^\s*<\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION|NOTIFICATION)\s*>[\s\S]*?<\s*/\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION|NOTIFICATION)\s*>\s*\n?",
         "",
         text,
         flags=re.IGNORECASE,
     )
     # Unclosed standalone system / task notification blocks on their own line extending to EOF
     text = re.sub(
-        r"(?m)^\s*<\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION)\s*>\s*\n[\s\S]*?$",
+        r"(?m)^\s*<\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION|NOTIFICATION)\s*>\s*\n[\s\S]*?$",
         "",
         text,
         flags=re.IGNORECASE,
