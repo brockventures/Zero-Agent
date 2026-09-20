@@ -24,26 +24,21 @@ PT = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Resolve SSH and host configuration from environment or secrets
+for _p in ["/workspace", "/workspace/tools"]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# Resolve SSH and host configuration from nas_docker_mcp or environment
 def _resolve_nas_config():
-    ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
-    host_1 = os.environ.get("NAS_HOST_1_IP")
-    host_2 = os.environ.get("NAS_HOST_2_IP")
-
-    if os.path.exists("/secrets/env.json"):
+    try:
         try:
-            with open("/secrets/env.json") as f:
-                d = json.load(f)
-                if d.get("NAS_SSH_PORT"):
-                    ssh_port = str(d["NAS_SSH_PORT"])
-                if d.get("NAS_HOST_1_IP"):
-                    host_1 = d["NAS_HOST_1_IP"]
-                if d.get("NAS_HOST_2_IP"):
-                    host_2 = d["NAS_HOST_2_IP"]
-        except Exception:
-            pass
-
-    return host_1 or os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), host_2 or os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), ssh_port
+            from tools.nas_docker_mcp import _resolve_nas_config as _mcp_resolve
+        except ImportError:
+            from nas_docker_mcp import _resolve_nas_config as _mcp_resolve
+        return _mcp_resolve()
+    except Exception:
+        ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
+        return os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), ssh_port
 
 HOST_1_IP, HOST_2_IP, SSH_PORT = _resolve_nas_config()
 SSH_KEY = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
