@@ -418,39 +418,13 @@ async def execute_agy_turn(
                         # Extract current progress/action from stream-json or raw text using robust line buffering
                         while "\n" in line_buffer:
                             line, line_buffer = line_buffer.split("\n", 1)
-                            line_s = line.strip()
-                            if line_s.startswith("{") and line_s.endswith("}"):
-                                try:
-                                    ev = json.loads(line_s)
-                                    ev_name = ev.get("event") or ev.get("type")
-                                    if ev_name == "init":
-                                        init_received = True
-                                    coord.process_stream_event(ev, timer=timer)
-                                    current_action = coord.current_action
-                                except Exception:
-                                    pass
-                            elif line_s.startswith("● "):
-                                current_action = line_s[:100]
-                            elif "(Calls tool:" in line_s:
-                                current_action = line_s[:100]
-                            elif "AGY_ERROR:" in line_s:
-                                agy_err = parse_agy_error(line_s)
-                                if agy_err:
-                                    last_agy_error = agy_err
-                                    coord.last_agy_error = agy_err
-                                    print(f"[BridgeRunner] 🚨 Captured AGY_ERROR in PID {proc.pid}: {agy_err}")
+                            ev = coord.handle_line(line, timer=timer)
+                            if ev and (ev.get("event") == "init" or ev.get("type") == "init"):
+                                init_received = True
 
                         # Throttle progress updates to Discord (every 1.5s)
-                        now_edit = time.time()
-                        if status_msg and (now_edit - last_status_edit >= 1.5):
-                            ticker_enabled = get_runtime_rules().get("live_status_ticker_enabled", False)
-                            if ticker_enabled:
-                                clean_action = re.sub(r"\x1b(?:\[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", current_action)
-                                try:
-                                    await status_msg.edit(content=f"⏳ *{clean_action}*")
-                                    last_status_edit = now_edit
-                                except Exception:
-                                    pass
+                        ticker_enabled = rules.get("live_status_ticker_enabled", False)
+                        await coord.update_status_ticker(ticker_enabled=ticker_enabled)
 
                         # Detect Google OAuth URL on uninitialized raw terminal boot
                         if not init_received and not auth_detected:
@@ -529,23 +503,11 @@ async def execute_agy_turn(
                 return
 
         finally:
-            if channel_id in channel_active_procs:
-                del channel_active_procs[channel_id]
-            if escalated_to_thread and 'thread' in locals() and hasattr(thread, 'id') and thread.id in channel_active_procs:
-                del channel_active_procs[thread.id]
-            if mode == "home":
-                if channel_id == TARGET_CHANNEL_ID:
-                    active_proc = None
-                try:
-                    clear_in_flight(channel_id)
-                except Exception:
-                    pass
-            else:
+            coord.cleanup_process(proc=proc, br_module=sys.modules[__name__])
+            if mode == "home" and channel_id == TARGET_CHANNEL_ID:
+                active_proc = None
+            elif mode == "external":
                 ext_active_proc = None
-
-            # Only switch beacon to IDLE if no running processes remain across all channels
-            if not any(p and p.returncode is None for p in channel_active_procs.values()):
-                update_beacon("IDLE", "")
 
             if apply_presence_fn:
                 try:
@@ -594,48 +556,24 @@ async def execute_agy_turn(
     active_cid = get_channel_session_id(channel_id, mode) or conv_id
     final_text = extract_agent_response(full_raw, conv_id=active_cid)
 
-    # Detect if response is empty, placeholder, leak, or silence sentinel
-    is_empty_or_placeholder = not final_text or final_text.startswith("*(") or len(final_text.strip()) == 0
-    is_leak = is_internal_cli_leak(final_text)
-    is_silence = final_text.strip() in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP", "reply:none", "reply: none")
+    # Fallback to on-disk transcript, leak scrubbing, or error beacon via TurnCoordinator
+    final_text, _ = coord.harvest_fallback(
+        final_text,
+        active_cid=active_cid,
+        proc=proc,
+        turn_timeout_seconds=turn_timeout_seconds,
+    )
 
-    # In external mode, genuine non-error silence without output maps to [NO_REPLY]
-    if mode == "external" and (is_leak or is_silence) and not (timed_out or wedged_diagnostic or last_agy_error or (proc and proc.returncode not in (0, None))):
-        final_text = "[NO_REPLY]"
-
-    # Fallback to on-disk transcript if response was empty, leak, or placeholder
-    # (In home mode, NEVER skip transcript recovery even if silence/leak sentinel was detected)
-    if is_empty_or_placeholder or is_leak or (mode == "home" and is_silence):
-        harvested = harvest_transcript_response(active_cid)
-        if harvested and not is_internal_cli_leak(harvested):
-            print(f"[BridgeRunner] 🌾 Harvested response from on-disk transcript for session {active_cid} ({len(harvested)} chars).")
-            final_text = f"⚠️ *(Recovered from session transcript following process cutoff)*\n\n{harvested}"
-            is_empty_or_placeholder = False
-            is_leak = False
-            is_silence = False
-
-    # In Home Turf, silence sentinels and empty outputs are strictly invalid - emit explicit error beacon (NEVER fail silently)
-    # In external mode, emit error beacons if process failed/timed out/wedged
-    has_process_failure = timed_out or wedged_diagnostic or last_agy_error or (proc and proc.returncode not in (0, None))
-    should_emit_beacon = (mode == "home" and (is_empty_or_placeholder or is_leak or is_silence)) or (mode == "external" and has_process_failure and (is_empty_or_placeholder or is_leak or is_silence))
-
-    if should_emit_beacon:
-        final_text = coord.format_diagnostic_beacon(
-            proc_pid=proc.pid if proc else None,
-            returncode=proc.returncode if proc else None,
-            turn_timeout_seconds=turn_timeout_seconds,
-        )
-
-    if timed_out:
+    if coord.timed_out:
         timer.status = "TIMEOUT"
-    elif last_agy_error or (proc and proc.returncode == 3):
+    elif coord.last_agy_error or (proc and proc.returncode == 3):
         timer.status = "ERROR_3_MODEL_API"
     elif proc and proc.returncode not in (0, None):
         timer.status = f"ERROR_{proc.returncode}"
 
     await deliver_turn_output(
         output_text=final_text,
-        status_msg=status_msg,
+        status_msg=coord.status_msg,
         reply_target=reply_target,
         mode=mode,
         channel_id=channel_id,
@@ -643,10 +581,10 @@ async def execute_agy_turn(
         turn_start_time=turn_start_time,
         button_choice_fn=button_choice_fn,
         quick_choice_view_cls=quick_choice_view_cls,
-        delivery_target=delivery_target,
-        escalated_to_thread=escalated_to_thread,
-        notify_root_channel=notify_root_channel,
-        thread_jump_url=thread_jump_url,
+        delivery_target=coord.delivery_target,
+        escalated_to_thread=coord.escalated_to_thread,
+        notify_root_channel=coord.notify_root_channel,
+        thread_jump_url=coord.thread_jump_url,
         is_last_word=is_last_word,
         last_word_bot_id=last_word_bot_id,
         last_word_bot_name=last_word_bot_name,

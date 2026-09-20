@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from tools.bridge_engine import TurnCoordinator
 
 
-class TestBridgeEngine(unittest.TestCase):
+class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.reply_target = MagicMock()
         self.coordinator = TurnCoordinator(
@@ -199,6 +199,146 @@ class TestBridgeEngine(unittest.TestCase):
         beacon = self.coordinator.format_diagnostic_beacon(proc_pid=555, returncode=137)
         self.assertIn("Process terminated with exit code 137", beacon)
 
+    def test_handle_line(self):
+        # 1. JSON line
+        json_line = '{"event": "step_update", "step_update": {"step_type": "tool", "tool_name": "view_file", "tool_info": {"parameters": {"AbsolutePath": "/test/file.py"}}}}'
+        ev = self.coordinator.handle_line(json_line)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.get("event"), "step_update")
+        self.assertIn("Reading: file.py", self.coordinator.current_action)
+
+        # 2. Terminal action bullet
+        bullet_line = "● Fetching git commit status..."
+        self.coordinator.handle_line(bullet_line)
+        self.assertEqual(self.coordinator.current_action, bullet_line)
+
+        # 3. AGY_ERROR line
+        agy_err_line = 'AGY_ERROR: {"canonical_status": "RESOURCE_EXHAUSTED", "code": 429, "retryable": false, "error_id": "err-1", "short_error": "Rate limit"}'
+        self.coordinator.handle_line(agy_err_line)
+        self.assertIsNotNone(self.coordinator.last_agy_error)
+        self.assertEqual(self.coordinator.last_agy_error.get("code"), 429)
+
+    async def test_update_status_ticker(self):
+        mock_msg = AsyncMock()
+        self.coordinator.status_msg = mock_msg
+        self.coordinator.current_action = "\x1b[32mSearching files...\x1b[0m"
+
+        # Disabled ticker
+        self.coordinator.last_status_edit = time.time() - 2.0
+        updated = await self.coordinator.update_status_ticker(ticker_enabled=False)
+        self.assertFalse(updated)
+        mock_msg.edit.assert_not_awaited()
+
+        # Enabled ticker
+        updated = await self.coordinator.update_status_ticker(ticker_enabled=True)
+        self.assertTrue(updated)
+        mock_msg.edit.assert_awaited_once_with(content="⏳ *Searching files...*")
+
+    @patch("tools.bridge_engine.harvest_transcript_response")
+    def test_harvest_fallback(self, mock_harvest):
+        # Case 1: Nominal substantive text
+        res, was_harvested = self.coordinator.harvest_fallback("Hello Ryan")
+        self.assertEqual(res, "Hello Ryan")
+        self.assertFalse(was_harvested)
+        mock_harvest.assert_not_called()
+
+        # Case 2: External silence sentinel -> maps to [NO_REPLY]
+        coord_ext = TurnCoordinator(
+            channel_id=123, prompt="ping", mode="external", reply_target=self.reply_target, status_msg=None, conv_id=None
+        )
+        res, was_harvested = coord_ext.harvest_fallback("[NO_REPLY]")
+        self.assertEqual(res, "[NO_REPLY]")
+        self.assertFalse(was_harvested)
+
+        # Case 3: Home empty output with recoverable transcript
+        mock_harvest.return_value = "Recovered response text from disk."
+        res, was_harvested = self.coordinator.harvest_fallback("")
+        self.assertTrue(was_harvested)
+        self.assertIn("Recovered from session transcript", res)
+        self.assertIn("Recovered response text from disk.", res)
+
+        # Case 4: Home empty output without transcript -> error beacon
+        mock_harvest.return_value = None
+        res, was_harvested = self.coordinator.harvest_fallback("")
+        self.assertFalse(was_harvested)
+        self.assertIn("⚠️ **Turn Incomplete:**", res)
+
+    async def test_execute_stream_loop_success(self):
+        reader = AsyncMock()
+        lines = [
+            b'{"event":"step_update","step_update":{"step_type":"tool","tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"ls"}}}}\n',
+            b'{"event":"result","result":{"conversation_id":"conv-warm-222","status":"SUCCESS","response":"Loop test done"}}\n',
+            b''
+        ]
+        line_iter = iter(lines)
+        reader.readline = AsyncMock(side_effect=lambda: next(line_iter))
+
+        parser = MagicMock()
+        parser.get_final_response.return_value = "Loop test done"
+        timer = MagicMock()
+        proc = MagicMock()
+        proc.pid = 9999
+
+        resp = await self.coordinator.execute_stream_loop(
+            proc=proc,
+            stdout_reader=reader,
+            stream_parser=parser,
+            timer=timer,
+            rules={"live_status_ticker_enabled": False},
+        )
+        self.assertEqual(resp, "Loop test done")
+        self.assertEqual(self.coordinator.conv_id, "conv-warm-222")
+
+    async def test_execute_stream_loop_eof_with_agy_error(self):
+        reader = AsyncMock()
+        reader.readline = AsyncMock(return_value=b"")
+
+        parser = MagicMock()
+        timer = MagicMock()
+        proc = MagicMock()
+        proc.pid = 8888
+        proc.returncode = 3
+
+        agy_err = {
+            "canonical_status": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "retryable": False,
+            "error_id": "err-test-eof",
+            "short_error": "Out of tokens",
+        }
+        mock_recycle = AsyncMock()
+
+        resp = await self.coordinator.execute_stream_loop(
+            proc=proc,
+            stdout_reader=reader,
+            stream_parser=parser,
+            timer=timer,
+            rules={"live_status_ticker_enabled": False},
+            on_recycle=mock_recycle,
+            get_last_agy_error=lambda: agy_err,
+        )
+        mock_recycle.assert_awaited_once()
+        self.assertIn("⚠️ **Model API Failure (CLI Exit Code 3):**", resp)
+        self.assertIn("Out of tokens", resp)
+
+    @patch("tools.bridge_engine.update_beacon")
+    @patch("tools.bridge_engine.clear_in_flight")
+    def test_cleanup_process(self, mock_clear_in_flight, mock_update_beacon):
+        from tools.bridge_engine import channel_active_procs
+        proc = MagicMock()
+        proc.returncode = 0
+        channel_active_procs[self.coordinator.channel_id] = proc
+
+        mock_br = MagicMock()
+        mock_br.active_proc = proc
+
+        self.coordinator.cleanup_process(proc=proc, br_module=mock_br)
+        self.assertNotIn(self.coordinator.channel_id, channel_active_procs)
+        self.assertIsNone(mock_br.active_proc)
+        mock_clear_in_flight.assert_called_once_with(self.coordinator.channel_id)
+        mock_update_beacon.assert_called_once_with("IDLE", "")
+
 
 if __name__ == "__main__":
     unittest.main()
+
