@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-import time, socket, subprocess
+import os, sys, time, socket, subprocess
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+for _p in ["/workspace", "/workspace/tools"]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from tools.nas_docker_mcp import _resolve_nas_config
+except ImportError:
+    from nas_docker_mcp import _resolve_nas_config
+
 PT = ZoneInfo('America/Los_Angeles')
-HOST = os.environ.get('NAS_HOST_1_IP', '127.0.0.1')
-SSH_PORT = int(os.environ.get('NAS_SSH_PORT', '22'))
-SSH_KEY = '/secrets/id_ed25519'
-SSH_USER = 'Brock'
+_h1, _, _port = _resolve_nas_config()
+HOST = _h1
+SSH_PORT = int(_port)
+SSH_KEY = os.environ.get('NAS_SSH_KEY', '/secrets/id_ed25519' if os.path.exists('/secrets/id_ed25519') else '/root/.ssh/id_ed25519')
+SSH_USER = os.environ.get('NAS_SSH_USER', 'Brock')
 
 PORTS = {
     22: 'SSH',
