@@ -10,6 +10,8 @@ Responsibilities:
 2. Wedge & Stall Detection: Probes process tree wait-states on extended silence.
 3. Stream Event Handling: Parses stream-json events, updates status previews, tracks completion.
 4. Turn Recovery: Harvests on-disk transcripts and formats structured diagnostic beacons.
+5. Persistent Stream Loop: Unified asynchronous stream reading for worker daemons.
+6. Process & Beacon Teardown: Clean de-registration and idle beacon restoration.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import time
 from dataclasses import dataclass, field
@@ -34,14 +37,16 @@ from tools.bridge_formatting import (
     is_internal_cli_leak,
     parse_agy_error,
 )
+from tools.bridge_pipeline import TurnTimer
 from tools.bridge_state import (
     DATA_DIR,
     TARGET_CHANNEL_ID,
     clear_channel_session_id,
+    clear_in_flight,
+    get_runtime_rules,
     set_channel_session_id,
     update_beacon,
 )
-from tools.bridge_pipeline import TurnTimer
 from tools.process_probe import diagnose_process_tree
 
 # Global active process map: channel_id -> subprocess.Popen
@@ -58,10 +63,11 @@ class TurnCoordinator:
     reply_target: Any
     status_msg: Optional[discord.Message]
     conv_id: Optional[str]
-    turn_start_time: float = field(default_factory=time.time)
-    last_activity_time: float = field(default_factory=time.time)
-    last_probe_time: float = field(default_factory=time.time)
-    last_beacon_touch: float = field(default_factory=time.time)
+    turn_start_time: float = 0.0
+    last_activity_time: float = 0.0
+    last_probe_time: float = 0.0
+    last_beacon_touch: float = 0.0
+    last_status_edit: float = 0.0
     escalated_to_thread: bool = False
     delivery_target: Any = None
     thread: Optional[discord.Thread] = None
@@ -77,6 +83,18 @@ class TurnCoordinator:
     current_action: str = "Processing..."
 
     def __post_init__(self):
+        now = self.turn_start_time if self.turn_start_time > 0 else time.time()
+        if self.turn_start_time <= 0:
+            self.turn_start_time = now
+        if self.last_activity_time <= 0:
+            self.last_activity_time = now
+        if self.last_probe_time <= 0:
+            self.last_probe_time = now
+        if self.last_beacon_touch <= 0:
+            self.last_beacon_touch = now
+        if self.last_status_edit <= 0:
+            self.last_status_edit = now
+
         if self.delivery_target is None:
             self.delivery_target = self.reply_target
 
@@ -91,6 +109,26 @@ class TurnCoordinator:
             if (now - self.last_beacon_touch) >= interval:
                 update_beacon(state, self.prompt, channel_id=self.channel_id)
                 self.last_beacon_touch = now
+
+    async def update_status_ticker(
+        self, ticker_enabled: Optional[bool] = None, force: bool = False
+    ) -> bool:
+        """Throttled status message edit with clean ANSI-stripped action text."""
+        now = time.time()
+        if self.status_msg and (force or (now - self.last_status_edit >= 1.5)):
+            if ticker_enabled is None:
+                ticker_enabled = get_runtime_rules().get("live_status_ticker_enabled", False)
+            if ticker_enabled:
+                clean_action = re.sub(
+                    r"\x1b(?:\[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", self.current_action
+                )
+                try:
+                    await self.status_msg.edit(content=f"⏳ *{clean_action}*")
+                    self.last_status_edit = now
+                    return True
+                except Exception:
+                    pass
+        return False
 
     async def check_thread_escalation(
         self,
@@ -146,7 +184,7 @@ class TurnCoordinator:
                 if diag.get("is_interactive_stdin"):
                     print(
                         f"[BridgeEngine] 🚨 Wedged interactive subprocess detected for PID {proc_pid} "
-                        f"in channel {self.channel_id}: {diag['summary']}. Terminating early..."
+                        f"in channel {self.channel_id}: {diag.get('summary', 'interactive deadlock')}. Terminating early..."
                     )
                     self.wedged_diagnostic = diag
                     self.timed_out = True
@@ -155,6 +193,10 @@ class TurnCoordinator:
                 print(f"[BridgeEngine] Warning running process probe: {pe}")
         return False
 
+    def handle_wedge_detection(self, proc_pid: Optional[int], output_snippet: str = "") -> bool:
+        """Alias for probe_process_wedge."""
+        return self.probe_process_wedge(proc_pid, output_snippet=output_snippet)
+
     def check_watchdog_timeout(
         self,
         step_idle_timeout: float = 90.0,
@@ -162,7 +204,7 @@ class TurnCoordinator:
         max_turn_ceiling: float = 1800.0,
     ) -> tuple[bool, str]:
         """Evaluate two-tier inactivity and hard turn ceilings.
-        
+
         Returns: (is_timed_out, reason_description)
         """
         now = time.time()
@@ -189,7 +231,7 @@ class TurnCoordinator:
         agent_done_window: float = 15.0,
     ) -> tuple[bool, str]:
         """Check if post-result or quiescent agent completion cutoffs have been satisfied.
-        
+
         Returns: (is_cutoff_reached, trigger_label)
         """
         now = time.time()
@@ -283,6 +325,262 @@ class TurnCoordinator:
                     set_channel_session_id(self.channel_id, self.mode, res_cid)
                 self.conv_id = res_cid
             self.current_action = "Finalizing output..."
+
+    def handle_line(
+        self,
+        line_s: str,
+        stream_parser: Optional[AgyStreamParser] = None,
+        timer: Optional[TurnTimer] = None,
+    ) -> Optional[dict]:
+        """Parse a single output line (JSON stream-json event or formatted terminal text)."""
+        line_s = line_s.strip()
+        if not line_s:
+            return None
+
+        if line_s.startswith("{") and line_s.endswith("}"):
+            try:
+                ev = json.loads(line_s)
+                self.process_stream_event(ev, stream_parser=stream_parser, timer=timer)
+                return ev
+            except Exception:
+                return None
+
+        if line_s.startswith("● "):
+            self.current_action = line_s[:100]
+        elif "(Calls tool:" in line_s:
+            self.current_action = line_s[:100]
+        elif "AGY_ERROR:" in line_s:
+            agy_err = parse_agy_error(line_s)
+            if agy_err:
+                self.last_agy_error = agy_err
+        return None
+
+    async def execute_stream_loop(
+        self,
+        proc: Any,
+        stdout_reader: asyncio.StreamReader,
+        stream_parser: AgyStreamParser,
+        timer: TurnTimer,
+        rules: Optional[dict] = None,
+        worker_name: str = "worker",
+        on_recycle: Optional[Callable[..., Any]] = None,
+        get_last_agy_error: Optional[Callable[[], Optional[dict]]] = None,
+    ) -> str:
+        """Execute stream reading loop for a persistent worker daemon."""
+        if rules is None:
+            rules = get_runtime_rules()
+
+        watchdog_timeout = float(rules.get("turn_watchdog_seconds", 300.0))
+        max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 1800.0))
+        escalation_seconds = float(rules.get("auto_thread_escalation_seconds", 180.0))
+        escalation_enabled = rules.get("auto_thread_escalation_enabled", True)
+        ticker_enabled = rules.get("live_status_ticker_enabled", False)
+
+        output_response = ""
+        while True:
+            # 1. Thread escalation check (#zero-chat root only)
+            await self.check_thread_escalation(
+                proc=proc,
+                escalation_enabled=escalation_enabled,
+                escalation_seconds=escalation_seconds,
+            )
+
+            # 2. Read next line with timeout
+            line_bytes = None
+            while line_bytes is None:
+                try:
+                    line_bytes = await asyncio.wait_for(
+                        stdout_reader.readline(), timeout=5.0
+                    )
+                    self.touch_activity()
+                except asyncio.TimeoutError:
+                    now_wait = time.time()
+                    proc_pid = getattr(proc, "pid", None) if proc else None
+
+                    # Check for wedged interactive subprocess at >= 45s of silence
+                    if self.probe_process_wedge(proc_pid):
+                        if on_recycle:
+                            await on_recycle()
+                        return self.format_diagnostic_beacon(proc_pid=proc_pid)
+
+                    # Watchdog timeout check
+                    is_timeout, reason = self.check_watchdog_timeout(
+                        step_idle_timeout=watchdog_timeout,
+                        turn_timeout_seconds=watchdog_timeout,
+                        max_turn_ceiling=max_turn_ceiling,
+                    )
+                    if is_timeout:
+                        print(
+                            f"[BridgeEngine] ⚠️ Watchdog timeout: #{worker_name} worker exceeded {reason}. Recycling..."
+                        )
+                        if on_recycle:
+                            await on_recycle()
+                        raise TimeoutError(
+                            f"Turn watchdog timeout ({reason}) exceeded in #{worker_name}"
+                        )
+
+            if self.wedged_diagnostic is not None:
+                break
+
+            # 3. Handle EOF / premature termination
+            if not line_bytes:
+                await asyncio.sleep(0.05)
+                last_err = self.last_agy_error or (
+                    get_last_agy_error() if get_last_agy_error else None
+                )
+                proc_rc = getattr(proc, "returncode", None) if proc else None
+                proc_pid = getattr(proc, "pid", None) if proc else None
+
+                err_detail = ""
+                if last_err:
+                    err_detail = f": {last_err}"
+                elif proc_rc is not None:
+                    err_detail = f" (exit code {proc_rc})"
+
+                print(f"[BridgeEngine] ⚠️ Persistent worker for #{worker_name} exited unexpectedly{err_detail}.")
+                if on_recycle:
+                    await on_recycle()
+                if last_err:
+                    return format_agy_error_message(
+                        last_err,
+                        elapsed_sec=int(time.time() - self.turn_start_time),
+                        pid_str=f"PID {proc_pid}" if proc_pid else "",
+                    )
+                raise RuntimeError(
+                    f"Persistent worker for #{worker_name} terminated unexpectedly{err_detail}"
+                )
+
+            # 4. Handle substantive line
+            line_s = line_bytes.decode("utf-8", errors="replace").strip()
+            if not line_s:
+                continue
+
+            ev = self.handle_line(line_s, stream_parser=stream_parser, timer=timer)
+            if ev and (ev.get("event") == "result" or "result" in ev):
+                res_data = ev.get("result", {}) if isinstance(ev.get("result"), dict) else ev
+                output_response = stream_parser.get_final_response(
+                    fallback_result=res_data.get("response", "")
+                )
+                res_cid = res_data.get("conversation_id")
+                if res_cid:
+                    if self.escalated_to_thread and self.thread and hasattr(self.thread, "id"):
+                        set_channel_session_id(self.thread.id, self.mode, res_cid)
+                        clear_channel_session_id(TARGET_CHANNEL_ID, "home")
+                        if on_recycle:
+                            await on_recycle(new_conv_id=None)
+                        print(
+                            f"[BridgeEngine] 🧵 Bound session {res_cid} to migrated thread {self.thread.id} and recycled root worker."
+                        )
+                    else:
+                        self.conv_id = res_cid
+                        set_channel_session_id(self.channel_id, self.mode, res_cid)
+                break
+
+            # 5. Live status ticker update
+            await self.update_status_ticker(ticker_enabled=ticker_enabled)
+
+            # 6. Beacon update
+            self.maybe_touch_beacon()
+
+        return output_response
+
+    def harvest_fallback(
+        self,
+        output_response: str,
+        active_cid: Optional[str] = None,
+        proc: Any = None,
+        turn_timeout_seconds: float = 300.0,
+    ) -> tuple[str, bool]:
+        """Audit response for empty, leak, or silence sentinels, harvest from transcript,
+        and apply authoritative error beacons if necessary.
+
+        Returns: (final_text, was_harvested)
+        """
+        cid = active_cid or self.conv_id
+        if self.escalated_to_thread and self.thread and hasattr(self.thread, "id"):
+            cid = cid or getattr(self.thread, "id", None)
+
+        final_text = output_response or ""
+        is_empty_or_placeholder = (
+            not final_text or final_text.startswith("*(") or len(final_text.strip()) == 0
+        )
+        is_leak = is_internal_cli_leak(final_text)
+        is_silence = final_text.strip() in (
+            "[NO_REPLY]",
+            "NO_REPLY",
+            "[NO_OP]",
+            "NO_OP",
+            "reply:none",
+            "reply: none",
+        )
+
+        has_process_failure = (
+            self.timed_out
+            or self.wedged_diagnostic
+            or self.last_agy_error
+            or (proc and getattr(proc, "returncode", None) not in (0, None))
+        )
+
+        # In external mode, genuine non-error silence without output maps to [NO_REPLY]
+        if self.mode == "external" and (is_leak or is_silence) and not has_process_failure:
+            final_text = "[NO_REPLY]"
+            return final_text, False
+
+        was_harvested = False
+        if is_empty_or_placeholder or is_leak or (self.mode == "home" and is_silence):
+            harvested = harvest_transcript_response(str(cid) if cid else None)
+            if harvested and not is_internal_cli_leak(harvested):
+                print(
+                    f"[BridgeEngine] 🌾 Harvested response from on-disk transcript for session {cid} "
+                    f"({len(harvested)} chars)."
+                )
+                final_text = f"⚠️ *(Recovered from session transcript following process cutoff)*\n\n{harvested}"
+                is_empty_or_placeholder = False
+                is_leak = False
+                is_silence = False
+                was_harvested = True
+
+        should_emit_beacon = (
+            (self.mode == "home" and (is_empty_or_placeholder or is_leak or is_silence))
+            or (self.mode == "external" and has_process_failure and (is_empty_or_placeholder or is_leak or is_silence))
+        )
+
+        if should_emit_beacon:
+            proc_pid = getattr(proc, "pid", None) if proc else None
+            returncode = getattr(proc, "returncode", None) if proc else None
+            final_text = self.format_diagnostic_beacon(
+                proc_pid=proc_pid,
+                returncode=returncode,
+                turn_timeout_seconds=turn_timeout_seconds,
+            )
+
+        return final_text, was_harvested
+
+    def cleanup_process(self, proc: Any = None, br_module: Any = None):
+        """Clean up active process mapping, in-flight state, and restore beacon to IDLE if all workers are idle."""
+        if self.channel_id in channel_active_procs:
+            del channel_active_procs[self.channel_id]
+        if (
+            self.escalated_to_thread
+            and self.thread
+            and hasattr(self.thread, "id")
+            and self.thread.id in channel_active_procs
+        ):
+            del channel_active_procs[self.thread.id]
+
+        if self.mode == "home":
+            if br_module and hasattr(br_module, "active_proc"):
+                br_module.active_proc = None
+            try:
+                clear_in_flight(self.channel_id)
+            except Exception:
+                pass
+        else:
+            if br_module and hasattr(br_module, "ext_active_proc"):
+                br_module.ext_active_proc = None
+
+        if not any(p and getattr(p, "returncode", None) is None for p in channel_active_procs.values()):
+            update_beacon("IDLE", "")
 
     def format_diagnostic_beacon(
         self,
