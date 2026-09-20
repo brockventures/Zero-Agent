@@ -16,7 +16,10 @@ import time
 import urllib.parse
 import urllib.request
 import requests
-import fitz  # pymupdf
+try:
+    import fitz  # pymupdf
+except ImportError:
+    fitz = None
 
 WORKSPACE = "/workspace"
 SECRETS_FILE = "/secrets/env.json"
