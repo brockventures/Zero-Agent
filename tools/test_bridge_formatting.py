@@ -79,14 +79,14 @@ class TestBridgeFormatting(unittest.TestCase):
 
     def test_convert_capability_comparison_markdown_tables(self):
         table = (
-            "| Capability | Local Home Assistant (`:8766`) | Google Home MCP (`:8769`) |\n"
+            "| Capability | Local Home Assistant (`:8766`) | Google Home MCP (`:8770`) |\n"
             "| :--- | :--- | :--- |\n"
             "| **TV / Media Intents** | ⚡ Fast (VLC) | ❌ Restricted |\n"
             "| **Local Latency** | ⚡ Sub-50ms | ☁️ 300ms |\n"
         )
         converted = convert_markdown_tables(table)
-        self.assertIn("- **TV / Media Intents**:\n  - *Local Home Assistant (`:8766`)*: ⚡ Fast (VLC)\n  - *Google Home MCP (`:8769`)*: ❌ Restricted", converted)
-        self.assertIn("- **Local Latency**:\n  - *Local Home Assistant (`:8766`)*: ⚡ Sub-50ms\n  - *Google Home MCP (`:8769`)*: ☁️ 300ms", converted)
+        self.assertIn("- **TV / Media Intents**:\n  - *Local Home Assistant (`:8766`)*: ⚡ Fast (VLC)\n  - *Google Home MCP (`:8770`)*: ❌ Restricted", converted)
+        self.assertIn("- **Local Latency**:\n  - *Local Home Assistant (`:8766`)*: ⚡ Sub-50ms\n  - *Google Home MCP (`:8770`)*: ☁️ 300ms", converted)
 
     def test_format_for_discord_bullet_normalization(self):
         text = "• Point 1\n  • Subpoint\n> • Quoted"
