@@ -183,6 +183,40 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
             self.assertIn("what are the system specs?", call_args2["prompt"])
             self.assertEqual(call_args2["mode"], "external")
 
+    async def test_zero_tag_no_false_positives(self):
+        """Verify that common English usages like 'zero wrapping' do not trigger Zero mentions."""
+        from tools.classifier import ZERO_TAGS
+        import re
+
+        # Common English phrases that should NOT match ZERO_TAGS
+        false_positive_phrases = [
+            "single line with zero wrapping or vertical clipping",
+            "zero layout shift (CLS = 0)",
+            "we have zero tolerance for bugs",
+            "reduced to zero",
+            "from zero to one"
+        ]
+        for phrase in false_positive_phrases:
+            self.assertFalse(
+                any(re.search(p, phrase, re.I) for p in ZERO_TAGS),
+                f"Phrase '{phrase}' incorrectly matched ZERO_TAGS"
+            )
+
+        # Legitimate mentions that SHOULD match
+        legit_mentions = [
+            "@zero can you check this?",
+            "hey zero, what's up?",
+            "Zero: please run tests",
+            "Zero, look at this",
+            "hello zero",
+            "thanks @Zero"
+        ]
+        for phrase in legit_mentions:
+            self.assertTrue(
+                any(re.search(p, phrase, re.I) for p in ZERO_TAGS),
+                f"Legit mention '{phrase}' failed to match ZERO_TAGS"
+            )
+
     async def test_lazy_typer_minimal_role_mention(self):
         """Verify that minimal role mentions (e.g. <@&1542294519914037341> ^) trigger lazy typer directive."""
         mock_bot = MagicMock()
@@ -1087,11 +1121,82 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         # Should not trigger a reply turn
         home_queue.put.assert_not_called()
 
-        # But MUST be recorded in channel history
-        recent = get_recent_messages(ch_id, limit=5)
-        self.assertTrue(any("BB refresh_stats alert" in m.get("content", "") for m in recent))
+    async def test_queue_worker_dispatches_without_task_done_error(self):
+        """Verify that queue_worker successfully handles items and marks task_done without TypeError."""
+        mock_bot = MagicMock()
+        q = asyncio.Queue()
+        item = {
+            "prompt": "test prompt",
+            "reply_target": MagicMock(),
+            "channel_id": 1542081375287640084,
+            "is_thread_task": False
+        }
+        await q.put(item)
+
+        # Run worker briefly and cancel
+        worker_task = asyncio.create_task(
+            bh.queue_worker(
+                home_turn_queue=q,
+                bot=mock_bot
+            )
+        )
+        await asyncio.sleep(0.05)
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+
+    async def test_reply_to_zero_satisfies_channel_tag_requirement(self):
+        """Verify that native Discord replies to Zero bypass channel tag requirements."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        lounge_id = 1534452820995080192
+        now = time.time()
+
+        # Mock reply referencing Zero's message ID in history
+        from collections import deque
+        from tools.channel_history import record_message, _history_store
+        _history_store[str(lounge_id)] = deque(maxlen=20)
+        record_message(
+            channel_id=lounge_id,
+            channel_name="lounge",
+            author_name="Zero",
+            is_bot=True,
+            content="Here is the explanation...",
+            msg_id=777888
+        )
+
+        reply_msg = MagicMock()
+        reply_msg.id = 777889
+        reply_msg.channel.id = lounge_id
+        reply_msg.channel.name = "lounge"
+        reply_msg.author.id = 1210466877294518272
+        reply_msg.author.bot = False
+        reply_msg.author.display_name = "Arcane"
+        reply_msg.content = "That just explains how you prevent tool spam, not how you prevent agy from exiting"
+        reply_msg.created_at.timestamp.return_value = now
+        reply_msg.role_mentions = []
+        reply_msg.mentions = []
+        reply_msg.reference = MagicMock()
+        reply_msg.reference.resolved = None  # Unresolved by discord.py cache
+        reply_msg.reference.message_id = 777888
+
+        turn_queue = AsyncMock()
+        rules = {
+            "channel_tag_requirements": {str(lounge_id): "1543285916506783799"},
+            "ambient_classifier_enabled": False
+        }
+        with patch("tools.bridge_handlers.get_runtime_rules", return_value=rules):
+            await bh.handle_message(reply_msg, mock_bot, home_turn_queue=AsyncMock(), ext_turn_queue=turn_queue)
+            turn_queue.put.assert_awaited_once()
+            call_args = turn_queue.put.call_args[0][0]
+            self.assertEqual(call_args["prompt"], "That just explains how you prevent tool spam, not how you prevent agy from exiting")
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
 

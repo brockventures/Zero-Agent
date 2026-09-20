@@ -93,17 +93,51 @@ class TestHardcodedRuleFixes(unittest.TestCase):
             self.assertNotIn("Amos — Ledger DDL & SQLite genesis state", agenda)
 
     def test_weekly_digest_dynamic_reminders_and_cashflow(self):
-        """Verify weekly digest queries dynamic sources without hardcoded lists."""
+        """Verify weekly digest queries dynamic sources without hardcoded lists or bills, including birthdays."""
         from tools.weekly_digest import get_upcoming_reminders_and_renewals, get_recent_cashflow_rows
 
         now = datetime(2026, 9, 3, 10, 0, tzinfo=PT)
         renewals = get_upcoming_reminders_and_renewals(now, days=30)
         self.assertTrue(len(renewals) > 0)
         self.assertTrue(any("SmartThings" in r for r in renewals))
+        self.assertTrue(any("Kara Brock" in r or "Bob Brock" in r or "Dominijanni" in r for r in renewals))
+        self.assertFalse(any("AT&T Fiber" in r for r in renewals))
+        self.assertFalse(any("Kia EV9" in r for r in renewals))
 
         rows = get_recent_cashflow_rows()
         self.assertTrue(len(rows) >= 3)
         self.assertIn("Item           Amount   Trend ", rows[0])
+
+    @patch("tools.weekly_digest.calendar_list_events")
+    def test_weekly_digest_week_ahead_radar(self, mock_cal):
+        """Verify weekly digest queries and filters 7-day week ahead radar events, excluding Roy Cloud and Emily."""
+        import json
+        from tools.weekly_digest import get_week_ahead_events
+
+        mock_cal.return_value = json.dumps({
+            "ok": True,
+            "events": [
+                {"summary": "Labor Day - RCSD Holiday", "start": "2026-09-07", "end": "2026-09-08"},
+                {"summary": "Rosie dropoff", "start": "2026-09-07T08:05:00-07:00", "end": "2026-09-07T08:10:00-07:00"},
+                {"summary": "Rosie gymnastics", "start": "2026-09-07T17:00:00-07:00", "end": "2026-09-07T18:00:00-07:00"},
+                {"summary": "Isaac pickup", "start": "2026-09-07T17:25:00-07:00", "end": "2026-09-07T17:35:00-07:00"},
+                {"summary": "Costco Delivery (Order 1311502321)", "start": "2026-09-08T16:00:00-07:00", "end": "2026-09-08T18:00:00-07:00"},
+                {"summary": "Iready begins", "start": "2026-08-24", "end": "2026-09-12"},
+                {"summary": "Minimum Day Dismissal", "calendar": "Roy Cloud", "start": "2026-09-10", "end": "2026-09-11"},
+                {"summary": "pay bills", "calendar": "Emily", "start": "2026-09-07", "end": "2026-09-08"},
+            ]
+        })
+
+        now = datetime(2026, 9, 6, 20, 0, tzinfo=PT)
+        events = get_week_ahead_events(now)
+        self.assertTrue(any("Labor Day" in e for e in events))
+        self.assertTrue(any("Costco Delivery" in e for e in events))
+        self.assertTrue(any("Rosie gymnastics" in e for e in events))
+        self.assertFalse(any("Rosie dropoff" in e for e in events))
+        self.assertFalse(any("Isaac pickup" in e for e in events))
+        self.assertFalse(any("Iready begins" in e for e in events))
+        self.assertFalse(any("Minimum Day Dismissal" in e for e in events))
+        self.assertFalse(any("pay bills" in e for e in events))
 
     def test_sidecars_email_triage_dynamic(self):
         """Verify nightly triage parses dates and categorizes without hardcoded haircut rules."""

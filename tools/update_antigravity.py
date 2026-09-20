@@ -128,7 +128,7 @@ def perform_upgrade(target_version: str = None):
                     if len(parts) == 4 and parts[-1] == "82":
                         host_2 = ".".join(parts[:3] + ["84"])
 
-                return host_1 or "127.0.0.1", host_2 or "127.0.0.1", ssh_port
+                return host_1 or os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), host_2 or os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), ssh_port
 
             _, host_2, ssh_port = _resolve_nas_config()
             ssh_key = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")

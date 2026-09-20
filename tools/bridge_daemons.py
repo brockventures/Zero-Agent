@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 import discord
@@ -49,9 +50,12 @@ from tools.bridge_formatting import (
     scrub_credentials,
     clean_discord_latex,
     generate_concise_thread_title,
+    parse_agy_error,
+    format_agy_error_message,
+    is_internal_cli_leak,
 )
 
-PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "10m")
+PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "30m")
 
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
 LOUNGE_CHANNEL_ID = 1534452820995080192
@@ -110,17 +114,29 @@ class PersistentChannelWorker:
         self.lock = asyncio.Lock()
         self.start_lock = asyncio.Lock()
         self.stderr_task: asyncio.Task | None = None
+        self.recent_stderr: deque[str] = deque(maxlen=50)
+        self.last_agy_error: dict | None = None
         self.started_at: float = 0.0
         self.turn_count: int = 0
         self.last_turn_at: float = 0.0
 
     async def _drain_stderr(self):
-        """Continuously drain stderr so pipe buffer never deadlocks the Go process."""
+        """Continuously drain stderr so pipe buffer never deadlocks the Go process,
+        and capture structured AGY_ERROR payloads for instant triage.
+        """
         try:
             while self.proc and self.proc.stderr:
-                line = await self.proc.stderr.readline()
-                if not line:
+                line_bytes = await self.proc.stderr.readline()
+                if not line_bytes:
                     break
+                line_s = line_bytes.decode("utf-8", errors="replace").strip()
+                if line_s:
+                    self.recent_stderr.append(line_s)
+                    if "AGY_ERROR:" in line_s:
+                        err_payload = parse_agy_error(line_s)
+                        if err_payload:
+                            self.last_agy_error = err_payload
+                            print(f"[BridgeDaemon] 🚨 Captured AGY_ERROR in #{self.name}: {err_payload}")
         except (asyncio.CancelledError, Exception):
             pass
 
@@ -353,6 +369,7 @@ class PersistentChannelWorker:
                 except Exception:
                     pass
 
+            self.last_agy_error = None
             turn_start_time = time.time()
             last_status_edit = time.time()
             last_beacon_touch = time.time()
@@ -431,9 +448,11 @@ class PersistentChannelWorker:
                         except asyncio.TimeoutError:
                             now_wait = time.time()
                             silence_dur = now_wait - last_activity_time
+                            watchdog_timeout = float(rules.get("turn_watchdog_seconds", 300.0))
+                            max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 1200.0))
 
                             # Check for wedged interactive subprocess at >= 45s of silence
-                            if silence_dur >= 45.0 and (now_wait - last_probe_time) >= 10.0 and self.proc and self.proc.pid:
+                            if (now_wait - last_activity_time) >= 45.0 and (now_wait - last_probe_time) >= 10.0 and self.proc and self.proc.pid:
                                 last_probe_time = now_wait
                                 try:
                                     from tools.process_probe import diagnose_process_tree
@@ -481,10 +500,24 @@ class PersistentChannelWorker:
                         break
 
                     if not line_bytes:
-                        print(f"[BridgeDaemon] ⚠️ Persistent worker for #{self.name} exited unexpectedly.")
+                        # Allow stderr drain task a moment to capture any final AGY_ERROR payload
+                        await asyncio.sleep(0.05)
+                        err_detail = ""
+                        if self.last_agy_error:
+                            err_detail = f": {self.last_agy_error}"
+                        elif self.proc and self.proc.returncode is not None:
+                            err_detail = f" (exit code {self.proc.returncode})"
+                        print(f"[BridgeDaemon] ⚠️ Persistent worker for #{self.name} exited unexpectedly{err_detail}.")
                         await self.recycle()
+                        if self.last_agy_error:
+                            output_response = format_agy_error_message(
+                                self.last_agy_error,
+                                elapsed_sec=int(time.time() - turn_start_time),
+                                pid_str=f"PID {self.proc.pid}" if self.proc else "",
+                            )
+                            break
                         raise RuntimeError(
-                            f"Persistent worker for #{self.name} terminated unexpectedly"
+                            f"Persistent worker for #{self.name} terminated unexpectedly{err_detail}"
                         )
 
                     line_s = line_bytes.decode("utf-8", errors="replace").strip()
@@ -499,8 +532,9 @@ class PersistentChannelWorker:
                             if ev_name == "step_update":
                                 step = ev.get("step_update", {})
                                 stype = step.get("step_type")
+                                sstate = step.get("state")
                                 tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
-                                if stype == "tool" and tname:
+                                if stype == "tool" and tname and sstate != "DONE":
                                     timer.mark_event(tool_name=tname)
                                     tinfo = step.get("tool_info", {})
                                     params = tinfo.get("parameters", {})
@@ -619,16 +653,21 @@ class PersistentChannelWorker:
                 if (escalated_to_thread and "thread" in locals() and thread and hasattr(thread, "id"))
                 else None
             )
-            if (
-                (not output_response or output_response.startswith("*(") or len(output_response.strip()) == 0)
-                and output_response != "[NO_REPLY]"
-            ):
+            is_empty_or_placeholder = (
+                not output_response or output_response.startswith("*(") or len(output_response.strip()) == 0
+            )
+            is_leak = is_internal_cli_leak(output_response)
+            is_silence = output_response.strip() in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP", "reply:none", "reply: none")
+
+            if is_empty_or_placeholder or is_leak or (self.mode == "home" and is_silence):
                 harvested = harvest_transcript_response(active_cid)
-                if harvested:
+                if harvested and not is_internal_cli_leak(harvested):
                     print(
                         f"[BridgeDaemon] 🌾 Harvested response from on-disk transcript for session {active_cid} ({len(harvested)} chars)."
                     )
                     output_response = f"⚠️ *(Recovered from session transcript following process cutoff)*\n\n{harvested}"
+                elif self.mode == "home":
+                    output_response = "⚠️ **Turn Incomplete:** Agent process completed turn without generating text output."
 
             self.turn_count += 1
             self.last_turn_at = time.time()

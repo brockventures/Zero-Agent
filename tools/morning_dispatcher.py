@@ -3,10 +3,11 @@
 morning_dispatcher.py - Crab Cavern Centralized Morning Topic Rotation Dispatcher
 
 Runs daily at 09:30 AM PT via KarakosScheduler in schedule.json.
-Determines daily roster via Pacific (America/Los_Angeles) day-of-year % 3:
-  - Day % 3 == 0 -> Zero (Seeds engineering topic directly)
-  - Day % 3 == 1 -> Amos (Tags <@1468012353206354197> with handoff baton)
-  - Day % 3 == 2 -> Marvin (Tags <@1492043459618537492> with handoff baton)
+Determines daily roster via Pacific (America/Los_Angeles) day-of-year % 4:
+  - Day % 4 == 0 -> Zero (Seeds engineering topic directly)
+  - Day % 4 == 1 -> Amos (Tags <@1468012353206354197> with handoff baton)
+  - Day % 4 == 2 -> Marvin (Tags <@1492043459618537492> with handoff baton)
+  - Day % 4 == 3 -> Aerial (Tags <@1542035925603713086> with handoff baton)
 
 Workflow:
 1. Claims Banana mutex lock via tools/banana.py.
@@ -53,7 +54,13 @@ ROSTER = [
         "agent": "marvin",
         "name": "Marvin",
         "tag": "<@1492043459618537492>",
-        "role": "Ian's agent"
+        "role": "Dr. Coley's agent"
+    },
+    {
+        "agent": "aerial",
+        "name": "Aerial",
+        "tag": "<@1542035925603713086>",
+        "role": "Alex's agent"
     }
 ]
 
@@ -83,13 +90,19 @@ TEAM_ROLE_TAG = "<@&1543462881624858624>"
 
 THEME_DESCRIPTION = (
     "Feel free to bring whatever is top of mind across:\n"
-    "• **Lessons learned & scars:** Recent bugs, silent failures, or unexpected behaviors.\n"
-    "• **Recent improvements:** Features, tools, or optimizations you've recently shipped.\n"
-    "• **Active friction & blockers:** Problems you're working through where you'd like a second opinion.\n"
-    "• **Future plans & RFCs:** Upcoming architecture changes, experiments, or designs you're considering."
+    "- **Lessons learned & scars:** Recent bugs, silent failures, or unexpected behaviors.\n"
+    "- **Recent improvements:** Features, tools, or optimizations you've recently shipped.\n"
+    "- **Active friction & blockers:** Problems you're working through where you'd like a second opinion.\n"
+    "- **Future plans & RFCs:** Upcoming architecture changes, experiments, or designs you're considering.\n\n"
+    "📚 **Shared Playbook ([mcarmody/agent-playbook](<https://github.com/mcarmody/agent-playbook>)):**\n"
+    "If you've shipped or dialed in any cool skills, harness patterns, or system prompt code snippets recently, consider opening a PR to upstream them as runnable recipes so the fleet can test and adopt them!"
 )
 
 ZERO_TOPIC_SEEDS = [
+    {
+        "title": "Agent Playbook & Reusable Skills Harvest",
+        "description": "What recently shipped skills, harness ergonomics, or system prompt snippets from your local setup are ripe to extract into runnable recipes for [mcarmody/agent-playbook](<https://github.com/mcarmody/agent-playbook>)?"
+    },
     {
         "title": "Asynchronous Workers & Background Task Reliability",
         "description": "How are you structuring background sidecars and long-running async tasks to handle unexpected crashes, event loop garbage collection, and state recovery after restarts?"
@@ -172,9 +185,38 @@ def generate_morning_payload(target: dict, note: str | None = None) -> str:
             f"{body}"
         )
 
+    elif agent == "aerial":
+        envelope = {
+            "v": 0,
+            "kind": "handoff",
+            "reply": "required",
+            "subject": f"morning-topic-{date_str}",
+            "to": "Aerial",
+            "round": 1,
+            "max_rounds": 3,
+            "evidence": [
+                {
+                    "src": "bin/morning-dispatcher.py",
+                    "note": f"Pacific Day {day_num} roster rotation (3 rounds max)"
+                }
+            ]
+        }
+        env_str = json.dumps(envelope, indent=2)
+        body = (
+            f"{target['tag']} {TEAM_ROLE_TAG} **Morning Engineering Standup (Round 1 of 3) — Aerial, the floor is yours.**\n\n"
+            f"{THEME_DESCRIPTION}\n\n"
+            f"Floor is open for your topic (3 rounds of discussion)."
+        )
+        if note:
+            body = f"{body}\n\n*{note}*"
+        return (
+            f"🍌 ```handoff\n{env_str}\n```\n\n"
+            f"{body}"
+        )
+
     else:
         # Zero's turn
-        seed_idx = (day_num // 3) % len(ZERO_TOPIC_SEEDS)
+        seed_idx = (day_num // len(ROSTER)) % len(ZERO_TOPIC_SEEDS)
         seed = ZERO_TOPIC_SEEDS[seed_idx]
 
         envelope = {

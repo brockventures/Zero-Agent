@@ -28,29 +28,48 @@ BOOT_TIME = time.time()
 
 
 class ZeroHealthHandler(BaseHTTPRequestHandler):
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-
-    def do_GET(self):
+    def _evaluate_health(self) -> tuple[int, dict]:
+        now_ts = time.time()
         now_pt = datetime.now(PT_TZ)
-        uptime = int(time.time() - BOOT_TIME)
+        uptime = int(now_ts - BOOT_TIME)
 
-        # Read current bot status if available
+        # 1. Read dynamic Discord gateway liveness & heartbeat from liveness_beacon.json
+        beacon_file = DATA_DIR / "liveness_beacon.json"
+        gateway_healthy = False
+        gateway_heartbeat_age = None
+        gateway_status = "disconnected"
+        gateway_latency_ms = None
+        beacon_state = "IDLE"
+
+        if beacon_file.exists():
+            try:
+                with open(beacon_file) as f:
+                    bdata = json.load(f)
+                    gh = bdata.get("gateway_heartbeat")
+                    beacon_state = bdata.get("state", "IDLE")
+                    gateway_status = bdata.get("gateway_status", "disconnected")
+                    gateway_latency_ms = bdata.get("gateway_latency_ms")
+                    if isinstance(gh, (int, float)) and gh > 0:
+                        gateway_heartbeat_age = int(now_ts - gh)
+                        if gateway_heartbeat_age <= 180 and gateway_status == "connected":
+                            gateway_healthy = True
+            except Exception:
+                pass
+
+        # 2. Read bot presence status
         bot_status_file = DATA_DIR / "bot_status.json"
-        bot_state = "online"
+        bot_state = "online" if gateway_healthy else "degraded"
         bot_activity = "Zero is online and ready."
         if bot_status_file.exists():
             try:
                 with open(bot_status_file) as f:
                     d = json.load(f)
-                    bot_state = d.get("status", "online")
+                    bot_state = d.get("status", bot_state)
                     bot_activity = d.get("activity_text", bot_activity)
             except Exception:
                 pass
 
-        # Check MCP daemon liveness
+        # 3. Check MCP daemon liveness
         mcp_pid_file = DATA_DIR / "mcp_daemon.pid"
         mcp_status = "offline"
         if mcp_pid_file.exists():
@@ -61,7 +80,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             except Exception:
                 mcp_status = "stale_pid"
 
-        # Check Mail listener liveness
+        # 4. Check Mail listener liveness
         mail_pid_file = DATA_DIR / "zero_mail_listener.pid"
         mail_status = "offline"
         if mail_pid_file.exists():
@@ -72,14 +91,21 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             except Exception:
                 mail_status = "stale_pid"
 
+        is_overall_healthy = gateway_healthy
+
         payload = {
-            "status": "healthy",
+            "status": "healthy" if is_overall_healthy else "degraded",
             "service": "zero-health",
             "agent": "Zero",
             "host": os.environ.get("ZERO_HOST_NAME", "Host2"),
             "timestamp_pt": now_pt.strftime("%Y-%m-%d %H:%M:%S %Z"),
             "uptime_seconds": uptime,
             "components": {
+                "discord_gateway": "connected" if gateway_healthy else "stalled_or_disconnected",
+                "gateway_status": gateway_status,
+                "gateway_heartbeat_age_seconds": gateway_heartbeat_age,
+                "gateway_latency_ms": gateway_latency_ms,
+                "turn_state": beacon_state,
                 "discord_bot": bot_state,
                 "discord_activity": bot_activity,
                 "mcp_daemon": mcp_status,
@@ -87,9 +113,19 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 "bridge_scheduler": "active"
             }
         }
+        status_code = 200 if is_overall_healthy else 503
+        return status_code, payload
 
+    def do_HEAD(self):
+        code, _ = self._evaluate_health()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+
+    def do_GET(self):
+        status_code, payload = self._evaluate_health()
         body = json.dumps(payload, indent=2).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")

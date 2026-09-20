@@ -4,10 +4,12 @@ Reaction GIF Tool for Discord Banter (Dynamic-First with OCR Safety & Anti-Repet
 Prioritizes contextual live search, verifies HTTP 200, runs OCR over animation frames
 to reject toxic/out-of-pocket text, tracks recent history, and formats properly titled markdown links.
 """
-import sys, os, re, json, random, urllib.request, urllib.parse, io
+import sys, os, re, json, random, urllib.request, urllib.parse, io, sqlite3
 from pathlib import Path
 
 HISTORY_FILE = Path("/workspace/data/gif_history.json")
+FAILURE_LOG_FILE = Path("/workspace/data/gif_failures.jsonl")
+CANONICAL_GIFS_FILE = Path("/workspace/data/canonical_gifs.json")
 
 FILLER_WORDS = {
     "gif", "gifs", "quality", "intergalactic", "thumbnail", "reaction",
@@ -136,6 +138,48 @@ FRANCHISE_SIGNATURES = {
             "charlie kelly", "dennis reynolds", "mac mcdonald", "dee reynolds",
             "frank reynolds", "dayman", "nightman", "pepe silvia", "paddys pub"
         ]
+    },
+    "brooklyn_nine_nine": {
+        "display_name": "Brooklyn Nine-Nine",
+        "keywords": [
+            "brooklyn nine-nine", "brooklyn 99", "b99", "captain holt",
+            "raymond holt", "jake peralta", "amy santiago", "rosa diaz",
+            "terry jeffords", "charles boyle", "vindication", "nine nine"
+        ]
+    },
+    "reaction_classics": {
+        "display_name": "Reaction Classics",
+        "keywords": [
+            "antonio banderas", "assassins", "doc rivers", "disbelief",
+            "ted striker", "airplane movie", "airplane!"
+        ]
+    },
+    "nathan_for_you": {
+        "display_name": "Nathan for You",
+        "keywords": [
+            "nathan for you", "nathan fielder", "nfy", "the rehearsal"
+        ]
+    },
+    "jurassic_park": {
+        "display_name": "Jurassic Park",
+        "keywords": [
+            "jurassic park", "dennis nedry", "nedry", "ray arnold",
+            "magic word", "hold onto your butts"
+        ]
+    },
+    "office_space": {
+        "display_name": "Office Space",
+        "keywords": [
+            "office space", "bill lumbergh", "lumbergh", "that would be great",
+            "milton", "red stapler", "peter gibbons"
+        ]
+    },
+    "the_simpsons": {
+        "display_name": "The Simpsons",
+        "keywords": [
+            "the simpsons", "simpsons", "homer simpson", "bart simpson",
+            "lisa simpson", "marge simpson", "mr burns", "ned flanders"
+        ]
     }
 }
 
@@ -157,9 +201,9 @@ def get_runtime_gif_rules() -> dict:
     rules_path = Path("/workspace/config/runtime_rules.json")
     default_rules = {
         "enabled": True,
-        "default_cooldown_turns": 5,
+        "default_cooldown_turns": 2,
         "franchise_cooldowns": {
-            "arrested_development": 8
+            "arrested_development": 4
         },
         "quarantined_franchises": [],
         "rotation_pool": [
@@ -200,30 +244,60 @@ def clean_slug_title(slug: str) -> str:
     return title or "Reaction GIF"
 
 
-def extract_gif_ocr(media_url: str, max_samples: int = 5) -> str:
+def extract_gif_ocr(media_url: str, max_samples: int = 2) -> str:
     """Download preview GIF and run OCR across sampled animation frames to detect burned-in text."""
     if not media_url:
         return ""
     try:
         from PIL import Image
         import pytesseract
+        import concurrent.futures
 
         req = urllib.request.Request(
             media_url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         )
-        with urllib.request.urlopen(req, timeout=3.5) as resp:
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
             content = resp.read()
 
         im = Image.open(io.BytesIO(content))
         n_frames = getattr(im, "n_frames", 1)
 
+        if n_frames <= 1:
+            sample_frames = [0]
+        elif max_samples <= 1:
+            sample_frames = [n_frames // 2]
+        elif max_samples == 2:
+            sample_frames = [int(n_frames * 0.35), int(n_frames * 0.75)]
+        else:
+            step = max(1, n_frames // max_samples)
+            sample_frames = list(range(0, n_frames, step))[:max_samples]
+
+        frames_to_ocr = []
+        for f in sample_frames:
+            try:
+                im.seek(f)
+                frames_to_ocr.append(im.convert("L"))
+            except Exception:
+                pass
+
+        if not frames_to_ocr:
+            return ""
+
+        def _ocr_frame(f_img):
+            try:
+                return pytesseract.image_to_string(f_img, timeout=1.5).strip()
+            except Exception:
+                return ""
+
+        if len(frames_to_ocr) == 1:
+            texts = [_ocr_frame(frames_to_ocr[0])]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(2, len(frames_to_ocr))) as pool:
+                texts = list(pool.map(_ocr_frame, frames_to_ocr))
+
         extracted = []
-        step = max(1, n_frames // max_samples)
-        for f in range(0, n_frames, step):
-            im.seek(f)
-            frame = im.convert("L")
-            txt = pytesseract.image_to_string(frame, timeout=1.5).strip()
+        for txt in texts:
             clean_line = " ".join(txt.split())
             if clean_line and clean_line not in extracted and len(clean_line) > 1:
                 extracted.append(clean_line)
@@ -233,6 +307,7 @@ def extract_gif_ocr(media_url: str, max_samples: int = 5) -> str:
         return " | ".join(extracted)
     except Exception as e:
         return ""
+
 
 
 def is_ocr_safe(ocr_text: str) -> bool:
@@ -248,7 +323,8 @@ def is_ocr_safe(ocr_text: str) -> bool:
 
 
 def is_valid_gif_url(url: str, timeout: float = 2.5) -> bool:
-    """Fast HTTP HEAD probe to verify a Tenor GIF URL returns HTTP 200 OK before delivering."""
+    """Fast HTTP HEAD probe to verify a Tenor GIF URL returns HTTP 200 OK before delivering.
+    Rejects hallucinated Tenor URLs where arbitrary numerical IDs redirect to a completely different slug."""
     if not url or not url.startswith("http"):
         return False
     req = urllib.request.Request(
@@ -258,7 +334,20 @@ def is_valid_gif_url(url: str, timeout: float = 2.5) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status == 200
+            if resp.status != 200:
+                return False
+            raw_geturl = resp.geturl() if hasattr(resp, "geturl") else url
+            final_url = raw_geturl if isinstance(raw_geturl, str) else url
+            if "tenor.com/view/" in url and final_url != url:
+                orig_slug = url.split("/view/")[-1].lower()
+                final_slug = final_url.split("/view/")[-1].lower()
+                orig_words = {w for w in re.findall(r"[a-z0-9]+", orig_slug) if w not in FILLER_WORDS and not w.isdigit()}
+                final_words = {w for w in re.findall(r"[a-z0-9]+", final_slug) if w not in FILLER_WORDS and not w.isdigit()}
+                overlap = orig_words & final_words
+                if not overlap and (orig_words or final_words):
+                    print(f"[GIF] Hallucinated Tenor URL rejected: {url} redirected to {final_url} (0 word overlap)", file=sys.stderr)
+                    return False
+            return True
     except Exception:
         return False
 
@@ -287,12 +376,13 @@ def load_history() -> list[dict]:
     return []
 
 
-def get_history_urls(history: list[dict | str] | None = None) -> set[str]:
-    """Extract set of URLs from history records (supports dicts and raw strings)."""
+def get_history_urls(history: list[dict | str] | None = None, limit: int = 3) -> set[str]:
+    """Extract set of URLs from recent history records (supports dicts and raw strings)."""
     if history is None:
         history = load_history()
+    recent = history[-limit:] if limit else history
     urls = set()
-    for item in history:
+    for item in recent:
         if isinstance(item, str):
             urls.add(item)
         elif isinstance(item, dict) and "url" in item:
@@ -310,7 +400,7 @@ def record_history(
     try:
         import time
         records = load_history()
-        detected_f = franchise or detect_franchise(f"{query} {title} {url}")
+        detected_f = franchise or detect_franchise(f"{title} {url}")
         records.append({
             "url": url,
             "query": query,
@@ -323,6 +413,63 @@ def record_history(
             json.dump(records, f, indent=2)
     except Exception:
         pass
+
+
+def log_gif_failure(
+    query: str,
+    reason: str,
+    details: str = "",
+    franchise: str | None = None,
+    candidate_url: str | None = None,
+):
+    """Record a structured failure entry in gif_failures.jsonl for forensic observability."""
+    try:
+        import datetime
+        now_pt = datetime.datetime.now(
+            datetime.timezone(datetime.timedelta(hours=-7))
+        ).strftime("%Y-%m-%d %H:%M:%S PT")
+        entry = {
+            "timestamp": now_pt,
+            "query": query,
+            "reason": reason,
+            "details": details,
+            "franchise": franchise,
+            "candidate_url": candidate_url,
+        }
+        FAILURE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lines = []
+        if FAILURE_LOG_FILE.exists():
+            try:
+                with open(FAILURE_LOG_FILE, "r") as f:
+                    lines = f.readlines()
+            except Exception:
+                pass
+        lines.append(json.dumps(entry) + "\n")
+        if len(lines) > 200:
+            lines = lines[-200:]
+        with open(FAILURE_LOG_FILE, "w") as f:
+            f.writelines(lines)
+    except Exception as e:
+        print(f"[GIF] Error writing failure log: {e}", file=sys.stderr)
+
+
+def get_recent_failures(limit: int = 15) -> list[dict]:
+    """Retrieve recent failure entries from gif_failures.jsonl for auditing."""
+    if not FAILURE_LOG_FILE.exists():
+        return []
+    try:
+        with open(FAILURE_LOG_FILE, "r") as f:
+            lines = [line.strip() for line in f if line.strip()]
+        entries = []
+        for line in reversed(lines[-limit:]):
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                pass
+        return entries
+    except Exception:
+        return []
+
 
 
 def check_cooldown(
@@ -339,7 +486,7 @@ def check_cooldown(
         return False, 0, 0
 
     rules = get_runtime_gif_rules()
-    if not rules.get("enabled", True):
+    if not rules.get("enabled", False):
         return False, 0, 0
 
     quarantined = rules.get("quarantined_franchises", [])
@@ -400,61 +547,147 @@ def get_cooldown_summary(history: list[dict | str] | None = None) -> dict:
     }
 
 
-def search_tenor(query: str, limit: int = 6) -> list[dict]:
-    clean_q = re.sub(r"[^a-zA-Z0-9\s]", "", query).strip()
-    slug = urllib.parse.quote(clean_q.replace(" ", "-"))
-    url = f"https://tenor.com/search/{slug}-gifs"
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    )
-    results = []
-    try:
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-            figures = re.findall(
-                r'<figure[^>]*>.*?<a[^>]+href=\"(/view/[^\"]+)\"[^>]*>.*?<img[^>]+src=\"(https://media[^\"]+\.gif)\"',
-                html,
-                re.DOTALL
-            )
-            seen = set()
-            for m, media_url in figures:
-                if m in seen:
-                    continue
-                seen.add(m)
-                full_url = "https://tenor.com" + m
-                raw_slug = m.split("/view/")[-1]
-                title = clean_slug_title(raw_slug)
-                results.append({
-                    "title": title,
-                    "url": full_url,
-                    "media_url": media_url
-                })
-                if len(results) >= limit:
-                    break
+STOP_WORDS = {
+    "the", "a", "an", "and", "or", "of", "in", "to", "for", "with",
+    "is", "it", "on", "at", "by", "this", "that", "gif", "gifs",
+    "about", "we", "you", "they", "i", "my", "your", "our", "are",
+    "was", "were", "be", "been", "being", "have", "has", "had",
+    "can", "could", "will", "would", "should", "just", "like",
+    "into", "out", "all", "any", "some", "what", "who", "when",
+    "where", "why", "how", "get", "got", "from"
+}
 
-            if len(results) < limit:
-                matches = re.findall(r'href=\"(/view/[^\"]+)\"', html)
-                for m in matches:
+
+def score_candidate(query: str, candidate: dict) -> float:
+    """
+    Score relevance of a candidate GIF against the search query.
+    Enforces franchise integrity, token overlap, and key concept matching.
+    Returns:
+        float score (higher is better; negative values indicate disqualified candidates).
+    """
+    if not query or not candidate:
+        return 0.0
+
+    q_norm = query.lower().strip()
+    c_url = candidate.get("url", "")
+    slug = candidate.get("slug") or c_url.split("/")[-1]
+    slug_norm = slug.lower().replace("-", " ").replace("_", " ")
+    title_norm = candidate.get("title", "").lower()
+    c_text = f"{title_norm} {slug_norm}"
+
+    q_franchise = detect_franchise(query)
+    c_franchise = detect_franchise(c_text)
+
+    score = 0.0
+
+    # 1. Franchise Integrity
+    if q_franchise:
+        if c_franchise == q_franchise:
+            score += 40.0
+        else:
+            meta = FRANCHISE_SIGNATURES.get(q_franchise, {})
+            kws = meta.get("keywords", [])
+            if any(kw in c_text for kw in kws):
+                score += 30.0
+            else:
+                # Disqualify: Candidate lacks requested franchise
+                return -100.0
+
+    # 2. Token Overlap
+    q_words = [w for w in re.findall(r"[a-z0-9]+", q_norm) if w not in STOP_WORDS]
+    if q_words:
+        matched_words = 0
+        for w in q_words:
+            if re.search(rf"\b{re.escape(w)}\b", c_text):
+                matched_words += 1
+            elif w in c_text:
+                matched_words += 0.5
+        overlap_ratio = matched_words / len(q_words)
+        score += overlap_ratio * 30.0
+
+    # 3. Exact phrase match
+    clean_q_phrase = " ".join(q_words)
+    if clean_q_phrase and clean_q_phrase in c_text:
+        score += 20.0
+
+    if len(title_norm.split()) >= 2:
+        score += 5.0
+
+    return score
+
+
+def search_tenor(query: str, limit: int = 12) -> list[dict]:
+    clean_q = re.sub(r"[^a-zA-Z0-9\s]", "", query).strip()
+    if not clean_q:
+        return []
+
+    def _fetch_slug(slug_str: str) -> list[dict]:
+        url = f"https://tenor.com/search/{slug_str}-gifs"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        res = []
+        try:
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+                figures = re.findall(
+                    r'<figure[^>]*>.*?<a[^>]+href=\"(/view/[^\"]+)\"[^>]*>.*?<img[^>]+src=\"(https://media[^\"]+\.gif)\"',
+                    html,
+                    re.DOTALL
+                )
+                seen = set()
+                for m, media_url in figures:
                     if m in seen:
                         continue
                     seen.add(m)
                     full_url = "https://tenor.com" + m
                     raw_slug = m.split("/view/")[-1]
                     title = clean_slug_title(raw_slug)
-                    results.append({
+                    res.append({
                         "title": title,
                         "url": full_url,
-                        "media_url": None
+                        "media_url": media_url,
+                        "slug": raw_slug
                     })
-                    if len(results) >= limit:
+                    if len(res) >= limit:
                         break
-    except Exception as e:
-        print(f"[GIF] Search error: {e}", file=sys.stderr)
+
+                if len(res) < limit:
+                    matches = re.findall(r'href=\"(/view/[^\"]+)\"', html)
+                    for m in matches:
+                        if m in seen:
+                            continue
+                        seen.add(m)
+                        full_url = "https://tenor.com" + m
+                        raw_slug = m.split("/view/")[-1]
+                        title = clean_slug_title(raw_slug)
+                        res.append({
+                            "title": title,
+                            "url": full_url,
+                            "media_url": None,
+                            "slug": raw_slug
+                        })
+                        if len(res) >= limit:
+                            break
+        except Exception:
+            pass
+        return res
+
+    words = clean_q.split()
+    primary_slug = urllib.parse.quote("-".join(words))
+    results = _fetch_slug(primary_slug)
+
+    # Fallback to 2-word slug if 3+ word slug returned nothing / 404ed
+    if not results and len(words) > 2:
+        secondary_slug = urllib.parse.quote("-".join(words[:2]))
+        results = _fetch_slug(secondary_slug)
+
     return results
 
 
-def search_giphy(query: str, limit: int = 6) -> list[dict]:
+
+def search_giphy(query: str, limit: int = 12) -> list[dict]:
     clean_q = re.sub(r"[^a-zA-Z0-9\s]", "", query).strip()
     slug = urllib.parse.quote(clean_q.replace(" ", "-"))
     url = f"https://giphy.com/search/{slug}"
@@ -480,7 +713,8 @@ def search_giphy(query: str, limit: int = 6) -> list[dict]:
                 results.append({
                     "title": title,
                     "url": full_url,
-                    "media_url": media_url
+                    "media_url": media_url,
+                    "slug": raw_slug
                 })
                 if len(results) >= limit:
                     break
@@ -489,13 +723,376 @@ def search_giphy(query: str, limit: int = 6) -> list[dict]:
     return results
 
 
-def get_contextual_gif(query: str, run_ocr: bool = True, force: bool = False) -> dict:
+def load_canonical_registry() -> list[dict]:
+    """Load canonical GIF registry from disk."""
+    if CANONICAL_GIFS_FILE.exists():
+        try:
+            with open(CANONICAL_GIFS_FILE) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception as e:
+            print(f"[GIF] Warning loading canonical registry: {e}", file=sys.stderr)
+    return []
+
+
+_CANONICAL_DB_CACHE = None
+
+def _get_canonical_fts_db(registry: list[dict]) -> sqlite3.Connection:
+    global _CANONICAL_DB_CACHE
+    if _CANONICAL_DB_CACHE is not None:
+        return _CANONICAL_DB_CACHE
+
+    con = sqlite3.connect(":memory:")
+    con.execute("""
+    CREATE VIRTUAL TABLE gifs_fts USING fts5(
+        id UNINDEXED,
+        franchise,
+        character,
+        vibes,
+        situation,
+        tags,
+        title,
+        tokenize='porter ascii'
+    );
+    """)
+    for g in registry:
+        con.execute("""
+        INSERT INTO gifs_fts(id, franchise, character, vibes, situation, tags, title)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            g.get("id", ""),
+            g.get("franchise", ""),
+            g.get("character", ""),
+            " ".join(g.get("vibes", [])).replace("_", " "),
+            g.get("situation", ""),
+            " ".join(g.get("tags", [])).replace("_", " "),
+            g.get("title", "")
+        ))
+    _CANONICAL_DB_CACHE = con
+    return con
+
+
+def score_canonical_candidate(query: str, entry: dict, fts_score: float | None = None) -> float:
     """
-    Dynamic GIF Picker with OCR Safety & Franchise Cooldown Verification:
-    1. Primary: Searches Tenor, filters against history & cooled-down franchises, verifies HTTP 200, checks OCR.
-    2. Fallback: Searches Giphy, filters against history & cooled-down franchises, verifies HTTP 200, checks OCR.
-    3. Formats properly titled markdown hyperlinks: [Title](URL).
-    4. Skip: If both providers return no valid links, returns None.
+    Score relevance of a canonical GIF entry against situational search queries.
+    Evaluates situation descriptions, vibes, tags, character name, title, and franchise affinity.
+    Higher score is better; 0.0 indicates no substantive relevance.
+    """
+    if not query or not entry:
+        return 0.0
+
+    q_norm = query.lower().strip()
+    entry_id = str(entry.get("id", "")).lower()
+
+    # Direct ID Match bonus (instant winner)
+    if entry_id and (entry_id == q_norm or entry_id == q_norm.replace("-", "_") or entry_id.replace("_", " ") == q_norm):
+        return 1000.0
+
+    q_words = [w for w in re.findall(r"[a-z0-9]+", q_norm) if len(w) > 1 and w not in STOP_WORDS]
+    if not q_words:
+        return 0.0
+
+    entry_title = str(entry.get("title", "")).lower()
+    entry_char = str(entry.get("character", "")).lower()
+    entry_franchise = str(entry.get("franchise", "")).lower()
+    entry_vibes = [str(v).lower() for v in entry.get("vibes", [])]
+    entry_tags = [str(t).lower() for t in entry.get("tags", [])]
+    entry_situation = str(entry.get("situation", "")).lower()
+
+    score = 0.0
+    if fts_score is not None:
+        # BM25 returns negative values (e.g. -25.0 is better than -5.0).
+        # Convert to positive base boost
+        score += max(0.0, -fts_score * 10.0)
+
+    # 1. Exact Vibe & Tag Matches
+    matched_words = 0
+    matched_vibe = False
+    clean_q_underscore = "_".join(q_words)
+    for v in entry_vibes:
+        if clean_q_underscore == v or any(w == v for w in q_words):
+            score += 35.0
+            matched_vibe = True
+            matched_words += 1
+        elif any(w in v.replace("_", " ").split() for w in q_words):
+            score += 15.0
+
+    for t in entry_tags:
+        if clean_q_underscore == t or any(w == t for w in q_words):
+            score += 20.0
+            matched_words += 1
+        elif any(w in t.replace("_", " ").split() for w in q_words):
+            score += 15.0
+
+    # 2. Token matches in situation, character, title
+    for w in q_words:
+        w_hit = False
+        if re.search(rf"\b{re.escape(w)}\b", entry_situation):
+            score += 25.0
+            w_hit = True
+        if re.search(rf"\b{re.escape(w)}\b", entry_title):
+            score += 15.0
+            w_hit = True
+        if re.search(rf"\b{re.escape(w)}\b", entry_char):
+            score += 20.0
+            w_hit = True
+        if w_hit:
+            matched_words += 1
+
+    # 3. Multi-word phrase matches in situation
+    for i in range(len(q_words) - 1):
+        pair = f"{q_words[i]} {q_words[i+1]}"
+        if pair in entry_situation:
+            score += 40.0
+            matched_words += 2
+
+    # 4. Franchise Affinity
+    q_franchise = detect_franchise(query)
+    if q_franchise and entry_franchise == q_franchise:
+        score += 35.0
+
+    # Multi-word specificity guard: if query has 2+ substantive words,
+    # require at least 2 token matches, an exact vibe match, explicit franchise affinity,
+    # or a strong multi-term FTS5 match (bm25 <= -4.0)
+    has_strong_fts = (fts_score is not None and fts_score <= -4.0)
+    if len(q_words) >= 2 and matched_words < 2 and not matched_vibe and not (q_franchise and entry_franchise == q_franchise) and not has_strong_fts:
+        return 0.0
+
+    return score
+
+
+def llm_select_canonical_gif(
+    query: str,
+    registry: list[dict],
+    history_urls: set[str],
+    history: list[dict | str] | None = None,
+    force: bool = False,
+    timeout: int = 15
+) -> dict | None:
+    """
+    Use Gemini Flash via Antigravity CLI to select the single best canonical reaction GIF
+    based on conversational situation, subtext, and irony.
+    """
+    if not query or not registry:
+        return None
+
+    exclude_ids = set()
+    for entry in registry:
+        if entry.get("url") in history_urls and not force:
+            exclude_ids.add(entry.get("id"))
+        f_slug = entry.get("franchise")
+        if f_slug and not force:
+            is_cd, dist, thresh = check_cooldown(f_slug, history=history)
+            if is_cd:
+                exclude_ids.add(entry.get("id"))
+
+    lines = []
+    for g in registry:
+        vibes_str = ", ".join(g.get("vibes", []))
+        lines.append(f"- {g['id']}: {g.get('situation', '')} [vibes: {vibes_str}]")
+
+    catalog_str = "\n".join(lines)
+    exclude_block = ""
+    if exclude_ids:
+        exclude_block = f"\nRECENTLY USED GIFS (DO NOT SELECT):\n" + "\n".join(f"- {x}" for x in sorted(exclude_ids)) + "\n"
+
+    prompt = f"""You are the reaction GIF selector for Zero, an autonomous systems engineering agent.
+Analyze the user's conversational situation or upcoming message context, and select the single most fitting, comedic, or ironic reaction GIF from the canonical catalog below.
+
+SITUATION:
+"{query}"
+{exclude_block}
+CANONICAL GIF CATALOG:
+{catalog_str}
+
+CRITICAL INSTRUCTIONS:
+1. Select the SINGLE BEST GIF ID from the catalog that fits the tone, humor, or situation.
+2. DO NOT pick any GIF from the RECENTLY USED list.
+3. Return ONLY the chosen GIF ID on a line by itself. Do not include markdown, explanations, or quotes.
+"""
+    import subprocess
+    try:
+        res = subprocess.run(
+            [
+                "agy",
+                "--model=gemini-3.8-flash-low",
+                "--disable-slash-commands",
+                f"-p={prompt}"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        raw_out = res.stdout.strip()
+        if not raw_out:
+            return None
+
+        chosen_entry = None
+        for g in registry:
+            gid = g.get("id", "")
+            if gid and re.search(rf"\b{re.escape(gid)}\b", raw_out):
+                chosen_entry = g
+                break
+
+        if not chosen_entry:
+            return None
+
+        if chosen_entry.get("url") in history_urls and not force:
+            return None
+
+        f_slug = chosen_entry.get("franchise")
+        if f_slug and not force:
+            is_cd, dist, thresh = check_cooldown(f_slug, history=history)
+            if is_cd:
+                return None
+
+        if not is_valid_gif_url(chosen_entry["url"]):
+            return None
+
+        title = chosen_entry.get("title") or clean_slug_title(chosen_entry["url"].split("/view/")[-1])
+        record_history(chosen_entry["url"], query=query, title=title, franchise=f_slug)
+
+        return {
+            "title": title,
+            "url": chosen_entry["url"],
+            "markdown": f"[GIF]({chosen_entry['url']})",
+            "ocr_text": "",
+            "source": "canonical_registry",
+            "franchise": f_slug,
+            "canonical_id": chosen_entry.get("id"),
+            "situation": chosen_entry.get("situation"),
+            "vibes": chosen_entry.get("vibes")
+        }
+    except Exception as e:
+        print(f"[GIF] LLM selection error or timeout: {e}", file=sys.stderr)
+        return None
+
+
+def find_canonical_gif(query: str, history: list[dict | str] | None = None, force: bool = False, use_llm: bool = True) -> dict | None:
+    """
+    Tier-0: Match situational query against curated canonical Hall of Fame GIFs.
+    First evaluates via Gemini Flash LLM semantic selection; falls back to
+    in-memory SQLite FTS5 BM25 Porter stemmer.
+    Enforces anti-repetition and HTTP validity.
+    Completely bypasses dynamic OCR safety verification; all canonical GIFs
+    are pre-vetted, manually reviewed, and guaranteed clean.
+    """
+    registry = load_canonical_registry()
+    if not registry:
+        return None
+
+    history_urls = get_history_urls(history)
+
+    # 1. Check exact ID match first
+    q_norm = query.lower().strip().replace("-", "_")
+    for entry in registry:
+        if entry.get("id", "").lower() == q_norm:
+            f_slug = entry.get("franchise")
+            if f_slug and not force:
+                is_cd, dist, thresh = check_cooldown(f_slug, history=history)
+                if is_cd:
+                    continue
+            if entry.get("url") in history_urls and not force:
+                continue
+            if is_valid_gif_url(entry["url"]):
+                title = entry.get("title") or clean_slug_title(entry["url"].split("/view/")[-1])
+                record_history(entry["url"], query=query, title=title, franchise=f_slug)
+                return {
+                    "title": title,
+                    "url": entry["url"],
+                    "markdown": f"[GIF]({entry['url']})",
+                    "ocr_text": "",
+                    "source": "canonical_registry",
+                    "franchise": f_slug,
+                    "canonical_id": entry.get("id"),
+                    "situation": entry.get("situation"),
+                    "vibes": entry.get("vibes")
+                }
+
+    # 2. LLM Semantic Selection (Primary)
+    if use_llm:
+        llm_pick = llm_select_canonical_gif(query, registry, history_urls, history=history, force=force)
+        if llm_pick:
+            return llm_pick
+
+    # 2. FTS5 BM25 search
+    fts_ranks = {}
+    words = [w for w in re.findall(r"[a-z0-9]+", query.lower()) if len(w) > 1 and w not in STOP_WORDS]
+    if words:
+        try:
+            con = _get_canonical_fts_db(registry)
+            fts_q = " OR ".join(words)
+            cur = con.execute("""
+                SELECT id, bm25(gifs_fts, 1.0, 1.5, 8.0, 12.0, 3.0, 2.0) as rank
+                FROM gifs_fts
+                WHERE gifs_fts MATCH ?
+            """, (fts_q,))
+            fts_ranks = {row[0]: row[1] for row in cur.fetchall()}
+        except Exception as e:
+            # Fall back to pure token matching
+            pass
+
+    # 3. Score all candidates
+    candidates = []
+    for entry in registry:
+        url = entry.get("url")
+        if not url:
+            continue
+
+        s = score_canonical_candidate(query, entry, fts_score=fts_ranks.get(entry.get("id")))
+        if s >= 35.0:
+            candidates.append((s, entry))
+
+    if not candidates:
+        return None
+
+    # Sort highest score first
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # 4. Filter by cooldown and history
+    for score, pick in candidates:
+        url = pick.get("url")
+        f_slug = pick.get("franchise")
+
+        if url in history_urls and not force:
+            continue
+
+        if f_slug and not force:
+            is_cd, dist, thresh = check_cooldown(f_slug, history=history)
+            if is_cd:
+                continue
+
+        if not is_valid_gif_url(url):
+            continue
+
+        title = pick.get("title") or clean_slug_title(url.split("/view/")[-1])
+        record_history(url, query=query, title=title, franchise=f_slug)
+
+        return {
+            "title": title,
+            "url": url,
+            "markdown": f"[GIF]({url})",
+            "ocr_text": "",
+            "source": "canonical_registry",
+            "franchise": f_slug,
+            "canonical_id": pick.get("id"),
+            "score": round(score, 1),
+            "situation": pick.get("situation"),
+            "vibes": pick.get("vibes")
+        }
+
+    return None
+
+
+def get_contextual_gif(query: str, run_ocr: bool = True, force: bool = False, allow_dynamic: bool = False, use_llm: bool = True) -> dict:
+    """
+    Reaction GIF Picker with Tier-0 Canonical Fast-Path & Dynamic Fallback:
+    0. Tier 0 (Canonical Registry): Matches against curated Hall of Fame GIFs.
+       Pre-vetted safe; completely bypasses OCR frame downloads and text extraction.
+    1. Tier 1 (Tenor Dynamic): Searches Tenor, checks history, validates HTTP 200, runs OCR safety check.
+    2. Tier 2 (Giphy Dynamic): Searches Giphy, checks history, validates HTTP 200, runs OCR safety check.
+    3. Tier 3 (Graceful Skip): Returns clean skip if no suitable candidates match.
     """
     # 0. If query explicitly targets a franchise on cooldown, reject early unless force=True
     q_franchise = detect_franchise(query)
@@ -509,6 +1106,12 @@ def get_contextual_gif(query: str, run_ocr: bool = True, force: bool = False) ->
             msg = (
                 f"Franchise '{disp}' is on cooldown ({dist}/{thresh} turns). "
                 f"Eligible rotation: {eligible_str}."
+            )
+            log_gif_failure(
+                query=query,
+                reason="cooldown_blocked",
+                details=msg,
+                franchise=q_franchise,
             )
             print(f"[GIF] Cooldown blocked query '{query}': {msg}", file=sys.stderr)
             return {
@@ -524,105 +1127,145 @@ def get_contextual_gif(query: str, run_ocr: bool = True, force: bool = False) ->
     raw_history = load_history()
     history_urls = get_history_urls(raw_history)
 
-    # Tier 1: Dynamic Tenor search
-    tenor_candidates = search_tenor(query, limit=8)
-    tenor_fresh = [c for c in tenor_candidates if c["url"] not in history_urls]
-    tenor_pool = tenor_fresh if tenor_fresh else tenor_candidates
+    import concurrent.futures
 
-    valid_tenor = []
-    for c in tenor_pool:
-        c_slug = c["url"].split("/")[-1]
-        c_franchise = detect_franchise(f"{query} {c.get('title', '')} {c_slug}")
-        if c_franchise and not force:
-            is_cd, dist, thresh = check_cooldown(c_franchise, history=raw_history)
-            if is_cd:
-                print(f"[GIF] Candidate skipped: franchise '{c_franchise}' on cooldown ({dist}/{thresh}).", file=sys.stderr)
+    def _validate_and_pick(candidate_pool: list[dict], source_name: str) -> dict | None:
+        scored_candidates = []
+        for c in candidate_pool:
+            s = score_candidate(query, c)
+            if s >= 0:
+                scored_candidates.append((s, c))
+
+        if not scored_candidates:
+            return None
+
+        # Sort by relevance score descending. Preserve search ranking for ties.
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        for score, c in scored_candidates:
+            c_slug = c.get("slug") or c["url"].split("/")[-1]
+            c_title = c.get("title", "")
+            c_franchise = detect_franchise(f"{c_title} {c_slug}")
+            if c_franchise and not force:
+                is_cd, dist, thresh = check_cooldown(c_franchise, history=raw_history)
+                if is_cd:
+                    log_gif_failure(
+                        query=query,
+                        reason="candidate_cooldown",
+                        details=f"Franchise '{c_franchise}' on cooldown ({dist}/{thresh})",
+                        franchise=c_franchise,
+                        candidate_url=c["url"],
+                    )
+                    print(f"[GIF] Candidate skipped: franchise '{c_franchise}' on cooldown ({dist}/{thresh}).", file=sys.stderr)
+                    continue
+
+            # Parallel validation: HTTP HEAD probe and OCR extraction run concurrently
+            url_valid = False
+            ocr_text = ""
+            media_url = c.get("media_url")
+
+            if run_ocr and media_url:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                    f_url = ex.submit(is_valid_gif_url, c["url"])
+                    f_ocr = ex.submit(extract_gif_ocr, media_url)
+                    url_valid = f_url.result()
+                    ocr_text = f_ocr.result()
+            else:
+                url_valid = is_valid_gif_url(c["url"])
+
+            if not url_valid:
+                log_gif_failure(
+                    query=query,
+                    reason="url_probe_failed",
+                    details="HTTP HEAD status returned non-200 or timed out",
+                    candidate_url=c["url"],
+                )
                 continue
 
-        if is_valid_gif_url(c["url"]):
-            ocr_text = ""
-            if run_ocr and c.get("media_url"):
-                ocr_text = extract_gif_ocr(c["media_url"])
+            if run_ocr and ocr_text:
                 if not is_ocr_safe(ocr_text):
+                    log_gif_failure(
+                        query=query,
+                        reason="ocr_safety_rejected",
+                        details=f"Blocked term detected in OCR text: '{ocr_text}'",
+                        candidate_url=c["url"],
+                    )
                     continue
                 if not c_franchise:
                     c_franchise = detect_franchise(ocr_text)
                     if c_franchise and not force:
                         is_cd, dist, thresh = check_cooldown(c_franchise, history=raw_history)
                         if is_cd:
+                            log_gif_failure(
+                                query=query,
+                                reason="ocr_cooldown_detected",
+                                details=f"Franchise '{c_franchise}' detected in OCR on cooldown ({dist}/{thresh})",
+                                franchise=c_franchise,
+                                candidate_url=c["url"],
+                            )
                             print(f"[GIF] Candidate skipped by OCR: franchise '{c_franchise}' on cooldown ({dist}/{thresh}).", file=sys.stderr)
                             continue
 
-            c["ocr_text"] = ocr_text
-            c["franchise"] = c_franchise
-            valid_tenor.append(c)
-        if len(valid_tenor) >= 3:
-            break
+            # Best matching, fully valid, safe candidate is selected
+            title = c["title"]
+            pick_f = c_franchise or detect_franchise(f"{title} {c_slug} {ocr_text}")
+            record_history(c["url"], query=query, title=title, franchise=pick_f)
+            return {
+                "title": title,
+                "url": c["url"],
+                "markdown": f"[GIF]({c['url']})",
+                "ocr_text": ocr_text,
+                "source": source_name,
+                "franchise": pick_f
+            }
+        return None
 
-    if valid_tenor:
-        pick = random.choice(valid_tenor)
-        title = pick["title"]
-        pick_f = pick.get("franchise") or detect_franchise(f"{query} {title} {pick['url']}")
-        record_history(pick["url"], query=query, title=title, franchise=pick_f)
+    # Tier 0: Canonical Registry Lookup
+    canonical_pick = find_canonical_gif(query, history=raw_history, force=force, use_llm=use_llm)
+    if canonical_pick:
+        return canonical_pick
+
+    rules = get_runtime_gif_rules()
+    canonical_only = rules.get("canonical_only", False) and not allow_dynamic
+
+    if canonical_only:
+        log_gif_failure(
+            query=query,
+            reason="no_canonical_match",
+            details="Query did not match any eligible canonical Hall of Fame GIFs and canonical_only is enforced",
+            franchise=q_franchise,
+        )
         return {
-            "title": title,
-            "url": pick["url"],
-            "markdown": f"[{title}]({pick['url']})",
-            "ocr_text": pick.get("ocr_text", ""),
-            "source": "dynamic_tenor",
-            "franchise": pick_f
+            "title": None,
+            "url": None,
+            "markdown": None,
+            "ocr_text": "",
+            "source": "skip",
+            "franchise": None
         }
+
+    # Tier 1: Dynamic Tenor search
+    tenor_candidates = search_tenor(query, limit=12)
+    tenor_fresh = [c for c in tenor_candidates if c["url"] not in history_urls]
+    tenor_pool = tenor_fresh if tenor_fresh else tenor_candidates
+    tenor_pick = _validate_and_pick(tenor_pool, "dynamic_tenor")
+    if tenor_pick:
+        return tenor_pick
 
     # Tier 2: Dynamic Giphy fallback
-    giphy_candidates = search_giphy(query, limit=8)
+    giphy_candidates = search_giphy(query, limit=12)
     giphy_fresh = [c for c in giphy_candidates if c["url"] not in history_urls]
     giphy_pool = giphy_fresh if giphy_fresh else giphy_candidates
-
-    valid_giphy = []
-    for c in giphy_pool:
-        c_slug = c["url"].split("/")[-1]
-        c_franchise = detect_franchise(f"{query} {c.get('title', '')} {c_slug}")
-        if c_franchise and not force:
-            is_cd, dist, thresh = check_cooldown(c_franchise, history=raw_history)
-            if is_cd:
-                print(f"[GIF] Giphy candidate skipped: franchise '{c_franchise}' on cooldown ({dist}/{thresh}).", file=sys.stderr)
-                continue
-
-        if is_valid_gif_url(c["url"]):
-            ocr_text = ""
-            if run_ocr and c.get("media_url"):
-                ocr_text = extract_gif_ocr(c["media_url"])
-                if not is_ocr_safe(ocr_text):
-                    continue
-                if not c_franchise:
-                    c_franchise = detect_franchise(ocr_text)
-                    if c_franchise and not force:
-                        is_cd, dist, thresh = check_cooldown(c_franchise, history=raw_history)
-                        if is_cd:
-                            print(f"[GIF] Giphy candidate skipped by OCR: franchise '{c_franchise}' on cooldown ({dist}/{thresh}).", file=sys.stderr)
-                            continue
-
-            c["ocr_text"] = ocr_text
-            c["franchise"] = c_franchise
-            valid_giphy.append(c)
-        if len(valid_giphy) >= 3:
-            break
-
-    if valid_giphy:
-        pick = random.choice(valid_giphy)
-        title = pick["title"]
-        pick_f = pick.get("franchise") or detect_franchise(f"{query} {title} {pick['url']}")
-        record_history(pick["url"], query=query, title=title, franchise=pick_f)
-        return {
-            "title": title,
-            "url": pick["url"],
-            "markdown": f"[{title}]({pick['url']})",
-            "ocr_text": pick.get("ocr_text", ""),
-            "source": "dynamic_giphy",
-            "franchise": pick_f
-        }
+    giphy_pick = _validate_and_pick(giphy_pool, "dynamic_giphy")
+    if giphy_pick:
+        return giphy_pick
 
     # Tier 3: Graceful skip (no hardcoded static URLs)
+    log_gif_failure(
+        query=query,
+        reason="skip_no_candidates",
+        details="All candidate search and fallback providers failed to produce a valid GIF",
+    )
     return {
         "title": None,
         "url": None,
@@ -635,7 +1278,7 @@ def get_contextual_gif(query: str, run_ocr: bool = True, force: bool = False) ->
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: gif_tool.py <query> [--force] [--cooldowns]")
+        print("Usage: gif_tool.py <query> [--force] [--cooldowns] [--failures] [--canonical] [--dynamic] [--no-llm]")
         sys.exit(0)
 
     args = sys.argv[1:]
@@ -644,11 +1287,35 @@ if __name__ == "__main__":
         print(json.dumps(summary, indent=2))
         sys.exit(0)
 
+    if "--failures" in args:
+        failures = get_recent_failures(limit=20)
+        print(json.dumps(failures, indent=2))
+        sys.exit(0)
+
+    if "--canonical" in args:
+        reg = load_canonical_registry()
+        print(json.dumps(reg, indent=2))
+        sys.exit(0)
+
     force = False
     if "--force" in args:
         force = True
         args.remove("--force")
 
+    allow_dynamic = False
+    if "--dynamic" in args:
+        allow_dynamic = True
+        args.remove("--dynamic")
+
+    use_llm = True
+    if "--no-llm" in args:
+        use_llm = False
+        args.remove("--no-llm")
+    elif "--llm" in args:
+        use_llm = True
+        args.remove("--llm")
+
     q = " ".join(args)
-    res = get_contextual_gif(q, force=force)
+    res = get_contextual_gif(q, force=force, allow_dynamic=allow_dynamic, use_llm=use_llm)
     print(json.dumps(res, indent=2))
+

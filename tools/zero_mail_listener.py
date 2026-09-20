@@ -23,10 +23,6 @@ import urllib.parse
 from datetime import datetime
 from collections import Counter
 
-SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_PATH", os.environ.get("GOOGLE_OAUTH_SECRETS", "/secrets/google_oauth.json"))
-if not os.path.exists(SECRETS_PATH) and os.path.exists("/workspace/config/google_oauth.json"):
-    SECRETS_PATH = "/workspace/config/google_oauth.json"
-
 ENV_PATH = os.environ.get("ENV_PATH", "/workspace/.env")
 STATE_DIR = os.environ.get("DATA_DIR", "/workspace/data")
 SEEN_FILE = os.path.join(STATE_DIR, "seen_zero_emails.json")
@@ -34,6 +30,8 @@ LOG_FILE = os.environ.get("ZERO_MAIL_LOG", os.path.join(STATE_DIR, "zero_mail_li
 
 POLL_INTERVAL = 15  # seconds
 TIMEOUT = 15
+
+_last_throttled_errors: dict[str, float] = {}
 
 def _resolve_target_email() -> str:
     target = os.environ.get("ZERO_TARGET_EMAIL", os.environ.get("ZERO_EMAIL", ""))
@@ -73,6 +71,69 @@ def log(msg: str):
     except Exception:
         pass
 
+def log_error_throttled(key: str, msg: str, interval: int = 3600):
+    """Log repeated errors at most once per interval (default: 1 hour) to prevent log flooding."""
+    now = time.time()
+    last_ts = _last_throttled_errors.get(key, 0.0)
+    if (now - last_ts) >= interval:
+        _last_throttled_errors[key] = now
+        log(f"[RATE LIMITED ERROR] {msg} (suppressing repeat logs for {interval}s)")
+
+def resolve_credentials() -> tuple[dict | None, str | None]:
+    """Resolve Google OAuth credentials across fallback chain with strict schema validation.
+    
+    Resolution order:
+    1. Explicit env vars (GOOGLE_OAUTH_PATH, GOOGLE_OAUTH_SECRETS)
+    2. /secrets/google_oauth.json
+    3. /workspace/config/google_oauth.json
+    """
+    candidates = []
+    env_override = os.environ.get("GOOGLE_OAUTH_PATH") or os.environ.get("GOOGLE_OAUTH_SECRETS")
+    if env_override:
+        candidates.append(env_override)
+    candidates.extend([
+        "/secrets/google_oauth.json",
+        "/workspace/config/google_oauth.json",
+    ])
+
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            if os.path.getsize(path) < 10:
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            data = json.loads(content)
+            if isinstance(data, dict):
+                cid = data.get("client_id")
+                csec = data.get("client_secret")
+                rtoken = data.get("refresh_token")
+                if (
+                    isinstance(cid, str) and cid.strip() and
+                    isinstance(csec, str) and csec.strip() and
+                    isinstance(rtoken, str) and rtoken.strip()
+                ):
+                    return data, path
+        except Exception:
+            continue
+
+    return None, None
+
+def load_credentials(path: str | None = None) -> dict:
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.loads(f.read())
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    creds, _ = resolve_credentials()
+    if creds:
+        return creds
+    raise RuntimeError("No valid Google OAuth credentials found across /secrets or /workspace/config.")
+
 try:
     from tools.email_sanitizer import sanitize_discord_display
 except ImportError:
@@ -96,20 +157,6 @@ def sanitize_text(text: str, max_len: int = 150) -> str:
     if len(text) > max_len:
         text = text[:max_len-3] + "..."
     return text
-
-def load_credentials(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        creds = {}
-        for line in content.splitlines():
-            line = line.strip().rstrip(",")
-            if ":" in line:
-                k, v = line.split(":", 1)
-                creds[k.strip().strip("\"").strip("'")] = v.strip().strip("\"").strip("'")
-        return creds
 
 def load_env() -> dict:
     env = {}
@@ -140,7 +187,9 @@ def get_access_token() -> str:
     if _cached_token and now < _token_expiry - 60:
         return _cached_token
     
-    creds = load_credentials(SECRETS_PATH)
+    creds, resolved_path = resolve_credentials()
+    if not creds:
+        raise RuntimeError("No valid Google OAuth credentials found across fallback chain (/secrets/google_oauth.json -> /workspace/config/google_oauth.json).")
 
     data = urllib.parse.urlencode({
         "client_id": creds["client_id"],
@@ -378,7 +427,7 @@ def run_loop():
                         save_seen(seen_ids)
 
             except Exception as e:
-                log(f"Polling loop exception: {e}")
+                log_error_throttled("poll_loop_exception", f"Polling loop exception: {e}", interval=3600)
 
             for _ in range(POLL_INTERVAL):
                 if not _running:

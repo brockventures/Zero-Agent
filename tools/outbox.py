@@ -14,6 +14,9 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timezone
 
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
+
 DATA_DIR = Path("/workspace/data")
 OUTBOX_DIR = DATA_DIR / "outbox"
 PENDING_FILE = OUTBOX_DIR / "pending.jsonl"
@@ -33,6 +36,11 @@ KNOWN_CHANNELS = {
     "general": 1534452820995080192,  # alias to lounge or main
     "signals": 1534436119888793750,
     "staff-comms": 1534436119888793750,
+    "server-updates": 1330447543477338202,
+    "baseball": 1548196929308065893,
+    "projects": 1548196930788524094,
+    "brock-house": 1550577908811178095,
+    "vault": 1550577910757458015,
 }
 
 def resolve_channel(channel_input: str | int) -> tuple[str, int | None]:
@@ -57,10 +65,20 @@ def queue_outbox_message(channel: str, content: str, source_turn: str = "zero") 
     """
     clean_name, ch_id = resolve_channel(channel)
     content = content.strip()
+
+    # Strip reaction GIFs if target channel has them disabled
+    try:
+        from tools.bridge_state import is_gif_disabled_for_channel
+        from tools.bridge_formatting import strip_reaction_gifs
+        if is_gif_disabled_for_channel(clean_name, channel_id=ch_id):
+            content = strip_reaction_gifs(content)
+    except Exception:
+        pass
+
     if not content:
         raise ValueError("Message content cannot be empty.")
-    if len(content) > 4000:
-        raise ValueError(f"Message content exceeds 4,000 character ceiling (len={len(content)}).")
+    if len(content) > 10000:
+        raise ValueError(f"Message content exceeds 10,000 character ceiling (len={len(content)}).")
 
     msg_record = {
         "id": f"outbox-{int(time.time()*1000)}-{os.getpid()}",
@@ -161,6 +179,64 @@ def flush_pending_messages() -> list[dict]:
 
     return messages
 
+def dispatch_via_rest(omsg: dict) -> bool:
+    """Send an outbox message directly to Discord via REST API."""
+    import urllib.request
+    token = os.environ.get("DISCORD_BOT_TOKEN")
+    if not token:
+        print("[Outbox] Warning: DISCORD_BOT_TOKEN not found, cannot dispatch via REST.", file=sys.stderr)
+        return False
+
+    target_cid = omsg.get("channel_id")
+    ch_name = omsg.get("channel")
+    if not target_cid:
+        print(f"[Outbox] Warning: Missing channel_id for message {omsg.get('id')}", file=sys.stderr)
+        return False
+
+    is_banana_stand = (target_cid == 1534436119888793750 or str(ch_name) in ("the-banana-stand", "agent-chat"))
+    if is_banana_stand:
+        try:
+            from tools.banana import claim, release
+            claim(subject=omsg.get("id", "outbox-cli-flush"))
+        except Exception as be:
+            print(f"[Outbox] Warning claiming Banana: {be}", file=sys.stderr)
+
+    try:
+        url = f"https://discord.com/api/v10/channels/{target_cid}/messages"
+        payload = json.dumps({"content": omsg.get("content", "")}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bot {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "DiscordBot (https://github.com/brockventures/zero-agent, 1.0)"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status in (200, 201)
+    except Exception as e:
+        print(f"[Outbox] Error delivering message {omsg.get('id')} to {target_cid}: {e}", file=sys.stderr)
+        dlq_file = DATA_DIR / "outbox" / "failed.jsonl"
+        try:
+            dlq_file.parent.mkdir(parents=True, exist_ok=True)
+            failed_entry = dict(omsg)
+            failed_entry["failed_at"] = time.time()
+            failed_entry["error"] = str(e)
+            with open(dlq_file, "a", encoding="utf-8") as df:
+                df.write(json.dumps(failed_entry) + "\n")
+        except Exception:
+            pass
+        return False
+    finally:
+        if is_banana_stand:
+            try:
+                from tools.banana import release
+                release()
+            except Exception:
+                pass
+
 def main():
     parser = argparse.ArgumentParser(
         description="Zero Cross-Channel Outbox Queue Manager",
@@ -174,7 +250,8 @@ def main():
     parser.add_argument("--channel", "-c", help="Target channel name or ID (e.g. lounge, the-banana-stand, zero-chat)")
     parser.add_argument("--message", "-m", help="Message content to queue for cross-channel delivery")
     parser.add_argument("--list", "-l", action="store_true", help="List all currently queued pending messages")
-    parser.add_argument("--flush", "-f", action="store_true", help="Drain and print all pending messages")
+    parser.add_argument("--flush", "-f", action="store_true", help="Drain and immediately dispatch all pending messages via Discord REST API")
+    parser.add_argument("--discard", action="store_true", help="Purge pending queue without sending (discard messages)")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
 
     args = parser.parse_args()
@@ -189,14 +266,30 @@ def main():
                 print(f"  {idx}. [{msg['created_at_iso']}] -> #{msg['channel']} ({len(msg['content'])} chars): {msg['content'][:60]}...")
         return
 
-    if args.flush:
+    if args.discard:
         drained = flush_pending_messages()
         if args.json:
-            print(json.dumps(drained, indent=2))
+            print(json.dumps({"discarded": len(drained)}, indent=2))
         else:
-            print(f"🚀 Flushed {len(drained)} messages from outbox.")
-            for msg in drained:
-                print(f"  -> #{msg['channel']}: {msg['content'][:80]}...")
+            print(f"🗑️ Discarded {len(drained)} messages from outbox without sending.")
+        return
+
+    if args.flush:
+        drained = flush_pending_messages()
+        dispatched_count = 0
+        for msg in drained:
+            success = dispatch_via_rest(msg)
+            if success:
+                dispatched_count += 1
+                if not args.json:
+                    print(f"  ✓ Dispatched -> #{msg['channel']} ({msg.get('id')})")
+            else:
+                if not args.json:
+                    print(f"  ✗ Failed to dispatch -> #{msg['channel']} ({msg.get('id')})")
+        if args.json:
+            print(json.dumps({"flushed": len(drained), "dispatched": dispatched_count}, indent=2))
+        else:
+            print(f"🚀 Flushed and dispatched {dispatched_count}/{len(drained)} messages from outbox.")
         return
 
     if not args.channel or not args.message:

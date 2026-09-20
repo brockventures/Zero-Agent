@@ -244,6 +244,7 @@ class TestBridgeEndToEndStress(unittest.IsolatedAsyncioTestCase):
         )
 
         with patch("tools.scheduler_tool.load_schedule", return_value=[]), \
+             patch("tools.process_probe.reap_stale_agy_processes") as mock_reap, \
              patch("tools.outbox.flush_pending_messages", return_value=[{
                  "id": "outbox-test-1",
                  "channel_id": 1534436119888793750,

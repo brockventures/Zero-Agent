@@ -14,6 +14,21 @@
       }
     ]
   },
+  "tool-batching-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /workspace/.agents/hooks/batch_guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
   "pacific-time-context": {
     "enabled": true,
     "PreInvocation": [

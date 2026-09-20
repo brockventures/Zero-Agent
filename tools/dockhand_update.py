@@ -39,7 +39,7 @@ def _resolve_nas_config():
         if len(parts) == 4 and parts[-1] == "82":
             host_2 = ".".join(parts[:3] + ["84"])
 
-    return host_1 or "127.0.0.1", host_2 or "127.0.0.1", ssh_port
+    return host_1 or os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), host_2 or os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), ssh_port
 
 HOST_1_IP, HOST_2_IP, SSH_PORT = _resolve_nas_config()
 
@@ -101,22 +101,44 @@ def perform_upgrade():
     print("1. Upgrading Host1 (.82):")
     # WAL-safe backup
     print("   • Backing up SQLite DB (WAL-safe)...")
-    get_remote_out(SSH_82, f"mkdir -p /data/backups/dockhand && sqlite3 /docker/appdata/dockhand/db/dockhand.db \".backup '/data/backups/dockhand/dockhand.db.bak-{ts}'\"")
+    bak_82 = f"/data/backups/dockhand/dockhand.db.bak-{ts}"
+    get_remote_out(SSH_82, f"mkdir -p /data/backups/dockhand && sqlite3 /docker/appdata/dockhand/db/dockhand.db \".backup '{bak_82}'\"")
+    bak_sz_82 = get_remote_out(SSH_82, f"ls -lh '{bak_82}' 2>/dev/null | awk '{{print $5}}'")
+    if bak_sz_82:
+        print(f"   • Backup verified: {bak_sz_82} ({bak_82})")
+    else:
+        print("   ⚠️ Backup file verification failed, proceeding with caution...")
+
     print("   • Pulling new image & recreating container...")
     get_remote_out(SSH_82, "cd /docker/appdata && docker compose pull dockhand && docker compose up -d dockhand")
-    time.sleep(3)
-    status_82 = get_remote_out(SSH_82, "curl -s -o /dev/null -w '%{http_code}' http://localhost:3866/ || true")
+    status_82 = ""
+    for _ in range(10):
+        time.sleep(2)
+        status_82 = get_remote_out(SSH_82, "curl -s -o /dev/null -w '%{http_code}' http://localhost:3866/ || true")
+        if status_82 in ("200", "302"):
+            break
     print(f"   • Host1 Status: HTTP {status_82} OK")
 
     # 2. Host2 (.84)
     print("\n2. Upgrading Host2 (.84):")
     # WAL-safe backup
     print("   • Backing up SQLite DB (WAL-safe)...")
-    get_remote_out(SSH_84, f"mkdir -p /docker/support/dockhand/backups && sqlite3 /docker/support/dockhand/db/dockhand.db \".backup '/docker/support/dockhand/backups/dockhand.db.bak-{ts}'\"")
+    bak_84 = f"/docker/support/dockhand/backups/dockhand.db.bak-{ts}"
+    get_remote_out(SSH_84, f"mkdir -p /docker/support/dockhand/backups && sqlite3 /docker/support/dockhand/db/dockhand.db \".backup '{bak_84}'\"")
+    bak_sz_84 = get_remote_out(SSH_84, f"ls -lh '{bak_84}' 2>/dev/null | awk '{{print $5}}'")
+    if bak_sz_84:
+        print(f"   • Backup verified: {bak_sz_84} ({bak_84})")
+    else:
+        print("   ⚠️ Backup file verification failed, proceeding with caution...")
+
     print("   • Pulling new image & recreating container...")
     get_remote_out(SSH_84, "cd /docker/support && docker compose pull dockhand && docker compose up -d dockhand")
-    time.sleep(3)
-    status_84 = get_remote_out(SSH_84, "curl -s -o /dev/null -w '%{http_code}' http://localhost:3866/ || true")
+    status_84 = ""
+    for _ in range(10):
+        time.sleep(2)
+        status_84 = get_remote_out(SSH_84, "curl -s -o /dev/null -w '%{http_code}' http://localhost:3866/ || true")
+        if status_84 in ("200", "302"):
+            break
     print(f"   • Host2 Status: HTTP {status_84} OK")
 
     print("\n🎉 **Dockhand upgraded and online on both servers!**")

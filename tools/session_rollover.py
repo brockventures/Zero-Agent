@@ -31,6 +31,7 @@ from tools.bridge_state import (
     DEFAULT_HOME_CHANNELS,
     TARGET_CHANNEL_ID,
     get_session_metadata,
+    set_session_metadata,
     clear_channel_session_id,
     get_channel_session_id,
 )
@@ -88,6 +89,7 @@ def run_daily_session_rollover(bot=None, dry_run: bool = False) -> tuple[bool, s
         try:
             if not dry_run:
                 generate_summary(conv_id=conv_id, sess_key=sess_key)
+                set_session_metadata(sess_key, {"parent_conv_id": conv_id})
                 br.reset_session_keys.add(sess_key)
             rolled_over.append(sess_key)
         except Exception as se:

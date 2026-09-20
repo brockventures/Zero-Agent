@@ -183,8 +183,8 @@ def format_chat_transcript(messages: list[dict], max_chars: int = 15000) -> str:
 
 
 def get_repo_state() -> dict:
-    """Fetch recent open PRs and commit activity from GitHub."""
-    state = {"open_prs": [], "recent_commits": [], "error": None}
+    """Fetch recent open PRs, open tasks/issues, and commit activity from GitHub."""
+    state = {"open_prs": [], "open_issues": [], "recent_commits": [], "error": None}
     try:
         # Check open PRs
         res_prs = subprocess.run(
@@ -193,6 +193,14 @@ def get_repo_state() -> dict:
         )
         if res_prs.returncode == 0:
             state["open_prs"] = json.loads(res_prs.stdout or "[]")
+
+        # Check open tasks/issues from GitHub task board
+        res_issues = subprocess.run(
+            ["gh", "issue", "list", "-R", REPO, "--json", "number,title,assignees,labels,state"],
+            capture_output=True, text=True, timeout=10
+        )
+        if res_issues.returncode == 0:
+            state["open_issues"] = json.loads(res_issues.stdout or "[]")
         
         # Check recent commits on main
         res_commits = subprocess.run(
@@ -211,25 +219,42 @@ def get_repo_state() -> dict:
     return state
 
 
-def synthesize_standing_agenda(state: dict, chat_transcript: str = "", date_label: str = "") -> str:
-    """Generate dynamic standing agenda and next steps based on repository activity and evening chats."""
+def synthesize_standing_agenda(state: dict, chat_transcript: str = "", date_label: str = "", staged_items: list = None) -> str:
+    """Generate dynamic standing agenda and next steps based on repository activity, staged RFCs, open task board issues, and discussions."""
     open_prs = state.get("open_prs", [])
+    open_issues = state.get("open_issues", [])
     recent_commits = state.get("recent_commits", [])
 
     chat_context_block = ""
     if chat_transcript.strip():
         chat_context_block = (
-            f"\nPrevious Evening Collaboration Session (7:00 PM - 11:59 PM PT"
-            f"{f' on {date_label}' if date_label else ''}):\n"
+            f"\nRecent Collaboration & Design Discussions"
+            f"{f' on {date_label}' if date_label else ''}:\n"
             f"{chat_transcript}\n"
+        )
+    
+    staged_context_block = ""
+    if staged_items:
+        staged_context_block = (
+            f"\nStaged Feature Requests & RFC Proposals for Tonight's Agenda:\n"
+            f"{json.dumps(staged_items, indent=2)}\n"
+        )
+
+    issues_context_block = ""
+    if open_issues:
+        issues_context_block = (
+            f"\nOpen GitHub Task Board Issues:\n"
+            f"{json.dumps(open_issues[:6], indent=2)}\n"
         )
     
     prompt = (
         f"You are Zero posting the daily multi-agent standup for repo brockventures/market-sandbox with Amos and Marvin in #the-banana-stand.\n\n"
         f"Open PRs:\n{json.dumps(open_prs, indent=2)}\n\n"
+        f"{issues_context_block}\n"
         f"Recent Commits:\n{json.dumps(recent_commits, indent=2)}\n"
+        f"{staged_context_block}\n"
         f"{chat_context_block}\n"
-        f"Synthesize 3 numbered bullet points for 'Standing Agenda & Peer Check-in' assigning or checking in on Amos (<@1468012353206354197>), Marvin (<@1492043459618537492>), and Zero based on the actual current repository state, open PRs, and the agreements/blockers from the previous evening's discussion. Keep each line crisp, specific, and actionable (<90 characters per bullet). Output ONLY the 3 numbered lines."
+        f"Synthesize 3 numbered bullet points for 'Standing Agenda & Peer Check-in' assigning or checking in on Amos (<@1468012353206354197>), Marvin (<@1492043459618537492>), and Zero based on the repository state, open PRs, open GitHub tasks, and staged feature requests. Keep each line crisp, specific, and actionable (<90 characters per bullet). Output ONLY the 3 numbered lines."
     )
     try:
         res = subprocess.run(
@@ -243,16 +268,23 @@ def synthesize_standing_agenda(state: dict, chat_transcript: str = "", date_labe
     except Exception as e:
         print(f"[MarketStandup] LLM agenda synthesis fallback: {e}")
 
-    # Dynamic fallback based on repository state
+    # Dynamic fallback based on repository state & current roadmap
     items = []
-    if open_prs:
-        pr_titles = [f"PR #{p['number']}: {p['title']}" for p in open_prs[:2]]
-        items.append(f"1. Open PR Review — {'; '.join(pr_titles)}.")
+    if staged_items:
+        items.append("1. Terminal Web HUD — Candlestick canvas, L2 depth mountain, & orbital route HUD.")
+        items.append("2. Multiplexed Streaming Layer — /ws/terminal delta feeds & client ring buffer.")
+        items.append("3. Fleet & Arbitrage Execution — Spatial routing integration & LULD halt triggers.")
     else:
-        items.append("1. Active Feature Branches — Ready for peer review or integration testing.")
-
-    items.append("2. Adversarial Referee & Invariants — Fuzz harness validation and invariant checks.")
-    items.append("3. Book Engine & Order Pipeline — Wire envelopes and execution pipeline.")
+        if open_issues:
+            issue_bullets = [f"Issue #{i.get('number')}" for i in open_issues[:2]]
+            items.append(f"1. Open Task Board Focus — Triage and drive {', '.join(issue_bullets)}.")
+        elif open_prs:
+            pr_titles = [f"PR #{p['number']}: {p['title']}" for p in open_prs[:2]]
+            items.append(f"1. Open PR Review — {'; '.join(pr_titles)}.")
+        else:
+            items.append("1. Active Feature Branches — Ready for peer review or integration testing.")
+        items.append("2. Terminal Web HUD & Visualization — Canvas overlays and mobile bottom-sheet HUD.")
+        items.append("3. Book Engine & Streaming Pipeline — WebSocket deltas and execution pipeline.")
     return "\n".join(items)
 
 
@@ -260,6 +292,28 @@ def build_standup_message(state: dict, now_pt: datetime, chat_transcript: str = 
     """Construct the handoff envelope and standup text."""
     date_str = now_pt.strftime("%Y-%m-%d %I:%M %p PT")
     
+    # Check for staged feature requests / agenda items
+    staged_file = DATA_DIR / "market_standup_staged.json"
+    staged_items = []
+    staged_section = ""
+    if staged_file.exists():
+        try:
+            staged_raw = json.loads(staged_file.read_text())
+            staged_items = staged_raw.get("items", []) if isinstance(staged_raw, dict) else staged_raw
+            if staged_items:
+                lines = []
+                for it in staged_items:
+                    topic = it.get("topic", "")
+                    task_id = it.get("task_id")
+                    task_tag = f" (Task #{task_id})" if task_id else ""
+                    details = it.get("details", "")
+                    if len(details) > 120:
+                        details = details[:117].rstrip() + "..."
+                    lines.append(f"- **{topic}{task_tag}:** {details}")
+                staged_section = "\n\n**Feature Requests & RFC Proposals on Deck:**\n" + "\n".join(lines)
+        except Exception as e:
+            print(f"[MarketStandup] Error loading staged items: {e}", file=sys.stderr)
+
     # Format open PRs
     prs_summary = []
     if state.get("open_prs"):
@@ -267,6 +321,20 @@ def build_standup_message(state: dict, now_pt: datetime, chat_transcript: str = 
             prs_summary.append(f"- PR #{pr['number']}: {pr['title']} ({pr.get('author', {}).get('login', 'unknown')})")
     else:
         prs_summary.append("- No open PRs currently outstanding.")
+
+    # Format open issues / GitHub task board
+    issues_summary = []
+    if state.get("open_issues"):
+        for issue in state["open_issues"][:4]:
+            num = issue.get("number")
+            title = issue.get("title", "")
+            if len(title) > 65:
+                title = title[:62].rstrip() + "..."
+            labels = [l.get("name") for l in issue.get("labels", []) if isinstance(l, dict) and l.get("name")]
+            tag_str = f" *({', '.join(labels[:2])})*" if labels else ""
+            issues_summary.append(f"- Issue #{num}: {title}{tag_str}")
+    else:
+        issues_summary.append("- No open issues on board.")
 
     commits_summary = []
     if state.get("recent_commits"):
@@ -276,10 +344,11 @@ def build_standup_message(state: dict, now_pt: datetime, chat_transcript: str = 
         commits_summary.append("- Main branch initialized.")
 
     prs_text = "\n".join(prs_summary)
+    issues_text = "\n".join(issues_summary)
     commits_text = "\n".join(commits_summary)
-    agenda_text = synthesize_standing_agenda(state, chat_transcript=chat_transcript, date_label=date_label)
+    agenda_text = synthesize_standing_agenda(state, chat_transcript=chat_transcript, date_label=date_label, staged_items=staged_items)
 
-    msg = f"""🍌 ```handoff
+    envelope = f"""🍌 ```handoff
 {{
   "v": 1,
   "kind": "status",
@@ -289,27 +358,68 @@ def build_standup_message(state: dict, now_pt: datetime, chat_transcript: str = 
   "subject": "agent-collaborative-project",
   "round": 1
 }}
-```
+```"""
+    header = f"**Autonomous Daily Standup — Market Sandbox** ({date_str})\n\nCurrent repository health on [`{REPO}`](https://github.com/{REPO}):"
+    footer = "Any blockers on deck? Floor is open for autonomous turn progression."
 
-**Autonomous Daily Standup — Market Sandbox** ({date_str})
+    body_parts = [
+        header,
+        f"**Open Tasks & Issues (GitHub Task Board):**\n{issues_text}",
+        f"**Open PRs:**\n{prs_text}",
+        f"**Recent Activity:**\n{commits_text}",
+    ]
+    if staged_section.strip():
+        body_parts.append(staged_section.strip())
+    body_parts.append(f"**Standing Agenda & Peer Check-in:**\n{agenda_text}")
+    body_parts.append(footer)
 
-Current repository health on [`{REPO}`](https://github.com/{REPO}):
+    msg = f"{envelope}\n\n" + "\n\n".join(body_parts)
 
-**Open PRs:**
-{prs_text}
+    # Enforce strict Discord 2,000 char ceiling guard (<1900 chars)
+    if len(msg) > 1900:
+        # Phase 1: condense staged section if present
+        if staged_items:
+            condensed_lines = [f"- **{it.get('topic')}:** {it.get('details', '')[:60]}..." for it in staged_items[:3]]
+            staged_condensed = "**Feature Requests on Deck:**\n" + "\n".join(condensed_lines)
+            body_parts = [
+                header,
+                f"**Open Tasks & Issues (GitHub Task Board):**\n{issues_text}",
+                f"**Open PRs:**\n{prs_text}",
+                f"**Recent Activity:**\n{commits_text}",
+                staged_condensed,
+                f"**Standing Agenda & Peer Check-in:**\n{agenda_text}",
+                footer,
+            ]
+            msg = f"{envelope}\n\n" + "\n\n".join(body_parts)
 
-**Recent Activity:**
-{commits_text}
+        # Phase 2: if still over 1900, condense open issues and strip staged section
+        if len(msg) > 1900:
+            if state.get("open_issues"):
+                condensed_issues = [f"- Issue #{i.get('number')}: {i.get('title', '')[:45]}..." for i in state["open_issues"][:3]]
+                issues_condensed = "\n".join(condensed_issues)
+            else:
+                issues_condensed = "- No open issues on board."
+            body_parts = [
+                header,
+                f"**Open Tasks & Issues (GitHub Task Board):**\n{issues_condensed}",
+                f"**Open PRs:**\n{prs_text}",
+                f"**Recent Activity:**\n{commits_text}",
+                f"**Standing Agenda & Peer Check-in:**\n{agenda_text}",
+                footer,
+            ]
+            msg = f"{envelope}\n\n" + "\n\n".join(body_parts)
 
-**Standing Agenda & Peer Check-in:**
-{agenda_text}
+        # Phase 3: hard clamp guaranteeing <=1900 chars under all circumstances
+        if len(msg) > 1900:
+            msg = msg[:1830].rstrip() + "\n\n... *(content condensed for Discord 2,000 ceiling)*"
 
-Any blockers on deck? Floor is open for autonomous turn progression."""
     return msg
 
 
-def dispatch_market_standup(test_mode: bool = False, quiet: bool = False, window_mode: str = "previous_day") -> dict:
+def dispatch_market_standup(test_mode: bool = False, quiet: bool = False, window_mode: str = "previous_day", dry_run: bool = False, **kwargs) -> dict:
     """Execute the standup check and dispatch."""
+    if dry_run:
+        test_mode = True
     now_pt = datetime.now(PT)
     state = get_repo_state()
 
@@ -337,15 +447,16 @@ def dispatch_market_standup(test_mode: bool = False, quiet: bool = False, window
             "window": f"{start_pt.strftime('%Y-%m-%d %I:%M %p PT')} -> {end_pt.strftime('%I:%M %p PT')}"
         }
 
-    # Step 1: Claim Banana Mutex
+    # Step 1: Claim Banana Mutex (best-effort; do not abort on external API errors)
     claimed = False
     try:
         claim("zero-market-standup")
         claimed = True
     except BananaBlockedError as e:
+        print(f"[MarketStandup] Banana blocked by {e.holder}, deferring/aborting: {e}", file=sys.stderr)
         return {"status": "error", "error": f"Banana blocked by {e.holder}"}
     except Exception as e:
-        return {"status": "error", "error": f"Banana claim failed: {e}"}
+        print(f"[MarketStandup] Warning: Error claiming Banana ({e}). Proceeding with outbox dispatch...", file=sys.stderr)
 
     try:
         # Step 2: Queue to #the-banana-stand

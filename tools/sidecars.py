@@ -94,7 +94,7 @@ def _resolve_nas_config():
         if len(parts) == 4 and parts[-1] == "82":
             host_2 = ".".join(parts[:3] + ["84"])
 
-    return host_1 or "127.0.0.1", host_2 or "127.0.0.1", ssh_port
+    return host_1 or os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), host_2 or os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), ssh_port
 
 HOST_1_IP, HOST_2_IP, SSH_PORT = _resolve_nas_config()
 
@@ -114,10 +114,11 @@ SERVERBROCK_STOPPED_ALLOWLIST = {
 }
 
 SERVERBROCK2_EXPECTED_CONTAINERS = {
-    "baseball_db", "baseball_shiny_app", "baseball_shiny_pro",
-    "baseball_shiny_dev", "baseball-scraper-1", "dockhand",
-    "dozzle-agent", "discord-antigravity-agent"
+    "baseball_db", "baseball_projections_analysis", "big_board_pro",
+    "baseball-scraper-1", "dockhand",
+    "dozzle-agent", "discord-antigravity-agent", "discord-ivy-agent"
 }
+SERVERBROCK2_STOPPED_ALLOWLIST = set()
 BROCKSERVER2_EXPECTED_CONTAINERS = SERVERBROCK2_EXPECTED_CONTAINERS
 
 SELF_SENDER_PATTERNS = (
@@ -282,8 +283,8 @@ def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> 
             ok = True
             message = res
         elif isinstance(res, dict):
-            ok = res.get("ok", True)
-            message = res.get("message", res.get("digest", str(res)))
+            ok = res.get("ok", True) if "ok" in res else (res.get("status") != "error")
+            message = res.get("message", res.get("digest", res.get("error", str(res))))
             extra = res
         elif res is None:
             ok = True
@@ -308,22 +309,26 @@ def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> 
                 ok = True
                 status = "ok"
         elif job_id == "marketing":
+            should_post = res[0] if isinstance(res, tuple) else True
             if message and any(err_tag in message for err_tag in ("⚠️", "🚨", "Could not")):
                 ok = False
                 status = "warning"
             else:
                 ok = True
                 status = "ok"
+            extra = {"should_post": should_post}
         elif job_id == "heartbeat":
             status = "ok" if ok else "warning"
         elif job_id == "nas_logs":
             status = "ok" if ok else "warning"
         elif job_id == "plex":
             status = "ok" if ok else "warning"
+        elif job_id in ("host1_backup", "host2_backup"):
+            status = "ok" if ok else "error"
         else:
             status = "ok" if ok else "warning"
 
-        summary = message[:400] if message else ("(clean run / silent)" if ok else "(degraded)")
+        summary = message[:400] if message else (extra.get("summary", "(clean run / silent)") if isinstance(extra, dict) and ok else "(degraded)")
         log_execution(job_id=job_id, name=name, status=status, duration_sec=duration, summary=summary, error="" if ok else summary, extra=extra if isinstance(extra, dict) else None)
         return ok, message, extra
 
@@ -378,6 +383,74 @@ def get_sidecar_health_summary(since_hours: float = 24.0) -> dict:
         if entry.get("status") in ("warning", "error")
     ]
 
+    # STALENESS AUDIT: Check for enabled jobs that have missed their execution cadence
+    stale_jobs = []
+    sched_file = DATA_DIR / "schedule.json"
+    if sched_file.exists():
+        try:
+            with open(sched_file, "r") as sf:
+                sched_jobs = json.load(sf)
+            now_ts = time.time()
+            for sj in sched_jobs:
+                if not sj.get("enabled", True):
+                    continue
+                jid = sj.get("id", "")
+                stype = sj.get("schedule_type", "daily")
+
+                if stype == "interval":
+                    cadence = sj.get("interval_seconds", 3600)
+                    threshold = max(cadence * 3.0, 7200)
+                    cadence_desc = f"every {cadence // 60}m" if cadence < 3600 else f"every {cadence / 3600:.1f}h"
+                elif stype == "daily":
+                    cadence = 86400
+                    threshold = 86400 * 2.5
+                    cadence_desc = "daily"
+                elif stype == "weekly":
+                    cadence = 7 * 86400
+                    threshold = 7 * 86400 * 2.0
+                    cadence_desc = "weekly"
+                elif stype == "monthly":
+                    cadence = 30 * 86400
+                    threshold = 35 * 86400
+                    cadence_desc = "monthly"
+                else:
+                    continue
+
+                entry = latest_map.get(jid)
+                status_epoch = entry.get("timestamp_epoch", 0) if entry else 0
+                sched_epoch = int(sj.get("last_run_ts") or 0)
+                if status_epoch >= sched_epoch and status_epoch > 0:
+                    last_epoch = status_epoch
+                    last_pt = entry.get("timestamp_pt", "unknown")
+                elif sched_epoch > 0:
+                    last_epoch = sched_epoch
+                    last_pt = sj.get("last_run_at", "unknown")
+                else:
+                    last_epoch = None
+                    last_pt = "never"
+
+                if not last_epoch:
+                    stale_jobs.append({
+                        "id": jid,
+                        "name": sj.get("name", jid),
+                        "last_run_pt": "never",
+                        "age_hours": None,
+                        "cadence_desc": cadence_desc,
+                        "reason": "never executed"
+                    })
+                elif (now_ts - last_epoch) > threshold:
+                    age_h = (now_ts - last_epoch) / 3600
+                    stale_jobs.append({
+                        "id": jid,
+                        "name": sj.get("name", jid),
+                        "last_run_pt": last_pt,
+                        "age_hours": round(age_h, 1),
+                        "cadence_desc": cadence_desc,
+                        "reason": f"last ran {age_h:.1f}h ago ({last_pt}), expected {cadence_desc}"
+                    })
+        except Exception as se:
+            print(f"[Sidecars] Error evaluating staleness: {se}")
+
     return {
         "total_runs": total,
         "ok_count": ok_count,
@@ -385,8 +458,9 @@ def get_sidecar_health_summary(since_hours: float = 24.0) -> dict:
         "error_count": err_count,
         "failures": failures,
         "active_failures": active_failures,
+        "stale_jobs": stale_jobs,
         "latest_by_job": latest_map,
-        "all_healthy": len(active_failures) == 0
+        "all_healthy": len(active_failures) == 0 and len(stale_jobs) == 0
     }
 
 def format_sidecar_status_summary() -> str:
@@ -414,6 +488,14 @@ def format_sidecar_status_summary() -> str:
             if status != "ok" and entry.get("summary"):
                 snip = entry['summary'].splitlines()[0][:100]
                 lines.append(f"  -# *Detail:* `{snip}`")
+
+    if summary.get("stale_jobs"):
+        lines.extend([
+            "",
+            "### ⏳ Stale / Missed Sidecars (Cadence Warning)"
+        ])
+        for sj in summary["stale_jobs"]:
+            lines.append(f"- ⚠️ **{sj['name']}** (`{sj['id']}`): {sj['reason']}")
 
     if summary["failures"]:
         lines.extend([
@@ -696,7 +778,7 @@ def run_nightly_triage() -> str:
 
     # Baseball pipeline refresh timestamp
     bb_path = os.environ.get("BASEBALL_REFRESH_PATH", "/docker/baseball/shiny_app/data/last_refresh.txt")
-    bb_res = _ssh_cmd(HOST_2_IP, f"cat {bb_path} 2>/dev/null || echo 'unavailable'")
+    bb_res = _ssh_cmd(HOST_2_IP, f"cat {bb_path} 2>/dev/null || cat /docker/baseball/shiny_app/data/last_refresh.txt 2>/dev/null || echo 'unavailable'")
     bb_ts = bb_res.stdout.strip() if bb_res.returncode == 0 and bb_res.stdout.strip() else "unavailable"
 
     # Sidecar summary line based on active registered jobs
@@ -824,134 +906,23 @@ def _diagnose_container_errors(cname: str, errors: list[str]) -> tuple[int, str,
             parts = res.stdout.strip().split("|")
             expl = parts[0].replace("Explanation:", "").strip()
             step = parts[1].replace("Next Step:", "").strip() if len(parts) > 1 else "Inspect container logs."
-            tier = 1 if re.search(r"panic|fatal|segfault|oom|killed|unhandled exception|syntaxerror", joined, re.I) else 2
+            tier = 1 if re.search(r"panic|fatal|segfault|\boom\b|killed|unhandled exception|syntaxerror", joined, re.I) else 2
             if expl:
                 return tier, expl, step
     except Exception:
         pass
 
     # Generic Fallbacks
-    if re.search(r"panic|fatal|segfault|oom|killed|unhandled exception|syntaxerror", joined, re.I):
+    if re.search(r"panic|fatal|segfault|\boom\b|killed|unhandled exception|syntaxerror", joined, re.I):
         return 1, f"Critical application error or unhandled crash in {cname}.", "Inspect detailed container logs with docker logs and verify configuration."
     else:
         return 2, f"Transient operational warning or non-critical error in {cname}.", "Monitor on subsequent health checks; investigate if error recurs continuously."
 
 def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
-    now_pt = datetime.now(PT).strftime("%A %b %d %Y, %I:%M %p PT")
-    tier1_flagged = []
-    tier2_flagged = []
-    scanned = 0
+    """Execute high-speed batch NAS log scanning & triage across Host 1 and Host 2."""
+    from tools.nas_log_triage import run_nas_log_review as _run_triage
+    return _run_triage(since=since)
 
-    # Noise filter regex
-    noise_re = re.compile(
-        r"("
-        r"libusb_init failed|"
-        r"TaskCanceledException|"
-        r"TVDb convert warning|"
-        r"OpenSubtitles|"
-        r"forecast_solar|"
-        r"Matter Node 2|"
-        r"connection reset by peer|"
-        r"socket\.timeout|"
-        r"\[EnvUpdateCheck\]|"
-        r"DNSSD packet parsing|"
-        r"\"error\":\s*0|"
-        r"\"error\":0|"
-        r"images.*\/error\/|"
-        r"Failed to load resource.*status of 503|"
-        r"Transient Google auth\/eligibility error|"
-        r"Warmed channel history|"
-        r"Generated new chapter thumbnails|"
-        r"closing transport|"
-        r"TimeoutNegativeWarning|"
-        r"\[Nest\] API observe: error|"
-        r"unsupported method: GET|"
-        r"UptimeRobot|"
-        r"Dozzle-Agent|"
-        r"upstream timed out|"
-        r"<httpProxy>|"
-        r"credentialedProxyHandler|"
-        r"connect EHOSTUNREACH|"
-        r"Error calling http:\/\/\d+\.\d+\.\d+\.\d+|"
-        r"octoprint.*|"
-        r"android_ip_webcam.*|"
-        r"failed to sufficiently increase receive buffer size|"
-        r"Frame rx failed, error:Duplicated|"
-        r"CASESession timed out while waiting for a response from peer <0000000000000002|"
-        r"Stopped reading data from server error=.*EOF"
-        r")",
-        re.IGNORECASE
-    )
-
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-
-    for host in [HOST_1_IP, HOST_2_IP]:
-        ps_res = json.loads(nas_docker("ps", host))
-        if not ps_res.get("ok"):
-            continue
-        for line in ps_res.get("output", "").splitlines():
-            parts = [p.strip() for p in line.split("\t") if p.strip()]
-            if parts and parts[1].startswith("Up"):
-                cname = parts[0]
-                if host == HOST_1_IP and cname in SERVERBROCK_STOPPED_ALLOWLIST:
-                    continue
-                scanned += 1
-
-                # Query logs for candidate errors
-                cmd = f"docker logs --since {since} --tail 200 {cname} 2>&1 | grep -iE 'panic|fatal|segfault|oom|killed|error|exception|failed|failure|traceback|critical' | tail -20"
-                try:
-                    res = _ssh_cmd(host, cmd, timeout=20)
-                    out = res.stdout.strip()
-                    if out:
-                        # Apply noise filtering with ANSI escape stripping
-                        real_errors = []
-                        for l in out.splitlines():
-                            clean_l = ansi_escape.sub('', l).strip()
-                            if clean_l and not noise_re.search(clean_l):
-                                real_errors.append(clean_l)
-
-                        if real_errors:
-                            tier, explanation, next_step = _diagnose_container_errors(cname, real_errors)
-                            entry = {
-                                "container": cname,
-                                "explanation": explanation,
-                                "next_step": next_step
-                            }
-                            if tier == 1:
-                                tier1_flagged.append(entry)
-                            else:
-                                tier2_flagged.append(entry)
-                except Exception:
-                    pass
-
-    total_issues = len(tier1_flagged) + len(tier2_flagged)
-    if total_issues == 0:
-        return True, f"🗄️ **NAS Log Review** — {now_pt}\nScanned the last {since} of logs for {scanned} running containers across NAS clusters — all systems healthy with zero actionable errors. ✅", {"tier1_count": 0, "tier2_count": 0}
-
-    c_word = "container" if total_issues == 1 else "containers"
-    report = [
-        f"🗄️ **NAS Log Review — Flagged Issues** [{now_pt}]",
-        f"Scanned {scanned} running containers across NAS clusters. Found issues in {total_issues} {c_word}:\n"
-    ]
-    if tier1_flagged:
-        t1_word = "container" if len(tier1_flagged) == 1 else "containers"
-        report.append(f"🔴 **Tier 1: Actionable Failures** ({len(tier1_flagged)} {t1_word})")
-        for f in tier1_flagged:
-            report.append(f"* **{f['container']}**")
-            report.append(f"  * **Issue:** {f['explanation']}")
-            report.append(f"  * **Proposed Next Step:** {f['next_step']}")
-        report.append("")
-
-    if tier2_flagged:
-        t2_word = "container" if len(tier2_flagged) == 1 else "containers"
-        report.append(f"🟡 **Tier 2: Flapping / Transient Degradations** ({len(tier2_flagged)} {t2_word})")
-        for f in tier2_flagged:
-            report.append(f"* **{f['container']}**")
-            report.append(f"  * **Issue:** {f['explanation']}")
-            report.append(f"  * **Proposed Next Step:** {f['next_step']}")
-        report.append("")
-
-    return True, "\n".join(report).strip(), {"tier1_count": len(tier1_flagged), "tier2_count": len(tier2_flagged)}
 
 # --------------------------------------------------------------------------
 # 4. Plex Transcode Session Cleanup
@@ -1104,7 +1075,7 @@ def run_marketing_sweep(force: bool = False) -> tuple[bool, str]:
     """Biweekly promotional-inbox sweep. Returns (should_post, message)."""
     now_pt = datetime.now(PT)
     if not force and not _marketing_due():
-        return False, "Marketing sweep not due yet (last run within 12 days)."
+        return False, ""
 
     date_str = now_pt.strftime("%b %d")
     res = json.loads(gmail_search(MARKETING_QUERY, 50))
@@ -1151,16 +1122,17 @@ def run_marketing_sweep(force: bool = False) -> tuple[bool, str]:
 # --------------------------------------------------------------------------
 # 8-14. Additional Maintenance Tasks
 # --------------------------------------------------------------------------
-def run_ha_battery_check(threshold: float = 15.0) -> tuple[bool, str]:
+def run_ha_battery_check(threshold: float = 15.0) -> tuple[bool, str, dict]:
     """Check IoT sensor battery levels via ha_battery_check."""
     try:
         res = subprocess.run(["python3", "/workspace/tools/ha_battery_check.py", f"--threshold={threshold}"], capture_output=True, text=True, timeout=20)
         out = res.stdout.strip()
-        if "Low Battery Alert" in out:
-            return False, out
-        return True, out or "✅ All IoT sensors healthy."
+        if res.returncode != 0 or "Failed to query" in out or "token not found" in out:
+            return False, out or "⚠️ Low battery check script exited with error.", {"has_alert": False, "error": True}
+        has_alert = "Low Battery Alert" in out
+        return True, out or "✅ All IoT sensors healthy.", {"has_alert": has_alert}
     except Exception as e:
-        return False, f"⚠️ Low battery check failed: {e}"
+        return False, f"⚠️ Low battery check failed: {e}", {"has_alert": False, "error": str(e)}
 
 def run_nas_storage_check() -> tuple[bool, str]:
     """Check NAS volume storage and RAID status."""
@@ -1173,10 +1145,42 @@ def run_nas_storage_check() -> tuple[bool, str]:
     except Exception as e:
         return False, f"⚠️ NAS storage check failed: {e}"
 
+def run_host2_backup(quiet: bool = True) -> tuple[bool, str, dict]:
+    """Execute automated local backup of Host 2 to /volumeUSB1/usbshare/."""
+    try:
+        cmd = ["python3", "/workspace/tools/backup_host2.py"]
+        if quiet:
+            cmd.append("--quiet")
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        out = res.stdout.strip()
+        err = res.stderr.strip()
+        combined = f"{out}\n{err}".strip() if err else out
+        if res.returncode != 0:
+            return False, f"⚠️ Host 2 backup failed (code {res.returncode}): {combined}", {"output": out, "error": err}
+        return True, "", {"summary": "Host 2 local USB backup completed successfully", "output": out}
+    except Exception as e:
+        return False, f"⚠️ Host 2 backup exception: {e}", {"error": str(e)}
+
+def run_host1_backup(quiet: bool = True) -> tuple[bool, str, dict]:
+    """Execute automated local backup of Host 1 to /volumeUSB1/usbshare/."""
+    try:
+        cmd = ["python3", "/workspace/tools/backup_host1.py"]
+        if quiet:
+            cmd.append("--quiet")
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=360)
+        out = res.stdout.strip()
+        err = res.stderr.strip()
+        combined = f"{out}\n{err}".strip() if err else out
+        if res.returncode != 0:
+            return False, f"⚠️ Host 1 backup failed (code {res.returncode}): {combined}", {"output": out, "error": err}
+        return True, "", {"summary": "Host 1 local USB backup completed successfully", "output": out}
+    except Exception as e:
+        return False, f"⚠️ Host 1 backup exception: {e}", {"error": str(e)}
+
 def run_ha_update_check() -> tuple[bool, str]:
     """Check for stable mature Home Assistant updates."""
     try:
-        res = subprocess.run(["python3", "/workspace/tools/ha_update_check.py", "--quiet"], capture_output=True, text=True, timeout=30)
+        res = subprocess.run(["python3", "/workspace/tools/ha_update_check.py", "check", "--quiet"], capture_output=True, text=True, timeout=30)
         out = res.stdout.strip()
         return True, out
     except Exception as e:
@@ -1228,15 +1232,6 @@ def run_core_friends_reminder(weeks: int = 8, as_of_date: str | None = None) -> 
     except Exception as e:
         return False, f"⚠️ Core friends reminder check failed: {e}"
 
-def run_token_report() -> tuple[bool, str]:
-    """Daily token and compute budget report."""
-    try:
-        from tools.token_reporter import generate_report
-        report = generate_report()
-        return True, report
-    except Exception as e:
-        return False, f"⚠️ Token report calculation failed: {e}"
-
 def run_hardcode_regex_audit() -> tuple[bool, str]:
     """Monthly codebase audit for hardcoded rules and brittle regex heuristics."""
     try:
@@ -1251,8 +1246,10 @@ def run_hardcode_regex_audit() -> tuple[bool, str]:
 def run_arr_queue_watchdog(auto_fix: bool = True, force: bool = False) -> tuple[bool, str]:
     """Audit Radarr & Sonarr queues for import errors and permission snags."""
     try:
-        from tools.arr_queue_watchdog import run_watchdog
-        has_activity, summary, _ = run_watchdog(auto_fix=auto_fix, force_dispatch=force)
+        import importlib
+        import tools.arr_queue_watchdog as aqw
+        importlib.reload(aqw)
+        has_activity, summary, _ = aqw.run_watchdog(auto_fix=auto_fix, force_dispatch=force)
         return True, summary if has_activity else "(nominal - 0 import failures)"
     except Exception as e:
         return False, f"⚠️ Arr queue watchdog failed: {e}"
@@ -1260,8 +1257,10 @@ def run_arr_queue_watchdog(auto_fix: bool = True, force: bool = False) -> tuple[
 def run_ha_reauth_watchdog(force: bool = False) -> tuple[bool, str]:
     """Audit Home Assistant integrations for re-auth and setup failures."""
     try:
-        from tools.ha_reauth_watchdog import check_ha_integrations
-        has_activity, summary, _ = check_ha_integrations(force=force)
+        import importlib
+        import tools.ha_reauth_watchdog as hrw
+        importlib.reload(hrw)
+        has_activity, summary, _ = hrw.check_ha_integrations(force=force)
         return True, summary if has_activity else "(nominal - 0 HA integration failures)"
     except Exception as e:
         return False, f"⚠️ Home Assistant re-auth watchdog failed: {e}"
@@ -1269,8 +1268,10 @@ def run_ha_reauth_watchdog(force: bool = False) -> tuple[bool, str]:
 def run_prowlarr_watchdog(force: bool = False) -> tuple[bool, str]:
     """Audit Prowlarr indexers for disabled state, backoffs, and health errors."""
     try:
-        from tools.prowlarr_watchdog import check_prowlarr
-        has_activity, summary, _ = check_prowlarr(force=force)
+        import importlib
+        import tools.prowlarr_watchdog as pw
+        importlib.reload(pw)
+        has_activity, summary, _ = pw.check_prowlarr(force=force)
         return True, summary if has_activity else "(nominal - 0 Prowlarr failures)"
     except Exception as e:
         return False, f"⚠️ Prowlarr watchdog failed: {e}"
@@ -1278,8 +1279,10 @@ def run_prowlarr_watchdog(force: bool = False) -> tuple[bool, str]:
 def run_sabnzbd_watchdog(force: bool = False) -> tuple[bool, str]:
     """Audit SABnzbd queue, disk space, and failed unpacks."""
     try:
-        from tools.sabnzbd_watchdog import check_sabnzbd
-        has_activity, summary, _ = check_sabnzbd(force=force)
+        import importlib
+        import tools.sabnzbd_watchdog as sw
+        importlib.reload(sw)
+        has_activity, summary, _ = sw.check_sabnzbd(force=force)
         return True, summary if has_activity else "(nominal - 0 SABnzbd failures)"
     except Exception as e:
         return False, f"⚠️ SABnzbd watchdog failed: {e}"
@@ -1293,12 +1296,148 @@ def run_kometa_audit(force: bool = False) -> tuple[bool, str]:
     except Exception as e:
         return False, f"⚠️ Kometa log audit failed: {e}"
 
+def run_bridge_watchdog(auto_heal: bool = True) -> tuple[bool, str]:
+    """Audit Discord bridge gateway liveness, stuck processing turns, and orphan agy processes."""
+    try:
+        from tools.bridge_watchdog import check_bridge_health
+        ok, summary, _ = check_bridge_health(auto_heal=auto_heal)
+        return ok, summary
+    except Exception as e:
+        return False, f"⚠️ Bridge watchdog execution failed: {e}"
+
+def run_weekly_grocery_staging() -> tuple[bool, str]:
+    """Ingests Home Assistant todo.shopping_list + due staples and compiles the 1-click Whole Foods AFX cart."""
+    try:
+        from tools.grocery_manager import compile_weekly_manifest
+        res = compile_weekly_manifest(include_due_staples=True)
+        manifest = res["manifest"]
+        assumed = res["assumed_in_stock"]
+        url = res["url"]
+        rec_names = res.get("recipe_names", [])
+        warnings = res.get("quantity_warnings", [])
+        costco = res.get("costco_items", [])
+        rec_count = res.get("recipes_ingested", 0)
+        rec_str = f", {rec_count} meal recipe(s)" if rec_count else ""
+
+        lines = [
+            f"🛒 **Weekly Whole Foods Cart Ready ({len(manifest)} Items)**",
+            f"• Sourced: {res['tasks_ingested']} item(s) from tasks{rec_str}, {res['staples_ingested']} due staple(s)"
+        ]
+        if rec_names:
+            lines.append(f"🍽️ **Dinners:** {', '.join(rec_names)}")
+
+        lines.append(f"\n🛒 [**1-Click Whole Foods Cart**](<{url}>)")
+        lines.append("*Tap the link above to stage items in Amazon, choose your Friday afternoon delivery window, and complete checkout.*")
+
+        if warnings:
+            lines.append("\n### ⚠️ Quantity & Packaging Checks")
+            for w in warnings:
+                lines.append(f"- {w}")
+
+        if costco:
+            lines.append(f"\n### 🛒 Separate Trip / Costco Due ({len(costco)} Items)")
+            for c in costco:
+                lines.append(f"- {c}")
+
+        if assumed:
+            lines.append("\n### 🧂 Assumed in Stock (Pantry)")
+            lines.append(f"*{', '.join(assumed)}*")
+
+        return True, "\n".join(lines)
+    except Exception as e:
+        return False, f"⚠️ Weekly grocery staging failed: {e}"
+
+def run_weekly_meal_proposal() -> tuple[bool, str]:
+    """Generates the 3-dinner weekly rotation proposal for Sunday, Tuesday, and Thursday."""
+    try:
+        from tools.meal_planner_proposal import generate_proposal, format_proposal_markdown
+        plan = generate_proposal()
+        return True, format_proposal_markdown(plan)
+    except Exception as e:
+        return False, f"⚠️ Weekly meal planning proposal failed: {e}"
+
+def run_tasks_sync() -> tuple[bool, str, dict]:
+    """Execute two-way synchronization between tasks.json and Google Tasks."""
+    try:
+        from tools.google_tasks_sync import sync_tasks
+        res = sync_tasks(quiet=True)
+        ok = res.get("ok", True)
+        # Completely silent sidecar: msg is empty so chat is never notified on nominal success.
+        # Structured details are kept in res dict for durable execution logging.
+        return ok, "", res
+    except Exception as e:
+        return False, f"⚠️ Google Tasks sync failed: {e}", {"error": str(e)}
+
+
+def run_cubs_game_notifier(force: bool = False, test: bool = False) -> tuple[bool, str, any]:
+    """Check Cubs schedule and notify ~10 minutes before first pitch."""
+    try:
+        from tools.cubs_notifier import check_cubs_game
+        return check_cubs_game(force=force, test=test)
+    except Exception as e:
+        return False, f"⚠️ Cubs game notifier error: {e}", {"error": str(e)}
+
+def run_kalshi_paper_bot():
+    """Execute Kalshi quant paper bot: weather, daily MLB matchups, and playoff futures."""
+    import subprocess
+    try:
+        outputs = []
+        # 1. Settle resolved contracts
+        subprocess.run(["python3", "/workspace/tools/kalshi_paper_bot.py", "settle"], check=False)
+        subprocess.run(["python3", "/workspace/tools/baseball_daily_quant.py", "settle"], check=False)
+        
+        # 2. Weather CLOB Scan & Trade
+        res_w = subprocess.run(["python3", "/workspace/tools/kalshi_paper_bot.py", "trade"], capture_output=True, text=True, check=False)
+        if res_w.stdout:
+            outputs.append("=== WEATHER ARBITRAGE ===\n" + res_w.stdout.strip())
+            
+        # 3. MLB Daily Matchups Scan & Trade
+        res_m = subprocess.run(["python3", "/workspace/tools/baseball_daily_quant.py", "trade"], capture_output=True, text=True, check=False)
+        if res_m.stdout:
+            outputs.append("=== MLB DAILY MATCHUPS ===\n" + res_m.stdout.strip())
+            
+        # 4. MLB Playoff Futures Scan & Trade
+        res_p = subprocess.run(["python3", "/workspace/tools/baseball_playoff_model.py", "--trade"], capture_output=True, text=True, check=False)
+        if res_p.stdout:
+            outputs.append("=== MLB PLAYOFF FUTURES ===\n" + res_p.stdout.strip())
+            
+        return True, "\n\n".join(outputs), {}
+    except Exception as e:
+        return False, f"⚠️ Kalshi quant sidecar error: {e}", {"error": str(e)}
+
+def run_kalshi_performance_review(phase="all"):
+    """Execute Kalshi paper trading evening settlement, performance review, and task board sync."""
+    import subprocess
+    try:
+        cmd = ["python3", "/workspace/tools/kalshi_performance_review.py", f"--phase={phase}"]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        output = res.stdout.strip() if res.stdout else res.stderr.strip()
+        return res.returncode == 0, output, {}
+    except Exception as e:
+        return False, f"⚠️ Kalshi review sidecar error: {e}", {"error": str(e)}
+
+def run_kalshi_autoworker():
+    """Execute autonomous 5-minute task board sprint cycle for Kalshi quant trading."""
+    import subprocess
+    try:
+        res = subprocess.run(["python3", "/workspace/tools/kalshi_autoworker.py"], capture_output=True, text=True, check=False)
+        output = res.stdout.strip() if res.stdout else res.stderr.strip()
+        return res.returncode == 0, output, {}
+    except Exception as e:
+        return False, f"⚠️ Kalshi autoworker error: {e}", {"error": str(e)}
+
 # --------------------------------------------------------------------------
 # CLI Dispatcher
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "heartbeat"
-    if action in ("arr_queue", "arr_watchdog", "queue"):
+    if action in ("cubs", "cubs_game", "cubs_notifier"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("cubs_game_notifier", "Cubs Game Day Notifier", run_cubs_game_notifier, force=force, test=test)
+        if rep:
+            print(rep)
+    elif action in ("arr_queue", "arr_watchdog", "queue"):
         force = "--force" in sys.argv or "-f" in sys.argv
         ok, rep, _ = run_sidecar_job("arr_queue_watchdog", "Arr Queue Watchdog", run_arr_queue_watchdog, force=force)
         if rep and rep != "(nominal - 0 import failures)":
@@ -1322,6 +1461,11 @@ if __name__ == "__main__":
         force = "--force" in sys.argv or "-f" in sys.argv
         ok, rep, _ = run_sidecar_job("kometa_audit", "Kometa Post-Run Audit", run_kometa_audit, force=force)
         if rep and rep != "(nominal - Kometa run clean)":
+            print(rep)
+    elif action in ("bridge_watchdog", "bridge_check", "watchdog_bridge"):
+        no_heal = "--no-heal" in sys.argv
+        ok, rep, _ = run_sidecar_job("bridge_watchdog", "Bridge Liveness Watchdog", run_bridge_watchdog, auto_heal=not no_heal)
+        if rep:
             print(rep)
     elif action == "heartbeat":
         ok, rep, _ = run_sidecar_job("heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
@@ -1378,6 +1522,20 @@ if __name__ == "__main__":
     elif action == "storage":
         ok, rep, _ = run_sidecar_job("nas_storage", "NAS Storage Check", run_nas_storage_check)
         print(rep)
+    elif action in ("backup_host2", "host2_backup", "backup2"):
+        verbose = "-v" in sys.argv or "--verbose" in sys.argv
+        ok, rep, extra = run_sidecar_job("host2_backup", "Host 2 Local USB Backup", run_host2_backup, quiet=not verbose)
+        if not ok:
+            print(rep)
+        elif verbose and extra and isinstance(extra, dict) and extra.get("output"):
+            print(extra["output"])
+    elif action in ("backup_host1", "host1_backup", "backup1"):
+        verbose = "-v" in sys.argv or "--verbose" in sys.argv
+        ok, rep, extra = run_sidecar_job("host1_backup", "Host 1 Local USB Backup", run_host1_backup, quiet=not verbose)
+        if not ok:
+            print(rep)
+        elif verbose and extra and isinstance(extra, dict) and extra.get("output"):
+            print(extra["output"])
     elif action == "ha_update":
         ok, rep, _ = run_sidecar_job("ha_update_check", "HA Update Check", run_ha_update_check)
         print(rep or "HA up to date.")
@@ -1387,9 +1545,6 @@ if __name__ == "__main__":
     elif action == "antigravity":
         ok, rep, _ = run_sidecar_job("update_antigravity", "Antigravity CLI Check", run_antigravity_check)
         print(rep or "Antigravity up to date.")
-    elif action in ("token_report", "tokens"):
-        ok, rep, _ = run_sidecar_job("daily_token_budget_report", "Daily Token & AI Ultra Budget Report", run_token_report)
-        print(rep)
     elif action == "morning":
         from tools.morning_dispatcher import dispatch_morning_topic
         ok, rep, _ = run_sidecar_job("morning_topic_rotation", "Crab Cavern Morning Topic Rotation", dispatch_morning_topic)
@@ -1409,6 +1564,42 @@ if __name__ == "__main__":
         from tools.session_rollover import run_daily_session_rollover
         ok, rep, _ = run_sidecar_job("session_rollover", "Daily Multi-Channel Session Rollover", run_daily_session_rollover)
         print(rep)
+    elif action in ("grocery_staging", "grocery", "cart"):
+        ok, rep, _ = run_sidecar_job("weekly_grocery_staging", "Weekly Whole Foods Grocery Staging", run_weekly_grocery_staging)
+        if rep:
+            print(rep)
+    elif action in ("meal_proposal", "meal_planner", "meals", "mealplan"):
+        ok, rep, _ = run_sidecar_job("weekly_meal_proposal", "Weekly 3-Dinner Meal Proposal", run_weekly_meal_proposal)
+        if rep:
+            print(rep)
+    elif action in ("tasks_sync", "sync_tasks", "task_sync"):
+        ok, rep, _ = run_sidecar_job("google_tasks_sync", "Google Tasks Two-Way Sync", run_tasks_sync)
+        if rep:
+            print(rep)
+        else:
+            print("(nominal - all tasks in sync)")
+    elif action in ("agora_sprint", "agora_autoworker", "agora_worker"):
+        res = subprocess.run(["python3", "/workspace/tools/agora_autoworker.py"], capture_output=True, text=True)
+        if res.stdout:
+            print(res.stdout.strip())
+        if res.stderr:
+            print(res.stderr.strip(), file=sys.stderr)
+    elif action in ("kalshi", "kalshi_paper", "kalshi_bot"):
+        ok, rep, _ = run_sidecar_job("kalshi_paper_bot", "Kalshi Weather Quant Paper Bot", run_kalshi_paper_bot)
+        if rep:
+            print(rep)
+    elif action in ("kalshi_review", "kalshi_evening"):
+        ok, rep, _ = run_sidecar_job("kalshi_evening_review", "Kalshi Paper Trading Evening Review & Model Sync", lambda: run_kalshi_performance_review(phase="evening"))
+        if rep:
+            print(rep)
+    elif action in ("kalshi_audit", "kalshi_night"):
+        ok, rep, _ = run_sidecar_job("kalshi_night_audit", "Kalshi Nightly Settlement & Quant Standup", lambda: run_kalshi_performance_review(phase="night"))
+        if rep:
+            print(rep)
+    elif action in ("kalshi_sprint", "kalshi_autoworker", "kalshi_worker"):
+        ok, rep, _ = run_sidecar_job("kalshi_quant_sprint", "Kalshi Task Board Autonomous Sprint", run_kalshi_autoworker)
+        if rep:
+            print(rep)
     elif action == "status":
         print(format_sidecar_status_summary())
     elif action == "history":

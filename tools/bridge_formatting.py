@@ -53,62 +53,401 @@ def convert_markdown_tables(text: str) -> str:
                 table_rows.append(cells)
                 i += 1
 
+            if not table_rows:
+                continue
+
+            # Check if column 0 is a Section/Group and column 1 is the item/metric
+            has_section_col = False
+            if len(headers) >= 4 and headers[0].lower() in ("segment", "section", "category", "group", "type"):
+                has_section_col = True
+
             # Detect if this is a true comparison table
-            # True comparison: header 0 is Feature/Criteria/VS AND header 1..N are product/option names (not attribute words)
+            # True comparison: (1) header 0 is a feature/criteria/capability keyword, OR (2) header 1..N are product/system/option names (not attribute words)
             is_comparison = False
             attr_words = {
                 "count", "status", "notes", "note", "details", "detail", "description",
                 "value", "val", "cost", "price", "port", "host", "ip", "url", "link",
                 "date", "time", "type", "size", "action", "result", "finding", "resolution",
-                "state", "reason", "error", "percent", "percentage", "progress", "metric", "unit"
+                "state", "reason", "error", "percent", "percentage", "progress", "unit"
             }
-            if len(headers) >= 3:
-                h0 = headers[0].lower()
-                other_headers = [h.lower().strip() for h in headers[1:]]
-                if h0 in ("feature", "criteria", "aspect", "comparison", "vs", "versus"):
+            comparison_lead_words = {
+                "feature", "criteria", "aspect", "comparison", "vs", "versus",
+                "capability", "dimension", "spec", "specification", "category",
+                "attribute", "service", "item", "area", "property", "function", "metric", "target"
+            }
+
+            check_headers = headers[2:] if has_section_col else headers[1:]
+            h0 = re.sub(r"[^a-z0-9_-]", "", headers[0].lower())
+            other_headers = [re.sub(r"[^a-z0-9_-]", "", h.lower().strip()) for h in check_headers]
+
+            if has_section_col:
+                is_comparison = True
+            elif len(headers) >= 3:
+                if h0 in comparison_lead_words:
                     if not any(oh in attr_words for oh in other_headers):
                         is_comparison = True
+                elif not any(oh in attr_words for oh in other_headers):
+                    is_comparison = True
 
+            current_group = ""
             for row in table_rows:
                 if not row or not any(row):
                     continue
-                first = re.sub(r"^\*\*|\*\*$", "", row[0]).strip()
-                if not first:
-                    continue
 
-                if is_comparison and len(headers) >= 3:
-                    out.append(f"- **{first}**:")
-                    for col_idx in range(1, len(headers)):
+                if has_section_col:
+                    group_cell = re.sub(r"^\*\*|\*\*$", "", row[0]).strip() if len(row) > 0 else ""
+                    if group_cell:
+                        current_group = group_cell
+                        out.append(f"\n### {current_group}")
+
+                    metric_name = re.sub(r"^\*\*|\*\*$", "", row[1]).strip() if len(row) > 1 else ""
+                    if not metric_name:
+                        continue
+
+                    # Multi-system comparison sub-items
+                    vals = []
+                    for col_idx in range(2, len(headers)):
                         if col_idx < len(row):
                             val = row[col_idx].strip()
                             clean_col = re.sub(r"^\*\*|\*\*$", "", headers[col_idx]).strip()
                             if val and val not in ("—", "-"):
-                                out.append(f"  - *{clean_col}*: {val}")
-                elif len(headers) == 2 or len(row) == 2:
-                    val = row[1].strip() if len(row) > 1 else ""
-                    out.append(f"- **{first}**: {val}")
-                else:
-                    second = row[1].strip() if len(row) > 1 else ""
-                    if second in ("—", "-"):
-                        second = ""
-                    notes_parts = [c.strip() for c in row[2:] if c.strip() and c.strip() not in ("—", "-")]
-                    notes = " · ".join(notes_parts)
-
-                    if second and notes:
-                        if "(" not in second and len(second) <= 25:
-                            out.append(f"- **{first}** ({second}): {notes}")
-                        else:
-                            out.append(f"- **{first}**: {second} · {notes}")
-                    elif second:
-                        out.append(f"- **{first}** ({second})")
-                    elif notes:
-                        out.append(f"- **{first}**: {notes}")
+                                vals.append(f"*{clean_col}*: {val}")
+                    if vals:
+                        out.append(f"- **{metric_name}**: " + " · ".join(vals))
                     else:
-                        out.append(f"- **{first}**")
+                        out.append(f"- **{metric_name}**")
+                else:
+                    first = re.sub(r"^\*\*|\*\*$", "", row[0]).strip()
+                    if not first:
+                        continue
+
+                    if is_comparison and len(headers) >= 3:
+                        out.append(f"- **{first}**:")
+                        for col_idx in range(1, len(headers)):
+                            if col_idx < len(row):
+                                val = row[col_idx].strip()
+                                clean_col = re.sub(r"^\*\*|\*\*$", "", headers[col_idx]).strip()
+                                if val and val not in ("—", "-"):
+                                    out.append(f"  - *{clean_col}*: {val}")
+                    elif len(headers) == 2 or len(row) == 2:
+                        val = row[1].strip() if len(row) > 1 else ""
+                        out.append(f"- **{first}**: {val}")
+                    else:
+                        second = row[1].strip() if len(row) > 1 else ""
+                        if second in ("—", "-"):
+                            second = ""
+                        notes_parts = [c.strip() for c in row[2:] if c.strip() and c.strip() not in ("—", "-")]
+                        notes = " · ".join(notes_parts)
+
+                        if second and notes:
+                            if "(" not in second and len(second) <= 25:
+                                out.append(f"- **{first}** ({second}): {notes}")
+                            else:
+                                out.append(f"- **{first}**: {second} · {notes}")
+                        elif second:
+                            out.append(f"- **{first}** ({second})")
+                        elif notes:
+                            out.append(f"- **{first}**: {notes}")
+                        else:
+                            out.append(f"- **{first}**")
             continue
         out.append(line)
         i += 1
     return "\n".join(out)
+
+
+def dedup_repetitive_patterns(text: str, max_repeats: int = 3) -> str:
+    """Collapse runaway repetitive single lines or multi-line patterns produced by degenerative LLM loops."""
+    if not text:
+        return ""
+    lines = text.split("\n")
+    n = len(lines)
+    if n < 6:
+        return text
+
+    # Check for repeating blocks of length k (1 to 4)
+    for k in range(1, 5):
+        i = 0
+        new_lines = []
+        pattern_collapsed = False
+        while i < len(lines):
+            block = [l.strip() for l in lines[i : i + k]]
+            if any(len(l) > 3 for l in block) and i + k <= len(lines):
+                repeats = 1
+                while i + (repeats + 1) * k <= len(lines):
+                    next_block = [l.strip() for l in lines[i + repeats * k : i + (repeats + 1) * k]]
+                    if next_block == block:
+                        repeats += 1
+                    else:
+                        break
+                if repeats > max_repeats:
+                    new_lines.extend(lines[i : i + max_repeats * k])
+                    new_lines.append("... [repetitive output truncated] ...")
+                    i += repeats * k
+                    pattern_collapsed = True
+                    continue
+            new_lines.append(lines[i])
+            i += 1
+        if pattern_collapsed:
+            lines = new_lines
+
+    return "\n".join(lines)
+
+
+CLI_LEAK_LINE_PATTERNS = [
+    r"^\s*error:\s*interrupted\s*$",
+    r"^\s*error:\s*the connection to the agent was interrupted[^\n]*$",
+    r"^\s*No tools called(?:\.|\s+Waiting for [^\n]+|\s*$)",
+    r"^\s*Waiting for (?:the\s+)?(?:background\s+)?(?:task|command|subagent|process)[s]?(?:-[a-zA-Z0-9_-]+)?(?:\s+to\s+(?:complete|finish)|\s+finishes|\s+completes)?(?:\.\.\.|\.)?\s*$",
+    r"^\s*Waiting for task-[a-zA-Z0-9_-]+[^\n]*$",
+    r"^\s*I (?:will|have)\s+wait(?:ed|ing)? for [^\n]+?(?:to complete|to finish|finish|complete)\.?\s*$",
+    r"^\s*I (?:have\s+)?(?:initiated|launched|started|spawned|triggered)[^\n]+?(?:as soon as the (?:background\s+)?task\s+(?:completes|finishes)|when the (?:command|task)\s+finishes|and (?:will\s+)?wait for it to finish|the moment it completes|waiting for PID 1 to consume)[^\n]*\.?\s*$",
+    r"^\s*I will (?:review|inspect|check|analyze) the results (?:as soon as|when|once|the moment) the (?:background\s+)?task (?:completes|finishes)[^\n]*\.?\s*$",
+    r"^\s*I am pausing tool calls to allow [^\n]+? to complete in the background[^\n]*\.?\s*$",
+    r"^\s*The system will resume execution automatically once [^\n]+\.?\s*$",
+    r"^\s*I have launched [^\n]+? and will wait for it to finish[^\n]*\.?\s*$",
+    r"^\s*Tool execution was canceled\.?\s*$",
+    r"^\s*No content generated yet\.?\s*$",
+    r"^\s*\*\(\s*Response completed, but no text output was generated\s*\)\*\s*$",
+    r"^\s*⚠️\s*\*\(\s*Recovered from session transcript following process cutoff\s*\)\*\s*$",
+    r"^\s*Log:\s*file://[^\n]+$",
+    r"^\s*An async(?:hronous)? task has completed[^\n]*$",
+    r"^\s*Task ID:\s*[^\n]+$",
+    r"^\s*Task Exit Code:\s*\d+\s*$",
+    r"^\s*Task Output:\s*$",
+    r"^\s*<end of task output>\s*$",
+    r"^\s*root agent idle; waiting up to \d+s for \d+ background task\(s\)\s*$",
+    r"^\s*terminating \d+ background task\(s\) on exit\s*$",
+    r"^\s*A subagent has completed[^\n]*$",
+    r"^\s*Subagent (?:ID|Status|Output):\s*[^\n]*$",
+    r"^\s*<end of subagent output>\s*$",
+    r"^\s*\[Message\]\s+timestamp=[^\n]*$",
+    r"^\s*\[Task Update\]\s+Task\s+[^\n]*$",
+    r"^\s*</?RECEIVED_TASK_NOTIFICATION>\s*$",
+    r"^\s*Exit code:\s*\d+\s*$",
+    r"^\s*Stdout:\s*$",
+    r"^\s*Stderr:\s*$",
+    r"^\s*To authenticate, visit:\s*$",
+    r"^\s*Process\s+[a-f0-9-]+/task-[a-zA-Z0-9_-]+\s+completed with exit code\s+\d+\.?\s*(?:Output:)?\s*$",
+    r"^\s*Process\s+[^\n]+?\s+completed with exit code\s+\d+\.?\s*(?:Output:)?\s*$",
+    r"^\s*\[BridgeDaemon\][^\n]+$",
+    r"^\s*\[BridgeState\][^\n]+$",
+    r"^\s*Ran \d+ tests? in [0-9.]+s\s*$",
+    r"^\s*OK\s*$",
+    r"^\s*FAILED\s*\(.*?\)\s*$",
+    r"^\s*-{6,}\s*$",
+    r"^\s*\.{4,}\s*$",
+    r"^\s*Task Description:\s*[^\n]+$",
+    r"^\s*Task logs are available at:[^\n]+$",
+    r"^\s*Tool is running as a background task with task id:[^\n]*$",
+    r"^\s*YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS:[^\n]*$",
+    r"^\s*DO NOTHING ELSE\.?\s*$",
+    r"^\s*\.\.\.\s*\[repetitive (?:lines|output) truncated\]\s*\.\.\.\s*$",
+]
+
+
+def strip_internal_cli_chatter(text: str) -> str:
+    """Strip Antigravity CLI system messages, background task envelopes, and wait chatter."""
+    if not text:
+        return ""
+
+    # Collapse repetitive patterns first to prevent runaway repetitive loops
+    text = dedup_repetitive_patterns(text, max_repeats=3)
+
+    # 1. Block-level removals (anchored to line start so inline mentions are not eaten to EOF)
+    text = re.sub(
+        r"(?m)^\s*The following is a\s*<\s*SYSTEM_MESSAGE\s*>[\s\S]*?(?:<\s*/\s*SYSTEM_MESSAGE\s*>|\}\s*(?=[A-Z#])|$)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?m)^\s*<\s*SYSTEM_MESSAGE\s*>[\s\S]*?<\s*/\s*SYSTEM_MESSAGE\s*>\s*\n?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?m)^\s*<\s*RECEIVED_TASK_NOTIFICATION\s*>[\s\S]*?<\s*/\s*RECEIVED_TASK_NOTIFICATION\s*>\s*\n?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Unclosed standalone system / task notification blocks on their own line extending to EOF
+    text = re.sub(
+        r"(?m)^\s*<\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION)\s*>\s*\n[\s\S]*?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"^The following is a <SYSTEM_MESSAGE>[^\n]*\n*",
+        "",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    text = re.sub(r"(?:^|\n+)\s*The following is a\s*(?=\n|$)", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?m)^\s*Process\s+[^\n]+?\s+completed with exit code\s+\d+\.?\s*(?:Output:)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?m)^\s*\[BridgeDaemon\] Worker (?:for\s+)?#[a-zA-Z0-9_-]+ (?:exited cleanly|terminated)[^\n]*\n?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"Tool is running as a background task with task id:\s*[^\n]+(?:\nTask Description:[^\n]+)?(?:\nTask logs are available at:[^\n]+)?(?:\nYOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS:[^\n]+)?(?:\n\s*DO NOTHING ELSE\.?)?",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(
+        r"YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS:[\s\S]*?(?:DO NOTHING ELSE\.?|$)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"Task id\s+[\"'][^\"']+[\"']\s+(?:was\s+canceled|finished|completed|failed)[^\n]*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"Task logs are available at:\s*file://[^\n]+", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"An async(?:hronous)? task has completed[\s\S]*?<end of task output>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"An async(?:hronous)? task has completed:\s*[^\n]+(?:\s*\(State:[^\)]+\))?(?:\s*Result payload:\s*\d+)?(?:\s*Task output:\s*(?:\[[^\]\r\n]*\]|[^\r\n]*))?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"A subagent has completed[\s\S]*?<end of subagent output>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"root agent idle; waiting up to \d+s for \d+ background task\(s\)[^\n]*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"terminating \d+ background task\(s\) on exit[^\n]*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"Subagent execution in progress\.\.\.[\s\S]*?(?:If you call a tool now[^\n]*|wait for tasks or subagents\.\.?|DO NOTHING ELSE\.?)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"^\s*(?:No content generated yet\.?\s*)+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?:^|\n+)\s*No content generated yet\.?\s*(?=\n|$)",
+        "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # 2. Line-by-line scrubbing for chatter / sentinel leaks
+    lines = text.split("\n")
+    cleaned_lines = []
+    for line in lines:
+        matched = False
+        for pat in CLI_LEAK_LINE_PATTERNS:
+            if re.search(pat, line, re.IGNORECASE):
+                matched = True
+                break
+        if not matched:
+            cleaned_lines.append(line)
+
+    res = "\n".join(cleaned_lines)
+    return re.sub(r"\n{3,}", "\n\n", res).strip()
+
+
+def is_internal_cli_leak(text: str) -> bool:
+    """Return True if text contains only internal CLI artifacts, task wait chatter, or empty sentinels."""
+    if not text or not isinstance(text, str):
+        return True
+    orig_lower = text.lower().strip()
+    if re.match(r"^process\s+[^\n]+?\s+completed with exit code", orig_lower):
+        return True
+    if orig_lower.startswith("tool is running as a background task with task id"):
+        return True
+    if orig_lower.startswith("an async task has completed") or orig_lower.startswith("an asynchronous task has completed"):
+        return True
+
+    cleaned = strip_internal_cli_chatter(text).strip()
+    if not cleaned:
+        return True
+    lower = cleaned.lower().strip()
+    if lower in (
+        "[no_reply]",
+        "no_reply",
+        "[no_op]",
+        "no_op",
+        "reply:none",
+        "reply: none",
+        "none",
+        "*(response completed, but no text output was generated)*",
+        "no content generated yet",
+        "no content generated yet.",
+        "... [repetitive lines truncated] ...",
+        "... [repetitive output truncated] ...",
+    ):
+        return True
+    if lower.startswith("error: interrupted") or lower == "interrupted":
+        return True
+
+    # Standalone pure CLI status, process completion, or task completion notices
+    if re.match(r"^process\s+[^\n]+?\s+completed with exit code", lower):
+        return True
+    if lower.startswith("an async task has completed") or lower.startswith("an asynchronous task has completed"):
+        return True
+
+    # If remaining lines are exclusively internal daemon/system/test lines without user-facing content
+    remaining_lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
+    if remaining_lines and all(
+        re.match(
+            r"^(\[BridgeDaemon\]|\[BridgeState\]|Process\s+[^\n]+completed|Ran \d+ test|OK$|FAILED|\.\.\.|-{5,}|<end of|<RECEIVED_TASK_NOTIFICATION)",
+            l,
+            re.IGNORECASE,
+        )
+        for l in remaining_lines
+    ):
+        return True
+
+    # Standalone pure CLI status or task completion notices without substantive user content
+    words = [w for w in cleaned.split() if any(c.isalnum() for c in w)]
+    if len(words) <= 15:
+        if "root agent idle; waiting up to" in lower:
+            return True
+        if "terminating" in lower and "background task(s) on exit" in lower:
+            return True
+        if lower.startswith("task id") and ("canceled" in lower or "completed" in lower or "failed" in lower):
+            return True
+        if "waiting for task" in lower:
+            return True
+
+    return False
 
 
 def format_for_discord(text: str) -> str:
@@ -199,90 +538,10 @@ def format_for_discord(text: str) -> str:
     # 4c. Tighten loose lists where a parent list item is followed by an empty line before its sub-bullets
     text = re.sub(r"(^[ \t]*(?:[-*]|\d+\.)\s+[^\n]+)\n\n+([ \t]{2,}(?:[-*]|\d+\.)\s+)", r"\1\n\2", text, flags=re.MULTILINE)
 
-    # 5. Strip internal agent task lifecycle envelopes and echoed system progress headers
-    text = re.sub(
-        r"(?:The following is a\s+)?<SYSTEM_MESSAGE>[\s\S]*?</SYSTEM_MESSAGE>",
-        "",
-        text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    text = re.sub(
-        r"(?:^|\n+)\s*The following is a\s*(?=\n|$)",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"An asynchronous task has completed:\s*[^\n]+\s*\(State:\s*[^\)]+\)(?:\s*Result payload:\s*\d+)?(?:\s*Task output:\s*(?:\[[^\]\r\n]*\]|[^\r\n]*))?",
-        "",
-        text,
-    )
-    text = re.sub(
-        r"Tool is running as a background task with task id:\s*[^\n]+(?:\nTask Description:[^\n]+)?(?:\nTask logs are available at:[^\n]+)?(?:\nYOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS:[^\n]+)?(?:\n\s*DO NOTHING ELSE\.)?",
-        "",
-        text,
-        flags=re.DOTALL,
-    )
-    text = re.sub(
-        r"Subagent execution in progress\.\.\.[\s\S]*?(?:If you call a tool now[^\n]*|wait for tasks or subagents\.\.?|DO NOTHING ELSE\.?)",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
+    # 5. Strip internal agent task lifecycle envelopes, CLI leak lines, and intermediate progress chatter
+    text = strip_internal_cli_chatter(text)
 
-    # 5b. Strip Antigravity CLI internal placeholder sentinels
-    text = re.sub(
-        r"^\s*(?:No content generated yet\.?\s*)+",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"(?:^|\n+)\s*No content generated yet\.?\s*(?=\n|$)",
-        "\n",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    # 6. Strip intermediate background task wait and launch self-narration chatter
-    text = re.sub(
-        r"(?:^|\n+|\.\s+)\s*I (?:have\s+)?(?:initiated|launched|started|spawned|triggered)[^\n]+?(?:as soon as the (?:background\s+)?task\s+(?:completes|finishes)|when the (?:command|task)\s+finishes|and (?:will\s+)?wait for it to finish|the moment it completes|waiting for PID 1 to consume)[^\n]*\.?",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"(?:^|\n+|\.\s+)\s*I will (?:review|inspect|check|analyze) the results (?:as soon as|when|once|the moment) the (?:background\s+)?task (?:completes|finishes)[^\n]*\.?",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"(?:^|\n+|\.\s+)\s*I am pausing tool calls to allow [^\n]+? to complete in the background[^\n]*\.?",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"(?:^|\n+|\.\s+)\s*The system will resume execution automatically once [^\n]+\.?",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"(?:^|\n+|\.\s+)\s*I have launched [^\n]+? and will wait for it to finish[^\n]*\.?",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"(?:^|\n+)\s*Waiting for task-\d+ to complete\.\.\.?",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    # 7. Sanitize reaction GIFs: verify Tenor links are live (HTTP 200) and replace 404s with working fallbacks
+    # 6. Sanitize reaction GIFs: verify Tenor links are live (HTTP 200) and replace 404s with working fallbacks
     text = sanitize_reaction_gifs(text)
 
     # 8. Ensure handoff envelopes include physical Discord mentions for peer bots
@@ -305,8 +564,11 @@ def sanitize_reaction_gifs(text: str) -> str:
 
     gif_url_pattern = r"https?://(?:www\.)?(?:tenor\.com/view/[a-zA-Z0-9_\-]+|giphy\.com/gifs/[a-zA-Z0-9_\-]+)"
     gif_urls = re.findall(gif_url_pattern, text)
+    filler_words = {"gif", "gifs", "the", "a", "an", "and", "or", "of", "in", "to", "for", "with", "view", "hd"}
+
     for url in set(gif_urls):
         is_ok = False
+        final_dest_url = url
         try:
             req = urllib.request.Request(
                 url,
@@ -315,9 +577,28 @@ def sanitize_reaction_gifs(text: str) -> str:
             )
             with urllib.request.urlopen(req, timeout=2.0) as resp:
                 if resp.status == 200:
-                    is_ok = True
+                    raw_geturl = resp.geturl() if hasattr(resp, "geturl") else url
+                    final_url = raw_geturl if isinstance(raw_geturl, str) else url
+                    if "tenor.com/view/" in url and final_url != url:
+                        orig_slug = url.split("/view/")[-1].lower()
+                        final_slug = final_url.split("/view/")[-1].lower()
+                        orig_words = {w for w in re.findall(r"[a-z0-9]+", orig_slug) if w not in filler_words and not w.isdigit()}
+                        final_words = {w for w in re.findall(r"[a-z0-9]+", final_slug) if w not in filler_words and not w.isdigit()}
+                        overlap = orig_words & final_words
+                        if not overlap and (orig_words or final_words):
+                            print(f"[BridgeFormatting] ⚠️ Hallucinated Tenor URL rejected: {url} redirected to {final_url} (0 word overlap)", file=sys.stderr)
+                            is_ok = False
+                        else:
+                            is_ok = True
+                            final_dest_url = final_url
+                    else:
+                        is_ok = True
         except Exception:
             is_ok = False
+
+        if is_ok and final_dest_url != url:
+            text = text.replace(url, final_dest_url)
+            url = final_dest_url
 
         if not is_ok:
             try:
@@ -430,12 +711,9 @@ class AgyStreamParser:
 
     @staticmethod
     def _is_silence_or_placeholder(text: str) -> bool:
-        cleaned = text.strip().lower()
-        if cleaned in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none", ""):
+        if not text or not isinstance(text, str):
             return True
-        if cleaned.rstrip(".") == "no content generated yet":
-            return True
-        return False
+        return is_internal_cli_leak(text)
 
     def process_event(self, event: dict) -> None:
         if not isinstance(event, dict):
@@ -491,7 +769,7 @@ class AgyStreamParser:
                     curr = "".join(self.accumulated_segment).strip()
                     if curr:
                         if self._is_silence_or_placeholder(curr):
-                            if curr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
+                            if curr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none") or is_internal_cli_leak(curr):
                                 self.is_explicit_silence = True
                         else:
                             self.last_substantive_response = curr
@@ -546,30 +824,33 @@ class AgyStreamParser:
     def get_final_response(self, fallback_result: str = "") -> str:
         curr = "".join(self.accumulated_segment).strip()
 
-        # Check if the current segment is an explicit silence request
-        if curr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
+        # Check if the current segment is an explicit silence request or internal CLI leak
+        if curr and (curr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none") or is_internal_cli_leak(curr)):
             if not self.last_substantive_response or self._is_silence_or_placeholder(self.last_substantive_response):
                 return "[NO_REPLY]"
 
         # 1. Check current segment after last tool
         if curr and not self._is_silence_or_placeholder(curr):
             clean = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", curr, flags=re.IGNORECASE).strip()
+            clean = strip_internal_cli_chatter(clean)
             if clean and not self._is_silence_or_placeholder(clean):
                 return clean
 
         # 2. Check last substantive response before an asynchronous system message
         if self.last_substantive_response and not self._is_silence_or_placeholder(self.last_substantive_response):
             clean = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", self.last_substantive_response, flags=re.IGNORECASE).strip()
+            clean = strip_internal_cli_chatter(clean)
             if clean and not self._is_silence_or_placeholder(clean):
                 return clean
 
         # 3. Check final result response from agy
         frr = self.final_result_response.strip() or fallback_result.strip()
         if frr:
-            if frr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none"):
+            if frr.lower() in ("[no_reply]", "no_reply", "[no_op]", "no_op", "reply:none", "reply: none", "none") or is_internal_cli_leak(frr):
                 if not self.last_substantive_response or self._is_silence_or_placeholder(self.last_substantive_response):
                     return "[NO_REPLY]"
             clean_frr = re.sub(r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", frr, flags=re.IGNORECASE).strip()
+            clean_frr = strip_internal_cli_chatter(clean_frr)
             if clean_frr and not self._is_silence_or_placeholder(clean_frr):
                 return clean_frr
 
@@ -587,7 +868,7 @@ def extract_agent_response(raw_text: str, conv_id: str | None = None) -> str:
     if not raw_text:
         if conv_id:
             harvested = harvest_transcript_response(conv_id)
-            if harvested:
+            if harvested and not is_internal_cli_leak(harvested):
                 return format_for_discord(harvested)
         return "*(Response completed, but no text output was generated)*"
 
@@ -603,6 +884,8 @@ def extract_agent_response(raw_text: str, conv_id: str | None = None) -> str:
             break
 
     if not has_json:
+        if is_internal_cli_leak(text):
+            return "[NO_REPLY]"
         return format_for_discord(text)
 
     parser = AgyStreamParser(conv_id=conv_id)
@@ -611,7 +894,7 @@ def extract_agent_response(raw_text: str, conv_id: str | None = None) -> str:
 
     final_resp = parser.get_final_response()
 
-    if final_resp == "[NO_REPLY]":
+    if is_internal_cli_leak(final_resp):
         return "[NO_REPLY]"
 
     if final_resp:
@@ -621,7 +904,7 @@ def extract_agent_response(raw_text: str, conv_id: str | None = None) -> str:
     target_cid = conv_id or parser.conv_id
     if target_cid:
         harvested = harvest_transcript_response(target_cid)
-        if harvested:
+        if harvested and not is_internal_cli_leak(harvested):
             return format_for_discord(harvested)
 
     # Fallback filter for plain text outside JSON lines
@@ -637,7 +920,10 @@ def extract_agent_response(raw_text: str, conv_id: str | None = None) -> str:
         clean_lines.append(l)
 
     if clean_lines:
-        return format_for_discord("\n".join(clean_lines))
+        cand = format_for_discord("\n".join(clean_lines))
+        if not is_internal_cli_leak(cand):
+            return cand
+        return "[NO_REPLY]"
 
     return "*(Response completed, but no text output was generated)*"
 
@@ -668,19 +954,60 @@ def chunk_text(text: str, max_len: int = 1980) -> list[str]:
     in_code_block = False
     code_lang = ""
 
-    for line in lines:
+    for idx, line in enumerate(lines):
         stripped = line.strip()
         is_code_fence = stripped.startswith("```")
 
-        # If entering a code block and current chunk already has substantial text (>half max_len),
-        # break early so the entire code block starts cleanly on a new message.
-        if is_code_fence and not in_code_block and current_len > (max_len // 2):
-            if current_chunk:
+        # If entering a code block, look ahead to closing fence to see if the entire block fits in current_chunk.
+        # If it fits within the remaining budget of current_chunk, DO NOT break early (keeps handoff envelopes
+        # and short code snippets intact with the preceding text).
+        # Only break early if the block would overflow the current chunk AND current_chunk has text.
+        if is_code_fence and not in_code_block and current_chunk:
+            block_len = len(line)
+            found_close = False
+            for j in range(idx + 1, len(lines)):
+                block_len += len(lines[j])
+                if lines[j].strip().startswith("```"):
+                    found_close = True
+                    break
+            if found_close and (current_len + block_len > max_len):
                 chunks.append("".join(current_chunk).strip())
                 current_chunk = []
                 current_len = 0
 
         overhead = (len(code_lang) + 12) if in_code_block else 0
+
+        # If a single line exceeds max_len on its own, flush current chunk and split the line
+        if len(line) + overhead > max_len:
+            if current_chunk:
+                if in_code_block:
+                    current_chunk.append("\n```\n")
+                chunks.append("".join(current_chunk).strip())
+                current_chunk = []
+                current_len = 0
+                if in_code_block:
+                    prefix = f"```{code_lang}\n"
+                    current_chunk.append(prefix)
+                    current_len = len(prefix)
+
+            rem = line
+            effective_max = max_len - (len(code_lang) + 12 if in_code_block else 0)
+            while len(rem) > effective_max:
+                split_idx = rem.rfind(" ", 0, effective_max)
+                if split_idx <= 0:
+                    split_idx = effective_max
+                sub_part = rem[:split_idx].rstrip()
+                if in_code_block:
+                    chunks.append(f"{sub_part}\n```")
+                    rem = f"```{code_lang}\n" + rem[split_idx:].lstrip()
+                else:
+                    chunks.append(sub_part)
+                    rem = rem[split_idx:].lstrip()
+
+            if rem and rem.strip():
+                current_chunk.append(rem)
+                current_len += len(rem)
+            continue
 
         if current_len + len(line) + overhead > max_len:
             if current_chunk:
@@ -1099,7 +1426,8 @@ def parse_interactive_choices(text: str, quick_choice_view_cls=None, button_choi
     for m in matches:
         raw_choices = m.group(1).strip()
         delim = "|" if "|" in raw_choices else ","
-        choices = [c.strip() for c in raw_choices.split(delim) if c.strip()]
+        choices = [c.strip().strip("'\"`“”‘’").strip() for c in raw_choices.split(delim) if c.strip()]
+        choices = [c for c in choices if c]
         if choices and not all(c in ("...", "…", "Option 1", "Option 2", "Option 3") for c in choices):
             parsed_choices = choices
             valid_match = m
@@ -1109,4 +1437,67 @@ def parse_interactive_choices(text: str, quick_choice_view_cls=None, button_choi
         view = quick_choice_view_cls(parsed_choices, callback_fn=button_choice_fn)
         return clean_text, view
     return text, None
+
+
+def parse_agy_error(text: str) -> dict | None:
+    """Extract and parse structured AGY_ERROR payload from output or stderr stream.
+
+    The Antigravity CLI v1.2.6+ emits:
+    AGY_ERROR: {"canonical_status":..., "code":..., "retryable":..., "error_id":..., "short_error":...}
+    on stderr and exits with code 3 on agent/model API failures.
+    """
+    if not text:
+        return None
+
+    for line in text.splitlines():
+        if "AGY_ERROR:" in line:
+            payload_str = line.split("AGY_ERROR:", 1)[1].strip()
+            try:
+                data = json.loads(payload_str)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+            m = re.search(r"\{.*?\}", payload_str)
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    pass
+    return None
+
+
+def format_agy_error_message(err: dict, elapsed_sec: int = 0, pid_str: str = "") -> str:
+    """Format structured AGY_ERROR payload into an actionable Discord diagnostic."""
+    canonical = err.get("canonical_status") or err.get("status") or "API_FAILURE"
+    code = err.get("code") or err.get("http_code") or err.get("grpc_code") or ""
+    retryable = err.get("retryable")
+    error_id = err.get("error_id") or err.get("id") or ""
+    msg = (
+        err.get("short_error")
+        or err.get("message")
+        or err.get("error")
+        or "Upstream model API failure"
+    )
+
+    header = "⚠️ **Model API Failure (CLI Exit Code 3):**"
+    lines = [header, f"\n{msg}\n"]
+
+    status_str = f"`{canonical}`"
+    if code:
+        status_str += f" (Code {code})"
+    lines.append(f"• **Status:** {status_str}")
+
+    if error_id:
+        lines.append(f"• **Error ID:** `{error_id}`")
+    if retryable is not None:
+        lines.append(f"• **Retryable:** {'Yes' if retryable else 'No'}")
+    if elapsed_sec:
+        lines.append(f"• **Elapsed:** {elapsed_sec}s")
+    if pid_str:
+        lines.append(f"• **Process:** `{pid_str}`")
+
+    return "\n".join(lines)
 

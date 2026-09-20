@@ -105,6 +105,77 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             # Turn queue should not be enqueued (bypasses full LLM turn)
             mock_turn_queue.put.assert_not_called()
 
+    async def test_host2_backup_silent(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_turn_queue = AsyncMock()
+
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "", {"summary": "Host 2 local USB backup completed successfully"})):
+            await bshed.dispatch_scheduled_prompt(
+                "Run the Host 2 local USB backup using /workspace/tools/sidecars.py backup_host2. Silent sidecar execution (silent unless error).",
+                "Host 2 Local USB Backup",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue
+            )
+            mock_channel.send.assert_not_called()
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_host2_backup_error(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_turn_queue = AsyncMock()
+
+        err_msg = "⚠️ Host 2 backup failed (code 1): pg_dump failed"
+        with patch("tools.sidecars.run_sidecar_job", return_value=(False, err_msg, {"error": "pg_dump failed"})):
+            await bshed.dispatch_scheduled_prompt(
+                "Run the Host 2 local USB backup using /workspace/tools/sidecars.py backup_host2. Silent sidecar execution (silent unless error).",
+                "Host 2 Local USB Backup",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue
+            )
+            mock_channel.send.assert_called_once_with(err_msg)
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_host1_backup_silent(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_turn_queue = AsyncMock()
+
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "", {"summary": "Host 1 local USB backup completed successfully"})):
+            await bshed.dispatch_scheduled_prompt(
+                "Run the Host 1 local USB backup using /workspace/tools/sidecars.py backup_host1. Silent sidecar execution (silent unless error).",
+                "Host 1 Local USB Backup",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue
+            )
+            mock_channel.send.assert_not_called()
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_host1_backup_error(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_turn_queue = AsyncMock()
+
+        err_msg = "⚠️ Host 1 backup failed (code 1): docker exec failed"
+        with patch("tools.sidecars.run_sidecar_job", return_value=(False, err_msg, {"error": "docker exec failed"})):
+            await bshed.dispatch_scheduled_prompt(
+                "Run the Host 1 local USB backup using /workspace/tools/sidecars.py backup_host1. Silent sidecar execution (silent unless error).",
+                "Host 1 Local USB Backup",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue
+            )
+            mock_channel.send.assert_called_once_with(err_msg)
+            mock_turn_queue.put.assert_not_called()
+
+
     async def test_should_run_job_on_time(self):
         now = 1788360000.0
         job = {
@@ -450,8 +521,161 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(kwargs["view"].children), 4)
         self.assertEqual(kwargs["view"].children[0].label, "Lock In Menu")
 
+    async def test_outbox_flush_chunks_large_message(self):
+        """Verify outbox messages > 2,000 chars (e.g. 2,527 chars) are defensively chunked into sends <= 1900 chars."""
+        from tools.bridge_handlers import QuickChoiceView
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        scheduler = bshed.KarakosScheduler(
+            dispatch_fn=AsyncMock(),
+            bot=mock_bot,
+            quick_choice_view_cls=QuickChoiceView,
+            button_choice_fn=AsyncMock(),
+        )
+
+        # Construct 2,527 character message (exactly matching the evening incident)
+        large_body = "Line of standup status details with actionable context.\n" * 45
+        self.assertGreater(len(large_body), 2000)
+
+        outbox_msg = {
+            "id": "outbox-test-large",
+            "channel": "zero-chat",
+            "channel_id": 1542081375287640084,
+            "content": large_body + "\n\n[CHOICES: Proceed | Abort]"
+        }
+
+        with patch("tools.outbox.flush_pending_messages", return_value=[outbox_msg]):
+            await scheduler.flush_outbox_queue()
+
+        self.assertGreater(mock_channel.send.await_count, 1)
+        for call_args in mock_channel.send.await_args_list:
+            chunk = call_args[0][0]
+            self.assertLessEqual(len(chunk), 1900)
+
+        # Choice view must be attached only to the final chunk
+        last_call_kwargs = mock_channel.send.await_args_list[-1][1]
+        self.assertIn("view", last_call_kwargs)
+        self.assertIsInstance(last_call_kwargs["view"], QuickChoiceView)
+
+    async def test_outbox_flush_banana_stand_chunks_large_message(self):
+        """Verify large messages targeting #the-banana-stand are chunked and guarded by Banana mutex."""
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        scheduler = bshed.KarakosScheduler(
+            dispatch_fn=AsyncMock(),
+            bot=mock_bot,
+        )
+
+        large_banana_msg = "🍌 Standup RFC Proposal Content: " + ("x" * 2400)
+        outbox_msg = {
+            "id": "outbox-test-banana-large",
+            "channel": "the-banana-stand",
+            "channel_id": 1534436119888793750,
+            "content": large_banana_msg
+        }
+
+        with patch("tools.outbox.flush_pending_messages", return_value=[outbox_msg]), \
+             patch("tools.banana.claim") as mock_claim, \
+             patch("tools.banana.release") as mock_release:
+            await scheduler.flush_outbox_queue()
+
+        mock_claim.assert_called_once_with(subject="outbox-test-banana-large")
+        mock_release.assert_called_once()
+        self.assertGreater(mock_channel.send.await_count, 1)
+        for call_args in mock_channel.send.await_args_list:
+            chunk = call_args[0][0]
+            self.assertLessEqual(len(chunk), 1900)
+
+    async def test_outbox_flush_dlq_on_send_failure(self):
+        """Verify per-message failure isolation and dead-letter queue logging."""
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        # First message fails (e.g. Discord 400 or HTTP error), second succeeds
+        mock_channel.send.side_effect = [Exception("HTTP 400 Bad Request: Invalid Form Body"), None]
+        mock_bot.get_channel.return_value = mock_channel
+
+        scheduler = bshed.KarakosScheduler(
+            dispatch_fn=AsyncMock(),
+            bot=mock_bot,
+        )
+
+        msg1 = {"id": "outbox-fail-1", "channel": "lounge", "channel_id": 1534452820995080192, "content": "bad msg"}
+        msg2 = {"id": "outbox-succ-2", "channel": "lounge", "channel_id": 1534452820995080192, "content": "good msg"}
+
+        with patch("tools.outbox.flush_pending_messages", return_value=[msg1, msg2]), \
+             patch("builtins.open", unittest.mock.mock_open()) as mock_file:
+            await scheduler.flush_outbox_queue()
+
+        # Both sends were attempted despite first error
+        self.assertEqual(mock_channel.send.await_count, 2)
+        # DLQ file was written
+        mock_file.assert_called()
+
+    async def test_long_running_job_does_not_block_scheduler_or_heartbeat(self):
+        """Verify long-running sidecars (e.g. dreaming pass) run in background without blocking evaluate or heartbeats."""
+        job_started = asyncio.Event()
+        job_finish = asyncio.Event()
+
+        async def slow_dispatch(prompt, job_name=None, channel_id=None):
+            job_started.set()
+            await job_finish.wait()
+
+        mock_bot = MagicMock()
+        mock_bot.is_ready.return_value = True
+        mock_bot.latency = 0.05
+
+        scheduler = bshed.KarakosScheduler(
+            dispatch_fn=slow_dispatch,
+            bot=mock_bot,
+        )
+
+        test_job = {
+            "id": "dream",
+            "name": "Dreaming Consolidation",
+            "enabled": True,
+            "schedule_type": "daily",
+            "hour_pt": 1,
+            "minute_pt": 45,
+            "next_run_ts": 100.0,
+            "prompt": "Run dreaming consolidation"
+        }
+
+        with patch("tools.scheduler_tool.load_schedule", return_value=[test_job]), \
+             patch("tools.bridge_scheduler.should_run_job", return_value=(True, "due")), \
+             patch("tools.scheduler_tool.save_schedule"):
+            
+            # 1. _evaluate_and_dispatch_jobs should return immediately (non-blocking)
+            await scheduler._evaluate_and_dispatch_jobs()
+            
+            # Wait until the background task has actually started executing
+            await asyncio.wait_for(job_started.wait(), timeout=1.0)
+            self.assertEqual(len(scheduler._active_job_tasks), 1)
+
+            # 2. Heartbeat loop should still update liveness_beacon while job is running
+            scheduler._running = True
+            with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError()]):
+                await scheduler._heartbeat_loop()
+
+            self.assertTrue(bs.BEACON_FILE.exists())
+            with open(bs.BEACON_FILE) as bf:
+                beacon_data = json.load(bf)
+            self.assertEqual(beacon_data.get("gateway_status"), "connected")
+            self.assertIsNotNone(beacon_data.get("gateway_heartbeat"))
+
+            # 3. Clean up the slow job
+            job_finish.set()
+            if scheduler._active_job_tasks:
+                await asyncio.gather(*list(scheduler._active_job_tasks))
+            self.assertEqual(len(scheduler._active_job_tasks), 0)
+            scheduler._running = False
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

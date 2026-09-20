@@ -237,7 +237,7 @@ DEFAULT_JOBS = [
         "enabled": True,
         "schedule_type": "weekly",
         "day_of_week": 6,  # Sunday
-        "hour_pt": 8,
+        "hour_pt": 20,  # 8:00 PM PT
         "minute_pt": 0,
         "prompt": "Run the Option B weekly proactive digest using /workspace/tools/weekly_digest.py.",
         "catchup_if_missed": False
@@ -247,20 +247,10 @@ DEFAULT_JOBS = [
         "name": "Plex Weekly New Media Digest",
         "enabled": True,
         "schedule_type": "weekly",
-        "day_of_week": 6,  # Sunday
-        "hour_pt": 9,
+        "day_of_week": 4,  # Friday
+        "hour_pt": 16,  # 4:00 PM PT
         "minute_pt": 0,
         "prompt": "Run the Plex weekly new media digest using /workspace/tools/plex_weekly_digest.py.",
-        "catchup_if_missed": False
-    },
-    {
-        "id": "daily_token_budget_report",
-        "name": "Daily Token & AI Ultra Budget Report",
-        "enabled": True,
-        "schedule_type": "daily",
-        "hour_pt": 23,
-        "minute_pt": 59,
-        "prompt": "Run the daily token & Google AI Ultra compute budget usage report using /workspace/tools/sidecars.py token_report.",
         "catchup_if_missed": False
     },
     {
@@ -274,20 +264,52 @@ DEFAULT_JOBS = [
         "prompt": "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics.",
         "catchup_if_missed": True,
         "catchup_window_seconds": 86400
+    },
+    {
+        "id": "host2_backup",
+        "name": "Host 2 Local USB Backup",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 3,
+        "minute_pt": 30,
+        "prompt": "Run the Host 2 local USB backup using /workspace/tools/sidecars.py backup_host2. Silent sidecar execution (silent unless error).",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 14400
+    },
+    {
+        "id": "host1_backup",
+        "name": "Host 1 Local USB Backup",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 3,
+        "minute_pt": 45,
+        "prompt": "Run the Host 1 local USB backup using /workspace/tools/sidecars.py backup_host1. Silent sidecar execution (silent unless error).",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 14400
+    },
+    {
+        "id": "bridge_watchdog",
+        "name": "Bridge Liveness Watchdog",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 300,
+        "prompt": "Run the bridge liveness & gateway watchdog check using /workspace/tools/sidecars.py bridge_watchdog. Auto-heals and alerts only if degraded (silent when nominal).",
+        "catchup_if_missed": False
     }
 ]
 
 def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
     """Compute the next Unix timestamp for a job."""
-    now_pt = datetime.fromtimestamp(from_ts or time.time(), tz=PT)
+    now_ts = from_ts or time.time()
+    now_pt = datetime.fromtimestamp(now_ts, tz=PT)
     stype = job.get("schedule_type", "daily")
 
     if stype == "interval":
         interval = job.get("interval_seconds", 7200)
         last = job.get("last_run_ts")
-        if last:
-            return last + interval
-        return now_pt.timestamp() + interval
+        if last and (last + interval) > now_ts:
+            return float(last + interval)
+        return float(now_ts + interval)
 
     elif stype == "daily":
         h = job.get("hour_pt", 0)
@@ -349,8 +371,9 @@ SIDECAR_ALIASES = {
     "dockhand_update": ["dockhand_check", "dockhand_update"],
     "weekly_proactive_digest": ["weekly_digest", "weekly_proactive_digest"],
     "plex_weekly_digest": ["plex_weekly_digest"],
-    "daily_token_budget_report": ["daily_token_report", "token_report", "daily_token_budget_report"],
-    "monthly_hardcode_regex_audit": ["monthly_hardcode_regex_audit", "code_audit", "hardcode_audit", "regex_audit"]
+    "monthly_hardcode_regex_audit": ["monthly_hardcode_regex_audit", "code_audit", "hardcode_audit", "regex_audit"],
+    "host2_backup": ["host2_backup", "backup_host2", "backup2"],
+    "host1_backup": ["host1_backup", "backup_host1", "backup1"]
 }
 
 def get_last_execution_for_job(job_info: str | dict) -> tuple[float | None, str | None]:
@@ -464,9 +487,13 @@ def format_schedule_summary() -> str:
         status = "🟢 Active" if j.get("enabled", True) else "⏸️ Paused"
         next_dt = datetime.fromtimestamp(j["next_run_ts"], tz=PT)
         time_diff = next_dt - now_pt
-        hours, remainder = divmod(int(time_diff.total_seconds()), 3600)
-        minutes, _ = divmod(remainder, 60)
-        rel = f"in {hours}h {minutes}m" if hours > 0 else f"in {minutes}m"
+        total_sec = int(time_diff.total_seconds())
+        if total_sec < 0:
+            rel = "due now"
+        else:
+            hours, remainder = divmod(total_sec, 3600)
+            minutes, _ = divmod(remainder, 60)
+            rel = f"in {hours}h {minutes}m" if hours > 0 else f"in {minutes}m"
         time_str = next_dt.strftime("%a %b %-d at %I:%M %p PT")
         
         out.append(f"• **{j['name']}** ({status}): Next run `{time_str}` ({rel})")

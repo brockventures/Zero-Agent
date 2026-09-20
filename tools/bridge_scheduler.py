@@ -20,6 +20,7 @@ from tools.bridge_state import (
     BOT_STATUS_FILE,
     TARGET_CHANNEL_ID,
     HOMELAB_CHANNEL_ID,
+    VAULT_CHANNEL_ID,
     PT_TZ,
     update_beacon,
     get_channel_session_id,
@@ -52,6 +53,10 @@ async def dispatch_scheduled_prompt(
 ):
     """Inject a scheduled sidecar prompt into the message queue with anti-storm guard."""
     global LAST_SCHEDULED_DISPATCH
+
+    # Strictly isolate all Kalshi quant paper trading sidecars to #vault
+    if "kalshi" in job_name.lower() or "kalshi" in prompt.lower():
+        channel_id = VAULT_CHANNEL_ID
 
     # Anti-storm guard: prevent any job from dispatching more than once per 5 minutes
     now_ts = time.time()
@@ -99,8 +104,10 @@ async def dispatch_scheduled_prompt(
     # Heartbeat sweep: silent execution unless degraded
     if job_name == "Heartbeat Sweep" or "sidecars.py heartbeat" in prompt:
         try:
-            from tools.sidecars import run_heartbeat_sweep
-            healthy, report, _ = await _run_sidecar_job_async("heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
+            import importlib
+            import tools.sidecars
+            importlib.reload(tools.sidecars)
+            healthy, report, _ = await _run_sidecar_job_async("heartbeat", "Heartbeat Sweep", tools.sidecars.run_heartbeat_sweep)
             if not healthy and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -361,7 +368,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Arr queue & import check: silent unless import issues found
-    if "arr_queue" in prompt or job_name in ("Arr Queue & Import Watchdog", "Arr Queue Watchdog"):
+    if "arr_queue" in prompt or job_name in ("Arr Queue & Import Watchdog", "Arr Queue Watchdog", "Arr Queue & Health Watchdog"):
         try:
             from tools.sidecars import run_arr_queue_watchdog
             ok, out, _ = await _run_sidecar_job_async("arr_queue_watchdog", "Arr Queue Watchdog", run_arr_queue_watchdog)
@@ -437,6 +444,51 @@ async def dispatch_scheduled_prompt(
                 print("[Scheduler] Google Tasks sync checked: nominal (silent).")
         except Exception as e:
             print(f"[Scheduler] Google Tasks sync execution error: {e}")
+        return
+
+    # Host 2 Local USB Backup: silent unless error
+    if "backup_host2" in prompt or job_name in ("Host 2 Local USB Backup", "Host 2 Backup"):
+        try:
+            from tools.sidecars import run_host2_backup
+            ok, out, _ = await _run_sidecar_job_async("host2_backup", "Host 2 Local USB Backup", run_host2_backup)
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] Host 2 USB backup completed: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Host 2 backup execution error: {e}")
+        return
+
+    # Host 1 Local USB Backup: silent unless error
+    if "backup_host1" in prompt or job_name in ("Host 1 Local USB Backup", "Host 1 Backup"):
+        try:
+            from tools.sidecars import run_host1_backup
+            ok, out, _ = await _run_sidecar_job_async("host1_backup", "Host 1 Local USB Backup", run_host1_backup)
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] Host 1 USB backup completed: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Host 1 backup execution error: {e}")
+        return
+
+    # Bridge Liveness Watchdog: silent unless error / degraded
+    if "bridge_watchdog" in prompt or job_name in ("Bridge Liveness Watchdog", "Bridge Watchdog"):
+        try:
+            from tools.sidecars import run_bridge_watchdog
+            ok, out, _ = await _run_sidecar_job_async("bridge_watchdog", "Bridge Liveness Watchdog", run_bridge_watchdog)
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] Bridge watchdog checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Bridge watchdog execution error: {e}")
         return
 
     # Plex Weekly New Media Digest
@@ -558,8 +610,8 @@ async def dispatch_scheduled_prompt(
     if "market_standup.py" in prompt or job_name in ("Market Sandbox Autonomous Daily Standup", "Market Standup"):
         try:
             from tools.market_standup import dispatch_market_standup
-            res = await asyncio.to_thread(dispatch_market_standup, dry_run=False)
-            print(f"[Scheduler] Market Sandbox standup dispatched: status={res.get('status')}")
+            ok, rep, extra = await _run_sidecar_job_async("market_standup", "Market Sandbox Autonomous Daily Standup", dispatch_market_standup, dry_run=False)
+            print(f"[Scheduler] Market Sandbox standup dispatched: ok={ok}")
         except Exception as e:
             print(f"[Scheduler] Market Sandbox standup dispatch error: {e}")
         return
@@ -568,8 +620,8 @@ async def dispatch_scheduled_prompt(
     if "agora_steering.py" in prompt or job_name in ("AGORA Daily Steering Briefing", "AGORA Steering"):
         try:
             from tools.agora_steering import dispatch_agora_steering
-            res = await asyncio.to_thread(dispatch_agora_steering, dry_run=False)
-            print(f"[Scheduler] AGORA steering briefing dispatched: status={res.get('status')}")
+            ok, rep, extra = await _run_sidecar_job_async("agora_steering", "AGORA Daily Steering Briefing", dispatch_agora_steering, dry_run=False)
+            print(f"[Scheduler] AGORA steering briefing dispatched: ok={ok}")
         except Exception as e:
             print(f"[Scheduler] AGORA steering briefing dispatch error: {e}")
         return
@@ -690,6 +742,20 @@ class KarakosScheduler:
         self.button_choice_fn = button_choice_fn
         self._running = False
         self._task = None
+        self._heartbeat_task = None
+        self._active_job_tasks = set()
+
+    async def _safe_dispatch(self, prompt: str, name: str, cid: int | None):
+        """Safely execute a single scheduled job dispatch in a decoupled background task."""
+        try:
+            try:
+                await self.dispatch_fn(prompt, job_name=name, channel_id=cid)
+            except TypeError:
+                await self.dispatch_fn(prompt, job_name=name)
+        except asyncio.CancelledError:
+            pass
+        except Exception as de:
+            print(f"[KarakosScheduler] Error dispatching {name}: {de}")
 
     async def _evaluate_and_dispatch_jobs(self, is_startup: bool = False):
         """Evaluate all jobs in schedule.json, strictly enforcing catchup window rules and persistence."""
@@ -735,30 +801,128 @@ class KarakosScheduler:
             if updated:
                 save_schedule(jobs)
 
-            # Dispatch all eligible jobs
+            # Dispatch all eligible jobs in decoupled background tasks
             for item in jobs_to_dispatch:
                 prompt, name = item[0], item[1]
                 cid = item[2] if len(item) > 2 else None
-                try:
-                    await self.dispatch_fn(prompt, job_name=name, channel_id=cid)
-                except TypeError:
-                    await self.dispatch_fn(prompt, job_name=name)
-                except Exception as de:
-                    print(f"[KarakosScheduler] Error dispatching {name}: {de}")
+                task = asyncio.create_task(self._safe_dispatch(prompt, name, cid))
+                self._active_job_tasks.add(task)
+                task.add_done_callback(self._active_job_tasks.discard)
+
+            if jobs_to_dispatch:
+                await asyncio.sleep(0)  # Yield so newly created tasks start execution immediately
 
         except Exception as e:
             print(f"[KarakosScheduler] Error evaluating jobs: {e}")
+
+    async def _heartbeat_loop(self):
+        """Dedicated, isolated heartbeat loop running every 15s regardless of main loop activities."""
+        while self._running:
+            try:
+                from tools.bridge_state import update_gateway_heartbeat
+                gw_status = "connected" if (self.bot and getattr(self.bot, "is_ready", lambda: False)()) else "disconnected"
+                update_gateway_heartbeat(self.bot, status=gw_status)
+            except Exception:
+                pass
+            try:
+                await asyncio.sleep(15)
+            except asyncio.CancelledError:
+                break
 
     async def start(self):
         self._running = True
         # Evaluate missed/due jobs on startup
         await self._evaluate_and_dispatch_jobs(is_startup=True)
         self._task = asyncio.create_task(self._loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def stop(self):
         self._running = False
         if self._task:
             self._task.cancel()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+        for t in list(self._active_job_tasks):
+            t.cancel()
+
+    async def flush_outbox_queue(self):
+        """Outbox Queue Flusher (Cross-Channel Asynchronous Dispatch)
+        
+        Safely drains pending outbox messages with:
+        - Mandatory chunking via chunk_text(..., max_len=1900) so no single Discord payload exceeds 2,000 chars.
+        - Preservation of interactive choice buttons on the final chunk.
+        - Banana mutex protection for #the-banana-stand across all chunks.
+        - Per-message error isolation so one failure never aborts or drops remaining outbox items.
+        - Dead-Letter Queue (failed.jsonl) logging on unhandled delivery errors.
+        """
+        try:
+            from tools.outbox import flush_pending_messages
+            pending_outbox = flush_pending_messages()
+            if not pending_outbox:
+                return
+
+            for omsg in pending_outbox:
+                omsg_id = omsg.get("id", "unknown-outbox")
+                ch_name = omsg.get("channel", "unknown")
+                target_cid = omsg.get("channel_id")
+                if not target_cid or not self.bot:
+                    continue
+
+                try:
+                    target_channel = self.bot.get_channel(target_cid) or await self.bot.fetch_channel(target_cid)
+                    if not target_channel:
+                        print(f"[Outbox] Warning: Channel {target_cid} not found for {omsg_id}")
+                        continue
+
+                    is_banana_stand = (target_cid == 1534436119888793750 or str(ch_name) in ("the-banana-stand", "agent-chat"))
+                    raw_content = omsg.get("content", "")
+
+                    if is_banana_stand:
+                        try:
+                            from tools.banana import claim, release
+                            claim(subject=omsg_id)
+                        except Exception as be:
+                            print(f"[Outbox] Warning claiming Banana: {be}")
+                        try:
+                            # Defensively chunk to guarantee <=1900 chars per Discord REST send call
+                            chunks = chunk_text(raw_content, max_len=1900)
+                            for ch in chunks:
+                                await target_channel.send(ch)
+                        finally:
+                            try:
+                                release()
+                            except Exception as err:
+                                print(f"[Outbox] Warning releasing Banana: {err}")
+                    else:
+                        clean_content, choice_view = parse_interactive_choices(
+                            raw_content,
+                            self.quick_choice_view_cls,
+                            self.button_choice_fn,
+                        )
+                        chunks = chunk_text(clean_content, max_len=1900)
+                        for idx, ch in enumerate(chunks):
+                            is_last = (idx == len(chunks) - 1)
+                            view = choice_view if is_last else None
+                            if view:
+                                await target_channel.send(ch, view=view)
+                            else:
+                                await target_channel.send(ch)
+
+                    print(f"[Outbox] Dispatched message {omsg_id} to #{ch_name} ({target_cid})")
+                except Exception as item_err:
+                    print(f"[Outbox] Error delivering message {omsg_id} to #{ch_name}: {item_err}")
+                    try:
+                        dlq_file = DATA_DIR / "outbox" / "failed.jsonl"
+                        dlq_file.parent.mkdir(parents=True, exist_ok=True)
+                        failed_entry = dict(omsg)
+                        failed_entry["failed_at"] = time.time()
+                        failed_entry["error"] = str(item_err)
+                        with open(dlq_file, "a", encoding="utf-8") as df:
+                            df.write(json.dumps(failed_entry) + "\n")
+                    except Exception:
+                        pass
+        except Exception as oe:
+            print(f"[Bridge] Error flushing outbox queue: {oe}")
 
     async def _loop(self):
         global _last_bot_status_mtime
@@ -766,6 +930,29 @@ class KarakosScheduler:
             try:
                 now_ts = time.time()
                 await self._evaluate_and_dispatch_jobs(is_startup=False)
+
+                # Dynamic Discord Gateway Heartbeat Verification
+                try:
+                    from tools.bridge_state import update_gateway_heartbeat
+                    gw_status = "connected" if (self.bot and getattr(self.bot, "is_ready", lambda: False)()) else "disconnected"
+                    update_gateway_heartbeat(self.bot, status=gw_status)
+                except Exception as he:
+                    pass
+
+                # Autonomous Subprocess Watchdog & Reaper
+                try:
+                    from tools.process_probe import reap_stale_agy_processes
+                    allowed_pids = set()
+                    if br.active_proc and getattr(br.active_proc, "pid", None):
+                        allowed_pids.add(br.active_proc.pid)
+                    if br.ext_active_proc and getattr(br.ext_active_proc, "pid", None):
+                        allowed_pids.add(br.ext_active_proc.pid)
+                    for p in getattr(br, "channel_active_procs", {}).values():
+                        if p and getattr(p, "pid", None):
+                            allowed_pids.add(p.pid)
+                    reap_stale_agy_processes(max_age_seconds=600.0, allowed_active_pids=allowed_pids)
+                except Exception as re_err:
+                    pass
 
                 # Liveness Beacon & Wedge Check (Karakos Pattern: >420s unbroken silence while PROCESSING)
                 if BEACON_FILE.exists():
@@ -826,42 +1013,7 @@ class KarakosScheduler:
                         pass
 
                 # Outbox Queue Flusher (Cross-Channel Asynchronous Dispatch)
-                try:
-                    from tools.outbox import flush_pending_messages
-                    pending_outbox = flush_pending_messages()
-                    for omsg in pending_outbox:
-                        target_cid = omsg.get("channel_id")
-                        if target_cid and self.bot:
-                            target_channel = self.bot.get_channel(target_cid) or await self.bot.fetch_channel(target_cid)
-                            if target_channel:
-                                is_banana_stand = (target_cid == 1534436119888793750 or str(omsg.get("channel")) in ("the-banana-stand", "agent-chat"))
-                                if is_banana_stand:
-                                    try:
-                                        from tools.banana import claim, release
-                                        claim(subject=omsg.get("id", "outbox-dispatch"))
-                                    except Exception as be:
-                                        print(f"[Outbox] Warning claiming Banana: {be}")
-                                    try:
-                                        await target_channel.send(omsg.get("content", ""))
-                                    finally:
-                                        try:
-                                            release()
-                                        except Exception as err:
-                                            print(f"[Outbox] Warning releasing Banana: {err}")
-                                else:
-                                    raw_content = omsg.get("content", "")
-                                    clean_content, choice_view = parse_interactive_choices(
-                                        raw_content,
-                                        self.quick_choice_view_cls,
-                                        self.button_choice_fn,
-                                    )
-                                    if choice_view:
-                                        await target_channel.send(clean_content, view=choice_view)
-                                    else:
-                                        await target_channel.send(clean_content)
-                                print(f"[Outbox] Dispatched message {omsg.get('id')} to #{omsg.get('channel')} ({target_cid})")
-                except Exception as oe:
-                    print(f"[Bridge] Error flushing outbox queue: {oe}")
+                await self.flush_outbox_queue()
 
                 # Zero-downtime bridge reload trigger
                 reload_flag = DATA_DIR / "reload_bridge.flag"

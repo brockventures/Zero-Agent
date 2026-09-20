@@ -18,7 +18,13 @@ BLOCKED_EXACT_ROOTS = {
     "/root",
     "/docker",
     "/data",
-    "/archives"
+    "/archives",
+    "/volume1",
+    "/volume2",
+    "/volume3",
+    "/volume4",
+    "/volumeUSB1",
+    "/volumeUSB2",
 }
 
 BLOCKED_TREE_PREFIXES = (
@@ -85,9 +91,6 @@ def check_command_line(cmd: str, cwd: str) -> tuple[bool, str]:
     has_find = bool(re.search(r'\bfind\b', cmd))
     has_git_grep = bool(re.search(r'\bgit\s+grep\b', cmd))
 
-    if not (has_recursive_grep or has_find or has_git_grep):
-        return True, ""
-
     # 2. Check find commands
     if has_find:
         if re.search(r'\bfind\s+(/|/workspace|\.|\*)\b', cmd) and "-maxdepth" not in cmd:
@@ -100,6 +103,11 @@ def check_command_line(cmd: str, cwd: str) -> tuple[bool, str]:
 
     # 3. Check recursive grep / rg / ag
     if has_recursive_grep:
+        if re.search(r'\b(grep\s+-[a-zA-Z]*r[a-zA-Z]*|rg|ag|ack)\b.*?\s+([\'"]?)(/|/volume[0-9]*/?|/volumeUSB[0-9]*/?|/workspace/?|/root/?|/docker/?|/data/?)\2(\s|$|;|\)|\||&)', cmd):
+            return False, (
+                "Command Blocked: Unbounded recursive search targeting root or full volume is prohibited. "
+                "Target a specific subfolder (e.g. 'grep -rn \"pattern\" /docker/baseball/')."
+            )
         tokens = cmd.split()
         # Check if there is an explicit target or if it defaults to cwd
         targets = []
@@ -111,11 +119,30 @@ def check_command_line(cmd: str, cwd: str) -> tuple[bool, str]:
                 continue
             # Assume any non-flag token could be query or target path
             norm = normalize_path(cleaned, cwd)
-            if norm in BLOCKED_EXACT_ROOTS:
+            if norm in BLOCKED_EXACT_ROOTS or re.match(r'^/volume[0-9]*$', norm):
                 return False, (
                     f"Command Blocked: Unbounded recursive search targeting '{cleaned}' (resolved: '{norm}') is prohibited. "
-                    f"Target a specific subfolder: e.g. 'grep -rn \"pattern\" /workspace/tools/'."
+                    f"Target a specific subfolder: e.g. 'grep -rn \"pattern\" /docker/baseball/'."
                 )
+
+    # 4. Check known interactive CLI commands that block on STDIN
+    if re.search(r'\bnpx\s+', cmd) and not re.search(r'\b(-y|--yes)\b', cmd):
+        return False, (
+            "Command Blocked: 'npx' without '-y' / '--yes' hangs waiting for interactive package confirmation. "
+            "Please invoke as 'npx -y <package>'."
+        )
+
+    if re.search(r'\b(apt|apt-get)\s+install\b', cmd) and not re.search(r'\b(-y|--yes|--assume-yes)\b', cmd):
+        return False, (
+            "Command Blocked: 'apt/apt-get install' without '-y' hangs waiting for confirmation. "
+            "Please pass '-y'."
+        )
+
+    if re.search(r'\bnxapi\s+(nso|pctl)\s+auth\b', cmd) and "switch_auth" not in cmd:
+        return False, (
+            "Command Blocked: 'nxapi auth' spawns an interactive readline prompt waiting on STDIN. "
+            "Use decoupled '/workspace/tools/switch_auth.js generate' instead."
+        )
 
     return True, ""
 

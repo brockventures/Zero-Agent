@@ -33,6 +33,7 @@ from tools.bridge_state import (
     READONLY_NOTIFICATION_CHANNELS,
     TARGET_CHANNEL_ID,
     OWNER_USER_ID,
+    IVY_USER_ID,
     get_runtime_rules,
     get_channel_session_id,
     set_channel_session_id,
@@ -51,6 +52,7 @@ from tools.bridge_state import (
     is_home_channel,
     BROCK_GUILD_ID,
     is_brock_guild,
+    VAULT_CHANNEL_ID,
 )
 from tools.bridge_formatting import (
     format_command_preview,
@@ -85,7 +87,8 @@ has_notified_ready = False
 
 # Multi-Channel Concurrency State
 channel_queues = {}             # channel_id -> asyncio.Queue
-channel_active_tasks = {}       # channel_id -> asyncio.Task
+channel_worker_tasks = {}       # channel_id -> asyncio.Task (worker daemon loop)
+channel_active_tasks = {}       # channel_id -> asyncio.Task (active turn processing)
 channel_active_status_msgs = {} # channel_id -> discord.Message
 channel_concurrency_semaphore = None
 
@@ -244,7 +247,7 @@ async def execute_container_restart(channel=None, initiator: str = "user", reaso
     import subprocess
     ssh_key = "/secrets/id_ed25519"
     ssh_port = os.getenv("NAS_SSH_PORT", "22")
-    ssh_user = os.getenv("NAS_USER", "root")
+    ssh_user = os.getenv("NAS_USER", "Brock")
     host_2 = os.getenv("NAS_HOST_2_IP", "127.0.0.1")
 
     restart_cmd = [
@@ -513,6 +516,7 @@ async def run_channel_turn_worker(
                 except Exception as se:
                     print(f"[Channel Worker {channel_id}] Notice creating status placeholder: {se}")
 
+            channel_active_tasks[channel_id] = asyncio.current_task()
             if is_home_root:
                 active_turn_task = asyncio.current_task()
                 active_status_msg = status_msg
@@ -562,6 +566,7 @@ async def run_channel_turn_worker(
                 except Exception:
                     pass
             finally:
+                channel_active_tasks.pop(channel_id, None)
                 if is_home_root:
                     active_turn_task = None
                     active_status_msg = None
@@ -586,6 +591,7 @@ async def run_channel_turn_worker(
                         await execute_bridge_reload(bot, None, initiator="agent", force=True, reason="Post-turn in-place reload flag")
 
     finally:
+        channel_worker_tasks.pop(channel_id, None)
         channel_active_tasks.pop(channel_id, None)
 
 
@@ -602,24 +608,24 @@ async def queue_worker(home_turn_queue, bot: discord.Client, presence_fn=None, b
                 t_task = asyncio.create_task(run_thread_turn_worker(item, bot, presence_fn, button_choice_fn, quick_choice_view_cls))
                 tid = getattr(getattr(reply_target, "channel", None), "id", None) or getattr(reply_target, "id", None) or channel_id
                 thread_active_tasks[tid] = t_task
-                home_turn_queue.task_done(item)
+                home_turn_queue.task_done()
                 continue
 
             cid = int(channel_id) if str(channel_id).isdigit() else channel_id
             q = get_channel_queue(cid)
             await q.put(item)
-            home_turn_queue.task_done(item)
+            home_turn_queue.task_done()
 
-            existing_task = channel_active_tasks.get(cid)
+            existing_task = channel_worker_tasks.get(cid)
             if existing_task is None or existing_task.done():
                 t = asyncio.create_task(
                     run_channel_turn_worker(
                         cid, q, bot, presence_fn, button_choice_fn, quick_choice_view_cls, reload_fn
                     )
                 )
-                channel_active_tasks[cid] = t
+                channel_worker_tasks[cid] = t
     finally:
-        for cid, t in list(channel_active_tasks.items()):
+        for cid, t in list(channel_worker_tasks.items()):
             if t and not t.done():
                 t.cancel()
 
@@ -632,16 +638,16 @@ async def external_queue_worker(ext_turn_queue, bot: discord.Client, presence_fn
         cid = int(channel_id) if str(channel_id).isdigit() else channel_id
         q = get_channel_queue(cid)
         await q.put(item)
-        ext_turn_queue.task_done(item)
+        ext_turn_queue.task_done()
 
-        existing_task = channel_active_tasks.get(cid)
+        existing_task = channel_worker_tasks.get(cid)
         if existing_task is None or existing_task.done():
             t = asyncio.create_task(
                 run_channel_turn_worker(
                     cid, q, bot, presence_fn, button_choice_fn, quick_choice_view_cls, reload_fn
                 )
             )
-            channel_active_tasks[cid] = t
+            channel_worker_tasks[cid] = t
 
 
 async def handle_on_ready(
@@ -939,10 +945,11 @@ async def handle_message(
             return
 
     if not is_home:
-        # Public channels in Brock Discord (e.g. #seerr-requests-and-chat, #server-updates, #seerr-notifications)
-        # Strict Rule: Only respond to messages directly from Ryan Brock (owner), explicitly tagging Zero.
+        # Public channels in Brock Discord (e.g. #seerr-requests-and-chat, #server-updates, #seerr-notifications, #baseball)
+        # Strict Rule: Only respond to messages directly from Ryan Brock (owner) OR Ivy (peer bot in #baseball), explicitly tagging Zero.
         if is_brock_guild(msg):
-            if msg.author.bot:
+            is_ivy = (msg.author.id == IVY_USER_ID or msg.author.id == 1541205716948353074)
+            if msg.author.bot and not is_ivy:
                 return
 
             is_owner = (msg.author.id == OWNER_USER_ID)
@@ -951,10 +958,10 @@ async def handle_message(
                 (bot.user and bot.user in msg.mentions) or
                 f"<@{bot_id}>" in content or
                 f"<@!{bot_id}>" in content or
-                re.search(r"(?:^|[\s,;/])(?:hey\s+)?@?zero(?:\b|[!?:,/])", content, re.IGNORECASE) is not None
+                re.search(r"(?:@zero\b|@robot\b|\b(?:hey|hi|hello)\s+@?zero\b|^\s*@?zero\s*[:,-])", content, re.IGNORECASE) is not None
             )
 
-            if not (is_owner and is_tagged):
+            if not ((is_owner or is_ivy) and is_tagged):
                 return
 
             # Ryan explicitly invoked Zero in a public Brock Discord channel
@@ -1134,6 +1141,29 @@ async def handle_message(
                 return
             channel_last_bot_reply[msg.channel.id] = now
 
+        # Addressing Gate: check if this message is a direct reply to Zero (via resolved Discord reference or channel history lookup)
+        bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
+        bot_mention_1 = f"<@{bot_id}>"
+        bot_mention_2 = f"<@!{bot_id}>"
+
+        is_reply_to_zero = False
+        if msg.reference:
+            if msg.reference.resolved and hasattr(msg.reference.resolved, "author"):
+                if bot.user and msg.reference.resolved.author.id == bot.user.id:
+                    is_reply_to_zero = True
+            elif msg.reference.message_id:
+                try:
+                    from tools.channel_history import get_recent_messages
+                    ref_id = msg.reference.message_id
+                    for m in get_recent_messages(msg.channel.id, limit=25):
+                        if m.get("id") == ref_id:
+                            a_name = str(m.get("author", "")).lower()
+                            if "zero" in a_name or (m.get("is_bot") and "zero" in a_name):
+                                is_reply_to_zero = True
+                            break
+                except Exception as re_err:
+                    print(f"[Bridge] Warning resolving reply reference {ref_id}: {re_err}")
+
         # Channel-specific tag enforcement
         rules = get_runtime_rules()
         channel_tag_requirements = rules.get("channel_tag_requirements", {})
@@ -1156,7 +1186,6 @@ async def handle_message(
         )
 
         if req_tag:
-            bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
             allowed_tags = req_tag if isinstance(req_tag, list) else [req_tag]
             allowed_tag_strs = [f"<@&{t}>" for t in allowed_tags]
             has_required_tag = (
@@ -1169,23 +1198,13 @@ async def handle_message(
                 f"<@!{bot_id}>" in content or
                 re.search(r"(?:^|[\s,;])@zero\b", content, re.IGNORECASE) is not None or
                 is_robot_tagged or
-                is_team_tagged
+                is_team_tagged or
+                is_reply_to_zero
             )
             if not has_required_tag and not is_direct_bot_ping:
                 print(f"[Bridge] Message in channel {msg.channel.id} ignored: missing required tag(s) {allowed_tag_strs}")
                 return
             is_tagged_role = True
-
-        # Addressing Gate
-        bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
-        bot_mention_1 = f"<@{bot_id}>"
-        bot_mention_2 = f"<@!{bot_id}>"
-
-        is_reply_to_zero = False
-        if msg.reference and msg.reference.resolved:
-            ref = msg.reference.resolved
-            if hasattr(ref, "author") and bot.user and ref.author.id == bot.user.id:
-                is_reply_to_zero = True
 
         # Conversational follow-up detection:
         # If a human responds in the channel shortly after Zero spoke (within 300s)
@@ -1238,7 +1257,7 @@ async def handle_message(
             bot_mention_2 in content or
             is_robot_tagged or
             is_team_tagged or
-            re.search(r"(?:^|[\s,;/])(?:hey\s+)?@?zero(?:\b|[!?:,/])", content, re.IGNORECASE) is not None or
+            re.search(r"(?:@zero\b|@robot\b|\b(?:hey|hi|hello)\s+@?zero\b|^\s*@?zero\s*[:,-])", content, re.IGNORECASE) is not None or
             is_reply_to_zero or
             handoff_for_zero or
             is_conversational_follow_up
@@ -1819,6 +1838,8 @@ async def handle_message(
         "/steering": ("⏳ *Running AGORA Steering briefing dispatcher...*", "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch."),
         "!agora_steering": ("⏳ *Running AGORA Steering briefing dispatcher...*", "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch."),
         "/agora_steering": ("⏳ *Running AGORA Steering briefing dispatcher...*", "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch."),
+        "!agora_roadmap_sprint": ("⏳ *Running Agora Roadmap Autonomous Sprint...*", "Run the autonomous Agora roadmap worker using python3 /workspace/tools/agora_autoworker.py. Advance the next pending Station Agora roadmap subtask on the public board, implement and verify code and tests, and report progress."),
+        "/agora_roadmap_sprint": ("⏳ *Running Agora Roadmap Autonomous Sprint...*", "Run the autonomous Agora roadmap worker using python3 /workspace/tools/agora_autoworker.py. Advance the next pending Station Agora roadmap subtask on the public board, implement and verify code and tests, and report progress."),
         "!code_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics."),
         "/code_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics."),
         "!hardcode_audit": ("⏳ *Running on-demand Hardcoded Rule & Regex Audit...*", "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics."),
@@ -1841,12 +1862,24 @@ async def handle_message(
         "/ha_update_check": ("⏳ *Checking for Home Assistant updates...*", "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py."),
         "!dockhand_update": ("⏳ *Checking Dockhand container updates...*", "Run the Dockhand container image check using /workspace/tools/dockhand_update.py."),
         "/dockhand_update": ("⏳ *Checking Dockhand container updates...*", "Run the Dockhand container image check using /workspace/tools/dockhand_update.py."),
+        "!backup_host2": ("⏳ *Running Host 2 local USB backup...*", "Run the Host 2 local USB backup using /workspace/tools/sidecars.py backup_host2."),
+        "/backup_host2": ("⏳ *Running Host 2 local USB backup...*", "Run the Host 2 local USB backup using /workspace/tools/sidecars.py backup_host2."),
+        "!backup_host1": ("⏳ *Running Host 1 local USB backup...*", "Run the Host 1 local USB backup using /workspace/tools/sidecars.py backup_host1."),
+        "/backup_host1": ("⏳ *Running Host 1 local USB backup...*", "Run the Host 1 local USB backup using /workspace/tools/sidecars.py backup_host1."),
         "!meals": ("⏳ *Generating 3-dinner meal proposal...*", "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons."),
         "/meals": ("⏳ *Generating 3-dinner meal proposal...*", "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons."),
         "!mealplan": ("⏳ *Generating 3-dinner meal proposal...*", "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons."),
         "/mealplan": ("⏳ *Generating 3-dinner meal proposal...*", "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons."),
         "!grocery": ("⏳ *Compiling weekly Whole Foods delivery cart...*", "Run the weekly Whole Foods grocery staging using /workspace/tools/sidecars.py grocery_staging. Ingest pending items from Home Assistant ('todo.shopping_list') and due recurring staples, then post the 1-click cart link."),
-        "/grocery": ("⏳ *Compiling weekly Whole Foods delivery cart...*", "Run the weekly Whole Foods grocery staging using /workspace/tools/sidecars.py grocery_staging. Ingest pending items from Home Assistant ('todo.shopping_list') and due recurring staples, then post the 1-click cart link.")
+        "/grocery": ("⏳ *Compiling weekly Whole Foods delivery cart...*", "Run the weekly Whole Foods grocery staging using /workspace/tools/sidecars.py grocery_staging. Ingest pending items from Home Assistant ('todo.shopping_list') and due recurring staples, then post the 1-click cart link."),
+        "!kalshi": ("⏳ *Running Kalshi Weather Quant Paper Bot...*", "Run the Kalshi weather quant paper bot using /workspace/tools/sidecars.py kalshi. Settle resolved contracts, scan live order books against NOAA models, execute positive-EV trades, and report the portfolio status."),
+        "/kalshi": ("⏳ *Running Kalshi Weather Quant Paper Bot...*", "Run the Kalshi weather quant paper bot using /workspace/tools/sidecars.py kalshi. Settle resolved contracts, scan live order books against NOAA models, execute positive-EV trades, and report the portfolio status."),
+        "!kalshi_review": ("⏳ *Running Kalshi Paper Trading Evening Review...*", "Run the Kalshi paper trading evening settlement, performance review, and task board sync using /workspace/tools/sidecars.py kalshi_review."),
+        "/kalshi_review": ("⏳ *Running Kalshi Paper Trading Evening Review...*", "Run the Kalshi paper trading evening settlement, performance review, and task board sync using /workspace/tools/sidecars.py kalshi_review."),
+        "!kalshi_audit": ("⏳ *Running Kalshi Nightly Quant Standup & Brier Audit...*", "Run the Kalshi nightly settlement, Brier calibration audit, and GitHub board sync using /workspace/tools/sidecars.py kalshi_audit."),
+        "/kalshi_audit": ("⏳ *Running Kalshi Nightly Quant Standup & Brier Audit...*", "Run the Kalshi nightly settlement, Brier calibration audit, and GitHub board sync using /workspace/tools/sidecars.py kalshi_audit."),
+        "!kalshi_sprint": ("⏳ *Running Kalshi Task Board Autonomous Sprint Cycle...*", "Run the 5-minute autonomous Kalshi task board sprint cycle using /workspace/tools/sidecars.py kalshi_sprint."),
+        "/kalshi_sprint": ("⏳ *Running Kalshi Task Board Autonomous Sprint Cycle...*", "Run the 5-minute autonomous Kalshi task board sprint cycle using /workspace/tools/sidecars.py kalshi_sprint.")
     }
 
     cmd_key = content.lower().split()[0] if content else ""
@@ -1867,6 +1900,12 @@ async def handle_message(
         return
 
     if cmd_key in triggers:
+        # Strictly isolate Kalshi quant trading commands to #vault
+        if cmd_key in ("/kalshi", "!kalshi", "/kalshi_review", "!kalshi_review", "/kalshi_audit", "!kalshi_audit", "/kalshi_sprint", "!kalshi_sprint"):
+            if getattr(msg.channel, "id", None) != VAULT_CHANNEL_ID:
+                await msg.reply(f"🔒 *Kalshi quant trading operations and sidecars exclusively operate in <#{VAULT_CHANNEL_ID}>.*")
+                return
+
         status_text, prompt_text = triggers[cmd_key]
         try:
             await msg.channel.typing()
