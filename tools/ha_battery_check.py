@@ -2,32 +2,50 @@
 import sys, json, urllib.request, os
 
 SECRETS_PATH = os.environ.get("HA_SECRETS_PATH", "/secrets/ha.json")
-BASE_URL = os.environ.get("HA_BASE_URL", "http://127.0.0.1:8123")
 
-def get_ha_token():
+def get_ha_config() -> tuple[str, str]:
+    base_url = os.environ.get("HA_BASE_URL", "").rstrip("/")
+    token = os.environ.get("HA_ACCESS_TOKEN", "")
+
+    if os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json") as f:
+                d = json.load(f)
+                if not base_url and d.get("HA_BASE_URL"):
+                    base_url = d["HA_BASE_URL"].rstrip("/")
+                if not token and d.get("HA_ACCESS_TOKEN"):
+                    token = d["HA_ACCESS_TOKEN"]
+        except Exception:
+            pass
+
     if os.path.exists(SECRETS_PATH):
         try:
             with open(SECRETS_PATH) as f:
-                return json.load(f).get("token", "")
+                d = json.load(f)
+                if not base_url and d.get("url"):
+                    base_url = d["url"].rstrip("/")
+                if not token and d.get("token"):
+                    token = d["token"]
         except Exception:
             pass
-    return os.environ.get("HA_ACCESS_TOKEN", "")
 
-def check_batteries(threshold: float = 15.0, quiet: bool = False):
-    token = get_ha_token()
+    return base_url or "http://127.0.0.1:8123", token
+
+def check_batteries(threshold: float = 15.0, quiet: bool = False) -> int:
+    base_url, token = get_ha_config()
     if not token:
         if not quiet:
             print("⚠️ Home Assistant token not found.")
-        return
+        return 1
 
-    req = urllib.request.Request(f"{BASE_URL}/api/states", headers={"Authorization": f"Bearer {token}"})
+    req = urllib.request.Request(f"{base_url}/api/states", headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             states = json.loads(resp.read().decode())
     except Exception as e:
         if not quiet:
             print(f"⚠️ Failed to query Home Assistant states: {e}")
-        return
+        return 1
 
     ignore_patterns = ["pixel", "fold", "watch", "ev9", "envoy", "encharge", "reserve_battery", "balance"]
     low_batteries = []
@@ -61,6 +79,7 @@ def check_batteries(threshold: float = 15.0, quiet: bool = False):
     else:
         if not quiet:
             print(f"✅ All {len(states)} Home Assistant IoT sensors have healthy battery levels (> {threshold:.0f}%).")
+    return 0
 
 if __name__ == "__main__":
     quiet = "--quiet" in sys.argv
@@ -69,4 +88,4 @@ if __name__ == "__main__":
         if arg.startswith("--threshold="):
             try: thresh = float(arg.split("=")[1])
             except ValueError: pass
-    check_batteries(threshold=thresh, quiet=quiet)
+    sys.exit(check_batteries(threshold=thresh, quiet=quiet))

@@ -34,8 +34,8 @@ memory/**
 .agents/memory/**
 
 # 4. Personal Data, Exports, Databases & Address Books
-data/
-data/**
+data/*
+!data/canonical_gifs.json
 car_monitor_data/
 car_monitor_data/**
 *.xlsx
@@ -115,3 +115,4 @@ Thumbs.db
 .vscode/
 *.sublime-project
 *.sublime-workspace
+kalshi-quant/

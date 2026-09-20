@@ -30,9 +30,14 @@ python3 /workspace/tools/outbox.py --channel lounge --message "🍌 Executive Su
 python3 /workspace/tools/outbox.py --list
 ```
 
-### 3. Flush Outbox Queue (Manual / Dry-Run)
+### 3. Flush Outbox Queue (Force Immediate Delivery)
 ```bash
 python3 /workspace/tools/outbox.py --flush
+```
+
+### 4. Discard Outbox Queue (Purge Without Delivery)
+```bash
+python3 /workspace/tools/outbox.py --discard
 ```
 
 ---

@@ -26,27 +26,29 @@ BENIGN_STANDBY_DOMAINS = {"octoprint", "android_ip_webcam", "androidtv_remote"}
 
 
 def _get_ha_config() -> tuple[str, str]:
-    base_url = os.environ.get("HA_BASE_URL", "http://127.0.0.1:8123").rstrip("/")
+    base_url = os.environ.get("HA_BASE_URL", "").rstrip("/")
     token = ""
     if os.path.exists("/secrets/env.json"):
         try:
             with open("/secrets/env.json") as f:
                 d = json.load(f)
-                if d.get("HA_BASE_URL"):
+                if not base_url and d.get("HA_BASE_URL"):
                     base_url = d["HA_BASE_URL"].rstrip("/")
                 if d.get("HA_ACCESS_TOKEN"):
                     token = d["HA_ACCESS_TOKEN"]
         except Exception:
             pass
-    if not token and os.path.exists("/secrets/ha.json"):
+    if os.path.exists("/secrets/ha.json"):
         try:
             with open("/secrets/ha.json") as f:
                 d = json.load(f)
-                if d.get("token"):
+                if not base_url and d.get("url"):
+                    base_url = d["url"].rstrip("/")
+                if not token and d.get("token"):
                     token = d["token"]
         except Exception:
             pass
-    return base_url, token
+    return base_url or "http://127.0.0.1:8123", token
 
 
 def _load_state() -> dict:

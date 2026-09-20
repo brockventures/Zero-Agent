@@ -27,6 +27,10 @@ from tools.bridge_formatting import (
     generate_concise_thread_title,
     synthesize_thread_title,
     parse_thread_title_tag,
+    is_internal_cli_leak,
+    strip_internal_cli_chatter,
+    parse_agy_error,
+    format_agy_error_message,
 )
 from tools.bridge_state import (
     DATA_DIR,
@@ -56,17 +60,18 @@ from tools.bridge_state import (
     get_reset_session_keys,
 )
 
-PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "10m")
+PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "30m")
 
 # Global execution & steering tracking
 active_master_fd = None
 active_proc = None
 ext_active_proc = None
 ext_active_master_fd = None
-channel_active_procs = {}    # channel_id -> subprocess.Popen
 steering_channels = set()     # channel/thread IDs actively being steered
 reset_session_keys = PersistentSessionKeySet(get_reset_session_keys())    # session keys (persisted to disk) to reset on next turn
 thread_active_tasks = {}     # thread_id -> asyncio.Task
+
+from tools.bridge_engine import TurnCoordinator, channel_active_procs
 
 
 from tools.bridge_pipeline import (
@@ -117,7 +122,7 @@ def harvest_transcript_response(conv_id: str | None) -> str | None:
                         content = data.get("content")
                         if content and isinstance(content, str) and content.strip():
                             stripped = content.strip()
-                            if stripped.lower() in ("no content generated yet.", "no content generated yet"):
+                            if is_internal_cli_leak(stripped):
                                 continue
                             return stripped
                 except Exception:
@@ -193,6 +198,7 @@ async def execute_agy_turn(
 
     max_retries = 2
     for attempt in range(max_retries + 1):
+        sync_credentials()
         master_fd, slave_fd = pty.openpty()
         cmd = ["agy", "--add-dir=/workspace"]
 
@@ -306,41 +312,36 @@ async def execute_agy_turn(
             elif mode == "external":
                 ext_active_proc = proc
 
-            last_beacon_touch = time.time()
-            last_activity_time = time.time()
-            last_probe_time = time.time()
-            init_received = False
-            result_received_at = None
-            agent_response_done_at = None
-            had_substantive_delta = False
-            line_buffer = ""
-            turn_timeout_seconds = float(rules.get("turn_watchdog_seconds", 600.0))
-            timed_out = False
-            wedged_diagnostic = None
-
-            is_root_eligible = (
-                mode == "home" and
-                channel_id == TARGET_CHANNEL_ID and
-                reply_target is not None and
-                hasattr(reply_target, "create_thread") and
-                not isinstance(getattr(reply_target, "channel", None), discord.Thread) and
-                escalation_enabled and
-                escalation_seconds > 0 and
-                not escalated_to_thread
+            coord = TurnCoordinator(
+                channel_id=channel_id,
+                prompt=prompt,
+                mode=mode,
+                reply_target=delivery_target,
+                status_msg=status_msg,
+                conv_id=conv_id,
+                escalated_to_thread=escalated_to_thread,
+                thread=thread,
+                notify_root_channel=notify_root_channel,
+                thread_jump_url=thread_jump_url,
             )
+            step_idle_timeout = float(rules.get("turn_step_idle_seconds", 90.0))
+            turn_timeout_seconds = float(rules.get("turn_watchdog_seconds", 300.0))
+            agent_done_window = float(rules.get("agent_done_cutoff_seconds", 15.0))
+            max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 1800.0))
+            timed_out = False
+            is_hard_ceiling = False
+            wedged_diagnostic = None
+            last_agy_error = None
+            init_received = False
+            line_buffer = ""
 
             while True:
                 r, _, _ = select.select([master_fd], [], [], 0.1)
-                now = time.time()
 
-                # Post-result & completion drain cutoff:
-                # Trigger 1: Terminal 'result' event emitted >= 1.5s ago
-                # Trigger 2: Agent completed final response step (state: DONE) >= 2.0s ago without subsequent tool calls
-                is_result_cutoff = (result_received_at is not None and (now - result_received_at) >= 1.5)
-                is_agent_done_cutoff = (agent_response_done_at is not None and (now - agent_response_done_at) >= 2.0)
-                if is_result_cutoff or is_agent_done_cutoff:
-                    trigger_label = "Result event" if is_result_cutoff else "Agent response DONE"
-                    print(f"[BridgeRunner] ⏱️ {trigger_label} cutoff reached (>1.5-2s), but PTY held open (PID {proc.pid}). Terminating to drain output...")
+                # Post-result & completion drain cutoff
+                is_cutoff, trigger_label = coord.evaluate_completion_cutoffs(agent_done_window=agent_done_window)
+                if is_cutoff:
+                    print(f"[BridgeRunner] ⏱️ {trigger_label} cutoff reached, but PTY held open (PID {proc.pid}). Terminating to drain output...")
                     kill_process_tree(proc, signal.SIGTERM)
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=1.0)
@@ -353,35 +354,30 @@ async def execute_agy_turn(
                     break
 
                 # Early wedge detection: If process tree has been completely silent for >= 45s, probe kernel wait states
-                if (now - last_activity_time) >= 45.0 and (now - last_probe_time) >= 10.0:
-                    last_probe_time = now
+                if coord.probe_process_wedge(proc.pid, output_snippet="".join(output_chunks[-5:])):
+                    wedged_diagnostic = coord.wedged_diagnostic
+                    timed_out = True
+                    kill_process_tree(proc, signal.SIGTERM)
                     try:
-                        from tools.process_probe import diagnose_process_tree
-                        diag = diagnose_process_tree(proc.pid, output_buffer="".join(output_chunks[-5:]))
-                        if diag.get("is_interactive_stdin"):
-                            print(f"[BridgeRunner] 🚨 Wedged interactive subprocess detected for PID {proc.pid} in channel {channel_id}: {diag['summary']}. Terminating early...")
-                            wedged_diagnostic = diag
-                            timed_out = True
-                            kill_process_tree(proc, signal.SIGTERM)
-                            try:
-                                await asyncio.wait_for(proc.wait(), timeout=1.0)
-                            except (asyncio.TimeoutError, Exception):
-                                kill_process_tree(proc, signal.SIGKILL)
-                                try:
-                                    await asyncio.wait_for(proc.wait(), timeout=0.5)
-                                except Exception:
-                                    pass
-                            break
-                    except Exception as pe:
-                        print(f"[BridgeRunner] Warning running process probe: {pe}")
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except (asyncio.TimeoutError, Exception):
+                        kill_process_tree(proc, signal.SIGKILL)
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=0.5)
+                        except Exception:
+                            pass
+                    break
 
-                # Bridge-level turn watchdog: enforces hard inactivity timeout so silent hangs are killed,
-                # while active turns actively streaming output are permitted up to absolute ceiling (2x).
-                max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 1800.0))
-                if (now - last_activity_time) >= turn_timeout_seconds or (now - turn_start_time) >= max_turn_ceiling:
-                    reason = f"{int(turn_timeout_seconds)}s idle" if (now - last_activity_time) >= turn_timeout_seconds else f"{int(max_turn_ceiling)}s hard ceiling"
+                # Bridge-level turn watchdog: enforces hard inactivity timeout so silent hangs are killed
+                is_timeout, reason = coord.check_watchdog_timeout(
+                    step_idle_timeout=step_idle_timeout,
+                    turn_timeout_seconds=turn_timeout_seconds,
+                    max_turn_ceiling=max_turn_ceiling,
+                )
+                if is_timeout:
                     print(f"[BridgeRunner] ⏱️ Turn watchdog exceeded ({reason}) for PID {proc.pid} in channel {channel_id}. Terminating...")
                     timed_out = True
+                    is_hard_ceiling = coord.is_hard_ceiling
                     kill_process_tree(proc, signal.SIGTERM)
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=1.5)
@@ -394,24 +390,14 @@ async def execute_agy_turn(
                     break
 
                 # Dynamic Escalation to Discord Thread (#zero-chat root only)
-                # Evaluated unconditionally on every tick so silent agent turns escalate precisely at escalation_seconds
-                if is_root_eligible and not escalated_to_thread and (now - turn_start_time) >= escalation_seconds:
-                    try:
-                        escalated_to_thread = True
-                        is_root_eligible = False
-                        clean_title = generate_concise_thread_title(prompt)
-                        thread = await reply_target.create_thread(name=f"🧵 {clean_title}", auto_archive_duration=1440)
-                        await reply_target.reply(f"🧵 *Task execution exceeded {int(escalation_seconds)}s — migrating deliverable to {thread.mention}. `#zero-chat` remains free.*")
-                        status_msg = None
-                        delivery_target = thread
-                        notify_root_channel = getattr(reply_target, "channel", None)
-                        thread_jump_url = thread.jump_url
-                        channel_active_procs[thread.id] = proc
-                        if TARGET_CHANNEL_ID in channel_active_procs:
-                            del channel_active_procs[TARGET_CHANNEL_ID]
-                        active_proc = None
-                    except Exception as te:
-                        print(f"[BridgeRunner] Warning escalating turn to thread: {te}")
+                if await coord.check_thread_escalation(proc, escalation_enabled, escalation_seconds):
+                    escalated_to_thread = coord.escalated_to_thread
+                    delivery_target = coord.delivery_target
+                    status_msg = coord.status_msg
+                    thread = coord.thread
+                    notify_root_channel = coord.notify_root_channel
+                    thread_jump_url = coord.thread_jump_url
+                    active_proc = None
 
                 if master_fd in r:
                     try:
@@ -426,9 +412,8 @@ async def execute_agy_turn(
                         # Touch liveness beacon so long active turns never trip false wedge alerts
                         if mode == "home":
                             now_touch = time.time()
-                            if (now_touch - last_beacon_touch) >= 10:
-                                update_beacon("PROCESSING", prompt, channel_id=channel_id)
-                                last_beacon_touch = now_touch
+                        coord.touch_activity()
+                        coord.maybe_touch_beacon()
 
                         # Extract current progress/action from stream-json or raw text using robust line buffering
                         while "\n" in line_buffer:
@@ -440,62 +425,20 @@ async def execute_agy_turn(
                                     ev_name = ev.get("event") or ev.get("type")
                                     if ev_name == "init":
                                         init_received = True
-                                        new_cid = ev.get("conversation_id")
-                                        if new_cid:
-                                            set_channel_session_id(channel_id, mode, new_cid)
-                                    elif ev_name == "step_update":
-                                        step = ev.get("step_update", {})
-                                        stype = step.get("step_type")
-                                        tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
-                                        if stype in ("tool", "system_message", "system") or tname:
-                                            timer.mark_event(tool_name=tname)
-                                            agent_response_done_at = None
-                                            tinfo = step.get("tool_info", {})
-                                            params = tinfo.get("parameters", {})
-                                            if tname == "run_command" and "CommandLine" in params:
-                                                current_action = format_command_preview(params["CommandLine"])
-                                            elif tname == "view_file" and "AbsolutePath" in params:
-                                                fpath = Path(params["AbsolutePath"]).name
-                                                current_action = f"Reading: {fpath}..."
-                                            elif tname == "grep_search" and "Query" in params:
-                                                current_action = f"Searching: {params['Query'][:50]}..."
-                                            elif tname == "replace_file_content" and "TargetFile" in params:
-                                                fpath = Path(params["TargetFile"]).name
-                                                current_action = f"Editing: {fpath}..."
-                                            elif tname == "call_mcp_tool":
-                                                mcp_tool = params.get("ToolName", "mcp")
-                                                current_action = f"Querying {mcp_tool}..."
-                                            else:
-                                                current_action = f"Calling tool: {tname}..."
-                                        elif stype == "agent_response":
-                                            delta = step.get("text_delta") or step.get("text") or step.get("content")
-                                            if delta and isinstance(delta, str) and delta.strip():
-                                                had_substantive_delta = True
-                                                timer.mark_event(is_token=True)
-                                                current_action = "Drafting response..."
-                                            if step.get("state") == "DONE" and had_substantive_delta:
-                                                if agent_response_done_at is None:
-                                                    agent_response_done_at = time.time()
-                                    elif ev_name == "result" or "result" in ev:
-                                        timer.mark_result()
-                                        if result_received_at is None:
-                                            result_received_at = time.time()
-                                        res_data = ev.get("result", {}) if isinstance(ev.get("result"), dict) else ev
-                                        res_cid = res_data.get("conversation_id")
-                                        if res_cid:
-                                            if escalated_to_thread and thread and hasattr(thread, 'id'):
-                                                set_channel_session_id(thread.id, mode, res_cid)
-                                                clear_channel_session_id(TARGET_CHANNEL_ID, "home")
-                                                print(f"[BridgeRunner] 🧵 Bound session {res_cid} to migrated thread {thread.id} and freed root channel.")
-                                            else:
-                                                set_channel_session_id(channel_id, mode, res_cid)
-                                        current_action = "Finalizing output..."
+                                    coord.process_stream_event(ev, timer=timer)
+                                    current_action = coord.current_action
                                 except Exception:
                                     pass
                             elif line_s.startswith("● "):
                                 current_action = line_s[:100]
                             elif "(Calls tool:" in line_s:
                                 current_action = line_s[:100]
+                            elif "AGY_ERROR:" in line_s:
+                                agy_err = parse_agy_error(line_s)
+                                if agy_err:
+                                    last_agy_error = agy_err
+                                    coord.last_agy_error = agy_err
+                                    print(f"[BridgeRunner] 🚨 Captured AGY_ERROR in PID {proc.pid}: {agy_err}")
 
                         # Throttle progress updates to Discord (every 1.5s)
                         now_edit = time.time()
@@ -627,11 +570,13 @@ async def execute_agy_turn(
             "authentication failed or timed out",
             "timeout waiting for response"
         ])
-        if is_transient_auth and attempt < max_retries:
-            print(f"[BridgeRunner] Transient Google auth/API handshake error on attempt {attempt+1}/{max_retries}. Retrying in 1.5s...")
+        is_retryable_stall = timed_out and not is_hard_ceiling
+        if (is_transient_auth or is_retryable_stall) and attempt < max_retries:
+            reason_label = "Step inactivity / API stall" if is_retryable_stall else "Transient Google auth/API handshake hiccup"
+            print(f"[BridgeRunner] 🔄 {reason_label} on attempt {attempt+1}/{max_retries}. Retrying in 1.5s...")
             if status_msg:
                 try:
-                    await status_msg.edit(content=f"⏳ *Transient Google auth/handshake hiccup, retrying... ({attempt+1}/{max_retries})*")
+                    await status_msg.edit(content=f"⏳ *{reason_label}, retrying... ({attempt+1}/{max_retries})*")
                 except Exception:
                     pass
             await asyncio.sleep(1.5)
@@ -646,42 +591,45 @@ async def execute_agy_turn(
         break
 
     full_raw = "".join(output_chunks).strip()
-    final_text = extract_agent_response(full_raw)
-
     active_cid = get_channel_session_id(channel_id, mode) or conv_id
+    final_text = extract_agent_response(full_raw, conv_id=active_cid)
 
-    # Fallback to on-disk transcript if stdout was empty, cut off, or returned default placeholder
-    if (not final_text or final_text.startswith("*(") or len(final_text.strip()) == 0) and final_text != "[NO_REPLY]":
+    # Detect if response is empty, placeholder, leak, or silence sentinel
+    is_empty_or_placeholder = not final_text or final_text.startswith("*(") or len(final_text.strip()) == 0
+    is_leak = is_internal_cli_leak(final_text)
+    is_silence = final_text.strip() in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP", "reply:none", "reply: none")
+
+    # In external mode, genuine non-error silence without output maps to [NO_REPLY]
+    if mode == "external" and (is_leak or is_silence) and not (timed_out or wedged_diagnostic or last_agy_error or (proc and proc.returncode not in (0, None))):
+        final_text = "[NO_REPLY]"
+
+    # Fallback to on-disk transcript if response was empty, leak, or placeholder
+    # (In home mode, NEVER skip transcript recovery even if silence/leak sentinel was detected)
+    if is_empty_or_placeholder or is_leak or (mode == "home" and is_silence):
         harvested = harvest_transcript_response(active_cid)
-        if harvested:
+        if harvested and not is_internal_cli_leak(harvested):
             print(f"[BridgeRunner] 🌾 Harvested response from on-disk transcript for session {active_cid} ({len(harvested)} chars).")
             final_text = f"⚠️ *(Recovered from session transcript following process cutoff)*\n\n{harvested}"
+            is_empty_or_placeholder = False
+            is_leak = False
+            is_silence = False
 
-    # If STILL no substantive response, emit explicit error beacon (NEVER fail silently)
-    if (not final_text or final_text.startswith("*(") or len(final_text.strip()) == 0) and final_text != "[NO_REPLY]":
-        elapsed_sec = int(time.time() - turn_start_time)
-        pid_str = f"PID {proc.pid}" if proc else "unknown PID"
-        if wedged_diagnostic:
-            culprit = wedged_diagnostic.get("culprit") or {}
-            c_name = culprit.get("name") or culprit.get("cmdline") or pid_str
-            c_wchan = culprit.get("wchan") or "unknown"
-            c_pid = culprit.get("pid") or (proc.pid if proc else "?")
-            final_text = (
-                f"⚠️ **Subprocess Wedged on Interactive Input:**\n\n"
-                f"{wedged_diagnostic['summary']}\n\n"
-                f"• **Culprit:** `{c_name}` (PID {c_pid})\n"
-                f"• **Kernel Wait Channel:** `{c_wchan}`\n"
-                f"• **Diagnostic:** A tool spawned an interactive command without automated flags. The subprocess was terminated after {elapsed_sec}s of silence to prevent an indefinite hang."
-            )
-        elif timed_out:
-            final_text = f"⚠️ **Turn Timed Out:** Subprocess exceeded watchdog limit of {int(turn_timeout_seconds)}s ({pid_str}). No complete response was produced."
-        elif proc and proc.returncode not in (0, None):
-            final_text = f"⚠️ **Turn Failed:** Process terminated with exit code {proc.returncode} after {elapsed_sec}s ({pid_str}). No complete output was produced."
-        else:
-            final_text = f"⚠️ **Turn Incomplete:** Agent process exited after {elapsed_sec}s ({pid_str}) without generating output or a recoverable transcript."
+    # In Home Turf, silence sentinels and empty outputs are strictly invalid - emit explicit error beacon (NEVER fail silently)
+    # In external mode, emit error beacons if process failed/timed out/wedged
+    has_process_failure = timed_out or wedged_diagnostic or last_agy_error or (proc and proc.returncode not in (0, None))
+    should_emit_beacon = (mode == "home" and (is_empty_or_placeholder or is_leak or is_silence)) or (mode == "external" and has_process_failure and (is_empty_or_placeholder or is_leak or is_silence))
+
+    if should_emit_beacon:
+        final_text = coord.format_diagnostic_beacon(
+            proc_pid=proc.pid if proc else None,
+            returncode=proc.returncode if proc else None,
+            turn_timeout_seconds=turn_timeout_seconds,
+        )
 
     if timed_out:
         timer.status = "TIMEOUT"
+    elif last_agy_error or (proc and proc.returncode == 3):
+        timer.status = "ERROR_3_MODEL_API"
     elif proc and proc.returncode not in (0, None):
         timer.status = f"ERROR_{proc.returncode}"
 

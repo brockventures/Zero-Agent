@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
+import argparse
 import json
-import sys
 import os
-import urllib.request
+import sys
 import urllib.parse
+import urllib.request
 
 NAS_SECRETS_PATH = os.environ.get("NAS_OAUTH_SECRETS_PATH", "/docker/discord-agy-agent/secrets/google_oauth.json")
 WORKSPACE_SECRETS_PATH = os.environ.get("GOOGLE_OAUTH_PATH", "/secrets/google_oauth.json")
 if not os.path.exists(WORKSPACE_SECRETS_PATH) and os.path.exists("/workspace/config/google_oauth.json"):
     WORKSPACE_SECRETS_PATH = "/workspace/config/google_oauth.json"
+
 
 def _resolve_nas_config():
     ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
@@ -44,6 +46,7 @@ def _resolve_nas_config():
 
     return host_1 or "127.0.0.1", host_2 or "127.0.0.1", ssh_port
 
+
 def parse_credentials(content: str) -> dict:
     try:
         return json.loads(content)
@@ -56,11 +59,13 @@ def parse_credentials(content: str) -> dict:
                 creds[k.strip().strip("\"").strip("'")] = v.strip().strip("\"").strip("'")
         return creds
 
+
 def load_credentials(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return parse_credentials(f.read())
 
-def exchange(raw_input: str):
+
+def exchange(raw_input: str, target: str = "workspace"):
     raw_input = raw_input.strip()
     if "code=" in raw_input:
         parsed = urllib.parse.urlparse(raw_input)
@@ -76,7 +81,7 @@ def exchange(raw_input: str):
     ssh_user = os.environ.get("NAS_SSH_USER", "Brock")
     _, host_2, ssh_port = _resolve_nas_config()
 
-    # Read client credentials
+    # Read base client credentials (client_id / client_secret)
     if os.path.exists(WORKSPACE_SECRETS_PATH):
         creds = load_credentials(WORKSPACE_SECRETS_PATH)
     else:
@@ -102,11 +107,22 @@ def exchange(raw_input: str):
             if new_refresh:
                 creds["refresh_token"] = new_refresh
             
-            # Save to /workspace/config/google_oauth.json and try WORKSPACE_SECRETS_PATH
-            local_configs = ["/workspace/config/google_oauth.json"]
-            if WORKSPACE_SECRETS_PATH not in local_configs:
-                local_configs.append(WORKSPACE_SECRETS_PATH)
-            for p in local_configs:
+            # Target filenames
+            if target == "home":
+                target_local_files = [
+                    "/workspace/config/google_home_oauth.json",
+                    "/secrets/google_home_oauth.json"
+                ]
+                nas_dest = "/docker/discord-agy-agent/secrets/google_home_oauth.json"
+            else:
+                target_local_files = [
+                    "/workspace/config/google_oauth.json"
+                ]
+                if WORKSPACE_SECRETS_PATH not in target_local_files:
+                    target_local_files.append(WORKSPACE_SECRETS_PATH)
+                nas_dest = NAS_SECRETS_PATH
+
+            for p in target_local_files:
                 try:
                     os.makedirs(os.path.dirname(p), exist_ok=True)
                     with open(p, "w") as f:
@@ -117,9 +133,9 @@ def exchange(raw_input: str):
             
             # Save to NAS host directly over SSH
             json_str = json.dumps(creds, indent=2)
-            sync_cmd = f'ssh -i {ssh_key} -p {ssh_port} -o BatchMode=yes -o StrictHostKeyChecking=no {ssh_user}@{host_2} "cat << \'INNER\' > {NAS_SECRETS_PATH}\n{json_str}\nINNER"'
+            sync_cmd = f'ssh -i {ssh_key} -p {ssh_port} -o BatchMode=yes -o StrictHostKeyChecking=no {ssh_user}@{host_2} "cat << \'INNER\' > {nas_dest}\n{json_str}\nINNER"'
             os.system(sync_cmd)
-            print(f"SUCCESS: Successfully exchanged and saved new refresh token to host ({host_2})!")
+            print(f"SUCCESS: Successfully exchanged and saved new refresh token to host ({host_2}) at {nas_dest}!")
             return True
     except urllib.error.HTTPError as e:
         print("HTTPError:", e.code, e.read().decode())
@@ -128,8 +144,12 @@ def exchange(raw_input: str):
         print(f"Exchange error: {e}")
         return False
 
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        exchange(sys.argv[1])
-    else:
-        print("Usage: exchange_oauth_token.py <code_or_url>")
+    parser = argparse.ArgumentParser(description="OAuth Token Exchange Utility")
+    parser.add_argument("code", help="Authorization code or redirected URL")
+    parser.add_argument("--home", action="store_true", help="Save token as Google Home credentials")
+    args = parser.parse_args()
+
+    target_type = "home" if args.home else "workspace"
+    exchange(args.code, target=target_type)

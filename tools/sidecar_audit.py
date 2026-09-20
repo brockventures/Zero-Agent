@@ -215,8 +215,6 @@ def audit_sidecars(verbose: bool = False) -> tuple[bool, list[dict]]:
                 candidates.extend(["reminders", "birthdays", "birthday"])
             if "digest" in jid:
                 candidates.append("digest")
-            if "token" in jid:
-                candidates.extend(["tokens", "token_report"])
             if "log" in jid:
                 candidates.extend(["logs", "nas_logs"])
         if script_path:
@@ -229,6 +227,31 @@ def audit_sidecars(verbose: bool = False) -> tuple[bool, list[dict]]:
                 break
         if not trigger_match and enabled and prompt != "[INTERNAL_SESSION_ROLLOVER]":
             warnings.append(f"No on-demand !<action> trigger mapped in tools/bridge_handlers.py (e.g. !{sidecar_act or jid})")
+
+        # 7. Execution Freshness & Staleness Check
+        if enabled:
+            last_epoch = job.get("last_run_ts")
+            now_epoch = time.time()
+            if stype == "interval":
+                cadence = job.get("interval_seconds", 3600)
+                thresh = max(cadence * 3.0, 7200)
+                cdesc = f"every {cadence // 60}m" if cadence < 3600 else f"every {cadence / 3600:.1f}h"
+            elif stype == "daily":
+                thresh = 86400 * 2.5
+                cdesc = "daily"
+            elif stype == "weekly":
+                thresh = 7 * 86400 * 2.0
+                cdesc = "weekly"
+            elif stype == "monthly":
+                thresh = 35 * 86400
+                cdesc = "monthly"
+            else:
+                thresh = None
+                cdesc = stype
+
+            if thresh and last_epoch and (now_epoch - last_epoch) > thresh:
+                age_h = (now_epoch - last_epoch) / 3600
+                warnings.append(f"Stale execution: last ran {job.get('last_run_at', 'unknown')} ({age_h:.1f}h ago, expected {cdesc})")
 
         status = "FAIL" if issues else ("WARN" if warnings else "PASS")
         if status == "FAIL":

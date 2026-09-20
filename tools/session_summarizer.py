@@ -209,19 +209,48 @@ def synthesize_session_milestones(dialogue: list[dict], sess_key: str) -> tuple[
         f"}}"
     )
     try:
-        res = subprocess.run(
+        proc = subprocess.Popen(
             ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={prompt}"],
-            capture_output=True, text=True, timeout=15
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,  # Isolated process group
+            cwd="/workspace"
         )
-        if res.returncode == 0 and res.stdout.strip():
-            m_json = re.search(r"\{[\s\S]*\}", res.stdout)
-            if m_json:
-                data = json.loads(m_json.group(0))
-                ms = "\n".join(data.get("milestones", []))
-                dr = "\n".join(data.get("directives", []))
-                ed = "\n".join(data.get("eng_delta", []))
-                if ms and dr:
-                    return ms, dr, ed or ms
+        try:
+            stdout, stderr = proc.communicate(timeout=15)
+            if proc.returncode == 0 and stdout.strip():
+                m_json = re.search(r"\{[\s\S]*\}", stdout)
+                if m_json:
+                    data = json.loads(m_json.group(0))
+                    ms = "\n".join(data.get("milestones", []))
+                    dr = "\n".join(data.get("directives", []))
+                    ed = "\n".join(data.get("eng_delta", []))
+                    if ms and dr:
+                        return ms, dr, ed or ms
+        except subprocess.TimeoutExpired:
+            print(f"[Summarizer] Timeout (15s) synthesizing milestones for {sess_key}. Reaping process group {proc.pid}...")
+            try:
+                import signal
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        finally:
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            if proc.stderr:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[Summarizer] LLM synthesis fallback: {e}")
 
@@ -264,10 +293,23 @@ def generate_summary(conv_id: str | None = None, sess_key: str = "home", dry_run
 
     milestones_block, directives_block, eng_delta_block = synthesize_session_milestones(recent_dialogue, sess_key)
 
+    # Resolve parent conversation ID
+    parent_id = conv_id
+    if not parent_id:
+        try:
+            from tools.bridge_state import get_session_parent_id
+            parent_id = get_session_parent_id(sess_key)
+        except Exception:
+            pass
+
+    parent_tag = f" [Parent: {parent_id}]" if parent_id else ""
+    parent_line = f"• **Parent Session UUID:** `{parent_id}`\n" if parent_id else ""
+
     # 1. Thread-Isolated Private Summary
     summary = (
-        f"<!-- Smart Rolling Compaction Generated {datetime.now(PT).strftime('%Y-%m-%d %I:%M %p PT')} [Session: {sess_key}] -->\n"
+        f"<!-- Smart Rolling Compaction Generated {datetime.now(PT).strftime('%Y-%m-%d %I:%M %p PT')} [Session: {sess_key}]{parent_tag} -->\n"
         "## 1. Compacted Earlier Session History (Milestones)\n"
+        f"{parent_line}"
         f"{milestones_block}\n\n"
         "## 2. Recent Verbatim Dialogue (Line-by-Line Context)\n"
         f"{dialogue_block}\n\n"
@@ -277,8 +319,9 @@ def generate_summary(conv_id: str | None = None, sess_key: str = "home", dry_run
 
     # 2. Sanitized Engineering Summary (for Crab Cavern)
     eng_summary = (
-        f"<!-- Engineering Delta Carry-Forward {datetime.now(PT).strftime('%Y-%m-%d %I:%M %p PT')} [Session: {sess_key}] -->\n"
+        f"<!-- Engineering Delta Carry-Forward {datetime.now(PT).strftime('%Y-%m-%d %I:%M %p PT')} [Session: {sess_key}]{parent_tag} -->\n"
         "## Engineering State & Architecture Delta\n"
+        f"{parent_line}"
         f"{eng_delta_block}\n"
     )
 

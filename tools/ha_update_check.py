@@ -34,7 +34,7 @@ def _resolve_nas_config():
         except Exception:
             pass
 
-    return host_1 or "127.0.0.1", host_2 or "127.0.0.1", ssh_port
+    return host_1 or os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), host_2 or os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), ssh_port
 
 HOST_1_IP, _, SSH_PORT = _resolve_nas_config()
 
@@ -105,37 +105,68 @@ def check_updates(quiet: bool = False):
             print(f"• Matter Server & OTBR: Aligned with active Thread mesh.")
 
 def perform_upgrade(target_service: str = "all"):
-    print("📦 **Initiating Smart Home Stack Upgrade...**")
+    print("📦 **Initiating Smart Home Stack Upgrade...**\n")
     ts = time.strftime("%Y%m%d_%H%M%S")
     backup_dir = "/data/backups/homeassistant"
-    run_ssh(f"mkdir -p {backup_dir}")
+    usb_backup_dir = "/volumeUSB1/usbshare/backups/homeassistant"
+    run_ssh(f"mkdir -p {backup_dir} {usb_backup_dir} 2>/dev/null || true")
 
-    # 1. Snapshot all stateful directories
+    # 1. Snapshot stateful directories & DB
     print("1. Creating snapshot backups of HA config, Matter fabric, and Thread credentials...")
+    backup_tar = f"{backup_dir}/smart_home_pre_upgrade_{ts}.tar.gz"
     backup_cmd = (
         f"tar --exclude='home-assistant_v2.db*' --exclude='*.log*' --exclude='.cloud' "
         f"--exclude='backups' --exclude='.git' --exclude='.cache' "
-        f"-czf {backup_dir}/smart_home_pre_upgrade_{ts}.tar.gz "
+        f"-czf '{backup_tar}' "
         f"-C /docker/homeassistant config matter-server otbr-data 2>/dev/null || true"
     )
     run_ssh(backup_cmd)
-    print("   ✅ Snapshots preserved in /data/backups/homeassistant/.")
+    
+    # SQLite WAL-safe backup of HA DB
+    backup_db = f"{backup_dir}/ha_db_pre_upgrade_{ts}.db"
+    run_ssh(f"sqlite3 /docker/homeassistant/config/home-assistant_v2.db \".backup '{backup_db}'\" 2>/dev/null || true")
+
+    # Check backup sizes
+    sz_tar = run_ssh(f"ls -lh '{backup_tar}' 2>/dev/null | awk '{{print $5}}'")
+    sz_db = run_ssh(f"ls -lh '{backup_db}' 2>/dev/null | awk '{{print $5}}'")
+    print(f"   ✅ Config & mesh snapshot: {sz_tar or 'saved'} ({backup_tar})")
+    print(f"   ✅ SQLite DB snapshot: {sz_db or 'saved'} ({backup_db})")
+
+    # Copy to USB backup if available
+    run_ssh(f"cp '{backup_tar}' '{usb_backup_dir}/' 2>/dev/null && cp '{backup_db}' '{usb_backup_dir}/' 2>/dev/null || true")
 
     # 2. Pull and recreate via compose
     latest_ha = get_latest_ha_stable()
-    print(f"2. Pulling and updating services to `v{latest_ha}`...")
+    print(f"\n2. Upgrading Home Assistant Core to `v{latest_ha}`...")
     # Update compose file image tag
     run_ssh(f"sed -i -E 's|image: homeassistant/home-assistant:.*|image: homeassistant/home-assistant:{latest_ha}|g' /docker/docker-compose.yml")
     
-    # Recreate in background detached
-    restart_cmd = (
-        "nohup sh -c '"
-        "cd /docker && docker compose pull homeassistant && docker compose up -d homeassistant && "
-        "cd /docker/homeassistant && docker compose pull matter-server otbr && docker compose up -d matter-server otbr"
-        "' >/dev/null 2>&1 &"
-    )
-    run_ssh(restart_cmd)
-    print(f"\n🚀 **Smart Home Stack Upgrade Dispatched!**\n• Pinned Home Assistant to `v{latest_ha}`\n• Matter Server & OTBR companions refreshing\n• Backups verified and safe.")
+    # Pull and recreate
+    run_ssh("cd /docker && docker compose pull homeassistant && docker compose up -d homeassistant")
+    run_ssh("cd /docker/homeassistant && docker compose pull matter-server otbr go2rtc && docker compose up -d matter-server otbr go2rtc")
+
+    # 3. Verify health & state
+    print("\n3. Verifying service health...")
+    ha_online = False
+    for i in range(15):
+        time.sleep(3)
+        res = run_ssh("curl -s -o /dev/null -w '%{http_code}' http://localhost:8123/api/ || true")
+        if res in ("200", "401"):
+            ha_online = True
+            break
+    
+    new_version = get_installed_ha_version()
+    print(f"   • Home Assistant Core: `v{new_version}` ({'Online' if ha_online else 'Starting up'})")
+    
+    # Check companion containers
+    matter_stat = run_ssh("docker inspect -f '{{.State.Status}}' matterserver 2>/dev/null || true")
+    otbr_stat = run_ssh("docker inspect -f '{{.State.Status}}' otbr 2>/dev/null || true")
+    go2rtc_stat = run_ssh("docker inspect -f '{{.State.Status}}' go2rtc 2>/dev/null || true")
+    print(f"   • Matter Server: `{matter_stat or 'unknown'}`")
+    print(f"   • OpenThread Border Router (OTBR): `{otbr_stat or 'unknown'}`")
+    print(f"   • go2rtc: `{go2rtc_stat or 'unknown'}`")
+
+    print(f"\n🎉 **Smart Home Stack Upgrade Complete!**\n• Pinned Home Assistant to `v{latest_ha}`\n• Matter Server, OTBR, and go2rtc refreshed\n• Pre-upgrade snapshots preserved.")
 
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "check"

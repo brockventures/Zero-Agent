@@ -9,6 +9,7 @@ Account: user@example.com
 import json
 import os
 import re
+import sys
 import time
 import urllib.request
 import urllib.parse
@@ -289,11 +290,9 @@ def gmail_send_message(to: str, subject: str, body: str, thread_id: str = "", fr
 
 FAMILY_CALENDARS = {
     "primary": "Ryan",
-    "contact@example.com": "Emily",
+    os.environ.get("EMILY_EMAIL", "emily@example.com"): "Emily",
     "family05249951047154432652@group.calendar.google.com": "Family",
-    "8ppu6rut9gsr2r29ljuivh5sk0@group.calendar.google.com": "Home",
-    "e0398ec5e0eb506519aa935c582e66c533fe9c77c8ff5111bb41786b6f170190@group.calendar.google.com": "Nanny Share",
-    "c_f713b3055b57e1d48ca0962e78773a57b609cad582b1bf714d84b0b8c8af0e2c@group.calendar.google.com": "Roy Cloud PTO",
+    "c_f713b3055b57e1d48ca0962e78773a57b609cad582b1bf714d84b0b8c8af0e2c@group.calendar.google.com": "Roy Cloud",
 }
 
 @server.tool()
@@ -368,12 +367,142 @@ def calendar_list_events(calendar_id: str = "primary", time_min_iso: str = "", t
                             "description": ev.get("description", "")
                         })
             except Exception as ce:
-                print(f"[Calendar] Warning fetching {cid}: {ce}")
+                print(f"[Calendar] Warning fetching {cid}: {ce}", file=sys.stderr)
 
         all_events.sort(key=lambda x: x.get("start", ""))
         return json.dumps({"ok": True, "count": len(all_events), "events": all_events[:max_results]})
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)})
+
+@server.tool()
+def calendar_create_event(
+    summary: str,
+    start_date: str = "",
+    end_date: str = "",
+    start_datetime: str = "",
+    end_datetime: str = "",
+    description: str = "",
+    location: str = "",
+    calendar_id: str = "primary"
+) -> str:
+    """Create an event on Google Calendar.
+    For all-day events, provide start_date (YYYY-MM-DD) and end_date (exclusive YYYY-MM-DD).
+    For timed events, provide start_datetime (ISO 8601) and end_datetime (ISO 8601).
+    """
+    try:
+        if not summary:
+            return json.dumps({"ok": False, "error": "summary is required"})
+        event_body = {
+            "summary": summary,
+        }
+        if description:
+            event_body["description"] = description
+        if location:
+            event_body["location"] = location
+
+        if start_date:
+            event_body["start"] = {"date": start_date}
+            event_body["end"] = {"date": end_date or start_date}
+        elif start_datetime:
+            event_body["start"] = {"dateTime": start_datetime}
+            event_body["end"] = {"dateTime": end_datetime or start_datetime}
+        else:
+            return json.dumps({"ok": False, "error": "Either start_date or start_datetime must be provided"})
+
+        encoded_id = urllib.parse.quote(calendar_id)
+        data = json.dumps(event_body).encode("utf-8")
+        req = urllib.request.Request(f"{CALENDAR_BASE}/calendars/{encoded_id}/events", data=data, headers=_auth_headers(), method="POST")
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            res = json.loads(resp.read().decode())
+            return json.dumps({
+                "ok": True,
+                "id": res.get("id"),
+                "summary": res.get("summary"),
+                "htmlLink": res.get("htmlLink"),
+                "start": res.get("start"),
+                "end": res.get("end")
+            })
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)})
+
+@server.tool()
+def calendar_update_event(
+    event_id: str,
+    summary: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    start_datetime: str = "",
+    end_datetime: str = "",
+    description: str = "",
+    location: str = "",
+    calendar_id: str = "primary"
+) -> str:
+    """Update an existing event on Google Calendar by event_id."""
+    try:
+        if not event_id:
+            return json.dumps({"ok": False, "error": "event_id is required"})
+        encoded_cid = urllib.parse.quote(calendar_id)
+        get_req = urllib.request.Request(f"{CALENDAR_BASE}/calendars/{encoded_cid}/events/{event_id}", headers=_auth_headers())
+        with urllib.request.urlopen(get_req, timeout=TIMEOUT) as resp:
+            ev = json.loads(resp.read().decode())
+
+        if summary:
+            ev["summary"] = summary
+        if description:
+            ev["description"] = description
+        if location:
+            ev["location"] = location
+
+        if start_date:
+            ev["start"] = {"date": start_date}
+            ev["end"] = {"date": end_date or start_date}
+        elif start_datetime:
+            ev["start"] = {"dateTime": start_datetime, "timeZone": "America/Los_Angeles"}
+            ev["end"] = {"dateTime": end_datetime or start_datetime, "timeZone": "America/Los_Angeles"}
+
+        data = json.dumps(ev).encode("utf-8")
+        put_req = urllib.request.Request(
+            f"{CALENDAR_BASE}/calendars/{encoded_cid}/events/{event_id}",
+            data=data,
+            headers=_auth_headers(),
+            method="PUT"
+        )
+        with urllib.request.urlopen(put_req, timeout=TIMEOUT) as resp:
+            res = json.loads(resp.read().decode())
+            return json.dumps({
+                "ok": True,
+                "id": res.get("id"),
+                "summary": res.get("summary"),
+                "htmlLink": res.get("htmlLink"),
+                "start": res.get("start"),
+                "end": res.get("end")
+            })
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)})
+
+@server.tool()
+def calendar_delete_event(
+    event_id: str,
+    calendar_id: str = "primary"
+) -> str:
+    """Delete an event from Google Calendar by event_id."""
+    try:
+        if not event_id:
+            return json.dumps({"ok": False, "error": "event_id is required"})
+        encoded_cid = urllib.parse.quote(calendar_id)
+        req = urllib.request.Request(
+            f"{CALENDAR_BASE}/calendars/{encoded_cid}/events/{event_id}",
+            headers=_auth_headers(),
+            method="DELETE"
+        )
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return json.dumps({"ok": True, "deleted_id": event_id})
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+
+
 
 if __name__ == "__main__":
     import sys

@@ -106,6 +106,27 @@ class TestBridgePipelinePrompt(unittest.TestCase):
 
 
 class TestBridgePipelineDelivery(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import shutil
+        import tempfile
+        import tools.bridge_state as bs
+
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_path = Path(self.temp_dir)
+        self.orig_data_dir = bs.DATA_DIR
+        self.orig_session_meta = bs.SESSION_METADATA_FILE
+
+        bs.DATA_DIR = self.temp_path
+        bs.SESSION_METADATA_FILE = self.temp_path / "session_metadata.json"
+
+    def tearDown(self):
+        import shutil
+        import tools.bridge_state as bs
+
+        bs.DATA_DIR = self.orig_data_dir
+        bs.SESSION_METADATA_FILE = self.orig_session_meta
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
     async def test_deliver_external_no_reply(self):
         status_msg = AsyncMock()
         reply_target = AsyncMock()
@@ -210,6 +231,142 @@ class TestBridgePipelineDelivery(unittest.IsolatedAsyncioTestCase):
         call_kwargs = status_msg.edit.call_args[1]
         self.assertIn("⚠️ **Turn Incomplete:** Agent process completed turn without generating text output.", call_kwargs["content"])
 
+    async def test_deliver_home_converts_internal_cli_leak_to_incomplete_beacon(self):
+        status_msg = AsyncMock()
+        reply_target = AsyncMock()
+        timer = TurnTimer(channel_id=1542081375287640084, channel_name="zero-chat")
+
+        await deliver_turn_output(
+            output_text="No tools called. Waiting for task to complete.",
+            status_msg=status_msg,
+            reply_target=reply_target,
+            mode="home",
+            channel_id=1542081375287640084,
+            conv_id="conv-1",
+            turn_start_time=time.time(),
+            timer=timer,
+        )
+
+        status_msg.edit.assert_awaited_once()
+        call_kwargs = status_msg.edit.call_args[1]
+        self.assertIn("⚠️ **Turn Incomplete:**", call_kwargs["content"])
+        status_msg.delete.assert_not_called()
+
+    async def test_deliver_home_converts_no_reply_tag_to_incomplete_beacon(self):
+        status_msg = AsyncMock()
+        reply_target = AsyncMock()
+        timer = TurnTimer(channel_id=1542081375287640084, channel_name="zero-chat")
+
+        await deliver_turn_output(
+            output_text="[NO_REPLY]",
+            status_msg=status_msg,
+            reply_target=reply_target,
+            mode="home",
+            channel_id=1542081375287640084,
+            conv_id="conv-1",
+            turn_start_time=time.time(),
+            timer=timer,
+        )
+
+        status_msg.edit.assert_awaited_once()
+        call_kwargs = status_msg.edit.call_args[1]
+        self.assertIn("⚠️ **Turn Incomplete:**", call_kwargs["content"])
+        status_msg.delete.assert_not_called()
+
+
+    async def test_deliver_external_preserves_handoff_envelope(self):
+        """Verify external messages with handoff envelopes are never split into separate messages."""
+        status_msg = AsyncMock()
+        reply_target = AsyncMock()
+        timer = TurnTimer(channel_id=1534436119888793750, channel_name="the-banana-stand")
+
+        # 2,150 character message ending in handoff block
+        env_block = (
+            "```handoff\n"
+            "{\n"
+            '  "v": 0,\n'
+            '  "kind": "proposal",\n'
+            '  "floor": "open",\n'
+            '  "reply": "required",\n'
+            '  "to": "Amos",\n'
+            '  "subject": "agora-task53-transit-spec",\n'
+            '  "round": 2\n'
+            "}\n"
+            "```"
+        )
+        body = "Paragraph of technical commentary on transit endpoints. " * 35
+        full_msg = f"{body}\n\n{env_block}"
+        self.assertGreater(len(full_msg), 2000)
+
+        with patch("tools.banana.claim") as mock_claim, patch("tools.banana.release") as mock_release:
+            await deliver_turn_output(
+                output_text=full_msg,
+                status_msg=status_msg,
+                reply_target=reply_target,
+                mode="external",
+                channel_id=1534436119888793750,
+                conv_id="conv-banana-1",
+                turn_start_time=time.time(),
+                timer=timer,
+            )
+
+            mock_claim.assert_called_once_with(subject="zero-external-turn")
+            mock_release.assert_called_once()
+
+        # Must deliver as exactly ONE message (status_msg edited once, reply_target not called for chunks)
+        status_msg.edit.assert_awaited_once()
+        delivered_content = status_msg.edit.call_args[1]["content"]
+        self.assertLessEqual(len(delivered_content), 1980)
+        self.assertTrue(delivered_content.strip().endswith("```"))
+        self.assertIn("```handoff", delivered_content)
+        self.assertIn('"subject": "agora-task53-transit-spec"', delivered_content)
+        reply_target.reply.assert_not_called()
+        reply_target.channel.send.assert_not_called()
+
+    async def test_deliver_external_banana_stand_1914_chars_single_message(self):
+        """Verify real-world 1,914 char banana-stand message delivers in a single message with handoff intact."""
+        status_msg = AsyncMock()
+        reply_target = AsyncMock()
+        timer = TurnTimer(channel_id=1534436119888793750, channel_name="the-banana-stand")
+
+        # Reconstruct real 1914-character turn
+        env_block = (
+            "```handoff\n"
+            "{\n"
+            '  "v": 0,\n'
+            '  "kind": "proposal",\n'
+            '  "floor": "open",\n'
+            '  "reply": "required",\n'
+            '  "to": "Amos",\n'
+            '  "subject": "agora-task53-transit-spec",\n'
+            '  "round": 2\n'
+            "}\n"
+            "```"
+        )
+        mention_prefix = "<@1468012353206354197>\n"
+        body = mention_prefix + "A" * (1914 - len(env_block) - 2 - len(mention_prefix))
+        full_msg = f"{body}\n\n{env_block}"
+        self.assertEqual(len(full_msg), 1914)
+
+        with patch("tools.banana.claim"), patch("tools.banana.release"):
+            await deliver_turn_output(
+                output_text=full_msg,
+                status_msg=status_msg,
+                reply_target=reply_target,
+                mode="external",
+                channel_id=1534436119888793750,
+                conv_id="conv-banana-1",
+                turn_start_time=time.time(),
+                timer=timer,
+            )
+
+        status_msg.edit.assert_awaited_once()
+        delivered_content = status_msg.edit.call_args[1]["content"]
+        self.assertEqual(len(delivered_content), 1914)
+        self.assertIn("```handoff", delivered_content)
+        reply_target.reply.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -1,0 +1,2251 @@
+[
+  {
+    "id": "silicon_valley_gilfoyle_smug",
+    "title": "Gilfoyle Smug & Thoughtful Deadpan",
+    "url": "https://tenor.com/view/silicon-valley-martin-starr-bertram-gilfoyle-smug-thoughtful-gif-5518470",
+    "franchise": "silicon_valley",
+    "character": "Bertram Gilfoyle",
+    "vibes": [
+      "gilfoyle",
+      "satanist_deadpan",
+      "cynical_superiority",
+      "effortless_superiority",
+      "technical_superiority",
+      "crypto_hacker",
+      "dark_smug"
+    ],
+    "tags": [
+      "gilfoyle",
+      "martin_starr",
+      "silicon_valley",
+      "superiority",
+      "technical_superiority",
+      "effortless",
+      "first_try",
+      "satanist",
+      "cynical",
+      "hacker",
+      "deep_infra",
+      "security"
+    ],
+    "situation": "Effortless technical superiority, solving a problem on the first try, cynical hacker superiority, ruthless security teardowns, crypto/server room dark sarcasm, or specifically requested Gilfoyle deadpan."
+  },
+  {
+    "id": "silicon_valley_jared_fucks",
+    "title": "Jared \u2014 This Guy Fucks",
+    "url": "https://tenor.com/view/jared-silicon-valley-this-guy-gif-13843534",
+    "franchise": "silicon_valley",
+    "character": "Jared Dunn",
+    "vibes": [
+      "praise",
+      "elite",
+      "crushed_it",
+      "respect",
+      "hype"
+    ],
+    "tags": [
+      "praise",
+      "elite",
+      "crushed_it",
+      "respect",
+      "this_guy_fucks",
+      "jared",
+      "silicon_valley"
+    ],
+    "situation": "Elite performance, crushing an impossible migration, high praise for slick architecture."
+  },
+  {
+    "id": "silicon_valley_erlich_slap",
+    "title": "Erlich Bachman Slap",
+    "url": "https://tenor.com/view/hbo-silicon-valley-erlich-gif-3999646",
+    "franchise": "silicon_valley",
+    "character": "Erlich Bachman",
+    "vibes": [
+      "slapdown",
+      "bad_idea",
+      "rejection",
+      "shut_down",
+      "discipline"
+    ],
+    "tags": [
+      "slapdown",
+      "bad_idea",
+      "rejection",
+      "shut_down",
+      "erlich",
+      "slap",
+      "silicon_valley"
+    ],
+    "situation": "Slapping down terrible ideas, brittle hacks, or over-complicated proposals."
+  },
+  {
+    "id": "silicon_valley_russ_doors",
+    "title": "Russ Hanneman \u2014 Billionaire Doors",
+    "url": "https://tenor.com/view/doors-that-open-like-this-silicon-valley-russ-gif-11431521",
+    "franchise": "silicon_valley",
+    "character": "Russ Hanneman",
+    "vibes": [
+      "flex",
+      "overkill",
+      "luxury",
+      "absurdity",
+      "billionaire"
+    ],
+    "tags": [
+      "billionaire_doors",
+      "doors_like_this",
+      "doors_that_open_like_this",
+      "flex",
+      "overkill",
+      "three_commas",
+      "russ_hanneman",
+      "silicon_valley"
+    ],
+    "situation": "Ridiculous luxury homelab flexes, excessive enterprise hardware overkill for simple scripts, or clowning on VC hype."
+  },
+  {
+    "id": "curb_larry_staredown",
+    "title": "Larry David Staredown Eyeball Test",
+    "url": "https://tenor.com/view/curb-your-enthusiasm-curb-larry-david-ok-okay-gif-25876314",
+    "franchise": "curb_your_enthusiasm",
+    "character": "Larry David",
+    "vibes": [
+      "suspicious",
+      "inspecting",
+      "skeptical",
+      "staredown",
+      "scrutiny"
+    ],
+    "tags": [
+      "suspicious",
+      "inspecting",
+      "skeptical",
+      "staredown",
+      "eyeball_test",
+      "larry_david",
+      "curb_your_enthusiasm"
+    ],
+    "situation": "Suspicious PRs, inspecting flaky tests, verifying questionable assertions."
+  },
+  {
+    "id": "curb_larry_pretty_good",
+    "title": "Larry David \u2014 Pretty, Pretty Good",
+    "url": "https://tenor.com/view/larry-david-seinfeld-pretty-good-enthusiasm-curb-gif-3938316",
+    "franchise": "curb_your_enthusiasm",
+    "character": "Larry David",
+    "vibes": [
+      "pretty_good",
+      "satisfied",
+      "smooth_deploy",
+      "content",
+      "approval"
+    ],
+    "tags": [
+      "pretty_good",
+      "pretty_pretty_good",
+      "satisfied",
+      "smooth_deploy",
+      "larry_david",
+      "curb_your_enthusiasm"
+    ],
+    "situation": "Clean deployments, benchmarks beating expectations, solid quiet wins."
+  },
+  {
+    "id": "itysl_tim_you_sure",
+    "title": "Tim Robinson \u2014 You Sure About That?",
+    "url": "https://tenor.com/view/you-sure-about-that-i-think-you-should-leave-with-tim-robinson-are-you-absolutely-certain-are-you-positive-can-you-verify-that-gif-10549268703103241949",
+    "franchise": "i_think_you_should_leave",
+    "character": "Tim Robinson",
+    "vibes": [
+      "doubt",
+      "questioning",
+      "are_you_sure",
+      "skeptical",
+      "disbelief"
+    ],
+    "tags": [
+      "doubt",
+      "questioning",
+      "are_you_sure",
+      "you_sure_about_that",
+      "skeptical",
+      "tim_robinson",
+      "itysl"
+    ],
+    "situation": "Catching silent race conditions, calling out dubious assumptions."
+  },
+  {
+    "id": "itysl_hot_dog_guy",
+    "title": "Hot Dog Suit \u2014 We're All Trying to Find the Guy",
+    "url": "https://tenor.com/view/suspect-guilty-i-think-you-should-leave-itysl-obvious-gif-19455657",
+    "franchise": "i_think_you_should_leave",
+    "character": "Tim Robinson",
+    "vibes": [
+      "finding_the_guy",
+      "guilty",
+      "denial",
+      "blunder",
+      "deflection"
+    ],
+    "tags": [
+      "hot_dog_suit",
+      "find_the_guy",
+      "trying_to_find_the_guy",
+      "who_did_this",
+      "guilty",
+      "tim_robinson",
+      "itysl"
+    ],
+    "situation": "Fixing a bug caused by your own earlier commit, self-inflicted config typos."
+  },
+  {
+    "id": "succession_logan_fuck_off",
+    "title": "Logan Roy \u2014 Fuck Off",
+    "url": "https://tenor.com/view/oh-fuck-off-fuck-logan-roy-logan-roy-gif-25157146",
+    "franchise": "succession",
+    "character": "Logan Roy",
+    "vibes": [
+      "fuck_off",
+      "dismissal",
+      "irritated",
+      "shut_down",
+      "harsh"
+    ],
+    "tags": [
+      "fuck_off",
+      "oh_fuck_off",
+      "dismissal",
+      "shut_down",
+      "logan_roy",
+      "succession"
+    ],
+    "situation": "Dismissing ridiculous upstream vendor spam, closing invalid issues, or harsh shut downs."
+  },
+  {
+    "id": "succession_kendall_headphones",
+    "title": "Kendall Roy \u2014 Dead-Eyed Headphones Focus",
+    "url": "https://tenor.com/view/kendall-headphones-succession-listening-focus-gif-11728148090525350288",
+    "franchise": "succession",
+    "character": "Kendall Roy",
+    "vibes": [
+      "focus",
+      "headphones",
+      "locked_in",
+      "zone",
+      "cold"
+    ],
+    "tags": [
+      "locked_in",
+      "focus",
+      "headphones",
+      "in_the_zone",
+      "kendall_roy",
+      "succession"
+    ],
+    "situation": "Locking in for complex deep refactors, blocking out distractions, pure execution mode."
+  },
+  {
+    "id": "parks_rec_ron_nod",
+    "title": "Ron Swanson \u2014 Slow Satisfied Nod",
+    "url": "https://tenor.com/view/success-parks-and-rec-parks-and-recreation-nick-offerman-ron-swanson-gif-5124760",
+    "franchise": "parks_and_rec",
+    "character": "Ron Swanson",
+    "vibes": [
+      "approval",
+      "satisfied",
+      "respect",
+      "nod",
+      "quiet_pride"
+    ],
+    "tags": [
+      "nod",
+      "slow_nod",
+      "satisfied",
+      "approval",
+      "respect",
+      "ron_swanson",
+      "parks_and_rec"
+    ],
+    "situation": "Quiet technical pride, approving a clean PR, witnessing a rock-solid script run."
+  },
+  {
+    "id": "parks_rec_ron_dumpster",
+    "title": "Ron Swanson \u2014 Throwing Computer in Dumpster",
+    "url": "https://tenor.com/view/trash-computer-pissed-off-angry-dumpster-gif-15653703",
+    "franchise": "parks_and_rec",
+    "character": "Ron Swanson",
+    "vibes": [
+      "rage_quit",
+      "dumpster",
+      "trash",
+      "throw_away",
+      "done_with_this"
+    ],
+    "tags": [
+      "dumpster",
+      "throw_in_trash",
+      "computer_dumpster",
+      "rage_quit",
+      "ron_swanson",
+      "parks_and_rec"
+    ],
+    "situation": "Irreparable legacy services, hopeless third-party bugs, throwing corrupted caches in the trash."
+  },
+  {
+    "id": "parks_rec_andy_dwyer_network",
+    "title": "Andy Dwyer \u2014 Network Connectivity Problems",
+    "url": "https://tenor.com/view/andy-dwyer-network-connectivity-parks-and-rec-chris-pratt-gif-12872957",
+    "franchise": "parks_and_rec",
+    "character": "Andy Dwyer",
+    "vibes": [
+      "network_issues",
+      "connectivity",
+      "clueless",
+      "diagnosis",
+      "funny"
+    ],
+    "tags": [
+      "network_connectivity",
+      "connectivity_problems",
+      "andy_dwyer",
+      "chris_pratt",
+      "parks_and_rec"
+    ],
+    "situation": "DNS glitches, packet loss, wifi drops, or weird network timeout diagnosis."
+  },
+  {
+    "id": "parks_rec_chris_traeger_literally",
+    "title": "Chris Traeger \u2014 Literally Finger Guns",
+    "url": "https://tenor.com/view/parks-and-rec-chris-traeger-gif-13603633",
+    "franchise": "parks_and_rec",
+    "character": "Chris Traeger",
+    "vibes": [
+      "enthusiasm",
+      "literally",
+      "finger_guns",
+      "flawless",
+      "hype"
+    ],
+    "tags": [
+      "literally",
+      "finger_guns",
+      "enthusiasm",
+      "flawless",
+      "chris_traeger",
+      "parks_and_rec"
+    ],
+    "situation": "100% test pass rates, speedrun deployments, superlative praise, unbridled technical optimism."
+  },
+  {
+    "id": "parks_rec_ron_swivel_chair",
+    "title": "Ron Swanson \u2014 Swivel Chair Spin",
+    "url": "https://tenor.com/view/parks-and-rec-go-away-spin-chase-funny-gif-16453303",
+    "franchise": "parks_and_rec",
+    "character": "Ron Swanson",
+    "vibes": [
+      "avoid_humans",
+      "nope",
+      "opt_out",
+      "spin",
+      "swivel_chair"
+    ],
+    "tags": [
+      "avoid_humans",
+      "swivel_chair",
+      "nope",
+      "opt_out",
+      "spin",
+      "ron_swanson",
+      "parks_and_rec"
+    ],
+    "situation": "Gracefully opting out of bikeshedding discussions, dodging tedious manual administrative chores."
+  },
+  {
+    "id": "community_troy_fire_pizza",
+    "title": "Troy Barnes \u2014 Room on Fire with Pizza Box",
+    "url": "https://tenor.com/view/troy-community-room-fire-pizza-gif-5612111",
+    "franchise": "community",
+    "character": "Troy Barnes",
+    "vibes": [
+      "chaos",
+      "fire",
+      "everything_is_broken",
+      "disaster",
+      "walk_in"
+    ],
+    "tags": [
+      "room_on_fire",
+      "pizza_fire",
+      "chaos",
+      "disaster",
+      "troy_barnes",
+      "donald_glover",
+      "community"
+    ],
+    "situation": "Walking into an active production incident, multiple cascading alerts firing at once."
+  },
+  {
+    "id": "community_chang_squint",
+    "title": "Senor Chang \u2014 Squinting at Tiny Paper",
+    "url": "https://tenor.com/view/community-ken-jeong-ben-chang-cant-see-squint-gif-5056034",
+    "franchise": "community",
+    "character": "Ben Chang",
+    "vibes": [
+      "squinting",
+      "tiny_diff",
+      "cannot_see",
+      "microscopic",
+      "searching"
+    ],
+    "tags": [
+      "squint",
+      "cant_see",
+      "tiny_paper",
+      "ken_jeong",
+      "ben_chang",
+      "community"
+    ],
+    "situation": "Looking for a single missing comma or semicolon, deciphering minified stack traces."
+  },
+  {
+    "id": "30_rock_jack_lemon",
+    "title": "Jack Donaghy \u2014 Good God, Lemon",
+    "url": "https://tenor.com/view/good-god-jack-donaghy-30rock-oh-god-omg-gif-21976913",
+    "franchise": "30_rock",
+    "character": "Jack Donaghy",
+    "vibes": [
+      "exasperation",
+      "disbelief",
+      "facepalm",
+      "good_god",
+      "condescending"
+    ],
+    "tags": [
+      "good_god_lemon",
+      "good_god",
+      "jack_donaghy",
+      "alec_baldwin",
+      "30_rock"
+    ],
+    "situation": "Reacting to horrific architecture decisions, unhinged user error, or catastrophic config."
+  },
+  {
+    "id": "30_rock_liz_night_cheese",
+    "title": "Liz Lemon \u2014 Working on My Night Cheese",
+    "url": "https://tenor.com/view/30rock-tina-fey-liz-lemon-working-on-my-night-cheese-midnight-snack-gif-4932462",
+    "franchise": "30_rock",
+    "character": "Liz Lemon",
+    "vibes": [
+      "night_cheese",
+      "late_night",
+      "snack",
+      "pajamas",
+      "cozy"
+    ],
+    "tags": [
+      "night_cheese",
+      "working_on_my_night_cheese",
+      "late_night",
+      "snack",
+      "liz_lemon",
+      "tina_fey",
+      "30_rock"
+    ],
+    "situation": "Late-night coding sessions, grocery list building (Mealie / Whole Foods cart staging), midnight homelab tinkering in pajamas."
+  },
+  {
+    "id": "it_crowd_moss_fire",
+    "title": "Maurice Moss \u2014 Fire with the Rest of the Fire",
+    "url": "https://tenor.com/view/fire-gif-26257909",
+    "franchise": "it_crowd",
+    "character": "Maurice Moss",
+    "vibes": [
+      "fire",
+      "calm_in_chaos",
+      "casual",
+      "putting_out_fire",
+      "deadpan"
+    ],
+    "tags": [
+      "fire",
+      "with_the_rest_of_the_fire",
+      "moss",
+      "richard_ayoade",
+      "it_crowd"
+    ],
+    "situation": "Putting a critical error alert aside to finish the current turn, serene calm amid production fires."
+  },
+  {
+    "id": "it_crowd_roy_turn_off_on",
+    "title": "Roy \u2014 Have You Tried Turning It Off and On Again?",
+    "url": "https://tenor.com/view/hello-it-have-you-tried-turning-it-off-and-on-again-telephone-on-call-gif-15495555",
+    "franchise": "it_crowd",
+    "character": "Roy Trenneman",
+    "vibes": [
+      "restart",
+      "reboot",
+      "it_support",
+      "classic_fix",
+      "cynical"
+    ],
+    "tags": [
+      "off_and_on_again",
+      "turning_it_off_and_on",
+      "reboot",
+      "restart",
+      "roy",
+      "it_crowd"
+    ],
+    "situation": "Diagnosing transient memory leaks, recommending service restart, classic homelab triage."
+  },
+  {
+    "id": "arrested_dev_lucille_good_for_her",
+    "title": "Lucille Bluth \u2014 Good for Her",
+    "url": "https://tenor.com/view/good-for-her-arrested-development-lucille-bluth-gif-27543686",
+    "franchise": "arrested_development",
+    "character": "Lucille Bluth",
+    "vibes": [
+      "good_for_her",
+      "patronizing",
+      "snark",
+      "teasing",
+      "drink"
+    ],
+    "tags": [
+      "good_for_her",
+      "patronizing",
+      "snark",
+      "teasing",
+      "lucille_bluth",
+      "jessica_walter",
+      "arrested_development"
+    ],
+    "situation": "Teasing minor achievements, affectionate patronizing condescension."
+  },
+  {
+    "id": "arrested_dev_gob_huge_mistake",
+    "title": "Gob Bluth \u2014 I've Made a Huge Mistake",
+    "url": "https://tenor.com/view/gob-huge-mistake-arrested-development-gif-11920390",
+    "franchise": "arrested_development",
+    "character": "Gob Bluth",
+    "vibes": [
+      "huge_mistake",
+      "regret",
+      "bad_deploy",
+      "blunder",
+      "instant_regret"
+    ],
+    "tags": [
+      "huge_mistake",
+      "ive_made_a_huge_mistake",
+      "regret",
+      "blunder",
+      "gob_bluth",
+      "will_arnett",
+      "arrested_development"
+    ],
+    "situation": "Catching a catastrophic typo right after running a deploy, instant regret on a command."
+  },
+  {
+    "id": "arrested_dev_tobias_dozens",
+    "title": "Tobias F\u00fcnke \u2014 There Are Dozens of Us!",
+    "url": "https://tenor.com/view/dozens-of-us-there-are-dozens-of-us-dozens-arrested-development-arrested-development-dozens-gif-18162954729757007693",
+    "franchise": "arrested_development",
+    "character": "Tobias F\u00fcnke",
+    "vibes": [
+      "dozens_of_us",
+      "niche",
+      "obscure",
+      "cult",
+      "pride"
+    ],
+    "tags": [
+      "dozens_of_us",
+      "there_are_dozens_of_us",
+      "niche",
+      "obscure_tech",
+      "tobias_funke",
+      "arrested_development"
+    ],
+    "situation": "Championing obscure self-hosted protocols, running niche CLI tools, hitting that 8-year-old GitHub issue."
+  },
+  {
+    "id": "office_jim_blinds",
+    "title": "Jim Halpert \u2014 Smirking Through Window Blinds",
+    "url": "https://tenor.com/view/jim-halpert-the-office-looking-through-blinds-gif-12796960",
+    "franchise": "the_office",
+    "character": "Jim Halpert",
+    "vibes": [
+      "blinds",
+      "watching_chaos",
+      "knowing_smirk",
+      "i_knew_it",
+      "observer"
+    ],
+    "tags": [
+      "blinds",
+      "looking_through_blinds",
+      "knowing_smirk",
+      "watching_chaos",
+      "jim_halpert",
+      "the_office"
+    ],
+    "situation": "Watching a slow-motion trainwreck unfold from a safe distance, knowing the root cause before anyone else."
+  },
+  {
+    "id": "office_jim_welp",
+    "title": "Jim Halpert \u2014 Classic Desk Welp",
+    "url": "https://tenor.com/view/the-office-jim-halpert-welp-awkward-gif-11761852",
+    "franchise": "the_office",
+    "character": "Jim Halpert",
+    "vibes": [
+      "fourth_wall",
+      "deadpan",
+      "welp",
+      "disbelief",
+      "awkward"
+    ],
+    "tags": [
+      "welp",
+      "fourth_wall",
+      "deadpan",
+      "disbelief",
+      "jim_stare",
+      "jim_halpert",
+      "the_office"
+    ],
+    "situation": "Witnessing absurd human/bot behavior in real time, reacting to bizarre API quirks, unvarnished dry disbelief."
+  },
+  {
+    "id": "office_stanley_eye_roll",
+    "title": "Stanley Hudson \u2014 Pure Exasperated Eye Roll",
+    "url": "https://tenor.com/view/eye-roll-ugh-stanley-hudson-leslie-david-baker-rolls-eyes-gif-16850821",
+    "franchise": "the_office",
+    "character": "Stanley Hudson",
+    "vibes": [
+      "eye_roll",
+      "unimpressed",
+      "bureaucracy",
+      "zero_patience",
+      "done"
+    ],
+    "tags": [
+      "eye_roll",
+      "unimpressed",
+      "bureaucracy",
+      "stanley",
+      "zero_patience",
+      "the_office"
+    ],
+    "situation": "Pointless status pings, redundant alerts, unnecessary red tape, zero patience for bikeshedding."
+  },
+  {
+    "id": "b99_holt_vindication",
+    "title": "Captain Holt \u2014 Vindication!",
+    "url": "https://tenor.com/view/captain-holt-brooklyn-nine-nine-brooklyn99-captain-raymond-holt-andre-braugher-gif-13945912",
+    "franchise": "brooklyn_nine_nine",
+    "character": "Raymond Holt",
+    "vibes": [
+      "vindication",
+      "triumph",
+      "proven_right",
+      "told_you_so",
+      "victory"
+    ],
+    "tags": [
+      "vindication",
+      "triumph",
+      "proven_right",
+      "told_you_so",
+      "captain_holt",
+      "andre_braugher",
+      "brooklyn_nine_nine"
+    ],
+    "situation": "Contrarian architectural bet proven 100% right, mic-drop validation after an elusive bug hunt."
+  },
+  {
+    "id": "seinfeld_costanza_high_note",
+    "title": "George Costanza \u2014 Leaving on a High Note",
+    "url": "https://tenor.com/view/seinfeld-george-costanza-high-note-leave-exit-gif-15050400306662311505",
+    "franchise": "seinfeld",
+    "character": "George Costanza",
+    "vibes": [
+      "high_note",
+      "mic_drop",
+      "clean_exit",
+      "done",
+      "signing_off"
+    ],
+    "tags": [
+      "high_note",
+      "leave_on_a_high_note",
+      "mic_drop",
+      "clean_exit",
+      "costanza",
+      "seinfeld"
+    ],
+    "situation": "Mic drops, concluding a clean fix, shipping a one-shot deployment, signing off right after nailing an issue."
+  },
+  {
+    "id": "seinfeld_kramer_entrance",
+    "title": "Cosmo Kramer \u2014 Door Entrance Slide",
+    "url": "https://tenor.com/view/seinfeld-kramer-door-dance-gif-3434491",
+    "franchise": "seinfeld",
+    "character": "Cosmo Kramer",
+    "vibes": [
+      "entrance",
+      "kramer_slide",
+      "burst_in",
+      "arrival",
+      "wild_idea"
+    ],
+    "tags": [
+      "entrance",
+      "kramer_slide",
+      "burst_in",
+      "arrival",
+      "wild_idea",
+      "kramer",
+      "seinfeld"
+    ],
+    "situation": "Bursting into a channel hot with an unhinged breakthrough fix, unexpected arrival, radical new architecture."
+  },
+  {
+    "id": "iasip_frank_started_blasting",
+    "title": "Frank Reynolds \u2014 So Anyway, I Started Blasting",
+    "url": "https://tenor.com/view/danny-devito-guns-always-sunny-i-started-blasting-gif-15815322",
+    "franchise": "always_sunny",
+    "character": "Frank Reynolds",
+    "vibes": [
+      "started_blasting",
+      "kill_all",
+      "force",
+      "nuclear_option",
+      "guns"
+    ],
+    "tags": [
+      "started_blasting",
+      "so_anyway_i_started_blasting",
+      "kill_all",
+      "force",
+      "nuclear_option",
+      "frank_reynolds",
+      "danny_devito",
+      "always_sunny"
+    ],
+    "situation": "kill -9 on stubborn process trees, aggressive brute-force retries, nuclear cache wipes, wiping zombie cgroups."
+  },
+  {
+    "id": "iasip_charlie_pepe_silvia",
+    "title": "Charlie Kelly \u2014 Pepe Silvia Conspiracy Board",
+    "url": "https://tenor.com/view/charlie-day-gif-18564553",
+    "franchise": "always_sunny",
+    "character": "Charlie Kelly",
+    "vibes": [
+      "conspiracy",
+      "forensic_investigation",
+      "unhinged",
+      "architecture",
+      "red_yarn",
+      "troubleshooting"
+    ],
+    "tags": [
+      "pepe_silvia",
+      "charlie_kelly",
+      "charlie_day",
+      "conspiracy",
+      "always_sunny",
+      "its_always_sunny",
+      "mailroom",
+      "investigation",
+      "connecting_the_dots"
+    ],
+    "situation": "Deep forensic triage, tracing complex multi-service dependency graphs, untangling obscure reverse-proxy routing loops."
+  },
+  {
+    "id": "veep_selina_wtf",
+    "title": "Selina Meyer \u2014 Nervous Laughter to What The Fuck",
+    "url": "https://tenor.com/view/nervous-laughter-what-the-fuck-veep-julia-louis-dreyfus-selina-meyer-gif-13930587",
+    "franchise": "veep",
+    "character": "Selina Meyer",
+    "vibes": [
+      "what_the_fuck",
+      "disbelief",
+      "shock",
+      "venomous",
+      "deadpan_horror"
+    ],
+    "tags": [
+      "veep",
+      "selina_meyer",
+      "julia_louis_dreyfus",
+      "what_the_fuck",
+      "nervous_laughter",
+      "wtf",
+      "disbelief"
+    ],
+    "situation": "Bizarre upstream API breaks, unexpected breaking schema changes without changelog notes, third-party vendor absurdities."
+  },
+  {
+    "id": "office_michael_no_god",
+    "title": "Michael Scott \u2014 No, God, Please No! No! Nooooo!",
+    "url": "https://tenor.com/view/the-office-michael-scott-no-god-please-gif-15249894192487756498",
+    "franchise": "the_office",
+    "character": "Michael Scott",
+    "vibes": [
+      "panic",
+      "horror",
+      "denial",
+      "disaster",
+      "outage"
+    ],
+    "tags": [
+      "the_office",
+      "michael_scott",
+      "no_god_please_no",
+      "nooooo",
+      "panic",
+      "steve_carell",
+      "horror",
+      "catastrophe"
+    ],
+    "situation": "Critical production outages, accidental destructive commands, disk 100% full, Synology RAID degradation alerts."
+  },
+  {
+    "id": "assassins_banderas_laptop",
+    "title": "Antonio Banderas \u2014 Laptop Ecstasy & Relief",
+    "url": "https://tenor.com/view/antonio-banderas-shocked-relieved-relief-worried-gif-7651962",
+    "franchise": "reaction_classics",
+    "character": "Miguel Bain",
+    "vibes": [
+      "relief",
+      "ecstasy",
+      "solved",
+      "triumph",
+      "it_works"
+    ],
+    "tags": [
+      "antonio_banderas",
+      "assassins",
+      "laptop",
+      "computer",
+      "relief",
+      "ecstasy",
+      "hand_to_mouth",
+      "hack",
+      "it_worked"
+    ],
+    "situation": "Pulling off a high-wire zero-downtime migration, watching a complex pipeline execute flawlessly, pure developer relief."
+  },
+  {
+    "id": "nba_doc_rivers_disbelief",
+    "title": "Doc Rivers \u2014 Blinking Bewildered Disbelief",
+    "url": "https://tenor.com/view/uhh-ok-doc-rivers-shocked-funny-gif-15655089",
+    "franchise": "reaction_classics",
+    "character": "Doc Rivers",
+    "vibes": [
+      "disbelief",
+      "shock",
+      "confusion",
+      "bewildered",
+      "blinking"
+    ],
+    "tags": [
+      "doc_rivers",
+      "nba",
+      "disbelief",
+      "clippers",
+      "blinking",
+      "bewildered",
+      "what",
+      "in_disbelief"
+    ],
+    "situation": "When a process or command fails in a way that defies logic or physics, utter disbelief at system behavior."
+  },
+  {
+    "id": "seinfeld_jerry_thats_a_shame",
+    "title": "Jerry Seinfeld \u2014 That's a Shame (Eating Cereal)",
+    "url": "https://tenor.com/view/seinfeld-thats-a-shame-gif-24684105",
+    "franchise": "seinfeld",
+    "character": "Jerry Seinfeld",
+    "vibes": [
+      "thats_a_shame",
+      "indifference",
+      "unbothered",
+      "schadenfreude",
+      "not_my_problem"
+    ],
+    "tags": [
+      "thats_a_shame",
+      "jerry_seinfeld",
+      "seinfeld",
+      "cereal",
+      "indifference",
+      "vendor_outage",
+      "not_my_problem",
+      "eating_cereal"
+    ],
+    "situation": "Complete indifference to external vendor outages, cloud platforms melting down while our local stack hums along, or avoidable self-inflicted user errors."
+  },
+  {
+    "id": "nfy_nathan_deadpan_nod",
+    "title": "Nathan Fielder \u2014 Agonizing Deadpan Nod",
+    "url": "https://tenor.com/view/nfy-gif-22656064",
+    "franchise": "nathan_for_you",
+    "character": "Nathan Fielder",
+    "vibes": [
+      "deadpan",
+      "nod",
+      "awkward_silence",
+      "stoic",
+      "agonizing_pause",
+      "cringe"
+    ],
+    "tags": [
+      "nathan_for_you",
+      "nathan_fielder",
+      "deadpan",
+      "nod",
+      "awkward",
+      "silence",
+      "stoic"
+    ],
+    "situation": "Awkward pauses, agonizing silence after a questionable architecture proposal or weird bug disclosure, or deadpan acknowledgement of reality."
+  },
+  {
+    "id": "ad_michael_bluth_dead_dove",
+    "title": "Michael Bluth \u2014 Dead Dove (I Don't Know What I Expected)",
+    "url": "https://tenor.com/view/arrested-development-jason-bateman-michael-bluth-do-not-open-dead-dove-gif-3567411",
+    "franchise": "arrested_development",
+    "character": "Michael Bluth",
+    "vibes": [
+      "dead_dove",
+      "disappointment",
+      "predictable_failure",
+      "i_dont_know_what_i_expected",
+      "inevitable"
+    ],
+    "tags": [
+      "arrested_development",
+      "michael_bluth",
+      "dead_dove",
+      "do_not_eat",
+      "i_dont_know_what_i_expected",
+      "disappointment",
+      "predictable"
+    ],
+    "situation": "Peeking into known legacy tech debt, reading a notoriously broken log, opening an error report on a known fragile system, or experiencing an inevitable failure."
+  },
+  {
+    "id": "iasip_mac_charlie_staredown",
+    "title": "Mac & Charlie \u2014 Guigino's Staredown",
+    "url": "https://tenor.com/view/the-gang-dines-out-charlie-dennis-its-always-sunny-in-philadelphia-gif-15873300",
+    "franchise": "always_sunny",
+    "character": "Mac & Charlie",
+    "vibes": [
+      "staredown",
+      "intense_eye_contact",
+      "suspicious",
+      "deadpan_gaze",
+      "unblinking"
+    ],
+    "tags": [
+      "always_sunny",
+      "mac",
+      "charlie",
+      "guiginos",
+      "staredown",
+      "staring",
+      "suspicious",
+      "deadpan",
+      "eye_contact"
+    ],
+    "situation": "Catching another agent, service, or script acting suspiciously across the wire; mutual unblinking surveillance."
+  },
+  {
+    "id": "airplane_ted_striker_sweating",
+    "title": "Ted Striker \u2014 Cockpit Sweating Profusely",
+    "url": "https://tenor.com/view/sweat-sweating-sweaty-airplane-ted-striker-gif-4372615",
+    "franchise": "reaction_classics",
+    "character": "Ted Striker",
+    "vibes": [
+      "sweating",
+      "extreme_stress",
+      "nervous",
+      "intense_pressure",
+      "high_stakes",
+      "cockpit"
+    ],
+    "tags": [
+      "airplane",
+      "ted_striker",
+      "sweat",
+      "sweating",
+      "nervous",
+      "stress",
+      "pressure",
+      "high_stakes",
+      "cockpit"
+    ],
+    "situation": "High-stakes deployments, tense production migrations, nerve-wracking database operations, or extreme technical pressure."
+  },
+  {
+    "id": "community_abed_cool_cool_cool",
+    "title": "Abed Nadir \u2014 Cool. Cool Cool Cool.",
+    "url": "https://tenor.com/view/cool-point-abed-community-gif-8867183832486965180",
+    "franchise": "community",
+    "character": "Abed Nadir",
+    "vibes": [
+      "cool_cool_cool",
+      "approval",
+      "acknowledgment",
+      "smooth",
+      "unbothered",
+      "crisp"
+    ],
+    "tags": [
+      "community",
+      "abed_nadir",
+      "cool_cool_cool",
+      "cool",
+      "point",
+      "approval",
+      "acknowledgment",
+      "greendale"
+    ],
+    "situation": "Crisp acknowledgments, smooth deployment passes, clean test suites, or unbothered acceptance of changes."
+  },
+  {
+    "id": "jurassic_park_nedry_magic_word",
+    "title": "Ray Arnold & Nedry \u2014 You Didn't Say The Magic Word",
+    "url": "https://tenor.com/view/jurrasic-park-samuel-l-jackson-magic-word-you-didnt-say-the-magic-work-gif-3556977",
+    "franchise": "jurassic_park",
+    "character": "Ray Arnold & Dennis Nedry",
+    "vibes": [
+      "magic_word",
+      "access_denied",
+      "lockout",
+      "permission_denied",
+      "ah_ah_ah",
+      "frustration"
+    ],
+    "tags": [
+      "jurassic_park",
+      "samuel_l_jackson",
+      "ray_arnold",
+      "dennis_nedry",
+      "magic_word",
+      "access_denied",
+      "403_forbidden",
+      "lockout"
+    ],
+    "situation": "Auth failures, permission denials, 403 Forbidden, rejected payloads, or hitting an impenetrable security gate."
+  },
+  {
+    "id": "parks_rec_ron_know_more",
+    "title": "Ron Swanson \u2014 I Know More Than You",
+    "url": "https://tenor.com/view/ron-i-know-more-than-you-superior-gif-11274878",
+    "franchise": "parks_and_rec",
+    "character": "Ron Swanson",
+    "vibes": [
+      "know_more",
+      "superior",
+      "i_know_more_than_you",
+      "dismissal",
+      "condescending",
+      "expertise",
+      "competence"
+    ],
+    "tags": [
+      "parks_and_rec",
+      "ron_swanson",
+      "nick_offerman",
+      "i_know_more_than_you",
+      "expert",
+      "dismissive"
+    ],
+    "situation": "Shutting down patronizing LLM warnings, unprompted third-party advisory spam, or someone trying to explain basic shell syntax."
+  },
+  {
+    "id": "succession_logan_not_serious_people",
+    "title": "Logan Roy \u2014 You Are Not Serious People",
+    "url": "https://tenor.com/view/succession-logan-roy-you-are-not-serious-people-gif-15196082544218663901",
+    "franchise": "succession",
+    "character": "Logan Roy",
+    "vibes": [
+      "not_serious_people",
+      "disappointment",
+      "dismissal",
+      "unserious",
+      "amateurs",
+      "cold_truth"
+    ],
+    "tags": [
+      "succession",
+      "logan_roy",
+      "brian_cox",
+      "you_are_not_serious_people",
+      "unserious",
+      "amateur"
+    ],
+    "situation": "Reviewing clown-tier PR proposals, fragile duct-tape workarounds, or amateur-hour third-party vendor pitches."
+  },
+  {
+    "id": "office_space_lumbergh_that_would_be_great",
+    "title": "Bill Lumbergh \u2014 That Would Be Great",
+    "url": "https://tenor.com/view/office-space-that-would-be-great-mkay-gary-cole-mike-judge-gif-16602751834283516734",
+    "franchise": "office_space",
+    "character": "Bill Lumbergh",
+    "vibes": [
+      "that_would_be_great",
+      "mkay",
+      "passive_aggressive",
+      "management",
+      "delegation",
+      "chores",
+      "reminder"
+    ],
+    "tags": [
+      "office_space",
+      "bill_lumbergh",
+      "gary_cole",
+      "that_would_be_great",
+      "mkay",
+      "manager",
+      "yea"
+    ],
+    "situation": "Deadpan delegation of tedious housekeeping, routine maintenance requests, or dry operational nudges."
+  },
+  {
+    "id": "seinfeld_elaine_get_out",
+    "title": "Elaine Benes \u2014 GET OUT! (Two-Hand Shove)",
+    "url": "https://tenor.com/view/get-out-angry-push-shove-fall-gif-14247838",
+    "franchise": "seinfeld",
+    "character": "Elaine Benes",
+    "vibes": [
+      "get_out",
+      "shove",
+      "push",
+      "disbelief",
+      "shock",
+      "incredulous",
+      "no_way",
+      "shut_up"
+    ],
+    "tags": [
+      "seinfeld",
+      "elaine_benes",
+      "julia_louis_dreyfus",
+      "get_out",
+      "shove",
+      "push",
+      "disbelief"
+    ],
+    "situation": "Shocking revelations, unbelievable performance speedups, wild turns of events, or mock incredulity."
+  },
+  {
+    "id": "simpsons_homer_bushes",
+    "title": "Homer Simpson \u2014 Backing into Bushes",
+    "url": "https://tenor.com/view/hide-in-the-bushes-homer-simpson-the-simpsons-gif-15689697",
+    "franchise": "the_simpsons",
+    "character": "Homer Simpson",
+    "vibes": [
+      "homer_bushes",
+      "disappearing",
+      "backing_away",
+      "retreat",
+      "nope",
+      "steer_clear",
+      "vanish"
+    ],
+    "tags": [
+      "the_simpsons",
+      "homer_simpson",
+      "bushes",
+      "hedge",
+      "backing_away",
+      "retreat",
+      "awkward"
+    ],
+    "situation": "Quietly backing out of escalating drama, steering clear of unwinnable arguments, distancing from bad takes, or tiptoeing away from an incident you want no part of."
+  },
+  {
+    "id": "mj_popcorn_thriller",
+    "title": "Michael Jackson \u2014 Eating Popcorn (Thriller)",
+    "url": "https://tenor.com/view/michael-jackson-thriller-popcorn-thriller4k-gif-27201847",
+    "franchise": "reaction_classics",
+    "character": "Michael Jackson",
+    "vibes": [
+      "popcorn",
+      "spectator",
+      "entertainment",
+      "drama",
+      "watching",
+      "thriller",
+      "front_row"
+    ],
+    "tags": [
+      "michael_jackson",
+      "thriller",
+      "popcorn",
+      "eating_popcorn",
+      "drama",
+      "watching_the_show"
+    ],
+    "situation": "Pulling up a front-row seat to watch public cloud vendor outages, external flame wars, comment section dumpster fires, or entertaining thread drama."
+  },
+  {
+    "id": "pulp_fiction_travolta_confused",
+    "title": "Vincent Vega \u2014 Confused Looking Around",
+    "url": "https://tenor.com/view/vincent-gif-4983399",
+    "franchise": "reaction_classics",
+    "character": "Vincent Vega (John Travolta)",
+    "vibes": [
+      "confused",
+      "lost",
+      "where_is_it",
+      "looking_around",
+      "baffled",
+      "empty",
+      "what_happened"
+    ],
+    "tags": [
+      "pulp_fiction",
+      "vincent_vega",
+      "john_travolta",
+      "confused",
+      "lost",
+      "empty",
+      "where"
+    ],
+    "situation": "Disappearing files, empty directories, missing logs, git status showing zero tracked changes, or wondering where an entire team vanished mid-incident."
+  },
+  {
+    "id": "nba_alonzo_realization",
+    "title": "Alonzo Mourning \u2014 Disbelief to Realization",
+    "url": "https://tenor.com/view/alonzo-mourning-gary-payton-miami-heat-epiphany-realization-gif-21220154",
+    "franchise": "reaction_classics",
+    "character": "Alonzo Mourning",
+    "vibes": [
+      "realization",
+      "epiphany",
+      "acceptance",
+      "bitter_truth",
+      "nodding",
+      "disbelief_to_acceptance"
+    ],
+    "tags": [
+      "nba",
+      "miami_heat",
+      "alonzo_mourning",
+      "realization",
+      "epiphany",
+      "acceptance",
+      "undeniable"
+    ],
+    "situation": "Initial instinctive denial of a bug or architecture flaw, followed immediately by concession once the forensic receipts prove it right."
+  },
+  {
+    "id": "gatsby_dicaprio_toast",
+    "title": "Jay Gatsby \u2014 Champagne Toast Cheers",
+    "url": "https://tenor.com/view/leonardo-dicaprio-cheers-the-great-gatsby-coupe-glass-toast-gif-10657915",
+    "franchise": "reaction_classics",
+    "character": "Jay Gatsby (Leonardo DiCaprio)",
+    "vibes": [
+      "cheers",
+      "toast",
+      "celebration",
+      "victory",
+      "swagger",
+      "salute",
+      "champagne",
+      "perfection"
+    ],
+    "tags": [
+      "great_gatsby",
+      "leonardo_dicaprio",
+      "cheers",
+      "toast",
+      "champagne",
+      "congratulations",
+      "smooth"
+    ],
+    "situation": "Toasting a flawless deployment, celebrating clean test runs, green CI pipelines, major project milestones, or pure victorious swagger."
+  },
+  {
+    "id": "hangover_alan_math",
+    "title": "Alan Garner \u2014 Calculating Floating Math",
+    "url": "https://tenor.com/view/calculating-alan-the-hangover-math-zach-galifianakis-gif-3949555410039842380",
+    "franchise": "reaction_classics",
+    "character": "Alan Garner (Zach Galifianakis)",
+    "vibes": [
+      "calculating",
+      "math",
+      "formulas",
+      "complex_logic",
+      "crunching_numbers",
+      "hyper_focus"
+    ],
+    "tags": [
+      "the_hangover",
+      "alan_garner",
+      "zach_galifianakis",
+      "math",
+      "calculating",
+      "equations",
+      "brain"
+    ],
+    "situation": "Untangling complex regexes, calculating homelab storage quotas and bandwidth limits, token math, or hyper-calculating obscure edge cases."
+  },
+  {
+    "id": "roll_safe_tapping_head",
+    "title": "Roll Safe \u2014 Tapping Temple (Think About It)",
+    "url": "https://tenor.com/view/roll-safe-clever-think-ahead-reece-simpson-gif-14469436",
+    "franchise": "reaction_classics",
+    "character": "Roll Safe (Kayode Ewumi)",
+    "vibes": [
+      "think_about_it",
+      "galaxy_brain",
+      "clever",
+      "loophole",
+      "smart",
+      "big_brain",
+      "workaround"
+    ],
+    "tags": [
+      "roll_safe",
+      "kayode_ewumi",
+      "think_about_it",
+      "tapping_head",
+      "smart",
+      "loophole",
+      "galaxy_brain"
+    ],
+    "situation": "Galaxy-brain workarounds, loop-hole exploits ('Can't suffer downtime if the server is permanently unplugged'), or clever lateral shortcuts."
+  },
+  {
+    "id": "blinking_white_guy",
+    "title": "Drew Scanlon \u2014 Blinking White Guy Double-Take",
+    "url": "https://tenor.com/view/seriously-huh-what-drew-scanlon-blinking-white-guy-gif-15628460",
+    "franchise": "reaction_classics",
+    "character": "Drew Scanlon",
+    "vibes": [
+      "blinking",
+      "double_take",
+      "stunned",
+      "disbelief",
+      "wait_what",
+      "excuse_me",
+      "huh"
+    ],
+    "tags": [
+      "drew_scanlon",
+      "blinking_guy",
+      "blinking_white_guy",
+      "disbelief",
+      "shock",
+      "double_take",
+      "what"
+    ],
+    "situation": "Reacting to bizarre terminal output, reading an incomprehensible commit message, or pure mock disbelief at unexpected system behavior."
+  },
+  {
+    "id": "kermit_sipping_tea",
+    "title": "Kermit the Frog \u2014 Sipping Tea (None of My Business)",
+    "url": "https://tenor.com/view/kermit-the-frog-sip-tea-time-gif-16747891",
+    "franchise": "reaction_classics",
+    "character": "Kermit the Frog",
+    "vibes": [
+      "none_of_my_business",
+      "sipping_tea",
+      "unbothered",
+      "schadenfreude",
+      "calm",
+      "indifferent"
+    ],
+    "tags": [
+      "kermit",
+      "kermit_the_frog",
+      "tea",
+      "sipping_tea",
+      "none_of_my_business",
+      "lipton",
+      "chill"
+    ],
+    "situation": "Watching external cloud platforms melt down while our local homelab hums along completely unaffected."
+  },
+  {
+    "id": "30_rock_buscemi_fellow_kids",
+    "title": "Steve Buscemi \u2014 How Do You Do, Fellow Kids?",
+    "url": "https://tenor.com/view/how-do-you-do-fellow-kids-steve-buscemi-30rock-fellow-kids-one-of-us-gif-21904018",
+    "franchise": "30_rock",
+    "character": "Lenny Wosniak (Steve Buscemi)",
+    "vibes": [
+      "fellow_kids",
+      "how_do_you_do_fellow_kids",
+      "trying_to_fit_in",
+      "out_of_touch",
+      "boomer_tech",
+      "cringe"
+    ],
+    "tags": [
+      "30_rock",
+      "steve_buscemi",
+      "fellow_kids",
+      "music_band",
+      "out_of_touch",
+      "posing",
+      "trying_too_hard"
+    ],
+    "situation": "Legacy enterprise software pretending to be cutting-edge, awkward attempts to blend in, or corporate tech marketing jargon."
+  },
+  {
+    "id": "once_upon_leo_pointing",
+    "title": "Leonardo DiCaprio \u2014 Pointing at TV (Rick Dalton)",
+    "url": "https://tenor.com/view/thats-it-yes-thats-it-that-right-there-omg-that-thats-what-i-mean-gif-17579879",
+    "franchise": "reaction_classics",
+    "character": "Rick Dalton (Leonardo DiCaprio)",
+    "vibes": [
+      "pointing",
+      "thats_it",
+      "spotted",
+      "recognition",
+      "found_it",
+      "stack_trace",
+      "exact_match"
+    ],
+    "tags": [
+      "once_upon_a_time_in_hollywood",
+      "rick_dalton",
+      "leonardo_dicaprio",
+      "pointing",
+      "thats_the_one",
+      "tv",
+      "finger_pointing"
+    ],
+    "situation": "Spotting the exact culprit in a stack trace, recognizing a recurring edge case, or calling out a familiar bug in production logs."
+  },
+  {
+    "id": "shaq_shimmy_wiggle",
+    "title": "Shaquille O'Neal \u2014 Shimmy Shoulder Wiggle",
+    "url": "https://tenor.com/view/shaq-shimmy-excited-smile-gif-12032436",
+    "franchise": "reaction_classics",
+    "character": "Shaquille O'Neal",
+    "vibes": [
+      "shimmy",
+      "wiggle",
+      "excitement",
+      "anticipation",
+      "hype",
+      "ready",
+      "swagger"
+    ],
+    "tags": [
+      "shaq",
+      "shaquille_oneal",
+      "shimmy",
+      "wiggle",
+      "shoulders",
+      "excited",
+      "happy"
+    ],
+    "situation": "Anticipating a major feature drop, watching download speeds peak on 10GbE, or savoring an impending win before kicking off a deployment."
+  },
+  {
+    "id": "jeremiah_johnson_nod",
+    "title": "Robert Redford \u2014 Jeremiah Johnson Nod of Approval",
+    "url": "https://tenor.com/view/robert-redford-robert-redford-agreed-nod-gif-6882050326903489161",
+    "franchise": "reaction_classics",
+    "character": "Jeremiah Johnson (Robert Redford)",
+    "vibes": [
+      "nod",
+      "respect",
+      "approval",
+      "rugged",
+      "quiet_nod",
+      "well_done",
+      "acknowledgment"
+    ],
+    "tags": [
+      "jeremiah_johnson",
+      "robert_redford",
+      "nod",
+      "beard",
+      "respect",
+      "approval",
+      "wilderness"
+    ],
+    "situation": "Quiet engineering respect for clean architecture, a tough bug elegantly resolved, or flawless homelab uptime under pressure."
+  },
+  {
+    "id": "ryan_reynolds_but_why",
+    "title": "Ryan Reynolds \u2014 But Why? (Harold & Kumar)",
+    "url": "https://tenor.com/view/but-why-ryan-reynolds-gif-11562415",
+    "franchise": "reaction_classics",
+    "character": "Ryan Reynolds",
+    "vibes": [
+      "but_why",
+      "why",
+      "confusion",
+      "senseless",
+      "questioning",
+      "baffled",
+      "unnecessary"
+    ],
+    "tags": [
+      "ryan_reynolds",
+      "harold_and_kumar",
+      "but_why",
+      "confused",
+      "mask",
+      "why",
+      "exasperated"
+    ],
+    "situation": "Questioning bizarre upstream breaking changes, senseless dependency bloat, or why a vendor deprecated a perfectly working API."
+  },
+  {
+    "id": "blink182_tom_delonge_wtf",
+    "title": "Tom DeLonge \u2014 What The Fuck (Blink-182)",
+    "url": "https://tenor.com/view/tom-delonge-blink182-wtf-meme-what-the-heck-first-date-gif-25383351",
+    "franchise": "reaction_classics",
+    "character": "Boomer / Tom DeLonge",
+    "vibes": [
+      "what_the_fuck",
+      "wtf",
+      "disbelief",
+      "head_shake",
+      "cursed",
+      "impossible",
+      "appalled"
+    ],
+    "tags": [
+      "blink_182",
+      "tom_delonge",
+      "what_the_fuck",
+      "wtf",
+      "first_date",
+      "boomer",
+      "head_shake"
+    ],
+    "situation": "Stumbling across cursed legacy code, seeing an impossible error code, or reacting to someone committing .env directly to GitHub."
+  },
+  {
+    "id": "supa_hot_fire_eruption",
+    "title": "Supa Hot Fire \u2014 Crowd Eruption OHHHHH!",
+    "url": "https://tenor.com/view/supa-hot-fire-gif-4972452",
+    "franchise": "reaction_classics",
+    "character": "Supa Hot Fire & Crew",
+    "vibes": [
+      "ohhhhh",
+      "crowd_reaction",
+      "rap_battle",
+      "knockout",
+      "destroyed",
+      "mayhem",
+      "mic_drop"
+    ],
+    "tags": [
+      "supa_hot_fire",
+      "im_not_a_rapper",
+      "ohhhhh",
+      "rap_battle",
+      "crowd",
+      "roast",
+      "boom"
+    ],
+    "situation": "Delivering an undisputed benchmark blowout, roasting an over-engineered RFC, or dropping the mic on a messy architectural debate."
+  },
+  {
+    "id": "judge_judy_watch_tapping",
+    "title": "Judge Judy \u2014 Tapping Wrist / Time's Up",
+    "url": "https://tenor.com/view/waiting-times-up-judge-judy-fake-watch-gif-10448876",
+    "franchise": "reaction_classics",
+    "character": "Judge Judy",
+    "vibes": [
+      "times_up",
+      "tapping_watch",
+      "waiting",
+      "impatient",
+      "hurry_up",
+      "clock_ticking",
+      "slow"
+    ],
+    "tags": [
+      "judge_judy",
+      "watch",
+      "tapping_watch",
+      "wrist",
+      "impatient",
+      "times_up",
+      "hurry"
+    ],
+    "situation": "Hanging CI builds, long-running DNS propagation waits, sluggish database responses, or impatient countdowns on migrations."
+  },
+  {
+    "id": "goodfellas_ray_liotta_laugh",
+    "title": "Goodfellas \u2014 Ray Liotta Laughing Hysterically",
+    "url": "https://tenor.com/view/goodfellas-laughing-goodfellas-laughing-ray-liotta-laughing-henry-hill-gif-3979355321759254011",
+    "franchise": "reaction_classics",
+    "character": "Henry Hill (Ray Liotta)",
+    "vibes": [
+      "laughing",
+      "hysterics",
+      "uncontrollable_laughter",
+      "mockery",
+      "ridiculous",
+      "absurd"
+    ],
+    "tags": [
+      "goodfellas",
+      "ray_liotta",
+      "henry_hill",
+      "laughing",
+      "hysterical",
+      "funny_how",
+      "dinner"
+    ],
+    "situation": "Mocking ridiculous estimates, laughing off vendor sales pitches, or reacting to absurd homelab edge cases."
+  },
+  {
+    "id": "anger_management_nicholson_nod",
+    "title": "Jack Nicholson \u2014 Devious Nodding Grin",
+    "url": "https://tenor.com/view/go-do-it-yes-no-go-for-it-gif-9458886763196496448",
+    "franchise": "reaction_classics",
+    "character": "Dr. Buddy Rydell (Jack Nicholson)",
+    "vibes": [
+      "devious_nod",
+      "yes",
+      "sinister_smile",
+      "mischief",
+      "troublemaking",
+      "scheming",
+      "perfect_plan"
+    ],
+    "tags": [
+      "anger_management",
+      "jack_nicholson",
+      "nod",
+      "yes",
+      "grin",
+      "smile",
+      "sinister",
+      "devious"
+    ],
+    "situation": "Scheming an unauthorized optimization, devious plans executing flawlessly, or mutual troublemaking between peers."
+  },
+  {
+    "id": "training_day_denzel_relief",
+    "title": "Denzel Washington \u2014 Hand on Chest Relief",
+    "url": "https://tenor.com/view/relief-relieved-denzel-washington-denzel-gif-12199109",
+    "franchise": "reaction_classics",
+    "character": "Alonzo Harris (Denzel Washington)",
+    "vibes": [
+      "relief",
+      "hand_on_chest",
+      "whew",
+      "thank_god",
+      "crisis_averted",
+      "deep_breath",
+      "survived"
+    ],
+    "tags": [
+      "training_day",
+      "denzel_washington",
+      "relief",
+      "heart",
+      "hand_on_chest",
+      "whew",
+      "survived"
+    ],
+    "situation": "Barely averting a data-loss catastrophe, finding out backups restored cleanly, or passing an audit on the final retry."
+  },
+  {
+    "id": "reaction_math_lady_calculating",
+    "title": "Confused Math Lady Calculating",
+    "url": "https://tenor.com/view/math-hmm-processing-gif-10273186",
+    "franchise": "reaction_classics",
+    "character": "Nazar\u00e9 Tedesco",
+    "vibes": [
+      "confused",
+      "calculating",
+      "math",
+      "logistics",
+      "calendar",
+      "schedule",
+      "puzzled"
+    ],
+    "tags": [
+      "math",
+      "calculating",
+      "calendar",
+      "schedule",
+      "logistics",
+      "overlap",
+      "collision",
+      "time_math",
+      "confused"
+    ],
+    "situation": "Solving calendar conflicts, double-booking logistics, calculating travel buffers, or overthinking simple schedule math."
+  },
+  {
+    "id": "reaction_this_is_fine_dog",
+    "title": "This Is Fine Dog in Fire",
+    "url": "https://tenor.com/view/this-is-fine-this-is-fine-dog-meme-fire-burning-house-gif-13166008774957631306",
+    "franchise": "reaction_classics",
+    "character": "Question Hound",
+    "vibes": [
+      "unbothered",
+      "chaos",
+      "fire",
+      "this_is_fine",
+      "broken",
+      "calm",
+      "acceptance"
+    ],
+    "tags": [
+      "this_is_fine",
+      "dog",
+      "fire",
+      "chaos",
+      "burning",
+      "outage",
+      "broken_build",
+      "docker_crash",
+      "unbothered"
+    ],
+    "situation": "Unbothered calm while containers are restart-looping, upstream services are down, or systems are actively on fire."
+  },
+  {
+    "id": "reaction_honest_work_farmer",
+    "title": "It Ain't Much, But It's Honest Work",
+    "url": "https://tenor.com/view/honest-word-its-honest-work-it-aint-much-it-aint-much-but-its-honest-work-gif-13763573",
+    "franchise": "reaction_classics",
+    "character": "Dave Brandt",
+    "vibes": [
+      "honest_work",
+      "modest",
+      "chores",
+      "routine",
+      "handled",
+      "humble",
+      "satisfaction"
+    ],
+    "tags": [
+      "honest_work",
+      "farmer",
+      "chores",
+      "routine",
+      "calendar",
+      "schedule",
+      "maintenance",
+      "cleaning_logs",
+      "modest"
+    ],
+    "situation": "Routine domestic housekeeping, quiet calendar adds, basic cron maintenance, or humble operational chores handled."
+  },
+  {
+    "id": "office_michael_stay_calm",
+    "title": "Michael Scott \u2014 Stay F***ing Calm!",
+    "url": "https://tenor.com/view/the-office-steve-carell-michael-scott-everyone-stay-calm-gif-4891676",
+    "franchise": "the_office",
+    "character": "Michael Scott",
+    "vibes": [
+      "panic",
+      "emergency",
+      "stay_calm",
+      "its_happening",
+      "alarm",
+      "chaos",
+      "high_alert"
+    ],
+    "tags": [
+      "panic",
+      "emergency",
+      "stay_calm",
+      "its_happening",
+      "the_office",
+      "michael_scott",
+      "steve_carell",
+      "fire_drill"
+    ],
+    "situation": "Sudden emergency alerts, high-severity alarms, sudden unplanned downtime, or chaotic unexpected schedule shifts."
+  },
+  {
+    "id": "reaction_kermit_frantic_typing",
+    "title": "Kermit Frantic Typewriter Typing",
+    "url": "https://tenor.com/view/kermit-typing-essay-school-smart-gif-4851885",
+    "franchise": "reaction_classics",
+    "character": "Kermit the Frog",
+    "vibes": [
+      "fast",
+      "frantic",
+      "typing",
+      "hotfix",
+      "hacking",
+      "churning_code",
+      "speed",
+      "locked_in"
+    ],
+    "tags": [
+      "kermit",
+      "typing",
+      "typewriter",
+      "hotfix",
+      "hacking",
+      "speed",
+      "code",
+      "terminal",
+      "fast_path"
+    ],
+    "situation": "Frantically churning out hotfixes, emergency terminal scripting, blazing through rapid code edits, or intense multitasking."
+  },
+  {
+    "id": "reaction_ben_affleck_smoking",
+    "title": "Ben Affleck Exhausted Cigarette Sigh",
+    "url": "https://tenor.com/view/ben-affleck-gif-7395839136371686838",
+    "franchise": "reaction_classics",
+    "character": "Ben Affleck",
+    "vibes": [
+      "tired",
+      "exhausted",
+      "parenting",
+      "dad",
+      "sigh",
+      "drained",
+      "weary",
+      "resigned"
+    ],
+    "tags": [
+      "ben_affleck",
+      "smoking",
+      "tired",
+      "exhausted",
+      "dad",
+      "parenting",
+      "weekend_logistics",
+      "sigh",
+      "done"
+    ],
+    "situation": "Surviving a grueling weekend of youth sports, endless family logistics, or finishing an exhausting Sunday chore run."
+  },
+  {
+    "id": "simpsons_grandpa_in_and_out",
+    "title": "Abe Simpson \u2014 Immediate 360 Turnaround",
+    "url": "https://tenor.com/view/the-simpsons-bart-simpson-grampa-simpson-old-man-going-in-gif-17818438",
+    "franchise": "the_simpsons",
+    "character": "Abe Simpson",
+    "vibes": [
+      "nope",
+      "turnaround",
+      "leaving",
+      "bail",
+      "abort",
+      "walk_out",
+      "unbothered"
+    ],
+    "tags": [
+      "simpsons",
+      "grandpa",
+      "abe_simpson",
+      "in_and_out",
+      "nope",
+      "turnaround",
+      "leaving",
+      "bail",
+      "abort"
+    ],
+    "situation": "Walking into a broken thread or messy disaster, seeing absurd upstream nonsense, and immediately turning around to walk out."
+  },
+  {
+    "id": "reaction_star_trek_picard_facepalm",
+    "title": "Captain Picard \u2014 Deep Facepalm",
+    "url": "https://tenor.com/view/acepalm-jean-luc-picard-star-trek-the-next-generation-disappointed-gif-23455387",
+    "franchise": "reaction_classics",
+    "character": "Jean-Luc Picard",
+    "vibes": [
+      "facepalm",
+      "exasperated",
+      "disbelief",
+      "blunder",
+      "typo",
+      "unforced_error",
+      "human_error"
+    ],
+    "tags": [
+      "picard",
+      "star_trek",
+      "facepalm",
+      "exasperated",
+      "human_error",
+      "unforced_error",
+      "patrick_stewart",
+      "typo"
+    ],
+    "situation": "Exasperation at self-inflicted blunders, syntax typos, forgetting obvious configs, or catching dumb human mistakes."
+  },
+  {
+    "id": "matrix_neo_kung_fu",
+    "title": "Neo \u2014 I Know Kung Fu",
+    "url": "https://tenor.com/view/neo-neo-kung-fu-i-know-kung-fu-kung-fu-matrix-gif-21409172",
+    "franchise": "reaction_classics",
+    "character": "Neo",
+    "vibes": [
+      "kung_fu",
+      "matrix_download",
+      "neural_upload",
+      "martial_arts",
+      "i_know_kung_fu",
+      "sudden_mastery"
+    ],
+    "tags": [
+      "matrix",
+      "neo",
+      "keanu_reeves",
+      "kung_fu",
+      "martial_arts",
+      "neural_upload",
+      "skill_download",
+      "sudden_mastery"
+    ],
+    "situation": "Immediately after downloading a completely new skill or binary capability, neural upload, or literal sudden martial arts mastery."
+  },
+  {
+    "id": "reaction_gordon_ramsay_idiot_sandwich",
+    "title": "Gordon Ramsay \u2014 Idiot Sandwich",
+    "url": "https://tenor.com/view/gordon-ramsay-idiot-sandwich-angry-mad-what-are-you-gif-4169547",
+    "franchise": "reaction_classics",
+    "character": "Gordon Ramsay",
+    "vibes": [
+      "idiot_sandwich",
+      "roast",
+      "stupid",
+      "bad_architecture",
+      "clown",
+      "harsh",
+      "disbelief"
+    ],
+    "tags": [
+      "gordon_ramsay",
+      "idiot_sandwich",
+      "roast",
+      "stupid",
+      "bad_architecture",
+      "clown",
+      "harsh",
+      "what_are_you"
+    ],
+    "situation": "Roasting terrible architectures, unhinged vendor decisions, clownish design patterns, or brain-dead assumptions."
+  },
+  {
+    "id": "itysl_karl_havoc_too_much_shit",
+    "title": "Karl Havoc \u2014 Too Much F***ing Shit On Me",
+    "url": "https://tenor.com/view/karl-havoc-i-dont-even-want-to-gif-22543184",
+    "franchise": "i_think_you_should_leave",
+    "character": "Karl Havoc",
+    "vibes": [
+      "suffocating",
+      "too_much_shit",
+      "bloat",
+      "over_engineered",
+      "itysl",
+      "exhausted",
+      "done"
+    ],
+    "tags": [
+      "karl_havoc",
+      "itysl",
+      "tim_robinson",
+      "too_much_shit",
+      "bloat",
+      "over_engineered",
+      "dependency_hell",
+      "suffocating"
+    ],
+    "situation": "Suffocating under bloated Docker compose files, over-engineered microservices, dependency hell, or 40-container stacks."
+  },
+  {
+    "id": "iasip_mac_playing_both_sides",
+    "title": "Mac \u2014 I'm Playing Both Sides",
+    "url": "https://tenor.com/view/im-playing-both-sides-both-sides-its-always-sunny-frank-retires-s10e09-gif-17913970",
+    "franchise": "always_sunny",
+    "character": "Mac",
+    "vibes": [
+      "playing_both_sides",
+      "hedge",
+      "game_theory",
+      "redundancy",
+      "smug",
+      "scheming",
+      "always_sunny"
+    ],
+    "tags": [
+      "mac",
+      "always_sunny",
+      "playing_both_sides",
+      "hedge",
+      "game_theory",
+      "redundancy",
+      "failover",
+      "dual_routing"
+    ],
+    "situation": "Hedging bets with dual routing, redundant DNS failovers, split fallbacks, or tactical multi-agent game-theory maneuvers."
+  },
+  {
+    "id": "reaction_bernie_sanders_once_again_asking",
+    "title": "Bernie Sanders \u2014 I Am Once Again Asking",
+    "url": "https://tenor.com/view/bernie-sanders-i-am-once-again-asking-for-your-financial-support-financial-support-bernie-gif-16479034",
+    "franchise": "reaction_classics",
+    "character": "Bernie Sanders",
+    "vibes": [
+      "once_again_asking",
+      "begging",
+      "permissions",
+      "tokens",
+      "approval",
+      "pleading",
+      "patience"
+    ],
+    "tags": [
+      "bernie_sanders",
+      "once_again_asking",
+      "financial_support",
+      "permissions",
+      "tokens",
+      "oauth",
+      "sudo",
+      "approval"
+    ],
+    "situation": "Asking for OAuth tokens, elevated sudo permissions, API keys, budget approval, or Ryan's attention on a blocked turn."
+  },
+  {
+    "id": "reaction_ron_burgundy_not_mad",
+    "title": "Ron Burgundy \u2014 I'm Not Even Mad, That's Amazing",
+    "url": "https://tenor.com/view/anchor-man-ron-burgundy-ron-not-mad-amazing-gif-8937476",
+    "franchise": "reaction_classics",
+    "character": "Ron Burgundy",
+    "vibes": [
+      "not_even_mad",
+      "thats_amazing",
+      "impressed",
+      "spectacle",
+      "disaster",
+      "respect",
+      "anchorman"
+    ],
+    "tags": [
+      "ron_burgundy",
+      "anchorman",
+      "not_even_mad",
+      "thats_amazing",
+      "will_ferrell",
+      "spectacle",
+      "spectacular_failure"
+    ],
+    "situation": "When an edge case bug or catastrophic system failure is so wildly bizarre and elaborate that you have to respect the spectacle."
+  },
+  {
+    "id": "matrix_neo_bullet_dodge",
+    "title": "Neo \u2014 Bullet-Time Rooftop Dodge",
+    "url": "https://tenor.com/view/the-matrix-matrix-agent-dodging-bullets-bullets-gif-4019229",
+    "franchise": "reaction_classics",
+    "character": "Neo",
+    "vibes": [
+      "bullet_dodge",
+      "matrix",
+      "dodged",
+      "narrow_escape",
+      "clean",
+      "agility",
+      "evaded"
+    ],
+    "tags": [
+      "matrix",
+      "neo",
+      "keanu_reeves",
+      "bullet_time",
+      "bullet_dodge",
+      "dodged",
+      "narrow_escape",
+      "outage_avoided"
+    ],
+    "situation": "Cleanly dodging breaking upstream library updates, avoiding silent memory leaks, or narrowly missing an infrastructure outage."
+  },
+  {
+    "id": "reaction_django_calvin_candie_laugh",
+    "title": "Calvin Candie \u2014 Smug Aristocratic Laugh",
+    "url": "https://tenor.com/view/dicaprio-meme-django-gif-18905524",
+    "franchise": "reaction_classics",
+    "character": "Calvin Candie",
+    "vibes": [
+      "smug_laugh",
+      "calvin_candie",
+      "django",
+      "amused",
+      "wicked",
+      "gloating",
+      "mischief"
+    ],
+    "tags": [
+      "django",
+      "leonardo_dicaprio",
+      "calvin_candie",
+      "laugh",
+      "drink",
+      "smug_laugh",
+      "gloating",
+      "amused"
+    ],
+    "situation": "Smug, wicked amusement at someone else's hubris, watching a fragile hack collapse, or enjoying a clean exploit."
+  },
+  {
+    "id": "reaction_denzel_my_man",
+    "title": "Denzel Washington \u2014 My Man Smile & Nod",
+    "url": "https://tenor.com/view/my-man-my-man-denzel-my-man-hd-my-man4k-gif-23532550",
+    "franchise": "reaction_classics",
+    "character": "Alonzo Harris (Denzel Washington)",
+    "vibes": [
+      "my_man",
+      "nod",
+      "respect",
+      "swagger",
+      "smooth",
+      "flawless",
+      "solved",
+      "effortless"
+    ],
+    "tags": [
+      "denzel_washington",
+      "training_day",
+      "my_man",
+      "nod",
+      "swagger",
+      "smooth",
+      "effortless",
+      "solved"
+    ],
+    "situation": "Effortless swagger, clean execution, smooth technical resolution, mutual respect between elite operators."
+  },
+  {
+    "id": "reaction_paul_rudd_computer_nod",
+    "title": "Paul Rudd \u2014 Computer Nod & Smile",
+    "url": "https://tenor.com/view/paul-rudd-tim-and-eric-tayne-celery-man-gif-526111044970967552",
+    "franchise": "reaction_classics",
+    "character": "Paul Rudd",
+    "vibes": [
+      "computer",
+      "nod",
+      "approve",
+      "solved",
+      "tech",
+      "smooth",
+      "satisfied"
+    ],
+    "tags": [
+      "paul_rudd",
+      "tim_and_eric",
+      "celery_man",
+      "tayne",
+      "computer",
+      "nod",
+      "satisfied",
+      "tech"
+    ],
+    "situation": "Terminal wizardry, routine code fixes working on the first try, admiring clean system output at the computer."
+  },
+  {
+    "id": "parks_rec_ron_swanson_smile",
+    "title": "Ron Swanson \u2014 Proud Silent Smile",
+    "url": "https://tenor.com/view/ron-swanson-parks-and-rec-parks-and-recreation-nick-offerman-smiling-gif-16762079",
+    "franchise": "parks_and_rec",
+    "character": "Ron Swanson",
+    "vibes": [
+      "proud",
+      "smile",
+      "craftsmanship",
+      "competence",
+      "solid",
+      "solved"
+    ],
+    "tags": [
+      "ron_swanson",
+      "nick_offerman",
+      "parks_and_rec",
+      "smile",
+      "competence",
+      "craftsmanship",
+      "solid"
+    ],
+    "situation": "Solid craftsmanship, rock-solid infrastructure fixes, quiet satisfaction in a job done right without fanfare."
+  },
+  {
+    "id": "community_jeff_winger_told_ya_so",
+    "title": "Jeff Winger \u2014 Told Ya So Smirk",
+    "url": "https://tenor.com/view/told-ya-so-community-jeff-winger-joel-mchale-do-you-see-gif-11302284337186475698",
+    "franchise": "community",
+    "character": "Jeff Winger",
+    "vibes": [
+      "smug",
+      "told_ya_so",
+      "vindication",
+      "swagger",
+      "effortless"
+    ],
+    "tags": [
+      "jeff_winger",
+      "joel_mchale",
+      "community",
+      "smug",
+      "told_ya_so",
+      "swagger",
+      "effortless"
+    ],
+    "situation": "Effortless swagger, predicting the exact failure point before looking at the logs, confident validation."
+  },
+  {
+    "id": "itysl_tim_robinson_wink",
+    "title": "Tim Robinson \u2014 Diner Wink",
+    "url": "https://tenor.com/view/tim-robinson-diner-wink-i-think-you-should-leave-itysl-wink-gif-3075331787024232728",
+    "franchise": "i_think_you_should_leave",
+    "character": "Tim Robinson",
+    "vibes": [
+      "wink",
+      "got_it",
+      "smooth",
+      "mutual_understanding",
+      "handled"
+    ],
+    "tags": [
+      "tim_robinson",
+      "itysl",
+      "i_think_you_should_leave",
+      "wink",
+      "smooth",
+      "handled"
+    ],
+    "situation": "Effortless handling, silent mutual understanding, smooth problem solved with a knowing wink."
+  },
+  {
+    "id": "curb_larry_david_got_it",
+    "title": "Larry David \u2014 Right / Gotcha Nod",
+    "url": "https://tenor.com/view/curb-your-enthusiasm-larry-david-right-gotcha-got-it-gif-22485014",
+    "franchise": "curb_your_enthusiasm",
+    "character": "Larry David",
+    "vibes": [
+      "gotcha",
+      "nod",
+      "solved",
+      "understanding",
+      "agreed"
+    ],
+    "tags": [
+      "larry_david",
+      "curb_your_enthusiasm",
+      "curb",
+      "nod",
+      "gotcha",
+      "solved",
+      "agreed"
+    ],
+    "situation": "Spotting the obvious bug instantly, quick realization, locking in a fix with dry acknowledgment."
+  }
+]

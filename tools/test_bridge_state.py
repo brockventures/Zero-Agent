@@ -77,6 +77,30 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         bs.clear_channel_session_id(ext_ch, "external")
         self.assertIsNone(bs.get_channel_session_id(ext_ch, "external"))
 
+    def test_session_rotation_parent_tracking(self):
+        ch = 123456789
+        bs.set_channel_session_id(ch, "external", "conv-v1")
+        self.assertEqual(bs.get_channel_session_id(ch, "external"), "conv-v1")
+        self.assertIsNone(bs.get_session_parent_id(str(ch)))
+
+        # Rotate directly via set_channel_session_id
+        bs.set_channel_session_id(ch, "external", "conv-v2")
+        self.assertEqual(bs.get_channel_session_id(ch, "external"), "conv-v2")
+        self.assertEqual(bs.get_session_parent_id(str(ch)), "conv-v1")
+        meta = bs.get_session_metadata(str(ch))
+        self.assertEqual(meta.get("conv_history"), ["conv-v1"])
+
+        # Rotate via clear_channel_session_id then set
+        bs.clear_channel_session_id(ch, "external")
+        self.assertIsNone(bs.get_channel_session_id(ch, "external"))
+        self.assertEqual(bs.get_session_parent_id(str(ch)), "conv-v2")
+        meta = bs.get_session_metadata(str(ch))
+        self.assertEqual(meta.get("conv_history"), ["conv-v1", "conv-v2"])
+
+        bs.set_channel_session_id(ch, "external", "conv-v3")
+        self.assertEqual(bs.get_channel_session_id(ch, "external"), "conv-v3")
+        self.assertEqual(bs.get_session_parent_id(str(ch)), "conv-v2")
+
     def test_compaction_thresholds(self):
         # 1. Turns threshold >= 15
         needed, reason = bs.check_compaction_needed("conv-1", 15)
@@ -235,6 +259,27 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         bs.clear_in_flight(12345)
         self.assertFalse(bs.IN_FLIGHT_FILE.exists())
 
+    def test_is_home_channel_excludes_baseball(self):
+        class DummyChannel:
+            def __init__(self, ch_id, cat_id=None, parent_id=None):
+                self.id = ch_id
+                self.category_id = cat_id
+                self.parent_id = parent_id
+                self.parent = None
+
+        # #zero-chat is home
+        zero_chat = DummyChannel(1542081375287640084, cat_id=1544953274363412533)
+        self.assertTrue(bs.is_home_channel(zero_chat))
+
+        # #baseball is excluded even though category is operations
+        baseball_ch = DummyChannel(1548196929308065893, cat_id=1544953274363412533)
+        self.assertFalse(bs.is_home_channel(baseball_ch))
+
+        # Thread in #baseball is also excluded
+        baseball_thread = DummyChannel(999999999, parent_id=1548196929308065893)
+        self.assertFalse(bs.is_home_channel(baseball_thread))
+
 
 if __name__ == "__main__":
     unittest.main()
+

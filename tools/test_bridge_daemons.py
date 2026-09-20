@@ -319,6 +319,62 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             self.assertIn("[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\nRecapped milestones", sent_prompt)
             self.assertIn("Good morning Zero", sent_prompt)
 
+    async def test_08_agy_error_stderr_capture_and_delivery(self):
+        """Verify that AGY_ERROR on stderr is captured and delivered as a structured error alert."""
+        worker = bd.PersistentChannelWorker(
+            channel_id=1544953279664889888,
+            name="zero-ops",
+            mode="home",
+            sess_key="1544953279664889888",
+        )
+        worker.proc = MagicMock()
+        worker.proc.returncode = None
+        worker.proc.pid = 88888
+        worker.proc.stdin = MagicMock()
+        worker.proc.stdin.write = MagicMock()
+        worker.proc.stdin.drain = AsyncMock()
+        worker.proc.stdout = MagicMock()
+
+        agy_err_payload = {
+            "canonical_status": "RESOURCE_EXHAUSTED",
+            "code": 429,
+            "retryable": False,
+            "error_id": "err-quota-exceeded",
+            "short_error": "API rate limit exceeded",
+        }
+
+        async def fake_readline():
+            # Simulate _drain_stderr capturing AGY_ERROR concurrently before worker process exits
+            worker.last_agy_error = agy_err_payload
+            worker.proc.returncode = 3
+            return b""
+
+        worker.proc.stdout.readline = AsyncMock(side_effect=fake_readline)
+        worker.proc.stderr = AsyncMock()
+        worker.proc.stderr.readline = AsyncMock(return_value=b"")
+        worker.is_ready = True
+        worker.conv_id = "test-conv-agy-err"
+
+        mock_status = AsyncMock()
+        mock_status.id = 99992
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.id = 1544953279664889888
+
+        with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
+             patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock) as mock_deliver, \
+             patch.object(worker, "recycle", new_callable=AsyncMock) as mock_recycle:
+            await worker.execute_turn("Prompt that trips rate limit", mock_status, mock_target, [])
+
+            mock_recycle.assert_awaited_once()
+            mock_deliver.assert_awaited_once()
+            output_text = mock_deliver.call_args.kwargs["output_text"]
+            self.assertIn("⚠️ **Model API Failure (CLI Exit Code 3):**", output_text)
+            self.assertIn("API rate limit exceeded", output_text)
+            self.assertIn("`RESOURCE_EXHAUSTED` (Code 429)", output_text)
+            self.assertIn("`err-quota-exceeded`", output_text)
+            self.assertIn("Retryable:** No", output_text)
+
 
 if __name__ == "__main__":
     unittest.main()

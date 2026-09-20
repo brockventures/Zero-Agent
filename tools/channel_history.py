@@ -218,6 +218,9 @@ def is_handoff_addressed_to_zero(content: str) -> bool:
     or requiring response from Zero.
     """
     try:
+        if "🍌 **Discussion Concluded**" in content and ("<@1542285964213358633>" in content or "@zero" in content.lower()):
+            return True
+
         from tools.handoff import parse_envelope
         env = parse_envelope(content)
         if not env:

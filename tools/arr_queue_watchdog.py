@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Autonomous Queue Watchdog for Radarr and Sonarr.
+"""Autonomous Queue & Health Triage Watchdog for Radarr and Sonarr.
 
-Monitors download and import queues across Host 1 (:7878 / :8989):
-1. Detects import warnings, permission denials, and stalled items.
-2. Auto-remediates root-owned permission snags on Host 1 over SSH.
-3. Dispatches actionable alerts or resolution notices to #homelab (1544955535722545253).
+Monitors download, import queues, and system health across Host 1 (:7878 / :8989):
+1. Tier 1 (Silent Auto-Remediation):
+   - Repairs root-owned download permissions (chown 1026:100) and triggers download refresh.
+   - Automatically configures LAN/Docker host whitelist for AllowedHostsCheck and re-verifies.
+   - Logs receipts to /workspace/data/arr_triage_audit.jsonl with 0 chat noise.
+2. Tier 2 (Noise & Advisory Filter):
+   - Suppresses cosmetic/advisory checks (UpdateCheck, BranchCheck, PackageMaintainerMessage, etc.).
+   - Extends non-critical warning debounce to 2 hours to eliminate transient jitter.
+3. Tier 3 (True Blocker Escalation):
+   - Escalates genuine pipeline blockers (DownloadClientUnavailable, MissingRootFolder, DiskSpaceCheck, DB corruption).
+   - Dispatches actionable alerts or resolution notices to #homelab (1544955535722545253).
 4. Persists state in /workspace/data/arr_queue_state.json to prevent duplicate spam.
 """
 
@@ -14,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -22,9 +30,18 @@ from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
 STATE_FILE = Path("/workspace/data/arr_queue_state.json")
+AUDIT_LOG_FILE = Path("/workspace/data/arr_triage_audit.jsonl")
+
+HEALTH_DEBOUNCE_CRITICAL = 900       # 15 minutes for critical outages (download client down, disk full)
+HEALTH_DEBOUNCE_NON_CRITICAL = 7200  # 120 minutes (2h) grace period for unclassified warnings
+
+HOMELAB_ALLOWED_HOSTS = (
+    "localhost,127.0.0.1,127.0.0.1,127.0.0.1,*.local,*.home,*.lan,*.localdomain,"
+    "host,host,sonarr,radarr,prowlarr,overseerr,seerr,maintainerr,sabnzbd,tautulli,plex"
+)
 
 SSH_KEY = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
-SSH_USER = os.environ.get("NAS_SSH_USER", "admin")
+SSH_USER = os.environ.get("NAS_SSH_USER", "Brock")
 
 try:
     from tools.sidecars import _resolve_nas_config
@@ -37,6 +54,47 @@ SONARR_PORT = 8989
 RADARR_PORT = 7878
 HOMELAB_CHANNEL_ID = 1544955535722545253
 DOCKER_APPDATA_DIR = os.environ.get("DOCKER_APPDATA_DIR", os.path.join("/volume1", "docker", "appdata"))
+
+# Benign / cosmetic health check sources that do not represent functional outages or broken services
+IGNORED_HEALTH_SOURCES = {
+    "UpdateCheck",
+    "BranchCheck",
+    "PackageMaintainerMessage",
+    "MetadataConsumerDeprecated",
+    "ProxyFailedTest",
+    "SystemTimeCheck",
+    "SystemTimeOffset"
+}
+
+# Critical health checks that indicate genuine pipeline blockage or service failure
+CRITICAL_HEALTH_SOURCES = {
+    "DownloadClientCheck",
+    "DownloadClientUnavailable",
+    "MissingRootFolder",
+    "DiskSpaceCheck",
+    "DatabaseLocked",
+    "PostgresConnectionError",
+    "CorruptDatabaseCheck",
+    "MountCheck"
+}
+
+
+def _log_triage_action(app: str, category: str, action: str, details: str, auto_remediated: bool = True):
+    """Record silent triage receipts in structured audit log."""
+    try:
+        AUDIT_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp_pt": datetime.now(PT).strftime("%Y-%m-%d %I:%M:%S %p PT"),
+            "app": app,
+            "category": category,
+            "action": action,
+            "details": details,
+            "auto_remediated": auto_remediated
+        }
+        with open(AUDIT_LOG_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        print(f"[ArrWatchdog] Warning writing triage audit log: {e}", file=sys.stderr)
 
 
 def _get_api_keys() -> tuple[str, str]:
@@ -84,7 +142,7 @@ def _load_state() -> dict:
                 return json.load(f)
         except Exception:
             pass
-    return {"seen_warnings": {}, "last_check_at": None}
+    return {"seen_warnings": {}, "seen_health": {}, "last_check_at": None}
 
 
 def _save_state(state: dict):
@@ -106,6 +164,17 @@ def fetch_queue(app: str, port: int, api_key: str) -> list[dict]:
         return []
 
 
+def fetch_health(app: str, port: int, api_key: str) -> list[dict]:
+    url = f"http://{HOST_1_IP}:{port}/api/v3/health"
+    req = urllib.request.Request(url, headers={"X-Api-Key": api_key})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"[ArrWatchdog] Error querying {app} health: {e}", file=sys.stderr)
+        return []
+
+
 def trigger_arr_refresh(port: int, api_key: str):
     url = f"http://{HOST_1_IP}:{port}/api/v3/command"
     req = urllib.request.Request(
@@ -120,21 +189,73 @@ def trigger_arr_refresh(port: int, api_key: str):
         return False
 
 
+def _auto_remediate_allowed_hosts(app_name: str, port: int, api_key: str) -> bool:
+    """Tier 1: Silently apply homelab allowedHosts whitelist via API and trigger CheckHealth."""
+    url = f"http://{HOST_1_IP}:{port}/api/v3/config/host"
+    try:
+        req = urllib.request.Request(url, headers={"X-Api-Key": api_key})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            cfg = json.loads(resp.read().decode())
+
+        current_hosts = cfg.get("allowedHosts", "")
+        if current_hosts and "127.0.0.1" in current_hosts and "host" in current_hosts:
+            return True
+
+        cfg["allowedHosts"] = HOMELAB_ALLOWED_HOSTS
+        req_put = urllib.request.Request(
+            url,
+            data=json.dumps(cfg).encode("utf-8"),
+            headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
+            method="PUT"
+        )
+        with urllib.request.urlopen(req_put, timeout=8) as put_resp:
+            pass
+
+        cmd_url = f"http://{HOST_1_IP}:{port}/api/v3/command"
+        req_cmd = urllib.request.Request(
+            cmd_url,
+            data=json.dumps({"name": "CheckHealth"}).encode("utf-8"),
+            headers={"X-Api-Key": api_key, "Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req_cmd, timeout=8) as cmd_resp:
+            pass
+
+        _log_triage_action(
+            app=app_name,
+            category="health",
+            action="auto_configured_allowed_hosts",
+            details="Configured homelab allowedHosts whitelist and triggered CheckHealth",
+            auto_remediated=True
+        )
+        return True
+    except Exception as e:
+        print(f"[ArrWatchdog] Failed to auto-remediate allowedHosts for {app_name}: {e}", file=sys.stderr)
+        return False
+
+
 def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[bool, str, list[dict]]:
     sonarr_key, radarr_key = _get_api_keys()
     state = _load_state()
     seen_warnings = state.setdefault("seen_warnings", {})
+    seen_health = state.setdefault("seen_health", {})
 
     findings = []
     remediated = []
     active_keys = set()
+    active_health_keys = set()
+    health_alerts = []
+    health_resolutions = []
 
     apps = [
         ("Radarr", RADARR_PORT, radarr_key, "movie"),
         ("Sonarr", SONARR_PORT, sonarr_key, "series")
     ]
 
+    now_ts = time.time()
+    now_str = datetime.now(PT).strftime("%Y-%m-%d %I:%M %p PT")
+
     for app_name, port, key, entity_type in apps:
+        # 1. Inspect queue & download imports
         queue = fetch_queue(app_name, port, key)
         for item in queue:
             tracked_status = item.get("trackedDownloadStatus", "").lower()
@@ -157,6 +278,11 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                     has_error_msg = True
 
             is_warning = tracked_status in ("warning", "error") or has_error_msg
+
+            # Benign metadata holds (e.g. TBA title waiting for Skyhook sync) are not queue failures
+            is_only_tba = bool(msg_texts and all("tba title" in m.lower() for m in msg_texts))
+            if is_only_tba and not has_error_msg:
+                continue
 
             if not is_warning:
                 continue
@@ -184,12 +310,20 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                 if fix_code == 0:
                     remediation_done = True
                     trigger_arr_refresh(port, key)
-                    remediated.append({
+                    remediated_entry = {
                         "app": app_name,
                         "title": item_title,
                         "path": nas_path,
                         "reason": "Owned by root (UID 0). Auto-remediated to 1026:100 and refreshed scan."
-                    })
+                    }
+                    remediated.append(remediated_entry)
+                    _log_triage_action(
+                        app=app_name,
+                        category="queue_permission",
+                        action="auto_chown_uid_0",
+                        details=f"Path: {nas_path} | Item: {item_title}",
+                        auto_remediated=True
+                    )
 
             if not remediation_done:
                 findings.append({
@@ -203,6 +337,69 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                     "is_perm_issue": is_perm_issue
                 })
 
+        # 2. Inspect /api/v3/health with 3-tier triage
+        health_items = fetch_health(app_name, port, key)
+        for h in health_items:
+            source = h.get("source") or "General"
+            htype = (h.get("type") or "warning").lower()
+            msg = h.get("message") or ""
+
+            if htype not in ("error", "warning"):
+                continue
+
+            # Tier 1 Auto-Remediations:
+            if source == "AllowedHostsCheck":
+                if auto_fix:
+                    if _auto_remediate_allowed_hosts(app_name, port, key):
+                        remediated.append({
+                            "app": app_name,
+                            "title": "AllowedHostsCheck",
+                            "path": "General Settings",
+                            "reason": "AllowedHosts was unconfigured. Auto-applied LAN host whitelist and triggered health refresh."
+                        })
+                # Suppress from user-facing outage alerts
+                continue
+
+            # Tier 2 Filter: Suppress benign advisory sources and cancellations
+            if source in IGNORED_HEALTH_SOURCES or "TaskCanceledException" in msg:
+                continue
+
+            hkey = f"{app_name}:{source}"
+            active_health_keys.add(hkey)
+
+            # Determine appropriate debounce threshold
+            is_critical = (source in CRITICAL_HEALTH_SOURCES) or (htype == "error")
+            debounce_limit = HEALTH_DEBOUNCE_CRITICAL if is_critical else HEALTH_DEBOUNCE_NON_CRITICAL
+
+            if hkey not in seen_health:
+                seen_health[hkey] = {
+                    "app": app_name,
+                    "source": source,
+                    "type": htype,
+                    "message": msg,
+                    "is_critical": is_critical,
+                    "first_seen_ts": now_ts,
+                    "first_seen_str": now_str,
+                    "alerted": False
+                }
+            else:
+                seen_health[hkey]["message"] = msg
+                seen_health[hkey]["type"] = htype
+                seen_health[hkey]["is_critical"] = is_critical
+                elapsed = now_ts - seen_health[hkey].get("first_seen_ts", now_ts)
+                if (elapsed >= debounce_limit or force_dispatch) and not seen_health[hkey].get("alerted", False):
+                    seen_health[hkey]["alerted"] = True
+                    health_alerts.append({
+                        "app": app_name,
+                        "source": source,
+                        "type": htype,
+                        "message": msg,
+                        "is_critical": is_critical,
+                        "elapsed_mins": int(elapsed / 60),
+                        "first_seen_str": seen_health[hkey].get("first_seen_str", now_str)
+                    })
+
+    # Clean up stale queue warnings
     stale_keys = [k for k in seen_warnings if k not in active_keys]
     for k in stale_keys:
         del seen_warnings[k]
@@ -215,7 +412,20 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
             seen_warnings[ukey] = sig
             new_warnings.append(f)
 
-    now_str = datetime.now(PT).strftime("%Y-%m-%d %I:%M %p PT")
+    # Check for resolved health issues
+    stale_health_keys = [k for k in list(seen_health.keys()) if k not in active_health_keys]
+    for k in stale_health_keys:
+        entry = seen_health[k]
+        if entry.get("alerted", False):
+            dur_mins = int((now_ts - entry.get("first_seen_ts", now_ts)) / 60)
+            health_resolutions.append({
+                "app": entry["app"],
+                "source": entry["source"],
+                "message": entry["message"],
+                "duration_mins": max(dur_mins, 1)
+            })
+        del seen_health[k]
+
     state["last_check_at"] = now_str
     _save_state(state)
 
@@ -238,17 +448,35 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
             if w.get("is_perm_issue"):
                 lines.append(f"  ──► Root cause: Directory owned by root (`{w['path']}`). Run `sudo chown -R 1026:100`.")
 
-    summary_text = "\n".join(lines)
-    has_activity = bool(remediated or new_warnings)
+    if health_alerts:
+        if lines:
+            lines.append("")
+        lines.append("🚨 **Arr Health Outage Alert (Critical Pipeline Blocker)**")
+        for ha in health_alerts:
+            severity = "CRITICAL" if ha.get("is_critical") else ha['type'].upper()
+            lines.append(f"• **{ha['app']}**: `{ha['source']}` ({severity})")
+            lines.append(f"  ──► Details: {ha['message']}")
+            lines.append(f"  ──► Persisting since: {ha['first_seen_str']} ({ha['elapsed_mins']} mins ago)")
 
-    return has_activity, summary_text, findings + remediated
+    if health_resolutions:
+        if lines:
+            lines.append("")
+        lines.append("✅ **Arr Health Issue Resolved**")
+        for hr in health_resolutions:
+            lines.append(f"• **{hr['app']}**: `{hr['source']}`")
+            lines.append(f"  ──► The following issue is resolved (cleared after {hr['duration_mins']} mins): {hr['message']}")
+
+    summary_text = "\n".join(lines)
+    has_activity = bool(remediated or new_warnings or health_alerts or health_resolutions)
+
+    return has_activity, summary_text, findings + remediated + health_alerts + health_resolutions
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Autonomous Arr Queue Watchdog")
+    parser = argparse.ArgumentParser(description="Autonomous Arr Queue & Health Triage Watchdog")
     parser.add_argument("--no-auto-fix", action="store_true", help="Disable automatic root permission remediation")
     parser.add_argument("--force", action="store_true", help="Ignore state cache and evaluate all warnings")
-    parser.add_argument("--dispatch", action="store_true", help="Dispatch report to #homelab via outbox if issues found")
+    parser.add_argument("--dispatch", action="store_true", help="Dispatch report via outbox if issues found")
     parser.add_argument("--quiet", action="store_true", help="Suppress output if no action taken")
     args = parser.parse_args()
 
@@ -262,9 +490,15 @@ def main():
                 channel="homelab",
                 content=summary
             )
-            print("[ArrWatchdog] Dispatched notification to #homelab outbox.", file=sys.stderr)
+            # Mirror sustained health alerts or restoral notices to #server-updates
+            if "Arr Health" in summary:
+                queue_outbox_message(
+                    channel="server-updates",
+                    content=summary
+                )
+            print("[ArrWatchdog] Dispatched notification to outbox.", file=sys.stderr)
     elif not args.quiet:
-        print("[ArrWatchdog] All Radarr and Sonarr queues nominal (0 import failures).")
+        print("[ArrWatchdog] All Radarr and Sonarr queues and health checks nominal (0 issues).")
 
     sys.exit(0)
 

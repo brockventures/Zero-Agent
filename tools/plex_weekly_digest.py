@@ -34,7 +34,7 @@ if not HOST_1_IP and os.path.exists("/secrets/ha.json"):
     except Exception:
         pass
 
-HOST_1_IP = HOST_1_IP or "127.0.0.1"
+HOST_1_IP = HOST_1_IP or os.environ.get("NAS_HOST_1_IP", "127.0.0.1")
 TAUTULLI_API_URL = os.environ.get("TAUTULLI_URL", f"http://{HOST_1_IP}:8181/api/v2")
 
 def generate_digest(days: int = 7, tag_all: bool = False) -> str:
@@ -120,17 +120,32 @@ def post_digest(tag_all: bool = False):
         print("No new media added this week.")
         return
 
-    payload = {
-        "username": "Plex Weekly Roundup",
-        "avatar_url": "https://raw.githubusercontent.com/Tautulli/Tautulli/master/data/interfaces/default/images/logo-plex.png",
-        "content": digest,
-        "allowed_mentions": {"parse": ["everyone"]} if tag_all else {"parse": []}
-    }
-    res = requests.post(WEBHOOK_URL, json=payload)
-    if res.status_code in (200, 204):
-        print("Weekly digest posted successfully!")
-    else:
-        print(f"Failed to post digest: {res.status_code} {res.text}")
+    if WEBHOOK_URL:
+        payload = {
+            "username": "Plex Weekly Roundup",
+            "avatar_url": "https://raw.githubusercontent.com/Tautulli/Tautulli/master/data/interfaces/default/images/logo-plex.png",
+            "content": digest,
+            "allowed_mentions": {"parse": ["everyone"]} if tag_all else {"parse": []}
+        }
+        try:
+            res = requests.post(WEBHOOK_URL, json=payload)
+            if res.status_code in (200, 204):
+                print("Weekly digest posted successfully via webhook!")
+                return
+            else:
+                print(f"Failed to post digest via webhook: {res.status_code} {res.text}")
+        except Exception as we:
+            print(f"Webhook request failed: {we}")
+
+    # Fallback to outbox queue for #server-updates
+    try:
+        from outbox import queue_outbox_message
+        queue_outbox_message("server-updates", digest, source_turn="plex_weekly_digest")
+        print("Weekly digest queued via outbox to #server-updates!")
+    except Exception as e:
+        print(f"Failed to queue outbox message: {e}")
+
+
 
 if __name__ == "__main__":
     tag = "--tag-all" in sys.argv

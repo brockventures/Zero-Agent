@@ -2,9 +2,12 @@
 name: shopping-advisor
 description: >-
   Use this skill whenever the user asks for product recommendations, buying advice,
-  reviews, or comparisons (e.g., "what is the best X", "find me steak knives", "recommend an espresso machine", "what should I buy for Y").
-  Executes a three-pillar protocol: Reddit community consensus (r/BuyItForLife), Wirecutter/RTINGS editorial
-  testing, and live Amazon 1P/Prime pricing and defect review audits.
+  reviews, comparisons, alternatives, or replacements, or to find/source a product to buy on Amazon or retail
+  (e.g., "what is the best X", "find me steak knives", "recommend an espresso machine", "what should I buy for Y",
+  "those shoes we ordered ended up being not quite right, do you have other suggestions", "this didn't work out, what should I get instead",
+  "alternatives to X", "find this on amazon", "what is this item, can you find it on amazon", or image-based product identification and sourcing).
+  Executes live Amazon SerpApi pricing/ASIN retrieval, defect review audits, Reddit consensus (r/BuyItForLife),
+  and Wirecutter/RTINGS testing.
 ---
 
 # 🛍️ Product Research & Shopping Advisor Skill
@@ -56,6 +59,20 @@ When external sources disagree, explicitly highlight the tension:
 
 ---
 
+### 3. The Anti-Conceptual Trap & Product Replacement Invariant
+
+* **Zero Purely Conceptual Responses:** When the user asks for suggestions, recommendations, or alternatives for physical products—even conversationally without mentioning a store or asking for links explicitly (e.g., *"Those shoes we ordered ended up being not quite right. Do you have other suggestions?"*, *"What should I look into instead?"*, *"Recommend a replacement"*):
+  - **NEVER stop at plain-text analysis, biomechanical essays, or bare brand names.**
+  - Explaining the ergonomic, biomechanical, or engineering failure mode of a prior item is great context, but it **MUST be immediately accompanied by verified direct product page links** (`/dp/<ASIN>`) for candidate replacements.
+* **Product Replacements & Post-Return Workflow:**
+  1. **Diagnose the failure mode:** Pinpoint the mechanical or structural flaw of the returned product (e.g. rigid forefoot rocker, excessive stack height, unstable bevel).
+  2. **Select targeted counter-models:** Identify 3-4 specific models that resolve that exact defect (e.g., flexible forefoot, moderate stack, neutral styling).
+  3. **Execute live retail retrieval:** Run `python3 /workspace/tools/amazon_serpapi.py search "<query>" --limit 5` to pull active 1P/Prime ASINs, live pricing, and reviews.
+  4. **Verify links:** Pre-flight check URLs via `python3 /workspace/.agents/skills/shopping-advisor/scripts/verify_links.py`.
+  5. **Deliver standard recommendation cards:** Present structured cards containing direct product detail links (`https://www.amazon.com/dp/<ASIN>`), live pricing, and defect/consensus audits.
+
+---
+
 ## 🛠️ Tooling & Execution Runbook
 
 ### Step 1: Run Reddit & Editorial Research Concurrently
@@ -86,22 +103,22 @@ python3 /workspace/tools/amazon_serpapi.py reviews "<ASIN>" --limit 10
 
 ```markdown
 🏆 **1. [Product Name / Model]** — *Recommended: [e.g. Best Overall / Enthusiast Pick]*
-• 💵 **Price:** `$XX.XX` (New, Prime / Retail)
-• 🏷️ **Seller:** Ships from / Sold by `Amazon.com` (or `[Brand] Official Storefront` / `Costco` / `Home Depot`)
-• ⭐ **Multi-Source Consensus:**
+- 💵 **Price:** `$XX.XX` (New, Prime / Retail)
+- 🏷️ **Seller:** Ships from / Sold by `Amazon.com` (or `[Brand] Official Storefront` / `Costco` / `Home Depot`)
+- ⭐ **Multi-Source Consensus:**
   - 🗞️ **Wirecutter:** *Top Pick* (Praised for temperature stability and brew speed)
   - 💬 **Reddit (r/BuyItForLife):** *Consensus Favorite* (5+ year longevity, replaceable parts)
   - 📦 **Retail / Amazon Rating:** 4.7 ★ (8,500+ reviews)
-• 🔍 **Critical Takeaway & Defect Audit:** [Summary of verified user failure modes, transit hazards, or build notes]
-• 🔗 **Link:** [Amazon Product Detail Page](https://www.amazon.com/dp/ASIN) | [Home Depot Search](https://www.homedepot.com/s/QUERY) | [Costco Search](https://www.costco.com/s?dept=All&keyword=QUERY)
+- 🔍 **Critical Takeaway & Defect Audit:** [Summary of verified user failure modes, transit hazards, or build notes]
+- 🔗 **Link:** [Amazon Product Detail Page](https://www.amazon.com/dp/ASIN) | [Home Depot Search](https://www.homedepot.com/s/QUERY) | [Costco Search](https://www.costco.com/s?dept=All&keyword=QUERY)
 
 🥈 **2. [Product Name / Model]** — *Alternative: [e.g. Best Value / Runner-Up]*
-• 💵 **Price:** `$XX.XX` (New, Prime / Retail)
-• 🏷️ **Seller:** Ships from / Sold by `Amazon.com` (or authorized retailer)
-• ⭐ **Multi-Source Consensus:**
+- 💵 **Price:** `$XX.XX` (New, Prime / Retail)
+- 🏷️ **Seller:** Ships from / Sold by `Amazon.com` (or authorized retailer)
+- ⭐ **Multi-Source Consensus:**
   - 🗞️ **Wirecutter:** *Budget Pick*
   - 💬 **Reddit:** *Solid Entry-Level Recommendation*
   - 📦 **Retail / Amazon Rating:** 4.5 ★ (22,000+ reviews)
-• 🔍 **Critical Takeaway & Defect Audit:** [Summary of pros, cons, and why it differs from Pick #1]
-• 🔗 **Link:** [Amazon Product Detail Page](https://www.amazon.com/dp/ASIN) (or [Retailer Search Link](canonical_url))
+- 🔍 **Critical Takeaway & Defect Audit:** [Summary of pros, cons, and why it differs from Pick #1]
+- 🔗 **Link:** [Amazon Product Detail Page](https://www.amazon.com/dp/ASIN) (or [Retailer Search Link](canonical_url))
 ```

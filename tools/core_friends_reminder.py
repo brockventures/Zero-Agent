@@ -32,6 +32,8 @@ HOUSEHOLD_MEMBERS = {
     "Rosalind ('Rosie') Brock",
     "Rosie Brock",
     "Isaac Brock",
+    "Genevieve Brock",
+    "Genevieve",
     "Baby Girl #3 Brock"
 }
 

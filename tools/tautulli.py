@@ -40,7 +40,7 @@ if not HOST_1_IP and os.path.exists("/secrets/ha.json"):
     except Exception:
         pass
 
-HOST_1_IP = HOST_1_IP or "127.0.0.1"
+HOST_1_IP = HOST_1_IP or os.environ.get("NAS_HOST_1_IP", "127.0.0.1")
 URL = os.environ.get("TAUTULLI_URL", f"http://{HOST_1_IP}:8181/api/v2")
 TIMEOUT = 25
 

@@ -213,28 +213,44 @@ class TestBridgeRunner(unittest.TestCase):
         self.assertEqual(line_buffer, "")
 
     def test_dual_completion_triggers(self):
-        """Verify cutoff logic triggers when either result event or agent_response DONE is observed."""
+        """Verify cutoff logic triggers when either result event or quiescent agent_response DONE is observed."""
         now = time.time()
+        agent_done_window = 15.0
 
-        # Case 1: Result event received > 1.5s ago
+        # Case 1: Result event received > 1.5s ago (fast path)
         result_received_at = now - 1.6
         agent_response_done_at = None
+        last_activity_time = now
         is_result_cutoff = (result_received_at is not None and (now - result_received_at) >= 1.5)
-        is_agent_done_cutoff = (agent_response_done_at is not None and (now - agent_response_done_at) >= 2.0)
+        is_agent_done_cutoff = (
+            agent_response_done_at is not None
+            and (now - agent_response_done_at) >= agent_done_window
+            and (now - last_activity_time) >= agent_done_window
+        )
         self.assertTrue(is_result_cutoff or is_agent_done_cutoff)
 
-        # Case 2: Agent response completed (state: DONE) > 2.0s ago without result event
+        # Case 2: Agent response completed (state: DONE) > 15.0s ago AND quiescent
         result_received_at = None
-        agent_response_done_at = now - 2.1
+        agent_response_done_at = now - 15.5
+        last_activity_time = now - 15.5
         is_result_cutoff = (result_received_at is not None and (now - result_received_at) >= 1.5)
-        is_agent_done_cutoff = (agent_response_done_at is not None and (now - agent_response_done_at) >= 2.0)
+        is_agent_done_cutoff = (
+            agent_response_done_at is not None
+            and (now - agent_response_done_at) >= agent_done_window
+            and (now - last_activity_time) >= agent_done_window
+        )
         self.assertTrue(is_result_cutoff or is_agent_done_cutoff)
 
-        # Case 3: Inactive - agent still actively generating
+        # Case 3: Inactive - agent still actively generating or recent activity (<15s)
         result_received_at = None
-        agent_response_done_at = None
+        agent_response_done_at = now - 2.0  # Only 2s elapsed, tools or tasks might still run!
+        last_activity_time = now - 1.0
         is_result_cutoff = (result_received_at is not None and (now - result_received_at) >= 1.5)
-        is_agent_done_cutoff = (agent_response_done_at is not None and (now - agent_response_done_at) >= 2.0)
+        is_agent_done_cutoff = (
+            agent_response_done_at is not None
+            and (now - agent_response_done_at) >= agent_done_window
+            and (now - last_activity_time) >= agent_done_window
+        )
         self.assertFalse(is_result_cutoff or is_agent_done_cutoff)
 
     def test_wedged_diagnostic_formatting(self):
@@ -271,6 +287,26 @@ class TestBridgeRunner(unittest.TestCase):
         self.assertIn("n_tty_read", final_text)
         self.assertIn("PID 1235", final_text)
         self.assertIn("47s of silence", final_text)
+
+    def test_step_inactivity_retry_detection(self):
+        """Verify that step inactivity timeouts trigger retry when attempts remain."""
+        max_retries = 2
+        attempt = 0
+        timed_out = True
+        is_hard_ceiling = False
+
+        is_retryable_stall = timed_out and not is_hard_ceiling
+        self.assertTrue(is_retryable_stall and attempt < max_retries)
+
+        # On exhausted retries, do not retry
+        attempt = 2
+        self.assertFalse(is_retryable_stall and attempt < max_retries)
+
+        # On hard ceiling timeout, do not retry
+        attempt = 0
+        is_hard_ceiling = True
+        is_retryable_stall = timed_out and not is_hard_ceiling
+        self.assertFalse(is_retryable_stall and attempt < max_retries)
 
 
 if __name__ == "__main__":

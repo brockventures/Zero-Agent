@@ -20,15 +20,21 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
+TOOLS_DIR = Path(__file__).resolve().parent
 MEMORY_DIR = Path("/workspace/memory")
 PUB_DIR = MEMORY_DIR / "public"
 PRIV_DIR = MEMORY_DIR / "private"
+VAULT_DIR = MEMORY_DIR / "vault"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 MEMORY_PUB_INDEX = MEMORY_DIR / "MEMORY_PUBLIC.md"
 MEMORY_PRIV_INDEX = MEMORY_DIR / "MEMORY_PRIVATE.md"
+MEMORY_VAULT_INDEX = VAULT_DIR / "VAULT.md"
 CHANNEL_HISTORY_PATH = Path("/workspace/data/channel_history.json")
 CC_DECISIONS_FILE = MEMORY_DIR / "crab_cavern" / "decisions.md"
 USER_RYAN_FILE = PRIV_DIR / "user_ryan.md"
+
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
 
 log = logging.getLogger("memory_manager")
 
@@ -49,82 +55,159 @@ def _get_security_rules():
 def memory_write(name: str, title: str, description: str, category: str, content: str, tier: str = "auto") -> dict:
     """Create or update a memory file in public/ or private/ tier and update index files.
     
+    Dual-Write / Mirroring Architecture:
+    - Purely personal/confidential domains ('user', 'finances', 'family', 'social', 'preference', 'credentials')
+      write exclusively to memory/private/.
+    - Engineering/technical domains ('architecture', 'engineering', 'protocol', 'pattern', 'tool', 'scar', 'reference')
+      automatically execute a Dual-Write when tier='auto':
+      1. Write the full-fidelity, unredacted original to memory/private/<name>.
+      2. Automatically scrub homelab IPs, NAS volume paths, and personal PII via promote_memory.scrub_content().
+      3. Verify the scrubbed content against validate_commit_safety.validate_scrubbed_safety().
+      4. If clean, write the sanitized mirror to memory/public/<name> so Public Zero has immediate access.
+    
     Args:
         name: filename (e.g. 'arch_rolling_compaction.md' or 'user_preferences.md')
         title: Title of the memory document
         description: 1-line description
         category: category tag ('architecture', 'engineering', 'protocol', 'user', 'project', etc.)
         content: Markdown content
-        tier: 'public', 'private', or 'auto' (automatically evaluates against security rules)
+        tier: 'public', 'private', or 'auto' (automatically dual-writes engineering knowledge)
     """
     if not name.endswith(".md"):
         name += ".md"
 
     # Enforce naming prefix if appropriate
-    valid_prefixes = ("user_", "project_", "reference_", "feedback_", "arch_", "scar_")
+    valid_prefixes = ("user_", "project_", "reference_", "feedback_", "arch_", "scar_", "pattern_", "tool_")
     if not any(name.startswith(p) for p in valid_prefixes):
-        if category in ("user", "project", "reference", "feedback", "arch", "scar"):
+        if category in ("user", "project", "reference", "feedback", "arch", "scar", "pattern", "tool"):
             name = f"{category}_{name}"
 
-    # Determine tier if auto
-    if tier == "auto":
-        is_priv = False
-        private_categories = ("user", "finances", "family", "private_email", "sms")
-        if category in private_categories or name.startswith(("user_", "deep_", "private_", "security_")):
-            is_priv = True
-        else:
-            for pat, _ in _get_security_rules():
-                if re.search(pat, content):
-                    is_priv = True
-                    break
-        target_dir = PRIV_DIR if is_priv else PUB_DIR
+    now_str = datetime.now(PT).strftime("%Y-%m-%d")
+
+    def format_document(t_title: str, t_desc: str, t_cat: str, t_body: str, source_tag: str | None = None) -> str:
+        fm = [
+            "---",
+            f"name: {t_title}",
+            f"description: \"{t_desc}\"",
+            f"category: {t_cat}",
+        ]
+        if source_tag:
+            fm.append(f"source: {source_tag}")
+        fm.extend([
+            f"updated: {now_str}",
+            "---",
+            "",
+            t_body.strip(),
+            ""
+        ])
+        return "\n".join(fm)
+
+    private_categories = ("user", "finances", "family", "private_email", "sms", "preference", "social", "credentials")
+    is_personal = category in private_categories or name.startswith(("user_", "deep_", "private_", "security_"))
+
+    written_files = []
+    mirrored_public = False
+    primary_file = None
+    primary_tier = "private"
+
+    if tier == "vault":
+        # Strictly vault memory (isolated, no public/private mirror, no root symlink, independent VAULT.md index)
+        VAULT_DIR.mkdir(parents=True, exist_ok=True)
+        vault_file = VAULT_DIR / name
+        vault_file.write_text(format_document(title, description, category, content), encoding="utf-8")
+        written_files.append(str(vault_file))
+        primary_tier = "vault"
+        primary_file = vault_file
+        rebuild_indexes()
+        return {
+            "ok": True,
+            "file": str(primary_file),
+            "tier": primary_tier,
+            "mirrored_public": False,
+            "files": written_files,
+            "indexed": True
+        }
+
+    elif tier == "private" or is_personal:
+        # Strictly private (ground-truth only, no public mirror)
+        PRIV_DIR.mkdir(parents=True, exist_ok=True)
+        priv_file = PRIV_DIR / name
+        priv_file.write_text(format_document(title, description, category, content), encoding="utf-8")
+        written_files.append(str(priv_file))
+        primary_tier = "private"
+        primary_file = priv_file
+
     elif tier == "public":
-        # Validate security before accepting public write
+        # Strictly public explicit write (must pass security validation raw)
         for pat, desc in _get_security_rules():
             m = re.search(pat, content)
             if m:
                 raise ValueError(f"Security validation failed for public memory: Matched {desc} ('{m.group(0)}')")
-        target_dir = PUB_DIR
+        PUB_DIR.mkdir(parents=True, exist_ok=True)
+        pub_file = PUB_DIR / name
+        pub_file.write_text(format_document(title, description, category, content), encoding="utf-8")
+        written_files.append(str(pub_file))
+        primary_tier = "public"
+        primary_file = pub_file
+
     else:
-        target_dir = PRIV_DIR
+        # tier == "auto" for engineering / technical content: DUAL-WRITE
+        # 1. Write full-fidelity unredacted original to memory/private/
+        PRIV_DIR.mkdir(parents=True, exist_ok=True)
+        priv_file = PRIV_DIR / name
+        priv_file.write_text(format_document(title, description, category, content), encoding="utf-8")
+        written_files.append(str(priv_file))
+        primary_tier = "dual"
+        primary_file = priv_file
 
-    target_dir.mkdir(parents=True, exist_ok=True)
-    file_path = target_dir / name
-    now_str = datetime.now(PT).strftime("%Y-%m-%d")
+        # 2. In-flight scrubbing for sanitized public mirror
+        try:
+            if str(TOOLS_DIR) not in sys.path:
+                sys.path.insert(0, str(TOOLS_DIR))
+            import promote_memory
+            scrubbed_content = promote_memory.scrub_content(content)
+            scrubbed_title = promote_memory.scrub_content(title)
+            scrubbed_desc = promote_memory.scrub_content(description)
 
-    # Format YAML frontmatter
-    fm = [
-        "---",
-        f"name: {title}",
-        f"description: \"{description}\"",
-        f"category: {category}",
-        f"updated: {now_str}",
-        "---",
-        "",
-        content.strip(),
-        ""
-    ]
-    file_path.write_text("\n".join(fm), encoding="utf-8")
+            violations = promote_memory.validate_scrubbed_safety(f"{scrubbed_title}\n{scrubbed_desc}\n{scrubbed_content}")
+            if not violations:
+                PUB_DIR.mkdir(parents=True, exist_ok=True)
+                pub_file = PUB_DIR / name
+                pub_file.write_text(format_document(scrubbed_title, scrubbed_desc, category, scrubbed_content, source_tag=f"private/{name}"), encoding="utf-8")
+                written_files.append(str(pub_file))
+                mirrored_public = True
+            else:
+                log.warning(f"Public mirror skipped for {name}: unscrubbed tokens detected: {violations}")
+        except Exception as e:
+            log.warning(f"Error generating public mirror for {name}: {e}")
 
     # Create / update backward-compatible symlink at root of memory dir
     root_link = MEMORY_DIR / name
-    if root_link != file_path:
+    if primary_file and root_link != primary_file:
         try:
             if root_link.is_symlink() or root_link.exists():
                 root_link.unlink()
-            root_link.symlink_to(Path(target_dir.name) / name)
+            root_link.symlink_to(Path(primary_file.parent.name) / name)
         except Exception as e:
             log.warning(f"Failed creating root symlink for {name}: {e}")
 
     # Rebuild indexes
     rebuild_indexes()
 
-    return {"ok": True, "file": str(file_path), "tier": target_dir.name, "indexed": True}
+    return {
+        "ok": True,
+        "file": str(primary_file),
+        "tier": primary_tier,
+        "mirrored_public": mirrored_public,
+        "files": written_files,
+        "indexed": True
+    }
 
 def rebuild_indexes():
-    """Rebuild MEMORY_PUBLIC.md, MEMORY_PRIVATE.md, and unified MEMORY.md."""
+    """Rebuild MEMORY_PUBLIC.md, MEMORY_PRIVATE.md, unified MEMORY.md, and isolated VAULT.md."""
     PUB_DIR.mkdir(parents=True, exist_ok=True)
     PRIV_DIR.mkdir(parents=True, exist_ok=True)
+    VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
     def get_info(fp: Path) -> tuple[str, str]:
         try:
@@ -159,7 +242,7 @@ def rebuild_indexes():
     MEMORY_PRIV_INDEX.write_text("\n".join(priv_lines) + "\n", encoding="utf-8")
     (PRIV_DIR / "MEMORY.md").write_text("\n".join(priv_lines) + "\n", encoding="utf-8")
 
-    # Unified index
+    # Unified index (Public + Private only; strictly NO VAULT)
     uni_lines = [
         "# Zero Complete Memory Index (Unified)\n",
         "## 🌐 Public Engineering & Architecture Memory (`memory/public/`)\n"
@@ -168,6 +251,17 @@ def rebuild_indexes():
     uni_lines.append("\n## 🔒 Private Homelab & Personal Memory (`memory/private/`)\n")
     uni_lines.extend(priv_lines[1:])
     MEMORY_INDEX.write_text("\n".join(uni_lines) + "\n", encoding="utf-8")
+
+    # Isolated Vault Index (Vault files only)
+    vault_lines = ["# Zero Vault Secret Memory Index (Strictly Isolated Enclave)\n"]
+    for f in sorted(VAULT_DIR.glob("*.md")):
+        if f.name in ("VAULT.md", "MEMORY.md"):
+            continue
+        title, desc = get_info(f)
+        vault_lines.append(f"- [{title}]({f.name}) — {desc}")
+    if len(vault_lines) == 1:
+        vault_lines.append("- *(Vault is currently empty. No secret records active.)*")
+    MEMORY_VAULT_INDEX.write_text("\n".join(vault_lines) + "\n", encoding="utf-8")
 
     # Sync SQLite FTS5 Index
     try:

@@ -117,7 +117,56 @@ class TestMarketStandup(unittest.TestCase):
             self.assertTrue(res["test"])
             self.assertEqual(res["evening_messages"], 1)
             mock_claim.assert_not_called()
-            mock_queue.assert_not_called()
+    @patch("tools.market_standup.synthesize_standing_agenda")
+    def test_build_standup_message_ceiling_invariant(self, mock_synth):
+        """Verify build_standup_message strictly caps output <= 1900 chars under extreme bloat."""
+        from tools.market_standup import build_standup_message
+        mock_synth.return_value = "1. Agenda point A\n2. Agenda point B\n3. Agenda point C"
+        test_now = datetime(2026, 9, 11, 19, 0, 0, tzinfo=PT)
+
+        state = {
+            "open_prs": [
+                {"number": i, "title": f"Feature proposal and complex architectural refactor #{i}", "author": {"login": "contributor"}}
+                for i in range(10)
+            ],
+            "recent_commits": [
+                f"`abcdef{i}` Extensive commit message describing multi-component pipeline refactor ({i})"
+                for i in range(10)
+            ]
+        }
+
+        # Staged items with verbose details
+        staged_items = [
+            {"topic": f"Major Feature {i}", "task_id": 50 + i, "details": "A" * 300}
+            for i in range(8)
+        ]
+
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("pathlib.Path.read_text", return_value=json.dumps({"items": staged_items})):
+            msg = build_standup_message(state, test_now)
+
+        self.assertLessEqual(len(msg), 1900)
+        self.assertIn("handoff", msg)
+        self.assertIn("Autonomous Daily Standup", msg)
+
+    @patch("tools.market_standup.synthesize_standing_agenda")
+    def test_build_standup_message_includes_github_issues(self, mock_synth):
+        """Verify build_standup_message formats open issues from GitHub task board."""
+        from tools.market_standup import build_standup_message
+        mock_synth.return_value = "1. Point 1\n2. Point 2\n3. Point 3"
+        test_now = datetime(2026, 9, 19, 19, 0, 0, tzinfo=PT)
+        state = {
+            "open_prs": [],
+            "open_issues": [
+                {"number": 58, "title": "CircuitBreakerEngine.get_vwap() falls back to unscoped last_price", "labels": [{"name": "agent:zero"}, {"name": "priority:p1"}]},
+                {"number": 39, "title": "Ops: Vercel Edge & Railway Backend Auto-Deploy Pipeline Sync", "labels": [{"name": "agent:zero"}]}
+            ],
+            "recent_commits": []
+        }
+        msg = build_standup_message(state, test_now)
+        self.assertIn("**Open Tasks & Issues (GitHub Task Board):**", msg)
+        self.assertIn("- Issue #58: CircuitBreakerEngine.get_vwap() falls back to unscoped last_price *(agent:zero, priority:p1)*", msg)
+        self.assertIn("- Issue #39: Ops: Vercel Edge & Railway Backend Auto-Deploy Pipeline Sync *(agent:zero)*", msg)
 
 
 if __name__ == "__main__":

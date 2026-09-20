@@ -42,10 +42,16 @@ READONLY_NOTIFICATION_CHANNELS = {
 TARGET_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "1542081375287640084"))
 BROCK_GUILD_ID = int(os.getenv("DISCORD_BROCK_GUILD_ID", "1210466877294518272"))
 OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
+IVY_USER_ID = int(os.getenv("DISCORD_IVY_USER_ID", "1541205716948353074"))
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
 
 OPERATIONS_CATEGORY_ID = 1544953274363412533
 HOMELAB_CHANNEL_ID = 1544955535722545253
+BROCK_HOUSE_CHANNEL_ID = 1550577908811178095  # #brock-house
+VAULT_CHANNEL_ID = 1550577910757458015        # #vault (isolated memory tier)
+DEFAULT_EXCLUDED_HOME_CHANNELS = {
+    1548196929308065893,  # #baseball (dedicated to Ivy)
+}
 DEFAULT_HOME_CHANNELS = {
     TARGET_CHANNEL_ID,
     1544953275877556334,  # #home-assistant
@@ -54,6 +60,9 @@ DEFAULT_HOME_CHANNELS = {
     1544955532765560924,  # #finances
     HOMELAB_CHANNEL_ID,    # #homelab
     1544955538033348618,  # #shopping
+    1548196930788524094,  # #projects
+    BROCK_HOUSE_CHANNEL_ID,  # #brock-house
+    VAULT_CHANNEL_ID,        # #vault
 }
 RETITLED_THREADS_FILE = DATA_DIR / "retitled_threads.json"
 
@@ -66,8 +75,16 @@ def is_home_channel(channel) -> bool:
     rules = get_runtime_rules()
     ops_cat_id = rules.get("operations_category_id", OPERATIONS_CATEGORY_ID)
     home_ch_ids = set(rules.get("home_channel_ids", DEFAULT_HOME_CHANNELS))
+    excluded_ch_ids = set(rules.get("excluded_home_channel_ids", DEFAULT_EXCLUDED_HOME_CHANNELS))
 
     ch_id = getattr(channel, "id", None)
+    if ch_id in excluded_ch_ids:
+        return False
+
+    parent_id = getattr(channel, "parent_id", None)
+    if parent_id and parent_id in excluded_ch_ids:
+        return False
+
     if ch_id in home_ch_ids:
         return True
 
@@ -524,14 +541,23 @@ def set_channel_session_id(channel_id: int | str, mode: str, conv_id: str, targe
             except Exception:
                 d = {}
         key = "home" if (mode == "home" and int(channel_id) == target_channel_id) else str(channel_id)
-        if d.get(key) != conv_id:
+        old_conv_id = d.get(key)
+        if old_conv_id != conv_id:
             d[key] = conv_id
             tmp = SESSIONS_FILE.with_suffix(".tmp")
             with open(tmp, "w") as f:
                 json.dump(d, f, indent=2)
             tmp.replace(SESSIONS_FILE)
             print(f"[BridgeState] Persisted session mapping: {key} -> {conv_id}")
-            set_session_metadata(key, {"conv_id": conv_id, "last_active": int(time.time())})
+            meta_update = {"conv_id": conv_id, "last_active": int(time.time())}
+            if old_conv_id:
+                meta_update["parent_conv_id"] = old_conv_id
+                meta = get_session_metadata(key)
+                hist = list(meta.get("conv_history", []))
+                if not hist or hist[-1] != old_conv_id:
+                    hist.append(old_conv_id)
+                meta_update["conv_history"] = hist[-10:]
+            set_session_metadata(key, meta_update)
     except Exception as e:
         print(f"[BridgeState] Failed persisting session mapping: {e}")
 
@@ -540,10 +566,12 @@ def clear_channel_session_id(channel_id: int | str, mode: str, target_channel_id
     """Clear conversation ID mapping and reset session metadata."""
     try:
         key = "home" if (mode == "home" and int(channel_id) == target_channel_id) else str(channel_id)
+        old_conv_id = None
         if SESSIONS_FILE.exists():
             with open(SESSIONS_FILE) as f:
                 d = json.load(f)
             if key in d:
+                old_conv_id = d[key]
                 del d[key]
                 tmp = SESSIONS_FILE.with_suffix(".tmp")
                 with open(tmp, "w") as f:
@@ -551,8 +579,24 @@ def clear_channel_session_id(channel_id: int | str, mode: str, target_channel_id
                 tmp.replace(SESSIONS_FILE)
                 print(f"[BridgeState] Cleared session mapping for: {key}")
         reset_session_meta(key)
+        if old_conv_id:
+            meta = get_session_metadata(key)
+            hist = list(meta.get("conv_history", []))
+            if not hist or hist[-1] != old_conv_id:
+                hist.append(old_conv_id)
+            set_session_metadata(key, {
+                "parent_conv_id": old_conv_id,
+                "conv_id": None,
+                "conv_history": hist[-10:]
+            })
     except Exception as e:
         print(f"[BridgeState] Failed clearing session mapping: {e}")
+
+
+def get_session_parent_id(sess_key: str) -> str | None:
+    """Retrieve parent conversation ID for a session key if it was rotated."""
+    meta = get_session_metadata(sess_key)
+    return meta.get("parent_conv_id")
 
 
 # Active model selection persistence
@@ -672,13 +716,21 @@ def update_beacon(state: str = "IDLE", prompt: str = "", channel_id: int | str =
         clean_prompt = re.sub(r"\[GIF Cadence Tracker[^\n]*(?:\n\s*[•\-\*][^\n]*)*\n*", "", clean_prompt).strip()
         clean_prompt = clean_prompt.strip()
 
-        data = {
+        data = {}
+        if BEACON_FILE.exists():
+            try:
+                with open(BEACON_FILE) as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+
+        data.update({
             "state": state,
             "ts": time.time(),
             "time_pt": datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M:%S %p PT"),
             "prompt": clean_prompt[:120] if clean_prompt else "",
             "channel_id": int(channel_id) if str(channel_id).isdigit() else channel_id
-        }
+        })
         tmp = BEACON_FILE.with_suffix(".tmp")
         with open(tmp, "w") as f:
             json.dump(data, f)
@@ -687,9 +739,45 @@ def update_beacon(state: str = "IDLE", prompt: str = "", channel_id: int | str =
         pass
 
 
+def update_gateway_heartbeat(bot=None, status: str = "connected") -> dict:
+    """Update dynamic Discord gateway heartbeat and latency in liveness_beacon.json."""
+    data = {}
+    try:
+        if BEACON_FILE.exists():
+            try:
+                with open(BEACON_FILE) as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+
+        now = time.time()
+        latency = None
+        if bot and hasattr(bot, "latency"):
+            try:
+                latency = round(bot.latency * 1000, 1)
+            except Exception:
+                pass
+
+        data["gateway_heartbeat"] = now
+        data["gateway_status"] = status
+        data["gateway_latency_ms"] = latency
+        data["gateway_time_pt"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M:%S %p PT")
+        if "state" not in data:
+            data["state"] = "IDLE"
+            data["ts"] = now
+
+        tmp = BEACON_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        tmp.replace(BEACON_FILE)
+    except Exception:
+        pass
+    return data
+
+
 def is_container_restart_intent(text: str) -> bool:
     """Detect explicit commands or natural language requests to restart the Docker container via SSH."""
-    clean = text.strip().lower()
+    clean = text.strip().strip("'\"`“”‘’").strip().lower()
     if not clean:
         return False
 
@@ -710,7 +798,7 @@ def is_container_restart_intent(text: str) -> bool:
 
 def is_reload_intent(text: str) -> bool:
     """Detect explicit commands or natural language requests to restart/reload the bot/bridge in-place."""
-    clean = text.strip().lower()
+    clean = text.strip().strip("'\"`“”‘’").strip().lower()
     if not clean:
         return False
 
@@ -749,17 +837,111 @@ def is_reload_intent(text: str) -> bool:
     return False
 
 
-def sync_credentials():
-    """Mirror OAuth token to persistent storage locations."""
+def sync_credentials() -> bool:
+    """Validate, sanitize, repair, and atomically mirror the Antigravity OAuth token.
+
+    Prevents 'invalid character after top-level value' outages by:
+    1. Detecting and stripping trailing bytes (e.g. non-truncated background daemon writes).
+    2. Restoring from valid persistent backups if primary token is missing, empty, or corrupted.
+    3. Writing atomically via temporary files and os.replace() with fsync to prevent partial reads.
+    4. Mirroring clean, validated tokens to all persistent backup locations.
+    """
     src = "/root/.gemini/antigravity-cli/antigravity-oauth-token"
     dsts = [
         "/root/.gemini/antigravity-oauth-token.bak",
-        "/root/.config/antigravity/antigravity-oauth-token"
+        "/root/.config/antigravity/antigravity-oauth-token",
+        "/root/.config/antigravity/antigravity-oauth-token.bak",
     ]
+
+    def _is_valid_token(d: dict) -> bool:
+        if not isinstance(d, dict):
+            return False
+        return "token" in d or "access_token" in d or "auth_method" in d
+
+    def _atomic_write(path: str, content: str, mode: int = 0o600):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+
+    parsed_data = None
+    needs_repair = False
+
+    # 1. Inspect primary source
     if os.path.exists(src):
-        for dst in dsts:
-            try:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-            except Exception as e:
-                print(f"[BridgeState] Failed to mirror token to {dst}: {e}")
+        try:
+            with open(src, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            if raw:
+                try:
+                    data = json.loads(raw)
+                    if _is_valid_token(data):
+                        parsed_data = data
+                except json.JSONDecodeError:
+                    # Trailing or leading garbage detected (e.g. non-truncated rewrite)
+                    decoder = json.JSONDecoder()
+                    start_brace = raw.find("{")
+                    if start_brace != -1:
+                        try:
+                            data, end_idx = decoder.raw_decode(raw[start_brace:])
+                            if _is_valid_token(data):
+                                parsed_data = data
+                                needs_repair = True
+                                print(
+                                    f"[BridgeState] Sanitized token with trailing garbage ({len(raw)} -> {end_idx} chars)"
+                                )
+                        except Exception as de:
+                            print(f"[BridgeState] Failed to decode raw JSON token: {de}")
+        except Exception as e:
+            print(f"[BridgeState] Error reading token at {src}: {e}")
+
+    # 2. If primary invalid or missing, recover from backups
+    if not parsed_data:
+        for b_path in dsts:
+            if os.path.exists(b_path):
+                try:
+                    with open(b_path, "r", encoding="utf-8") as f:
+                        b_raw = f.read().strip()
+                    b_data = json.loads(b_raw)
+                    if _is_valid_token(b_data):
+                        parsed_data = b_data
+                        needs_repair = True
+                        print(f"[BridgeState] Recovered valid OAuth token from backup: {b_path}")
+                        break
+                except Exception:
+                    continue
+
+    if not parsed_data:
+        print("[BridgeState] Warning: No valid OAuth token found in primary or backup locations.")
+        return False
+
+    clean_json_str = json.dumps(parsed_data, indent=2)
+
+    # 3. Atomically repair primary if needed
+    if needs_repair or not os.path.exists(src):
+        try:
+            _atomic_write(src, clean_json_str)
+            print(f"[BridgeState] Atomically wrote sanitized token to {src}")
+        except Exception as e:
+            print(f"[BridgeState] Error writing sanitized token to {src}: {e}")
+            return False
+
+    # 4. Atomically mirror to backups (skipping writes if identical)
+    for b_path in dsts:
+        try:
+            if os.path.exists(b_path):
+                try:
+                    with open(b_path, "r", encoding="utf-8") as f:
+                        if f.read().strip() == clean_json_str.strip():
+                            continue
+                except Exception:
+                    pass
+            _atomic_write(b_path, clean_json_str)
+        except Exception as e:
+            print(f"[BridgeState] Failed to mirror token to {b_path}: {e}")
+
+    return True

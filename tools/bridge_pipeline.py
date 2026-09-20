@@ -18,6 +18,7 @@ import discord
 from tools.bridge_state import (
     DATA_DIR,
     TARGET_CHANNEL_ID,
+    VAULT_CHANNEL_ID,
     PT_TZ,
     get_runtime_rules,
     get_channel_session_id,
@@ -36,6 +37,8 @@ from tools.bridge_formatting import (
     scrub_credentials,
     chunk_text,
     strip_reaction_gifs,
+    is_internal_cli_leak,
+    strip_internal_cli_chatter,
 )
 
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
@@ -242,13 +245,27 @@ def prepare_turn_prompt(
     now_pt = now_utc.astimezone(PT_TZ)
     gif_guidance = get_gif_prompt_guidance(sess_key, channel_id=channel_id)
 
+    anti_leak_guidance = (
+        "[Bridge Execution Invariant - Strictly Zero Internal Chatter Leaks]:\n"
+        "• NEVER emit 'No tools called', 'Waiting for task to complete', 'Waiting for command to finish', or any background task wait/status chatter to chat.\n"
+        "• When tools or background tasks are executing, NEVER emit premature placeholder text or premature '[NO_REPLY]' for active user requests. Stop calling tools and wait silently for the system notification/result before generating your final response.\n"
+        "• Reserve '[NO_REPLY]' strictly for shared/ambient channels where an inbound message genuinely requires no response (e.g., passive chatter, silent emoji reaction, or explicitly unaddressed message)."
+    )
+
     if mode == "home":
         time_guidance = (
             f"[System Time & Timezone]: Current time is {now_pt.strftime('%A, %b %d, %Y %I:%M %p PT')} (America/Los_Angeles).\n"
             f"• Note: System VM clock and runtime metadata are UTC ({now_utc.strftime('%H:%M:%S UTC')}).\n"
             f"• Rule: ALWAYS use Pacific Time (PT). Never quote raw UTC timestamps or assume raw UTC is local time."
         )
-        return f"{time_guidance}\n\n{gif_guidance}\n\n{prompt}"
+        if channel_id == VAULT_CHANNEL_ID:
+            vault_guidance = (
+                "[ZERO VAULT ENCLAVE]: You are operating in #vault — Ryan's strictly isolated secret memory enclave.\n"
+                "• All memories, notes, and records generated in this channel MUST be written exclusively to tier='vault' (/workspace/memory/vault/).\n"
+                "• NEVER push or leak vault memories to main private (/workspace/memory/private/) or public (/workspace/memory/public/) memory indexes."
+            )
+            return f"{time_guidance}\n\n{vault_guidance}\n\n{gif_guidance}\n\n{anti_leak_guidance}\n\n{prompt}"
+        return f"{time_guidance}\n\n{gif_guidance}\n\n{anti_leak_guidance}\n\n{prompt}"
 
     # External mode (Crab Cavern & multi-agent shared channels)
     channel_ctx_block = ""
@@ -298,10 +315,11 @@ def prepare_turn_prompt(
                 ext_prompt = f"{time_block}\n\n{ext_prompt}"
             if "{gif_guidance}" not in tmpl and "[GIF Cadence Tracker" not in ext_prompt:
                 ext_prompt = f"{gif_guidance}\n\n{ext_prompt}"
+            ext_prompt = f"{ext_prompt}\n\n{anti_leak_guidance}"
             return ext_prompt
         except Exception:
             return (
-                f"{time_block}\n\n{gif_guidance}\n\n{manifest_block}\n\n{channel_ctx_block}"
+                f"{time_block}\n\n{gif_guidance}\n\n{anti_leak_guidance}\n\n{manifest_block}\n\n{channel_ctx_block}"
                 f"[INBOUND MESSAGE{author_tag}]: {prompt}"
             )
     else:
@@ -311,6 +329,7 @@ def prepare_turn_prompt(
             f"{channel_ctx_block}"
             f"{time_block}\n\n"
             f"{gif_guidance}\n\n"
+            f"{anti_leak_guidance}\n\n"
             f"[INBOUND MESSAGE{author_tag}]: {prompt}"
         )
 
@@ -398,7 +417,33 @@ async def deliver_turn_output(
         except Exception as re_err:
             print(f"[BridgePipeline] Error recording Zero reply to channel history: {re_err}")
 
-        chunks = chunk_text(clean_ext_text, 1900)
+        # Ensure handoff envelopes are never severed into a separate message in external mode
+        env_match = re.search(
+            r"(\n*```(?:handoff)?\s*\n?\{.*?\}\s*```\s*)$", clean_ext_text, re.DOTALL
+        )
+        if env_match and len(clean_ext_text) > 1980:
+            env_str = env_match.group(1).strip()
+            body = clean_ext_text[: env_match.start()].rstrip()
+            body_condensed = re.sub(r"\n{3,}", "\n\n", body)
+            body_condensed = re.sub(r"[ \t]+\n", "\n", body_condensed).strip()
+            combined = f"{body_condensed}\n\n{env_str}"
+            if len(combined) <= 1980:
+                clean_ext_text = combined
+            else:
+                budget = 1980 - len(env_str) - 2
+                if budget > 200:
+                    cut_idx = -1
+                    for delim in ["\n\n", ".\n", ". ", "\n", " "]:
+                        pos = body_condensed.rfind(delim, 0, budget)
+                        if pos > budget // 2:
+                            cut_idx = pos + (len(delim) if delim in (". ", ".\n") else 0)
+                            break
+                    trimmed_body = (
+                        body_condensed[:cut_idx] if cut_idx > 0 else body_condensed[:budget]
+                    ).rstrip()
+                    clean_ext_text = f"{trimmed_body}\n\n{env_str}"
+
+        chunks = chunk_text(clean_ext_text, 1980)
         if not chunks or (len(chunks) == 1 and chunks[0] == "*(No output from agent)*"):
             if status_msg:
                 try:
@@ -412,19 +457,61 @@ async def deliver_turn_output(
             return
 
         target_dest = delivery_target if delivery_target else reply_target
+        dest_cid = None
+        if target_dest:
+            ch = getattr(target_dest, "channel", None)
+            ch_id = getattr(ch, "id", None)
+            if ch_id is not None and str(ch_id).isdigit():
+                dest_cid = int(ch_id)
+            elif getattr(target_dest, "id", None) is not None and str(target_dest.id).isdigit():
+                dest_cid = int(target_dest.id)
+        if dest_cid is None:
+            try:
+                dest_cid = int(channel_id)
+            except (ValueError, TypeError):
+                dest_cid = None
+
+        is_banana_stand = (dest_cid == BANANA_STAND_CHANNEL_ID)
+        held_turn_banana = False
+
+        if is_banana_stand:
+            try:
+                from tools.banana import claim
+
+                claim(subject="zero-external-turn")
+                held_turn_banana = True
+            except Exception as be:
+                print(f"[BridgePipeline] Banana claim notice for the-banana-stand turn: {be}")
+
         try:
             if status_msg:
-                await status_msg.edit(content=chunks[0])
+                try:
+                    await status_msg.edit(content=chunks[0])
+                except Exception as edit_err:
+                    print(f"[BridgePipeline] Failed to edit status message ({edit_err}), falling back to reply...")
+                    await target_dest.reply(chunks[0])
             else:
-                await target_dest.reply(chunks[0])
-        except Exception:
-            await target_dest.reply(chunks[0])
+                try:
+                    await target_dest.reply(chunks[0])
+                except Exception as reply_err:
+                    print(f"[BridgePipeline] target_dest.reply failed ({reply_err}), falling back to channel.send...")
+                    target_ch = getattr(target_dest, "channel", target_dest)
+                    await target_ch.send(chunks[0])
 
-        for ch in chunks[1:]:
-            try:
-                await target_dest.reply(ch)
-            except Exception:
-                await target_dest.channel.send(ch)
+            for ch in chunks[1:]:
+                try:
+                    await target_dest.reply(ch)
+                except Exception:
+                    target_ch = getattr(target_dest, "channel", target_dest)
+                    await target_ch.send(ch)
+        finally:
+            if held_turn_banana:
+                try:
+                    from tools.banana import release
+
+                    release()
+                except Exception as err:
+                    print(f"[BridgePipeline] Banana release warning for external turn: {err}")
 
         # Look for new artifacts generated during this turn in external mode
         active_cid = get_channel_session_id(channel_id, mode) or conv_id
@@ -505,9 +592,10 @@ async def deliver_turn_output(
         r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", final_text, flags=re.IGNORECASE
     ).strip()
 
-    # In Home Turf, silence tags and empty outputs are invalid - flag as incomplete turn so Ryan is never ghosted
+    # In Home Turf, silence tags, internal CLI leaks, and empty outputs are invalid - flag as incomplete turn so Ryan is never ghosted
     if (
-        final_text.strip()
+        is_internal_cli_leak(final_text)
+        or final_text.strip()
         in (
             "[NO_REPLY]",
             "NO_REPLY",
@@ -573,14 +661,23 @@ async def deliver_turn_output(
         except Exception as e:
             print(f"[BridgePipeline] Failed to attach artifact {art}: {e}")
 
-    chunks = chunk_text(final_text, 1900)
+    chunks = chunk_text(final_text, 1980)
     target_dest = delivery_target if delivery_target else reply_target
-    dest_cid = (
-        getattr(getattr(target_dest, "channel", None), "id", None)
-        or getattr(target_dest, "id", None)
-        or channel_id
-    )
-    is_banana_stand = (int(dest_cid) == BANANA_STAND_CHANNEL_ID) if str(dest_cid).isdigit() else False
+    dest_cid = None
+    if target_dest:
+        ch = getattr(target_dest, "channel", None)
+        ch_id = getattr(ch, "id", None)
+        if ch_id is not None and str(ch_id).isdigit():
+            dest_cid = int(ch_id)
+        elif getattr(target_dest, "id", None) is not None and str(target_dest.id).isdigit():
+            dest_cid = int(target_dest.id)
+    if dest_cid is None:
+        try:
+            dest_cid = int(channel_id)
+        except (ValueError, TypeError):
+            dest_cid = None
+
+    is_banana_stand = (dest_cid == BANANA_STAND_CHANNEL_ID)
     held_turn_banana = False
 
     if is_banana_stand:

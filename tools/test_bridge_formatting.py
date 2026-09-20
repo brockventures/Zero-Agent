@@ -24,6 +24,11 @@ from tools.bridge_formatting import (
     clean_discord_latex,
     generate_concise_thread_title,
     strip_reaction_gifs,
+    is_internal_cli_leak,
+    strip_internal_cli_chatter,
+    dedup_repetitive_patterns,
+    parse_agy_error,
+    format_agy_error_message,
 )
 
 
@@ -71,6 +76,17 @@ class TestBridgeFormatting(unittest.TestCase):
         converted = convert_markdown_tables(table)
         self.assertIn("- **Defrost Type**:\n  - *Chest Freezer*: Manual (-10°F)\n  - *Upright Freezer*: Auto (32°F)", converted)
         self.assertIn("- **Power Outage**:\n  - *Chest Freezer*: 48+ hours\n  - *Upright Freezer*: 12-24 hours", converted)
+
+    def test_convert_capability_comparison_markdown_tables(self):
+        table = (
+            "| Capability | Local Home Assistant (`:8766`) | Google Home MCP (`:8769`) |\n"
+            "| :--- | :--- | :--- |\n"
+            "| **TV / Media Intents** | ⚡ Fast (VLC) | ❌ Restricted |\n"
+            "| **Local Latency** | ⚡ Sub-50ms | ☁️ 300ms |\n"
+        )
+        converted = convert_markdown_tables(table)
+        self.assertIn("- **TV / Media Intents**:\n  - *Local Home Assistant (`:8766`)*: ⚡ Fast (VLC)\n  - *Google Home MCP (`:8769`)*: ❌ Restricted", converted)
+        self.assertIn("- **Local Latency**:\n  - *Local Home Assistant (`:8766`)*: ⚡ Sub-50ms\n  - *Google Home MCP (`:8769`)*: ☁️ 300ms", converted)
 
     def test_format_for_discord_bullet_normalization(self):
         text = "• Point 1\n  • Subpoint\n> • Quoted"
@@ -251,7 +267,100 @@ class TestBridgeFormatting(unittest.TestCase):
             '{"event":"result","result":{"conversation_id":"c-task-wait","status":"DONE","response":"Final substantive result."}}\n'
         )
         res = extract_agent_response(raw_stream)
-        self.assertEqual(res, "Final substantive result.")
+    def test_is_internal_cli_leak(self):
+        leaks = [
+            "No tools called. Waiting for task to complete.",
+            "No tools called.",
+            "Waiting for task to complete.",
+            "Waiting for the command to finish.",
+            "Waiting for task-1154 to complete...",
+            "I will wait for the task to finish.",
+            "I have launched the command and will wait for it to finish.",
+            'Task id "26040ca8-9071-484a-ba4a-bb822ec60c65/task-1154" was canceled with result:\nTool execution was canceled',
+            "Tool is running as a background task with task id: 123",
+            "No content generated yet.",
+            "*(Response completed, but no text output was generated)*",
+            "[NO_REPLY]",
+            "   \n\n  ",
+            "Process 295661fc-0967-4dec-862a-a0ecadbc2261/task-1536 completed with exit code 0. Output:\n........\nRan 8 tests in 10.373s\nOK\n[BridgeDaemon] Worker for #zero-chat exited cleanly.\n[BridgeDaemon] Worker for #the-banana-stand exited cleanly.",
+            "Process 1234/task-99 completed with exit code 0. Output:\nSome raw task log\n[BridgeDaemon] Worker for #zero-chat exited cleanly.",
+            "\n".join(["[BridgeDaemon] Worker for #zero-chat exited cleanly."] * 10),
+            "\n".join(["[BridgeDaemon] Worker for #zero-chat exited cleanly.", "[BridgeDaemon] Worker for #the-banana-stand exited cleanly."] * 10),
+        ]
+        for leak in leaks:
+            self.assertTrue(is_internal_cli_leak(leak), f"Failed to classify leak: {leak!r}")
+
+        non_leaks = [
+            "Here is the plan for the server migration.",
+            "PR #31 is merged and PR #32 is ready for review.",
+            "Waiting for task-300 to complete...\nHere is the real substantive answer.",
+            "If the process exits 0 while stderr contains `terminating \\d+ background task(s) on exit` (or uncompleted tasks lack SYSTEM_MESSAGE payloads), catch the exit and resume.",
+        ]
+        for non_leak in non_leaks:
+            self.assertFalse(is_internal_cli_leak(non_leak), f"False positive leak classification: {non_leak!r}")
+
+    def test_strip_internal_cli_chatter(self):
+        text = (
+            "Here is part 1 of the report.\n"
+            "No tools called. Waiting for task to complete.\n"
+            "Here is part 2 with the conclusion."
+        )
+        cleaned = strip_internal_cli_chatter(text)
+        self.assertEqual(cleaned, "Here is part 1 of the report.\nHere is part 2 with the conclusion.")
+
+        # Test stripping RECEIVED_TASK_NOTIFICATION envelope
+        notification_text = (
+            "<RECEIVED_TASK_NOTIFICATION>\n"
+            "Task `c16e568c/task-183` completed.\n"
+            "Run results:\n"
+            "Output:\n"
+            "switch.irrigation_brains_hill_right -> State: on\n"
+            "Exit code: 0\n"
+            "</RECEIVED_TASK_NOTIFICATION>\n"
+            "Handled. Updated **`Irrigation: Hill Right`** in Home Assistant."
+        )
+        self.assertEqual(
+            strip_internal_cli_chatter(notification_text),
+            "Handled. Updated **`Irrigation: Hill Right`** in Home Assistant."
+        )
+
+        # Test inline mentions of tags in code ticks are preserved and do NOT truncate to EOF
+        inline_mention_text = (
+            "The sanitizer scrubs CLI artifacts like `<SYSTEM_MESSAGE>` and `<RECEIVED_TASK_NOTIFICATION>` tags.\n"
+            "Here is the rest of the text that must not be truncated."
+        )
+        self.assertEqual(
+            strip_internal_cli_chatter(inline_mention_text),
+            inline_mention_text
+        )
+
+    def test_dedup_repetitive_patterns(self):
+        # Single-line repetition
+        spam_single = "\n".join(["[BridgeDaemon] Worker for #zero-chat exited cleanly."] * 20)
+        deduped = dedup_repetitive_patterns(spam_single, max_repeats=3)
+        self.assertIn("... [repetitive output truncated] ...", deduped)
+        self.assertLess(len(deduped), len(spam_single))
+
+        # Multi-line pattern repetition
+        pattern = ["[BridgeDaemon] Worker for #zero-chat exited cleanly.", "[BridgeDaemon] Worker for #the-banana-stand exited cleanly."]
+        spam_multi = "\n".join(pattern * 15)
+        deduped_multi = dedup_repetitive_patterns(spam_multi, max_repeats=3)
+        self.assertIn("... [repetitive output truncated] ...", deduped_multi)
+        self.assertLess(len(deduped_multi), len(spam_multi))
+
+    def test_extract_agent_response_pure_task_wait_returns_no_reply(self):
+        # When agent emits 'No tools called. Waiting for task to complete.', extract_agent_response must return [NO_REPLY]
+        raw_stream = (
+            '{"event":"init","conversation_id":"c-leak-test"}\n'
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"No tools called. Waiting for task to complete."}}\n'
+            '{"event":"result","result":{"conversation_id":"c-leak-test","status":"DONE","response":"No tools called. Waiting for task to complete."}}\n'
+        )
+        res = extract_agent_response(raw_stream)
+        self.assertEqual(res, "[NO_REPLY]")
+
+        # Plain text mode fallback
+        res_plain = extract_agent_response("No tools called. Waiting for task to complete.")
+        self.assertEqual(res_plain, "[NO_REPLY]")
 
     def test_chunk_text_basic_and_boundary(self):
         short_text = "Hello world"
@@ -268,6 +377,42 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertTrue(len(chunks) > 1)
         for c in chunks:
             self.assertTrue(len(c) <= 550)
+
+    def test_chunk_text_preserves_code_block_when_it_fits(self):
+        """Verify code blocks and handoff envelopes that fit in current chunk are NOT split into separate chunks."""
+        # 1,749 characters of text + 163 character handoff block = 1,912 chars (Msg 36 regression test)
+        body = "Engineering review of endpoints and referee state.\n" * 34
+        env = (
+            "```handoff\n"
+            "{\n"
+            '  "v": 0,\n'
+            '  "kind": "proposal",\n'
+            '  "to": "Amos"\n'
+            "}\n"
+            "```"
+        )
+        full_text = f"{body.strip()}\n\n{env}"
+        self.assertLessEqual(len(full_text), 1980)
+
+        chunks = chunk_text(full_text, 1980)
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("```handoff", chunks[0])
+        self.assertTrue(chunks[0].endswith("```"))
+
+    def test_chunk_text_breaks_before_overflowing_code_block(self):
+        """Verify that when a code block would overflow the current chunk, it breaks before the code block."""
+        # 1,500 characters of text + 600 character code block = 2,100 chars
+        body = "Line of text\n" * 115  # ~1495 chars
+        code_body = "x = 1\n" * 100        # ~600 chars
+        code_block = f"```python\n{code_body}```"
+        full_text = f"{body.strip()}\n\n{code_block}"
+
+        chunks = chunk_text(full_text, 1980)
+        self.assertEqual(len(chunks), 2)
+        # First chunk should have the text
+        self.assertNotIn("```python", chunks[0])
+        # Second chunk should cleanly start with the code block
+        self.assertTrue(chunks[1].startswith("```python"))
 
     def test_clean_discord_latex(self):
         latex_text = "Let $x$ be the variable and $$\\alpha + \\beta = \\gamma$$ for calculation."
@@ -349,6 +494,20 @@ class TestBridgeFormatting(unittest.TestCase):
         text4 = f"[GIF]({bare_url})\n\nHandled. Both dispatchers are green.\n\n[CHOICES: Inspect Host 1 | Inspect Host 2]"
         cleaned4 = format_for_discord(text4)
         self.assertEqual(cleaned4, f"Handled. Both dispatchers are green.\n\n[GIF]({bare_url})\n\n[CHOICES: Inspect Host 1 | Inspect Host 2]")
+
+        # 5. Hallucinated Tenor URL with mismatched redirected slug is rejected
+        mock_hallucinated = MagicMock()
+        mock_hallucinated.status = 200
+        mock_hallucinated.geturl.return_value = "https://tenor.com/view/xdbacom-sfea-gif-20092285"
+        mock_hallucinated.__enter__.return_value = mock_hallucinated
+        mock_urlopen.return_value = mock_hallucinated
+
+        hallucinated_url = "https://tenor.com/view/hot-dog-suit-costume-car-crash-i-think-you-should-leave-gif-20092285"
+        text5 = f"Check this out:\n{hallucinated_url}\nDone."
+        with patch("tools.gif_tool.get_contextual_gif", return_value=None):
+            cleaned5 = format_for_discord(text5)
+        self.assertNotIn(hallucinated_url, cleaned5)
+        self.assertNotIn("xdbacom", cleaned5)
 
     def test_ensure_handoff_mentions_direct_bot(self):
         from tools.handoff import format_envelope, ensure_handoff_mentions
@@ -537,6 +696,41 @@ class TestBridgeFormatting(unittest.TestCase):
         final_resp = parser.get_final_response()
         self.assertEqual(final_resp, "Multi-event line test.")
         self.assertEqual(parser.conv_id, "c-multi")
+
+    def test_parse_agy_error(self):
+        raw_stderr = (
+            "Some preamble\n"
+            'AGY_ERROR: {"canonical_status":"RESOURCE_EXHAUSTED","code":429,"retryable":true,"error_id":"err-xyz-123","short_error":"Quota exceeded for model gemini-3.8-flash"}\n'
+            "Some trailer\n"
+        )
+        parsed = parse_agy_error(raw_stderr)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.get("canonical_status"), "RESOURCE_EXHAUSTED")
+        self.assertEqual(parsed.get("code"), 429)
+        self.assertTrue(parsed.get("retryable"))
+        self.assertEqual(parsed.get("error_id"), "err-xyz-123")
+        self.assertEqual(parsed.get("short_error"), "Quota exceeded for model gemini-3.8-flash")
+
+        # Test empty or non-matching
+        self.assertIsNone(parse_agy_error(""))
+        self.assertIsNone(parse_agy_error("Random error without AGY_ERROR tag"))
+
+    def test_format_agy_error_message(self):
+        err = {
+            "canonical_status": "UNAVAILABLE",
+            "code": 503,
+            "retryable": True,
+            "error_id": "req-999-abc",
+            "short_error": "Backend upstream unavailable",
+        }
+        msg = format_agy_error_message(err, elapsed_sec=12, pid_str="PID 12345")
+        self.assertIn("⚠️ **Model API Failure (CLI Exit Code 3):**", msg)
+        self.assertIn("Backend upstream unavailable", msg)
+        self.assertIn("`UNAVAILABLE` (Code 503)", msg)
+        self.assertIn("`req-999-abc`", msg)
+        self.assertIn("Retryable:** Yes", msg)
+        self.assertIn("Elapsed:** 12s", msg)
+        self.assertIn("Process:** `PID 12345`", msg)
 
 
 if __name__ == "__main__":

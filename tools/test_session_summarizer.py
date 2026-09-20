@@ -11,7 +11,7 @@ from pathlib import Path
 WORKSPACE = Path("/workspace")
 sys.path.insert(0, str(WORKSPACE))
 
-from tools.session_summarizer import clean_dialogue_content
+from tools.session_summarizer import clean_dialogue_content, generate_summary
 
 
 class TestSessionSummarizer(unittest.TestCase):
@@ -101,6 +101,11 @@ class TestSessionSummarizer(unittest.TestCase):
         )
         cleaned = clean_dialogue_content(raw, is_user=False)
         self.assertEqual(cleaned, "Here is the forensic breakdown.")
+
+    def test_generate_summary_parent_stamping(self):
+        summary = generate_summary(conv_id="conv-parent-abc", sess_key="test_key", dry_run=True)
+        self.assertIn("[Parent: conv-parent-abc]", summary)
+        self.assertIn("• **Parent Session UUID:** `conv-parent-abc`", summary)
 
 
 if __name__ == "__main__":

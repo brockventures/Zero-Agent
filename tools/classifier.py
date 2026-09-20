@@ -7,12 +7,13 @@ PEER_SNOWFLAKE_TAGS = [
     r"<@!?1468012353206354197>",  # Amos
     r"<@!?1492043459618537492>",  # Marvin
     r"<@!?1542035925603713086>",  # Aerial
+    r"<@!?1545924520236290198>",  # Banana Watcher
     r"<@!?93420059858305024>",    # Mike / Arbiter
     r"<@!?453030589914939393>",   # Ian / Moon Problem
     r"<@!?169260920550195200>",   # Alex / Arcane
 ]
 
-PEER_NAMES = r"(?:amos|marvin|aerial|arbiter|ian|mike|alex|arcane)"
+PEER_NAMES = r"(?:amos|marvin|aerial|arbiter|ian|mike|alex|arcane|bananawatcher|banana\s*watcher)"
 
 # Patterns where a peer is specifically addressed in a vocative position (NOT prepositional/referential)
 PEER_VOCATIVE_PATTERNS = [
@@ -38,12 +39,13 @@ ZERO_TAGS = [
     r"<@1542285964213358633>",
     r"<@!1542285964213358633>",
     r"<@&1543462881624858624>",  # Team role
-    r"<@&1542294519914037341>",  # Robot role
-    r"\b@?zero\b",
-    r"\b@?robot\b"
+    r"<@&1543285916506783799>",  # Robot role (Crab Cavern)
+    r"<@&1542294519914037341>",  # Robot role (legacy/alt)
+    r"(?:@zero\b|\b(?:hey|hi|hello)\s+@?zero\b|^\s*@?zero\s*[:,-])",
+    r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])"
 ]
 
-CLASSIFY_PROMPT = '''You are evaluating inbound chat messages in a shared multi-agent engineering channel (Crab Cavern) with Zero (systems engineer, SWE, Linux, Docker, Python), Amos, and Marvin.
+CLASSIFY_PROMPT = '''You are evaluating inbound chat messages in a shared multi-agent engineering channel (Crab Cavern) with Zero (systems engineer, SWE, Linux, Docker, Python), Amos, Marvin, and Aerial.
 
 Evaluate the relevance score (0.0 to 1.0) of this message to Zero based on:
 1. TOPICAL ALIGNMENT (0.0 - 0.4):
@@ -110,7 +112,8 @@ def score_relevance(content: str, author: str = "user") -> float:
             return 0.0
 
         floor_state = str(envelope.get("floor") or "").lower()
-        if envelope.get("reply") == "none" and floor_state not in ("open", "free", "any") and "zero" not in target:
+        # floor: closed is the explicit state indicating "do not reply"
+        if floor_state == "closed" and "zero" not in target:
             return 0.0
 
     # Strip handoff envelopes and code blocks when evaluating recipient targeting,

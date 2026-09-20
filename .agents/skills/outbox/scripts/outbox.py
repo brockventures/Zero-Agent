@@ -33,6 +33,8 @@ KNOWN_CHANNELS = {
     "general": 1534452820995080192,  # alias to lounge or main
     "signals": 1534436119888793750,
     "staff-comms": 1534436119888793750,
+    "brock-house": 1550577908811178095,
+    "vault": 1550577910757458015,
 }
 
 def resolve_channel(channel_input: str | int) -> tuple[str, int | None]:
@@ -59,8 +61,8 @@ def queue_outbox_message(channel: str, content: str, source_turn: str = "zero") 
     content = content.strip()
     if not content:
         raise ValueError("Message content cannot be empty.")
-    if len(content) > 4000:
-        raise ValueError(f"Message content exceeds 4,000 character ceiling (len={len(content)}).")
+    if len(content) > 10000:
+        raise ValueError(f"Message content exceeds 10,000 character ceiling (len={len(content)}).")
 
     msg_record = {
         "id": f"outbox-{int(time.time()*1000)}-{os.getpid()}",
