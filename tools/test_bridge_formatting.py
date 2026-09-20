@@ -324,6 +324,24 @@ class TestBridgeFormatting(unittest.TestCase):
             "Handled. Updated **`Irrigation: Hill Right`** in Home Assistant."
         )
 
+        # Test stripping AGY 2.0 NOTIFICATION envelope
+        agy_notification_text = (
+            "<NOTIFICATION>\n"
+            "Task 9e2b1c8d/task-144 has completed.\n"
+            "Task status: success\n"
+            "Exit code: 0\n"
+            "Standard output:\n"
+            "Ran 261 tests in 10.597s\n"
+            "OK\n"
+            "</NOTIFICATION>\n"
+            "### Forensic Autopsy: NAS Log Review Failure\n"
+            "Here is the report."
+        )
+        self.assertEqual(
+            strip_internal_cli_chatter(agy_notification_text),
+            "### Forensic Autopsy: NAS Log Review Failure\nHere is the report."
+        )
+
         # Test inline mentions of tags in code ticks are preserved and do NOT truncate to EOF
         inline_mention_text = (
             "The sanitizer scrubs CLI artifacts like `<SYSTEM_MESSAGE>` and `<RECEIVED_TASK_NOTIFICATION>` tags.\n"
