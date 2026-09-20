@@ -279,13 +279,18 @@ async def execute_container_restart(
         except Exception:
             pass
 
-    ssh_key = "/secrets/id_ed25519"
-    ssh_port = os.getenv("NAS_SSH_PORT", "22")
+    try:
+        from tools.nas_docker_mcp import _resolve_nas_config
+        _, host_2, ssh_port = _resolve_nas_config()
+    except Exception:
+        host_2 = os.getenv("NAS_HOST_2_IP", "127.0.0.1")
+        ssh_port = os.getenv("NAS_SSH_PORT", str(49000 + 876))
+
+    ssh_key = os.getenv("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
     ssh_user = os.getenv("NAS_USER", "Brock")
-    host_2 = os.getenv("NAS_HOST_2_IP", "127.0.0.1")
 
     restart_cmd = [
-        "ssh", "-i", ssh_key, "-p", ssh_port, "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+        "ssh", "-i", ssh_key, "-p", str(ssh_port), "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
         f"{ssh_user}@{host_2}",
         "nohup sh -c 'sleep 3 && docker restart discord-antigravity-agent' >/dev/null 2>&1 &"
     ]

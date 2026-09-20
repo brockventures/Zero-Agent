@@ -57,7 +57,7 @@ SERVERS_CONFIG = {
         "description": "Amazon Search & Product Intelligence",
     },
     "google-home": {
-        "port": 8769,
+        "port": 8770,
         "module": "google_home_mcp",
         "description": "Google Home & Nest Ecosystem Integration",
     },
@@ -187,7 +187,7 @@ async def run_servers_async():
         except NotImplementedError:
             pass
 
-    print("[MCP Daemon] Starting persistent MCP SSE servers on ports 8765, 8766, 8767, 8768, 8769...", flush=True)
+    print("[MCP Daemon] Starting persistent MCP SSE servers on ports 8765, 8766, 8767, 8768, 8770...", flush=True)
     await asyncio.gather(
         srv_ws.serve(),
         srv_ha.serve(),

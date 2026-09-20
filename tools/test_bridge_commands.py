@@ -132,6 +132,28 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
             mock_kill.assert_called_once_with(initiator="Ryan", action="halt", channel_id=123)
             msg.reply.assert_awaited_once_with("🛑 Agora trading halted.")
 
+    async def test_execute_container_restart_dispatches_with_resolved_nas(self):
+        from tools.bridge_commands import execute_container_restart
+
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock()
+
+        with patch("tools.nas_docker_mcp._resolve_nas_config", return_value=("mock-host-1", "mock-host-2", "2222")), \
+             patch("subprocess.run") as mock_run, \
+             patch("tools.bridge_commands.record_restart_intent") as mock_record:
+            await execute_container_restart(mock_channel, initiator="Ryan", reason="Unit test restart")
+
+            mock_record.assert_called_once_with("Unit test restart", initiator="Ryan")
+            mock_channel.send.assert_awaited_once()
+            self.assertIn("Restarting Zero Docker container", mock_channel.send.call_args[0][0])
+            mock_run.assert_called_once()
+            cmd = mock_run.call_args[0][0]
+            self.assertEqual(cmd[0], "ssh")
+            self.assertIn("-p", cmd)
+            self.assertEqual(cmd[cmd.index("-p") + 1], "2222")
+            self.assertEqual(cmd[cmd.index("-o") - 1] if "-o" in cmd else cmd[cmd.index("-p") + 1], "2222")
+            self.assertTrue(any("mock-host-2" in arg for arg in cmd))
+
 
 if __name__ == "__main__":
     unittest.main()
