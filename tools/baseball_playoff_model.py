@@ -11,6 +11,7 @@ Compares model championship probabilities against live Kalshi KXMLB order books.
 import argparse
 import json
 import math
+import os
 import random
 import sys
 import urllib.request
@@ -141,7 +142,25 @@ def resolve_dynamic_playoff_field():
         conn.close()
     except Exception as e:
         print(f"Warning: Failed to load dynamic playoff data from PostgreSQL: {e}")
-        
+
+    if not wins:
+        cache_file = Path("/workspace/data/cached_team_baselines.json")
+        if cache_file.exists():
+            try:
+                cached_data = json.loads(cache_file.read_text())
+                for t, wpct in cached_data.items():
+                    mapped = ALIASES.get(t, t)
+                    wins[mapped] = int(float(wpct) * 162)
+                    pyth_ratings[mapped] = float(wpct)
+                    if mapped not in rotations:
+                        rotations[mapped] = [
+                            {"name": "Ace", "stuff_plus": 105.0},
+                            {"name": "SP2", "stuff_plus": 100.0},
+                            {"name": "SP3", "stuff_plus": 98.0},
+                        ]
+            except Exception as ce:
+                print(f"Warning loading disk baseline cache: {ce}")
+
     def build_league_seeds(league_prefix):
         divs = [d for d in DIVISIONS if d.startswith(league_prefix)]
         div_winners = []
