@@ -862,6 +862,46 @@ def score_canonical_candidate(query: str, entry: dict, fts_score: float | None =
     return score
 
 
+def _get_gemini_api_key() -> str | None:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if api_key:
+        return api_key
+    secrets_path = Path("/secrets/env.json")
+    if secrets_path.exists():
+        try:
+            with open(secrets_path) as f:
+                data = json.load(f)
+                return data.get("GEMINI_API_KEY")
+        except Exception:
+            pass
+    return None
+
+
+def _call_gemini_api_direct(prompt: str, timeout: float = 3.0) -> str | None:
+    """Execute direct HTTPS call to Gemini Flash Lite REST API for sub-second semantic classification."""
+    api_key = _get_gemini_api_key()
+    if not api_key:
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 30}
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            candidates = data.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "").strip()
+    except Exception as e:
+        print(f"[GIF] Direct Gemini API call failed: {e}", file=sys.stderr)
+    return None
+
+
 def llm_select_canonical_gif(
     query: str,
     registry: list[dict],
@@ -871,8 +911,8 @@ def llm_select_canonical_gif(
     timeout: int = 15
 ) -> dict | None:
     """
-    Use Gemini Flash via Antigravity CLI to select the single best canonical reaction GIF
-    based on conversational situation, subtext, and irony.
+    Use Gemini Flash (direct REST API fast-path, falling back to agy CLI) to select
+    the single best canonical reaction GIF based on conversational situation, subtext, and irony.
     """
     if not query or not registry:
         return None
@@ -911,23 +951,35 @@ CRITICAL INSTRUCTIONS:
 2. DO NOT pick any GIF from the RECENTLY USED list.
 3. Return ONLY the chosen GIF ID on a line by itself. Do not include markdown, explanations, or quotes.
 """
-    import subprocess
+    raw_out = None
     try:
-        res = subprocess.run(
-            [
-                "agy",
-                "--model=gemini-3.8-flash-low",
-                "--disable-slash-commands",
-                f"-p={prompt}"
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        raw_out = res.stdout.strip()
-        if not raw_out:
+        raw_out = _call_gemini_api_direct(prompt, timeout=3.0)
+    except Exception as e:
+        print(f"[GIF] Direct API error: {e}", file=sys.stderr)
+
+    if not raw_out:
+        import subprocess
+        try:
+            res = subprocess.run(
+                [
+                    "agy",
+                    "--model=gemini-3.8-flash-low",
+                    "--disable-slash-commands",
+                    f"-p={prompt}"
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            raw_out = res.stdout.strip()
+        except Exception as e:
+            print(f"[GIF] LLM selection error or timeout: {e}", file=sys.stderr)
             return None
 
+    if not raw_out:
+        return None
+
+    try:
         chosen_entry = None
         for g in registry:
             gid = g.get("id", "")
@@ -965,7 +1017,7 @@ CRITICAL INSTRUCTIONS:
             "vibes": chosen_entry.get("vibes")
         }
     except Exception as e:
-        print(f"[GIF] LLM selection error or timeout: {e}", file=sys.stderr)
+        print(f"[GIF] Selection post-processing error: {e}", file=sys.stderr)
         return None
 
 
