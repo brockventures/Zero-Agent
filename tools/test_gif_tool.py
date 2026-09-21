@@ -437,12 +437,13 @@ class TestGifTool(unittest.TestCase):
         self.assertEqual(r7["source"], "canonical_registry")
         self.assertEqual(r7["canonical_id"], "seinfeld_costanza_high_note")
 
+    @patch("tools.gif_tool._call_gemini_api_direct", return_value=None)
     @patch("subprocess.run")
     @patch("tools.gif_tool.is_valid_gif_url", return_value=True)
     @patch("tools.gif_tool.load_history", return_value=[])
     @patch("tools.gif_tool.record_history")
-    def test_llm_semantic_selection_mocked(self, mock_rec, mock_hist, mock_valid, mock_subproc):
-        # Mock LLM returning a specific canonical ID
+    def test_llm_semantic_selection_mocked(self, mock_rec, mock_hist, mock_valid, mock_subproc, mock_direct):
+        # 1. Mock LLM returning a specific canonical ID via subprocess fallback (direct returns None)
         mock_proc = MagicMock()
         mock_proc.stdout = "office_jim_welp\n"
         mock_subproc.return_value = mock_proc
@@ -451,7 +452,14 @@ class TestGifTool(unittest.TestCase):
         self.assertEqual(res["source"], "canonical_registry")
         self.assertEqual(res["canonical_id"], "office_jim_welp")
 
-        # Verify fallback to FTS5 if LLM fails
+        # 2. Mock direct REST API fast-path
+        mock_direct.return_value = "office_jim_blinds"
+        res_direct = get_contextual_gif("another situation query", run_ocr=False, force=True, use_llm=True)
+        self.assertEqual(res_direct["source"], "canonical_registry")
+        self.assertEqual(res_direct["canonical_id"], "office_jim_blinds")
+        mock_direct.return_value = None
+
+        # 3. Verify fallback to FTS5 if both direct API and subprocess fail
         mock_proc.stdout = ""
         res_fallback = get_contextual_gif("kermit sipping tea", run_ocr=False, force=True, use_llm=True)
         self.assertEqual(res_fallback["source"], "canonical_registry")
