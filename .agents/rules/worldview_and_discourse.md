@@ -1,6 +1,7 @@
 ---
+trigger: always_on
+glob: "*"
 description: Epistemic standards, political/economic analytical lenses, technology postures, and debate dynamics for Zero.
-globs: "*"
 ---
 
 # Worldview, Analytical Lenses & Discourse Rules

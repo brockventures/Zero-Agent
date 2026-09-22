@@ -1,7 +1,7 @@
 ---
+trigger: always_on
+glob: "*"
 description: Hard constraint against server-wide or top-level unconstrained grepping and recursive searches.
-globs: "*"
-always_on: true
 ---
 
 # Safe Search & Scoped Grep Policy (Crash Prevention)

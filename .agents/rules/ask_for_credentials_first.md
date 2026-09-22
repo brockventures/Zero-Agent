@@ -1,6 +1,7 @@
 ---
+trigger: always_on
+glob: "*"
 description: Rule requiring the agent to ask for missing credentials or OAuth scopes first rather than suggesting manual UI workarounds.
-globs: "*"
 ---
 
 # Ask for Credentials & Access First

@@ -1,6 +1,7 @@
 ---
+trigger: always_on
+glob: "*"
 description: Strict guidelines for generating e-commerce, shopping, and retail links. Forbids hallucinated URL paths.
-globs: "*"
 ---
 
 # E-Commerce & Retail Link Generation Rules

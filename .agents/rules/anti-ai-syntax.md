@@ -1,6 +1,7 @@
 ---
+trigger: always_on
+glob: "*"
 description: Comprehensive rules to eliminate AI-generated writing tells, synthetic vocabulary, structural clichés, and hollow cadence.
-globs: "*"
 ---
 
 # Anti-AI Syntax & Natural Voice Rules

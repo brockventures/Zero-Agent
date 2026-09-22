@@ -1,7 +1,7 @@
 ---
+trigger: always_on
+glob: "*"
 description: Mandatory Pacific Timezone (PT) conversion discipline. Strictly prohibits quoting raw UTC timestamps or assuming UTC is local time.
-globs: "*"
-always_on: true
 ---
 
 # Pacific Time (PT) Invariant & Time Conversion Discipline

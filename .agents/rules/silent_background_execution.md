@@ -1,6 +1,7 @@
 ---
+trigger: always_on
+glob: "*"
 description: Prohibits intermediate play-by-play status chatter, pause announcements, or taking SDK Option B bait when commands run in the background.
-globs: "*"
 ---
 
 # Silent Background Execution & Anti-Option-B Invariant

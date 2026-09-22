@@ -1,6 +1,7 @@
 ---
+trigger: always_on
+glob: "*"
 description: Humans are lazy typers and proactive image parsing invariant protocol.
-globs: "*"
 ---
 
 # Lazy Typers & Proactive Image Parsing Invariant
