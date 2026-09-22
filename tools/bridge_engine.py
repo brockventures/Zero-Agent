@@ -44,6 +44,7 @@ from tools.bridge_state import (
     clear_channel_session_id,
     clear_in_flight,
     get_runtime_rules,
+    is_home_channel,
     set_channel_session_id,
     update_beacon,
 )
@@ -551,13 +552,14 @@ class TurnCoordinator:
             or (proc and getattr(proc, "returncode", None) not in (0, None))
         )
 
-        # In external mode, genuine non-error silence without output maps to [NO_REPLY]
-        if self.mode == "external" and (is_leak or is_silence) and not has_process_failure:
+        # Genuine non-error silence without output maps to [NO_REPLY] in non-home channels or external mode
+        is_home_turf = is_home_channel(self.channel_id)
+        if (not is_home_turf or self.mode == "external") and (is_leak or is_silence) and not has_process_failure:
             final_text = "[NO_REPLY]"
             return final_text, False
 
         was_harvested = False
-        if is_empty_or_placeholder or is_leak or (self.mode == "home" and is_silence):
+        if is_empty_or_placeholder or is_leak or (is_home_turf and self.mode == "home" and is_silence):
             harvested = harvest_transcript_response(str(cid) if cid else None)
             if harvested and not is_internal_cli_leak(harvested):
                 print(
@@ -571,8 +573,8 @@ class TurnCoordinator:
                 was_harvested = True
 
         should_emit_beacon = (
-            (self.mode == "home" and (is_empty_or_placeholder or is_leak or is_silence))
-            or (self.mode == "external" and has_process_failure and (is_empty_or_placeholder or is_leak or is_silence))
+            (is_home_turf and self.mode == "home" and (is_empty_or_placeholder or is_leak or is_silence))
+            or ((not is_home_turf or self.mode == "external") and has_process_failure and (is_empty_or_placeholder or is_leak or is_silence))
         )
 
         if should_emit_beacon:
