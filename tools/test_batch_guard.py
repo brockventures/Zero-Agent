@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Unit test suite for tool batching guard hook.
+Unit test suite for enhanced tool batching guard hook.
+Verifies enforcement across shell inspections, repetitive view_file slices,
+serial file view chains, and repetitive replace_file_content calls.
 """
 import sys
 import os
@@ -11,7 +13,14 @@ WORKSPACE = Path("/workspace")
 sys.path.insert(0, str(WORKSPACE / ".agents" / "hooks"))
 
 import batch_guard
-from batch_guard import check_batching, STATE_FILE, is_single_inspection, is_batched_or_mutating
+from batch_guard import (
+    check_batching,
+    check_tool_use,
+    STATE_FILE,
+    is_single_inspection,
+    is_batched_or_mutating,
+    load_state,
+)
 
 
 class TestBatchGuard(unittest.TestCase):
@@ -24,27 +33,22 @@ class TestBatchGuard(unittest.TestCase):
         if os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)
 
-    def test_catches_serial_inspections(self):
-        # Commands 1, 2, 3 ought to pass
+    def test_catches_serial_shell_inspections(self):
         for i in range(3):
             allowed, reason = check_batching("docker ps")
-            self.assertTrue(allowed, f"Command {i+ 1} should be allowed")
+            self.assertTrue(allowed, f"Command {i + 1} should be allowed")
 
-        # 4th consecutive inspection should be denied
         allowed, reason = check_batching("docker inspect foo")
         self.assertFalse(allowed, "Expected 4th inspection to be blocked")
-        self.assertIn("Invariant Triggered", reason)
+        self.assertIn("consecutive single-line inspection commands", reason)
 
-    def test_scpatch_script_resets(self):
-        # 3 inspections
+    def test_scratch_script_resets_shell_count(self):
         for i in range(3):
             check_batching("docker ps")
 
-        # Scratch script execution
         allowed, reason = check_batching("python3 /workspace/scratch/check.py")
         self.assertTrue(allowed)
 
-        # New inspection after reset should succeed (count reset to 1)
         allowed, reason = check_batching("docker ps")
         self.assertTrue(allowed)
 
@@ -59,6 +63,50 @@ class TestBatchGuard(unittest.TestCase):
 
         allowed, reason = check_batching('ssh testuser@remote-host.local "crontab -l"')
         self.assertFalse(allowed)
+
+    def test_view_file_same_file_blocks_on_third_call(self):
+        allowed, _ = check_tool_use("view_file", {"AbsolutePath": "/workspace/tools/foo.py", "StartLine": 1, "EndLine": 50})
+        self.assertTrue(allowed)
+        allowed, _ = check_tool_use("view_file", {"AbsolutePath": "/workspace/tools/foo.py", "StartLine": 51, "EndLine": 100})
+        self.assertTrue(allowed)
+        allowed, reason = check_tool_use("view_file", {"AbsolutePath": "/workspace/tools/foo.py", "StartLine": 101, "EndLine": 150})
+        self.assertFalse(allowed)
+        self.assertIn("3 consecutive view_file calls on '/workspace/tools/foo.py'", reason)
+
+    def test_view_file_across_different_files_blocks_on_fifth(self):
+        files = ["/a.py", "/b.py", "/c.py", "/d.py"]
+        for f in files:
+            allowed, _ = check_tool_use("view_file", {"AbsolutePath": f})
+            self.assertTrue(allowed)
+        allowed, reason = check_tool_use("view_file", {"AbsolutePath": "/e.py"})
+        self.assertFalse(allowed)
+        self.assertIn("5 consecutive serial view_file calls", reason)
+
+    def test_replace_file_content_same_file_blocks_on_fourth(self):
+        for _ in range(3):
+            allowed, _ = check_tool_use("replace_file_content", {"TargetFile": "/workspace/tools/bar.py"})
+            self.assertTrue(allowed)
+        allowed, reason = check_tool_use("replace_file_content", {"TargetFile": "/workspace/tools/bar.py"})
+        self.assertFalse(allowed)
+        self.assertIn("4 consecutive replace_file_content calls on '/workspace/tools/bar.py'", reason)
+
+    def test_test_command_resets_file_edits(self):
+        for _ in range(3):
+            check_tool_use("replace_file_content", {"TargetFile": "/workspace/tools/bar.py"})
+        allowed, _ = check_tool_use("run_command", {"CommandLine": "python3 -m unittest test_bar.py"})
+        self.assertTrue(allowed)
+        allowed, _ = check_tool_use("replace_file_content", {"TargetFile": "/workspace/tools/bar.py"})
+        self.assertTrue(allowed)
+
+    def test_write_to_file_resets_all_counters(self):
+        for _ in range(3):
+            check_tool_use("view_file", {"AbsolutePath": f"/{_}.py"})
+        allowed, _ = check_tool_use("write_to_file", {"TargetFile": "/workspace/foo.py"})
+        self.assertTrue(allowed)
+        state = load_state()
+        self.assertEqual(state["consecutive_file_views"], 0)
+        self.assertEqual(state["cmd_inspections"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
