@@ -622,7 +622,8 @@ async def deliver_turn_output(
 
     # In non-home channels (e.g. public Brock channels like #baseball, #server-updates), honor silence tags cleanly
     reply_ch = getattr(reply_target, "channel", reply_target) if reply_target else None
-    if is_silence_response and not is_home_channel(reply_ch):
+    is_home = is_home_channel(reply_ch) or is_home_channel(channel_id)
+    if is_silence_response and not is_home:
         print(f"[BridgePipeline] Suppressed [NO_REPLY] in non-home channel")
         if timer:
             timer.mark_delivery_end()

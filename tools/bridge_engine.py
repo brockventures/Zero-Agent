@@ -45,6 +45,7 @@ from tools.bridge_state import (
     clear_in_flight,
     get_runtime_rules,
     is_home_channel,
+    is_excluded_channel,
     set_channel_session_id,
     update_beacon,
 )
@@ -551,6 +552,11 @@ class TurnCoordinator:
             or self.last_agy_error
             or (proc and getattr(proc, "returncode", None) not in (0, None))
         )
+
+        # In excluded channels (e.g. #baseball owned exclusively by Ivy), NEVER emit diagnostic beacons or leak text
+        if is_excluded_channel(self.channel_id):
+            if is_empty_or_placeholder or is_leak or is_silence or has_process_failure:
+                return "[NO_REPLY]", False
 
         # Genuine non-error silence without output maps to [NO_REPLY] in non-home channels or external mode
         is_home_turf = is_home_channel(self.channel_id)

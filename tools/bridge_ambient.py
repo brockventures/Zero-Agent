@@ -44,6 +44,7 @@ from tools.bridge_state import (
     is_brock_guild,
     is_container_restart_intent,
     is_home_channel,
+    is_excluded_channel,
     is_reload_intent,
 )
 
@@ -166,13 +167,20 @@ async def route_external_message(
             return True
 
         bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
-        is_tagged = (
-            (bot.user and bot.user in msg.mentions) or
-            f"<@{bot_id}>" in content or
-            f"<@!{bot_id}>" in content or
-            contains_zero_mention(content) or
-            re.search(r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])", content, re.IGNORECASE) is not None
-        )
+        if is_excluded_channel(msg.channel):
+            is_tagged = (
+                f"<@{bot_id}>" in content or
+                f"<@!{bot_id}>" in content or
+                bool(re.search(r"@zero\b", content, re.IGNORECASE))
+            )
+        else:
+            is_tagged = (
+                (bot.user and bot.user in msg.mentions) or
+                f"<@{bot_id}>" in content or
+                f"<@!{bot_id}>" in content or
+                contains_zero_mention(content) or
+                re.search(r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])", content, re.IGNORECASE) is not None
+            )
 
         if not is_tagged:
             return True

@@ -79,6 +79,13 @@ def is_home_channel(channel) -> bool:
     home_ch_ids = set(rules.get("home_channel_ids", DEFAULT_HOME_CHANNELS))
     excluded_ch_ids = set(rules.get("excluded_home_channel_ids", DEFAULT_EXCLUDED_HOME_CHANNELS))
 
+    if isinstance(channel, (int, str)):
+        try:
+            cid = int(channel)
+            return (cid in home_ch_ids) and (cid not in excluded_ch_ids)
+        except (ValueError, TypeError):
+            return False
+
     ch_id = getattr(channel, "id", None)
     if ch_id in excluded_ch_ids:
         return False
@@ -100,6 +107,31 @@ def is_home_channel(channel) -> bool:
 
     parent = getattr(channel, "parent", None)
     if parent and getattr(parent, "category_id", None) == ops_cat_id:
+        return True
+
+    return False
+
+
+def is_excluded_channel(channel) -> bool:
+    """Check if a Discord channel or thread is explicitly excluded from Zero's operational turf (e.g. #baseball owned by Ivy)."""
+    if not channel:
+        return False
+
+    rules = get_runtime_rules()
+    excluded_ch_ids = set(rules.get("excluded_home_channel_ids", DEFAULT_EXCLUDED_HOME_CHANNELS))
+
+    if isinstance(channel, (int, str)):
+        try:
+            return int(channel) in excluded_ch_ids
+        except (ValueError, TypeError):
+            return False
+
+    ch_id = getattr(channel, "id", None)
+    if ch_id and ch_id in excluded_ch_ids:
+        return True
+
+    parent_id = getattr(channel, "parent_id", None)
+    if parent_id and parent_id in excluded_ch_ids:
         return True
 
     return False
