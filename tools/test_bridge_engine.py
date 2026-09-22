@@ -91,6 +91,14 @@ class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
         cutoff, label = self.coordinator.evaluate_completion_cutoffs(agent_done_window=15.0)
         self.assertFalse(cutoff)
 
+        # Case 4: Background task pending -> Never cut off even if result received!
+        self.coordinator.result_received_at = now - 5.0
+        self.coordinator.conv_id = "conv-pending-test"
+        with patch("tools.task_settle.get_turn_pending_tasks", return_value=["task-999"]):
+            cutoff, label = self.coordinator.evaluate_completion_cutoffs(agent_done_window=15.0)
+            self.assertFalse(cutoff)
+            self.assertEqual(label, "")
+
     def test_process_stream_events(self):
         # 1. init event
         init_ev = {"event": "init", "conversation_id": "conv-new-999"}

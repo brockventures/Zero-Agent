@@ -31,6 +31,17 @@ DATA_DIR = Path("/workspace/data")
 PENDING_SDK_TASKS_FILE = DATA_DIR / "pending_sdk_tasks.json"
 
 
+def _is_task_finished_content(clean_tid: str, content: str) -> bool:
+    """Check if text content explicitly reports task completion rather than cancellation or in-progress status."""
+    lower = content.lower()
+    if "was canceled" in lower or "was cancelled" in lower:
+        return False
+    if clean_tid not in content:
+        return False
+    pattern = rf"({re.escape(clean_tid)}[^\n]*?\b(?:finished|completed)\b|\b(?:finished|completed)\b[^\n]*?{re.escape(clean_tid)})"
+    return bool(re.search(pattern, content, re.IGNORECASE))
+
+
 def extract_turn_lines(lines: list[str]) -> list[str]:
     """Scan transcript lines in reverse to extract strictly the active turn."""
     last_user_idx = -1
@@ -100,8 +111,8 @@ def get_turn_pending_tasks(
                 if clean_tid not in launched_tasks:
                     launched_tasks.append(clean_tid)
 
-            # Completion pattern in transcript: "Task id \"<tid>\" finished" or "was canceled"
-            for m in re.finditer(r"Task id \"?([^\s\n\"]+)\"? (?:finished|was canceled)", content):
+            # Completion pattern in transcript: "Task id \"<tid>\" finished"
+            for m in re.finditer(r"Task id \"?([^\s\n\"]+)\"? finished", content):
                 full_tid = m.group(1).strip("\"'")
                 clean_tid = full_tid.split("/")[-1]
                 completed_in_transcript.add(clean_tid)
@@ -122,10 +133,9 @@ def get_turn_pending_tasks(
             try:
                 with open(mf, "r", encoding="utf-8", errors="replace") as fp:
                     md = json.load(fp)
-                    sender = str(md.get("sender", ""))
                     content = str(md.get("content", ""))
                     for tid in launched_tasks:
-                        if tid in sender or f'"{tid}" finished' in content or f'"{tid}" was canceled' in content:
+                        if _is_task_finished_content(tid, content):
                             completed_in_messages.add(tid)
             except Exception:
                 pass
@@ -152,9 +162,8 @@ def is_task_completed(
             try:
                 with open(mf, "r", encoding="utf-8", errors="replace") as fp:
                     md = json.load(fp)
-                    sender = str(md.get("sender", ""))
                     content = str(md.get("content", ""))
-                    if clean_tid in sender or f'"{clean_tid}" finished' in content or f'"{clean_tid}" was canceled' in content:
+                    if _is_task_finished_content(clean_tid, content):
                         return True
             except Exception:
                 pass
@@ -164,7 +173,7 @@ def is_task_completed(
         try:
             with open(tpath, "r", encoding="utf-8", errors="replace") as f:
                 for line in reversed(f.readlines()[-30:]):
-                    if f'"{clean_tid}" finished' in line or f'"{clean_tid}" was canceled' in line:
+                    if _is_task_finished_content(clean_tid, line):
                         return True
         except Exception:
             pass
