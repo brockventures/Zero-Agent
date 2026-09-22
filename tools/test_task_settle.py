@@ -115,6 +115,30 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(is_task_completed(self.conv_id, "task-555", brain_dir=self.test_dir))
 
+    def test_cancellation_message_does_not_clear_pending_task(self):
+        tpath = self.logs_dir / "transcript.jsonl"
+        lines = [
+            json.dumps({"type": "USER_INPUT", "source": "USER", "content": "run long test"}),
+            json.dumps({
+                "type": "GENERIC",
+                "source": "MODEL",
+                "content": "Tool is running as a background task with task id: test-conv-1234/task-246",
+            }),
+        ]
+        tpath.write_text("\n".join(lines), encoding="utf-8")
+
+        # Cancellation message written to disk
+        msg_file = self.msgs_dir / "msg-cancel.json"
+        msg_payload = {
+            "sender": "test-conv-1234/task-246",
+            "content": 'Task id "test-conv-1234/task-246" was canceled with result:\nTool execution was canceled',
+        }
+        msg_file.write_text(json.dumps(msg_payload), encoding="utf-8")
+
+        # Must NOT be considered finished or completed
+        self.assertFalse(is_task_completed(self.conv_id, "task-246", brain_dir=self.test_dir))
+        self.assertEqual(get_turn_pending_tasks(self.conv_id, brain_dir=self.test_dir), ["task-246"])
+
     async def test_wait_for_tasks_to_settle_success(self):
         # Simulate background task completing 0.2s later
         async def delayed_complete():

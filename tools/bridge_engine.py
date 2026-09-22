@@ -235,6 +235,17 @@ class TurnCoordinator:
         Returns: (is_cutoff_reached, trigger_label)
         """
         now = time.time()
+
+        # If there are active background tasks pending in this turn, hold execution open
+        if self.conv_id:
+            try:
+                from tools.task_settle import get_turn_pending_tasks
+                pending = get_turn_pending_tasks(self.conv_id)
+                if pending:
+                    return False, ""
+            except Exception:
+                pass
+
         is_result_cutoff = (
             self.result_received_at is not None
             and (now - self.result_received_at) >= 1.5
@@ -308,7 +319,14 @@ class TurnCoordinator:
                             timer.mark_event(is_token=True)
                         self.current_action = "Drafting response..."
                 if step.get("state") == "DONE" and self.had_substantive_delta:
-                    if self.agent_response_done_at is None:
+                    is_pending = False
+                    if self.conv_id:
+                        try:
+                            from tools.task_settle import get_turn_pending_tasks
+                            is_pending = bool(get_turn_pending_tasks(self.conv_id))
+                        except Exception:
+                            pass
+                    if not is_pending and self.agent_response_done_at is None:
                         self.agent_response_done_at = time.time()
 
         elif ev_name == "result" or "result" in event:

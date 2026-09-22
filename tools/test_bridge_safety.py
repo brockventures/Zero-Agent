@@ -38,8 +38,12 @@ class TestBridgeSafety(unittest.TestCase):
         self.assertTrue(is_internal_cli_leak("Tool is running as a background task with task id: task-999"))
         self.assertTrue(is_internal_cli_leak("An async task has completed: task-999"))
         self.assertTrue(is_internal_cli_leak("<WAITING_FOR_TASKS_OUTPUT>\nWait for at least one of the background tasks to complete:\n- d4e7469b-ec01-48bf-abc3-1ee1b05f8c8e/task-818</WAITING_FOR_TASKS_OUTPUT>"))
-        self.assertTrue(is_internal_cli_leak("<WAITING_FOR_TASKS_OUTPUT>\nWait for at least one of the background tasks to complete:\n- task-818"))
         self.assertTrue(is_internal_cli_leak("Wait for at least one of the background tasks to complete:\n- task-818"))
+        self.assertTrue(is_internal_cli_leak("Wait for task: d6f2513e-4b4b-414e-bf5a-b1ffb52b472b/task-246 to complete. No other work to do."))
+        self.assertTrue(is_internal_cli_leak("Wait for background task to complete..."))
+        self.assertTrue(is_internal_cli_leak("Waiting for task to complete."))
+        self.assertTrue(is_internal_cli_leak("Wait for command to finish."))
+        self.assertTrue(is_internal_cli_leak("No other work to do."))
 
         # Real substantive user messages should NEVER be classified as a leak
         self.assertFalse(is_internal_cli_leak("Deployment completed successfully. All 4 containers are healthy."))

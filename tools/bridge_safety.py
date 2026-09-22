@@ -76,6 +76,11 @@ CLI_LEAK_LINE_PATTERNS = [
     r"^\s*YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS:[^\n]*$",
     r"^\s*DO NOTHING ELSE\.?\s*$",
     r"^\s*\.\.\.\s*\[repetitive (?:lines|output) truncated\]\s*\.\.\.\s*$",
+    r"^\s*Wait(?:ing)?\s+for\s+(?:task|background\s+task|at\s+least\s+one)[^\n]*$",
+    r"^\s*Wait(?:ing)?\s+for\s+[a-f0-9\-]+(?:/task-\d+)?\s+to\s+(?:complete|finish)[^\n]*$",
+    r"^\s*Wait(?:ing)?\s+for\s+task[:\s][^\n]*$",
+    r"^\s*Wait(?:ing)?\s+for\s+(?:command|process)\s+to\s+(?:finish|complete)[^\n]*$",
+    r"^\s*No other work to do\.?\s*$",
 ]
 
 
@@ -315,6 +320,16 @@ def is_internal_cli_leak(text: str) -> bool:
     if lower.startswith("an async task has completed") or lower.startswith("an asynchronous task has completed"):
         return True
 
+    # Option B chatter on cleaned text
+    if re.search(r"\bwait(?:ing)?\s+for\s+(?:at\s+least\s+one\s+of\s+the\s+)?(?:background\s+)?task", lower):
+        return True
+    if re.search(r"\bwait(?:ing)?\s+for\s+task[:\s]", lower):
+        return True
+    if re.search(r"\bwait(?:ing)?\s+for\s+[a-f0-9\-]+(?:/task-\d+)?\s+to\s+(?:complete|finish)", lower):
+        return True
+    if re.search(r"\bwait(?:ing)?\s+for\s+(?:command|process)\s+to\s+(?:finish|complete)", lower):
+        return True
+
     # If remaining lines are exclusively internal daemon/system/test lines without user-facing content
     remaining_lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
     if remaining_lines and all(
@@ -336,7 +351,11 @@ def is_internal_cli_leak(text: str) -> bool:
             return True
         if lower.startswith("task id") and ("canceled" in lower or "completed" in lower or "failed" in lower):
             return True
-        if "waiting for task" in lower:
+        if "waiting for task" in lower or "wait for task" in lower or "wait for background task" in lower:
+            return True
+        if "no other work to do" in lower:
+            return True
+        if lower.startswith("wait for") and ("complete" in lower or "finish" in lower):
             return True
 
     return False
