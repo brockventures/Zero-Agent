@@ -78,6 +78,31 @@ class TestBridgeSafety(unittest.TestCase):
         )
         self.assertEqual(strip_internal_cli_chatter(async_msg), "Ready for review.")
 
+        # Test regression: Quoting the SDK prompt inside backticks should NOT strip the rest of the text
+        quoted_msg = (
+            "The SDK prompted:\n"
+            "`YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: A) proceed to other work or B) simply update the user.`\n\n"
+            "The model took the Option B bait.\n\n"
+            "### Resolution\n"
+            "Handled cleanly."
+        )
+        cleaned_quoted = strip_internal_cli_chatter(quoted_msg)
+        self.assertIn("The model took the Option B bait.", cleaned_quoted)
+        self.assertIn("### Resolution", cleaned_quoted)
+
+        # Test lounge async command running leak is completely stripped and identified as leak
+        lounge_leak = (
+            "An async command is running. The system will automatically resume execution when the command completes. "
+            "Do not poll or call additional tools until the background task finishes.\n"
+            "Task log: `/root/.gemini/antigravity-cli/brain/17b40886-f700-437d-ba37-5fddd3563eab/.system_generated/tasks/task-223.log`\n"
+            "Task: 17b40886-f700-437d-ba37-5fddd3563eab/task-223, Status: completed\n"
+            "Match: b'defaultRulesBudget'\n"
+            "Match: b'budget to default'\n"
+            "Match: b'defaultRules"
+        )
+        self.assertEqual(strip_internal_cli_chatter(lounge_leak), "")
+        self.assertTrue(is_internal_cli_leak(lounge_leak))
+
     def test_dedup_repetitive_patterns(self):
         repeated_line = "Running diagnostic check...\n" * 10
         collapsed = dedup_repetitive_patterns(repeated_line, max_repeats=3)

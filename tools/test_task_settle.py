@@ -194,6 +194,108 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Background task(s) task-777 completed", mock_reinvoke.call_args.kwargs["prompt"])
         self.assertTrue(mock_reinvoke.call_args.kwargs["is_settle_reinvocation"])
 
+    async def test_evaluate_and_settle_turn_timeout_returns_clean_notice_when_leak(self):
+        tpath = self.logs_dir / "transcript.jsonl"
+        lines = [
+            json.dumps({"type": "USER_INPUT", "source": "USER", "content": "long task"}),
+            json.dumps({
+                "type": "GENERIC",
+                "source": "MODEL",
+                "content": "Tool is running as a background task with task id: test-conv-1234/task-999",
+            }),
+            json.dumps({"type": "PLANNER_RESPONSE", "content": "Wait for background task to complete..."}),
+        ]
+        tpath.write_text("\n".join(lines), encoding="utf-8")
+
+        mock_reinvoke = AsyncMock()
+
+        # Case 1: External mode with leak text
+        was_settled, result = await evaluate_and_settle_turn(
+            conv_id=self.conv_id,
+            channel_id=123456,
+            mode="external",
+            status_msg=None,
+            reply_target=None,
+            reinvoke_coro_fn=mock_reinvoke,
+            timeout_seconds=0.1,
+            brain_dir=self.test_dir,
+            current_text="An async command is running. Task log: /tmp/log\nMatch: b'foo'",
+        )
+
+        self.assertFalse(was_settled)
+        self.assertIn("Task running in the background", result)
+
+        # Case 2: Home mode with empty text
+        was_settled, result_home = await evaluate_and_settle_turn(
+            conv_id=self.conv_id,
+            channel_id=123456,
+            mode="home",
+            status_msg=None,
+            reply_target=None,
+            reinvoke_coro_fn=mock_reinvoke,
+            timeout_seconds=0.1,
+            brain_dir=self.test_dir,
+            current_text="",
+        )
+
+        self.assertFalse(was_settled)
+        self.assertIn("Background task in progress", result_home)
+
+    def test_register_pending_tasks_and_dispatch_completed(self):
+        from tools.task_settle import (
+            register_pending_tasks,
+            check_and_dispatch_completed_tasks,
+            get_task_completion_details,
+        )
+
+        data_dir = Path(self.test_dir) / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Register pending task
+        register_pending_tasks(
+            conv_id=self.conv_id,
+            channel_id=123456,
+            mode="external",
+            task_ids=["task-auto-1"],
+            data_dir=data_dir,
+        )
+
+        pending_file = data_dir / "pending_sdk_tasks.json"
+        self.assertTrue(pending_file.exists())
+        pdata = json.loads(pending_file.read_text())
+        self.assertEqual(pdata[self.conv_id]["task_ids"], ["task-auto-1"])
+
+        # 2. Before completion: dispatch does nothing
+        with patch("tools.outbox.queue_outbox_message") as mock_outbox:
+            dispatched = check_and_dispatch_completed_tasks(brain_dir=self.test_dir, data_dir=data_dir)
+            self.assertEqual(dispatched, [])
+            mock_outbox.assert_not_called()
+
+        # 3. Simulate task completing with log and message
+        log_file = self.tasks_dir / "task-auto-1.log"
+        log_file.write_text("Starting step 1\nStep 1 OK\nBuild complete successfully\n")
+
+        msg_file = self.msgs_dir / "msg-auto-1.json"
+        msg_file.write_text(json.dumps({
+            "sender": f"{self.conv_id}/task-auto-1",
+            "content": f'Task id "{self.conv_id}/task-auto-1" finished with exit code 0',
+        }))
+
+        # 4. Dispatch should find it, queue outbox, and remove from pending
+        with patch("tools.outbox.queue_outbox_message") as mock_outbox:
+            dispatched = check_and_dispatch_completed_tasks(brain_dir=self.test_dir, data_dir=data_dir)
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(dispatched[0]["task_id"], "task-auto-1")
+            mock_outbox.assert_called_once()
+            call_kwargs = mock_outbox.call_args.kwargs
+            self.assertEqual(call_kwargs["channel"], 123456)
+            self.assertIn("Background Task Complete", call_kwargs["content"])
+            self.assertIn("Build complete successfully", call_kwargs["content"])
+
+        # 5. Pending file should now be cleared
+        pdata_after = json.loads(pending_file.read_text())
+        self.assertNotIn(self.conv_id, pdata_after)
+
 
 if __name__ == "__main__":
     unittest.main()

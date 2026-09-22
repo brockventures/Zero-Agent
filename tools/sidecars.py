@@ -195,7 +195,7 @@ def log_execution(job_id: str, name: str, status: str, duration_sec: float, summ
     status_map[job_id] = entry
     _atomic_write_json(EXECUTION_STATUS_FILE, status_map)
 
-    # 3. Synchronize schedule.json if KarakosScheduler tracks this sidecar
+    # 3. Synchronize schedule.json if BridgeScheduler tracks this sidecar
     try:
         from scheduler_tool import SIDECAR_ALIASES, load_schedule, save_schedule, calculate_next_run
         sched_file = DATA_DIR / "schedule.json"

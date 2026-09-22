@@ -5,7 +5,7 @@ Decomposed into isolated, testable modules:
 - bridge_formatting.py: Discord message formatting, cards, LaTeX & credential scrubbers.
 - bridge_state.py: Session mappings, turn tracking, compaction detection & persistent queues.
 - bridge_runner.py: Subprocess lifecycle, pseudo-terminal (PTY) engine & JSON stream parsing.
-- bridge_scheduler.py: Karakos persistent background scheduler & sidecar dispatchers.
+- bridge_scheduler.py: Persistent background scheduler & sidecar dispatchers.
 - bridge_handlers.py: Discord bot event handlers, routing, thread workers & queues.
 """
 
@@ -108,7 +108,7 @@ from tools.bridge_handlers import (
     handle_message,
 )
 from tools.bridge_scheduler import (
-    KarakosScheduler,
+    BridgeScheduler,
     dispatch_scheduled_prompt,
 )
 
@@ -140,8 +140,23 @@ def _set_active_model(model_name: str):
     set_active_model(model_name)
 
 
-async def _execute_reload(channel=None, initiator: str = "user", force: bool = True, reason: str = "Manual in-place bridge reload requested"):
-    await execute_bridge_reload(bot, channel=channel, initiator=initiator, force=force, reason=reason)
+async def _execute_reload(*args, **kwargs):
+    target_channel = kwargs.pop("channel", None)
+    initiator = kwargs.pop("initiator", "user")
+    force = kwargs.pop("force", True)
+    reason = kwargs.pop("reason", "Manual in-place bridge reload requested")
+
+    if args:
+        # If first arg is a discord Client/Bot instance, target channel is second arg
+        if isinstance(args[0], (discord.Client, discord.AutoShardedClient)):
+            if len(args) > 1:
+                target_channel = args[1]
+        else:
+            target_channel = args[0]
+            if len(args) > 1 and "initiator" not in kwargs:
+                initiator = args[1]
+
+    await execute_bridge_reload(bot, channel=target_channel, initiator=str(initiator), force=force, reason=str(reason))
 
 
 async def _apply_presence(custom_activity: str = None, status_override: str = None):
@@ -198,7 +213,7 @@ def _start_queue_workers():
 async def _start_scheduler():
     global scheduler
     if scheduler is None:
-        scheduler = KarakosScheduler(
+        scheduler = BridgeScheduler(
             dispatch_fn=_dispatch_scheduled,
             bot=bot,
             is_busy_fn=_is_busy,
@@ -208,7 +223,7 @@ async def _start_scheduler():
             button_choice_fn=_button_choice_callback,
         )
         await scheduler.start()
-        print("[Antigravity] Karakos-style persistent JSON scheduler initialized.")
+        print("[Antigravity] Persistent JSON bridge scheduler initialized.")
 
 
 @bot.event

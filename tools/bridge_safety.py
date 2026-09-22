@@ -66,6 +66,12 @@ CLI_LEAK_LINE_PATTERNS = [
     r"^\s*\.{4,}\s*$",
     r"^\s*Task Description:\s*[^\n]+$",
     r"^\s*Task logs are available at:[^\n]+$",
+    r"^\s*Task log:\s*`?(?:file://)?[^\n`]+`?\s*$",
+    r"^\s*Task:\s*[^\n]+,\s*Status:\s*[^\n]+$",
+    r"^\s*Match:\s*b?['\"][^\n]*$",
+    r"^\s*An async(?:hronous)? command is running[^\n]*$",
+    r"^\s*The system will automatically resume execution when the command completes[^\n]*$",
+    r"^\s*Do not poll or call additional tools until the background task finishes[^\n]*$",
     r"^\s*Tool is running as a background task with task id:[^\n]*$",
     r"^\s*YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS:[^\n]*$",
     r"^\s*DO NOTHING ELSE\.?\s*$",
@@ -171,11 +177,20 @@ def strip_internal_cli_chatter(text: str) -> str:
         flags=re.DOTALL | re.IGNORECASE,
     )
     text = re.sub(
-        r"YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS:[\s\S]*?(?:DO NOTHING ELSE\.?|$)",
+        r"(?m)^\s*YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS:[\s\S]*?(?:DO NOTHING ELSE\.?|\n\s*\n)",
         "",
         text,
         flags=re.IGNORECASE,
     )
+    text = re.sub(
+        r"(?m)^\s*An async(?:hronous)? command is running\.[\s\S]*?(?:Do not poll or call additional tools until the background task finishes\.?\s*\n?)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"(?m)^\s*Task log:\s*`?(?:file://)?[^\n`]+`?\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?m)^\s*Task:\s*[^\n]+,\s*Status:\s*[^\n]+\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?m)^\s*(?:Match:\s*[^\n]+\n?)+", "", text, flags=re.IGNORECASE)
     text = re.sub(
         r"Task id\s+[\"'][^\"']+[\"']\s+(?:was\s+canceled|finished|completed|failed)[^\n]*",
         "",
@@ -266,6 +281,10 @@ def is_internal_cli_leak(text: str) -> bool:
     if orig_lower.startswith("tool is running as a background task with task id"):
         return True
     if orig_lower.startswith("an async task has completed") or orig_lower.startswith("an asynchronous task has completed"):
+        return True
+    if orig_lower.startswith("an async command is running") or "do not poll or call additional tools until the background task finishes" in orig_lower:
+        return True
+    if orig_lower.startswith("task log:") or re.match(r"^task log:\s*`?(?:file://)?", orig_lower):
         return True
 
     cleaned = strip_internal_cli_chatter(text).strip()

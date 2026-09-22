@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit test suite for bridge_scheduler.py (Karakos Background Scheduler & Sidecar Dispatcher).
+Unit test suite for bridge_scheduler.py (Bridge Background Scheduler & Sidecar Dispatcher).
 """
 
 import asyncio
@@ -340,7 +340,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
 
     async def test_evaluate_and_dispatch_forwards_channel_id(self):
         dispatch_mock = AsyncMock()
-        scheduler = bshed.KarakosScheduler(dispatch_fn=dispatch_mock)
+        scheduler = bshed.BridgeScheduler(dispatch_fn=dispatch_mock)
         test_job = {
             "id": "nas_logs",
             "name": "NAS Log Review",
@@ -364,7 +364,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
 
     async def test_scheduler_lifecycle(self):
         dispatch_mock = AsyncMock()
-        scheduler = bshed.KarakosScheduler(dispatch_fn=dispatch_mock)
+        scheduler = bshed.BridgeScheduler(dispatch_fn=dispatch_mock)
         with patch("tools.scheduler_tool.load_schedule", return_value=[]):
             await scheduler.start()
             self.assertTrue(scheduler._running)
@@ -449,7 +449,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_scheduler_reload_flag_defers_when_busy(self):
-        """Verify KarakosScheduler does not trigger reload if is_busy returns active channels, even if flag > 20s."""
+        """Verify BridgeScheduler does not trigger reload if is_busy returns active channels, even if flag > 20s."""
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -459,7 +459,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             os.utime(flag, (time.time() - 30, time.time() - 30))
 
             reload_mock = AsyncMock()
-            scheduler = bshed.KarakosScheduler(
+            scheduler = bshed.BridgeScheduler(
                 dispatch_fn=AsyncMock(),
                 reload_fn=reload_mock,
                 is_busy_fn=lambda: ["#zero-chat"]
@@ -481,7 +481,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_bot.get_channel.return_value = mock_channel
         callback_mock = AsyncMock()
 
-        scheduler = bshed.KarakosScheduler(
+        scheduler = bshed.BridgeScheduler(
             dispatch_fn=AsyncMock(),
             bot=mock_bot,
             quick_choice_view_cls=QuickChoiceView,
@@ -528,7 +528,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_channel = AsyncMock()
         mock_bot.get_channel.return_value = mock_channel
 
-        scheduler = bshed.KarakosScheduler(
+        scheduler = bshed.BridgeScheduler(
             dispatch_fn=AsyncMock(),
             bot=mock_bot,
             quick_choice_view_cls=QuickChoiceView,
@@ -565,7 +565,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_channel = AsyncMock()
         mock_bot.get_channel.return_value = mock_channel
 
-        scheduler = bshed.KarakosScheduler(
+        scheduler = bshed.BridgeScheduler(
             dispatch_fn=AsyncMock(),
             bot=mock_bot,
         )
@@ -598,7 +598,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_channel.send.side_effect = [Exception("HTTP 400 Bad Request: Invalid Form Body"), None]
         mock_bot.get_channel.return_value = mock_channel
 
-        scheduler = bshed.KarakosScheduler(
+        scheduler = bshed.BridgeScheduler(
             dispatch_fn=AsyncMock(),
             bot=mock_bot,
         )
@@ -628,7 +628,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_bot.is_ready.return_value = True
         mock_bot.latency = 0.05
 
-        scheduler = bshed.KarakosScheduler(
+        scheduler = bshed.BridgeScheduler(
             dispatch_fn=slow_dispatch,
             bot=mock_bot,
         )

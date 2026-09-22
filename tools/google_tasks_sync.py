@@ -12,7 +12,7 @@ Features:
 - Automatic export: tasks added in Zero are pushed to Google Tasks.
 - Title and metadata synchronization with Zero Task ID tags in notes.
 - Conflict-safe state tracking in /workspace/data/google_tasks_sync_state.json.
-- Fully compatible with the 5-layer Karakos sidecar framework.
+- Fully compatible with the 5-layer sidecar framework.
 """
 
 import argparse

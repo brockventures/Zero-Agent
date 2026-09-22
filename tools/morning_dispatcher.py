@@ -2,7 +2,7 @@
 """
 morning_dispatcher.py - Crab Cavern Centralized Morning Topic Rotation Dispatcher
 
-Runs daily at 09:30 AM PT via KarakosScheduler in schedule.json.
+Runs daily at 09:30 AM PT via BridgeScheduler in schedule.json.
 Determines daily roster via Pacific (America/Los_Angeles) day-of-year % 4:
   - Day % 4 == 0 -> Zero (Seeds engineering topic directly)
   - Day % 4 == 1 -> Amos (Tags <@1468012353206354197> with handoff baton)

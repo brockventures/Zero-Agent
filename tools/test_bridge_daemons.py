@@ -375,6 +375,58 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             self.assertIn("`err-quota-exceeded`", output_text)
             self.assertIn("Retryable:** No", output_text)
 
+    async def test_09_persistent_worker_task_settle_integration(self):
+        """Verify PersistentChannelWorker triggers evaluate_and_settle_turn and handles settle reinvocation without deadlock."""
+        worker = bd.PersistentChannelWorker(
+            channel_id=bs.TARGET_CHANNEL_ID,
+            name="zero-chat",
+            mode="home",
+            sess_key="home",
+        )
+        worker.conv_id = "test-conv-persistent-settle"
+        worker.proc = AsyncMock()
+        worker.proc.stdin = AsyncMock()
+        worker.proc.stdout = AsyncMock()
+        worker.proc.stdout.readline = AsyncMock(return_value=b"")
+        worker.proc.returncode = 0
+        worker.is_ready = True
+
+        mock_status = AsyncMock()
+        mock_status.id = 99993
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.id = bs.TARGET_CHANNEL_ID
+
+        # Mock evaluate_and_settle_turn returning was_settled=True
+        mock_settle = AsyncMock(return_value=(True, "Final settled substantive answer from reinvocation!"))
+
+        with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
+             patch("tools.bridge_daemons.TurnCoordinator.execute_stream_loop", new_callable=AsyncMock, return_value="Initial turn response"), \
+             patch("tools.task_settle.evaluate_and_settle_turn", mock_settle), \
+             patch.object(worker, "start", new_callable=AsyncMock), \
+             patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock) as mock_deliver:
+
+            result = await worker.execute_turn(
+                prompt="Run detached calculation",
+                status_msg=mock_status,
+                reply_target=mock_target,
+                attachments=[],
+            )
+
+            # Settle protocol was invoked with correct channel & conv_id
+            mock_settle.assert_awaited_once()
+            call_kwargs = mock_settle.call_args.kwargs
+            self.assertEqual(call_kwargs["conv_id"], worker.conv_id)
+            self.assertEqual(call_kwargs["channel_id"], bs.TARGET_CHANNEL_ID)
+            self.assertEqual(call_kwargs["mode"], "home")
+            self.assertEqual(call_kwargs["reinvoke_coro_fn"], worker.execute_turn)
+
+            # Result is settled_text directly
+            self.assertEqual(result, "Final settled substantive answer from reinvocation!")
+            # deliver_turn_output should not be called again in outer turn because reinvocation handled it
+            mock_deliver.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
+

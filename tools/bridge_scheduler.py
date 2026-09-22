@@ -1,5 +1,5 @@
 """
-Zero Discord Bridge - Karakos Background Scheduler & Sidecar Dispatcher Module
+Zero Discord Bridge - Persistent Background Scheduler & Sidecar Dispatcher Module
 Encapsulates all persistent JSON-backed cron/schedule evaluation, sidecar execution,
 anti-storm guards, liveness wedge detection, and outbox queue flushing.
 """
@@ -726,8 +726,8 @@ def should_run_job(job: dict, now_ts: float) -> tuple[bool, str]:
     return True, f"catchup within window ({overdue:.0f}s late <= {window}s)"
 
 
-class KarakosScheduler:
-    """Karakos-style persistent JSON-backed background scheduler for sidecars."""
+class BridgeScheduler:
+    """Persistent JSON-backed background scheduler for sidecars."""
     def __init__(
         self,
         dispatch_fn,
@@ -760,7 +760,7 @@ class KarakosScheduler:
         except asyncio.CancelledError:
             pass
         except Exception as de:
-            print(f"[KarakosScheduler] Error dispatching {name}: {de}")
+            print(f"[BridgeScheduler] Error dispatching {name}: {de}")
 
     async def _evaluate_and_dispatch_jobs(self, is_startup: bool = False):
         """Evaluate all jobs in schedule.json, strictly enforcing catchup window rules and persistence."""
@@ -791,7 +791,7 @@ class KarakosScheduler:
                     else:
                         j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
 
-                    prefix = "[KarakosScheduler Startup]" if is_startup else "[KarakosScheduler]"
+                    prefix = "[BridgeScheduler Startup]" if is_startup else "[BridgeScheduler]"
                     if should_run:
                         j["last_run_ts"] = now_ts
                         j["last_run_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
@@ -818,7 +818,7 @@ class KarakosScheduler:
                 await asyncio.sleep(0)  # Yield so newly created tasks start execution immediately
 
         except Exception as e:
-            print(f"[KarakosScheduler] Error evaluating jobs: {e}")
+            print(f"[BridgeScheduler] Error evaluating jobs: {e}")
 
     async def _heartbeat_loop(self):
         """Dedicated, isolated heartbeat loop running every 15s regardless of main loop activities."""
@@ -967,7 +967,7 @@ class KarakosScheduler:
                 except Exception as re_err:
                     pass
 
-                # Liveness Beacon & Wedge Check (Karakos Pattern: >420s unbroken silence while PROCESSING)
+                # Liveness Beacon & Wedge Check (Scheduler Pattern: >420s unbroken silence while PROCESSING)
                 if BEACON_FILE.exists():
                     try:
                         with open(BEACON_FILE) as bf:
@@ -1025,6 +1025,13 @@ class KarakosScheduler:
                     except Exception:
                         pass
 
+                # Check and dispatch completed background SDK tasks via Outbox
+                try:
+                    from tools.task_settle import check_and_dispatch_completed_tasks
+                    check_and_dispatch_completed_tasks()
+                except Exception:
+                    pass
+
                 # Outbox Queue Flusher (Cross-Channel Asynchronous Dispatch)
                 await self.flush_outbox_queue()
 
@@ -1049,6 +1056,7 @@ class KarakosScheduler:
                     else:
                         print(f"[Bridge] Reload flag detected (age={flag_age:.1f}s), but bridge is busy ({busy}). Deferring reload until idle...")
             except Exception as e:
-                print(f"[KarakosScheduler] Error in loop: {e}")
+                print(f"[BridgeScheduler] Error in loop: {e}")
 
             await asyncio.sleep(15)
+

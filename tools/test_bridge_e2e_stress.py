@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 End-to-End Integration and Stress Test Suite for Zero Discord Bridge.
-Validates multi-channel concurrency, mid-turn steering, Karakos scheduling,
+Validates multi-channel concurrency, mid-turn steering, Bridge scheduling,
 liveness wedge detection, outbox queue flushing, Banana mutex contention,
 and multi-tier session compaction.
 """
@@ -217,7 +217,7 @@ class TestBridgeEndToEndStress(unittest.IsolatedAsyncioTestCase):
         item = await self.ext_queue.get()
         self.assertIn("handoff", item["prompt"])
 
-    async def test_04_karakos_scheduler_wedge_and_outbox(self):
+    async def test_04_bridge_scheduler_wedge_and_outbox(self):
         """Stress test: verify liveness wedge alert on silence and outbox queue flushing."""
         now = time.time()
         # Write stale beacon (>420s silence while PROCESSING)
@@ -238,7 +238,7 @@ class TestBridgeEndToEndStress(unittest.IsolatedAsyncioTestCase):
         mock_proc.returncode = None
         br.active_proc = mock_proc
 
-        scheduler = bshed.KarakosScheduler(
+        scheduler = bshed.BridgeScheduler(
             dispatch_fn=AsyncMock(),
             bot=mock_bot
         )

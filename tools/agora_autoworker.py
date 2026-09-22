@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """agora_autoworker.py - Autonomous 3-hour roadmap runner for Station Agora.
 
-Wakes up via Karakos interval schedule every 10 minutes.
+Wakes up via interval schedule every 10 minutes.
 Audits remaining roadmap tasks, executes implementation and tests,
 and cleanly self-expires after 3 hours.
 """

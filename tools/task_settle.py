@@ -27,6 +27,8 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 DEFAULT_BRAIN_DIR = Path("/root/.gemini/antigravity-cli/brain")
 DEFAULT_SETTLE_TIMEOUT = 25.0
+DATA_DIR = Path("/workspace/data")
+PENDING_SDK_TASKS_FILE = DATA_DIR / "pending_sdk_tasks.json"
 
 
 def extract_turn_lines(lines: list[str]) -> list[str]:
@@ -244,6 +246,19 @@ async def evaluate_and_settle_turn(
             f"still pending: {still_pending}. Treating as long-running daemon / build. "
             "Releasing turn without reinvocation."
         )
+        register_pending_tasks(
+            conv_id=conv_id,
+            channel_id=channel_id,
+            mode=mode,
+            task_ids=still_pending,
+        )
+        from tools.bridge_safety import is_internal_cli_leak
+        if not current_text or is_internal_cli_leak(current_text):
+            if mode == "external":
+                notice = "⏳ *Task running in the background—will update here when complete.*"
+            else:
+                notice = "⏳ **Background task in progress.** Command is running in the background; I'll notify when complete."
+            return False, notice
         return False, None
 
     print(
@@ -275,3 +290,187 @@ async def evaluate_and_settle_turn(
     except Exception as e:
         print(f"[TaskSettle] Error during reinvocation for {conv_id}: {e}")
         return False, None
+
+
+def register_pending_tasks(
+    conv_id: str,
+    channel_id: int | str,
+    mode: str,
+    task_ids: list[str],
+    data_dir: Path | str = DATA_DIR,
+):
+    """Register pending SDK background tasks to be monitored asynchronously."""
+    p_file = Path(data_dir) / "pending_sdk_tasks.json"
+    data = {}
+    if p_file.exists():
+        try:
+            with open(p_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+    entry = data.get(conv_id, {
+        "channel_id": int(channel_id) if str(channel_id).isdigit() else channel_id,
+        "mode": mode,
+        "task_ids": [],
+        "registered_at": time.time(),
+    })
+    for tid in task_ids:
+        clean_tid = tid.split("/")[-1]
+        if clean_tid not in entry["task_ids"]:
+            entry["task_ids"].append(clean_tid)
+    entry["updated_at"] = time.time()
+    data[conv_id] = entry
+
+    try:
+        tmp_file = p_file.with_suffix(".tmp")
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        tmp_file.replace(p_file)
+    except Exception as e:
+        print(f"[TaskSettle] Warning saving pending tasks: {e}")
+
+
+def get_task_completion_details(
+    conv_id: str,
+    task_id: str,
+    brain_dir: Path | str = DEFAULT_BRAIN_DIR,
+) -> dict:
+    """Retrieve completion payload, status, and log tail for a background task."""
+    clean_tid = task_id.split("/")[-1]
+    conv_path = Path(brain_dir) / conv_id
+    res = {
+        "task_id": clean_tid,
+        "status": "completed",
+        "exit_code": 0,
+        "log_snippet": "",
+        "log_path": "",
+    }
+
+    # 1. Check message files
+    msg_dir = conv_path / ".system_generated" / "messages"
+    if msg_dir.exists():
+        for mf in glob.glob(str(msg_dir / "*.json")):
+            if os.path.basename(mf) == "read.json":
+                continue
+            try:
+                with open(mf, "r", encoding="utf-8", errors="replace") as fp:
+                    md = json.load(fp)
+                    content = str(md.get("content", ""))
+                    if clean_tid in str(md.get("sender", "")) or f'"{clean_tid}" finished' in content or f'"{clean_tid}" was canceled' in content:
+                        if "canceled" in content:
+                            res["status"] = "cancelled"
+                            res["exit_code"] = -1
+                        elif "exit code" in content:
+                            m = re.search(r"exit code\s+(\d+)", content)
+                            if m:
+                                res["exit_code"] = int(m.group(1))
+                                if res["exit_code"] != 0:
+                                    res["status"] = "failed"
+            except Exception:
+                pass
+
+    # 2. Check task log
+    task_log = conv_path / ".system_generated" / "tasks" / f"{clean_tid}.log"
+    if task_log.exists():
+        res["log_path"] = str(task_log)
+        try:
+            with open(task_log, "r", encoding="utf-8", errors="replace") as lf:
+                lines = [l.rstrip() for l in lf.readlines() if l.strip()]
+                tail = lines[-12:]
+                if tail:
+                    res["log_snippet"] = "\n".join(tail)
+        except Exception:
+            pass
+
+    return res
+
+
+def check_and_dispatch_completed_tasks(
+    brain_dir: Path | str = DEFAULT_BRAIN_DIR,
+    data_dir: Path | str = DATA_DIR,
+) -> list[dict]:
+    """Check pending SDK tasks and dispatch outbox notifications upon completion.
+    
+    Returns list of dispatched task details.
+    """
+    p_file = Path(data_dir) / "pending_sdk_tasks.json"
+    if not p_file.exists():
+        return []
+
+    try:
+        with open(p_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+
+    if not data:
+        return []
+
+    dispatched = []
+    modified = False
+
+    for conv_id, info in list(data.items()):
+        channel_id = info.get("channel_id")
+        task_ids = info.get("task_ids", [])
+        still_pending = []
+
+        for tid in task_ids:
+            if is_task_completed(conv_id, tid, brain_dir=brain_dir):
+                details = get_task_completion_details(conv_id, tid, brain_dir=brain_dir)
+                status = details["status"]
+                status_emoji = "✅" if status == "completed" else ("🛑" if status == "cancelled" else "❌")
+                status_title = "Complete" if status == "completed" else ("Cancelled" if status == "cancelled" else "Failed")
+
+                msg_lines = [
+                    f"{status_emoji} **Background Task {status_title}** (`{tid}`)",
+                ]
+                if details.get("exit_code") is not None:
+                    msg_lines.append(f"• **Exit Code:** `{details['exit_code']}`")
+                if details.get("log_path"):
+                    msg_lines.append(f"• **Log File:** `{details['log_path']}`")
+
+                snippet = details.get("log_snippet")
+                if snippet:
+                    from tools.bridge_safety import strip_internal_cli_chatter
+                    clean_snip = strip_internal_cli_chatter(snippet).strip()
+                    if clean_snip:
+                        msg_lines.append(f"\n**Output Excerpt:**\n```text\n{clean_snip}\n```")
+
+                outbox_content = "\n".join(msg_lines)
+
+                try:
+                    from tools.outbox import queue_outbox_message
+                    queue_outbox_message(
+                        channel=channel_id,
+                        content=outbox_content,
+                        source_turn=f"sdk-task-{tid}",
+                    )
+                    dispatched.append(details)
+                    print(f"[TaskSettle] 🚀 Dispatched outbox completion notice for task {tid} to channel {channel_id}")
+                except Exception as oe:
+                    print(f"[TaskSettle] Failed to queue outbox notification for {tid}: {oe}")
+                    still_pending.append(tid)
+            else:
+                reg_at = info.get("registered_at", time.time())
+                if (time.time() - reg_at) < 7200:
+                    still_pending.append(tid)
+
+        if len(still_pending) != len(task_ids):
+            modified = True
+            if still_pending:
+                info["task_ids"] = still_pending
+                data[conv_id] = info
+            else:
+                del data[conv_id]
+
+    if modified:
+        try:
+            tmp_file = p_file.with_suffix(".tmp")
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            tmp_file.replace(p_file)
+        except Exception as e:
+            print(f"[TaskSettle] Warning updating pending tasks: {e}")
+
+    return dispatched

@@ -2,7 +2,7 @@
 """
 agora_steering.py - AGORA Daily Steering Meeting Briefing Dispatcher
 
-Runs daily at 09:30 PM PT (21:30 PT) via KarakosScheduler in schedule.json.
+Runs daily at 09:30 PM PT (21:30 PT) via BridgeScheduler in schedule.json.
 Addresses the executive PM prompt in #lounge (1534452820995080192):
 "As the PM, give me a status update on project AGORA and where various parts of the operation stand.
 Flag any decisions needed from Mike and questions about next steps."

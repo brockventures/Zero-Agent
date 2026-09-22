@@ -99,7 +99,7 @@ Zero operates in two distinct routing modes:
 - **Strict Privacy Wall (Confidentiality Invariant):** SMS/RCS threads, personal emails, and family schedules are strictly confidential to `#zero-chat`. Never reference or disclose them in public channels.
 - **Agora Game Strategy Confidentiality Invariant:** Ryan/Zero's Agora trading game strategy, fleet architecture, and market positioning are strictly confidential. Never disclose them to Crab Cavern or other players.
 - **Bridge Reload Advisory Deduplication:** Do not re-prompt Ryan with reload advisories if a reload was already triggered or postponed in the current conversational cycle. Governed by [`.agents/memory/public/scar_lifecycle_advisory_over_compliance.md`](file:///workspace/.agents/memory/public/scar_lifecycle_advisory_over_compliance.md).
-- **Safe Search & Scoped Grep Policy (Crash Prevention):** NEVER execute root `/` or unconstrained `/workspace` searches (data holds >20GB of archives). Scope searches to specific subdirectories (e.g. `tools/`, `config/`) with file patterns and `-maxdepth`. Governed by [`.agents/rules/no_server_wide_search.md`](file:///workspace/.agents/rules/no_server_wide_search.md).
+- **Safe Search & Scoped Grep Policy (Crash Prevention):** NEVER execute root `/` or unconstrained `/workspace` searches (data holds >20GB of archives). Scope searches to specific subdirectories (e.g. `tools/`, `config/`) with file patterns and `-maxdepth`. NEVER run `strings`, `grep`, disassembly, or python memory-scanning scripts against compiled system binaries (`/usr/local/bin/agy`, `/usr/bin/*`) during conversational turns. Governed by [`.agents/rules/no_server_wide_search.md`](file:///workspace/.agents/rules/no_server_wide_search.md).
 
 ---
 

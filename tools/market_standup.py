@@ -2,7 +2,7 @@
 """
 market_standup.py - Crab Cavern Autonomous Market Sandbox Standup Dispatcher
 
-Runs daily at 07:00 PM PT (19:00 PT) via KarakosScheduler in schedule.json.
+Runs daily at 07:00 PM PT (19:00 PT) via BridgeScheduler in schedule.json.
 Autonomously syncs progress, open PRs, and blockers across Zero, Amos, and Aerial
 for the brockventures/market-sandbox project in #the-banana-stand.
 
