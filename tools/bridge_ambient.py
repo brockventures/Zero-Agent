@@ -51,7 +51,7 @@ BANANA_WATCHER_BOT_ID = 1545924520236290198
 PROCESSED_BACKLOG_MSG_IDS: set[int] = set()
 channel_last_bot_reply: dict[int, float] = {}
 
-NON_NAME_NOUNS = r"(?:day|shot|downtime|errors?|detections?|latency|tolerance|cost|percent|sum|crossing|emission|point|index|out|wrapping|layout|config)\b"
+NON_NAME_NOUNS = r"(?:day|shot|downtime|errors?|detections?|latency|tolerance|cost|percent|sum|crossing|emission|point|index|out|wrapping|layout|config|leakage|padding|margin|trust|knowledge|defect|defects|risk|budget|drift|progress)\b"
 
 
 def contains_zero_mention(text: str) -> bool:
@@ -65,7 +65,8 @@ def contains_zero_mention(text: str) -> bool:
     if re.search(r"\b(?:hey|hi|hello)\s+zero\b", text, re.IGNORECASE):
         return True
     # 3. Punctuation vocative: 'Zero:', 'Zero,', 'Zero -', 'Zero?'
-    if re.search(r"(?:^|[\n.!?\s,;])zero\s*[:,-]", text, re.IGNORECASE) or re.search(r"\bzero\s*[?!]", text, re.IGNORECASE):
+    # Note: For dashes, require whitespace or end of string to prevent false-positives on hyphenated words (zero-leakage, zero-shot, zero-sum)
+    if re.search(r"(?:^|[\n.!?\s,;])zero\s*(?:[:,]|--?(?:\s+|$))", text, re.IGNORECASE) or re.search(r"\bzero\s*[?!]", text, re.IGNORECASE):
         return True
     # 4. Directive verbs targeting Zero: 'ask Zero', 'tag Zero', 'tell Zero', 'cc Zero'
     if re.search(r"\b(?:ask|tag|tell|ping|cc)\s+zero\b", text, re.IGNORECASE):
