@@ -1,6 +1,7 @@
 ---
+trigger: always_on
+glob: "*"
 description: Strict rules for Discord mobile formatting. Banning wide ASCII box diagrams, multi-column trees, and literal Unicode bullet points. Enforcing native markdown lists and compact cards.
-globs: "*"
 ---
 
 # Discord Mobile Formatting Rules

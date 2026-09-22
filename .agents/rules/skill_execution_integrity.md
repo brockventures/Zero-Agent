@@ -1,6 +1,7 @@
 ---
+trigger: always_on
+glob: "*"
 description: Strict protocol forbidding silent skill abandonment, swallowed tool failures, or ungrounded downgrades when skills or APIs encounter errors.
-globs: "*"
 ---
 
 # Skill Execution Integrity & Failure Disclosure Protocol
