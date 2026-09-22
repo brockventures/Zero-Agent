@@ -624,6 +624,21 @@ async def deliver_turn_output(
     reply_ch = getattr(reply_target, "channel", reply_target) if reply_target else None
     is_home = is_home_channel(reply_ch) or is_home_channel(channel_id)
     if is_silence_response and not is_home:
+        if is_last_word and (last_word_bot_id or last_word_bot_name):
+            try:
+                from tools.last_word_protocol import pause_bot
+
+                rules = get_runtime_rules()
+                pause_sec = float(rules.get("last_word_pause_minutes", 3)) * 60.0
+                pause_bot(
+                    channel_id=channel_id,
+                    bot_id=last_word_bot_id,
+                    bot_name=last_word_bot_name,
+                    duration_seconds=pause_sec,
+                    reason=f"Last Word Protocol triggered after {last_word_streak} uninterrupted messages",
+                )
+            except Exception as lwe:
+                print(f"[BridgePipeline] Error setting Last Word pause on silence: {lwe}")
         print(f"[BridgePipeline] Suppressed [NO_REPLY] in non-home channel")
         if timer:
             timer.mark_delivery_end()
@@ -778,6 +793,32 @@ async def deliver_turn_output(
                     )
             except Exception as e:
                 print(f"[BridgePipeline] Error posting artifact files: {e}")
+
+        # Trigger Last Word Protocol cooldown once response is delivered in home mode
+        if is_last_word and (last_word_bot_id or last_word_bot_name):
+            try:
+                from tools.last_word_protocol import pause_bot
+
+                rules = get_runtime_rules()
+                pause_sec = float(rules.get("last_word_pause_minutes", 3)) * 60.0
+                pause_bot(
+                    channel_id=channel_id,
+                    bot_id=last_word_bot_id,
+                    bot_name=last_word_bot_name,
+                    duration_seconds=pause_sec,
+                    reason=f"Last Word Protocol triggered after {last_word_streak} uninterrupted messages",
+                )
+                print(
+                    f"[BridgePipeline] Last Word Protocol (home): paused responses to {last_word_bot_name} ({last_word_bot_id}) in channel {channel_id} for {pause_sec/60:.0f}m."
+                )
+            except Exception as lwe:
+                print(f"[BridgePipeline] Error triggering Last Word Protocol pause: {lwe}")
+
+        try:
+            from tools.bridge_ambient import channel_last_bot_reply
+            channel_last_bot_reply[channel_id] = time.time()
+        except Exception:
+            pass
     finally:
         if held_turn_banana:
             try:

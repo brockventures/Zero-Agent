@@ -45,6 +45,7 @@ from tools.bridge_state import (
     is_container_restart_intent,
     is_home_channel,
     is_excluded_channel,
+    is_reply_to_zero as resolve_is_reply_to_zero,
     is_reload_intent,
 )
 
@@ -160,21 +161,33 @@ async def route_external_message(
     # 1. Public channels in Brock Discord (e.g. #seerr-requests-and-chat, #server-updates, #seerr-notifications, #baseball)
     # Strict Rule: In Brock Discord, Zero strictly ignores all bots (including Ivy) and ONLY responds to Ryan Brock explicitly tagging Zero.
     if is_brock_guild(msg):
-        if msg.author.bot:
-            return True
-
-        if msg.author.id != OWNER_USER_ID:
-            return True
+        # Dedicated Excluded Channel Quarantine (#baseball):
+        # Owned exclusively by Ivy. Zero responds ONLY if:
+        # - Ryan Brock (OWNER_USER_ID) explicitly tags Zero or replies directly to Zero.
+        # - Ivy (IVY_USER_ID) explicitly tags Zero's snowflake or replies directly to Zero.
+        # Governed by Last Word Protocol and 4s cascade cooldown.
+        is_excluded = is_excluded_channel(msg.channel)
+        if is_excluded:
+            if msg.author.id not in (OWNER_USER_ID, IVY_USER_ID):
+                return True
+        else:
+            # Standard Brock Public Channels (#server-updates, #seerr-*): responds ONLY to Ryan Brock.
+            if msg.author.bot or msg.author.id != OWNER_USER_ID:
+                return True
 
         bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
-        if is_excluded_channel(msg.channel):
-            is_tagged = (
+        reply_to_zero = resolve_is_reply_to_zero(msg, bot)
+
+        if is_excluded:
+            has_tag = (
                 f"<@{bot_id}>" in content or
                 f"<@!{bot_id}>" in content or
                 bool(re.search(r"@zero\b", content, re.IGNORECASE))
             )
+            is_tagged = has_tag or reply_to_zero
         else:
             is_tagged = (
+                reply_to_zero or
                 (bot.user and bot.user in msg.mentions) or
                 f"<@{bot_id}>" in content or
                 f"<@!{bot_id}>" in content or
@@ -185,7 +198,26 @@ async def route_external_message(
         if not is_tagged:
             return True
 
-        # Ryan explicitly invoked Zero in a public Brock Discord channel
+        # Check if author is Ivy
+        is_ivy = (msg.author.id == IVY_USER_ID)
+        is_last_word = False
+        last_word_streak = 0
+        if is_ivy:
+            from tools.last_word_protocol import is_bot_paused, check_last_word_condition, build_last_word_prompt_injection
+            paused, rem, _ = is_bot_paused(msg.channel.id, msg.author.id, "Ivy")
+            if paused:
+                print(f"[BridgeAmbient] Excluded channel #{getattr(msg.channel, 'name', msg.channel.id)}: Ivy is paused ({rem:.1f}s). Dropping.")
+                return True
+
+            threshold = int(rules.get("excluded_channel_last_word_threshold", 4))
+            is_last_word, last_word_streak = check_last_word_condition(
+                channel_id=msg.channel.id,
+                bot_id=msg.author.id,
+                bot_name="Ivy",
+                threshold=threshold,
+            )
+
+        # Clean invocation prefix
         cleaned = content
         cleaned = re.sub(rf"<@!?{bot_id}>", "", cleaned)
         cleaned = re.sub(r"^(hey\s+)?zero[:,\s]*", "", cleaned, flags=re.IGNORECASE)
@@ -205,23 +237,24 @@ async def route_external_message(
                 except Exception as e:
                     print(f"[Bridge] Failed saving attachment: {e}")
 
-        if cleaned.lower() in ("!reset", "/reset", "!new", "/new"):
-            clear_channel_session_id(msg.channel.id, "home")
-            await msg.reply("🔄 Conversation session reset for this channel.")
-            return True
+        if not is_ivy:
+            if cleaned.lower() in ("!reset", "/reset", "!new", "/new"):
+                clear_channel_session_id(msg.channel.id, "home")
+                await msg.reply("🔄 Conversation session reset for this channel.")
+                return True
 
-        if is_container_restart_intent(cleaned):
-            ch_name = getattr(msg.channel, "name", str(msg.channel.id))
-            await execute_container_restart(msg.channel, initiator=author_name, reason=f"Manual Docker container restart requested via #{ch_name}")
-            return True
+            if is_container_restart_intent(cleaned):
+                ch_name = getattr(msg.channel, "name", str(msg.channel.id))
+                await execute_container_restart(msg.channel, initiator=author_name, reason=f"Manual Docker container restart requested via #{ch_name}")
+                return True
 
-        if is_reload_intent(cleaned):
-            ch_name = getattr(msg.channel, "name", str(msg.channel.id))
-            if reload_fn:
-                await reload_fn(msg.channel, initiator=author_name, force=True, reason=f"Manual in-place bridge reload requested via #{ch_name}")
-            else:
-                await execute_bridge_reload(bot, msg.channel, initiator=author_name, force=True, reason=f"Manual in-place bridge reload requested via #{ch_name}")
-            return True
+            if is_reload_intent(cleaned):
+                ch_name = getattr(msg.channel, "name", str(msg.channel.id))
+                if reload_fn:
+                    await reload_fn(msg.channel, initiator=author_name, force=True, reason=f"Manual in-place bridge reload requested via #{ch_name}")
+                else:
+                    await execute_bridge_reload(bot, msg.channel, initiator=author_name, force=True, reason=f"Manual in-place bridge reload requested via #{ch_name}")
+                return True
 
         prompt_content = cleaned
         is_lazy = bool(
@@ -256,6 +289,10 @@ async def route_external_message(
         if not prompt_content:
             return True
 
+        if is_ivy and is_last_word:
+            pause_mins = int(rules.get("last_word_pause_minutes", 3))
+            prompt_content += build_last_word_prompt_injection("Ivy", last_word_streak, pause_minutes=pause_mins)
+
         ch_name = getattr(msg.channel, "name", str(msg.channel.id))
         ch_ctx_block = ""
         try:
@@ -266,14 +303,25 @@ async def route_external_message(
         except Exception:
             pass
 
-        public_prompt = (
-            f"[OPERATIONAL DIRECTIVE - BROCK DISCORD PUBLIC CHANNEL #{ch_name}]:\n"
-            f"You are responding directly to Ryan in a public channel on Brock Discord.\n"
-            f"• Be direct, concise, and helpful (single Discord message, max 2000 characters).\n"
-            f"• Public-Safe Etiquette: Do NOT reveal sensitive credentials, tokens, private IPs, or personal family information.\n\n"
-            f"{ch_ctx_block}"
-            f"{prompt_content}"
-        )
+        if is_ivy:
+            public_prompt = (
+                f"[OPERATIONAL DIRECTIVE - BROCK DISCORD #{ch_name} (CROSS-BOT PEER COMMUNICATION)]:\n"
+                f"You are responding directly to Ivy (<@{IVY_USER_ID}>), the Assistant GM AI partner in #{ch_name}.\n"
+                f"• Be direct, sharp, and concise (single Discord message, max 2000 characters).\n"
+                f"• Honor the baseball domain boundaries and peer operating discipline.\n"
+                f"• Public-Safe Etiquette: Do NOT reveal sensitive credentials, tokens, private IPs, or personal family information.\n\n"
+                f"{ch_ctx_block}"
+                f"{prompt_content}"
+            )
+        else:
+            public_prompt = (
+                f"[OPERATIONAL DIRECTIVE - BROCK DISCORD PUBLIC CHANNEL #{ch_name}]:\n"
+                f"You are responding directly to Ryan in a public channel on Brock Discord.\n"
+                f"• Be direct, concise, and helpful (single Discord message, max 2000 characters).\n"
+                f"• Public-Safe Etiquette: Do NOT reveal sensitive credentials, tokens, private IPs, or personal family information.\n\n"
+                f"{ch_ctx_block}"
+                f"{prompt_content}"
+            )
 
         await home_turn_queue.put({
             "prompt": public_prompt,
@@ -284,6 +332,10 @@ async def route_external_message(
             "mode": "home",
             "channel_id": msg.channel.id,
             "author_name": author_name,
+            "is_last_word": is_last_word,
+            "last_word_bot_id": str(msg.author.id) if is_ivy else None,
+            "last_word_bot_name": "Ivy" if is_ivy else None,
+            "last_word_streak": last_word_streak,
             "queued_at": time.perf_counter(),
         })
         return True
@@ -364,23 +416,7 @@ async def route_external_message(
     bot_mention_1 = f"<@{bot_id}>"
     bot_mention_2 = f"<@!{bot_id}>"
 
-    is_reply_to_zero = False
-    if msg.reference:
-        if msg.reference.resolved and hasattr(msg.reference.resolved, "author"):
-            if bot.user and msg.reference.resolved.author.id == bot.user.id:
-                is_reply_to_zero = True
-        elif msg.reference.message_id:
-            try:
-                from tools.channel_history import get_recent_messages
-                ref_id = msg.reference.message_id
-                for m in get_recent_messages(msg.channel.id, limit=25):
-                    if m.get("id") == ref_id:
-                        a_name = str(m.get("author", "")).lower()
-                        if "zero" in a_name or (m.get("is_bot") and "zero" in a_name):
-                            is_reply_to_zero = True
-                        break
-            except Exception as re_err:
-                print(f"[Bridge] Warning resolving reply reference {ref_id}: {re_err}")
+    is_reply_to_zero = resolve_is_reply_to_zero(msg, bot)
 
     # Channel-specific tag enforcement
     channel_tag_requirements = rules.get("channel_tag_requirements", {})

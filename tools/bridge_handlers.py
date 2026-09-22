@@ -74,9 +74,11 @@ from tools.bridge_state import (
     PT_TZ,
     is_home_channel,
     is_excluded_channel,
+    is_reply_to_zero,
     BROCK_GUILD_ID,
     is_brock_guild,
     VAULT_CHANNEL_ID,
+    IVY_USER_ID,
 )
 from tools.bridge_formatting import (
     format_command_preview,
@@ -105,7 +107,6 @@ BOT_BOOT_TIME = time.time()
 BANANA_WATCHER_BOT_ID = 1545924520236290198
 PROCESSED_INTERACTIONS = set()
 PROCESSED_BACKLOG_MSG_IDS = set()
-channel_last_bot_reply = {}
 active_turn_task = None
 active_status_msg = None
 has_notified_ready = False
@@ -343,13 +344,14 @@ async def run_channel_turn_worker(
 
             except Exception as e:
                 print(f"[Channel Worker {channel_id}] Error in turn execution: {e}")
-                try:
-                    if hasattr(reply_target, "reply"):
-                        await reply_target.reply(f"⚠️ **Error executing task:** {e}")
-                    elif hasattr(reply_target, "send"):
-                        await reply_target.send(f"⚠️ **Error executing task:** {e}")
-                except Exception:
-                    pass
+                if not is_excluded_channel(channel_id):
+                    try:
+                        if hasattr(reply_target, "reply"):
+                            await reply_target.reply(f"⚠️ **Error executing task:** {e}")
+                        elif hasattr(reply_target, "send"):
+                            await reply_target.send(f"⚠️ **Error executing task:** {e}")
+                    except Exception:
+                        pass
             finally:
                 channel_active_tasks.pop(channel_id, None)
                 if is_home_root:
@@ -731,19 +733,52 @@ async def handle_message(
         return
 
     # Dedicated Excluded Channel Quarantine (e.g. #baseball dedicated exclusively to Ivy):
-    # Strictly ignore all messages unless explicitly tagged in text by Ryan Brock (Owner).
-    # Bots (including Ivy) are NEVER permitted to trigger Zero in excluded channels.
+    # Owned exclusively by Ivy. Zero responds ONLY if:
+    # 1. Ryan Brock (Owner) explicitly tags Zero or replies directly to Zero.
+    # 2. Ivy (Assistant GM) explicitly tags Zero's snowflake or replies directly to Zero.
+    # Zero NEVER evaluates ambient chatter or vocatives (e.g. "zero-leakage").
     if is_excluded_channel(msg.channel):
-        if getattr(msg.author, "bot", False) or getattr(msg.author, "id", None) != OWNER_USER_ID:
+        author_id = getattr(msg.author, "id", None)
+        if author_id not in (OWNER_USER_ID, IVY_USER_ID):
             return
+
         bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
+        reply_to_zero = is_reply_to_zero(msg, bot)
         has_explicit_tag = (
             f"<@{bot_id}>" in content or
             f"<@!{bot_id}>" in content or
             bool(re.search(r"@zero\b", content, re.IGNORECASE))
         )
-        if not has_explicit_tag:
-            return
+
+        if author_id == OWNER_USER_ID:
+            # Human message in excluded channel strictly clears any active bot cooldown
+            try:
+                from tools.last_word_protocol import unpause_bot
+                unpause_bot(msg.channel.id, "Ivy")
+            except Exception as ue:
+                print(f"[Bridge] Warning unpausing Ivy on owner message: {ue}")
+
+            if not has_explicit_tag and not reply_to_zero:
+                return
+
+        elif author_id == IVY_USER_ID:
+            if not has_explicit_tag and not reply_to_zero:
+                return
+
+            # Check if Ivy is paused under Last Word Protocol
+            from tools.last_word_protocol import is_bot_paused
+            is_paused, remaining, _ = is_bot_paused(msg.channel.id, author_id, "Ivy")
+            if is_paused:
+                print(f"[Bridge] Excluded channel #{getattr(msg.channel, 'name', msg.channel.id)}: Ivy is paused under Last Word Protocol ({remaining:.1f}s remaining). Dropping.")
+                return
+
+            # 4-second cascade cooldown to prevent rapid-fire bot loops
+            now = time.time()
+            last_reply = channel_last_bot_reply.get(msg.channel.id, 0.0)
+            if (now - last_reply) < 4.0:
+                print(f"[Bridge] Excluded channel #{getattr(msg.channel, 'name', msg.channel.id)}: 4s cascade cooldown active ({now - last_reply:.2f}s < 4.0s). Dropping.")
+                return
+            channel_last_bot_reply[msg.channel.id] = now
 
     if is_home:
         # Home Turf (#zero-chat): strictly 1-on-1 pairing with Ryan; ignore other bots

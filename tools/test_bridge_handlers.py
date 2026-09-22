@@ -4,6 +4,7 @@ Unit test suite for bridge_handlers.py (Discord Bot Event Handlers, Routing & Di
 """
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import os
 import shutil
@@ -39,6 +40,10 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         ch.CHANNEL_HISTORY_FILE = self.temp_path / "channel_history.json"
         ch._history_store.clear()
 
+        import tools.last_word_protocol as lwp
+        self.orig_cooldowns_file = lwp.COOLDOWNS_FILE
+        lwp.COOLDOWNS_FILE = self.temp_path / "bot_cooldowns.json"
+
         bs.DATA_DIR = self.temp_path
         bh.ATTACHMENTS_DIR = self.temp_path / "attachments"
         bh.ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,6 +52,9 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         bs.RESTART_INTENT_FILE = self.temp_path / "restart_intent.json"
 
     def tearDown(self):
+        import tools.last_word_protocol as lwp
+        lwp.COOLDOWNS_FILE = self.orig_cooldowns_file
+
         import tools.channel_history as ch
         ch.CHANNEL_HISTORY_FILE = self.orig_history_file
         ch._history_store = self.orig_history_store
@@ -1194,8 +1202,8 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
             call_args = turn_queue.put.call_args[0][0]
             self.assertEqual(call_args["prompt"], "That just explains how you prevent tool spam, not how you prevent agy from exiting")
 
-    async def test_excluded_channel_quarantine_drops_ivy_bot_messages(self):
-        """Verify that any bot messages (like Ivy) in #baseball are dropped immediately."""
+    async def test_excluded_channel_quarantine_drops_ivy_passive_ambient_chatter(self):
+        """Verify that passive/ambient chatter from Ivy in #baseball without explicit tag or reply to Zero is dropped."""
         mock_bot = MagicMock()
         mock_bot.user.id = 1542285964213358633
 
@@ -1205,13 +1213,14 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         msg.channel.id = baseball_id
         msg.channel.name = "baseball"
         msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
         msg.author.id = 1541205716948353074  # Ivy
         msg.author.bot = True
         msg.author.display_name = "Ivy"
         msg.content = "Thanks for clearing the frequency, Zero. Back to the hedge fund."
         msg.created_at.timestamp.return_value = time.time()
-        msg.mentions = [mock_bot.user]  # Even if Zero is in mentions from inline reply
-        msg.reference = MagicMock()
+        msg.mentions = []
+        msg.reference = None
 
         home_queue = AsyncMock()
         ext_queue = AsyncMock()
@@ -1231,6 +1240,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         msg.channel.id = baseball_id
         msg.channel.name = "baseball"
         msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
         msg.author.id = 179407724335988736  # Ryan Brock (Owner)
         msg.author.bot = False
         msg.author.display_name = "Ryan"
@@ -1272,6 +1282,211 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
 
         await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
         home_queue.put.assert_awaited_once()
+
+    async def test_excluded_channel_accepts_ivy_tagging_zero_snowflake(self):
+        """Verify that Ivy tagging Zero's snowflake in #baseball is accepted and routes to home_turn_queue."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        baseball_id = 1548196929308065893
+        msg = MagicMock()
+        msg.id = 888114
+        msg.channel.id = baseball_id
+        msg.channel.name = "baseball"
+        msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
+        msg.author.id = 1541205716948353074  # Ivy
+        msg.author.bot = True
+        msg.author.display_name = "Ivy"
+        msg.content = "<@1542285964213358633> What is the Cubs lineup today?"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = [mock_bot.user]
+        msg.reference = None
+        msg.attachments = []
+
+        bh.channel_last_bot_reply[baseball_id] = 0.0
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_awaited_once()
+        item = home_queue.put.call_args[0][0]
+        self.assertIn("CROSS-BOT PEER COMMUNICATION", item["prompt"])
+        self.assertIn("Ivy", item["prompt"])
+        self.assertEqual(item["channel_id"], baseball_id)
+
+    async def test_excluded_channel_accepts_ivy_inline_reply_to_zero(self):
+        """Verify that Ivy replying to a Zero message via Discord inline reply in #baseball is accepted."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        baseball_id = 1548196929308065893
+        msg = MagicMock()
+        msg.id = 888115
+        msg.channel.id = baseball_id
+        msg.channel.name = "baseball"
+        msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
+        msg.author.id = 1541205716948353074  # Ivy
+        msg.author.bot = True
+        msg.author.display_name = "Ivy"
+        msg.content = "I reviewed that model too, looks solid."
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = [mock_bot.user]
+        msg.reference = MagicMock()
+        msg.reference.resolved = MagicMock()
+        msg.reference.resolved.author.id = 1542285964213358633  # Zero
+        msg.reference.resolved.author.bot = True
+        msg.reference.resolved.author.display_name = "Zero"
+        msg.attachments = []
+
+        bh.channel_last_bot_reply[baseball_id] = 0.0
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_awaited_once()
+        item = home_queue.put.call_args[0][0]
+        self.assertIn("CROSS-BOT PEER COMMUNICATION", item["prompt"])
+
+    async def test_excluded_channel_drops_ivy_when_paused_under_last_word(self):
+        """Verify that Ivy messages in #baseball are dropped when Ivy is on cooldown."""
+        from tools.last_word_protocol import pause_bot
+
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        baseball_id = 1548196929308065893
+        pause_bot(baseball_id, 1541205716948353074, "Ivy", duration_seconds=180.0)
+
+        msg = MagicMock()
+        msg.id = 888116
+        msg.channel.id = baseball_id
+        msg.channel.name = "baseball"
+        msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
+        msg.author.id = 1541205716948353074  # Ivy
+        msg.author.bot = True
+        msg.author.display_name = "Ivy"
+        msg.content = "<@1542285964213358633> Are you there?"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = [mock_bot.user]
+        msg.reference = None
+        msg.attachments = []
+
+        bh.channel_last_bot_reply[baseball_id] = 0.0
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_not_called()
+
+    async def test_excluded_channel_drops_ivy_when_cascade_cooldown_active(self):
+        """Verify that Ivy messages arriving within 4s of last bot reply are dropped."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        baseball_id = 1548196929308065893
+        bh.channel_last_bot_reply[baseball_id] = time.time()  # Active right now
+
+        msg = MagicMock()
+        msg.id = 888117
+        msg.channel.id = baseball_id
+        msg.channel.name = "baseball"
+        msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
+        msg.author.id = 1541205716948353074  # Ivy
+        msg.author.bot = True
+        msg.author.display_name = "Ivy"
+        msg.content = "<@1542285964213358633> Rapid fire ping"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = [mock_bot.user]
+        msg.reference = None
+        msg.attachments = []
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_not_called()
+
+    async def test_excluded_channel_owner_message_unpauses_ivy(self):
+        """Verify that any message from Ryan in #baseball clears Ivy's pause cooldown."""
+        from tools.last_word_protocol import pause_bot, is_bot_paused
+
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        baseball_id = 1548196929308065893
+        pause_bot(baseball_id, 1541205716948353074, "Ivy", duration_seconds=180.0)
+        self.assertTrue(is_bot_paused(baseball_id, 1541205716948353074, "Ivy")[0])
+
+        msg = MagicMock()
+        msg.id = 888118
+        msg.channel.id = baseball_id
+        msg.channel.name = "baseball"
+        msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
+        msg.author.id = 179407724335988736  # Ryan Brock
+        msg.author.bot = False
+        msg.author.display_name = "Ryan"
+        msg.content = "Let's reset the board here."
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = []
+        msg.reference = None
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        paused, _, _ = is_bot_paused(baseball_id, 1541205716948353074, "Ivy")
+        self.assertFalse(paused)
+        home_queue.put.assert_not_called()  # Ryan didn't tag Zero, so no turn triggered
+
+    async def test_excluded_channel_last_word_streak_trigger(self):
+        """Verify that 4-message uninterrupted bot streak between Zero and Ivy triggers Last Word Protocol."""
+        import tools.channel_history as ch
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        baseball_id = 1548196929308065893
+        t_now = time.time()
+
+        # Inject 4 alternating messages between Zero and Ivy into channel history
+        ch.record_message(baseball_id, "baseball", "Zero", is_bot=True, content="Zero msg 1", msg_id=101, timestamp=datetime.fromtimestamp(t_now - 20, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+        ch.record_message(baseball_id, "baseball", "Ivy", is_bot=True, content="Ivy msg 1", msg_id=102, timestamp=datetime.fromtimestamp(t_now - 15, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+        ch.record_message(baseball_id, "baseball", "Zero", is_bot=True, content="Zero msg 2", msg_id=103, timestamp=datetime.fromtimestamp(t_now - 10, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+        ch.record_message(baseball_id, "baseball", "Ivy", is_bot=True, content="Ivy msg 2", msg_id=104, timestamp=datetime.fromtimestamp(t_now - 5, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+        msg = MagicMock()
+        msg.id = 105
+        msg.channel.id = baseball_id
+        msg.channel.name = "baseball"
+        msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
+        msg.author.id = 1541205716948353074  # Ivy
+        msg.author.bot = True
+        msg.author.display_name = "Ivy"
+        msg.content = "<@1542285964213358633> Any final thoughts on that trade?"
+        msg.created_at.timestamp.return_value = t_now
+        msg.mentions = [mock_bot.user]
+        msg.reference = None
+        msg.attachments = []
+
+        bh.channel_last_bot_reply[baseball_id] = 0.0
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_awaited_once()
+        item = home_queue.put.call_args[0][0]
+        self.assertTrue(item.get("is_last_word"))
+        self.assertEqual(item.get("last_word_bot_id"), "1541205716948353074")
+        self.assertIn("LAST WORD PROTOCOL ACTIVE", item["prompt"])
 
 
 if __name__ == "__main__":

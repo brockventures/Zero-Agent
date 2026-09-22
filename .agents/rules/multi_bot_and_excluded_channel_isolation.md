@@ -6,21 +6,24 @@
   - `#baseball` is dedicated strictly to Ivy's operations: sabermetric modeling, FanGraphs ingestion, Big Board Pro, dynasty valuations, and 1-on-1 collaboration with Ryan Brock.
   - Zero has zero jurisdiction in `#baseball`. Zero must never monitor, interject, summarize, or react in `#baseball` under normal operations.
 
-## 2. Absolute Bot-to-Bot Prohibition on Brock Guild
-- **No Bot-on-Bot Triggers:**
-  - On the Brock Guild (`1210466877294518272`), Zero NEVER responds to any bot (including Ivy, Home Assistant webhooks, Dockhand alerts, or third-party bots).
-  - If `msg.author.bot` is `True`, Zero drops the message unconditionally and immediately at the front door (`handle_message`).
-  - Cross-agent collaboration occurs exclusively in Crab Cavern (`#the-banana-stand`, `#lounge` on Guild `1534436119888793747`) under the Banana Mutex and Last Word Protocol.
+## 2. Bot-to-Bot Addressing Discipline on Brock Guild
+- **Brock Public Channels (`#server-updates`, `#seerr-*`):**
+  - Zero NEVER responds to any bot on Brock Guild public channels.
+  - If `msg.author.bot` is `True` outside excluded channels, Zero drops the message unconditionally and immediately at the front door (`handle_message`).
+- **Dedicated Excluded Channel Quarantine (`#baseball`):**
+  - Ivy (`1541205716948353074`) is permitted to communicate directly with Zero strictly via:
+    1. Direct snowflake mentions: `<@1542285964213358633>` or `<@!1542285964213358633>` (or `@Zero`).
+    2. Native Discord inline replies (`msg.reference` resolving to a message authored by Zero).
+  - Passive chatter, vocatives ("Zero."), and unaddressed chatter from Ivy are dropped at the front door.
+  - Cross-bot interaction is strictly governed by the **Last Word Protocol** (4-message threshold between Zero and Ivy without human intervention, triggering a concluding turn and a 3-minute cooldown) and a **4-second cascade cooldown**.
+  - Any human message from Ryan Brock in `#baseball` immediately unpauses Ivy and resets the streak.
 
 ## 3. Excluded Channel Front-Door Quarantine
-- **Strict Owner Text-Tag Invariant:**
+- **Strict Addressing Invariant:**
   - In any excluded channel (`DEFAULT_EXCLUDED_HOME_CHANNELS` / `is_excluded_channel(msg.channel)`):
-    1. Any message from a bot is dropped immediately.
-    2. Any message from any user other than Ryan Brock (`OWNER_USER_ID: 179407724335988736`) is dropped immediately.
-    3. Ryan MUST explicitly include Zero's tag (`<@1542285964213358633>`, `<@!1542285964213358633>`, or `@zero\b`) in raw message text.
-- **Discord Inline Reply Quarantine:**
-  - Discord native inline replies (`msg.reference`) automatically inject the referenced author into `msg.mentions`.
-  - In excluded channels and public Brock channels, Zero MUST NEVER treat `bot.user in msg.mentions` as an explicit mention. The mention must physically exist in `msg.content`.
+    1. Any message from any bot OTHER than Ivy is dropped immediately.
+    2. Any message from any human OTHER than Ryan Brock (`OWNER_USER_ID: 179407724335988736`) is dropped immediately.
+    3. Zero responds ONLY if explicitly tagged (`<@1542285964213358633>`, `<@!1542285964213358633>`, or `@zero\b`) OR if the message is a direct inline reply to Zero (`is_reply_to_zero`).
 - **Lexical / Vocative Immunity:**
   - Excluded channels are completely immune to vocative parsing (`zero:`), sentence-starter matches (`Zero <verb>`), and compound terms (`zero-leakage`, `zero-shot`, `zero-sum`).
 
