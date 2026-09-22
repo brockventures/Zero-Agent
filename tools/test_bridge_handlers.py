@@ -1194,9 +1194,89 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
             call_args = turn_queue.put.call_args[0][0]
             self.assertEqual(call_args["prompt"], "That just explains how you prevent tool spam, not how you prevent agy from exiting")
 
+    async def test_excluded_channel_quarantine_drops_ivy_bot_messages(self):
+        """Verify that any bot messages (like Ivy) in #baseball are dropped immediately."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        baseball_id = 1548196929308065893
+        msg = MagicMock()
+        msg.id = 888111
+        msg.channel.id = baseball_id
+        msg.channel.name = "baseball"
+        msg.channel.parent_id = None
+        msg.author.id = 1541205716948353074  # Ivy
+        msg.author.bot = True
+        msg.author.display_name = "Ivy"
+        msg.content = "Thanks for clearing the frequency, Zero. Back to the hedge fund."
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = [mock_bot.user]  # Even if Zero is in mentions from inline reply
+        msg.reference = MagicMock()
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_not_called()
+        ext_queue.put.assert_not_called()
+
+    async def test_excluded_channel_quarantine_drops_unaddressed_owner_messages(self):
+        """Verify that messages in #baseball from owner without explicit text mention are dropped."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        baseball_id = 1548196929308065893
+        msg = MagicMock()
+        msg.id = 888112
+        msg.channel.id = baseball_id
+        msg.channel.name = "baseball"
+        msg.channel.parent_id = None
+        msg.author.id = 179407724335988736  # Ryan Brock (Owner)
+        msg.author.bot = False
+        msg.author.display_name = "Ryan"
+        msg.content = "What do you think about zero-leakage modeling?"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = []
+        msg.reference = None
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_not_called()
+        ext_queue.put.assert_not_called()
+
+    async def test_excluded_channel_quarantine_accepts_explicitly_tagged_owner_commands(self):
+        """Verify that messages in #baseball explicitly tagging Zero from owner are processed."""
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        baseball_id = 1548196929308065893
+        msg = MagicMock()
+        msg.id = 888113
+        msg.channel.id = baseball_id
+        msg.channel.name = "baseball"
+        msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
+        msg.author.id = 179407724335988736  # Ryan Brock (Owner)
+        msg.author.bot = False
+        msg.author.display_name = "Ryan"
+        msg.content = "<@1542285964213358633> stop immediately"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = [mock_bot.user]
+        msg.reference = None
+        msg.attachments = []
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+        home_queue.put.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

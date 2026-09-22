@@ -73,6 +73,7 @@ from tools.bridge_state import (
     sync_credentials,
     PT_TZ,
     is_home_channel,
+    is_excluded_channel,
     BROCK_GUILD_ID,
     is_brock_guild,
     VAULT_CHANNEL_ID,
@@ -728,6 +729,21 @@ async def handle_message(
     # Never reply to ourselves
     if bot.user and msg.author.id == bot.user.id:
         return
+
+    # Dedicated Excluded Channel Quarantine (e.g. #baseball dedicated exclusively to Ivy):
+    # Strictly ignore all messages unless explicitly tagged in text by Ryan Brock (Owner).
+    # Bots (including Ivy) are NEVER permitted to trigger Zero in excluded channels.
+    if is_excluded_channel(msg.channel):
+        if getattr(msg.author, "bot", False) or getattr(msg.author, "id", None) != OWNER_USER_ID:
+            return
+        bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
+        has_explicit_tag = (
+            f"<@{bot_id}>" in content or
+            f"<@!{bot_id}>" in content or
+            bool(re.search(r"@zero\b", content, re.IGNORECASE))
+        )
+        if not has_explicit_tag:
+            return
 
     if is_home:
         # Home Turf (#zero-chat): strictly 1-on-1 pairing with Ryan; ignore other bots
