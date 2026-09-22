@@ -157,13 +157,14 @@ async def route_external_message(
     rules = rules or get_runtime_rules()
 
     # 1. Public channels in Brock Discord (e.g. #seerr-requests-and-chat, #server-updates, #seerr-notifications, #baseball)
-    # Strict Rule: Only respond to messages directly from Ryan Brock (owner) OR Ivy (peer bot in #baseball), explicitly tagging Zero.
+    # Strict Rule: In Brock Discord, Zero strictly ignores all bots (including Ivy) and ONLY responds to Ryan Brock explicitly tagging Zero.
     if is_brock_guild(msg):
-        is_ivy = (msg.author.id == IVY_USER_ID or msg.author.id == 1541205716948353074)
-        if msg.author.bot and not is_ivy:
+        if msg.author.bot:
             return True
 
-        is_owner = (msg.author.id == OWNER_USER_ID)
+        if msg.author.id != OWNER_USER_ID:
+            return True
+
         bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
         is_tagged = (
             (bot.user and bot.user in msg.mentions) or
@@ -173,7 +174,7 @@ async def route_external_message(
             re.search(r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])", content, re.IGNORECASE) is not None
         )
 
-        if not ((is_owner or is_ivy) and is_tagged):
+        if not is_tagged:
             return True
 
         # Ryan explicitly invoked Zero in a public Brock Discord channel
