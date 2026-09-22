@@ -31,30 +31,46 @@ STATIONS = {
     "SFO": {
         "city": "San Francisco",
         "station": "KSFO",
+        "lat": 37.62,
+        "lon": -122.38,
         "grid_url": "https://api.weather.gov/gridpoints/MTR/85,105/forecast",
         "series": "KXHIGHTSFO",
-        "std_dev": 1.8
+        "std_dev": 2.0,
+        "min_std": 1.8,
+        "skew": -1.8
     },
     "LAX": {
         "city": "Los Angeles",
         "station": "KLAX",
+        "lat": 33.94,
+        "lon": -118.41,
         "grid_url": "https://api.weather.gov/gridpoints/LOX/154,44/forecast",
         "series": "KXHIGHLAX",
-        "std_dev": 2.0
+        "std_dev": 2.2,
+        "min_std": 1.8,
+        "skew": -1.2
     },
     "CHI": {
         "city": "Chicago",
         "station": "KORD",
+        "lat": 41.97,
+        "lon": -87.91,
         "grid_url": "https://api.weather.gov/gridpoints/LOT/73,74/forecast",
         "series": "KXHIGHTCHI",
-        "std_dev": 2.2
+        "std_dev": 2.2,
+        "min_std": 1.6,
+        "skew": 0.0
     },
     "HOU": {
         "city": "Houston",
         "station": "KHOU",
+        "lat": 29.65,
+        "lon": -95.28,
         "grid_url": "https://api.weather.gov/gridpoints/HGX/65,97/forecast",
         "series": "KXHIGHTHOU",
-        "std_dev": 1.9
+        "std_dev": 2.0,
+        "min_std": 1.6,
+        "skew": 0.0
     }
 }
 
@@ -63,6 +79,8 @@ STARTING_BALANCE = 1000.00
 MAX_TRADE_RISK = 10.00       # $10 max per position
 MAX_TOTAL_EXPOSURE = 200.00  # $200 max open risk
 MIN_EDGE_THRESHOLD = 0.08    # +8% EV edge required to trade
+MIN_CONTRACT_PRICE = 0.08    # Ban buying longshots / lottery tickets under $0.08
+MAX_CONTRACT_PRICE = 0.92    # Ban buying heavy favorites over $0.92 (excessive downside risk)
 
 def load_domain_params(domain="weather"):
     """Load dynamic calibration parameters and risk limits from kalshi_model_params.json."""
@@ -169,8 +187,50 @@ def get_db():
             )
     return conn
 
+def standard_normal_pdf(x):
+    return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
+
 def normal_cdf(x, mean, std):
     return 0.5 * (1.0 + math.erf((x - mean) / (std * math.sqrt(2.0))))
+
+def skew_normal_cdf(x, mean, std, alpha=0.0):
+    """
+    Compute skew-normal CDF using Azzalini's formulation and Simpson numerical integration.
+    alpha = 0.0 -> symmetric Gaussian
+    alpha < 0.0 -> negative skew (marine layer: sharp upper cap, elongated lower tail)
+    alpha > 0.0 -> positive skew
+    """
+    if abs(alpha) < 1e-4:
+        return normal_cdf(x, mean, std)
+        
+    delta = alpha / math.sqrt(1.0 + alpha * alpha)
+    mean_z = delta * math.sqrt(2.0 / math.pi)
+    var_z = 1.0 - 2.0 * (delta ** 2) / math.pi
+    omega = std / math.sqrt(max(1e-6, var_z))
+    xi = mean - omega * mean_z
+    
+    z = (x - xi) / omega
+    if z <= -7.0:
+        return 0.0
+    if z >= 7.0:
+        return 1.0
+        
+    n = 60
+    a = -7.0
+    b = z
+    h = (b - a) / n
+    
+    def integrand(u):
+        return 2.0 * standard_normal_pdf(u) * (0.5 * (1.0 + math.erf(alpha * u / math.sqrt(2.0))))
+        
+    s = integrand(a) + integrand(b)
+    for i in range(1, n, 2):
+        s += 4.0 * integrand(a + i * h)
+    for i in range(2, n, 2):
+        s += 2.0 * integrand(a + i * h)
+        
+    cdf_val = (h / 3.0) * s
+    return max(0.0, min(1.0, cdf_val))
 
 def http_get_json(url, headers=None, timeout=8, max_retries=3, fallback_urls=None):
     """Fetch JSON with exponential backoff, jitter, and automated URL fallback cascade."""
@@ -254,24 +314,51 @@ def parse_strike_bounds(title, ticker):
             return "range", (float(m.group(1)), float(m.group(2)))
     return None, None
 
-def calculate_bracket_prob(strike_type, bounds, mean, std):
-    """Compute Gaussian probability mass for the bracket."""
+def calculate_bracket_prob(strike_type, bounds, mean, std, skew=0.0):
+    """Compute Gaussian or Skew-Gaussian probability mass for the bracket."""
     if strike_type == "less":
         # e.g. <70 means 69 or less (cutoff 69.5)
-        return normal_cdf(bounds - 0.5, mean, std)
+        return skew_normal_cdf(bounds - 0.5, mean, std, alpha=skew)
     elif strike_type == "greater":
         # e.g. >77 means 78 or greater (cutoff 77.5)
-        return 1.0 - normal_cdf(bounds + 0.5, mean, std)
+        return 1.0 - skew_normal_cdf(bounds + 0.5, mean, std, alpha=skew)
     elif strike_type == "range":
         low, high = bounds
         # range low to high means [low - 0.5, high + 0.5]
-        p_high = normal_cdf(high + 0.5, mean, std)
-        p_low = normal_cdf(low - 0.5, mean, std)
+        p_high = skew_normal_cdf(high + 0.5, mean, std, alpha=skew)
+        p_low = skew_normal_cdf(low - 0.5, mean, std, alpha=skew)
         return max(0.0, p_high - p_low)
     return 0.0
 
 
-def compute_ensemble_spread(models, base_std=2.0):
+def get_open_meteo_forecast(lat, lon):
+    """Fetch multi-model global numerical guidance (ECMWF IFS, GFS, ICON, GEM) from Open-Meteo."""
+    if not lat or not lon:
+        return []
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=temperature_2m_max&models=ecmwf_ifs025,gfs_seamless,icon_seamless,gem_seamless&timezone=America%2FLos_Angeles"
+    headers = {"User-Agent": "ZeroQuant/1.0 (ryan@brockventures.com)", "Accept": "application/json"}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode())
+            daily = data.get("daily", {})
+            results = []
+            model_map = [
+                ("ECMWF_IFS", "temperature_2m_max_ecmwf_ifs025"),
+                ("GFS_Global", "temperature_2m_max_gfs_seamless"),
+                ("ICON_Global", "temperature_2m_max_icon_seamless"),
+                ("GEM_Global", "temperature_2m_max_gem_seamless")
+            ]
+            for label, key in model_map:
+                vals = daily.get(key, [])
+                if vals and vals[0] is not None:
+                    f_val = round(float(vals[0]) * 1.8 + 32.0, 1)
+                    results.append((label, f_val))
+            return results
+    except Exception:
+        return []
+
+def compute_ensemble_spread(models, base_std=2.0, min_std=1.1):
     """Compute ensemble mean and regime-dependent dynamic standard deviation from model spread."""
     if not models:
         return None, base_std
@@ -282,20 +369,28 @@ def compute_ensemble_spread(models, base_std=2.0):
         variance = sum((t - mean) ** 2 for t in temps) / (len(temps) - 1)
         sample_std = math.sqrt(variance)
         # Regime-dependent blend: compresses when spread is narrow, expands when spread is wide
-        dynamic_std = round(min(3.8, max(1.1, 0.50 * sample_std + 0.50 * base_std + (spread - 1.5) * 0.20)), 2)
+        dynamic_std = round(min(4.5, max(min_std, 0.50 * sample_std + 0.50 * base_std + (spread - 1.5) * 0.20)), 2)
     else:
-        dynamic_std = base_std
+        dynamic_std = max(min_std, base_std)
     return round(mean, 2), dynamic_std
 
 def get_ensemble_weather_forecast(config):
-    """Ingest numerical guidance across NWS period, 12Z/00Z raw model grid, and hourly HRRR/NBM."""
+    """Ingest numerical guidance across Open-Meteo (ECMWF/GFS/ICON/GEM) and NOAA NWS (Period/Grid/HRRR)."""
     models = []
-    # 1. Period forecast
+    
+    # 1. Independent Global Numerical Models (ECMWF IFS, GFS, ICON, GEM)
+    lat = config.get("lat")
+    lon = config.get("lon")
+    if lat and lon:
+        om_models = get_open_meteo_forecast(lat, lon)
+        models.extend(om_models)
+
+    # 2. Local NOAA NWS Period forecast
     fc_p, _ = get_noaa_forecast(config)
     if fc_p is not None:
         models.append(("NWS_Period", float(fc_p)))
         
-    # 2. Raw numerical grid maxTemperature
+    # 3. NOAA Raw numerical grid maxTemperature
     try:
         raw_url = config.get("grid_url", "").replace("/forecast", "")
         if raw_url:
@@ -307,7 +402,7 @@ def get_ensemble_weather_forecast(config):
     except Exception:
         pass
         
-    # 3. High-resolution hourly guidance (HRRR/NBM hourly curve peak)
+    # 4. High-resolution hourly guidance (HRRR/NBM hourly curve peak)
     try:
         hourly_url = config.get("grid_url", "") + "/hourly"
         data = http_get_json(hourly_url, headers={"User-Agent": "ZeroQuant/1.0", "Accept": "application/geo+json"})
@@ -319,7 +414,8 @@ def get_ensemble_weather_forecast(config):
         pass
         
     base_std = config.get("std_dev", 2.0)
-    mean, dynamic_std = compute_ensemble_spread(models, base_std=base_std)
+    min_std = config.get("min_std", 1.1)
+    mean, dynamic_std = compute_ensemble_spread(models, base_std=base_std, min_std=min_std)
     return mean, dynamic_std, models
 
 def get_asos_observed_high(station_code):
@@ -384,18 +480,18 @@ def scan_markets():
             if not strike_type:
                 continue
                 
-            p_raw = calculate_bracket_prob(strike_type, bounds, effective_high, dynamic_std)
+            p_raw = calculate_bracket_prob(strike_type, bounds, effective_high, dynamic_std, skew=cfg.get("skew", 0.0))
             # Apply shrinkage calibration against market midpoint/ask
             ref_mkt = yes_ask if yes_ask > 0.0 else 0.50
             p_model = round(alpha * p_raw + (1.0 - alpha) * ref_mkt, 4)
             
-            # 1. Check BUY YES edge
-            if yes_ask > 0.0 and yes_ask < 0.95:
+            # 1. Check BUY YES edge (Tail risk filter: ban buying longshots <$0.08 or shorting <$0.08)
+            if yes_ask >= MIN_CONTRACT_PRICE and yes_ask <= MAX_CONTRACT_PRICE:
                 edge_yes = p_model - yes_ask
                 if edge_yes >= min_edge:
                     opportunities.append({
                         "city": cfg["city"],
-                        "forecast": forecast_high,
+                        "forecast": effective_high,
                         "ticker": ticker,
                         "title": title,
                         "side": "YES",
@@ -406,15 +502,15 @@ def scan_markets():
                         "market_obj": m
                     })
                     
-            # 2. Check BUY NO edge
-            if yes_bid > 0.05 and yes_bid <= 1.0:
-                no_ask = round(1.0 - yes_bid, 2)
+            # 2. Check BUY NO edge (Tail risk filter)
+            no_ask = round(1.0 - yes_bid, 2) if yes_bid > 0.0 else 1.0
+            if no_ask >= MIN_CONTRACT_PRICE and no_ask <= MAX_CONTRACT_PRICE:
                 p_model_no = 1.0 - p_model
                 edge_no = p_model_no - no_ask
                 if edge_no >= min_edge:
                     opportunities.append({
                         "city": cfg["city"],
-                        "forecast": forecast_high,
+                        "forecast": effective_high,
                         "ticker": ticker,
                         "title": title,
                         "side": "NO",
@@ -653,6 +749,10 @@ def execute_trade(conn, opp):
     tripped, cb_msg = check_intraday_circuit_breaker(conn)
     if tripped:
         return False, f"Trading halted: {cb_msg}"
+        
+    # Tail risk filter safety check for weather domain
+    if category == "weather" and (price < MIN_CONTRACT_PRICE or price > MAX_CONTRACT_PRICE):
+        return False, f"Price ${price:.2f} rejected by tail-risk safety filter (${MIN_CONTRACT_PRICE:.2f}-${MAX_CONTRACT_PRICE:.2f})"
     
     # Check if position already exists
     cur = conn.execute("SELECT * FROM positions WHERE ticker = ? AND status = 'OPEN'", (ticker,))
@@ -1138,7 +1238,7 @@ def settle_markets(conn):
             status = m.get("status")
             result = (m.get("result") or "").lower() # "yes" or "no"
             
-            if status in ["finalized", "closed"] and result in ["yes", "no"]:
+            if status in ["finalized", "closed", "determined", "settled"] and result in ["yes", "no"]:
                 won = (pos["side"].lower() == result)
                 settled_price = 1.00 if won else 0.00
                 payout = pos["contracts"] * settled_price

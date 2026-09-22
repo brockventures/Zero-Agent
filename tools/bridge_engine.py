@@ -104,11 +104,10 @@ class TurnCoordinator:
 
     def maybe_touch_beacon(self, state: str = "PROCESSING", interval: float = 10.0):
         """Update the bridge liveness beacon if enough time has elapsed."""
-        if self.mode == "home":
-            now = time.time()
-            if (now - self.last_beacon_touch) >= interval:
-                update_beacon(state, self.prompt, channel_id=self.channel_id)
-                self.last_beacon_touch = now
+        now = time.time()
+        if (now - self.last_beacon_touch) >= interval:
+            update_beacon(state, self.prompt, channel_id=self.channel_id)
+            self.last_beacon_touch = now
 
     async def update_status_ticker(
         self, ticker_enabled: Optional[bool] = None, force: bool = False
@@ -202,14 +201,15 @@ class TurnCoordinator:
         step_idle_timeout: float = 90.0,
         turn_timeout_seconds: float = 300.0,
         max_turn_ceiling: float = 1800.0,
+        has_active_children: bool = False,
     ) -> tuple[bool, str]:
         """Evaluate two-tier inactivity and hard turn ceilings.
 
         Returns: (is_timed_out, reason_description)
         """
         now = time.time()
-        is_step_idle = (now - self.last_activity_time) >= step_idle_timeout
-        is_turn_timeout = (now - self.last_activity_time) >= turn_timeout_seconds
+        is_step_idle = (now - self.last_activity_time) >= step_idle_timeout and not has_active_children
+        is_turn_timeout = (now - self.last_activity_time) >= turn_timeout_seconds and not has_active_children
         self.is_hard_ceiling = (now - self.turn_start_time) >= max_turn_ceiling
 
         if is_step_idle or is_turn_timeout or self.is_hard_ceiling:
@@ -302,10 +302,11 @@ class TurnCoordinator:
             elif stype == "agent_response":
                 delta = step.get("text_delta") or step.get("text") or step.get("content")
                 if delta and isinstance(delta, str) and delta.strip():
-                    self.had_substantive_delta = True
-                    if timer:
-                        timer.mark_event(is_token=True)
-                    self.current_action = "Drafting response..."
+                    if not is_internal_cli_leak(delta):
+                        self.had_substantive_delta = True
+                        if timer:
+                            timer.mark_event(is_token=True)
+                        self.current_action = "Drafting response..."
                 if step.get("state") == "DONE" and self.had_substantive_delta:
                     if self.agent_response_done_at is None:
                         self.agent_response_done_at = time.time()
@@ -403,11 +404,22 @@ class TurnCoordinator:
                             await on_recycle()
                         return self.format_diagnostic_beacon(proc_pid=proc_pid)
 
+                    has_children = False
+                    if proc_pid:
+                        try:
+                            from tools.process_probe import get_process_children
+                            has_children = len(get_process_children(proc_pid)) > 0
+                            if has_children:
+                                self.maybe_touch_beacon()
+                        except Exception:
+                            pass
+
                     # Watchdog timeout check
                     is_timeout, reason = self.check_watchdog_timeout(
                         step_idle_timeout=watchdog_timeout,
                         turn_timeout_seconds=watchdog_timeout,
                         max_turn_ceiling=max_turn_ceiling,
+                        has_active_children=has_children,
                     )
                     if is_timeout:
                         print(

@@ -180,7 +180,11 @@ async def dispatch_scheduled_prompt(
     # Nightly NAS log review: autonomous closed-loop triage
     if job_name in ("NAS Log Review", "NAS Log Review Check") or "sidecars.py nas_logs" in prompt or "nas_log_triage" in prompt:
         try:
-            from tools.nas_log_triage import run_nas_log_review, format_autonomous_triage_prompt
+            import importlib
+            import tools.nas_log_triage
+            importlib.reload(tools.nas_log_triage)
+            run_nas_log_review = tools.nas_log_triage.run_nas_log_review
+            format_autonomous_triage_prompt = tools.nas_log_triage.format_autonomous_triage_prompt
             ok, rep, extra = await _run_sidecar_job_async("nas_logs", "NAS Log Review", run_nas_log_review)
             total_issues = extra.get("total_issues", 0) if isinstance(extra, dict) else 0
 
@@ -201,11 +205,10 @@ async def dispatch_scheduled_prompt(
                     return
 
                 triage_prompt = format_autonomous_triage_prompt(extra)
-                status_msg = await dest_ch.send("🗄️ **[Nightly NAS Log Review]** *Candidate issues flagged across containers — initiating autonomous Zero triage & remediation...*")
                 await turn_queue.put({
                     "prompt": triage_prompt,
-                    "status_msg": status_msg,
-                    "reply_target": status_msg,
+                    "status_msg": None,
+                    "reply_target": dest_ch,
                     "attachments": [],
                     "is_steer": False,
                     "mode": "home",
@@ -646,14 +649,16 @@ async def dispatch_scheduled_prompt(
         if not ch:
             print(f"[Scheduler] Could not fetch channel {target_cid}")
             return
-        status_msg = await ch.send(f"⏱️ **[Scheduled: {job_name}]** *Starting execution...*")
+
+        # Do not send noisy interstitial "scheduled" placeholder messages into Discord scrollback
+        mode = "home" if target_cid == TARGET_CHANNEL_ID else "external"
         await turn_queue.put({
             "prompt": prompt,
-            "status_msg": status_msg,
-            "reply_target": status_msg,
+            "status_msg": None,
+            "reply_target": ch,
             "attachments": [],
             "is_steer": False,
-            "mode": "home",
+            "mode": mode,
             "channel_id": target_cid
         })
 
@@ -942,7 +947,8 @@ class KarakosScheduler:
                 # Autonomous Subprocess Watchdog & Reaper
                 try:
                     from tools.process_probe import reap_stale_agy_processes
-                    allowed_pids = set()
+                    from tools.bridge_state import get_all_active_pids
+                    allowed_pids = set(get_all_active_pids())
                     if br.active_proc and getattr(br.active_proc, "pid", None):
                         allowed_pids.add(br.active_proc.pid)
                     if br.ext_active_proc and getattr(br.ext_active_proc, "pid", None):
@@ -950,7 +956,14 @@ class KarakosScheduler:
                     for p in getattr(br, "channel_active_procs", {}).values():
                         if p and getattr(p, "pid", None):
                             allowed_pids.add(p.pid)
-                    reap_stale_agy_processes(max_age_seconds=600.0, allowed_active_pids=allowed_pids)
+                    try:
+                        from tools.bridge_daemons import daemon_manager
+                        for w in daemon_manager.workers.values():
+                            if w.proc and getattr(w.proc, "pid", None):
+                                allowed_pids.add(w.proc.pid)
+                    except Exception:
+                        pass
+                    reap_stale_agy_processes(allowed_active_pids=allowed_pids)
                 except Exception as re_err:
                     pass
 

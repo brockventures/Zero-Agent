@@ -161,8 +161,7 @@ def inspect_single_process(pid: int) -> Dict[str, Any]:
 
     # 5. Classify wait channel
     wchan = info["wchan"]
-    is_tty = any(t in info.get("stdin_target", "") for t in ("/dev/pts", "/dev/tty"))
-    if wchan in ("n_tty_read", "read_chan", "tty_read") or (wchan == "pipe_read" and is_tty):
+    if wchan in ("n_tty_read", "read_chan", "tty_read"):
         info["is_waiting_stdin"] = True
         info["diagnosis"] = f"Blocked on interactive STDIN read in kernel ({wchan})"
     elif wchan in NETWORK_WAIT_CHANNELS:
@@ -174,6 +173,9 @@ def inspect_single_process(pid: int) -> Dict[str, Any]:
     elif wchan in ("do_wait", "wait4"):
         info["is_waiting_child"] = True
         info["diagnosis"] = f"Waiting on child process ({wchan})"
+    elif wchan == "pipe_read":
+        # Internal IPC pipe wait (e.g. git reading from helper child, or pipeline stdout)
+        info["diagnosis"] = f"Waiting on IPC pipe read ({wchan})"
 
     return info
 
@@ -223,7 +225,7 @@ def diagnose_process_tree(root_pid: int, output_buffer: str = "") -> Dict[str, A
             continue
         if p["pid"] == root_pid and not prompt_detected:
             continue
-        if p["is_waiting_stdin"] or (prompt_detected and "wait" in p["wchan"]):
+        if p["is_waiting_stdin"] or (prompt_detected and ("wait" in p["wchan"] or "read" in p["wchan"])):
             culprit = p
             break
 
@@ -297,20 +299,102 @@ def get_process_age(pid: int) -> float | None:
     return None
 
 
+def get_process_cpu_ticks(pid: int) -> Optional[int]:
+    """Read total CPU ticks (utime + stime + cutime + cstime) from /proc/<pid>/stat."""
+    stat_file = Path(f"/proc/{pid}/stat")
+    if not stat_file.exists():
+        return None
+    try:
+        stat_str = stat_file.read_text()
+        rparen = stat_str.rfind(")")
+        if rparen == -1:
+            return None
+        rest = stat_str[rparen + 1:].split()
+        if len(rest) > 14:
+            utime = int(rest[11])
+            stime = int(rest[12])
+            cutime = int(rest[13])
+            cstime = int(rest[14])
+            return utime + stime + cutime + cstime
+    except Exception:
+        pass
+    return None
+
+
+def get_process_tree_cpu_ticks(pid: int) -> int:
+    """Sum CPU ticks for root PID and all its running children."""
+    total = get_process_cpu_ticks(pid) or 0
+    for cpid in get_process_children(pid):
+        total += get_process_cpu_ticks(cpid) or 0
+    return total
+
+
+_LAST_CPU_SAMPLES: Dict[int, Tuple[float, int]] = {}
+
+
+def is_process_making_progress(pid: int, sample_window: float = 0.05) -> bool:
+    """Check if process or its descendants are executing commands, running tools, or consuming CPU.
+
+    Returns True if:
+    1. The process has active running child processes (e.g. running bash, python, pytest, git).
+    2. CPU ticks have increased since last check or increase over a brief sample window.
+    """
+    children = get_process_children(pid)
+    if len(children) > 0:
+        return True
+
+    curr_ticks = get_process_tree_cpu_ticks(pid)
+    now = time.time()
+
+    if pid in _LAST_CPU_SAMPLES:
+        prev_ts, prev_ticks = _LAST_CPU_SAMPLES[pid]
+        _LAST_CPU_SAMPLES[pid] = (now, curr_ticks)
+        if curr_ticks > prev_ticks:
+            return True
+
+    if sample_window > 0:
+        time.sleep(sample_window)
+        next_ticks = get_process_tree_cpu_ticks(pid)
+        _LAST_CPU_SAMPLES[pid] = (time.time(), next_ticks)
+        return next_ticks > curr_ticks
+
+    _LAST_CPU_SAMPLES[pid] = (now, curr_ticks)
+    return False
+
+
 def reap_stale_agy_processes(
     max_age_seconds: float = 600.0,
     allowed_active_pids: set[int] | None = None,
-    dry_run: bool = False
+    dry_run: bool = False,
+    max_stall_seconds: float = 600.0,
 ) -> list[dict]:
-    """Scan and forcibly terminate stale or wedged agy CLI subprocesses.
-    
-    Terminates any agy process exceeding max_age_seconds (default: 600s / 10min)
-    or deadlocked on thread locks / futexes.
+    """Scan and forcibly terminate only true failure loops or dead wedged agy subprocesses.
+
+    Crucially, tasks making active forward progress (running tools, spawning child processes,
+    consuming CPU ticks) are NEVER terminated regardless of total wall-clock elapsed time.
+
+    Reaps ONLY:
+    1. Processes wedged on interactive console STDIN (e.g. password, confirmation prompt) for >= 60s.
+    2. Processes deadlocked on kernel futexes/locks with 0 CPU delta and 0 children for >= 120s.
+    3. Untracked orphaned processes (not in allowed/in-flight) with 0 children and 0 CPU progress for >= 300s.
+    4. Allowed processes that have experienced complete unbroken silence / stall (0 CPU delta, 0 children) for >= max_stall_seconds.
     """
-    import time
-    import signal
     reaped = []
-    allowed = allowed_active_pids or set()
+    allowed = set(allowed_active_pids or set())
+    if not allowed:
+        try:
+            from tools.bridge_state import get_all_active_pids
+            allowed = set(get_all_active_pids())
+        except Exception:
+            pass
+
+    daemon_pids = set()
+    try:
+        from tools.bridge_state import get_daemon_pids
+        daemon_pids = set(get_daemon_pids())
+    except Exception:
+        pass
+
     current_pid = os.getpid()
 
     try:
@@ -337,15 +421,52 @@ def reap_stale_agy_processes(
                 if age is None:
                     continue
 
-                if pid in allowed and age < 1800.0:
-                    continue
-
+                is_allowed = pid in allowed or pid in daemon_pids
+                is_daemon = pid in daemon_pids or ("--input-format=stream-json" in cmdline and "--print=" in cmdline)
                 diag = diagnose_process_tree(pid)
-                is_stale_timeout = age >= max_age_seconds
-                is_wedged_interactive = bool(diag.get("is_interactive_stdin") and age >= 60.0)
+                culprit = diag.get("culprit")
+                culprit_pid = culprit.get("pid") if (culprit and isinstance(culprit, dict)) else pid
+                culprit_age = get_process_age(culprit_pid) if culprit_pid != pid else age
+                if culprit_age is None:
+                    culprit_age = age
 
-                if is_stale_timeout or is_wedged_interactive:
-                    reason = f"Timeout exceeded ({age:.0f}s >= {max_age_seconds:.0f}s)" if is_stale_timeout else f"Wedged on interactive STDIN ({diag.get('summary')})"
+                # Check if process tree is actively making forward progress (tools running, CPU burning)
+                has_progress = is_process_making_progress(pid, sample_window=0.05)
+
+                should_reap = False
+                reason = ""
+
+                # Interactive STDIN wedge: requires true interactive stdin / prompt,
+                # the culprit process itself must be >= 60s old, AND the tree is not making forward progress
+                is_wedged_interactive = bool(
+                    diag.get("is_interactive_stdin")
+                    and culprit_age >= 60.0
+                    and not has_progress
+                )
+
+                if is_wedged_interactive:
+                    should_reap = True
+                    reason = f"Wedged on interactive STDIN ({diag.get('summary')})"
+                elif not has_progress:
+                    # No active child tools and no CPU progress
+                    is_lock_deadlock = bool(culprit and culprit.get("is_waiting_lock") and culprit_age >= 120.0)
+
+                    if is_lock_deadlock:
+                        should_reap = True
+                        reason = f"Deadlocked on thread futex/mutex with 0 CPU delta ({culprit.get('wchan')})"
+                    elif not is_allowed and not is_daemon and age >= 300.0:
+                        # Untracked orphan process with zero activity
+                        should_reap = True
+                        reason = f"Untracked orphan process with zero activity (age: {age:.0f}s)"
+                    elif is_allowed and not is_daemon and age >= 1800.0:
+                        # Allowed non-daemon turn exceeding hard ceiling with zero active progress
+                        should_reap = True
+                        reason = f"Stalled turn exceeded hard ceiling with zero activity ({age:.0f}s >= 1800s)"
+                else:
+                    # Process is making forward progress (has children or CPU advancing)
+                    should_reap = False
+
+                if should_reap:
                     entry = {
                         "pid": pid,
                         "cmdline": cmdline[:120],

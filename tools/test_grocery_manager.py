@@ -1,3 +1,7 @@
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
+
 import pytest
 from tools.grocery_manager import parse_raw_ingredient, compile_cart
 from tools.whole_foods_afx import build_afx_payload, normalize_ingredient_name

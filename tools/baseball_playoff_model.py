@@ -75,14 +75,33 @@ TEAM_NAMES = {
 }
 
 def get_db_connection():
-    return psycopg2.connect(
-        host=os.environ.get("IVY_DB_HOST", "127.0.0.1"),
-        port=5433,
-        dbname="baseball_data",
-        user="myuser",
-        password="mypassword",
-        connect_timeout=4
-    )
+    host = os.environ.get("IVY_DB_HOST")
+    if not host:
+        try:
+            from tools.sidecars import HOST_2_IP
+            host = HOST_2_IP
+        except Exception:
+            host = "127.0.0.1"
+    try:
+        return psycopg2.connect(
+            host=host,
+            port=5433,
+            dbname="baseball_data",
+            user="myuser",
+            password="mypassword",
+            connect_timeout=4
+        )
+    except Exception:
+        if host != "127.0.0.1":
+            return psycopg2.connect(
+                host="127.0.0.1",
+                port=5433,
+                dbname="baseball_data",
+                user="myuser",
+                password="mypassword",
+                connect_timeout=4
+            )
+        raise
 
 def resolve_dynamic_playoff_field():
     """Resolve dynamic playoff seeds 1-6 for AL and NL from Host 2 PostgreSQL standings and stats."""

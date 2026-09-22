@@ -101,7 +101,12 @@ def kill_process_tree(proc, sig=signal.SIGTERM):
 
 
 def harvest_transcript_response(conv_id: str | None) -> str | None:
-    """Harvest completed response from transcript files if stdout was truncated or cut off."""
+    """Harvest completed response from transcript files if stdout was truncated or cut off.
+
+    Enforces active turn boundary: stops immediately if a USER_INPUT or CHECKPOINT step is
+    encountered before finding a substantive PLANNER_RESPONSE, preventing prior turn responses
+    from ever being harvested or re-delivered.
+    """
     if not conv_id:
         return None
     brain_dir = Path("/root/.gemini/antigravity-cli/brain") / conv_id / ".system_generated" / "logs"
@@ -118,7 +123,19 @@ def harvest_transcript_response(conv_id: str | None) -> str | None:
                     continue
                 try:
                     data = json.loads(line_s)
-                    if data.get("type") == "PLANNER_RESPONSE":
+                    step_type = data.get("type")
+                    source = data.get("source")
+                    role = data.get("role")
+
+                    # Turn boundary check: Never cross into prior conversation turns or checkpoints
+                    if (
+                        step_type in ("USER_INPUT", "CHECKPOINT", "user", "USER")
+                        or source in ("USER_EXPLICIT", "USER")
+                        or role in ("user", "USER")
+                    ):
+                        break
+
+                    if step_type == "PLANNER_RESPONSE":
                         content = data.get("content")
                         if content and isinstance(content, str) and content.strip():
                             stripped = content.strip()
@@ -148,6 +165,7 @@ async def execute_agy_turn(
     last_word_bot_name: str = None,
     last_word_streak: int = 0,
     queued_at: float | None = None,
+    is_settle_reinvocation: bool = False,
 ):
     """Execute a single agy CLI turn with streaming status and output delivery."""
     global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session_keys
@@ -307,6 +325,16 @@ async def execute_agy_turn(
             timer.mark_boot_end()
             timer.mark_send()
             channel_active_procs[channel_id] = proc
+            try:
+                record_in_flight(
+                    channel_id=channel_id,
+                    prompt=prompt,
+                    conv_id=conv_id,
+                    status_msg_id=status_msg.id if status_msg else None,
+                    pid=proc.pid,
+                )
+            except Exception:
+                pass
             if mode == "home" and channel_id == TARGET_CHANNEL_ID:
                 active_proc = proc
             elif mode == "external":
@@ -570,6 +598,43 @@ async def execute_agy_turn(
         timer.status = "ERROR_3_MODEL_API"
     elif proc and proc.returncode not in (0, None):
         timer.status = f"ERROR_{proc.returncode}"
+
+    # TaskSettle Protocol: Detect and settle premature turn exits while background tasks are pending
+    if (
+        rules.get("task_settle_enabled", True)
+        and not is_settle_reinvocation
+        and not coord.timed_out
+        and not coord.last_agy_error
+    ):
+        try:
+            from tools.task_settle import evaluate_and_settle_turn
+
+            settle_timeout = float(rules.get("task_settle_timeout_seconds", 25.0))
+            was_settled, settled_text = await evaluate_and_settle_turn(
+                conv_id=active_cid,
+                channel_id=channel_id,
+                mode=mode,
+                status_msg=coord.status_msg,
+                reply_target=reply_target,
+                reinvoke_coro_fn=execute_agy_turn,
+                timeout_seconds=settle_timeout,
+                turn_kwargs={
+                    "author_name": author_name,
+                    "apply_presence_fn": apply_presence_fn,
+                    "button_choice_fn": button_choice_fn,
+                    "quick_choice_view_cls": quick_choice_view_cls,
+                    "is_last_word": is_last_word,
+                    "last_word_bot_id": last_word_bot_id,
+                    "last_word_bot_name": last_word_bot_name,
+                    "last_word_streak": last_word_streak,
+                    "queued_at": queued_at,
+                },
+            )
+            if was_settled:
+                # The reinvoked turn finished and already delivered the substantive final output
+                return settled_text
+        except Exception as settle_err:
+            print(f"[BridgeRunner] TaskSettle error: {settle_err}")
 
     await deliver_turn_output(
         output_text=final_text,

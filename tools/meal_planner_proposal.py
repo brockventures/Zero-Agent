@@ -24,7 +24,19 @@ RECIPES_FILE = os.path.join(DATA_DIR, "mealie_recipes.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "meal_history.json")
 ACTIVE_PLAN_FILE = os.path.join(DATA_DIR, "active_meal_plan.json")
 PT = ZoneInfo("America/Los_Angeles")
-MEALIE_BASE = "http://127.0.0.1:9090"
+
+for _p in ["/workspace", "/workspace/tools"]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from tools.nas_config import resolve_nas_config
+except ImportError:
+    from nas_config import resolve_nas_config
+
+_, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
+
+MEALIE_BASE = os.environ.get("MEALIE_BASE_URL", f"http://{HOST_2_IP}:9090")
 FAMILY_CALENDAR_ID = "family05249951047154432652@group.calendar.google.com"
 
 
@@ -78,8 +90,8 @@ for r in recipes:
 print(json.dumps(recipes))
 '''
         cmd = [
-            "ssh", "-i", "/secrets/id_ed25519", "-p", os.environ.get("NAS_SSH_PORT", "22"),
-            "-o", "StrictHostKeyChecking=no", "user@127.0.0.1",
+            "ssh", "-i", str(SSH_KEY), "-p", str(SSH_PORT),
+            "-o", "StrictHostKeyChecking=no", f"{SSH_USER}@{HOST_2_IP}",
             "docker exec -i mealie python -"
         ]
         res = subprocess.run(cmd, input=py_dump, capture_output=True, text=True, timeout=12)
@@ -431,8 +443,8 @@ con.execute('INSERT INTO group_meal_plans (created_at, update_at, date, entry_ty
 con.commit()
 """
                 ssh_cmd = [
-                    "ssh", "-i", "/secrets/id_ed25519", "-p", os.environ.get("NAS_SSH_PORT", "22"),
-                    "-o", "StrictHostKeyChecking=no", "user@127.0.0.1",
+                    "ssh", "-i", str(SSH_KEY), "-p", str(SSH_PORT),
+                    "-o", "StrictHostKeyChecking=no", f"{SSH_USER}@{HOST_2_IP}",
                     "docker exec -i mealie python -"
                 ]
                 subprocess.run(ssh_cmd, input=py_script, text=True, capture_output=True, timeout=10)

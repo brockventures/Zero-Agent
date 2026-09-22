@@ -12,6 +12,7 @@ import html
 import json
 import os
 import re
+import sys
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional

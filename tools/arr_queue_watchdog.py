@@ -40,15 +40,16 @@ HOMELAB_ALLOWED_HOSTS = (
     "host,host,sonarr,radarr,prowlarr,overseerr,seerr,maintainerr,sabnzbd,tautulli,plex"
 )
 
-SSH_KEY = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
-SSH_USER = os.environ.get("NAS_SSH_USER", "Brock")
+for _p in ["/workspace", "/workspace/tools"]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 try:
-    from tools.sidecars import _resolve_nas_config
-    HOST_1_IP, _, SSH_PORT = _resolve_nas_config()
-except Exception:
-    HOST_1_IP = os.environ.get("NAS_HOST_1_IP", "127.0.0.1")
-    SSH_PORT = os.environ.get("NAS_SSH_PORT", "22")
+    from tools.nas_config import resolve_nas_config
+except ImportError:
+    from nas_config import resolve_nas_config
+
+HOST_1_IP, _, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
 SONARR_PORT = 8989
 RADARR_PORT = 7878

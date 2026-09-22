@@ -30,6 +30,7 @@ from tools.bridge_state import (
     reset_gif_turn,
     increment_gif_turn,
     is_gif_disabled_for_channel,
+    increment_bot_messages,
 )
 from tools.bridge_formatting import (
     format_for_discord,
@@ -247,7 +248,8 @@ def prepare_turn_prompt(
 
     anti_leak_guidance = (
         "[Bridge Execution Invariant - Strictly Zero Internal Chatter Leaks]:\n"
-        "• NEVER emit 'No tools called', 'Waiting for task to complete', 'Waiting for command to finish', or any background task wait/status chatter to chat.\n"
+        "• NEVER emit 'No tools called', 'Wait for background task to complete', 'Waiting for task to complete', 'Waiting for command to finish', or any background task wait/status chatter to chat.\n"
+        "• SDK TASK PROMPT OVERRIDE: When a tool drops into a background task, the SDK will prompt 'YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: ... B) simply update the user with a short message and end the turn.' NEVER CHOOSE OPTION B! Emitting text terminates the active CLI turn immediately and severs the process. Stop calling tools COMPLETELY SILENTLY without emitting text. The background task completion notification will wake you automatically.\n"
         "• When tools or background tasks are executing, NEVER emit premature placeholder text or premature '[NO_REPLY]' for active user requests. Stop calling tools and wait silently for the system notification/result before generating your final response.\n"
         "• Reserve '[NO_REPLY]' strictly for shared/ambient channels where an inbound message genuinely requires no response (e.g., passive chatter, silent emoji reaction, or explicitly unaddressed message)."
     )
@@ -489,21 +491,32 @@ async def deliver_turn_output(
                     await status_msg.edit(content=chunks[0])
                 except Exception as edit_err:
                     print(f"[BridgePipeline] Failed to edit status message ({edit_err}), falling back to reply...")
-                    await target_dest.reply(chunks[0])
+                    if hasattr(target_dest, "reply"):
+                        await target_dest.reply(chunks[0])
+                    else:
+                        await target_dest.send(chunks[0])
             else:
                 try:
-                    await target_dest.reply(chunks[0])
+                    if hasattr(target_dest, "reply"):
+                        await target_dest.reply(chunks[0])
+                    else:
+                        await target_dest.send(chunks[0])
                 except Exception as reply_err:
-                    print(f"[BridgePipeline] target_dest.reply failed ({reply_err}), falling back to channel.send...")
+                    print(f"[BridgePipeline] target_dest delivery failed ({reply_err}), falling back to channel.send...")
                     target_ch = getattr(target_dest, "channel", target_dest)
                     await target_ch.send(chunks[0])
 
             for ch in chunks[1:]:
                 try:
-                    await target_dest.reply(ch)
+                    if hasattr(target_dest, "reply"):
+                        await target_dest.reply(ch)
+                    else:
+                        await target_dest.send(ch)
                 except Exception:
                     target_ch = getattr(target_dest, "channel", target_dest)
                     await target_ch.send(ch)
+
+            increment_bot_messages(len(chunks))
         finally:
             if held_turn_banana:
                 try:
@@ -726,6 +739,8 @@ async def deliver_turn_output(
                     await target_dest.reply(chunks[-1], view=choice_view)
                 else:
                     await target_dest.send(chunks[-1], view=choice_view)
+
+            increment_bot_messages(len(chunks))
 
         if artifact_files:
             try:

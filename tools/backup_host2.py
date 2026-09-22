@@ -21,27 +21,19 @@ from zoneinfo import ZoneInfo
 PT = ZoneInfo("America/Los_Angeles")
 RETENTION_DAYS = 14
 
-SSH_KEY = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
-SSH_PORT = os.environ.get("NAS_SSH_PORT", "22")
-SSH_USER = os.environ.get("NAS_SSH_USER", "Brock")
-HOST_2_IP = os.environ.get("NAS_HOST_2_IP", "127.0.0.1")
+for _p in ["/workspace", "/workspace/tools"]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from tools.nas_config import resolve_nas_config, run_ssh as _nas_run_ssh, DOCKER_ROOT
+except ImportError:
+    from nas_config import resolve_nas_config, run_ssh as _nas_run_ssh, DOCKER_ROOT
+
+_, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
 def run_ssh(cmd: str, timeout: int = 120) -> tuple[int, str, str]:
-    ssh_cmd = [
-        "ssh", "-i", str(SSH_KEY),
-        "-p", str(SSH_PORT),
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=5",
-        f"{SSH_USER}@{HOST_2_IP}",
-        cmd
-    ]
-    try:
-        res = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
-        return res.returncode, res.stdout, res.stderr
-    except subprocess.TimeoutExpired:
-        return -1, "", f"Command timed out after {timeout}s: {cmd[:60]}"
-    except Exception as e:
-        return -1, "", f"SSH execution exception: {e}"
+    return _nas_run_ssh(HOST_2_IP, cmd, timeout=timeout, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
 
 def prune_old_backups(dir_path: str, days: int = RETENTION_DAYS) -> int:
     cmd = f"find {dir_path} -type f -mtime +{days} -delete 2>/dev/null"
@@ -63,13 +55,13 @@ def backup_mealie(ts: str) -> tuple[bool, str]:
     dest_tar = f"/volumeUSB1/usbshare/backups/mealie/mealie_recipes_{ts}.tar.gz"
     
     # 1. WAL-safe SQLite backup
-    cmd_db = f"sudo sqlite3 /docker/mealie/data/mealie.db \".backup '{dest_db}'\""
+    cmd_db = f"sudo sqlite3 '{DOCKER_ROOT}/mealie/data/mealie.db' \".backup '{dest_db}'\""
     code, _, stderr = run_ssh(cmd_db, timeout=60)
     if code != 0:
         return False, f"mealie sqlite backup failed: {stderr.strip()}"
     
     # 2. Recipes & config tarball
-    cmd_tar = f"sudo tar -czf '{dest_tar}' -C /docker/mealie/data recipes .secret .session_secret 2>/dev/null"
+    cmd_tar = f"sudo tar -czf '{dest_tar}' -C '{DOCKER_ROOT}/mealie/data' recipes .secret .session_secret 2>/dev/null"
     code, _, stderr = run_ssh(cmd_tar, timeout=60)
     if code != 0:
         return False, f"mealie tar failed: {stderr.strip()}"
@@ -81,12 +73,12 @@ def backup_openmessage(ts: str) -> tuple[bool, str]:
     dest_db = f"/volumeUSB1/usbshare/backups/openmessage/messages_{ts}.db"
     dest_tar = f"/volumeUSB1/usbshare/backups/openmessage/session_{ts}.tar.gz"
 
-    cmd_db = f"sudo sqlite3 /docker/openmessage/data/messages.db \".backup '{dest_db}'\""
+    cmd_db = f"sudo sqlite3 '{DOCKER_ROOT}/openmessage/data/messages.db' \".backup '{dest_db}'\""
     code, _, stderr = run_ssh(cmd_db, timeout=60)
     if code != 0:
         return False, f"openmessage sqlite backup failed: {stderr.strip()}"
 
-    cmd_tar = f"sudo tar -czf '{dest_tar}' -C /docker/openmessage/data session.json control.token 2>/dev/null"
+    cmd_tar = f"sudo tar -czf '{dest_tar}' -C '{DOCKER_ROOT}/openmessage/data' session.json control.token 2>/dev/null"
     code, _, stderr = run_ssh(cmd_tar, timeout=60)
     if code != 0:
         return False, f"openmessage tar failed: {stderr.strip()}"
@@ -98,7 +90,7 @@ def backup_zero(ts: str) -> tuple[bool, str]:
     cmd = (
         f"sudo tar --exclude='backups' --exclude='*.log' --exclude='*.out' "
         f"--exclude='__pycache__' --exclude='scratch' --exclude='.git' "
-        f"-czf '{dest_tar}' -C /docker/discord-agy-agent "
+        f"-czf '{dest_tar}' -C '{DOCKER_ROOT}/discord-agy-agent' "
         f"memory data agents.md config docker-compose.yml entrypoint.sh bridge.py 2>/dev/null"
     )
     code, _, stderr = run_ssh(cmd, timeout=120)

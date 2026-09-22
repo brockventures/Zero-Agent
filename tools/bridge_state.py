@@ -32,6 +32,8 @@ SESSION_METADATA_FILE = DATA_DIR / "session_metadata.json"
 RESET_SESSION_KEYS_FILE = DATA_DIR / "reset_session_keys.json"
 BEACON_FILE = DATA_DIR / "liveness_beacon.json"
 BOT_STATUS_FILE = DATA_DIR / "bot_status.json"
+DAEMON_PIDS_FILE = DATA_DIR / "daemon_pids.json"
+BOT_STATS_FILE = DATA_DIR / "bot_stats.json"
 RUNTIME_RULES_FILE = Path("/workspace/config/runtime_rules.json")
 
 READONLY_NOTIFICATION_CHANNELS = {
@@ -165,7 +167,7 @@ def record_restart_intent(reason: str, initiator: str = "user"):
         print(f"[BridgeState] Error recording restart intent: {e}")
 
 
-def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, status_msg_id: int = None):
+def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, status_msg_id: int = None, pid: int = None):
     """Atomically record an in-flight turn for a channel to survive crashes/restarts."""
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -187,14 +189,20 @@ def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, st
         if isinstance(prev, dict) and prev.get("prompt") == prompt:
             attempts = prev.get("attempts", 1) + 1
 
-        data[cid_str] = {
+        effective_pid = pid if pid is not None else (prev.get("pid") if isinstance(prev, dict) else None)
+
+        entry = {
             "conv_id": conv_id,
             "status_msg_id": status_msg_id,
             "channel_id": int(channel_id) if str(channel_id).isdigit() else channel_id,
             "prompt": prompt,
             "attempts": attempts,
-            "ts": time.time()
+            "ts": time.time(),
         }
+        if effective_pid is not None:
+            entry["pid"] = effective_pid
+
+        data[cid_str] = entry
         # Maintain top-level fields for legacy callers/tests checking single dict
         data["prompt"] = prompt
         data["channel_id"] = int(channel_id) if str(channel_id).isdigit() else channel_id
@@ -202,6 +210,8 @@ def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, st
         data["attempts"] = attempts
         data["ts"] = time.time()
         data["status_msg_id"] = status_msg_id
+        if effective_pid is not None:
+            data["pid"] = effective_pid
 
         tmp = IN_FLIGHT_FILE.with_suffix(".tmp")
         with open(tmp, "w") as f:
@@ -209,6 +219,106 @@ def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, st
         tmp.replace(IN_FLIGHT_FILE)
     except Exception as e:
         print(f"[BridgeState] Error recording in-flight: {e}")
+
+
+def record_daemon_pids(pids: list[int] | set[int] | dict[str, int]) -> None:
+    """Atomically record persistent worker PIDs for watchdog discovery."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if isinstance(pids, dict):
+            pid_list = [int(v) for v in pids.values() if v is not None and str(v).isdigit()]
+        else:
+            pid_list = [int(p) for p in pids if p is not None and str(p).isdigit()]
+        tmp = DAEMON_PIDS_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump({"pids": sorted(list(set(pid_list))), "updated_at": time.time()}, f, indent=2)
+        tmp.replace(DAEMON_PIDS_FILE)
+    except Exception as e:
+        print(f"[BridgeState] Error recording daemon PIDs: {e}")
+
+
+def get_daemon_pids() -> set[int]:
+    """Retrieve recorded persistent worker PIDs from disk."""
+    pids = set()
+    if not DAEMON_PIDS_FILE.exists():
+        return pids
+    try:
+        with open(DAEMON_PIDS_FILE) as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                for p in data.get("pids", []):
+                    if isinstance(p, int):
+                        pids.add(p)
+            elif isinstance(data, list):
+                for p in data:
+                    if isinstance(p, int):
+                        pids.add(p)
+    except Exception:
+        pass
+    return pids
+
+
+def get_in_flight() -> dict:
+    """Retrieve currently recorded in-flight turn data from disk."""
+    if not IN_FLIGHT_FILE.exists():
+        return {}
+    try:
+        with open(IN_FLIGHT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_all_active_pids() -> set[int]:
+    """Return all active PIDs discovered across in-flight turns and daemon workers."""
+    active = set(get_daemon_pids())
+    try:
+        in_flight = get_in_flight()
+        if isinstance(in_flight, dict):
+            if isinstance(in_flight.get("pid"), int):
+                active.add(in_flight["pid"])
+            for v in in_flight.values():
+                if isinstance(v, dict) and isinstance(v.get("pid"), int):
+                    active.add(v["pid"])
+    except Exception:
+        pass
+    return active
+
+
+def get_bot_stats() -> dict:
+    """Retrieve persistent bot statistics including all-time message counters."""
+    defaults = {
+        "all_time_messages_sent": 5026,
+        "all_time_turns": 776,
+        "updated_at": time.time(),
+    }
+    if BOT_STATS_FILE.exists():
+        try:
+            with open(BOT_STATS_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if isinstance(d, dict):
+                    defaults.update(d)
+        except Exception:
+            pass
+    return defaults
+
+
+def increment_bot_messages(count: int = 1) -> int:
+    """Atomically increment all-time message count and persist to disk."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        stats = get_bot_stats()
+        stats["all_time_messages_sent"] = stats.get("all_time_messages_sent", 5026) + count
+        stats["updated_at"] = time.time()
+        tmp = BOT_STATS_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+        tmp.replace(BOT_STATS_FILE)
+        return stats["all_time_messages_sent"]
+    except Exception as e:
+        print(f"[BridgeState] Error incrementing bot messages: {e}")
+        return 5026
 
 
 def clear_in_flight(channel_id: int | str = None):

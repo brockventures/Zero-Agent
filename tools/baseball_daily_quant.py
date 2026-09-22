@@ -11,6 +11,7 @@ executes paper trades into /workspace/data/kalshi_paper.db.
 import argparse
 import json
 import math
+import os
 import sys
 import urllib.request
 from datetime import datetime
@@ -26,14 +27,33 @@ KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 
 
 def get_db_connection():
-    return psycopg2.connect(
-        host=os.environ.get("IVY_DB_HOST", "127.0.0.1"),
-        port=5433,
-        dbname="baseball_data",
-        user="myuser",
-        password="mypassword",
-        connect_timeout=4
-    )
+    host = os.environ.get("IVY_DB_HOST")
+    if not host:
+        try:
+            from tools.sidecars import HOST_2_IP
+            host = HOST_2_IP
+        except Exception:
+            host = "127.0.0.1"
+    try:
+        return psycopg2.connect(
+            host=host,
+            port=5433,
+            dbname="baseball_data",
+            user="myuser",
+            password="mypassword",
+            connect_timeout=4
+        )
+    except Exception:
+        if host != "127.0.0.1":
+            return psycopg2.connect(
+                host="127.0.0.1",
+                port=5433,
+                dbname="baseball_data",
+                user="myuser",
+                password="mypassword",
+                connect_timeout=4
+            )
+        raise
 
 # Team code aliases in Kalshi tickers
 KALSHI_ALIASES = {
@@ -355,6 +375,7 @@ def evaluate_daily_matchups(min_edge=0.05):
                 edge_yes = p_model - yes_ask
                 if edge_yes >= min_edge:
                     opportunities.append({
+                        "game_id": parts[1],
                         "ticker": ticker,
                         "title": title,
                         "team": team_code,
@@ -374,6 +395,7 @@ def evaluate_daily_matchups(min_edge=0.05):
                 edge_no = p_model_no - no_ask
                 if edge_no >= min_edge:
                     opportunities.append({
+                        "game_id": parts[1],
                         "ticker": ticker,
                         "title": title,
                         "team": team_code,
@@ -386,7 +408,14 @@ def evaluate_daily_matchups(min_edge=0.05):
                         "opp_sp": opp_sp
                     })
                     
-    return sorted(opportunities, key=lambda x: x["edge"], reverse=True)
+    # Best Execution: strictly select the single highest-edge vehicle per game matchup
+    best_by_game = {}
+    for opp in sorted(opportunities, key=lambda x: x["edge"], reverse=True):
+        gid = opp["game_id"]
+        if gid not in best_by_game:
+            best_by_game[gid] = opp
+            
+    return sorted(best_by_game.values(), key=lambda x: x["edge"], reverse=True)
 
 def settle_games(conn):
     """Check Kalshi API for finalized MLB games and settle positions."""
@@ -410,7 +439,7 @@ def settle_games(conn):
                 status = m.get("status")
                 result = (m.get("result") or "").lower()
                 
-                if status in ["finalized", "closed"] and result in ["yes", "no"]:
+                if status in ["finalized", "closed", "determined", "settled"] and result in ["yes", "no"]:
                     won = (pos["side"].lower() == result)
                     settled_price = 1.00 if won else 0.00
                     payout = pos["contracts"] * settled_price

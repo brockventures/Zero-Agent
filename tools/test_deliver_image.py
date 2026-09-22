@@ -1,6 +1,11 @@
 import os
+import sys
 import json
 import time
+
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
+
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock

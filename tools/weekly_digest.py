@@ -245,6 +245,7 @@ def get_recent_cashflow_rows() -> list[str]:
 FILTER_PATTERNS = [
     re.compile(r"\b(rosie|isaac)\s+(dropoff|pickup)\b", re.I),
     re.compile(r"\biready\s+begins\b", re.I),
+    re.compile(r"\b(rafaela('?s)?\s+class(es)?|isaac\s*[-–/]\s*rafaela)\b", re.I),
 ]
 
 

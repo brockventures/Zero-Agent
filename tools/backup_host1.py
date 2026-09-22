@@ -19,27 +19,19 @@ from zoneinfo import ZoneInfo
 PT = ZoneInfo("America/Los_Angeles")
 RETENTION_DAYS = 14
 
-SSH_KEY = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
-SSH_PORT = os.environ.get("NAS_SSH_PORT", os.environ.get("NAS_SSH_PORT", "22"))
-SSH_USER = os.environ.get("NAS_SSH_USER", "Brock")
-HOST_1_IP = os.environ.get("NAS_HOST_1_IP", os.environ.get("NAS_HOST_1_IP", "127.0.0.1"))
+for _p in ["/workspace", "/workspace/tools"]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from tools.nas_config import resolve_nas_config, run_ssh as _nas_run_ssh, DOCKER_ROOT
+except ImportError:
+    from nas_config import resolve_nas_config, run_ssh as _nas_run_ssh, DOCKER_ROOT
+
+HOST_1_IP, _, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
 def run_ssh(cmd: str, timeout: int = 180) -> tuple[int, str, str]:
-    ssh_cmd = [
-        "ssh", "-i", str(SSH_KEY),
-        "-p", str(SSH_PORT),
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=5",
-        f"{SSH_USER}@{HOST_1_IP}",
-        cmd
-    ]
-    try:
-        res = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
-        return res.returncode, res.stdout, res.stderr
-    except subprocess.TimeoutExpired:
-        return -1, "", f"Command timed out after {timeout}s: {cmd[:60]}"
-    except Exception as e:
-        return -1, "", f"SSH execution exception: {e}"
+    return _nas_run_ssh(HOST_1_IP, cmd, timeout=timeout, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
 
 def prune_old_backups(dir_path: str, days: int = RETENTION_DAYS) -> int:
     cmd = f"find {dir_path} -type f -mtime +{days} -delete 2>/dev/null"
@@ -64,14 +56,14 @@ def backup_home_assistant(ts: str) -> tuple[bool, str]:
     cmd_tar = (
         f"sudo tar --exclude='.git' --exclude='.cache' --exclude='backups' "
         f"--exclude='*.db*' --exclude='*.log' "
-        f"-czf '{dest_config}' -C /docker/homeassistant/config . 2>/dev/null"
+        f"-czf '{dest_config}' -C '{DOCKER_ROOT}/homeassistant/config' . 2>/dev/null"
     )
     code, _, stderr = run_ssh(cmd_tar, timeout=120)
     if code != 0:
         return False, f"ha config tar failed (code {code}): {stderr.strip()}"
 
     # 2. SQLite WAL-safe backup of history database
-    cmd_db = f"sudo sqlite3 /docker/homeassistant/config/home-assistant_v2.db \".backup '{dest_db}'\""
+    cmd_db = f"sudo sqlite3 '{DOCKER_ROOT}/homeassistant/config/home-assistant_v2.db' \".backup '{dest_db}'\""
     code_db, _, stderr_db = run_ssh(cmd_db, timeout=180)
     if code_db != 0:
         return False, f"ha sqlite db backup failed (code {code_db}): {stderr_db.strip()}"
@@ -84,7 +76,7 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
     dest_tar = f"/volumeUSB1/usbshare/backups/docker-appdata/appdata_critical_{ts}.tar.gz"
 
     # 1. Copy root compose stack
-    cmd_cp = f"cp /docker/appdata/docker-compose.yml '{dest_compose}'"
+    cmd_cp = f"cp '{DOCKER_ROOT}/appdata/docker-compose.yml' '{dest_compose}'"
     code_cp, _, stderr_cp = run_ssh(cmd_cp, timeout=30)
     if code_cp != 0:
         return False, f"docker-compose copy failed (code {code_cp}): {stderr_cp.strip()}"
@@ -94,7 +86,7 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
     cmd_tar = (
         f"sudo tar --exclude='backups' --exclude='cache' --exclude='Transcode' "
         f"--exclude='logs' --exclude='*.log' "
-        f"-czf '{dest_tar}' -C /docker/appdata "
+        f"-czf '{dest_tar}' -C '{DOCKER_ROOT}/appdata' "
         f"maintainerr seerr tautulli dockhand 2>/dev/null"
     )
     code, _, stderr = run_ssh(cmd_tar, timeout=180)

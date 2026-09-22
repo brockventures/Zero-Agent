@@ -3,12 +3,16 @@
 
 import json
 import os
+import sys
 import tempfile
 import time
-import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
+
+import pytest
 import tools.arr_queue_watchdog as aqw
 import tools.prowlarr_watchdog as pw
 

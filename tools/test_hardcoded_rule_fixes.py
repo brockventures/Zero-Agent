@@ -125,6 +125,9 @@ class TestHardcodedRuleFixes(unittest.TestCase):
                 {"summary": "Iready begins", "start": "2026-08-24", "end": "2026-09-12"},
                 {"summary": "Minimum Day Dismissal", "calendar": "Roy Cloud", "start": "2026-09-10", "end": "2026-09-11"},
                 {"summary": "pay bills", "calendar": "Emily", "start": "2026-09-07", "end": "2026-09-08"},
+                {"summary": "Rafaela classes begin", "start": "2026-09-07", "end": "2026-09-08"},
+                {"summary": "Rafaela class", "start": "2026-09-07T17:15:00-07:00", "end": "2026-09-07T18:15:00-07:00"},
+                {"summary": "Isaac-Rafaela", "start": "2026-09-07T08:00:00-07:00", "end": "2026-09-07T08:05:00-07:00"},
             ]
         })
 
@@ -138,6 +141,9 @@ class TestHardcodedRuleFixes(unittest.TestCase):
         self.assertFalse(any("Iready begins" in e for e in events))
         self.assertFalse(any("Minimum Day Dismissal" in e for e in events))
         self.assertFalse(any("pay bills" in e for e in events))
+        self.assertFalse(any("Rafaela classes begin" in e for e in events))
+        self.assertFalse(any("Rafaela class" in e for e in events))
+        self.assertFalse(any("Isaac-Rafaela" in e for e in events))
 
     def test_sidecars_email_triage_dynamic(self):
         """Verify nightly triage parses dates and categorizes without hardcoded haircut rules."""

@@ -195,15 +195,19 @@ with ThreadPoolExecutor(max_workers=10) as executor:
 print(json.dumps({'scanned': len(targets), 'flagged': flagged}))
 '''
 
-def _ssh_python_batch(host: str, since: str = "24h", timeout: int = 20) -> dict:
+def _ssh_python_batch(host: str, since: str = "24h", timeout: int = 20, port: str = None, key: str = None, user: str = None) -> dict:
     """Run the batch scanner remotely on a host via SSH in a single pass."""
     script = REMOTE_BATCH_SCANNER.replace("__SINCE__", since)
+    _, _, resolved_port = _resolve_nas_config()
+    p = port or resolved_port or SSH_PORT
+    k = key or SSH_KEY
+    u = user or SSH_USER
     try:
         proc = subprocess.run([
-            "ssh", "-i", SSH_KEY, "-p", SSH_PORT,
+            "ssh", "-i", k, "-p", p,
             "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=6",
-            f"{SSH_USER}@{host}", "python3 -"
+            f"{u}@{host}", "python3 -"
         ], input=script, capture_output=True, text=True, timeout=timeout)
         if proc.returncode == 0 and proc.stdout.strip():
             return json.loads(proc.stdout.strip())
@@ -236,7 +240,8 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
     total_scanned = 0
     host_errors = {}
 
-    hosts = [HOST_1_IP, HOST_2_IP]
+    h1, h2, _ = _resolve_nas_config()
+    hosts = [h1 or HOST_1_IP, h2 or HOST_2_IP]
     with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
         futures = {executor.submit(_ssh_python_batch, host, since=since): host for host in hosts}
         for future in futures:

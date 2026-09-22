@@ -20,6 +20,8 @@ if "/workspace" not in sys.path:
 DATA_DIR = Path("/workspace/data")
 OUTBOX_DIR = DATA_DIR / "outbox"
 PENDING_FILE = OUTBOX_DIR / "pending.jsonl"
+HISTORY_FILE = OUTBOX_DIR / "history.jsonl"
+DEFAULT_DEDUPE_WINDOW_SECONDS = 600
 
 KNOWN_CHANNELS = {
     "the-banana-stand": 1534436119888793750,
@@ -39,6 +41,7 @@ KNOWN_CHANNELS = {
     "server-updates": 1330447543477338202,
     "baseball": 1548196929308065893,
     "projects": 1548196930788524094,
+    "side-project": 1551465050072416286,
     "brock-house": 1550577908811178095,
     "vault": 1550577910757458015,
 }
@@ -58,10 +61,149 @@ def resolve_channel(channel_input: str | int) -> tuple[str, int | None]:
     ch_id = KNOWN_CHANNELS.get(clean_name)
     return clean_name, ch_id
 
-def queue_outbox_message(channel: str, content: str, source_turn: str = "zero") -> dict:
+def extract_summary_topic(content: str) -> str | None:
+    """Extract topic title if content is an executive summary."""
+    import re
+    m = re.search(r"(?:📋|🍌)?\s*\*{0,2}Executive Summary:\s*([^\*\n\r]+)\*{0,2}", content, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().lower()
+    return None
+
+def normalize_text_for_dedupe(text: str) -> str:
+    import re
+    cleaned = re.sub(r"[\*\_`#🍌📋]", "", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+    return cleaned
+
+def topic_match(t1: str | None, t2: str | None) -> bool:
+    """Fuzzy match two executive summary topic titles."""
+    if not t1 or not t2:
+        return False
+    t1, t2 = t1.lower().strip(), t2.lower().strip()
+    if t1 == t2 or t1 in t2 or t2 in t1:
+        return True
+    import re
+    words1 = set(re.findall(r"\w+", t1))
+    words2 = set(re.findall(r"\w+", t2))
+    stop = {"vs", "and", "or", "the", "in", "on", "for", "to", "of", "a", "an"}
+    w1 = words1 - stop
+    w2 = words2 - stop
+    if not w1 or not w2:
+        return False
+    overlap = len(w1 & w2) / max(len(w1), len(w2))
+    return overlap >= 0.5
+
+def is_duplicate_outbox_message(
+    channel: str,
+    content: str,
+    window_seconds: int = DEFAULT_DEDUPE_WINDOW_SECONDS
+) -> tuple[bool, str]:
+    """
+    Check if an identical message or duplicate executive summary was recently
+    queued or dispatched to the given channel within window_seconds.
+    """
+    clean_name, _ = resolve_channel(channel)
+    now = time.time()
+    new_norm = normalize_text_for_dedupe(content)
+    new_topic = extract_summary_topic(content)
+
+    # 1. Check currently pending queue
+    pending = get_pending_messages()
+    for p in pending:
+        if p.get("channel") != clean_name:
+            continue
+        p_ts = p.get("created_at", 0)
+        if now - p_ts > window_seconds:
+            continue
+        p_norm = normalize_text_for_dedupe(p.get("content", ""))
+        if p_norm == new_norm:
+            return True, f"identical message already pending in queue ({p.get('id')})"
+        p_topic = extract_summary_topic(p.get("content", ""))
+        if new_topic and p_topic and topic_match(new_topic, p_topic):
+            return True, f"executive summary for '{new_topic}' already pending in queue ({p.get('id')})"
+
+    # 2. Check recently dispatched history
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        h = json.loads(line)
+                    except Exception:
+                        continue
+                    if h.get("channel") != clean_name:
+                        continue
+                    h_ts = h.get("dispatched_at") or h.get("created_at", 0)
+                    if now - h_ts > window_seconds:
+                        continue
+                    h_norm = normalize_text_for_dedupe(h.get("content", ""))
+                    if h_norm == new_norm:
+                        return True, f"identical message dispatched to #{clean_name} {int(now - h_ts)}s ago ({h.get('id')})"
+                    h_topic = extract_summary_topic(h.get("content", ""))
+                    if new_topic and h_topic and topic_match(new_topic, h_topic):
+                        return True, f"executive summary for topic '{new_topic}' dispatched to #{clean_name} {int(now - h_ts)}s ago ({h.get('id')})"
+        except Exception as e:
+            print(f"[Outbox] Warning reading history for dedupe check: {e}", file=sys.stderr)
+
+    return False, ""
+
+def record_dispatched_history(omsg: dict):
+    """Record successfully dispatched message to history with 48h retention pruning."""
+    OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    record = {
+        "id": omsg.get("id"),
+        "channel": omsg.get("channel"),
+        "channel_id": omsg.get("channel_id"),
+        "content": omsg.get("content", ""),
+        "source": omsg.get("source"),
+        "dispatched_at": now,
+        "dispatched_at_iso": datetime.now(timezone.utc).isoformat()
+    }
+    retained = []
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            h = json.loads(line)
+                            if now - (h.get("dispatched_at") or 0) < 172800:
+                                retained.append(h)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    retained.append(record)
+    try:
+        tmp_file = OUTBOX_DIR / f"history.{int(now*1000)}.{os.getpid()}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            for r in retained:
+                f.write(json.dumps(r) + "\n")
+        tmp_file.replace(HISTORY_FILE)
+        try:
+            from tools.bridge_state import increment_bot_messages
+            increment_bot_messages(1)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[Outbox] Warning saving history: {e}", file=sys.stderr)
+
+def queue_outbox_message(
+    channel: str,
+    content: str,
+    source_turn: str = "zero",
+    dedupe_window: int = DEFAULT_DEDUPE_WINDOW_SECONDS,
+    force: bool = False
+) -> dict:
     """
     Queue a message for asynchronous delivery to another Discord channel.
     Uses atomic append to durable pending.jsonl queue.
+    Guarded by deduplication window (default 600s). Pass force=True to bypass.
     """
     clean_name, ch_id = resolve_channel(channel)
     content = content.strip()
@@ -80,6 +222,24 @@ def queue_outbox_message(channel: str, content: str, source_turn: str = "zero") 
     if len(content) > 10000:
         raise ValueError(f"Message content exceeds 10,000 character ceiling (len={len(content)}).")
 
+    # Deduplication Guard
+    if not force:
+        is_dup, reason = is_duplicate_outbox_message(clean_name, content, window_seconds=dedupe_window)
+        if is_dup:
+            print(f"[Outbox] Deduplication guard: Suppressed duplicate message to #{clean_name} ({reason})", file=sys.stderr)
+            return {
+                "id": f"suppressed-dedupe-{int(time.time()*1000)}-{os.getpid()}",
+                "channel": clean_name,
+                "channel_id": ch_id,
+                "content": content,
+                "source": source_turn,
+                "created_at": time.time(),
+                "created_at_iso": datetime.now(timezone.utc).isoformat(),
+                "status": "deduplicated",
+                "suppressed": True,
+                "reason": reason
+            }
+
     msg_record = {
         "id": f"outbox-{int(time.time()*1000)}-{os.getpid()}",
         "channel": clean_name,
@@ -87,7 +247,9 @@ def queue_outbox_message(channel: str, content: str, source_turn: str = "zero") 
         "content": content,
         "source": source_turn,
         "created_at": time.time(),
-        "created_at_iso": datetime.now(timezone.utc).isoformat()
+        "created_at_iso": datetime.now(timezone.utc).isoformat(),
+        "status": "queued",
+        "suppressed": False
     }
 
     OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -215,7 +377,10 @@ def dispatch_via_rest(omsg: dict) -> bool:
             method="POST"
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status in (200, 201)
+            success = resp.status in (200, 201)
+            if success:
+                record_dispatched_history(omsg)
+            return success
     except Exception as e:
         print(f"[Outbox] Error delivering message {omsg.get('id')} to {target_cid}: {e}", file=sys.stderr)
         dlq_file = DATA_DIR / "outbox" / "failed.jsonl"
@@ -252,6 +417,8 @@ def main():
     parser.add_argument("--list", "-l", action="store_true", help="List all currently queued pending messages")
     parser.add_argument("--flush", "-f", action="store_true", help="Drain and immediately dispatch all pending messages via Discord REST API")
     parser.add_argument("--discard", action="store_true", help="Purge pending queue without sending (discard messages)")
+    parser.add_argument("--force", action="store_true", help="Bypass deduplication guard and force message delivery")
+    parser.add_argument("--dedupe-window", type=int, default=DEFAULT_DEDUPE_WINDOW_SECONDS, help=f"Deduplication window in seconds (default: {DEFAULT_DEDUPE_WINDOW_SECONDS})")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
 
     args = parser.parse_args()
@@ -296,7 +463,19 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    record = queue_outbox_message(args.channel, args.message)
+    record = queue_outbox_message(
+        args.channel,
+        args.message,
+        dedupe_window=args.dedupe_window,
+        force=args.force
+    )
+    if record.get("suppressed"):
+        if args.json:
+            print(json.dumps(record, indent=2))
+        else:
+            print(f"⚠️ Message to #{record['channel']} suppressed by deduplication guard ({record.get('reason')}). Use --force to override.")
+        return
+
     if args.json:
         print(json.dumps(record, indent=2))
     else:

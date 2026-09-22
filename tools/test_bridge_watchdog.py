@@ -78,7 +78,8 @@ class TestBridgeWatchdog(unittest.TestCase):
         }
         bwatch.BEACON_FILE.write_text(json.dumps(beacon_data))
 
-        with patch("tools.bridge_watchdog.reap_stale_agy_processes", return_value=[]):
+        with patch("tools.bridge_watchdog.reap_stale_agy_processes", return_value=[]), \
+             patch("tools.bridge_watchdog.get_all_active_pids", return_value=set()):
             healthy, summary, details = bwatch.check_bridge_health(auto_heal=True)
             self.assertFalse(healthy)
             self.assertIn("PROCESSING", summary)

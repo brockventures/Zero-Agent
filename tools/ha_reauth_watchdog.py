@@ -103,6 +103,28 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
         if st == "setup_retry" and domain in BENIGN_STANDBY_DOMAINS:
             continue
 
+        # Auto-heal ZHA if coordinator is back online
+        if domain == "zha" and st in ("setup_retry", "setup_error"):
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            try:
+                if sock.connect_ex((os.environ.get("HUE_BRIDGE_IP", "127.0.0.1"), 6638)) == 0:
+                    reload_url = f"{base_url}/api/config/config_entries/entry/{entry_id}/reload"
+                    rel_req = urllib.request.Request(
+                        reload_url,
+                        data=b"{}",
+                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(rel_req, timeout=5) as rel_resp:
+                        if rel_resp.status == 200:
+                            print(f"[HAReauthWatchdog] 🔄 Auto-healed ZHA config entry {entry_id} (coordinator port 6638 open).", file=sys.stderr)
+                            continue
+            except Exception as ex:
+                print(f"[HAReauthWatchdog] Auto-heal probe error: {ex}", file=sys.stderr)
+            finally:
+                sock.close()
+
         is_reauth = "reauth" in str(reason).lower() or "authentication" in str(reason).lower() or st == "setup_error"
         unique_key = f"entry:{entry_id}"
         active_keys.add(unique_key)

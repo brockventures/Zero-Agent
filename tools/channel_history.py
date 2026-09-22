@@ -77,10 +77,14 @@ def record_message(
     if ch_key not in _history_store:
         _history_store[ch_key] = deque(maxlen=MAX_HISTORY_PER_CHANNEL)
 
-    # Avoid duplicate message IDs if already recorded
+    # Avoid duplicate message IDs if already recorded, or backfill id if previously recorded without id
     if msg_id is not None:
-        for existing in _history_store[ch_key]:
+        for existing in reversed(_history_store[ch_key]):
             if existing.get("id") == msg_id:
+                return existing
+            if existing.get("id") is None and existing.get("author") == author_name and existing.get("content") == content:
+                existing["id"] = msg_id
+                save_history()
                 return existing
 
     if not timestamp:
