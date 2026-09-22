@@ -139,6 +139,7 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         mock_channel.send = AsyncMock()
 
         with patch("tools.nas_docker_mcp._resolve_nas_config", return_value=("mock-host-1", "mock-host-2", "2222")), \
+             patch("tools.bridge_git_sync.sync_git_on_reload", return_value={"synced": True, "clean": True, "sha": "mocksha", "files": [], "message": "Clean", "error": None}), \
              patch("subprocess.run") as mock_run, \
              patch("tools.bridge_commands.record_restart_intent") as mock_record:
             await execute_container_restart(mock_channel, initiator="Ryan", reason="Unit test restart")

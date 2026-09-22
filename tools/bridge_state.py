@@ -152,6 +152,44 @@ def is_brock_guild(obj) -> bool:
     return False
 
 
+def is_reply_to_zero(msg, bot=None) -> bool:
+    """Check if a Discord message is a native inline reply to a message authored by Zero."""
+    if not msg or not getattr(msg, "reference", None):
+        return False
+
+    ref = msg.reference
+    # 1. Resolved reference (populated by discord.py when cached)
+    resolved = getattr(ref, "resolved", None)
+    if resolved and hasattr(resolved, "author"):
+        author = resolved.author
+        if bot and getattr(bot, "user", None) and getattr(author, "id", None) == bot.user.id:
+            return True
+        if str(getattr(author, "id", "")) == "1542285964213358633":
+            return True
+        a_name = str(getattr(author, "display_name", "") or getattr(author, "name", "")).lower()
+        if "zero" in a_name and getattr(author, "bot", False):
+            return True
+
+    # 2. Unresolved reference - check channel history by message ID
+    ref_id = getattr(ref, "message_id", None)
+    ch = getattr(msg, "channel", None)
+    ch_id = getattr(ch, "id", None)
+    if ref_id and ch_id:
+        try:
+            from tools.channel_history import get_recent_messages
+            for m in get_recent_messages(ch_id, limit=25):
+                if m.get("id") == ref_id:
+                    a_name = str(m.get("author", "")).lower()
+                    aid = str(m.get("author_id", ""))
+                    if aid == "1542285964213358633" or "zero" in a_name or (m.get("is_bot") and "zero" in a_name):
+                        return True
+                    break
+        except Exception:
+            pass
+
+    return False
+
+
 def is_thread_retitled(thread_id: int | str) -> bool:
     """Check if a thread has already received its post-turn retitle."""
     if RETITLED_THREADS_FILE.exists():
