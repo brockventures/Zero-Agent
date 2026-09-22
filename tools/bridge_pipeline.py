@@ -31,6 +31,7 @@ from tools.bridge_state import (
     increment_gif_turn,
     is_gif_disabled_for_channel,
     increment_bot_messages,
+    is_home_channel,
 )
 from tools.bridge_formatting import (
     format_for_discord,
@@ -605,10 +606,8 @@ async def deliver_turn_output(
         r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", final_text, flags=re.IGNORECASE
     ).strip()
 
-    # In Home Turf, silence tags, internal CLI leaks, and empty outputs are invalid - flag as incomplete turn so Ryan is never ghosted
-    if (
-        is_internal_cli_leak(final_text)
-        or final_text.strip()
+    is_silence_response = (
+        final_text.strip()
         in (
             "[NO_REPLY]",
             "NO_REPLY",
@@ -619,7 +618,19 @@ async def deliver_turn_output(
             "*(No output from agent)*",
         )
         or not final_text.strip()
-    ):
+    )
+
+    # In non-home channels (e.g. public Brock channels like #baseball, #server-updates), honor silence tags cleanly
+    reply_ch = getattr(reply_target, "channel", reply_target) if reply_target else None
+    if is_silence_response and not is_home_channel(reply_ch):
+        print(f"[BridgePipeline] Suppressed [NO_REPLY] in non-home channel")
+        if timer:
+            timer.mark_delivery_end()
+            timer.finish("NO_REPLY")
+        return
+
+    # In Home Turf, silence tags, internal CLI leaks, and empty outputs are invalid - flag as incomplete turn so Ryan is never ghosted
+    if is_internal_cli_leak(final_text) or is_silence_response:
         final_text = "⚠️ **Turn Incomplete:** Agent process completed turn without generating text output."
 
     # Parse [CHOICES: ...] interactive buttons
