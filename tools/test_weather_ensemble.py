@@ -40,5 +40,41 @@ class TestWeatherEnsemble(unittest.TestCase):
         self.assertEqual(paper_bot_job.get("hour_pt"), 5)
         self.assertEqual(paper_bot_job.get("minute_pt"), 15)
 
+    def test_min_std_floor(self):
+        # Even with identical model agreement, min_std must be respected
+        models = [("ECMWF_IFS", 65.0), ("GFS_Global", 65.0), ("NWS_Period", 65.0)]
+        mean, dynamic_std = compute_ensemble_spread(models, base_std=2.0, min_std=1.8)
+        self.assertEqual(mean, 65.0)
+        self.assertGreaterEqual(dynamic_std, 1.8)
+
+    def test_tail_risk_filter_bounds(self):
+        from tools.kalshi_paper_bot import MIN_CONTRACT_PRICE, MAX_CONTRACT_PRICE
+        self.assertEqual(MIN_CONTRACT_PRICE, 0.08)
+        self.assertEqual(MAX_CONTRACT_PRICE, 0.92)
+
+    def test_open_meteo_integration(self):
+        from tools.kalshi_paper_bot import get_open_meteo_forecast
+        models = get_open_meteo_forecast(37.62, -122.38)
+        # Should return list of tuples with ECMWF, GFS, ICON, GEM
+        labels = [m[0] for m in models]
+        self.assertIn("ECMWF_IFS", labels)
+        self.assertIn("GFS_Global", labels)
+        for label, temp in models:
+            self.assertGreater(temp, 40.0)
+            self.assertLess(temp, 115.0)
+
+    def test_coastal_negative_skew(self):
+        from tools.kalshi_paper_bot import calculate_bracket_prob
+        # Under symmetric Gaussian (skew=0.0), P(>70 | mean=66, std=2)
+        p_sym_hot = calculate_bracket_prob("greater", 70.0, mean=66.0, std=2.0, skew=0.0)
+        # Under negative coastal skew (skew=-1.8), right tail must be compressed
+        p_skew_hot = calculate_bracket_prob("greater", 70.0, mean=66.0, std=2.0, skew=-1.8)
+        self.assertLess(p_skew_hot, p_sym_hot)
+        
+        # Conversely, cold bracket (<64) should capture more probability mass
+        p_sym_cold = calculate_bracket_prob("less", 64.0, mean=66.0, std=2.0, skew=0.0)
+        p_skew_cold = calculate_bracket_prob("less", 64.0, mean=66.0, std=2.0, skew=-1.8)
+        self.assertGreater(p_skew_cold, p_sym_cold)
+
 if __name__ == "__main__":
     unittest.main()

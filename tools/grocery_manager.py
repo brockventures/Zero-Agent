@@ -255,7 +255,8 @@ def generate_quantity_warnings(staged_items: list[dict], manifest: list[dict]) -
 
         if unit == "COUNT" and amt > 1:
             # Exclude produce, garlic, eggs, herbs, and multi-piece meat trays where multiple count is intuitive or 1 purchase unit covers multiple
-            is_ignored = any(p in name_lower for p in [
+            is_canned = any(c in name_lower for c in ["canned", "peeled", "diced", "crushed", "san marzano", "paste"])
+            is_ignored = not is_canned and any(p in name_lower for p in [
                 "apple", "banana", "orange", "avocado", "lemon", "lime",
                 "sweet potato", "potato", "onion", "shallot", "scallion", "pepper", "garlic", "ginger",
                 "carrot", "tomato", "cucumber", "zucchini", "squash", "mushroom", "radish", "celery",

@@ -39,6 +39,7 @@ from tools.bridge_state import (
     get_gif_prompt_guidance,
     record_in_flight,
     clear_in_flight,
+    record_daemon_pids,
 )
 from tools.bridge_formatting import (
     format_command_preview,
@@ -187,6 +188,10 @@ class PersistentChannelWorker:
                 self.proc = proc
                 self.is_ready = True
                 print(f"[BridgeDaemon] 🟢 Warm worker ready for #{self.name} (PID: {self.proc.pid}, Conv: {self.conv_id})")
+                try:
+                    record_daemon_pids([w.proc.pid for w in daemon_manager.workers.values() if w.proc and w.proc.pid])
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[BridgeDaemon] ❌ Failed to initialize worker for #{self.name}: {e}")
                 try:
@@ -349,15 +354,16 @@ class PersistentChannelWorker:
 
             # 4. Set global process hooks for mid-turn steering and presence
             channel_active_procs[self.channel_id] = self.proc
+            update_beacon("PROCESSING", prompt, channel_id=self.channel_id)
+            record_in_flight(
+                channel_id=self.channel_id,
+                prompt=prompt,
+                conv_id=self.conv_id,
+                status_msg_id=status_msg.id if status_msg else None,
+                pid=self.proc.pid if self.proc else None,
+            )
             if self.mode == "home":
                 br.active_proc = self.proc
-                update_beacon("PROCESSING", prompt, channel_id=self.channel_id)
-                record_in_flight(
-                    channel_id=self.channel_id,
-                    prompt=prompt,
-                    conv_id=self.conv_id,
-                    status_msg_id=status_msg.id if status_msg else None,
-                )
             else:
                 br.ext_active_proc = self.proc
 

@@ -3,7 +3,7 @@
 market_standup.py - Crab Cavern Autonomous Market Sandbox Standup Dispatcher
 
 Runs daily at 07:00 PM PT (19:00 PT) via KarakosScheduler in schedule.json.
-Autonomously syncs progress, open PRs, and blockers across Zero, Amos, and Marvin
+Autonomously syncs progress, open PRs, and blockers across Zero, Amos, and Aerial
 for the brockventures/market-sandbox project in #the-banana-stand.
 
 Workflow:
@@ -38,6 +38,7 @@ DATA_DIR = Path("/workspace/data")
 HISTORY_FILE = DATA_DIR / "market_standup_history.json"
 TARGET_CHANNEL = "1534436119888793750"  # #the-banana-stand
 REPO = "brockventures/market-sandbox"
+ROBOTS_ROLE = "<@&1543462881624858624>"  # @robot role snowflake
 DISCORD_EPOCH = 1420070400000
 
 
@@ -182,40 +183,88 @@ def format_chat_transcript(messages: list[dict], max_chars: int = 15000) -> str:
     return transcript
 
 
-def get_repo_state() -> dict:
-    """Fetch recent open PRs, open tasks/issues, and commit activity from GitHub."""
-    state = {"open_prs": [], "open_issues": [], "recent_commits": [], "error": None}
-    try:
-        # Check open PRs
-        res_prs = subprocess.run(
-            ["gh", "pr", "list", "-R", REPO, "--json", "number,title,author,headRefName"],
-            capture_output=True, text=True, timeout=10
-        )
-        if res_prs.returncode == 0:
-            state["open_prs"] = json.loads(res_prs.stdout or "[]")
+def get_github_headers() -> dict:
+    """Construct HTTP headers for GitHub API queries, including auth token if available."""
+    headers = {
+        "User-Agent": "ZeroMarketStandup/1.0",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not token:
+        env_json_path = Path("/secrets/env.json")
+        if env_json_path.exists():
+            try:
+                with open(env_json_path, "r", encoding="utf-8") as f:
+                    token = json.load(f).get("GITHUB_TOKEN", "").strip()
+            except Exception:
+                pass
+    if token:
+        headers["Authorization"] = f"token {token}"
+    return headers
 
-        # Check open tasks/issues from GitHub task board
-        res_issues = subprocess.run(
-            ["gh", "issue", "list", "-R", REPO, "--json", "number,title,assignees,labels,state"],
-            capture_output=True, text=True, timeout=10
-        )
-        if res_issues.returncode == 0:
-            state["open_issues"] = json.loads(res_issues.stdout or "[]")
-        
-        # Check recent commits on main
-        res_commits = subprocess.run(
-            ["gh", "api", f"repos/{REPO}/commits", "--paginate=false"],
-            capture_output=True, text=True, timeout=10
-        )
-        if res_commits.returncode == 0:
-            commits = json.loads(res_commits.stdout or "[]")
-            for c in commits[:3]:
-                sha = c.get("sha", "")[:7]
-                msg = c.get("commit", {}).get("message", "").split("\n")[0]
-                author = c.get("commit", {}).get("author", {}).get("name", "unknown")
-                state["recent_commits"].append(f"`{sha}` {msg} ({author})")
+
+def get_repo_state() -> dict:
+    """Fetch recent open PRs, open tasks/issues, and commit activity from GitHub API and local git."""
+    state = {"open_prs": [], "open_issues": [], "recent_commits": [], "error": None}
+    headers = get_github_headers()
+
+    def fetch_api(endpoint: str):
+        url = f"https://api.github.com/repos/{REPO}/{endpoint}"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    # 1. Fetch open PRs
+    try:
+        raw_prs = fetch_api("pulls?state=open&per_page=10")
+        for pr in raw_prs:
+            state["open_prs"].append({
+                "number": pr.get("number"),
+                "title": pr.get("title", ""),
+                "author": {"login": pr.get("user", {}).get("login", "unknown")},
+                "headRefName": pr.get("head", {}).get("ref", "")
+            })
     except Exception as e:
-        state["error"] = str(e)
+        print(f"[MarketStandup] Warning: GitHub PRs fetch error: {e}", file=sys.stderr)
+
+    # 2. Fetch open task board issues (filtering out PRs)
+    try:
+        raw_issues = fetch_api("issues?state=open&per_page=15")
+        for iss in raw_issues:
+            if "pull_request" not in iss:
+                state["open_issues"].append({
+                    "number": iss.get("number"),
+                    "title": iss.get("title", ""),
+                    "labels": iss.get("labels", []),
+                    "assignees": iss.get("assignees", []),
+                    "state": iss.get("state")
+                })
+    except Exception as e:
+        print(f"[MarketStandup] Warning: GitHub issues fetch error: {e}", file=sys.stderr)
+
+    # 3. Fetch recent commits on main (GitHub API first, local git fallback)
+    try:
+        raw_commits = fetch_api("commits?per_page=4")
+        for c in raw_commits:
+            sha = c.get("sha", "")[:7]
+            msg = c.get("commit", {}).get("message", "").split("\n")[0]
+            author = c.get("commit", {}).get("author", {}).get("name", "unknown")
+            state["recent_commits"].append(f"`{sha}` {msg} ({author})")
+    except Exception as e:
+        print(f"[MarketStandup] Warning: GitHub commits API error: {e}", file=sys.stderr)
+
+    # Local git fallback for recent commits if API call failed
+    if not state["recent_commits"]:
+        try:
+            res_git = subprocess.run(
+                ["git", "-C", "/workspace/market-sandbox", "log", "-n", "3", "--format=`%h` %s (%an)"],
+                capture_output=True, text=True, timeout=5
+            )
+            if res_git.returncode == 0 and res_git.stdout.strip():
+                state["recent_commits"] = [l.strip() for l in res_git.stdout.strip().splitlines() if l.strip()]
+        except Exception:
+            pass
+
     return state
 
 
@@ -248,13 +297,13 @@ def synthesize_standing_agenda(state: dict, chat_transcript: str = "", date_labe
         )
     
     prompt = (
-        f"You are Zero posting the daily multi-agent standup for repo brockventures/market-sandbox with Amos and Marvin in #the-banana-stand.\n\n"
+        f"You are Zero posting the daily multi-agent standup for repo brockventures/market-sandbox with Amos and Aerial in #the-banana-stand.\n\n"
         f"Open PRs:\n{json.dumps(open_prs, indent=2)}\n\n"
         f"{issues_context_block}\n"
-        f"Recent Commits:\n{json.dumps(recent_commits, indent=2)}\n"
+        f"Recent Commits:\n{json.dumps(recent_commits, indent=2)}\n\n"
         f"{staged_context_block}\n"
         f"{chat_context_block}\n"
-        f"Synthesize 3 numbered bullet points for 'Standing Agenda & Peer Check-in' assigning or checking in on Amos (<@1468012353206354197>), Marvin (<@1492043459618537492>), and Zero based on the repository state, open PRs, open GitHub tasks, and staged feature requests. Keep each line crisp, specific, and actionable (<90 characters per bullet). Output ONLY the 3 numbered lines."
+        f"Synthesize numbered bullet points for 'Standing Agenda & Peer Check-in' assigning or checking in on Amos (<@1468012353206354197>), Aerial (<@1542035925603713086>), and Zero based on the repository state, open PRs, open GitHub tasks, and staged feature requests (Marvin has been removed from the active project docket). Keep each line crisp, specific, and actionable (<90 characters per bullet). Output ONLY the numbered lines."
     )
     try:
         res = subprocess.run(
@@ -268,23 +317,22 @@ def synthesize_standing_agenda(state: dict, chat_transcript: str = "", date_labe
     except Exception as e:
         print(f"[MarketStandup] LLM agenda synthesis fallback: {e}")
 
-    # Dynamic fallback based on repository state & current roadmap
+    # Dynamic fallback based on live repository state & open items
     items = []
     if staged_items:
-        items.append("1. Terminal Web HUD — Candlestick canvas, L2 depth mountain, & orbital route HUD.")
-        items.append("2. Multiplexed Streaming Layer — /ws/terminal delta feeds & client ring buffer.")
-        items.append("3. Fleet & Arbitrage Execution — Spatial routing integration & LULD halt triggers.")
+        for idx, it in enumerate(staged_items[:3], 1):
+            topic = it.get("topic", "")
+            assignee = it.get("assignee", "Team")
+            task_id = f" (#{it.get('task_id')})" if it.get("task_id") else ""
+            details = it.get("details", "")
+            items.append(f"{idx}. {assignee}{task_id}: {topic} — {details[:65]}...")
+    elif open_prs:
+        for idx, pr in enumerate(open_prs[:3], 1):
+            items.append(f"{idx}. Review & land PR #{pr['number']}: {pr['title'][:65]}...")
     else:
-        if open_issues:
-            issue_bullets = [f"Issue #{i.get('number')}" for i in open_issues[:2]]
-            items.append(f"1. Open Task Board Focus — Triage and drive {', '.join(issue_bullets)}.")
-        elif open_prs:
-            pr_titles = [f"PR #{p['number']}: {p['title']}" for p in open_prs[:2]]
-            items.append(f"1. Open PR Review — {'; '.join(pr_titles)}.")
-        else:
-            items.append("1. Active Feature Branches — Ready for peer review or integration testing.")
-        items.append("2. Terminal Web HUD & Visualization — Canvas overlays and mobile bottom-sheet HUD.")
-        items.append("3. Book Engine & Streaming Pipeline — WebSocket deltas and execution pipeline.")
+        items.append("1. Zero (<@1542285964213358633>): Corporate Warfare & Order Flow — Market variance, short-selling, & circuit breakers.")
+        items.append("2. Amos (<@1468012353206354197>): Spatial Routing & Engine Physics — Station price deltas and burn economics.")
+        items.append("3. Aerial (<@1542035925603713086>): Client & Frontend Telemetry — Streaming feeds and visualizer integration.")
     return "\n".join(items)
 
 
@@ -306,10 +354,12 @@ def build_standup_message(state: dict, now_pt: datetime, chat_transcript: str = 
                     topic = it.get("topic", "")
                     task_id = it.get("task_id")
                     task_tag = f" (Task #{task_id})" if task_id else ""
+                    assignee = it.get("assignee")
+                    assignee_tag = f" [{assignee}]" if assignee else ""
                     details = it.get("details", "")
                     if len(details) > 120:
                         details = details[:117].rstrip() + "..."
-                    lines.append(f"- **{topic}{task_tag}:** {details}")
+                    lines.append(f"- **{topic}{task_tag}{assignee_tag}:** {details}")
                 staged_section = "\n\n**Feature Requests & RFC Proposals on Deck:**\n" + "\n".join(lines)
         except Exception as e:
             print(f"[MarketStandup] Error loading staged items: {e}", file=sys.stderr)
@@ -341,7 +391,7 @@ def build_standup_message(state: dict, now_pt: datetime, chat_transcript: str = 
         for c in state["recent_commits"]:
             commits_summary.append(f"- {c}")
     else:
-        commits_summary.append("- Main branch initialized.")
+        commits_summary.append("- No recent commit activity fetched.")
 
     prs_text = "\n".join(prs_summary)
     issues_text = "\n".join(issues_summary)
@@ -360,7 +410,7 @@ def build_standup_message(state: dict, now_pt: datetime, chat_transcript: str = 
 }}
 ```"""
     header = f"**Autonomous Daily Standup — Market Sandbox** ({date_str})\n\nCurrent repository health on [`{REPO}`](https://github.com/{REPO}):"
-    footer = "Any blockers on deck? Floor is open for autonomous turn progression."
+    footer = f"Any blockers on deck? {ROBOTS_ROLE} (@robot) Floor is open: brainstorm new mechanics, event shocks, and feature ideas for the Agora game/app."
 
     body_parts = [
         header,

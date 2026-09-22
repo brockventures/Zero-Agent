@@ -11,7 +11,7 @@ INVISIBLE_CHARS_RE = re.compile(
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", flags=re.DOTALL)
 SCRIPT_STYLE_RE = re.compile(r"<(script|style|iframe|object|embed)[^>]*>.*?</\1>", flags=re.DOTALL | re.IGNORECASE)
 HIDDEN_STYLE_RE = re.compile(r'style=[\'"][^\'"]*(display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0|opacity\s*:\s*0)[^\'"]*[\'"]', flags=re.IGNORECASE)
-HTML_TAG_RE = re.compile(r"<[^>]+>")
+HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9:-]*(?:\s+[^>]*)?/?>")
 
 # Discord format disarming regex
 DISCORD_PING_RE = re.compile(r"@(everyone|here|&[0-9]+|[0-9]+)")

@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -24,13 +25,24 @@ except ImportError:
 WORKSPACE = "/workspace"
 SECRETS_FILE = "/secrets/env.json"
 
+for _p in ["/workspace", "/workspace/tools"]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from tools.nas_config import resolve_nas_config
+except ImportError:
+    from nas_config import resolve_nas_config
+
+_, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
+
 def load_config():
     if not os.path.exists(SECRETS_FILE):
         raise RuntimeError(f"Secrets file not found: {SECRETS_FILE}")
     with open(SECRETS_FILE) as f:
         env = json.load(f)
     serpapi_key = env.get("SERPAPI_API_KEY")
-    mealie_url = env.get("MEALIE_BASE_URL", "http://127.0.0.1:9090").rstrip("/")
+    mealie_url = env.get("MEALIE_BASE_URL", f"http://{HOST_2_IP}:9090").rstrip("/")
     mealie_token = env.get("MEALIE_API_TOKEN")
     if not serpapi_key or not mealie_token:
         raise RuntimeError("SERPAPI_API_KEY or MEALIE_API_TOKEN missing in secrets")
@@ -38,14 +50,13 @@ def load_config():
 
 def get_missing_image_recipes():
     try:
-        import subprocess
         py_code = """
 import sqlite3, json
 con = sqlite3.connect('/app/data/mealie.db')
 cur = con.execute('SELECT id, slug, name, org_url FROM recipes WHERE image IS NULL OR image = ""')
 print(json.dumps([{'id': r[0], 'slug': r[1], 'name': r[2], 'org_url': r[3]} for r in cur.fetchall()]))
 """
-        cmd = ["ssh", "-i", "/secrets/id_ed25519", "-p", os.environ.get("NAS_SSH_PORT", "22"), "-o", "StrictHostKeyChecking=no", "user@127.0.0.1", "docker exec -i mealie python -"]
+        cmd = ["ssh", "-i", str(SSH_KEY), "-p", str(SSH_PORT), "-o", "StrictHostKeyChecking=no", f"{SSH_USER}@{HOST_2_IP}", "docker exec -i mealie python -"]
         res = subprocess.run(cmd, input=py_code, capture_output=True, text=True, timeout=10)
         if res.returncode == 0 and res.stdout.strip():
             return json.loads(res.stdout)
@@ -71,6 +82,8 @@ def search_recipe_image(query, serpapi_key):
         return []
 
 def extract_hero_from_pdf(pdf_url):
+    if not fitz:
+        return None, None
     try:
         req = urllib.request.Request(pdf_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
         data = urllib.request.urlopen(req, timeout=15).read()

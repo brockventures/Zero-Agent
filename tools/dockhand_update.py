@@ -4,44 +4,16 @@ import sys, subprocess, json, urllib.request, time
 import os
 import urllib.parse
 
-SSH_KEY = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
-SSH_USER = os.environ.get("NAS_SSH_USER", "Brock")
+for _p in ["/workspace", "/workspace/tools"]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-def _resolve_nas_config():
-    ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
-    host_1 = os.environ.get("NAS_HOST_1_IP")
-    host_2 = os.environ.get("NAS_HOST_2_IP")
+try:
+    from tools.nas_config import resolve_nas_config
+except ImportError:
+    from nas_config import resolve_nas_config
 
-    if os.path.exists("/secrets/env.json"):
-        try:
-            with open("/secrets/env.json") as f:
-                d = json.load(f)
-                if d.get("NAS_SSH_PORT"):
-                    ssh_port = str(d["NAS_SSH_PORT"])
-                if d.get("NAS_HOST_1_IP"):
-                    host_1 = d["NAS_HOST_1_IP"]
-                elif d.get("HA_BASE_URL"):
-                    host_1 = urllib.parse.urlparse(d["HA_BASE_URL"]).hostname
-        except Exception:
-            pass
-
-    if not host_2 and os.path.exists("/secrets/env.json"):
-        try:
-            with open("/secrets/env.json") as f:
-                d = json.load(f)
-                if d.get("NAS_HOST_2_IP"):
-                    host_2 = d["NAS_HOST_2_IP"]
-        except Exception:
-            pass
-
-    if host_1 and not host_2:
-        parts = host_1.split(".")
-        if len(parts) == 4 and parts[-1] == "82":
-            host_2 = ".".join(parts[:3] + ["84"])
-
-    return host_1 or os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), host_2 or os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), ssh_port
-
-HOST_1_IP, HOST_2_IP, SSH_PORT = _resolve_nas_config()
+HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
 SSH_82 = ["ssh", "-i", SSH_KEY, "-p", SSH_PORT, "-o", "BatchMode=yes", f"{SSH_USER}@{HOST_1_IP}"]
 SSH_84 = ["ssh", "-i", SSH_KEY, "-p", SSH_PORT, "-o", "BatchMode=yes", f"{SSH_USER}@{HOST_2_IP}"]
@@ -101,8 +73,12 @@ def perform_upgrade():
     print("1. Upgrading Host1 (.82):")
     # WAL-safe backup
     print("   • Backing up SQLite DB (WAL-safe)...")
-    bak_82 = f"/data/backups/dockhand/dockhand.db.bak-{ts}"
-    get_remote_out(SSH_82, f"mkdir -p /data/backups/dockhand && sqlite3 /docker/appdata/dockhand/db/dockhand.db \".backup '{bak_82}'\"")
+    backup_dir = os.environ.get('DOCKER_BACKUP_DIR', '/data/backups')
+    appdata_dir = os.environ.get('DOCKER_APPDATA_DIR', '/docker/appdata')
+    support_dir = os.environ.get('DOCKER_SUPPORT_DIR', '/docker/support/dockhand')
+
+    bak_82 = f"{backup_dir}/dockhand/dockhand.db.bak-{ts}"
+    get_remote_out(SSH_82, f"mkdir -p '{backup_dir}/dockhand' && sqlite3 '{appdata_dir}/dockhand/db/dockhand.db' \".backup '{bak_82}'\"")
     bak_sz_82 = get_remote_out(SSH_82, f"ls -lh '{bak_82}' 2>/dev/null | awk '{{print $5}}'")
     if bak_sz_82:
         print(f"   • Backup verified: {bak_sz_82} ({bak_82})")
@@ -110,7 +86,7 @@ def perform_upgrade():
         print("   ⚠️ Backup file verification failed, proceeding with caution...")
 
     print("   • Pulling new image & recreating container...")
-    get_remote_out(SSH_82, "cd /docker/appdata && docker compose pull dockhand && docker compose up -d dockhand")
+    get_remote_out(SSH_82, f"cd '{appdata_dir}' && docker compose pull dockhand && docker compose up -d dockhand")
     status_82 = ""
     for _ in range(10):
         time.sleep(2)
@@ -123,8 +99,8 @@ def perform_upgrade():
     print("\n2. Upgrading Host2 (.84):")
     # WAL-safe backup
     print("   • Backing up SQLite DB (WAL-safe)...")
-    bak_84 = f"/docker/support/dockhand/backups/dockhand.db.bak-{ts}"
-    get_remote_out(SSH_84, f"mkdir -p /docker/support/dockhand/backups && sqlite3 /docker/support/dockhand/db/dockhand.db \".backup '{bak_84}'\"")
+    bak_84 = f"{support_dir}/backups/dockhand.db.bak-{ts}"
+    get_remote_out(SSH_84, f"mkdir -p '{support_dir}/backups' && sqlite3 '{support_dir}/db/dockhand.db' \".backup '{bak_84}'\"")
     bak_sz_84 = get_remote_out(SSH_84, f"ls -lh '{bak_84}' 2>/dev/null | awk '{{print $5}}'")
     if bak_sz_84:
         print(f"   • Backup verified: {bak_sz_84} ({bak_84})")

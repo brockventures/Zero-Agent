@@ -24,8 +24,8 @@ WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
     sys.path.insert(0, str(WORKSPACE))
 
-from tools.process_probe import reap_stale_agy_processes, diagnose_process_tree
-from tools.bridge_state import DATA_DIR, BEACON_FILE, SESSIONS_FILE
+from tools.process_probe import reap_stale_agy_processes, diagnose_process_tree, is_process_making_progress
+from tools.bridge_state import DATA_DIR, BEACON_FILE, SESSIONS_FILE, get_all_active_pids
 
 PT_TZ = ZoneInfo("America/Los_Angeles")
 LOG_FILE = DATA_DIR / "bridge_watchdog.log"
@@ -92,12 +92,21 @@ def check_bridge_health(auto_heal: bool = True) -> tuple[bool, str, dict]:
         turn_silence = now - float(turn_ts)
         details["turn_silence_seconds"] = int(turn_silence)
         if turn_silence > MAX_PROCESSING_SILENCE:
-            issues.append(f"Turn state held in PROCESSING for {int(turn_silence)}s (> {int(MAX_PROCESSING_SILENCE)}s)")
-            details["beacon_healthy"] = False
+            # Verify if any active process is still running and making forward progress
+            active_pids = get_all_active_pids()
+            has_progress = False
+            for apid in active_pids:
+                if is_process_making_progress(apid):
+                    has_progress = True
+                    break
+            if not has_progress:
+                issues.append(f"Turn state held in PROCESSING for {int(turn_silence)}s (> {int(MAX_PROCESSING_SILENCE)}s) with zero progress")
+                details["beacon_healthy"] = False
 
     # 3. Reap any stale / orphaned agy CLI processes
     try:
-        reaped = reap_stale_agy_processes(max_age_seconds=600.0, dry_run=not auto_heal)
+        allowed = get_all_active_pids()
+        reaped = reap_stale_agy_processes(allowed_active_pids=allowed, dry_run=not auto_heal)
         if reaped:
             details["reaped_processes"] = reaped
             actions_taken.append(f"Reaped {len(reaped)} stale/wedged agy CLI subprocess(es)")

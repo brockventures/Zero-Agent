@@ -46,7 +46,12 @@ def format_command_preview(cmd_raw: str, max_len: int = 80) -> str:
 
 
 def harvest_transcript_response(conv_id: Optional[str]) -> Optional[str]:
-    """Harvest completed response from transcript files if stdout was truncated or cut off."""
+    """Harvest completed response from transcript files if stdout was truncated or cut off.
+
+    Enforces active turn boundary: stops immediately if a USER_INPUT or CHECKPOINT step is
+    encountered before finding a substantive PLANNER_RESPONSE, preventing prior turn responses
+    from ever being harvested or re-delivered.
+    """
     if not conv_id:
         return None
     brain_dir = Path("/root/.gemini/antigravity-cli/brain") / str(conv_id) / ".system_generated" / "logs"
@@ -63,7 +68,19 @@ def harvest_transcript_response(conv_id: Optional[str]) -> Optional[str]:
                     continue
                 try:
                     data = json.loads(line_s)
-                    if data.get("type") == "PLANNER_RESPONSE":
+                    step_type = data.get("type")
+                    source = data.get("source")
+                    role = data.get("role")
+
+                    # Turn boundary check: Never cross into prior conversation turns or checkpoints
+                    if (
+                        step_type in ("USER_INPUT", "CHECKPOINT", "user", "USER")
+                        or source in ("USER_EXPLICIT", "USER")
+                        or role in ("user", "USER")
+                    ):
+                        break
+
+                    if step_type == "PLANNER_RESPONSE":
                         content = data.get("content")
                         if content and isinstance(content, str) and content.strip():
                             stripped = content.strip()
@@ -131,6 +148,7 @@ class AgyStreamParser:
             if (stype in ("tool",) or tname):
                 # Tool execution: clear pre-tool narration
                 self.accumulated_segment.clear()
+                self.is_explicit_silence = False
 
             elif stype in ("system_message", "system"):
                 # Asynchronous system event: preserve substantive content generated prior
@@ -160,9 +178,11 @@ class AgyStreamParser:
                                 self.is_explicit_silence = True
                         else:
                             self.last_substantive_response = curr
+                            self.is_explicit_silence = False
 
         elif ev_type in ("tool", "tool_call", "tool_use"):
             self.accumulated_segment.clear()
+            self.is_explicit_silence = False
 
         elif ev_type in ("system_message", "system"):
             curr = "".join(self.accumulated_segment).strip()

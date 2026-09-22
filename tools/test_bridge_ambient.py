@@ -129,6 +129,41 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
             # Below 0.80 -> buffered silently, queue remains empty
             self.assertTrue(ext_queue.empty())
 
+    async def test_bare_zero_text_in_tag_gated_channel(self):
+        msg = MagicMock()
+        msg.guild.id = 1534436119888793740
+        msg.author.id = 179407724335988736
+        msg.author.bot = False
+        msg.channel.id = 1551465050072416286  # #side-project
+        msg.channel.name = "side-project"
+        msg.content = "Zero can you update so you respond to bare Zero text as well?"
+        msg.attachments = []
+        msg.reference = None
+        msg.role_mentions = []
+        msg.mentions = []
+
+        bot = MagicMock()
+        bot.user.id = 1542285964213358633
+        home_queue = asyncio.Queue()
+        ext_queue = asyncio.Queue()
+
+        rules = {
+            "channel_tag_requirements": {
+                "1551465050072416286": ["1543285916506783799", "1543462881624858624"]
+            },
+            "ambient_classifier_enabled": False,
+        }
+
+        with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
+             patch("tools.channel_history.format_channel_context", return_value=""):
+            handled = await route_external_message(
+                msg, bot, msg.content, "Ryan", home_queue, ext_queue, rules=rules
+            )
+            self.assertTrue(handled)
+            self.assertFalse(ext_queue.empty())
+            item = await ext_queue.get()
+            self.assertIn("can you update so you respond to bare Zero text as well?", item["prompt"])
+
 
 if __name__ == "__main__":
     unittest.main()

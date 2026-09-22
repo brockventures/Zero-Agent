@@ -18,7 +18,7 @@ Whenever an ad-hoc command, script, test suite, or migration is expected or esti
 1. **NEVER execute synchronously** within the conversational Discord turn.
 2. **NEVER hold the turn open** with standard `run_command` polling.
 3. **MANDATORY DECOUPLING:** Launch the job via `/workspace/tools/detached_runner.py start`.
-4. **IMMEDIATE DISCORD REPLY:** Output the task ID, process PID, and log path to the user, then conclude the turn immediately so the channel remains unblocked.
+4. **SILENT EXECUTION (ZERO INTERSTITIAL CHATTER):** Do NOT output intermediate task IDs, process PIDs, or placeholder messages to chat ('Starting task...', 'Running in background...'). Conclude or proceed silently. The runner delivers strictly the final result upon completion.
 5. **ASYNCHRONOUS OUTBOX DELIVERY:** The detached runner monitors the child process to completion, logs stdout/stderr to disk, and automatically queues an outbox notification with execution status, elapsed duration, exit code, and a tail log snippet upon finish.
 
 ---
@@ -84,8 +84,7 @@ task_id = res["task_id"]
        ▼
 [Zero Interactive Turn] ─── (Spawns detached_runner.py start)
        │
-       ├──► Replies immediately with Task ID & Log path
-       └──► Finishes turn; Discord channel unlocked
+       └──► Finishes turn silently (no interstitial chatter)
                │
                ▼
    [Detached Worker Process] (Independent Process Group)

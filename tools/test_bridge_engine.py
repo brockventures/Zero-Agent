@@ -146,6 +146,34 @@ class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.coordinator.result_received_at)
         self.assertEqual(self.coordinator.current_action, "Finalizing output...")
 
+    def test_task_wait_leak_does_not_trigger_substantive_delta(self):
+        """Verify that AGY WAITING_FOR_TASKS_OUTPUT chatter does not set had_substantive_delta or agent_response_done_at."""
+        leak_ev = {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "state": "IN_PROGRESS",
+                "text_delta": (
+                    "<WAITING_FOR_TASKS_OUTPUT>\n"
+                    "Wait for at least one of the background tasks to complete:\n"
+                    "- d4e7469b-ec01-48bf-abc3-1ee1b05f8c8e/task-818</WAITING_FOR_TASKS_OUTPUT>"
+                ),
+            },
+        }
+        self.coordinator.process_stream_event(leak_ev)
+        self.assertFalse(self.coordinator.had_substantive_delta)
+
+        done_ev = {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "state": "DONE",
+            },
+        }
+        self.coordinator.process_stream_event(done_ev)
+        # agent_response_done_at must remain None so quiescent cutoff does not fire during background task!
+        self.assertIsNone(self.coordinator.agent_response_done_at)
+
     @patch("tools.bridge_engine.diagnose_process_tree")
     def test_probe_process_wedge(self, mock_diag):
         now = time.time()

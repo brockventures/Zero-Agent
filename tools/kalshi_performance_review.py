@@ -23,6 +23,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
+ENV_PATH = Path("/workspace/.env")
+if ENV_PATH.exists():
+    for _line in ENV_PATH.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 DB_PATH = Path("/workspace/data/kalshi_paper.db")
 PARAMS_PATH = Path("/workspace/data/kalshi_model_params.json")
 REPO_DIR = Path("/workspace/kalshi-quant")
@@ -171,6 +179,139 @@ def settle_open_positions(conn, dry_run=False):
                     
     return settled_list, total_realized_pnl
 
+def evaluate_open_positions(open_pos):
+    """Forensically evaluate live open positions against real-time ground truth (NOAA / MLB)."""
+    if not open_pos:
+        return {"est_open_pnl": 0.0, "wins": [], "losses": []}
+        
+    today_str = datetime.now(PT).strftime("%Y-%m-%d")
+    
+    def parse_weather_ticker(ticker):
+        m = re.match(r"KXHIGH(?:T)?([A-Z]{3})-(\d{2}[A-Z]{3}\d{2})-([TB])([\d\.]+)", ticker)
+        if not m:
+            return None
+        st, date_code, strike_type, strike_val = m.groups()
+        return {
+            "station": f"K{st}",
+            "date_code": date_code,
+            "strike_type": strike_type,
+            "strike_val": float(strike_val)
+        }
+        
+    weather_stations = {
+        parse_weather_ticker(p["ticker"])["station"]
+        for p in open_pos if parse_weather_ticker(p["ticker"])
+    }
+    
+    station_max = {}
+    def fetch_station(st):
+        url = f"https://api.weather.gov/stations/{st}/observations"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Zero-Quant (quant@example.com)"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+                temps = [
+                    f["properties"]["temperature"]["value"] * 9/5 + 32
+                    for f in data.get("features", [])
+                    if f.get("properties", {}).get("timestamp", "") >= f"{today_str}T07:00:00"
+                    and f.get("properties", {}).get("temperature", {}).get("value") is not None
+                ]
+                if temps:
+                    return st, max(temps)
+        except Exception:
+            pass
+        return st, None
+
+    mlb_winners = {}
+    def fetch_mlb():
+        url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today_str}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Zero-Quant (quant@example.com)"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+                for date in data.get("dates", []):
+                    for g in date.get("games", []):
+                        away = g["teams"]["away"]["team"]["name"]
+                        home = g["teams"]["home"]["team"]["name"]
+                        if g["status"]["detailedState"] in ("Final", "Game Over", "Completed Early"):
+                            a_s = g["teams"]["away"].get("score", 0)
+                            h_s = g["teams"]["home"].get("score", 0)
+                            mlb_winners[away] = (a_s > h_s)
+                            mlb_winners[home] = (h_s > a_s)
+        except Exception:
+            pass
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        f_mlb = ex.submit(fetch_mlb)
+        f_st = [ex.submit(fetch_station, s) for s in weather_stations]
+        for f in f_st:
+            st, m_temp = f.result()
+            if m_temp is not None:
+                station_max[st] = m_temp
+        f_mlb.result()
+
+    wins = []
+    losses = []
+    est_open_pnl = 0.0
+    sfo_losses_count = 0
+    sfo_losses_pnl = 0.0
+
+    for p in open_pos:
+        ticker = p["ticker"]
+        side = p["side"].upper()
+        cost = p["total_cost"]
+        contracts = p["contracts"]
+        title = p["title"] or ""
+        
+        parsed = parse_weather_ticker(ticker)
+        if parsed and parsed["station"] in station_max:
+            s_max = station_max[parsed["station"]]
+            s_type = parsed["strike_type"]
+            s_val = parsed["strike_val"]
+            
+            if s_type == "B":
+                is_yes = (s_val - 0.5 <= s_max <= s_val + 0.5)
+            elif "<" in title:
+                is_yes = (s_max < s_val)
+            else:
+                is_yes = (s_max > s_val)
+                
+            won = (side == "YES" and is_yes) or (side == "NO" and not is_yes)
+            pos_pnl = round((contracts * 1.0 - cost) if won else -cost, 2)
+            est_open_pnl += pos_pnl
+            
+            st_name = parsed["station"].replace("K", "")
+            if parsed["station"] == "KSFO" and not won:
+                sfo_losses_count += 1
+                sfo_losses_pnl += pos_pnl
+            else:
+                label = f"{st_name} {s_val:.1f}° {side}" if "." in str(s_val) and not str(s_val).endswith(".0") else f"{st_name} {int(s_val)}° {side}"
+                if won:
+                    wins.append({"label": label, "pnl": pos_pnl, "ticker": ticker})
+                else:
+                    losses.append({"label": label, "pnl": pos_pnl, "ticker": ticker})
+        elif ticker.startswith("KXMLBGAME"):
+            won = False
+            if "TOR" in ticker and mlb_winners.get("Toronto Blue Jays") is not None:
+                won = (side == "YES" and mlb_winners["Toronto Blue Jays"]) or (side == "NO" and not mlb_winners["Toronto Blue Jays"])
+            pos_pnl = round((contracts * 1.0 - cost) if won else -cost, 2)
+            est_open_pnl += pos_pnl
+            team = "TOR" if "TOR" in ticker else "MLB"
+            if won:
+                wins.append({"label": f"{team} {side}", "pnl": pos_pnl, "ticker": ticker})
+            else:
+                losses.append({"label": f"{team} {side}", "pnl": pos_pnl, "ticker": ticker})
+
+    if sfo_losses_count > 0:
+        losses.insert(0, {"label": f"SFO cool bias ({sfo_losses_count}x)", "pnl": round(sfo_losses_pnl, 2), "ticker": "KSFO"})
+
+    return {
+        "est_open_pnl": round(est_open_pnl, 2),
+        "wins": wins,
+        "losses": losses
+    }
+
 def compute_portfolio_metrics(conn):
     """Calculate portfolio balance, open exposure, Brier score, and win rate."""
     p = conn.execute("SELECT * FROM portfolio WHERE id = 1").fetchone()
@@ -182,6 +323,15 @@ def compute_portfolio_metrics(conn):
     
     wins = [r for r in resolved_pos if (r["realized_pnl"] or 0.0) > 0]
     win_rate = (len(wins) / len(resolved_pos) * 100) if resolved_pos else 0.0
+    
+    # Today's settled positions
+    today_str = datetime.now(PT).strftime("%Y-%m-%d")
+    today_settled = [r for r in resolved_pos if (r["settled_at"] or "").startswith(today_str)]
+    today_pnl = sum(r["realized_pnl"] or 0.0 for r in today_settled)
+    today_wins = len([r for r in today_settled if (r["realized_pnl"] or 0.0) > 0])
+    today_losses = len([r for r in today_settled if (r["realized_pnl"] or 0.0) < 0])
+    
+    open_eval = evaluate_open_positions(open_pos)
     
     # Calculate Brier score across resolved positions where model_prob is available
     brier_scores = {}
@@ -227,6 +377,13 @@ def compute_portfolio_metrics(conn):
         "resolved_count": len(resolved_pos),
         "win_count": len(wins),
         "win_rate": win_rate,
+        "today_pnl": round(today_pnl, 2),
+        "today_wins": today_wins,
+        "today_losses": today_losses,
+        "today_settled_count": len(today_settled),
+        "est_open_pnl": open_eval["est_open_pnl"],
+        "open_tracking_wins": open_eval["wins"],
+        "open_tracking_losses": open_eval["losses"],
         "brier_scores": summary_brier,
         "brier_skill_scores": summary_bss,
         "domain_counts": domain_counts,
@@ -478,40 +635,48 @@ def update_vault_doc(metrics):
         print(f"⚠️ Vault update error: {e}")
 
 def print_review_summary(metrics, settled, adjustments):
-    print("==========================================================")
-    print("      ZERO KALSHI PAPER TRADING PERFORMANCE REVIEW       ")
-    print("==========================================================")
-    print(f"Current Time:        {datetime.now(PT).strftime('%Y-%m-%d %I:%M:%S %p PT')}")
-    print(f"Cash Balance:        ${metrics['cash']:>10.2f}")
-    print(f"Open Exposure:       ${metrics['open_exposure']:>10.2f} ({metrics['open_count']} positions)")
-    print(f"Total Equity:        ${metrics['total_equity']:>10.2f}")
-    print(f"Realized P&L:        ${metrics['realized_pnl']:>+10.2f}")
-    print(f"Resolved Trades:     {metrics['resolved_count']:>10} (Win Rate: {metrics['win_rate']:.1f}%)")
-    print("----------------------------------------------------------")
-    if settled:
-        print(f"SETTLED TODAY ({len(settled)} markets):")
-        for s in settled:
-            flag = "WIN" if s["won"] else "LOSS"
-            print(f" • [{flag}] {s['ticker']} ({s['side']}): Payout ${s['payout']:.2f}, P&L ${s['realized_pnl']:+.2f}")
+    now_str = datetime.now(PT).strftime("%b %d, %I:%M %p PT")
+    today_pnl = metrics.get("today_pnl", 0.0)
+    today_w = metrics.get("today_wins", 0)
+    today_l = metrics.get("today_losses", 0)
+    open_cnt = metrics.get("open_count", 0)
+    open_exp = metrics.get("open_exposure", 0.0)
+    est_open_pnl = metrics.get("est_open_pnl", 0.0)
+    
+    lines = [
+        f"### 📈 Kalshi Daily Review • {now_str}",
+        ""
+    ]
+    
+    if today_w + today_l > 0:
+        wr = (today_w / (today_w + today_l)) * 100
+        pnl_sign = "+" if today_pnl >= 0 else "-"
+        lines.append(f"- **Settled Today:** `{pnl_sign}${abs(today_pnl):.2f}` ({today_w}W – {today_l}L · {wr:.0f}% win rate)")
     else:
-        print("No open positions settled in this run.")
+        lines.append("- **Settled Today:** `$0.00` (0 resolved)")
         
-    print("----------------------------------------------------------")
-    brier = metrics.get("brier_scores", {})
-    if brier:
-        print("BRIER SCORE CALIBRATION:")
-        for k, v in brier.items():
-            bss = metrics.get("brier_skill_scores", {}).get(k, 0.0)
-            print(f" • {k:<15}: Brier {v:.4f} | BSS {bss:+.3f}")
+    if open_cnt > 0:
+        pnl_sign = "+" if est_open_pnl >= 0 else "-"
+        lines.append(f"- **Open Bets ({open_cnt}):** `{pnl_sign}${abs(est_open_pnl):.2f}` est. outcome (`${open_exp:.2f}` at risk)")
+        wins = metrics.get("open_tracking_wins", [])
+        losses = metrics.get("open_tracking_losses", [])
+        if wins:
+            w_str = ", ".join(f"{w['label']} (`{'+' if w['pnl']>=0 else '-'}${abs(w['pnl']):.2f}`)" for w in wins)
+            lines.append(f"  - 🟢 **Tracking Win:** {w_str}")
+        if losses:
+            l_str = ", ".join(f"{l['label']} (`{'+' if l['pnl']>=0 else '-'}${abs(l['pnl']):.2f}`)" for l in losses)
+            lines.append(f"  - 🔴 **Tracking Loss:** {l_str}")
     else:
-        print("Brier score: Awaiting settled contracts.")
+        lines.append("- **Open Bets:** None active")
         
-    if adjustments:
-        print("----------------------------------------------------------")
-        print("DYNAMIC ADJUSTMENTS APPLIED:")
-        for a in adjustments:
-            print(f" • [{a['scope']}] {a.get('reason', '')}")
-    print("==========================================================")
+    lines.append(f"- **Total Equity:** `${metrics['total_equity']:.2f}` (`${metrics['cash']:.2f}` cash · `${open_exp:.2f}` open)")
+    
+    brier = metrics.get("brier_scores", {}).get("overall")
+    adj_str = f" · {adjustments[0]['scope']} alpha → `{adjustments[0].get('new_alpha', '')}`" if adjustments else ""
+    if brier is not None:
+        lines.append(f"- **Calibration:** Brier `{brier:.3f}` overall{adj_str}")
+        
+    print("\n".join(lines))
 
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Paper Trading Performance Review & Task Board Sync")

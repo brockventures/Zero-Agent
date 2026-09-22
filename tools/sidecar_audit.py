@@ -27,6 +27,7 @@ DATA_DIR = WORKSPACE / "data"
 SCHEDULE_FILE = DATA_DIR / "schedule.json"
 SIDECARS_FILE = WORKSPACE / "tools" / "sidecars.py"
 HANDLERS_FILE = WORKSPACE / "tools" / "bridge_handlers.py"
+COMMANDS_FILE = WORKSPACE / "tools" / "bridge_commands.py"
 PT = ZoneInfo("America/Los_Angeles")
 
 VALID_SCHEDULE_TYPES = {"interval", "daily", "weekly", "monthly"}
@@ -88,20 +89,20 @@ def get_sidecars_py_actions() -> set[str]:
 
 
 def get_bridge_triggers() -> set[str]:
-    """Parse on-demand command triggers from tools/bridge_handlers.py using AST analysis."""
+    """Parse on-demand command triggers from tools/bridge_commands.py and bridge_handlers.py using AST analysis."""
     triggers = set()
-    if not HANDLERS_FILE.exists():
-        return triggers
-    try:
-        tree = ast.parse(HANDLERS_FILE.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Dict):
-                for k in node.keys:
-                    if isinstance(k, ast.Constant) and isinstance(k.value, str):
-                        if k.value.startswith("!") or k.value.startswith("/"):
-                            triggers.add(k.value.lstrip("!/"))
-    except Exception as e:
-        print(f"[Auditor] Error reading bridge_handlers.py AST: {e}", file=sys.stderr)
+    files_to_check = [f for f in (COMMANDS_FILE, HANDLERS_FILE) if f.exists()]
+    for target_file in files_to_check:
+        try:
+            tree = ast.parse(target_file.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Dict):
+                    for k in node.keys:
+                        if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                            if k.value.startswith("!") or k.value.startswith("/"):
+                                triggers.add(k.value.lstrip("!/"))
+        except Exception as e:
+            print(f"[Auditor] Error reading {target_file.name} AST: {e}", file=sys.stderr)
     return triggers
 
 

@@ -342,6 +342,27 @@ class TestBridgeFormatting(unittest.TestCase):
             "### Forensic Autopsy: NAS Log Review Failure\nHere is the report."
         )
 
+        # Test stripping AGY 2.0 WAITING_FOR_TASKS_OUTPUT envelope
+        task_wait_text = (
+            "<WAITING_FOR_TASKS_OUTPUT>\n"
+            "Wait for at least one of the background tasks to complete:\n"
+            "- d4e7469b-ec01-48bf-abc3-1ee1b05f8c8e/task-818</WAITING_FOR_TASKS_OUTPUT>\n"
+            "Handled. Both dispatchers are green."
+        )
+        self.assertEqual(
+            strip_internal_cli_chatter(task_wait_text),
+            "Handled. Both dispatchers are green."
+        )
+
+        # Test pure WAITING_FOR_TASKS_OUTPUT stripped to empty string
+        pure_task_wait = (
+            "<WAITING_FOR_TASKS_OUTPUT>\n"
+            "Wait for at least one of the background tasks to complete:\n"
+            "- d4e7469b-ec01-48bf-abc3-1ee1b05f8c8e/task-818</WAITING_FOR_TASKS_OUTPUT>"
+        )
+        self.assertEqual(strip_internal_cli_chatter(pure_task_wait), "")
+        self.assertTrue(is_internal_cli_leak(pure_task_wait))
+
         # Test inline mentions of tags in code ticks are preserved and do NOT truncate to EOF
         inline_mention_text = (
             "The sanitizer scrubs CLI artifacts like `<SYSTEM_MESSAGE>` and `<RECEIVED_TASK_NOTIFICATION>` tags.\n"

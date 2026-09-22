@@ -50,53 +50,13 @@ from nas_docker_mcp import nas_docker
 from workspace_mcp import calendar_list_events, gmail_search
 
 PT = ZoneInfo("America/Los_Angeles")
-SSH_KEY = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
-SSH_USER = os.environ.get("NAS_SSH_USER", "Brock")
 
-def _resolve_nas_config():
-    ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
-    host_1 = os.environ.get("NAS_HOST_1_IP")
-    host_2 = os.environ.get("NAS_HOST_2_IP")
+try:
+    from tools.nas_config import resolve_nas_config, _resolve_nas_config
+except ImportError:
+    from nas_config import resolve_nas_config, _resolve_nas_config
 
-    if os.path.exists("/secrets/env.json"):
-        try:
-            with open("/secrets/env.json") as f:
-                d = json.load(f)
-                if d.get("NAS_SSH_PORT"):
-                    ssh_port = str(d["NAS_SSH_PORT"])
-                if d.get("NAS_HOST_1_IP"):
-                    host_1 = d["NAS_HOST_1_IP"]
-                elif d.get("HA_BASE_URL"):
-                    host_1 = urllib.parse.urlparse(d["HA_BASE_URL"]).hostname
-        except Exception:
-            pass
-
-    if not host_1 and os.path.exists("/secrets/ha.json"):
-        try:
-            with open("/secrets/ha.json") as f:
-                d = json.load(f)
-                if d.get("url"):
-                    host_1 = urllib.parse.urlparse(d["url"]).hostname
-        except Exception:
-            pass
-
-    if not host_2 and os.path.exists("/secrets/env.json"):
-        try:
-            with open("/secrets/env.json") as f:
-                d = json.load(f)
-                if d.get("NAS_HOST_2_IP"):
-                    host_2 = d["NAS_HOST_2_IP"]
-        except Exception:
-            pass
-
-    if host_1 and not host_2:
-        parts = host_1.split(".")
-        if len(parts) == 4 and parts[-1] == "82":
-            host_2 = ".".join(parts[:3] + ["84"])
-
-    return host_1 or os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), host_2 or os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), ssh_port
-
-HOST_1_IP, HOST_2_IP, SSH_PORT = _resolve_nas_config()
+HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -328,7 +288,7 @@ def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> 
         else:
             status = "ok" if ok else "warning"
 
-        summary = message[:400] if message else (extra.get("summary", "(clean run / silent)") if isinstance(extra, dict) and ok else "(degraded)")
+        summary = message[:400] if message else ((extra.get("summary", "(clean run / silent)") if isinstance(extra, dict) else "(clean run / silent)") if ok else "(degraded)")
         log_execution(job_id=job_id, name=name, status=status, duration_sec=duration, summary=summary, error="" if ok else summary, extra=extra if isinstance(extra, dict) else None)
         return ok, message, extra
 
@@ -920,8 +880,13 @@ def _diagnose_container_errors(cname: str, errors: list[str]) -> tuple[int, str,
 
 def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     """Execute high-speed batch NAS log scanning & triage across Host 1 and Host 2."""
-    from tools.nas_log_triage import run_nas_log_review as _run_triage
-    return _run_triage(since=since)
+    import importlib
+    try:
+        import tools.nas_log_triage as _triage_mod
+    except ImportError:
+        import nas_log_triage as _triage_mod
+    importlib.reload(_triage_mod)
+    return _triage_mod.run_nas_log_review(since=since)
 
 
 # --------------------------------------------------------------------------
@@ -1378,7 +1343,7 @@ def run_cubs_game_notifier(force: bool = False, test: bool = False) -> tuple[boo
         return False, f"⚠️ Cubs game notifier error: {e}", {"error": str(e)}
 
 def run_kalshi_paper_bot():
-    """Execute Kalshi quant paper bot: weather, daily MLB matchups, and playoff futures."""
+    """Execute Kalshi quant paper bot: weather and daily MLB matchups."""
     import subprocess
     try:
         outputs = []
@@ -1395,11 +1360,6 @@ def run_kalshi_paper_bot():
         res_m = subprocess.run(["python3", "/workspace/tools/baseball_daily_quant.py", "trade"], capture_output=True, text=True, check=False)
         if res_m.stdout:
             outputs.append("=== MLB DAILY MATCHUPS ===\n" + res_m.stdout.strip())
-            
-        # 4. MLB Playoff Futures Scan & Trade
-        res_p = subprocess.run(["python3", "/workspace/tools/baseball_playoff_model.py", "--trade"], capture_output=True, text=True, check=False)
-        if res_p.stdout:
-            outputs.append("=== MLB PLAYOFF FUTURES ===\n" + res_p.stdout.strip())
             
         return True, "\n\n".join(outputs), {}
     except Exception as e:
@@ -1425,6 +1385,16 @@ def run_kalshi_autoworker():
         return res.returncode == 0, output, {}
     except Exception as e:
         return False, f"⚠️ Kalshi autoworker error: {e}", {"error": str(e)}
+
+def run_sideproject_watcher(*args, **kwargs) -> tuple[bool, str, any]:
+    """Execute autonomous 30-minute sprint cycle for Highball & Outpost side-projects."""
+    try:
+        from tools.sideproject_watcher import run_cycle
+        force = kwargs.get("force", False)
+        test = kwargs.get("test", False)
+        return run_cycle(force=force, test=test)
+    except Exception as e:
+        return False, f"⚠️ Sideproject watcher error: {e}", {"error": str(e)}
 
 # --------------------------------------------------------------------------
 # CLI Dispatcher
@@ -1584,7 +1554,7 @@ if __name__ == "__main__":
             print(res.stdout.strip())
         if res.stderr:
             print(res.stderr.strip(), file=sys.stderr)
-    elif action in ("kalshi", "kalshi_paper", "kalshi_bot"):
+    elif action in ("kalshi", "kalshi_paper", "kalshi_bot", "kalshi_midday"):
         ok, rep, _ = run_sidecar_job("kalshi_paper_bot", "Kalshi Weather Quant Paper Bot", run_kalshi_paper_bot)
         if rep:
             print(rep)
@@ -1598,6 +1568,12 @@ if __name__ == "__main__":
             print(rep)
     elif action in ("kalshi_sprint", "kalshi_autoworker", "kalshi_worker"):
         ok, rep, _ = run_sidecar_job("kalshi_quant_sprint", "Kalshi Task Board Autonomous Sprint", run_kalshi_autoworker)
+        if rep:
+            print(rep)
+    elif action in ("sideproject_watcher", "sideproject", "sideproject_sprint"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("sideproject_watcher", "Side-Project Autonomous Sprint Watcher", run_sideproject_watcher, force=force, test=test)
         if rep:
             print(rep)
     elif action == "status":

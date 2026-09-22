@@ -34,6 +34,9 @@ In this architecture, **writing a standalone `.py` script is only Layer 1**. A p
 > [!CAUTION]
 > **Never invoke the runtime `schedule` tool during Discord bridge turns.** The builtin `schedule` tool spawns a local background cron in the CLI runtime (`agy`), keeping stdout open and causing `bridge_runner.py` to hang on `proc.wait()` until hitting the 30-minute timeout (`PRINT_TIMEOUT=30m`). Always register recurring sidecars in `schedule.json` (Layer 3).
 
+> [!IMPORTANT]
+> **Zero Interstitial Message Invariant (Sidecars):** Scheduled sidecars and on-demand maintenance runs must NEVER emit starting announcements or placeholder messages to chat (`Starting execution...`, `Running sidecar...`). Sidecars execute completely silently and deliver strictly their final findings/results upon completion (or remain 100% silent when nominal).
+
 ---
 
 ## 🛠️ Automated Verification Tools

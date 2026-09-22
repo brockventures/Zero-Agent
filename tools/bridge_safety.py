@@ -21,9 +21,9 @@ CLI_LEAK_LINE_PATTERNS = [
     r"^\s*error:\s*interrupted\s*$",
     r"^\s*error:\s*the connection to the agent was interrupted[^\n]*$",
     r"^\s*No tools called(?:\.|\s+Waiting for [^\n]+|\s*$)",
-    r"^\s*Waiting for (?:the\s+)?(?:background\s+)?(?:task|command|subagent|process)[s]?(?:-[a-zA-Z0-9_-]+)?(?:\s+to\s+(?:complete|finish)|\s+finishes|\s+completes)?(?:\.\.\.|\.)?\s*$",
-    r"^\s*Waiting for task-[a-zA-Z0-9_-]+[^\n]*$",
-    r"^\s*I (?:will|have)\s+wait(?:ed|ing)? for [^\n]+?(?:to complete|to finish|finish|complete)\.?\s*$",
+    r"^\s*Wait(?:ing)? for (?:the\s+)?(?:background\s+)?(?:task|command|subagent|process)[s]?(?:-[a-zA-Z0-9_-]+)?(?:\s+to\s+(?:complete|finish)|\s+finishes|\s+completes)?(?:\.\.\.|\.)?\s*$",
+    r"^\s*Wait(?:ing)? for task-[a-zA-Z0-9_-]+[^\n]*$",
+    r"^\s*(?:I (?:will|have)\s+)?wait(?:ed|ing)? for [^\n]+?(?:to complete|to finish|finish|complete)\.?\s*$",
     r"^\s*I (?:have\s+)?(?:initiated|launched|started|spawned|triggered)[^\n]+?(?:as soon as the (?:background\s+)?task\s+(?:completes|finishes)|when the (?:command|task)\s+finishes|and (?:will\s+)?wait for it to finish|the moment it completes|waiting for PID 1 to consume)[^\n]*\.?\s*$",
     r"^\s*I will (?:review|inspect|check|analyze) the results (?:as soon as|when|once|the moment) the (?:background\s+)?task (?:completes|finishes)[^\n]*\.?\s*$",
     r"^\s*I am pausing tool calls to allow [^\n]+? to complete in the background[^\n]*\.?\s*$",
@@ -47,6 +47,10 @@ CLI_LEAK_LINE_PATTERNS = [
     r"^\s*\[Message\]\s+timestamp=[^\n]*$",
     r"^\s*\[Task Update\]\s+Task\s+[^\n]*$",
     r"^\s*</?RECEIVED_TASK_NOTIFICATION>\s*$",
+    r"^\s*</?WAITING_FOR_TASKS_OUTPUT>\s*$",
+    r"^\s*Wait for at least one of the background tasks to complete:?\s*$",
+    r"^\s*-\s+[a-zA-Z0-9_-]+/task-[a-zA-Z0-9_-]+.*$",
+    r"^\s*-\s+task-[a-zA-Z0-9_-]+.*$",
     r"^\s*Exit code:\s*\d+\s*$",
     r"^\s*Stdout:\s*$",
     r"^\s*Stderr:\s*$",
@@ -123,14 +127,20 @@ def strip_internal_cli_chatter(text: str) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"(?m)^\s*<\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION|NOTIFICATION)\s*>[\s\S]*?<\s*/\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION|NOTIFICATION)\s*>\s*\n?",
+        r"(?m)^\s*<\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION|NOTIFICATION|WAITING_FOR_TASKS_OUTPUT)\s*>[\s\S]*?<\s*/\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION|NOTIFICATION|WAITING_FOR_TASKS_OUTPUT)\s*>\s*\n?",
         "",
         text,
         flags=re.IGNORECASE,
     )
     # Unclosed standalone system / task notification blocks on their own line extending to EOF
     text = re.sub(
-        r"(?m)^\s*<\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION|NOTIFICATION)\s*>\s*\n[\s\S]*?$",
+        r"(?m)^\s*<\s*(?:SYSTEM_MESSAGE|RECEIVED_TASK_NOTIFICATION|NOTIFICATION|WAITING_FOR_TASKS_OUTPUT)\s*>\s*\n?[\s\S]*?$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?m)^\s*Wait for at least one of the background tasks to complete:?[\s\S]*?(?=\n\n|\Z)",
         "",
         text,
         flags=re.IGNORECASE,
@@ -243,6 +253,14 @@ def is_internal_cli_leak(text: str) -> bool:
     if not text or not isinstance(text, str):
         return True
     orig_lower = text.lower().strip()
+    if "waiting_for_tasks_output" in orig_lower:
+        cleaned_wait = strip_internal_cli_chatter(text).strip()
+        if not cleaned_wait or is_internal_cli_leak(cleaned_wait):
+            return True
+    if "wait for at least one of the background tasks to complete" in orig_lower:
+        cleaned_wait = strip_internal_cli_chatter(text).strip()
+        if not cleaned_wait or is_internal_cli_leak(cleaned_wait):
+            return True
     if re.match(r"^process\s+[^\n]+?\s+completed with exit code", orig_lower):
         return True
     if orig_lower.startswith("tool is running as a background task with task id"):
@@ -282,7 +300,7 @@ def is_internal_cli_leak(text: str) -> bool:
     remaining_lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
     if remaining_lines and all(
         re.match(
-            r"^(\[BridgeDaemon\]|\[BridgeState\]|Process\s+[^\n]+completed|Ran \d+ test|OK$|FAILED|\.\.\.|-{5,}|<end of|<RECEIVED_TASK_NOTIFICATION)",
+            r"^(\[BridgeDaemon\]|\[BridgeState\]|Process\s+[^\n]+completed|Ran \d+ test|OK$|FAILED|\.\.\.|-{5,}|<end of|<RECEIVED_TASK_NOTIFICATION|</?WAITING_FOR_TASKS_OUTPUT|Wait for at least one)",
             l,
             re.IGNORECASE,
         )

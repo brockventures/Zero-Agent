@@ -3,8 +3,16 @@
 
 import json
 import os
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
+
+if "playwright" not in sys.modules:
+    try:
+        import playwright
+    except ImportError:
+        sys.modules["playwright"] = MagicMock()
+        sys.modules["playwright.sync_api"] = MagicMock()
 
 from tools.web_qa import run_web_qa
 

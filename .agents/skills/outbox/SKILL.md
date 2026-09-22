@@ -12,7 +12,8 @@ The **Outbox** skill provides an atomic, file-backed message queue (`/workspace/
 ---
 
 ## 🎯 When to Activate This Skill
-* **Multi-Audience Summary Dispatch:** When an engineering decision or deep debate in `#the-banana-stand` needs an executive summary mirrored to `#lounge` or `#zero-chat`.
+* **Multi-Audience Summary Dispatch (ELI5 Default):** When an engineering decision or deep debate in `#the-banana-stand` needs an executive summary mirrored to `#lounge` (`1534452820995080192`), the summary MUST strictly be the ELI5 / plain-language version by default (≤250 words, no complex SWE acronyms or jargon). Technical details belong in `#zero-chat` or decisions memory.
+* **Built-in Deduplication Guard:** Outbox automatically suppresses duplicate messages or redundant executive summaries sent to the same channel within 10 minutes (600s). Use `--force` or `force=True` to bypass if required.
 * **Asynchronous Notifications:** Queuing status notifications for external channels without breaking the conversational flow of the current thread.
 * **Crash-Resilient Delivery:** Messages placed in the outbox survive timeouts, subagent crashes, or container reloads, and are dispatched by the bridge background worker.
 

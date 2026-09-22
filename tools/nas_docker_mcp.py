@@ -13,53 +13,12 @@ import threading
 import urllib.parse
 from mcp.server.mcpserver import MCPServer
 
-SSH_KEY = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
-SSH_USER = os.environ.get("NAS_SSH_USER", "Brock")
+try:
+    from tools.nas_config import resolve_nas_config, _resolve_nas_config
+except ImportError:
+    from nas_config import resolve_nas_config, _resolve_nas_config
 
-def _resolve_nas_config():
-    ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
-    host_1 = os.environ.get("NAS_HOST_1_IP")
-    host_2 = os.environ.get("NAS_HOST_2_IP")
-
-    if os.path.exists("/secrets/env.json"):
-        try:
-            with open("/secrets/env.json") as f:
-                d = json.load(f)
-                if d.get("NAS_SSH_PORT"):
-                    ssh_port = str(d["NAS_SSH_PORT"])
-                if d.get("NAS_HOST_1_IP"):
-                    host_1 = d["NAS_HOST_1_IP"]
-                elif d.get("HA_BASE_URL"):
-                    host_1 = urllib.parse.urlparse(d["HA_BASE_URL"]).hostname
-        except Exception:
-            pass
-
-    if not host_1 and os.path.exists("/secrets/ha.json"):
-        try:
-            with open("/secrets/ha.json") as f:
-                d = json.load(f)
-                if d.get("url"):
-                    host_1 = urllib.parse.urlparse(d["url"]).hostname
-        except Exception:
-            pass
-
-    if not host_2 and os.path.exists("/secrets/env.json"):
-        try:
-            with open("/secrets/env.json") as f:
-                d = json.load(f)
-                if d.get("NAS_HOST_2_IP"):
-                    host_2 = d["NAS_HOST_2_IP"]
-        except Exception:
-            pass
-
-    if host_1 and not host_2:
-        parts = host_1.split(".")
-        if len(parts) == 4 and parts[-1] == "82":
-            host_2 = ".".join(parts[:3] + ["84"])
-
-    return host_1 or "127.0.0.1", host_2 or "127.0.0.1", ssh_port
-
-HOST_1_IP, HOST_2_IP, SSH_PORT = _resolve_nas_config()
+HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
 def _get_hosts():
     h1, h2, _ = _resolve_nas_config()

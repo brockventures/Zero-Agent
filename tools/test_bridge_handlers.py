@@ -544,7 +544,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         msg_named.author.id = 1210466877294518272
         msg_named.author.bot = False
         msg_named.author.display_name = "Ryan"
-        msg_named.content = "Zero, what do you think of this?"
+        msg_named.content = "Amos, what do you think of this?"
         msg_named.created_at.timestamp.return_value = now
         msg_named.role_mentions = []
         msg_named.mentions = []

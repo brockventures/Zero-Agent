@@ -168,6 +168,30 @@ class TestBridgeRunner(unittest.TestCase):
             recovered = br.harvest_transcript_response(conv_id)
             self.assertEqual(recovered, "Initial scan complete.")
 
+    def test_harvest_transcript_response_does_not_cross_turn_boundary(self):
+        """Verify that harvest_transcript_response never harvests previous turn's response when active turn is incomplete."""
+        conv_id = "test-conv-boundary"
+        log_dir = self.temp_path / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript_full.jsonl"
+
+        steps = [
+            # Turn 1: Completed
+            {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "What's next?"},
+            {"type": "PLANNER_RESPONSE", "content": "Here is what is on deck."},
+            # Turn 2: Incomplete (process terminated mid-turn during tool calls)
+            {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Go for 1 and 2"},
+            {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command"}]},
+            {"type": "GENERIC", "content": "Running tests..."},
+        ]
+        with open(transcript_file, "w") as f:
+            for s in steps:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_runner.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            recovered = br.harvest_transcript_response(conv_id)
+            self.assertIsNone(recovered)
+
     def test_kill_process_tree(self):
         """Verify that kill_process_tree signals the process group via os.killpg."""
         mock_proc = MagicMock()

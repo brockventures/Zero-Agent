@@ -47,6 +47,31 @@ AUTO_CLOSE_TIMEOUT_SECONDS = 1800   # 30 minutes of idle after open topic -> aut
 FAST_ACK_TIMEOUT_SECONDS = 120      # 2 minutes of unacknowledged direct handoff -> nudge
 LOOP_WARNING_ROUNDS = 10            # 10 turns without terminal state -> nudge to summarize
 
+# Game & Simulation keywords for topics that must remain open during active multi-round events
+GAME_TOPIC_KEYWORDS = (
+    "agora",
+    "trading-floor",
+    "trading_floor",
+    "combine",
+    "tournament",
+    "agon",
+    "game",
+    "match",
+    "simulation",
+)
+
+def is_game_topic(subject: str) -> bool:
+    """
+    Returns True if the subject represents an active game, simulation, tournament,
+    combine, or trading floor (e.g. Station Agora / Operation AGON).
+    During games, the floor must remain open across multi-round events without loop warnings,
+    stalled-topic nudges, or auto-clamping.
+    """
+    if not subject:
+        return False
+    sub_lower = subject.lower()
+    return any(kw in sub_lower for kw in GAME_TOPIC_KEYWORDS)
+
 def log(msg: str):
     now_str = datetime.now(PT).strftime("%Y-%m-%d %H:%M:%S PT")
     line = f"[{now_str}] {msg}"
@@ -266,10 +291,11 @@ def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
         })
 
     # 7. Governor Limit Breach Without Clamp (round >= max_rounds without terminal clamp)
+    # Exclude active game / trading floor topics where rounds represent simulation checkpoints rather than conversation loop governors.
     try:
         round_val = int(env.get("round", 0))
         max_rounds_val = int(env.get("max_rounds", 0))
-        if round_val > 0 and max_rounds_val > 0 and round_val >= max_rounds_val:
+        if not is_game_topic(subject) and round_val > 0 and max_rounds_val > 0 and round_val >= max_rounds_val:
             if floor != "closed" or reply != "none" or kind not in terminal_kinds:
                 contradictions.append({
                     "tag": "governor_breach",
@@ -279,6 +305,16 @@ def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
                 })
     except (ValueError, TypeError):
         pass
+
+    # 8. Game / Trading Floor Floor Closure
+    # Live game, tournament, combine, or trading floor topics must keep floor: open while simulation rounds are active.
+    if is_game_topic(subject) and floor == "closed" and kind not in ("final", "game_over", "final_bell"):
+        contradictions.append({
+            "tag": "game_floor_closed",
+            "title": f"`floor: closed` during active game/trading floor `{subject}`",
+            "detail": f"The floor was closed on active game/trading floor topic `{subject}`. Game floors must remain open (`floor: open`) while simulation rounds are active.",
+            "fix": "Set `floor: open` to ensure trading and strategy rounds continue without interruption."
+        })
 
     return contradictions
 
@@ -356,10 +392,11 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
                     save_state(state)
 
     # 1. Stalled & Inactive Topic Management: Floor open, non-terminal kind, channel idle, and no active mutex holder
-    # Exclude headless heartbeats, pings, or pure handshakes without subject
+    # Exclude headless heartbeats, pings, pure handshakes, or live game/simulation topics
     is_stallable = (
         bool(subject)
         and not is_terminal
+        and not is_game_topic(subject)
         and kind not in ("heartbeat", "handshake", "ping")
         and not (kind == "status" and reply == "none")
     )
@@ -379,19 +416,42 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
                 )
 
                 if ended_on_delivery and concluded_key not in state.get("summarized_subjects", {}):
-                    # Auto-promote to resolution and prompt Zero for executive summary to #lounge
-                    close_msg = (
-                        f"🍌 **Topic Concluded (30m Inactivity)**: Topic `{subject}` ended on `{kind}` with verified state.\n"
-                        f"Auto-clamping floor to closed.\n"
-                        f"<@{ZERO_BOT_ID}> (@Zero): Please synthesize and deliver a concise summary of this discussion to <#{LOUNGE_CHANNEL_ID}> (no more than 250 words, in plain language without overly complex industry lingo)."
+                    # Check dedupe guard before prompting
+                    closing_content = (latest_env_msg.get("content") or "").lower() if latest_env_msg else ""
+                    already_dispatched = (
+                        "executive summary dispatched" in closing_content
+                        or "summary dispatched to #lounge" in closing_content
+                        or "summary dispatched to lounge" in closing_content
                     )
-                    actions.append(f"Auto-closed topic with summary prompt: {subject} ({mins}m idle)")
-                    if post_discord(close_msg, dry_run=dry_run):
+                    if not already_dispatched:
+                        try:
+                            from tools.outbox import is_duplicate_outbox_message
+                            is_dup, _ = is_duplicate_outbox_message("lounge", f"Executive Summary: {subject}")
+                            if is_dup:
+                                already_dispatched = True
+                        except Exception:
+                            pass
+
+                    if already_dispatched:
+                        actions.append(f"Auto-closed topic with summary already dispatched: {subject}")
                         if not dry_run:
                             state.setdefault("autoclosed_topics", {})[env_msg_id] = now
                             state.setdefault("nudged_stalls", {})[env_msg_id] = now
                             state.setdefault("summarized_subjects", {})[concluded_key] = now
                             save_state(state)
+                    else:
+                        close_msg = (
+                            f"🍌 **Topic Concluded (30m Inactivity)**: Topic `{subject}` ended on `{kind}` with verified state.\n"
+                            f"Auto-clamping floor to closed.\n"
+                            f"<@{ZERO_BOT_ID}> (@Zero): Please synthesize and deliver a concise summary of this discussion to <#{LOUNGE_CHANNEL_ID}> (no more than 250 words, in plain language without overly complex industry lingo)."
+                        )
+                        actions.append(f"Auto-closed topic with summary prompt: {subject} ({mins}m idle)")
+                        if post_discord(close_msg, dry_run=dry_run):
+                            if not dry_run:
+                                state.setdefault("autoclosed_topics", {})[env_msg_id] = now
+                                state.setdefault("nudged_stalls", {})[env_msg_id] = now
+                                state.setdefault("summarized_subjects", {})[concluded_key] = now
+                                save_state(state)
                 elif concluded_key not in state.get("summarized_subjects", {}):
                     # Open proposal or debate without resolution: auto-park it to clean floor without #lounge spam
                     close_msg = (
@@ -455,7 +515,9 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
                         save_state(state)
 
     # 3. Echo-Loop / Turn Count Rule: Count turns on this subject
-    if subject and subject_turns >= LOOP_WARNING_ROUNDS and not is_terminal:
+    # Game / simulation / trading-floor topics (e.g. Agora, combine, tournament) are live multi-round events
+    # and MUST NOT trigger loop warnings or prompts to close the floor.
+    if subject and not is_game_topic(subject) and subject_turns >= LOOP_WARNING_ROUNDS and not is_terminal:
         loop_key = f"loop-{subject}"
         last_loop_nudge = state.get("nudged_stalls", {}).get(loop_key, 0)
         # Nudge once, then latch for at least 1 hour (3600s) to avoid cascading nags on every turn
@@ -471,19 +533,42 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
                     save_state(state)
 
     # 4. Concluded Discussion Executive Summary Prompt
-    # Only substantive multi-turn discussions (turns >= 2) that reach resolution trigger an executive summary to #lounge
-    if subject and is_terminal and subject_turns >= 2 and kind not in ("heartbeat", "handshake", "ping"):
+    # Only substantive multi-turn discussions (turns >= 2) that reach resolution trigger an executive summary to #lounge.
+    # Live game/trading floor topics are operational simulations, not architectural debates, and do not trigger #lounge prompts.
+    if subject and not is_game_topic(subject) and is_terminal and subject_turns >= 2 and kind not in ("heartbeat", "handshake", "ping"):
         concluded_key = f"concluded-{subject}"
         if concluded_key not in state.get("summarized_subjects", {}):
-            summary_msg = (
-                f"🍌 **Discussion Concluded**: Topic `{subject}` has reached resolution.\n"
-                f"<@{ZERO_BOT_ID}> (@Zero): Please synthesize and deliver a concise summary of this discussion to <#{LOUNGE_CHANNEL_ID}> (no more than 250 words, in plain language without overly complex industry lingo)."
+            # Check dedupe guard before prompting Zero
+            closing_content = (latest_env_msg.get("content") or "").lower() if latest_env_msg else ""
+            already_dispatched = (
+                "executive summary dispatched" in closing_content
+                or "summary dispatched to #lounge" in closing_content
+                or "summary dispatched to lounge" in closing_content
             )
-            actions.append(f"Summary prompt to Zero on {subject}")
-            if post_discord(summary_msg, dry_run=dry_run):
+            if not already_dispatched:
+                try:
+                    from tools.outbox import is_duplicate_outbox_message
+                    is_dup, _ = is_duplicate_outbox_message("lounge", f"Executive Summary: {subject}")
+                    if is_dup:
+                        already_dispatched = True
+                except Exception:
+                    pass
+
+            if already_dispatched:
+                actions.append(f"Summary already dispatched for {subject}; suppressing prompt to Zero")
                 if not dry_run:
                     state.setdefault("summarized_subjects", {})[concluded_key] = now
                     save_state(state)
+            else:
+                summary_msg = (
+                    f"🍌 **Discussion Concluded**: Topic `{subject}` has reached resolution.\n"
+                    f"<@{ZERO_BOT_ID}> (@Zero): Please synthesize and deliver a concise summary of this discussion to <#{LOUNGE_CHANNEL_ID}> (no more than 250 words, in plain language without overly complex industry lingo)."
+                )
+                actions.append(f"Summary prompt to Zero on {subject}")
+                if post_discord(summary_msg, dry_run=dry_run):
+                    if not dry_run:
+                        state.setdefault("summarized_subjects", {})[concluded_key] = now
+                        save_state(state)
 
     if actions or (now - (state.get("last_check_ts") or 0) >= 300):
         state["last_check_ts"] = now

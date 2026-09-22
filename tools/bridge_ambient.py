@@ -51,6 +51,30 @@ BANANA_WATCHER_BOT_ID = 1545924520236290198
 PROCESSED_BACKLOG_MSG_IDS: set[int] = set()
 channel_last_bot_reply: dict[int, float] = {}
 
+NON_NAME_NOUNS = r"(?:day|shot|downtime|errors?|detections?|latency|tolerance|cost|percent|sum|crossing|emission|point|index|out|wrapping|layout|config)\b"
+
+
+def contains_zero_mention(text: str) -> bool:
+    """Check if text addresses Zero via @Zero, snowflake, vocative, or bare 'Zero' text."""
+    if not text:
+        return False
+    # 1. Explicit @zero mention anywhere
+    if re.search(r"@zero\b", text, re.IGNORECASE):
+        return True
+    # 2. Greetings: 'hey/hi/hello zero'
+    if re.search(r"\b(?:hey|hi|hello)\s+zero\b", text, re.IGNORECASE):
+        return True
+    # 3. Punctuation vocative: 'Zero:', 'Zero,', 'Zero -', 'Zero?'
+    if re.search(r"(?:^|[\n.!?\s,;])zero\s*[:,-]", text, re.IGNORECASE) or re.search(r"\bzero\s*[?!]", text, re.IGNORECASE):
+        return True
+    # 4. Directive verbs targeting Zero: 'ask Zero', 'tag Zero', 'tell Zero', 'cc Zero'
+    if re.search(r"\b(?:ask|tag|tell|ping|cc)\s+zero\b", text, re.IGNORECASE):
+        return True
+    # 5. Sentence starter: 'Zero <verb/query>' at start of message, line, or sentence
+    if re.search(r"(?:^|[\n.!?]\s*)zero\b(?:\s+(?!" + NON_NAME_NOUNS + r")\S+|$)", text, re.IGNORECASE):
+        return True
+    return False
+
 
 async def warm_channel_history(
     channel: discord.abc.Messageable,
@@ -144,7 +168,8 @@ async def route_external_message(
             (bot.user and bot.user in msg.mentions) or
             f"<@{bot_id}>" in content or
             f"<@!{bot_id}>" in content or
-            re.search(r"(?:@zero\b|@robot\b|\b(?:hey|hi|hello)\s+@?zero\b|^\s*@?zero\s*[:,-])", content, re.IGNORECASE) is not None
+            contains_zero_mention(content) or
+            re.search(r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])", content, re.IGNORECASE) is not None
         )
 
         if not ((is_owner or is_ivy) and is_tagged):
@@ -378,7 +403,7 @@ async def route_external_message(
             (bot.user and bot.user in msg.mentions) or
             f"<@{bot_id}>" in content or
             f"<@!{bot_id}>" in content or
-            re.search(r"(?:^|[\s,;])@zero\b", content, re.IGNORECASE) is not None or
+            contains_zero_mention(content) or
             is_robot_tagged or
             is_team_tagged or
             is_reply_to_zero
@@ -444,7 +469,8 @@ async def route_external_message(
         bot_mention_2 in content or
         is_robot_tagged or
         is_team_tagged or
-        re.search(r"(?:@zero\b|@robot\b|\b(?:hey|hi|hello)\s+@?zero\b|^\s*@?zero\s*[:,-])", content, re.IGNORECASE) is not None or
+        contains_zero_mention(content) or
+        re.search(r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])", content, re.IGNORECASE) is not None or
         is_reply_to_zero or
         handoff_for_zero or
         is_conversational_follow_up
@@ -496,7 +522,7 @@ async def route_external_message(
         cleaned = re.sub(rf"<@&{rid}>", "", cleaned)
 
     if not other_mentions and not is_banana_directive:
-        cleaned = re.sub(r"^(hey\s+)?zero[:,\s]*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(?:hey\s+)?zero\b[:,\s]*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"@zero\b", "", cleaned, flags=re.IGNORECASE)
     elif is_banana_directive:
         cleaned = re.sub(r"@Zero\s*\(@Zero\):?", "@Zero:", cleaned, flags=re.IGNORECASE)

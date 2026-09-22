@@ -21,6 +21,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
+ENV_PATH = Path("/workspace/.env")
+if ENV_PATH.exists():
+    for _line in ENV_PATH.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 REPO_DIR = Path("/workspace/kalshi-quant")
 STATE_FILE = Path("/workspace/data/kalshi_autoworker_state.json")
 SCHEDULE_FILE = Path("/workspace/data/schedule.json")

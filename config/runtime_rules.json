@@ -11,11 +11,18 @@
   "turn_watchdog_seconds": 300.0,
   "turn_max_ceiling_seconds": 1800.0,
   "live_status_ticker_enabled": false,
+  "task_settle_enabled": true,
+  "task_settle_timeout_seconds": 25.0,
+  "task_settle_max_resumptions": 1,
   "compaction_max_turns": 15,
   "compaction_max_steps": 1500,
   "compaction_max_mb": 2.0,
   "channel_tag_requirements": {
     "1534452820995080192": [
+      "1543285916506783799",
+      "1543462881624858624"
+    ],
+    "1551465050072416286": [
       "1543285916506783799",
       "1543462881624858624"
     ]
@@ -58,7 +65,8 @@
   "last_word_pause_minutes": 3,
   "last_word_channels": [
     1534452820995080192,
-    1534436119888793750
+    1534436119888793750,
+    1551465050072416286
   ],
   "gif_diversity": {
     "enabled": false,

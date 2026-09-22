@@ -119,6 +119,30 @@ class TestBananaWatcher(unittest.TestCase):
             actions = check_channel_and_evaluate(dry_run=True)
             self.assertTrue(any("Summary prompt to Zero on banana-sync-hardening" in a for a in actions))
 
+    @patch("tools.banana.get_status", return_value={"holder": None})
+    @patch("tools.banana_watcher.post_discord", return_value=True)
+    @patch("tools.banana_watcher.load_state", return_value={"nudged_stalls": {}, "nudged_handoffs": {}, "warned_contradictions": {}, "summarized_subjects": {}})
+    @patch("tools.banana_watcher.save_state")
+    def test_already_dispatched_summary_suppresses_prompt(self, mock_save, mock_load, mock_post, mock_bstatus):
+        raw_msgs = [
+            {
+                "id": "1002",
+                "timestamp": "2026-09-07T02:05:00Z",
+                "author": {"id": "1542285964213358633", "username": "Zero"},
+                "content": '🍌 Parking `banana-sync-hardening`: Executive summary dispatched to #lounge.\n\n```handoff\n{"v": 1, "kind": "resolution", "floor": "closed", "reply": "none", "subject": "banana-sync-hardening"}\n```'
+            },
+            {
+                "id": "1001",
+                "timestamp": "2026-09-07T02:00:20Z",
+                "author": {"id": "1468012353206354197", "username": "Amos"},
+                "content": '```handoff\n{"v": 1, "kind": "proposal", "floor": "open", "subject": "banana-sync-hardening", "round": 1}\n```'
+            }
+        ]
+        with patch("tools.banana_watcher.get_recent_messages", return_value=raw_msgs):
+            actions = check_channel_and_evaluate(dry_run=True)
+            self.assertTrue(any("Summary already dispatched for banana-sync-hardening; suppressing prompt to Zero" in a for a in actions))
+            mock_post.assert_not_called()
+
     def test_analyze_contradictions_direct(self):
         from tools.banana_watcher import analyze_envelope_contradictions
 
@@ -157,6 +181,55 @@ class TestBananaWatcher(unittest.TestCase):
         # Clean terminal envelope produces NO contradictions
         c_clean = analyze_envelope_contradictions({"kind": "consensus", "reply": "none", "floor": "closed", "round": 3, "max_rounds": 10, "subject": "topic-clean"}, subject_turns=3)
         self.assertEqual(c_clean, [])
+
+        # 8. Game topic floor closed triggers game_floor_closed contradiction
+        c8 = analyze_envelope_contradictions({"kind": "status", "floor": "closed", "subject": "agora-trading-floor"})
+        self.assertEqual([x["tag"] for x in c8], ["game_floor_closed"])
+
+        # Game topic with round == max_rounds does NOT trigger governor breach
+        c_game_rounds = analyze_envelope_contradictions({"kind": "status", "floor": "open", "round": 5, "max_rounds": 5, "subject": "agora-trading-floor"})
+        self.assertEqual(c_game_rounds, [])
+
+    @patch("tools.banana.get_status", return_value={"holder": None})
+    @patch("tools.banana_watcher.post_discord", return_value=True)
+    @patch("tools.banana_watcher.load_state", return_value={"nudged_stalls": {}, "nudged_handoffs": {}, "warned_contradictions": {}, "summarized_subjects": {}})
+    @patch("tools.banana_watcher.save_state")
+    def test_game_topic_exempt_from_loop_warning(self, mock_save, mock_load, mock_post, mock_bstatus):
+        # 12 turns on agora-trading-floor must NOT trigger loop warning
+        raw_msgs = [
+            {
+                "id": str(1000 + i),
+                "timestamp": "2026-09-20T20:50:00Z",
+                "author": {"id": "1542285964213358633", "username": "Zero"},
+                "content": f'```handoff\n{{"v": 1, "kind": "status", "floor": "open", "subject": "agora-trading-floor", "round": {i}}}\n```'
+            }
+            for i in range(12)
+        ]
+        with patch("tools.banana_watcher.get_recent_messages", return_value=raw_msgs):
+            actions = check_channel_and_evaluate(dry_run=True)
+            self.assertEqual(actions, [])
+            mock_post.assert_not_called()
+
+    @patch("tools.banana.get_status", return_value={"holder": None})
+    @patch("tools.banana_watcher.post_discord", return_value=True)
+    @patch("tools.banana_watcher.load_state", return_value={"nudged_stalls": {}, "nudged_handoffs": {}, "warned_contradictions": {}, "summarized_subjects": {}})
+    @patch("tools.banana_watcher.save_state")
+    def test_game_topic_exempt_from_stall_and_autoclose(self, mock_save, mock_load, mock_post, mock_bstatus):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        msg_time_str = (now - timedelta(minutes=35)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        raw_msgs = [
+            {
+                "id": "12349",
+                "timestamp": msg_time_str,
+                "author": {"id": "1542285964213358633", "username": "Zero"},
+                "content": '```handoff\n{"v": 1, "kind": "status", "floor": "open", "subject": "operation-agon"}\n```'
+            }
+        ]
+        with patch("tools.banana_watcher.get_recent_messages", return_value=raw_msgs):
+            actions = check_channel_and_evaluate(dry_run=True)
+            self.assertEqual(actions, [])
+            mock_post.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

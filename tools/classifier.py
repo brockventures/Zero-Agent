@@ -41,7 +41,7 @@ ZERO_TAGS = [
     r"<@&1543462881624858624>",  # Team role
     r"<@&1543285916506783799>",  # Robot role (Crab Cavern)
     r"<@&1542294519914037341>",  # Robot role (legacy/alt)
-    r"(?:@zero\b|\b(?:hey|hi|hello)\s+@?zero\b|^\s*@?zero\s*[:,-])",
+    r"(?:@zero\b|\b(?:hey|hi|hello)\s+zero\b|(?:^|[\n.!?\s,;])zero\s*[:,-]|\bzero\s*[?!]|\b(?:ask|tag|tell|ping|cc)\s+zero\b|(?:^|[\n.!?]\s*)zero\b(?:\s+(?!(?:day|shot|downtime|errors?|detections?|latency|tolerance|cost|percent|sum|crossing|emission|point|index|out|wrapping|layout|config)\b)\S+|$))",
     r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])"
 ]
 

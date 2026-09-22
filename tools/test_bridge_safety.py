@@ -37,14 +37,26 @@ class TestBridgeSafety(unittest.TestCase):
         self.assertTrue(is_internal_cli_leak("Process c123/task-456 completed with exit code 0. Output:"))
         self.assertTrue(is_internal_cli_leak("Tool is running as a background task with task id: task-999"))
         self.assertTrue(is_internal_cli_leak("An async task has completed: task-999"))
+        self.assertTrue(is_internal_cli_leak("<WAITING_FOR_TASKS_OUTPUT>\nWait for at least one of the background tasks to complete:\n- d4e7469b-ec01-48bf-abc3-1ee1b05f8c8e/task-818</WAITING_FOR_TASKS_OUTPUT>"))
+        self.assertTrue(is_internal_cli_leak("<WAITING_FOR_TASKS_OUTPUT>\nWait for at least one of the background tasks to complete:\n- task-818"))
+        self.assertTrue(is_internal_cli_leak("Wait for at least one of the background tasks to complete:\n- task-818"))
 
         # Real substantive user messages should NEVER be classified as a leak
         self.assertFalse(is_internal_cli_leak("Deployment completed successfully. All 4 containers are healthy."))
         self.assertFalse(is_internal_cli_leak("The MLB model predicts the Dodgers over the Giants with 62% confidence."))
+        self.assertFalse(is_internal_cli_leak("I updated the task board with all open milestones."))
 
     def test_strip_internal_cli_chatter(self):
         system_msg = "<SYSTEM_MESSAGE>This is an internal instruction</SYSTEM_MESSAGE>\n\nSubstantive content here."
         self.assertEqual(strip_internal_cli_chatter(system_msg), "Substantive content here.")
+
+        task_wait_msg = (
+            "<WAITING_FOR_TASKS_OUTPUT>\n"
+            "Wait for at least one of the background tasks to complete:\n"
+            "- d4e7469b-ec01-48bf-abc3-1ee1b05f8c8e/task-818</WAITING_FOR_TASKS_OUTPUT>\n\n"
+            "Final results are ready."
+        )
+        self.assertEqual(strip_internal_cli_chatter(task_wait_msg), "Final results are ready.")
 
         task_msg = (
             "Tool is running as a background task with task id: task-xyz\n"

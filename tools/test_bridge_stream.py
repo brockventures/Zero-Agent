@@ -138,6 +138,30 @@ class TestBridgeStream(unittest.TestCase):
             harvested = harvest_transcript_response(conv_id)
             self.assertEqual(harvested, "Pong from transcript.")
 
+    def test_harvest_transcript_response_does_not_cross_turn_boundary(self):
+        """Verify that harvest_transcript_response never harvests previous turn's response when active turn is incomplete."""
+        conv_id = "test-conv-boundary"
+        log_dir = self.temp_path / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript_full.jsonl"
+
+        steps = [
+            # Turn 1: Completed
+            {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "What's next?"},
+            {"type": "PLANNER_RESPONSE", "content": "Here is what is on deck."},
+            # Turn 2: Incomplete (process terminated mid-turn during tool calls)
+            {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Go for 1 and 2"},
+            {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command"}]},
+            {"type": "GENERIC", "content": "Running tests..."},
+        ]
+        with open(transcript_file, "w") as f:
+            for s in steps:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            harvested = harvest_transcript_response(conv_id)
+            self.assertIsNone(harvested)
+
     def test_parse_agy_error(self):
         text = 'AGY_ERROR: {"canonical_status": "UNAVAILABLE", "code": 503, "retryable": true, "error_id": "err-503", "short_error": "Backend timeout"}\n'
         err = parse_agy_error(text)
