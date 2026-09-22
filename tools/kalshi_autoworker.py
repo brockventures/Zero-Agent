@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Kalshi Task Board Autonomous Sprint Runner & Autoworker.
 
-Wakes up every 5 minutes via Karakos interval schedule exclusively in #vault (1550577910757458015).
+Wakes up every 5 minutes via interval schedule exclusively in #vault (1550577910757458015).
 Inspects GitHub Project #3 and brockventures/kalshi-quant issues.
 Executes task implementation, runs verification tests, updates project item status to Done,
 closes resolved issues, commits code to git, and populates new follow-on tasks as needed.

@@ -273,7 +273,7 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
 
 def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     """
-    Karakos-compatible sidecar entry point.
+    Bridge-compatible sidecar entry point.
     Returns (ok, report_or_summary, extra_data).
     - If 0 actionable issues: emits crisp 1-liner nominal report.
     - If actionable issues exist: emits structured candidate dossier for Zero.

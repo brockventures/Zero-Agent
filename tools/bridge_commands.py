@@ -338,7 +338,18 @@ async def handle_button_choice(
         await interaction.channel.send(f"🔘 **Selected:** `{choice_text}`")
         bh = sys.modules.get("tools.bridge_handlers")
         reload_action = reload_fn or (getattr(bh, "execute_bridge_reload", execute_bridge_reload) if bh else execute_bridge_reload)
-        await reload_action(interaction.client, interaction.channel, initiator=interaction.user.display_name or interaction.user.name, force=True, reason=f"Choice button '{choice_text}' selected")
+        initiator_name = interaction.user.display_name or interaction.user.name
+        try:
+            if reload_fn:
+                await reload_fn(channel=interaction.channel, initiator=initiator_name, force=True, reason=f"Choice button '{choice_text}' selected")
+            else:
+                await reload_action(interaction.client, channel=interaction.channel, initiator=initiator_name, force=True, reason=f"Choice button '{choice_text}' selected")
+        except Exception as rerr:
+            print(f"[BridgeCommands] Error triggering reload from button: {rerr}")
+            try:
+                await execute_bridge_reload(interaction.client, channel=interaction.channel, initiator=initiator_name, force=True, reason=f"Choice button '{choice_text}' selected")
+            except Exception as rerr2:
+                print(f"[BridgeCommands] Fatal fallback reload error: {rerr2}")
         return
 
     # Intercept Meal Planning choices directly (Fast-Path deterministic execution)

@@ -124,8 +124,26 @@ def check_command_line(cmd: str, cwd: str) -> tuple[bool, str]:
                     f"Command Blocked: Unbounded recursive search targeting '{cleaned}' (resolved: '{norm}') is prohibited. "
                     f"Target a specific subfolder: e.g. 'grep -rn \"pattern\" /docker/baseball/'."
                 )
+            for prefix in BLOCKED_TREE_PREFIXES:
+                if norm.startswith(prefix.rstrip("/")):
+                    if os.path.isfile(norm) and norm in SAFE_EXEMPT_FILES:
+                        continue
+                    return False, (
+                        f"Command Blocked: Recursive search inside '{cleaned}' (resolved: '{norm}') is prohibited "
+                        f"because it falls under bulk/system directory '{prefix}'. "
+                        "Target a specific workspace subfolder (e.g. /workspace/tools, /workspace/config)."
+                    )
 
-    # 4. Check known interactive CLI commands that block on STDIN
+    # 4. Check binary reverse-engineering / binary scan commands
+    has_binary_inspection = bool(re.search(r'\b(strings|hexdump|objdump|readelf|nm|gdb|radare2|ghidra)\b', cmd))
+    targets_binary_dir = bool(re.search(r'(/usr/local/bin|/usr/bin|/bin|/usr/sbin|/sbin)\b', cmd))
+    if targets_binary_dir and (has_binary_inspection or re.search(r'\bgrep\b', cmd)):
+        return False, (
+            "Command Blocked: Direct grep, strings, or disassembly inspection of system binaries "
+            "in /usr/local/bin or /usr/bin is prohibited. Check documentation or CLI help flags instead."
+        )
+
+    # 5. Check known interactive CLI commands that block on STDIN
     if re.search(r'\bnpx\s+', cmd) and not re.search(r'\b(-y|--yes)\b', cmd):
         return False, (
             "Command Blocked: 'npx' without '-y' / '--yes' hangs waiting for interactive package confirmation. "

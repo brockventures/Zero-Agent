@@ -43,6 +43,31 @@ class TestSearchGuard(unittest.TestCase):
             self.assertIn("Command Blocked", reason)
 
 
+    def test_blocks_recursive_grep_in_blocked_prefixes(self):
+        """Verify recursive grep targeting /root, /docker, /workspace/data is blocked."""
+        blocked = [
+            'grep -ri "customization.*budget" /root/.gemini/antigravity-cli/',
+            'grep -rn "secret" /docker/some_dir',
+            'rg "pattern" /workspace/data/',
+        ]
+        for cmd in blocked:
+            allowed, reason = check_command_line(cmd, "/workspace")
+            self.assertFalse(allowed, f"Expected command to be blocked: {cmd}")
+            self.assertIn("Command Blocked", reason)
+
+    def test_blocks_binary_inspection(self):
+        """Verify strings, disassembly, or grep on /usr/local/bin or /usr/bin is blocked."""
+        blocked = [
+            'strings /usr/local/bin/agy | grep -i "budget"',
+            'grep -a -o -E "[a-zA-Z0-9_]{0,30}budget" /usr/local/bin/agy',
+            'objdump -d /usr/bin/python3',
+            'hexdump -C /usr/local/bin/agy',
+        ]
+        for cmd in blocked:
+            allowed, reason = check_command_line(cmd, "/workspace")
+            self.assertFalse(allowed, f"Expected binary command to be blocked: {cmd}")
+            self.assertIn("Command Blocked", reason)
+
     def test_allows_targeted_recursive_grep(self):
         """Verify targeted recursive grep on specific folders is allowed."""
         allowed = [

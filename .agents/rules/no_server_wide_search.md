@@ -30,6 +30,10 @@ description: Hard constraint against server-wide or top-level unconstrained grep
    - Never run unbounded `grep -r`, `rg`, or `find /` from shell.
    - Always specify explicit subdirectories, use `-maxdepth <N>`, and bound outputs (e.g., `head -n 20`).
 
+6. **Prohibition of Binary Scanning & Reverse-Engineering:**
+   - NEVER run `grep`, `strings`, `hexdump`, `objdump`, or disassembly against compiled system binaries (e.g. `/usr/local/bin/agy`, `/usr/bin/*`) or multi-megabyte binary blobs.
+   - NEVER write python scratch scripts to read system binaries into memory for regex or symbol scraping during conversational turns. Check documentation, CLI `--help` flags, or system APIs instead.
+
 ---
 
 ## 🛡️ Active PreToolUse Safety Gate (Deterministic Enforcement)

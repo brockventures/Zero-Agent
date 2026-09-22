@@ -158,8 +158,8 @@ def record_restart_intent(reason: str, initiator: str = "user"):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         with open(RESTART_INTENT_FILE, "w") as f:
             json.dump({
-                "reason": reason,
-                "initiator": initiator,
+                "reason": str(reason),
+                "initiator": str(initiator),
                 "timestamp": time.time(),
                 "formatted_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }, f, indent=2)
@@ -367,12 +367,14 @@ def get_runtime_rules() -> dict:
         "anti_cascade_delay_seconds": 4.0,
         "bot_word_floor": 4,
         "worker_memory_cap_mb": 2048,
-        "max_parallel_workers": 3,
+        "max_parallel_workers": 5,
         "ambient_classifier_enabled": True,
         "ambient_relevance_threshold": 0.80,
         "auto_thread_escalation_enabled": False,
         "auto_thread_escalation_seconds": 180.0,
-        "external_system_prompt": None
+        "last_word_threshold": 6,
+        "external_system_prompt": None,
+        "external_prompt_path": "/workspace/config/prompts/crab_cavern_prompt.md",
     }
     if RUNTIME_RULES_FILE.exists():
         try:
@@ -381,6 +383,13 @@ def get_runtime_rules() -> dict:
                 defaults.update(d)
         except Exception:
             pass
+    if not defaults.get("external_system_prompt"):
+        prompt_path = Path(defaults.get("external_prompt_path", "/workspace/config/prompts/crab_cavern_prompt.md"))
+        if prompt_path.exists():
+            try:
+                defaults["external_system_prompt"] = prompt_path.read_text()
+            except Exception:
+                pass
     return defaults
 
 

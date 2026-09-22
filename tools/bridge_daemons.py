@@ -240,6 +240,8 @@ class PersistentChannelWorker:
         status_msg: discord.Message | None,
         reply_target: discord.Message | discord.TextChannel | discord.Thread,
         attachments: list[str],
+        mode: str | None = None,
+        channel_id: int | None = None,
         author_name: str = "",
         apply_presence_fn=None,
         button_choice_fn=None,
@@ -250,8 +252,66 @@ class PersistentChannelWorker:
         last_word_bot_name: str | None = None,
         last_word_streak: int = 0,
         queued_at: float | None = None,
+        is_settle_reinvocation: bool = False,
+        **kwargs,
     ):
         """Execute a conversational turn on the persistent warm worker via stdin/stdout streaming."""
+        if is_settle_reinvocation:
+            return await self._execute_turn_core(
+                prompt=prompt,
+                status_msg=status_msg,
+                reply_target=reply_target,
+                attachments=attachments,
+                author_name=author_name,
+                apply_presence_fn=apply_presence_fn,
+                button_choice_fn=button_choice_fn,
+                quick_choice_view_cls=quick_choice_view_cls,
+                reload_fn=reload_fn,
+                is_last_word=is_last_word,
+                last_word_bot_id=last_word_bot_id,
+                last_word_bot_name=last_word_bot_name,
+                last_word_streak=last_word_streak,
+                queued_at=queued_at,
+                is_settle_reinvocation=True,
+            )
+
+        async with self.lock:
+            return await self._execute_turn_core(
+                prompt=prompt,
+                status_msg=status_msg,
+                reply_target=reply_target,
+                attachments=attachments,
+                author_name=author_name,
+                apply_presence_fn=apply_presence_fn,
+                button_choice_fn=button_choice_fn,
+                quick_choice_view_cls=quick_choice_view_cls,
+                reload_fn=reload_fn,
+                is_last_word=is_last_word,
+                last_word_bot_id=last_word_bot_id,
+                last_word_bot_name=last_word_bot_name,
+                last_word_streak=last_word_streak,
+                queued_at=queued_at,
+                is_settle_reinvocation=False,
+            )
+
+    async def _execute_turn_core(
+        self,
+        prompt: str,
+        status_msg: discord.Message | None,
+        reply_target: discord.Message | discord.TextChannel | discord.Thread,
+        attachments: list[str],
+        author_name: str = "",
+        apply_presence_fn=None,
+        button_choice_fn=None,
+        quick_choice_view_cls=None,
+        reload_fn=None,
+        is_last_word: bool = False,
+        last_word_bot_id: str | None = None,
+        last_word_bot_name: str | None = None,
+        last_word_streak: int = 0,
+        queued_at: float | None = None,
+        is_settle_reinvocation: bool = False,
+    ):
         from tools.bridge_runner import (
             steering_channels,
             reset_session_keys,
@@ -264,12 +324,12 @@ class PersistentChannelWorker:
             queued_at=queued_at,
         )
 
-        async with self.lock:
+        eng_carry_block = ""
+        if not is_settle_reinvocation:
             # 1. Compaction / Reset Check
             timer.mark_compaction_start()
             current_turns = increment_session_turn(self.sess_key)
             should_compact, compact_reason = check_compaction_needed(self.conv_id, current_turns)
-            eng_carry_block = ""
 
             if should_compact or (self.sess_key in reset_session_keys):
                 if self.sess_key in reset_session_keys:
@@ -444,14 +504,57 @@ class PersistentChannelWorker:
                 turn_timeout_seconds=float(rules.get("turn_watchdog_seconds", 300.0)),
             )
 
-            self.turn_count += 1
+            if not is_settle_reinvocation:
+                self.turn_count += 1
             self.last_turn_at = time.time()
             if coord.conv_id:
                 self.conv_id = coord.conv_id
 
+            final_text = output_response or "*(No output from agent)*"
+
+            # TaskSettle Protocol: Detect and settle premature turn exits while background tasks are pending
+            if (
+                rules.get("task_settle_enabled", True)
+                and not is_settle_reinvocation
+                and not coord.timed_out
+                and not coord.last_agy_error
+            ):
+                try:
+                    from tools.task_settle import evaluate_and_settle_turn
+
+                    settle_timeout = float(rules.get("task_settle_timeout_seconds", 25.0))
+                    was_settled, settled_text = await evaluate_and_settle_turn(
+                        conv_id=self.conv_id,
+                        channel_id=self.channel_id,
+                        mode=self.mode,
+                        status_msg=coord.status_msg,
+                        reply_target=reply_target,
+                        reinvoke_coro_fn=self.execute_turn,
+                        timeout_seconds=settle_timeout,
+                        current_text=final_text,
+                        turn_kwargs={
+                            "author_name": author_name,
+                            "apply_presence_fn": apply_presence_fn,
+                            "button_choice_fn": button_choice_fn,
+                            "quick_choice_view_cls": quick_choice_view_cls,
+                            "reload_fn": reload_fn,
+                            "is_last_word": is_last_word,
+                            "last_word_bot_id": last_word_bot_id,
+                            "last_word_bot_name": last_word_bot_name,
+                            "last_word_streak": last_word_streak,
+                            "queued_at": queued_at,
+                        },
+                    )
+                    if was_settled:
+                        return settled_text
+                    elif settled_text:
+                        final_text = settled_text
+                except Exception as settle_err:
+                    print(f"[BridgeDaemon] TaskSettle error in #{self.name}: {settle_err}")
+
             # Deliver response output to Discord
             await deliver_turn_output(
-                output_text=output_response or "*(No output from agent)*",
+                output_text=final_text,
                 status_msg=coord.status_msg,
                 reply_target=reply_target,
                 mode=self.mode,
@@ -470,6 +573,7 @@ class PersistentChannelWorker:
                 last_word_streak=last_word_streak,
                 timer=timer,
             )
+            return final_text
 
 
 class PersistentDaemonManager:

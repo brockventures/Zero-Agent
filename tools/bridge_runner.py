@@ -181,6 +181,8 @@ async def execute_agy_turn(
                     status_msg=status_msg,
                     reply_target=reply_target,
                     attachments=attachments,
+                    mode=mode,
+                    channel_id=channel_id,
                     author_name=author_name,
                     apply_presence_fn=apply_presence_fn,
                     button_choice_fn=button_choice_fn,
@@ -190,6 +192,7 @@ async def execute_agy_turn(
                     last_word_bot_name=last_word_bot_name,
                     last_word_streak=last_word_streak,
                     queued_at=queued_at,
+                    is_settle_reinvocation=is_settle_reinvocation,
                 )
             except Exception as pe:
                 print(f"[BridgeRunner] ⚠️ Persistent daemon turn error in channel {channel_id}: {pe}. Ensuring worker recycled & falling back to dynamic execution...")
@@ -618,6 +621,7 @@ async def execute_agy_turn(
                 reply_target=reply_target,
                 reinvoke_coro_fn=execute_agy_turn,
                 timeout_seconds=settle_timeout,
+                current_text=final_text,
                 turn_kwargs={
                     "author_name": author_name,
                     "apply_presence_fn": apply_presence_fn,
@@ -633,6 +637,8 @@ async def execute_agy_turn(
             if was_settled:
                 # The reinvoked turn finished and already delivered the substantive final output
                 return settled_text
+            elif settled_text:
+                final_text = settled_text
         except Exception as settle_err:
             print(f"[BridgeRunner] TaskSettle error: {settle_err}")
 

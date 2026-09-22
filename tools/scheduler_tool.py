@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Karakos-Style Persistent Sidecar Scheduler for Ivy-AG.
+"""Persistent Sidecar Scheduler.
 
 Maintains /workspace/data/schedule.json:
 - Durable across container restarts and crashes.
@@ -482,7 +482,7 @@ def format_schedule_summary() -> str:
 
     sorted_jobs = sorted(jobs, key=lambda x: x.get("next_run_ts", float("inf")))
 
-    out = [f"📅 **Karakos Sidecar Schedule** — Current Time: `{now_pt.strftime('%I:%M %p PT')}`\n"]
+    out = [f"📅 **Sidecar Schedule** — Current Time: `{now_pt.strftime('%I:%M %p PT')}`\n"]
     for j in sorted_jobs:
         status = "🟢 Active" if j.get("enabled", True) else "⏸️ Paused"
         next_dt = datetime.fromtimestamp(j["next_run_ts"], tz=PT)
