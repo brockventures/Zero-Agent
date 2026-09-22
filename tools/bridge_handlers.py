@@ -585,6 +585,24 @@ async def handle_on_ready(
             f"You (Zero) just completed a reboot/reload on {host_name}.\n"
             f"• Restart Reason: {restart_reason} {'(Planned Feature Deploy/Update)' if is_intentional else '(System/Container Boot)'}\n"
         )
+
+        # Include active git commit status
+        try:
+            from tools.bridge_git_sync import LAST_SYNC_FILE, get_current_git_sha
+            sha = get_current_git_sha()
+            sync_detail = ""
+            if LAST_SYNC_FILE.exists():
+                try:
+                    with open(LAST_SYNC_FILE, "r") as sf:
+                        sd = json.load(sf)
+                        if sd.get("sha") == sha:
+                            sync_detail = f" (auto-synced {sd.get('files_count', 0)} files before reload)"
+                except Exception:
+                    pass
+            startup_prompt += f"• Active Git Commit: `{sha}`{sync_detail}\n"
+        except Exception:
+            pass
+
         if interrupted_prompt:
             if interrupted_attempts >= 2:
                 startup_prompt += f"• Interrupted Task Prior to Reboot: \"{interrupted_prompt[:150]}\" (cleared after {interrupted_attempts} attempts to prevent hang loop)\n"
@@ -595,7 +613,7 @@ async def handle_on_ready(
             "\nDeliver a sharp, confident, and proactive restart briefing to Ryan in #zero-chat:\n"
             "1. MUST start your message with the exact standard status header:\n"
             "🟢 **Zero is online and ready.**\n\n"
-            "2. Explain concisely why you restarted (e.g. what features were just deployed, upgraded, or recovered).\n"
+            "2. Explain concisely why you restarted (e.g. what features were just deployed, upgraded, or recovered, including the active git commit).\n"
             "3. Proactively propose 2-3 immediate, actionable next steps or open threads.\n"
             "4. End with interactive [CHOICES: Step 1 | Step 2 | Step 3] buttons."
         )

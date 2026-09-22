@@ -129,7 +129,7 @@ Zero operates in two distinct routing modes:
 *Note: Scheduled cron scripts (`update_antigravity.py`, `ha_update_check.py`, `dockhand_update.py`, `ha_battery_check.py`, `nas_storage_check.py`, `plex_weekly_digest.py`) run via `bridge_scheduler.py` and live in [`.agents/memory/public/reference_native_maintenance_tools.md`](file:///workspace/.agents/memory/public/reference_native_maintenance_tools.md).*
 
 ### 4. Bridge Reload & Hot-Patching Invariant
-When updating bridge code/templates: (1) Modify `/workspace/tools/bridge_*.py` first. (2) Mirror to `/app/` (`cp /workspace/tools/bridge_*.py /app/`). (3) Advise Ryan that reload is required with `[CHOICES: Reload Bridge In-Place | Postpone Reload]`.
+When updating bridge code/templates: (1) Modify `/workspace/tools/bridge_*.py` first. (2) Pre-Reload Git Synchronization: Any reload (button choice, `!reload`, or watchdog flag) automatically stages, commits, and pushes modified architecture code and tools to `origin/main` via `tools/bridge_git_sync.py`. (3) Mirror to `/app/` (`cp /workspace/tools/bridge_*.py /app/`). (4) Advise Ryan that reload is required with `[CHOICES: Reload Bridge In-Place | Postpone Reload]`. Startup briefings verify the active commit SHA.
 
 ---
 

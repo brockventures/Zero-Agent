@@ -218,6 +218,19 @@ async def execute_bridge_reload(
         except Exception:
             pass
 
+    # 0. Pre-Reload Git Synchronization: Auto-sync architecture changes to origin/main
+    try:
+        from tools.bridge_git_sync import sync_git_on_reload
+        sync_res = sync_git_on_reload(reason=reason, initiator=initiator)
+        if sync_res.get("synced"):
+            print(f"[Bridge] 🚀 Pre-reload git sync: {sync_res.get('message')}")
+        elif sync_res.get("clean"):
+            print(f"[Bridge] 🟢 Pre-reload git sync: {sync_res.get('message')}")
+        elif sync_res.get("error"):
+            print(f"[Bridge] ⚠️ Pre-reload git sync notice: {sync_res.get('message')}")
+    except Exception as gse:
+        print(f"[Bridge] Warning during pre-reload git sync: {gse}")
+
     # Terminate persistent daemons and active procs cleanly so they don't linger
     try:
         from tools.bridge_daemons import daemon_manager
@@ -282,6 +295,15 @@ async def execute_container_restart(
             await channel.send("🔄 **Restarting Zero Docker container on Host 2 over SSH...**\n• Full cgroup wipe & clean PID 1 reinitialization.")
         except Exception:
             pass
+
+    # Pre-Restart Git Synchronization: Ensure architecture updates are pushed before container wipe
+    try:
+        from tools.bridge_git_sync import sync_git_on_reload
+        sync_res = sync_git_on_reload(reason=reason, initiator=initiator)
+        if sync_res.get("synced"):
+            print(f"[Bridge] 🚀 Pre-restart git sync: {sync_res.get('message')}")
+    except Exception as gse:
+        print(f"[Bridge] Warning during pre-restart git sync: {gse}")
 
     try:
         from tools.nas_docker_mcp import _resolve_nas_config
