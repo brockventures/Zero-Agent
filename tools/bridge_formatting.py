@@ -218,6 +218,49 @@ def format_for_discord(text: str) -> str:
     pattern = r"(\*\*|\*)?\[([^\]]+)\]\(<?(https?://[^\)>]+)>?\)(?:\1)?"
     text = re.sub(pattern, normalize_discord_links, text)
 
+    # 1c. Collapse bare URLs (<https://...>) by default to suppress bloated link preview cards
+    # Preserves code blocks, markdown links, already bracketed URLs, and visual GIFs
+    def collapse_bare_urls(content: str) -> str:
+        code_blocks = []
+        def save_code(m):
+            code_blocks.append(m.group(0))
+            return f"__CODE_BLOCK_{len(code_blocks)-1}__"
+
+        s = re.sub(r"```[\s\S]*?```|`[^`\n]+`", save_code, content)
+
+        md_links = []
+        def save_md(m):
+            md_links.append(m.group(0))
+            return f"__MD_LINK_{len(md_links)-1}__"
+        s = re.sub(r"\[[^\]]+\]\([^\)]+\)", save_md, s)
+
+        bracketed = []
+        def save_bracket(m):
+            bracketed.append(m.group(0))
+            return f"__BRACKETED_{len(bracketed)-1}__"
+        s = re.sub(r"<https?://[^>]+>", save_bracket, s)
+
+        def wrap_bare(m):
+            url = m.group(1)
+            punct = m.group(2) or ""
+            if "tenor.com/view/" in url or "giphy.com/gifs/" in url:
+                return f"{url}{punct}"
+            return f"<{url}>{punct}"
+
+        url_pattern = r"(https?://[^\s<>\(\)\[\]]+?)([.,;:?!]?)(?=[.,;:?!]?(?:\s|$|\)))"
+        s = re.sub(url_pattern, wrap_bare, s)
+
+        for i, b in enumerate(bracketed):
+            s = s.replace(f"__BRACKETED_{i}__", b)
+        for i, m in enumerate(md_links):
+            s = s.replace(f"__MD_LINK_{i}__", m)
+        for i, c in enumerate(code_blocks):
+            s = s.replace(f"__CODE_BLOCK_{i}__", c)
+
+        return s
+
+    text = collapse_bare_urls(text)
+
     # 2. Strip internal action/progress pseudo-tags (e.g. <Action: ...>)
     text = re.sub(r"<\s*action:[^>]+>", "", text, flags=re.IGNORECASE)
 

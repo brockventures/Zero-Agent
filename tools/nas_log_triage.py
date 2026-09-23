@@ -122,7 +122,8 @@ noise_re = re.compile(
     r'192\.168\.1\.164:3333.*connection refused|'
     r'twcc_sender_interceptor.*read\/write on closed pipe|'
     r'write tcp.*write: broken pipe|'
-    r'\[Summarizer\] LLM synthesis fallback'
+    r'\[Summarizer\] LLM synthesis fallback|'
+    r'canceled by remote with error code 0'
     r')',
     re.IGNORECASE
 )

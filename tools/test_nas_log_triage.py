@@ -41,5 +41,13 @@ class TestNasLogTriage(unittest.TestCase):
         self.assertIsNotNone(rx.search("kernel: out of memory: oom-killer"))
         self.assertIsNotNone(rx.search("fatal error encountered"))
 
+    def test_noise_re_cloudflared_disconnect(self):
+        from tools.nas_log_triage import REMOTE_BATCH_SCANNER
+        ns = {}
+        exec("import re\n" + REMOTE_BATCH_SCANNER[:REMOTE_BATCH_SCANNER.find("err_re =")], ns)
+        rx = ns["noise_re"]
+        sample = '2026-09-23T04:16:42Z ERR Request failed error="stream 64477 canceled by remote with error code 0" connIndex=0 dest=https://outpost.brock.ventures/events'
+        self.assertIsNotNone(rx.search(sample))
+
 if __name__ == "__main__":
     unittest.main()

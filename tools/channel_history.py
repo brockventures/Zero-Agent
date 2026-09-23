@@ -219,9 +219,13 @@ def format_channel_context(
 def is_handoff_addressed_to_zero(content: str) -> bool:
     """
     Check if a message contains a v0 handoff block explicitly targeting Zero
-    or requiring response from Zero.
+    or requiring response from Zero. Physical snowflake tags override envelope defaults.
     """
     try:
+        # Physical mention snowflake invariant: explicit tag wakes Zero regardless of envelope to
+        if "<@1542285964213358633>" in content or "<@!1542285964213358633>" in content:
+            return True
+
         if "🍌 **Discussion Concluded**" in content and ("<@1542285964213358633>" in content or "@zero" in content.lower()):
             return True
 

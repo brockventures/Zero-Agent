@@ -258,6 +258,13 @@ if __name__ == "__main__":
         print("Free:", is_free())
     elif cmd == "health":
         print(json.dumps(check_health(), indent=2))
+    elif cmd == "claim":
+        subj = sys.argv[2] if len(sys.argv) > 2 else ""
+        res = claim(subj)
+        print(json.dumps(res, indent=2))
+    elif cmd == "release":
+        res = release()
+        print(json.dumps(res, indent=2))
     elif cmd == "test":
         print("1. Status:", get_status().get("holder"))
         print("2. Claiming...")
