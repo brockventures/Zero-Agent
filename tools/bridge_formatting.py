@@ -253,7 +253,8 @@ def format_for_discord(text: str) -> str:
 
     # 8. Ensure handoff envelopes include physical Discord mentions for peer bots
     try:
-        from tools.handoff import ensure_handoff_mentions
+        from tools.handoff import convert_bare_peer_mentions, ensure_handoff_mentions
+        text = convert_bare_peer_mentions(text)
         text = ensure_handoff_mentions(text)
     except Exception:
         pass

@@ -772,5 +772,16 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertIn("Process:** `PID 12345`", msg)
 
 
+    def test_convert_bare_peer_mentions(self):
+        from tools.handoff import convert_bare_peer_mentions
+        raw = "Hey @Amos and @Marvin, see inline code and codeblock."
+        res = convert_bare_peer_mentions(raw)
+        self.assertIn("<@1468012353206354197>", res)
+        self.assertIn("<@1492043459618537492>", res)
+        # Check via format_for_discord
+        out = format_for_discord("Ping @Amos about the sprint.")
+        self.assertIn("<@1468012353206354197>", out)
+
+
 if __name__ == "__main__":
     unittest.main()

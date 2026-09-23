@@ -18,7 +18,7 @@ PT_NOW = time.strftime("%Y-%m-%d %H:%M:%S PT")
 LOG_DIR = Path("/workspace/data")
 TRADER_LOG = LOG_DIR / "trader_burst_session.log"
 ROUNDS = 8
-INTERVAL = 25.0
+INTERVAL = 180.0
 
 print(f"=== [Agora Burst Orchestrator] Session Launch at {PT_NOW} ===")
 print(f"Targeting: {ROUNDS} rounds @ {INTERVAL}s tick interval")
