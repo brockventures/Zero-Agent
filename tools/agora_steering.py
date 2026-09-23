@@ -303,9 +303,9 @@ def synthesize_pm_steering_update(
         f"1. DELTA-DRIVEN REPORTING: Compare today against Yesterday's Briefing. Focus heavily on what MOVED TODAY (last 24 hours). Do NOT re-announce merged PRs or milestones that were already announced yesterday unless there is new follow-up progress today.\n"
         f"2. STEADY-STATE COMPACTNESS: If an operational area (e.g. Amos's ledger, Marvin's harness, Zero's matching engine) had no new code changes today, state its steady-state readiness in a single concise phrase. Do NOT fabricate or recycle old PR descriptions to fill space.\n"
         f"3. DECISION & BLOCKER GROUNDING: Look strictly for explicit, unresolved blocker questions asked by team members (Amos, Marvin, Aerial, Zero) to Mike in the provided 24-hour chat history. If there are NO unresolved decisions pending in the chat context, you MUST state: 'None pending — autonomous execution active.' NEVER speculate, invent, or bring up hypothetical infrastructure/DNS/token decisions.\n"
-        f"4. DISCORD FORMATTING: Use clean native Discord markdown list syntax ('- ' with 2-space indentation). NEVER use LaTeX math ($d$), ASCII boxes, markdown pipe tables, or literal Unicode bullets ('• ').\n"
+        f"4. DISCORD FORMATTING: Use clean native Discord markdown list syntax ('- ' with 2-space indentation). Enclose ALL URLs in angle brackets (< >) by default to suppress bloated link preview cards: e.g. '[#88](<https://github.com/...>)'. NEVER use LaTeX math ($d$), ASCII boxes, markdown pipe tables, or literal Unicode bullets ('• ').\n"
         f"5. HUMAN NAMES: Refer to human developers by real first names: Mike, Dr. Coley, Ryan.\n"
-        f"6. LENGTH: 1,100 to 1,450 characters (absolute maximum 1,600 characters). Output ONLY the final Discord message text.\n\n"
+        f"6. LENGTH: Strictly 1,000 to 1,350 characters (absolute maximum 1,500 characters). Output ONLY the final Discord message text.\n\n"
         f"Recommended Structure:\n"
         f"**Project AGORA — 9:30 PM PT Steering Briefing**\n\n"
         f"**Executive Verdict:** (1 punchy line on readiness and operational state)\n\n"
@@ -326,15 +326,16 @@ def synthesize_pm_steering_update(
         )
         if res.returncode == 0 and res.stdout.strip():
             msg = res.stdout.strip()
-            # Clean any literal Unicode bullets if the model leaked them
-            lines = []
-            for l in msg.split("\n"):
-                if l.startswith("• "):
-                    l = "- " + l[2:]
-                lines.append(l)
-            msg = "\n".join(lines)
-            if len(msg) > 1750:
-                msg = msg[:1750] + "..."
+            from tools.bridge_formatting import format_for_discord
+            msg = format_for_discord(msg)
+            if len(msg) > 1900:
+                # Truncate at the last section or line break before 1900 chars
+                cut_idx = msg.rfind("\n\n", 0, 1900)
+                if cut_idx > 1000:
+                    msg = msg[:cut_idx]
+                else:
+                    cut_idx = msg.rfind("\n", 0, 1900)
+                    msg = msg[:cut_idx] if cut_idx > 1000 else msg[:1900]
             return msg
     except Exception as e:
         print(f"[AgoraSteering] LLM synthesis fallback: {e}", file=sys.stderr)

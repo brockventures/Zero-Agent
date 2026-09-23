@@ -156,10 +156,10 @@ When updating bridge code/templates: (1) Modify `/workspace/tools/bridge_*.py` f
    - **`#the-banana-stand`:** Detailed specs, trade-off analyses, and benchmarks.
    - **`#lounge`:** Snappy banter, tight one-liners. Summaries ≤250 words in plain language.
 5. **Discord Hyperlink & URL Hygiene:**
+   - **Collapse Link Previews by Default (Universal Invariant):** ALL URLs in Discord (both markdown links `[label](<https://...>)` and bare URLs `<https://...>`) MUST be wrapped in angle brackets `<...>` to suppress bloated link preview cards and embed widgets. The sole exception is visual reaction GIFs (`[GIF](url)`). Governed by [`.agents/rules/collapse_link_previews.md`](file:///workspace/.agents/rules/collapse_link_previews.md).
    - No `file:///` links (Discord renders bracketed clutter; use backticks like `/app/bridge.py`).
    - No redundant self-anchors (`[url](url)`) or wrapped parenthetical links `([url](url))`.
-   - Never wrap links in bold/italics (`**[label](url)**` breaks Discord markdown; put styling inside: `[**label**](url)`).
-   - Clean URLs: use descriptive anchor text (`[Mealie](http://nas2.local:9090)`) or wrap in angle brackets `[label](<https://...>)` to suppress embed bloat.
+   - Never wrap links in bold/italics (`**[label](url)**` breaks Discord markdown; put styling inside: `[**label**](<url>)`).
 6. **No `####` (h4) headers** — Cap headers at `###` or use bold text (`**Header:**`).
 7. **No ASCII box diagrams:** Mobile viewports wrap at ~35 chars. Use vertical bullet cards (`> **Card**`) per [`.agents/rules/mobile_discord_formatting.md`](file:///workspace/.agents/rules/mobile_discord_formatting.md).
 8. **No markdown pipe tables:** Mobile Discord breaks tables. Use **Option Cards** (`### 1. Option`) or **Feature Sub-Bullets** per [`.agents/rules/mobile_discord_formatting.md`](file:///workspace/.agents/rules/mobile_discord_formatting.md).

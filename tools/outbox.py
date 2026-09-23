@@ -208,6 +208,13 @@ def queue_outbox_message(
     clean_name, ch_id = resolve_channel(channel)
     content = content.strip()
 
+    # Format message for Discord: collapses link previews (< >), cleans broken file links, converts tables
+    try:
+        from tools.bridge_formatting import format_for_discord
+        content = format_for_discord(content)
+    except Exception:
+        pass
+
     # Strip reaction GIFs if target channel has them disabled
     try:
         from tools.bridge_state import is_gif_disabled_for_channel
@@ -365,7 +372,13 @@ def dispatch_via_rest(omsg: dict) -> bool:
 
     try:
         url = f"https://discord.com/api/v10/channels/{target_cid}/messages"
-        payload = json.dumps({"content": omsg.get("content", "")}).encode("utf-8")
+        raw_content = omsg.get("content", "")
+        try:
+            from tools.bridge_formatting import format_for_discord
+            formatted_content = format_for_discord(raw_content)
+        except Exception:
+            formatted_content = raw_content
+        payload = json.dumps({"content": formatted_content}).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=payload,
