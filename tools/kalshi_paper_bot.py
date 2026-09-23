@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo
 PT = ZoneInfo("America/Los_Angeles")
 UTC = ZoneInfo("UTC")
 
+from tools.kalshi_cross_bracket import detect_cross_bracket_arbitrage, sweep_kalshi_events
+
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 DB_PATH = Path("/workspace/data/kalshi_paper.db")
 
@@ -521,6 +523,89 @@ def scan_markets():
                         "market_obj": m
                     })
                     
+        # Check cross-bracket arbitrage on today's city weather bracket set
+        if today_markets and len(today_markets) >= 2:
+            cb_analysis = detect_cross_bracket_arbitrage(today_markets, event_title=f"{cfg['city']} Weather")
+            if cb_analysis["has_underround_arb"]:
+                print(f"  [CrossBracket] 🚨 Detected weather under-round basket arb for {cfg['city']}! Sum Ask: ${cb_analysis['sum_ask']:.2f}, Profit/share: ${cb_analysis['arb_profit_per_share']:.4f}")
+                for m in today_markets:
+                    ask = float(m.get("yes_ask_dollars") or 0.0)
+                    if ask > 0.0:
+                        opportunities.append({
+                            "city": cfg["city"],
+                            "forecast": effective_high,
+                            "ticker": m.get("ticker"),
+                            "title": m.get("title"),
+                            "side": "YES",
+                            "model_prob": 1.0,
+                            "market_price": ask,
+                            "edge": cb_analysis["arb_profit_per_share"],
+                            "category": "cross_bracket",
+                            "market_obj": m
+                        })
+            elif cb_analysis["has_overround_fade"] and cb_analysis["best_fade_bracket"]:
+                b = cb_analysis["best_fade_bracket"]
+                if b["yes_ask"] >= MIN_CONTRACT_PRICE and b["yes_ask"] <= MAX_CONTRACT_PRICE:
+                    p_fade_no = round(1.0 - b["normalized_prob"], 4)
+                    edge_fade = round(p_fade_no - b["no_ask"], 4)
+                    if edge_fade >= min_edge:
+                        opportunities.append({
+                            "city": cfg["city"],
+                            "forecast": effective_high,
+                            "ticker": b["ticker"],
+                            "title": b["title"],
+                            "side": "NO",
+                            "model_prob": p_fade_no,
+                            "market_price": b["no_ask"],
+                            "edge": edge_fade,
+                            "category": "cross_bracket",
+                            "market_obj": {"ticker": b["ticker"], "title": b["title"]}
+                        })
+
+    # Universal Cross-Bracket Sweep across Macroeconomics, Box Office, Crypto, and Financials
+    try:
+        print(f"[{now_pt.strftime('%Y-%m-%d %I:%M:%S %p PT')}] Sweeping Universal Cross-Bracket opportunities across all Kalshi categories (horizon <= 14d)...")
+        universal_opps = sweep_kalshi_events(max_days=14, limit=60)
+        for uo in universal_opps:
+            a = uo["analysis"]
+            ev_title = uo["event_title"]
+            if a["has_underround_arb"]:
+                print(f"  [UniversalCrossBracket] 🚨 Basket Arb: {ev_title} (Net profit/sh: ${a['arb_profit_per_share']:.4f})")
+                for vm in a["normalized_distribution"]:
+                    if vm["yes_ask"] > 0.0:
+                        opportunities.append({
+                            "city": uo["category"],
+                            "forecast": None,
+                            "ticker": vm["ticker"],
+                            "title": vm["title"],
+                            "side": "YES",
+                            "model_prob": 1.0,
+                            "market_price": vm["yes_ask"],
+                            "edge": a["arb_profit_per_share"],
+                            "category": "cross_bracket",
+                            "market_obj": {"ticker": vm["ticker"], "title": vm["title"]}
+                        })
+            elif a["has_overround_fade"] and a["best_fade_bracket"]:
+                b = a["best_fade_bracket"]
+                if b["yes_ask"] >= MIN_CONTRACT_PRICE and b["yes_ask"] <= MAX_CONTRACT_PRICE:
+                    p_fade_no = round(1.0 - b["normalized_prob"], 4)
+                    edge_fade = round(p_fade_no - b["no_ask"], 4)
+                    if edge_fade >= min_edge:
+                        opportunities.append({
+                            "city": uo["category"],
+                            "forecast": None,
+                            "ticker": b["ticker"],
+                            "title": b["title"],
+                            "side": "NO",
+                            "model_prob": p_fade_no,
+                            "market_price": b["no_ask"],
+                            "edge": edge_fade,
+                            "category": "cross_bracket",
+                            "market_obj": {"ticker": b["ticker"], "title": b["title"]}
+                        })
+    except Exception as ex:
+        print(f"  [UniversalCrossBracket] Sweep note: {ex}")
+
     return opportunities
 
 def get_clob_orderbook(ticker, depth=10):
