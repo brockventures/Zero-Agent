@@ -19,7 +19,7 @@ Whenever an ad-hoc command, script, test suite, or migration is expected or esti
 2. **NEVER hold the turn open** with standard `run_command` polling.
 3. **MANDATORY DECOUPLING:** Launch the job via `/workspace/tools/detached_runner.py start`.
 4. **SILENT EXECUTION (ZERO INTERSTITIAL CHATTER):** Do NOT output intermediate task IDs, process PIDs, or placeholder messages to chat ('Starting task...', 'Running in background...'). Conclude or proceed silently. The runner delivers strictly the final result upon completion.
-5. **ASYNCHRONOUS OUTBOX DELIVERY:** The detached runner monitors the child process to completion, logs stdout/stderr to disk, and automatically queues an outbox notification with execution status, elapsed duration, exit code, and a tail log snippet upon finish.
+5. **FAILURE-ONLY ASYNCHRONOUS OUTBOX DELIVERY:** By default, successful jobs (`exit 0`) log silently to disk with zero Discord outbox spam. The detached runner fires an outbox notification strictly on failures, timeouts, or cancellations (or if explicitly requested via `--notify-on-success`), containing the failure status, duration, filtered error snippet, and CLI log inspection command.
 
 ---
 

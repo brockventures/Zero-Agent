@@ -84,6 +84,7 @@ def start_task(
     name: str = "",
     timeout: int = 3600,
     cwd: str = "/workspace",
+    notify_on_success: bool = False,
 ) -> dict:
     """Spawn a detached background task and return its metadata immediately."""
     name_clean = name.strip() or "Ad-Hoc Background Task"
@@ -110,6 +111,7 @@ def start_task(
         "end_time": None,
         "duration_seconds": None,
         "exit_code": None,
+        "notify_on_success": bool(notify_on_success),
         "log_file": str(log_file),
     }
     _write_meta(task_id, meta)
@@ -216,37 +218,54 @@ def _run_worker(task_id: str):
     fresh_meta["duration_seconds"] = duration
     _write_meta(task_id, fresh_meta)
 
-    # Extract log tail snippet for outbox notice
+    dur_str = _format_duration(duration)
+
+    # Check notification policy: failure-only by default
+    notify_on_success = fresh_meta.get("notify_on_success", False)
+    if not notify_on_success:
+        try:
+            from tools.bridge_state import get_runtime_rules
+            notify_on_success = get_runtime_rules().get("detached_notify_on_success", False)
+        except Exception:
+            pass
+
+    # Suppress notification if task completed successfully and notify_on_success is False
+    if final_status == "completed" and not notify_on_success:
+        with open(log_file_path, "a", encoding="utf-8") as lf:
+            lf.write(f"\n[Detached Runner] Task completed successfully in {dur_str}. Suppressing success notification (failure-only policy active).\n")
+        return
+
+    # Extract log tail snippet for outbox notice, filtering runner headers
     log_snippet = ""
     try:
         with open(log_file_path, "r", encoding="utf-8", errors="replace") as lf:
             lines = lf.readlines()
-            # Grab last non-empty lines up to 12
-            tail = [line.rstrip() for line in lines if line.strip()][-12:]
+            filtered = [
+                line.rstrip() for line in lines
+                if line.strip() and not line.strip().startswith("--- [Detached Runner]")
+            ]
+            tail = filtered[-12:]
             if tail:
                 log_snippet = "\n```text\n" + "\n".join(tail) + "\n```"
     except Exception:
         pass
 
-    # Build outbox notification
-    dur_str = _format_duration(duration)
+    # Build clean outbox notification
     if final_status == "completed":
-        header = f"✅ **Background Task Complete: {name}**"
+        header = f"✅ **Background Task Complete: {name}** ({dur_str})"
     elif final_status == "timed_out":
         header = f"⏱️ **Background Task Timed Out: {name}** (Limit: {timeout}s)"
     elif final_status == "cancelled":
-        header = f"🛑 **Background Task Cancelled: {name}**"
+        header = f"🛑 **Background Task Cancelled: {name}** (after {dur_str})"
     else:
-        header = f"❌ **Background Task Failed: {name}** (Exit Code: {exit_code})"
+        header = f"❌ **Background Task Failed: {name}** (Exit Code: {exit_code}, after {dur_str})"
 
-    msg_lines = [
-        header,
-        f"• **Task ID:** `{task_id}`",
-        f"• **Duration:** {dur_str} • **Exit Code:** {exit_code}",
-        f"• **Log File:** `{log_file_path}`",
-    ]
+    msg_lines = [header]
     if log_snippet:
-        msg_lines.append(f"\n**Log Excerpt:**{log_snippet}")
+        snippet_header = "**Output:**" if final_status == "completed" else "**Error Excerpt:**"
+        msg_lines.append(f"{snippet_header}{log_snippet}")
+
+    msg_lines.append(f"• *Inspect full logs:* `python3 /workspace/tools/detached_runner.py logs {task_id}`")
 
     outbox_body = "\n".join(msg_lines)
 
@@ -346,6 +365,7 @@ def main():
     start_p.add_argument("--name", "-n", help="Human-readable name for the task", default="")
     start_p.add_argument("--timeout", "-t", type=int, help="Timeout in seconds (default: 3600)", default=3600)
     start_p.add_argument("--cwd", help="Working directory (default: /workspace)", default="/workspace")
+    start_p.add_argument("--notify-on-success", action="store_true", help="Send outbox notification even on successful completion (default: False, failure-only)")
 
     # Status
     status_p = subparsers.add_parser("status", help="Check status of a detached task")
@@ -377,6 +397,7 @@ def main():
             name=args.name,
             timeout=args.timeout,
             cwd=args.cwd,
+            notify_on_success=args.notify_on_success,
         )
         print(json.dumps(res, indent=2))
 
