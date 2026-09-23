@@ -246,3 +246,81 @@ def test_prowlarr_allowed_hosts_auto_remediation(temp_env, monkeypatch):
     assert auto_remed_mock.called
     assert not has_act
     assert "nominal" in summary
+
+
+def test_arr_non_upgrade_auto_purged_and_blocklisted(temp_env, monkeypatch):
+    """Tier 1: Non-upgrade releases rejected by Custom Formats are auto-purged from download client and blocklisted."""
+    _, audit_file = temp_env
+
+    monkeypatch.setattr(aqw, "_get_api_keys", lambda: ("sonarr_mock_key", "radarr_mock_key"))
+    monkeypatch.setattr(aqw, "fetch_health", lambda app, port, key: [])
+    monkeypatch.setattr(aqw, "_auto_remediate_media_management", lambda app, port, key: (False, ""))
+
+    queue_mock = [
+        {
+            "id": 1495902780,
+            "downloadId": "mock-download-123",
+            "title": "Ted.Lasso.S04E08.PROPER.1080p.WEB.h264-ETHEL",
+            "status": "completed",
+            "trackedDownloadStatus": "warning",
+            "statusMessages": [
+                {
+                    "title": "Ted.Lasso.S04E08.PROPER.1080p.WEB.h264-ETHEL",
+                    "messages": [
+                        "Not a Custom Format upgrade for existing episode file(s). New: [Language ENG, Repack/Proper] (5) do not improve on Existing: [ATVP, Language ENG, WEB Tier 01] (1800)"
+                    ]
+                }
+            ],
+            "series": {"path": "/data/media/tv/Ted Lasso"}
+        }
+    ]
+    monkeypatch.setattr(aqw, "fetch_queue", lambda app, port, key: queue_mock if app == "Sonarr" else [])
+
+    remove_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(aqw, "remove_queue_item", remove_mock)
+
+    has_activity, summary, items = aqw.run_watchdog(auto_fix=True, force_dispatch=True)
+
+    assert remove_mock.called
+    assert remove_mock.call_args[0][2] == 1495902780
+    assert remove_mock.call_args[1]["remove_from_client"] is True
+    assert remove_mock.call_args[1]["blocklist"] is True
+    assert "⚠️ **Arr Queue Warnings Detected**" not in summary
+    assert "🛠️ **Arr Import Auto-Remediation Live**" in summary
+    assert "inferior non-upgrade" in summary
+
+    # Verify audit receipt was written
+    assert audit_file.exists()
+    with open(audit_file) as f:
+        log_content = f.read()
+        assert "queue_non_upgrade" in log_content
+        assert "auto_purged_and_blocklisted" in log_content
+
+
+def test_arr_proper_repack_config_auto_remediated(temp_env, monkeypatch):
+    """Tier 1: Media management downloadPropersAndRepacks is auto-remediated to doNotPrefer."""
+    _, audit_file = temp_env
+
+    mock_cfg = {"id": 1, "downloadPropersAndRepacks": "preferAndUpgrade"}
+
+    def mock_urlopen(req, timeout=8):
+        method = req.get_method() if hasattr(req, "get_method") else "GET"
+        if method == "GET":
+            return MockResponse(json.dumps(mock_cfg).encode())
+        elif method == "PUT":
+            data = json.loads(req.data.decode("utf-8"))
+            mock_cfg.update(data)
+            return MockResponse(json.dumps(mock_cfg).encode())
+        return MockResponse(b"{}")
+
+    monkeypatch.setattr(aqw.urllib.request, "urlopen", mock_urlopen)
+
+    changed, old_val = aqw._auto_remediate_media_management("Sonarr", 8989, "mock_key")
+    assert changed is True
+    assert old_val == "preferAndUpgrade"
+    assert mock_cfg["downloadPropersAndRepacks"] == "doNotPrefer"
+
+    # Running a second time should detect it is already doNotPrefer
+    changed_again, _ = aqw._auto_remediate_media_management("Sonarr", 8989, "mock_key")
+    assert changed_again is False
+
