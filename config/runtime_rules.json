@@ -14,6 +14,7 @@
   "task_settle_enabled": true,
   "task_settle_timeout_seconds": 25.0,
   "task_settle_max_resumptions": 1,
+  "detached_notify_on_success": false,
   "compaction_max_turns": 15,
   "compaction_max_steps": 1500,
   "compaction_max_mb": 2.0,
