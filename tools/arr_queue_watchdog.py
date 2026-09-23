@@ -234,6 +234,67 @@ def _auto_remediate_allowed_hosts(app_name: str, port: int, api_key: str) -> boo
         return False
 
 
+NON_UPGRADE_PATTERNS = [
+    r"not a (?:custom format )?upgrade for existing",
+    r"not an upgrade for existing",
+    r"do(?:es)? not improve on existing",
+    r"existing file meets cutoff",
+    r"equal or higher preference"
+]
+NON_UPGRADE_RE = re.compile("|".join(NON_UPGRADE_PATTERNS), re.IGNORECASE)
+
+
+def remove_queue_item(port: int, api_key: str, queue_id: int, remove_from_client: bool = True, blocklist: bool = True) -> bool:
+    """Delete an unwanted queue item, removing files from download client and blocklisting."""
+    url = (
+        f"http://{HOST_1_IP}:{port}/api/v3/queue/{queue_id}"
+        f"?removeFromClient={'true' if remove_from_client else 'false'}"
+        f"&blocklist={'true' if blocklist else 'false'}"
+    )
+    req = urllib.request.Request(url, headers={"X-Api-Key": api_key}, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status in (200, 204)
+    except Exception as e:
+        print(f"[ArrWatchdog] Failed to remove queue item {queue_id}: {e}", file=sys.stderr)
+        return False
+
+
+def _auto_remediate_media_management(app_name: str, port: int, api_key: str) -> tuple[bool, str]:
+    """Ensure downloadPropersAndRepacks is set to doNotPrefer to defer upgrade evaluation to Custom Formats."""
+    url = f"http://{HOST_1_IP}:{port}/api/v3/config/mediamanagement"
+    try:
+        req = urllib.request.Request(url, headers={"X-Api-Key": api_key})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            cfg = json.loads(resp.read().decode())
+
+        old_val = cfg.get("downloadPropersAndRepacks")
+        if old_val == "doNotPrefer":
+            return False, ""
+
+        cfg["downloadPropersAndRepacks"] = "doNotPrefer"
+        req_put = urllib.request.Request(
+            url,
+            data=json.dumps(cfg).encode("utf-8"),
+            headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
+            method="PUT"
+        )
+        with urllib.request.urlopen(req_put, timeout=8) as put_resp:
+            pass
+
+        _log_triage_action(
+            app=app_name,
+            category="config",
+            action="auto_configured_proper_repack_policy",
+            details=f"Changed downloadPropersAndRepacks from '{old_val}' to 'doNotPrefer' to prevent grabbing non-upgrades",
+            auto_remediated=True
+        )
+        return True, old_val or "unknown"
+    except Exception as e:
+        print(f"[ArrWatchdog] Failed to auto-remediate media management for {app_name}: {e}", file=sys.stderr)
+        return False, ""
+
+
 def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[bool, str, list[dict]]:
     sonarr_key, radarr_key = _get_api_keys()
     state = _load_state()
@@ -256,6 +317,17 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
     now_str = datetime.now(PT).strftime("%Y-%m-%d %I:%M %p PT")
 
     for app_name, port, key, entity_type in apps:
+        # Tier 1 Auto-Remediation: Preventative proper/repack configuration drift
+        if auto_fix and key:
+            changed, old_val = _auto_remediate_media_management(app_name, port, key)
+            if changed:
+                remediated.append({
+                    "app": app_name,
+                    "title": "MediaManagement.downloadPropersAndRepacks",
+                    "path": "Media Management Settings",
+                    "reason": f"Config drift detected ('{old_val}'). Auto-remediated to 'doNotPrefer' to defer upgrade scoring to Custom Formats."
+                })
+
         # 1. Inspect queue & download imports
         queue = fetch_queue(app_name, port, key)
         for item in queue:
@@ -323,6 +395,28 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                         category="queue_permission",
                         action="auto_chown_uid_0",
                         details=f"Path: {nas_path} | Item: {item_title}",
+                        auto_remediated=True
+                    )
+
+            # Tier 1 Auto-Remediation: Inferior non-upgrade releases blocked at import
+            is_non_upgrade = bool(msg_texts and any(NON_UPGRADE_RE.search(m) for m in msg_texts))
+            if not remediation_done and is_non_upgrade and auto_fix:
+                queue_item_id = item.get("id")
+                if queue_item_id and remove_queue_item(port, key, queue_item_id, remove_from_client=True, blocklist=True):
+                    remediation_done = True
+                    matching_msg = next((m for m in msg_texts if NON_UPGRADE_RE.search(m)), "Rejected non-upgrade")
+                    remediated_entry = {
+                        "app": app_name,
+                        "title": item_title,
+                        "path": "Download Queue",
+                        "reason": f"Rejected by {app_name} as inferior non-upgrade ({matching_msg}). Auto-purged from download client and blocklisted."
+                    }
+                    remediated.append(remediated_entry)
+                    _log_triage_action(
+                        app=app_name,
+                        category="queue_non_upgrade",
+                        action="auto_purged_and_blocklisted",
+                        details=f"Item: {item_title} (ID: {queue_item_id}) | Reason: {matching_msg}",
                         auto_remediated=True
                     )
 
