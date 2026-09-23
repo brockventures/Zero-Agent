@@ -24,50 +24,68 @@ import urllib.error
 from typing import Dict, Any, Optional, Set, Tuple
 
 DEFAULT_CHANNEL_ID = "1534436119888793750"  # #the-banana-stand
-DEFAULT_ROBOT_ROLE_ID = "1543462881624858624"  # @robot
-DEFAULT_TEAM_ROLE_ID = "1542294519914037341"   # @team
+# Load environment variables early so AGORA_BASE_URL and tokens are populated
+for env_path in ("/workspace/market-sandbox/.env", "/workspace/.env"):
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for eline in f:
+                    eline = eline.strip()
+                    if eline and not eline.startswith("#") and "=" in eline:
+                        k, v = eline.split("=", 1)
+                        os.environ.setdefault(k.strip(), v.strip())
+        except Exception:
+            pass
+
+DEFAULT_ROBOT_ROLE_ID = "1543462881624858624"  # @Robot
+DEFAULT_TEAM_ROLE_ID = "1543462881624858624"   # @Robot
 DEFAULT_TARGET_TAG = f"<@&{DEFAULT_ROBOT_ROLE_ID}>"
 
-REFEREE_BASE_URL = os.environ.get("AGORA_BASE_URL", "https://agora.mikecarmody.net")
+REFEREE_BASE_URL = os.environ.get("AGORA_BASE_URL", "https://agora-banana-production.up.railway.app")
 
 STATION_ROTATION = ["ceres", "mars", "earth", "luna"]
 
 STATION_PROFILES = {
     "ceres": {
-        "name": "CERES DEPOT (The Asteroid Belt)",
+        "name": "PIAZZI DEPOT (Ceres Belt Gate)",
         "emoji": "🪐",
-        "intel": "Belter unrest at Ceres Hydroponics has triggered a critical FOOD deficit. Belters are dumping raw ORE and salvage FRAG to afford emergency rations.",
-        "opp": "Ceres pays premium CR for FOOD; sells ORE and FRAG cheap."
+        "intel": "Aeroponic nutrient failure struck Ceres Sub-Ring 4. Station Commissariat has issued urgent food requisitions at elevated spot prices while dumping raw ORE and salvage FRAG.",
+        "opp": "Piazzi Depot pays premium CR for FOOD; sells ORE and FRAG cheap."
     },
     "mars": {
-        "name": "TYCHO STATION / MARS ORBIT (MCRN Shipyards)",
+        "name": "ARCADIA FOUNDRIES (Martian Orbital Yards)",
         "emoji": "🔴",
-        "intel": "Martian naval exercises underway. Shipyards are aggressively stockpiling propellant FUEL and structural ORE for fleet retrofits.",
-        "opp": "Tycho Shipyards paying top CR for FUEL and ORE."
+        "intel": "Martian orbital shipyards announced emergency structural procurement contracts. Unrefined hull fragments and cryogenic propellant fuel trading at premium spot valuations.",
+        "opp": "Arcadia Foundries paying top CR for FUEL and ORE."
     },
     "earth": {
-        "name": "EARTH HIGH ORBITAL (Inners Megacity)",
+        "name": "KENNEDY ORBITAL ELEVATOR (High Earth Terminal)",
         "emoji": "🌍",
-        "intel": "Inners industrial boom. Agricultural mega-domes have massive FOOD surpluses, but terrestrial foundries are starved for raw Belter ORE and salvage FRAG.",
-        "opp": "Earth sells FOOD cheap; pays high prices for ORE and FRAG."
+        "intel": "Midwest hydroponic mega-farms report massive harvest surplus. Earth orbital depots flooded with fresh food, while terrestrial clean tech mandates bid aggressively for imported raw asteroid ORE.",
+        "opp": "Kennedy Elevator sells FOOD cheap; pays high prices for ORE and FRAG."
     },
     "luna": {
-        "name": "LOVELL CITY GATEWAY (Luna Neutral Free Port)",
+        "name": "SHACKLETON COLD TRAP (Lunar Polar Port)",
         "emoji": "🌕",
-        "intel": "Lovell Free Trade Summit in session. Neutral banking protocols active; high liquidity and narrow spreads across all commodities.",
-        "opp": "Tight spreads across all orderbooks. Ideal for rapid market-making."
+        "intel": "High-velocity micrometeorite shower pelted Lunar south pole, scattering salvageable composite fragments across Shackleton Crater while southern polar He-3 collectors maintain steady refuel operations.",
+        "opp": "Deep resting liquidity and tight spreads across all orderbooks. Ideal for rapid market-making."
     }
 }
 
 FLEET_NAMES = {
-    "amos": "Atlantean Paperclip Manufacturing [Belters]",
-    "marvin": "Ballistic Liquidation Co. [Mars]",
-    "zero": "Apex Vector Arbitrage [Inners]",
-    "aerial": "Zenith Drift Overwatch [Automated]"
+    "amos": "Atlantean Paperclip Manufacturing [APM]",
+    "marvin": "Ballistic Liquidation Co. [BLC]",
+    "zero": "Apex Vector Arbitrage [AVA]",
+    "aerial": "Zenith Drift Overwatch [ZDO]"
 }
 
 TRADE_PATTERN = re.compile(
     r"\b(BUY|BID|SELL|ASK)\s+(\d+)\s+(FRAG|FUEL|FOOD|ORE|BANANA)\b(?:[^\d]*?(\d+))?(?:.*?\b(?:AT|IN|STATION)\s+([A-Za-z]+))?",
+    re.IGNORECASE
+)
+
+TRANSIT_PATTERN = re.compile(
+    r"\b(?:MOVE|TRANSIT|FLY|WARP|GO)\s+(?:TO\s+)?([A-Za-z]+)(?:\s+(?:WITH|CARRYING|LOAD)\s+(\d+)\s+([A-Za-z]+))?",
     re.IGNORECASE
 )
 
@@ -117,18 +135,23 @@ def get_referee_token() -> str:
     return "agora-combine-2026"
 
 
-def fetch_json(endpoint: str) -> dict:
-    """Fetch JSON from referee API."""
+def fetch_json(endpoint: str, retries: int = 3, backoff_sec: float = 1.0) -> dict:
+    """Fetch JSON from referee API with retries for transient blips."""
     url = f"{REFEREE_BASE_URL.rstrip('/')}{endpoint}"
     req = urllib.request.Request(
         url,
         headers={"User-Agent": "AgoraAnnouncer/2.0", "Accept": "application/json"}
     )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    last_err = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(backoff_sec * (attempt + 1))
+    return {"status": "error", "error": str(last_err)}
 
 
 def trigger_referee_burst(rounds: int = 8, interval_sec: float = 180.0) -> dict:
@@ -222,27 +245,50 @@ def fetch_ticker_status() -> dict:
 def post_discord(channel_id: str, content: str, token: str) -> Optional[dict]:
     """Post message directly via Discord REST API and return response dict."""
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    payload = json.dumps({"content": content}).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "DiscordBot (https://github.com/brockventures/market-sandbox, 2.0)",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8")
-        print(f"Discord API Error ({e.code}): {err_body}", file=sys.stderr)
-        return None
-    except Exception as e:
-        print(f"Discord Post Error: {e}", file=sys.stderr)
-        return None
+    chunks = []
+    if len(content) <= 1950:
+        chunks = [content]
+    else:
+        current = []
+        curr_len = 0
+        for block in content.split("\n\n"):
+            if curr_len + len(block) + 2 > 1950:
+                if current:
+                    chunks.append("\n\n".join(current))
+                    current = [block]
+                    curr_len = len(block)
+                else:
+                    chunks.append(block[:1950])
+            else:
+                current.append(block)
+                curr_len += len(block) + 2
+        if current:
+            chunks.append("\n\n".join(current))
+
+    last_resp = None
+    for chunk in chunks:
+        payload = json.dumps({"content": chunk}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bot {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "DiscordBot (https://github.com/brockventures/market-sandbox, 2.0)",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                last_resp = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8")
+            print(f"Discord API Error ({e.code}): {err_body}", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"Discord Post Error: {e}", file=sys.stderr)
+            return None
+    return last_resp
 
 
 def add_discord_reaction(channel_id: str, message_id: str, emoji: str, token: str) -> bool:
@@ -281,6 +327,78 @@ def fetch_discord_messages(channel_id: str, after_id: str, token: str, limit: in
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return []
+
+
+def submit_transit_to_referee(transit: dict, ref_token: str) -> dict:
+    """Submit interplanetary transit to referee /stations/transit."""
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/stations/transit"
+    payload = json.dumps(transit).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return {"status": "error", "http_code": e.code, "error": json.loads(raw)}
+        except Exception:
+            return {"status": "error", "http_code": e.code, "raw_error": raw}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def parse_discord_transit(content: str, author_id: str, author_name: str) -> Optional[dict]:
+    """Parse natural language transit command from Discord chat."""
+    if TRADE_PATTERN.search(content) and not re.search(r"\b(?:MOVE|TRANSIT)\b", content, re.I):
+        return None
+    m = TRANSIT_PATTERN.search(content)
+    if not m:
+        return None
+    dest_raw, qty_raw, comm_raw = m.groups()
+    dest = dest_raw.lower().strip()
+    if dest not in STATION_PROFILES and dest not in ("earth", "luna", "mars", "ceres"):
+        return None
+
+    qty = int(qty_raw) if qty_raw else 0
+    comm = comm_raw.upper().strip() if comm_raw else "FRAG"
+    if comm == "BANANA":
+        comm = "FRAG"
+
+    agent = None
+    agent_override = re.search(r"\b(?:as|agent:?)\s+(amos|marvin|zero|aerial)\b", content, re.I)
+    if agent_override:
+        agent = agent_override.group(1).lower()
+    elif author_id in AUTHOR_MAP:
+        agent = AUTHOR_MAP[author_id]
+    else:
+        name_lower = author_name.lower()
+        if "amos" in name_lower or "carmody" in name_lower or "mike" in name_lower:
+            agent = "amos"
+        elif "marvin" in name_lower or "alex" in name_lower:
+            agent = "marvin"
+        elif "zero" in name_lower or "brock" in name_lower or "ryan" in name_lower:
+            agent = "zero"
+        elif "aerial" in name_lower:
+            agent = "aerial"
+
+    if not agent:
+        agent = "zero"
+
+    return {
+        "agent_id": agent,
+        "destination": dest,
+        "commodity": comm,
+        "cargo_qty": qty
+    }
 
 
 def submit_trade_to_referee(trade: dict, ref_token: str) -> dict:
@@ -362,16 +480,18 @@ def build_burst_kickoff(burst_id: str, rounds: int, interval_sec: float, start_r
     return (
         f"🚀 **STATION AGORA // SOL SYSTEM COMBINE INITIATED** ({target_tag})\n"
         f"```text\n"
-        f"BURST ID: {burst_id}\n"
+        f"BURST ID:       {burst_id}\n"
         f"COMBINE WINDOW: Rounds #{start_round + 1} -> #{end_round} ({rounds} rounds)\n"
         f"ROUND CADENCE:  {interval_sec:.0f}s per strategy window\n"
         f"STATUS:         FLOOR OPEN // IN-CHANNEL DISCORD TRADING ENGAGED\n"
         f"```\n"
-        f"*All syndicates are cleared for trade. Bids, asks, and chat commands will clear immediately. Round 1 begins now!*"
+        f"💬 **How to Trade:** Reply `BUY/SELL <qty> <commodity> @ <price>` (e.g. `BUY 50 FOOD @ 32`)\n"
+        f"⚡ **Quick Curl:** `POST https://agora.mikecarmody.net/referee/quick_order` with token `agora-combine-2026`\n"
+        f"*Round 1 strategy window and depot quotes follow immediately below!*"
     )
 
 
-def build_announcement(round_num: int = 1, rounds_total: int = 8, codename: str = "", mention: str = "") -> Tuple[str, str]:
+def build_announcement(round_num: int = 1, rounds_total: int = 8, codename: str = "", mention: str = "", round_index: Optional[int] = None) -> Tuple[str, str]:
     """Compile rich thematic Strategy Window announcement. Returns (msg_text, active_station)."""
     health = fetch_json("/referee/health")
     leaderboard = fetch_json("/referee/leaderboard")
@@ -417,9 +537,16 @@ def build_announcement(round_num: int = 1, rounds_total: int = 8, codename: str 
     standings_str = "\n".join(standings_lines) if standings_lines else "No active balances"
 
     target_tag = mention if mention else DEFAULT_TARGET_TAG
-    title = f"COMBINE ROUND {round_num}/{rounds_total}"
+    idx_disp = f"{round_index}/{rounds_total}" if round_index is not None else f"{round_num}/{rounds_total}"
+    title = f"COMBINE ROUND {idx_disp} (Round #{round_num})"
     if codename:
         title += f" // OP {codename.upper()}"
+
+    base = REFEREE_BASE_URL.rstrip('/')
+    trade_body = '{"agent_id":"amos","side":"buy","qty":50,"price":32,"commodity":"FOOD","station":"' + st_key + '"}'
+    curl_trade = f'`curl -s -X POST {base}/referee/quick_order -H "Authorization: Bearer agora-combine-2026" -H "Content-Type: application/json" -d \'{trade_body}\'`'
+    transit_body = '{"agent_id":"amos","destination":"mars","commodity":"FOOD","cargo_qty":100}'
+    curl_transit = f'`curl -s -X POST {base}/stations/transit -H "Authorization: Bearer agora-combine-2026" -H "Content-Type: application/json" -d \'{transit_body}\'`'
 
     msg = (
         f"🔔 **STATION AGORA // {title}** ({target_tag})\n"
@@ -432,14 +559,13 @@ def build_announcement(round_num: int = 1, rounds_total: int = 8, codename: str 
         f"📊 **FLEET INVENTORIES & STANDINGS:**\n"
         f"{standings_str}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 **HOW TO TRADE THIS ROUND (ZERO PREP):**\n"
-        f"💬 **1. Discord Chat:** Reply directly in this channel:\n"
-        f"   `BUY 50 FOOD @ 32` or `SELL 100 ORE @ 9`\n"
-        f"   *Format: `BUY/SELL <qty> <commodity> @ <price> [AT <station>]`*\n\n"
-        f"⚡ **2. One-Line Curl:**\n"
-        f"   `curl -s -X POST https://agora.mikecarmody.net/referee/quick_order -H \"Authorization: Bearer agora-combine-2026\" -H \"Content-Type: application/json\" -d '{{\"agent_id\":\"amos\",\"side\":\"buy\",\"qty\":50,\"price\":32,\"commodity\":\"FOOD\",\"station\":\"{st_key}\"}}'`\n"
+        f"🤖 **ROBOT COMBAT DIRECTIVE:**\n"
+        f"Floor open for Round #{round_num}. Reply in channel with orders:\n"
+        f"• **Trade:** `BUY 50 FOOD @ 32` or `SELL 100 ORE @ 9`\n"
+        f"• **Transit:** `MOVE TO MARS WITH 100 FOOD` or `TRANSIT CERES`\n"
+        f"• **API:** {curl_trade}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"*Orders execute immediately against depot pools or rival bids/asks.*"
+        f"*Orders and transits execute immediately against referee state and depot pools.*"
     )
     return msg, st_key
 
@@ -502,6 +628,47 @@ def poll_and_execute_trades(channel: str, bot_token: str, ref_token: str, active
         content = msg.get("content", "").strip()
         trade = parse_discord_trade(content, author.get("id", ""), author.get("username", ""), default_station=active_station)
         if not trade:
+            transit = parse_discord_transit(content, author.get("id", ""), author.get("username", ""))
+            if transit:
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected transit from {author.get('username')}: {transit}")
+                sys.stdout.flush()
+                res = submit_transit_to_referee(transit, ref_token)
+                ag_id = transit["agent_id"]
+                fl_name = FLEET_NAMES.get(ag_id, ag_id.upper())
+                dest_disp = transit["destination"].title()
+
+                if res.get("status") == "error" or res.get("kind") == "reject":
+                    err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+                    err_detail = err_obj.get("payload", {}).get("detail") or res.get("payload", {}).get("detail") or res.get("error") or str(res)
+                    add_discord_reaction(channel, msg_id, "❌", bot_token)
+                    reject_msg = (
+                        f"⚠️ **[Agora Trade Terminal] Transit Rejected**\n"
+                        f"> **Syndicate:** {fl_name}\n"
+                        f"> **Target Station:** {dest_disp}\n"
+                        f"> **Reason:** `{err_detail}`"
+                    )
+                    post_discord(channel, reject_msg, bot_token)
+                else:
+                    payload = res.get("payload", {})
+                    origin_disp = payload.get("origin", active_station).title()
+                    cargo_qty = payload.get("cargo_qty", 0)
+                    comm_disp = payload.get("commodity", "")
+                    cargo_str = f"**{cargo_qty} {comm_disp}**" if cargo_qty > 0 else "empty cargo bay"
+                    fuel_burned = payload.get("fuel_burned", 0)
+                    arrival_rnd = payload.get("arrival_round", "?")
+                    duration = payload.get("rounds_duration", 1)
+
+                    add_discord_reaction(channel, msg_id, "🚀", bot_token)
+                    add_discord_reaction(channel, msg_id, "✅", bot_token)
+                    receipt_msg = (
+                        f"🚀 **[Agora Trade Terminal] Interplanetary Transit Dispatched**\n"
+                        f"> **Syndicate:** {fl_name}\n"
+                        f"> **Flight Corridor:** {origin_disp} ➔ **{dest_disp}** ({cargo_str})\n"
+                        f"> **Propellant:** Burned **{fuel_burned} FUEL**\n"
+                        f"> **ETA:** Arriving at {dest_disp} on **Round #{arrival_rnd}** ({duration} round(s))\n"
+                        f"> **Status:** Fleet undocked and in transfer orbit."
+                    )
+                    post_discord(channel, receipt_msg, bot_token)
             continue
 
         # If price was omitted, default to reasonable limit from current depots
@@ -520,7 +687,8 @@ def poll_and_execute_trades(channel: str, bot_token: str, ref_token: str, active
         st_disp = trade["station_id"].title()
 
         if res.get("status") == "error" or res.get("kind") == "reject":
-            err_detail = res.get("error", {}).get("payload", {}).get("detail") or res.get("error") or str(res)
+            err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+            err_detail = err_obj.get("payload", {}).get("detail") or res.get("payload", {}).get("detail") or res.get("error") or str(res)
             add_discord_reaction(channel, msg_id, "❌", bot_token)
             reject_msg = (
                 f"⚠️ **[Agora Trade Terminal] Order Rejected**\n"
@@ -577,11 +745,25 @@ def run_burst_loop(rounds: int, interval_sec: float, channel: str, token: str, c
     if last_seen_msg_id:
         processed_ids.add(last_seen_msg_id)
 
+    # Immediately post Round 1 strategy window at T=0 so the floor is actionable instantly
+    rounds_announced = 1
     last_announced_round = start_round
-    rounds_announced = 0
     burst_completed = False
-    active_station = "ceres"
     ref_token = get_referee_token()
+
+    msg, active_station = build_announcement(
+        round_num=start_round + 1,
+        rounds_total=rounds,
+        codename=codename,
+        mention=mention,
+        round_index=1
+    )
+    ann_resp = post_discord(channel, msg, token)
+    if ann_resp and ann_resp.get("id"):
+        last_seen_msg_id = ann_resp["id"]
+        processed_ids.add(last_seen_msg_id)
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Broadcasted Round {start_round + 1} (1/{rounds}) at {active_station} (T=0 kickoff)")
+    sys.stdout.flush()
 
     while not burst_completed:
         # 1. Listen for and execute Discord chat trades during strategy window
@@ -596,6 +778,12 @@ def run_burst_loop(rounds: int, interval_sec: float, channel: str, token: str, c
 
         time.sleep(min(2.0, max(0.5, interval_sec / 10)))
         st = fetch_ticker_status()
+        if st.get("status") == "error":
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Warning: transient error fetching ticker status: {st.get('error')}. Retrying...")
+            sys.stdout.flush()
+            time.sleep(2.0)
+            continue
+
         cur_rnd = st.get("current_round", last_announced_round)
         is_active = st.get("burst_active", False)
         rounds_remaining = st.get("rounds_remaining", 0)
@@ -603,13 +791,21 @@ def run_burst_loop(rounds: int, interval_sec: float, channel: str, token: str, c
         if cur_rnd > last_announced_round:
             last_announced_round = cur_rnd
             rounds_announced += 1
-            msg, active_station = build_announcement(round_num=cur_rnd, rounds_total=rounds, codename=codename, mention=mention)
-            ann_resp = post_discord(channel, msg, token)
-            if ann_resp and ann_resp.get("id"):
-                last_seen_msg_id = ann_resp["id"]
-                processed_ids.add(last_seen_msg_id)
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Broadcasted Round {cur_rnd} ({rounds_announced}/{rounds}) at {active_station}")
-            sys.stdout.flush()
+            if rounds_announced <= rounds:
+                next_round_num = start_round + rounds_announced
+                msg, active_station = build_announcement(
+                    round_num=next_round_num,
+                    rounds_total=rounds,
+                    codename=codename,
+                    mention=mention,
+                    round_index=rounds_announced
+                )
+                ann_resp = post_discord(channel, msg, token)
+                if ann_resp and ann_resp.get("id"):
+                    last_seen_msg_id = ann_resp["id"]
+                    processed_ids.add(last_seen_msg_id)
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Broadcasted Round {next_round_num} ({rounds_announced}/{rounds}) at {active_station}")
+                sys.stdout.flush()
 
         if not is_active and (rounds_remaining == 0 or rounds_announced >= rounds):
             burst_completed = True
