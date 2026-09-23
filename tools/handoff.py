@@ -93,6 +93,25 @@ def format_envelope(
     return block
 
 
+
+
+def convert_bare_peer_mentions(text: str) -> str:
+    """Convert bare text mentions like @Amos, @Marvin, @Aerial to Discord snowflakes,
+    ignoring matches inside markdown code blocks or inline code."""
+    if not text or "@" not in text:
+        return text
+    parts = re.split(r"(```[\s\S]*?```|`[^`\n]+`)", text)
+    pattern = re.compile(r"(?<![\w/])@([a-zA-Z_]+)\b")
+    for i in range(0, len(parts), 2):
+        def repl(m):
+            key = m.group(1).lower()
+            if key in TARGET_MENTIONS:
+                return TARGET_MENTIONS[key]
+            return m.group(0)
+        parts[i] = pattern.sub(repl, parts[i])
+    return "".join(parts)
+
+
 def ensure_handoff_mentions(text: str) -> str:
     """Ensure outgoing messages containing handoff envelopes include physical Discord mentions.
 

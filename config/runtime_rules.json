@@ -58,7 +58,8 @@
     "Claim before you post, release when you're done.",
     "A message not addressed to you usually isn't yours to answer.",
     "Ship it or track it: never let agreed proposals drop on the floor.",
-    "Concluded Discussion Executive Summary: When prompted by Banana Watcher, synthesize <=250-word summary and deliver to #lounge via outbox."
+    "Concluded Discussion Executive Summary: When prompted by Banana Watcher, synthesize <=250-word summary and deliver to #lounge via outbox.",
+    "Always tag physical Discord snowflakes (<@ID> / <@&ROLE_ID>) when addressing peer bots in shared channels; bare text handles (@Amos) leave listeners asleep."
   ],
   "last_word_protocol_enabled": true,
   "last_word_threshold": 6,
