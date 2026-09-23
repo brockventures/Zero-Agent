@@ -442,7 +442,8 @@ def get_runtime_rules() -> dict:
         "ambient_relevance_threshold": 0.80,
         "auto_thread_escalation_enabled": False,
         "auto_thread_escalation_seconds": 180.0,
-        "last_word_threshold": 6,
+        "last_word_threshold": 10,
+        "excluded_channel_last_word_threshold": 10,
         "external_system_prompt": None,
         "external_prompt_path": "/workspace/config/prompts/crab_cavern_prompt.md",
     }

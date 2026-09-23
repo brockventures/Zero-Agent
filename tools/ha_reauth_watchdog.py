@@ -96,11 +96,11 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
         reason = e.get("reason") or ""
         disabled = bool(e.get("disabled_by"))
 
-        if disabled or st in ("loaded", "not_loaded"):
+        if disabled or st in ("loaded", "not_loaded", "setup_in_progress"):
             continue
 
         # Ignore standby devices in setup_retry
-        if st == "setup_retry" and domain in BENIGN_STANDBY_DOMAINS:
+        if st in ("setup_retry", "setup_in_progress") and domain in BENIGN_STANDBY_DOMAINS:
             continue
 
         # Auto-heal ZHA if coordinator is back online

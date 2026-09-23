@@ -222,8 +222,15 @@ def is_handoff_addressed_to_zero(content: str) -> bool:
     or requiring response from Zero. Physical snowflake tags override envelope defaults.
     """
     try:
-        # Physical mention snowflake invariant: explicit tag wakes Zero regardless of envelope to
-        if "<@1542285964213358633>" in content or "<@!1542285964213358633>" in content:
+        # Physical mention invariant: explicit tag/mention wakes Zero regardless of envelope to/reply
+        if (
+            "<@1542285964213358633>" in content
+            or "<@!1542285964213358633>" in content
+            or re.search(r"@zero\b", content, re.IGNORECASE)
+            or re.search(r"@robot\b", content, re.IGNORECASE)
+            or "<@&1542294519914037341>" in content
+            or "<@&1543285916506783799>" in content
+        ):
             return True
 
         if "🍌 **Discussion Concluded**" in content and ("<@1542285964213358633>" in content or "@zero" in content.lower()):
