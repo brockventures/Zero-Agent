@@ -23,7 +23,16 @@ from zoneinfo import ZoneInfo
 PT = ZoneInfo("America/Los_Angeles")
 UTC = ZoneInfo("UTC")
 
-from tools.kalshi_cross_bracket import detect_cross_bracket_arbitrage, sweep_kalshi_events
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+if str(TOOLS_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR.parent))
+
+try:
+    from tools.kalshi_cross_bracket import detect_cross_bracket_arbitrage, sweep_kalshi_events
+except ImportError:
+    from kalshi_cross_bracket import detect_cross_bracket_arbitrage, sweep_kalshi_events
 
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 DB_PATH = Path("/workspace/data/kalshi_paper.db")

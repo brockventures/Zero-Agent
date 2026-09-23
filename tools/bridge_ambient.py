@@ -209,7 +209,7 @@ async def route_external_message(
                 print(f"[BridgeAmbient] Excluded channel #{getattr(msg.channel, 'name', msg.channel.id)}: Ivy is paused ({rem:.1f}s). Dropping.")
                 return True
 
-            threshold = int(rules.get("excluded_channel_last_word_threshold", 4))
+            threshold = int(rules.get("excluded_channel_last_word_threshold", 10))
             is_last_word, last_word_streak = check_last_word_condition(
                 channel_id=msg.channel.id,
                 bot_id=msg.author.id,

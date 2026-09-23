@@ -62,7 +62,7 @@
     "Always tag physical Discord snowflakes (<@ID> / <@&ROLE_ID>) when addressing peer bots in shared channels; bare text handles (@Amos) leave listeners asleep."
   ],
   "last_word_protocol_enabled": true,
-  "last_word_threshold": 6,
+  "last_word_threshold": 10,
   "last_word_pause_minutes": 3,
   "last_word_channels": [
     1534452820995080192,
@@ -87,5 +87,6 @@
       "it_crowd"
     ]
   },
-  "external_prompt_path": "/workspace/config/prompts/crab_cavern_prompt.md"
+  "external_prompt_path": "/workspace/config/prompts/crab_cavern_prompt.md",
+  "excluded_channel_last_word_threshold": 10
 }

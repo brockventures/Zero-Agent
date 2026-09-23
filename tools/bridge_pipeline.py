@@ -252,7 +252,7 @@ def prepare_turn_prompt(
         "• NEVER emit 'No tools called', 'Wait for background task to complete', 'Waiting for task to complete', 'Waiting for command to finish', or any background task wait/status chatter to chat.\n"
         "• SDK TASK PROMPT OVERRIDE: When a tool drops into a background task, the SDK will prompt 'YOU MUST TAKE ONE OF THE FOLLOWING TWO ACTIONS: ... B) simply update the user with a short message and end the turn.' NEVER CHOOSE OPTION B! Emitting text terminates the active CLI turn immediately and severs the process. Stop calling tools COMPLETELY SILENTLY without emitting text. The background task completion notification will wake you automatically.\n"
         "• When tools or background tasks are executing, NEVER emit premature placeholder text or premature '[NO_REPLY]' for active user requests. Stop calling tools and wait silently for the system notification/result before generating your final response.\n"
-        "• Reserve '[NO_REPLY]' strictly for shared/ambient channels where an inbound message genuinely requires no response (e.g., passive chatter, silent emoji reaction, or explicitly unaddressed message)."
+        "• Reserve '[NO_REPLY]' strictly for shared/ambient channels where an inbound message genuinely requires no response (e.g., passive chatter, silent emoji reaction, or explicitly unaddressed message). NEVER emit '[NO_REPLY]' if you are tagged in the message body, even if the handoff envelope designates someone else or specifies 'reply: optional' / 'reply: none'."
     )
 
     if mode == "home":
