@@ -106,6 +106,31 @@ class TestBatchGuard(unittest.TestCase):
         state = load_state()
         self.assertEqual(state["consecutive_file_views"], 0)
         self.assertEqual(state["cmd_inspections"], 0)
+        self.assertEqual(state.get("consecutive_git_cmds", 0), 0)
+
+    def test_unscoped_pytest_blocks(self):
+        for cmd in ["pytest", "pytest -v", "pytest tests", "pytest tests/", "pytest ."]:
+            allowed, reason = check_tool_use("run_command", {"CommandLine": cmd})
+            self.assertFalse(allowed, f"Expected {cmd} to be blocked")
+            self.assertIn("Unscoped full test suite execution", reason)
+
+    def test_scoped_pytest_allows(self):
+        for cmd in ["pytest tests/test_foo.py", "pytest -k test_bar", "pytest tests/test_bar.py::test_func"]:
+            allowed, _ = check_tool_use("run_command", {"CommandLine": cmd})
+            self.assertTrue(allowed, f"Expected {cmd} to be allowed")
+
+    def test_serial_git_lifecycle_blocks_on_third(self):
+        allowed, _ = check_tool_use("run_command", {"CommandLine": "git add file.py"})
+        self.assertTrue(allowed)
+        allowed, _ = check_tool_use("run_command", {"CommandLine": "git commit -m 'feat: update'"})
+        self.assertTrue(allowed)
+        allowed, reason = check_tool_use("run_command", {"CommandLine": "git push origin branch"})
+        self.assertFalse(allowed)
+        self.assertIn("3 consecutive unbatched git lifecycle commands in serial", reason)
+
+    def test_compound_git_pipeline_allows(self):
+        allowed, _ = check_tool_use("run_command", {"CommandLine": "git add file.py && git commit -m 'feat: update' && git push origin branch"})
+        self.assertTrue(allowed)
 
 
 if __name__ == "__main__":

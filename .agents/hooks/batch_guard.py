@@ -23,6 +23,7 @@ MAX_CONSECUTIVE_SHELL_INSPECTIONS = 3
 MAX_CONSECUTIVE_SAME_FILE_VIEWS = 2
 MAX_CONSECUTIVE_FILE_VIEWS = 4
 MAX_CONSECUTIVE_SAME_FILE_EDITS = 3
+MAX_CONSECUTIVE_GIT_CMDS = 2
 TURN_RESET_IDLE_SECONDS = 45.0
 
 
@@ -41,6 +42,7 @@ def load_state(state_file: str = STATE_FILE) -> dict:
         "same_file_view_count": 0,
         "last_edited_file": "",
         "same_file_edit_count": 0,
+        "consecutive_git_cmds": 0,
     }
 
 
@@ -51,6 +53,34 @@ def save_state(state: dict, state_file: str = STATE_FILE):
     except Exception:
         pass
 
+
+
+
+def is_unscoped_pytest(cmd: str) -> bool:
+    cmd_clean = cmd.strip()
+    if " && " in cmd_clean or " || " in cmd_clean or "; " in cmd_clean or "\n" in cmd_clean:
+        return False
+    m = re.match(r"^(?:pytest|python[0-9.]*\s+-m\s+pytest)(?:\s+(.*))?$", cmd_clean)
+    if not m:
+        return False
+    args = m.group(1) or ""
+    tokens = args.split()
+    if not tokens:
+        return True
+    if any(t.endswith(".py") or ".py::" in t or t.startswith("-k") or t.startswith("-m") for t in tokens):
+        return False
+    if "-k" in tokens or "-m" in tokens:
+        return False
+    generic_targets = {"tests", "tests/", ".", "./"}
+    return all(t.startswith("-") or t in generic_targets for t in tokens)
+
+
+def is_single_git_lifecycle_cmd(cmd: str) -> bool:
+    cmd_clean = cmd.strip()
+    if " && " in cmd_clean or " || " in cmd_clean or "; " in cmd_clean or "\n" in cmd_clean:
+        return False
+    git_lifecycle_pattern = r"^(?:git\s+(?:add|commit|push|checkout\s+-b|switch\s+-c)|gh\s+pr\s+create)\b"
+    return bool(re.search(git_lifecycle_pattern, cmd_clean))
 
 def is_batched_or_mutating_cmd(cmd: str) -> bool:
     cmd_clean = cmd.strip()
@@ -97,12 +127,41 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
             "same_file_view_count": 0,
             "last_edited_file": "",
             "same_file_edit_count": 0,
+            "consecutive_git_cmds": 0,
         }
     state["last_time"] = now
 
     # 1. run_command check
     if name == "run_command":
         cmd = args.get("CommandLine", "")
+
+        # A. Unscoped test suite check (Ban bare pytest in interactive turns)
+        if is_unscoped_pytest(cmd):
+            return False, (
+                f"Batch Invariant Triggered: Unscoped full test suite execution ('{cmd}'). "
+                "Scope test execution to the specific test file or function under test (e.g. 'pytest tests/test_feature.py' or 'pytest -k test_name') "
+                "to avoid multi-minute turn latency. Let GitHub Actions CI run the full regression suite in the cloud."
+            )
+
+        # B. Serial unbatched git lifecycle check
+        if is_single_git_lifecycle_cmd(cmd):
+            state["consecutive_git_cmds"] = state.get("consecutive_git_cmds", 0) + 1
+            if state["consecutive_git_cmds"] > MAX_CONSECUTIVE_GIT_CMDS:
+                save_state(state, state_file)
+                return False, (
+                    f"Batch Invariant Triggered: Detected {state['consecutive_git_cmds']} consecutive unbatched git lifecycle commands in serial. "
+                    "Please bundle git operations (e.g. 'git add <files> && git commit -m \"...\" && git push && gh pr create') into a single compound "
+                    "command or script to minimize tool roundtrips."
+                )
+            state["cmd_inspections"] = 0
+            state["consecutive_file_views"] = 0
+            state["same_file_view_count"] = 0
+            state["same_file_edit_count"] = 0
+            save_state(state, state_file)
+            return True, ""
+        else:
+            state["consecutive_git_cmds"] = 0
+
         if is_batched_or_mutating_cmd(cmd):
             # Batch script, tests, or mutating commands reset all warning counters
             state["cmd_inspections"] = 0
@@ -192,6 +251,7 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
             "same_file_view_count": 0,
             "last_edited_file": "",
             "same_file_edit_count": 0,
+            "consecutive_git_cmds": 0,
         }
         save_state(state, state_file)
         return True, ""
