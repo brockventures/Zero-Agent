@@ -70,10 +70,15 @@
     1551465050072416286
   ],
   "gif_diversity": {
-    "enabled": false,
+    "enabled": true,
     "canonical_only": false,
-    "default_cooldown_turns": 0,
-    "franchise_cooldowns": {},
+    "default_cooldown_turns": 4,
+    "franchise_cooldowns": {
+      "curb_your_enthusiasm": 4,
+      "silicon_valley": 4,
+      "seinfeld": 4,
+      "reaction_classics": 3
+    },
     "quarantined_franchises": [],
     "rotation_pool": [
       "silicon_valley",

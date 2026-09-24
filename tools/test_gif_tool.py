@@ -506,15 +506,36 @@ class TestGifTool(unittest.TestCase):
                 f"Query {q!r} should have matched matrix_neo_kung_fu"
             )
 
-    def test_history_window_limit_3(self):
-        # Verify default limit=3 filters out the last 3 items, but not older items
-        history = [{"url": f"https://tenor.com/view/gif-{i}"} for i in range(10)]
+    def test_history_window_limit_15(self):
+        # Verify default limit=15 filters out the last 15 items, but not older items
+        history = [{"url": f"https://tenor.com/view/gif-{i}"} for i in range(25)]
         excluded = get_history_urls(history)
+        self.assertEqual(len(excluded), 15)
+        self.assertIn("https://tenor.com/view/gif-24", excluded)
+        self.assertIn("https://tenor.com/view/gif-10", excluded)
+        self.assertNotIn("https://tenor.com/view/gif-9", excluded)
+        self.assertNotIn("https://tenor.com/view/gif-0", excluded)
+
+    def test_explicit_limit_respected(self):
+        history = [{"url": f"https://tenor.com/view/gif-{i}"} for i in range(10)]
+        excluded = get_history_urls(history, limit=3)
         self.assertEqual(len(excluded), 3)
         self.assertIn("https://tenor.com/view/gif-9", excluded)
-        self.assertIn("https://tenor.com/view/gif-7", excluded)
         self.assertNotIn("https://tenor.com/view/gif-6", excluded)
-        self.assertNotIn("https://tenor.com/view/gif-0", excluded)
+
+    def test_frequency_decay_penalizes_recent_frequent_gifs(self):
+        from tools.gif_tool import find_canonical_gif
+        # Synthetic history where nathan is used 2 times in last 30 deliveries
+        history = [
+            {"canonical_id": "nfy_nathan_deadpan_nod", "url": "https://tenor.com/view/fake-1"},
+            {"canonical_id": "nfy_nathan_deadpan_nod", "url": "https://tenor.com/view/fake-2"}
+        ]
+        # Force=False, query matching deadpan smirk
+        # Because nathan has 2 recent uses, its score gets penalized by 70 points
+        res = find_canonical_gif("deadpan smirk satisfied handled", history=history, force=False, use_llm=False)
+        self.assertIsNotNone(res)
+        # Nathan should be penalized and yield to another candidate
+        self.assertNotEqual(res.get("canonical_id"), "nfy_nathan_deadpan_nod")
 
 
 if __name__ == "__main__":
