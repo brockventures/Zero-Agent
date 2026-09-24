@@ -48,6 +48,13 @@ class TestNasLogTriage(unittest.TestCase):
         rx = ns["noise_re"]
         sample = '2026-09-23T04:16:42Z ERR Request failed error="stream 64477 canceled by remote with error code 0" connIndex=0 dest=https://outpost.brock.ventures/events'
         self.assertIsNotNone(rx.search(sample))
+        self.assertIsNotNone(rx.search("[BridgeDaemon] ⚠️ Turn execution failed in #the-banana-stand: Persistent worker for #the-banana-stand terminated unexpectedly (exit code 1). Recycling worker to purge pipe state..."))
+        self.assertIsNotNone(rx.search("[BridgeTimer:#the-banana-stand] [FAILED: Persistent worker for #the-banana-stand terminated unexpectedly (exit code 1)] Turn finished in 6.05s"))
+        self.assertIsNotNone(rx.search("2026-09-23 21:31:15.805 ERROR (SyncWorker_12) [hyundai_kia_connect_api.KiaUvoApiUSA] hyundai_kia_connect_api - Error: unknown error response"))
+        self.assertIsNotNone(rx.search("2026-09-23 21:31:15.949 ERROR (MainThread) [custom_components.kia_uvo.coordinator] Force update failed, falling back to cached"))
+        self.assertIsNotNone(rx.search("2026-09-23 22:06:31.748 ERROR (MainThread) [custom_components.emporia_vue] Error communicating with Emporia API: HTTPSConnectionPool(host='api.emporiaenergy.com', port=443): Read timed out."))
+
+
 
 if __name__ == "__main__":
     unittest.main()

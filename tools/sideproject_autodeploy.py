@@ -68,13 +68,14 @@ def save_state(state: dict):
     temp_file.replace(STATE_FILE)
 
 
-def is_service_healthy(health_url: str, timeout: float = 2.0) -> bool:
+def is_service_healthy(health_url: str, timeout: float = 6.0) -> bool:
     try:
         req = urllib.request.Request(health_url, headers={"User-Agent": "AutoDeployWatcher/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
     except Exception:
         return False
+
 
 
 def get_service_pid(service_name: str) -> int | None:
@@ -208,12 +209,26 @@ def check_and_sync_repo(service_name: str) -> dict:
                 log(f"[{service_name}] Static/template files changed ({len(diff_files)} files). Dynamic reload active.")
         else:
             # No new commits, but ensure service is alive
-            if not is_service_healthy(cfg["health_url"]):
-                log(f"[{service_name}] Health check failed while idle. Triggering auto-heal restart...")
-                restart_service(service_name)
-                res["restarted"] = True
+            state = load_state()
+            fail_map = state.setdefault("health_failures", {})
+            if not is_service_healthy(cfg["health_url"], timeout=6.0):
+                failures = fail_map.get(service_name, 0) + 1
+                fail_map[service_name] = failures
+                save_state(state)
+                if failures >= 2:
+                    log(f"[{service_name}] Health check failed ({failures} consecutive attempts). Triggering auto-heal restart...")
+                    restart_service(service_name)
+                    res["restarted"] = True
+                    fail_map[service_name] = 0
+                    save_state(state)
+                else:
+                    log(f"[{service_name}] Health check slow/failed (attempt {failures}/2). Holding restart for debounce.")
+            else:
+                if fail_map.get(service_name, 0) > 0:
+                    fail_map[service_name] = 0
+                    save_state(state)
 
-        res["healthy"] = is_service_healthy(cfg["health_url"])
+        res["healthy"] = is_service_healthy(cfg["health_url"], timeout=6.0)
     except subprocess.TimeoutExpired:
         res["error"] = "Git operation timed out"
         log(f"[{service_name}] Git operation timed out")
