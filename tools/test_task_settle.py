@@ -233,7 +233,7 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
 
         mock_reinvoke = AsyncMock()
 
-        # Case 1: External mode with leak text
+        # Case 1: External mode with leak text suppresses placeholder notices (silent background execution)
         was_settled, result = await evaluate_and_settle_turn(
             conv_id=self.conv_id,
             channel_id=123456,
@@ -247,7 +247,7 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(was_settled)
-        self.assertIn("Task running in the background", result)
+        self.assertIsNone(result)
 
         # Case 2: Home mode with empty text
         was_settled, result_home = await evaluate_and_settle_turn(

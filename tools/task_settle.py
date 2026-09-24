@@ -264,10 +264,11 @@ async def evaluate_and_settle_turn(
         from tools.bridge_safety import is_internal_cli_leak
         if not current_text or is_internal_cli_leak(current_text):
             if mode == "external":
-                notice = "⏳ *Task running in the background—will update here when complete.*"
+                # External shared channels enforce silent background execution; suppress interim placeholder chatter
+                return False, None
             else:
                 notice = "⏳ **Background task in progress.** Command is running in the background; I'll notify when complete."
-            return False, notice
+                return False, notice
         return False, None
 
     print(
