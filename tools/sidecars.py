@@ -1292,7 +1292,7 @@ def run_weekly_grocery_staging() -> tuple[bool, str]:
             lines.append(f"🍽️ **Dinners:** {', '.join(rec_names)}")
 
         lines.append(f"\n🛒 [**1-Click Whole Foods Cart**](<{url}>)")
-        lines.append("*Tap the link above to stage items in Amazon, choose your Friday afternoon delivery window, and complete checkout.*")
+        lines.append("*Tap the link above to stage items in Amazon, choose your delivery window, and complete checkout.*")
 
         if warnings:
             lines.append("\n### ⚠️ Quantity & Packaging Checks")

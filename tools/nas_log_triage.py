@@ -121,9 +121,17 @@ noise_re = re.compile(
     r'Failed to reply to query.*OS Error 0x02000001: Operation not permitted|'
     r'192\.168\.1\.164:3333.*connection refused|'
     r'twcc_sender_interceptor.*read\/write on closed pipe|'
-    r'write tcp.*write: broken pipe|'
     r'\[Summarizer\] LLM synthesis fallback|'
-    r'canceled by remote with error code 0'
+    r'canceled by remote with error code 0|'
+    r'Persistent worker for #.* terminated unexpectedly \(exit code -?\d+\)|'
+    r'\[BridgeTimer:#.*\] \[FAILED: Persistent worker for|'
+    r'hyundai_kia_connect_api.*unknown error response|'
+    r'custom_components\.kia_uvo\.coordinator.*falling back to cached|'
+    r'custom_components\.emporia_vue.*(Read timed out|Error communicating with Emporia API)|'
+    r'requests\.exceptions\.RequestException|'
+    r'Traceback \(most recent call last\):|'
+    r'\[Classifier\] Error: Command|'
+    r'pychromecast\.socket_client.*(Failed to connect|Error reading from socket|retrying in)'
     r')',
     re.IGNORECASE
 )
