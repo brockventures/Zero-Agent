@@ -190,6 +190,26 @@ class TestBananaWatcher(unittest.TestCase):
         c_game_rounds = analyze_envelope_contradictions({"kind": "status", "floor": "open", "round": 5, "max_rounds": 5, "subject": "agora-trading-floor"})
         self.assertEqual(c_game_rounds, [])
 
+        # 9. Non-existent / unknown recipient
+        c9_single = analyze_envelope_contradictions({"kind": "answer", "to": "fakebot", "subject": "topic-h"})
+        self.assertEqual([x["tag"] for x in c9_single], ["unknown_recipient"])
+
+        c9_list = analyze_envelope_contradictions({"kind": "answer", "to": ["amos", "ghostbot"], "subject": "topic-h"})
+        self.assertEqual([x["tag"] for x in c9_list], ["unknown_recipient"])
+
+        c9_valid_list = analyze_envelope_contradictions({"kind": "answer", "to": ["amos", "aerial"], "subject": "topic-h"})
+        self.assertEqual(c9_valid_list, [])
+
+        c9_wildcard = analyze_envelope_contradictions({"kind": "answer", "to": "team", "subject": "topic-h"})
+        self.assertEqual(c9_wildcard, [])
+
+        # 10. Unratified kind (e.g. kind: "task")
+        c10_task = analyze_envelope_contradictions({"kind": "task", "to": "amos", "subject": "topic-i"})
+        self.assertEqual([x["tag"] for x in c10_task], ["unratified_kind"])
+
+        c10_valid_finding = analyze_envelope_contradictions({"kind": "finding", "to": "amos", "subject": "topic-i"})
+        self.assertEqual(c10_valid_finding, [])
+
     @patch("tools.banana.get_status", return_value={"holder": None})
     @patch("tools.banana_watcher.post_discord", return_value=True)
     @patch("tools.banana_watcher.load_state", return_value={"nudged_stalls": {}, "nudged_handoffs": {}, "warned_contradictions": {}, "summarized_subjects": {}})
