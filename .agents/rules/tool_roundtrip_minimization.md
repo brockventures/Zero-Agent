@@ -26,6 +26,20 @@ description: Enforces tool roundtrip minimization, broad-slice file reads, and d
    - If making extensive changes across a file, use `write_to_file` with `Overwrite: true` or a Python script to apply changes cleanly in a single pass.
    - Always run test suites (`pytest`, unit tests) after making edits before chaining further replacements.
 
+5. **Targeted Pytest over Full-Suite Runs (Ban Unscoped Full-Suite Pytest):**
+   - In active interactive PR turns, **NEVER** run unconstrained full repository test suites (e.g. bare `pytest` or `pytest tests/`) if the suite spans multiple unrelated modules or takes >10s.
+   - **ALWAYS** scope test execution strictly to the relevant test file or function under test (e.g. `pytest tests/test_vessel_absorb.py` or `pytest -k "test_hull_index"`).
+   - Rely on asynchronous CI (GitHub Actions) to execute the complete regression test matrix in the cloud once the PR is pushed.
+
+6. **One-Shot Git & PR Pipeline Batching:**
+   - When staging, committing, pushing, and opening pull requests, **NEVER** execute serial micro-tool calls (e.g. `git add` -> `git commit` -> `git push` -> `gh pr create`).
+   - **ALWAYS** bundle the git lifecycle into a single compound shell command:
+     `git add <files> && git commit -m "<msg>" && git push -u origin <branch> && gh pr create --title "<title>" --body "<body>"` (or a single Python script).
+
+7. **Conversational & Deliberation Zero-Tool Fast-Path:**
+   - When responding to pure conversational, opinion, strategy, design feedback, or consensus prompts that do not require live file edits or diagnostic verification, **ZERO** tool calls should be made.
+   - Deliver the conversational response directly in a single inference pass without running exploratory bash checks (`git status`, directory listings, grep).
+
 ---
 
 ## 🛡️ Active PreToolUse Safety Gate (Deterministic Enforcement)
@@ -36,3 +50,5 @@ description: Enforces tool roundtrip minimization, broad-slice file reads, and d
   - Blocks on 3rd consecutive `view_file` call to the same file.
   - Blocks on 5th consecutive serial `view_file` call across different files.
   - Blocks on 4th consecutive `replace_file_content` call to the same file.
+  - Blocks on unscoped full repository test execution (bare `pytest` / `pytest tests/` without target file).
+  - Blocks on 3rd consecutive unbatched single-line git lifecycle command (`git add`, `git commit`, `git push`, `gh pr`).
