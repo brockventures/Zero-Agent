@@ -53,7 +53,7 @@ def format_envelope(
     supersedes: str | None = None,
     spoiler: bool = False,
     include_mention: bool = True,
-    v: int = 1,
+    v: int | float = 1.1,
 ) -> str:
     """Generate a standard fenced handoff JSON block with optional physical Discord mention."""
     payload = {

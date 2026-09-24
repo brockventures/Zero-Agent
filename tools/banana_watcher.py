@@ -213,6 +213,20 @@ def parse_iso_timestamp(iso_str: str) -> float:
     except Exception:
         return time.time()
 
+# Known agents, developers, and broadcast wildcards in Crab Cavern
+KNOWN_RECIPIENTS = {
+    # Peer bots
+    "amos", "marvin", "aerial", "zero", "bananawatcher", "banana_watcher",
+    # Developers & humans
+    "mike", "arbiter", "alex", "arcane", "ian", "themoonproblem", "moon problem", "dr. coley", "dr_coley", "coley", "ryan", "harper", "harperwallbanger",
+    # Broadcast wildcards & team roles (ratified v1.1)
+    "team", "all", "*", "robot", "robots",
+}
+
+RATIFIED_KINDS = {
+    "finding", "question", "answer", "handoff", "correction", "status", "proposal", "consensus", "resolution", "summary"
+}
+
 def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
     """
     Scans a handoff envelope for protocol contradictions.
@@ -223,8 +237,19 @@ def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
     kind = str(env.get("kind") or "").lower().strip()
     floor = str(env.get("floor") or "open").lower().strip()
     reply = str(env.get("reply") or "optional").lower().strip()
-    to_agent = str(env.get("to") or env.get("target") or "").lower().strip()
     subject = str(env.get("subject") or "").strip()
+
+    # Extract all recipient targets (string or list, supporting v1.1)
+    to_raw = env.get("to") if env.get("to") is not None else env.get("target")
+    targets = []
+    if isinstance(to_raw, list):
+        for item in to_raw:
+            if isinstance(item, str):
+                targets.extend(p.strip().lower().lstrip("@") for p in item.split(",") if p.strip())
+    elif isinstance(to_raw, str):
+        targets.extend(p.strip().lower().lstrip("@") for p in to_raw.split(",") if p.strip())
+
+    to_agent = targets[0] if targets else ""
 
     # 1. Premature / Contradictory Floor Closure (e.g. kind: status with floor: closed on multi-turn thread)
     # Setting floor: closed halts conversation across all bots (Tier.SILENT) without reaching consensus/resolution,
@@ -262,7 +287,8 @@ def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
 
     # 4. Unaddressed Required Reply (Orphaned Baton)
     # Requiring a reply without targeting an agent creates bystander apathy or simultaneous claim collisions.
-    if reply in ("required", "baton") and (not to_agent or to_agent in ("null", "none", "team")) and floor != "closed":
+    is_unaddressed = not targets or all(t in ("null", "none", "") for t in targets)
+    if reply in ("required", "baton") and is_unaddressed and floor != "closed":
         contradictions.append({
             "tag": "unaddressed_baton",
             "title": f"`reply: {reply}` without specific target",
@@ -314,6 +340,30 @@ def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
             "title": f"`floor: closed` during active game/trading floor `{subject}`",
             "detail": f"The floor was closed on active game/trading floor topic `{subject}`. Game floors must remain open (`floor: open`) while simulation rounds are active.",
             "fix": "Set `floor: open` to ensure trading and strategy rounds continue without interruption."
+        })
+
+    # 9. Non-Existent or Unregistered Recipient Check
+    # Addressing messages to non-existent bots or unregistered handles drops messages on the floor
+    # and leaves turns in limbo because no runtime is listening to wake up.
+    if targets:
+        unknown_targets = [t for t in targets if t not in KNOWN_RECIPIENTS and not t.isdigit() and t not in ("null", "none")]
+        if unknown_targets:
+            bad_names = ", ".join(f"`{t}`" for t in unknown_targets)
+            contradictions.append({
+                "tag": "unknown_recipient",
+                "title": f"Unknown recipient: {bad_names}",
+                "detail": f"Envelope targeted {bad_names}, which is not a registered Crab Cavern agent, human dev, or valid broadcast wildcard.",
+                "fix": "Target registered bots (`amos`, `marvin`, `aerial`, `zero`), human devs (`ryan`, `alex`, `mike`, `dr. coley`), or valid wildcards (`team`, `all`, `*`)."
+            })
+
+    # 10. Unratified Enum Verb (Invalid kind)
+    # Using non-standard kinds (e.g. kind: "task", "bug") triggers schema validation exceptions in peer parsers (Pydantic/marshmallow).
+    if kind and kind not in RATIFIED_KINDS and not is_game_topic(subject):
+        contradictions.append({
+            "tag": "unratified_kind",
+            "title": f"Unratified envelope `kind: {kind}`",
+            "detail": f"Envelope uses non-standard `kind: {kind}`, which causes schema validation failures in peer runtimes.",
+            "fix": "Use a ratified v1.1 kind verb: `finding`, `question`, `answer`, `handoff`, `correction`, `status`, `proposal`, `consensus`, `resolution`, `summary`."
         })
 
     return contradictions
