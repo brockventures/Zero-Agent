@@ -1132,7 +1132,7 @@ def run_host1_backup(quiet: bool = True) -> tuple[bool, str, dict]:
         cmd = ["python3", "/workspace/tools/backup_host1.py"]
         if quiet:
             cmd.append("--quiet")
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=360)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         out = res.stdout.strip()
         err = res.stderr.strip()
         combined = f"{out}\n{err}".strip() if err else out
