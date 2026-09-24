@@ -43,6 +43,7 @@ def backup_postgres_arr(ts: str) -> tuple[bool, str]:
     cmd = f"sudo docker exec postgres-arr pg_dumpall -U postgres | gzip > '{dest}'"
     code, stdout, stderr = run_ssh(cmd, timeout=180)
     if code != 0:
+        run_ssh(f"rm -f '{dest}'")
         return False, f"pg_dumpall failed (code {code}): {stderr.strip()}"
     
     code, size_out, _ = run_ssh(f"ls -lh '{dest}' | awk '{{print $5}}'")
@@ -60,12 +61,14 @@ def backup_home_assistant(ts: str) -> tuple[bool, str]:
     )
     code, _, stderr = run_ssh(cmd_tar, timeout=120)
     if code != 0:
+        run_ssh(f"rm -f '{dest_config}'")
         return False, f"ha config tar failed (code {code}): {stderr.strip()}"
 
     # 2. SQLite WAL-safe backup of history database
     cmd_db = f"sudo sqlite3 '{DOCKER_ROOT}/homeassistant/config/home-assistant_v2.db' \".backup '{dest_db}'\""
-    code_db, _, stderr_db = run_ssh(cmd_db, timeout=180)
+    code_db, _, stderr_db = run_ssh(cmd_db, timeout=240)
     if code_db != 0:
+        run_ssh(f"rm -f '{dest_db}'")
         return False, f"ha sqlite db backup failed (code {code_db}): {stderr_db.strip()}"
 
     code, size_out, _ = run_ssh(f"ls -lh '{dest_config}' '{dest_db}' | awk '{{print $9, $5}}'")
@@ -79,6 +82,7 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
     cmd_cp = f"cp '{DOCKER_ROOT}/appdata/docker-compose.yml' '{dest_compose}'"
     code_cp, _, stderr_cp = run_ssh(cmd_cp, timeout=30)
     if code_cp != 0:
+        run_ssh(f"rm -f '{dest_compose}'")
         return False, f"docker-compose copy failed (code {code_cp}): {stderr_cp.strip()}"
 
     # 2. Tar critical lightweight appdata configs (maintainerr, seerr, tautulli, dockhand)
@@ -91,6 +95,7 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
     )
     code, _, stderr = run_ssh(cmd_tar, timeout=180)
     if code != 0:
+        run_ssh(f"rm -f '{dest_tar}'")
         return False, f"appdata tar failed (code {code}): {stderr.strip()}"
 
     code, size_out, _ = run_ssh(f"ls -lh '{dest_compose}' '{dest_tar}' | awk '{{print $9, $5}}'")
