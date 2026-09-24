@@ -376,7 +376,7 @@ def load_history() -> list[dict]:
     return []
 
 
-def get_history_urls(history: list[dict | str] | None = None, limit: int = 3) -> set[str]:
+def get_history_urls(history: list[dict | str] | None = None, limit: int = 15) -> set[str]:
     """Extract set of URLs from recent history records (supports dicts and raw strings)."""
     if history is None:
         history = load_history()
@@ -950,6 +950,7 @@ CRITICAL INSTRUCTIONS:
 1. Select the SINGLE BEST GIF ID from the catalog that fits the tone, humor, or situation.
 2. DO NOT pick any GIF from the RECENTLY USED list.
 3. Return ONLY the chosen GIF ID on a line by itself. Do not include markdown, explanations, or quotes.
+4. DIVERSIFY SELECTION: Prefer underutilized or fresh gems from the catalog over repeated staples when multiple GIFs fit the tone.
 """
     raw_out = None
     try:
@@ -1085,7 +1086,20 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
             # Fall back to pure token matching
             pass
 
-    # 3. Score all candidates
+    # 3. Score all candidates with historical frequency decay penalty
+    if history is None:
+        history = load_history()
+    recent_30 = history[-30:] if history else []
+    recent_freq = {}
+    for item in recent_30:
+        if isinstance(item, dict):
+            cid = item.get("canonical_id") or item.get("title")
+            u = item.get("url")
+            if cid:
+                recent_freq[cid] = recent_freq.get(cid, 0) + 1
+            if u:
+                recent_freq[u] = recent_freq.get(u, 0) + 1
+
     candidates = []
     for entry in registry:
         url = entry.get("url")
@@ -1094,7 +1108,13 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
 
         s = score_canonical_candidate(query, entry, fts_score=fts_ranks.get(entry.get("id")))
         if s >= 35.0:
-            candidates.append((s, entry))
+            # Frequency decay penalty: penalize GIFs that have been used multiple times in the last 30 deliveries
+            cid = entry.get("id")
+            freq = max(recent_freq.get(cid, 0), recent_freq.get(url, 0))
+            if freq > 0 and not force:
+                s = max(0.0, s - (freq * 35.0))
+            if s >= 35.0 or force:
+                candidates.append((s, entry))
 
     if not candidates:
         return None
@@ -1102,7 +1122,8 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
     # Sort highest score first
     candidates.sort(key=lambda x: x[0], reverse=True)
 
-    # 4. Filter by cooldown and history
+    # 4. Filter by cooldown and history to get eligible pool
+    eligible_candidates = []
     for score, pick in candidates:
         url = pick.get("url")
         f_slug = pick.get("franchise")
@@ -1118,23 +1139,37 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
         if not is_valid_gif_url(url):
             continue
 
-        title = pick.get("title") or clean_slug_title(url.split("/view/")[-1])
-        record_history(url, query=query, title=title, franchise=f_slug)
+        eligible_candidates.append((score, pick))
 
-        return {
-            "title": title,
-            "url": url,
-            "markdown": f"[GIF]({url})",
-            "ocr_text": "",
-            "source": "canonical_registry",
-            "franchise": f_slug,
-            "canonical_id": pick.get("id"),
-            "score": round(score, 1),
-            "situation": pick.get("situation"),
-            "vibes": pick.get("vibes")
-        }
+    if not eligible_candidates:
+        return None
 
-    return None
+    # 5. Top-K Jitter Selection: Sample stochastically from candidates within 15% of top score
+    top_score = eligible_candidates[0][0]
+    top_tier = [c for c in eligible_candidates if c[0] >= top_score * 0.85]
+    if len(top_tier) > 1 and not force:
+        weights = [max(1.0, c[0]) for c in top_tier]
+        chosen_score, pick = random.choices(top_tier, weights=weights, k=1)[0]
+    else:
+        chosen_score, pick = eligible_candidates[0]
+
+    url = pick.get("url")
+    f_slug = pick.get("franchise")
+    title = pick.get("title") or clean_slug_title(url.split("/view/")[-1])
+    record_history(url, query=query, title=title, franchise=f_slug)
+
+    return {
+        "title": title,
+        "url": url,
+        "markdown": f"[GIF]({url})",
+        "ocr_text": "",
+        "source": "canonical_registry",
+        "franchise": f_slug,
+        "canonical_id": pick.get("id"),
+        "score": round(chosen_score, 1),
+        "situation": pick.get("situation"),
+        "vibes": pick.get("vibes")
+    }
 
 
 def get_contextual_gif(query: str, run_ocr: bool = True, force: bool = False, allow_dynamic: bool = False, use_llm: bool = True) -> dict:
