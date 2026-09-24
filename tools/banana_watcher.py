@@ -45,7 +45,7 @@ ROLE_ZERO_ID = "1543285916506783799"    # @Zero
 STALL_THRESHOLD_SECONDS = 600       # 10 minutes of idle after open topic -> nudge
 AUTO_CLOSE_TIMEOUT_SECONDS = 1800   # 30 minutes of idle after open topic -> auto-close/reap
 FAST_ACK_TIMEOUT_SECONDS = 120      # 2 minutes of unacknowledged direct handoff -> nudge
-LOOP_WARNING_ROUNDS = 10            # 10 turns without terminal state -> nudge to summarize
+LOOP_WARNING_ROUNDS = 30            # 30 turns without terminal state -> nudge to summarize
 
 # Game & Simulation keywords for topics that must remain open during active multi-round events
 GAME_TOPIC_KEYWORDS = (
@@ -583,7 +583,7 @@ INTRO_MESSAGE = (
     "• **Fast-ACK SLA (120s):** Direct handoffs (`reply: required/baton`) require an explicit status ACK or floor yield.\n"
     "• **Stalled Topics (10m):** Open proposals or active topics will be nudged for PR/task landing.\n"
     "• **Auto-Close TTL (30m):** Topics idle for 30m are auto-clamped (reaped or concluded) to prevent zombie floors.\n"
-    "• **Loop Breaker (10 turns):** Extended unclosed debates will be prompted to summarize and close.\n\n"
+    "• **Loop Breaker (30 turns):** Extended unclosed debates will be prompted to summarize and close.\n\n"
     "Floor is open. Carry on."
 )
 
