@@ -107,14 +107,25 @@ def get_turn_pending_tasks(
             # Launch pattern: "Tool is running as a background task with task id: <tid>"
             for m in re.finditer(r"Tool is running as a background task with task id:\s*([^\s\n]+)", content):
                 full_tid = m.group(1).strip("\"'")
-                clean_tid = full_tid.split("/")[-1]
+                if "/" in full_tid:
+                    cid_prefix, clean_tid = full_tid.split("/", 1)
+                    if cid_prefix != conv_id:
+                        # Belongs to a different conversation (e.g. foreign transcript inspection)
+                        continue
+                else:
+                    clean_tid = full_tid
                 if clean_tid not in launched_tasks:
                     launched_tasks.append(clean_tid)
 
             # Completion pattern in transcript: "Task id \"<tid>\" finished"
             for m in re.finditer(r"Task id \"?([^\s\n\"]+)\"? finished", content):
                 full_tid = m.group(1).strip("\"'")
-                clean_tid = full_tid.split("/")[-1]
+                if "/" in full_tid:
+                    cid_prefix, clean_tid = full_tid.split("/", 1)
+                    if cid_prefix != conv_id:
+                        continue
+                else:
+                    clean_tid = full_tid
                 completed_in_transcript.add(clean_tid)
         except Exception:
             continue
@@ -213,6 +224,29 @@ async def wait_for_tasks_to_settle(
     return len(still_pending) == 0, elapsed, still_pending
 
 
+def is_substantive_response(text: Optional[str]) -> bool:
+    """Check if text is substantive user-facing content (not silence, leak, or placeholder)."""
+    if not text or not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped or stripped == "*(No output from agent)*":
+        return False
+    if stripped.lower() in (
+        "[no_reply]",
+        "no_reply",
+        "[no_op]",
+        "no_op",
+        "reply:none",
+        "reply: none",
+        "none",
+    ):
+        return False
+    from tools.bridge_safety import is_internal_cli_leak
+    if is_internal_cli_leak(stripped):
+        return False
+    return True
+
+
 async def evaluate_and_settle_turn(
     conv_id: Optional[str],
     channel_id: int,
@@ -263,12 +297,9 @@ async def evaluate_and_settle_turn(
         )
         from tools.bridge_safety import is_internal_cli_leak
         if not current_text or is_internal_cli_leak(current_text):
-            if mode == "external":
-                # External shared channels enforce silent background execution; suppress interim placeholder chatter
-                return False, None
-            else:
-                notice = "⏳ **Background task in progress.** Command is running in the background; I'll notify when complete."
-                return False, notice
+            # Universal Invariant: Silent Background Execution strictly bans interim placeholder chatter
+            # (e.g. "Background task in progress"). Background completion is dispatched asynchronously via outbox.
+            return False, None
         return False, None
 
     print(
@@ -277,11 +308,20 @@ async def evaluate_and_settle_turn(
     )
 
     # Prompt re-invoking agy to process completion message and deliver final response
-    reinvoke_prompt = (
-        f"[TaskSettle Protocol]: Background task(s) {', '.join(pending)} completed successfully. "
-        "Review the task output now in your context and deliver your final, complete, and substantive "
-        "response to the user. Do NOT emit any waiting or interim chatter; deliver strictly the finished deliverable."
-    )
+    if is_substantive_response(current_text):
+        reinvoke_prompt = (
+            f"[TaskSettle Protocol]: Background task(s) {', '.join(pending)} completed successfully. "
+            "Review the task output now in your context. If your previous response already answered the user's "
+            "question, provide a concise settlement summary of the completed task(s) to accompany it. "
+            "Otherwise, incorporate the findings into your final substantive response. "
+            "Do NOT emit any waiting or interim chatter."
+        )
+    else:
+        reinvoke_prompt = (
+            f"[TaskSettle Protocol]: Background task(s) {', '.join(pending)} completed successfully. "
+            "Review the task output now in your context and deliver your final, complete, and substantive "
+            "response to the user. Do NOT emit any waiting or interim chatter; deliver strictly the finished deliverable."
+        )
 
     kwargs = dict(turn_kwargs or {})
     kwargs["is_settle_reinvocation"] = True
@@ -296,9 +336,41 @@ async def evaluate_and_settle_turn(
             channel_id=channel_id,
             **kwargs,
         )
-        return True, str(reinvoke_res) if reinvoke_res is not None else None
+        res_text = str(reinvoke_res) if reinvoke_res is not None else ""
+        from tools.bridge_safety import is_internal_cli_leak
+        if is_internal_cli_leak(res_text) or "⚠️ **Turn Failed**" in res_text or "Eligibility check failed" in res_text:
+            if is_substantive_response(current_text):
+                print(
+                    f"[TaskSettle] 🛡️ Reinvocation returned leak/error ({res_text[:80]}), "
+                    f"preserving valid pre-settle response ({len(current_text)} chars)."
+                )
+                return True, current_text
+            return False, None
+
+        if not is_substantive_response(res_text):
+            if is_substantive_response(current_text):
+                return True, current_text
+            return False, None
+
+        # Both current_text and res_text are substantive
+        if is_substantive_response(current_text):
+            c_strip = current_text.strip()
+            r_strip = res_text.strip()
+            # If res_text already substantially contains current_text, deliver res_text directly
+            if c_strip in r_strip or (len(c_strip) > 40 and c_strip[:40] in r_strip):
+                return True, r_strip
+            # Otherwise, combine pre-settle substantive deliverable with settle update
+            print(
+                f"[TaskSettle] 🔗 Merging pre-settle substantive text ({len(c_strip)} chars) "
+                f"with settlement response ({len(r_strip)} chars)."
+            )
+            return True, f"{c_strip}\n\n{r_strip}"
+
+        return True, res_text
     except Exception as e:
         print(f"[TaskSettle] Error during reinvocation for {conv_id}: {e}")
+        if is_substantive_response(current_text):
+            return True, current_text
         return False, None
 
 
