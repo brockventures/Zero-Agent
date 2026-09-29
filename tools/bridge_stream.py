@@ -81,6 +81,9 @@ def harvest_transcript_response(conv_id: Optional[str]) -> Optional[str]:
                         break
 
                     if step_type == "PLANNER_RESPONSE":
+                        # Intermediate steps with tool calls are pre-tool scratchpad chatter, not final responses
+                        if data.get("tool_calls"):
+                            continue
                         content = data.get("content")
                         if content and isinstance(content, str) and content.strip():
                             stripped = content.strip()
@@ -148,6 +151,7 @@ class AgyStreamParser:
             if (stype in ("tool",) or tname):
                 # Tool execution: clear pre-tool narration
                 self.accumulated_segment.clear()
+                self.last_substantive_response = ""
                 self.is_explicit_silence = False
 
             elif stype in ("system_message", "system"):
@@ -177,11 +181,11 @@ class AgyStreamParser:
                             ) or is_internal_cli_leak(curr):
                                 self.is_explicit_silence = True
                         else:
-                            self.last_substantive_response = curr
                             self.is_explicit_silence = False
 
         elif ev_type in ("tool", "tool_call", "tool_use"):
             self.accumulated_segment.clear()
+            self.last_substantive_response = ""
             self.is_explicit_silence = False
 
         elif ev_type in ("system_message", "system"):
@@ -250,28 +254,44 @@ class AgyStreamParser:
             ):
                 return "[NO_REPLY]"
 
-        # 1. Check current segment after last tool
+        clean_curr = ""
         if curr and not self._is_silence_or_placeholder(curr):
-            clean = re.sub(
+            clean_curr = re.sub(
                 r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", curr, flags=re.IGNORECASE
             ).strip()
-            clean = strip_internal_cli_chatter(clean)
-            if clean and not self._is_silence_or_placeholder(clean):
-                return clean
+            clean_curr = strip_internal_cli_chatter(clean_curr)
+            if self._is_silence_or_placeholder(clean_curr):
+                clean_curr = ""
 
-        # 2. Check last substantive response before an asynchronous system message
+        clean_last = ""
         if self.last_substantive_response and not self._is_silence_or_placeholder(
             self.last_substantive_response
         ):
-            clean = re.sub(
+            clean_last = re.sub(
                 r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$",
                 "",
                 self.last_substantive_response,
                 flags=re.IGNORECASE,
             ).strip()
-            clean = strip_internal_cli_chatter(clean)
-            if clean and not self._is_silence_or_placeholder(clean):
-                return clean
+            clean_last = strip_internal_cli_chatter(clean_last)
+            if self._is_silence_or_placeholder(clean_last):
+                clean_last = ""
+
+        # 1. Both last substantive response (pre-system-event) and current segment exist
+        if clean_last and clean_curr:
+            # If current segment already repeats/subsumes the pre-system response, deliver clean_curr
+            if clean_last in clean_curr or (len(clean_last) > 40 and clean_last[:40] in clean_curr):
+                return clean_curr
+            # Otherwise, combine pre-system substantive answer with trailing update/receipt
+            return f"{clean_last}\n\n{clean_curr}"
+
+        # 2. Only current segment exists
+        if clean_curr:
+            return clean_curr
+
+        # 3. Only last substantive response exists (e.g. system event was last with no trailing text)
+        if clean_last:
+            return clean_last
 
         # 3. Check final result response from agy
         frr = self.final_result_response.strip() or fallback_result.strip()

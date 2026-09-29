@@ -97,6 +97,36 @@ class TestBridgeStream(unittest.TestCase):
         self.assertEqual(parser.last_substantive_response, "Here is the critical analysis of the bug.")
         self.assertEqual(parser.get_final_response(), "Here is the critical analysis of the bug.")
 
+    def test_agy_stream_parser_system_message_followed_by_trailing_settlement_receipt(self):
+        """Verify that a trailing settlement receipt after an async system message merges with substantive answer."""
+        parser = AgyStreamParser(conv_id="conv-123")
+        # Step 1: Substantive response
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "Yes. Both data sources were validated live from Host 2.",
+            },
+        })
+        # Step 2: Asynchronous system message arrives
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "system_message",
+            },
+        })
+        # Step 3: Trailing settlement receipt
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "All background validation tasks have settled cleanly.",
+                "state": "DONE",
+            },
+        })
+        expected = "Yes. Both data sources were validated live from Host 2.\n\nAll background validation tasks have settled cleanly."
+        self.assertEqual(parser.get_final_response(), expected)
+
     def test_agy_stream_parser_result_event(self):
         parser = AgyStreamParser(conv_id="conv-123")
         parser.process_event({
@@ -160,6 +190,44 @@ class TestBridgeStream(unittest.TestCase):
 
         with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
             harvested = harvest_transcript_response(conv_id)
+            self.assertIsNone(harvested)
+
+    def test_harvest_transcript_response_skips_intermediate_tool_call_steps(self):
+        """Verify that harvest_transcript_response skips intermediate steps that had both content and tool_calls."""
+        conv_id = "test-conv-tool-chatter"
+        log_dir = self.temp_path / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript_full.jsonl"
+
+        steps = [
+            {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Run benchmark"},
+            # Step with pre-tool scratchpad content AND tool_calls
+            {
+                "type": "PLANNER_RESPONSE",
+                "content": "And the task finishes: (waiting silently without text output)...",
+                "tool_calls": [{"name": "manage_task", "args": {"Action": "status"}}]
+            },
+            {"type": "GENERIC", "content": "Task status: RUNNING"},
+            # Final step with completed text
+            {"type": "PLANNER_RESPONSE", "content": "Benchmark complete: R2 is 0.9715."},
+        ]
+        with open(transcript_file, "w") as f:
+            for s in steps:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            harvested = harvest_transcript_response(conv_id)
+            self.assertEqual(harvested, "Benchmark complete: R2 is 0.9715.")
+
+        # Now test when turn ended without a final text step (only tool steps followed)
+        steps_no_final = steps[:-1]
+        with open(transcript_file, "w") as f:
+            for s in steps_no_final:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            harvested = harvest_transcript_response(conv_id)
+            # Intermediate scratchpad should NOT be harvested as final answer
             self.assertIsNone(harvested)
 
     def test_parse_agy_error(self):

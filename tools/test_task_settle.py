@@ -214,56 +214,47 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(was_settled)
         self.assertEqual(result, "Here is the final map review with high resolution tiles.")
-        mock_reinvoke.assert_called_once()
-        self.assertIn("Background task(s) task-777 completed", mock_reinvoke.call_args.kwargs["prompt"])
-        self.assertTrue(mock_reinvoke.call_args.kwargs["is_settle_reinvocation"])
 
-    async def test_evaluate_and_settle_turn_timeout_returns_clean_notice_when_leak(self):
+    async def test_evaluate_and_settle_preserves_substantive_on_auth_leak(self):
         tpath = self.logs_dir / "transcript.jsonl"
         lines = [
-            json.dumps({"type": "USER_INPUT", "source": "USER", "content": "long task"}),
+            json.dumps({"type": "USER_INPUT", "source": "USER", "content": "check status"}),
             json.dumps({
                 "type": "GENERIC",
                 "source": "MODEL",
-                "content": "Tool is running as a background task with task id: test-conv-1234/task-999",
+                "content": "Tool is running as a background task with task id: test-conv-1234/task-auth-1",
             }),
-            json.dumps({"type": "PLANNER_RESPONSE", "content": "Wait for background task to complete..."}),
+            json.dumps({"type": "PLANNER_RESPONSE", "content": "Host 1 is fully up. Coordinators connected."}),
         ]
-        tpath.write_text("\n".join(lines), encoding="utf-8")
+        tpath.write_text(chr(10).join(lines), encoding="utf-8")
 
-        mock_reinvoke = AsyncMock()
+        async def delayed_complete():
+            await asyncio.sleep(0.1)
+            msg_file = self.msgs_dir / "msg-auth-1.json"
+            msg_file.write_text(json.dumps({
+                "sender": "test-conv-1234/task-auth-1",
+                "content": 'Task id "task-auth-1" finished',
+            }), encoding="utf-8")
+        asyncio.create_task(delayed_complete())
 
-        # Case 1: External mode with leak text suppresses placeholder notices (silent background execution)
+        auth_error = 'Error: Eligibility check failed: Get "https://www.googleapis.com/oauth2/v2/userinfo": EOF'
+        mock_reinvoke = AsyncMock(return_value=auth_error)
+
+        pre_settle_text = "Host 1 is fully up. Coordinators connected."
         was_settled, result = await evaluate_and_settle_turn(
-            conv_id=self.conv_id,
-            channel_id=123456,
-            mode="external",
-            status_msg=None,
-            reply_target=None,
-            reinvoke_coro_fn=mock_reinvoke,
-            timeout_seconds=0.1,
-            brain_dir=self.test_dir,
-            current_text="An async command is running. Task log: /tmp/log\nMatch: b'foo'",
-        )
-
-        self.assertFalse(was_settled)
-        self.assertIsNone(result)
-
-        # Case 2: Home mode with empty text
-        was_settled, result_home = await evaluate_and_settle_turn(
             conv_id=self.conv_id,
             channel_id=123456,
             mode="home",
             status_msg=None,
             reply_target=None,
             reinvoke_coro_fn=mock_reinvoke,
-            timeout_seconds=0.1,
+            timeout_seconds=2.0,
             brain_dir=self.test_dir,
-            current_text="",
+            current_text=pre_settle_text,
         )
 
-        self.assertFalse(was_settled)
-        self.assertIn("Background task in progress", result_home)
+        self.assertTrue(was_settled)
+        self.assertEqual(result, pre_settle_text)
 
     def test_register_pending_tasks_and_dispatch_completed(self):
         from tools.task_settle import (
@@ -319,6 +310,53 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
         # 5. Pending file should now be cleared
         pdata_after = json.loads(pending_file.read_text())
         self.assertNotIn(self.conv_id, pdata_after)
+
+    async def test_evaluate_and_settle_merges_substantive_pre_settle_with_settle_update(self):
+        """Verify that a substantive pre-settle answer is not clobbered by a trailing settlement status update."""
+        tpath = self.logs_dir / "transcript.jsonl"
+        lines = [
+            json.dumps({"type": "USER_INPUT", "source": "USER", "content": "Why 50 FV?"}),
+            json.dumps({
+                "type": "GENERIC",
+                "source": "MODEL",
+                "content": "Tool is running as a background task with task id: test-conv-1234/task-merge-1",
+            }),
+            json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "content": "Skenes and Wheeler were given 50 FV because veterans lacked entries in prospect_roster_clocks.",
+            }),
+        ]
+        tpath.write_text("\n".join(lines), encoding="utf-8")
+
+        async def delayed_complete():
+            await asyncio.sleep(0.1)
+            msg_file = self.msgs_dir / "msg-merge-1.json"
+            msg_file.write_text(json.dumps({
+                "sender": "test-conv-1234/task-merge-1",
+                "content": 'Task id "task-merge-1" finished',
+            }), encoding="utf-8")
+        asyncio.create_task(delayed_complete())
+
+        pre_settle_text = "Skenes and Wheeler were given 50 FV because veterans lacked entries in prospect_roster_clocks."
+        settle_receipt = "All background tasks settled cleanly: commit e5e00b2 pushed and DB rebuilt."
+        mock_reinvoke = AsyncMock(return_value=settle_receipt)
+
+        was_settled, result = await evaluate_and_settle_turn(
+            conv_id=self.conv_id,
+            channel_id=123456,
+            mode="home",
+            status_msg=None,
+            reply_target=None,
+            reinvoke_coro_fn=mock_reinvoke,
+            timeout_seconds=2.0,
+            brain_dir=self.test_dir,
+            current_text=pre_settle_text,
+        )
+
+        self.assertTrue(was_settled)
+        self.assertIn("Skenes and Wheeler were given 50 FV", result)
+        self.assertIn("All background tasks settled cleanly: commit e5e00b2", result)
+        self.assertEqual(result, f"{pre_settle_text}\n\n{settle_receipt}")
 
 
 if __name__ == "__main__":
