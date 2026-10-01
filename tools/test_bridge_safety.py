@@ -157,6 +157,17 @@ class TestBridgeSafety(unittest.TestCase):
         self.assertFalse(is_internal_cli_leak(valid))
         self.assertFalse(is_transient_auth_error(valid))
 
+    def test_substantive_wait_discussion_not_leak(self):
+        msg = (
+            "### The Proposed Protection Architecture\n\n"
+            "1. Pre-Flight Task Audit:\n"
+            "Before executing reload, inspect running tasks.\n\n"
+            "2. Interactive Gate:\n"
+            "With interactive choices: Force Reload Now or Wait for Tasks to Settle or Abort Reload\n\n"
+            "Selecting Wait for Tasks to Settle touches the reload flag, and we wait for background tasks to settle cleanly."
+        )
+        self.assertFalse(is_internal_cli_leak(msg))
+
 
 if __name__ == "__main__":
     unittest.main()

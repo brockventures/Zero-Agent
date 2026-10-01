@@ -350,15 +350,17 @@ def is_internal_cli_leak(text: str) -> bool:
     if lower.startswith("an async task has completed") or lower.startswith("an asynchronous task has completed"):
         return True
 
-    # Option B chatter on cleaned text
-    if re.search(r"\bwait(?:ing)?\s+for\s+(?:at\s+least\s+one\s+of\s+the\s+)?(?:background\s+)?task", lower):
-        return True
-    if re.search(r"\bwait(?:ing)?\s+for\s+task[:\s]", lower):
-        return True
-    if re.search(r"\bwait(?:ing)?\s+for\s+[a-f0-9\-]+(?:/task-\d+)?\s+to\s+(?:complete|finish)", lower):
-        return True
-    if re.search(r"\bwait(?:ing)?\s+for\s+(?:command|process)\s+to\s+(?:finish|complete)", lower):
-        return True
+    # Option B chatter on cleaned text (suppress only if not substantive)
+    is_substantive = len(cleaned.strip()) > 300 and ("\n\n" in cleaned or "###" in cleaned)
+    if not is_substantive:
+        if re.search(r"\bwait(?:ing)?\s+for\s+(?:at\s+least\s+one\s+of\s+the\s+)?(?:background\s+)?task", lower):
+            return True
+        if re.search(r"\bwait(?:ing)?\s+for\s+task[:\s]", lower):
+            return True
+        if re.search(r"\bwait(?:ing)?\s+for\s+[a-f0-9\-]+(?:/task-\d+)?\s+to\s+(?:complete|finish)", lower):
+            return True
+        if re.search(r"\bwait(?:ing)?\s+for\s+(?:command|process)\s+to\s+(?:finish|complete)", lower):
+            return True
 
     # If remaining lines are exclusively internal daemon/system/test lines without user-facing content
     remaining_lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
