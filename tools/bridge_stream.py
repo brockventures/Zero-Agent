@@ -155,11 +155,16 @@ class AgyStreamParser:
                 self.is_explicit_silence = False
 
             elif stype in ("system_message", "system"):
-                # Asynchronous system event: preserve substantive content generated prior
-                curr = "".join(self.accumulated_segment).strip()
-                if curr and not self._is_silence_or_placeholder(curr):
-                    self.last_substantive_response = curr
-                self.accumulated_segment.clear()
+                # Asynchronous system event: preserve substantive content generated prior, unless interrupted
+                step_str = json.dumps(step).lower()
+                if "interrupted" in step_str or step.get("state") == "ERROR":
+                    self.accumulated_segment.clear()
+                    self.last_substantive_response = ""
+                else:
+                    curr = "".join(self.accumulated_segment).strip()
+                    if curr and not self._is_silence_or_placeholder(curr):
+                        self.last_substantive_response = curr
+                    self.accumulated_segment.clear()
 
             elif stype == "agent_response":
                 delta = step.get("text_delta") or step.get("text") or step.get("content")
@@ -189,10 +194,19 @@ class AgyStreamParser:
             self.is_explicit_silence = False
 
         elif ev_type in ("system_message", "system"):
-            curr = "".join(self.accumulated_segment).strip()
-            if curr and not self._is_silence_or_placeholder(curr):
-                self.last_substantive_response = curr
+            ev_str = json.dumps(event).lower()
+            if "interrupted" in ev_str or event.get("type") == "ERROR_MESSAGE":
+                self.accumulated_segment.clear()
+                self.last_substantive_response = ""
+            else:
+                curr = "".join(self.accumulated_segment).strip()
+                if curr and not self._is_silence_or_placeholder(curr):
+                    self.last_substantive_response = curr
+                self.accumulated_segment.clear()
+
+        elif ev_type in ("error", "error_message"):
             self.accumulated_segment.clear()
+            self.last_substantive_response = ""
 
         elif ev_type in ("content", "message", "text", "delta"):
             content = event.get("content") or event.get("text") or event.get("delta")
@@ -281,6 +295,13 @@ class AgyStreamParser:
         if clean_last and clean_curr:
             # If current segment already repeats/subsumes the pre-system response, deliver clean_curr
             if clean_last in clean_curr or (len(clean_last) > 40 and clean_last[:40] in clean_curr):
+                return clean_curr
+            # If both start with a banana prefix or identical header/tag line, treat as redraft
+            first_last_line = clean_last.splitlines()[0].strip()
+            first_curr_line = clean_curr.splitlines()[0].strip()
+            if (clean_last.startswith("🍌") and clean_curr.startswith("🍌")) or (
+                first_last_line and first_curr_line and first_last_line == first_curr_line
+            ):
                 return clean_curr
             # Otherwise, combine pre-system substantive answer with trailing update/receipt
             return f"{clean_last}\n\n{clean_curr}"

@@ -259,5 +259,39 @@ class TestBridgeStream(unittest.TestCase):
         self.assertIn("Process:** `PID 12345`", msg)
 
 
+
+    def test_interruption_clears_accumulated_segment_and_prevents_gluing(self):
+        parser = AgyStreamParser(conv_id="conv-456")
+        # Step 1: Draft starts
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "🍌 <@123> Initial draft cut off mid-word,",
+            },
+        })
+        # Step 2: Stream interruption arrives
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "system_message",
+                "content": "Error: The stream was interrupted. Please continue.",
+            },
+        })
+        # Verify accumulated segment was cleared
+        self.assertEqual(len(parser.accumulated_segment), 0)
+        self.assertEqual(parser.last_substantive_response, "")
+
+        # Step 3: Redraft starts cleanly
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "🍌 <@123> Clean redrafted message.",
+                "state": "DONE",
+            },
+        })
+        self.assertEqual(parser.get_final_response(), "🍌 <@123> Clean redrafted message.")
+
 if __name__ == "__main__":
     unittest.main()
