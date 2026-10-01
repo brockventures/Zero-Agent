@@ -615,6 +615,64 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         # DLQ file was written
         mock_file.assert_called()
 
+    async def test_outbox_flush_agent_turn_dispatches_cleanly(self):
+        """Verify agent_turn outbox messages route to dispatch_fn without dumping raw prompt to channel."""
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_dispatch = AsyncMock()
+
+        scheduler = bshed.BridgeScheduler(
+            dispatch_fn=mock_dispatch,
+            bot=mock_bot,
+        )
+
+        msg = {
+            "id": "outbox-agent-turn-1",
+            "type": "agent_turn",
+            "channel": "zero-chat",
+            "channel_id": 1542081375287640084,
+            "content": "[SYSTEM NOTIFICATION: DETACHED TASK COMPLETE]\nDirective: Synthesize this.",
+            "source": "Detached Task: Test Task",
+        }
+
+        with patch("tools.outbox.flush_pending_messages", return_value=[msg]):
+            await scheduler.flush_outbox_queue()
+
+        mock_dispatch.assert_awaited_once_with(
+            prompt="[SYSTEM NOTIFICATION: DETACHED TASK COMPLETE]\nDirective: Synthesize this.",
+            job_name="Detached Task: Test Task",
+            channel_id=1542081375287640084,
+        )
+        mock_channel.send.assert_not_called()
+
+    async def test_outbox_flush_agent_turn_suppresses_prompt_when_dispatch_fails(self):
+        """Verify agent_turn prompt is never leaked to channel even if dispatch_fn raises an exception."""
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_dispatch = AsyncMock(side_effect=Exception("Turn queue full"))
+
+        scheduler = bshed.BridgeScheduler(
+            dispatch_fn=mock_dispatch,
+            bot=mock_bot,
+        )
+
+        msg = {
+            "id": "outbox-agent-turn-fail",
+            "type": "agent_turn",
+            "channel": "zero-chat",
+            "channel_id": 1542081375287640084,
+            "content": "[SYSTEM NOTIFICATION: DETACHED TASK COMPLETE]\nDirective: Synthesize this.",
+            "source": "Detached Task: Test Task",
+        }
+
+        with patch("tools.outbox.flush_pending_messages", return_value=[msg]):
+            await scheduler.flush_outbox_queue()
+
+        mock_dispatch.assert_awaited_once()
+        mock_channel.send.assert_not_called()
+
     async def test_long_running_job_does_not_block_scheduler_or_heartbeat(self):
         """Verify long-running sidecars (e.g. dreaming pass) run in background without blocking evaluate or heartbeats."""
         job_started = asyncio.Event()
