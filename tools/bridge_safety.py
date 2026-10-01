@@ -292,6 +292,27 @@ def is_internal_cli_leak(text: str) -> bool:
     if orig_lower.startswith("task log:") or re.match(r"^task log:\s*`?(?:file://)?", orig_lower):
         return True
 
+    # Upstream Model Routing & API Gateway Failures
+    if (
+        'not found for api version' in orig_lower
+        or 'modelservice.listmodels' in orig_lower
+        or ('error: not_found' in orig_lower and 'models/' in orig_lower)
+    ):
+        return True
+
+    # Antigravity CLI Google Auth & Eligibility Failures
+    if (
+        "eligibility check failed" in orig_lower
+        or "failed to get profile picture" in orig_lower
+        or "failed to get user info" in orig_lower
+        or "lh3.googleusercontent.com" in orig_lower
+        or "googleapis.com/oauth2/v2/userinfo" in orig_lower
+        or "net/http: tls handshake timeout" in orig_lower
+    ):
+        is_substantive = len(text.strip()) > 300 and ("\n\n" in text or "###" in text)
+        if not is_substantive:
+            return True
+
     cleaned = strip_internal_cli_chatter(text).strip()
     if not cleaned:
         return True
@@ -312,6 +333,15 @@ def is_internal_cli_leak(text: str) -> bool:
     ):
         return True
     if lower.startswith("error: interrupted") or lower == "interrupted":
+        return True
+
+    # Agent runtime meta-reasoning leaks
+    if (
+        "in this agent runtime" in lower
+        or "waiting silently without text output" in lower
+        or "if we output visible text, the turn ends" in lower
+        or "and the task finishes:" in lower
+    ):
         return True
 
     # Standalone pure CLI status, process completion, or task completion notices
@@ -454,3 +484,18 @@ def scrub_credentials(text: str) -> str:
     text = re.sub(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "[REDACTED_JWT]", text)
 
     return text
+
+
+def is_transient_auth_error(text: str) -> bool:
+    """Return True if text contains transient Google auth or eligibility check failures."""
+    if not text or not isinstance(text, str):
+        return False
+    lower = text.lower()
+    return any(sig in lower for sig in (
+        "eligibility check failed",
+        "failed to get profile picture",
+        "failed to get user info",
+        "lh3.googleusercontent.com",
+        "googleapis.com/oauth2/v2/userinfo",
+        "authentication failed or timed out",
+    ))

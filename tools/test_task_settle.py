@@ -115,7 +115,7 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(is_task_completed(self.conv_id, "task-555", brain_dir=self.test_dir))
 
-    def test_cancellation_message_does_not_clear_pending_task(self):
+    def test_cancellation_message_clears_pending_task(self):
         tpath = self.logs_dir / "transcript.jsonl"
         lines = [
             json.dumps({"type": "USER_INPUT", "source": "USER", "content": "run long test"}),
@@ -135,9 +135,9 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
         }
         msg_file.write_text(json.dumps(msg_payload), encoding="utf-8")
 
-        # Must NOT be considered finished or completed
-        self.assertFalse(is_task_completed(self.conv_id, "task-246", brain_dir=self.test_dir))
-        self.assertEqual(get_turn_pending_tasks(self.conv_id, brain_dir=self.test_dir), ["task-246"])
+        # Canceled tasks are terminal and must be cleared so they do not hang pending
+        self.assertTrue(is_task_completed(self.conv_id, "task-246", brain_dir=self.test_dir))
+        self.assertEqual(get_turn_pending_tasks(self.conv_id, brain_dir=self.test_dir), [])
 
     async def test_wait_for_tasks_to_settle_success(self):
         # Simulate background task completing 0.2s later

@@ -18,6 +18,7 @@ from tools.bridge_safety import (
     is_internal_cli_leak,
     scrub_credentials,
     strip_internal_cli_chatter,
+    is_transient_auth_error,
 )
 
 
@@ -132,6 +133,29 @@ class TestBridgeSafety(unittest.TestCase):
         self.assertNotIn("sk-1234567890abcdef1234567890abcdef", scrubbed)
         self.assertIn("[REDACTED_GITHUB_TOKEN]", scrubbed)
         self.assertIn("[REDACTED_API_KEY]", scrubbed)
+
+
+    def test_auth_eligibility_leak_detection(self):
+        err1 = 'Error: Eligibility check failed: failed to get profile picture: Get "https://lh3.googleusercontent.com/a/test": net/http: TLS handshake timeout'
+        err2 = 'Error: Eligibility check failed: Get "https://www.googleapis.com/oauth2/v2/userinfo": EOF'
+        self.assertTrue(is_internal_cli_leak(err1))
+        self.assertTrue(is_internal_cli_leak(err2))
+        self.assertTrue(is_transient_auth_error(err1))
+        self.assertTrue(is_transient_auth_error(err2))
+
+        # Substantive responses discussing auth failures must NOT be dropped as leaks
+        autopsy_msg = (
+            "### Network Autopsy & Investigation Receipts\n\n"
+            "The gateway stalled during DNS resolution. Specifically, when querying "
+            "https://www.googleapis.com/oauth2/v2/userinfo the TLS handshake timed out due to "
+            "upstream packet loss on eth4. We verified that both interfaces were attempting to "
+            "claim the same CIDR simultaneously. Once the conflict was resolved, traffic resumed nominal throughput."
+        )
+        self.assertFalse(is_internal_cli_leak(autopsy_msg))
+
+        valid = 'Host 1 is fully up and running. Coordinators reconnected.'
+        self.assertFalse(is_internal_cli_leak(valid))
+        self.assertFalse(is_transient_auth_error(valid))
 
 
 if __name__ == "__main__":
