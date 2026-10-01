@@ -32,12 +32,12 @@ PENDING_SDK_TASKS_FILE = DATA_DIR / "pending_sdk_tasks.json"
 
 
 def _is_task_finished_content(clean_tid: str, content: str) -> bool:
-    """Check if text content explicitly reports task completion rather than cancellation or in-progress status."""
+    """Check if text content explicitly reports task completion or terminal cancellation rather than in-progress status."""
     lower = content.lower()
-    if "was canceled" in lower or "was cancelled" in lower:
-        return False
     if clean_tid not in content:
         return False
+    if "was canceled" in lower or "was cancelled" in lower:
+        return True
     pattern = rf"({re.escape(clean_tid)}[^\n]*?\b(?:finished|completed)\b|\b(?:finished|completed)\b[^\n]*?{re.escape(clean_tid)})"
     return bool(re.search(pattern, content, re.IGNORECASE))
 
