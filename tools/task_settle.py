@@ -23,10 +23,11 @@ import os
 import re
 import time
 from pathlib import Path
+from tools.bridge_safety import is_internal_cli_leak
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 DEFAULT_BRAIN_DIR = Path("/root/.gemini/antigravity-cli/brain")
-DEFAULT_SETTLE_TIMEOUT = 25.0
+DEFAULT_SETTLE_TIMEOUT = 45.0
 DATA_DIR = Path("/workspace/data")
 PENDING_SDK_TASKS_FILE = DATA_DIR / "pending_sdk_tasks.json"
 
@@ -36,7 +37,12 @@ def _is_task_finished_content(clean_tid: str, content: str) -> bool:
     lower = content.lower()
     if clean_tid not in content:
         return False
-    if "was canceled" in lower or "was cancelled" in lower:
+    if (
+        "was canceled" in lower
+        or "was cancelled" in lower
+        or "timer cancelled" in lower
+        or "early-termination condition" in lower
+    ):
         return True
     pattern = rf"({re.escape(clean_tid)}[^\n]*?\b(?:finished|completed)\b|\b(?:finished|completed)\b[^\n]*?{re.escape(clean_tid)})"
     return bool(re.search(pattern, content, re.IGNORECASE))
@@ -103,10 +109,20 @@ def get_turn_pending_tasks(
             continue
         try:
             d = json.loads(line_s)
+            step_type = d.get("type", "")
+            source = d.get("source", "")
+            # Strict safety: never parse user inputs, checkpoints, or system context for task launches
+            if (
+                step_type in ("USER_INPUT", "CHECKPOINT", "user", "USER", "EPHEMERAL_MESSAGE")
+                or source in ("USER_EXPLICIT", "USER")
+                or d.get("role") in ("user", "USER")
+            ):
+                continue
+
             content = str(d.get("content", ""))
             # Launch pattern: "Tool is running as a background task with task id: <tid>"
             for m in re.finditer(r"Tool is running as a background task with task id:\s*([^\s\n]+)", content):
-                full_tid = m.group(1).strip("\"'")
+                full_tid = m.group(1).strip("\"'.,;:()`[]{}")
                 if "/" in full_tid:
                     cid_prefix, clean_tid = full_tid.split("/", 1)
                     if cid_prefix != conv_id:
@@ -114,19 +130,36 @@ def get_turn_pending_tasks(
                         continue
                 else:
                     clean_tid = full_tid
+
+                clean_tid = clean_tid.strip("\"'.,;:()`[]{}")
+                clean_tid = re.sub(r"[^a-zA-Z0-9_-]", "", clean_tid)
+                if not clean_tid:
+                    continue
+
+                # Strict disk validation: Non-standard task IDs (anything not starting with task-)
+                # must exist on disk under this conversation's task directory.
+                task_log = conv_path / ".system_generated" / "tasks" / f"{clean_tid}.log"
+                task_dir_entry = conv_path / ".system_generated" / "tasks" / clean_tid
+                if not clean_tid.startswith("task-"):
+                    if not task_log.exists() and not task_dir_entry.exists():
+                        continue
+
                 if clean_tid not in launched_tasks:
                     launched_tasks.append(clean_tid)
 
             # Completion pattern in transcript: "Task id \"<tid>\" finished"
             for m in re.finditer(r"Task id \"?([^\s\n\"]+)\"? finished", content):
-                full_tid = m.group(1).strip("\"'")
+                full_tid = m.group(1).strip("\"'.,;:()`[]{}")
                 if "/" in full_tid:
                     cid_prefix, clean_tid = full_tid.split("/", 1)
                     if cid_prefix != conv_id:
                         continue
                 else:
                     clean_tid = full_tid
-                completed_in_transcript.add(clean_tid)
+                clean_tid = clean_tid.strip("\"'.,;:()`[]{}")
+                clean_tid = re.sub(r"[^a-zA-Z0-9_-]", "", clean_tid)
+                if clean_tid:
+                    completed_in_transcript.add(clean_tid)
         except Exception:
             continue
 
@@ -189,6 +222,17 @@ def is_task_completed(
         except Exception:
             pass
 
+    # 3. Check task log file for early-cancelled timers or finished notices
+    task_log = conv_path / ".system_generated" / "tasks" / f"{clean_tid}.log"
+    if task_log.exists():
+        try:
+            with open(task_log, "r", encoding="utf-8", errors="replace") as lf:
+                log_txt = lf.read().lower()
+                if "timer cancelled:" in log_txt or "early-termination condition" in log_txt:
+                    return True
+        except Exception:
+            pass
+
     return False
 
 
@@ -241,7 +285,6 @@ def is_substantive_response(text: Optional[str]) -> bool:
         "none",
     ):
         return False
-    from tools.bridge_safety import is_internal_cli_leak
     if is_internal_cli_leak(stripped):
         return False
     return True
@@ -295,7 +338,6 @@ async def evaluate_and_settle_turn(
             mode=mode,
             task_ids=still_pending,
         )
-        from tools.bridge_safety import is_internal_cli_leak
         if not current_text or is_internal_cli_leak(current_text):
             # Universal Invariant: Silent Background Execution strictly bans interim placeholder chatter
             # (e.g. "Background task in progress"). Background completion is dispatched asynchronously via outbox.
@@ -337,7 +379,6 @@ async def evaluate_and_settle_turn(
             **kwargs,
         )
         res_text = str(reinvoke_res) if reinvoke_res is not None else ""
-        from tools.bridge_safety import is_internal_cli_leak
         if is_internal_cli_leak(res_text) or "⚠️ **Turn Failed**" in res_text or "Eligibility check failed" in res_text:
             if is_substantive_response(current_text):
                 print(
@@ -497,6 +538,9 @@ def check_and_dispatch_completed_tasks(
         task_ids = info.get("task_ids", [])
         still_pending = []
 
+        any_completed = False
+        any_timed_out = False
+
         for tid in task_ids:
             if is_task_completed(conv_id, tid, brain_dir=brain_dir):
                 details = get_task_completion_details(conv_id, tid, brain_dir=brain_dir)
@@ -517,6 +561,8 @@ def check_and_dispatch_completed_tasks(
                     from tools.bridge_safety import strip_internal_cli_chatter
                     clean_snip = strip_internal_cli_chatter(snippet).strip()
                     if clean_snip:
+                        if len(clean_snip) > 1200:
+                            clean_snip = clean_snip[-1200:]
                         msg_lines.append(f"\n**Output Excerpt:**\n```text\n{clean_snip}\n```")
 
                 outbox_content = "\n".join(msg_lines)
@@ -529,6 +575,7 @@ def check_and_dispatch_completed_tasks(
                         source_turn=f"sdk-task-{tid}",
                     )
                     dispatched.append(details)
+                    any_completed = True
                     print(f"[TaskSettle] 🚀 Dispatched outbox completion notice for task {tid} to channel {channel_id}")
                 except Exception as oe:
                     print(f"[TaskSettle] Failed to queue outbox notification for {tid}: {oe}")
@@ -537,6 +584,8 @@ def check_and_dispatch_completed_tasks(
                 reg_at = info.get("registered_at", time.time())
                 if (time.time() - reg_at) < 7200:
                     still_pending.append(tid)
+                else:
+                    any_timed_out = True
 
         if len(still_pending) != len(task_ids):
             modified = True
@@ -545,6 +594,35 @@ def check_and_dispatch_completed_tasks(
                 data[conv_id] = info
             else:
                 del data[conv_id]
+                # If all tasks finished (and did NOT expire via TTL timeout), check if agent produced a completed substantive response in the transcript
+                # Strictly drop harvest if:
+                # 1. Any task timed out rather than completed.
+                # 2. No tasks were completed in this settlement check.
+                # 3. Channel is an excluded quarantine channel (#baseball).
+                # 4. Registered task is older than 30 minutes (prevent stale zombie replays).
+                from tools.bridge_state import DEFAULT_EXCLUDED_HOME_CHANNELS
+                is_excluded = (
+                    int(channel_id) in DEFAULT_EXCLUDED_HOME_CHANNELS
+                    if str(channel_id).isdigit()
+                    else str(channel_id).lower() in ("baseball", "#baseball")
+                )
+                reg_at = info.get("registered_at", 0)
+                is_stale = (time.time() - reg_at) > 1800
+
+                if any_completed and not any_timed_out and not is_excluded and not is_stale:
+                    try:
+                        from tools.bridge_stream import harvest_transcript_response
+                        harvested = harvest_transcript_response(conv_id, brain_base_dir=brain_dir)
+                        if harvested and not is_internal_cli_leak(harvested):
+                            from tools.outbox import queue_outbox_message
+                            queue_outbox_message(
+                                channel=channel_id,
+                                content=harvested,
+                                source_turn=f"harvest-{conv_id[:8]}",
+                            )
+                            print(f"[TaskSettle] 🚀 Dispatched late-harvested response for {conv_id} to channel {channel_id}")
+                    except Exception as he:
+                        print(f"[TaskSettle] Note on harvesting post-task response: {he}")
 
     if modified:
         try:
