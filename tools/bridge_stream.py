@@ -45,7 +45,10 @@ def format_command_preview(cmd_raw: str, max_len: int = 80) -> str:
     return f"Running: {snip}..."
 
 
-def harvest_transcript_response(conv_id: Optional[str]) -> Optional[str]:
+def harvest_transcript_response(
+    conv_id: Optional[str],
+    brain_base_dir: Optional[Path | str] = None,
+) -> Optional[str]:
     """Harvest completed response from transcript files if stdout was truncated or cut off.
 
     Enforces active turn boundary: stops immediately if a USER_INPUT or CHECKPOINT step is
@@ -54,7 +57,8 @@ def harvest_transcript_response(conv_id: Optional[str]) -> Optional[str]:
     """
     if not conv_id:
         return None
-    brain_dir = Path("/root/.gemini/antigravity-cli/brain") / str(conv_id) / ".system_generated" / "logs"
+    base = Path(brain_base_dir) if brain_base_dir else Path("/root/.gemini/antigravity-cli/brain")
+    brain_dir = base / str(conv_id) / ".system_generated" / "logs"
     for fname in ("transcript_full.jsonl", "transcript.jsonl"):
         tpath = brain_dir / fname
         if not tpath.exists():
@@ -62,6 +66,7 @@ def harvest_transcript_response(conv_id: Optional[str]) -> Optional[str]:
         try:
             with open(tpath, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
+            candidates = []
             for line in reversed(lines):
                 line_s = line.strip()
                 if not line_s:
@@ -89,9 +94,35 @@ def harvest_transcript_response(conv_id: Optional[str]) -> Optional[str]:
                             stripped = content.strip()
                             if is_internal_cli_leak(stripped):
                                 continue
-                            return stripped
+                            candidates.append(stripped)
                 except Exception:
                     continue
+
+            if not candidates:
+                continue
+
+            if len(candidates) == 1:
+                return candidates[0]
+
+            latest = candidates[0]
+            # If multiple candidates exist in the active turn, prevent short background-task completion stubs
+            # from overwriting rich, substantive answers generated earlier in the same turn.
+            for earlier in candidates[1:]:
+                # If latest candidate is a short background-task completion stub, or earlier is much more substantive:
+                is_latest_stub = any(k in latest.lower() for k in [
+                    "standing by", "no background tasks", "migrations and evaluations are complete",
+                    "evaluations are complete", "migrations are complete", "background task"
+                ]) or len(latest) < 180
+                
+                if (is_latest_stub and len(earlier) > len(latest)) or (len(earlier) > 200 and len(earlier) > len(latest) * 1.5):
+                    if latest in earlier:
+                        return earlier
+                    # If latest adds a distinct non-generic status receipt, append it; otherwise prefer earlier substantive answer
+                    if not any(k in latest.lower() for k in ["standing by", "no background tasks", "migrations and evaluations are complete", "evaluations are complete"]):
+                        return f"{earlier}\n\n{latest}"
+                    return earlier
+
+            return latest
         except Exception as e:
             print(f"[BridgeStream] Error reading transcript {tpath}: {e}")
     return None
@@ -149,9 +180,8 @@ class AgyStreamParser:
             tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
 
             if (stype in ("tool",) or tname):
-                # Tool execution: clear pre-tool narration
+                # Tool execution: clear pre-tool narration, but preserve substantive response across system tasks
                 self.accumulated_segment.clear()
-                self.last_substantive_response = ""
                 self.is_explicit_silence = False
 
             elif stype in ("system_message", "system"):
@@ -190,7 +220,6 @@ class AgyStreamParser:
 
         elif ev_type in ("tool", "tool_call", "tool_use"):
             self.accumulated_segment.clear()
-            self.last_substantive_response = ""
             self.is_explicit_silence = False
 
         elif ev_type in ("system_message", "system"):
@@ -303,6 +332,9 @@ class AgyStreamParser:
                 first_last_line and first_curr_line and first_last_line == first_curr_line
             ):
                 return clean_curr
+            # If trailing segment is just a generic standing-by / task completion stub, deliver the substantive answer
+            if any(k in clean_curr.lower() for k in ["standing by", "no background tasks", "migrations and evaluations are complete", "evaluations are complete"]) and len(clean_last) > len(clean_curr) * 2:
+                return clean_last
             # Otherwise, combine pre-system substantive answer with trailing update/receipt
             return f"{clean_last}\n\n{clean_curr}"
 
