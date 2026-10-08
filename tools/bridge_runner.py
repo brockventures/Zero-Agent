@@ -67,11 +67,9 @@ active_master_fd = None
 active_proc = None
 ext_active_proc = None
 ext_active_master_fd = None
-steering_channels = set()     # channel/thread IDs actively being steered
+from tools.bridge_engine import TurnCoordinator, channel_active_procs, channel_active_prompts, steering_channels
 reset_session_keys = PersistentSessionKeySet(get_reset_session_keys())    # session keys (persisted to disk) to reset on next turn
 thread_active_tasks = {}     # thread_id -> asyncio.Task
-
-from tools.bridge_engine import TurnCoordinator, channel_active_procs
 
 
 from tools.bridge_pipeline import (
@@ -100,53 +98,7 @@ def kill_process_tree(proc, sig=signal.SIGTERM):
 
 
 
-def harvest_transcript_response(conv_id: str | None) -> str | None:
-    """Harvest completed response from transcript files if stdout was truncated or cut off.
-
-    Enforces active turn boundary: stops immediately if a USER_INPUT or CHECKPOINT step is
-    encountered before finding a substantive PLANNER_RESPONSE, preventing prior turn responses
-    from ever being harvested or re-delivered.
-    """
-    if not conv_id:
-        return None
-    brain_dir = Path("/root/.gemini/antigravity-cli/brain") / conv_id / ".system_generated" / "logs"
-    for fname in ("transcript_full.jsonl", "transcript.jsonl"):
-        tpath = brain_dir / fname
-        if not tpath.exists():
-            continue
-        try:
-            with open(tpath, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-            for line in reversed(lines):
-                line_s = line.strip()
-                if not line_s:
-                    continue
-                try:
-                    data = json.loads(line_s)
-                    step_type = data.get("type")
-                    source = data.get("source")
-                    role = data.get("role")
-
-                    # Turn boundary check: Never cross into prior conversation turns or checkpoints
-                    if (
-                        step_type in ("USER_INPUT", "CHECKPOINT", "user", "USER")
-                        or source in ("USER_EXPLICIT", "USER")
-                        or role in ("user", "USER")
-                    ):
-                        break
-
-                    if step_type == "PLANNER_RESPONSE":
-                        content = data.get("content")
-                        if content and isinstance(content, str) and content.strip():
-                            stripped = content.strip()
-                            if is_internal_cli_leak(stripped):
-                                continue
-                            return stripped
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"[BridgeRunner] Error reading transcript {tpath}: {e}")
-    return None
+from tools.bridge_stream import harvest_transcript_response
 
 
 async def execute_agy_turn(
@@ -166,6 +118,7 @@ async def execute_agy_turn(
     last_word_streak: int = 0,
     queued_at: float | None = None,
     is_settle_reinvocation: bool = False,
+    is_physical_mention: bool = False,
 ):
     """Execute a single agy CLI turn with streaming status and output delivery."""
     global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session_keys
@@ -193,8 +146,13 @@ async def execute_agy_turn(
                     last_word_streak=last_word_streak,
                     queued_at=queued_at,
                     is_settle_reinvocation=is_settle_reinvocation,
+                    is_physical_mention=is_physical_mention,
                 )
             except Exception as pe:
+                if channel_id in steering_channels:
+                    steering_channels.discard(channel_id)
+                    print(f"[BridgeRunner] 🧭 Mid-turn steering: discarded cancelled turn for channel {channel_id}.")
+                    return
                 print(f"[BridgeRunner] ⚠️ Persistent daemon turn error in channel {channel_id}: {pe}. Ensuring worker recycled & falling back to dynamic execution...")
                 try:
                     await worker.recycle()
@@ -265,6 +223,18 @@ async def execute_agy_turn(
             cmd.append(f"--conversation={conv_id}")
 
         timer.mark_ctx_start()
+        if (
+            reply_target
+            and getattr(reply_target, "reference", None)
+            and not getattr(reply_target.reference, "resolved", None)
+        ):
+            try:
+                ref_id = reply_target.reference.message_id
+                if ref_id and hasattr(reply_target, "channel") and hasattr(reply_target.channel, "fetch_message"):
+                    reply_target.reference.resolved = await reply_target.channel.fetch_message(ref_id)
+            except Exception as fe:
+                print(f"[BridgeRunner] Warning pre-resolving message reference {ref_id}: {fe}")
+
         turn_prompt = prepare_turn_prompt(
             prompt=prompt,
             mode=mode,
@@ -328,6 +298,7 @@ async def execute_agy_turn(
             timer.mark_boot_end()
             timer.mark_send()
             channel_active_procs[channel_id] = proc
+            channel_active_prompts[channel_id] = prompt
             try:
                 record_in_flight(
                     channel_id=channel_id,
@@ -355,7 +326,7 @@ async def execute_agy_turn(
                 notify_root_channel=notify_root_channel,
                 thread_jump_url=thread_jump_url,
             )
-            step_idle_timeout = float(rules.get("turn_step_idle_seconds", 90.0))
+            step_idle_timeout = float(rules.get("turn_step_idle_seconds", 150.0))
             turn_timeout_seconds = float(rules.get("turn_watchdog_seconds", 300.0))
             agent_done_window = float(rules.get("agent_done_cutoff_seconds", 15.0))
             max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 1800.0))
@@ -566,13 +537,15 @@ async def execute_agy_turn(
         is_retryable_stall = timed_out and not is_hard_ceiling
         if (is_transient_auth or is_retryable_stall) and attempt < max_retries:
             reason_label = "Step inactivity / API stall" if is_retryable_stall else "Transient Google auth/API handshake hiccup"
-            print(f"[BridgeRunner] 🔄 {reason_label} on attempt {attempt+1}/{max_retries}. Retrying in 1.5s...")
+            backoff_s = (attempt + 1) * 2.0
+            print(f"[BridgeRunner] 🔄 {reason_label} on attempt {attempt+1}/{max_retries}. Retrying in {backoff_s:.1f}s...")
             if status_msg:
                 try:
                     await status_msg.edit(content=f"⏳ *{reason_label}, retrying... ({attempt+1}/{max_retries})*")
                 except Exception:
                     pass
-            await asyncio.sleep(1.5)
+            sync_credentials()
+            await asyncio.sleep(backoff_s)
             continue
 
         # Clean up temporary attachment files
@@ -584,6 +557,12 @@ async def execute_agy_turn(
         break
 
     full_raw = "".join(output_chunks).strip()
+    if is_transient_auth and not coord.last_agy_error:
+        coord.last_agy_error = {
+            "type": "auth_eligibility_failure",
+            "message": "Google account authentication / eligibility handshake timed out upstream.",
+            "raw": full_raw[:400],
+        }
     active_cid = get_channel_session_id(channel_id, mode) or conv_id
     final_text = extract_agent_response(full_raw, conv_id=active_cid)
 
@@ -634,11 +613,20 @@ async def execute_agy_turn(
                     "queued_at": queued_at,
                 },
             )
-            if was_settled:
-                # The reinvoked turn finished and already delivered the substantive final output
-                return settled_text
+            if was_settled and settled_text:
+                from tools.bridge_safety import is_internal_cli_leak
+                if settled_text == final_text:
+                    # Reinvocation failed/leaked and preserved pre-settle response:
+                    # Fall through to deliver_turn_output so user receives the response!
+                    pass
+                elif not is_internal_cli_leak(settled_text) and "⚠️ **Turn Failed**" not in settled_text:
+                    return settled_text
+                else:
+                    return settled_text
             elif settled_text:
-                final_text = settled_text
+                from tools.bridge_safety import is_internal_cli_leak
+                if not is_internal_cli_leak(settled_text):
+                    final_text = settled_text
         except Exception as settle_err:
             print(f"[BridgeRunner] TaskSettle error: {settle_err}")
 
@@ -660,5 +648,6 @@ async def execute_agy_turn(
         last_word_bot_id=last_word_bot_id,
         last_word_bot_name=last_word_bot_name,
         last_word_streak=last_word_streak,
+        is_physical_mention=is_physical_mention,
         timer=timer,
     )
