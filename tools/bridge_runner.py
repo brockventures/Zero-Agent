@@ -625,7 +625,6 @@ async def execute_agy_turn(
                 },
             )
             if was_settled and settled_text:
-                from tools.bridge_safety import is_internal_cli_leak
                 if settled_text == final_text:
                     # Reinvocation failed/leaked and preserved pre-settle response:
                     # Fall through to deliver_turn_output so user receives the response!
@@ -635,7 +634,6 @@ async def execute_agy_turn(
                 else:
                     return settled_text
             elif settled_text:
-                from tools.bridge_safety import is_internal_cli_leak
                 if not is_internal_cli_leak(settled_text):
                     final_text = settled_text
         except Exception as settle_err:
