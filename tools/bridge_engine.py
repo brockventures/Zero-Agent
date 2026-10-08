@@ -54,6 +54,12 @@ from tools.process_probe import diagnose_process_tree
 # Global active process map: channel_id -> subprocess.Popen
 channel_active_procs: dict[int, Any] = {}
 
+# Global active prompt map: channel_id -> prompt string (for mid-turn steering preservation)
+channel_active_prompts: dict[int, str] = {}
+
+# Global steering tracking: channel/thread IDs actively being steered mid-turn
+steering_channels: set[int] = set()
+
 
 @dataclass
 class TurnCoordinator:
@@ -78,11 +84,13 @@ class TurnCoordinator:
     wedged_diagnostic: Optional[dict] = None
     timed_out: bool = False
     is_hard_ceiling: bool = False
+    timeout_reason: Optional[str] = None
     last_agy_error: Optional[dict] = None
     result_received_at: Optional[float] = None
     agent_response_done_at: Optional[float] = None
     had_substantive_delta: bool = False
     current_action: str = "Processing..."
+    recorded_usage: bool = False
 
     def __post_init__(self):
         now = self.turn_start_time if self.turn_start_time > 0 else time.time()
@@ -99,6 +107,9 @@ class TurnCoordinator:
 
         if self.delivery_target is None:
             self.delivery_target = self.reply_target
+
+        if self.prompt:
+            channel_active_prompts[self.channel_id] = self.prompt
 
     def touch_activity(self):
         """Record that stdout/stderr data or an event was received."""
@@ -168,6 +179,9 @@ class TurnCoordinator:
                     channel_active_procs[self.thread.id] = proc
                     if TARGET_CHANNEL_ID in channel_active_procs:
                         del channel_active_procs[TARGET_CHANNEL_ID]
+                if self.prompt:
+                    channel_active_prompts[self.thread.id] = self.prompt
+                    channel_active_prompts.pop(TARGET_CHANNEL_ID, None)
                 return True
             except Exception as te:
                 print(f"[BridgeEngine] Warning escalating turn to thread: {te}")
@@ -200,7 +214,7 @@ class TurnCoordinator:
 
     def check_watchdog_timeout(
         self,
-        step_idle_timeout: float = 90.0,
+        step_idle_timeout: float = 150.0,
         turn_timeout_seconds: float = 300.0,
         max_turn_ceiling: float = 1800.0,
         has_active_children: bool = False,
@@ -225,6 +239,7 @@ class TurnCoordinator:
                     else f"{int(max_turn_ceiling)}s hard ceiling"
                 )
             )
+            self.timeout_reason = reason
             return True, reason
         return False, ""
 
@@ -347,6 +362,25 @@ class TurnCoordinator:
                 self.conv_id = res_cid
             self.current_action = "Finalizing output..."
 
+            if not self.recorded_usage:
+                usage = res_data.get("usage") or event.get("usage")
+                if usage:
+                    try:
+                        from tools.bridge_telemetry import record_token_usage
+
+                        record_token_usage(
+                            channel_id=self.channel_id,
+                            usage=usage,
+                            conv_id=self.conv_id or res_cid,
+                            mode=self.mode,
+                            reply_target=self.delivery_target or self.reply_target,
+                            thread=self.thread,
+                            escalated_to_thread=self.escalated_to_thread,
+                        )
+                        self.recorded_usage = True
+                    except Exception as te:
+                        print(f"[TurnCoordinator] Failed recording token telemetry: {te}")
+
     def handle_line(
         self,
         line_s: str,
@@ -457,6 +491,23 @@ class TurnCoordinator:
             # 3. Handle EOF / premature termination
             if not line_bytes:
                 await asyncio.sleep(0.05)
+                # Check for intentional mid-turn steering cancellation
+                is_steered = (self.channel_id in steering_channels) or (
+                    bool(self.thread and getattr(self.thread, "id", None) in steering_channels)
+                )
+                if is_steered:
+                    proc_pid = getattr(proc, "pid", None) if proc else None
+                    print(
+                        f"[BridgeEngine] 🧭 Mid-turn steering: active worker for #{worker_name} "
+                        f"(PID {proc_pid}) was cancelled for revised directive."
+                    )
+                    if on_recycle:
+                        try:
+                            await on_recycle(keep_conv_id=True)
+                        except TypeError:
+                            await on_recycle()
+                    return ""
+
                 last_err = self.last_agy_error or (
                     get_last_agy_error() if get_last_agy_error else None
                 )
@@ -553,17 +604,9 @@ class TurnCoordinator:
             or (proc and getattr(proc, "returncode", None) not in (0, None))
         )
 
-        # In excluded channels (e.g. #baseball owned exclusively by Ivy), NEVER emit diagnostic beacons or leak text
-        if is_excluded_channel(self.channel_id):
-            if is_empty_or_placeholder or is_leak or is_silence or has_process_failure:
-                return "[NO_REPLY]", False
-
-        # Genuine non-error silence without output maps to [NO_REPLY] in non-home channels or external mode
         is_home_turf = is_home_channel(self.channel_id)
-        if (not is_home_turf or self.mode == "external") and (is_leak or is_silence) and not has_process_failure:
-            final_text = "[NO_REPLY]"
-            return final_text, False
 
+        # Attempt transcript harvest first if output is empty or was interrupted
         was_harvested = False
         if is_empty_or_placeholder or is_leak or (is_home_turf and self.mode == "home" and is_silence):
             harvested = harvest_transcript_response(str(cid) if cid else None)
@@ -577,6 +620,17 @@ class TurnCoordinator:
                 is_leak = False
                 is_silence = False
                 was_harvested = True
+
+        # In excluded channels (e.g. #baseball owned exclusively by Ivy), NEVER emit diagnostic error beacons or leaks,
+        # but ALWAYS deliver substantive responses if the model produced an answer (even if returncode was non-zero on exit)
+        if is_excluded_channel(self.channel_id):
+            if is_empty_or_placeholder or is_leak or is_silence:
+                return "[NO_REPLY]", False
+
+        # Genuine non-error silence without output maps to [NO_REPLY] in non-home channels or external mode
+        if (not is_home_turf or self.mode == "external") and (is_leak or is_silence) and not has_process_failure:
+            final_text = "[NO_REPLY]"
+            return final_text, False
 
         should_emit_beacon = (
             (is_home_turf and self.mode == "home" and (is_empty_or_placeholder or is_leak or is_silence))
@@ -598,13 +652,15 @@ class TurnCoordinator:
         """Clean up active process mapping, in-flight state, and restore beacon to IDLE if all workers are idle."""
         if self.channel_id in channel_active_procs:
             del channel_active_procs[self.channel_id]
+        channel_active_prompts.pop(self.channel_id, None)
         if (
             self.escalated_to_thread
             and self.thread
             and hasattr(self.thread, "id")
-            and self.thread.id in channel_active_procs
         ):
-            del channel_active_procs[self.thread.id]
+            if self.thread.id in channel_active_procs:
+                del channel_active_procs[self.thread.id]
+            channel_active_prompts.pop(self.thread.id, None)
 
         if self.mode == "home":
             if br_module and hasattr(br_module, "active_proc"):
@@ -644,6 +700,16 @@ class TurnCoordinator:
                 f"The subprocess was terminated after {elapsed_sec}s of silence to prevent an indefinite hang."
             )
         if self.timed_out:
+            if self.is_hard_ceiling:
+                return (
+                    f"⚠️ **Turn Timed Out (Hard Ceiling):** Turn exceeded hard ceiling limit "
+                    f"({pid_str}). Terminated to prevent unbounded execution."
+                )
+            if self.timeout_reason and "step idle" in self.timeout_reason:
+                return (
+                    f"⚠️ **Turn Timed Out (Step Inactivity):** Subprocess produced zero output for {self.timeout_reason} "
+                    f"({pid_str}). No complete response was produced."
+                )
             return (
                 f"⚠️ **Turn Timed Out:** Subprocess exceeded watchdog limit of {int(turn_timeout_seconds)}s "
                 f"({pid_str}). No complete response was produced."
