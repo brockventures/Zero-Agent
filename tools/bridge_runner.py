@@ -527,14 +527,25 @@ async def execute_agy_turn(
             return
 
         full_raw = "".join(output_chunks).strip()
-        is_transient_auth = any(sig.lower() in full_raw.lower() for sig in [
+        active_cid = get_channel_session_id(channel_id, mode) or conv_id
+        final_text_peek = extract_agent_response(full_raw, conv_id=active_cid)
+        has_substantive = bool(
+            final_text_peek
+            and not is_internal_cli_leak(final_text_peek)
+            and not final_text_peek.startswith("*(")
+            and final_text_peek.strip() not in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP")
+        )
+
+        # Only treat auth/stall errors as retryable if the turn actually failed without producing a substantive response.
+        # Never discard and retry a successfully generated turn just because tool logs contained a timeout string!
+        is_transient_auth = (not has_substantive) and any(sig.lower() in full_raw.lower() for sig in [
             "Eligibility check failed",
             "failed to get profile picture",
             "failed to get user info",
             "authentication failed or timed out",
             "timeout waiting for response"
         ])
-        is_retryable_stall = timed_out and not is_hard_ceiling
+        is_retryable_stall = (not has_substantive) and timed_out and not is_hard_ceiling
         if (is_transient_auth or is_retryable_stall) and attempt < max_retries:
             reason_label = "Step inactivity / API stall" if is_retryable_stall else "Transient Google auth/API handshake hiccup"
             backoff_s = (attempt + 1) * 2.0
