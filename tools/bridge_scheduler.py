@@ -20,6 +20,7 @@ from tools.bridge_state import (
     BOT_STATUS_FILE,
     TARGET_CHANNEL_ID,
     HOMELAB_CHANNEL_ID,
+    FINANCES_CHANNEL_ID,
     VAULT_CHANNEL_ID,
     PT_TZ,
     update_beacon,
@@ -41,6 +42,42 @@ async def _run_sidecar_job_async(job_id: str, job_name: str, func, *args, **kwar
     return await asyncio.to_thread(run_sidecar_job, job_id, job_name, func, *args, **kwargs)
 
 
+async def _send_chunked_content(channel, content: str, choice_view=None, max_len: int = 1900):
+    """Defensively chunk text and send each piece, attaching choice_view to the final chunk."""
+    chunks = chunk_text(content, max_len=max_len)
+    for idx, chunk in enumerate(chunks):
+        is_last = (idx == len(chunks) - 1)
+        view = choice_view if is_last else None
+        if view:
+            await channel.send(chunk, view=view)
+        else:
+            await channel.send(chunk)
+
+
+INTERNAL_SYSTEM_MAINTENANCE_NAMES = {
+    "Session Rollover",
+    "Daily Session Rollover",
+    "Dreaming Memory Consolidation",
+    "Dreaming Consolidation",
+    "Host 2 Local USB Backup",
+    "Host 2 Backup",
+    "Host 1 Local USB Backup",
+    "Host 1 Backup",
+    "Bridge Liveness Watchdog",
+    "Bridge Watchdog",
+    "Plex Transcode Cleanup",
+}
+
+INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
+    "session_rollover",
+    "dreaming",
+    "host1_backup",
+    "host2_backup",
+    "bridge_watchdog",
+    "plex_cleanup",
+}
+
+
 async def dispatch_scheduled_prompt(
     prompt: str,
     job_name: str = "Sidecar",
@@ -53,6 +90,13 @@ async def dispatch_scheduled_prompt(
 ):
     """Inject a scheduled sidecar prompt into the message queue with anti-storm guard."""
     global LAST_SCHEDULED_DISPATCH
+
+    # Enforce 11 PM to 7 AM PT quiet window on all scheduled sidecars
+    now_pt = datetime.now(PT_TZ)
+    is_quiet_time = (now_pt.hour >= 23 or now_pt.hour < 7)
+    if is_quiet_time and job_name not in INTERNAL_SYSTEM_MAINTENANCE_NAMES:
+        print(f"[BridgeScheduler] Pausing sidecar dispatch for '{job_name}' (11 PM - 7 AM PT quiet hours active)")
+        return
 
     # Strictly isolate all Kalshi quant paper trading sidecars to #vault
     if "kalshi" in job_name.lower() or "kalshi" in prompt.lower():
@@ -249,7 +293,7 @@ async def dispatch_scheduled_prompt(
     if job_name in ("Memory Doctor Audit", "Memory Doctor") or "sidecars.py doctor" in prompt:
         try:
             from tools.memory_manager import run_memory_doctor
-            ok, rep, _ = await _run_sidecar_job_async("doctor", "Memory Doctor Audit", run_memory_doctor)
+            ok, rep, _ = await _run_sidecar_job_async("doctor", "Memory Doctor Audit", lambda: run_memory_doctor(auto_remediate=True))
             if rep and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -268,10 +312,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    if choice_view:
-                        await ch.send(clean_content, view=choice_view)
-                    else:
-                        await ch.send(clean_content)
+                    await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Antigravity CLI check: up to date (silent).")
         except Exception as e:
@@ -287,10 +328,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    if choice_view:
-                        await ch.send(clean_content, view=choice_view)
-                    else:
-                        await ch.send(clean_content)
+                    await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Dockhand image check: up to date on both NAS hosts (silent).")
         except Exception as e:
@@ -306,10 +344,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    if choice_view:
-                        await ch.send(clean_content, view=choice_view)
-                    else:
-                        await ch.send(clean_content)
+                    await _send_chunked_content(ch, clean_content, choice_view)
         except Exception as e:
             print(f"[Scheduler] HA update check execution error: {e}")
         return
@@ -400,6 +435,21 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] HA re-auth watchdog execution error: {e}")
         return
 
+    # Nest x Yale Lock & Homebridge self-healing watchdog: silent unless self-healing triggers or errors
+    if "nest_lock" in prompt or job_name in ("Nest Lock & Homebridge Self-Healing Watchdog", "Nest Lock Watchdog"):
+        try:
+            from tools.sidecars import run_nest_lock_watchdog
+            ok, out, _ = await _run_sidecar_job_async("nest_lock_watchdog", "Nest Lock Watchdog", run_nest_lock_watchdog)
+            if out and out != "(nominal - 0 lock failures)" and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] Nest lock checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Nest lock watchdog execution error: {e}")
+        return
+
     # Kometa post-run audit: silent unless critical issues found
     if "kometa" in prompt or job_name in ("Kometa Post-Run Audit", "Kometa Audit"):
         try:
@@ -424,10 +474,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    if choice_view:
-                        await ch.send(clean_content, view=choice_view)
-                    else:
-                        await ch.send(clean_content)
+                    await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Cubs game notifier checked: nominal (silent).")
         except Exception as e:
@@ -514,10 +561,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    if choice_view:
-                        await ch.send(clean_content, view=choice_view)
-                    else:
-                        await ch.send(clean_content)
+                    await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Weekly meal proposal checked: nominal (silent).")
         except Exception as e:
@@ -559,10 +603,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    if choice_view:
-                        await ch.send(clean_content, view=choice_view)
-                    else:
-                        await ch.send(clean_content)
+                    await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Daily birthday reminder checked: 0 birthdays today (silent).")
         except Exception as e:
@@ -579,10 +620,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    if choice_view:
-                        await ch.send(clean_content, view=choice_view)
-                    else:
-                        await ch.send(clean_content)
+                    await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Weekly social review checked: 0 updates (silent).")
         except Exception as e:
@@ -599,10 +637,7 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    if choice_view:
-                        await ch.send(clean_content, view=choice_view)
-                    else:
-                        await ch.send(clean_content)
+                    await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Monthly core friends reminder checked: all caught up (silent).")
         except Exception as e:
@@ -629,6 +664,39 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] AGORA steering briefing dispatch error: {e}")
         return
 
+    # Agora Roguelike PM & Board Coordinator: silent execution unless board state changed (dispatches to #agora)
+    if "agora_roguelike_pm" in prompt or "agora_pm" in prompt or job_name in ("Agora Roguelike PM & Board Coordinator", "Agora Roguelike PM", "Agora Roguelike PM & Task Assignment"):
+        try:
+            from tools.sidecars import run_agora_roguelike_pm
+            dest_cid = channel_id or 1558202642663211169  # #agora
+            ok, rep, extra = await _run_sidecar_job_async(
+                "agora_roguelike_pm",
+                "Agora Roguelike PM & Task Assignment",
+                lambda: run_agora_roguelike_pm(dispatch=False, channel=dest_cid)
+            )
+            print(f"[Scheduler] Agora Roguelike PM completed: ok={ok}, nominal={extra.get('nominal') if isinstance(extra, dict) else False}")
+        except Exception as e:
+            print(f"[Scheduler] Agora Roguelike PM execution error: {e}")
+        return
+
+    # Agora Roguelike Engineering Execution: runs 3m after PM sidecar
+    if "agora_roguelike_engineer" in prompt or "agora_engineer" in prompt or job_name in ("Agora Roguelike Engineering Execution", "Agora Roguelike Engineer"):
+        try:
+            from tools.sidecars import run_agora_roguelike_engineer
+            ok, rep, extra = await _run_sidecar_job_async(
+                "agora_roguelike_engineer",
+                "Agora Roguelike Engineering Execution",
+                run_agora_roguelike_engineer
+            )
+            print(f"[Scheduler] Agora Roguelike Engineer completed: ok={ok}")
+            if not ok and rep and bot:
+                ch = await get_dest_channel(default_cid=1558202642663211169)
+                if ch:
+                    await ch.send(f"⚠️ **Agora Roguelike Engineering Failure**:\n```\n{rep}\n```")
+        except Exception as e:
+            print(f"[Scheduler] Agora Roguelike Engineer execution error: {e}")
+        return
+
     # Monthly Hardcoded Rule & Regex Audit
     if "code_audit" in prompt or "hardcode_regex_audit" in prompt or job_name in ("Monthly Hardcoded Rule & Regex Audit", "Hardcode Regex Audit"):
         try:
@@ -641,6 +709,55 @@ async def dispatch_scheduled_prompt(
                         await ch.send(chunk)
         except Exception as e:
             print(f"[Scheduler] Monthly hardcoded rule audit execution error: {e}")
+        return
+
+    # Actual Budget automated daily bank sync: silent execution unless error (alerts to #finances)
+    if "actual_sync" in prompt or "actual_bank_sync" in prompt or job_name in ("Actual Budget Daily Bank Sync", "Actual Budget Bank Sync"):
+        try:
+            from tools.sidecars import run_actual_bank_sync
+            ok, rep, extra = await _run_sidecar_job_async("actual_bank_sync", "Actual Budget Daily Bank Sync", run_actual_bank_sync)
+            if not ok and rep and bot:
+                ch = await get_dest_channel(default_cid=FINANCES_CHANNEL_ID)
+                if ch:
+                    await ch.send(rep)
+            else:
+                print("[Scheduler] Actual Budget bank sync: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Actual Budget bank sync execution error: {e}")
+            if bot:
+                ch = await get_dest_channel(default_cid=FINANCES_CHANNEL_ID)
+                if ch:
+                    await ch.send(f"⚠️ **Actual Budget Sync Error**: {e}")
+        return
+
+    # Monthly Cash Sweep Policy Monitor
+    if "cash_sweep" in prompt or ("sweep" in prompt and "sidecars.py" in prompt) or job_name == "Monthly Cash Sweep Policy Monitor":
+        try:
+            from tools.sidecars import run_cash_sweep_monitor
+            ok, rep, extra = await _run_sidecar_job_async("cash_sweep_monitor", "Monthly Cash Sweep Policy Monitor", run_cash_sweep_monitor, post=True)
+            print(f"[Scheduler] Cash sweep monitor completed: ok={ok}")
+        except Exception as e:
+            print(f"[Scheduler] Cash sweep monitor execution error: {e}")
+        return
+
+    # Monthly Financial Model Variance Digest
+    if "variance_digest" in prompt or ("variance" in prompt and "sidecars.py" in prompt) or job_name == "Monthly Financial Model Variance Digest":
+        try:
+            from tools.sidecars import run_model_variance_digest
+            ok, rep, extra = await _run_sidecar_job_async("monthly_variance_digest", "Monthly Financial Model Variance Digest", run_model_variance_digest, post=True)
+            print(f"[Scheduler] Model variance digest completed: ok={ok}")
+        except Exception as e:
+            print(f"[Scheduler] Model variance digest execution error: {e}")
+        return
+
+    # Daily Token Budget Watchdog
+    if "token_budget" in prompt or "token_budget_watchdog" in prompt or job_name == "Daily Token Budget Watchdog":
+        try:
+            from tools.sidecars import run_token_budget_watchdog
+            ok, rep, extra = await _run_sidecar_job_async("token_budget_watchdog", "Daily Token Budget Watchdog", run_token_budget_watchdog, dispatch=True)
+            print(f"[Scheduler] Token budget watchdog completed: ok={ok}")
+        except Exception as e:
+            print(f"[Scheduler] Token budget watchdog execution error: {e}")
         return
 
     if bot and turn_queue:
@@ -673,6 +790,17 @@ def should_run_job(job: dict, now_ts: float) -> tuple[bool, str]:
     """
     if not job.get("enabled", True):
         return False, "disabled"
+
+    quiet = job.get("quiet_hours")
+    if quiet is None and job.get("id") not in INTERNAL_SYSTEM_MAINTENANCE_JOBS:
+        quiet = [23, 7]  # Default 11 PM - 7 AM PT pause for all sidecars
+
+    if quiet and len(quiet) == 2:
+        start_h, end_h = quiet
+        now_pt = datetime.fromtimestamp(now_ts, tz=PT_TZ)
+        in_quiet = (start_h <= now_pt.hour < end_h) if start_h < end_h else (now_pt.hour >= start_h or now_pt.hour < end_h)
+        if in_quiet:
+            return False, f"quiet_hours_{start_h}_to_{end_h}_pt"
 
     next_ts = job.get("next_run_ts")
     if not next_ts:
@@ -879,6 +1007,22 @@ class BridgeScheduler:
                         print(f"[Outbox] Warning: Channel {target_cid} not found for {omsg_id}")
                         continue
 
+                    # Check if this outbox item requests an autonomous agent synthesis turn
+                    if omsg.get("type") == "agent_turn" or omsg.get("is_agent_turn"):
+                        if hasattr(self, "dispatch_fn") and self.dispatch_fn:
+                            try:
+                                await self.dispatch_fn(
+                                    prompt=omsg.get("content", ""),
+                                    job_name=omsg.get("source", "Detached Task Synthesis"),
+                                    channel_id=target_cid,
+                                )
+                                print(f"[Outbox] 🟢 Dispatched agent synthesis turn for {omsg_id} to #{ch_name} ({target_cid}).")
+                                continue
+                            except Exception as de:
+                                print(f"[Outbox] Warning: Failed to dispatch agent turn ({de}). Suppressing prompt dump.")
+                        print(f"[Outbox] Warning: Agent turn dispatch unavailable for {omsg_id}. Suppressing raw prompt to chat.")
+                        continue
+
                     is_banana_stand = (target_cid == 1534436119888793750 or str(ch_name) in ("the-banana-stand", "agent-chat"))
                     raw_content = omsg.get("content", "")
 
@@ -914,6 +1058,11 @@ class BridgeScheduler:
                                 await target_channel.send(ch)
 
                     print(f"[Outbox] Dispatched message {omsg_id} to #{ch_name} ({target_cid})")
+                    try:
+                        from tools.outbox import record_dispatched_history
+                        record_dispatched_history(omsg)
+                    except Exception as he:
+                        print(f"[Outbox] Warning recording history for {omsg_id}: {he}")
                 except Exception as item_err:
                     print(f"[Outbox] Error delivering message {omsg_id} to #{ch_name}: {item_err}")
                     try:

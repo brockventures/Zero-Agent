@@ -732,6 +732,143 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             scheduler._running = False
 
 
+    async def test_actual_budget_sync_silent(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_turn_queue = AsyncMock()
+
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "", {"new_transactions": 5})):
+            await bshed.dispatch_scheduled_prompt(
+                "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
+                "Actual Budget Daily Bank Sync",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue
+            )
+            mock_channel.send.assert_not_called()
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_actual_budget_sync_error_routes_to_finances(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_finances_channel = AsyncMock()
+        mock_bot.get_channel.side_effect = lambda cid: mock_finances_channel if cid == bs.FINANCES_CHANNEL_ID else None
+        mock_turn_queue = AsyncMock()
+
+        err_msg = "⚠️ Actual Budget sync sidecar failed: SimpleFin API 401 Unauthorized"
+        with patch("tools.sidecars.run_sidecar_job", return_value=(False, err_msg, {"error": "401"})):
+            await bshed.dispatch_scheduled_prompt(
+                "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
+                "Actual Budget Daily Bank Sync",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue
+            )
+            mock_finances_channel.send.assert_called_once_with(err_msg)
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_daily_token_budget_watchdog_dispatch(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_turn_queue = AsyncMock()
+
+        with patch("tools.sidecars.run_token_budget_watchdog", return_value=(True, "Report sent", {})) as mock_run:
+            await bshed.dispatch_scheduled_prompt(
+                "Run daily token budget watchdog using tools/sidecars.py token_budget_watchdog",
+                "Daily Token Budget Watchdog",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue
+            )
+            mock_run.assert_called_once()
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_agora_roguelike_pm_headless_dispatch(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_turn_queue = AsyncMock()
+
+        with patch("tools.sidecars.run_agora_roguelike_pm", return_value=(True, "", {"nominal": True})) as mock_pm:
+            await bshed.dispatch_scheduled_prompt(
+                "Run the Agora Roguelike PM board assessment and autonomous merge check using python3 /workspace/tools/sidecars.py agora_pm. Post updates to #agora when PRs or assignments change (silent when nominal).",
+                "Agora Roguelike PM & Board Coordinator",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue,
+                channel_id=1558202642663211169
+            )
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_agora_roguelike_engineer_headless_dispatch(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_turn_queue = AsyncMock()
+
+        with patch("tools.sidecars.run_agora_roguelike_engineer", return_value=(True, "All pass", None)) as mock_eng:
+            await bshed.dispatch_scheduled_prompt(
+                "Run the Agora Roguelike engineering execution check using python3 /workspace/tools/sidecars.py agora_engineer.",
+                "Agora Roguelike Engineering Execution",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue,
+                channel_id=1558202642663211169
+            )
+            mock_turn_queue.put.assert_not_called()
+
+    def test_should_run_job_quiet_hours_overnight(self):
+        from tools.bridge_scheduler import should_run_job
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        pt = ZoneInfo("America/Los_Angeles")
+
+        job = {
+            "id": "agora_roguelike_pm",
+            "name": "Agora Roguelike PM & Board Coordinator",
+            "enabled": True,
+            "quiet_hours": [23, 7],
+            "next_run_ts": 1000,
+            "catchup_if_missed": True,
+            "catchup_window_seconds": 7200,
+            "schedule_type": "interval",
+            "min_period_seconds": 60,
+        }
+
+        # 11:30 PM PT (Hour 23) -> Should be paused
+        ts_2330 = datetime(2026, 10, 9, 23, 30, tzinfo=pt).timestamp()
+        ok, reason = should_run_job(job, ts_2330)
+        self.assertFalse(ok)
+        self.assertIn("quiet_hours", reason)
+
+        # 03:00 AM PT (Hour 3) -> Should be paused
+        ts_0300 = datetime(2026, 10, 10, 3, 0, tzinfo=pt).timestamp()
+        ok, reason = should_run_job(job, ts_0300)
+        self.assertFalse(ok)
+        self.assertIn("quiet_hours", reason)
+
+        # 07:05 AM PT (Hour 7) -> Should NOT be paused by quiet hours
+        ts_0705 = datetime(2026, 10, 10, 7, 5, tzinfo=pt).timestamp()
+        job["next_run_ts"] = ts_0705 - 10
+        ok, reason = should_run_job(job, ts_0705)
+        self.assertTrue(ok)
+
+    def test_should_run_job_maintenance_exempt(self):
+        from tools.bridge_scheduler import should_run_job
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        pt = ZoneInfo("America/Los_Angeles")
+
+        # Session rollover at 2 AM is maintenance exempt from default quiet hours
+        ts_0200 = datetime(2026, 10, 10, 2, 0, tzinfo=pt).timestamp()
+        job = {
+            "id": "session_rollover",
+            "name": "Daily Session Rollover",
+            "enabled": True,
+            "next_run_ts": ts_0200 - 10,
+            "catchup_if_missed": True,
+            "catchup_window_seconds": 7200,
+            "schedule_type": "daily",
+            "min_period_seconds": 60,
+        }
+        ok, reason = should_run_job(job, ts_0200)
+        self.assertTrue(ok)
+
 if __name__ == "__main__":
     unittest.main()
 
