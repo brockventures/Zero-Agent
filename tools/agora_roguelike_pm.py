@@ -228,6 +228,12 @@ def get_elapsed_minutes(iso_str: str | None, now: datetime) -> float:
 
 def assess_board(force: bool = False, stall_threshold_mins: float = 45.0, nudge_cooldown_mins: float = 45.0) -> dict:
     """Assess the live GitHub board for agora-roguelike."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    now_pt = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Los_Angeles"))
+    if (now_pt.hour >= 23 or now_pt.hour < 7) and not force:
+        print("[agora_roguelike_pm] Paused: Quiet hours active (11 PM - 7 AM PT). Board assessment skipped.")
+        sys.exit(0)
     prev_state = load_state()
     known_merged = set(prev_state.get("known_merged_prs", []))
 
