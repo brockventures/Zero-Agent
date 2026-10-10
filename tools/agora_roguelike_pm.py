@@ -34,6 +34,7 @@ STATE_FILE = Path("/workspace/data/agora_roguelike_pm_state.json")
 
 # Roadmap prioritization: M0 tasks first, then proceeding along existing priority list
 PRIORITY_ISSUE_LIST = [
+    105,  # Epic 6: re-skin the HUD from CRT phosphor to the approved Scavengers Reign style
     83,  # M0 Task 1: Assemble Root Scene (res://scenes/main.tscn)
     84,  # M0 Task 2: Wire M0 Game Loop (Single-Station Trading, Controls, Audio)
     85,  # M0 Task 3: Configure Main Scene & Demo Launcher (run_demo.sh)
@@ -180,7 +181,10 @@ def get_open_prioritized_issues() -> list[dict]:
     try:
         issues = json.loads(out)
         issue_map = {i["number"]: i for i in issues}
-        return [issue_map[num] for num in PRIORITY_ISSUE_LIST if num in issue_map]
+        prioritized = [issue_map[num] for num in PRIORITY_ISSUE_LIST if num in issue_map]
+        seen = {i["number"] for i in prioritized}
+        remaining = [i for i in issues if i["number"] not in seen]
+        return prioritized + remaining
     except Exception:
         return []
 
