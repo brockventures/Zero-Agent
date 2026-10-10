@@ -32,9 +32,11 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -138,10 +140,12 @@ def check_tcp_port(host: str, port: int, timeout: float = 3.0) -> bool:
 # --------------------------------------------------------------------------
 # Unified Execution Engine & Logger
 # --------------------------------------------------------------------------
+_log_lock = threading.Lock()
+
 def _atomic_write_json(file_path: Path, data: any):
     """Write data to a JSON file atomically via a temporary file."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_path = file_path.with_suffix(f".tmp.{os.getpid()}")
+    tmp_path = file_path.with_name(f"{file_path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}")
     try:
         with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
@@ -171,29 +175,30 @@ def log_execution(job_id: str, name: str, status: str, duration_sec: float, summ
     if extra:
         entry["extra"] = extra
 
-    # 1. Update execution log
-    entries = []
-    if EXECUTION_LOG_FILE.exists():
-        try:
-            with open(EXECUTION_LOG_FILE, "r") as f:
-                entries = json.load(f)
-        except Exception:
-            entries = []
-    entries.insert(0, entry)
-    if len(entries) > MAX_LOG_ENTRIES:
-        entries = entries[:MAX_LOG_ENTRIES]
-    _atomic_write_json(EXECUTION_LOG_FILE, entries)
+    with _log_lock:
+        # 1. Update execution log
+        entries = []
+        if EXECUTION_LOG_FILE.exists():
+            try:
+                with open(EXECUTION_LOG_FILE, "r") as f:
+                    entries = json.load(f)
+            except Exception:
+                entries = []
+        entries.insert(0, entry)
+        if len(entries) > MAX_LOG_ENTRIES:
+            entries = entries[:MAX_LOG_ENTRIES]
+        _atomic_write_json(EXECUTION_LOG_FILE, entries)
 
-    # 2. Update latest status map
-    status_map = {}
-    if EXECUTION_STATUS_FILE.exists():
-        try:
-            with open(EXECUTION_STATUS_FILE, "r") as f:
-                status_map = json.load(f)
-        except Exception:
-            status_map = {}
-    status_map[job_id] = entry
-    _atomic_write_json(EXECUTION_STATUS_FILE, status_map)
+        # 2. Update latest status map
+        status_map = {}
+        if EXECUTION_STATUS_FILE.exists():
+            try:
+                with open(EXECUTION_STATUS_FILE, "r") as f:
+                    status_map = json.load(f)
+            except Exception:
+                status_map = {}
+        status_map[job_id] = entry
+        _atomic_write_json(EXECUTION_STATUS_FILE, status_map)
 
     # 3. Synchronize schedule.json if BridgeScheduler tracks this sidecar
     try:
@@ -224,6 +229,19 @@ def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> 
     Measures duration, handles and records unhandled exceptions, persists status,
     and returns (ok: bool, message: str, extra: any).
     """
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    now_pt = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Los_Angeles"))
+    is_quiet_hours = (now_pt.hour >= 23 or now_pt.hour < 7)
+    INTERNAL_SYSTEM_MAINTENANCE = {
+        "session_rollover", "dreaming", "dream", "host1_backup", "backup_host1",
+        "host2_backup", "backup_host2", "bridge_watchdog", "plex_cleanup", "plex"
+    }
+    force_run = kwargs.get("force", False) or "--force" in sys.argv
+    if is_quiet_hours and job_id not in INTERNAL_SYSTEM_MAINTENANCE and not force_run:
+        print(f"[Sidecar] Paused: '{name}' ({job_id}) skipped during 11 PM - 7 AM PT quiet hours.")
+        return True, f"Paused: Quiet hours active (11 PM - 7 AM PT). Skipped {name}.", {"quiet_hours": True}
+
     start_ts = time.time()
     try:
         res = func(*args, **kwargs)
@@ -1230,6 +1248,22 @@ def run_ha_reauth_watchdog(force: bool = False) -> tuple[bool, str]:
     except Exception as e:
         return False, f"⚠️ Home Assistant re-auth watchdog failed: {e}"
 
+def run_nest_lock_watchdog(force: bool = False) -> tuple[bool, str]:
+    """Audit Nest x Yale Lock & Homebridge, auto-healing on stall or auth drop."""
+    try:
+        import importlib
+        import tools.nest_lock_watchdog as nlw
+        importlib.reload(nlw)
+        healthy, summary, details = nlw.run_watchdog(force_heal=force)
+        if healthy and details.get("heal_ok"):
+            return True, f"🛠️ {summary}"
+        elif healthy:
+            return True, "(nominal - 0 lock failures)"
+        else:
+            return False, f"⚠️ Nest lock watchdog alert: {summary}"
+    except Exception as e:
+        return False, f"⚠️ Nest lock watchdog failed: {e}"
+
 def run_prowlarr_watchdog(force: bool = False) -> tuple[bool, str]:
     """Audit Prowlarr indexers for disabled state, backoffs, and health errors."""
     try:
@@ -1313,7 +1347,7 @@ def run_weekly_grocery_staging() -> tuple[bool, str]:
         return False, f"⚠️ Weekly grocery staging failed: {e}"
 
 def run_weekly_meal_proposal() -> tuple[bool, str]:
-    """Generates the 3-dinner weekly rotation proposal for Sunday, Tuesday, and Thursday."""
+    """Generates the 3-dinner weekly rotation proposal for Tuesday, Thursday, and Sunday."""
     try:
         from tools.meal_planner_proposal import generate_proposal, format_proposal_markdown
         plan = generate_proposal()
@@ -1321,11 +1355,11 @@ def run_weekly_meal_proposal() -> tuple[bool, str]:
     except Exception as e:
         return False, f"⚠️ Weekly meal planning proposal failed: {e}"
 
-def run_tasks_sync() -> tuple[bool, str, dict]:
+def run_tasks_sync(quiet: bool = True, *args, **kwargs) -> tuple[bool, str, dict]:
     """Execute two-way synchronization between tasks.json and Google Tasks."""
     try:
         from tools.google_tasks_sync import sync_tasks
-        res = sync_tasks(quiet=True)
+        res = sync_tasks(quiet=quiet)
         ok = res.get("ok", True)
         # Completely silent sidecar: msg is empty so chat is never notified on nominal success.
         # Structured details are kept in res dict for durable execution logging.
@@ -1342,6 +1376,28 @@ def run_cubs_game_notifier(force: bool = False, test: bool = False) -> tuple[boo
     except Exception as e:
         return False, f"⚠️ Cubs game notifier error: {e}", {"error": str(e)}
 
+def run_agora_roguelike_pm(dispatch: bool = False, channel: str | int | None = None):
+    """Assess the GitHub board, merge approved PRs, and assign tasks."""
+    import subprocess
+    cmd = ["python3", "/workspace/tools/agora_roguelike_pm.py"]
+    if dispatch:
+        cmd.append("--dispatch")
+    if channel:
+        cmd.extend(["--channel", str(channel)])
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    out = res.stdout.strip()
+    if out == "(nominal - board state unchanged)":
+        return res.returncode == 0, "", {"nominal": True}
+    return res.returncode == 0, out, None
+
+
+def run_agora_roguelike_engineer():
+    """Execute the engineering task assigned to Zero."""
+    import subprocess
+    res = subprocess.run(["python3", "/workspace/tools/agora_roguelike_engineer.py"], capture_output=True, text=True)
+    return res.returncode == 0, res.stdout.strip(), None
+
+
 def run_kalshi_paper_bot():
     """Execute Kalshi quant paper bot: weather and daily MLB matchups."""
     import subprocess
@@ -1356,10 +1412,8 @@ def run_kalshi_paper_bot():
         if res_w.stdout:
             outputs.append("=== WEATHER ARBITRAGE ===\n" + res_w.stdout.strip())
             
-        # 3. MLB Daily Matchups Scan & Trade
-        res_m = subprocess.run(["python3", "/workspace/tools/baseball_daily_quant.py", "trade"], capture_output=True, text=True, check=False)
-        if res_m.stdout:
-            outputs.append("=== MLB DAILY MATCHUPS ===\n" + res_m.stdout.strip())
+        # 3. MLB Daily Matchups Scan & Trade (Deactivated - Regular Season Ended)
+        # Settle remains above for cleanup, trade scan disabled per directive
             
         return True, "\n\n".join(outputs), {}
     except Exception as e:
@@ -1396,9 +1450,64 @@ def run_sideproject_watcher(*args, **kwargs) -> tuple[bool, str, any]:
     except Exception as e:
         return False, f"⚠️ Sideproject watcher error: {e}", {"error": str(e)}
 
+
+def run_actual_bank_sync(test: bool = False, quiet: bool = True, notify: bool = False, *args, **kwargs) -> tuple[bool, str, dict]:
+    """Execute automated Actual Budget bank sync and category rule dispatch."""
+    try:
+        from tools.actual_sync import sync_actual_budget
+        ok, rep, meta = sync_actual_budget(test=test, quiet=quiet, notify=notify)
+        # Silent sidecar: remain 100% silent on nominal/successful runs; return text only on error
+        msg = rep if not ok else ""
+        return ok, msg, meta or {}
+    except Exception as e:
+        return False, f"⚠️ Actual Budget sync sidecar failed: {e}", {"error": str(e)}
+
+
+def run_cash_sweep_monitor(test: bool = False, post: bool = True, quiet: bool = False, *args, **kwargs) -> tuple[bool, str, dict]:
+    """Execute monthly liquid cash sweep policy evaluation."""
+    try:
+        from tools.cash_sweep_monitor import evaluate_cash_sweep
+        ok, rep, meta = evaluate_cash_sweep(test=test, post=post, quiet=quiet)
+        return ok, rep, meta or {}
+    except Exception as e:
+        return False, f"⚠️ Cash sweep monitor sidecar failed: {e}", {"error": str(e)}
+
+
+def run_model_variance_digest(test: bool = False, post: bool = True, quiet: bool = False, target_month: str = "", *args, **kwargs) -> tuple[bool, str, dict]:
+    """Execute monthly financial model variance digest."""
+    try:
+        from tools.model_variance_digest import generate_variance_digest
+        ok, rep, meta = generate_variance_digest(target_month=target_month, test=test, post=post, quiet=quiet)
+        return ok, rep, meta or {}
+    except Exception as e:
+        return False, f"⚠️ Model variance digest sidecar failed: {e}", {"error": str(e)}
+
 # --------------------------------------------------------------------------
 # CLI Dispatcher
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Daily Token Budget Watchdog
+# --------------------------------------------------------------------------
+def run_token_budget_watchdog(dispatch: bool = True, force: bool = False, target_day: str = None) -> tuple[bool, str, dict]:
+    """Evaluate daily token consumption against 145M budget and alert if exceeded."""
+    from tools.token_budget_watchdog import evaluate_daily_token_budget, dispatch_token_budget_alert
+    try:
+        report = evaluate_daily_token_budget(target_day=target_day)
+        is_exceeded = report.get('is_exceeded', False)
+        if is_exceeded or force:
+            if dispatch:
+                dispatch_token_budget_alert(report, channel='zero-ops', force=force)
+            summary = f"⚠️ Daily token budget exceeded: {report.get('fleet_wire_tokens'):,} / 145M ({report.get('pct_daily')}%). Alert dispatched to #zero-ops."
+            return True, summary, report
+        else:
+            summary = f"Daily token burn nominal: {report.get('fleet_wire_tokens'):,} / 145M ({report.get('pct_daily')}%). Rolling 7-day at {report.get('pct_weekly')}% of weekly limit. ✅"
+            return True, summary, report
+    except Exception as e:
+        log.error(f"Token budget watchdog failed: {e}", exc_info=True)
+        return False, f"Token budget watchdog error: {e}", {'error': str(e)}
+
+
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "heartbeat"
     if action in ("cubs", "cubs_game", "cubs_notifier"):
@@ -1416,6 +1525,11 @@ if __name__ == "__main__":
         force = "--force" in sys.argv or "-f" in sys.argv
         ok, rep, _ = run_sidecar_job("ha_reauth_watchdog", "HA Re-Auth Watchdog", run_ha_reauth_watchdog, force=force)
         if rep and rep != "(nominal - 0 HA integration failures)":
+            print(rep)
+    elif action in ("nest_lock", "lock_watchdog", "lock_heal"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        ok, rep, _ = run_sidecar_job("nest_lock_watchdog", "Nest Lock Watchdog", run_nest_lock_watchdog, force=force)
+        if rep and rep != "(nominal - 0 lock failures)":
             print(rep)
     elif action in ("prowlarr", "indexers"):
         force = "--force" in sys.argv or "-f" in sys.argv
@@ -1480,7 +1594,7 @@ if __name__ == "__main__":
         print(rep)
     elif action == "doctor":
         from tools.memory_manager import run_memory_doctor
-        ok, rep, _ = run_sidecar_job("doctor", "Memory Doctor Audit", run_memory_doctor)
+        ok, rep, _ = run_sidecar_job("doctor", "Memory Doctor Audit", lambda: run_memory_doctor(auto_remediate=True))
         print(rep)
     elif action == "dream":
         from tools.memory_manager import run_dreaming_consolidation
@@ -1548,6 +1662,25 @@ if __name__ == "__main__":
             print(rep)
         else:
             print("(nominal - all tasks in sync)")
+    elif action in ("agora_roguelike_pm", "agora_pm"):
+        do_dispatch = "--dispatch" in sys.argv
+        target_ch = None
+        for i, a in enumerate(sys.argv):
+            if a == "--channel" and i + 1 < len(sys.argv):
+                target_ch = sys.argv[i + 1]
+        ok, rep, _ = run_sidecar_job(
+            "agora_roguelike_pm",
+            "Agora Roguelike PM & Task Assignment",
+            lambda: run_agora_roguelike_pm(dispatch=do_dispatch, channel=target_ch)
+        )
+        if rep:
+            print(rep)
+        else:
+            print("(nominal - board state unchanged)")
+    elif action in ("agora_roguelike_engineer", "agora_engineer", "agora_eng"):
+        ok, rep, _ = run_sidecar_job("agora_roguelike_engineer", "Agora Roguelike Engineering Execution", run_agora_roguelike_engineer)
+        if rep:
+            print(rep)
     elif action in ("agora_sprint", "agora_autoworker", "agora_worker"):
         res = subprocess.run(["python3", "/workspace/tools/agora_autoworker.py"], capture_output=True, text=True)
         if res.stdout:
@@ -1574,6 +1707,49 @@ if __name__ == "__main__":
         force = "--force" in sys.argv or "-f" in sys.argv
         test = "--test" in sys.argv or "-t" in sys.argv
         ok, rep, _ = run_sidecar_job("sideproject_watcher", "Side-Project Autonomous Sprint Watcher", run_sideproject_watcher, force=force, test=test)
+        if rep:
+            print(rep)
+    elif action in ("hourly_agora_ping", "agora_ping", "hourly_ping"):
+        from tools.hourly_agora_ping import dispatch_hourly_agora_ping
+        test = "--test" in sys.argv or "--dry-run" in sys.argv
+        ok, rep, _ = run_sidecar_job("hourly_agora_ping", "Hourly Agora Standup Ping", dispatch_hourly_agora_ping, dry_run=test)
+        if rep:
+            print(rep)
+    elif action in ("actual_sync", "sync_finances", "actual_bank_sync"):
+        test = "--test" in sys.argv or "-t" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv or "--force" not in sys.argv
+        ok, rep, _ = run_sidecar_job("actual_bank_sync", "Actual Budget Daily Bank Sync", run_actual_bank_sync, test=test, quiet=quiet)
+        if rep:
+            print(rep)
+        elif not quiet:
+            print("(nominal - 0 new transactions)")
+    elif action in ("cash_sweep", "sweep", "sweep_monitor", "cash_sweep_monitor"):
+        test = "--test" in sys.argv or "-t" in sys.argv
+        post = "--post" in sys.argv or "-p" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv
+        ok, rep, _ = run_sidecar_job("cash_sweep_monitor", "Monthly Cash Sweep Policy Monitor", run_cash_sweep_monitor, test=test, post=post, quiet=quiet)
+        if rep:
+            print(rep)
+    elif action in ("variance_digest", "variance", "budget_audit", "model_variance"):
+        test = "--test" in sys.argv or "-t" in sys.argv
+        post = "--post" in sys.argv or "-p" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv
+        month = ""
+        for i, a in enumerate(sys.argv):
+            if a in ("--month", "-m") and i + 1 < len(sys.argv):
+                month = sys.argv[i+1]
+        ok, rep, _ = run_sidecar_job("monthly_variance_digest", "Monthly Financial Model Variance Digest", run_model_variance_digest, test=test, post=post, quiet=quiet, target_month=month)
+        if rep:
+            print(rep)
+    elif action in ("token_budget_watchdog", "token_budget", "tokenwatchdog"):
+        test = "--test" in sys.argv or "-t" in sys.argv
+        force = "--force" in sys.argv or "-f" in sys.argv
+        dispatch = "--dispatch" in sys.argv or "-d" in sys.argv or force
+        day = None
+        for i, a in enumerate(sys.argv):
+            if a in ("--day",) and i + 1 < len(sys.argv):
+                day = sys.argv[i+1]
+        ok, rep, _ = run_sidecar_job("token_budget_watchdog", "Daily Token Budget Watchdog", run_token_budget_watchdog, dispatch=dispatch, force=force, target_day=day)
         if rep:
             print(rep)
     elif action == "status":
