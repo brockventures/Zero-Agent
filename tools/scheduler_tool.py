@@ -29,6 +29,41 @@ log = logging.getLogger("scheduler_tool")
 
 DEFAULT_JOBS = [
     {
+        "id": "actual_bank_sync",
+        "name": "Actual Budget Daily Bank Sync",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 6,
+        "minute_pt": 0,
+        "prompt": "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
+        "catchup_if_missed": False,
+    },
+    {
+        "id": "cash_sweep_monitor",
+        "name": "Monthly Cash Sweep Policy Monitor",
+        "enabled": True,
+        "schedule_type": "monthly",
+        "day_of_month": 2,
+        "hour_pt": 9,
+        "minute_pt": 0,
+        "prompt": "Run monthly cash sweep policy evaluation using /workspace/tools/sidecars.py cash_sweep. Post liquid reserve status and recommended sweep amount to #finances.",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 86400,
+    },
+    {
+        "id": "monthly_variance_digest",
+        "name": "Monthly Financial Model Variance Digest",
+        "enabled": True,
+        "schedule_type": "monthly",
+        "day_of_month": 3,
+        "hour_pt": 9,
+        "minute_pt": 15,
+        "prompt": "Run monthly financial model variance evaluation using /workspace/tools/sidecars.py variance_digest. Post actuals vs model comparison to #finances.",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 86400,
+    },
+
+    {
         "id": "heartbeat_sweep",
         "name": "Heartbeat Sweep",
         "enabled": True,
@@ -295,8 +330,38 @@ DEFAULT_JOBS = [
         "interval_seconds": 300,
         "prompt": "Run the bridge liveness & gateway watchdog check using /workspace/tools/sidecars.py bridge_watchdog. Auto-heals and alerts only if degraded (silent when nominal).",
         "catchup_if_missed": False
+    },
+    {
+        "id": "agora_roguelike_pm",
+        "name": "Agora Roguelike PM & Board Coordinator",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 900,
+        "channel_id": 1558202642663211169,
+        "prompt": "Run the Agora Roguelike PM board assessment and autonomous merge check using python3 /workspace/tools/sidecars.py agora_pm. Post updates to #agora when PRs or assignments change (silent when nominal).",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "agora_roguelike_engineer",
+        "name": "Agora Roguelike Engineering Execution",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 900,
+        "channel_id": 1558202642663211169,
+        "prompt": "Run the Agora Roguelike engineering execution check using python3 /workspace/tools/sidecars.py agora_engineer.",
+        "catchup_if_missed": False
     }
 ]
+
+INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
+    "session_rollover",
+    "dreaming",
+    "host1_backup",
+    "host2_backup",
+    "bridge_watchdog",
+    "plex_cleanup",
+}
+
 
 def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
     """Compute the next Unix timestamp for a job."""
@@ -308,8 +373,24 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
         interval = job.get("interval_seconds", 7200)
         last = job.get("last_run_ts")
         if last and (last + interval) > now_ts:
-            return float(last + interval)
-        return float(now_ts + interval)
+            nxt = float(last + interval)
+        else:
+            nxt = float(now_ts + interval)
+
+        quiet = job.get("quiet_hours")
+        if quiet is None and job.get("id") not in INTERNAL_SYSTEM_MAINTENANCE_JOBS:
+            quiet = [23, 7]
+
+        if quiet and len(quiet) == 2:
+            start_h, end_h = quiet
+            nxt_pt = datetime.fromtimestamp(nxt, tz=PT)
+            in_quiet = (start_h <= nxt_pt.hour < end_h) if start_h < end_h else (nxt_pt.hour >= start_h or nxt_pt.hour < end_h)
+            if in_quiet:
+                resume_pt = nxt_pt.replace(hour=end_h, minute=0, second=0, microsecond=0)
+                if resume_pt <= nxt_pt:
+                    resume_pt += timedelta(days=1)
+                nxt = resume_pt.timestamp()
+        return nxt
 
     elif stype == "daily":
         h = job.get("hour_pt", 0)
@@ -350,6 +431,8 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
     return now_pt.timestamp() + 3600
 
 SIDECAR_ALIASES = {
+    "agora_roguelike_pm": ["agora_roguelike_pm", "agora_pm"],
+    "agora_roguelike_engineer": ["agora_roguelike_engineer", "agora_eng", "agora_engineer"],
     "heartbeat_sweep": ["heartbeat", "heartbeat_sweep"],
     "nightly_triage": ["triage", "nightly_triage"],
     "nas_logs": ["nas_logs"],
