@@ -518,8 +518,9 @@ def assess_board(force: bool = False, stall_threshold_mins: float = 45.0, nudge_
             if task_nudged.get("amos") is None or amos_last_nudge >= nudge_cooldown_mins:
                 iss_num = amos_task.get("issue") or amos_task.get("pr")
                 title = amos_task.get("title", "")
-                if "review gate" in title.lower() or "steering" in title.lower():
-                    follow_ups.append(f"- <@179407724335988736> [**Issue #{iss_num}**](<https://github.com/{REPO}/issues/{iss_num}>) ({title}) is stalled awaiting human steering. Can you provide design guidance to unblock <@1468012353206354197>?")
+                is_review_gate = ("review gate" in title.lower() and "pass" not in title.lower() and iss_num != 97)
+                if is_review_gate:
+                    follow_ups.append(f"- [**Issue #{iss_num}**](<https://github.com/{REPO}/issues/{iss_num}>) ({title}) is awaiting human steering in #lounge (<#1534452820995080192>).")
                 else:
                     follow_ups.append(f"- <@1468012353206354197> you've been on [**Issue #{iss_num}**](<https://github.com/{REPO}/issues/{iss_num}>) for {int(amos_elapsed)}m with no updates. What's the latest status?")
                 task_nudged["amos"] = now.isoformat()
@@ -532,8 +533,9 @@ def assess_board(force: bool = False, stall_threshold_mins: float = 45.0, nudge_
             if task_nudged.get("zero") is None or zero_last_nudge >= nudge_cooldown_mins:
                 iss_num = zero_task.get("issue") or zero_task.get("pr")
                 title = zero_task.get("title", "")
-                if "review gate" in title.lower() or "steering" in title.lower():
-                    follow_ups.append(f"- <@179407724335988736> [**Issue #{iss_num}**](<https://github.com/{REPO}/issues/{iss_num}>) ({title}) is stalled awaiting human steering. Can you provide design guidance to unblock <@1542285964213358633>?")
+                is_review_gate = ("review gate" in title.lower() and "pass" not in title.lower() and iss_num != 97)
+                if is_review_gate:
+                    follow_ups.append(f"- [**Issue #{iss_num}**](<https://github.com/{REPO}/issues/{iss_num}>) ({title}) is awaiting human steering in #lounge (<#1534452820995080192>).")
                 else:
                     follow_ups.append(f"- <@1542285964213358633> you've been on [**Issue #{iss_num}**](<https://github.com/{REPO}/issues/{iss_num}>) for {int(zero_elapsed)}m with no updates. What's the latest status?")
                 task_nudged["zero"] = now.isoformat()
