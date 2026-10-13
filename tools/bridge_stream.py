@@ -48,12 +48,13 @@ def format_command_preview(cmd_raw: str, max_len: int = 80) -> str:
 def harvest_transcript_response(
     conv_id: Optional[str],
     brain_base_dir: Optional[Path | str] = None,
+    min_step_index: int = -1,
 ) -> Optional[str]:
     """Harvest completed response from transcript files if stdout was truncated or cut off.
 
     Enforces active turn boundary: stops immediately if a USER_INPUT or CHECKPOINT step is
-    encountered before finding a substantive PLANNER_RESPONSE, preventing prior turn responses
-    from ever being harvested or re-delivered.
+    encountered (or if step_index <= min_step_index) before finding a substantive
+    PLANNER_RESPONSE, preventing prior turn responses from ever being harvested or re-delivered.
     """
     if not conv_id:
         return None
@@ -73,6 +74,9 @@ def harvest_transcript_response(
                     continue
                 try:
                     data = json.loads(line_s)
+                    sidx = data.get("step_index")
+                    if min_step_index >= 0 and sidx is not None and int(sidx) <= min_step_index:
+                        break
                     step_type = data.get("type")
                     source = data.get("source")
                     role = data.get("role")
