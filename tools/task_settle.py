@@ -41,7 +41,10 @@ def _is_task_finished_content(clean_tid: str, content: str) -> bool:
         "was canceled" in lower
         or "was cancelled" in lower
         or "timer cancelled" in lower
+        or "timer fired" in lower
         or "early-termination condition" in lower
+        or f"sender={clean_tid}" in content
+        or f"/{clean_tid} " in content
     ):
         return True
     pattern = rf"({re.escape(clean_tid)}[^\n]*?\b(?:finished|completed)\b|\b(?:finished|completed)\b[^\n]*?{re.escape(clean_tid)})"
@@ -147,9 +150,9 @@ def get_turn_pending_tasks(
                 if clean_tid not in launched_tasks:
                     launched_tasks.append(clean_tid)
 
-            # Completion pattern in transcript: "Task id \"<tid>\" finished"
-            for m in re.finditer(r"Task id \"?([^\s\n\"]+)\"? finished", content):
-                full_tid = m.group(1).strip("\"'.,;:()`[]{}")
+            # Completion pattern in transcript: "Task id \"<tid>\" finished" or SYSTEM_MESSAGE sender=<cid>/<tid>
+            for m in re.finditer(r"(?:Task id \"?([^\s\n\"]+)\"? finished|sender=([^\s\n\"]+/task-[0-9]+))", content):
+                full_tid = (m.group(1) or m.group(2) or "").strip("\"'.,;:()`[]{}")
                 if "/" in full_tid:
                     cid_prefix, clean_tid = full_tid.split("/", 1)
                     if cid_prefix != conv_id:
@@ -178,13 +181,34 @@ def get_turn_pending_tasks(
                 with open(mf, "r", encoding="utf-8", errors="replace") as fp:
                     md = json.load(fp)
                     content = str(md.get("content", ""))
+                    sender = str(md.get("sender", ""))
                     for tid in launched_tasks:
-                        if _is_task_finished_content(tid, content):
+                        if _is_task_finished_content(tid, content) or sender.endswith(f"/{tid}") or sender == tid:
                             completed_in_messages.add(tid)
             except Exception:
                 pass
 
     all_completed = completed_in_transcript | completed_in_messages
+
+    # 3. Check task log files for early-cancelled timers or finished notices
+    for tid in launched_tasks:
+        if tid in all_completed:
+            continue
+        task_log = conv_path / ".system_generated" / "tasks" / f"{tid}.log"
+        if task_log.exists():
+            try:
+                with open(task_log, "r", encoding="utf-8", errors="replace") as lf:
+                    log_txt = lf.read().lower()
+                    if (
+                        "timer cancelled:" in log_txt
+                        or "timer fired." in log_txt
+                        or "early-termination condition" in log_txt
+                        or _is_task_finished_content(tid, log_txt)
+                    ):
+                        all_completed.add(tid)
+            except Exception:
+                pass
+
     pending = [tid for tid in launched_tasks if tid not in all_completed]
     return pending
 
@@ -207,7 +231,8 @@ def is_task_completed(
                 with open(mf, "r", encoding="utf-8", errors="replace") as fp:
                     md = json.load(fp)
                     content = str(md.get("content", ""))
-                    if _is_task_finished_content(clean_tid, content):
+                    sender = str(md.get("sender", ""))
+                    if _is_task_finished_content(clean_tid, content) or sender.endswith(f"/{clean_tid}") or sender == clean_tid:
                         return True
             except Exception:
                 pass
@@ -228,7 +253,7 @@ def is_task_completed(
         try:
             with open(task_log, "r", encoding="utf-8", errors="replace") as lf:
                 log_txt = lf.read().lower()
-                if "timer cancelled:" in log_txt or "early-termination condition" in log_txt:
+                if "timer cancelled:" in log_txt or "timer fired." in log_txt or "early-termination condition" in log_txt:
                     return True
         except Exception:
             pass
@@ -499,10 +524,11 @@ def get_task_completion_details(
         res["log_path"] = str(task_log)
         try:
             with open(task_log, "r", encoding="utf-8", errors="replace") as lf:
-                lines = [l.rstrip() for l in lf.readlines() if l.strip()]
-                tail = lines[-12:]
-                if tail:
-                    res["log_snippet"] = "\n".join(tail)
+                raw_text = lf.read()
+                res["log_content"] = raw_text
+                lines = [l.rstrip() for l in raw_text.splitlines() if l.strip()]
+                if lines:
+                    res["log_snippet"] = "\n".join(lines)
         except Exception:
             pass
 
@@ -548,24 +574,35 @@ def check_and_dispatch_completed_tasks(
                 status_emoji = "✅" if status == "completed" else ("🛑" if status == "cancelled" else "❌")
                 status_title = "Complete" if status == "completed" else ("Cancelled" if status == "cancelled" else "Failed")
 
-                msg_lines = [
-                    f"{status_emoji} **Background Task {status_title}** (`{tid}`)",
-                ]
-                if details.get("exit_code") is not None:
-                    msg_lines.append(f"• **Exit Code:** `{details['exit_code']}`")
-                if details.get("log_path"):
-                    msg_lines.append(f"• **Log File:** `{details['log_path']}`")
-
                 snippet = details.get("log_snippet")
+                clean_snip = ""
                 if snippet:
                     from tools.bridge_safety import strip_internal_cli_chatter
                     clean_snip = strip_internal_cli_chatter(snippet).strip()
-                    if clean_snip:
-                        if len(clean_snip) > 1200:
-                            clean_snip = clean_snip[-1200:]
-                        msg_lines.append(f"\n**Output Excerpt:**\n```text\n{clean_snip}\n```")
 
-                outbox_content = "\n".join(msg_lines)
+                is_err = details.get("exit_code", 0) != 0
+                outbox_lines = [
+                    f"[TaskSettle Protocol]: Background Task {status_title} (`{tid}`) exited with code {details.get('exit_code', 0)}.",
+                ]
+                if clean_snip:
+                    if len(clean_snip) <= 1200:
+                        lbl = "**Error:**" if is_err else "**Output:**"
+                        outbox_lines.append(f"\n{lbl}\n```text\n{clean_snip}\n```")
+                    else:
+                        tail_chunk = clean_snip[-1200:]
+                        nl_pos = tail_chunk.find("\n")
+                        if nl_pos != -1 and nl_pos < 150:
+                            tail_chunk = tail_chunk[nl_pos + 1:]
+                        lbl = "**Error (Tail Excerpt):**" if is_err else "**Output (Tail Excerpt):**"
+                        outbox_lines.append(f"\n{lbl}\n```text\n{tail_chunk}\n```")
+
+                outbox_lines.append(
+                    "\nReview the completed background task results above. Synthesize the findings and deliver your final, complete, and substantive response "
+                    "or execute the necessary follow-up work to complete the user's request. "
+                    "Do NOT emit any waiting or interim chatter; deliver strictly the final substantive deliverable."
+                )
+
+                outbox_content = "\n".join(outbox_lines)
 
                 try:
                     from tools.outbox import queue_outbox_message
@@ -573,10 +610,11 @@ def check_and_dispatch_completed_tasks(
                         channel=channel_id,
                         content=outbox_content,
                         source_turn=f"sdk-task-{tid}",
+                        msg_type="agent_turn",
                     )
                     dispatched.append(details)
                     any_completed = True
-                    print(f"[TaskSettle] 🚀 Dispatched outbox completion notice for task {tid} to channel {channel_id}")
+                    print(f"[TaskSettle] 🚀 Dispatched outbox agent_turn synthesis notice for task {tid} to channel {channel_id}")
                 except Exception as oe:
                     print(f"[TaskSettle] Failed to queue outbox notification for {tid}: {oe}")
                     still_pending.append(tid)

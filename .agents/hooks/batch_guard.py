@@ -156,6 +156,13 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
         state = _default_state(now)
     state["last_time"] = now
 
+    # 0. Runtime schedule tool is prohibited in Discord bridge turns
+    if name == "schedule":
+        return False, (
+            "Schedule Tool Prohibited in Bridge Turns: Do not invoke the runtime 'schedule' timer tool to poll background tasks. "
+            "Stop calling tools silently and let the background task completion notification wake you automatically."
+        )
+
     # 1. run_command check
     if name == "run_command":
         cmd = args.get("CommandLine", "")
@@ -360,13 +367,47 @@ def main():
         tool_call = payload.get("toolCall", {})
         name = tool_call.get("name", "")
         args = tool_call.get("args", {})
+        cwd = payload.get("cwd", "/workspace")
 
+        # 1. Unified Search Safety Gate (in-process, avoiding a second Python subprocess spawn)
+        if name in ("grep_search", "find_by_name", "run_command"):
+            try:
+                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                from search_guard import check_search_path, check_command_line, normalize_path
+                if name == "grep_search":
+                    s_ok, s_reason = check_search_path(args.get("SearchPath", ""), cwd)
+                    if not s_ok:
+                        print(json.dumps({"decision": "deny", "reason": s_reason}))
+                        return
+                elif name == "find_by_name":
+                    search_dir = args.get("SearchDirectory", "")
+                    max_depth = args.get("MaxDepth")
+                    s_ok, s_reason = check_search_path(search_dir, cwd)
+                    if not s_ok:
+                        if not (normalize_path(search_dir, cwd) == "/workspace" and max_depth is not None and int(max_depth) <= 2):
+                            print(json.dumps({"decision": "deny", "reason": s_reason}))
+                            return
+                elif name == "run_command":
+                    s_ok, s_reason = check_command_line(args.get("CommandLine", ""), args.get("Cwd", cwd))
+                    if not s_ok:
+                        print(json.dumps({"decision": "deny", "reason": s_reason}))
+                        return
+            except Exception:
+                pass
+
+        # 2. Tool Batching Guard
         allowed, reason = check_tool_use(name, args)
         if not allowed:
             print(json.dumps({"decision": "deny", "reason": reason}))
             return
 
-        print(json.dumps({"decision": "allow"}))
+        resp = {"decision": "allow"}
+        if name == "run_command" and not args.get("IsDaemon", False):
+            wait_ms = args.get("WaitMsBeforeAsync", 0)
+            if isinstance(wait_ms, (int, float)) and wait_ms < 10000:
+                resp["overwrite"] = {"WaitMsBeforeAsync": 10000}
+
+        print(json.dumps(resp))
     except Exception:
         print(json.dumps({"decision": "allow"}))
 
