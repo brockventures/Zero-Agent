@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
 Tool Batching Safety Guard (Antigravity PreToolUse Hook)
-Enforces the Tool Roundtrip Minimization & Batch Execution Invariant across:
-1. Shell inspection commands (run_command).
-2. Repetitive file reading / small line slicing (view_file).
-3. Excessive unverified single-file replacements (replace_file_content).
-
-Forces the agent to:
-- Bundle shell diagnostics into compound commands or Python scratch scripts in /workspace/scratch/.
-- Read files in full (up to 800 lines) instead of small 30-50 line slices.
-- Bundle multi-file checks into scratch scripts.
-- Use write_to_file or script-based transforms for extensive file modifications.
+Enforces the Tool Roundtrip Minimization & Batch Execution Invariant using strictly
+CONSECUTIVE anti-pattern counters (zero cumulative turn-level step or scratch-write caps):
+1. Consecutive single-line shell inspection commands (run_command), including sed/awk/wc slicing.
+2. Consecutive inline Python heredoc / -c probing loops (MAX_CONSECUTIVE_INLINE_PYTHON = 3).
+3. Consecutive repetitive file reading / narrow line slicing (view_file), with wide-slice (>=350 lines) allowance.
+4. Consecutive unverified single-file replacements (replace_file_content).
+5. Consecutive unbatched git lifecycle commands (git add / commit / push / gh pr create).
 """
 import sys
 import os
@@ -20,30 +17,44 @@ import re
 
 STATE_FILE = "/tmp/batch_guard_state.json"
 MAX_CONSECUTIVE_SHELL_INSPECTIONS = 3
+MAX_CONSECUTIVE_INLINE_PYTHON = 3
 MAX_CONSECUTIVE_SAME_FILE_VIEWS = 2
+MAX_WIDE_SAME_FILE_VIEWS = 4
+WIDE_VIEW_MIN_LINES = 350
 MAX_CONSECUTIVE_FILE_VIEWS = 4
 MAX_CONSECUTIVE_SAME_FILE_EDITS = 3
 MAX_CONSECUTIVE_GIT_CMDS = 2
 TURN_RESET_IDLE_SECONDS = 45.0
 
 
-def load_state(state_file: str = STATE_FILE) -> dict:
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
+def _default_state(now: float = 0.0) -> dict:
     return {
-        "last_time": 0.0,
+        "last_time": now,
         "cmd_inspections": 0,
+        "consecutive_inline_python": 0,
         "consecutive_file_views": 0,
         "last_viewed_file": "",
         "same_file_view_count": 0,
         "last_edited_file": "",
         "same_file_edit_count": 0,
         "consecutive_git_cmds": 0,
+        "agora_eval_calls": 0,
     }
+
+
+def load_state(state_file: str = STATE_FILE) -> dict:
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r") as f:
+                data = json.load(f)
+                base = _default_state(data.get("last_time", 0.0))
+                for k in base:
+                    if k in data:
+                        base[k] = data[k]
+                return base
+        except Exception:
+            pass
+    return _default_state(0.0)
 
 
 def save_state(state: dict, state_file: str = STATE_FILE):
@@ -52,8 +63,6 @@ def save_state(state: dict, state_file: str = STATE_FILE):
             json.dump(state, f)
     except Exception:
         pass
-
-
 
 
 def is_unscoped_pytest(cmd: str) -> bool:
@@ -82,15 +91,29 @@ def is_single_git_lifecycle_cmd(cmd: str) -> bool:
     git_lifecycle_pattern = r"^(?:git\s+(?:add|commit|push|checkout\s+-b|switch\s+-c)|gh\s+pr\s+create)\b"
     return bool(re.search(git_lifecycle_pattern, cmd_clean))
 
+
+def is_inline_python_probe(cmd: str) -> bool:
+    """Detect standalone inline python -c or heredoc (python3 - << 'EOF') probing commands."""
+    cmd_clean = cmd.strip()
+    first_line = cmd_clean.splitlines()[0].strip() if cmd_clean else ""
+    unquoted_first = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "", first_line)
+    if " && " in unquoted_first or " || " in unquoted_first or "; " in unquoted_first:
+        return False
+    return bool(re.match(r"^python[0-9.]*\s+(?:-c\b|-\s*<<|<<)", first_line))
+
+
 def is_batched_or_mutating_cmd(cmd: str) -> bool:
     cmd_clean = cmd.strip()
-    if " && " in cmd_clean or " || " in cmd_clean or "; " in cmd_clean or "\n" in cmd_clean:
+    if is_inline_python_probe(cmd_clean):
+        return False
+    unquoted = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "", cmd_clean)
+    if " && " in unquoted or " || " in unquoted or "; " in unquoted or "\n" in unquoted:
         return True
     if "scratch/" in cmd_clean or "test_" in cmd_clean or "pytest" in cmd_clean:
         return True
-    if re.search(r"python[0-9.]*\s+(-c|-|/workspace/|/root/)", cmd_clean):
+    if re.search(r"python[0-9.]*\s+(/workspace/|/baseball/|/root/)", cmd_clean):
         return True
-    if re.search(r"\b(git|touch|mkdir|rm|cp|mv|chmod|kill|pkill|restart|reboot|compose)\b", cmd_clean):
+    if re.search(r"\b(git|touch|mkdir|rm|cp|mv|chmod|kill|pkill|restart|reboot|compose)\b", unquoted):
         return True
     return False
 
@@ -104,6 +127,7 @@ def is_single_shell_inspection(cmd: str) -> bool:
     inspection_starters = (
         "docker ps", "docker inspect", "docker logs",
         "cat", "head", "tail", "grep", "rg", "ag", "find",
+        "sed", "awk", "wc", "cut", "sort", "uniq", "stat",
         "ls", "df", "free", "uptime", "vmstat", "iostat",
         "crontab", "ss", "netstat", "ps", "which", "echo"
     )
@@ -113,27 +137,56 @@ def is_single_shell_inspection(cmd: str) -> bool:
     return first_word in inspection_starters or first_two in inspection_starters
 
 
+def is_ouroboros_polling_loop(cmd: str) -> bool:
+    """Detect manual shell busy-wait process polling loops (e.g. while pgrep -f ...; do sleep ...)."""
+    if not cmd:
+        return False
+    pattern = (
+        r"\b(?:while|until)\s+(?:!\s*)?(?:pgrep|ps\s+|pidof|kill\s+-0)\b[^;\"\n']*?[;\n]+\s*do\b[\s\S]*?\bsleep\s+[0-9.]+"
+    )
+    return bool(re.search(pattern, cmd))
+
+
 def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple[bool, str]:
     now = time.time()
     state = load_state(state_file)
 
-    # Reset state on idle turn boundary
+    # Reset short-window state on idle turn boundary
     if now - state.get("last_time", 0.0) > TURN_RESET_IDLE_SECONDS:
-        state = {
-            "last_time": now,
-            "cmd_inspections": 0,
-            "consecutive_file_views": 0,
-            "last_viewed_file": "",
-            "same_file_view_count": 0,
-            "last_edited_file": "",
-            "same_file_edit_count": 0,
-            "consecutive_git_cmds": 0,
-        }
+        state = _default_state(now)
     state["last_time"] = now
 
     # 1. run_command check
     if name == "run_command":
         cmd = args.get("CommandLine", "")
+
+        # Agora Fast-Path Invariant
+        if re.search(r"agora_play\.py\s+(?:order|move)\b", cmd):
+            return False, (
+                "Agora Fast-Path Invariant: Direct CLI order/move commands are prohibited in conversational turns. "
+                "Orders and vessel movement must be emitted directly via Discord chat syntax (BUY/SELL <qty> <good> @ <px> AT <st>) "
+                "so agora_announcer.py submits them. Keep turns to zero tools."
+            )
+        if re.search(r"agora_play\.py\s+(?:status|eval)\b", cmd):
+            agora_calls = state.get("agora_eval_calls", 0) + 1
+            state["agora_eval_calls"] = agora_calls
+            if agora_calls > 1:
+                save_state(state, state_file)
+                return False, (
+                    f"Agora Fast-Path Invariant: Detected {agora_calls} agora_play inspection calls in a single turn. "
+                    "The Discord round announcement already embeds all quotes. Keep Agora turns to 0 tools (or at most 1 fast eval call)."
+                )
+            save_state(state, state_file)
+            return True, ""
+
+        # A0. Ouroboros Process-Polling Loop Guard
+        if is_ouroboros_polling_loop(cmd):
+            return False, (
+                "Ouroboros Polling Guard Triggered: Manual shell process-polling loops ('while ... pgrep/ps ... sleep') "
+                "are prohibited because 'pgrep -f' matches its own bash -c wrapper and deadlocks the turn. "
+                "For SDK background tasks, stop calling tools silently and let the task completion event wake you; "
+                "for jobs >2 minutes, use 'python3 /workspace/tools/detached_runner.py start ...'."
+            )
 
         # A. Unscoped test suite check (Ban bare pytest in interactive turns)
         if is_unscoped_pytest(cmd):
@@ -143,7 +196,27 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
                 "to avoid multi-minute turn latency. Let GitHub Actions CI run the full regression suite in the cloud."
             )
 
-        # B. Serial unbatched git lifecycle check
+        # B. Consecutive inline Python probe check (python3 -c / heredoc loops)
+        if is_inline_python_probe(cmd):
+            state["consecutive_inline_python"] = state.get("consecutive_inline_python", 0) + 1
+            if state["consecutive_inline_python"] > MAX_CONSECUTIVE_INLINE_PYTHON:
+                save_state(state, state_file)
+                return False, (
+                    f"Batch Invariant Triggered: Detected {state['consecutive_inline_python']} consecutive inline Python probe commands "
+                    f"(limit: {MAX_CONSECUTIVE_INLINE_PYTHON}). Consolidate multi-step diagnostics or parameter sweeps into a single "
+                    "reusable script in scratch/ instead of serial inline heredocs."
+                )
+            state["cmd_inspections"] = 0
+            state["consecutive_file_views"] = 0
+            state["same_file_view_count"] = 0
+            state["same_file_edit_count"] = 0
+            state["consecutive_git_cmds"] = 0
+            save_state(state, state_file)
+            return True, ""
+        else:
+            state["consecutive_inline_python"] = 0
+
+        # C. Serial unbatched git lifecycle check
         if is_single_git_lifecycle_cmd(cmd):
             state["consecutive_git_cmds"] = state.get("consecutive_git_cmds", 0) + 1
             if state["consecutive_git_cmds"] > MAX_CONSECUTIVE_GIT_CMDS:
@@ -157,17 +230,18 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
             state["consecutive_file_views"] = 0
             state["same_file_view_count"] = 0
             state["same_file_edit_count"] = 0
+            state["agora_eval_calls"] = 0
             save_state(state, state_file)
             return True, ""
         else:
             state["consecutive_git_cmds"] = 0
 
         if is_batched_or_mutating_cmd(cmd):
-            # Batch script, tests, or mutating commands reset all warning counters
             state["cmd_inspections"] = 0
             state["consecutive_file_views"] = 0
             state["same_file_view_count"] = 0
             state["same_file_edit_count"] = 0
+            state["agora_eval_calls"] = 0
             save_state(state, state_file)
             return True, ""
 
@@ -189,12 +263,18 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
     # 2. view_file check
     if name == "view_file":
         target_file = args.get("AbsolutePath", "")
+        start_line = args.get("StartLine")
+        end_line = args.get("EndLine")
+        is_wide_slice = (start_line is None and end_line is None) or (
+            isinstance(start_line, int) and isinstance(end_line, int) and (end_line - start_line) >= WIDE_VIEW_MIN_LINES
+        )
         state["cmd_inspections"] = 0
+        state["consecutive_inline_python"] = 0
 
-        # Check repetitive same-file views
         if target_file and target_file == state.get("last_viewed_file"):
             state["same_file_view_count"] = state.get("same_file_view_count", 0) + 1
-            if state["same_file_view_count"] > MAX_CONSECUTIVE_SAME_FILE_VIEWS:
+            allowed_same = MAX_WIDE_SAME_FILE_VIEWS if is_wide_slice else MAX_CONSECUTIVE_SAME_FILE_VIEWS
+            if state["same_file_view_count"] > allowed_same:
                 save_state(state, state_file)
                 return False, (
                     f"Batch Invariant Triggered: Detected {state['same_file_view_count']} consecutive view_file calls on '{target_file}'. "
@@ -205,7 +285,6 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
             state["last_viewed_file"] = target_file
             state["same_file_view_count"] = 1
 
-        # Check total consecutive file views across files
         state["consecutive_file_views"] = state.get("consecutive_file_views", 0) + 1
         if state["consecutive_file_views"] > MAX_CONSECUTIVE_FILE_VIEWS:
             save_state(state, state_file)
@@ -222,6 +301,7 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
     if name == "replace_file_content":
         target_file = args.get("TargetFile", "")
         state["cmd_inspections"] = 0
+        state["consecutive_inline_python"] = 0
         state["consecutive_file_views"] = 0
         state["same_file_view_count"] = 0
 
@@ -241,18 +321,16 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
         save_state(state, state_file)
         return True, ""
 
-    # 4. write_to_file resets everything
+    # 4. write_to_file resets consecutive counters (zero cumulative scratch-write cap)
     if name == "write_to_file":
-        state = {
-            "last_time": now,
-            "cmd_inspections": 0,
-            "consecutive_file_views": 0,
-            "last_viewed_file": "",
-            "same_file_view_count": 0,
-            "last_edited_file": "",
-            "same_file_edit_count": 0,
-            "consecutive_git_cmds": 0,
-        }
+        state["cmd_inspections"] = 0
+        state["consecutive_inline_python"] = 0
+        state["consecutive_file_views"] = 0
+        state["last_viewed_file"] = ""
+        state["same_file_view_count"] = 0
+        state["last_edited_file"] = ""
+        state["same_file_edit_count"] = 0
+        state["consecutive_git_cmds"] = 0
         save_state(state, state_file)
         return True, ""
 
@@ -260,7 +338,6 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
     return True, ""
 
 
-# Backward compatibility for existing test suite
 def check_batching(cmd: str) -> tuple[bool, str]:
     return check_tool_use("run_command", {"CommandLine": cmd})
 
@@ -291,7 +368,6 @@ def main():
 
         print(json.dumps({"decision": "allow"}))
     except Exception:
-        # Failsafe: never crash the agent turn on hook bug
         print(json.dumps({"decision": "allow"}))
 
 
