@@ -32,6 +32,7 @@ from tools.bridge_formatting import generate_concise_thread_title
 from tools.bridge_safety import is_internal_cli_leak
 from tools.bridge_stream import (
     AgyStreamParser,
+    check_transcript_turn_status,
     format_agy_error_message,
     format_command_preview,
     harvest_transcript_response,
@@ -72,6 +73,7 @@ class TurnCoordinator:
     status_msg: Optional[discord.Message]
     conv_id: Optional[str]
     turn_start_time: float = 0.0
+    baseline_step_index: int = -1
     last_activity_time: float = 0.0
     last_probe_time: float = 0.0
     last_beacon_touch: float = 0.0
@@ -253,12 +255,20 @@ class TurnCoordinator:
         """
         now = time.time()
 
-        # If there are active background tasks pending in this turn, hold execution open
+        # If there are active background tasks pending in this turn, or transcript turn is not yet complete, hold execution open
         if self.conv_id:
             try:
                 from tools.task_settle import get_turn_pending_tasks
                 pending = get_turn_pending_tasks(self.conv_id)
                 if pending:
+                    return False, ""
+                t_status = check_transcript_turn_status(
+                    str(self.conv_id), min_step_index=self.baseline_step_index
+                )
+                if (
+                    t_status.get("has_active_tool")
+                    or t_status.get("reason") in ("intermediate_task_wait", "empty_or_leak_content")
+                ):
                     return False, ""
             except Exception:
                 pass
@@ -300,6 +310,8 @@ class TurnCoordinator:
                 set_channel_session_id(self.channel_id, self.mode, new_cid)
 
         elif ev_name == "step_update":
+            # Any new step update means the turn is actively continuing; clear any prior intermediate result timestamp
+            self.result_received_at = None
             step = event.get("step_update", {})
             stype = step.get("step_type")
             sstate = step.get("state")
@@ -347,11 +359,8 @@ class TurnCoordinator:
                         self.agent_response_done_at = time.time()
 
         elif ev_name == "result" or "result" in event:
-            if timer:
-                timer.mark_result()
-            if self.result_received_at is None:
-                self.result_received_at = time.time()
             res_data = event.get("result", {}) if isinstance(event.get("result"), dict) else event
+            res_resp = str(res_data.get("response") or event.get("response") or "").strip()
             res_cid = res_data.get("conversation_id")
             if res_cid:
                 if self.escalated_to_thread and self.thread and hasattr(self.thread, "id"):
@@ -360,7 +369,22 @@ class TurnCoordinator:
                 else:
                     set_channel_session_id(self.channel_id, self.mode, res_cid)
                 self.conv_id = res_cid
-            self.current_action = "Finalizing output..."
+
+            # Do not arm result_received_at if background tasks are still pending
+            is_intermediate = False
+            if self.conv_id:
+                try:
+                    from tools.task_settle import get_turn_pending_tasks
+                    if get_turn_pending_tasks(str(self.conv_id)):
+                        is_intermediate = True
+                except Exception:
+                    pass
+            if not is_intermediate:
+                if timer:
+                    timer.mark_result()
+                if self.result_received_at is None:
+                    self.result_received_at = time.time()
+                self.current_action = "Finalizing output..."
 
             if not self.recorded_usage:
                 usage = res_data.get("usage") or event.get("usage")
@@ -540,11 +564,70 @@ class TurnCoordinator:
 
             ev = self.handle_line(line_s, stream_parser=stream_parser, timer=timer)
             if ev and (ev.get("event") == "result" or "result" in ev):
+                now_res = time.time()
                 res_data = ev.get("result", {}) if isinstance(ev.get("result"), dict) else ev
+                res_resp = str(res_data.get("response") or "")
+                if (
+                    (now_res - self.turn_start_time) < 1.5
+                    and not self.had_substantive_delta
+                    and (not res_resp or is_internal_cli_leak(res_resp))
+                ):
+                    print(
+                        f"[BridgeEngine] ⚠️ Stale 'result' event received in #{worker_name} after only "
+                        f"{now_res - self.turn_start_time:.3f}s with no turn delta. Discarding residue..."
+                    )
+                    self.result_received_at = None
+                    continue
+
+                res_cid = res_data.get("conversation_id")
+                active_cid = res_cid or self.conv_id
+                if active_cid:
+                    try:
+                        from tools.task_settle import get_turn_pending_tasks
+                        pending_sdk_tasks = get_turn_pending_tasks(str(active_cid))
+                        t_status = check_transcript_turn_status(
+                            str(active_cid), min_step_index=self.baseline_step_index
+                        )
+                        if (
+                            pending_sdk_tasks
+                            or t_status.get("has_active_tool")
+                            or t_status.get("reason") == "intermediate_task_wait"
+                        ):
+                            print(
+                                f"[BridgeEngine] ⏳ Intermediate result received in #{worker_name} while background task/tool active "
+                                f"(tasks={len(pending_sdk_tasks)}, reason={t_status.get('reason')}); continuing stdout stream..."
+                            )
+                            self.result_received_at = None
+                            continue
+                    except Exception as pte:
+                        print(f"[BridgeEngine] Warning checking pending tasks on result: {pte}")
+
                 output_response = stream_parser.get_final_response(
                     fallback_result=res_data.get("response", "")
                 )
-                res_cid = res_data.get("conversation_id")
+                err_check = (stream_parser.error_response or output_response or "").strip()
+                if err_check.startswith("Error:") and any(
+                    t_marker in err_check
+                    for t_marker in (
+                        "TLS handshake timeout",
+                        "oauth2.googleapis.com/token",
+                        "i/o timeout",
+                        "connection reset by peer",
+                        "EOF",
+                        "server_error",
+                        "temporarily unavailable",
+                    )
+                ):
+                    print(
+                        f"[BridgeEngine] 🔄 Transient upstream OAuth/TLS error in #{worker_name}: "
+                        f"{err_check[:140]}. Recycling worker for retry..."
+                    )
+                    if on_recycle:
+                        try:
+                            await on_recycle(keep_conv_id=True)
+                        except TypeError:
+                            await on_recycle()
+                    raise RuntimeError(f"Transient upstream API error in #{worker_name}: {err_check[:160]}")
                 if res_cid:
                     if self.escalated_to_thread and self.thread and hasattr(self.thread, "id"):
                         set_channel_session_id(self.thread.id, self.mode, res_cid)
@@ -609,7 +692,10 @@ class TurnCoordinator:
         # Attempt transcript harvest first if output is empty or was interrupted
         was_harvested = False
         if is_empty_or_placeholder or is_leak or (is_home_turf and self.mode == "home" and is_silence):
-            harvested = harvest_transcript_response(str(cid) if cid else None)
+            harvested = harvest_transcript_response(
+                str(cid) if cid else None,
+                min_step_index=self.baseline_step_index,
+            )
             if harvested and not is_internal_cli_leak(harvested):
                 print(
                     f"[BridgeEngine] 🌾 Harvested response from on-disk transcript for session {cid} "
