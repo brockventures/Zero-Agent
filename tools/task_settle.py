@@ -392,6 +392,8 @@ async def evaluate_and_settle_turn(
 
     kwargs = dict(turn_kwargs or {})
     kwargs["is_settle_reinvocation"] = True
+    if is_substantive_response(current_text):
+        kwargs["pre_settle_text"] = current_text.strip()
 
     try:
         reinvoke_res = await reinvoke_coro_fn(
@@ -420,17 +422,16 @@ async def evaluate_and_settle_turn(
 
         # Both current_text and res_text are substantive
         if is_substantive_response(current_text):
+            from tools.bridge_stream import reconcile_step_segments
+
             c_strip = current_text.strip()
             r_strip = res_text.strip()
-            # If res_text already substantially contains current_text, deliver res_text directly
-            if c_strip in r_strip or (len(c_strip) > 40 and c_strip[:40] in r_strip):
-                return True, r_strip
-            # Otherwise, combine pre-settle substantive deliverable with settle update
+            reconciled = reconcile_step_segments(c_strip, r_strip)
             print(
-                f"[TaskSettle] 🔗 Merging pre-settle substantive text ({len(c_strip)} chars) "
-                f"with settlement response ({len(r_strip)} chars)."
+                f"[TaskSettle] 🔗 Reconciled pre-settle text ({len(c_strip)} chars) "
+                f"with settlement response ({len(r_strip)} chars) -> {len(reconciled)} chars."
             )
-            return True, f"{c_strip}\n\n{r_strip}"
+            return True, reconciled
 
         return True, res_text
     except Exception as e:
