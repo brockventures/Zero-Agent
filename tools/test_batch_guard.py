@@ -1,30 +1,13 @@
-#!/usr/bin/env python3
-"""
-Unit test suite for enhanced tool batching guard hook.
-Verifies enforcement across shell inspections, repetitive view_file slices,
-serial file view chains, and repetitive replace_file_content calls.
-"""
-import sys
-import os
 import unittest
-from pathlib import Path
+import os
+import time
+import sys
 
-WORKSPACE = Path("/workspace")
-sys.path.insert(0, str(WORKSPACE / ".agents" / "hooks"))
-
-import batch_guard
-from batch_guard import (
-    check_batching,
-    check_tool_use,
-    STATE_FILE,
-    is_single_inspection,
-    is_batched_or_mutating,
-    load_state,
-)
+sys.path.insert(0, "/workspace/.agents/hooks")
+from batch_guard import check_batching, check_tool_use, STATE_FILE, load_state, save_state
 
 
 class TestBatchGuard(unittest.TestCase):
-
     def setUp(self):
         if os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)
@@ -33,35 +16,56 @@ class TestBatchGuard(unittest.TestCase):
         if os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)
 
-    def test_catches_serial_shell_inspections(self):
+    def test_consecutive_inspections_blocked(self):
         for i in range(3):
             allowed, reason = check_batching("docker ps")
-            self.assertTrue(allowed, f"Command {i + 1} should be allowed")
+            self.assertTrue(allowed, f"Call {i+1} should be allowed")
 
-        allowed, reason = check_batching("docker inspect foo")
-        self.assertFalse(allowed, "Expected 4th inspection to be blocked")
-        self.assertIn("consecutive single-line inspection commands", reason)
+        allowed, reason = check_batching("ls -la /workspace")
+        self.assertFalse(allowed, "4th consecutive inspection should be blocked")
+        self.assertIn("Batch Invariant Triggered", reason)
 
-    def test_scratch_script_resets_shell_count(self):
-        for i in range(3):
+    def test_sed_awk_counted_as_shell_inspections(self):
+        allowed, _ = check_batching("sed -n '100,150p' /workspace/tools/foo.py")
+        self.assertTrue(allowed)
+        allowed, _ = check_batching("awk 'NR>=150 && NR<=200' /workspace/tools/foo.py")
+        self.assertTrue(allowed)
+        allowed, _ = check_batching("wc -l /workspace/tools/foo.py")
+        self.assertTrue(allowed)
+        allowed, reason = check_batching("head -n 50 /workspace/tools/foo.py")
+        self.assertFalse(allowed)
+        self.assertIn("4 consecutive single-line inspection commands", reason)
+
+    def test_batched_command_resets_counter(self):
+        for _ in range(3):
             check_batching("docker ps")
 
-        allowed, reason = check_batching("python3 /workspace/scratch/check.py")
+        allowed, _ = check_batching("docker ps && ls -la")
         self.assertTrue(allowed)
 
-        allowed, reason = check_batching("docker ps")
+        allowed, _ = check_batching("docker ps")
+        self.assertTrue(allowed)
+
+    def test_scratch_script_resets_counter(self):
+        for _ in range(3):
+            check_batching("docker ps")
+
+        allowed, _ = check_batching("python3 /workspace/scratch/check.py")
+        self.assertTrue(allowed)
+
+        allowed, _ = check_batching("docker ps")
         self.assertTrue(allowed)
 
     def test_compound_command_allowed(self):
-        allowed, reason = check_batching("ssh testuser@remote-host.local 'docker ps; crontab -l' ")
+        allowed, _ = check_batching("ssh testuser@remote-host.local 'docker ps; crontab -l' ")
         self.assertTrue(allowed)
 
     def test_ssh_inspection_counting(self):
-        for i in range(3):
-            allowed, reason = check_batching('ssh testuser@remote-host.local "docker ps"')
+        for _ in range(3):
+            allowed, _ = check_batching('ssh testuser@remote-host.local "docker ps"')
             self.assertTrue(allowed)
 
-        allowed, reason = check_batching('ssh testuser@remote-host.local "crontab -l"')
+        allowed, _ = check_batching('ssh testuser@remote-host.local "crontab -l"')
         self.assertFalse(allowed)
 
     def test_view_file_same_file_blocks_on_third_call(self):
@@ -72,6 +76,19 @@ class TestBatchGuard(unittest.TestCase):
         allowed, reason = check_tool_use("view_file", {"AbsolutePath": "/workspace/tools/foo.py", "StartLine": 101, "EndLine": 150})
         self.assertFalse(allowed)
         self.assertIn("3 consecutive view_file calls on '/workspace/tools/foo.py'", reason)
+
+    def test_view_file_wide_slice_allows_up_to_four(self):
+        for i in range(4):
+            allowed, _ = check_tool_use(
+                "view_file",
+                {"AbsolutePath": "/baseball/big-projections/predict_big.py", "StartLine": i * 500 + 1, "EndLine": (i + 1) * 500},
+            )
+            self.assertTrue(allowed, f"Wide slice {i+1} should be allowed")
+        allowed, _ = check_tool_use(
+            "view_file",
+            {"AbsolutePath": "/baseball/big-projections/predict_big.py", "StartLine": 2001, "EndLine": 2500},
+        )
+        self.assertFalse(allowed)
 
     def test_view_file_across_different_files_blocks_on_fifth(self):
         files = ["/a.py", "/b.py", "/c.py", "/d.py"]
@@ -89,6 +106,28 @@ class TestBatchGuard(unittest.TestCase):
         allowed, reason = check_tool_use("replace_file_content", {"TargetFile": "/workspace/tools/bar.py"})
         self.assertFalse(allowed)
         self.assertIn("4 consecutive replace_file_content calls on '/workspace/tools/bar.py'", reason)
+
+    def test_consecutive_inline_python_probes_blocked_after_three_and_reset_on_progress(self):
+        for i in range(3):
+            allowed, _ = check_batching(f"python3 - << 'EOF'\nprint({i})\nEOF")
+            self.assertTrue(allowed, f"Probe {i+1} should be allowed")
+        allowed, reason = check_batching("python3 -c 'print(4)'")
+        self.assertFalse(allowed)
+        self.assertIn("consecutive inline Python probe commands", reason)
+
+        # Running a real script or editing a file resets consecutive_inline_python
+        allowed, _ = check_batching("python3 /workspace/scratch/calibrate.py")
+        self.assertTrue(allowed)
+        allowed, _ = check_batching("python3 -c 'print(1)'")
+        self.assertTrue(allowed)
+
+    def test_no_cumulative_turn_tool_call_or_scratch_write_cap(self):
+        """Ensure productive deep turns (>40 tool calls and >5 scratch writes) are never artificially capped."""
+        for i in range(45):
+            allowed, _ = check_tool_use("write_to_file", {"TargetFile": f"/baseball/big-projections/scratch/opt_{i}.py"})
+            self.assertTrue(allowed, f"Write {i+1} should be allowed")
+            allowed, _ = check_batching(f"python3 /baseball/big-projections/scratch/opt_{i}.py")
+            self.assertTrue(allowed, f"Run {i+1} should be allowed")
 
     def test_test_command_resets_file_edits(self):
         for _ in range(3):
@@ -131,6 +170,19 @@ class TestBatchGuard(unittest.TestCase):
     def test_compound_git_pipeline_allows(self):
         allowed, _ = check_tool_use("run_command", {"CommandLine": "git add file.py && git commit -m 'feat: update' && git push origin branch"})
         self.assertTrue(allowed)
+
+    def test_agora_order_move_prohibited(self):
+        for cmd in ["python3 /workspace/tools/agora_play.py order --side BUY --good ORE --qty 250", "python3 /workspace/tools/agora_play.py move --dest earth"]:
+            allowed, reason = check_tool_use("run_command", {"CommandLine": cmd})
+            self.assertFalse(allowed, f"Expected {cmd} to be blocked")
+            self.assertIn("Agora Fast-Path Invariant", reason)
+
+    def test_agora_status_blocks_on_second(self):
+        allowed, _ = check_tool_use("run_command", {"CommandLine": "python3 /workspace/tools/agora_play.py status"})
+        self.assertTrue(allowed, "First agora status should be allowed")
+        allowed, reason = check_tool_use("run_command", {"CommandLine": "python3 /workspace/tools/agora_play.py eval"})
+        self.assertFalse(allowed, "Second agora status/eval should be blocked")
+        self.assertIn("Agora Fast-Path Invariant", reason)
 
 
 if __name__ == "__main__":
