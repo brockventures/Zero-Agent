@@ -119,13 +119,15 @@ async def execute_agy_turn(
     queued_at: float | None = None,
     is_settle_reinvocation: bool = False,
     is_physical_mention: bool = False,
+    model_override: str | None = None,
+    pre_settle_text: str | None = None,
 ):
     """Execute a single agy CLI turn with streaming status and output delivery."""
     global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session_keys
 
     # Thread Escalation State (Home Turf Root Channel Only) - preserved across retry attempts
     from tools.bridge_daemons import daemon_manager
-    if daemon_manager.is_dedicated_channel(channel_id):
+    if daemon_manager.is_dedicated_channel(channel_id) and not model_override:
         worker = daemon_manager.get_worker(channel_id)
         if worker:
             try:
@@ -147,6 +149,7 @@ async def execute_agy_turn(
                     queued_at=queued_at,
                     is_settle_reinvocation=is_settle_reinvocation,
                     is_physical_mention=is_physical_mention,
+                    pre_settle_text=pre_settle_text,
                 )
             except Exception as pe:
                 if channel_id in steering_channels:
@@ -176,12 +179,14 @@ async def execute_agy_turn(
     escalation_enabled = rules.get("auto_thread_escalation_enabled", True)
 
     max_retries = 2
+    forced_retry_model: str | None = None
     for attempt in range(max_retries + 1):
         sync_credentials()
         master_fd, slave_fd = pty.openpty()
         cmd = ["agy", "--add-dir=/workspace"]
 
-        conv_id = get_channel_session_id(channel_id, mode)
+        is_ephemeral_override = bool(model_override and daemon_manager.is_dedicated_channel(channel_id))
+        conv_id = None if is_ephemeral_override else get_channel_session_id(channel_id, mode)
         sess_key = "home" if (mode == "home" and int(channel_id) == TARGET_CHANNEL_ID) else str(channel_id)
 
         timer.mark_compaction_start()
@@ -253,7 +258,13 @@ async def execute_agy_turn(
             f"--print-timeout={PRINT_TIMEOUT}"
         ])
 
-        active_model = get_active_model()
+        from tools.bridge_models import (
+            get_channel_model_override,
+            get_fallback_model,
+            is_model_error,
+            list_available_models,
+        )
+        active_model = forced_retry_model or model_override or get_channel_model_override(channel_id, ch_name_label) or get_active_model()
         if active_model:
             cmd.append(f"--model={active_model}")
 
@@ -262,11 +273,6 @@ async def execute_agy_turn(
 
         ch_title = getattr(reply_target.channel, "name", "") if (reply_target and hasattr(reply_target, "channel")) else ""
         turn_text = f"Crunching in #{ch_title}..." if ch_title else "Processing task..."
-        if apply_presence_fn:
-            try:
-                await apply_presence_fn(custom_activity=turn_text, status_override="dnd")
-            except Exception:
-                pass
 
         output_chunks = []
         auth_detected = False
@@ -297,6 +303,11 @@ async def execute_agy_turn(
             os.close(slave_fd)
             timer.mark_boot_end()
             timer.mark_send()
+            if apply_presence_fn:
+                try:
+                    await apply_presence_fn(custom_activity=turn_text, status_override="dnd")
+                except Exception:
+                    pass
             channel_active_procs[channel_id] = proc
             channel_active_prompts[channel_id] = prompt
             try:
@@ -463,7 +474,8 @@ async def execute_agy_turn(
                         if ev.get("event") == "result":
                             res_cid = ev.get("result", {}).get("conversation_id")
                             if res_cid:
-                                set_channel_session_id(channel_id, mode, res_cid)
+                                if not is_ephemeral_override:
+                                    set_channel_session_id(channel_id, mode, res_cid)
                     except Exception:
                         pass
 
@@ -545,9 +557,20 @@ async def execute_agy_turn(
             "authentication failed or timed out",
             "timeout waiting for response"
         ])
+        is_transient_model_err = (not has_substantive) and is_model_error(full_raw)
         is_retryable_stall = (not has_substantive) and timed_out and not is_hard_ceiling
-        if (is_transient_auth or is_retryable_stall) and attempt < max_retries:
-            reason_label = "Step inactivity / API stall" if is_retryable_stall else "Transient Google auth/API handshake hiccup"
+        if (is_transient_auth or is_transient_model_err or is_retryable_stall) and attempt < max_retries:
+            if is_transient_model_err and attempt >= 1 and active_model:
+                avail_now = await asyncio.to_thread(list_available_models, True)
+                fb_cand = get_fallback_model(avail_now, exclude=active_model) if avail_now else None
+                if fb_cand:
+                    forced_retry_model = fb_cand
+                    print(f"[BridgeRunner] ⚠️ CLI rejected {active_model} on retry; falling back to {fb_cand} for final attempt.")
+            reason_label = (
+                "Step inactivity / API stall"
+                if is_retryable_stall
+                else ("Transient CLI model registry hiccup" if is_transient_model_err else "Transient Google auth/API handshake hiccup")
+            )
             backoff_s = (attempt + 1) * 2.0
             print(f"[BridgeRunner] 🔄 {reason_label} on attempt {attempt+1}/{max_retries}. Retrying in {backoff_s:.1f}s...")
             if status_msg:
@@ -568,7 +591,7 @@ async def execute_agy_turn(
         break
 
     full_raw = "".join(output_chunks).strip()
-    if is_transient_auth and not coord.last_agy_error:
+    if (is_transient_auth or is_transient_model_err) and not coord.last_agy_error:
         coord.last_agy_error = {
             "type": "auth_eligibility_failure",
             "message": "Google account authentication / eligibility handshake timed out upstream.",
@@ -592,6 +615,12 @@ async def execute_agy_turn(
     elif proc and proc.returncode not in (0, None):
         timer.status = f"ERROR_{proc.returncode}"
 
+    if is_settle_reinvocation and pre_settle_text:
+        from tools.bridge_stream import reconcile_step_segments
+        from tools.task_settle import is_substantive_response
+        if is_substantive_response(final_text):
+            final_text = reconcile_step_segments(pre_settle_text, final_text)
+
     # TaskSettle Protocol: Detect and settle premature turn exits while background tasks are pending
     if (
         rules.get("task_settle_enabled", True)
@@ -600,7 +629,7 @@ async def execute_agy_turn(
         and not coord.last_agy_error
     ):
         try:
-            from tools.task_settle import evaluate_and_settle_turn
+            from tools.task_settle import evaluate_and_settle_turn, is_substantive_response
 
             settle_timeout = float(rules.get("task_settle_timeout_seconds", 25.0))
             was_settled, settled_text = await evaluate_and_settle_turn(
@@ -626,16 +655,17 @@ async def execute_agy_turn(
             )
             if was_settled and settled_text:
                 if settled_text == final_text:
-                    # Reinvocation failed/leaked and preserved pre-settle response:
-                    # Fall through to deliver_turn_output so user receives the response!
                     pass
-                elif not is_internal_cli_leak(settled_text) and "⚠️ **Turn Failed**" not in settled_text:
-                    return settled_text
                 else:
                     return settled_text
             elif settled_text:
                 if not is_internal_cli_leak(settled_text):
                     final_text = settled_text
+            elif not was_settled:
+                # Tasks were NOT settled within window. If final_text is an internal leak or
+                # non-substantive placeholder (e.g. "An async task is running..."), suppress it!
+                if is_internal_cli_leak(final_text) or not is_substantive_response(final_text):
+                    final_text = "[NO_REPLY]"
         except Exception as settle_err:
             print(f"[BridgeRunner] TaskSettle error: {settle_err}")
 

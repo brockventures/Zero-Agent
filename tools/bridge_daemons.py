@@ -55,18 +55,24 @@ from tools.bridge_formatting import (
     format_agy_error_message,
     is_internal_cli_leak,
 )
-from tools.bridge_engine import TurnCoordinator, channel_active_procs
+from tools.bridge_engine import TurnCoordinator, channel_active_procs, channel_active_prompts
 
 PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "30m")
 
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
 LOUNGE_CHANNEL_ID = 1534452820995080192
+ZERO_OPS_CHANNEL_ID = 1544953279664889888
 
 DEDICATED_CHANNEL_CONFIGS = {
     TARGET_CHANNEL_ID: {
         "name": "zero-chat",
         "mode": "home",
         "sess_key": "home",
+    },
+    ZERO_OPS_CHANNEL_ID: {
+        "name": "zero-ops",
+        "mode": "home",
+        "sess_key": str(ZERO_OPS_CHANNEL_ID),
     },
     BANANA_STAND_CHANNEL_ID: {
         "name": "the-banana-stand",
@@ -143,6 +149,35 @@ class PersistentChannelWorker:
             pass
 
     async def start(self):
+        """Boot the persistent worker, retrying once on the fallback model if the CLI rejects the configured one."""
+        from tools.bridge_models import (
+            ModelSelectionError,
+            format_fallback_notice,
+            get_fallback_model,
+            list_available_models,
+        )
+        self._forced_model = None
+        try:
+            await self._start_inner()
+        except ModelSelectionError as me:
+            available = await asyncio.to_thread(list_available_models, True)
+            if not available or me.model in available:
+                print(f"[BridgeDaemon] 🔄 Transient CLI model-list rejection for {me.model} on #{self.name}; retrying once before fallback...")
+                await asyncio.sleep(2.0)
+                try:
+                    await self._start_inner()
+                    return
+                except ModelSelectionError:
+                    pass
+            fallback = get_fallback_model(available, exclude=me.model) if available else None
+            if not fallback:
+                raise
+            print(f"[BridgeDaemon] ⚠️ CLI rejected model {me.model} for #{self.name}; retrying on fallback {fallback}.")
+            self._forced_model = fallback
+            self.fallback_info = format_fallback_notice(me.model, fallback, reason="was rejected by the CLI")
+            await self._start_inner()
+
+    async def _start_inner(self):
         """Boot the persistent agy CLI instance in stream-json mode and register init."""
         async with self.start_lock:
             if self.is_ready and self.proc is not None and self.proc.returncode is None:
@@ -162,7 +197,8 @@ class PersistentChannelWorker:
             if self.conv_id:
                 cmd.append(f"--conversation={self.conv_id}")
 
-            active_model = get_active_model()
+            from tools.bridge_models import get_channel_model_override
+            active_model = getattr(self, "_forced_model", None) or get_channel_model_override(self.channel_id, self.name) or get_active_model()
             if active_model:
                 cmd.append(f"--model={active_model}")
 
@@ -173,6 +209,7 @@ class PersistentChannelWorker:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=16 * 1024 * 1024,
             )
             self.started_at = time.time()
 
@@ -194,12 +231,21 @@ class PersistentChannelWorker:
                     pass
             except Exception as e:
                 print(f"[BridgeDaemon] ❌ Failed to initialize worker for #{self.name}: {e}")
+                stderr_text = ""
+                try:
+                    if proc.stderr:
+                        stderr_text = (await asyncio.wait_for(proc.stderr.read(4096), timeout=2.0)).decode("utf-8", errors="replace")
+                except Exception:
+                    pass
                 try:
                     proc.kill()
                 except Exception:
                     pass
                 self.proc = None
                 self.is_ready = False
+                from tools.bridge_models import ModelSelectionError, is_model_error
+                if active_model and not getattr(self, "_forced_model", None) and is_model_error(f"{stderr_text}\n{e}"):
+                    raise ModelSelectionError(active_model, stderr_text.strip()[:300]) from e
                 raise
 
             self.stderr_task = asyncio.create_task(self._drain_stderr())
@@ -223,12 +269,15 @@ class PersistentChannelWorker:
             self.proc = None
             print(f"[BridgeDaemon] Worker #{self.name} terminated.")
 
-    async def recycle(self, new_conv_id: str | None = None):
+    async def recycle(self, new_conv_id: str | None = None, keep_conv_id: bool = False):
         """Recycle worker process with an optional new conversation ID (e.g. post-compaction)."""
         await self.shutdown()
         if new_conv_id:
             self.conv_id = new_conv_id
             set_channel_session_id(self.channel_id, self.mode, new_conv_id)
+        elif keep_conv_id:
+            # Preserve current session conversation ID across process recycle (e.g. mid-turn steering)
+            pass
         else:
             self.conv_id = None
             clear_channel_session_id(self.channel_id, self.mode)
@@ -253,6 +302,8 @@ class PersistentChannelWorker:
         last_word_streak: int = 0,
         queued_at: float | None = None,
         is_settle_reinvocation: bool = False,
+        is_physical_mention: bool = False,
+        pre_settle_text: str | None = None,
         **kwargs,
     ):
         """Execute a conversational turn on the persistent warm worker via stdin/stdout streaming."""
@@ -273,6 +324,8 @@ class PersistentChannelWorker:
                 last_word_streak=last_word_streak,
                 queued_at=queued_at,
                 is_settle_reinvocation=True,
+                is_physical_mention=is_physical_mention,
+                pre_settle_text=pre_settle_text,
             )
 
         async with self.lock:
@@ -292,6 +345,8 @@ class PersistentChannelWorker:
                 last_word_streak=last_word_streak,
                 queued_at=queued_at,
                 is_settle_reinvocation=False,
+                is_physical_mention=is_physical_mention,
+                pre_settle_text=pre_settle_text,
             )
 
     async def _execute_turn_core(
@@ -311,6 +366,8 @@ class PersistentChannelWorker:
         last_word_streak: int = 0,
         queued_at: float | None = None,
         is_settle_reinvocation: bool = False,
+        is_physical_mention: bool = False,
+        pre_settle_text: str | None = None,
     ):
         from tools.bridge_runner import (
             steering_channels,
@@ -386,7 +443,15 @@ class PersistentChannelWorker:
             if not self.is_ready or self.proc is None or self.proc.returncode is not None:
                 await self.start()
 
-            # Non-blocking pre-turn drain of any stray residual bytes in stdout buffer
+            # Notify the channel on every turn that runs on a fallback model
+            fb_notice = getattr(self, "fallback_info", None)
+            if fb_notice and reply_target:
+                try:
+                    await getattr(reply_target, "channel", reply_target).send(fb_notice)
+                except Exception as ne:
+                    print(f"[BridgeDaemon] Warning delivering model fallback notice: {ne}")
+
+            # Non-blocking pre-turn drain of any stray residual bytes in stdout StreamReader buffer
             if self.proc and self.proc.stdout:
                 try:
                     buf = getattr(self.proc.stdout, "_buffer", None)
@@ -401,6 +466,18 @@ class PersistentChannelWorker:
 
             # 3. Format Prompt
             timer.mark_ctx_start()
+            if (
+                reply_target
+                and getattr(reply_target, "reference", None)
+                and not getattr(reply_target.reference, "resolved", None)
+            ):
+                try:
+                    ref_id = reply_target.reference.message_id
+                    if ref_id and hasattr(reply_target, "channel") and hasattr(reply_target.channel, "fetch_message"):
+                        reply_target.reference.resolved = await reply_target.channel.fetch_message(ref_id)
+                except Exception as fe:
+                    print(f"[BridgeDaemon] Warning pre-resolving message reference {ref_id}: {fe}")
+
             prepared_prompt = prepare_turn_prompt(
                 prompt=prompt,
                 mode=self.mode,
@@ -414,6 +491,7 @@ class PersistentChannelWorker:
 
             # 4. Set global process hooks for mid-turn steering and presence
             channel_active_procs[self.channel_id] = self.proc
+            channel_active_prompts[self.channel_id] = prompt
             update_beacon("PROCESSING", prompt, channel_id=self.channel_id)
             record_in_flight(
                 channel_id=self.channel_id,
@@ -429,15 +507,12 @@ class PersistentChannelWorker:
 
             ch_title = getattr(reply_target.channel, "name", "") if (reply_target and hasattr(reply_target, "channel")) else self.name
             turn_text = f"Crunching in #{ch_title}..." if ch_title else "Processing task..."
-            if apply_presence_fn:
-                try:
-                    await apply_presence_fn(custom_activity=turn_text, status_override="dnd")
-                except Exception:
-                    pass
 
             self.last_agy_error = None
             rules = get_runtime_rules()
             turn_start_time = time.time()
+            from tools.bridge_stream import get_latest_transcript_step_index
+            baseline_step_index = get_latest_transcript_step_index(self.conv_id)
 
             coord = TurnCoordinator(
                 channel_id=self.channel_id,
@@ -447,14 +522,21 @@ class PersistentChannelWorker:
                 status_msg=status_msg,
                 conv_id=self.conv_id,
                 turn_start_time=turn_start_time,
+                baseline_step_index=baseline_step_index,
             )
 
             try:
-                # 5. Send NDJSON user message on stdin
+                # 5. Send NDJSON user message on stdin immediately before Discord presence update
                 payload = {"event": "user", "message": {"content": prepared_prompt}}
                 timer.mark_send()
                 self.proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
                 await self.proc.stdin.drain()
+
+                if apply_presence_fn:
+                    try:
+                        await apply_presence_fn(custom_activity=turn_text, status_override="dnd")
+                    except Exception:
+                        pass
 
                 # 6. Stream events from stdout via TurnCoordinator
                 stream_parser = AgyStreamParser(conv_id=self.conv_id)
@@ -469,6 +551,18 @@ class PersistentChannelWorker:
                     get_last_agy_error=lambda: self.last_agy_error,
                 )
             except Exception as te:
+                if self.channel_id in steering_channels:
+                    steering_channels.discard(self.channel_id)
+                    timer.finish("STEERED")
+                    print(
+                        f"[BridgeDaemon] 🧭 Mid-turn steering in #{self.name}: cancelled active turn ({te}). "
+                        f"Purging worker state for incoming directive."
+                    )
+                    try:
+                        await self.recycle(keep_conv_id=True)
+                    except Exception as rec_err:
+                        print(f"[BridgeDaemon] Error recycling worker after steering: {rec_err}")
+                    return
                 timer.finish(f"FAILED: {te}")
                 print(f"[BridgeDaemon] ⚠️ Turn execution failed in #{self.name}: {te}. Recycling worker to purge pipe state...")
                 try:
@@ -494,7 +588,12 @@ class PersistentChannelWorker:
             # Steering check
             if self.channel_id in steering_channels:
                 steering_channels.discard(self.channel_id)
-                print(f"[BridgeDaemon] Mid-turn steering executed in #{self.name}. Discarding stale turn response.")
+                timer.finish("STEERED")
+                print(f"[BridgeDaemon] 🧭 Mid-turn steering executed in #{self.name}. Discarding stale turn response.")
+                try:
+                    await self.recycle(keep_conv_id=True)
+                except Exception as rec_err:
+                    print(f"[BridgeDaemon] Error recycling worker after steering: {rec_err}")
                 return
 
             # Fallback to on-disk transcript if output was empty or placeholder and not explicit silence
@@ -511,6 +610,12 @@ class PersistentChannelWorker:
                 self.conv_id = coord.conv_id
 
             final_text = output_response or "*(No output from agent)*"
+
+            if is_settle_reinvocation and pre_settle_text:
+                from tools.bridge_stream import reconcile_step_segments
+                from tools.task_settle import is_substantive_response
+                if is_substantive_response(final_text):
+                    final_text = reconcile_step_segments(pre_settle_text, final_text)
 
             # TaskSettle Protocol: Detect and settle premature turn exits while background tasks are pending
             if (
@@ -546,7 +651,10 @@ class PersistentChannelWorker:
                         },
                     )
                     if was_settled:
-                        return settled_text
+                        if settled_text and settled_text == final_text:
+                            pass
+                        else:
+                            return settled_text
                     elif settled_text:
                         final_text = settled_text
                 except Exception as settle_err:
@@ -571,6 +679,7 @@ class PersistentChannelWorker:
                 last_word_bot_id=last_word_bot_id,
                 last_word_bot_name=last_word_bot_name,
                 last_word_streak=last_word_streak,
+                is_physical_mention=is_physical_mention,
                 timer=timer,
             )
             return final_text
