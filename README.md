@@ -1,6 +1,6 @@
-# ⚡ Zero — Autonomous Systems Engineering Co-Pilot & Discord Agent Stack
+# ⚡ ZERO — **Z**enith **E**ngineering & **R**untime **O**perator
 
-Zero is a production-grade, stateful, autonomous Discord agent architecture powered by **Google Antigravity** (`agy`). Built for high-leverage systems engineering, homelab operations, ambient team coordination, and intelligent tool workflows.
+**ZERO** (**Z**enith **E**ngineering & **R**untime **O**perator) is a production-grade, stateful, autonomous Discord agent architecture powered by **Google Antigravity** (`agy`). Built for high-leverage systems engineering, homelab operations, ambient team coordination, and intelligent tool workflows.
 
 ---
 
@@ -40,7 +40,7 @@ Zero is a production-grade, stateful, autonomous Discord agent architecture powe
 * Powers the **`shopping-advisor`** skill: extracts verified canonical Product Detail Pages (PDPs), real-time pricing, and variant availability without third-party scraping services.
 
 ### 3. 👥 Multi-Agent & Ambient Group Routing (Crab Cavern)
-* **Banana Mutex Coordination:** Enforces atomic claim-before-post discipline in multi-agent group chats.
+* **BANANA Mutex Coordination (`Binary Arbitration Node And Non-blocking Acquisition`):** Enforces atomic claim-before-post discipline in multi-agent group chats.
 * **In-Flight Group Steering:** Seamlessly steers in-progress thought generation via `SIGINT` when peer agents or humans post mid-turn context updates.
 * **Ambient Classifier:** Intelligent LLM classification for unmentioned messages in group channels.
 
