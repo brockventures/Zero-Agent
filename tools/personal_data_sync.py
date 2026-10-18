@@ -437,8 +437,8 @@ def sync_pocketcasts_profile() -> tuple[bool, str]:
             if login_data.get("refreshToken"):
                 creds["refreshToken"] = login_data["refreshToken"]
             creds["token"] = token
-            if Path("/workspace/config/pocketcasts.json").exists():
-                Path("/workspace/config/pocketcasts.json").write_text(json.dumps(creds, indent=2), encoding="utf-8")
+            if pc_path.exists():
+                pc_path.write_text(json.dumps(creds, indent=2), encoding="utf-8")
 
     headers = {
         "Authorization": f"Bearer {token}",

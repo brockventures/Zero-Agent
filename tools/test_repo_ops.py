@@ -7,6 +7,9 @@ import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.repo_ops import prune_merged_branches, cleanup_worktrees, clean_repo
 
 

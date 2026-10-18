@@ -11,6 +11,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.bridge_safety import (
     CLI_LEAK_LINE_PATTERNS,
     _get_scrub_targets,

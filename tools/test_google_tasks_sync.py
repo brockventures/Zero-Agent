@@ -8,6 +8,9 @@ import unittest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.google_tasks_sync import (
     extract_task_id_from_notes,
     sync_tasks,

@@ -56,7 +56,11 @@ except Exception:
         ], capture_output=True, text=True, timeout=timeout)
 
     def _resolve_nas_config():
-        return os.environ.get("NAS_HOST_1_IP", os.environ.get("NAS_HOST_1_IP", "127.0.0.1")), os.environ.get("NAS_HOST_2_IP", os.environ.get("NAS_HOST_2_IP", "127.0.0.1")), os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
+        return (
+            os.environ.get("NAS_HOST_1_IP", "127.0.0.1"),
+            os.environ.get("NAS_HOST_2_IP", "127.0.0.1"),
+            os.environ.get("NAS_SSH_PORT") or str(49000 + 876),
+        )
 
 HOUSEHOLD_MEMBERS = {
     "Ryan Brock",

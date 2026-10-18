@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import json
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.market_standup import (
     datetime_to_snowflake,
     get_previous_evening_window,

@@ -4,6 +4,9 @@ import sqlite3
 import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.kalshi_paper_bot import (
     calculate_covariance_scaling,
     check_exposure_ceilings,

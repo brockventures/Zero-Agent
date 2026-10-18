@@ -33,6 +33,17 @@ except ImportError:
     DEFAULT_FROM = os.environ.get("ZERO_SENDER_EMAIL", "")
     DEFAULT_CC = os.environ.get("ZERO_NOTIFICATION_EMAIL", "")
 
+if (not DEFAULT_FROM or not DEFAULT_CC) and os.path.exists("/secrets/env.json"):
+    try:
+        with open("/secrets/env.json", encoding="utf-8") as _f:
+            _env = json.load(_f)
+            if not DEFAULT_FROM:
+                DEFAULT_FROM = _env.get("ZERO_SENDER_EMAIL", "")
+            if not DEFAULT_CC:
+                DEFAULT_CC = _env.get("ZERO_NOTIFICATION_EMAIL", "") or _env.get("ADMIN_CC_EMAIL", "")
+    except Exception:
+        pass
+
 GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024  # 24MB safe threshold under Gmail 25MB limit
 TIMEOUT = 30
@@ -62,7 +73,7 @@ def send_email(
 
     # Enforce Ryan CC policy
     effective_cc = cc.strip() if cc else ""
-    if DEFAULT_CC not in effective_cc and DEFAULT_CC not in to:
+    if DEFAULT_CC and DEFAULT_CC not in effective_cc and DEFAULT_CC not in to:
         effective_cc = f"{effective_cc}, {DEFAULT_CC}".strip(", ") if effective_cc else DEFAULT_CC
 
     msg = EmailMessage()

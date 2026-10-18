@@ -17,6 +17,9 @@ from actual.queries import (
 )
 
 import os
+for _p in ("/workspace", "/workspace/tools"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import nas_config
 ACTUAL_URL = os.environ.get("ACTUAL_SERVER_URL", f"http://{nas_config.HOST_2_IP}:5006")
 ACTUAL_PASSWORD = "zerobudget"

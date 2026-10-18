@@ -19,6 +19,9 @@ DEFAULT_RATE = "-5%"
 DEFAULT_VOLUME = 21
 
 ADB_PATH = "/workspace/tools/bin/adb"
+for _p in ("/workspace", "/workspace/tools"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import nas_config
 ADB_HOST = nas_config.HOST_2_IP
 ADB_PORT = "5037"

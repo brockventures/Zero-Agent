@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Regression test suite for Kalshi historical backtester & parameter calibration."""
 import unittest
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.kalshi_backtester import generate_historical_dataset, run_simulation, run_grid_search
 
 class TestKalshiBacktester(unittest.TestCase):

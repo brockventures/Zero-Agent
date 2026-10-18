@@ -1,3 +1,6 @@
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 #!/usr/bin/env python3
 """Unit and integration test suite for the Multi-Venue Quant Paper Trading Expansion."""
 

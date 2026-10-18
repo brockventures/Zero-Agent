@@ -12,6 +12,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.task_settle import (
     evaluate_and_settle_turn,
     extract_turn_lines,

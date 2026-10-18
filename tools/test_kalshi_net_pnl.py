@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from unittest.mock import patch
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.kalshi_paper_bot import (
     get_portfolio_status,
     execute_trade

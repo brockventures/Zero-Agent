@@ -10,6 +10,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.bridge_git_sync import get_current_git_sha, sync_git_on_reload
 
 

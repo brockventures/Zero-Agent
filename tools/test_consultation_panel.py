@@ -2,6 +2,9 @@
 """Unit tests for Consultation Panel Tool."""
 
 import unittest
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.consultation_panel import detect_domain, generate_panel_specs, format_decision_matrix
 
 

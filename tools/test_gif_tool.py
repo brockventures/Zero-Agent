@@ -5,6 +5,9 @@ Tests multi-tier dynamic search: Tenor -> Giphy -> Graceful Skip.
 """
 import unittest
 from unittest.mock import patch, MagicMock
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.gif_tool import (
     clean_slug_title,
     is_ocr_safe,

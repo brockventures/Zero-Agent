@@ -34,6 +34,9 @@ if str(WORKSPACE) not in sys.path:
 if str(WORKSPACE / "tools") not in sys.path:
     sys.path.insert(0, str(WORKSPACE / "tools"))
 
+for _p in ("/workspace", "/workspace/tools"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import send_mail
 import workspace_mcp
 

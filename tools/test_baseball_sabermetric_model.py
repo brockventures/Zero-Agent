@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Regression test suite for MLB Sabermetric Game Model with Run-Expectancy & Platoon Splits."""
 import unittest
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.baseball_daily_quant import calculate_game_run_expectancy
 
 class TestBaseballSabermetricModel(unittest.TestCase):

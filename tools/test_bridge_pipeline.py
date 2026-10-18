@@ -6,6 +6,9 @@ import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.bridge_pipeline import (
     TurnTimer,
     prepare_turn_prompt,

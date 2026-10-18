@@ -7,6 +7,9 @@ import urllib.error
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 from zoneinfo import ZoneInfo
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.kalshi_paper_bot import (
     reconcile_live_orders_and_positions,
     http_get_json

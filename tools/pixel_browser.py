@@ -27,7 +27,9 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.request
 
-sys.path.insert(0, "/workspace")
+for _p in ("/workspace", "/workspace/tools"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 ADB_BIN = "/workspace/tools/bin/adb"
 if not os.path.exists(ADB_BIN):
@@ -37,33 +39,41 @@ import nas_config
 HOST2_IP = nas_config.HOST_2_IP
 ADB_PORT = "5037"
 USB_SERIAL = "36261FDJG0003L"
-WIFI_DEVICE = os.environ.get("PIXEL_WIFI_ADB", "")
+
+
+def _resolve_wifi_device() -> str:
+    val = os.environ.get("PIXEL_WIFI_ADB", "").strip()
+    if val:
+        return val
+    env_file = Path("/secrets/env.json")
+    if env_file.exists():
+        try:
+            data = json.loads(env_file.read_text(encoding="utf-8"))
+            return str(data.get("PIXEL_WIFI_ADB", "")).strip()
+        except Exception:
+            pass
+    return ""
+
+
+WIFI_DEVICE = _resolve_wifi_device()
 CDP_PORT = 9223
 IP_WEBCAM_URL = f"http://{HOST2_IP}:3333/status.json"
 
 
 def get_adb_command_prefix() -> Tuple[List[str], str]:
-    """Resolve ADB command prefix, checking local connected devices first then Host 2."""
+    """Resolve ADB command prefix, checking local connected devices, Host 2 USB, then Wi-Fi."""
     # 1. Check local connected devices
     try:
         res = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, timeout=2)
         for line in res.stdout.splitlines():
             if "	device" in line and not line.startswith("List"):
                 dev = line.split("	")[0].strip()
-                return [ADB_BIN, "-s", dev], "local"
+                if dev:
+                    return [ADB_BIN, "-s", dev], "local"
     except Exception:
         pass
 
-    # 2. Try connecting to WiFi device locally if offline
-    try:
-        subprocess.run([ADB_BIN, "connect", WIFI_DEVICE], capture_output=True, text=True, timeout=3)
-        res = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, timeout=2)
-        if f"{WIFI_DEVICE}	device" in res.stdout:
-            return [ADB_BIN, "-s", WIFI_DEVICE], "local"
-    except Exception:
-        pass
-
-    # 3. Try USB via Host 2 ADB server
+    # 2. Try USB via Host 2 ADB server
     try:
         res = subprocess.run(
             [ADB_BIN, "-H", HOST2_IP, "-P", ADB_PORT, "devices"],
@@ -76,8 +86,19 @@ def get_adb_command_prefix() -> Tuple[List[str], str]:
     except Exception:
         pass
 
-    # Fallback to local wifi device
-    return [ADB_BIN, "-s", WIFI_DEVICE], "local"
+    # 3. Try connecting to Wi-Fi device locally if configured
+    if WIFI_DEVICE:
+        try:
+            subprocess.run([ADB_BIN, "connect", WIFI_DEVICE], capture_output=True, text=True, timeout=3)
+            res = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, timeout=2)
+            if f"{WIFI_DEVICE}	device" in res.stdout:
+                return [ADB_BIN, "-s", WIFI_DEVICE], "local"
+        except Exception:
+            pass
+        return [ADB_BIN, "-s", WIFI_DEVICE], "local"
+
+    # Fallback to Host 2 USB ADB server
+    return [ADB_BIN, "-H", HOST2_IP, "-P", ADB_PORT, "-s", USB_SERIAL], "usb"
 
 
 def run_adb_shell(cmd_args: List[str], timeout: int = 10) -> subprocess.CompletedProcess:

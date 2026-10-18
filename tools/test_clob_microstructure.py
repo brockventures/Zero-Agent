@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Regression test suite for Kalshi CLOB orderbook depth, VWAP, and slippage modeling."""
 import unittest
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.kalshi_paper_bot import calculate_vwap_and_slippage
 
 class TestKalshiCLOBMicrostructure(unittest.TestCase):

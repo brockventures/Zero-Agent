@@ -12,6 +12,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.bridge_commands import (
     MODEL_ALIASES,
     ON_DEMAND_TRIGGERS,

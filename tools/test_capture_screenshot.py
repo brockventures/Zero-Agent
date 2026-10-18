@@ -15,6 +15,9 @@ if "playwright" not in sys.modules:
         sys.modules["playwright"] = MagicMock()
         sys.modules["playwright.sync_api"] = MagicMock()
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.capture_screenshot import (
     VIEWPORT_PRESETS,
     capture_and_deliver,

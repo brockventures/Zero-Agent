@@ -78,7 +78,7 @@ def get_db_connection():
     host = os.environ.get("IVY_DB_HOST")
     if not host:
         try:
-            from tools.sidecars import HOST_2_IP
+            from tools.nas_config import HOST_2_IP
             host = HOST_2_IP
         except Exception:
             host = "127.0.0.1"

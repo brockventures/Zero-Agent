@@ -5,6 +5,9 @@ import unittest
 from unittest.mock import MagicMock, call, patch
 import urllib.error
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.pixel_browser import (
     check_printer_conflict,
     get_adb_command_prefix,

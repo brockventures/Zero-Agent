@@ -36,6 +36,9 @@ import requests
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
+for _p in ("/workspace", "/workspace/tools"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import nas_config
 OCTOPRINT_DEFAULT_URL = f"http://{nas_config.HOST_2_IP}:8888"
 OCTOPRINT_DEFAULT_KEY = "8FC0C5F37CD14D4384100ED682682A80"

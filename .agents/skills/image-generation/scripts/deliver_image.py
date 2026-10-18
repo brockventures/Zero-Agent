@@ -35,6 +35,16 @@ KNOWN_CHANNELS = {
     "finances": 1544955532765560924,
     "homelab": 1544955535722545253,
     "shopping": 1544955538033348618,
+    "baseball": 1548196929308065893,
+    "projects": 1548196930788524094,
+    "3d-print": 1555973316752449576,
+    "agora": 1558202642663211169,
+    "server-updates": 1330447543477338202,
+    "debug-huddle": 1549555629222404096,
+    "side-project": 1551465050072416286,
+    "mirrormere": 1552732003076669460,
+    "brock-house": 1550577908811178095,
+    "vault": 1550577910757458015,
     "general": 1534452820995080192,
     "signals": 1534436119888793750,
     "staff-comms": 1534436119888793750,
@@ -66,6 +76,14 @@ def get_discord_token() -> str:
     token_file = Path("/secrets/discord_token")
     if token_file.exists():
         return token_file.read_text().strip()
+    env_file = Path("/secrets/env.json")
+    if env_file.exists():
+        try:
+            data = json.loads(env_file.read_text(encoding="utf-8"))
+            if data.get("DISCORD_BOT_TOKEN"):
+                return str(data["DISCORD_BOT_TOKEN"]).strip()
+        except Exception:
+            pass
     raise RuntimeError("Discord bot token not found in DISCORD_BOT_TOKEN or /secrets/discord_token")
 
 

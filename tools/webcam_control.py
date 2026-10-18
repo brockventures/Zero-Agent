@@ -23,10 +23,20 @@ ADB_BIN = "/workspace/tools/bin/adb"
 if not os.path.exists(ADB_BIN):
     ADB_BIN = "/workspace/scratch/platform-tools/platform-tools/adb"
 
+for _p in ("/workspace", "/workspace/tools"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 USB_SERIAL = "36261FDJG0003L"
 import nas_config
 HOST2_IP = nas_config.HOST_2_IP
-WIFI_DEVICE = os.environ.get("WEBCAM_WIFI_ADB", "")
+WIFI_DEVICE = os.environ.get("WEBCAM_WIFI_ADB", "").strip()
+if not WIFI_DEVICE and os.path.exists("/secrets/env.json"):
+    try:
+        with open("/secrets/env.json", encoding="utf-8") as _f:
+            WIFI_DEVICE = str(json.load(_f).get("WEBCAM_WIFI_ADB", "")).strip()
+    except Exception:
+        pass
 
 # Model and bed coordinate anchors for 1080x1920 portrait frames
 MODEL_CENTER_X = 540
@@ -62,15 +72,18 @@ def get_adb_context(ensure_forward: bool = True):
     except Exception:
         pass
 
-    # Fallback to Wi-Fi
-    try:
-        subprocess.run([ADB_BIN, "connect", WIFI_DEVICE], capture_output=True, timeout=3)
-        if ensure_forward:
-            subprocess.run([ADB_BIN, "-s", WIFI_DEVICE, "forward", "tcp:3333", "tcp:3333"], capture_output=True, timeout=3)
-    except Exception:
-        pass
-    dev_ip = WIFI_DEVICE.split(":")[0]
-    return [ADB_BIN, "-s", WIFI_DEVICE], f"http://{dev_ip}:3333", "wifi"
+    # Fallback to Wi-Fi if configured, otherwise Host 2 USB
+    if WIFI_DEVICE:
+        try:
+            subprocess.run([ADB_BIN, "connect", WIFI_DEVICE], capture_output=True, timeout=3)
+            if ensure_forward:
+                subprocess.run([ADB_BIN, "-s", WIFI_DEVICE, "forward", "tcp:3333", "tcp:3333"], capture_output=True, timeout=3)
+        except Exception:
+            pass
+        dev_ip = WIFI_DEVICE.split(":")[0]
+        return [ADB_BIN, "-s", WIFI_DEVICE], f"http://{dev_ip}:3333", "wifi"
+
+    return [ADB_BIN, "-H", HOST2_IP, "-P", "5037", "-s", USB_SERIAL], f"http://{HOST2_IP}:3333", "usb"
 
 
 def is_port_open():

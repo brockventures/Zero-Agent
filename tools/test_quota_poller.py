@@ -13,6 +13,9 @@ _WORKSPACE = Path(__file__).resolve().parent.parent
 if str(_WORKSPACE) not in sys.path:
     sys.path.insert(0, str(_WORKSPACE))
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.quota_poller import (
     format_attribution_text,
     format_quota_status_text,

@@ -54,7 +54,7 @@ except ImportError:
         from nas_config import run_ssh, HOST_2_IP
     except ImportError:
         run_ssh = None
-        HOST_2_IP = os.environ.get("HOST_2_IP", "127.0.0.1")
+        HOST_2_IP = os.environ.get("NAS_HOST_2_IP", os.environ.get("HOST_2_IP", "127.0.0.1"))
 
 PT_TZ = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path("/workspace/data")

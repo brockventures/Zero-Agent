@@ -4,6 +4,9 @@ import sqlite3
 import unittest
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.kalshi_paper_bot import (
     calculate_multi_level_ofi,
     calculate_avellaneda_stoikov_quote,

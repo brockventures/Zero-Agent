@@ -3,6 +3,9 @@ import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.meal_planner_proposal import (
     is_dinner_recipe,
     filter_eligible_recipes,

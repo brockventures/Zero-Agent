@@ -42,6 +42,10 @@ def get_access_token():
         return json.loads(resp.read().decode())["access_token"]
 
 def format_spreadsheet(sheet_id=DEFAULT_SHEET_ID):
+    import sys
+    for _p in ("/workspace", "/workspace/tools"):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
     from push_friends_to_sheets import push_to_google_sheets
     return push_to_google_sheets(sheet_id)
 

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Regression test suite for October MLB Postseason Monte Carlo Tournament Model."""
 import unittest
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.baseball_playoff_model import (
     resolve_dynamic_playoff_field,
     simulate_series_with_rotation,

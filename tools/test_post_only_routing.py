@@ -4,6 +4,9 @@ import sqlite3
 import unittest
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.kalshi_paper_bot import submit_post_only_order, process_resting_orders
 
 PT = ZoneInfo("America/Los_Angeles")

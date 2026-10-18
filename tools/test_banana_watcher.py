@@ -3,6 +3,9 @@ from unittest.mock import patch, MagicMock
 import json
 import time
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.banana_watcher import check_channel_and_evaluate, STALL_THRESHOLD_SECONDS
 
 class TestBananaWatcher(unittest.TestCase):

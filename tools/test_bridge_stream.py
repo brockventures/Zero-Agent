@@ -13,6 +13,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.bridge_stream import (
     AgyStreamParser,
     format_agy_error_message,

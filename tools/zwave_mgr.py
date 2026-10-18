@@ -14,6 +14,9 @@ from pathlib import Path
 import aiohttp
 
 STATUS_FILE = Path("/workspace/data/zwave_status.json")
+for _p in ("/workspace", "/workspace/tools"):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import nas_config
 WS_URL = os.environ.get("ZWAVE_WS_URL", f"ws://{nas_config.HOST_1_IP}:3000")
 

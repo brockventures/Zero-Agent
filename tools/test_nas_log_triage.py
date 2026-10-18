@@ -1,5 +1,8 @@
 import unittest
 from unittest.mock import patch
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.nas_log_triage import run_nas_log_review
 
 class TestNasLogTriage(unittest.TestCase):

@@ -16,6 +16,7 @@ import os
 import random
 import re
 import sys
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 WORKSPACE = "/workspace"
@@ -36,7 +37,22 @@ except ImportError:
 
 _, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
-MEALIE_BASE = os.environ.get("MEALIE_BASE_URL", "https://mealie.brock.ventures")
+def _resolve_mealie_base() -> str:
+    val = os.environ.get("MEALIE_BASE_URL", "").strip()
+    if val:
+        return val.rstrip("/")
+    env_file = Path("/secrets/env.json")
+    if env_file.exists():
+        try:
+            data = json.loads(env_file.read_text(encoding="utf-8"))
+            if data.get("MEALIE_BASE_URL"):
+                return str(data["MEALIE_BASE_URL"]).strip().rstrip("/")
+        except Exception:
+            pass
+    return "https://mealie.brock.ventures"
+
+
+MEALIE_BASE = _resolve_mealie_base()
 FAMILY_CALENDAR_ID = "family05249951047154432652@group.calendar.google.com"
 
 

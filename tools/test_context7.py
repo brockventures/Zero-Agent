@@ -6,6 +6,9 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.context7 import search_libraries, fetch_library_context, query_docs
 
 

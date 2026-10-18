@@ -1,5 +1,8 @@
 import unittest
 from datetime import datetime, timezone, timedelta
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 from tools.kalshi_cross_bracket import (
     calculate_taker_fee,
     check_horizon,
