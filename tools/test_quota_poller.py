@@ -272,6 +272,29 @@ class TestQuotaPoller(unittest.TestCase):
         self.assertIn("5.00%", attr_text)
         self.assertIn("zero-chat", attr_text)
 
+    def test_monotonic_low_water_mark_prevents_jitter_double_counting(self):
+        # 1. Start at 99.0%
+        b1 = [{"bucket_id": "gemini-weekly", "name": "W", "window": "weekly", "remaining_fraction": 0.990, "reset_time": "2026-10-24T00:06:03Z", "group_name": "Gemini"}]
+        sample_quota(source="test", conn=self.conn, db_path=self.db_path, custom_buckets=b1)
+
+        # 2. Burn down to 98.0% (delta = 0.010)
+        b2 = [{"bucket_id": "gemini-weekly", "name": "W", "window": "weekly", "remaining_fraction": 0.980, "reset_time": "2026-10-24T00:06:03Z", "group_name": "Gemini"}]
+        r2 = sample_quota(source="test", conn=self.conn, db_path=self.db_path, custom_buckets=b2)
+        self.assertAlmostEqual(r2["snapshots"][0]["delta_fraction"], 0.010, places=5)
+
+        # 3. Rolling window ticks upward to 98.5% (delta = 0.0)
+        b3 = [{"bucket_id": "gemini-weekly", "name": "W", "window": "weekly", "remaining_fraction": 0.985, "reset_time": "2026-10-24T00:06:03Z", "group_name": "Gemini"}]
+        r3 = sample_quota(source="test", conn=self.conn, db_path=self.db_path, custom_buckets=b3)
+        self.assertAlmostEqual(r3["snapshots"][0]["delta_fraction"], 0.0, places=5)
+
+        # 4. Drops back to 97.9% — only 0.1% below the 98.0% low-water mark (NOT 0.6% from 98.5%!)
+        b4 = [{"bucket_id": "gemini-weekly", "name": "W", "window": "weekly", "remaining_fraction": 0.979, "reset_time": "2026-10-24T00:06:03Z", "group_name": "Gemini"}]
+        r4 = sample_quota(source="test", conn=self.conn, db_path=self.db_path, custom_buckets=b4)
+        self.assertAlmostEqual(r4["snapshots"][0]["delta_fraction"], 0.001, places=5)
+
+        attr = get_quota_attribution(hours=1.0, bucket_id="gemini-weekly", conn=self.conn, db_path=self.db_path)
+        self.assertAlmostEqual(attr["total_quota_pct_burned"], 1.1, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -189,7 +189,24 @@ def sample_quota(
                         is_reset = 1
                         delta_frac = 0.0
                     else:
-                        delta_frac = max(0.0, prev_frac - curr_frac)
+                        # Compare against the cycle's monotonic low-water mark (minimum remaining_fraction
+                        # seen in the current reset_time cycle) so small upward rolling-window ticks
+                        # do not get re-counted as fresh burn when remaining_fraction steps back down.
+                        cur.execute(
+                            """
+                            SELECT MIN(remaining_fraction) AS min_rem
+                            FROM quota_snapshots
+                            WHERE bucket_id = ? AND reset_time = ?;
+                            """,
+                            (b_id, curr_reset),
+                        )
+                        min_row = cur.fetchone()
+                        low_water = (
+                            float(min_row["min_rem"])
+                            if (min_row is not None and min_row["min_rem"] is not None)
+                            else prev_frac
+                        )
+                        delta_frac = max(0.0, low_water - curr_frac)
 
             snapshot_record = {
                 "timestamp": ts,
@@ -358,17 +375,37 @@ def get_quota_attribution(
         channel_tokens: Dict[str, Dict[str, int]] = {}
         external_burn_fraction = 0.0
 
+        low_water_frac: Optional[float] = (
+            float(snapshots[0]["remaining_fraction"]) if snapshots else None
+        )
+        low_water_ts: Optional[float] = (
+            float(snapshots[0]["timestamp"]) if snapshots else None
+        )
+
         for i in range(1, len(snapshots)):
             s_prev = snapshots[i - 1]
             s_curr = snapshots[i]
 
-            delta = float(s_curr.get("delta_fraction") or 0.0)
-            if delta <= 0.0 or s_curr.get("is_reset", 0):
+            curr_frac = float(s_curr.get("remaining_fraction") or 0.0)
+            curr_ts = float(s_curr["timestamp"])
+
+            if s_curr.get("is_reset", 0) or low_water_frac is None:
+                low_water_frac = curr_frac
+                low_water_ts = curr_ts
                 continue
 
+            # Monotonic low-water clamping: only count net new burn below the lowest
+            # remaining_fraction already accounted for in the current cycle.
+            if curr_frac >= low_water_frac:
+                continue
+
+            delta = low_water_frac - curr_frac
+            t_start = low_water_ts if low_water_ts is not None else float(s_prev["timestamp"])
+            t_end = curr_ts
+            low_water_frac = curr_frac
+            low_water_ts = curr_ts
+
             total_burn_fraction += delta
-            t_start = s_prev["timestamp"]
-            t_end = s_curr["timestamp"]
 
             # Query token_usage turns that occurred strictly within this interval
             cur.execute(
