@@ -18,7 +18,20 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from mcp.server.mcpserver import MCPServer
 
-SECRETS_PATH = "/secrets/google_oauth.json" if os.path.exists("/secrets/google_oauth.json") else os.environ.get("GOOGLE_OAUTH_PATH", os.environ.get("GOOGLE_OAUTH_CREDENTIALS", "/workspace/config/google_oauth.json"))
+def _resolve_secrets_path() -> str:
+    """Dynamically resolve Google OAuth credentials path so in-memory imports never cache a moved path."""
+    for candidate in (
+        "/secrets/google_oauth.json",
+        os.environ.get("GOOGLE_OAUTH_PATH", ""),
+        os.environ.get("GOOGLE_OAUTH_CREDENTIALS", ""),
+        "/workspace/config/google_oauth.json",
+    ):
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return "/secrets/google_oauth.json"
+
+
+SECRETS_PATH = _resolve_secrets_path()
 ACCOUNT = os.environ.get("GOOGLE_ACCOUNT", "user@example.com")
 PT = ZoneInfo("America/Los_Angeles")
 TIMEOUT = 30
@@ -51,10 +64,13 @@ def _get_access_token() -> str:
     if _cached_token and now < _token_expiry - 60:
         return _cached_token
 
-    if not os.path.exists(SECRETS_PATH):
-        raise FileNotFoundError(f"OAuth credentials not found at {SECRETS_PATH}")
+    global SECRETS_PATH
+    secrets_path = _resolve_secrets_path()
+    SECRETS_PATH = secrets_path
+    if not os.path.exists(secrets_path):
+        raise FileNotFoundError(f"OAuth credentials not found at {secrets_path}")
 
-    creds = load_credentials(SECRETS_PATH)
+    creds = load_credentials(secrets_path)
 
     data = urllib.parse.urlencode({
         "client_id": creds["client_id"],

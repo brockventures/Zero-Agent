@@ -38,6 +38,15 @@ _last_bot_status_mtime = 0.0
 
 async def _run_sidecar_job_async(job_id: str, job_name: str, func, *args, **kwargs):
     """Run synchronous sidecar jobs in a worker thread to keep the asyncio event loop unblocked."""
+    import sys as _sys
+    import importlib as _importlib
+    if "tools.workspace_mcp" in _sys.modules:
+        _wmcp = _sys.modules["tools.workspace_mcp"]
+        if not hasattr(_wmcp, "_resolve_secrets_path") or not os.path.exists(getattr(_wmcp, "SECRETS_PATH", "")):
+            try:
+                _importlib.reload(_wmcp)
+            except Exception:
+                pass
     from tools.sidecars import run_sidecar_job
     return await asyncio.to_thread(run_sidecar_job, job_id, job_name, func, *args, **kwargs)
 

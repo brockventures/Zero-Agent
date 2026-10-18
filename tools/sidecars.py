@@ -178,7 +178,12 @@ def log_execution(job_id: str, name: str, status: str, duration_sec: float, summ
     if extra:
         entry["extra"] = extra
 
-    if ("pytest" in sys.modules or "unittest" in sys.modules) and str(EXECUTION_STATUS_FILE).startswith("/workspace/data"):
+    is_test_runner = (
+        "PYTEST_CURRENT_TEST" in os.environ
+        or "pytest" in sys.modules
+        or ("unittest" in sys.modules and any(k.startswith("test_") or ".test_" in k for k in sys.modules))
+    )
+    if is_test_runner and str(EXECUTION_STATUS_FILE).startswith("/workspace/data"):
         return entry
 
     with _log_lock:
@@ -1432,6 +1437,10 @@ def run_weekly_meal_proposal() -> tuple[bool, str]:
 def run_tasks_sync(quiet: bool = True, *args, **kwargs) -> tuple[bool, str, dict]:
     """Execute two-way synchronization between tasks.json and Google Tasks."""
     try:
+        import importlib
+        import tools.workspace_mcp
+        if not hasattr(tools.workspace_mcp, "_resolve_secrets_path") or not os.path.exists(getattr(tools.workspace_mcp, "SECRETS_PATH", "")):
+            importlib.reload(tools.workspace_mcp)
         from tools.google_tasks_sync import sync_tasks
         res = sync_tasks(quiet=quiet)
         ok = res.get("ok", True)

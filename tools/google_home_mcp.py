@@ -65,6 +65,12 @@ def get_access_token() -> str:
     if _cached_token and now < _token_expiry - 60:
         return _cached_token
 
+    global SECRETS_PATH
+    if not os.path.exists(SECRETS_PATH):
+        for cand in ("/secrets/google_home_oauth.json", "/secrets/google_oauth.json", "/workspace/config/google_home_oauth.json", "/workspace/config/google_oauth.json"):
+            if os.path.exists(cand):
+                SECRETS_PATH = cand
+                break
     if not os.path.exists(SECRETS_PATH):
         raise FileNotFoundError(f"OAuth credentials not found at {SECRETS_PATH}")
 
