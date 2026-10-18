@@ -559,10 +559,13 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
     except Exception:
         pass
 
-    # 6. Persistent MCP Daemon Health
+    # 6. Persistent MCP Daemon Health (with auto-heal on transient drop or reboot race)
     try:
-        from tools.mcp_daemon import get_status
+        from tools.mcp_daemon import ensure_mcp_daemon_running, get_status
         mcp_stat = get_status()
+        if not mcp_stat.get("healthy"):
+            ensure_mcp_daemon_running()
+            mcp_stat = get_status()
         if not mcp_stat.get("healthy"):
             failures.append(f"Persistent MCP Daemon degraded or stopped: {mcp_stat.get('servers')}")
     except Exception as me:

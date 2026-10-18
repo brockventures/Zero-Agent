@@ -123,6 +123,20 @@ def is_process_running(pid: int) -> bool:
     except OSError:
         return False
 
+def is_mcp_daemon_process(pid: int) -> bool:
+    """Verify the process exists and its cmdline is actually mcp_daemon.py (prevents PID-reuse collisions on container boot)."""
+    if not is_process_running(pid):
+        return False
+    try:
+        cmdline_path = Path(f"/proc/{pid}/cmdline")
+        if cmdline_path.exists():
+            cmdline = cmdline_path.read_bytes().decode("utf-8", errors="replace")
+            return "mcp_daemon.py" in cmdline
+    except Exception:
+        pass
+    return True
+
+
 def get_daemon_pid() -> int | None:
     """Read the current daemon PID from PID_FILE if running."""
     if not PID_FILE.exists():
@@ -130,7 +144,7 @@ def get_daemon_pid() -> int | None:
     try:
         with open(PID_FILE, "r") as f:
             pid = int(f.read().strip())
-        if is_process_running(pid):
+        if is_mcp_daemon_process(pid):
             return pid
         else:
             PID_FILE.unlink(missing_ok=True)
@@ -317,6 +331,8 @@ def ensure_mcp_daemon_running() -> bool:
     if status["running"] and status["healthy"]:
         sync_mcp_config_json()
         return True
+    if status["running"]:
+        stop_daemon()
     return start_daemon_background()
 
 if __name__ == "__main__":
