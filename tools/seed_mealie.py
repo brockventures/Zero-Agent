@@ -17,6 +17,8 @@ def get_env_config():
 
 _env = get_env_config()
 MEALIE_URL = _env.get("MEALIE_BASE_URL", "http://127.0.0.1:9090")
+AUTH_USER = os.environ.get("MEALIE_USER", _env.get("MEALIE_USER", ""))
+AUTH_PASS = os.environ.get("MEALIE_PASS", _env.get("MEALIE_PASS", ""))
 
 def get_token():
     if _env.get("MEALIE_API_TOKEN"):

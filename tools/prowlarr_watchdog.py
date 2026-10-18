@@ -136,7 +136,7 @@ def _auto_remediate_allowed_hosts(api_key: str) -> bool:
             cfg = json.loads(resp.read().decode())
 
         current_hosts = cfg.get("allowedHosts", "")
-        if current_hosts and "127.0.0.1" in current_hosts and "host" in current_hosts:
+        if current_hosts and HOST_1_IP in current_hosts and "host" in current_hosts:
             return True
 
         cfg["allowedHosts"] = HOMELAB_ALLOWED_HOSTS

@@ -31,8 +31,18 @@ def _resolve_secrets_path() -> str:
     return "/secrets/google_oauth.json"
 
 
+def _load_env_secrets() -> dict:
+    if os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json", "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+_ENV_SECRETS = _load_env_secrets()
 SECRETS_PATH = _resolve_secrets_path()
-ACCOUNT = os.environ.get("GOOGLE_ACCOUNT", "user@example.com")
+ACCOUNT = os.environ.get("GOOGLE_ACCOUNT") or _ENV_SECRETS.get("GOOGLE_ACCOUNT", "user@example.com")
 PT = ZoneInfo("America/Los_Angeles")
 TIMEOUT = 30
 
@@ -192,8 +202,8 @@ def gmail_get_thread(thread_id: str) -> str:
         return json.dumps({"ok": False, "error": str(e)})
 
 def _get_email_defaults() -> tuple[str, str]:
-    sender = os.environ.get("ZERO_SENDER_EMAIL", os.environ.get("ZERO_EMAIL", ""))
-    notify = os.environ.get("ZERO_NOTIFICATION_EMAIL", os.environ.get("OWNER_EMAIL", ""))
+    sender = os.environ.get("ZERO_SENDER_EMAIL") or os.environ.get("ZERO_EMAIL") or _ENV_SECRETS.get("ZERO_SENDER_EMAIL", "")
+    notify = os.environ.get("ZERO_NOTIFICATION_EMAIL") or os.environ.get("OWNER_EMAIL") or _ENV_SECRETS.get("ZERO_NOTIFICATION_EMAIL") or _ENV_SECRETS.get("OWNER_EMAIL", "")
     if not sender or not notify:
         env_path = Path("/workspace/.env")
         if env_path.exists():
@@ -349,7 +359,7 @@ def gmail_send_message(to: str, subject: str, body: str, thread_id: str = "", fr
 
 FAMILY_CALENDARS = {
     "primary": "Ryan",
-    os.environ.get("EMILY_EMAIL", "emily@example.com"): "Emily",
+    (os.environ.get("EMILY_EMAIL") or _ENV_SECRETS.get("EMILY_EMAIL", "emily@example.com")): "Emily",
     "family05249951047154432652@group.calendar.google.com": "Family",
     "c_f713b3055b57e1d48ca0962e78773a57b609cad582b1bf714d84b0b8c8af0e2c@group.calendar.google.com": "Roy Cloud",
 }

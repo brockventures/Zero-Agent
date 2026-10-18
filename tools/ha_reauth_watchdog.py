@@ -109,7 +109,15 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(2.0)
             try:
-                if sock.connect_ex((os.environ.get("HUE_BRIDGE_IP", "127.0.0.1"), 6638)) == 0:
+                _zha_ip = os.environ.get("ZHA_COORDINATOR_IP") or os.environ.get("HUE_BRIDGE_IP")
+                if not _zha_ip and os.path.exists("/secrets/env.json"):
+                    try:
+                        with open("/secrets/env.json") as _ef:
+                            _ed = json.load(_ef)
+                            _zha_ip = _ed.get("ZHA_COORDINATOR_IP") or _ed.get("HUE_BRIDGE_IP")
+                    except Exception:
+                        pass
+                if sock.connect_ex((_zha_ip or "127.0.0.1", 6638)) == 0:
                     reload_url = f"{base_url}/api/config/config_entries/entry/{entry_id}/reload"
                     rel_req = urllib.request.Request(
                         reload_url,

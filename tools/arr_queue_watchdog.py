@@ -35,12 +35,6 @@ AUDIT_LOG_FILE = Path("/workspace/data/arr_triage_audit.jsonl")
 HEALTH_DEBOUNCE_CRITICAL = 900       # 15 minutes for critical outages (download client down, disk full)
 HEALTH_DEBOUNCE_NON_CRITICAL = 7200  # 120 minutes (2h) grace period for unclassified warnings
 
-HOMELAB_ALLOWED_HOSTS = (
-    "localhost,127.0.0.1,127.0.0.1,127.0.0.1,100.112.209.97,100.127.101.77,"
-    "*.local,*.home,*.lan,*.localdomain,*.brock.ventures,*.ts.net," +
-    os.environ.get("ARR_LOCAL_HOSTS", "host,sonarr,radarr,prowlarr,overseerr,seerr,maintainerr,sabnzbd,tautulli,plex")
-)
-
 for _p in ["/workspace", "/workspace/tools"]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -50,7 +44,13 @@ try:
 except ImportError:
     from nas_config import resolve_nas_config
 
-HOST_1_IP, _, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
+HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
+
+HOMELAB_ALLOWED_HOSTS = (
+    f"localhost,127.0.0.1,{HOST_1_IP},{HOST_2_IP},100.112.209.97,100.127.101.77,"
+    "*.local,*.home,*.lan,*.localdomain,*.brock.ventures,*.ts.net," +
+    os.environ.get("ARR_LOCAL_HOSTS", "host,sonarr,radarr,prowlarr,overseerr,seerr,maintainerr,sabnzbd,tautulli,plex")
+)
 
 SONARR_PORT = 8989
 RADARR_PORT = 7878
@@ -200,7 +200,7 @@ def _auto_remediate_allowed_hosts(app_name: str, port: int, api_key: str) -> boo
             cfg = json.loads(resp.read().decode())
 
         current_hosts = cfg.get("allowedHosts", "")
-        if current_hosts and "127.0.0.1" in current_hosts and "brock.ventures" in current_hosts and cfg.get("trustCgnatIpAddresses") is True:
+        if current_hosts and HOST_1_IP in current_hosts and "brock.ventures" in current_hosts and cfg.get("trustCgnatIpAddresses") is True:
             return True
 
         cfg["allowedHosts"] = HOMELAB_ALLOWED_HOSTS

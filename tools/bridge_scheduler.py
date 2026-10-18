@@ -973,6 +973,16 @@ async def dispatch_scheduled_prompt(
 
         # Do not send noisy interstitial "scheduled" placeholder messages into Discord scrollback
         mode = "home" if target_cid == TARGET_CHANNEL_ID else "external"
+        _model_override = "gemini-3.8-flash-low"
+        try:
+            from tools.scheduler_tool import load_schedule as _load_sched
+            for _j in _load_sched():
+                if (job_id and _j.get("id") == job_id) or (job_name and _j.get("name") == job_name):
+                    if _j.get("model_override"):
+                        _model_override = _j["model_override"]
+                    break
+        except Exception:
+            pass
         await turn_queue.put({
             "prompt": prompt,
             "status_msg": None,
@@ -981,7 +991,7 @@ async def dispatch_scheduled_prompt(
             "is_steer": False,
             "mode": mode,
             "channel_id": target_cid,
-            "model_override": job.get("model_override") or "gemini-3.8-flash-low",
+            "model_override": _model_override,
         })
 
 
