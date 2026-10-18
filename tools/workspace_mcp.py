@@ -18,7 +18,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from mcp.server.mcpserver import MCPServer
 
-SECRETS_PATH = "/workspace/config/google_oauth.json" if os.path.exists("/workspace/config/google_oauth.json") else os.environ.get("GOOGLE_OAUTH_PATH", os.environ.get("GOOGLE_OAUTH_CREDENTIALS", "/secrets/google_oauth.json"))
+SECRETS_PATH = "/secrets/google_oauth.json" if os.path.exists("/secrets/google_oauth.json") else os.environ.get("GOOGLE_OAUTH_PATH", os.environ.get("GOOGLE_OAUTH_CREDENTIALS", "/workspace/config/google_oauth.json"))
 ACCOUNT = os.environ.get("GOOGLE_ACCOUNT", "user@example.com")
 PT = ZoneInfo("America/Los_Angeles")
 TIMEOUT = 30

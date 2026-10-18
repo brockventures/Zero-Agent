@@ -290,9 +290,11 @@ def sync_plex_taste_profile() -> tuple[bool, str]:
 
 def sync_youtube_prime416_profile() -> tuple[bool, str]:
     """Sync Ryan's Prime416 YouTube & YouTube Music playlists, liked videos, and subscriptions."""
-    yt_oauth_file = CONFIG_DIR / "youtube_oauth.json"
+    yt_oauth_file = Path("/secrets/youtube_oauth.json")
     if not yt_oauth_file.exists():
-        return False, "Missing /workspace/config/youtube_oauth.json"
+        yt_oauth_file = CONFIG_DIR / "youtube_oauth.json"
+    if not yt_oauth_file.exists():
+        return False, "Missing /secrets/youtube_oauth.json"
 
     cfg = json.loads(yt_oauth_file.read_text(encoding="utf-8"))
     token_data = urllib.parse.urlencode({
@@ -409,9 +411,9 @@ def sync_pocketcasts_profile() -> tuple[bool, str]:
     import urllib.parse
     import urllib.request
 
-    pc_path = Path("/workspace/config/pocketcasts.json")
+    pc_path = Path("/secrets/pocketcasts.json")
     if not pc_path.exists():
-        pc_path = Path("/secrets/pocketcasts.json")
+        pc_path = Path("/workspace/config/pocketcasts.json")
     if not pc_path.exists():
         return False, "Missing pocketcasts.json credentials"
 
