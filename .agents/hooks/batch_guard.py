@@ -17,7 +17,7 @@ import re
 
 STATE_FILE = "/tmp/batch_guard_state.json"
 MAX_CONSECUTIVE_SHELL_INSPECTIONS = 3
-MAX_CONSECUTIVE_INLINE_PYTHON = 3
+MAX_CONSECUTIVE_INLINE_PYTHON = 2
 MAX_CONSECUTIVE_SAME_FILE_VIEWS = 2
 MAX_WIDE_SAME_FILE_VIEWS = 4
 WIDE_VIEW_MIN_LINES = 350
@@ -93,13 +93,26 @@ def is_single_git_lifecycle_cmd(cmd: str) -> bool:
 
 
 def is_inline_python_probe(cmd: str) -> bool:
-    """Detect standalone inline python -c or heredoc (python3 - << 'EOF') probing commands."""
+    """Detect inline python -c or heredoc (python3 - << 'EOF') probing commands, even when chained with &&."""
     cmd_clean = cmd.strip()
     first_line = cmd_clean.splitlines()[0].strip() if cmd_clean else ""
-    unquoted_first = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "", first_line)
-    if " && " in unquoted_first or " || " in unquoted_first or "; " in unquoted_first:
+    if bool(re.match(r"^python[0-9.]*\s+(?:-c\b|-\s*<<|<<)", first_line)):
+        return True
+    unquoted = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "", cmd_clean)
+    if " && " in unquoted or " || " in unquoted or "; " in unquoted:
         return False
-    return bool(re.match(r"^python[0-9.]*\s+(?:-c\b|-\s*<<|<<)", first_line))
+    return False
+
+
+def is_unbounded_ha_sqlite_query(cmd: str) -> bool:
+    """Detect SQLite queries against home-assistant_v2.db that lack last_updated_ts bounds or read-only mode."""
+    if "home-assistant_v2.db" not in cmd:
+        return False
+    if "SELECT" not in cmd.upper():
+        return False
+    if "last_updated_ts >" not in cmd and "last_updated_ts >=" not in cmd:
+        return True
+    return False
 
 
 def is_batched_or_mutating_cmd(cmd: str) -> bool:
@@ -193,6 +206,14 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
                 "are prohibited because 'pgrep -f' matches its own bash -c wrapper and deadlocks the turn. "
                 "For SDK background tasks, stop calling tools silently and let the task completion event wake you; "
                 "for jobs >2 minutes, use 'python3 /workspace/tools/detached_runner.py start ...'."
+            )
+
+        # A0b. Unbounded Home Assistant Recorder SQLite Guard
+        if is_unbounded_ha_sqlite_query(cmd):
+            return False, (
+                "HA Recorder SQLite Guard Triggered: Querying 'home-assistant_v2.db' without an explicit 'last_updated_ts >' "
+                "lower bound causes multi-minute table scans and write-lock stalls. Prefer the Home Assistant REST API "
+                "(/api/states or /api/history/period) or include an indexed 'last_updated_ts >' filter with '-readonly'."
             )
 
         # A. Unscoped test suite check (Ban bare pytest in interactive turns)

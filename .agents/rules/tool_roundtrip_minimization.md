@@ -46,4 +46,14 @@ description: Enforces tool roundtrip minimization, broad-slice file reads, and d
 10. **Post-PR Compaction Discipline:**
    - Every completed PR marks the end of an isolated working memory cycle. Compact or recycle the session immediately upon PR merge/closure per `.agents/rules/autonomous_github_management.md` to prevent cumulative token ballooning on subsequent tool turns.
 
+11. **One-Shot Remote SSH & Multi-Command Batching (`nas_config.run_ssh`):**
+   - **NEVER** execute serial SSH roundtrips (`nas_config.run_ssh` or `ssh`) to inspect multiple line slices, files, or database tables on Host 1 or remote hosts.
+   - **ALWAYS** bundle remote inspections, config edits, and API reloads into a single self-contained Python script (using base64 payload execution for remote scripts to avoid shell-quoting syntax errors) and run it in a single tool call.
+
+12. **Home Assistant Recorder SQLite Lock & Index Fast-Path (`home-assistant_v2.db`):**
+   - **Prefer REST API first:** For current entity states or recent history, query the Home Assistant REST API (`/api/states/<entity_id>` or `/api/history/period/...`) via `HA_BASE_URL` and `HA_ACCESS_TOKEN` in `/secrets/env.json` instead of opening `home-assistant_v2.db` over SSH.
+   - **Read-Only + Busy Timeout + Indexed Bounds:** When direct SQLite querying of `home-assistant_v2.db` is required, **ALWAYS**:
+     1. Open in immutable/read-only mode (`file:$NAS_DOCKER_ROOT/homeassistant/config/home-assistant_v2.db?mode=ro` or `sqlite3 -readonly -cmd ".timeout 3000"`) so Home Assistant's recorder write transactions never block the query for minutes.
+     2. Filter on indexed columns (`s.metadata_id = (SELECT metadata_id FROM states_meta WHERE entity_id = '...')` and `s.last_updated_ts > <epoch>`) and **NEVER** apply unindexed `CAST(s.state AS REAL)` filters without a tight `last_updated_ts` lower bound.
+
 *Note: Enforced deterministically by `batch_guard.py`.*

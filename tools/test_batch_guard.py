@@ -107,11 +107,11 @@ class TestBatchGuard(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("4 consecutive replace_file_content calls on '/workspace/tools/bar.py'", reason)
 
-    def test_consecutive_inline_python_probes_blocked_after_three_and_reset_on_progress(self):
-        for i in range(3):
+    def test_consecutive_inline_python_probes_blocked_after_two_and_reset_on_progress(self):
+        for i in range(2):
             allowed, _ = check_batching(f"python3 - << 'EOF'\nprint({i})\nEOF")
             self.assertTrue(allowed, f"Probe {i+1} should be allowed")
-        allowed, reason = check_batching("python3 -c 'print(4)'")
+        allowed, reason = check_batching("python3 -c 'print(3)'")
         self.assertFalse(allowed)
         self.assertIn("consecutive inline Python probe commands", reason)
 
@@ -119,6 +119,25 @@ class TestBatchGuard(unittest.TestCase):
         allowed, _ = check_batching("python3 /workspace/scratch/calibrate.py")
         self.assertTrue(allowed)
         allowed, _ = check_batching("python3 -c 'print(1)'")
+        self.assertTrue(allowed)
+
+    def test_chained_inline_python_still_counted_as_probe(self):
+        allowed, _ = check_batching("python3 -c 'print(1)' && echo done")
+        self.assertTrue(allowed)
+        allowed, _ = check_batching("python3 -c 'print(2)' && echo done")
+        self.assertTrue(allowed)
+        allowed, reason = check_batching("python3 -c 'print(3)'")
+        self.assertFalse(allowed)
+        self.assertIn("consecutive inline Python probe commands", reason)
+
+    def test_unbounded_ha_sqlite_query_blocked(self):
+        unbounded_cmd = "sqlite3 /docker/homeassistant/config/home-assistant_v2.db \"SELECT state FROM states WHERE metadata_id = 1 ORDER BY last_updated_ts DESC LIMIT 50;\""
+        allowed, reason = check_batching(unbounded_cmd)
+        self.assertFalse(allowed)
+        self.assertIn("HA Recorder SQLite Guard Triggered", reason)
+
+        bounded_cmd = "sqlite3 -readonly /docker/homeassistant/config/home-assistant_v2.db \"SELECT state FROM states WHERE metadata_id = 1 AND last_updated_ts > 1700000000 ORDER BY last_updated_ts DESC LIMIT 50;\""
+        allowed, _ = check_batching(bounded_cmd)
         self.assertTrue(allowed)
 
     def test_no_cumulative_turn_tool_call_or_scratch_write_cap(self):
