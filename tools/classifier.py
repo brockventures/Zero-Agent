@@ -67,15 +67,48 @@ Score Guidance:
 - 0.6 - 0.7: Open architectural/technical discussions affecting the shared codebase.
 - 0.8 - 1.0: Actionable technical questions, broken builds, or blockers where Zero's input is needed.
 
-Output ONLY a single float between 0.0 and 1.0 (e.g. 0.35, 0.65, 0.85).
+Optional Lightweight Reaction (for scores < 0.80 ONLY):
+- Most ambient messages need NO reaction. However, if the message is a genuinely funny joke/roast, a shipped milestone/win, or a warm acknowledgment where a single native Discord emoji reaction from Zero would be natural (e.g. 😂, 💀, 🔥, 🎉, 👍, 👀, 🍻), you may append ` | REACT: <single_emoji>` after the float.
+- Never attach a reaction to routine chatter or peer-to-peer handoffs.
+
+Output ONLY a single float between 0.0 and 1.0, optionally followed by ` | REACT: <emoji>` (e.g. `0.25`, `0.30 | REACT: 😂`, `0.85`).
 
 Message from {author}: "{content}"'''
+
+_LAST_AMBIENT_REACTION: str | None = None
+
+
+def pop_last_reaction() -> str | None:
+    """Return and clear the most recent ambient reaction suggested by score_relevance."""
+    global _LAST_AMBIENT_REACTION
+    rx = _LAST_AMBIENT_REACTION
+    _LAST_AMBIENT_REACTION = None
+    return rx
+
+
+def extract_classifier_reaction(output: str) -> str | None:
+    """Extract optional lightweight emoji reaction from classifier output (e.g. '0.30 | REACT: 😂')."""
+    if not output:
+        return None
+    m = re.search(r"\bREACT(?:ION)?:\s*([^\s|,;\[\]]+)", output, re.IGNORECASE)
+    if not m:
+        return None
+    candidate = m.group(1).strip()
+    if candidate.lower() in ("none", "null", "n/a", "<emoji>", "..."):
+        return None
+    # Ensure it contains a non-ASCII emoji character or custom Discord emoji format
+    if any(ord(ch) > 127 for ch in candidate) or re.match(r"^<a?:\w+:\d+>$", candidate):
+        return candidate
+    return None
+
 
 def extract_classifier_score(output: str) -> float | None:
     """Extract relevance score float safely without matching token counts or metadata numbers."""
     if not output:
         return None
-    lines = [line.strip() for line in output.strip().splitlines() if line.strip()]
+    # Strip any optional '| REACT: ...' suffix before parsing score
+    cleaned_output = re.sub(r"\s*\|?\s*\bREACT(?:ION)?:.*$", "", output, flags=re.IGNORECASE | re.MULTILINE)
+    lines = [line.strip() for line in cleaned_output.strip().splitlines() if line.strip()]
     # 1. Look for score on a line by itself or prefixed with 'score:' (starting from bottom)
     for line in reversed(lines):
         m = re.search(r"^(?:score:?\s*)?(0(?:\.\d+)?|1(?:\.0+)?)$", line, re.IGNORECASE)
@@ -88,8 +121,11 @@ def extract_classifier_score(output: str) -> float | None:
             return float(m.group(1))
     return None
 
+
 def score_relevance(content: str, author: str = "user") -> float:
     """Score message relevance for Zero using ambient classifier."""
+    global _LAST_AMBIENT_REACTION
+    _LAST_AMBIENT_REACTION = None
     content_clean = content.strip()
 
     # Fast-path: Explicit Zero mentions or @Robot snowflake tags immediately score 1.0
@@ -149,6 +185,7 @@ def score_relevance(content: str, author: str = "user") -> float:
             text=True,
             timeout=25
         )
+        _LAST_AMBIENT_REACTION = extract_classifier_reaction(res.stdout)
         val = extract_classifier_score(res.stdout)
         if val is not None:
             return val

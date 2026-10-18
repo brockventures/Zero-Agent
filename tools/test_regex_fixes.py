@@ -10,7 +10,7 @@ from pathlib import Path
 if "/workspace" not in sys.path:
     sys.path.insert(0, "/workspace")
 
-from tools.classifier import extract_classifier_score
+from tools.classifier import extract_classifier_reaction, extract_classifier_score
 from tools.bridge_formatting import format_for_discord
 from tools.email_sanitizer import sanitize_email_text, sanitize_discord_display
 from tools.zero_mail_listener import sanitize_text as zero_sanitize_text
@@ -35,6 +35,9 @@ class TestRegexFixes(unittest.TestCase):
         self.assertEqual(extract_classifier_score("1.0"), 1.0)
         self.assertEqual(extract_classifier_score("1"), 1.0)
         self.assertEqual(extract_classifier_score("Relevance score: 0.70"), 0.70)
+        self.assertEqual(extract_classifier_score("0.30 | REACT: 😂"), 0.30)
+        self.assertEqual(extract_classifier_reaction("0.30 | REACT: 😂"), "😂")
+        self.assertIsNone(extract_classifier_reaction("0.25"))
         self.assertIsNone(extract_classifier_score("Random error with 500 status"))
 
     def test_2_bridge_task_envelope_lookahead_no_swallow(self):

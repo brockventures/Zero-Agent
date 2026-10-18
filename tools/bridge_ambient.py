@@ -559,13 +559,21 @@ async def route_external_message(
     if not is_mentioned:
         if rules.get("ambient_classifier_enabled", False):
             try:
-                from tools.classifier import score_relevance
+                from tools.classifier import pop_last_reaction, score_relevance
                 score = await asyncio.to_thread(score_relevance, content, author_name)
+                ambient_rx = pop_last_reaction()
                 threshold = float(rules.get("ambient_relevance_threshold", 0.80))
                 if score >= threshold:
                     print(f"[Bridge] Ambient classifier scored {score:.2f} >= {threshold:.2f} for {author_name}. Triggering chime-in.")
                 else:
-                    print(f"[Bridge] Ambient classifier scored {score:.2f} < {threshold:.2f} for {author_name} (buffered, remaining silent)")
+                    if ambient_rx and hasattr(msg, "add_reaction"):
+                        try:
+                            await msg.add_reaction(ambient_rx)
+                            print(f"[Bridge] Ambient classifier scored {score:.2f} < {threshold:.2f} for {author_name} (applied lightweight reaction '{ambient_rx}')")
+                        except Exception as rx_err:
+                            print(f"[Bridge] Notice adding ambient reaction '{ambient_rx}': {rx_err}")
+                    else:
+                        print(f"[Bridge] Ambient classifier scored {score:.2f} < {threshold:.2f} for {author_name} (buffered, remaining silent)")
                     return True
             except Exception as ce:
                 print(f"[Bridge] Error running ambient classifier: {ce}")

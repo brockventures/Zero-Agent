@@ -141,6 +141,41 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
             # Below 0.80 -> buffered silently, queue remains empty
             self.assertTrue(ext_queue.empty())
 
+    async def test_ambient_classifier_applies_lightweight_reaction(self):
+        msg = MagicMock()
+        msg.guild.id = 1534436119888793740
+        msg.author.id = 11111111
+        msg.author.bot = False
+        msg.channel.id = 1534452820995080192  # #lounge
+        msg.channel.name = "lounge"
+        msg.content = "That container crash log is pure comedy gold"
+        msg.attachments = []
+        msg.reference = None
+        msg.role_mentions = []
+        msg.mentions = []
+        msg.add_reaction = AsyncMock()
+
+        bot = MagicMock()
+        bot.user.id = 1542285964213358633
+        home_queue = asyncio.Queue()
+        ext_queue = asyncio.Queue()
+
+        rules = {
+            "ambient_classifier_enabled": True,
+            "ambient_relevance_threshold": 0.80,
+            "channel_tag_requirements": {},
+        }
+
+        with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
+             patch("tools.classifier.score_relevance", return_value=0.30), \
+             patch("tools.classifier.pop_last_reaction", return_value="😂"):
+            handled = await route_external_message(
+                msg, bot, msg.content, "Ian", home_queue, ext_queue, rules=rules
+            )
+            self.assertTrue(handled)
+            self.assertTrue(ext_queue.empty())
+            msg.add_reaction.assert_awaited_once_with("😂")
+
     async def test_bare_zero_text_in_tag_gated_channel(self):
         msg = MagicMock()
         msg.guild.id = 1534436119888793740
