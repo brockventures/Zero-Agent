@@ -264,6 +264,7 @@ CHANNEL_MODEL_OVERRIDES: dict[int, str] = {
     1548196930788524094: "gemini-4-argon-medium",   # #projects
     1558202642663211169: "gemini-4-argon-medium",   # #agora
     1551465050072416286: "gemini-4-argon-medium",   # #side-project
+    1561509863018856468: "gemini-4-argon-medium",   # #gotchi
     # Tier 3: Gemini 4 Argon (Low) — Fast Conversational Speed + Argon Quality
     1542081375287640084: "gemini-4-argon-low",      # #zero-chat
     1550577908811178095: "gemini-4-argon-low",      # #brock-house
@@ -304,6 +305,7 @@ def get_channel_model_override(
             "projects",
             "agora",
             "side-project",
+            "gotchi",
         ):
             return "gemini-4-argon-medium"
         if cname in ("zero-chat", "brock-house", "shopping", "steam-deck", "the-banana-stand", "lounge"):
