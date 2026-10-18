@@ -163,7 +163,13 @@ noise_re = re.compile(
     r'Attempting a reconnect in \d|'
     r'\[IvyDaemon\] Turn result received \(status: ERROR\)|'
     r'WRN (?:Serve tunnel error|Connection terminated) error=\"(?:datagram manager|accept stream listener) error:.*(?:Application error 0x0 \(remote\)|timeout: no recent network activity)|'
-    r'WRN Failed to dial a quic connection error=\"failed to dial to edge with quic: timeout: no recent network activity\"'
+    r'WRN Failed to dial a quic connection error=\"failed to dial to edge with quic: timeout: no recent network activity\"|'
+    r'--gotify-notify-error|'
+    r'\[BridgePipeline\] target_dest delivery failed.*50035|'
+    r'In message_reference: Cannot reply to a system message|'
+    r'homeassistant\.components\.tplink\.entity.*Unable to read data for.*get_auto_off_config|'
+    r'snitun\.multiplexer\.core.*Timeout error while pinging peer|'
+    r'matter_server\.server\.client_handler.*Disconnected: Received error message: No PONG received after'
     r')',
     re.IGNORECASE
 )

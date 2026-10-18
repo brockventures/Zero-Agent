@@ -86,6 +86,7 @@ def get_avatar_data_uri(agent: str = "zero") -> str:
         fallback_svg = 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="45" fill="%23059669"/><text x="50" y="65" font-size="45" text-anchor="middle" fill="white">⚾</text></svg>'
     else:
         paths = [
+            Path("/workspace/assets/zero_avatar_animated.gif"),
             DATA_DIR / "zero_avatar.png",
             Path("/workspace/assets/zero_avatar.png"),
         ]
@@ -94,9 +95,10 @@ def get_avatar_data_uri(agent: str = "zero") -> str:
     for p in paths:
         if p.exists():
             try:
+                mime = "image/gif" if p.suffix.lower() == ".gif" else "image/png"
                 with open(p, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode("ascii")
-                    return f"data:image/png;base64,{b64}"
+                    return f"data:{mime};base64,{b64}"
             except Exception:
                 pass
     return fallback_svg

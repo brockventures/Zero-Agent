@@ -338,7 +338,7 @@ def check_victoriametrics_health(vm_url: str = DEFAULT_VM_URL) -> tuple[bool, in
         return False, 0
 
 
-def query_vm_history(vm_url: str, entity_id: str, days: int = 14) -> tuple[list[float], list[float]]:
+def query_vm_history(vm_url: str, entity_id: str, days: int = 14, unit: str = "") -> tuple[list[float], list[float]]:
     """Query VictoriaMetrics range API for an entity's historical values and timestamps."""
     end_ts = int(datetime.now(timezone.utc).timestamp())
     start_ts = end_ts - (days * 86400)
@@ -356,13 +356,30 @@ def query_vm_history(vm_url: str, entity_id: str, days: int = 14) -> tuple[list[
         results = payload.get("data", {}).get("result", [])
         vals: list[float] = []
         ts_list: list[float] = []
+        ignored_exact = {
+            "ha_entity_available",
+            "ha_entity_info",
+            "ha_last_updated_time_seconds",
+            "ha_state_change_total",
+            "ha_sensor_timestamp_seconds",
+        }
         for series in results:
             metric_name = series.get("metric", {}).get("__name__", "")
-            if metric_name.endswith("_created") or metric_name == "ha_last_updated_time_seconds":
+            if (
+                metric_name in ignored_exact
+                or metric_name.endswith(("_created", "_total", "_info"))
+            ):
                 continue
+            is_celsius_to_f = metric_name.endswith("_celsius") and unit == "°F"
+            is_kw_to_w = metric_name.endswith("_kw") and unit == "W"
             for ts, val_str in series.get("values", []):
                 try:
-                    vals.append(float(val_str))
+                    val = float(val_str)
+                    if is_celsius_to_f:
+                        val = val * 9.0 / 5.0 + 32.0
+                    elif is_kw_to_w:
+                        val = val * 1000.0
+                    vals.append(val)
                     ts_list.append(float(ts))
                 except (ValueError, TypeError):
                     pass
@@ -432,7 +449,7 @@ def analyze_anomalies(
 
     for eid in monitored:
         if vm_ok and vm_series_count > 0:
-            vals, ts_list = query_vm_history(vm_url, eid, days=days)
+            vals, ts_list = query_vm_history(vm_url, eid, days=days, unit=monitored[eid].get("unit", ""))
             if len(vals) >= 24:
                 history_by_eid[eid] = (vals, ts_list)
                 continue

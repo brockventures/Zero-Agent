@@ -155,6 +155,11 @@ class TestNasLogTriage(unittest.TestCase):
             '2026-10-13T19:18:08Z WRN Connection terminated error="datagram manager error: Application error 0x0 (remote)" connIndex=2',
             '2026-10-14T00:21:24Z WRN Serve tunnel error error="datagram manager error: timeout: no recent network activity" connIndex=0 event=0 ip=198.41.192.27',
             '2026-10-13T12:11:40Z WRN Failed to dial a quic connection error="failed to dial to edge with quic: timeout: no recent network activity" connIndex=0 event=0 ip=198.41.192.57',
+            '| --gotify-notify-error (GOTIFY_NOTIFY_ERROR): True                                                  |',
+            '[BridgePipeline] target_dest delivery failed (400 Bad Request (error code: 50035): Invalid Form Body',
+            '2026-10-17 21:39:54.867 WARNING (MainThread) [homeassistant.components.tplink.entity] Unable to read data for 198.51.100.211 number.kitchen_counter_lights_3_turn_off_in: get_auto_off_config for AutoOff',
+            '2026-10-17 21:41:22.575 ERROR (MainThread) [snitun.multiplexer.core] Timeout error while pinging peer',
+            '2026-10-17 20:35:52.095 (MainThread) WARNING [matter_server.server.client_handler] [140038283884640] Disconnected: Received error message: No PONG received after 27.5 seconds',
         ]
         for s in samples:
             self.assertIsNotNone(rx.search(s), f"Failed to match: {s}")

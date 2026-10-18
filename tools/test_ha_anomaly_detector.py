@@ -131,3 +131,44 @@ def test_format_report_outputs_clean_markdown():
     assert "Frozen / Zombie Sensors" in out
     assert "64.2h" in out
     assert "reload:nest_protect" in out
+
+
+def test_query_vm_history_filters_metadata_and_converts_celsius(monkeypatch):
+    import io
+    import json
+    import urllib.request
+    from tools.ha_anomaly_detector import query_vm_history
+
+    fake_payload = {
+        "status": "success",
+        "data": {
+            "resultType": "matrix",
+            "result": [
+                {
+                    "metric": {"__name__": "ha_entity_available", "entity": "sensor.bedroom_temperature"},
+                    "values": [[1700000000, "1"], [1700000900, "1"]],
+                },
+                {
+                    "metric": {"__name__": "ha_entity_info", "entity": "sensor.bedroom_temperature"},
+                    "values": [[1700000000, "1"], [1700000900, "1"]],
+                },
+                {
+                    "metric": {"__name__": "ha_sensor_temperature_celsius", "entity": "sensor.bedroom_temperature"},
+                    "values": [[1700000000, "20.0"], [1700000900, "25.0"]],
+                },
+            ],
+        },
+    }
+
+    class DummyResp:
+        def __enter__(self):
+            return io.BytesIO(json.dumps(fake_payload).encode())
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: DummyResp())
+    vals, ts = query_vm_history("http://198.51.100.1:8428", "sensor.bedroom_temperature", days=7, unit="°F")
+    assert vals == [68.0, 77.0]
+    assert ts == [1700000000.0, 1700000900.0]
+
