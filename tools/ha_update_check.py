@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import sys, subprocess, json, urllib.request, time
-
 import os
 import urllib.parse
 
@@ -9,20 +8,15 @@ for _p in ["/workspace", "/workspace/tools"]:
         sys.path.insert(0, _p)
 
 try:
-    from tools.nas_config import resolve_nas_config
+    from tools.nas_config import resolve_nas_config, run_ssh as _nas_run_ssh, DOCKER_ROOT
 except ImportError:
-    from nas_config import resolve_nas_config
+    from nas_config import resolve_nas_config, run_ssh as _nas_run_ssh, DOCKER_ROOT
 
 HOST_1_IP, _, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
-HOST_SSH = ["ssh", "-i", SSH_KEY, "-p", SSH_PORT, "-o", "BatchMode=yes", f"{SSH_USER}@{HOST_1_IP}"]
-
-def run_ssh(cmd_str: str) -> str:
-    cmd = HOST_SSH + [cmd_str]
-    try:
-        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
-    except Exception:
-        return ""
+def run_ssh(cmd_str: str, timeout: int = 180) -> str:
+    code, stdout, stderr = _nas_run_ssh(HOST_1_IP, cmd_str, timeout=timeout, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
+    return stdout.strip()
 
 def get_installed_ha_version() -> str:
     out = run_ssh("docker inspect home-assistant --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}'")
@@ -84,9 +78,9 @@ def check_updates(quiet: bool = False):
 def perform_upgrade(target_service: str = "all"):
     print("📦 **Initiating Smart Home Stack Upgrade...**\n")
     ts = time.strftime("%Y%m%d_%H%M%S")
-    backup_dir = "/data/backups/homeassistant"
+    backup_dir = os.environ.get("HA_BACKUP_DIR", os.path.join(os.sep, "volume1", "data", "backups", "homeassistant"))
     usb_backup_dir = "/volumeUSB1/usbshare/backups/homeassistant"
-    run_ssh(f"mkdir -p {backup_dir} {usb_backup_dir} 2>/dev/null || true")
+    run_ssh(f"mkdir -p '{backup_dir}' '{usb_backup_dir}' 2>/dev/null || true")
 
     # 1. Snapshot stateful directories & DB
     print("1. Creating snapshot backups of HA config, Matter fabric, and Thread credentials...")
@@ -95,13 +89,13 @@ def perform_upgrade(target_service: str = "all"):
         f"tar --exclude='home-assistant_v2.db*' --exclude='*.log*' --exclude='.cloud' "
         f"--exclude='backups' --exclude='.git' --exclude='.cache' "
         f"-czf '{backup_tar}' "
-        f"-C /docker/homeassistant config matter-server otbr-data 2>/dev/null || true"
+        f"-C '{DOCKER_ROOT}/homeassistant' config matter-server otbr-data zwave-js-ui 2>/dev/null || true"
     )
-    run_ssh(backup_cmd)
+    run_ssh(backup_cmd, timeout=180)
     
     # SQLite WAL-safe backup of HA DB
     backup_db = f"{backup_dir}/ha_db_pre_upgrade_{ts}.db"
-    run_ssh(f"sqlite3 /docker/homeassistant/config/home-assistant_v2.db \".backup '{backup_db}'\" 2>/dev/null || true")
+    run_ssh(f"sqlite3 '{DOCKER_ROOT}/homeassistant/config/home-assistant_v2.db' \".backup '{backup_db}'\" 2>/dev/null || true", timeout=240)
 
     # Check backup sizes
     sz_tar = run_ssh(f"ls -lh '{backup_tar}' 2>/dev/null | awk '{{print $5}}'")
@@ -116,16 +110,16 @@ def perform_upgrade(target_service: str = "all"):
     latest_ha = get_latest_ha_stable()
     print(f"\n2. Upgrading Home Assistant Core to `v{latest_ha}`...")
     # Update compose file image tag
-    run_ssh(f"sed -i -E 's|image: homeassistant/home-assistant:.*|image: homeassistant/home-assistant:{latest_ha}|g' /docker/docker-compose.yml")
+    run_ssh(f"sed -i -E 's|image: homeassistant/home-assistant:.*|image: homeassistant/home-assistant:{latest_ha}|g' '{DOCKER_ROOT}/docker-compose.yml'")
     
     # Pull and recreate
-    run_ssh("cd /docker && docker compose pull homeassistant && docker compose up -d homeassistant")
-    run_ssh("cd /docker/homeassistant && docker compose pull matter-server otbr go2rtc && docker compose up -d matter-server otbr go2rtc")
+    run_ssh(f"cd '{DOCKER_ROOT}' && docker compose pull homeassistant && docker compose up -d homeassistant", timeout=120)
+    run_ssh(f"cd '{DOCKER_ROOT}/homeassistant' && docker compose pull matter-server otbr go2rtc && docker compose up -d matter-server otbr go2rtc", timeout=120)
 
     # 3. Verify health & state
     print("\n3. Verifying service health...")
     ha_online = False
-    for i in range(15):
+    for i in range(25):
         time.sleep(3)
         res = run_ssh("curl -s -o /dev/null -w '%{http_code}' http://localhost:8123/api/ || true")
         if res in ("200", "401"):
@@ -139,11 +133,18 @@ def perform_upgrade(target_service: str = "all"):
     matter_stat = run_ssh("docker inspect -f '{{.State.Status}}' matterserver 2>/dev/null || true")
     otbr_stat = run_ssh("docker inspect -f '{{.State.Status}}' otbr 2>/dev/null || true")
     go2rtc_stat = run_ssh("docker inspect -f '{{.State.Status}}' go2rtc 2>/dev/null || true")
+    zwave_stat = run_ssh("docker inspect -f '{{.State.Status}}' zwave-js-ui 2>/dev/null || true")
     print(f"   • Matter Server: `{matter_stat or 'unknown'}`")
     print(f"   • OpenThread Border Router (OTBR): `{otbr_stat or 'unknown'}`")
     print(f"   • go2rtc: `{go2rtc_stat or 'unknown'}`")
+    print(f"   • Z-Wave JS UI: `{zwave_stat or 'unknown'}`")
 
-    print(f"\n🎉 **Smart Home Stack Upgrade Complete!**\n• Pinned Home Assistant to `v{latest_ha}`\n• Matter Server, OTBR, and go2rtc refreshed\n• Pre-upgrade snapshots preserved.")
+    # OTBR Thread network state check
+    otbr_health = run_ssh("curl -s http://localhost:8081/node 2>/dev/null || true")
+    if "NEST-PAN-262C" in otbr_health:
+        print("   • OTBR Thread Mesh: `Connected (NEST-PAN-262C)`")
+
+    print(f"\n🎉 **Smart Home Stack Upgrade Complete!**\n• Pinned Home Assistant to `v{latest_ha}`\n• Companion services online\n• Pre-upgrade snapshots preserved.")
 
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "check"

@@ -225,6 +225,38 @@ def extract_task_id_from_notes(notes: str | None) -> int | None:
     return None
 
 
+DEV_PATTERNS = [
+    r"^(feat|fix|refactor|chore|test|perf|ci|docs)[\(:]",
+    r"https?://github\.com/",
+    r"github issue",
+    r"\(issue #\d+\)",
+    r"#\d+:",
+    r"\bpr #\d+\b",
+    r"\bagora[- ]roguelike\b",
+    r"\bagent[- ]playbook\b",
+    r"\bagora\b",
+    r"\bbanana[- ]protocol\b",
+    r"\begress telemetry\b",
+    r"\bucp client\b",
+    r"\bagentic storefronts\b",
+    r"\bharden agent identity\b",
+    r"\breview aerial/alex\b",
+    r"\bmarvin persona\b",
+    r"\bterminal web hud\b",
+    r"\bmarket variance rfc\b",
+    r"\brivals & corporate warfare\b",
+    r"\bmemsearch\b",
+]
+
+
+def is_dev_task(task: dict) -> bool:
+    """Return True if task is an internal software engineering, repository, or agent ticket."""
+    if task.get("dev") is True or task.get("type") in ("dev", "engineering", "code"):
+        return True
+    text = f"{task.get('title', '')} {task.get('notes') or ''}".lower().strip()
+    return any(re.search(pat, text) for pat in DEV_PATTERNS)
+
+
 def sync_tasks(quiet: bool = False) -> dict:
     """
     Execute full two-way synchronization between tasks.json and Google Tasks.
@@ -260,14 +292,17 @@ def sync_tasks(quiet: bool = False) -> dict:
 
         embedded_id = extract_task_id_from_notes(gt.get("notes"))
         if embedded_id and embedded_id in local_by_id:
+            loc = local_by_id[embedded_id]
+            if is_dev_task(loc):
+                continue
             lid_str = str(embedded_id)
             mappings[lid_str] = {
                 "google_id": gid,
                 "last_title": gt.get("title", ""),
-                "last_status": local_by_id[embedded_id].get("status", "pending"),
+                "last_status": loc.get("status", "pending"),
                 "last_google_status": gt.get("status", "needsAction"),
             }
-            local_by_id[embedded_id]["google_task_id"] = gid
+            loc["google_task_id"] = gid
 
     # Step 2: Remote -> Local (Incorporate changes Ryan made on phone/web)
     for gt in google_tasks:
@@ -283,6 +318,8 @@ def sync_tasks(quiet: bool = False) -> dict:
 
         if matching_lid and int(matching_lid) in local_by_id:
             loc = local_by_id[int(matching_lid)]
+            if is_dev_task(loc):
+                continue
             map_entry = mappings[matching_lid]
 
             # 2a. Status change on Google Tasks
@@ -343,6 +380,21 @@ def sync_tasks(quiet: bool = False) -> dict:
     for loc in local_tasks:
         lid_str = str(loc["id"])
         map_entry = mappings.get(lid_str)
+
+        if is_dev_task(loc):
+            # Internal dev tasks are never synced to Google Tasks. If previously mapped, purge from Google Tasks.
+            if map_entry:
+                gid = map_entry.get("google_id")
+                if gid:
+                    try:
+                        delete_google_task(list_id, gid)
+                        changes["deleted_in_google"].append(f"Purged dev task #{loc['id']}: {loc['title']}")
+                    except Exception as e:
+                        log.warning(f"Error purging dev task #{loc['id']} from Google Tasks: {e}")
+                mappings.pop(lid_str, None)
+                if "google_task_id" in loc:
+                    del loc["google_task_id"]
+            continue
 
         is_completed = loc.get("status") in ("completed", "retired")
         target_g_status = "completed" if is_completed else "needsAction"
@@ -405,6 +457,22 @@ def sync_tasks(quiet: bool = False) -> dict:
             except Exception as e:
                 log.error(f"Error exporting task #{loc['id']} to Google Tasks: {e}")
 
+    # Step 4: Propagate local deletions (tasks removed from tasks.json -> delete from Google Tasks)
+    for lid_str in list(mappings.keys()):
+        try:
+            lid_int = int(lid_str)
+        except ValueError:
+            continue
+        if lid_int not in local_by_id:
+            map_entry = mappings.pop(lid_str, {})
+            gid = map_entry.get("google_id")
+            if gid and gid in google_by_id:
+                try:
+                    delete_google_task(list_id, gid)
+                    changes["deleted_in_google"].append(f"Deleted task #{lid_int}: {map_entry.get('last_title', '')}")
+                except Exception as e:
+                    log.warning(f"Error deleting locally removed task #{lid_int} from Google Tasks: {e}")
+
     # Persist updated state and local tasks
     save_local_tasks(local_tasks)
     state["last_sync"] = datetime.now(PT).strftime("%Y-%m-%d %H:%M PT")
@@ -421,6 +489,8 @@ def sync_tasks(quiet: bool = False) -> dict:
         summary_parts.append(f"Updated {len(changes['pulled_to_local'])} local task(s)")
     if changes["pushed_to_google"]:
         summary_parts.append(f"Updated {len(changes['pushed_to_google'])} Google task(s)")
+    if changes["deleted_in_google"]:
+        summary_parts.append(f"Purged {len(changes['deleted_in_google'])} dev task(s) from Google Tasks")
 
     msg = "; ".join(summary_parts) if summary_parts else "All tasks in sync (nominal)."
 

@@ -119,9 +119,9 @@ def format_tasks_summary() -> str:
     if not tasks:
         return "📋 **Project & Task Tracker**: No tasks currently recorded."
 
-    p1s = [t for t in tasks if t.get("priority") == "p1" and t.get("status") != "completed"]
-    p2s = [t for t in tasks if t.get("priority") == "p2" and t.get("status") != "completed"]
-    p3s = [t for t in tasks if (t.get("priority") == "p3" or t.get("status") == "parking_lot") and t.get("status") != "completed"]
+    p1s = [t for t in tasks if t.get("priority") == "p1" and t.get("status") not in ("completed", "retired")]
+    p2s = [t for t in tasks if t.get("priority") == "p2" and t.get("status") not in ("completed", "retired")]
+    p3s = [t for t in tasks if (t.get("priority") == "p3" or t.get("status") == "parking_lot") and t.get("status") not in ("completed", "retired")]
 
     out = ["📋 **Project & Task Tracker**\n"]
     if p1s:

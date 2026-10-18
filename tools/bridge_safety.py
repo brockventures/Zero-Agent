@@ -19,8 +19,11 @@ from typing import Optional
 
 CLI_LEAK_LINE_PATTERNS = [
     r"^\s*error:\s*interrupted\s*$",
+    r"^\s*error:\s*invalid model selection[^\n]*$",
     r"^\s*error:\s*the connection to the agent was interrupted[^\n]*$",
     r"^\s*No tools called(?:\.|\s+Waiting for [^\n]+|\s*$)",
+    r"^\s*(?:-\s*)?a?wait(?:ing)?\s+(?:for\s+)?[^\n]+(?:results|execution|completion|finish|output|task|process|search|eval|run)[^\n]*\.?\s*$",
+    r"^\s*(?:-\s*)?awaiting\s+[^\n]+(?:\.|\s*$)",
     r"^\s*Wait(?:ing)? for (?:the\s+)?(?:background\s+)?(?:task|command|subagent|process)[s]?(?:-[a-zA-Z0-9_-]+)?(?:\s+to\s+(?:complete|finish)|\s+finishes|\s+completes)?(?:\.\.\.|\.)?\s*$",
     r"^\s*Wait(?:ing)? for task-[a-zA-Z0-9_-]+[^\n]*$",
     r"^\s*(?:I (?:will|have)\s+)?wait(?:ed|ing)? for [^\n]+?(?:to complete|to finish|finish|complete)\.?\s*$",
@@ -34,18 +37,28 @@ CLI_LEAK_LINE_PATTERNS = [
     r"^\s*\*\(\s*Response completed, but no text output was generated\s*\)\*\s*$",
     r"^\s*⚠️\s*\*\(\s*Recovered from session transcript following process cutoff\s*\)\*\s*$",
     r"^\s*Log:\s*file://[^\n]+$",
-    r"^\s*An async(?:hronous)? task has completed[^\n]*$",
+    r"^\s*An async(?:hronous)? task (?:[a-zA-Z0-9_\-\/]+ )?has completed[^\n]*$",
+    r"^\s*An async(?:hronous)? (?:command|task|job) or scheduled task is still running[^\n]*$",
+    r"^\s*I(?:'ll| will) continue once I receive an update\.?\s*$",
+    r"^\s*I will continue (?:once|when|after) [^\n]+\.?\s*$",
+    r"^\s*Log file content:\s*$",
+    r"^\s*Task id\s+[\"'][^\"']+[\"']\s+finished with result:\s*$",
+    r"^\s*The command exited with code\s+-?\d+\.?\s*$",
     r"^\s*Task ID:\s*[^\n]+$",
     r"^\s*Task Exit Code:\s*\d+\s*$",
     r"^\s*Task Output:\s*$",
     r"^\s*<end of task output>\s*$",
+    r"^\s*(?:[A-Z][a-zA-Z0-9_\- ]+?)\s+in the background(?:\.\.\.|\.)?\s*$",
     r"^\s*root agent idle; waiting up to \d+s for \d+ background task\(s\)\s*$",
     r"^\s*terminating \d+ background task\(s\) on exit\s*$",
     r"^\s*A subagent has completed[^\n]*$",
     r"^\s*Subagent (?:ID|Status|Output):\s*[^\n]*$",
     r"^\s*<end of subagent output>\s*$",
     r"^\s*\[Message\]\s+timestamp=[^\n]*$",
-    r"^\s*\[Task Update\]\s+Task\s+[^\n]*$",
+    r"^\s*(?:\[|\*\*)?Task Update(?:\]|\*\*)?:?\s+Task\s+[^\n]*$",
+    r"^\s*(?:\[|\*\*)?Task Update(?:\]|\*\*)?:?\s*Background task is running[^\n]*$",
+    r"^\s*(?:\[|\*\*)?Task Update(?:\]|\*\*)?:?\s*[^\n]*$",
+    r"^\s*(?:Background task is running\.?\s*)?Please stand by\.?\s*$",
     r"^\s*</?RECEIVED_TASK_NOTIFICATION>\s*$",
     r"^\s*</?WAITING_FOR_TASKS_OUTPUT>\s*$",
     r"^\s*Wait for at least one of the background tasks to complete:?\s*$",
@@ -79,8 +92,17 @@ CLI_LEAK_LINE_PATTERNS = [
     r"^\s*Wait(?:ing)?\s+for\s+(?:task|background\s+task|at\s+least\s+one)[^\n]*$",
     r"^\s*Wait(?:ing)?\s+for\s+[a-f0-9\-]+(?:/task-\d+)?\s+to\s+(?:complete|finish)[^\n]*$",
     r"^\s*Wait(?:ing)?\s+for\s+task[:\s][^\n]*$",
+    r"^\s*An async(?:hronous)?\s+(?:background\s+)?(?:command|task|job|process)\s+(?:[a-zA-Z0-9_\-\/:]+\s+)?(?:is\s+)?(?:currently\s+|already\s+|still\s+)?running[^\n]*$",
+    r"^\s*Continuing\s+(?:silent\s+)?(?:background\s+)?(?:execution|waiting)[^\n]*$",
+    r"^\s*(?:Please\s+)?(?:do\s+not|don't)\s+call\s+(?:any\s+more\s+|additional\s+)?tools\s+(?:until\s+[^\n]+)?\.?\s*$",
+    r"^\s*Wait\s+silently\s+(?:for\s+[^\n]+)?\.?\s*$",
+    r"^\s*WaitMsBeforeAsync:[^\n]+$",
+    r"^\s*No\s+response\s+text\s+needed\s+while\s+waiting[^\n]*$",
     r"^\s*Wait(?:ing)?\s+for\s+(?:command|process)\s+to\s+(?:finish|complete)[^\n]*$",
     r"^\s*No other work to do\.?\s*$",
+    r"^\s*(?:Queries completed with no tool calls|Roundtrip complete)\.\s*Raising signal for pending messages.*$",
+    r"^\s*Background messages arrived during execution:\s*$",
+    r"^\s*Floated messages complete\.\s*Continuing execution\.?\s*$",
 ]
 
 
@@ -122,6 +144,126 @@ def dedup_repetitive_patterns(text: str, max_repeats: int = 3) -> str:
     return "\n".join(lines)
 
 
+_CODE_SPAN_RE = re.compile(
+    r"(?m)((?<!`)(?P<fence>`{3,})[a-zA-Z0-9_+-]*[ \t]*\n[\s\S]*?(?:^[ \t>]*(?P=fence)`*[ \t]*$|\Z))"
+    r"|((?<!`)(?P<ticks>`+)(?!`)(?:[^\n]*?(?<!`)(?P=ticks)(?!`)))"
+)
+
+
+def mask_code_spans(text: str, prefix: str = "\x00CODE_SPAN_") -> tuple[str, list[str]]:
+    """Replace all CommonMark fenced code blocks and N-backtick inline code spans with immutable placeholders.
+
+    Correctly handles:
+    - Multi-line fenced code blocks (```...``` or ````...````), even when interior contains single/double backticks.
+    - Single-line N-backtick code spans (`...`, ``...``, ```...```), even when interior contains shorter/longer
+      backtick runs (e.g. `` `foo` `` or `r"(...```handoff...```\\s*$)"`).
+    """
+    if not text or "`" not in text:
+        return text, []
+
+    spans: list[str] = []
+
+    def _save(m: re.Match) -> str:
+        idx = len(spans)
+        spans.append(m.group(0))
+        return f"{prefix}{idx}\x00"
+
+    masked = _CODE_SPAN_RE.sub(_save, text)
+    return masked, spans
+
+
+def restore_code_spans(text: str, spans: list[str], prefix: str = "\x00CODE_SPAN_") -> str:
+    """Restore placeholders created by mask_code_spans back to their original code spans."""
+    if not text or not spans:
+        return text
+    for idx, span in enumerate(spans):
+        text = text.replace(f"{prefix}{idx}\x00", span)
+    return text
+
+
+_MONOLOGUE_INDICATORS = (
+    "calibrating response...",
+    "physical mention override invariant",
+    "[crab cavern multi-agent collaboration environment]",
+    "[gif cadence tracker",
+    "[bridge execution invariant",
+    "[active memory context]",
+    "let's check the constraints:",
+    "deliver the response in a single inference pass",
+    "let's write a punchy one-liner",
+    "let's make it a lethal ",
+    "wait—rule ",
+    "wait: rule ",
+    "wait - rule ",
+)
+
+
+def strip_leaked_chain_of_thought(text: str) -> str:
+    """Strip leaked model chain-of-thought, prompt-rule deliberation, and pre-tool monologue.
+
+    Handles cases where low-effort model variants (e.g. gemini-4-argon-low) fail to open a
+    separate thinking channel and spill internal deliberation into visible content before
+    emitting the final user-facing reply.
+    """
+    if not text:
+        return ""
+
+    # 1. Strip explicit <thought>...</thought> or <thinking>...</thinking> blocks and orphaned closing tags
+    text = re.sub(
+        r"(?is)<\s*(?:thought|thinking)\s*>[\s\S]*?<\s*/\s*(?:thought|thinking)\s*>\s*",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"(?is)^[\s\S]*?<\s*/\s*(?:thought|thinking)\s*>\s*",
+        "",
+        text,
+    )
+
+    lower = text.lower()
+    has_monologue_marker = any(ind in lower for ind in _MONOLOGUE_INDICATORS) or bool(
+        re.match(
+            r"^\s*(?:[^\w\s]*|\S+/)?\s*(?:calibrating response\.\.\.|wait[—\-:]\s*(?:let's|rule\s+\d+|can\s+we))",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+    if has_monologue_marker:
+        # 2a. Self-dispatch cue ("Let's send it!", "Let's post it!", "Let's ship it!") followed by the final reply
+        dispatch_matches = list(
+            re.finditer(
+                r"(?is)(?:let's\s+(?:send|post|deliver|emit|ship)\s+(?:it|this|that)|here\s+goes)\s*[!.:]*\s*",
+                text,
+            )
+        )
+        if dispatch_matches:
+            last_m = dispatch_matches[-1]
+            prefix_lower = text[: last_m.start()].lower()
+            remainder = text[last_m.end() :].strip()
+            if remainder and any(ind in prefix_lower for ind in _MONOLOGUE_INDICATORS):
+                return remainder
+
+        # 2b. Quoted draft-then-emit suffix duplication (model drafts "X" in monologue, then emits X at end)
+        stripped_text = text.strip()
+        lines = [ln.strip() for ln in stripped_text.splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            tail = lines[-1]
+            if len(tail) >= 15:
+                prefix_body = stripped_text[: -len(tail)]
+                if f'"{tail}"' in prefix_body or f"“{tail}”" in prefix_body:
+                    return tail
+
+        # 2c. Pure unfinished pre-tool monologue (e.g. "Wait—let's get a reaction GIF via gif_tool.py ... Let's run gif_tool.py.")
+        if re.match(
+            r"(?is)^\s*(?:[^\w\s]*|\S+/)?\s*(?:calibrating response\.\.\.|wait[—\-:]\s*let's\b)[\s\S]*?(?:let's\s+(?:run|check|call|fetch|get|use)\s+[^\n]+)\s*$",
+            stripped_text,
+        ):
+            return ""
+
+    return text
+
+
 def strip_internal_cli_chatter(text: str) -> str:
     """Strip Antigravity CLI system messages, background task envelopes, and wait chatter."""
     if not text:
@@ -130,7 +272,22 @@ def strip_internal_cli_chatter(text: str) -> str:
     # Collapse repetitive patterns first to prevent runaway repetitive loops
     text = dedup_repetitive_patterns(text, max_repeats=3)
 
-    # 1. Block-level removals (anchored to line start so inline mentions are not eaten to EOF)
+    # Strip leaked model chain-of-thought / prompt-rule deliberation before code-span masking
+    text = strip_leaked_chain_of_thought(text)
+    if not text:
+        return ""
+
+    # 1. System / task XML envelope removals (anchored to line start so inline mentions are not eaten to EOF)
+    text = re.sub(
+        r"(?is)(?:Queries completed with no tool calls|Roundtrip complete)\.\s*Raising signal for pending messages\.\.\.[\s\S]*?Floated messages complete\.\s*Continuing execution\.?\s*",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"(?is)\[MESSAGE FROM BACKGROUND TASK\s*\(id:[^\)]+\)\][\s\S]*?(?:Floated messages complete\.\s*Continuing execution\.?\s*|(?=\n\s*#{1,6}\s)|\Z)",
+        "",
+        text,
+    )
     text = re.sub(
         r"(?m)^\s*The following is a\s*<\s*SYSTEM_MESSAGE\s*>[\s\S]*?(?:<\s*/\s*SYSTEM_MESSAGE\s*>|\}\s*(?=[A-Z#])|$)",
         "",
@@ -150,6 +307,31 @@ def strip_internal_cli_chatter(text: str) -> str:
         text,
         flags=re.IGNORECASE,
     )
+    text = re.sub(
+        r"An async(?:hronous)? task (?:[a-zA-Z0-9_\-\/]+ )?has completed:\s*[^\n]+(?:\s*\(State:[^\)]+\))?(?:\s*Result payload:\s*\d+)?(?:\s*Task output:\s*(?:\[[^\]\r\n]*\]|[^\r\n]*))?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?is)(?:^|\n)\s*An async(?:hronous)? task (?:[a-zA-Z0-9_\-\/]+ )?has completed"
+        r"(?:"
+        r"[\s\S]*?<end of task output>"
+        r"|\s+with exit code:?\s*-?\d+\.?[\s\S]*?(?:(?:Log:\s*file://[^\n]+(?:\n|$))|(?:\n\s*\}\s*\n+(?=[A-Za-z#*📸🍌]))|(?:\n\s*\]\s*\n+(?=[A-Za-z#*📸🍌]))|(?=\n\s*(?:#{1,6}\s|\*\*|📸|🍌|✅|⚠️))|\Z)"
+        r")",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"A subagent has completed[\s\S]*?<end of subagent output>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Shield all fenced code blocks and inline code spans before line/phrase chatter scrubbing
+    text, code_spans = mask_code_spans(text, prefix="\x00SAFETY_SPAN_")
+
     text = re.sub(
         r"(?m)^\s*Wait for at least one of the background tasks to complete:?[\s\S]*?(?=\n\n|\Z)",
         "",
@@ -202,24 +384,18 @@ def strip_internal_cli_chatter(text: str) -> str:
         text,
         flags=re.IGNORECASE,
     )
-    text = re.sub(r"Task logs are available at:\s*file://[^\n]+", "", text, flags=re.IGNORECASE)
     text = re.sub(
-        r"An async(?:hronous)? task has completed[\s\S]*?<end of task output>",
+        r"An async(?:hronous)? task (?:[a-zA-Z0-9_\-\/]+ )?has completed:\s*[^\n]+(?:\s*\(State:[^\)]+\))?(?:\s*Result payload:\s*\d+)?(?:\s*Task output:\s*(?:\[[^\]\r\n]*\]|[^\r\n]*))?",
         "",
         text,
         flags=re.IGNORECASE,
     )
+
+    # Strip raw command stdout sentinels and trailing script result JSON blocks
     text = re.sub(
-        r"An async(?:hronous)? task has completed:\s*[^\n]+(?:\s*\(State:[^\)]+\))?(?:\s*Result payload:\s*\d+)?(?:\s*Task output:\s*(?:\[[^\]\r\n]*\]|[^\r\n]*))?",
+        r"(?m)^\s*===+[^=\n]+===+\s*\n\s*\{[\s\S]*?\n\}\s*\n*",
         "",
         text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(
-        r"A subagent has completed[\s\S]*?<end of subagent output>",
-        "",
-        text,
-        flags=re.IGNORECASE,
     )
     text = re.sub(
         r"root agent idle; waiting up to \d+s for \d+ background task\(s\)[^\n]*",
@@ -265,6 +441,7 @@ def strip_internal_cli_chatter(text: str) -> str:
             cleaned_lines.append(line)
 
     res = "\n".join(cleaned_lines)
+    res = restore_code_spans(res, code_spans, prefix="\x00SAFETY_SPAN_")
     return re.sub(r"\n{3,}", "\n\n", res).strip()
 
 
@@ -285,7 +462,36 @@ def is_internal_cli_leak(text: str) -> bool:
         return True
     if orig_lower.startswith("tool is running as a background task with task id"):
         return True
-    if orig_lower.startswith("an async task has completed") or orig_lower.startswith("an asynchronous task has completed"):
+    # Option B background execution placeholders
+    if re.search(r"\b(?:task update|background task(?: is)? running|please stand by)\b", orig_lower):
+        is_substantive = len(text.strip()) > 300 and ("\n\n" in text or "###" in text)
+        if not is_substantive:
+            return True
+    # Asynchronous task / background execution wait leaks
+    if re.search(r"\ban async(?:hronous)?\s+(?:background\s+)?(?:command|task|job|process)\b", orig_lower):
+        if any(w in orig_lower for w in ("running", "wait", "silent", "tools", "completed", "finish")):
+            is_substantive = len(text.strip()) > 300 and ("\n\n" in text or "###" in text)
+            if not is_substantive:
+                return True
+    if (
+        "continuing silent background execution" in orig_lower
+        or "waitmsbeforeasync:" in orig_lower
+        or "no response text needed while waiting" in orig_lower
+        or "wait silently for the next event" in orig_lower
+        or "please do not call any more tools until the task finishes" in orig_lower
+        or "do not poll or call additional tools" in orig_lower
+    ):
+        is_substantive = len(text.strip()) > 300 and ("\n\n" in text or "###" in text)
+        if not is_substantive:
+            return True
+
+    if (
+        orig_lower.startswith("an async task has completed")
+        or orig_lower.startswith("an asynchronous task has completed")
+        or re.match(r"^an async(?:hronous)? task (?:[a-zA-Z0-9_\-\/]+ )?has completed", orig_lower)
+    ):
+        return True
+    if orig_lower.startswith("task id ") and "finished with result" in orig_lower:
         return True
     if orig_lower.startswith("an async command is running") or "do not poll or call additional tools until the background task finishes" in orig_lower:
         return True
@@ -297,6 +503,8 @@ def is_internal_cli_leak(text: str) -> bool:
         'not found for api version' in orig_lower
         or 'modelservice.listmodels' in orig_lower
         or ('error: not_found' in orig_lower and 'models/' in orig_lower)
+        or 'invalid model selection' in orig_lower
+        or 'not recognized as a known model' in orig_lower
     ):
         return True
 
@@ -313,6 +521,13 @@ def is_internal_cli_leak(text: str) -> bool:
         if not is_substantive:
             return True
 
+    # System message echoes and malformed tool call artifacts
+    if "<system_message>" in orig_lower or "the following is a <system_message>" in orig_lower:
+        cleaned_msg = strip_internal_cli_chatter(text).strip()
+        words_msg = [w for w in cleaned_msg.split() if any(c.isalnum() for c in w)]
+        if len(words_msg) < 5:
+            return True
+
     cleaned = strip_internal_cli_chatter(text).strip()
     if not cleaned:
         return True
@@ -325,6 +540,18 @@ def is_internal_cli_leak(text: str) -> bool:
         "reply:none",
         "reply: none",
         "none",
+        "null",
+        "}",
+        "]",
+        ")",
+        ">",
+        "{",
+        "[",
+        "(",
+        "<",
+        "}}",
+        "]}",
+        "})",
         "*(response completed, but no text output was generated)*",
         "no content generated yet",
         "no content generated yet.",
@@ -353,13 +580,21 @@ def is_internal_cli_leak(text: str) -> bool:
     # Option B chatter on cleaned text (suppress only if not substantive)
     is_substantive = len(cleaned.strip()) > 300 and ("\n\n" in cleaned or "###" in cleaned)
     if not is_substantive:
-        if re.search(r"\bwait(?:ing)?\s+for\s+(?:at\s+least\s+one\s+of\s+the\s+)?(?:background\s+)?task", lower):
+        lines_non_empty = [l.strip() for l in cleaned.splitlines() if l.strip()]
+        if lines_non_empty and all(
+            re.match(r"^(?:-\s*)?(?:a?waiting|wait)\s+", l, re.IGNORECASE)
+            for l in lines_non_empty
+        ):
             return True
-        if re.search(r"\bwait(?:ing)?\s+for\s+task[:\s]", lower):
+        if re.search(r"\ba?wait(?:ing)?\s+for\s+(?:at\s+least\s+one\s+of\s+the\s+)?(?:background\s+)?task", lower):
             return True
-        if re.search(r"\bwait(?:ing)?\s+for\s+[a-f0-9\-]+(?:/task-\d+)?\s+to\s+(?:complete|finish)", lower):
+        if re.search(r"\ba?wait(?:ing)?\s+for\s+task[:\s]", lower):
             return True
-        if re.search(r"\bwait(?:ing)?\s+for\s+(?:command|process)\s+to\s+(?:finish|complete)", lower):
+        if re.search(r"\ba?wait(?:ing)?\s+for\s+[a-f0-9\-]+(?:/task-\d+)?\s+to\s+(?:complete|finish)", lower):
+            return True
+        if re.search(r"\ba?wait(?:ing)?\s+for\s+(?:command|process)\s+to\s+(?:finish|complete)", lower):
+            return True
+        if re.search(r"\ba?waiting\s+(?:isolated|execution|grid|search|task|command|background|process)\b", lower):
             return True
 
     # If remaining lines are exclusively internal daemon/system/test lines without user-facing content
@@ -376,14 +611,22 @@ def is_internal_cli_leak(text: str) -> bool:
 
     # Standalone pure CLI status or task completion notices without substantive user content
     words = [w for w in cleaned.split() if any(c.isalnum() for c in w)]
-    if len(words) <= 15:
+    if not words and not any(ord(c) > 127 for c in cleaned):
+        return True
+    # Stray CJK / punctuation empty-turn sampler tokens (e.g. "即是", "...") with no ASCII words or emojis
+    if len(cleaned) <= 12 and not any(c.isascii() and c.isalnum() for c in cleaned):
+        if all(not (0x1F000 <= ord(c) <= 0x1FAFF or 0x2600 <= ord(c) <= 0x27BF) for c in cleaned):
+            return True
+    if len(words) <= 25:
+        if "awaiting" in lower and any(k in lower for k in ("results", "execution", "task", "search", "grid", "eval")):
+            return True
         if "root agent idle; waiting up to" in lower:
             return True
-        if "terminating" in lower and "background task(s) on exit" in lower:
+        if re.search(r"(?<!`)\bterminating\s+\d+\s+background\s+task\(s\)\s+on\s+exit\b", lower):
             return True
         if lower.startswith("task id") and ("canceled" in lower or "completed" in lower or "failed" in lower):
             return True
-        if "waiting for task" in lower or "wait for task" in lower or "wait for background task" in lower:
+        if "waiting for task" in lower or "wait for task" in lower or "wait for background task" in lower or "awaiting task" in lower:
             return True
         if "no other work to do" in lower:
             return True

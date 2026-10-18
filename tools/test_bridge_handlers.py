@@ -19,6 +19,8 @@ WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
     sys.path.insert(0, str(WORKSPACE))
 
+import signal
+import discord
 import tools.bridge_handlers as bh
 import tools.bridge_state as bs
 import tools.bridge_runner as br
@@ -1316,8 +1318,8 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Ivy", item["prompt"])
         self.assertEqual(item["channel_id"], baseball_id)
 
-    async def test_excluded_channel_accepts_ivy_inline_reply_to_zero(self):
-        """Verify that Ivy replying to a Zero message via Discord inline reply in #baseball is accepted."""
+    async def test_excluded_channel_drops_ivy_bare_inline_reply_to_zero(self):
+        """Verify that Ivy replying to a Zero message via bare Discord inline reply without explicit tag is dropped."""
         mock_bot = MagicMock()
         mock_bot.user.id = 1542285964213358633
 
@@ -1333,7 +1335,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         msg.author.display_name = "Ivy"
         msg.content = "I reviewed that model too, looks solid."
         msg.created_at.timestamp.return_value = time.time()
-        msg.mentions = [mock_bot.user]
+        msg.mentions = []
         msg.reference = MagicMock()
         msg.reference.resolved = MagicMock()
         msg.reference.resolved.author.id = 1542285964213358633  # Zero
@@ -1347,9 +1349,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         ext_queue = AsyncMock()
 
         await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
-        home_queue.put.assert_awaited_once()
-        item = home_queue.put.call_args[0][0]
-        self.assertIn("CROSS-BOT PEER COMMUNICATION", item["prompt"])
+        home_queue.put.assert_not_called()
 
     async def test_excluded_channel_drops_ivy_when_paused_under_last_word(self):
         """Verify that Ivy messages in #baseball are dropped when Ivy is on cooldown."""
@@ -1455,11 +1455,14 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         baseball_id = 1548196929308065893
         t_now = time.time()
 
-        # Inject 4 alternating messages between Zero and Ivy into channel history
-        ch.record_message(baseball_id, "baseball", "Zero", is_bot=True, content="Zero msg 1", msg_id=101, timestamp=datetime.fromtimestamp(t_now - 20, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
-        ch.record_message(baseball_id, "baseball", "Ivy", is_bot=True, content="Ivy msg 1", msg_id=102, timestamp=datetime.fromtimestamp(t_now - 15, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
-        ch.record_message(baseball_id, "baseball", "Zero", is_bot=True, content="Zero msg 2", msg_id=103, timestamp=datetime.fromtimestamp(t_now - 10, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
-        ch.record_message(baseball_id, "baseball", "Ivy", is_bot=True, content="Ivy msg 2", msg_id=104, timestamp=datetime.fromtimestamp(t_now - 5, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+        # Inject 10 alternating messages between Zero and Ivy into channel history
+        for idx in range(1, 11):
+            bot_name = "Zero" if idx % 2 != 0 else "Ivy"
+            ch.record_message(
+                baseball_id, "baseball", bot_name, is_bot=True,
+                content=f"{bot_name} msg {idx}", msg_id=100 + idx,
+                timestamp=datetime.fromtimestamp(t_now - (55 - idx * 5), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            )
 
         msg = MagicMock()
         msg.id = 105
@@ -1487,6 +1490,270 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(item.get("is_last_word"))
         self.assertEqual(item.get("last_word_bot_id"), "1541205716948353074")
         self.assertIn("LAST WORD PROTOCOL ACTIVE", item["prompt"])
+
+
+
+    async def test_mid_turn_steering_preserves_inflight_prompt(self):
+        """Verify mid-turn steering captures and preserves in-flight prompt for dual-turn synthesis."""
+        import signal
+        import tools.bridge_handlers as bh
+        from tools.bridge_runner import channel_active_procs, channel_active_prompts, steering_channels
+
+        channel_id = 1542081375287640084
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        channel_active_procs[channel_id] = mock_proc
+        channel_active_prompts[channel_id] = "Will ivy pick up that changed setting too?"
+
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        msg = MagicMock()
+        msg.id = 9999
+        msg.channel.id = channel_id
+        msg.channel.name = "zero-chat"
+        msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
+        msg.author.id = 179407724335988736  # Ryan Brock
+        msg.author.bot = False
+        msg.author.display_name = "Ryan"
+        msg.content = "Do we need to restart your bridge?"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = []
+        msg.reference = None
+        msg.attachments = []
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        try:
+            await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+            mock_proc.send_signal.assert_called_with(signal.SIGINT)
+            self.assertIn(channel_id, steering_channels)
+            home_queue.put.assert_awaited_once()
+
+            item = home_queue.put.call_args[0][0]
+            self.assertTrue(item.get("is_steer"))
+            steer_prompt = item["prompt"]
+            self.assertIn("[ORIGINAL IN-FLIGHT TASK BEING EXECUTED]", steer_prompt)
+            self.assertIn("Will ivy pick up that changed setting too?", steer_prompt)
+            self.assertIn("[NEW DIRECTIVE RECEIVED MID-TURN]", steer_prompt)
+            self.assertIn("Do we need to restart your bridge?", steer_prompt)
+            self.assertIn("SYNTHESIZE BOTH", steer_prompt)
+        finally:
+            channel_active_procs.pop(channel_id, None)
+            channel_active_prompts.pop(channel_id, None)
+            steering_channels.discard(channel_id)
+
+    async def test_mid_turn_steering_fallback_to_in_flight_disk(self):
+        """Verify mid-turn steering falls back to get_in_flight() if memory map is empty."""
+        import signal
+        import tools.bridge_handlers as bh
+        from tools.bridge_runner import channel_active_procs, channel_active_prompts, steering_channels
+
+        channel_id = 1542081375287640084
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        channel_active_procs[channel_id] = mock_proc
+        channel_active_prompts.pop(channel_id, None)
+
+        mock_bot = MagicMock()
+        mock_bot.user.id = 1542285964213358633
+
+        msg = MagicMock()
+        msg.id = 10000
+        msg.channel.id = channel_id
+        msg.channel.name = "zero-chat"
+        msg.channel.parent_id = None
+        msg.guild.id = 1210466877294518272
+        msg.author.id = 179407724335988736
+        msg.author.bot = False
+        msg.author.display_name = "Ryan"
+        msg.content = "Second question here"
+        msg.created_at.timestamp.return_value = time.time()
+        msg.mentions = []
+        msg.reference = None
+        msg.attachments = []
+
+        home_queue = AsyncMock()
+        ext_queue = AsyncMock()
+
+        with patch("tools.bridge_handlers.get_in_flight", return_value={str(channel_id): {"prompt": "First question on disk"}}):
+            try:
+                await bh.handle_message(msg, mock_bot, home_turn_queue=home_queue, ext_turn_queue=ext_queue)
+                item = home_queue.put.call_args[0][0]
+                steer_prompt = item["prompt"]
+                self.assertIn("[ORIGINAL IN-FLIGHT TASK BEING EXECUTED]", steer_prompt)
+                self.assertIn("First question on disk", steer_prompt)
+                self.assertIn("Second question here", steer_prompt)
+            finally:
+                channel_active_procs.pop(channel_id, None)
+                channel_active_prompts.pop(channel_id, None)
+                steering_channels.discard(channel_id)
+
+    def test_try_coalesce_pending_turn_same_author(self):
+        from tools.bridge_handlers import channel_queues, try_coalesce_pending_turn
+        import asyncio
+
+        cid = 888123
+        aid = 999456
+        q = asyncio.Queue()
+        item = {
+            "prompt": "First message chunk",
+            "raw_prompt": "First message chunk",
+            "channel_id": cid,
+            "author_id": aid,
+            "author_name": "Amos",
+            "is_steer": False,
+            "attachments": ["/tmp/att1.png"],
+            "queued_at": time.perf_counter(),
+        }
+        q.put_nowait(item)
+        channel_queues[cid] = q
+
+        mock_msg = MagicMock()
+        mock_msg.id = 555001
+
+        res = try_coalesce_pending_turn(
+            channel_id=cid,
+            author_id=aid,
+            author_name="Amos",
+            new_text="Second message chunk (handoff envelope)",
+            new_attachments=["/tmp/att2.png"],
+            new_msg=mock_msg,
+            is_group=True,
+        )
+
+        self.assertTrue(res)
+        self.assertEqual(q.qsize(), 1)
+        coalesced = q.get_nowait()
+        self.assertEqual(coalesced["prompt"], "First message chunk\n\nSecond message chunk (handoff envelope)")
+        self.assertEqual(coalesced["attachments"], ["/tmp/att1.png", "/tmp/att2.png"])
+        self.assertEqual(coalesced["reply_target"], mock_msg)
+        self.assertEqual(coalesced["coalesced_count"], 2)
+
+    def test_try_coalesce_pending_turn_steered_item(self):
+        from tools.bridge_handlers import channel_queues, try_coalesce_pending_turn
+        import asyncio
+
+        cid = 888124
+        aid = 999456
+        q = asyncio.Queue()
+        item = {
+            "prompt": "[MID-TURN GROUP CONVERSATION UPDATE]\nWhile you were drafting your reply, a new message arrived in the channel from Amos:\n\"Part 1\"",
+            "raw_prompt": "Part 1",
+            "original_task": "Review PR 97",
+            "channel_id": cid,
+            "author_id": aid,
+            "author_name": "Amos",
+            "is_steer": True,
+            "attachments": [],
+            "queued_at": time.perf_counter(),
+        }
+        q.put_nowait(item)
+        channel_queues[cid] = q
+
+        res = try_coalesce_pending_turn(
+            channel_id=cid,
+            author_id=aid,
+            author_name="Amos",
+            new_text="Part 2 (continuation)",
+            new_attachments=[],
+            new_msg=None,
+            is_group=True,
+        )
+
+        self.assertTrue(res)
+        coalesced = q.get_nowait()
+        self.assertEqual(coalesced["raw_prompt"], "Part 1\n\nPart 2 (continuation)")
+        self.assertIn("Part 1\n\nPart 2 (continuation)", coalesced["prompt"])
+        self.assertIn("Review PR 97", coalesced["prompt"])
+
+    def test_try_coalesce_pending_turn_different_author(self):
+        from tools.bridge_handlers import channel_queues, try_coalesce_pending_turn
+        import asyncio
+
+        cid = 888125
+        q = asyncio.Queue()
+        item = {
+            "prompt": "Message from User A",
+            "raw_prompt": "Message from User A",
+            "channel_id": cid,
+            "author_id": 111111,
+            "author_name": "UserA",
+            "is_steer": False,
+            "attachments": [],
+            "queued_at": time.perf_counter(),
+        }
+        q.put_nowait(item)
+        channel_queues[cid] = q
+
+        res = try_coalesce_pending_turn(
+            channel_id=cid,
+            author_id=222222,
+            author_name="UserB",
+            new_text="Message from User B",
+            new_attachments=[],
+            new_msg=None,
+            is_group=True,
+        )
+
+        self.assertFalse(res)
+        self.assertEqual(q.qsize(), 1)
+        remaining = q.get_nowait()
+        self.assertEqual(remaining["prompt"], "Message from User A")
+
+    async def test_resilient_typing_continuous_heartbeats(self):
+        """Verify resilient_typing fires initial and subsequent heartbeats."""
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.typing = MagicMock()
+
+        async with bh.resilient_typing(mock_target, interval=0.04):
+            await asyncio.sleep(0.15)
+
+        self.assertGreaterEqual(mock_target.channel.typing.call_count, 3)
+
+    async def test_resilient_typing_error_resilience(self):
+        """Verify resilient_typing survives transient HTTP or network exceptions."""
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.typing = AsyncMock(side_effect=[None, Exception("HTTP 429 Rate Limited"), None, None])
+
+        async with bh.resilient_typing(mock_target, interval=0.04):
+            await asyncio.sleep(0.15)
+
+        self.assertGreaterEqual(mock_target.channel.typing.call_count, 3)
+
+    async def test_resilient_typing_clean_cancellation(self):
+        """Verify resilient_typing cancels cleanly when the context block exits."""
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.typing = AsyncMock()
+
+        async with bh.resilient_typing(mock_target, interval=0.05):
+            await asyncio.sleep(0.01)
+
+        # Context exited cleanly
+        count_at_exit = mock_target.channel.typing.call_count
+        await asyncio.sleep(0.1)
+        self.assertEqual(mock_target.channel.typing.call_count, count_at_exit)
+
+    async def test_resilient_typing_none_target_noop(self):
+        """Verify resilient_typing handles None target without errors."""
+        async with bh.resilient_typing(None):
+            pass
+
+    async def test_resilient_typing_dynamic_callable_target(self):
+        """Verify resilient_typing supports dynamic callable target getters."""
+        chan = MagicMock(spec=discord.TextChannel)
+        chan.typing = AsyncMock()
+        getter = lambda: chan
+
+        async with bh.resilient_typing(getter, interval=0.04):
+            await asyncio.sleep(0.1)
+
+        self.assertGreaterEqual(chan.typing.call_count, 2)
 
 
 if __name__ == "__main__":

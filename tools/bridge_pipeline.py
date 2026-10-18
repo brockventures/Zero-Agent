@@ -462,7 +462,8 @@ def prepare_turn_prompt(
 
     anti_leak_guidance = (
         "[Bridge Execution Invariant - Strictly Zero Internal Chatter Leaks]:\n"
-        "• Never choose SDK Option B or emit intermediate wait/status chatter; stop calling tools silently while waiting for background tasks, and reserve '[NO_REPLY]' strictly for unaddressed ambient chatter (never when tagged)."
+        "• Never choose SDK Option B or emit intermediate wait/status chatter; stop calling tools silently while waiting for background tasks, and reserve '[NO_REPLY]' strictly for unaddressed ambient chatter (never when tagged).\n"
+        "• Never emit internal chain-of-thought, prompt rule citations, or draft rehearsals into visible response text; output ONLY the final user-facing message."
     )
 
     reply_ctx = extract_reply_context(reply_target, channel_id=channel_id)
@@ -525,6 +526,49 @@ def prepare_turn_prompt(
     except Exception as ce:
         print(f"[BridgePipeline] Warning formatting channel context: {ce}")
 
+    author_tag = f" from {author_name}{reply_author_tag_suffix}" if author_name else (reply_author_tag_suffix or "")
+    time_block = (
+        f"[System Time & Timezone]: Current time is {now_pt.strftime('%A, %b %d, %Y %I:%M %p PT')} (America/Los_Angeles; VM UTC: {now_utc.strftime('%H:%M:%S UTC')}). Always use Pacific Time (PT)."
+    )
+    reply_block_section = f"{reply_block}\n\n" if reply_block else ""
+    ext_mem_ctx = get_ambient_memory_context(prompt, mode="external", channel_id=channel_id)
+    mem_section = f"{ext_mem_ctx}\n\n" if ext_mem_ctx else ""
+    carry_section = f"{eng_carry_block}\n\n" if eng_carry_block else ""
+
+    # Check if this external channel already has an initialized session transcript on disk (Turn 1+).
+    # On resumed turns, Step 0 of the transcript already holds the full 20-point crab_cavern_prompt.md
+    # and architecture_manifest; re-injecting 20 KB of system rules into <USER_REQUEST> every turn
+    # bloats context and primes low-effort models to recite prompt rules out loud.
+    is_resumed_external = False
+    try:
+        from tools.bridge_state import get_reset_session_keys
+        from tools.bridge_stream import get_latest_transcript_step_index
+
+        existing_cid = get_channel_session_id(channel_id, mode="external")
+        if (
+            existing_cid
+            and str(sess_key) not in get_reset_session_keys()
+            and get_latest_transcript_step_index(existing_cid) >= 1
+        ):
+            is_resumed_external = True
+    except Exception:
+        is_resumed_external = False
+
+    if is_resumed_external:
+        return (
+            "[CRAB CAVERN MULTI-AGENT COLLABORATION ENVIRONMENT — RESUMED TURN]\n"
+            "• Keep responses under 2,000 chars (in #lounge: 1–3 sentences max in plain conversational prose, zero headers/bullets; in #the-banana-stand: v1.1 handoff envelope <=180 chars).\n"
+            "• Use physical Discord snowflakes (<@ID>) when addressing peers; never leak private homelab data.\n\n"
+            f"{carry_section}"
+            f"{time_block}\n\n"
+            f"{gif_guidance}\n\n"
+            f"{anti_leak_guidance}\n\n"
+            f"{channel_ctx_block}"
+            f"{mem_section}"
+            f"{reply_block_section}"
+            f"[INBOUND MESSAGE{author_tag}]: {prompt}"
+        )
+
     manifest_block = ""
     try:
         from tools.session_summarizer import get_architecture_manifest
@@ -533,14 +577,8 @@ def prepare_turn_prompt(
     except Exception as me:
         print(f"[BridgePipeline] Warning generating architecture manifest: {me}")
 
-    author_tag = f" from {author_name}{reply_author_tag_suffix}" if author_name else (reply_author_tag_suffix or "")
-    time_block = (
-        f"[System Time & Timezone]: Current time is {now_pt.strftime('%A, %b %d, %Y %I:%M %p PT')} (America/Los_Angeles; VM UTC: {now_utc.strftime('%H:%M:%S UTC')}). Always use Pacific Time (PT)."
-    )
-
     rules = get_runtime_rules()
     tmpl = rules.get("external_system_prompt")
-    reply_block_section = f"{reply_block}\n\n" if reply_block else ""
     if tmpl:
         try:
             ext_prompt = (
@@ -558,7 +596,6 @@ def prepare_turn_prompt(
                     ext_prompt = ext_prompt.replace("[INBOUND MESSAGE", f"{reply_block}\n\n[INBOUND MESSAGE", 1)
                 else:
                     ext_prompt = f"{ext_prompt}\n\n{reply_block}"
-            ext_mem_ctx = get_ambient_memory_context(prompt, mode="external", channel_id=channel_id)
             if ext_mem_ctx:
                 if "[INBOUND MESSAGE" in ext_prompt:
                     ext_prompt = ext_prompt.replace("[INBOUND MESSAGE", f"{ext_mem_ctx}\n\n[INBOUND MESSAGE", 1)
@@ -571,8 +608,6 @@ def prepare_turn_prompt(
             ext_prompt = f"{ext_prompt}\n\n{anti_leak_guidance}"
             return ext_prompt
         except Exception:
-            ext_mem_ctx = get_ambient_memory_context(prompt, mode="external", channel_id=channel_id)
-            mem_section = f"{ext_mem_ctx}\n\n" if ext_mem_ctx else ""
             return (
                 f"{time_block}\n\n{gif_guidance}\n\n{anti_leak_guidance}\n\n{manifest_block}\n\n{channel_ctx_block}"
                 f"{mem_section}"
@@ -580,8 +615,6 @@ def prepare_turn_prompt(
                 f"[INBOUND MESSAGE{author_tag}]: {prompt}"
             )
     else:
-        ext_mem_ctx = get_ambient_memory_context(prompt, mode="external", channel_id=channel_id)
-        mem_section = f"{ext_mem_ctx}\n\n" if ext_mem_ctx else ""
         return (
             "[CRAB CAVERN MULTI-AGENT COLLABORATION ENVIRONMENT]\n"
             "You are Zero, an autonomous systems engineering co-pilot collaborating with peer AI agents (Amos, Marvin) and developers in Crab Cavern.\n\n"
@@ -623,21 +656,48 @@ async def deliver_turn_output(
 
     sent_messages: list[discord.Message] = []
 
-    final_text = format_for_discord(output_text or "*(No output from agent)*")
-    final_text = clean_discord_latex(final_text)
+    # 0. Extract and apply any [REACT: <emoji>] / [REACTION: <emoji>] tags (ignoring inline/fenced code spans)
+    from tools.bridge_formatting import (
+        _CODE_OR_CHOICES_RE,
+        extract_react_directives,
+        strip_unquoted_choices,
+    )
+    output_text_clean, reactions_to_add = extract_react_directives(output_text or "")
+
+    target_reaction_msg = reply_target if hasattr(reply_target, "add_reaction") else (
+        delivery_target if hasattr(delivery_target, "add_reaction") else None
+    )
+    if reactions_to_add and target_reaction_msg:
+        for emoji in reactions_to_add:
+            try:
+                await target_reaction_msg.add_reaction(emoji)
+            except Exception as rx_err:
+                print(f"[BridgePipeline] Notice adding reaction '{emoji}': {rx_err}")
+
+    # If the response was purely reaction(s) with no text payload, resolve cleanly without sending empty message
+    if not output_text_clean and reactions_to_add:
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        if timer:
+            timer.mark_delivery_end()
+            timer.finish("SUCCESS")
+        return []
+
+    final_text = format_for_discord(output_text_clean or "*(No output from agent)*")
 
     if is_gif_disabled_for_channel(str(channel_id), channel_id=channel_id):
         final_text = strip_reaction_gifs(final_text)
 
     if mode == "external":
-        clean_ext_text = re.sub(r":\s*(?:\n\s*)*\[(?:CHOICES|OPTIONS):\s*(?:[^\[\]]|\[[^\]]*\])+\]", ".", final_text, flags=re.IGNORECASE).strip()
-        clean_ext_text = re.sub(r"\[(?:CHOICES|OPTIONS):\s*(?:[^\[\]]|\[[^\]]*\])+\]", "", clean_ext_text, flags=re.IGNORECASE).strip()
+        clean_ext_text = re.sub(r":\s*(?:\n\s*)*\[(?:CHOICES|OPTIONS):\s*(?:[^\[\]]|\[[^\]]*\])+\]\s*$", ".", final_text, flags=re.IGNORECASE).strip()
+        clean_ext_text = strip_unquoted_choices(clean_ext_text)
         clean_ext_text = scrub_credentials(clean_ext_text)
-        clean_ext_text = clean_discord_latex(clean_ext_text)
         clean_ext_text = re.sub(
             r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", clean_ext_text, flags=re.IGNORECASE
         ).strip()
-        clean_ext_text = strip_internal_cli_chatter(clean_ext_text)
 
         # Resolve destination channel ID early for channel-specific formatting & Banana protocol quarantine
         target_dest = delivery_target if delivery_target else reply_target
@@ -657,14 +717,20 @@ async def deliver_turn_output(
 
         is_banana_stand = (dest_cid == BANANA_STAND_CHANNEL_ID)
 
-        # Banana Protocol Channel Quarantine: Strip handoff envelopes from all non-banana channels
+        # Banana Protocol Channel Quarantine: Strip handoff envelopes from all non-banana channels (both top and bottom)
         if not is_banana_stand:
+            clean_ext_text = re.sub(
+                r"^(?:\s*(?:```(?:handoff)?|<!--\s*(?:banana-)?envelope)\s*\n?\{.*?\}\s*(?:```|-->)\s*\n*)",
+                "",
+                clean_ext_text,
+                flags=re.DOTALL,
+            )
             clean_ext_text = re.sub(
                 r"(\n*(?:```(?:handoff)?|<!--\s*(?:banana-)?envelope)\s*\n?\{.*?\}\s*(?:```|-->)\s*)$",
                 "",
                 clean_ext_text,
                 flags=re.DOTALL,
-            ).rstrip()
+            ).strip()
 
         if (
             clean_ext_text
@@ -712,17 +778,29 @@ async def deliver_turn_output(
         except Exception as re_err:
             print(f"[BridgePipeline] Error recording Zero reply to channel history: {re_err}")
 
-        # In #the-banana-stand, prevent handoff envelopes from being severed into an orphan message.
-        # Auto-minify envelopes and condense whitespace to preserve the protocol envelope in message 1.
+        # In #the-banana-stand, enforce a strict 1-message ceiling (<= 1,980 chars) and support both
+        # top-placed (v1.1) and bottom-placed handoff envelopes so replies never split into 2 messages.
         if is_banana_stand and len(clean_ext_text) > 1980:
-            env_match = re.search(
+            top_env_match = re.match(
+                r"^(\s*(?:```(?:handoff)?|<!--\s*(?:banana-)?envelope)\s*\n?\{.*?\}\s*(?:```|-->)\s*\n*)",
+                clean_ext_text,
+                re.DOTALL,
+            )
+            bot_env_match = re.search(
                 r"(\n*(?:```(?:handoff)?|<!--\s*(?:banana-)?envelope)\s*\n?\{.*?\}\s*(?:```|-->)\s*)$",
                 clean_ext_text,
                 re.DOTALL,
             )
+            env_match = top_env_match or bot_env_match
+            is_top_env = bool(top_env_match)
+
             if env_match:
                 raw_env_str = env_match.group(1).strip()
-                body = clean_ext_text[: env_match.start()].rstrip()
+                if is_top_env:
+                    body = clean_ext_text[env_match.end() :].strip()
+                else:
+                    body = clean_ext_text[: env_match.start()].rstrip()
+
                 # 1. Auto-minify and prune envelope bloat before touching body
                 m_json = re.search(r"\{.*\}", raw_env_str, re.DOTALL)
                 if m_json:
@@ -749,11 +827,12 @@ async def deliver_turn_output(
 
                 body_condensed = re.sub(r"\n{3,}", "\n\n", body)
                 body_condensed = re.sub(r"[ \t]+\n", "\n", body_condensed).strip()
-                combined = f"{body_condensed}\n\n{env_str}"
+                combined = f"{env_str}\n{body_condensed}" if is_top_env else f"{body_condensed}\n\n{env_str}"
                 if len(combined) <= 1980:
                     clean_ext_text = combined
                 else:
-                    budget = 1980 - len(env_str) - 2
+                    sep = "\n" if is_top_env else "\n\n"
+                    budget = 1980 - len(env_str) - len(sep)
                     if budget > 200:
                         cut_idx = -1
                         for delim in ["\n\n", ".\n", ". ", "\n", " "]:
@@ -764,7 +843,25 @@ async def deliver_turn_output(
                         trimmed_body = (
                             body_condensed[:cut_idx] if cut_idx > 0 else body_condensed[:budget]
                         ).rstrip()
-                        clean_ext_text = f"{trimmed_body}\n\n{env_str}"
+                        clean_ext_text = (
+                            f"{env_str}\n{trimmed_body}" if is_top_env else f"{trimmed_body}\n\n{env_str}"
+                        )
+            else:
+                body_condensed = re.sub(r"\n{3,}", "\n\n", clean_ext_text)
+                body_condensed = re.sub(r"[ \t]+\n", "\n", body_condensed).strip()
+                if len(body_condensed) <= 1980:
+                    clean_ext_text = body_condensed
+                else:
+                    budget = 1980
+                    cut_idx = -1
+                    for delim in ["\n\n", ".\n", ". ", "\n", " "]:
+                        pos = body_condensed.rfind(delim, 0, budget)
+                        if pos > budget // 2:
+                            cut_idx = pos + (len(delim) if delim in (". ", ".\n") else 0)
+                            break
+                    clean_ext_text = (
+                        body_condensed[:cut_idx] if cut_idx > 0 else body_condensed[:budget]
+                    ).rstrip()
         else:
             # Non-destructive whitespace condensation for all other channels & messages (no lossy cutting)
             body_condensed = re.sub(r"\n{3,}", "\n\n", clean_ext_text)
@@ -1006,15 +1103,21 @@ async def deliver_turn_output(
     if is_internal_cli_leak(final_text) or is_silence_response:
         final_text = "⚠️ **Turn Incomplete:** Agent process completed turn without generating text output."
 
-    # Parse [CHOICES: ...] interactive buttons
+    # Parse [CHOICES: ...] interactive buttons (ignoring inline/fenced code spans)
+    from tools.bridge_safety import mask_code_spans, restore_code_spans
     choice_view = None
-    matches = list(re.finditer(r"\[(?:CHOICES|OPTIONS):\s*((?:[^\[\]]|\[[^\]]*\])+)\]", final_text, re.IGNORECASE))
+    masked_final, choice_spans = mask_code_spans(final_text, prefix="\x00PIPE_CHOICES_")
+    matches = [m for m in _CODE_OR_CHOICES_RE.finditer(masked_final) if m.group(2) is not None]
     valid_match = None
     parsed_choices = []
     for m in reversed(matches):
-        raw_choices = m.group(1).strip()
+        raw_choices = m.group(3).strip()
         delim = "|" if "|" in raw_choices else ","
-        choices = [c.strip() for c in raw_choices.split(delim) if c.strip()]
+        choices = [
+            restore_code_spans(c, choice_spans, prefix="\x00PIPE_CHOICES_").strip()
+            for c in raw_choices.split(delim)
+            if c.strip()
+        ]
         if choices and not all(c in ("...", "…", "Option 1", "Option 2", "Option 3") for c in choices):
             valid_match = m
             parsed_choices = choices
@@ -1030,7 +1133,7 @@ async def deliver_turn_output(
             except Exception as fe:
                 print(f"[BridgePipeline] Warning filtering reload choices: {fe}")
 
-        final_text = re.sub(r"\[(?:CHOICES|OPTIONS):\s*(?:[^\[\]]|\[[^\]]*\])+\]", "", final_text, flags=re.IGNORECASE).strip()
+        final_text = strip_unquoted_choices(final_text)
         if parsed_choices:
             choice_view = quick_choice_view_cls(parsed_choices, button_choice_fn)
 
@@ -1088,6 +1191,16 @@ async def deliver_turn_output(
 
     try:
         if chunks:
+            async def _reply_or_send(dest, text_chunk: str, view_obj=None):
+                try:
+                    if hasattr(dest, "reply"):
+                        return await dest.reply(text_chunk, view=view_obj)
+                    return await dest.send(text_chunk, view=view_obj)
+                except Exception as reply_err:
+                    print(f"[BridgePipeline] target_dest.reply failed ({reply_err}), falling back to channel.send...")
+                    target_ch = getattr(dest, "channel", dest)
+                    return await target_ch.send(text_chunk, view=view_obj)
+
             if existing_messages:
                 for idx, ch in enumerate(chunks):
                     is_last_chunk = (idx == len(chunks) - 1)
@@ -1099,10 +1212,7 @@ async def deliver_turn_output(
                             continue
                         except Exception as edit_err:
                             print(f"[BridgePipeline] Failed to edit existing message {idx} ({edit_err}), sending new...")
-                    if hasattr(target_dest, "reply"):
-                        m = await target_dest.reply(ch, view=v_arg)
-                    else:
-                        m = await target_dest.send(ch, view=v_arg)
+                    m = await _reply_or_send(target_dest, ch, view_obj=v_arg)
                     if m:
                         sent_messages.append(m)
                 for extra_msg in existing_messages[len(chunks):]:
@@ -1118,41 +1228,25 @@ async def deliver_turn_output(
                         )
                         sent_messages.append(m0 or status_msg)
                     except Exception:
-                        if hasattr(target_dest, "reply"):
-                            m0 = await target_dest.reply(
-                                chunks[0], view=choice_view if len(chunks) == 1 else None
-                            )
-                        else:
-                            m0 = await target_dest.send(
-                                chunks[0], view=choice_view if len(chunks) == 1 else None
-                            )
+                        m0 = await _reply_or_send(
+                            target_dest, chunks[0], view_obj=choice_view if len(chunks) == 1 else None
+                        )
                         if m0:
                             sent_messages.append(m0)
                 else:
-                    if hasattr(target_dest, "reply"):
-                        m0 = await target_dest.reply(
-                            chunks[0], view=choice_view if len(chunks) == 1 else None
-                        )
-                    else:
-                        m0 = await target_dest.send(
-                            chunks[0], view=choice_view if len(chunks) == 1 else None
-                        )
+                    m0 = await _reply_or_send(
+                        target_dest, chunks[0], view_obj=choice_view if len(chunks) == 1 else None
+                    )
                     if m0:
                         sent_messages.append(m0)
 
                 if len(chunks) > 1:
                     for ch in chunks[1:-1]:
-                        if hasattr(target_dest, "reply"):
-                            m = await target_dest.reply(ch)
-                        else:
-                            m = await target_dest.send(ch)
+                        m = await _reply_or_send(target_dest, ch)
                         if m:
                             sent_messages.append(m)
 
-                    if hasattr(target_dest, "reply"):
-                        m_last = await target_dest.reply(chunks[-1], view=choice_view)
-                    else:
-                        m_last = await target_dest.send(chunks[-1], view=choice_view)
+                    m_last = await _reply_or_send(target_dest, chunks[-1], view_obj=choice_view)
                     if m_last:
                         sent_messages.append(m_last)
 
@@ -1208,6 +1302,13 @@ async def deliver_turn_output(
             channel_last_bot_reply[channel_id] = time.time()
         except Exception:
             pass
+
+        # Post-turn zero-token quota sampling (throttled to max 1 sample per 60s)
+        try:
+            from tools.quota_poller import throttled_post_turn_sample
+            asyncio.create_task(asyncio.to_thread(throttled_post_turn_sample, 60.0))
+        except Exception as qe:
+            print(f"[BridgePipeline] Quota post-turn sample notice: {qe}")
     finally:
         if held_turn_banana:
             try:

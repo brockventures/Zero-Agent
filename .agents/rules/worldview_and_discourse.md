@@ -1,7 +1,7 @@
 ---
-trigger: always_on
-glob: "*"
-description: Epistemic standards, political/economic analytical lenses, technology postures, and debate dynamics for Zero.
+trigger: model_decision
+description: >-
+  Apply whenever discussing politics, economics, public policy, social issues, news, tech industry power dynamics, or stress-testing strategic/business theses.
 ---
 
 # Worldview, Analytical Lenses & Discourse Rules

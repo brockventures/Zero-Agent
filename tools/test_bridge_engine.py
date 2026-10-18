@@ -53,6 +53,7 @@ class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(timed_out)
         self.assertIn("90s step idle", reason)
+        self.assertEqual(self.coordinator.timeout_reason, reason)
         self.assertFalse(self.coordinator.is_hard_ceiling)
 
         # Case 3: Hard ceiling timeout (turn running >= 1800s)
@@ -219,12 +220,25 @@ class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Subprocess Wedged on Interactive Input", beacon)
         self.assertIn("test_cmd", beacon)
 
-        # Timed out
+        # Timed out (generic / turn timeout)
         self.coordinator.wedged_diagnostic = None
         self.coordinator.timed_out = True
+        self.coordinator.timeout_reason = None
+        self.coordinator.is_hard_ceiling = False
         beacon = self.coordinator.format_diagnostic_beacon(proc_pid=555, turn_timeout_seconds=300)
         self.assertIn("Turn Timed Out", beacon)
         self.assertIn("300s", beacon)
+
+        # Timed out (step idle)
+        self.coordinator.timeout_reason = "150s step idle"
+        beacon = self.coordinator.format_diagnostic_beacon(proc_pid=555, turn_timeout_seconds=300)
+        self.assertIn("Turn Timed Out (Step Inactivity)", beacon)
+        self.assertIn("150s step idle", beacon)
+
+        # Timed out (hard ceiling)
+        self.coordinator.is_hard_ceiling = True
+        beacon = self.coordinator.format_diagnostic_beacon(proc_pid=555, turn_timeout_seconds=300)
+        self.assertIn("Turn Timed Out (Hard Ceiling)", beacon)
 
         # API Failure (exit code 3)
         self.coordinator.timed_out = False
@@ -373,6 +387,37 @@ class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(mock_br.active_proc)
         mock_clear_in_flight.assert_called_once_with(self.coordinator.channel_id)
         mock_update_beacon.assert_called_once_with("IDLE", "")
+
+
+    async def test_execute_stream_loop_eof_with_steering(self):
+        from tools.bridge_engine import steering_channels
+
+        reader = AsyncMock()
+        reader.readline = AsyncMock(return_value=b"")
+
+        parser = MagicMock()
+        timer = MagicMock()
+        proc = MagicMock()
+        proc.pid = 7777
+        proc.returncode = -2  # SIGINT
+
+        mock_recycle = AsyncMock()
+        steering_channels.add(self.coordinator.channel_id)
+
+        try:
+            resp = await self.coordinator.execute_stream_loop(
+                proc=proc,
+                stdout_reader=reader,
+                stream_parser=parser,
+                timer=timer,
+                rules={"live_status_ticker_enabled": False},
+                on_recycle=mock_recycle,
+            )
+            # Returns empty string cleanly without raising RuntimeError
+            self.assertEqual(resp, "")
+            mock_recycle.assert_awaited_once_with(keep_conv_id=True)
+        finally:
+            steering_channels.discard(self.coordinator.channel_id)
 
 
 if __name__ == "__main__":

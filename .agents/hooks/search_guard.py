@@ -113,7 +113,7 @@ def check_command_line(cmd: str, cwd: str) -> tuple[bool, str]:
         targets = []
         for token in tokens:
             cleaned = token.strip('"\'')
-            if cleaned.startswith("-"):
+            if not cleaned or cleaned.startswith("-"):
                 continue
             if cleaned in ("grep", "rg", "ag", "ack"):
                 continue
@@ -161,6 +161,15 @@ def check_command_line(cmd: str, cwd: str) -> tuple[bool, str]:
             "Command Blocked: 'nxapi auth' spawns an interactive readline prompt waiting on STDIN. "
             "Use decoupled '/workspace/tools/switch_auth.js generate' instead."
         )
+
+    # 6. Check unauthorized direct SerpApi web scraping
+    if re.search(r'serpapi\.com', cmd) and not re.search(r'(amazon_serpapi\.py|reddit_extractor\.py|serpapi_guard\.py)', cmd):
+        if re.search(r'engine=(google_images|google|bing|yahoo|duckduckgo)', cmd) or "nutritionCard" in cmd or "greenchef" in cmd:
+            return False, (
+                "Command Blocked: Ad-hoc web/image scraping via SerpApi is prohibited to preserve the 250-query monthly quota. "
+                "SerpApi is restricted strictly to Amazon product intelligence (tools/amazon_serpapi.py) and Reddit research (tools/reddit_extractor.py). "
+                "Use Playwright, Browserless, or free search tools for web/image scraping."
+            )
 
     return True, ""
 

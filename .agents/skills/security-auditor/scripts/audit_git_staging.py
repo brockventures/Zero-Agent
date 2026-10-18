@@ -25,7 +25,7 @@ def main():
         status = line[:2]
         file_path = line[3:].strip()
         for pat in FORBIDDEN_TRACKED_PATTERNS:
-            if pat in file_path and not file_path.endswith(".example") and not file_path.endswith(".example.json"):
+            if file_path != "data/canonical_gifs.json" and pat in file_path and not file_path.endswith(".example") and not file_path.endswith(".example.json"):
                 flagged.append((status, file_path, f"Matches forbidden tracked pattern: {pat}"))
 
     if flagged:

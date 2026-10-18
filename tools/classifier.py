@@ -91,11 +91,17 @@ def extract_classifier_score(output: str) -> float | None:
 def score_relevance(content: str, author: str = "user") -> float:
     """Score message relevance for Zero using ambient classifier."""
     content_clean = content.strip()
+
+    # Fast-path: Explicit Zero mentions or @Robot snowflake tags immediately score 1.0
+    if any(re.search(tag, content_clean, re.I) for tag in ZERO_TAGS):
+        return 1.0
+
     words = content_clean.split()
 
     # Pre-filtering heuristics to save model calls:
     is_directive = bool(re.search(r"^(?:ship|run|deploy|push|update|test|proceed|rollback|revert|fix|merge|build|restart|reload|check|verify|clean|sync|retry|stop|start|cancel|go ahead|lgtm|approved|do it)\b", content_clean, re.I))
     if len(words) < 4 and "?" not in content_clean and "```" not in content_clean and not is_directive:
+        print("[Classifier] Drop reason=short_non_directive", file=sys.stderr)
         return 0.0
 
     # Parse handoff envelope if present
@@ -108,12 +114,14 @@ def score_relevance(content: str, author: str = "user") -> float:
 
     if envelope:
         target = str(envelope.get("to") or envelope.get("target") or envelope.get("recipient") or "").lower()
-        if target and "zero" not in target:
+        if target and "zero" not in target and "team" not in target:
+            print(f"[Classifier] Drop reason=envelope_target_other target={target}", file=sys.stderr)
             return 0.0
 
         floor_state = str(envelope.get("floor") or "").lower()
         # floor: closed is the explicit state indicating "do not reply"
         if floor_state == "closed" and "zero" not in target:
+            print("[Classifier] Drop reason=envelope_floor_closed", file=sys.stderr)
             return 0.0
 
     # Strip handoff envelopes and code blocks when evaluating recipient targeting,
@@ -125,7 +133,7 @@ def score_relevance(content: str, author: str = "user") -> float:
     if envelope and envelope.get("reply") == "optional":
         kind = str(envelope.get("kind") or "").lower()
         target = str(envelope.get("to") or envelope.get("target") or "").lower()
-        if (kind in ("question", "discussion", "handoff", "finding") or "?" in text_for_targeting) and not target:
+        if (kind in ("question", "discussion", "handoff", "finding", "proposal") or "?" in text_for_targeting) and (not target or "team" in target):
             is_open_optional_question = True
 
     prompt = CLASSIFY_PROMPT.format(author=author or "user", content=content_clean)
@@ -144,10 +152,12 @@ def score_relevance(content: str, author: str = "user") -> float:
         val = extract_classifier_score(res.stdout)
         if val is not None:
             return val
+        print("[Classifier] Fallback reason=parse_null", file=sys.stderr)
     except Exception as e:
-        print(f"[Classifier] Error: {e}", file=sys.stderr)
-        if is_open_optional_question and "?" in text_for_targeting:
-            return 0.85
+        print(f"[Classifier] Fallback reason=subprocess_error err={e}", file=sys.stderr)
+    if is_open_optional_question and "?" in text_for_targeting:
+        print("[Classifier] Escalating open optional question to 0.85 on fallback", file=sys.stderr)
+        return 0.85
     return 0.0
 
 if __name__ == "__main__":

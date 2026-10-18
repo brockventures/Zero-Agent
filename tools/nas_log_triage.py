@@ -60,8 +60,12 @@ ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 # Noise filter for benign, expected, or standby operational chatter
 noise_re = re.compile(
     r'('
+    r'\[debug\]|'
     r'libusb_init failed|'
+    r'init_VideoIn failed|'
     r'TaskCanceledException|'
+    r'--- End of inner exception stack trace ---|'
+    r'at System\.Net\.Http\.HttpClient\.HandleFailure|'
     r'TVDb convert warning|'
     r'OpenSubtitles|'
     r'forecast_solar|'
@@ -73,7 +77,7 @@ noise_re = re.compile(
     r'\"error\":\s*0|'
     r'\"error\":0|'
     r'images.*\/error\/|'
-    r'Failed to load resource.*status of 503|'
+    r'Failed to load resource.*status of (?:404|503)|'
     r'Transient Google auth\/eligibility error|'
     r'Warmed channel history|'
     r'Generated new chapter thumbnails|'
@@ -95,10 +99,16 @@ noise_re = re.compile(
     r'Frame data is truncated.*Status\.NOT_SUPPORTED|'
     r'Received an exception while passing frame to API.*CommandType\.AREQ|'
     r'Data is too short to contain \d+ bytes|'
-    r'zigpy_znp.*from_frame|'
+    r'zigpy.*(?:DeliveryError|InvalidCommandResponse|from_frame)|'
+    r'Status\.(?:APS_NO_ACK|NWK_NO_ROUTE)|'
+    r'raise DeliveryError|'
+    r'During handling of the above exception|'
+    r'The above exception was the direct cause of the following exception|'
     r'CASESession timed out while waiting for a response from peer <0000000000000002|'
     r'CHIP_ERROR.*Msg Retransmission to [0-9]:000000000000000[02] failure|'
     r'CHIP_ERROR.*Node: <000000000000000[02]|'
+    r'CHIP_ERROR.*OperationalSessionSetup\[1:0000000000000002\]|'
+    r'CHIP_ERROR.*Failed to establish CASE for re-subscription.*CHIP Error 0x00000032: Timeout|'
     r'Stopped reading data from server error=.*EOF|'
     r'Fontconfig error: No writable cache directories|'
     r'CHIP_ERROR.*Subscription Liveness timeout|'
@@ -106,18 +116,21 @@ noise_re = re.compile(
     r'matter_server.*Unable to subscribe to Node|'
     r'matter_server.*Subscription failed with CHIP Error|'
     r'WARN.*\[SubprocessManager\] Go worker error for env 1: list containers|'
+    r'failed to (?:inspect container, falling back to list entry|list containers while adding container)|'
     r'check_update.*Error trying to get releases from GitHub|'
     r'pychromecast.*(Heartbeat timeout|Failed to connect|Connection reestablished)|'
     r'homeassistant\.components\.octoprint.*Config entry.*not ready yet|'
     r'homeassistant\.components\.android_ip_webcam.*Config entry.*not ready yet|'
     r'homeassistant\.components\.steam_online.*Failed to connect to Steam|'
     r'homeassistant\.components\.tplink\.coordinator.*Unable to communicate with the device|'
+    r'homeassistant\.components\.broadlink\.updater.*(Network timeout|data recovered)|'
     r'roombapy\.roomba.*Unexpectedly disconnected from Roomba|'
-    r'otbr-agent.*(Failed to handle ICMPv6 message|Sent ICMPv6 Error|Failed to write CLI output)|'
+    r'otbr-agent.*(?:\[I\]|Failed to handle ICMPv6 message|Sent ICMPv6 Error|Failed to write CLI output|Frame tx attempt.*failed|Failed to send IPv6 UDP msg|P-MdnsSocket--:\s*sendto\(IPv4\) failed)|'
     r'ERR failed to run the datagram handler error=\"timeout: no recent network activity\"|'
     r'\[BridgeTimer:#.*\] \[ERROR_-?\d+\]|'
     r'Warning releasing Banana.*timed out|'
     r'browserless\.io:error No route or file found for resource GET: /|'
+    r'browserless\.io.*Current period usage|'
     r'Failed to reply to query.*OS Error 0x02000001: Operation not permitted|'
     r'192\.168\.1\.164:3333.*connection refused|'
     r'twcc_sender_interceptor.*read\/write on closed pipe|'
@@ -131,7 +144,26 @@ noise_re = re.compile(
     r'requests\.exceptions\.RequestException|'
     r'Traceback \(most recent call last\):|'
     r'\[Classifier\] Error: Command|'
-    r'pychromecast\.socket_client.*(Failed to connect|Error reading from socket|retrying in)'
+    r'pychromecast\.socket_client.*(Failed to connect|Error reading from socket|retrying in)|'
+    r'homeassistant\.components\.enphase_envoy\.coordinator.*(Error communicating with Envoy API|Unexpected error updating listener)|'
+    r'ValueError: Sensor sensor\.encharge_.*has device class .temperature..*non-numeric value: .unknown.|'
+    r'Unable to reach the origin service.*(dial tcp.*:(?:8000|8001): connect: connection refused|robots\.txt)|'
+    r'If you restarted Plex just before running ImageMaid|'
+    r'\[error\]\[Plex Scan\]: Failed to process Plex media.*No Guid metadata|'
+    r'homeassistant\.components\.plex\.server.*Could not connect to Plex server.*Read timed out|'
+    r'aioesphomeapi\.reconnect_logic.*Can\'t connect to ESPHome API|'
+    r'homeassistant\.components\.xbox\.coordinator.*Failed to connect to Xbox Network|'
+    r'homeassistant\.components\.tesla_wall_connector\.coordinator.*Could not fetch data from Tesla WallConnector|'
+    r'myuser@baseball_data.*(?:column.*does not exist|syntax error|relation.*does not exist|function.*does not exist|missing FROM-clause entry)|'
+    r'myuser@baseball_data.*FATAL:\s*connection to client lost|'
+    r'myuser@baseball_db.*FATAL:\s*database.*does not exist|'
+    r'postgres@baseball_data.*FATAL:\s*password authentication failed|'
+    r'FATAL:\s*the database system is (?:in recovery mode|not yet accepting connections|starting up)|'
+    r'Failed to interview node 2|'
+    r'Attempting a reconnect in \d|'
+    r'\[IvyDaemon\] Turn result received \(status: ERROR\)|'
+    r'WRN (?:Serve tunnel error|Connection terminated) error=\"(?:datagram manager|accept stream listener) error:.*(?:Application error 0x0 \(remote\)|timeout: no recent network activity)|'
+    r'WRN Failed to dial a quic connection error=\"failed to dial to edge with quic: timeout: no recent network activity\"'
     r')',
     re.IGNORECASE
 )
@@ -284,7 +316,7 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     """
     Bridge-compatible sidecar entry point.
     Returns (ok, report_or_summary, extra_data).
-    - If 0 actionable issues: emits crisp 1-liner nominal report.
+    - If 0 actionable issues: emits crisp 1-liner nominal report (or appends self-healed/telemetry report).
     - If actionable issues exist: emits structured candidate dossier for Zero.
     """
     now_pt = datetime.now(PT).strftime("%A, %b %d, %Y, %I:%M %p PT")
@@ -293,6 +325,17 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     actionable = res["actionable_issues"]
     stale = res["stale_transients"]
 
+    # Run Home Assistant + VictoriaMetrics statistical telemetry & self-healing check
+    ha_telemetry = {}
+    ha_report = ""
+    try:
+        from tools.ha_anomaly_detector import analyze_anomalies, format_report
+        ha_telemetry = analyze_anomalies(auto_heal=True)
+        if ha_telemetry.get("has_anomalies"):
+            ha_report = format_report(ha_telemetry, quiet=True)
+    except Exception as e:
+        ha_telemetry = {"ok": False, "error": str(e)}
+
     extra = {
         "total_issues": len(actionable),
         "tier1_count": sum(1 for a in actionable if any("fatal" in s.lower() or "panic" in s.lower() or re.search(r"\boom\b", s, re.I) for s in a.get("sample_errors", []))),
@@ -300,7 +343,8 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
         "dossier": actionable,
         "stale_transients": stale,
         "duration_sec": res["duration_sec"],
-        "scanned": total_scanned
+        "scanned": total_scanned,
+        "ha_telemetry": ha_telemetry,
     }
 
     host_errors = res.get("host_errors", {})
@@ -309,15 +353,23 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     if total_scanned == 0:
         err_details = "; ".join(f"{h}: {e}" for h, e in host_errors.items()) if host_errors else "SSH timeout / unreachable"
         rep = f"⚠️ **NAS Log Review** [{now_pt}]: Failed to scan containers across NAS clusters ({err_details})."
+        if ha_report:
+            rep = f"{rep}\n\n{ha_report}"
         return False, rep, extra
 
-    # Nominal: All scanned containers healthy or only harmless historical transients
+    # Nominal container logs: All scanned containers healthy or only harmless historical transients
     if len(actionable) == 0:
         if host_errors:
             err_hosts = ", ".join(host_errors.keys())
             rep = f"⚠️ **NAS Log Review** [{now_pt}]: {total_scanned} containers healthy, but scan failed on {err_hosts}."
+            if ha_report:
+                rep = f"{rep}\n\n{ha_report}"
             return False, rep, extra
-        rep = f"🗄️ **NAS Log Review** [{now_pt}]: All {total_scanned} containers healthy across .82 and .84. ✅"
+        monitored_ha = ha_telemetry.get("monitored_count", 0)
+        ha_suffix = f" ({monitored_ha} HA sensors nominal)" if monitored_ha and not ha_report else ""
+        rep = f"🗄️ **NAS Log Review** [{now_pt}]: All {total_scanned} containers healthy across .82 and .84{ha_suffix}. ✅"
+        if ha_report:
+            rep = f"{rep}\n\n{ha_report}"
         return True, rep, extra
 
     # Candidate issues detected
@@ -340,6 +392,9 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     if stale:
         lines.append(f"\n🟢 **Historical Transients Cleared (>6h ago, 0 recent):** {', '.join(s['container'] for s in stale)}")
 
+    if ha_report:
+        lines.append(f"\n{ha_report}")
+
     return True, "\n".join(lines).strip(), extra
 
 
@@ -348,20 +403,26 @@ def format_autonomous_triage_prompt(extra: dict) -> str:
     now_pt = datetime.now(PT).strftime("%A, %b %d, %Y, %I:%M %p PT")
     actionable = extra.get("dossier", [])
     stale = extra.get("stale_transients", [])
+    ha_telemetry = extra.get("ha_telemetry", {})
     total = len(actionable)
 
     dossier_json = json.dumps({
         "actionable_containers": actionable,
-        "cleared_stale_transients": [s["container"] for s in stale]
+        "cleared_stale_transients": [s["container"] for s in stale],
+        "ha_telemetry_anomalies": {
+            "healed_events": ha_telemetry.get("healed_events", []),
+            "zombies": ha_telemetry.get("zombies", []),
+            "amplitude_anomalies": ha_telemetry.get("amplitude_anomalies", []),
+        } if ha_telemetry.get("has_anomalies") else "nominal"
     }, indent=2)
 
     return (
-        f"Nightly Autonomous NAS Log Triage [{now_pt}]:\n"
+        f"Nightly Autonomous NAS Log & Telemetry Triage [{now_pt}]:\n"
         f"The log harvester scanned {extra.get('scanned', 39)} running containers across Host1 (.82) and Host2 (.84) "
         f"and flagged candidate issues in {total} container(s).\n\n"
         f"### Incident Dossier:\n```json\n{dossier_json}\n```\n\n"
         f"### Autonomous Directives:\n"
-        f"1. **Forensic Liveness & Root-Cause Analysis:** Silently investigate each flagged container. Determine if errors are actively recurring or transient hiccups.\n"
+        f"1. **Forensic Liveness & Root-Cause Analysis:** Silently investigate each flagged container and any HA telemetry anomalies. Determine if errors are actively recurring or transient hiccups.\n"
         f"2. **Autonomous Safe Remediation:** For actionable code, config, schema, or mapping issues within homelab policy "
         f"(e.g., Kometa configs/syntax/exclusions, volume mount mismatches, stale lock files, directory permissions), "
         f"apply the fix immediately and verify it with validation commands.\n"

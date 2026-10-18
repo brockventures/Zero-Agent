@@ -314,75 +314,115 @@ async def slash_new(interaction: discord.Interaction, prompt: str = ""):
 
 @bot.tree.command(name="reset", description="Reset the conversation session for the current channel or thread")
 async def slash_reset(interaction: discord.Interaction):
+    await interaction.response.defer()
     ch_id = interaction.channel_id
     is_home = (ch_id == TARGET_CHANNEL_ID) or (isinstance(interaction.channel, discord.Thread) and getattr(interaction.channel, "parent_id", None) == TARGET_CHANNEL_ID)
     mode = "home" if is_home else "external"
     clear_channel_session_id(ch_id, mode)
     sess_key = "home" if (ch_id == TARGET_CHANNEL_ID) else str(ch_id)
     reset_session_keys.discard(sess_key)
-    await interaction.response.send_message("🔄 Conversation session reset for this channel/thread. Your next message will start a fresh session.")
+    try:
+        bd = sys.modules.get("tools.bridge_daemons")
+        dm = getattr(bd, "daemon_manager", None)
+        if dm and dm.is_dedicated_channel(ch_id):
+            await dm.recycle_worker(ch_id, new_conv_id=None)
+    except Exception as de:
+        print(f"[SlashReset] Error recycling worker on reset: {de}")
+    await interaction.followup.send("🔄 Conversation session reset for this channel/thread. Your next message will start a fresh session.")
 
 
 @bot.tree.command(name="model", description="View or switch the active AI model")
-@app_commands.describe(model_name="Model name or alias (e.g. 3.7, pro, sonnet, opus, flash-low)")
+@app_commands.describe(model_name="Model name or alias (e.g. argon, argon-low, flash, sonnet, opus, 3.8-low)")
 async def slash_model(interaction: discord.Interaction, model_name: str = ""):
+    await interaction.response.defer()
     current_model = _get_active_model()
+    from tools.bridge_models import get_fallback_model, list_available_models, resolve_model, set_fallback_model
+    available = await asyncio.to_thread(list_available_models, True)
+    fallback = get_fallback_model(available) if available else None
+
     if not model_name:
-        models_help = (
-            f"🤖 **Current Active Model:** `{current_model}`\n\n"
-            "**Available Models & Aliases:**\n"
-            "• `3.8` or `flash` → `gemini-3.8-flash-high` *(Default, fast & smart)*\n"
-            "• `3.8-med` or `3.8-medium` → `gemini-3.8-flash-medium`\n"
-            "• `3.8-lite`, `3.8-low` or `flash-low` → `gemini-3.8-flash-low` *(Lightweight & fast)*\n"
-            "• `3.7` or `3.7-flash` → `gemini-3.7-flash-high`\n"
-            "• `3.7-lite` or `3.7-low` → `gemini-3.7-flash-low`\n"
-            "• `3.6` or `3.6-flash` → `gemini-3.6-flash-high`\n"
-            "• `3.1-pro` or `pro` → `gemini-3.1-pro-high`\n"
-            "• `sonnet` or `claude` → `claude-sonnet-4-6`\n"
-            "• `opus` → `claude-opus-4-6-thinking`\n"
-            "• `gpt` → `gpt-oss-120b-medium`\n"
-        )
-        await interaction.response.send_message(models_help)
+        help_lines = [
+            f"🤖 **Current Active Model:** `{current_model}`",
+            f"🛟 **Fallback Model:** `{fallback or 'unavailable'}`",
+            "",
+        ]
+        if available:
+            help_lines.append("**Available Models (live from the CLI):**")
+            help_lines.extend(f"- `{mid}` ({label})" for mid, label in available.items())
+            help_lines.append("")
+            help_lines.append("*Shortcuts:* `argon`, `argon-med`, `argon-low`, `flash`, `3.8-low`, `sonnet`, `opus`, `gpt`")
+        else:
+            help_lines.append("⚠️ Could not fetch the live model list from the CLI. Try again in a moment.")
+        help_lines.append("*Switch with:* `/model <name>` | *Set fallback with:* `/model fallback <name>`")
+        await interaction.followup.send("\n".join(help_lines))
         return
 
-    aliases = {
-        "3.8": "gemini-3.8-flash-high",
-        "flash": "gemini-3.8-flash-high",
-        "3.8-flash": "gemini-3.8-flash-high",
-        "3.8-flash-high": "gemini-3.8-flash-high",
-        "3.8-med": "gemini-3.8-flash-medium",
-        "3.8-medium": "gemini-3.8-flash-medium",
-        "3.8-lite": "gemini-3.8-flash-low",
-        "3.8-low": "gemini-3.8-flash-low",
-        "3.8-flash-low": "gemini-3.8-flash-low",
-        "3.7": "gemini-3.7-flash-high",
-        "3.7-flash": "gemini-3.7-flash-high",
-        "3.7-flash-high": "gemini-3.7-flash-high",
-        "3.7-med": "gemini-3.7-flash-medium",
-        "3.7-medium": "gemini-3.7-flash-medium",
-        "3.7-lite": "gemini-3.7-flash-low",
-        "3.7-low": "gemini-3.7-flash-low",
-        "3.7-flash-low": "gemini-3.7-flash-low",
-        "flash-low": "gemini-3.8-flash-low",
-        "3.5-lite": "gemini-3.7-flash-low",
-        "3.5-flash-low": "gemini-3.7-flash-low",
-        "3.5": "gemini-3.7-flash-medium",
-        "3.6": "gemini-3.6-flash-high",
-        "3.6-flash": "gemini-3.6-flash-high",
-        "3.6-lite": "gemini-3.6-flash-low",
-        "3.6-low": "gemini-3.6-flash-low",
-        "3.1-pro": "gemini-3.1-pro-high",
-        "pro": "gemini-3.1-pro-high",
-        "3.1-pro-low": "gemini-3.1-pro-low",
-        "sonnet": "claude-sonnet-4-6",
-        "claude": "claude-sonnet-4-6",
-        "opus": "claude-opus-4-6-thinking",
-        "gpt": "gpt-oss-120b-medium",
-        "gpt-oss": "gpt-oss-120b-medium"
-    }
-    resolved = aliases.get(model_name.lower().strip(), model_name.strip())
+    if not available:
+        await interaction.followup.send("⚠️ Couldn't fetch the live model list from the CLI, so the model was not changed. Try again in a moment.")
+        return
+
+    target_m = model_name.strip()
+    is_fallback_cmd = target_m.lower().split()[0] == "fallback"
+    name = target_m.split(maxsplit=1)[1].strip() if is_fallback_cmd and len(target_m.split(maxsplit=1)) > 1 else ("" if is_fallback_cmd else target_m)
+    if is_fallback_cmd and not name:
+        await interaction.followup.send(f"🛟 Fallback model is `{get_fallback_model(available)}`. Set it with `/model fallback <name>`.")
+        return
+
+    resolved = resolve_model(name, available)
+    if not resolved:
+        valid = ", ".join(f"`{m}`" for m in available)
+        await interaction.followup.send(f"❌ `{name}` isn't a model the CLI knows. Valid models: {valid}")
+        return
+
+    if is_fallback_cmd:
+        set_fallback_model(resolved)
+        await interaction.followup.send(f"🛟 Fallback model set to **`{resolved}`**. It is used (with a notice in chat) whenever the active model is unavailable.")
+        return
+
     _set_active_model(resolved)
-    await interaction.response.send_message(f"🔄 Switched active model to **`{resolved}`** for subsequent turns (persisted across restarts).")
+    try:
+        bd = sys.modules.get("tools.bridge_daemons")
+        dm = getattr(bd, "daemon_manager", None)
+        if dm:
+            await dm.recycle_all()
+    except Exception as de:
+        print(f"[SlashModel] Error recycling workers: {de}")
+    await interaction.followup.send(f"🔄 Switched active model to **`{resolved}`** and recycled persistent workers.")
+
+
+@slash_model.autocomplete("model_name")
+async def slash_model_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    from tools.bridge_models import CACHE_TTL_SECONDS, _read_cache, list_available_models
+    cache = _read_cache()
+    available = cache["models"] if cache and isinstance(cache.get("models"), dict) else {}
+    # Trigger non-blocking background cache refresh if stale or missing so autocomplete returns in <5ms
+    if not cache or (time.time() - cache.get("fetched_at", 0)) >= CACHE_TTL_SECONDS:
+        asyncio.create_task(asyncio.to_thread(list_available_models, False))
+
+    choices: list[app_commands.Choice[str]] = []
+    shortcuts = [
+        ("argon (Gemini 4 Argon High)", "argon"),
+        ("argon-med (Gemini 4 Argon Medium)", "argon-med"),
+        ("argon-low (Gemini 4 Argon Low)", "argon-low"),
+        ("flash (Gemini 3.8 Flash High)", "flash"),
+        ("flash-medium (Gemini 3.8 Flash Medium)", "flash-medium"),
+        ("flash-low (Gemini 3.8 Flash Low)", "flash-low"),
+        ("sonnet (Claude Sonnet 5.5 High)", "sonnet"),
+        ("sonnet-medium (Claude Sonnet 5.5 Medium)", "sonnet-medium"),
+        ("opus (Claude Opus 5.5 High)", "opus"),
+        ("gpt (GPT-OSS 120B Medium)", "gpt"),
+    ]
+    cur = current.lower().strip()
+    for label, val in shortcuts:
+        if not cur or cur in label.lower() or cur in val.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=val))
+    if available:
+        for mid, label in available.items():
+            if not cur or cur in mid.lower() or cur in label.lower():
+                if not any(c.value == mid for c in choices):
+                    choices.append(app_commands.Choice(name=f"{mid} ({label})"[:100], value=mid))
+    return choices[:25]
+
 
 
 @bot.tree.command(name="logs", description="Run on-demand NAS log review across containers")
@@ -391,7 +431,7 @@ async def slash_logs(interaction: discord.Interaction, since: str = "24h"):
     await interaction.response.defer()
     try:
         from tools.sidecars import run_sidecar_job, run_nas_log_review
-        ok, rep, _ = run_sidecar_job("nas_logs", "NAS Log Review", run_nas_log_review, since=since)
+        ok, rep, _ = await asyncio.to_thread(run_sidecar_job, "nas_logs", "NAS Log Review", run_nas_log_review, since=since)
         chunks = chunk_text(rep, limit=1950)
         for i, c in enumerate(chunks):
             if i == 0:
@@ -407,7 +447,7 @@ async def slash_triage(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
         from tools.sidecars import run_sidecar_job, run_nightly_triage
-        ok, rep, _ = run_sidecar_job("triage", "Nightly Triage & Briefing", run_nightly_triage)
+        ok, rep, _ = await asyncio.to_thread(run_sidecar_job, "triage", "Nightly Triage & Briefing", run_nightly_triage)
         chunks = chunk_text(rep, limit=1950)
         for i, c in enumerate(chunks):
             if i == 0:
@@ -423,7 +463,7 @@ async def slash_heartbeat(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
         from tools.sidecars import run_sidecar_job, run_heartbeat_sweep
-        ok, rep, _ = run_sidecar_job("heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
+        ok, rep, _ = await asyncio.to_thread(run_sidecar_job, "heartbeat", "Heartbeat Sweep", run_heartbeat_sweep)
         chunks = chunk_text(rep, limit=1950)
         for i, c in enumerate(chunks):
             if i == 0:
@@ -438,7 +478,7 @@ async def slash_heartbeat(interaction: discord.Interaction):
 async def slash_tasks(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        res = subprocess.run(["python3", "/workspace/tools/task_manager.py", "summary"], capture_output=True, text=True, timeout=15)
+        res = await asyncio.to_thread(subprocess.run, ["python3", "/workspace/tools/task_manager.py", "summary"], capture_output=True, text=True, timeout=15)
         out = res.stdout.strip() or res.stderr.strip() or "No tasks found."
         chunks = chunk_text(out, limit=1950)
         for i, c in enumerate(chunks):
@@ -454,8 +494,8 @@ async def slash_tasks(interaction: discord.Interaction):
 async def slash_sidecars(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        from tools.sidecars import format_sidecar_status_report
-        rep = format_sidecar_status_report()
+        from tools.sidecars import format_sidecar_status_summary
+        rep = await asyncio.to_thread(format_sidecar_status_summary)
         chunks = chunk_text(rep, limit=1950)
         for i, c in enumerate(chunks):
             if i == 0:
@@ -503,6 +543,60 @@ async def on_button_interaction(interaction: discord.Interaction):
             except Exception:
                 pass
             await _button_choice_callback(choice_text, interaction)
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    try:
+        from tools.bridge_voice import handle_voice_state_update
+        await handle_voice_state_update(bot, member, before, after)
+    except Exception as ve:
+        print(f"[Bridge] Error in on_voice_state_update: {ve}")
+
+
+@bot.tree.command(name="voice", description="Join, leave, or check Zero's Gemini Live voice session in #zero-voice")
+@app_commands.describe(action="join, leave, or status (default: join)", model="Optional Live model override (default: gemini-3.8-live)")
+async def slash_voice(interaction: discord.Interaction, action: str = "join", model: str = ""):
+    await interaction.response.defer()
+    from tools.bridge_voice import ZERO_VOICE_CHANNEL_ID, get_voice_manager
+    mgr = get_voice_manager(bot)
+    act = action.lower().strip()
+
+    if act in ("status", "info"):
+        st = mgr.get_status_dict()
+        if st["active"]:
+            await interaction.followup.send(
+                f"🎙️ **Zero Live Voice is ACTIVE** in <#{st['channel_id']}>\n"
+                f"- **Model:** `{st['model']}` | **Voice:** `{st['voice']}`\n"
+                f"- **Uptime:** {st['uptime_seconds']}s | **Audio:** {st['input_audio_seconds']}s in / {st['output_audio_seconds']}s out (~{st['est_audio_tokens']:,} audio tokens)"
+            )
+        else:
+            await interaction.followup.send(
+                f"🔇 **Zero Live Voice is idle.** Hop into <#{ZERO_VOICE_CHANNEL_ID}> (auto-joins) or run `/voice join`."
+            )
+        return
+
+    if act in ("leave", "stop", "disconnect", "off"):
+        rep = await mgr.stop_session()
+        await interaction.followup.send(rep)
+        return
+
+    target_vc = None
+    if getattr(interaction.user, "voice", None) and getattr(interaction.user.voice, "channel", None):
+        target_vc = interaction.user.voice.channel
+    if not target_vc:
+        target_vc = bot.get_channel(ZERO_VOICE_CHANNEL_ID)
+    if not target_vc and interaction.guild:
+        try:
+            target_vc = await interaction.guild.fetch_channel(ZERO_VOICE_CHANNEL_ID)
+        except Exception:
+            pass
+    if not target_vc:
+        await interaction.followup.send("⚠️ Could not locate `#zero-voice` channel.")
+        return
+
+    ok, rep = await mgr.start_session(target_vc, notify_channel=interaction.channel, model_override=model.strip() or None)
+    await interaction.followup.send(rep)
 
 
 @bot.event

@@ -7,6 +7,7 @@ Exposes a lightweight HTTP JSON status endpoint on port 8769 for zero.brock.vent
 from __future__ import annotations
 
 import base64
+import importlib
 import json
 import os
 import signal
@@ -16,11 +17,35 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import urllib.parse
 from zoneinfo import ZoneInfo
 
 WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
     sys.path.insert(0, str(WORKSPACE))
+
+try:
+    import tools.zero_dashboard as zero_dashboard
+except ImportError:
+    try:
+        import zero_dashboard
+    except ImportError:
+        zero_dashboard = None
+
+
+def _get_zero_dashboard():
+    global zero_dashboard
+    try:
+        if zero_dashboard is not None:
+            zero_dashboard = importlib.reload(zero_dashboard)
+        else:
+            try:
+                import tools.zero_dashboard as zero_dashboard
+            except ImportError:
+                import zero_dashboard
+    except Exception:
+        pass
+    return zero_dashboard
 
 try:
     from tools.nas_config import run_ssh, HOST_2_IP
@@ -53,7 +78,15 @@ try:
 except Exception as e:
     res["container_status"] = "offline"
 
-meta_path = "os.environ.get("IVY_AGENT_DIR", "/opt/docker/discord-ivy-agent")/workspace/data/session_meta.json"
+ivy_dir = os.environ.get("IVY_AGENT_DIR", os.path.join(os.environ.get("NAS_DOCKER_ROOT", os.path.join(os.sep, "volume1", "docker")), "discord-ivy-agent"))
+if not os.path.exists(ivy_dir):
+    for candidate in [os.path.join(os.environ.get("NAS_DOCKER_ROOT", os.path.join(os.sep, "volume1", "docker")), "discord-ivy-agent"), "/opt/docker/discord-ivy-agent"]:
+        if os.path.exists(candidate):
+            ivy_dir = candidate
+            break
+
+data_dir = os.path.join(ivy_dir, "workspace", "data")
+meta_path = os.path.join(data_dir, "session_meta.json")
 if os.path.exists(meta_path):
     try:
         with open(meta_path) as f:
@@ -61,7 +94,7 @@ if os.path.exists(meta_path):
     except Exception:
         pass
 
-cfg_path = "os.environ.get("IVY_AGENT_DIR", "/opt/docker/discord-ivy-agent")/workspace/data/runtime_config.json"
+cfg_path = os.path.join(data_dir, "runtime_config.json")
 if os.path.exists(cfg_path):
     try:
         with open(cfg_path) as f:
@@ -69,7 +102,7 @@ if os.path.exists(cfg_path):
     except Exception:
         pass
 
-stats_path = "os.environ.get("IVY_AGENT_DIR", "/opt/docker/discord-ivy-agent")/workspace/data/bot_stats.json"
+stats_path = os.path.join(data_dir, "bot_stats.json")
 if os.path.exists(stats_path):
     try:
         with open(stats_path) as f:
@@ -77,7 +110,7 @@ if os.path.exists(stats_path):
     except Exception:
         pass
 
-in_flight_path = "os.environ.get("IVY_AGENT_DIR", "/opt/docker/discord-ivy-agent")/workspace/data/in_flight_turn.json"
+in_flight_path = os.path.join(data_dir, "in_flight_turn.json")
 if os.path.exists(in_flight_path):
     try:
         with open(in_flight_path) as f:
@@ -85,7 +118,7 @@ if os.path.exists(in_flight_path):
     except Exception:
         pass
 
-detached_path = "os.environ.get("IVY_AGENT_DIR", "/opt/docker/discord-ivy-agent")/workspace/data/detached_tasks"
+detached_path = os.path.join(data_dir, "detached_tasks")
 detached_count = 0
 if os.path.exists(detached_path):
     try:
@@ -101,7 +134,7 @@ if os.path.exists(detached_path):
         pass
 res["active_detached_tasks"] = detached_count
 
-beacon_path = "os.environ.get("IVY_AGENT_DIR", "/opt/docker/discord-ivy-agent")/workspace/data/liveness_beacon.json"
+beacon_path = os.path.join(data_dir, "liveness_beacon.json")
 if os.path.exists(beacon_path):
     try:
         with open(beacon_path) as f:
@@ -222,18 +255,34 @@ def _evaluate_ivy(force: bool = False, strict: bool = False) -> tuple[int, dict]
     total_ivy_in_flight = in_flight_turns + active_detached
 
     model_display_names = {
+        "gemini-4-argon-high": "Gemini 4 Argon (High)",
+        "gemini-4-argon-medium": "Gemini 4 Argon (Medium)",
+        "gemini-4-argon-low": "Gemini 4 Argon (Low)",
         "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
+        "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
+        "gemini-3.8-flash-low": "Gemini 3.8 Flash (Low)",
         "gemini-3.8-flash": "Gemini 3.8 Flash",
         "gemini-3.7-flash-high": "Gemini 3.7 Flash (High)",
         "gemini-3.7-flash": "Gemini 3.7 Flash",
         "gemini-3.7-pro": "Gemini 3.7 Pro",
+        "claude-sonnet-5-5-high": "Claude Sonnet 5.5 (High)",
+        "claude-sonnet-5-5-medium": "Claude Sonnet 5.5 (Medium)",
+        "claude-opus-5-5-high": "Claude Opus 5.5 (High)",
     }
     short_names = {
+        "gemini-4-argon-high": "4 Argon",
+        "gemini-4-argon-medium": "4 Argon Med",
+        "gemini-4-argon-low": "4 Argon Low",
         "gemini-3.8-flash-high": "3.8 Flash",
+        "gemini-3.8-flash-medium": "3.8 Flash Med",
+        "gemini-3.8-flash-low": "3.8 Flash Low",
         "gemini-3.8-flash": "3.8 Flash",
         "gemini-3.7-flash-high": "3.7 Flash",
         "gemini-3.7-flash": "3.7 Flash",
         "gemini-3.7-pro": "3.7 Pro",
+        "claude-sonnet-5-5-high": "Sonnet 5.5",
+        "claude-sonnet-5-5-medium": "Sonnet 5.5 Med",
+        "claude-opus-5-5-high": "Opus 5.5",
     }
 
     model_display = model_display_names.get(raw_model, raw_model)
@@ -441,18 +490,34 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 pass
 
         model_display_names = {
+            "gemini-4-argon-high": "Gemini 4 Argon (High)",
+            "gemini-4-argon-medium": "Gemini 4 Argon (Medium)",
+            "gemini-4-argon-low": "Gemini 4 Argon (Low)",
             "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
+            "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
+            "gemini-3.8-flash-low": "Gemini 3.8 Flash (Low)",
             "gemini-3.8-flash": "Gemini 3.8 Flash",
             "gemini-3.7-flash-high": "Gemini 3.7 Flash (High)",
             "gemini-3.7-flash": "Gemini 3.7 Flash",
             "gemini-3.7-pro": "Gemini 3.7 Pro",
+            "claude-sonnet-5-5-high": "Claude Sonnet 5.5 (High)",
+            "claude-sonnet-5-5-medium": "Claude Sonnet 5.5 (Medium)",
+            "claude-opus-5-5-high": "Claude Opus 5.5 (High)",
         }
         short_names = {
+            "gemini-4-argon-high": "4 Argon",
+            "gemini-4-argon-medium": "4 Argon Med",
+            "gemini-4-argon-low": "4 Argon Low",
             "gemini-3.8-flash-high": "3.8 Flash",
+            "gemini-3.8-flash-medium": "3.8 Flash Med",
+            "gemini-3.8-flash-low": "3.8 Flash Low",
             "gemini-3.8-flash": "3.8 Flash",
             "gemini-3.7-flash-high": "3.7 Flash",
             "gemini-3.7-flash": "3.7 Flash",
             "gemini-3.7-pro": "3.7 Pro",
+            "claude-sonnet-5-5-high": "Sonnet 5.5",
+            "claude-sonnet-5-5-medium": "Sonnet 5.5 Med",
+            "claude-opus-5-5-high": "Opus 5.5",
         }
         active_model_display = model_display_names.get(active_model_raw, active_model_raw)
         model_short = short_names.get(active_model_raw, active_model_raw.replace("gemini-", "").replace("-high", ""))
@@ -539,23 +604,174 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         clean_path = self.path.split("?")[0].rstrip("/")
         if clean_path in ("/api/ivy", "/ivy"):
             code, _ = self._evaluate_ivy(strict=strict)
+            content_type = "application/json"
+        elif clean_path in ("/api/avatar", "/avatar.png", "/zero_avatar.png"):
+            code = 200
+            content_type = "image/png"
+        elif clean_path in ("/api/telemetry", "/api/context", "/api/sessions"):
+            code = 200
+            content_type = "application/json"
+        elif clean_path in ("/api/health", "/health", "/api/status", "/status"):
+            code, _ = self._evaluate_health(strict=strict)
+            content_type = "application/json"
+        elif clean_path in ("", "/", "/dashboard"):
+            host_header = self.headers.get("Host", "").lower()
+            accept_header = self.headers.get("Accept", "")
+            if "probe." in host_header or "status." in host_header:
+                code, _ = self._evaluate_health(strict=strict)
+                content_type = "application/json"
+            elif (clean_path == "/dashboard" or "text/html" in accept_header) and "format=json" not in self.path and not strict:
+                code = 200
+                content_type = "text/html; charset=utf-8"
+            else:
+                code, _ = self._evaluate_health(strict=strict)
+                content_type = "application/json"
         else:
             code, _ = self._evaluate_health(strict=strict)
+            content_type = "application/json"
+
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
         self.end_headers()
 
     def do_GET(self):
         strict = self._parse_strict()
         clean_path = self.path.split("?")[0].rstrip("/")
-        if clean_path in ("/api/ivy", "/ivy"):
+        query_str = self.path.partition("?")[2]
+        query_params = urllib.parse.parse_qs(query_str) if query_str else {}
+        host_header = self.headers.get("Host", "").lower()
+        accept_header = self.headers.get("Accept", "")
+
+        is_ivy = (
+            "ivy." in host_header
+            or query_params.get("agent", [""])[0].lower() == "ivy"
+            or clean_path.startswith("/ivy")
+            or clean_path == "/api/ivy"
+        )
+        agent = "ivy" if is_ivy else "zero"
+
+        # 1. Ivy Health Endpoint (explicit)
+        if clean_path in ("/api/ivy", "/ivy") and "text/html" not in accept_header:
             status_code, payload = self._evaluate_ivy(strict=strict)
+            body = json.dumps(payload, indent=2).encode("utf-8")
+            content_type = "application/json"
+
+        # Avatar Endpoint
+        elif clean_path in ("/api/avatar", "/avatar.png", "/zero_avatar.png", "/ivy_avatar.png"):
+            if agent == "ivy" or clean_path == "/ivy_avatar.png":
+                avatar_path = Path("/workspace/data/ivy_avatar.png")
+            else:
+                avatar_path = Path("/workspace/data/zero_avatar.png")
+                if not avatar_path.exists():
+                    avatar_path = Path("/workspace/assets/zero_avatar.png")
+
+            if avatar_path.exists():
+                try:
+                    with open(avatar_path, "rb") as f:
+                        body = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                except Exception:
+                    pass
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        # 2. Telemetry & Context API
+        elif clean_path in ("/api/telemetry", "/api/context"):
+            session_id = query_params.get("session", [None])[0]
+            channel_name = query_params.get("channel", [None])[0]
+            compacted_id = query_params.get("compacted_id", [None])[0]
+            target = channel_name or session_id
+            zd = _get_zero_dashboard()
+            if zd:
+                payload = zd.get_telemetry_payload(target=target, compacted_id=compacted_id, agent=agent)
+            else:
+                payload = {"error": "zero_dashboard module unavailable"}
+            body = json.dumps(payload, indent=2).encode("utf-8")
+            content_type = "application/json"
+            status_code = 200
+
+        # 3. Available Sessions List API
+        elif clean_path in ("/api/sessions",):
+            zd = _get_zero_dashboard()
+            if zd:
+                payload = {"sessions": zd.get_sessions_list(agent=agent)}
+            else:
+                payload = {"sessions": []}
+            body = json.dumps(payload, indent=2).encode("utf-8")
+            content_type = "application/json"
+            status_code = 200
+
+        # 4. Health JSON Endpoint
+        elif clean_path in ("/api/health", "/health", "/api/status", "/status"):
+            if agent == "ivy":
+                status_code, payload = self._evaluate_ivy(strict=strict)
+            else:
+                status_code, payload = self._evaluate_health(strict=strict)
+            body = json.dumps(payload, indent=2).encode("utf-8")
+            content_type = "application/json"
+
+        # 5. Root / Dashboard Endpoint
+        elif clean_path in ("", "/", "/dashboard", "/ivy"):
+            if "probe." in host_header or "status." in host_header:
+                # Dedicated probe host: always return JSON health status without dashboard UI leakage
+                if agent == "ivy":
+                    status_code, payload = self._evaluate_ivy(strict=strict)
+                else:
+                    status_code, payload = self._evaluate_health(strict=strict)
+                body = json.dumps(payload, indent=2).encode("utf-8")
+                content_type = "application/json"
+            elif (clean_path in ("/dashboard", "/ivy") or "text/html" in accept_header) and "format=json" not in query_str and not strict:
+                # Browser requesting visual dashboard UI
+                zd = _get_zero_dashboard()
+                if zd:
+                    html_content = zd.render_dashboard_html(agent=agent)
+                    body = html_content.encode("utf-8")
+                    content_type = "text/html; charset=utf-8"
+                    status_code = 200
+                else:
+                    if agent == "ivy":
+                        status_code, payload = self._evaluate_ivy(strict=strict)
+                    else:
+                        status_code, payload = self._evaluate_health(strict=strict)
+                    body = json.dumps(payload, indent=2).encode("utf-8")
+                    content_type = "application/json"
+            else:
+                # Default for root API consumers (Homepage customapi widget, curl, monitoring probes)
+                if agent == "ivy":
+                    status_code, payload = self._evaluate_ivy(strict=strict)
+                else:
+                    status_code, payload = self._evaluate_health(strict=strict)
+                body = json.dumps(payload, indent=2).encode("utf-8")
+                content_type = "application/json"
+
+        # 6. Fallback
         else:
-            status_code, payload = self._evaluate_health(strict=strict)
-        body = json.dumps(payload, indent=2).encode("utf-8")
+            if agent == "ivy":
+                status_code, payload = self._evaluate_ivy(strict=strict)
+            else:
+                status_code, payload = self._evaluate_health(strict=strict)
+            body = json.dumps(payload, indent=2).encode("utf-8")
+            content_type = "application/json"
+
         self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(body)

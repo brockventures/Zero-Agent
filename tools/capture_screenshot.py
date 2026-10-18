@@ -46,10 +46,15 @@ def parse_viewport(viewport_str: str) -> Tuple[int, int]:
     return (1280, 800)
 
 
-def get_active_brain_dir() -> Optional[Path]:
-    """Find the most recently modified conversation session directory in brain."""
+def get_active_brain_dir(conv_id: Optional[str] = None) -> Optional[Path]:
+    """Find the conversation session directory in brain, prioritizing explicit conv_id or env vars."""
     if not BRAIN_ROOT.exists():
         return None
+    target_cid = conv_id or os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+    if target_cid:
+        target_dir = BRAIN_ROOT / target_cid
+        if target_dir.exists() and target_dir.is_dir():
+            return target_dir
     conv_dirs = [d for d in BRAIN_ROOT.iterdir() if d.is_dir() and not d.name.startswith(".")]
     if not conv_dirs:
         return None
@@ -67,6 +72,7 @@ def capture_screenshot(
     wait_ms: int = 1500,
     timeout_ms: int = 30000,
     padding: int = 8,
+    conv_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Capture a screenshot of a target URL or element using Playwright."""
     from PIL import Image
@@ -191,7 +197,7 @@ def capture_screenshot(
     size_kb = round(size_bytes / 1024.0, 2)
 
     # Sync to brain session directory if present
-    brain_dir = get_active_brain_dir()
+    brain_dir = get_active_brain_dir(conv_id)
     brain_path = None
     if brain_dir and brain_dir.exists():
         try:
@@ -228,6 +234,7 @@ def capture_and_deliver(
     color_scheme: str = "dark",
     wait_selector: Optional[str] = None,
     wait_ms: int = 1500,
+    conv_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Capture screenshot and optionally deliver directly to Discord."""
     res = capture_screenshot(
@@ -239,6 +246,7 @@ def capture_and_deliver(
         color_scheme=color_scheme,
         wait_selector=wait_selector,
         wait_ms=wait_ms,
+        conv_id=conv_id,
     )
 
     if not res.get("success"):
@@ -294,6 +302,7 @@ def main():
     parser.add_argument("--wait-ms", type=int, default=1500, help="Wait time in ms after navigation (default: 1500)")
     parser.add_argument("--channel", "-c", help="Target Discord channel to upload to (e.g. zero-chat, lounge)")
     parser.add_argument("--caption", "-m", help="Caption text to accompany Discord image upload")
+    parser.add_argument("--conv-id", help="Explicit conversation ID for brain session artifact directory")
     parser.add_argument("--json", action="store_true", help="Output result as JSON")
 
     args = parser.parse_args()
@@ -309,6 +318,7 @@ def main():
         color_scheme=args.color_scheme,
         wait_selector=args.wait_selector,
         wait_ms=args.wait_ms,
+        conv_id=args.conv_id,
     )
 
     if args.json:

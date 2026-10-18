@@ -304,8 +304,10 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
             mock_outbox.assert_called_once()
             call_kwargs = mock_outbox.call_args.kwargs
             self.assertEqual(call_kwargs["channel"], 123456)
+            self.assertEqual(call_kwargs.get("msg_type"), "agent_turn")
             self.assertIn("Background Task Complete", call_kwargs["content"])
             self.assertIn("Build complete successfully", call_kwargs["content"])
+            self.assertNotIn("Log File:", call_kwargs["content"])
 
         # 5. Pending file should now be cleared
         pdata_after = json.loads(pending_file.read_text())
@@ -359,5 +361,165 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, f"{pre_settle_text}\n\n{settle_receipt}")
 
 
+    def test_get_turn_pending_tasks_ignores_foreign_uuid_task(self):
+        """Verify that foreign UUID task IDs from inspected logs are ignored."""
+        from tools.task_settle import get_turn_pending_tasks
+
+        tpath = self.logs_dir / "transcript.jsonl"
+        lines = [
+            json.dumps({
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": "Why was Ivy slow?",
+            }),
+            json.dumps({
+                "type": "GENERIC",
+                "source": "MODEL",
+                "content": 'Tool is running as a background task with task id: "bad41297-bb6a-471b-a984-54c4e00a1fba"',
+            }),
+        ]
+        tpath.write_text("\n".join(lines), encoding="utf-8")
+
+        pending = get_turn_pending_tasks(self.conv_id, brain_dir=self.test_dir)
+        self.assertEqual(pending, [])
+
+    def test_ttl_timeout_drops_without_harvesting_response(self):
+        """Verify that task expiration past 7200s TTL does NOT trigger harvest dispatch."""
+        from tools.task_settle import (
+            register_pending_tasks,
+            check_and_dispatch_completed_tasks,
+        )
+
+        data_dir = Path(self.test_dir) / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        register_pending_tasks(
+            conv_id=self.conv_id,
+            channel_id=123456,
+            mode="home",
+            task_ids=["task-old-1"],
+            data_dir=data_dir,
+        )
+
+        p_file = data_dir / "pending_sdk_tasks.json"
+        pdata = json.loads(p_file.read_text())
+        import time
+        pdata[self.conv_id]["registered_at"] = time.time() - 8000
+        p_file.write_text(json.dumps(pdata))
+
+        with patch("tools.outbox.queue_outbox_message") as mock_outbox:
+            dispatched = check_and_dispatch_completed_tasks(brain_dir=self.test_dir, data_dir=data_dir)
+            self.assertEqual(dispatched, [])
+            mock_outbox.assert_not_called()
+
+        pdata_after = json.loads(p_file.read_text())
+        self.assertNotIn(self.conv_id, pdata_after)
+
+    def test_excluded_channel_blocks_outbox_harvest(self):
+        """Verify that completed background tasks on excluded quarantine channels do not harvest transcript response."""
+        from tools.task_settle import (
+            register_pending_tasks,
+            check_and_dispatch_completed_tasks,
+        )
+
+        data_dir = Path(self.test_dir) / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        register_pending_tasks(
+            conv_id=self.conv_id,
+            channel_id=1548196929308065893,  # #baseball
+            mode="home",
+            task_ids=["task-bb-1"],
+            data_dir=data_dir,
+        )
+
+        log_file = self.tasks_dir / "task-bb-1.log"
+        log_file.write_text("All done\n")
+        msg_file = self.msgs_dir / "msg-bb-1.json"
+        msg_file.write_text(json.dumps({
+            "sender": f"{self.conv_id}/task-bb-1",
+            "content": 'Task id "task-bb-1" finished with exit code 0',
+        }))
+
+        with patch("tools.outbox.queue_outbox_message") as mock_outbox, \
+             patch("tools.bridge_stream.harvest_transcript_response", return_value="Harvested message"):
+            dispatched = check_and_dispatch_completed_tasks(brain_dir=self.test_dir, data_dir=data_dir)
+            self.assertEqual(len(dispatched), 1)
+            # The task completion notification is sent, but harvest response is blocked due to quarantine
+            self.assertEqual(mock_outbox.call_count, 1)
+            self.assertIn("Background Task Complete", mock_outbox.call_args.kwargs["content"])
+
+    def test_get_turn_pending_tasks_ignores_truncated_and_user_input_tasks(self):
+        """Verify that task strings in USER_INPUT or carryforward prompts are never treated as tasks."""
+        tpath = self.logs_dir / "transcript.jsonl"
+        lines = [
+            json.dumps({
+                "type": "USER_INPUT",
+                "source": "USER",
+                "content": 'Tool is running as a background task with task id: bad41297-...`.\nSome carryforward prompt',
+            }),
+            json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "content": "Zero is online and ready.",
+            }),
+        ]
+        tpath.write_text("\n".join(lines), encoding="utf-8")
+
+        pending = get_turn_pending_tasks(self.conv_id, brain_dir=self.test_dir)
+        self.assertEqual(pending, [])
+
+
+
+    def test_dispatch_full_output_vs_tail_excerpt(self):
+        from tools.task_settle import register_pending_tasks, check_and_dispatch_completed_tasks
+
+        data_dir = Path(self.test_dir) / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Test short log: must return full output under **Output:**
+        register_pending_tasks(
+            conv_id=self.conv_id,
+            channel_id=999001,
+            mode="external",
+            task_ids=["task-full-1"],
+            data_dir=data_dir,
+        )
+        (self.tasks_dir / "task-full-1.log").write_text("Line 1: Alpha\nLine 2: Beta\nLine 3: Gamma\n")
+        (self.msgs_dir / "msg-full-1.json").write_text(json.dumps({
+            "sender": f"{self.conv_id}/task-full-1",
+            "content": f"Task id \"{self.conv_id}/task-full-1\" finished with exit code 0",
+        }))
+
+        with patch("tools.outbox.queue_outbox_message") as mock_outbox:
+            dispatched = check_and_dispatch_completed_tasks(brain_dir=self.test_dir, data_dir=data_dir)
+            self.assertEqual(len(dispatched), 1)
+            msg = mock_outbox.call_args.kwargs["content"]
+            self.assertIn("**Output:**", msg)
+            self.assertNotIn("Output Excerpt", msg)
+            self.assertIn("Line 1: Alpha\nLine 2: Beta\nLine 3: Gamma", msg)
+
+        # 2. Test long log (>1200 chars): must return **Output (Tail Excerpt):**
+        register_pending_tasks(
+            conv_id=self.conv_id,
+            channel_id=999001,
+            mode="external",
+            task_ids=["task-long-1"],
+            data_dir=data_dir,
+        )
+        long_log = "\n".join(f"Row {i:04d}: data payload value {i * 7}" for i in range(200))
+        (self.tasks_dir / "task-long-1.log").write_text(long_log)
+        (self.msgs_dir / "msg-long-1.json").write_text(json.dumps({
+            "sender": f"{self.conv_id}/task-long-1",
+            "content": f"Task id \"{self.conv_id}/task-long-1\" finished with exit code 0",
+        }))
+
+        with patch("tools.outbox.queue_outbox_message") as mock_outbox:
+            dispatched = check_and_dispatch_completed_tasks(brain_dir=self.test_dir, data_dir=data_dir)
+            self.assertEqual(len(dispatched), 1)
+            msg = mock_outbox.call_args.kwargs["content"]
+            self.assertIn("**Output (Tail Excerpt):**", msg)
+            self.assertIn("Row 0199:", msg)
+
 if __name__ == "__main__":
     unittest.main()
+

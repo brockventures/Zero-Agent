@@ -923,62 +923,63 @@ def llm_select_canonical_gif(
             exclude_ids.add(entry.get("id"))
         f_slug = entry.get("franchise")
         if f_slug and not force:
-            is_cd, dist, thresh = check_cooldown(f_slug, history=history)
+            is_cd, _, _ = check_cooldown(f_slug, history=history)
             if is_cd:
                 exclude_ids.add(entry.get("id"))
 
+    eligible_entries = [g for g in registry if g.get("id") not in exclude_ids]
+    if not eligible_entries:
+        return None
+
     lines = []
-    for g in registry:
+    for g in eligible_entries:
         vibes_str = ", ".join(g.get("vibes", []))
         lines.append(f"- {g['id']}: {g.get('situation', '')} [vibes: {vibes_str}]")
 
     catalog_str = "\n".join(lines)
-    exclude_block = ""
-    if exclude_ids:
-        exclude_block = f"\nRECENTLY USED GIFS (DO NOT SELECT):\n" + "\n".join(f"- {x}" for x in sorted(exclude_ids)) + "\n"
 
     prompt = f"""You are the reaction GIF selector for Zero, an autonomous systems engineering agent.
 Analyze the user's conversational situation or upcoming message context, and select the single most fitting, comedic, or ironic reaction GIF from the canonical catalog below.
 
 SITUATION:
 "{query}"
-{exclude_block}
+
 CANONICAL GIF CATALOG:
 {catalog_str}
 
 CRITICAL INSTRUCTIONS:
-1. Select the SINGLE BEST GIF ID from the catalog that fits the tone, humor, or situation.
-2. DO NOT pick any GIF from the RECENTLY USED list.
-3. Return ONLY the chosen GIF ID on a line by itself. Do not include markdown, explanations, or quotes.
+1. Select the SINGLE BEST GIF ID from the catalog that genuinely fits the tone, humor, or situation.
+2. If NO GIF in the catalog genuinely fits the context or tone (e.g. serious technical explanation, architectural menu, outage, or no matching comedic trope), return "NONE". Do NOT force an unfitting GIF.
+3. Return ONLY the chosen GIF ID (or "NONE") on a line by itself. Do not include markdown, explanations, or quotes.
 4. DIVERSIFY SELECTION: Prefer underutilized or fresh gems from the catalog over repeated staples when multiple GIFs fit the tone.
 """
     raw_out = None
+    import subprocess
     try:
-        raw_out = _call_gemini_api_direct(prompt, timeout=3.0)
-    except Exception as e:
-        print(f"[GIF] Direct API error: {e}", file=sys.stderr)
-
-    if not raw_out:
-        import subprocess
-        try:
-            res = subprocess.run(
-                [
-                    "agy",
-                    "--model=gemini-3.8-flash-low",
-                    "--disable-slash-commands",
-                    f"-p={prompt}"
-                ],
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
+        res = subprocess.run(
+            [
+                "agy",
+                "--model=gemini-3.8-flash-low",
+                "--disable-slash-commands",
+                f"-p={prompt}"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        if res.returncode == 0 and res.stdout.strip():
             raw_out = res.stdout.strip()
-        except Exception as e:
-            print(f"[GIF] LLM selection error or timeout: {e}", file=sys.stderr)
-            return None
+    except Exception as e:
+        print(f"[GIF] agy LLM selection error or timeout: {e}", file=sys.stderr)
+        raw_out = None
 
     if not raw_out:
         return None
+
+    cleaned_out = raw_out.strip()
+    if cleaned_out.upper() == "NONE" or re.search(r"\bNONE\b", cleaned_out, re.IGNORECASE):
+        print(f"[GIF] LLM explicitly abstained (returned NONE for situation: '{query}').", file=sys.stderr)
+        return "ABSTAIN"
 
     try:
         chosen_entry = None
@@ -989,14 +990,14 @@ CRITICAL INSTRUCTIONS:
                 break
 
         if not chosen_entry:
-            return None
+            return "ABSTAIN"
 
         if chosen_entry.get("url") in history_urls and not force:
             return None
 
         f_slug = chosen_entry.get("franchise")
         if f_slug and not force:
-            is_cd, dist, thresh = check_cooldown(f_slug, history=history)
+            is_cd, _, _ = check_cooldown(f_slug, history=history)
             if is_cd:
                 return None
 
@@ -1043,7 +1044,7 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
         if entry.get("id", "").lower() == q_norm:
             f_slug = entry.get("franchise")
             if f_slug and not force:
-                is_cd, dist, thresh = check_cooldown(f_slug, history=history)
+                is_cd, _, _ = check_cooldown(f_slug, history=history)
                 if is_cd:
                     continue
             if entry.get("url") in history_urls and not force:
@@ -1066,8 +1067,10 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
     # 2. LLM Semantic Selection (Primary)
     if use_llm:
         llm_pick = llm_select_canonical_gif(query, registry, history_urls, history=history, force=force)
-        if llm_pick:
+        if isinstance(llm_pick, dict):
             return llm_pick
+        if llm_pick == "ABSTAIN":
+            return None
 
     # 2. FTS5 BM25 search
     fts_ranks = {}
@@ -1132,7 +1135,7 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
             continue
 
         if f_slug and not force:
-            is_cd, dist, thresh = check_cooldown(f_slug, history=history)
+            is_cd, _, _ = check_cooldown(f_slug, history=history)
             if is_cd:
                 continue
 
@@ -1229,7 +1232,7 @@ def get_contextual_gif(query: str, run_ocr: bool = True, force: bool = False, al
         # Sort by relevance score descending. Preserve search ranking for ties.
         scored_candidates.sort(key=lambda x: x[0], reverse=True)
 
-        for score, c in scored_candidates:
+        for _, c in scored_candidates:
             c_slug = c.get("slug") or c["url"].split("/")[-1]
             c_title = c.get("title", "")
             c_franchise = detect_franchise(f"{c_title} {c_slug}")

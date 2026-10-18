@@ -439,12 +439,20 @@ def settle_games(conn):
                 status = m.get("status")
                 result = (m.get("result") or "").lower()
                 
+                settled_price = None
+                pos_fee = (pos["fee"] or 0.0) if ("fee" in pos.keys()) else 0.0
                 if status in ["finalized", "closed", "determined", "settled"] and result in ["yes", "no"]:
                     won = (pos["side"].lower() == result)
                     settled_price = 1.00 if won else 0.00
-                    payout = pos["contracts"] * settled_price
-                    realized_pnl = round(payout - pos["total_cost"], 2)
+                    payout = round(pos["contracts"] * settled_price, 2)
+                    realized_pnl = round(payout - pos["total_cost"] - pos_fee, 2)
+                elif status in ["finalized", "closed", "determined", "settled"] and result == "scalar":
+                    scalar_val = float(m.get("settlement_value_dollars") or 0.0)
+                    settled_price = scalar_val if pos["side"].upper() == "YES" else (1.00 - scalar_val)
+                    payout = round(pos["contracts"] * settled_price, 2)
+                    realized_pnl = round(payout - pos["total_cost"] - pos_fee, 2)
                     
+                if settled_price is not None:
                     with conn:
                         conn.execute("""
                             UPDATE positions
@@ -463,6 +471,9 @@ def settle_games(conn):
             
     return settled, total_pnl
 
+# Regular season toggle
+MLB_SEASON_ACTIVE = False
+
 def main():
     parser = argparse.ArgumentParser(description="MLB Daily Matchup Quant & Kalshi Arbitrage")
     parser.add_argument("command", choices=["scan", "trade", "settle", "status"], default="scan", nargs="?", help="Action to execute")
@@ -471,6 +482,11 @@ def main():
     
     conn = get_db()
     
+    if args.command in ["scan", "trade"]:
+        if not MLB_SEASON_ACTIVE:
+            print("MLB 2026 regular season concluded. Daily matchup model deactivated.")
+            return
+            
     if args.command == "settle":
         count, pnl = settle_games(conn)
         print(f"Settled {count} MLB game markets. Realized P&L: ${pnl:+.2f}")

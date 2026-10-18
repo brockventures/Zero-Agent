@@ -146,5 +146,36 @@ class TestRegexFixes(unittest.TestCase):
         self.assertEqual(eva_partner["Name"], "Frank Castle")
 
 
+
+    def test_9_bridge_beacon_preserves_math_and_generics(self):
+        """Verify beacon stripping preserves math inequalities and generic types while removing XML tags and pings."""
+        import json
+        import tools.bridge_state as bs
+        temp_file = Path("/workspace/data/test_beacon.json")
+        orig_file = bs.BEACON_FILE
+        bs.BEACON_FILE = temp_file
+        try:
+            prompt = "<USER_REQUEST> Please check if x < 5 and y > 3 for <@1542285964213358633> with Vector<T> </USER_REQUEST>"
+            bs.update_beacon(state="ACTIVE", prompt=prompt)
+            with open(temp_file) as f:
+                data = json.load(f)
+            self.assertIn("x < 5 and y > 3", data["prompt"])
+            self.assertIn("Vector<T>", data["prompt"])
+            self.assertNotIn("<USER_REQUEST>", data["prompt"])
+            self.assertNotIn("<@1542285964213358633>", data["prompt"])
+        finally:
+            bs.BEACON_FILE = orig_file
+            if temp_file.exists():
+                temp_file.unlink()
+
+    def test_10_zero_mail_tag_regex_preserves_inequalities(self):
+        """Verify zero_mail_listener HTML_TAG_RE does not strip math inequalities."""
+        from tools.zero_mail_listener import HTML_TAG_RE
+        text = "Review if a < 10 and b > 2 before <b>submitting</b>."
+        cleaned = HTML_TAG_RE.sub(" ", text)
+        self.assertIn("a < 10 and b > 2", cleaned)
+        self.assertNotIn("<b>", cleaned)
+        self.assertNotIn("</b>", cleaned)
+
 if __name__ == "__main__":
     unittest.main()

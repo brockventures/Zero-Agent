@@ -14,6 +14,8 @@ import random
 import re
 import sqlite3
 import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -87,10 +89,10 @@ STATIONS = {
 
 # Risk Management Caps (Default fallbacks)
 STARTING_BALANCE = 1000.00
-MAX_TRADE_RISK = 10.00       # $10 max per position
-MAX_TOTAL_EXPOSURE = 200.00  # $200 max open risk
+MAX_TRADE_RISK = 120.00      # $120 max per position (12% of book, scaled dynamically by Kelly + CLOB depth)
+MAX_TOTAL_EXPOSURE = 500.00  # $500 max open risk (50% of book)
 MIN_EDGE_THRESHOLD = 0.08    # +8% EV edge required to trade
-MIN_CONTRACT_PRICE = 0.08    # Ban buying longshots / lottery tickets under $0.08
+MIN_CONTRACT_PRICE = 0.15       # Ban buying longshots / lottery tickets under $0.15 (Safeguard 2)
 MAX_CONTRACT_PRICE = 0.92    # Ban buying heavy favorites over $0.92 (excessive downside risk)
 
 def load_domain_params(domain="weather"):
@@ -104,9 +106,9 @@ def load_domain_params(domain="weather"):
                 glob = data.get("global", {})
                 return {
                     "min_edge": dom.get("min_edge_threshold", 0.08),
-                    "max_trade_risk": dom.get("max_trade_risk", 10.00),
+                    "max_trade_risk": dom.get("max_trade_risk", 120.00),
                     "shrinkage_alpha": dom.get("shrinkage_alpha", 0.95),
-                    "max_total_exposure": glob.get("max_total_exposure", 200.00),
+                    "max_total_exposure": glob.get("max_total_exposure", 500.00),
                     "kelly_fraction": glob.get("kelly_fraction", 0.25),
                     "max_slippage": dom.get("max_slippage_tolerance", glob.get("max_slippage_tolerance", 0.03))
                 }
@@ -114,9 +116,9 @@ def load_domain_params(domain="weather"):
             pass
     return {
         "min_edge": 0.08,
-        "max_trade_risk": 10.00,
+        "max_trade_risk": 120.00,
         "shrinkage_alpha": 0.95,
-        "max_total_exposure": 200.00,
+        "max_total_exposure": 500.00,
         "kelly_fraction": 0.25,
         "max_slippage": 0.03
     }
@@ -150,7 +152,8 @@ def get_db():
                 settled_price REAL,
                 realized_pnl REAL,
                 model_prob REAL,
-                category TEXT
+                category TEXT,
+                fee REAL DEFAULT 0.0
             )
         """)
         # Ensure schema migrations if columns missing
@@ -159,6 +162,8 @@ def get_db():
             conn.execute("ALTER TABLE positions ADD COLUMN model_prob REAL")
         if "category" not in cols:
             conn.execute("ALTER TABLE positions ADD COLUMN category TEXT")
+        if "fee" not in cols:
+            conn.execute("ALTER TABLE positions ADD COLUMN fee REAL DEFAULT 0.0")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -429,8 +434,8 @@ def get_ensemble_weather_forecast(config):
     mean, dynamic_std = compute_ensemble_spread(models, base_std=base_std, min_std=min_std)
     return mean, dynamic_std, models
 
-def get_asos_observed_high(station_code):
-    """Fetch today's maximum observed temperature from NOAA ASOS station."""
+def get_asos_station_telemetry(station_code):
+    """Fetch today's maximum observed temperature, current temp, and wind vector from NOAA ASOS (Safeguard 1)."""
     try:
         url = f"https://api.weather.gov/stations/{station_code}/observations"
         req = urllib.request.Request(url, headers={"User-Agent": "ZeroQuant/1.0", "Accept": "application/geo+json"})
@@ -438,22 +443,64 @@ def get_asos_observed_high(station_code):
             data = json.loads(resp.read().decode())
             obs = data.get("features", [])
             temps_f = []
-            now_pt = datetime.now(PT)
+            latest_wind_dir = None
+            latest_wind_spd = None
             for o in obs[:24]:
                 props = o.get("properties", {})
-                ts_str = props.get("timestamp")
                 val_c = props.get("temperature", {}).get("value")
-                if ts_str and val_c is not None:
-                    # Convert to deg F
+                if val_c is not None:
                     val_f = (val_c * 9.0 / 5.0) + 32.0
                     temps_f.append(val_f)
-            if temps_f:
-                return round(max(temps_f), 1)
+                if latest_wind_dir is None:
+                    wdir = props.get("windDirection", {}).get("value")
+                    wspd = props.get("windSpeed", {}).get("value")
+                    if wdir is not None:
+                        latest_wind_dir = float(wdir)
+                        latest_wind_spd = float(wspd) * 0.621371 if wspd is not None else 0.0
+            observed_high = round(max(temps_f), 1) if temps_f else None
+            return {
+                "observed_high": observed_high,
+                "wind_dir": latest_wind_dir,
+                "wind_spd": latest_wind_spd
+            }
     except Exception:
         pass
-    return None
+    return {"observed_high": None, "wind_dir": None, "wind_spd": None}
 
-def scan_markets():
+def evaluate_weather_safeguards(city_code, strike_type, bounds, effective_high, is_onshore_flow):
+    """Evaluate Safeguards 1a, 1b, and 4 against parsed strike_type ('range', 'less', 'greater')."""
+    is_near_bracket_center = False
+    if strike_type in ("range", "B") and isinstance(bounds, (tuple, list)) and len(bounds) == 2:
+        if (bounds[1] - bounds[0]) <= 2.0:
+            bracket_center = (bounds[0] + bounds[1]) / 2.0
+            if abs(effective_high - bracket_center) <= 1.5:
+                is_near_bracket_center = True
+
+    bound_val = bounds[0] if isinstance(bounds, (tuple, list)) else float(bounds or 0.0)
+    lax_tail_blocked = (
+        city_code == "LAX"
+        and is_onshore_flow
+        and strike_type in ("greater", "T")
+        and bound_val >= 90.0
+    )
+    bound_high = bounds[1] if isinstance(bounds, (tuple, list)) else float(bounds or 0.0)
+    sfo_tail_blocked = (
+        city_code == "SFO"
+        and is_onshore_flow
+        and strike_type in ("less", "T")
+        and bound_high <= 82.0
+    )
+    return {
+        "is_near_bracket_center": is_near_bracket_center,
+        "lax_tail_blocked": lax_tail_blocked,
+        "sfo_tail_blocked": sfo_tail_blocked,
+    }
+
+def get_asos_observed_high(station_code):
+    """Fetch today's maximum observed temperature from NOAA ASOS station."""
+    return get_asos_station_telemetry(station_code).get("observed_high")
+
+def scan_markets(verbose=False):
     """Scan all tracked cities, calculate fair value, and identify mispricings."""
     opportunities = []
     now_pt = datetime.now(PT)
@@ -463,7 +510,7 @@ def scan_markets():
     min_edge = params.get("min_edge", MIN_EDGE_THRESHOLD)
     alpha = params.get("shrinkage_alpha", 0.95)
     
-    print(f"[{now_pt.strftime('%Y-%m-%d %I:%M:%S %p PT')}] Scanning Kalshi weather CLOB against NOAA Multi-Model Ensemble (Edge Hurdle: +{min_edge*100:.1f}%, Shrinkage α: {alpha:.2f})...")
+    if verbose: print(f"[{now_pt.strftime('%Y-%m-%d %I:%M:%S %p PT')}] Scanning Kalshi weather CLOB against NOAA Multi-Model Ensemble (Edge Hurdle: +{min_edge*100:.1f}%, Shrinkage α: {alpha:.2f})...")
     
     for city_code, cfg in STATIONS.items():
         # Ingest multi-model numerical ensemble (Issue #7)
@@ -471,9 +518,37 @@ def scan_markets():
         if ensemble_high is None:
             continue
             
-        # Ingest ground-truth ASOS observed temperature floor (Issue #2)
-        observed_floor = get_asos_observed_high(cfg["station"])
+        # Ingest ground-truth ASOS observed temperature floor & wind vector (Safeguard 1)
+        telemetry = get_asos_station_telemetry(cfg["station"])
+        observed_floor = telemetry.get("observed_high")
         effective_high = max(ensemble_high, observed_floor) if observed_floor else ensemble_high
+        wind_dir = telemetry.get("wind_dir")
+        wind_spd = telemetry.get("wind_spd") or 0.0
+
+        # Safeguard 1: Coastal ASOS Wind & Sea-Breeze Gate
+        is_onshore_flow = False
+        if city_code == "SFO":
+            # Onshore flow: westerly/northwesterly/southwesterly wind (180° - 340°) or light/calm marine air
+            is_onshore_flow = (wind_dir is None) or (180.0 <= wind_dir <= 340.0)
+            if is_onshore_flow and effective_high > 75.0:
+                if verbose: print(f"  [WindGate] 🌊 SFO Onshore Flow active (Wind: {wind_dir}° @ {wind_spd:.1f}mph). Clamping forecast ceiling from {effective_high}°F to 75.0°F")
+                effective_high = 75.0
+        elif city_code == "LAX":
+            # Offshore Santa Ana winds are strictly NE/E (010° to 100°). Everything else is onshore/calm sea breeze
+            is_offshore = (wind_dir is not None and (10.0 <= wind_dir <= 100.0) and wind_spd >= 6.0)
+            is_onshore_flow = not is_offshore
+            if is_onshore_flow and effective_high > 88.0:
+                if verbose: print(f"  [WindGate] 🌊 LAX Sea-Breeze active (No offshore wind: {wind_dir}° @ {wind_spd:.1f}mph). Clamping forecast ceiling from {effective_high}°F to 88.0°F")
+                effective_high = 88.0
+
+        # Safeguard 3: Coastal Dispersion Floor & Negative Skew Adjustment (Combatting Model Herding)
+        station_skew = cfg.get("skew", 0.0)
+        station_std = dynamic_std
+        if city_code in ("SFO", "LAX") and effective_high >= (72.0 if city_code == "SFO" else 82.0):
+            station_std = max(dynamic_std, 2.8)
+            station_skew = -2.2 if city_code == "SFO" else -1.8
+            if station_std > dynamic_std:
+                if verbose: print(f"  [CoastalDispersion] 🛡️ {city_code} warm regime dispersion floor active: std {dynamic_std}°F -> {station_std}°F, skew {station_skew}")
 
         markets = get_kalshi_markets(cfg["series"])
         # Filter for today's event markets
@@ -491,15 +566,22 @@ def scan_markets():
             if not strike_type:
                 continue
                 
-            p_raw = calculate_bracket_prob(strike_type, bounds, effective_high, dynamic_std, skew=cfg.get("skew", 0.0))
+            p_raw = calculate_bracket_prob(strike_type, bounds, effective_high, station_std, skew=station_skew)
             # Apply shrinkage calibration against market midpoint/ask
             ref_mkt = yes_ask if yes_ask > 0.0 else 0.50
             p_model = round(alpha * p_raw + (1.0 - alpha) * ref_mkt, 4)
+
+            sg = evaluate_weather_safeguards(city_code, strike_type, bounds, effective_high, is_onshore_flow)
+            is_near_bracket_center = sg["is_near_bracket_center"]
             
-            # 1. Check BUY YES edge (Tail risk filter: ban buying longshots <$0.08 or shorting <$0.08)
+            # Safeguard 2: Tail contract safety filter & Low-price edge hurdle (+15% edge if price < $0.25)
+            # 1. Check BUY YES edge
+            req_edge_yes = max(min_edge, 0.15) if yes_ask < 0.25 else min_edge
             if yes_ask >= MIN_CONTRACT_PRICE and yes_ask <= MAX_CONTRACT_PRICE:
                 edge_yes = p_model - yes_ask
-                if edge_yes >= min_edge:
+                # Safeguard 1b: Block BUY YES on LAX extreme heat tails without offshore wind
+                lax_tail_blocked = sg["lax_tail_blocked"]
+                if edge_yes >= req_edge_yes and not lax_tail_blocked:
                     opportunities.append({
                         "city": cfg["city"],
                         "forecast": effective_high,
@@ -513,12 +595,18 @@ def scan_markets():
                         "market_obj": m
                     })
                     
-            # 2. Check BUY NO edge (Tail risk filter)
+            # 2. Check BUY NO edge
             no_ask = round(1.0 - yes_bid, 2) if yes_bid > 0.0 else 1.0
+            req_edge_no = max(min_edge, 0.15) if no_ask < 0.25 else min_edge
             if no_ask >= MIN_CONTRACT_PRICE and no_ask <= MAX_CONTRACT_PRICE:
                 p_model_no = 1.0 - p_model
                 edge_no = p_model_no - no_ask
-                if edge_no >= min_edge:
+                # Safeguard 1a: Block BUY NO on SFO cool tails during onshore flow
+                sfo_tail_blocked = sg["sfo_tail_blocked"]
+                # Safeguard 4: Block BUY NO on narrow brackets centered on forecast
+                bracket_blocked = is_near_bracket_center
+                
+                if edge_no >= req_edge_no and not sfo_tail_blocked and not bracket_blocked:
                     opportunities.append({
                         "city": cfg["city"],
                         "forecast": effective_high,
@@ -536,7 +624,7 @@ def scan_markets():
         if today_markets and len(today_markets) >= 2:
             cb_analysis = detect_cross_bracket_arbitrage(today_markets, event_title=f"{cfg['city']} Weather")
             if cb_analysis["has_underround_arb"]:
-                print(f"  [CrossBracket] 🚨 Detected weather under-round basket arb for {cfg['city']}! Sum Ask: ${cb_analysis['sum_ask']:.2f}, Profit/share: ${cb_analysis['arb_profit_per_share']:.4f}")
+                if verbose: print(f"  [CrossBracket] 🚨 Detected weather under-round basket arb for {cfg['city']}! Sum Ask: ${cb_analysis['sum_ask']:.2f}, Profit/share: ${cb_analysis['arb_profit_per_share']:.4f}")
                 for m in today_markets:
                     ask = float(m.get("yes_ask_dollars") or 0.0)
                     if ask > 0.0:
@@ -573,13 +661,13 @@ def scan_markets():
 
     # Universal Cross-Bracket Sweep across Macroeconomics, Box Office, Crypto, and Financials
     try:
-        print(f"[{now_pt.strftime('%Y-%m-%d %I:%M:%S %p PT')}] Sweeping Universal Cross-Bracket opportunities across all Kalshi categories (horizon <= 14d)...")
+        if verbose: print(f"[{now_pt.strftime('%Y-%m-%d %I:%M:%S %p PT')}] Sweeping Universal Cross-Bracket opportunities across all Kalshi categories (horizon <= 14d)...")
         universal_opps = sweep_kalshi_events(max_days=14, limit=60)
         for uo in universal_opps:
             a = uo["analysis"]
             ev_title = uo["event_title"]
             if a["has_underround_arb"]:
-                print(f"  [UniversalCrossBracket] 🚨 Basket Arb: {ev_title} (Net profit/sh: ${a['arb_profit_per_share']:.4f})")
+                if verbose: print(f"  [UniversalCrossBracket] 🚨 Basket Arb: {ev_title} (Net profit/sh: ${a['arb_profit_per_share']:.4f})")
                 for vm in a["normalized_distribution"]:
                     if vm["yes_ask"] > 0.0:
                         opportunities.append({
@@ -613,7 +701,7 @@ def scan_markets():
                             "market_obj": {"ticker": b["ticker"], "title": b["title"]}
                         })
     except Exception as ex:
-        print(f"  [UniversalCrossBracket] Sweep note: {ex}")
+        if verbose: print(f"  [UniversalCrossBracket] Sweep note: {ex}")
 
     return opportunities
 
@@ -855,16 +943,17 @@ def execute_trade(conn, opp):
         
     params = load_domain_params(category)
     k_fraction = params.get("kelly_fraction", 0.25)
-    max_risk = params.get("max_trade_risk", 10.00)
-    max_exposure = params.get("max_total_exposure", 200.00)
+    max_risk = params.get("max_trade_risk", 120.00)
+    max_exposure = params.get("max_total_exposure", 500.00)
     min_edge = params.get("min_edge", MIN_EDGE_THRESHOLD)
     max_slippage = params.get("max_slippage", 0.03)
     
-    # Check total exposure
+    # Check total exposure room
     cur = conn.execute("SELECT SUM(total_cost) as total FROM positions WHERE status = 'OPEN'")
     row = cur.fetchone()
     current_exposure = row["total"] or 0.0
-    if current_exposure + max_risk > max_exposure:
+    remaining_exposure = max(0.0, max_exposure - current_exposure)
+    if remaining_exposure < 1.00:
         return False, f"Total exposure limit hit (${current_exposure:.2f}/${max_exposure:.2f})"
         
     # Check cash
@@ -873,19 +962,29 @@ def execute_trade(conn, opp):
     if cash < 1.00:
         return False, f"Insufficient cash (${cash:.2f})"
         
+    total_equity = cash + current_exposure
+    ens_std = float(opp.get("ensemble_std") or 2.0)
+    if ens_std <= 1.6:
+        conf_mult = 1.25
+    elif ens_std >= 2.8:
+        conf_mult = 0.65
+    else:
+        conf_mult = 1.0
+
     # Fractional Kelly sizing: f* = (p - price) / (1 - price)
     if price < 1.0 and model_prob > price:
         f_star = (model_prob - price) / (1.0 - price)
-        kelly_allocation = cash * f_star * k_fraction
-        allocated_risk = min(max_risk, max(1.00, kelly_allocation))
+        kelly_allocation = total_equity * f_star * k_fraction * conf_mult
+        allocated_risk = min(max_risk, remaining_exposure, max(1.00, kelly_allocation))
     else:
-        allocated_risk = max_risk
+        allocated_risk = min(max_risk, remaining_exposure)
         
     # Apply correlated portfolio covariance penalty scaling
     cur = conn.execute("SELECT * FROM positions WHERE status = 'OPEN'")
     open_positions = [dict(r) for r in cur.fetchall()]
     cov_scale = calculate_covariance_scaling(ticker, open_positions, max_trade_risk=max_risk)
-    allocated_risk = allocated_risk * cov_scale
+    llm_mult = max(0.2, min(1.5, float(opp.get("llm_conviction_multiplier", 1.0))))
+    allocated_risk = min(max_risk, remaining_exposure, allocated_risk * cov_scale * llm_mult)
     
     # Sector and settlement date hard ceilings (max 15% / $150)
     ok_ceil, ceil_msg = check_exposure_ceilings(conn, ticker, category, allocated_risk, max_cap=MAX_SECTOR_EXPOSURE)
@@ -925,10 +1024,17 @@ def execute_trade(conn, opp):
         # Deduct cash
         conn.execute("UPDATE portfolio SET cash = cash - ?, last_updated = ? WHERE id = 1", (total_cost + fee, now_str))
         # Insert position
-        conn.execute("""
-            INSERT INTO positions (ticker, title, side, contracts, entry_price, total_cost, opened_at, status, model_prob, category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
-        """, (ticker, title, side, contracts, actual_price, total_cost, now_str, model_prob, category))
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()]
+        if "fee" in cols:
+            conn.execute("""
+                INSERT INTO positions (ticker, title, side, contracts, entry_price, total_cost, fee, opened_at, status, model_prob, category)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+            """, (ticker, title, side, contracts, actual_price, total_cost, fee, now_str, model_prob, category))
+        else:
+            conn.execute("""
+                INSERT INTO positions (ticker, title, side, contracts, entry_price, total_cost, opened_at, status, model_prob, category)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+            """, (ticker, title, side, contracts, actual_price, total_cost, now_str, model_prob, category))
         # Log order
         conn.execute("""
             INSERT INTO orders (timestamp, ticker, side, action, contracts, price, fee, status, reason)
@@ -1087,8 +1193,8 @@ def submit_post_only_order(conn, opp, timeout_minutes=15):
         
     params = load_domain_params(category)
     k_fraction = params.get("kelly_fraction", 0.25)
-    max_risk = params.get("max_trade_risk", 10.00)
-    max_exposure = params.get("max_total_exposure", 200.00)
+    max_risk = params.get("max_trade_risk", 120.00)
+    max_exposure = params.get("max_total_exposure", 500.00)
     
     # Query current position inventory for this ticker to apply Avellaneda-Stoikov inventory skew
     cur = conn.execute("SELECT SUM(contracts) as total_qty FROM positions WHERE ticker = ? AND status = 'OPEN'", (ticker,))
@@ -1098,7 +1204,8 @@ def submit_post_only_order(conn, opp, timeout_minutes=15):
     
     cur = conn.execute("SELECT SUM(total_cost) as total FROM positions WHERE status = 'OPEN'")
     current_exposure = cur.fetchone()["total"] or 0.0
-    if current_exposure + max_risk > max_exposure:
+    remaining_exposure = max(0.0, max_exposure - current_exposure)
+    if remaining_exposure < 1.00:
         return False, f"Total exposure limit hit (${current_exposure:.2f}/${max_exposure:.2f})"
         
     cur = conn.execute("SELECT cash FROM portfolio WHERE id = 1")
@@ -1106,11 +1213,12 @@ def submit_post_only_order(conn, opp, timeout_minutes=15):
     if cash < 1.00:
         return False, f"Insufficient cash (${cash:.2f})"
         
+    total_equity = cash + current_exposure
     if price < 1.0 and model_prob > price:
         f_star = (model_prob - price) / (1.0 - price)
-        allocated_risk = min(max_risk, min(cash, max(1.00, cash * f_star * k_fraction)))
+        allocated_risk = min(max_risk, remaining_exposure, min(cash, max(1.00, total_equity * f_star * k_fraction)))
     else:
-        allocated_risk = min(max_risk, cash)
+        allocated_risk = min(max_risk, remaining_exposure, cash)
         
     # Apply correlated portfolio covariance penalty scaling
     cur = conn.execute("SELECT * FROM positions WHERE status = 'OPEN'")
@@ -1249,10 +1357,17 @@ def reconcile_live_orders_and_positions(conn, remote_orders=None, remote_positio
                 total_cost = round(contracts * price, 2)
                 with conn:
                     conn.execute("UPDATE orders SET status = 'FILLED', reason = reason || ' | Reconciled: filled' WHERE id = ?", (order_id,))
-                    conn.execute("""
-                        INSERT OR IGNORE INTO positions (ticker, title, side, contracts, entry_price, total_cost, opened_at, status, model_prob, category)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
-                    """, (ticker, ticker, side, contracts, price, total_cost, now_str, price + 0.08, category))
+                    cols = [r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()]
+                    if "fee" in cols:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO positions (ticker, title, side, contracts, entry_price, total_cost, fee, opened_at, status, model_prob, category)
+                            VALUES (?, ?, ?, ?, ?, ?, 0.0, ?, 'OPEN', ?, ?)
+                        """, (ticker, ticker, side, contracts, price, total_cost, now_str, price + 0.08, category))
+                    else:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO positions (ticker, title, side, contracts, entry_price, total_cost, opened_at, status, model_prob, category)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+                        """, (ticker, ticker, side, contracts, price, total_cost, now_str, price + 0.08, category))
                 reconciled_orders += 1
             elif rem_status in ["canceled", "cancelled", "expired"]:
                 refund = round(contracts * price, 2)
@@ -1332,12 +1447,20 @@ def settle_markets(conn):
             status = m.get("status")
             result = (m.get("result") or "").lower() # "yes" or "no"
             
+            settled_price = None
+            pos_fee = (pos["fee"] or 0.0) if ("fee" in pos.keys()) else 0.0
             if status in ["finalized", "closed", "determined", "settled"] and result in ["yes", "no"]:
                 won = (pos["side"].lower() == result)
                 settled_price = 1.00 if won else 0.00
-                payout = pos["contracts"] * settled_price
-                realized_pnl = round(payout - pos["total_cost"], 2)
+                payout = round(pos["contracts"] * settled_price, 2)
+                realized_pnl = round(payout - pos["total_cost"] - pos_fee, 2)
+            elif status in ["finalized", "closed", "determined", "settled"] and result == "scalar":
+                scalar_val = float(m.get("settlement_value_dollars") or 0.0)
+                settled_price = scalar_val if pos["side"].upper() == "YES" else (1.00 - scalar_val)
+                payout = round(pos["contracts"] * settled_price, 2)
+                realized_pnl = round(payout - pos["total_cost"] - pos_fee, 2)
                 
+            if settled_price is not None:
                 with conn:
                     # Update position
                     conn.execute("""
@@ -1368,8 +1491,19 @@ def get_portfolio_status(conn):
     open_cost = sum(r["total_cost"] for r in open_pos)
     total_equity = p["cash"] + open_cost # approximate mark-to-cost
     
-    wins = [r for r in resolved_pos if r["realized_pnl"] > 0]
+    wins = [r for r in resolved_pos if (r["realized_pnl"] or 0.0) > 0]
     win_rate = (len(wins) / len(resolved_pos) * 100) if resolved_pos else 0.0
+
+    total_fees = 0.0
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(positions)").fetchall()]
+    if "fee" in cols:
+        fee_row = conn.execute("SELECT sum(fee) FROM positions WHERE fee IS NOT NULL").fetchone()
+        if fee_row and fee_row[0] is not None:
+            total_fees = fee_row[0]
+    if not total_fees:
+        ord_fee = conn.execute("SELECT sum(fee) FROM orders WHERE status = 'FILLED'").fetchone()
+        if ord_fee and ord_fee[0] is not None:
+            total_fees = ord_fee[0]
     
     return {
         "starting_balance": p["starting_balance"],
@@ -1377,6 +1511,8 @@ def get_portfolio_status(conn):
         "open_exposure": open_cost,
         "total_equity": total_equity,
         "realized_pnl": p["realized_pnl"],
+        "net_pnl": p["realized_pnl"],
+        "total_fees": total_fees,
         "open_count": len(open_pos),
         "resolved_count": len(resolved_pos),
         "win_rate": win_rate,
@@ -1384,19 +1520,30 @@ def get_portfolio_status(conn):
         "resolved_positions": resolved_pos
     }
 
-def print_status(conn):
+def print_status(conn, verbose=False):
     st = get_portfolio_status(conn)
+    if not verbose:
+        open_items = [f"`{p['ticker']}` ({p['side']} {p['contracts']}x)" for p in st["open_positions"][:4]]
+        if len(st["open_positions"]) > 4:
+            open_items.append(f"+{len(st['open_positions'])-4} more")
+        open_sub = f" — {', '.join(open_items)}" if open_items else ""
+        print(
+            f"- **Kalshi Book (Weather & Events):** `${st['total_equity']:.2f}` equity "
+            f"(`${st['cash']:.2f}` cash · `{st['open_count']}` open / `${st['open_exposure']:.2f}` risk · "
+            f"Realized `{st['realized_pnl']:+.2f}` · {st['win_rate']:.1f}% WR){open_sub}"
+        )
+        return
     print("========================================")
     print("      ZERO KALSHI QUANT PAPER BOT       ")
     print("========================================")
     print(f"Cash:              ${st['cash']:>10.2f}")
     print(f"Open Exposure:     ${st['open_exposure']:>10.2f}")
     print(f"Total Equity:      ${st['total_equity']:>10.2f}")
-    print(f"Realized P&L:      ${st['realized_pnl']:>+10.2f}")
+    print(f"Net Realized P&L:  ${st['realized_pnl']:>+10.2f}")
+    print(f"Cumulative Fees:   ${st['total_fees']:>10.2f}")
     print(f"Open Positions:    {st['open_count']:>10}")
     print(f"Resolved Trades:   {st['resolved_count']:>10} (Win Rate: {st['win_rate']:.1f}%)")
     print("----------------------------------------")
-    
     if st["open_positions"]:
         print("OPEN POSITIONS:")
         for p in st["open_positions"]:
@@ -1408,6 +1555,7 @@ def print_status(conn):
 def main():
     parser = argparse.ArgumentParser(description="Zero Kalshi Paper Trading Bot")
     parser.add_argument("command", choices=["scan", "trade", "status", "settle", "reset"], help="Action to execute")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose diagnostic output")
     args = parser.parse_args()
     
     conn = get_db()
@@ -1424,32 +1572,74 @@ def main():
 
     if args.command == "settle":
         count, pnl = settle_markets(conn)
-        print(f"Settled {count} markets. Realized P&L: ${pnl:+.2f}")
+        if count > 0 or args.verbose:
+            print(f"Settled {count} markets. Realized P&L: ${pnl:+.2f}")
         return
 
     if args.command in ["scan", "trade"]:
-        opps = scan_markets()
-        print(f"\nFound {len(opps)} positive-EV opportunities (Threshold: +{MIN_EDGE_THRESHOLD*100:.0f}% edge):")
-        
-        if not opps:
-            print("No mispriced contracts currently meet the edge threshold.")
-        else:
+        opps = scan_markets(verbose=args.verbose)
+        if args.verbose:
+            print(f"\nFound {len(opps)} positive-EV opportunities (Threshold: +{MIN_EDGE_THRESHOLD*100:.0f}% edge):")
+
+        pm_decision = {
+            "approved_indices": list(range(len(opps))),
+            "sizing_multipliers": {},
+            "rationale_by_index": {},
+            "unwinds": [],
+            "pm_thesis": "",
+            "model_used": "gemini-4-argon-high",
+        }
+        try:
+            from tools.llm_sidecar import evaluate_quant_candidates_llm
+            pm_decision = evaluate_quant_candidates_llm(
+                "kalshi_paper_bot",
+                "Kalshi Weather & Cross-Bracket CLOB",
+                opps,
+                get_portfolio_status(conn),
+            )
+            if args.verbose and pm_decision.get("pm_thesis"):
+                print(f"\n🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
+        except Exception as e:
+            if args.verbose:
+                print(f"  [Quant PM Note]: {e}")
+
+        approved_set = set(pm_decision.get("approved_indices", range(len(opps))))
+        mult_map = pm_decision.get("sizing_multipliers", {})
+        rat_map = pm_decision.get("rationale_by_index", {})
+
+        new_fills = []
+        if opps:
             for i, opp in enumerate(opps, 1):
-                print(f"[{i}] {opp['city']} (NOAA Fc: {opp['forecast']}°F) -> {opp['ticker']}")
-                print(f"    Title: {opp['title']}")
-                print(f"    Action: BUY {opp['side']} @ ${opp['market_price']:.2f} | Model Prob: {opp['model_prob']*100:.1f}% | Edge: {opp['edge']*100:+.1f}%")
-                
+                idx = i - 1
+                conv_mult = float(mult_map.get(str(idx), 1.0))
+                opp["llm_conviction_multiplier"] = conv_mult
+                pm_note = rat_map.get(str(idx), "")
+                if args.verbose:
+                    print(f"[{i}] {opp['city']} (NOAA Fc: {opp['forecast']}°F) -> {opp['ticker']}")
+                    print(f"    Title: {opp['title']}")
+                    print(f"    Action: BUY {opp['side']} @ ${opp['market_price']:.2f} | Model Prob: {opp['model_prob']*100:.1f}% | Edge: {opp['edge']*100:+.1f}% | PM Mult: {conv_mult:.2f}x")
+                    if pm_note:
+                        print(f"    [PM Thesis]: {pm_note}")
+
                 if args.command == "trade":
+                    if idx not in approved_set:
+                        if args.verbose:
+                            print("    [PM VETO]: Filtered out by Quant Portfolio Manager risk review.")
+                        continue
                     success, msg = execute_trade(conn, opp)
-                    status_flag = "EXEC" if success else "SKIP"
-                    print(f"    [{status_flag}]: {msg}")
-                    
-        print()
-        print_status(conn)
+                    if success:
+                        new_fills.append(f"`{opp['ticker']}` ({opp['side']} @ ${opp['market_price']:.2f}, +{opp['edge']*100:.1f}% edge)")
+                    if args.verbose:
+                        status_flag = "EXEC" if success else "SKIP"
+                        print(f"    [{status_flag}]: {msg}")
+
+        print_status(conn, verbose=args.verbose)
+        if new_fills and not args.verbose:
+            print(f"  - *New Weather Fills ({len(new_fills)}):* {', '.join(new_fills[:3])}")
         return
 
     if args.command == "status":
-        print_status(conn)
+        print_status(conn, verbose=args.verbose)
 
 if __name__ == "__main__":
     main()

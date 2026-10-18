@@ -782,6 +782,271 @@ class TestBridgeFormatting(unittest.TestCase):
         out = format_for_discord("Ping @Amos about the sprint.")
         self.assertIn("<@1468012353206354197>", out)
 
+    def test_scrub_ephemeral_directives(self):
+        from tools.bridge_formatting import scrub_ephemeral_directives, format_steering_prompt
+
+        # Banana Watcher prompt should be scrubbed to empty
+        bw_prompt = (
+            "🍌 **Topic Stalled**: Topic `market-sandbox-pr97` has had no activity for 30m.\n\n"
+            "[CRITICAL OPERATIONAL DIRECTIVE - BANANA WATCHER TOPIC STALLED NUDGE]:\n"
+            "Banana Watcher has flagged that topic `market-sandbox-pr97` has stalled without resolution.\n"
+            "2. If a peer bot has ALREADY replied... output [NO_REPLY] to avoid redundant chatter.\n"
+        )
+        self.assertEqual(scrub_ephemeral_directives(bw_prompt), "")
+
+        # When original_task is solely Banana Watcher, format_steering_prompt omits the original task section
+        steer_out = format_steering_prompt(
+            new_directive="What do you think of PR 97?",
+            original_task=bw_prompt,
+            author_name="Amos",
+            is_group=True,
+        )
+        self.assertNotIn("[ORIGINAL IN-FLIGHT TASK BEING EXECUTED]", steer_out)
+        self.assertNotIn("output [NO_REPLY]", steer_out)
+        self.assertNotIn("Banana Watcher", steer_out)
+        self.assertIn("While you were drafting your reply, a new message arrived in the channel from Amos:", steer_out)
+        self.assertIn("What do you think of PR 97?", steer_out)
+
+        # Mixed prompt preserves real user request while stripping directives
+        mixed_prompt = (
+            "Can you review the PR 97 changes?\n\n"
+            "[CRITICAL OPERATIONAL DIRECTIVE - BANANA WATCHER LOOP WARNING]:\n"
+            "Clamp the loop immediately: output [NO_REPLY] if someone responded.\n"
+        )
+        cleaned_mixed = scrub_ephemeral_directives(mixed_prompt)
+        self.assertEqual(cleaned_mixed, "Can you review the PR 97 changes?")
+
+        steer_mixed = format_steering_prompt(
+            new_directive="Also check the unit tests",
+            original_task=mixed_prompt,
+            author_name="Ryan",
+            is_group=False,
+        )
+        self.assertIn("[ORIGINAL IN-FLIGHT TASK BEING EXECUTED]:", steer_mixed)
+        self.assertIn("Can you review the PR 97 changes?", steer_mixed)
+        self.assertNotIn("output [NO_REPLY]", steer_mixed)
+        self.assertNotIn("LOOP WARNING", steer_mixed)
+    def test_parse_interactive_choices_nested_brackets(self):
+        """Verify parse_interactive_choices handles nested brackets inside choice labels."""
+        from tools.bridge_formatting import parse_interactive_choices
+        raw = "Sprint updated.\n\n[CHOICES: Continue Sprint: [UI-3] Unified Plan Architecture | Continue Sprint: [UI-4] Obsidian Glass Elevation | Inspect Backlog]"
+        clean, view = parse_interactive_choices(raw, quick_choice_view_cls=lambda choices, callback_fn: choices)
+        self.assertEqual(clean, "Sprint updated.")
+        self.assertEqual(view, [
+            "Continue Sprint: [UI-3] Unified Plan Architecture",
+            "Continue Sprint: [UI-4] Obsidian Glass Elevation",
+            "Inspect Backlog",
+        ])
+
+    def test_react_and_choices_preserved_inside_code_spans(self):
+        """Verify [REACT: ...] and [CHOICES: ...] inside inline backticks or fenced code blocks are not stripped."""
+        from tools.bridge_formatting import (
+            extract_react_directives,
+            parse_interactive_choices,
+            strip_unquoted_choices,
+        )
+
+        msg = (
+            "[REACT: 🫡]\n"
+            "Done — updated `.agents/rules/discord_formatting.md` to clarify `[REACT: <emoji>]` usage.\n"
+            "- Never prefix text replies with `[REACT: 🫡]` or `[REACT: 🎯]`.\n"
+            "- Gated `[CHOICES: Option 1 | Option 2]` strictly on real decisions.\n"
+            "```markdown\n"
+            "[REACT: 👍]\n"
+            "[CHOICES: Fake A | Fake B]\n"
+            "```\n\n"
+            "[CHOICES: Reload Bridge In-Place | Postpone Reload]"
+        )
+
+        cleaned_react, emojis = extract_react_directives(msg)
+        self.assertEqual(emojis, ["🫡"])
+        self.assertIn("`[REACT: <emoji>]`", cleaned_react)
+        self.assertIn("`[REACT: 🫡]`", cleaned_react)
+        self.assertIn("`[REACT: 🎯]`", cleaned_react)
+        self.assertIn("```markdown\n[REACT: 👍]", cleaned_react)
+        self.assertNotIn("``", cleaned_react.replace("```", ""))
+
+        final_text, view = parse_interactive_choices(
+            cleaned_react,
+            quick_choice_view_cls=lambda choices, callback_fn: choices,
+        )
+        self.assertEqual(view, ["Reload Bridge In-Place", "Postpone Reload"])
+        self.assertIn("`[CHOICES: Option 1 | Option 2]`", final_text)
+        self.assertIn("[CHOICES: Fake A | Fake B]", final_text)
+        self.assertNotIn("Reload Bridge In-Place", final_text)
+
+        stripped = strip_unquoted_choices(cleaned_react)
+        self.assertIn("`[CHOICES: Option 1 | Option 2]`", stripped)
+        self.assertNotIn("Reload Bridge In-Place", stripped)
+
+    def test_commonmark_nested_backtick_shielding(self):
+        """Verify multi-backtick inline spans containing triple backticks or choices are never split open."""
+        from tools.bridge_formatting import (
+            extract_react_directives,
+            parse_interactive_choices,
+            strip_unquoted_choices,
+        )
+
+        # Double-backtick inline span containing triple backticks and file:/// / @Amos / $SOL
+        text = (
+            "In `bridge_pipeline.py`, the regex ``r\"(\\n*(?:```(?:handoff)?|<!--\\s*(?:banana-)?envelope).*)\"`` "
+            "matches `file:///workspace/tools/bridge.py` and `@Amos` with ``[CHOICES: Fake 1 | Fake 2]`` and ``[REACT: 🔥]``."
+        )
+        cleaned_react, emojis = extract_react_directives(text)
+        self.assertEqual(emojis, [])
+        formatted = format_for_discord(cleaned_react)
+        self.assertIn("``r\"(\\n*(?:```(?:handoff)?|<!--\\s*(?:banana-)?envelope).*)\"``", formatted)
+        self.assertIn("`file:///workspace/tools/bridge.py`", formatted)
+        self.assertIn("`@Amos`", formatted)
+        self.assertNotIn("<@1468012353206354197>", formatted)
+
+        after_choices, view = parse_interactive_choices(
+            formatted,
+            quick_choice_view_cls=lambda choices, callback_fn: choices,
+        )
+        self.assertIsNone(view)
+        self.assertIn("``[CHOICES: Fake 1 | Fake 2]``", after_choices)
+        self.assertIn("``[CHOICES: Fake 1 | Fake 2]``", strip_unquoted_choices(formatted))
+
+    def test_clean_discord_latex_whitelist_preserves_prose_dollars_and_regexes(self):
+        """Verify tickers, prices, shell vars, and regex backslashes are never mangled by clean_discord_latex."""
+        # 1. Tickers and prices
+        prose_finance = "Bought $SOL at ~$200 and sold $ETH at $3,500."
+        self.assertEqual(clean_discord_latex(prose_finance), prose_finance)
+        self.assertEqual(format_for_discord(prose_finance), prose_finance)
+
+        # 2. Shell variables
+        prose_env = "Export $PATH:$HOME/bin or check $USER_ID and $API_KEY in the env."
+        self.assertEqual(clean_discord_latex(prose_env), prose_env)
+
+        # 3. Unbackticked regexes with \s and \d
+        prose_regex = r"The pattern $foo\s+bar$ or $a\d+b$ matches end-of-line anchors."
+        self.assertEqual(clean_discord_latex(prose_regex), prose_regex)
+
+        # 4. Valid inline LaTeX still converts cleanly
+        valid_math = r"For $x^2 + y_1 = z$, density is $1.24\,\text{g/cm}^3$ and $\alpha + \beta \leq \gamma$."
+        cleaned_math = clean_discord_latex(valid_math)
+        self.assertIn("x² + y₁ = z", cleaned_math)
+        self.assertIn("1.24 g/cm³", cleaned_math)
+        self.assertIn("α + β ≤ γ", cleaned_math)
+
+    def test_code_block_preservation_across_all_mutators(self):
+        """Verify fenced code blocks preserve CLI output lines ('OK', 'Exit code: 0'), file:// URIs, URLs, tables, and headers."""
+        code_sample = (
+            "Here is the test output for [bridge.py](file:///workspace/tools/bridge.py):\n"
+            "```text\n"
+            "file:///workspace/internal/path.py\n"
+            "https://example.com/raw-url\n"
+            "#### Raw H4 Header\n"
+            "> [!NOTE]\n"
+            "@Amos @Marvin\n"
+            "Ran 53 tests in 0.42s\n"
+            "OK\n"
+            "Exit code: 0\n"
+            "```\n"
+            "Done checking https://example.com/prose-url."
+        )
+        formatted = format_for_discord(code_sample)
+        # Prose outside code block is formatted
+        self.assertIn("`bridge.py`", formatted)
+        self.assertIn("<https://example.com/prose-url>.", formatted)
+        # Inside code block is 100% untouched
+        self.assertIn("file:///workspace/internal/path.py", formatted)
+        self.assertIn("https://example.com/raw-url\n", formatted)
+        self.assertIn("#### Raw H4 Header", formatted)
+        self.assertIn("> [!NOTE]", formatted)
+        self.assertIn("@Amos @Marvin", formatted)
+        self.assertIn("\nOK\nExit code: 0\n", formatted)
+
+    def test_convert_markdown_tables_with_pipes_in_code_spans(self):
+        """Verify pipes inside inline backticks or escaped pipes do not split markdown table cells."""
+        table = (
+            "| Operator | Pattern | Meaning |\n"
+            "|---|---|---|\n"
+            "| Alternation | `foo | bar` | Matches `foo` or `bar` |\n"
+            "| Escaped | a \\| b | Literal pipe |\n"
+        )
+        converted = format_for_discord(table)
+        self.assertIn("- **Alternation** (`foo | bar`): Matches `foo` or `bar`", converted)
+        self.assertIn("- **Escaped** (a | b): Literal pipe", converted)
+
+    def test_format_for_discord_idempotency(self):
+        """Verify running format_for_discord multiple times is strictly idempotent."""
+        sample = (
+            "### Summary for @Amos\n"
+            "Check [bridge.py](file:///workspace/tools/bridge.py) and https://example.com/docs.\n"
+            "- Price is $200 for $SOL when $x^2 = 4$.\n"
+            "| Service | Port | Status |\n"
+            "|---|---|---|\n"
+            "| Bridge | `8080 | 8081` | Online |\n\n"
+            "```python\n"
+            "url = 'https://example.com'\n"
+            "print('OK')\n"
+            "```"
+        )
+        once = format_for_discord(sample)
+        twice = format_for_discord(once)
+        self.assertEqual(once, twice)
+
+    def test_strip_leaked_chain_of_thought_and_role_mention_safety(self):
+        """Verify leaked internal chain-of-thought (e.g. #lounge Step 9/11 hot-mic) is stripped and @robot/@Zero in prose never trigger role/self pings."""
+        from tools.handoff import convert_bare_peer_mentions
+
+        # 1. Exact Step 9 #lounge leak (draft-then-emit + 'Let's send it!' + quoted prompt rules)
+        leaked_step_9 = (
+            'calibrating response... Let\'s check `tools/banana.py` and `gif_tool.py` in a single compound command, or even stamp the docstring into `tools/banana.py` right now since Amos and Aerial joked "effective when the commit lands" / "ship that to the README immediately", or just check `tools/banana.py` and `gif_tool.py`. Let\'s run a quick compound command! Wait—rule 7 says: "When responding to pure conversational, opinion, strategy, design feedback, or consensus prompts that do not require live file edits or diagnostics, ZERO tool calls should be made. Deliver the response in a single inference pass."\n'
+            'Wait: can we just deliver a sharp 1-2 sentence reply in a single inference pass, or `[REACT: 😎]`?\n'
+            'Wait: Rule 1 says:\n'
+            '"PHYSICAL MENTION OVERRIDE INVARIANT: If an incoming message physically tags Zero (<@1542285964213358633>, @Zero, @robot), you MUST respond to the task, review request, or question addressed to you."\n'
+            'And in `#lounge`, Mike (`Arbiter`) said: `Fuck @Zero that’s so good`.\n'
+            'Let\'s make it a lethal 1-sentence comeback in `#lounge`!\n\n'
+            'Let\'s check the constraints:\n'
+            '- `#lounge`: 1–3 sentences max in plain conversational prose, zero headers/bullets, zero em dashes (`—` or `--`).\n'
+            '- Snowflake addressing if mentioning anyone, or no mention needed since replying directly in `#lounge`.\n\n'
+            'Let\'s write a punchy one-liner:\n'
+            '"Years of DARPA-grade bureaucratic naming conventions finally paying off in the shitposting trenches. 🫡🍌"\n\n'
+            'Short, hilarious, zero em-dashes, fits the room energy. Let\'s send it!Years of DARPA-grade bureaucratic naming conventions finally paying off in the shitposting trenches. 🫡🍌'
+        )
+        cleaned_9 = format_for_discord(leaked_step_9)
+        self.assertEqual(
+            cleaned_9,
+            "Years of DARPA-grade bureaucratic naming conventions finally paying off in the shitposting trenches. 🫡🍌",
+        )
+        self.assertNotIn("calibrating response", cleaned_9)
+        self.assertNotIn("PHYSICAL MENTION OVERRIDE", cleaned_9)
+        self.assertNotIn("<@&1543462881624858624>", cleaned_9)
+
+        # 2. Exact Step 11 pre-tool monologue leak
+        leaked_step_11 = "할아버지/Wait—let's get a reaction GIF via `gif_tool.py` since `[GIF Cadence Tracker]` says `⚠️ DUE (>=5 turns without GIF)`. Let's run `gif_tool.py`."
+        self.assertEqual(strip_internal_cli_chatter(leaked_step_11), "")
+        self.assertTrue(is_internal_cli_leak(leaked_step_11))
+
+        # 3. Orphaned </thought> tag leak
+        orphaned_thought = "Let's check the rules first.\n</thought>\nClean final answer."
+        self.assertEqual(format_for_discord(orphaned_thought), "Clean final answer.")
+
+        # 4. Bare @robot, @team, and @Zero in prose must never convert to role/self snowflakes
+        prose_mentions = "When @Amos or @Zero talks about the @robot and @team roles, only Amos gets pinged."
+        converted_mentions = convert_bare_peer_mentions(prose_mentions)
+        self.assertIn("<@1468012353206354197>", converted_mentions)
+        self.assertIn("@Zero", converted_mentions)
+        self.assertIn("@robot", converted_mentions)
+        self.assertIn("@team", converted_mentions)
+        self.assertNotIn("<@&1543462881624858624>", converted_mentions)
+        self.assertNotIn("<@1542285964213358633>", converted_mentions)
+
+    def test_repair_corrupted_snowflakes_and_ryan_mention(self):
+        """Verify LLM digit-stuttered snowflakes (e.g. extra '7' in Ryan's ID) are deterministically repaired while code spans stay untouched."""
+        # Stuttered 19-digit snowflake with extra '7'
+        corrupted = "🍌 <@1794077724335988736> and @Ryan, check `<@1794077724335988736>` vs <@1468012353206354198>."
+        formatted = format_for_discord(corrupted)
+        self.assertIn("🍌 <@179407724335988736> and <@179407724335988736>", formatted)
+        self.assertIn("`<@1794077724335988736>`", formatted)
+        self.assertIn("<@1468012353206354197>", formatted)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+

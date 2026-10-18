@@ -359,7 +359,8 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             dispatch_mock.assert_called_once_with(
                 "Run the nightly NAS log review",
                 job_name="NAS Log Review",
-                channel_id=bs.HOMELAB_CHANNEL_ID
+                channel_id=bs.HOMELAB_CHANNEL_ID,
+                job_id="nas_logs"
             )
 
     async def test_scheduler_lifecycle(self):
@@ -869,8 +870,45 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         ok, reason = should_run_job(job, ts_0200)
         self.assertTrue(ok)
 
+    async def test_quant_daily_sweep_does_not_route_to_cash_sweep_monitor(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_turn_queue = AsyncMock()
+
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "📈 Quant Sweep Report", {})) as mock_sidecar:
+            await bshed.dispatch_scheduled_prompt(
+                "Run the multi-venue quantitative paper trading expansion sweep across all 4 tracks (Prediction Markets, Sports Positive-EV, Crypto Funding Basis, Equity/ETF Stat-Arb) using python3 /workspace/tools/sidecars.py quant. Post the track-by-track P&L and edge scorecard to #projects.",
+                "Multi-Venue Quant Paper Trading Sweep",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue,
+                channel_id=1546029274627309638,
+                job_id="quant_daily_sweep",
+            )
+            mock_sidecar.assert_called_once()
+            self.assertEqual(mock_sidecar.call_args[0][0], "quant_expansion_sweep")
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_kalshi_and_grocery_direct_sidecar_dispatch(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_turn_queue = AsyncMock()
+
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🛒 Grocery Cart Ready", {})) as mock_sidecar:
+            await bshed.dispatch_scheduled_prompt(
+                "Run the automated Sunday Whole Foods grocery cart staging sidecar: python3 /workspace/tools/sidecars.py grocery_stage",
+                "Weekly Sunday Whole Foods Cart Staging",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue,
+                channel_id=1544956793053253723,
+                job_id="weekly_grocery_staging",
+            )
+            mock_sidecar.assert_called_once()
+            self.assertEqual(mock_sidecar.call_args[0][0], "weekly_grocery_staging")
+            mock_turn_queue.put.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()
-
-
-

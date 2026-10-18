@@ -18,7 +18,7 @@ import urllib.request
 parser = argparse.ArgumentParser(description="Agora Burst Orchestrator")
 parser.add_argument("--rounds", type=int, default=10, help="Number of burst rounds to run")
 parser.add_argument("--interval", type=float, default=180.0, help="Seconds per round tick (default: 180s)")
-parser.add_argument("--channel", type=str, default="1534436119888793750", help="Target Discord channel ID")
+parser.add_argument("--channel", type=str, default="1558202642663211169", help="Target Discord channel ID")
 parser.add_argument("--codename", type=str, default="live-burst-10", help="Optional codename for burst")
 args = parser.parse_args()
 

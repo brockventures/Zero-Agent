@@ -36,8 +36,9 @@ HEALTH_DEBOUNCE_CRITICAL = 900       # 15 minutes for critical outages (download
 HEALTH_DEBOUNCE_NON_CRITICAL = 7200  # 120 minutes (2h) grace period for unclassified warnings
 
 HOMELAB_ALLOWED_HOSTS = (
-    "localhost,127.0.0.1,127.0.0.1,127.0.0.1,*.local,*.home,*.lan,*.localdomain,"
-    "host,host,sonarr,radarr,prowlarr,overseerr,seerr,maintainerr,sabnzbd,tautulli,plex"
+    "localhost,127.0.0.1,127.0.0.1,127.0.0.1,100.112.209.97,100.127.101.77,"
+    "*.local,*.home,*.lan,*.localdomain,*.brock.ventures,*.ts.net," +
+    os.environ.get("ARR_LOCAL_HOSTS", "host,sonarr,radarr,prowlarr,overseerr,seerr,maintainerr,sabnzbd,tautulli,plex")
 )
 
 for _p in ["/workspace", "/workspace/tools"]:
@@ -199,10 +200,11 @@ def _auto_remediate_allowed_hosts(app_name: str, port: int, api_key: str) -> boo
             cfg = json.loads(resp.read().decode())
 
         current_hosts = cfg.get("allowedHosts", "")
-        if current_hosts and "127.0.0.1" in current_hosts and "host" in current_hosts:
+        if current_hosts and "127.0.0.1" in current_hosts and "brock.ventures" in current_hosts and cfg.get("trustCgnatIpAddresses") is True:
             return True
 
         cfg["allowedHosts"] = HOMELAB_ALLOWED_HOSTS
+        cfg["trustCgnatIpAddresses"] = True
         req_put = urllib.request.Request(
             url,
             data=json.dumps(cfg).encode("utf-8"),
@@ -231,6 +233,36 @@ def _auto_remediate_allowed_hosts(app_name: str, port: int, api_key: str) -> boo
         return True
     except Exception as e:
         print(f"[ArrWatchdog] Failed to auto-remediate allowedHosts for {app_name}: {e}", file=sys.stderr)
+        return False
+
+
+def _auto_remediate_notification_health(app_name: str, port: int, api_key: str) -> bool:
+    """Tier 1: Trigger CheckHealth to re-evaluate transient notification failures."""
+    cmd_url = f"http://{HOST_1_IP}:{port}/api/v3/command"
+    try:
+        req_cmd = urllib.request.Request(
+            cmd_url,
+            data=json.dumps({"name": "CheckHealth"}).encode("utf-8"),
+            headers={"X-Api-Key": api_key, "Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req_cmd, timeout=8) as cmd_resp:
+            pass
+
+        time.sleep(1)
+        remaining = fetch_health(app_name, port, api_key)
+        is_cleared = not any((h.get("source") == "NotificationStatusCheck") for h in remaining)
+        if is_cleared:
+            _log_triage_action(
+                app=app_name,
+                category="health",
+                action="auto_cleared_stale_notification_health",
+                details="Triggered CheckHealth and verified transient notification failure cleared",
+                auto_remediated=True
+            )
+            return True
+        return False
+    except Exception as e:
+        print(f"[ArrWatchdog] Failed to auto-remediate notification health for {app_name}: {e}", file=sys.stderr)
         return False
 
 
@@ -455,6 +487,17 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                 # Suppress from user-facing outage alerts
                 continue
 
+            if source == "NotificationStatusCheck":
+                if auto_fix:
+                    if _auto_remediate_notification_health(app_name, port, key):
+                        remediated.append({
+                            "app": app_name,
+                            "title": "NotificationStatusCheck",
+                            "path": "Notification Settings",
+                            "reason": "Transient notification timeout detected. Auto-triggered CheckHealth refresh and verified cleared."
+                        })
+                        continue
+
             # Tier 2 Filter: Suppress benign advisory sources and cancellations
             if source in IGNORED_HEALTH_SOURCES or "TaskCanceledException" in msg:
                 continue
@@ -546,7 +589,11 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
     if health_alerts:
         if lines:
             lines.append("")
-        lines.append("🚨 **Arr Health Outage Alert (Critical Pipeline Blocker)**")
+        has_critical = any(ha.get("is_critical") for ha in health_alerts)
+        if has_critical:
+            lines.append("🚨 **Arr Health Outage Alert (Critical Pipeline Blocker)**")
+        else:
+            lines.append("⚠️ **Arr Health Advisory (Non-Critical Warning)**")
         for ha in health_alerts:
             severity = "CRITICAL" if ha.get("is_critical") else ha['type'].upper()
             lines.append(f"• **{ha['app']}**: `{ha['source']}` ({severity})")
@@ -585,8 +632,12 @@ def main():
                 channel="homelab",
                 content=summary
             )
-            # Mirror sustained health alerts or restoral notices to #server-updates
-            if "Arr Health" in summary:
+            # Mirror sustained critical health alerts or restoral notices to #server-updates
+            # Non-critical advisories (like webhook notifications) stay in #homelab only
+            has_critical = any(
+                item.get("is_critical") for item in items if isinstance(item, dict) and item.get("is_critical")
+            )
+            if has_critical:
                 queue_outbox_message(
                     channel="server-updates",
                     content=summary

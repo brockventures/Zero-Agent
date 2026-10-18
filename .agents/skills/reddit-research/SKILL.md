@@ -36,7 +36,7 @@ This skill governs conducting authentic, unblocked research into Reddit discussi
 
 ### 1. Interactive Agent Grounding (Zero / Crab Cavern)
 When executing research turns in chat or delegating to subagents:
-* **Model Selection:** Use the lightweight tier **`gemini-3.7-flash-low`** (or subagent `Model="flash_lite"`) by default. Reddit discussion reading and consensus summarization are high-volume, low-complexity retrieval tasks where Flash-Low provides optimal speed and minimal cost. Reserve `gemini-3.7-flash-high` only for deep multi-subsystem engineering audits.
+* **Model Selection:** Use the lightweight tier **`gemini-3.8-flash-low`** (or subagent `Model="flash_lite"`) by default. Reddit discussion reading and consensus summarization are high-volume, low-complexity retrieval tasks where Flash-Low provides optimal speed and minimal cost. Reserve `gemini-4-argon-high` only for deep multi-subsystem engineering audits.
 * Formulate clear search queries with the current year or temporal constraints:
   - `site:reddit.com/r/selfhosted synology vs truenas 2026`
   - `site:reddit.com/r/BuyItForLife best espresso grinder 2026`

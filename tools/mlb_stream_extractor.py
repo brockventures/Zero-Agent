@@ -124,7 +124,7 @@ def resolve_media_event(
     return media_events[0]
 
 
-def resolve_stream_url(media_event_id: int, flavor_id: str = "free.live.espn") -> str:
+def resolve_stream_url(media_event_id: int, flavor_id: str = "free.live.sportsnet") -> str:
     """Call the generate_stream_info API to get the live HLS .m3u8 master URL."""
     api_url = "https://api.mlb24all.ir/api/v2/generate_stream_info"
     payload = json.dumps({
@@ -136,8 +136,14 @@ def resolve_stream_url(media_event_id: int, flavor_id: str = "free.live.espn") -
     headers["Content-Type"] = "application/json"
 
     req = urllib.request.Request(api_url, data=payload, headers=headers)
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        res = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as he:
+        body = he.read().decode("utf-8", errors="ignore")
+        if he.code == 406:
+            raise RuntimeError(f"Stream relay not yet active or flavor '{flavor_id}' mismatch for media event {media_event_id} ({body.strip()}).")
+        raise RuntimeError(f"HTTP {he.code} from stream generator: {body.strip()}")
 
     stream_url = res.get("url")
     if not stream_url:
@@ -209,13 +215,23 @@ def cast_to_home_assistant(
     if is_cold:
         sys.stderr.write(f"Cold start detected: waiting {cold_start_delay}s for Samsung TV HDMI input switch & handshake...\n")
         time.sleep(cold_start_delay)
+    elif remote_entity:
+        # If warm and already running an app (e.g. BrowseHere playing previous stream),
+        # send HOME first to release the active video surface so the new stream intent is not swallowed.
+        try:
+            home_payload = json.dumps({"entity_id": remote_entity, "command": "HOME"}).encode("utf-8")
+            home_req = urllib.request.Request(f"{base_url}/api/services/remote/send_command", data=home_payload, headers=headers)
+            urllib.request.urlopen(home_req, timeout=4)
+            time.sleep(1.2)
+        except Exception:
+            pass
 
-    # 4. Dispatch play_media URL using vlc:// protocol scheme
-    vlc_stream_url = f"vlc://{stream_url}" if not stream_url.startswith("vlc://") else stream_url
+    # 4. Dispatch play_media URL (explicit vlc:// scheme prevents fallback browser intercept)
+    vlc_media_id = stream_url if stream_url.startswith("vlc://") else f"vlc://{stream_url}"
     play_payload = json.dumps({
         "entity_id": entity_id,
         "media_content_type": "url",
-        "media_content_id": vlc_stream_url
+        "media_content_id": vlc_media_id
     }).encode("utf-8")
 
     def _send_play() -> bool:
@@ -263,15 +279,30 @@ def main():
         feed_override=feed_pref
     )
 
-    # Determine flavor
+    # Determine flavor dynamically
     flavors = data.get("flavors", [])
-    chosen_flavor = "free.live.espn"
+    chosen_flavor = None
     for fl in flavors:
         if "free" in fl.get("id", "").lower() and media_event["id"] in fl.get("media_event_ids", []):
             chosen_flavor = fl["id"]
             break
 
-    stream_url = resolve_stream_url(media_event["id"], chosen_flavor)
+    if not chosen_flavor:
+        for fl in flavors:
+            if "free.live" in fl.get("id", "").lower():
+                chosen_flavor = fl["id"]
+                break
+        if not chosen_flavor:
+            chosen_flavor = "free.live.sportsnet"
+
+    stream_url = None
+    try:
+        stream_url = resolve_stream_url(media_event["id"], chosen_flavor)
+    except Exception as e:
+        if game.get("status") in ("W", "P", "S") or media_event.get("status") == "P":
+            stream_url = None
+        else:
+            raise
 
     result = {
         "team": teams.get(target_team_id),
@@ -285,7 +316,30 @@ def main():
         "stream_url": stream_url
     }
 
-    if args.cast:
+    if not stream_url:
+        result["stream_ready"] = False
+        result["notice"] = (
+            f"{result['matchup']} is in Warmup/Pre-game (status: {result['status']}). "
+            "First pitch is scheduled for 7:00 PM PT. The live stream relay opens right at game time."
+        )
+        # If cast was requested, ensure the TV is powered on and awake so it's ready
+        if args.cast:
+            remote_entity = "remote.living_room_tv" if "living_room" in args.entity else None
+            if remote_entity:
+                try:
+                    with open("/secrets/ha.json") as f:
+                        ha_cfg = json.load(f)
+                    base_url = ha_cfg["url"].rstrip("/")
+                    token = ha_cfg["token"]
+                    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                    on_payload = json.dumps({"entity_id": remote_entity}).encode("utf-8")
+                    on_req = urllib.request.Request(f"{base_url}/api/services/remote/turn_on", data=on_payload, headers=headers)
+                    urllib.request.urlopen(on_req, timeout=5)
+                    result["tv_powered"] = True
+                except Exception:
+                    result["tv_powered"] = False
+
+    if stream_url and args.cast:
         success = cast_to_home_assistant(stream_url, args.entity)
         result["casted"] = success
         result["target_entity"] = args.entity
@@ -297,10 +351,17 @@ def main():
     else:
         print(f"Game: {result['matchup']} ({result['status']})")
         print(f"Broadcast: {result['broadcast']} ({result['flavor']})")
-        print(f"Stream: {result['stream_url']}")
+        if result.get("stream_url"):
+            print(f"Stream: {result['stream_url']}")
+        elif result.get("notice"):
+            print(f"Notice: {result['notice']}")
         if args.cast:
-            status_str = "SUCCESS" if result.get("casted") else "FAILED"
-            print(f"Casting to {args.entity}: {status_str}")
+            if not result.get("stream_url"):
+                tv_status = "Powered on & primed on Google TV launcher" if result.get("tv_powered") else "Ready"
+                print(f"TV Status: {tv_status}. Stream relay will dispatch once live at 7:00 PM PT.")
+            else:
+                status_str = "SUCCESS" if result.get("casted") else "FAILED"
+                print(f"Casting to {args.entity}: {status_str}")
 
 
 if __name__ == "__main__":

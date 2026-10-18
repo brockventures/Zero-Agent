@@ -7,6 +7,7 @@ Ensures all scheduled sidecars follow the 5-layer lifecycle protocol:
 3. Registration in data/schedule.json & tools/scheduler_tool.py
 4. Discord On-Demand Command Hook in tools/bridge_handlers.py
 5. Anti-Contention & PT Timezone Alignment
+6. Bidirectional Orphan Auditing (Code-to-Schedule Drift Prevention)
 """
 
 import argparse
@@ -30,7 +31,72 @@ HANDLERS_FILE = WORKSPACE / "tools" / "bridge_handlers.py"
 COMMANDS_FILE = WORKSPACE / "tools" / "bridge_commands.py"
 PT = ZoneInfo("America/Los_Angeles")
 
-VALID_SCHEDULE_TYPES = {"interval", "daily", "weekly", "monthly"}
+VALID_SCHEDULE_TYPES = {"interval", "daily", "weekly", "monthly", "one_shot"}
+
+# Mappings from code job_id (in sidecars.py) to schedule.json id
+KNOWN_ALIASES = {
+    "doctor": "memory_doctor",
+    "dream": "dreaming",
+    "ev9": "ev9_monitor",
+    "ha_battery": "ha_battery_check",
+    "ha_update_check": "ha_update_check",
+    "heartbeat": "heartbeat_sweep",
+    "host1_backup": "host1_backup",
+    "host2_backup": "host2_backup",
+    "marketing": "marketing_sweep",
+    "nas_logs": "nas_logs",
+    "nas_storage": "nas_storage_check",
+    "pid_watchdog": "pid_watchdog",
+    "plex": "plex_cleanup",
+    "reminders": "dated_reminders",
+    "session_rollover": "session_rollover",
+    "triage": "nightly_triage",
+    "update_antigravity": "antigravity_check",
+    "weekly_social_review": "weekly_social_last_seen_review",
+    "monthly_core_friends_reminder": "monthly_core_friends_reconnect",
+    "reddit_fantasy_scanner": "reddit_fantasy_morning",
+    "dockhand_check": "dockhand_update",
+    "meal_proposal": "weekly_meal_proposal",
+    "grocery_staging": "weekly_grocery_staging",
+}
+
+# Jobs intentionally turned off or retired
+INTENTIONALLY_DISABLED_JOBS = {
+    "market_standup",
+    "agora_steering",
+}
+
+# 1. Quant expansion sub-tracks (run strictly inside tools/sidecars.py quant under quant_daily_sweep)
+QUANT_SUBROUTINE_JOBS = {
+    "quant_cross_venue",
+    "quant_hyperliquid",
+    "quant_polymarket",
+    "quant_trend",
+    "quant_expansion_sweep",
+}
+
+# 2. Seasonally suspended during off-season (dormant Oct 1 - Mar 15)
+SEASONALLY_SUSPENDED_JOBS = {
+    "cubs_game_notifier",
+}
+
+# 3. Independent event-driven, webhook, or on-demand watchdogs (not tied to quant or daily schedules)
+EVENT_DRIVEN_WATCHDOG_JOBS = {
+    "sideproject_watcher",
+    "hourly_agora_ping",
+    "kalshi_quant_sprint",
+    "daily_token_report",
+    "daily_token_budget_report",
+    "backfill_telemetry",
+    "ivy_telemetry",
+    "ha_anomaly_check",
+}
+
+EVENT_OR_SUBROUTINE_JOBS = (
+    QUANT_SUBROUTINE_JOBS
+    | SEASONALLY_SUSPENDED_JOBS
+    | EVENT_DRIVEN_WATCHDOG_JOBS
+)
 
 
 def extract_script_path(prompt: str) -> Path | None:
@@ -60,7 +126,6 @@ def get_sidecars_py_actions() -> set[str]:
         tree = ast.parse(SIDECARS_FILE.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Compare):
-                # Is action on left?
                 if isinstance(node.left, ast.Name) and node.left.id == "action":
                     for op, comparator in zip(node.ops, node.comparators):
                         if isinstance(op, ast.Eq):
@@ -71,7 +136,6 @@ def get_sidecars_py_actions() -> set[str]:
                                 for elt in comparator.elts:
                                     if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                                         actions.add(elt.value)
-                # Is action on right? (e.g. "foo" == action)
                 for op, comparator in zip(node.ops, node.comparators):
                     if isinstance(comparator, ast.Name) and comparator.id == "action":
                         if isinstance(op, ast.Eq):
@@ -86,6 +150,14 @@ def get_sidecars_py_actions() -> set[str]:
     except Exception as e:
         print(f"[Auditor] Error reading sidecars.py AST: {e}", file=sys.stderr)
     return actions
+
+
+def get_registered_sidecar_job_ids() -> set[str]:
+    """Parse all job IDs registered via run_sidecar_job(...) in tools/sidecars.py."""
+    if not SIDECARS_FILE.exists():
+        return set()
+    text = SIDECARS_FILE.read_text(encoding="utf-8")
+    return set(re.findall(r'run_sidecar_job\(\s*"([^"]+)"', text))
 
 
 def get_bridge_triggers() -> set[str]:
@@ -106,18 +178,18 @@ def get_bridge_triggers() -> set[str]:
     return triggers
 
 
-def audit_sidecars(verbose: bool = False) -> tuple[bool, list[dict]]:
-    """Audit all registered jobs in data/schedule.json against disk and system hooks."""
+def audit_sidecars(verbose: bool = False, check_orphans: bool = True) -> tuple[bool, list[dict], list[str], list[str]]:
+    """Audit all registered jobs in data/schedule.json against disk, system hooks, and bidirectional code drift."""
     if not SCHEDULE_FILE.exists():
         print(f"❌ Schedule file missing: {SCHEDULE_FILE}")
-        return False, []
+        return False, [], [], []
 
     try:
         with open(SCHEDULE_FILE, "r") as f:
             jobs = json.load(f)
     except Exception as e:
         print(f"❌ Malformed schedule.json: {e}")
-        return False, []
+        return False, [], [], []
 
     sidecars_actions = get_sidecars_py_actions()
     bridge_triggers = get_bridge_triggers()
@@ -198,7 +270,7 @@ def audit_sidecars(verbose: bool = False) -> tuple[bool, list[dict]]:
                 issues.append(f"Target script does not exist: {script_path}")
             elif not os.access(script_path, os.R_OK):
                 issues.append(f"Target script not readable: {script_path}")
-        elif prompt != "[INTERNAL_SESSION_ROLLOVER]":
+        elif prompt != "[INTERNAL_SESSION_ROLLOVER]" and stype != "one_shot":
             warnings.append("Prompt does not reference an explicit script path (.py/.sh)")
 
         # 5. Sidecars.py Hook Check
@@ -206,7 +278,7 @@ def audit_sidecars(verbose: bool = False) -> tuple[bool, list[dict]]:
         if sidecar_act:
             if sidecar_act not in sidecars_actions:
                 warnings.append(f"Action '{sidecar_act}' not registered in tools/sidecars.py CLI dispatcher")
-        
+
         # 6. Discord Trigger Hook Check
         trigger_match = None
         candidates = [jid, sidecar_act]
@@ -226,7 +298,7 @@ def audit_sidecars(verbose: bool = False) -> tuple[bool, list[dict]]:
             if candidate and candidate in bridge_triggers:
                 trigger_match = candidate
                 break
-        if not trigger_match and enabled and prompt != "[INTERNAL_SESSION_ROLLOVER]":
+        if not trigger_match and enabled and prompt != "[INTERNAL_SESSION_ROLLOVER]" and stype != "one_shot":
             warnings.append(f"No on-demand !<action> trigger mapped in tools/bridge_handlers.py (e.g. !{sidecar_act or jid})")
 
         # 7. Execution Freshness & Staleness Check
@@ -274,10 +346,28 @@ def audit_sidecars(verbose: bool = False) -> tuple[bool, list[dict]]:
         if len(job_ids) > 1:
             collision_warnings.append(f"Exact timing collision at {slot}: jobs {job_ids}")
 
-    return not has_critical_failures, results, collision_warnings
+    # 8. Check for Code-to-Schedule Drift (Orphaned Sidecars)
+    orphan_warnings = []
+    if check_orphans and SIDECARS_FILE.exists():
+        sched_ids = {j.get("id") for j in jobs if j.get("id")}
+        registered_code_jobs = get_registered_sidecar_job_ids()
+        for c_id in sorted(registered_code_jobs):
+            if c_id in sched_ids:
+                continue
+            mapped = KNOWN_ALIASES.get(c_id)
+            if mapped and mapped in sched_ids:
+                continue
+            if c_id in INTENTIONALLY_DISABLED_JOBS:
+                continue
+            if c_id in EVENT_OR_SUBROUTINE_JOBS:
+                continue
+            orphan_warnings.append(f"Job '{c_id}' in tools/sidecars.py is missing from schedule.json and unclassified")
+            has_critical_failures = True
+
+    return not has_critical_failures, results, collision_warnings, orphan_warnings
 
 
-def print_audit_report(results: list[dict], collisions: list[str], verbose: bool = False):
+def print_audit_report(results: list[dict], collisions: list[str], orphans: list[str] = None, verbose: bool = False):
     """Print clean terminal audit summary."""
     now_pt = datetime.now(tz=PT).strftime("%Y-%m-%d %I:%M %p PT")
     print(f"\n📋 **Sidecar Schedule & Lifecycle Audit Report** ({now_pt})\n")
@@ -305,8 +395,14 @@ def print_audit_report(results: list[dict], collisions: list[str], verbose: bool
         for c in collisions:
             print(f"  • {c}")
 
+    if orphans:
+        print("\n❌ **Orphaned Sidecars Detected (Code-to-Schedule Drift):**")
+        for o in orphans:
+            print(f"  • {o}")
+
     print("-" * 80)
-    print(f"Summary: {len(results)} total sidecars audited | {pass_count} Passed | {warn_count} Warnings | {fail_count} Critical Failures\n")
+    orphan_note = f" | {len(orphans)} Orphaned" if orphans else ""
+    print(f"Summary: {len(results)} total sidecars audited | {pass_count} Passed | {warn_count} Warnings | {fail_count} Critical Failures{orphan_note}\n")
 
 
 def print_schedule_matrix():
@@ -406,6 +502,7 @@ def main():
 
     audit_parser = subparsers.add_parser("audit", help="Audit all registered sidecars")
     audit_parser.add_argument("-v", "--verbose", action="store_true", help="Show verbose debugging info")
+    audit_parser.add_argument("--no-orphans", action="store_true", help="Skip reverse orphan detection")
 
     matrix_parser = subparsers.add_parser("matrix", help="Show 24-hour visual schedule breakdown")
 
@@ -416,8 +513,9 @@ def main():
     args = parser.parse_args()
 
     if args.command in ("audit", None):
-        success, results, collisions = audit_sidecars(verbose=getattr(args, "verbose", False))
-        print_audit_report(results, collisions)
+        check_orphans = not getattr(args, "no_orphans", False)
+        success, results, collisions, orphans = audit_sidecars(verbose=getattr(args, "verbose", False), check_orphans=check_orphans)
+        print_audit_report(results, collisions, orphans)
         sys.exit(0 if success else 1)
     elif args.command == "matrix":
         print_schedule_matrix()

@@ -201,5 +201,114 @@ class TestGoogleTasksSync(unittest.TestCase):
         self.assertEqual(mock_urlopen.call_count, 3)
         self.assertEqual(mock_sleep.call_count, 2)
 
+    def test_is_dev_task(self):
+        from tools.google_tasks_sync import is_dev_task
+        # Dev tasks
+        self.assertTrue(is_dev_task({"title": "feat(ui): clamp trading order quantities"}))
+        self.assertTrue(is_dev_task({"title": "fix: resolve memory leak"}))
+        self.assertTrue(is_dev_task({"title": "Agora Roguelike: Epic 2 Balance Pass (GitHub Issue #97)"}))
+        self.assertTrue(is_dev_task({"title": "Agent Playbook: Track Amos recipe"}))
+        self.assertTrue(is_dev_task({"title": "Check issue", "notes": "https://github.com/brockventures/agora-roguelike/issues/191"}))
+        self.assertTrue(is_dev_task({"title": "Arbitrary task", "dev": True}))
+        # Homelab / Personal tasks
+        self.assertFalse(is_dev_task({"title": "HA Entry Lights 3 / Front Door Zigbee outage"}))
+        self.assertFalse(is_dev_task({"title": "Bedroom sink leak sensor offline"}))
+        self.assertFalse(is_dev_task({"title": "Load retro game library into Steam Deck"}))
+        self.assertFalse(is_dev_task({"title": "Clean garage desk area"}))
+        self.assertFalse(is_dev_task({"title": "Return Zappos order"}))
+
+    @patch("tools.google_tasks_sync.get_or_create_target_list", return_value="list_123")
+    @patch("tools.google_tasks_sync.fetch_all_google_tasks")
+    @patch("tools.google_tasks_sync.create_google_task")
+    @patch("tools.google_tasks_sync.load_local_tasks")
+    @patch("tools.google_tasks_sync.save_local_tasks")
+    @patch("tools.google_tasks_sync.load_sync_state")
+    @patch("tools.google_tasks_sync.save_sync_state")
+    def test_dev_task_excluded_from_export(
+        self, mock_save_state, mock_load_state, mock_save_local, mock_load_local,
+        mock_create, mock_fetch_google, mock_get_list
+    ):
+        mock_load_local.return_value = [
+            {"id": 74, "title": "feat(ui): clamp trading order quantities", "priority": "p2", "status": "pending"}
+        ]
+        mock_load_state.return_value = {"list_id": "list_123", "mappings": {}}
+        mock_fetch_google.return_value = []
+
+        res = sync_tasks(quiet=True)
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(res["changes"]["created_in_google"]), 0)
+        mock_create.assert_not_called()
+
+    @patch("tools.google_tasks_sync.get_or_create_target_list", return_value="list_123")
+    @patch("tools.google_tasks_sync.fetch_all_google_tasks")
+    @patch("tools.google_tasks_sync.delete_google_task")
+    @patch("tools.google_tasks_sync.load_local_tasks")
+    @patch("tools.google_tasks_sync.save_local_tasks")
+    @patch("tools.google_tasks_sync.load_sync_state")
+    @patch("tools.google_tasks_sync.save_sync_state")
+    def test_dev_task_purged_if_mapped(
+        self, mock_save_state, mock_load_state, mock_save_local, mock_load_local,
+        mock_delete, mock_fetch_google, mock_get_list
+    ):
+        dev_task = {"id": 70, "title": "Agora Roguelike: Epic 2 Balance Pass", "priority": "p1", "status": "pending", "google_task_id": "gt_70"}
+        mock_load_local.return_value = [dev_task]
+        mock_load_state.return_value = {
+            "list_id": "list_123",
+            "mappings": {
+                "70": {
+                    "google_id": "gt_70",
+                    "last_title": "Agora Roguelike: Epic 2 Balance Pass",
+                    "last_status": "pending",
+                    "last_google_status": "needsAction"
+                }
+            }
+        }
+        mock_fetch_google.return_value = [
+            {"id": "gt_70", "title": "Agora Roguelike: Epic 2 Balance Pass", "status": "needsAction"}
+        ]
+
+        res = sync_tasks(quiet=True)
+        self.assertTrue(res["ok"])
+        mock_delete.assert_called_once_with("list_123", "gt_70")
+        self.assertIn("Purged dev task #70: Agora Roguelike: Epic 2 Balance Pass", res["changes"]["deleted_in_google"])
+        self.assertNotIn("google_task_id", dev_task)
+        # Verify local task was not retired or completed
+        self.assertEqual(dev_task["status"], "pending")
+
+    @patch("tools.google_tasks_sync.get_or_create_target_list", return_value="list_123")
+    @patch("tools.google_tasks_sync.fetch_all_google_tasks")
+    @patch("tools.google_tasks_sync.delete_google_task")
+    @patch("tools.google_tasks_sync.load_local_tasks")
+    @patch("tools.google_tasks_sync.save_local_tasks")
+    @patch("tools.google_tasks_sync.load_sync_state")
+    @patch("tools.google_tasks_sync.save_sync_state")
+    def test_local_delete_propagates_to_google(
+        self, mock_save_state, mock_load_state, mock_save_local, mock_load_local,
+        mock_delete, mock_fetch_google, mock_get_list
+    ):
+        # Task #48 was deleted locally from tasks.json, so local_tasks is empty
+        mock_load_local.return_value = []
+        state = {
+            "list_id": "list_123",
+            "mappings": {
+                "48": {
+                    "google_id": "gt_48",
+                    "last_title": "Rewire the BAF fans",
+                    "last_status": "pending",
+                    "last_google_status": "needsAction"
+                }
+            }
+        }
+        mock_load_state.return_value = state
+        mock_fetch_google.return_value = [
+            {"id": "gt_48", "title": "Rewire the BAF fans", "status": "needsAction"}
+        ]
+
+        res = sync_tasks(quiet=True)
+        self.assertTrue(res["ok"])
+        mock_delete.assert_called_once_with("list_123", "gt_48")
+        self.assertIn("Deleted task #48: Rewire the BAF fans", res["changes"]["deleted_in_google"])
+        self.assertNotIn("48", state["mappings"])
+
 if __name__ == "__main__":
     unittest.main()

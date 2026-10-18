@@ -45,6 +45,14 @@ class TestBridgeSafety(unittest.TestCase):
         self.assertTrue(is_internal_cli_leak("Waiting for task to complete."))
         self.assertTrue(is_internal_cli_leak("Wait for command to finish."))
         self.assertTrue(is_internal_cli_leak("No other work to do."))
+        self.assertTrue(is_internal_cli_leak("An asynchronous task is already running. Please do not call any more tools until the task finishes. Wait silently for the next event."))
+        self.assertTrue(is_internal_cli_leak("An asynchronous background task is currently running: e660bca3-f3aa-4000-8e36-fc31186cf566/task-1269 (./game/tests/run.sh).\nContinuing silent background execution until completion."))
+        self.assertTrue(is_internal_cli_leak("WaitMsBeforeAsync: 10000 has expired. Command is still running. Will wait for completion."))
+        self.assertTrue(is_internal_cli_leak("No response text needed while waiting for background task."))
+        self.assertTrue(is_internal_cli_leak("Continuing silent background execution until completion."))
+        self.assertTrue(is_internal_cli_leak("- Awaiting isolated execution results.\n\n- Awaiting grid search results."))
+        self.assertTrue(is_internal_cli_leak("Awaiting grid search results."))
+        self.assertTrue(is_internal_cli_leak("- Awaiting task execution."))
 
         # Real substantive user messages should NEVER be classified as a leak
         self.assertFalse(is_internal_cli_leak("Deployment completed successfully. All 4 containers are healthy."))
@@ -108,6 +116,11 @@ class TestBridgeSafety(unittest.TestCase):
         self.assertEqual(strip_internal_cli_chatter(lounge_leak), "")
         self.assertTrue(is_internal_cli_leak(lounge_leak))
 
+        leak1 = "An asynchronous task is already running. Please do not call any more tools until the task finishes. Wait silently for the next event."
+        self.assertEqual(strip_internal_cli_chatter(leak1), "")
+        leak2 = "An asynchronous background task is currently running: e660bca3-f3aa-4000-8e36-fc31186cf566/task-1269 (./game/tests/run.sh).\nContinuing silent background execution until completion."
+        self.assertEqual(strip_internal_cli_chatter(leak2), "")
+
     def test_dedup_repetitive_patterns(self):
         repeated_line = "Running diagnostic check...\n" * 10
         collapsed = dedup_repetitive_patterns(repeated_line, max_repeats=3)
@@ -167,6 +180,48 @@ class TestBridgeSafety(unittest.TestCase):
             "Selecting Wait for Tasks to Settle touches the reload flag, and we wait for background tasks to settle cleanly."
         )
         self.assertFalse(is_internal_cli_leak(msg))
+
+
+    def test_antigravity_async_task_completion_and_json_scrubbing(self):
+        # Exact reproduction of Antigravity task completion injection with stdout and JSON block
+        raw_task_echo = (
+            "An async task 6341716f-8aa2-4937-9a24-66f2d2189c8b/task-618 has completed with exit code: 0\n"
+            "Log file content:\n"
+            "Uploading V2 Preview to Discord #3d-print...\n"
+            "Image delivery result: {'success': True, 'file_path': '/workspace/data/3dprint/zero_casual_robot_v2_preview.png'}\n"
+            "Copying V2 STL and profiles to Host 2 OrcaSlicer directory...\n"
+            "Running OrcaSlicer on Host 2...\n"
+            "Staging G-code on OctoPrint...\n"
+            "=== FINAL RESULTS ===\n"
+            "{\n"
+            '  "image_delivery": {\n'
+            '    "success": true\n'
+            "  },\n"
+            '  "state": "Printing"\n'
+            "}\n\n"
+            "Preview render is live in [#3d-print](<https://discord.com/channels/1330447543477338202/1555973316752449576>).\n\n"
+            "V2 completely closes the topological holes that caused V1 to print like hollow papercraft."
+        )
+
+        stripped = strip_internal_cli_chatter(raw_task_echo)
+        self.assertNotIn("An async task", stripped)
+        self.assertNotIn("Log file content:", stripped)
+        self.assertNotIn("Uploading V2", stripped)
+        self.assertNotIn("=== FINAL RESULTS ===", stripped)
+        self.assertNotIn('"image_delivery"', stripped)
+        self.assertTrue(stripped.startswith("Preview render is live in"))
+        self.assertIn("V2 completely closes the topological holes", stripped)
+
+        # Standalone task notification should be fully neutralized and marked as leak
+        standalone_task = (
+            "An async task 6341716f-8aa2-4937-9a24-66f2d2189c8b/task-744 has completed with exit code: 0\n"
+            "Log file content:\n"
+            "Ran 75 tests in 0.443s\n\n"
+            "OK\n\n"
+            "Log: file:///root/.gemini/antigravity-cli/brain/task-744.log\n"
+        )
+        self.assertTrue(is_internal_cli_leak(standalone_task))
+        self.assertEqual(strip_internal_cli_chatter(standalone_task), "")
 
 
 if __name__ == "__main__":

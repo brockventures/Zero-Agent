@@ -55,12 +55,12 @@ def backup_home_assistant(ts: str) -> tuple[bool, str]:
 
     # 1. Config tarball (.storage, automations, cloud, yaml)
     cmd_tar = (
-        f"sudo tar --exclude='.git' --exclude='.cache' --exclude='backups' "
+        f"sudo tar --warning=no-file-changed --exclude='.git' --exclude='.cache' --exclude='backups' "
         f"--exclude='*.db*' --exclude='*.log' "
-        f"-czf '{dest_config}' -C '{DOCKER_ROOT}/homeassistant/config' . 2>/dev/null"
+        f"-czf '{dest_config}' -C '{DOCKER_ROOT}/homeassistant/config' ."
     )
     code, _, stderr = run_ssh(cmd_tar, timeout=120)
-    if code != 0:
+    if code not in (0, 1):
         run_ssh(f"rm -f '{dest_config}'")
         return False, f"ha config tar failed (code {code}): {stderr.strip()}"
 
@@ -85,16 +85,29 @@ def backup_docker_appdata(ts: str) -> tuple[bool, str]:
         run_ssh(f"rm -f '{dest_compose}'")
         return False, f"docker-compose copy failed (code {code_cp}): {stderr_cp.strip()}"
 
-    # 2. Tar critical lightweight appdata configs (maintainerr, seerr, tautulli, dockhand)
-    # Exclude internal backups, cache, transcode, and logs to avoid disk stall
+    # 2. Checkpoint SQLite WAL databases before archiving (Dockhand, Seerr, Tautulli, Maintainerr)
+    cmd_ckpt = (
+        f"for db in "
+        f"'{DOCKER_ROOT}/appdata/dockhand/db/dockhand.db' "
+        f"'{DOCKER_ROOT}/appdata/seerr/db/db.sqlite3' "
+        f"'{DOCKER_ROOT}/appdata/tautulli/tautulli.db' "
+        f"'{DOCKER_ROOT}/appdata/maintainerr/maintainerr.sqlite'; do "
+        f"[ -f \"$db\" ] && sudo sqlite3 \"$db\" 'PRAGMA wal_checkpoint(PASSIVE);' >/dev/null 2>&1 || true; "
+        f"done"
+    )
+    run_ssh(cmd_ckpt, timeout=30)
+
+    # 3. Tar critical lightweight appdata configs (maintainerr, seerr, tautulli, dockhand)
+    # Exclude internal backups, cache, transcode, and logs to avoid disk stall;
+    # use --warning=no-file-changed and allow GNU tar exit code 1 (live WAL/file mutation during read)
     cmd_tar = (
-        f"sudo tar --exclude='backups' --exclude='cache' --exclude='Transcode' "
+        f"sudo tar --warning=no-file-changed --exclude='backups' --exclude='cache' --exclude='Transcode' "
         f"--exclude='logs' --exclude='*.log' "
         f"-czf '{dest_tar}' -C '{DOCKER_ROOT}/appdata' "
-        f"maintainerr seerr tautulli dockhand 2>/dev/null"
+        f"maintainerr seerr tautulli dockhand"
     )
     code, _, stderr = run_ssh(cmd_tar, timeout=180)
-    if code != 0:
+    if code not in (0, 1):
         run_ssh(f"rm -f '{dest_tar}'")
         return False, f"appdata tar failed (code {code}): {stderr.strip()}"
 

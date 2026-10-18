@@ -57,7 +57,7 @@ DISCORD_POST_DELAY = 1.2       # Sleep between Discord calls to avoid HTTP 429
 INVISIBLE_CHARS_RE = re.compile(
     r"[\u200B-\u200D\uFEFF\u00AD\u2060\u202A-\u202E\u2066-\u2069\u0000-\u0008\u000B\u000C\u000E-\u001F]"
 )
-HTML_TAG_RE = re.compile(r"<[^>]+>")
+HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9:-]*(?:\s+[^>]*)?/?>")
 DISCORD_PING_RE = re.compile(r"@(everyone|here|&[0-9]+|[0-9]+)")
 
 def log(msg: str):

@@ -123,14 +123,16 @@ class TestMLBStreamExtractor(unittest.TestCase):
         # 2. _get_state(media_player.living_room_tv_2) -> on
         # 3. turn_on remote -> 200
         # 4. _get_state(media_player.living_room_tv) -> off
-        # 5. play_media -> 200
+        # 5. send_command HOME -> 200
+        # 6. play_media -> 200
         m1 = self._make_mock_resp(200, {"state": "on"})
         m2 = self._make_mock_resp(200, {"state": "on"})
         m3 = self._make_mock_resp(200)
         m4 = self._make_mock_resp(200, {"state": "off"})
+        m_home = self._make_mock_resp(200)
         m5 = self._make_mock_resp(200)
 
-        mock_urlopen.side_effect = [m1, m2, m3, m4, m5]
+        mock_urlopen.side_effect = [m1, m2, m3, m4, m_home, m5]
 
         res = cast_to_home_assistant("https://stream/master.m3u8", cold_start_delay=4.0)
         self.assertTrue(res)

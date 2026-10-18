@@ -160,6 +160,9 @@ def test_prowlarr_single_indexer_backoff_suppression(temp_env, monkeypatch):
         url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
         if "/indexerstatus" in url:
             return MockResponse(json.dumps(status_mock).encode())
+        elif "/indexer/test" in url:
+            import urllib.error
+            raise urllib.error.URLError("Probe failed")
         elif "/indexer" in url:
             return MockResponse(json.dumps(indexers_mock).encode())
         elif "/health" in url:
@@ -202,6 +205,9 @@ def test_prowlarr_systemic_indexer_outage_escalates(temp_env, monkeypatch):
         url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
         if "/indexerstatus" in url:
             return MockResponse(json.dumps(status_mock).encode())
+        elif "/indexer/test" in url:
+            import urllib.error
+            raise urllib.error.URLError("Probe failed")
         elif "/indexer" in url:
             return MockResponse(json.dumps(indexers_mock).encode())
         elif "/health" in url:
@@ -231,6 +237,9 @@ def test_prowlarr_allowed_hosts_auto_remediation(temp_env, monkeypatch):
         url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
         if "/indexerstatus" in url:
             return MockResponse(json.dumps(status_mock).encode())
+        elif "/indexer/test" in url:
+            import urllib.error
+            raise urllib.error.URLError("Probe failed")
         elif "/indexer" in url:
             return MockResponse(json.dumps(indexers_mock).encode())
         elif "/health" in url:
@@ -324,3 +333,167 @@ def test_arr_proper_repack_config_auto_remediated(temp_env, monkeypatch):
     changed_again, _ = aqw._auto_remediate_media_management("Sonarr", 8989, "mock_key")
     assert changed_again is False
 
+
+
+def test_prowlarr_active_self_healing_probe_recovers_indexer(temp_env, monkeypatch):
+    """Tier 1: Active self-healing probe re-tests indexer in backoff, resets state, and clears alarm."""
+    _, audit_file = temp_env
+
+    monkeypatch.setattr(pw, "_get_api_key", lambda: "mock_prowlarr_key")
+
+    indexers_mock = [
+        {"id": 2, "name": "NZBgeek", "enable": True},
+        {"id": 4, "name": "DrunkenSlug", "enable": True},
+    ]
+
+    status_mock = [
+        {"indexerId": 2, "disabledTill": "2026-09-30T03:30:00Z", "failureCount": 1}
+    ]
+
+    health_mock = [
+        {"source": "IndexerStatusCheck", "type": "warning", "message": "Indexers unavailable due to failures: NZBgeek"}
+    ]
+
+    put_called = []
+    cmd_called = []
+
+    def mock_urlopen(req, timeout=10):
+        url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+        method = req.get_method() if hasattr(req, "get_method") else "GET"
+        if method == "PUT" and "/indexer/2" in url:
+            put_called.append(url)
+            return MockResponse(b"{}")
+        elif method == "POST" and "/command" in url:
+            cmd_called.append(url)
+            return MockResponse(b"{}")
+        elif method == "POST" and "/indexer/test" in url:
+            return MockResponse(b"{}")  # Probe succeeds!
+        elif "/indexerstatus" in url:
+            return MockResponse(json.dumps(status_mock).encode())
+        elif "/indexer" in url:
+            return MockResponse(json.dumps(indexers_mock).encode())
+        elif "/health" in url:
+            return MockResponse(json.dumps(health_mock).encode())
+        return MockResponse(b"[]")
+
+    monkeypatch.setattr(pw.urllib.request, "urlopen", mock_urlopen)
+
+    has_act, summary, issues = pw.check_prowlarr(force=True)
+
+    assert not has_act
+    assert "nominal" in summary
+    assert len(issues) == 0
+    assert len(put_called) == 1
+    assert len(cmd_called) == 1
+
+    # Verify audit receipt was written
+    assert audit_file.exists()
+    with open(audit_file) as f:
+        log_content = f.read()
+        assert "auto_probed_and_recovered" in log_content
+        assert "NZBgeek" in log_content
+
+
+def test_prowlarr_two_indexer_pool_single_throttle_suppressed(temp_env, monkeypatch):
+    """Tier 2: Single throttle in 2-indexer pool (NZBgeek + DrunkenSlug) is suppressed if DrunkenSlug is healthy."""
+    _, audit_file = temp_env
+
+    monkeypatch.setattr(pw, "_get_api_key", lambda: "mock_prowlarr_key")
+
+    indexers_mock = [
+        {"id": 2, "name": "NZBgeek", "enable": True},
+        {"id": 4, "name": "DrunkenSlug", "enable": True},
+    ]
+
+    status_mock = [
+        {"indexerId": 2, "disabledTill": "2026-09-30T03:30:00Z", "failureCount": 6}
+    ]
+
+    def mock_urlopen(req, timeout=10):
+        url = req.full_url if hasattr(req, "full_url") else req.get_full_url()
+        if "/indexerstatus" in url:
+            return MockResponse(json.dumps(status_mock).encode())
+        elif "/indexer/test" in url:
+            import urllib.error
+            raise urllib.error.URLError("Probe failed")
+        elif "/indexer" in url:
+            return MockResponse(json.dumps(indexers_mock).encode())
+        elif "/health" in url:
+            return MockResponse(json.dumps([]).encode())
+        return MockResponse(b"[]")
+
+    monkeypatch.setattr(pw.urllib.request, "urlopen", mock_urlopen)
+
+    has_act, summary, issues = pw.check_prowlarr(force=True)
+
+    assert not has_act
+    assert "nominal" in summary
+    assert len(issues) == 0
+
+    assert audit_file.exists()
+    with open(audit_file) as f:
+        log_content = f.read()
+        assert "suppressed_transient_single_backoff" in log_content
+        assert "NZBgeek" in log_content
+        assert "1 healthy indexers active" in log_content
+
+
+def test_arr_notification_status_auto_remediation(temp_env, monkeypatch):
+    """Tier 1: Stale NotificationStatusCheck is auto-probed via CheckHealth and cleared silently."""
+    _, audit_file = temp_env
+
+    monkeypatch.setattr(aqw, "_get_api_keys", lambda: ("sonarr_mock_key", "radarr_mock_key"))
+    monkeypatch.setattr(aqw, "fetch_queue", lambda app, port, key: [])
+
+    health_mock = [
+        {
+            "source": "NotificationStatusCheck",
+            "type": "warning",
+            "message": "Notifications unavailable due to failures: Discord"
+        }
+    ]
+    monkeypatch.setattr(aqw, "fetch_health", lambda app, port, key: health_mock)
+
+    auto_remed_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(aqw, "_auto_remediate_notification_health", auto_remed_mock)
+
+    has_activity, summary, items = aqw.run_watchdog(auto_fix=True, force_dispatch=True)
+
+    assert auto_remed_mock.call_count == 2
+    assert "NotificationStatusCheck" in summary
+    assert "Transient notification timeout detected" in summary
+    assert "🚨 **Arr Health Outage Alert" not in summary
+
+
+def test_arr_notification_status_unresolved_advisory_not_critical(temp_env, monkeypatch):
+    """Tier 2: Unresolved NotificationStatusCheck alerts as advisory, never critical pipeline blocker."""
+    monkeypatch.setattr(aqw, "_get_api_keys", lambda: ("sonarr_mock_key", "radarr_mock_key"))
+    monkeypatch.setattr(aqw, "fetch_queue", lambda app, port, key: [])
+
+    health_mock = [
+        {
+            "source": "NotificationStatusCheck",
+            "type": "warning",
+            "message": "Notifications unavailable due to failures: Discord"
+        }
+    ]
+    monkeypatch.setattr(aqw, "fetch_health", lambda app, port, key: health_mock)
+    monkeypatch.setattr(aqw, "_auto_remediate_notification_health", lambda app, port, key: False)
+
+    t0 = 1000000.0
+    monkeypatch.setattr(aqw.time, "time", lambda: t0)
+    has_act1, sum1, _ = aqw.run_watchdog(auto_fix=True, force_dispatch=False)
+    assert not has_act1  # Debouncing, 0 elapsed
+
+    # Run at T0 + 130 minutes: Should alert as advisory, NOT critical
+    monkeypatch.setattr(aqw.time, "time", lambda: t0 + 7800)
+    has_act2, sum2, items = aqw.run_watchdog(auto_fix=True, force_dispatch=False)
+    assert has_act2
+    assert "⚠️ **Arr Health Advisory (Non-Critical Warning)**" in sum2
+    assert "🚨 **Arr Health Outage Alert (Critical Pipeline Blocker)**" not in sum2
+    assert "NotificationStatusCheck" in sum2
+
+    # Verify is_critical is False for all items
+    for it in items:
+        if isinstance(it, dict) and it.get("source") == "NotificationStatusCheck":
+            assert it.get("is_critical") is False

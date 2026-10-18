@@ -11,7 +11,7 @@ Workflow:
 1. Queries GitHub API for brockventures/market-sandbox with 24-hour delta tracking (PRs merged today, commits today, open PRs).
 2. Queries Discord REST API for the full 24-hour collaboration context in #the-banana-stand and #lounge.
 3. Retrieves yesterday's briefing from durable history to compute true operational diffs and eliminate repetition.
-4. Synthesizes an executive, delta-focused PM status report (<1650 chars) via agy (gemini-3.8-flash-low / gemini-3.7-flash).
+4. Synthesizes an executive, delta-focused PM status report (<1650 chars) via agy (gemini-3.8-flash-low).
 5. Enforces zero negative-prompt leakage: decisions must be explicitly asked blockers from chat, or 'None pending'.
 6. Queues message to #lounge via tools/outbox.py and durably logs full content to /workspace/data/agora_steering_history.json.
 """
@@ -37,7 +37,8 @@ PT = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path("/workspace/data")
 HISTORY_FILE = DATA_DIR / "agora_steering_history.json"
 LOUNGE_CHANNEL = "1534452820995080192"  # #lounge
-BANANA_CHANNEL = "1534436119888793750"  # #the-banana-stand
+AGORA_CHANNEL = "1558202642663211169"    # #agora
+BANANA_CHANNEL = "1534436119888793750"  # historical fallback
 REPO = "brockventures/market-sandbox"
 DISCORD_EPOCH = 1420070400000
 MIKE_DISCORD_ID = "93420059858305024"
@@ -287,7 +288,7 @@ def synthesize_pm_steering_update(
     context_blocks.append(f"### REPOSITORY TELEMETRY:\n{json.dumps(repo_summary, indent=2)}\n")
 
     if banana_chat.strip():
-        context_blocks.append(f"### LAST 24H CHAT (#the-banana-stand):\n{banana_chat}\n")
+        context_blocks.append(f"### LAST 24H CHAT (#agora):\n{banana_chat}\n")
     if lounge_chat.strip():
         context_blocks.append(f"### LAST 24H CHAT (#lounge):\n{lounge_chat}\n")
 
@@ -378,8 +379,9 @@ def dispatch_agora_steering(test_mode: bool = False, quiet: bool = False, dry_ru
     cutoff_pt = now_pt - timedelta(hours=24)
 
     # 1. Fetch Discord Context (Full 24h window)
-    raw_banana_msgs = fetch_channel_messages(BANANA_CHANNEL, cutoff_pt, now_pt, limit=80)
-    banana_chat = format_chat_snippet(raw_banana_msgs, max_chars=4000)
+    raw_agora_msgs = fetch_channel_messages(AGORA_CHANNEL, cutoff_pt, now_pt, limit=80)
+    raw_banana_msgs = fetch_channel_messages(BANANA_CHANNEL, cutoff_pt, now_pt, limit=40) if not raw_agora_msgs else []
+    banana_chat = format_chat_snippet(raw_agora_msgs or raw_banana_msgs, max_chars=4000)
 
     raw_lounge_msgs = fetch_channel_messages(LOUNGE_CHANNEL, cutoff_pt, now_pt, limit=40)
     lounge_chat = format_chat_snippet(raw_lounge_msgs, max_chars=3000)

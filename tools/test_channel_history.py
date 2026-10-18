@@ -101,5 +101,30 @@ class TestChannelHistoryCrossChannel(unittest.TestCase):
         self.assertIn("[09:12:11 PM PT] Zero (bot): Checking time", ctx)
         self.assertIn("PT timezone", ctx)
 
+    def test_reply_formatting(self):
+        """Messages with reply_to should display replying to author and snippet."""
+        ch_id = "1534452820995080192"
+        ch.record_message(
+            channel_id=ch_id,
+            channel_name="lounge",
+            author_name="Zero",
+            is_bot=True,
+            content="Detailed breakdown of federal student loan policy.",
+            msg_id=500,
+            timestamp="2026-09-30 20:50:00 UTC",
+        )
+        ch.record_message(
+            channel_id=ch_id,
+            channel_name="lounge",
+            author_name="Ryan",
+            is_bot=False,
+            content="In English please.",
+            msg_id=501,
+            reply_to_id=500,
+            timestamp="2026-09-30 20:55:00 UTC",
+        )
+        ctx = ch.format_channel_context(ch_id, limit=2)
+        self.assertIn('Ryan (replying to @Zero: "Detailed breakdown of federal student..."): In English please.', ctx)
+
 if __name__ == "__main__":
     unittest.main()

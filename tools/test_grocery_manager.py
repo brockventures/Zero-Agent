@@ -63,8 +63,8 @@ class TestAfxRetailNormalization:
         assert payload["ingredients"][0]["quantityList"][0]["unit"] == "COUNT"
         assert payload["ingredients"][0]["quantityList"][0]["amount"] >= 1
 
-    def test_bread_normalizes_to_365_sandwich_bread(self):
-        assert normalize_ingredient_name("sara lee artesano bakery bread") == "365 classic white sandwich bread"
+    def test_bread_normalizes_to_butterbread(self):
+        assert normalize_ingredient_name("sara lee artesano bakery bread") == "Nature's Own Butterbread, Non-GMO Bread, Sandwich Bread, 20 oz Loaf"
 
 
 class TestQuantityWarningsAndCostco:

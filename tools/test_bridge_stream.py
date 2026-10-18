@@ -293,5 +293,72 @@ class TestBridgeStream(unittest.TestCase):
         })
         self.assertEqual(parser.get_final_response(), "🍌 <@123> Clean redrafted message.")
 
+    def test_cjk_sampler_stub_not_prepended_to_substantive_response(self):
+        parser = AgyStreamParser(conv_id="conv-cjk-789")
+        # Step 1: Model sampler emits stray CJK filler token on empty wait turn
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "即是",
+                "state": "DONE",
+            },
+        })
+        # Step 2: Background task completes via system_message
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "system_message",
+            },
+        })
+        self.assertEqual(parser.last_substantive_response, "")
+        # Step 3: Real substantive response arrives
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "All 11 sidecar upgrades are live and verified across the schedule.",
+                "state": "DONE",
+            },
+        })
+        self.assertEqual(
+            parser.get_final_response(),
+            "All 11 sidecar upgrades are live and verified across the schedule.",
+        )
+
+    def test_short_pre_task_stub_discarded_when_substantive_response_arrives(self):
+        parser = AgyStreamParser(conv_id="conv-stub-999")
+        # Step 1: Short pre-task stub (< 6 words) before background task settles
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "Hold on a sec.",
+                "state": "DONE",
+            },
+        })
+        # Step 2: Background task completes
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "system_message",
+            },
+        })
+        # Step 3: Full substantive answer (> 80 chars) arrives
+        full_answer = (
+            "Here is the complete breakdown of the architecture and why we clamped "
+            "WaitMsBeforeAsync to 10,000ms across all synchronous shell executions."
+        )
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": full_answer,
+                "state": "DONE",
+            },
+        })
+        self.assertEqual(parser.get_final_response(), full_answer)
+
+
 if __name__ == "__main__":
     unittest.main()

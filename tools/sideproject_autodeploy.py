@@ -240,12 +240,16 @@ def check_and_sync_repo(service_name: str) -> dict:
 
 
 def run_cycle() -> dict:
-    state = load_state()
     cycle_results = {}
     for svc in SERVICES:
         res = check_and_sync_repo(svc)
         cycle_results[svc] = res
-        state["repos"][svc] = {
+
+    # Reload state from disk to preserve health_failures updated by check_and_sync_repo
+    state = load_state()
+    for svc in SERVICES:
+        res = cycle_results[svc]
+        state.setdefault("repos", {})[svc] = {
             "commit": res.get("new_commit") or res.get("old_commit"),
             "healthy": res.get("healthy", False),
             "last_updated": datetime.now(PT_TZ).isoformat(),

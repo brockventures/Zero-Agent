@@ -1,7 +1,7 @@
 ---
 name: detached-task
 description: >-
-  Use this skill whenever executing, monitoring, or managing ad-hoc commands, scripts, builds, or migrations expected to take longer than 3 minutes (180 seconds).
+  Use this skill whenever executing, monitoring, or managing ad-hoc commands, scripts, builds, or migrations expected to take longer than 2 minutes (120 seconds).
   Spawns jobs completely detached from the active Discord bridge turn, tails logs to disk, and delivers completion notifications asynchronously via tools/outbox.py.
 ---
 
@@ -11,9 +11,9 @@ The **Detached Task** skill prevents Discord turn lockups, typing indicator spam
 
 ---
 
-## 🎯 The 3-Minute Invariant & Trigger Gate
+## 🎯 The 2-Minute Invariant & Trigger Gate
 
-Whenever an ad-hoc command, script, test suite, or migration is expected or estimated to take **longer than 3 minutes (180 seconds)**:
+Whenever an ad-hoc command, script, test suite, or migration is expected or estimated to take **longer than 2 minutes (120 seconds)**:
 
 1. **NEVER execute synchronously** within the conversational Discord turn.
 2. **NEVER hold the turn open** with standard `run_command` polling.

@@ -146,12 +146,53 @@ class CodebaseAuditor:
         return all_findings
 
 
+def run_llm_semantic_audit(target_path: Path, static_findings: List[Dict[str, Any]]) -> str:
+    """Invoke Gemini 4 Argon (High) to perform semantic architecture review over tools/sidecars."""
+    try:
+        from tools.llm_sidecar import call_sidecar_llm, get_sidecar_model
+        model_id = get_sidecar_model("monthly_hardcode_regex_audit", "gemini-4-argon-high")
+        py_files = sorted(target_path.glob("*.py")) if target_path.is_dir() else [target_path]
+        # Gather compact AST / heuristic signatures across recently modified scripts
+        py_files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        summaries = []
+        for p in py_files[:15]:
+            try:
+                src = p.read_text(encoding="utf-8", errors="replace")
+                elif_chains = len(re.findall(r"^\s*elif\s+", src, flags=re.M))
+                regex_compiles = len(re.findall(r"re\.(?:compile|search|match|sub)\(", src))
+                if elif_chains >= 4 or regex_compiles >= 5:
+                    summaries.append({
+                        "file": p.name,
+                        "lines": len(src.splitlines()),
+                        "elif_branches": elif_chains,
+                        "regex_calls": regex_compiles,
+                    })
+            except Exception:
+                pass
+
+        prompt = (
+            f"You are Zero's Staff Architecture Auditor ({model_id}) conducting the Monthly Hardcoded Rule & Brittle Regex Audit.\n\n"
+            f"Static Regex Findings ({len(static_findings)}):\n{json.dumps(static_findings[:10], indent=2)}\n\n"
+            f"High-Branching / Regex-Dense Modules in `{target_path}`:\n{json.dumps(summaries, indent=2)}\n\n"
+            "Write a concise 3-bullet architectural assessment identifying where brittle heuristics, "
+            "canned templates, or fragile regexes should be replaced with dynamic state queries or LLM reasoning. "
+            "Use standard `- **Label:** description` bullets without em dashes."
+        )
+        return call_sidecar_llm("monthly_hardcode_regex_audit", prompt, timeout=75)
+    except Exception:
+        return ""
+
+
 def format_audit_report(findings: List[Dict[str, Any]], target_path: Path) -> str:
-    """Format findings into a high-signal markdown audit report."""
+    """Format findings into a high-signal markdown audit report with Gemini 4 Argon High synthesis."""
+    llm_review = run_llm_semantic_audit(target_path, findings)
+    llm_block = f"\n\n### 🧠 Semantic Architecture Review (`gemini-4-argon-high`)\n{llm_review}" if llm_review else ""
+
     if not findings:
         return (
             f"🔍 **Hardcoded Rule & Brittle Regex Audit** (`{target_path}`)\n"
-            f"✅ **Zero Fragile Heuristics Detected.** Codebase adheres to dynamic state and LLM intent routing protocols."
+            f"✅ **Zero Fragile Static Heuristics Detected.** Codebase adheres to dynamic state and LLM intent routing protocols."
+            f"{llm_block}"
         )
 
     high_count = sum(1 for f in findings if f["severity"] == "HIGH")
@@ -170,6 +211,9 @@ def format_audit_report(findings: List[Dict[str, Any]], target_path: Path) -> st
         lines.append(f"- **Code:** `{f['content']}`")
         lines.append(f"- **Diagnostic:** {f['description']}")
         lines.append(f"- **Architectural Fix:** **{f['rec_type']}** — {f['recommendation']}\n")
+
+    if llm_block:
+        lines.append(llm_block.strip())
 
     return "\n".join(lines)
 

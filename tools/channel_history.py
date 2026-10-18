@@ -70,7 +70,9 @@ def record_message(
     content: str,
     msg_id: int | None = None,
     reply_to_id: int | None = None,
-    timestamp: str | None = None
+    timestamp: str | None = None,
+    reply_to_author: str | None = None,
+    reply_to_snippet: str | None = None,
 ) -> dict:
     """Record an incoming or outgoing message into the channel history buffer."""
     ch_key = str(channel_id)
@@ -90,6 +92,16 @@ def record_message(
     if not timestamp:
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    if reply_to_id and not reply_to_author:
+        for q in _history_store.values():
+            for m in q:
+                if m.get("id") == reply_to_id:
+                    reply_to_author = m.get("author")
+                    reply_to_snippet = m.get("content", "")
+                    break
+            if reply_to_author:
+                break
+
     entry = {
         "id": msg_id,
         "channel_id": str(channel_id),
@@ -98,7 +110,9 @@ def record_message(
         "is_bot": is_bot,
         "content": content,
         "reply_to": reply_to_id,
-        "timestamp": timestamp
+        "reply_to_author": reply_to_author,
+        "reply_to_snippet": reply_to_snippet,
+        "timestamp": timestamp,
     }
 
     _history_store[ch_key].append(entry)
@@ -118,7 +132,7 @@ def get_recent_messages(channel_id: int | str, limit: int = 15, exclude_msg_id: 
 
 def format_ts_pt(raw_ts: str | None) -> str:
     """Convert raw 'YYYY-MM-DD HH:MM:SS UTC' timestamp to clean 'hh:mm:ss AM/PM PT'."""
-    if not raw_ts:
+    if not raw_ts or not isinstance(raw_ts, str):
         return ""
     try:
         if "UTC" in raw_ts:
@@ -127,6 +141,48 @@ def format_ts_pt(raw_ts: str | None) -> str:
     except Exception:
         pass
     return raw_ts.split(" ")[1] if " " in raw_ts else raw_ts
+
+def _format_message_line(m: dict, context_msgs: list[dict] | None = None) -> str:
+    """Format single message line with timestamp, author, reply context, and truncated content."""
+    ts = format_ts_pt(m.get("timestamp", ""))
+    author_label = f"{m.get('author', 'Unknown')}" + (" (bot)" if m.get("is_bot") else "")
+    content = m.get("content", "").strip()
+    if len(content) > 600:
+        content = content[:590] + "... [truncated]"
+
+    reply_annot = ""
+    reply_id = m.get("reply_to")
+    if reply_id:
+        target_author = m.get("reply_to_author")
+        target_snip = m.get("reply_to_snippet")
+        if not target_author and context_msgs:
+            for cand in context_msgs:
+                if cand.get("id") == reply_id:
+                    target_author = cand.get("author")
+                    target_snip = cand.get("content")
+                    break
+        if not target_author and _history_store:
+            for q in _history_store.values():
+                for cand in q:
+                    if cand.get("id") == reply_id:
+                        target_author = cand.get("author")
+                        target_snip = cand.get("content")
+                        break
+                if target_author:
+                    break
+
+        if target_author:
+            clean_snip = (target_snip or "").strip().replace("\n", " ")
+            if len(clean_snip) > 40:
+                clean_snip = clean_snip[:37] + "..."
+            if clean_snip:
+                reply_annot = f" (replying to @{target_author}: \"{clean_snip}\")"
+            else:
+                reply_annot = f" (replying to @{target_author})"
+        else:
+            reply_annot = " (replying to previous message)"
+
+    return f"[{ts}] {author_label}{reply_annot}: {content}"
 
 def format_channel_context(
     channel_id: int | str,
@@ -147,13 +203,7 @@ def format_channel_context(
         total_len = 0
         # Walk newest to oldest to enforce max_chars budget, then reverse
         for m in reversed(recent):
-            ts = format_ts_pt(m.get("timestamp", ""))
-            author_label = f"{m.get('author', 'Unknown')}" + (" (bot)" if m.get("is_bot") else "")
-            content = m.get("content", "").strip()
-            # Truncate individual overly long message snippets if needed
-            if len(content) > 600:
-                content = content[:590] + "... [truncated]"
-            line = f"[{ts}] {author_label}: {content}"
+            line = _format_message_line(m, context_msgs=recent)
             if total_len + len(line) > max_chars:
                 break
             lines.append(line)
@@ -197,12 +247,7 @@ def format_channel_context(
                     p_lines = []
                     p_len = 0
                     for pm in reversed(valid_peer_msgs):
-                        ts = format_ts_pt(pm.get("timestamp", ""))
-                        author_label = f"{pm.get('author', 'Unknown')}" + (" (bot)" if pm.get("is_bot") else "")
-                        content = pm.get("content", "").strip()
-                        if len(content) > 600:
-                            content = content[:590] + "... [truncated]"
-                        line = f"[{ts}] {author_label}: {content}"
+                        line = _format_message_line(pm, context_msgs=valid_peer_msgs)
                         if p_len + len(line) > 2500:
                             break
                         p_lines.append(line)

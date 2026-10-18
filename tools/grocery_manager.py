@@ -75,6 +75,44 @@ def get_due_staples() -> list[dict]:
     return due
 
 
+def mark_staples_purchased(ids_or_names: list[str], purchase_date: str | None = None) -> list[str]:
+    """Updates last_purchased date for the specified staple IDs or names."""
+    if not purchase_date:
+        purchase_date = datetime.now(PT).strftime("%Y-%m-%d")
+    staples = load_staples()
+    updated = []
+    norm_targets = {t.lower().strip() for t in ids_or_names}
+    for item in staples:
+        item_id = item.get("id", "").lower().strip()
+        item_name = item.get("name", "").lower().strip()
+        if item_id in norm_targets or item_name in norm_targets or any(target in item_name or target in item_id for target in norm_targets):
+            item["last_purchased"] = purchase_date
+            updated.append(item["name"])
+    if updated:
+        save_staples(staples)
+    return updated
+
+
+def is_pantry_item(raw_name: str, exclusions: set[str]) -> bool:
+    """Robustly checks if a recipe ingredient is covered by the household pantry inventory."""
+    import re
+    clean = raw_name.lower().strip()
+    if clean in exclusions:
+        return True
+    if "salt" in clean and "pepper" in clean and any(w in clean for w in ["black", "kosher", "table", "sea"]):
+        return True
+    clean_mod = re.sub(r"^(?:organic|mild|hot|sweet|freshly\s+ground|ground|pure|crushed|whole|coarse|fine|flaked)\s+", "", clean).strip()
+    clean_mod = clean_mod.replace("-", " ")
+    if clean_mod in exclusions:
+        return True
+    if clean_mod in ("pepper", "black pepper"):
+        return True
+    for prefix in ["ground ", "crushed ", "whole ", "dried "]:
+        if f"{prefix}{clean_mod}" in exclusions:
+            return True
+    return False
+
+
 def compile_cart(items: list[dict], exclude_pantry: bool = True) -> tuple[str, list[dict], list[str]]:
     """Filters, deduplicates, and compiles items into a 1-click Whole Foods AFX URL,
     returning (url, final_manifest, assumed_in_stock)."""
@@ -88,8 +126,9 @@ def compile_cart(items: list[dict], exclude_pantry: bool = True) -> tuple[str, l
         if not raw_name:
             continue
         
-        # Check pantry exclusion
-        if it.get("is_pantry") or raw_name.lower() in exclusions:
+        # Check pantry exclusion (user-requested items from HA/tasks are never excluded)
+        is_user_request = it.get("is_user_request", False)
+        if not is_user_request and (it.get("is_pantry") or is_pantry_item(raw_name, exclusions)):
             display_name = it.get("pantry_display") or raw_name
             if display_name.lower() not in [a.lower() for a in assumed_in_stock]:
                 assumed_in_stock.append(display_name)
@@ -116,6 +155,23 @@ def compile_cart(items: list[dict], exclude_pantry: bool = True) -> tuple[str, l
 
 def parse_single_item(text_clean: str, is_pantry: bool = False, pantry_display: str = "") -> dict:
     import re
+    # Normalize unicode fraction characters before regex matching
+    unicode_fractions = {
+        "½": "1/2", "⅓": "1/3", "⅔": "2/3", "¼": "1/4", "¾": "3/4",
+        "⅛": "1/8", "⅜": "3/8", "⅝": "5/8", "⅞": "7/8"
+    }
+    for u_frac, rep in unicode_fractions.items():
+        text_clean = text_clean.replace(u_frac, f" {rep} ")
+    text_clean = re.sub(r"\s+", " ", text_clean).strip()
+
+    # Normalize 'boneless, skinless' phrases before splitting on comma
+    text_clean = re.sub(r"\bboneless\s*,\s*skinless\b", "boneless skinless", text_clean, flags=re.IGNORECASE)
+    text_clean = re.sub(r"\bskinless\s*,\s*boneless\b", "skinless boneless", text_clean, flags=re.IGNORECASE)
+
+    # Normalize 'a pinch of' or 'a dash of'
+    text_clean = re.sub(r"^(?:a\s+)?pinch\s+(?:of\s+)?", "1 pinch ", text_clean, flags=re.IGNORECASE)
+    text_clean = re.sub(r"^(?:a\s+)?dash\s+(?:of\s+)?", "1 dash ", text_clean, flags=re.IGNORECASE)
+
     text_clean = re.split(r",|\bto taste\b|\bplus more\b|\bfor serving\b|\boptional\b", text_clean, flags=re.IGNORECASE)[0].strip()
     qty_match = re.match(r"^([\d\s\/\.\-]+)\s*(.*)$", text_clean)
     qty = 1.0
@@ -137,7 +193,7 @@ def parse_single_item(text_clean: str, is_pantry: bool = False, pantry_display: 
             qty = 1.0
 
     unit = "COUNT"
-    unit_match = re.match(r"^(pounds?|lbs?|ounces?|oz|cups?|tablespoons?|tbsp|teaspoons?|tsp|cloves?|cans?|bottles?|bunches?|bunch|bags?|packages?|pkg|heads?)\b\s*(.*)$", rem, flags=re.IGNORECASE)
+    unit_match = re.match(r"^(pounds?|lbs?|ounces?|oz|cups?|tablespoons?|tbsp|teaspoons?|tsp|cloves?|cans?|bottles?|bunches?|bunch|bags?|packages?|pkg|heads?|pinch(?:es)?|dash(?:es)?)\b\s*(.*)$", rem, flags=re.IGNORECASE)
     if unit_match:
         u_raw = unit_match.group(1).lower()
         rem = unit_match.group(2).strip()
@@ -154,7 +210,7 @@ def parse_single_item(text_clean: str, is_pantry: bool = False, pantry_display: 
         else:
             unit = "COUNT"
 
-    name = re.sub(r"\s+", " ", rem.strip())
+    name = re.sub(r"\s+", " ", rem.strip()).rstrip("*").strip()
     if not name:
         name = text_clean
 
@@ -174,6 +230,13 @@ def parse_raw_ingredient(raw_text: str) -> list[dict]:
     import re
     pantry_exclusions = load_pantry_exclusions()
 
+    # Special case: compound salt and black pepper
+    if re.search(r"^(?:kosher\s+|fine\s+|coarse\s+|organic\s+)?salt\s+and\s+(?:freshly\s+ground\s+)?(?:black\s+)?pepper", text, re.IGNORECASE):
+        return [
+            parse_single_item("kosher salt", is_pantry=True, pantry_display="kosher salt"),
+            parse_single_item("black pepper", is_pantry=True, pantry_display="black pepper")
+        ]
+
     # Check for proprietary spice blends / seasonings with parentheticals
     blend_match = re.search(r"^(.*?)\s*\(([^)]+)\)\s*$", text)
     if blend_match:
@@ -185,9 +248,15 @@ def parse_raw_ingredient(raw_text: str) -> list[dict]:
             if len(pantry_hits) >= max(1, len(sub_items) * 0.5):
                 return [parse_single_item(title, is_pantry=True, pantry_display=f"{title} ({sub_str})")]
 
+    # Strip alternative options in parentheticals like '(or ...)' or '(see note)' before compound splitting
+    text_cleaned = re.sub(r"\s*\((?:or|see\s+note)[^)]*\)", "", text, flags=re.IGNORECASE)
+
+    # Protect compound adjective pairings like 'black & white sesame seeds'
+    text_cleaned = re.sub(r"\bblack\s*[\&\+]\s*white\b", "black and white", text_cleaned, flags=re.IGNORECASE)
+
     # Split compound lines with '&' or ' + '
     sub_lines = []
-    for part in re.split(r"\s+[\&\+]\s+", text):
+    for part in re.split(r"\s+[\&\+]\s+", text_cleaned):
         part = part.strip()
         if not part:
             continue
@@ -210,34 +279,61 @@ def parse_raw_ingredient(raw_text: str) -> list[dict]:
     return results
 
 
-def extract_active_meal_plan_items() -> tuple[list[dict], list[str]]:
-    """Reads /workspace/data/active_meal_plan.json and extracts recipe ingredients."""
+def extract_active_meal_plan_items() -> tuple[list[dict], list[str], list[dict]]:
+    """Reads /workspace/data/active_meal_plan.json and extracts recipe ingredients,
+    returning (raw_items, recipes_loaded, meal_breakdowns)."""
     plan_file = WORKSPACE / "data" / "active_meal_plan.json"
     if not plan_file.exists():
-        return [], []
+        return [], [], []
     try:
         with open(plan_file, "r") as f:
             plan = json.load(f)
     except Exception:
-        return [], []
+        return [], [], []
 
     meals = plan.get("meals", {})
     if not meals:
-        return [], []
+        return [], [], []
 
+    pantry_exclusions = load_pantry_exclusions()
     raw_items = []
     recipes_loaded = []
+    meal_breakdowns = []
+
     for slot, data in meals.items():
         rec = data.get("recipe", {})
         r_name = rec.get("name", "Unknown")
+        r_slug = rec.get("slug", "")
+        day_str = data.get("date_display") or data.get("day_name") or slot.title()
+        url = f"https://mealie.brock.ventures/g/home/r/{r_slug}" if r_slug else "https://mealie.brock.ventures/household/mealplan/planner/"
+
         recipes_loaded.append(r_name)
+        meal_cart_items = []
+
         for line in rec.get("ingredients", []):
             parsed = parse_raw_ingredient(line)
-            if isinstance(parsed, list):
-                raw_items.extend(parsed)
-            elif parsed:
-                raw_items.append(parsed)
-    return raw_items, recipes_loaded
+            items_to_check = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
+            for it in items_to_check:
+                raw_items.append(it)
+                raw_name = it.get("name", "").strip()
+                if not raw_name:
+                    continue
+                # If not pantry item, add to meal's cart items breakdown
+                if not (it.get("is_pantry") or is_pantry_item(raw_name, pantry_exclusions)):
+                    norm_disp = it.get("search_query") or normalize_ingredient_name(raw_name)
+                    clean_item_name = norm_disp.title()
+                    if clean_item_name not in meal_cart_items:
+                        meal_cart_items.append(clean_item_name)
+
+        meal_breakdowns.append({
+            "name": r_name,
+            "slug": r_slug,
+            "day": day_str,
+            "url": url,
+            "items": meal_cart_items
+        })
+
+    return raw_items, recipes_loaded, meal_breakdowns
 
 
 def generate_quantity_warnings(staged_items: list[dict], manifest: list[dict]) -> list[str]:
@@ -305,8 +401,9 @@ def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan:
     recipes_included = []
 
     # 1. Fetch ingredients from active meal plan (if present)
+    meal_breakdowns = []
     if include_meal_plan:
-        meal_items, recipes_included = extract_active_meal_plan_items()
+        meal_items, recipes_included, meal_breakdowns = extract_active_meal_plan_items()
         staged_items.extend(meal_items)
     task_records = []
     
@@ -317,7 +414,7 @@ def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan:
         for it in ha_items:
             title = it.get("title", "").strip()
             if title:
-                staged_items.append({"name": title, "amount": 1, "unit": "COUNT"})
+                staged_items.append({"name": title, "amount": 1, "unit": "COUNT", "is_user_request": True})
                 task_records.append({"id": it["id"], "source": "ha", "title": title})
     except Exception as e:
         print(f"[GroceryManager] Note: Could not fetch Home Assistant items: {e}", file=sys.stderr)
@@ -330,7 +427,7 @@ def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan:
             title = t.get("title", "").strip()
             # Avoid duplicate if already pulled from HA
             if title and title.lower() not in [x["name"].lower() for x in staged_items]:
-                staged_items.append({"name": title, "amount": 1, "unit": "COUNT"})
+                staged_items.append({"name": title, "amount": 1, "unit": "COUNT", "is_user_request": True})
                 task_records.append({"id": t["id"], "source": "gtasks", "title": title})
     except Exception as e:
         print(f"[GroceryManager] Note: Could not fetch Google Tasks: {e}", file=sys.stderr)
@@ -390,6 +487,7 @@ def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan:
         "staples_ingested": due_wf_count,
         "recipes_ingested": len(recipes_included),
         "recipe_names": recipes_included,
+        "meal_breakdowns": meal_breakdowns,
         "quantity_warnings": warnings,
         "costco_items": costco_items,
     }
@@ -401,10 +499,20 @@ def main():
     parser.add_argument("--stage-due", action="store_true", help="Compile cart containing all due staples")
     parser.add_argument("--weekly-staging", action="store_true", help="Ingest Google Tasks + due staples and compile weekly Whole Foods cart")
     parser.add_argument("--complete-tasks", action="store_true", help="Mark ingested Google Tasks complete (use post-checkout)")
+    parser.add_argument("--mark-purchased", nargs="+", help="Mark staple IDs or names as purchased today")
     parser.add_argument("--json-out", action="store_true", help="Output JSON format")
     args = parser.parse_args()
 
-    if args.due_staples:
+    if args.mark_purchased:
+        updated = mark_staples_purchased(args.mark_purchased)
+        if args.json_out:
+            print(json.dumps({"updated": updated}, indent=2))
+        else:
+            print(f"Marked {len(updated)} staple(s) as purchased today ({datetime.now(PT).strftime('%Y-%m-%d')}):")
+            for u in updated:
+                print(f"- {u}")
+
+    elif args.due_staples:
         due = get_due_staples()
         if args.json_out:
             print(json.dumps(due, indent=2))

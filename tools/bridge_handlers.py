@@ -10,6 +10,7 @@ Re-exports ambient and command symbols for 100% backward compatibility.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -42,6 +43,7 @@ from tools.bridge_commands import (
     handle_operator_command,
 )
 from tools.bridge_state import (
+    get_in_flight,
     DATA_DIR,
     ATTACHMENTS_DIR,
     CONFIG_FILE,
@@ -91,11 +93,13 @@ from tools.bridge_formatting import (
     clean_discord_latex,
     generate_concise_thread_title,
     parse_interactive_choices,
+    format_steering_prompt,
 )
 from tools.bridge_runner import (
     execute_agy_turn,
     find_new_artifacts,
     channel_active_procs,
+    channel_active_prompts,
     steering_channels,
     reset_session_keys,
     thread_active_tasks,
@@ -135,6 +139,83 @@ def get_concurrency_semaphore() -> asyncio.Semaphore:
         max_workers = int(rules.get("max_parallel_workers", 3))
         channel_concurrency_semaphore = asyncio.Semaphore(max_workers)
     return channel_concurrency_semaphore
+
+
+def try_coalesce_pending_turn(
+    channel_id: int | str,
+    author_id: int | str | None,
+    author_name: str | None,
+    new_text: str,
+    new_attachments: list[str] | None = None,
+    new_msg: discord.Message | None = None,
+    is_group: bool = False,
+    extra_queue: Any = None,
+) -> bool:
+    """Coalesce a rapid split-delivery or sequential message from the same author
+    into an already queued turn before execution begins.
+    Returns True if successfully coalesced into an existing queued turn, False otherwise.
+    """
+    try:
+        cid = int(channel_id) if str(channel_id).isdigit() else channel_id
+        aid = int(author_id) if author_id is not None and str(author_id).isdigit() else author_id
+
+        queues_to_check = []
+        ch_q = channel_queues.get(cid)
+        if ch_q is not None and hasattr(ch_q, "_queue"):
+            queues_to_check.append(ch_q._queue)
+
+        if extra_queue is not None:
+            if hasattr(extra_queue, "queue") and hasattr(extra_queue.queue, "_queue"):
+                queues_to_check.append(extra_queue.queue._queue)
+            elif hasattr(extra_queue, "_queue"):
+                queues_to_check.append(extra_queue._queue)
+
+        for q_deque in queues_to_check:
+            for item in reversed(q_deque):
+                if not isinstance(item, dict):
+                    continue
+                item_cid = item.get("channel_id")
+                item_aid = item.get("author_id")
+                item_aname = item.get("author_name")
+
+                # Match channel and author
+                if item_cid == cid and (
+                    (aid is not None and item_aid is not None and item_aid == aid)
+                    or (author_name and item_aname and item_aname == author_name)
+                ):
+                    # Coalesce into this queued item!
+                    if item.get("is_steer"):
+                        prev_raw = item.get("raw_prompt") or item.get("prompt", "")
+                        combined_raw = f"{prev_raw}\n\n{new_text}".strip()
+                        item["raw_prompt"] = combined_raw
+                        item["prompt"] = format_steering_prompt(
+                            new_directive=combined_raw,
+                            original_task=item.get("original_task"),
+                            author_name=author_name,
+                            is_group=is_group,
+                        )
+                    else:
+                        item["prompt"] = f"{item['prompt']}\n\n{new_text}".strip()
+                        if "raw_prompt" in item:
+                            item["raw_prompt"] = f"{item['raw_prompt']}\n\n{new_text}".strip()
+
+                    if new_attachments:
+                        item.setdefault("attachments", []).extend(new_attachments)
+
+                    if new_msg:
+                        item["reply_target"] = new_msg
+
+                    item["coalesced_count"] = item.get("coalesced_count", 1) + 1
+                    item["updated_at"] = time.perf_counter()
+                    print(
+                        f"[Bridge] 🧩 Coalesced rapid message from {author_name} (ID: {aid}) "
+                        f"into pending turn for channel {cid} (total parts: {item['coalesced_count']})"
+                    )
+                    return True
+    except Exception as ce:
+        print(f"[Bridge] Warning during pending turn coalescing: {ce}")
+
+    return False
 
 
 
@@ -209,6 +290,87 @@ def is_bridge_busy(home_queue=None, ext_queue=None, exclude_channel_id: int | No
     return busy
 
 
+def resolve_typing_target(target: Any) -> Any:
+    """Resolve the typing destination channel from a Message, Thread, Channel, mock, or callable."""
+    if callable(target) and not hasattr(target, "channel") and not hasattr(target, "reply") and not hasattr(target, "send"):
+        try:
+            target = target()
+        except Exception:
+            return None
+    if target is None:
+        return None
+    if hasattr(target, "channel") and target.channel is not None and hasattr(target.channel, "typing"):
+        return target.channel
+    if hasattr(target, "typing"):
+        return target
+    if hasattr(target, "channel") and target.channel is not None:
+        return target.channel
+    return target
+
+
+async def _send_one_typing(dest: Any) -> None:
+    """Send a single typing heartbeat to a channel destination, supporting discord.py objects and mocks."""
+    if dest is None:
+        return
+    if hasattr(dest, "typing"):
+        t = dest.typing()
+        if hasattr(t, "wrapped_typer"):
+            await t.wrapped_typer()
+        elif hasattr(t, "__aenter__"):
+            await t.__aenter__()
+            if hasattr(t, "__aexit__"):
+                await t.__aexit__(None, None, None)
+        elif asyncio.iscoroutine(t) or hasattr(t, "__await__"):
+            await t
+
+
+@contextlib.asynccontextmanager
+async def resilient_typing(target: Any, interval: float = 6.0):
+    """Resilient typing indicator context manager.
+    
+    Continuously sends Discord typing heartbeats every `interval` seconds across
+    long-running turns. Catches transient network errors, socket timeouts, and rate
+    limits without dying silently, and cleanly cancels when the turn completes.
+    """
+    dest = resolve_typing_target(target)
+    if dest is None or not hasattr(dest, "typing"):
+        yield
+        return
+
+    stop_event = asyncio.Event()
+
+    async def _typing_loop():
+        # First heartbeat immediately
+        try:
+            await _send_one_typing(dest)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                curr_dest = resolve_typing_target(target) if callable(target) else dest
+                try:
+                    await _send_one_typing(curr_dest)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+
+    task = asyncio.create_task(_typing_loop())
+    try:
+        yield
+    finally:
+        stop_event.set()
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 async def run_thread_turn_worker(item, bot: discord.Client, presence_fn=None, button_choice_fn=None, quick_choice_view_cls=QuickChoiceView):
@@ -237,13 +399,9 @@ async def run_thread_turn_worker(item, bot: discord.Client, presence_fn=None, bu
             "quick_choice_view_cls": quick_choice_view_cls,
             "queued_at": item.get("queued_at"),
         }
-        if reply_target and hasattr(reply_target, "typing"):
-            async with reply_target.typing():
-                await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
-        elif reply_target and hasattr(reply_target, "channel") and hasattr(reply_target.channel, "typing"):
-            async with reply_target.channel.typing():
-                await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
-        else:
+        if item.get("model_override"):
+            kwargs["model_override"] = item["model_override"]
+        async with resilient_typing(reply_target):
             await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
     except Exception as e:
         print(f"[Thread Worker] Error in thread turn execution: {e}")
@@ -303,6 +461,7 @@ async def run_channel_turn_worker(
                     print(f"[Channel Worker {channel_id}] Notice creating status placeholder: {se}")
 
             channel_active_tasks[channel_id] = asyncio.current_task()
+            channel_active_prompts[channel_id] = prompt
             if is_home_root:
                 active_turn_task = asyncio.current_task()
                 active_status_msg = status_msg
@@ -323,14 +482,11 @@ async def run_channel_turn_worker(
                         "last_word_bot_name": item.get("last_word_bot_name"),
                         "last_word_streak": item.get("last_word_streak", 0),
                         "queued_at": item.get("queued_at"),
+                        "is_physical_mention": item.get("is_physical_mention", False),
                     }
-                    if reply_target and hasattr(reply_target, "channel") and hasattr(reply_target.channel, "typing"):
-                        async with reply_target.channel.typing():
-                            await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
-                    elif reply_target and hasattr(reply_target, "typing"):
-                        async with reply_target.typing():
-                            await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
-                    else:
+                    if item.get("model_override"):
+                        kwargs["model_override"] = item["model_override"]
+                    async with resilient_typing(reply_target):
                         await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
 
                 # Priority Fast-Lane: Dedicated persistent channels (#zero-chat, #the-banana-stand, #lounge)
@@ -351,9 +507,15 @@ async def run_channel_turn_worker(
                         elif hasattr(reply_target, "send"):
                             await reply_target.send(f"⚠️ **Error executing task:** {e}")
                     except Exception:
-                        pass
+                        try:
+                            target_ch = getattr(reply_target, "channel", reply_target)
+                            if hasattr(target_ch, "send"):
+                                await target_ch.send(f"⚠️ **Error executing task:** {e}")
+                        except Exception:
+                            pass
             finally:
                 channel_active_tasks.pop(channel_id, None)
+                channel_active_prompts.pop(channel_id, None)
                 if is_home_root:
                     active_turn_task = None
                     active_status_msg = None
@@ -425,7 +587,7 @@ async def external_queue_worker(ext_turn_queue, bot: discord.Client, presence_fn
         cid = int(channel_id) if str(channel_id).isdigit() else channel_id
         q = get_channel_queue(cid)
         await q.put(item)
-        ext_turn_queue.task_done()
+        ext_turn_queue.task_done(item)
 
         existing_task = channel_worker_tasks.get(cid)
         if existing_task is None or existing_task.done():
@@ -471,6 +633,15 @@ async def handle_on_ready(
         print(f"[Antigravity] Inbound Email Listener active (PID: {mail_status.get('pid')}, target: {mail_status.get('target')}).")
     except Exception as mle:
         print(f"[Bridge] Warning initializing email listener: {mle}")
+
+    # Ensure Amazon Order Listener Daemon is active
+    try:
+        from tools.amazon_order_listener import ensure_amazon_listener_running, get_status as get_amazon_status
+        ensure_amazon_listener_running()
+        amazon_status = get_amazon_status()
+        print(f"[Antigravity] Amazon Order Listener active (PID: {amazon_status.get('pid')}).")
+    except Exception as aoe:
+        print(f"[Bridge] Warning initializing Amazon order listener: {aoe}")
 
     # Ensure Zero Health Check HTTP Server is active (for zero.brock.ventures)
     try:
@@ -704,6 +875,13 @@ async def handle_message(
         author_name = msg.author.display_name or msg.author.name
         ch_name = getattr(msg.channel, "name", str(msg.channel.id))
         reply_id = msg.reference.message_id if msg.reference else None
+        reply_author = None
+        reply_snip = None
+        if msg.reference:
+            resolved = getattr(msg.reference, "resolved", None)
+            if resolved and hasattr(resolved, "author"):
+                reply_author = getattr(resolved.author, "display_name", None) or getattr(resolved.author, "name", None)
+                reply_snip = getattr(resolved, "clean_content", None) or getattr(resolved, "content", "")
         record_message(
             channel_id=msg.channel.id,
             channel_name=ch_name,
@@ -712,7 +890,9 @@ async def handle_message(
             content=content,
             msg_id=msg.id,
             reply_to_id=reply_id,
-            timestamp=msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if hasattr(msg, "created_at") else None
+            timestamp=msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if hasattr(msg, "created_at") else None,
+            reply_to_author=reply_author,
+            reply_to_snippet=reply_snip,
         )
         if len(get_recent_messages(msg.channel.id, limit=5)) <= 1:
             asyncio.create_task(
@@ -744,10 +924,11 @@ async def handle_message(
 
         bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
         reply_to_zero = is_reply_to_zero(msg, bot)
+        stripped_for_tag = re.sub(r"`[^`]*`|\(\s*@zero\s*\)", "", content, flags=re.IGNORECASE)
         has_explicit_tag = (
             f"<@{bot_id}>" in content or
             f"<@!{bot_id}>" in content or
-            bool(re.search(r"@zero\b", content, re.IGNORECASE))
+            bool(re.search(r"@zero\b", stripped_for_tag, re.IGNORECASE))
         )
 
         if author_id == OWNER_USER_ID:
@@ -762,7 +943,9 @@ async def handle_message(
                 return
 
         elif author_id == IVY_USER_ID:
-            if not has_explicit_tag and not reply_to_zero:
+            # In excluded channels (#baseball), Ivy must explicitly tag Zero.
+            # Automated Discord message references (inline replies) from bots are dropped at the front door.
+            if not has_explicit_tag:
                 return
 
             # Check if Ivy is paused under Last Word Protocol
@@ -930,14 +1113,29 @@ async def handle_message(
     if not prompt_content:
         return
 
+    # First: attempt to coalesce rapid split-delivery from the same author into any pending queued turn
+    if try_coalesce_pending_turn(
+        channel_id=msg.channel.id,
+        author_id=msg.author.id,
+        author_name=author_name,
+        new_text=prompt_content,
+        new_attachments=saved_attachments,
+        new_msg=msg,
+        is_group=False,
+        extra_queue=home_turn_queue,
+    ):
+        return
+
     # Active Steering Check in THIS channel/thread
     target_proc = channel_active_procs.get(msg.channel.id)
     if target_proc is not None and target_proc.returncode is None:
-        steering_channels.add(msg.channel.id)
-        try:
-            target_proc.send_signal(signal.SIGINT)
-        except Exception as se:
-            print(f"[Bridge] Warning sending SIGINT for steering in {msg.channel.id}: {se}")
+        already_steering = msg.channel.id in steering_channels
+        if not already_steering:
+            steering_channels.add(msg.channel.id)
+            try:
+                target_proc.send_signal(signal.SIGINT)
+            except Exception as se:
+                print(f"[Bridge] Warning sending SIGINT for steering in {msg.channel.id}: {se}")
 
         target_st_msg = channel_active_status_msgs.get(msg.channel.id) or (active_status_msg if msg.channel.id == TARGET_CHANNEL_ID else None)
         if target_st_msg and not is_thread_channel:
@@ -953,26 +1151,54 @@ async def handle_message(
             await msg.channel.typing()
         except Exception:
             pass
-        steer_prompt = (
-            f"[USER MID-TURN STEERING UPDATE]\n"
-            f"The user provided new instructions while you were in the middle of executing:\n"
-            f"\"{prompt_content}\"\n\n"
-            f"CRITICAL INSTRUCTIONS FOR REVISED TURN:\n"
-            f"1. Absorb this directive immediately.\n"
-            f"2. If this invalidates your prior plan or direction, abort redundant tool calls and pivot cleanly.\n"
-            f"3. Seamlessly incorporate this guidance into your response without restarting from scratch unless requested."
-        )
-        await home_turn_queue.put({
-            "prompt": steer_prompt,
-            "status_msg": None,
-            "reply_target": msg,
-            "attachments": saved_attachments,
-            "is_steer": True,
-            "mode": "home",
-            "channel_id": msg.channel.id,
-            "is_thread_task": is_thread_channel,
-            "queued_at": time.perf_counter(),
-        })
+        orig_prompt = channel_active_prompts.get(msg.channel.id)
+        if not orig_prompt:
+            try:
+                in_flight_data = get_in_flight()
+                if isinstance(in_flight_data, dict):
+                    orig_prompt = in_flight_data.get(str(msg.channel.id), {}).get("prompt")
+            except Exception:
+                pass
+
+        try:
+            steer_prompt = format_steering_prompt(
+                new_directive=prompt_content,
+                original_task=orig_prompt,
+                is_group=False,
+            )
+            await home_turn_queue.put({
+                "prompt": steer_prompt,
+                "raw_prompt": prompt_content,
+                "original_task": orig_prompt,
+                "status_msg": None,
+                "reply_target": msg,
+                "attachments": saved_attachments,
+                "is_steer": True,
+                "mode": "home",
+                "channel_id": msg.channel.id,
+                "author_id": msg.author.id,
+                "author_name": author_name,
+                "is_thread_task": is_thread_channel,
+                "queued_at": time.perf_counter(),
+            })
+        except Exception as steer_err:
+            print(f"[Bridge] Error formatting steering prompt: {steer_err}")
+            if not already_steering:
+                steering_channels.discard(msg.channel.id)
+            await home_turn_queue.put({
+                "prompt": prompt_content,
+                "raw_prompt": prompt_content,
+                "status_msg": None,
+                "reply_target": msg,
+                "attachments": saved_attachments,
+                "is_steer": False,
+                "mode": "home",
+                "channel_id": msg.channel.id,
+                "author_id": msg.author.id,
+                "author_name": author_name,
+                "is_thread_task": is_thread_channel,
+                "queued_at": time.perf_counter(),
+            })
         return
 
     try:
@@ -981,12 +1207,15 @@ async def handle_message(
         pass
     await home_turn_queue.put({
         "prompt": prompt_content,
+        "raw_prompt": prompt_content,
         "status_msg": None,
         "reply_target": msg,
         "attachments": saved_attachments,
         "is_steer": False,
         "mode": "home",
         "channel_id": msg.channel.id,
+        "author_id": msg.author.id,
+        "author_name": author_name,
         "is_thread_task": is_thread_channel,
         "queued_at": time.perf_counter(),
     })

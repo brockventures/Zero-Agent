@@ -2,7 +2,7 @@
 """
 Weekly Meal Planning Proposal & Calendar Sync
 Author: Zero
-Description: Selects a balanced 3-dinner rotation (Sunday, Tuesday, Thursday) from Mealie
+Description: Selects a balanced 3-dinner rotation (Tuesday, Thursday, Sunday) from Mealie
 adhering to household dietary guidelines (GF baseline, 100% grass-fed beef, oven/stovetop only,
 1 quick, 1 comfort/slow-cook, 1 kid-friendly staple), enforces a 21-day recency backoff,
 posts proposals to #shopping (<#1544955538033348618>), and synchronizes locked dinners to
@@ -36,7 +36,7 @@ except ImportError:
 
 _, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
-MEALIE_BASE = os.environ.get("MEALIE_BASE_URL", f"http://{HOST_2_IP}:9090")
+MEALIE_BASE = os.environ.get("MEALIE_BASE_URL", "https://mealie.brock.ventures")
 FAMILY_CALENDAR_ID = "family05249951047154432652@group.calendar.google.com"
 
 
@@ -143,28 +143,26 @@ def save_active_plan(plan: dict):
 
 
 def get_target_cooking_dates(ref_date: datetime | None = None) -> dict[str, datetime]:
-    """Calculates the upcoming Sunday, Tuesday, and Thursday cooking dates.
-    When run on Wednesday, targets the upcoming Sunday, following Tuesday, and following Thursday.
+    """Calculates the upcoming Tuesday, Thursday, and Sunday cooking dates.
+    When run on Sunday (or Monday), targets the upcoming Tuesday, following Thursday, and following Sunday.
     """
     if ref_date is None:
         ref_date = datetime.now(PT)
 
-    # Days ahead to Sunday (weekday 6)
+    # Days ahead to the upcoming Tuesday (weekday 1)
     # Python weekday: Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
-    days_to_sunday = (6 - ref_date.weekday()) % 7
-    if days_to_sunday == 0 and ref_date.hour >= 18:
-        days_to_sunday = 7
-    elif days_to_sunday == 0:
-        days_to_sunday = 0  # Today is Sunday before dinner
+    days_to_tuesday = (1 - ref_date.weekday()) % 7
+    if days_to_tuesday == 0 and ref_date.hour >= 18:
+        days_to_tuesday = 7
 
-    sunday = (ref_date + timedelta(days=days_to_sunday)).replace(hour=18, minute=0, second=0, microsecond=0)
-    tuesday = sunday + timedelta(days=2)
-    thursday = sunday + timedelta(days=4)
+    tuesday = (ref_date + timedelta(days=days_to_tuesday)).replace(hour=18, minute=0, second=0, microsecond=0)
+    thursday = tuesday + timedelta(days=2)
+    sunday = tuesday + timedelta(days=5)
 
     return {
-        "sunday": sunday,
         "tuesday": tuesday,
         "thursday": thursday,
+        "sunday": sunday,
     }
 
 
@@ -277,11 +275,11 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False) -> 
         active = load_active_plan()
         if active and active.get("status") == "proposed" and active.get("meals"):
             meals = active.get("meals", {})
-            sun_date = meals.get("sunday", {}).get("date")
-            target_sun = dates["sunday"].strftime("%Y-%m-%d")
-            if sun_date == target_sun:
+            tue_date = meals.get("tuesday", {}).get("date")
+            target_tue = dates["tuesday"].strftime("%Y-%m-%d")
+            if tue_date == target_tue:
                 all_valid_dinners = True
-                for slot_key in ("sunday", "tuesday", "thursday"):
+                for slot_key in ("tuesday", "thursday", "sunday"):
                     r = meals.get(slot_key, {}).get("recipe", {})
                     if not r or not is_dinner_recipe(r):
                         all_valid_dinners = False
@@ -298,31 +296,57 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False) -> 
     cutoff = (now - timedelta(days=21)).strftime("%Y-%m-%d")
     recent_slugs = {h.get("slug") for h in history if h.get("date", "") >= cutoff and h.get("slug")}
 
-    # Pick Sunday meal (Comfort / Batch / Serious Eats)
-    sunday_pool = filter_eligible_recipes(recipes, recent_slugs, "sunday")
-    sunday_pick = random.choice(sunday_pool) if sunday_pool else recipes[0]
-    selected_slugs = {sunday_pick.get("slug")}
-
     # Pick Tuesday meal (Quick / 30-min / Bowls)
-    tuesday_pool = [r for r in filter_eligible_recipes(recipes, recent_slugs, "tuesday") if r.get("slug") not in selected_slugs]
-    tuesday_pick = random.choice(tuesday_pool) if tuesday_pool else recipes[1]
-    selected_slugs.add(tuesday_pick.get("slug"))
+    tuesday_pool = filter_eligible_recipes(recipes, recent_slugs, "tuesday")
+    tuesday_pick = random.choice(tuesday_pool) if tuesday_pool else recipes[0]
+    selected_slugs = {tuesday_pick.get("slug")}
 
     # Pick Thursday meal (Kid-Friendly / Crowd Pleaser)
     thursday_pool = [r for r in filter_eligible_recipes(recipes, recent_slugs, "thursday") if r.get("slug") not in selected_slugs]
-    thursday_pick = random.choice(thursday_pool) if thursday_pool else recipes[2]
+    thursday_pick = random.choice(thursday_pool) if thursday_pool else recipes[1]
+    selected_slugs.add(thursday_pick.get("slug"))
+
+    # Pick Sunday meal (Comfort / Batch / Serious Eats)
+    sunday_pool = [r for r in filter_eligible_recipes(recipes, recent_slugs, "sunday") if r.get("slug") not in selected_slugs]
+    sunday_pick = random.choice(sunday_pool) if sunday_pool else recipes[2]
+
+    chef_note = ""
+    try:
+        from tools.llm_sidecar import call_sidecar_llm_json, get_sidecar_model
+        model_id = get_sidecar_model("weekly_meal_proposal", "gemini-4-argon-low")
+        def _pool_brief(pool):
+            return [{"slug": r.get("slug"), "name": r.get("name"), "tags": r.get("tags", [])[:4]} for r in pool[:10]]
+        meal_prompt = (
+            f"You are selecting a balanced 3-dinner family menu ({model_id}) for {dates['tuesday'].strftime('%b %d')} to {dates['sunday'].strftime('%b %d')}.\n"
+            "All candidates below are already verified Gluten-Free, oven/stovetop-only, and clear of the 21-day recency backoff.\n"
+            f"Tuesday Pool (Fast Weeknight): {json.dumps(_pool_brief(tuesday_pool))}\n"
+            f"Thursday Pool (Kid-Friendly Staple): {json.dumps(_pool_brief(thursday_pool))}\n"
+            f"Sunday Pool (Weekend Comfort): {json.dumps(_pool_brief(sunday_pool))}\n\n"
+            "Pick 1 distinct recipe slug for each day that creates great protein variety, seasonal fit, and ingredient synergy across Whole Foods shopping.\n"
+            "Respond ONLY with valid JSON:\n"
+            '{"tuesday_slug": "...", "thursday_slug": "...", "sunday_slug": "...", "chef_note": "1-sentence note on why this trio pairs well this week."}'
+        )
+        llm_choice = call_sidecar_llm_json("weekly_meal_proposal", meal_prompt, timeout=45)
+        if isinstance(llm_choice, dict):
+            by_slug = {r.get("slug"): r for r in recipes if r.get("slug")}
+            t_slug = llm_choice.get("tuesday_slug")
+            th_slug = llm_choice.get("thursday_slug")
+            s_slug = llm_choice.get("sunday_slug")
+            if t_slug in {r.get("slug") for r in tuesday_pool}:
+                tuesday_pick = by_slug[t_slug]
+            if th_slug in {r.get("slug") for r in thursday_pool} and th_slug != tuesday_pick.get("slug"):
+                thursday_pick = by_slug[th_slug]
+            if s_slug in {r.get("slug") for r in sunday_pool} and s_slug not in {tuesday_pick.get("slug"), thursday_pick.get("slug")}:
+                sunday_pick = by_slug[s_slug]
+            chef_note = str(llm_choice.get("chef_note") or "").strip()
+    except Exception:
+        pass
 
     plan = {
         "generated_at": now.strftime("%Y-%m-%d %I:%M %p PT"),
         "status": "proposed",
+        "chef_note": chef_note,
         "meals": {
-            "sunday": {
-                "day_name": "Sunday",
-                "date": dates["sunday"].strftime("%Y-%m-%d"),
-                "date_display": dates["sunday"].strftime("%a, %b %d"),
-                "slot_type": "Comfort Batch / Weekend Classic",
-                "recipe": sunday_pick,
-            },
             "tuesday": {
                 "day_name": "Tuesday",
                 "date": dates["tuesday"].strftime("%Y-%m-%d"),
@@ -337,6 +361,13 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False) -> 
                 "slot_type": "Kid-Friendly Family Staple",
                 "recipe": thursday_pick,
             },
+            "sunday": {
+                "day_name": "Sunday",
+                "date": dates["sunday"].strftime("%Y-%m-%d"),
+                "date_display": dates["sunday"].strftime("%a, %b %d"),
+                "slot_type": "Comfort Batch / Weekend Classic",
+                "recipe": sunday_pick,
+            },
         },
     }
 
@@ -346,39 +377,43 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False) -> 
 
 def format_proposal_markdown(plan: dict) -> str:
     meals = plan.get("meals", {})
-    sun = meals.get("sunday", {})
+    chef_note = plan.get("chef_note", "")
     tue = meals.get("tuesday", {})
     thu = meals.get("thursday", {})
+    sun = meals.get("sunday", {})
 
-    r_sun = sun.get("recipe", {})
     r_tue = tue.get("recipe", {})
     r_thu = thu.get("recipe", {})
+    r_sun = sun.get("recipe", {})
 
     def _fmt_meal(m_info, r):
         name = r.get("name", "Unknown Recipe")
         total_time = r.get("total_time") or "30 mins"
         tags_str = ", ".join(r.get("tags", [])[:3])
         desc = r.get("description", "")
-        if len(desc) > 120:
-            desc = desc[:117] + "..."
-        link = f"{MEALIE_BASE}/household/mealplan/planner/"
+        slug = r.get("slug", "")
+        link = f"{MEALIE_BASE}/g/home/r/{slug}" if slug else f"{MEALIE_BASE}/household/mealplan/planner/"
         return (
-            f"• **{m_info.get('date_display')}** ({m_info.get('slot_type')}):\n"
+            f"- **{m_info.get('date_display')}** ({m_info.get('slot_type')}):\n"
             f"  🍽️ **[{name}](<{link}>)** — ⏱️ {total_time} | _{tags_str}_\n"
             f"  _{desc}_"
         )
 
     lines = [
         "🥘 **Weekly Dinner Rotation Proposal (3 Meals)**",
-        f"_{sun.get('date_display')} – {thu.get('date_display')} | Sourced from Mealie Database_\n",
-        _fmt_meal(sun, r_sun),
-        "",
+        f"_{tue.get('date_display')} – {sun.get('date_display')} | Sourced from Mealie Database_\n",
         _fmt_meal(tue, r_tue),
         "",
         _fmt_meal(thu, r_thu),
-        "\n*Once locked in, these will push directly to the shared **Family** Google Calendar and stage ingredients into Thursday's 5:00 PM PT Whole Foods delivery cart.*",
-        "\n[CHOICES: Lock In Menu | Swap Sunday | Swap Tuesday | Swap Thursday]",
+        "",
+        _fmt_meal(sun, r_sun),
     ]
+    if chef_note:
+        lines.append(f"\n👨‍🍳 **Chef's Pairing Note (`gemini-3.8-flash-high`):** {chef_note}")
+    lines.extend([
+        "\n*Once locked in, these will push directly to the shared **Family** Google Calendar and stage ingredients into Monday's 5:00 PM PT Whole Foods delivery cart.*",
+        "\n[CHOICES: Lock In Menu | Swap Tuesday | Swap Thursday | Swap Sunday]",
+    ])
     return "\n".join(lines)
 
 
@@ -389,7 +424,7 @@ def lock_in_menu() -> tuple[bool, str]:
         return False, "No active proposed meal plan found to lock in."
 
     if plan.get("status") == "locked":
-        return True, "✅ **Weekly Dinner Menu is already locked in!**\nEvents are already present on Family Calendar and staged for Thursday Whole Foods delivery."
+        return True, "✅ **Weekly Dinner Menu is already locked in!**\nEvents are already present on Family Calendar and staged for Monday Whole Foods delivery."
 
     meals = plan.get("meals", {})
     history = load_history()
@@ -468,7 +503,7 @@ con.commit()
     report = [
         "✅ **Weekly Dinner Menu Officially Locked In!**",
         "\n".join(calendar_sync_results),
-        "\nIngredients are staged for Thursday 5:00 PM PT Whole Foods delivery cart compilation in <#1544955538033348618>.",
+        "\nIngredients are staged for Monday 5:00 PM PT Whole Foods delivery cart compilation in <#1544955538033348618>.",
     ]
     return True, "\n".join(report)
 

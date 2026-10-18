@@ -42,16 +42,21 @@ async def _run_sidecar_job_async(job_id: str, job_name: str, func, *args, **kwar
     return await asyncio.to_thread(run_sidecar_job, job_id, job_name, func, *args, **kwargs)
 
 
-async def _send_chunked_content(channel, content: str, choice_view=None, max_len: int = 1900):
-    """Defensively chunk text and send each piece, attaching choice_view to the final chunk."""
+async def _send_chunked_content(channel, content: str, choice_view=None, max_len: int = 1900, file_path: str | None = None):
+    """Defensively chunk text and send each piece, attaching choice_view and optional file_path to the final chunk."""
     chunks = chunk_text(content, max_len=max_len)
     for idx, chunk in enumerate(chunks):
         is_last = (idx == len(chunks) - 1)
         view = choice_view if is_last else None
-        if view:
-            await channel.send(chunk, view=view)
-        else:
-            await channel.send(chunk)
+        discord_file = None
+        if is_last and file_path and Path(file_path).exists():
+            discord_file = discord.File(str(file_path), filename=Path(file_path).name)
+        kwargs = {}
+        if view is not None:
+            kwargs["view"] = view
+        if discord_file is not None:
+            kwargs["file"] = discord_file
+        await channel.send(chunk, **kwargs)
 
 
 INTERNAL_SYSTEM_MAINTENANCE_NAMES = {
@@ -66,6 +71,13 @@ INTERNAL_SYSTEM_MAINTENANCE_NAMES = {
     "Bridge Liveness Watchdog",
     "Bridge Watchdog",
     "Plex Transcode Cleanup",
+    "Kalshi Weather Quant Paper Bot",
+    "kalshi_paper_bot",
+    "Multi-Venue Quant Paper Trading Sweep",
+    "Multi-Venue Quantitative Expansion Sweep",
+    "quant_daily_sweep",
+    "Kalshi Nightly Settlement & Quant Standup",
+    "kalshi_night_audit",
 }
 
 INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
@@ -74,7 +86,12 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "host1_backup",
     "host2_backup",
     "bridge_watchdog",
+    "pid_watchdog",
     "plex_cleanup",
+    "kalshi_paper_bot",
+    "quant_daily_sweep",
+    "quant_expansion_sweep",
+    "kalshi_night_audit",
 }
 
 
@@ -87,27 +104,24 @@ async def dispatch_scheduled_prompt(
     quick_choice_view_cls = None,
     button_choice_fn = None,
     channel_id: int | None = None,
+    job_id: str | None = None,
 ):
     """Inject a scheduled sidecar prompt into the message queue with anti-storm guard."""
     global LAST_SCHEDULED_DISPATCH
 
-    # Enforce 11 PM to 7 AM PT quiet window on all scheduled sidecars
-    now_pt = datetime.now(PT_TZ)
-    is_quiet_time = (now_pt.hour >= 23 or now_pt.hour < 7)
-    if is_quiet_time and job_name not in INTERNAL_SYSTEM_MAINTENANCE_NAMES:
-        print(f"[BridgeScheduler] Pausing sidecar dispatch for '{job_name}' (11 PM - 7 AM PT quiet hours active)")
-        return
 
     # Strictly isolate all Kalshi quant paper trading sidecars to #vault
-    if "kalshi" in job_name.lower() or "kalshi" in prompt.lower():
+    if (job_id and "kalshi" in job_id.lower()) or "kalshi" in job_name.lower() or "kalshi" in prompt.lower():
         channel_id = VAULT_CHANNEL_ID
 
     # Anti-storm guard: prevent any job from dispatching more than once per 5 minutes
     now_ts = time.time()
-    last_disp = LAST_SCHEDULED_DISPATCH.get(job_name, 0)
+    storm_key = job_id or job_name
+    last_disp = LAST_SCHEDULED_DISPATCH.get(storm_key, 0)
     if (now_ts - last_disp) < 300:
         print(f"[Scheduler] Anti-storm block: {job_name} attempted re-trigger within 300s (last: {now_ts - last_disp:.1f}s ago). Dropping.")
         return
+    LAST_SCHEDULED_DISPATCH[storm_key] = now_ts
     LAST_SCHEDULED_DISPATCH[job_name] = now_ts
 
     async def get_dest_channel(default_cid: int = TARGET_CHANNEL_ID):
@@ -120,15 +134,16 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Could not fetch channel {dest_id}: {e}")
             return None
 
-    if prompt == "[INTERNAL_SESSION_ROLLOVER]" or job_name in ("Session Rollover", "Daily Session Rollover"):
+    if job_id == "session_rollover" or prompt == "[INTERNAL_SESSION_ROLLOVER]" or job_name in ("Session Rollover", "Daily Session Rollover"):
         try:
             from tools.session_rollover import run_daily_session_rollover
-            ok, rep, details = run_daily_session_rollover(bot=bot, dry_run=False)
+            ok, rep, details = await _run_sidecar_job_async("session_rollover", "Daily Session Rollover", run_daily_session_rollover, bot=bot, dry_run=False)
             if not ok and bot:
                 ch = await get_dest_channel()
                 if ch:
                     await ch.send(rep)
-            print(f"[Scheduler] Executed daily multi-channel session rollover at 2:00 AM PT (ok={ok}, rolled_over={len(details.get('rolled_over', []))}).")
+            rolled_count = len(details.get("rolled_over", [])) if isinstance(details, dict) else 0
+            print(f"[Scheduler] Executed daily multi-channel session rollover at 2:00 AM PT (ok={ok}, rolled_over={rolled_count}).")
 
             # Proactively recycle and re-warm all persistent worker daemons overnight
             try:
@@ -335,6 +350,21 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Dockhand image check execution error: {e}")
         return
 
+    # Reddit fantasy baseball scanner: surface high-signal dilemma draft card to #zero-chat
+    if "reddit_fantasy" in prompt or "reddit_scan" in prompt or "Reddit Fantasy Baseball" in job_name:
+        try:
+            from tools.reddit_fantasy_scanner import run_reddit_fantasy_scanner
+            ok, out, _ = await _run_sidecar_job_async("reddit_fantasy_scanner", "Reddit Fantasy Baseball Scanner", run_reddit_fantasy_scanner)
+            if ok and out and not out.startswith("No new") and not out.startswith("Scanned active") and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print(f"[Scheduler] Reddit fantasy baseball scanner checked: {out}")
+        except Exception as e:
+            print(f"[Scheduler] Reddit fantasy scanner execution error: {e}")
+        return
+
     # Home Assistant stable update check
     if "ha_update_check.py" in prompt or job_name in ("Home Assistant Stable Update Check", "HA Update Check"):
         try:
@@ -360,6 +390,19 @@ async def dispatch_scheduled_prompt(
                     await ch.send(out)
         except Exception as e:
             print(f"[Scheduler] HA battery check execution error: {e}")
+        return
+
+    # Home Assistant statistical telemetry anomaly check: silent unless zombie or MAD outlier detected
+    if "ha_anomaly_detector.py" in prompt or job_name in ("Home Assistant Telemetry Anomaly Check", "HA Telemetry Anomaly Check"):
+        try:
+            from tools.sidecars import run_ha_anomaly_check
+            ok, out, _ = await _run_sidecar_job_async("ha_anomaly_check", "HA Telemetry Anomaly Check", lambda: run_ha_anomaly_check(quiet=True))
+            if (("Telemetry Anomaly Report" in out) or not ok) and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+        except Exception as e:
+            print(f"[Scheduler] HA anomaly check execution error: {e}")
         return
 
     # Synology storage & RAID health check: silent unless volume >85% or RAID degraded
@@ -526,6 +569,21 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Host 1 backup execution error: {e}")
         return
 
+    # PID & Process Headroom Watchdog: silent unless warning/critical
+    if "pid_watchdog" in prompt or job_name in ("PID & Process Headroom Watchdog", "PID Watchdog"):
+        try:
+            from tools.sidecars import run_pid_watchdog
+            ok, out, _ = await _run_sidecar_job_async("pid_watchdog", "PID & Process Headroom Watchdog", run_pid_watchdog)
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] PID watchdog checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] PID watchdog execution error: {e}")
+        return
+
     # Bridge Liveness Watchdog: silent unless error / degraded
     if "bridge_watchdog" in prompt or job_name in ("Bridge Liveness Watchdog", "Bridge Watchdog"):
         try:
@@ -542,10 +600,10 @@ async def dispatch_scheduled_prompt(
         return
 
     # Plex Weekly New Media Digest
-    if "plex_weekly_digest.py" in prompt or job_name == "Plex Weekly New Media Digest":
+    if job_id == "plex_weekly_digest" or "plex_weekly_digest.py" in prompt or job_name == "Plex Weekly New Media Digest":
         try:
-            res = await asyncio.to_thread(subprocess.run, ["python3", "/workspace/tools/plex_weekly_digest.py", "post", "--tag-all"], capture_output=True, text=True, timeout=60)
-            out = res.stdout.strip()
+            from tools.sidecars import run_plex_weekly_digest
+            ok, out, _ = await _run_sidecar_job_async("plex_weekly_digest", "Plex Weekly New Media Digest", run_plex_weekly_digest, post=True, tag_all=True)
             if out:
                 print(f"[Scheduler] Plex weekly digest executed: {out[:100]}")
         except Exception as e:
@@ -553,7 +611,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Weekly 3-Dinner Meal Proposal
-    if "meal_proposal" in prompt or "meal_planner" in prompt or job_name in ("Weekly 3-Dinner Meal Proposal", "Weekly Meal Proposal"):
+    if job_id == "weekly_meal_proposal" or "meal_proposal" in prompt or "meal_planner" in prompt or job_name in ("Weekly 3-Dinner Meal Proposal", "Weekly Meal Proposal"):
         try:
             from tools.sidecars import run_weekly_meal_proposal
             ok, out, _ = await _run_sidecar_job_async("weekly_meal_proposal", "Weekly 3-Dinner Meal Proposal", run_weekly_meal_proposal)
@@ -568,12 +626,28 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Weekly meal proposal execution error: {e}")
         return
 
-    # Option B Weekly Proactive Digest
-    if ("weekly_digest.py" in prompt and "plex_weekly_digest" not in prompt) or job_name in ("Option B Weekly Proactive Digest", "Weekly Proactive Digest"):
+    # Weekly Whole Foods Grocery Staging
+    if job_id == "weekly_grocery_staging" or "sidecars.py groceries" in prompt or "grocery_staging" in prompt or job_name in ("Weekly Whole Foods Grocery Staging", "Weekly Grocery Staging"):
         try:
-            res = await asyncio.to_thread(subprocess.run, ["python3", "/workspace/tools/weekly_digest.py"], capture_output=True, text=True, timeout=60)
-            out = res.stdout.strip()
-            if out and bot:
+            from tools.sidecars import run_weekly_grocery_staging
+            ok, out, _ = await _run_sidecar_job_async("weekly_grocery_staging", "Weekly Whole Foods Grocery Staging", run_weekly_grocery_staging)
+            if out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    await _send_chunked_content(ch, clean_content, choice_view)
+            else:
+                print("[Scheduler] Weekly grocery staging checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Weekly grocery staging execution error: {e}")
+        return
+
+    # Option B Weekly Proactive Digest
+    if job_id == "weekly_proactive_digest" or ("weekly_digest.py" in prompt and "plex_weekly_digest" not in prompt) or job_name in ("Option B Weekly Proactive Digest", "Weekly Proactive Digest"):
+        try:
+            from tools.sidecars import run_weekly_proactive_digest
+            ok, out, _ = await _run_sidecar_job_async("weekly_proactive_digest", "Option B Weekly Proactive Digest", run_weekly_proactive_digest)
+            if out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
                     for chunk in chunk_text(out):
@@ -584,17 +658,66 @@ async def dispatch_scheduled_prompt(
 
 
     # Crab Cavern Morning Topic Rotation
-    if "morning_dispatcher.py" in prompt or job_name in ("Crab Cavern Morning Topic Rotation", "Morning Topic Rotation"):
+    if job_id == "morning_topic_rotation" or "morning_dispatcher.py" in prompt or job_name in ("Crab Cavern Morning Topic Rotation", "Morning Topic Rotation"):
         try:
             from tools.morning_dispatcher import dispatch_morning_topic
-            res = await asyncio.to_thread(dispatch_morning_topic, dry_run=False)
+            ok, rep, extra = await _run_sidecar_job_async("morning_topic_rotation", "Crab Cavern Morning Topic Rotation", dispatch_morning_topic, dry_run=False)
+            res = extra if isinstance(extra, dict) else {}
             print(f"[Scheduler] Crab Cavern morning rotation dispatched: status={res.get('status')}, outbox_id={res.get('outbox_id')}")
         except Exception as e:
             print(f"[Scheduler] Crab Cavern morning rotation dispatch error: {e}")
         return
 
+    # Daily Gemini Quota Card: posts progress bar card to #zero-chat at 7:00 AM PT
+    if (
+        job_id == "daily_quota_card"
+        or "quota_card.py" in prompt
+        or ("sidecars.py quota" in prompt and "quota_poller" not in prompt)
+        or job_name in ("Daily Gemini Quota Card", "Daily Quota Card")
+    ):
+        try:
+            from tools.quota_card import run_quota_card
+            ok, out, _ = await _run_sidecar_job_async("daily_quota_card", "Daily Gemini Quota Card", run_quota_card)
+            if out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            print(f"[Scheduler] Daily Gemini quota card dispatched: ok={ok}")
+        except Exception as e:
+            print(f"[Scheduler] Daily Gemini quota card execution error: {e}")
+        return
+
+    # Daily Zero & Ivy Context Email Digest: sends and auto-archives to Gmail (silent unless error)
+    if job_id == "gemini_context_digest" or "gemini_context_digest.py" in prompt or "sidecars.py context_digest" in prompt or job_name in ("Daily Zero & Ivy Context Email Digest", "Gemini Context Digest"):
+        try:
+            from tools.gemini_context_digest import run_daily_context_digest
+            ok, out, _ = await _run_sidecar_job_async(
+                "gemini_context_digest",
+                "Daily Zero & Ivy Context Email Digest",
+                lambda: run_daily_context_digest(quiet=True),
+            )
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print(f"[Scheduler] Daily Zero & Ivy context email digest dispatched & archived: ok={ok}")
+        except Exception as e:
+            print(f"[Scheduler] Daily Zero & Ivy context email digest error: {e}")
+        return
+
+    # 10-Minute Quota Usage Poller: polls ground-truth quota fractions silently into SQLite
+    if job_id == "quota_poller" or "quota_poller.py" in prompt or "sidecars.py quota_poller" in prompt or job_name in ("10-Minute Quota Usage Poller", "Quota Usage Poller"):
+        try:
+            from tools.quota_poller import run_quota_poller
+            ok, out, _ = await _run_sidecar_job_async("quota_poller", "10-Minute Quota Usage Poller", run_quota_poller, quiet=True)
+            print(f"[Scheduler] 10-Minute quota poller sampled silently: ok={ok}")
+        except Exception as e:
+            print(f"[Scheduler] 10-Minute quota poller execution error: {e}")
+        return
+
     # Daily birthday reminder: silent execution unless someone has a birthday today
-    if "birthday_reminder.py" in prompt or job_name in ("Daily Birthday Reminder", "Birthday Reminder") or "sidecars.py birthdays" in prompt:
+    if job_id == "daily_birthday_reminder" or "birthday_reminder.py" in prompt or job_name in ("Daily Birthday Reminder", "Birthday Reminder") or "sidecars.py birthdays" in prompt:
         try:
             from tools.sidecars import run_birthday_reminders
             ok, out, extra = await _run_sidecar_job_async("daily_birthday_reminder", "Daily Birthday Reminder", run_birthday_reminders)
@@ -611,7 +734,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Weekly social & last seen review: silent execution unless qualifying events found
-    if "social_last_seen_review.py" in prompt or job_name in ("Weekly Social & Last Seen Review", "Weekly Social Review") or "sidecars.py social_review" in prompt:
+    if job_id == "weekly_social_last_seen_review" or "social_last_seen_review.py" in prompt or job_name in ("Weekly Social & Last Seen Review", "Weekly Social Review") or "sidecars.py social_review" in prompt:
         try:
             from tools.sidecars import run_social_last_seen_review
             ok, out, extra = await _run_sidecar_job_async("weekly_social_review", "Weekly Social & Last Seen Review", run_social_last_seen_review)
@@ -628,7 +751,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Monthly core friends reconnect reminder: silent execution unless unseen core friends found
-    if "core_friends_reminder.py" in prompt or job_name in ("Monthly Core Friends Social Planning Reminder", "Monthly Core Friends Social Reminder", "Core Friends Reminder") or "sidecars.py core_friends" in prompt:
+    if job_id == "monthly_core_friends_reconnect" or "core_friends_reminder.py" in prompt or job_name in ("Monthly Core Friends Social Planning Reminder", "Monthly Core Friends Social Reminder", "Core Friends Reminder") or "sidecars.py core_friends" in prompt:
         try:
             from tools.sidecars import run_core_friends_reminder
             ok, out, extra = await _run_sidecar_job_async("monthly_core_friends_reminder", "Monthly Core Friends Social Reminder", run_core_friends_reminder)
@@ -645,7 +768,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Market Sandbox Autonomous Daily Standup
-    if "market_standup.py" in prompt or job_name in ("Market Sandbox Autonomous Daily Standup", "Market Standup"):
+    if job_id == "market_standup" or "market_standup.py" in prompt or job_name in ("Market Sandbox Autonomous Daily Standup", "Market Standup"):
         try:
             from tools.market_standup import dispatch_market_standup
             ok, rep, extra = await _run_sidecar_job_async("market_standup", "Market Sandbox Autonomous Daily Standup", dispatch_market_standup, dry_run=False)
@@ -655,7 +778,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # AGORA Daily Steering Briefing
-    if "agora_steering.py" in prompt or job_name in ("AGORA Daily Steering Briefing", "AGORA Steering"):
+    if job_id == "agora_steering" or "agora_steering.py" in prompt or job_name in ("AGORA Daily Steering Briefing", "AGORA Steering"):
         try:
             from tools.agora_steering import dispatch_agora_steering
             ok, rep, extra = await _run_sidecar_job_async("agora_steering", "AGORA Daily Steering Briefing", dispatch_agora_steering, dry_run=False)
@@ -665,7 +788,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Agora Roguelike PM & Board Coordinator: silent execution unless board state changed (dispatches to #agora)
-    if "agora_roguelike_pm" in prompt or "agora_pm" in prompt or job_name in ("Agora Roguelike PM & Board Coordinator", "Agora Roguelike PM", "Agora Roguelike PM & Task Assignment"):
+    if job_id == "agora_roguelike_pm" or "agora_roguelike_pm" in prompt or "agora_pm" in prompt or job_name in ("Agora Roguelike PM & Board Coordinator", "Agora Roguelike PM", "Agora Roguelike PM & Task Assignment"):
         try:
             from tools.sidecars import run_agora_roguelike_pm
             dest_cid = channel_id or 1558202642663211169  # #agora
@@ -680,7 +803,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Agora Roguelike Engineering Execution: runs 3m after PM sidecar
-    if "agora_roguelike_engineer" in prompt or "agora_engineer" in prompt or job_name in ("Agora Roguelike Engineering Execution", "Agora Roguelike Engineer"):
+    if job_id == "agora_roguelike_engineer" or "agora_roguelike_engineer" in prompt or "agora_engineer" in prompt or job_name in ("Agora Roguelike Engineering Execution", "Agora Roguelike Engineer"):
         try:
             from tools.sidecars import run_agora_roguelike_engineer
             ok, rep, extra = await _run_sidecar_job_async(
@@ -698,7 +821,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Monthly Hardcoded Rule & Regex Audit
-    if "code_audit" in prompt or "hardcode_regex_audit" in prompt or job_name in ("Monthly Hardcoded Rule & Regex Audit", "Hardcode Regex Audit"):
+    if job_id == "monthly_hardcode_regex_audit" or "code_audit" in prompt or "hardcode_regex_audit" in prompt or job_name in ("Monthly Hardcoded Rule & Regex Audit", "Hardcode Regex Audit"):
         try:
             from tools.sidecars import run_hardcode_regex_audit
             ok, rep, _ = await _run_sidecar_job_async("monthly_hardcode_regex_audit", "Monthly Hardcoded Rule & Regex Audit", run_hardcode_regex_audit)
@@ -712,7 +835,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Actual Budget automated daily bank sync: silent execution unless error (alerts to #finances)
-    if "actual_sync" in prompt or "actual_bank_sync" in prompt or job_name in ("Actual Budget Daily Bank Sync", "Actual Budget Bank Sync"):
+    if job_id == "actual_bank_sync" or "actual_sync" in prompt or "actual_bank_sync" in prompt or job_name in ("Actual Budget Daily Bank Sync", "Actual Budget Bank Sync"):
         try:
             from tools.sidecars import run_actual_bank_sync
             ok, rep, extra = await _run_sidecar_job_async("actual_bank_sync", "Actual Budget Daily Bank Sync", run_actual_bank_sync)
@@ -730,8 +853,80 @@ async def dispatch_scheduled_prompt(
                     await ch.send(f"⚠️ **Actual Budget Sync Error**: {e}")
         return
 
+    # Kalshi Paper Trading Evening Review & Model Sync (sole daily consolidated Discord update to #vault)
+    if job_id == "kalshi_evening_review" or "sidecars.py kalshi_evening" in prompt or "sidecars.py kalshi_review" in prompt or job_name == "Kalshi Paper Trading Evening Review & Model Sync":
+        try:
+            from tools.sidecars import run_kalshi_performance_review
+            ok, rep, extra = await _run_sidecar_job_async(
+                "kalshi_evening_review",
+                "Kalshi Paper Trading Evening Review & Model Sync",
+                lambda: run_kalshi_performance_review(phase="evening"),
+            )
+            chart_path = extra.get("chart_path") if isinstance(extra, dict) else "/workspace/data/quant_equity_chart.png"
+            if rep and rep.strip() and bot:
+                ch = await get_dest_channel(default_cid=VAULT_CHANNEL_ID)
+                if ch:
+                    await _send_chunked_content(ch, rep, file_path=chart_path)
+            print(f"[Scheduler] Kalshi evening review completed: ok={ok}")
+        except Exception as e:
+            print(f"[Scheduler] Kalshi evening review execution error: {e}")
+        return
+
+    # Kalshi Nightly Settlement & Quant Standup (silent background settlement & recalibration; alerts #vault only on error)
+    if job_id == "kalshi_night_audit" or "sidecars.py kalshi_night" in prompt or "sidecars.py kalshi_audit" in prompt or job_name == "Kalshi Nightly Settlement & Quant Standup":
+        try:
+            from tools.sidecars import run_kalshi_performance_review
+            ok, rep, _ = await _run_sidecar_job_async(
+                "kalshi_night_audit",
+                "Kalshi Nightly Settlement & Quant Standup",
+                lambda: run_kalshi_performance_review(phase="night"),
+            )
+            if not ok and rep and rep.strip() and bot:
+                ch = await get_dest_channel(default_cid=VAULT_CHANNEL_ID)
+                if ch:
+                    await _send_chunked_content(ch, f"⚠️ **Kalshi Night Audit Error:**\n{rep}")
+            else:
+                print(f"[Scheduler] Kalshi night audit completed: ok={ok} (silent background).")
+        except Exception as e:
+            print(f"[Scheduler] Kalshi night audit execution error: {e}")
+        return
+
+    # Kalshi Weather Quant Paper Bot (silent morning trade execution; alerts #vault only on error)
+    if job_id == "kalshi_paper_bot" or prompt.strip().endswith("sidecars.py kalshi") or "sidecars.py kalshi_bot" in prompt or job_name in ("Kalshi Weather Quant Paper Bot", "kalshi_paper_bot"):
+        try:
+            from tools.sidecars import run_kalshi_paper_bot
+            ok, rep, _ = await _run_sidecar_job_async("kalshi_paper_bot", "Kalshi Weather Quant Paper Bot", run_kalshi_paper_bot)
+            if not ok and rep and rep.strip() and bot:
+                ch = await get_dest_channel(default_cid=VAULT_CHANNEL_ID)
+                if ch:
+                    await _send_chunked_content(ch, f"⚠️ **Kalshi Morning Scan Error:**\n{rep}")
+            else:
+                print(f"[Scheduler] Kalshi paper bot completed: ok={ok} (silent background).")
+        except Exception as e:
+            print(f"[Scheduler] Kalshi paper bot execution error: {e}")
+        return
+
+    # Multi-Venue Quant Paper Trading Sweep (silent morning 4-track sweep; alerts #vault only on error)
+    if job_id in ("quant_daily_sweep", "quant_expansion_sweep") or "sidecars.py quant" in prompt or job_name in ("Multi-Venue Quant Paper Trading Sweep", "Multi-Venue Quantitative Expansion Sweep"):
+        try:
+            from tools.sidecars import run_quant_expansion_sidecar
+            ok, rep, _ = await _run_sidecar_job_async(
+                "quant_expansion_sweep",
+                "Multi-Venue Quantitative Expansion Sweep",
+                lambda: run_quant_expansion_sidecar("all"),
+            )
+            if not ok and rep and rep.strip() and bot:
+                ch = await get_dest_channel(default_cid=VAULT_CHANNEL_ID)
+                if ch:
+                    await _send_chunked_content(ch, f"⚠️ **Quant Daily Sweep Error:**\n{rep}")
+            else:
+                print(f"[Scheduler] Quant daily sweep completed: ok={ok} (silent background).")
+        except Exception as e:
+            print(f"[Scheduler] Quant daily sweep execution error: {e}")
+        return
+
     # Monthly Cash Sweep Policy Monitor
-    if "cash_sweep" in prompt or ("sweep" in prompt and "sidecars.py" in prompt) or job_name == "Monthly Cash Sweep Policy Monitor":
+    if job_id == "cash_sweep_monitor" or "cash_sweep" in prompt or "sidecars.py sweep" in prompt or job_name == "Monthly Cash Sweep Policy Monitor":
         try:
             from tools.sidecars import run_cash_sweep_monitor
             ok, rep, extra = await _run_sidecar_job_async("cash_sweep_monitor", "Monthly Cash Sweep Policy Monitor", run_cash_sweep_monitor, post=True)
@@ -741,7 +936,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Monthly Financial Model Variance Digest
-    if "variance_digest" in prompt or ("variance" in prompt and "sidecars.py" in prompt) or job_name == "Monthly Financial Model Variance Digest":
+    if job_id == "monthly_variance_digest" or "variance_digest" in prompt or "sidecars.py variance" in prompt or job_name == "Monthly Financial Model Variance Digest":
         try:
             from tools.sidecars import run_model_variance_digest
             ok, rep, extra = await _run_sidecar_job_async("monthly_variance_digest", "Monthly Financial Model Variance Digest", run_model_variance_digest, post=True)
@@ -751,7 +946,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Daily Token Budget Watchdog
-    if "token_budget" in prompt or "token_budget_watchdog" in prompt or job_name == "Daily Token Budget Watchdog":
+    if job_id == "token_budget_watchdog" or "token_budget" in prompt or "token_budget_watchdog" in prompt or job_name == "Daily Token Budget Watchdog":
         try:
             from tools.sidecars import run_token_budget_watchdog
             ok, rep, extra = await _run_sidecar_job_async("token_budget_watchdog", "Daily Token Budget Watchdog", run_token_budget_watchdog, dispatch=True)
@@ -776,7 +971,8 @@ async def dispatch_scheduled_prompt(
             "attachments": [],
             "is_steer": False,
             "mode": mode,
-            "channel_id": target_cid
+            "channel_id": target_cid,
+            "model_override": job.get("model_override") or "gemini-3.8-flash-low",
         })
 
 
@@ -792,8 +988,6 @@ def should_run_job(job: dict, now_ts: float) -> tuple[bool, str]:
         return False, "disabled"
 
     quiet = job.get("quiet_hours")
-    if quiet is None and job.get("id") not in INTERNAL_SYSTEM_MAINTENANCE_JOBS:
-        quiet = [23, 7]  # Default 11 PM - 7 AM PT pause for all sidecars
 
     if quiet and len(quiet) == 2:
         start_h, end_h = quiet
@@ -878,13 +1072,16 @@ class BridgeScheduler:
         self._heartbeat_task = None
         self._active_job_tasks = set()
 
-    async def _safe_dispatch(self, prompt: str, name: str, cid: int | None):
+    async def _safe_dispatch(self, prompt: str, name: str, cid: int | None, job_id: str | None = None):
         """Safely execute a single scheduled job dispatch in a decoupled background task."""
         try:
             try:
-                await self.dispatch_fn(prompt, job_name=name, channel_id=cid)
+                await self.dispatch_fn(prompt, job_name=name, channel_id=cid, job_id=job_id)
             except TypeError:
-                await self.dispatch_fn(prompt, job_name=name)
+                try:
+                    await self.dispatch_fn(prompt, job_name=name, channel_id=cid)
+                except TypeError:
+                    await self.dispatch_fn(prompt, job_name=name)
         except asyncio.CancelledError:
             pass
         except Exception as de:
@@ -924,7 +1121,7 @@ class BridgeScheduler:
                         j["last_run_ts"] = now_ts
                         j["last_run_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
                         print(f"{prefix} Triggering {j['name']} ({reason}, next: {j['next_run_ts']})")
-                        jobs_to_dispatch.append((j["prompt"], j["name"], j.get("channel_id")))
+                        jobs_to_dispatch.append((j["prompt"], j["name"], j.get("channel_id"), j.get("id")))
                     else:
                         print(f"{prefix} Skipping {j['name']} ({reason}, advanced next to: {j['next_run_ts']})")
 
@@ -938,7 +1135,8 @@ class BridgeScheduler:
             for item in jobs_to_dispatch:
                 prompt, name = item[0], item[1]
                 cid = item[2] if len(item) > 2 else None
-                task = asyncio.create_task(self._safe_dispatch(prompt, name, cid))
+                jid = item[3] if len(item) > 3 else None
+                task = asyncio.create_task(self._safe_dispatch(prompt, name, cid, job_id=jid))
                 self._active_job_tasks.add(task)
                 task.add_done_callback(self._active_job_tasks.discard)
 

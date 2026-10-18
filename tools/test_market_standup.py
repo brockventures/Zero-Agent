@@ -168,6 +168,28 @@ class TestMarketStandup(unittest.TestCase):
         self.assertIn("- Issue #58: CircuitBreakerEngine.get_vwap() falls back to unscoped last_price *(agent:zero, priority:p1)*", msg)
         self.assertIn("- Issue #39: Ops: Vercel Edge & Railway Backend Auto-Deploy Pipeline Sync *(agent:zero)*", msg)
 
+    def test_synthesize_standing_agenda_clean_board_invariant(self):
+        """Verify synthesize_standing_agenda returns clean zero-workstream status when board is empty."""
+        from tools.market_standup import synthesize_standing_agenda
+        state = {"open_prs": [], "open_issues": [], "recent_commits": []}
+        agenda = synthesize_standing_agenda(state, chat_transcript="Aerial: working on task #54\nAmos: balance pass", staged_items=[])
+        self.assertIn("Task board is clean with 0 open issues", agenda)
+        self.assertIn("no active blockers", agenda)
+        self.assertNotIn("task #54", agenda.lower())
+
+    def test_validate_and_prune_staged_items(self):
+        """Verify validate_and_prune_staged_items drops closed tasks against open_issues."""
+        from tools.market_standup import validate_and_prune_staged_items
+        from pathlib import Path
+        raw_items = [
+            {"topic": "Closed Task", "task_id": 54, "details": "Old execution loop"},
+            {"topic": "Open Task", "task_id": 99, "details": "Active issue"}
+        ]
+        state = {"open_issues": [{"number": 99, "title": "Active issue"}]}
+        pruned = validate_and_prune_staged_items(raw_items, state, {"items": raw_items}, Path("/nonexistent/file.json"))
+        self.assertEqual(len(pruned), 1)
+        self.assertEqual(pruned[0]["task_id"], 99)
+
 
 if __name__ == "__main__":
     unittest.main()

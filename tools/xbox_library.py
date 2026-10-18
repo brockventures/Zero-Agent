@@ -3,14 +3,14 @@
 
 Fetches complete Xbox game library, achievements, and Gamerscore stats via OpenXBL API.
 Saves raw normalized database to /workspace/data/xbox_games.json.
-Generates structured gaming profile for /workspace/memory/media_gaming_xbox_profile.md.
+Generates structured gaming profile for /workspace/memory/private/media_gaming_xbox_profile.md.
 """
 
 import json
 import os
 import sys
-import urllib.request
 import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -19,7 +19,8 @@ PT = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path("/workspace/data")
 CREDENTIALS_FILE = DATA_DIR / "xbl_credentials.json"
 GAMES_JSON = DATA_DIR / "xbox_games.json"
-PROFILE_MD = Path("/workspace/memory/media_gaming_xbox_profile.md")
+PROFILE_MD = Path("/workspace/memory/private/media_gaming_xbox_profile.md")
+LEGACY_PROFILE_MD = Path("/workspace/memory/media_gaming_xbox_profile.md")
 PROFILE_MD_LINK = Path("/workspace/.agents/memory/media_gaming_xbox_profile.md")
 
 DEFAULT_HEADERS = {
@@ -54,7 +55,6 @@ def xbl_get(endpoint: str, api_key: str) -> dict:
 
 
 def fetch_xbox_library(api_key: str) -> tuple[dict, list[dict]]:
-    # 1. Account info
     acc_data = xbl_get("/account", api_key)
     profile_users = acc_data.get("content", {}).get("profileUsers", [{}])
     profile_user = profile_users[0] if profile_users else {}
@@ -70,7 +70,6 @@ def fetch_xbox_library(api_key: str) -> tuple[dict, list[dict]]:
         "avatar_url": settings.get("GameDisplayPicRaw", ""),
     }
 
-    # 2. Achievements / Title history
     ach_data = xbl_get("/achievements", api_key)
     titles = ach_data.get("content", {}).get("titles", [])
 
@@ -83,7 +82,6 @@ def generate_profile_markdown(account_info: dict, titles: list[dict]) -> str:
     total_g = account_info.get("gamerscore", "0")
     total_titles = len(titles)
 
-    # Compute stats
     device_counts = {}
     completed_games = []
     in_progress = []
@@ -119,13 +117,17 @@ def generate_profile_markdown(account_info: dict, titles: list[dict]) -> str:
             else:
                 in_progress.append(game_summary)
 
-    # Sort started games by earned gamerscore descending
     started_games.sort(key=lambda x: x["cur_g"], reverse=True)
     in_progress.sort(key=lambda x: x["cur_g"], reverse=True)
+    recent_xbox = sorted(
+        [g for g in started_games if g.get("last_played")],
+        key=lambda x: str(x.get("last_played") or ""),
+        reverse=True,
+    )
 
     md = []
-    md.append(f"# Ryan Brock: Xbox Gaming Profile & Telemetry")
-    md.append(f"*Ingested on {now_str} via OpenXBL API (`Gamertag: {gt}`, `XUID: {account_info.get('xuid')}`).*\n")
+    md.append("# Ryan Brock: Xbox Gaming Profile & Telemetry")
+    md.append(f"*Synced on {now_str} via OpenXBL API (`Gamertag: {gt}`, `XUID: {account_info.get('xuid')}`).*\n")
     md.append("---\n")
 
     md.append("## 1. High-Level Gaming Telemetry")
@@ -134,17 +136,23 @@ def generate_profile_markdown(account_info: dict, titles: list[dict]) -> str:
     md.append(f"- **Total Catalog Titles:** **{total_titles} games**")
     md.append(f"- **Active Played Titles (Earned Gamerscore > 0):** {len(started_games)} games")
     md.append(f"- **100% Completed Titles:** {len(completed_games)} games")
-    
+
     dev_str = ", ".join(f"**{k}** ({v})" for k, v in sorted(device_counts.items(), key=lambda x: x[1], reverse=True))
     md.append(f"- **Platform Footprint:** {dev_str}\n")
     md.append("---\n")
 
+    if recent_xbox:
+        md.append("## 1B. Most Recently Played on Xbox / Game Pass")
+        for g in recent_xbox[:10]:
+            lp = str(g["last_played"])[:10]
+            devs_label = "/".join(g["devices"])
+            md.append(f"- **{g['name']}** (`{devs_label}`) — **{g['cur_g']:,}** / {g['max_g']:,} G ({g['progress']}%, Last played: {lp})")
+        md.append("\n---\n")
+
     md.append("## 2. Top Games by Gamerscore (Highest Investment)")
-    md.append("| Game | Platform(s) | Gamerscore | Progress |")
-    md.append("| :--- | :--- | :--- | :--- |")
     for g in started_games[:25]:
         devs_label = "/".join(g["devices"])
-        md.append(f"| **{g['name']}** | `{devs_label}` | **{g['cur_g']:,}** / {g['max_g']:,} G | {g['progress']}% |")
+        md.append(f"- **{g['name']}** (`{devs_label}`): **{g['cur_g']:,}** / {g['max_g']:,} G ({g['progress']}%)")
     md.append("\n---\n")
 
     if completed_games:
@@ -162,46 +170,41 @@ def generate_profile_markdown(account_info: dict, titles: list[dict]) -> str:
     return "\n".join(md) + "\n"
 
 
-def main(force_refresh=False):
+def main(force_refresh=True):
     key = load_api_key()
     if not key:
         print("[Xbox] Error: No API key found in xbl_credentials.json or environment.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[Xbox] Authenticating with OpenXBL API...")
+    print("[Xbox] Authenticating with OpenXBL API...")
     account_info, titles = fetch_xbox_library(key)
-    print(f"[Xbox] Authenticated as {account_info.get('gamertag')} (Gamerscore: {account_info.get('gamerscore')} G).")
-    print(f"[Xbox] Ingested {len(titles)} titles.")
+    print(f"[Xbox] Authenticated as {account_info.get('gamertag')} (Gamerscore: {account_info.get('gamerscore')} G, {len(titles)} titles).")
 
-    # Save JSON database
     payload = {
         "account": account_info,
         "fetched_at": datetime.now(PT).isoformat(),
         "total_titles": len(titles),
         "titles": titles,
     }
+    GAMES_JSON.parent.mkdir(parents=True, exist_ok=True)
     with open(GAMES_JSON, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     print(f"[Xbox] Saved raw database to {GAMES_JSON}")
 
-    # Generate Profile Markdown
     md_content = generate_profile_markdown(account_info, titles)
     PROFILE_MD.parent.mkdir(parents=True, exist_ok=True)
     with open(PROFILE_MD, "w", encoding="utf-8") as f:
         f.write(md_content)
-    print(f"[Xbox] Generated profile document at {PROFILE_MD}")
-
-    # Symlink to .agents if present
-    if PROFILE_MD_LINK.parent.exists():
+    for extra in (LEGACY_PROFILE_MD, PROFILE_MD_LINK):
         try:
-            if not PROFILE_MD_LINK.exists() and not PROFILE_MD_LINK.is_symlink():
-                PROFILE_MD_LINK.symlink_to(PROFILE_MD)
+            if extra.parent.exists():
+                with open(extra, "w", encoding="utf-8") as f:
+                    f.write(md_content)
         except Exception:
             pass
-
+    print(f"[Xbox] Generated profile document at {PROFILE_MD}")
     return account_info, titles
 
 
 if __name__ == "__main__":
-    force = "--force" in sys.argv
-    main(force_refresh=force)
+    main(force_refresh=True)

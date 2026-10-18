@@ -65,21 +65,10 @@ print(json.dumps([{'id': r[0], 'slug': r[1], 'name': r[2], 'org_url': r[3]} for 
     return []
 
 def search_recipe_image(query, serpapi_key):
-    params = {
-        "engine": "google_images",
-        "q": query,
-        "api_key": serpapi_key,
-        "num": 5
-    }
-    url = "https://serpapi.com/search.json?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "Zero/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-            return data.get("images_results", [])
-    except Exception as e:
-        print(f"[ImageBackfill] SerpAPI search failed for '{query}': {e}", file=sys.stderr)
-        return []
+    # SerpApi is decommissioned for image backfill to protect the 250-query monthly quota.
+    # Image search is routed to direct PDF card extraction or free web search.
+    print(f"[ImageBackfill] SerpApi disabled for image scraping: {query}", file=sys.stderr)
+    return []
 
 def extract_hero_from_pdf(pdf_url):
     if not fitz:

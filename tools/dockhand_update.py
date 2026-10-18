@@ -73,9 +73,10 @@ def perform_upgrade():
     print("1. Upgrading Host1 (.82):")
     # WAL-safe backup
     print("   • Backing up SQLite DB (WAL-safe)...")
-    backup_dir = os.environ.get('DOCKER_BACKUP_DIR', '/data/backups')
-    appdata_dir = os.environ.get('DOCKER_APPDATA_DIR', '/docker/appdata')
-    support_dir = os.environ.get('DOCKER_SUPPORT_DIR', '/docker/support/dockhand')
+    backup_dir = os.environ.get('DOCKER_BACKUP_DIR', os.path.join('/volume1', 'data', 'backups'))
+    appdata_dir = os.environ.get('DOCKER_APPDATA_DIR', os.path.join('/volume1', 'docker', 'appdata'))
+    support_dir = os.environ.get('DOCKER_SUPPORT_DIR', os.path.join('/volume1', 'docker', 'support', 'dockhand'))
+    support_compose_dir = os.environ.get('DOCKER_SUPPORT_COMPOSE_DIR', os.path.join('/volume1', 'docker', 'support'))
 
     bak_82 = f"{backup_dir}/dockhand/dockhand.db.bak-{ts}"
     get_remote_out(SSH_82, f"mkdir -p '{backup_dir}/dockhand' && sqlite3 '{appdata_dir}/dockhand/db/dockhand.db' \".backup '{bak_82}'\"")
@@ -108,7 +109,7 @@ def perform_upgrade():
         print("   ⚠️ Backup file verification failed, proceeding with caution...")
 
     print("   • Pulling new image & recreating container...")
-    get_remote_out(SSH_84, "cd /docker/support && docker compose pull dockhand && docker compose up -d dockhand")
+    get_remote_out(SSH_84, f"cd '{support_compose_dir}' && docker compose pull dockhand && docker compose up -d dockhand")
     status_84 = ""
     for _ in range(10):
         time.sleep(2)

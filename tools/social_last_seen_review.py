@@ -401,6 +401,45 @@ def identify_social_updates(days: int = 7) -> list[dict]:
 
     # Sort proposals by proposed_last_seen descending
     proposed_updates.sort(key=lambda x: x["proposed_last_seen"], reverse=True)
+
+    # ---------------------------------------------------------
+    # 4. LLM Semantic Catch-Up Verification (Gemini 4 Argon Low)
+    # ---------------------------------------------------------
+    if proposed_updates:
+        try:
+            from tools.llm_sidecar import call_sidecar_llm_json, get_sidecar_model
+            model_id = get_sidecar_model("weekly_social_review", "gemini-4-argon-low")
+            prompt = (
+                f"You are filtering candidate 'Last Seen' social tracker updates ({model_id}).\n"
+                "Evaluate each person's candidate calendar events and SMS snippets below.\n"
+                "Rules:\n"
+                "- APPROVE (`keep: true`) if the interaction reflects a real social gathering, hangout, dinner, visit, or meaningful personal catch-up.\n"
+                "- REJECT (`keep: false`) if the interaction is purely automated noise, a 1-word logistics ping, or a cancelled event.\n"
+                "- Provide a clean, human-readable `refined_summary` (under 12 words) for approved entries.\n\n"
+                f"Candidates:\n{json.dumps(proposed_updates, indent=2, default=str)}\n\n"
+                "Respond ONLY with valid JSON:\n"
+                '{"decisions": [{"name": "Person Name", "keep": true, "refined_summary": "..."}]}'
+            )
+            llm_res = call_sidecar_llm_json("weekly_social_review", prompt, timeout=60)
+            if isinstance(llm_res, dict) and isinstance(llm_res.get("decisions"), list):
+                decision_map = {
+                    str(d.get("name", "")).strip(): d
+                    for d in llm_res["decisions"]
+                    if isinstance(d, dict) and d.get("name")
+                }
+                filtered = []
+                for item in proposed_updates:
+                    d = decision_map.get(item["name"])
+                    if d is not None:
+                        if not d.get("keep", True):
+                            continue
+                        if d.get("refined_summary"):
+                            item["event_summary"] = str(d["refined_summary"]).strip()
+                    filtered.append(item)
+                proposed_updates = filtered
+        except Exception as e:
+            print(f"[SocialReview] LLM filter fallback: {e}", file=sys.stderr)
+
     return proposed_updates
 
 def format_review_message(updates: list[dict]) -> tuple[bool, str]:

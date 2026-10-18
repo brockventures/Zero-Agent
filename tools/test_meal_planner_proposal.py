@@ -106,6 +106,18 @@ class TestMealPlannerDinnerFilter(unittest.TestCase):
 
 
 class TestMealPlanGenerationAndSwap(unittest.TestCase):
+    def setUp(self):
+        import tempfile, os
+        self.test_dir = tempfile.mkdtemp()
+        self.temp_plan = os.path.join(self.test_dir, "test_active_plan.json")
+        self.patcher = patch("tools.meal_planner_proposal.ACTIVE_PLAN_FILE", self.temp_plan)
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+        import shutil
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
     def test_proposal_structure(self):
         plan = generate_proposal(force=False)
         self.assertIn("meals", plan)

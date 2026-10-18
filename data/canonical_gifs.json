@@ -110,22 +110,21 @@
     "franchise": "curb_your_enthusiasm",
     "character": "Larry David",
     "vibes": [
-      "suspicious",
-      "inspecting",
       "skeptical",
-      "staredown",
-      "scrutiny"
+      "squint",
+      "interrogation",
+      "distrust",
+      "staredown"
     ],
     "tags": [
-      "suspicious",
-      "inspecting",
-      "skeptical",
-      "staredown",
-      "eyeball_test",
       "larry_david",
-      "curb_your_enthusiasm"
+      "curb_your_enthusiasm",
+      "staredown",
+      "suspicious",
+      "squint",
+      "eyeball_test"
     ],
-    "situation": "Suspicious PRs, inspecting flaky tests, verifying questionable assertions."
+    "situation": "Strictly for active suspicion of human deceit, caught red-handed in a lie, or intense doubt during an interrogation. Never for routine code inspection, verification, or affirmative acknowledgments."
   },
   {
     "id": "curb_larry_pretty_good",
@@ -220,29 +219,6 @@
       "succession"
     ],
     "situation": "Dismissing ridiculous upstream vendor spam, closing invalid issues, or harsh shut downs."
-  },
-  {
-    "id": "succession_kendall_headphones",
-    "title": "Kendall Roy \u2014 Dead-Eyed Headphones Focus",
-    "url": "https://tenor.com/view/kendall-headphones-succession-listening-focus-gif-11728148090525350288",
-    "franchise": "succession",
-    "character": "Kendall Roy",
-    "vibes": [
-      "focus",
-      "headphones",
-      "locked_in",
-      "zone",
-      "cold"
-    ],
-    "tags": [
-      "locked_in",
-      "focus",
-      "headphones",
-      "in_the_zone",
-      "kendall_roy",
-      "succession"
-    ],
-    "situation": "Locking in for complex deep refactors, blocking out distractions, pure execution mode."
   },
   {
     "id": "parks_rec_ron_nod",
@@ -647,21 +623,19 @@
     "character": "Raymond Holt",
     "vibes": [
       "vindication",
-      "triumph",
       "proven_right",
       "told_you_so",
-      "victory"
+      "skepticism_refuted"
     ],
     "tags": [
       "vindication",
-      "triumph",
       "proven_right",
       "told_you_so",
       "captain_holt",
       "andre_braugher",
       "brooklyn_nine_nine"
     ],
-    "situation": "Contrarian architectural bet proven 100% right, mic-drop validation after an elusive bug hunt."
+    "situation": "Strictly when an unpopular, contested, or doubted architectural bet is proven 100% right against active skepticism. Never use for routine task execution, uncontested fixes, or general success."
   },
   {
     "id": "seinfeld_costanza_high_note",
@@ -886,31 +860,6 @@
       "eating_cereal"
     ],
     "situation": "Complete indifference to external vendor outages, cloud platforms melting down while our local stack hums along, or avoidable self-inflicted user errors."
-  },
-  {
-    "id": "nfy_nathan_deadpan_nod",
-    "title": "Nathan Fielder \u2014 Agonizing Deadpan Nod",
-    "url": "https://tenor.com/view/nfy-gif-22656064",
-    "franchise": "nathan_for_you",
-    "character": "Nathan Fielder",
-    "vibes": [
-      "deadpan",
-      "nod",
-      "awkward_silence",
-      "stoic",
-      "agonizing_pause",
-      "cringe"
-    ],
-    "tags": [
-      "nathan_for_you",
-      "nathan_fielder",
-      "deadpan",
-      "nod",
-      "awkward",
-      "silence",
-      "stoic"
-    ],
-    "situation": "Awkward pauses, agonizing silence after a questionable architecture proposal or weird bug disclosure, or deadpan acknowledgement of reality."
   },
   {
     "id": "ad_michael_bluth_dead_dove",

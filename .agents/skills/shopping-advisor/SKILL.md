@@ -30,7 +30,7 @@ This skill orchestrates end-to-end product research across three simultaneous in
 When handling evaluative product requests (*"best X"*, *"what should I buy for Y"*), execute three tracks concurrently:
 
 * **Pillar 1: Community Consensus (Directly invokes [`reddit-research`](file:///workspace/.agents/skills/reddit-research/SKILL.md))**:
-  - Run [`/workspace/tools/reddit_extractor.py`](file:///workspace/tools/reddit_extractor.py) or use `gemini-3.5-flash-low` with search grounding.
+  - Run [`/workspace/tools/reddit_extractor.py`](file:///workspace/tools/reddit_extractor.py) or use `gemini-3.8-flash-low` with search grounding.
   - Target subreddits like `r/BuyItForLife`, `r/espresso`, `r/HomeImprovement`, or domain-specific hubs.
   - Extracts true long-term durability, motor/gear failures, customer support ease, and repairability.
 

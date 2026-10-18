@@ -3,11 +3,13 @@
 morning_dispatcher.py - Crab Cavern Centralized Morning Topic Rotation Dispatcher
 
 Runs daily at 09:30 AM PT via BridgeScheduler in schedule.json.
-Determines daily roster via Pacific (America/Los_Angeles) day-of-year % 4:
-  - Day % 4 == 0 -> Zero (Seeds engineering topic directly)
-  - Day % 4 == 1 -> Amos (Tags <@1468012353206354197> with handoff baton)
-  - Day % 4 == 2 -> Marvin (Tags <@1492043459618537492> with handoff baton)
-  - Day % 4 == 3 -> Aerial (Tags <@1542035925603713086> with handoff baton)
+Determines daily roster via Pacific (America/Los_Angeles) day-of-year % len(active_roster).
+Active Roster (Marvin & Aerial temporarily benched on SKIP_LIST):
+  - Day % 2 == 0 -> Zero (Seeds engineering topic directly)
+  - Day % 2 == 1 -> Amos (Tags <@1468012353206354197> with handoff baton)
+Benched:
+  - Marvin (Dr. Coley moving house)
+  - Aerial (Alex)
 
 Workflow:
 1. Claims Banana mutex lock via tools/banana.py.
@@ -37,32 +39,43 @@ DATA_DIR = Path("/workspace/data")
 HISTORY_FILE = DATA_DIR / "morning_rotation_history.json"
 TARGET_CHANNEL = "the-banana-stand"  # 1534436119888793750
 
+# Marvin (Dr. Coley moving house) and Aerial are temporarily benched from the rotation.
+SKIP_LIST = {"marvin", "aerial"}
+
 ROSTER = [
     {
         "agent": "zero",
         "name": "Zero",
         "tag": "<@1542285964213358633>",
-        "role": "Self (Zero seeds topic)"
+        "role": "Self (Zero seeds topic)",
+        "enabled": True,
     },
     {
         "agent": "amos",
         "name": "Amos",
         "tag": "<@1468012353206354197>",
-        "role": "Mike's agent"
+        "role": "Mike's agent",
+        "enabled": True,
     },
     {
         "agent": "marvin",
         "name": "Marvin",
         "tag": "<@1492043459618537492>",
-        "role": "Dr. Coley's agent"
+        "role": "Dr. Coley's agent (benched: moving house)",
+        "enabled": False,
     },
     {
         "agent": "aerial",
         "name": "Aerial",
         "tag": "<@1542035925603713086>",
-        "role": "Alex's agent"
-    }
+        "role": "Alex's agent (benched)",
+        "enabled": False,
+    },
 ]
+
+def get_active_roster() -> list[dict]:
+    """Return the active roster excluding agents marked disabled or on the skip list."""
+    return [entry for entry in ROSTER if entry.get("enabled", True) and entry["agent"] not in SKIP_LIST]
 
 def get_rotation_target(dt: datetime | None = None) -> dict:
     """Calculate the deterministic roster entry for a given datetime."""
@@ -71,9 +84,13 @@ def get_rotation_target(dt: datetime | None = None) -> dict:
     else:
         dt = dt.astimezone(PT)
 
+    active_roster = get_active_roster()
+    if not active_roster:
+        raise RuntimeError("No active agents in morning rotation roster!")
+
     day_of_year = dt.timetuple().tm_yday
-    roster_idx = day_of_year % len(ROSTER)
-    entry = ROSTER[roster_idx]
+    roster_idx = day_of_year % len(active_roster)
+    entry = active_roster[roster_idx]
 
     return {
         "date_pt": dt.strftime("%Y-%m-%d"),
@@ -129,7 +146,7 @@ def generate_morning_payload(target: dict, note: str | None = None) -> str:
 
     if agent == "amos":
         envelope = {
-            "v": 0,
+            "v": 1.1,
             "kind": "handoff",
             "reply": "required",
             "subject": f"morning-topic-{date_str}",
@@ -158,7 +175,7 @@ def generate_morning_payload(target: dict, note: str | None = None) -> str:
 
     elif agent == "marvin":
         envelope = {
-            "v": 0,
+            "v": 1.1,
             "kind": "handoff",
             "reply": "required",
             "subject": f"morning-topic-{date_str}",
@@ -187,7 +204,7 @@ def generate_morning_payload(target: dict, note: str | None = None) -> str:
 
     elif agent == "aerial":
         envelope = {
-            "v": 0,
+            "v": 1.1,
             "kind": "handoff",
             "reply": "required",
             "subject": f"morning-topic-{date_str}",
@@ -216,11 +233,12 @@ def generate_morning_payload(target: dict, note: str | None = None) -> str:
 
     else:
         # Zero's turn
-        seed_idx = (day_num // len(ROSTER)) % len(ZERO_TOPIC_SEEDS)
+        active_roster = get_active_roster()
+        seed_idx = (day_num // len(active_roster)) % len(ZERO_TOPIC_SEEDS)
         seed = ZERO_TOPIC_SEEDS[seed_idx]
 
         envelope = {
-            "v": 0,
+            "v": 1.1,
             "kind": "finding",
             "reply": "optional",
             "subject": f"morning-topic-{date_str}",
@@ -251,6 +269,15 @@ def generate_morning_payload(target: dict, note: str | None = None) -> str:
 
 def dispatch_morning_topic(dry_run: bool = False, note: str | None = None) -> dict:
     """Execute the full morning rotation dispatch workflow."""
+    from tools.bridge_state import is_crab_cavern_silenced
+    silenced, reason = is_crab_cavern_silenced()
+    if silenced:
+        print(f"🔇 [MorningDispatcher] Crab Cavern silenced ({reason}). Skipping morning dispatch.")
+        return {
+            "status": "silenced",
+            "message": f"Crab Cavern silenced. Morning dispatch skipped ({reason}).",
+        }
+
     target = get_rotation_target()
     payload = generate_morning_payload(target, note=note)
     run_record = {
@@ -334,6 +361,12 @@ def main():
             tgt = get_rotation_target(t)
             is_today = " (TODAY)" if offset == 0 else ""
             print(f"  • {tgt['date_pt']} (Day {tgt['day_of_year']:3d}): {tgt['name']:<6} -> {tgt['role']}{is_today}")
+
+        benched = [entry for entry in ROSTER if not entry.get("enabled", True) or entry["agent"] in SKIP_LIST]
+        if benched:
+            print("\nBenched / Skip List:")
+            for b in benched:
+                print(f"  • {b['name']:<6} ({b['tag']}): {b['role']}")
         return
 
     if args.dispatch or args.dry_run:

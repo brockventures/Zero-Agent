@@ -1,0 +1,262 @@
+import os
+import sys
+import json
+import sqlite3
+import pytest
+from pathlib import Path
+
+# Ensure workspace is on sys.path
+sys.path.insert(0, "/workspace")
+
+from tools.transcript_index import (
+    check_has_vec,
+    TranscriptIndexer,
+    chunk_text,
+    extract_frontmatter,
+    format_search_results,
+    init_schema,
+    get_db,
+    DEFAULT_RRF_K
+)
+
+
+@pytest.fixture
+def temp_db(tmp_path):
+    db_file = str(tmp_path / "test_index.db")
+    con = get_db(db_file, load_vec=True)
+    init_schema(con)
+    con.close()
+    return db_file
+
+
+def test_chunk_text():
+    # Empty
+    assert chunk_text("") == []
+    # Short
+    assert chunk_text("Hello world", max_chars=100) == ["Hello world"]
+    # Long text with paragraphs
+    paras = ["Para " + str(i) + " " + ("content " * 20) for i in range(5)]
+    full_text = "\n\n".join(paras)
+    chunks = chunk_text(full_text, max_chars=150, overlap=30)
+    assert len(chunks) >= 5
+    for c in chunks:
+        assert len(c) <= 250
+
+
+def test_extract_frontmatter():
+    doc = """---
+name: Test Rule
+category: rules
+description: A test description
+---
+# Body
+This is the markdown body.
+"""
+    fm, body = extract_frontmatter(doc)
+    assert fm.get("name") == "Test Rule"
+    assert fm.get("category") == "rules"
+    assert "This is the markdown body." in body
+
+    # No frontmatter
+    doc2 = "Plain markdown text"
+    fm2, body2 = extract_frontmatter(doc2)
+    assert fm2 == {}
+    assert body2 == "Plain markdown text"
+
+
+def test_schema_init(temp_db):
+    con = get_db(temp_db, load_vec=True)
+    cur = con.cursor()
+    tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    assert "meta" in tables
+    assert "indexed_files" in tables
+    assert "conversations" in tables
+    assert "memory_fts" in tables
+    assert "transcript_fts" in tables
+    assert "channel_fts" in tables
+    assert "memory_chunks" in tables
+    assert "transcript_chunks" in tables
+    assert "channel_chunks" in tables
+    if check_has_vec(con):
+        assert "vec_memory" in tables
+        assert "vec_transcripts" in tables
+        assert "vec_channel" in tables
+    con.close()
+
+
+def test_indexing_and_hybrid_search(tmp_path):
+    db_file = str(tmp_path / "hybrid_test.db")
+    mem_dir = tmp_path / "memory"
+    mem_dir.mkdir()
+    
+    # Create test memory files
+    doc1 = mem_dir / "nas_hang.md"
+    doc1.write_text("""---
+title: Synology Log Driver Hang
+category: scars
+description: Docker logs hanging indefinitely
+---
+DSM SQLite log driver hangs indefinitely on Host 2 when querying docker logs without tail.
+Always use ha_get_state or check disk logs instead.
+""")
+
+    doc2 = mem_dir / "shopping.md"
+    doc2.write_text("""---
+title: Shopping Advisor Rule
+category: rules
+description: Amazon product recommendations
+---
+Product sourcing and gear recommendations must invoke shopping-advisor and amazon_serpapi.py.
+Retrieve verified 1P Prime ASINs and defect review audits.
+""")
+
+    indexer = TranscriptIndexer(db_file)
+    # Monkeypatch MEMORY_DIR for test
+    import tools.transcript_index as ti
+    orig_mem = ti.MEMORY_DIR
+    ti.MEMORY_DIR = str(mem_dir)
+
+    try:
+        stats = indexer.sync_all(force=True, embed=True, scope="memory")
+        assert stats["memory_files_indexed"] == 2
+        assert stats["memory_chunks"] >= 2
+
+        # 1. Exact match query
+        res_exact = indexer.search("Synology Log Driver Hang", target="memory", mode="hybrid")
+        assert len(res_exact["memory"]) >= 1
+        top_match = res_exact["memory"][0]
+        assert "Synology Log Driver Hang" in top_match["title"]
+        assert top_match["match_type"] in ("hybrid", "exact_lexical")
+        assert "rrf_score" in top_match
+
+        # 2. Semantic query with different wording
+        res_semantic = indexer.search("buying items on amazon prime", target="memory", mode="hybrid")
+        assert len(res_semantic["memory"]) >= 1
+        top_sem = res_semantic["memory"][0]
+        assert "Shopping" in top_sem["title"]
+        assert top_sem["match_type"] in ("hybrid", "semantic_vector")
+
+        # 3. Test pure FTS mode
+        res_fts = indexer.search("ASINs", target="memory", mode="fts")
+        assert len(res_fts["memory"]) >= 1
+        assert res_fts["memory"][0]["match_type"] == "exact_lexical"
+
+        # 4. Format search results helper
+        fmt = format_search_results(res_exact)
+        assert "Search Results for" in fmt
+        assert "Synology" in fmt
+
+        # 5. Stats endpoint
+        st = indexer.stats()
+        assert st["indexed_memory_files"] == 2
+        assert st["vector_chunks"]["memory"] >= 2
+    finally:
+        ti.MEMORY_DIR = orig_mem
+        indexer.close()
+
+
+def test_channel_indexing_and_search(tmp_path):
+    db_file = str(tmp_path / "channel_test.db")
+    ch_file = tmp_path / "channel_history.json"
+    
+    mock_channel_data = {
+        "1542081375287640084": [
+            {
+                "id": "1001",
+                "channel_name": "zero-chat",
+                "author": "Ryan",
+                "timestamp": "2026-09-30 20:00:00",
+                "content": "Let's investigate the PostgreSQL RRF claims versus SQLite embedded vectors"
+            },
+            {
+                "id": "1002",
+                "channel_name": "zero-chat",
+                "author": "Zero",
+                "timestamp": "2026-09-30 20:01:00",
+                "content": "Handled. FastEmbed ONNX runs in 11ms on CPU with sqlite-vec and zero daemons"
+            }
+        ]
+    }
+    ch_file.write_text(json.dumps(mock_channel_data))
+
+    import tools.transcript_index as ti
+    orig_ch = ti.CHANNEL_HISTORY_PATH
+    ti.CHANNEL_HISTORY_PATH = str(ch_file)
+    indexer = TranscriptIndexer(db_file)
+
+    try:
+        stats = indexer.sync_all(force=True, embed=True, scope="channel")
+        assert stats["channel_messages_indexed"] == 2
+        assert stats["channel_chunks"] == 2
+
+        # Hybrid search on channel
+        res = indexer.search("PostgreSQL versus SQLite", target="channel", mode="hybrid")
+        assert len(res["channel"]) >= 1
+        top = res["channel"][0]
+        assert top["author"] == "Ryan"
+        assert "rrf_score" in top
+    finally:
+        ti.CHANNEL_HISTORY_PATH = orig_ch
+        indexer.close()
+
+
+def test_transcript_indexing_and_search(tmp_path):
+    db_file = str(tmp_path / "transcript_test.db")
+    brain_dir = tmp_path / "brain"
+    conv_dir = brain_dir / "conv_abc123" / ".system_generated" / "logs"
+    conv_dir.mkdir(parents=True)
+    t_file = conv_dir / "transcript.jsonl"
+
+    lines = [
+        {"step_index": 1, "type": "USER_INPUT", "source": "USER_EXPLICIT", "created_at": "2026-09-30T21:00:00Z", "content": "How do we configure Dockhand and Tautulli backups?"},
+        {"step_index": 2, "type": "PLANNER_RESPONSE", "source": "MODEL", "created_at": "2026-09-30T21:00:05Z", "content": "Dockhand and Tautulli run in SQLite WAL mode. Always checkpoint before copying DB files."}
+    ]
+    t_file.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+
+    import tools.transcript_index as ti
+    orig_brain = ti.BRAIN_DIR
+    ti.BRAIN_DIR = str(brain_dir)
+    indexer = TranscriptIndexer(db_file)
+
+    try:
+        stats = indexer.sync_all(force=True, embed=True, scope="transcripts", depth="full")
+        assert stats["transcripts_indexed"] == 1
+        assert stats["transcript_steps"] == 2
+        assert stats["transcript_chunks"] == 2
+
+        # Search transcripts
+        res = indexer.search("SQLite WAL mode checkpoint", target="transcripts", mode="hybrid")
+        assert len(res["transcripts"]) >= 1
+        assert res["transcripts"][0]["conversation_id"] == "conv_abc123"
+    finally:
+        ti.BRAIN_DIR = orig_brain
+        indexer.close()
+
+
+def test_prune_missing(tmp_path):
+    db_file = str(tmp_path / "prune_test.db")
+    mem_dir = tmp_path / "memory"
+    mem_dir.mkdir()
+    
+    doc1 = mem_dir / "temp_doc.md"
+    doc1.write_text("---\ntitle: Temporary\n---\nTemporary content to be pruned.")
+
+    import tools.transcript_index as ti
+    orig_mem = ti.MEMORY_DIR
+    ti.MEMORY_DIR = str(mem_dir)
+    indexer = TranscriptIndexer(db_file)
+
+    try:
+        indexer.sync_all(force=True, embed=True, scope="memory")
+        assert indexer.stats()["indexed_memory_files"] == 1
+        assert indexer.stats()["vector_chunks"]["memory"] == 1
+
+        # Delete the file and prune
+        doc1.unlink()
+        p_stats = indexer.prune_missing()
+        assert p_stats["memory_pruned"] == 1
+        assert indexer.stats()["indexed_memory_files"] == 0
+        assert indexer.stats()["vector_chunks"]["memory"] == 0
+    finally:
+        ti.MEMORY_DIR = orig_mem
+        indexer.close()

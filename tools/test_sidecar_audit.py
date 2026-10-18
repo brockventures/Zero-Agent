@@ -23,7 +23,7 @@ class TestSidecarAudit(unittest.TestCase):
 
     def test_empty_schedule(self):
         sa.SCHEDULE_FILE.write_text("[]")
-        ok, results, collisions = sa.audit_sidecars()
+        ok, results, collisions, orphans = sa.audit_sidecars(check_orphans=False)
         self.assertTrue(ok)
         self.assertEqual(len(results), 0)
 
@@ -40,7 +40,7 @@ class TestSidecarAudit(unittest.TestCase):
             }
         ]
         sa.SCHEDULE_FILE.write_text(json.dumps(fake_schedule))
-        ok, results, collisions = sa.audit_sidecars()
+        ok, results, collisions, orphans = sa.audit_sidecars(check_orphans=False)
         self.assertFalse(ok)
         self.assertEqual(results[0]["status"], "FAIL")
         self.assertIn("Target script does not exist", results[0]["issues"][0])
@@ -56,7 +56,7 @@ class TestSidecarAudit(unittest.TestCase):
             }
         ]
         sa.SCHEDULE_FILE.write_text(json.dumps(fake_schedule))
-        ok, results, collisions = sa.audit_sidecars()
+        ok, results, collisions, orphans = sa.audit_sidecars(check_orphans=False)
         self.assertFalse(ok)
         self.assertEqual(results[0]["status"], "FAIL")
         self.assertTrue(any("Invalid schedule_type" in i for i in results[0]["issues"]))
@@ -83,11 +83,40 @@ class TestSidecarAudit(unittest.TestCase):
             }
         ]
         sa.SCHEDULE_FILE.write_text(json.dumps(fake_schedule))
-        ok, results, collisions = sa.audit_sidecars()
+        ok, results, collisions, orphans = sa.audit_sidecars(check_orphans=False)
         self.assertTrue(ok)
         self.assertEqual(len(collisions), 1)
         self.assertIn("job1", collisions[0])
         self.assertIn("job2", collisions[0])
+
+    def test_orphan_detection(self):
+        fake_schedule = [
+            {
+                "id": "known_job",
+                "name": "Known Job",
+                "enabled": True,
+                "schedule_type": "daily",
+                "hour_pt": 10,
+                "minute_pt": 0,
+                "prompt": "[INTERNAL_SESSION_ROLLOVER]"
+            }
+        ]
+        sa.SCHEDULE_FILE.write_text(json.dumps(fake_schedule))
+        
+        fake_sidecars = self.temp_path / "fake_sidecars.py"
+        fake_sidecars.write_text("""
+run_sidecar_job("known_job", "Known", lambda: (True, ""))
+run_sidecar_job("unregistered_ghost_job", "Ghost", lambda: (True, ""))
+""")
+        orig_sidecars = sa.SIDECARS_FILE
+        try:
+            sa.SIDECARS_FILE = fake_sidecars
+            ok, results, collisions, orphans = sa.audit_sidecars(check_orphans=True)
+            self.assertFalse(ok)
+            self.assertEqual(len(orphans), 1)
+            self.assertIn("unregistered_ghost_job", orphans[0])
+        finally:
+            sa.SIDECARS_FILE = orig_sidecars
 
 
 if __name__ == "__main__":

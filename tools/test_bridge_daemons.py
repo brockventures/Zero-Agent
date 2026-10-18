@@ -427,6 +427,57 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             mock_deliver.assert_not_called()
 
 
+    async def test_10_recycle_keep_conv_id(self):
+        worker = bd.PersistentChannelWorker(
+            channel_id=12345,
+            name="test-recycle",
+            mode="home",
+            sess_key="home:12345",
+        )
+        worker.conv_id = "conv-keep-123"
+        with patch.object(worker, "shutdown", new_callable=AsyncMock) as mock_shut,              patch.object(worker, "start", new_callable=AsyncMock) as mock_start:
+            await worker.recycle(keep_conv_id=True)
+            mock_shut.assert_awaited_once()
+            mock_start.assert_awaited_once()
+            self.assertEqual(worker.conv_id, "conv-keep-123")
+
+    async def test_11_execute_turn_mid_turn_steering(self):
+        from tools.bridge_runner import steering_channels
+        worker = bd.PersistentChannelWorker(
+            channel_id=999001,
+            name="test-steer",
+            mode="home",
+            sess_key="home:999001",
+        )
+        worker.conv_id = "conv-steer-456"
+        worker.is_ready = True
+        worker.proc = MagicMock()
+        worker.proc.returncode = None
+        worker.proc.stdin = AsyncMock()
+        worker.proc.stdout = AsyncMock()
+
+        mock_status = AsyncMock()
+        mock_target = MagicMock()
+        mock_target.channel.name = "test-steer"
+        mock_target.channel.id = 999001
+
+        steering_channels.add(worker.channel_id)
+
+        with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)),              patch("tools.bridge_daemons.TurnCoordinator.execute_stream_loop", new_callable=AsyncMock, return_value=""),              patch.object(worker, "recycle", new_callable=AsyncMock) as mock_recycle,              patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock) as mock_deliver:
+
+            result = await worker.execute_turn(
+                prompt="Initial prompt that gets steered",
+                status_msg=mock_status,
+                reply_target=mock_target,
+                attachments=[],
+            )
+
+            self.assertNotIn(worker.channel_id, steering_channels)
+            self.assertIsNone(result)
+            mock_deliver.assert_not_called()
+            mock_recycle.assert_called_once_with(keep_conv_id=True)
+
+
 if __name__ == "__main__":
     unittest.main()
 

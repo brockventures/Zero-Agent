@@ -134,7 +134,7 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
                 f.write(f'{{"step": {i}}}\n')
         needed, reason = bs.check_compaction_needed("transcript_steps", 2, brain_root=conv_dir)
         self.assertTrue(needed)
-        self.assertIn("transcript steps (1505) exceeds 1500-step ceiling", reason)
+        self.assertIn("transcript steps (1505) exceeds 600-step ceiling", reason)
 
     async def test_persistent_turn_queue(self):
         q_file = self.temp_path / "test_queue.json"

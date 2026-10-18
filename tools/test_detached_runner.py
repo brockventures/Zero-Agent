@@ -102,15 +102,51 @@ class TestDetachedRunner(unittest.TestCase):
         with patch("subprocess.Popen", return_value=mock_proc):
             _run_worker(task_id)
 
-        # Verification: Outbox notification SHOULD be sent
+        # Verification: Outbox notification SHOULD be sent as agent synthesis turn
+        mock_queue.assert_called_once()
+        args, kwargs = mock_queue.call_args
+        content = kwargs.get("content") or args[1]
+        msg_type = kwargs.get("msg_type") or "text"
+        self.assertIn("[SYSTEM NOTIFICATION: DETACHED TASK COMPLETE]", content)
+        self.assertIn("Task Name: Docker Image Build", content)
+        self.assertEqual(msg_type, "agent_turn")
+
+    @patch("tools.outbox.queue_outbox_message")
+    def test_success_raw_notification_when_no_synthesize(self, mock_queue):
+        task_id = "dt-test-success-raw"
+        t_dir = Path(self.test_dir.name) / task_id
+        t_dir.mkdir(parents=True)
+        log_file = t_dir / "run.log"
+        log_file.write_text("--- [Detached Runner] Started at ... ---\nBuild finished with status 0\n")
+
+        meta = {
+            "task_id": task_id,
+            "name": "Docker Image Build",
+            "command": "docker build -t test .",
+            "channel": "zero-chat",
+            "timeout": 300,
+            "cwd": "/workspace",
+            "status": "starting",
+            "notify_on_success": True,
+            "synthesize": False,
+            "log_file": str(log_file),
+            "start_time": 1000.0,
+        }
+        _write_meta(task_id, meta)
+
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = 0
+        mock_proc.pid = 99998
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            _run_worker(task_id)
+
+        # Verification: Raw outbox notification SHOULD be sent
         mock_queue.assert_called_once()
         args, kwargs = mock_queue.call_args
         content = kwargs.get("content") or args[1]
         self.assertIn("✅ **Background Task Complete: Docker Image Build**", content)
-        self.assertIn("• *Inspect full logs:* `python3 /workspace/tools/detached_runner.py logs dt-test-success-notify`", content)
-        # Verify internal paths and task ID lines were stripped
-        self.assertNotIn("• **Task ID:**", content)
-        self.assertNotIn("• **Log File:**", content)
+        self.assertIn("• *Inspect full logs:* `python3 /workspace/tools/detached_runner.py logs dt-test-success-raw`", content)
 
     @patch("tools.outbox.queue_outbox_message")
     def test_failure_always_sends_alert(self, mock_queue):

@@ -119,10 +119,22 @@ def format_game_notification(game: dict, minutes_left: int = 10) -> str:
     return msg
 
 
-def check_cubs_game(force: bool = False, test: bool = False) -> tuple[bool, str, dict]:
+def check_cubs_game(force: bool = False, test: bool = False, date_str: str = None) -> tuple[bool, str, dict]:
     """Check if a Cubs game is starting within ~10-15 minutes and format notification."""
     now_pt = datetime.now(PT_TZ)
-    date_str = now_pt.strftime("%Y-%m-%d")
+    if not date_str:
+        date_str = now_pt.strftime("%Y-%m-%d")
+
+    # Off-season suspension guard: Oct 1 through March 15
+    # During the MLB off-season, no regular season games are played.
+    # Suspend background polling to conserve network and API requests. Bypass with force or test.
+    if not force and not test:
+        dt = datetime.strptime(date_str, "%Y-%m-%d") if date_str else now_pt
+        month = dt.month
+        day = dt.day
+        is_offseason = (month >= 10 or month <= 2) or (month == 3 and day < 16)
+        if is_offseason:
+            return True, "", {"status": "offseason_suspended", "notice": "MLB Off-Season (Oct 1 - Mar 15)"}
 
     if test:
         # In test mode, check today, then tomorrow if today is complete or off

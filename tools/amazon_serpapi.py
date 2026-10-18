@@ -17,13 +17,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from mcp.server.mcpserver import MCPServer
 
+try:
+    from serpapi_guard import acquire_quota
+except ImportError:
+    from tools.serpapi_guard import acquire_quota
+
 log = logging.getLogger("amazon_serpapi")
 
 BASE_URL = "https://serpapi.com/search.json"
 TIMEOUT = 30
 SECRETS_PATH = os.environ.get("SECRETS_PATH", "/secrets/env.json")
 CACHE_DIR = Path(os.environ.get("SERPAPI_CACHE_DIR", "/workspace/data/serpapi_cache"))
-CACHE_TTL_SECONDS = 3600 * 4  # 4-hour cache for live shopping sessions
+CACHE_TTL_SECONDS = 3600 * 24  # 24-hour cache for live shopping sessions
 
 server = MCPServer("amazon-search")
 
@@ -78,6 +83,12 @@ def _fetch_serpapi(params: Dict[str, Any], use_cache: bool = True) -> Dict[str, 
         cached_data = _get_cache(cache_key)
         if cached_data is not None:
             return {"ok": True, "data": cached_data, "cached": True}
+
+    engine = params.get("engine", "amazon")
+    q_target = params.get("k") or params.get("asin") or str(params)
+    allowed, reason = acquire_quota(engine, q_target, caller="amazon_serpapi")
+    if not allowed:
+        return {"ok": False, "error": f"CircuitBreaker: {reason}"}
 
     api_key = get_api_key()
     if not api_key:

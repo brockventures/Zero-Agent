@@ -42,6 +42,11 @@ from tools.bridge_state import (
 PROCESSED_INTERACTIONS: set[int] = set()
 
 MODEL_ALIASES: dict[str, str] = {
+    "argon": "gemini-4-argon-high",
+    "argon-high": "gemini-4-argon-high",
+    "argon-med": "gemini-4-argon-medium",
+    "argon-medium": "gemini-4-argon-medium",
+    "argon-low": "gemini-4-argon-low",
     "3.8": "gemini-3.8-flash-high",
     "flash": "gemini-3.8-flash-high",
     "3.8-flash": "gemini-3.8-flash-high",
@@ -69,15 +74,36 @@ MODEL_ALIASES: dict[str, str] = {
     "3.6-low": "gemini-3.6-flash-low",
     "3.1-pro": "gemini-3.1-pro-high",
     "pro": "gemini-3.1-pro-high",
-    "3.1-pro-low": "gemini-3.1-pro-low",
-    "sonnet": "claude-sonnet-4-6",
-    "claude": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6-thinking",
+    "sonnet": "claude-sonnet-5-5-high",
+    "claude": "claude-sonnet-5-5-high",
+    "sonnet-5.5": "claude-sonnet-5-5-high",
+    "sonnet-5-5": "claude-sonnet-5-5-high",
+    "sonnet-high": "claude-sonnet-5-5-high",
+    "sonnet-med": "claude-sonnet-5-5-medium",
+    "sonnet-medium": "claude-sonnet-5-5-medium",
+    "sonnet-low": "claude-sonnet-5-5-low",
+    "sonnet-lite": "claude-sonnet-5-5-low",
+    "opus": "claude-opus-5-5-high",
+    "opus-5.5": "claude-opus-5-5-high",
+    "opus-5-5": "claude-opus-5-5-high",
+    "opus-high": "claude-opus-5-5-high",
+    "opus-med": "claude-opus-5-5-medium",
+    "opus-medium": "claude-opus-5-5-medium",
+    "opus-low": "claude-opus-5-5-low",
+    "opus-lite": "claude-opus-5-5-low",
     "gpt": "gpt-oss-120b-medium",
     "gpt-oss": "gpt-oss-120b-medium",
 }
 
 ON_DEMAND_TRIGGERS: dict[str, str] = {
+    "!agora_pm": "Run the Agora Roguelike PM board assessment using /workspace/tools/agora_roguelike_pm.py.",
+    "/agora_pm": "Run the Agora Roguelike PM board assessment using /workspace/tools/agora_roguelike_pm.py.",
+    "!agora_roguelike_pm": "Run the Agora Roguelike PM board assessment using /workspace/tools/agora_roguelike_pm.py.",
+    "/agora_roguelike_pm": "Run the Agora Roguelike PM board assessment using /workspace/tools/agora_roguelike_pm.py.",
+    "!agora_eng": "Run the Agora Roguelike engineering readiness check using /workspace/tools/agora_roguelike_engineer.py.",
+    "/agora_eng": "Run the Agora Roguelike engineering readiness check using /workspace/tools/agora_roguelike_engineer.py.",
+    "!agora_roguelike_engineer": "Run the Agora Roguelike engineering readiness check using /workspace/tools/agora_roguelike_engineer.py.",
+    "/agora_roguelike_engineer": "Run the Agora Roguelike engineering readiness check using /workspace/tools/agora_roguelike_engineer.py.",
     "!heartbeat": "Run the infrastructure heartbeat check using /workspace/tools/sidecars.py heartbeat. Report the status cleanly.",
     "/heartbeat": "Run the infrastructure heartbeat check using /workspace/tools/sidecars.py heartbeat. Report the status cleanly.",
     "!triage": "Run the nightly agenda & inbox triage briefing using /workspace/tools/sidecars.py triage. Present tomorrow's calendar agenda and priority unread emails.",
@@ -104,12 +130,19 @@ ON_DEMAND_TRIGGERS: dict[str, str] = {
     "/projects": "Show active projects and tasks using /workspace/tools/task_manager.py summary.",
     "!schedule": "Show the current sidecar schedule using /workspace/tools/scheduler_tool.py summary.",
     "/schedule": "Show the current sidecar schedule using /workspace/tools/scheduler_tool.py summary.",
+        "!pid_watchdog": "Run the PID and process headroom watchdog check using /workspace/tools/sidecars.py pid_watchdog --test. Report findings cleanly.",
+    "/pid_watchdog": "Run the PID and process headroom watchdog check using /workspace/tools/sidecars.py pid_watchdog --test. Report findings cleanly.",
+    "!pids": "Run the PID and process headroom watchdog check using /workspace/tools/sidecars.py pid_watchdog --test. Report findings cleanly.",
     "!arr_queue": "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly.",
     "/arr_queue": "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly.",
     "!queue": "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly.",
     "/queue": "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly.",
     "!reauth": "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth --force. Report status.",
     "/reauth": "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth --force. Report status.",
+    "!nest_lock": "Run the Nest lock & Homebridge self-healing watchdog check using /workspace/tools/sidecars.py nest_lock --force. Report status.",
+    "/nest_lock": "Run the Nest lock & Homebridge self-healing watchdog check using /workspace/tools/sidecars.py nest_lock --force. Report status.",
+    "!lock_heal": "Run the Nest lock & Homebridge self-healing watchdog check using /workspace/tools/sidecars.py nest_lock --force. Report status.",
+    "/lock_heal": "Run the Nest lock & Homebridge self-healing watchdog check using /workspace/tools/sidecars.py nest_lock --force. Report status.",
     "!prowlarr": "Run the Prowlarr indexer health check using /workspace/tools/sidecars.py prowlarr --force. Report status.",
     "/prowlarr": "Run the Prowlarr indexer health check using /workspace/tools/sidecars.py prowlarr --force. Report status.",
     "!sabnzbd": "Run the SABnzbd downloader check using /workspace/tools/sidecars.py sabnzbd --force. Report status.",
@@ -118,7 +151,31 @@ ON_DEMAND_TRIGGERS: dict[str, str] = {
     "/kometa_audit": "Run the Kometa post-run log audit using /workspace/tools/sidecars.py kometa_audit --force. Report status.",
     "!cubs": "Check the Chicago Cubs game schedule using /workspace/tools/sidecars.py cubs --test. Present matchup, start time, and streaming options.",
     "/cubs": "Check the Chicago Cubs game schedule using /workspace/tools/sidecars.py cubs --test. Present matchup, start time, and streaming options.",
-    "!sidecars": "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status.",
+    "!actual_sync": "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
+    "/actual_sync": "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
+    "!sync_finances": "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
+    "/sync_finances": "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
+    "!sweep": "Run monthly cash sweep policy evaluation using /workspace/tools/sidecars.py cash_sweep. Post liquid reserve status and recommended sweep amount to #finances.",
+    "/sweep": "Run monthly cash sweep policy evaluation using /workspace/tools/sidecars.py cash_sweep. Post liquid reserve status and recommended sweep amount to #finances.",
+    "!cash_sweep": "Run monthly cash sweep policy evaluation using /workspace/tools/sidecars.py cash_sweep. Post liquid reserve status and recommended sweep amount to #finances.",
+    "/cash_sweep": "Run monthly cash sweep policy evaluation using /workspace/tools/sidecars.py cash_sweep. Post liquid reserve status and recommended sweep amount to #finances.",
+    "!variance": "Run monthly financial model variance evaluation using /workspace/tools/sidecars.py variance_digest. Post actuals vs model comparison to #finances.",
+    "/variance": "Run monthly financial model variance evaluation using /workspace/tools/sidecars.py variance_digest. Post actuals vs model comparison to #finances.",
+    "!budget_audit": "Run monthly financial model variance evaluation using /workspace/tools/sidecars.py variance_digest. Post actuals vs model comparison to #finances.",
+    "/budget_audit": "Run monthly financial model variance evaluation using /workspace/tools/sidecars.py variance_digest. Post actuals vs model comparison to #finances.",
+        "!tokenbudget": "Run daily token budget watchdog evaluation using /workspace/tools/sidecars.py token_budget_watchdog --dispatch --force.",
+    "/tokenbudget": "Run daily token budget watchdog evaluation using /workspace/tools/sidecars.py token_budget_watchdog --dispatch --force.",
+    "!tokenwatchdog": "Run daily token budget watchdog evaluation using /workspace/tools/sidecars.py token_budget_watchdog --dispatch --force.",
+    "/tokenwatchdog": "Run daily token budget watchdog evaluation using /workspace/tools/sidecars.py token_budget_watchdog --dispatch --force.",
+    "!reddit_scan": "Run the Reddit fantasy baseball scanner using /workspace/tools/sidecars.py reddit_fantasy --post-discord.",
+    "/reddit_scan": "Run the Reddit fantasy baseball scanner using /workspace/tools/sidecars.py reddit_fantasy --post-discord.",
+    "!reddit": "Run the Reddit fantasy baseball scanner using /workspace/tools/sidecars.py reddit_fantasy --post-discord.",
+    "/reddit": "Run the Reddit fantasy baseball scanner using /workspace/tools/sidecars.py reddit_fantasy --post-discord.",
+    "!personal_sync": "Run the personal data and gaming profile sync using /workspace/tools/sidecars.py personal_data_sync. Report updated stats cleanly.",
+    "/personal_sync": "Run the personal data and gaming profile sync using /workspace/tools/sidecars.py personal_data_sync. Report updated stats cleanly.",
+    "!personal_data_sync": "Run the personal data and gaming profile sync using /workspace/tools/sidecars.py personal_data_sync. Report updated stats cleanly.",
+    "/personal_data_sync": "Run the personal data and gaming profile sync using /workspace/tools/sidecars.py personal_data_sync. Report updated stats cleanly.",
+"!sidecars": "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status.",
     "/sidecars": "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status.",
     "!mcp": "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status.",
     "/mcp": "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status.",
@@ -158,6 +215,8 @@ ON_DEMAND_TRIGGERS: dict[str, str] = {
     "/antigravity_check": "Check for Antigravity CLI updates using /workspace/tools/update_antigravity.py.",
     "!ha_battery_check": "Run the Home Assistant IoT battery watchdog check using /workspace/tools/ha_battery_check.py.",
     "/ha_battery_check": "Run the Home Assistant IoT battery watchdog check using /workspace/tools/ha_battery_check.py.",
+    "!ha_anomaly_check": "Run the Home Assistant statistical telemetry anomaly check using /workspace/tools/ha_anomaly_detector.py.",
+    "/ha_anomaly_check": "Run the Home Assistant statistical telemetry anomaly check using /workspace/tools/ha_anomaly_detector.py.",
     "!nas_storage_check": "Run the Synology storage & array health check using /workspace/tools/nas_storage_check.py.",
     "/nas_storage_check": "Run the Synology storage & array health check using /workspace/tools/nas_storage_check.py.",
     "!ha_update_check": "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py.",
@@ -168,10 +227,10 @@ ON_DEMAND_TRIGGERS: dict[str, str] = {
     "/backup_host2": "Run the Host 2 local USB backup using /workspace/tools/sidecars.py backup_host2.",
     "!backup_host1": "Run the Host 1 local USB backup using /workspace/tools/sidecars.py backup_host1.",
     "/backup_host1": "Run the Host 1 local USB backup using /workspace/tools/sidecars.py backup_host1.",
-    "!meals": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons.",
-    "/meals": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons.",
-    "!mealplan": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons.",
-    "/mealplan": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Sunday, Tuesday, and Thursday nights with interactive swap buttons.",
+    "!meals": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Tuesday, Thursday, and Sunday nights with interactive swap buttons.",
+    "/meals": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Tuesday, Thursday, and Sunday nights with interactive swap buttons.",
+    "!mealplan": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Tuesday, Thursday, and Sunday nights with interactive swap buttons.",
+    "/mealplan": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Tuesday, Thursday, and Sunday nights with interactive swap buttons.",
     "!grocery": "Run the weekly Whole Foods grocery staging using /workspace/tools/sidecars.py grocery_staging. Ingest pending items from Home Assistant ('todo.shopping_list') and due recurring staples, then post the 1-click cart link.",
     "/grocery": "Run the weekly Whole Foods grocery staging using /workspace/tools/sidecars.py grocery_staging. Ingest pending items from Home Assistant ('todo.shopping_list') and due recurring staples, then post the 1-click cart link.",
     "!kalshi": "Run the Kalshi weather quant paper bot using /workspace/tools/sidecars.py kalshi. Settle resolved contracts, scan live order books against NOAA models, execute positive-EV trades, and report the portfolio status.",
@@ -181,7 +240,18 @@ ON_DEMAND_TRIGGERS: dict[str, str] = {
     "!kalshi_audit": "Run the Kalshi nightly settlement, Brier calibration audit, and GitHub board sync using /workspace/tools/sidecars.py kalshi_audit.",
     "/kalshi_audit": "Run the Kalshi nightly settlement, Brier calibration audit, and GitHub board sync using /workspace/tools/sidecars.py kalshi_audit.",
     "!kalshi_sprint": "Run the 5-minute autonomous Kalshi task board sprint cycle using /workspace/tools/sidecars.py kalshi_sprint.",
-    "/kalshi_sprint": "Run the 5-minute autonomous Kalshi task board sprint cycle using /workspace/tools/sidecars.py kalshi_sprint.",
+    "!quota": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
+    "/quota": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
+    "!quota_poller": "Poll ground-truth quota usage snapshots using /workspace/tools/sidecars.py quota_poller.",
+    "/quota_poller": "Poll ground-truth quota usage snapshots using /workspace/tools/sidecars.py quota_poller.",
+    "!quota_poll": "Poll ground-truth quota usage snapshots using /workspace/tools/sidecars.py quota_poller.",
+    "/quota_poll": "Poll ground-truth quota usage snapshots using /workspace/tools/sidecars.py quota_poller.",
+    "!daily_quota_card": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
+    "/daily_quota_card": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
+    "!context_digest": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest.",
+    "/context_digest": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest.",
+    "!gemini_context_digest": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest.",
+    "/gemini_context_digest": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest.",
 }
 
 
@@ -197,10 +267,11 @@ class ChoiceButton(discord.ui.Button):
 class QuickChoiceView(discord.ui.View):
     def __init__(self, options: list[str], callback_fn=None, timeout: Optional[float] = None):
         super().__init__(timeout=timeout)
-        for idx, opt in enumerate(options[:5]):
+        for opt in options[:5]:
             clean_label = opt.strip()
             if clean_label:
-                self.add_item(ChoiceButton(label=clean_label[:80], custom_id=f"choice:{clean_label[:80]}"))
+                btn_label = (clean_label[:77] + "...") if len(clean_label) > 80 else clean_label
+                self.add_item(ChoiceButton(label=btn_label, custom_id=f"choice:{btn_label}"))
 
 
 async def execute_bridge_reload(
@@ -268,17 +339,20 @@ async def execute_bridge_reload(
         except Exception:
             pass
 
-    # Ensure /app/bridge.py stays synchronized with /workspace/tools/bridge.py before execv
+    # Ensure /app python modules stay synchronized with /workspace/tools before execv
     try:
-        ws_bridge = Path("/workspace/tools/bridge.py")
-        app_bridge = Path("/app/bridge.py")
-        if ws_bridge.exists() and app_bridge.exists():
-            ws_bytes = ws_bridge.read_bytes()
-            if app_bridge.read_bytes() != ws_bytes:
-                app_bridge.write_bytes(ws_bytes)
-                print("[Bridge] Synchronized /workspace/tools/bridge.py -> /app/bridge.py before reload")
+        ws_tools_dir = Path("/workspace/tools")
+        app_dir = Path("/app")
+        if ws_tools_dir.exists() and app_dir.exists():
+            for py_file in ws_tools_dir.glob("*.py"):
+                target = app_dir / py_file.name
+                if target.exists():
+                    ws_bytes = py_file.read_bytes()
+                    if target.read_bytes() != ws_bytes:
+                        target.write_bytes(ws_bytes)
+                        print(f"[Bridge] Synchronized {py_file} -> {target} before reload")
     except Exception as se:
-        print(f"[Bridge] Notice checking /app/bridge.py sync: {se}")
+        print(f"[Bridge] Notice checking /app sync: {se}")
 
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -347,6 +421,8 @@ async def handle_button_choice(
         PROCESSED_INTERACTIONS.clear()
         PROCESSED_INTERACTIONS.add(interaction.id)
 
+    choice_lower = choice_text.strip().lower()
+
     # Intercept container restart button choices directly
     if is_container_restart_intent(choice_text):
         await interaction.channel.send(f"🔘 **Selected:** `{choice_text}`")
@@ -372,6 +448,22 @@ async def handle_button_choice(
                 await execute_bridge_reload(interaction.client, channel=interaction.channel, initiator=initiator_name, force=True, reason=f"Choice button '{choice_text}' selected")
             except Exception as rerr2:
                 print(f"[BridgeCommands] Fatal fallback reload error: {rerr2}")
+        return
+
+    # Intercept session reset button choices directly
+    if any(k in choice_lower for k in ("reset session", "restart session", "fresh session", "new session")):
+        await interaction.channel.send(f"🔘 **Selected:** `{choice_text}`")
+        sess_key = "home" if (interaction.channel.id == TARGET_CHANNEL_ID) else str(interaction.channel.id)
+        clear_channel_session_id(interaction.channel.id, "home")
+        br.reset_session_keys.discard(sess_key)
+        try:
+            bd = sys.modules.get("tools.bridge_daemons")
+            dm = getattr(bd, "daemon_manager", None)
+            if dm and dm.is_dedicated_channel(interaction.channel.id):
+                await dm.recycle_worker(interaction.channel.id, new_conv_id=None)
+        except Exception as de:
+            print(f"[BridgeCommands] Error recycling worker on button reset: {de}")
+        await interaction.channel.send("🔄 Conversation session reset for this channel. Your next message will start a fresh session on the active model.")
         return
 
     # Intercept Meal Planning choices directly (Fast-Path deterministic execution)
@@ -463,6 +555,13 @@ async def handle_operator_command(
         sess_key = "home" if (msg.channel.id == TARGET_CHANNEL_ID) else str(msg.channel.id)
         clear_channel_session_id(msg.channel.id, "home")
         br.reset_session_keys.discard(sess_key)
+        try:
+            bd = sys.modules.get("tools.bridge_daemons")
+            dm = getattr(bd, "daemon_manager", None)
+            if dm and dm.is_dedicated_channel(msg.channel.id):
+                await dm.recycle_worker(msg.channel.id, new_conv_id=None)
+        except Exception as de:
+            print(f"[BridgeCommands] Error recycling worker on reset: {de}")
         await msg.reply("🔄 Conversation session reset for this channel/thread. Your next message will start a fresh session.")
         return True
 
@@ -513,6 +612,63 @@ async def handle_operator_command(
             await msg.reply(f"▶️ Responses to **{target_bot}** in <#{target_ch}> resumed.")
         else:
             await msg.reply(f"ℹ️ **{target_bot}** was not currently paused in <#{target_ch}>.")
+        return True
+
+    # Operator command: silence / unsilence Crab Cavern
+    crab_match = re.search(
+        r"^(?:!silence_crab|/silence_crab|!mute_crab|/mute_crab|silence\s+crab(?:\s+cavern)?|mute\s+crab(?:\s+cavern)?)\b(?:\s+(.*))?$",
+        content.strip(),
+        re.IGNORECASE,
+    )
+    if crab_match:
+        from tools.bridge_state import RUNTIME_RULES_FILE
+        rules_data = {}
+        if RUNTIME_RULES_FILE.exists():
+            with open(RUNTIME_RULES_FILE) as rf:
+                rules_data = json.load(rf)
+        from tools.bridge_state import parse_silence_until
+        try:
+            until_dt = parse_silence_until(crab_match.group(1))
+        except Exception:
+            await msg.reply("⚠️ Couldn't parse that. Use `!silence_crab`, `!silence_crab 6h`, `!silence_crab tomorrow 8pm`, or `!silence_crab 2026-10-13 20:00`.")
+            return True
+        rules_data["crab_cavern_silenced_until"] = until_dt.isoformat()
+        rules_data["crab_cavern_silence_reason"] = f"Operator command from {author_name}"
+        with open(RUNTIME_RULES_FILE, "w") as rf:
+            json.dump(rules_data, rf, indent=2)
+        await msg.reply(f"🔇 Crab Cavern silenced across all posts and dispatches until **{until_dt.strftime('%A, %b %d, %Y, %I:%M %p')} PT**.")
+        return True
+
+    crab_un_match = re.search(
+        r"^(?:!unsilence_crab|/unsilence_crab|!unmute_crab|/unmute_crab|unsilence\s+crab(?:\s+cavern)?|unmute\s+crab(?:\s+cavern)?|resume\s+crab(?:\s+cavern)?)$",
+        content.strip(),
+        re.IGNORECASE,
+    )
+    if crab_un_match:
+        from tools.bridge_state import RUNTIME_RULES_FILE
+        rules_data = {}
+        if RUNTIME_RULES_FILE.exists():
+            with open(RUNTIME_RULES_FILE) as rf:
+                rules_data = json.load(rf)
+        rules_data.pop("crab_cavern_silenced_until", None)
+        rules_data.pop("crab_cavern_silence_reason", None)
+        with open(RUNTIME_RULES_FILE, "w") as rf:
+            json.dump(rules_data, rf, indent=2)
+        await msg.reply("🔊 Crab Cavern unsilenced. Responses and dispatches resumed.")
+        return True
+
+    crab_status_match = re.search(
+        r"^(?:!crab_status|/crab_status|crab\s+status)$",
+        content.strip(),
+        re.IGNORECASE,
+    )
+    if crab_status_match:
+        from tools.bridge_state import is_crab_cavern_silenced
+        silenced, reason = is_crab_cavern_silenced()
+        if silenced:
+            await msg.reply(f"🔇 **Crab Cavern Status:** {reason}")
+        else:
+            await msg.reply("🔊 **Crab Cavern Status:** Active (not silenced).")
         return True
 
     # Operator emergency kill switch: !halt / !resume for Station Agora trading
@@ -590,34 +746,157 @@ async def handle_operator_command(
         current_model = active_model_getter() if active_model_getter else get_active_model()
         parts = content.split(maxsplit=1)
         if len(parts) == 1:
-            models_help = (
-                f"🤖 **Current Active Model:** `{current_model}`\n\n"
-                "**Available Models & Aliases:**\n"
-                "• `3.8` or `flash` → `gemini-3.8-flash-high` *(Default, fast & smart)*\n"
-                "• `3.8-med` or `3.8-medium` → `gemini-3.8-flash-medium`\n"
-                "• `3.8-lite`, `3.8-low` or `flash-low` → `gemini-3.8-flash-low` *(Lightweight & fast)*\n"
-                "• `3.7` or `3.7-flash` → `gemini-3.7-flash-high`\n"
-                "• `3.7-lite` or `3.7-low` → `gemini-3.7-flash-low`\n"
-                "• `3.6` or `3.6-flash` → `gemini-3.6-flash-high`\n"
-                "• `3.1-pro` or `pro` → `gemini-3.1-pro-high` *(Deep reasoning / complex refactors)*\n"
-                "• `sonnet` or `claude` → `claude-sonnet-4-6` *(Claude Thinking model)*\n"
-                "• `opus` → `claude-opus-4-6-thinking` *(Claude Opus Thinking)*\n"
-                "• `gpt` → `gpt-oss-120b-medium`\n\n"
-                "*Switch model with:* `!model <name>` (e.g. `!model 3.8`, `!model pro`, `!model flash-low`)"
-            )
-            await msg.reply(models_help)
+            from tools.bridge_models import get_fallback_model, list_available_models
+            available = await asyncio.to_thread(list_available_models, True)
+            fallback = get_fallback_model(available) if available else None
+            help_lines = [
+                f"🤖 **Current Active Model:** `{current_model}`",
+                f"🛟 **Fallback Model:** `{fallback or 'unavailable'}`",
+                "",
+            ]
+            if available:
+                help_lines.append("**Available Models (live from the CLI):**")
+                help_lines.extend(f"- `{mid}` ({label})" for mid, label in available.items())
+                help_lines.append("")
+                help_lines.append("*Shortcuts:* `argon`, `argon-med`, `argon-low`, `flash`, `3.8-low`, `sonnet`, `sonnet-medium`, `opus`, `gpt`")
+            else:
+                help_lines.append("⚠️ Could not fetch the live model list from the CLI. Try again in a moment.")
+            help_lines.append("*Switch with:* `!model <name>` | *Set fallback with:* `!model fallback <name>`")
+            await msg.reply("\n".join(help_lines))
             return True
 
         target_m = parts[1].strip()
-        resolved = MODEL_ALIASES.get(target_m.lower(), target_m)
+        from tools.bridge_models import get_fallback_model, list_available_models, resolve_model, set_fallback_model
+        available = await asyncio.to_thread(list_available_models, True)
+        if not available:
+            await msg.reply("⚠️ Couldn't fetch the live model list from the CLI, so the model was not changed. Try again in a moment.")
+            return True
+
+        is_fallback_cmd = target_m.lower().split()[0] == "fallback"
+        name = target_m.split(maxsplit=1)[1].strip() if is_fallback_cmd and len(target_m.split(maxsplit=1)) > 1 else ("" if is_fallback_cmd else target_m)
+        if is_fallback_cmd and not name:
+            await msg.reply(f"🛟 Fallback model is `{get_fallback_model(available)}`. Set it with `!model fallback <name>`.")
+            return True
+
+        resolved = resolve_model(name, available)
+        if not resolved:
+            valid = ", ".join(f"`{m}`" for m in available)
+            await msg.reply(f"❌ `{name}` isn't a model the CLI knows. Valid models: {valid}")
+            return True
+
+        if is_fallback_cmd:
+            set_fallback_model(resolved)
+            await msg.reply(f"🛟 Fallback model set to **`{resolved}`**. It is used (with a notice in chat) whenever the active model is unavailable.")
+            return True
+
         if active_model_setter:
             active_model_setter(resolved)
         else:
             set_active_model(resolved)
-        await msg.reply(f"🔄 Switched active model to **`{resolved}`** for subsequent turns (persisted across restarts).")
+        try:
+            bd = sys.modules.get("tools.bridge_daemons")
+            dm = getattr(bd, "daemon_manager", None)
+            if dm:
+                await dm.recycle_all()
+        except Exception as de:
+            print(f"[BridgeCommands] Error recycling workers: {de}")
+        await msg.reply(f"🔄 Switched active model to **`{resolved}`** and recycled persistent workers.")
+        return True
+
+    # Handle Zero Live Voice (Gemini Multimodal Live API) commands
+    if content.lower().startswith("!voice") or content.lower().startswith("/voice"):
+        from tools.bridge_voice import ZERO_VOICE_CHANNEL_ID, get_voice_manager
+        parts = content.split()
+        subcmd = parts[1].lower() if len(parts) > 1 else "join"
+        mgr = get_voice_manager(bot)
+
+        if subcmd in ("status", "info"):
+            st = mgr.get_status_dict()
+            if st["active"]:
+                await msg.reply(
+                    f"🎙️ **Zero Live Voice is ACTIVE** in <#{st['channel_id']}>\n"
+                    f"- **Model:** `{st['model']}` | **Voice:** `{st['voice']}`\n"
+                    f"- **Uptime:** {st['uptime_seconds']}s | **Audio:** {st['input_audio_seconds']}s in / {st['output_audio_seconds']}s out (~{st['est_audio_tokens']:,} audio tokens)"
+                )
+            else:
+                await msg.reply(
+                    f"🔇 **Zero Live Voice is idle.**\n"
+                    f"- Hop into <#{ZERO_VOICE_CHANNEL_ID}> (auto-joins) or run `!voice join`."
+                )
+            return True
+
+        if subcmd in ("leave", "stop", "disconnect", "off"):
+            rep = await mgr.stop_session()
+            await msg.reply(rep)
+            return True
+
+        if subcmd in ("set", "voice") and len(parts) > 2:
+            new_voice = parts[2].strip().capitalize()
+            mgr.voice_name = new_voice
+            if mgr.is_active and mgr.voice_client and mgr.voice_client.channel:
+                vc_ch = mgr.voice_client.channel
+                await mgr.stop_session()
+                ok, rep = await mgr.start_session(vc_ch, notify_channel=msg.channel)
+                await msg.reply(f"🔄 Hot-swapped voice to **`{new_voice}`** and reconnected:\n{rep}")
+            else:
+                await msg.reply(f"🎙️ Default Gemini Live voice updated to **`{new_voice}`** for the next `#zero-voice` session.")
+            return True
+
+        # Default: join Ryan's current voice channel or #zero-voice
+        target_vc = None
+        if getattr(msg.author, "voice", None) and getattr(msg.author.voice, "channel", None):
+            target_vc = msg.author.voice.channel
+        if not target_vc:
+            target_vc = bot.get_channel(ZERO_VOICE_CHANNEL_ID)
+        if not target_vc and msg.guild:
+            try:
+                target_vc = await msg.guild.fetch_channel(ZERO_VOICE_CHANNEL_ID)
+            except Exception:
+                pass
+        if not target_vc:
+            await msg.reply("⚠️ Could not locate `#zero-voice` channel.")
+            return True
+
+        model_arg = parts[2].strip() if len(parts) > 2 else None
+        ok, rep = await mgr.start_session(target_vc, notify_channel=msg.channel, model_override=model_arg)
+        await msg.reply(rep)
         return True
 
     cmd_key = content.lower().split()[0] if content else ""
+
+    # Instant zero-token Gemini Weekly Quota progress bar card
+    if cmd_key in ("/quota", "!quota", "/usage", "!usage", "/daily_quota_card", "!daily_quota_card"):
+        from tools.quota_card import build_quota_card
+        ok, card, _ = await asyncio.to_thread(build_quota_card)
+        await msg.reply(card)
+        return True
+
+    # Instant Zero & Ivy Daily Context Digest email dispatch & auto-archive
+    if cmd_key in ("/context_digest", "!context_digest", "/gemini_context_digest", "!gemini_context_digest", "/email_digest", "!email_digest"):
+        from tools.gemini_context_digest import run_daily_context_digest
+        ok, rep, _ = await asyncio.to_thread(run_daily_context_digest)
+        await msg.reply(f"📨 {rep}" if ok else rep)
+        return True
+
+    # Instant zero-token Quota Poller / Attribution command
+    if cmd_key in ("/quota_poller", "!quota_poller", "/quota_poll", "!quota_poll", "/poller_quota"):
+        from tools.quota_poller import (
+            run_quota_poller,
+            get_latest_quota,
+            format_quota_status_text,
+            get_quota_attribution,
+            format_attribution_text,
+        )
+        if "--attr" in content.lower() or "-a" in content.lower():
+            attr = await asyncio.to_thread(get_quota_attribution, 24.0)
+            await msg.reply(format_attribution_text(attr))
+        else:
+            ok, rep, _ = await asyncio.to_thread(run_quota_poller, False, False)
+            latest = await asyncio.to_thread(get_latest_quota)
+            status_txt = format_quota_status_text(latest)
+            reply_txt = f"{rep}\n\n{status_txt}" if rep else status_txt
+            await msg.reply(reply_txt)
+        return True
 
     # On-Demand Thread Rename Command
     if is_thread_channel and cmd_key in ("/title", "!title", "/rename", "!rename"):

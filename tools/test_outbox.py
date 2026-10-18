@@ -8,8 +8,12 @@ import shutil
 
 import tools.outbox as outbox
 
+
 class TestOutboxDedupe(unittest.TestCase):
     def setUp(self):
+        self.silence_patcher = patch("tools.bridge_state.is_crab_cavern_silenced", return_value=(False, ""))
+        self.silence_patcher.start()
+
         self.temp_dir = tempfile.mkdtemp()
         self.orig_data_dir = outbox.DATA_DIR
         self.orig_outbox_dir = outbox.OUTBOX_DIR
@@ -22,6 +26,7 @@ class TestOutboxDedupe(unittest.TestCase):
         outbox.HISTORY_FILE = outbox.OUTBOX_DIR / "history.jsonl"
 
     def tearDown(self):
+        self.silence_patcher.stop()
         outbox.DATA_DIR = self.orig_data_dir
         outbox.OUTBOX_DIR = self.orig_outbox_dir
         outbox.PENDING_FILE = self.orig_pending_file
@@ -85,6 +90,39 @@ class TestOutboxDedupe(unittest.TestCase):
         # Different channel should not be suppressed
         r_other = outbox.queue_outbox_message("zero-chat", s2, dedupe_window=300)
         self.assertFalse(r_other.get("suppressed"))
+
+    def test_hard_duplicate_guard_blocks_forced_identical(self):
+        msg = "Identical payload test"
+        # 1. Queue first message
+        res1 = outbox.queue_outbox_message("lounge", msg)
+        self.assertFalse(res1.get("suppressed"))
+
+        # 2. Simulate dispatch to history
+        outbox.record_dispatched_history(res1)
+
+        # 3. Attempt forced re-queue within 120s
+        res2 = outbox.queue_outbox_message("lounge", msg, force=True)
+        self.assertTrue(res2.get("suppressed"))
+        self.assertIn("Hard duplicate guard", res2.get("reason", ""))
+
+    def test_is_duplicate_recent_alias(self):
+        msg = "Alias test payload"
+        res = outbox.queue_outbox_message("lounge", msg)
+        is_dup, reason = outbox.is_duplicate_recent("lounge", msg)
+        self.assertTrue(is_dup)
+
+    def test_outbox_crab_cavern_silenced_suppresses_queue(self):
+        self.silence_patcher.stop()
+        try:
+            with patch("tools.bridge_state.is_crab_cavern_silenced", return_value=(True, "Quota reset hold")):
+                msg = "Test dispatch during blackout"
+                res = outbox.queue_outbox_message("the-banana-stand", msg)
+                self.assertTrue(res.get("suppressed"))
+                self.assertEqual(res.get("status"), "silenced")
+                self.assertIn("Quota reset hold", res.get("reason"))
+        finally:
+            self.silence_patcher.start()
+
 
 if __name__ == "__main__":
     unittest.main()

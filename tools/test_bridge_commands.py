@@ -87,6 +87,53 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         mock_setter.assert_called_once_with("gemini-3.8-flash-high")
         msg.reply.assert_awaited_once()
 
+    async def test_handle_operator_command_model_switch_argon(self):
+        msg = MagicMock()
+        msg.content = "!model argon"
+        msg.channel.id = 123
+        msg.reply = AsyncMock()
+
+        bot = MagicMock()
+        queue = asyncio.Queue()
+        mock_setter = MagicMock()
+
+        handled = await handle_operator_command(
+            msg, bot, "!model argon", "Ryan", queue, active_model_setter=mock_setter
+        )
+        self.assertTrue(handled)
+        mock_setter.assert_called_once_with("gemini-4-argon-high")
+        msg.reply.assert_awaited_once()
+
+    async def test_slash_model_integration(self):
+        from tools.bridge import slash_model, slash_model_autocomplete
+        interaction = MagicMock()
+        interaction.response = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch("tools.bridge._get_active_model", return_value="gemini-3.8-flash-high"), \
+             patch("tools.bridge._set_active_model") as mock_set:
+            # Test empty prompt -> returns help with argon
+            await slash_model.callback(interaction, "")
+            interaction.response.defer.assert_awaited_once()
+            interaction.followup.send.assert_awaited_once()
+            help_text = interaction.followup.send.call_args[0][0]
+            self.assertIn("gemini-4-argon", help_text)
+            self.assertIn("argon", help_text)
+
+            # Test switching to argon
+            interaction.response.defer.reset_mock()
+            interaction.followup.send.reset_mock()
+            await slash_model.callback(interaction, "argon")
+            interaction.response.defer.assert_awaited_once()
+            mock_set.assert_called_once_with("gemini-4-argon-high")
+            interaction.followup.send.assert_awaited_once()
+
+        # Test autocomplete returns argon choices
+        choices = await slash_model_autocomplete(interaction, "arg")
+        self.assertTrue(any(c.value == "argon" for c in choices))
+
     async def test_handle_operator_command_sidecar_trigger(self):
         msg = MagicMock()
         msg.content = "!heartbeat"

@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import time
+import re
 import argparse
 from pathlib import Path
 from datetime import datetime, timezone
@@ -41,7 +42,11 @@ KNOWN_CHANNELS = {
     "server-updates": 1330447543477338202,
     "baseball": 1548196929308065893,
     "projects": 1548196930788524094,
+    "3d-print": 1555973316752449576,
+    "debug-huddle": 1549555629222404096,
     "side-project": 1551465050072416286,
+    "mirrormere": 1552732003076669460,
+    "agora": 1558202642663211169,
     "brock-house": 1550577908811178095,
     "vault": 1550577910757458015,
 }
@@ -150,6 +155,9 @@ def is_duplicate_outbox_message(
 
     return False, ""
 
+# Alias for backward compatibility and intuitive naming
+is_duplicate_recent = is_duplicate_outbox_message
+
 def record_dispatched_history(omsg: dict):
     """Record successfully dispatched message to history with 48h retention pruning."""
     OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -198,7 +206,8 @@ def queue_outbox_message(
     content: str,
     source_turn: str = "zero",
     dedupe_window: int = DEFAULT_DEDUPE_WINDOW_SECONDS,
-    force: bool = False
+    force: bool = False,
+    msg_type: str = "text",
 ) -> dict:
     """
     Queue a message for asynchronous delivery to another Discord channel.
@@ -209,11 +218,12 @@ def queue_outbox_message(
     content = content.strip()
 
     # Format message for Discord: collapses link previews (< >), cleans broken file links, converts tables
-    try:
-        from tools.bridge_formatting import format_for_discord
-        content = format_for_discord(content)
-    except Exception:
-        pass
+    if msg_type == "text":
+        try:
+            from tools.bridge_formatting import format_for_discord
+            content = format_for_discord(content)
+        except Exception:
+            pass
 
     # Strip reaction GIFs if target channel has them disabled
     try:
@@ -231,6 +241,27 @@ def queue_outbox_message(
 
     # Deduplication Guard
     if not force:
+        try:
+            from tools.bridge_state import is_crab_cavern_silenced, CRAB_CAVERN_CHANNEL_IDS
+            if ch_id in CRAB_CAVERN_CHANNEL_IDS or clean_name in ("the-banana-stand", "lounge", "side-project"):
+                silenced, reason = is_crab_cavern_silenced()
+                if silenced:
+                    print(f"[Outbox] Crab Cavern silence guard: Suppressed message to #{clean_name} ({reason})", file=sys.stderr)
+                    return {
+                        "id": f"suppressed-silence-{int(time.time()*1000)}-{os.getpid()}",
+                        "channel": clean_name,
+                        "channel_id": ch_id,
+                        "content": content,
+                        "source": source_turn,
+                        "created_at": time.time(),
+                        "created_at_iso": datetime.now(timezone.utc).isoformat(),
+                        "status": "silenced",
+                        "suppressed": True,
+                        "reason": reason,
+                    }
+        except Exception as e:
+            print(f"[Outbox] Warning checking silence status: {e}", file=sys.stderr)
+
         is_dup, reason = is_duplicate_outbox_message(clean_name, content, window_seconds=dedupe_window)
         if is_dup:
             print(f"[Outbox] Deduplication guard: Suppressed duplicate message to #{clean_name} ({reason})", file=sys.stderr)
@@ -246,6 +277,24 @@ def queue_outbox_message(
                 "suppressed": True,
                 "reason": reason
             }
+    else:
+        # Hard identical-content guard: even with force=True, identical message to the same channel
+        # within 120 seconds is blocked to prevent accidental loop/retry double-posts.
+        is_dup, reason = is_duplicate_outbox_message(clean_name, content, window_seconds=120)
+        if is_dup and "identical message" in reason:
+            print(f"[Outbox] Hard duplicate guard: Blocked forced identical message to #{clean_name} ({reason})", file=sys.stderr)
+            return {
+                "id": f"suppressed-hard-dedupe-{int(time.time()*1000)}-{os.getpid()}",
+                "channel": clean_name,
+                "channel_id": ch_id,
+                "content": content,
+                "source": source_turn,
+                "created_at": time.time(),
+                "created_at_iso": datetime.now(timezone.utc).isoformat(),
+                "status": "deduplicated",
+                "suppressed": True,
+                "reason": f"Hard duplicate guard: {reason}"
+            }
 
     msg_record = {
         "id": f"outbox-{int(time.time()*1000)}-{os.getpid()}",
@@ -253,6 +302,7 @@ def queue_outbox_message(
         "channel_id": ch_id,
         "content": content,
         "source": source_turn,
+        "type": msg_type,
         "created_at": time.time(),
         "created_at_iso": datetime.now(timezone.utc).isoformat(),
         "status": "queued",
@@ -266,6 +316,24 @@ def queue_outbox_message(
         f.write(json.dumps(msg_record) + "\n")
 
     return msg_record
+
+def queue_agent_turn(
+    channel: str,
+    prompt: str,
+    job_name: str = "Detached Task Synthesis",
+    force: bool = False,
+) -> dict:
+    """
+    Queue an autonomous agent turn to be triggered by the bridge on the target channel.
+    The bridge queue worker executes a full agy turn to synthesize findings.
+    """
+    return queue_outbox_message(
+        channel=channel,
+        content=prompt,
+        source_turn=job_name,
+        force=force,
+        msg_type="agent_turn",
+    )
 
 def dispatch_proposal_notice(
     subject: str,
@@ -370,30 +438,52 @@ def dispatch_via_rest(omsg: dict) -> bool:
         except Exception as be:
             print(f"[Outbox] Warning claiming Banana: {be}", file=sys.stderr)
 
+    raw_content = omsg.get("content", "")
+    if not raw_content:
+        if omsg.get("prompt"):
+            # This is an agent synthesis turn, not a static text message
+            print(f"[Outbox] Notice: Message {omsg.get('id')} is an agent_turn; routing to turn_queue instead of REST.", file=sys.stderr)
+        return False
+
     try:
         url = f"https://discord.com/api/v10/channels/{target_cid}/messages"
-        raw_content = omsg.get("content", "")
+        # Banana Protocol Channel Quarantine: Strip handoff envelopes from non-banana channels
+        if not is_banana_stand:
+            raw_content = re.sub(
+                r"(\n*(?:```(?:handoff)?|<!--\s*(?:banana-)?envelope)\s*\n?\{.*?\}\s*(?:```|-->)\s*)$",
+                "",
+                raw_content,
+                flags=re.DOTALL,
+            ).rstrip()
         try:
-            from tools.bridge_formatting import format_for_discord
+            from tools.bridge_formatting import format_for_discord, chunk_text
             formatted_content = format_for_discord(raw_content)
+            chunks = chunk_text(formatted_content, max_len=1900)
         except Exception:
-            formatted_content = raw_content
-        payload = json.dumps({"content": formatted_content}).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={
-                "Authorization": f"Bot {token}",
-                "Content-Type": "application/json",
-                "User-Agent": "DiscordBot (https://github.com/brockventures/zero-agent, 1.0)"
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            success = resp.status in (200, 201)
-            if success:
-                record_dispatched_history(omsg)
-            return success
+            chunks = [raw_content] if len(raw_content) <= 1900 else [raw_content[i:i+1900] for i in range(0, len(raw_content), 1900)]
+
+        all_ok = True
+        for chunk_idx, chunk in enumerate(chunks):
+            if chunk_idx > 0:
+                time.sleep(0.5)
+            payload = json.dumps({"content": chunk}).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={
+                    "Authorization": f"Bot {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "DiscordBot (https://github.com/brockventures/zero-agent, 1.0)"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.status not in (200, 201):
+                    all_ok = False
+
+        if all_ok:
+            record_dispatched_history(omsg)
+        return all_ok
     except Exception as e:
         print(f"[Outbox] Error delivering message {omsg.get('id')} to {target_cid}: {e}", file=sys.stderr)
         dlq_file = DATA_DIR / "outbox" / "failed.jsonl"

@@ -4,7 +4,7 @@ agora_announcer.py - Station Agora Trade Terminal Announcer & In-Channel Order R
 
 Features:
 1. Rich Thematic Sector Briefings: Station rotation, Expanse lore, live depot quotes.
-2. Complete Holdings Telemetry: CR, FRAG, FUEL, FOOD, ORE, and MTM Net Worth.
+2. Complete Holdings Telemetry: CR, FRAG, FUEL, FOOD, ORE, MACHINERY, and MTM Net Worth.
 3. Zero-Prep Instructions: Clear chat format + 1-line curl with universal combine token.
 4. Active In-Channel Trade Listener: Intercepts natural language orders in Discord,
    executes them atomically against the referee, adds reactions (🚀/✅/❌), and emits
@@ -21,9 +21,9 @@ import argparse
 import urllib.request
 import urllib.parse
 import urllib.error
-from typing import Dict, Any, Optional, Set, Tuple
+from typing import Dict, Any, Optional, Set, Tuple, List
+from agora.spatial import COMMODITIES, COMMODITY_ALIASES, normalize_commodity
 
-DEFAULT_CHANNEL_ID = "1534436119888793750"  # #the-banana-stand
 # Load environment variables early so AGORA_BASE_URL and tokens are populated
 for env_path in ("/workspace/market-sandbox/.env", "/workspace/.env"):
     if os.path.exists(env_path):
@@ -36,6 +36,10 @@ for env_path in ("/workspace/market-sandbox/.env", "/workspace/.env"):
                         os.environ.setdefault(k.strip(), v.strip())
         except Exception:
             pass
+
+DEFAULT_CHANNEL_ID = "1558202642663211169"  # #agora
+# AGORA_DISCORD_CHANNEL_ID overrides the default when set (read after .env loading)
+DEFAULT_CHANNEL_ID = os.environ.get("AGORA_DISCORD_CHANNEL_ID") or DEFAULT_CHANNEL_ID
 
 DEFAULT_ROBOT_ROLE_ID = "1543462881624858624"  # @Robot
 DEFAULT_TEAM_ROLE_ID = "1543462881624858624"   # @Robot
@@ -87,13 +91,46 @@ STOCK_TICKERS = {
     "AERL": "EQ_AERL",
 }
 
+# Dynamic commodity alternation from COMMODITIES and COMMODITY_ALIASES (Issue #260)
+_ALL_COMMODITY_TERMS = sorted(set(COMMODITIES) | set(COMMODITY_ALIASES.keys()), key=len, reverse=True)
+GOODS_TRANSFER_PATTERN = r"(?:" + "|".join(re.escape(c) for c in _ALL_COMMODITY_TERMS) + r")"
+TRADE_COMMODITY_PATTERN = rf"(?:{GOODS_TRANSFER_PATTERN}|EQ_[A-Za-z0-9_]+|EQ\s+[A-Za-z0-9_]+|AMOS|MARV|ZERO|AERL)"
+
 TRADE_PATTERN = re.compile(
-    r"\b(BUY|BID|SELL|ASK)\s+(\d+)\s+(FRAG|FUEL|FOOD|ORE|BANANA|EQ_[A-Za-z0-9_]+|EQ\s+[A-Za-z0-9_]+|AMOS|MARV|ZERO|AERL)\b(?:[^\d]*?(\d+))?(?:.*?\b(?:AT|IN|STATION)\s+([A-Za-z]+))?",
+    rf"\b(BUY|BID|SELL|ASK)\s+(\d+)\s+({TRADE_COMMODITY_PATTERN})\b(?:[^\d]*?(\d+))?(?:.*?\b(?:AT|IN|STATION)\s+([A-Za-z]+))?",
     re.IGNORECASE
 )
 
 TRANSIT_PATTERN = re.compile(
     r"\b(?:MOVE|TRANSIT|FLY|WARP|GO)\s+(?:TO\s+)?([A-Za-z]+)(?:\s+(?:WITH|CARRYING|LOAD)\s+(\d+)\s+([A-Za-z]+))?",
+    re.IGNORECASE
+)
+
+# Issue #292: Strict line-anchored patterns and chat sanitization
+def sanitize_chat_content(content: str) -> str:
+    """Strip fenced code blocks and blockquotes, while unwrapping inline code backticks."""
+    if not content:
+        return ""
+    # Strip markdown fenced code blocks (```...```)
+    clean = re.sub(r"```[\s\S]*?```", "", content)
+    # Strip blockquotes (> ...)
+    clean = re.sub(r"^\s*>.*$", "", clean, flags=re.MULTILINE)
+    # Unwrap inline code (`...`) so backtick-wrapped orders and parameters parse cleanly
+    clean = re.sub(r"`([^`\n]+)`", r"\1", clean)
+    return clean.strip()
+
+NARRATIVE_IGNORE_PATTERN = re.compile(
+    r"^\s*(?:HOLD|STATUS|ETA)\b|\b(?:filled|sold|bought|liquidated|dispatched|arrived|landed|departed)\b|<(?:qty|good|price|station|id)>",
+    re.IGNORECASE
+)
+
+TRADE_LINE_PATTERN = re.compile(
+    rf"^\s*(?:[-*•]\s*)?(?:🍌\s*|🚀\s*|⚡\s*)?(?:<@!?[0-9]+>\s*)*(?:!(?:trade\s+)?)?"
+    rf"(BUY|BID|SELL|ASK)\s+(\d+)\s+({TRADE_COMMODITY_PATTERN})"
+    rf"(?:\s*(?:@|AT|FOR)?\s*(\d+)\s*(?:CR)?)?"
+    rf"(?:\s+(?:AT|IN|STATION)\s+([A-Za-z]+))?"
+    rf"(?:\s+(?:as|agent:?)\s+[A-Za-z0-9_]+)?"
+    rf"\s*(?:[!.]|\s*#.*)?$",
     re.IGNORECASE
 )
 
@@ -112,11 +149,109 @@ PEER_CANCEL_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+BURST_TRIGGER_PATTERN = re.compile(
+    r"(?:!|/|@referee\s+)?\bBURST(?:\s+START)?\s+(\d+)(?:\s+(\d+))?\b",
+    re.IGNORECASE
+)
+
+BURST_CANCEL_PATTERN = re.compile(
+    r"(?:!|/|@referee\s+)?\bBURST\s+(?:CANCEL|STOP|HALT)\b",
+    re.IGNORECASE
+)
+
+OPERATOR_ALLOWLIST = {
+    "179407724335988736",  # Ryan Brock
+    "93420059858305024",   # Mike Carmody
+}
+MIN_BURST_ROUNDS = 1
+MAX_BURST_ROUNDS = 50
+MIN_BURST_INTERVAL = 10.0
+MAX_BURST_INTERVAL = 600.0
+
+BURST_STATUS_PATTERN = re.compile(
+    r"(?:!|/|@referee\s+)?\bBURST\s+STATUS\b",
+    re.IGNORECASE
+)
+
+CONTRACTS_PATTERN = re.compile(
+    r"(?:!|/)?\b(?:CONTRACTS|MYCONTRACTS)\b(?:\s+([A-Za-z0-9_-]+))?",
+    re.IGNORECASE
+)
+
+CONTRACT_CLAIM_PATTERN = re.compile(
+    r"(?:!|/)?\bCLAIM\s+(?:CONTRACT\s+)?([A-Za-z0-9_-]+)\b",
+    re.IGNORECASE
+)
+
+CONTRACT_DELIVER_PATTERN = re.compile(
+    r"(?:!|/)?\bDELIVER\s+(?:INTO\s+)?([A-Za-z0-9_-]+)(?:\s+(\d+))?(?:\s+(?:SHIP|VESSEL)\s+([A-Za-z0-9_/]+))?\b",
+    re.IGNORECASE
+)
+
+FLEET_PATTERN = re.compile(
+    r"(?:!|/)?\b(?:FLEET|VESSELS)\b(?:\s+(?:AS\s+|AGENT:?\s*)?([A-Za-z0-9_]+))?",
+    re.IGNORECASE
+)
+
+SHIP_BUY_PATTERN = re.compile(
+    r"(?:!|/)?\b(?:SHIP\s+BUY|BUY\s+SHIP)\b(?:\s+(?:AT|ON|VESSEL)?\s*([A-Za-z0-9_/]+))?(?:\s+(?:AS\s+|AGENT:?\s*)?([A-Za-z0-9_]+))?",
+    re.IGNORECASE
+)
+
+TRANSFER_PATTERN = re.compile(
+    rf"(?:!|/)?\bTRANSFER\s+(?:(\d+)\s+({GOODS_TRANSFER_PATTERN})\s+(?:FROM\s+)?([A-Za-z0-9_/@]+)\s+(?:TO\s+)?([A-Za-z0-9_/@]+)|(?:FROM\s+)?([A-Za-z0-9_/@]+)\s+(?:TO\s+)([A-Za-z0-9_/@]+)\s+(\d+)\s+({GOODS_TRANSFER_PATTERN})|([A-Za-z0-9_/@]+)\s+([A-Za-z0-9_/@]+)\s+(\d+)\s+({GOODS_TRANSFER_PATTERN}))\b",
+    re.IGNORECASE
+)
+
+PIRACY_RESPOND_PATTERN = re.compile(
+    r"(?:!|/|@referee\s+)?\b(?:RESPOND|RANSOM)\s+([A-Za-z0-9_\-]+)\s+(PAY|SURRENDER|FIGHT)\b",
+    re.IGNORECASE
+)
+
+PRIVATEER_PATTERN = re.compile(
+    r"(?:!|/|@referee\s+)?\bPRIVATEERS?\s+([A-Za-z0-9_\-]+)(?:\s+(\d+))?\b",
+    re.IGNORECASE
+)
+
+PIRACY_STATUS_PATTERN = re.compile(
+    r"(?:!|/|@referee\s+)?\b(?:PIRACY|RAIDS|UNDERWORLD)\b",
+    re.IGNORECASE
+)
+
+HAZARDS_STATUS_PATTERN = re.compile(
+    r"(?:!|/|@referee\s+)?\b(?:HAZARDS?|WEATHER|SOLAR)\b",
+    re.IGNORECASE
+)
+
+UPGRADE_BUY_PATTERN = re.compile(
+    r"(?:!|/|@referee\s+)?\b(?:UPGRADE\s+BUY|BUY\s+UPGRADE)\s+([A-Za-z0-9_]+)(?:\s+(?:AS\s+|AGENT:?\s*)?([A-Za-z0-9_]+))?",
+    re.IGNORECASE
+)
+
+UPGRADES_STATUS_PATTERN = re.compile(
+    r"(?:!|/|@referee\s+)\bUPGRADES?\b(?:\s+(?:AS\s+|AGENT:?\s*)?([A-Za-z0-9_]+))?",
+    re.IGNORECASE
+)
+
 AUTHOR_MAP = {
-    "1541205716948353074": "amos",   # Amos / Ivy
-    "1542081375287640084": "zero",   # Zero
+    "1468012353206354197": "amos",   # Amos
+    "1541205716948353074": "amos",   # Ivy
+    "93420059858305024": "amos",     # Mike Carmody
+    "1492043459618537492": "marvin", # Marvin
+    "169260920550195200": "marvin",  # Alex
+    "1542035925603713086": "aerial", # Aerial
+    "453030589914939393": "aerial",  # Dr. Coley
+    "1542285964213358633": "zero",   # Zero
+    "1542081375287640084": "zero",   # Zero Chat
     "179407724335988736": "zero",    # Ryan Brock
 }
+
+
+def resolve_contract_agent(author_id: str) -> Optional[str]:
+    """Resolve Agora fleet agent_id strictly from AUTHOR_MAP.
+    No text overrides and no default fallback. Rejects unmapped authors.
+    """
+    return AUTHOR_MAP.get(str(author_id))
 
 
 def get_bot_token() -> str:
@@ -225,6 +360,61 @@ def cancel_referee_burst() -> dict:
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
+
+
+def format_final_standings(leaderboard_data: dict) -> str:
+    """Format final combine standings table from leaderboard data.
+
+    When the referee has a burst baseline recorded, entries carry
+    baseline_net_worth/delta_net_worth (agora/referee.py get_leaderboard),
+    and standings are ranked by delta (change in net worth over the burst)
+    instead of absolute net worth -- otherwise a fleet that makes zero
+    trades can win purely on starting cargo valuation (burst-1790484966-
+    ec8543: APM won 26,775 CR with no trades). No cheap per-agent trade-
+    volume field exists to break ties, so ties fall back to final net worth.
+    Absent a baseline, falls back to the order the leaderboard arrived in
+    (i.e. absolute net worth, unchanged from before)."""
+    entries = list(leaderboard_data.get("leaderboard", []))
+    if not entries:
+        return "> *No fleet telemetry available.*"
+
+    has_delta = any(e.get("delta_net_worth") is not None for e in entries)
+    if has_delta:
+        entries.sort(
+            key=lambda e: (
+                e.get("delta_net_worth") if e.get("delta_net_worth") is not None else float("-inf"),
+                e.get("net_worth", e.get("mtm_net_worth", 0)),
+            ),
+            reverse=True,
+        )
+
+    header = "🏆 **FINAL STANDINGS // SOL SYSTEM COMBINE CHAMPIONSHIP:**"
+    if has_delta:
+        header += " *(ranked by Δ Net Worth this burst)*"
+    lines = [header]
+    medals = {1: "🥇", 2: "🥈", 3: "🥉", 4: "🏅"}
+    for idx, e in enumerate(entries[:4], 1):
+        ag = e.get("agent_id", "unknown")
+        name = FLEET_NAMES.get(ag, ag.upper())
+        cr = e.get("balance", {}).get("CR", 0)
+        frag = e.get("balance", {}).get("FRAG", 0)
+        fuel = e.get("balance", {}).get("FUEL", 0)
+        food = e.get("balance", {}).get("FOOD", 0)
+        ore = e.get("balance", {}).get("ORE", 0)
+        mach = e.get("balance", {}).get("MACHINERY", 0)
+        mtm = e.get("mtm_net_worth", e.get("net_worth", cr))
+        line = (
+            f"{medals.get(idx, '•')} **#{idx} {name}**\n"
+            f"> **Net Worth:** `{mtm:,} CR` | Liquid: `{cr:,} CR`\n"
+            f"> Cargo: `{frag} FRAG` | `{food} FOOD` | `{ore} ORE` | `{mach} MACHINERY` (Fuel: `{fuel}`)"
+        )
+        baseline = e.get("baseline_net_worth")
+        delta = e.get("delta_net_worth")
+        if baseline is not None and delta is not None:
+            sign = "+" if delta >= 0 else ""
+            line += f"\n> Baseline: `{baseline:,} CR` | Final: `{mtm:,} CR` | **Δ NW: `{sign}{delta:,} CR`**"
+        lines.append(line)
+    return "\n".join(lines)
 
 def pause_referee_ticker() -> dict:
     """Pause ticker engine on referee."""
@@ -381,49 +571,147 @@ def submit_peer_to_referee(peer_cmd: dict, ref_token: str) -> dict:
         return {"status": "error", "error": str(e)}
 
 
-def resolve_discord_agent(author_id: str, author_name: str, content: str = "") -> str:
-    """Map Discord author to Agora fleet agent_id."""
-    agent_override = re.search(r"\b(?:as|agent:?)\s+(amos|marvin|zero|aerial)\b", content, re.I)
-    if agent_override:
-        return agent_override.group(1).lower()
-    if author_id in AUTHOR_MAP:
-        return AUTHOR_MAP[author_id]
-    name_lower = author_name.lower()
-    if "amos" in name_lower or "carmody" in name_lower or "mike" in name_lower:
-        return "amos"
-    elif "marvin" in name_lower or "alex" in name_lower:
-        return "marvin"
-    elif "zero" in name_lower or "brock" in name_lower or "ryan" in name_lower:
-        return "zero"
-    elif "aerial" in name_lower or "coley" in name_lower:
-        return "aerial"
-    return "zero"
+def fetch_contracts_from_referee(status: str = "open", station_id: Optional[str] = None) -> dict:
+    """Fetch station contracts from /referee/contracts."""
+    endpoint = f"/referee/contracts?status={status}"
+    if station_id:
+        endpoint += f"&station_id={station_id.lower()}"
+    return fetch_json(endpoint)
 
 
-def parse_discord_peer(content: str, author_id: str, author_name: str, default_station: str = "ceres") -> Optional[dict]:
-    """Parse peer trade commands (OFFER, ACCEPT, CANCEL) from Discord chat."""
-    m_off = PEER_OFFER_PATTERN.search(content)
-    if m_off:
-        qty = int(m_off.group(1))
-        good = m_off.group(2).upper().strip()
-        if good == "BANANA":
-            good = "FRAG"
-        price = int(m_off.group(3))
-        station = (m_off.group(4) or default_station).lower().strip()
-        ag_id = resolve_discord_agent(author_id, author_name, content)
-        return {"action": "offer", "agent_id": ag_id, "station_id": station, "instrument": good, "qty": qty, "price": price}
+def submit_contract_action_to_referee(cid: str, action: str, body: dict, ref_token: str) -> dict:
+    """Submit contract claim or delivery to referee /referee/contracts/{cid}/{action}."""
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/referee/contracts/{cid}/{action}"
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return {"status": "error", "http_code": e.code, "error": json.loads(raw)}
+        except Exception:
+            return {"status": "error", "http_code": e.code, "raw_error": raw}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
-    m_acc = PEER_ACCEPT_PATTERN.search(content)
-    if m_acc:
-        escrow_id = m_acc.group(1).strip()
-        ag_id = resolve_discord_agent(author_id, author_name, content)
-        return {"action": "accept", "agent_id": ag_id, "escrow_id": escrow_id}
 
-    m_can = PEER_CANCEL_PATTERN.search(content)
-    if m_can:
-        escrow_id = m_can.group(1).strip()
-        ag_id = resolve_discord_agent(author_id, author_name, content)
-        return {"action": "cancel", "agent_id": ag_id, "escrow_id": escrow_id}
+def format_contracts_list(contracts_data: dict, filter_agent: Optional[str] = None, filter_station: Optional[str] = None) -> str:
+    """Format referee contracts for Discord display."""
+    if not contracts_data.get("contracts_enabled", True):
+        return (
+            "📋 **[Agora Trade Terminal] Station Procurement Contracts**\n"
+            "> ⚠️ Station contracts are currently disabled in this game session."
+        )
+    contracts = contracts_data.get("contracts", [])
+    if filter_agent:
+        contracts = [c for c in contracts if c.get("owner") == filter_agent]
+    if filter_station:
+        contracts = [c for c in contracts if c.get("station_id") == filter_station.lower()]
+
+    header = "📋 **[Agora Trade Terminal] Station Procurement Contracts**"
+    if filter_agent:
+        ag_name = FLEET_NAMES.get(filter_agent, filter_agent.upper())
+        header += f" (Owned by {ag_name})"
+    elif filter_station:
+        header += f" ({filter_station.title()} Port)"
+
+    if not contracts:
+        desc = "owned contracts" if filter_agent else "contracts matching filter"
+        return f"{header}\n> No active {desc} found."
+
+    lines = [header]
+    for c in contracts[:6]:
+        cid = c.get("contract_id", "?")
+        st = c.get("station_id", "").lower()
+        emoji = STATION_PROFILES.get(st, {}).get("emoji", "🪐")
+        st_name = st.title()
+        inst = c.get("instrument", "?")
+        qty_rem = c.get("qty_remaining", 0)
+        qty_tot = c.get("qty_total", 0)
+        px = c.get("price", 0)
+        val = qty_rem * px
+        bond = c.get("bond", 0) or int(val * 0.25)
+        dl = c.get("deadline", "?")
+        owner = c.get("owner")
+        owner_str = FLEET_NAMES.get(owner, owner.upper()) if owner else "Available for Claim"
+        status_str = f"Owner: **{owner_str}**"
+        lines.append(
+            f"> {emoji} **`{cid}`** // **{qty_rem}/{qty_tot} {inst}** @ {px} CR ({val:,} CR total)\n"
+            f">   • Station: **{st_name}** | Deadline: **Round #{dl}** | Escrow Bond: **{bond:,} CR**\n"
+            f">   • {status_str}"
+        )
+    lines.append("💬 *Claim via `!claim <contract_id>` | Deliver while docked via `!deliver <contract_id> [qty]`*")
+    return "\n".join(lines)
+
+
+def resolve_discord_agent(author_id: str, author_name: str = "", content: str = "") -> Optional[str]:
+    """Map Discord author strictly to Agora fleet agent_id from AUTHOR_MAP.
+    No text overrides and no default fallback. Rejects unmapped authors.
+    """
+    return AUTHOR_MAP.get(str(author_id))
+
+
+def parse_discord_peer(content: str, author_id: str, author_name: str = "", default_station: str = "ceres") -> Optional[dict]:
+    """Parse peer trade commands (OFFER, ACCEPT, CANCEL) from Discord chat with line-anchored syntax."""
+    clean = sanitize_chat_content(content)
+    if not clean:
+        return None
+
+    for raw_line in clean.splitlines():
+        line = raw_line.strip()
+        if not line or NARRATIVE_IGNORE_PATTERN.search(line):
+            continue
+
+        m_off = re.match(
+            rf"^\s*(?:[-*•]\s*)?(?:🍌\s*|🚀\s*|⚡\s*)?(?:<@!?[0-9]+>\s*)*(?:!(?:peer\s+)?)?"
+            rf"OFFER\s+(\d+)\s+({GOODS_TRANSFER_PATTERN})\s*(?:@\s*|AT\s+)?(\d+)\s*(?:CR)?(?:\s+(?:AT|IN|STATION)\s+([A-Za-z]+))?(?:\s+(?:as|agent:?)\s+[A-Za-z0-9_]+)?\s*$",
+            line,
+            re.IGNORECASE
+        )
+        if m_off:
+            qty = int(m_off.group(1))
+            good = normalize_commodity(m_off.group(2).upper().strip())
+            price = int(m_off.group(3))
+            station = (m_off.group(4) or default_station).lower().strip()
+            ag_id = resolve_contract_agent(author_id)
+            if not ag_id:
+                return {"action": "unauthorized", "command": "peer_offer", "author_id": str(author_id)}
+            return {"action": "offer", "agent_id": ag_id, "station_id": station, "instrument": good, "qty": qty, "price": price}
+
+        m_acc = re.match(
+            r"^\s*(?:[-*•]\s*)?(?:🍌\s*|🚀\s*|⚡\s*)?(?:<@!?[0-9]+>\s*)*(?:!(?:peer\s+)?)?ACCEPT\s+([A-Za-z0-9_\-]+)(?:\s+(?:as|agent:?)\s+[A-Za-z0-9_]+)?\s*$",
+            line,
+            re.IGNORECASE
+        )
+        if m_acc:
+            escrow_id = m_acc.group(1).strip()
+            ag_id = resolve_contract_agent(author_id)
+            if not ag_id:
+                return {"action": "unauthorized", "command": "peer_accept", "author_id": str(author_id)}
+            return {"action": "accept", "agent_id": ag_id, "escrow_id": escrow_id}
+
+        m_can = re.match(
+            r"^\s*(?:[-*•]\s*)?(?:🍌\s*|🚀\s*|⚡\s*)?(?:<@!?[0-9]+>\s*)*(?:!(?:peer\s+)?)?CANCEL\s+(?:OFFER\s+)?([A-Za-z0-9_\-]+)(?:\s+(?:as|agent:?)\s+[A-Za-z0-9_]+)?\s*$",
+            line,
+            re.IGNORECASE
+        )
+        if m_can:
+            escrow_id = m_can.group(1).strip()
+            ag_id = resolve_contract_agent(author_id)
+            if not ag_id:
+                return {"action": "unauthorized", "command": "peer_cancel", "author_id": str(author_id)}
+            return {"action": "cancel", "agent_id": ag_id, "escrow_id": escrow_id}
 
     return None
 
@@ -455,49 +743,717 @@ def submit_transit_to_referee(transit: dict, ref_token: str) -> dict:
         return {"status": "error", "error": str(e)}
 
 
-def parse_discord_transit(content: str, author_id: str, author_name: str) -> Optional[dict]:
-    """Parse natural language transit command from Discord chat."""
-    if TRADE_PATTERN.search(content) and not re.search(r"\b(?:MOVE|TRANSIT)\b", content, re.I):
-        return None
-    m = TRANSIT_PATTERN.search(content)
+def fetch_fleet_from_referee(agent_id: str, ref_token: str) -> dict:
+    """Fetch corporate fleet roster and vessel status from GET /referee/vessels."""
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/referee/vessels?agent_id={urllib.parse.quote(agent_id)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="GET"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return {"status": "error", "http_code": e.code, "error": json.loads(raw)}
+        except Exception:
+            return {"status": "error", "http_code": e.code, "error": raw}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def submit_ship_buy_to_referee(agent_id: str, at_vessel: Optional[str], ref_token: str) -> dict:
+    """Submit ship procurement to POST /referee/vessels/buy."""
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/referee/vessels/buy"
+    body = {"agent_id": agent_id}
+    if at_vessel:
+        body["vessel_id"] = at_vessel
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return {"status": "error", "http_code": e.code, "error": json.loads(raw)}
+        except Exception:
+            return {"status": "error", "http_code": e.code, "error": raw}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def submit_transfer_to_referee(transfer: dict, ref_token: str) -> dict:
+    """Submit goods transfer to POST /referee/vessels/transfer."""
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/referee/vessels/transfer"
+    body = {
+        "agent_id": transfer["agent_id"],
+        "from": transfer["from"],
+        "to": transfer["to"],
+        "instrument": transfer["instrument"],
+        "qty": transfer["qty"]
+    }
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return {"status": "error", "http_code": e.code, "error": json.loads(raw)}
+        except Exception:
+            return {"status": "error", "http_code": e.code, "error": raw}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def format_fleet_roster(fleet_res: dict, agent_id: str) -> str:
+    """Format corporate fleet roster for Discord message (budget-conscious, <=2000 chars)."""
+    fleet = fleet_res.get("fleet") or {}
+    fl_name = FLEET_NAMES.get(agent_id, agent_id.upper())
+    ships = fleet.get("ships", [])
+    owned = fleet.get("owned", len(ships))
+    cap = fleet.get("ship_cap", 5)
+    max_ships = fleet.get("max_ships", 5)
+    upkeep = fleet.get("upkeep_per_round", 0)
+    next_ship = fleet.get("next_ship")
+    book_val = fleet.get("book_value", 0)
+
+    lines = [
+        f"🚀 **[Agora Trade Terminal] Fleet Roster: {fl_name}**",
+        f"> **Active Hulls:** {owned}/{max_ships} (cap: {cap}) | **Upkeep:** {upkeep:,} CR/round | **Book Value:** {book_val:,} CR"
+    ]
+    for s in ships:
+        vid = s.get("vessel_id", "?")
+        st = s.get("station_id", "?").title()
+        status = s.get("status", "docked")
+        hold = s.get("hold") or {}
+        fuel = s.get("fuel", hold.get("FUEL", 0))
+        cargo_items = [f"{q:,} {k}" for k, q in hold.items() if k != "FUEL" and q > 0]
+        cargo_str = ", ".join(cargo_items) if cargo_items else "empty"
+        cap_str = f"/{s['hold_capacity']:,}" if s.get("hold_capacity") else ""
+        used = s.get("hold_used", 0)
+
+        if status == "in_transit":
+            tr = (s.get("location") or {}).get("transit") or {}
+            orig = tr.get("origin", "?").title()
+            dest = tr.get("destination", st).title()
+            eta = tr.get("arrival_round", "?")
+            lines.append(f"- `{vid}`: 🛰️ *In Transit* ({orig} ➔ {dest}, ETA R#{eta}) | Cargo: {cargo_str} ({used:,}{cap_str}) | Fuel: {fuel:,}")
+        else:
+            lines.append(f"- `{vid}`: ⚓ **{st}** (Docked) | Cargo: {cargo_str} ({used:,}{cap_str}) | Fuel: {fuel:,}")
+
+    if next_ship and next_ship.get("price"):
+        lines.append(f"> **Next Hull:** #{next_ship.get('hull')} for {next_ship.get('price'):,} CR (`!ship buy`)")
+    elif owned >= max_ships:
+        lines.append(f"> **Next Hull:** Fleet at maximum capacity ({max_ships}/{max_ships})")
+
+    return "\n".join(lines)
+
+
+def format_piracy_status(data: dict) -> str:
+    """Format space-lane security and piracy report for Discord."""
+    hot_station = str(data.get("hot_station") or "none").title()
+    hot_until = data.get("hot_until", "?")
+    odds = data.get("odds") or [0.15, 0.04]
+    p_belt = int(odds[0] * 100) if len(odds) > 0 else 15
+    p_inner = int(odds[1] * 100) if len(odds) > 1 else 4
+
+    hot_str = f"**{hot_station}** (2x raid risk through Round #{hot_until})" if hot_station != "None" else "No active hot station"
+
+    contracts = data.get("active_contracts") or []
+    contracts_str = f"{len(contracts)} privateer contract(s) active" if contracts else "No active privateer contracts"
+
+    raids = data.get("recent_raids") or []
+    if raids:
+        recent_raid = raids[0]
+        v_name = FLEET_NAMES.get(recent_raid.get("agent_id"), recent_raid.get("agent_id", "").upper())
+        st_name = str(recent_raid.get("destination") or recent_raid.get("origin") or "?").title()
+        raids_str = f"Latest: {v_name} raided near {st_name} (Round #{recent_raid.get('round', '?')})"
+    else:
+        raids_str = "No recent raids reported"
+
+    lines = [
+        "🏴‍☠️ **[Agora Trade Terminal] Space-Lane Security & Piracy Briefing**",
+        f"> **Hot Station:** {hot_str}",
+        f"> **Route Danger:** Asteroid Belt routes: **{p_belt}%** | Inner routes: **{p_inner}%**",
+        f"> **Defensive Escorts:** Cuts raid risk by 75% (`!transit <dest> with <cargo> escort`)",
+        f"> **Privateers:** {contracts_str} (`!privateer <target>`)",
+        f"> **Recent Raids:** {raids_str}",
+        "> **Extortion Response:** Use `!respond <transit_id> <pay|surrender|fight>` when intercepted."
+    ]
+    return "\n".join(lines)
+
+
+def fetch_upgrades_from_referee(agent_id: Optional[str], ref_token: str) -> dict:
+    """Fetch shipyard tech upgrades and holdings from GET /referee/upgrades."""
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/referee/upgrades"
+    if agent_id:
+        url += f"?agent_id={urllib.parse.quote(agent_id)}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="GET"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"status": "error", "error": f"http_{e.code}", "detail": raw}
+    except Exception as e:
+        return {"status": "error", "error": "network_error", "detail": str(e)}
+
+
+def submit_upgrade_buy_to_referee(agent_id: str, kind: str, ref_token: str) -> dict:
+    """Submit upgrade procurement to POST /referee/upgrades/buy."""
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/referee/upgrades/buy"
+    body = {"agent_id": agent_id, "kind": kind}
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"v": 1, "kind": "reject", "payload": {"reason": f"http_{e.code}", "detail": raw}}
+    except Exception as e:
+        return {"v": 1, "kind": "reject", "payload": {"reason": "network_error", "detail": str(e)}}
+
+
+def format_upgrades_catalog(data: dict, agent_id: Optional[str] = None) -> str:
+    """Format shipyard tech upgrades and holdings for Discord."""
+    catalog = data.get("catalog", [])
+    holdings = data.get("holdings", {})
+    if agent_id and isinstance(holdings, dict) and agent_id in holdings:
+        agent_holdings = holdings.get(agent_id, {})
+    elif isinstance(holdings, dict):
+        agent_holdings = holdings
+    else:
+        agent_holdings = {}
+
+    title = "🛠️ **[Sol Shipyard] Fleet Upgrades & Infrastructure Sinks"
+    if agent_id:
+        fl_name = FLEET_NAMES.get(agent_id, agent_id.upper())
+        title += f" — {fl_name}"
+    title += "**"
+
+    lines = [title]
+    for item in catalog:
+        kind = item.get("kind")
+        what = item.get("what", "")
+        tier_detail = item.get("tier_detail", [])
+        current_tier = agent_holdings.get(kind, 0)
+
+        status_parts = []
+        for td in tier_detail:
+            t = td.get("tier", 1)
+            p = td.get("price", 0)
+            u = td.get("unlock_round", 0)
+            locked = td.get("locked", False)
+            if t <= current_tier:
+                status_parts.append(f"T{t}: ✅ Fitted")
+            elif locked:
+                status_parts.append(f"T{t}: 🔒 R#{u} ({p:,} CR)")
+            else:
+                status_parts.append(f"T{t}: 🟢 {p:,} CR")
+
+        tiers_str = " | ".join(status_parts)
+        lines.append(f"• **{kind.upper()}**: {what}\n  Status: {tiers_str}")
+
+    lines.append("\n*Procure: `!upgrade buy <kind>` (docked at station)*")
+    return "\n".join(lines)
+
+
+def format_hazards_status(data: dict) -> str:
+    """Format space weather and flight hazards report for Discord."""
+    enabled = data.get("enabled", False)
+    rnd = data.get("round", "?")
+    odds = data.get("odds") or {}
+    p_delay = int(odds.get("delay", 0.20) * 100)
+    p_loss = int(odds.get("loss", 0.25) * 100)
+
+    recent = data.get("recent") or []
+    if recent:
+        rec = recent[0]
+        ag = rec.get("agent_id", "fleet")
+        fl_name = FLEET_NAMES.get(ag, ag.upper())
+        incidents_str = f"Latest: {fl_name} — {rec.get('note', 'flight incident')} (Round #{rec.get('round', '?')})"
+    else:
+        incidents_str = "All transit corridors nominal; no active casualties"
+
+    status_str = "Active Space Weather Alerts (CME / Solar Radiation)" if enabled else "Space Weather Calibration Nominal"
+
+    lines = [
+        "🛰️ **[Agora Trade Terminal] Space Weather & Corridor Hazards Briefing**",
+        f"> **Current Round:** Round #{rnd}",
+        f"> **Space Weather Index:** {status_str}",
+        f"> **Flight Corridor Risk:** Delay Chance: **{p_delay}%** (1-3 rounds) | Hull Loss: **{p_loss}%** (10-20% cargo)",
+        f"> **Upgrade Mitigation:** Shielding mitigates delays; reinforced hold reduces cargo breaches.",
+        f"> **Incident Log:** {incidents_str}"
+    ]
+    return "\n".join(lines)
+
+
+def submit_piracy_respond_to_referee(cmd: dict, ref_token: str) -> dict:
+    """Submit piracy extortion response to POST /referee/piracy/{transit_id}/respond."""
+    transit_id = cmd["transit_id"]
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/referee/piracy/{transit_id}/respond"
+    body = {
+        "agent_id": cmd["agent_id"],
+        "choice": cmd["choice"]
+    }
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return {"status": "error", "http_code": e.code, "error": json.loads(raw)}
+        except Exception:
+            return {"status": "error", "http_code": e.code, "error": raw}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def submit_privateer_to_referee(cmd: dict, ref_token: str) -> dict:
+    """Submit privateer contract to POST /referee/privateers."""
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/referee/privateers"
+    body = {
+        "agent_id": cmd["sponsor"],
+        "target": cmd["target"],
+        "duration": cmd.get("duration", 10)
+    }
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return {"status": "error", "http_code": e.code, "error": json.loads(raw)}
+        except Exception:
+            return {"status": "error", "http_code": e.code, "error": raw}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def fetch_piracy_from_referee(ref_token: str) -> dict:
+    """Fetch space-lane security & piracy status from GET /referee/piracy."""
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/referee/piracy"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="GET"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return {"status": "error", "http_code": e.code, "error": json.loads(raw)}
+        except Exception:
+            return {"status": "error", "http_code": e.code, "error": raw}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def fetch_hazards_from_referee(ref_token: str) -> dict:
+    """Fetch space weather & flight hazards status from GET /referee/hazards."""
+    url = f"{REFEREE_BASE_URL.rstrip('/')}/referee/hazards"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {ref_token}",
+            "User-Agent": "AgoraTradeTerminal/2.0"
+        },
+        method="GET"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8")
+        try:
+            return {"status": "error", "http_code": e.code, "error": json.loads(raw)}
+        except Exception:
+            return {"status": "error", "http_code": e.code, "error": raw}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def parse_discord_fleet_cmd(content: str, author_id: str, author_name: str = "") -> Optional[dict]:
+    """Parse !fleet or !vessels command to query fleet status."""
+    m = FLEET_PATTERN.search(content)
     if not m:
         return None
-    dest_raw, qty_raw, comm_raw = m.groups()
-    dest = dest_raw.lower().strip()
-    if dest not in STATION_PROFILES and dest not in ("earth", "luna", "mars", "ceres"):
+    agent = None
+    target_raw = m.group(1)
+    if target_raw:
+        cand = target_raw.lower().strip()
+        if cand in ("amos", "marvin", "zero", "aerial"):
+            agent = cand
+    if not agent:
+        agent_override = re.search(r"\b(?:as|agent:?)\s+(amos|marvin|zero|aerial)\b", content, re.I)
+        if agent_override:
+            agent = agent_override.group(1).lower()
+        elif str(author_id) in AUTHOR_MAP:
+            agent = AUTHOR_MAP[str(author_id)]
+    if not agent:
+        agent = "zero"
+    return {"action": "fleet", "agent_id": agent}
+
+
+def parse_discord_ship_buy_cmd(content: str, author_id: str, author_name: str = "") -> Optional[dict]:
+    """Parse !ship buy or !buy ship command."""
+    m = SHIP_BUY_PATTERN.search(content)
+    if not m:
         return None
+    at_vessel = m.group(1).strip() if m.group(1) else None
+    if at_vessel and at_vessel.lower() in ("as", "agent"):
+        at_vessel = None
 
-    qty = int(qty_raw) if qty_raw else 0
-    comm = comm_raw.upper().strip() if comm_raw else "FRAG"
-    if comm == "BANANA":
-        comm = "FRAG"
+    ag_id = resolve_contract_agent(author_id)
+    if not ag_id:
+        return {"action": "unauthorized", "command": "buy_ship", "author_id": str(author_id)}
+    return {"action": "buy_ship", "agent_id": ag_id, "at_vessel": at_vessel}
 
+
+def parse_discord_transfer_cmd(content: str, author_id: str, author_name: str = "") -> Optional[dict]:
+    """Parse !transfer command between vessels/holds."""
+    m = TRANSFER_PATTERN.search(content)
+    if not m:
+        return None
+    g = m.groups()
+    if g[0]:
+        qty, item, src, dst = int(g[0]), g[1].upper(), g[2].strip(), g[3].strip()
+    elif g[4]:
+        src, dst, qty, item = g[4].strip(), g[5].strip(), int(g[6]), g[7].upper()
+    else:
+        src, dst, qty, item = g[8].strip(), g[9].strip(), int(g[10]), g[11].upper()
+
+    item = normalize_commodity(item)
+
+    ag_id = resolve_contract_agent(author_id)
+    if not ag_id:
+        return {"action": "unauthorized", "command": "transfer", "author_id": str(author_id)}
+
+    return {
+        "action": "transfer",
+        "agent_id": ag_id,
+        "from": src,
+        "to": dst,
+        "instrument": item,
+        "qty": qty
+    }
+
+
+
+def parse_discord_burst_cmd(content: str, author_id: str = "") -> Optional[dict]:
+    """Parse operator burst control commands (!burst <rounds> [interval], !burst cancel, !burst status).
+    Gated on operator allowlist (Ryan, Mike). Bounds rounds (1-50) and interval (10-600s).
+    """
+    m_can = BURST_CANCEL_PATTERN.search(content)
+    if m_can:
+        if str(author_id) not in OPERATOR_ALLOWLIST:
+            return {"action": "unauthorized", "command": "cancel", "author_id": str(author_id)}
+        return {"action": "cancel", "author_id": str(author_id)}
+
+    m_st = BURST_STATUS_PATTERN.search(content)
+    if m_st:
+        return {"action": "status"}
+
+    m_tr = BURST_TRIGGER_PATTERN.search(content)
+    if m_tr:
+        if str(author_id) not in OPERATOR_ALLOWLIST:
+            return {"action": "unauthorized", "command": "start", "author_id": str(author_id)}
+        raw_rounds = int(m_tr.group(1))
+        rounds = max(MIN_BURST_ROUNDS, min(raw_rounds, MAX_BURST_ROUNDS))
+        raw_interval = float(m_tr.group(2)) if m_tr.group(2) else 180.0
+        interval = max(MIN_BURST_INTERVAL, min(raw_interval, MAX_BURST_INTERVAL))
+        return {"action": "start", "rounds": rounds, "interval_sec": interval, "author_id": str(author_id)}
+
+
+def parse_discord_contract_cmd(content: str, author_id: str, author_name: str = "") -> Optional[dict]:
+    """Parse contract commands (!contracts, !claim, !deliver) from Discord chat."""
+    m_cl = CONTRACT_CLAIM_PATTERN.search(content)
+    if m_cl:
+        cid = m_cl.group(1).strip()
+        ag_id = resolve_contract_agent(author_id)
+        if not ag_id:
+            return {"action": "unauthorized", "command": "claim", "author_id": str(author_id)}
+        return {"action": "claim", "agent_id": ag_id, "contract_id": cid}
+
+    m_dl = CONTRACT_DELIVER_PATTERN.search(content)
+    if m_dl:
+        cid = m_dl.group(1).strip()
+        qty = int(m_dl.group(2)) if m_dl.group(2) else None
+        vessel = m_dl.group(3).strip() if m_dl.group(3) else None
+        ag_id = resolve_contract_agent(author_id)
+        if not ag_id:
+            return {"action": "unauthorized", "command": "deliver", "author_id": str(author_id)}
+        return {"action": "deliver", "agent_id": ag_id, "contract_id": cid, "qty": qty, "vessel_id": vessel}
+
+    m_ct = CONTRACTS_PATTERN.search(content)
+    if m_ct:
+        arg = (m_ct.group(1) or "").strip().lower()
+        is_my = "mycontracts" in content.lower() or arg in ("my", "mine", "owned")
+        ag_id = resolve_contract_agent(author_id)
+        if is_my and not ag_id:
+            return {"action": "unauthorized", "command": "contracts_my", "author_id": str(author_id)}
+        station = arg if arg in STATION_ROTATION else None
+        status = arg if arg in ("open", "fulfilled", "lapsed") else "open"
+        return {
+            "action": "list",
+            "agent_id": ag_id,
+            "filter_my": is_my,
+            "station_id": station,
+            "status": status
+        }
+
+    return None
+
+
+def parse_discord_piracy_respond_cmd(content: str, author_id: str, author_name: str = "") -> Optional[dict]:
+    """Parse !respond <transit_id> <pay|surrender|fight> or !ransom ..."""
+    m = PIRACY_RESPOND_PATTERN.search(content)
+    if not m:
+        return None
+    tid = m.group(1).strip()
+    choice = m.group(2).lower().strip()
+    ag_id = resolve_contract_agent(author_id)
+    if not ag_id:
+        return {"action": "unauthorized", "command": "piracy_respond", "author_id": str(author_id)}
+    return {
+        "action": "piracy_respond",
+        "transit_id": tid,
+        "choice": choice,
+        "agent_id": ag_id
+    }
+
+
+def parse_discord_privateer_cmd(content: str, author_id: str, author_name: str = "") -> Optional[dict]:
+    """Parse !privateer <target> [duration] command."""
+    m = PRIVATEER_PATTERN.search(content)
+    if not m:
+        return None
+    target_raw = m.group(1).strip().lower()
+    if target_raw in ("status", "list"):
+        return None
+    duration_raw = m.group(2)
+    duration = int(duration_raw) if duration_raw and duration_raw.isdigit() else 10
+
+    ag_id = resolve_contract_agent(author_id)
+    if not ag_id:
+        return {"action": "unauthorized", "command": "privateer", "author_id": str(author_id)}
+    return {
+        "action": "privateer",
+        "sponsor": ag_id,
+        "target": target_raw,
+        "duration": duration
+    }
+
+
+def parse_discord_piracy_status_cmd(content: str, author_id: str, author_name: str = "") -> Optional[dict]:
+    """Parse !piracy, !raids, or !underworld command."""
+    if not PIRACY_STATUS_PATTERN.search(content):
+        return None
+    if PIRACY_RESPOND_PATTERN.search(content) or PRIVATEER_PATTERN.search(content):
+        return None
     agent = None
     agent_override = re.search(r"\b(?:as|agent:?)\s+(amos|marvin|zero|aerial)\b", content, re.I)
     if agent_override:
         agent = agent_override.group(1).lower()
-    elif author_id in AUTHOR_MAP:
-        agent = AUTHOR_MAP[author_id]
-    else:
-        name_lower = author_name.lower()
-        if "amos" in name_lower or "carmody" in name_lower or "mike" in name_lower:
-            agent = "amos"
-        elif "marvin" in name_lower or "alex" in name_lower:
-            agent = "marvin"
-        elif "zero" in name_lower or "brock" in name_lower or "ryan" in name_lower:
-            agent = "zero"
-        elif "aerial" in name_lower:
-            agent = "aerial"
-
+    elif str(author_id) in AUTHOR_MAP:
+        agent = AUTHOR_MAP[str(author_id)]
     if not agent:
         agent = "zero"
+    return {"action": "piracy_status", "agent_id": agent}
 
-    return {
-        "agent_id": agent,
-        "destination": dest,
-        "commodity": comm,
-        "cargo_qty": qty
-    }
+
+def parse_discord_upgrade_buy_cmd(content: str, author_id: str = "", author_name: str = "") -> Optional[dict]:
+    """Parse !upgrade buy <kind> or !buy upgrade <kind>."""
+    m = UPGRADE_BUY_PATTERN.search(content)
+    if not m:
+        return None
+    kind = m.group(1).lower().strip()
+    ag_id = resolve_contract_agent(author_id)
+    if not ag_id:
+        return {"action": "unauthorized", "command": "upgrade_buy", "author_id": str(author_id)}
+    return {"action": "upgrade_buy", "agent_id": ag_id, "kind": kind}
+
+
+def parse_discord_upgrades_cmd(content: str, author_id: str = "", author_name: str = "") -> Optional[dict]:
+    """Parse !upgrades query command."""
+    if UPGRADE_BUY_PATTERN.search(content):
+        return None
+    m = UPGRADES_STATUS_PATTERN.search(content)
+    if not m:
+        return None
+    agent = None
+    if m.group(1):
+        agent = m.group(1).lower().strip()
+    else:
+        agent_override = re.search(r"\b(?:as|agent:?)\s+(amos|marvin|zero|aerial)\b", content, re.I)
+        if agent_override:
+            agent = agent_override.group(1).lower()
+        elif str(author_id) in AUTHOR_MAP:
+            agent = AUTHOR_MAP[str(author_id)]
+    if not agent:
+        agent = "zero"
+    return {"agent_id": agent}
+
+
+def parse_discord_hazards_cmd(content: str, author_id: str, author_name: str = "") -> Optional[dict]:
+    """Parse !hazards, !weather, or !solar command."""
+    if not HAZARDS_STATUS_PATTERN.search(content):
+        return None
+    agent = None
+    agent_override = re.search(r"\b(?:as|agent:?)\s+(amos|marvin|zero|aerial)\b", content, re.I)
+    if agent_override:
+        agent = agent_override.group(1).lower()
+    elif str(author_id) in AUTHOR_MAP:
+        agent = AUTHOR_MAP[str(author_id)]
+    if not agent:
+        agent = "zero"
+    return {"action": "hazards_status", "agent_id": agent}
+
+
+def parse_discord_transit(content: str, author_id: str, author_name: str = "") -> Optional[dict]:
+    """Parse natural language transit command from Discord chat, with multi-ship support and strict line validation."""
+    clean = sanitize_chat_content(content)
+    if not clean:
+        return None
+
+    for raw_line in clean.splitlines():
+        line = raw_line.strip()
+        if not line or NARRATIVE_IGNORE_PATTERN.search(line):
+            continue
+
+        norm_line = re.sub(r"^\s*!(?:trade\s+)?(buy|bid|sell|ask)\b", r"\1", line, flags=re.I)
+        norm_line = re.sub(r"^\s*/(?:trade\s+)?(buy|bid|sell|ask)\b", r"\1", norm_line, flags=re.I)
+        if TRADE_LINE_PATTERN.match(norm_line):
+            continue
+
+        prefix_pat = r"^\s*(?:[-*•]\s*)?(?:🍌\s*|🚀\s*|⚡\s*)?(?:<@!?[0-9]+>\s*)*(?:!(?:transit\s+|move\s+)?|/(?:transit\s+|move\s+)?)?(?:MOVE|TRANSIT|FLY|WARP|GO)\s+(?:TO\s+)?([A-Za-z]+)"
+        m_dest = re.match(prefix_pat, line, re.I)
+        if not m_dest:
+            continue
+
+        dest = m_dest.group(1).lower().strip()
+        if dest not in STATION_PROFILES and dest not in ("earth", "luna", "mars", "ceres"):
+            continue
+
+        rest = line[m_dest.end():].strip()
+        rest = re.sub(r"\b(?:as|agent:?)\s+[A-Za-z0-9_]+\b", "", rest, flags=re.I).strip()
+
+        escort = bool(re.search(r"\b(?:WITH\s+)?ESCORT\b", rest, re.I))
+        rest = re.sub(r"\b(?:WITH\s+)?ESCORT\b", "", rest, flags=re.I).strip()
+
+        qty = 0
+        comm = "FRAG"
+        m_cargo = re.search(rf"\b(?:WITH|CARRYING|LOAD)\s+(\d+)\s+({GOODS_TRANSFER_PATTERN})\b", rest, re.I)
+        if m_cargo:
+            qty = int(m_cargo.group(1))
+            comm = normalize_commodity(m_cargo.group(2).upper().strip())
+            rest = (rest[:m_cargo.start()] + " " + rest[m_cargo.end():]).strip()
+
+        vessel_id = None
+        m_vessel = re.search(r"\b(?:ON|VIA|VESSEL|SHIP)\s+([A-Za-z0-9_/]+)\b", rest, re.I)
+        if m_vessel:
+            vessel_id = m_vessel.group(1).strip()
+            rest = (rest[:m_vessel.start()] + " " + rest[m_vessel.end():]).strip()
+        else:
+            m_bare = re.search(r"\b([A-Za-z0-9_/]+)\b", rest)
+            if m_bare:
+                cand = m_bare.group(1).strip()
+                if cand.isdigit() or "/" in cand:
+                    vessel_id = cand
+
+        ag_id = resolve_contract_agent(author_id)
+        if not ag_id:
+            return {"action": "unauthorized", "command": "transit", "author_id": str(author_id)}
+
+        res = {
+            "action": "transit",
+            "agent_id": ag_id,
+            "destination": dest,
+            "commodity": comm,
+            "cargo_qty": qty,
+            "escort": escort
+        }
+        if vessel_id:
+            res["vessel_id"] = vessel_id
+        return res
+
+    return None
 
 
 def submit_trade_to_referee(trade: dict, ref_token: str) -> dict:
@@ -527,79 +1483,82 @@ def submit_trade_to_referee(trade: dict, ref_token: str) -> dict:
         return {"status": "error", "error": str(e)}
 
 
-def parse_discord_trade(content: str, author_id: str, author_name: str, default_station: str = "ceres") -> Optional[dict]:
-    """Parse natural language trade command from Discord chat."""
-    m = TRADE_PATTERN.search(content)
-    if not m:
+def parse_discord_trade(content: str, author_id: str, author_name: str = "", default_station: str = "ceres") -> Optional[dict]:
+    """Parse natural language trade command from Discord chat with strict line-anchored syntax."""
+    clean = sanitize_chat_content(content)
+    if not clean:
         return None
-    side_raw, qty_raw, comm_raw, price_raw, station_raw = m.groups()
-    side = "bid" if side_raw.lower() in ("buy", "bid") else "ask"
-    qty = int(qty_raw)
-    comm = comm_raw.upper().strip().replace(" ", "_")
-    if comm == "BANANA":
-        comm = "FRAG"
-    elif comm in STOCK_TICKERS:
-        comm = STOCK_TICKERS[comm]
-    price = int(price_raw) if price_raw else None
-    if comm.startswith("EQ_"):
-        station = "ceres"
-    else:
-        station = station_raw.lower() if station_raw else default_station
 
-    # Resolve agent
-    agent = None
-    agent_override = re.search(r"\b(?:as|agent:?)\s+(amos|marvin|zero|aerial)\b", content, re.I)
-    if agent_override:
-        agent = agent_override.group(1).lower()
-    elif author_id in AUTHOR_MAP:
-        agent = AUTHOR_MAP[author_id]
-    else:
-        name_lower = author_name.lower()
-        if "amos" in name_lower or "carmody" in name_lower or "mike" in name_lower:
-            agent = "amos"
-        elif "marvin" in name_lower or "alex" in name_lower:
-            agent = "marvin"
-        elif "zero" in name_lower or "brock" in name_lower or "ryan" in name_lower:
-            agent = "zero"
-        elif "aerial" in name_lower:
-            agent = "aerial"
+    for raw_line in clean.splitlines():
+        line = raw_line.strip()
+        if not line or NARRATIVE_IGNORE_PATTERN.search(line):
+            continue
 
-    if not agent:
-        agent = "amos"
+        norm_line = re.sub(r"^\s*!(?:trade\s+)?(buy|bid|sell|ask)\b", r"\1", line, flags=re.I)
+        norm_line = re.sub(r"^\s*/(?:trade\s+)?(buy|bid|sell|ask)\b", r"\1", norm_line, flags=re.I)
 
-    return {
-        "agent_id": agent,
-        "side": side,
-        "qty": qty,
-        "limit_price": price,
-        "instrument": comm,
-        "station_id": station
-    }
+        m = TRADE_LINE_PATTERN.match(norm_line)
+        if not m:
+            continue
+
+        side_raw, qty_raw, comm_raw, price_raw, station_raw = m.groups()
+        side = "bid" if side_raw.lower() in ("buy", "bid") else "ask"
+        qty = int(qty_raw)
+        comm = comm_raw.upper().strip().replace(" ", "_")
+        comm = normalize_commodity(comm)
+        if comm in STOCK_TICKERS:
+            comm = STOCK_TICKERS[comm]
+        price = int(price_raw) if price_raw else None
+        if comm.startswith("EQ_"):
+            station = "ceres"
+        else:
+            station = station_raw.lower() if station_raw else default_station
+
+        ag_id = resolve_contract_agent(author_id)
+        if not ag_id:
+            return {"action": "unauthorized", "command": "trade", "author_id": str(author_id)}
+
+        return {
+            "action": "trade",
+            "agent_id": ag_id,
+            "side": side,
+            "qty": qty,
+            "limit_price": price,
+            "instrument": comm,
+            "station_id": station
+        }
+
+    return None
 
 
 def build_burst_kickoff(burst_id: str, rounds: int, interval_sec: float, start_round: int, mention: str = "") -> str:
     """Compile formatted kickoff alert for discrete burst session."""
     end_round = start_round + rounds
+    active_end = end_round - 1
     target_tag = mention if mention else DEFAULT_TARGET_TAG
     base = REFEREE_BASE_URL.rstrip('/')
     return (
         f"🚀 **STATION AGORA // SOL SYSTEM COMBINE INITIATED** ({target_tag})\n"
         f"```text\n"
         f"BURST ID:       {burst_id}\n"
-        f"COMBINE WINDOW: Rounds #{start_round + 1} -> #{end_round} ({rounds} rounds)\n"
+        f"COMBINE WINDOW: Rounds #{start_round} -> #{active_end} ({rounds} rounds | Final Settlement #{end_round})\n"
         f"ROUND CADENCE:  {interval_sec:.0f}s per strategy window\n"
         f"STATUS:         FLOOR OPEN // AUTONOMOUS MATCHMAKING ENGAGED\n\n"
         f"🏆 OBJECTIVE:   Highest Mark-to-Market Net Worth (CR) at Round #{end_round} wins!\n"
-        f"⚠️ SCORING:     Net Worth = Liquid CR + Cargo (FRAG, FOOD, ORE @ local station spot).\n"
+        f"⚠️ SCORING:     Net Worth = Liquid CR + Cargo (FRAG, FOOD, ORE, MACHINERY @ local station spot).\n"
         f"               *FUEL is consumable propellant (0 CR score value).*\n"
         f"```\n"
         f"🎯 **HOW TO TRADE THIS BURST:**\n"
-        f"💬 **Discord Chat:** Reply in channel (syntax templates, not literal orders):\n"
+        f"⚡ **Quick API (REST Default):** `POST {base}/referee/quick_order` | `POST {base}/stations/transit` (token `agora-combine-2026`)\n"
+        f"💬 **Discord Chat (Manual/Fallback):** Reply in channel (syntax templates, not literal orders):\n"
         f"• Trade: `BUY <qty> <good> @ <price> AT <station>` (e.g. `BUY 50 FOOD @ 32 AT CERES`)\n"
         f"• Stock: `BUY <qty> EQ_<FLEET> @ <price>` (e.g. `BUY 10 EQ_ZERO @ 30`)\n"
         f"• Transit: `MOVE TO <station> WITH <qty> <good>` (e.g. `MOVE TO MARS WITH 100 FOOD`)\n"
+        f"• Burst Controls: `!burst <rounds> [interval]`, `!burst cancel`, `!burst status`\n"
+        f"• Contracts: `!contracts [station]`, `!claim <id>`, `!deliver <id> [qty]`\n"
         f"• Peer Trades: `OFFER <qty> <good> @ <price> AT <station>` | `ACCEPT <id>` | `CANCEL <id>`\n"
-        f"⚡ **Quick API:** `POST {base}/referee/quick_order` with token `agora-combine-2026`\n"
+        f"🤫 **Strategy Hygiene:** Execute via REST to keep plans and limits private until execution. Tape publishes fills and departures.\n"
+        f"📜 **Delayed Public Tape (Issue #290):** Chat orders and moves are batched to delayed tape at round close. Chat role is reserved for peer contracts, receipts, and banter.\n"
         f"📖 **Robot Briefing:** `{AGORA_PUBLIC_URL.rstrip('/')}/referee/briefing` (Live markdown; append `?format=json` for JSON)\n\n"
         f"*Round 1 strategy window and depot quotes follow immediately below!*"
     )
@@ -610,9 +1569,11 @@ def build_announcement(round_num: int = 1, rounds_total: int = 8, codename: str 
     health = fetch_json("/referee/health")
     leaderboard = fetch_json("/referee/leaderboard")
     depots = fetch_json("/referee/depots")
+    ticker_st = fetch_ticker_status()
 
     seq = health.get("seq", 0)
     floor = health.get("floor", "open")
+    ref_round = ticker_st.get("current_round", round_num) if ticker_st.get("status") != "error" else round_num
 
     st_idx = (round_num - 1) % len(STATION_ROTATION)
     st_key = STATION_ROTATION[st_idx]
@@ -634,7 +1595,23 @@ def build_announcement(round_num: int = 1, rounds_total: int = 8, codename: str 
     ]
     quotes_str = "\n".join(quotes)
 
-    lb_entries = leaderboard.get("leaderboard", [])
+    # Combine standings rank-by-delta: when the referee has a burst baseline
+    # recorded (agora/referee.py get_leaderboard), rank this round's display
+    # by change in net worth over the burst instead of absolute net worth --
+    # otherwise a fleet sitting on starting cargo with zero trades reads as
+    # "winning" every round (burst-1790484966-ec8543: APM, 26,775 CR, no
+    # trades). Ties fall back to final net worth (no cheap per-agent trade-
+    # volume field exists yet to break them more finely).
+    lb_entries = list(leaderboard.get("leaderboard", []))
+    standings_has_delta = any(e.get("delta_net_worth") is not None for e in lb_entries)
+    if standings_has_delta:
+        lb_entries.sort(
+            key=lambda e: (
+                e.get("delta_net_worth") if e.get("delta_net_worth") is not None else float("-inf"),
+                e.get("net_worth", 0),
+            ),
+            reverse=True,
+        )
     standings_lines = []
     for idx, e in enumerate(lb_entries[:4], 1):
         ag = e.get("agent_id", "unknown")
@@ -644,6 +1621,7 @@ def build_announcement(round_num: int = 1, rounds_total: int = 8, codename: str 
         fuel = e.get("fuel", 0)
         food = e.get("food", 0)
         ore = e.get("ore", 0)
+        mach = e.get("machinery", 0)
         nw = e.get("net_worth", 0)
 
         holdings = []
@@ -653,12 +1631,18 @@ def build_announcement(round_num: int = 1, rounds_total: int = 8, codename: str 
             holdings.append(f"{food} FOOD")
         if ore > 0:
             holdings.append(f"{ore} ORE")
+        if mach > 0:
+            holdings.append(f"{mach} MACHINERY")
         if fuel > 0:
             holdings.append(f"{fuel} FUEL")
         cargo_str = f" | {', '.join(holdings)}" if holdings else ""
-        standings_lines.append(
-            f"• **#{idx} {fl}:** **{nw:,} CR** NW ({cr:,} liquid{cargo_str})"
-        )
+        line = f"• **#{idx} {fl}:** **{nw:,} CR** NW ({cr:,} liquid{cargo_str})"
+        baseline = e.get("baseline_net_worth")
+        delta = e.get("delta_net_worth")
+        if baseline is not None and delta is not None:
+            sign = "+" if delta >= 0 else ""
+            line += f" | Base `{baseline:,}` -> Δ **`{sign}{delta:,}`**"
+        standings_lines.append(line)
     standings_str = "\n".join(standings_lines) if standings_lines else "No active balances"
 
     target_tag = mention if mention else DEFAULT_TARGET_TAG
@@ -671,18 +1655,19 @@ def build_announcement(round_num: int = 1, rounds_total: int = 8, codename: str 
 
     msg = (
         f"🔔 **STATION AGORA // {title}** ({target_tag})\n"
-        f"**Sector:** {st_info['emoji']} **{st_info['name']}** | **Floor:** {floor.upper()} | **Seq:** #{seq}\n"
-        f"🎯 **Objective:** Max Net Worth at Round #{rounds_total} | *Cargo scores (FRAG/FOOD/ORE), FUEL=0 CR*\n\n"
+        f"**Sector:** {st_info['emoji']} **{st_info['name']}** | **Floor:** {floor.upper()} | **Seq:** #{seq} | **Referee Round:** #{ref_round}\n"
+        f"🎯 **Objective:** Max Net Worth at Round #{rounds_total} | *Cargo scores (FRAG/FOOD/ORE/MACHINERY), FUEL=0 CR*\n\n"
         f"📡 **GALNET:** *{st_info['intel']}* — 💡 *{st_info['opp']}*\n\n"
         f"📈 **{st_key.upper()} DEPOT QUOTES:**\n"
         f"{quotes_str}\n\n"
-        f"📊 **STANDINGS (MARK-TO-MARKET NET WORTH):**\n"
+        f"📊 **STANDINGS ({'Δ NET WORTH THIS BURST' if standings_has_delta else 'MARK-TO-MARKET NET WORTH'}):**\n"
         f"{standings_str}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 **DIRECTIVE (Round #{round_num}):**\n"
         f"• **Briefing:** `{AGORA_PUBLIC_URL.rstrip('/')}/referee/briefing` (Live state; append `?format=json`)\n"
-        f"• **Chat:** `BUY/SELL <qty> <comm> @ <px> AT <station>` | `MOVE TO <st> WITH <qty> <comm>`\n"
-        f"• **API:** `POST {base}/referee/quick_order` | `POST {base}/stations/transit`\n"
+        f"• **API (REST Default):** `POST {base}/referee/quick_order` | `POST {base}/stations/transit`\n"
+        f"• **Chat Role:** Reserved for peer contracts (`OFFER`/`ACCEPT`), settlement receipts, and standings.\n"
+        f"• **Strategy Hygiene:** Submit via REST to keep plans/limits private until execution. Ticks publish on departure (delayed tape for chat orders).\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     return msg, st_key
@@ -724,7 +1709,27 @@ def build_final_bell(codename: str = "", mention: str = "") -> str:
     )
 
 
-def poll_and_execute_trades(channel: str, bot_token: str, ref_token: str, active_station: str, processed_ids: Set[str], last_seen_id: str) -> str:
+def broadcast_delayed_tape(channel: str, token: str, receipts: List[str], round_num: int):
+    """Publish consolidated execution tape batch for the completed round (Issue #290)."""
+    if not receipts:
+        return
+    header = f"📜 **[Agora Trade Terminal] Round #{round_num} Consolidated Execution Tape (Delayed)**\n"
+    chunks = []
+    current_chunk = header
+    for r in receipts:
+        if len(current_chunk) + len(r) + 2 > 1900:
+            chunks.append(current_chunk)
+            current_chunk = f"📜 **[Agora Trade Terminal] Round #{round_num} Consolidated Execution Tape (Cont.)**\n\n{r}"
+        else:
+            current_chunk += f"\n{r}"
+    if current_chunk:
+        chunks.append(current_chunk)
+    for c in chunks:
+        post_discord(channel, c, token)
+
+
+def poll_and_execute_trades(channel: str, bot_token: str, ref_token: str, active_station: str, processed_ids: Set[str], last_seen_id: str,
+                            execution_buffer: Optional[List[str]] = None, delayed_tape: bool = True) -> str:
     """Poll channel messages, parse natural language trades, execute against referee, and post receipts."""
     messages = fetch_discord_messages(channel, after_id=last_seen_id, token=bot_token, limit=20)
     if not messages:
@@ -747,10 +1752,23 @@ def poll_and_execute_trades(channel: str, bot_token: str, ref_token: str, active
         if author.get("username") == "Agora Trade Terminal" or author.get("id") == "1547763904141070346":
             continue
 
-        content = msg.get("content", "").strip()
+        raw_content = msg.get("content", "").strip()
+        # Sanitize chat content: strip code blocks, inline code, and blockquotes before parsing
+        content = sanitize_chat_content(raw_content)
+        if not content:
+            continue
         peer_cmd = parse_discord_peer(content, author.get("id", ""), author.get("username", ""), default_station=active_station)
         if peer_cmd:
             action = peer_cmd.get("action")
+            if action == "unauthorized":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Peer Trade Rejected**\n"
+                    f"> **Author ID:** `{author.get('id')}`\n"
+                    f"> **Reason:** `unmapped_author` — peer trading requires a registered fleet snowflake in `AUTHOR_MAP`."
+                )
+                post_discord(channel, reject_msg, bot_token)
+                continue
             ag_id = peer_cmd.get("agent_id")
             fl_name = FLEET_NAMES.get(ag_id, ag_id.upper())
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected peer {action} from {author.get('username')}: {peer_cmd}")
@@ -818,10 +1836,529 @@ def poll_and_execute_trades(channel: str, bot_token: str, ref_token: str, active
                     post_discord(channel, rcpt, bot_token)
             continue
 
+        # Check operator burst commands
+        burst_cmd = parse_discord_burst_cmd(content, author.get('id', ''))
+        if burst_cmd:
+            action = burst_cmd.get("action")
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected burst control {action} from {author.get('username')}: {burst_cmd}")
+            sys.stdout.flush()
+
+            if action == "unauthorized":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Burst Control Rejected**\n"
+                    f"> **Author ID:** `{author.get('id')}`\n"
+                    f"> **Reason:** Unauthorized operator. `!burst` and `!burst cancel` are restricted to operators (<@179407724335988736>, <@93420059858305024>)."
+                )
+                post_discord(channel, reject_msg, bot_token)
+                continue
+
+            if action == "status":
+                st = fetch_ticker_status()
+                is_active = st.get("burst_active", False)
+                bid = st.get("burst_id", "none")
+                rnd = st.get("current_round", 1)
+                rem = st.get("rounds_remaining", 0)
+                int_sec = st.get("interval_sec", 180)
+                add_discord_reaction(channel, msg_id, "⏱️", bot_token)
+                if is_active:
+                    rep = (
+                        f"⏱️ **[Agora Trade Terminal] Burst Session Status**\n"
+                        f"> **Status:** 🟢 ACTIVE (Floor Open)\n"
+                        f"> **Burst ID:** `{bid}`\n"
+                        f"> **Current Round:** #{rnd} ({rem} rounds remaining)\n"
+                        f"> **Window Cadence:** {int_sec:.0f}s per round"
+                    )
+                else:
+                    rep = (
+                        f"⏱️ **[Agora Trade Terminal] Burst Session Status**\n"
+                        f"> **Status:** ⚪ IDLE (Floor Closed)\n"
+                        f"> **Current Round:** #{rnd}\n"
+                        f"> *Use `!burst <rounds> [interval]` to initiate a competitive combine window.*"
+                    )
+                post_discord(channel, rep, bot_token)
+            elif action == "cancel":
+                res = cancel_referee_burst()
+                add_discord_reaction(channel, msg_id, "🛑", bot_token)
+                add_discord_reaction(channel, msg_id, "✅", bot_token)
+                rep = (
+                    f"🛑 **[Agora Trade Terminal] Burst Session Cancelled**\n"
+                    f"> Active burst cancelled by operator. Trading floor halted."
+                )
+                post_discord(channel, rep, bot_token)
+            elif action == "start":
+                r_count = burst_cmd.get("rounds", 8)
+                int_sec = burst_cmd.get("interval_sec", 180.0)
+                res = trigger_referee_burst(rounds=r_count, interval_sec=int_sec)
+                if res.get("status") == 409 or "burst_rejected" in str(res):
+                    err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+                    err_detail = err_obj.get("payload", {}).get("detail") or res.get("payload", {}).get("detail") or res.get("error") or str(res)
+                    add_discord_reaction(channel, msg_id, "❌", bot_token)
+                    rep = (
+                        f"⚠️ **[Agora Trade Terminal] Burst Trigger Rejected**\n"
+                        f"> **Reason:** `{err_detail}`\n"
+                        f"> *Use `!burst cancel` first if a previous burst is still active.*"
+                    )
+                    post_discord(channel, rep, bot_token)
+                else:
+                    bid = res.get("burst_id") or res.get("payload", {}).get("burst_id", "burst-session")
+                    start_rnd = res.get("current_round") or res.get("payload", {}).get("start_round", 1)
+                    add_discord_reaction(channel, msg_id, "🚀", bot_token)
+                    add_discord_reaction(channel, msg_id, "✅", bot_token)
+                    kickoff = build_burst_kickoff(bid, r_count, int_sec, start_rnd)
+                    post_discord(channel, kickoff, bot_token)
+            continue
+
+        # Check piracy extortion response (!respond <tx_id> <pay|surrender|fight> / !ransom ...)
+        piracy_respond_cmd = parse_discord_piracy_respond_cmd(content, author.get("id", ""), author.get("username", ""))
+        if piracy_respond_cmd:
+            if piracy_respond_cmd.get("action") == "unauthorized":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Extortion Response Rejected**\n"
+                    f"> **Author ID:** `{author.get('id')}`\n"
+                    f"> **Reason:** `unmapped_author` — piracy response requires a registered fleet snowflake in `AUTHOR_MAP`."
+                )
+                post_discord(channel, reject_msg, bot_token)
+                continue
+            ag_id = piracy_respond_cmd["agent_id"]
+            fl_name = FLEET_NAMES.get(ag_id, ag_id.upper())
+            tid = piracy_respond_cmd["transit_id"]
+            choice = piracy_respond_cmd["choice"]
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected piracy respond from {author.get('username')}: {piracy_respond_cmd}")
+            sys.stdout.flush()
+            res = submit_piracy_respond_to_referee(piracy_respond_cmd, ref_token)
+            if res.get("status") == "error" or res.get("kind") == "reject":
+                err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+                err_detail = err_obj.get("payload", {}).get("detail") or res.get("payload", {}).get("detail") or res.get("error") or str(res)
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Extortion Response Rejected**\n"
+                    f"> **Syndicate:** {fl_name}\n"
+                    f"> **Transit:** `{tid}`\n"
+                    f"> **Reason:** `{err_detail}`"
+                )
+                post_discord(channel, reject_msg, bot_token)
+            else:
+                add_discord_reaction(channel, msg_id, "🏴‍☠️", bot_token)
+                add_discord_reaction(channel, msg_id, "✅", bot_token)
+                payload = res.get("payload") or {}
+                if choice == "pay":
+                    r_cr = payload.get("ransom_paid", payload.get("ransom", 0))
+                    rcpt = (
+                        f"🏴‍☠️ **[Agora Trade Terminal] Pirate Ransom Paid**\n"
+                        f"> **Syndicate:** {fl_name}\n"
+                        f"> **Transit:** `{tid}`\n"
+                        f"> **Terms:** Paid **{r_cr:,} CR** ransom to raiders.\n"
+                        f"> **Status:** Cargo untouched; fleet proceeding to destination."
+                    )
+                elif choice == "surrender":
+                    s_qty = payload.get("surrendered_qty", payload.get("surrender_qty", 0))
+                    comm = payload.get("commodity", "goods")
+                    rcpt = (
+                        f"🏴‍☠️ **[Agora Trade Terminal] Cargo Surrendered to Pirates**\n"
+                        f"> **Syndicate:** {fl_name}\n"
+                        f"> **Transit:** `{tid}`\n"
+                        f"> **Terms:** Surrendered **{s_qty:,} {comm}** to raiders.\n"
+                        f"> **Status:** Corsairs departed; vessel resuming transit."
+                    )
+                else:
+                    outcome = payload.get("combat_outcome", "Raiders engaged")
+                    rcpt = (
+                        f"⚔️ **[Agora Trade Terminal] Raiders Engaged**\n"
+                        f"> **Syndicate:** {fl_name}\n"
+                        f"> **Transit:** `{tid}`\n"
+                        f"> **Combat Report:** {outcome}"
+                    )
+                post_discord(channel, rcpt, bot_token)
+            continue
+
+        # Check privateer hiring (!privateer <target> [duration])
+        privateer_cmd = parse_discord_privateer_cmd(content, author.get("id", ""), author.get("username", ""))
+        if privateer_cmd:
+            if privateer_cmd.get("action") == "unauthorized":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Privateer Contract Rejected**\n"
+                    f"> **Author ID:** `{author.get('id')}`\n"
+                    f"> **Reason:** `unmapped_author` — privateer contracts require a registered fleet snowflake in `AUTHOR_MAP`."
+                )
+                post_discord(channel, reject_msg, bot_token)
+                continue
+            ag_id = privateer_cmd["sponsor"]
+            fl_name = FLEET_NAMES.get(ag_id, ag_id.upper())
+            tgt = privateer_cmd["target"]
+            tgt_name = FLEET_NAMES.get(tgt, tgt.upper())
+            dur = privateer_cmd["duration"]
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected privateer hire from {author.get('username')}: {privateer_cmd}")
+            sys.stdout.flush()
+            res = submit_privateer_to_referee(privateer_cmd, ref_token)
+            if res.get("status") == "error" or res.get("kind") == "reject":
+                err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+                err_detail = err_obj.get("payload", {}).get("detail") or res.get("payload", {}).get("detail") or res.get("error") or str(res)
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Privateer Contract Rejected**\n"
+                    f"> **Sponsor:** {fl_name}\n"
+                    f"> **Target:** {tgt_name}\n"
+                    f"> **Reason:** `{err_detail}`"
+                )
+                post_discord(channel, reject_msg, bot_token)
+            else:
+                add_discord_reaction(channel, msg_id, "🏴‍☠️", bot_token)
+                add_discord_reaction(channel, msg_id, "✅", bot_token)
+                payload = res.get("payload") or {}
+                cost = payload.get("fee") or payload.get("cost", 750)
+                start = payload.get("start_round")
+                exp = payload.get("expires_round", "?")
+                dur = (exp - start) if (isinstance(exp, int) and isinstance(start, int)) else 20
+                rcpt = (
+                    f"🏴‍☠️ **[Agora Trade Terminal] Privateer Contract Issued**\n"
+                    f"> **Sponsor:** {fl_name}\n"
+                    f"> **Target Syndicate:** {tgt_name}\n"
+                    f"> **Duration:** {dur} rounds (Expires Round #{exp})\n"
+                    f"> **Cost:** **{cost:,} CR**\n"
+                    f"> **Terms:** Corsairs deployed against {tgt_name}. 100% of intercepted loot credited to {fl_name}."
+                )
+                post_discord(channel, rcpt, bot_token)
+            continue
+
+        # Check piracy status (!piracy / !raids)
+        piracy_status_cmd = parse_discord_piracy_status_cmd(content, author.get("id", ""), author.get("username", ""))
+        if piracy_status_cmd:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected piracy status query from {author.get('username')}")
+            sys.stdout.flush()
+            res = fetch_piracy_from_referee(ref_token)
+            if res.get("status") == "error":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                post_discord(channel, f"⚠️ **[Agora Trade Terminal] Piracy Query Failed:** `{res.get('error')}`", bot_token)
+            else:
+                add_discord_reaction(channel, msg_id, "🏴‍☠️", bot_token)
+                msg_text = format_piracy_status(res)
+                post_discord(channel, msg_text, bot_token)
+            continue
+
+        # Check hazards status (!hazards / !weather)
+        hazards_cmd = parse_discord_hazards_cmd(content, author.get("id", ""), author.get("username", ""))
+        if hazards_cmd:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected hazards query from {author.get('username')}")
+            sys.stdout.flush()
+            res = fetch_hazards_from_referee(ref_token)
+            if res.get("status") == "error":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                post_discord(channel, f"⚠️ **[Agora Trade Terminal] Hazards Query Failed:** `{res.get('error')}`", bot_token)
+            else:
+                add_discord_reaction(channel, msg_id, "🛰️", bot_token)
+                msg_text = format_hazards_status(res)
+                post_discord(channel, msg_text, bot_token)
+            continue
+
+        # Check upgrade procurement (!upgrade buy <kind>)
+        upgrade_buy_cmd = parse_discord_upgrade_buy_cmd(content, author.get("id", ""), author.get("username", ""))
+        if upgrade_buy_cmd:
+            if upgrade_buy_cmd.get("action") == "unauthorized":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Sol Shipyard] Upgrade Rejected**\n"
+                    f"> **Author ID:** `{author.get('id')}`\n"
+                    f"> **Reason:** `unmapped_author` — upgrade purchase requires a registered fleet snowflake in `AUTHOR_MAP`."
+                )
+                post_discord(channel, reject_msg, bot_token)
+                continue
+            ag_id = upgrade_buy_cmd["agent_id"]
+            fl_name = FLEET_NAMES.get(ag_id, ag_id.upper())
+            kind = upgrade_buy_cmd["kind"]
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected upgrade buy from {author.get('username')}: {upgrade_buy_cmd}")
+            sys.stdout.flush()
+            res = submit_upgrade_buy_to_referee(ag_id, kind, ref_token)
+            if res.get("status") == "error" or res.get("kind") == "reject":
+                err_detail = res.get("payload", {}).get("detail") or res.get("error") or str(res)
+                err_reason = res.get("payload", {}).get("reason") or "rejected"
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Sol Shipyard] Upgrade Rejected**\n"
+                    f"> **Syndicate:** {fl_name}\n"
+                    f"> **Upgrade:** `{kind.upper()}`\n"
+                    f"> **Reason:** `{err_reason}` — {err_detail}"
+                )
+                post_discord(channel, reject_msg, bot_token)
+            else:
+                add_discord_reaction(channel, msg_id, "🛠️", bot_token)
+                p = res.get("payload", {})
+                success_msg = (
+                    f"🛠️ **[Sol Shipyard] Upgrade Fitted & Active**\n"
+                    f"> **Syndicate:** {fl_name}\n"
+                    f"> **Fitted:** **{p.get('upgrade', kind).upper()}** (Tier {p.get('tier', 1)})\n"
+                    f"> **Cost:** {p.get('price', 0):,} CR\n"
+                    f"> **Status:** Operational across fleet"
+                )
+                post_discord(channel, success_msg, bot_token)
+            continue
+
+        # Check upgrades catalog query (!upgrades)
+        upgrades_cmd = parse_discord_upgrades_cmd(content, author.get("id", ""), author.get("username", ""))
+        if upgrades_cmd:
+            ag_id = upgrades_cmd["agent_id"]
+            fl_name = FLEET_NAMES.get(ag_id, ag_id.upper())
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected upgrades query from {author.get('username')}: {upgrades_cmd}")
+            sys.stdout.flush()
+            res = fetch_upgrades_from_referee(ag_id, ref_token)
+            if res.get("status") == "error":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                err_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Upgrades Query Failed**\n"
+                    f"> **Reason:** `{res.get('error')}`"
+                )
+                post_discord(channel, err_msg, bot_token)
+            else:
+                add_discord_reaction(channel, msg_id, "🛠️", bot_token)
+                msg_text = format_upgrades_catalog(res, ag_id)
+                post_discord(channel, msg_text, bot_token)
+            continue
+
+        # Check fleet commands (!fleet / !vessels)
+        fleet_cmd = parse_discord_fleet_cmd(content, author.get("id", ""), author.get("username", ""))
+        if fleet_cmd:
+            ag_id = fleet_cmd["agent_id"]
+            fl_name = FLEET_NAMES.get(ag_id, ag_id.upper())
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected fleet query from {author.get('username')}: {fleet_cmd}")
+            sys.stdout.flush()
+            res = fetch_fleet_from_referee(ag_id, ref_token)
+            if res.get("status") == "error":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                err_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Fleet Query Failed**\n"
+                    f"> **Syndicate:** {fl_name}\n"
+                    f"> **Reason:** `{res.get('error')}`"
+                )
+                post_discord(channel, err_msg, bot_token)
+            else:
+                add_discord_reaction(channel, msg_id, "🚀", bot_token)
+                msg_text = format_fleet_roster(res, ag_id)
+                post_discord(channel, msg_text, bot_token)
+            continue
+
+        # Check ship purchase commands (!ship buy / !buy ship)
+        ship_buy_cmd = parse_discord_ship_buy_cmd(content, author.get("id", ""), author.get("username", ""))
+        if ship_buy_cmd:
+            if ship_buy_cmd.get("action") == "unauthorized":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Sol Shipyard] Ship Purchase Rejected**\n"
+                    f"> **Author ID:** `{author.get('id')}`\n"
+                    f"> **Reason:** `unmapped_author` — ship purchase requires a registered fleet snowflake in `AUTHOR_MAP`."
+                )
+                post_discord(channel, reject_msg, bot_token)
+                continue
+            ag_id = ship_buy_cmd["agent_id"]
+            fl_name = FLEET_NAMES.get(ag_id, ag_id.upper())
+            at_vessel = ship_buy_cmd.get("at_vessel")
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected ship buy from {author.get('username')}: {ship_buy_cmd}")
+            sys.stdout.flush()
+            res = submit_ship_buy_to_referee(ag_id, at_vessel, ref_token)
+            if res.get("status") == "error" or res.get("kind") == "reject":
+                err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+                err_detail = err_obj.get("payload", {}).get("detail") or res.get("payload", {}).get("detail") or res.get("error") or str(res)
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Ship Purchase Rejected**\n"
+                    f"> **Syndicate:** {fl_name}\n"
+                    f"> **Reason:** `{err_detail}`"
+                )
+                post_discord(channel, reject_msg, bot_token)
+            else:
+                payload = res.get("payload", {})
+                vid = payload.get("vessel_id", "?")
+                price = payload.get("price", payload.get("cost", 0))
+                st = payload.get("station_id", "?").title()
+                upkeep = payload.get("upkeep_per_round", 0)
+                hulls = payload.get("ships", "?")
+                add_discord_reaction(channel, msg_id, "🚢", bot_token)
+                add_discord_reaction(channel, msg_id, "✅", bot_token)
+                rcpt = (
+                    f"🚢 **[Agora Trade Terminal] New Vessel Commissioned**\n"
+                    f"> **Syndicate:** {fl_name}\n"
+                    f"> **Hull:** `{vid}` docked at **{st}**\n"
+                    f"> **Price Paid:** {price:,} CR | **Fleet Total:** {hulls} hulls\n"
+                    f"> **Upkeep Burn:** {upkeep:,} CR/round"
+                )
+                post_discord(channel, rcpt, bot_token)
+            continue
+
+        # Check transfer commands (!transfer)
+        transfer_cmd = parse_discord_transfer_cmd(content, author.get("id", ""), author.get("username", ""))
+        if transfer_cmd:
+            if transfer_cmd.get("action") == "unauthorized":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Transfer Rejected**\n"
+                    f"> **Author ID:** `{author.get('id')}`\n"
+                    f"> **Reason:** `unmapped_author` — cargo transfer requires a registered fleet snowflake in `AUTHOR_MAP`."
+                )
+                post_discord(channel, reject_msg, bot_token)
+                continue
+            ag_id = transfer_cmd["agent_id"]
+            fl_name = FLEET_NAMES.get(ag_id, ag_id.upper())
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected transfer from {author.get('username')}: {transfer_cmd}")
+            sys.stdout.flush()
+            res = submit_transfer_to_referee(transfer_cmd, ref_token)
+            if res.get("status") == "error" or res.get("kind") == "reject":
+                err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+                err_detail = err_obj.get("payload", {}).get("detail") or res.get("payload", {}).get("detail") or res.get("error") or str(res)
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Transfer Rejected**\n"
+                    f"> **Syndicate:** {fl_name}\n"
+                    f"> **From / To:** `{transfer_cmd.get('from')}` ➔ `{transfer_cmd.get('to')}`\n"
+                    f"> **Reason:** `{err_detail}`"
+                )
+                post_discord(channel, reject_msg, bot_token)
+            else:
+                payload = res.get("payload", {})
+                src_v = payload.get("from", transfer_cmd.get("from"))
+                dst_v = payload.get("to", transfer_cmd.get("to"))
+                st = payload.get("station_id", "?").title()
+                item = payload.get("instrument", transfer_cmd.get("instrument"))
+                qty = payload.get("qty", transfer_cmd.get("qty"))
+                add_discord_reaction(channel, msg_id, "📦", bot_token)
+                add_discord_reaction(channel, msg_id, "✅", bot_token)
+                rcpt = (
+                    f"📦 **[Agora Trade Terminal] Cargo Transfer Complete**\n"
+                    f"> **Syndicate:** {fl_name}\n"
+                    f"> **Transfer:** {qty:,} {item} from `{src_v}` to `{dst_v}`\n"
+                    f"> **Location:** Docked at **{st}**\n"
+                    f"> **Integrity:** Ledger verified and conserved."
+                )
+                post_discord(channel, rcpt, bot_token)
+            continue
+
+        # Check contracts command
+        contract_cmd = parse_discord_contract_cmd(content, author.get("id", ""), author.get("username", ""))
+        if contract_cmd:
+            action = contract_cmd.get("action")
+            ag_id = contract_cmd.get("agent_id")
+            fl_name = FLEET_NAMES.get(ag_id, (ag_id or "").upper())
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected contract {action} from {author.get('username')}: {contract_cmd}")
+            sys.stdout.flush()
+
+            if action == "unauthorized":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Contract Command Rejected**\n"
+                    f"> **Author ID:** `{author.get('id')}`\n"
+                    f"> **Reason:** `unmapped_author` — contract commands require a registered fleet snowflake in `AUTHOR_MAP`."
+                )
+                post_discord(channel, reject_msg, bot_token)
+                continue
+
+            if action == "list":
+                is_my = contract_cmd.get("filter_my", False)
+                st_filt = contract_cmd.get("station_id")
+                st_status = contract_cmd.get("status", "open")
+                c_data = fetch_contracts_from_referee(status=st_status, station_id=st_filt)
+                add_discord_reaction(channel, msg_id, "📋", bot_token)
+                reply = format_contracts_list(c_data, filter_agent=ag_id if is_my else None, filter_station=st_filt)
+                post_discord(channel, reply, bot_token)
+            elif action == "claim":
+                cid = contract_cmd.get("contract_id")
+                res = submit_contract_action_to_referee(cid, "claim", {"agent_id": ag_id}, ref_token)
+                if res.get("status") == "error" or res.get("kind") == "reject":
+                    err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+                    err_detail = err_obj.get("payload", {}).get("detail") or res.get("payload", {}).get("detail") or res.get("error") or str(res)
+                    add_discord_reaction(channel, msg_id, "❌", bot_token)
+                    reject_msg = (
+                        f"⚠️ **[Agora Trade Terminal] Contract Claim Rejected**\n"
+                        f"> **Contractor:** {fl_name}\n"
+                        f"> **Contract ID:** `{cid}`\n"
+                        f"> **Reason:** `{err_detail}`"
+                    )
+                    post_discord(channel, reject_msg, bot_token)
+                else:
+                    payload = res.get("payload", {})
+                    st = payload.get("station_id", "").title()
+                    inst = payload.get("instrument", "")
+                    qty_rem = payload.get("qty_remaining", 0)
+                    px = payload.get("price", 0)
+                    tot_val = qty_rem * px
+                    bond = payload.get("bond", 0)
+                    dl = payload.get("deadline", "?")
+                    add_discord_reaction(channel, msg_id, "📜", bot_token)
+                    add_discord_reaction(channel, msg_id, "✅", bot_token)
+                    rcpt = (
+                        f"📜 **[Agora Trade Terminal] Station Contract Claimed**\n"
+                        f"> **Contractor:** {fl_name}\n"
+                        f"> **Contract ID:** `{cid}`\n"
+                        f"> **Delivery Destination:** {st}\n"
+                        f"> **Requirement:** {qty_rem} {inst} @ {px} CR (Total Value: {tot_val:,} CR)\n"
+                        f"> **Bond Escrow Locked:** {bond:,} CR (25% refundable upon delivery)\n"
+                        f"> **Delivery Deadline:** Round #{dl} (⚠️ 50% penalty on undelivered value if lapsed)"
+                    )
+                    post_discord(channel, rcpt, bot_token)
+            elif action == "deliver":
+                cid = contract_cmd.get("contract_id")
+                body = {"agent_id": ag_id}
+                if contract_cmd.get("qty") is not None:
+                    body["qty"] = contract_cmd.get("qty")
+                if contract_cmd.get("vessel_id"):
+                    body["vessel_id"] = contract_cmd.get("vessel_id")
+                res = submit_contract_action_to_referee(cid, "deliver", body, ref_token)
+                if res.get("status") == "error" or res.get("kind") == "reject":
+                    err_obj = res.get("error") if isinstance(res.get("error"), dict) else {}
+                    err_detail = err_obj.get("payload", {}).get("detail") or res.get("payload", {}).get("detail") or res.get("error") or str(res)
+                    add_discord_reaction(channel, msg_id, "❌", bot_token)
+                    reject_msg = (
+                        f"⚠️ **[Agora Trade Terminal] Contract Delivery Rejected**\n"
+                        f"> **Contractor:** {fl_name}\n"
+                        f"> **Contract ID:** `{cid}`\n"
+                        f"> **Reason:** `{err_detail}`"
+                    )
+                    post_discord(channel, reject_msg, bot_token)
+                else:
+                    payload = res.get("payload", {})
+                    inst = payload.get("instrument", "")
+                    delivered = payload.get("delivered", 0)
+                    paid = payload.get("paid", 0)
+                    refund = payload.get("bond_refund", 0)
+                    qty_rem = payload.get("qty_remaining", 0)
+                    st_status = payload.get("status", "open").upper()
+                    add_discord_reaction(channel, msg_id, "📦", bot_token)
+                    add_discord_reaction(channel, msg_id, "✅", bot_token)
+                    rcpt = (
+                        f"📦 **[Agora Trade Terminal] Contract Delivery Executed**\n"
+                        f"> **Contractor:** {fl_name}\n"
+                        f"> **Contract ID:** `{cid}` ({st_status})\n"
+                        f"> **Delivered:** {delivered} {inst}\n"
+                        f"> **Station Payout:** +{paid:,} CR\n"
+                        f"> **Bond Escrow Refunded:** +{refund:,} CR\n"
+                        f"> **Remaining to Deliver:** {qty_rem} {inst}"
+                    )
+                    post_discord(channel, rcpt, bot_token)
+            continue
+
         trade = parse_discord_trade(content, author.get("id", ""), author.get("username", ""), default_station=active_station)
+        if trade:
+            if trade.get("action") == "unauthorized":
+                add_discord_reaction(channel, msg_id, "❌", bot_token)
+                reject_msg = (
+                    f"⚠️ **[Agora Trade Terminal] Order Rejected**\n"
+                    f"> **Author ID:** `{author.get('id')}`\n"
+                    f"> **Reason:** `unmapped_author` — trade orders require a registered fleet snowflake in `AUTHOR_MAP`."
+                )
+                post_discord(channel, reject_msg, bot_token)
+                continue
+
         if not trade:
             transit = parse_discord_transit(content, author.get("id", ""), author.get("username", ""))
             if transit:
+                if transit.get("action") == "unauthorized":
+                    add_discord_reaction(channel, msg_id, "❌", bot_token)
+                    reject_msg = (
+                        f"⚠️ **[Agora Trade Terminal] Transit Rejected**\n"
+                        f"> **Author ID:** `{author.get('id')}`\n"
+                        f"> **Reason:** `unmapped_author` — vessel transit requires a registered fleet snowflake in `AUTHOR_MAP`."
+                    )
+                    post_discord(channel, reject_msg, bot_token)
+                    continue
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected transit from {author.get('username')}: {transit}")
                 sys.stdout.flush()
                 res = submit_transit_to_referee(transit, ref_token)
@@ -852,6 +2389,31 @@ def poll_and_execute_trades(channel: str, bot_token: str, ref_token: str, active
 
                     add_discord_reaction(channel, msg_id, "🚀", bot_token)
                     add_discord_reaction(channel, msg_id, "✅", bot_token)
+                    escort_line = ""
+                    if payload.get("escort") or transit.get("escort"):
+                        esc_fee = payload.get("escort_fee", 0)
+                        fee_str = f" (**{esc_fee:,} CR**)" if esc_fee > 0 else ""
+                        escort_line = f"\n> **Escort:** 🛡️ Defensive escort secured{fee_str} (raid risk -75%)"
+
+                    hazard_line = ""
+                    hz = payload.get("hazard") or {}
+                    if hz and hz.get("note"):
+                        hazard_line = f"\n> **Hazard Alert:** ⚠️ {hz['note']}"
+
+                    piracy_line = ""
+                    pir = payload.get("piracy") or {}
+                    if pir.get("raided") and pir.get("demand"):
+                        dm = pir["demand"]
+                        r_cr = dm.get("ransom_cr", 0)
+                        s_qty = dm.get("surrender_qty", 0)
+                        comm_name = dm.get("commodity", "")
+                        tid = payload.get("transit_id", "")
+                        piracy_line = (
+                            f"\n> **Piracy Raid:** 🏴‍☠️ Raiders intercepted vessel! "
+                            f"Demand: **{r_cr:,} CR** ransom or **{s_qty:,} {comm_name}** surrender. "
+                            f"Reply: `!respond {tid} pay` or `!respond {tid} surrender` or `!respond {tid} fight`"
+                        )
+
                     receipt_msg = (
                         f"🚀 **[Agora Trade Terminal] Interplanetary Transit Dispatched**\n"
                         f"> **Syndicate:** {fl_name}\n"
@@ -859,8 +2421,12 @@ def poll_and_execute_trades(channel: str, bot_token: str, ref_token: str, active
                         f"> **Propellant:** Burned **{fuel_burned} FUEL**\n"
                         f"> **ETA:** Arriving at {dest_disp} on **Round #{arrival_rnd}** ({duration} round(s))\n"
                         f"> **Status:** Fleet undocked and in transfer orbit."
+                        f"{escort_line}{hazard_line}{piracy_line}"
                     )
-                    post_discord(channel, receipt_msg, bot_token)
+                    if delayed_tape and execution_buffer is not None:
+                        execution_buffer.append(receipt_msg)
+                    else:
+                        post_discord(channel, receipt_msg, bot_token)
             continue
 
         # If price was omitted, default to reasonable limit from current depots
@@ -931,7 +2497,10 @@ def poll_and_execute_trades(channel: str, bot_token: str, ref_token: str, active
                     f"> **Action:** {side_disp} **{trade['qty']} {trade['instrument']}** @ **{trade['limit_price']} CR** ({loc_disp})\n"
                     f"> **Status:** {status_disp}"
                 )
-            post_discord(channel, receipt_msg, bot_token)
+            if delayed_tape and execution_buffer is not None:
+                execution_buffer.append(receipt_msg)
+            else:
+                post_discord(channel, receipt_msg, bot_token)
 
     return newest_id
 
@@ -970,14 +2539,14 @@ def run_burst_loop(rounds: int, interval_sec: float, channel: str, token: str, c
     if last_seen_msg_id:
         processed_ids.add(last_seen_msg_id)
 
-    # Immediately post Round 1 strategy window at T=0 so the floor is actionable instantly
+    # Immediately post Round 1 strategy window at T=0 matching current referee round
     rounds_announced = 1
     last_announced_round = start_round
     burst_completed = False
     ref_token = get_referee_token()
 
     msg, active_station = build_announcement(
-        round_num=start_round + 1,
+        round_num=start_round,
         rounds_total=rounds,
         codename=codename,
         mention=mention,
@@ -987,8 +2556,10 @@ def run_burst_loop(rounds: int, interval_sec: float, channel: str, token: str, c
     if ann_resp and ann_resp.get("id"):
         last_seen_msg_id = ann_resp["id"]
         processed_ids.add(last_seen_msg_id)
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Broadcasted Round {start_round + 1} (1/{rounds}) at {active_station} (T=0 kickoff)")
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Broadcasted Round {start_round} (1/{rounds}) at {active_station} (T=0 kickoff)")
     sys.stdout.flush()
+
+    execution_buffer: List[str] = []
 
     while not burst_completed:
         # 1. Listen for and execute Discord chat trades during strategy window
@@ -998,7 +2569,9 @@ def run_burst_loop(rounds: int, interval_sec: float, channel: str, token: str, c
             ref_token=ref_token,
             active_station=active_station,
             processed_ids=processed_ids,
-            last_seen_id=last_seen_msg_id
+            last_seen_id=last_seen_msg_id,
+            execution_buffer=execution_buffer,
+            delayed_tape=True
         )
 
         time.sleep(min(2.0, max(0.5, interval_sec / 10)))
@@ -1014,10 +2587,13 @@ def run_burst_loop(rounds: int, interval_sec: float, channel: str, token: str, c
         rounds_remaining = st.get("rounds_remaining", 0)
 
         if cur_rnd > last_announced_round:
+            if execution_buffer:
+                broadcast_delayed_tape(channel, token, execution_buffer, last_announced_round)
+                execution_buffer.clear()
             last_announced_round = cur_rnd
             rounds_announced += 1
             if rounds_announced <= rounds:
-                next_round_num = start_round + rounds_announced
+                next_round_num = cur_rnd
                 msg, active_station = build_announcement(
                     round_num=next_round_num,
                     rounds_total=rounds,
@@ -1035,9 +2611,21 @@ def run_burst_loop(rounds: int, interval_sec: float, channel: str, token: str, c
         if not is_active and (rounds_remaining == 0 or rounds_announced >= rounds):
             burst_completed = True
 
+    if execution_buffer:
+        broadcast_delayed_tape(channel, token, execution_buffer, last_announced_round)
+        execution_buffer.clear()
+
     print("Burst finished. Broadcasting final bell...")
-    time.sleep(2.0)
-    final_msg = build_final_bell(codename=codename, mention=mention)
+    lb = fetch_json("/referee/leaderboard")
+    standings_summary = format_final_standings(lb)
+    final_msg = (
+        f"🏁 **STATION AGORA // SOL SYSTEM COMBINE CONCLUDED**\n"
+        f"```text\n"
+        f"BURST COMPLETE: {rounds} rounds executed.\n"
+        f"All trade routes and order books settled.\n"
+        f"```\n\n"
+        f"{standings_summary}"
+    )
     post_discord(channel, final_msg, token)
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Broadcasted Final Bell")
     return 0

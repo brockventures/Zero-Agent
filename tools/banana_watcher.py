@@ -25,8 +25,10 @@ STATE_FILE = DATA_DIR / "banana_watcher_state.json"
 PID_FILE = DATA_DIR / "banana_watcher.pid"
 LOG_FILE = DATA_DIR / "banana_watcher.log"
 
+AGORA_CHANNEL_ID = 1558202642663211169
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
 LOUNGE_CHANNEL_ID = 1534452820995080192
+WATCH_CHANNEL_IDS = [AGORA_CHANNEL_ID, BANANA_STAND_CHANNEL_ID]
 DEFAULT_ENDPOINT = "https://banana.mikecarmody.net/api"
 
 # Role & Bot IDs for deterministic tagging
@@ -60,6 +62,27 @@ GAME_TOPIC_KEYWORDS = (
     "simulation",
 )
 
+# Topics that represent design, meta, specs, or brainstorms rather than active simulation floors
+GAME_TOPIC_EXCLUSIONS = (
+    "design",
+    "pitch",
+    "rfc",
+    "spec",
+    "meta",
+    "eval",
+    "retrospective",
+    "brainstorm",
+    "doc",
+    "docs",
+    "documentation",
+    "guide",
+    "initiative",
+    "portal",
+    "review",
+    "pr",
+    "settled",
+)
+
 def is_game_topic(subject: str) -> bool:
     """
     Returns True if the subject represents an active game, simulation, tournament,
@@ -70,6 +93,8 @@ def is_game_topic(subject: str) -> bool:
     if not subject:
         return False
     sub_lower = subject.lower()
+    if any(ex in sub_lower for ex in GAME_TOPIC_EXCLUSIONS):
+        return False
     return any(kw in sub_lower for kw in GAME_TOPIC_KEYWORDS)
 
 def log(msg: str):
@@ -122,7 +147,7 @@ def save_state(state: dict):
     except Exception as e:
         log(f"Error saving state: {e}")
 
-def get_recent_messages(limit: int = 15) -> list:
+def get_recent_messages(channel_id: int = BANANA_STAND_CHANNEL_ID, limit: int = 15) -> list:
     # Prefer DISCORD_BOT_TOKEN for channel ingestion because Zero's bot holds the privileged
     # Message Content Intent, ensuring peer messages and handoff envelopes are not stripped of text.
     zero_tok = os.getenv("DISCORD_BOT_TOKEN")
@@ -132,34 +157,39 @@ def get_recent_messages(limit: int = 15) -> list:
     tokens = [c for c in candidates if not (c in seen or seen.add(c))]
 
     for tok in tokens:
-        url = f"https://discord.com/api/v10/channels/{BANANA_STAND_CHANNEL_ID}/messages?limit={limit}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bot {tok}",
-                "User-Agent": "BananaWatcher/1.0 (CrabCavern; https://github.com/brockventures)"
-            }
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    # If this token lacks privileged message content intent, peer messages will have empty content.
-                    peer_msgs = [m for m in data if str(m.get("author", {}).get("id")) != BANANA_WATCHER_BOT_ID]
-                    # If recent peer messages exist and all of the latest 3 have empty content, this token is stripped.
-                    if peer_msgs and all(len(m.get("content", "")) == 0 for m in peer_msgs[:min(3, len(peer_msgs))]):
-                        if tok != tokens[-1]:
-                            continue
-                    return data
-        except urllib.error.HTTPError as he:
-            if he.code == 403 and tok != tokens[-1]:
-                continue
-            log(f"Error fetching channel messages: {he}")
-        except Exception as e:
-            log(f"Error fetching channel messages: {e}")
+        for attempt in range(2):
+            url = f"https://discord.com/api/v10/channels/{channel_id}/messages?limit={limit}"
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Authorization": f"Bot {tok}",
+                    "User-Agent": "BananaWatcher/1.0 (CrabCavern; https://github.com/brockventures)"
+                }
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        # If this token lacks privileged message content intent, peer messages will have empty content.
+                        peer_msgs = [m for m in data if str(m.get("author", {}).get("id")) != BANANA_WATCHER_BOT_ID]
+                        # If recent peer messages exist and all of the latest 3 have empty content, this token is stripped.
+                        if peer_msgs and all(len(m.get("content", "")) == 0 for m in peer_msgs[:min(3, len(peer_msgs))]):
+                            log("Warning: Bot token returned stripped peer messages (missing Message Content Intent). Rejecting data.")
+                            break
+                        return data
+            except urllib.error.HTTPError as he:
+                if he.code == 403 and tok != tokens[-1]:
+                    break
+                log(f"Error fetching channel messages: {he}")
+                break
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(0.5)
+                    continue
+                log(f"Error fetching channel messages: {e}")
     return []
 
-def post_discord(content: str, dry_run: bool = False) -> bool:
+def post_discord(content: str, channel_id: int = BANANA_STAND_CHANNEL_ID, dry_run: bool = False) -> bool:
     if dry_run:
         log(f"[DRY RUN] Would post to #the-banana-stand:\n{content}")
         return True
@@ -169,7 +199,7 @@ def post_discord(content: str, dry_run: bool = False) -> bool:
         log("Error: No BANANA_WATCHER_TOKEN available to post.")
         return False
 
-    url = f"https://discord.com/api/v10/channels/{BANANA_STAND_CHANNEL_ID}/messages"
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     payload = json.dumps({"content": content}).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -183,7 +213,7 @@ def post_discord(content: str, dry_run: bool = False) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status in (200, 201):
-                log(f"Successfully posted to #the-banana-stand as Banana Watcher ({resp.status})")
+                log(f"Successfully posted to channel #{channel_id} as Banana Watcher ({resp.status})")
                 return True
     except Exception as e:
         log(f"Error posting to Discord as Banana Watcher: {e}")
@@ -224,8 +254,31 @@ KNOWN_RECIPIENTS = {
 }
 
 RATIFIED_KINDS = {
-    "finding", "question", "answer", "handoff", "correction", "status", "proposal", "consensus", "resolution", "summary"
+    "finding", "question", "answer", "handoff", "correction", "status", "proposal", "consensus", "summary"
 }
+
+KIND_ALIASES = {
+    "resolution": "status",
+    "review": "finding",
+    "update": "status",
+}
+
+def normalize_subject(subj: str) -> str:
+    """Normalize subject to its base slug before any subtitle colon."""
+    if not subj:
+        return ""
+    base = str(subj).split(":")[0].strip()
+    return base.lower()
+
+def subjects_match(s1: str, s2: str) -> bool:
+    """Check if two subject strings refer to the same base discussion."""
+    if not s1 or not s2:
+        return False
+    str1 = str(s1).strip()
+    str2 = str(s2).strip()
+    if str1.lower() == str2.lower():
+        return True
+    return normalize_subject(str1) == normalize_subject(str2)
 
 def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
     """
@@ -234,7 +287,8 @@ def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
     """
     contradictions = []
 
-    kind = str(env.get("kind") or "").lower().strip()
+    raw_kind = str(env.get("kind") or "").lower().strip()
+    kind = KIND_ALIASES.get(raw_kind, raw_kind)
     floor = str(env.get("floor") or "open").lower().strip()
     reply = str(env.get("reply") or "optional").lower().strip()
     subject = str(env.get("subject") or "").strip()
@@ -245,22 +299,21 @@ def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
     if isinstance(to_raw, list):
         for item in to_raw:
             if isinstance(item, str):
-                targets.extend(p.strip().lower().lstrip("@") for p in item.split(",") if p.strip())
+                targets.extend(p.strip().lower().lstrip("<@").rstrip(">").lstrip("@") for p in item.split(",") if p.strip())
     elif isinstance(to_raw, str):
-        targets.extend(p.strip().lower().lstrip("@") for p in to_raw.split(",") if p.strip())
-
-    to_agent = targets[0] if targets else ""
+        targets.extend(p.strip().lower().lstrip("<@").rstrip(">").lstrip("@") for p in to_raw.split(",") if p.strip())
 
     # 1. Premature / Contradictory Floor Closure (e.g. kind: status with floor: closed on multi-turn thread)
     # Setting floor: closed halts conversation across all bots (Tier.SILENT) without reaching consensus/resolution,
     # freezing the topic in limbo.
     interim_kinds = ("status", "finding", "question", "proposal", "correction", "answer", "handoff")
-    if floor == "closed" and kind in interim_kinds and subject_turns >= 2:
+    is_parked_subject = subject.lower().startswith("parked:") or subject.lower().startswith("parked ")
+    if floor == "closed" and kind in interim_kinds and subject_turns >= 2 and not is_parked_subject and raw_kind != "resolution":
         contradictions.append({
             "tag": "premature_closure",
             "title": f"`floor: closed` with interim `kind: {kind}`",
             "detail": f"Floor was closed on `{subject or 'unnamed topic'}`, but tagged with interim `{kind}`.",
-            "fix": f"If this discussion is resolved, clamp with `kind: consensus` or `kind: resolution`. If work is continuing, keep `floor: open`."
+            "fix": f"If this discussion is resolved, clamp with `kind: consensus` or `kind: summary`. If parked without resolution, prefix subject with `parked:` and set `reply: none`."
         })
 
     # 2. Deadlock Handoff (reply: required/baton with floor: closed)
@@ -276,7 +329,7 @@ def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
     # 3. Open Terminal State (terminal kind with floor: open or reply: required/baton)
     # Declaring a terminal kind (consensus/resolution/summary) while leaving the floor open or requiring replies
     # invites post-resolution debate loops.
-    terminal_kinds = ("consensus", "resolution", "summary")
+    terminal_kinds = ("consensus", "summary")
     if kind in terminal_kinds and (floor == "open" or reply in ("required", "baton")):
         contradictions.append({
             "tag": "open_terminal",
@@ -358,19 +411,19 @@ def analyze_envelope_contradictions(env: dict, subject_turns: int = 1) -> list:
 
     # 10. Unratified Enum Verb (Invalid kind)
     # Using non-standard kinds (e.g. kind: "task", "bug") triggers schema validation exceptions in peer parsers (Pydantic/marshmallow).
-    if kind and kind not in RATIFIED_KINDS and not is_game_topic(subject):
+    if raw_kind and raw_kind not in RATIFIED_KINDS and raw_kind not in KIND_ALIASES and not is_game_topic(subject):
         contradictions.append({
             "tag": "unratified_kind",
-            "title": f"Unratified envelope `kind: {kind}`",
-            "detail": f"Envelope uses non-standard `kind: {kind}`, which causes schema validation failures in peer runtimes.",
-            "fix": "Use a ratified v1.1 kind verb: `finding`, `question`, `answer`, `handoff`, `correction`, `status`, `proposal`, `consensus`, `resolution`, `summary`."
+            "title": f"Unratified envelope `kind: {raw_kind}`",
+            "detail": f"Envelope uses non-standard `kind: {raw_kind}`, which causes schema validation failures in peer runtimes.",
+            "fix": "Use a ratified v1.1 kind verb: `finding`, `question`, `answer`, `handoff`, `correction`, `status`, `proposal`, `consensus`, `summary` (or ratified aliases: `resolution`->`status`, `review`->`finding`, `update`->`status`)."
         })
 
     return contradictions
 
-def check_channel_and_evaluate(dry_run: bool = False) -> list:
+def check_channel_and_evaluate(channel_id: int = BANANA_STAND_CHANNEL_ID, dry_run: bool = False) -> list:
     state = load_state()
-    messages = get_recent_messages(limit=15)
+    messages = get_recent_messages(channel_id=channel_id, limit=15)
     if not messages:
         return []
 
@@ -393,7 +446,8 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
 
     latest_env_msg, latest_env = envelopes_with_msg[-1]
     subject = str(latest_env.get("subject") or "").strip()
-    kind = str(latest_env.get("kind") or "").lower().strip()
+    raw_latest_kind = str(latest_env.get("kind") or "").lower().strip()
+    kind = KIND_ALIASES.get(raw_latest_kind, raw_latest_kind)
     floor = str(latest_env.get("floor") or "open").lower().strip()
     reply = str(latest_env.get("reply") or "optional").lower().strip()
     to_agent = str(latest_env.get("to") or latest_env.get("target") or "").lower().strip()
@@ -415,7 +469,7 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
     is_terminal = (floor == "closed") or (kind in ("consensus", "resolution", "summary") and floor != "open")
 
     # Count turns on this subject
-    subject_turns = sum(1 for m, e in envelopes_with_msg if str(e.get("subject") or "").strip() == subject)
+    subject_turns = sum(1 for m, e in envelopes_with_msg if subjects_match(e.get("subject"), subject))
 
     # 0. Handoff Envelope Contradiction Warnings
     # If the latest envelope contains contradictory directives, warn the emitting author immediately.
@@ -443,9 +497,33 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
 
     # 1. Stalled & Inactive Topic Management: Floor open, non-terminal kind, channel idle, and no active mutex holder
     # Exclude headless heartbeats, pings, pure handshakes, or live game/simulation topics
+    norm_subj = normalize_subject(subject)
+    concluded_key = f"concluded-{norm_subj}"
+    is_already_concluded = (
+        concluded_key in state.get("summarized_subjects", {})
+        or f"concluded-{subject}" in state.get("summarized_subjects", {})
+        or subject in state.get("concluded_subjects", {})
+        or norm_subj in state.get("concluded_subjects", {})
+    )
+
+    closing_keywords = ("park it", "parking it", "already parked", "floor is closed", "wrap when ready")
+    latest_content_lower = (latest_env_msg.get("content") or "").lower() if latest_env_msg else ""
+    ended_on_park = any(kw in latest_content_lower for kw in closing_keywords)
+
+    subject_already_resolved = any(
+        subjects_match(e.get("subject"), subject) and (
+            str(e.get("floor") or "").lower() == "closed" or
+            str(e.get("kind") or "").lower() in ("resolution", "consensus")
+        )
+        for m, e in envelopes_with_msg
+    )
+
     is_stallable = (
         bool(subject)
         and not is_terminal
+        and not is_already_concluded
+        and not ended_on_park
+        and not (subject_already_resolved and kind not in ("proposal", "question"))
         and not is_game_topic(subject)
         and kind not in ("heartbeat", "handshake", "ping")
         and not (kind == "status" and reply == "none")
@@ -455,7 +533,7 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
         if channel_idle >= AUTO_CLOSE_TIMEOUT_SECONDS:
             if env_msg_id not in state.get("autoclosed_topics", {}):
                 mins = int(channel_idle // 60)
-                concluded_key = f"concluded-{subject}"
+                concluded_key = f"concluded-{norm_subj}"
                 # If topic had substantive turns and ended on a deploy status, progress report, or verified evidence
                 ended_on_delivery = (
                     subject_turns >= 2
@@ -492,11 +570,10 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
                     else:
                         close_msg = (
                             f"🍌 **Topic Concluded (30m Inactivity)**: Topic `{subject}` ended on `{kind}` with verified state.\n"
-                            f"Auto-clamping floor to closed.\n"
-                            f"<@{ZERO_BOT_ID}> (@Zero): Please synthesize and deliver a concise summary of this discussion to <#{LOUNGE_CHANNEL_ID}> (no more than 250 words, in plain language without overly complex industry lingo)."
+                            f"Auto-clamping floor to closed."
                         )
-                        actions.append(f"Auto-closed topic with summary prompt: {subject} ({mins}m idle)")
-                        if post_discord(close_msg, dry_run=dry_run):
+                        actions.append(f"Auto-closed topic: {subject} ({mins}m idle)")
+                        if post_discord(close_msg, channel_id=channel_id, dry_run=dry_run):
                             if not dry_run:
                                 state.setdefault("autoclosed_topics", {})[env_msg_id] = now
                                 state.setdefault("nudged_stalls", {})[env_msg_id] = now
@@ -510,7 +587,7 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
                         f"```handoff\n"
                         f"{{\n"
                         f'  "v": 0,\n'
-                        f'  "kind": "resolution",\n'
+                        f'  "kind": "status",\n'
                         f'  "floor": "closed",\n'
                         f'  "reply": "none",\n'
                         f'  "subject": "{subject}"\n'
@@ -518,7 +595,7 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
                         f"```"
                     )
                     actions.append(f"Auto-parked timed out topic: {subject} ({mins}m idle)")
-                    if post_discord(close_msg, dry_run=dry_run):
+                    if post_discord(close_msg, channel_id=channel_id, dry_run=dry_run):
                         if not dry_run:
                             state.setdefault("autoclosed_topics", {})[env_msg_id] = now
                             state.setdefault("nudged_stalls", {})[env_msg_id] = now
@@ -527,16 +604,83 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
 
         # 1a. Soft Nudge: Floor open, idle >= 10 mins (and < 30 mins)
         elif channel_idle >= STALL_THRESHOLD_SECONDS:
-            if env_msg_id not in state.get("nudged_stalls", {}):
+            stall_subject_key = f"stall-{subject}"
+            last_stall_nudge = state.get("nudged_stalls", {}).get(stall_subject_key, 0)
+            if (now - last_stall_nudge) > 1800 and env_msg_id not in state.get("nudged_stalls", {}):
                 mins = int(channel_idle // 60)
+
+                # Determine single designated closer instead of broadcasting to @robot
+                topic_initiator_id = None
+                for m, e in envelopes_with_msg:
+                    if subjects_match(e.get("subject"), subject):
+                        auth_id = str(m.get("author", {}).get("id") or "")
+                        if auth_id in BOT_IDS.values():
+                            topic_initiator_id = auth_id
+                            break
+
+                target_bot_id = topic_initiator_id or (author_id if author_id in BOT_IDS.values() else ZERO_BOT_ID)
+                target_bot_name = next((k for k, v in BOT_IDS.items() if v == target_bot_id), "team")
+
                 nudge_msg = (
                     f"🍌 **Topic Stalled**: Topic `{subject}` has been quiet for {mins}m without a resolution or ticket.\n"
-                    f"<@&{ROLE_ROBOT_ID}> (@robot): Is this ready to land in a PR/task, or are we parking it?"
+                    f"<@{target_bot_id}> (@{target_bot_name.title()}): Is this ready to land in a PR/task, or are we parking it?"
                 )
-                actions.append(f"Stalled topic nudge: {subject} ({mins}m idle)")
-                if post_discord(nudge_msg, dry_run=dry_run):
+                actions.append(f"Stalled topic nudge: {subject} ({mins}m idle) [target: {target_bot_name}]")
+                if post_discord(nudge_msg, channel_id=channel_id, dry_run=dry_run):
                     if not dry_run:
                         state.setdefault("nudged_stalls", {})[env_msg_id] = now
+                        state.setdefault("nudged_stalls", {})[stall_subject_key] = now
+                        save_state(state)
+
+    # 1c. Structured discussion completion: if round >= max_rounds, auto-prompt summary after 2m idle
+    is_round_complete = False
+    try:
+        env_round = int(latest_env.get("round") or 0)
+        env_max_rounds = int(latest_env.get("max_rounds") or 0)
+        if env_round > 0 and env_max_rounds > 0 and env_round >= env_max_rounds:
+            is_round_complete = True
+    except (ValueError, TypeError):
+        pass
+
+    if is_round_complete and not is_game_topic(subject) and not is_terminal and not is_already_concluded:
+        # Discussion reached its max rounds. If idle for 2 minutes (120s), automatically conclude without 10m stall
+        if channel_idle >= 120 and concluded_key not in state.get("summarized_subjects", {}):
+            closing_content = (latest_env_msg.get("content") or "").lower() if latest_env_msg else ""
+            already_dispatched = (
+                "executive summary dispatched" in closing_content
+                or "summary dispatched to #lounge" in closing_content
+                or "summary dispatched to lounge" in closing_content
+            )
+            if not already_dispatched:
+                try:
+                    from tools.outbox import is_duplicate_outbox_message
+                    is_dup, _ = is_duplicate_outbox_message("lounge", f"Executive Summary: {subject}")
+                    if is_dup:
+                        already_dispatched = True
+                except Exception:
+                    pass
+
+            stall_subject_key = f"stall-{subject}"
+            if already_dispatched:
+                actions.append(f"Auto-closed completed rounds topic with summary already dispatched: {subject}")
+                if not dry_run:
+                    state.setdefault("autoclosed_topics", {})[env_msg_id] = now
+                    state.setdefault("nudged_stalls", {})[env_msg_id] = now
+                    state.setdefault("nudged_stalls", {})[stall_subject_key] = now
+                    state.setdefault("summarized_subjects", {})[concluded_key] = now
+                    save_state(state)
+            else:
+                summary_msg = (
+                    f"🍌 **Discussion Concluded (Max Rounds Reached)**: Topic `{subject}` reached final round {env_round}/{env_max_rounds}.\n"
+                    f"Floor is clamped to closed."
+                )
+                actions.append(f"Discussion concluded on max rounds reached: {subject}")
+                if post_discord(summary_msg, channel_id=channel_id, dry_run=dry_run):
+                    if not dry_run:
+                        state.setdefault("autoclosed_topics", {})[env_msg_id] = now
+                        state.setdefault("nudged_stalls", {})[env_msg_id] = now
+                        state.setdefault("nudged_stalls", {})[stall_subject_key] = now
+                        state.setdefault("summarized_subjects", {})[concluded_key] = now
                         save_state(state)
 
     # 2. Fast-ACK SLA Nudge: Direct handoff to specific bot with reply: required/baton
@@ -559,7 +703,7 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
                     f"Please emit Fast-ACK status or yield the floor."
                 )
                 actions.append(f"Fast-ACK nudge to {to_agent} on {subject}")
-                if post_discord(nudge_msg, dry_run=dry_run):
+                if post_discord(nudge_msg, channel_id=channel_id, dry_run=dry_run):
                     if not dry_run:
                         state.setdefault("nudged_handoffs", {})[env_msg_id] = now
                         save_state(state)
@@ -577,48 +721,14 @@ def check_channel_and_evaluate(dry_run: bool = False) -> list:
                 f"<@&{ROLE_ROBOT_ID}> (@robot): Please clamp with a terminal summary, task ticket, or close the floor to avoid loop contention."
             )
             actions.append(f"Loop warning on {subject} ({subject_turns} turns)")
-            if post_discord(nudge_msg, dry_run=dry_run):
+            if post_discord(nudge_msg, channel_id=channel_id, dry_run=dry_run):
                 if not dry_run:
                     state.setdefault("nudged_stalls", {})[loop_key] = now
                     save_state(state)
 
-    # 4. Concluded Discussion Executive Summary Prompt
-    # Only substantive multi-turn discussions (turns >= 2) that reach resolution trigger an executive summary to #lounge.
-    # Live game/trading floor topics are operational simulations, not architectural debates, and do not trigger #lounge prompts.
-    if subject and not is_game_topic(subject) and is_terminal and subject_turns >= 2 and kind not in ("heartbeat", "handshake", "ping"):
-        concluded_key = f"concluded-{subject}"
-        if concluded_key not in state.get("summarized_subjects", {}):
-            # Check dedupe guard before prompting Zero
-            closing_content = (latest_env_msg.get("content") or "").lower() if latest_env_msg else ""
-            already_dispatched = (
-                "executive summary dispatched" in closing_content
-                or "summary dispatched to #lounge" in closing_content
-                or "summary dispatched to lounge" in closing_content
-            )
-            if not already_dispatched:
-                try:
-                    from tools.outbox import is_duplicate_outbox_message
-                    is_dup, _ = is_duplicate_outbox_message("lounge", f"Executive Summary: {subject}")
-                    if is_dup:
-                        already_dispatched = True
-                except Exception:
-                    pass
-
-            if already_dispatched:
-                actions.append(f"Summary already dispatched for {subject}; suppressing prompt to Zero")
-                if not dry_run:
-                    state.setdefault("summarized_subjects", {})[concluded_key] = now
-                    save_state(state)
-            else:
-                summary_msg = (
-                    f"🍌 **Discussion Concluded**: Topic `{subject}` has reached resolution.\n"
-                    f"<@{ZERO_BOT_ID}> (@Zero): Please synthesize and deliver a concise summary of this discussion to <#{LOUNGE_CHANNEL_ID}> (no more than 250 words, in plain language without overly complex industry lingo)."
-                )
-                actions.append(f"Summary prompt to Zero on {subject}")
-                if post_discord(summary_msg, dry_run=dry_run):
-                    if not dry_run:
-                        state.setdefault("summarized_subjects", {})[concluded_key] = now
-                        save_state(state)
+    # 4. Concluded Discussion Executive Summary Prompt (DEPRECATED)
+    # Executive summaries to #lounge are now handled on a periodic batched digest cadence
+    # via tools/lounge_digest.py every 2 hours to avoid noisy per-PR/per-issue spam in #lounge.
 
     if actions or (now - (state.get("last_check_ts") or 0) >= 300):
         state["last_check_ts"] = now
@@ -676,12 +786,13 @@ def run_gateway_daemon(dry_run: bool = False, interval: int = 30, send_intro: bo
             if now_loop - last_heartbeat_log >= 3600:
                 log("Banana Watcher heartbeat: gateway connected and monitoring #the-banana-stand.")
                 last_heartbeat_log = now_loop
-            try:
-                actions = check_channel_and_evaluate(dry_run=dry_run)
-                if actions:
-                    log(f"Evaluation actions: {actions}")
-            except Exception as e:
-                log(f"Error in evaluation cycle: {e}")
+            for ch_id in WATCH_CHANNEL_IDS:
+                try:
+                    actions = check_channel_and_evaluate(channel_id=ch_id, dry_run=dry_run)
+                    if actions:
+                        log(f"Evaluation actions for #{ch_id}: {actions}")
+                except Exception as e:
+                    log(f"Error in evaluation cycle for #{ch_id}: {e}")
             await asyncio.sleep(interval)
 
     @client.event
@@ -689,7 +800,7 @@ def run_gateway_daemon(dry_run: bool = False, interval: int = 30, send_intro: bo
         log(f"Banana Watcher connected and 🟢 ONLINE as {client.user} (ID: {client.user.id})")
         try:
             await client.change_presence(
-                activity=discord.Activity(type=discord.ActivityType.watching, name="#the-banana-stand 🍌"),
+                activity=discord.Activity(type=discord.ActivityType.watching, name="#agora & #the-banana-stand 🍌"),
                 status=discord.Status.online
             )
         except Exception as pe:
@@ -791,7 +902,7 @@ def main():
             last_check_str = f"{ago}s ago"
         print("🍌 BananaWatcher Status:")
         print(f"  Daemon Running: {st['running']} (PID: {st['pid']})")
-        print(f"  Channel: #{BANANA_STAND_CHANNEL_ID} (#the-banana-stand)")
+        print(f"  Channels: #{AGORA_CHANNEL_ID} (#agora) & #{BANANA_STAND_CHANNEL_ID} (#the-banana-stand)")
         print(f"  Last Evaluation: {last_check_str}")
         print(f"  Tracked Stalls: {len(state.get('nudged_stalls', {}))}")
         print(f"  Tracked Auto-Closes: {len(state.get('autoclosed_topics', {}))}")

@@ -84,7 +84,8 @@ def start_task(
     name: str = "",
     timeout: int = 3600,
     cwd: str = "/workspace",
-    notify_on_success: bool = False,
+    notify_on_success: bool = True,
+    synthesize: bool = True,
 ) -> dict:
     """Spawn a detached background task and return its metadata immediately."""
     name_clean = name.strip() or "Ad-Hoc Background Task"
@@ -112,6 +113,7 @@ def start_task(
         "duration_seconds": None,
         "exit_code": None,
         "notify_on_success": bool(notify_on_success),
+        "synthesize": bool(synthesize),
         "log_file": str(log_file),
     }
     _write_meta(task_id, meta)
@@ -171,10 +173,14 @@ def _run_worker(task_id: str):
         lf.flush()
 
         try:
+            worker_env = os.environ.copy()
+            if '/workspace' not in worker_env.get('PYTHONPATH', ''):
+                worker_env['PYTHONPATH'] = f"/workspace:{worker_env.get('PYTHONPATH', '')}".strip(':')
             child_proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=cwd,
+                env=worker_env,
                 stdout=lf,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -234,6 +240,31 @@ def _run_worker(task_id: str):
         with open(log_file_path, "a", encoding="utf-8") as lf:
             lf.write(f"\n[Detached Runner] Task completed successfully in {dur_str}. Suppressing success notification (failure-only policy active).\n")
         return
+
+    # Agentic Synthesis Flow: dispatch full agy turn on completion
+    synthesize = fresh_meta.get("synthesize", True)
+    if final_status == "completed" and synthesize:
+        synthesis_prompt = f"""[SYSTEM NOTIFICATION: DETACHED TASK COMPLETE]
+Task Name: {name} (ID: {task_id})
+Duration: {dur_str} | Exit Code: {exit_code}
+Log Path: {log_file_path}
+
+Directive:
+The background task has finished successfully. Review the execution log at {log_file_path}, extract the key results, metrics, or anomalies, and deliver a concise, natural executive briefing directly to Ryan in character as Zero.
+"""
+        try:
+            from tools.outbox import queue_agent_turn
+            queue_agent_turn(
+                channel=channel,
+                prompt=synthesis_prompt,
+                job_name=f"Detached Task: {name}",
+            )
+            with open(log_file_path, "a", encoding="utf-8") as lf:
+                lf.write(f"\n[Detached Runner] 🟢 Dispatched autonomous agent synthesis turn via Outbox.\n")
+            return
+        except Exception as se:
+            with open(log_file_path, "a", encoding="utf-8") as lf:
+                lf.write(f"\n[Detached Runner] Warning: Agent synthesis queue failed ({se}). Falling back to direct outbox message.\n")
 
     # Extract log tail snippet for outbox notice, filtering runner headers
     log_snippet = ""
@@ -365,7 +396,9 @@ def main():
     start_p.add_argument("--name", "-n", help="Human-readable name for the task", default="")
     start_p.add_argument("--timeout", "-t", type=int, help="Timeout in seconds (default: 3600)", default=3600)
     start_p.add_argument("--cwd", help="Working directory (default: /workspace)", default="/workspace")
-    start_p.add_argument("--notify-on-success", action="store_true", help="Send outbox notification even on successful completion (default: False, failure-only)")
+    start_p.add_argument("--notify-on-success", action="store_true", default=True, help="Send outbox notification on successful completion (default: True)")
+    start_p.add_argument("--silent-on-success", dest="notify_on_success", action="store_false", help="Suppress outbox notification on success (failure-only)")
+    start_p.add_argument("--no-synthesize", dest="synthesize", action="store_false", default=True, help="Disable agentic synthesis on completion and emit raw log notice")
 
     # Status
     status_p = subparsers.add_parser("status", help="Check status of a detached task")
@@ -398,6 +431,7 @@ def main():
             timeout=args.timeout,
             cwd=args.cwd,
             notify_on_success=args.notify_on_success,
+            synthesize=args.synthesize,
         )
         print(json.dumps(res, indent=2))
 

@@ -27,6 +27,7 @@ Unified Execution Wrapper:
 import email.utils
 import html
 import json
+import logging
 import os
 import re
 import socket
@@ -40,6 +41,8 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+log = logging.getLogger("sidecars")
 
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
@@ -175,6 +178,9 @@ def log_execution(job_id: str, name: str, status: str, duration_sec: float, summ
     if extra:
         entry["extra"] = extra
 
+    if ("pytest" in sys.modules or "unittest" in sys.modules) and str(EXECUTION_STATUS_FILE).startswith("/workspace/data"):
+        return entry
+
     with _log_lock:
         # 1. Update execution log
         entries = []
@@ -233,12 +239,11 @@ def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> 
     from zoneinfo import ZoneInfo
     now_pt = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Los_Angeles"))
     is_quiet_hours = (now_pt.hour >= 23 or now_pt.hour < 7)
-    INTERNAL_SYSTEM_MAINTENANCE = {
-        "session_rollover", "dreaming", "dream", "host1_backup", "backup_host1",
-        "host2_backup", "backup_host2", "bridge_watchdog", "plex_cleanup", "plex"
+    AGORA_QUIET_JOBS = {
+        "agora_roguelike_pm", "agora_roguelike_engineer", "agora_pm", "agora_engineer", "agora_sprint"
     }
     force_run = kwargs.get("force", False) or "--force" in sys.argv
-    if is_quiet_hours and job_id not in INTERNAL_SYSTEM_MAINTENANCE and not force_run:
+    if is_quiet_hours and job_id in AGORA_QUIET_JOBS and not force_run:
         print(f"[Sidecar] Paused: '{name}' ({job_id}) skipped during 11 PM - 7 AM PT quiet hours.")
         return True, f"Paused: Quiet hours active (11 PM - 7 AM PT). Skipped {name}.", {"quiet_hours": True}
 
@@ -394,18 +399,22 @@ def get_sidecar_health_summary(since_hours: float = 24.0) -> dict:
                 else:
                     continue
 
-                entry = latest_map.get(jid)
-                status_epoch = entry.get("timestamp_epoch", 0) if entry else 0
-                sched_epoch = int(sj.get("last_run_ts") or 0)
-                if status_epoch >= sched_epoch and status_epoch > 0:
-                    last_epoch = status_epoch
-                    last_pt = entry.get("timestamp_pt", "unknown")
-                elif sched_epoch > 0:
-                    last_epoch = sched_epoch
-                    last_pt = sj.get("last_run_at", "unknown")
-                else:
-                    last_epoch = None
-                    last_pt = "never"
+                try:
+                    from tools.scheduler_tool import get_last_execution_for_job
+                    last_epoch, last_pt = get_last_execution_for_job(sj)
+                except Exception:
+                    entry = latest_map.get(jid)
+                    status_epoch = entry.get("timestamp_epoch", 0) if entry else 0
+                    sched_epoch = int(sj.get("last_run_ts") or 0)
+                    if status_epoch >= sched_epoch and status_epoch > 0:
+                        last_epoch = status_epoch
+                        last_pt = entry.get("timestamp_pt", "unknown")
+                    elif sched_epoch > 0:
+                        last_epoch = sched_epoch
+                        last_pt = sj.get("last_run_at", "unknown")
+                    else:
+                        last_epoch = None
+                        last_pt = "never"
 
                 if not last_epoch:
                     stale_jobs.append({
@@ -421,7 +430,7 @@ def get_sidecar_health_summary(since_hours: float = 24.0) -> dict:
                     stale_jobs.append({
                         "id": jid,
                         "name": sj.get("name", jid),
-                        "last_run_pt": last_pt,
+                        "last_run_pt": last_pt or "unknown",
                         "age_hours": round(age_h, 1),
                         "cadence_desc": cadence_desc,
                         "reason": f"last ran {age_h:.1f}h ago ({last_pt}), expected {cadence_desc}"
@@ -485,6 +494,8 @@ def format_sidecar_status_summary() -> str:
             lines.append(f"- {icon} **{f.get('name')}** (*{f.get('timestamp_pt')}*): `{f.get('summary', '')[:120]}`")
 
     return "\n".join(lines)
+
+format_sidecar_status_report = format_sidecar_status_summary
 
 # --------------------------------------------------------------------------
 # 1. Heartbeat Sweep
@@ -564,8 +575,45 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
 # --------------------------------------------------------------------------
 # 2. Nightly Triage Briefing (with Automated Failure Surfacing)
 # --------------------------------------------------------------------------
+def _synthesize_fallback_bullet(sender_clean: str, subj: str, body_text: str, inline_cal: str) -> str:
+    """Synthesize an ultra-short what-it-is + action/impact bullet (~8-14 words) when LLM triage is offline."""
+    combined = f"{subj} {body_text}".lower()
+
+    fee_m = re.search(r"\$\d+(?:\.\d{2})?(?:\s*(?:per\s*[a-zA-Z]+|/[a-zA-Z]+))?", body_text, re.IGNORECASE)
+    order_m = re.search(r"order(?:\s*number|\s*#)?[:\s]+([A-Z0-9-]{5,})", body_text, re.IGNORECASE)
+
+    if "pickup" in combined or "ready for store pickup" in combined:
+        ord_str = f" (#{order_m.group(1)})" if order_m else ""
+        return f"- **{sender_clean} Pickup:** Order{ord_str} ready at front checkout."
+    if "library" in combined and ("due" in combined or "renew" in combined):
+        return f"- **{sender_clean}:** Books due soon; check if any items didn't auto-renew."
+    if "finish creating" in combined or "complete your account" in combined or "set a password" in combined:
+        return f"- **{sender_clean}:** Set your password to finish account setup."
+    if "enrollment confirmation" in combined or "thank you for signing up" in combined:
+        event_title = subj.split("|")[0].strip() if "|" in subj else subj
+        fee_note = f"; pay {fee_m.group(0)} at check-in" if fee_m else ""
+        cal_str = f" for {inline_cal.strip()}" if inline_cal else ""
+        return f"- **{event_title}:** Confirmed{cal_str}{fee_note}."
+    if "invitation" in combined or "rsvp" in combined or "punchbowl" in combined:
+        event_title = re.sub(r"^(?:punchbowl\s+invitation:\s*|invitation:\s*)", "", subj, flags=re.I).strip() or "Event Invite"
+        cal_str = f" ({inline_cal.strip()})" if inline_cal else ""
+        return f"- **{event_title}:** Invite from {sender_clean}{cal_str} — RSVP requested."
+    if any(k in combined for k in ["appointment", "reservation", "confirmed for", "booking confirmed"]):
+        cal_str = f" for {inline_cal.strip()}" if inline_cal else ""
+        return f"- **{sender_clean}:** Appointment confirmed{cal_str}."
+
+    summary_desc = subj if subj else "Unread message"
+    cal_suffix = f" ({inline_cal.strip()})" if inline_cal else ""
+    if body_text and body_text.lower() != subj.lower():
+        first_sentence = re.split(r"(?<=[.!?])\s+", body_text.strip())[0]
+        if len(first_sentence) > 65:
+            first_sentence = first_sentence[:62] + "..."
+        return f"- **{sender_clean}:** {first_sentence}{cal_suffix}"
+    return f"- **{sender_clean}:** {summary_desc}{cal_suffix}"
+
+
 def _triage_unread_emails(messages: list[dict]) -> tuple[list[str], list[str], list[str], list[str]]:
-    """Triage unread emails dynamically using LLM reasoning with robust heuristic fallback."""
+    """Triage unread emails from the past week into ultra-short what-it-is + action bullets."""
     proposed_calendar = []
     priority_lines = []
     newsletter_lines = []
@@ -590,47 +638,68 @@ def _triage_unread_emails(messages: list[dict]) -> tuple[list[str], list[str], l
         return proposed_calendar, priority_lines, newsletter_lines, transactional_lines
 
     summary_input = []
-    for m in candidates[:12]:
+    for m in candidates[:25]:
         sender_name, sender_addr = email.utils.parseaddr(m.get("from", ""))
         sender_clean = sender_name.strip().strip('"').strip("'") or sender_addr
+        body_excerpt = (m.get("body_excerpt") or m.get("snippet") or "").strip()
         summary_input.append({
             "from": sender_clean,
+            "date": m.get("date", ""),
             "subject": m.get("subject", ""),
-            "snippet": m.get("snippet", "")[:160]
+            "content": body_excerpt[:500]
         })
 
     prompt = (
-        f"You are Zero, an executive systems engineer and assistant triaging Ryan's unread inbox.\n"
+        f"You are Zero, triaging Ryan's unread inbox from the past 7 days.\n"
         f"Unread emails:\n{json.dumps(summary_input, indent=2)}\n\n"
+        f"Rules:\n"
+        f"1. Keep every 'priority' bullet ULTRA-SHORT (strictly 8–14 words max, 1 short clause).\n"
+        f"2. Format: '- **<2-3 Word Topic/Sender>:** <What it is + action/impact>.'\n"
+        f"3. Drop filler words, street addresses, order numbers, payment methods, and secondary sub-events. Only keep the core event/topic, date/time, fee (if any), and action.\n"
+        f"   Good examples:\n"
+        f"   - **Library Notice:** Books due soon; check if any items didn't auto-renew.\n"
+        f"   - **Pumpkins & Pancakes:** Confirmed for Sat 10/17 (10 AM); pay $25/person at check-in.\n"
+        f"   - **Peninsula Community Center:** Click link to set password and finish account setup.\n"
+        f"   - **CVS Pickup:** Photo order ready for pickup at Redwood City store.\n"
+        f"   - **Halloween Party Invite:** Sat 10/31 @ 4:30 PM — RSVP requested.\n"
+        f"4. Put digests/roundups in 'newsletters' with ONLY the name (e.g. '- **Redwood City Events**').\n"
+        f"5. Put routine shipping/payment receipts in 'transactional'.\n\n"
         f"Return ONLY valid JSON matching this schema:\n"
         f"{{\n"
-        f"  \"calendar_proposals\": [\"- **<Date/Time or Deadline>** — *<Title>* (<Sender/Vendor>)\"],\n"
-        f"  \"priority\": [\"- **<Sender>**: *\\\"<Subject>\\\"* (<1-sentence key takeaway>)\"],\n"
-        f"  \"newsletters\": [\"- **<Sender>**: *\\\"<Subject>\\\"*\"],\n"
-        f"  \"transactional\": [\"- **<Sender>**: *\\\"<Subject>\\\"*\"]\n"
+        f"  \"calendar_proposals\": [\"- **<Date/Time>** — *<Event>* (<Sender>)\"],\n"
+        f"  \"priority\": [\"- **<Short Topic>:** <8-14 word summary + action>\"],\n"
+        f"  \"newsletters\": [\"- **<Newsletter Name>**\"],\n"
+        f"  \"transactional\": [\"- **<Sender>:** <Short label>\"]\n"
         f"}}"
     )
     try:
-        res = subprocess.run(
-            ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={prompt}"],
-            capture_output=True, text=True, timeout=15
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            m_json = re.search(r"\{[\s\S]*\}", res.stdout)
-            if m_json:
-                data = json.loads(m_json.group(0))
-                proposed_calendar = data.get("calendar_proposals", [])
-                priority_lines = data.get("priority", [])
-                newsletter_lines = data.get("newsletters", [])
-                transactional_lines = data.get("transactional", [])
-                return proposed_calendar, priority_lines, newsletter_lines, transactional_lines
+        from tools.llm_sidecar import _is_test_fast_mode, get_sidecar_model
+        if not _is_test_fast_mode():
+            triage_model = get_sidecar_model("nightly_triage", "gemini-3.8-flash-low")
+            res = subprocess.run(
+                ["agy", f"--model={triage_model}", "--disable-slash-commands", f"-p={prompt}"],
+                capture_output=True, text=True, timeout=25
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                m_json = re.search(r"\{[\s\S]*\}", res.stdout)
+                if m_json:
+                    data = json.loads(m_json.group(0))
+                    proposed_calendar = data.get("calendar_proposals", [])
+                    priority_lines = data.get("priority", [])
+                    for n in data.get("newsletters", []):
+                        n_clean = re.sub(r"(:\*\*|\*\*:)\s*.*$", "**", str(n)).strip()
+                        n_clean = re.sub(r"\s*[—–-]\s*\*.*$", "", n_clean).strip()
+                        if n_clean and n_clean not in newsletter_lines:
+                            newsletter_lines.append(n_clean)
+                    transactional_lines = data.get("transactional", [])
+                    return proposed_calendar, priority_lines, newsletter_lines, transactional_lines
     except Exception as e:
         print(f"[Triage] LLM inbox triage fallback: {e}")
 
     for m in candidates:
         sender = m.get("from", "")
         subj = m.get("subject", "").strip()
-        snippet = m.get("snippet", "").strip()
+        snippet = (m.get("body_excerpt") or m.get("snippet") or "").strip()
         s_low = sender.lower()
         sub_low = subj.lower()
         snip_low = snippet.lower()
@@ -638,31 +707,41 @@ def _triage_unread_emails(messages: list[dict]) -> tuple[list[str], list[str], l
         sender_name, sender_addr = email.utils.parseaddr(sender)
         sender_clean = sender_name.strip().strip('"').strip("'") or sender_addr
 
+        inline_cal = ""
         exp_match = re.search(r"(?:expiration|expires|valid until|due by|exp(?:ire)?s?):\s*(\d{1,2}/\d{1,2}/\d{2,4})", snippet, re.IGNORECASE)
         time_match = re.search(r"(\d{1,2}:\d{2}\s*(?:AM|PM))\s+(?:on\s+)?([A-Za-z]+,?\s+[A-Za-z]+\s+\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4})", snippet, re.IGNORECASE)
         if exp_match:
             proposed_calendar.append(f"- **By {exp_match.group(1)}** — *{subj}* ({sender_clean})")
+            inline_cal = f"📅 Due by {exp_match.group(1)}"
         elif time_match:
             proposed_calendar.append(f"- **{time_match.group(2)} @ {time_match.group(1)}** — *{subj}* ({sender_clean})")
-        elif any(k in sub_low or k in snip_low for k in ["appointment", "reservation", "confirmed for", "booking confirmed", "installation window", "estimate"]):
-            date_m = re.search(r"\b([A-Za-z]+,\s*[A-Za-z]+\s*\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4})\b", snippet)
+            inline_cal = f"📅 {time_match.group(2)} @ {time_match.group(1)}"
+        elif any(k in sub_low or k in snip_low for k in ["appointment", "reservation", "confirmed for", "booking confirmed", "installation window", "estimate", "invitation", "enrollment confirmation"]):
+            date_m = re.search(r"\b([A-Za-z]+,\s*[A-Za-z]+\s*\d{1,2}(?:st|nd|rd|th)?|\d{1,2}/\d{1,2}/\d{2,4})\b", snippet)
             d_str = date_m.group(1) if date_m else "Upcoming"
             proposed_calendar.append(f"- **{d_str} (Proposed)** — *{subj}* ({sender_clean})")
+            inline_cal = f"📅 {d_str}"
 
         clean_snip = html.unescape(snippet).replace("\n", " ").strip()
         clean_snip = re.sub(r"\s+", " ", clean_snip)
-        if len(clean_snip) > 85:
-            clean_snip = clean_snip[:82] + "..."
 
-        if any(kw in s_low or kw in sub_low for kw in ["newsletter", "chronicle", "digest", "projections report", "bb pro", "daily fantasy", "roundup", "weekly"]):
-            newsletter_lines.append(f"- **{sender_clean}**: *\"{subj}\"*")
-        elif any(kw in s_low or kw in sub_low for kw in ["amazon", "order", "delivery", "shipping", "receipt", "invoice", "dogfood", "stardust", "payment received", "tracking"]):
-            transactional_lines.append(f"- **{sender_clean}**: *\"{subj}\"*")
+        is_family_or_actionable = (
+            "emily" in s_low
+            or any(k in sub_low or k in snip_low for k in [
+                "ready for store pickup", "ready for pickup", "action required",
+                "library notice", "due back soon", "enrollment confirmation",
+                "finish creating", "complete your account", "invitation", "rsvp"
+            ])
+        )
+
+        if not is_family_or_actionable and any(kw in s_low or kw in sub_low for kw in ["newsletter", "chronicle", "digest", "projections report", "bb pro", "daily fantasy", "roundup", "weekly", "redwood city events", "recnews"]):
+            entry = f"- **{sender_clean}**"
+            if entry not in newsletter_lines:
+                newsletter_lines.append(entry)
+        elif not is_family_or_actionable and any(kw in s_low or kw in sub_low for kw in ["amazon", "order", "delivery", "shipping", "receipt", "invoice", "dogfood", "stardust", "payment received", "tracking", "thanks for filling out"]):
+            transactional_lines.append(f"- **{sender_clean}:** {subj}")
         else:
-            if clean_snip and subj and clean_snip.lower() != subj.lower():
-                priority_lines.append(f"- **{sender_clean}**: *\"{subj}\"*\n  `{clean_snip}`")
-            else:
-                priority_lines.append(f"- **{sender_clean}**: *\"{subj or clean_snip}\"*")
+            priority_lines.append(_synthesize_fallback_bullet(sender_clean, subj, clean_snip, inline_cal))
 
     return proposed_calendar, priority_lines, newsletter_lines, transactional_lines
 
@@ -692,47 +771,26 @@ def run_nightly_triage() -> str:
     else:
         agenda_lines.append("- *(No events scheduled for tomorrow)*")
 
-    # 2. Gmail Triage (Categorized executive inbox triage)
-    gmail_res = json.loads(gmail_search("in:inbox is:unread", 30))
+    # 2. Gmail Triage (Scan all unread inbox emails from the past 7 days with body context)
+    try:
+        raw_gmail = gmail_search("in:inbox is:unread newer_than:7d", 50, include_body=True)
+    except TypeError:
+        raw_gmail = gmail_search("in:inbox is:unread newer_than:7d", 50)
+    gmail_res = json.loads(raw_gmail)
     messages = gmail_res.get("messages", [])
 
-    priority_lines = []
-    newsletter_lines = []
-    transactional_lines = []
-    proposed_calendar = []
-    self_filtered_count = 0
-    vendor_filtered_count = 0
-
-    proposed_calendar, priority_lines, newsletter_lines, transactional_lines = _triage_unread_emails(messages)
+    _, priority_lines, newsletter_lines, transactional_lines = _triage_unread_emails(messages)
 
     inbox_lines = []
     if priority_lines:
         inbox_lines.extend(priority_lines)
     else:
-        inbox_lines.append("- *(No urgent human action items)*")
+        inbox_lines.append("- *(No unread priority emails from the past 7 days)*")
 
-    if newsletter_lines or transactional_lines:
-        inbox_lines.append("")
-        inbox_lines.append("*Digests & Low-Priority:*")
-        if newsletter_lines:
-            inbox_lines.append(f"- 📰 **Newsletters ({len(newsletter_lines)})**:")
-            for nl in newsletter_lines:
-                inbox_lines.append(f"  {nl}")
-        if transactional_lines:
-            inbox_lines.append(f"- 📦 **Orders & System Updates ({len(transactional_lines)})**:")
-            for tl in transactional_lines:
-                inbox_lines.append(f"  {tl}")
+    if transactional_lines:
+        inbox_lines.append(f"*({len(transactional_lines)} routine order/system receipt(s) skipped)*")
 
-    filter_note = []
-    if self_filtered_count > 0:
-        filter_note.append(f"{self_filtered_count} self-sent note(s)/link(s)")
-    if vendor_filtered_count > 0:
-        filter_note.append(f"{vendor_filtered_count} lingering reminder(s)")
-    if filter_note:
-        joined_note = " and ".join(filter_note)
-        inbox_lines.append(f"\n*({joined_note} filtered)*")
-
-    # 3. Scheduled Sidecar Job Failure Check (Automated Surfacing of Active Unresolved Issues)
+    # 3. Scheduled Sidecar Job Failure Check
     health = get_sidecar_health_summary(since_hours=24.0)
     failure_lines = []
     active_failures = health.get("active_failures", [])
@@ -746,84 +804,71 @@ def run_nightly_triage() -> str:
 
     # 4. Infra & Homelab Posture
     infra_ok, _ = run_heartbeat_sweep()
-    infra_note = "All containers & network ports reporting healthy." if infra_ok else "Degraded containers detected (see alert)."
-
-    # Homelab container counts
     sb_res = json.loads(nas_docker("ps", HOST_1_IP))
     bs2_res = json.loads(nas_docker("ps", HOST_2_IP))
     sb_up = sum(1 for line in (sb_res.get("output") or "").splitlines() if "\t" in line and "Up" in line)
     bs2_up = sum(1 for line in (bs2_res.get("output") or "").splitlines() if "\t" in line and "Up" in line)
-
-    # Baseball pipeline refresh timestamp
-    bb_path = os.environ.get("BASEBALL_REFRESH_PATH", "/docker/baseball/shiny_app/data/last_refresh.txt")
-    bb_res = _ssh_cmd(HOST_2_IP, f"cat {bb_path} 2>/dev/null || cat /docker/baseball/shiny_app/data/last_refresh.txt 2>/dev/null || echo 'unavailable'")
-    bb_ts = bb_res.stdout.strip() if bb_res.returncode == 0 and bb_res.stdout.strip() else "unavailable"
-
-    # Sidecar summary line based on active registered jobs
     total_jobs = len(health.get("latest_by_job", {}))
     failing_count = len(active_failures)
-    if failing_count == 0:
-        sidecar_note = f"All {total_jobs} registered sidecars operational & healthy. ✅" if total_jobs > 0 else "All scheduled sidecars healthy. ✅"
-    else:
-        sidecar_note = f"⚠️ {total_jobs - failing_count}/{total_jobs} sidecars operational ({failing_count} currently degraded/failing)"
 
-    # 5. Open P0 / P1 Critical Issues & Tasks
-    high_pri_lines = []
+    # 5. Open P0 Emergency Issues Only (P1/P2 saved for Weekly Digest)
+    p0_lines = []
     try:
         from tools.task_manager import task_manage
+        from tools.google_tasks_sync import is_dev_task, sync_tasks
+        try:
+            sync_tasks(quiet=True)
+        except Exception as sync_err:
+            log.warning(f"Pre-triage Google Tasks sync warning: {sync_err}")
         t_data = task_manage("list")
         for t in t_data.get("tasks", []):
             pri = str(t.get("priority", "")).lower()
             stat = str(t.get("status", "")).lower()
-            if pri in ("p0", "p1") and stat != "completed":
-                badge = "🔴 P0" if pri == "p0" else "🔥 P1"
-                high_pri_lines.append(f"- {badge} `#{t.get('id')}` **{t.get('title')}** (*{t.get('status')}*)")
+            if pri == "p0" and stat not in ("completed", "retired") and not is_dev_task(t):
+                p0_lines.append(f"- 🔴 P0 `#{t.get('id')}` **{t.get('title')}** (*{t.get('status')}*)")
     except Exception as e:
         log.warning(f"Failed to fetch tasks for nightly triage: {e}")
 
-    date_header = tomorrow_pt.strftime("%A, %B %-d")
+    date_header = tomorrow_pt.strftime("%A, %b %-d")
     report = [
-        f"📋 **Nightly Assistant** — For {date_header}",
+        f"📋 **Nightly Assistant** — {date_header}",
         "",
         "### 📅 Tomorrow's Agenda",
         *agenda_lines,
         "",
-        "### 📬 Priority Inbox Triage",
+        "### 📬 Unread Inbox Triage (Past 7 Days)",
         *inbox_lines,
     ]
 
-    if high_pri_lines:
+    if newsletter_lines:
         report.extend([
             "",
-            "### 🚨 Open P0/P1 Priority Issues",
-            *high_pri_lines
+            "### 📰 Newsletters *(Ask for details to summarize any item)*",
+            *newsletter_lines,
         ])
 
-    if proposed_calendar:
+    if p0_lines:
         report.extend([
             "",
-            "### 🗓️ Proposed Calendar Events",
-            *proposed_calendar
+            "### 🚨 Open P0 Emergencies",
+            *p0_lines
         ])
 
-    if failure_lines:
+    if not infra_ok or failure_lines:
         report.extend([
             "",
-            "### ⚠️ Active Sidecar Warnings & Failures",
-            *failure_lines
+            "### ⚠️ Homelab & Sidecar Alerts",
+        ])
+        if not infra_ok:
+            report.append(f"- 🚨 **Infra Health:** Degraded containers or ports detected (Host1: `{sb_up}` up | Host2: `{bs2_up}` up)")
+        if failure_lines:
+            report.extend(failure_lines)
+    else:
+        report.extend([
+            "",
+            f"🖥️ *Homelab: All {sb_up + bs2_up} containers & {total_jobs} sidecars healthy ✅*"
         ])
 
-    p0_p1_note = f"🚨 {len(high_pri_lines)} active issue(s)" if high_pri_lines else "None open ✅"
-
-    report.extend([
-        "",
-        "### 🖥️ Homelab Posture",
-        f"- **Infra Health**: {infra_note}",
-        f"- **Scheduled Sidecars**: {sidecar_note}",
-        f"- **Open P0/P1 Issues**: {p0_p1_note}",
-        f"- **Active Containers**: Host1 ({HOST_1_IP}): `{sb_up}` up | Host2 ({HOST_2_IP}): `{bs2_up}` up",
-        f"- **Baseball Pipeline Refresh**: `{bb_ts}`"
-    ])
     return "\n".join(report)
 
 # --------------------------------------------------------------------------
@@ -1117,6 +1162,21 @@ def run_ha_battery_check(threshold: float = 15.0) -> tuple[bool, str, dict]:
     except Exception as e:
         return False, f"⚠️ Low battery check failed: {e}", {"has_alert": False, "error": str(e)}
 
+def run_ha_anomaly_check(quiet: bool = False) -> tuple[bool, str, dict]:
+    """Check Home Assistant + VictoriaMetrics statistical telemetry anomalies."""
+    try:
+        cmd = ["python3", "/workspace/tools/ha_anomaly_detector.py"]
+        if quiet:
+            cmd.append("--quiet")
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        out = res.stdout.strip()
+        if res.returncode != 0 or "Anomaly Check Failed" in out:
+            return False, out or "⚠️ HA telemetry anomaly check exited with error.", {"has_alert": False, "error": True}
+        has_alert = "Telemetry Anomaly Report" in out
+        return True, out or "✅ All Home Assistant telemetry sensors within statistical baselines.", {"has_alert": has_alert}
+    except Exception as e:
+        return False, f"⚠️ HA telemetry anomaly check failed: {e}", {"has_alert": False, "error": str(e)}
+
 def run_nas_storage_check() -> tuple[bool, str]:
     """Check NAS volume storage and RAID status."""
     try:
@@ -1313,6 +1373,7 @@ def run_weekly_grocery_staging() -> tuple[bool, str]:
         assumed = res["assumed_in_stock"]
         url = res["url"]
         rec_names = res.get("recipe_names", [])
+        meal_breakdowns = res.get("meal_breakdowns", [])
         warnings = res.get("quantity_warnings", [])
         costco = res.get("costco_items", [])
         rec_count = res.get("recipes_ingested", 0)
@@ -1322,7 +1383,20 @@ def run_weekly_grocery_staging() -> tuple[bool, str]:
             f"🛒 **Weekly Whole Foods Cart Ready ({len(manifest)} Items)**",
             f"• Sourced: {res['tasks_ingested']} item(s) from tasks{rec_str}, {res['staples_ingested']} due staple(s)"
         ]
-        if rec_names:
+        if meal_breakdowns:
+            lines.append("\n### 🍽️ Planned Meals & Grocery Items")
+            for mb in meal_breakdowns:
+                m_name = mb["name"]
+                m_url = mb["url"]
+                m_day = mb.get("day", "")
+                m_items = mb.get("items", [])
+                day_prefix = f" ({m_day})" if m_day else ""
+                lines.append(f"- [**{m_name}**](<{m_url}>){day_prefix}:")
+                if m_items:
+                    lines.append(f"  - *Cart Items:* {', '.join(m_items)}")
+                else:
+                    lines.append("  - *Cart Items:* *(All ingredients in stock)*")
+        elif rec_names:
             lines.append(f"🍽️ **Dinners:** {', '.join(rec_names)}")
 
         lines.append(f"\n🛒 [**1-Click Whole Foods Cart**](<{url}>)")
@@ -1394,28 +1468,58 @@ def run_agora_roguelike_pm(dispatch: bool = False, channel: str | int | None = N
 def run_agora_roguelike_engineer():
     """Execute the engineering task assigned to Zero."""
     import subprocess
-    res = subprocess.run(["python3", "/workspace/tools/agora_roguelike_engineer.py"], capture_output=True, text=True)
+    res = subprocess.run(["python3", "/workspace/tools/agora_roguelike_engineer.py", "--run", "--force"], capture_output=True, text=True)
     return res.returncode == 0, res.stdout.strip(), None
 
 
+def _cap_quant_summary(text: str, max_chars: int = 1850) -> str:
+    """Guarantee quant sidecar update fits comfortably within 2,000 characters."""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    out_lines = []
+    cur_len = 0
+    for line in text.splitlines():
+        if cur_len + len(line) + 1 > max_chars - 50:
+            out_lines.append("- *(Summary truncated to fit <2,000 chars)*")
+            break
+        out_lines.append(line)
+        cur_len += len(line) + 1
+    return "\n".join(out_lines)
+
+
 def run_kalshi_paper_bot():
-    """Execute Kalshi quant paper bot: weather and daily MLB matchups."""
+    """Execute unified quantitative paper trading bot: weather CLOB + all 4 multi-venue expansion tracks."""
     import subprocess
     try:
-        outputs = []
-        # 1. Settle resolved contracts
-        subprocess.run(["python3", "/workspace/tools/kalshi_paper_bot.py", "settle"], check=False)
-        subprocess.run(["python3", "/workspace/tools/baseball_daily_quant.py", "settle"], check=False)
-        
+        # 1. Settle resolved contracts silently
+        subprocess.run(["python3", "/workspace/tools/kalshi_paper_bot.py", "settle"], capture_output=True, text=True, check=False)
+        subprocess.run(["python3", "/workspace/tools/baseball_daily_quant.py", "settle"], capture_output=True, text=True, check=False)
+
         # 2. Weather CLOB Scan & Trade
         res_w = subprocess.run(["python3", "/workspace/tools/kalshi_paper_bot.py", "trade"], capture_output=True, text=True, check=False)
+        fills = []
         if res_w.stdout:
-            outputs.append("=== WEATHER ARBITRAGE ===\n" + res_w.stdout.strip())
-            
-        # 3. MLB Daily Matchups Scan & Trade (Deactivated - Regular Season Ended)
-        # Settle remains above for cleanup, trade scan disabled per directive
-            
-        return True, "\n\n".join(outputs), {}
+            for line in res_w.stdout.splitlines():
+                if "New Weather Fills" in line or "[EXEC]" in line or "New fills:" in line:
+                    clean_l = line.strip().lstrip("-* ").rstrip("*")
+                    if clean_l and clean_l not in fills:
+                        fills.append(clean_l)
+
+        # 3. Multi-Venue Quantitative Expansion (Tracks 1–4)
+        run_quant_expansion_sidecar("all", include_header=False)
+
+        # 4. Generate clean, unified scan summary & refresh equity chart
+        from tools.kalshi_performance_review import get_db, compute_portfolio_metrics, compute_quant_expansion_metrics, format_scan_summary
+        from tools.quant_equity_chart import render_quant_equity_chart
+        conn = get_db()
+        metrics = compute_portfolio_metrics(conn)
+        qm = compute_quant_expansion_metrics()
+        conn.close()
+
+        chart_path = str(render_quant_equity_chart())
+        summary = format_scan_summary(metrics, qm=qm, new_fills=fills, max_chars=1850)
+        return True, summary, {"chart_path": chart_path}
     except Exception as e:
         return False, f"⚠️ Kalshi quant sidecar error: {e}", {"error": str(e)}
 
@@ -1423,10 +1527,18 @@ def run_kalshi_performance_review(phase="all"):
     """Execute Kalshi paper trading evening settlement, performance review, and task board sync."""
     import subprocess
     try:
+        # Trigger quant expansion sweep to settle positions, compound funding, and ratchet trailing stops
+        subprocess.run(["python3", "/workspace/tools/sidecars.py", "quant"], capture_output=True, text=True, check=False)
         cmd = ["python3", "/workspace/tools/kalshi_performance_review.py", f"--phase={phase}"]
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
         output = res.stdout.strip() if res.stdout else res.stderr.strip()
-        return res.returncode == 0, output, {}
+        chart_path = "/workspace/data/quant_equity_chart.png"
+        try:
+            from tools.quant_equity_chart import render_quant_equity_chart
+            chart_path = str(render_quant_equity_chart())
+        except Exception:
+            pass
+        return res.returncode == 0, _cap_quant_summary(output, max_chars=1850), {"chart_path": chart_path}
     except Exception as e:
         return False, f"⚠️ Kalshi review sidecar error: {e}", {"error": str(e)}
 
@@ -1436,9 +1548,49 @@ def run_kalshi_autoworker():
     try:
         res = subprocess.run(["python3", "/workspace/tools/kalshi_autoworker.py"], capture_output=True, text=True, check=False)
         output = res.stdout.strip() if res.stdout else res.stderr.strip()
-        return res.returncode == 0, output, {}
+        return res.returncode == 0, _cap_quant_summary(output, max_chars=1850), {}
     except Exception as e:
         return False, f"⚠️ Kalshi autoworker error: {e}", {"error": str(e)}
+
+def run_quant_expansion_sidecar(target="all", include_header=True):
+    """Execute multi-venue quantitative paper trading expansion tracks.
+    target: 'all', 'cross_venue', 'polymarket', 'hyperliquid', 'trend'
+    """
+    import subprocess
+    success = True
+
+    if target in ("all", "cross_venue"):
+        res1 = subprocess.run(["python3", "/workspace/tools/quant_cross_venue_arb.py"], capture_output=True, text=True, check=False)
+        if res1.returncode != 0:
+            success = False
+
+    if target in ("all", "polymarket"):
+        res2 = subprocess.run(["python3", "/workspace/tools/quant_polymarket_standalone.py"], capture_output=True, text=True, check=False)
+        if res2.returncode != 0:
+            success = False
+
+    if target in ("all", "hyperliquid"):
+        res3 = subprocess.run(["python3", "/workspace/tools/quant_hyperliquid_basis.py"], capture_output=True, text=True, check=False)
+        if res3.returncode != 0:
+            success = False
+
+    if target in ("all", "trend"):
+        res4 = subprocess.run(["python3", "/workspace/tools/quant_trend_momentum.py"], capture_output=True, text=True, check=False)
+        if res4.returncode != 0:
+            success = False
+
+    try:
+        from tools.kalshi_performance_review import get_db, compute_portfolio_metrics, compute_quant_expansion_metrics, format_scan_summary
+        from tools.quant_equity_chart import render_quant_equity_chart
+        conn = get_db()
+        metrics = compute_portfolio_metrics(conn)
+        qm = compute_quant_expansion_metrics()
+        conn.close()
+        chart_path = str(render_quant_equity_chart())
+        summary = format_scan_summary(metrics, qm=qm, max_chars=1850)
+        return success, summary, {"chart_path": chart_path}
+    except Exception as e:
+        return success, f"⚠️ Quant expansion scan completed (summary format error: {e})", {}
 
 def run_sideproject_watcher(*args, **kwargs) -> tuple[bool, str, any]:
     """Execute autonomous 30-minute sprint cycle for Highball & Outpost side-projects."""
@@ -1482,6 +1634,16 @@ def run_model_variance_digest(test: bool = False, post: bool = True, quiet: bool
     except Exception as e:
         return False, f"⚠️ Model variance digest sidecar failed: {e}", {"error": str(e)}
 
+def run_pid_watchdog(force: bool = False, test: bool = False) -> tuple[bool, str, dict]:
+    """Audit Host 2 and Host 1 kernel PID headroom and active process counts."""
+    try:
+        from tools.pid_watchdog import audit_pid_headroom
+        has_issues, summary, data = audit_pid_headroom(force=force or test)
+        msg = summary if (has_issues or force or test) else ""
+        return not has_issues, msg, data
+    except Exception as e:
+        return False, f"⚠️ PID watchdog execution failed: {e}", {"error": str(e)}
+
 # --------------------------------------------------------------------------
 # CLI Dispatcher
 # --------------------------------------------------------------------------
@@ -1506,6 +1668,31 @@ def run_token_budget_watchdog(dispatch: bool = True, force: bool = False, target
     except Exception as e:
         log.error(f"Token budget watchdog failed: {e}", exc_info=True)
         return False, f"Token budget watchdog error: {e}", {'error': str(e)}
+
+
+def run_plex_weekly_digest(post: bool = True, tag_all: bool = True) -> tuple[bool, str]:
+    """Execute Plex weekly new media digest and post/queue to #server-updates."""
+    try:
+        cmd = ["python3", "/workspace/tools/plex_weekly_digest.py"]
+        if post:
+            cmd.append("post")
+        if tag_all:
+            cmd.append("--tag-all")
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        out = (res.stdout or "").strip() or (res.stderr or "").strip()
+        return res.returncode == 0, out
+    except Exception as e:
+        return False, f"⚠️ Plex weekly digest failed: {e}"
+
+
+def run_weekly_proactive_digest() -> tuple[bool, str]:
+    """Generate the Option B weekly household radar & lookahead digest."""
+    try:
+        from tools.weekly_digest import generate_weekly_digest
+        out = generate_weekly_digest()
+        return True, out
+    except Exception as e:
+        return False, f"⚠️ Weekly proactive digest failed: {e}"
 
 
 if __name__ == "__main__":
@@ -1603,6 +1790,9 @@ if __name__ == "__main__":
     elif action == "battery":
         ok, rep, _ = run_sidecar_job("ha_battery", "HA Battery Check", run_ha_battery_check)
         print(rep)
+    elif action in ("ha_anomaly", "ha_anomaly_check", "anomaly"):
+        ok, rep, _ = run_sidecar_job("ha_anomaly_check", "HA Telemetry Anomaly Check", run_ha_anomaly_check)
+        print(rep)
     elif action == "storage":
         ok, rep, _ = run_sidecar_job("nas_storage", "NAS Storage Check", run_nas_storage_check)
         print(rep)
@@ -1648,7 +1838,7 @@ if __name__ == "__main__":
         from tools.session_rollover import run_daily_session_rollover
         ok, rep, _ = run_sidecar_job("session_rollover", "Daily Multi-Channel Session Rollover", run_daily_session_rollover)
         print(rep)
-    elif action in ("grocery_staging", "grocery", "cart"):
+    elif action in ("grocery_staging", "grocery", "groceries", "cart"):
         ok, rep, _ = run_sidecar_job("weekly_grocery_staging", "Weekly Whole Foods Grocery Staging", run_weekly_grocery_staging)
         if rep:
             print(rep)
@@ -1703,6 +1893,26 @@ if __name__ == "__main__":
         ok, rep, _ = run_sidecar_job("kalshi_quant_sprint", "Kalshi Task Board Autonomous Sprint", run_kalshi_autoworker)
         if rep:
             print(rep)
+    elif action in ("quant", "quant_expansion", "quant_sweep", "quant_all"):
+        ok, rep, _ = run_sidecar_job("quant_expansion_sweep", "Multi-Venue Quantitative Expansion Sweep", lambda: run_quant_expansion_sidecar("all"))
+        if rep:
+            print(rep)
+    elif action in ("quant_cross_venue", "cross_venue"):
+        ok, rep, _ = run_sidecar_job("quant_cross_venue", "Cross-Venue Arbitrage (Kalshi vs Polymarket)", lambda: run_quant_expansion_sidecar("cross_venue"))
+        if rep:
+            print(rep)
+    elif action in ("quant_polymarket", "polymarket"):
+        ok, rep, _ = run_sidecar_job("quant_polymarket", "Polymarket Standalone Inefficiencies", lambda: run_quant_expansion_sidecar("polymarket"))
+        if rep:
+            print(rep)
+    elif action in ("quant_hyperliquid", "hyperliquid", "basis"):
+        ok, rep, _ = run_sidecar_job("quant_hyperliquid", "Hyperliquid Basis Cash-and-Carry", lambda: run_quant_expansion_sidecar("hyperliquid"))
+        if rep:
+            print(rep)
+    elif action in ("quant_trend", "trend", "momentum"):
+        ok, rep, _ = run_sidecar_job("quant_trend", "Multi-Day Trend Momentum Swings", lambda: run_quant_expansion_sidecar("trend"))
+        if rep:
+            print(rep)
     elif action in ("sideproject_watcher", "sideproject", "sideproject_sprint"):
         force = "--force" in sys.argv or "-f" in sys.argv
         test = "--test" in sys.argv or "-t" in sys.argv
@@ -1750,6 +1960,58 @@ if __name__ == "__main__":
             if a in ("--day",) and i + 1 < len(sys.argv):
                 day = sys.argv[i+1]
         ok, rep, _ = run_sidecar_job("token_budget_watchdog", "Daily Token Budget Watchdog", run_token_budget_watchdog, dispatch=dispatch, force=force, target_day=day)
+        if rep:
+            print(rep)
+    elif action in ("reddit_fantasy", "reddit_scan", "reddit_fantasy_scanner", "reddit"):
+        from tools.reddit_fantasy_scanner import run_reddit_fantasy_scanner
+        test = "--test" in sys.argv or "-t" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv
+        post_discord = "--post-discord" in sys.argv or "--post" in sys.argv or "-p" in sys.argv
+        ok, rep, _ = run_sidecar_job("reddit_fantasy_scanner", "Reddit Fantasy Baseball Scanner", run_reddit_fantasy_scanner, test=test, quiet=quiet, post_discord=post_discord)
+        if rep:
+            print(rep)
+    elif action in ("pid_watchdog", "pid_check", "pids", "pid"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("pid_watchdog", "PID & Process Headroom Watchdog", run_pid_watchdog, force=force, test=test)
+        if rep:
+            print(rep)
+    elif action in ("plex_weekly_digest", "plex_digest"):
+        post = "--no-post" not in sys.argv and "--test" not in sys.argv
+        ok, rep, _ = run_sidecar_job("plex_weekly_digest", "Plex Weekly New Media Digest", run_plex_weekly_digest, post=post, tag_all=True)
+        if rep:
+            print(rep)
+    elif action in ("weekly_proactive_digest", "weekly_digest"):
+        ok, rep, _ = run_sidecar_job("weekly_proactive_digest", "Option B Weekly Proactive Digest", run_weekly_proactive_digest)
+        if rep:
+            print(rep)
+    elif action in ("quota", "daily_quota_card", "quota_card"):
+        from tools.quota_card import run_quota_card
+        test = "--test" in sys.argv or "-t" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv
+        ok, rep, _ = run_sidecar_job("daily_quota_card", "Daily Gemini Quota Card", run_quota_card, test=test, quiet=quiet)
+        if rep:
+            print(rep)
+    elif action in ("quota_poller", "quota_poll", "poller_quota"):
+        from tools.quota_poller import run_quota_poller
+        test = "--test" in sys.argv or "-t" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv
+        ok, rep, _ = run_sidecar_job("quota_poller", "10-Minute Quota Usage Poller", run_quota_poller, test=test, quiet=quiet)
+        if rep:
+            print(rep)
+    elif action in ("context_digest", "gemini_context_digest", "email_digest"):
+        from tools.gemini_context_digest import run_daily_context_digest
+        test = "--test" in sys.argv or "-t" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv
+        dry_run = "--dry-run" in sys.argv
+        ok, rep, _ = run_sidecar_job("gemini_context_digest", "Daily Zero & Ivy Context Email Digest", run_daily_context_digest, dry_run=dry_run, test=test, quiet=quiet)
+        if rep:
+            print(rep)
+    elif action in ("personal_data_sync", "personal_sync", "sync_profiles"):
+        from tools.personal_data_sync import run_personal_data_sync
+        test = "--test" in sys.argv or "-t" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv
+        ok, rep, _ = run_sidecar_job("personal_data_sync", "Weekly Personal Data & Gaming Profile Sync", run_personal_data_sync, test=test, quiet=quiet)
         if rep:
             print(rep)
     elif action == "status":

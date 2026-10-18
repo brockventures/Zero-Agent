@@ -144,8 +144,8 @@ class TestBridgeRunner(unittest.TestCase):
             for s in steps:
                 f.write(json.dumps(s) + "\n")
 
-        with patch("tools.bridge_runner.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
-            recovered = br.harvest_transcript_response(conv_id)
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            recovered = br.harvest_transcript_response(conv_id, brain_base_dir=self.temp_path)
             self.assertEqual(recovered, "The capital of France is Paris.")
 
     def test_harvest_transcript_response_skips_placeholder_sentinel(self):
@@ -164,8 +164,8 @@ class TestBridgeRunner(unittest.TestCase):
             for s in steps:
                 f.write(json.dumps(s) + "\n")
 
-        with patch("tools.bridge_runner.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
-            recovered = br.harvest_transcript_response(conv_id)
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            recovered = br.harvest_transcript_response(conv_id, brain_base_dir=self.temp_path)
             self.assertEqual(recovered, "Initial scan complete.")
 
     def test_harvest_transcript_response_does_not_cross_turn_boundary(self):
@@ -188,8 +188,8 @@ class TestBridgeRunner(unittest.TestCase):
             for s in steps:
                 f.write(json.dumps(s) + "\n")
 
-        with patch("tools.bridge_runner.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
-            recovered = br.harvest_transcript_response(conv_id)
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            recovered = br.harvest_transcript_response(conv_id, brain_base_dir=self.temp_path)
             self.assertIsNone(recovered)
 
     def test_kill_process_tree(self):

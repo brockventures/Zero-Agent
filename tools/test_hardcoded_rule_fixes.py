@@ -146,7 +146,7 @@ class TestHardcodedRuleFixes(unittest.TestCase):
         self.assertFalse(any("Isaac-Rafaela" in e for e in events))
 
     def test_sidecars_email_triage_dynamic(self):
-        """Verify nightly triage parses dates and categorizes without hardcoded haircut rules."""
+        """Verify nightly triage parses dates and synthesizes impact/action bullets without verbatim snippet dumps."""
         from tools.sidecars import _triage_unread_emails
 
         test_emails = [
@@ -154,6 +154,16 @@ class TestHardcodedRuleFixes(unittest.TestCase):
                 "from": "Dental Clinic <reception@dental.com>",
                 "subject": "Appointment Confirmation",
                 "snippet": "Your cleaning is reserved for 10:30 AM on Friday, Oct 2 with Dr. Lee."
+            },
+            {
+                "from": "CVS <shop@mynotifications.cvs.com>",
+                "subject": "Reminder, your order is ready for store pickup!",
+                "body_excerpt": "We still have your pickup order, Ryan. Order Number: 766140857 Items for pickup at Store #9690."
+            },
+            {
+                "from": "Lauren Saxelby <laurens@wearepcc.com>",
+                "subject": "Pumpkins and Pancakes | Enrollment Confirmation",
+                "body_excerpt": "Hi Ryan! Thank you for signing up for Pumpkins and Pancakes! When you arrive at the front desk on Saturday, October 17th from 10:00am-1:00pm, please be prepared to pay your entry fees ($25 per person)."
             },
             {
                 "from": "Morning Brew <crew@morningbrew.com>",
@@ -164,6 +174,8 @@ class TestHardcodedRuleFixes(unittest.TestCase):
         cal, prio, news, trans = _triage_unread_emails(test_emails)
         self.assertTrue(any("10:30 AM" in c for c in cal))
         self.assertTrue(any("Morning Brew" in n for n in news))
+        self.assertTrue(any("#766140857" in p and "ready" in p for p in prio))
+        self.assertTrue(any("$25 per person" in p and "Pumpkins and Pancakes" in p for p in prio))
 
     def test_session_summarizer_dynamic_milestones(self):
         """Verify session summarizer extracts dynamic milestones rather than static strings."""
@@ -177,6 +189,17 @@ class TestHardcodedRuleFixes(unittest.TestCase):
         self.assertIn("classifier prefilter", ms.lower())
         self.assertNotIn("Google Takeout & Profile: Deep synthesis completed", ms)
 
+
+
+    def test_session_summarizer_non_ryan_directive_fallback(self):
+        """Verify session summarizer extracts directives from non-Ryan speakers in fallback."""
+        from tools.session_summarizer import synthesize_session_milestones
+        dialogue = [
+            {"speaker": "Alex", "content": "Can we benchmark the new SQLite query performance?"},
+            {"speaker": "Zero", "content": "Benchmarked at 0.42ms average latency."}
+        ]
+        ms, dr, ed = synthesize_session_milestones(dialogue, "crab_cavern_test")
+        self.assertIn("benchmark", dr.lower())
 
 if __name__ == "__main__":
     unittest.main()

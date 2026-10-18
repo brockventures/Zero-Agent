@@ -203,7 +203,7 @@ def memory_write(name: str, title: str, description: str, category: str, content
         "indexed": True
     }
 
-def rebuild_indexes():
+def rebuild_indexes(sync_fts: bool = True, embed: bool = True):
     """Rebuild MEMORY_PUBLIC.md, MEMORY_PRIVATE.md, unified MEMORY.md, and isolated VAULT.md."""
     PUB_DIR.mkdir(parents=True, exist_ok=True)
     PRIV_DIR.mkdir(parents=True, exist_ok=True)
@@ -263,50 +263,121 @@ def rebuild_indexes():
         vault_lines.append("- *(Vault is currently empty. No secret records active.)*")
     MEMORY_VAULT_INDEX.write_text("\n".join(vault_lines) + "\n", encoding="utf-8")
 
-    # Sync SQLite FTS5 Index
-    try:
-        if "/workspace" not in sys.path:
-            sys.path.insert(0, "/workspace")
-        from tools.transcript_index import TranscriptIndexer
-        indexer = TranscriptIndexer()
-        indexer.sync_all()
-        indexer.close()
-    except Exception as e:
-        log.warning(f"Failed to sync SQLite FTS5 index: {e}")
+    # Sync SQLite FTS5 Index (optional; detached dreaming daemon indexes this asynchronously)
+    if sync_fts:
+        try:
+            if "/workspace" not in sys.path:
+                sys.path.insert(0, "/workspace")
+            from tools.transcript_index import TranscriptIndexer
+            indexer = TranscriptIndexer()
+            indexer.sync_all(scope="memory", embed=embed)
+            indexer.close()
+        except Exception as e:
+            log.warning(f"Failed to sync SQLite FTS5 index: {e}")
 
-def run_memory_doctor() -> tuple[bool, str]:
+def run_memory_doctor(auto_remediate: bool = False) -> tuple[bool, str]:
     """Audit both memory tiers for orphaned files, broken links, and security compliance."""
     if not MEMORY_DIR.exists():
         return False, "Memory directory /workspace/memory does not exist."
 
     issues = []
-    
+    remediated_actions = []
+    unresolved_leaks = []
+
     # 1. Audit public tier against security rules
-    security_violations = []
     rules = _get_security_rules()
-    for f in PUB_DIR.glob("*.md"):
+    agents_pub_dir = Path("/workspace/.agents/memory/public")
+
+    for f in sorted(PUB_DIR.glob("*.md")):
         if f.name == "MEMORY.md":
             continue
         content = f.read_text(encoding="utf-8", errors="replace")
+        file_violations = []
         for pat, desc in rules:
             m = re.search(pat, content)
             if m:
-                security_violations.append(f"`{f.name}` contains {desc} ('{m.group(0)}')")
-                break
+                file_violations.append((desc, m.group(0)))
 
-    if security_violations:
-        issues.append(f"🚨 **Security Air-Gap Violations in Public Memory:**\n  " + "\n  ".join(security_violations))
+        if not file_violations:
+            continue
+
+        if auto_remediate:
+            # Check if this is a high-severity credential leak that cannot be silently auto-fixed
+            is_critical_secret = any(
+                "token" in desc.lower() or "secret" in desc.lower() or "private key" in desc.lower()
+                for desc, _ in file_violations
+            )
+
+            # Check if this is homelab/private documentation that should be demoted/migrated to private
+            priv_counterpart = PRIV_DIR / f.name
+            is_homelab_doc = (
+                priv_counterpart.exists() or
+                any(f.name.startswith(p) for p in (
+                    "reference_att_", "reference_unifi_", "reference_network_",
+                    "project_home_network", "project_ha_", "project_matterserver_",
+                    "scar_at_t_modem_"
+                ))
+            )
+
+            if is_homelab_doc and not is_critical_secret:
+                # Safe Demotion / Migration
+                if not priv_counterpart.exists():
+                    PRIV_DIR.mkdir(parents=True, exist_ok=True)
+                    priv_counterpart.write_text(content, encoding="utf-8")
+                    log.info(f"[Memory Doctor] Migrated {f.name} to private memory.")
+
+                f.unlink(missing_ok=True)
+                if agents_pub_dir.exists():
+                    (agents_pub_dir / f.name).unlink(missing_ok=True)
+                remediated_actions.append(f"Demoted `{f.name}` to private-only")
+                log.info(f"[Memory Doctor] Unlinked {f.name} from public memory.")
+                continue
+
+            # Check if it's an engineering doc where private subnet IP can be masked
+            only_ip_violations = all(
+                "Private Subnet IP" in desc or "Private Homelab IP" in desc
+                for desc, _ in file_violations
+            )
+            if only_ip_violations and (f.name.startswith("arch_") or f.name.startswith("pattern_") or f.name.startswith("scar_")):
+                masked_content = re.sub(r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "10.0.0.x", content)
+                masked_content = re.sub(r"\b192\.168\.1\.\d{1,3}\b", "10.0.0.x", masked_content)
+                rem = [desc for pat, desc in rules if re.search(pat, masked_content)]
+                if not rem:
+                    f.write_text(masked_content, encoding="utf-8")
+                    remediated_actions.append(f"Masked bare IP in `{f.name}` (`10.0.0.x`)")
+                    log.info(f"[Memory Doctor] Auto-masked IP in {f.name}")
+                    continue
+
+            # If not auto-remediable, record as unresolved leak
+            for desc, match in file_violations:
+                unresolved_leaks.append(f"`{f.name}` contains {desc} ('{match}')")
+        else:
+            for desc, match in file_violations:
+                unresolved_leaks.append(f"`{f.name}` contains {desc} ('{match}')")
 
     # 2. Rebuild and check indexes
-    rebuild_indexes()
-    
+    rebuild_indexes(sync_fts=False)
+
     pub_count = len([f for f in PUB_DIR.glob("*.md") if f.name != "MEMORY.md"])
     priv_count = len([f for f in PRIV_DIR.glob("*.md") if f.name != "MEMORY.md"])
 
+    if unresolved_leaks:
+        issues.append(f"🚨 **Security Air-Gap Violations in Public Memory:**\n  " + "\n  ".join(unresolved_leaks))
+
     if not issues:
+        if remediated_actions:
+            report = (
+                f"🩺 **Memory Doctor**: Auto-remediated {len(remediated_actions)} item(s) "
+                f"({', '.join(remediated_actions)}). Store is clean and air-gapped. ✅\n"
+                f"- **Public Engineering Documents:** `{pub_count}`\n"
+                f"- **Private Homelab Documents:** `{priv_count}`"
+            )
+            return True, report
         return True, f"Memory store is healthy and air-gapped. ✅\n- **Public Engineering Documents:** `{pub_count}`\n- **Private Homelab Documents:** `{priv_count}`"
 
     report = "🩺 **Memory Doctor Audit**:\n" + "\n".join(issues)
+    if remediated_actions:
+        report += "\n\n**Auto-Remediated Actions:**\n  • " + "\n  • ".join(remediated_actions)
     return False, report
 
 IGNORED_CHANNELS = {
@@ -399,9 +470,11 @@ def _evaluate_episode_llm(ep: list[dict], ch_name: str, is_public: bool) -> dict
     prompt = SCORING_PROMPT.format(channel_name=ch_name, tier=tier, transcript=transcript_text)
     
     try:
+        from tools.llm_sidecar import get_sidecar_model
+        dream_model = get_sidecar_model("dreaming", "gemini-3.8-flash-low")
         res = subprocess.run([
             "agy",
-            "--model=gemini-3.8-flash-low",
+            f"--model={dream_model}",
             "--disable-slash-commands",
             f"-p={prompt}"
         ], capture_output=True, text=True, timeout=35)
@@ -517,17 +590,26 @@ def run_dreaming_consolidation(dry_run: bool = False, hours_back: int = 24) -> t
 
                 # Stage 2: Private Preference or Scar
                 elif category == "PRIVATE_PREFERENCE":
-                    if USER_RYAN_FILE.exists():
-                        u_content = USER_RYAN_FILE.read_text(encoding="utf-8", errors="replace")
-                        if title.lower() not in u_content.lower() and slug not in u_content.lower():
-                            rule_bullet = f"\n- **{title} ({t0_str}):** {summary}"
-                            if not dry_run:
-                                USER_RYAN_FILE.write_text(u_content.rstrip() + rule_bullet + "\n", encoding="utf-8")
-                            consolidated_items.append(f"Ryan Preference updated: `{title}`")
-                    else:
+                    ym_str = now_dt.strftime("%Y_%m")
+                    ym_label = now_dt.strftime("%b %Y")
+                    monthly_pref_file = PRIV_DIR / f"user_ryan_directives_{ym_str}.md"
+                    if not monthly_pref_file.exists() and not dry_run:
+                        init_doc = (
+                            "---\n"
+                            f"name: Ryan Operational Directives Log ({ym_label})\n"
+                            f'description: "Chronological log of Ryan\'s operational directives, homelab preferences, and workflow ratifications from {ym_label}"\n'
+                            "category: user\n"
+                            f"updated: {now_dt.strftime('%Y-%m-%d')}\n"
+                            "---\n\n"
+                            f"# Ryan Operational Directives & Preferences ({ym_label})\n\n"
+                        )
+                        monthly_pref_file.write_text(init_doc, encoding="utf-8")
+                    u_content = monthly_pref_file.read_text(encoding="utf-8", errors="replace") if monthly_pref_file.exists() else ""
+                    if title.lower() not in u_content.lower() and slug not in u_content.lower():
+                        rule_bullet = f"\n- **{title} ({t0_str}):** {summary}"
                         if not dry_run:
-                            memory_write(f"user_pref_{slug}.md", title, summary[:100], "user", summary, tier="private")
-                        consolidated_items.append(f"Private Preference created: `user_pref_{slug}.md`")
+                            monthly_pref_file.write_text(u_content.rstrip() + rule_bullet + "\n", encoding="utf-8")
+                        consolidated_items.append(f"Ryan Preference logged to `{monthly_pref_file.name}`: `{title}`")
 
                 elif category == "PRIVATE_SCAR":
                     scar_name = f"scar_{slug}.md"
@@ -565,7 +647,7 @@ def run_dreaming_consolidation(dry_run: bool = False, hours_back: int = 24) -> t
         log.warning(f"Dreaming promotion scan error: {e}")
 
     if not dry_run:
-        rebuild_indexes()
+        rebuild_indexes(sync_fts=True, embed=True)
 
     if not consolidated_items:
         return False, f"Dream pass complete ({hours_back}h window): no new long-term memories required consolidation."
@@ -581,7 +663,8 @@ def run_dreaming_consolidation(dry_run: bool = False, hours_back: int = 24) -> t
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "doctor"
     if action == "doctor":
-        ok, msg = run_memory_doctor()
+        auto_fix = any(arg in ("--auto-fix", "--auto-remediate", "-f") for arg in sys.argv[2:])
+        ok, msg = run_memory_doctor(auto_remediate=auto_fix)
         print(msg)
     elif action == "dream":
         hours = int(sys.argv[2]) if len(sys.argv) > 2 else 24

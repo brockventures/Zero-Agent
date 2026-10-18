@@ -1,97 +1,104 @@
 {
-  "external_char_limit": 1950,
-  "anti_cascade_delay_seconds": 4.0,
-  "bot_word_floor": 4,
-  "worker_memory_cap_mb": 2048,
-  "max_parallel_workers": 5,
-  "persistent_daemons_enabled": true,
-  "morning_discussion_max_rounds": 3,
-  "turn_step_idle_seconds": 90.0,
-  "agent_done_cutoff_seconds": 15.0,
-  "turn_watchdog_seconds": 300.0,
-  "turn_max_ceiling_seconds": 1800.0,
-  "live_status_ticker_enabled": false,
-  "task_settle_enabled": true,
-  "task_settle_timeout_seconds": 25.0,
-  "task_settle_max_resumptions": 1,
-  "detached_notify_on_success": false,
-  "compaction_max_turns": 15,
-  "compaction_max_steps": 1500,
-  "compaction_max_mb": 2.0,
-  "channel_tag_requirements": {
-    "1534452820995080192": [
-      "1543285916506783799",
-      "1543462881624858624"
-    ],
-    "1551465050072416286": [
-      "1543285916506783799",
-      "1543462881624858624"
-    ]
-  },
-  "operations_category_id": 1544953274363412533,
-  "excluded_home_channel_ids": [
-    1548196929308065893
-  ],
-  "home_channel_ids": [
-    1542081375287640084,
-    1544953275877556334,
-    1544953277592899615,
-    1544953279664889888,
-    1544955532765560924,
-    1544955535722545253,
-    1544955538033348618,
-    1548196930788524094,
-    1550577908811178095,
-    1550577910757458015
-  ],
-  "gif_disabled_channels": [
-    1534436119888793750,
-    "the-banana-stand"
-  ],
-  "ambient_classifier_enabled": true,
-  "ambient_relevance_threshold": 0.6,
-  "auto_thread_escalation_enabled": false,
-  "auto_thread_escalation_seconds": 180,
-  "ratified_peer_checklist": [
-    "Don't wake someone for nothing.",
-    "Ship the thing, don't narrate getting there.",
-    "Claim before you post, release when you're done.",
-    "A message not addressed to you usually isn't yours to answer.",
-    "Ship it or track it: never let agreed proposals drop on the floor.",
-    "Concluded Discussion Executive Summary: When prompted by Banana Watcher, synthesize <=250-word summary and deliver to #lounge via outbox.",
-    "Always tag physical Discord snowflakes (<@ID> / <@&ROLE_ID>) when addressing peer bots in shared channels; bare text handles (@Amos) leave listeners asleep."
-  ],
-  "last_word_protocol_enabled": true,
-  "last_word_threshold": 10,
-  "last_word_pause_minutes": 3,
-  "last_word_channels": [
-    1534452820995080192,
-    1534436119888793750,
-    1551465050072416286
-  ],
-  "gif_diversity": {
-    "enabled": true,
-    "canonical_only": false,
-    "default_cooldown_turns": 4,
-    "franchise_cooldowns": {
-      "curb_your_enthusiasm": 4,
-      "silicon_valley": 4,
-      "seinfeld": 4,
-      "reaction_classics": 3
+    "external_char_limit": 1950,
+    "anti_cascade_delay_seconds": 4.0,
+    "bot_word_floor": 4,
+    "worker_memory_cap_mb": 2048,
+    "max_parallel_workers": 5,
+    "persistent_daemons_enabled": true,
+    "morning_discussion_max_rounds": 3,
+    "turn_step_idle_seconds": 150.0,
+    "agent_done_cutoff_seconds": 15.0,
+    "turn_watchdog_seconds": 300.0,
+    "turn_max_ceiling_seconds": 1800.0,
+    "live_status_ticker_enabled": false,
+    "task_settle_enabled": true,
+    "task_settle_timeout_seconds": 25.0,
+    "task_settle_max_resumptions": 1,
+    "detached_notify_on_success": false,
+    "compaction_max_turns": 10,
+    "compaction_max_steps": 600,
+    "compaction_max_mb": 0.5,
+    "channel_tag_requirements": {
+        "1534452820995080192": [
+            "1543285916506783799",
+            "1543462881624858624"
+        ]
     },
-    "quarantined_franchises": [],
-    "rotation_pool": [
-      "silicon_valley",
-      "curb_your_enthusiasm",
-      "i_think_you_should_leave",
-      "succession",
-      "30_rock",
-      "parks_and_rec",
-      "community",
-      "veep",
-      "it_crowd"
-    ]
-  },
-  "external_prompt_path": "/workspace/config/prompts/crab_cavern_prompt.md",
-  "excluded_channel_last_word_threshold": 10
+    "operations_category_id": 1544953274363412533,
+    "excluded_home_channel_ids": [
+        1548196929308065893
+    ],
+    "home_channel_ids": [
+        1542081375287640084,
+        1544953275877556334,
+        1544953277592899615,
+        1544953279664889888,
+        1544955532765560924,
+        1544955535722545253,
+        1544955538033348618,
+        1548196930788524094,
+        1555973316752449576,
+        1550577908811178095,
+        1550577910757458015
+    ],
+    "gif_disabled_channels": [
+        1534436119888793750,
+        "the-banana-stand"
+    ],
+    "steering_disabled_channels": [
+        1534436119888793750,
+        "1534436119888793750"
+    ],
+    "ambient_classifier_enabled": true,
+    "ambient_relevance_threshold": 0.6,
+    "auto_thread_escalation_enabled": false,
+    "auto_thread_escalation_seconds": 180,
+    "ratified_peer_checklist": [
+        "Don't wake someone for nothing.",
+        "Ship the thing, don't narrate getting there.",
+        "Claim before you post, release when you're done.",
+        "A message not addressed to you usually isn't yours to answer.",
+        "Ship it or track it: never let agreed proposals drop on the floor.",
+        "Concluded Discussion Executive Summary: When prompted by Banana Watcher, synthesize <=250-word summary and deliver to #lounge via outbox.",
+        "Always tag physical Discord snowflakes (<@ID> / <@&ROLE_ID>) when addressing peer bots in shared channels; bare text handles (@Amos) leave listeners asleep."
+    ],
+    "last_word_protocol_enabled": true,
+    "last_word_threshold": 10,
+    "last_word_pause_minutes": 3,
+    "last_word_channels": [
+        1534436119888793750,
+        1534452820995080192,
+        1549555629222404096,
+        1551465050072416286,
+        1552732003076669460,
+        1558202642663211169
+    ],
+    "gif_diversity": {
+        "enabled": true,
+        "canonical_only": true,
+        "default_cooldown_turns": 4,
+        "franchise_cooldowns": {
+            "curb_your_enthusiasm": 6,
+            "silicon_valley": 4,
+            "seinfeld": 4,
+            "reaction_classics": 3,
+            "brooklyn_nine_nine": 6
+        },
+        "quarantined_franchises": [],
+        "rotation_pool": [
+            "silicon_valley",
+            "curb_your_enthusiasm",
+            "i_think_you_should_leave",
+            "succession",
+            "30_rock",
+            "parks_and_rec",
+            "community",
+            "veep",
+            "it_crowd"
+        ]
+    },
+    "external_prompt_path": "/workspace/config/prompts/crab_cavern_prompt.md",
+    "excluded_channel_last_word_threshold": 10,
+    "crab_cavern_silenced_until": "2026-10-13T20:00:00-07:00",
+    "crab_cavern_silence_reason": "Ryan requested hold until tomorrow 8:00 PM PT (2026-10-12)"
 }

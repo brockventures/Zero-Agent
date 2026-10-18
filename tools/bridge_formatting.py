@@ -17,12 +17,15 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-# Re-export pure security, leak detection, and secret scrubbing symbols
+# Re-export pure security, leak detection, code-span shielding, and secret scrubbing symbols
 from tools.bridge_safety import (
     CLI_LEAK_LINE_PATTERNS,
+    _CODE_SPAN_RE,
     _get_scrub_targets,
     dedup_repetitive_patterns,
     is_internal_cli_leak,
+    mask_code_spans,
+    restore_code_spans,
     scrub_credentials,
     strip_internal_cli_chatter,
 )
@@ -38,19 +41,30 @@ from tools.bridge_stream import (
 
 
 def convert_markdown_tables(text: str) -> str:
-    """Convert raw markdown pipe tables into mobile-friendly Discord card lists with subtext."""
-    lines = text.splitlines()
+    """Convert raw markdown pipe tables into mobile-friendly Discord card lists with subtext.
+    Shields inline code spans before splitting on '|' so pipes inside backticks never break cells."""
+    if not text or "|" not in text:
+        return text
+
+    masked_text, table_spans = mask_code_spans(text, prefix="\x00TABLE_SPAN_")
+    lines = masked_text.splitlines()
     out = []
     i = 0
     while i < len(lines):
         line = lines[i]
         # Detect markdown table header followed by separator (|---|---|)
         if line.strip().startswith("|") and i + 1 < len(lines) and re.match(r"^\s*\|?\s*[-:]+[-| :]*$", lines[i + 1]):
-            headers = [re.sub(r"^\*\*|\*\*$", "", c).strip() for c in line.strip().strip("|").split("|")]
+            headers = [
+                re.sub(r"^\*\*|\*\*$", "", c.replace(r"\|", "|")).strip()
+                for c in re.split(r"(?<!\\)\|", line.strip().strip("|"))
+            ]
             i += 2  # skip header and separator
             table_rows = []
             while i < len(lines) and lines[i].strip().startswith("|"):
-                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                cells = [
+                    c.replace(r"\|", "|").strip()
+                    for c in re.split(r"(?<!\\)\|", lines[i].strip().strip("|"))
+                ]
                 table_rows.append(cells)
                 i += 1
 
@@ -62,33 +76,23 @@ def convert_markdown_tables(text: str) -> str:
             if len(headers) >= 4 and headers[0].lower() in ("segment", "section", "category", "group", "type"):
                 has_section_col = True
 
-            # Detect if this is a true comparison table
-            # True comparison: (1) header 0 is a feature/criteria/capability keyword, OR (2) header 1..N are product/system/option names (not attribute words)
+            # Detect if this is a multi-column comparison table vs a compact attribute/status summary table
             is_comparison = False
             attr_words = {
                 "count", "status", "notes", "note", "details", "detail", "description",
                 "value", "val", "cost", "price", "port", "host", "ip", "url", "link",
                 "date", "time", "type", "size", "action", "result", "finding", "resolution",
-                "state", "reason", "error", "percent", "percentage", "progress", "unit"
-            }
-            comparison_lead_words = {
-                "feature", "criteria", "aspect", "comparison", "vs", "versus",
-                "capability", "dimension", "spec", "specification", "category",
-                "attribute", "service", "item", "area", "property", "function", "metric", "target"
+                "state", "reason", "error", "percent", "percentage", "progress", "unit",
+                "pattern", "meaning", "summary", "info"
             }
 
             check_headers = headers[2:] if has_section_col else headers[1:]
-            h0 = re.sub(r"[^a-z0-9_-]", "", headers[0].lower())
             other_headers = [re.sub(r"[^a-z0-9_-]", "", h.lower().strip()) for h in check_headers]
 
             if has_section_col:
                 is_comparison = True
-            elif len(headers) >= 3:
-                if h0 in comparison_lead_words:
-                    if not any(oh in attr_words for oh in other_headers):
-                        is_comparison = True
-                elif not any(oh in attr_words for oh in other_headers):
-                    is_comparison = True
+            elif len(headers) >= 3 and not any(oh in attr_words for oh in other_headers):
+                is_comparison = True
 
             current_group = ""
             for row in table_rows:
@@ -105,7 +109,6 @@ def convert_markdown_tables(text: str) -> str:
                     if not metric_name:
                         continue
 
-                    # Multi-system comparison sub-items
                     vals = []
                     for col_idx in range(2, len(headers)):
                         if col_idx < len(row):
@@ -154,38 +157,67 @@ def convert_markdown_tables(text: str) -> str:
             continue
         out.append(line)
         i += 1
-    return "\n".join(out)
+    return restore_code_spans("\n".join(out), table_spans, prefix="\x00TABLE_SPAN_")
 
 
 def format_for_discord(text: str) -> str:
-    """Format markdown for clean Discord presentation:
-    - Strips file:/// markdown links which render broken on Discord
-    - Converts GitHub alerts (> [!NOTE]) to clean emoji callouts
-    - Converts broken markdown pipe tables into clean mobile cards
-    - Preserves standard https:// links
+    """Format markdown for clean Discord presentation using a single outer code-span shield:
     - Strips internal system task envelopes and intermediate progress chatter
+    - Shields all fenced code blocks (```...```) and N-backtick inline code spans (`...`, ``...``)
+    - Strips file:/// markdown links which render broken on Discord
+    - Collapses link previews (<https://...>) and normalizes hyperlink brackets
+    - Converts GitHub alerts (> [!NOTE]) to clean emoji callouts
+    - Converts markdown pipe tables into clean mobile cards
+    - Converts explicit LaTeX notation into Unicode symbols without touching prose $ prices/tickers
+    - Restores shielded code spans and positions reaction GIFs / handoff mentions
     """
     if not text:
         return ""
 
+    # 0a. Strip internal agent task lifecycle envelopes, CLI leak lines, and intermediate progress chatter first
+    text = strip_internal_cli_chatter(text)
+    if not text:
+        return ""
+
+    # 0b. Pre-shield link hygiene for accidental backticks around bare URLs or inside http(s) link labels:
+    # - Single-backticked bare URLs: `<https://...>` or `https://...` -> <https://...>
+    # - Backticked labels on web links: [`label`](https://...) -> [label](https://...)
+    text = re.sub(r"(?<!`)`<?(https?://[^\s`>]+)>?`(?!`)", r"<\1>", text)
+    text = re.sub(r"\[\s*`+([^`\]\n]+)`+\s*\]\((<?https?://[^\)\n]+)\)", r"[\1](\2)", text)
+
+    # 0c. Global Code-Span Shield: mask all fenced code blocks and N-backtick inline code spans
+    # so zero prose regexes can mutate code, regex patterns, or bash snippets.
+    text, code_spans = mask_code_spans(text, prefix="\x00DISCORD_SPAN_")
+
+    def _add_protected_span(val: str) -> str:
+        idx = len(code_spans)
+        code_spans.append(val)
+        return f"\x00DISCORD_SPAN_{idx}\x00"
+
     # 1. Clean file:/// links: [`/path`](file:///path) -> `/path`, [path](file:///path) -> `path`, bare file:///path -> `/path`
     def clean_file_link(m):
         inner = m.group(1).strip()
-        if inner.startswith("`") and inner.endswith("`"):
+        if inner.startswith("\x00DISCORD_SPAN_") and inner.endswith("\x00"):
             return inner
-        return f"`{inner}`"
+        if inner.startswith("`") and inner.endswith("`"):
+            return _add_protected_span(inner)
+        return _add_protected_span(f"`{inner}`")
 
     text = re.sub(r"\[([^\]]+)\]\(file://[^\)]*\)", clean_file_link, text)
-    text = re.sub(r"(?<![\w`\(])file://(/[^\s\)\>]+?)(?=[.,;:?!]?(?:\s|$|\)))", r"`\1`", text)
+    text = re.sub(
+        r"(?<![\w`\(])file://(/[^\s\)\>]+?)(?=[.,;:?!]?(?:\s|$|\)))",
+        lambda m: _add_protected_span(f"`{m.group(1)}`"),
+        text,
+    )
 
     # 1b. Normalize Discord hyperlinks:
     # Discord breaks when bold/italics wrap the outside of brackets (**[label](url)**)
     # or when emojis are inside brackets. Also, raw URLs with underscores inside parentheses
     # can trigger italic markdown unless wrapped in angle brackets (< >).
     def normalize_discord_links(m):
-        prefix_outer = m.group(1) or ""
         label = m.group(2).strip()
         raw_url = m.group(3).strip()
+        suffix_colon = m.group(4) or ""
         clean_url = raw_url.strip("<>").strip()
 
         # Preserve Tenor/Giphy links so Discord media player can embed them
@@ -202,42 +234,34 @@ def format_for_discord(text: str) -> str:
             inner_label = label
 
         # Discord's link parser requires plain text inside brackets ([]).
-        # Any bold (**), italic (*), or backtick (`) formatting inside or outside brackets breaks the link.
         clean_inner = inner_label.strip("*_`").strip()
 
         # If label is identical to the target URL, collapse redundant [url](<url>) into clean <url>
         if clean_inner.lower() == clean_url.lower() or clean_inner.lower().rstrip("/") == clean_url.lower().rstrip("/"):
-            return f"<{clean_url}>"
+            return f"<{clean_url}>{suffix_colon}"
 
-        link_str = f"[{clean_inner}](<{clean_url}>)"
+        link_str = f"[{clean_inner}](<{clean_url}>){suffix_colon}"
 
         if lead_emoji:
             return f"{lead_emoji} {link_str}"
         return link_str
 
-    pattern = r"(\*\*|\*)?\[([^\]]+)\]\(<?(https?://[^\)>]+)>?\)(?:\1)?"
+    pattern = r"(\*\*|\*)?\[([^\]]+)\]\(<?(https?://[^\)>]+)>?\)(:?)(\*\*|\*)?"
     text = re.sub(pattern, normalize_discord_links, text)
 
     # 1c. Collapse bare URLs (<https://...>) by default to suppress bloated link preview cards
-    # Preserves code blocks, markdown links, already bracketed URLs, and visual GIFs
+    # Code blocks are already shielded by \x00DISCORD_SPAN_; preserve markdown links, already bracketed URLs, and GIFs.
     def collapse_bare_urls(content: str) -> str:
-        code_blocks = []
-        def save_code(m):
-            code_blocks.append(m.group(0))
-            return f"__CODE_BLOCK_{len(code_blocks)-1}__"
-
-        s = re.sub(r"```[\s\S]*?```|`[^`\n]+`", save_code, content)
-
         md_links = []
         def save_md(m):
             md_links.append(m.group(0))
-            return f"__MD_LINK_{len(md_links)-1}__"
-        s = re.sub(r"\[[^\]]+\]\([^\)]+\)", save_md, s)
+            return f"\x00MD_LINK_{len(md_links)-1}\x00"
+        s = re.sub(r"\[[^\]]+\]\([^\)]+\)", save_md, content)
 
         bracketed = []
         def save_bracket(m):
             bracketed.append(m.group(0))
-            return f"__BRACKETED_{len(bracketed)-1}__"
+            return f"\x00BRACKETED_{len(bracketed)-1}\x00"
         s = re.sub(r"<https?://[^>]+>", save_bracket, s)
 
         def wrap_bare(m):
@@ -247,15 +271,13 @@ def format_for_discord(text: str) -> str:
                 return f"{url}{punct}"
             return f"<{url}>{punct}"
 
-        url_pattern = r"(https?://[^\s<>\(\)\[\]]+?)([.,;:?!]?)(?=[.,;:?!]?(?:\s|$|\)))"
+        url_pattern = r"(https?://[^\s<>\(\)\[\]\x00]+?)([.,;:?!]?)(?=[.,;:?!]?(?:\s|$|\)))"
         s = re.sub(url_pattern, wrap_bare, s)
 
         for i, b in enumerate(bracketed):
-            s = s.replace(f"__BRACKETED_{i}__", b)
+            s = s.replace(f"\x00BRACKETED_{i}\x00", b)
         for i, m in enumerate(md_links):
-            s = s.replace(f"__MD_LINK_{i}__", m)
-        for i, c in enumerate(code_blocks):
-            s = s.replace(f"__CODE_BLOCK_{i}__", c)
+            s = s.replace(f"\x00MD_LINK_{i}\x00", m)
 
         return s
 
@@ -275,29 +297,42 @@ def format_for_discord(text: str) -> str:
     for alert, emoji in alerts.items():
         text = re.sub(rf"^>\s*\[!{alert}\]", f"> {emoji}", text, flags=re.MULTILINE | re.IGNORECASE)
 
-    # 3. Collapse unsupported h4+ headers (####+) to h3 (###) so Discord renders them as headings
+    # 3b. Collapse unsupported h4+ headers (####+) to h3 (###) so Discord renders them as headings
     text = re.sub(r"^(#{4,})\s*(.*)$", r"### \2", text, flags=re.MULTILINE)
 
     # 4. Convert markdown pipe tables to clean Discord mobile cards
     text = convert_markdown_tables(text)
 
     # 4b. Normalize literal Unicode bullets (•) to native Discord markdown list syntax (-)
-    # Discord treats literal • as plain paragraph text, breaking mobile hanging indents and creating blank line gaps before sublists.
     text = re.sub(r"^([ \t]*(?:>[ \t]*)*)•[ \t]*", r"\1- ", text, flags=re.MULTILINE)
+
+    # 4b-ii. Strip redundant numbering inside bulleted list items (e.g. "- **1. Gold:**" -> "- **Gold:**" or "- 1. Gold" -> "- Gold")
+    text = re.sub(r"^([ \t]*[-*]\s+\*\*)\d+\.\s+", r"\1", text, flags=re.MULTILINE)
+    text = re.sub(r"^([ \t]*[-*]\s+)\d+\.\s+", r"\1", text, flags=re.MULTILINE)
 
     # 4c. Tighten loose lists where a parent list item is followed by an empty line before its sub-bullets
     text = re.sub(r"(^[ \t]*(?:[-*]|\d+\.)\s+[^\n]+)\n\n+([ \t]{2,}(?:[-*]|\d+\.)\s+)", r"\1\n\2", text, flags=re.MULTILINE)
 
-    # 5. Strip internal agent task lifecycle envelopes, CLI leak lines, and intermediate progress chatter
-    text = strip_internal_cli_chatter(text)
+    # 5. Convert LaTeX notation into clean Discord markdown and Unicode symbols (while code spans remain masked)
+    text = clean_discord_latex(text)
 
-    # 6. Sanitize reaction GIFs: verify Tenor links are live (HTTP 200) and replace 404s with working fallbacks
+    # 6. Convert bare @peer mentions and repair any LLM-stuttered snowflake IDs while code spans are masked
+    try:
+        from tools.handoff import convert_bare_peer_mentions, repair_corrupted_snowflakes
+        text = convert_bare_peer_mentions(text)
+        text = repair_corrupted_snowflakes(text)
+    except Exception:
+        pass
+
+    # 7. Restore all shielded fenced code blocks and inline code spans
+    text = restore_code_spans(text, code_spans, prefix="\x00DISCORD_SPAN_")
+
+    # 8. Sanitize reaction GIFs (verify Tenor links are live HTTP 200 and position at end before [CHOICES: ...])
     text = sanitize_reaction_gifs(text)
 
-    # 8. Ensure handoff envelopes include physical Discord mentions for peer bots
+    # 9. Ensure handoff envelopes include physical Discord mentions for peer bots
     try:
-        from tools.handoff import convert_bare_peer_mentions, ensure_handoff_mentions
-        text = convert_bare_peer_mentions(text)
+        from tools.handoff import ensure_handoff_mentions
         text = ensure_handoff_mentions(text)
     except Exception:
         pass
@@ -309,12 +344,17 @@ def sanitize_reaction_gifs(text: str) -> str:
     """Probe Tenor and Giphy links in Discord output. If a reaction GIF returns HTTP 404,
     replace it with a live dynamic GIF or strip the line so Discord never renders broken previews.
     Normalizes all GIF links to [GIF](url) format and repositions the GIF hyperlink to the
-    very end of the message (immediately before any [CHOICES: ...] / [OPTIONS: ...] block)."""
+    very end of the message (immediately before any [CHOICES: ...] / [OPTIONS: ...] block).
+    Ignores GIF URLs inside fenced or inline code spans."""
     if not text or ("tenor.com/view/" not in text and "giphy.com/gifs/" not in text):
         return text
 
+    masked_text, code_spans = mask_code_spans(text, prefix="\x00GIF_SPAN_")
+    if "tenor.com/view/" not in masked_text and "giphy.com/gifs/" not in masked_text:
+        return text
+
     gif_url_pattern = r"https?://(?:www\.)?(?:tenor\.com/view/[a-zA-Z0-9_\-]+|giphy\.com/gifs/[a-zA-Z0-9_\-]+)"
-    gif_urls = re.findall(gif_url_pattern, text)
+    gif_urls = re.findall(gif_url_pattern, masked_text)
     filler_words = {"gif", "gifs", "the", "a", "an", "and", "or", "of", "in", "to", "for", "with", "view", "hd"}
 
     for url in set(gif_urls):
@@ -348,7 +388,7 @@ def sanitize_reaction_gifs(text: str) -> str:
             is_ok = False
 
         if is_ok and final_dest_url != url:
-            text = text.replace(url, final_dest_url)
+            masked_text = masked_text.replace(url, final_dest_url)
             url = final_dest_url
 
         if not is_ok:
@@ -356,19 +396,19 @@ def sanitize_reaction_gifs(text: str) -> str:
                 from tools.gif_tool import get_contextual_gif
                 fallback = get_contextual_gif("shrug")
                 if fallback and fallback.get("url"):
-                    text = text.replace(url, fallback["url"])
+                    masked_text = masked_text.replace(url, fallback["url"])
                     url = fallback["url"]
                 else:
-                    text = re.sub(rf"(?:^|\n)[^\n]*{re.escape(url)}[^\n]*(?:\n|$)", "\n", text)
+                    masked_text = re.sub(rf"(?:^|\n)[^\n]*{re.escape(url)}[^\n]*(?:\n|$)", "\n", masked_text)
                     continue
             except Exception:
-                text = re.sub(rf"(?:^|\n)[^\n]*{re.escape(url)}[^\n]*(?:\n|$)", "\n", text)
+                masked_text = re.sub(rf"(?:^|\n)[^\n]*{re.escape(url)}[^\n]*(?:\n|$)", "\n", masked_text)
                 continue
 
     # Find remaining valid URLs
-    remaining_urls = re.findall(gif_url_pattern, text)
+    remaining_urls = re.findall(gif_url_pattern, masked_text)
     if not remaining_urls:
-        return text.strip()
+        return restore_code_spans(masked_text.strip(), code_spans, prefix="\x00GIF_SPAN_")
 
     # Deduplicate while preserving original appearance order
     unique_urls = list(dict.fromkeys(remaining_urls))
@@ -381,7 +421,7 @@ def sanitize_reaction_gifs(text: str) -> str:
     )
 
     # Strip existing GIF links from lines
-    lines = text.split("\n")
+    lines = masked_text.split("\n")
     cleaned_lines = []
     for line in lines:
         line_stripped = line.strip()
@@ -396,29 +436,35 @@ def sanitize_reaction_gifs(text: str) -> str:
     gif_block = "\n".join(f"[GIF]({u})" for u in unique_urls)
 
     # Place GIF immediately before trailing [CHOICES: ...] or [OPTIONS: ...] block, or at the end
-    choices_pattern = re.compile(r"(\n*\s*\[(?:CHOICES|OPTIONS):\s*[^\]]+\]\s*)$", re.IGNORECASE)
+    choices_pattern = re.compile(
+        r"(\n*\s*\[(?:CHOICES|OPTIONS):\s*(?:[^\[\]]|\[[^\]]*\])+\]\s*)$", re.IGNORECASE
+    )
     choices_match = choices_pattern.search(collapsed_body)
     if choices_match:
         content_before = collapsed_body[:choices_match.start()].rstrip()
         choice_block = choices_match.group(1).strip()
         if content_before:
-            return f"{content_before}\n\n{gif_block}\n\n{choice_block}"
+            out_text = f"{content_before}\n\n{gif_block}\n\n{choice_block}"
         else:
-            return f"{gif_block}\n\n{choice_block}"
+            out_text = f"{gif_block}\n\n{choice_block}"
     else:
         if collapsed_body:
-            return f"{collapsed_body}\n\n{gif_block}"
+            out_text = f"{collapsed_body}\n\n{gif_block}"
         else:
-            return gif_block
+            out_text = gif_block
+
+    return restore_code_spans(out_text, code_spans, prefix="\x00GIF_SPAN_")
 
 
 def strip_reaction_gifs(text: str) -> str:
     """Completely remove all Tenor, Giphy, and reaction GIF links from text,
-    stripping orphan lines and collapsing surplus whitespace."""
+    stripping orphan lines and collapsing surplus whitespace while preserving code spans."""
     if not text or ("tenor.com" not in text and "giphy.com" not in text and ".gif" not in text.lower()):
         return text.strip()
 
-    gif_url_pattern = r"https?://(?:www\.)?(?:tenor\.com/(?:view/)?[a-zA-Z0-9_\-]+|media\.tenor\.com/[a-zA-Z0-9_\-/]+|giphy\.com/gifs/[a-zA-Z0-9_\-]+|[^\s\)\>\]]+\.gif\b)"
+    masked_text, code_spans = mask_code_spans(text, prefix="\x00STRIP_GIF_SPAN_")
+
+    gif_url_pattern = r"https?://(?:www\.)?(?:tenor\.com/(?:view/)?[a-zA-Z0-9_\-]+|media\.tenor\.com/[a-zA-Z0-9_\-/]+|giphy\.com/gifs/[a-zA-Z0-9_\-]+|[^\s\)\>\]\x00]+\.gif\b)"
     full_gif_re = re.compile(
         r"\[[^\]]*\]\(\s*<?" + gif_url_pattern + r">?\s*\)|"
         r"<" + gif_url_pattern + r">|"
@@ -426,7 +472,7 @@ def strip_reaction_gifs(text: str) -> str:
         re.IGNORECASE,
     )
 
-    lines = text.split("\n")
+    lines = masked_text.split("\n")
     cleaned_lines = []
     for line in lines:
         line_stripped = line.strip()
@@ -437,7 +483,8 @@ def strip_reaction_gifs(text: str) -> str:
             cleaned_lines.append(cleaned_line)
 
     raw_body = "\n".join(cleaned_lines)
-    return re.sub(r"\n{3,}", "\n\n", raw_body).strip()
+    collapsed = re.sub(r"\n{3,}", "\n\n", raw_body).strip()
+    return restore_code_spans(collapsed, code_spans, prefix="\x00STRIP_GIF_SPAN_")
 
 
 def extract_agent_response(raw_text: str, conv_id: str | None = None) -> str:
@@ -514,14 +561,15 @@ def chunk_text(text: str, max_len: int = 1980) -> list[str]:
     - Prefers breaking before code blocks so blocks stay intact whenever possible.
     """
     cleaned = text.strip()
-    if len(cleaned) <= max_len:
+    # Discord's native single-message limit is 2000. If the whole text fits, never split.
+    if len(cleaned) <= 2000:
         return [cleaned]
 
     # Boundary squeeze: if barely over limit (<=2100 chars), collapse whitespace to fit in 1 message
     if len(cleaned) <= 2100:
         condensed = re.sub(r"\n{3,}", "\n\n", cleaned)
         condensed = re.sub(r"[ \t]+\n", "\n", condensed).strip()
-        if len(condensed) <= max_len:
+        if len(condensed) <= 2000:
             return [condensed]
 
     lines = cleaned.splitlines(keepends=True)
@@ -697,59 +745,123 @@ def convert_markdown_to_mobile_html(md_text: str) -> str:
 </html>"""
 
 
+_KNOWN_LATEX_CMD_RE = re.compile(
+    r"\\(?:alpha|beta|gamma|delta|epsilon|zeta|eta|theta|lambda|mu|pi|rho|sigma|tau|phi|omega"
+    r"|Delta|Theta|Lambda|Sigma|Omega|cdot|times|div|leq?|geq?|neq|approx|sim|pm|to|rightarrow|leftarrow"
+    r"|infty|partial|nabla|in|notin|subset|subseteq|frac|text|mathrm|mathbf|left|right|quad|[,;!%])"
+)
+
+
 def clean_discord_latex(text: str) -> str:
-    """Convert raw LaTeX math notation into clean, native Discord markdown and Unicode symbols."""
+    """Convert explicit LaTeX math notation into clean, native Discord markdown and Unicode symbols.
+    - Shields all CommonMark fenced code blocks and N-backtick inline code spans first.
+    - Converts block math ($$...$$, \\[...\\]) and explicit inline math (\\(...\\)).
+    - Converts $...$ ONLY when the interior is a valid mathematical expression (single variable,
+      superscript/subscript term, known LaTeX command, or explicit equation), never matching
+      tickers ($SOL), prices ($200), shell variables ($PATH), or regexes ($foo\\s+bar$).
+    """
     if not text:
         return text
 
+    text, code_spans = mask_code_spans(text, prefix="\x00LATEX_SPAN_")
+
+    def _add_latex_span(val: str) -> str:
+        idx = len(code_spans)
+        code_spans.append(val)
+        return f"\x00LATEX_SPAN_{idx}\x00"
+
     symbol_map = {
-        r"\\alpha": "α", r"\\beta": "β", r"\\gamma": "γ", r"\\delta": "δ",
-        r"\\epsilon": "ε", r"\\zeta": "ζ", r"\\eta": "η", r"\\theta": "θ",
-        r"\\lambda": "λ", r"\\mu": "μ", r"\\pi": "π", r"\\rho": "ρ",
-        r"\\sigma": "σ", r"\\tau": "τ", r"\\phi": "φ", r"\\omega": "ω",
-        r"\\Delta": "Δ", r"\\Theta": "Θ", r"\\Lambda": "Λ", r"\\Sigma": "Σ",
-        r"\\Omega": "Ω",
-        r"\\cdot": "·", r"\\times": "×", r"\\div": "÷",
-        r"\\leq?": "≤", r"\\geq?": "≥", r"\\neq": "≠", r"\\approx": "≈",
-        r"\\pm": "±", r"\\to": "→", r"\\rightarrow": "→", r"\\leftarrow": "←",
-        r"\\infty": "∞", r"\\partial": "∂", r"\\nabla": "∇",
-        r"\\in": "∈", r"\\notin": "∉", r"\\subset": "⊂", r"\\subseteq": "⊆"
+        r"\\alpha\b": "α", r"\\beta\b": "β", r"\\gamma\b": "γ", r"\\delta\b": "δ",
+        r"\\epsilon\b": "ε", r"\\zeta\b": "ζ", r"\\eta\b": "η", r"\\theta\b": "θ",
+        r"\\lambda\b": "λ", r"\\mu\b": "μ", r"\\pi\b": "π", r"\\rho\b": "ρ",
+        r"\\sigma\b": "σ", r"\\tau\b": "τ", r"\\phi\b": "φ", r"\\omega\b": "ω",
+        r"\\Delta\b": "Δ", r"\\Theta\b": "Θ", r"\\Lambda\b": "Λ", r"\\Sigma\b": "Σ",
+        r"\\Omega\b": "Ω",
+        r"\\cdot\b": "·", r"\\times\b": "×", r"\\div\b": "÷",
+        r"\\leq?\b": "≤", r"\\geq?\b": "≥", r"\\neq\b": "≠", r"\\approx\b": "≈",
+        r"\\sim\b": "~", r"\\pm\b": "±", r"\\to\b": "→", r"\\rightarrow\b": "→", r"\\leftarrow\b": "←",
+        r"\\infty\b": "∞", r"\\partial\b": "∂", r"\\nabla\b": "∇",
+        r"\\in\b": "∈", r"\\notin\b": "∉", r"\\subset\b": "⊂", r"\\subseteq\b": "⊆",
+        r"\\quad\b": " ", r"\\,": " ", r"\\;": " ", r"\\!": "", r"\\%": "%",
     }
 
-    # 1. Convert block math $$...$$ and \[ ... \]
-    def replace_block_math(match):
-        inner = match.group(1).strip()
+    superscripts = {"0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹"}
+    subscripts = {"0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉"}
+
+    def _transform_math_body(inner: str, is_block: bool = False) -> str:
         for pat, sym in symbol_map.items():
             inner = re.sub(pat, sym, inner)
         inner = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"\1/\2", inner)
         inner = re.sub(r"\\(?:text|mathrm|mathbf)\{([^}]+)\}", r"\1", inner)
-        inner = re.sub(r"\\(?:left|right)", "", inner)
-        return f"\n```\n{inner}\n```\n"
+        inner = re.sub(r"\\(?:left|right)\b", "", inner)
+        for k, v in superscripts.items():
+            inner = inner.replace(f"^{k}", v)
+        for k, v in subscripts.items():
+            inner = inner.replace(f"_{k}", v)
+        if not is_block:
+            inner = re.sub(r"\s+", " ", inner).strip()
+            if len(inner) == 1 and inner.isascii() and inner.isalpha():
+                return f"*{inner}*"
+        return inner
+
+    # 1. Convert block math $$...$$ and \[ ... \] and shield resulting code blocks immediately
+    def replace_block_math(match):
+        inner = _transform_math_body(match.group(1).strip(), is_block=True)
+        return _add_latex_span(f"\n```\n{inner}\n```\n")
 
     text = re.sub(r"\$\$(.+?)\$\$", replace_block_math, text, flags=re.DOTALL)
     text = re.sub(r"\\\[(.+?)\\\]", replace_block_math, text, flags=re.DOTALL)
 
-    # 2. Convert inline math \( ... \)
-    text = re.sub(r"\\\((.+?)\\\)", r"$\1$", text)
+    # 2. Convert explicit inline math \( ... \)
+    text = re.sub(r"\\\((.+?)\\\)", lambda m: _transform_math_body(m.group(1)), text)
 
-    # 3. Convert inline math $...$ (ignoring currency like $50 or $100.00)
-    def replace_inline_math(match):
-        inner = match.group(1).strip()
-        for pat, sym in symbol_map.items():
-            inner = re.sub(pat, sym, inner)
-        inner = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"\1/\2", inner)
-        inner = re.sub(r"\\(?:text|mathrm|mathbf)\{([^}]+)\}", r"\1", inner)
-        inner = re.sub(r"\\(?:left|right)", "", inner)
-        inner = inner.replace("\\", "")
+    # 3. Closed single numbers enclosed in dollar signs like $450$ or $200$ (LaTeX single-number notation)
+    text = re.sub(r"(?<![\w\$\\~])\$(\d+(?:\.\d+)?)\$(?![\w\$])", r"\1", text)
 
-        # Single variable or letter: render as italics (*d*)
-        if len(inner) == 1 and inner.isalpha():
-            return f"*{inner}*"
-        return inner
+    # 4. Whitelist-only inline $...$ conversion:
+    # Only convert $inner$ if there is no leading/trailing space inside the $ delimiters AND
+    # inner is a recognized mathematical expression (never arbitrary prose, tickers, paths, or regexes).
+    def _is_valid_inline_latex(inner: str) -> bool:
+        s = inner.strip()
+        if not s:
+            return False
+        # (a) Contains an explicit known LaTeX command (e.g. \alpha, \frac, \text, \sim, \cdot)
+        if _KNOWN_LATEX_CMD_RE.search(s):
+            # Reject if it also contains non-LaTeX regex/path escapes like \s, \d, \w, \n, \b
+            stripped_known = _KNOWN_LATEX_CMD_RE.sub("", s)
+            if "\\" in stripped_known:
+                return False
+            return True
+        # Reject any other string containing backslashes (e.g. regexes \s, \d or Windows paths)
+        if "\\" in s:
+            return False
+        # (b) Single ASCII variable (e.g. $x$, $d$, $n$)
+        if len(s) == 1 and s.isascii() and s.isalpha():
+            return True
+        # (c) Algebraic variable/number with superscript or subscript (e.g. $x^2$, $10^6$, $R^2$, $v_0$)
+        if re.match(r"^[a-zA-Z0-9]+(?:\^[0-9a-zA-Z+\-]+|_[0-9a-zA-Z+\-]+)+$", s):
+            return True
+        # (d) Clean mathematical equation/comparison (must contain =, ^, <, >, ±, ×, ÷, ≤, ≥, ≠, or ≈, and no slashes/colons/tildes)
+        if (
+            re.match(r"^[a-zA-Z0-9\s\+\-\*=\^_\(\)\.,<>±×÷≤≥≠≈]+$", s)
+            and any(op in s for op in ("=", "^", "<", ">", "±", "×", "÷", "≤", "≥", "≠", "≈"))
+        ):
+            return True
+        return False
 
-    text = re.sub(r"(?<![\w\$])\$(?!\d)([^$\n]+?)\$(?![\w\$])", replace_inline_math, text)
+    def _replace_inline_dollar_math(m: re.Match) -> str:
+        inner = m.group(1)
+        if _is_valid_inline_latex(inner):
+            return _transform_math_body(inner)
+        return m.group(0)
 
-    # 4. Clean HTML tags into Discord markdown (no raw <br> or <b>)
+    text = re.sub(
+        r"(?<![\w\$\\~])\$(?!\s)([^$\n]+?)(?<!\s)\$(?![\w\$])",
+        _replace_inline_dollar_math,
+        text,
+    )
+
+    # 5. Clean HTML tags into Discord markdown (no raw <br> or <b>)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<(b|strong)>", "**", text, flags=re.IGNORECASE)
     text = re.sub(r"</(b|strong)>", "**", text, flags=re.IGNORECASE)
@@ -758,7 +870,7 @@ def clean_discord_latex(text: str) -> str:
     text = re.sub(r"<code>", "`", text, flags=re.IGNORECASE)
     text = re.sub(r"</code>", "`", text, flags=re.IGNORECASE)
 
-    return text
+    return restore_code_spans(text, code_spans, prefix="\x00LATEX_SPAN_")
 
 
 def generate_concise_thread_title(prompt: str, target_words: int = 6) -> str:
@@ -900,23 +1012,149 @@ def synthesize_thread_title(prompt: str, response: str, max_words: int = 6) -> s
     return generate_concise_thread_title(prompt, target_words=max_words)
 
 
+_CODE_OR_REACT_RE = re.compile(
+    r"(```[\s\S]*?```|``[^`\n]+``|`[^`\n]+`)|(\[(?:REACT|REACTION):\s*([^\[\]]+)\])",
+    re.IGNORECASE,
+)
+
+_CODE_OR_CHOICES_RE = re.compile(
+    r"(```[\s\S]*?```|``[^`\n]+``|`[^`\n]+`)|(\[(?:CHOICES|OPTIONS):\s*((?:[^\[\]]|\[[^\]]*\])+)\])",
+    re.IGNORECASE,
+)
+
+
+def extract_react_directives(text: str) -> tuple[str, list[str]]:
+    """Extract and strip [REACT: <emoji>] tags outside of code blocks/inline backticks.
+
+    Returns (cleaned_text, reactions_to_add). Ignores backticked prose references like
+    `[REACT: <emoji>]` or `` `[REACT: ...]` `` so empty backticks are never left behind.
+    """
+    if not text:
+        return "", []
+    masked, spans = mask_code_spans(text, prefix="\x00REACT_SPAN_")
+    reactions: list[str] = []
+
+    def _repl(m: re.Match) -> str:
+        if m.group(1) is not None:
+            return m.group(1)
+        raw_emojis = (m.group(3) or "").strip()
+        parts = [p.strip() for p in re.split(r"[, ]+", raw_emojis) if p.strip()]
+        valid_parts = [
+            p for p in parts
+            if p not in ("...", "…", "<emoji>", "<emojis>") and not (p.startswith("<") and p.endswith(">") and ":" not in p)
+        ]
+        if not valid_parts:
+            return m.group(0)
+        reactions.extend(valid_parts)
+        return ""
+
+    cleaned = _CODE_OR_REACT_RE.sub(_repl, masked).strip()
+    return restore_code_spans(cleaned, spans, prefix="\x00REACT_SPAN_"), reactions
+
+
+def strip_unquoted_choices(text: str) -> str:
+    """Strip [CHOICES: ...] / [OPTIONS: ...] tags only when outside of inline/fenced code blocks."""
+    if not text:
+        return ""
+    masked, spans = mask_code_spans(text, prefix="\x00CHOICES_SPAN_")
+    cleaned = _CODE_OR_CHOICES_RE.sub(lambda m: m.group(1) if m.group(1) is not None else "", masked).strip()
+    return restore_code_spans(cleaned, spans, prefix="\x00CHOICES_SPAN_")
+
+
 def parse_interactive_choices(text: str, quick_choice_view_cls=None, button_choice_fn=None) -> tuple[str, any]:
-    """Parse [CHOICES: opt1 | opt2] tag from text and return (cleaned_text, choice_view)."""
-    matches = list(re.finditer(r"\[CHOICES:\s*([^\]]+)\]", text))
+    """Parse [CHOICES: opt1 | opt2] tag from text (ignoring code spans) and return (cleaned_text, choice_view)."""
+    if not text:
+        return text, None
+    masked, spans = mask_code_spans(text, prefix="\x00CHOICES_SPAN_")
+    matches = [m for m in _CODE_OR_CHOICES_RE.finditer(masked) if m.group(2) is not None]
     parsed_choices = []
     valid_match = None
     for m in matches:
-        raw_choices = m.group(1).strip()
+        raw_choices = m.group(3).strip()
         delim = "|" if "|" in raw_choices else ","
-        choices = [c.strip().strip("'\"`“”‘’").strip() for c in raw_choices.split(delim) if c.strip()]
+        choices = [
+            restore_code_spans(c, spans, prefix="\x00CHOICES_SPAN_").strip().strip("'\"`“”‘’").strip()
+            for c in raw_choices.split(delim)
+            if c.strip()
+        ]
         choices = [c for c in choices if c]
         if choices and not all(c in ("...", "…", "Option 1", "Option 2", "Option 3") for c in choices):
             parsed_choices = choices
             valid_match = m
 
     if valid_match and parsed_choices and quick_choice_view_cls:
-        clean_text = re.sub(r"\[CHOICES:\s*([^\]]+)\]", "", text).strip()
+        clean_text = strip_unquoted_choices(text)
         view = quick_choice_view_cls(parsed_choices, callback_fn=button_choice_fn)
         return clean_text, view
     return text, None
+
+
+def scrub_ephemeral_directives(text: str) -> str:
+    """Scrub ephemeral operational directives (Banana Watcher, watchdog alerts, loop warnings)
+    from in-flight tasks before constructing a mid-turn steering prompt.
+    Prevents autonomous NO_REPLY rules or bot probes from contaminating conversational turns.
+    """
+    if not text:
+        return ""
+    # Strip CRITICAL OPERATIONAL DIRECTIVE blocks
+    text = re.sub(
+        r"\[CRITICAL OPERATIONAL DIRECTIVE[^\]]*\].*?(?=(?:\n\s*\n\[|\Z))",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    # Strip Banana Watcher headers
+    text = re.sub(
+        r"🍌 \*\*(?:Topic Stalled|Loop Warning|Consensus Reached)\*\*:[^\n]*",
+        "",
+        text,
+    )
+    # Strip orphaned NO_REPLY directives
+    text = re.sub(r"(?i)output \[NO_REPLY\][^\n]*", "", text)
+    return text.strip()
+
+
+def format_steering_prompt(
+    new_directive: str,
+    original_task: str | None = None,
+    author_name: str | None = None,
+    is_group: bool = False,
+) -> str:
+    """Format a mid-turn steering prompt preserving original in-flight context."""
+    orig_section = ""
+    if original_task and str(original_task).strip():
+        clean_orig = scrub_ephemeral_directives(str(original_task))
+        if clean_orig:
+            orig_section = (
+                f"\n[ORIGINAL IN-FLIGHT TASK BEING EXECUTED]:\n"
+                f"\"{clean_orig}\"\n\n"
+            )
+
+    if is_group:
+        sender = f"from {author_name}" if author_name else "in the channel"
+        return (
+            f"[MID-TURN GROUP CONVERSATION UPDATE]\n"
+            f"{orig_section}"
+            f"While you were drafting your reply, a new message arrived in the channel {sender}:\n"
+            f"\"{new_directive.strip()}\"\n\n"
+            f"CRITICAL INSTRUCTIONS FOR REVISED TURN:\n"
+            f"1. Absorb this new context immediately. If your in-progress thought is now obsolete, answered, or contradicted, pivot cleanly or yield.\n"
+            f"2. If the new message is an addition, follow-up, or related question, synthesize both naturally in your reply.\n"
+            f"3. If you were emitting a ```handoff block, ensure it is completely valid, closed JSON or omitted entirely.\n"
+            f"4. Keep your output concise (strictly under 2,000 chars) and respond naturally to the CURRENT state of the room."
+        )
+
+    return (
+        f"[USER MID-TURN STEERING UPDATE]\n"
+        f"{orig_section}"
+        f"[NEW DIRECTIVE RECEIVED MID-TURN]:\n"
+        f"\"{new_directive.strip()}\"\n\n"
+        f"CRITICAL INSTRUCTIONS FOR REVISED TURN:\n"
+        f"1. Absorb the new directive immediately in the context of the original in-flight task.\n"
+        f"2. If the new directive is an addition, clarification, or follow-up question, SYNTHESIZE BOTH: address the new directive while fulfilling the original task (answer both questions or combine them).\n"
+        f"3. If the new directive explicitly contradicts, cancels, or supersedes the prior plan, abort the prior task and pivot cleanly to the new directive.\n"
+        f"4. Seamlessly incorporate this guidance into your response without restarting from scratch unless requested."
+    )
+
+
 

@@ -54,10 +54,16 @@ class TestCubsNotifier(unittest.TestCase):
     @patch("tools.cubs_notifier.save_state")
     def test_check_cubs_game_no_game(self, mock_save, mock_load, mock_fetch):
         mock_fetch.return_value = []
-        ok, rep, meta = check_cubs_game()
+        ok, rep, meta = check_cubs_game(date_str="2026-07-04")
         self.assertTrue(ok)
         self.assertEqual(rep, "")
         self.assertEqual(meta.get("status"), "no_game_today")
+
+    def test_check_cubs_game_offseason(self):
+        ok, rep, meta = check_cubs_game(date_str="2026-11-15")
+        self.assertTrue(ok)
+        self.assertEqual(rep, "")
+        self.assertEqual(meta.get("status"), "offseason_suspended")
 
 if __name__ == "__main__":
     unittest.main()

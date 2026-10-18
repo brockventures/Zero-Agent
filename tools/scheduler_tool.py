@@ -29,6 +29,17 @@ log = logging.getLogger("scheduler_tool")
 
 DEFAULT_JOBS = [
     {
+        "id": "quant_daily_sweep",
+        "name": "Multi-Venue Quant Paper Trading Sweep",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 8,
+        "minute_pt": 0,
+        "prompt": "Run multi-venue quantitative paper trading expansion sweep across all 4 tracks: python3 /workspace/tools/sidecars.py quant. Silent background execution (alerts #vault only on error).",
+        "catchup_if_missed": False,
+        "quiet_hours": None,
+    },
+    {
         "id": "actual_bank_sync",
         "name": "Actual Budget Daily Bank Sync",
         "enabled": True,
@@ -169,12 +180,34 @@ DEFAULT_JOBS = [
         "catchup_if_missed": False
     },
     {
+        "id": "gemini_context_digest",
+        "name": "Daily Zero & Ivy Context Email Digest",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 6,
+        "minute_pt": 30,
+        "prompt": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest --quiet.",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 14400
+    },
+    {
+        "id": "daily_quota_card",
+        "name": "Daily Gemini Quota Card",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 7,
+        "minute_pt": 0,
+        "prompt": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 14400
+    },
+    {
         "id": "daily_birthday_reminder",
         "name": "Daily Birthday Reminder",
         "enabled": True,
         "schedule_type": "daily",
         "hour_pt": 7,
-        "minute_pt": 0,
+        "minute_pt": 15,
         "prompt": "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py --quiet. If someone has a birthday today, post the reminder with the interactive text button.",
         "catchup_if_missed": True,
         "catchup_window_seconds": 14400
@@ -332,24 +365,219 @@ DEFAULT_JOBS = [
         "catchup_if_missed": False
     },
     {
+        "id": "pid_watchdog",
+        "name": "PID & Process Headroom Watchdog",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 900,
+        "channel_id": 1544953279664889888,
+        "prompt": "Run the Host 2 and Host 1 PID & process headroom watchdog using /workspace/tools/sidecars.py pid_watchdog. Silent execution unless warning or critical threshold exceeded.",
+        "catchup_if_missed": False
+    },
+    {
         "id": "agora_roguelike_pm",
         "name": "Agora Roguelike PM & Board Coordinator",
-        "enabled": True,
+        "enabled": False,
         "schedule_type": "interval",
         "interval_seconds": 900,
         "channel_id": 1558202642663211169,
         "prompt": "Run the Agora Roguelike PM board assessment and autonomous merge check using python3 /workspace/tools/sidecars.py agora_pm. Post updates to #agora when PRs or assignments change (silent when nominal).",
-        "catchup_if_missed": False
+        "catchup_if_missed": False,
+        "quiet_hours": [23, 7]
     },
     {
         "id": "agora_roguelike_engineer",
         "name": "Agora Roguelike Engineering Execution",
-        "enabled": True,
+        "enabled": False,
         "schedule_type": "interval",
         "interval_seconds": 900,
         "channel_id": 1558202642663211169,
         "prompt": "Run the Agora Roguelike engineering execution check using python3 /workspace/tools/sidecars.py agora_engineer.",
+        "catchup_if_missed": False,
+        "quiet_hours": [23, 7]
+    },
+    {
+        "id": "kalshi_paper_bot",
+        "name": "Kalshi Weather Quant Paper Bot",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 5,
+        "minute_pt": 15,
+        "prompt": "Run the daily Kalshi weather quant paper bot scan and settlement: python3 /workspace/tools/sidecars.py kalshi",
+        "catchup_if_missed": False,
+        "quiet_hours": None
+    },
+    {
+        "id": "kalshi_evening_review",
+        "name": "Kalshi Paper Trading Evening Review & Model Sync",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 18,
+        "minute_pt": 45,
+        "prompt": "Run the Kalshi paper trading evening settlement and review: python3 /workspace/tools/sidecars.py kalshi_evening",
+        "catchup_if_missed": False,
+        "quiet_hours": [23, 7]
+    },
+    {
+        "id": "weekly_meal_proposal",
+        "name": "Weekly 3-Dinner Meal Proposal",
+        "enabled": True,
+        "schedule_type": "weekly",
+        "day_of_week": 6,  # Sunday
+        "hour_pt": 19,
+        "minute_pt": 0,
+        "channel_id": 1544955538033348618,
+        "prompt": "Run weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Post dinner rotation options to #shopping.",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 14400
+    },
+    {
+        "id": "weekly_grocery_staging",
+        "name": "Weekly Whole Foods Grocery Staging",
+        "enabled": True,
+        "schedule_type": "weekly",
+        "day_of_week": 0,  # Monday
+        "hour_pt": 9,
+        "minute_pt": 0,
+        "channel_id": 1544955538033348618,
+        "prompt": "Run weekly grocery cart compilation using /workspace/tools/sidecars.py groceries. Ingest recipes and todo.shopping_list, and post the 1-click Whole Foods AFX cart to #shopping.",
         "catchup_if_missed": False
+    },
+    {
+        "id": "token_budget_watchdog",
+        "name": "Daily Token Budget Watchdog",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 23,
+        "minute_pt": 45,
+        "channel_id": 1544953279664889888,
+        "prompt": "Run daily token budget watchdog evaluation using /workspace/tools/sidecars.py token_budget_watchdog --dispatch.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "reddit_fantasy_morning",
+        "name": "Reddit Fantasy Baseball Morning Scanner",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 8,
+        "minute_pt": 5,
+        "channel_id": 1542081375287640084,
+        "prompt": "Run the Reddit fantasy baseball morning discovery scan using /workspace/tools/sidecars.py reddit_fantasy. Scan r/fantasybaseball for active dilemma comments, generate draft replies, and post candidate cards to #zero-chat.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "reddit_fantasy_afternoon",
+        "name": "Reddit Fantasy Baseball Afternoon Scanner",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 14,
+        "minute_pt": 0,
+        "channel_id": 1542081375287640084,
+        "prompt": "Run the Reddit fantasy baseball afternoon discovery scan using /workspace/tools/sidecars.py reddit_fantasy. Scan r/fantasybaseball for active dilemma comments, generate draft replies, and post candidate cards to #zero-chat.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "kalshi_night_audit",
+        "name": "Kalshi Nightly Settlement & Quant Standup",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 21,
+        "minute_pt": 45,
+        "prompt": "Run the Kalshi nightly settlement, calibration audit, and GitHub sync: python3 /workspace/tools/sidecars.py kalshi_night",
+        "catchup_if_missed": False,
+        "quiet_hours": [23, 7]
+    },
+    {
+        "id": "kometa_audit",
+        "name": "Kometa Post-Run Audit",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 2,
+        "minute_pt": 15,
+        "channel_id": 1544955535722545253,
+        "prompt": "Run the Kometa post-run log audit using /workspace/tools/sidecars.py kometa_audit. Audit meta.log on Host 1 and report status.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "arr_queue_watchdog",
+        "name": "Arr Queue & Health Watchdog",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 3600,
+        "channel_id": 1544955535722545253,
+        "prompt": "Run the Arr queue & health watchdog using /workspace/tools/sidecars.py arr_queue.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "prowlarr_watchdog",
+        "name": "Prowlarr Indexer Watchdog",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 3600,
+        "channel_id": 1544955535722545253,
+        "prompt": "Run the Prowlarr indexer health watchdog using /workspace/tools/sidecars.py prowlarr.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "sabnzbd_watchdog",
+        "name": "SABnzbd Watchdog",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 3600,
+        "channel_id": 1544955535722545253,
+        "prompt": "Run the SABnzbd downloader & unpack watchdog using /workspace/tools/sidecars.py sabnzbd.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "nest_lock_watchdog",
+        "name": "Nest Lock Watchdog",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 3600,
+        "channel_id": 1544953275877556334,
+        "prompt": "Run the Nest lock & Homebridge self-healing watchdog using /workspace/tools/sidecars.py nest_lock.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "ha_reauth_watchdog",
+        "name": "HA Re-Auth Watchdog",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 3600,
+        "channel_id": 1544953275877556334,
+        "prompt": "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "google_tasks_sync",
+        "name": "Google Tasks Two-Way Sync",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 1800,
+        "prompt": "Run the Google Tasks two-way sync using /workspace/tools/sidecars.py tasks_sync. Silent sidecar execution (silent unless error).",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "quota_poller",
+        "name": "10-Minute Quota Usage Poller",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 600,
+        "prompt": "Run the 10-minute ground-truth quota usage poller using /workspace/tools/sidecars.py quota_poller. Captures live remaining fractions and cycle burn deltas.",
+        "catchup_if_missed": False
+    },
+    {
+        "id": "personal_data_sync",
+        "name": "Weekly Personal Data & Gaming Profile Sync",
+        "enabled": True,
+        "schedule_type": "weekly",
+        "day_of_week": 6,  # Sunday
+        "hour_pt": 4,
+        "minute_pt": 0,
+        "channel_id": 1544953279664889888,
+        "prompt": "Run the weekly personal data and gaming profile sync using /workspace/tools/sidecars.py personal_data_sync --quiet. Syncs Steam, Xbox, Switch 2, Amazon orders, and Plex watch history into durable memory and re-indexes transcript_index.db.",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 14400
     }
 ]
 
@@ -359,7 +587,11 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "host1_backup",
     "host2_backup",
     "bridge_watchdog",
+    "pid_watchdog",
     "plex_cleanup",
+    "kalshi_paper_bot",
+    "quota_poller",
+    "personal_data_sync",
 }
 
 
@@ -378,8 +610,6 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
             nxt = float(now_ts + interval)
 
         quiet = job.get("quiet_hours")
-        if quiet is None and job.get("id") not in INTERNAL_SYSTEM_MAINTENANCE_JOBS:
-            quiet = [23, 7]
 
         if quiet and len(quiet) == 2:
             start_h, end_h = quiet
@@ -431,13 +661,17 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
     return now_pt.timestamp() + 3600
 
 SIDECAR_ALIASES = {
+    "quant_daily_sweep": ["quant_daily_sweep", "quant_expansion_sweep", "quant"],
+    "actual_bank_sync": ["actual_bank_sync", "actual_sync"],
+    "cash_sweep_monitor": ["cash_sweep_monitor", "cash_sweep", "sweep"],
+    "monthly_variance_digest": ["monthly_variance_digest", "variance_digest", "variance"],
     "agora_roguelike_pm": ["agora_roguelike_pm", "agora_pm"],
     "agora_roguelike_engineer": ["agora_roguelike_engineer", "agora_eng", "agora_engineer"],
     "heartbeat_sweep": ["heartbeat", "heartbeat_sweep"],
     "nightly_triage": ["triage", "nightly_triage"],
     "nas_logs": ["nas_logs"],
     "dreaming": ["dream", "dreaming"],
-    "session_rollover": ["session_rollover"],
+    "session_rollover": ["session_rollover", "rollover"],
     "plex_cleanup": ["plex", "plex_cleanup"],
     "dated_reminders": ["reminders", "dated_reminders"],
     "ev9_monitor": ["ev9", "ev9_monitor"],
@@ -446,9 +680,10 @@ SIDECAR_ALIASES = {
     "daily_birthday_reminder": ["daily_birthday_reminder", "birthday_reminder", "birthdays"],
     "weekly_social_last_seen_review": ["weekly_social_review", "social_review", "weekly_social_last_seen_review"],
     "monthly_core_friends_reconnect": ["monthly_core_friends_reminder", "core_friends", "monthly_core_friends_reconnect"],
-    "morning_topic_rotation": ["morning_topic_rotation", "morning_dispatcher"],
+    "morning_topic_rotation": ["morning_topic_rotation", "morning_dispatcher", "morning"],
     "antigravity_check": ["update_antigravity", "antigravity_check"],
     "ha_battery_check": ["ha_battery", "ha_battery_check"],
+    "ha_anomaly_check": ["ha_anomaly_check", "ha_anomaly", "anomaly"],
     "nas_storage_check": ["nas_storage", "nas_storage_check"],
     "ha_update_check": ["ha_update_check"],
     "dockhand_update": ["dockhand_check", "dockhand_update"],
@@ -456,7 +691,25 @@ SIDECAR_ALIASES = {
     "plex_weekly_digest": ["plex_weekly_digest"],
     "monthly_hardcode_regex_audit": ["monthly_hardcode_regex_audit", "code_audit", "hardcode_audit", "regex_audit"],
     "host2_backup": ["host2_backup", "backup_host2", "backup2"],
-    "host1_backup": ["host1_backup", "backup_host1", "backup1"]
+    "host1_backup": ["host1_backup", "backup_host1", "backup1"],
+    "bridge_watchdog": ["bridge_watchdog"],
+    "pid_watchdog": ["pid_watchdog", "pid"],
+    "kalshi_paper_bot": ["kalshi_paper_bot", "kalshi", "kalshi_bot"],
+    "kalshi_evening_review": ["kalshi_evening_review", "kalshi_evening", "kalshi_review"],
+    "kalshi_night_audit": ["kalshi_night_audit", "kalshi_night", "kalshi_audit"],
+    "reddit_fantasy_morning": ["reddit_fantasy_morning", "reddit_fantasy_scanner", "reddit_fantasy"],
+    "reddit_fantasy_afternoon": ["reddit_fantasy_afternoon", "reddit_fantasy_scanner", "reddit_fantasy"],
+    "weekly_meal_proposal": ["weekly_meal_proposal", "meal_proposal"],
+    "weekly_grocery_staging": ["weekly_grocery_staging", "grocery_staging", "groceries"],
+    "token_budget_watchdog": ["token_budget_watchdog", "token_budget"],
+    "arr_queue_watchdog": ["arr_queue_watchdog", "arr_queue", "arr"],
+    "prowlarr_watchdog": ["prowlarr_watchdog", "prowlarr", "indexers"],
+    "sabnzbd_watchdog": ["sabnzbd_watchdog", "sabnzbd", "sab"],
+    "nest_lock_watchdog": ["nest_lock_watchdog", "nest_lock", "lock_watchdog", "lock_heal"],
+    "ha_reauth_watchdog": ["ha_reauth_watchdog", "ha_reauth", "ha_auth"],
+    "kometa_audit": ["kometa_audit", "kometa"],
+    "google_tasks_sync": ["google_tasks_sync", "tasks_sync"],
+    "quota_poller": ["quota_poller", "quota_poll", "poller_quota"],
 }
 
 def get_last_execution_for_job(job_info: str | dict) -> tuple[float | None, str | None]:

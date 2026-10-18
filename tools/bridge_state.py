@@ -10,7 +10,7 @@ import os
 import re
 import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -46,9 +46,19 @@ BROCK_GUILD_ID = int(os.getenv("DISCORD_BROCK_GUILD_ID", "1210466877294518272"))
 OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
 IVY_USER_ID = int(os.getenv("DISCORD_IVY_USER_ID", "1541205716948353074"))
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
+CRAB_CAVERN_GUILD_ID = int(os.getenv("DISCORD_CRAB_CAVERN_GUILD_ID", "1486135733214380105"))
+CRAB_CAVERN_CHANNEL_IDS = {
+    1534436119888793750,  # #the-banana-stand
+    1534452820995080192,  # #lounge
+    1549555629222404096,  # #debug-huddle
+    1551465050072416286,  # #side-project
+    1552732003076669460,  # #mirrormere
+    1558202642663211169,  # #agora
+}
 
 OPERATIONS_CATEGORY_ID = 1544953274363412533
 HOMELAB_CHANNEL_ID = 1544955535722545253
+FINANCES_CHANNEL_ID = 1544955532765560924        # #finances
 BROCK_HOUSE_CHANNEL_ID = 1550577908811178095  # #brock-house
 VAULT_CHANNEL_ID = 1550577910757458015        # #vault (isolated memory tier)
 DEFAULT_EXCLUDED_HOME_CHANNELS = {
@@ -59,10 +69,11 @@ DEFAULT_HOME_CHANNELS = {
     1544953275877556334,  # #home-assistant
     1544953277592899615,  # #steam-deck
     1544953279664889888,  # #zero-ops / #harness-management
-    1544955532765560924,  # #finances
+    FINANCES_CHANNEL_ID,  # #finances
     HOMELAB_CHANNEL_ID,    # #homelab
     1544955538033348618,  # #shopping
     1548196930788524094,  # #projects
+    1555973316752449576,  # #3d-print
     BROCK_HOUSE_CHANNEL_ID,  # #brock-house
     VAULT_CHANNEL_ID,        # #vault
 }
@@ -150,6 +161,67 @@ def is_brock_guild(obj) -> bool:
     if isinstance(guild_id, (int, str)) and str(guild_id).isdigit():
         return int(guild_id) == BROCK_GUILD_ID
     return False
+
+
+def is_crab_cavern_silenced(rules: dict | None = None) -> tuple[bool, str]:
+    """Check if Crab Cavern is currently in a blackout / silence period."""
+    if rules is None:
+        rules = get_runtime_rules()
+    silenced_until = rules.get("crab_cavern_silenced_until")
+    if not silenced_until:
+        return False, ""
+    try:
+        if isinstance(silenced_until, (int, float)):
+            silence_ts = float(silenced_until)
+        else:
+            silence_dt = datetime.fromisoformat(str(silenced_until))
+            silence_ts = silence_dt.timestamp()
+        now = time.time()
+        if now < silence_ts:
+            rem_hours = (silence_ts - now) / 3600.0
+            until_pt = datetime.fromtimestamp(silence_ts, tz=PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
+            reason = rules.get("crab_cavern_silence_reason", "Quota preservation hold")
+            return True, f"Crab Cavern silenced until {until_pt} ({rem_hours:.1f}h remaining: {reason})"
+    except Exception as e:
+        print(f"[BridgeState] Error parsing crab_cavern_silenced_until: {e}")
+    return False, ""
+
+
+def parse_silence_until(arg: str | None, now: datetime | None = None) -> datetime:
+    """Resolve an operator silence argument to a tz-aware PT deadline.
+
+    Accepts: empty (next 8:00 PM PT), "<N>h", "tomorrow [at] [H[:MM]am|pm]",
+    or an ISO date/time ("2026-10-13" or "2026-10-13 20:00", naive = PT).
+    """
+    now = (now or datetime.now(PT_TZ)).astimezone(PT_TZ)
+    text = (arg or "").strip().lower()
+    text = re.sub(r"^until\s+", "", text)
+
+    def _at(day, hour=20, minute=0):
+        return day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    if not text:
+        target = _at(now)
+        return target if target > now else _at(now + timedelta(days=1))
+
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*h(?:ours?|rs?)?", text)
+    if m:
+        return now + timedelta(hours=float(m.group(1)))
+
+    m = re.fullmatch(r"tomorrow(?:\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm))?", text)
+    if m:
+        hour, minute = 20, 0
+        if m.group(1):
+            hour = int(m.group(1)) % 12 + (12 if m.group(3) == "pm" else 0)
+            minute = int(m.group(2) or 0)
+        return _at(now + timedelta(days=1), hour, minute)
+
+    dt = datetime.fromisoformat(text.replace("t", " ").strip())
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=PT_TZ)
+    if "-" in text and ":" not in text:
+        dt = dt.replace(hour=20, minute=0)
+    return dt.astimezone(PT_TZ)
 
 
 def is_reply_to_zero(msg, bot=None) -> bool:
@@ -561,6 +633,9 @@ def clear_reset_session_keys():
 class PersistentSessionKeySet(set):
     """A set of session keys that automatically synchronizes additions and removals to disk."""
 
+    def __contains__(self, element):
+        return str(element) in get_reset_session_keys()
+
     def add(self, element):
         s_elem = str(element)
         super().add(s_elem)
@@ -654,15 +729,7 @@ def get_gif_prompt_guidance(sess_key: str, channel_id: int | str | None = None) 
 
     return (
         f"[GIF Cadence Tracker (Channel: {sess_key})]: {count} message(s) since last reaction GIF in this channel.\n"
-        f"• Target Cadence: ~1 in 5-7 messages.\n"
-        f"• Situational Query Strategy: Describe the situation or vibe of your upcoming message (use: python3 /workspace/tools/gif_tool.py \"<situation or vibe description>\"). Matches against curated situation and vibe metadata in canonical_gifs.json.\n"
-        f"• Status: {status_str}.\n"
-        f"• Contextual Overrides:\n"
-        f"  - Serious / Critical Override: If the message/topic is serious, urgent, an outage, data entry, or sensitive, override and SKIP the GIF regardless of count.\n"
-        f"  - Social / Banter Override: If the exchange is particularly social, humorous, or banter-laden, you may include a GIF even if count < 5.\n"
-        f"  - Fast-Fail & Single-Shot Rule: GIF queries are strictly single-shot. If 404s or fails, bail out immediately and emit text—never inspect tool code or retry.\n"
-        f"  - Formatting & Placement: Hyperlink text MUST strictly say 'GIF' (e.g. [GIF](<url>) or [GIF](url)). Always place the [GIF](<url>) link at the VERY END of your message (immediately before any [CHOICES: ...] block, never at the beginning).\n"
-        f"  - Diagnostic Ping Override: If prompt is a latency/ping check ('ping', 'respond pong'), skip tool calls entirely."
+        f"• Status: {status_str} (Target ~1 in 5-7 turns via `python3 /workspace/tools/gif_tool.py \"<situation or vibe>\"`; skip on serious/outage/ping turns; place `[GIF](url)` at very end before `[CHOICES: ...]`)."
     )
 
 
@@ -672,11 +739,17 @@ def check_compaction_needed(
     current_turns: int,
     brain_root: Path = Path("/root/.gemini/antigravity-cli/brain")
 ) -> tuple[bool, str]:
-    """Evaluate whether a session should be compacted based on turns, transcript size, step count, or age."""
+    """Evaluate whether a session should be compacted based on turns, transcript size, step count, or age.
+
+    Shared Zero & Ivy thresholds:
+      - 15 turns (multi-turn feature/modeling horizon)
+      - 800 steps (accommodates 6-8 heavy 100-step turns or 2-3 massive 250-step turns without mid-task amnesia)
+      - 1.0 MB (1,024 KB) compact transcript.jsonl size (~50k-65k trajectory tokens)
+    """
     rules = get_runtime_rules()
     max_turns = int(rules.get("compaction_max_turns", 15))
-    max_steps = int(rules.get("compaction_max_steps", 1500))
-    max_mb = float(rules.get("compaction_max_mb", 2.0))
+    max_steps = int(rules.get("compaction_max_steps", 800))
+    max_mb = float(rules.get("compaction_max_mb", 1.0))
 
     if current_turns >= max_turns:
         return True, f"turn count reached {current_turns}/{max_turns}"
@@ -790,7 +863,7 @@ def get_session_parent_id(sess_key: str) -> str | None:
 
 
 # Active model selection persistence
-ACTIVE_MODEL = os.getenv("AGY_MODEL", "gemini-3.8-flash-high")
+ACTIVE_MODEL = os.getenv("AGY_MODEL", "gemini-4-argon-low")
 if CONFIG_FILE.exists():
     try:
         with open(CONFIG_FILE) as f:
@@ -824,8 +897,30 @@ def set_active_model(model_name: str) -> str:
 def save_runtime_config():
     """Save runtime settings (like active model) to persistent storage."""
     try:
+        cfg = {}
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE) as f:
+                    cfg = json.load(f)
+                if not isinstance(cfg, dict):
+                    cfg = {}
+            except Exception:
+                cfg = {}
+        cfg["model"] = ACTIVE_MODEL
         with open(CONFIG_FILE, "w") as f:
-            json.dump({"model": ACTIVE_MODEL}, f, indent=2)
+            json.dump(cfg, f, indent=2)
+        for spath, nested in [("/root/.gemini/antigravity-cli/settings.json", False), ("/root/.gemini/config/config.json", True)]:
+            try:
+                with open(spath) as sf:
+                    sdata = json.load(sf)
+                if nested:
+                    sdata.setdefault("userSettings", {})["model"] = ACTIVE_MODEL
+                else:
+                    sdata["model"] = ACTIVE_MODEL
+                with open(spath, "w") as sf:
+                    json.dump(sdata, sf, indent=2)
+            except Exception:
+                pass
     except Exception as e:
         print(f"[BridgeState] Failed saving runtime config: {e}")
 
@@ -887,6 +982,10 @@ class PersistentTurnQueue:
                 if prompt:
                     self.pending_items = [p for p in self.pending_items if p.get("prompt") != prompt]
             self._persist()
+        else:
+            if self.pending_items:
+                self.pending_items.pop(0)
+                self._persist()
         self.queue.task_done()
 
     def empty(self):
@@ -901,7 +1000,9 @@ def update_beacon(state: str = "IDLE", prompt: str = "", channel_id: int | str =
             clean_prompt = clean_prompt.split("[CURRENT USER PROMPT]:", 1)[1].strip()
         elif "[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:" in clean_prompt:
             clean_prompt = re.sub(r"\[PREVIOUS SESSION CARRY-FORWARD CONTEXT\]:.*?(?=\n\n|\Z)", "", clean_prompt, flags=re.DOTALL).strip()
-        clean_prompt = re.sub(r"<[^>]+>", "", clean_prompt).strip()
+        # Strip Discord mentions (<@123>, <#456>, <@&789>) and XML/HTML tags while preserving math inequalities and generics
+        clean_prompt = re.sub(r"<[@#][!&]?[0-9]+>", "", clean_prompt)
+        clean_prompt = re.sub(r"</?(?:USER_REQUEST|ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|SYSTEM_MESSAGE|TASK_OUTPUT|[a-zA-Z]{2,})(?:\s+[^>]*)?/?>", "", clean_prompt).strip()
         clean_prompt = re.sub(r"\[System Time & Timezone\]:[^\n]*(?:\n\s*[•\-\*][^\n]*)*\n*", "", clean_prompt).strip()
         clean_prompt = re.sub(r"\[GIF Cadence Tracker[^\n]*(?:\n\s*[•\-\*][^\n]*)*\n*", "", clean_prompt).strip()
         clean_prompt = clean_prompt.strip()

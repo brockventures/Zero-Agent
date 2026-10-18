@@ -60,7 +60,7 @@ THIN_SKIN_ORGANIC = {
     "raspberry", "raspberries", "blackberry", "blackberries",
     "spinach", "kale", "greens", "lettuce", "spring mix", "arugula",
     "grape", "grapes", "apple", "apples", "peach", "peaches", "nectarine", "nectarines",
-    "cherry", "cherries", "bell pepper", "bell peppers", "pepper", "peppers",
+    "cherry", "cherries", "bell pepper", "bell peppers", "sweet peppers", "mini peppers",
     "celery", "cucumber", "cucumbers", "tomato", "tomatoes", "cilantro", "parsley"
 }
 
@@ -72,10 +72,12 @@ GRASS_FED_MEATS = {
 WF_INGREDIENT_NORMALIZER = {
     "milk": "365 organic whole milk",
     "whole milk": "365 organic whole milk",
-    "egg": "large brown eggs",
-    "eggs": "large brown eggs",
-    "large eggs": "large brown eggs",
-    "brown eggs": "large brown eggs",
+    "egg": "large brown grade a eggs",
+    "eggs": "large brown grade a eggs",
+    "large eggs": "large brown grade a eggs",
+    "brown eggs": "large brown grade a eggs",
+    "large brown eggs": "large brown grade a eggs",
+    "organic eggs": "organic large brown grade a eggs",
     "ranch dressing": "365 ranch dressing",
     "ranch": "365 ranch dressing",
     "barbecue sauce": "365 organic barbecue sauce",
@@ -108,12 +110,12 @@ WF_INGREDIENT_NORMALIZER = {
     "mild italian sausage": "365 mild italian pork sausage",
     "italian pork sausage": "365 mild italian pork sausage",
     "italian sausage": "365 mild italian pork sausage",
-    "parmesan": "365 grated parmesan cheese",
-    "grated parmesan": "365 grated parmesan cheese",
-    "grated parmesan cheese": "365 grated parmesan cheese",
-    "parmigiano-reggiano": "365 grated parmesan cheese",
-    "parmigiano reggiano": "365 grated parmesan cheese",
-    "freshly grated parmigiano-reggiano": "365 grated parmesan cheese",
+    "parmesan": "grated parmesan cheese",
+    "grated parmesan": "grated parmesan cheese",
+    "grated parmesan cheese": "grated parmesan cheese",
+    "parmigiano-reggiano": "grated parmesan cheese",
+    "parmigiano reggiano": "grated parmesan cheese",
+    "freshly grated parmigiano-reggiano": "grated parmesan cheese",
     "fresh basil": "organic fresh basil",
     "fresh basil leaves": "organic fresh basil",
     "basil leaves": "organic fresh basil",
@@ -122,13 +124,31 @@ WF_INGREDIENT_NORMALIZER = {
     "chopped fresh italian parsley": "organic fresh parsley",
     "fresh cilantro": "organic fresh cilantro",
     "chopped fresh cilantro": "organic fresh cilantro",
-    "sara lee artesano bakery bread": "365 classic white sandwich bread",
-    "white bread": "365 classic white sandwich bread",
-    "sandwich bread": "365 classic white sandwich bread",
+    "sara lee artesano bakery bread": "Nature's Own Butterbread, Non-GMO Bread, Sandwich Bread, 20 oz Loaf",
+    "white bread": "Nature's Own Butterbread, Non-GMO Bread, Sandwich Bread, 20 oz Loaf",
+    "sandwich bread": "Nature's Own Butterbread, Non-GMO Bread, Sandwich Bread, 20 oz Loaf",
+    "nature's own butterbread": "Nature's Own Butterbread, Non-GMO Bread, Sandwich Bread, 20 oz Loaf",
+    "butterbread": "Nature's Own Butterbread, Non-GMO Bread, Sandwich Bread, 20 oz Loaf",
+    "honey nut cheerios": "Honey Nut Cheerios Cereal, Limited Edition Heart Shapes, Affirmations Box, Heart Healthy, Gluten Free, Large Size, 15.4 oz",
+    "oatmeal": "365 by Whole Foods Market, Organic Maple & Brown Sugar Instant Oatmeal Packets, 1.41 Ounce (Pack of 8)",
+    "instant oatmeal": "365 by Whole Foods Market, Organic Maple & Brown Sugar Instant Oatmeal Packets, 1.41 Ounce (Pack of 8)",
+    "purely elizabeth oatmeal": "365 by Whole Foods Market, Organic Maple & Brown Sugar Instant Oatmeal Packets, 1.41 Ounce (Pack of 8)",
+    "purely elizabeth cinnamon instant oatmeal": "365 by Whole Foods Market, Organic Maple & Brown Sugar Instant Oatmeal Packets, 1.41 Ounce (Pack of 8)",
+    "ground turkey": "organic ground turkey",
+    "ground pork": "ground pork",
     "whole-milk ricotta cheese": "365 organic whole milk ricotta cheese",
     "ricotta cheese": "365 organic whole milk ricotta cheese",
-    "feta cheese": "365 organic feta cheese",
-    "crumbled feta cheese": "365 organic feta cheese",
+    "feta cheese": "crumbled feta cheese",
+    "crumbled feta cheese": "crumbled feta cheese",
+    "shredded carrots": "organic shredded carrots",
+    "whole jalapeño chiles": "organic jalapeno peppers",
+    "jalapeño chiles": "organic jalapeno peppers",
+    "jalapeno chiles": "organic jalapeno peppers",
+    "jalapeños": "organic jalapeno peppers",
+    "jalapeno": "organic jalapeno peppers",
+    "jalapeño": "organic jalapeno peppers",
+    "ají amarillo pepper paste": "organic jalapeno peppers",
+    "aji amarillo pepper paste": "organic jalapeno peppers",
     "cotija cheese": "cotija cheese",
     "cremini mushrooms": "organic cremini mushrooms",
     "grape tomatoes": "organic grape tomatoes",
@@ -140,7 +160,21 @@ WF_INGREDIENT_NORMALIZER = {
     "whole peeled san marzano tomatoes": "365 whole peeled san marzano tomatoes",
     "san marzano tomatoes": "365 whole peeled san marzano tomatoes",
     "gluten-free breadcrumbs": "gluten free breadcrumbs",
-    "chicken breasts": "organic chicken breasts",
+    "chicken breasts": "organic boneless skinless chicken breast",
+    "chicken breast": "organic boneless skinless chicken breast",
+    "boneless skinless chicken breasts": "organic boneless skinless chicken breast",
+    "boneless skinless chicken breast": "organic boneless skinless chicken breast",
+    "boneless skinless chicken breasts or thighs": "organic boneless skinless chicken breast",
+    "chicken breasts or thighs": "organic boneless skinless chicken breast",
+    "chicken thighs or breasts": "organic boneless skinless chicken breast",
+    "chicken thighs": "organic boneless skinless chicken thighs",
+    "boneless skinless chicken thighs": "organic boneless skinless chicken thighs",
+    "ground pepper": "365 organic ground black pepper",
+    "pepper": "365 organic ground black pepper",
+    "black pepper": "365 organic ground black pepper",
+    "ground black pepper": "365 organic ground black pepper",
+    "ground allspice": "365 organic allspice ground",
+    "allspice": "365 organic allspice ground",
 }
 
 PACKAGED_RETAIL_KEYWORDS = {
@@ -152,14 +186,188 @@ PACKAGED_RETAIL_KEYWORDS = {
 }
 
 
+def apply_365_store_brand(name: str) -> str:
+    """Prioritizes Whole Foods store brand (365 by Whole Foods Market) for packaged goods,
+    pantry staples, canned goods, dairy, grains, and condiments whenever available."""
+    clean = name.strip().lower()
+
+    # Do not override explicit specialty or requested third-party brands
+    specialty_brands = [
+        "purely elizabeth", "simply elizabeth", "banza", "jovial", "barilla",
+        "tate's", "schär", "schar", "rao's", "raos", "one degree", "dr praegers",
+        "dr. praeger's", "yasso", "cheerios", "waterloo", "vital farms", "shin ramyun",
+        "sara lee"
+    ]
+    if any(b in clean for b in specialty_brands):
+        return name.strip()
+
+    # Canned beans & legumes
+    if any(w in clean for w in ["chickpea", "garbanzo"]):
+        return "365 organic garbanzo beans"
+    if "black bean" in clean:
+        return "365 organic black beans"
+    if "kidney bean" in clean:
+        return "365 organic kidney beans"
+    if "cannellini" in clean or ("white bean" in clean and "green" not in clean):
+        return "365 organic cannellini beans"
+    if "pinto bean" in clean:
+        return "365 organic pinto beans"
+
+    # Coconut milk & canned milks
+    if "coconut milk" in clean:
+        return "365 organic coconut milk"
+    if "evaporated milk" in clean:
+        return "365 organic evaporated milk"
+
+    # Broth & stocks
+    if any(w in clean for w in ["broth", "stock"]):
+        if any(w in clean for w in ["veg", "vegetable"]):
+            return "365 organic vegetable broth"
+        elif "beef" in clean:
+            return "365 organic beef broth"
+        elif "bone" in clean:
+            return "365 organic chicken bone broth"
+        else:
+            return "365 organic chicken broth"
+
+    # Canned tomatoes & sauces
+    if "tomato paste" in clean:
+        return "365 organic tomato paste"
+    if "tomato sauce" in clean:
+        return "365 organic tomato sauce"
+    if "diced tomato" in clean or "canned tomato" in clean:
+        return "365 organic diced tomatoes"
+    if "crushed tomato" in clean:
+        return "365 organic crushed tomatoes"
+    if "san marzano" in clean or "peeled tomato" in clean:
+        return "365 whole peeled san marzano tomatoes"
+
+    # Pasta & grains
+    if "macaroni" in clean or "elbow" in clean:
+        return "365 organic pasta elbows"
+    if "penne" in clean:
+        return "365 organic penne pasta"
+    if "spaghetti" in clean:
+        return "365 organic spaghetti"
+    if "jasmine rice" in clean:
+        return "365 organic jasmine rice"
+    if "basmati rice" in clean:
+        return "365 organic basmati rice"
+    if "brown rice" in clean:
+        return "365 organic brown rice"
+    if "quinoa" in clean:
+        return "365 organic tricolor quinoa"
+    if "rolled oats" in clean or "quick oats" in clean:
+        return "365 organic old fashioned rolled oats"
+
+    # Tortillas
+    if "tortilla" in clean and ("corn" in clean or "yellow" in clean or "white" in clean):
+        return "365 organic yellow corn tortillas"
+
+    # Oils & vinegars
+    if "olive oil" in clean:
+        return "365 extra virgin olive oil"
+    if "white wine vinegar" in clean:
+        return "365 organic white wine vinegar"
+    if "red wine vinegar" in clean:
+        return "365 organic red wine vinegar"
+    if "apple cider vinegar" in clean:
+        return "365 organic apple cider vinegar"
+    if "balsamic vinegar" in clean:
+        return "365 balsamic vinegar of modena"
+    if "canola oil" in clean or "vegetable oil" in clean:
+        return "365 organic canola oil"
+
+    # Cheeses & dairy
+    if "cheddar" in clean:
+        if any(w in clean for w in ["shredded", "grated", "mild", "monterey", "jack"]):
+            return "365 shredded mild cheddar cheese"
+        return "365 mild cheddar cheese"
+    if "monterey jack" in clean or "jack cheese" in clean:
+        return "365 shredded monterey jack cheese"
+    if "mozzarella" in clean:
+        if "shredded" in clean or "grated" in clean:
+            return "365 shredded mozzarella cheese"
+        return "365 mozzarella cheese"
+    if "parmesan" in clean or "parmigiano" in clean:
+        return "365 grated parmesan cheese"
+    if "ricotta" in clean:
+        return "365 organic whole milk ricotta cheese"
+    if "cream cheese" in clean:
+        return "365 organic cream cheese"
+    if "sour cream" in clean:
+        return "365 organic sour cream"
+    if "heavy whipping cream" in clean or "heavy cream" in clean:
+        return "365 organic heavy whipping cream"
+    if "butter" in clean:
+        if "unsalted" in clean:
+            return "365 unsalted butter"
+        return "365 salted butter"
+
+    # Spices (if requested or not in pantry)
+    if "black pepper" in clean or ("pepper" in clean and any(w in clean for w in ["ground", "coarse", "cracked", "whole"])):
+        return "365 organic ground black pepper"
+    if "allspice" in clean:
+        return "365 organic allspice ground"
+    if "cinnamon" in clean and any(w in clean for w in ["ground", "spice"]):
+        return "365 organic ground cinnamon"
+    if "cumin" in clean:
+        return "365 organic ground cumin"
+    if "garlic powder" in clean:
+        return "365 organic garlic powder"
+    if "onion powder" in clean:
+        return "365 organic onion powder"
+    if "paprika" in clean:
+        if "smoked" in clean:
+            return "365 organic smoked paprika"
+        return "365 organic paprika"
+    if "chili powder" in clean:
+        return "365 organic chili powder"
+
+    # Condiments
+    if "maple syrup" in clean:
+        return "365 organic maple syrup"
+    if re.search(r"\bhoney\b", clean) and not any(w in clean for w in ["nut", "apple", "honeycrisp", "melon", "dew", "mustard"]):
+        return "365 organic mountain forest raw honey"
+    if "peanut butter" in clean:
+        return "365 organic creamy peanut butter"
+    if "almond butter" in clean:
+        return "365 organic creamy almond butter"
+    if "mustard" in clean:
+        if "dijon" in clean:
+            return "365 organic dijon mustard"
+        return "365 organic yellow mustard"
+    if "ketchup" in clean:
+        return "365 organic tomato ketchup"
+    if "mayonnaise" in clean or "mayo" in clean:
+        return "365 organic mayonnaise"
+    if "bbq sauce" in clean or "barbecue sauce" in clean:
+        return "365 organic barbecue sauce"
+    if "ranch" in clean:
+        return "365 ranch dressing"
+
+    # Frozen
+    if "frozen peas" in clean:
+        return "365 organic sweet peas"
+    if "frozen corn" in clean:
+        return "365 organic sweet corn"
+
+    return name.strip()
+
+
 def normalize_ingredient_name(name: str) -> str:
     """Normalizes generic recipe strings into Whole Foods catalog-friendly terms
-    enforcing household dietary preferences (thin-skin organic, 100% grass-fed meat, 365 brand)."""
+    enforcing household dietary preferences (store brand 365 default, thin-skin organic, 100% grass-fed meat)."""
     clean = name.strip().lower()
 
     # Exact table match
     if clean in WF_INGREDIENT_NORMALIZER:
         return WF_INGREDIENT_NORMALIZER[clean]
+
+    # Store brand (365) default for packaged pantry, canned goods, dairy, grains, condiments
+    store_brand_name = apply_365_store_brand(name)
+    if store_brand_name != name.strip():
+        return store_brand_name
 
     # Rule 1: Thin-skin produce must be organic
     for term in THIN_SKIN_ORGANIC:

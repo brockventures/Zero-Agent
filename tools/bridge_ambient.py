@@ -30,11 +30,16 @@ from tools.bridge_commands import (
     execute_bridge_reload,
     execute_container_restart,
 )
+from tools.bridge_formatting import (
+    format_steering_prompt,
+)
 from tools.bridge_runner import (
     channel_active_procs,
+    channel_active_prompts,
     steering_channels,
 )
 from tools.bridge_state import (
+    get_in_flight,
     ATTACHMENTS_DIR,
     IVY_USER_ID,
     OWNER_USER_ID,
@@ -101,6 +106,13 @@ async def warm_channel_history(
         for m in msgs:
             author_name = m.author.display_name or m.author.name
             reply_id = m.reference.message_id if m.reference else None
+            reply_author = None
+            reply_snip = None
+            if m.reference:
+                resolved = getattr(m.reference, "resolved", None)
+                if resolved and hasattr(resolved, "author"):
+                    reply_author = getattr(resolved.author, "display_name", None) or getattr(resolved.author, "name", None)
+                    reply_snip = getattr(resolved, "clean_content", None) or getattr(resolved, "content", "")
             record_message(
                 channel_id=channel.id,
                 channel_name=getattr(channel, "name", str(channel.id)),
@@ -110,6 +122,8 @@ async def warm_channel_history(
                 msg_id=m.id,
                 reply_to_id=reply_id,
                 timestamp=m.created_at.strftime("%Y-%m-%d %H:%M:%S UTC") if hasattr(m, "created_at") else None,
+                reply_to_author=reply_author,
+                reply_to_snippet=reply_snip,
             )
         print(f"[Bridge] Warmed channel history for #{getattr(channel, 'name', channel.id)}: {len(msgs)} messages loaded.")
 
@@ -179,12 +193,18 @@ async def route_external_message(
         reply_to_zero = resolve_is_reply_to_zero(msg, bot)
 
         if is_excluded:
+            stripped_for_tag = re.sub(r"`[^`]*`|\(\s*@zero\s*\)", "", content, flags=re.IGNORECASE)
             has_tag = (
                 f"<@{bot_id}>" in content or
                 f"<@!{bot_id}>" in content or
-                bool(re.search(r"@zero\b", content, re.IGNORECASE))
+                bool(re.search(r"@zero\b", stripped_for_tag, re.IGNORECASE))
             )
-            is_tagged = has_tag or reply_to_zero
+            # In excluded channels (#baseball), Ivy (bot) must explicitly tag Zero.
+            # Human owner (Ryan) can trigger via explicit tag or click-to-reply.
+            if msg.author.id == IVY_USER_ID:
+                is_tagged = has_tag
+            else:
+                is_tagged = has_tag or reply_to_zero
         else:
             is_tagged = (
                 reply_to_zero or
@@ -209,7 +229,7 @@ async def route_external_message(
                 print(f"[BridgeAmbient] Excluded channel #{getattr(msg.channel, 'name', msg.channel.id)}: Ivy is paused ({rem:.1f}s). Dropping.")
                 return True
 
-            threshold = int(rules.get("excluded_channel_last_word_threshold", 10))
+            threshold = int(rules.get("excluded_channel_last_word_threshold", 4))
             is_last_word, last_word_streak = check_last_word_condition(
                 channel_id=msg.channel.id,
                 bot_id=msg.author.id,
@@ -308,6 +328,7 @@ async def route_external_message(
                 f"[OPERATIONAL DIRECTIVE - BROCK DISCORD #{ch_name} (CROSS-BOT PEER COMMUNICATION)]:\n"
                 f"You are responding directly to Ivy (<@{IVY_USER_ID}>), the Assistant GM AI partner in #{ch_name}.\n"
                 f"• Be direct, sharp, and concise (single Discord message, max 2000 characters).\n"
+                f"• 2-Turn Audit & Human-Gate Protocol: If Ivy is reporting completed benchmark/code results, audit her work and present your verdict + [CHOICES: ...] directly to Ryan WITHOUT tagging <@{IVY_USER_ID}> (@Ivy), pausing cleanly for human review. Only tag <@{IVY_USER_ID}> if there is a blocking defect Ivy must fix first.\n"
                 f"• Honor the baseball domain boundaries and peer operating discipline.\n"
                 f"• Public-Safe Etiquette: Do NOT reveal sensitive credentials, tokens, private IPs, or personal family information.\n\n"
                 f"{ch_ctx_block}"
@@ -346,6 +367,13 @@ async def route_external_message(
         return True
 
     # 3. Crab Cavern & External / Shared Space Mode (Crab Cavern Protocol)
+    from tools.bridge_state import is_crab_cavern_silenced
+    silenced, silence_reason = is_crab_cavern_silenced(rules)
+    if silenced:
+        ch_title = getattr(msg.channel, "name", str(msg.channel.id))
+        print(f"[BridgeAmbient] Suppressed Crab Cavern message in #{ch_title} from {author_name}: {silence_reason}")
+        return True
+
     from tools.channel_history import is_handoff_addressed_to_zero
     handoff_for_zero = is_handoff_addressed_to_zero(content)
 
@@ -415,6 +443,13 @@ async def route_external_message(
     bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
     bot_mention_1 = f"<@{bot_id}>"
     bot_mention_2 = f"<@!{bot_id}>"
+
+    is_physical_mention = bool(
+        (bot.user and bot.user in getattr(msg, "mentions", [])) or
+        bot_mention_1 in content or
+        bot_mention_2 in content or
+        contains_zero_mention(content)
+    )
 
     is_reply_to_zero = resolve_is_reply_to_zero(msg, bot)
 
@@ -493,15 +528,15 @@ async def route_external_message(
                             last_content = last_msg.get("content", "")
                             asked_question = ("?" in last_content[-400:]) or ('"reply": "optional"' in last_content) or ('"floor": "open"' in last_content)
                             is_action_or_affirmative = bool(re.search(
-                                r"^(?:yep|yeah|yes|sure|go ahead|sounds good|do it|proceed|approved|lgtm|update|check|push|fix|please|pls|thanks|thank you|can you|could you|what about|how about|also|no|nope|wait|try|use|make|let|revert|rollback|deploy|show|tell|why|explain|see|look|run|stop|start|restart|reload|clean|add|remove|delete|set|get|test|verify|option|choice|step)\b",
+                                r"^(?:yep|yeah|yes|sure|go ahead|sounds good|do it|proceed|approved|lgtm|update|check|push|fix|please|pls|thanks|thank you|can you|could you|what about|how about|also|no|nope|wait|try|use|make|let|revert|rollback|deploy|show|tell|why|explain|see|look|run|stop|start|restart|reload|clean|add|remove|delete|set|get|test|verify|option|choice|step|ship|merge|rebase|pull|diff|rebuild|build|stage|commit|pr|audit|diagnose|investigate|benchmark|sync)\b",
                                 content.strip(),
                                 re.IGNORECASE,
                             ))
                             is_direct_query = bool(re.search(
-                                r"^(?:done|status|ready|finished|how'?s|is\s+it|did\s+it|any\s+update|which|where|what)\b",
+                                r"^(?:done|status|ready|finished|how'?s|is\s+(?:it|there|this|that)|did\s+(?:it|you|this|that|the)|any\s+update|which|where|what|why|who|when|can\s+(?:we|you)|could\s+(?:we|you)|should\s+(?:we|you))\b",
                                 content.strip(),
                                 re.IGNORECASE,
-                            )) or ("?" in content and len(content.split()) <= 15)
+                            ))
                             if asked_question or is_action_or_affirmative or is_direct_query:
                                 is_conversational_follow_up = True
                                 print(f"[Bridge] Conversational follow-up to Zero detected from {author_name} ({elapsed:.1f}s after Zero's turn) in channel {msg.channel.id}")
@@ -554,7 +589,7 @@ async def route_external_message(
 
     is_banana_directive = is_banana_summary_prompt or is_banana_stall_prompt or is_banana_loop_prompt
 
-    if other_mentions or is_banana_directive:
+    if is_physical_mention or other_mentions or is_banana_directive:
         cleaned = re.sub(rf"<@!?{bot_id}>", "@Zero", content)
     else:
         cleaned = re.sub(rf"<@!?{bot_id}>", "", content)
@@ -567,7 +602,7 @@ async def route_external_message(
     for rid in target_role_ids:
         cleaned = re.sub(rf"<@&{rid}>", "", cleaned)
 
-    if not other_mentions and not is_banana_directive:
+    if not is_physical_mention and not other_mentions and not is_banana_directive:
         cleaned = re.sub(r"^(?:hey\s+)?zero\b[:,\s]*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"@zero\b", "", cleaned, flags=re.IGNORECASE)
     elif is_banana_directive:
@@ -615,10 +650,11 @@ async def route_external_message(
             f"Banana Watcher has flagged that topic `{stalled_subj}` has stalled without resolution in #the-banana-stand.\n"
             f"In accordance with Crab Cavern Ratified Peer Operating Rule 6 ('Ship it or track it: never let agreed proposals drop on the floor'):\n"
             f"1. Review recent channel context on `{stalled_subj}`.\n"
-            f"2. If the discussion concluded, reached consensus, or should be parked:\n"
+            f"2. If a peer bot (Aerial, Marvin, Amos) has ALREADY replied to park or resolve this topic within the last 2 minutes, output [NO_REPLY] to avoid redundant chatter.\n"
+            f"3. Otherwise, if the discussion concluded, reached consensus, or should be parked:\n"
             f"   Reply directly in #the-banana-stand with: '🍌 Parking `{stalled_subj}`, Banana Watcher: <brief reason>' with handoff envelope (kind: 'resolution', floor: 'closed', reply: 'none').\n"
-            f"3. If there is an actionable proposal or pending task agreed upon, record a task ticket in /workspace/data/tasks.json, log to /workspace/memory/crab_cavern/decisions.md, and post the ticket details.\n"
-            f"4. You MUST respond to Banana Watcher. NEVER emit [NO_REPLY] to a Banana Watcher nudge."
+            f"4. If there is an actionable proposal or pending task agreed upon, record a task ticket in /workspace/data/tasks.json, log to /workspace/memory/crab_cavern/decisions.md, and post the ticket details.\n"
+            f"5. If you are the designated closer or no peer bot has responded, you MUST respond to Banana Watcher. NEVER emit [NO_REPLY] to an unaddressed Banana Watcher nudge."
         )
 
     if is_banana_loop_prompt:
@@ -752,36 +788,87 @@ async def route_external_message(
     except Exception:
         pass
 
-    # Group Chat Mid-Turn Steering Check (Channel-scoped)
-    target_proc = channel_active_procs.get(msg.channel.id)
-    if target_proc is not None and target_proc.returncode is None:
-        steering_channels.add(msg.channel.id)
-        try:
-            target_proc.send_signal(signal.SIGINT)
-        except Exception as se:
-            print(f"[Bridge] Warning sending SIGINT for external group steering in channel {msg.channel.id}: {se}")
+    from tools.bridge_handlers import try_coalesce_pending_turn
 
-        steer_prompt = (
-            f"[MID-TURN GROUP CONVERSATION UPDATE]\n"
-            f"While you were drafting your reply, a new message arrived in the channel from {author_name}:\n"
-            f"\"{cleaned}\"\n\n"
-            f"CRITICAL INSTRUCTIONS FOR REVISED TURN:\n"
-            f"1. Absorb this new context immediately. If your in-progress thought is now obsolete, answered, or contradicted, pivot cleanly or yield.\n"
-            f"2. If you were emitting a ```handoff block, ensure it is completely valid, closed JSON or omitted entirely.\n"
-            f"3. Keep your output concise (strictly under 2,000 chars) and respond naturally to the CURRENT state of the room."
-        )
-        print(f"[Bridge] Silently steering in-flight external turn for new message from {author_name}")
-        await ext_turn_queue.put({
-            "prompt": steer_prompt,
-            "status_msg": None,
-            "reply_target": msg,
-            "attachments": saved_attachments,
-            "is_steer": True,
-            "mode": "external",
-            "channel_id": msg.channel.id,
-            "author_name": author_name,
-            "queued_at": time.perf_counter(),
-        })
+    # First: attempt to coalesce rapid split-delivery from the same author into any pending queued turn
+    if try_coalesce_pending_turn(
+        channel_id=msg.channel.id,
+        author_id=msg.author.id,
+        author_name=author_name,
+        new_text=cleaned,
+        new_attachments=saved_attachments,
+        new_msg=msg,
+        is_group=True,
+        extra_queue=ext_turn_queue,
+    ):
+        return True
+
+    # Group Chat Mid-Turn Steering Check (Channel-scoped)
+    steering_disabled_channels = [str(c) for c in rules.get("steering_disabled_channels", [])]
+    target_proc = channel_active_procs.get(msg.channel.id)
+    if (
+        str(msg.channel.id) not in steering_disabled_channels
+        and target_proc is not None
+        and target_proc.returncode is None
+    ):
+        already_steering = msg.channel.id in steering_channels
+        if not already_steering:
+            steering_channels.add(msg.channel.id)
+            try:
+                target_proc.send_signal(signal.SIGINT)
+            except Exception as se:
+                print(f"[Bridge] Warning sending SIGINT for external group steering in channel {msg.channel.id}: {se}")
+
+        orig_prompt = channel_active_prompts.get(msg.channel.id)
+        if not orig_prompt:
+            try:
+                in_flight_data = get_in_flight()
+                if isinstance(in_flight_data, dict):
+                    orig_prompt = in_flight_data.get(str(msg.channel.id), {}).get("prompt")
+            except Exception:
+                pass
+
+        try:
+            steer_prompt = format_steering_prompt(
+                new_directive=cleaned,
+                original_task=orig_prompt,
+                author_name=author_name,
+                is_group=True,
+            )
+            print(f"[Bridge] Silently steering in-flight external turn for new message from {author_name}")
+            await ext_turn_queue.put({
+                "prompt": steer_prompt,
+                "raw_prompt": cleaned,
+                "original_task": orig_prompt,
+                "status_msg": None,
+                "reply_target": msg,
+                "attachments": saved_attachments,
+                "is_steer": True,
+                "mode": "external",
+                "channel_id": msg.channel.id,
+                "author_id": msg.author.id,
+                "author_name": author_name,
+                "is_physical_mention": is_physical_mention,
+                "queued_at": time.perf_counter(),
+            })
+        except Exception as steer_err:
+            print(f"[Bridge] Error formatting external group steering prompt: {steer_err}")
+            if not already_steering:
+                steering_channels.discard(msg.channel.id)
+            await ext_turn_queue.put({
+                "prompt": cleaned,
+                "raw_prompt": cleaned,
+                "status_msg": None,
+                "reply_target": msg,
+                "attachments": saved_attachments,
+                "is_steer": False,
+                "mode": "external",
+                "channel_id": msg.channel.id,
+                "author_id": msg.author.id,
+                "author_name": author_name,
+                "is_physical_mention": is_physical_mention,
+                "queued_at": time.perf_counter(),
+            })
         return True
 
     is_last_word = False
@@ -806,13 +893,16 @@ async def route_external_message(
 
     await ext_turn_queue.put({
         "prompt": cleaned,
+        "raw_prompt": cleaned,
         "status_msg": None,
         "reply_target": msg,
         "attachments": saved_attachments,
         "is_steer": False,
         "mode": "external",
         "channel_id": msg.channel.id,
+        "author_id": msg.author.id,
         "author_name": author_name,
+        "is_physical_mention": is_physical_mention,
         "is_last_word": is_last_word,
         "last_word_bot_id": str(msg.author.id) if msg.author.bot else None,
         "last_word_bot_name": author_name if msg.author.bot else None,

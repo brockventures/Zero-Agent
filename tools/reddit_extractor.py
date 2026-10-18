@@ -24,7 +24,12 @@ BASE_URL = "https://serpapi.com/search.json"
 TIMEOUT = 25
 SECRETS_PATH = os.environ.get("SECRETS_PATH", "/secrets/env.json")
 CACHE_DIR = Path(os.environ.get("REDDIT_CACHE_DIR", "/workspace/data/reddit_cache"))
-CACHE_TTL_SECONDS = 3600 * 6  # 6-hour cache for research queries
+CACHE_TTL_SECONDS = 3600 * 72  # 72-hour cache for research queries
+
+try:
+    from serpapi_guard import acquire_quota
+except ImportError:
+    from tools.serpapi_guard import acquire_quota
 
 
 def get_api_key() -> str:
@@ -83,6 +88,11 @@ def _query_serpapi(params: Dict[str, Any], use_cache: bool = True) -> Dict[str, 
         cached = _get_cache(cache_key)
         if cached is not None:
             return cached
+
+    q_target = params.get("q", "")
+    allowed, reason = acquire_quota("google", q_target, caller="reddit_extractor")
+    if not allowed:
+        return {"error": f"CircuitBreaker: {reason}"}
 
     query_str = urllib.parse.urlencode(params)
     full_url = f"{BASE_URL}?{query_str}"

@@ -1,3 +1,6 @@
+import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 #!/usr/bin/env python3
 """Regression test suite for Multi-Model Weather Ensemble with Dynamic Regime-Dependent Variance."""
 import json
@@ -49,7 +52,7 @@ class TestWeatherEnsemble(unittest.TestCase):
 
     def test_tail_risk_filter_bounds(self):
         from tools.kalshi_paper_bot import MIN_CONTRACT_PRICE, MAX_CONTRACT_PRICE
-        self.assertEqual(MIN_CONTRACT_PRICE, 0.08)
+        self.assertEqual(MIN_CONTRACT_PRICE, 0.15)
         self.assertEqual(MAX_CONTRACT_PRICE, 0.92)
 
     def test_open_meteo_integration(self):
@@ -75,6 +78,29 @@ class TestWeatherEnsemble(unittest.TestCase):
         p_sym_cold = calculate_bracket_prob("less", 64.0, mean=66.0, std=2.0, skew=0.0)
         p_skew_cold = calculate_bracket_prob("less", 64.0, mean=66.0, std=2.0, skew=-1.8)
         self.assertGreater(p_skew_cold, p_sym_cold)
+
+
+    def test_weather_safeguards_parsed_strike_types(self):
+        from tools.kalshi_paper_bot import evaluate_weather_safeguards, parse_strike_bounds
+        # 1. Safeguard 4: 91-92° bracket ('range') when forecast is 91.34°F -> blocked!
+        st_type, bounds = parse_strike_bounds("Will the maximum temperature be 91-92° on Oct 13, 2026?", "KXHIGHTHOU-26OCT13-B91.5")
+        self.assertEqual(st_type, "range")
+        sg = evaluate_weather_safeguards("HOU", st_type, bounds, effective_high=91.34, is_onshore_flow=False)
+        self.assertTrue(sg["is_near_bracket_center"])
+
+        # Distant bracket (95-96° when forecast is 91.34°F) -> not blocked
+        st_far, b_far = parse_strike_bounds("Will the maximum temperature be 95-96° on Oct 13, 2026?", "KXHIGHTHOU-26OCT13-B95.5")
+        sg_far = evaluate_weather_safeguards("HOU", st_far, b_far, effective_high=91.34, is_onshore_flow=False)
+        self.assertFalse(sg_far["is_near_bracket_center"])
+
+        # 2. Safeguard 1a/1b: SFO '<75°' ('less') and LAX '>92°' ('greater') under onshore flow
+        st_sfo, b_sfo = parse_strike_bounds("Will the maximum temperature be <75°?", "KXHIGHTSFO-T75")
+        self.assertEqual(st_sfo, "less")
+        self.assertTrue(evaluate_weather_safeguards("SFO", st_sfo, b_sfo, 70.0, True)["sfo_tail_blocked"])
+
+        st_lax, b_lax = parse_strike_bounds("Will the maximum temperature be >92°?", "KXHIGHLAX-T92")
+        self.assertEqual(st_lax, "greater")
+        self.assertTrue(evaluate_weather_safeguards("LAX", st_lax, b_lax, 80.0, True)["lax_tail_blocked"])
 
 if __name__ == "__main__":
     unittest.main()

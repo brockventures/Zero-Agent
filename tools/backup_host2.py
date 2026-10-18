@@ -61,10 +61,10 @@ def backup_mealie(ts: str) -> tuple[bool, str]:
         return False, f"mealie sqlite backup failed: {stderr.strip()}"
     
     # 2. Recipes & config tarball
-    cmd_tar = f"sudo tar -czf '{dest_tar}' -C '{DOCKER_ROOT}/mealie/data' recipes .secret .session_secret 2>/dev/null"
+    cmd_tar = f"sudo tar --warning=no-file-changed -czf '{dest_tar}' -C '{DOCKER_ROOT}/mealie/data' recipes .secret .session_secret"
     code, _, stderr = run_ssh(cmd_tar, timeout=60)
-    if code != 0:
-        return False, f"mealie tar failed: {stderr.strip()}"
+    if code not in (0, 1):
+        return False, f"mealie tar failed (code {code}): {stderr.strip()}"
 
     code, size_out, _ = run_ssh(f"ls -lh '{dest_db}' '{dest_tar}' | awk '{{print $9, $5}}'")
     return True, f"mealie -> {dest_db} & {dest_tar}"
@@ -78,24 +78,24 @@ def backup_openmessage(ts: str) -> tuple[bool, str]:
     if code != 0:
         return False, f"openmessage sqlite backup failed: {stderr.strip()}"
 
-    cmd_tar = f"sudo tar -czf '{dest_tar}' -C '{DOCKER_ROOT}/openmessage/data' session.json control.token 2>/dev/null"
+    cmd_tar = f"sudo tar --warning=no-file-changed -czf '{dest_tar}' -C '{DOCKER_ROOT}/openmessage/data' session.json control.token"
     code, _, stderr = run_ssh(cmd_tar, timeout=60)
-    if code != 0:
-        return False, f"openmessage tar failed: {stderr.strip()}"
+    if code not in (0, 1):
+        return False, f"openmessage tar failed (code {code}): {stderr.strip()}"
 
     return True, f"openmessage -> {dest_db} & {dest_tar}"
 
 def backup_zero(ts: str) -> tuple[bool, str]:
     dest_tar = f"/volumeUSB1/usbshare/backups/zero/zero_state_{ts}.tar.gz"
     cmd = (
-        f"sudo tar --exclude='backups' --exclude='*.log' --exclude='*.out' "
+        f"sudo tar --warning=no-file-changed --exclude='backups' --exclude='*.log' --exclude='*.out' "
         f"--exclude='__pycache__' --exclude='scratch' --exclude='.git' "
         f"-czf '{dest_tar}' -C '{DOCKER_ROOT}/discord-agy-agent' "
-        f"memory data agents.md config docker-compose.yml entrypoint.sh bridge.py 2>/dev/null"
+        f"memory data agents.md config docker-compose.yml entrypoint.sh bridge.py"
     )
     code, _, stderr = run_ssh(cmd, timeout=120)
-    if code != 0:
-        return False, f"zero state backup failed: {stderr.strip()}"
+    if code not in (0, 1):
+        return False, f"zero state backup failed (code {code}): {stderr.strip()}"
     
     code, size_out, _ = run_ssh(f"ls -lh '{dest_tar}' | awk '{{print $5}}'")
     return True, f"zero -> {dest_tar} ({size_out.strip()})"

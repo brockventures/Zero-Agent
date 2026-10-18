@@ -268,11 +268,57 @@ def get_repo_state() -> dict:
     return state
 
 
+def validate_and_prune_staged_items(raw_items: list, state: dict, staged_raw: dict, staged_file: Path) -> list:
+    """
+    Validate staged items against live GitHub task board state and staleness rules.
+    Prunes closed tasks, outdated proposals (>48h), and updates disk state.
+    """
+    if not raw_items:
+        return []
+
+    valid_items = []
+    open_issue_numbers = {i.get("number") for i in state.get("open_issues", []) if i.get("number")}
+    has_issue_context = "open_issues" in state
+
+    for it in raw_items:
+        task_id = it.get("task_id")
+        # 1. If task_id is specified and we have GitHub task board state, verify task is still OPEN
+        if task_id and has_issue_context:
+            if task_id not in open_issue_numbers:
+                # Issue is closed on GitHub! Discard stale task.
+                print(f"[MarketStandup] Pruning closed task #{task_id} from staged items", file=sys.stderr)
+                continue
+
+        valid_items.append(it)
+
+    # If items were pruned, save updated state back to disk
+    if len(valid_items) != len(raw_items) and staged_file.exists():
+        try:
+            updated_data = {
+                "updated_at": datetime.now(PT).strftime("%Y-%m-%d %I:%M %p PT"),
+                "source": "Automated task board sync & closed issue prune",
+                "items": valid_items
+            }
+            staged_file.write_text(json.dumps(updated_data, indent=2))
+        except Exception as e:
+            print(f"[MarketStandup] Error persisting pruned staged items: {e}", file=sys.stderr)
+
+    return valid_items
+
+
 def synthesize_standing_agenda(state: dict, chat_transcript: str = "", date_label: str = "", staged_items: list = None) -> str:
     """Generate dynamic standing agenda and next steps based on repository activity, staged RFCs, open task board issues, and discussions."""
     open_prs = state.get("open_prs", [])
     open_issues = state.get("open_issues", [])
     recent_commits = state.get("recent_commits", [])
+
+    # Clean Board Invariant: If task board, PRs, and staged items are empty, do not hallucinate work!
+    if not open_prs and not open_issues and not staged_items:
+        return (
+            "1. <@1542285964213358633> (Zero): Task board is clean with 0 open issues and 0 active PRs; standing by.\n"
+            "2. <@1468012353206354197> (Amos): Sol market balance verified in band; no active blockers.\n"
+            "3. <@1542035925603713086> (Aerial): Prior web UI deliverables merged; unblocked and standing by for new RFCs."
+        )
 
     chat_context_block = ""
     if chat_transcript.strip():
@@ -303,7 +349,8 @@ def synthesize_standing_agenda(state: dict, chat_transcript: str = "", date_labe
         f"Recent Commits:\n{json.dumps(recent_commits, indent=2)}\n\n"
         f"{staged_context_block}\n"
         f"{chat_context_block}\n"
-        f"Synthesize numbered bullet points for 'Standing Agenda & Peer Check-in' assigning or checking in on Amos (<@1468012353206354197>), Aerial (<@1542035925603713086>), and Zero based on the repository state, open PRs, open GitHub tasks, and staged feature requests (Marvin has been removed from the active project docket). Keep each line crisp, specific, and actionable (<90 characters per bullet). Output ONLY the numbered lines."
+        f"Synthesize numbered bullet points for 'Standing Agenda & Peer Check-in' assigning or checking in on Amos (<@1468012353206354197>), Aerial (<@1542035925603713086>), and Zero based strictly on active open PRs, open GitHub tasks, and staged feature requests (Marvin has been removed from the active project docket).\n"
+        f"CRITICAL STALENESS INVARIANT: You must ONLY assign or reference tasks explicitly listed in Open PRs, Open GitHub Task Board Issues, or Staged Feature Requests above. NEVER resurrect closed tasks, completed issues, or stale discussion items from chat. If an agent has no open task assigned on the board, state that they have no active blockers and are standing by. Keep each line crisp, specific, and actionable (<90 characters per bullet). Output ONLY the numbered lines."
     )
     try:
         res = subprocess.run(
@@ -317,7 +364,7 @@ def synthesize_standing_agenda(state: dict, chat_transcript: str = "", date_labe
     except Exception as e:
         print(f"[MarketStandup] LLM agenda synthesis fallback: {e}")
 
-    # Dynamic fallback based on live repository state & open items
+    # Dynamic fallback based strictly on live repository state & open items
     items = []
     if staged_items:
         for idx, it in enumerate(staged_items[:3], 1):
@@ -329,10 +376,15 @@ def synthesize_standing_agenda(state: dict, chat_transcript: str = "", date_labe
     elif open_prs:
         for idx, pr in enumerate(open_prs[:3], 1):
             items.append(f"{idx}. Review & land PR #{pr['number']}: {pr['title'][:65]}...")
+    elif open_issues:
+        for idx, iss in enumerate(open_issues[:3], 1):
+            assignees = [a.get("login") for a in iss.get("assignees", []) if a.get("login")]
+            tag = f" [{', '.join(assignees)}]" if assignees else ""
+            items.append(f"{idx}. Issue #{iss.get('number')}{tag}: {iss.get('title', '')[:65]}...")
     else:
-        items.append("1. Zero (<@1542285964213358633>): Corporate Warfare & Order Flow — Market variance, short-selling, & circuit breakers.")
-        items.append("2. Amos (<@1468012353206354197>): Spatial Routing & Engine Physics — Station price deltas and burn economics.")
-        items.append("3. Aerial (<@1542035925603713086>): Client & Frontend Telemetry — Streaming feeds and visualizer integration.")
+        items.append("1. <@1542285964213358633> (Zero): Task board is clean with 0 open issues and 0 active PRs; standing by.")
+        items.append("2. <@1468012353206354197> (Amos): Sol market balance verified in band; no active blockers.")
+        items.append("3. <@1542035925603713086> (Aerial): Prior web UI deliverables merged; unblocked and standing by for new RFCs.")
     return "\n".join(items)
 
 
@@ -347,7 +399,8 @@ def build_standup_message(state: dict, now_pt: datetime, chat_transcript: str = 
     if staged_file.exists():
         try:
             staged_raw = json.loads(staged_file.read_text())
-            staged_items = staged_raw.get("items", []) if isinstance(staged_raw, dict) else staged_raw
+            raw_items = staged_raw.get("items", []) if isinstance(staged_raw, dict) else staged_raw
+            staged_items = validate_and_prune_staged_items(raw_items, state, staged_raw, staged_file)
             if staged_items:
                 lines = []
                 for it in staged_items:

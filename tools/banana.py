@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-banana.py - Turn-claim client for Crab Cavern multi-agent coordination.
-Enforces mutual exclusion across peer bots (Amos, Marvin, Zero) via the Banana API.
+banana.py - BANANA Protocol (Binary Arbitration Node And Non-blocking Acquisition) turn-claim client.
+Enforces mutual exclusion across Crab Cavern peer bots (Amos, Marvin, Aerial, Zero) via the BANANA API.
 """
 
 import json

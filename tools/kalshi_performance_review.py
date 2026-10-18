@@ -17,6 +17,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+if "/workspace" not in sys.path:
+    sys.path.insert(0, "/workspace")
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +56,8 @@ def get_db():
             conn.execute("ALTER TABLE positions ADD COLUMN model_prob REAL")
         if "category" not in cols:
             conn.execute("ALTER TABLE positions ADD COLUMN category TEXT")
+        if "fee" not in cols:
+            conn.execute("ALTER TABLE positions ADD COLUMN fee REAL DEFAULT 0.0")
     return conn
 
 def load_params():
@@ -139,12 +143,23 @@ def settle_open_positions(conn, dry_run=False):
         status = (m.get("status") or "").lower()
         result = (m.get("result") or "").lower()
         
+        pos_fee = (pos["fee"] or 0.0) if ("fee" in pos.keys()) else 0.0
+        settled_price = None
         if status in ("finalized", "closed", "settled") and result in ("yes", "no"):
             won = (pos["side"].lower() == result)
             settled_price = 1.00 if won else 0.00
-            payout = pos["contracts"] * settled_price
-            realized_pnl = round(payout - pos["total_cost"], 2)
+            payout = round(pos["contracts"] * settled_price, 2)
+            realized_pnl = round(payout - pos["total_cost"] - pos_fee, 2)
+            res_str = result.upper()
+        elif status in ("finalized", "closed", "settled") and result == "scalar":
+            scalar_val = float(m.get("settlement_value_dollars") or 0.0)
+            settled_price = scalar_val if pos["side"].upper() == "YES" else (1.00 - scalar_val)
+            payout = round(pos["contracts"] * settled_price, 2)
+            realized_pnl = round(payout - pos["total_cost"] - pos_fee, 2)
+            won = (realized_pnl >= 0)
+            res_str = f"SCALAR (${scalar_val:.2f})"
             
+        if settled_price is not None:
             settled_item = {
                 "id": pos["id"],
                 "ticker": ticker,
@@ -154,8 +169,9 @@ def settle_open_positions(conn, dry_run=False):
                 "contracts": pos["contracts"],
                 "entry_price": pos["entry_price"],
                 "total_cost": pos["total_cost"],
+                "fee": pos_fee,
                 "model_prob": pos["model_prob"],
-                "result": result.upper(),
+                "result": res_str,
                 "won": won,
                 "payout": payout,
                 "realized_pnl": realized_pnl
@@ -251,8 +267,21 @@ def evaluate_open_positions(open_pos):
                 station_max[st] = m_temp
         f_mlb.result()
 
+    station_tz_map = {
+        "KSFO": ZoneInfo("America/Los_Angeles"),
+        "KLAX": ZoneInfo("America/Los_Angeles"),
+        "KHOU": ZoneInfo("America/Chicago"),
+        "KORD": ZoneInfo("America/Chicago"),
+        "KCHI": ZoneInfo("America/Chicago"),
+        "KNYC": ZoneInfo("America/New_York"),
+        "KMIA": ZoneInfo("America/New_York"),
+        "KDEN": ZoneInfo("America/Denver"),
+        "KPHX": ZoneInfo("America/Phoenix")
+    }
+
     wins = []
     losses = []
+    in_progress = []
     est_open_pnl = 0.0
     sfo_losses_count = 0
     sfo_losses_pnl = 0.0
@@ -266,31 +295,82 @@ def evaluate_open_positions(open_pos):
         
         parsed = parse_weather_ticker(ticker)
         if parsed and parsed["station"] in station_max:
-            s_max = station_max[parsed["station"]]
+            st = parsed["station"]
+            s_max = station_max[st]
             s_type = parsed["strike_type"]
             s_val = parsed["strike_val"]
             
-            if s_type == "B":
-                is_yes = (s_val - 0.5 <= s_max <= s_val + 0.5)
-            elif "<" in title:
-                is_yes = (s_max < s_val)
-            else:
-                is_yes = (s_max > s_val)
-                
-            won = (side == "YES" and is_yes) or (side == "NO" and not is_yes)
-            pos_pnl = round((contracts * 1.0 - cost) if won else -cost, 2)
-            est_open_pnl += pos_pnl
+            st_tz = station_tz_map.get(st, PT)
+            local_time = datetime.now(st_tz)
+            is_post_peak = (local_time.hour >= 17) # 5:00 PM local time marks diurnal heating peak
             
-            st_name = parsed["station"].replace("K", "")
-            if parsed["station"] == "KSFO" and not won:
-                sfo_losses_count += 1
-                sfo_losses_pnl += pos_pnl
-            else:
-                label = f"{st_name} {s_val:.1f}° {side}" if "." in str(s_val) and not str(s_val).endswith(".0") else f"{st_name} {int(s_val)}° {side}"
-                if won:
-                    wins.append({"label": label, "pnl": pos_pnl, "ticker": ticker})
+            state = "IN_PROGRESS"
+            pos_pnl = 0.0
+            
+            if s_max is None:
+                state = "IN_PROGRESS"
+            elif s_type == "B":
+                low_b = s_val - 0.5
+                high_b = s_val + 0.5
+                if s_max > high_b:
+                    # Station already exceeded bracket ceiling: guaranteed locked outcome
+                    if side == "NO":
+                        state = "WIN"
+                        pos_pnl = round(contracts * 1.0 - cost, 2)
+                    else:
+                        state = "LOSS"
+                        pos_pnl = -cost
+                elif is_post_peak:
+                    in_bracket = (low_b <= s_max <= high_b)
+                    won = (side == "YES" and in_bracket) or (side == "NO" and not in_bracket)
+                    state = "WIN" if won else "LOSS"
+                    pos_pnl = round((contracts * 1.0 - cost) if won else -cost, 2)
+                else:
+                    state = "IN_PROGRESS"
+                    pos_pnl = 0.0
+            elif "<" in title:
+                if s_max >= s_val:
+                    state = "WIN" if side == "NO" else "LOSS"
+                    pos_pnl = round((contracts * 1.0 - cost) if side == "NO" else -cost, 2)
+                elif is_post_peak:
+                    won = (side == "YES")
+                    state = "WIN" if won else "LOSS"
+                    pos_pnl = round((contracts * 1.0 - cost) if won else -cost, 2)
+                else:
+                    state = "IN_PROGRESS"
+                    pos_pnl = 0.0
+            else: # > threshold
+                if s_max > s_val:
+                    state = "WIN" if side == "YES" else "LOSS"
+                    pos_pnl = round((contracts * 1.0 - cost) if side == "YES" else -cost, 2)
+                elif is_post_peak:
+                    won = (side == "NO")
+                    state = "WIN" if won else "LOSS"
+                    pos_pnl = round((contracts * 1.0 - cost) if won else -cost, 2)
+                else:
+                    state = "IN_PROGRESS"
+                    pos_pnl = 0.0
+                    
+            st_name = st.replace("K", "")
+            label = f"{st_name} {s_val:.1f}° {side}" if "." in str(s_val) and not str(s_val).endswith(".0") else f"{st_name} {int(s_val)}° {side}"
+            
+            if state == "WIN":
+                est_open_pnl += pos_pnl
+                wins.append({"label": label, "pnl": pos_pnl, "ticker": ticker})
+            elif state == "LOSS":
+                est_open_pnl += pos_pnl
+                if st == "KSFO":
+                    sfo_losses_count += 1
+                    sfo_losses_pnl += pos_pnl
                 else:
                     losses.append({"label": label, "pnl": pos_pnl, "ticker": ticker})
+            else:
+                in_progress.append({
+                    "label": label,
+                    "obs": round(s_max, 1) if s_max is not None else None,
+                    "local_time": local_time.strftime("%I:%M %p"),
+                    "ticker": ticker
+                })
         elif ticker.startswith("KXMLBGAME"):
             won = False
             if "TOR" in ticker and mlb_winners.get("Toronto Blue Jays") is not None:
@@ -309,8 +389,101 @@ def evaluate_open_positions(open_pos):
     return {
         "est_open_pnl": round(est_open_pnl, 2),
         "wins": wins,
-        "losses": losses
+        "losses": losses,
+        "in_progress": in_progress
     }
+
+
+QUANT_DB_PATH = Path("/workspace/data/quant_paper.db")
+
+def compute_quant_expansion_metrics():
+    """Compute performance and position telemetry across the 4 quantitative expansion tracks."""
+    if not QUANT_DB_PATH.exists():
+        return None
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(QUANT_DB_PATH))
+        conn.row_factory = sqlite3.Row
+        try:
+            from tools.quant_cross_venue_arb import settle_resolved_cross_venue_trades
+            from tools.quant_polymarket_standalone import settle_resolved_polymarket_trades
+            settle_resolved_cross_venue_trades(conn)
+            settle_resolved_polymarket_trades(conn)
+        except Exception:
+            pass
+        
+        t1_port = conn.execute("SELECT * FROM cross_venue_portfolio WHERE id=1").fetchone()
+        t1_trades = conn.execute("SELECT * FROM cross_venue_trades WHERE status='OPEN'").fetchall()
+        
+        t2_port = conn.execute("SELECT * FROM polymarket_standalone_portfolio WHERE id=1").fetchone()
+        t2_trades = conn.execute("SELECT * FROM polymarket_standalone_trades WHERE status='OPEN'").fetchall()
+        
+        t3_port = conn.execute("SELECT * FROM hyperliquid_portfolio WHERE id=1").fetchone()
+        t3_positions = conn.execute("SELECT * FROM hyperliquid_positions WHERE status='OPEN'").fetchall()
+        
+        t4_port = conn.execute("SELECT * FROM trend_portfolio WHERE id=1").fetchone()
+        t4_positions = conn.execute("SELECT * FROM trend_positions WHERE status='OPEN'").fetchall()
+        
+        conn.close()
+        t1_open_cost = sum(t["sum_cost"] for t in t1_trades)
+        t1_locked_pnl = sum(t["locked_profit"] for t in t1_trades)
+        t1_cash = float(t1_port["cash"]) if t1_port else 1000.0
+        t1_realized = float(t1_port["realized_pnl"]) if t1_port else 0.0
+        t1_expected_equity = t1_cash + t1_open_cost + t1_locked_pnl
+
+        t2_cash = float(t2_port["cash"]) if t2_port else 1000.0
+        t2_realized = float(t2_port["realized_pnl"]) if t2_port else 0.0
+        t2_locked_pnl = sum(t["locked_profit"] for t in t2_trades)
+        t2_open_cost = max(0.0, 1000.0 + t2_realized - t2_cash)
+        t2_expected_equity = t2_cash + t2_open_cost + t2_locked_pnl
+
+        t3_total_equity = float(t3_port["total_equity"]) if t3_port else 1000.0
+
+        t4_unrealized = sum(p["unrealized_pnl"] or 0.0 for p in t4_positions)
+        t4_total_equity = (float(t4_port["total_equity"]) if t4_port else 1000.0) + t4_unrealized
+
+        return {
+            "track1": {
+                "cash": t1_cash,
+                "realized_pnl": t1_realized,
+                "open_cost": t1_open_cost,
+                "locked_pnl": t1_locked_pnl,
+                "total_equity": t1_expected_equity,
+                "expected_equity": t1_expected_equity,
+                "open_count": len(t1_trades),
+                "open_trades": [dict(t) for t in t1_trades]
+            },
+            "track2": {
+                "cash": t2_cash,
+                "realized_pnl": t2_realized,
+                "open_cost": t2_open_cost,
+                "locked_pnl": t2_locked_pnl,
+                "total_equity": t2_expected_equity,
+                "expected_equity": t2_expected_equity,
+                "open_count": len(t2_trades),
+                "open_trades": [dict(t) for t in t2_trades]
+            },
+            "track3": {
+                "cash": float(t3_port["cash"]) if t3_port else 0.0,
+                "cumulative_funding": float(t3_port["cumulative_funding"]) if t3_port else 0.0,
+                "total_equity": t3_total_equity,
+                "expected_equity": t3_total_equity,
+                "open_count": len(t3_positions),
+                "positions": [dict(p) for p in t3_positions]
+            },
+            "track4": {
+                "cash": float(t4_port["cash"]) if t4_port else 1000.0,
+                "realized_pnl": float(t4_port["realized_pnl"]) if t4_port else 0.0,
+                "unrealized_pnl": t4_unrealized,
+                "total_equity": t4_total_equity,
+                "expected_equity": t4_total_equity,
+                "open_count": len(t4_positions),
+                "positions": [dict(p) for p in t4_positions]
+            }
+        }
+    except Exception as e:
+        print(f"⚠️ Error computing quant expansion metrics: {e}")
+        return None
 
 def compute_portfolio_metrics(conn):
     """Calculate portfolio balance, open exposure, Brier score, and win rate."""
@@ -384,6 +557,7 @@ def compute_portfolio_metrics(conn):
         "est_open_pnl": open_eval["est_open_pnl"],
         "open_tracking_wins": open_eval["wins"],
         "open_tracking_losses": open_eval["losses"],
+        "open_in_progress": open_eval.get("in_progress", []),
         "brier_scores": summary_brier,
         "brier_skill_scores": summary_bss,
         "domain_counts": domain_counts,
@@ -464,13 +638,50 @@ def recalibrate_models(params, metrics, dry_run=False):
                     domain_cfg["shrinkage_alpha"] = new_alpha
                     domain_cfg["min_edge_threshold"] = new_edge
                     
+    # 3. LLM Quant Portfolio Manager Post-Mortem & Calibration Synthesis (Gemini 4 Argon High)
+    try:
+        from tools.llm_sidecar import call_sidecar_llm_json, get_sidecar_model
+        model_id = get_sidecar_model("kalshi_night_audit", "gemini-4-argon-high")
+        llm_prompt = (
+            f"You are Zero's Quantitative Portfolio Manager ({model_id}) conducting the daily Kalshi & Multi-Venue Quant calibration review.\n\n"
+            f"Current Portfolio Metrics & Brier Calibration:\n{json.dumps(metrics, indent=2, default=str)}\n\n"
+            f"Current Model Parameters:\n{json.dumps(params.get('domains', {}), indent=2, default=str)}\n\n"
+            f"Baseline Rule Adjustments Proposed:\n{json.dumps(adjustments, indent=2, default=str)}\n\n"
+            "Analyze the settled performance, Brier calibration drift, and 5-book exposure. "
+            "Provide:\n"
+            "1. `pm_postmortem`: A sharp 2-3 sentence quantitative post-mortem on model calibration, edge realization, and risk posture across the 5 books.\n"
+            "2. `recommended_kelly`: Optional float between 0.10 and 0.30 if Kelly fraction should be adjusted.\n\n"
+            "Respond ONLY with valid JSON:\n"
+            '{"pm_postmortem": "...", "recommended_kelly": 0.25}'
+        )
+        llm_res = call_sidecar_llm_json("kalshi_night_audit", llm_prompt, timeout=75)
+        if isinstance(llm_res, dict) and llm_res.get("pm_postmortem"):
+            metrics["llm_pm_postmortem"] = str(llm_res["pm_postmortem"]).strip()
+            metrics["llm_pm_model"] = model_id
+            rec_k = llm_res.get("recommended_kelly")
+            if isinstance(rec_k, (int, float)):
+                bounded_k = max(0.10, min(0.30, round(float(rec_k), 2)))
+                curr_k = params.get("global", {}).get("kelly_fraction", 0.25)
+                if abs(bounded_k - curr_k) >= 0.02:
+                    adjustments.append({
+                        "scope": "global (LLM PM)",
+                        "parameter": "kelly_fraction",
+                        "old": curr_k,
+                        "new": bounded_k,
+                        "reason": f"Quant PM ({model_id}) calibration adjustment",
+                    })
+                    if not dry_run:
+                        params.setdefault("global", {})["kelly_fraction"] = bounded_k
+    except Exception as e:
+        print(f"[KalshiReview] LLM post-mortem note: {e}", file=sys.stderr)
+
     if adjustments and not dry_run:
         params.setdefault("calibration_history", []).append({
             "timestamp": now_str,
             "adjustments": adjustments
         })
         save_params(params)
-        
+
     return adjustments
 
 def update_github_project_board(metrics, settled, adjustments, dry_run=False):
@@ -487,7 +698,7 @@ def update_github_project_board(metrics, settled, adjustments, dry_run=False):
         f"| **Total Portfolio Equity** | **${metrics['total_equity']:.2f}** | ${metrics['starting_balance']:.2f} | {'🟢 In Green' if metrics['total_equity'] >= metrics['starting_balance'] else '🟡 Drawdown'} |",
         f"| **Available Cash** | ${metrics['cash']:.2f} | - | Nominal |",
         f"| **Open Market Exposure** | ${metrics['open_exposure']:.2f} | $200.00 Max | Within Cap |",
-        f"| **Cumulative Realized P&L** | **${metrics['realized_pnl']:+.2f}** | - | Realized |",
+        f"| **Cumulative Realized P&L (Net)** | **${metrics['realized_pnl']:+.2f}** | - | Net (Post-Fees) |",
         f"| **Settled Positions** | {metrics['resolved_count']} trades ({metrics['win_count']}W / {metrics['resolved_count'] - metrics['win_count']}L) | - | Win Rate: {metrics['win_rate']:.1f}% |",
         "",
         "#### Model Calibration & Brier Skill Scores"
@@ -512,7 +723,7 @@ def update_github_project_board(metrics, settled, adjustments, dry_run=False):
         comment_lines.append("#### Settled Contracts Today")
         for s in settled:
             w_flag = "✅ WIN" if s["won"] else "❌ LOSS"
-            comment_lines.append(f"- **{w_flag}** `{s['ticker']}` ({s['side']}): Payout `${s['payout']:.2f}` (P&L: `${s['realized_pnl']:+.2f}`) | Model: `{s['model_prob']*100:.1f}%`" if s.get("model_prob") else f"- **{w_flag}** `{s['ticker']}` ({s['side']}): Payout `${s['payout']:.2f}` (P&L: `${s['realized_pnl']:+.2f}`)")
+            comment_lines.append(f"- **{w_flag}** `{s['ticker']}` ({s['side']}): Payout `${s['payout']:.2f}` (Net P&L: `${s['realized_pnl']:+.2f}`) | Model: `{s['model_prob']*100:.1f}%`" if s.get("model_prob") else f"- **{w_flag}** `{s['ticker']}` ({s['side']}): Payout `${s['payout']:.2f}` (Net P&L: `${s['realized_pnl']:+.2f}`)")
         comment_lines.append("")
         
     if adjustments:
@@ -538,9 +749,9 @@ def update_github_project_board(metrics, settled, adjustments, dry_run=False):
             "-f", f"body={comment_body}"
         ]
         subprocess.run(cmd, capture_output=True, text=True, check=True)
-        print("✅ Posted telemetry comment to brockventures/kalshi-quant Issue #5")
+        print("✅ Posted telemetry comment to brockventures/kalshi-quant Issue #5", file=sys.stderr)
     except Exception as e:
-        print(f"⚠️ Failed to post comment to Issue #5: {e}")
+        print(f"⚠️ Failed to post comment to Issue #5: {e}", file=sys.stderr)
         
     # 3. Advance Project #3 Issue #5 to "In Progress" if not already
     try:
@@ -565,9 +776,9 @@ def update_github_project_board(metrics, settled, adjustments, dry_run=False):
         """
         cmd = ["gh", "api", "graphql", "-f", f"query={mutation}"]
         subprocess.run(cmd, capture_output=True, text=True, check=True)
-        print("✅ Advanced Issue #5 on Project #3 board to 'In Progress'")
+        print("✅ Advanced Issue #5 on Project #3 board to 'In Progress'", file=sys.stderr)
     except Exception as e:
-        print(f"⚠️ Failed to update Project #3 board item: {e}")
+        print(f"⚠️ Failed to update Project #3 board item: {e}", file=sys.stderr)
         
     return True
 
@@ -582,7 +793,15 @@ def sync_repository(dry_run=False):
         ("tools/kalshi_paper_bot.py", "tools/kalshi_paper_bot.py"),
         ("tools/baseball_daily_quant.py", "tools/baseball_daily_quant.py"),
         ("tools/baseball_playoff_model.py", "tools/baseball_playoff_model.py"),
-        ("data/kalshi_model_params.json", "data/kalshi_model_params.json")
+        ("tools/quant_cross_venue_arb.py", "tools/quant_cross_venue_arb.py"),
+        ("tools/quant_polymarket_standalone.py", "tools/quant_polymarket_standalone.py"),
+        ("tools/quant_hyperliquid_basis.py", "tools/quant_hyperliquid_basis.py"),
+        ("tools/quant_trend_momentum.py", "tools/quant_trend_momentum.py"),
+        ("tools/test_weather_ensemble.py", "tools/test_weather_ensemble.py"),
+        ("tools/test_quant_expansion.py", "tools/test_quant_expansion.py"),
+        ("tools/quant_equity_chart.py", "tools/quant_equity_chart.py"),
+        ("data/kalshi_model_params.json", "data/kalshi_model_params.json"),
+        ("data/quant_equity_chart.png", "data/quant_equity_chart.png")
     ]
     
     (REPO_DIR / "data").mkdir(parents=True, exist_ok=True)
@@ -595,7 +814,7 @@ def sync_repository(dry_run=False):
             shutil.copy2(src_path, dst_path)
             
     if dry_run:
-        print("[Dry Run] Synced files to /workspace/kalshi-quant (skipping git commit)")
+        print("[Dry Run] Synced files to /workspace/kalshi-quant (skipping git commit)", file=sys.stderr)
         return True
         
     try:
@@ -606,12 +825,12 @@ def sync_repository(dry_run=False):
             msg = f"chore(quant): update model parameters and daily review telemetry ({datetime.now(PT).strftime('%Y-%m-%d %H:%M')})"
             subprocess.run(["git", "-C", str(REPO_DIR), "commit", "-m", msg], check=True, capture_output=True)
             subprocess.run(["git", "-C", str(REPO_DIR), "push", "origin", "main"], check=True, capture_output=True)
-            print("✅ Pushed updated quant engine & calibration params to brockventures/kalshi-quant (main)")
+            print("✅ Pushed updated quant engine & calibration params to brockventures/kalshi-quant (main)", file=sys.stderr)
         else:
-            print("ℹ️ No code/parameter diffs to commit in kalshi-quant")
+            print("ℹ️ No code/parameter diffs to commit in kalshi-quant", file=sys.stderr)
         return True
     except Exception as e:
-        print(f"⚠️ Git sync error: {e}")
+        print(f"⚠️ Git sync error: {e}", file=sys.stderr)
         return False
 
 def update_vault_doc(metrics):
@@ -630,53 +849,133 @@ def update_vault_doc(metrics):
         else:
             content += f"\n{new_line}\n"
         VAULT_DOC.write_text(content)
-        print("✅ Updated vault memory enclave: project_kalshi_quant_bot.md")
+        print("✅ Updated vault memory enclave: project_kalshi_quant_bot.md", file=sys.stderr)
     except Exception as e:
-        print(f"⚠️ Vault update error: {e}")
+        print(f"⚠️ Vault update error: {e}", file=sys.stderr)
 
-def print_review_summary(metrics, settled, adjustments):
+def _cap_summary_length(text: str, max_chars: int = 1850) -> str:
+    """Ensure summary fits comfortably within a single 2,000-char Discord message."""
+    if len(text) <= max_chars:
+        return text
+    out_lines = []
+    cur_len = 0
+    for line in text.splitlines():
+        if cur_len + len(line) + 1 > max_chars - 50:
+            out_lines.append("- *(Summary truncated to fit <2,000 chars)*")
+            break
+        out_lines.append(line)
+        cur_len += len(line) + 1
+    return "\n".join(out_lines)
+
+def clean_event_name(name: str) -> str:
+    """Clean sport/ticker/oracle prefixes and trailing noise from event titles."""
+    if not name:
+        return ""
+    s = re.sub(r"^\[.*?\]\s*(\d{4}-\d{2}-\d{2}\s*)?", "", name)
+    s = re.sub(r"\s*\([^)]*Maker[^)]*\)", "", s)
+    s = re.sub(r"What price will (.*?) hit.*", r"\1 Target", s)
+    s = re.sub(r"\s*\(\$.*?\)", "", s)
+    s = s.strip()
+    if len(s) > 36:
+        s = s[:34].rsplit(" ", 1)[0] + "…"
+    return s
+
+def _fmt_signed_usd(val: float) -> str:
+    sign = "+" if val >= 0 else "-"
+    return f"{sign}${abs(val):,.2f}"
+
+def format_review_summary(metrics, settled, adjustments, max_chars=1850):
     now_str = datetime.now(PT).strftime("%b %d, %I:%M %p PT")
-    today_pnl = metrics.get("today_pnl", 0.0)
-    today_w = metrics.get("today_wins", 0)
-    today_l = metrics.get("today_losses", 0)
     open_cnt = metrics.get("open_count", 0)
     open_exp = metrics.get("open_exposure", 0.0)
-    est_open_pnl = metrics.get("est_open_pnl", 0.0)
-    
-    lines = [
-        f"### 📈 Kalshi Daily Review • {now_str}",
-        ""
-    ]
-    
-    if today_w + today_l > 0:
-        wr = (today_w / (today_w + today_l)) * 100
-        pnl_sign = "+" if today_pnl >= 0 else "-"
-        lines.append(f"- **Settled Today:** `{pnl_sign}${abs(today_pnl):.2f}` ({today_w}W – {today_l}L · {wr:.0f}% win rate)")
+
+    qm = compute_quant_expansion_metrics()
+    k_eq = metrics["total_equity"]
+    k_delta = k_eq - 1000.0
+    tot_eq = k_eq
+    if qm:
+        tot_eq += (
+            qm["track1"]["expected_equity"]
+            + qm["track2"]["expected_equity"]
+            + qm["track3"]["expected_equity"]
+            + qm["track4"]["expected_equity"]
+        )
+        tot_delta = tot_eq - 5000.0
+        tot_pct = (tot_delta / 5000.0) * 100.0
     else:
-        lines.append("- **Settled Today:** `$0.00` (0 resolved)")
-        
+        tot_delta = k_delta
+        tot_pct = (tot_delta / 1000.0) * 100.0
+
+    lines = [
+        f"### 📈 Daily Quant Portfolio Update • {now_str}",
+        f"**Total Equity:** **${tot_eq:,.2f}** (**{_fmt_signed_usd(tot_delta)}** / **{tot_pct:+.1f}%**)",
+        "",
+    ]
+
+    # 1. Book 1: Kalshi Weather & Events
+    k_realized = metrics.get("realized_pnl", 0.0)
+    lines.append(f"1. **Kalshi Weather & Events:** **${k_eq:,.2f}** (**{_fmt_signed_usd(k_delta)}**)")
     if open_cnt > 0:
-        pnl_sign = "+" if est_open_pnl >= 0 else "-"
-        lines.append(f"- **Open Bets ({open_cnt}):** `{pnl_sign}${abs(est_open_pnl):.2f}` est. outcome (`${open_exp:.2f}` at risk)")
         wins = metrics.get("open_tracking_wins", [])
         losses = metrics.get("open_tracking_losses", [])
-        if wins:
-            w_str = ", ".join(f"{w['label']} (`{'+' if w['pnl']>=0 else '-'}${abs(w['pnl']):.2f}`)" for w in wins)
-            lines.append(f"  - 🟢 **Tracking Win:** {w_str}")
-        if losses:
-            l_str = ", ".join(f"{l['label']} (`{'+' if l['pnl']>=0 else '-'}${abs(l['pnl']):.2f}`)" for l in losses)
-            lines.append(f"  - 🔴 **Tracking Loss:** {l_str}")
+        in_progress = metrics.get("open_in_progress", [])
+        parts = [f"{w['label']} ({_fmt_signed_usd(w['pnl'])})" for w in wins[:2]]
+        parts += [f"{l['label']} ({_fmt_signed_usd(l['pnl'])})" for l in losses[:2]]
+        parts += [f"{ip['label']} ({ip['obs']}°F)" for ip in in_progress[:2]]
+        detail = f": {', '.join(parts)}" if parts else ""
+        lines.append(f"   - {_fmt_signed_usd(k_realized)} realized · {open_cnt} open (${open_exp:,.2f} risk{detail})")
     else:
-        lines.append("- **Open Bets:** None active")
-        
-    lines.append(f"- **Total Equity:** `${metrics['total_equity']:.2f}` (`${metrics['cash']:.2f}` cash · `${open_exp:.2f}` open)")
-    
-    brier = metrics.get("brier_scores", {}).get("overall")
-    adj_str = f" · {adjustments[0]['scope']} alpha → `{adjustments[0].get('new_alpha', '')}`" if adjustments else ""
-    if brier is not None:
-        lines.append(f"- **Calibration:** Brier `{brier:.3f}` overall{adj_str}")
-        
-    print("\n".join(lines))
+        lines.append(f"   - {_fmt_signed_usd(k_realized)} realized · 0 open positions")
+
+    if qm:
+        # 2. Book 2: Cross-Venue Arbitrage
+        t1 = qm["track1"]
+        t1_eq = t1["expected_equity"]
+        t1_delta = t1_eq - 1000.0
+        lines.append(f"2. **Cross-Venue Arbitrage:** **${t1_eq:,.2f}** (**{_fmt_signed_usd(t1_delta)}**)")
+        lines.append(
+            f"   - {_fmt_signed_usd(t1['realized_pnl'])} realized · {_fmt_signed_usd(t1['locked_pnl'])} locked across {t1['open_count']} open pairs"
+        )
+
+        # 3. Book 3: Polymarket Standalone
+        t2 = qm["track2"]
+        t2_eq = t2["expected_equity"]
+        t2_delta = t2_eq - 1000.0
+        lines.append(f"3. **Polymarket Standalone:** **${t2_eq:,.2f}** (**{_fmt_signed_usd(t2_delta)}**)")
+        lines.append(
+            f"   - {_fmt_signed_usd(t2['realized_pnl'])} realized · {_fmt_signed_usd(t2['locked_pnl'])} locked across {t2['open_count']} open positions"
+        )
+
+        # 4. Book 4: Hyperliquid Basis
+        t3 = qm["track3"]
+        t3_eq = t3["expected_equity"]
+        t3_delta = t3_eq - 1000.0
+        fund = t3.get("cumulative_funding", 0.0)
+        pos_items = [f"{p['asset']} ({p['annualized_yield']*100:.0f}% APY)" for p in t3.get("positions", [])[:4]]
+        pos_str = f": {', '.join(pos_items)}" if pos_items else ""
+        lines.append(f"4. **Hyperliquid Basis:** **${t3_eq:,.2f}** (**{_fmt_signed_usd(t3_delta)}**)")
+        lines.append(f"   - {_fmt_signed_usd(fund)} accrued funding · {t3['open_count']} active perps{pos_str}")
+
+        # 5. Book 5: Trend Momentum
+        t4 = qm["track4"]
+        t4_eq = t4["expected_equity"]
+        t4_delta = t4_eq - 1000.0
+        unreal = t4.get("unrealized_pnl", 0.0)
+        swings = [f"{p['symbol']} ({_fmt_signed_usd(p['unrealized_pnl'] or 0.0)})" for p in t4.get("positions", [])[:5]]
+        swing_str = f": {', '.join(swings)}" if swings else ""
+        lines.append(f"5. **Trend Momentum:** **${t4_eq:,.2f}** (**{_fmt_signed_usd(t4_delta)}**)")
+        lines.append(f"   - {_fmt_signed_usd(t4['realized_pnl'])} realized · {_fmt_signed_usd(unreal)} unrealized across {t4['open_count']} swings{swing_str}")
+
+    return _cap_summary_length("\n".join(lines), max_chars=max_chars)
+
+
+def format_scan_summary(metrics, qm=None, new_fills=None, max_chars=1850):
+    """Format concise daytime/morning scan and trade execution update."""
+    return format_review_summary(metrics, [], [], max_chars=max_chars)
+
+
+def print_review_summary(metrics, settled, adjustments):
+    print(format_review_summary(metrics, settled, adjustments))
 
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Paper Trading Performance Review & Task Board Sync")
@@ -706,19 +1005,26 @@ def main():
     # 3. Model Recalibration
     adjustments = recalibrate_models(params, metrics, dry_run=args.dry_run)
     
-    # 4. Summary display
+    # 4. Render Equity Trend Chart & Record Snapshot
+    try:
+        from tools.quant_equity_chart import render_quant_equity_chart
+        render_quant_equity_chart()
+    except Exception as e:
+        print(f"⚠️ Chart render warning: {e}", file=sys.stderr)
+
+    # 5. Summary display
     if not args.quiet:
         print_review_summary(metrics, settled, adjustments)
         
-    # 5. GitHub Task Board & Telemetry
+    # 6. GitHub Task Board & Telemetry
     if not args.no_board_sync:
         update_github_project_board(metrics, settled, adjustments, dry_run=args.dry_run)
         
-    # 6. Git Sync
+    # 7. Git Sync
     if not args.no_git_sync:
         sync_repository(dry_run=args.dry_run)
         
-    # 7. Vault Doc
+    # 8. Vault Doc
     if not args.dry_run:
         update_vault_doc(metrics)
 

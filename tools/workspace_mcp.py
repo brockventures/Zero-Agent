@@ -64,12 +64,21 @@ def _get_access_token() -> str:
     }).encode("utf-8")
 
     req = urllib.request.Request(creds.get("token_uri", "https://oauth2.googleapis.com/token"), data=data)
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        tokens = json.loads(resp.read().decode())
-        _cached_token = tokens["access_token"]
-        expires_in = tokens.get("expires_in", 3600)
-        _token_expiry = now + expires_in
-        return _cached_token
+    last_err = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                tokens = json.loads(resp.read().decode())
+                _cached_token = tokens["access_token"]
+                expires_in = tokens.get("expires_in", 3600)
+                _token_expiry = now + expires_in
+                return _cached_token
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            raise last_err
 
 def _auth_headers() -> dict:
     tok = _get_access_token()
@@ -78,9 +87,39 @@ def _auth_headers() -> dict:
         "Content-Type": "application/json"
     }
 
+def _extract_plain_body(payload: dict, max_chars: int = 1200) -> str:
+    """Extract clean readable plain text from a Gmail message payload."""
+    import base64
+    import html
+
+    def _walk(part: dict, target_mime: str) -> str:
+        if part.get("mimeType") == target_mime and part.get("body", {}).get("data"):
+            try:
+                return base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="ignore")
+            except Exception:
+                return ""
+        for sub in part.get("parts", []):
+            found = _walk(sub, target_mime)
+            if found:
+                return found
+        return ""
+
+    raw = _walk(payload, "text/plain")
+    if not raw:
+        raw_html = _walk(payload, "text/html")
+        if raw_html:
+            cleaned = re.sub(r"<style[\s\S]*?</style>|<script[\s\S]*?</script>", " ", raw_html, flags=re.I)
+            cleaned = re.sub(r"</?[a-zA-Z][a-zA-Z0-9:-]*(?:\s+[^<>]*)?>", " ", cleaned)
+            raw = html.unescape(cleaned)
+    if not raw:
+        return ""
+    raw = re.sub(r"https?://\S+", "", raw)
+    return " ".join(raw.split())[:max_chars]
+
+
 @server.tool()
-def gmail_search(query: str = "is:unread", max_results: int = 15) -> str:
-    """Search Gmail messages. Returns snippet, id, threadId."""
+def gmail_search(query: str = "is:unread", max_results: int = 15, include_body: bool = False) -> str:
+    """Search Gmail messages. Returns snippet, id, threadId, and optional body_excerpt."""
     try:
         params = urllib.parse.urlencode({
             "q": query,
@@ -91,20 +130,24 @@ def gmail_search(query: str = "is:unread", max_results: int = 15) -> str:
             data = json.loads(resp.read().decode())
             messages = data.get("messages", [])
             results = []
+            fmt = "full" if include_body else "metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date"
             for m in messages:
-                # Fetch snippet and headers for each message
-                m_req = urllib.request.Request(f"{GMAIL_BASE}/messages/{m['id']}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date", headers=_auth_headers())
+                m_req = urllib.request.Request(f"{GMAIL_BASE}/messages/{m['id']}?format={fmt}", headers=_auth_headers())
                 with urllib.request.urlopen(m_req, timeout=TIMEOUT) as m_resp:
                     m_data = json.loads(m_resp.read().decode())
-                    headers = {h["name"]: h["value"] for h in m_data.get("payload", {}).get("headers", [])}
-                    results.append({
+                    payload = m_data.get("payload", {})
+                    headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
+                    entry = {
                         "id": m["id"],
                         "threadId": m.get("threadId"),
                         "subject": headers.get("Subject", "(no subject)"),
                         "from": headers.get("From", "(unknown)"),
                         "date": headers.get("Date", ""),
                         "snippet": m_data.get("snippet", "")
-                    })
+                    }
+                    if include_body:
+                        entry["body_excerpt"] = _extract_plain_body(payload)
+                    results.append(entry)
             return json.dumps({"ok": True, "count": len(results), "messages": results})
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)})

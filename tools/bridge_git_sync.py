@@ -209,5 +209,10 @@ def sync_git_on_reload(
         result["error"] = str(e)
         result["message"] = f"Git sync encountered an issue: {e}"
         print(f"[BridgeGitSync] ⚠️ {result['message']}")
+        # Clean up staging index so the repository is not left in a dirty staged state
+        try:
+            subprocess.run(["git", "restore", "--staged", "."], cwd=str(repo), capture_output=True, timeout=5)
+        except Exception:
+            pass
 
     return result
