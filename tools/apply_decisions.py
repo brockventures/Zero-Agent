@@ -18,6 +18,7 @@ from actual.queries import (
     create_category,
 )
 
+import os
 import nas_config
 ACTUAL_URL = os.environ.get("ACTUAL_SERVER_URL", f"http://{nas_config.HOST_2_IP}:5006")
 ACTUAL_PASSWORD = "zerobudget"

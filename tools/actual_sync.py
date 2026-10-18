@@ -28,6 +28,7 @@ try:
 except ImportError:
     from outbox import queue_outbox_message
 
+import os
 import nas_config
 ACTUAL_URL = os.environ.get("ACTUAL_SERVER_URL", f"http://{nas_config.HOST_2_IP}:5006")
 ACTUAL_PASSWORD = "zerobudget"

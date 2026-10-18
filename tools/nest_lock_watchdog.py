@@ -32,11 +32,14 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 try:
+    import tools.nas_config as nas_config
     from tools.nas_config import HOST_1_IP, run_ssh
 except ImportError:
     try:
+        import nas_config
         from nas_config import HOST_1_IP, run_ssh
     except ImportError:
+        nas_config = None
         HOST_1_IP = os.environ.get("NAS_HOST_1_IP", "127.0.0.1")
         run_ssh = None
 

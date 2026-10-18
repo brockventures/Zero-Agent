@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, subprocess, urllib.request, tarfile, shutil
+import os, sys, json, subprocess, urllib.request, tarfile, shutil
 
 def get_current_version() -> str:
     try:

@@ -252,6 +252,7 @@ def gather_ivy_baseball_context() -> list[str]:
     """Pull Ivy's latest baseball memory and league context from Host 2."""
     lines = []
     try:
+        import tools.nas_config as nas_config
         from tools.nas_config import run_ssh, HOST_2_IP
         cmd = (
             f"head -n 60 {nas_config.DOCKER_ROOT}/discord-ivy-agent/workspace/memory/MEMORY.md {nas_config.DOCKER_ROOT}/discord-ivy-agent/workspace/memory/sos_legacy_2026.md {nas_config.DOCKER_ROOT}/discord-ivy-agent/workspace/memory/12gm_3to_2026.md 2>/dev/null"
