@@ -460,7 +460,10 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         """Verify that native Discord Slash Commands are registered in bot.tree."""
         from tools.bridge import bot
         cmd_names = {cmd.name for cmd in bot.tree.get_commands()}
-        expected_commands = {"new", "reset", "model", "logs", "triage", "heartbeat", "tasks", "sidecars", "title"}
+        expected_commands = {
+            "new", "reset", "model", "quota", "reload", "crab", "run",
+            "logs", "triage", "heartbeat", "tasks", "sidecars", "title", "voice"
+        }
         for exp in expected_commands:
             self.assertIn(exp, cmd_names, f"Expected slash command '/{exp}' to be registered on bot.tree")
 

@@ -10,6 +10,7 @@ Decomposed into isolated, testable modules:
 """
 
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -61,13 +62,18 @@ from tools.bridge_state import (
     SESSION_METADATA_FILE,
     BEACON_FILE,
     BOT_STATUS_FILE,
+    RUNTIME_RULES_FILE,
     TARGET_CHANNEL_ID,
+    VAULT_CHANNEL_ID,
     OWNER_USER_ID,
     PersistentTurnQueue,
     get_active_model,
     set_active_model,
+    get_runtime_rules,
     is_reload_intent,
     is_container_restart_intent,
+    is_crab_cavern_silenced,
+    parse_silence_until,
     sync_credentials,
     clear_channel_session_id,
     PT_TZ,
@@ -107,6 +113,7 @@ from tools.bridge_handlers import (
     handle_on_ready,
     handle_message,
 )
+from tools.bridge_commands import ON_DEMAND_TRIGGERS
 from tools.bridge_scheduler import (
     BridgeScheduler,
     dispatch_scheduled_prompt,
@@ -117,7 +124,7 @@ ACTIVE_MODEL = get_active_model()
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="/", intents=intents)
 
 # Persistent Queues
 home_turn_queue = PersistentTurnQueue(QUEUE_FILE)
@@ -286,7 +293,7 @@ async def slash_new(interaction: discord.Interaction, prompt: str = ""):
         if clean_prompt:
             resp = await interaction.followup.send(f"🧵 Starting new thread for: **{clean_prompt}**...")
         else:
-            resp = await interaction.followup.send(f"🧵 Starting new threaded conversation...")
+            resp = await interaction.followup.send("🧵 Starting new threaded conversation...")
 
         thread = await resp.create_thread(name=f"🧵 {task_title}", auto_archive_duration=1440)
         await resp.edit(content=f"🧵 *Spawned new conversation thread:* {thread.mention} *(#{getattr(ch, 'name', 'chat')} remains free for other tasks)*")
@@ -423,6 +430,249 @@ async def slash_model_autocomplete(interaction: discord.Interaction, current: st
                     choices.append(app_commands.Choice(name=f"{mid} ({label})"[:100], value=mid))
     return choices[:25]
 
+
+@bot.tree.command(name="quota", description="Check Gemini quota progress card, poll live usage, or send daily context digest")
+@app_commands.describe(action="card (default), poll, attribution, or email-digest")
+async def slash_quota(interaction: discord.Interaction, action: str = "card"):
+    await interaction.response.defer()
+    act = action.lower().strip()
+    if act in ("poll", "poller", "quota_poller"):
+        from tools.quota_poller import format_quota_status_text, get_latest_quota, run_quota_poller
+        ok, rep, _ = await asyncio.to_thread(run_quota_poller, False, False)
+        latest = await asyncio.to_thread(get_latest_quota)
+        status_txt = format_quota_status_text(latest)
+        reply_txt = f"{rep}\n\n{status_txt}" if rep else status_txt
+        await interaction.followup.send(reply_txt)
+        return
+    if act in ("attribution", "attr"):
+        from tools.quota_poller import format_attribution_text, get_quota_attribution
+        attr = await asyncio.to_thread(get_quota_attribution, 24.0)
+        await interaction.followup.send(format_attribution_text(attr))
+        return
+    if act in ("email-digest", "context_digest", "digest"):
+        from tools.gemini_context_digest import run_daily_context_digest
+        ok, rep, _ = await asyncio.to_thread(run_daily_context_digest)
+        await interaction.followup.send(f"📨 {rep}" if ok else rep)
+        return
+
+    from tools.quota_card import build_quota_card
+    ok, card, _ = await asyncio.to_thread(build_quota_card)
+    await interaction.followup.send(card)
+
+
+@slash_quota.autocomplete("action")
+async def slash_quota_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    options = [
+        ("card (Weekly Gemini Quota Progress Bar Card)", "card"),
+        ("poll (Poll Live Ground-Truth Quota Snapshot)", "poll"),
+        ("attribution (24h Token & Quota Attribution Breakdown)", "attribution"),
+        ("email-digest (Send Zero & Ivy Daily Context Digest Email)", "email-digest"),
+    ]
+    cur = current.lower().strip()
+    return [app_commands.Choice(name=label, value=val) for label, val in options if not cur or cur in label.lower() or cur in val.lower()]
+
+
+@bot.tree.command(name="reload", description="Reload Zero bridge in-place or restart the Docker container")
+@app_commands.describe(mode="in-place (fast execv reload) or container (full Docker restart)")
+async def slash_reload(interaction: discord.Interaction, mode: str = "in-place"):
+    await interaction.response.defer()
+    initiator_name = interaction.user.display_name or interaction.user.name
+    m = mode.lower().strip()
+    if m in ("container", "docker"):
+        await interaction.followup.send("🔄 Dispatching full Zero Docker container restart on Host 2...")
+        await execute_container_restart(interaction.channel, initiator=initiator_name, reason="Slash command /reload container")
+        return
+
+    await interaction.followup.send("🔄 Reloading Zero bridge in-place...")
+    await _execute_reload(channel=interaction.channel, initiator=initiator_name, force=True, reason="Slash command /reload in-place")
+
+
+@slash_reload.autocomplete("mode")
+async def slash_reload_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    options = [
+        ("in-place (Fast zero-downtime process execv reload)", "in-place"),
+        ("container (Full Docker container restart on Host 2)", "container"),
+    ]
+    cur = current.lower().strip()
+    return [app_commands.Choice(name=label, value=val) for label, val in options if not cur or cur in label.lower() or cur in val.lower()]
+
+
+@bot.tree.command(name="crab", description="Manage Crab Cavern silence state, peer bot cooldowns, Agora trading, and BananaWatcher")
+@app_commands.describe(
+    action="Action to perform (status, silence, unsilence, pause-bot, unpause-bot, halt-agora, resume-agora, bananawatcher-status)",
+    target="Optional target bot name (for pause-bot/unpause-bot) or silence duration (e.g. 6h, tomorrow 8am)",
+    duration_mins="Optional pause duration in minutes (default: 3)"
+)
+async def slash_crab(interaction: discord.Interaction, action: str = "status", target: str = "", duration_mins: int = 3):
+    await interaction.response.defer()
+    act = action.lower().strip()
+    initiator_name = interaction.user.display_name or interaction.user.name
+
+    if act == "status":
+        silenced, reason = is_crab_cavern_silenced()
+        if silenced:
+            await interaction.followup.send(f"🔇 **Crab Cavern Status:** {reason}")
+        else:
+            await interaction.followup.send("🔊 **Crab Cavern Status:** Active (not silenced).")
+        return
+
+    if act == "silence":
+        rules_data = {}
+        if RUNTIME_RULES_FILE.exists():
+            with open(RUNTIME_RULES_FILE) as rf:
+                rules_data = json.load(rf)
+        try:
+            until_dt = parse_silence_until(target.strip() or None)
+        except Exception:
+            await interaction.followup.send("⚠️ Couldn't parse duration. Try `6h`, `tomorrow 8am`, or `2026-10-19 20:00`.")
+            return
+        rules_data["crab_cavern_silenced_until"] = until_dt.isoformat()
+        rules_data["crab_cavern_silence_reason"] = f"Slash command /crab silence from {initiator_name}"
+        with open(RUNTIME_RULES_FILE, "w") as rf:
+            json.dump(rules_data, rf, indent=2)
+        await interaction.followup.send(f"🔇 Crab Cavern silenced across all posts and dispatches until **{until_dt.strftime('%A, %b %d, %Y, %I:%M %p')} PT**.")
+        return
+
+    if act == "unsilence":
+        rules_data = {}
+        if RUNTIME_RULES_FILE.exists():
+            with open(RUNTIME_RULES_FILE) as rf:
+                rules_data = json.load(rf)
+        rules_data.pop("crab_cavern_silenced_until", None)
+        rules_data.pop("crab_cavern_silence_reason", None)
+        with open(RUNTIME_RULES_FILE, "w") as rf:
+            json.dump(rules_data, rf, indent=2)
+        await interaction.followup.send("🔊 Crab Cavern unsilenced. Responses and dispatches resumed.")
+        return
+
+    if act == "pause-bot":
+        bot_target = target.strip() or "Amos"
+        from tools.last_word_protocol import pause_bot
+        rec = pause_bot(
+            channel_id=1534452820995080192,
+            bot_id=bot_target if bot_target.isdigit() else None,
+            bot_name=bot_target if not bot_target.isdigit() else None,
+            duration_seconds=max(1, duration_mins) * 60.0,
+            reason=f"Slash command /crab pause-bot from {initiator_name}",
+        )
+        await interaction.followup.send(f"⏸️ Responses to **{rec.get('bot_name', bot_target)}** in <#1534452820995080192> paused for {duration_mins} minutes (until {rec.get('pause_until_pt')}).")
+        return
+
+    if act == "unpause-bot":
+        bot_target = target.strip() or "Amos"
+        from tools.last_word_protocol import unpause_bot
+        removed = unpause_bot(1534452820995080192, bot_target)
+        if removed:
+            await interaction.followup.send(f"▶️ Responses to **{bot_target}** in <#1534452820995080192> resumed.")
+        else:
+            await interaction.followup.send(f"ℹ️ **{bot_target}** was not currently paused in <#1534452820995080192>.")
+        return
+
+    if act in ("halt-agora", "halt"):
+        from tools.agora_kill_switch import trigger_kill_switch
+        res = trigger_kill_switch(initiator=initiator_name, action="halt", channel_id=interaction.channel_id)
+        await interaction.followup.send(res["message"])
+        return
+
+    if act in ("resume-agora", "resume"):
+        from tools.agora_kill_switch import trigger_kill_switch
+        res = trigger_kill_switch(initiator=initiator_name, action="resume", channel_id=interaction.channel_id)
+        await interaction.followup.send(res["message"])
+        return
+
+    if act.startswith("bananawatcher"):
+        from tools.banana_watcher import get_daemon_status, load_state, start_daemon, stop_daemon
+        if act == "bananawatcher-start":
+            st = get_daemon_status()
+            if st["running"]:
+                await interaction.followup.send(f"🍌 **BananaWatcher** is already running with PID `{st['pid']}`.")
+            else:
+                res = start_daemon()
+                await interaction.followup.send(f"🚀 Started **BananaWatcher** daemon (PID: `{res.get('pid')}`).")
+            return
+        if act == "bananawatcher-stop":
+            st = get_daemon_status()
+            if not st["running"]:
+                await interaction.followup.send("ℹ️ **BananaWatcher** is not currently running.")
+            else:
+                stop_daemon()
+                await interaction.followup.send(f"🛑 Stopped **BananaWatcher** (PID `{st['pid']}`).")
+            return
+        st = get_daemon_status()
+        state = load_state()
+        last_check_str = f"{int(time.time() - state['last_check_ts'])}s ago" if state.get("last_check_ts") else "Never"
+        await interaction.followup.send(
+            f"🍌 **BananaWatcher Status:**\n"
+            f"- **Daemon Running:** `{st['running']}` (PID: `{st['pid']}`)\n"
+            f"- **Channel:** <#1534436119888793750> (`#the-banana-stand`)\n"
+            f"- **Last Evaluation:** `{last_check_str}`\n"
+            f"- **Tracked Stalls:** {len(state.get('nudged_stalls', {}))} | **Handoffs:** {len(state.get('nudged_handoffs', {}))}"
+        )
+        return
+
+    await interaction.followup.send(f"⚠️ Unknown `/crab` action `{action}`. Choose `status`, `silence`, `unsilence`, `pause-bot`, `unpause-bot`, `halt-agora`, `resume-agora`, or `bananawatcher-status`.")
+
+
+@slash_crab.autocomplete("action")
+async def slash_crab_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    options = [
+        ("status (Check Crab Cavern Silence Status)", "status"),
+        ("silence (Silence Crab Cavern Posts & Dispatches)", "silence"),
+        ("unsilence (Resume Crab Cavern Posts & Dispatches)", "unsilence"),
+        ("pause-bot (Pause Responses to a Peer Bot in #lounge)", "pause-bot"),
+        ("unpause-bot (Resume Responses to a Peer Bot in #lounge)", "unpause-bot"),
+        ("halt-agora (Emergency Halt Station Agora Trading)", "halt-agora"),
+        ("resume-agora (Resume Station Agora Trading)", "resume-agora"),
+        ("bananawatcher-status (Check BananaWatcher Daemon Status)", "bananawatcher-status"),
+        ("bananawatcher-start (Start BananaWatcher Daemon)", "bananawatcher-start"),
+        ("bananawatcher-stop (Stop BananaWatcher Daemon)", "bananawatcher-stop"),
+    ]
+    cur = current.lower().strip()
+    return [app_commands.Choice(name=label, value=val) for label, val in options if not cur or cur in label.lower() or cur in val.lower()]
+
+
+@bot.tree.command(name="run", description="Run any on-demand sidecar or operational task")
+@app_commands.describe(job="Name of the sidecar or operational job to trigger")
+async def slash_run(interaction: discord.Interaction, job: str):
+    await interaction.response.defer()
+    clean_job = job.strip().lower().lstrip("!/")
+    cmd_key = f"/{clean_job}"
+
+    if cmd_key not in ON_DEMAND_TRIGGERS:
+        valid_jobs = ", ".join(f"`{k.lstrip('/')}`" for k in sorted(ON_DEMAND_TRIGGERS.keys())[:25])
+        await interaction.followup.send(f"❌ Unknown job `{clean_job}`. Try one of: {valid_jobs}...")
+        return
+
+    if cmd_key in ("/kalshi", "/kalshi_review", "/kalshi_audit", "/kalshi_sprint"):
+        if interaction.channel_id != VAULT_CHANNEL_ID:
+            await interaction.followup.send(f"🔒 *Kalshi quant trading operations and sidecars exclusively operate in <#{VAULT_CHANNEL_ID}>.*")
+            return
+
+    prompt_text = ON_DEMAND_TRIGGERS[cmd_key]
+    resp_msg = await interaction.followup.send(f"🚀 **Triggered `/run {clean_job}`** — queuing execution...")
+    await home_turn_queue.put({
+        "prompt": prompt_text,
+        "status_msg": None,
+        "reply_target": resp_msg or interaction.channel,
+        "attachments": [],
+        "is_steer": False,
+        "mode": "home",
+        "channel_id": interaction.channel_id,
+        "queued_at": time.perf_counter(),
+    })
+
+
+@slash_run.autocomplete("job")
+async def slash_run_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    cur = current.lower().strip().lstrip("!/")
+    choices: list[app_commands.Choice[str]] = []
+    for k, desc in sorted(ON_DEMAND_TRIGGERS.items()):
+        job_name = k.lstrip("/")
+        short_desc = desc.split(".")[0].replace("Run the ", "").replace("Run ", "")
+        label = f"{job_name} — {short_desc}"[:100]
+        if not cur or cur in job_name.lower() or cur in short_desc.lower():
+            choices.append(app_commands.Choice(name=label, value=job_name))
+    return choices[:25]
 
 
 @bot.tree.command(name="logs", description="Run on-demand NAS log review across containers")

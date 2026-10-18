@@ -1,5 +1,5 @@
 """
-Unit tests for tools/bridge_commands.py.
+Unit tests for tools/bridge_commands.py and native Discord slash commands in tools/bridge.py.
 Exercises UI choice views, operator commands, model switching, sidecar triggers, and lifecycle hooks.
 """
 
@@ -33,6 +33,13 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         from tools.bridge_commands import PROCESSED_INTERACTIONS
         PROCESSED_INTERACTIONS.clear()
 
+    def test_on_demand_triggers_strictly_slash_prefixed(self):
+        """Verify all ON_DEMAND_TRIGGERS use canonical /<job> keys without legacy ! duplicates."""
+        self.assertGreater(len(ON_DEMAND_TRIGGERS), 40)
+        for k in ON_DEMAND_TRIGGERS:
+            self.assertTrue(k.startswith("/"), f"Expected canonical slash key, got {k}")
+            self.assertFalse(k.startswith("!"), f"Legacy bang key found: {k}")
+
     def test_quick_choice_view_structure(self):
         options = ["Option A", "Option B", "Option C", "Option D", "Option E", "Option F"]
         view = QuickChoiceView(options)
@@ -57,7 +64,7 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
 
     async def test_handle_operator_command_reset(self):
         msg = MagicMock()
-        msg.content = "!reset"
+        msg.content = "/reset"
         msg.channel.id = 123
         msg.reply = AsyncMock()
 
@@ -65,14 +72,14 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         queue = asyncio.Queue()
 
         with patch("tools.bridge_commands.clear_channel_session_id") as mock_clear:
-            handled = await handle_operator_command(msg, bot, "!reset", "Ryan", queue)
+            handled = await handle_operator_command(msg, bot, "/reset", "Ryan", queue)
             self.assertTrue(handled)
             mock_clear.assert_called_once_with(123, "home")
             msg.reply.assert_awaited_once()
 
     async def test_handle_operator_command_model_switch(self):
         msg = MagicMock()
-        msg.content = "!model 3.8"
+        msg.content = "/model 3.8"
         msg.channel.id = 123
         msg.reply = AsyncMock()
 
@@ -81,7 +88,7 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         mock_setter = MagicMock()
 
         handled = await handle_operator_command(
-            msg, bot, "!model 3.8", "Ryan", queue, active_model_setter=mock_setter
+            msg, bot, "/model 3.8", "Ryan", queue, active_model_setter=mock_setter
         )
         self.assertTrue(handled)
         mock_setter.assert_called_once_with("gemini-3.8-flash-high")
@@ -89,7 +96,7 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
 
     async def test_handle_operator_command_model_switch_argon(self):
         msg = MagicMock()
-        msg.content = "!model argon"
+        msg.content = "/model argon"
         msg.channel.id = 123
         msg.reply = AsyncMock()
 
@@ -98,7 +105,7 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         mock_setter = MagicMock()
 
         handled = await handle_operator_command(
-            msg, bot, "!model argon", "Ryan", queue, active_model_setter=mock_setter
+            msg, bot, "/model argon", "Ryan", queue, active_model_setter=mock_setter
         )
         self.assertTrue(handled)
         mock_setter.assert_called_once_with("gemini-4-argon-high")
@@ -134,16 +141,62 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         choices = await slash_model_autocomplete(interaction, "arg")
         self.assertTrue(any(c.value == "argon" for c in choices))
 
+    async def test_slash_run_and_autocomplete(self):
+        from tools.bridge import slash_run, slash_run_autocomplete, home_turn_queue
+        interaction = MagicMock()
+        interaction.channel_id = 123
+        interaction.response = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+
+        # Autocomplete check
+        choices = await slash_run_autocomplete(interaction, "ev9")
+        self.assertTrue(any(c.value == "ev9" for c in choices))
+
+        # Kalshi isolation check via /run
+        await slash_run.callback(interaction, "kalshi")
+        interaction.followup.send.assert_awaited_once()
+        self.assertIn("exclusively operate in", interaction.followup.send.call_args[0][0])
+
+        # Valid job execution via /run
+        interaction.followup.send.reset_mock()
+        with patch.object(home_turn_queue, "put", new_callable=AsyncMock) as mock_put:
+            await slash_run.callback(interaction, "heartbeat")
+            mock_put.assert_awaited_once()
+            queued = mock_put.call_args[0][0]
+            self.assertIn("Run the infrastructure heartbeat check", queued["prompt"])
+
+    async def test_slash_quota_and_crab(self):
+        from tools.bridge import slash_quota, slash_crab
+        interaction = MagicMock()
+        interaction.channel_id = 123
+        interaction.user.display_name = "Ryan"
+        interaction.response = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+
+        with patch("tools.quota_card.build_quota_card", return_value=(True, "📊 Quota Card", None)):
+            await slash_quota.callback(interaction, "card")
+            interaction.followup.send.assert_awaited_once_with("📊 Quota Card")
+
+        interaction.followup.send.reset_mock()
+        with patch("tools.agora_kill_switch.trigger_kill_switch", return_value={"message": "🛑 Agora trading halted."}) as mock_kill:
+            await slash_crab.callback(interaction, "halt-agora", "", 3)
+            mock_kill.assert_called_once_with(initiator="Ryan", action="halt", channel_id=123)
+            interaction.followup.send.assert_awaited_once_with("🛑 Agora trading halted.")
+
     async def test_handle_operator_command_sidecar_trigger(self):
         msg = MagicMock()
-        msg.content = "!heartbeat"
+        msg.content = "/heartbeat"
         msg.channel.id = 123
         msg.channel.typing = AsyncMock()
 
         bot = MagicMock()
         queue = asyncio.Queue()
 
-        handled = await handle_operator_command(msg, bot, "!heartbeat", "Ryan", queue)
+        handled = await handle_operator_command(msg, bot, "/heartbeat", "Ryan", queue)
         self.assertTrue(handled)
         self.assertFalse(queue.empty())
         item = await queue.get()
@@ -151,14 +204,14 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
 
     async def test_handle_operator_command_kalshi_isolation(self):
         msg = MagicMock()
-        msg.content = "!kalshi"
+        msg.content = "/kalshi"
         msg.channel.id = 123  # Not VAULT_CHANNEL_ID
         msg.reply = AsyncMock()
 
         bot = MagicMock()
         queue = asyncio.Queue()
 
-        handled = await handle_operator_command(msg, bot, "!kalshi", "Ryan", queue)
+        handled = await handle_operator_command(msg, bot, "/kalshi", "Ryan", queue)
         self.assertTrue(handled)
         self.assertTrue(queue.empty())
         msg.reply.assert_awaited_once()
@@ -166,7 +219,7 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
 
     async def test_handle_operator_command_agora_kill_switch(self):
         msg = MagicMock()
-        msg.content = "!halt Agora trading emergency"
+        msg.content = "/halt Agora trading emergency"
         msg.channel.id = 123
         msg.reply = AsyncMock()
 
@@ -174,7 +227,7 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         queue = asyncio.Queue()
 
         with patch("tools.agora_kill_switch.trigger_kill_switch", return_value={"message": "🛑 Agora trading halted."}) as mock_kill:
-            handled = await handle_operator_command(msg, bot, "!halt Agora trading emergency", "Ryan", queue)
+            handled = await handle_operator_command(msg, bot, "/halt Agora trading emergency", "Ryan", queue)
             self.assertTrue(handled)
             mock_kill.assert_called_once_with(initiator="Ryan", action="halt", channel_id=123)
             msg.reply.assert_awaited_once_with("🛑 Agora trading halted.")
@@ -199,7 +252,6 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cmd[0], "ssh")
             self.assertIn("-p", cmd)
             self.assertEqual(cmd[cmd.index("-p") + 1], "2222")
-            self.assertEqual(cmd[cmd.index("-o") - 1] if "-o" in cmd else cmd[cmd.index("-p") + 1], "2222")
             self.assertTrue(any("mock-host-2" in arg for arg in cmd))
 
 

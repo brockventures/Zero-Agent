@@ -283,7 +283,10 @@ def audit_sidecars(verbose: bool = False, check_orphans: bool = True) -> tuple[b
         trigger_match = None
         candidates = [jid, sidecar_act]
         if jid:
-            candidates.extend(jid.split("_"))
+            parts = jid.split("_")
+            candidates.extend(parts)
+            if len(parts) >= 2:
+                candidates.extend([f"{parts[i]}_{parts[j]}" for i in range(len(parts)) for j in range(i + 1, len(parts))])
             if "reminder" in jid:
                 candidates.extend(["reminders", "birthdays", "birthday"])
             if "digest" in jid:
@@ -291,15 +294,18 @@ def audit_sidecars(verbose: bool = False, check_orphans: bool = True) -> tuple[b
             if "log" in jid:
                 candidates.extend(["logs", "nas_logs"])
         if script_path:
+            stem_parts = script_path.stem.split("_")
             candidates.append(script_path.stem)
-            candidates.extend(script_path.stem.split("_"))
+            candidates.extend(stem_parts)
+            if len(stem_parts) >= 2:
+                candidates.extend([f"{stem_parts[i]}_{stem_parts[j]}" for i in range(len(stem_parts)) for j in range(i + 1, len(stem_parts))])
 
         for candidate in candidates:
             if candidate and candidate in bridge_triggers:
                 trigger_match = candidate
                 break
         if not trigger_match and enabled and prompt != "[INTERNAL_SESSION_ROLLOVER]" and stype != "one_shot":
-            warnings.append(f"No on-demand !<action> trigger mapped in tools/bridge_handlers.py (e.g. !{sidecar_act or jid})")
+            warnings.append(f"No on-demand /<action> trigger mapped in tools/bridge_commands.py (e.g. /{sidecar_act or jid})")
 
         # 7. Execution Freshness & Staleness Check
         if enabled:

@@ -6,12 +6,13 @@ Core Responsibilities:
 2. Bridge Lifecycle: Clean in-place reload (execv) and detached container restart over SSH.
 3. Operator Interventions: Bot pause/unpause (Last Word Protocol), Agora kill switch,
    BananaWatcher daemon control, session resets, and active model switching.
-4. On-Demand Sidecar Triggers: Mapping and execution of 60+ operational slash/bang commands.
+4. On-Demand Sidecar Triggers: Mapping and execution of canonical operational slash commands.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -95,163 +96,65 @@ MODEL_ALIASES: dict[str, str] = {
     "gpt-oss": "gpt-oss-120b-medium",
 }
 
+# Canonical On-Demand Jobs Registry (powers `/run <job>` autocomplete and sidecar_audit.py AST verification)
 ON_DEMAND_TRIGGERS: dict[str, str] = {
-    "!agora_pm": "Run the Agora Roguelike PM board assessment using /workspace/tools/agora_roguelike_pm.py.",
     "/agora_pm": "Run the Agora Roguelike PM board assessment using /workspace/tools/agora_roguelike_pm.py.",
-    "!agora_roguelike_pm": "Run the Agora Roguelike PM board assessment using /workspace/tools/agora_roguelike_pm.py.",
-    "/agora_roguelike_pm": "Run the Agora Roguelike PM board assessment using /workspace/tools/agora_roguelike_pm.py.",
-    "!agora_eng": "Run the Agora Roguelike engineering readiness check using /workspace/tools/agora_roguelike_engineer.py.",
     "/agora_eng": "Run the Agora Roguelike engineering readiness check using /workspace/tools/agora_roguelike_engineer.py.",
-    "!agora_roguelike_engineer": "Run the Agora Roguelike engineering readiness check using /workspace/tools/agora_roguelike_engineer.py.",
-    "/agora_roguelike_engineer": "Run the Agora Roguelike engineering readiness check using /workspace/tools/agora_roguelike_engineer.py.",
-    "!heartbeat": "Run the infrastructure heartbeat check using /workspace/tools/sidecars.py heartbeat. Report the status cleanly.",
     "/heartbeat": "Run the infrastructure heartbeat check using /workspace/tools/sidecars.py heartbeat. Report the status cleanly.",
-    "!triage": "Run the nightly agenda & inbox triage briefing using /workspace/tools/sidecars.py triage. Present tomorrow's calendar agenda and priority unread emails.",
     "/triage": "Run the nightly agenda & inbox triage briefing using /workspace/tools/sidecars.py triage. Present tomorrow's calendar agenda and priority unread emails.",
-    "!logs": "Run the autonomous NAS log review and triage using /workspace/tools/nas_log_triage.py. If issues are found, investigate root causes, apply safe code/config fixes autonomously, and present one-click options for any needed approvals. If clean, report the crisp one-liner.",
     "/logs": "Run the autonomous NAS log review and triage using /workspace/tools/nas_log_triage.py. If issues are found, investigate root causes, apply safe code/config fixes autonomously, and present one-click options for any needed approvals. If clean, report the crisp one-liner.",
-    "!plex": "Run the Plex transcode cache cleanup using /workspace/tools/sidecars.py plex. Report status.",
     "/plex": "Run the Plex transcode cache cleanup using /workspace/tools/sidecars.py plex. Report status.",
-    "!reminders": "Check dated one-shot reminders using /workspace/tools/sidecars.py reminders. Report any due reminders.",
     "/reminders": "Check dated one-shot reminders using /workspace/tools/sidecars.py reminders. Report any due reminders.",
-    "!ev9": "Run the Kia EV9 listing monitor using /workspace/tools/sidecars.py ev9 --force. Display the latest listings digest.",
     "/ev9": "Run the Kia EV9 listing monitor using /workspace/tools/sidecars.py ev9 --force. Display the latest listings digest.",
-    "!marketing": "Run the promotional email marketing sweep using /workspace/tools/sidecars.py marketing.",
     "/marketing": "Run the promotional email marketing sweep using /workspace/tools/sidecars.py marketing.",
-    "!doctor": "Run the memory store audit pass using /workspace/tools/sidecars.py doctor.",
     "/doctor": "Run the memory store audit pass using /workspace/tools/sidecars.py doctor.",
-    "!digest": "Generate and post the Option B Weekly Proactive Digest using /workspace/tools/weekly_digest.py. Present upcoming maintenance, 30-day renewals, and cash-flow deltas cleanly.",
     "/digest": "Generate and post the Option B Weekly Proactive Digest using /workspace/tools/weekly_digest.py. Present upcoming maintenance, 30-day renewals, and cash-flow deltas cleanly.",
-    "!tasks": "Show active projects and tasks using /workspace/tools/task_manager.py summary.",
     "/tasks": "Show active projects and tasks using /workspace/tools/task_manager.py summary.",
-    "!tasks-sync": "Run two-way task sync with Google Tasks using /workspace/tools/sidecars.py tasks_sync. Report any changes cleanly.",
     "/tasks-sync": "Run two-way task sync with Google Tasks using /workspace/tools/sidecars.py tasks_sync. Report any changes cleanly.",
-    "!projects": "Show active projects and tasks using /workspace/tools/task_manager.py summary.",
-    "/projects": "Show active projects and tasks using /workspace/tools/task_manager.py summary.",
-    "!schedule": "Show the current sidecar schedule using /workspace/tools/scheduler_tool.py summary.",
     "/schedule": "Show the current sidecar schedule using /workspace/tools/scheduler_tool.py summary.",
-        "!pid_watchdog": "Run the PID and process headroom watchdog check using /workspace/tools/sidecars.py pid_watchdog --test. Report findings cleanly.",
     "/pid_watchdog": "Run the PID and process headroom watchdog check using /workspace/tools/sidecars.py pid_watchdog --test. Report findings cleanly.",
-    "!pids": "Run the PID and process headroom watchdog check using /workspace/tools/sidecars.py pid_watchdog --test. Report findings cleanly.",
-    "!arr_queue": "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly.",
     "/arr_queue": "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly.",
-    "!queue": "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly.",
-    "/queue": "Run the Arr queue watchdog check using /workspace/tools/sidecars.py arr_queue --force. Report findings and auto-remediations cleanly.",
-    "!reauth": "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth --force. Report status.",
     "/reauth": "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth --force. Report status.",
-    "!nest_lock": "Run the Nest lock & Homebridge self-healing watchdog check using /workspace/tools/sidecars.py nest_lock --force. Report status.",
     "/nest_lock": "Run the Nest lock & Homebridge self-healing watchdog check using /workspace/tools/sidecars.py nest_lock --force. Report status.",
-    "!lock_heal": "Run the Nest lock & Homebridge self-healing watchdog check using /workspace/tools/sidecars.py nest_lock --force. Report status.",
-    "/lock_heal": "Run the Nest lock & Homebridge self-healing watchdog check using /workspace/tools/sidecars.py nest_lock --force. Report status.",
-    "!prowlarr": "Run the Prowlarr indexer health check using /workspace/tools/sidecars.py prowlarr --force. Report status.",
     "/prowlarr": "Run the Prowlarr indexer health check using /workspace/tools/sidecars.py prowlarr --force. Report status.",
-    "!sabnzbd": "Run the SABnzbd downloader check using /workspace/tools/sidecars.py sabnzbd --force. Report status.",
     "/sabnzbd": "Run the SABnzbd downloader check using /workspace/tools/sidecars.py sabnzbd --force. Report status.",
-    "!kometa_audit": "Run the Kometa post-run log audit using /workspace/tools/sidecars.py kometa_audit --force. Report status.",
     "/kometa_audit": "Run the Kometa post-run log audit using /workspace/tools/sidecars.py kometa_audit --force. Report status.",
-    "!cubs": "Check the Chicago Cubs game schedule using /workspace/tools/sidecars.py cubs --test. Present matchup, start time, and streaming options.",
     "/cubs": "Check the Chicago Cubs game schedule using /workspace/tools/sidecars.py cubs --test. Present matchup, start time, and streaming options.",
-    "!actual_sync": "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
     "/actual_sync": "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
-    "!sync_finances": "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
-    "/sync_finances": "Run automated Actual Budget bank sync using /workspace/tools/sidecars.py actual_sync. Silent sidecar (silent execution on routine sync, alert only on MFA reauth or failure).",
-    "!sweep": "Run monthly cash sweep policy evaluation using /workspace/tools/sidecars.py cash_sweep. Post liquid reserve status and recommended sweep amount to #finances.",
-    "/sweep": "Run monthly cash sweep policy evaluation using /workspace/tools/sidecars.py cash_sweep. Post liquid reserve status and recommended sweep amount to #finances.",
-    "!cash_sweep": "Run monthly cash sweep policy evaluation using /workspace/tools/sidecars.py cash_sweep. Post liquid reserve status and recommended sweep amount to #finances.",
     "/cash_sweep": "Run monthly cash sweep policy evaluation using /workspace/tools/sidecars.py cash_sweep. Post liquid reserve status and recommended sweep amount to #finances.",
-    "!variance": "Run monthly financial model variance evaluation using /workspace/tools/sidecars.py variance_digest. Post actuals vs model comparison to #finances.",
     "/variance": "Run monthly financial model variance evaluation using /workspace/tools/sidecars.py variance_digest. Post actuals vs model comparison to #finances.",
-    "!budget_audit": "Run monthly financial model variance evaluation using /workspace/tools/sidecars.py variance_digest. Post actuals vs model comparison to #finances.",
-    "/budget_audit": "Run monthly financial model variance evaluation using /workspace/tools/sidecars.py variance_digest. Post actuals vs model comparison to #finances.",
-        "!tokenbudget": "Run daily token budget watchdog evaluation using /workspace/tools/sidecars.py token_budget_watchdog --dispatch --force.",
     "/tokenbudget": "Run daily token budget watchdog evaluation using /workspace/tools/sidecars.py token_budget_watchdog --dispatch --force.",
-    "!tokenwatchdog": "Run daily token budget watchdog evaluation using /workspace/tools/sidecars.py token_budget_watchdog --dispatch --force.",
-    "/tokenwatchdog": "Run daily token budget watchdog evaluation using /workspace/tools/sidecars.py token_budget_watchdog --dispatch --force.",
-    "!reddit_scan": "Run the Reddit fantasy baseball scanner using /workspace/tools/sidecars.py reddit_fantasy --post-discord.",
     "/reddit_scan": "Run the Reddit fantasy baseball scanner using /workspace/tools/sidecars.py reddit_fantasy --post-discord.",
-    "!reddit": "Run the Reddit fantasy baseball scanner using /workspace/tools/sidecars.py reddit_fantasy --post-discord.",
-    "/reddit": "Run the Reddit fantasy baseball scanner using /workspace/tools/sidecars.py reddit_fantasy --post-discord.",
-    "!personal_sync": "Run the personal data and gaming profile sync using /workspace/tools/sidecars.py personal_data_sync. Report updated stats cleanly.",
-    "/personal_sync": "Run the personal data and gaming profile sync using /workspace/tools/sidecars.py personal_data_sync. Report updated stats cleanly.",
-    "!personal_data_sync": "Run the personal data and gaming profile sync using /workspace/tools/sidecars.py personal_data_sync. Report updated stats cleanly.",
     "/personal_data_sync": "Run the personal data and gaming profile sync using /workspace/tools/sidecars.py personal_data_sync. Report updated stats cleanly.",
-"!sidecars": "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status.",
     "/sidecars": "Show recent sidecar execution health and failures using /workspace/tools/sidecars.py status.",
-    "!mcp": "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status.",
     "/mcp": "Show persistent MCP daemon status and endpoint health using /workspace/tools/mcp_daemon.py status.",
-    "!mail": "Show inbound email listener status using /workspace/tools/zero_mail_listener.py status.",
     "/mail": "Show inbound email listener status using /workspace/tools/zero_mail_listener.py status.",
-    "!morning": "Run the Crab Cavern morning rotation dispatcher using /workspace/tools/morning_dispatcher.py --dispatch.",
     "/morning": "Run the Crab Cavern morning rotation dispatcher using /workspace/tools/morning_dispatcher.py --dispatch.",
-    "!birthdays": "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py. Post any birthdays.",
     "/birthdays": "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py. Post any birthdays.",
-    "!standup": "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch.",
     "/standup": "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch.",
-    "!market_standup": "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch.",
-    "/market_standup": "Run the Market Sandbox autonomous daily standup using /workspace/tools/market_standup.py --dispatch.",
-    "!steering": "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch.",
     "/steering": "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch.",
-    "!agora_steering": "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch.",
-    "/agora_steering": "Run the daily AGORA Steering meeting briefing using /workspace/tools/agora_steering.py --dispatch.",
-    "!agora_roadmap_sprint": "Run the autonomous Agora roadmap worker using python3 /workspace/tools/agora_autoworker.py. Advance the next pending Station Agora roadmap subtask on the public board, implement and verify code and tests, and report progress.",
     "/agora_roadmap_sprint": "Run the autonomous Agora roadmap worker using python3 /workspace/tools/agora_autoworker.py. Advance the next pending Station Agora roadmap subtask on the public board, implement and verify code and tests, and report progress.",
-    "!sideproject": "Execute the autonomous Side-Project Engineering Sprint for Highball and Outpost in #side-project. DO NOT simply run a status script or report static health: check channel history and tasks, pull repos fresh, pick the top open task, write and test code, push to main, restart the service, and report verified receipts tagging Amos (<@1468012353206354197>).",
     "/sideproject": "Execute the autonomous Side-Project Engineering Sprint for Highball and Outpost in #side-project. DO NOT simply run a status script or report static health: check channel history and tasks, pull repos fresh, pick the top open task, write and test code, push to main, restart the service, and report verified receipts tagging Amos (<@1468012353206354197>).",
-    "!sideproject_watcher": "Execute the autonomous Side-Project Engineering Sprint for Highball and Outpost in #side-project. DO NOT simply run a status script or report static health: check channel history and tasks, pull repos fresh, pick the top open task, write and test code, push to main, restart the service, and report verified receipts tagging Amos (<@1468012353206354197>).",
-    "/sideproject_watcher": "Execute the autonomous Side-Project Engineering Sprint for Highball and Outpost in #side-project. DO NOT simply run a status script or report static health: check channel history and tasks, pull repos fresh, pick the top open task, write and test code, push to main, restart the service, and report verified receipts tagging Amos (<@1468012353206354197>).",
-    "!code_audit": "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics.",
     "/code_audit": "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics.",
-    "!hardcode_audit": "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics.",
-    "/hardcode_audit": "Run the monthly hardcoded rule & regex audit using /workspace/tools/sidecars.py code_audit. Present findings and architectural recommendations for eliminating brittle heuristics.",
-    "!weekly_social_last_seen_review": "Review the past week's social events, calendar, and text messages using /workspace/tools/social_last_seen_review.py.",
-    "/weekly_social_last_seen_review": "Review the past week's social events, calendar, and text messages using /workspace/tools/social_last_seen_review.py.",
-    "!social_review": "Review the past week's social events, calendar, and text messages using /workspace/tools/social_last_seen_review.py.",
     "/social_review": "Review the past week's social events, calendar, and text messages using /workspace/tools/social_last_seen_review.py.",
-    "!monthly_core_friends_reconnect": "Check for local Core friends we have not seen in at least 8 weeks using /workspace/tools/core_friends_reminder.py.",
-    "/monthly_core_friends_reconnect": "Check for local Core friends we have not seen in at least 8 weeks using /workspace/tools/core_friends_reminder.py.",
-    "!core_friends": "Check for local Core friends we have not seen in at least 8 weeks using /workspace/tools/core_friends_reminder.py.",
     "/core_friends": "Check for local Core friends we have not seen in at least 8 weeks using /workspace/tools/core_friends_reminder.py.",
-    "!antigravity_check": "Check for Antigravity CLI updates using /workspace/tools/update_antigravity.py.",
     "/antigravity_check": "Check for Antigravity CLI updates using /workspace/tools/update_antigravity.py.",
-    "!ha_battery_check": "Run the Home Assistant IoT battery watchdog check using /workspace/tools/ha_battery_check.py.",
     "/ha_battery_check": "Run the Home Assistant IoT battery watchdog check using /workspace/tools/ha_battery_check.py.",
-    "!ha_anomaly_check": "Run the Home Assistant statistical telemetry anomaly check using /workspace/tools/ha_anomaly_detector.py.",
     "/ha_anomaly_check": "Run the Home Assistant statistical telemetry anomaly check using /workspace/tools/ha_anomaly_detector.py.",
-    "!nas_storage_check": "Run the Synology storage & array health check using /workspace/tools/nas_storage_check.py.",
     "/nas_storage_check": "Run the Synology storage & array health check using /workspace/tools/nas_storage_check.py.",
-    "!ha_update_check": "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py.",
     "/ha_update_check": "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py.",
-    "!dockhand_update": "Run the Dockhand container image check using /workspace/tools/dockhand_update.py.",
     "/dockhand_update": "Run the Dockhand container image check using /workspace/tools/dockhand_update.py.",
-    "!backup_host2": "Run the Host 2 local USB backup using /workspace/tools/sidecars.py backup_host2.",
     "/backup_host2": "Run the Host 2 local USB backup using /workspace/tools/sidecars.py backup_host2.",
-    "!backup_host1": "Run the Host 1 local USB backup using /workspace/tools/sidecars.py backup_host1.",
     "/backup_host1": "Run the Host 1 local USB backup using /workspace/tools/sidecars.py backup_host1.",
-    "!meals": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Tuesday, Thursday, and Sunday nights with interactive swap buttons.",
     "/meals": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Tuesday, Thursday, and Sunday nights with interactive swap buttons.",
-    "!mealplan": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Tuesday, Thursday, and Sunday nights with interactive swap buttons.",
-    "/mealplan": "Run the weekly 3-dinner meal proposal using /workspace/tools/sidecars.py meal_proposal. Propose the 3 dinners for Tuesday, Thursday, and Sunday nights with interactive swap buttons.",
-    "!grocery": "Run the weekly Whole Foods grocery staging using /workspace/tools/sidecars.py grocery_staging. Ingest pending items from Home Assistant ('todo.shopping_list') and due recurring staples, then post the 1-click cart link.",
     "/grocery": "Run the weekly Whole Foods grocery staging using /workspace/tools/sidecars.py grocery_staging. Ingest pending items from Home Assistant ('todo.shopping_list') and due recurring staples, then post the 1-click cart link.",
-    "!kalshi": "Run the Kalshi weather quant paper bot using /workspace/tools/sidecars.py kalshi. Settle resolved contracts, scan live order books against NOAA models, execute positive-EV trades, and report the portfolio status.",
     "/kalshi": "Run the Kalshi weather quant paper bot using /workspace/tools/sidecars.py kalshi. Settle resolved contracts, scan live order books against NOAA models, execute positive-EV trades, and report the portfolio status.",
-    "!kalshi_review": "Run the Kalshi paper trading evening settlement, performance review, and task board sync using /workspace/tools/sidecars.py kalshi_review.",
     "/kalshi_review": "Run the Kalshi paper trading evening settlement, performance review, and task board sync using /workspace/tools/sidecars.py kalshi_review.",
-    "!kalshi_audit": "Run the Kalshi nightly settlement, Brier calibration audit, and GitHub board sync using /workspace/tools/sidecars.py kalshi_audit.",
     "/kalshi_audit": "Run the Kalshi nightly settlement, Brier calibration audit, and GitHub board sync using /workspace/tools/sidecars.py kalshi_audit.",
-    "!kalshi_sprint": "Run the 5-minute autonomous Kalshi task board sprint cycle using /workspace/tools/sidecars.py kalshi_sprint.",
-    "!quota": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
+    "/kalshi_sprint": "Run the 5-minute autonomous Kalshi task board sprint cycle using /workspace/tools/sidecars.py kalshi_sprint.",
     "/quota": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
-    "!quota_poller": "Poll ground-truth quota usage snapshots using /workspace/tools/sidecars.py quota_poller.",
     "/quota_poller": "Poll ground-truth quota usage snapshots using /workspace/tools/sidecars.py quota_poller.",
-    "!quota_poll": "Poll ground-truth quota usage snapshots using /workspace/tools/sidecars.py quota_poller.",
-    "/quota_poll": "Poll ground-truth quota usage snapshots using /workspace/tools/sidecars.py quota_poller.",
-    "!daily_quota_card": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
-    "/daily_quota_card": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
-    "!context_digest": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest.",
     "/context_digest": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest.",
-    "!gemini_context_digest": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest.",
-    "/gemini_context_digest": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest.",
 }
 
 
@@ -551,7 +454,7 @@ async def handle_operator_command(
         return True
 
     # Handle session reset commands
-    if content.lower().strip() in ("!reset", "/reset", "!new", "/new"):
+    if content.lower().strip() in ("/reset", "/new"):
         sess_key = "home" if (msg.channel.id == TARGET_CHANNEL_ID) else str(msg.channel.id)
         clear_channel_session_id(msg.channel.id, "home")
         br.reset_session_keys.discard(sess_key)
@@ -567,7 +470,7 @@ async def handle_operator_command(
 
     # Operator command: pause / unpause responses to a bot (default: #lounge)
     pause_match = re.search(
-        r"^(?:!pause|/pause|pause\s+responses?\s+to|pause\s+responding\s+to|pause)\s+([a-zA-Z0-9_-]+)(?:\s+(?:for\s+)?(\d+)\s*(?:m|min|mins|minutes)?)?(?:\s+(?:in\s+)?(?:channel\s+)?([a-zA-Z0-9_-]+))?$",
+        r"^(?:/pause|pause\s+responses?\s+to|pause\s+responding\s+to|pause)\s+([a-zA-Z0-9_-]+)(?:\s+(?:for\s+)?(\d+)\s*(?:m|min|mins|minutes)?)?(?:\s+(?:in\s+)?(?:channel\s+)?([a-zA-Z0-9_-]+))?$",
         content,
         re.IGNORECASE,
     )
@@ -593,7 +496,7 @@ async def handle_operator_command(
         return True
 
     unpause_match = re.search(
-        r"^(?:!unpause|/unpause|resume\s+responses?\s+to|resume\s+responding\s+to|unpause)\s+([a-zA-Z0-9_-]+)(?:\s+(?:in\s+)?(?:channel\s+)?([a-zA-Z0-9_-]+))?$",
+        r"^(?:/unpause|resume\s+responses?\s+to|resume\s+responding\s+to|unpause)\s+([a-zA-Z0-9_-]+)(?:\s+(?:in\s+)?(?:channel\s+)?([a-zA-Z0-9_-]+))?$",
         content,
         re.IGNORECASE,
     )
@@ -616,7 +519,7 @@ async def handle_operator_command(
 
     # Operator command: silence / unsilence Crab Cavern
     crab_match = re.search(
-        r"^(?:!silence_crab|/silence_crab|!mute_crab|/mute_crab|silence\s+crab(?:\s+cavern)?|mute\s+crab(?:\s+cavern)?)\b(?:\s+(.*))?$",
+        r"^(?:/silence_crab|/mute_crab|silence\s+crab(?:\s+cavern)?|mute\s+crab(?:\s+cavern)?)\b(?:\s+(.*))?$",
         content.strip(),
         re.IGNORECASE,
     )
@@ -630,7 +533,7 @@ async def handle_operator_command(
         try:
             until_dt = parse_silence_until(crab_match.group(1))
         except Exception:
-            await msg.reply("⚠️ Couldn't parse that. Use `!silence_crab`, `!silence_crab 6h`, `!silence_crab tomorrow 8pm`, or `!silence_crab 2026-10-13 20:00`.")
+            await msg.reply("⚠️ Couldn't parse that. Use `/crab silence`, `/crab silence 6h`, or `/crab silence tomorrow 8pm`.")
             return True
         rules_data["crab_cavern_silenced_until"] = until_dt.isoformat()
         rules_data["crab_cavern_silence_reason"] = f"Operator command from {author_name}"
@@ -640,7 +543,7 @@ async def handle_operator_command(
         return True
 
     crab_un_match = re.search(
-        r"^(?:!unsilence_crab|/unsilence_crab|!unmute_crab|/unmute_crab|unsilence\s+crab(?:\s+cavern)?|unmute\s+crab(?:\s+cavern)?|resume\s+crab(?:\s+cavern)?)$",
+        r"^(?:/unsilence_crab|/unmute_crab|unsilence\s+crab(?:\s+cavern)?|unmute\s+crab(?:\s+cavern)?|resume\s+crab(?:\s+cavern)?)$",
         content.strip(),
         re.IGNORECASE,
     )
@@ -658,7 +561,7 @@ async def handle_operator_command(
         return True
 
     crab_status_match = re.search(
-        r"^(?:!crab_status|/crab_status|crab\s+status)$",
+        r"^(?:/crab_status|crab\s+status)$",
         content.strip(),
         re.IGNORECASE,
     )
@@ -671,15 +574,15 @@ async def handle_operator_command(
             await msg.reply("🔊 **Crab Cavern Status:** Active (not silenced).")
         return True
 
-    # Operator emergency kill switch: !halt / !resume for Station Agora trading
-    agora_halt_match = re.search(r"^(?:!halt|/halt|!stop|/stop)(?:\s+(.*))?$", content.strip(), re.IGNORECASE)
+    # Operator emergency kill switch: /halt / /resume for Station Agora trading
+    agora_halt_match = re.search(r"^(?:/halt|/stop)(?:\s+(.*))?$", content.strip(), re.IGNORECASE)
     if agora_halt_match:
         from tools.agora_kill_switch import trigger_kill_switch
         res = trigger_kill_switch(initiator=author_name, action="halt", channel_id=msg.channel.id)
         await msg.reply(res["message"])
         return True
 
-    agora_resume_match = re.search(r"^(?:!resume|/resume|!start|/start)(?:\s+(.*))?$", content.strip(), re.IGNORECASE)
+    agora_resume_match = re.search(r"^(?:/resume|/start)(?:\s+(.*))?$", content.strip(), re.IGNORECASE)
     if agora_resume_match:
         from tools.agora_kill_switch import trigger_kill_switch
         res = trigger_kill_switch(initiator=author_name, action="resume", channel_id=msg.channel.id)
@@ -700,7 +603,7 @@ async def handle_operator_command(
         return True
 
     # Handle BananaWatcher commands
-    if content.lower().startswith("!bananawatcher") or content.lower().startswith("!banana-watcher") or content.lower().startswith("/bananawatcher"):
+    if content.lower().startswith("/bananawatcher"):
         from tools.banana_watcher import check_channel_and_evaluate, get_daemon_status, load_state, start_daemon, stop_daemon
         parts = content.split(maxsplit=1)
         subcmd = parts[1].strip().lower() if len(parts) > 1 else "status"
@@ -742,7 +645,7 @@ async def handle_operator_command(
         return True
 
     # Handle model query & switching commands
-    if content.lower().startswith("!model") or content.lower().startswith("/model"):
+    if content.lower().startswith("/model"):
         current_model = active_model_getter() if active_model_getter else get_active_model()
         parts = content.split(maxsplit=1)
         if len(parts) == 1:
@@ -761,7 +664,7 @@ async def handle_operator_command(
                 help_lines.append("*Shortcuts:* `argon`, `argon-med`, `argon-low`, `flash`, `3.8-low`, `sonnet`, `sonnet-medium`, `opus`, `gpt`")
             else:
                 help_lines.append("⚠️ Could not fetch the live model list from the CLI. Try again in a moment.")
-            help_lines.append("*Switch with:* `!model <name>` | *Set fallback with:* `!model fallback <name>`")
+            help_lines.append("*Switch with:* `/model <name>` | *Set fallback with:* `/model fallback <name>`")
             await msg.reply("\n".join(help_lines))
             return True
 
@@ -775,7 +678,7 @@ async def handle_operator_command(
         is_fallback_cmd = target_m.lower().split()[0] == "fallback"
         name = target_m.split(maxsplit=1)[1].strip() if is_fallback_cmd and len(target_m.split(maxsplit=1)) > 1 else ("" if is_fallback_cmd else target_m)
         if is_fallback_cmd and not name:
-            await msg.reply(f"🛟 Fallback model is `{get_fallback_model(available)}`. Set it with `!model fallback <name>`.")
+            await msg.reply(f"🛟 Fallback model is `{get_fallback_model(available)}`. Set it with `/model fallback <name>`.")
             return True
 
         resolved = resolve_model(name, available)
@@ -804,7 +707,7 @@ async def handle_operator_command(
         return True
 
     # Handle Zero Live Voice (Gemini Multimodal Live API) commands
-    if content.lower().startswith("!voice") or content.lower().startswith("/voice"):
+    if content.lower().startswith("/voice"):
         from tools.bridge_voice import ZERO_VOICE_CHANNEL_ID, get_voice_manager
         parts = content.split()
         subcmd = parts[1].lower() if len(parts) > 1 else "join"
@@ -821,7 +724,7 @@ async def handle_operator_command(
             else:
                 await msg.reply(
                     f"🔇 **Zero Live Voice is idle.**\n"
-                    f"- Hop into <#{ZERO_VOICE_CHANNEL_ID}> (auto-joins) or run `!voice join`."
+                    f"- Hop into <#{ZERO_VOICE_CHANNEL_ID}> (auto-joins) or run `/voice join`."
                 )
             return True
 
@@ -865,21 +768,21 @@ async def handle_operator_command(
     cmd_key = content.lower().split()[0] if content else ""
 
     # Instant zero-token Gemini Weekly Quota progress bar card
-    if cmd_key in ("/quota", "!quota", "/usage", "!usage", "/daily_quota_card", "!daily_quota_card"):
+    if cmd_key in ("/quota", "/usage", "/daily_quota_card"):
         from tools.quota_card import build_quota_card
         ok, card, _ = await asyncio.to_thread(build_quota_card)
         await msg.reply(card)
         return True
 
     # Instant Zero & Ivy Daily Context Digest email dispatch & auto-archive
-    if cmd_key in ("/context_digest", "!context_digest", "/gemini_context_digest", "!gemini_context_digest", "/email_digest", "!email_digest"):
+    if cmd_key in ("/context_digest", "/gemini_context_digest", "/email_digest"):
         from tools.gemini_context_digest import run_daily_context_digest
         ok, rep, _ = await asyncio.to_thread(run_daily_context_digest)
         await msg.reply(f"📨 {rep}" if ok else rep)
         return True
 
     # Instant zero-token Quota Poller / Attribution command
-    if cmd_key in ("/quota_poller", "!quota_poller", "/quota_poll", "!quota_poll", "/poller_quota"):
+    if cmd_key in ("/quota_poller", "/quota_poll", "/poller_quota"):
         from tools.quota_poller import (
             run_quota_poller,
             get_latest_quota,
@@ -899,7 +802,7 @@ async def handle_operator_command(
         return True
 
     # On-Demand Thread Rename Command
-    if is_thread_channel and cmd_key in ("/title", "!title", "/rename", "!rename"):
+    if is_thread_channel and cmd_key in ("/title", "/rename"):
         new_name = content[len(cmd_key):].strip()
         if new_name:
             if not new_name.startswith("🧵"):
@@ -915,7 +818,7 @@ async def handle_operator_command(
 
     if cmd_key in ON_DEMAND_TRIGGERS:
         # Strictly isolate Kalshi quant trading commands to #vault
-        if cmd_key in ("/kalshi", "!kalshi", "/kalshi_review", "!kalshi_review", "/kalshi_audit", "!kalshi_audit", "/kalshi_sprint", "!kalshi_sprint"):
+        if cmd_key in ("/kalshi", "/kalshi_review", "/kalshi_audit", "/kalshi_sprint"):
             if getattr(msg.channel, "id", None) != VAULT_CHANNEL_ID:
                 await msg.reply(f"🔒 *Kalshi quant trading operations and sidecars exclusively operate in <#{VAULT_CHANNEL_ID}>.*")
                 return True
