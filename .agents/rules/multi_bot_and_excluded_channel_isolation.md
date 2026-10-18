@@ -1,8 +1,14 @@
+---
+trigger: model_decision
+description: >-
+  Apply whenever operating in or discussing #baseball, Ivy (discord-ivy-agent), excluded channels, or bot-to-bot addressing on Brock Guild.
+---
+
 # Multi-Bot & Excluded Channel Isolation Invariant
 
 ## 1. Territory Exclusivity & Channel Boundaries
 - **`#baseball` (`1548196929308065893`) is Exclusively Owned by Ivy:**
-  - Ivy (`discord-ivy-agent`, Bot ID `1541205716948353074`) is the dedicated Assistant General Manager / Front-Office AI.
+  - Ivy (**I**nstant **V**aluation **Y**eeter — `discord-ivy-agent`, Bot ID `1541205716948353074`) is the dedicated Assistant General Manager / Front-Office AI.
   - `#baseball` is dedicated strictly to Ivy's operations: sabermetric modeling, FanGraphs ingestion, Big Board Pro, dynasty valuations, and 1-on-1 collaboration with Ryan Brock.
   - Zero has zero jurisdiction in `#baseball`. Zero must never monitor, interject, summarize, or react in `#baseball` under normal operations.
 
@@ -13,9 +19,9 @@
 - **Dedicated Excluded Channel Quarantine (`#baseball`):**
   - Ivy (`1541205716948353074`) is permitted to communicate directly with Zero strictly via:
     1. Direct snowflake mentions: `<@1542285964213358633>` or `<@!1542285964213358633>` (or `@Zero`).
-    2. Native Discord inline replies (`msg.reference` resolving to a message authored by Zero).
+    2. Automated Discord inline replies (`msg.reference`) from Ivy are dropped at the front door to prevent automated message-chaining loops.
   - Passive chatter, vocatives ("Zero."), and unaddressed chatter from Ivy are dropped at the front door.
-  - Cross-bot interaction is strictly governed by the **Last Word Protocol** (4-message threshold between Zero and Ivy without human intervention, triggering a concluding turn and a 3-minute cooldown) and a **4-second cascade cooldown**.
+  - Cross-bot interaction is strictly governed by the **Last Word Protocol** (10-message threshold between Zero and Ivy without human intervention, triggering a concluding turn and a 3-minute cooldown) and a **4-second cascade cooldown**.
   - Any human message from Ryan Brock in `#baseball` immediately unpauses Ivy and resets the streak.
 
 ## 3. Excluded Channel Front-Door Quarantine
@@ -23,7 +29,8 @@
   - In any excluded channel (`DEFAULT_EXCLUDED_HOME_CHANNELS` / `is_excluded_channel(msg.channel)`):
     1. Any message from any bot OTHER than Ivy is dropped immediately.
     2. Any message from any human OTHER than Ryan Brock (`OWNER_USER_ID: 179407724335988736`) is dropped immediately.
-    3. Zero responds ONLY if explicitly tagged (`<@1542285964213358633>`, `<@!1542285964213358633>`, or `@zero\b`) OR if the message is a direct inline reply to Zero (`is_reply_to_zero`).
+    3. Zero responds to Ivy ONLY if explicitly tagged (`<@1542285964213358633>`, `<@!1542285964213358633>`, or `@zero\b`).
+    4. Zero responds to Ryan Brock if explicitly tagged OR if Ryan uses a direct inline reply to Zero (`is_reply_to_zero`).
 - **Lexical / Vocative Immunity:**
   - Excluded channels are completely immune to vocative parsing (`zero:`), sentence-starter matches (`Zero <verb>`), and compound terms (`zero-leakage`, `zero-shot`, `zero-sum`).
 
