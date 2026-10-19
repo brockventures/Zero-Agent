@@ -725,6 +725,21 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] 10-Minute quota poller execution error: {e}")
         return
 
+    # Weekly Personal Data & Gaming Profile Sync: silent unless degraded/error
+    if job_id == "personal_data_sync" or "personal_data_sync" in prompt or "sidecars.py personal_sync" in prompt or job_name == "Weekly Personal Data & Gaming Profile Sync":
+        try:
+            from tools.personal_data_sync import run_personal_data_sync
+            ok, out, _ = await _run_sidecar_job_async("personal_data_sync", "Weekly Personal Data & Gaming Profile Sync", run_personal_data_sync, quiet=True)
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await _send_chunked_content(ch, out)
+            else:
+                print(f"[Scheduler] Personal data sync completed silently: ok={ok}")
+        except Exception as e:
+            print(f"[Scheduler] Personal data sync execution error: {e}")
+        return
+
     # Daily birthday reminder: silent execution unless someone has a birthday today
     if job_id == "daily_birthday_reminder" or "birthday_reminder.py" in prompt or job_name in ("Daily Birthday Reminder", "Birthday Reminder") or "sidecars.py birthdays" in prompt:
         try:
@@ -1037,7 +1052,7 @@ def should_run_job(job: dict, now_ts: float) -> tuple[bool, str]:
         min_period = 86400 * 0.7
         double_run_guard = (last_run >= next_ts - 300)
     elif stype == "weekly":
-        min_period = 86400  # 24h guard: prevents same-day double runs without blocking scheduled runs after weekend tests
+        min_period = 21600  # 6h guard: prevents same-slot double runs without blocking scheduled morning runs after prior-day manual tests
         double_run_guard = (last_run >= next_ts - 300)
     elif stype == "interval":
         interval = job.get("interval_seconds", 3600)

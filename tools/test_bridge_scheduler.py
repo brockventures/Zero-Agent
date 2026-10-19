@@ -304,6 +304,61 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(should_run)
         self.assertEqual(reason, "on_time")
 
+    async def test_should_run_job_weekly_not_blocked_by_prior_day_manual_run(self):
+        # Saturday 12:31 PM PT manual test run: 15.5 hours before Sunday 4:00 AM PT slot
+        sunday_4am_slot_ts = 1792302000.0
+        saturday_manual_ts = sunday_4am_slot_ts - int(15.5 * 3600)
+
+        status_file = bs.DATA_DIR / "sidecar_status.json"
+        with open(status_file, "w") as f:
+            json.dump({
+                "personal_data_sync": {
+                    "job_id": "personal_data_sync",
+                    "timestamp_epoch": int(saturday_manual_ts),
+                    "status": "warning"
+                }
+            }, f)
+
+        job = {
+            "id": "personal_data_sync",
+            "name": "Weekly Personal Data & Gaming Profile Sync",
+            "enabled": True,
+            "schedule_type": "weekly",
+            "next_run_ts": sunday_4am_slot_ts,
+            "catchup_if_missed": True
+        }
+        should_run, reason = bshed.should_run_job(job, sunday_4am_slot_ts)
+        self.assertTrue(should_run)
+        self.assertEqual(reason, "on_time")
+
+    async def test_get_sidecar_health_summary_excludes_stale_active_failures(self):
+        import time as _time
+        from tools import sidecars
+        status_file = bs.DATA_DIR / "sidecar_status.json"
+        now_epoch = int(_time.time())
+        with open(status_file, "w") as f:
+            json.dump({
+                "old_weekly_job": {
+                    "job_id": "old_weekly_job",
+                    "name": "Old Weekly Job",
+                    "timestamp_epoch": now_epoch - int(35 * 3600),  # 35h ago (>24h window)
+                    "status": "warning",
+                    "summary": "Stale warning from 35h ago"
+                },
+                "recent_job": {
+                    "job_id": "recent_job",
+                    "name": "Recent Job",
+                    "timestamp_epoch": now_epoch - int(2 * 3600),  # 2h ago (<24h window)
+                    "status": "warning",
+                    "summary": "Recent warning from 2h ago"
+                }
+            }, f)
+        with patch.object(sidecars, "EXECUTION_STATUS_FILE", status_file):
+            summary = sidecars.get_sidecar_health_summary(since_hours=24.0)
+        active_ids = [f["job_id"] for f in summary["active_failures"]]
+        self.assertNotIn("old_weekly_job", active_ids)
+        self.assertIn("recent_job", active_ids)
+
     async def test_nas_logs_dispatch_targets_homelab_channel(self):
         bshed.LAST_SCHEDULED_DISPATCH.clear()
         mock_bot = MagicMock()

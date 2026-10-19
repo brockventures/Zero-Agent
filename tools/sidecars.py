@@ -366,9 +366,11 @@ def get_sidecar_health_summary(since_hours: float = 24.0) -> dict:
         except Exception:
             latest_map = {}
 
+    cutoff = (time.time() - (since_hours * 3600)) if since_hours is not None else 0
     active_failures = [
         entry for entry in latest_map.values()
         if entry.get("status") in ("warning", "error")
+        and entry.get("timestamp_epoch", 0) >= cutoff
     ]
 
     # STALENESS AUDIT: Check for enabled jobs that have missed their execution cadence
