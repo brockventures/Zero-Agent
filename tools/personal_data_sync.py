@@ -438,7 +438,10 @@ def sync_pocketcasts_profile() -> tuple[bool, str]:
                 creds["refreshToken"] = login_data["refreshToken"]
             creds["token"] = token
             if pc_path.exists():
-                pc_path.write_text(json.dumps(creds, indent=2), encoding="utf-8")
+                try:
+                    pc_path.write_text(json.dumps(creds, indent=2), encoding="utf-8")
+                except OSError:
+                    pass
 
     headers = {
         "Authorization": f"Bearer {token}",
