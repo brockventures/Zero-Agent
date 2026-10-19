@@ -165,7 +165,7 @@ def _setup_blender_studio_and_render(
         pivot.location = (0.0, 0.0, center_z)
 
         cam_data = bpy.data.cameras.new("TurntableCam")
-        cam_data.lens = 55.0
+        cam_data.lens = 45.0
         cam_data.clip_start = max_dim * 0.01
         cam_data.clip_end = max_dim * 50.0
         cam_obj = bpy.data.objects.new("TurntableCam", cam_data)
@@ -173,10 +173,10 @@ def _setup_blender_studio_and_render(
         scene.camera = cam_obj
         cam_obj.parent = pivot
 
-        # Compute framing radius so the model fills ~75% of the frame regardless of aspect ratio
+        # Compute framing radius with comfortable margin around the model & ground shadow
         xy_radius = math.hypot(ext_x, ext_y) * 0.5
-        bounding_radius = max(xy_radius * 1.15, ext_z * 0.58)
-        cam_dist = bounding_radius * 2.55
+        bounding_radius = max(xy_radius * 1.25, ext_z * 0.65)
+        cam_dist = bounding_radius * 3.65
         elev_rad = math.radians(elev)
         cam_y = -cam_dist * math.cos(elev_rad)
         cam_z = cam_dist * math.sin(elev_rad)
