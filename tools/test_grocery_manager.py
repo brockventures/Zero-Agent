@@ -66,6 +66,13 @@ class TestAfxRetailNormalization:
     def test_bread_normalizes_to_butterbread(self):
         assert normalize_ingredient_name("sara lee artesano bakery bread") == "Nature's Own Butterbread, Non-GMO Bread, Sandwich Bread, 20 oz Loaf"
 
+    def test_eggs_and_mandarins_normalize_cleanly_for_afx(self):
+        assert normalize_ingredient_name("eggs") == "large brown eggs"
+        assert normalize_ingredient_name("large brown grade a eggs") == "large brown eggs"
+        assert normalize_ingredient_name("mandarin oranges") == "clementines"
+        assert normalize_ingredient_name("cuties") == "clementines"
+
+
 
 class TestQuantityWarningsAndCostco:
     def test_detects_multi_count_canned_goods(self):
@@ -96,3 +103,10 @@ class TestQuantityWarningsAndCostco:
         assert len(warnings) == 1
         assert "1 lb pack" in warnings[0]
         assert "surplus" in warnings[0]
+
+    def test_identifies_costco_recipe_by_tag_or_name(self):
+        from tools.grocery_manager import is_costco_recipe
+        assert is_costco_recipe({"name": "Costco Crispy Skillet Carnitas", "tags": ["Quick"]}) is True
+        assert is_costco_recipe({"name": "15-Minute Pesto Salmon", "tags": ["Costco-Hack", "Seafood"]}) is True
+        assert is_costco_recipe({"name": "Caramelized Shallot Pasta", "tags": ["NYT Cooking"]}) is False
+

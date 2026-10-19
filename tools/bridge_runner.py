@@ -67,7 +67,20 @@ active_master_fd = None
 active_proc = None
 ext_active_proc = None
 ext_active_master_fd = None
-from tools.bridge_engine import TurnCoordinator, channel_active_procs, channel_active_prompts, steering_channels
+from tools.bridge_engine import (
+    TurnCoordinator,
+    channel_active_procs,
+    channel_active_prompts,
+    channel_active_presence,
+    steering_channels,
+    GENERAL_ACTIVITY_VERBS,
+    CHANNEL_ACTIVITY_VERBS,
+    resolve_channel_label,
+    pick_activity_verb,
+    format_active_presence_text,
+    register_active_presence,
+    unregister_active_presence,
+)
 reset_session_keys = PersistentSessionKeySet(get_reset_session_keys())    # session keys (persisted to disk) to reset on next turn
 thread_active_tasks = {}     # thread_id -> asyncio.Task
 
@@ -271,8 +284,8 @@ async def execute_agy_turn(
         if mode == "home":
             update_beacon("PROCESSING", prompt, channel_id=channel_id)
 
-        ch_title = getattr(reply_target.channel, "name", "") if (reply_target and hasattr(reply_target, "channel")) else ""
-        turn_text = f"Crunching in #{ch_title}..." if ch_title else "Processing task..."
+        ch_title = resolve_channel_label(reply_target, fallback_name=ch_name_label)
+        turn_text = register_active_presence(channel_id, ch_title)
 
         output_chunks = []
         auth_detected = False

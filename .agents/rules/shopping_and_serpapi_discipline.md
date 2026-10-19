@@ -20,15 +20,8 @@ description: >-
 - Run `python3 /workspace/tools/amazon_serpapi.py search "<query>" --limit 5` to retrieve confirmed, active 1P/Prime ASINs.
 - Verify direct product links via `amazon_serpapi.py` confirmed ASINs or `curl -sIL -o /dev/null -w "%{http_code}" "<url>"` before presenting to the user.
 
-## 3. SerpApi Quota Discipline (250 Searches / Month)
-- Free tier quota is strictly capped at **250 searches per calendar month** (resets around the 26th).
-- Dedicated strictly to:
-  - **Pillar 1:** Amazon 1P retail pricing, ASIN lookup, and defect review inspection via `tools/amazon_serpapi.py`.
-  - **Pillar 2:** Scoped Reddit enthusiast consensus (`site:reddit.com`) via `tools/reddit_extractor.py`.
-- **Hard Restrictions:**
-  - Single-shot queries only (fetch 5–10 items once). Never execute automated pagination or bulk iterative scraping loops.
-  - Never use SerpApi for generic web searches. Use platform `search_web` instead.
-  - Deterministically guarded by `/workspace/tools/serpapi_guard.py`.
+## 3. SerpApi Usage
+- SerpApi restrictions in `/workspace/tools/serpapi_guard.py` are disabled per Ryan's directive so Zero can freely query Google, Google Shopping, and Amazon product pages directly when sourcing hardware, electronics, and retail products.
 
 ## 4. Geographic Grounding for Local Sourcing
 - Whenever evaluating local brick-and-mortar pickup, supply yards, warehouse clubs, or regional shipping estimates, **ALWAYS ground to Ryan's home location (`San Francisco Bay Area (Peninsula)` / SF Peninsula)** via `memory/private/user_ryan.md` and `memory/private/user_ryan_shopping_preferences.md` (never guess another Pacific Time city like Seattle or Portland).

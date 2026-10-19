@@ -279,26 +279,36 @@ def parse_raw_ingredient(raw_text: str) -> list[dict]:
     return results
 
 
-def extract_active_meal_plan_items() -> tuple[list[dict], list[str], list[dict]]:
+def is_costco_recipe(rec: dict) -> bool:
+    """Checks if a recipe is a Costco meal (via 'Costco-Hack' tag or 'Costco' title prefix)."""
+    r_name = rec.get("name", "").strip().lower()
+    if r_name.startswith("costco"):
+        return True
+    tags = [t.strip().lower() for t in rec.get("tags", []) if isinstance(t, str)]
+    return any("costco" in t for t in tags)
+
+
+def extract_active_meal_plan_items() -> tuple[list[dict], list[str], list[dict], list[str]]:
     """Reads /workspace/data/active_meal_plan.json and extracts recipe ingredients,
-    returning (raw_items, recipes_loaded, meal_breakdowns)."""
+    returning (wf_raw_items, recipes_loaded, meal_breakdowns, costco_recipe_items)."""
     plan_file = WORKSPACE / "data" / "active_meal_plan.json"
     if not plan_file.exists():
-        return [], [], []
+        return [], [], [], []
     try:
         with open(plan_file, "r") as f:
             plan = json.load(f)
     except Exception:
-        return [], [], []
+        return [], [], [], []
 
     meals = plan.get("meals", {})
     if not meals:
-        return [], [], []
+        return [], [], [], []
 
     pantry_exclusions = load_pantry_exclusions()
     raw_items = []
     recipes_loaded = []
     meal_breakdowns = []
+    costco_recipe_items = []
 
     for slot, data in meals.items():
         rec = data.get("recipe", {})
@@ -306,6 +316,7 @@ def extract_active_meal_plan_items() -> tuple[list[dict], list[str], list[dict]]
         r_slug = rec.get("slug", "")
         day_str = data.get("date_display") or data.get("day_name") or slot.title()
         url = f"https://mealie.brock.ventures/g/home/r/{r_slug}" if r_slug else "https://mealie.brock.ventures/household/mealplan/planner/"
+        costco_meal = is_costco_recipe(rec)
 
         recipes_loaded.append(r_name)
         meal_cart_items = []
@@ -314,12 +325,22 @@ def extract_active_meal_plan_items() -> tuple[list[dict], list[str], list[dict]]
             parsed = parse_raw_ingredient(line)
             items_to_check = parsed if isinstance(parsed, list) else ([parsed] if parsed else [])
             for it in items_to_check:
-                raw_items.append(it)
                 raw_name = it.get("name", "").strip()
                 if not raw_name:
                     continue
-                # If not pantry item, add to meal's cart items breakdown
-                if not (it.get("is_pantry") or is_pantry_item(raw_name, pantry_exclusions)):
+                if it.get("is_pantry") or is_pantry_item(raw_name, pantry_exclusions):
+                    # Keep pantry items in raw_items so compile_cart catalogs them into assumed_in_stock
+                    raw_items.append(it)
+                    continue
+
+                if costco_meal:
+                    clean_costco_name = raw_name[0].upper() + raw_name[1:] if raw_name else raw_name
+                    if clean_costco_name not in meal_cart_items:
+                        meal_cart_items.append(clean_costco_name)
+                    if not any(clean_costco_name.lower() == c.lower() for c in costco_recipe_items):
+                        costco_recipe_items.append(clean_costco_name)
+                else:
+                    raw_items.append(it)
                     norm_disp = it.get("search_query") or normalize_ingredient_name(raw_name)
                     clean_item_name = norm_disp.title()
                     if clean_item_name not in meal_cart_items:
@@ -330,10 +351,11 @@ def extract_active_meal_plan_items() -> tuple[list[dict], list[str], list[dict]]
             "slug": r_slug,
             "day": day_str,
             "url": url,
+            "store": "costco" if costco_meal else "whole_foods",
             "items": meal_cart_items
         })
 
-    return raw_items, recipes_loaded, meal_breakdowns
+    return raw_items, recipes_loaded, meal_breakdowns, costco_recipe_items
 
 
 def generate_quantity_warnings(staged_items: list[dict], manifest: list[dict]) -> list[str]:
@@ -387,9 +409,30 @@ def generate_quantity_warnings(staged_items: list[dict], manifest: list[dict]) -
     return unique
 
 
-def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan: bool = True, complete_tasks: bool = False) -> dict:
+def sync_costco_tasks(items_to_ensure: list[str]) -> list[str]:
+    """Ensures all Costco items are present on the '🛒 Costco' Google Tasks list without duplicating."""
+    if not items_to_ensure:
+        return []
+    try:
+        from tools.google_tasks_grocery import get_pending_groceries, add_grocery_item
+        existing = get_pending_groceries(title="🛒 Costco")
+        existing_titles = {t.get("title", "").strip().lower() for t in existing if t.get("title")}
+        added = []
+        for item in items_to_ensure:
+            clean = item.strip()
+            if clean and clean.lower() not in existing_titles:
+                add_grocery_item(clean, list_title="🛒 Costco")
+                existing_titles.add(clean.lower())
+                added.append(clean)
+        return added
+    except Exception as e:
+        print(f"[GroceryManager] Note: Could not sync Costco tasks: {e}", file=sys.stderr)
+        return []
+
+
+def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan: bool = True, complete_tasks: bool = False, sync_costco_list: bool = True) -> dict:
     """Ingests pending items from Home Assistant todo.shopping_list + active meal plan recipes + due staples,
-    filters pantry exclusions, and compiles a 1-click AFX URL with quantity mismatch and Costco alerts."""
+    filters pantry exclusions, routes Costco recipes to '🛒 Costco' Google Tasks list, and compiles a 1-click AFX URL."""
     try:
         from tools.google_tasks_grocery import get_pending_groceries, complete_task
     except ImportError:
@@ -399,11 +442,14 @@ def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan:
     staged_items = []
     task_records = []
     recipes_included = []
+    costco_recipe_items = []
 
     # 1. Fetch ingredients from active meal plan (if present)
     meal_breakdowns = []
     if include_meal_plan:
-        meal_items, recipes_included, meal_breakdowns = extract_active_meal_plan_items()
+        extracted = extract_active_meal_plan_items()
+        meal_items, recipes_included, meal_breakdowns = extracted[0], extracted[1], extracted[2]
+        costco_recipe_items = extracted[3] if len(extracted) > 3 else []
         staged_items.extend(meal_items)
     task_records = []
     
@@ -435,6 +481,12 @@ def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan:
     # 2. Add due staples & collect Costco items
     due = []
     costco_items = []
+    for cr_item in costco_recipe_items:
+        costco_items.append(cr_item)
+
+    if sync_costco_list and costco_recipe_items:
+        sync_costco_tasks(costco_recipe_items)
+
     due_wf_count = 0
     if include_due_staples:
         due = get_due_staples()
@@ -449,16 +501,17 @@ def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan:
                 due_wf_count += 1
             elif store == "costco":
                 cadence_info = f"Due — {s.get('cadence_days')}d cadence"
-                costco_items.append(f"{s['name']} ({cadence_info})")
+                if not any(s["name"].lower() in c.lower() for c in costco_items):
+                    costco_items.append(f"{s['name']} ({cadence_info})")
 
     # Also check Google Tasks '🛒 Costco' list
     try:
         costco_tasks = get_pending_groceries(title="🛒 Costco")
         for ct in costco_tasks:
             t_title = ct.get("title", "").strip()
-            if t_title and not any(t_title.lower() in c.lower() for c in costco_items):
-                costco_items.append(f"{t_title} (from Google Tasks)")
-    except Exception as e:
+            if t_title and not any(t_title.lower() in c.lower() or c.lower() in t_title.lower() for c in costco_items):
+                costco_items.append(f"{t_title} (from Costco Task List)")
+    except Exception:
         pass
 
     # 3. Compile cart

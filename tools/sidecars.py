@@ -245,7 +245,7 @@ def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> 
     now_pt = datetime.now(timezone.utc).astimezone(ZoneInfo("America/Los_Angeles"))
     is_quiet_hours = (now_pt.hour >= 23 or now_pt.hour < 7)
     AGORA_QUIET_JOBS = {
-        "agora_roguelike_pm", "agora_roguelike_engineer", "agora_pm", "agora_engineer", "agora_sprint"
+        "agora_roguelike_pm", "agora_roguelike_engineer", "agora_pm", "agora_engineer", "agora_sprint", "gotchi_sprint", "gotchi"
     }
     force_run = kwargs.get("force", False) or "--force" in sys.argv
     if is_quiet_hours and job_id in AGORA_QUIET_JOBS and not force_run:
@@ -1400,10 +1400,12 @@ def run_weekly_grocery_staging() -> tuple[bool, str]:
                 m_url = mb["url"]
                 m_day = mb.get("day", "")
                 m_items = mb.get("items", [])
+                m_store = mb.get("store", "whole_foods")
                 day_prefix = f" ({m_day})" if m_day else ""
                 lines.append(f"- [**{m_name}**](<{m_url}>){day_prefix}:")
                 if m_items:
-                    lines.append(f"  - *Cart Items:* {', '.join(m_items)}")
+                    label = "Costco Task List Items" if m_store == "costco" else "Whole Foods Cart Items"
+                    lines.append(f"  - *{label}:* {', '.join(m_items)}")
                 else:
                     lines.append("  - *Cart Items:* *(All ingredients in stock)*")
         elif rec_names:
@@ -1477,6 +1479,18 @@ def run_agora_roguelike_pm(dispatch: bool = False, channel: str | int | None = N
     if out == "(nominal - board state unchanged)":
         return res.returncode == 0, "", {"nominal": True}
     return res.returncode == 0, out, None
+
+
+def run_gotchi_sprint(force: bool = False, test: bool = False, *args, **kwargs) -> tuple[bool, str, dict]:
+    """Execute autonomous 15-minute software sprint cycle for GOTCHI (brockventures/gotchi)."""
+    try:
+        from tools.gotchi_sprint import execute_sprint_cycle, format_sprint_report
+        data = execute_sprint_cycle(force=force, test=test)
+        report = format_sprint_report(data)
+        ok = data.get("status") in ("success", "skipped")
+        return ok, report, data
+    except Exception as e:
+        return False, f"⚠️ Gotchi software sprint sidecar failed: {e}", {"error": str(e)}
 
 
 def run_agora_roguelike_engineer():
@@ -1881,6 +1895,12 @@ if __name__ == "__main__":
             print(rep)
         else:
             print("(nominal - board state unchanged)")
+    elif action in ("gotchi_sprint", "gotchi"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("gotchi_sprint", "GOTCHI Software Sprint Coordinator", run_gotchi_sprint, force=force, test=test)
+        if rep:
+            print(rep)
     elif action in ("agora_roguelike_engineer", "agora_engineer", "agora_eng"):
         ok, rep, _ = run_sidecar_job("agora_roguelike_engineer", "Agora Roguelike Engineering Execution", run_agora_roguelike_engineer)
         if rep:

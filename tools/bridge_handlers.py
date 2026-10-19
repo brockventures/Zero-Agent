@@ -224,6 +224,12 @@ async def apply_bot_presence(bot: discord.Client, custom_activity: str = None, s
     try:
         if not bot or not bot.is_ready():
             return
+        if custom_activity is None:
+            from tools.bridge_engine import format_active_presence_text
+            active_text = format_active_presence_text()
+            if active_text:
+                custom_activity = active_text
+                status_override = status_override or "dnd"
         if custom_activity is not None:
             activity = discord.CustomActivity(name=custom_activity[:128])
             st = discord.Status.dnd if status_override == "dnd" else (

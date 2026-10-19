@@ -41,7 +41,7 @@ from tools.nas_config import HOST_1_IP
 
 DEFAULT_VM_URL = os.environ.get("VICTORIAMETRICS_URL", f"http://{HOST_1_IP}:8428")
 HEAL_STATE_FILE = Path("/workspace/data/ha_anomaly_heal_state.json")
-HEAL_COOLDOWN_SECONDS = 24 * 3600
+HEAL_COOLDOWN_SECONDS = 23 * 3600
 
 # Device classes monitored by the statistical engines
 MONITORED_CLASSES = {"temperature", "humidity", "carbon_dioxide", "power"}
@@ -129,15 +129,28 @@ def compute_mad_score(values: list[float], current_value: float, device_class: s
     return z_score, med, mad
 
 
-def compute_overdue_threshold_hours(timestamps_sec: list[float], default_max_hours: float = 24.0) -> float:
+def compute_overdue_threshold_hours(
+    timestamps_sec: list[float],
+    default_max_hours: float = 24.0,
+    values: list[float] | None = None,
+) -> float:
     """Compute dynamic cadence overdue threshold in hours from historical state change intervals."""
-    if len(timestamps_sec) < 6:
+    if values is not None and len(values) == len(timestamps_sec) and len(values) >= 2:
+        paired = sorted(zip(timestamps_sec, values), key=lambda x: x[0])
+        change_ts = [paired[0][0]]
+        last_val = paired[0][1]
+        for ts, val in paired[1:]:
+            if abs(val - last_val) > 1e-4:
+                change_ts.append(ts)
+                last_val = val
+    else:
+        change_ts = sorted(timestamps_sec)
+    if len(change_ts) < 5:
         return default_max_hours
-    ordered = sorted(timestamps_sec)
     deltas_h = [
-        (ordered[i] - ordered[i - 1]) / 3600.0
-        for i in range(1, len(ordered))
-        if (ordered[i] - ordered[i - 1]) > 10.0
+        (change_ts[i] - change_ts[i - 1]) / 3600.0
+        for i in range(1, len(change_ts))
+        if (change_ts[i] - change_ts[i - 1]) > 10.0
     ]
     if len(deltas_h) < 4:
         return default_max_hours
@@ -503,7 +516,7 @@ def analyze_anomalies(
         # 1. Zombie / Flatlined Sensor Cadence Check
         is_idle_power = (dc == "power" and cur_val <= 5.0)
         if not is_idle_power:
-            thresh_h = compute_overdue_threshold_hours(ts_list, default_max_hours=stale_hours)
+            thresh_h = compute_overdue_threshold_hours(ts_list, default_max_hours=stale_hours, values=vals)
             if age_h >= thresh_h:
                 heal_res = None
                 if auto_heal:

@@ -172,3 +172,20 @@ def test_query_vm_history_filters_metadata_and_converts_celsius(monkeypatch):
     assert vals == [68.0, 77.0]
     assert ts == [1700000000.0, 1700000900.0]
 
+
+def test_compute_overdue_threshold_hours_filters_uniform_vm_grid():
+    from tools.ha_anomaly_detector import compute_overdue_threshold_hours
+
+    # Simulate a 7-day uniform 15-min (900s) VM grid where a quantized sensor only shifts every ~12-30h
+    change_hours = [0.0, 1.0, 12.5, 20.0, 43.75, 75.25]
+    ts_list = [1700000000.0 + i * 900.0 for i in range(400)]
+    vals = []
+    for t in ts_list:
+        elapsed_h = (t - 1700000000.0) / 3600.0
+        idx = sum(1 for ch in change_hours if elapsed_h >= ch)
+        vals.append(66.0 + idx * 0.5)
+
+    thresh = compute_overdue_threshold_hours(ts_list, default_max_hours=24.0, values=vals)
+    assert thresh > 48.0
+
+

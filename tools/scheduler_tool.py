@@ -386,6 +386,18 @@ DEFAULT_JOBS = [
         "quiet_hours": [23, 7]
     },
     {
+        "id": "gotchi_sprint",
+        "name": "GOTCHI Software Sprint Coordinator",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 900,
+        "channel_id": 1561509863018856468,
+        "prompt": "Run the GOTCHI software sprint cycle using python3 /workspace/tools/sidecars.py gotchi_sprint --force. Execute the next open software issue on brockventures/gotchi or output [NO_REPLY] when idle.",
+        "catchup_if_missed": False,
+        "quiet_hours": [23, 7],
+        "model_override": "gemini-4-argon-medium"
+    },
+    {
         "id": "agora_roguelike_engineer",
         "name": "Agora Roguelike Engineering Execution",
         "enabled": False,
@@ -667,6 +679,7 @@ SIDECAR_ALIASES = {
     "monthly_variance_digest": ["monthly_variance_digest", "variance_digest", "variance"],
     "agora_roguelike_pm": ["agora_roguelike_pm", "agora_pm"],
     "agora_roguelike_engineer": ["agora_roguelike_engineer", "agora_eng", "agora_engineer"],
+    "gotchi_sprint": ["gotchi_sprint", "gotchi"],
     "heartbeat_sweep": ["heartbeat", "heartbeat_sweep"],
     "nightly_triage": ["triage", "nightly_triage"],
     "nas_logs": ["nas_logs"],

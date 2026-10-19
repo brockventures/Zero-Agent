@@ -430,7 +430,82 @@ class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
         finally:
             steering_channels.discard(self.coordinator.channel_id)
 
+    def test_dynamic_verb_pool_and_channel_awareness(self):
+        from tools.bridge_engine import (
+            CHANNEL_ACTIVITY_VERBS,
+            GENERAL_ACTIVITY_VERBS,
+            pick_activity_verb,
+        )
+
+        # General channel picks from GENERAL_ACTIVITY_VERBS and avoids immediate repeats
+        prev = None
+        for _ in range(15):
+            v = pick_activity_verb("zero-chat")
+            self.assertIn(v, GENERAL_ACTIVITY_VERBS)
+            if prev is not None:
+                self.assertNotEqual(v, prev)
+            prev = v
+
+        # Channel-aware pool includes specialized verbs (e.g. 3d-print, shopping)
+        allowed_3d = set(CHANNEL_ACTIVITY_VERBS["3d-print"]) | set(GENERAL_ACTIVITY_VERBS)
+        sampled_3d = {pick_activity_verb("3d-print") for _ in range(40)}
+        self.assertTrue(sampled_3d.issubset(allowed_3d))
+        self.assertTrue(sampled_3d & set(CHANNEL_ACTIVITY_VERBS["3d-print"]))
+
+    async def test_multi_channel_active_presence_and_apply_bot_presence(self):
+        import discord
+        from tools.bridge_engine import (
+            channel_active_presence,
+            format_active_presence_text,
+            register_active_presence,
+            unregister_active_presence,
+        )
+        from tools.bridge_handlers import apply_bot_presence
+
+        channel_active_presence.clear()
+        try:
+            # 1. Single channel active
+            t1 = register_active_presence(101, "3d-print", verb="Slicing")
+            self.assertEqual(t1, "Slicing in #3d-print...")
+
+            # 2. Second channel starts concurrently -> combines both with general verb
+            t2 = register_active_presence(102, "homelab", verb="Scheming")
+            self.assertEqual(t2, "Scheming in #3d-print & #homelab...")
+
+            # 3. Third channel starts concurrently -> shows all 3 when compact
+            t3 = register_active_presence(103, "zero-ops", verb="Tinkering")
+            self.assertEqual(t3, "Tinkering in #3d-print, #homelab & #zero-ops...")
+
+            # 4. Fourth channel starts concurrently -> summarizes as +2 more
+            t4 = register_active_presence(104, "shopping", verb="Crunching")
+            self.assertEqual(t4, "Crunching in #3d-print, #homelab +2 more...")
+            self.assertLessEqual(len(t4), 128)
+
+            # 5. Finish channels 104, 103, 102 while 101 (#3d-print) is still running
+            unregister_active_presence(104)
+            unregister_active_presence(103)
+            rem = unregister_active_presence(102)
+            self.assertEqual(rem, "Slicing in #3d-print...")
+
+            # Calling apply_bot_presence(bot) with custom_activity=None while 101 is still active
+            # must preserve DND + "Slicing in #3d-print..." instead of resetting to idle
+            mock_bot = MagicMock()
+            mock_bot.is_ready.return_value = True
+            mock_bot.change_presence = AsyncMock()
+            await apply_bot_presence(mock_bot)
+            mock_bot.change_presence.assert_awaited_once()
+            call_kwargs = mock_bot.change_presence.call_args.kwargs
+            self.assertEqual(call_kwargs["status"], discord.Status.dnd)
+            self.assertEqual(call_kwargs["activity"].name, "Slicing in #3d-print...")
+
+            # 6. Finish last channel -> returns None and restores idle presence
+            self.assertIsNone(unregister_active_presence(101))
+            self.assertIsNone(format_active_presence_text())
+        finally:
+            channel_active_presence.clear()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

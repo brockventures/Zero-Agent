@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 import signal
 import time
@@ -60,6 +61,171 @@ channel_active_prompts: dict[int, str] = {}
 
 # Global steering tracking: channel/thread IDs actively being steered mid-turn
 steering_channels: set[int] = set()
+
+# Global active presence map:
+# channel_id -> {"channel_name": str, "verb": str, "general_verb": str, "started_at": float}
+channel_active_presence: dict[int, dict[str, Any]] = {}
+
+GENERAL_ACTIVITY_VERBS: tuple[str, ...] = (
+    "Crunching",
+    "Scheming",
+    "Tinkering",
+    "Cooking",
+    "Spelunking",
+    "Wrenching",
+    "Dissecting",
+    "Synthesizing",
+    "Overclocking",
+    "Debugging",
+)
+
+CHANNEL_ACTIVITY_VERBS: dict[str, tuple[str, ...]] = {
+    "3d-print": ("Slicing", "Extruding", "Modeling", "Calibrating", "Tinkering"),
+    "shopping": ("Scouting", "Comparing", "Sourcing", "Vetting", "Auditing"),
+    "finances": ("Auditing", "Reconciling", "Modeling", "Analyzing", "Crunching"),
+    "homelab": ("Wrenching", "Routing", "Probing", "Tuning", "Overclocking", "Spelunking"),
+    "home-assistant": ("Automating", "Wiring", "Tuning", "Orchestrating", "Tinkering"),
+    "steam-deck": ("Modding", "Tinkering", "Optimizing", "Overclocking"),
+    "projects": ("Architecting", "Shipping", "Building", "Refactoring", "Synthesizing"),
+    "zero-ops": ("Wrenching", "Orchestrating", "Scheming", "Tinkering", "Dissecting", "Tuning"),
+    "vault": ("Encrypting", "Auditing", "Indexing", "Securing", "Dissecting"),
+    "brock-house": ("Coordinating", "Planning", "Organizing", "Tinkering"),
+    "the-banana-stand": ("Deliberating", "Scheming", "Coordinating", "Arbitrating", "Synthesizing"),
+    "agora": ("Trading", "Hedging", "Arbitraging", "Scheming", "Crunching"),
+    "debug-huddle": ("Debugging", "Dissecting", "Tracing", "Spelunking"),
+    "side-project": ("Prototyping", "Hacking", "Building", "Scheming", "Tinkering"),
+    "mirrormere": ("Pondering", "Reflecting", "Spelunking", "Synthesizing"),
+    "lounge": ("Riffing", "Bantering", "Cooking", "Scheming"),
+}
+
+_last_picked_verb: Optional[str] = None
+
+
+def resolve_channel_label(reply_target: Any = None, fallback_name: str = "") -> str:
+    """Resolve a clean channel display name (without leading '#') from a Discord message, thread, or channel."""
+    ch = None
+    if reply_target is not None:
+        ch_attr = getattr(reply_target, "channel", None)
+        ch = ch_attr if ch_attr is not None else reply_target
+
+    if ch is not None:
+        raw_name = getattr(ch, "name", None)
+        name_str = raw_name.strip() if isinstance(raw_name, str) else ""
+        is_thread_like = isinstance(ch, discord.Thread) or name_str.startswith("🧵")
+        if is_thread_like:
+            parent = getattr(ch, "parent", None)
+            parent_name = getattr(parent, "name", None) if parent is not None else None
+            if isinstance(parent_name, str) and parent_name.strip():
+                return parent_name.strip().lstrip("#").strip()
+        if name_str:
+            cleaned = name_str.lstrip("🧵").lstrip("#").strip()
+            if cleaned:
+                return cleaned
+
+    if isinstance(fallback_name, str) and fallback_name.strip():
+        return fallback_name.strip().lstrip("🧵").lstrip("#").strip()
+    return ""
+
+
+def pick_activity_verb(channel_name: str = "", rng: Any = None) -> str:
+    """Pick a dynamic status verb blending channel-aware verbs with the general Zero verb pool."""
+    global _last_picked_verb
+    chooser = rng if rng is not None else random
+    norm_ch = (channel_name or "").strip().lstrip("#").lower()
+    ch_verbs = CHANNEL_ACTIVITY_VERBS.get(norm_ch)
+
+    if ch_verbs:
+        pool = list(ch_verbs) * 2 + [v for v in GENERAL_ACTIVITY_VERBS if v not in ch_verbs]
+    else:
+        pool = list(GENERAL_ACTIVITY_VERBS)
+
+    filtered = [v for v in pool if v != _last_picked_verb] or pool
+    picked = chooser.choice(filtered)
+    _last_picked_verb = picked
+    return picked
+
+
+def format_active_presence_text(max_len: int = 128) -> Optional[str]:
+    """Format the live Discord custom status string across all currently active channels."""
+    if not channel_active_presence:
+        return None
+
+    ordered = sorted(
+        channel_active_presence.values(),
+        key=lambda item: float(item.get("started_at", 0.0)),
+    )
+
+    unique_channels: list[str] = []
+    for entry in ordered:
+        ch_name = str(entry.get("channel_name") or "").strip().lstrip("#")
+        if ch_name and ch_name not in unique_channels:
+            unique_channels.append(ch_name)
+
+    latest = ordered[-1]
+    single_verb = str(latest.get("verb") or "Crunching")
+    multi_verb = str(
+        latest.get("general_verb")
+        or (single_verb if single_verb in GENERAL_ACTIVITY_VERBS else "Crunching")
+    )
+
+    if not unique_channels:
+        return f"{single_verb} task..."[:max_len]
+
+    if len(unique_channels) == 1:
+        ch_verb = single_verb
+        for entry in reversed(ordered):
+            if str(entry.get("channel_name") or "").strip().lstrip("#") == unique_channels[0]:
+                ch_verb = str(entry.get("verb") or single_verb)
+                break
+        return f"{ch_verb} in #{unique_channels[0]}..."[:max_len]
+
+    if len(unique_channels) == 2:
+        text = f"{multi_verb} in #{unique_channels[0]} & #{unique_channels[1]}..."
+        return text[:max_len]
+
+    if len(unique_channels) == 3:
+        candidate = f"{multi_verb} in #{unique_channels[0]}, #{unique_channels[1]} & #{unique_channels[2]}..."
+        if len(candidate) <= min(64, max_len):
+            return candidate
+
+    extra = len(unique_channels) - 2
+    text = f"{multi_verb} in #{unique_channels[0]}, #{unique_channels[1]} +{extra} more..."
+    if len(text) > max_len:
+        text = f"{multi_verb} in #{unique_channels[0]} +{len(unique_channels) - 1} more..."
+    return text[:max_len]
+
+
+def register_active_presence(
+    channel_id: int,
+    channel_name: str = "",
+    verb: Optional[str] = None,
+    rng: Any = None,
+) -> str:
+    """Register an active turn for a channel and return the formatted multi-channel status text."""
+    clean_name = (channel_name or "").strip().lstrip("#").strip()
+    chosen_verb = verb or pick_activity_verb(clean_name, rng=rng)
+    chooser = rng if rng is not None else random
+    general_verb = (
+        chosen_verb
+        if chosen_verb in GENERAL_ACTIVITY_VERBS
+        else chooser.choice(GENERAL_ACTIVITY_VERBS)
+    )
+    channel_active_presence[int(channel_id)] = {
+        "channel_name": clean_name,
+        "verb": chosen_verb,
+        "general_verb": general_verb,
+        "started_at": time.time(),
+    }
+    return format_active_presence_text() or f"{chosen_verb} task..."
+
+
+def unregister_active_presence(channel_id: int, thread_id: Optional[int] = None) -> Optional[str]:
+    """Unregister a finished turn's channel/thread and return the remaining active status text (or None)."""
+    channel_active_presence.pop(int(channel_id), None)
+    if thread_id is not None:
+        channel_active_presence.pop(int(thread_id), None)
+    return format_active_presence_text()
+
 
 
 @dataclass
@@ -184,6 +350,8 @@ class TurnCoordinator:
                 if self.prompt:
                     channel_active_prompts[self.thread.id] = self.prompt
                     channel_active_prompts.pop(TARGET_CHANNEL_ID, None)
+                if TARGET_CHANNEL_ID in channel_active_presence:
+                    channel_active_presence[self.thread.id] = channel_active_presence.pop(TARGET_CHANNEL_ID)
                 return True
             except Exception as te:
                 print(f"[BridgeEngine] Warning escalating turn to thread: {te}")
@@ -752,14 +920,16 @@ class TurnCoordinator:
         if self.channel_id in channel_active_procs:
             del channel_active_procs[self.channel_id]
         channel_active_prompts.pop(self.channel_id, None)
-        if (
-            self.escalated_to_thread
-            and self.thread
-            and hasattr(self.thread, "id")
-        ):
-            if self.thread.id in channel_active_procs:
-                del channel_active_procs[self.thread.id]
-            channel_active_prompts.pop(self.thread.id, None)
+        thread_id = (
+            getattr(self.thread, "id", None)
+            if (self.escalated_to_thread and self.thread and hasattr(self.thread, "id"))
+            else None
+        )
+        if thread_id is not None:
+            if thread_id in channel_active_procs:
+                del channel_active_procs[thread_id]
+            channel_active_prompts.pop(thread_id, None)
+        unregister_active_presence(self.channel_id, thread_id=thread_id)
 
         if self.mode == "home":
             if br_module and hasattr(br_module, "active_proc"):

@@ -100,6 +100,7 @@ MODEL_ALIASES: dict[str, str] = {
 ON_DEMAND_TRIGGERS: dict[str, str] = {
     "/agora_pm": "Run the Agora Roguelike PM board assessment using /workspace/tools/agora_roguelike_pm.py.",
     "/agora_eng": "Run the Agora Roguelike engineering readiness check using /workspace/tools/agora_roguelike_engineer.py.",
+    "/gotchi_sprint": "Run the GOTCHI software sprint cycle using /workspace/tools/sidecars.py gotchi_sprint --force.",
     "/heartbeat": "Run the infrastructure heartbeat check using /workspace/tools/sidecars.py heartbeat. Report the status cleanly.",
     "/triage": "Run the nightly agenda & inbox triage briefing using /workspace/tools/sidecars.py triage. Present tomorrow's calendar agenda and priority unread emails.",
     "/logs": "Run the autonomous NAS log review and triage using /workspace/tools/nas_log_triage.py. If issues are found, investigate root causes, apply safe code/config fixes autonomously, and present one-click options for any needed approvals. If clean, report the crisp one-liner.",

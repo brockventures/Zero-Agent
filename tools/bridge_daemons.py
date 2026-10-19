@@ -55,7 +55,13 @@ from tools.bridge_formatting import (
     format_agy_error_message,
     is_internal_cli_leak,
 )
-from tools.bridge_engine import TurnCoordinator, channel_active_procs, channel_active_prompts
+from tools.bridge_engine import (
+    TurnCoordinator,
+    channel_active_procs,
+    channel_active_prompts,
+    resolve_channel_label,
+    register_active_presence,
+)
 
 PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "30m")
 
@@ -505,8 +511,8 @@ class PersistentChannelWorker:
             else:
                 br.ext_active_proc = self.proc
 
-            ch_title = getattr(reply_target.channel, "name", "") if (reply_target and hasattr(reply_target, "channel")) else self.name
-            turn_text = f"Crunching in #{ch_title}..." if ch_title else "Processing task..."
+            ch_title = resolve_channel_label(reply_target, fallback_name=self.name)
+            turn_text = register_active_presence(self.channel_id, ch_title)
 
             self.last_agy_error = None
             rules = get_runtime_rules()

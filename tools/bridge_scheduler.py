@@ -826,6 +826,24 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Agora Roguelike PM execution error: {e}")
         return
 
+    # GOTCHI Software Sprint Coordinator: runs every 15m and queues an agent turn when open tasks exist
+    if job_id == "gotchi_sprint" or "gotchi_sprint" in prompt or job_name in ("GOTCHI Software Sprint Coordinator", "Gotchi Software Sprint"):
+        try:
+            from tools.sidecars import run_gotchi_sprint
+            ok, rep, extra = await _run_sidecar_job_async(
+                "gotchi_sprint",
+                "GOTCHI Software Sprint Coordinator",
+                lambda: run_gotchi_sprint(force=False, test=False)
+            )
+            print(f"[Scheduler] GOTCHI Software Sprint completed: ok={ok}")
+            if not ok and rep and bot:
+                ch = await get_dest_channel(default_cid=1561509863018856468)
+                if ch:
+                    await ch.send(f"⚠️ **GOTCHI Software Sprint Failure**:\n```\n{rep}\n```")
+        except Exception as e:
+            print(f"[Scheduler] GOTCHI Software Sprint execution error: {e}")
+        return
+
     # Agora Roguelike Engineering Execution: runs 3m after PM sidecar
     if job_id == "agora_roguelike_engineer" or "agora_roguelike_engineer" in prompt or "agora_engineer" in prompt or job_name in ("Agora Roguelike Engineering Execution", "Agora Roguelike Engineer"):
         try:
