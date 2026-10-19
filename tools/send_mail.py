@@ -71,17 +71,32 @@ def send_email(
     if body is None:
         body = ""
 
+    # Dynamically refresh defaults in case module was imported before /secrets/env.json update
+    default_from, default_cc = DEFAULT_FROM, DEFAULT_CC
+    try:
+        import workspace_mcp
+        if hasattr(workspace_mcp, "_get_email_defaults"):
+            default_from, default_cc = workspace_mcp._get_email_defaults()
+            workspace_mcp.DEFAULT_FROM = default_from
+            workspace_mcp.DEFAULT_CC = default_cc
+    except Exception:
+        pass
+
+    to = to.removeprefix(r"\b").removesuffix(r"\b") if isinstance(to, str) else to
+    if isinstance(from_email, str):
+        from_email = from_email.replace(r"\b", "")
+
     # Enforce Ryan CC policy
-    effective_cc = cc.strip() if cc else ""
-    if DEFAULT_CC and DEFAULT_CC not in effective_cc and DEFAULT_CC not in to:
-        effective_cc = f"{effective_cc}, {DEFAULT_CC}".strip(", ") if effective_cc else DEFAULT_CC
+    effective_cc = cc.replace(r"\b", "").strip() if cc else ""
+    if default_cc and default_cc not in effective_cc and default_cc not in to:
+        effective_cc = f"{effective_cc}, {default_cc}".strip(", ") if effective_cc else default_cc
 
     msg = EmailMessage()
     msg["To"] = to
     if effective_cc:
         msg["Cc"] = effective_cc
     msg["Subject"] = subject
-    msg["From"] = from_email or DEFAULT_FROM
+    msg["From"] = from_email or default_from
     msg.set_content(body)
 
     # Process and attach files

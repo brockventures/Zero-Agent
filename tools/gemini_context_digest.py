@@ -478,6 +478,10 @@ def run_daily_context_digest(
         if dry_run:
             return True, f"Dry-run generated `{subject}` ({len(body)} chars).", {"subject": subject, "chars": len(body)}
 
+        if hasattr(workspace_mcp, "_get_email_defaults"):
+            default_from, default_cc = workspace_mcp._get_email_defaults()
+            workspace_mcp.DEFAULT_FROM = default_from
+            workspace_mcp.DEFAULT_CC = default_cc
         to_addr = getattr(workspace_mcp, "DEFAULT_CC", "") or os.environ.get("ADMIN_CC_EMAIL", "")
         from_addr = getattr(workspace_mcp, "DEFAULT_FROM", "") or os.environ.get("AGENT_FROM_EMAIL", "Zero")
 

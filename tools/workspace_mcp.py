@@ -35,7 +35,11 @@ def _load_env_secrets() -> dict:
     if os.path.exists("/secrets/env.json"):
         try:
             with open("/secrets/env.json", "r", encoding="utf-8") as f:
-                return json.load(f)
+                raw = json.load(f)
+            return {
+                k: (v.removeprefix(r"\b").removesuffix(r"\b") if isinstance(v, str) else v)
+                for k, v in raw.items()
+            }
         except Exception:
             pass
     return {}
@@ -202,8 +206,13 @@ def gmail_get_thread(thread_id: str) -> str:
         return json.dumps({"ok": False, "error": str(e)})
 
 def _get_email_defaults() -> tuple[str, str]:
-    sender = os.environ.get("ZERO_SENDER_EMAIL") or os.environ.get("ZERO_EMAIL") or _ENV_SECRETS.get("ZERO_SENDER_EMAIL", "")
-    notify = os.environ.get("ZERO_NOTIFICATION_EMAIL") or os.environ.get("OWNER_EMAIL") or _ENV_SECRETS.get("ZERO_NOTIFICATION_EMAIL") or _ENV_SECRETS.get("OWNER_EMAIL", "")
+    env_secrets = _load_env_secrets()
+    sender = os.environ.get("ZERO_SENDER_EMAIL") or os.environ.get("ZERO_EMAIL") or env_secrets.get("ZERO_SENDER_EMAIL", "")
+    notify = os.environ.get("ZERO_NOTIFICATION_EMAIL") or os.environ.get("OWNER_EMAIL") or env_secrets.get("ZERO_NOTIFICATION_EMAIL") or env_secrets.get("OWNER_EMAIL", "")
+    if isinstance(sender, str):
+        sender = sender.removeprefix(r"\b").removesuffix(r"\b")
+    if isinstance(notify, str):
+        notify = notify.removeprefix(r"\b").removesuffix(r"\b")
     if not sender or not notify:
         env_path = Path("/workspace/.env")
         if env_path.exists():
