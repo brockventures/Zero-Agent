@@ -680,11 +680,24 @@ class TurnCoordinator:
             "reply: none",
         )
 
+        proc_rc = getattr(proc, "returncode", None) if proc else None
+        is_post_result_sigterm = (
+            (
+                self.result_received_at is not None
+                or self.agent_response_done_at is not None
+                or is_silence
+            )
+            and proc_rc in (-15, 143, 255)
+            and not self.timed_out
+            and not self.wedged_diagnostic
+            and not self.last_agy_error
+        )
+
         has_process_failure = (
             self.timed_out
             or self.wedged_diagnostic
             or self.last_agy_error
-            or (proc and getattr(proc, "returncode", None) not in (0, None))
+            or (proc_rc not in (0, None) and not is_post_result_sigterm)
         )
 
         is_home_turf = is_home_channel(self.channel_id)

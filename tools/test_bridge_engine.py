@@ -303,6 +303,14 @@ class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res, "[NO_REPLY]")
         self.assertFalse(was_harvested)
 
+        # Case 2b: External [NO_REPLY] with post-drain PTY SIGTERM (exit code 255) -> stays [NO_REPLY]
+        proc_sigterm = MagicMock()
+        proc_sigterm.pid = 9814
+        proc_sigterm.returncode = 255
+        res_255, was_harvested_255 = coord_ext.harvest_fallback("[NO_REPLY]", proc=proc_sigterm)
+        self.assertEqual(res_255, "[NO_REPLY]")
+        self.assertFalse(was_harvested_255)
+
         # Case 3: Home empty output with recoverable transcript
         mock_harvest.return_value = "Recovered response text from disk."
         res, was_harvested = self.coordinator.harvest_fallback("")
