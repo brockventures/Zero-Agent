@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
+"""Modal Serverless 3D Turntable Renderer (Powered by Headless Blender 4.2 Cycles).
+
+Renders path-traced 360° studio turntables with 3-point area lighting, ambient occlusion,
+and contact ground shadows on Modal cloud compute so Host 2 takes 0% CPU load.
+"""
+
+import argparse
+import io
+import math
 import os
 import sys
-import argparse
+import tempfile
 import time
 from pathlib import Path
 import modal
@@ -10,150 +19,218 @@ app = modal.App("zero-3d-render-service")
 
 render_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("trimesh", "numpy", "matplotlib", "pillow", "scipy", "fast-simplification")
+    .apt_install(
+        "libx11-6",
+        "libxxf86vm1",
+        "libxfixes3",
+        "libxi6",
+        "libxkbcommon0",
+        "libsm6",
+        "libice6",
+        "libgl1",
+        "libegl1",
+        "libgomp1",
+        "libxrender1",
+    )
+    .pip_install(
+        "bpy==4.2.0",
+        "trimesh",
+        "numpy",
+        "pillow",
+        "scipy",
+        "fast-simplification",
+    )
 )
 
-@app.function(image=render_image, cpu=4, memory=8192, timeout=180)
-def render_cloud_turntable(
+
+def _setup_blender_studio_and_render(
     stl_bytes: bytes,
     target_height_mm: float = 0.0,
     n_frames: int = 24,
-    elev: float = 24.0
-) -> bytes:
-    import io
+    elev: float = 24.0,
+    samples: int = 16,
+    res_x: int = 520,
+    res_y: int = 580,
+) -> tuple[bytes, bytes]:
+    """Import STL into headless Blender 4.2, frame 1:1:1 camera + 3-point studio lighting, and render turntable."""
+    import bpy
+    import mathutils
     import trimesh
-    import numpy as np
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     from PIL import Image
 
-    print(f"Cloud Worker: Processing STL ({len(stl_bytes):,} bytes)...")
+    # 1. Normalize, scale, and ground mesh using trimesh first to guarantee exact bounding box & centering
     mesh = trimesh.load(io.BytesIO(stl_bytes), file_type="stl")
-    
-    # Scale & Center (preserve scale if target_height_mm <= 0)
-    if target_height_mm and target_height_mm > 0:
+    if target_height_mm and target_height_mm > 0 and mesh.extents[2] > 0:
         scale = target_height_mm / mesh.extents[2]
         mesh.apply_scale(scale)
+
     bounds = mesh.bounds
     mesh.apply_translation([
         -((bounds[0][0] + bounds[1][0]) / 2.0),
         -((bounds[0][1] + bounds[1][1]) / 2.0),
-        -bounds[0][2]
+        -bounds[0][2],
     ])
 
-    print(f"Cloud Worker: Loaded mesh ({len(mesh.vertices):,} verts, {len(mesh.faces):,} faces)")
-    
-    # Decimate visual proxy if over 150k faces for faster rendering
-    if len(mesh.faces) > 150000:
-        target_faces = 100000
-        reduction = 1.0 - (target_faces / len(mesh.faces))
-        reduction = max(0.01, min(0.95, reduction))
-        print(f"Cloud Worker: Decimating visual proxy by {reduction:.1%} from {len(mesh.faces):,} faces...")
-        render_mesh = mesh.simplify_quadric_decimation(reduction)
-    else:
-        render_mesh = mesh
+    ext_x, ext_y, ext_z = [float(v) for v in mesh.extents]
+    max_dim = max(ext_x, ext_y, ext_z, 1.0)
+    center_z = ext_z * 0.48
 
-    # 3-Point Studio Lighting
-    light1 = np.array([0.6, -0.6, 0.75])
-    light1 /= np.linalg.norm(light1)
-    light2 = np.array([-0.6, -0.5, 0.4])
-    light2 /= np.linalg.norm(light2)
-    light3 = np.array([0.1, 0.8, 0.6])
-    light3 /= np.linalg.norm(light3)
+    with tempfile.TemporaryDirectory(prefix="zero_bpy_") as tmpdir:
+        norm_stl = os.path.join(tmpdir, "normalized.stl")
+        mesh.export(norm_stl, file_type="stl")
 
-    normals = render_mesh.face_normals
-    d1 = np.clip(np.dot(normals, light1), 0, 1)
-    d2 = np.clip(np.dot(normals, light2), 0, 1)
-    d3 = np.clip(np.dot(normals, light3), 0, 1)
-    intensity = 0.20 + 0.60 * d1 + 0.15 * d2 + 0.15 * d3
-    base_color = np.array([0.92, 0.94, 0.97])
-    face_colors = np.clip(base_color[None, :] * intensity[:, None], 0, 1)
+        # 2. Reset Blender to clean empty factory scene
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        bpy.ops.wm.stl_import(filepath=norm_stl)
+        obj = bpy.context.selected_objects[0]
+        bpy.context.view_layer.objects.active = obj
 
-    ext_x, ext_y, ext_z = render_mesh.extents
-    max_xy = max(ext_x, ext_y)
-    radius = max_xy * 0.65
-    z_span = max(ext_z * 1.1, max_xy * 0.4)
+        # Smooth shading with weighted normals for clean mechanical & organic highlights
+        bpy.ops.object.shade_smooth()
 
-    # 3-Point Studio Lighting vectors
-    light1 = np.array([0.6, -0.6, 0.75])
-    light1 /= np.linalg.norm(light1)
-    light2 = np.array([-0.6, -0.5, 0.4])
-    light2 /= np.linalg.norm(light2)
-    light3 = np.array([0.1, 0.8, 0.6])
-    light3 /= np.linalg.norm(light3)
-    base_color = np.array([0.88, 0.92, 0.96])
+        # 3. Configure Cycles Engine (8-vCPU path tracing)
+        scene = bpy.context.scene
+        scene.render.engine = "CYCLES"
+        scene.cycles.device = "CPU"
+        scene.cycles.samples = samples
+        scene.cycles.use_adaptive_sampling = True
+        scene.cycles.adaptive_threshold = 0.05
+        scene.cycles.use_denoising = False
+        scene.cycles.max_bounces = 3
+        scene.cycles.diffuse_bounces = 2
+        scene.cycles.glossy_bounces = 2
+        scene.render.resolution_x = res_x
+        scene.render.resolution_y = res_y
+        scene.render.image_settings.file_format = "PNG"
 
-    elev_rad = np.radians(elev)
+        # 4. Studio World Background (#090d16 dark slate)
+        world = bpy.data.worlds.new("StudioWorld")
+        scene.world = world
+        world.use_nodes = True
+        bg_node = world.node_tree.nodes.get("Background")
+        if bg_node:
+            bg_node.inputs[0].default_value = (0.008, 0.013, 0.024, 1.0)
+            bg_node.inputs[1].default_value = 1.0
 
-    frames = []
-    print(f"Cloud Worker: Rendering {n_frames} frames of 360° turntable with back-face culling & depth sorting...")
-    for i, azim in enumerate(np.linspace(0, 360, n_frames, endpoint=False)):
-        azim_rad = np.radians(azim)
-        cam_vec = np.array([
-            np.cos(elev_rad) * np.cos(azim_rad + np.pi/2),
-            np.cos(elev_rad) * np.sin(azim_rad + np.pi/2),
-            np.sin(elev_rad)
-        ])
-        cam_vec /= np.linalg.norm(cam_vec)
+        # 5. Studio Matte Sculpt Material (Subtle subsurface & specular highlight)
+        mat = bpy.data.materials.new(name="ZeroStudioClay")
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf:
+            bsdf.inputs["Base Color"].default_value = (0.83, 0.87, 0.93, 1.0)
+            bsdf.inputs["Roughness"].default_value = 0.38
+            if "Specular IOR Level" in bsdf.inputs:
+                bsdf.inputs["Specular IOR Level"].default_value = 0.45
+        obj.data.materials.append(mat)
 
-        # Back-face culling: cull faces pointing away from the camera
-        dot = np.dot(render_mesh.face_normals, cam_vec)
-        vis_mask = dot > 0.02
-        if not np.any(vis_mask):
-            vis_mask = np.ones(len(render_mesh.faces), dtype=bool)
+        # 6. Matte Studio Floor (catches soft contact shadows & bounce light)
+        bpy.ops.mesh.primitive_plane_add(size=max_dim * 12.0, location=(0.0, 0.0, 0.0))
+        floor_obj = bpy.context.active_object
+        floor_mat = bpy.data.materials.new(name="StudioFloor")
+        floor_mat.use_nodes = True
+        f_bsdf = floor_mat.node_tree.nodes.get("Principled BSDF")
+        if f_bsdf:
+            f_bsdf.inputs["Base Color"].default_value = (0.012, 0.018, 0.032, 1.0)
+            f_bsdf.inputs["Roughness"].default_value = 0.72
+        floor_obj.data.materials.append(floor_mat)
 
-        vis_faces = render_mesh.faces[vis_mask]
-        vis_normals = render_mesh.face_normals[vis_mask]
+        # 7. 3-Point Studio Area Lighting (scaled dynamically to model dimensions)
+        target_pt = mathutils.Vector((0.0, 0.0, center_z))
+        dist_scale = max_dim * 1.8
 
-        # 3-Point Lighting on visible faces
-        d1 = np.clip(np.dot(vis_normals, light1), 0, 1)
-        d2 = np.clip(np.dot(vis_normals, light2), 0, 1)
-        d3 = np.clip(np.dot(vis_normals, light3), 0, 1)
-        intensity = 0.20 + 0.60 * d1 + 0.15 * d2 + 0.15 * d3
-        face_colors = np.clip(base_color[None, :] * intensity[:, None], 0, 1)
+        def add_area_light(name: str, rel_pos: tuple[float, float, float], intensity_mult: float, size_mult: float, color: tuple[float, float, float]):
+            ldata = bpy.data.lights.new(name=name, type="AREA")
+            # Power scales with distance squared in Blender physical lighting units
+            ldata.energy = intensity_mult * (dist_scale ** 2)
+            ldata.size = max_dim * size_mult
+            ldata.color = color
+            lobj = bpy.data.objects.new(name=name, object_data=ldata)
+            scene.collection.objects.link(lobj)
+            lobj.location = (
+                rel_pos[0] * dist_scale,
+                rel_pos[1] * dist_scale,
+                center_z + rel_pos[2] * dist_scale,
+            )
+            direction = target_pt - lobj.location
+            lobj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
 
-        # Depth-sorting (Painter's algorithm: draw farthest to nearest)
-        tri_verts = render_mesh.vertices[vis_faces]
-        face_centers = tri_verts.mean(axis=1)
-        dist = np.dot(face_centers, cam_vec)
-        order = np.argsort(dist)
+        # Key light (warm front-right), Fill light (cool front-left), Rim light (crisp back-top)
+        add_area_light("KeyLight", (0.85, -0.85, 0.95), 28.0, 1.1, (1.0, 0.98, 0.95))
+        add_area_light("FillLight", (-0.95, -0.70, 0.45), 11.0, 1.4, (0.82, 0.90, 1.0))
+        add_area_light("RimLight", (0.15, 1.05, 0.85), 24.0, 0.9, (0.90, 0.96, 1.0))
 
-        tri_verts = tri_verts[order]
-        face_colors = face_colors[order]
+        # 8. Camera Rig & Turntable Pivot
+        pivot = bpy.data.objects.new("TurntablePivot", None)
+        scene.collection.objects.link(pivot)
+        pivot.location = (0.0, 0.0, center_z)
 
-        fig = plt.figure(figsize=(6, 7), facecolor='#090d16')
-        ax = fig.add_subplot(111, projection='3d', facecolor='#090d16')
-        ax.add_collection3d(Poly3DCollection(tri_verts, facecolors=face_colors, edgecolors='none', alpha=1.0))
-        
-        ax.set_xlim(-radius, radius)
-        ax.set_ylim(-radius, radius)
-        ax.set_zlim(0, z_span)
-        ax.set_box_aspect([2 * radius, 2 * radius, z_span])
-        ax.view_init(elev=elev, azim=azim)
-        ax.axis('off')
+        cam_data = bpy.data.cameras.new("TurntableCam")
+        cam_data.lens = 55.0
+        cam_data.clip_start = max_dim * 0.01
+        cam_data.clip_end = max_dim * 50.0
+        cam_obj = bpy.data.objects.new("TurntableCam", cam_data)
+        scene.collection.objects.link(cam_obj)
+        scene.camera = cam_obj
+        cam_obj.parent = pivot
 
-        fig.canvas.draw()
-        rgba = np.asarray(fig.canvas.buffer_rgba())
-        frames.append(Image.fromarray(rgba).convert('RGB'))
-        plt.close(fig)
+        # Compute framing radius so the model fills ~75% of the frame regardless of aspect ratio
+        xy_radius = math.hypot(ext_x, ext_y) * 0.5
+        bounding_radius = max(xy_radius * 1.15, ext_z * 0.58)
+        cam_dist = bounding_radius * 2.55
+        elev_rad = math.radians(elev)
+        cam_y = -cam_dist * math.cos(elev_rad)
+        cam_z = cam_dist * math.sin(elev_rad)
+        cam_obj.location = (0.0, cam_y, cam_z)
+        cam_dir = mathutils.Vector((0.0, 0.0, 0.0)) - cam_obj.location
+        cam_obj.rotation_euler = cam_dir.to_track_quat("-Z", "Y").to_euler()
 
-    out_buf = io.BytesIO()
-    frames[0].save(
-        out_buf,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=90,
-        loop=0,
-        optimize=True
+        # 9. Render N frames around 360°
+        frames: list[Image.Image] = []
+        for i in range(n_frames):
+            angle_deg = i * (360.0 / n_frames)
+            pivot.rotation_euler[2] = math.radians(angle_deg)
+            frame_path = os.path.join(tmpdir, f"frame_{i:03d}.png")
+            scene.render.filepath = frame_path
+            bpy.ops.render.render(write_still=True)
+            frames.append(Image.open(frame_path).convert("RGB"))
+
+        gif_buf = io.BytesIO()
+        frames[0].save(
+            gif_buf,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=90,
+            loop=0,
+            optimize=True,
+        )
+
+        hero_buf = io.BytesIO()
+        frames[0].save(hero_buf, format="PNG")
+
+        return gif_buf.getvalue(), hero_buf.getvalue()
+
+
+@app.function(image=render_image, cpu=8, memory=16384, timeout=240)
+def render_cloud_turntable(
+    stl_bytes: bytes,
+    target_height_mm: float = 0.0,
+    n_frames: int = 24,
+    elev: float = 24.0,
+) -> bytes:
+    print(f"Cloud Worker (Blender 4.2 Cycles): Rendering {n_frames}-frame turntable ({len(stl_bytes):,} bytes)...")
+    gif_bytes, _ = _setup_blender_studio_and_render(
+        stl_bytes=stl_bytes,
+        target_height_mm=target_height_mm,
+        n_frames=n_frames,
+        elev=elev,
     )
-    print("Cloud Worker: Finished rendering turntable GIF!")
-    return out_buf.getvalue()
+    print(f"Cloud Worker: Finished Cycles turntable GIF ({len(gif_bytes):,} bytes)!")
+    return gif_bytes
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Render 3D STL to 360° Turntable via Modal Cloud Compute")
+    parser = argparse.ArgumentParser(description="Render 3D STL to 360° Cycles Turntable via Modal Cloud Compute (Blender 4.2)")
     parser.add_argument("stl_path", help="Path to input .stl file")
     parser.add_argument("--output", "-o", help="Path to save output .gif", default=None)
     parser.add_argument("--channel", "-c", help="Discord channel ID to deliver preview to", default=None)
@@ -170,7 +247,7 @@ def main():
 
     out_file = Path(args.output) if args.output else stl_file.with_name(f"{stl_file.stem}_cloud_turntable.gif")
 
-    print(f"Dispatching {stl_file.name} ({stl_file.stat().st_size:,} bytes) to Modal cloud compute...")
+    print(f"Dispatching {stl_file.name} ({stl_file.stat().st_size:,} bytes) to Modal Blender 4.2 Cycles cloud worker...")
     t0 = time.time()
     stl_bytes = stl_file.read_bytes()
 
@@ -179,19 +256,20 @@ def main():
         gif_bytes = render_cloud_turntable.remote(
             stl_bytes,
             target_height_mm=target_h,
-            elev=args.elev
+            elev=args.elev,
         )
 
     out_file.write_bytes(gif_bytes)
-    print(f"Received rendered turntable from Modal ({len(gif_bytes):,} bytes) in {time.time() - t0:.1f}s")
+    print(f"Received rendered Cycles turntable from Modal ({len(gif_bytes):,} bytes) in {time.time() - t0:.1f}s")
     print(f"Saved to: {out_file}")
 
     if args.channel:
-        sys.path.insert(0, '/workspace/tools')
+        sys.path.insert(0, "/workspace/tools")
         from deliver_image import deliver_image
-        caption = args.caption or f"🎬 **360° Studio Turntable (Modal Cloud Render)**: {stl_file.name}"
+        caption = args.caption or f"🎬 **360° Studio Turntable (Modal Blender Cycles Render)**: {stl_file.name}"
         res = deliver_image(str(out_file), channel_input=args.channel, caption=caption)
         print("Discord delivery:", res)
+
 
 if __name__ == "__main__":
     main()

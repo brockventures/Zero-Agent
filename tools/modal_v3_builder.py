@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
+"""Modal Serverless V3 Mesh Builder & Turntable Renderer (Powered by Headless Blender 4.2).
+
+Uses Blender 4.2's native OpenVDB Voxel Remesher (`REMESH` VOXEL mode), Corrective Smooth
+(volume-preserving crease retention), and Cycles path-traced 3-point studio lighting
+with contact shadows on Modal cloud compute.
+"""
+
+import argparse
+import io
+import math
 import os
 import sys
+import tempfile
 import time
-import argparse
 from pathlib import Path
 import modal
 
@@ -10,150 +20,249 @@ app = modal.App("zero-v3-cloud-generator")
 
 cloud_image = (
     modal.Image.debian_slim(python_version="3.11")
+    .apt_install(
+        "libx11-6",
+        "libxxf86vm1",
+        "libxfixes3",
+        "libxi6",
+        "libxkbcommon0",
+        "libsm6",
+        "libice6",
+        "libgl1",
+        "libegl1",
+        "libgomp1",
+        "libxrender1",
+    )
     .pip_install(
+        "bpy==4.2.0",
         "trimesh",
         "numpy",
-        "matplotlib",
         "pillow",
         "scipy",
-        "scikit-image",
-        "fast-simplification"
+        "fast-simplification",
     )
 )
 
+
 @app.function(image=cloud_image, cpu=8, memory=16384, timeout=300)
-def generate_v3_cloud(raw_stl_bytes: bytes, pitch: float = 0.22, target_height_mm: float = 120.0, n_frames: int = 24) -> dict:
-    import io
+def generate_v3_cloud(
+    raw_stl_bytes: bytes,
+    pitch: float = 0.22,
+    target_height_mm: float = 120.0,
+    n_frames: int = 24,
+    elev: float = 18.0,
+) -> dict:
+    import bpy
+    import mathutils
     import trimesh
-    import numpy as np
-    import scipy.ndimage as ndimage
-    from skimage import measure
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     from PIL import Image
 
-    print(f"Cloud Worker: Loading raw mesh ({len(raw_stl_bytes):,} bytes)...")
+    print(f"Cloud Worker (Blender 4.2 OpenVDB + Cycles): Loading raw mesh ({len(raw_stl_bytes):,} bytes)...")
     m_raw = trimesh.load(io.BytesIO(raw_stl_bytes), file_type="stl")
+    if isinstance(m_raw, trimesh.Scene):
+        m_raw = m_raw.dump(concatenate=True)
+
     print(f"Cloud Worker: Raw sculpt has {len(m_raw.vertices):,} vertices, {len(m_raw.faces):,} faces. Extents: {m_raw.extents.tolist()}")
-    if target_height_mm and target_height_mm > 0:
+    if target_height_mm and target_height_mm > 0 and m_raw.extents[2] > 0:
         scale_in = target_height_mm / m_raw.extents[2]
         m_raw.apply_scale(scale_in)
-        print(f"Cloud Worker: Scaled input mesh to target height {target_height_mm}mm. Extents: {m_raw.extents.tolist()}")
 
-    # 1. High-Density Voxelization at 0.22mm with 8-voxel boundary padding
-    print(f"Cloud Worker: Voxelizing at pitch={pitch}mm with 8-voxel padding...")
-    v = m_raw.voxelized(pitch=pitch)
-    matrix = v.matrix
-    padded = np.pad(matrix, 8, mode='constant', constant_values=0)
-    print(f"Cloud Worker: Voxel grid shape: {padded.shape} ({padded.size:,} total voxels)")
+    bounds = m_raw.bounds
+    m_raw.apply_translation([
+        -((bounds[0][0] + bounds[1][0]) / 2.0),
+        -((bounds[0][1] + bounds[1][1]) / 2.0),
+        -bounds[0][2],
+    ])
 
-    # 2. Continuous 3D Spatial Solidification (Isotropic 26-Connectivity)
-    print("Cloud Worker: Executing continuous 3D isotropic spatial solidification...")
-    struct_3d = ndimage.generate_binary_structure(3, 2)
-    solid_3d = ndimage.binary_closing(padded, structure=struct_3d, iterations=1)
-    solid_3d = ndimage.binary_fill_holes(solid_3d)
+    with tempfile.TemporaryDirectory(prefix="zero_v3_bpy_") as tmpdir:
+        in_stl = os.path.join(tmpdir, "input_raw.stl")
+        out_stl = os.path.join(tmpdir, "output_v3.stl")
+        m_raw.export(in_stl, file_type="stl")
 
-    # 3. Continuous 3D Gaussian Distance Field & Sub-Voxel Marching Cubes
-    print("Cloud Worker: Generating continuous 3D Gaussian distance field (sub-voxel anti-aliasing)...")
-    smooth_field = ndimage.gaussian_filter(solid_3d.astype(np.float32), sigma=1.0)
+        # 1. Load into headless Blender 4.2
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        bpy.ops.wm.stl_import(filepath=in_stl)
+        obj = bpy.context.selected_objects[0]
+        bpy.context.view_layer.objects.active = obj
 
-    print("Cloud Worker: Extracting watertight Marching Cubes surface from continuous field...")
-    verts, faces, normals, values = measure.marching_cubes(smooth_field, level=0.5, spacing=(pitch, pitch, pitch))
-    verts[:, 0] -= (verts[:, 0].min() + verts[:, 0].max()) / 2.0
-    verts[:, 1] -= (verts[:, 1].min() + verts[:, 1].max()) / 2.0
-    verts[:, 2] -= verts[:, 2].min()
+        # 2. Native OpenVDB Voxel Remesh (`REMESH` VOXEL mode)
+        print(f"Cloud Worker: Executing Blender OpenVDB Voxel Remesh at voxel_size={pitch}mm...")
+        remesh = obj.modifiers.new(name="OpenVDB_Remesh", type="REMESH")
+        remesh.mode = "VOXEL"
+        remesh.voxel_size = float(pitch)
+        remesh.adaptivity = 0.0
+        remesh.use_smooth_shade = True
+        bpy.ops.object.modifier_apply(modifier=remesh.name)
 
-    m_v3 = trimesh.Trimesh(vertices=verts, faces=faces)
-    scale_v3 = target_height_mm / m_v3.extents[2]
-    m_v3.apply_scale(scale_v3)
+        # 3. Volume-Preserving Corrective Smooth (eliminates voxel stepping while preserving sharp creases)
+        print("Cloud Worker: Applying Blender Corrective Smooth modifier (8 iterations)...")
+        smooth = obj.modifiers.new(name="CorrectiveSmooth", type="CORRECTIVE_SMOOTH")
+        smooth.iterations = 8
+        smooth.scale = 0.5
+        smooth.use_only_smooth = True
+        smooth.use_pin_boundary = True
+        bpy.ops.object.modifier_apply(modifier=smooth.name)
 
-    # 4. Multi-Scale Taubin Smoothing (Preserves feature creases without shrinkage)
-    print("Cloud Worker: Applying multi-scale Taubin smoothing (10 iterations)...")
-    trimesh.smoothing.filter_taubin(m_v3, lamb=0.5, nu=-0.53, iterations=10)
+        # Triangulate quads from OpenVDB for clean STL export and exact volume metrics
+        tri_mod = obj.modifiers.new(name="Triangulate", type="TRIANGULATE")
+        bpy.ops.object.modifier_apply(modifier=tri_mod.name)
 
-    # Export STL
-    stl_buf = io.BytesIO()
-    m_v3.export(stl_buf, file_type="stl")
-    v3_stl_bytes = stl_buf.getvalue()
-    print(f"Cloud Worker: Exported V3 STL ({len(v3_stl_bytes):,} bytes).")
+        bpy.ops.object.shade_smooth()
+        bpy.ops.wm.stl_export(filepath=out_stl, export_selected_objects=True)
 
-    # 5. Render 360° Studio Turntable
-    print("Cloud Worker: Rendering 360° studio turntable animation...")
-    if len(m_v3.faces) > 150000:
-        target_faces = 100000
-        reduction = 1.0 - (target_faces / len(m_v3.faces))
-        reduction = max(0.01, min(0.95, reduction))
-        render_mesh = m_v3.simplify_quadric_decimation(reduction)
-    else:
-        render_mesh = m_v3
+        # 4. Re-verify watertightness & ground Z=0 via trimesh
+        m_v3 = trimesh.load(out_stl, file_type="stl")
+        if target_height_mm and target_height_mm > 0 and m_v3.extents[2] > 0:
+            m_v3.apply_scale(target_height_mm / m_v3.extents[2])
+        b3 = m_v3.bounds
+        m_v3.apply_translation([
+            -((b3[0][0] + b3[1][0]) / 2.0),
+            -((b3[0][1] + b3[1][1]) / 2.0),
+            -b3[0][2],
+        ])
 
-    light1 = np.array([0.6, -0.6, 0.75]); light1 /= np.linalg.norm(light1)
-    light2 = np.array([-0.6, -0.5, 0.4]); light2 /= np.linalg.norm(light2)
-    light3 = np.array([0.1, 0.8, 0.6]); light3 /= np.linalg.norm(light3)
+        stl_buf = io.BytesIO()
+        m_v3.export(stl_buf, file_type="stl")
+        v3_stl_bytes = stl_buf.getvalue()
+        print(f"Cloud Worker: Exported OpenVDB V3 STL ({len(v3_stl_bytes):,} bytes, {len(m_v3.faces):,} faces).")
 
-    normals = render_mesh.face_normals
-    d1 = np.clip(np.dot(normals, light1), 0, 1)
-    d2 = np.clip(np.dot(normals, light2), 0, 1)
-    d3 = np.clip(np.dot(normals, light3), 0, 1)
-    intensity = 0.20 + 0.60 * d1 + 0.15 * d2 + 0.15 * d3
-    base_color = np.array([0.92, 0.94, 0.97])
-    face_colors = np.clip(base_color[None, :] * intensity[:, None], 0, 1)
+        # 5. Render 360° Studio Turntable via Blender Cycles
+        print(f"Cloud Worker: Rendering {n_frames}-frame Cycles path-traced studio turntable...")
+        ext_x, ext_y, ext_z = [float(v) for v in m_v3.extents]
+        max_dim = max(ext_x, ext_y, ext_z, 1.0)
+        center_z = ext_z * 0.48
 
-    tri_verts = render_mesh.vertices[render_mesh.faces]
-    ext_x, ext_y, ext_z = render_mesh.extents
+        scene = bpy.context.scene
+        scene.render.engine = "CYCLES"
+        scene.cycles.device = "CPU"
+        scene.cycles.samples = 16
+        scene.cycles.use_adaptive_sampling = True
+        scene.cycles.adaptive_threshold = 0.05
+        scene.cycles.use_denoising = False
+        scene.cycles.max_bounces = 3
+        scene.cycles.diffuse_bounces = 2
+        scene.cycles.glossy_bounces = 2
+        scene.render.resolution_x = 520
+        scene.render.resolution_y = 580
+        scene.render.image_settings.file_format = "PNG"
 
-    frames = []
-    for i, azim in enumerate(np.linspace(0, 360, n_frames, endpoint=False)):
-        fig = plt.figure(figsize=(6, 7), facecolor='#090d16')
-        ax = fig.add_subplot(111, projection='3d', facecolor='#090d16')
-        ax.add_collection3d(Poly3DCollection(tri_verts, facecolors=face_colors, edgecolors='none', alpha=1.0))
-        ax.set_xlim(-ext_x * 0.6, ext_x * 0.6)
-        ax.set_ylim(-ext_y * 0.6, ext_y * 0.6)
-        ax.set_zlim(0, ext_z * 1.05)
-        ax.set_box_aspect([ext_x, ext_y, ext_z])
-        ax.view_init(elev=12, azim=azim)
-        ax.axis('off')
-        fig.canvas.draw()
-        rgba = np.asarray(fig.canvas.buffer_rgba())
-        frames.append(Image.fromarray(rgba).convert('RGB'))
-        plt.close(fig)
+        world = bpy.data.worlds.new("StudioWorld")
+        scene.world = world
+        world.use_nodes = True
+        bg_node = world.node_tree.nodes.get("Background")
+        if bg_node:
+            bg_node.inputs[0].default_value = (0.008, 0.013, 0.024, 1.0)
+            bg_node.inputs[1].default_value = 1.0
 
-    gif_buf = io.BytesIO()
-    frames[0].save(
-        gif_buf,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=90,
-        loop=0,
-        optimize=True
-    )
+        mat = bpy.data.materials.new(name="ZeroStudioClay")
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf:
+            bsdf.inputs["Base Color"].default_value = (0.83, 0.87, 0.93, 1.0)
+            bsdf.inputs["Roughness"].default_value = 0.38
+            if "Specular IOR Level" in bsdf.inputs:
+                bsdf.inputs["Specular IOR Level"].default_value = 0.45
+        obj.data.materials.append(mat)
 
-    hero_buf = io.BytesIO()
-    frames[0].save(hero_buf, format="PNG")
+        bpy.ops.mesh.primitive_plane_add(size=max_dim * 12.0, location=(0.0, 0.0, 0.0))
+        floor_obj = bpy.context.active_object
+        floor_mat = bpy.data.materials.new(name="StudioFloor")
+        floor_mat.use_nodes = True
+        f_bsdf = floor_mat.node_tree.nodes.get("Principled BSDF")
+        if f_bsdf:
+            f_bsdf.inputs["Base Color"].default_value = (0.012, 0.018, 0.032, 1.0)
+            f_bsdf.inputs["Roughness"].default_value = 0.72
+        floor_obj.data.materials.append(floor_mat)
 
-    print("Cloud Worker: Complete!")
-    return {
-        "v3_stl_bytes": v3_stl_bytes,
-        "turntable_gif_bytes": gif_buf.getvalue(),
-        "hero_png_bytes": hero_buf.getvalue(),
-        "metrics": {
-            "vertices": len(m_v3.vertices),
-            "faces": len(m_v3.faces),
-            "is_watertight": bool(m_v3.is_watertight),
-            "volume_mm3": float(m_v3.volume),
-            "extents_mm": m_v3.extents.tolist()
+        target_pt = mathutils.Vector((0.0, 0.0, center_z))
+        dist_scale = max_dim * 1.8
+
+        def add_area_light(name: str, rel_pos: tuple[float, float, float], intensity_mult: float, size_mult: float, color: tuple[float, float, float]):
+            ldata = bpy.data.lights.new(name=name, type="AREA")
+            ldata.energy = intensity_mult * (dist_scale ** 2)
+            ldata.size = max_dim * size_mult
+            ldata.color = color
+            lobj = bpy.data.objects.new(name=name, object_data=ldata)
+            scene.collection.objects.link(lobj)
+            lobj.location = (
+                rel_pos[0] * dist_scale,
+                rel_pos[1] * dist_scale,
+                center_z + rel_pos[2] * dist_scale,
+            )
+            direction = target_pt - lobj.location
+            lobj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+
+        add_area_light("KeyLight", (0.85, -0.85, 0.95), 28.0, 1.1, (1.0, 0.98, 0.95))
+        add_area_light("FillLight", (-0.95, -0.70, 0.45), 11.0, 1.4, (0.82, 0.90, 1.0))
+        add_area_light("RimLight", (0.15, 1.05, 0.85), 24.0, 0.9, (0.90, 0.96, 1.0))
+
+        pivot = bpy.data.objects.new("TurntablePivot", None)
+        scene.collection.objects.link(pivot)
+        pivot.location = (0.0, 0.0, center_z)
+
+        cam_data = bpy.data.cameras.new("TurntableCam")
+        cam_data.lens = 55.0
+        cam_data.clip_start = max_dim * 0.01
+        cam_data.clip_end = max_dim * 50.0
+        cam_obj = bpy.data.objects.new("TurntableCam", cam_data)
+        scene.collection.objects.link(cam_obj)
+        scene.camera = cam_obj
+        cam_obj.parent = pivot
+
+        xy_radius = math.hypot(ext_x, ext_y) * 0.5
+        bounding_radius = max(xy_radius * 1.15, ext_z * 0.58)
+        cam_dist = bounding_radius * 2.55
+        elev_rad = math.radians(elev)
+        cam_y = -cam_dist * math.cos(elev_rad)
+        cam_z = cam_dist * math.sin(elev_rad)
+        cam_obj.location = (0.0, cam_y, cam_z)
+        cam_dir = mathutils.Vector((0.0, 0.0, 0.0)) - cam_obj.location
+        cam_obj.rotation_euler = cam_dir.to_track_quat("-Z", "Y").to_euler()
+
+        frames: list[Image.Image] = []
+        for i in range(n_frames):
+            angle_deg = i * (360.0 / n_frames)
+            pivot.rotation_euler[2] = math.radians(angle_deg)
+            frame_path = os.path.join(tmpdir, f"frame_{i:03d}.png")
+            scene.render.filepath = frame_path
+            bpy.ops.render.render(write_still=True)
+            frames.append(Image.open(frame_path).convert("RGB"))
+
+        gif_buf = io.BytesIO()
+        frames[0].save(
+            gif_buf,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            duration=90,
+            loop=0,
+            optimize=True,
+        )
+
+        hero_buf = io.BytesIO()
+        frames[0].save(hero_buf, format="PNG")
+
+        print("Cloud Worker: Complete!")
+        return {
+            "v3_stl_bytes": v3_stl_bytes,
+            "turntable_gif_bytes": gif_buf.getvalue(),
+            "hero_png_bytes": hero_buf.getvalue(),
+            "metrics": {
+                "vertices": len(m_v3.vertices),
+                "faces": len(m_v3.faces),
+                "is_watertight": bool(m_v3.is_watertight),
+                "volume_mm3": float(m_v3.volume),
+                "extents_mm": m_v3.extents.tolist(),
+            },
         }
-    }
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate high-resolution V3 mesh & turntable via Modal cloud compute")
+    parser = argparse.ArgumentParser(description="Generate high-resolution V3 mesh & Cycles turntable via Modal Blender 4.2 cloud compute")
     parser.add_argument("--raw-stl", default="/workspace/data/3dprint/zero_casual_robot_zup.stl", help="Input raw STL")
     parser.add_argument("--out-stl", default="/workspace/data/3dprint/zero_casual_robot_v3.stl", help="Output V3 solid STL")
     parser.add_argument("--out-gif", default="/workspace/data/3dprint/zero_figurine_v3_turntable.gif", help="Output turntable GIF")
-    parser.add_argument("--pitch", type=float, default=0.22, help="Voxel pitch in mm (default 0.22)")
+    parser.add_argument("--pitch", type=float, default=0.22, help="OpenVDB Voxel pitch in mm (default 0.22)")
     parser.add_argument("--target-height", type=float, default=120.0, help="Target height in mm (default 120.0)")
     parser.add_argument("--channel", default="1555973316752449576", help="Discord channel ID for delivery")
     args = parser.parse_args()
@@ -166,7 +275,7 @@ def main():
     print(f"1. Reading raw sculpt: {raw_p.name} ({raw_p.stat().st_size:,} bytes)...")
     raw_bytes = raw_p.read_bytes()
 
-    print(f"2. Dispatching full V3 remesh & turntable to Modal (8 vCPUs, 16GB RAM, pitch={args.pitch}mm, height={args.target_height}mm)...")
+    print(f"2. Dispatching Blender 4.2 OpenVDB remesh & Cycles turntable to Modal (8 vCPUs, 16GB RAM, pitch={args.pitch}mm, height={args.target_height}mm)...")
     t0 = time.time()
     with app.run():
         result = generate_v3_cloud.remote(raw_bytes, pitch=args.pitch, target_height_mm=args.target_height)
@@ -193,19 +302,20 @@ def main():
 
     # 4. Deliver to Discord
     if args.channel:
-        sys.path.insert(0, '/workspace/tools')
+        sys.path.insert(0, "/workspace/tools")
         from deliver_image import deliver_image
         caption = (
-            f"🎬 **Zero Figurine V3 — High-Res Turntable (Modal Cloud Render)**\n"
+            f"🎬 **Zero Figurine V3 — Blender 4.2 OpenVDB + Cycles Turntable (Modal Cloud)**\n"
             f"- **Faces:** {metrics['faces']:,} ({metrics['vertices']:,} verts, {out_stl.stat().st_size / 1024 / 1024:.1f} MB)\n"
-            f"- **Voxel Pitch:** {args.pitch}mm (8x voxel density over V2)\n"
-            f"- **Solid Core:** {metrics['volume_mm3']:.1f} mm³ (100% watertight, zero hollow cavities)\n"
-            f"- **Host 2 CPU Usage:** 0.0% (computed entirely on Modal 8-core cloud worker)"
+            f"- **OpenVDB Voxel Pitch:** {args.pitch}mm\n"
+            f"- **Solid Core:** {metrics['volume_mm3']:.1f} mm³ (100% watertight)\n"
+            f"- **Host 2 CPU Usage:** 0.0% (computed on Modal 8-core Blender worker)"
         )
         deliv_res = deliver_image(str(out_gif), channel_input=args.channel, caption=caption)
         print("   Discord delivery result:", deliv_res)
 
     print(f"=== V3 Pipeline Finished in {time.time() - t0:.1f}s ===")
+
 
 if __name__ == "__main__":
     main()

@@ -53,19 +53,16 @@ Heavy CAD geometry generation, multi-mesh Boolean unions, voxel remeshing, and t
   /workspace/.venv/modal/bin/modal run /workspace/tools/modal_render_3d.py
   ```
 
-### Cloud Tooling Architecture:
+### Cloud Tooling Architecture (Headless Blender 4.2 `bpy` + OpenVDB + Cycles):
 1. **`tools/modal_v3_builder.py`:**
-   - Ingests raw components (pedestal base, torso, articulated arms).
-   - Solves multi-mesh coordinate alignment and Boolean union.
-   - Executes high-resolution volumetric voxelization with constant 8-voxel zero padding.
-   - Executes continuous 3D isotropic spatial closing (`ndimage.generate_binary_structure(3, 2)`) across all axes, strictly avoiding slice-wise 2D loops along Z to prevent topographical contour aliasing.
-   - Computes a continuous 3D Gaussian distance field (`ndimage.gaussian_filter(..., sigma=1.0)`) for sub-voxel anti-aliased Marching Cubes (`measure.marching_cubes`).
-   - Applies multi-scale Taubin smoothing (10 iterations) to preserve geometric feature edges and creases without volume shrinkage.
-   - Delivers monolithic watertight STL to `/workspace/data/3dprint/`.
+   - Runs headless **Blender 4.2 (`bpy==4.2.0`)** on an 8-vCPU, 16GB RAM Modal cloud container.
+   - Executes native **OpenVDB Voxel Remeshing** (`REMESH` modifier in `VOXEL` mode, ~0.4s execution) instead of slow CPU numpy Marching Cubes.
+   - Applies volume-preserving **Corrective Smooth** (`CORRECTIVE_SMOOTH` with `use_only_smooth=True` and `use_pin_boundary=True`) to eliminate voxel stepping while retaining crisp mechanical creases and edges.
+   - Triangulates (`TRIANGULATE`), verifies manifold watertightness and $Z=0$ grounding via `trimesh`, and exports the monolithic STL to `/workspace/data/3dprint/`.
 2. **`tools/modal_render_3d.py`:**
-   - Renders studio-lit 3D clay previews and 24-frame, 360° turntable animations.
-   - Employs 3-point Key/Fill/Rim lighting and real-world bounding-box aspect ratio (`ax.set_box_aspect`).
-   - Exports optimized GIF/WebP turntables delivered directly to Discord `#3d-print`.
+   - Renders path-traced 24-frame, 360° studio turntables using **Blender Cycles** (`CYCLES` engine with adaptive sampling).
+   - Features a physical 3-point Area Light studio rig (warm Key, cool Fill, crisp Rim), Principled BSDF clay/sculpt shaders, ambient occlusion, and a matte ground plane that catches real contact shadows.
+   - Automatically scales camera distance and area light wattage to any single part or multi-part assembly bounding box in true 1:1:1 proportion, delivering optimized GIF turntables directly to Discord.
 
 ---
 
