@@ -24,6 +24,101 @@ HOME_ASSISTANT_CHANNEL_ID = 1544953275877556334
 # Devices that routinely enter setup_retry when powered off at the wall
 BENIGN_STANDBY_DOMAINS = {"octoprint", "android_ip_webcam", "androidtv_remote"}
 
+# Matter-over-Thread sleepy end devices (SEDs) prone to python-matter-server's
+# dead-subscription stalemate after transient Thread border-router hops.
+MATTER_THREAD_WATCH_ENTITIES = {
+    "binary_sensor.entryway_entryway_motion_sensor_occupancy",
+}
+
+
+def _parse_active_srp_matter_services(srp_output: str) -> list[str]:
+    """Extract active (deleted: false) _matter._tcp service names from `ot-ctl srp server service`."""
+    active_services: list[str] = []
+    current_service: str | None = None
+    for raw_line in srp_output.splitlines():
+        line = raw_line.strip()
+        if line.endswith("._matter._tcp.default.service.arpa."):
+            current_service = line.replace(".default.service.arpa.", ".local.")
+        elif current_service and line.startswith("deleted:"):
+            is_deleted = line.split(":", 1)[1].strip().lower() == "true"
+            if not is_deleted and current_service not in active_services:
+                active_services.append(current_service)
+            current_service = None
+    return active_services
+
+
+def _auto_heal_matter_thread_nodes(states: list[dict]) -> list[str]:
+    """Detect unavailable Matter-over-Thread entities with active OTBR SRP leases and poke mDNS inside matterserver."""
+    unavailable_targets = [
+        s.get("entity_id", "")
+        for s in states
+        if s.get("entity_id") in MATTER_THREAD_WATCH_ENTITIES and s.get("state") == "unavailable"
+    ]
+    if not unavailable_targets:
+        return []
+
+    try:
+        import base64
+        from tools import nas_config
+    except ImportError:
+        try:
+            import base64
+            import nas_config  # type: ignore
+        except ImportError:
+            return []
+
+    rc, srp_out, _ = nas_config.run_ssh(
+        nas_config.HOST_1_IP,
+        "sudo /usr/local/bin/docker exec otbr ot-ctl srp server service",
+        timeout=15,
+    )
+    if rc != 0 or not srp_out:
+        return []
+
+    services = _parse_active_srp_matter_services(srp_out)
+    if not services:
+        return []
+
+    poke_script = f"""
+import socket, time
+from zeroconf import DNSOutgoing, DNSText, const
+
+services = {services!r}
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for svc in services:
+    out1 = DNSOutgoing(const._FLAGS_QR_RESPONSE | const._FLAGS_AA)
+    out1.add_answer_at_time(
+        DNSText(svc, const._TYPE_TXT, const._CLASS_IN | const._CLASS_UNIQUE, 120, b"\\x09SII=17000\\x08SAI=2500\\x08SAT=1000\\x03T=1"),
+        0,
+    )
+    for pkt in out1.packets():
+        sock.sendto(pkt, ("224.0.0.251", 5353))
+time.sleep(1.0)
+for svc in services:
+    out2 = DNSOutgoing(const._FLAGS_QR_RESPONSE | const._FLAGS_AA)
+    out2.add_answer_at_time(
+        DNSText(svc, const._TYPE_TXT, const._CLASS_IN | const._CLASS_UNIQUE, 120, b"\\x09SII=17000\\x08SAI=2500\\x08SAT=1000"),
+        0,
+    )
+    for pkt in out2.packets():
+        sock.sendto(pkt, ("224.0.0.251", 5353))
+sock.close()
+print("POKED_SERVICES=" + ",".join(services))
+"""
+    b64_payload = base64.b64encode(poke_script.encode("utf-8")).decode("ascii")
+    poke_cmd = (
+        f"sudo /usr/local/bin/docker exec matterserver python3 -c "
+        f"'import base64; exec(base64.b64decode(\"{b64_payload}\"))'"
+    )
+    rc2, poke_out, _ = nas_config.run_ssh(nas_config.HOST_1_IP, poke_cmd, timeout=20)
+    if rc2 == 0 and "POKED_SERVICES=" in poke_out:
+        print(
+            f"[HAReauthWatchdog] 🔄 Auto-healed Matter-over-Thread dead subscription for {unavailable_targets} via mDNS poke ({services}).",
+            file=sys.stderr,
+        )
+        return unavailable_targets
+    return []
+
 
 def _get_ha_config() -> tuple[str, str]:
     base_url = os.environ.get("HA_BASE_URL", "").rstrip("/")
@@ -146,12 +241,13 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
             "key": unique_key
         })
 
-    # 2. Check Persistent Notifications
+    # 2. Check Persistent Notifications & Matter-over-Thread Dead Subscriptions
     try:
         url = f"{base_url}/api/states"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             states = json.loads(resp.read().decode())
+        _auto_heal_matter_thread_nodes(states)
         for s in states:
             eid = s.get("entity_id", "")
             if eid.startswith("persistent_notification."):
