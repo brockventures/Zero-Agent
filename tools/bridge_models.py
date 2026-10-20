@@ -267,6 +267,7 @@ CHANNEL_MODEL_OVERRIDES: dict[int, str] = {
     1561509863018856468: "gemini-4-argon-medium",   # #gotchi
     # Tier 3: Gemini 4 Argon (Low) — Fast Conversational Speed + Argon Quality
     1542081375287640084: "gemini-4-argon-low",      # #zero-chat
+    1562246590943461429: "gemini-4-argon-low",      # #gotchi-chat
     1550577908811178095: "gemini-4-argon-low",      # #brock-house
     1544955538033348618: "gemini-4-argon-low",      # #shopping
     1544953277592899615: "gemini-4-argon-low",      # #steam-deck
@@ -308,7 +309,7 @@ def get_channel_model_override(
             "gotchi",
         ):
             return "gemini-4-argon-medium"
-        if cname in ("zero-chat", "brock-house", "shopping", "steam-deck", "the-banana-stand", "lounge"):
+        if cname in ("zero-chat", "gotchi-chat", "gotchi-log", "brock-house", "shopping", "steam-deck", "the-banana-stand", "lounge"):
             return "gemini-4-argon-low"
         if cname == "server-updates" or cname.startswith("seer"):
             return "gemini-3.8-flash-low"

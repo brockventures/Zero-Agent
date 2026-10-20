@@ -85,7 +85,10 @@ def _setup_blender_studio_and_render(
         obj = bpy.context.selected_objects[0]
         bpy.context.view_layer.objects.active = obj
 
-        # Smooth shading with weighted normals for clean mechanical & organic highlights
+        # Smooth shading with 32-degree edge split so mechanical CAD faces stay crisp while curves are smooth
+        edge_mod = obj.modifiers.new(name="AutoEdgeSplit", type="EDGE_SPLIT")
+        edge_mod.split_angle = math.radians(32.0)
+        edge_mod.use_edge_angle = True
         bpy.ops.object.shade_smooth()
 
         # 3. Configure Cycles Engine (8-vCPU path tracing)

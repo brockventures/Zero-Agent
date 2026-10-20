@@ -58,6 +58,7 @@ log = logging.getLogger("bridge_voice")
 PT_TZ = ZoneInfo("America/Los_Angeles")
 
 ZERO_VOICE_CHANNEL_ID = 1560924105279275042
+GOTCHI_CHAT_CHANNEL_ID = 1562246590943461429
 DEFAULT_LIVE_MODEL = "gemini-3.8-live"
 FALLBACK_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
 DEFAULT_VOICE_NAME = "Schedar"  # Even, steady, composed lower-middle male voice in Gemini Live
@@ -76,9 +77,15 @@ def _ensure_opus_loaded() -> bool:
         return False
 
 
-def _append_voice_turn_to_history(speaker: str, text: str) -> None:
-    """Persist voice turns to both `/workspace/data/voice_transcripts.json` and `#zero-chat`
-    `channel_history.json` so text turns in `#zero-chat` have full context of what was said on voice!
+def _append_voice_turn_to_history(
+    speaker: str,
+    text: str,
+    source_tag: str = "🎙️ #zero-voice",
+    extra_channel_ids: Optional[list[int]] = None,
+) -> None:
+    """Persist voice & Gotchi turns to both `/workspace/data/voice_transcripts.json` and `#zero-chat`
+    `channel_history.json` (plus any extra channel IDs like `#gotchi-chat`) so text, `#zero-voice`,
+    and Gotchi hardware share seamless conversational state!
     """
     clean = " ".join(text.strip().split())
     if not clean:
@@ -94,7 +101,15 @@ def _append_voice_turn_to_history(speaker: str, text: str) -> None:
                 items = json.loads(VOICE_TRANSCRIPT_FILE.read_text())
             except Exception:
                 items = []
-        items.append({"timestamp_utc": now_utc, "timestamp_pt": now_pt, "speaker": speaker, "text": clean})
+        items.append(
+            {
+                "timestamp_utc": now_utc,
+                "timestamp_pt": now_pt,
+                "speaker": speaker,
+                "source": source_tag,
+                "text": clean,
+            }
+        )
         VOICE_TRANSCRIPT_FILE.write_text(json.dumps(items[-200:], indent=2))
     except Exception as e:
         log.debug(f"[ZeroVoice] Failed writing voice_transcripts.json: {e}")
@@ -102,18 +117,27 @@ def _append_voice_turn_to_history(speaker: str, text: str) -> None:
     try:
         if CHANNEL_HISTORY_FILE.exists():
             ch_data = json.loads(CHANNEL_HISTORY_FILE.read_text())
-            ch_key = str(TARGET_CHANNEL_ID)
-            if ch_key in ch_data and isinstance(ch_data[ch_key], list):
-                ch_data[ch_key].append(
-                    {
-                        "author": speaker,
-                        "content": f"[🎙️ #zero-voice] {clean}",
-                        "timestamp": now_utc,
-                        "timestamp_pt": now_pt,
-                    }
-                )
-                ch_data[ch_key] = ch_data[ch_key][-50:]
-                CHANNEL_HISTORY_FILE.write_text(json.dumps(ch_data, indent=2))
+        else:
+            ch_data = {}
+        target_ids = [TARGET_CHANNEL_ID]
+        if extra_channel_ids:
+            for cid in extra_channel_ids:
+                if cid and cid not in target_ids:
+                    target_ids.append(cid)
+        for cid in target_ids:
+            ch_key = str(cid)
+            if ch_key not in ch_data or not isinstance(ch_data[ch_key], list):
+                ch_data[ch_key] = []
+            ch_data[ch_key].append(
+                {
+                    "author": speaker,
+                    "content": f"[{source_tag}] {clean}",
+                    "timestamp": now_utc,
+                    "timestamp_pt": now_pt,
+                }
+            )
+            ch_data[ch_key] = ch_data[ch_key][-50:]
+        CHANNEL_HISTORY_FILE.write_text(json.dumps(ch_data, indent=2))
     except Exception as e:
         log.debug(f"[ZeroVoice] Failed syncing voice turn to channel_history.json: {e}")
 

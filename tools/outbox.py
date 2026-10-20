@@ -49,6 +49,9 @@ KNOWN_CHANNELS = {
     "agora": 1558202642663211169,
     "brock-house": 1550577908811178095,
     "vault": 1550577910757458015,
+    "gotchi": 1561509863018856468,
+    "gotchi-chat": 1562246590943461429,
+    "gotchi-log": 1562246590943461429,
 }
 
 def resolve_channel(channel_input: str | int) -> tuple[str, int | None]:

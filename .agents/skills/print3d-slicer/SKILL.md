@@ -13,13 +13,32 @@ The **Print3D-Slicer** skill governs the headless preparation, cloud-accelerated
 ## 🎯 When to Activate This Skill
 
 Activate this skill whenever:
-- Converting an `.stl`, `.obj`, or `.3mf` into sliced `.gcode` for the Ender-3 V2.
+- Designing parametric mechanical CAD parts, enclosures, brackets, threads, or Gridfinity hardware in Python via **`build123d`** and **`bd_warehouse`** (OpenCASCADE B-Rep kernel).
+- Converting an `.stl`, `.obj`, `.step`, or `.3mf` into sliced `.gcode` for the Ender-3 V2.
 - Generating watertight solid meshes from raw 2D-to-3D outputs (Trellis, Meshy, Tripo3D) via Modal serverless compute.
 - Offloading heavy 3D CAD transforms, voxelization, or 360° turntable rendering to cloud compute.
 - Scaling models up or down while auditing physical FDM nozzle resolution limits.
 - Running headless OrcaSlicer on Host 2 (`<HOST_2_IP>`).
 - Extracting G-code metrics (estimated print time, filament grams, layer count, embedded thumbnail).
 - Dispatching sliced files to OctoPrint and starting the autonomous Zero Printer Watcher daemon.
+
+---
+
+## 🛠️ Parametric Mechanical CAD Standard (`build123d` + `bd_warehouse` OpenCASCADE B-Rep)
+
+For all functional 3D prints (enclosures, brackets, stands, snap-fit housings, threaded couplers, gears, and hardware mounts), **default to `build123d` + `bd_warehouse`** (OpenCASCADE B-Rep kernel) rather than writing manual `trimesh` vertex/polygon math:
+
+### 1. Environment & Persistence:
+- **Installed Location:** Persisted on NAS storage in `/workspace/.venv/modal` (symlinked at `/workspace/.venv/cad`) and linked globally into system `python3` via `/usr/local/lib/python3.11/dist-packages/zero_cad.pth`.
+- **Core Packages:**
+  - `build123d`: Analytical Boundary Representation (B-Rep) modeling (`BuildPart`, `BuildSketch`, `BuildLine`, exact topological `fillet()`, `chamfer()`, `offset()`, `loft()`, `sweep()`, and `section()`).
+  - `bd_warehouse`: Parametric hardware library (`bd_warehouse.thread.IsoThread`, `bd_warehouse.fastener`, `bd_warehouse.bearing`, `bd_warehouse.gear`, `bd_warehouse.pipe`).
+  - `manifold3d` + `trimesh`: Fast mesh verification, watertightness auditing, and bounding-box grounding.
+
+### 2. Why B-Rep (`build123d`) Replaces Raw Mesh CSG for Functional Parts:
+- **1-Line Topological Fillets & 45° FDM Chamfers:** Select edges topologically (`part.edges().filter_by(Axis.Z)` or `part.faces().sort_by(Axis.Z)[-1].edges()`) and apply exact `chamfer(..., length=0.8)` or `fillet(..., radius=1.5)` without manual trigonometry.
+- **Dual Export (`.step` + `.stl` / `.3mf`):** Always export both the analytical B-Rep `.step` file (`export_step(part.part, "model.step")`) for CAD interchange and high-resolution `.stl` (`export_stl(part.part, "model.stl", tolerance=0.002, angular_tolerance=0.05)`) for OrcaSlicer.
+- **Standard Hardware & Threads (`bd_warehouse`):** Generate true ISO metric threads (`IsoThread(major_diameter=6 * MM, pitch=1 * MM, length=10 * MM)`), counterbored M-series screw clearance holes (`CounterBoreHole`), and heat-set insert bosses directly in code.
 
 ---
 
@@ -132,24 +151,25 @@ nice -n 19 sudo docker exec orcaslicer /opt/orcaslicer/bin/orca-slicer \
 
 Whenever generating 3D renders, build plate previews, or layout visualizations:
 
-1. **Mandatory Real-World Aspect Ratio Invariant (`ax.set_box_aspect`):**
-   - **NEVER omit `ax.set_box_aspect()`** in matplotlib 3D projections.
-   - Matplotlib defaults to cubic normalization, scaling all three axes ($X, Y, Z$) to equal visual screen dimensions.
-   - For a 220×220mm build plate with a 20–35mm tall part, omitting `set_box_aspect` creates an artificial 6× to 10× vertical elongation ($Z$-axis stretch), distorting squat enclosures into towering chimneys.
-   - **Always enforce:** `ax.set_box_aspect((x_span, y_span, z_span))` (e.g. `ax.set_box_aspect((220, 220, z_max))` for build plates, or `(radius * 2, radius * 2, z_span)` for isolated parts).
+1. **Strict Ban on `matplotlib` `Poly3DCollection` for 3D Mesh Rendering (Painter's Algorithm Defect):**
+   - **NEVER use `matplotlib` `Poly3DCollection` to render 3D STL/CAD meshes.**
+   - `Poly3DCollection` has no per-pixel depth buffer (Z-buffer); it sorts whole triangles by their average centroid depth (Painter's Algorithm). On Boolean CSG meshes (`manifold3d` / `trimesh`), long diagonal triangles on flat outer bezels sort behind smaller internal cavity triangles, causing internal faces to bleed through outer walls as jagged diagonal shards.
+   - **Primary Standard — Headless Blender 4.2 (`bpy` + Cycles) on Modal (`tools/modal_render_3d.py`):**
+     - Offload 3D CAD previews, multi-part assembly renders, build-plate layouts, and 360° turntables to headless **Blender 4.2 Cycles** on Modal.
+     - For mechanical/hard-surface CAD parts, always apply an `EDGE_SPLIT` modifier (`split_angle = math.radians(32.0)`) or `shade_auto_smooth` so flat walls remain razor-sharp while cylindrical bores and fillets render smoothly.
+   - **Secondary Local Fallback — True Per-Pixel Barycentric Z-Buffer (`/workspace/gotchi/cad/render_labeled.py`):**
+     - If generating annotated 2D/3D orthographic diagrams locally without matplotlib 3D collections, use a true per-pixel barycentric Z-buffer with back-face culling and 2× SSAA (`rasterize_scene_zbuffer`), never `Poly3DCollection`.
 
-2. **Strict Ban on Naive Index-Strided Face Subsampling (`faces[::N]`):**
-   - **NEVER** downsample triangular meshes by taking arbitrary stride slices of the face index array (`faces[::3]`, `faces[::4]`).
-   - Slicing the index array breaks topological manifold continuity, dropping 67%–75% of surface triangles and rendering solid watertight plastic as a spiky, hollow, see-through wireframe birdcage.
-   - For fast visualization:
-     - Render intact watertight meshes with solid directional lighting (`Poly3DCollection` with surface normals lighting and `linewidths=0`, `edgecolors='none'`).
-     - If mesh density exceeds 100,000 faces, offload to Modal (`tools/modal_render_3d.py`) or use proper volumetric quadric edge-collapse decimation (`mesh.simplify_quadric_decimation()`), never raw array slicing.
+2. **Mandatory Real-World 1:1:1 Aspect Ratio Invariant:**
+   - All renders (Blender camera framing or orthographic projections) must preserve true 1:1:1 physical proportions so squat enclosures are never stretched vertically.
 
-3. **Dual-View Preview Standard (Assembled Product + Build Plate Layout):**
-   - Functional prints often require parts to be inverted or oriented sideways on the build plate to print support-free (e.g. lid roof resting flat against PEI bed).
-   - An inverted part on a build plate does not visually reflect the intended consumer product.
+3. **Strict Ban on Naive Index-Strided Face Subsampling (`faces[::N]`):**
+   - **NEVER** downsample triangular meshes by taking arbitrary stride slices of the face index array (`faces[::3]`, `faces[::4]`), which destroys manifold topology.
+
+4. **Dual-View Preview Standard (Assembled Product + Build Plate Layout):**
+   - Functional prints often require parts to be inverted or oriented sideways on the build plate to print cleanly.
    - Whenever staging a multi-part functional model, generate **both**:
-     1. **Assembled Form Preview:** Shows the parts mated in their final upright configuration (e.g. lid on base, looking like the finished product) with 3-point directional lighting.
+     1. **Assembled Form Preview:** Shows the parts mated in their final upright configuration (with distinct materials/colors per component) under 3-point studio area lighting.
      2. **Accurate Plate Layout Preview:** Shows the parts oriented on the 220×220 mm bed in true 1:1:1 physical proportion.
 
 ---
