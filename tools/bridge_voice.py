@@ -937,8 +937,20 @@ class ZeroVoiceSessionManager:
                             [send_task, recv_task],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
+                        for d in done:
+                            try:
+                                d.result()
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception as task_err:
+                                if "1000" not in str(task_err):
+                                    log.warning(f"[ZeroVoice] Stream task ended with error: {task_err}")
                         for p in pending:
                             p.cancel()
+                            try:
+                                await p
+                            except (asyncio.CancelledError, Exception):
+                                pass
                         break
                 except asyncio.CancelledError:
                     return
@@ -986,56 +998,64 @@ class ZeroVoiceSessionManager:
         zero_transcript_buf: list[str] = []
 
         while not self._stop_event.is_set():
-            async for response in session.receive():
-                if self._stop_event.is_set():
-                    break
+            try:
+                async for response in session.receive():
+                    if self._stop_event.is_set():
+                        break
 
-                sc = getattr(response, "server_content", None)
-                if sc:
-                    in_tr = getattr(sc, "input_transcription", None)
-                    if in_tr and getattr(in_tr, "text", None):
-                        user_transcript_buf.append(in_tr.text)
+                    sc = getattr(response, "server_content", None)
+                    if sc:
+                        in_tr = getattr(sc, "input_transcription", None)
+                        if in_tr and getattr(in_tr, "text", None):
+                            user_transcript_buf.append(in_tr.text)
 
-                    out_tr = getattr(sc, "output_transcription", None)
-                    if out_tr and getattr(out_tr, "text", None):
-                        zero_transcript_buf.append(out_tr.text)
+                        out_tr = getattr(sc, "output_transcription", None)
+                        if out_tr and getattr(out_tr, "text", None):
+                            zero_transcript_buf.append(out_tr.text)
 
-                    if getattr(sc, "interrupted", False):
-                        if self.audio_source:
-                            self.audio_source.clear_buffer()
+                        if getattr(sc, "interrupted", False):
+                            if self.audio_source:
+                                self.audio_source.clear_buffer()
 
-                    model_turn = getattr(sc, "model_turn", None)
-                    if model_turn and getattr(model_turn, "parts", None):
-                        for part in model_turn.parts:
-                            inline = getattr(part, "inline_data", None)
-                            if inline and getattr(inline, "data", None) and self.audio_source:
-                                self.audio_source.feed_gemini_pcm_24k_mono(inline.data)
+                        model_turn = getattr(sc, "model_turn", None)
+                        if model_turn and getattr(model_turn, "parts", None):
+                            for part in model_turn.parts:
+                                inline = getattr(part, "inline_data", None)
+                                if inline and getattr(inline, "data", None) and self.audio_source:
+                                    self.audio_source.feed_gemini_pcm_24k_mono(inline.data)
 
-                    if getattr(sc, "turn_complete", False) or getattr(sc, "interrupted", False):
+                        if getattr(sc, "turn_complete", False) or getattr(sc, "interrupted", False):
+                            if user_transcript_buf:
+                                _append_voice_turn_to_history("Ryan", "".join(user_transcript_buf))
+                                user_transcript_buf.clear()
+                            if zero_transcript_buf:
+                                _append_voice_turn_to_history("Zero", "".join(zero_transcript_buf))
+                                zero_transcript_buf.clear()
+
+                    tool_call = getattr(response, "tool_call", None)
+                    if tool_call and getattr(tool_call, "function_calls", None):
                         if user_transcript_buf:
                             _append_voice_turn_to_history("Ryan", "".join(user_transcript_buf))
                             user_transcript_buf.clear()
-                        if zero_transcript_buf:
-                            _append_voice_turn_to_history("Zero", "".join(zero_transcript_buf))
-                            zero_transcript_buf.clear()
-
-                tool_call = getattr(response, "tool_call", None)
-                if tool_call and getattr(tool_call, "function_calls", None):
-                    if user_transcript_buf:
-                        _append_voice_turn_to_history("Ryan", "".join(user_transcript_buf))
-                        user_transcript_buf.clear()
-                    func_responses = []
-                    for fc in tool_call.function_calls:
-                        res_dict = await self._execute_tool_call(fc, notify_channel)
-                        func_responses.append(
-                            types.FunctionResponse(
-                                id=getattr(fc, "id", None),
-                                name=fc.name,
-                                response=res_dict,
+                        func_responses = []
+                        for fc in tool_call.function_calls:
+                            res_dict = await self._execute_tool_call(fc, notify_channel)
+                            func_responses.append(
+                                types.FunctionResponse(
+                                    id=getattr(fc, "id", None),
+                                    name=fc.name,
+                                    response=res_dict,
+                                )
                             )
-                        )
-                    if func_responses:
-                        await session.send_tool_response(function_responses=func_responses)
+                        if func_responses:
+                            await session.send_tool_response(function_responses=func_responses)
+            except asyncio.CancelledError:
+                break
+            except Exception as rx_err:
+                if "1000" in str(rx_err) or "ConnectionClosedOK" in type(rx_err).__name__:
+                    log.info("[ZeroVoice] Gemini Live WebSocket closed cleanly (1000 OK).")
+                    break
+                raise
 
 
 _voice_manager: Optional[ZeroVoiceSessionManager] = None

@@ -278,3 +278,29 @@ def test_solar_inverter_weather_normalized_share_detection():
     assert res["solar_anomalies"][0]["entity_id"] == "sensor.inverter_test_9"
     assert res["solar_anomalies"][0]["reason"] == "dead_zero_output"
 
+
+def test_attempt_cast_speaker_reboot_respects_cooldown(monkeypatch):
+    import urllib.request
+    from tools.ha_anomaly_detector import attempt_cast_speaker_reboot
+
+    class DummyResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: DummyResp())
+    heal_state = {}
+    res1 = attempt_cast_speaker_reboot("198.51.100.214", "00:11:22:33:44:55", heal_state, now_ts=100000.0)
+    assert res1["rebooted"] is True
+    assert "cast_reboot" in res1["note"]
+
+    # Calling again within 24h should hit cooldown
+    res2 = attempt_cast_speaker_reboot("198.51.100.214", "00:11:22:33:44:55", heal_state, now_ts=100500.0)
+    assert res2["attempted"] is False
+    assert "cooldown" in res2["note"]
+
+

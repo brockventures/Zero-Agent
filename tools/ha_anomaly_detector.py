@@ -292,6 +292,81 @@ def _resolve_cast_eureka_name(ip: str, ctx: ssl.SSLContext) -> str:
     return ""
 
 
+def attempt_cast_speaker_reboot(
+    ip: str,
+    mac: str,
+    heal_state: dict[str, Any],
+    ctx: ssl.SSLContext | None = None,
+    unifi_opener: Any = None,
+    unifi_base: str = "",
+    csrf_token: str = "",
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Trigger a local Cast `/setup/reboot` (`{"params": "now"}`) or UniFi `reconnect-sta` with 24h cooldown."""
+    if not ip and not mac:
+        return {"attempted": False, "rebooted": False, "note": "Missing speaker IP/MAC"}
+    now_epoch = now_ts if now_ts is not None else time.time()
+    reboots_map = heal_state.setdefault("unifi_reboots", {})
+    last_ts = float(reboots_map.get(mac, {}).get("last_reboot_ts", 0.0))
+    if (now_epoch - last_ts) < HEAL_COOLDOWN_SECONDS:
+        return {
+            "attempted": False,
+            "rebooted": False,
+            "note": "Speaker self-heal in 24h cooldown",
+        }
+
+    ssl_ctx = ctx
+    if ssl_ctx is None:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    actions: list[str] = []
+    payload = json.dumps({"params": "now"}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if ip:
+        for url in (f"http://{ip}:8008/setup/reboot", f"https://{ip}:8443/setup/reboot"):
+            try:
+                req = urllib.request.Request(url, data=payload, headers=headers)
+                with urllib.request.urlopen(req, context=ssl_ctx, timeout=3.5) as resp:
+                    if resp.status in (200, 202, 204):
+                        actions.append("cast_reboot")
+                        break
+            except Exception:
+                pass
+
+    if unifi_opener is not None and unifi_base and mac:
+        try:
+            u_headers = {"Content-Type": "application/json"}
+            if csrf_token:
+                u_headers["X-CSRF-Token"] = csrf_token
+            u_payload = json.dumps({"cmd": "reconnect-sta", "mac": mac}).encode("utf-8")
+            u_req = urllib.request.Request(
+                f"{unifi_base.rstrip('/')}/proxy/network/api/s/default/cmd/stamgr",
+                data=u_payload,
+                headers=u_headers,
+            )
+            with unifi_opener.open(u_req, timeout=5.0) as resp:
+                if resp.status == 200:
+                    actions.append("unifi_reconnect_sta")
+        except Exception:
+            pass
+
+    if actions:
+        reboots_map[mac] = {"ip": ip, "actions": actions, "last_reboot_ts": now_epoch}
+        return {
+            "attempted": True,
+            "rebooted": True,
+            "note": f"Auto-reset speaker via `{' + '.join(actions)}`",
+        }
+
+    return {
+        "attempted": True,
+        "rebooted": False,
+        "note": f"Cast reboot & UniFi reconnect failed for `{ip}`",
+    }
+
+
 def export_unifi_to_victoriametrics(vm_url: str, client_summaries: list[dict[str, Any]]) -> bool:
     """Push compact per-client 24h/3h traffic gauges to VictoriaMetrics via Prometheus import API."""
     if not vm_url or not client_summaries:
@@ -323,6 +398,8 @@ def analyze_unifi_traffic_anomalies(
     days: int = 30,
     z_threshold: float = 4.0,
     vm_url: str = DEFAULT_VM_URL,
+    auto_heal: bool = True,
+    heal_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Query UCG-Max per-device traffic, export to VictoriaMetrics, and detect runaway bandwidth loops."""
     unifi_base, unifi_user, unifi_pw = _get_unifi_credentials()
@@ -489,6 +566,18 @@ def analyze_unifi_traffic_anomalies(
                     "z_score": eval_res["z_score"],
                 }
                 if eval_res["active_3h"]:
+                    if auto_heal and cat == "iot_speaker" and heal_state is not None:
+                        reb_res = attempt_cast_speaker_reboot(
+                            meta["ip"],
+                            mac,
+                            heal_state,
+                            ctx=ctx,
+                            unifi_opener=opener,
+                            unifi_base=unifi_base,
+                            csrf_token=csrf_token,
+                        )
+                        entry["heal_note"] = reb_res["note"]
+                        entry["rebooted"] = reb_res["rebooted"]
                     active_anomalies.append(entry)
                 else:
                     subsided_spikes.append(entry)
@@ -1127,7 +1216,15 @@ def analyze_anomalies(
 
     unifi_res: dict[str, Any] = {"monitored_clients": 0, "active_anomalies": [], "subsided_spikes": []}
     if include_unifi:
-        unifi_res = analyze_unifi_traffic_anomalies(days=30, z_threshold=z_threshold, vm_url=vm_url)
+        unifi_res = analyze_unifi_traffic_anomalies(
+            days=30,
+            z_threshold=z_threshold,
+            vm_url=vm_url,
+            auto_heal=auto_heal,
+            heal_state=heal_state,
+        )
+        if auto_heal:
+            save_heal_state(heal_state)
 
     network_anomalies = unifi_res.get("active_anomalies", [])
     subsided_network_spikes = unifi_res.get("subsided_spikes", [])
@@ -1246,10 +1343,13 @@ def format_report(res: dict[str, Any], quiet: bool = False) -> str:
     if net_active:
         lines.append("### 🌐 Runaway Network Traffic Anomalies (UniFi 30d Rolling MAD)")
         for n in net_active:
-            lines.append(
+            line = (
                 f"- **{n['name']}** (`{n['ip']}`): **{n['current_24h_gb']:.1f} GB** {n['direction'].lower()} in 24h "
                 f"(**{n['last_3h_gb']:.2f} GB** in last 3h) vs 30d baseline **{n['baseline_gb']:.1f} GB/day** (**{n['z_score']:.1f}σ**)"
             )
+            if n.get("heal_note"):
+                line += f"\n  - *Self-Heal:* {n['heal_note']}"
+            lines.append(line)
         lines.append("")
 
     if solar_anom:
