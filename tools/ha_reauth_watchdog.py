@@ -24,12 +24,6 @@ HOME_ASSISTANT_CHANNEL_ID = 1544953275877556334
 # Devices that routinely enter setup_retry when powered off at the wall
 BENIGN_STANDBY_DOMAINS = {"octoprint", "android_ip_webcam", "androidtv_remote"}
 
-# Matter-over-Thread sleepy end devices (SEDs) prone to python-matter-server's
-# dead-subscription stalemate after transient Thread border-router hops.
-MATTER_THREAD_WATCH_ENTITIES = {
-    "binary_sensor.entryway_entryway_motion_sensor_occupancy",
-}
-
 
 def _parse_active_srp_matter_services(srp_output: str) -> list[str]:
     """Extract active (deleted: false) _matter._tcp service names from `ot-ctl srp server service`."""
@@ -47,16 +41,37 @@ def _parse_active_srp_matter_services(srp_output: str) -> list[str]:
     return active_services
 
 
-def _auto_heal_matter_thread_nodes(states: list[dict]) -> list[str]:
-    """Detect unavailable Matter-over-Thread entities with active OTBR SRP leases and poke mDNS inside matterserver."""
-    unavailable_targets = [
-        s.get("entity_id", "")
-        for s in states
-        if s.get("entity_id") in MATTER_THREAD_WATCH_ENTITIES and s.get("state") == "unavailable"
-    ]
-    if not unavailable_targets:
-        return []
+def _find_stale_matter_thread_services(
+    active_srp_services: list[str],
+    compressed_fabric_id: int,
+    matter_nodes: list[dict],
+) -> list[str]:
+    """Intersect active OTBR Thread SRP leases with offline nodes in python-matter-server.
 
+    Returns the list of `<FABRIC_HEX>-<NODE_HEX>._matter._tcp.local.` service names
+    that are alive on Thread (`deleted: false` in OTBR) but stuck `available: false`
+    in `matterserver` due to `shutdown_subscription`.
+    """
+    if not active_srp_services or not compressed_fabric_id or not matter_nodes:
+        return []
+    fabric_hex = f"{compressed_fabric_id:016X}"
+    offline_services = {
+        f"{fabric_hex}-{int(n['node_id']):016X}._matter._tcp.local."
+        for n in matter_nodes
+        if n.get("node_id") is not None and not n.get("available", True)
+    }
+    return [svc for svc in active_srp_services if svc in offline_services]
+
+
+def _auto_heal_matter_thread_nodes(states: list[dict] | None = None) -> list[str]:
+    """Generalized Matter-over-Thread dead-subscription healer.
+
+    Queries OTBR's SRP table (`ot-ctl srp server service`) and `matterserver`'s
+    WebSocket (`get_nodes`). Any Thread node that holds an active SRP lease
+    (`deleted: false`) while marked `available: false` in `matterserver` gets a
+    1-second multicast mDNS TXT update poke inside `matterserver` to re-trigger
+    its subscription automatically.
+    """
     try:
         import base64
         from tools import nas_config
@@ -75,48 +90,76 @@ def _auto_heal_matter_thread_nodes(states: list[dict]) -> list[str]:
     if rc != 0 or not srp_out:
         return []
 
-    services = _parse_active_srp_matter_services(srp_out)
-    if not services:
+    active_srp_services = _parse_active_srp_matter_services(srp_out)
+    if not active_srp_services:
         return []
 
-    poke_script = f"""
-import socket, time
+    probe_and_poke_script = f"""
+import asyncio, json, socket, time, aiohttp
 from zeroconf import DNSOutgoing, DNSText, const
 
-services = {services!r}
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-for svc in services:
-    out1 = DNSOutgoing(const._FLAGS_QR_RESPONSE | const._FLAGS_AA)
-    out1.add_answer_at_time(
-        DNSText(svc, const._TYPE_TXT, const._CLASS_IN | const._CLASS_UNIQUE, 120, b"\\x09SII=17000\\x08SAI=2500\\x08SAT=1000\\x03T=1"),
-        0,
-    )
-    for pkt in out1.packets():
-        sock.sendto(pkt, ("224.0.0.251", 5353))
-time.sleep(1.0)
-for svc in services:
-    out2 = DNSOutgoing(const._FLAGS_QR_RESPONSE | const._FLAGS_AA)
-    out2.add_answer_at_time(
-        DNSText(svc, const._TYPE_TXT, const._CLASS_IN | const._CLASS_UNIQUE, 120, b"\\x09SII=17000\\x08SAI=2500\\x08SAT=1000"),
-        0,
-    )
-    for pkt in out2.packets():
-        sock.sendto(pkt, ("224.0.0.251", 5353))
-sock.close()
-print("POKED_SERVICES=" + ",".join(services))
+active_srp = {active_srp_services!r}
+
+async def run():
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect("http://127.0.0.1:5580/ws", timeout=10) as ws:
+            info = await ws.receive_json()
+            cfid = info.get("compressed_fabric_id")
+            await ws.send_json({{"message_id": "1", "command": "get_nodes"}})
+            res = await ws.receive_json()
+            nodes = res.get("result", [])
+
+    if not cfid:
+        return []
+    fabric_hex = f"{{cfid:016X}}"
+    offline_svcs = {{
+        f"{{fabric_hex}}-{{int(n['node_id']):016X}}._matter._tcp.local."
+        for n in nodes
+        if n.get("node_id") is not None and not n.get("available", True)
+    }}
+    targets = [svc for svc in active_srp if svc in offline_svcs]
+    if not targets:
+        return []
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for svc in targets:
+        out1 = DNSOutgoing(const._FLAGS_QR_RESPONSE | const._FLAGS_AA)
+        out1.add_answer_at_time(
+            DNSText(svc, const._TYPE_TXT, const._CLASS_IN | const._CLASS_UNIQUE, 120, b"\\x09SII=17000\\x08SAI=2500\\x08SAT=1000\\x03T=1"),
+            0,
+        )
+        for pkt in out1.packets():
+            sock.sendto(pkt, ("224.0.0.251", 5353))
+    time.sleep(1.0)
+    for svc in targets:
+        out2 = DNSOutgoing(const._FLAGS_QR_RESPONSE | const._FLAGS_AA)
+        out2.add_answer_at_time(
+            DNSText(svc, const._TYPE_TXT, const._CLASS_IN | const._CLASS_UNIQUE, 120, b"\\x09SII=17000\\x08SAI=2500\\x08SAT=1000"),
+            0,
+        )
+        for pkt in out2.packets():
+            sock.sendto(pkt, ("224.0.0.251", 5353))
+    sock.close()
+    print("POKED_SERVICES=" + ",".join(targets))
+    return targets
+
+asyncio.run(run())
 """
-    b64_payload = base64.b64encode(poke_script.encode("utf-8")).decode("ascii")
+    b64_payload = base64.b64encode(probe_and_poke_script.encode("utf-8")).decode("ascii")
     poke_cmd = (
         f"sudo /usr/local/bin/docker exec matterserver python3 -c "
         f"'import base64; exec(base64.b64decode(\"{b64_payload}\"))'"
     )
     rc2, poke_out, _ = nas_config.run_ssh(nas_config.HOST_1_IP, poke_cmd, timeout=20)
     if rc2 == 0 and "POKED_SERVICES=" in poke_out:
-        print(
-            f"[HAReauthWatchdog] 🔄 Auto-healed Matter-over-Thread dead subscription for {unavailable_targets} via mDNS poke ({services}).",
-            file=sys.stderr,
-        )
-        return unavailable_targets
+        for line in poke_out.splitlines():
+            if line.startswith("POKED_SERVICES="):
+                healed = [s for s in line.split("=", 1)[1].split(",") if s]
+                print(
+                    f"[HAReauthWatchdog] 🔄 Auto-healed Matter-over-Thread dead subscription(s) via mDNS poke: {healed}",
+                    file=sys.stderr,
+                )
+                return healed
     return []
 
 
