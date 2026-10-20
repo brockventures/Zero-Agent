@@ -167,6 +167,74 @@ class TestNasLogTriage(unittest.TestCase):
         for s in samples:
             self.assertIsNotNone(rx.search(s), f"Failed to match: {s}")
 
+    @patch("tools.nas_log_triage.scan_all_nas_containers")
+    @patch("tools.nas_log_triage.fetch_cisa_kev_catalog")
+    def test_kev_silent_when_patched(self, mock_kev, mock_scan):
+        mock_kev.return_value = [
+            {
+                "cveID": "CVE-2026-9999",
+                "vendorProject": "Plex",
+                "product": "Plex Media Server",
+                "vulnerabilityName": "Plex2Shell Arbitrary File Write",
+                "shortDescription": "Plex Media Server prior to 1.43.2 contains an RCE vulnerability.",
+                "requiredAction": "Upgrade to version 1.43.2 or later.",
+            }
+        ]
+        mock_scan.return_value = {
+            "total_scanned": 39,
+            "actionable_issues": [],
+            "stale_transients": [],
+            "host_errors": {},
+            "versions_by_host": {
+                "198.51.100.10": {
+                    "plex": "1.43.4.10903-e5521bd8c",
+                    "seerr": "v3.5.0",
+                    "synology-dsm": "7.3.2",
+                }
+            },
+            "duration_sec": 2.1,
+        }
+        ok, rep, extra = run_nas_log_review()
+        self.assertTrue(ok)
+        self.assertEqual(extra.get("kev_risks"), [])
+        self.assertEqual(extra.get("total_issues"), 0)
+        self.assertNotIn("Active Vulnerability", rep)
+
+    @patch("tools.nas_log_triage.scan_all_nas_containers")
+    @patch("tools.nas_log_triage.fetch_cisa_kev_catalog")
+    def test_kev_flags_vulnerable_version(self, mock_kev, mock_scan):
+        mock_kev.return_value = [
+            {
+                "cveID": "CVE-2026-9999",
+                "vendorProject": "F5",
+                "product": "NGINX",
+                "vulnerabilityName": "NGINX HTTP/3 RCE",
+                "shortDescription": "NGINX prior to 1.27.4 allows unauthenticated remote code execution.",
+                "requiredAction": "Apply updates per vendor instructions.",
+            }
+        ]
+        mock_scan.return_value = {
+            "total_scanned": 39,
+            "actionable_issues": [],
+            "stale_transients": [],
+            "host_errors": {},
+            "versions_by_host": {
+                "198.51.100.10": {
+                    "plex": "1.43.0.10000",
+                    "nginx": "1.26.2",
+                    "synology-dsm": "7.3.2",
+                }
+            },
+            "duration_sec": 2.1,
+        }
+        ok, rep, extra = run_nas_log_review()
+        self.assertTrue(ok)
+        self.assertEqual(len(extra.get("kev_risks", [])), 2)
+        self.assertGreaterEqual(extra.get("total_issues", 0), 2)
+        self.assertIn("Active Vulnerability / Version Floor Risk Flagged", rep)
+        self.assertIn("plex", rep)
+        self.assertIn("CVE-2026-9999", rep)
+
 if __name__ == "__main__":
     unittest.main()
 

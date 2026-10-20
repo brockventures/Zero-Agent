@@ -239,8 +239,187 @@ with ThreadPoolExecutor(max_workers=10) as executor:
         if r:
             flagged.append(r)
 
-print(json.dumps({'scanned': len(targets), 'flagged': flagged}))
+versions = {}
+try:
+    with open('/etc.defaults/VERSION') as vf:
+        kv = dict(re.findall(r'^(\w+)="([^"]*)"', vf.read(), re.M))
+        if kv.get('productversion'):
+            versions['synology-dsm'] = kv['productversion']
+except Exception:
+    pass
+
+try:
+    cnames = [t[0] for t in targets]
+    if cnames:
+        insp = subprocess.run(['docker', 'inspect'] + cnames, capture_output=True, text=True, timeout=4)
+        if insp.returncode == 0:
+            for item in json.loads(insp.stdout):
+                nm = item.get('Name', '').lstrip('/')
+                labels = (item.get('Config') or {}).get('Labels') or {}
+                ver = (
+                    labels.get('org.opencontainers.image.version')
+                    or labels.get('build_version')
+                    or labels.get('version')
+                    or ''
+                )
+                if ver:
+                    versions[nm] = ver
+except Exception:
+    pass
+
+print(json.dumps({'scanned': len(targets), 'flagged': flagged, 'versions': versions}))
 '''
+
+CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+KEV_CACHE_FILE = DATA_DIR / "cisa_kev_cache.json"
+
+# Deterministic minimum safe versions for exposed / core homelab services
+CRITICAL_MIN_VERSIONS = {
+    "plex": ("1.43.2", "Plex Media Server RCE / Plex2Shell (require >= 1.43.2)"),
+    "seerr": ("1.33.2", "Seerr / Overseerr security baseline"),
+    "overseerr": ("1.33.2", "Overseerr security baseline"),
+    "homeassistant": ("2024.1.0", "Home Assistant Core security baseline"),
+    "home-assistant": ("2024.1.0", "Home Assistant Core security baseline"),
+    "tautulli": ("2.13.0", "Tautulli unauthenticated RCE / path traversal fix"),
+    "synology-dsm": ("7.2.2", "Synology DSM Pwn2Own RCE baseline (require >= 7.2.2)"),
+}
+
+KEV_PRODUCT_MAP = {
+    "plex": ("plex", "plex media server"),
+    "homeassistant": ("home assistant", "home-assistant"),
+    "home-assistant": ("home assistant", "home-assistant"),
+    "synology-dsm": ("synology", "diskstation manager"),
+    "nginx": ("f5", "nginx"),
+    "cloudflared": ("cloudflare", "cloudflared"),
+    "zero-cloudflared": ("cloudflare", "cloudflared"),
+}
+
+
+def parse_semver_tuple(ver_str: str) -> tuple[int, ...]:
+    """Extract numeric version tuple (e.g. 'v1.43.4.10903-e5521' -> (1, 43, 4, 10903))."""
+    if not ver_str:
+        return ()
+    m = re.search(r"(\d+(?:\.\d+)+)", str(ver_str))
+    if not m:
+        return ()
+    return tuple(int(p) for p in m.group(1).split("."))
+
+
+def _is_version_below(running_ver: str, min_ver: str) -> bool:
+    """Return True only when both versions parse cleanly and running_ver < min_ver."""
+    r_tup = parse_semver_tuple(running_ver)
+    m_tup = parse_semver_tuple(min_ver)
+    if not r_tup or not m_tup:
+        return False
+    width = min(len(r_tup), len(m_tup))
+    if r_tup[:width] != m_tup[:width]:
+        return r_tup[:width] < m_tup[:width]
+    return len(r_tup) < len(m_tup)
+
+
+def fetch_cisa_kev_catalog(max_age_sec: int = 86400) -> list[dict]:
+    """Fetch CISA KEV catalog with 24h on-disk cache and silent fallback on network failure."""
+    import urllib.request
+
+    try:
+        if KEV_CACHE_FILE.exists() and (time.time() - KEV_CACHE_FILE.stat().st_mtime) < max_age_sec:
+            data = json.loads(KEV_CACHE_FILE.read_text())
+            return data.get("vulnerabilities", []) if isinstance(data, dict) else []
+    except Exception:
+        pass
+
+    try:
+        req = urllib.request.Request(CISA_KEV_URL, headers={"User-Agent": "Zero-Homelab-Monitor/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            if isinstance(data, dict) and "vulnerabilities" in data:
+                try:
+                    KEV_CACHE_FILE.write_text(raw)
+                except Exception:
+                    pass
+                return data["vulnerabilities"]
+    except Exception:
+        try:
+            if KEV_CACHE_FILE.exists():
+                data = json.loads(KEV_CACHE_FILE.read_text())
+                return data.get("vulnerabilities", []) if isinstance(data, dict) else []
+        except Exception:
+            pass
+    return []
+
+
+def evaluate_kev_risks(versions_by_host: dict, kev_catalog: list[dict] | None = None) -> list[dict]:
+    """
+    Silently evaluate running container/DSM versions against deterministic critical floors
+    and active CISA KEV advisories. Only returns items when a real version mismatch risk exists.
+    """
+    if not versions_by_host:
+        return []
+
+    risks = []
+    seen_keys = set()
+
+    # 1. Deterministic critical minimum version floor checks
+    for host, ver_map in versions_by_host.items():
+        if not isinstance(ver_map, dict):
+            continue
+        for service, running_ver in ver_map.items():
+            svc_key = service.lower()
+            if svc_key in CRITICAL_MIN_VERSIONS:
+                min_ver, desc = CRITICAL_MIN_VERSIONS[svc_key]
+                if _is_version_below(running_ver, min_ver):
+                    rkey = (host, svc_key, min_ver)
+                    if rkey not in seen_keys:
+                        seen_keys.add(rkey)
+                        risks.append({
+                            "host": host,
+                            "service": service,
+                            "running_version": running_ver,
+                            "fixed_version": min_ver,
+                            "cve_id": "CRITICAL-FLOOR",
+                            "summary": desc,
+                        })
+
+    # 2. CISA KEV catalog check against running versions
+    catalog = kev_catalog if kev_catalog is not None else fetch_cisa_kev_catalog()
+    if not catalog:
+        return risks
+
+    ver_extract_re = re.compile(r"(?:prior to|before|earlier than|<|<=)\s*v?(\d+\.\d+(?:\.\d+)*)", re.I)
+
+    for host, ver_map in versions_by_host.items():
+        if not isinstance(ver_map, dict):
+            continue
+        for service, running_ver in ver_map.items():
+            svc_key = service.lower()
+            if svc_key not in KEV_PRODUCT_MAP or not parse_semver_tuple(running_ver):
+                continue
+            vendor_kw, prod_kw = KEV_PRODUCT_MAP[svc_key]
+            for vuln in catalog:
+                v_vendor = str(vuln.get("vendorProject", "")).lower()
+                v_prod = str(vuln.get("product", "")).lower()
+                if vendor_kw not in v_vendor or prod_kw not in v_prod:
+                    continue
+                desc_text = f"{vuln.get('shortDescription', '')} {vuln.get('requiredAction', '')}"
+                m = ver_extract_re.search(desc_text)
+                if m:
+                    fixed_ver = m.group(1)
+                    if _is_version_below(running_ver, fixed_ver):
+                        cve_id = vuln.get("cveID", "CISA-KEV")
+                        rkey = (host, svc_key, cve_id)
+                        if rkey not in seen_keys:
+                            seen_keys.add(rkey)
+                            risks.append({
+                                "host": host,
+                                "service": service,
+                                "running_version": running_ver,
+                                "fixed_version": fixed_ver,
+                                "cve_id": cve_id,
+                                "summary": vuln.get("vulnerabilityName") or vuln.get("shortDescription", "")[:140],
+                            })
+
+    return risks
 
 def _ssh_python_batch(host: str, since: str = "24h", timeout: int = 20, port: str = None, key: str = None, user: str = None) -> dict:
     """Run the batch scanner remotely on a host via SSH in a single pass."""
@@ -276,6 +455,7 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
             "actionable_issues": list[dict],
             "stale_transients": list[dict],
             "host_errors": dict[str, str],
+            "versions_by_host": dict[str, dict],
             "duration_sec": float
         }
     """
@@ -286,6 +466,7 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
     stale = []
     total_scanned = 0
     host_errors = {}
+    versions_by_host = {}
 
     h1, h2, _ = _resolve_nas_config()
     hosts = [h1 or HOST_1_IP, h2 or HOST_2_IP]
@@ -299,6 +480,8 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
                 total_scanned += scanned
                 if res.get("error"):
                     host_errors[host] = res["error"]
+                if res.get("versions"):
+                    versions_by_host[host] = res["versions"]
                 for item in res.get("flagged", []):
                     item["host"] = host
                     if item.get("is_transient"):
@@ -314,8 +497,21 @@ def scan_all_nas_containers(since: str = "24h") -> dict:
         "actionable_issues": actionable,
         "stale_transients": stale,
         "host_errors": host_errors,
+        "versions_by_host": versions_by_host,
         "duration_sec": round(duration, 2)
     }
+
+
+def _format_kev_report_block(kev_risks: list[dict]) -> str:
+    if not kev_risks:
+        return ""
+    lines = ["🛡️ **Active Vulnerability / Version Floor Risk Flagged:**"]
+    for r in kev_risks:
+        lines.append(
+            f"- **{r['service']}** ({r['host']}): running `{r['running_version']}` < `{r['fixed_version']}` "
+            f"(`{r['cve_id']}` — {r['summary']})"
+        )
+    return "\n".join(lines)
 
 
 def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
@@ -330,6 +526,15 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     total_scanned = res["total_scanned"]
     actionable = res["actionable_issues"]
     stale = res["stale_transients"]
+    versions_by_host = res.get("versions_by_host", {})
+
+    # Silent high-threshold CISA KEV + critical version floor check
+    kev_risks = []
+    try:
+        kev_risks = evaluate_kev_risks(versions_by_host)
+    except Exception:
+        kev_risks = []
+    kev_report = _format_kev_report_block(kev_risks)
 
     # Run Home Assistant + VictoriaMetrics statistical telemetry & self-healing check
     ha_telemetry = {}
@@ -343,10 +548,11 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
         ha_telemetry = {"ok": False, "error": str(e)}
 
     extra = {
-        "total_issues": len(actionable),
-        "tier1_count": sum(1 for a in actionable if any("fatal" in s.lower() or "panic" in s.lower() or re.search(r"\boom\b", s, re.I) for s in a.get("sample_errors", []))),
+        "total_issues": len(actionable) + len(kev_risks),
+        "tier1_count": sum(1 for a in actionable if any("fatal" in s.lower() or "panic" in s.lower() or re.search(r"\boom\b", s, re.I) for s in a.get("sample_errors", []))) + len(kev_risks),
         "tier2_count": len(actionable),
         "dossier": actionable,
+        "kev_risks": kev_risks,
         "stale_transients": stale,
         "duration_sec": res["duration_sec"],
         "scanned": total_scanned,
@@ -370,12 +576,16 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
             rep = f"⚠️ **NAS Log Review** [{now_pt}]: {total_scanned} containers healthy, but scan failed on {err_hosts}."
             if ha_report:
                 rep = f"{rep}\n\n{ha_report}"
+            if kev_report:
+                rep = f"{rep}\n\n{kev_report}"
             return False, rep, extra
         monitored_ha = ha_telemetry.get("monitored_count", 0)
         ha_suffix = f" ({monitored_ha} HA sensors nominal)" if monitored_ha and not ha_report else ""
         rep = f"🗄️ **NAS Log Review** [{now_pt}]: All {total_scanned} containers healthy across .82 and .84{ha_suffix}. ✅"
         if ha_report:
             rep = f"{rep}\n\n{ha_report}"
+        if kev_report:
+            rep = f"{rep}\n\n{kev_report}"
         return True, rep, extra
 
     # Candidate issues detected
@@ -401,6 +611,9 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     if ha_report:
         lines.append(f"\n{ha_report}")
 
+    if kev_report:
+        lines.append(f"\n{kev_report}")
+
     return True, "\n".join(lines).strip(), extra
 
 
@@ -408,12 +621,14 @@ def format_autonomous_triage_prompt(extra: dict) -> str:
     """Format an actionable prompt for Zero to investigate and auto-remediate flagged containers."""
     now_pt = datetime.now(PT).strftime("%A, %b %d, %Y, %I:%M %p PT")
     actionable = extra.get("dossier", [])
+    kev_risks = extra.get("kev_risks", [])
     stale = extra.get("stale_transients", [])
     ha_telemetry = extra.get("ha_telemetry", {})
     total = len(actionable)
 
     dossier_json = json.dumps({
         "actionable_containers": actionable,
+        "kev_vulnerability_risks": kev_risks,
         "cleared_stale_transients": [s["container"] for s in stale],
         "ha_telemetry_anomalies": {
             "healed_events": ha_telemetry.get("healed_events", []),
