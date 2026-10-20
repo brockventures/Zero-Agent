@@ -785,6 +785,9 @@ class TurnCoordinator:
                         "EOF",
                         "server_error",
                         "temporarily unavailable",
+                        "INVALID_ARGUMENT",
+                        "invalid argument",
+                        "code 400",
                     )
                 ):
                     print(

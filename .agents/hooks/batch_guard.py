@@ -24,7 +24,13 @@ WIDE_VIEW_MIN_LINES = 350
 MAX_CONSECUTIVE_FILE_VIEWS = 4
 MAX_CONSECUTIVE_SAME_FILE_EDITS = 3
 MAX_CONSECUTIVE_GIT_CMDS = 2
+MAX_VERSIONED_SCRATCH_SWEEPS = 3
 TURN_RESET_IDLE_SECONDS = 45.0
+
+_VERSIONED_SCRATCH_SWEEP_RE = re.compile(
+    r"(?:^|/)(?:scratch|brain/[^/]+/scratch)/(?P<stem>[a-zA-Z0-9_-]*?(?:sim|sweep|grid|solve|tune|calib)[a-zA-Z0-9_-]*?)_v\d+\.py$",
+    re.IGNORECASE,
+)
 
 
 def _default_state(now: float = 0.0) -> dict:
@@ -39,6 +45,7 @@ def _default_state(now: float = 0.0) -> dict:
         "same_file_edit_count": 0,
         "consecutive_git_cmds": 0,
         "agora_eval_calls": 0,
+        "versioned_scratch_sweeps": [],
     }
 
 
@@ -349,8 +356,9 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
         save_state(state, state_file)
         return True, ""
 
-    # 4. write_to_file resets consecutive counters (zero cumulative scratch-write cap)
-    if name == "write_to_file":
+    # 4. write_to_file / write_file resets consecutive counters and blocks LLM-in-the-loop versioned scratch sweep loops (sim_v1..v14.py)
+    if name in ("write_to_file", "write_file"):
+        target_file = args.get("TargetFile") or args.get("Path") or ""
         state["cmd_inspections"] = 0
         state["consecutive_inline_python"] = 0
         state["consecutive_file_views"] = 0
@@ -359,6 +367,22 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
         state["last_edited_file"] = ""
         state["same_file_edit_count"] = 0
         state["consecutive_git_cmds"] = 0
+
+        if target_file and _VERSIONED_SCRATCH_SWEEP_RE.search(target_file):
+            sweeps = list(state.get("versioned_scratch_sweeps", []))
+            if target_file not in sweeps:
+                sweeps.append(target_file)
+            state["versioned_scratch_sweeps"] = sweeps
+            if len(sweeps) > MAX_VERSIONED_SCRATCH_SWEEPS:
+                save_state(state, state_file)
+                return False, (
+                    f"Batch & Modal Offload Invariant Triggered: Detected {len(sweeps)} versioned scratch sweep scripts "
+                    f"({', '.join(os.path.basename(s) for s in sweeps[-4:])}) in a single turn (limit: {MAX_VERSIONED_SCRATCH_SWEEPS}). "
+                    "Do not run iterative LLM-in-the-loop scratch simulation sweeps (sim_v1..vN.py) that burn the 60-minute turn ceiling. "
+                    "Evaluate all parameter combinations inside a single vectorized Python loop or offload multi-combo sweeps to "
+                    "'/baseball/big-projections/modal_harness.py --mode grid' (or detached_runner.py for jobs >2m)."
+                )
+
         save_state(state, state_file)
         return True, ""
 

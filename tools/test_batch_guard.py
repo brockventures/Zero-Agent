@@ -203,6 +203,21 @@ class TestBatchGuard(unittest.TestCase):
         self.assertFalse(allowed, "Second agora status/eval should be blocked")
         self.assertIn("Agora Fast-Path Invariant", reason)
 
+    def test_versioned_scratch_sweep_loop_blocked_after_three(self):
+        for v in range(1, 4):
+            allowed, _ = check_tool_use(
+                "write_file",
+                {"Path": f"/root/.gemini/antigravity-cli/brain/0c46714e/scratch/sim_31_v{v}.py"},
+            )
+            self.assertTrue(allowed, f"sim_31_v{v}.py should be allowed")
+        allowed, reason = check_tool_use(
+            "write_file",
+            {"Path": "/root/.gemini/antigravity-cli/brain/0c46714e/scratch/sim_31_v4.py"},
+        )
+        self.assertFalse(allowed, "4th versioned scratch sweep script should be blocked")
+        self.assertIn("Modal Offload Invariant Triggered", reason)
+        self.assertIn("modal_harness.py", reason)
+
 
 if __name__ == "__main__":
     unittest.main()
