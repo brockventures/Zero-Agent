@@ -428,10 +428,25 @@ def strip_internal_cli_chatter(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # 2. Line-by-line scrubbing for chatter / sentinel leaks
+    # 2. Line-by-line scrubbing for chatter / sentinel leaks and stray non-ASCII sampler tokens
     lines = text.split("\n")
     cleaned_lines = []
     for line in lines:
+        ls = line.strip()
+        if (
+            ls
+            and not any(c.isascii() and c.isalnum() for c in ls)
+            and any(ord(c) > 127 for c in ls)
+            and all(
+                not (0x1F000 <= ord(c) <= 0x1FAFF or 0x2600 <= ord(c) <= 0x27BF)
+                for c in ls
+            )
+            and any(
+                ord(c) > 127 and ord(c) not in (0x2013, 0x2014, 0x2022, 0x2026)
+                for c in ls
+            )
+        ):
+            continue
         matched = False
         for pat in CLI_LEAK_LINE_PATTERNS:
             if re.search(pat, line, re.IGNORECASE):
@@ -613,8 +628,9 @@ def is_internal_cli_leak(text: str) -> bool:
     words = [w for w in cleaned.split() if any(c.isalnum() for c in w)]
     if not words and not any(ord(c) > 127 for c in cleaned):
         return True
-    # Stray CJK / punctuation empty-turn sampler tokens (e.g. "即是", "...") with no ASCII words or emojis
-    if len(cleaned) <= 12 and not any(c.isascii() and c.isalnum() for c in cleaned):
+    # Stray non-ASCII / CJK / Devanagari / punctuation empty-turn sampler tokens (e.g. "即是", "देणें", "...")
+    # with zero ASCII alphanumeric characters and zero emojis across single or multi-line outputs
+    if not any(c.isascii() and c.isalnum() for c in cleaned):
         if all(not (0x1F000 <= ord(c) <= 0x1FAFF or 0x2600 <= ord(c) <= 0x27BF) for c in cleaned):
             return True
     if len(words) <= 25:

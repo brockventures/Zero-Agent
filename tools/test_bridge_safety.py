@@ -226,6 +226,19 @@ class TestBridgeSafety(unittest.TestCase):
         self.assertTrue(is_internal_cli_leak(standalone_task))
         self.assertEqual(strip_internal_cli_chatter(standalone_task), "")
 
+    def test_multiline_non_ascii_sampler_glitch_filtering(self):
+        # Single and multi-line non-ASCII sampler glitches (e.g. Devanagari "देणें" x3 = 17 chars)
+        self.assertTrue(is_internal_cli_leak("देणें"))
+        self.assertTrue(is_internal_cli_leak("देणें\nदेणें\nदेणें"))
+        self.assertEqual(strip_internal_cli_chatter("देणें\nदेणें\nदेणें"), "")
+        self.assertEqual(
+            strip_internal_cli_chatter("देणें\nदेणें\nHere is the verified projection update."),
+            "Here is the verified projection update.",
+        )
+        # Standalone emojis must NOT be treated as leaks
+        self.assertFalse(is_internal_cli_leak("⚾"))
+        self.assertEqual(strip_internal_cli_chatter("⚾"), "⚾")
+
 
 if __name__ == "__main__":
     unittest.main()

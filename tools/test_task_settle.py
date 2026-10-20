@@ -471,6 +471,26 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
         pending = get_turn_pending_tasks(self.conv_id, brain_dir=self.test_dir)
         self.assertEqual(pending, [])
 
+    def test_get_turn_pending_tasks_ignores_quoted_code_or_unprefixed_phantom_task(self):
+        """Verify that reading a test file containing 'Tool is running as a background task with task id: task-999' does not trigger a phantom pending task."""
+        tpath = self.logs_dir / "transcript.jsonl"
+        lines = [
+            json.dumps({
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": "Check bridge safety tests",
+            }),
+            json.dumps({
+                "type": "GENERIC",
+                "source": "MODEL",
+                "content": 'Showing lines 1-60:\n42: self.assertTrue(is_internal_cli_leak("Tool is running as a background task with task id: task-999"))',
+            }),
+        ]
+        tpath.write_text("\n".join(lines), encoding="utf-8")
+
+        pending = get_turn_pending_tasks(self.conv_id, brain_dir=self.test_dir)
+        self.assertEqual(pending, [])
+
 
 
     def test_dispatch_full_output_vs_tail_excerpt(self):

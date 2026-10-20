@@ -766,6 +766,7 @@ class TurnCoordinator:
                                 f"(tasks={len(pending_sdk_tasks)}, reason={t_status.get('reason')}); continuing stdout stream..."
                             )
                             self.result_received_at = None
+                            stream_parser.final_result_response = ""
                             continue
                     except Exception as pte:
                         print(f"[BridgeEngine] Warning checking pending tasks on result: {pte}")

@@ -362,6 +362,30 @@ class TestBridgeStream(unittest.TestCase):
         })
         self.assertEqual(parser.get_final_response(), full_answer)
 
+    def test_intermediate_result_cleared_by_subsequent_tool_calls(self):
+        parser = AgyStreamParser(conv_id="conv-ivy-devanagari")
+        # Multi-line non-ASCII sampler glitch in an intermediate result event
+        parser.process_event({
+            "event": "result",
+            "result": {
+                "conversation_id": "conv-ivy-devanagari",
+                "response": "देणें\nदेणें\nदेणें",
+            },
+        })
+        self.assertEqual(parser.final_result_response, "")
+
+        # Even if an intermediate result had non-leak text, subsequent tool calls must clear it
+        parser.final_result_response = "Intermediate sub-turn text"
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "tool_name": "run_command",
+            },
+        })
+        self.assertEqual(parser.final_result_response, "")
+        self.assertEqual(parser.get_final_response(), "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -123,14 +123,16 @@ def get_turn_pending_tasks(
                 continue
 
             content = str(d.get("content", ""))
-            # Launch pattern: "Tool is running as a background task with task id: <tid>"
-            for m in re.finditer(r"Tool is running as a background task with task id:\s*([^\s\n]+)", content):
+            # Launch pattern: "Tool is running as a background task with task id: <tid>" (strictly anchored to line start)
+            for m in re.finditer(r"(?m)^Tool is running as a background task with task id:\s*([^\s\n]+)", content):
                 full_tid = m.group(1).strip("\"'.,;:()`[]{}")
+                has_conv_prefix = False
                 if "/" in full_tid:
                     cid_prefix, clean_tid = full_tid.split("/", 1)
                     if cid_prefix != conv_id:
                         # Belongs to a different conversation (e.g. foreign transcript inspection)
                         continue
+                    has_conv_prefix = True
                 else:
                     clean_tid = full_tid
 
@@ -139,11 +141,11 @@ def get_turn_pending_tasks(
                 if not clean_tid:
                     continue
 
-                # Strict disk validation: Non-standard task IDs (anything not starting with task-)
+                # Strict disk validation: Unprefixed task IDs or non-standard task IDs
                 # must exist on disk under this conversation's task directory.
                 task_log = conv_path / ".system_generated" / "tasks" / f"{clean_tid}.log"
                 task_dir_entry = conv_path / ".system_generated" / "tasks" / clean_tid
-                if not clean_tid.startswith("task-"):
+                if not has_conv_prefix or not clean_tid.startswith("task-"):
                     if not task_log.exists() and not task_dir_entry.exists():
                         continue
 

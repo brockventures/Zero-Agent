@@ -416,9 +416,10 @@ class AgyStreamParser:
             tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
 
             if (stype in ("tool",) or tname):
-                # Tool execution: clear pre-tool narration, but preserve substantive response across system tasks
+                # Tool execution: clear pre-tool narration and any stale intermediate result, preserving substantive response across system tasks
                 self.accumulated_segment.clear()
                 self.interrupted_draft = ""
+                self.final_result_response = ""
                 self.is_explicit_silence = False
                 self.current_agent_step_index = None
 
@@ -473,6 +474,7 @@ class AgyStreamParser:
         elif ev_type in ("tool", "tool_call", "tool_use"):
             self.accumulated_segment.clear()
             self.interrupted_draft = ""
+            self.final_result_response = ""
             self.is_explicit_silence = False
             self.current_agent_step_index = None
 
