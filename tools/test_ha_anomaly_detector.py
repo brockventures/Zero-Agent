@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for Home Assistant Statistical Telemetry Anomaly Detector & Self-Healer (Task #58)."""
+"""Unit tests for Home Assistant & UniFi Statistical Telemetry Anomaly Detector & Self-Healer (Task #58)."""
 
 import sys
 
@@ -9,9 +9,11 @@ for _p in ("/workspace", "/workspace/tools"):
 
 from tools.ha_anomaly_detector import (
     NEVER_RELOAD_DOMAINS,
+    classify_unifi_client,
     compute_flatline_age_hours,
     compute_mad_score,
     compute_overdue_threshold_hours,
+    evaluate_client_traffic_series,
     format_report,
     is_monitored_sensor,
 )
@@ -92,19 +94,24 @@ def test_format_report_outputs_clean_markdown():
         "vm_healthy": True,
         "vm_series_count": 412,
         "monitored_count": 88,
+        "unifi_clients_count": 68,
         "healed_events": [],
         "zombies": [],
         "amplitude_anomalies": [],
+        "network_anomalies": [],
+        "subsided_network_spikes": [],
         "has_anomalies": False,
     }
     assert format_report(nominal, quiet=True) == ""
-    assert "HA Telemetry Nominal" in format_report(nominal, quiet=False)
+    assert "HA & Network Telemetry Nominal" in format_report(nominal, quiet=False)
+    assert "68 UniFi clients" in format_report(nominal, quiet=False)
 
     alert = {
         "ok": True,
         "vm_healthy": True,
         "vm_series_count": 0,
         "monitored_count": 88,
+        "unifi_clients_count": 68,
         "healed_events": [
             {
                 "entity_id": "sensor.patio_temp",
@@ -124,6 +131,21 @@ def test_format_report_outputs_clean_markdown():
             }
         ],
         "amplitude_anomalies": [],
+        "network_anomalies": [
+            {
+                "mac": "00:11:22:33:44:55",
+                "name": "Kitchen speaker (Google-Home-Speaker)",
+                "ip": "198.51.100.214",
+                "category": "iot_speaker",
+                "direction": "Download",
+                "current_24h_gb": 136.3,
+                "last_3h_gb": 28.4,
+                "baseline_gb": 6.2,
+                "mad_gb": 1.1,
+                "z_score": 52.0,
+            }
+        ],
+        "subsided_network_spikes": [],
         "has_anomalies": True,
     }
     out = format_report(alert, quiet=True)
@@ -131,6 +153,8 @@ def test_format_report_outputs_clean_markdown():
     assert "Frozen / Zombie Sensors" in out
     assert "64.2h" in out
     assert "reload:nest_protect" in out
+    assert "Runaway Network Traffic Anomalies" in out
+    assert "Kitchen speaker" in out
 
 
 def test_query_vm_history_filters_metadata_and_converts_celsius(monkeypatch):
@@ -188,4 +212,69 @@ def test_compute_overdue_threshold_hours_filters_uniform_vm_grid():
     thresh = compute_overdue_threshold_hours(ts_list, default_max_hours=24.0, values=vals)
     assert thresh > 48.0
 
+
+def test_unifi_traffic_anomaly_detection_and_baseline_drift_guard():
+    assert classify_unifi_client("Google-Home-Speaker", "Google, Inc.", is_wired=False) == "iot_speaker"
+    assert classify_unifi_client("Nest-Cam-indoor", "Google, Inc.", is_wired=False) == "camera"
+    assert classify_unifi_client("Living-Room-TV", "Google, Inc.", is_wired=True) == "general"
+
+    # Simulate 17 normal days (~6 GB/day) + 12 days of runaway firmware loop (~150 GB/day)
+    speaker_hist = [5.8, 6.2, 6.0, 5.5, 6.4, 7.1, 5.9, 6.3, 6.0, 5.7, 6.1, 6.5, 5.9, 6.2, 6.0, 5.8, 6.1] + [150.0] * 12
+
+    # Case 1: Active runaway loop (136 GB in 24h, 25 GB in last 3h) -> flagged as active
+    res_active = evaluate_client_traffic_series(
+        daily_gb_series=speaker_hist,
+        last_24h_gb=136.3,
+        last_3h_gb=25.0,
+        category="iot_speaker",
+    )
+    assert res_active["anomalous_24h"] is True
+    assert res_active["active_3h"] is True
+    assert res_active["baseline_gb"] < 8.0
+    assert res_active["z_score"] >= 10.0
+
+    # Case 2: Subsided runaway loop (136 GB in 24h, but patched 5h ago so last 3h is 0.05 GB) -> anomalous_24h True, active_3h False
+    res_subsided = evaluate_client_traffic_series(
+        daily_gb_series=speaker_hist,
+        last_24h_gb=136.3,
+        last_3h_gb=0.05,
+        category="iot_speaker",
+    )
+    assert res_subsided["anomalous_24h"] is True
+    assert res_subsided["active_3h"] is False
+
+    # Case 3: Wired Living Room TV watching 4K video (11.8 GB in 24h vs 0.1 GB median) -> ignored by 25 GB general noise floor
+    tv_hist = [0.05, 0.08, 0.1, 0.04, 0.02, 0.12, 0.09] * 4
+    res_tv = evaluate_client_traffic_series(
+        daily_gb_series=tv_hist,
+        last_24h_gb=11.8,
+        last_3h_gb=11.7,
+        category="general",
+    )
+    assert res_tv["anomalous_24h"] is False
+
+
+def test_solar_inverter_weather_normalized_share_detection():
+    from tools.ha_anomaly_detector import evaluate_solar_inverter_shares
+
+    # 5 days of 10-panel array where each panel normally produces ~10% of the array (even on a cloudy day at day 3)
+    days_ts = [1700000000 + i * 86400 for i in range(5)]
+    panel_daily_wh = {}
+    for p in range(10):
+        eid = f"sensor.inverter_test_{p}"
+        pts = []
+        for d_idx, ts in enumerate(days_ts):
+            base_wh = 400.0 if d_idx == 2 else 1000.0  # Day 2 is cloudy (4 kWh total vs 10 kWh total)
+            if p == 9 and d_idx == 4:
+                # Panel 9 dies on the final day (5 Wh instead of 1000 Wh)
+                pts.append((ts, 5.0))
+            else:
+                pts.append((ts, base_wh))
+        panel_daily_wh[eid] = pts
+
+    res = evaluate_solar_inverter_shares(panel_daily_wh, min_array_wh=3000.0)
+    assert res["monitored_inverters"] == 10
+    assert len(res["solar_anomalies"]) == 1
+    assert res["solar_anomalies"][0]["entity_id"] == "sensor.inverter_test_9"
+    assert res["solar_anomalies"][0]["reason"] == "dead_zero_output"
 

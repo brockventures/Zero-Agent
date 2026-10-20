@@ -1552,9 +1552,12 @@ def run_kalshi_paper_bot():
         return False, f"⚠️ Kalshi quant sidecar error: {e}", {"error": str(e)}
 
 def run_kalshi_performance_review(phase="all"):
-    """Execute Kalshi paper trading evening settlement, performance review, and task board sync."""
+    """Execute Kalshi paper trading settlement, performance review, and task board sync."""
     import subprocess
     try:
+        if phase == "night":
+            # At 6:45 PM PT (silent sweep), also scan Book 1 weather before running Books 2-5 and settlement
+            subprocess.run(["python3", "/workspace/tools/kalshi_paper_bot.py", "trade"], capture_output=True, text=True, check=False)
         # Trigger quant expansion sweep to settle positions, compound funding, and ratchet trailing stops
         subprocess.run(["python3", "/workspace/tools/sidecars.py", "quant"], capture_output=True, text=True, check=False)
         cmd = ["python3", "/workspace/tools/kalshi_performance_review.py", f"--phase={phase}"]

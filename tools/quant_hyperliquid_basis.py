@@ -146,7 +146,9 @@ def fetch_hyperliquid_meta():
                 name = u.get("name")
                 mark_px = float(ctx.get("markPx") or 0.0)
                 oracle_px = float(ctx.get("oraclePx") or 0.0)
-                funding_8h = float(ctx.get("funding") or 0.0)
+                # Hyperliquid metaAndAssetCtxs returns the 1-hour funding rate; multiply by 8 for 8-hour equivalent
+                funding_1h = float(ctx.get("funding") or 0.0)
+                funding_8h = round(funding_1h * 8.0, 8)
                 open_interest = float(ctx.get("openInterest") or 0.0)
                 
                 annualized = round(funding_8h * 3.0 * 365.0, 4)
@@ -155,6 +157,7 @@ def fetch_hyperliquid_meta():
                     "name": name,
                     "mark_px": mark_px,
                     "oracle_px": oracle_px,
+                    "funding_1h": funding_1h,
                     "funding_8h": funding_8h,
                     "annualized_yield": annualized,
                     "open_interest_usd": round(open_interest * mark_px, 2)
@@ -165,13 +168,14 @@ def fetch_hyperliquid_meta():
         return []
 
 def accrue_funding_payments(conn, assets_by_name):
-    """Simulate 8-hour funding payment collection for all active basis positions."""
+    """Simulate funding payment collection for all active basis positions scaled by elapsed hours."""
     cur = conn.execute("SELECT * FROM hyperliquid_positions WHERE status = 'OPEN'")
     open_positions = cur.fetchall()
     if not open_positions:
         return 0.0
         
-    now_str = datetime.now(PT).isoformat()
+    now_dt = datetime.now(PT)
+    now_str = now_dt.isoformat()
     total_accrued = 0.0
     
     for pos in open_positions:
@@ -188,9 +192,27 @@ def accrue_funding_payments(conn, assets_by_name):
         
         if eff_rate_8h <= 0.0:
             continue
+
+        # Scale accrual by elapsed 8-hour intervals since last accrual for this position (default 1.0 interval)
+        intervals_8h = 1.0
+        try:
+            last_row = conn.execute(
+                "SELECT timestamp FROM hyperliquid_funding_accruals WHERE asset = ? ORDER BY id DESC LIMIT 1",
+                (asset,)
+            ).fetchone()
+            ref_ts = last_row["timestamp"] if last_row else pos["opened_at"]
+            if ref_ts:
+                ref_dt = datetime.fromisoformat(ref_ts)
+                if ref_dt.tzinfo is None:
+                    ref_dt = ref_dt.replace(tzinfo=PT)
+                elapsed_hours = (now_dt - ref_dt).total_seconds() / 3600.0
+                if elapsed_hours >= 0.25:
+                    intervals_8h = min(3.0, max(0.25, elapsed_hours / 8.0))
+        except Exception:
+            intervals_8h = 1.0
             
         allocated = pos["allocated_usd"]
-        payment = round(allocated * eff_rate_8h, 4)
+        payment = round(allocated * eff_rate_8h * intervals_8h, 4)
         total_accrued += payment
         
         with conn:
@@ -317,23 +339,25 @@ def manage_basis_portfolio(conn, assets, verbose: bool = False):
         "pm_thesis": "",
         "model_used": "gemini-4-argon-high",
     }
-    try:
-        from tools.llm_sidecar import evaluate_quant_candidates_llm
-        pm_decision = evaluate_quant_candidates_llm(
-            "quant_hyperliquid_basis",
-            "Track 3: Hyperliquid Delta-Neutral Basis & Funding Cash-and-Carry",
-            candidates,
-            {
-                "cash": cash,
-                "open_assets": list(open_assets),
-                "available_slots": available_slots,
-            },
-        )
-        if False and pm_decision.get("pm_thesis"):
-            print(f"  🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
-    except Exception as e:
-        if verbose:
-            print(f"  [Quant PM Note]: {e}")
+    unheld_candidates = [c for c in candidates if c["name"] not in open_assets]
+    if available_slots > 0 and cash >= min_slot_allocation and unheld_candidates:
+        try:
+            from tools.llm_sidecar import evaluate_quant_candidates_llm
+            pm_decision = evaluate_quant_candidates_llm(
+                "quant_hyperliquid_basis",
+                "Track 3: Hyperliquid Delta-Neutral Basis & Funding Cash-and-Carry",
+                candidates,
+                {
+                    "cash": cash,
+                    "open_assets": list(open_assets),
+                    "available_slots": available_slots,
+                },
+            )
+            if False and pm_decision.get("pm_thesis"):
+                print(f"  🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
+        except Exception as e:
+            if verbose:
+                print(f"  [Quant PM Note]: {e}")
 
     # Process any LLM PM recommended early unwinds
     pm_unwinds = set(pm_decision.get("unwinds", []))

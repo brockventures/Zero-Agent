@@ -1589,19 +1589,25 @@ def main():
             "pm_thesis": "",
             "model_used": "gemini-4-argon-high",
         }
-        try:
-            from tools.llm_sidecar import evaluate_quant_candidates_llm
-            pm_decision = evaluate_quant_candidates_llm(
-                "kalshi_paper_bot",
-                "Kalshi Weather & Cross-Bracket CLOB",
-                opps,
-                get_portfolio_status(conn),
-            )
-            if args.verbose and pm_decision.get("pm_thesis"):
-                print(f"\n🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
-        except Exception as e:
-            if args.verbose:
-                print(f"  [Quant PM Note]: {e}")
+        st_pre = get_portfolio_status(conn)
+        held_tickers = {p["ticker"] for p in st_pre["open_positions"]}
+        unheld_opps = [o for o in opps if o["ticker"] not in held_tickers]
+        max_exp = load_domain_params("weather").get("max_total_exposure", MAX_TOTAL_EXPOSURE)
+        has_trade_capacity = (st_pre["cash"] >= 5.0) and (st_pre["open_exposure"] < max_exp)
+        if unheld_opps and has_trade_capacity:
+            try:
+                from tools.llm_sidecar import evaluate_quant_candidates_llm
+                pm_decision = evaluate_quant_candidates_llm(
+                    "kalshi_paper_bot",
+                    "Kalshi Weather & Cross-Bracket CLOB",
+                    opps,
+                    st_pre,
+                )
+                if args.verbose and pm_decision.get("pm_thesis"):
+                    print(f"\n🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
+            except Exception as e:
+                if args.verbose:
+                    print(f"  [Quant PM Note]: {e}")
 
         approved_set = set(pm_decision.get("approved_indices", range(len(opps))))
         mult_map = pm_decision.get("sizing_multipliers", {})

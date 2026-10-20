@@ -218,8 +218,8 @@ async def execute_agy_turn(
                 if mode == "home":
                     try:
                         from tools.session_summarizer import generate_summary, get_carryforward_context
-                        generate_summary(conv_id=old_conv_id, sess_key=sess_key)
-                        carry_ctx = get_carryforward_context(sess_key=sess_key)
+                        await asyncio.to_thread(generate_summary, conv_id=old_conv_id, sess_key=sess_key)
+                        carry_ctx = await asyncio.to_thread(get_carryforward_context, sess_key=sess_key)
                         if carry_ctx:
                             prompt = f"[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\n{carry_ctx}\n\n[CURRENT USER PROMPT]: {prompt}"
                             print(f"[BridgeRunner] 🔄 Auto-compacted home session for {sess_key} ({compact_reason or 'manual reset'}) and injected carry-forward context.")
@@ -228,8 +228,8 @@ async def execute_agy_turn(
                 else:
                     try:
                         from tools.session_summarizer import generate_summary, get_engineering_carryforward_context
-                        generate_summary(conv_id=old_conv_id, sess_key=sess_key)
-                        eng_ctx = get_engineering_carryforward_context(sess_key=sess_key)
+                        await asyncio.to_thread(generate_summary, conv_id=old_conv_id, sess_key=sess_key)
+                        eng_ctx = await asyncio.to_thread(get_engineering_carryforward_context, sess_key=sess_key)
                         if eng_ctx:
                             eng_carry_block = f"\n[PREVIOUS SESSION ENGINEERING DELTA]:\n{eng_ctx}\n\n"
                         print(f"[BridgeRunner] 🔄 Auto-compacted external session for channel {sess_key} ({compact_reason}) and generated engineering carry-forward.")
@@ -253,7 +253,8 @@ async def execute_agy_turn(
             except Exception as fe:
                 print(f"[BridgeRunner] Warning pre-resolving message reference {ref_id}: {fe}")
 
-        turn_prompt = prepare_turn_prompt(
+        turn_prompt = await asyncio.to_thread(
+            prepare_turn_prompt,
             prompt=prompt,
             mode=mode,
             channel_id=channel_id,

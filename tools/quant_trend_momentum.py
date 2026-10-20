@@ -181,6 +181,15 @@ def fetch_equity_candles(symbol, days=40):
     except Exception:
         return []
 
+def _round_px(val: float) -> float:
+    """Dynamic decimal precision so sub-dollar tokens (DOGE, SUI) never round ATR or stops to 0.0."""
+    av = abs(val)
+    if av > 0 and av < 0.5:
+        return round(val, 6)
+    if av < 10.0:
+        return round(val, 4)
+    return round(val, 2)
+
 def calculate_technical_indicators(candles):
     """Compute ATR, 20 SMA, 50 SMA, Bollinger Bands, and Keltner Squeeze."""
     if len(candles) < 20:
@@ -207,7 +216,8 @@ def calculate_technical_indicators(candles):
         )
         tr_list.append(tr)
         
-    atr_14 = sum(tr_list[-14:]) / 14.0 if len(tr_list) >= 14 else (highs[-1] - lows[-1])
+    raw_atr = sum(tr_list[-14:]) / 14.0 if len(tr_list) >= 14 else (highs[-1] - lows[-1])
+    atr_14 = max(raw_atr, closes[-1] * 0.005)
     
     kc_upper = sma_20 + (1.5 * atr_14)
     kc_lower = sma_20 - (1.5 * atr_14)
@@ -221,15 +231,15 @@ def calculate_technical_indicators(candles):
     
     return {
         "current_price": closes[-1],
-        "sma_20": round(sma_20, 2),
-        "sma_50": round(sma_50, 2),
-        "atr": round(atr_14, 2),
+        "sma_20": _round_px(sma_20),
+        "sma_50": _round_px(sma_50),
+        "atr": _round_px(atr_14),
         "momentum_velocity": round(mom_14, 3),
         "is_squeeze_on": is_squeeze_on,
         "is_bull_regime": is_bull_regime,
         "is_bear_regime": is_bear_regime,
-        "bb_upper": round(bb_upper, 2),
-        "kc_upper": round(kc_upper, 2)
+        "bb_upper": _round_px(bb_upper),
+        "kc_upper": _round_px(kc_upper)
     }
 
 def update_open_positions(conn, market_data):
@@ -251,7 +261,7 @@ def update_open_positions(conn, market_data):
         
         if direction == "LONG":
             peak_px = max(pos["peak_price"], cur_px)
-            new_stop = max(pos["trailing_stop"], peak_px - (2.0 * atr))
+            new_stop = _round_px(max(pos["trailing_stop"], peak_px - (2.0 * atr)))
             unrealized = round((cur_px - pos["entry_price"]) * pos["size"], 2)
             hit_stop = cur_px <= new_stop
             lost_regime = (not tech["is_bull_regime"]) or (mom < 0.25)
@@ -260,7 +270,7 @@ def update_open_positions(conn, market_data):
         else:
             # SHORT position: peak_price tracks lowest favorable price reached
             peak_px = min(pos["peak_price"], cur_px)
-            new_stop = min(pos["trailing_stop"], peak_px + (2.0 * atr))
+            new_stop = _round_px(min(pos["trailing_stop"], peak_px + (2.0 * atr)))
             unrealized = round((pos["entry_price"] - cur_px) * pos["size"], 2)
             hit_stop = cur_px >= new_stop
             lost_regime = (not tech["is_bear_regime"]) or (mom > -0.50)
@@ -333,13 +343,57 @@ def run_trend_momentum_scan(conn=None, verbose: bool = False):
     
     open_pos = conn.execute("SELECT * FROM trend_positions WHERE status = 'OPEN'").fetchall()
     open_symbols = {p["symbol"] for p in open_pos}
+    now_str = datetime.now(PT).isoformat()
+
+    # Opportunity-Cost Laggard Rotation: when all 5 slots are full (or cash < MIN_SLOT_ALLOCATION)
+    # and a fresh breakout candidate beats an underwater/weak open slot by >= +0.35 velocity units, rotate out.
+    fresh_candidates = [c for c in candidates if c[0] not in open_symbols]
+    if open_pos and fresh_candidates and len(open_pos) >= MAX_OPEN_POSITIONS:
+        best_sym, best_dir, _best_tech, best_score = fresh_candidates[0]
+        # Rank open positions by unrealized P&L and current momentum strength (weakest first)
+        def _pos_strength(pos_row):
+            t_info = market_data.get(pos_row["symbol"], {})
+            vel = abs(float(t_info.get("momentum_velocity", 0.0)))
+            unr = float(pos_row["unrealized_pnl"] or 0.0)
+            return (1 if unr >= 0 else 0, vel, unr)
+
+        weakest_pos = sorted(open_pos, key=_pos_strength)[0]
+        w_sym = weakest_pos["symbol"]
+        w_vel = abs(float(market_data.get(w_sym, {}).get("momentum_velocity", 0.0)))
+        w_unr = float(weakest_pos["unrealized_pnl"] or 0.0)
+        if w_unr < 0.0 and best_score >= (w_vel + 0.35):
+            exit_px = float(market_data.get(w_sym, {}).get("current_price") or weakest_pos["current_price"])
+            if (weakest_pos["direction"] or "LONG") == "LONG":
+                realized = round((exit_px - weakest_pos["entry_price"]) * weakest_pos["size"], 2)
+            else:
+                realized = round((weakest_pos["entry_price"] - exit_px) * weakest_pos["size"], 2)
+            if verbose:
+                print(
+                    f"  🔄 ROTATE LAGGARD SWING: Closing {w_sym} (vel {w_vel:.2f}, unreal ${w_unr:+.2f}) "
+                    f"for stronger leader {best_sym} ({best_dir} vel {best_score:.2f})"
+                )
+            with conn:
+                conn.execute("""
+                    UPDATE trend_positions
+                    SET status = 'CLOSED', closed_at = ?, exit_price = ?,
+                        realized_pnl = ?, unrealized_pnl = 0.0
+                    WHERE id = ?
+                """, (now_str, exit_px, realized, weakest_pos["id"]))
+                conn.execute("""
+                    UPDATE trend_portfolio
+                    SET cash = ROUND(cash + ? + ?, 2),
+                        realized_pnl = ROUND(realized_pnl + ?, 2),
+                        total_equity = ROUND(starting_balance + realized_pnl + ?, 2),
+                        last_updated = ?
+                    WHERE id = 1
+                """, (weakest_pos["allocated_usd"], realized, realized, realized, now_str))
+            open_pos = conn.execute("SELECT * FROM trend_positions WHERE status = 'OPEN'").fetchall()
+            open_symbols = {p["symbol"] for p in open_pos}
+
     available_slots = MAX_OPEN_POSITIONS - len(open_pos)
     
     p = conn.execute("SELECT * FROM trend_portfolio WHERE id = 1").fetchone()
     cash = float(p["cash"])
-    now_str = datetime.now(PT).isoformat()
-    
-    pass
 
     cand_dicts = [
         {
@@ -362,23 +416,25 @@ def run_trend_momentum_scan(conn=None, verbose: bool = False):
         "pm_thesis": "",
         "model_used": "gemini-4-argon-high",
     }
-    try:
-        from tools.llm_sidecar import evaluate_quant_candidates_llm
-        pm_decision = evaluate_quant_candidates_llm(
-            "quant_trend_momentum",
-            "Track 4: Bi-Directional Multi-Day Trend Momentum & Volatility Squeeze",
-            cand_dicts,
-            {
-                "cash": cash,
-                "open_symbols": list(open_symbols),
-                "available_slots": available_slots,
-            },
-        )
-        if False and pm_decision.get("pm_thesis"):
-            print(f"  🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
-    except Exception as e:
-        if verbose:
-            print(f"  [Quant PM Note]: {e}")
+    unheld_candidates = [c for c in candidates if c[0] not in open_symbols]
+    if available_slots > 0 and cash >= MIN_SLOT_ALLOCATION and unheld_candidates:
+        try:
+            from tools.llm_sidecar import evaluate_quant_candidates_llm
+            pm_decision = evaluate_quant_candidates_llm(
+                "quant_trend_momentum",
+                "Track 4: Bi-Directional Multi-Day Trend Momentum & Volatility Squeeze",
+                cand_dicts,
+                {
+                    "cash": cash,
+                    "open_symbols": list(open_symbols),
+                    "available_slots": available_slots,
+                },
+            )
+            if False and pm_decision.get("pm_thesis"):
+                print(f"  🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
+        except Exception as e:
+            if verbose:
+                print(f"  [Quant PM Note]: {e}")
 
     approved_set = set(pm_decision.get("approved_indices", range(len(candidates))))
     mult_map = pm_decision.get("sizing_multipliers", {})
@@ -415,10 +471,10 @@ def run_trend_momentum_scan(conn=None, verbose: bool = False):
             break
 
         if direction == "LONG":
-            trailing_stop = round(cur_px - (2.0 * atr), 4)
+            trailing_stop = _round_px(cur_px - (2.0 * atr))
             strat = "volatility_squeeze" if tech["is_squeeze_on"] else "dual_momentum"
         else:
-            trailing_stop = round(cur_px + (2.0 * atr), 4)
+            trailing_stop = _round_px(cur_px + (2.0 * atr))
             strat = "bear_squeeze_breakdown" if tech["is_squeeze_on"] else "bear_momentum"
 
         size = round(alloc / cur_px, 6)

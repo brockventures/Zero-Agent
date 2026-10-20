@@ -191,7 +191,7 @@ def evaluate_quant_candidates_llm(
         "pm_thesis": "",
         "model_used": get_sidecar_model(track_key, "gemini-4-argon-medium"),
     }
-    if _is_test_fast_mode():
+    if _is_test_fast_mode() or not candidates:
         return default_result
 
     # Summarize candidates compactly (cap at top 12 to keep prompt lean and fast)

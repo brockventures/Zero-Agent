@@ -580,7 +580,9 @@ def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
                 rep = f"{rep}\n\n{kev_report}"
             return False, rep, extra
         monitored_ha = ha_telemetry.get("monitored_count", 0)
-        ha_suffix = f" ({monitored_ha} HA sensors nominal)" if monitored_ha and not ha_report else ""
+        unifi_cnt = ha_telemetry.get("unifi_clients_count", 0)
+        unifi_part = f", {unifi_cnt} UniFi clients" if unifi_cnt else ""
+        ha_suffix = f" ({monitored_ha} HA sensors{unifi_part} nominal)" if monitored_ha and not ha_report else ""
         rep = f"🗄️ **NAS Log Review** [{now_pt}]: All {total_scanned} containers healthy across .82 and .84{ha_suffix}. ✅"
         if ha_report:
             rep = f"{rep}\n\n{ha_report}"
@@ -634,6 +636,7 @@ def format_autonomous_triage_prompt(extra: dict) -> str:
             "healed_events": ha_telemetry.get("healed_events", []),
             "zombies": ha_telemetry.get("zombies", []),
             "amplitude_anomalies": ha_telemetry.get("amplitude_anomalies", []),
+            "network_anomalies": ha_telemetry.get("network_anomalies", []),
         } if ha_telemetry.get("has_anomalies") else "nominal"
     }, indent=2)
 

@@ -106,23 +106,24 @@ nice -n 19 sudo docker exec orcaslicer /opt/orcaslicer/bin/orca-slicer \
 
 | Model Archetype | Layer Height | Walls | Infill Type & % | Support Strategy |
 |---|---|---|---|---|
-| **Miniature / Figurine (60mm)** | `0.16mm` | 3 | Gyroid 12%–15% | **Organic Tree Supports** (Buildplate only, 30° threshold) |
-| **Display Bust / Large Sculpture** | `0.16mm` | 3 | Gyroid 10% | **Organic Tree Supports** (Buildplate only) |
-| **Functional Bracket / Tool** | `0.20mm` | 4–5 | Gyroid 25%–40% | **None** or **Snug Normal** (overhangs > 50°) |
-| **Rapid Prototype / Fit Test** | `0.28mm` | 2 | Grid 10% | **None** |
+| **Miniature / Figurine / Sculpt** | `0.16mm` | 3 | Gyroid 12%–15% | **Option C: Easy-Snap Tree Slim** (`tree(auto)` + `tree_slim`, 25° threshold) |
+| **Functional Bracket / Stand / Case** | `0.20mm` | 3–5 | Gyroid 15%–40% | **Option A: None** (Default CAD split/chamfers) → **Option B: Normal Snug** (`normal(auto)` + `snug` if unavoidable overhang) |
+| **Rapid Prototype / Fit Test** | `0.28mm` | 2 | Gyroid 10% | **None** |
 
 ### Key FDM Rules for Ender-3 V2:
 1. **Always Use Gyroid Infill:** Linear infills (Grid, Triangle) cross over previously printed paths on the same layer, causing nozzle clicks that knock delicate miniatures off the bed. Gyroid infill never crosses itself.
 2. **Zero-Brim & Ban on Rafts (Textured PEI Bed):**
    - The textured PEI spring steel build plate provides massive mechanical and thermal adhesion for PETG/PLA at 60°C bed temperature.
-   - **Rafts are Strictly Banned (`raft_layers = 0`):** Rafts waste filament, distort bottom accuracy, and are a nightmare to peel.
-   - **Brims are Banned on Flat Footprints (`brim_width = 0`):** Any model with flat contact area $>100\text{ mm}^2$ (enclosures, brackets, broad figurine pedestals) prints without a brim. Never fuse a 4–5mm brim to an enclosure edge requiring scraping or deburring.
-   - **Detached Purge Skirt Only:** Use `skirt_loops = 1` with `skirt_distance = 4mm` strictly to prime the nozzle and purge stale plastic.
-3. **Effortless Support Release Tuning (Tree Slim / Organic):**
-   - **Top Z-Distance (`support_top_z_distance = 0.26mm`):** Default `0.20mm` creates a single 1-layer gap that thermally welds to sticky PETG. Increasing to `0.26mm` (1.3× layer height) establishes a clean thermal separation layer so supports snap off cleanly with zero scarring.
-   - **Single-Wall Tree Trunks (`support_tree_wall_count = 1`):** Default 2-wall trunks become rigid structural pipes that require pliers to crush. A single perimeter wall makes branches brittle so they snap off effortlessly with finger pressure.
-   - **XY Wall Clearance (`support_xy_distance = 0.50mm`):** Expands lateral clearance from default `0.35mm` to `0.50mm`, preventing growing vertical tree trunks from fusing into side walls.
-   - **Loosened Interface Spacing (`support_interface_spacing = 0.80mm`):** Replaces solid interface sheets with sparse contact points that pop off without leaving scarred plastic pads.
+   - **Rafts & Auto-Brims are Strictly Banned (`raft_layers = 0`, `brim_type = no_brim`, `brim_width = 0`):** Always explicitly set `brim_type = "no_brim"`, `tree_support_auto_brim = "0"`, `tree_support_brim_width = "0"`, and `support_object_first_layer_gap = "1.0"` so OrcaSlicer never sneaks a 3–5mm first-layer brim flange around the model or support trunks.
+   - **Detached Purge Skirt Only:** Use `skirt_loops = 1` with `skirt_distance = 3–4mm` strictly to prime the nozzle and purge stale plastic.
+3. **Support Hierarchy (Functional vs. Organic/Figurine):**
+   - **Functional Parts:** Default to **Option A (100% Support-Free CAD)** via flat `Z = 0.0` splits, 45° chamfers, and crowned bridge arches. If a functional part has an unavoidable flat overhang, use **Option B (`support_type = "normal(auto)"`, `support_style = "snug"`)** so the support column pops off in a single block without wrapping branches around the part.
+   - **Miniatures & Organic Sculpts (Option C — Easy-Snap Tree Slim):**
+     - **Style (`support_type = "tree(auto)"`, `support_style = "tree_slim"`):** Slim trunks (`tree_support_branch_diameter = 2.5mm`, `tree_support_tip_diameter = 0.6mm`) prevent giant merged logs and break away at pinpoint tips.
+     - **Top/Bottom Z-Distance (`support_top_z_distance = 0.28mm`, `support_bottom_z_distance = 0.28mm`):** Establishes a clean thermal separation gap so supports snap off cleanly with zero scarring.
+     - **Single-Wall Tree Trunks (`tree_support_wall_count = 1`):** Single perimeter wall makes branches brittle so they crush and snap off effortlessly with finger pressure.
+     - **XY Wall & First-Layer Clearance (`support_object_xy_distance = 0.60mm`, `support_object_first_layer_gap = 1.0mm`):** Prevents growing vertical tree trunks or first-layer pads from fusing into the model.
+     - **Sparse 1-Layer Interface (`support_interface_top_layers = 1`, `support_interface_spacing = 0.80mm`):** Replaces dense welded interface pads with sparse contact points.
 4. **Bed Contact Stability:** Verify the bottom plane is completely flat at $Z = 0.0$. If a miniature base is slightly domed, apply planar bisecting or translation so the first layer has solid surface area.
 
 ---

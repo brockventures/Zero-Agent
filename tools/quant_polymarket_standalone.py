@@ -176,8 +176,10 @@ def sweep_negative_risk_underrounds(events=None):
         # Must be either native negRisk or explicit single-winner tournament/election/bucket
         if not is_neg_risk and not any(w in t_lower for w in ["champion", "winner", "division", "mvp", "nominee", "president", "chancellor", "price on", "tweets"]):
             continue
-        # Exclude non-exclusive multi-selection props or sub-inning markets
-        if any(neg in t_lower for neg in ["player props", "margin", "points", "inning", "first 5", "by...?", "more markets"]):
+        # Exclude non-exclusive multi-selection props or sub-inning markets (allow negRisk margin/bucket sets)
+        if any(neg in t_lower for neg in ["player props", "points", "inning", "first 5", "by...?", "more markets"]):
+            continue
+        if "margin" in t_lower and not is_neg_risk:
             continue
 
         real_candidates = []
@@ -241,13 +243,15 @@ def sweep_negative_risk_underrounds(events=None):
                     "net_edge": net_edge_a,
                     "max_fillable_usd": basket_fillable_usd,
                 })
-        elif N == 3 and is_neg_risk and net_cost_a <= 1.000:
-            # Strategy C: Zero-Vigorish 3-Way Match Moneyline Maker Underround
-            # When 3-way soccer moneyline has 0% taker overround (Sum(Ask) == 1.000), posting a passive
-            # maker bid (+1c above bestBid) on the widest leg captures a $0.990 complete set (+1.0% edge).
-            widest_spread = max(c["ask"] - c["bid"] for c in real_candidates)
-            if widest_spread >= 0.01:
-                maker_cost = round(net_cost_a - 0.01, 4)
+        elif N == 3 and is_neg_risk and net_cost_a <= 1.015:
+            # Strategy C: Zero-Vigorish / Passive-Maker 3-Way Match Moneyline Underround
+            # When 3-way soccer moneyline has tight overround (Sum(Ask) <= 1.015 and Sum(Bid) <= 0.990),
+            # posting passive maker bids on the 2 widest legs captures a <= $0.990 complete set (+1.0% to +1.5% edge).
+            sum_bid_3 = round(sum(c["bid"] for c in real_candidates), 4)
+            spreads = sorted([round(c["ask"] - c["bid"], 4) for c in real_candidates], reverse=True)
+            maker_rebate = round(spreads[0] + (spreads[1] if net_cost_a > 1.000 else 0.0), 4)
+            if sum_bid_3 <= 0.990 and maker_rebate >= 0.01:
+                maker_cost = round(max(0.985, min(0.990, net_cost_a - maker_rebate)), 4)
                 net_edge_c = round(1.00 - maker_cost, 4)
                 opportunities.append({
                     "strategy": "combinatorial_maker_underround_yes",
@@ -268,7 +272,7 @@ def sweep_negative_risk_underrounds(events=None):
         if K >= 3:
             sum_active_bid = sum(c["bid"] for c in active_bid_legs)
             net_edge_b = round(sum_active_bid - 1.00, 4)
-            if 0.005 <= net_edge_b <= 0.25:
+            if 0.002 <= net_edge_b <= 0.25:
                 total_no_cost = round(sum(c["no_ask"] for c in active_bid_legs), 4)
                 unit_cost = round(total_no_cost / (K - 1), 4)
                 opportunities.append({
@@ -278,7 +282,8 @@ def sweep_negative_risk_underrounds(events=None):
                     "basket": active_bid_legs,
                     "sum_ask": unit_cost,
                     "total_cost": unit_cost,
-                    "net_edge": round(1.00 - unit_cost, 4)
+                    "net_edge": round(1.00 - unit_cost, 4),
+                    "max_fillable_usd": basket_fillable_usd,
                 })
 
     return opportunities
@@ -486,19 +491,21 @@ def run_polymarket_standalone_scan(conn=None, execute=True, verbose=False):
         "pm_thesis": "",
         "model_used": "gemini-4-argon-high",
     }
-    try:
-        from tools.llm_sidecar import evaluate_quant_candidates_llm
-        pm_decision = evaluate_quant_candidates_llm(
-            "quant_polymarket_standalone",
-            "Track 2: Polymarket Standalone Structural Inefficiencies",
-            all_opps,
-            {"cash": current_cash, "open_positions_count": len(open_keys), "open_titles": [k[1] for k in list(open_keys)[:10]]},
-        )
-        if verbose and pm_decision.get("pm_thesis"):
-            print(f"  🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
-    except Exception as e:
-        if verbose:
-            print(f"  [Quant PM Note]: {e}")
+    unheld_opps = [o for o in all_opps if (o["strategy"], o["event_title"]) not in open_keys]
+    if execute and unheld_opps and current_cash >= 25.0:
+        try:
+            from tools.llm_sidecar import evaluate_quant_candidates_llm
+            pm_decision = evaluate_quant_candidates_llm(
+                "quant_polymarket_standalone",
+                "Track 2: Polymarket Standalone Structural Inefficiencies",
+                all_opps,
+                {"cash": current_cash, "open_positions_count": len(open_keys), "open_titles": [k[1] for k in list(open_keys)[:10]]},
+            )
+            if verbose and pm_decision.get("pm_thesis"):
+                print(f"  🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
+        except Exception as e:
+            if verbose:
+                print(f"  [Quant PM Note]: {e}")
 
     approved_set = set(pm_decision.get("approved_indices", range(len(all_opps))))
     mult_map = pm_decision.get("sizing_multipliers", {})

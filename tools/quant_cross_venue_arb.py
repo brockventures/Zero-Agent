@@ -863,19 +863,27 @@ def run_cross_venue_scan(conn=None, execute=True, verbose=False):
         "pm_thesis": "",
         "model_used": "gemini-4-argon-high",
     }
-    try:
-        from tools.llm_sidecar import evaluate_quant_candidates_llm
-        pm_decision = evaluate_quant_candidates_llm(
-            "quant_cross_venue_arb",
-            "Track 1: Kalshi vs Polymarket Cross-Venue Arbitrage",
-            opportunities,
-            {"cash": current_cash, "open_pairs_count": len(open_pairs), "open_pairs": [list(p) for p in list(open_pairs)[:10]]},
-        )
-        if verbose and pm_decision.get("pm_thesis"):
-            print(f"  🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
-    except Exception as e:
-        if verbose:
-            print(f"  [Quant PM Note]: {e}")
+    unheld_opps = [
+        o for o in opportunities
+        if (
+            (o["leg1_ticker"] if o["leg1_venue"] == "Kalshi" else o["leg2_ticker"]),
+            (o["leg2_ticker"] if o["leg1_venue"] == "Kalshi" else o["leg1_ticker"]),
+        ) not in open_pairs
+    ]
+    if execute and unheld_opps and current_cash >= 25.0:
+        try:
+            from tools.llm_sidecar import evaluate_quant_candidates_llm
+            pm_decision = evaluate_quant_candidates_llm(
+                "quant_cross_venue_arb",
+                "Track 1: Kalshi vs Polymarket Cross-Venue Arbitrage",
+                opportunities,
+                {"cash": current_cash, "open_pairs_count": len(open_pairs), "open_pairs": [list(p) for p in list(open_pairs)[:10]]},
+            )
+            if verbose and pm_decision.get("pm_thesis"):
+                print(f"  🧠 [Quant PM · {pm_decision.get('model_used')}]: {pm_decision['pm_thesis']}")
+        except Exception as e:
+            if verbose:
+                print(f"  [Quant PM Note]: {e}")
 
     approved_set = set(pm_decision.get("approved_indices", range(len(opportunities))))
     mult_map = pm_decision.get("sizing_multipliers", {})

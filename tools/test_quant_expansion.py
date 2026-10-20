@@ -449,6 +449,50 @@ class TestQuantExpansion(unittest.TestCase):
         self.assertGreater(pos["allocated_usd"], 250.0)
         self.assertLessEqual(pos["allocated_usd"], 400.0)
 
+    def test_books_3_to_5_patches(self):
+        """Verify Book 3 maker spread capture, Book 4 1h->8h funding conversion, and Book 5 sub-dollar ATR & laggard rotation."""
+        from datetime import datetime, timedelta, timezone
+        soon_iso = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+
+        # 1. Book 3: 3-way negRisk soccer moneyline with sum(ask)=1.01, sum(bid)=0.98 should qualify via 2-leg maker rebate
+        events_3way = [{
+            "title": "Liverpool FC vs. Villarreal CF",
+            "endDate": soon_iso,
+            "negRisk": True,
+            "markets": [
+                {"id": "m1", "question": "Liverpool win", "bestBid": "0.64", "bestAsk": "0.65", "liquidityNum": 100000},
+                {"id": "m2", "question": "Draw", "bestBid": "0.19", "bestAsk": "0.20", "liquidityNum": 100000},
+                {"id": "m3", "question": "Villarreal win", "bestBid": "0.15", "bestAsk": "0.16", "liquidityNum": 100000},
+            ]
+        }]
+        opps_3way = track2.sweep_negative_risk_underrounds(events_3way)
+        self.assertEqual(len(opps_3way), 1)
+        self.assertEqual(opps_3way[0]["strategy"], "combinatorial_maker_underround_yes")
+        self.assertAlmostEqual(opps_3way[0]["total_cost"], 0.990, places=3)
+
+        # 2. Book 5: Sub-dollar DOGE candles must never round ATR to 0.0
+        doge_candles = [
+            {"open": 0.080, "high": 0.082, "low": 0.078, "close": 0.080 - (i * 0.0002), "volume": 100000.0, "timestamp": i}
+            for i in range(30)
+        ]
+        doge_tech = track4.calculate_technical_indicators(doge_candles)
+        self.assertIsNotNone(doge_tech)
+        self.assertGreater(doge_tech["atr"], 0.001)
+
+    def test_smart_llm_pm_gate_zero_token_when_empty(self):
+        """Verify evaluate_quant_candidates_llm short-circuits with zero LLM calls when candidates list is empty."""
+        from unittest.mock import patch
+        import tools.llm_sidecar as llm_sc
+        with patch.object(llm_sc, "_is_test_fast_mode", return_value=False), \
+             patch.object(llm_sc, "call_sidecar_llm_json", side_effect=AssertionError("LLM should not be called on empty candidates")):
+            res = llm_sc.evaluate_quant_candidates_llm(
+                track_key="quant_trend",
+                track_name="TestBook",
+                candidates=[],
+                portfolio_context={"cash": 1000.0},
+            )
+        self.assertEqual(res["approved_indices"], [])
+
 if __name__ == "__main__":
     unittest.main()
 

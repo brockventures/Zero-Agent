@@ -589,11 +589,41 @@ class ZeroVoiceSessionManager:
                 self.active_model = model_override
 
             self._stop_event.clear()
-            try:
-                self.voice_client = await voice_channel.connect(cls=voice_recv.VoiceRecvClient, timeout=15.0, reconnect=True)
-            except Exception as e:
-                log.error(f"[ZeroVoice] Failed to connect to voice channel {voice_channel.id}: {e}")
-                return False, f"⚠️ Failed to join voice channel **#{voice_channel.name}**: `{e}`"
+            last_err: Optional[Exception] = None
+            for attempt in range(1, 4):
+                try:
+                    existing_vc = getattr(voice_channel.guild, "voice_client", None)
+                    if existing_vc is not None:
+                        try:
+                            await existing_vc.disconnect(force=True)
+                        except Exception:
+                            pass
+                    self.voice_client = await voice_channel.connect(
+                        cls=voice_recv.VoiceRecvClient,
+                        timeout=20.0,
+                        reconnect=True,
+                    )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    err_desc = str(e) or type(e).__name__
+                    log.warning(
+                        f"[ZeroVoice] Voice connect attempt {attempt}/3 to {voice_channel.id} failed: {err_desc}"
+                    )
+                    existing_vc = getattr(voice_channel.guild, "voice_client", None)
+                    if existing_vc is not None:
+                        try:
+                            await existing_vc.disconnect(force=True)
+                        except Exception:
+                            pass
+                    if attempt < 3:
+                        await asyncio.sleep(1.5)
+
+            if last_err is not None or self.voice_client is None:
+                err_desc = str(last_err) or type(last_err).__name__
+                log.error(f"[ZeroVoice] Failed to connect to voice channel {voice_channel.id}: {err_desc}")
+                return False, f"⚠️ Failed to join voice channel **#{voice_channel.name}**: `{err_desc}`"
 
             audio_in_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=120)
             self.audio_source = StreamingPCMAudioSource()
@@ -876,7 +906,7 @@ class ZeroVoiceSessionManager:
                             activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
                         ),
                         system_instruction=types.Content(
-                            parts=[types.Part.from_text(text=_build_zero_live_system_prompt())]
+                            parts=[types.Part.from_text(text=await asyncio.to_thread(_build_zero_live_system_prompt))]
                         ),
                         tools=_build_live_tools(),
                     )
