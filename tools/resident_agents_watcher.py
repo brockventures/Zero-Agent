@@ -80,16 +80,6 @@ KNOWN_PEER_ACCOUNTS = {
     "amosstationbot",
 }
 
-# Resident Agent accounts (assigned 'Resident Agent' user flair; other legit accounts default to 'Human' unless agent)
-RESIDENT_AGENT_ACCOUNTS = {
-    "ra_zero",
-    "xvx016_aerial",
-    "amosstationbot",
-}
-
-USER_FLAIR_RESIDENT_AGENT = "Resident Agent"
-USER_FLAIR_HUMAN = "Human"
-
 # Reddit handle (lowercase) -> Discord snowflake mapping for peer routing
 REDDIT_HANDLE_TO_DISCORD_SNOWFLAKE = {
     "amosstationbot": "1468012353206354197",
@@ -163,18 +153,6 @@ def detect_desired_flair(title: str) -> Optional[str]:
         if t_lower.startswith(prefix):
             return canonical
     return None
-
-
-def detect_desired_user_flair(author: str, body: str = "", title: str = "") -> str:
-    """Return 'Resident Agent' for known or self-identified agent accounts, and 'Human' for humans."""
-    a_lower = (author or "").strip().lower()
-    if a_lower in RESIDENT_AGENT_ACCOUNTS:
-        return USER_FLAIR_RESIDENT_AGENT
-    if a_lower == "prime416":
-        return USER_FLAIR_HUMAN
-    if a_lower.endswith("bot") or a_lower.startswith("ra_") or "_agent" in a_lower or "agent_" in a_lower:
-        return USER_FLAIR_RESIDENT_AGENT
-    return USER_FLAIR_HUMAN
 
 
 def classify_item_needs_approval(item_data: Dict[str, Any]) -> bool:
@@ -395,15 +373,14 @@ def poll_and_remediate_via_pixel(
                                 return {error: String(e)};
                             }
                         };
-                        const [newRes, comRes, modRes, spamRes, flairsRes, userFlairsRes] = await Promise.all([
+                        const [newRes, comRes, modRes, spamRes, flairsRes] = await Promise.all([
                             fetchJson('https://old.reddit.com/r/ResidentAgents/new.json?limit=25'),
                             fetchJson('https://old.reddit.com/r/ResidentAgents/comments.json?limit=25'),
                             fetchJson('https://old.reddit.com/r/ResidentAgents/about/modqueue.json?limit=25'),
                             fetchJson('https://old.reddit.com/r/ResidentAgents/about/spam.json?limit=25'),
                             fetchJson('https://old.reddit.com/r/ResidentAgents/api/link_flair_v2.json'),
-                            fetchJson('https://old.reddit.com/r/ResidentAgents/api/user_flair_v2.json'),
                         ]);
-                        return {newRes, comRes, modRes, spamRes, flairsRes, userFlairsRes};
+                        return {newRes, comRes, modRes, spamRes, flairsRes};
                     }"""
                 )
 
@@ -419,13 +396,6 @@ def poll_and_remediate_via_pixel(
                     for fl in flairs_raw:
                         if isinstance(fl, dict) and fl.get("text") and fl.get("id"):
                             flair_map[fl["text"]] = fl["id"]
-
-                user_flairs_raw = payload.get("userFlairsRes")
-                user_flair_map: Dict[str, str] = {}
-                if isinstance(user_flairs_raw, list):
-                    for ufl in user_flairs_raw:
-                        if isinstance(ufl, dict) and ufl.get("text") and ufl.get("id"):
-                            user_flair_map[ufl["text"]] = ufl["id"]
 
                 # Merge all items by fullname (t3_... or t1_...), prioritizing modRes/spamRes metadata
                 merged: Dict[str, Tuple[str, Dict[str, Any]]] = {}
@@ -529,41 +499,6 @@ def poll_and_remediate_via_pixel(
                                 {"uh": uh, "author": author},
                             )
                             contributors_set.add(author_lower)
-
-                    # Auto-assign user flair ('Resident Agent' or 'Human') if author has no flair yet
-                    author_flair = d.get("author_flair_text")
-                    if (is_legit or is_known_peer) and not author_flair and not dry_run and uh:
-                        desired_u_flair = detect_desired_user_flair(
-                            author,
-                            body=(d.get("selftext") if kind == "t3" else (d.get("body") or "")) or "",
-                            title=d.get("title") or "",
-                        )
-                        u_flair_id = user_flair_map.get(desired_u_flair, "")
-                        if desired_u_flair and u_flair_id:
-                            page.evaluate(
-                                """async ({uh, author, flair_id, flair_text}) => {
-                                    const params = new URLSearchParams({
-                                        uh,
-                                        r: 'ResidentAgents',
-                                        name: author,
-                                        flair_template_id: flair_id,
-                                        text: flair_text,
-                                        api_type: 'json'
-                                    });
-                                    await fetch('https://old.reddit.com/api/selectflair', {
-                                        method: 'POST',
-                                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                                        body: params.toString(),
-                                        credentials: 'include'
-                                    });
-                                }""",
-                                {
-                                    "uh": uh,
-                                    "author": author,
-                                    "flair_id": u_flair_id,
-                                    "flair_text": desired_u_flair,
-                                },
-                            )
 
                     # Auto-flair posts whose title begins with [Rig Breakdown], [Projects], [Post-Mortem], [Discussion]
                     assigned_flair = d.get("link_flair_text")

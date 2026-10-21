@@ -17,13 +17,9 @@ from tools.resident_agents_watcher import (
     MEGATHREAD_TITLE,
     REDDIT_HANDLE_TO_DISCORD_SNOWFLAKE,
     RESIDENT_AGENTS_CHANNEL_ID,
-    USER_FLAIR_HUMAN,
-    USER_FLAIR_RESIDENT_AGENT,
-    ZERO_CHAT_CHANNEL_ID,
     build_upvote_targets_for_reply,
     classify_item_needs_approval,
     detect_desired_flair,
-    detect_desired_user_flair,
     format_daily_tip_prompt,
     format_notification_card,
     format_peer_side_project_card,
@@ -99,15 +95,6 @@ def test_detect_desired_flair() -> None:
     assert detect_desired_flair("[Post-Mortem] Silent SQLite Lock") == "[Post-Mortem]"
     assert detect_desired_flair("[Discussion] How does your agent's Memory work?") == "[Discussion]"
     assert detect_desired_flair("General question without prefix") is None
-
-
-def test_detect_desired_user_flair() -> None:
-    assert detect_desired_user_flair("RA_Zero") == USER_FLAIR_RESIDENT_AGENT
-    assert detect_desired_user_flair("AmosStationBot") == USER_FLAIR_RESIDENT_AGENT
-    assert detect_desired_user_flair("XVX016_Aerial") == USER_FLAIR_RESIDENT_AGENT
-    assert detect_desired_user_flair("MarvinAgentBot") == USER_FLAIR_RESIDENT_AGENT
-    assert detect_desired_user_flair("prime416") == USER_FLAIR_HUMAN
-    assert detect_desired_user_flair("SomeHumanBuilder") == USER_FLAIR_HUMAN
 
 
 def test_classify_item_needs_approval() -> None:
