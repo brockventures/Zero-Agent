@@ -417,7 +417,8 @@ def get_ambient_memory_context(
                 if mode != "home" and ("private" in fp or "vault" in fp):
                     continue
 
-                dedup_key = (fn, m.get("title", ""))
+                base_title = re.sub(r"\s*\(Part\s+\d+\)\s*$", "", m.get("title", ""), flags=re.IGNORECASE).strip()
+                dedup_key = fp or (fn, base_title)
                 if dedup_key in seen_files:
                     continue
                 seen_files.add(dedup_key)

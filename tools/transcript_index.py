@@ -856,7 +856,7 @@ class TranscriptIndexer:
             try:
                 v_rows = cursor.execute(
                     """
-                    SELECT chunk_id, distance
+                    SELECT chunk_id, distance, embedding
                     FROM vec_memory
                     WHERE embedding MATCH ? AND k = ?
                     ORDER BY distance ASC
@@ -877,12 +877,13 @@ class TranscriptIndexer:
                             cids,
                         )
                     }
-                    for cid, dist in v_rows:
+                    for cid, dist, emb_bytes in v_rows:
                         c_row = chunk_map.get(cid)
                         if c_row:
                             vec_matches.append({
                                 "chunk_id": cid,
                                 "distance": round(dist, 4),
+                                "_embedding": emb_bytes,
                                 "file_path": c_row[0],
                                 "file_name": c_row[1],
                                 "category": c_row[2],
@@ -903,6 +904,7 @@ class TranscriptIndexer:
             for v in vec_matches:
                 if v["file_path"] not in seen:
                     seen.add(v["file_path"])
+                    v.pop("_embedding", None)
                     v["snippet"] = v["content"][:220].strip() + "..."
                     v["match_type"] = "semantic_vector"
                     out.append(v)
@@ -911,10 +913,11 @@ class TranscriptIndexer:
         # Hybrid RRF Fusion
         return self._fuse_memory_rrf(bm25_matches, vec_matches, limit, rrf_k)
 
-    def _fuse_memory_rrf(self, bm25_list: List[dict], vec_list: List[dict], limit: int, k: int) -> List[dict]:
+    def _fuse_memory_rrf(self, bm25_list: List[dict], vec_list: List[dict], limit: int, k: int, mmr_lambda: float = 0.7) -> List[dict]:
         scores: Dict[str, float] = {}
         items: Dict[str, dict] = {}
         meta: Dict[str, dict] = {}
+        emb_map: Dict[str, Any] = {}
 
         for rank, item in enumerate(bm25_list, start=1):
             fp = item["file_path"]
@@ -930,6 +933,8 @@ class TranscriptIndexer:
             if fp in vec_seen:
                 continue
             vec_seen.add(fp)
+            if item.get("_embedding"):
+                emb_map[fp] = item["_embedding"]
             scores[fp] = scores.get(fp, 0.0) + (1.0 / (k + v_rank))
             if fp not in items:
                 items[fp] = {
@@ -949,8 +954,77 @@ class TranscriptIndexer:
             v_rank += 1
 
         sorted_fps = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+        pool_fps = sorted_fps[:max(limit * 3, 25)]
+
+        # Backfill embeddings for any BM25-only pool candidates so MMR can evaluate pairwise cosine similarity
+        missing_fps = [fp for fp in pool_fps if fp not in emb_map]
+        if missing_fps and self.has_vec:
+            try:
+                placeholders = ",".join("?" * len(missing_fps))
+                rows = self.con.execute(
+                    f"""
+                    SELECT mc.file_path, vm.embedding
+                    FROM memory_chunks mc
+                    JOIN vec_memory vm ON mc.chunk_id = vm.chunk_id
+                    WHERE mc.file_path IN ({placeholders}) AND mc.chunk_index = 0
+                    """,
+                    missing_fps,
+                ).fetchall()
+                for r_fp, r_emb in rows:
+                    if r_fp not in emb_map and r_emb:
+                        emb_map[r_fp] = r_emb
+            except Exception:
+                pass
+
+        # Greedy Maximal Marginal Relevance (MMR) selection over normalized RRF scores and cosine similarity
+        selected_fps: List[str] = []
+        if len(pool_fps) <= 1 or not emb_map:
+            selected_fps = pool_fps[:limit]
+        else:
+            try:
+                import numpy as np
+                vecs: Dict[str, Any] = {}
+                for fp, raw_b in emb_map.items():
+                    if isinstance(raw_b, (bytes, bytearray, memoryview)):
+                        arr = np.frombuffer(raw_b, dtype=np.float32)
+                        norm = float(np.linalg.norm(arr))
+                        if norm > 0:
+                            vecs[fp] = arr / norm
+
+                max_rrf = scores[pool_fps[0]] if pool_fps and scores[pool_fps[0]] > 0 else 1.0
+                remaining = list(pool_fps)
+                while remaining and len(selected_fps) < limit:
+                    if not selected_fps:
+                        selected_fps.append(remaining.pop(0))
+                        continue
+                    best_fp = None
+                    best_mmr = -1e9
+                    for cand_fp in remaining:
+                        rel = scores[cand_fp] / max_rrf
+                        c_vec = vecs.get(cand_fp)
+                        if c_vec is not None:
+                            sims = [
+                                float(np.dot(c_vec, vecs[s_fp]))
+                                for s_fp in selected_fps
+                                if s_fp in vecs
+                            ]
+                            max_sim = max(sims) if sims else 0.0
+                        else:
+                            max_sim = 0.0
+                        mmr_val = mmr_lambda * rel - (1.0 - mmr_lambda) * max_sim
+                        if mmr_val > best_mmr:
+                            best_mmr = mmr_val
+                            best_fp = cand_fp
+                    if best_fp is not None:
+                        selected_fps.append(best_fp)
+                        remaining.remove(best_fp)
+                    else:
+                        break
+            except Exception:
+                selected_fps = pool_fps[:limit]
+
         fused = []
-        for fp in sorted_fps[:limit]:
+        for fp in selected_fps:
             entry = dict(items[fp])
             entry["rrf_score"] = round(scores[fp], 6)
             entry["bm25_rank"] = meta[fp]["bm25_rank"]

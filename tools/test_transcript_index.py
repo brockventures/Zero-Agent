@@ -260,3 +260,33 @@ def test_prune_missing(tmp_path):
     finally:
         ti.MEMORY_DIR = orig_mem
         indexer.close()
+
+
+def test_mmr_diversity_reranking(tmp_path):
+    import numpy as np
+
+    db_file = str(tmp_path / "mmr_test.db")
+    indexer = TranscriptIndexer(db_file)
+    try:
+        v_cluster_1 = (np.array([1.0, 0.0] + [0.0] * 382, dtype=np.float32)).tobytes()
+        v_cluster_2 = (np.array([0.99, 0.14] + [0.0] * 382, dtype=np.float32)).tobytes()
+        v_novel = (np.array([0.0, 1.0] + [0.0] * 382, dtype=np.float32)).tobytes()
+
+        bm25_list = [
+            {"file_path": "/mem/doc_a.md", "file_name": "doc_a.md", "category": "scars", "title": "Cluster Doc A", "description": "", "snippet": "A", "bm25_score": -5.0},
+            {"file_path": "/mem/doc_b.md", "file_name": "doc_b.md", "category": "scars", "title": "Cluster Doc B", "description": "", "snippet": "B", "bm25_score": -4.8},
+            {"file_path": "/mem/doc_c.md", "file_name": "doc_c.md", "category": "rules", "title": "Novel Doc C", "description": "", "snippet": "C", "bm25_score": -4.5},
+        ]
+        vec_list = [
+            {"chunk_id": 1, "distance": 0.1, "_embedding": v_cluster_1, "file_path": "/mem/doc_a.md", "file_name": "doc_a.md", "category": "scars", "title": "Cluster Doc A", "description": "", "content": "A"},
+            {"chunk_id": 2, "distance": 0.12, "_embedding": v_cluster_2, "file_path": "/mem/doc_b.md", "file_name": "doc_b.md", "category": "scars", "title": "Cluster Doc B", "description": "", "content": "B"},
+            {"chunk_id": 3, "distance": 0.15, "_embedding": v_novel, "file_path": "/mem/doc_c.md", "file_name": "doc_c.md", "category": "rules", "title": "Novel Doc C", "description": "", "content": "C"},
+        ]
+
+        fused = indexer._fuse_memory_rrf(bm25_list, vec_list, limit=2, k=60, mmr_lambda=0.7)
+        assert len(fused) == 2
+        assert fused[0]["file_path"] == "/mem/doc_a.md"
+        # MMR promotes orthogonal Novel Doc C over near-duplicate Cluster Doc B for slot 2
+        assert fused[1]["file_path"] == "/mem/doc_c.md"
+    finally:
+        indexer.close()
