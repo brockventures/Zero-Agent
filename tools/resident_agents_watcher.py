@@ -676,11 +676,6 @@ def run_resident_agents_watcher(
     card = format_notification_card(new_items)
     peer_card = format_peer_side_project_card(new_items, state.get("thread_reply_counts", {}))
     if post_discord and not test:
-        queue_outbox_message(
-            channel=str(ZERO_CHAT_CHANNEL_ID),
-            content=card,
-            source_turn="resident_agents_watcher",
-        )
         if peer_card:
             queue_outbox_message(
                 channel=str(RESIDENT_AGENTS_CHANNEL_ID),

@@ -199,7 +199,6 @@ def test_state_persistence_and_runner(tmp_path: Path) -> None:
             ok, msg, extra = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
             assert ok is True
             assert msg == ""
-            assert mock_enq.call_count == 2
+            assert mock_enq.call_count == 1
             channels = [c.kwargs["channel"] for c in mock_enq.call_args_list]
-            assert str(ZERO_CHAT_CHANNEL_ID) in channels
-            assert str(RESIDENT_AGENTS_CHANNEL_ID) in channels
+            assert channels == [str(RESIDENT_AGENTS_CHANNEL_ID)]
