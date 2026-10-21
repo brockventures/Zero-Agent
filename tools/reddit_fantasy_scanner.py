@@ -122,20 +122,20 @@ def scan_reddit_via_pixel(timeout_sec: int = 40) -> List[Dict[str, Any]]:
                         else:
                             raw_text = entry.inner_text().strip()
 
-                        # Basic filtering
-                        if not raw_text or len(raw_text) < 25:
+                        # Basic filtering (allow concise 10+ char questions like 'Tolle or Seth Hernandez?' before child replies are stripped)
+                        if not raw_text or len(raw_text) < 10:
                             continue
                         if any(b in raw_text.lower() for b in ["automoderator", "deleted", "[removed]", "writers and website owners"]):
                             continue
 
-                        # Extract author if not on element
+                        # Extract author & metadata from the comment's own header (never from nested child comments)
                         author = entry.get_attribute("author") or ""
                         if not author or author == "community_member":
-                            author_elem = entry.locator('a[href*="/user/"], a[slot="author"], span[slot="authorName"]').first
+                            author_elem = entry.locator('> .entry a.author, a[slot="author"], span[slot="authorName"], a[href*="/user/"]').first
                             if author_elem.count() > 0:
                                 author = author_elem.inner_text().strip().replace("u/", "")
                         if not author or author == "community_member":
-                            lines = raw_text.splitlines()
+                            lines = entry.inner_text().strip().splitlines()
                             for line in lines[:3]:
                                 if line.startswith("[–]") or "points" in line or "ago" in line:
                                     parts = line.replace("[–]", "").strip().split()
@@ -164,7 +164,7 @@ def scan_reddit_via_pixel(timeout_sec: int = 40) -> List[Dict[str, Any]]:
                             cleaned_lines.append(l)
                         clean_body = "\n".join(cleaned_lines).strip()
 
-                        if not clean_body or len(clean_body) < 15:
+                        if not clean_body or len(clean_body) < 10:
                             continue
 
                         # A genuine dilemma MUST be an inquiry asking for advice/decision, not advice statements
@@ -205,6 +205,10 @@ def scan_reddit_via_pixel(timeout_sec: int = 40) -> List[Dict[str, Any]]:
                                             }
                                             p = p.parentElement;
                                         }
+                                        if (d === 0) {
+                                            const ownParentBtn = el.querySelector(':scope > .entry ul.buttons a[data-event-action="parent"]');
+                                            if (ownParentBtn) return 1;
+                                        }
                                         return d;
                                     }"""
                                 )
@@ -213,9 +217,11 @@ def scan_reddit_via_pixel(timeout_sec: int = 40) -> List[Dict[str, Any]]:
                             except Exception:
                                 pass
 
-                        # Also check if raw_text includes a 'parent' action link (Old Reddit only renders 'parent' on replies to other comments, never on top-level comments)
-                        if depth_val == 0 and re.search(r"\bparent\b", raw_text.lower()):
-                            depth_val = 1
+                        # Fallback when DOM evaluation isn't available: only inspect text before any nested '[–]' child comment block
+                        if depth_val == 0:
+                            own_entry_text = re.split(r"\n\s*\[[–-]\]", entry.inner_text().strip())[0]
+                            if re.search(r"permalink.*?parent.*?reply", own_entry_text.lower()):
+                                depth_val = 1
 
                         # Strictly skip non-top-level comments (replies to other users' dilemmas)
                         if depth_val > 0:
@@ -410,10 +416,18 @@ def score_candidate(candidate: Dict[str, Any]) -> Tuple[float, List[str]]:
         reasons.append("Stale Thread (-20)")
 
     # 7. Disqualifications / Heavy Penalties
-    off_topic = ["touchdown", "quarterback", "fantasy football", "rb1", "wr1", "nfl", "nba", "lebron", "mahomes"]
+    off_topic = [
+        "touchdown", "quarterback", "fantasy football", "rb1", "wr1", "nfl", "nba", "lebron", "mahomes",
+        "make this weekly", "anything goes?", "automod", "subreddit"
+    ]
     if any(ot in text_lower for ot in off_topic):
         score = -50.0
         reasons.append("Off-Topic Disqualified (-50)")
+
+    # Short comments (< 10 words) must contain at least a comparison ('or', 'vs') or trade/keeper/draft keyword
+    if word_count < 10 and not re.search(r"\b(or|vs\.?|trade|keep|keeper|drop|add|draft|stash|prospect|dynasty)\b", text_lower):
+        score = -50.0
+        reasons.append("Non-Dilemma Brief Comment Disqualified (-50)")
 
     has_question = ("?" in text) or any(
         q in text_lower for q in [

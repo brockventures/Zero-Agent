@@ -189,6 +189,34 @@ class TestRedditFantasyScanner(unittest.TestCase):
         self.assertEqual(selected.get("author"), "ThoughtfulManager")
         self.assertIn("ThoughtfulManager", report)
 
+    def test_old_reddit_top_level_with_child_parent_button_not_disqualified(self):
+        """Verify Old Reddit top-level comment whose child reply has a 'parent' link is kept at depth=0."""
+        import re
+        raw_entry_text = (
+            "[–]AverageKhorneWorship 10 man points league yahoo 2 points 23 hours ago \n\n"
+            "Tolle or Seth Hernandez?\n\n"
+            "permalinkembedsavereportreply\n\n"
+            "[–]Penstripedsox 1 point 18 hours ago \n\n"
+            "who is seth hernandez? tolle is a top 20 dynasty pitcher already.\n\n"
+            "permalinkembedsaveparentreportreply"
+        )
+        own_entry_text = re.split(r"\n\s*\[[–-]\]", raw_entry_text.strip())[0]
+        self.assertIsNone(re.search(r"permalink.*?parent.*?reply", own_entry_text.lower()))
+
+        child_entry_text = (
+            "[–]Penstripedsox 1 point 18 hours ago \n\n"
+            "who is seth hernandez? tolle is a top 20 dynasty pitcher already.\n\n"
+            "permalinkembedsaveparentreportreply"
+        )
+        own_child_text = re.split(r"\n\s*\[[–-]\]", child_entry_text.strip())[0]
+        self.assertIsNotNone(re.search(r"permalink.*?parent.*?reply", own_child_text.lower()))
+
+        from tools.reddit_fantasy_scanner import score_candidate
+        meta_score, _ = score_candidate({"text": "Can we make this weekly?", "reply_count": 0, "depth": 0, "time_ago": "2h ago"})
+        self.assertLess(meta_score, 0)
+        versus_score, _ = score_candidate({"text": "Tolle or Seth Hernandez?", "reply_count": 0, "depth": 0, "time_ago": "2h ago"})
+        self.assertGreaterEqual(versus_score, 60)
+
 
 if __name__ == "__main__":
     unittest.main()
