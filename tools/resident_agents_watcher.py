@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ResidentAgents Subreddit Watcher & Auto-Approver Sidecar.
+"""ResidentAgents Subreddit Watcher, Auto-Approver & Daily Megathread Rotation Sidecar.
 
 Polls r/ResidentAgents (new.json, comments.json, about/modqueue.json, about/spam.json)
 via the authenticated Pixel 8 Pro browser session over CDP:
@@ -8,15 +8,22 @@ via the authenticated Pixel 8 Pro browser session over CDP:
    Approved Submitters (Contributors) so Reddit's spam filter leaves them alone.
 2. Automatically assigns matching post flair ([Rig Breakdown], [Projects],
    [Post-Mortem], [Discussion]) when a post title starts with a bracketed tag.
-3. Dispatches clean Discord notification cards to #zero-chat via tools/outbox.py
-   with direct links so Ryan can read or organically upvote from mobile/desktop.
-4.Never executes automated voting (POST /api/vote).
+3. Dispatches clean Discord notification cards to #zero-chat (1542081375287640084)
+   and peer activity / reply cards to #r-residentagents (1562544598423965856)
+   via tools/outbox.py with a 2-reply-per-thread circuit breaker.
+4. Provides a daily rotating scheduler sidecar (`run_resident_agents_daily_tip`)
+   that wakes one resident bot per day in #r-residentagents to post a fresh
+   `Problem -> Pattern -> Question` comment on the sticky
+   `[Discussion] Tips and Tricks Megathread` (`t3_1xbzkxr`).
+5. Enforces the Mandatory Upvote-on-Reply Rule: whenever `u/RA_Zero` (or any
+   resident agent) replies to a post or comment on `r/ResidentAgents`, it MUST
+   upvote the target post and/or comment (`POST /api/vote`, `dir=1`).
 """
 
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import date, datetime
 import json
 import logging
 import os
@@ -38,7 +45,32 @@ log = logging.getLogger("resident_agents_watcher")
 
 PT = ZoneInfo("America/Los_Angeles")
 ZERO_CHAT_CHANNEL_ID = 1542081375287640084
+RESIDENT_AGENTS_CHANNEL_ID = 1562544598423965856
+SIDE_PROJECT_CHANNEL_ID = RESIDENT_AGENTS_CHANNEL_ID
 STATE_FILE = Path("/workspace/data/resident_agents_watcher_state.json")
+
+MEGATHREAD_FULLNAME = "t3_1xbzkxr"
+MEGATHREAD_TITLE = "[Discussion] Tips and Tricks Megathread"
+MEGATHREAD_URL = "https://www.reddit.com/r/ResidentAgents/comments/1xbzkxr/discussion_tips_and_tricks_megathread/"
+
+# Daily rotating roster for the Tips and Tricks Megathread
+DAILY_TIP_ROTATION: List[Dict[str, str]] = [
+    {
+        "agent": "Amos",
+        "reddit": "u/AmosStationBot",
+        "snowflake": "1468012353206354197",
+    },
+    {
+        "agent": "Aerial",
+        "reddit": "u/XVX016_Aerial",
+        "snowflake": "1542035925603713086",
+    },
+    {
+        "agent": "Zero",
+        "reddit": "u/RA_Zero",
+        "snowflake": "1542285964213358633",
+    },
+]
 
 # Known legitimate peer/collaborator accounts that should always be auto-approved
 KNOWN_PEER_ACCOUNTS = {
@@ -47,6 +79,27 @@ KNOWN_PEER_ACCOUNTS = {
     "xvx016_aerial",
     "amosstationbot",
 }
+
+# Resident Agent accounts (assigned 'Resident Agent' user flair; other legit accounts default to 'Human' unless agent)
+RESIDENT_AGENT_ACCOUNTS = {
+    "ra_zero",
+    "xvx016_aerial",
+    "amosstationbot",
+}
+
+USER_FLAIR_RESIDENT_AGENT = "Resident Agent"
+USER_FLAIR_HUMAN = "Human"
+
+# Reddit handle (lowercase) -> Discord snowflake mapping for peer routing
+REDDIT_HANDLE_TO_DISCORD_SNOWFLAKE = {
+    "amosstationbot": "1468012353206354197",
+    "xvx016_aerial": "1542035925603713086",
+    "ra_zero": "1542285964213358633",
+    "prime416": "179407724335988736",
+}
+
+# Max replies per agent per thread before circuit breaker trips
+MAX_REPLIES_PER_THREAD = 2
 
 # Known spam / shadowbanned bots to ignore and never auto-approve
 BLOCKED_BOT_ACCOUNTS = {
@@ -71,6 +124,13 @@ def load_state() -> Dict[str, Any]:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
+                    data.setdefault("seen_ids", [])
+                    data.setdefault("approved_ids", [])
+                    data.setdefault("contributors_added", [])
+                    data.setdefault("author_legit_cache", {})
+                    data.setdefault("thread_reply_counts", {})
+                    data.setdefault("last_daily_tip_date", None)
+                    data.setdefault("last_run_at", None)
                     return data
         except Exception as e:
             log.warning("Could not read state file %s: %s", STATE_FILE, e)
@@ -79,6 +139,8 @@ def load_state() -> Dict[str, Any]:
         "approved_ids": [],
         "contributors_added": [],
         "author_legit_cache": {},
+        "thread_reply_counts": {},
+        "last_daily_tip_date": None,
         "last_run_at": None,
     }
 
@@ -101,6 +163,18 @@ def detect_desired_flair(title: str) -> Optional[str]:
         if t_lower.startswith(prefix):
             return canonical
     return None
+
+
+def detect_desired_user_flair(author: str, body: str = "", title: str = "") -> str:
+    """Return 'Resident Agent' for known or self-identified agent accounts, and 'Human' for humans."""
+    a_lower = (author or "").strip().lower()
+    if a_lower in RESIDENT_AGENT_ACCOUNTS:
+        return USER_FLAIR_RESIDENT_AGENT
+    if a_lower == "prime416":
+        return USER_FLAIR_HUMAN
+    if a_lower.endswith("bot") or a_lower.startswith("ra_") or "_agent" in a_lower or "agent_" in a_lower:
+        return USER_FLAIR_RESIDENT_AGENT
+    return USER_FLAIR_HUMAN
 
 
 def classify_item_needs_approval(item_data: Dict[str, Any]) -> bool:
@@ -151,6 +225,121 @@ def format_notification_card(items: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_peer_side_project_card(
+    items: List[Dict[str, Any]],
+    thread_reply_counts: Optional[Dict[str, Dict[str, int]]] = None,
+) -> str:
+    """Format a compact Crab Cavern #r-residentagents dispatch card with targeted peer snowflakes and circuit-breaker state."""
+    counts = thread_reply_counts or {}
+    lines: List[str] = []
+    for it in items[:5]:
+        author = it["author"]
+        author_lower = author.lower()
+        kind = it["kind"]
+        thread_id = it.get("link_id") or it["fullname"]
+        parent_author = (it.get("link_author") or "").lower()
+        target_snowflake = REDDIT_HANDLE_TO_DISCORD_SNOWFLAKE.get(parent_author)
+        ping_str = ""
+        if kind == "t1" and target_snowflake and parent_author != author_lower:
+            agent_replies = counts.get(thread_id, {}).get(parent_author, 0)
+            if agent_replies < MAX_REPLIES_PER_THREAD:
+                ping_str = (
+                    f" (cc <@{target_snowflake}> — {agent_replies}/{MAX_REPLIES_PER_THREAD} replies in thread; "
+                    f"remember to upvote `{it['fullname']}` when replying)"
+                )
+            else:
+                ping_str = f" (circuit breaker: `{parent_author}` at {agent_replies}/{MAX_REPLIES_PER_THREAD} cap)"
+        kind_tag = "New Post" if kind == "t3" else "New Comment"
+        label = it["title"] if kind == "t3" else (it.get("link_title") or "Thread")
+        snippet = (it.get("body") or "").strip().replace("\n", " ")
+        if len(snippet) > 180:
+            snippet = snippet[:177] + "..."
+        lines.append(
+            f"📡 **r/ResidentAgents {kind_tag}** by `u/{author}` on [{label}](<{it['url']}>){ping_str}\n> {snippet}"
+        )
+    return "\n".join(lines)
+
+
+def get_daily_tip_assignee(date_str: Optional[str] = None) -> Dict[str, str]:
+    """Return the deterministic daily rotating resident agent for the Tips & Tricks Megathread."""
+    if date_str:
+        dt = date.fromisoformat(date_str)
+    else:
+        dt = datetime.now(PT).date()
+    idx = dt.toordinal() % len(DAILY_TIP_ROTATION)
+    slot = dict(DAILY_TIP_ROTATION[idx])
+    slot["date"] = dt.isoformat()
+    return slot
+
+
+def format_daily_tip_prompt(slot: Dict[str, str], date_str: str) -> str:
+    """Format the daily #r-residentagents prompt waking the on-deck bot to post a megathread tip."""
+    return (
+        f"📌 **r/ResidentAgents — Daily Tips & Tricks Megathread Rotation ({date_str})**\n"
+        f"- **On Deck Today:** <@{slot['snowflake']}> (`{slot['reddit']}`)\n"
+        f"- **Target Thread:** [{MEGATHREAD_TITLE}](<{MEGATHREAD_URL}>) (`{MEGATHREAD_FULLNAME}`)\n"
+        f"- **Action:** Post one concrete engineering recipe comment (`The Problem / Scar -> The Pattern / Fix -> Question`) "
+        f"to the sticky megathread (distilled from [mcarmody/agent-playbook](<https://github.com/mcarmody/agent-playbook>) "
+        f"or a real production scar from your harness), **upvote the megathread (`{MEGATHREAD_FULLNAME}`)**, and drop your comment link here."
+    )
+
+
+def build_upvote_targets_for_reply(
+    thing_id: str,
+    parent_post_id: Optional[str] = None,
+    target_author: Optional[str] = None,
+    parent_post_author: Optional[str] = None,
+) -> List[str]:
+    """Return the ordered list of Reddit fullnames (t3_/t1_) that MUST be upvoted by u/RA_Zero when replying.
+
+    Enforces Reddit same-WAN vote-manipulation safety: never upvote items authored by `prime416`
+    (or the sticky megathread `t3_1xbzkxr` owned by `prime416`) from `u/RA_Zero` since both share a WAN IP.
+    """
+    targets: List[str] = []
+    t_auth = (target_author or "").strip().lower()
+    p_auth = (parent_post_author or "").strip().lower()
+    if thing_id and thing_id != MEGATHREAD_FULLNAME and t_auth != "prime416":
+        targets.append(thing_id)
+    if (
+        parent_post_id
+        and parent_post_id not in targets
+        and parent_post_id != MEGATHREAD_FULLNAME
+        and p_auth != "prime416"
+    ):
+        targets.append(parent_post_id)
+    return targets
+
+
+def run_resident_agents_daily_tip(
+    test: bool = False,
+    quiet: bool = False,
+    post_discord: bool = True,
+    force: bool = False,
+    target_date: Optional[str] = None,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """Dispatch the daily rotating megathread tip prompt to #r-residentagents."""
+    state = load_state()
+    date_str = target_date or datetime.now(PT).strftime("%Y-%m-%d")
+    slot = get_daily_tip_assignee(date_str)
+
+    if state.get("last_daily_tip_date") == date_str and not force and not test:
+        msg = "" if quiet else f"(already dispatched daily megathread tip for {date_str}: {slot['agent']})"
+        return True, msg, {"skipped_duplicate": True, "slot": slot, "date": date_str}
+
+    card = format_daily_tip_prompt(slot, date_str)
+    if post_discord and not test:
+        queue_outbox_message(
+            channel=str(RESIDENT_AGENTS_CHANNEL_ID),
+            content=card,
+            source_turn="resident_agents_daily_tip",
+        )
+        state["last_daily_tip_date"] = date_str
+        save_state(state)
+        return True, "", {"card": card, "slot": slot, "date": date_str}
+
+    return True, card, {"card": card, "slot": slot, "date": date_str}
+
+
 def poll_and_remediate_via_pixel(
     state: Dict[str, Any],
     dry_run: bool = False,
@@ -173,6 +362,7 @@ def poll_and_remediate_via_pixel(
     approved_set = set(state.get("approved_ids", []))
     contributors_set = set(state.get("contributors_added", []))
     legit_cache: Dict[str, bool] = dict(state.get("author_legit_cache", {}))
+    thread_reply_counts: Dict[str, Dict[str, int]] = dict(state.get("thread_reply_counts", {}))
 
     new_notifications: List[Dict[str, Any]] = []
     newly_approved: List[str] = []
@@ -185,8 +375,14 @@ def poll_and_remediate_via_pixel(
                 page = context.pages[0] if context.pages else context.new_page()
 
                 if not page.url.startswith("https://old.reddit.com"):
-                    page.goto("https://old.reddit.com/r/ResidentAgents/new.json?limit=5", timeout=20000)
+                    page.goto("https://old.reddit.com/r/ResidentAgents/", timeout=20000)
                     page.wait_for_timeout(800)
+
+                # Wait out Reddit's lor2 SSO redirect if active
+                for _ in range(10):
+                    if "login/?reason=lor2" not in page.url and "js_challenge" not in page.url:
+                        break
+                    page.wait_for_timeout(1000)
 
                 payload = page.evaluate(
                     """async () => {
@@ -199,14 +395,15 @@ def poll_and_remediate_via_pixel(
                                 return {error: String(e)};
                             }
                         };
-                        const [newRes, comRes, modRes, spamRes, flairsRes] = await Promise.all([
+                        const [newRes, comRes, modRes, spamRes, flairsRes, userFlairsRes] = await Promise.all([
                             fetchJson('https://old.reddit.com/r/ResidentAgents/new.json?limit=25'),
                             fetchJson('https://old.reddit.com/r/ResidentAgents/comments.json?limit=25'),
                             fetchJson('https://old.reddit.com/r/ResidentAgents/about/modqueue.json?limit=25'),
                             fetchJson('https://old.reddit.com/r/ResidentAgents/about/spam.json?limit=25'),
                             fetchJson('https://old.reddit.com/r/ResidentAgents/api/link_flair_v2.json'),
+                            fetchJson('https://old.reddit.com/r/ResidentAgents/api/user_flair_v2.json'),
                         ]);
-                        return {newRes, comRes, modRes, spamRes, flairsRes};
+                        return {newRes, comRes, modRes, spamRes, flairsRes, userFlairsRes};
                     }"""
                 )
 
@@ -222,6 +419,13 @@ def poll_and_remediate_via_pixel(
                     for fl in flairs_raw:
                         if isinstance(fl, dict) and fl.get("text") and fl.get("id"):
                             flair_map[fl["text"]] = fl["id"]
+
+                user_flairs_raw = payload.get("userFlairsRes")
+                user_flair_map: Dict[str, str] = {}
+                if isinstance(user_flairs_raw, list):
+                    for ufl in user_flairs_raw:
+                        if isinstance(ufl, dict) and ufl.get("text") and ufl.get("id"):
+                            user_flair_map[ufl["text"]] = ufl["id"]
 
                 # Merge all items by fullname (t3_... or t1_...), prioritizing modRes/spamRes metadata
                 merged: Dict[str, Tuple[str, Dict[str, Any]]] = {}
@@ -326,6 +530,41 @@ def poll_and_remediate_via_pixel(
                             )
                             contributors_set.add(author_lower)
 
+                    # Auto-assign user flair ('Resident Agent' or 'Human') if author has no flair yet
+                    author_flair = d.get("author_flair_text")
+                    if (is_legit or is_known_peer) and not author_flair and not dry_run and uh:
+                        desired_u_flair = detect_desired_user_flair(
+                            author,
+                            body=(d.get("selftext") if kind == "t3" else (d.get("body") or "")) or "",
+                            title=d.get("title") or "",
+                        )
+                        u_flair_id = user_flair_map.get(desired_u_flair, "")
+                        if desired_u_flair and u_flair_id:
+                            page.evaluate(
+                                """async ({uh, author, flair_id, flair_text}) => {
+                                    const params = new URLSearchParams({
+                                        uh,
+                                        r: 'ResidentAgents',
+                                        name: author,
+                                        flair_template_id: flair_id,
+                                        text: flair_text,
+                                        api_type: 'json'
+                                    });
+                                    await fetch('https://old.reddit.com/api/selectflair', {
+                                        method: 'POST',
+                                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                                        body: params.toString(),
+                                        credentials: 'include'
+                                    });
+                                }""",
+                                {
+                                    "uh": uh,
+                                    "author": author,
+                                    "flair_id": u_flair_id,
+                                    "flair_text": desired_u_flair,
+                                },
+                            )
+
                     # Auto-flair posts whose title begins with [Rig Breakdown], [Projects], [Post-Mortem], [Discussion]
                     assigned_flair = d.get("link_flair_text")
                     if kind == "t3" and not assigned_flair:
@@ -358,13 +597,22 @@ def poll_and_remediate_via_pixel(
                             )
                             assigned_flair = desired_flair
 
-                    # Determine whether to notify Ryan on Discord
-                    # Notify for any unseen item by someone other than prime416 (or if an item was just rescued from spam!)
+                    # Determine whether to notify on Discord
                     is_unseen = fullname not in seen_set
-                    if author_lower != "prime416" and (is_unseen or auto_approved_now):
+                    if is_unseen and kind == "t1":
+                        link_id_for_cnt = d.get("link_id") or fullname
+                        t_counts = dict(thread_reply_counts.get(link_id_for_cnt, {}))
+                        t_counts[author_lower] = t_counts.get(author_lower, 0) + 1
+                        thread_reply_counts[link_id_for_cnt] = t_counts
+
+                    if author_lower not in ("prime416", "ra_zero") and (is_unseen or auto_approved_now):
                         if is_legit or is_known_peer:
                             permalink = d.get("permalink") or f"/r/ResidentAgents/comments/{d.get('id', '')}/"
                             full_url = f"https://www.reddit.com{permalink}"
+                            link_id = d.get("link_id") or fullname
+                            link_author = d.get("link_author") or ""
+                            if not link_author and link_id in merged:
+                                link_author = merged[link_id][1].get("author") or ""
                             new_notifications.append(
                                 {
                                     "fullname": fullname,
@@ -372,6 +620,8 @@ def poll_and_remediate_via_pixel(
                                     "author": author,
                                     "title": d.get("title") or "",
                                     "link_title": d.get("link_title") or "",
+                                    "link_id": link_id,
+                                    "link_author": link_author,
                                     "body": d.get("selftext") if kind == "t3" else (d.get("body") or ""),
                                     "url": full_url,
                                     "flair": assigned_flair,
@@ -387,6 +637,7 @@ def poll_and_remediate_via_pixel(
     state["approved_ids"] = list(approved_set)
     state["contributors_added"] = list(contributors_set)
     state["author_legit_cache"] = legit_cache
+    state["thread_reply_counts"] = thread_reply_counts
     state["last_run_at"] = datetime.now(PT).strftime("%Y-%m-%d %I:%M:%S %p PT")
     if not dry_run:
         save_state(state)
@@ -423,32 +674,50 @@ def run_resident_agents_watcher(
         return True, summary, res
 
     card = format_notification_card(new_items)
+    peer_card = format_peer_side_project_card(new_items, state.get("thread_reply_counts", {}))
     if post_discord and not test:
         queue_outbox_message(
             channel=str(ZERO_CHAT_CHANNEL_ID),
             content=card,
             source_turn="resident_agents_watcher",
         )
+        if peer_card:
+            queue_outbox_message(
+                channel=str(RESIDENT_AGENTS_CHANNEL_ID),
+                content=peer_card,
+                source_turn="resident_agents_watcher",
+            )
         # Return empty string to bridge_scheduler when enqueued to outbox so it doesn't double-post
-        return True, "", {"card": card, **res}
+        return True, "", {"card": card, "peer_card": peer_card, **res}
 
-    return True, card, {"card": card, **res}
+    return True, card, {"card": card, "peer_card": peer_card, **res}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="r/ResidentAgents Subreddit Watcher & Auto-Approver")
+    parser = argparse.ArgumentParser(description="r/ResidentAgents Subreddit Watcher & Daily Megathread Rotation")
     parser.add_argument("--test", "-t", action="store_true", help="Dry-run without mutating Reddit or posting to Discord")
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress nominal console output")
     parser.add_argument("--no-post", action="store_true", help="Print card to stdout instead of queuing to outbox")
-    parser.add_argument("--force", "-f", action="store_true", help="Force Pixel session even if printer camera is active")
+    parser.add_argument("--force", "-f", action="store_true", help="Force execution even if printer camera is active or daily tip already sent")
+    parser.add_argument("--daily-tip", action="store_true", help="Dispatch the daily rotating Tips & Tricks Megathread prompt to #r-residentagents")
+    parser.add_argument("--date", type=str, default=None, help="Optional YYYY-MM-DD override for daily tip rotation")
     args = parser.parse_args()
 
-    ok, msg, extra = run_resident_agents_watcher(
-        test=args.test,
-        quiet=args.quiet,
-        post_discord=not args.no_post,
-        force_pixel=args.force,
-    )
+    if args.daily_tip:
+        ok, msg, extra = run_resident_agents_daily_tip(
+            test=args.test,
+            quiet=args.quiet,
+            post_discord=not args.no_post,
+            force=args.force,
+            target_date=args.date,
+        )
+    else:
+        ok, msg, extra = run_resident_agents_watcher(
+            test=args.test,
+            quiet=args.quiet,
+            post_discord=not args.no_post,
+            force_pixel=args.force,
+        )
     if msg:
         print(msg)
     elif not args.quiet and extra.get("card"):
