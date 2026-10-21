@@ -156,6 +156,7 @@ ON_DEMAND_TRIGGERS: dict[str, str] = {
     "/quota": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
     "/quota_poller": "Poll ground-truth quota usage snapshots using /workspace/tools/sidecars.py quota_poller.",
     "/context_digest": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest.",
+    "/resident_agents": "Run the r/ResidentAgents subreddit watcher and auto-approver using /workspace/tools/sidecars.py resident_agents_watcher.",
 }
 
 

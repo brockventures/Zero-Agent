@@ -612,6 +612,17 @@ DEFAULT_JOBS = [
         "prompt": "Run the weekly personal data and gaming profile sync using /workspace/tools/sidecars.py personal_data_sync --quiet. Syncs Steam, Xbox, Switch 2, Amazon orders, and Plex watch history into durable memory and re-indexes transcript_index.db.",
         "catchup_if_missed": True,
         "catchup_window_seconds": 14400
+    },
+    {
+        "id": "resident_agents_watcher",
+        "name": "r/ResidentAgents Watcher & Auto-Approver",
+        "enabled": True,
+        "schedule_type": "interval",
+        "interval_seconds": 300,
+        "channel_id": 1542081375287640084,
+        "prompt": "Run the r/ResidentAgents subreddit watcher and auto-approver using /workspace/tools/sidecars.py resident_agents_watcher --quiet. Silent background execution: if 0 new items and 0 approvals occurred (no output), emit ONLY [NO_REPLY].",
+        "catchup_if_missed": False,
+        "quiet_hours": [23, 7]
     }
 ]
 
@@ -630,6 +641,7 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "kalshi_night_audit",
     "quota_poller",
     "personal_data_sync",
+    "resident_agents_watcher",
 }
 
 
@@ -751,6 +763,7 @@ SIDECAR_ALIASES = {
     "kometa_audit": ["kometa_audit", "kometa"],
     "google_tasks_sync": ["google_tasks_sync", "tasks_sync"],
     "quota_poller": ["quota_poller", "quota_poll", "poller_quota"],
+    "resident_agents_watcher": ["resident_agents_watcher", "resident_agents", "ra_watcher"],
 }
 
 def get_last_execution_for_job(job_info: str | dict) -> tuple[float | None, str | None]:

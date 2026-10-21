@@ -87,6 +87,8 @@ INTERNAL_SYSTEM_MAINTENANCE_NAMES = {
     "quant_daily_sweep",
     "Kalshi Nightly Settlement & Quant Standup",
     "kalshi_night_audit",
+    "r/ResidentAgents Watcher & Auto-Approver",
+    "resident_agents_watcher",
 }
 
 INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
@@ -101,6 +103,7 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "quant_daily_sweep",
     "quant_expansion_sweep",
     "kalshi_night_audit",
+    "resident_agents_watcher",
 }
 
 
@@ -738,6 +741,27 @@ async def dispatch_scheduled_prompt(
                 print(f"[Scheduler] Personal data sync completed silently: ok={ok}")
         except Exception as e:
             print(f"[Scheduler] Personal data sync execution error: {e}")
+        return
+
+    # r/ResidentAgents Subreddit Watcher & Auto-Approver: zero-token background poller
+    if job_id == "resident_agents_watcher" or "resident_agents_watcher" in prompt or "resident_agents" in prompt or "r/ResidentAgents Watcher" in job_name:
+        try:
+            from tools.resident_agents_watcher import run_resident_agents_watcher
+            ok, out, extra = await _run_sidecar_job_async(
+                "resident_agents_watcher",
+                "r/ResidentAgents Watcher & Auto-Approver",
+                lambda: run_resident_agents_watcher(test=False, quiet=True, post_discord=True),
+            )
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await _send_chunked_content(ch, out)
+            else:
+                new_cnt = len(extra.get("new_items", [])) if isinstance(extra, dict) else 0
+                app_cnt = len(extra.get("approved_items", [])) if isinstance(extra, dict) else 0
+                print(f"[Scheduler] r/ResidentAgents watcher checked: ok={ok}, new={new_cnt}, approved={app_cnt}")
+        except Exception as e:
+            print(f"[Scheduler] r/ResidentAgents watcher execution error: {e}")
         return
 
     # Daily birthday reminder: silent execution unless someone has a birthday today

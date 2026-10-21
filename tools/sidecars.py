@@ -2051,6 +2051,23 @@ if __name__ == "__main__":
         ok, rep, _ = run_sidecar_job("personal_data_sync", "Weekly Personal Data & Gaming Profile Sync", run_personal_data_sync, test=test, quiet=quiet)
         if rep:
             print(rep)
+    elif action in ("resident_agents_watcher", "resident_agents", "ra_watcher"):
+        from tools.resident_agents_watcher import run_resident_agents_watcher
+        test = "--test" in sys.argv or "-t" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv
+        no_post = "--no-post" in sys.argv
+        force = "--force" in sys.argv or "-f" in sys.argv
+        ok, rep, _ = run_sidecar_job(
+            "resident_agents_watcher",
+            "r/ResidentAgents Watcher & Auto-Approver",
+            run_resident_agents_watcher,
+            test=test,
+            quiet=quiet,
+            post_discord=not no_post,
+            force_pixel=force,
+        )
+        if rep:
+            print(rep)
     elif action == "status":
         print(format_sidecar_status_summary())
     elif action == "history":
