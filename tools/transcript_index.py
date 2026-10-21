@@ -16,9 +16,12 @@ import os
 import sys
 import glob
 import json
+import math
+import re
 import time
 import sqlite3
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -31,6 +34,44 @@ MODEL_NAME = "BAAI/bge-small-en-v1.5"
 MODEL_CACHE_DIR = os.environ.get("FASTEMBED_CACHE_PATH", "/workspace/data/cache/fastembed")
 DEFAULT_RRF_K = 60
 EMBEDDING_DIM = 384
+RECENCY_DECAY_FLOOR = 0.90
+RECENCY_HALF_LIFE_DAYS = 30.0
+
+
+def compute_recency_multiplier(
+    age_days: float,
+    floor: float = RECENCY_DECAY_FLOOR,
+    half_life_days: float = RECENCY_HALF_LIFE_DAYS,
+) -> float:
+    """Compute an asymptotic recency multiplier in [floor, 1.0] that never decays below floor."""
+    if age_days <= 0.0:
+        return 1.0
+    decay = math.pow(0.5, age_days / max(half_life_days, 1e-6))
+    return floor + (1.0 - floor) * decay
+
+
+def _parse_iso_to_epoch(ts_str: Optional[str]) -> Optional[float]:
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    s = ts_str.strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+        if m:
+            try:
+                dt = datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                pass
+    return None
 
 _EMBEDDING_MODEL = None
 
@@ -956,6 +997,34 @@ class TranscriptIndexer:
         sorted_fps = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
         pool_fps = sorted_fps[:max(limit * 3, 25)]
 
+        # Apply asymptotic 0.90-floor recency multiplier across memory candidates
+        if pool_fps:
+            now_ts = time.time()
+            mtime_map: Dict[str, float] = {}
+            try:
+                placeholders = ",".join("?" * len(pool_fps))
+                for r_p, r_m in self.con.execute(
+                    f"SELECT path, mtime FROM indexed_files WHERE path IN ({placeholders})",
+                    pool_fps,
+                ):
+                    if r_m:
+                        mtime_map[r_p] = float(r_m)
+            except Exception:
+                pass
+            for fp in pool_fps:
+                mt = mtime_map.get(fp)
+                if mt is None and os.path.exists(fp):
+                    try:
+                        mt = os.path.getmtime(fp)
+                    except OSError:
+                        mt = None
+                if mt is not None:
+                    age_days = max(0.0, (now_ts - mt) / 86400.0)
+                    mult = compute_recency_multiplier(age_days)
+                    scores[fp] *= mult
+                    meta[fp]["recency_multiplier"] = round(mult, 4)
+            pool_fps = sorted(pool_fps, key=lambda x: scores[x], reverse=True)
+
         # Backfill embeddings for any BM25-only pool candidates so MMR can evaluate pairwise cosine similarity
         missing_fps = [fp for fp in pool_fps if fp not in emb_map]
         if missing_fps and self.has_vec:
@@ -1030,6 +1099,8 @@ class TranscriptIndexer:
             entry["bm25_rank"] = meta[fp]["bm25_rank"]
             entry["vector_rank"] = meta[fp]["vector_rank"]
             entry["vector_distance"] = meta[fp]["distance"]
+            if "recency_multiplier" in meta[fp]:
+                entry["recency_multiplier"] = meta[fp]["recency_multiplier"]
             if meta[fp]["bm25_rank"] and meta[fp]["vector_rank"]:
                 entry["match_type"] = "hybrid"
             elif meta[fp]["bm25_rank"]:
@@ -1163,6 +1234,15 @@ class TranscriptIndexer:
             else:
                 meta[key] = {"bm25_rank": None, "vector_rank": rank, "distance": item["distance"]}
 
+        now_ts = time.time()
+        for key, item in items.items():
+            ep = _parse_iso_to_epoch(item.get("created_at"))
+            if ep is not None:
+                age_days = max(0.0, (now_ts - ep) / 86400.0)
+                mult = compute_recency_multiplier(age_days)
+                scores[key] *= mult
+                meta[key]["recency_multiplier"] = round(mult, 4)
+
         sorted_keys = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
         fused = []
         for key in sorted_keys[:limit]:
@@ -1171,6 +1251,8 @@ class TranscriptIndexer:
             entry["bm25_rank"] = meta[key]["bm25_rank"]
             entry["vector_rank"] = meta[key]["vector_rank"]
             entry["vector_distance"] = meta[key]["distance"]
+            if "recency_multiplier" in meta[key]:
+                entry["recency_multiplier"] = meta[key]["recency_multiplier"]
             if meta[key]["bm25_rank"] and meta[key]["vector_rank"]:
                 entry["match_type"] = "hybrid"
             elif meta[key]["bm25_rank"]:
@@ -1302,6 +1384,15 @@ class TranscriptIndexer:
             else:
                 meta[mid] = {"bm25_rank": None, "vector_rank": rank, "distance": item["distance"]}
 
+        now_ts = time.time()
+        for mid, item in items.items():
+            ep = _parse_iso_to_epoch(item.get("timestamp"))
+            if ep is not None:
+                age_days = max(0.0, (now_ts - ep) / 86400.0)
+                mult = compute_recency_multiplier(age_days)
+                scores[mid] *= mult
+                meta[mid]["recency_multiplier"] = round(mult, 4)
+
         sorted_mids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
         fused = []
         for mid in sorted_mids[:limit]:
@@ -1310,6 +1401,8 @@ class TranscriptIndexer:
             entry["bm25_rank"] = meta[mid]["bm25_rank"]
             entry["vector_rank"] = meta[mid]["vector_rank"]
             entry["vector_distance"] = meta[mid]["distance"]
+            if "recency_multiplier" in meta[mid]:
+                entry["recency_multiplier"] = meta[mid]["recency_multiplier"]
             if meta[mid]["bm25_rank"] and meta[mid]["vector_rank"]:
                 entry["match_type"] = "hybrid"
             elif meta[mid]["bm25_rank"]:

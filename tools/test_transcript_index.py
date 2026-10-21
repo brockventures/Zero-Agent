@@ -290,3 +290,50 @@ def test_mmr_diversity_reranking(tmp_path):
         assert fused[1]["file_path"] == "/mem/doc_c.md"
     finally:
         indexer.close()
+
+
+def test_asymptotic_recency_decay_floor(tmp_path):
+    import time
+    from tools.transcript_index import compute_recency_multiplier
+
+    # Brand new memory = 1.0
+    assert compute_recency_multiplier(0.0) == 1.0
+    # 30 days (1 half-life) = 0.95
+    assert abs(compute_recency_multiplier(30.0) - 0.95) < 1e-4
+    # 10 years old never drops below 0.90 floor
+    assert compute_recency_multiplier(3650.0) >= 0.90
+    assert abs(compute_recency_multiplier(3650.0) - 0.90) < 1e-4
+
+    # Verify tie-breaking across two equally ranked candidates where one is fresh and one is 180 days old
+    db_file = str(tmp_path / "recency_test.db")
+    indexer = TranscriptIndexer(db_file)
+    try:
+        now = time.time()
+        with indexer.con:
+            indexer.con.execute(
+                "INSERT INTO indexed_files (path, mtime, size, item_count, indexed_at) VALUES (?, ?, 100, 1, 'now')",
+                ("/mem/old_doc.md", now - 180 * 86400),
+            )
+            indexer.con.execute(
+                "INSERT INTO indexed_files (path, mtime, size, item_count, indexed_at) VALUES (?, ?, 100, 1, 'now')",
+                ("/mem/new_doc.md", now),
+            )
+
+        # Give old_doc rank 1 in BM25 and rank 2 in vector; give new_doc rank 2 in BM25 and rank 1 in vector
+        # Without recency tie-breaker, both have identical raw RRF score (1/61 + 1/62)
+        bm25_list = [
+            {"file_path": "/mem/old_doc.md", "file_name": "old_doc.md", "category": "scars", "title": "Old Doc", "description": "", "snippet": "old", "bm25_score": -5.0},
+            {"file_path": "/mem/new_doc.md", "file_name": "new_doc.md", "category": "scars", "title": "New Doc", "description": "", "snippet": "new", "bm25_score": -5.0},
+        ]
+        vec_list = [
+            {"chunk_id": 1, "distance": 0.1, "_embedding": None, "file_path": "/mem/new_doc.md", "file_name": "new_doc.md", "category": "scars", "title": "New Doc", "description": "", "content": "new"},
+            {"chunk_id": 2, "distance": 0.1, "_embedding": None, "file_path": "/mem/old_doc.md", "file_name": "old_doc.md", "category": "scars", "title": "Old Doc", "description": "", "content": "old"},
+        ]
+
+        fused = indexer._fuse_memory_rrf(bm25_list, vec_list, limit=2, k=60)
+        assert fused[0]["file_path"] == "/mem/new_doc.md"
+        assert fused[0]["recency_multiplier"] == 1.0
+        assert fused[1]["file_path"] == "/mem/old_doc.md"
+        assert 0.90 <= fused[1]["recency_multiplier"] < 0.91
+    finally:
+        indexer.close()
