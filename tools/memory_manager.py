@@ -568,20 +568,22 @@ def run_dreaming_consolidation(dry_run: bool = False, hours_back: int = 24) -> t
 
                 # Stage 1: Public Decision
                 if category == "PUBLIC_DECISION" and is_public:
+                    from tools.topic_tracker import is_ephemeral_memory_noise, upsert_decision_resolution
+                    if is_ephemeral_memory_noise(summary, slug):
+                        continue
                     if CC_DECISIONS_FILE.exists():
-                        dec_content = CC_DECISIONS_FILE.read_text(encoding="utf-8", errors="replace")
-                        if slug not in dec_content and title.lower() not in dec_content.lower():
-                            block = f"""
----
-
-### Resolution: `{slug}` ({t0_str})
-* **Author**: Zero (consolidated via dreaming)
-* **Kind**: `decision` / `architecture`
-* **Title**: {title}
-* **Summary**: 🍌 {summary}
-"""
-                            if not dry_run:
-                                CC_DECISIONS_FILE.write_text(dec_content.rstrip() + block + "\n", encoding="utf-8")
+                        if not dry_run:
+                            wrote = upsert_decision_resolution(
+                                subject=slug,
+                                author_name="Zero (consolidated via dreaming)",
+                                kind="decision",
+                                summary_text=f"🍌 {summary} ({title})",
+                                timestamp_str=t0_str,
+                                decisions_path=CC_DECISIONS_FILE,
+                            )
+                            if wrote:
+                                consolidated_items.append(f"Public Decision logged: `{title}` (Crab Cavern)")
+                        else:
                             consolidated_items.append(f"Public Decision logged: `{title}` (Crab Cavern)")
                     else:
                         if not dry_run:
@@ -647,6 +649,11 @@ def run_dreaming_consolidation(dry_run: bool = False, hours_back: int = 24) -> t
         log.warning(f"Dreaming promotion scan error: {e}")
 
     if not dry_run:
+        compact_res = compact_decisions_log(dry_run=False)
+        if compact_res.get("removed", 0) > 0:
+            consolidated_items.append(
+                f"Compacted `decisions.md`: pruned {compact_res['removed']} duplicate/superseded/noise blocks ({compact_res['kept']} canonical blocks kept)"
+            )
         rebuild_indexes(sync_fts=True, embed=True)
 
     if not consolidated_items:
@@ -659,6 +666,72 @@ def run_dreaming_consolidation(dry_run: bool = False, hours_back: int = 24) -> t
         + "\nMemory indexes rebuilt and synced with SQLite FTS5."
     )
     return True, report
+
+
+def compact_decisions_log(decisions_path: Path = CC_DECISIONS_FILE, dry_run: bool = False) -> dict:
+    """Consolidate decisions.md (#1 noise filter + #3 subject superseding + #5 cluster deduplication)."""
+    if not decisions_path.exists():
+        return {"before": 0, "kept": 0, "removed": 0}
+
+    from tools.topic_tracker import is_ephemeral_memory_noise
+
+    raw = decisions_path.read_text(encoding="utf-8", errors="replace")
+    parts = re.split(r"(?=\n### Resolution:)", raw)
+    header = parts[0]
+    blocks = parts[1:]
+    before_count = len(blocks)
+    if before_count == 0:
+        return {"before": 0, "kept": 0, "removed": 0}
+
+    generic_subjects = {"general", "general-finding", "status", "lounge-chat"}
+    seen_norm = set()
+    deduped = []
+
+    for b in blocks:
+        clean_b = re.sub(r"\n---\s*$", "", b.strip()).strip()
+        m_subj = re.search(r"### Resolution:\s*`([^`]+)`", clean_b)
+        subj = m_subj.group(1).strip() if m_subj else "general"
+        m_sum = re.search(r"\*\s*\*\*Summary\*\*:\s*([\s\S]+)$", clean_b)
+        summary_body = m_sum.group(1).strip() if m_sum else clean_b
+
+        if is_ephemeral_memory_noise(summary_body, subj):
+            continue
+
+        norm_key = re.sub(r"\s+", " ", summary_body[:240]).lower()
+        if norm_key in seen_norm:
+            continue
+        seen_norm.add(norm_key)
+        deduped.append((subj, clean_b))
+
+    # Reverse pass to supersede older entries of specific named topics (keeping latest canonical resolution per topic)
+    seen_subjects = set()
+    final_blocks_rev = []
+    for subj, clean_b in reversed(deduped):
+        s_low = subj.lower()
+        if s_low not in generic_subjects:
+            if s_low in seen_subjects:
+                continue
+            seen_subjects.add(s_low)
+        final_blocks_rev.append(clean_b)
+
+    final_blocks = list(reversed(final_blocks_rev))
+    removed_count = before_count - len(final_blocks)
+
+    if removed_count > 0 and not dry_run:
+        updated_text = header.rstrip() + "\n\n" + "\n\n".join(final_blocks) + "\n"
+        decisions_path.write_text(updated_text, encoding="utf-8")
+        dot_mem = Path("/workspace/.agents/memory/crab_cavern/decisions.md")
+        if dot_mem.parent.exists() and decisions_path == CC_DECISIONS_FILE:
+            try:
+                dot_mem.write_text(updated_text, encoding="utf-8")
+            except Exception:
+                pass
+
+    return {
+        "before": before_count,
+        "kept": len(final_blocks),
+        "removed": removed_count,
+    }
 
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "doctor"

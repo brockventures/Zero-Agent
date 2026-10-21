@@ -21,6 +21,102 @@ DATA_DIR = Path("/workspace/data")
 TOPICS_FILE = DATA_DIR / "active_topics.json"
 MEM_DECISIONS = Path("/workspace/memory/crab_cavern/decisions.md")
 
+# Ephemeral / operational noise patterns that should never be written to durable memory
+_EPHEMERAL_NOISE_RE = re.compile(
+    r"(?:\b(?:BUY|SELL)\s+\d+\s+[A-Z_]+\s+@\s+\d+|\bMOVE\s+TO\s+[A-Z0-9_-]+|\bHOLD\s+AT\s+[A-Z0-9_-]+"
+    r"|STATION AGORA // COMBINE ROUND"
+    r"|^(?:yielding the floor|standing by|acknowledged\.?\s*standing by|closing this one|no action needed|nothing more is needed)\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def is_ephemeral_memory_noise(text: str, subject: str = "") -> bool:
+    """Deterministic gate (#1) to veto ephemeral CI/build/trading/floor-yield noise before memory ingestion."""
+    s = (text or "").strip()
+    if not s or len(s) < 25:
+        return True
+    subj_low = (subject or "").strip().lower()
+    if subj_low in ("", "none", "null", "status", "ping", "heartbeat", "agora-live-burst"):
+        return True
+    if _EPHEMERAL_NOISE_RE.search(s):
+        return True
+    # Pure PR/commit/CI status bump with no architectural substance
+    if len(s) < 160 and re.search(
+        r"\b(?:auto-merge armed|all checks passing|ci passed|merged pr #\d+|rebased onto main)\b",
+        s,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def upsert_decision_resolution(
+    subject: str,
+    author_name: str,
+    kind: str,
+    summary_text: str,
+    timestamp_str: str | None = None,
+    decisions_path: Path = MEM_DECISIONS,
+) -> bool:
+    """Append or supersede a resolution in decisions.md (#1 noise gate + #3 explicit subject superseding)."""
+    subj = (subject or "general-finding").strip()
+    if is_ephemeral_memory_noise(summary_text, subj):
+        return False
+
+    now_pt_str = timestamp_str or datetime.now(PT).strftime("%Y-%m-%d %I:%M:%S %p PT")
+    new_block = (
+        f"### Resolution: `{subj}` ({now_pt_str})\n"
+        f"* **Author**: {author_name}\n"
+        f"* **Kind**: `{kind}`\n"
+        f"* **Summary**: {summary_text.strip()}\n"
+    )
+
+    decisions_path.parent.mkdir(parents=True, exist_ok=True)
+    if not decisions_path.exists():
+        decisions_path.write_text(f"# Crab Cavern Architectural Decisions\n\n{new_block}", encoding="utf-8")
+        return True
+
+    raw = decisions_path.read_text(encoding="utf-8", errors="replace")
+    norm_summary = re.sub(r"\s+", " ", summary_text.strip()).lower()
+    if norm_summary in re.sub(r"\s+", " ", raw).lower():
+        return False
+
+    parts = re.split(r"(?=\n### Resolution:)", raw)
+    header = parts[0]
+    blocks = parts[1:]
+
+    # For specific named topics (not generic catch-alls), supersede older interim blocks of the same subject
+    generic_subjects = {"general", "general-finding", "status", "lounge-chat"}
+    kept_blocks = []
+    superseded_count = 0
+    for b in blocks:
+        m = re.search(r"### Resolution:\s*`([^`]+)`", b)
+        b_subj = m.group(1).strip() if m else ""
+        if subj.lower() not in generic_subjects and b_subj.lower() == subj.lower():
+            superseded_count += 1
+            continue
+        kept_blocks.append(b.strip())
+
+    if superseded_count > 0:
+        new_block = (
+            f"### Resolution: `{subj}` ({now_pt_str})\n"
+            f"* **Author**: {author_name}\n"
+            f"* **Kind**: `{kind}` *(supersedes {superseded_count} prior `{subj}` entry/entries)*\n"
+            f"* **Summary**: {summary_text.strip()}\n"
+        )
+
+    kept_blocks.append(new_block.strip())
+    updated_text = header.rstrip() + "\n\n" + "\n\n".join(kept_blocks) + "\n"
+    decisions_path.write_text(updated_text, encoding="utf-8")
+
+    dot_mem = Path("/workspace/.agents/memory/crab_cavern/decisions.md")
+    if dot_mem.parent.exists() and decisions_path == MEM_DECISIONS:
+        try:
+            dot_mem.write_text(updated_text, encoding="utf-8")
+        except Exception:
+            pass
+    return True
+
 def _summarize_resolution(clean_text: str, subject: str, author_name: str) -> str:
     """Extract or synthesize a concise technical resolution summary using LLM when appropriate."""
     lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
@@ -119,29 +215,21 @@ def check_and_resolve_topic(envelope: dict, content: str, author_name: str, mess
 
     # Internalize resolution cleanly without posting synthetic emoji reactions
 
-    # 2. Append to durable memory in /workspace/memory/crab_cavern/decisions.md
+    # 2. Append or supersede in durable memory in /workspace/memory/crab_cavern/decisions.md
     try:
         clean_text = re.sub(r"```handoff.*?```", "", content, flags=re.DOTALL).strip()
+        if is_ephemeral_memory_noise(clean_text, subject or ""):
+            return False
         summary_text = _summarize_resolution(clean_text, subject or "general-finding", author_name)
-        now_pt_str = datetime.now(PT).strftime("%Y-%m-%d %I:%M:%S %p PT")
-
-        entry = f"\n\n### Resolution: `{subject or 'general-finding'}` ({now_pt_str})\n"
-        entry += f"* **Author**: {author_name}\n"
-        entry += f"* **Kind**: `{kind}`\n"
-        entry += f"* **Summary**: {summary_text}\n"
-
-
-        MEM_DECISIONS.parent.mkdir(parents=True, exist_ok=True)
-        with open(MEM_DECISIONS, "a") as f:
-            f.write(entry)
-
-        dot_mem = Path("/workspace/.agents/memory/crab_cavern/decisions.md")
-        if dot_mem.parent.exists():
-            with open(dot_mem, "a") as f:
-                f.write(entry)
-
-        print(f"[TopicTracker] Internalized '{subject}' into {MEM_DECISIONS}")
-        return True
+        wrote = upsert_decision_resolution(
+            subject=subject or "general-finding",
+            author_name=author_name,
+            kind=kind or "finding",
+            summary_text=summary_text,
+        )
+        if wrote:
+            print(f"[TopicTracker] Internalized '{subject}' into {MEM_DECISIONS}")
+        return wrote
     except Exception as e:
         print(f"[TopicTracker] Error internalizing topic: {e}")
         return False
