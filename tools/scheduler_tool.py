@@ -623,6 +623,18 @@ DEFAULT_JOBS = [
         "prompt": "Run the r/ResidentAgents subreddit watcher and auto-approver using /workspace/tools/sidecars.py resident_agents_watcher --quiet. Silent background execution: if 0 new items and 0 approvals occurred (no output), emit ONLY [NO_REPLY].",
         "catchup_if_missed": False,
         "quiet_hours": [23, 7]
+    },
+    {
+        "id": "resident_agents_daily_tip",
+        "name": "r/ResidentAgents Daily Tips & Tricks Megathread Rotation",
+        "enabled": True,
+        "schedule_type": "daily",
+        "hour_pt": 11,
+        "minute_pt": 30,
+        "channel_id": 1562544598423965856,
+        "prompt": "Run the daily r/ResidentAgents Tips and Tricks Megathread rotation prompt using /workspace/tools/sidecars.py resident_agents_daily_tip --quiet. Wakes the on-deck resident bot in #r-residentagents to post a daily engineering recipe comment on t3_1xbzkxr.",
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 14400
     }
 ]
 
@@ -642,6 +654,7 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "quota_poller",
     "personal_data_sync",
     "resident_agents_watcher",
+    "resident_agents_daily_tip",
 }
 
 
@@ -764,6 +777,7 @@ SIDECAR_ALIASES = {
     "google_tasks_sync": ["google_tasks_sync", "tasks_sync"],
     "quota_poller": ["quota_poller", "quota_poll", "poller_quota"],
     "resident_agents_watcher": ["resident_agents_watcher", "resident_agents", "ra_watcher"],
+    "resident_agents_daily_tip": ["resident_agents_daily_tip", "resident_agents_tip", "ra_daily_tip"],
 }
 
 def get_last_execution_for_job(job_info: str | dict) -> tuple[float | None, str | None]:

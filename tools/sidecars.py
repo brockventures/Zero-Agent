@@ -2068,6 +2068,23 @@ if __name__ == "__main__":
         )
         if rep:
             print(rep)
+    elif action in ("resident_agents_daily_tip", "resident_agents_tip", "ra_daily_tip"):
+        from tools.resident_agents_watcher import run_resident_agents_daily_tip
+        test = "--test" in sys.argv or "-t" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv
+        no_post = "--no-post" in sys.argv
+        force = "--force" in sys.argv or "-f" in sys.argv
+        ok, rep, _ = run_sidecar_job(
+            "resident_agents_daily_tip",
+            "r/ResidentAgents Daily Tips & Tricks Megathread Rotation",
+            run_resident_agents_daily_tip,
+            test=test,
+            quiet=quiet,
+            post_discord=not no_post,
+            force=force,
+        )
+        if rep:
+            print(rep)
     elif action == "status":
         print(format_sidecar_status_summary())
     elif action == "history":

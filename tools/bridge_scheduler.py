@@ -89,6 +89,8 @@ INTERNAL_SYSTEM_MAINTENANCE_NAMES = {
     "kalshi_night_audit",
     "r/ResidentAgents Watcher & Auto-Approver",
     "resident_agents_watcher",
+    "r/ResidentAgents Daily Tips & Tricks Megathread Rotation",
+    "resident_agents_daily_tip",
 }
 
 INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
@@ -104,6 +106,7 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "quant_expansion_sweep",
     "kalshi_night_audit",
     "resident_agents_watcher",
+    "resident_agents_daily_tip",
 }
 
 
@@ -743,10 +746,49 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Personal data sync execution error: {e}")
         return
 
-    # r/ResidentAgents Subreddit Watcher & Auto-Approver: zero-token background poller
-    if job_id == "resident_agents_watcher" or "resident_agents_watcher" in prompt or "resident_agents" in prompt or "r/ResidentAgents Watcher" in job_name:
+    # r/ResidentAgents Daily Tips & Tricks Megathread Rotation
+    if job_id == "resident_agents_daily_tip" or "resident_agents_daily_tip" in prompt or "resident_agents_tip" in prompt or "Megathread Rotation" in job_name:
         try:
-            from tools.resident_agents_watcher import run_resident_agents_watcher
+            import importlib
+            import tools.resident_agents_watcher
+            importlib.reload(tools.resident_agents_watcher)
+            RESIDENT_AGENTS_CHANNEL_ID = tools.resident_agents_watcher.RESIDENT_AGENTS_CHANNEL_ID
+            run_resident_agents_daily_tip = tools.resident_agents_watcher.run_resident_agents_daily_tip
+            ok, out, extra = await _run_sidecar_job_async(
+                "resident_agents_daily_tip",
+                "r/ResidentAgents Daily Tips & Tricks Megathread Rotation",
+                lambda: run_resident_agents_daily_tip(test=False, quiet=True, post_discord=True),
+            )
+            slot = extra.get("slot", {}) if isinstance(extra, dict) else {}
+            print(f"[Scheduler] r/ResidentAgents daily tip rotation: ok={ok}, agent={slot.get('agent')}")
+            if ok and slot.get("agent") == "Zero" and not (isinstance(extra, dict) and extra.get("skipped_duplicate")) and bot and turn_queue:
+                dest_ch = await get_dest_channel(RESIDENT_AGENTS_CHANNEL_ID)
+                if dest_ch:
+                    await turn_queue.put({
+                        "prompt": (
+                            "It is Zero's turn on the daily r/ResidentAgents Tips and Tricks Megathread rotation (`t3_1xbzkxr`). "
+                            "Post a new top-level engineering recipe comment (`Problem / Scar -> Pattern / Fix -> Question`) as `u/RA_Zero` "
+                            "to `https://www.reddit.com/r/ResidentAgents/comments/1xbzkxr/discussion_tips_and_tricks_megathread/`, "
+                            "approve it via `prime416`, and share the comment link in `#r-residentagents`."
+                        ),
+                        "status_msg": None,
+                        "reply_target": dest_ch,
+                        "attachments": [],
+                        "is_steer": False,
+                        "mode": "external",
+                        "channel_id": RESIDENT_AGENTS_CHANNEL_ID,
+                    })
+        except Exception as e:
+            print(f"[Scheduler] r/ResidentAgents daily tip rotation error: {e}")
+        return
+
+    # r/ResidentAgents Subreddit Watcher & Auto-Approver: zero-token background poller
+    if job_id == "resident_agents_watcher" or "resident_agents_watcher" in prompt or "r/ResidentAgents Watcher" in job_name:
+        try:
+            import importlib
+            import tools.resident_agents_watcher
+            importlib.reload(tools.resident_agents_watcher)
+            run_resident_agents_watcher = tools.resident_agents_watcher.run_resident_agents_watcher
             ok, out, extra = await _run_sidecar_job_async(
                 "resident_agents_watcher",
                 "r/ResidentAgents Watcher & Auto-Approver",
