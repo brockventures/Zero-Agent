@@ -52,6 +52,7 @@ KNOWN_CHANNELS = {
     "gotchi": 1561509863018856468,
     "gotchi-chat": 1562246590943461429,
     "gotchi-log": 1562246590943461429,
+    "r-residentagents": 1562544598423965856,
 }
 
 def resolve_channel(channel_input: str | int) -> tuple[str, int | None]:
