@@ -336,28 +336,40 @@ class GeminiLiveAudioSink(voice_recv.AudioSink):
         self._pcm_16k_accum.clear()
 
 
+_STATIC_CONTEXT_CACHE: dict[str, Any] = {"ts": 0.0, "text": ""}
+
+
 def _load_startup_context_snapshot() -> str:
     """Pre-load Zero's operational reference (`GEMINI.md`), Ryan's core profile (`user_ryan.md`),
-    active tasks (`tasks.json`), and recent `#zero-chat` messages right into the initial
-    WebSocket `system_instruction` (transmitted once per session).
+    active tasks (`tasks.json`), recent `#zero-chat` messages, and recent voice/Gotchi turns.
+    Caches static reference files in memory for 120s to eliminate disk read latency on PTT turns.
     """
-    sections = []
+    now_mono = time.monotonic()
+    if not _STATIC_CONTEXT_CACHE["text"] or (now_mono - _STATIC_CONTEXT_CACHE["ts"] > 120.0):
+        static_parts = []
+        try:
+            gemini_md = Path("/workspace/GEMINI.md")
+            if gemini_md.exists():
+                static_parts.append(
+                    "=== ZERO CORE OPERATIONAL REFERENCE (/workspace/GEMINI.md) ===\n"
+                    + gemini_md.read_text()[:8000]
+                )
+        except Exception:
+            pass
 
-    # 1. Core Operational Reference (/workspace/GEMINI.md)
-    try:
-        gemini_md = Path("/workspace/GEMINI.md")
-        if gemini_md.exists():
-            sections.append("=== ZERO CORE OPERATIONAL REFERENCE (/workspace/GEMINI.md) ===\n" + gemini_md.read_text()[:10000])
-    except Exception:
-        pass
+        try:
+            ryan_md = Path("/workspace/memory/private/user_ryan.md")
+            if ryan_md.exists():
+                static_parts.append(
+                    "=== RYAN BROCK PROFILE (/workspace/memory/private/user_ryan.md) ===\n"
+                    + ryan_md.read_text()[:6500]
+                )
+        except Exception:
+            pass
+        _STATIC_CONTEXT_CACHE["text"] = "\n\n".join(static_parts)
+        _STATIC_CONTEXT_CACHE["ts"] = now_mono
 
-    # 2. Ryan Brock Core Profile (/workspace/memory/private/user_ryan.md)
-    try:
-        ryan_md = Path("/workspace/memory/private/user_ryan.md")
-        if ryan_md.exists():
-            sections.append("=== RYAN BROCK PROFILE (/workspace/memory/private/user_ryan.md) ===\n" + ryan_md.read_text()[:8500])
-    except Exception:
-        pass
+    sections = [_STATIC_CONTEXT_CACHE["text"]] if _STATIC_CONTEXT_CACHE["text"] else []
 
     # 3. Pending tasks from /workspace/data/tasks.json
     try:
@@ -366,7 +378,7 @@ def _load_startup_context_snapshot() -> str:
             tasks = json.loads(t_file.read_text())
             pending = [t for t in tasks if t.get("status") in ("pending", "in_progress", "parking_lot")]
             if pending:
-                lines = [f"  - [#{t.get('id')}] ({t.get('status')}) {t.get('title')}" for t in pending[-15:]]
+                lines = [f"  - [#{t.get('id')}] ({t.get('status')}) {t.get('title')}" for t in pending[-12:]]
                 sections.append("=== ACTIVE ZERO TASKS (/workspace/data/tasks.json) ===\n" + "\n".join(lines))
     except Exception:
         pass
@@ -377,11 +389,24 @@ def _load_startup_context_snapshot() -> str:
             ch = json.loads(CHANNEL_HISTORY_FILE.read_text()).get(str(TARGET_CHANNEL_ID), [])
             if ch:
                 lines = []
-                for m in ch[-10:]:
+                for m in ch[-8:]:
                     author = m.get("author", "User")
                     content = " ".join(str(m.get("content", "")).split())[:220]
                     lines.append(f"  - {author}: {content}")
-                sections.append("=== RECENT #zero-chat CONTEXT ===\n" + "\n".join(lines))
+                sections.append("=== RECENT #zero-chat & VOICE CONTEXT ===\n" + "\n".join(lines))
+    except Exception:
+        pass
+
+    # 5. Recent voice & Gotchi turns for immediate multi-turn follow-up continuity
+    try:
+        if VOICE_TRANSCRIPT_FILE.exists():
+            vt = json.loads(VOICE_TRANSCRIPT_FILE.read_text())
+            if vt:
+                v_lines = [
+                    f"  - [{item.get('source', 'voice')}] {item.get('speaker')}: {str(item.get('text', ''))[:240]}"
+                    for item in vt[-8:]
+                ]
+                sections.append("=== RECENT GOTCHI & #zero-voice DIALOGUE ===\n" + "\n".join(v_lines))
     except Exception:
         pass
 
@@ -542,14 +567,25 @@ def _build_live_tools() -> list[types.Tool]:
                 ),
                 types.FunctionDeclaration(
                     name="post_note_to_zero_chat",
-                    description="Send a text summary, code snippet, link, or action item into #zero-chat on Discord during a voice call.",
+                    description=(
+                        "Send a clickable hyperlink, markdown summary, code snippet, local artifact/image file, "
+                        "or live webpage screenshot into #zero-chat on Discord during a voice or Gotchi session."
+                    ),
                     parameters=types.Schema(
                         type="OBJECT",
                         properties={
                             "message": types.Schema(
                                 type="STRING",
-                                description="Markdown text to post to #zero-chat.",
-                            )
+                                description="Markdown text, clickable links ([Label](<https://...>)), or notes to post to #zero-chat.",
+                            ),
+                            "file_path": types.Schema(
+                                type="STRING",
+                                description="Optional absolute path to a local image (.png, .jpg, .webp), 3D model (.stl, .3mf, .step), or file to attach to #zero-chat.",
+                            ),
+                            "screenshot_url": types.Schema(
+                                type="STRING",
+                                description="Optional http/https URL to capture a live visual screenshot of and upload to #zero-chat.",
+                            ),
                         },
                         required=["message"],
                     ),
@@ -872,10 +908,46 @@ class ZeroVoiceSessionManager:
 
         if name == "post_note_to_zero_chat":
             msg_text = str(args.get("message", "")).strip()
+            file_path = str(args.get("file_path", "") or "").strip()
+            screenshot_url = str(args.get("screenshot_url", "") or "").strip()
+            if screenshot_url and not file_path:
+                try:
+                    shot_path = f"/workspace/data/attachments/voice_shot_{int(time.time()*1000)}.png"
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        ["python3", "/workspace/tools/capture_screenshot.py", screenshot_url, "--output", shot_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=20,
+                    )
+                    if Path(shot_path).exists():
+                        file_path = shot_path
+                except Exception as se:
+                    log.warning(f"[ZeroVoice] Screenshot capture failed: {se}")
+
+            if file_path and Path(file_path).exists():
+                try:
+                    from tools.deliver_image import deliver_file
+
+                    caption = f"🎙️ **[Voice Session Artifact]:**\n{msg_text}" if msg_text else "🎙️ **[Voice Session Artifact]**"
+                    res = await asyncio.to_thread(
+                        deliver_file,
+                        file_path,
+                        str(TARGET_CHANNEL_ID),
+                        caption,
+                    )
+                    if res.get("success"):
+                        return {"status": "uploaded artifact to #zero-chat", "file_path": file_path}
+                except Exception as de:
+                    log.warning(f"[ZeroVoice] deliver_file fallback: {de}")
+
             target_ch = notify_channel or self.bot.get_channel(TARGET_CHANNEL_ID)
             if target_ch and msg_text:
                 try:
-                    await target_ch.send(f"🎙️ **[Voice Session Note]:**\n{msg_text}")
+                    from tools.bridge_formatting import format_for_discord
+
+                    formatted_msg = format_for_discord(f"🎙️ **[Voice Session Note]:**\n{msg_text}")
+                    await target_ch.send(formatted_msg)
                     return {"status": "posted to #zero-chat"}
                 except Exception as e:
                     return {"error": str(e)}

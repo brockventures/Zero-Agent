@@ -48,6 +48,9 @@ KNOWN_CHANNELS = {
     "general": 1534452820995080192,
     "signals": 1534436119888793750,
     "staff-comms": 1534436119888793750,
+    "gotchi": 1561509863018856468,
+    "gotchi-chat": 1562246590943461429,
+    "gotchi-log": 1562246590943461429,
 }
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -265,6 +268,74 @@ def deliver_image(
             "success": False,
             "error": f"Failed to deliver image over HTTP: {e}",
         }
+
+
+def deliver_file(
+    file_path: str | Path,
+    channel_input: str | int,
+    caption: str | None = None,
+    reply_to: int | str | None = None,
+) -> dict:
+    """
+    Upload any visual image OR general artifact file (.stl, .3mf, .step, .pdf, .md, .json, .py)
+    to a Discord channel via REST API v10. Delegates to `deliver_image` for raster images.
+    """
+    p = Path(file_path).resolve()
+    if not p.exists() or not p.is_file():
+        return {"success": False, "error": f"Artifact file does not exist: {p}"}
+    if p.stat().st_size == 0:
+        return {"success": False, "error": f"Artifact file is empty (0 bytes): {p}"}
+
+    if p.suffix.lower() in IMAGE_EXTENSIONS:
+        return deliver_image(p, channel_input=channel_input, caption=caption, reply_to=reply_to)
+
+    clean_name, channel_id = resolve_channel(channel_input)
+    if not channel_id:
+        return {
+            "success": False,
+            "error": f"Could not resolve channel '{channel_input}'.",
+        }
+
+    token = get_discord_token()
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    headers = {
+        "Authorization": f"Bot {token}",
+        "User-Agent": "ZeroDiscordBridge/1.0",
+    }
+    payload = {}
+    if caption:
+        payload["content"] = caption
+    if reply_to:
+        payload["message_reference"] = {"message_id": str(reply_to)}
+
+    mime_type = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+    try:
+        with open(p, "rb") as f:
+            files = {
+                "files[0]": (p.name, f.read(), mime_type),
+                "payload_json": (None, json.dumps(payload), "application/json"),
+            }
+            res = requests.post(url, headers=headers, files=files, timeout=30)
+        if res.status_code in (200, 201):
+            res_json = res.json()
+            msg_id = res_json.get("id")
+            record_delivered_artifact(p, channel_id, msg_id, p.name)
+            return {
+                "success": True,
+                "channel": clean_name,
+                "channel_id": channel_id,
+                "message_id": msg_id,
+                "attachments": res_json.get("attachments", []),
+                "file_path": str(p),
+                "size_kb": round(p.stat().st_size / 1024.0, 2),
+            }
+        return {
+            "success": False,
+            "error": f"Discord API error {res.status_code}: {res.text}",
+            "status_code": res.status_code,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"Failed to deliver file over HTTP: {e}"}
 
 
 def main():

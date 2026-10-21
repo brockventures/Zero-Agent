@@ -59,7 +59,7 @@ MONITORED_CLASSES = {"temperature", "humidity", "carbon_dioxide", "power", "volt
 MIN_SIGMA_FLOOR = {
     "temperature": 1.5,      # °F
     "humidity": 3.0,         # %
-    "carbon_dioxide": 50.0,  # ppm
+    "carbon_dioxide": 125.0, # ppm (accounts for open-door daytime vs closed-door bedtime bedroom swings)
     "power": 25.0,           # W
     "voltage": 4.0,          # V (120V/240V mains & UPS voltage stability)
     "energy_daily": 2.5,     # kWh/day for Emporia Vue daily circuit totals

@@ -493,6 +493,94 @@ class TestQuantExpansion(unittest.TestCase):
             )
         self.assertEqual(res["approved_indices"], [])
 
+    def test_track4_five_structural_fixes(self):
+        """Verify Track 4 50-SMA alignment, ATR hysteresis buffer, 24h cooldown, beta alignment, and anti-exhaustion."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        PT = ZoneInfo("America/Los_Angeles")
+
+        # 1. 60-candle history populates distinct sma_20 and sma_50
+        candles_60 = [
+            {"open": 100.0 + i * 0.5, "high": 101.0 + i * 0.5, "low": 99.0 + i * 0.5, "close": 100.5 + i * 0.5, "volume": 1500.0, "timestamp": i}
+            for i in range(60)
+        ]
+        tech_60 = track4.calculate_technical_indicators(candles_60)
+        self.assertIsNotNone(tech_60)
+        self.assertGreater(tech_60["sma_20"], tech_60["sma_50"])
+        self.assertTrue(tech_60["is_bull_regime"])
+
+        # 2. ATR Hysteresis: minor 0.15x ATR dip below SMA20 with positive velocity does NOT whipsaw exit
+        track4.init_db(self.mem_conn)
+        with self.mem_conn:
+            self.mem_conn.execute("""
+                INSERT INTO trend_positions (
+                    symbol, direction, asset_class, strategy, size, entry_price, current_price,
+                    trailing_stop, peak_price, atr, opened_at, allocated_usd, unrealized_pnl, status
+                ) VALUES ('GLD', 'LONG', 'equity', 'donchian_breakout', 1.0, 250.0, 250.0, 242.0, 251.0, 4.0, '2026-10-19', 250.0, 0.0, 'OPEN')
+            """)
+        # Price 249.5 is only 0.5 below SMA20 (250.0), well inside 0.5x ATR (2.0) buffer, with mom +0.60
+        mild_dip_data = {
+            "GLD": {
+                "current_price": 249.5,
+                "sma_20": 250.0,
+                "sma_50": 244.0,
+                "atr": 4.0,
+                "momentum_velocity": 0.60,
+                "is_bull_regime": False,
+                "is_bear_regime": False,
+                "is_squeeze_on": False,
+            }
+        }
+        track4.update_open_positions(self.mem_conn, mild_dip_data)
+        still_open = self.mem_conn.execute("SELECT * FROM trend_positions WHERE symbol='GLD' AND status='OPEN'").fetchall()
+        self.assertEqual(len(still_open), 1)
+
+        # 3. 24-hour symbol cooldown prevents same-day wash-churn re-entry
+        now_str = datetime.now(PT).isoformat()
+        with self.mem_conn:
+            self.mem_conn.execute("""
+                INSERT INTO trend_positions (
+                    symbol, direction, asset_class, strategy, size, entry_price, current_price,
+                    trailing_stop, peak_price, atr, opened_at, allocated_usd, unrealized_pnl, status, closed_at
+                ) VALUES ('AAPL', 'LONG', 'equity', 'dual_momentum', 0.5, 340.0, 339.5, 330.0, 341.0, 5.0, ?, 170.0, 0.0, 'CLOSED', ?)
+            """, (now_str, now_str))
+        cooldown = track4.get_recently_closed_symbols(self.mem_conn, cooldown_hours=24.0)
+        self.assertIn("AAPL", cooldown)
+
+        # 4. Directional Beta Alignment: forbid shorting QQQ/NVDA when already LONG MSFT
+        open_tech = [{"symbol": "MSFT", "direction": "LONG"}]
+        self.assertFalse(track4.passes_beta_alignment("QQQ", "SHORT", open_tech, {}))
+        self.assertFalse(track4.passes_beta_alignment("NVDA", "SHORT", open_tech, {}))
+        self.assertTrue(track4.passes_beta_alignment("NVDA", "LONG", open_tech, {}))
+
+        # 5. Anti-Exhaustion Filter: reject >2.4x ATR overextended spike, accept pullback/breakout
+        overextended = {
+            "is_bull_regime": True,
+            "momentum_velocity": 3.1,
+            "mom_5": 1.8,
+            "dist_from_sma20_atr": 2.85,
+            "vol_ratio": 1.3,
+            "is_squeeze_on": False,
+            "is_donchian_bull_breakout": True,
+            "is_pullback_bounce": False,
+        }
+        self.assertIsNone(track4.evaluate_candidate_signal("SOL", overextended))
+
+        pullback_setup = {
+            "is_bull_regime": True,
+            "momentum_velocity": 0.85,
+            "mom_5": 0.25,
+            "dist_from_sma20_atr": 0.45,
+            "vol_ratio": 1.15,
+            "is_squeeze_on": False,
+            "is_donchian_bull_breakout": False,
+            "is_pullback_bounce": True,
+        }
+        sig = track4.evaluate_candidate_signal("GLD", pullback_setup)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig[0], "LONG")
+        self.assertEqual(sig[1], "trend_pullback")
+
 if __name__ == "__main__":
     unittest.main()
 

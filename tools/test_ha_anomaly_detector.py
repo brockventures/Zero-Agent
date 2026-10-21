@@ -62,6 +62,14 @@ def test_compute_mad_score_detects_outliers_and_respects_floor():
     z_spike, med_o, _ = compute_mad_score(office_vals, 82.3, "temperature")
     assert z_spike >= 5.0
 
+    # Bedroom CO2 rising from daytime open-door baseline (~576 ppm) to normal bedtime closed-door level (992 ppm)
+    co2_daytime = [550.0, 576.5, 600.0, 520.0, 620.0, 576.5] * 4
+    z_bedtime, _, _ = compute_mad_score(co2_daytime, 992.0, "carbon_dioxide")
+    assert z_bedtime < 4.0
+    # Genuine high CO2 spike (1850 ppm) still triggers z >= 4.0
+    z_co2_high, _, _ = compute_mad_score(co2_daytime, 1850.0, "carbon_dioxide")
+    assert z_co2_high >= 4.0
+
 
 def test_compute_overdue_threshold_hours_clamps_sensibly():
     # Hourly updates over 20 hours -> threshold clamps to default floor (24.0h)

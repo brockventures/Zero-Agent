@@ -72,13 +72,17 @@ def get_sidecar_model(job_key: str, default: str = "gemini-4-argon-low") -> str:
 
 
 def _is_test_fast_mode() -> bool:
-    """Return True if running inside pytest without explicit live LLM opt-in."""
+    """Return True if running inside pytest or a unittest test runner without explicit live LLM opt-in."""
     if os.environ.get("FORCE_LLM_SIDECAR") == "1":
         return False
     if os.environ.get("LLM_SIDECAR_DISABLED") == "1":
         return True
-    if os.environ.get("PYTEST_CURRENT_TEST"):
+    if os.environ.get("PYTEST_CURRENT_TEST") or "pytest" in sys.modules:
         return True
+    if "unittest" in sys.modules:
+        main_file = os.path.basename(getattr(sys.modules.get("__main__"), "__file__", "") or "")
+        if main_file.startswith("test_") or any(k.startswith("test_") or ".test_" in k for k in sys.modules):
+            return True
     return False
 
 

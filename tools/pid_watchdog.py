@@ -31,14 +31,22 @@ DEFAULT_PROC_CRITICAL = 2500     # 2,500 running processes
 DEFAULT_CHURN_WARNING = 150.0    # 150 forks/second sustained
 
 def check_host_pid_health(ip: str, host_name: str, threshold: float = DEFAULT_THREAD_THRESHOLD) -> Dict[str, Any]:
-    """Inspects thread headroom, active process count, and fork velocity on a target host."""
+    """Inspects thread headroom, active process count, and fork velocity on a target host.
+    Retries up to 3 times on transient SSH banner/connect timeouts (e.g. DSM sshd page-in during RAID I/O).
+    """
     cmd = (
         "cat /proc/sys/kernel/threads-max 2>/dev/null; "
         "cat /proc/sys/kernel/pid_max 2>/dev/null; "
         "cat /proc/loadavg 2>/dev/null; "
         "ps -ef 2>/dev/null | wc -l"
     )
-    code, out, err = run_ssh(ip, cmd, timeout=15, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
+    code, out, err = -1, "", ""
+    for attempt in range(1, 4):
+        code, out, err = run_ssh(ip, cmd, timeout=20, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
+        if code == 0 and len([l.strip() for l in out.strip().split("\n") if l.strip()]) >= 4:
+            break
+        if attempt < 3:
+            time.sleep(2.0 * attempt)
     if code != 0:
         return {
             "host": host_name,
