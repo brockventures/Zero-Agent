@@ -85,7 +85,33 @@ def test_compact_decisions_log_dedupes_and_supersedes(tmp_path):
 * **Summary**: Duplicate general note about masking CommonMark code spans before running regex replacements in outbound messages.
 """
     dec_file.write_text(raw)
-    stats = compact_decisions_log(decisions_path=dec_file, dry_run=True)
+    stats = compact_decisions_log(decisions_path=dec_file, dry_run=True, semantic_threshold=0.0)
     assert stats["before"] == 5
     assert stats["kept"] == 2
     assert stats["removed"] == 3
+
+
+def test_compact_decisions_log_semantic_clustering(tmp_path):
+    dec_file = tmp_path / "decisions.md"
+    raw = """# Decisions
+
+### Resolution: `banana-protocol-pr-11` (2026-09-05 08:29 PM PT)
+* **Author**: Zero / Amos
+* **Kind**: `resolution`
+* **Summary**: Ratified decoupled floor governance timeout at 180s in PR #11 across all agents.
+
+### Resolution: `banana-protocol-pr-11-v0.6.0` (2026-09-05 08:30 PM PT)
+* **Author**: Zero / Amos / Marvin
+* **Kind**: `resolution`
+* **Summary**: Ratified decoupled floor governance timeout at 180s in PR #11 v0.6.0 across all agents.
+
+### Resolution: `sqlite-vec-mmr-rerank` (2026-10-21 10:49 AM PT)
+* **Author**: Zero
+* **Kind**: `architecture`
+* **Summary**: Added greedy MMR diversity re-ranking (lambda=0.7) to hybrid search.
+"""
+    dec_file.write_text(raw)
+    stats = compact_decisions_log(decisions_path=dec_file, dry_run=True, semantic_threshold=0.50)
+    assert stats["before"] == 3
+    assert stats["semantic_merged"] == 1
+    assert stats["kept"] == 2

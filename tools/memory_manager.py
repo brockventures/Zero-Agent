@@ -668,11 +668,17 @@ def run_dreaming_consolidation(dry_run: bool = False, hours_back: int = 24) -> t
     return True, report
 
 
-def compact_decisions_log(decisions_path: Path = CC_DECISIONS_FILE, dry_run: bool = False) -> dict:
-    """Consolidate decisions.md (#1 noise filter + #3 subject superseding + #5 cluster deduplication)."""
+def compact_decisions_log(
+    decisions_path: Path = CC_DECISIONS_FILE,
+    dry_run: bool = False,
+    semantic_threshold: float = 0.50,
+) -> dict:
+    """Consolidate decisions.md (#1 noise filter + #3 subject superseding + #5 TF-IDF bigram semantic cluster merging)."""
     if not decisions_path.exists():
-        return {"before": 0, "kept": 0, "removed": 0}
+        return {"before": 0, "kept": 0, "removed": 0, "semantic_merged": 0}
 
+    from collections import Counter
+    import math
     from tools.topic_tracker import is_ephemeral_memory_noise
 
     raw = decisions_path.read_text(encoding="utf-8", errors="replace")
@@ -681,7 +687,7 @@ def compact_decisions_log(decisions_path: Path = CC_DECISIONS_FILE, dry_run: boo
     blocks = parts[1:]
     before_count = len(blocks)
     if before_count == 0:
-        return {"before": 0, "kept": 0, "removed": 0}
+        return {"before": 0, "kept": 0, "removed": 0, "semantic_merged": 0}
 
     generic_subjects = {"general", "general-finding", "status", "lounge-chat"}
     seen_norm = set()
@@ -701,20 +707,82 @@ def compact_decisions_log(decisions_path: Path = CC_DECISIONS_FILE, dry_run: boo
         if norm_key in seen_norm:
             continue
         seen_norm.add(norm_key)
-        deduped.append((subj, clean_b))
+        deduped.append((subj, summary_body, clean_b))
 
     # Reverse pass to supersede older entries of specific named topics (keeping latest canonical resolution per topic)
     seen_subjects = set()
-    final_blocks_rev = []
-    for subj, clean_b in reversed(deduped):
+    subject_deduped_rev = []
+    for subj, summary_body, clean_b in reversed(deduped):
         s_low = subj.lower()
         if s_low not in generic_subjects:
             if s_low in seen_subjects:
                 continue
             seen_subjects.add(s_low)
-        final_blocks_rev.append(clean_b)
+        subject_deduped_rev.append((subj, summary_body, clean_b))
 
-    final_blocks = list(reversed(final_blocks_rev))
+    subject_deduped = list(reversed(subject_deduped_rev))
+
+    # #5 Semantic Cluster Merging Pass: collapse older blocks whose TF-IDF unigram+bigram
+    # cosine similarity exceeds semantic_threshold against a newer canonical resolution.
+    semantic_merged = 0
+    if semantic_threshold > 0.0 and len(subject_deduped) > 1:
+        try:
+            import numpy as np
+
+            stopwords = {
+                "the", "and", "for", "that", "with", "this", "from", "was", "are", "all",
+                "have", "has", "had", "not", "but", "into", "via", "across", "merged",
+                "shipped", "ratified", "confirmed", "verified", "approved", "closed",
+                "resolution", "summary", "author", "kind", "zero", "amos", "aerial", "marvin", "ryan", "mike",
+            }
+            doc_tokens = []
+            df: Counter = Counter()
+            for s, body, _ in subject_deduped:
+                words = [w for w in re.findall(r"[a-z0-9_]{3,}", f"{s} {s} {body[:400]}".lower()) if w not in stopwords]
+                toks = Counter(words)
+                for i in range(len(words) - 1):
+                    toks[f"{words[i]}_{words[i + 1]}"] += 1
+                doc_tokens.append(toks)
+                for k in toks:
+                    df[k] += 1
+
+            n_docs = len(subject_deduped)
+            vocab_keys = [k for k, c in df.items() if c >= 2]
+            if vocab_keys:
+                vocab = {k: i for i, k in enumerate(vocab_keys)}
+                mat = np.zeros((n_docs, len(vocab)), dtype=np.float32)
+                for i, toks in enumerate(doc_tokens):
+                    for k, cnt in toks.items():
+                        idx = vocab.get(k)
+                        if idx is not None:
+                            idf = math.log((n_docs + 1.0) / (df[k] + 1.0)) + 1.0
+                            mat[i, idx] = (1.0 + math.log(cnt)) * idf
+                norms = np.linalg.norm(mat, axis=1, keepdims=True)
+                mat = mat / np.maximum(norms, 1e-12)
+                sim_matrix = mat @ mat.T
+                np.fill_diagonal(sim_matrix, 0.0)
+
+                kept_indices = []
+                for idx in range(n_docs - 1, -1, -1):
+                    if not kept_indices:
+                        kept_indices.append(idx)
+                        continue
+                    max_sim = float(np.max(sim_matrix[idx, kept_indices]))
+                    if max_sim >= semantic_threshold:
+                        semantic_merged += 1
+                    else:
+                        kept_indices.append(idx)
+
+                kept_indices.reverse()
+                final_blocks = [subject_deduped[i][2] for i in kept_indices]
+            else:
+                final_blocks = [b for _, _, b in subject_deduped]
+        except Exception as e:
+            log.warning(f"Semantic clustering pass skipped in compact_decisions_log: {e}")
+            final_blocks = [b for _, _, b in subject_deduped]
+    else:
+        final_blocks = [b for _, _, b in subject_deduped]
+
     removed_count = before_count - len(final_blocks)
 
     if removed_count > 0 and not dry_run:
@@ -731,6 +799,7 @@ def compact_decisions_log(decisions_path: Path = CC_DECISIONS_FILE, dry_run: boo
         "before": before_count,
         "kept": len(final_blocks),
         "removed": removed_count,
+        "semantic_merged": semantic_merged,
     }
 
 if __name__ == "__main__":

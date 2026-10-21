@@ -43,6 +43,7 @@ STATE_FILE = Path("/workspace/data/resident_agents_watcher_state.json")
 # Known legitimate peer/collaborator accounts that should always be auto-approved
 KNOWN_PEER_ACCOUNTS = {
     "prime416",
+    "ra_zero",
     "xvx016_aerial",
     "amosstationbot",
 }
