@@ -25,6 +25,7 @@ MAX_CONSECUTIVE_FILE_VIEWS = 4
 MAX_CONSECUTIVE_SAME_FILE_EDITS = 3
 MAX_CONSECUTIVE_GIT_CMDS = 2
 MAX_VERSIONED_SCRATCH_SWEEPS = 3
+MAX_INLINE_PRODUCTION_FILES = 2
 TURN_RESET_IDLE_SECONDS = 45.0
 
 _VERSIONED_SCRATCH_SWEEP_RE = re.compile(
@@ -46,7 +47,35 @@ def _default_state(now: float = 0.0) -> dict:
         "consecutive_git_cmds": 0,
         "agora_eval_calls": 0,
         "versioned_scratch_sweeps": [],
+        "inline_prod_files": [],
     }
+
+
+def is_forge_worktree_or_exempt_path(target_file: str, cwd: str = "/workspace") -> bool:
+    """Return True if target_file is inside a FORGE worktree, scratch, memory, data, or unit test file."""
+    if not target_file:
+        return True
+    if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
+        return True
+    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    if norm_cwd.startswith("/tmp/forge-wt-"):
+        return True
+    norm_target = os.path.abspath(os.path.join(norm_cwd, target_file)).replace("\\", "/")
+    exempt_prefixes = (
+        "/tmp/",
+        "/workspace/scratch/",
+        "/workspace/memory/",
+        "/workspace/data/",
+        "/root/.gemini/",
+    )
+    if norm_target.startswith(exempt_prefixes):
+        return True
+    if "/scratch/" in norm_target or "/memory/" in norm_target or "/brain/" in norm_target:
+        return True
+    base = os.path.basename(norm_target)
+    if base.startswith("test_") or base.endswith("_test.py") or "/tests/" in norm_target:
+        return True
+    return False
 
 
 def load_state(state_file: str = STATE_FILE) -> dict:
@@ -167,7 +196,34 @@ def is_ouroboros_polling_loop(cmd: str) -> bool:
     return bool(re.search(pattern, cmd))
 
 
-def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple[bool, str]:
+def _check_inline_production_edit_gate(
+    target_file: str,
+    cwd: str,
+    state: dict,
+    state_file: str,
+) -> tuple[bool, str]:
+    """Enforce FORGE Tier 2/3 Gate: block interactive turns outside /tmp/forge-wt-* from mutating >2 production files inline."""
+    if is_forge_worktree_or_exempt_path(target_file, cwd=cwd):
+        return True, ""
+    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    norm_target = os.path.abspath(os.path.join(norm_cwd, target_file)).replace("\\", "/")
+    prod_files = list(state.get("inline_prod_files", []))
+    if norm_target not in prod_files:
+        prod_files.append(norm_target)
+    state["inline_prod_files"] = prod_files
+    if len(prod_files) > MAX_INLINE_PRODUCTION_FILES:
+        save_state(state, state_file)
+        short_list = ", ".join(os.path.basename(p) for p in prod_files)
+        return False, (
+            f"FORGE Tier 2/3 Gate Triggered: Interactive turn attempted to mutate {len(prod_files)} distinct production files inline "
+            f"({short_list}; inline Tier 1 limit: {MAX_INLINE_PRODUCTION_FILES}). "
+            "Multi-file features and refactors must be decomposed into a validated ForgePlan JSON (e.g. scratch/forge_plan.json) "
+            "and enqueued via 'python3 /workspace/tools/forge.py enqueue scratch/forge_plan.json' so #forge workers execute them in isolated git worktrees."
+        )
+    return True, ""
+
+
+def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str = "/workspace") -> tuple[bool, str]:
     now = time.time()
     state = load_state(state_file)
 
@@ -186,6 +242,8 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
     # 1. run_command check
     if name == "run_command":
         cmd = args.get("CommandLine", "")
+        if "forge.py" in cmd and "enqueue" in cmd:
+            state["inline_prod_files"] = []
 
         # Agora Fast-Path Invariant
         if re.search(r"agora_play\.py\s+(?:order|move)\b", cmd):
@@ -295,9 +353,9 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
         save_state(state, state_file)
         return True, ""
 
-    # 2. view_file check
-    if name == "view_file":
-        target_file = args.get("AbsolutePath", "")
+    # 2. view_file / read_file check
+    if name in ("view_file", "read_file"):
+        target_file = args.get("AbsolutePath") or args.get("Path") or ""
         start_line = args.get("StartLine")
         end_line = args.get("EndLine")
         is_wide_slice = (start_line is None and end_line is None) or (
@@ -312,8 +370,8 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
             if state["same_file_view_count"] > allowed_same:
                 save_state(state, state_file)
                 return False, (
-                    f"Batch Invariant Triggered: Detected {state['same_file_view_count']} consecutive view_file calls on '{target_file}'. "
-                    "view_file supports viewing up to 800 lines in a single call. Omit StartLine/EndLine to view the file in one shot, "
+                    f"Batch Invariant Triggered: Detected {state['same_file_view_count']} consecutive {name} calls on '{target_file}'. "
+                    f"{name} supports viewing up to 800 lines in a single call. Omit StartLine/EndLine to view the file in one shot, "
                     "or write a targeted Python scratch script in /workspace/scratch/ to inspect AST/regexes in a single pass."
                 )
         else:
@@ -324,7 +382,7 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
         if state["consecutive_file_views"] > MAX_CONSECUTIVE_FILE_VIEWS:
             save_state(state, state_file)
             return False, (
-                f"Batch Invariant Triggered: Detected {state['consecutive_file_views']} consecutive serial view_file calls. "
+                f"Batch Invariant Triggered: Detected {state['consecutive_file_views']} consecutive serial {name} calls. "
                 "Please bundle multi-file inspections into a single Python scratch script in /workspace/scratch/ "
                 "to inspect multiple files in a single pass."
             )
@@ -332,21 +390,25 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
         save_state(state, state_file)
         return True, ""
 
-    # 3. replace_file_content check
-    if name == "replace_file_content":
-        target_file = args.get("TargetFile", "")
+    # 3. replace_file_content / edit_file check
+    if name in ("replace_file_content", "edit_file"):
+        target_file = args.get("TargetFile") or args.get("Path") or ""
         state["cmd_inspections"] = 0
         state["consecutive_inline_python"] = 0
         state["consecutive_file_views"] = 0
         state["same_file_view_count"] = 0
+
+        ok_tier, tier_reason = _check_inline_production_edit_gate(target_file, cwd, state, state_file)
+        if not ok_tier:
+            return False, tier_reason
 
         if target_file and target_file == state.get("last_edited_file"):
             state["same_file_edit_count"] = state.get("same_file_edit_count", 0) + 1
             if state["same_file_edit_count"] > MAX_CONSECUTIVE_SAME_FILE_EDITS:
                 save_state(state, state_file)
                 return False, (
-                    f"Batch Invariant Triggered: Detected {state['same_file_edit_count']} consecutive replace_file_content calls on '{target_file}'. "
-                    "For extensive edits or multiple modifications in the same file, use write_to_file or a Python script in /workspace/scratch/ "
+                    f"Batch Invariant Triggered: Detected {state['same_file_edit_count']} consecutive {name} calls on '{target_file}'. "
+                    "For extensive edits or multiple modifications in the same file, use write_file or a Python script in /workspace/scratch/ "
                     "to apply changes in a single pass."
                 )
         else:
@@ -382,6 +444,10 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
                     "Evaluate all parameter combinations inside a single vectorized Python loop or offload multi-combo sweeps to "
                     "'/baseball/big-projections/modal_harness.py --mode grid' (or 'forge.py job start' / detached_runner.py for jobs >90s)."
                 )
+
+        ok_tier, tier_reason = _check_inline_production_edit_gate(target_file, cwd, state, state_file)
+        if not ok_tier:
+            return False, tier_reason
 
         save_state(state, state_file)
         return True, ""
@@ -441,7 +507,7 @@ def main():
                 pass
 
         # 2. Tool Batching Guard
-        allowed, reason = check_tool_use(name, args)
+        allowed, reason = check_tool_use(name, args, cwd=cwd)
         if not allowed:
             print(json.dumps({"decision": "deny", "reason": reason}))
             return

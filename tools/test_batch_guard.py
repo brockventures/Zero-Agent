@@ -218,6 +218,53 @@ class TestBatchGuard(unittest.TestCase):
         self.assertIn("Modal Offload Invariant Triggered", reason)
         self.assertIn("modal_harness.py", reason)
 
+    def test_read_file_and_edit_file_supported(self):
+        allowed, _ = check_tool_use("read_file", {"Path": "/workspace/tools/foo.py", "StartLine": 1, "EndLine": 50})
+        self.assertTrue(allowed)
+        allowed, _ = check_tool_use("read_file", {"Path": "/workspace/tools/foo.py", "StartLine": 51, "EndLine": 100})
+        self.assertTrue(allowed)
+        allowed, reason = check_tool_use("read_file", {"Path": "/workspace/tools/foo.py", "StartLine": 101, "EndLine": 150})
+        self.assertFalse(allowed)
+        self.assertIn("3 consecutive read_file calls", reason)
+
+        for _ in range(3):
+            allowed, _ = check_tool_use("edit_file", {"Path": "/workspace/tools/bar.py"})
+            self.assertTrue(allowed)
+        allowed, reason = check_tool_use("edit_file", {"Path": "/workspace/tools/bar.py"})
+        self.assertFalse(allowed)
+        self.assertIn("4 consecutive edit_file calls", reason)
+
+    def test_forge_tier2_tier3_gate_blocks_third_inline_production_file(self):
+        # 2 production files + unit test + scratch plan allowed in Tier 1
+        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/alpha.py"})[0])
+        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/beta.py"})[0])
+        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/test_alpha.py"})[0])
+        self.assertTrue(check_tool_use("write_file", {"Path": "/workspace/scratch/forge_plan.json"})[0])
+
+        # 3rd distinct production file in interactive turn is blocked by FORGE Tier 2/3 Gate
+        allowed, reason = check_tool_use("edit_file", {"Path": "/workspace/tools/gamma.py"})
+        self.assertFalse(allowed)
+        self.assertIn("FORGE Tier 2/3 Gate Triggered", reason)
+        self.assertIn("forge.py enqueue", reason)
+
+        # Inside an isolated /tmp/forge-wt-* worktree, multi-file edits are unrestricted
+        self.assertTrue(
+            check_tool_use(
+                "edit_file",
+                {"Path": "/tmp/forge-wt-fg-123-c0/tools/gamma.py"},
+                cwd="/tmp/forge-wt-fg-123-c0",
+            )[0]
+        )
+
+        # Enqueueing a FORGE plan resets the inline production file counter
+        self.assertTrue(
+            check_tool_use(
+                "run_command",
+                {"CommandLine": "python3 /workspace/tools/forge.py enqueue /workspace/scratch/forge_plan.json"},
+            )[0]
+        )
+        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/delta.py"})[0])
+
 
 if __name__ == "__main__":
     unittest.main()
