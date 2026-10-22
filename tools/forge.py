@@ -891,6 +891,7 @@ def verify_chunk_worktree(
     verification_cmd: Optional[str] = None,
     prohibited_files: Optional[list[str]] = None,
     target_files: Optional[list[str]] = None,
+    require_changes: bool = False,
 ) -> tuple[bool, str, str]:
     """Run deterministic Maker-Checker verification inside the chunk worktree.
 
@@ -910,6 +911,9 @@ def verify_chunk_worktree(
         timeout=15,
     )
     changed = [line[3:].strip().strip('"') for line in st_proc.stdout.splitlines() if len(line) > 3]
+
+    if require_changes and not changed:
+        return False, "", "Worker produced zero file changes in worktree (git status --porcelain is empty)."
 
     # 1. Check prohibited files were not modified
     if prohibited_files:
@@ -1253,18 +1257,19 @@ class ForgeSupervisor:
             prompt = format_chunk_prompt(build_id, chunk_idx, db_path=self.db_path, worktree_dir=str(wt_dir))
             agy_cmd = [
                 "/usr/local/bin/agy",
-                "chat",
-                "--mode", "agent",
-                "--yolo",
-                "--print",
-                "--output-format", "stream-json",
+                f"--add-dir={wt_dir}",
+                f"-p={prompt}",
+                "--output-format=stream-json",
+                "--dangerously-skip-permissions",
                 "--print-timeout=4h",
-                "--workspace", str(wt_dir),
-                "--model", model,
-                prompt,
+                f"--model={model}",
             ]
             try:
-                subprocess.run(agy_cmd, cwd=str(wt_dir), capture_output=True, text=True, timeout=1200)
+                agy_res = subprocess.run(agy_cmd, cwd=str(wt_dir), capture_output=True, text=True, timeout=1200)
+                if agy_res.returncode != 0:
+                    err_msg = (agy_res.stderr or agy_res.stdout or f"agy exited {agy_res.returncode}").strip()
+                    with get_db_connection(self.db_path) as conn:
+                        conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (err_msg[-1500:], chunk_id))
             except Exception as e:
                 with get_db_connection(self.db_path) as conn:
                     conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (str(e), chunk_id))
@@ -1279,6 +1284,7 @@ class ForgeSupervisor:
                 chunk_row["verification_cmd"],
                 prohibited_files=prohibited,
                 target_files=target_files,
+                require_changes=True,
             )
             if passed:
                 # Collect short diff stat against base_ref before committing

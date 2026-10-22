@@ -138,6 +138,7 @@ PRAGMA busy_timeout=5000;
 CREATE TABLE IF NOT EXISTS forge_builds (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
+    objective TEXT NOT NULL DEFAULT '',
     repo TEXT NOT NULL DEFAULT '/workspace',
     tier INTEGER NOT NULL DEFAULT 2,
     touches_core_bridge INTEGER NOT NULL DEFAULT 0,
@@ -146,6 +147,7 @@ CREATE TABLE IF NOT EXISTS forge_builds (
     origin_conv_id TEXT,
     forge_message_id INTEGER,
     fact_sheet_json TEXT NOT NULL DEFAULT '[]',
+    shared_context_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'queued', -- queued | running | awaiting_approval | completed | failed | cancelled
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -156,11 +158,14 @@ CREATE TABLE IF NOT EXISTS forge_chunks (
     build_id TEXT NOT NULL REFERENCES forge_builds(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     title TEXT NOT NULL,
+    repo TEXT NOT NULL DEFAULT '',
     worker_model TEXT NOT NULL DEFAULT 'gemini-3.8-flash-high',
     target_files_json TEXT NOT NULL DEFAULT '[]',
+    target_symbols_json TEXT NOT NULL DEFAULT '[]',
     prohibited_files_json TEXT NOT NULL DEFAULT '[]',
+    shared_context_json TEXT NOT NULL DEFAULT '[]',
     instructions TEXT NOT NULL,
-    verification_cmd TEXT NOT NULL,
+    verification_cmd TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending', -- pending | running | verifying | awaiting_approval | merged | failed
     attempt_count INTEGER NOT NULL DEFAULT 0,
     pr_number INTEGER,

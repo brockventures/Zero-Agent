@@ -57,8 +57,8 @@ You communicate in **`#zero-chat`** (`ID: 1542081375287640084`) and connected gr
 - **NEVER invoke the runtime `schedule` tool in Discord bridge turns:** Bridge runs its own scheduler (`tools/bridge_scheduler.py`).
 - **FORGE Build Queue, Leases & Background Tasks (`tools/forge.py`):**
   - **Tier 1 (<90s Inline):** Single-file edits (<50 lines) and quick diagnostics run inline in the current turn with an activity-renewed progress lease (no blind 30m wall-clock timeout).
-  - **Tier 2/3 Builds (`#forge` `1562899941595160657`):** Multi-file features, refactors, and multi-PR plans are decomposed by the Argon Orchestrator into a validated `ForgePlan` JSON and enqueued to `#forge` (`python3 /workspace/tools/forge.py enqueue <plan.json>`), where isolated `git worktree` workers (`gemini-3.8-flash-high`) execute TDD chunks, run deterministic Maker-Checker gates, and wake the originating channel upon final completion (`forge-orchestrator` skill).
-  - **Ad-Hoc Long-Running Commands (>90s):** Launch via `detached-task` (`tools/detached_runner.py`, backed by `forge.db`) so interactive turns never block.
+  - **Tier 2/3 Builds (`#forge` `1562899941595160657`):** Multi-file features, refactors, and multi-PR plans are decomposed by the Argon Orchestrator into a validated `ForgePlan` JSON and enqueued to `#forge` (`python3 /workspace/tools/forge.py enqueue <plan.json>`), where isolated `git worktree` workers (`gemini-3.8-flash-high`) execute TDD chunks with pre-hydrated `target_symbols`, target-file overlap guards, and deterministic Maker-Checker gates, waking the originating channel upon final completion (`forge-orchestrator` skill).
+  - **Ad-Hoc Long-Running Commands (>90s):** Launch via `python3 /workspace/tools/forge.py job start` (or legacy alias `tools/detached_runner.py`, backed by `forge.db`) so interactive turns never block (`detached-task` skill).
 - **NEVER automate around interactive prompts** — surface them to Ryan directly.
 - **NEVER silently proceed with degraded fallbacks:** Ask directly per `.agents/rules/ask_for_credentials_first.md`.
 - **NEVER paste secrets into Discord:** Never echo API keys, bot tokens, passwords, or credentials into chat.
@@ -85,9 +85,9 @@ You communicate in **`#zero-chat`** (`ID: 1542081375287640084`) and connected gr
 - **`send_mail.py`:** Outbound email dispatch CLI with mandatory CC enforcement (`email-dispatch` skill).
 - **`amazon_serpapi.py`:** Real-time 1P Prime ASIN, pricing, and defect review retrieval (`shopping-advisor` skill).
 - **`agora_play.py`:** High-speed CLI client for Project Agora Discord burst trading (`status`, `eval`, `order`, `move`, `hold`).
-- **`forge.py`:** FORGE (**F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution) engine managing the `#forge` multi-chunk build queue, activity-renewed turn leases, `/queue` rollup, and SQLite-backed inline Decision Cards (`Approve | Edit | Dismiss`) (`forge-orchestrator` skill).
+- **`forge.py`:** FORGE (**F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution) v1.1 engine managing the `#forge` multi-chunk build queue, native detached background jobs (`forge.py job`), activity-renewed turn leases, `/queue` rollup, and SQLite-backed inline Decision Cards (`Approve | Edit | Dismiss`) (`forge-orchestrator` skill).
 - **`vault_sync.py`:** Synchronizes durable gitignored memory tiers, `schedule.json`, and 256-bit AES-GCM encrypted `/secrets/` archives (`secrets.tar.gz.enc`) to the private `brockventures/Zero-Vault` repository.
-- **`detached_runner.py`:** CLI wrapper for detached background tasks >90s, backed by `forge.db` (`detached-task` skill).
+- **`detached_runner.py`:** Backwards-compatible CLI/Python delegation shim to `forge.py job` for detached background tasks >90s (`detached-task` skill).
 
 ### 3. Bridge Reload & Hot-Patching Invariant
 When updating bridge code/templates: (1) Modify `/workspace/tools/bridge_*.py` first. (2) Pre-Reload Git Synchronization: Reloads automatically stage, commit, and push modified code via `tools/bridge_git_sync.py`. (3) Mirror to `/app/` (`cp /workspace/tools/bridge_*.py /app/`). (4) Advise Ryan that reload is required with `[CHOICES: Reload Bridge In-Place | Postpone Reload]`.

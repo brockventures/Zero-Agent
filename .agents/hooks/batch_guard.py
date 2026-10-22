@@ -212,7 +212,7 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
                 "Ouroboros Polling Guard Triggered: Manual shell process-polling loops ('while ... pgrep/ps ... sleep') "
                 "are prohibited because 'pgrep -f' matches its own bash -c wrapper and deadlocks the turn. "
                 "For SDK background tasks, stop calling tools silently and let the task completion event wake you; "
-                "for jobs >2 minutes, use 'python3 /workspace/tools/detached_runner.py start ...'."
+                "for jobs >90 seconds, use 'python3 /workspace/tools/forge.py job start ...' (or detached_runner.py)."
             )
 
         # A0b. Unbounded Home Assistant Recorder SQLite Guard
@@ -380,7 +380,7 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE) -> tuple
                     f"({', '.join(os.path.basename(s) for s in sweeps[-4:])}) in a single turn (limit: {MAX_VERSIONED_SCRATCH_SWEEPS}). "
                     "Do not run iterative LLM-in-the-loop scratch simulation sweeps (sim_v1..vN.py) that burn the 60-minute turn ceiling. "
                     "Evaluate all parameter combinations inside a single vectorized Python loop or offload multi-combo sweeps to "
-                    "'/baseball/big-projections/modal_harness.py --mode grid' (or detached_runner.py for jobs >2m)."
+                    "'/baseball/big-projections/modal_harness.py --mode grid' (or 'forge.py job start' / detached_runner.py for jobs >90s)."
                 )
 
         save_state(state, state_file)

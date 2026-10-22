@@ -283,14 +283,26 @@ class TestForgeEngine(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("Boundary violation", err)
 
-        # Restore prohibited file and modify allowed file -> passes even with empty verification_cmd (baseline fallback)
+        # Restore prohibited file -> no changes in worktree -> must fail when require_changes=True
         subprocess.run(["git", "checkout", "prohibited.py"], cwd=str(wt_dir), check=True, capture_output=True)
+        passed_empty, _, err_empty = verify_chunk_worktree(
+            wt_dir,
+            "true",
+            prohibited_files=["prohibited.py"],
+            target_files=["allowed.py"],
+            require_changes=True,
+        )
+        self.assertFalse(passed_empty)
+        self.assertIn("zero file changes", err_empty)
+
+        # Modify allowed file -> passes even with empty verification_cmd (baseline fallback)
         (wt_dir / "allowed.py").write_text("def greet():\n    return 'hello'\n", encoding="utf-8")
         passed, diff_stat, err = verify_chunk_worktree(
             wt_dir,
             "",
             prohibited_files=["prohibited.py"],
             target_files=["allowed.py"],
+            require_changes=True,
         )
         self.assertTrue(passed, err)
         self.assertIn("1 file changed", diff_stat)
