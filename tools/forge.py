@@ -2,26 +2,33 @@
 """
 forge.py — FORGE Engine (Federated Orchestration, Runtime & Gated Execution)
 
-Unifies three core runtime pillars in a single WAL-mode SQLite state machine (/workspace/data/forge.db):
+Unifies four core runtime pillars in a single WAL-mode SQLite state machine (/workspace/data/forge.db):
 1. Activity-Renewed Lease & Heartbeat Engine: Replaces blind wall-clock guillotines with 4-signal
    ground-truth progress leases (stdout deltas, child PIDs, SDK task logs, subagent transcripts)
    plus a 3-strike runaway tool-loop circuit breaker.
 2. Multi-Chunk Spec-Driven Build Queue (#forge): Executes Tier 2/3 engineering plans in isolated
    git worktrees using gemini-3.8-flash-high (with escalation to gemini-4-argon-medium), enforcing
-   deterministic Maker-Checker verification gates, live #forge widget updates, mid-run wake
-   suppression, and originating-channel completion wake notifications.
-3. Deterministic Decisions Framework: Backs inline Discord Approve / Edit / Dismiss cards with
+   pre-enqueue target-file overlap guards, Turn-0 AST/symbol snippet hydration (target_symbols +
+   shared_context), per-chunk multi-repo routing, optional verification_cmd with auto-baseline
+   lint/test fallback, live #forge widget updates, and originating-channel completion wakeups.
+3. Native Detached Job Runner (`forge.py job`): Spawns and supervises long-running non-LLM shell
+   jobs (>90s) directly in SQLite (`forge_jobs`) with flock idempotency and outbox delivery,
+   retiring standalone `detached_runner.py` metadata files.
+4. Deterministic Decisions Framework: Backs inline Discord Approve / Edit / Dismiss cards with
    SQLite action payloads executed in <1s at zero token cost.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
+import fcntl
 import glob
 import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -37,10 +44,18 @@ import requests
 WORKSPACE_DIR = Path("/workspace")
 if str(WORKSPACE_DIR) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_DIR))
+TOOLS_DIR = WORKSPACE_DIR / "tools"
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
 
 DATA_DIR = WORKSPACE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 FORGE_DB_PATH = DATA_DIR / "forge.db"
+FORGE_LOGS_DIR = DATA_DIR / "forge_logs"
+FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+TASKS_DIR = DATA_DIR / "detached_tasks"
+TASKS_DIR.mkdir(parents=True, exist_ok=True)
+
 DEFAULT_BRAIN_DIR = Path("/root/.gemini/antigravity-cli/brain")
 PT_TZ = ZoneInfo("America/Los_Angeles")
 
@@ -55,7 +70,7 @@ DEFAULT_LEASE_TTL_SECONDS = 300.0
 
 
 # ---------------------------------------------------------------------------
-# 1. SQLite WAL Database Initialization & Connection Helper
+# 1. SQLite WAL Database Initialization & Idempotent Schema Migrations
 # ---------------------------------------------------------------------------
 
 def get_db_connection(db_path: Path | str = FORGE_DB_PATH) -> sqlite3.Connection:
@@ -70,14 +85,22 @@ def get_db_connection(db_path: Path | str = FORGE_DB_PATH) -> sqlite3.Connection
     return conn
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_def: str) -> None:
+    """Idempotently add a column to an existing SQLite table if missing."""
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
+
+
 def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
-    """Initialize all FORGE tables and indexes idempotently."""
+    """Initialize all FORGE tables, columns, and indexes idempotently."""
     with get_db_connection(db_path) as conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS forge_builds (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
+                objective TEXT NOT NULL DEFAULT '',
                 repo TEXT NOT NULL DEFAULT '/workspace',
                 tier INTEGER NOT NULL DEFAULT 2,
                 touches_core_bridge INTEGER NOT NULL DEFAULT 0,
@@ -86,6 +109,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
                 origin_conv_id TEXT,
                 forge_message_id INTEGER,
                 fact_sheet_json TEXT NOT NULL DEFAULT '[]',
+                shared_context_json TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL DEFAULT 'queued',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -96,11 +120,14 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
                 build_id TEXT NOT NULL REFERENCES forge_builds(id) ON DELETE CASCADE,
                 chunk_index INTEGER NOT NULL,
                 title TEXT NOT NULL,
+                repo TEXT NOT NULL DEFAULT '',
                 worker_model TEXT NOT NULL DEFAULT 'gemini-3.8-flash-high',
                 target_files_json TEXT NOT NULL DEFAULT '[]',
+                target_symbols_json TEXT NOT NULL DEFAULT '[]',
+                shared_context_json TEXT NOT NULL DEFAULT '[]',
                 prohibited_files_json TEXT NOT NULL DEFAULT '[]',
                 instructions TEXT NOT NULL,
-                verification_cmd TEXT NOT NULL,
+                verification_cmd TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'pending',
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 pr_number INTEGER,
@@ -156,6 +183,12 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_forge_jobs_status ON forge_jobs(status);
             """
         )
+        # Idempotent v1.1 migrations for existing forge.db files
+        _ensure_column(conn, "forge_builds", "objective", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "forge_builds", "shared_context_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "forge_chunks", "repo", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "forge_chunks", "target_symbols_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "forge_chunks", "shared_context_json", "TEXT NOT NULL DEFAULT '[]'")
 
 
 # Initialize schema on import
@@ -165,6 +198,29 @@ init_forge_db()
 def _now_pt_str(ts: Optional[float] = None) -> str:
     dt = datetime.fromtimestamp(ts if ts is not None else time.time(), tz=timezone.utc).astimezone(PT_TZ)
     return dt.strftime("%Y-%m-%d %I:%M:%S %p PT")
+
+
+def _format_duration(seconds: float) -> str:
+    secs = int(seconds)
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    rem_secs = secs % 60
+    if mins < 60:
+        return f"{mins}m {rem_secs}s"
+    hours = mins // 60
+    rem_mins = mins % 60
+    return f"{hours}h {rem_mins}m {rem_secs}s"
+
+
+def _is_pid_running(pid: Optional[int]) -> bool:
+    if not pid or int(pid) <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -291,8 +347,104 @@ def check_runaway_tool_loop(
 
 
 # ---------------------------------------------------------------------------
-# 3. Pillar 2: FORGE Build Queue & Spec Validation
+# 3. Pillar 2: FORGE Build Queue, Symbol Pre-Hydration & Spec Validation
 # ---------------------------------------------------------------------------
+
+def extract_symbol_snippet(
+    file_path: Path | str,
+    symbol_name: str,
+    max_lines: int = 90,
+) -> str:
+    """Extract a line-numbered AST or regex snippet for `symbol_name` from `file_path`."""
+    p = Path(file_path)
+    if not p.exists() or not p.is_file():
+        return ""
+    try:
+        src = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+    lines = src.splitlines()
+    if not lines:
+        return ""
+
+    # 1. Try Python AST lookup for exact class/function/method boundaries
+    if p.suffix == ".py":
+        try:
+            tree = ast.parse(src)
+            target_part = symbol_name.split(".")[-1]
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if node.name == symbol_name or node.name == target_part:
+                        start_idx = max(0, (getattr(node, "lineno", 1) or 1) - 1)
+                        end_lineno = getattr(node, "end_lineno", start_idx + 35) or (start_idx + 35)
+                        end_idx = min(len(lines), start_idx + max_lines, end_lineno)
+                        numbered = [f"{i + 1:4d}: {lines[i]}" for i in range(start_idx, end_idx)]
+                        if end_lineno > end_idx:
+                            numbered.append(f"      ... ({end_lineno - end_idx} more lines in {node.name})")
+                        return "\n".join(numbered)
+        except Exception:
+            pass
+
+    # 2. Fallback to regex/substring search with surrounding context
+    pattern = re.compile(rf"\b{re.escape(symbol_name.split('.')[-1])}\b")
+    for idx, line in enumerate(lines):
+        if pattern.search(line):
+            start_idx = max(0, idx - 3)
+            end_idx = min(len(lines), idx + min(max_lines, 35))
+            numbered = [f"{i + 1:4d}: {lines[i]}" for i in range(start_idx, end_idx)]
+            return "\n".join(numbered)
+
+    return ""
+
+
+def check_target_file_overlap(
+    plan: dict,
+    db_path: Path | str = FORGE_DB_PATH,
+) -> list[dict]:
+    """Detect if any target_files in `plan` overlap with currently active (queued/running) FORGE chunks."""
+    default_repo = str(Path(str(plan.get("repo") or "/workspace").strip()).resolve())
+    planned_pairs: set[tuple[str, str]] = set()
+    for ch in plan.get("chunks", []):
+        ch_repo = str(Path(str(ch.get("repo") or default_repo).strip()).resolve())
+        for tf in ch.get("target_files", []):
+            norm_tf = str(tf).strip().lstrip("./")
+            if norm_tf:
+                planned_pairs.add((ch_repo, norm_tf))
+
+    if not planned_pairs:
+        return []
+
+    overlaps: list[dict] = []
+    with get_db_connection(db_path) as conn:
+        active_rows = conn.execute(
+            """
+            SELECT b.id AS build_id, b.title AS build_title, b.repo AS build_repo,
+                   c.id AS chunk_id, c.chunk_index, c.title AS chunk_title,
+                   c.repo AS chunk_repo, c.target_files_json, c.status AS chunk_status
+            FROM forge_chunks c
+            JOIN forge_builds b ON c.build_id = b.id
+            WHERE b.status IN ('queued', 'running', 'awaiting_approval')
+              AND c.status IN ('pending', 'running', 'verifying', 'awaiting_approval')
+            """
+        ).fetchall()
+
+    for r in active_rows:
+        active_repo = str(Path(str(r["chunk_repo"] or r["build_repo"] or "/workspace").strip()).resolve())
+        t_files = json.loads(r["target_files_json"] or "[]")
+        for tf in t_files:
+            norm_tf = str(tf).strip().lstrip("./")
+            if (active_repo, norm_tf) in planned_pairs:
+                overlaps.append({
+                    "repo": active_repo,
+                    "file": norm_tf,
+                    "build_id": r["build_id"],
+                    "build_title": r["build_title"],
+                    "chunk_id": r["chunk_id"],
+                    "chunk_title": r["chunk_title"],
+                })
+    return overlaps
+
 
 def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     """Deterministically validate a ForgePlan JSON dictionary before enqueueing."""
@@ -326,17 +478,52 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
         ch_title = str(ch.get("title") or "").strip()
         if not ch_title:
             return False, f"Chunk {idx} is missing 'title'."
+        ch_repo_str = str(ch.get("repo") or repo_str).strip()
+        ch_repo_path = Path(ch_repo_str).resolve()
+        if not (ch_repo_path / ".git").exists():
+            return False, f"Chunk {idx} ('{ch_title}') repo '{ch_repo_str}' is not a valid git repository."
         t_files = ch.get("target_files")
         if not isinstance(t_files, list) or not t_files:
             return False, f"Chunk {idx} ('{ch_title}') must specify a non-empty 'target_files' list."
         instr = str(ch.get("instructions") or "").strip()
         if len(instr) < 15:
             return False, f"Chunk {idx} ('{ch_title}') must include detailed TDD 'instructions'."
-        v_cmd = str(ch.get("verification_cmd") or "").strip()
-        if not v_cmd:
-            return False, f"Chunk {idx} ('{ch_title}') must specify a deterministic 'verification_cmd'."
+        # Note: verification_cmd is now optional (auto-falls back to deterministic baseline checks)
 
     return True, "Valid ForgePlan."
+
+
+def build_default_verification_cmd(target_files: list[str], worktree_dir: Optional[Path | str] = None) -> str:
+    """Synthesize a deterministic baseline verification command when `verification_cmd` is omitted."""
+    py_files = [str(f).strip() for f in target_files if str(f).strip().endswith(".py")]
+    if not py_files:
+        return "true"
+
+    cmds: list[str] = []
+    quoted_py = " ".join(f'"{f}"' for f in py_files)
+    cmds.append(f"python3 -m py_compile {quoted_py}")
+
+    # Find matching or explicitly targeted test files
+    test_files: list[str] = []
+    for f in py_files:
+        p = Path(f)
+        if p.name.startswith("test_") or p.name.endswith("_test.py"):
+            if f not in test_files:
+                test_files.append(f)
+        else:
+            cand = p.parent / f"test_{p.name}"
+            if worktree_dir and (Path(worktree_dir) / cand).exists():
+                if str(cand) not in test_files:
+                    test_files.append(str(cand))
+            elif (WORKSPACE_DIR / cand).exists():
+                if str(cand) not in test_files:
+                    test_files.append(str(cand))
+
+    if test_files:
+        quoted_tests = " ".join(f'"{tf}"' for tf in test_files)
+        cmds.append(f"pytest {quoted_tests}")
+
+    return " && ".join(cmds)
 
 
 def _detect_touches_core_bridge(plan: dict) -> bool:
@@ -387,6 +574,8 @@ def render_build_widget_text(build_id: str, db_path: Path | str = FORGE_DB_PATH)
         f"### {b_emoji} FORGE Build `{build['id']}`: {build['title']}",
         f"- **Status:** **{b_label}** | **Tier:** {build['tier']} | **Repo:** `{repo_name}` | **Origin:** {origin_ref}",
     ]
+    if build["objective"] and build["objective"].strip() != build["title"].strip():
+        lines.append(f"- **Objective:** {build['objective'].strip()}")
 
     total = len(chunks)
     merged_count = sum(1 for c in chunks if c["status"] == "merged")
@@ -407,10 +596,13 @@ def render_build_widget_text(build_id: str, db_path: Path | str = FORGE_DB_PATH)
         c_emoji = chunk_badge_map.get(c["status"], "•")
         idx_num = c["chunk_index"] + 1
         model_tag = c["worker_model"]
+        ch_repo_suffix = ""
+        if c["repo"] and Path(c["repo"]).resolve() != Path(build["repo"]).resolve():
+            ch_repo_suffix = f" (`{Path(c['repo']).name}`)"
         pr_suffix = f" (PR #{c['pr_number']})" if c["pr_number"] else ""
         diff_suffix = f" — `{c['diff_stat']}`" if c["diff_stat"] else ""
         lines.append(
-            f"- {c_emoji} **Chunk {idx_num}/{total}: {c['title']}** [`{model_tag}`]{pr_suffix}{diff_suffix}"
+            f"- {c_emoji} **Chunk {idx_num}/{total}: {c['title']}**{ch_repo_suffix} [`{model_tag}`]{pr_suffix}{diff_suffix}"
         )
         if c["status"] == "failed" and c["last_error"]:
             err_snip = c["last_error"].strip().splitlines()[-1][:140]
@@ -466,36 +658,52 @@ def enqueue_build(
     plan: dict,
     db_path: Path | str = FORGE_DB_PATH,
     post_widget: bool = True,
+    allow_overlap: bool = False,
 ) -> dict:
-    """Validate and enqueue a multi-chunk FORGE build plan."""
+    """Validate and enqueue a multi-chunk FORGE build plan with pre-enqueue target-file overlap deduplication."""
     valid, reason = validate_forge_plan(plan)
     if not valid:
         raise ValueError(f"Invalid ForgePlan: {reason}")
+
+    if not allow_overlap and not plan.get("allow_overlap"):
+        overlaps = check_target_file_overlap(plan, db_path=db_path)
+        if overlaps:
+            ov = overlaps[0]
+            raise ValueError(
+                f"Target file overlap detected: '{ov['file']}' is already queued/running in build "
+                f"'{ov['build_id']}' ({ov['build_title']} / {ov['chunk_title']}). "
+                "Wait for the active build to complete or pass allow_overlap=True."
+            )
 
     now = time.time()
     slug = re.sub(r"[^a-z0-9]+", "-", plan["title"].lower()).strip("-")[:18] or "build"
     build_id = plan.get("id") or f"fg-{int(now)}-{slug}"
     touches_core = 1 if _detect_touches_core_bridge(plan) else 0
+    default_repo = str(plan.get("repo") or "/workspace").strip()
+    objective = str(plan.get("objective") or plan["title"]).strip()
+    build_shared_ctx = plan.get("shared_context") or []
 
     with get_db_connection(db_path) as conn:
         conn.execute(
             """
             INSERT INTO forge_builds (
-                id, title, repo, tier, touches_core_bridge,
+                id, title, objective, repo, tier, touches_core_bridge,
                 origin_channel_id, origin_thread_id, origin_conv_id,
-                fact_sheet_json, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                fact_sheet_json, shared_context_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
             """,
             (
                 build_id,
                 plan["title"].strip(),
-                str(plan.get("repo") or "/workspace").strip(),
+                objective,
+                default_repo,
                 int(plan.get("tier") or (3 if len(plan["chunks"]) > 1 else 2)),
                 touches_core,
                 int(plan["origin_channel_id"]),
                 int(plan["origin_thread_id"]) if plan.get("origin_thread_id") else None,
                 plan.get("origin_conv_id"),
                 json.dumps(plan["context_fact_sheet"]),
+                json.dumps(build_shared_ctx),
                 now,
                 now,
             ),
@@ -503,30 +711,43 @@ def enqueue_build(
 
         for idx, ch in enumerate(plan["chunks"]):
             chunk_id = f"{build_id}-c{idx}"
+            ch_repo = str(ch.get("repo") or default_repo).strip()
+            t_files = ch.get("target_files", [])
+            v_cmd = str(ch.get("verification_cmd") or "").strip()
             conn.execute(
                 """
                 INSERT INTO forge_chunks (
-                    id, build_id, chunk_index, title, worker_model,
-                    target_files_json, prohibited_files_json,
-                    instructions, verification_cmd, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                    id, build_id, chunk_index, title, repo, worker_model,
+                    target_files_json, target_symbols_json, shared_context_json,
+                    prohibited_files_json, instructions, verification_cmd, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
                 """,
                 (
                     chunk_id,
                     build_id,
                     idx,
                     ch["title"].strip(),
+                    ch_repo,
                     ch.get("worker_model") or DEFAULT_WORKER_MODEL,
-                    json.dumps(ch.get("target_files", [])),
+                    json.dumps(t_files),
+                    json.dumps(ch.get("target_symbols", [])),
+                    json.dumps(ch.get("shared_context", [])),
                     json.dumps(ch.get("prohibited_files", [])),
                     ch["instructions"].strip(),
-                    ch["verification_cmd"].strip(),
+                    v_cmd,
                 ),
             )
 
     msg_id = None
     if post_widget:
         msg_id = post_or_update_build_widget(build_id, db_path=db_path)
+
+    # Immediately trigger background worker if enqueued against production forge.db
+    if Path(db_path).resolve() == FORGE_DB_PATH.resolve():
+        try:
+            forge_supervisor.maybe_spawn_next_build_worker()
+        except Exception:
+            pass
 
     return {
         "ok": True,
@@ -538,8 +759,13 @@ def enqueue_build(
     }
 
 
-def format_chunk_prompt(build_id: str, chunk_index: int, db_path: Path | str = FORGE_DB_PATH, worktree_dir: Optional[str] = None) -> str:
-    """Synthesize the bounded, high-signal prompt for a FORGE chunk worker."""
+def format_chunk_prompt(
+    build_id: str,
+    chunk_index: int,
+    db_path: Path | str = FORGE_DB_PATH,
+    worktree_dir: Optional[str] = None,
+) -> str:
+    """Synthesize the bounded, high-signal prompt for a FORGE chunk worker with Turn-0 symbol hydration."""
     with get_db_connection(db_path) as conn:
         build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
         if not build:
@@ -556,19 +782,35 @@ def format_chunk_prompt(build_id: str, chunk_index: int, db_path: Path | str = F
     prior_chunks = [c for c in chunks if c["chunk_index"] < chunk_index]
     upcoming_chunks = [c for c in chunks if c["chunk_index"] > chunk_index]
     fact_sheet = json.loads(build["fact_sheet_json"] or "[]")
+    build_shared_ctx = json.loads(build["shared_context_json"] or "[]") if "shared_context_json" in build.keys() else []
     target_files = json.loads(target_chunk["target_files_json"] or "[]")
+    target_symbols = json.loads(target_chunk["target_symbols_json"] or "[]") if "target_symbols_json" in target_chunk.keys() else []
+    chunk_shared_ctx = json.loads(target_chunk["shared_context_json"] or "[]") if "shared_context_json" in target_chunk.keys() else []
     prohibited_files = json.loads(target_chunk["prohibited_files_json"] or "[]")
-    wt_str = worktree_dir or build["repo"]
+
+    effective_repo = (target_chunk["repo"] if "repo" in target_chunk.keys() and target_chunk["repo"] else build["repo"]) or "/workspace"
+    wt_str = worktree_dir or effective_repo
+    wt_path = Path(wt_str)
+    objective_text = (build["objective"] if "objective" in build.keys() and build["objective"] else build["title"]).strip()
+    effective_v_cmd = (target_chunk["verification_cmd"] or "").strip() or build_default_verification_cmd(target_files, wt_path)
 
     lines = [
         f"# [FORGE WORKER EXECUTION CONTRACT — BUILD `{build_id}` / CHUNK {chunk_index + 1} OF {len(chunks)}]",
-        f"**Overall Build Objective:** {build['title']}",
+        f"**Build Title:** {build['title']}",
+        f"**Overall Build Objective (Why):** {objective_text}",
+        f"**Target Repository:** `{effective_repo}`",
         f"**Isolated Working Directory:** `{wt_str}`",
         "",
         "## 1. Architectural Context Fact Sheet (From Lead Orchestrator)",
     ]
     for fact in fact_sheet:
         lines.append(f"- {fact}")
+
+    combined_shared = list(build_shared_ctx) + [x for x in chunk_shared_ctx if x not in build_shared_ctx]
+    if combined_shared:
+        lines.append("\n### Shared Context & Code Exemplars:")
+        for snippet in combined_shared:
+            lines.append(f"- {snippet}")
 
     lines.append("\n## 2. Completed Chunks Ledger (Already Landed)")
     if not prior_chunks:
@@ -581,9 +823,44 @@ def format_chunk_prompt(build_id: str, chunk_index: int, db_path: Path | str = F
 
     lines.append(f"\n## 3. Active Chunk Specification (Chunk {chunk_index + 1}: {target_chunk['title']})")
     lines.append(f"- **Allowed Target Files:** `{', '.join(target_files)}`")
+    if target_symbols:
+        lines.append(f"- **Target Symbols:** `{', '.join(target_symbols)}`")
     if prohibited_files:
         lines.append(f"- **Prohibited Files (DO NOT MODIFY):** `{', '.join(prohibited_files)}`")
-    lines.append(f"- **Mandatory Verification Gate:** `{target_chunk['verification_cmd']}`")
+    lines.append(f"- **Mandatory Verification Gate:** `{effective_v_cmd}`")
+
+    # Pre-hydrate target_symbols AST/line-slice snippets so Flash workers skip discovery reads
+    if target_symbols:
+        hydrated_blocks: list[str] = []
+        search_roots = [wt_path]
+        if Path(effective_repo).resolve() != wt_path.resolve():
+            search_roots.append(Path(effective_repo))
+        for sym in target_symbols:
+            sym_str = str(sym).strip()
+            if not sym_str:
+                continue
+            # Support optional "path/to/file.py:symbol_name" or search across target_files
+            if ":" in sym_str and not sym_str.startswith(":"):
+                f_hint, s_name = sym_str.split(":", 1)
+                cand_files = [f_hint.strip()]
+            else:
+                s_name = sym_str
+                cand_files = list(target_files)
+            for rel_f in cand_files:
+                snippet = ""
+                for root in search_roots:
+                    cand_p = (root / rel_f).resolve()
+                    if cand_p.exists():
+                        snippet = extract_symbol_snippet(cand_p, s_name)
+                        if snippet:
+                            hydrated_blocks.append(f"#### `{rel_f}` — `{s_name}`\n```python\n{snippet}\n```")
+                            break
+                if snippet:
+                    break
+        if hydrated_blocks:
+            lines.append("\n### Pre-Hydrated Target Symbol Slices (Turn-0 Fast-Path Context):")
+            lines.extend(hydrated_blocks)
+
     lines.append("\n### Implementation Instructions:")
     lines.append(target_chunk["instructions"])
 
@@ -603,7 +880,7 @@ def format_chunk_prompt(build_id: str, chunk_index: int, db_path: Path | str = F
         "\n## 5. Mandatory Execution Discipline\n"
         f"1. Operate strictly inside `{wt_str}`.\n"
         "2. Implement ONLY the Active Chunk Specification and its unit tests.\n"
-        f"3. Run `{target_chunk['verification_cmd']}` until it exits 0.\n"
+        f"3. Run `{effective_v_cmd}` until it exits 0.\n"
         "4. Output a concise summary of changes and stop immediately."
     )
     return "\n".join(lines)
@@ -611,36 +888,45 @@ def format_chunk_prompt(build_id: str, chunk_index: int, db_path: Path | str = F
 
 def verify_chunk_worktree(
     worktree_dir: Path | str,
-    verification_cmd: str,
+    verification_cmd: Optional[str] = None,
     prohibited_files: Optional[list[str]] = None,
+    target_files: Optional[list[str]] = None,
 ) -> tuple[bool, str, str]:
     """Run deterministic Maker-Checker verification inside the chunk worktree.
 
+    If `verification_cmd` is empty or omitted, automatically runs baseline py_compile +
+    matching unit tests on `target_files` (or modified files in git status).
     Returns (passed, diff_stat_summary, error_output).
     """
     wt = Path(worktree_dir)
     if not wt.exists():
         return False, "", f"Worktree directory does not exist: {wt}"
 
+    st_proc = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(wt),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    changed = [line[3:].strip().strip('"') for line in st_proc.stdout.splitlines() if len(line) > 3]
+
     # 1. Check prohibited files were not modified
     if prohibited_files:
-        st_proc = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=str(wt),
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        changed = [line[3:].strip().strip('"') for line in st_proc.stdout.splitlines() if len(line) > 3]
         violated = [f for f in changed if f in set(prohibited_files)]
         if violated:
             return False, "", f"Boundary violation: chunk modified prohibited file(s): {', '.join(violated)}"
 
-    # 2. Execute verification_cmd
+    # 2. Execute verification_cmd (or synthesized baseline gate if omitted)
+    effective_cmd = (verification_cmd or "").strip()
+    if not effective_cmd:
+        files_to_check = list(target_files) if target_files else changed
+        effective_cmd = build_default_verification_cmd(files_to_check, worktree_dir=wt)
+
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{wt}:{env.get('PYTHONPATH', '')}".strip(":")
     v_proc = subprocess.run(
-        verification_cmd,
+        effective_cmd,
         shell=True,
         cwd=str(wt),
         env=env,
@@ -696,15 +982,20 @@ def format_origin_completion_envelope(build_id: str, db_path: Path | str = FORGE
     lines = [
         f"[FORGE BUILD COMPLETION ENVELOPE — `{build['id']}`]",
         f"**Build Title:** {build['title']}",
+    ]
+    if "objective" in build.keys() and build["objective"] and build["objective"].strip() != build["title"].strip():
+        lines.append(f"**Objective:** {build['objective'].strip()}")
+    lines.extend([
         f"**Repository:** `{build['repo']}`",
         f"**Status:** All {len(chunks)} chunk(s) passed deterministic Maker-Checker verification and merged.",
         "",
         "### Merged Chunks Ledger:",
-    ]
+    ])
     for c in chunks:
         pr_tag = f"PR #{c['pr_number']}" if c["pr_number"] else "Merged"
         diff_tag = f" ({c['diff_stat']})" if c["diff_stat"] else ""
-        lines.append(f"- **Chunk {c['chunk_index'] + 1}: {c['title']}** — {pr_tag}{diff_tag} [verified via `{c['verification_cmd']}`]")
+        v_label = c["verification_cmd"] or "auto-baseline"
+        lines.append(f"- **Chunk {c['chunk_index'] + 1}: {c['title']}** — {pr_tag}{diff_tag} [verified via `{v_label}`]")
 
     if fact_sheet:
         lines.append("\n### Original Context Fact Sheet:")
@@ -762,6 +1053,7 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
             subprocess.run(["git", "worktree", "prune"], cwd=str(repo_cand), capture_output=True, timeout=10)
 
     reset_chunks = 0
+    pruned_jobs = 0
     with get_db_connection(db_path) as conn:
         cur = conn.execute(
             "UPDATE forge_chunks SET status = 'pending' WHERE status IN ('running', 'verifying') AND attempt_count < 3"
@@ -771,8 +1063,25 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
             "UPDATE forge_builds SET status = 'queued', updated_at = ? WHERE status = 'running'",
             (time.time(),),
         )
+        # Reconcile stale/dead forge_jobs and remove leaked /tmp test fixtures
+        del_cur = conn.execute("DELETE FROM forge_jobs WHERE log_file LIKE '/tmp/%' OR id LIKE 'dt-test-%'")
+        pruned_jobs += del_cur.rowcount
+        active_jobs = conn.execute(
+            "SELECT id, status, worker_pid, child_pid, start_time FROM forge_jobs WHERE status IN ('starting', 'running')"
+        ).fetchall()
+        now_ts = time.time()
+        for j in active_jobs:
+            wpid = j["worker_pid"]
+            cpid = j["child_pid"]
+            alive = _is_pid_running(cpid) or _is_pid_running(wpid)
+            if not alive and (now_ts - float(j["start_time"] or 0)) > 15.0:
+                conn.execute(
+                    "UPDATE forge_jobs SET status = 'unknown_exit', end_time = ? WHERE id = ?",
+                    (now_ts, j["id"]),
+                )
+                pruned_jobs += 1
 
-    return {"cleaned_worktrees": cleaned_wts, "reset_chunks": reset_chunks}
+    return {"cleaned_worktrees": cleaned_wts, "reset_chunks": reset_chunks, "pruned_jobs": pruned_jobs}
 
 
 class ForgeSupervisor:
@@ -780,10 +1089,10 @@ class ForgeSupervisor:
 
     def __init__(self, db_path: Path | str = FORGE_DB_PATH):
         self.db_path = Path(db_path)
-        self._active_build_task: Optional[Any] = None
+        self._active_build_proc: Optional[subprocess.Popen] = None
 
     def tick_sync(self) -> dict:
-        """Synchronous housekeeping tick: expire stale decisions and check pending SDK tasks."""
+        """Synchronous housekeeping tick: expire stale decisions, dispatch SDK tasks, and advance queued builds."""
         expired = expire_stale_decisions(db_path=self.db_path)
         dispatched_sdk = []
         try:
@@ -791,7 +1100,91 @@ class ForgeSupervisor:
             dispatched_sdk = check_and_dispatch_completed_tasks()
         except Exception:
             pass
-        return {"expired_decisions": expired, "dispatched_sdk_tasks": len(dispatched_sdk)}
+
+        spawned_build = self.maybe_spawn_next_build_worker()
+        return {
+            "expired_decisions": expired,
+            "dispatched_sdk_tasks": len(dispatched_sdk),
+            "spawned_build": spawned_build,
+        }
+
+    def maybe_spawn_next_build_worker(self) -> Optional[str]:
+        """If a build is queued in SQLite and no build worker is currently running, spawn a detached worker."""
+        if self._active_build_proc is not None and self._active_build_proc.poll() is None:
+            return None
+
+        lock_path = self.db_path.parent / ".forge_build_worker.lock"
+        try:
+            with open(lock_path, "a+", encoding="utf-8") as lf:
+                try:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError):
+                    return None
+                else:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+
+        with get_db_connection(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') ORDER BY created_at ASC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            build_id = row["id"]
+
+        log_path = FORGE_LOGS_DIR / f"build-{build_id}.log"
+        lf_out = open(log_path, "a", encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "_build_worker", build_id, "--db-path", str(self.db_path)],
+            cwd=str(WORKSPACE_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=lf_out,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        self._active_build_proc = proc
+        return build_id
+
+    def run_build_pipeline(self, build_id: str) -> bool:
+        """Execute all pending chunks for `build_id` sequentially under an exclusive file lock."""
+        lock_path = self.db_path.parent / ".forge_build_worker.lock"
+        lock_fh = open(lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            lock_fh.close()
+            return False
+
+        try:
+            while True:
+                with get_db_connection(self.db_path) as conn:
+                    build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
+                    if not build or build["status"] in ("cancelled", "failed", "completed"):
+                        break
+                    next_chunk = conn.execute(
+                        "SELECT * FROM forge_chunks WHERE build_id = ? AND status != 'merged' ORDER BY chunk_index ASC LIMIT 1",
+                        (build_id,),
+                    ).fetchone()
+                    if not next_chunk:
+                        conn.execute(
+                            "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
+                            (time.time(), build_id),
+                        )
+                        post_or_update_build_widget(build_id, db_path=self.db_path)
+                        dispatch_build_completion_to_origin(build_id, db_path=self.db_path)
+                        return True
+
+                ok = self.execute_chunk_in_worktree(build_id, next_chunk)
+                if not ok:
+                    return False
+            return True
+        finally:
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            lock_fh.close()
 
     def execute_chunk_in_worktree(self, build_id: str, chunk_row: sqlite3.Row) -> bool:
         """Execute a single FORGE chunk inside an isolated git worktree with Maker-Checker verification."""
@@ -812,15 +1205,19 @@ class ForgeSupervisor:
 
         post_or_update_build_widget(build_id, db_path=self.db_path)
 
-        repo_dir = Path(build["repo"]).resolve()
+        effective_repo = (chunk_row["repo"] if "repo" in chunk_row.keys() and chunk_row["repo"] else build["repo"]) or "/workspace"
+        repo_dir = Path(effective_repo).resolve()
         wt_dir = Path(f"/tmp/forge-wt-{chunk_id}")
         branch_name = f"forge/{build_id}-c{chunk_idx}"
-        base_ref = f"forge/release-{build_id}" if build["touches_core_bridge"] else "origin/main"
+        staging_ref = f"forge/release-{build_id}"
 
-        # Ensure base ref exists
+        # Ensure base ref exists and carries prior chunks forward
         subprocess.run(["git", "fetch", "origin", "main"], cwd=str(repo_dir), capture_output=True, timeout=30)
-        if build["touches_core_bridge"] and chunk_idx == 0:
-            subprocess.run(["git", "branch", "-f", base_ref, "origin/main"], cwd=str(repo_dir), capture_output=True, timeout=10)
+        if chunk_idx == 0:
+            chk_ref = subprocess.run(["git", "rev-parse", "--verify", "origin/main"], cwd=str(repo_dir), capture_output=True)
+            start_ref = "origin/main" if chk_ref.returncode == 0 else "HEAD"
+            subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
+        base_ref = staging_ref
 
         shutil.rmtree(wt_dir, ignore_errors=True)
         subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
@@ -832,7 +1229,6 @@ class ForgeSupervisor:
             timeout=30,
         )
         if wt_res.returncode != 0:
-            # Fallback to HEAD if origin/main is not fetched in test repos
             subprocess.run(
                 ["git", "worktree", "add", "-B", branch_name, str(wt_dir), "HEAD"],
                 cwd=str(repo_dir),
@@ -842,6 +1238,7 @@ class ForgeSupervisor:
             )
 
         prohibited = json.loads(chunk_row["prohibited_files_json"] or "[]")
+        target_files = json.loads(chunk_row["target_files_json"] or "[]")
         max_attempts = 3
 
         for attempt in range(1, max_attempts + 1):
@@ -881,15 +1278,32 @@ class ForgeSupervisor:
                 wt_dir,
                 chunk_row["verification_cmd"],
                 prohibited_files=prohibited,
+                target_files=target_files,
             )
             if passed:
-                # Commit and merge into base
+                # Collect short diff stat against base_ref before committing
+                diff_proc = subprocess.run(
+                    ["git", "diff", "--shortstat", base_ref],
+                    cwd=str(wt_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if diff_proc.stdout.strip():
+                    diff_stat = diff_proc.stdout.strip()
                 subprocess.run(["git", "add", "-A"], cwd=str(wt_dir), capture_output=True, timeout=15)
                 subprocess.run(
                     ["git", "commit", "-m", f"feat(forge): {chunk_row['title']} [{chunk_id}]"],
                     cwd=str(wt_dir),
                     capture_output=True,
                     timeout=15,
+                )
+                # Fast-forward staging branch so subsequent chunks inherit this chunk's commits
+                subprocess.run(
+                    ["git", "branch", "-f", base_ref, branch_name],
+                    cwd=str(repo_dir),
+                    capture_output=True,
+                    timeout=10,
                 )
                 shutil.rmtree(wt_dir, ignore_errors=True)
                 subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
@@ -908,6 +1322,11 @@ class ForgeSupervisor:
                             "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
                             (time.time(), build_id),
                         )
+
+                # If final chunk completed and not touching core bridge, sync staging branch into local main
+                if remaining == 0 and not build["touches_core_bridge"]:
+                    subprocess.run(["git", "merge", "--ff-only", base_ref], cwd=str(repo_dir), capture_output=True, timeout=15)
+                    subprocess.run(["git", "push", "origin", "main"], cwd=str(repo_dir), capture_output=True, timeout=30)
 
                 post_or_update_build_widget(build_id, db_path=self.db_path)
                 if remaining == 0:
@@ -931,7 +1350,485 @@ forge_supervisor = ForgeSupervisor()
 
 
 # ---------------------------------------------------------------------------
-# 4. Pillar 3: Deterministic Decisions Framework (Inline Approval Cards)
+# 4. Pillar 3: Native Detached Background Job Runner (`forge_jobs`)
+# ---------------------------------------------------------------------------
+
+def _get_job_dir(task_id: str) -> Path:
+    return TASKS_DIR / task_id
+
+
+def _read_job_meta(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> Optional[dict]:
+    """Read job metadata from `forge_jobs` in SQLite (with legacy `meta.json` fallback)."""
+    meta_file = _get_job_dir(task_id) / "meta.json"
+    if meta_file.exists():
+        try:
+            return json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    try:
+        with get_db_connection(db_path) as conn:
+            row = conn.execute("SELECT * FROM forge_jobs WHERE id = ?", (task_id,)).fetchone()
+            if row:
+                d = dict(row)
+                d["task_id"] = d["id"]
+                d["notify_on_success"] = bool(d.get("notify_on_success"))
+                d["synthesize"] = bool(d.get("synthesize", 1))
+                return d
+    except Exception:
+        pass
+    return None
+
+
+def _write_job_meta(task_id: str, meta: dict, db_path: Path | str = FORGE_DB_PATH) -> None:
+    """Persist job metadata to `TASKS_DIR/<id>/meta.json` and sync to `forge_jobs` when in production."""
+    task_dir = _get_job_dir(task_id)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    meta_file = task_dir / "meta.json"
+    temp_file = task_dir / "meta.json.tmp"
+    temp_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    temp_file.replace(meta_file)
+
+    is_prod_dir = (TASKS_DIR.resolve() == (WORKSPACE_DIR / "data" / "detached_tasks").resolve())
+    is_custom_db = (Path(db_path).resolve() != FORGE_DB_PATH.resolve())
+    if is_prod_dir or is_custom_db:
+        try:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO forge_jobs (
+                        id, name, command, cwd, channel, timeout, status,
+                        worker_pid, child_pid, exit_code, log_file,
+                        notify_on_success, synthesize, start_time, end_time, duration_seconds
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        status=excluded.status,
+                        worker_pid=excluded.worker_pid,
+                        child_pid=excluded.child_pid,
+                        exit_code=excluded.exit_code,
+                        end_time=excluded.end_time,
+                        duration_seconds=excluded.duration_seconds
+                    """,
+                    (
+                        task_id,
+                        meta.get("name", "Background Task"),
+                        meta.get("command", ""),
+                        meta.get("cwd", "/workspace"),
+                        str(meta.get("channel", "zero-chat")),
+                        int(meta.get("timeout", 3600)),
+                        meta.get("status", "starting"),
+                        meta.get("worker_pid"),
+                        meta.get("child_pid"),
+                        meta.get("exit_code"),
+                        str(meta.get("log_file", "")),
+                        1 if meta.get("notify_on_success") else 0,
+                        1 if meta.get("synthesize", True) else 0,
+                        float(meta.get("start_time") or time.time()),
+                        meta.get("end_time"),
+                        meta.get("duration_seconds"),
+                    ),
+                )
+        except Exception:
+            pass
+
+
+def _is_job_worker_flock_held(task_id: str) -> bool:
+    lock_path = _get_job_dir(task_id) / "worker.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        with open(lock_path, "a+", encoding="utf-8") as lf:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                return True
+            else:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                return False
+    except Exception:
+        return False
+
+
+def _is_job_active(meta: dict) -> bool:
+    status = meta.get("status")
+    if status not in ("starting", "running"):
+        return False
+    task_id = meta.get("task_id") or meta.get("id") or ""
+    if task_id and _is_job_worker_flock_held(task_id):
+        return True
+    child_pid = meta.get("child_pid")
+    worker_pid = meta.get("worker_pid")
+    if _is_pid_running(child_pid) or _is_pid_running(worker_pid):
+        return True
+    start_time = meta.get("start_time") or 0
+    if status == "starting" and (time.time() - float(start_time)) < 5.0:
+        return True
+    return False
+
+
+def _find_active_duplicate_job(command: str, cwd: str, db_path: Path | str = FORGE_DB_PATH) -> Optional[dict]:
+    norm_cmd = command.strip()
+    norm_cwd = cwd.strip()
+    if TASKS_DIR.exists():
+        for entry in sorted(TASKS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if not entry.is_dir():
+                continue
+            meta = _read_job_meta(entry.name, db_path=db_path)
+            if not meta:
+                continue
+            if meta.get("command", "").strip() == norm_cmd and meta.get("cwd", "/workspace").strip() == norm_cwd:
+                if _is_job_active(meta):
+                    return meta
+    return None
+
+
+def start_job(
+    command: str,
+    channel: str = "zero-chat",
+    name: str = "",
+    timeout: int = 3600,
+    cwd: str = "/workspace",
+    notify_on_success: bool = True,
+    synthesize: bool = True,
+    allow_duplicate: bool = False,
+    db_path: Path | str = FORGE_DB_PATH,
+) -> dict:
+    """Spawn a detached background shell job backed by `forge_jobs` and return its metadata immediately."""
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    enqueue_lock_path = TASKS_DIR / ".enqueue.lock"
+
+    with open(enqueue_lock_path, "a+", encoding="utf-8") as elock:
+        fcntl.flock(elock.fileno(), fcntl.LOCK_EX)
+        try:
+            if not allow_duplicate:
+                existing = _find_active_duplicate_job(command, cwd, db_path=db_path)
+                if existing:
+                    dup_meta = dict(existing)
+                    dup_meta["deduplicated"] = True
+                    return dup_meta
+
+            name_clean = name.strip() or "Ad-Hoc Background Task"
+            slug = re.sub(r"[^a-zA-Z0-9_-]", "", name_clean.lower().replace(" ", "-"))[:20] or "job"
+            task_id = f"dt-{int(time.time())}-{slug}"
+            task_dir = _get_job_dir(task_id)
+            if task_dir.exists():
+                task_id = f"dt-{int(time.time() * 1000)}-{slug}"
+                task_dir = _get_job_dir(task_id)
+            task_dir.mkdir(parents=True, exist_ok=True)
+
+            log_file = task_dir / "run.log"
+            log_file.touch(exist_ok=True)
+
+            meta = {
+                "task_id": task_id,
+                "name": name_clean,
+                "command": command,
+                "channel": channel,
+                "timeout": int(timeout),
+                "cwd": cwd,
+                "status": "starting",
+                "worker_pid": None,
+                "child_pid": None,
+                "start_time": time.time(),
+                "start_time_iso": datetime.now(timezone.utc).isoformat(),
+                "end_time": None,
+                "duration_seconds": None,
+                "exit_code": None,
+                "notify_on_success": bool(notify_on_success),
+                "synthesize": bool(synthesize),
+                "log_file": str(log_file),
+            }
+            _write_job_meta(task_id, meta, db_path=db_path)
+
+            worker_cmd = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "_job_worker",
+                task_id,
+                "--db-path",
+                str(db_path),
+            ]
+            proc = subprocess.Popen(
+                worker_cmd,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+            time.sleep(0.15)
+            updated_meta = _read_job_meta(task_id, db_path=db_path) or meta
+            if not updated_meta.get("worker_pid"):
+                updated_meta["worker_pid"] = proc.pid
+                _write_job_meta(task_id, updated_meta, db_path=db_path)
+
+            return updated_meta
+        finally:
+            fcntl.flock(elock.fileno(), fcntl.LOCK_UN)
+
+
+def _run_job_worker(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> None:
+    """Internal entrypoint executed in the detached background job worker process."""
+    meta = _read_job_meta(task_id, db_path=db_path)
+    if not meta:
+        sys.exit(1)
+
+    task_dir = _get_job_dir(task_id)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    lock_file_path = task_dir / "worker.lock"
+    lock_fh = open(lock_file_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        lock_fh.close()
+        return
+
+    try:
+        _run_job_worker_locked(task_id, meta, db_path=db_path)
+    finally:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fh.close()
+
+
+def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE_DB_PATH) -> None:
+    meta["worker_pid"] = os.getpid()
+    meta["status"] = "running"
+    _write_job_meta(task_id, meta, db_path=db_path)
+
+    command = meta["command"]
+    timeout = meta.get("timeout", 3600)
+    cwd = meta.get("cwd", "/workspace")
+    channel = meta.get("channel", "zero-chat")
+    name = meta.get("name", "Background Task")
+    log_file_path = Path(meta["log_file"])
+
+    start_ts = time.time()
+    exit_code = -1
+    timed_out = False
+    cancelled = False
+
+    with open(log_file_path, "a", encoding="utf-8") as lf:
+        lf.write(f"--- [Detached Runner] Started at {datetime.now(timezone.utc).isoformat()} ---\n")
+        lf.write(f"--- Command: {command} ---\n")
+        lf.write(f"--- Target Channel: {channel} | Timeout: {timeout}s ---\n\n")
+        lf.flush()
+
+        try:
+            worker_env = os.environ.copy()
+            if "/workspace" not in worker_env.get("PYTHONPATH", ""):
+                worker_env["PYTHONPATH"] = f"/workspace:{worker_env.get('PYTHONPATH', '')}".strip(":")
+            child_proc = subprocess.Popen(
+                command,
+                shell=True,
+                cwd=cwd,
+                env=worker_env,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            meta["child_pid"] = child_proc.pid
+            _write_job_meta(task_id, meta, db_path=db_path)
+
+            try:
+                exit_code = child_proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                lf.write(f"\n--- [Detached Runner] ERROR: Task exceeded {timeout}s timeout. Terminating... ---\n")
+                lf.flush()
+                try:
+                    os.killpg(os.getpgid(child_proc.pid), signal.SIGTERM)
+                    time.sleep(1.0)
+                    if child_proc.poll() is None:
+                        os.killpg(os.getpgid(child_proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+                exit_code = -99
+        except Exception as ex:
+            lf.write(f"\n--- [Detached Runner] Process spawn error: {ex} ---\n")
+            lf.flush()
+            exit_code = -1
+
+    end_ts = time.time()
+    duration = end_ts - start_ts
+
+    fresh_meta = _read_job_meta(task_id, db_path=db_path) or meta
+    if fresh_meta.get("status") == "cancelled":
+        cancelled = True
+
+    final_status = "cancelled" if cancelled else ("timed_out" if timed_out else ("completed" if exit_code == 0 else "failed"))
+    fresh_meta["status"] = final_status
+    fresh_meta["exit_code"] = exit_code
+    fresh_meta["end_time"] = end_ts
+    fresh_meta["duration_seconds"] = duration
+    _write_job_meta(task_id, fresh_meta, db_path=db_path)
+
+    dur_str = _format_duration(duration)
+    notify_on_success = fresh_meta.get("notify_on_success", False)
+    if not notify_on_success:
+        try:
+            from tools.bridge_state import get_runtime_rules
+            notify_on_success = get_runtime_rules().get("detached_notify_on_success", False)
+        except Exception:
+            pass
+
+    if final_status == "completed" and not notify_on_success:
+        with open(log_file_path, "a", encoding="utf-8") as lf:
+            lf.write(f"\n[Detached Runner] Task completed successfully in {dur_str}. Suppressing success notification (failure-only policy active).\n")
+        return
+
+    synthesize = fresh_meta.get("synthesize", True)
+    if final_status == "completed" and synthesize:
+        synthesis_prompt = f"""[SYSTEM NOTIFICATION: DETACHED TASK COMPLETE]
+Task Name: {name} (ID: {task_id})
+Duration: {dur_str} | Exit Code: {exit_code}
+Log Path: {log_file_path}
+
+Directive:
+The background task has finished successfully. Review the execution log at {log_file_path}, extract the key results, metrics, or anomalies, and deliver a concise, natural executive briefing directly to Ryan in character as Zero.
+"""
+        try:
+            from tools.outbox import queue_agent_turn
+            queue_agent_turn(
+                channel=channel,
+                prompt=synthesis_prompt,
+                job_name=f"Detached Task: {name}",
+            )
+            with open(log_file_path, "a", encoding="utf-8") as lf:
+                lf.write("\n[Detached Runner] 🟢 Dispatched autonomous agent synthesis turn via Outbox.\n")
+            return
+        except Exception as se:
+            with open(log_file_path, "a", encoding="utf-8") as lf:
+                lf.write(f"\n[Detached Runner] Warning: Agent synthesis queue failed ({se}). Falling back to direct outbox message.\n")
+
+    log_snippet = ""
+    try:
+        with open(log_file_path, "r", encoding="utf-8", errors="replace") as lf:
+            lines = lf.readlines()
+            filtered = [
+                line.rstrip() for line in lines
+                if line.strip() and not line.strip().startswith("--- [Detached Runner]")
+            ]
+            tail = filtered[-12:]
+            if tail:
+                log_snippet = "\n```text\n" + "\n".join(tail) + "\n```"
+    except Exception:
+        pass
+
+    if final_status == "completed":
+        header = f"✅ **Background Task Complete: {name}** ({dur_str})"
+    elif final_status == "timed_out":
+        header = f"⏱️ **Background Task Timed Out: {name}** (Limit: {timeout}s)"
+    elif final_status == "cancelled":
+        header = f"🛑 **Background Task Cancelled: {name}** (after {dur_str})"
+    else:
+        header = f"❌ **Background Task Failed: {name}** (Exit Code: {exit_code}, after {dur_str})"
+
+    msg_lines = [header]
+    if log_snippet:
+        snippet_header = "**Output:**" if final_status == "completed" else "**Error Excerpt:**"
+        msg_lines.append(f"{snippet_header}{log_snippet}")
+
+    msg_lines.append(f"• *Inspect full logs:* `python3 /workspace/tools/detached_runner.py logs {task_id}`")
+    outbox_body = "\n".join(msg_lines)
+
+    try:
+        from tools.outbox import queue_outbox_message
+        queue_outbox_message(
+            channel=channel,
+            content=outbox_body,
+            source_turn=f"detached-{task_id}",
+        )
+    except Exception as oe:
+        with open(log_file_path, "a", encoding="utf-8") as lf:
+            lf.write(f"\n[Detached Runner] Failed to dispatch outbox message: {oe}\n")
+
+
+def cancel_job(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
+    """Cancel an active background job."""
+    meta = _read_job_meta(task_id, db_path=db_path)
+    if not meta:
+        return {"error": f"Task '{task_id}' not found."}
+
+    child_pid = meta.get("child_pid")
+    worker_pid = meta.get("worker_pid")
+
+    meta["status"] = "cancelled"
+    _write_job_meta(task_id, meta, db_path=db_path)
+
+    killed = False
+    for pid in (child_pid, worker_pid):
+        if pid and _is_pid_running(pid):
+            try:
+                os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
+                killed = True
+            except Exception:
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                    killed = True
+                except Exception:
+                    pass
+
+    return {"task_id": task_id, "status": "cancelled", "process_killed": killed}
+
+
+def get_job_status(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
+    """Get status of a specific detached job."""
+    meta = _read_job_meta(task_id, db_path=db_path)
+    if not meta:
+        return {"error": f"Task '{task_id}' not found."}
+
+    child_pid = meta.get("child_pid")
+    worker_pid = meta.get("worker_pid")
+    is_alive = _is_pid_running(child_pid) or _is_pid_running(worker_pid)
+
+    if meta["status"] == "running" and not is_alive:
+        meta["status"] = "unknown_exit"
+
+    meta["is_running"] = is_alive
+    if is_alive:
+        meta["current_duration"] = _format_duration(time.time() - float(meta["start_time"]))
+    elif meta.get("duration_seconds"):
+        meta["current_duration"] = _format_duration(float(meta["duration_seconds"]))
+
+    return meta
+
+
+def list_jobs(limit: int = 15, db_path: Path | str = FORGE_DB_PATH) -> list[dict]:
+    """List recent detached jobs from SQLite (or TASKS_DIR fallback)."""
+    tasks: list[dict] = []
+    seen: set[str] = set()
+    try:
+        with get_db_connection(db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM forge_jobs ORDER BY start_time DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            for r in rows:
+                d = dict(r)
+                d["task_id"] = d["id"]
+                d["is_running"] = _is_pid_running(d.get("child_pid")) or _is_pid_running(d.get("worker_pid"))
+                tasks.append(d)
+                seen.add(d["id"])
+    except Exception:
+        pass
+
+    if len(tasks) < limit and TASKS_DIR.exists():
+        for entry in sorted(TASKS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if entry.is_dir() and entry.name not in seen:
+                meta = _read_job_meta(entry.name, db_path=db_path)
+                if meta:
+                    meta["is_running"] = _is_pid_running(meta.get("child_pid"))
+                    tasks.append(meta)
+                    if len(tasks) >= limit:
+                        break
+    return tasks
+
+
+# ---------------------------------------------------------------------------
+# 5. Pillar 4: Deterministic Decisions Framework (Inline Approval Cards)
 # ---------------------------------------------------------------------------
 
 def stage_decision(
@@ -1247,7 +2144,7 @@ class ForgeDecisionEditModal(discord.ui.Modal):
 
 
 # ---------------------------------------------------------------------------
-# 5. Global `/queue` Digest & Active Build Inspection
+# 6. Global `/queue` Digest & Active Build Inspection
 # ---------------------------------------------------------------------------
 
 def has_active_forge_builds(db_path: Path | str = FORGE_DB_PATH) -> list[str]:
@@ -1329,7 +2226,7 @@ def format_queue_digest(
 
 
 # ---------------------------------------------------------------------------
-# 6. CLI Entrypoint (`python3 /workspace/tools/forge.py ...`)
+# 7. CLI Entrypoint (`python3 /workspace/tools/forge.py ...`)
 # ---------------------------------------------------------------------------
 
 def main():
@@ -1339,6 +2236,7 @@ def main():
     p_enq = sub.add_parser("enqueue", help="Validate and enqueue a ForgePlan JSON file")
     p_enq.add_argument("plan_file", help="Path to ForgePlan JSON file")
     p_enq.add_argument("--no-widget", action="store_true", help="Skip posting initial #forge Discord widget")
+    p_enq.add_argument("--allow-overlap", action="store_true", help="Allow enqueueing even if target_files overlap an active build")
 
     p_st = sub.add_parser("status", help="Show FORGE queue digest or specific build status")
     p_st.add_argument("--build-id", default="", help="Specific build ID")
@@ -1356,10 +2254,47 @@ def main():
 
     p_boot = sub.add_parser("reconcile", help="Run boot reconciliation and worktree cleanup")
 
+    # Native `forge.py job <action>` subcommands (absorbs detached_runner.py)
+    p_job = sub.add_parser("job", help="Manage detached background shell jobs in forge_jobs")
+    job_sub = p_job.add_subparsers(dest="job_action", required=True)
+
+    j_start = job_sub.add_parser("start", help="Spawn a detached background job")
+    j_start.add_argument("--command", "-c", required=True, help="Shell command to execute")
+    j_start.add_argument("--channel", default="zero-chat", help="Originating Discord channel")
+    j_start.add_argument("--name", "-n", default="", help="Human-readable name for the job")
+    j_start.add_argument("--timeout", "-t", type=int, default=3600, help="Timeout in seconds")
+    j_start.add_argument("--cwd", default="/workspace", help="Working directory")
+    j_start.add_argument("--notify-on-success", action="store_true", default=True)
+    j_start.add_argument("--silent-on-success", dest="notify_on_success", action="store_false")
+    j_start.add_argument("--no-synthesize", dest="synthesize", action="store_false", default=True)
+    j_start.add_argument("--allow-duplicate", action="store_true", default=False)
+
+    j_status = job_sub.add_parser("status", help="Check status of a detached job")
+    j_status.add_argument("task_id", help="Job ID")
+
+    j_list = job_sub.add_parser("list", help="List recent detached jobs")
+    j_list.add_argument("--limit", type=int, default=10)
+
+    j_cancel = job_sub.add_parser("cancel", help="Cancel a running detached job")
+    j_cancel.add_argument("task_id", help="Job ID")
+
+    j_logs = job_sub.add_parser("logs", help="Tail logs for a detached job")
+    j_logs.add_argument("task_id", help="Job ID")
+    j_logs.add_argument("--lines", "-n", type=int, default=30)
+
+    # Internal workers
+    p_bw = sub.add_parser("_build_worker", help=argparse.SUPPRESS)
+    p_bw.add_argument("build_id", help="Build ID")
+    p_bw.add_argument("--db-path", default=str(FORGE_DB_PATH))
+
+    p_jw = sub.add_parser("_job_worker", help=argparse.SUPPRESS)
+    p_jw.add_argument("task_id", help="Task ID")
+    p_jw.add_argument("--db-path", default=str(FORGE_DB_PATH))
+
     args = parser.parse_args()
     if args.cmd == "enqueue":
         plan_data = json.loads(Path(args.plan_file).read_text(encoding="utf-8"))
-        res = enqueue_build(plan_data, post_widget=not args.no_widget)
+        res = enqueue_build(plan_data, post_widget=not args.no_widget, allow_overlap=args.allow_overlap)
         print(json.dumps(res, indent=2))
     elif args.cmd == "status":
         if args.build_id:
@@ -1380,6 +2315,43 @@ def main():
         print(json.dumps(res, indent=2))
     elif args.cmd == "reconcile":
         print(json.dumps(reconcile_forge_on_boot(), indent=2))
+    elif args.cmd == "_build_worker":
+        sup = ForgeSupervisor(db_path=args.db_path)
+        sup.run_build_pipeline(args.build_id)
+    elif args.cmd == "_job_worker":
+        _run_job_worker(args.task_id, db_path=args.db_path)
+    elif args.cmd == "job":
+        if args.job_action == "start":
+            res = start_job(
+                command=args.command,
+                channel=args.channel,
+                name=args.name,
+                timeout=args.timeout,
+                cwd=args.cwd,
+                notify_on_success=args.notify_on_success,
+                synthesize=args.synthesize,
+                allow_duplicate=args.allow_duplicate,
+            )
+            print(json.dumps(res, indent=2))
+        elif args.job_action == "status":
+            print(json.dumps(get_job_status(args.task_id), indent=2))
+        elif args.job_action == "list":
+            print(json.dumps(list_jobs(limit=args.limit), indent=2))
+        elif args.job_action == "cancel":
+            print(json.dumps(cancel_job(args.task_id), indent=2))
+        elif args.job_action == "logs":
+            meta = _read_job_meta(args.task_id)
+            if not meta:
+                print(f"Error: Task '{args.task_id}' not found.", file=sys.stderr)
+                sys.exit(1)
+            log_path = Path(meta["log_file"])
+            if not log_path.exists():
+                print("Log file empty or not yet created.")
+                sys.exit(0)
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+                tail = lines[-args.lines:] if len(lines) > args.lines else lines
+                sys.stdout.write("".join(tail))
 
 
 if __name__ == "__main__":

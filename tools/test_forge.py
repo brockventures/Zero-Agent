@@ -1,12 +1,14 @@
 """
-test_forge.py — Comprehensive Unit Tests for FORGE Engine & Zero-Vault Encryption.
+test_forge.py — Comprehensive Unit Tests for FORGE v1.1 Engine & Zero-Vault Encryption.
 
 Covers:
 1. Activity-Renewed Lease & 4-Signal Heartbeat Tracker (SDK tasks, subagent transcripts, runaway loops).
-2. ForgePlan Validation, Multi-Chunk Enqueueing, Prompt Hydration, and Originating Channel Notification.
-3. Deterministic Maker-Checker Worktree Gate & Prohibited File Boundary Enforcement.
-4. Decisions Framework (Approve / Edit / Dismiss, TTL Expiry, Privacy Filtering in /queue).
-5. Zero-Vault AES-256-GCM Secret Archive Encryption & Round-Trip Decryption + Platform Rule Size Guard.
+2. ForgePlan Validation, Build `objective`, Per-Chunk `repo`, Turn-0 `target_symbols` AST Hydration,
+   `shared_context` Exemplars, and Pre-Enqueue Target-File Overlap Deduplication.
+3. Optional `verification_cmd` with Automatic Baseline Fallback + Prohibited File Boundary Guard.
+4. Native `forge.py job` Detached Runner Lifecycle (`start_job`, `_run_job_worker`, `get_job_status`, `cancel_job`).
+5. Decisions Framework (Approve / Edit / Dismiss, TTL Expiry, Privacy Filtering in /queue).
+6. Zero-Vault AES-256-GCM Secret Archive Encryption & Round-Trip Decryption + Platform Rule Size Guard.
 """
 
 import json
@@ -15,31 +17,41 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import sys
 if "/workspace" not in sys.path:
     sys.path.insert(0, "/workspace")
 
+import tools.forge as forge_mod
 from tools.forge import (
     FORGE_CHANNEL_ID,
     OWNER_USER_ID,
     ZERO_CHAT_CHANNEL_ID,
     ZERO_OPS_CHANNEL_ID,
     HeartbeatTracker,
+    _read_job_meta,
+    _run_job_worker,
+    _write_job_meta,
+    build_default_verification_cmd,
+    cancel_job,
     check_runaway_tool_loop,
+    check_target_file_overlap,
     dismiss_decision,
     dispatch_build_completion_to_origin,
     enqueue_build,
     execute_decision,
     expire_stale_decisions,
+    extract_symbol_snippet,
     format_chunk_prompt,
     format_origin_completion_envelope,
     format_queue_digest,
+    get_job_status,
     init_forge_db,
+    list_jobs,
     render_build_widget_text,
     stage_decision,
-    validate_forge_plan,
+     validate_forge_plan,
     verify_chunk_worktree,
 )
 from tools.vault_sync import decrypt_secrets_archive, encrypt_secrets_archive
@@ -54,7 +66,7 @@ class TestForgeEngine(unittest.TestCase):
     def tearDown(self):
         self.tmp_dir.cleanup()
 
-    def test_01_validate_and_enqueue_forge_plan(self):
+    def test_01_validate_and_enqueue_forge_plan_v1_1_features(self):
         # Missing context_fact_sheet should fail validation
         bad_plan = {
             "title": "Bad Plan",
@@ -67,13 +79,22 @@ class TestForgeEngine(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("context_fact_sheet", reason)
 
-        # Valid 2-chunk plan
+        # Valid 2-chunk plan with v1.1 features:
+        # - `objective` field
+        # - `shared_context` exemplars
+        # - `target_symbols` AST pre-hydration
+        # - optional `verification_cmd` (omitted on Chunk 2)
+        # - per-chunk `repo`
         good_plan = {
             "title": "Upgrade Telemetry & Queue Engine",
+            "objective": "Eliminate turn-0 discovery reads by pre-hydrating AST symbol slices into chunk prompts.",
             "origin_channel_id": ZERO_OPS_CHANNEL_ID,
             "origin_thread_id": 1599999999999999999,
             "repo": "/workspace",
             "tier": 3,
+            "shared_context": [
+                "Exemplar: Always open SQLite connections via get_db_connection(db_path)."
+            ],
             "context_fact_sheet": [
                 "Use WAL mode on SQLite connections.",
                 "Never block interactive channel turns over 90 seconds.",
@@ -81,8 +102,11 @@ class TestForgeEngine(unittest.TestCase):
             "chunks": [
                 {
                     "title": "Build SQLite Schema",
+                    "repo": "/workspace",
                     "worker_model": "gemini-3.8-flash-high",
                     "target_files": ["tools/forge.py"],
+                    "target_symbols": ["validate_forge_plan"],
+                    "shared_context": ["Chunk Exemplar: Return (bool, str) from validators."],
                     "prohibited_files": ["tools/bridge.py"],
                     "instructions": "Create SQLite WAL schema and connection helpers with full unit tests.",
                     "verification_cmd": "pytest tools/test_forge.py",
@@ -93,7 +117,7 @@ class TestForgeEngine(unittest.TestCase):
                     "target_files": ["tools/bridge.py"],
                     "prohibited_files": [],
                     "instructions": "Add /queue slash command to bridge.py and verify output formatting.",
-                    "verification_cmd": "pytest tools/test_forge.py",
+                    # Omit verification_cmd to test v1.1 optional fallback!
                 },
             ],
         }
@@ -106,22 +130,43 @@ class TestForgeEngine(unittest.TestCase):
         self.assertEqual(res["forge_channel_id"], FORGE_CHANNEL_ID)
         build_id = res["build_id"]
 
+        # Test Amos's Queue-Level Target-File Overlap Guard
+        overlapping_plan = dict(good_plan)
+        overlapping_plan["title"] = "Conflicting Concurrent Build"
+        overlaps = check_target_file_overlap(overlapping_plan, db_path=self.db_path)
+        self.assertTrue(len(overlaps) >= 1)
+        self.assertEqual(overlaps[0]["file"], "tools/forge.py")
+        with self.assertRaises(ValueError) as ctx:
+            enqueue_build(overlapping_plan, db_path=self.db_path, post_widget=False)
+        self.assertIn("Target file overlap detected", str(ctx.exception))
+
         # Verify widget rendering and chunk prompt hydration
         widget = render_build_widget_text(build_id, db_path=self.db_path)
         self.assertIn("Upgrade Telemetry & Queue Engine", widget)
+        self.assertIn("Eliminate turn-0 discovery reads", widget)
         self.assertIn("0/2 chunk(s) merged", widget)
         self.assertIn("gemini-3.8-flash-high", widget)
 
-        prompt_c0 = format_chunk_prompt(build_id, 0, db_path=self.db_path, worktree_dir="/tmp/forge-wt-test")
+        prompt_c0 = format_chunk_prompt(build_id, 0, db_path=self.db_path, worktree_dir="/workspace")
         self.assertIn("Use WAL mode on SQLite connections.", prompt_c0)
+        self.assertIn("**Overall Build Objective (Why):** Eliminate turn-0 discovery reads", prompt_c0)
+        self.assertIn("Exemplar: Always open SQLite connections", prompt_c0)
+        self.assertIn("Chunk Exemplar: Return (bool, str) from validators.", prompt_c0)
+        self.assertIn("Pre-Hydrated Target Symbol Slices (Turn-0 Fast-Path Context):", prompt_c0)
+        self.assertIn("def validate_forge_plan", prompt_c0)
         self.assertIn("**Prohibited Files (DO NOT MODIFY):** `tools/bridge.py`", prompt_c0)
         self.assertIn("DO NOT implement the following upcoming chunks", prompt_c0)
         self.assertIn("Chunk 2: Wire Bridge Slash Command", prompt_c0)
+
+        # Verify Chunk 1 (index 1) auto-synthesizes baseline verification_cmd when omitted
+        prompt_c1 = format_chunk_prompt(build_id, 1, db_path=self.db_path, worktree_dir="/workspace")
+        self.assertIn("python3 -m py_compile", prompt_c1)
 
         # Verify originating-channel completion envelope
         env_text = format_origin_completion_envelope(build_id, db_path=self.db_path)
         self.assertIn(build_id, env_text)
         self.assertIn("touches_core_bridge=true", env_text)
+        self.assertIn("auto-baseline", env_text)
 
         with patch("tools.outbox.queue_outbox_message") as mock_outbox:
             ok = dispatch_build_completion_to_origin(build_id, db_path=self.db_path)
@@ -131,7 +176,6 @@ class TestForgeEngine(unittest.TestCase):
             self.assertEqual(mock_outbox.call_args.kwargs["msg_type"], "agent_turn")
 
     def test_02_decisions_framework_and_privacy_filter(self):
-        # 1. Stage a public ops decision in #zero-ops
         d_ops = stage_decision(
             category="homelab",
             title="Restart Z-Wave JS UI",
@@ -141,7 +185,6 @@ class TestForgeEngine(unittest.TestCase):
             channel_id=ZERO_OPS_CHANNEL_ID,
             db_path=self.db_path,
         )
-        # 2. Stage a private email decision in #zero-chat
         d_priv = stage_decision(
             category="email",
             title="Send Contractor Reply",
@@ -152,33 +195,27 @@ class TestForgeEngine(unittest.TestCase):
             db_path=self.db_path,
         )
 
-        # Running /queue in #zero-ops must hide the private #zero-chat decision
         digest_ops = format_queue_digest(request_channel_id=ZERO_OPS_CHANNEL_ID, db_path=self.db_path)
         self.assertIn("Restart Z-Wave JS UI", digest_ops)
         self.assertNotIn("Send Contractor Reply", digest_ops)
 
-        # Running /queue in #zero-chat shows both
         digest_priv = format_queue_digest(request_channel_id=ZERO_CHAT_CHANNEL_ID, db_path=self.db_path)
         self.assertIn("Restart Z-Wave JS UI", digest_priv)
         self.assertIn("Send Contractor Reply", digest_priv)
 
-        # Unauthorized user cannot approve
         unauth = execute_decision(d_ops["decision_id"], user_id=999999, db_path=self.db_path)
         self.assertFalse(unauth["ok"])
 
-        # Authorized user approves -> executes in <1s and produces receipt
         exec_res = execute_decision(d_ops["decision_id"], user_id=OWNER_USER_ID, db_path=self.db_path)
         self.assertTrue(exec_res["ok"])
         self.assertEqual(exec_res["status"], "approved")
         self.assertIn("restarted zwave", exec_res["receipt"])
         self.assertIn("Approved & Executed", exec_res["formatted_card"])
 
-        # Dismiss the second decision
         dis_res = dismiss_decision(d_priv["decision_id"], user_id=OWNER_USER_ID, db_path=self.db_path)
         self.assertTrue(dis_res["ok"])
         self.assertEqual(dis_res["status"], "dismissed")
 
-        # Stage an already-expired decision and verify expire_stale_decisions
         d_exp = stage_decision(
             category="homelab",
             title="Stale Action",
@@ -203,17 +240,13 @@ class TestForgeEngine(unittest.TestCase):
         tracker = HeartbeatTracker(conv_id=conv_id, brain_dir=brain_root)
         self.assertFalse(tracker.poll_disk_progress())
 
-        # Create an active SDK task log and verify heartbeat detection
         task_log = tasks_dir / "task-1.log"
         task_log.write_text("Step 1 output...\n", encoding="utf-8")
         self.assertTrue(tracker.poll_disk_progress())
-        # Second poll without new bytes returns False
         self.assertFalse(tracker.poll_disk_progress())
-        # Append bytes -> returns True
         task_log.write_text("Step 1 output...\nStep 2 output...\n", encoding="utf-8")
         self.assertTrue(tracker.poll_disk_progress())
 
-        # Test 3-strike runaway tool loop detector
         tfile = logs_dir / "transcript.jsonl"
         entries = [
             {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "fix bug"},
@@ -232,14 +265,14 @@ class TestForgeEngine(unittest.TestCase):
         self.assertTrue(is_loop)
         self.assertIn("Runaway tool loop", reason)
 
-    def test_04_verify_chunk_worktree_and_boundary_guard(self):
+    def test_04_verify_chunk_worktree_and_optional_baseline_fallback(self):
         wt_dir = Path(self.tmp_dir.name) / "wt_repo"
         wt_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "init", "-b", "main"], cwd=str(wt_dir), check=True, capture_output=True)
         subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(wt_dir), check=True, capture_output=True)
         subprocess.run(["git", "config", "user.name", "Zero"], cwd=str(wt_dir), check=True, capture_output=True)
 
-        (wt_dir / "allowed.py").write_text("x = 1\n", encoding="utf-8")
+        (wt_dir / "allowed.py").write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
         (wt_dir / "prohibited.py").write_text("y = 1\n", encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=str(wt_dir), check=True, capture_output=True)
         subprocess.run(["git", "commit", "-m", "init"], cwd=str(wt_dir), check=True, capture_output=True)
@@ -250,14 +283,60 @@ class TestForgeEngine(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("Boundary violation", err)
 
-        # Restore prohibited file and modify allowed file -> passes
+        # Restore prohibited file and modify allowed file -> passes even with empty verification_cmd (baseline fallback)
         subprocess.run(["git", "checkout", "prohibited.py"], cwd=str(wt_dir), check=True, capture_output=True)
-        (wt_dir / "allowed.py").write_text("x = 2\n", encoding="utf-8")
-        passed, diff_stat, err = verify_chunk_worktree(wt_dir, "python3 -c 'import allowed; assert allowed.x == 2'", prohibited_files=["prohibited.py"])
+        (wt_dir / "allowed.py").write_text("def greet():\n    return 'hello'\n", encoding="utf-8")
+        passed, diff_stat, err = verify_chunk_worktree(
+            wt_dir,
+            "",
+            prohibited_files=["prohibited.py"],
+            target_files=["allowed.py"],
+        )
         self.assertTrue(passed, err)
         self.assertIn("1 file changed", diff_stat)
 
-    def test_05_vault_aes256_gcm_roundtrip_and_rule_platform_limits(self):
+        # Verify AST symbol extractor on allowed.py
+        snip = extract_symbol_snippet(wt_dir / "allowed.py", "greet")
+        self.assertIn("def greet():", snip)
+
+    def test_05_native_forge_job_runner(self):
+        tasks_tmp = Path(self.tmp_dir.name) / "tasks"
+        tasks_tmp.mkdir(parents=True, exist_ok=True)
+        with patch.object(forge_mod, "TASKS_DIR", tasks_tmp), patch("tools.outbox.queue_outbox_message") as mock_outbox:
+            task_id = "dt-test-native-job"
+            t_dir = tasks_tmp / task_id
+            t_dir.mkdir(parents=True, exist_ok=True)
+            log_file = t_dir / "run.log"
+            log_file.write_text("Job output line 1\n", encoding="utf-8")
+
+            meta = {
+                "task_id": task_id,
+                "name": "Native Forge Job",
+                "command": "echo ok",
+                "channel": "zero-chat",
+                "timeout": 60,
+                "cwd": "/workspace",
+                "status": "starting",
+                "notify_on_success": False,
+                "log_file": str(log_file),
+                "start_time": time.time(),
+            }
+            _write_job_meta(task_id, meta, db_path=self.db_path)
+
+            mock_proc = MagicMock()
+            mock_proc.wait.return_value = 0
+            mock_proc.pid = 88888
+            with patch("subprocess.Popen", return_value=mock_proc):
+                _run_job_worker(task_id, db_path=self.db_path)
+
+            mock_outbox.assert_not_called()
+            st = get_job_status(task_id, db_path=self.db_path)
+            self.assertEqual(st["status"], "completed")
+            self.assertEqual(st["exit_code"], 0)
+            jobs = list_jobs(limit=5, db_path=self.db_path)
+            self.assertTrue(any(j["task_id"] == task_id for j in jobs))
+
+    def test_06_vault_aes256_gcm_roundtrip_and_rule_platform_limits(self):
         sec_dir = Path(self.tmp_dir.name) / "mock_secrets"
         sec_dir.mkdir(parents=True, exist_ok=True)
         (sec_dir / "env.json").write_text('{"MOCK_KEY": "super-secret"}', encoding="utf-8")
@@ -268,14 +347,12 @@ class TestForgeEngine(unittest.TestCase):
         enc_res = encrypt_secrets_archive(secrets_dir=sec_dir, output_file=out_enc, key_path=key_file)
         self.assertEqual(enc_res["included_count"], 2)
         self.assertTrue(out_enc.exists())
-        # Verify encrypted file does not contain plaintext secret
         raw_cipher = out_enc.read_bytes()
         self.assertNotIn(b"super-secret", raw_cipher)
 
         members = decrypt_secrets_archive(encrypted_file=out_enc, key_path=key_file)
         self.assertEqual(sorted(members), ["env.json", "pii_rules.json"])
 
-        # Verify Antigravity platform rule file size limits (<= 24,000 bytes per file)
         agents_md = Path("/workspace/agents.md")
         self.assertLessEqual(agents_md.stat().st_size, 24000)
         for rule_file in Path("/workspace/.agents/rules").glob("*.md"):
