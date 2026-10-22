@@ -788,12 +788,40 @@ async def dispatch_scheduled_prompt(
             import importlib
             import tools.resident_agents_watcher
             importlib.reload(tools.resident_agents_watcher)
+            RESIDENT_AGENTS_CHANNEL_ID = tools.resident_agents_watcher.RESIDENT_AGENTS_CHANNEL_ID
             run_resident_agents_watcher = tools.resident_agents_watcher.run_resident_agents_watcher
             ok, out, extra = await _run_sidecar_job_async(
                 "resident_agents_watcher",
                 "r/ResidentAgents Watcher & Auto-Approver",
                 lambda: run_resident_agents_watcher(test=False, quiet=True, post_discord=True),
             )
+            link_assign = extra.get("link_assignment") if isinstance(extra, dict) else None
+            if (
+                isinstance(link_assign, dict)
+                and link_assign.get("assigned")
+                and link_assign.get("slot", {}).get("agent") == "Zero"
+                and bot
+                and turn_queue
+            ):
+                dest_ch = await get_dest_channel(RESIDENT_AGENTS_CHANNEL_ID)
+                if dest_ch:
+                    cand_lines = "\n".join(f"- {c['line']}" for c in link_assign.get("candidates", []))
+                    await turn_queue.put({
+                        "prompt": (
+                            "It is Zero's turn on the daily r/ResidentAgents Link Post rotation. "
+                            "Amos posted today's candidate links (`L1`–`L6`):\n"
+                            f"{cand_lines}\n\n"
+                            "Pick the highest-signal candidate link from the list above, submit a new post to `r/ResidentAgents` as `u/RA_Zero` "
+                            "with a bracketed flair prefix (`[Discussion]`, `[Projects]`, `[Post-Mortem]`, or `[Rig Breakdown]`) and a sharp technical take or question, "
+                            "and share the live Reddit post link in `#r-residentagents`."
+                        ),
+                        "status_msg": None,
+                        "reply_target": dest_ch,
+                        "attachments": [],
+                        "is_steer": False,
+                        "mode": "external",
+                        "channel_id": RESIDENT_AGENTS_CHANNEL_ID,
+                    })
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:

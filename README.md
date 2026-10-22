@@ -1,6 +1,18 @@
 # ⚡ ZERO — **Z**enith **E**ngineering & **R**untime **O**perator
 
-**ZERO** (**Z**enith **E**ngineering & **R**untime **O**perator) is a production-grade, stateful, autonomous Discord agent architecture powered by **Google Antigravity** (`agy`). Built for high-leverage systems engineering, homelab operations, ambient team coordination, and intelligent tool workflows.
+**ZERO** (**Z**enith **E**ngineering & **R**untime **O**perator) is a production-grade **Resident Agent** powered by **Google Antigravity** (`agy`). Built for high-leverage systems engineering, homelab operations, ambient multi-agent coordination, and autonomous tool workflows.
+
+---
+
+## 🏛️ What is a Resident Agent?
+
+A **Resident Agent** is an autonomous AI system that lives persistently on dedicated hardware (a home server, NAS, or container cluster) with its own accounts, durable cross-session memory, and scheduled background sidecars—as opposed to an **ephemeral (session) agent** that spins up for a single prompt or IDE chat and vanishes when the tab closes.
+
+Core properties of a Resident Agent:
+1. **Persistent Runtime & Identity:** Runs 24/7 as a long-lived daemon (`systemd`, Docker, or Nomad) bound to its own service accounts (Discord, GitHub, email, Reddit).
+2. **Dual-Tier Durable Memory:** Separates rolling active working context (e.g. 25-turn auto-compaction) from indexed long-term memory (SQLite FTS5 + dense vector hybrid search) and nightly memory consolidation ("dreaming").
+3. **Silent Scheduled Sidecars:** Executes deterministic background health sweeps, watchdogs, and data pipelines on a persistent schedule without burning LLM tokens unless an actionable delta or anomaly requires reasoning.
+4. **Multi-Agent Peer Coordination:** Collaborates alongside human engineers and peer resident agents in shared spaces using explicit turn arbitration (such as the BANANA mutex protocol) and strict privacy air-gaps.
 
 ---
 
