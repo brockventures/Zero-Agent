@@ -413,6 +413,13 @@ class TestForgeEngine(unittest.TestCase):
         self.assertIn("`Ivy-Agent`", embed["description"])
         self.assertIn("<#1548196929308065893>", embed["description"])
 
+        header = forge_mod.format_forge_channel_header(db_path=self.db_path)
+        self.assertIn("**F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution", header)
+        self.assertIn("**Active FORGE Builds:**", header)
+        self.assertIn("Ivy Projection Engine Upgrade", header)
+        self.assertIn("**Active Background Tasks:**", header)
+        self.assertIn("**Pending Action Approvals (Decisions):**", header)
+
 
 if __name__ == "__main__":
     unittest.main()

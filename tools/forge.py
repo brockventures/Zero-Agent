@@ -60,6 +60,7 @@ DEFAULT_BRAIN_DIR = Path("/root/.gemini/antigravity-cli/brain")
 PT_TZ = ZoneInfo("America/Los_Angeles")
 
 FORGE_CHANNEL_ID = 1562899941595160657
+FORGE_HEADER_MESSAGE_ID = 1562903902188208212
 ZERO_CHAT_CHANNEL_ID = 1542081375287640084
 ZERO_OPS_CHANNEL_ID = 1544953279664889888
 BASEBALL_CHANNEL_ID = 1548196929308065893
@@ -887,6 +888,7 @@ def enqueue_build(
     msg_id = None
     if post_widget:
         msg_id = post_or_update_build_widget(build_id, db_path=db_path)
+        sync_forge_channel_header(db_path=db_path)
 
     # Immediately trigger background worker if enqueued against production forge.db
     if Path(db_path).resolve() == FORGE_DB_PATH.resolve():
@@ -1250,9 +1252,10 @@ class ForgeSupervisor:
         self._active_build_proc: Optional[subprocess.Popen] = None
 
     def tick_sync(self) -> dict:
-        """Synchronous housekeeping tick: expire stale decisions, prune 1h completed #forge cards, dispatch SDK tasks, and advance queued builds."""
+        """Synchronous housekeeping tick: expire stale decisions, prune 1h completed #forge cards, sync header, dispatch SDK tasks, and advance queued builds."""
         expired = expire_stale_decisions(db_path=self.db_path)
         pruned_widgets = prune_completed_build_widgets(db_path=self.db_path)
+        sync_forge_channel_header(db_path=self.db_path)
         dispatched_sdk = []
         try:
             from tools.task_settle import check_and_dispatch_completed_tasks
@@ -1492,6 +1495,7 @@ class ForgeSupervisor:
                     subprocess.run(["git", "push", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=30)
 
                 post_or_update_build_widget(build_id, db_path=self.db_path)
+                sync_forge_channel_header(db_path=self.db_path)
                 if remaining == 0:
                     dispatch_build_completion_to_origin(build_id, db_path=self.db_path)
                 return True
@@ -1725,6 +1729,7 @@ def start_job(
             if not updated_meta.get("worker_pid"):
                 updated_meta["worker_pid"] = proc.pid
                 _write_job_meta(task_id, updated_meta, db_path=db_path)
+            sync_forge_channel_header(db_path=db_path)
 
             return updated_meta
         finally:
@@ -1828,6 +1833,7 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
     fresh_meta["end_time"] = end_ts
     fresh_meta["duration_seconds"] = duration
     _write_job_meta(task_id, fresh_meta, db_path=db_path)
+    sync_forge_channel_header(db_path=db_path)
 
     dur_str = _format_duration(duration)
     notify_on_success = fresh_meta.get("notify_on_success", False)
@@ -2386,6 +2392,86 @@ def format_queue_digest(
             lines.append(f"- {icon} `{rb['id']}`: {rb['title']} ({_now_pt_str(rb['updated_at'])})")
 
     return "\n".join(lines)
+
+
+def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
+    """Render the live #forge top header message with backronym and active queues."""
+    with get_db_connection(db_path) as conn:
+        builds = conn.execute(
+            "SELECT * FROM forge_builds WHERE status IN ('queued', 'running', 'awaiting_approval') ORDER BY created_at DESC LIMIT 10"
+        ).fetchall()
+        jobs = conn.execute(
+            "SELECT * FROM forge_jobs WHERE status IN ('starting', 'running') ORDER BY start_time DESC LIMIT 10"
+        ).fetchall()
+        decisions = conn.execute(
+            "SELECT * FROM forge_decisions WHERE status = 'pending' AND is_private = 0 ORDER BY created_at ASC"
+        ).fetchall()
+
+    lines = [
+        "### ⚒️ FORGE — **F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution",
+        "",
+        "**Active FORGE Builds:**",
+    ]
+    if not builds:
+        lines.append("- *No active multi-chunk builds in queue.*")
+    else:
+        for b in builds:
+            lines.append(
+                f"- 🔨 **`{b['id']}` — {b['title']}** (`{b['status'].upper()}` · <#{b['origin_thread_id'] or b['origin_channel_id']}>)"
+            )
+
+    lines.append("\n**Active Background Tasks:**")
+    if not jobs:
+        lines.append("- *No detached background tasks currently running.*")
+    else:
+        for j in jobs:
+            lines.append(f"- ⚙️ **`{j['id']}` — {j['name']}** (`{j['status']}` · `{j['channel']}`)")
+
+    lines.append("\n**Pending Action Approvals (Decisions):**")
+    if not decisions:
+        lines.append("- *Zero pending approval cards.*")
+    else:
+        for d in decisions:
+            lines.append(
+                f"- 🛡️ **`{d['id']}` [{d['category'].upper()}] {d['title']}** in <#{d['channel_id']}> — {d['summary'][:100]}"
+            )
+
+    return "\n".join(lines)
+
+
+def sync_forge_channel_header(
+    db_path: Path | str = FORGE_DB_PATH,
+    forge_channel_id: int = FORGE_CHANNEL_ID,
+    header_message_id: int = FORGE_HEADER_MESSAGE_ID,
+    force: bool = False,
+) -> bool:
+    """Update the #forge header message in place whenever active builds, tasks, or decisions change."""
+    if not force and Path(db_path).resolve() != FORGE_DB_PATH.resolve():
+        return False
+
+    content = format_forge_channel_header(db_path=db_path)
+    cache_file = DATA_DIR / ".forge_header_cache.txt"
+    if not force and cache_file.exists():
+        try:
+            if cache_file.read_text(encoding="utf-8") == content:
+                return False
+        except Exception:
+            pass
+
+    token = _get_discord_token()
+    if not token:
+        return False
+
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+    url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{header_message_id}"
+    try:
+        resp = requests.patch(url, headers=headers, json={"content": content[:1990], "embeds": []}, timeout=10)
+        if resp.status_code < 300:
+            cache_file.write_text(content, encoding="utf-8")
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # ---------------------------------------------------------------------------
