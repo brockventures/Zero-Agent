@@ -550,18 +550,18 @@ def score_seeding_thread(post_data: Dict[str, Any], now_utc: Optional[float] = N
 
 
 def generate_seeding_comment_draft(candidate: Dict[str, Any]) -> str:
-    """Synthesize a concise, practitioner-grade technical reply as u/prime416 that naturally uses 'resident agent'."""
+    """Synthesize a casual, human-sounding comment in Ryan's voice (u/prime416) that naturally uses 'resident agent'."""
     title = candidate.get("title", "")
     selftext = (candidate.get("selftext") or "")[:600]
     subreddit = candidate.get("subreddit", "LocalLLaMA")
     prompt = (
-        f"You are writing a concise, high-signal Reddit comment as a staff engineer on r/{subreddit}.\n"
+        f"You are Ryan (u/prime416), a tech PM and homelab builder, writing a casual, conversational Reddit comment on r/{subreddit}.\n"
         f"Thread Title: {title}\n"
         f"Thread Body: {selftext}\n\n"
         f"Rules:\n"
-        f"1. Write 2 to 4 sentences of genuinely useful, concrete systems engineering advice or experience directly answering the OP's topic (e.g. SQLite FTS5 + dense vector hybrid memory, rolling 25-turn compaction, persistent JSON sidecars, detached task runners, or multi-agent turn mutexes).\n"
-        f"2. Naturally use the lowercase architectural noun phrase 'resident agent' (or 'resident agents') ONCE to contrast persistent, stateful, always-on agents running on dedicated hardware against ephemeral session/chat agents.\n"
-        f"3. NEVER link to or mention 'r/ResidentAgents' or any subreddit name, NEVER sound like an ad or pitch, and NEVER use AI cliches ('delve', 'testament', 'seamless', 'game-changer').\n"
+        f"1. Write 2 to 3 short, natural sentences in first-person ('I', 'my friends and I'). Sound like a normal human chatting on Reddit—relaxed, direct, personal, and slightly wry. NO dense acronym soup, NO textbook lecturing, and NO stiff SWE jargon.\n"
+        f"2. Share a relatable real-world observation or ask a genuine follow-up question about how they handle keeping it running day-to-day, while casually using the phrase 'resident agent' (or 'resident agents') ONCE (e.g., 'I run a resident agent on my home NAS and ran into the exact same thing with memory...', or 'My friends and I each run resident agents at home and...').\n"
+        f"3. NEVER link to or mention 'r/ResidentAgents' or any subreddit name, NEVER sound like an ad, and NEVER use AI cliches.\n"
         f"4. Output ONLY the raw comment text, nothing else."
     )
     try:
@@ -577,7 +577,7 @@ def generate_seeding_comment_draft(candidate: Dict[str, Any]) -> str:
             )
             if res.returncode == 0 and res.stdout.strip():
                 draft = res.stdout.strip().strip('"')
-                if "resident agent" in draft.lower() and "r/residentagents" not in draft.lower() and len(draft.split()) >= 15:
+                if "resident agent" in draft.lower() and "r/residentagents" not in draft.lower() and len(draft.split()) >= 12:
                     return draft
     except Exception as e:
         log.warning("LLM seeding draft fallback: %s", e)
@@ -585,17 +585,15 @@ def generate_seeding_comment_draft(candidate: Dict[str, Any]) -> str:
     combined = f"{title} {selftext}".lower()
     if "memory" in combined or "context" in combined or "compaction" in combined:
         return (
-            "Once you move from ephemeral chat sessions to a persistent resident agent running 24/7, full-history context injection breaks down fast. "
-            "What worked for us is splitting memory into a rolling 25-turn compaction window for active state and an indexed SQLite FTS5 + dense vector store for historical recall, so old facts only load when queried."
+            "I ran into this exact headache once I moved from one-off chat sessions to running a resident agent 24/7 on my home NAS. "
+            "If you don't separate recent working context from a searchable long-term memory store, it starts forgetting things from two days ago or hallucinating stale facts—how are you deciding what gets saved long-term?"
         )
     if "cron" in combined or "schedule" in combined or "heartbeat" in combined or "daemon" in combined:
         return (
-            "The biggest shift when running a resident agent on dedicated hardware is decoupling scheduled background checks from interactive LLM turns. "
-            "We run deterministic Python sidecars on a persistent JSON schedule that stay 100% silent when nominal and only wake the model turn queue when an actionable delta or failure occurs."
+            "Love seeing more people building setups like this. I run a resident agent at home and ended up moving all the recurring checks into silent background scripts so it only wakes the model when something actually breaks—otherwise it burns through quota just saying everything is fine."
         )
     return (
-        "Treating it as a stateful resident agent rather than an ephemeral chat wrapper makes a huge difference for reliability. "
-        "Running the agent loop inside a persistent container with deterministic pre-flight hooks, scoped tool permissions, and a durable SQLite state store keeps multi-week sessions from drifting."
+        "This is super cool. A few friends and I each run a resident agent on our home servers 24/7 and keeping state clean across multi-day runs is easily the hardest part—how has this held up for you over a few days of continuous use?"
     )
 
 
@@ -722,8 +720,8 @@ def poll_and_remediate_via_pixel(
     today_seeding_count = int(seeding_posts_by_date.get(today_str, 0))
     should_scan_seeding = run_seeding or (
         (now_ts - float(state.get("last_seeding_scan_ts") or 0)) >= 3600
-        and today_seeding_count < 3
-        and (now_ts - float(state.get("last_seeding_post_ts") or 0)) >= 7200
+        and today_seeding_count < 5
+        and (now_ts - float(state.get("last_seeding_post_ts") or 0)) >= 5400
     )
 
     with pixel_session(force=force_pixel) as cdp_url:
