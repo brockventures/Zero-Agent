@@ -18,16 +18,25 @@ from tools.resident_agents_watcher import (
     REDDIT_HANDLE_TO_DISCORD_SNOWFLAKE,
     RESIDENT_AGENTS_CHANNEL_ID,
     build_upvote_targets_for_reply,
+    check_and_assign_daily_links,
     classify_item_needs_approval,
     detect_desired_flair,
+    find_unassigned_daily_links_message,
+    format_daily_link_assignment_prompt,
     format_daily_tip_prompt,
     format_notification_card,
     format_peer_side_project_card,
+    format_seeding_card,
+    generate_seeding_comment_draft,
+    get_daily_link_assignee,
     get_daily_tip_assignee,
     load_state,
+    parse_candidate_links,
+    run_resident_agents_daily_links,
     run_resident_agents_daily_tip,
     run_resident_agents_watcher,
     save_state,
+    score_seeding_thread,
 )
 
 
@@ -87,6 +96,126 @@ def test_daily_tip_rotation_and_dispatcher(tmp_path: Path) -> None:
         assert ok2 is True
         assert extra2.get("skipped_duplicate") is True
         assert mock_enq.call_count == 1
+
+
+def test_daily_link_parsing_and_assignment(tmp_path: Path) -> None:
+    fake_state_file = tmp_path / "state.json"
+
+    # Verify daily link assignee is staggered by +1 from daily tip assignee so one bot never gets both on the same day
+    for d in ("2026-10-21", "2026-10-22", "2026-10-23"):
+        tip_slot = get_daily_tip_assignee(d)
+        link_slot = get_daily_link_assignee(d)
+        assert tip_slot["agent"] != link_slot["agent"]
+
+    amos_text = (
+        "## r/ResidentAgents link candidates · 2026-10-22\n"
+        "- **L1** · [SQLite WAL Concurrency in Multi-Agent Daemons](<https://example.com/sqlite-wal>) · Hacker News\n"
+        "  -# Deep dive on busy_timeout and lock contention.\n"
+        "- `L2`: https://arxiv.org/abs/2610.12345 — Episodic memory pruning benchmarks.\n"
+        "L3 - [Nomad Task Driver Isolation](<https://example.com/nomad>) — cgroup v2 memory caps.\n"
+    )
+    parsed = parse_candidate_links(amos_text)
+    assert len(parsed) == 3
+    assert [c["label"] for c in parsed] == ["L1", "L2", "L3"]
+    assert "Deep dive on busy_timeout" in parsed[0]["line"]
+
+    # Meta-messages without URLs (like Amos explaining the cron setup) must be ignored
+    meta_msg = {
+        "id": 1001,
+        "author": "Amos",
+        "is_bot": True,
+        "content": "- **What:** up to 6 agent-related links from my news archive, each labelled `L1` to `L6`.",
+        "timestamp": "2026-10-21 22:39:13 UTC",
+    }
+    real_msg = {
+        "id": 1002,
+        "author": "Amos",
+        "is_bot": True,
+        "content": amos_text,
+        "timestamp": "2026-10-22 17:30:05 UTC",
+    }
+    found = find_unassigned_daily_links_message([meta_msg, real_msg], assigned_msg_ids=[])
+    assert found is not None
+    assert found["msg_id"] == "1002"
+    assert len(found["candidates"]) == 3
+
+    with patch("tools.resident_agents_watcher.STATE_FILE", fake_state_file), patch(
+        "tools.resident_agents_watcher.get_recent_messages",
+        return_value=[meta_msg, real_msg],
+    ), patch("tools.resident_agents_watcher.queue_outbox_message") as mock_enq:
+        ok, msg, extra = run_resident_agents_daily_links(
+            test=False,
+            quiet=True,
+            post_discord=True,
+            target_date="2026-10-22",
+        )
+        assert ok is True
+        assert extra.get("assigned") is True
+        assert mock_enq.call_count == 1
+        dispatched_card = mock_enq.call_args.kwargs["content"]
+        expected_slot = get_daily_link_assignee("2026-10-22")
+        assert f"<@{expected_slot['snowflake']}>" in dispatched_card
+        assert "`L1`" in dispatched_card and "`L3`" in dispatched_card
+
+        # Second run on same date / message ID must not re-assign
+        ok2, msg2, extra2 = run_resident_agents_daily_links(
+            test=False,
+            quiet=True,
+            post_discord=True,
+            target_date="2026-10-22",
+        )
+        assert ok2 is True
+        assert extra2.get("assigned") is False
+        assert mock_enq.call_count == 1
+
+
+def test_seeding_thread_scoring_and_draft_generation() -> None:
+    now_ts = 1792630000.0
+    high_signal_post = {
+        "name": "t3_seed1",
+        "subreddit": "LocalLLaMA",
+        "author": "some_builder",
+        "title": "How are you handling long-term memory and cron schedules for an always-on home server agent?",
+        "selftext": "I have a persistent agent running in Docker 24/7 with Claude Code, but context compaction keeps dropping state.",
+        "created_utc": now_ts - 3600,
+        "num_comments": 8,
+        "stickied": False,
+        "locked": False,
+        "over_18": False,
+    }
+    score, reasons = score_seeding_thread(high_signal_post, now_utc=now_ts)
+    assert score >= 55.0
+    assert any("Agent + Persistence Anchor" in r for r in reasons)
+
+    low_signal_post = {
+        "name": "t3_seed2",
+        "subreddit": "LocalLLaMA",
+        "author": "meme_poster",
+        "title": "[Meme] When your GPU runs out of VRAM",
+        "selftext": "",
+        "created_utc": now_ts - 1800,
+        "num_comments": 2,
+    }
+    low_score, _ = score_seeding_thread(low_signal_post, now_utc=now_ts)
+    assert low_score < 0
+
+    cand = {
+        "fullname": "t3_seed1",
+        "subreddit": "LocalLLaMA",
+        "author": "some_builder",
+        "title": high_signal_post["title"],
+        "selftext": high_signal_post["selftext"],
+        "url": "https://www.reddit.com/r/LocalLLaMA/comments/seed1/how_are_you/",
+        "score": score,
+    }
+    draft = generate_seeding_comment_draft(cand)
+    assert "resident agent" in draft.lower()
+    assert "r/residentagents" not in draft.lower()
+
+    card = format_seeding_card(cand, draft, posted_url=cand["url"])
+    assert "u/prime416" in card
+    assert "r/LocalLLaMA" in card
+    assert "Auto-Posted" in card
 
 
 def test_detect_desired_flair() -> None:
