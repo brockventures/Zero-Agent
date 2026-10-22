@@ -390,6 +390,29 @@ class TestForgeEngine(unittest.TestCase):
         for rule_file in Path("/workspace/.agents/rules").glob("*.md"):
             self.assertLessEqual(rule_file.stat().st_size, 24000, f"{rule_file.name} exceeds 24KB limit")
 
+    def test_07_ivy_channel_and_repo_resolution(self):
+        with patch.dict(forge_mod.os.environ, {"DISCORD_CHANNEL_ID": "1548196929308065893"}):
+            self.assertEqual(forge_mod.get_default_origin_channel(), "baseball")
+
+        ivy_plan = {
+            "title": "Ivy Projection Engine Upgrade",
+            "repo": "/workspace",
+            "origin_channel_id": 1548196929308065893,
+            "context_fact_sheet": ["Maintain 100% endogenous BIG baseline."],
+            "chunks": [
+                {
+                    "title": "Update ivy_daemon.py",
+                    "target_files": ["tools/ivy_daemon.py"],
+                    "instructions": "Implement activity lease renewal in ivy_daemon.py.",
+                }
+            ],
+        }
+        enq = enqueue_build(ivy_plan, db_path=self.db_path, post_widget=False)
+        self.assertTrue(enq["ok"])
+        embed = render_build_widget_embed(enq["build_id"], db_path=self.db_path)
+        self.assertIn("`Ivy-Agent`", embed["description"])
+        self.assertIn("<#1548196929308065893>", embed["description"])
+
 
 if __name__ == "__main__":
     unittest.main()

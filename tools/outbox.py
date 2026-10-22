@@ -29,6 +29,7 @@ KNOWN_CHANNELS = {
     "agent-chat": 1534436119888793750,  # alias for backward compatibility
     "lounge": 1534452820995080192,
     "zero-chat": 1542081375287640084,
+    "forge": 1562899941595160657,
     "steam-deck": 1544953277592899615,
     "home-assistant": 1544953275877556334,
     "finances": 1544955532765560924,

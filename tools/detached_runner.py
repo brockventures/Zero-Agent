@@ -45,7 +45,7 @@ def _write_meta(task_id: str, meta: dict) -> None:
 
 def start_task(
     command: str,
-    channel: str = "zero-chat",
+    channel: str = "",
     name: str = "",
     timeout: int = 3600,
     cwd: str = "/workspace",
@@ -55,9 +55,10 @@ def start_task(
 ) -> dict:
     """Spawn a detached background task via FORGE's native job runner."""
     _sync_tasks_dir()
+    eff_channel = channel or forge.get_default_origin_channel()
     return forge.start_job(
         command=command,
-        channel=channel,
+        channel=eff_channel,
         name=name,
         timeout=timeout,
         cwd=cwd,
@@ -97,7 +98,7 @@ def main() -> None:
 
     start_p = subparsers.add_parser("start", help="Spawn a detached background task")
     start_p.add_argument("--command", "-c", required=True, help="Shell command to execute")
-    start_p.add_argument("--channel", default="zero-chat", help="Originating Discord channel (default: zero-chat)")
+    start_p.add_argument("--channel", default="", help="Originating Discord channel (defaults to DISCORD_CHANNEL_ID or zero-chat)")
     start_p.add_argument("--name", "-n", default="", help="Human-readable name for the task")
     start_p.add_argument("--timeout", "-t", type=int, default=3600, help="Timeout in seconds (default: 3600)")
     start_p.add_argument("--cwd", default="/workspace", help="Working directory (default: /workspace)")

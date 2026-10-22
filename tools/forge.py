@@ -62,11 +62,70 @@ PT_TZ = ZoneInfo("America/Los_Angeles")
 FORGE_CHANNEL_ID = 1562899941595160657
 ZERO_CHAT_CHANNEL_ID = 1542081375287640084
 ZERO_OPS_CHANNEL_ID = 1544953279664889888
+BASEBALL_CHANNEL_ID = 1548196929308065893
 OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
 
 DEFAULT_WORKER_MODEL = "gemini-3.8-flash-high"
 ESCALATION_WORKER_MODEL = "gemini-4-argon-medium"
 DEFAULT_LEASE_TTL_SECONDS = 300.0
+
+
+def get_default_origin_channel() -> str:
+    """Return the default origin channel name/ID for the active container (Zero vs Ivy)."""
+    env_cid = os.getenv("DISCORD_CHANNEL_ID", "").strip()
+    if env_cid == str(BASEBALL_CHANNEL_ID):
+        return "baseball"
+    if env_cid:
+        return env_cid
+    return "zero-chat"
+
+
+def _get_discord_token() -> Optional[str]:
+    """Retrieve Discord bot token across Zero (/secrets) and Ivy (.env) environments."""
+    try:
+        from tools.deliver_image import get_discord_token
+        return get_discord_token()
+    except Exception:
+        pass
+    for env_cand in (Path("/app/.env"), Path("/workspace/.env"), Path(".env")):
+        if env_cand.exists():
+            try:
+                for line in env_cand.read_text(encoding="utf-8").splitlines():
+                    if line.strip().startswith("DISCORD_BOT_TOKEN="):
+                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if val:
+                            return val
+            except Exception:
+                pass
+    return None
+
+
+def _get_repo_default_branch(repo_dir: Path | str) -> str:
+    """Detect the active or default branch ('main', 'master', or 'dev') for a git repository."""
+    rp = Path(repo_dir)
+    try:
+        sym = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=str(rp),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        branch = sym.stdout.strip()
+        if sym.returncode == 0 and branch and not branch.startswith("forge/"):
+            return branch
+    except Exception:
+        pass
+    for cand in ("main", "master", "dev"):
+        chk = subprocess.run(
+            ["git", "rev-parse", "--verify", f"origin/{cand}"],
+            cwd=str(rp),
+            capture_output=True,
+            timeout=5,
+        )
+        if chk.returncode == 0:
+            return cand
+    return "main"
 
 
 # ---------------------------------------------------------------------------
@@ -527,13 +586,13 @@ def build_default_verification_cmd(target_files: list[str], worktree_dir: Option
 
 
 def _detect_touches_core_bridge(plan: dict) -> bool:
-    """Detect whether any chunk targets live tools/bridge*.py files."""
+    """Detect whether any chunk targets live tools/bridge*.py or ivy_daemon.py files."""
     if plan.get("touches_core_bridge") is not None:
         return bool(plan.get("touches_core_bridge"))
     for ch in plan.get("chunks", []):
         for tf in ch.get("target_files", []):
             norm = str(tf).replace("\\", "/")
-            if "bridge" in norm and norm.endswith(".py") and not Path(norm).name.startswith("test_"):
+            if ("bridge" in norm or "ivy_daemon" in norm) and norm.endswith(".py") and not Path(norm).name.startswith("test_"):
                 return True
     return False
 
@@ -586,7 +645,8 @@ def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH
     origin_ref = f"<#{build['origin_thread_id'] or build['origin_channel_id']}>"
     repo_name = Path(build["repo"]).name or "Zero-Agent"
     if repo_name == "workspace":
-        repo_name = "Zero-Agent"
+        is_ivy_origin = int(build["origin_channel_id"]) == BASEBALL_CHANNEL_ID or os.getenv("DISCORD_CHANNEL_ID", "").strip() == str(BASEBALL_CHANNEL_ID)
+        repo_name = "Ivy-Agent" if is_ivy_origin else "Zero-Agent"
 
     total = len(chunks)
     merged_count = sum(1 for c in chunks if c["status"] == "merged")
@@ -657,10 +717,8 @@ def post_or_update_build_widget(
 ) -> Optional[int]:
     """Post or edit the single live Discord Embed card for `build_id` inside #forge via REST API v10."""
     embed = render_build_widget_embed(build_id, db_path=db_path)
-    try:
-        from tools.deliver_image import get_discord_token
-        token = get_discord_token()
-    except Exception:
+    token = _get_discord_token()
+    if not token:
         return None
 
     headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
@@ -716,13 +774,7 @@ def prune_completed_build_widgets(
     if not rows:
         return pruned_ids
 
-    token = None
-    if delete_remote:
-        try:
-            from tools.deliver_image import get_discord_token
-            token = get_discord_token()
-        except Exception:
-            token = None
+    token = _get_discord_token() if delete_remote else None
 
     headers = {"Authorization": f"Bot {token}"} if token else {}
     for r in rows:
@@ -1146,7 +1198,15 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
         except Exception:
             pass
 
-    for repo_cand in (WORKSPACE_DIR, WORKSPACE_DIR / "market-sandbox", WORKSPACE_DIR / "kalshi-quant", WORKSPACE_DIR / "agora-roguelike", WORKSPACE_DIR / "sharkfin"):
+    for repo_cand in (
+        WORKSPACE_DIR,
+        WORKSPACE_DIR / "market-sandbox",
+        WORKSPACE_DIR / "kalshi-quant",
+        WORKSPACE_DIR / "agora-roguelike",
+        WORKSPACE_DIR / "sharkfin",
+        Path("/baseball"),
+        Path("/baseball/big-projections"),
+    ):
         if (repo_cand / ".git").exists():
             subprocess.run(["git", "worktree", "prune"], cwd=str(repo_cand), capture_output=True, timeout=10)
 
@@ -1307,15 +1367,16 @@ class ForgeSupervisor:
 
         effective_repo = (chunk_row["repo"] if "repo" in chunk_row.keys() and chunk_row["repo"] else build["repo"]) or "/workspace"
         repo_dir = Path(effective_repo).resolve()
+        default_branch = _get_repo_default_branch(repo_dir)
         wt_dir = Path(f"/tmp/forge-wt-{chunk_id}")
         branch_name = f"forge/{build_id}-c{chunk_idx}"
         staging_ref = f"forge/release-{build_id}"
 
         # Ensure base ref exists and carries prior chunks forward
-        subprocess.run(["git", "fetch", "origin", "main"], cwd=str(repo_dir), capture_output=True, timeout=30)
+        subprocess.run(["git", "fetch", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=30)
         if chunk_idx == 0:
-            chk_ref = subprocess.run(["git", "rev-parse", "--verify", "origin/main"], cwd=str(repo_dir), capture_output=True)
-            start_ref = "origin/main" if chk_ref.returncode == 0 else "HEAD"
+            chk_ref = subprocess.run(["git", "rev-parse", "--verify", f"origin/{default_branch}"], cwd=str(repo_dir), capture_output=True)
+            start_ref = f"origin/{default_branch}" if chk_ref.returncode == 0 else "HEAD"
             subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
         base_ref = staging_ref
 
@@ -1425,10 +1486,10 @@ class ForgeSupervisor:
                             (time.time(), build_id),
                         )
 
-                # If final chunk completed and not touching core bridge, sync staging branch into local main
+                # If final chunk completed and not touching core bridge, sync staging branch into local default branch
                 if remaining == 0 and not build["touches_core_bridge"]:
                     subprocess.run(["git", "merge", "--ff-only", base_ref], cwd=str(repo_dir), capture_output=True, timeout=15)
-                    subprocess.run(["git", "push", "origin", "main"], cwd=str(repo_dir), capture_output=True, timeout=30)
+                    subprocess.run(["git", "push", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=30)
 
                 post_or_update_build_widget(build_id, db_path=self.db_path)
                 if remaining == 0:
@@ -1585,7 +1646,7 @@ def _find_active_duplicate_job(command: str, cwd: str, db_path: Path | str = FOR
 
 def start_job(
     command: str,
-    channel: str = "zero-chat",
+    channel: str = "",
     name: str = "",
     timeout: int = 3600,
     cwd: str = "/workspace",
@@ -1595,6 +1656,7 @@ def start_job(
     db_path: Path | str = FORGE_DB_PATH,
 ) -> dict:
     """Spawn a detached background shell job backed by `forge_jobs` and return its metadata immediately."""
+    channel = channel or get_default_origin_channel()
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     enqueue_lock_path = TASKS_DIR / ".enqueue.lock"
 
@@ -1782,6 +1844,7 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
         return
 
     synthesize = fresh_meta.get("synthesize", True)
+    persona_name = "Ivy" if str(channel).strip().lstrip("#") in ("baseball", str(BASEBALL_CHANNEL_ID)) else "Zero"
     if final_status == "completed" and synthesize:
         synthesis_prompt = f"""[SYSTEM NOTIFICATION: DETACHED TASK COMPLETE]
 Task Name: {name} (ID: {task_id})
@@ -1789,7 +1852,7 @@ Duration: {dur_str} | Exit Code: {exit_code}
 Log Path: {log_file_path}
 
 Directive:
-The background task has finished successfully. Review the execution log at {log_file_path}, extract the key results, metrics, or anomalies, and deliver a concise, natural executive briefing directly to Ryan in character as Zero.
+The background task has finished successfully. Review the execution log at {log_file_path}, extract the key results, metrics, or anomalies, and deliver a concise, natural executive briefing directly to Ryan in character as {persona_name}.
 """
         try:
             from tools.outbox import queue_agent_turn
@@ -2031,10 +2094,8 @@ def _post_decision_card_rest(decision_id: str, db_path: Path | str = FORGE_DB_PA
         if not row:
             return None
 
-    try:
-        from tools.deliver_image import get_discord_token
-        token = get_discord_token()
-    except Exception:
+    token = _get_discord_token()
+    if not token:
         return None
 
     text = format_decision_card_text(row)
@@ -2362,7 +2423,7 @@ def main():
 
     j_start = job_sub.add_parser("start", help="Spawn a detached background job")
     j_start.add_argument("--command", "-c", required=True, help="Shell command to execute")
-    j_start.add_argument("--channel", default="zero-chat", help="Originating Discord channel")
+    j_start.add_argument("--channel", default="", help="Originating Discord channel (defaults to DISCORD_CHANNEL_ID or zero-chat)")
     j_start.add_argument("--name", "-n", default="", help="Human-readable name for the job")
     j_start.add_argument("--timeout", "-t", type=int, default=3600, help="Timeout in seconds")
     j_start.add_argument("--cwd", default="/workspace", help="Working directory")
