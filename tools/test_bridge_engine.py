@@ -59,9 +59,18 @@ class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.coordinator.timeout_reason, reason)
         self.assertFalse(self.coordinator.is_hard_ceiling)
 
-        # Case 3: Hard ceiling timeout (turn running >= 1800s)
+        # Case 3: Active turn running >= 1800s with recent activity (5s ago) MUST NOT be killed by wall-clock ceiling!
         self.coordinator.turn_start_time = now - 1805.0
         self.coordinator.last_activity_time = now - 5.0
+        timed_out, reason = self.coordinator.check_watchdog_timeout(
+            step_idle_timeout=90.0, turn_timeout_seconds=300.0, max_turn_ceiling=1800.0
+        )
+        self.assertFalse(timed_out)
+        self.assertEqual(reason, "")
+
+        # Case 4: Turn running >= 1800s AND idle >= step_idle_timeout -> triggers hard ceiling if max_turn_ceiling > 0
+        self.coordinator.turn_start_time = now - 1805.0
+        self.coordinator.last_activity_time = now - 95.0
         timed_out, reason = self.coordinator.check_watchdog_timeout(
             step_idle_timeout=90.0, turn_timeout_seconds=300.0, max_turn_ceiling=1800.0
         )

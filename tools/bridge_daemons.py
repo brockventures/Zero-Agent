@@ -63,7 +63,7 @@ from tools.bridge_engine import (
     register_active_presence,
 )
 
-PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "30m")
+PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "4h")
 
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
 LOUNGE_CHANNEL_ID = 1534452820995080192

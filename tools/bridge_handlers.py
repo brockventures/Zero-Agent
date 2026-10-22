@@ -293,6 +293,12 @@ def is_bridge_busy(home_queue=None, ext_queue=None, exclude_channel_id: int | No
             ch_name = "#zero-chat" if cid == TARGET_CHANNEL_ID else f"channel:{cid}"
             if ch_name not in busy:
                 busy.append(ch_name)
+    try:
+        from tools.forge import has_active_forge_builds
+        for b_label in has_active_forge_builds():
+            busy.append(f"#forge:{b_label}")
+    except Exception:
+        pass
     return busy
 
 
@@ -666,6 +672,14 @@ async def handle_on_ready(
         print(f"[Antigravity] Banana Watcher active (PID: {bw_status.get('pid')}).")
     except Exception as bwe:
         print(f"[Bridge] Warning initializing Banana Watcher: {bwe}")
+
+    # Reconcile FORGE worktrees and interrupted chunks on boot
+    try:
+        from tools.forge import reconcile_forge_on_boot
+        forge_rec = reconcile_forge_on_boot()
+        print(f"[Antigravity] FORGE boot reconciliation complete: {forge_rec}")
+    except Exception as fre:
+        print(f"[Bridge] Warning during FORGE boot reconciliation: {fre}")
 
     # Ensure Dedicated Persistent Channel Daemons are warmed up (#zero-chat, #the-banana-stand, #lounge)
     try:
@@ -1225,3 +1239,45 @@ async def handle_message(
         "is_thread_task": is_thread_channel,
         "queued_at": time.perf_counter(),
     })
+
+
+async def handle_raw_reaction_event(
+    payload: discord.RawReactionActionEvent,
+    bot: discord.Client,
+    added: bool = True,
+):
+    """Passively record Discord emoji reactions (adds/removes) into channel_history without waking the LLM."""
+    try:
+        if bot and bot.user and payload.user_id == bot.user.id:
+            return
+        from tools.channel_history import record_reaction
+        emoji_str = str(payload.emoji)
+        user_name = None
+        if added and getattr(payload, "member", None):
+            user_name = getattr(payload.member, "display_name", None) or getattr(payload.member, "name", None)
+        if not user_name and bot:
+            if getattr(payload, "guild_id", None):
+                guild = bot.get_guild(payload.guild_id)
+                if guild:
+                    m = guild.get_member(payload.user_id)
+                    if m:
+                        user_name = getattr(m, "display_name", None) or getattr(m, "name", None)
+            if not user_name:
+                u = bot.get_user(payload.user_id)
+                if u:
+                    user_name = getattr(u, "display_name", None) or getattr(u, "name", None)
+        if not user_name:
+            from tools.handoff import SNOWFLAKE_TO_NAME
+            user_name = SNOWFLAKE_TO_NAME.get(str(payload.user_id)) or (
+                "Ryan" if payload.user_id == OWNER_USER_ID else f"user:{payload.user_id}"
+            )
+        record_reaction(
+            channel_id=payload.channel_id,
+            msg_id=payload.message_id,
+            emoji=emoji_str,
+            user_name=user_name,
+            added=added,
+        )
+    except Exception as e:
+        print(f"[Bridge] Warning recording raw reaction event: {e}")
+

@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import json
+import fcntl
 import signal
 import subprocess
 import argparse
@@ -76,6 +77,100 @@ def _write_meta(task_id: str, meta: dict):
     with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     temp_file.replace(meta_file)
+    try:
+        from tools.forge import get_db_connection
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO forge_jobs (
+                    id, name, command, cwd, channel, timeout, status,
+                    worker_pid, child_pid, exit_code, log_file,
+                    notify_on_success, synthesize, start_time, end_time, duration_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status=excluded.status,
+                    worker_pid=excluded.worker_pid,
+                    child_pid=excluded.child_pid,
+                    exit_code=excluded.exit_code,
+                    end_time=excluded.end_time,
+                    duration_seconds=excluded.duration_seconds
+                """,
+                (
+                    task_id,
+                    meta.get("name", "Background Task"),
+                    meta.get("command", ""),
+                    meta.get("cwd", "/workspace"),
+                    str(meta.get("channel", "zero-chat")),
+                    int(meta.get("timeout", 3600)),
+                    meta.get("status", "starting"),
+                    meta.get("worker_pid"),
+                    meta.get("child_pid"),
+                    meta.get("exit_code"),
+                    str(meta.get("log_file", "")),
+                    1 if meta.get("notify_on_success") else 0,
+                    1 if meta.get("synthesize", True) else 0,
+                    float(meta.get("start_time") or time.time()),
+                    meta.get("end_time"),
+                    meta.get("duration_seconds"),
+                ),
+            )
+    except Exception:
+        pass
+
+
+def _is_worker_flock_held(task_id: str) -> bool:
+    """Return True if the task's worker.lock is currently held by an active worker process."""
+    lock_path = _get_task_dir(task_id) / "worker.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        with open(lock_path, "a+", encoding="utf-8") as lf:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                return True
+            else:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                return False
+    except Exception:
+        return False
+
+
+def _is_task_active(meta: dict) -> bool:
+    """Check whether a task metadata record represents a genuinely live in-flight task."""
+    status = meta.get("status")
+    if status not in ("starting", "running"):
+        return False
+    task_id = meta.get("task_id", "")
+    if task_id and _is_worker_flock_held(task_id):
+        return True
+    child_pid = meta.get("child_pid")
+    worker_pid = meta.get("worker_pid")
+    if (child_pid and _is_pid_running(child_pid)) or (worker_pid and _is_pid_running(worker_pid)):
+        return True
+    # Grace window for newly created 'starting' tasks before worker records PID
+    start_time = meta.get("start_time") or 0
+    if status == "starting" and (time.time() - float(start_time)) < 5.0:
+        return True
+    return False
+
+
+def _find_active_duplicate(command: str, cwd: str) -> dict | None:
+    """Scan TASKS_DIR for an already-active task running the identical command and cwd."""
+    if not TASKS_DIR.exists():
+        return None
+    norm_cmd = command.strip()
+    norm_cwd = cwd.strip()
+    for entry in sorted(TASKS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not entry.is_dir():
+            continue
+        meta = _read_meta(entry.name)
+        if not meta:
+            continue
+        if meta.get("command", "").strip() == norm_cmd and meta.get("cwd", "/workspace").strip() == norm_cwd:
+            if _is_task_active(meta):
+                return meta
+    return None
 
 
 def start_task(
@@ -86,62 +181,81 @@ def start_task(
     cwd: str = "/workspace",
     notify_on_success: bool = True,
     synthesize: bool = True,
+    allow_duplicate: bool = False,
 ) -> dict:
     """Spawn a detached background task and return its metadata immediately."""
-    name_clean = name.strip() or "Ad-Hoc Background Task"
-    slug = re.sub(r"[^a-zA-Z0-9_-]", "", name_clean.lower().replace(" ", "-"))[:20] or "job"
-    task_id = f"dt-{int(time.time())}-{slug}"
-    task_dir = _get_task_dir(task_id)
-    task_dir.mkdir(parents=True, exist_ok=True)
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    enqueue_lock_path = TASKS_DIR / ".enqueue.lock"
 
-    log_file = task_dir / "run.log"
-    log_file.touch(exist_ok=True)
+    with open(enqueue_lock_path, "a+", encoding="utf-8") as elock:
+        fcntl.flock(elock.fileno(), fcntl.LOCK_EX)
+        try:
+            if not allow_duplicate:
+                existing = _find_active_duplicate(command, cwd)
+                if existing:
+                    dup_meta = dict(existing)
+                    dup_meta["deduplicated"] = True
+                    return dup_meta
 
-    meta = {
-        "task_id": task_id,
-        "name": name_clean,
-        "command": command,
-        "channel": channel,
-        "timeout": int(timeout),
-        "cwd": cwd,
-        "status": "starting",
-        "worker_pid": None,
-        "child_pid": None,
-        "start_time": time.time(),
-        "start_time_iso": datetime.now(timezone.utc).isoformat(),
-        "end_time": None,
-        "duration_seconds": None,
-        "exit_code": None,
-        "notify_on_success": bool(notify_on_success),
-        "synthesize": bool(synthesize),
-        "log_file": str(log_file),
-    }
-    _write_meta(task_id, meta)
+            name_clean = name.strip() or "Ad-Hoc Background Task"
+            slug = re.sub(r"[^a-zA-Z0-9_-]", "", name_clean.lower().replace(" ", "-"))[:20] or "job"
+            task_id = f"dt-{int(time.time())}-{slug}"
+            task_dir = _get_task_dir(task_id)
+            if task_dir.exists():
+                task_id = f"dt-{int(time.time() * 1000)}-{slug}"
+                task_dir = _get_task_dir(task_id)
+            task_dir.mkdir(parents=True, exist_ok=True)
 
-    # Launch detached worker process
-    worker_cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "_worker",
-        task_id,
-    ]
-    proc = subprocess.Popen(
-        worker_cmd,
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+            log_file = task_dir / "run.log"
+            log_file.touch(exist_ok=True)
 
-    # Give worker a brief moment to record its PID
-    time.sleep(0.15)
-    updated_meta = _read_meta(task_id) or meta
-    if not updated_meta.get("worker_pid"):
-        updated_meta["worker_pid"] = proc.pid
-        _write_meta(task_id, updated_meta)
+            meta = {
+                "task_id": task_id,
+                "name": name_clean,
+                "command": command,
+                "channel": channel,
+                "timeout": int(timeout),
+                "cwd": cwd,
+                "status": "starting",
+                "worker_pid": None,
+                "child_pid": None,
+                "start_time": time.time(),
+                "start_time_iso": datetime.now(timezone.utc).isoformat(),
+                "end_time": None,
+                "duration_seconds": None,
+                "exit_code": None,
+                "notify_on_success": bool(notify_on_success),
+                "synthesize": bool(synthesize),
+                "log_file": str(log_file),
+            }
+            _write_meta(task_id, meta)
 
-    return updated_meta
+            # Launch detached worker process
+            worker_cmd = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "_worker",
+                task_id,
+            ]
+            proc = subprocess.Popen(
+                worker_cmd,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+            # Give worker a brief moment to record its PID
+            time.sleep(0.15)
+            updated_meta = _read_meta(task_id) or meta
+            if not updated_meta.get("worker_pid"):
+                updated_meta["worker_pid"] = proc.pid
+                _write_meta(task_id, updated_meta)
+
+            return updated_meta
+        finally:
+            fcntl.flock(elock.fileno(), fcntl.LOCK_UN)
 
 
 def _run_worker(task_id: str):
@@ -150,6 +264,28 @@ def _run_worker(task_id: str):
     if not meta:
         sys.exit(1)
 
+    task_dir = _get_task_dir(task_id)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    lock_file_path = task_dir / "worker.lock"
+    lock_fh = open(lock_file_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        lock_fh.close()
+        return
+
+    try:
+        _run_worker_locked(task_id, meta)
+    finally:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fh.close()
+
+
+def _run_worker_locked(task_id: str, meta: dict):
+    """Worker execution body guarded by an exclusive flock on worker.lock."""
     meta["worker_pid"] = os.getpid()
     meta["status"] = "running"
     _write_meta(task_id, meta)
@@ -399,6 +535,7 @@ def main():
     start_p.add_argument("--notify-on-success", action="store_true", default=True, help="Send outbox notification on successful completion (default: True)")
     start_p.add_argument("--silent-on-success", dest="notify_on_success", action="store_false", help="Suppress outbox notification on success (failure-only)")
     start_p.add_argument("--no-synthesize", dest="synthesize", action="store_false", default=True, help="Disable agentic synthesis on completion and emit raw log notice")
+    start_p.add_argument("--allow-duplicate", action="store_true", default=False, help="Allow spawning even if an identical command is already active")
 
     # Status
     status_p = subparsers.add_parser("status", help="Check status of a detached task")
@@ -432,6 +569,7 @@ def main():
             cwd=args.cwd,
             notify_on_success=args.notify_on_success,
             synthesize=args.synthesize,
+            allow_duplicate=args.allow_duplicate,
         )
         print(json.dumps(res, indent=2))
 

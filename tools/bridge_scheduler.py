@@ -7,11 +7,9 @@ anti-storm guards, liveness wedge detection, and outbox queue flushing.
 import asyncio
 import json
 import os
-import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 import discord
 
 from tools.bridge_state import (
@@ -24,7 +22,6 @@ from tools.bridge_state import (
     VAULT_CHANNEL_ID,
     PT_TZ,
     update_beacon,
-    get_channel_session_id,
 )
 from tools.bridge_formatting import (
     chunk_text,
@@ -373,7 +370,8 @@ async def dispatch_scheduled_prompt(
             if ok and out and not out.startswith("No new") and not out.startswith("Scanned active") and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print(f"[Scheduler] Reddit fantasy baseball scanner checked: {out}")
         except Exception as e:
@@ -1359,6 +1357,7 @@ class BridgeScheduler:
                                     prompt=omsg.get("content", ""),
                                     job_name=omsg.get("source", "Detached Task Synthesis"),
                                     channel_id=target_cid,
+                                    job_id=f"outbox_turn_{omsg_id}",
                                 )
                                 print(f"[Outbox] 🟢 Dispatched agent synthesis turn for {omsg_id} to #{ch_name} ({target_cid}).")
                                 continue
@@ -1518,12 +1517,16 @@ class BridgeScheduler:
                     except Exception:
                         pass
 
-                # Check and dispatch completed background SDK tasks via Outbox
+                # FORGE Supervisor Tick: expire stale Decision Cards & dispatch completed SDK tasks via Outbox
                 try:
-                    from tools.task_settle import check_and_dispatch_completed_tasks
-                    check_and_dispatch_completed_tasks()
+                    from tools.forge import forge_supervisor
+                    forge_supervisor.tick_sync()
                 except Exception:
-                    pass
+                    try:
+                        from tools.task_settle import check_and_dispatch_completed_tasks
+                        check_and_dispatch_completed_tasks()
+                    except Exception:
+                        pass
 
                 # Outbox Queue Flusher (Cross-Channel Asynchronous Dispatch)
                 await self.flush_outbox_queue()

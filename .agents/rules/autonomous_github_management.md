@@ -61,3 +61,7 @@ description: >-
 8. **Mandatory Project Backronym Naming Standard:**
    - **New Project Invariant:** Whenever starting, scaffolding, or naming a new project, repository, or major subsystem, Zero **MUST** give it a clever, fitting backronym name (in the tradition of **BIG** — *Baseball Intelligence & Analytics Graph* — and **BANANA** — *Binary Arbitration Node And Non-blocking Acquisition*).
    - **Documentation Lock-In:** Canonical project backronyms must be prominently displayed at the top of the project's `README.md` and GitHub repository description.
+
+## 9. FORGE Chunked PR Discipline (`forge/*` Branches)
+- Multi-chunk background builds orchestrated by `/workspace/tools/forge.py` execute inside isolated git worktrees (`/tmp/forge-wt-<chunk_id>`) on `forge/<build_id>/chunk-<idx>` branches using `gemini-3.8-flash-high`.
+- Each chunk must pass deterministic verification (`ruff check`, scoped `pytest`, `validate_commit_safety.py`, and `expected_files` boundary validation) before auto-merging via squash PR.

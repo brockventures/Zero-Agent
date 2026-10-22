@@ -59,9 +59,12 @@ Core properties of a Resident Agent:
 ### 4. 🗜️ 25-Turn Rolling Auto-Compactor & Carry-Forward Memory
 * Automatically compresses conversation history every 25 turns, extracting durable facts and carry-forward context to ensure infinite conversation sustainability without context blowup.
 
----
+### 5. 🛠️ FORGE — **F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution
+* **Activity-Renewed Progress Leases:** Replaces rigid wall-clock turn timeouts with a 4-signal heartbeat lease (stdout token/step deltas, child PID activity, SDK task log growth, and subagent transcript growth) plus a 3-strike runaway tool-loop circuit breaker.
+* **Isolated Worktree Build Queue (`#forge`):** Decomposes Tier 2/3 engineering specs (`ForgePlan` JSON) into atomic TDD chunks executed inside isolated `git worktree` sandboxes by `gemini-3.8-flash-high` (with automatic escalation to `gemini-4-argon-medium`), updating a live tracker widget in `#forge` and waking the originating channel when the final chunk merges.
+* **Deterministic Decisions Framework (`/queue`):** Backs inline Discord `Approve | Edit | Dismiss` cards with SQLite action payloads in `/workspace/data/forge.db` for zero-token, sub-second execution and modal parameter editing.
 
-## 🚀 Quickstart & Setup
+---
 
 ### 1. Prerequisites
 * Python 3.10+

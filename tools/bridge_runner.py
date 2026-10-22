@@ -60,7 +60,7 @@ from tools.bridge_state import (
     get_reset_session_keys,
 )
 
-PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "30m")
+PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "4h")
 
 # Global execution & steering tracking
 active_master_fd = None
@@ -354,7 +354,7 @@ async def execute_agy_turn(
             step_idle_timeout = float(rules.get("turn_step_idle_seconds", 150.0))
             turn_timeout_seconds = float(rules.get("turn_watchdog_seconds", 300.0))
             agent_done_window = float(rules.get("agent_done_cutoff_seconds", 15.0))
-            max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 1800.0))
+            max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 0.0))
             timed_out = False
             is_hard_ceiling = False
             wedged_diagnostic = None
@@ -395,11 +395,12 @@ async def execute_agy_turn(
                             pass
                     break
 
-                # Bridge-level turn watchdog: enforces hard inactivity timeout so silent hangs are killed
+                # Bridge-level turn watchdog: enforces activity-renewed progress lease
                 is_timeout, reason = coord.check_watchdog_timeout(
                     step_idle_timeout=step_idle_timeout,
                     turn_timeout_seconds=turn_timeout_seconds,
                     max_turn_ceiling=max_turn_ceiling,
+                    proc_pid=proc.pid,
                 )
                 if is_timeout:
                     print(f"[BridgeRunner] ⏱️ Turn watchdog exceeded ({reason}) for PID {proc.pid} in channel {channel_id}. Terminating...")
