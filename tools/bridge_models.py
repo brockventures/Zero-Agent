@@ -259,6 +259,7 @@ CHANNEL_MODEL_OVERRIDES: dict[int, str] = {
     1544955532765560924: "gemini-4-argon-medium",   # #finances
     1550577910757458015: "gemini-4-argon-medium",   # #vault
     1544953279664889888: "gemini-4-argon-medium",   # #zero-ops
+    1562899941595160657: "gemini-4-argon-medium",   # #forge
     1544953275877556334: "gemini-4-argon-medium",   # #home-assistant
     1544955535722545253: "gemini-4-argon-medium",   # #homelab
     1548196930788524094: "gemini-4-argon-medium",   # #projects
@@ -300,6 +301,7 @@ def get_channel_model_override(
             "finances",
             "vault",
             "zero-ops",
+            "forge",
             "harness-management",
             "home-assistant",
             "homelab",

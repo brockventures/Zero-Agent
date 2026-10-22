@@ -8,7 +8,6 @@ import asyncio
 import json
 import os
 import re
-import shutil
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -62,6 +61,7 @@ HOMELAB_CHANNEL_ID = 1544955535722545253
 FINANCES_CHANNEL_ID = 1544955532765560924        # #finances
 BROCK_HOUSE_CHANNEL_ID = 1550577908811178095  # #brock-house
 VAULT_CHANNEL_ID = 1550577910757458015        # #vault (isolated memory tier)
+FORGE_CHANNEL_ID = 1562899941595160657        # #forge (build queue & background task telemetry)
 DEFAULT_EXCLUDED_HOME_CHANNELS = {
     1548196929308065893,  # #baseball (dedicated to Ivy)
 }
@@ -77,6 +77,7 @@ DEFAULT_HOME_CHANNELS = {
     1555973316752449576,  # #3d-print
     BROCK_HOUSE_CHANNEL_ID,  # #brock-house
     VAULT_CHANNEL_ID,        # #vault
+    FORGE_CHANNEL_ID,        # #forge
 }
 RETITLED_THREADS_FILE = DATA_DIR / "retitled_threads.json"
 

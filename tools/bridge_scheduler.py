@@ -7,11 +7,9 @@ anti-storm guards, liveness wedge detection, and outbox queue flushing.
 import asyncio
 import json
 import os
-import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 import discord
 
 from tools.bridge_state import (
@@ -24,7 +22,6 @@ from tools.bridge_state import (
     VAULT_CHANNEL_ID,
     PT_TZ,
     update_beacon,
-    get_channel_session_id,
 )
 from tools.bridge_formatting import (
     chunk_text,
@@ -373,7 +370,8 @@ async def dispatch_scheduled_prompt(
             if ok and out and not out.startswith("No new") and not out.startswith("Scanned active") and bot:
                 ch = await get_dest_channel()
                 if ch:
-                    await ch.send(out)
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print(f"[Scheduler] Reddit fantasy baseball scanner checked: {out}")
         except Exception as e:
@@ -788,12 +786,40 @@ async def dispatch_scheduled_prompt(
             import importlib
             import tools.resident_agents_watcher
             importlib.reload(tools.resident_agents_watcher)
+            RESIDENT_AGENTS_CHANNEL_ID = tools.resident_agents_watcher.RESIDENT_AGENTS_CHANNEL_ID
             run_resident_agents_watcher = tools.resident_agents_watcher.run_resident_agents_watcher
             ok, out, extra = await _run_sidecar_job_async(
                 "resident_agents_watcher",
                 "r/ResidentAgents Watcher & Auto-Approver",
                 lambda: run_resident_agents_watcher(test=False, quiet=True, post_discord=True),
             )
+            link_assign = extra.get("link_assignment") if isinstance(extra, dict) else None
+            if (
+                isinstance(link_assign, dict)
+                and link_assign.get("assigned")
+                and link_assign.get("slot", {}).get("agent") == "Zero"
+                and bot
+                and turn_queue
+            ):
+                dest_ch = await get_dest_channel(RESIDENT_AGENTS_CHANNEL_ID)
+                if dest_ch:
+                    cand_lines = "\n".join(f"- {c['line']}" for c in link_assign.get("candidates", []))
+                    await turn_queue.put({
+                        "prompt": (
+                            "It is Zero's turn on the daily r/ResidentAgents Link Post rotation. "
+                            "Amos posted today's candidate links (`L1`–`L6`):\n"
+                            f"{cand_lines}\n\n"
+                            "Pick the highest-signal candidate link from the list above, submit a new post to `r/ResidentAgents` as `u/RA_Zero` "
+                            "with a bracketed flair prefix (`[Discussion]`, `[Projects]`, `[Post-Mortem]`, or `[Rig Breakdown]`) and a sharp technical take or question, "
+                            "and share the live Reddit post link in `#r-residentagents`."
+                        ),
+                        "status_msg": None,
+                        "reply_target": dest_ch,
+                        "attachments": [],
+                        "is_steer": False,
+                        "mode": "external",
+                        "channel_id": RESIDENT_AGENTS_CHANNEL_ID,
+                    })
             if not ok and out and out.strip() and bot:
                 ch = await get_dest_channel()
                 if ch:
@@ -1331,6 +1357,7 @@ class BridgeScheduler:
                                     prompt=omsg.get("content", ""),
                                     job_name=omsg.get("source", "Detached Task Synthesis"),
                                     channel_id=target_cid,
+                                    job_id=f"outbox_turn_{omsg_id}",
                                 )
                                 print(f"[Outbox] 🟢 Dispatched agent synthesis turn for {omsg_id} to #{ch_name} ({target_cid}).")
                                 continue
@@ -1490,12 +1517,16 @@ class BridgeScheduler:
                     except Exception:
                         pass
 
-                # Check and dispatch completed background SDK tasks via Outbox
+                # FORGE Supervisor Tick: expire stale Decision Cards & dispatch completed SDK tasks via Outbox
                 try:
-                    from tools.task_settle import check_and_dispatch_completed_tasks
-                    check_and_dispatch_completed_tasks()
+                    from tools.forge import forge_supervisor
+                    forge_supervisor.tick_sync()
                 except Exception:
-                    pass
+                    try:
+                        from tools.task_settle import check_and_dispatch_completed_tasks
+                        check_and_dispatch_completed_tasks()
+                    except Exception:
+                        pass
 
                 # Outbox Queue Flusher (Cross-Channel Asynchronous Dispatch)
                 await self.flush_outbox_queue()

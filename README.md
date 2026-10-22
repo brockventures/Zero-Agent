@@ -1,6 +1,18 @@
 # ⚡ ZERO — **Z**enith **E**ngineering & **R**untime **O**perator
 
-**ZERO** (**Z**enith **E**ngineering & **R**untime **O**perator) is a production-grade, stateful, autonomous Discord agent architecture powered by **Google Antigravity** (`agy`). Built for high-leverage systems engineering, homelab operations, ambient team coordination, and intelligent tool workflows.
+**ZERO** (**Z**enith **E**ngineering & **R**untime **O**perator) is a production-grade **Resident Agent** powered by **Google Antigravity** (`agy`). Built for high-leverage systems engineering, homelab operations, ambient multi-agent coordination, and autonomous tool workflows.
+
+---
+
+## 🏛️ What is a Resident Agent?
+
+A **Resident Agent** is an autonomous AI system that lives persistently on dedicated hardware (a home server, NAS, or container cluster) with its own accounts, durable cross-session memory, and scheduled background sidecars—as opposed to an **ephemeral (session) agent** that spins up for a single prompt or IDE chat and vanishes when the tab closes.
+
+Core properties of a Resident Agent:
+1. **Persistent Runtime & Identity:** Runs 24/7 as a long-lived daemon (`systemd`, Docker, or Nomad) bound to its own service accounts (Discord, GitHub, email, Reddit).
+2. **Dual-Tier Durable Memory:** Separates rolling active working context (e.g. 25-turn auto-compaction) from indexed long-term memory (SQLite FTS5 + dense vector hybrid search) and nightly memory consolidation ("dreaming").
+3. **Silent Scheduled Sidecars:** Executes deterministic background health sweeps, watchdogs, and data pipelines on a persistent schedule without burning LLM tokens unless an actionable delta or anomaly requires reasoning.
+4. **Multi-Agent Peer Coordination:** Collaborates alongside human engineers and peer resident agents in shared spaces using explicit turn arbitration (such as the BANANA mutex protocol) and strict privacy air-gaps.
 
 ---
 
@@ -47,9 +59,12 @@
 ### 4. 🗜️ 25-Turn Rolling Auto-Compactor & Carry-Forward Memory
 * Automatically compresses conversation history every 25 turns, extracting durable facts and carry-forward context to ensure infinite conversation sustainability without context blowup.
 
----
+### 5. 🛠️ FORGE — **F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution
+* **Activity-Renewed Progress Leases:** Replaces rigid wall-clock turn timeouts with a 4-signal heartbeat lease (stdout token/step deltas, child PID activity, SDK task log growth, and subagent transcript growth) plus a 3-strike runaway tool-loop circuit breaker.
+* **Isolated Worktree Build Queue (`#forge`):** Decomposes Tier 2/3 engineering specs (`ForgePlan` JSON) into atomic TDD chunks executed inside isolated `git worktree` sandboxes by `gemini-3.8-flash-high` (with automatic escalation to `gemini-4-argon-medium`), updating a live tracker widget in `#forge` and waking the originating channel when the final chunk merges.
+* **Deterministic Decisions Framework (`/queue`):** Backs inline Discord `Approve | Edit | Dismiss` cards with SQLite action payloads in `/workspace/data/forge.db` for zero-token, sub-second execution and modal parameter editing.
 
-## 🚀 Quickstart & Setup
+---
 
 ### 1. Prerequisites
 * Python 3.10+

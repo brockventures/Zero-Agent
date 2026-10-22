@@ -115,9 +115,9 @@ def merge_pr_and_cleanup(repo_dir: Path, pr_number: int, strategy: str = "squash
     view_code, view_out, _ = _run(["gh", "pr", "view", str(pr_number), "--json", "headRefName", "-q", ".headRefName"], repo_dir)
     head_branch = view_out.strip() if view_code == 0 else ""
 
-    # 3. Pull latest main
+    # 3. Pull latest main cleanly (using --rebase --autostash so Tier 1 edits in /workspace are never clobbered)
     _run(["git", "checkout", "main"], repo_dir)
-    _run(["git", "pull", "origin", "main"], repo_dir)
+    _run(["git", "pull", "--rebase", "--autostash", "origin", "main"], repo_dir)
 
     # 4. Clean up worktrees and local branch
     cleaned_wts = cleanup_worktrees(repo_dir)

@@ -9,7 +9,8 @@
     "turn_step_idle_seconds": 150.0,
     "agent_done_cutoff_seconds": 15.0,
     "turn_watchdog_seconds": 300.0,
-    "turn_max_ceiling_seconds": 1800.0,
+    "turn_max_ceiling_seconds": 0.0,
+    "forge_channel_id": 1562899941595160657,
     "live_status_ticker_enabled": false,
     "task_settle_enabled": true,
     "task_settle_timeout_seconds": 25.0,
@@ -39,7 +40,8 @@
         1548196930788524094,
         1555973316752449576,
         1550577908811178095,
-        1550577910757458015
+        1550577910757458015,
+        1562899941595160657
     ],
     "gif_disabled_channels": [
         1534436119888793750,

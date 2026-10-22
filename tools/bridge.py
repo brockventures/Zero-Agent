@@ -112,6 +112,7 @@ from tools.bridge_handlers import (
     external_queue_worker,
     handle_on_ready,
     handle_message,
+    handle_raw_reaction_event,
 )
 from tools.bridge_commands import ON_DEMAND_TRIGGERS
 from tools.bridge_scheduler import (
@@ -773,6 +774,22 @@ async def slash_title(interaction: discord.Interaction, new_title: str):
         await interaction.response.send_message(f"⚠️ Failed to rename thread: {e}", ephemeral=True)
 
 
+@bot.tree.command(name="queue", description="Display the unified FORGE build queue, active tasks, and pending Decision Cards")
+async def slash_queue(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        from tools.forge import format_queue_digest
+        rep = await asyncio.to_thread(format_queue_digest, interaction.channel_id)
+        chunks = chunk_text(rep, limit=1950)
+        for i, c in enumerate(chunks):
+            if i == 0:
+                await interaction.followup.send(c)
+            else:
+                await interaction.channel.send(c)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Error querying FORGE queue: {e}")
+
+
 @bot.listen("on_interaction")
 async def on_button_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.component:
@@ -793,6 +810,40 @@ async def on_button_interaction(interaction: discord.Interaction):
             except Exception:
                 pass
             await _button_choice_callback(choice_text, interaction)
+        elif cid.startswith(("forge_approve:", "forge_dismiss:", "forge_edit:")):
+            action_prefix, decision_id = cid.split(":", 1)
+            if action_prefix == "forge_edit":
+                try:
+                    from tools.forge import ForgeDecisionEditModal, get_db_connection
+                    with get_db_connection() as conn:
+                        row = conn.execute("SELECT payload_json FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
+                    cur_payload = json.loads(row["payload_json"]) if row and row["payload_json"] else {}
+                    await interaction.response.send_modal(ForgeDecisionEditModal(decision_id, cur_payload))
+                except Exception as me:
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(f"⚠️ Could not open edit modal: {me}", ephemeral=True)
+                return
+
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.defer()
+            except Exception:
+                pass
+
+            from tools.forge import dismiss_decision, execute_decision
+            if action_prefix == "forge_approve":
+                res = await asyncio.to_thread(execute_decision, decision_id, interaction.user.id)
+            else:
+                res = await asyncio.to_thread(dismiss_decision, decision_id, interaction.user.id)
+
+            if interaction.message and res.get("formatted_card"):
+                try:
+                    view = discord.ui.View.from_message(interaction.message)
+                    for item in view.children:
+                        item.disabled = True
+                    await interaction.message.edit(content=res["formatted_card"], view=view)
+                except Exception:
+                    pass
 
 
 @bot.event
@@ -860,6 +911,17 @@ async def on_message(msg: discord.Message):
         active_model_getter=_get_active_model,
         active_model_setter=_set_active_model,
     )
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    await handle_raw_reaction_event(payload, bot=bot, added=True)
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    await handle_raw_reaction_event(payload, bot=bot, added=False)
+
 
 
 if __name__ == "__main__":

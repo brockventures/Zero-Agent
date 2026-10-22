@@ -88,6 +88,7 @@ CHANNEL_ACTIVITY_VERBS: dict[str, tuple[str, ...]] = {
     "steam-deck": ("Modding", "Tinkering", "Optimizing", "Overclocking"),
     "projects": ("Architecting", "Shipping", "Building", "Refactoring", "Synthesizing"),
     "zero-ops": ("Wrenching", "Orchestrating", "Scheming", "Tinkering", "Dissecting", "Tuning"),
+    "forge": ("Forging", "Building", "Compiling", "Verifying", "Shipping"),
     "vault": ("Encrypting", "Auditing", "Indexing", "Securing", "Dissecting"),
     "brock-house": ("Coordinating", "Planning", "Organizing", "Tinkering"),
     "the-banana-stand": ("Deliberating", "Scheming", "Coordinating", "Arbitrating", "Synthesizing"),
@@ -278,6 +279,42 @@ class TurnCoordinator:
 
         if self.prompt:
             channel_active_prompts[self.channel_id] = self.prompt
+        self._heartbeat_tracker: Any = None
+        self._last_heartbeat_poll: float = 0.0
+
+    def refresh_activity_lease(self, proc_pid: Optional[int] = None) -> bool:
+        """Poll 4-signal ground-truth heartbeats (child PIDs, SDK task logs, subagent transcripts).
+
+        Renews last_activity_time if any background child or disk artifact is actively advancing.
+        """
+        now = time.time()
+        if (now - self._last_heartbeat_poll) < 2.0:
+            return False
+        self._last_heartbeat_poll = now
+        active = False
+
+        if proc_pid:
+            try:
+                from tools.process_probe import get_process_children
+                if len(get_process_children(proc_pid)) > 0:
+                    active = True
+            except Exception:
+                pass
+
+        if self.conv_id:
+            try:
+                if self._heartbeat_tracker is None:
+                    from tools.forge import HeartbeatTracker
+                    self._heartbeat_tracker = HeartbeatTracker(conv_id=str(self.conv_id))
+                if self._heartbeat_tracker.poll_disk_progress(conv_id=str(self.conv_id)):
+                    active = True
+            except Exception:
+                pass
+
+        if active:
+            self.touch_activity()
+            self.maybe_touch_beacon()
+        return active
 
     def touch_activity(self):
         """Record that stdout/stderr data or an event was received."""
@@ -386,27 +423,55 @@ class TurnCoordinator:
         self,
         step_idle_timeout: float = 150.0,
         turn_timeout_seconds: float = 300.0,
-        max_turn_ceiling: float = 1800.0,
+        max_turn_ceiling: float = 0.0,
         has_active_children: bool = False,
+        proc_pid: Optional[int] = None,
     ) -> tuple[bool, str]:
-        """Evaluate two-tier inactivity and hard turn ceilings.
+        """Evaluate activity-renewed progress lease and runaway loop circuit breaker.
 
+        The blind 30m wall-clock guillotine is retired (max_turn_ceiling defaults to 0.0).
+        If max_turn_ceiling > 0 is explicitly supplied, it only triggers when the turn is also idle
+        (no recent activity within step_idle_timeout and no active children/heartbeats).
         Returns: (is_timed_out, reason_description)
         """
+        if proc_pid is not None or self.conv_id:
+            if self.refresh_activity_lease(proc_pid=proc_pid):
+                has_active_children = True
+
         now = time.time()
-        is_step_idle = (now - self.last_activity_time) >= step_idle_timeout and not has_active_children
-        is_turn_timeout = (now - self.last_activity_time) >= turn_timeout_seconds and not has_active_children
-        self.is_hard_ceiling = (now - self.turn_start_time) >= max_turn_ceiling
+        idle_elapsed = now - self.last_activity_time
+        is_step_idle = idle_elapsed >= step_idle_timeout and not has_active_children
+        is_turn_timeout = idle_elapsed >= turn_timeout_seconds and not has_active_children
+
+        # Runaway tool loop check (3 identical failing tool calls in a row)
+        if self.conv_id and (now - self.turn_start_time) >= 15.0:
+            try:
+                from tools.forge import check_runaway_tool_loop
+                is_loop, loop_reason = check_runaway_tool_loop(self.conv_id)
+                if is_loop:
+                    self.timed_out = True
+                    self.timeout_reason = loop_reason
+                    return True, loop_reason
+            except Exception:
+                pass
+
+        # Retired wall-clock guillotine: never kill an actively progressing turn
+        self.is_hard_ceiling = (
+            max_turn_ceiling > 0.0
+            and (now - self.turn_start_time) >= max_turn_ceiling
+            and idle_elapsed >= step_idle_timeout
+            and not has_active_children
+        )
 
         if is_step_idle or is_turn_timeout or self.is_hard_ceiling:
             self.timed_out = True
             reason = (
-                f"{int(step_idle_timeout)}s step idle"
-                if is_step_idle
+                f"{int(max_turn_ceiling)}s hard ceiling"
+                if self.is_hard_ceiling
                 else (
-                    f"{int(turn_timeout_seconds)}s turn idle"
-                    if is_turn_timeout
-                    else f"{int(max_turn_ceiling)}s hard ceiling"
+                    f"{int(step_idle_timeout)}s step idle"
+                    if is_step_idle
+                    else f"{int(turn_timeout_seconds)}s turn idle"
                 )
             )
             self.timeout_reason = reason
@@ -618,7 +683,7 @@ class TurnCoordinator:
             rules = get_runtime_rules()
 
         watchdog_timeout = float(rules.get("turn_watchdog_seconds", 300.0))
-        max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 1800.0))
+        max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 0.0))
         escalation_seconds = float(rules.get("auto_thread_escalation_seconds", 180.0))
         escalation_enabled = rules.get("auto_thread_escalation_enabled", True)
         ticker_enabled = rules.get("live_status_ticker_enabled", False)
@@ -666,6 +731,7 @@ class TurnCoordinator:
                         turn_timeout_seconds=watchdog_timeout,
                         max_turn_ceiling=max_turn_ceiling,
                         has_active_children=has_children,
+                        proc_pid=proc_pid,
                     )
                     if is_timeout:
                         print(
