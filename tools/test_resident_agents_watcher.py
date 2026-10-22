@@ -191,8 +191,8 @@ def test_seeding_thread_scoring_and_draft_generation() -> None:
         "over_18": False,
         "url": "https://www.reddit.com/r/LocalLLaMA/comments/seed1/how_are_you/",
     }
-    assert SEEDING_MAX_POSTS_PER_DAY == 1
-    assert SEEDING_MIN_POST_INTERVAL_SEC >= 43200
+    assert SEEDING_MAX_POSTS_PER_DAY == 2
+    assert SEEDING_MIN_POST_INTERVAL_SEC >= 21600
     assert SEEDING_SCAN_INTERVAL_SEC >= 14400
 
     # Pure structural metadata checks (no regex/keyword heuristics)

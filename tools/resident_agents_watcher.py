@@ -117,9 +117,9 @@ SEEDING_SUBREDDITS = [
     "homelab",
 ]
 
-# Seeding rate limits & quality bar (max 1 post/day, >=12h spacing, >=85.0 Flash LLM relevance score)
-SEEDING_MAX_POSTS_PER_DAY = 1
-SEEDING_MIN_POST_INTERVAL_SEC = 43200  # 12 hours
+# Seeding rate limits & quality bar (max 2 posts/day, >=6h spacing, >=85.0 Flash LLM relevance score)
+SEEDING_MAX_POSTS_PER_DAY = 2
+SEEDING_MIN_POST_INTERVAL_SEC = 21600  # 6 hours
 SEEDING_SCAN_INTERVAL_SEC = 14400      # 4 hours
 SEEDING_MIN_SCORE = 85.0
 SEEDING_MAX_AGE_HOURS = 12.0
