@@ -49,6 +49,8 @@ from tools.forge import (
     get_job_status,
     init_forge_db,
     list_jobs,
+    prune_completed_build_widgets,
+    render_build_widget_embed,
     render_build_widget_text,
     stage_decision,
      validate_forge_plan,
@@ -146,6 +148,24 @@ class TestForgeEngine(unittest.TestCase):
         self.assertIn("Eliminate turn-0 discovery reads", widget)
         self.assertIn("0/2 chunk(s) merged", widget)
         self.assertIn("gemini-3.8-flash-high", widget)
+
+        embed = render_build_widget_embed(build_id, db_path=self.db_path)
+        self.assertEqual(embed["color"], 0xF59E0B)
+        self.assertIn("Upgrade Telemetry & Queue Engine", embed["title"])
+        self.assertIn("**0/2** chunks", embed["description"])
+        self.assertIn("1.** Build SQLite Schema", embed["description"])
+
+        # Verify 1h TTL auto-delete for completed build cards
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            conn.execute(
+                "UPDATE forge_builds SET status = 'completed', forge_message_id = 123456789, updated_at = ? WHERE id = ?",
+                (time.time() - 3700.0, build_id),
+            )
+        pruned = prune_completed_build_widgets(ttl_seconds=3600.0, db_path=self.db_path, delete_remote=False)
+        self.assertIn(build_id, pruned)
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            row_after = conn.execute("SELECT forge_message_id FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
+            self.assertIsNone(row_after["forge_message_id"])
 
         prompt_c0 = format_chunk_prompt(build_id, 0, db_path=self.db_path, worktree_dir="/workspace")
         self.assertIn("Use WAL mode on SQLite connections.", prompt_c0)

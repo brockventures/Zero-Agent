@@ -538,24 +538,40 @@ def _detect_touches_core_bridge(plan: dict) -> bool:
     return False
 
 
-def render_build_widget_text(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> str:
-    """Render the live Discord tracker widget markdown for a FORGE build in #forge."""
+COMPLETED_WIDGET_TTL_SECONDS = 3600.0
+
+
+def _compact_diff_stat(diff_stat: str) -> str:
+    """Condense `1 file changed, 165 insertions(+), 609 deletions(-)` into `+165/-609`."""
+    if not diff_stat:
+        return ""
+    ins = re.search(r"(\d+)\s+insertion", diff_stat)
+    dels = re.search(r"(\d+)\s+deletion", diff_stat)
+    if ins or dels:
+        i_val = ins.group(1) if ins else "0"
+        d_val = dels.group(1) if dels else "0"
+        return f"+{i_val}/-{d_val}"
+    return diff_stat.strip()[:28]
+
+
+def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
+    """Render a compact native Discord Embed dict for a FORGE build in #forge."""
     with get_db_connection(db_path) as conn:
         build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
         if not build:
-            return f"⚠️ Build `{build_id}` not found."
+            return {"title": f"⚠️ Build {build_id} not found", "color": 0xEF4444}
         chunks = conn.execute(
             "SELECT * FROM forge_chunks WHERE build_id = ? ORDER BY chunk_index ASC",
             (build_id,),
         ).fetchall()
 
-    status_map = {
-        "queued": ("⏳", "QUEUED"),
-        "running": ("🔨", "RUNNING"),
-        "awaiting_approval": ("🛑", "AWAITING APPROVAL"),
-        "completed": ("✅", "COMPLETED"),
-        "failed": ("❌", "FAILED"),
-        "cancelled": ("⚠️", "CANCELLED"),
+    status_meta = {
+        "queued": ("⏳", "QUEUED", 0xF59E0B),
+        "running": ("🔨", "RUNNING", 0xA855F7),
+        "awaiting_approval": ("🛑", "AWAITING APPROVAL", 0xF59E0B),
+        "completed": ("✅", "COMPLETED", 0x10B981),
+        "failed": ("❌", "FAILED", 0xEF4444),
+        "cancelled": ("⚠️", "CANCELLED", 0x6B7280),
     }
     chunk_badge_map = {
         "pending": "⏳",
@@ -566,50 +582,72 @@ def render_build_widget_text(build_id: str, db_path: Path | str = FORGE_DB_PATH)
         "failed": "❌",
     }
 
-    b_emoji, b_label = status_map.get(build["status"], ("⚙️", build["status"].upper()))
+    b_emoji, b_label, color = status_meta.get(build["status"], ("⚙️", build["status"].upper(), 0x3B82F6))
     origin_ref = f"<#{build['origin_thread_id'] or build['origin_channel_id']}>"
-    repo_name = Path(build["repo"]).name or "workspace"
-
-    lines = [
-        f"### {b_emoji} FORGE Build `{build['id']}`: {build['title']}",
-        f"- **Status:** **{b_label}** | **Tier:** {build['tier']} | **Repo:** `{repo_name}` | **Origin:** {origin_ref}",
-    ]
-    if build["objective"] and build["objective"].strip() != build["title"].strip():
-        lines.append(f"- **Objective:** {build['objective'].strip()}")
+    repo_name = Path(build["repo"]).name or "Zero-Agent"
+    if repo_name == "workspace":
+        repo_name = "Zero-Agent"
 
     total = len(chunks)
     merged_count = sum(1 for c in chunks if c["status"] == "merged")
-    lines.append(f"- **Progress:** {merged_count}/{total} chunk(s) merged")
-    lines.append("")
+    header_line = f"**{b_label}** · `{repo_name}` · {origin_ref} · **{merged_count}/{total}** chunks"
 
-    # Collapse older merged chunks if > 10 chunks total
     display_chunks = list(chunks)
-    if len(display_chunks) > 10:
+    chunk_lines: list[str] = []
+    if len(display_chunks) > 8:
         merged_indices = [i for i, c in enumerate(display_chunks) if c["status"] == "merged"]
-        if len(merged_indices) > 4:
-            hidden_count = len(merged_indices) - 3
-            lines.append(f"- ✅ *({hidden_count} earlier chunk(s) verified and merged)*")
-            keep_set = set(merged_indices[-3:]) | {i for i, c in enumerate(display_chunks) if c["status"] != "merged"}
+        if len(merged_indices) > 3:
+            hidden_count = len(merged_indices) - 2
+            chunk_lines.append(f"✅ *+{hidden_count} earlier chunk(s) merged*")
+            keep_set = set(merged_indices[-2:]) | {i for i, c in enumerate(display_chunks) if c["status"] != "merged"}
             display_chunks = [c for i, c in enumerate(display_chunks) if i in keep_set]
 
     for c in display_chunks:
         c_emoji = chunk_badge_map.get(c["status"], "•")
         idx_num = c["chunk_index"] + 1
-        model_tag = c["worker_model"]
-        ch_repo_suffix = ""
-        if c["repo"] and Path(c["repo"]).resolve() != Path(build["repo"]).resolve():
-            ch_repo_suffix = f" (`{Path(c['repo']).name}`)"
         pr_suffix = f" (PR #{c['pr_number']})" if c["pr_number"] else ""
-        diff_suffix = f" — `{c['diff_stat']}`" if c["diff_stat"] else ""
-        lines.append(
-            f"- {c_emoji} **Chunk {idx_num}/{total}: {c['title']}**{ch_repo_suffix} [`{model_tag}`]{pr_suffix}{diff_suffix}"
-        )
+        compact_diff = _compact_diff_stat(c["diff_stat"])
+        diff_suffix = f" (`{compact_diff}`)" if compact_diff else ""
+        chunk_lines.append(f"{c_emoji} **{idx_num}.** {c['title']}{pr_suffix}{diff_suffix}")
         if c["status"] == "failed" and c["last_error"]:
-            err_snip = c["last_error"].strip().splitlines()[-1][:140]
-            lines.append(f"  - ⚠️ Error: `{err_snip}`")
+            err_snip = c["last_error"].strip().splitlines()[-1][:110]
+            chunk_lines.append(f"  ⚠️ `{err_snip}`")
 
-    lines.append(f"\n*Updated {_now_pt_str(build['updated_at'])}*")
-    return "\n".join(lines)
+    desc = header_line + ("\n\n" + "\n".join(chunk_lines) if chunk_lines else "")
+    footer_suffix = " · Auto-clears in 1h" if build["status"] == "completed" else ""
+    return {
+        "title": f"{b_emoji} {build['title'][:220]}",
+        "description": desc[:4000],
+        "color": color,
+        "footer": {
+            "text": f"{build['id']} · Updated {_now_pt_str(build['updated_at'])}{footer_suffix}"
+        },
+    }
+
+
+def render_build_widget_text(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> str:
+    """Render the CLI/text summary for a FORGE build."""
+    with get_db_connection(db_path) as conn:
+        build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
+        if not build:
+            return f"⚠️ Build `{build_id}` not found."
+        chunks = conn.execute(
+            "SELECT * FROM forge_chunks WHERE build_id = ? ORDER BY chunk_index ASC",
+            (build_id,),
+        ).fetchall()
+
+    embed = render_build_widget_embed(build_id, db_path=db_path)
+    total = len(chunks)
+    merged_count = sum(1 for c in chunks if c["status"] == "merged")
+    models = sorted({c["worker_model"] for c in chunks if c["worker_model"]})
+    obj_line = f"\n- **Objective:** {build['objective'].strip()}" if build["objective"] else ""
+    return (
+        f"### {embed['title']} (`{build['id']}`)\n"
+        f"- {embed['description'].splitlines()[0]} | `{', '.join(models)}`\n"
+        f"- **Progress:** {merged_count}/{total} chunk(s) merged{obj_line}\n\n"
+        + "\n".join(embed["description"].splitlines()[2:])
+        + f"\n\n*{embed['footer']['text']}*"
+    )
 
 
 def post_or_update_build_widget(
@@ -617,8 +655,8 @@ def post_or_update_build_widget(
     db_path: Path | str = FORGE_DB_PATH,
     forge_channel_id: int = FORGE_CHANNEL_ID,
 ) -> Optional[int]:
-    """Post or edit the single live tracker message for `build_id` inside #forge via Discord REST API."""
-    content = render_build_widget_text(build_id, db_path=db_path)
+    """Post or edit the single live Discord Embed card for `build_id` inside #forge via REST API v10."""
+    embed = render_build_widget_embed(build_id, db_path=db_path)
     try:
         from tools.deliver_image import get_discord_token
         token = get_discord_token()
@@ -632,15 +670,16 @@ def post_or_update_build_widget(
             return None
         msg_id = row["forge_message_id"]
 
+    payload = {"content": "", "embeds": [embed]}
     try:
         if msg_id:
             url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
-            resp = requests.patch(url, headers=headers, json={"content": content[:1990]}, timeout=10)
+            resp = requests.patch(url, headers=headers, json=payload, timeout=10)
             if resp.status_code < 300:
                 return int(msg_id)
 
         url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages"
-        resp = requests.post(url, headers=headers, json={"content": content[:1990]}, timeout=10)
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
         if resp.status_code < 300:
             new_msg_id = int(resp.json()["id"])
             with get_db_connection(db_path) as conn:
@@ -652,6 +691,61 @@ def post_or_update_build_widget(
     except Exception as e:
         print(f"[FORGE] Warning updating #forge widget for {build_id}: {e}")
     return None
+
+
+def prune_completed_build_widgets(
+    ttl_seconds: float = COMPLETED_WIDGET_TTL_SECONDS,
+    db_path: Path | str = FORGE_DB_PATH,
+    forge_channel_id: int = FORGE_CHANNEL_ID,
+    delete_remote: bool = True,
+) -> list[str]:
+    """Delete Discord embed cards in #forge for completed builds older than `ttl_seconds` (default 1h)."""
+    cutoff = time.time() - float(ttl_seconds)
+    pruned_ids: list[str] = []
+    with get_db_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, forge_message_id FROM forge_builds
+            WHERE status = 'completed'
+              AND forge_message_id IS NOT NULL
+              AND updated_at <= ?
+            """,
+            (cutoff,),
+        ).fetchall()
+
+    if not rows:
+        return pruned_ids
+
+    token = None
+    if delete_remote:
+        try:
+            from tools.deliver_image import get_discord_token
+            token = get_discord_token()
+        except Exception:
+            token = None
+
+    headers = {"Authorization": f"Bot {token}"} if token else {}
+    for r in rows:
+        b_id = r["id"]
+        msg_id = r["forge_message_id"]
+        deleted_ok = not delete_remote
+        if delete_remote and token and msg_id:
+            try:
+                url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
+                resp = requests.delete(url, headers=headers, timeout=10)
+                if resp.status_code in (200, 204, 404):
+                    deleted_ok = True
+            except Exception:
+                pass
+        if deleted_ok:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE forge_builds SET forge_message_id = NULL WHERE id = ?",
+                    (b_id,),
+                )
+            pruned_ids.append(b_id)
+
+    return pruned_ids
 
 
 def enqueue_build(
@@ -1096,8 +1190,9 @@ class ForgeSupervisor:
         self._active_build_proc: Optional[subprocess.Popen] = None
 
     def tick_sync(self) -> dict:
-        """Synchronous housekeeping tick: expire stale decisions, dispatch SDK tasks, and advance queued builds."""
+        """Synchronous housekeeping tick: expire stale decisions, prune 1h completed #forge cards, dispatch SDK tasks, and advance queued builds."""
         expired = expire_stale_decisions(db_path=self.db_path)
+        pruned_widgets = prune_completed_build_widgets(db_path=self.db_path)
         dispatched_sdk = []
         try:
             from tools.task_settle import check_and_dispatch_completed_tasks
@@ -1108,6 +1203,7 @@ class ForgeSupervisor:
         spawned_build = self.maybe_spawn_next_build_worker()
         return {
             "expired_decisions": expired,
+            "pruned_widgets": pruned_widgets,
             "dispatched_sdk_tasks": len(dispatched_sdk),
             "spawned_build": spawned_build,
         }
