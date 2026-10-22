@@ -56,6 +56,7 @@ SIDECAR_MODEL_MAP: dict[str, str] = {
     "dreaming": "gemini-3.8-flash-low",
     "personal_data_sync": "gemini-3.8-flash-low",
     "amazon_order_listener": "gemini-3.8-flash-low",
+    "resident_agents_seeding": "gemini-3.8-flash-low",
 }
 
 

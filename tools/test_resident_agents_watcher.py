@@ -17,10 +17,15 @@ from tools.resident_agents_watcher import (
     MEGATHREAD_TITLE,
     REDDIT_HANDLE_TO_DISCORD_SNOWFLAKE,
     RESIDENT_AGENTS_CHANNEL_ID,
+    SEEDING_MAX_POSTS_PER_DAY,
+    SEEDING_MIN_POST_INTERVAL_SEC,
+    SEEDING_MIN_SCORE,
+    SEEDING_SCAN_INTERVAL_SEC,
     build_upvote_targets_for_reply,
     check_and_assign_daily_links,
     classify_item_needs_approval,
     detect_desired_flair,
+    evaluate_seeding_candidates_llm,
     find_unassigned_daily_links_message,
     format_daily_link_assignment_prompt,
     format_daily_tip_prompt,
@@ -30,6 +35,7 @@ from tools.resident_agents_watcher import (
     generate_seeding_comment_draft,
     get_daily_link_assignee,
     get_daily_tip_assignee,
+    is_eligible_seeding_metadata,
     load_state,
     parse_candidate_links,
     run_resident_agents_daily_links,
@@ -173,6 +179,7 @@ def test_seeding_thread_scoring_and_draft_generation() -> None:
     now_ts = 1792630000.0
     high_signal_post = {
         "name": "t3_seed1",
+        "fullname": "t3_seed1",
         "subreddit": "LocalLLaMA",
         "author": "some_builder",
         "title": "How are you handling long-term memory and cron schedules for an always-on home server agent?",
@@ -182,22 +189,63 @@ def test_seeding_thread_scoring_and_draft_generation() -> None:
         "stickied": False,
         "locked": False,
         "over_18": False,
+        "url": "https://www.reddit.com/r/LocalLLaMA/comments/seed1/how_are_you/",
     }
-    score, reasons = score_seeding_thread(high_signal_post, now_utc=now_ts)
-    assert score >= 55.0
-    assert any("Agent + Persistence Anchor" in r for r in reasons)
+    assert SEEDING_MAX_POSTS_PER_DAY == 1
+    assert SEEDING_MIN_POST_INTERVAL_SEC >= 43200
+    assert SEEDING_SCAN_INTERVAL_SEC >= 14400
 
-    low_signal_post = {
-        "name": "t3_seed2",
-        "subreddit": "LocalLLaMA",
-        "author": "meme_poster",
-        "title": "[Meme] When your GPU runs out of VRAM",
-        "selftext": "",
+    # Pure structural metadata checks (no regex/keyword heuristics)
+    ok_meta, _ = is_eligible_seeding_metadata(high_signal_post, now_utc=now_ts)
+    assert ok_meta is True
+    ok_locked, _ = is_eligible_seeding_metadata({**high_signal_post, "locked": True}, now_utc=now_ts)
+    assert ok_locked is False
+
+    workplace_post = {
+        "name": "t3_work1",
+        "fullname": "t3_work1",
+        "subreddit": "ClaudeAI",
+        "author": "marmelab",
+        "title": "When non-dev colleagues build internal apps with Claude Code, where do you host them?",
+        "selftext": "Some of my colleagues aren't developers, but they build internal apps with Claude Code on their laptops and want them self-hosted at work.",
         "created_utc": now_ts - 1800,
-        "num_comments": 2,
+        "num_comments": 5,
+        "url": "https://www.reddit.com/r/ClaudeAI/comments/work1/when_nondev/",
     }
-    low_score, _ = score_seeding_thread(low_signal_post, now_utc=now_ts)
-    assert low_score < 0
+
+    # Verify Flash LLM semantic evaluator selects genuine resident-agent thread and drafts grounded reply
+    mock_approve_json = {
+        "selected_index": 1,
+        "score": 94.0,
+        "rationale": "Directly discusses long-term memory compaction and cron scheduling for a 24/7 home server agent.",
+        "comment_draft": (
+            "Ran into this exact wall once I moved from one-off chat tabs to running a resident agent 24/7 in Docker on my home NAS. "
+            "Splitting recent verbatim turns from a local SQLite FTS5 index over markdown notes stopped the context rot—how are you deciding what gets compacted vs kept verbatim?"
+        ),
+    }
+    with patch("tools.llm_sidecar.call_sidecar_llm_json", return_value=mock_approve_json):
+        eval_res = evaluate_seeding_candidates_llm([workplace_post, high_signal_post], now_utc=now_ts)
+        assert eval_res is not None
+        assert eval_res["candidate"]["fullname"] == "t3_seed1"
+        assert eval_res["score"] == 94.0
+        assert "resident agent" in eval_res["draft"].lower()
+        assert "r/residentagents" not in eval_res["draft"].lower()
+
+        score, reasons = score_seeding_thread(high_signal_post, now_utc=now_ts)
+        assert score >= SEEDING_MIN_SCORE
+
+    # Verify Flash LLM semantic evaluator cleanly rejects off-topic workplace / non-resident threads
+    mock_reject_json = {
+        "selected_index": None,
+        "score": 15.0,
+        "rationale": "Thread is about enterprise hosting for internal colleague web apps, not persistent resident agents.",
+        "comment_draft": "",
+    }
+    with patch("tools.llm_sidecar.call_sidecar_llm_json", return_value=mock_reject_json):
+        assert evaluate_seeding_candidates_llm([workplace_post], now_utc=now_ts) is None
+        work_score, _ = score_seeding_thread(workplace_post, now_utc=now_ts)
+        assert work_score == 0.0
+        assert generate_seeding_comment_draft(workplace_post) is None
 
     cand = {
         "fullname": "t3_seed1",
@@ -205,14 +253,10 @@ def test_seeding_thread_scoring_and_draft_generation() -> None:
         "author": "some_builder",
         "title": high_signal_post["title"],
         "selftext": high_signal_post["selftext"],
-        "url": "https://www.reddit.com/r/LocalLLaMA/comments/seed1/how_are_you/",
-        "score": score,
+        "url": high_signal_post["url"],
+        "score": 94.0,
     }
-    draft = generate_seeding_comment_draft(cand)
-    assert "resident agent" in draft.lower()
-    assert "r/residentagents" not in draft.lower()
-
-    card = format_seeding_card(cand, draft, posted_url=cand["url"])
+    card = format_seeding_card(cand, mock_approve_json["comment_draft"], posted_url=cand["url"])
     assert "u/prime416" in card
     assert "r/LocalLLaMA" in card
     assert "Auto-Posted" in card
