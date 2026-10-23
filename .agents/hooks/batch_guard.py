@@ -21,7 +21,7 @@ MAX_CONSECUTIVE_INLINE_PYTHON = 2
 MAX_CONSECUTIVE_SAME_FILE_VIEWS = 2
 MAX_WIDE_SAME_FILE_VIEWS = 4
 WIDE_VIEW_MIN_LINES = 350
-MAX_CONSECUTIVE_FILE_VIEWS = 4
+MAX_CONSECUTIVE_FILE_VIEWS = 6
 MAX_CONSECUTIVE_SAME_FILE_EDITS = 3
 MAX_CONSECUTIVE_GIT_CMDS = 2
 MAX_VERSIONED_SCRATCH_SWEEPS = 3
@@ -196,6 +196,14 @@ def is_ouroboros_polling_loop(cmd: str) -> bool:
     return bool(re.search(pattern, cmd))
 
 
+def is_proc_fd_stream_read(cmd: str) -> bool:
+    """Detect tail/cat/head/grep against open container stdio FIFO pipes (/proc/1/fd/* or /proc/self/fd/*)."""
+    if not cmd:
+        return False
+    pattern = r"\b(?:tail|cat|head|grep|egrep|fgrep|rg|sed|awk)\b[^\n;|]*?/proc/(?:1|self|\d+)/fd/[012]\b"
+    return bool(re.search(pattern, cmd))
+
+
 def _check_inline_production_edit_gate(
     target_file: str,
     cwd: str,
@@ -271,6 +279,14 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                 "are prohibited because 'pgrep -f' matches its own bash -c wrapper and deadlocks the turn. "
                 "For SDK background tasks, stop calling tools silently and let the task completion event wake you; "
                 "for jobs >90 seconds, use 'python3 /workspace/tools/forge.py job start ...' (or detached_runner.py)."
+            )
+
+        # A0a. Container /proc/1/fd FIFO Stream Read Guard
+        if is_proc_fd_stream_read(cmd):
+            return False, (
+                "Proc FD Stream Guard Triggered: Reading container stdio pipes (/proc/1/fd/* or /proc/self/fd/*) "
+                "with tail/cat/head/grep blocks indefinitely on open FIFO streams and wedges the turn. "
+                "Inspect log files in /workspace/logs/ or /tmp/ directly instead."
             )
 
         # A0b. Unbounded Home Assistant Recorder SQLite Guard

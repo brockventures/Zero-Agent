@@ -579,6 +579,11 @@ def chunk_text(text: str, max_len: int = 1980) -> list[str]:
     in_code_block = False
     code_lang = ""
 
+    def _finalize_chunk(buf: list[str]) -> str:
+        # Strip leading/trailing newlines and trailing whitespace, but preserve leading spaces
+        # on the first non-empty line so nested 2-space bullets are never flattened across splits.
+        return "".join(buf).strip("\r\n").rstrip()
+
     for idx, line in enumerate(lines):
         stripped = line.strip()
         is_code_fence = stripped.startswith("```")
@@ -596,18 +601,34 @@ def chunk_text(text: str, max_len: int = 1980) -> list[str]:
                     found_close = True
                     break
             if found_close and (current_len + block_len > max_len):
-                chunks.append("".join(current_chunk).strip())
+                chunks.append(_finalize_chunk(current_chunk))
                 current_chunk = []
                 current_len = 0
 
         overhead = (len(code_lang) + 12) if in_code_block else 0
+
+        # Prevent orphaned section headers (### ...) or colon-terminated parent bullets (- **Label:**)
+        # at the bottom of a chunk when their first child line would immediately overflow into the next chunk.
+        if not in_code_block and current_chunk and (
+            re.match(r"^#{1,4}\s+\S", stripped)
+            or re.match(r"^(?:[-*]|\d+\.)\s+.*:(?:\*{1,2}|_)?\s*$", stripped)
+        ):
+            lookahead_len = len(line)
+            for j in range(idx + 1, len(lines)):
+                lookahead_len += len(lines[j])
+                if lines[j].strip():
+                    break
+            if current_len + lookahead_len + overhead > max_len and lookahead_len <= max_len:
+                chunks.append(_finalize_chunk(current_chunk))
+                current_chunk = []
+                current_len = 0
 
         # If a single line exceeds max_len on its own, flush current chunk and split the line
         if len(line) + overhead > max_len:
             if current_chunk:
                 if in_code_block:
                     current_chunk.append("\n```\n")
-                chunks.append("".join(current_chunk).strip())
+                chunks.append(_finalize_chunk(current_chunk))
                 current_chunk = []
                 current_len = 0
                 if in_code_block:
@@ -638,7 +659,7 @@ def chunk_text(text: str, max_len: int = 1980) -> list[str]:
             if current_chunk:
                 if in_code_block:
                     current_chunk.append("\n```\n")
-                chunks.append("".join(current_chunk).strip())
+                chunks.append(_finalize_chunk(current_chunk))
                 current_chunk = []
                 current_len = 0
                 if in_code_block:
@@ -658,7 +679,7 @@ def chunk_text(text: str, max_len: int = 1980) -> list[str]:
         current_len += len(line)
 
     if current_chunk:
-        chunks.append("".join(current_chunk).strip())
+        chunks.append(_finalize_chunk(current_chunk))
 
     return [c for c in chunks if c]
 

@@ -90,14 +90,19 @@ class TestBatchGuard(unittest.TestCase):
         )
         self.assertFalse(allowed)
 
-    def test_view_file_across_different_files_blocks_on_fifth(self):
-        files = ["/a.py", "/b.py", "/c.py", "/d.py"]
+    def test_view_file_across_different_files_blocks_on_seventh(self):
+        files = ["/a.py", "/b.py", "/c.py", "/d.py", "/e.py", "/f.py"]
         for f in files:
             allowed, _ = check_tool_use("view_file", {"AbsolutePath": f})
             self.assertTrue(allowed)
-        allowed, reason = check_tool_use("view_file", {"AbsolutePath": "/e.py"})
+        allowed, reason = check_tool_use("view_file", {"AbsolutePath": "/g.py"})
         self.assertFalse(allowed)
-        self.assertIn("5 consecutive serial view_file calls", reason)
+        self.assertIn("7 consecutive serial view_file calls", reason)
+
+    def test_proc_fd_stream_read_blocked(self):
+        allowed, reason = check_batching("tail -n 120 /proc/1/fd/1 /proc/1/fd/2")
+        self.assertFalse(allowed)
+        self.assertIn("Proc FD Stream Guard Triggered", reason)
 
     def test_replace_file_content_same_file_blocks_on_fourth(self):
         for _ in range(3):

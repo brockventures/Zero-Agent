@@ -453,6 +453,25 @@ class TestBridgeFormatting(unittest.TestCase):
         # Second chunk should cleanly start with the code block
         self.assertTrue(chunks[1].startswith("```python"))
 
+    def test_chunk_text_prevents_orphaned_parent_bullets_and_preserves_nested_indent(self):
+        """Verify colon-terminated parent bullets stay attached to their first child and nested indentation is preserved across splits."""
+        intro = "Intro paragraph line of text.\n" * 65  # 1950 chars (parent_bullet fits in 1980, but parent_bullet + child_1 overflows)
+        parent_bullet = "- **2024 Walk-Forward Holdout:**\n"
+        child_1 = "  - *Starting Pitchers:* Mean MAE drops cleanly.\n"
+        child_2 = "  - *Relievers:* Brier score improves across all folds.\n" * 6
+        full_text = f"{intro}{parent_bullet}{child_1}{child_2}"
+
+        chunks = chunk_text(full_text, 1980)
+        self.assertEqual(len(chunks), 2)
+        self.assertFalse(chunks[0].endswith("- **2024 Walk-Forward Holdout:**"))
+        self.assertTrue(chunks[1].startswith("- **2024 Walk-Forward Holdout:**\n  - *Starting Pitchers:*"))
+
+        # Even if a chunk split happens between two indented child bullets, leading 2-space indent on Chunk 2 is preserved
+        long_children = "  - *Sub-bullet item:* Detailed metric verification line across multiple seasons.\n" * 30
+        split_children = chunk_text(f"- **Header:**\n{long_children}", 1000)
+        self.assertGreaterEqual(len(split_children), 2)
+        self.assertTrue(split_children[1].startswith("  - *Sub-bullet item:*"))
+
     def test_clean_discord_latex(self):
         latex_text = "Let $x$ be the variable and $$\\alpha + \\beta = \\gamma$$ for calculation."
         cleaned = clean_discord_latex(latex_text)
