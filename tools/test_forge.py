@@ -155,6 +155,31 @@ class TestForgeEngine(unittest.TestCase):
         self.assertIn("**0/2** chunks", embed["description"])
         self.assertIn("1.** Build SQLite Schema", embed["description"])
 
+        # Verify live stream-json telemetry extraction and active chunk card rendering
+        sample_tool_ev = json.dumps({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "state": "RUNNING",
+                "tool_name": "edit_file",
+                "thinking": "Adding live stream telemetry to #forge embed cards.",
+                "tool_info": {"parameters": {"Path": "/workspace/tools/forge.py"}},
+            },
+        })
+        live_str, step_cnt = forge_mod.extract_live_chunk_telemetry(sample_tool_ev, step_count=3)
+        self.assertEqual(step_cnt, 4)
+        self.assertIn("Step 4 · Editing `forge.py`", live_str)
+        self.assertIn("Adding live stream telemetry", live_str)
+
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            conn.execute(
+                "UPDATE forge_chunks SET status = 'running', started_at = ?, live_status = ? WHERE build_id = ? AND chunk_index = 0",
+                (time.time() - 42.0, live_str, build_id),
+            )
+        embed_running = render_build_widget_embed(build_id, db_path=self.db_path)
+        self.assertIn("↳ ⚡", embed_running["description"])
+        self.assertIn("Step 4 · Editing `forge.py`", embed_running["description"])
+
         # Verify 1h TTL auto-delete for completed build cards
         with forge_mod.get_db_connection(self.db_path) as conn:
             conn.execute(

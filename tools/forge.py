@@ -321,6 +321,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
                 pr_number INTEGER,
                 branch_name TEXT,
                 diff_stat TEXT NOT NULL DEFAULT '',
+                live_status TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',
                 started_at REAL,
                 completed_at REAL,
@@ -377,6 +378,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
         _ensure_column(conn, "forge_chunks", "repo", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "forge_chunks", "target_symbols_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "forge_chunks", "shared_context_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "forge_chunks", "live_status", "TEXT NOT NULL DEFAULT ''")
 
 
 # Initialize schema on import
@@ -742,6 +744,91 @@ def _compact_diff_stat(diff_stat: str) -> str:
     return diff_stat.strip()[:28]
 
 
+def extract_live_chunk_telemetry(line: str, step_count: int = 0) -> tuple[Optional[str], int]:
+    """Parse a single `agy --output-format=stream-json` line into a concise live status string and updated step count.
+
+    Returns (status_string_or_None, updated_step_count).
+    """
+    s = line.strip()
+    if not s.startswith("{"):
+        return None, step_count
+    try:
+        ev = json.loads(s)
+    except Exception:
+        return None, step_count
+    if not isinstance(ev, dict):
+        return None, step_count
+
+    ev_name = ev.get("event") or ev.get("type")
+    if ev_name != "step_update":
+        return None, step_count
+
+    step = ev.get("step_update")
+    if not isinstance(step, dict):
+        return None, step_count
+
+    stype = step.get("step_type")
+    sstate = step.get("state")
+    tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
+
+    if (stype in ("tool", "system_message", "system") or tname) and sstate != "DONE":
+        step_count += 1
+        tinfo = step.get("tool_info") or {}
+        params = tinfo.get("parameters") or {}
+        action = f"Calling `{tname or 'tool'}`"
+        if tname == "run_command":
+            summary = str(params.get("toolSummary") or "").strip()
+            cmd_line = str(params.get("CommandLine") or "").strip().splitlines()[0] if params.get("CommandLine") else ""
+            if summary:
+                action = f"Running: {summary[:55]}"
+            elif cmd_line:
+                action = f"Running `{cmd_line[:50]}`"
+            else:
+                action = "Running command..."
+        elif tname in ("read_file", "view_file"):
+            p_val = params.get("Path") or params.get("AbsolutePath") or ""
+            fname = Path(str(p_val)).name if p_val else "file"
+            action = f"Reading `{fname}`"
+        elif tname in ("edit_file", "replace_file_content", "multi_replace_file_content"):
+            p_val = params.get("Path") or params.get("TargetFile") or ""
+            fname = Path(str(p_val)).name if p_val else "file"
+            action = f"Editing `{fname}`"
+        elif tname in ("write_file", "write_to_file"):
+            p_val = params.get("Path") or params.get("TargetFile") or ""
+            fname = Path(str(p_val)).name if p_val else "file"
+            action = f"Writing `{fname}`"
+        elif tname in ("grep_search", "find_by_name"):
+            q_val = str(params.get("Query") or params.get("Pattern") or "").strip()
+            action = f"Searching `{q_val[:40]}`" if q_val else f"Running `{tname}`"
+
+        thought_raw = str(step.get("thinking") or step.get("thought") or "").strip()
+        thought_snip = ""
+        if thought_raw:
+            last_line = [ln.strip() for ln in thought_raw.splitlines() if ln.strip()][-1]
+            clean_t = re.sub(r"[*_`#]+", "", last_line).strip()
+            if clean_t:
+                thought_snip = f" — *\"{clean_t[:55]}\"*"
+        return f"Step {step_count} · {action}{thought_snip}", step_count
+
+    # Also capture standalone thinking / reasoning updates or final response drafting
+    thought_delta = str(step.get("thinking_delta") or step.get("thinking") or step.get("thought") or "").strip()
+    if thought_delta:
+        lines_t = [ln.strip() for ln in thought_delta.splitlines() if ln.strip()]
+        if lines_t:
+            clean_t = re.sub(r"[*_`#]+", "", lines_t[-1]).strip()
+            if len(clean_t) >= 8:
+                prefix = f"Step {step_count} · " if step_count > 0 else ""
+                return f"{prefix}Thinking — *\"{clean_t[:65]}\"*", step_count
+
+    if stype == "agent_response" and sstate != "DONE":
+        delta = str(step.get("text_delta") or step.get("text") or "").strip()
+        if delta:
+            prefix = f"Step {step_count} · " if step_count > 0 else ""
+            return f"{prefix}Summarizing chunk changes...", step_count
+
+    return None, step_count
+
+
 def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
     """Render a compact native Discord Embed dict for a FORGE build in #forge."""
     with get_db_connection(db_path) as conn:
@@ -798,7 +885,18 @@ def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH
         compact_diff = _compact_diff_stat(c["diff_stat"])
         diff_suffix = f" (`{compact_diff}`)" if compact_diff else ""
         chunk_lines.append(f"{c_emoji} **{idx_num}.** {c['title']}{pr_suffix}{diff_suffix}")
-        if c["status"] == "failed" and c["last_error"]:
+        if c["status"] in ("running", "verifying"):
+            live_st = (c["live_status"] if "live_status" in c.keys() and c["live_status"] else "").strip()
+            elapsed_prefix = ""
+            if c["started_at"]:
+                elapsed_s = max(0, int(time.time() - float(c["started_at"])))
+                elapsed_prefix = f"({_format_duration(elapsed_s)}) · "
+            if c["status"] == "verifying" and not live_st.startswith("Running Maker-Checker"):
+                v_cmd_short = (c["verification_cmd"] or "auto-baseline").strip()[:50]
+                chunk_lines.append(f"  ↳ 🧪 {elapsed_prefix}Running Maker-Checker gate (`{v_cmd_short}`)...")
+            elif live_st:
+                chunk_lines.append(f"  ↳ ⚡ {elapsed_prefix}{live_st[:130]}")
+        elif c["status"] == "failed" and c["last_error"]:
             err_snip = c["last_error"].strip().splitlines()[-1][:110]
             chunk_lines.append(f"  ⚠️ `{err_snip}`")
 
@@ -1569,8 +1667,8 @@ class ForgeSupervisor:
             model = ESCALATION_WORKER_MODEL if attempt == max_attempts else (chunk_row["worker_model"] or DEFAULT_WORKER_MODEL)
             with get_db_connection(self.db_path) as conn:
                 conn.execute(
-                    "UPDATE forge_chunks SET attempt_count = ?, worker_model = ?, status = 'running' WHERE id = ?",
-                    (attempt, model, chunk_id),
+                    "UPDATE forge_chunks SET attempt_count = ?, worker_model = ?, status = 'running', live_status = ? WHERE id = ?",
+                    (attempt, model, f"Booting worker ({model})...", chunk_id),
                 )
             post_or_update_build_widget(build_id, db_path=self.db_path)
 
@@ -1585,9 +1683,44 @@ class ForgeSupervisor:
                 f"--model={model}",
             ]
             try:
-                agy_res = subprocess.run(agy_cmd, cwd=str(wt_dir), capture_output=True, text=True, timeout=1200)
-                if agy_res.returncode != 0:
-                    err_msg = (agy_res.stderr or agy_res.stdout or f"agy exited {agy_res.returncode}").strip()
+                proc = subprocess.Popen(
+                    agy_cmd,
+                    cwd=str(wt_dir),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                tail_lines: list[str] = []
+                step_cnt = 0
+                last_widget_patch = time.time()
+                start_ts = time.time()
+                if proc.stdout:
+                    for raw_line in proc.stdout:
+                        tail_lines.append(raw_line)
+                        if len(tail_lines) > 80:
+                            tail_lines.pop(0)
+                        status_str, step_cnt = extract_live_chunk_telemetry(raw_line, step_count=step_cnt)
+                        now_ts = time.time()
+                        if status_str and (now_ts - last_widget_patch >= 12.0 or step_cnt == 1):
+                            last_widget_patch = now_ts
+                            with get_db_connection(self.db_path) as conn:
+                                conn.execute(
+                                    "UPDATE forge_chunks SET live_status = ? WHERE id = ?",
+                                    (status_str[:220], chunk_id),
+                                )
+                                conn.execute(
+                                    "UPDATE forge_builds SET updated_at = ? WHERE id = ?",
+                                    (now_ts, build_id),
+                                )
+                            post_or_update_build_widget(build_id, db_path=self.db_path)
+                        if (now_ts - start_ts) > 1200.0:
+                            proc.kill()
+                            raise TimeoutError("Chunk worker exceeded 1200s execution timeout")
+                ret_code = proc.wait(timeout=30)
+                if ret_code != 0:
+                    err_msg = "".join(tail_lines).strip() or f"agy exited {ret_code}"
                     with get_db_connection(self.db_path) as conn:
                         conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (err_msg[-1500:], chunk_id))
             except Exception as e:
@@ -1596,7 +1729,7 @@ class ForgeSupervisor:
                 continue
 
             with get_db_connection(self.db_path) as conn:
-                conn.execute("UPDATE forge_chunks SET status = 'verifying' WHERE id = ?", (chunk_id,))
+                conn.execute("UPDATE forge_chunks SET status = 'verifying', live_status = '' WHERE id = ?", (chunk_id,))
             post_or_update_build_widget(build_id, db_path=self.db_path)
 
             passed, diff_stat, err_out = verify_chunk_worktree(
@@ -1653,7 +1786,7 @@ class ForgeSupervisor:
 
                 with get_db_connection(self.db_path) as conn:
                     conn.execute(
-                        "UPDATE forge_chunks SET status = 'merged', branch_name = ?, diff_stat = ?, completed_at = ?, last_error = '' WHERE id = ?",
+                        "UPDATE forge_chunks SET status = 'merged', branch_name = ?, diff_stat = ?, completed_at = ?, live_status = '', last_error = '' WHERE id = ?",
                         (branch_name, diff_stat, time.time(), chunk_id),
                     )
                     remaining = conn.execute(
