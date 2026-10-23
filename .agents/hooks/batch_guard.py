@@ -2,18 +2,22 @@
 """
 Tool Batching Safety Guard (Antigravity PreToolUse Hook)
 Enforces the Tool Roundtrip Minimization & Batch Execution Invariant using strictly
-CONSECUTIVE anti-pattern counters (zero cumulative turn-level step or scratch-write caps):
+CONSECUTIVE anti-pattern counters and 90-second FORGE Tier 1/2/3 gates:
 1. Consecutive single-line shell inspection commands (run_command), including sed/awk/wc slicing.
-2. Consecutive inline Python heredoc / -c probing loops (MAX_CONSECUTIVE_INLINE_PYTHON = 3).
-3. Consecutive repetitive file reading / narrow line slicing (view_file), with wide-slice (>=350 lines) allowance.
-4. Consecutive unverified single-file replacements (replace_file_content).
+2. Consecutive inline Python heredoc / -c probing loops (MAX_CONSECUTIVE_INLINE_PYTHON = 2).
+3. Consecutive repetitive file reading / narrow line slicing (view_file / read_file), with wide-slice (>=350 lines) allowance.
+4. Consecutive unverified single-file replacements (replace_file_content / edit_file).
 5. Consecutive unbatched git lifecycle commands (git add / commit / push / gh pr create).
+6. 90-second FORGE Tier 1/2/3 inline calibration & multi-file production mutation gates.
+7. Self-preservation AST syntax validation on hook edits and Decision Card file deletion gate.
 """
-import sys
-import os
+import ast
 import json
-import time
+import os
 import re
+import sqlite3
+import sys
+import time
 
 STATE_FILE = "/tmp/batch_guard_state.json"
 MAX_CONSECUTIVE_SHELL_INSPECTIONS = 3
@@ -27,26 +31,33 @@ MAX_CONSECUTIVE_GIT_CMDS = 2
 MAX_VERSIONED_SCRATCH_SWEEPS = 3
 MAX_SAME_SCRATCH_SCRIPT_RUNS = 3
 MAX_INLINE_PRODUCTION_FILES = 2
+FORGE_TIER1_INLINE_SECONDS = 90.0
+MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S = 2
 TURN_RESET_IDLE_SECONDS = 45.0
 TURN_STATE_EXPIRY_SECONDS = 900.0
 
 _VERSIONED_SCRATCH_SWEEP_RE = re.compile(
-    r"(?:^|/)(?:scratch|brain/[^/]+/scratch)/(?P<stem>[a-zA-Z0-9_-]*?(?:sim|sweep|grid|solve|tune|calib)[a-zA-Z0-9_-]*?)_v\d+\.py$",
+    r"(?:^|/)(?:scratch|brain/[^/]+/scratch|tmp)/(?:(?P<stem>[a-zA-Z0-9_-]*?(?:sim|sweep|grid|solve|tune|calib|opt)[a-zA-Z0-9_-]*?)_v\d+|v\d+)\.py$",
     re.IGNORECASE,
 )
 
 _SCRATCH_SCRIPT_EXEC_RE = re.compile(
-    r"\bpython[0-9.]*\s+(?P<script>[^\s;\"'|&>]*?(?:/scratch/|^scratch/)[^\s;\"'|&>]+?\.py)\b"
+    r"\bpython[0-9.]*\s+(?P<script>[^\s;\"'|&>]*?(?:/scratch/|^scratch/|/tmp/(?!forge-wt-))[^\s;\"'|&>]+?\.py)\b"
 )
 
 _HEAVY_CLI_BENCHMARK_OR_MIGRATE_RE = re.compile(
-    r"(?:run_unified_benchmark_gate\.py|--migrate-db\b|fast_migrate_[a-zA-Z0-9_-]*\.py\b|backfill_[a-zA-Z0-9_-]*?splits[a-zA-Z0-9_-]*\.py\b)"
+    r"(?:run_unified_benchmark_gate\.py|build_locked_evaluation_datasets|--migrate-db\b|fast_migrate_[a-zA-Z0-9_-]*\.py\b|backfill_[a-zA-Z0-9_-]*?splits[a-zA-Z0-9_-]*\.py\b)"
+)
+
+_PROD_SOURCE_PATH_RE = re.compile(
+    r"(?P<path>(?:/baseball/big-projections|/baseball/big_board_pro|/workspace/tools|/workspace/\.agents)/[a-zA-Z0-9_./-]+\.(?:py|R|sh))\b"
 )
 
 
 def _default_state(now: float = 0.0) -> dict:
     return {
         "last_time": now,
+        "turn_start_time": now,
         "cmd_inspections": 0,
         "consecutive_inline_python": 0,
         "consecutive_file_views": 0,
@@ -59,6 +70,7 @@ def _default_state(now: float = 0.0) -> dict:
         "versioned_scratch_sweeps": [],
         "inline_prod_files": [],
         "scratch_script_runs": {},
+        "total_scratch_runs": 0,
     }
 
 
@@ -110,6 +122,153 @@ def save_state(state: dict, state_file: str = STATE_FILE):
             json.dump(state, f)
     except Exception:
         pass
+
+
+def check_hook_python_syntax(name: str, args: dict, cwd: str = "/workspace") -> tuple[bool, str]:
+    """Self-Preservation AST Guard: prevent writing invalid Python syntax to .agents/hooks/*.py."""
+    target_file = args.get("TargetFile") or args.get("Path") or ""
+    if not target_file:
+        return True, ""
+    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    abs_path = os.path.abspath(os.path.join(norm_cwd, target_file)).replace("\\", "/")
+    if not abs_path.endswith(".py"):
+        return True, ""
+    if "/.agents/hooks/" not in abs_path and os.path.basename(abs_path) not in ("batch_guard.py", "search_guard.py", "time_context.py"):
+        return True, ""
+
+    candidate_src = None
+    if name in ("write_file", "write_to_file"):
+        candidate_src = args.get("Content") if "Content" in args else args.get("CodeContent")
+    elif name in ("edit_file", "replace_file_content") and os.path.exists(abs_path):
+        target_str = args.get("Target") if "Target" in args else args.get("TargetContent")
+        replacement_str = args.get("Replacement") if "Replacement" in args else args.get("ReplacementContent", "")
+        if isinstance(target_str, str) and target_str:
+            try:
+                with open(abs_path, "r", encoding="utf-8") as f:
+                    current_src = f.read()
+                if target_str in current_src:
+                    candidate_src = current_src.replace(target_str, replacement_str or "")
+            except Exception:
+                pass
+
+    if isinstance(candidate_src, str) and candidate_src.strip():
+        try:
+            tree = ast.parse(candidate_src, filename=abs_path)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Constant):
+                    return False, (
+                        f"Hook Self-Preservation Syntax Guard: Refusing to write '{target_file}' — line {getattr(node, 'lineno', '?')} "
+                        f"attempts to call literal {repr(node.func.value)} as a function (likely a missing comma before '(')."
+                    )
+        except SyntaxError as e:
+            return False, (
+                f"Hook Self-Preservation Syntax Guard: Refusing to write invalid Python syntax to '{target_file}' "
+                f"(line {e.lineno}: {e.msg}). Fix the syntax error before modifying hook scripts."
+            )
+    return True, ""
+
+
+def _has_active_delete_approval(db_path: str = "/workspace/data/forge.db") -> bool:
+    """Return True if an approved file_delete Decision Card exists in forge.db."""
+    if not os.path.exists(db_path):
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        try:
+            cur = conn.execute(
+                "SELECT 1 FROM decision_cards WHERE action_type = 'file_delete' AND status = 'approved' LIMIT 1"
+            )
+            return cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def _is_safe_ephemeral_delete_target(token: str, cwd: str = "/workspace") -> bool:
+    clean = token.strip().strip("'\"")
+    if not clean or clean.startswith("-"):
+        return True
+    if clean.endswith((".tmp", ".pyc", ".pyo")) or "__pycache__" in clean:
+        return True
+    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    if norm_cwd.startswith("/tmp/forge-wt-"):
+        return True
+    abs_p = os.path.abspath(os.path.join(norm_cwd, clean)).replace("\\", "/")
+    if abs_p.startswith(("/tmp/", "/workspace/scratch/")):
+        return True
+    if "/scratch/" in abs_p or "/__pycache__" in abs_p:
+        return True
+    return False
+
+
+def check_file_deletion_gate(cmd: str, cwd: str = "/workspace") -> tuple[bool, str]:
+    """Enforce human approval via FORGE Decision Card before deleting tracked/persistent files."""
+    if not cmd:
+        return True, ""
+    if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
+        return True, ""
+    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    if norm_cwd.startswith("/tmp/forge-wt-"):
+        return True, ""
+
+    # 1. Block direct SQL/shell tampering with decision_cards approval status
+    if "decision_cards" in cmd and re.search(r"\b(?:UPDATE|INSERT|REPLACE)\b", cmd, re.IGNORECASE):
+        return False, (
+            "Decision Card Tamper Blocked: Modifying 'decision_cards' approval status directly via SQL or shell is prohibited. "
+            "Only Ryan can approve a Decision Card via the interactive Discord button."
+        )
+
+    # 2. Remote SSH file deletion check
+    if re.search(r"\bssh\b", cmd) and re.search(r"\b(?:rm|unlink)\b|\bfind\b[^\n;|]*-delete\b", cmd):
+        if not _has_active_delete_approval():
+            return False, (
+                "File Deletion Gate Triggered (Remote NAS/SSH): Deleting files on remote hosts over SSH requires explicit human approval from Ryan. "
+                "Stage a Decision Card (action_type='file_delete') first."
+            )
+        return True, ""
+
+    # 3. Inline Python os.remove / os.unlink / shutil.rmtree / .unlink() check
+    py_del_m = re.findall(
+        r"(?:os\.(?:remove|unlink)|shutil\.rmtree)\s*\(\s*(['\"])(.*?)\1",
+        cmd,
+    )
+    for _, target in py_del_m:
+        if not _is_safe_ephemeral_delete_target(target, cwd):
+            if not _has_active_delete_approval():
+                return False, (
+                    f"File Deletion Gate Triggered: Deleting '{target}' requires explicit human approval from Ryan via an approved "
+                    "FORGE Decision Card (action_type='file_delete')."
+                )
+
+    # 4. find <path> ... -delete check
+    for find_m in re.finditer(r"\bfind\s+([^\s;\"'|&>]+)[^\n;|]*?-delete\b", cmd):
+        find_root = find_m.group(1)
+        if not _is_safe_ephemeral_delete_target(find_root, cwd):
+            if not _has_active_delete_approval():
+                return False, (
+                    f"File Deletion Gate Triggered: 'find {find_root} ... -delete' targets a protected path and requires explicit human approval from Ryan."
+                )
+
+    # 5. Shell rm / unlink / git rm check
+    segments = re.split(r"(?:&&|\|\||;|\n)", cmd)
+    for seg in segments:
+        seg_s = seg.strip()
+        m = re.match(r"^(?:sudo\s+)?(?:git\s+rm|rm|unlink)\b(.*)$", seg_s)
+        if not m:
+            continue
+        rest = m.group(1).strip()
+        tokens = re.findall(r"(?:'[^']*'|\"[^\"]*\"|\S+)", rest)
+        for tok in tokens:
+            if tok in ("&&", "||", ";", "|") or tok.startswith(">") or tok.startswith("2>"):
+                break
+            if not _is_safe_ephemeral_delete_target(tok, cwd):
+                if not _has_active_delete_approval():
+                    return False, (
+                        f"File Deletion Gate Triggered: Deleting '{tok}' requires explicit human approval from Ryan via an approved "
+                        "FORGE Decision Card (action_type='file_delete')."
+                    )
+    return True, ""
 
 
 def is_unscoped_pytest(cmd: str) -> bool:
@@ -167,7 +326,7 @@ _DESTRUCTIVE_GIT_WIPE_RE = re.compile(
     r"reset\s+--hard\b|"
     r"checkout-index\s+-[a-zA-Z]*f|"
     r"clean\s+-[a-zA-Z]*f|"
-    r"checkout\s+(?:[^\s;|&&]+\s+)?--\s+(?:\.|\$\([^)]+\)|(?:\.agents|tools|config|docs)\b)|"
+    r"checkout\s+(?:[^\s;|&]+\s+)?--\s+(?:\.|\$\([^)]+\)|(?:\.agents|tools|config|docs)\b)|"
     r"restore\s+(?:--worktree\s+|--source=[^\s]+\s+)*(?:\.|(?:\.agents|tools|config|docs)\b)"
     r")"
 )
@@ -274,12 +433,30 @@ def _check_inline_production_edit_gate(
     cwd: str,
     state: dict,
     state_file: str,
+    now: float = 0.0,
 ) -> tuple[bool, str]:
-    """Enforce FORGE Tier 2/3 Gate: block interactive turns outside /tmp/forge-wt-* from mutating >2 production files inline."""
+    """Enforce FORGE Tier 2/3 Gate: block interactive turns outside /tmp/forge-wt-* from mutating >2 production files inline or mutating after >90s calibration."""
     if is_forge_worktree_or_exempt_path(target_file, cwd=cwd):
         return True, ""
     norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
     norm_target = os.path.abspath(os.path.join(norm_cwd, target_file)).replace("\\", "/")
+
+    # 90-second calibration coupling: if turn has spent >90s running >=2 scratch/tmp scripts,
+    # inline production mutations are closed and must be enqueued via FORGE.
+    cur_now = now or time.time()
+    turn_start = float(state.get("turn_start_time", cur_now) or cur_now)
+    turn_elapsed = cur_now - turn_start
+    total_scratch = int(state.get("total_scratch_runs", 0))
+    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch >= MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
+        save_state(state, state_file)
+        return False, (
+            f"FORGE 90s Tier 2/3 Gate Triggered: Interactive turn has already spent {int(turn_elapsed)}s "
+            f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) running {total_scratch} inline calibration/scratch scripts "
+            f"before mutating '{os.path.basename(norm_target)}'. Tasks requiring >90s of calibration must be packaged into a "
+            "validated ForgePlan JSON (with your calibrated parameters in shared_context) and enqueued via "
+            "'python3 /workspace/tools/forge.py enqueue scratch/forge_plan.json' so #forge workers execute and verify them in isolated git worktrees."
+        )
+
     prod_files = list(state.get("inline_prod_files", []))
     if norm_target not in prod_files:
         prod_files.append(norm_target)
@@ -292,6 +469,42 @@ def _check_inline_production_edit_gate(
             f"({short_list}; inline Tier 1 limit: {MAX_INLINE_PRODUCTION_FILES}). "
             "Multi-file features and refactors must be decomposed into a validated ForgePlan JSON (e.g. scratch/forge_plan.json) "
             "and enqueued via 'python3 /workspace/tools/forge.py enqueue scratch/forge_plan.json' so #forge workers execute them in isolated git worktrees."
+        )
+    return True, ""
+
+
+def check_inline_production_shell_mutation(
+    cmd: str,
+    cwd: str,
+    state: dict,
+    state_file: str,
+    now: float = 0.0,
+) -> tuple[bool, str]:
+    """Block run_command workarounds (python3 -c open/write, sed -i, cat >) that mutate production code to bypass edit_file."""
+    if not cmd:
+        return True, ""
+    if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
+        return True, ""
+    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    if norm_cwd.startswith("/tmp/forge-wt-"):
+        return True, ""
+    if "forge.py" in cmd or "detached_runner.py" in cmd:
+        return True, ""
+
+    has_write_op = bool(
+        re.search(r"\.write\s*\(|open\s*\([^)]*,\s*['\"][wa]['\"]|\bsed\s+-i\b|\bcat\s+>>?", cmd)
+    )
+    if not has_write_op:
+        return True, ""
+
+    for m in _PROD_SOURCE_PATH_RE.finditer(cmd):
+        prod_path = m.group("path")
+        if is_forge_worktree_or_exempt_path(prod_path, cwd=cwd):
+            continue
+        return False, (
+            f"FORGE Shell Mutation Bypass Blocked: Direct shell/python mutation of production source file '{prod_path}' "
+            "via 'run_command' is prohibited. Use 'edit_file' for Tier 1 (<90s, <=2 files) edits, or enqueue a ForgePlan via "
+            "'python3 /workspace/tools/forge.py enqueue scratch/forge_plan.json' for Tier 2/3 builds."
         )
     return True, ""
 
@@ -316,18 +529,28 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
     idle_delta = now - state.get("last_time", 0.0)
 
     # Full turn state expiry after extended inactivity (15m); short idle gaps (45s)
-    # reset only short-window consecutive anti-polling counters while preserving turn-level
-    # FORGE gates (inline_prod_files, versioned_scratch_sweeps, scratch_script_runs).
-    if idle_delta > TURN_STATE_EXPIRY_SECONDS:
+    # reset short-window consecutive anti-polling counters while preserving active turn-level
+    # FORGE gates (inline_prod_files, versioned_scratch_sweeps, scratch_script_runs, total_scratch_runs).
+    if idle_delta > TURN_STATE_EXPIRY_SECONDS or state.get("last_time", 0.0) == 0.0:
         state = _default_state(now)
     elif idle_delta > TURN_RESET_IDLE_SECONDS:
         preserved_prod = list(state.get("inline_prod_files", []))
         preserved_sweeps = list(state.get("versioned_scratch_sweeps", []))
         preserved_runs = dict(state.get("scratch_script_runs", {}))
+        preserved_total_scratch = int(state.get("total_scratch_runs", 0))
+        preserved_start = float(state.get("turn_start_time", now) or now)
         state = _default_state(now)
         state["inline_prod_files"] = preserved_prod
         state["versioned_scratch_sweeps"] = preserved_sweeps
         state["scratch_script_runs"] = preserved_runs
+        state["total_scratch_runs"] = preserved_total_scratch
+        # Keep original turn_start_time if the turn has already started mutating files or running scratch sweeps
+        if preserved_total_scratch > 0 or len(preserved_prod) > 0:
+            state["turn_start_time"] = preserved_start
+        else:
+            state["turn_start_time"] = now
+    if not state.get("turn_start_time"):
+        state["turn_start_time"] = now
     state["last_time"] = now
 
     # 0. Runtime schedule tool is prohibited in Discord bridge turns
@@ -343,8 +566,22 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
         if "forge.py" in cmd and ("enqueue" in cmd or "job" in cmd):
             state["inline_prod_files"] = []
             state["scratch_script_runs"] = {}
+            state["total_scratch_runs"] = 0
+            state["turn_start_time"] = now
         elif "detached_runner.py" in cmd and "start" in cmd:
             state["scratch_script_runs"] = {}
+            state["total_scratch_runs"] = 0
+            state["turn_start_time"] = now
+
+        # A00-del. File Deletion & Decision Card Tamper Gate
+        ok_del, del_reason = check_file_deletion_gate(cmd, cwd=cwd)
+        if not ok_del:
+            return False, del_reason
+
+        # A00-mut. Inline Shell Production Mutation Bypass Gate
+        ok_mut, mut_reason = check_inline_production_shell_mutation(cmd, cwd, state, state_file, now=now)
+        if not ok_mut:
+            return False, mut_reason
 
         # A00. Heavy Inline Benchmark / Migration Gate (Require FORGE job start or enqueue)
         if is_heavy_inline_benchmark_or_migration(cmd, cwd=cwd):
@@ -356,9 +593,9 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                 "(or enqueue a multi-chunk ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
             )
 
-        # A00b. Repeated Same-Scratch-Script Loop Gate (Prevent iterative scratch/*.py overwrite-and-rerun loops)
+        # A00b. Repeated Same-Scratch-Script & >90s Calibration Loop Gate
         if os.environ.get("FORGE_WORKER_ACTIVE") != "1" and not os.path.abspath(cwd or "/workspace").replace("\\", "/").startswith("/tmp/forge-wt-"):
-            if "forge.py" not in cmd and "detached_runner.py" not in cmd:
+            if "forge.py" not in cmd and "detached_runner.py" not in cmd and "modal_harness.py" not in cmd:
                 scratch_m = _SCRATCH_SCRIPT_EXEC_RE.search(cmd)
                 if scratch_m:
                     raw_script = scratch_m.group("script")
@@ -367,6 +604,9 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                     run_cnt = int(runs_map.get(norm_script, 0)) + 1
                     runs_map[norm_script] = run_cnt
                     state["scratch_script_runs"] = runs_map
+                    total_scratch = int(state.get("total_scratch_runs", 0)) + 1
+                    state["total_scratch_runs"] = total_scratch
+
                     if run_cnt > MAX_SAME_SCRATCH_SCRIPT_RUNS:
                         save_state(state, state_file)
                         return False, (
@@ -374,6 +614,18 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                             f"(inline limit: {MAX_SAME_SCRATCH_SCRIPT_RUNS}). Do not run iterative edit-and-rerun loops on the same scratch script "
                             "inline in chat. Consolidate parameter sweeps into a single vectorized pass, offload to Modal, or launch long jobs via:\n"
                             "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\""
+                        )
+
+                    turn_elapsed = now - float(state.get("turn_start_time", now) or now)
+                    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
+                        save_state(state, state_file)
+                        return False, (
+                            f"FORGE 90s Calibration Offload Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
+                            f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {total_scratch} scratch/tmp scripts "
+                            f"(latest: '{os.path.basename(norm_script)}'). Do not run multi-minute iterative script sweeps inline by renaming scripts "
+                            "or moving them to /tmp/. Launch long calibration/benchmark jobs via:\n"
+                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\"\n"
+                            "(or offload to '/baseball/big-projections/modal_harness.py' / enqueue a ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
                         )
 
         # Agora Fast-Path Invariant
@@ -559,7 +811,11 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
         if not ok_ro:
             return False, ro_reason
 
-        ok_tier, tier_reason = _check_inline_production_edit_gate(target_file, cwd, state, state_file)
+        ok_syn, syn_reason = check_hook_python_syntax(name, args, cwd)
+        if not ok_syn:
+            return False, syn_reason
+
+        ok_tier, tier_reason = _check_inline_production_edit_gate(target_file, cwd, state, state_file, now=now)
         if not ok_tier:
             return False, tier_reason
 
@@ -595,6 +851,10 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
         if not ok_ro:
             return False, ro_reason
 
+        ok_syn, syn_reason = check_hook_python_syntax(name, args, cwd)
+        if not ok_syn:
+            return False, syn_reason
+
         if target_file and _VERSIONED_SCRATCH_SWEEP_RE.search(target_file):
             sweeps = list(state.get("versioned_scratch_sweeps", []))
             if target_file not in sweeps:
@@ -610,7 +870,7 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                     "'/baseball/big-projections/modal_harness.py --mode grid' (or 'forge.py job start' / detached_runner.py for jobs >90s)."
                 )
 
-        ok_tier, tier_reason = _check_inline_production_edit_gate(target_file, cwd, state, state_file)
+        ok_tier, tier_reason = _check_inline_production_edit_gate(target_file, cwd, state, state_file, now=now)
         if not ok_tier:
             return False, tier_reason
 

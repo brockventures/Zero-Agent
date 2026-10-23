@@ -1,10 +1,9 @@
 import unittest
 import os
-import time
 import sys
 
 sys.path.insert(0, "/workspace/.agents/hooks")
-from batch_guard import check_batching, check_tool_use, STATE_FILE, load_state, save_state
+from batch_guard import check_batching, check_tool_use, STATE_FILE, load_state
 
 
 class TestBatchGuard(unittest.TestCase):
@@ -342,6 +341,58 @@ class TestBatchGuard(unittest.TestCase):
                 cwd="/tmp/forge-wt-fg-999-c0",
             )[0]
         )
+
+    def test_tmp_versioned_sweep_and_90s_calibration_offload_gate(self):
+        from unittest.mock import patch
+        # 1. /tmp/v1.py .. /tmp/v4.py versioned sweep loop blocked
+        for v in range(1, 4):
+            self.assertTrue(check_tool_use("write_file", {"Path": f"/tmp/v{v}.py"})[0])
+        allowed, reason = check_tool_use("write_file", {"Path": "/tmp/v4.py"})
+        self.assertFalse(allowed)
+        self.assertIn("Modal Offload Invariant Triggered", reason)
+
+        # 2. 90s Calibration Offload Gate blocks renamed scratch/tmp scripts once turn exceeds 90s
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        base_now = 1_800_100_000.0
+        with patch("time.time", return_value=base_now):
+            self.assertTrue(check_batching("python3 /workspace/scratch/diag_1.py")[0])
+            self.assertTrue(check_batching("python3 /tmp/diag_2.py")[0])
+
+        # At +100s (>90s Tier 1 ceiling), 3rd distinct calibration script is blocked
+        with patch("time.time", return_value=base_now + 100.0):
+            allowed, reason = check_batching("python3 /workspace/scratch/opt_renamed_3.py")
+            self.assertFalse(allowed)
+            self.assertIn("FORGE 90s Calibration Offload Gate Triggered", reason)
+
+            # And inline production file edit is also gated because >90s calibration occurred
+            allowed_edit, edit_reason = check_tool_use(
+                "edit_file", {"Path": "/baseball/big-projections/hitter_components.py"}
+            )
+            self.assertFalse(allowed_edit)
+            self.assertIn("FORGE 90s Tier 2/3 Gate Triggered", edit_reason)
+
+    def test_shell_production_mutation_bypass_blocked(self):
+        bypass_cmds = [
+            'python3 -c \'with open("/baseball/big-projections/pitcher_components.py", "w") as f: f.write("x=1")\'',
+            "sed -i 's/foo/bar/g' /baseball/big-projections/hitter_components.py",
+            "cat >> /workspace/tools/bridge.py << 'EOF'\n# test\nEOF",
+        ]
+        for cmd in bypass_cmds:
+            allowed, reason = check_batching(cmd)
+            self.assertFalse(allowed, f"Expected shell mutation bypass to be blocked: {cmd}")
+            self.assertIn("FORGE Shell Mutation Bypass Blocked", reason)
+
+    def test_hook_self_preservation_syntax_guard(self):
+        allowed, reason = check_tool_use(
+            "write_file",
+            {
+                "Path": "/workspace/.agents/hooks/batch_guard.py",
+                "Content": "def broken():\n    return False (\n        'missing comma'\n    )\n",
+            },
+        )
+        self.assertFalse(allowed)
+        self.assertIn("Hook Self-Preservation Syntax Guard", reason)
 
 
 if __name__ == "__main__":

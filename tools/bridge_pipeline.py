@@ -451,6 +451,14 @@ def prepare_turn_prompt(
     eng_carry_block: str = "",
 ) -> str:
     """Format prompt with time context, gif cadence guidance, channel context, and air-gapped system prompts."""
+    # Reset per-turn batch_guard state at the start of every new user turn
+    try:
+        bg_state_path = Path("/tmp/batch_guard_state.json")
+        if bg_state_path.exists():
+            bg_state_path.unlink()
+    except Exception:
+        pass
+
     now_utc = datetime.now(timezone.utc)
     now_pt = now_utc.astimezone(PT_TZ)
     gif_guidance = get_gif_prompt_guidance(sess_key, channel_id=channel_id)
@@ -1088,7 +1096,7 @@ async def deliver_turn_output(
                 )
             except Exception as lwe:
                 print(f"[BridgePipeline] Error setting Last Word pause on silence: {lwe}")
-        print(f"[BridgePipeline] Suppressed [NO_REPLY] in non-home channel")
+        print("[BridgePipeline] Suppressed [NO_REPLY] in non-home channel")
         if timer:
             timer.mark_delivery_end()
             timer.finish("NO_REPLY")
