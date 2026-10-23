@@ -44,7 +44,11 @@ OCTOPRINT_DEFAULT_URL = f"http://{nas_config.HOST_2_IP}:8888"
 OCTOPRINT_DEFAULT_KEY = "8FC0C5F37CD14D4384100ED682682A80"
 DEFAULT_DISCORD_CHANNEL = "3d-print"  # 1555973316752449576
 
+import shutil
+from PIL import Image
+
 DATA_DIR = Path("/workspace/data/3dprint")
+TIMELAPSE_ROOT = DATA_DIR / "timelapse"
 PID_FILE = DATA_DIR / "watcher.pid"
 STATUS_FILE = DATA_DIR / "watcher_status.json"
 LOG_FILE = DATA_DIR / "watcher.log"
@@ -54,6 +58,73 @@ TOOLS_DIR = Path("/workspace/tools")
 WEBCAM_SCRIPT = TOOLS_DIR / "webcam_control.py"
 DELIVER_IMAGE_SCRIPT = TOOLS_DIR / "deliver_image.py"
 SPEECH_SCRIPT = TOOLS_DIR / "phone_speech.py"
+
+
+def get_job_timelapse_dir(filename: str) -> Path:
+    """Return (and create) the per-job directory storing sequential timelapse frames."""
+    stem = Path(filename or "unknown_job").stem
+    stem = re.sub(r"[^a-zA-Z0-9_-]+", "_", stem).strip("_") or "print_job"
+    d = TIMELAPSE_ROOT / stem
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def archive_timelapse_frame(src_image: Path, filename: str, reset_if_new: bool = False) -> Optional[Path]:
+    """Copy a captured snapshot into the sequential timelapse directory for `filename`."""
+    if not src_image.exists() or src_image.stat().st_size == 0:
+        return None
+    tl_dir = get_job_timelapse_dir(filename)
+    existing = sorted(tl_dir.glob("frame_*.jpg"))
+    if reset_if_new and existing:
+        for old_f in existing:
+            try:
+                old_f.unlink()
+            except Exception:
+                pass
+        existing = []
+    next_idx = len(existing) + 1
+    dest = tl_dir / f"frame_{next_idx:04d}.jpg"
+    shutil.copy2(src_image, dest)
+    return dest
+
+
+def compile_timelapse_gif(
+    filename: str,
+    max_width: int = 540,
+    frame_ms: int = 180,
+    final_hold_ms: int = 1600,
+) -> Optional[Path]:
+    """Compile archived `frame_*.jpg` images for `filename` into an animated GIF for Discord."""
+    tl_dir = get_job_timelapse_dir(filename)
+    frame_paths = sorted(tl_dir.glob("frame_*.jpg"))
+    if len(frame_paths) < 2:
+        print(f"[Timelapse] Only {len(frame_paths)} frame(s) in {tl_dir}; skipping GIF build.")
+        return None
+    try:
+        frames = []
+        for fp in frame_paths:
+            with Image.open(fp) as im:
+                im_rgb = im.convert("RGB")
+                w, h = im_rgb.size
+                if w > max_width:
+                    new_h = int(round(h * (max_width / float(w))))
+                    im_rgb = im_rgb.resize((max_width, new_h), Image.Resampling.LANCZOS)
+                frames.append(im_rgb.quantize(colors=256, method=Image.Quantize.FASTOCTREE))
+        durations = [frame_ms] * (len(frames) - 1) + [final_hold_ms]
+        out_gif = TIMELAPSE_ROOT / f"{tl_dir.name}_timelapse.gif"
+        frames[0].save(
+            out_gif,
+            save_all=True,
+            append_images=frames[1:],
+            duration=durations,
+            loop=0,
+            optimize=True,
+        )
+        print(f"[Timelapse] Compiled {len(frames)} frames -> {out_gif} ({out_gif.stat().st_size} bytes)")
+        return out_gif
+    except Exception as e:
+        print(f"[Timelapse] Error compiling GIF: {e}", file=sys.stderr)
+        return None
 
 
 def parse_time_string_to_seconds(time_str: str) -> int:
@@ -439,8 +510,41 @@ def get_nozzle_temp(client: OctoPrintClient) -> float:
             return 0.0
 
 
-def capture_webcam_snapshot(output_path: Path, burst: int = 6, interval: float = 4.0, max_window: float = 25.0) -> bool:
-    """Invoke tools/webcam_control.py to capture a rotated snapshot with adaptive early-exit burst."""
+def _image_mean_luma(image_path: Path) -> float:
+    """Compute mean grayscale brightness (0..255) of a captured JPEG."""
+    try:
+        with Image.open(image_path) as im:
+            gray = im.convert("L").resize((64, 64))
+            px = list(gray.getdata())
+            return sum(px) / float(len(px)) if px else 255.0
+    except Exception:
+        return 255.0
+
+
+def _set_webcam_torch(enabled: bool) -> bool:
+    """Toggle IP Webcam LED torch on/off via HTTP endpoint."""
+    endpoint = "enabletorch" if enabled else "disabletorch"
+    url = f"http://{nas_config.HOST_2_IP}:3333/{endpoint}"
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def capture_webcam_snapshot(
+    output_path: Path,
+    burst: int = 6,
+    interval: float = 4.0,
+    max_window: float = 25.0,
+    min_luma: float = 30.0,
+) -> bool:
+    """
+    Invoke tools/webcam_control.py to capture a rotated snapshot with adaptive early-exit burst.
+    If the captured frame is pitch-dark (mean luma < min_luma, e.g. overnight prints with room
+    lights off), automatically enables the Pixel 8 Pro LED torch, re-captures, and turns the torch off.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         try:
@@ -463,7 +567,20 @@ def capture_webcam_snapshot(output_path: Path, burst: int = 6, interval: float =
     ]
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
-        return True
+        luma = _image_mean_luma(output_path)
+        if luma < min_luma:
+            print(f"[Webcam] Low-light frame detected (mean luma={luma:.1f} < {min_luma}). Retrying with LED torch...")
+            try:
+                subprocess.run(["python3", str(WEBCAM_SCRIPT), "start"], capture_output=True, text=True, timeout=15)
+                if _set_webcam_torch(True):
+                    time.sleep(1.0)
+                    subprocess.run(cmd, capture_output=True, text=True)
+            except Exception as e:
+                print(f"[Webcam] Torch retry warning: {e}", file=sys.stderr)
+            finally:
+                _set_webcam_torch(False)
+                stop_webcam()
+        return output_path.exists() and output_path.stat().st_size > 0
     print(f"[Webcam] Snapshot capture failed: {res.stderr or res.stdout}", file=sys.stderr)
     return False
 
@@ -492,13 +609,21 @@ def cut_printer_power() -> bool:
         return False
 
 
-def evaluate_print_image(image_path: Path, timeout: float = 75.0) -> Dict[str, Any]:
+def evaluate_print_image(image_path: Path, completion: float = 0.0, timeout: float = 75.0) -> Dict[str, Any]:
     """
     Perform AI vision evaluation for catastrophic print failures
     using native agy CLI (Google Antigravity bundled quota).
     """
     if not image_path.exists() or image_path.stat().st_size == 0:
         return {"failure": False, "confidence": 0.0, "error": "Image file does not exist or is empty"}
+
+    air_print_clause = (
+        f"5. Air-printing / extrusion stoppage (clogged nozzle or ground filament): print progress is {completion:.1f}%, "
+        "so if progress is >= 40% but the parts on the build plate are still only paper-thin flat 1-2mm base layers "
+        "with zero vertical walls/thickness and the hotend is printing in empty air above them, flag failure=true. "
+        if completion >= 40.0
+        else ""
+    )
 
     prompt = (
         f"Inspect the image file {image_path.resolve()}. "
@@ -508,6 +633,7 @@ def evaluate_print_image(image_path: Path, timeout: float = 75.0) -> Dict[str, A
         "2. Print detached from the print bed and being dragged around. "
         "3. Massive layer shift destroying the part. "
         "4. Filament blob encasing the hotend / nozzle. "
+        f"{air_print_clause}"
         "Normal active printing, skirt lines, supports, infill, or completed prints on the bed are NOT failures. "
         "Respond ONLY with a valid JSON object with keys: "
         "failure (boolean), confidence (float between 0.0 and 1.0), issue (short summary string), summary (detailed string)."
@@ -585,6 +711,7 @@ class PrinterWatcherDaemon:
         octoprint_url: str = OCTOPRINT_DEFAULT_URL,
         api_key: str = OCTOPRINT_DEFAULT_KEY,
         interval_print: int = 1200,      # 20 minutes
+        interval_timelapse: int = 180,   # 3 minutes
         interval_cooldown: int = 60,     # 60 seconds
         cooldown_temp: float = 50.0,     # 50°C
         channel: str = DEFAULT_DISCORD_CHANNEL,
@@ -594,6 +721,7 @@ class PrinterWatcherDaemon:
     ):
         self.client = OctoPrintClient(octoprint_url, api_key)
         self.interval_print = interval_print
+        self.interval_timelapse = interval_timelapse
         self.interval_cooldown = interval_cooldown
         self.cooldown_temp = cooldown_temp
         self.channel = channel

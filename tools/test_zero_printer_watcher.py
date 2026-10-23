@@ -253,6 +253,29 @@ class TestZeroPrinterWatcher(unittest.TestCase):
             eta_done = estimate_eta_str("nonexistent.gcode", completion=0.0, print_time=0.0, octo_time_left=0.0)
             self.assertEqual(eta_done, "Calculating...")
 
+    def test_archive_and_compile_timelapse_gif(self):
+        from PIL import Image
+        import tools.zero_printer_watcher as zpw
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(zpw, "TIMELAPSE_ROOT", Path(tmpdir)):
+                src_img = Path(tmpdir) / "snap.jpg"
+                Image.new("RGB", (640, 480), color=(120, 140, 160)).save(src_img, "JPEG")
+
+                f1 = zpw.archive_timelapse_frame(src_img, "gotchi_case_v4_plate.gcode", reset_if_new=True)
+                self.assertIsNotNone(f1)
+                self.assertEqual(f1.name, "frame_0001.jpg")
+
+                Image.new("RGB", (640, 480), color=(180, 190, 200)).save(src_img, "JPEG")
+                f2 = zpw.archive_timelapse_frame(src_img, "gotchi_case_v4_plate.gcode", reset_if_new=False)
+                self.assertIsNotNone(f2)
+                self.assertEqual(f2.name, "frame_0002.jpg")
+
+                gif_path = zpw.compile_timelapse_gif("gotchi_case_v4_plate.gcode", max_width=320)
+                self.assertIsNotNone(gif_path)
+                self.assertTrue(gif_path.exists())
+                self.assertGreater(gif_path.stat().st_size, 100)
+
 
 if __name__ == "__main__":
     unittest.main()
