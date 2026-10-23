@@ -162,6 +162,26 @@ def is_unbounded_ha_sqlite_query(cmd: str) -> bool:
     return False
 
 
+_DESTRUCTIVE_GIT_WIPE_RE = re.compile(
+    r"\bgit\s+(?:"
+    r"reset\s+--hard\b|"
+    r"checkout-index\s+-[a-zA-Z]*f|"
+    r"clean\s+-[a-zA-Z]*f|"
+    r"checkout\s+(?:[^\s;|&&]+\s+)?--\s+(?:\.|\$\([^)]+\)|(?:\.agents|tools|config|docs)\b)|"
+    r"restore\s+(?:--worktree\s+|--source=[^\s]+\s+)*(?:\.|(?:\.agents|tools|config|docs)\b)"
+    r")"
+)
+
+
+def is_destructive_git_working_tree_wipe(cmd: str, cwd: str = "/workspace") -> bool:
+    """Block destructive git working-tree wipes in /workspace (e.g. git reset --hard, git checkout-index -f, blanket directory checkout)."""
+    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    if norm_cwd.startswith("/tmp/forge-wt-"):
+        return False
+    unquoted = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "", cmd)
+    return bool(_DESTRUCTIVE_GIT_WIPE_RE.search(unquoted))
+
+
 def is_batched_or_mutating_cmd(cmd: str) -> bool:
     cmd_clean = cmd.strip()
     if is_inline_python_probe(cmd_clean):
@@ -407,6 +427,15 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                 "HA Recorder SQLite Guard Triggered: Querying 'home-assistant_v2.db' without an explicit 'last_updated_ts >' "
                 "lower bound causes multi-minute table scans and write-lock stalls. Prefer the Home Assistant REST API "
                 "(/api/states or /api/history/period) or include an indexed 'last_updated_ts >' filter with '-readonly'."
+            )
+
+        # A0c. Destructive Git Working-Tree Wipe Guard
+        if is_destructive_git_working_tree_wipe(cmd, cwd):
+            return False, (
+                "Destructive Git Working-Tree Wipe Blocked: Commands like 'git reset --hard', 'git checkout-index -f', "
+                "'git clean -f', or blanket directory checkouts ('git checkout origin/main -- tools .agents') clobber "
+                "uncommitted changes from concurrent sessions/sidecars in /workspace. Commit or 'git stash' dirty files "
+                "explicitly before pulling/rebasing."
             )
 
         # A. Unscoped test suite check (Ban bare pytest in interactive turns)
