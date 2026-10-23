@@ -1170,27 +1170,56 @@ class PrinterWatcherDaemon:
             })
 
 
+def _find_running_watcher_pids() -> list[int]:
+    """Scan /proc for any live zero_printer_watcher.py --internal-run daemon processes."""
+    my_pid = os.getpid()
+    found: list[int] = []
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return found
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == my_pid:
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            if "zero_printer_watcher.py" in cmdline and "--internal-run" in cmdline:
+                os.kill(pid, 0)
+                found.append(pid)
+        except Exception:
+            continue
+    return sorted(found)
+
+
 def is_running() -> Tuple[bool, Optional[int]]:
-    """Check if a watcher process is currently running."""
-    if not PID_FILE.exists():
-        return False, None
-    try:
-        pid = int(PID_FILE.read_text().strip())
-        os.kill(pid, 0)
-        return True, pid
-    except (OSError, ValueError):
-        if PID_FILE.exists():
-            try:
-                PID_FILE.unlink()
-            except Exception:
-                pass
-        return False, None
+    """Check if a watcher process is currently running (via PID_FILE or /proc fallback)."""
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, 0)
+            return True, pid
+        except (OSError, ValueError):
+            if PID_FILE.exists():
+                try:
+                    PID_FILE.unlink()
+                except Exception:
+                    pass
+    orphans = _find_running_watcher_pids()
+    if orphans:
+        return True, orphans[0]
+    return False, None
 
 
 def stop_daemon(timeout: float = 10.0) -> bool:
-    """Stop running watcher daemon and wait for it to exit completely."""
+    """Stop all running watcher daemons (both PID_FILE and any orphaned --internal-run processes)."""
     running, pid = is_running()
-    if not running or pid is None:
+    target_pids = set(_find_running_watcher_pids())
+    if running and pid is not None:
+        target_pids.add(pid)
+
+    if not target_pids:
         print("No Zero Watcher daemon is running.")
         if PID_FILE.exists():
             try:
@@ -1198,13 +1227,19 @@ def stop_daemon(timeout: float = 10.0) -> bool:
             except Exception:
                 pass
         return True
-    print(f"Stopping Zero Watcher daemon (PID {pid})...")
+
+    pid_list = sorted(target_pids)
+    print(f"Stopping Zero Watcher daemon (PID(s): {', '.join(map(str, pid_list))})...")
     try:
-        os.kill(pid, signal.SIGTERM)
+        for p in pid_list:
+            try:
+                os.kill(p, signal.SIGTERM)
+            except OSError:
+                pass
         deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(0.5)
-            if not is_running()[0]:
+            if not is_running()[0] and not _find_running_watcher_pids():
                 print("Zero Watcher stopped cleanly.")
                 if PID_FILE.exists():
                     try:
@@ -1212,11 +1247,12 @@ def stop_daemon(timeout: float = 10.0) -> bool:
                     except Exception:
                         pass
                 return True
-        print(f"Zero Watcher (PID {pid}) did not stop within {timeout}s; escalating to SIGKILL...")
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
+        print(f"Zero Watcher (PID(s): {', '.join(map(str, pid_list))}) did not stop within {timeout}s; escalating to SIGKILL...")
+        for p in pid_list:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
         time.sleep(0.5)
         if PID_FILE.exists():
             try:

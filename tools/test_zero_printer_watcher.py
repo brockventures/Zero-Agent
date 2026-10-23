@@ -31,6 +31,22 @@ from tools.zero_printer_watcher import (
 
 
 class TestZeroPrinterWatcher(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmpdir.name)
+        self._pid_patcher = patch("tools.zero_printer_watcher.PID_FILE", self.tmp_path / "watcher.pid")
+        self._status_patcher = patch("tools.zero_printer_watcher.STATUS_FILE", self.tmp_path / "watcher_status.json")
+        self._orphan_patcher = patch("tools.zero_printer_watcher._find_running_watcher_pids", return_value=[])
+        self._pid_patcher.start()
+        self._status_patcher.start()
+        self.mock_orphans = self._orphan_patcher.start()
+
+    def tearDown(self):
+        self._orphan_patcher.stop()
+        self._status_patcher.stop()
+        self._pid_patcher.stop()
+        self._tmpdir.cleanup()
+
     @patch("subprocess.run")
     def test_evaluate_print_image_nominal(self, mock_subproc):
         mock_proc = MagicMock()
@@ -184,6 +200,16 @@ class TestZeroPrinterWatcher(unittest.TestCase):
         success = stop_daemon(timeout=2.0)
         self.assertTrue(success)
         mock_kill.assert_called_once_with(4321, signal.SIGTERM)
+
+    @patch("tools.zero_printer_watcher.time.sleep")
+    @patch("tools.zero_printer_watcher.os.kill")
+    def test_stop_daemon_kills_orphans_when_pid_file_missing(self, mock_kill, mock_sleep):
+        import signal
+        # Simulate watcher.pid missing on disk while an orphaned --internal-run process (PID 8888) is alive
+        self.mock_orphans.side_effect = [[8888], [8888], [], []]
+        success = stop_daemon(timeout=2.0)
+        self.assertTrue(success)
+        mock_kill.assert_called_once_with(8888, signal.SIGTERM)
 
     @patch("tools.zero_printer_watcher.PID_FILE")
     @patch("tools.zero_printer_watcher.time.sleep")
