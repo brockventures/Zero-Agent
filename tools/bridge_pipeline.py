@@ -1059,12 +1059,21 @@ async def deliver_turn_output(
         return sent_messages
 
     # Strip trailing silence tags if there is other substantive content before them
+    was_explicit_silence_tag = output_text_clean.strip().upper() in (
+        "[NO_REPLY]",
+        "NO_REPLY",
+        "[NO_OP]",
+        "NO_OP",
+        "REPLY:NONE",
+        "REPLY: NONE",
+    )
     final_text = re.sub(
         r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", final_text, flags=re.IGNORECASE
     ).strip()
 
     is_silence_response = (
-        final_text.strip()
+        was_explicit_silence_tag
+        or final_text.strip()
         in (
             "[NO_REPLY]",
             "NO_REPLY",
@@ -1077,10 +1086,13 @@ async def deliver_turn_output(
         or not final_text.strip()
     )
 
-    # In non-home channels (e.g. public Brock channels like #baseball, #server-updates), honor silence tags cleanly
+    # In non-home channels (e.g. public Brock channels like #baseball, #server-updates),
+    # or on autonomous background/system turns without an interactive user message placeholder,
+    # honor explicit silence tags ([NO_REPLY] / [NO_OP]) cleanly instead of emitting Turn Incomplete.
     reply_ch = getattr(reply_target, "channel", reply_target) if reply_target else None
     is_home = is_home_channel(reply_ch) or is_home_channel(channel_id)
-    if is_silence_response and not is_home:
+    is_autonomous_turn = status_msg is None and not hasattr(reply_target, "reply")
+    if is_silence_response and (not is_home or (is_autonomous_turn and was_explicit_silence_tag)):
         if is_last_word and (last_word_bot_id or last_word_bot_name):
             try:
                 from tools.last_word_protocol import pause_bot
@@ -1096,7 +1108,7 @@ async def deliver_turn_output(
                 )
             except Exception as lwe:
                 print(f"[BridgePipeline] Error setting Last Word pause on silence: {lwe}")
-        print("[BridgePipeline] Suppressed [NO_REPLY] in non-home channel")
+        print("[BridgePipeline] Suppressed [NO_REPLY] in non-home or autonomous system turn")
         if timer:
             timer.mark_delivery_end()
             timer.finish("NO_REPLY")

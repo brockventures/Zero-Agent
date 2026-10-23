@@ -394,6 +394,28 @@ class TestForgeEngine(unittest.TestCase):
         with patch.dict(forge_mod.os.environ, {"DISCORD_CHANNEL_ID": "1548196929308065893"}):
             self.assertEqual(forge_mod.get_default_origin_channel(), "baseball")
 
+        # Verify in_flight_turn.json ancestor PID fallback when DISCORD_CHANNEL_ID is unset
+        mock_in_flight_dir = Path(self.tmp_dir.name)
+        in_flight_file = mock_in_flight_dir / "in_flight_turn.json"
+        in_flight_file.write_text(
+            json.dumps(
+                {
+                    "1561509863018856468": {
+                        "channel_id": 1561509863018856468,
+                        "pid": forge_mod.os.getpid(),
+                        "ts": time.time(),
+                        "prompt": "test gotchi",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.dict(forge_mod.os.environ, {}, clear=False):
+            forge_mod.os.environ.pop("DISCORD_CHANNEL_ID", None)
+            with patch.object(forge_mod, "DATA_DIR", mock_in_flight_dir):
+                self.assertEqual(forge_mod.get_default_origin_channel(), "1561509863018856468")
+                self.assertTrue(forge_mod._is_channel_turn_actively_in_flight("1561509863018856468"))
+
         ivy_plan = {
             "title": "Ivy Projection Engine Upgrade",
             "repo": "/workspace",

@@ -417,6 +417,28 @@ class TestBridgePipelineDelivery(unittest.IsolatedAsyncioTestCase):
         self.assertIn("⚠️ **Turn Incomplete:**", call_kwargs["content"])
         status_msg.delete.assert_not_called()
 
+    async def test_deliver_home_autonomous_system_turn_honors_explicit_no_reply(self):
+        # Autonomous background turns (status_msg=None, reply_target=TextChannel without .reply)
+        # must cleanly suppress explicit [NO_REPLY] deduplication without posting Turn Incomplete.
+        channel_target = MagicMock(spec=["send", "id"])
+        channel_target.id = 1542081375287640084
+        channel_target.send = AsyncMock()
+        timer = TurnTimer(channel_id=1542081375287640084, channel_name="zero-chat")
+
+        sent = await deliver_turn_output(
+            output_text="[NO_REPLY]",
+            status_msg=None,
+            reply_target=channel_target,
+            mode="home",
+            channel_id=1542081375287640084,
+            conv_id="conv-1",
+            turn_start_time=time.time(),
+            timer=timer,
+        )
+        self.assertEqual(sent, [])
+        channel_target.send.assert_not_called()
+        self.assertEqual(timer.status, "NO_REPLY")
+
 
     async def test_deliver_external_preserves_handoff_envelope(self):
         """Verify external messages with handoff envelopes are never split into separate messages."""

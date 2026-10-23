@@ -308,6 +308,7 @@ async def execute_agy_turn(
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd="/workspace",
+                env={**os.environ, "DISCORD_CHANNEL_ID": str(channel_id)},
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,

@@ -212,6 +212,7 @@ class PersistentChannelWorker:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd="/workspace",
+                env={**os.environ, "DISCORD_CHANNEL_ID": str(self.channel_id)},
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

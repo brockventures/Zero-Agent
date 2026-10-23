@@ -92,13 +92,104 @@ def is_ivy_container() -> bool:
     )
 
 
+def _get_ancestor_pids() -> set[int]:
+    """Return the set of ancestor PIDs up to PID 1 for the current process."""
+    pids = set()
+    cur = os.getpid()
+    for _ in range(12):
+        if cur <= 1 or cur in pids:
+            break
+        pids.add(cur)
+        try:
+            stat_txt = Path(f"/proc/{cur}/stat").read_text(encoding="utf-8")
+            rparen = stat_txt.rfind(")")
+            if rparen != -1:
+                fields = stat_txt[rparen + 2 :].split()
+                if len(fields) >= 2 and fields[1].isdigit():
+                    cur = int(fields[1])
+                    continue
+        except Exception:
+            pass
+        break
+    return pids
+
+
+def _is_channel_turn_actively_in_flight(channel_id_or_name: str, max_age_s: float = 600.0) -> bool:
+    """Return True if the specified channel currently has an active in-flight agent turn."""
+    in_flight_file = DATA_DIR / "in_flight_turn.json"
+    if not in_flight_file.exists():
+        return False
+    try:
+        raw_ch = str(channel_id_or_name).strip().lstrip("#")
+        if raw_ch.isdigit():
+            target_cid = raw_ch
+        elif raw_ch == "baseball":
+            target_cid = str(BASEBALL_CHANNEL_ID)
+        elif raw_ch == "zero-chat":
+            target_cid = str(ZERO_CHAT_CHANNEL_ID)
+        elif raw_ch == "zero-ops":
+            target_cid = str(ZERO_OPS_CHANNEL_ID)
+        else:
+            target_cid = raw_ch
+            try:
+                from tools.outbox import resolve_channel_id
+                res_id = resolve_channel_id(raw_ch)
+                if res_id:
+                    target_cid = str(res_id)
+            except Exception:
+                pass
+        data = json.loads(in_flight_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return False
+        now = time.time()
+        entry = data.get(target_cid)
+        if not isinstance(entry, dict) and str(data.get("channel_id", "")) == target_cid:
+            entry = data
+        if isinstance(entry, dict):
+            ts = float(entry.get("ts") or 0.0)
+            if (now - ts) < max_age_s:
+                pid = entry.get("pid")
+                if isinstance(pid, int) and pid > 1:
+                    return Path(f"/proc/{pid}").exists()
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def get_default_origin_channel() -> str:
-    """Return the default origin channel name/ID for the active container (Zero vs Ivy)."""
+    """Return the default origin channel name/ID for the active container or in-flight turn."""
     env_cid = os.getenv("DISCORD_CHANNEL_ID", "").strip()
     if env_cid == str(BASEBALL_CHANNEL_ID):
         return "baseball"
     if env_cid:
         return env_cid
+
+    # Fallback: inspect /workspace/data/in_flight_turn.json to match ancestor agy worker PID
+    # or single active in-flight turn when DISCORD_CHANNEL_ID is not set in the environment.
+    in_flight_file = DATA_DIR / "in_flight_turn.json"
+    if in_flight_file.exists():
+        try:
+            data = json.loads(in_flight_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                ancestors = _get_ancestor_pids()
+                now = time.time()
+                active_candidates: list[tuple[float, str]] = []
+                for k, v in data.items():
+                    if not str(k).isdigit() or not isinstance(v, dict):
+                        continue
+                    ts = float(v.get("ts") or 0.0)
+                    if (now - ts) > 900.0:
+                        continue
+                    v_pid = v.get("pid")
+                    if isinstance(v_pid, int) and v_pid in ancestors:
+                        return "baseball" if str(k) == str(BASEBALL_CHANNEL_ID) else str(k)
+                    active_candidates.append((ts, str(k)))
+                if len(active_candidates) == 1:
+                    only_cid = active_candidates[0][1]
+                    return "baseball" if only_cid == str(BASEBALL_CHANNEL_ID) else only_cid
+        except Exception:
+            pass
     return "zero-chat"
 
 
@@ -1907,16 +1998,43 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
             lf.write(f"\n[Detached Runner] Task completed successfully in {dur_str}. Suppressing success notification (failure-only policy active).\n")
         return
 
+    # Suppress redundant outbox synthesis/failure alerts when a short (<25s) task finishes
+    # while the originating channel's interactive turn is still actively in-flight and polling it directly.
+    if duration < 25.0 and _is_channel_turn_actively_in_flight(channel):
+        with open(log_file_path, "a", encoding="utf-8") as lf:
+            lf.write(
+                f"\n[Detached Runner] Short task ({dur_str}, status={final_status}) finished while "
+                f"origin channel ({channel}) turn is still actively in-flight. "
+                "Suppressing duplicate outbox notification so active turn handles result inline.\n"
+            )
+        return
+
     synthesize = fresh_meta.get("synthesize", True)
     persona_name = "Ivy" if str(channel).strip().lstrip("#") in ("baseball", str(BASEBALL_CHANNEL_ID)) else "Zero"
-    if final_status == "completed" and synthesize:
-        synthesis_prompt = f"""[SYSTEM NOTIFICATION: DETACHED TASK COMPLETE]
+    if synthesize and final_status in ("completed", "failed", "timed_out"):
+        status_banner = (
+            "DETACHED TASK COMPLETE"
+            if final_status == "completed"
+            else ("DETACHED TASK TIMED OUT" if final_status == "timed_out" else "DETACHED TASK FAILED")
+        )
+        directive_text = (
+            f"The background task has finished successfully. Review the execution log at {log_file_path}, "
+            f"extract the key results, metrics, or anomalies, and deliver a concise, natural executive briefing directly to Ryan in character as {persona_name}."
+            if final_status == "completed"
+            else (
+                f"The background task exited with status '{final_status}' (exit code {exit_code}). "
+                f"Inspect the execution log at {log_file_path}, diagnose the failure, fix the underlying bug or script issue if appropriate, "
+                f"and either relaunch or report the root cause concisely to Ryan in character as {persona_name}. "
+                f"If this task failure was already handled inline during your previous turn, emit [NO_REPLY]."
+            )
+        )
+        synthesis_prompt = f"""[SYSTEM NOTIFICATION: {status_banner}]
 Task Name: {name} (ID: {task_id})
 Duration: {dur_str} | Exit Code: {exit_code}
 Log Path: {log_file_path}
 
 Directive:
-The background task has finished successfully. Review the execution log at {log_file_path}, extract the key results, metrics, or anomalies, and deliver a concise, natural executive briefing directly to Ryan in character as {persona_name}.
+{directive_text}
 """
         try:
             from tools.outbox import queue_agent_turn
@@ -1926,7 +2044,7 @@ The background task has finished successfully. Review the execution log at {log_
                 job_name=f"Detached Task: {name}",
             )
             with open(log_file_path, "a", encoding="utf-8") as lf:
-                lf.write("\n[Detached Runner] 🟢 Dispatched autonomous agent synthesis turn via Outbox.\n")
+                lf.write(f"\n[Detached Runner] 🟢 Dispatched autonomous agent synthesis turn ({final_status}) via Outbox.\n")
             return
         except Exception as se:
             with open(log_file_path, "a", encoding="utf-8") as lf:

@@ -939,10 +939,18 @@ class TurnCoordinator:
         )
 
         is_home_turf = is_home_channel(self.channel_id)
+        is_autonomous_system_turn = (
+            self.prompt.lstrip().startswith("[SYSTEM NOTIFICATION:")
+            or (self.status_msg is None and not hasattr(self.reply_target, "reply"))
+        )
 
         # Attempt transcript harvest first if output is empty or was interrupted
         was_harvested = False
-        if is_empty_or_placeholder or is_leak or (is_home_turf and self.mode == "home" and is_silence):
+        if (
+            is_empty_or_placeholder
+            or is_leak
+            or (is_home_turf and self.mode == "home" and is_silence and not is_autonomous_system_turn)
+        ):
             harvested = harvest_transcript_response(
                 str(cid) if cid else None,
                 min_step_index=self.baseline_step_index,
@@ -964,8 +972,13 @@ class TurnCoordinator:
             if is_empty_or_placeholder or is_leak or is_silence:
                 return "[NO_REPLY]", False
 
-        # Genuine non-error silence without output maps to [NO_REPLY] in non-home channels or external mode
-        if (not is_home_turf or self.mode == "external") and (is_leak or is_silence) and not has_process_failure:
+        # Genuine non-error silence without output maps to [NO_REPLY] in non-home channels, external mode,
+        # or autonomous system notifications (e.g. deduplicated detached task synthesis turns).
+        if (
+            (not is_home_turf or self.mode == "external" or (is_autonomous_system_turn and is_silence))
+            and (is_leak or is_silence)
+            and not has_process_failure
+        ):
             final_text = "[NO_REPLY]"
             return final_text, False
 
