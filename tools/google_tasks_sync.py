@@ -16,11 +16,12 @@ Features:
 """
 
 import argparse
+import http.client
 import json
 import logging
-import os
 import re
 import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -58,7 +59,7 @@ def _headers() -> dict:
     }
 
 
-def _api_request(req: urllib.request.Request, timeout: float = 25.0, retries: int = 2, backoff: float = 1.5) -> bytes:
+def _api_request(req: urllib.request.Request, timeout: float = 25.0, retries: int = 3, backoff: float = 1.5) -> bytes:
     """Execute HTTP request against Google Tasks API with exponential backoff and retries."""
     last_err = None
     for attempt in range(retries + 1):
@@ -72,7 +73,7 @@ def _api_request(req: urllib.request.Request, timeout: float = 25.0, retries: in
                 time.sleep(backoff * (attempt + 1))
                 continue
             raise
-        except (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionResetError) as e:
+        except (http.client.RemoteDisconnected, urllib.error.URLError, TimeoutError, socket.timeout, ConnectionResetError, ssl.SSLError) as e:
             last_err = e
             if attempt < retries:
                 log.warning("Google Tasks API network error (%s) on attempt %d/%d, retrying in %.1fs...", e, attempt + 1, retries + 1, backoff * (attempt + 1))

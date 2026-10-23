@@ -157,7 +157,7 @@ def send_email(
                 f"{GMAIL_BASE}/threads/{thread_id}?format=metadata&metadataHeaders=Message-Id&metadataHeaders=Message-ID",
                 headers=headers
             )
-            with urllib.request.urlopen(t_req, timeout=TIMEOUT) as t_resp:
+            with workspace_mcp.urlopen_with_retry(t_req, timeout=TIMEOUT) as t_resp:
                 t_data = json.loads(t_resp.read().decode())
                 messages = t_data.get("messages", [])
                 if messages:
@@ -181,7 +181,7 @@ def send_email(
         method="POST"
     )
 
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+    with workspace_mcp.urlopen_with_retry(req, timeout=TIMEOUT) as resp:
         data = json.loads(resp.read().decode())
         action_type = "Draft created" if is_draft else "Email sent"
         return {

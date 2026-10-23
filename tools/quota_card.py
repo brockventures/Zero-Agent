@@ -13,6 +13,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -23,11 +24,10 @@ WEEK_SECONDS = 7 * 86400  # 604,800 seconds
 def fetch_usage_data(timeout: int = 30, retries: int = 1) -> dict:
     """Invoke `agy -p "/usage" --output-format=json` and return parsed JSON."""
     last_err: Exception | None = None
-    for attempt in range(retries + 1):
+    for attempt in range(max(0, retries) + 1):
         try:
             res = subprocess.run(
                 ["agy", "-p", "/usage", "--output-format=json"],
-                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -42,32 +42,16 @@ def fetch_usage_data(timeout: int = 30, retries: int = 1) -> dict:
                 if line.startswith("{") and line.endswith("}"):
                     return json.loads(line)
             return json.loads(stdout)
-        except Exception as e:
+        except subprocess.TimeoutExpired as e:
             last_err = e
             if attempt < retries:
                 continue
             raise last_err
-
-
-def _get_fallback_weekly_bucket_from_db() -> dict | None:
-    """Fallback to the most recent gemini-weekly snapshot in telemetry.db when agy /usage CLI times out."""
-    try:
-        from tools.quota_poller import get_latest_quota
-        latest = get_latest_quota()
-        gw = latest.get("gemini-weekly")
-        if gw and gw.get("remaining_fraction") is not None and gw.get("reset_time"):
-            return {
-                "id": "gemini-weekly",
-                "name": "Weekly Limit Remaining",
-                "window": "weekly",
-                "remaining_fraction": float(gw["remaining_fraction"]),
-                "reset_time": str(gw["reset_time"]),
-            }
-    except Exception:
-        pass
-    return None
-
-
+        except Exception as e:
+            raise e
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("Unexpected failure in fetch_usage_data")
 
 
 def parse_gemini_weekly_bucket(data: dict) -> dict:
@@ -160,18 +144,31 @@ def compute_cycle_metrics(
 def build_quota_card(now_utc: datetime | None = None, data: dict | None = None) -> tuple[bool, str, dict]:
     """Fetch live Gemini weekly quota and render the progress bar card."""
     try:
+        bucket = None
         if data is not None:
             bucket = parse_gemini_weekly_bucket(data)
         else:
             try:
                 raw = fetch_usage_data()
                 bucket = parse_gemini_weekly_bucket(raw)
-            except Exception as cli_err:
-                fb = _get_fallback_weekly_bucket_from_db()
-                if fb is not None:
-                    bucket = fb
-                else:
-                    raise cli_err
+            except Exception as live_err:
+                # Fall back to the most recent (<6h old) gemini-weekly snapshot from telemetry.db
+                try:
+                    from tools.quota_poller import get_latest_quota
+
+                    latest = get_latest_quota()
+                    gw = latest.get("gemini-weekly")
+                    if gw and gw.get("remaining_fraction") is not None and gw.get("reset_time"):
+                        ref_ts = now_utc.timestamp() if now_utc is not None else time.time()
+                        snap_ts = float(gw.get("timestamp") or 0)
+                        if snap_ts and (ref_ts - snap_ts) > 6 * 3600:
+                            raise live_err
+                        bucket = gw
+                    else:
+                        raise live_err
+                except Exception:
+                    raise live_err
+
         frac = float(bucket.get("remaining_fraction", 0.0))
         reset_iso = str(bucket.get("reset_time", ""))
         bar, pct = format_progress_bar(frac, width=10)

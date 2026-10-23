@@ -386,7 +386,7 @@ def ensure_gmail_label(label_name: str = CONTEXT_LABEL_NAME) -> str | None:
     """Find or create a custom Gmail label and return its label ID."""
     headers = workspace_mcp._auth_headers()
     req = urllib.request.Request(f"{GMAIL_BASE}/labels", headers=headers)
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with workspace_mcp.urlopen_with_retry(req, timeout=15) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     for lbl in data.get("labels", []):
         if str(lbl.get("name", "")).lower() == label_name.lower():
@@ -404,7 +404,7 @@ def ensure_gmail_label(label_name: str = CONTEXT_LABEL_NAME) -> str | None:
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(create_req, timeout=15) as resp:
+    with workspace_mcp.urlopen_with_retry(create_req, timeout=15) as resp:
         created = json.loads(resp.read().decode("utf-8"))
         return created.get("id")
 
@@ -430,7 +430,7 @@ def auto_archive_digest(subject: str, sent_msg_id: str = "", sent_thread_id: str
     if sent_msg_id:
         msg_ids.add(sent_msg_id)
     try:
-        with urllib.request.urlopen(search_req, timeout=15) as resp:
+        with workspace_mcp.urlopen_with_retry(search_req, timeout=15) as resp:
             sdata = json.loads(resp.read().decode("utf-8"))
             for m in sdata.get("messages", []):
                 if m.get("id"):
@@ -453,7 +453,7 @@ def auto_archive_digest(subject: str, sent_msg_id: str = "", sent_thread_id: str
                 headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(mreq, timeout=15) as resp:
+            with workspace_mcp.urlopen_with_retry(mreq, timeout=15) as resp:
                 json.loads(resp.read().decode("utf-8"))
                 modified_ids.append(mid)
         except Exception as e:

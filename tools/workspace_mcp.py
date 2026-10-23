@@ -1,22 +1,79 @@
 #!/usr/bin/env python3
-"""Google Workspace (Gmail & Calendar) MCP Server for Zero.
+"""Google Workspace (Gmail & Calendar) MCP Server for Ivy-AG.
 
 Authenticates via /secrets/google_oauth.json using stored OAuth refresh token.
 Token refreshes are cached in-memory and renewed automatically.
 Account: user@example.com
 """
 
+import http.client
 import json
 import os
 import re
+import socket
+import ssl
 import sys
 import time
-import urllib.request
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from mcp.server.mcpserver import MCPServer
+
+# Prefer IPv4 over IPv6 on Docker bridge networks to avoid OSError(99, 'Cannot assign requested address')
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_preferred_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if family == 0 or family == socket.AF_UNSPEC:
+        try:
+            res = _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+            if res:
+                return res
+        except (socket.gaierror, OSError):
+            pass
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+
+if getattr(socket, "_zero_ipv4_preferred", False) is False:
+    socket.getaddrinfo = _ipv4_preferred_getaddrinfo
+    socket._zero_ipv4_preferred = True
+
+
+def urlopen_with_retry(
+    req: urllib.request.Request | str,
+    timeout: float = 30.0,
+    retries: int = 3,
+    backoff: float = 1.5,
+):
+    """Execute urllib.request.urlopen with exponential backoff on transient network and HTTP errors."""
+    last_err: Exception | None = None
+    for attempt in range(max(0, retries) + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            raise
+        except (
+            http.client.RemoteDisconnected,
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            ConnectionResetError,
+            ssl.SSLError,
+        ) as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            raise last_err
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("Unexpected failure in urlopen_with_retry")
 
 def _resolve_secrets_path() -> str:
     """Dynamically resolve Google OAuth credentials path so in-memory imports never cache a moved path."""
@@ -94,21 +151,12 @@ def _get_access_token() -> str:
     }).encode("utf-8")
 
     req = urllib.request.Request(creds.get("token_uri", "https://oauth2.googleapis.com/token"), data=data)
-    last_err = None
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-                tokens = json.loads(resp.read().decode())
-                _cached_token = tokens["access_token"]
-                expires_in = tokens.get("expires_in", 3600)
-                _token_expiry = now + expires_in
-                return _cached_token
-        except Exception as e:
-            last_err = e
-            if attempt < 2:
-                time.sleep(1.0 * (attempt + 1))
-                continue
-            raise last_err
+    with urlopen_with_retry(req, timeout=TIMEOUT, retries=3, backoff=1.5) as resp:
+        tokens = json.loads(resp.read().decode())
+        _cached_token = tokens["access_token"]
+        expires_in = tokens.get("expires_in", 3600)
+        _token_expiry = now + expires_in
+        return _cached_token
 
 def _auth_headers() -> dict:
     tok = _get_access_token()
@@ -573,7 +621,7 @@ def calendar_delete_event(
             headers=_auth_headers(),
             method="DELETE"
         )
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with urlopen_with_retry(req, timeout=TIMEOUT):
             return json.dumps({"ok": True, "deleted_id": event_id})
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)})
