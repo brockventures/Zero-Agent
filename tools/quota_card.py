@@ -14,31 +14,60 @@ import json
 import subprocess
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
 WEEK_SECONDS = 7 * 86400  # 604,800 seconds
 
 
-def fetch_usage_data(timeout: int = 15) -> dict:
+def fetch_usage_data(timeout: int = 30, retries: int = 1) -> dict:
     """Invoke `agy -p "/usage" --output-format=json` and return parsed JSON."""
-    res = subprocess.run(
-        ["agy", "-p", "/usage", "--output-format=json"],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    stdout = (res.stdout or "").strip()
-    if not stdout:
-        raise RuntimeError(f"Empty output from agy /usage (rc={res.returncode}, stderr={res.stderr.strip()})")
-    # Find the JSON object in stdout
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if line.startswith("{") and line.endswith("}"):
-            return json.loads(line)
-    return json.loads(stdout)
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            res = subprocess.run(
+                ["agy", "-p", "/usage", "--output-format=json"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            stdout = (res.stdout or "").strip()
+            if not stdout:
+                raise RuntimeError(f"Empty output from agy /usage (rc={res.returncode}, stderr={res.stderr.strip()})")
+            # Find the JSON object in stdout
+            for line in reversed(stdout.splitlines()):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    return json.loads(line)
+            return json.loads(stdout)
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                continue
+            raise last_err
+
+
+def _get_fallback_weekly_bucket_from_db() -> dict | None:
+    """Fallback to the most recent gemini-weekly snapshot in telemetry.db when agy /usage CLI times out."""
+    try:
+        from tools.quota_poller import get_latest_quota
+        latest = get_latest_quota()
+        gw = latest.get("gemini-weekly")
+        if gw and gw.get("remaining_fraction") is not None and gw.get("reset_time"):
+            return {
+                "id": "gemini-weekly",
+                "name": "Weekly Limit Remaining",
+                "window": "weekly",
+                "remaining_fraction": float(gw["remaining_fraction"]),
+                "reset_time": str(gw["reset_time"]),
+            }
+    except Exception:
+        pass
+    return None
+
+
 
 
 def parse_gemini_weekly_bucket(data: dict) -> dict:
@@ -131,8 +160,18 @@ def compute_cycle_metrics(
 def build_quota_card(now_utc: datetime | None = None, data: dict | None = None) -> tuple[bool, str, dict]:
     """Fetch live Gemini weekly quota and render the progress bar card."""
     try:
-        raw = data if data is not None else fetch_usage_data()
-        bucket = parse_gemini_weekly_bucket(raw)
+        if data is not None:
+            bucket = parse_gemini_weekly_bucket(data)
+        else:
+            try:
+                raw = fetch_usage_data()
+                bucket = parse_gemini_weekly_bucket(raw)
+            except Exception as cli_err:
+                fb = _get_fallback_weekly_bucket_from_db()
+                if fb is not None:
+                    bucket = fb
+                else:
+                    raise cli_err
         frac = float(bucket.get("remaining_fraction", 0.0))
         reset_iso = str(bucket.get("reset_time", ""))
         bar, pct = format_progress_bar(frac, width=10)

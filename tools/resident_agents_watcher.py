@@ -23,10 +23,9 @@ via the authenticated Pixel 8 Pro browser session over CDP:
 from __future__ import annotations
 
 import argparse
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 import json
 import logging
-import os
 from pathlib import Path
 import re
 import sys
@@ -144,6 +143,7 @@ def load_state() -> Dict[str, Any]:
                     data.setdefault("last_seeding_scan_ts", 0)
                     data.setdefault("last_seeding_post_ts", 0)
                     data.setdefault("seeding_posts_by_date", {})
+                    data.setdefault("consecutive_poll_errors", 0)
                     data.setdefault("last_run_at", None)
                     return data
         except Exception as e:
@@ -161,6 +161,7 @@ def load_state() -> Dict[str, Any]:
         "last_seeding_scan_ts": 0,
         "last_seeding_post_ts": 0,
         "seeding_posts_by_date": {},
+        "consecutive_poll_errors": 0,
         "last_run_at": None,
     }
 
@@ -718,7 +719,22 @@ def poll_and_remediate_via_pixel(
                 page = context.pages[0] if context.pages else context.new_page()
 
                 if not page.url.startswith("https://old.reddit.com"):
-                    page.goto("https://old.reddit.com/r/ResidentAgents/", timeout=20000)
+                    last_nav_err: Optional[Exception] = None
+                    for nav_attempt in range(3):
+                        try:
+                            page.goto(
+                                "https://old.reddit.com/r/ResidentAgents/",
+                                timeout=25000,
+                                wait_until="domcontentloaded",
+                            )
+                            last_nav_err = None
+                            break
+                        except Exception as nav_e:
+                            last_nav_err = nav_e
+                            if nav_attempt < 2:
+                                time.sleep(2.5 * (nav_attempt + 1))
+                    if last_nav_err is not None:
+                        raise last_nav_err
                     page.wait_for_timeout(800)
 
                 # Wait out Reddit's lor2 SSO redirect if active
@@ -1058,6 +1074,7 @@ def poll_and_remediate_via_pixel(
     state["author_legit_cache"] = legit_cache
     state["thread_reply_counts"] = thread_reply_counts
     state["seen_seeding_ids"] = list(seen_seeding_set)[-300:]
+    state["consecutive_poll_errors"] = 0
     state["last_run_at"] = datetime.now(PT).strftime("%Y-%m-%d %I:%M:%S %p PT")
     if not dry_run:
         save_state(state)
@@ -1069,6 +1086,24 @@ def poll_and_remediate_via_pixel(
         "approved_items": newly_approved,
         "seeding_result": seeding_result,
     }
+
+
+def _is_transient_pixel_poll_error(err: Exception | str) -> bool:
+    """Return True if an exception is a transient Pixel wake/DNS/navigation/CDP timeout."""
+    msg = str(err).lower()
+    transient_markers = (
+        "err_name_not_resolved",
+        "err_internet_disconnected",
+        "err_network_changed",
+        "err_connection_timed_out",
+        "err_connection_reset",
+        "err_timed_out",
+        "timeout",
+        "connect_over_cdp",
+        "target closed",
+        "websocket",
+    )
+    return any(m in msg for m in transient_markers)
 
 
 def run_resident_agents_watcher(
@@ -1097,9 +1132,26 @@ def run_resident_agents_watcher(
             auto_post_seeding=True,
         )
     except Exception as e:
+        consec = int(state.get("consecutive_poll_errors") or 0) + 1
+        state["consecutive_poll_errors"] = consec
+        if not test:
+            save_state(state)
         err_msg = f"⚠️ r/ResidentAgents watcher error: {e}"
-        log.error(err_msg)
-        return False, err_msg, {"error": str(e), "link_assignment": link_assignment}
+        log.warning("%s (consecutive_poll_errors=%d)", err_msg, consec)
+        if _is_transient_pixel_poll_error(e) and consec < 3:
+            # Suppress single-cycle Pixel wake/DNS/timeout hiccups from spamming #zero-chat
+            return True, "", {
+                "ok": True,
+                "transient_error_suppressed": True,
+                "consecutive_poll_errors": consec,
+                "error": str(e),
+                "link_assignment": link_assignment,
+            }
+        return False, err_msg, {
+            "error": str(e),
+            "consecutive_poll_errors": consec,
+            "link_assignment": link_assignment,
+        }
 
     if link_assignment:
         res["link_assignment"] = link_assignment

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import sys
 from unittest.mock import patch
@@ -22,12 +21,10 @@ from tools.resident_agents_watcher import (
     SEEDING_MIN_SCORE,
     SEEDING_SCAN_INTERVAL_SEC,
     build_upvote_targets_for_reply,
-    check_and_assign_daily_links,
     classify_item_needs_approval,
     detect_desired_flair,
     evaluate_seeding_candidates_llm,
     find_unassigned_daily_links_message,
-    format_daily_link_assignment_prompt,
     format_daily_tip_prompt,
     format_notification_card,
     format_peer_side_project_card,
@@ -362,3 +359,31 @@ def test_state_persistence_and_runner(tmp_path: Path) -> None:
             assert mock_enq.call_count == 1
             channels = [c.kwargs["channel"] for c in mock_enq.call_args_list]
             assert channels == [str(RESIDENT_AGENTS_CHANNEL_ID)]
+
+
+def test_transient_pixel_poll_error_suppression_until_3_strikes(tmp_path: Path) -> None:
+    fake_state_file = tmp_path / "state_err.json"
+    with patch("tools.resident_agents_watcher.STATE_FILE", fake_state_file), patch(
+        "tools.resident_agents_watcher.check_and_assign_daily_links", return_value=None
+    ), patch(
+        "tools.resident_agents_watcher.poll_and_remediate_via_pixel",
+        side_effect=RuntimeError("Page.goto: net::ERR_NAME_NOT_RESOLVED at https://old.reddit.com/r/ResidentAgents/"),
+    ):
+        # Strike 1 & 2: suppressed silently
+        ok1, msg1, extra1 = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
+        assert ok1 is True
+        assert msg1 == ""
+        assert extra1.get("transient_error_suppressed") is True
+        assert extra1.get("consecutive_poll_errors") == 1
+
+        ok2, msg2, extra2 = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
+        assert ok2 is True
+        assert msg2 == ""
+        assert extra2.get("consecutive_poll_errors") == 2
+
+        # Strike 3: surfaces alert
+        ok3, msg3, extra3 = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
+        assert ok3 is False
+        assert "ERR_NAME_NOT_RESOLVED" in msg3
+        assert extra3.get("consecutive_poll_errors") == 3
+

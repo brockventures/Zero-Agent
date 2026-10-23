@@ -82,7 +82,7 @@ def init_db(conn: Optional[sqlite3.Connection] = None, db_path: Path | str = DB_
             conn.close()
 
 
-def fetch_quota_buckets(timeout: int = 15) -> List[Dict[str, Any]]:
+def fetch_quota_buckets(timeout: int = 30) -> List[Dict[str, Any]]:
     """Fetch live quota buckets from agy CLI with zero token overhead."""
     from tools.quota_card import fetch_usage_data
 
