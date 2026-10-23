@@ -1176,7 +1176,7 @@ def format_origin_completion_envelope(build_id: str, db_path: Path | str = FORGE
             lines.append(f"- {f}")
 
     reload_note = (
-        "\nThis build modified core bridge files (`touches_core_bridge=true`). Include `[CHOICES: Reload Bridge In-Place | Postpone Reload]` at the end of your response."
+        "\nThis build modified core bridge files (`touches_core_bridge=true`). A FORGE Decision Card (`bridge_reload`) has been posted to this channel so Ryan can approve an in-place reload with one click."
         if build["touches_core_bridge"]
         else ""
     )
@@ -1197,6 +1197,20 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
 
     envelope = format_origin_completion_envelope(build_id, db_path=db_path)
     target_ch = build["origin_thread_id"] or build["origin_channel_id"]
+    if build["touches_core_bridge"]:
+        try:
+            stage_decision(
+                category="bridge_reload",
+                title=f"Reload Bridge After Build {build_id}",
+                summary=f"FORGE build `{build_id}` (**{build['title']}**) modified core bridge files (`touches_core_bridge=true`). Approve to trigger an in-place bridge reload.",
+                handler_type="bridge_reload",
+                payload={"build_id": build_id, "reason": f"FORGE build {build_id} ({build['title']})"},
+                channel_id=int(target_ch),
+                db_path=db_path,
+                post_to_discord=True,
+            )
+        except Exception as de:
+            print(f"[FORGE] Warning staging bridge_reload decision card for {build_id}: {de}")
     try:
         from tools.outbox import queue_outbox_message
         queue_outbox_message(
@@ -2246,7 +2260,37 @@ def execute_decision(
             reload_flag = DATA_DIR / "reload_bridge.flag"
             reload_flag.write_text(str(time.time()), encoding="utf-8")
             ok = True
-            receipt = "Triggered in-place bridge reload flag"
+            receipt = "Triggered in-place bridge reload"
+
+        elif handler == "file_delete":
+            cmd = payload.get("command", "")
+            paths = payload.get("paths") or payload.get("files") or ([] if not payload.get("path") else [payload["path"]])
+            if cmd:
+                cwd = payload.get("cwd", "/workspace")
+                proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60)
+                ok = proc.returncode == 0
+                out = (proc.stdout or proc.stderr or "").strip()
+                receipt = f"Deleted via `{cmd[:80]}`" if ok else f"Exit {proc.returncode}: {out[:160]}"
+            elif paths and payload.get("auto_delete"):
+                removed = []
+                for p_str in paths:
+                    p_obj = Path(p_str)
+                    if p_obj.is_dir():
+                        shutil.rmtree(p_obj)
+                        removed.append(str(p_obj))
+                    elif p_obj.exists() or p_obj.is_symlink():
+                        p_obj.unlink()
+                        removed.append(str(p_obj))
+                ok = True
+                receipt = f"Deleted {len(removed)} path(s): `{', '.join(removed)[:120]}`"
+            else:
+                ok = True
+                target_label = ", ".join(str(x) for x in paths) if paths else str(payload.get("target", "target files"))
+                receipt = f"Approved file deletion for `{target_label[:120]}`"
+
+        elif handler in ("noop", "approval"):
+            ok = True
+            receipt = str(payload.get("receipt") or payload.get("note") or "Approved by Ryan")
 
         else:
             return {"ok": False, "error": f"Unsupported handler_type: {handler}"}
@@ -2266,6 +2310,8 @@ def execute_decision(
     return {
         "ok": ok,
         "decision_id": decision_id,
+        "handler_type": handler,
+        "channel_id": int(row["channel_id"]),
         "status": final_status,
         "receipt": receipt,
         "formatted_card": format_decision_card_text(updated_row) if updated_row else "",

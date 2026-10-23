@@ -68,7 +68,19 @@ def check_updates(quiet: bool = False):
         for u in updates_available:
             print(f"• **{u['service']}:** `v{u['installed']}` → `v{u['latest']}`")
             print(f"  Notes: {u['notes']}")
-        print(f"\n[CHOICES: Backup & Upgrade Smart Home Stack | Snooze 1 Week | Skip]")
+        try:
+            from tools.forge import stage_decision
+            stage_decision(
+                category="ha_upgrade",
+                title=f"Backup & Upgrade Home Assistant Core to v{ha_latest}",
+                summary=f"Home Assistant Core `v{ha_curr}` → `v{ha_latest}` stable patch is ready. Approving creates a pre-upgrade snapshot + WAL-safe DB backup and runs `docker compose pull && up -d`.",
+                handler_type="shell",
+                payload={"command": "python3 /workspace/tools/ha_update_check.py upgrade", "cwd": "/workspace"},
+                channel_id=1544953275877556334,
+                post_to_discord=True,
+            )
+        except Exception as e:
+            print(f"\n[CHOICES: Backup & Upgrade Smart Home Stack | Snooze 1 Week | Skip] ({e})")
     else:
         if not quiet:
             print(f"✅ **Smart Home Stack is up to date:**")

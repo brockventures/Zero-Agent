@@ -859,6 +859,12 @@ async def on_button_interaction(interaction: discord.Interaction):
                 except Exception:
                     pass
 
+            if action_prefix == "forge_approve" and res.get("ok") and res.get("handler_type") == "bridge_reload":
+                try:
+                    await _execute_reload(interaction.channel, announce=True)
+                except Exception as re_err:
+                    print(f"[Bridge] Error executing reload from Decision Card {decision_id}: {re_err}")
+
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):

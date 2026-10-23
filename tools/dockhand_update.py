@@ -60,7 +60,19 @@ def check_updates(quiet: bool = False):
         for h in upgrades_needed:
             print(f"• **{h}:** Update ready to install")
         print("\n• **Safety:** Automated WAL-safe `.backup` of `dockhand.db` executes before container restart.")
-        print("\n[CHOICES: Backup DB & Update Dockhand on Both Hosts | Skip For Now]")
+        try:
+            from tools.forge import stage_decision, ZERO_OPS_CHANNEL_ID
+            stage_decision(
+                category="ops_upgrade",
+                title="Backup DB & Update Dockhand on Both Hosts",
+                summary=f"Docker Hub `fnsys/dockhand:latest` updated ({updated}, `{hub_digest[:19]}...`) for {', '.join(upgrades_needed)}. Approving runs WAL-safe SQLite backup + `docker compose pull && up -d`.",
+                handler_type="shell",
+                payload={"command": "python3 /workspace/tools/dockhand_update.py upgrade", "cwd": "/workspace"},
+                channel_id=ZERO_OPS_CHANNEL_ID,
+                post_to_discord=True,
+            )
+        except Exception as e:
+            print(f"\n[CHOICES: Backup DB & Update Dockhand on Both Hosts | Skip For Now] ({e})")
     else:
         if not quiet:
             print("✅ **Dockhand is up to date** on both Host1 (.82) and Host2 (.84).")

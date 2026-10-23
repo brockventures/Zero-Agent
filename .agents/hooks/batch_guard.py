@@ -175,10 +175,17 @@ def _has_active_delete_approval(db_path: str = "/workspace/data/forge.db") -> bo
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
         try:
-            cur = conn.execute(
-                "SELECT 1 FROM decision_cards WHERE action_type = 'file_delete' AND status = 'approved' LIMIT 1"
-            )
-            return cur.fetchone() is not None
+            for query in (
+                "SELECT 1 FROM forge_decisions WHERE category = 'file_delete' AND status IN ('approved', 'edited_approved') LIMIT 1",
+                "SELECT 1 FROM decision_cards WHERE action_type = 'file_delete' AND status = 'approved' LIMIT 1",
+            ):
+                try:
+                    cur = conn.execute(query)
+                    if cur.fetchone() is not None:
+                        return True
+                except Exception:
+                    continue
+            return False
         finally:
             conn.close()
     except Exception:
@@ -212,10 +219,10 @@ def check_file_deletion_gate(cmd: str, cwd: str = "/workspace") -> tuple[bool, s
     if norm_cwd.startswith("/tmp/forge-wt-"):
         return True, ""
 
-    # 1. Block direct SQL/shell tampering with decision_cards approval status
-    if "decision_cards" in cmd and re.search(r"\b(?:UPDATE|INSERT|REPLACE)\b", cmd, re.IGNORECASE):
+    # 1. Block direct SQL/shell tampering with decision_cards / forge_decisions approval status
+    if ("decision_cards" in cmd or "forge_decisions" in cmd) and re.search(r"\b(?:UPDATE|INSERT|REPLACE)\b", cmd, re.IGNORECASE):
         return False, (
-            "Decision Card Tamper Blocked: Modifying 'decision_cards' approval status directly via SQL or shell is prohibited. "
+            "Decision Card Tamper Blocked: Modifying 'decision_cards' or 'forge_decisions' approval status directly via SQL or shell is prohibited. "
             "Only Ryan can approve a Decision Card via the interactive Discord button."
         )
 
@@ -563,7 +570,7 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
     # 1. run_command check
     if name == "run_command":
         cmd = args.get("CommandLine", "")
-        if "forge.py" in cmd and ("enqueue" in cmd or "job" in cmd):
+        if "forge.py" in cmd and ("enqueue" in cmd or "job" in cmd or "stage-decision" in cmd):
             state["inline_prod_files"] = []
             state["scratch_script_runs"] = {}
             state["total_scratch_runs"] = 0
@@ -931,11 +938,30 @@ def main():
             except Exception:
                 pass
 
-        # 2. Tool Batching Guard
+        # 2. Tool Batching Guard (reset turn state automatically when a new agy process/turn starts)
+        try:
+            cur_ppid = os.getppid()
+            st = load_state(STATE_FILE)
+            if st.get("agy_ppid") and st.get("agy_ppid") != cur_ppid:
+                fresh = _default_state(time.time())
+                fresh["agy_ppid"] = cur_ppid
+                save_state(fresh, STATE_FILE)
+            elif not st.get("agy_ppid"):
+                st["agy_ppid"] = cur_ppid
+                save_state(st, STATE_FILE)
+        except Exception:
+            pass
+
         allowed, reason = check_tool_use(name, args, cwd=cwd)
         if not allowed:
             print(json.dumps({"decision": "deny", "reason": reason}))
             return
+        try:
+            st_after = load_state(STATE_FILE)
+            st_after["agy_ppid"] = os.getppid()
+            save_state(st_after, STATE_FILE)
+        except Exception:
+            pass
 
         resp = {"decision": "allow"}
         if name == "run_command" and not args.get("IsDaemon", False):

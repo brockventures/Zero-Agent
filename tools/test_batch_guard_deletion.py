@@ -61,12 +61,30 @@ def test_protected_deletion_allowed_when_decision_card_approved(tmp_path):
 
 def test_self_approval_tamper_blocked(tmp_path):
     state_file = str(tmp_path / "bg_state.json")
-    cmd = "sqlite3 /workspace/data/forge.db \"UPDATE decision_cards SET status = 'approved' WHERE action_type = 'file_delete'\""
-    ok, reason = batch_guard.check_tool_use(
-        "run_command", {"CommandLine": cmd}, state_file=state_file, cwd="/workspace"
+    for table in ("decision_cards", "forge_decisions"):
+        cmd = f"sqlite3 /workspace/data/forge.db \"UPDATE {table} SET status = 'approved' WHERE id = '1'\""
+        ok, reason = batch_guard.check_tool_use(
+            "run_command", {"CommandLine": cmd}, state_file=state_file, cwd="/workspace"
+        )
+        assert ok is False
+        assert "Tamper Blocked" in reason
+
+
+def test_has_active_delete_approval_reads_forge_decisions_schema(tmp_path):
+    import sqlite3
+    db_file = tmp_path / "forge_test.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.execute(
+        "CREATE TABLE forge_decisions (id TEXT PRIMARY KEY, category TEXT, status TEXT)"
     )
-    assert ok is False
-    assert "Tamper Blocked" in reason
+    conn.execute("INSERT INTO forge_decisions VALUES ('dec-1', 'file_delete', 'pending')")
+    conn.commit()
+    assert batch_guard._has_active_delete_approval(str(db_file)) is False
+
+    conn.execute("UPDATE forge_decisions SET status = 'approved' WHERE id = 'dec-1'")
+    conn.commit()
+    conn.close()
+    assert batch_guard._has_active_delete_approval(str(db_file)) is True
 
 
 def test_destructive_git_working_tree_wipes_blocked(tmp_path):
