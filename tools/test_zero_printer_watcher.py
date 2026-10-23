@@ -13,7 +13,10 @@ from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 # Add workspace to path
-sys.path.insert(0, "/workspace")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+if "/workspace" not in sys.path:
+    sys.path.append("/workspace")
 from tools.zero_printer_watcher import (
     OctoPrintClient,
     PrinterWatcherDaemon,
@@ -275,6 +278,132 @@ class TestZeroPrinterWatcher(unittest.TestCase):
                 self.assertIsNotNone(gif_path)
                 self.assertTrue(gif_path.exists())
                 self.assertGreater(gif_path.stat().st_size, 100)
+
+
+    @patch("tools.zero_printer_watcher.compile_timelapse_gif")
+    @patch("tools.zero_printer_watcher.archive_timelapse_frame")
+    @patch("tools.zero_printer_watcher.speak_announcement", return_value=True)
+    @patch("tools.zero_printer_watcher.cut_printer_power", return_value=True)
+    @patch("tools.zero_printer_watcher.stop_webcam", return_value=True)
+    @patch("tools.zero_printer_watcher.capture_webcam_snapshot", return_value=True)
+    @patch("tools.zero_printer_watcher.deliver_discord_photo", return_value=True)
+    @patch("tools.zero_printer_watcher.get_nozzle_temp", return_value=42.0)
+    @patch.object(OctoPrintClient, "get_job")
+    def test_daemon_terminal_done_triggers_timelapse_gif(
+        self,
+        mock_get_job,
+        mock_temp,
+        mock_deliver,
+        mock_snap,
+        mock_stop_cam,
+        mock_cut_pwr,
+        mock_speak,
+        mock_archive,
+        mock_compile,
+    ):
+        mock_get_job.return_value = {
+            "state": "Operational",
+            "progress": {"completion": 100.0, "printTime": 1800},
+            "job": {"file": {"name": "gear_bearing.gcode"}},
+        }
+        mock_gif_path = MagicMock(spec=Path)
+        mock_gif_path.exists.return_value = True
+        mock_compile.return_value = mock_gif_path
+
+        daemon = PrinterWatcherDaemon(
+            octoprint_url="http://127.0.0.1:8888",
+            api_key="test_key",
+            interval_print=1,
+            interval_cooldown=1,
+            cooldown_temp=50.0,
+            channel="3d-print",
+        )
+
+        with patch.object(daemon, "write_pid"), patch.object(daemon, "remove_pid"), patch("tools.zero_printer_watcher.time.sleep", side_effect=[None, None]):
+            daemon.run()
+
+        # Verify archive_timelapse_frame called on terminal snapshot
+        mock_archive.assert_called_with(unittest.mock.ANY, "gear_bearing.gcode", reset_if_new=False)
+        # Verify compile_timelapse_gif called with job filename
+        mock_compile.assert_called_once_with("gear_bearing.gcode")
+        # Verify deliver_discord_photo delivered the GIF
+        delivery_calls = mock_deliver.call_args_list
+        gif_deliveries = [call for call in delivery_calls if "🎬 **Zero Watcher: Print Timelapse GIF**" in call[0][1]]
+        self.assertEqual(len(gif_deliveries), 1)
+        self.assertEqual(gif_deliveries[0][0][0], mock_gif_path)
+        self.assertEqual(gif_deliveries[0][0][2], "3d-print")
+
+    @patch("tools.zero_printer_watcher.archive_timelapse_frame")
+    @patch("tools.zero_printer_watcher.evaluate_print_image")
+    @patch("tools.zero_printer_watcher.capture_webcam_snapshot", return_value=True)
+    @patch.object(OctoPrintClient, "get_job")
+    def test_daemon_printing_archives_timelapse_frame_fresh_start(
+        self,
+        mock_get_job,
+        mock_snap,
+        mock_eval,
+        mock_archive,
+    ):
+        mock_get_job.return_value = {
+            "state": "Printing",
+            "progress": {"completion": 1.0, "printTime": 30},
+            "job": {"file": {"name": "test_fresh.gcode"}},
+        }
+        mock_eval.return_value = {"failure": False, "confidence": 0.99, "issue": "nominal", "summary": "clean"}
+
+        daemon = PrinterWatcherDaemon(
+            octoprint_url="http://127.0.0.1:8888",
+            api_key="test_key",
+            interval_print=0,
+            interval_timelapse=180,
+            channel="3d-print",
+            post_progress=False,
+        )
+
+        with patch.object(daemon, "write_pid"), patch.object(daemon, "remove_pid"), patch("tools.zero_printer_watcher.get_nozzle_temp", return_value=205.0), patch("tools.zero_printer_watcher.time.sleep", side_effect=KeyboardInterrupt):
+            try:
+                daemon.run()
+            except KeyboardInterrupt:
+                pass
+
+        # Since was_printing was False and completion < 2.0, reset_if_new should be True
+        mock_archive.assert_called_once_with(unittest.mock.ANY, "test_fresh.gcode", reset_if_new=True)
+        mock_eval.assert_called_once_with(unittest.mock.ANY, completion=1.0)
+
+    @patch("tools.zero_printer_watcher.archive_timelapse_frame")
+    @patch("tools.zero_printer_watcher.evaluate_print_image")
+    @patch("tools.zero_printer_watcher.capture_webcam_snapshot", return_value=True)
+    @patch.object(OctoPrintClient, "get_job")
+    def test_daemon_timelapse_interval_archiving(
+        self,
+        mock_get_job,
+        mock_snap,
+        mock_eval,
+        mock_archive,
+    ):
+        mock_get_job.return_value = {
+            "state": "Printing",
+            "progress": {"completion": 25.0, "printTime": 600},
+            "job": {"file": {"name": "mid_job.gcode"}},
+        }
+
+        daemon = PrinterWatcherDaemon(
+            octoprint_url="http://127.0.0.1:8888",
+            api_key="test_key",
+            interval_print=10000,
+            interval_timelapse=10,
+            channel="3d-print",
+        )
+
+        with patch.object(daemon, "write_pid"), patch.object(daemon, "remove_pid"), patch("tools.zero_printer_watcher.get_nozzle_temp", return_value=200.0), patch("time.time", return_value=1000.0), patch("tools.zero_printer_watcher.time.sleep", side_effect=KeyboardInterrupt):
+            try:
+                daemon.run()
+            except KeyboardInterrupt:
+                pass
+
+        # Eval was skipped because (1000 - 0) < 10000, but timelapse triggered because (1000 - 0) >= 10
+        mock_eval.assert_not_called()
+        mock_archive.assert_called_once_with(unittest.mock.ANY, "mid_job.gcode", reset_if_new=False)
 
 
 if __name__ == "__main__":

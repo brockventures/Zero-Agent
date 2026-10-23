@@ -866,6 +866,7 @@ class PrinterWatcherDaemon:
         print(f"          Print Cadence: {self.interval_print}s | Cooldown Cadence: {self.interval_cooldown}s")
 
         last_eval_time = 0
+        last_timelapse_time = 0
         terminal_triggered = False
         terminal_reason = "DONE"
 
@@ -917,8 +918,11 @@ class PrinterWatcherDaemon:
 
                 # Check if print is actively running
                 if state == "Printing":
+                    is_fresh_start = False
                     if not self.was_printing:
                         self.was_printing = True
+                        if completion < 2.0:
+                            is_fresh_start = True
                         clean_name = clean_job_name(filename)
                         if completion < 2.0 and self.enable_voice:
                             speak_announcement(f"Extrusion initialized for {clean_name}. Keep your hands off the build plate.")
@@ -929,7 +933,9 @@ class PrinterWatcherDaemon:
                     if (now - last_eval_time) >= self.interval_print:
                         print(f"[Watcher] Active print at {completion:.1f}%. Capturing snapshot for vision eval...")
                         if capture_webcam_snapshot(LATEST_SNAPSHOT, burst=self.burst):
-                            eval_result = evaluate_print_image(LATEST_SNAPSHOT)
+                            archive_timelapse_frame(LATEST_SNAPSHOT, filename, reset_if_new=is_fresh_start)
+                            last_timelapse_time = now
+                            eval_result = evaluate_print_image(LATEST_SNAPSHOT, completion=completion)
                             if "error" in eval_result:
                                 print(f"[Watcher] Vision Eval warning (skipping bogus 0% fallback): {eval_result['error']}")
                                 last_eval_time = now
@@ -979,6 +985,12 @@ class PrinterWatcherDaemon:
                                 deliver_discord_photo(LATEST_SNAPSHOT, caption, self.channel)
 
                         last_eval_time = now
+                    elif self.interval_timelapse > 0 and (now - last_timelapse_time) >= self.interval_timelapse:
+                        if capture_webcam_snapshot(LATEST_SNAPSHOT, burst=self.burst):
+                            saved_frame = archive_timelapse_frame(LATEST_SNAPSHOT, filename, reset_if_new=False)
+                            if saved_frame:
+                                print(f"[Timelapse] Archived frame {saved_frame.name} at {completion:.1f}%")
+                            last_timelapse_time = now
 
                     # Sleep 15s between status loops while printing
                     time.sleep(15)
@@ -1033,11 +1045,21 @@ class PrinterWatcherDaemon:
 
                     print(f"[Watcher] Terminal state hit ({terminal_reason}). Capturing completion photo...")
                     if capture_webcam_snapshot(LATEST_SNAPSHOT):
+                        archive_timelapse_frame(LATEST_SNAPSHOT, filename, reset_if_new=False)
                         deliver_discord_photo(
                             LATEST_SNAPSHOT,
                             f"{caption_header}\nCooling hotend below {self.cooldown_temp:.0f}°C before automated power-off...",
                             self.channel
                         )
+
+                    if terminal_reason == "DONE":
+                        gif_path = compile_timelapse_gif(filename)
+                        if gif_path and gif_path.exists():
+                            deliver_discord_photo(
+                                gif_path,
+                                f"🎬 **Zero Watcher: Print Timelapse GIF** (`{filename}`)",
+                                self.channel,
+                            )
 
                 # Cooldown phase
                 if terminal_triggered:
@@ -1155,6 +1177,7 @@ def main():
     parser.add_argument("--no-post-progress", action="store_true", help="Disable posting periodic nominal progress photos to Discord")
     parser.add_argument("--no-voice", action="store_true", help="Disable audible speech announcements via Pixel 8 Pro")
     parser.add_argument("--interval-print", type=int, default=1200, help="Print evaluation cadence in seconds (default: 1200 / 20m)")
+    parser.add_argument("--interval-timelapse", type=int, default=180, help="Timelapse frame archiving cadence in seconds (default: 180 / 3m)")
     parser.add_argument("--interval-cooldown", type=int, default=60, help="Cooldown polling cadence in seconds (default: 60)")
     parser.add_argument("--cooldown-temp", type=float, default=50.0, help="Safe hotend power-off temperature (default: 50.0°C)")
     parser.add_argument("--channel", default=DEFAULT_DISCORD_CHANNEL, help="Target Discord channel for photos and alerts")
@@ -1205,6 +1228,7 @@ def main():
             str(Path(__file__).resolve()),
             "--internal-run",
             f"--interval-print={args.interval_print}",
+            f"--interval-timelapse={args.interval_timelapse}",
             f"--interval-cooldown={args.interval_cooldown}",
             f"--cooldown-temp={args.cooldown_temp}",
             f"--channel={args.channel}",
@@ -1235,6 +1259,7 @@ def main():
     if args.internal_run:
         watcher = PrinterWatcherDaemon(
             interval_print=args.interval_print,
+            interval_timelapse=args.interval_timelapse,
             interval_cooldown=args.interval_cooldown,
             cooldown_temp=args.cooldown_temp,
             channel=args.channel,
