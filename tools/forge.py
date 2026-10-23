@@ -1273,7 +1273,7 @@ def format_origin_completion_envelope(build_id: str, db_path: Path | str = FORGE
     )
     lines.append(
         "\nEvaluate the completed build ledger above against the original user request. "
-        "Deliver a concise final completion summary directly to Ryan in this channel."
+        "Deliver a concise final completion summary directly to Ryan in this channel focusing on what changed for him (do NOT recite commit SHAs, test pass counts, or internal verification gates unless asked)."
         + reload_note
     )
     return "\n".join(lines)

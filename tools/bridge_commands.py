@@ -202,11 +202,6 @@ async def execute_bridge_reload(
         sync_res = sync_git_on_reload(reason=reason, initiator=initiator)
         if sync_res.get("synced"):
             print(f"[Bridge] 🚀 Pre-reload git sync: {sync_res.get('message')}")
-            if channel:
-                try:
-                    await channel.send(f"📦 **Git Sync:** {sync_res.get('message')}")
-                except Exception:
-                    pass
         elif sync_res.get("clean"):
             print(f"[Bridge] 🟢 Pre-reload git sync: {sync_res.get('message')}")
         elif sync_res.get("error"):

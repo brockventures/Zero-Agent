@@ -24,7 +24,7 @@ description: >-
      - Delete the remote head feature branch.
      - **Atomic Local Teardown:** Immediately pull latest `main`, remove any associated scratch worktrees (`git worktree remove` and `git worktree prune`), delete the local feature branch (`git branch -d`), and prune remote tracking references (`git fetch --prune origin`). Never leave orphan worktrees or merged feature branches on disk.
      - Confirm automatic closure of associated tracking issues.
-     - Report the final merge commit SHA as the receipt.
+     - **Silent Git/CI Telemetry in Home Channels:** In Ryan's home channels, confirm the outcome in plain language without reciting commit SHAs, unit test pass counts, or internal safety/hook gates unless explicitly asked. (Reserve commit SHAs and PR numbers for Crab Cavern handoff envelopes or when Ryan asks for a specific PR/commit link).
 
 3. **Autonomous Resolution of Blocked PRs:**
    - If a PR is in `mergeable_state: blocked`:

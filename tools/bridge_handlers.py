@@ -807,7 +807,7 @@ async def handle_on_ready(
             "\nDeliver a brief, direct restart check-in to Ryan in #zero-chat (1–2 sentences max):\n"
             "1. MUST start your message with the exact standard status header:\n"
             "🟢 **Zero is online and ready.**\n\n"
-            "2. State concisely why you restarted and the active git commit.\n"
+            "2. State concisely why you restarted in plain language (do NOT mention git commit hashes, test counts, or internal sync details).\n"
             "3. Do NOT invent filler next-step menus or artificial [CHOICES: ...] buttons, and NEVER prompt Ryan to merge, commit, or run routine git housekeeping (land any autonomous git cleanup silently before replying). Only include [CHOICES: ...] if an interrupted user task or genuine architectural decision actively requires Ryan\x27s approval."
         )
 
