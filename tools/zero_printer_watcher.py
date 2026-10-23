@@ -578,7 +578,7 @@ def _image_mean_luma(image_path: Path) -> float:
     try:
         with Image.open(image_path) as im:
             gray = im.convert("L").resize((64, 64))
-            px = list(gray.getdata())
+            px = gray.tobytes()
             return sum(px) / float(len(px)) if px else 255.0
     except Exception:
         return 255.0
@@ -681,9 +681,11 @@ def evaluate_print_image(image_path: Path, completion: float = 0.0, timeout: flo
         return {"failure": False, "confidence": 0.0, "error": "Image file does not exist or is empty"}
 
     air_print_clause = (
-        f"5. Air-printing / extrusion stoppage (clogged nozzle or ground filament): print progress is {completion:.1f}%, "
-        "so if progress is >= 40% but the parts on the build plate are still only paper-thin flat 1-2mm base layers "
-        "with zero vertical walls/thickness and the hotend is printing in empty air above them, flag failure=true. "
+        f"5. Air-printing / extrusion stoppage (clogged nozzle): print progress is {completion:.1f}%. "
+        "ONLY flag air-printing if you can clearly see a large vertical gap (>= 5mm of empty air) between the brass nozzle tip "
+        "and the top surface of the plastic part while the gantry is high above the bed, or severe wispy under-extrusion cobwebs. "
+        "IMPORTANT: Many functional parts (backplates, lids, clips, stencils) are intentionally flat 1-3mm plates; "
+        "if the part is a clean flat plate and the toolhead/nozzle is right at the top surface of the part, that is 100% NORMAL and NOT air-printing. "
         if completion >= 40.0
         else ""
     )
