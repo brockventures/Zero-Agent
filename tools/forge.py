@@ -50,7 +50,6 @@ if str(TOOLS_DIR) not in sys.path:
 
 DATA_DIR = WORKSPACE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-FORGE_DB_PATH = DATA_DIR / "forge.db"
 FORGE_LOGS_DIR = DATA_DIR / "forge_logs"
 FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 TASKS_DIR = DATA_DIR / "detached_tasks"
@@ -69,6 +68,28 @@ OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
 DEFAULT_WORKER_MODEL = "gemini-3.8-flash-high"
 ESCALATION_WORKER_MODEL = "gemini-4-argon-medium"
 DEFAULT_LEASE_TTL_SECONDS = 300.0
+
+
+def resolve_default_forge_db_path() -> Path:
+    """Resolve the shared cross-container FORGE SQLite path on Host 2 (/baseball/data/forge.db) when present."""
+    env_override = os.getenv("FORGE_DB_PATH", "").strip()
+    if env_override:
+        return Path(env_override)
+    shared_baseball_data = Path("/baseball/data")
+    if shared_baseball_data.exists() and shared_baseball_data.is_dir():
+        return shared_baseball_data / "forge.db"
+    return DATA_DIR / "forge.db"
+
+
+FORGE_DB_PATH = resolve_default_forge_db_path()
+
+
+def is_ivy_container() -> bool:
+    """Return True if executing inside discord-ivy-agent (#baseball)."""
+    return (
+        os.getenv("DISCORD_CHANNEL_ID", "").strip() == str(BASEBALL_CHANNEL_ID)
+        or Path("/opt/zero/workspace").exists()
+    )
 
 
 def get_default_origin_channel() -> str:
@@ -1227,10 +1248,16 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
         del_cur = conn.execute("DELETE FROM forge_jobs WHERE log_file LIKE '/tmp/%' OR id LIKE 'dt-test-%'")
         pruned_jobs += del_cur.rowcount
         active_jobs = conn.execute(
-            "SELECT id, status, worker_pid, child_pid, start_time FROM forge_jobs WHERE status IN ('starting', 'running')"
+            "SELECT id, status, channel, worker_pid, child_pid, start_time FROM forge_jobs WHERE status IN ('starting', 'running')"
         ).fetchall()
         now_ts = time.time()
+        in_ivy = is_ivy_container()
         for j in active_jobs:
+            j_ch = str(j["channel"] or "").strip().lstrip("#")
+            job_belongs_to_ivy = j_ch in ("baseball", str(BASEBALL_CHANNEL_ID))
+            if job_belongs_to_ivy != in_ivy:
+                # PID namespaces are container-local; do not reap the peer container's jobs
+                continue
             wpid = j["worker_pid"]
             cpid = j["child_pid"]
             alive = _is_pid_running(cpid) or _is_pid_running(wpid)
@@ -1272,11 +1299,13 @@ class ForgeSupervisor:
         }
 
     def maybe_spawn_next_build_worker(self) -> Optional[str]:
-        """If a build is queued in SQLite and no build worker is currently running, spawn a detached worker."""
+        """If a build for this container is queued in SQLite and no build worker is currently running, spawn a detached worker."""
         if self._active_build_proc is not None and self._active_build_proc.poll() is None:
             return None
 
-        lock_path = self.db_path.parent / ".forge_build_worker.lock"
+        in_ivy = is_ivy_container()
+        lock_name = ".forge_build_worker_ivy.lock" if in_ivy else ".forge_build_worker.lock"
+        lock_path = self.db_path.parent / lock_name
         try:
             with open(lock_path, "a+", encoding="utf-8") as lf:
                 try:
@@ -1289,9 +1318,16 @@ class ForgeSupervisor:
             pass
 
         with get_db_connection(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') ORDER BY created_at ASC LIMIT 1"
-            ).fetchone()
+            if in_ivy:
+                row = conn.execute(
+                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND origin_channel_id = ? ORDER BY created_at ASC LIMIT 1",
+                    (BASEBALL_CHANNEL_ID,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND origin_channel_id != ? ORDER BY created_at ASC LIMIT 1",
+                    (BASEBALL_CHANNEL_ID,),
+                ).fetchone()
             if not row:
                 return None
             build_id = row["id"]
@@ -1311,7 +1347,9 @@ class ForgeSupervisor:
 
     def run_build_pipeline(self, build_id: str) -> bool:
         """Execute all pending chunks for `build_id` sequentially under an exclusive file lock."""
-        lock_path = self.db_path.parent / ".forge_build_worker.lock"
+        in_ivy = is_ivy_container()
+        lock_name = ".forge_build_worker_ivy.lock" if in_ivy else ".forge_build_worker.lock"
+        lock_path = self.db_path.parent / lock_name
         lock_fh = open(lock_path, "a+", encoding="utf-8")
         try:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

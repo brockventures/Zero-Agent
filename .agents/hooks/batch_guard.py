@@ -25,12 +25,22 @@ MAX_CONSECUTIVE_FILE_VIEWS = 6
 MAX_CONSECUTIVE_SAME_FILE_EDITS = 3
 MAX_CONSECUTIVE_GIT_CMDS = 2
 MAX_VERSIONED_SCRATCH_SWEEPS = 3
+MAX_SAME_SCRATCH_SCRIPT_RUNS = 3
 MAX_INLINE_PRODUCTION_FILES = 2
 TURN_RESET_IDLE_SECONDS = 45.0
+TURN_STATE_EXPIRY_SECONDS = 900.0
 
 _VERSIONED_SCRATCH_SWEEP_RE = re.compile(
     r"(?:^|/)(?:scratch|brain/[^/]+/scratch)/(?P<stem>[a-zA-Z0-9_-]*?(?:sim|sweep|grid|solve|tune|calib)[a-zA-Z0-9_-]*?)_v\d+\.py$",
     re.IGNORECASE,
+)
+
+_SCRATCH_SCRIPT_EXEC_RE = re.compile(
+    r"\bpython[0-9.]*\s+(?P<script>[^\s;\"'|&>]*?(?:/scratch/|^scratch/)[^\s;\"'|&>]+?\.py)\b"
+)
+
+_HEAVY_CLI_BENCHMARK_OR_MIGRATE_RE = re.compile(
+    r"(?:run_unified_benchmark_gate\.py|--migrate-db\b|fast_migrate_[a-zA-Z0-9_-]*\.py\b|backfill_[a-zA-Z0-9_-]*?splits[a-zA-Z0-9_-]*\.py\b)"
 )
 
 
@@ -48,6 +58,7 @@ def _default_state(now: float = 0.0) -> dict:
         "agora_eval_calls": 0,
         "versioned_scratch_sweeps": [],
         "inline_prod_files": [],
+        "scratch_script_runs": {},
     }
 
 
@@ -265,13 +276,38 @@ def _check_inline_production_edit_gate(
     return True, ""
 
 
+def is_heavy_inline_benchmark_or_migration(cmd: str, cwd: str = "/workspace") -> bool:
+    """Detect heavy multi-minute benchmark or database migration commands run inline outside FORGE."""
+    if not cmd:
+        return False
+    if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
+        return False
+    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    if norm_cwd.startswith("/tmp/forge-wt-"):
+        return False
+    if "forge.py" in cmd or "detached_runner.py" in cmd or "modal_harness.py" in cmd:
+        return False
+    return bool(_HEAVY_CLI_BENCHMARK_OR_MIGRATE_RE.search(cmd))
+
+
 def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str = "/workspace") -> tuple[bool, str]:
     now = time.time()
     state = load_state(state_file)
+    idle_delta = now - state.get("last_time", 0.0)
 
-    # Reset short-window state on idle turn boundary
-    if now - state.get("last_time", 0.0) > TURN_RESET_IDLE_SECONDS:
+    # Full turn state expiry after extended inactivity (15m); short idle gaps (45s)
+    # reset only short-window consecutive anti-polling counters while preserving turn-level
+    # FORGE gates (inline_prod_files, versioned_scratch_sweeps, scratch_script_runs).
+    if idle_delta > TURN_STATE_EXPIRY_SECONDS:
         state = _default_state(now)
+    elif idle_delta > TURN_RESET_IDLE_SECONDS:
+        preserved_prod = list(state.get("inline_prod_files", []))
+        preserved_sweeps = list(state.get("versioned_scratch_sweeps", []))
+        preserved_runs = dict(state.get("scratch_script_runs", {}))
+        state = _default_state(now)
+        state["inline_prod_files"] = preserved_prod
+        state["versioned_scratch_sweeps"] = preserved_sweeps
+        state["scratch_script_runs"] = preserved_runs
     state["last_time"] = now
 
     # 0. Runtime schedule tool is prohibited in Discord bridge turns
@@ -284,8 +320,41 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
     # 1. run_command check
     if name == "run_command":
         cmd = args.get("CommandLine", "")
-        if "forge.py" in cmd and "enqueue" in cmd:
+        if "forge.py" in cmd and ("enqueue" in cmd or "job" in cmd):
             state["inline_prod_files"] = []
+            state["scratch_script_runs"] = {}
+        elif "detached_runner.py" in cmd and "start" in cmd:
+            state["scratch_script_runs"] = {}
+
+        # A00. Heavy Inline Benchmark / Migration Gate (Require FORGE job start or enqueue)
+        if is_heavy_inline_benchmark_or_migration(cmd, cwd=cwd):
+            return False, (
+                f"FORGE Background Offload Gate Triggered: Heavy benchmark or database migration command ('{cmd[:90]}') "
+                "cannot be executed inline via bare 'run_command' (which blocks the interactive turn for 10–30 minutes). "
+                "Launch it as a tracked FORGE background job via:\n"
+                "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"<cmd>\"\n"
+                "(or enqueue a multi-chunk ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
+            )
+
+        # A00b. Repeated Same-Scratch-Script Loop Gate (Prevent iterative scratch/*.py overwrite-and-rerun loops)
+        if os.environ.get("FORGE_WORKER_ACTIVE") != "1" and not os.path.abspath(cwd or "/workspace").replace("\\", "/").startswith("/tmp/forge-wt-"):
+            if "forge.py" not in cmd and "detached_runner.py" not in cmd:
+                scratch_m = _SCRATCH_SCRIPT_EXEC_RE.search(cmd)
+                if scratch_m:
+                    raw_script = scratch_m.group("script")
+                    norm_script = os.path.abspath(os.path.join(cwd or "/workspace", raw_script)).replace("\\", "/")
+                    runs_map = dict(state.get("scratch_script_runs", {}))
+                    run_cnt = int(runs_map.get(norm_script, 0)) + 1
+                    runs_map[norm_script] = run_cnt
+                    state["scratch_script_runs"] = runs_map
+                    if run_cnt > MAX_SAME_SCRATCH_SCRIPT_RUNS:
+                        save_state(state, state_file)
+                        return False, (
+                            f"FORGE Scratch Loop Gate Triggered: Executed '{os.path.basename(norm_script)}' {run_cnt} times in this turn "
+                            f"(inline limit: {MAX_SAME_SCRATCH_SCRIPT_RUNS}). Do not run iterative edit-and-rerun loops on the same scratch script "
+                            "inline in chat. Consolidate parameter sweeps into a single vectorized pass, offload to Modal, or launch long jobs via:\n"
+                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\""
+                        )
 
         # Agora Fast-Path Invariant
         if re.search(r"agora_play\.py\s+(?:order|move)\b", cmd):

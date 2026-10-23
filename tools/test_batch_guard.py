@@ -279,6 +279,70 @@ class TestBatchGuard(unittest.TestCase):
         )
         self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/delta.py"})[0])
 
+    def test_45s_idle_reset_preserves_inline_prod_files_until_15m_expiry(self):
+        from unittest.mock import patch
+        base_now = 1_800_000_000.0
+        with patch("time.time", return_value=base_now):
+            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/alpha.py"})[0])
+            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/beta.py"})[0])
+            # Consecutive shell inspection counter reaches 3
+            self.assertTrue(check_batching("docker ps")[0])
+            self.assertTrue(check_batching("ls -la /workspace")[0])
+            self.assertTrue(check_batching("uptime")[0])
+
+        # 60 seconds later (>45s TURN_RESET_IDLE_SECONDS, <900s TURN_STATE_EXPIRY_SECONDS):
+        # Short-window inspection counter resets, but inline_prod_files is preserved!
+        with patch("time.time", return_value=base_now + 60.0):
+            self.assertTrue(check_batching("docker ps")[0])
+            allowed, reason = check_tool_use("edit_file", {"Path": "/workspace/tools/gamma.py"})
+            self.assertFalse(allowed)
+            self.assertIn("FORGE Tier 2/3 Gate Triggered", reason)
+
+        # 1000 seconds later (>900s TURN_STATE_EXPIRY_SECONDS): full turn state expires cleanly
+        with patch("time.time", return_value=base_now + 1000.0):
+            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/gamma.py"})[0])
+
+    def test_repeated_same_scratch_script_loop_blocked_after_three_runs(self):
+        for i in range(3):
+            allowed, _ = check_batching("python3 /workspace/scratch/tune_k.py")
+            self.assertTrue(allowed, f"Run {i+1} should be allowed")
+        allowed, reason = check_batching("python3 /workspace/scratch/tune_k.py")
+        self.assertFalse(allowed)
+        self.assertIn("FORGE Scratch Loop Gate Triggered", reason)
+        self.assertIn("forge.py job start", reason)
+
+        # Launching via forge.py job start is allowed and resets scratch_script_runs
+        allowed, _ = check_batching(
+            'python3 /workspace/tools/forge.py job start --name "Tune K" --command "python3 /workspace/scratch/tune_k.py"'
+        )
+        self.assertTrue(allowed)
+        self.assertTrue(check_batching("python3 /workspace/scratch/tune_k.py")[0])
+
+    def test_heavy_inline_benchmark_and_migration_blocked_outside_forge(self):
+        for heavy_cmd in [
+            "python3 /baseball/big-projections/run_unified_benchmark_gate.py",
+            "python3 /baseball/big-projections/predict_big.py --migrate-db",
+            "python3 /baseball/big-projections/fast_migrate_v2.py",
+            "python3 /baseball/big-projections/backfill_milb_splits.py",
+        ]:
+            allowed, reason = check_batching(heavy_cmd)
+            self.assertFalse(allowed, f"Expected {heavy_cmd} to be blocked inline")
+            self.assertIn("FORGE Background Offload Gate Triggered", reason)
+
+        # Allowed when wrapped in forge.py job start or inside a FORGE worktree
+        self.assertTrue(
+            check_batching(
+                'python3 /workspace/tools/forge.py job start --name "Benchmark" --command "python3 /baseball/big-projections/run_unified_benchmark_gate.py"'
+            )[0]
+        )
+        self.assertTrue(
+            check_tool_use(
+                "run_command",
+                {"CommandLine": "python3 /baseball/big-projections/run_unified_benchmark_gate.py"},
+                cwd="/tmp/forge-wt-fg-999-c0",
+            )[0]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

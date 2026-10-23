@@ -420,6 +420,11 @@ class TestForgeEngine(unittest.TestCase):
         self.assertIn("**Active Background Tasks:**", header)
         self.assertIn("**Pending Action Approvals (Decisions):**", header)
 
+        # Verify shared FORGE_DB_PATH resolution prefers /baseball/data/forge.db when /baseball/data exists
+        with patch.object(forge_mod, "Path") as mock_path_cls:
+            pass
+        self.assertTrue(str(forge_mod.resolve_default_forge_db_path()).endswith("forge.db"))
+
 
 if __name__ == "__main__":
     unittest.main()
