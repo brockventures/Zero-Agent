@@ -53,11 +53,74 @@ PID_FILE = DATA_DIR / "watcher.pid"
 STATUS_FILE = DATA_DIR / "watcher_status.json"
 LOG_FILE = DATA_DIR / "watcher.log"
 LATEST_SNAPSHOT = DATA_DIR / "watcher_snapshot.jpg"
+BED_MESH_STATE_FILE = DATA_DIR / "bed_mesh_state.json"
+BED_MESH_TTL_SECONDS = 7 * 86400  # 7-day weekly probing policy
 
 TOOLS_DIR = Path("/workspace/tools")
 WEBCAM_SCRIPT = TOOLS_DIR / "webcam_control.py"
 DELIVER_IMAGE_SCRIPT = TOOLS_DIR / "deliver_image.py"
 SPEECH_SCRIPT = TOOLS_DIR / "phone_speech.py"
+
+
+def is_bed_probe_due(
+    force_probe: bool = False,
+    now_epoch: Optional[float] = None,
+    state_file: Path = BED_MESH_STATE_FILE,
+    ttl_seconds: int = BED_MESH_TTL_SECONDS,
+) -> bool:
+    """Return True if a full G29 bed mesh probe is due (7-day TTL expired, missing state, or force_probe=True)."""
+    if force_probe or not state_file.exists():
+        return True
+    now_ts = time.time() if now_epoch is None else float(now_epoch)
+    try:
+        data = json.loads(state_file.read_text())
+        last_probed = float(data.get("last_probed_epoch", 0.0))
+        ttl = int(data.get("ttl_seconds", ttl_seconds))
+        return (now_ts - last_probed) >= ttl
+    except Exception:
+        return True
+
+
+def record_bed_probe(
+    now_epoch: Optional[float] = None,
+    state_file: Path = BED_MESH_STATE_FILE,
+    ttl_seconds: int = BED_MESH_TTL_SECONDS,
+) -> Dict[str, Any]:
+    """Record a completed G29 + M421 + M500 EEPROM bed probe in bed_mesh_state.json."""
+    now_ts = int(time.time() if now_epoch is None else now_epoch)
+    next_ts = now_ts + int(ttl_seconds)
+    now_pt = datetime.fromtimestamp(now_ts, tz=PT_TZ).isoformat(timespec="seconds")
+    next_pt = datetime.fromtimestamp(next_ts, tz=PT_TZ).isoformat(timespec="seconds")
+    payload = {
+        "policy": "weekly",
+        "ttl_days": int(ttl_seconds // 86400),
+        "ttl_seconds": int(ttl_seconds),
+        "last_probed_epoch": now_ts,
+        "last_probed_pt": now_pt,
+        "next_probe_due_epoch": next_ts,
+        "next_probe_due_pt": next_pt,
+        "active_profile": str(DATA_DIR / "my_machine.json"),
+        "probe_profile": str(DATA_DIR / "my_machine_probe.json"),
+    }
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(payload, indent=2) + "\n")
+    return payload
+
+
+def select_machine_profile(
+    force_probe: bool = False,
+    container_mount: str = "/prints",
+    now_epoch: Optional[float] = None,
+    state_file: Path = BED_MESH_STATE_FILE,
+) -> str:
+    """
+    Return the OrcaSlicer machine profile path ('/prints/my_machine.json' for fast EEPROM M420 S1
+    recall, or '/prints/my_machine_probe.json' if the 7-day weekly G29 probe is due).
+    """
+    if is_bed_probe_due(force_probe=force_probe, now_epoch=now_epoch, state_file=state_file):
+        record_bed_probe(now_epoch=now_epoch, state_file=state_file)
+        return f"{container_mount.rstrip('/')}/my_machine_probe.json"
+    return f"{container_mount.rstrip('/')}/my_machine.json"
 
 
 def get_job_timelapse_dir(filename: str) -> Path:

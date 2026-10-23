@@ -405,6 +405,28 @@ class TestZeroPrinterWatcher(unittest.TestCase):
         mock_eval.assert_not_called()
         mock_archive.assert_called_once_with(unittest.mock.ANY, "mid_job.gcode", reset_if_new=False)
 
+    def test_weekly_bed_mesh_policy_profile_selection(self):
+        import tools.zero_printer_watcher as zpw
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "bed_mesh_state.json"
+            # 1. Missing state file -> probe is due, selects my_machine_probe.json and writes state
+            p1 = zpw.select_machine_profile(now_epoch=1792764600, state_file=state_path)
+            self.assertEqual(p1, "/prints/my_machine_probe.json")
+            self.assertTrue(state_path.exists())
+
+            # 2. Within 7 days (e.g. +2 days) -> probe NOT due, selects fast my_machine.json
+            p2 = zpw.select_machine_profile(now_epoch=1792764600 + 2 * 86400, state_file=state_path)
+            self.assertEqual(p2, "/prints/my_machine.json")
+
+            # 3. After 7 days (+7 days) -> probe IS due, selects my_machine_probe.json
+            p3 = zpw.select_machine_profile(now_epoch=1792764600 + 7 * 86400, state_file=state_path)
+            self.assertEqual(p3, "/prints/my_machine_probe.json")
+
+            # 4. Explicit force_probe=True within 7-day window -> selects my_machine_probe.json
+            p4 = zpw.select_machine_profile(force_probe=True, now_epoch=1792764600 + 8 * 86400, state_file=state_path)
+            self.assertEqual(p4, "/prints/my_machine_probe.json")
+
 
 if __name__ == "__main__":
     unittest.main()

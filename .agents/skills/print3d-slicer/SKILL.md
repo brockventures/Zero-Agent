@@ -111,7 +111,13 @@ When scaling down full-size models (e.g. 50% scale from 120.0mm down to 60.0mm h
 
 OrcaSlicer runs headlessly inside Docker on Host 2 (`<HOST_2_IP>`):
 
-### 1. Slicing Command Pattern:
+### 1. Slicing Command Pattern & Weekly (7-Day) Bed Mesh Probing Policy:
+- **Default Fast Start (`my_machine.json` — `G28` + `M420 S1` EEPROM Recall):**
+  - Standard prints load `/prints/my_machine.json`, which homes via CR-Touch at the center of the heated 60°C bed (`G28`) and immediately restores the saved twist-compensated mesh from EEPROM (`M420 S1` in 0.1s), skipping the 2-minute 16-point `G29` probe.
+- **Weekly Full Calibration (`my_machine_probe.json` — 7-Day TTL in `bed_mesh_state.json`):**
+  - Full 16-point bilinear probing (`G29 L25 R170 F25 B190 T V4` + `M421` X-axis twist compensation + `M500` EEPROM save) is required only **once every 7 days** (or when `--force-probe` is requested after removing/cleaning the PEI spring-steel plate).
+  - Check `/workspace/data/3dprint/bed_mesh_state.json` (`python3 /workspace/tools/zero_printer_watcher.py --check-mesh` or `select_machine_profile()`): if `now >= next_probe_due_epoch`, slice with `/prints/my_machine_probe.json` and update `bed_mesh_state.json`; otherwise slice with `/prints/my_machine.json`.
+
 ```bash
 nice -n 19 sudo docker exec orcaslicer /opt/orcaslicer/bin/orca-slicer \
   --load-settings "/prints/my_machine.json;/prints/zero_figurine_process.json" \
