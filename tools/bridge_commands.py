@@ -185,11 +185,12 @@ async def execute_bridge_reload(
     channel: Optional[discord.abc.Messageable] = None,
     initiator: str = "user",
     force: bool = True,
-    reason: str = "Manual in-place bridge reload requested"
+    reason: str = "Manual in-place bridge reload requested",
+    announce: bool = True,
 ):
     """Execute clean in-place bridge reload without deadlock."""
     record_restart_intent(reason, initiator=initiator)
-    if channel:
+    if channel and announce:
         try:
             await channel.send("🔄 Reloading Zero bridge in-place...")
         except Exception:
@@ -201,10 +202,20 @@ async def execute_bridge_reload(
         sync_res = sync_git_on_reload(reason=reason, initiator=initiator)
         if sync_res.get("synced"):
             print(f"[Bridge] 🚀 Pre-reload git sync: {sync_res.get('message')}")
+            if channel:
+                try:
+                    await channel.send(f"📦 **Git Sync:** {sync_res.get('message')}")
+                except Exception:
+                    pass
         elif sync_res.get("clean"):
             print(f"[Bridge] 🟢 Pre-reload git sync: {sync_res.get('message')}")
         elif sync_res.get("error"):
             print(f"[Bridge] ⚠️ Pre-reload git sync notice: {sync_res.get('message')}")
+            if channel:
+                try:
+                    await channel.send(f"⚠️ **Git Sync Notice:** {sync_res.get('message')}")
+                except Exception:
+                    pass
     except Exception as gse:
         print(f"[Bridge] Warning during pre-reload git sync: {gse}")
 

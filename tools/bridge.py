@@ -153,6 +153,7 @@ async def _execute_reload(*args, **kwargs):
     initiator = kwargs.pop("initiator", "user")
     force = kwargs.pop("force", True)
     reason = kwargs.pop("reason", "Manual in-place bridge reload requested")
+    announce = kwargs.pop("announce", True)
 
     if args:
         # If first arg is a discord Client/Bot instance, target channel is second arg
@@ -164,7 +165,14 @@ async def _execute_reload(*args, **kwargs):
             if len(args) > 1 and "initiator" not in kwargs:
                 initiator = args[1]
 
-    await execute_bridge_reload(bot, channel=target_channel, initiator=str(initiator), force=force, reason=str(reason))
+    await execute_bridge_reload(
+        bot,
+        channel=target_channel,
+        initiator=str(initiator),
+        force=force,
+        reason=str(reason),
+        announce=announce,
+    )
 
 
 async def _apply_presence(custom_activity: str = None, status_override: str = None):
@@ -491,7 +499,7 @@ async def slash_reload(interaction: discord.Interaction, mode: str = "in-place")
         return
 
     await interaction.followup.send("🔄 Reloading Zero bridge in-place...")
-    await _execute_reload(channel=interaction.channel, initiator=initiator_name, force=True, reason="Slash command /reload in-place")
+    await _execute_reload(channel=interaction.channel, initiator=initiator_name, force=True, reason="Slash command /reload in-place", announce=False)
 
 
 @slash_reload.autocomplete("mode")
