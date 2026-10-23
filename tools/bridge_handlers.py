@@ -780,23 +780,6 @@ async def handle_on_ready(
             f"• Restart Reason: {restart_reason} {'(Planned Feature Deploy/Update)' if is_intentional else '(System/Container Boot)'}\n"
         )
 
-        # Include active git commit status
-        try:
-            from tools.bridge_git_sync import LAST_SYNC_FILE, get_current_git_sha
-            sha = get_current_git_sha()
-            sync_detail = ""
-            if LAST_SYNC_FILE.exists():
-                try:
-                    with open(LAST_SYNC_FILE, "r") as sf:
-                        sd = json.load(sf)
-                        if sd.get("sha") == sha:
-                            sync_detail = f" (auto-synced {sd.get('files_count', 0)} files before reload)"
-                except Exception:
-                    pass
-            startup_prompt += f"• Active Git Commit: `{sha}`{sync_detail}\n"
-        except Exception:
-            pass
-
         if interrupted_prompt:
             if interrupted_attempts >= 2:
                 startup_prompt += f"• Interrupted Task Prior to Reboot: \"{interrupted_prompt[:150]}\" (cleared after {interrupted_attempts} attempts to prevent hang loop)\n"
