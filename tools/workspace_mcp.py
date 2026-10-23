@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Google Workspace (Gmail & Calendar) MCP Server for Ivy-AG.
+"""Google Workspace (Gmail & Calendar) MCP Server for Zero.
 
 Authenticates via /secrets/google_oauth.json using stored OAuth refresh token.
 Token refreshes are cached in-memory and renewed automatically.

@@ -50,7 +50,7 @@ python3 /workspace/tools/send_mail.py \
   --subject "Re: Zero Skill Reference" \
   --thread-id "1a05f4b2bc4b4934" \
   --attach "/workspace/.agents/skills/shopping-advisor/SKILL.md" \
-  --attach "/workspace/.agents/skills/shopping-advisor/scripts/pdp_resolver.py" \
+  --attach "/workspace/.agents/skills/shopping-advisor/scripts/verify_links.py" \
   --body "Attached are the updated specs..."
 
 # Stage as draft with attachments for human review

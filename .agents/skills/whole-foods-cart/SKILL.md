@@ -20,16 +20,16 @@ This skill compiles grocery manifests into official **Amazon Fresh Experience (A
 3. **Produce Quality Partitioning (Thin-Skin Organic Rule):** Mandate `"organic"` for thin/edible skins or large surface area items (berries, strawberries, greens, spinach, kale, grapes, apples, peaches, cherries, bell peppers). Allow conventional or organic for thick-skinned produce (avocados, bananas, onions, melons, sweet potatoes).
 4. **Meat & Dairy Standards:** Default to 100% Grass-Fed for beef and red meat; standard large brown grade a eggs; 100% organic whole dairy milk.
 5. **Pantry Exclusion & Mandatory "Assumed in Stock" Visibility:** Baseline pantry spices and oils (salt, black pepper, cooking oil, basic flour) are excluded from the cart staging, but MUST ALWAYS be explicitly surfaced in a dedicated **"Assumed in Stock"** section. Never silently drop an ingredient without giving Ryan the visibility to catch if they've run out.
-6. **Discord Hyperlink Discipline:** Always output final links as `🛒 [**Label**](<url>)` with the emoji outside brackets and angle brackets `< >` around the URL to suppress embed bloat and prevent underscore-induced italic errors.
+6. **Discord Hyperlink Discipline:** Always output final links as `🛒 [Label](<url>)` with the emoji outside brackets, plain-text link labels (never bold inside brackets), and angle brackets `< >` around the URL to suppress embed bloat and prevent underscore-induced italic errors.
 7. **High-Signal Exception Formatting:** Do not dump exhaustive 30–45 line item manifests into Discord. The 1-click Whole Foods Cart link already holds all staged items. Discord messages must strictly be high-signal and executive: (1) Cart summary with dinner coverage, (2) Planned meals breakdown with direct Mealie recipe links and nested cart items, (3) 1-Click Cart Link, (4) Quantity & Packaging Checks (multi-count items where Amazon defaults to 1, fractional retail package surpluses), (5) Separate Trip / Costco Due items, and (6) Compact Assumed-in-Stock pantry list.
-8. **Per-Meal Grocery Breakdown & Mealie Recipe Links:** Whenever posting the weekly grocery cart to `#shopping`, enumerate each planned dinner with a direct link to its Mealie recipe card (`[**Recipe Name**](<https://mealie.brock.ventures/recipe/<slug>>)`), accompanied by a nested bulleted list of the exact cart items corresponding to that meal.
+8. **Per-Meal Grocery Breakdown & Mealie Recipe Links:** Whenever posting the weekly grocery cart to `#shopping`, enumerate each planned dinner with a direct link to its Mealie recipe card (`[Recipe Name](<https://mealie.brock.ventures/recipe/<slug>>)`), accompanied by a nested bulleted list of the exact cart items corresponding to that meal.
 
 ---
 
 ## 🔄 The 3 Ingestion Flows
 
 ### Flow 1: Recipe Ingestion (Mealie / Text / URL)
-- Parse 1 to 5 recipes from Mealie (`http://nas2.local:9090`), pasted recipe text, or recipe URLs.
+- Parse 1 to 5 recipes from Mealie (`http://<HOST_2_IP>:9090` or `https://mealie.brock.ventures`), pasted recipe text, or recipe URLs.
 - Extract ingredients, amounts, and units.
 - Strip items present in `data/pantry_staples.json` and catalog them into the **"Assumed in Stock"** block.
 - Aggregate duplicate items across recipes (e.g., Recipe A 1 can black beans + Recipe B 2 cans -> 3 cans).

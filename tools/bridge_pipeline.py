@@ -8,12 +8,10 @@ import asyncio
 import json
 import os
 import re
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 import discord
 
 from tools.bridge_state import (
@@ -23,8 +21,6 @@ from tools.bridge_state import (
     PT_TZ,
     get_runtime_rules,
     get_channel_session_id,
-    set_channel_session_id,
-    clear_channel_session_id,
     sync_credentials,
     get_gif_prompt_guidance,
     has_reaction_gif,
@@ -36,12 +32,10 @@ from tools.bridge_state import (
 )
 from tools.bridge_formatting import (
     format_for_discord,
-    clean_discord_latex,
     scrub_credentials,
     chunk_text,
     strip_reaction_gifs,
     is_internal_cli_leak,
-    strip_internal_cli_chatter,
 )
 
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
@@ -765,7 +759,7 @@ async def deliver_turn_output(
             if timer:
                 timer.mark_delivery_end()
                 timer.finish("NO_REPLY")
-            return
+            return []
 
         try:
             from tools.channel_history import record_message
@@ -880,7 +874,7 @@ async def deliver_turn_output(
             if timer:
                 timer.mark_delivery_end()
                 timer.finish("NO_REPLY")
-            return
+            return []
 
         target_dest = delivery_target if delivery_target else reply_target
         dest_cid = None

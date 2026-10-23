@@ -125,6 +125,17 @@ async def warm_channel_history(
                 reply_to_author=reply_author,
                 reply_to_snippet=reply_snip,
             )
+            if getattr(m, "reactions", None):
+                from tools.channel_history import record_reaction
+                for r in m.reactions:
+                    if getattr(r, "count", 0) > 0:
+                        record_reaction(
+                            channel_id=channel.id,
+                            msg_id=m.id,
+                            emoji=str(r.emoji),
+                            user_name=f"x{r.count}",
+                            added=True,
+                        )
         print(f"[Bridge] Warmed channel history for #{getattr(channel, 'name', channel.id)}: {len(msgs)} messages loaded.")
 
         # Backlog Recovery Guard: Check for unhandled user messages in home channels sent during reconnect or downtime

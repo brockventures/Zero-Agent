@@ -185,11 +185,10 @@ class TestHardcodedRuleFixes(unittest.TestCase):
             {"speaker": "Ryan", "content": "Let's fix the classifier prefilter bug."},
             {"speaker": "Zero", "content": "Fixed and verified classifier prefilter bypass."}
         ]
-        ms, dr, ed = synthesize_session_milestones(dialogue, "test_session")
+        with patch("subprocess.Popen", side_effect=OSError("offline fallback")):
+            ms, dr, ed = synthesize_session_milestones(dialogue, "test_session")
         self.assertIn("classifier prefilter", ms.lower())
         self.assertNotIn("Google Takeout & Profile: Deep synthesis completed", ms)
-
-
 
     def test_session_summarizer_non_ryan_directive_fallback(self):
         """Verify session summarizer extracts directives from non-Ryan speakers in fallback."""
@@ -198,7 +197,8 @@ class TestHardcodedRuleFixes(unittest.TestCase):
             {"speaker": "Alex", "content": "Can we benchmark the new SQLite query performance?"},
             {"speaker": "Zero", "content": "Benchmarked at 0.42ms average latency."}
         ]
-        ms, dr, ed = synthesize_session_milestones(dialogue, "crab_cavern_test")
+        with patch("subprocess.Popen", side_effect=OSError("offline fallback")):
+            ms, dr, ed = synthesize_session_milestones(dialogue, "crab_cavern_test")
         self.assertIn("benchmark", dr.lower())
 
 if __name__ == "__main__":

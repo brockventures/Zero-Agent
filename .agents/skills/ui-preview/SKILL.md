@@ -58,7 +58,7 @@ python3 /workspace/tools/capture_screenshot.py "http://localhost:3000" \
 ```bash
 python3 /workspace/tools/capture_screenshot.py "http://localhost:8008" \
   --full-page \
-  --name "serverbrock_homepage_full"
+  --name "nashost01_homepage_full"
 ```
 
 ### 4. Programmatic Python Execution

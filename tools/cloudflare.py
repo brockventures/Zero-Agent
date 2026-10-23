@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cloudflare DNS management for Ivy-AG.
+"""Cloudflare DNS management for Zero.
 
 List/read/create/update/delete DNS records across Ryan's zones:
 - brock.ventures

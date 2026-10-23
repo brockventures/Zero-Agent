@@ -140,7 +140,7 @@ noise_re = re.compile(
     r'browserless\.io:error No route or file found for resource GET: /|'
     r'browserless\.io.*Current period usage|'
     r'Failed to reply to query.*OS Error 0x02000001: Operation not permitted|'
-    r'192\.168\.1\.164:3333.*connection refused|'
+    r'(?:\d{1,3}\.){3}\d{1,3}:3333.*connection refused|'
     r'twcc_sender_interceptor.*read\/write on closed pipe|'
     r'\[Summarizer\] LLM synthesis fallback|'
     r'canceled by remote with error code 0|'
@@ -343,7 +343,9 @@ def fetch_cisa_kev_catalog(max_age_sec: int = 86400) -> list[dict]:
             data = json.loads(raw)
             if isinstance(data, dict) and "vulnerabilities" in data:
                 try:
-                    KEV_CACHE_FILE.write_text(raw)
+                    tmp_kev = KEV_CACHE_FILE.with_suffix(".tmp")
+                    tmp_kev.write_text(raw, encoding="utf-8")
+                    tmp_kev.replace(KEV_CACHE_FILE)
                 except Exception:
                     pass
                 return data["vulnerabilities"]

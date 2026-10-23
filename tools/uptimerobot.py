@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UptimeRobot monitor status for Ivy-AG.
+"""UptimeRobot monitor status for Zero.
 
 Read-only queries against UptimeRobot's API v2, using UPTIMEROBOT_API_KEY
 from environment or /secrets/env.json.

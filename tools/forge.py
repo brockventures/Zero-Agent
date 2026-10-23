@@ -1529,8 +1529,14 @@ class ForgeSupervisor:
 
                 # If final chunk completed and not touching core bridge, sync staging branch into local default branch
                 if remaining == 0 and not build["touches_core_bridge"]:
-                    subprocess.run(["git", "merge", "--ff-only", base_ref], cwd=str(repo_dir), capture_output=True, timeout=15)
-                    subprocess.run(["git", "push", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=30)
+                    try:
+                        subprocess.run(["git", "merge", "--ff-only", base_ref], cwd=str(repo_dir), capture_output=True, timeout=20)
+                    except Exception as e:
+                        print(f"[FORGE] Warning: git merge --ff-only {base_ref} failed/timed out: {e}", file=sys.stderr)
+                    try:
+                        subprocess.run(["git", "push", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=60)
+                    except Exception as e:
+                        print(f"[FORGE] Warning: git push origin {default_branch} failed/timed out: {e}", file=sys.stderr)
 
                 post_or_update_build_widget(build_id, db_path=self.db_path)
                 sync_forge_channel_header(db_path=self.db_path)

@@ -475,7 +475,8 @@ def format_draft_card(candidate: Dict[str, Any], draft: str) -> str:
         f"{bb_block}"
         f"- **Proposed Draft (Ivy Brain · Gemini 4 Argon Low · 2-Sentence Cap):**\n"
         f"\"{draft}\"\n\n"
-        f"- **Action:** Tap the thread link above to post manually, or reply to approve dispatch once mobile session is authenticated."
+        f"- **Action:** Approve below to post via `u/prime416`, edit the draft, or skip.\n\n"
+        f"[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]"
     )
 
 
@@ -539,8 +540,8 @@ def run_reddit_fantasy_scanner(
     if post_discord:
         dest_cid = channel_id or ZERO_CHAT_CHANNEL_ID
         try:
-            from tools.outbox import send_message
-            send_message(dest_cid, card)
+            from tools.outbox import queue_outbox_message
+            queue_outbox_message(str(dest_cid), card, source_turn="reddit_fantasy_scanner")
             log.info("Dispatched draft card to Discord channel %s", dest_cid)
         except Exception as e:
             log.warning("Could not dispatch to Discord: %s", e)

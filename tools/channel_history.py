@@ -113,16 +113,74 @@ def record_message(
         "reply_to_author": reply_to_author,
         "reply_to_snippet": reply_to_snippet,
         "timestamp": timestamp,
+        "reactions": {},
     }
 
     _history_store[ch_key].append(entry)
     save_history()
     return entry
 
+
+def record_reaction(
+    channel_id: int | str,
+    msg_id: int,
+    emoji: str,
+    user_name: str,
+    added: bool = True,
+) -> bool:
+    """Attach or remove an emoji reaction on an existing buffered message in channel history."""
+    if not emoji or not user_name or msg_id is None:
+        return False
+    ch_key = str(channel_id)
+    if ch_key not in _history_store and not _history_store:
+        load_history()
+
+    queues_to_scan = []
+    if ch_key in _history_store:
+        queues_to_scan.append(_history_store[ch_key])
+    for k, q in _history_store.items():
+        if k != ch_key:
+            queues_to_scan.append(q)
+
+    for q in queues_to_scan:
+        for m in reversed(q):
+            if m.get("id") == msg_id:
+                reacts = m.setdefault("reactions", {})
+                if not isinstance(reacts, dict):
+                    reacts = {}
+                    m["reactions"] = reacts
+                users = reacts.setdefault(emoji, [])
+                if not isinstance(users, list):
+                    users = []
+                    reacts[emoji] = users
+                if added:
+                    # If warming from history with 'xN' count, only set if no named users exist yet
+                    if user_name.startswith("x") and user_name[1:].isdigit():
+                        if not users:
+                            users.append(user_name)
+                            save_history()
+                            return True
+                        return False
+                    # Remove placeholder 'xN' count once named user reaction events arrive
+                    users[:] = [u for u in users if not (isinstance(u, str) and u.startswith("x") and u[1:].isdigit())]
+                    if user_name not in users:
+                        users.append(user_name)
+                        save_history()
+                        return True
+                else:
+                    if user_name in users:
+                        users.remove(user_name)
+                        if not users:
+                            reacts.pop(emoji, None)
+                        save_history()
+                        return True
+                return False
+    return False
+
 def get_recent_messages(channel_id: int | str, limit: int = 15, exclude_msg_id: int | None = None) -> list[dict]:
     """Retrieve recent messages for a channel up to limit, oldest to newest."""
     ch_key = str(channel_id)
-    if ch_key not in _history_store:
+    if ch_key not in _history_store and not _history_store:
         load_history()
 
     msgs = list(_history_store.get(ch_key, []))
@@ -182,7 +240,19 @@ def _format_message_line(m: dict, context_msgs: list[dict] | None = None) -> str
         else:
             reply_annot = " (replying to previous message)"
 
-    return f"[{ts}] {author_label}{reply_annot}: {content}"
+    react_annot = ""
+    reacts = m.get("reactions")
+    if isinstance(reacts, dict) and reacts:
+        r_parts = []
+        for em, u_list in reacts.items():
+            if isinstance(u_list, list) and u_list:
+                r_parts.append(f"{em} ({', '.join(str(u) for u in u_list)})")
+            elif isinstance(u_list, int) and u_list > 0:
+                r_parts.append(f"{em} (x{u_list})")
+        if r_parts:
+            react_annot = f" [Reacts: {', '.join(r_parts)}]"
+
+    return f"[{ts}] {author_label}{reply_annot}: {content}{react_annot}"
 
 def format_channel_context(
     channel_id: int | str,

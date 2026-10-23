@@ -11,7 +11,9 @@ Audits Home Assistant config entries and persistent notifications:
 import argparse
 import json
 import os
+import socket
 import sys
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +22,9 @@ from zoneinfo import ZoneInfo
 PT = ZoneInfo("America/Los_Angeles")
 STATE_FILE = Path("/workspace/data/ha_reauth_state.json")
 HOME_ASSISTANT_CHANNEL_ID = 1544953275877556334
+ZHA_RELOAD_TIMEOUT_SECONDS = 35
+ZHA_RADIO_RESET_SETTLE_SECONDS = 6.0
+ZHA_SOCKET_RELEASE_SETTLE_SECONDS = 0.5
 
 # Devices that routinely enter setup_retry when powered off at the wall
 BENIGN_STANDBY_DOMAINS = {"octoprint", "android_ip_webcam", "androidtv_remote"}
@@ -72,6 +77,8 @@ def _auto_heal_matter_thread_nodes(states: list[dict] | None = None) -> list[str
     1-second multicast mDNS TXT update poke inside `matterserver` to re-trigger
     its subscription automatically.
     """
+    if states and not any(s.get("state") in ("unavailable", "unknown") for s in states if isinstance(s, dict)):
+        return []
     try:
         import base64
         from tools import nas_config
@@ -207,6 +214,84 @@ def _save_state(state: dict):
     tmp.replace(STATE_FILE)
 
 
+def _get_zha_coordinator_ip() -> str:
+    zha_ip = os.environ.get("ZHA_COORDINATOR_IP") or os.environ.get("HUE_BRIDGE_IP")
+    if not zha_ip and os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json") as ef:
+                ed = json.load(ef)
+                zha_ip = ed.get("ZHA_COORDINATOR_IP") or ed.get("HUE_BRIDGE_IP")
+        except Exception:
+            pass
+    return zha_ip or "127.0.0.1"
+
+
+def _auto_heal_zha_entry(base_url: str, token: str, entry_id: str) -> bool:
+    """Attempt to recover a wedged ZHA config entry safely.
+
+    1. Probes coordinator TCP port 6638 and closes the socket immediately so the
+       single-client serial-over-TCP bridge is never held open during reload.
+    2. Pulses `button.slzb_06p7_zigbee_restart` via SMLIGHT integration to hardware-reset
+       a wedged CC2652P7 UART chip before ZHA runs `_skip_bootloader()`.
+    3. Calls `/reload` with a 35s timeout (preventing premature HTTP client disconnect
+       that cancels `async_setup_entry` into permanent `setup_error`).
+    4. Verifies the config entry reached `state == "loaded"` before reporting success.
+    """
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    zha_ip = _get_zha_coordinator_ip()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(2.0)
+            if sock.connect_ex((zha_ip, 6638)) != 0:
+                return False
+        time.sleep(ZHA_SOCKET_RELEASE_SETTLE_SECONDS)
+
+        try:
+            btn_req = urllib.request.Request(
+                f"{base_url}/api/services/button/press",
+                data=json.dumps({"entity_id": "button.slzb_06p7_zigbee_restart"}).encode(),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(btn_req, timeout=10) as btn_resp:
+                if btn_resp.status == 200:
+                    print(
+                        "[HAReauthWatchdog] 🔄 Pulsed button.slzb_06p7_zigbee_restart prior to ZHA reload.",
+                        file=sys.stderr,
+                    )
+                    time.sleep(ZHA_RADIO_RESET_SETTLE_SECONDS)
+        except Exception as btn_ex:
+            print(f"[HAReauthWatchdog] Note: Zigbee chip restart button press skipped: {btn_ex}", file=sys.stderr)
+
+        reload_url = f"{base_url}/api/config/config_entries/entry/{entry_id}/reload"
+        rel_req = urllib.request.Request(
+            reload_url,
+            data=b"{}",
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(rel_req, timeout=ZHA_RELOAD_TIMEOUT_SECONDS) as rel_resp:
+            if rel_resp.status != 200:
+                return False
+
+        verify_req = urllib.request.Request(
+            f"{base_url}/api/config/config_entries/entry",
+            headers=headers,
+        )
+        with urllib.request.urlopen(verify_req, timeout=10) as verify_resp:
+            entries = json.loads(verify_resp.read().decode())
+            for item in entries:
+                if item.get("entry_id") == entry_id and item.get("state") == "loaded":
+                    print(
+                        f"[HAReauthWatchdog] 🔄 Auto-healed ZHA config entry {entry_id} (verified state=loaded).",
+                        file=sys.stderr,
+                    )
+                    return True
+    except Exception as ex:
+        print(f"[HAReauthWatchdog] Auto-heal probe error: {ex}", file=sys.stderr)
+    return False
+
+
 def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
     base_url, token = _get_ha_config()
     if not token:
@@ -243,33 +328,8 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
 
         # Auto-heal ZHA if coordinator is back online
         if domain == "zha" and st in ("setup_retry", "setup_error"):
-            import socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2.0)
-            try:
-                _zha_ip = os.environ.get("ZHA_COORDINATOR_IP") or os.environ.get("HUE_BRIDGE_IP")
-                if not _zha_ip and os.path.exists("/secrets/env.json"):
-                    try:
-                        with open("/secrets/env.json") as _ef:
-                            _ed = json.load(_ef)
-                            _zha_ip = _ed.get("ZHA_COORDINATOR_IP") or _ed.get("HUE_BRIDGE_IP")
-                    except Exception:
-                        pass
-                if sock.connect_ex((_zha_ip or "127.0.0.1", 6638)) == 0:
-                    reload_url = f"{base_url}/api/config/config_entries/entry/{entry_id}/reload"
-                    rel_req = urllib.request.Request(
-                        reload_url,
-                        data=b"{}",
-                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                    )
-                    with urllib.request.urlopen(rel_req, timeout=5) as rel_resp:
-                        if rel_resp.status == 200:
-                            print(f"[HAReauthWatchdog] 🔄 Auto-healed ZHA config entry {entry_id} (coordinator port 6638 open).", file=sys.stderr)
-                            continue
-            except Exception as ex:
-                print(f"[HAReauthWatchdog] Auto-heal probe error: {ex}", file=sys.stderr)
-            finally:
-                sock.close()
+            if _auto_heal_zha_entry(base_url, token, entry_id):
+                continue
 
         is_reauth = "reauth" in str(reason).lower() or "authentication" in str(reason).lower() or st == "setup_error"
         unique_key = f"entry:{entry_id}"

@@ -107,11 +107,6 @@ def extract_mime_parts(payload: dict) -> dict[str, str]:
     return out
 
 
-def extract_body(payload: dict) -> str:
-    parts = extract_mime_parts(payload)
-    return parts["plain"] + "\n" + parts["html"]
-
-
 def parse_amazon_order(mdata: dict) -> dict:
     headers = {h["name"].lower(): h["value"] for h in mdata.get("payload", {}).get("headers", [])}
     parts = extract_mime_parts(mdata.get("payload", {}))

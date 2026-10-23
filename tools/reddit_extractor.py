@@ -7,10 +7,12 @@ Defaults to recent posts (current year / past 12 months).
 """
 
 import argparse
+from datetime import datetime
 import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -137,7 +139,8 @@ def search_reddit(
     }
 
     # Apply temporal filter
-    if recency == "year" or recency == "2026":
+    current_year_str = str(datetime.now().year)
+    if recency in ("year", current_year_str):
         params["tbs"] = "qdr:y"  # Past 12 months
     elif recency == "month":
         params["tbs"] = "qdr:m"  # Past month
@@ -190,9 +193,8 @@ def main():
     search_p.add_argument("-n", "--limit", type=int, default=10, help="Maximum number of results (default: 10)")
     search_p.add_argument(
         "-t", "--recency",
-        choices=["year", "month", "week", "all", "2026"],
         default="year",
-        help="Recency filter (default: year / past 12 months)"
+        help="Recency filter: year, month, week, all, or 4-digit year (default: year / past 12 months)"
     )
     search_p.add_argument("--no-cache", action="store_true", help="Bypass cached results")
 

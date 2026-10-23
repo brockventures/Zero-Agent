@@ -134,7 +134,7 @@ def is_within_horizon(event, max_days=MAX_HORIZON_DAYS):
     title = event.get("title", "")
     current_year = datetime.now(PT).year
     for y in range(current_year + 1, current_year + 10):
-        if str(y) in title:
+        if re.search(rf"\b{y}\b", title):
             return False
 
     end_date_str = event.get("endDate")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project and Task Management for Ivy-AG.
+"""Project and Task Management for Zero.
 
 Maintains /workspace/data/tasks.json:
 - Tracks P1, P2, and P3/parking-lot project items.

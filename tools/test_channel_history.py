@@ -3,17 +3,23 @@
 test_channel_history.py - Unit tests for cross-channel context awareness in Crab Cavern.
 """
 
+import sys
+sys.path.insert(0, "/workspace")
 import unittest
 from datetime import datetime, timezone, timedelta
 from collections import deque
+from unittest.mock import patch
 import tools.channel_history as ch
 
 class TestChannelHistoryCrossChannel(unittest.TestCase):
     def setUp(self):
-        self.orig_store = dict(ch._history_store)
+        self.save_patcher = patch.object(ch, "save_history")
+        self.save_patcher.start()
+        self.orig_store = {k: deque( (dict(m) for m in q), maxlen=ch.MAX_HISTORY_PER_CHANNEL ) for k, q in ch._history_store.items()}
         ch._history_store.clear()
 
     def tearDown(self):
+        self.save_patcher.stop()
         ch._history_store.clear()
         ch._history_store.update(self.orig_store)
 
@@ -125,6 +131,32 @@ class TestChannelHistoryCrossChannel(unittest.TestCase):
         )
         ctx = ch.format_channel_context(ch_id, limit=2)
         self.assertIn('Ryan (replying to @Zero: "Detailed breakdown of federal student..."): In English please.', ctx)
+
+    def test_reaction_recording_and_formatting(self):
+        """Reactions added/removed via record_reaction should render in [Reacts: ...] annotations."""
+        ch_id = "1534452820995080192"
+        ch.record_message(
+            channel_id=ch_id,
+            channel_name="lounge",
+            author_name="Zero",
+            is_bot=True,
+            content="Shipped the new fix.",
+            msg_id=600,
+            timestamp="2026-10-22 16:00:00 UTC",
+        )
+        self.assertTrue(ch.record_reaction(ch_id, 600, "👍", "Ryan", added=True))
+        self.assertTrue(ch.record_reaction(ch_id, 600, "👍", "Mike", added=True))
+        self.assertTrue(ch.record_reaction(ch_id, 600, "🔥", "Aerial", added=True))
+
+        ctx = ch.format_channel_context(ch_id, limit=1)
+        self.assertIn("Shipped the new fix. [Reacts: 👍 (Ryan, Mike), 🔥 (Aerial)]", ctx)
+
+        # Removing a reaction updates the list and prunes empty emoji keys
+        self.assertTrue(ch.record_reaction(ch_id, 600, "👍", "Ryan", added=False))
+        self.assertTrue(ch.record_reaction(ch_id, 600, "🔥", "Aerial", added=False))
+        ctx_after = ch.format_channel_context(ch_id, limit=1)
+        self.assertIn("Shipped the new fix. [Reacts: 👍 (Mike)]", ctx_after)
+        self.assertNotIn("🔥", ctx_after)
 
 if __name__ == "__main__":
     unittest.main()

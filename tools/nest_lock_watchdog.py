@@ -70,6 +70,8 @@ LOCK_ENTITY_ID = "lock.entryway_lock"
 COOLDOWN_SECONDS = 180  # 3 minutes minimum between restart attempts
 TRANSITION_TIMEOUT_SECONDS = 25.0  # Physical bolt throws in ~2.5s; >25s means stuck
 MAX_CONSECUTIVE_FAILURES = 3
+VERIFY_TIMEOUT_SECONDS = 65.0  # Homebridge + homebridge-nest startup takes ~42-60s
+VERIFY_POLL_INTERVAL_SECONDS = 5.0
 
 FATAL_LOG_SIGNATURES = [
     "Access token acquisition via googleAuth failed",
@@ -245,6 +247,41 @@ def audit_lock_health(
     return True, f"Nominal: {LOCK_ENTITY_ID} is {state_val}", details
 
 
+def wait_for_lock_recovery(
+    base_url: str,
+    token: str,
+    entity_id: str = LOCK_ENTITY_ID,
+    entry_id: str = HOMEKIT_CONFIG_ENTRY_ID,
+    timeout_seconds: float = VERIFY_TIMEOUT_SECONDS,
+    poll_interval: float = VERIFY_POLL_INTERVAL_SECONDS,
+) -> str:
+    """Reload HomeKit Controller entry and poll until lock entity leaves unavailable/unknown/transition state."""
+    reload_ok = reload_ha_config_entry(base_url, token, entry_id)
+    if not reload_ok:
+        print("[NestWatchdog] Warning: reload_config_entry returned non-200, checking state anyway")
+
+    time.sleep(3.0)
+    recovered_data = get_ha_entity_state(base_url, token, entity_id)
+    new_state = recovered_data.get("state") if recovered_data else "unknown"
+    if new_state not in ("unavailable", "unknown", "unlocking", "locking"):
+        return new_state
+
+    elapsed = 3.0
+    poll_count = 0
+    while elapsed < timeout_seconds:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        poll_count += 1
+        if poll_count % 3 == 0:
+            reload_ha_config_entry(base_url, token, entry_id)
+        recovered_data = get_ha_entity_state(base_url, token, entity_id)
+        new_state = recovered_data.get("state") if recovered_data else "unknown"
+        if new_state not in ("unavailable", "unknown", "unlocking", "locking"):
+            return new_state
+
+    return new_state
+
+
 def execute_self_heal(
     reason: str,
     base_url: str | None = None,
@@ -285,19 +322,9 @@ def execute_self_heal(
         save_state(state)
         return False, f"Failed to restart homebridge container: {err.strip() or out.strip()}"
 
-    # 2. Wait for Homebridge supervisor and Nest plugin initialization
+    # 2. Wait initial 7s, then reload HomeKit Controller and poll readiness up to 65s
     time.sleep(7.0)
-
-    # 3. Reload HomeKit Controller config entry in Home Assistant
-    reload_ok = reload_ha_config_entry(base_url, token, HOMEKIT_CONFIG_ENTRY_ID)
-    if not reload_ok:
-        print("[NestWatchdog] Warning: reload_config_entry returned non-200, checking state anyway")
-
-    time.sleep(3.0)
-
-    # 4. Verify entity restored to valid state
-    recovered_data = get_ha_entity_state(base_url, token, LOCK_ENTITY_ID)
-    new_state = recovered_data.get("state") if recovered_data else "unknown"
+    new_state = wait_for_lock_recovery(base_url, token, LOCK_ENTITY_ID, HOMEKIT_CONFIG_ENTRY_ID)
 
     if new_state in ("unavailable", "unknown", "unlocking", "locking"):
         state["consecutive_failures"] = consec + 1

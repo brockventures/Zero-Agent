@@ -45,7 +45,7 @@ python3 /workspace/tools/web_qa.py "http://localhost:3000" \
 from tools.web_qa import run_web_qa
 
 result = run_web_qa(
-    url="http://nas2.local:8000",
+    url="https://mealie.brock.ventures",
     wait_selector=".recipe-card",
     expect_texts=["Recipes"],
     screenshot_name="mealie_dashboard"

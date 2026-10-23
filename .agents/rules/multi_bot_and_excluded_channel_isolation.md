@@ -43,6 +43,6 @@ description: >-
 
 ## 5. Blast Radius & Channel Scope Isolation
 - Modifications to excluded channel handling must never alter:
-  - **Home Turf Operations:** 1-on-1 ops pairing with Ryan across `#zero-chat`, `#zero-ops`, `#shopping`, `#homelab`, `#home-assistant`, `#steam-deck`, `#finances`, `#projects`, `#brock-house`, `#vault`.
+  - **Home Turf Operations:** 1-on-1 ops pairing with Ryan across `#zero-chat`, `#zero-ops`, `#shopping`, `#homelab`, `#home-assistant`, `#steam-deck`, `#finances`, `#projects`, `#3d-print`, `#brock-house`, `#vault`.
   - **Crab Cavern Protocol:** Multi-agent collaboration in `#the-banana-stand` and `#lounge` (Banana mutex, 4-step Last Word Protocol, Tier-2 classifier).
   - **Public Brock Channels:** Explicit owner-only pings in `#server-updates` and `#seerr-*`.

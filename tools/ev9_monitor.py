@@ -1,4 +1,4 @@
-"""Used Kia EV9 listing monitor for Ivy-Gemini.
+"""Used Kia EV9 listing monitor for Zero.
 
 Searches MarketCheck's Cars API for 2024 Kia EV9 Land/GT/GT-Line listings under
 budget/mileage near Redwood City, CA (zip 94061, 75mi radius), diffs against

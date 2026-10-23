@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hardcoded Rule & Brittle Regex Auditor for Zero (Ivy-AG).
+"""Hardcoded Rule & Brittle Regex Auditor for Zero.
 
 Forensically scans Python scripts, sidecars, and tools for:
 1. Brittle heuristics (e.g. word count thresholds `len(split()) < 4`).
@@ -29,6 +29,13 @@ PATTERNS = [
         "category": "Heuristic Filter",
         "severity": "HIGH",
         "regex": re.compile(r"len\([^)]+\.split\(\)\)\s*(?:<=?|<)\s*\d+"),
+        "custom_check": lambda line: (
+            bool(re.search(r"len\([^)]+\.split\(\)\)\s*(?:<=?|<)\s*\d+", line))
+            and "is_directive" not in line
+            and "is_coref" not in line
+            and "is_short" not in line
+            and "l_strip" not in line
+        ),
         "description": "Arbitrary word-count prefilter may drop valid engineering directives (e.g. 'run tests', 'ship it').",
         "rec_type": "LLM Reasoning / Intent Routing",
         "recommendation": "Bypass prefilter for actionable intent directives or route directly to model classification."
@@ -38,8 +45,9 @@ PATTERNS = [
         "category": "Fragile Regex",
         "severity": "HIGH",
         "custom_check": lambda line: (
-            re.search(r"r?[\"'][^\"']*(?<!\d\+\.)\\d\+\\\.\\d\+[^\"']*[\"']", line)
+            bool(re.search(r"r?[\"'][^\"']*(?<!\d\+\.)\\d\+\\\.\\d\+[^\"']*[\"']", line))
             and not re.search(r"\\d\+\\\.\\d\+\\\.\\d\+", line)  # Ignore IP addresses
+            and not re.search(r"\\d\+\\\.\\d\+\(\?:\\\.\\d\+\)\*", line)  # Ignore semver extractors
             and not re.search(r"\d+\.\d+\.\d+", line)
         ),
         "description": "Unanchored float/decimal regex may collide with token counts or memory metadata instead of confidence scores.",

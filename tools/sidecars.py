@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive Sidecar Execution Engine for Zero (Ivy-AG).
+"""Comprehensive Sidecar Execution Engine for Zero.
 
 Implements all scheduled maintenance and monitoring jobs:
 1. Heartbeat Sweep (every 2 hours)
@@ -36,7 +36,6 @@ import sys
 import threading
 import time
 import traceback
-import urllib.parse
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -99,15 +98,6 @@ REMINDER_SKIP_SUBJECT_PATTERNS = (
 )
 
 DATED_REMINDERS = [
-    {
-        "id": "zwave-smartthings-decision-2026-09-08",
-        "due": "2026-09-08",
-        "message": (
-            "⏰ **SmartThings replacement reminder** — you asked to revisit this in 30 days (set 08-09).\n"
-            "Options: **HomeSeer Z-NET PRO** (standalone, replaces ZWA-2 stick) or **SLZB-06U + ZWA-2 combo** "
-            "(bridge + stick). Dropping SmartThings before the Oct 2026 API paywall for Z-Wave blinds."
-        ),
-    },
     {
         "id": "hdd-prices-2026-11-05",
         "due": "2026-11-05",
@@ -342,11 +332,6 @@ def get_execution_history(limit: int = 50, since_hours: float | None = None) -> 
     except Exception as e:
         print(f"[Sidecars] Error reading execution log: {e}")
         return []
-
-def get_recent_job_failures(since_hours: float = 24.0) -> list[dict]:
-    """Retrieve all failed, degraded, or errored jobs within the last N hours."""
-    entries = get_execution_history(limit=MAX_LOG_ENTRIES, since_hours=since_hours)
-    return [e for e in entries if e.get("status") in ("warning", "error")]
 
 def get_sidecar_health_summary(since_hours: float = 24.0) -> dict:
     """Calculate summary metrics for sidecars executed within the last N hours."""
@@ -884,73 +869,6 @@ def run_nightly_triage() -> str:
 # --------------------------------------------------------------------------
 # 3. NAS Log Review
 # --------------------------------------------------------------------------
-def _diagnose_container_errors(cname: str, errors: list[str]) -> tuple[int, str, str]:
-    """Analyze filtered container errors and return (tier, plain_english_explanation, proposed_next_step)."""
-    joined = " \n ".join(errors)
-
-    # 1. Database errors
-    if re.search(r"database is locked|sqlite3\.OperationalError", joined, re.I):
-        return 1, "SQLite database encountered write contention and locked.", "Check for concurrent background tasks or restart the container to clear stale locks."
-    if re.search(r"Npgsql\.NpgsqlException|TimeoutException.*queue", joined, re.I):
-        return 1, "Database stream connection timed out while querying the queue API.", "Monitor queue responsiveness; restart the container if UI operations stall."
-    if re.search(r"UNIQUE constraint failed", joined, re.I):
-        return 2, "Database constraint collision occurred during metadata caching.", "Scheduled cache maintenance will resolve key duplicates automatically."
-
-    # 2. Discord bot commands
-    if re.search(r"CommandNotFound: Application command", joined, re.I):
-        m = re.search(r"Application command '([^']+)' not found", joined)
-        cmd_name = f"/{m.group(1)}" if m else "slash command"
-        return 1, f"Discord client received an unregistered slash command ({cmd_name}).", "Sync application command definitions with Discord API."
-
-    # 3. Subprocess / Dockhand
-    if re.search(r"Go worker error.*list containers|Failed to send.*notification", joined, re.I):
-        return 2, "Worker encountered errors polling container states and sending webhook notifications.", "Verify Docker socket permissions or restart Dockhand if dashboard stats stall."
-
-    # 4. Media & Metadata (TMDb / Subtitles / Indexers)
-    if re.search(r"TMDb Error:.*404|No Episode found for TMDb", joined, re.I):
-        return 2, "Metadata lookup returned 404 Not Found for missing episodes on TMDb.", "Add affected TV series/specials to the exclude list if metadata is not on TMDb."
-    if re.search(r"check_update.*Error trying to get releases from GitHub", joined, re.I):
-        return 2, "GitHub release check timed out or hit API rate limiting.", "No action needed; automated updater will retry on the next check."
-    if re.search(r"Path does not exist", joined, re.I):
-        return 2, "Media indexer attempted to access an unmounted or missing file path.", "Check container volume mounts and root folder mappings."
-    if re.search(r"HttpClient\.HandleFailure|SocketException.*Resource temporarily unavailable", joined, re.I):
-        return 2, "Outbound HTTP or socket connection to external indexer or download client timed out.", "Automated retry will recover on the next scheduled refresh."
-
-    # 5. Smart Home / IoT
-    if re.search(r"pychromecast.*(Heartbeat timeout|Failed to connect)", joined, re.I):
-        return 2, "Chromecast integration lost connection during heartbeat check to cast devices.", "Normal when TVs or Chromecasts are in standby; verify device power if unresponsive."
-    if re.search(r"Nest API.*ECONNRESET|TLSSocket", joined, re.I):
-        return 2, "Nest cloud event stream disconnected unexpectedly.", "Plugin reconnects automatically; check HomeKit status if accessories show No Response."
-    if re.search(r"CASESession timed out|Setup for node failed", joined, re.I):
-        return 2, "Matter device secure communication timed out.", "Verify physical power and wireless mesh connectivity to the Matter node."
-
-    # 6. Novel, Unhandled, or Critical Errors (Attempt LLM diagnosis before generic fallback)
-    prompt = (
-        f"Container '{cname}' emitted these log errors:\n{joined[:1200]}\n\n"
-        f"Provide a 1-sentence plain-English root cause explanation and a 1-sentence recommended next step.\n"
-        f"Format strictly as: Explanation: <sentence> | Next Step: <sentence>"
-    )
-    try:
-        res = subprocess.run(
-            ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={prompt}"],
-            capture_output=True, text=True, timeout=12
-        )
-        if res.returncode == 0 and "Explanation:" in res.stdout:
-            parts = res.stdout.strip().split("|")
-            expl = parts[0].replace("Explanation:", "").strip()
-            step = parts[1].replace("Next Step:", "").strip() if len(parts) > 1 else "Inspect container logs."
-            tier = 1 if re.search(r"panic|fatal|segfault|\boom\b|killed|unhandled exception|syntaxerror", joined, re.I) else 2
-            if expl:
-                return tier, expl, step
-    except Exception:
-        pass
-
-    # Generic Fallbacks
-    if re.search(r"panic|fatal|segfault|\boom\b|killed|unhandled exception|syntaxerror", joined, re.I):
-        return 1, f"Critical application error or unhandled crash in {cname}.", "Inspect detailed container logs with docker logs and verify configuration."
-    else:
-        return 2, f"Transient operational warning or non-critical error in {cname}.", "Monitor on subsequent health checks; investigate if error recurs continuously."
-
 def run_nas_log_review(since: str = "24h") -> tuple[bool, str, dict]:
     """Execute high-speed batch NAS log scanning & triage across Host 1 and Host 2."""
     import importlib
@@ -1044,23 +962,6 @@ def run_dated_reminders(today_str: str | None = None) -> tuple[bool, str]:
         pass
 
     return True, msg
-
-def add_dated_reminder(due_date: str, message: str, reminder_id: str = "") -> dict:
-    """Dynamically register a one-shot dated reminder in /workspace/data/reminders.json."""
-    reminders_file = DATA_DIR / "reminders.json"
-    reminders_list = []
-    if reminders_file.exists():
-        try:
-            with open(reminders_file) as f:
-                reminders_list = json.load(f)
-        except Exception:
-            pass
-    rid = reminder_id or f"reminder-{due_date}-{int(time.time())}"
-    entry = {"id": rid, "due": due_date, "message": message}
-    reminders_list.append(entry)
-    with open(reminders_file, "w") as f:
-        json.dump(reminders_list, f, indent=2)
-    return {"ok": True, "reminder": entry}
 
 # --------------------------------------------------------------------------
 # 6. Used EV9 Monitor

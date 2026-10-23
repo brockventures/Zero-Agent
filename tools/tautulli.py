@@ -1,4 +1,4 @@
-"""Tautulli (Plex activity/history) queries for Ivy-Gemini.
+"""Tautulli (Plex activity/history) queries for Zero.
 
 Read-only queries against Tautulli's API v2 on Host1, using
 $TAUTULLI_API_KEY.

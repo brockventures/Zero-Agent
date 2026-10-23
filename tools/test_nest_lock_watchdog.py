@@ -225,3 +225,34 @@ def test_run_watchdog_resets_failures_when_healthy(mock_save, mock_load, mock_ss
         "consecutive_failures": 0,
         "last_status": "healthy",
     })
+
+
+@patch("nest_lock_watchdog.load_state")
+@patch("nest_lock_watchdog.save_state")
+@patch("nest_lock_watchdog.run_ssh")
+@patch("nest_lock_watchdog.reload_ha_config_entry")
+@patch("nest_lock_watchdog.get_ha_entity_state")
+@patch("nest_lock_watchdog.time.sleep")
+@patch("nest_lock_watchdog.queue_outbox_message")
+@patch("nest_lock_watchdog.create_ha_persistent_notification")
+def test_execute_self_heal_delayed_readiness_polling(
+    mock_notif, mock_outbox, mock_sleep, mock_get_ha, mock_reload, mock_ssh, mock_save, mock_load
+):
+    mock_load.return_value = {"last_heal_ts": 0, "consecutive_failures": 0, "history": []}
+    mock_ssh.return_value = (0, "Restarting homebridge\n", "")
+    mock_reload.return_value = True
+    # Simulate Homebridge taking ~25s to boot: 3 unavailable polls, then locked on the 4th poll
+    mock_get_ha.side_effect = [
+        {"state": "unavailable"},
+        {"state": "unavailable"},
+        {"state": "unavailable"},
+        {"state": "locked"},
+    ]
+
+    ok, msg = execute_self_heal("Lock entity is currently unavailable", "http://fake-ha", "fake-token", force=True)
+    assert ok is True
+    assert "Successfully restored" in msg
+    assert mock_get_ha.call_count == 4
+    # Initial reload + periodic retry on 3rd poll
+    assert mock_reload.call_count == 2
+

@@ -105,7 +105,7 @@ python3 /workspace/tools/mlb_stream_extractor.py --team cubs --json
 
 ## ⏰ Automated Game-Day Sidecar (`cubs_game_notifier`)
 
-The Cubs Game Day Notifier runs via the persistent Karakos scheduler (`schedule.json`):
+The Cubs Game Day Notifier runs via the persistent native bridge scheduler (`schedule.json`):
 * **Interval:** Every 5 minutes (`300s`).
 * **Detection Window:** Automatically checks `statsapi.mlb.com` for today's Cubs game. When first pitch is ~10 minutes out (0-15m window), emits a Discord alert to `#zero-chat`.
 * **One-Click TV Cast:** Dispatches Discord message with interactive `[CHOICES: Cast Cubs on TV | Dismiss]` buttons.

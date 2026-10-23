@@ -1,7 +1,7 @@
 ---
 name: modal-compute
 description: >-
-  Use this skill whenever running or orchestrating heavy machine learning model training, multi-fold cross-validation sweeps, hyperparameter optimization (Nelder-Mead, Powell, Optuna), large cohort backtests, or compute-intensive workloads. Offloads heavy CPU/RAM tasks from Host 2 (Synology DS1525+) to Modal serverless cloud compute (8–16 vCPUs, 32–64 GB RAM), protecting the NAS hardware from memory exhaustion and watchdog panics.
+  Use this skill whenever running or orchestrating heavy machine learning model training, multi-fold cross-validation sweeps, hyperparameter optimization (Nelder-Mead, Powell, Optuna), large cohort backtests, or compute-intensive workloads. Offloads heavy CPU/RAM tasks from Host 2 NAS to Modal serverless cloud compute (8–16 vCPUs, 32–64 GB RAM), protecting the NAS hardware from memory exhaustion and watchdog panics.
 ---
 
 # ☁️ Modal Serverless Cloud Compute Skill
@@ -60,7 +60,7 @@ python3 /baseball/big-projections/modal_harness.py --mode benchmark
 
 ## 🛑 Host 2 Hardware Protection Invariants
 
-Host 2 is a Synology DS1525+ with an AMD Ryzen Embedded V1780B (4 cores / 8 threads) and shared NAS storage:
+Host 2 is a 4-core / 8-thread NAS host with shared storage:
 
 1. **Local Heavy Compute Ban:**
    - Training suites, large grid sweeps, and unbounded multi-threaded fits are strictly forbidden from running directly on Host 2 CPU.

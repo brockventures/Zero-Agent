@@ -497,3 +497,67 @@ def test_arr_notification_status_unresolved_advisory_not_critical(temp_env, monk
     for it in items:
         if isinstance(it, dict) and it.get("source") == "NotificationStatusCheck":
             assert it.get("is_critical") is False
+
+
+def test_arr_id_mismatch_poison_grab_auto_remediated(temp_env, monkeypatch):
+    """Tier 1: Indexer ID-mismatch poison grabs are auto-purged (+ siblings), blocklisted, and re-searched."""
+    _, audit_file = temp_env
+
+    monkeypatch.setattr(aqw, "_get_api_keys", lambda: ("sonarr_mock_key", "radarr_mock_key"))
+    monkeypatch.setattr(aqw, "fetch_health", lambda app, port, key: [])
+    monkeypatch.setattr(aqw, "_auto_remediate_media_management", lambda app, port, key: (False, ""))
+
+    queue_mock = [
+        {
+            "id": 751862477,
+            "downloadId": "mock-jpod-e07",
+            "seriesId": 345,
+            "episodeId": 32874,
+            "title": "JPod.2008.S01E07.1080p.AMZN.WEB-DL.H.264.SDR.DDP2.0.English-HONE",
+            "status": "completed",
+            "trackedDownloadStatus": "warning",
+            "statusMessages": [
+                {
+                    "title": "JPod.2008.S01E07.1080p.AMZN.WEB-DL.H.264.SDR.DDP2.0.English-HONE",
+                    "messages": [
+                        "Found matching series via grab history, but release was matched to series by ID. Automatic import is not possible. See the FAQ for details."
+                    ],
+                }
+            ],
+            "series": {"path": "/data/media/tv/Six Feet Under (2001)"},
+        },
+        {
+            "id": 751862478,
+            "downloadId": "mock-jpod-e08",
+            "seriesId": 345,
+            "episodeId": 32875,
+            "title": "JPod.2008.S01E08.1080p.AMZN.WEB-DL.H.264.SDR.DDP2.0.English-HONE",
+            "status": "downloading",
+            "trackedDownloadStatus": "ok",
+            "statusMessages": [],
+            "series": {"path": "/data/media/tv/Six Feet Under (2001)"},
+        },
+    ]
+    monkeypatch.setattr(aqw, "fetch_queue", lambda app, port, key: queue_mock if app == "Sonarr" else [])
+
+    remove_mock = MagicMock(return_value=True)
+    search_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(aqw, "remove_queue_item", remove_mock)
+    monkeypatch.setattr(aqw, "trigger_replacement_search", search_mock)
+
+    has_activity, summary, items = aqw.run_watchdog(auto_fix=True, force_dispatch=True)
+
+    assert remove_mock.call_count == 2
+    assert search_mock.call_count == 1
+    assert search_mock.call_args[1]["episode_ids"] == [32874, 32875]
+    assert "⚠️ **Arr Queue Warnings Detected**" not in summary
+    assert "🛠️ **Arr Import Auto-Remediation Live**" in summary
+    assert "Indexer ID-mismatch poison grab" in summary
+    assert "+1 poisoned sibling grab(s)" in summary
+
+    assert audit_file.exists()
+    with open(audit_file) as f:
+        log_content = f.read()
+        assert "queue_id_mismatch" in log_content
+        assert "auto_purged_blocklisted_and_researched" in log_content
+

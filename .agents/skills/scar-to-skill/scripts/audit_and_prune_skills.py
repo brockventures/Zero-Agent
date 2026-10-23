@@ -166,7 +166,7 @@ def audit(verbose: bool = False):
             print(f"      Reason: {reason}")
             print(f"      Action: {action}")
     else:
-        print("\n✨ All 26 installed skills conform to Antigravity schema. Zero broken skills detected!")
+        print(f"\n✨ All {len(skill_dirs)} installed skills conform to Antigravity schema. Zero broken skills detected!")
 
     print("=" * 68)
     return 1 if broken_skills else 0

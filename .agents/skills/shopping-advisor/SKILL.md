@@ -95,7 +95,7 @@ python3 /workspace/tools/amazon_serpapi.py reviews "<ASIN>" --limit 10
 
 ### Step 3: Verify Links & Output Canonical Cards
 * Verify that all retail links are live or adhere to verified canonical search formats via [`scripts/verify_links.py`](file:///workspace/.agents/skills/shopping-advisor/scripts/verify_links.py).
-* Strictly follow [`.agents/rules/ecommerce_links.md`](file:///workspace/.agents/rules/ecommerce_links.md) and [`.agents/rules/mobile_discord_formatting.md`](file:///workspace/.agents/rules/mobile_discord_formatting.md).
+* Strictly follow [`.agents/rules/shopping_and_serpapi_discipline.md`](file:///workspace/.agents/rules/shopping_and_serpapi_discipline.md) and [`.agents/rules/discord_formatting.md`](file:///workspace/.agents/rules/discord_formatting.md).
 
 ---
 
@@ -103,22 +103,22 @@ python3 /workspace/tools/amazon_serpapi.py reviews "<ASIN>" --limit 10
 
 ```markdown
 🏆 **1. [Product Name / Model]** — *Recommended: [e.g. Best Overall / Enthusiast Pick]*
-- 💵 **Price:** `$XX.XX` (New, Prime / Retail)
-- 🏷️ **Seller:** Ships from / Sold by `Amazon.com` (or `[Brand] Official Storefront` / `Costco` / `Home Depot`)
+- 💵 **Price:** **$XX.XX** (New, Prime / Retail)
+- 🏷️ **Seller:** Ships from / Sold by **Amazon.com** (or **[Brand] Official Storefront** / **Costco** / **Home Depot**)
 - ⭐ **Multi-Source Consensus:**
   - 🗞️ **Wirecutter:** *Top Pick* (Praised for temperature stability and brew speed)
   - 💬 **Reddit (r/BuyItForLife):** *Consensus Favorite* (5+ year longevity, replaceable parts)
   - 📦 **Retail / Amazon Rating:** 4.7 ★ (8,500+ reviews)
 - 🔍 **Critical Takeaway & Defect Audit:** [Summary of verified user failure modes, transit hazards, or build notes]
-- 🔗 **Link:** [Amazon Product Detail Page](https://www.amazon.com/dp/ASIN) | [Home Depot Search](https://www.homedepot.com/s/QUERY) | [Costco Search](https://www.costco.com/s?dept=All&keyword=QUERY)
+- 🔗 **Link:** [Amazon Product Detail Page](<https://www.amazon.com/dp/ASIN>) | [Home Depot Search](<https://www.homedepot.com/s/QUERY>) | [Costco Search](<https://www.costco.com/s?dept=All&keyword=QUERY>)
 
 🥈 **2. [Product Name / Model]** — *Alternative: [e.g. Best Value / Runner-Up]*
-- 💵 **Price:** `$XX.XX` (New, Prime / Retail)
-- 🏷️ **Seller:** Ships from / Sold by `Amazon.com` (or authorized retailer)
+- 💵 **Price:** **$XX.XX** (New, Prime / Retail)
+- 🏷️ **Seller:** Ships from / Sold by **Amazon.com** (or authorized retailer)
 - ⭐ **Multi-Source Consensus:**
   - 🗞️ **Wirecutter:** *Budget Pick*
   - 💬 **Reddit:** *Solid Entry-Level Recommendation*
   - 📦 **Retail / Amazon Rating:** 4.5 ★ (22,000+ reviews)
 - 🔍 **Critical Takeaway & Defect Audit:** [Summary of pros, cons, and why it differs from Pick #1]
-- 🔗 **Link:** [Amazon Product Detail Page](https://www.amazon.com/dp/ASIN) (or [Retailer Search Link](canonical_url))
+- 🔗 **Link:** [Amazon Product Detail Page](<https://www.amazon.com/dp/ASIN>) (or [Retailer Search Link](<canonical_url>))
 ```

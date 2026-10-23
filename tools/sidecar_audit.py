@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sidecar Lifecycle & Schedule Auditor for Zero (Ivy-AG).
+"""Sidecar Lifecycle & Schedule Auditor for Zero.
 
 Ensures all scheduled sidecars follow the 5-layer lifecycle protocol:
 1. Script Exists & Executable on Disk

@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -46,10 +47,12 @@ except ImportError:
 
 HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
+_EXTRA_ALLOWED_HOSTS = os.environ.get("HOMELAB_EXTRA_HOSTS", "")
 HOMELAB_ALLOWED_HOSTS = (
-    f"localhost,127.0.0.1,{HOST_1_IP},{HOST_2_IP},100.112.209.97,100.127.101.77,"
-    "*.local,*.home,*.lan,*.localdomain,*.brock.ventures,*.ts.net," +
-    os.environ.get("ARR_LOCAL_HOSTS", "host,sonarr,radarr,prowlarr,overseerr,seerr,maintainerr,sabnzbd,tautulli,plex")
+    f"localhost,127.0.0.1,{HOST_1_IP},{HOST_2_IP},"
+    + (f"{_EXTRA_ALLOWED_HOSTS.strip(',')}," if _EXTRA_ALLOWED_HOSTS.strip(",") else "")
+    + "*.local,*.home,*.lan,*.localdomain,*.brock.ventures,*.ts.net,"
+    + os.environ.get("ARR_LOCAL_HOSTS", "host,sonarr,radarr,prowlarr,overseerr,seerr,maintainerr,sabnzbd,tautulli,plex")
 )
 
 SONARR_PORT = 8989
@@ -275,6 +278,48 @@ NON_UPGRADE_PATTERNS = [
 ]
 NON_UPGRADE_RE = re.compile("|".join(NON_UPGRADE_PATTERNS), re.IGNORECASE)
 
+ID_MISMATCH_PATTERNS = [
+    r"matched to (?:series|movie) by id.*automatic import is not possible",
+]
+ID_MISMATCH_RE = re.compile("|".join(ID_MISMATCH_PATTERNS), re.IGNORECASE)
+
+
+def _extract_release_show_prefix(title: str) -> str:
+    """Extract normalized show prefix prior to SxxExx token for sibling poison detection."""
+    parts = re.split(r"[.\s_-]+S\d{1,2}E\d{1,2}\b", title or "", maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) > 1 and parts[0].strip():
+        return re.sub(r"[^a-z0-9]+", "", parts[0].lower())
+    return ""
+
+
+def trigger_replacement_search(
+    app_name: str,
+    port: int,
+    api_key: str,
+    episode_ids: list[int] | None = None,
+    movie_ids: list[int] | None = None,
+) -> bool:
+    """Trigger EpisodeSearch (Sonarr) or MoviesSearch (Radarr) after blocklisting a poisoned grab."""
+    url = f"http://{HOST_1_IP}:{port}/api/v3/command"
+    if app_name == "Sonarr" and episode_ids:
+        payload = {"name": "EpisodeSearch", "episodeIds": sorted(set(episode_ids))}
+    elif app_name == "Radarr" and movie_ids:
+        payload = {"name": "MoviesSearch", "movieIds": sorted(set(movie_ids))}
+    else:
+        return False
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status in (200, 201)
+    except Exception as e:
+        print(f"[ArrWatchdog] Failed to trigger replacement search on {app_name}: {e}", file=sys.stderr)
+        return False
+
 
 def remove_queue_item(port: int, api_key: str, queue_id: int, remove_from_client: bool = True, blocklist: bool = True) -> bool:
     """Delete an unwanted queue item, removing files from download client and blocklisting."""
@@ -285,7 +330,7 @@ def remove_queue_item(port: int, api_key: str, queue_id: int, remove_from_client
     )
     req = urllib.request.Request(url, headers={"X-Api-Key": api_key}, method="DELETE")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=25) as resp:
             return resp.status in (200, 204)
     except Exception as e:
         print(f"[ArrWatchdog] Failed to remove queue item {queue_id}: {e}", file=sys.stderr)
@@ -362,7 +407,10 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
 
         # 1. Inspect queue & download imports
         queue = fetch_queue(app_name, port, key)
+        purged_queue_ids: set[int] = set()
         for item in queue:
+            if item.get("id") in purged_queue_ids:
+                continue
             tracked_status = item.get("trackedDownloadStatus", "").lower()
             status = item.get("status", "").lower()
             status_msgs = item.get("statusMessages", [])
@@ -401,7 +449,8 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
             is_perm_issue = False
             owner_uid = None
             if nas_path:
-                code, out, _ = _ssh_cmd(f"ls -ldn '{nas_path}' 2>/dev/null")
+                quoted_path = shlex.quote(nas_path)
+                code, out, _ = _ssh_cmd(f"ls -ldn {quoted_path} 2>/dev/null")
                 if code == 0 and out.strip():
                     parts = out.strip().split()
                     if len(parts) >= 3:
@@ -411,7 +460,8 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
 
             remediation_done = False
             if is_perm_issue and auto_fix and nas_path:
-                fix_code, _, fix_err = _ssh_cmd(f"sudo chown -R 1026:100 '{nas_path}'")
+                quoted_path = shlex.quote(nas_path)
+                fix_code, _, fix_err = _ssh_cmd(f"sudo chown -R 1026:100 {quoted_path}")
                 if fix_code == 0:
                     remediation_done = True
                     trigger_arr_refresh(port, key)
@@ -436,6 +486,7 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                 queue_item_id = item.get("id")
                 if queue_item_id and remove_queue_item(port, key, queue_item_id, remove_from_client=True, blocklist=True):
                     remediation_done = True
+                    purged_queue_ids.add(queue_item_id)
                     matching_msg = next((m for m in msg_texts if NON_UPGRADE_RE.search(m)), "Rejected non-upgrade")
                     remediated_entry = {
                         "app": app_name,
@@ -450,6 +501,62 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                         action="auto_purged_and_blocklisted",
                         details=f"Item: {item_title} (ID: {queue_item_id}) | Reason: {matching_msg}",
                         auto_remediated=True
+                    )
+
+            # Tier 1 Auto-Remediation: Indexer ID-mismatch / wrong-series poison grabs blocked at import
+            is_id_mismatch = bool(msg_texts and any(ID_MISMATCH_RE.search(m) for m in msg_texts))
+            if not remediation_done and is_id_mismatch and auto_fix:
+                queue_item_id = item.get("id")
+                if queue_item_id and remove_queue_item(port, key, queue_item_id, remove_from_client=True, blocklist=True):
+                    remediation_done = True
+                    purged_queue_ids.add(queue_item_id)
+                    affected_ep_ids = [item["episodeId"]] if item.get("episodeId") else []
+                    affected_movie_ids = [item["movieId"]] if item.get("movieId") else []
+                    sibling_count = 0
+
+                    # Also purge any queued sibling episodes for the same series sharing the mismatched show prefix
+                    bad_prefix = _extract_release_show_prefix(item_title)
+                    target_series_id = item.get("seriesId")
+                    if bad_prefix and target_series_id:
+                        for sib in queue:
+                            sib_id = sib.get("id")
+                            if not sib_id or sib_id in purged_queue_ids:
+                                continue
+                            if sib.get("seriesId") == target_series_id and _extract_release_show_prefix(sib.get("title", "")) == bad_prefix:
+                                if remove_queue_item(port, key, sib_id, remove_from_client=True, blocklist=True):
+                                    purged_queue_ids.add(sib_id)
+                                    sibling_count += 1
+                                    if sib.get("episodeId"):
+                                        affected_ep_ids.append(sib["episodeId"])
+
+                    re_searched = trigger_replacement_search(
+                        app_name,
+                        port,
+                        key,
+                        episode_ids=affected_ep_ids,
+                        movie_ids=affected_movie_ids,
+                    )
+                    sib_note = f" (+{sibling_count} poisoned sibling grab(s))" if sibling_count else ""
+                    search_note = " and triggered replacement search" if re_searched else ""
+                    remediated_entry = {
+                        "app": app_name,
+                        "title": item_title,
+                        "path": "Download Queue",
+                        "reason": (
+                            f"Indexer ID-mismatch poison grab blocked by {app_name}{sib_note}. "
+                            f"Auto-purged from download client, blocklisted{search_note}."
+                        ),
+                    }
+                    remediated.append(remediated_entry)
+                    _log_triage_action(
+                        app=app_name,
+                        category="queue_id_mismatch",
+                        action="auto_purged_blocklisted_and_researched",
+                        details=(
+                            f"Item: {item_title} (ID: {queue_item_id}){sib_note} | "
+                            f"Re-searched episodes={affected_ep_ids} movies={affected_movie_ids} (ok={re_searched})"
+                        ),
+                        auto_remediated=True,
                     )
 
             if not remediation_done:
@@ -560,6 +667,7 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                 "app": entry["app"],
                 "source": entry["source"],
                 "message": entry["message"],
+                "is_critical": bool(entry.get("is_critical", False)),
                 "duration_mins": max(dur_mins, 1)
             })
         del seen_health[k]

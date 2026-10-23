@@ -6,7 +6,7 @@ description: Emergency mobile browser automation fallback on physical Pixel 8 Pr
 # 📱 Pixel Browser (Pixel 8 Pro Real-Device Automation)
 
 ## Overview
-The `pixel-browser` skill provides real-device browser automation running on a physical **Google Pixel 8 Pro** (`husky`, Android 16, Google Tensor G3) tethered via USB to Host 2 (`<HOST_2_IP>:5037`, serial `36261FDJG0003L`). 
+The `pixel-browser` skill provides real-device browser automation running on a physical **Google Pixel 8 Pro** (`husky`, Android 16, Google Tensor G3) tethered via USB to Host 2 (`<HOST_2_IP>:5037`, serial `<PIXEL_ADB_SERIAL>`). 
 
 It connects to genuine mobile Google Chrome over the Chrome DevTools Protocol (CDP) forwarded across ADB, providing an unblockable execution environment that presents authentic mobile hardware fingerprints (Tensor G3, Mali-G715 GPU, authentic WebGL vendor strings, real touch dispatch, and residential network interfaces).
 
@@ -29,7 +29,7 @@ Activate this skill when standard server-side headless browsers (Playwright, Pup
   - Android suspends mobile Chrome JavaScript execution and rendering when the screen is asleep (`mWakefulness=Asleep`).
   - Sessions must wake and dismiss keyguard (`input keyevent 224` and `82`) on start.
   - Sessions **MUST unconditionally put the display to sleep (`input keyevent 26`)** upon termination via guaranteed `finally` context managers to prevent OLED burn-in and thermal battery degradation.
-- **Transport Priority:** Always prioritize the high-speed USB daemon on Host 2 (`-H <HOST_2_IP> -P 5037 -s 36261FDJG0003L`).
+- **Transport Priority:** Always prioritize the high-speed USB daemon on Host 2 (`-H <HOST_2_IP> -P 5037 -s <PIXEL_ADB_SERIAL>`).
 - **Tab Lifecycle & Single-Tab Invariant:**
   - Launching Chrome via Android `am start -d <url>` spawns an unmanaged new tab every invocation.
   - Automation must launch Chrome without `-d` and navigate the single existing page in-place.
@@ -53,7 +53,7 @@ python3 /workspace/tools/pixel_browser.py status
 {
   "device": "Pixel 8 Pro (husky)",
   "transport": "usb",
-  "serial": "36261FDJG0003L",
+  "serial": "<PIXEL_ADB_SERIAL>",
   "conflict": false,
   "conflict_message": "Clear (IP Webcam offline)",
   "battery_pct": 38,

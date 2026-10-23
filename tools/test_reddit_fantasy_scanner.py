@@ -79,6 +79,7 @@ class TestRedditFantasyScanner(unittest.TestCase):
         self.assertNotIn("...", card)
         self.assertIn(draft, card)
         self.assertIn("https://www.reddit.com/r/fantasybaseball/comments/123/", card)
+        self.assertIn("[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]", card)
 
     @patch("tools.reddit_fantasy_scanner.scan_reddit_via_pixel")
     def test_run_sidecar_contract(self, mock_scan):
@@ -188,6 +189,28 @@ class TestRedditFantasyScanner(unittest.TestCase):
         # Must select ThoughtfulManager over LazyPoster
         self.assertEqual(selected.get("author"), "ThoughtfulManager")
         self.assertIn("ThoughtfulManager", report)
+
+    def test_old_reddit_top_level_with_child_parent_button_not_disqualified(self):
+        """Verify Old Reddit top-level comment whose child reply has a 'parent' link is kept at depth=0."""
+        import re
+        raw_entry_text = (
+            "[–]AverageKhorneWorship 10 man points league yahoo 2 points 23 hours ago \n\n"
+            "Tolle or Seth Hernandez?\n\n"
+            "permalinkembedsavereportreply\n\n"
+            "[–]Penstripedsox 1 point 18 hours ago \n\n"
+            "who is seth hernandez? tolle is a top 20 dynasty pitcher already.\n\n"
+            "permalinkembedsaveparentreportreply"
+        )
+        own_entry_text = re.split(r"\n\s*\[[–-]\]", raw_entry_text.strip())[0]
+        self.assertIsNone(re.search(r"permalink.*?\bparent\b.*?reply", own_entry_text.lower()))
+
+        child_entry_text = (
+            "[–]Penstripedsox 1 point 18 hours ago \n\n"
+            "who is seth hernandez? tolle is a top 20 dynasty pitcher already.\n\n"
+            "permalinkembedsaveparentreportreply"
+        )
+        own_child_text = re.split(r"\n\s*\[[–-]\]", child_entry_text.strip())[0]
+        self.assertIsNotNone(re.search(r"permalink.*?\bparent\b.*?reply", own_child_text.lower()))
 
     def test_old_reddit_top_level_with_child_parent_button_not_disqualified(self):
         """Verify Old Reddit top-level comment whose child reply has a 'parent' link is kept at depth=0."""

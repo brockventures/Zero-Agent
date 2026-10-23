@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Home Assistant MCP Server for Ivy-AG.
+"""Home Assistant MCP Server for Zero.
 
 Exposes safe Home Assistant operations over Model Context Protocol (MCP).
 Operating rules:
