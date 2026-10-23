@@ -983,10 +983,44 @@ async def handle_message(
                 return
             channel_last_bot_reply[msg.channel.id] = now
 
+    ZERO_OPS_CHANNEL_ID = 1544953279664889888
     if is_home:
-        # Home Turf (#zero-chat): strictly 1-on-1 pairing with Ryan; ignore other bots
+        author_id = getattr(msg.author, "id", None)
+        if msg.channel.id == ZERO_OPS_CHANNEL_ID and author_id == OWNER_USER_ID:
+            try:
+                from tools.last_word_protocol import unpause_bot
+                unpause_bot(msg.channel.id, "Ivy")
+            except Exception as ue:
+                print(f"[Bridge] Warning unpausing Ivy on owner message in #zero-ops: {ue}")
+
+        # Home Turf (#zero-chat & ops channels): strictly 1-on-1 pairing with Ryan,
+        # EXCEPT in #zero-ops where Ivy (IVY_USER_ID) is permitted to escalate shared /opt/zero read-only or host issues via explicit @Zero mention.
         if msg.author.bot:
-            return
+            if msg.channel.id == ZERO_OPS_CHANNEL_ID and author_id == IVY_USER_ID:
+                bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
+                stripped_for_tag = re.sub(r"`[^`]*`|\(\s*@zero\s*\)", "", content, flags=re.IGNORECASE)
+                has_explicit_tag = (
+                    f"<@{bot_id}>" in content or
+                    f"<@!{bot_id}>" in content or
+                    bool(re.search(r"@zero\b", stripped_for_tag, re.IGNORECASE))
+                )
+                if not has_explicit_tag:
+                    return
+
+                from tools.last_word_protocol import is_bot_paused
+                is_paused, remaining, _ = is_bot_paused(msg.channel.id, author_id, "Ivy")
+                if is_paused:
+                    print(f"[Bridge] #zero-ops: Ivy is paused under Last Word Protocol ({remaining:.1f}s remaining). Dropping.")
+                    return
+
+                now = time.time()
+                last_reply = channel_last_bot_reply.get(msg.channel.id, 0.0)
+                if (now - last_reply) < 4.0:
+                    print(f"[Bridge] #zero-ops: 4s cascade cooldown active ({now - last_reply:.2f}s < 4.0s). Dropping.")
+                    return
+                channel_last_bot_reply[msg.channel.id] = now
+            else:
+                return
 
     # Ignore messages sent prior to current process startup (avoids replaying stale backlog on restart)
     msg_ts = msg.created_at.timestamp() if hasattr(msg, "created_at") else time.time()
@@ -1022,20 +1056,21 @@ async def handle_message(
             return
 
     # Route operator commands (resets, bot pause/unpause, Agora kill switch, restarts, model switching, sidecars)
-    cmd_handled = await handle_operator_command(
-        msg=msg,
-        bot=bot,
-        content=content,
-        author_name=author_name,
-        home_turn_queue=home_turn_queue,
-        reload_fn=reload_fn,
-        rules=rules,
-        is_thread_channel=is_thread_channel,
-        active_model_getter=active_model_getter,
-        active_model_setter=active_model_setter,
-    )
-    if cmd_handled:
-        return
+    if not msg.author.bot:
+        cmd_handled = await handle_operator_command(
+            msg=msg,
+            bot=bot,
+            content=content,
+            author_name=author_name,
+            home_turn_queue=home_turn_queue,
+            reload_fn=reload_fn,
+            rules=rules,
+            is_thread_channel=is_thread_channel,
+            active_model_getter=active_model_getter,
+            active_model_setter=active_model_setter,
+        )
+        if cmd_handled:
+            return
 
     saved_attachments = []
     if msg.attachments:
@@ -1132,6 +1167,14 @@ async def handle_message(
 
     if not prompt_content:
         return
+
+    if msg.channel.id == 1544953279664889888 and getattr(msg.author, "id", None) == IVY_USER_ID:
+        prompt_content = (
+            "[UPSTREAM INFRASTRUCTURE ESCALATION FROM IVY (discord-ivy-agent) IN #zero-ops]:\n"
+            "Ivy has escalated a shared /opt/zero read-only file bug, hook issue, or host-level blocker. "
+            "Verify the root cause, apply and test the fix in /workspace, commit & push to main (which updates /opt/zero live inside Ivy's container), and report the resolution concisely.\n\n"
+            f"{prompt_content}"
+        )
 
     # First: attempt to coalesce rapid split-delivery from the same author into any pending queued turn
     if try_coalesce_pending_turn(

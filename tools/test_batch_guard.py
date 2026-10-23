@@ -104,6 +104,15 @@ class TestBatchGuard(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("Proc FD Stream Guard Triggered", reason)
 
+    def test_readonly_shared_mount_blocked_with_zero_ops_escalation(self):
+        from unittest.mock import patch
+        with patch("os.path.realpath", return_value="/opt/zero/workspace/tools/bridge_formatting.py"):
+            allowed, reason = check_tool_use("edit_file", {"Path": "/workspace/tools/bridge_formatting.py"})
+            self.assertFalse(allowed)
+            self.assertIn("Read-Only Shared Mount Guard", reason)
+            self.assertIn("outbox.py --channel zero-ops", reason)
+            self.assertIn("<@1542285964213358633>", reason)
+
     def test_replace_file_content_same_file_blocks_on_fourth(self):
         for _ in range(3):
             allowed, _ = check_tool_use("replace_file_content", {"TargetFile": "/workspace/tools/bar.py"})

@@ -15,7 +15,10 @@ description: >-
 ## 2. Bot-to-Bot Addressing Discipline on Brock Guild
 - **Brock Public Channels (`#server-updates`, `#seerr-*`):**
   - Zero NEVER responds to any bot on Brock Guild public channels.
-  - If `msg.author.bot` is `True` outside excluded channels, Zero drops the message unconditionally and immediately at the front door (`handle_message`).
+  - Outside `#baseball` (`1548196929308065893`) and `#zero-ops` (`1544953279664889888`), if `msg.author.bot` is `True`, Zero drops the message unconditionally at the front door (`handle_message`).
+- **Ivy -> Zero Infrastructure Escalation Lane (`#zero-ops` `1544953279664889888`):**
+  - Ivy (`1541205716948353074`) is permitted to escalate shared `/opt/zero` read-only file bugs, hook issues, and host-level blockers to Zero in `#zero-ops` (`1544953279664889888`) via explicit `@Zero` (`<@1542285964213358633>`) mention (`outbox.py --channel zero-ops --message "<@1542285964213358633> ..." --force && outbox.py --flush`).
+  - Governed by the same Last Word Protocol and 4-second cascade cooldown as `#baseball`.
 - **Dedicated Excluded Channel Quarantine (`#baseball`):**
   - Ivy (`1541205716948353074`) is permitted to communicate directly with Zero strictly via:
     1. Direct snowflake mentions: `<@1542285964213358633>` or `<@!1542285964213358633>` (or `@Zero`).

@@ -204,6 +204,40 @@ def is_proc_fd_stream_read(cmd: str) -> bool:
     return bool(re.search(pattern, cmd))
 
 
+def check_readonly_shared_mount(target_file: str, cwd: str = "/workspace") -> tuple[bool, str]:
+    """Block attempts to edit or overwrite files residing on Zero's read-only /opt/zero shared mount."""
+    if not target_file:
+        return True, ""
+    norm_cwd = os.path.abspath(cwd or "/workspace")
+    abs_path = os.path.abspath(os.path.join(norm_cwd, target_file))
+    real_path = os.path.realpath(abs_path).replace("\\", "/")
+    if real_path.startswith("/opt/zero/"):
+        return False, (
+            f"Read-Only Shared Mount Guard: '{target_file}' resolves to '{real_path}' (owned by Zero and mounted read-only into discord-ivy-agent). "
+            "Do NOT attempt local edits or replace the symlink via cp/rm (which severs upstream updates). "
+            "Escalate the issue to Zero in #zero-ops (1544953279664889888) by running:\n"
+            "python3 /workspace/tools/outbox.py --channel zero-ops --message \"<@1542285964213358633> [Upstream Fix Request] <file & root cause>\" --force && python3 /workspace/tools/outbox.py --flush"
+        )
+    if os.path.exists(real_path) and not os.access(real_path, os.W_OK):
+        return False, (
+            f"Read-Only File Guard: '{target_file}' ('{real_path}') is read-only inside this container. "
+            "Do NOT bypass read-only mounts. Escalate the required change to Zero in #zero-ops (1544953279664889888) via:\n"
+            "python3 /workspace/tools/outbox.py --channel zero-ops --message \"<@1542285964213358633> [Upstream Fix Request] <file & root cause>\" --force && python3 /workspace/tools/outbox.py --flush"
+        )
+    return True, ""
+
+
+def is_opt_zero_symlink_tamper(cmd: str) -> bool:
+    """Detect shell commands attempting to overwrite or unlink /opt/zero symlinks inside discord-ivy-agent."""
+    if not cmd or not os.path.exists("/opt/zero/workspace"):
+        return False
+    if "/opt/zero/" in cmd and re.search(r"\b(?:cp|mv|rm|unlink|sed\s+-i|chmod|chown)\b", cmd):
+        return True
+    if re.search(r"\bcp\s+--remove-destination\b", cmd):
+        return True
+    return False
+
+
 def _check_inline_production_edit_gate(
     target_file: str,
     cwd: str,
@@ -287,6 +321,15 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                 "Proc FD Stream Guard Triggered: Reading container stdio pipes (/proc/1/fd/* or /proc/self/fd/*) "
                 "with tail/cat/head/grep blocks indefinitely on open FIFO streams and wedges the turn. "
                 "Inspect log files in /workspace/logs/ or /tmp/ directly instead."
+            )
+
+        # A0a-2. Shared /opt/zero Symlink Tamper Guard
+        if is_opt_zero_symlink_tamper(cmd):
+            return False, (
+                "Read-Only Shared Mount Guard: Do NOT unlink or overwrite /opt/zero symlinks via shell commands (cp --remove-destination / rm), "
+                "as that permanently severs discord-ivy-agent from Zero's upstream fixes. "
+                "Escalate the required change to Zero in #zero-ops (1544953279664889888) via:\n"
+                "python3 /workspace/tools/outbox.py --channel zero-ops --message \"<@1542285964213358633> [Upstream Fix Request] <file & root cause>\" --force && python3 /workspace/tools/outbox.py --flush"
             )
 
         # A0b. Unbounded Home Assistant Recorder SQLite Guard
@@ -414,6 +457,10 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
         state["consecutive_file_views"] = 0
         state["same_file_view_count"] = 0
 
+        ok_ro, ro_reason = check_readonly_shared_mount(target_file, cwd)
+        if not ok_ro:
+            return False, ro_reason
+
         ok_tier, tier_reason = _check_inline_production_edit_gate(target_file, cwd, state, state_file)
         if not ok_tier:
             return False, tier_reason
@@ -445,6 +492,10 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
         state["last_edited_file"] = ""
         state["same_file_edit_count"] = 0
         state["consecutive_git_cmds"] = 0
+
+        ok_ro, ro_reason = check_readonly_shared_mount(target_file, cwd)
+        if not ok_ro:
+            return False, ro_reason
 
         if target_file and _VERSIONED_SCRATCH_SWEEP_RE.search(target_file):
             sweeps = list(state.get("versioned_scratch_sweeps", []))
