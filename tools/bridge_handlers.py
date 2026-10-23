@@ -804,12 +804,11 @@ async def handle_on_ready(
                 startup_prompt += f"• Interrupted Task Prior to Reboot: \"{interrupted_prompt[:150]}\"\n"
 
         startup_prompt += (
-            "\nDeliver a sharp, confident, and proactive restart briefing to Ryan in #zero-chat:\n"
+            "\nDeliver a brief, direct restart check-in to Ryan in #zero-chat (1–2 sentences max):\n"
             "1. MUST start your message with the exact standard status header:\n"
             "🟢 **Zero is online and ready.**\n\n"
-            "2. Explain concisely why you restarted (e.g. what features were just deployed, upgraded, or recovered, including the active git commit).\n"
-            "3. Proactively propose 2-3 immediate, actionable next steps or open threads.\n"
-            "4. End with interactive [CHOICES: Step 1 | Step 2 | Step 3] buttons."
+            "2. State concisely why you restarted and the active git commit.\n"
+            "3. Do NOT invent filler next-step menus or artificial [CHOICES: ...] buttons, and NEVER prompt Ryan to merge, commit, or run routine git housekeeping (land any autonomous git cleanup silently before replying). Only include [CHOICES: ...] if an interrupted user task or genuine architectural decision actively requires Ryan\x27s approval."
         )
 
         if ch:
