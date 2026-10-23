@@ -30,11 +30,8 @@ from tools.forge import (
     ZERO_CHAT_CHANNEL_ID,
     ZERO_OPS_CHANNEL_ID,
     HeartbeatTracker,
-    _read_job_meta,
     _run_job_worker,
     _write_job_meta,
-    build_default_verification_cmd,
-    cancel_job,
     check_runaway_tool_loop,
     check_target_file_overlap,
     dismiss_decision,
@@ -206,6 +203,22 @@ class TestForgeEngine(unittest.TestCase):
         # Verify Chunk 1 (index 1) auto-synthesizes baseline verification_cmd when omitted
         prompt_c1 = format_chunk_prompt(build_id, 1, db_path=self.db_path, worktree_dir="/workspace")
         self.assertIn("python3 -m py_compile", prompt_c1)
+
+        # Verify dict-structured target_symbols ({"file": ..., "symbol": ...}) and shared_context
+        # both at enqueue time and when pre-existing unnormalized JSON is stored in forge.db
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            conn.execute(
+                "UPDATE forge_chunks SET target_symbols_json = ?, shared_context_json = ? WHERE build_id = ? AND chunk_index = 0",
+                (
+                    json.dumps([{"file": "tools/forge.py", "symbol": "validate_forge_plan"}]),
+                    json.dumps([{"file": "tools/forge.py", "note": "Normalize object-form target_symbols cleanly."}]),
+                    build_id,
+                ),
+            )
+        prompt_dict_syms = format_chunk_prompt(build_id, 0, db_path=self.db_path, worktree_dir="/workspace")
+        self.assertIn("`tools/forge.py:validate_forge_plan`", prompt_dict_syms)
+        self.assertIn("def validate_forge_plan", prompt_dict_syms)
+        self.assertIn("tools/forge.py: Normalize object-form target_symbols cleanly.", prompt_dict_syms)
 
         # Verify originating-channel completion envelope
         env_text = format_origin_completion_envelope(build_id, db_path=self.db_path)
@@ -468,7 +481,7 @@ class TestForgeEngine(unittest.TestCase):
         self.assertIn("**Pending Action Approvals (Decisions):**", header)
 
         # Verify shared FORGE_DB_PATH resolution prefers /baseball/data/forge.db when /baseball/data exists
-        with patch.object(forge_mod, "Path") as mock_path_cls:
+        with patch.object(forge_mod, "Path"):
             pass
         self.assertTrue(str(forge_mod.resolve_default_forge_db_path()).endswith("forge.db"))
 

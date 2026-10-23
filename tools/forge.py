@@ -35,7 +35,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import discord
@@ -588,6 +588,140 @@ def extract_symbol_snippet(
     return ""
 
 
+def _normalize_file_list(raw: Any) -> list[str]:
+    """Normalize target_files / prohibited_files into a deduplicated list of path strings."""
+    if not raw:
+        return []
+    items = [raw] if isinstance(raw, (str, dict)) else (list(raw) if isinstance(raw, (list, tuple, set)) else [])
+    out: list[str] = []
+    for item in items:
+        val = ""
+        if isinstance(item, str):
+            val = item.strip()
+        elif isinstance(item, dict):
+            val = str(item.get("file") or item.get("path") or item.get("target_file") or item.get("name") or "").strip()
+        if val and val not in out:
+            out.append(val)
+    return out
+
+
+def _normalize_target_symbols(raw: Any) -> list[str]:
+    """Normalize target_symbols (strings, {'file': ..., 'symbol': ...} dicts, or file->symbol maps) into ['file:symbol', ...] strings."""
+    if not raw:
+        return []
+
+    out: list[str] = []
+
+    def _add(val: str) -> None:
+        v = val.strip()
+        if v and v not in out:
+            out.append(v)
+
+    if isinstance(raw, str):
+        _add(raw)
+        return out
+
+    if isinstance(raw, dict):
+        known_descriptor_keys = {
+            "file", "path", "target_file", "module",
+            "symbol", "name", "function", "class", "method",
+            "symbols", "names", "functions",
+        }
+        if any(k in raw for k in known_descriptor_keys):
+            f_val = str(raw.get("file") or raw.get("path") or raw.get("target_file") or raw.get("module") or "").strip()
+            multi = raw.get("symbols") or raw.get("names") or raw.get("functions")
+            if isinstance(multi, (list, tuple, set)):
+                for s in multi:
+                    s_str = str(s or "").strip()
+                    if s_str:
+                        _add(f"{f_val}:{s_str}" if f_val and ":" not in s_str else s_str)
+            else:
+                s_val = str(
+                    raw.get("symbol") or raw.get("name") or raw.get("function") or raw.get("class") or raw.get("method") or ""
+                ).strip()
+                if s_val:
+                    _add(f"{f_val}:{s_val}" if f_val and ":" not in s_val else s_val)
+        else:
+            # Map of {"file.py": "sym"} or {"file.py": ["sym1", "sym2"]}
+            for k, v in raw.items():
+                f_key = str(k or "").strip()
+                if isinstance(v, (list, tuple, set)):
+                    for s in v:
+                        s_str = str(s or "").strip()
+                        if s_str:
+                            _add(f"{f_key}:{s_str}" if f_key and ":" not in s_str else s_str)
+                elif isinstance(v, str) and v.strip():
+                    s_str = v.strip()
+                    _add(f"{f_key}:{s_str}" if f_key and ":" not in s_str else s_str)
+        return out
+
+    if isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            for norm_s in _normalize_target_symbols(item):
+                _add(norm_s)
+        return out
+
+    _add(str(raw))
+    return out
+
+
+def _normalize_shared_context(raw: Any) -> list[str]:
+    """Normalize shared_context or context_fact_sheet (strings, lists of dicts, or dicts) into a list of strings."""
+    if not raw:
+        return []
+
+    out: list[str] = []
+
+    def _add(val: str) -> None:
+        v = val.strip()
+        if v and v not in out:
+            out.append(v)
+
+    if isinstance(raw, str):
+        _add(raw)
+        return out
+
+    if isinstance(raw, dict):
+        descriptor_keys = {"file", "path", "symbol", "title", "note", "description", "content", "snippet", "summary", "rule"}
+        if any(k in raw for k in descriptor_keys):
+            head = str(raw.get("file") or raw.get("path") or raw.get("title") or raw.get("symbol") or "").strip()
+            body = str(
+                raw.get("note")
+                or raw.get("description")
+                or raw.get("content")
+                or raw.get("snippet")
+                or raw.get("summary")
+                or raw.get("rule")
+                or ""
+            ).strip()
+            if head and body:
+                _add(f"{head}: {body}")
+            elif body:
+                _add(body)
+            elif head:
+                _add(head)
+            else:
+                _add(json.dumps(raw, sort_keys=True))
+        else:
+            for k, v in raw.items():
+                k_str = str(k or "").strip()
+                v_str = str(v or "").strip() if not isinstance(v, (dict, list)) else json.dumps(v)
+                if k_str and v_str:
+                    _add(f"{k_str}: {v_str}")
+                elif v_str:
+                    _add(v_str)
+        return out
+
+    if isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            for norm_c in _normalize_shared_context(item):
+                _add(norm_c)
+        return out
+
+    _add(str(raw))
+    return out
+
+
 def check_target_file_overlap(
     plan: dict,
     db_path: Path | str = FORGE_DB_PATH,
@@ -597,7 +731,7 @@ def check_target_file_overlap(
     planned_pairs: set[tuple[str, str]] = set()
     for ch in plan.get("chunks", []):
         ch_repo = str(Path(str(ch.get("repo") or default_repo).strip()).resolve())
-        for tf in ch.get("target_files", []):
+        for tf in _normalize_file_list(ch.get("target_files", [])):
             norm_tf = str(tf).strip().lstrip("./")
             if norm_tf:
                 planned_pairs.add((ch_repo, norm_tf))
@@ -654,8 +788,8 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     if not (repo_path / ".git").exists():
         return False, f"Target repo '{repo_str}' is not a valid git repository."
 
-    fact_sheet = plan.get("context_fact_sheet")
-    if not isinstance(fact_sheet, list) or not fact_sheet or not all(isinstance(x, str) and x.strip() for x in fact_sheet):
+    fact_sheet = _normalize_shared_context(plan.get("context_fact_sheet"))
+    if not fact_sheet:
         return False, "Plan must include a non-empty 'context_fact_sheet' list of architectural invariants."
 
     chunks = plan.get("chunks")
@@ -672,8 +806,8 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
         ch_repo_path = Path(ch_repo_str).resolve()
         if not (ch_repo_path / ".git").exists():
             return False, f"Chunk {idx} ('{ch_title}') repo '{ch_repo_str}' is not a valid git repository."
-        t_files = ch.get("target_files")
-        if not isinstance(t_files, list) or not t_files:
+        t_files = _normalize_file_list(ch.get("target_files"))
+        if not t_files:
             return False, f"Chunk {idx} ('{ch_title}') must specify a non-empty 'target_files' list."
         instr = str(ch.get("instructions") or "").strip()
         if len(instr) < 15:
@@ -1054,7 +1188,8 @@ def enqueue_build(
     touches_core = 1 if _detect_touches_core_bridge(plan) else 0
     default_repo = str(plan.get("repo") or "/workspace").strip()
     objective = str(plan.get("objective") or plan["title"]).strip()
-    build_shared_ctx = plan.get("shared_context") or []
+    build_shared_ctx = _normalize_shared_context(plan.get("shared_context"))
+    norm_fact_sheet = _normalize_shared_context(plan.get("context_fact_sheet"))
 
     with get_db_connection(db_path) as conn:
         conn.execute(
@@ -1075,7 +1210,7 @@ def enqueue_build(
                 int(plan["origin_channel_id"]),
                 int(plan["origin_thread_id"]) if plan.get("origin_thread_id") else None,
                 plan.get("origin_conv_id"),
-                json.dumps(plan["context_fact_sheet"]),
+                json.dumps(norm_fact_sheet),
                 json.dumps(build_shared_ctx),
                 now,
                 now,
@@ -1085,7 +1220,10 @@ def enqueue_build(
         for idx, ch in enumerate(plan["chunks"]):
             chunk_id = f"{build_id}-c{idx}"
             ch_repo = str(ch.get("repo") or default_repo).strip()
-            t_files = ch.get("target_files", [])
+            t_files = _normalize_file_list(ch.get("target_files", []))
+            t_symbols = _normalize_target_symbols(ch.get("target_symbols"))
+            ch_shared_ctx = _normalize_shared_context(ch.get("shared_context"))
+            p_files = _normalize_file_list(ch.get("prohibited_files", []))
             v_cmd = str(ch.get("verification_cmd") or "").strip()
             conn.execute(
                 """
@@ -1103,9 +1241,9 @@ def enqueue_build(
                     ch_repo,
                     ch.get("worker_model") or DEFAULT_WORKER_MODEL,
                     json.dumps(t_files),
-                    json.dumps(ch.get("target_symbols", [])),
-                    json.dumps(ch.get("shared_context", [])),
-                    json.dumps(ch.get("prohibited_files", [])),
+                    json.dumps(t_symbols),
+                    json.dumps(ch_shared_ctx),
+                    json.dumps(p_files),
                     ch["instructions"].strip(),
                     v_cmd,
                 ),
@@ -1155,12 +1293,18 @@ def format_chunk_prompt(
 
     prior_chunks = [c for c in chunks if c["chunk_index"] < chunk_index]
     upcoming_chunks = [c for c in chunks if c["chunk_index"] > chunk_index]
-    fact_sheet = json.loads(build["fact_sheet_json"] or "[]")
-    build_shared_ctx = json.loads(build["shared_context_json"] or "[]") if "shared_context_json" in build.keys() else []
-    target_files = json.loads(target_chunk["target_files_json"] or "[]")
-    target_symbols = json.loads(target_chunk["target_symbols_json"] or "[]") if "target_symbols_json" in target_chunk.keys() else []
-    chunk_shared_ctx = json.loads(target_chunk["shared_context_json"] or "[]") if "shared_context_json" in target_chunk.keys() else []
-    prohibited_files = json.loads(target_chunk["prohibited_files_json"] or "[]")
+    fact_sheet = _normalize_shared_context(json.loads(build["fact_sheet_json"] or "[]"))
+    build_shared_ctx = _normalize_shared_context(
+        json.loads(build["shared_context_json"] or "[]") if "shared_context_json" in build.keys() else []
+    )
+    target_files = _normalize_file_list(json.loads(target_chunk["target_files_json"] or "[]"))
+    target_symbols = _normalize_target_symbols(
+        json.loads(target_chunk["target_symbols_json"] or "[]") if "target_symbols_json" in target_chunk.keys() else []
+    )
+    chunk_shared_ctx = _normalize_shared_context(
+        json.loads(target_chunk["shared_context_json"] or "[]") if "shared_context_json" in target_chunk.keys() else []
+    )
+    prohibited_files = _normalize_file_list(json.loads(target_chunk["prohibited_files_json"] or "[]"))
 
     effective_repo = (target_chunk["repo"] if "repo" in target_chunk.keys() and target_chunk["repo"] else build["repo"]) or "/workspace"
     wt_str = worktree_dir or effective_repo
@@ -2876,7 +3020,7 @@ def main():
     p_dec.add_argument("--ttl", type=float, default=7200.0)
     p_dec.add_argument("--post", action="store_true", help="Post immediately via Discord REST API")
 
-    p_boot = sub.add_parser("reconcile", help="Run boot reconciliation and worktree cleanup")
+    sub.add_parser("reconcile", help="Run boot reconciliation and worktree cleanup")
 
     # Native `forge.py job <action>` subcommands (absorbs detached_runner.py)
     p_job = sub.add_parser("job", help="Manage detached background shell jobs in forge_jobs")
