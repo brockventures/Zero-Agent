@@ -377,11 +377,38 @@ class TestBatchGuard(unittest.TestCase):
             'python3 -c \'with open("/baseball/big-projections/pitcher_components.py", "w") as f: f.write("x=1")\'',
             "sed -i 's/foo/bar/g' /baseball/big-projections/hitter_components.py",
             "cat >> /workspace/tools/bridge.py << 'EOF'\n# test\nEOF",
+            'python3 - << \'EOF\'\nwith open("/docker/shelfmark/custom_patches/openlibrary.py", "w") as f: f.write("x=1")\nEOF',
         ]
         for cmd in bypass_cmds:
             allowed, reason = check_batching(cmd)
             self.assertFalse(allowed, f"Expected shell mutation bypass to be blocked: {cmd}")
             self.assertIn("FORGE Shell Mutation Bypass Blocked", reason)
+
+    def test_inline_heredoc_and_command_budget_gated_after_90s(self):
+        from unittest.mock import patch
+        base_now = 1_800_200_000.0
+        with patch("time.time", return_value=base_now):
+            # 2 inline python heredoc probes + 1 curl reset
+            self.assertTrue(check_batching("python3 - << 'EOF'\nprint(1)\nEOF")[0])
+            self.assertTrue(check_batching("python3 - << 'EOF'\nprint(2)\nEOF")[0])
+            self.assertTrue(check_batching("curl -s http://127.0.0.1:8769/health && echo ok")[0])
+
+        # At +100s (>90s Tier 1 ceiling), 3rd inline Python probe is blocked by 90s Calibration Offload Gate
+        with patch("time.time", return_value=base_now + 100.0):
+            allowed, reason = check_batching("python3 - << 'EOF'\nprint(3)\nEOF")
+            self.assertFalse(allowed)
+            self.assertIn("FORGE 90s Calibration Offload Gate Triggered", reason)
+
+        # Command budget gate: >8 non-probe run_command steps after 90s are blocked
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        with patch("time.time", return_value=base_now):
+            for i in range(8):
+                self.assertTrue(check_batching(f"curl -s http://127.0.0.1:8769/health && echo {i}")[0])
+        with patch("time.time", return_value=base_now + 100.0):
+            allowed, reason = check_batching("curl -s http://127.0.0.1:8769/health && echo 9")
+            self.assertFalse(allowed)
+            self.assertIn("FORGE 90s Command Budget Gate Triggered", reason)
 
     def test_hook_self_preservation_syntax_guard(self):
         allowed, reason = check_tool_use(

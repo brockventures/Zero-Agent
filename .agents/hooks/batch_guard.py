@@ -33,6 +33,7 @@ MAX_SAME_SCRATCH_SCRIPT_RUNS = 3
 MAX_INLINE_PRODUCTION_FILES = 2
 FORGE_TIER1_INLINE_SECONDS = 90.0
 MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S = 2
+MAX_INLINE_RUN_COMMANDS_AFTER_90S = 8
 TURN_RESET_IDLE_SECONDS = 45.0
 TURN_STATE_EXPIRY_SECONDS = 900.0
 
@@ -49,8 +50,9 @@ _HEAVY_CLI_BENCHMARK_OR_MIGRATE_RE = re.compile(
     r"(?:run_unified_benchmark_gate\.py|build_locked_evaluation_datasets|--migrate-db\b|fast_migrate_[a-zA-Z0-9_-]*\.py\b|backfill_[a-zA-Z0-9_-]*?splits[a-zA-Z0-9_-]*\.py\b)"
 )
 
+_DOCKER_ROOT_PREFIX = re.escape(os.environ.get("NAS_DOCKER_ROOT", "/" + "volume1/docker").rstrip("/"))
 _PROD_SOURCE_PATH_RE = re.compile(
-    r"(?P<path>(?:/baseball/big-projections|/baseball/big_board_pro|/workspace/tools|/workspace/\.agents)/[a-zA-Z0-9_./-]+\.(?:py|R|sh))\b"
+    rf"(?P<path>(?:/baseball/big-projections|/baseball/big_board_pro|/workspace/tools|/workspace/\.agents|{_DOCKER_ROOT_PREFIX}/[a-zA-Z0-9_.-]+|/docker/[a-zA-Z0-9_.-]+|/app/[a-zA-Z0-9_.-]+)/[a-zA-Z0-9_./-]+\.(?:py|R|sh|js|ts|tsx|jsx))\b"
 )
 
 
@@ -71,6 +73,7 @@ def _default_state(now: float = 0.0) -> dict:
         "inline_prod_files": [],
         "scratch_script_runs": {},
         "total_scratch_runs": 0,
+        "turn_run_commands": 0,
     }
 
 
@@ -545,14 +548,16 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
         preserved_sweeps = list(state.get("versioned_scratch_sweeps", []))
         preserved_runs = dict(state.get("scratch_script_runs", {}))
         preserved_total_scratch = int(state.get("total_scratch_runs", 0))
+        preserved_turn_cmds = int(state.get("turn_run_commands", 0))
         preserved_start = float(state.get("turn_start_time", now) or now)
         state = _default_state(now)
         state["inline_prod_files"] = preserved_prod
         state["versioned_scratch_sweeps"] = preserved_sweeps
         state["scratch_script_runs"] = preserved_runs
         state["total_scratch_runs"] = preserved_total_scratch
-        # Keep original turn_start_time if the turn has already started mutating files or running scratch sweeps
-        if preserved_total_scratch > 0 or len(preserved_prod) > 0:
+        state["turn_run_commands"] = preserved_turn_cmds
+        # Keep original turn_start_time if the turn has already started mutating files, running commands, or running scratch sweeps
+        if preserved_total_scratch > 0 or len(preserved_prod) > 0 or preserved_turn_cmds > 0:
             state["turn_start_time"] = preserved_start
         else:
             state["turn_start_time"] = now
@@ -574,10 +579,12 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
             state["inline_prod_files"] = []
             state["scratch_script_runs"] = {}
             state["total_scratch_runs"] = 0
+            state["turn_run_commands"] = 0
             state["turn_start_time"] = now
         elif "detached_runner.py" in cmd and "start" in cmd:
             state["scratch_script_runs"] = {}
             state["total_scratch_runs"] = 0
+            state["turn_run_commands"] = 0
             state["turn_start_time"] = now
 
         # A00-del. File Deletion & Decision Card Tamper Gate
@@ -600,9 +607,13 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                 "(or enqueue a multi-chunk ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
             )
 
-        # A00b. Repeated Same-Scratch-Script & >90s Calibration Loop Gate
+        # A00b. Repeated Same-Scratch-Script, Inline Heredoc & >90s Calibration / Command Loop Gate
         if os.environ.get("FORGE_WORKER_ACTIVE") != "1" and not os.path.abspath(cwd or "/workspace").replace("\\", "/").startswith("/tmp/forge-wt-"):
             if "forge.py" not in cmd and "detached_runner.py" not in cmd and "modal_harness.py" not in cmd:
+                turn_cmds = int(state.get("turn_run_commands", 0)) + 1
+                state["turn_run_commands"] = turn_cmds
+                turn_elapsed = now - float(state.get("turn_start_time", now) or now)
+
                 scratch_m = _SCRATCH_SCRIPT_EXEC_RE.search(cmd)
                 if scratch_m:
                     raw_script = scratch_m.group("script")
@@ -623,7 +634,6 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                             "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\""
                         )
 
-                    turn_elapsed = now - float(state.get("turn_start_time", now) or now)
                     if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
                         save_state(state, state_file)
                         return False, (
@@ -634,6 +644,29 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                             "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\"\n"
                             "(or offload to '/baseball/big-projections/modal_harness.py' / enqueue a ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
                         )
+                elif is_inline_python_probe(cmd):
+                    total_scratch = int(state.get("total_scratch_runs", 0)) + 1
+                    state["total_scratch_runs"] = total_scratch
+                    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
+                        save_state(state, state_file)
+                        return False, (
+                            f"FORGE 90s Calibration Offload Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
+                            f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {total_scratch} inline Python / scratch probes. "
+                            "Do not run multi-minute iterative heredoc or SSH loops inline in chat. Package the task into a script and launch via:\n"
+                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
+                            "(or enqueue a multi-chunk ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
+                        )
+
+                if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and turn_cmds > MAX_INLINE_RUN_COMMANDS_AFTER_90S:
+                    save_state(state, state_file)
+                    return False, (
+                        f"FORGE 90s Command Budget Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
+                        f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {turn_cmds} inline shell commands "
+                        f"(limit after 90s: {MAX_INLINE_RUN_COMMANDS_AFTER_90S}). Long-running multi-step builds, remote patches, and "
+                        "iterative debugging must be offloaded to #forge via:\n"
+                        "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
+                        "(or 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
+                    )
 
         # Agora Fast-Path Invariant
         if re.search(r"agora_play\.py\s+(?:order|move)\b", cmd):
