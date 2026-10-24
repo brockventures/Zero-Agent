@@ -747,13 +747,13 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         </div>
         <span class="host-tag">plexrequests.ryanbrock.org</span>
       </a>
-      <a class="card" href="https://books.ryanbrock.org" target="_blank" rel="noopener">
+      <a class="card" href="https://app.plex.tv" target="_blank" rel="noopener">
         <div>
-          <div class="icon">📚</div>
-          <h2>Books Library <span class="arrow">→</span></h2>
-          <p>Browse, read in-browser, or send EPUBs &amp; audiobooks to your e-reader via Calibre-Web.</p>
+          <div class="icon">🍿</div>
+          <h2>Plex <span class="arrow">→</span></h2>
+          <p>Stream movies, shows, and live channels in the Plex web player.</p>
         </div>
-        <span class="host-tag">books.ryanbrock.org</span>
+        <span class="host-tag">app.plex.tv</span>
       </a>
       <a class="card" href="https://bookrequests.ryanbrock.org" target="_blank" rel="noopener">
         <div>
@@ -763,13 +763,13 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         </div>
         <span class="host-tag">bookrequests.ryanbrock.org</span>
       </a>
-      <a class="card" href="https://app.plex.tv" target="_blank" rel="noopener">
+      <a class="card" href="https://books.ryanbrock.org" target="_blank" rel="noopener">
         <div>
-          <div class="icon">🍿</div>
-          <h2>Plex <span class="arrow">→</span></h2>
-          <p>Stream movies, shows, and live channels in the Plex web player.</p>
+          <div class="icon">📚</div>
+          <h2>Books Library <span class="arrow">→</span></h2>
+          <p>Browse, read in-browser, or send EPUBs &amp; audiobooks to your e-reader via Calibre-Web.</p>
         </div>
-        <span class="host-tag">app.plex.tv</span>
+        <span class="host-tag">books.ryanbrock.org</span>
       </a>
     </div>
     <footer>
