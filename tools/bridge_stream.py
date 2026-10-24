@@ -291,6 +291,13 @@ def check_transcript_turn_status(
                             }
 
                         content = (data.get("content") or "").strip()
+                        if content == "[NO_REPLY]":
+                            return {
+                                "is_complete": True,
+                                "content": "[NO_REPLY]",
+                                "step_index": sidx,
+                                "reason": "no_reply",
+                            }
                         if content:
                             if any(phrase in content.lower() for phrase in (
                                 "no tools were called",

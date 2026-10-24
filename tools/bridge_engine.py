@@ -498,10 +498,7 @@ class TurnCoordinator:
                 t_status = check_transcript_turn_status(
                     str(self.conv_id), min_step_index=self.baseline_step_index
                 )
-                if (
-                    t_status.get("has_active_tool")
-                    or t_status.get("reason") in ("intermediate_task_wait", "empty_or_leak_content")
-                ):
+                if t_status.get("has_active_tool"):
                     return False, ""
             except Exception:
                 pass
@@ -822,11 +819,7 @@ class TurnCoordinator:
                         t_status = check_transcript_turn_status(
                             str(active_cid), min_step_index=self.baseline_step_index
                         )
-                        if (
-                            pending_sdk_tasks
-                            or t_status.get("has_active_tool")
-                            or t_status.get("reason") == "intermediate_task_wait"
-                        ):
+                        if pending_sdk_tasks or t_status.get("has_active_tool"):
                             print(
                                 f"[BridgeEngine] ⏳ Intermediate result received in #{worker_name} while background task/tool active "
                                 f"(tasks={len(pending_sdk_tasks)}, reason={t_status.get('reason')}); continuing stdout stream..."
