@@ -676,6 +676,42 @@ class TestForgeEngine(unittest.TestCase):
                 row_all = conn.execute("SELECT forge_message_id FROM forge_jobs WHERE id = ?", (task_id,)).fetchone()
                 self.assertIsNone(row_all["forge_message_id"])
 
+            # 5. Verify remote channel sweep catches completed cards from unmounted peer containers
+            mock_get_resp = MagicMock()
+            mock_get_resp.status_code = 200
+            mock_get_resp.json.return_value = [
+                {
+                    "id": str(forge_mod.FORGE_HEADER_MESSAGE_ID),
+                    "timestamp": "2026-10-20T00:00:00.000000+00:00",
+                    "embeds": [],
+                },
+                {
+                    "id": "1563423123603324939",
+                    "timestamp": "2026-10-20T00:00:00.000000+00:00",
+                    "edited_timestamp": "2026-10-20T01:00:00.000000+00:00",
+                    "embeds": [
+                        {
+                            "title": "✅ Epic 40: Refresh BIG Peak",
+                            "description": "**COMPLETED** · `big-projections`",
+                            "footer": {"text": "Build ID: fg-1792819519-epic-40 · Auto-clears in 1h"},
+                        }
+                    ],
+                },
+            ]
+            mock_del_resp = MagicMock()
+            mock_del_resp.status_code = 204
+            with patch.object(forge_mod, "_get_discord_token", return_value="mock-token"), patch(
+                "requests.get", return_value=mock_get_resp
+            ), patch("requests.delete", return_value=mock_del_resp) as mock_del:
+                swept = prune_completed_build_widgets(
+                    ttl_seconds=3600.0,
+                    db_path=self.db_path,
+                    delete_remote=True,
+                    force_channel_sweep=True,
+                )
+                self.assertIn("fg-1792819519-epic-40", swept)
+                self.assertTrue(mock_del.called)
+
 
 if __name__ == "__main__":
     unittest.main()

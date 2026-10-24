@@ -1358,6 +1358,10 @@ def post_or_update_job_widget(
     return None
 
 
+_LAST_REMOTE_CHANNEL_SWEEP_TS: float = 0.0
+REMOTE_CHANNEL_SWEEP_INTERVAL_SECONDS: float = 300.0
+
+
 def prune_completed_job_widgets(
     ttl_seconds: float = COMPLETED_WIDGET_TTL_SECONDS,
     db_path: Path | str = FORGE_DB_PATH,
@@ -1367,48 +1371,129 @@ def prune_completed_job_widgets(
     """Delete Discord embed cards in #forge for completed background jobs older than `ttl_seconds` (default 1h)."""
     cutoff = time.time() - float(ttl_seconds)
     pruned_ids: list[str] = []
-    with get_db_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT id, forge_message_id FROM forge_jobs
-            WHERE status = 'completed'
-              AND forge_message_id IS NOT NULL
-              AND COALESCE(end_time, start_time) <= ?
-            """,
-            (cutoff,),
-        ).fetchall()
+    db_paths = [Path(db_path)] + _get_peer_forge_db_paths(db_path)
 
     token = _get_discord_token(for_forge_channel=True) if delete_remote else None
     headers = {"Authorization": f"Bot {token}"} if token else {}
-    for r in rows:
-        j_id = r["id"]
-        msg_id = r["forge_message_id"]
-        deleted_ok = not delete_remote
-        if delete_remote and token and msg_id:
-            try:
-                url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
-                resp = requests.delete(url, headers=headers, timeout=10)
-                if resp.status_code in (200, 204, 404):
-                    deleted_ok = True
-            except Exception:
-                pass
-        if deleted_ok:
-            with get_db_connection(db_path) as conn:
-                conn.execute(
-                    "UPDATE forge_jobs SET forge_message_id = NULL WHERE id = ?",
-                    (j_id,),
-                )
-            meta_file = _get_job_dir(j_id) / "meta.json"
-            if meta_file.exists():
+
+    for target_db in db_paths:
+        try:
+            with get_db_connection(target_db) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, forge_message_id FROM forge_jobs
+                    WHERE status = 'completed'
+                      AND forge_message_id IS NOT NULL
+                      AND COALESCE(end_time, start_time) <= ?
+                    """,
+                    (cutoff,),
+                ).fetchall()
+        except Exception:
+            continue
+
+        for r in rows:
+            j_id = r["id"]
+            msg_id = r["forge_message_id"]
+            deleted_ok = not delete_remote
+            if delete_remote and token and msg_id:
                 try:
-                    m = json.loads(meta_file.read_text(encoding="utf-8"))
-                    m["forge_message_id"] = None
-                    meta_file.write_text(json.dumps(m, indent=2), encoding="utf-8")
+                    url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
+                    resp = requests.delete(url, headers=headers, timeout=10)
+                    if resp.status_code in (200, 204, 404):
+                        deleted_ok = True
                 except Exception:
                     pass
-            pruned_ids.append(j_id)
+            if deleted_ok:
+                try:
+                    with get_db_connection(target_db) as conn:
+                        conn.execute(
+                            "UPDATE forge_jobs SET forge_message_id = NULL WHERE id = ?",
+                            (j_id,),
+                        )
+                except Exception:
+                    pass
+                meta_file = _get_job_dir(j_id) / "meta.json"
+                if meta_file.exists():
+                    try:
+                        m = json.loads(meta_file.read_text(encoding="utf-8"))
+                        m["forge_message_id"] = None
+                        meta_file.write_text(json.dumps(m, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
+                if j_id not in pruned_ids:
+                    pruned_ids.append(j_id)
 
     return pruned_ids
+
+
+def _sweep_stale_forge_channel_embeds(
+    cutoff: float,
+    forge_channel_id: int,
+    token: str,
+    db_paths: list[Path],
+) -> list[str]:
+    """Fallback channel-level sweep: delete completed #forge embed cards older than `cutoff` directly via Discord API.
+
+    Catches completed build/job cards whose originating SQLite DB lives inside an unmounted peer container
+    (e.g. `/baseball/data/forge.db` when inspected from `discord-antigravity-agent`).
+    """
+    swept_ids: list[str] = []
+    headers = {"Authorization": f"Bot {token}"}
+    try:
+        url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages?limit=30"
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return swept_ids
+        messages = resp.json()
+        if not isinstance(messages, list):
+            return swept_ids
+    except Exception:
+        return swept_ids
+
+    for msg in messages:
+        try:
+            msg_id_raw = msg.get("id")
+            if not msg_id_raw or int(msg_id_raw) == FORGE_HEADER_MESSAGE_ID:
+                continue
+            embeds = msg.get("embeds") or []
+            if not embeds:
+                continue
+            emb = embeds[0]
+            title = str(emb.get("title") or "")
+            desc = str(emb.get("description") or "")
+            if not (title.startswith("✅") or desc.startswith("**COMPLETED**")):
+                continue
+            ts_str = msg.get("edited_timestamp") or msg.get("timestamp")
+            if not ts_str:
+                continue
+            msg_ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).timestamp()
+            if msg_ts > cutoff:
+                continue
+
+            del_url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id_raw}"
+            del_resp = requests.delete(del_url, headers=headers, timeout=10)
+            if del_resp.status_code in (200, 204, 404):
+                footer_text = str((emb.get("footer") or {}).get("text") or "")
+                id_match = re.search(r"(?:Build|Job)\s+ID:\s*([A-Za-z0-9_-]+)", footer_text)
+                entity_id = id_match.group(1) if id_match else f"msg-{msg_id_raw}"
+                swept_ids.append(entity_id)
+                for target_db in db_paths:
+                    try:
+                        with get_db_connection(target_db) as conn:
+                            conn.execute(
+                                "UPDATE forge_builds SET forge_message_id = NULL WHERE forge_message_id = ? OR id = ?",
+                                (int(msg_id_raw), entity_id),
+                            )
+                            conn.execute(
+                                "UPDATE forge_jobs SET forge_message_id = NULL WHERE forge_message_id = ? OR id = ?",
+                                (int(msg_id_raw), entity_id),
+                            )
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+    return swept_ids
 
 
 def prune_completed_build_widgets(
@@ -1416,43 +1501,56 @@ def prune_completed_build_widgets(
     db_path: Path | str = FORGE_DB_PATH,
     forge_channel_id: int = FORGE_CHANNEL_ID,
     delete_remote: bool = True,
+    force_channel_sweep: bool = False,
 ) -> list[str]:
     """Delete Discord embed cards in #forge for completed builds and background jobs older than `ttl_seconds` (default 1h)."""
-    cutoff = time.time() - float(ttl_seconds)
+    global _LAST_REMOTE_CHANNEL_SWEEP_TS
+    now = time.time()
+    cutoff = now - float(ttl_seconds)
     pruned_ids: list[str] = []
-    with get_db_connection(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT id, forge_message_id FROM forge_builds
-            WHERE status = 'completed'
-              AND forge_message_id IS NOT NULL
-              AND updated_at <= ?
-            """,
-            (cutoff,),
-        ).fetchall()
+    db_paths = [Path(db_path)] + _get_peer_forge_db_paths(db_path)
 
     token = _get_discord_token(for_forge_channel=True) if delete_remote else None
-
     headers = {"Authorization": f"Bot {token}"} if token else {}
-    for r in rows:
-        b_id = r["id"]
-        msg_id = r["forge_message_id"]
-        deleted_ok = not delete_remote
-        if delete_remote and token and msg_id:
-            try:
-                url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
-                resp = requests.delete(url, headers=headers, timeout=10)
-                if resp.status_code in (200, 204, 404):
-                    deleted_ok = True
-            except Exception:
-                pass
-        if deleted_ok:
-            with get_db_connection(db_path) as conn:
-                conn.execute(
-                    "UPDATE forge_builds SET forge_message_id = NULL WHERE id = ?",
-                    (b_id,),
-                )
-            pruned_ids.append(b_id)
+
+    for target_db in db_paths:
+        try:
+            with get_db_connection(target_db) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, forge_message_id FROM forge_builds
+                    WHERE status = 'completed'
+                      AND forge_message_id IS NOT NULL
+                      AND updated_at <= ?
+                    """,
+                    (cutoff,),
+                ).fetchall()
+        except Exception:
+            continue
+
+        for r in rows:
+            b_id = r["id"]
+            msg_id = r["forge_message_id"]
+            deleted_ok = not delete_remote
+            if delete_remote and token and msg_id:
+                try:
+                    url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
+                    resp = requests.delete(url, headers=headers, timeout=10)
+                    if resp.status_code in (200, 204, 404):
+                        deleted_ok = True
+                except Exception:
+                    pass
+            if deleted_ok:
+                try:
+                    with get_db_connection(target_db) as conn:
+                        conn.execute(
+                            "UPDATE forge_builds SET forge_message_id = NULL WHERE id = ?",
+                            (b_id,),
+                        )
+                except Exception:
+                    pass
+                if b_id not in pruned_ids:
+                    pruned_ids.append(b_id)
 
     pruned_job_ids = prune_completed_job_widgets(
         ttl_seconds=ttl_seconds,
@@ -1460,7 +1558,23 @@ def prune_completed_build_widgets(
         forge_channel_id=forge_channel_id,
         delete_remote=delete_remote,
     )
-    return pruned_ids + pruned_job_ids
+    all_pruned = pruned_ids + [jid for jid in pruned_job_ids if jid not in pruned_ids]
+
+    if delete_remote and token and (
+        force_channel_sweep or (now - _LAST_REMOTE_CHANNEL_SWEEP_TS) >= REMOTE_CHANNEL_SWEEP_INTERVAL_SECONDS
+    ):
+        _LAST_REMOTE_CHANNEL_SWEEP_TS = now
+        swept = _sweep_stale_forge_channel_embeds(
+            cutoff=cutoff,
+            forge_channel_id=forge_channel_id,
+            token=token,
+            db_paths=db_paths,
+        )
+        for sid in swept:
+            if sid not in all_pruned:
+                all_pruned.append(sid)
+
+    return all_pruned
 
 
 def enqueue_build(
@@ -3348,6 +3462,12 @@ def sync_forge_channel_header(
     """Update the #forge header message in place whenever active builds, tasks, or decisions change."""
     if not force and Path(db_path).resolve() != FORGE_DB_PATH.resolve():
         return False
+
+    if not force:
+        try:
+            prune_completed_build_widgets(db_path=db_path, forge_channel_id=forge_channel_id)
+        except Exception:
+            pass
 
     content = format_forge_channel_header(db_path=db_path)
     cache_file = DATA_DIR / ".forge_header_cache.txt"
