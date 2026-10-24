@@ -334,8 +334,9 @@ def extract_frontmatter(content: str) -> Tuple[dict, str]:
 
 
 class TranscriptIndexer:
-    def __init__(self, db_path: str = DB_PATH):
+    def __init__(self, db_path: str = DB_PATH, use_proxy: bool = True):
         self.db_path = db_path
+        self.use_proxy = use_proxy
         self.con = get_db(db_path, load_vec=True)
         cur = self.con.cursor()
         has_tables = cur.execute(
@@ -821,8 +822,37 @@ class TranscriptIndexer:
         }
 
         # Check if vector capability is available
-        model = get_embedding_model() if mode in ("hybrid", "vector") else None
-        can_vector = self.has_vec and (model is not None)
+        query_bytes = None
+        can_vector = False
+        if mode in ("hybrid", "vector") and self.has_vec:
+            if _EMBEDDING_MODEL is not None:
+                import numpy as np
+                q_emb = list(_EMBEDDING_MODEL.embed([query]))[0]
+                query_bytes = np.array(q_emb, dtype=np.float32).tobytes()
+                can_vector = True
+            elif self.use_proxy and os.environ.get("TRANSCRIPT_DISABLE_PROXY") != "1":
+                try:
+                    import base64
+                    import urllib.parse
+                    import urllib.request
+                    port = int(os.environ.get("ZERO_HEALTH_PORT", 8769))
+                    url = f"http://127.0.0.1:{port}/api/embed?q={urllib.parse.quote(query)}"
+                    req = urllib.request.Request(url, headers={"User-Agent": "Zero-TranscriptIndex/1.0"})
+                    with urllib.request.urlopen(req, timeout=8.0) as resp:
+                        if resp.getcode() == 200:
+                            payload = json.loads(resp.read().decode("utf-8"))
+                            if payload.get("embedding_b64"):
+                                query_bytes = base64.b64decode(payload["embedding_b64"])
+                                can_vector = True
+                except Exception:
+                    pass
+            if not can_vector:
+                model = get_embedding_model()
+                if model is not None:
+                    import numpy as np
+                    q_emb = list(model.embed([query]))[0]
+                    query_bytes = np.array(q_emb, dtype=np.float32).tobytes()
+                    can_vector = True
 
         # Fallback to fts if vector search is impossible
         if mode == "vector" and not can_vector:
@@ -830,13 +860,6 @@ class TranscriptIndexer:
             return results
         if mode == "hybrid" and not can_vector:
             mode = "fts"
-
-        # Embed query once for all targets if vector needed
-        query_bytes = None
-        if mode in ("hybrid", "vector") and model:
-            import numpy as np
-            q_emb = list(model.embed([query]))[0]
-            query_bytes = np.array(q_emb, dtype=np.float32).tobytes()
 
         fts_query = self._format_query(query)
         candidate_k = max(limit * 3, 25)

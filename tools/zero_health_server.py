@@ -716,6 +716,53 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             content_type = "application/json"
             status_code = 200
 
+        # 3b. Shared Hybrid Search & Embedding Proxy (eliminates duplicate 250MB+ ONNX loads in CLI tools)
+        elif clean_path in ("/api/search",):
+            q = query_params.get("q", [""])[0]
+            target = query_params.get("target", ["all"])[0]
+            mode = query_params.get("mode", ["hybrid"])[0]
+            try:
+                limit = int(query_params.get("limit", ["10"])[0])
+            except ValueError:
+                limit = 10
+            try:
+                rrf_k = int(query_params.get("rrf_k", ["60"])[0])
+            except ValueError:
+                rrf_k = 60
+            try:
+                from tools.transcript_index import TranscriptIndexer
+                indexer = TranscriptIndexer(use_proxy=False)
+                try:
+                    payload = indexer.search(q, target=target, limit=limit, mode=mode, rrf_k=rrf_k)
+                finally:
+                    indexer.close()
+                status_code = 200
+            except Exception as e:
+                payload = {"error": str(e)}
+                status_code = 500
+            body = json.dumps(payload, indent=2).encode("utf-8")
+            content_type = "application/json"
+
+        elif clean_path in ("/api/embed",):
+            q = query_params.get("q", [""])[0]
+            try:
+                import numpy as np
+                from tools.transcript_index import get_embedding_model
+                model = get_embedding_model()
+                if model is None:
+                    payload = {"error": "FastEmbed model unavailable"}
+                    status_code = 503
+                else:
+                    q_emb = list(model.embed([q]))[0]
+                    emb_b64 = base64.b64encode(np.array(q_emb, dtype=np.float32).tobytes()).decode("ascii")
+                    payload = {"embedding_b64": emb_b64}
+                    status_code = 200
+            except Exception as e:
+                payload = {"error": str(e)}
+                status_code = 500
+            body = json.dumps(payload).encode("utf-8")
+            content_type = "application/json"
+
         # 4. Health JSON Endpoint
         elif clean_path in ("/api/health", "/health", "/api/status", "/status"):
             if agent == "ivy":

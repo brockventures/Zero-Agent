@@ -1,9 +1,6 @@
-import os
 import sys
 import json
-import sqlite3
 import pytest
-from pathlib import Path
 
 # Ensure workspace is on sys.path
 sys.path.insert(0, "/workspace")
@@ -16,7 +13,6 @@ from tools.transcript_index import (
     format_search_results,
     init_schema,
     get_db,
-    DEFAULT_RRF_K
 )
 
 
@@ -211,7 +207,7 @@ def test_transcript_indexing_and_search(tmp_path):
         {"step_index": 1, "type": "USER_INPUT", "source": "USER_EXPLICIT", "created_at": "2026-09-30T21:00:00Z", "content": "How do we configure Dockhand and Tautulli backups?"},
         {"step_index": 2, "type": "PLANNER_RESPONSE", "source": "MODEL", "created_at": "2026-09-30T21:00:05Z", "content": "Dockhand and Tautulli run in SQLite WAL mode. Always checkpoint before copying DB files."}
     ]
-    t_file.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+    t_file.write_text("\n".join(json.dumps(item) for item in lines) + "\n")
 
     import tools.transcript_index as ti
     orig_brain = ti.BRAIN_DIR
@@ -337,3 +333,51 @@ def test_asymptotic_recency_decay_floor(tmp_path):
         assert 0.90 <= fused[1]["recency_multiplier"] < 0.91
     finally:
         indexer.close()
+
+
+def test_embedding_proxy_fast_path(tmp_path, monkeypatch):
+    import base64
+    import numpy as np
+    import urllib.request
+    import tools.transcript_index as ti
+
+    db_file = str(tmp_path / "proxy_test.db")
+    indexer = TranscriptIndexer(db_file, use_proxy=True)
+    try:
+        monkeypatch.setattr(ti, "_EMBEDDING_MODEL", None)
+        fake_vec = np.ones(384, dtype=np.float32) / np.sqrt(384)
+        fake_b64 = base64.b64encode(fake_vec.tobytes()).decode("ascii")
+
+        called_urls = []
+
+        class DummyResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return json.dumps({"embedding_b64": fake_b64}).encode("utf-8")
+
+        def fake_urlopen(req, timeout=8.0):
+            called_urls.append(req.full_url)
+            return DummyResp()
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(
+            ti,
+            "get_embedding_model",
+            lambda: (_ for _ in ()).throw(AssertionError("Local model should not load when proxy succeeds")),
+        )
+
+        res = indexer.search("test proxy embedding query", target="memory", mode="hybrid", limit=3)
+        assert len(called_urls) == 1
+        assert "/api/embed?q=" in called_urls[0]
+        assert res["mode"] == "hybrid"
+    finally:
+        indexer.close()
+
