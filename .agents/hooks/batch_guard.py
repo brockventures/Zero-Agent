@@ -284,11 +284,20 @@ def check_file_deletion_gate(cmd: str, cwd: str = "/workspace") -> tuple[bool, s
     return True, ""
 
 
-def is_unscoped_pytest(cmd: str) -> bool:
-    cmd_clean = cmd.strip()
-    if " && " in cmd_clean or " || " in cmd_clean or "; " in cmd_clean or "\n" in cmd_clean:
+def _is_single_segment_unscoped_test(seg: str) -> bool:
+    seg_clean = seg.strip()
+    if not seg_clean:
         return False
-    m = re.match(r"^(?:pytest|python[0-9.]*\s+-m\s+pytest)(?:\s+(.*))?$", cmd_clean)
+    # Check go test ./... or bare go test
+    m_go = re.match(r"^go\s+test(?:\s+(.*))?$", seg_clean)
+    if m_go:
+        go_args = (m_go.group(1) or "").strip()
+        go_tokens = [t for t in go_args.split() if not t.startswith("-")]
+        if not go_tokens or "./..." in go_tokens or "..." in go_tokens:
+            return True
+        return False
+
+    m = re.match(r"^(?:pytest|python[0-9.]*\s+-m\s+pytest)(?:\s+(.*))?$", seg_clean)
     if not m:
         return False
     args = m.group(1) or ""
@@ -299,8 +308,22 @@ def is_unscoped_pytest(cmd: str) -> bool:
         return False
     if "-k" in tokens or "-m" in tokens:
         return False
-    generic_targets = {"tests", "tests/", ".", "./"}
+    generic_targets = {"tests", "tests/", "tools", "tools/", ".", "./"}
     return all(t.startswith("-") or t in generic_targets for t in tokens)
+
+
+def is_unscoped_pytest(cmd: str) -> bool:
+    cmd_clean = cmd.strip()
+    if not cmd_clean:
+        return False
+    # Split on top-level && or ; to catch 'cd /workspace && pytest' or 'ruff check . && pytest tests/'
+    unquoted = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "'quoted'", cmd_clean)
+    if "&&" not in unquoted and ";" not in unquoted and "||" not in unquoted and "\n" not in unquoted:
+        return _is_single_segment_unscoped_test(cmd_clean)
+    for seg in re.split(r"(?:&&|\|\||;|\n)", cmd_clean):
+        if _is_single_segment_unscoped_test(seg):
+            return True
+    return False
 
 
 def is_single_git_lifecycle_cmd(cmd: str) -> bool:
@@ -1190,9 +1213,25 @@ def main():
 
         resp = {"decision": "allow"}
         if name == "run_command" and not args.get("IsDaemon", False):
+            overwrites = {}
             wait_ms = args.get("WaitMsBeforeAsync", 0)
             if isinstance(wait_ms, (int, float)) and wait_ms < 10000:
-                resp["overwrite"] = {"WaitMsBeforeAsync": 10000}
+                overwrites["WaitMsBeforeAsync"] = 10000
+
+            try:
+                for tools_dir in ("/workspace/tools", "/opt/zero/workspace/tools"):
+                    if os.path.isdir(tools_dir) and tools_dir not in sys.path:
+                        sys.path.insert(0, tools_dir)
+                from output_shaper import rewrite_command_for_shaping
+                raw_cmd = args.get("CommandLine", "")
+                shaped_cmd = rewrite_command_for_shaping(raw_cmd)
+                if shaped_cmd and shaped_cmd != raw_cmd:
+                    overwrites["CommandLine"] = shaped_cmd
+            except Exception:
+                pass
+
+            if overwrites:
+                resp["overwrite"] = overwrites
 
         print(json.dumps(resp))
     except Exception:
