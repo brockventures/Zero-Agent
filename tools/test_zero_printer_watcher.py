@@ -5,12 +5,13 @@ Verifies state machine transitions, vision evaluation, Option B auto-pause,
 cooldown teardown logic, and accurate OrcaSlicer ETA parsing.
 """
 
-import os
 import sys
 import unittest
 import tempfile
 from unittest.mock import patch, MagicMock
 from pathlib import Path
+from PIL import Image
+import numpy as np
 
 # Add workspace to path
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -23,10 +24,17 @@ from tools.zero_printer_watcher import (
     evaluate_print_image,
     is_running,
     stop_daemon,
-    PID_FILE,
     parse_time_string_to_seconds,
     extract_gcode_sliced_seconds,
     estimate_eta_str,
+    compile_timelapse_gif,
+)
+from tools.webcam_control import (
+    score_burst_frame,
+    is_frame_unoccluded,
+    detect_bed_and_toolhead_pose,
+    DEFAULT_TARGET_BED_Y,
+    DEFAULT_TARGET_HEAD_X,
 )
 
 
@@ -452,6 +460,102 @@ class TestZeroPrinterWatcher(unittest.TestCase):
             # 4. Explicit force_probe=True within 7-day window -> selects my_machine_probe.json
             p4 = zpw.select_machine_profile(force_probe=True, now_epoch=1792764600 + 8 * 86400, state_file=state_path)
             self.assertEqual(p4, "/prints/my_machine_probe.json")
+
+    def test_xy_phase_locked_burst_scoring_and_unoccluded_check(self):
+        def _make_frame(bed_y=DEFAULT_TARGET_BED_Y, head_x=DEFAULT_TARGET_HEAD_X, head_y=800.0):
+            arr = np.full((1920, 1080, 3), 100, dtype=np.uint8)
+            by_px = int(round(bed_y))
+            # PEI lip step-edge in x=520..850
+            arr[1220:by_px, 520:850] = [200, 180, 50]
+            arr[by_px:1760, 520:850] = [30, 30, 30]
+            # COMGROW silkscreen fiducial
+            bx = 255.0 + (-0.35) * (bed_y - DEFAULT_TARGET_BED_Y)
+            bx_px = int(round(bx))
+            arr[by_px - 40:by_px - 20, bx_px - 30:bx_px + 30] = [240, 240, 240]
+            # Toolhead black shroud
+            hx_px = int(round(head_x))
+            hy_px = int(round(head_y))
+            arr[hy_px - 40:hy_px + 40, hx_px - 40:hx_px + 40] = [20, 20, 20]
+            # Printed model
+            arr[1050:1150, 500:600] = [255, 255, 255]
+            return Image.fromarray(arr)
+
+        # 1. Phase-locked frame (bed Y at 1385, toolhead X at 370)
+        f_locked = _make_frame(DEFAULT_TARGET_BED_Y, DEFAULT_TARGET_HEAD_X, 800.0)
+        score_locked, details_locked = score_burst_frame(f_locked)
+        self.assertLessEqual(details_locked["bed_y_err"], 14.0)
+        self.assertLessEqual(details_locked["head_x_err"], 45.0)
+        self.assertTrue(is_frame_unoccluded(details_locked))
+
+        # 2. Out-of-phase bed Y frame (bed_y=1450, err=65.0 > 14.0)
+        f_bed_out = _make_frame(1450.0, DEFAULT_TARGET_HEAD_X, 800.0)
+        score_bed_out, details_bed_out = score_burst_frame(f_bed_out)
+        self.assertGreater(details_bed_out["bed_y_err"], 14.0)
+        self.assertFalse(is_frame_unoccluded(details_bed_out))
+        self.assertGreater(score_locked, score_bed_out)
+
+        # 3. Out-of-phase toolhead X frame (head_x=650, err=280.0 > 45.0)
+        f_head_out = _make_frame(DEFAULT_TARGET_BED_Y, 650.0, 800.0)
+        score_head_out, details_head_out = score_burst_frame(f_head_out)
+        self.assertGreater(details_head_out["head_x_err"], 45.0)
+        self.assertFalse(is_frame_unoccluded(details_head_out))
+        self.assertGreater(score_locked, score_head_out)
+
+        # 4. Out-of-phase frame with artificially forced high score still rejected
+        fake_out_details = {
+            "score": 999999.0,
+            "shroud_px": 0,
+            "dist": 350.0,
+            "bed_y_err": 25.0,  # exceeds max_bed_y_err 14.0
+            "head_x_err": 10.0,
+        }
+        self.assertFalse(is_frame_unoccluded(fake_out_details))
+
+    def test_compile_timelapse_gif_bed_stabilization(self):
+        def _make_frame(bed_y=DEFAULT_TARGET_BED_Y):
+            arr = np.full((1920, 1080, 3), 100, dtype=np.uint8)
+            by_px = int(round(bed_y))
+            arr[1220:by_px, 520:850] = [200, 180, 50]
+            arr[by_px:1760, 520:850] = [30, 30, 30]
+            bx = 255.0 + (-0.35) * (bed_y - DEFAULT_TARGET_BED_Y)
+            bx_px = int(round(bx))
+            arr[by_px - 40:by_px - 20, bx_px - 30:bx_px + 30] = [240, 240, 240]
+            arr[760:840, 330:410] = [20, 20, 20]
+            arr[1050:1150, 500:600] = [255, 255, 255]
+            return Image.fromarray(arr)
+
+        tl_dir = self.tmp_path / "timelapse" / "stab_job"
+        tl_dir.mkdir(parents=True, exist_ok=True)
+
+        # 3 frames with bed jitter: 1375, 1385, 1395
+        f1 = _make_frame(1375.0)
+        f2 = _make_frame(1385.0)
+        f3 = _make_frame(1395.0)
+        f1.save(tl_dir / "frame_0001.jpg")
+        f2.save(tl_dir / "frame_0002.jpg")
+        f3.save(tl_dir / "frame_0003.jpg")
+
+        with patch("tools.zero_printer_watcher.TIMELAPSE_ROOT", self.tmp_path / "timelapse"):
+            # Compile with stabilization
+            out_gif = compile_timelapse_gif("stab_job.gcode", max_width=540, frame_ms=100, final_hold_ms=500, stabilize_bed=True)
+            self.assertIsNotNone(out_gif)
+            self.assertTrue(out_gif.exists())
+            self.assertGreater(out_gif.stat().st_size, 0)
+
+            # Inspect registered frames from output GIF
+            gif_img = Image.open(out_gif)
+            detected_ys = []
+            for i in range(gif_img.n_frames):
+                gif_img.seek(i)
+                fr = gif_img.convert("RGB")
+                pose = detect_bed_and_toolhead_pose(fr)
+                detected_ys.append(pose["bed_y"])
+
+            # Bed Y positions should now be registered closely around the median (1385.0)
+            self.assertEqual(len(detected_ys), 3)
+            raw_variance = float(np.var([1375.0, 1385.0, 1395.0]))
+            stab_variance = float(np.var(detected_ys))
+            self.assertLess(stab_variance, raw_variance / 2.0)
 
 
 if __name__ == "__main__":

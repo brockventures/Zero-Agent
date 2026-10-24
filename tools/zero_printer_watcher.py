@@ -18,7 +18,7 @@ import sys
 import time
 import json
 import signal
-import base64
+import numpy as np
 import argparse
 import urllib.request
 import urllib.error
@@ -156,15 +156,22 @@ def compile_timelapse_gif(
     max_width: int = 540,
     frame_ms: int = 180,
     final_hold_ms: int = 1600,
+    stabilize_bed: bool = True,
 ) -> Optional[Path]:
-    """Compile archived `frame_*.jpg` images for `filename` into an animated GIF for Discord."""
+    """Compile archived `frame_*.jpg` images for `filename` into an animated GIF for Discord.
+
+    When stabilize_bed is True, applies 2D bed-fiducial translation registration across frames
+    to eliminate residual frame-to-frame bed jitter.
+    """
     tl_dir = get_job_timelapse_dir(filename)
     frame_paths = sorted(tl_dir.glob("frame_*.jpg"))
     if len(frame_paths) < 2:
         print(f"[Timelapse] Only {len(frame_paths)} frame(s) in {tl_dir}; skipping GIF build.")
         return None
     try:
-        frames = []
+        from tools.webcam_control import detect_bed_and_toolhead_pose
+
+        raw_frames = []
         for fp in frame_paths:
             with Image.open(fp) as im:
                 im_rgb = im.convert("RGB")
@@ -172,7 +179,48 @@ def compile_timelapse_gif(
                 if w > max_width:
                     new_h = int(round(h * (max_width / float(w))))
                     im_rgb = im_rgb.resize((max_width, new_h), Image.Resampling.LANCZOS)
-                frames.append(im_rgb.quantize(colors=256, method=Image.Quantize.FASTOCTREE))
+                raw_frames.append(im_rgb)
+
+        if stabilize_bed and raw_frames:
+            poses = []
+            for frame in raw_frames:
+                try:
+                    p = detect_bed_and_toolhead_pose(frame)
+                    poses.append((p["bed_x"], p["bed_y"]))
+                except Exception as e:
+                    print(f"[Timelapse] Warning: bed pose detection failed on frame: {e}")
+                    poses.append((0.0, 0.0))
+
+            valid_poses = [p for p in poses if p[0] != 0.0 and p[1] != 0.0]
+            if valid_poses:
+                ref_bed_x = float(np.median([p[0] for p in valid_poses]))
+                ref_bed_y = float(np.median([p[1] for p in valid_poses]))
+
+                stabilized_frames = []
+                for frame, (bx, by) in zip(raw_frames, poses):
+                    if bx == 0.0 and by == 0.0:
+                        stabilized_frames.append(frame)
+                        continue
+                    fw, fh = frame.size
+                    sx = fw / 1080.0
+                    sy = fh / 1920.0
+                    dx = (ref_bed_x - bx) * sx
+                    dy = (ref_bed_y - by) * sy
+
+                    clamped_dx = max(-45.0, min(45.0, dx))
+                    clamped_dy = max(-95.0, min(95.0, dy))
+                    shift_x = int(round(clamped_dx))
+                    shift_y = int(round(clamped_dy))
+
+                    if shift_x != 0 or shift_y != 0:
+                        bg = Image.new("RGB", (fw, fh), (28, 28, 30))
+                        bg.paste(frame, (shift_x, shift_y))
+                        stabilized_frames.append(bg)
+                    else:
+                        stabilized_frames.append(frame)
+                raw_frames = stabilized_frames
+
+        frames = [f.quantize(colors=256, method=Image.Quantize.FASTOCTREE) for f in raw_frames]
         durations = [frame_ms] * (len(frames) - 1) + [final_hold_ms]
         out_gif = TIMELAPSE_ROOT / f"{tl_dir.name}_timelapse.gif"
         frames[0].save(
@@ -483,7 +531,7 @@ def build_zero_homing_resume_gcode(filename: str, filepos: int, attempt: int = 1
 
             # Advance to start of next complete G-code line at or after filepos
             f.seek(filepos)
-            partial_line = f.readline()
+            f.readline()
             actual_offset = f.tell()
             remaining_bytes = f.read()
 
@@ -598,10 +646,12 @@ def _set_webcam_torch(enabled: bool) -> bool:
 
 def capture_webcam_snapshot(
     output_path: Path,
-    burst: int = 6,
-    interval: float = 4.0,
-    max_window: float = 25.0,
+    burst: int = 8,
+    interval: float = 0.8,
+    max_window: float = 12.0,
     min_luma: float = 30.0,
+    target_bed_y: Optional[float] = None,
+    target_head_x: Optional[float] = None,
 ) -> bool:
     """
     Invoke tools/webcam_control.py to capture a rotated snapshot with adaptive early-exit burst.
@@ -628,6 +678,10 @@ def capture_webcam_snapshot(
         "--output",
         str(output_path),
     ]
+    if target_bed_y is not None:
+        cmd.extend(["--target-bed-y", str(target_bed_y)])
+    if target_head_x is not None:
+        cmd.extend(["--target-head-x", str(target_head_x)])
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
         luma = _image_mean_luma(output_path)
@@ -911,7 +965,7 @@ class PrinterWatcherDaemon:
             f"- **Continuation Job:** `{resume_path.name}` (Attempt `{attempt}/{self.max_auto_resumes}`)\n"
             f"- **Resume Coordinates:** `Z = {meta['z_height']:.2f} mm`"
             + (f", `X = {meta['resume_x']:.2f}`, `Y = {meta['resume_y']:.2f}`\n" if meta["resume_x"] is not None else "\n")
-            + f"- **Action:** Reconnected `/dev/ttyUSB0`, maintained `60°C` bed / `200°C` hotend, and spliced zero-homing continuation G-code in place."
+            + "- **Action:** Reconnected `/dev/ttyUSB0`, maintained `60°C` bed / `200°C` hotend, and spliced zero-homing continuation G-code in place."
         )
         if capture_webcam_snapshot(LATEST_SNAPSHOT, burst=self.burst):
             deliver_discord_photo(LATEST_SNAPSHOT, caption, self.channel)
@@ -1014,7 +1068,7 @@ class PrinterWatcherDaemon:
                             print(f"[Watcher] Vision Eval: failure={is_failure}, conf={confidence:.2f}, issue={issue}")
 
                             if is_failure and confidence >= 0.70:
-                                print(f"🚨 [Watcher] Catastrophic failure detected! Executing Option B (Auto-Pause)...")
+                                print("🚨 [Watcher] Catastrophic failure detected! Executing Option B (Auto-Pause)...")
                                 self.client.pause_job()
                                 clean_name = clean_job_name(filename)
                                 if self.enable_voice:

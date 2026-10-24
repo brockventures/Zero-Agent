@@ -260,6 +260,7 @@ python3 /workspace/tools/webcam_control.py start
 ### 2. Camera Controls & Stale Image Immunity:
 - **Start Camera:** `python3 /workspace/tools/webcam_control.py start` (brings camera online, verifies HTTP port).
 - **Snapshot:** `python3 /workspace/tools/webcam_control.py snapshot --output /workspace/data/3dprint/snap.jpg` (pulls `/shot.jpg` and rotates 270°).
+  - *XY Phase-Locked Burst:* Accepts `--burst 8`, `--interval 0.8`, `--max-window 12.0`, `--target-bed-y 1385.0`, and `--target-head-x 370.0` to lock presentation pose across frames.
   - *Stale Disk Invariant:* Callers MUST delete the target snapshot path before capture.
   - *Strict Exit Code:* `snapshot` exits with `1` if frame acquisition fails, preventing downstream tools from reading dead buffers.
 - **Stop Camera:** `python3 /workspace/tools/webcam_control.py stop` (force-stops app, closes port 3333, puts screen to sleep).
@@ -280,11 +281,11 @@ python3 /workspace/tools/zero_printer_watcher.py --daemon
    - Dispatches urgent spoken audio alert via Stefan profile: `"Catastrophic failure detected on {clean_name}. Print paused to prevent damage."`
    - Delivers urgent photo alert to `#3d-print` (`1555973316752449576`).
 3. **Capture Failure Graceful Degradation:** If `capture_webcam_snapshot` fails (camera asleep or offline), the watcher logs a warning and skips the vision evaluation cycle. It NEVER evaluates stale images and NEVER pauses an active print solely due to camera network dropouts.
-4. **Nominal Progress Receipts & Timelapse Frame Archiving:** Delivers clean progress checks with hotend temperatures and vision confidence to `#3d-print` every 20 minutes while archiving burst-scored, least-occluded frames (`frame_NNNN.jpg`) every 3 minutes (`--interval-timelapse=180`) into `/workspace/data/3dprint/timelapse/<job_stem>/`. Automatically toggles the Pixel 8 Pro LED torch (`/enabletorch` / `/disabletorch`) during low-light overnight captures so frames are never dark.
+4. **Nominal Progress Receipts & Timelapse Frame Archiving:** Delivers clean progress checks with hotend temperatures and vision confidence to `#3d-print` every 20 minutes while archiving burst-scored, least-occluded frames (`frame_NNNN.jpg`) every 3 minutes (`--interval-timelapse=180`) into `/workspace/data/3dprint/timelapse/<job_stem>/`. Uses XY phase-locked burst capture (`burst=8`, 0.8s sampling interval, `--target-bed-y 1385.0`, `--target-head-x 370.0`) to capture the bed and toolhead in consistent presentation pose and prevent out-of-phase early exits. Automatically toggles the Pixel 8 Pro LED torch (`/enabletorch` / `/disabletorch`) during low-light overnight captures so frames are never dark.
 5. **Dynamic Dual-Cadence Teardown & Post-Print Timelapse GIF:**
    - Upon `PrintDone`, `PrintCancelled`, or `PrintFailed`, shifts polling cadence to 60 seconds.
    - Dispatches completion announcement: `"Print complete for {clean_name}. Part cooling on bed. Do not touch."`
-   - Automatically compiles all archived `frame_*.jpg` snapshots into an animated **Timelapse `.gif`** (`/workspace/data/3dprint/timelapse/<job_stem>_timelapse.gif`, holding the final completed frame for 1.6 seconds) and delivers it directly to `#3d-print`.
+   - Automatically compiles all archived `frame_*.jpg` snapshots into an animated **Timelapse `.gif`** (`/workspace/data/3dprint/timelapse/<job_stem>_timelapse.gif`, holding the final completed frame for 1.6 seconds) with 2D bed-fiducial translation alignment (`stabilize_bed=True`) to eliminate residual frame-to-frame bed jitter, and delivers it directly to `#3d-print`.
    - Waits until the nozzle cools below 50.0°C to prevent heat creep.
    - Dispatches teardown announcement: `"Cooldown threshold satisfied. Cutting main power now."`
    - Stops IP Webcam on the Pixel 8 Pro via ADB.
