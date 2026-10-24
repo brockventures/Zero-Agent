@@ -20,8 +20,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import sys
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+elif sys.path[0] != _REPO_ROOT:
+    sys.path.remove(_REPO_ROOT)
+    sys.path.insert(0, _REPO_ROOT)
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
 
 import tools.forge as forge_mod
 from tools.forge import (
@@ -46,8 +52,11 @@ from tools.forge import (
     get_job_status,
     init_forge_db,
     list_jobs,
+    post_or_update_job_widget,
     prune_completed_build_widgets,
+    prune_completed_job_widgets,
     render_build_widget_embed,
+    render_job_widget_embed,
     render_build_widget_text,
     stage_decision,
      validate_forge_plan,
@@ -484,6 +493,188 @@ class TestForgeEngine(unittest.TestCase):
         with patch.object(forge_mod, "Path"):
             pass
         self.assertTrue(str(forge_mod.resolve_default_forge_db_path()).endswith("forge.db"))
+
+    def test_08_cross_container_unified_db_and_job_widget_lifecycle(self):
+        # 1. Test unified cross-DB querying via _query_unified_rows
+        peer_db = Path(self.tmp_dir.name) / "peer_forge.db"
+        init_forge_db(peer_db)
+
+        # Primary DB has j1 (older) and j2
+        t0 = time.time()
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO forge_jobs (id, name, command, start_time, status)
+                VALUES ('j1', 'Job 1', 'echo 1', ?, 'running'),
+                       ('j2', 'Job 2', 'echo 2', ?, 'running')
+                """,
+                (t0, t0 + 10.0),
+            )
+
+        # Peer DB has j3 and j1 (newer update with end_time)
+        with forge_mod.get_db_connection(peer_db) as conn:
+            conn.execute(
+                """
+                INSERT INTO forge_jobs (id, name, command, start_time, end_time, status)
+                VALUES ('j3', 'Job 3', 'echo 3', ?, ?, 'running'),
+                       ('j1', 'Job 1', 'echo 1', ?, ?, 'completed')
+                """,
+                (t0 + 20.0, t0 + 25.0, t0, t0 + 30.0),
+            )
+
+        # Non-production DB path skips peer DBs by default
+        self.assertEqual(forge_mod._get_peer_forge_db_paths(self.db_path), [])
+        single_rows = forge_mod._query_unified_rows(
+            "SELECT * FROM forge_jobs",
+            db_path=self.db_path,
+            sort_key="start_time",
+            reverse=True,
+        )
+        self.assertEqual(len(single_rows), 2)
+
+        # When peers are returned, _query_unified_rows merges and deduplicates
+        with patch.object(forge_mod, "_get_peer_forge_db_paths", return_value=[peer_db]):
+            merged = forge_mod._query_unified_rows(
+                "SELECT * FROM forge_jobs",
+                db_path=self.db_path,
+                sort_key="start_time",
+                reverse=True,
+            )
+            # j1, j2, j3 = 3 unique jobs
+            self.assertEqual(len(merged), 3)
+            # j3 has start_time = t0 + 20
+            self.assertEqual(merged[0]["id"], "j3")
+            self.assertEqual(merged[1]["id"], "j2")
+            self.assertEqual(merged[2]["id"], "j1")
+            # j1 should have the newer status from peer DB ('completed')
+            self.assertEqual(merged[2]["status"], "completed")
+
+            # Test limit
+            limited = forge_mod._query_unified_rows(
+                "SELECT * FROM forge_jobs",
+                db_path=self.db_path,
+                sort_key="start_time",
+                reverse=True,
+                limit=2,
+            )
+            self.assertEqual(len(limited), 2)
+            self.assertEqual(limited[0]["id"], "j3")
+            self.assertEqual(limited[1]["id"], "j2")
+
+        # Test candidate discovery when FORGE_DB_PATH is patched
+        with patch.object(forge_mod, "FORGE_DB_PATH", self.db_path):
+            with patch.object(forge_mod, "PEER_FORGE_DB_CANDIDATES", [peer_db]):
+                peers = forge_mod._get_peer_forge_db_paths(self.db_path)
+                self.assertEqual(peers, [peer_db])
+
+        # 2. Test render_job_widget_embed
+        tasks_tmp = Path(self.tmp_dir.name) / "tasks"
+        tasks_tmp.mkdir(parents=True, exist_ok=True)
+        task_id = "dt-render-test-01"
+        t_dir = tasks_tmp / task_id
+        t_dir.mkdir(parents=True, exist_ok=True)
+        log_file = t_dir / "run.log"
+        log_file.write_text(
+            "--- [Detached Runner] Started at 2026-10-24T00:00:00Z ---\n"
+            "--- Command: pytest tests/ ---\n"
+            "[Detached Runner] Starting worker\n"
+            "Line A\n"
+            "Line B\n"
+            "Line C\n"
+            "Line D\n"
+            "Line E\n",
+            encoding="utf-8",
+        )
+
+        job_meta = {
+            "task_id": task_id,
+            "name": "Integration Test Job",
+            "command": "pytest tests/test_runner.py -v",
+            "channel": "baseball",
+            "cwd": "/volume1/baseball",
+            "status": "running",
+            "start_time": time.time() - 45.0,
+            "log_file": str(log_file),
+        }
+        with patch.object(forge_mod, "TASKS_DIR", tasks_tmp):
+            forge_mod._write_job_meta(task_id, job_meta, db_path=self.db_path)
+
+            embed = render_job_widget_embed(task_id, db_path=self.db_path)
+            self.assertIn("⚙️", embed["title"])
+            self.assertIn("Integration Test Job", embed["title"])
+            self.assertEqual(embed["color"], 0x3B82F6)
+            self.assertIn("**RUNNING**", embed["description"])
+            self.assertIn("`baseball`", embed["description"])
+            self.assertIn("<#1548196929308065893>", embed["description"])
+            self.assertIn("pytest tests/test_runner.py -v", embed["description"])
+            # Should have the last 4 non-banner lines: Line B, Line C, Line D, Line E
+            self.assertIn("Line B\nLine C\nLine D\nLine E", embed["description"])
+            self.assertNotIn("--- [Detached Runner]", embed["description"])
+            self.assertNotIn("[Detached Runner] Starting worker", embed["description"])
+            self.assertNotIn("Line A", embed["description"])
+
+            # Test unknown task embed
+            unknown_embed = render_job_widget_embed("non-existent-task", db_path=self.db_path)
+            self.assertIn("⚠️ Job non-existent-task not found", unknown_embed["title"])
+
+        # 3. Test post_or_update_job_widget (POST then PATCH)
+        with patch.object(forge_mod, "TASKS_DIR", tasks_tmp):
+            with patch.object(forge_mod, "_get_discord_token", return_value="fake_bot_token"):
+                # Initial POST: create widget
+                mock_post_resp = MagicMock()
+                mock_post_resp.status_code = 200
+                mock_post_resp.json.return_value = {"id": "1122334455"}
+
+                with patch("requests.post", return_value=mock_post_resp) as mock_post, patch("requests.patch") as mock_patch:
+                    posted_id = post_or_update_job_widget(task_id, db_path=self.db_path)
+                    self.assertEqual(posted_id, 1122334455)
+                    self.assertTrue(mock_post.called)
+                    self.assertFalse(mock_patch.called)
+
+                # Verify forge_message_id is recorded in SQLite
+                with forge_mod.get_db_connection(self.db_path) as conn:
+                    row = conn.execute("SELECT forge_message_id FROM forge_jobs WHERE id = ?", (task_id,)).fetchone()
+                    self.assertEqual(row["forge_message_id"], 1122334455)
+
+                # Second call: PATCH existing widget
+                mock_patch_resp = MagicMock()
+                mock_patch_resp.status_code = 200
+
+                with patch("requests.post") as mock_post2, patch("requests.patch", return_value=mock_patch_resp) as mock_patch2:
+                    updated_id = post_or_update_job_widget(task_id, db_path=self.db_path)
+                    self.assertEqual(updated_id, 1122334455)
+                    self.assertFalse(mock_post2.called)
+                    self.assertTrue(mock_patch2.called)
+
+        # 4. Test 1h TTL auto-pruning of completed job widgets
+        with patch.object(forge_mod, "TASKS_DIR", tasks_tmp):
+            # Mark job as completed >1h ago
+            with forge_mod.get_db_connection(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE forge_jobs SET status = 'completed', end_time = ? WHERE id = ?",
+                    (time.time() - 3700.0, task_id),
+                )
+
+            # Test standalone prune_completed_job_widgets
+            pruned = prune_completed_job_widgets(ttl_seconds=3600.0, db_path=self.db_path, delete_remote=False)
+            self.assertIn(task_id, pruned)
+
+            # Check that forge_message_id was set to NULL
+            with forge_mod.get_db_connection(self.db_path) as conn:
+                row_after = conn.execute("SELECT forge_message_id FROM forge_jobs WHERE id = ?", (task_id,)).fetchone()
+                self.assertIsNone(row_after["forge_message_id"])
+
+            # Also verify prune_completed_build_widgets prunes completed jobs
+            with forge_mod.get_db_connection(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE forge_jobs SET status = 'completed', forge_message_id = 99887766, end_time = ? WHERE id = ?",
+                    (time.time() - 3700.0, task_id),
+                )
+            pruned_all = prune_completed_build_widgets(ttl_seconds=3600.0, db_path=self.db_path, delete_remote=False)
+            self.assertIn(task_id, pruned_all)
+            with forge_mod.get_db_connection(self.db_path) as conn:
+                row_all = conn.execute("SELECT forge_message_id FROM forge_jobs WHERE id = ?", (task_id,)).fetchone()
+                self.assertIsNone(row_all["forge_message_id"])
 
 
 if __name__ == "__main__":

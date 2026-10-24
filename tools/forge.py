@@ -83,6 +83,108 @@ def resolve_default_forge_db_path() -> Path:
 
 FORGE_DB_PATH = resolve_default_forge_db_path()
 
+PEER_FORGE_DB_CANDIDATES: list[Path] = [
+    Path("/baseball/data/forge.db"),
+    Path("/opt/zero/workspace/data/forge.db"),
+    DATA_DIR / "forge.db",
+]
+
+
+def _get_peer_forge_db_paths(primary_db_path: Path | str = FORGE_DB_PATH) -> list[Path]:
+    """Return readable peer FORGE SQLite paths across containers when querying production DB."""
+    primary = Path(primary_db_path)
+    try:
+        if primary.resolve() != FORGE_DB_PATH.resolve():
+            return []
+    except Exception:
+        return []
+
+    peers: list[Path] = []
+    seen: set[Path] = set()
+    try:
+        seen.add(primary.resolve())
+    except Exception:
+        seen.add(primary)
+
+    for p in PEER_FORGE_DB_CANDIDATES:
+        try:
+            if p.exists() and p.is_file() and os.access(p, os.R_OK):
+                rp = p.resolve()
+                if rp not in seen:
+                    seen.add(rp)
+                    peers.append(p)
+        except Exception:
+            pass
+    return peers
+
+
+def _query_unified_rows(
+    sql: str,
+    params: tuple = (),
+    db_path: Path | str = FORGE_DB_PATH,
+    sort_key: Optional[str] = None,
+    reverse: bool = True,
+    limit: Optional[int] = None,
+) -> list[dict]:
+    """Execute query across primary DB and any readable peer DBs, deduplicating rows by `id`."""
+    db_paths = [Path(db_path)] + _get_peer_forge_db_paths(db_path)
+    by_id: dict[str, dict] = {}
+    rows_without_id: list[dict] = []
+
+    def _row_ts(r: dict) -> float:
+        for k in ("updated_at", "end_time", "start_time", "created_at"):
+            v = r.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    pass
+        return 0.0
+
+    seen_paths: set[Path] = set()
+    for p in db_paths:
+        try:
+            rp = p.resolve()
+        except Exception:
+            rp = p
+        if rp in seen_paths:
+            continue
+        seen_paths.add(rp)
+
+        try:
+            with get_db_connection(p) as conn:
+                fetched = conn.execute(sql, params).fetchall()
+                for item in fetched:
+                    d = dict(item)
+                    rid = d.get("id")
+                    if rid is not None:
+                        rid_str = str(rid)
+                        if rid_str not in by_id or _row_ts(d) >= _row_ts(by_id[rid_str]):
+                            by_id[rid_str] = d
+                    else:
+                        rows_without_id.append(d)
+        except Exception:
+            pass
+
+    combined = list(by_id.values()) + rows_without_id
+
+    if sort_key:
+        def _get_sort_val(r: dict):
+            val = r.get(sort_key)
+            if val is None:
+                return float("-inf") if reverse else float("inf")
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return str(val)
+
+        combined.sort(key=_get_sort_val, reverse=reverse)
+
+    if limit is not None and limit > 0:
+        combined = combined[:limit]
+
+    return combined
+
 
 def is_ivy_container() -> bool:
     """Return True if executing inside discord-ivy-agent (#baseball)."""
@@ -963,6 +1065,20 @@ def extract_live_chunk_telemetry(line: str, step_count: int = 0) -> tuple[Option
     return None, step_count
 
 
+def _format_channel_mention(channel_val: Any) -> str:
+    """Format origin Discord channel as a clickable mention or readable label."""
+    raw = str(channel_val).strip().lstrip("#")
+    if raw.isdigit():
+        return f"<#{raw}>"
+    if raw == "baseball":
+        return f"<#{BASEBALL_CHANNEL_ID}>"
+    if raw == "zero-chat":
+        return f"<#{ZERO_CHAT_CHANNEL_ID}>"
+    if raw == "zero-ops":
+        return f"<#{ZERO_OPS_CHANNEL_ID}>"
+    return f"#{raw}" if raw else f"<#{ZERO_CHAT_CHANNEL_ID}>"
+
+
 def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
     """Render a compact native Discord Embed dict for a FORGE build in #forge."""
     with get_db_connection(db_path) as conn:
@@ -1112,13 +1228,196 @@ def post_or_update_build_widget(
     return None
 
 
+def render_job_widget_embed(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
+    """Render a compact native Discord Embed dict for a detached background job in #forge."""
+    meta = _read_job_meta(task_id, db_path=db_path)
+    if not meta:
+        return {"title": f"⚠️ Job {task_id} not found", "color": 0xEF4444}
+
+    status = meta.get("status", "starting")
+    status_meta = {
+        "starting": ("⏳", "STARTING", 0xF59E0B),
+        "running": ("⚙️", "RUNNING", 0x3B82F6),
+        "completed": ("✅", "COMPLETED", 0x10B981),
+        "failed": ("❌", "FAILED", 0xEF4444),
+        "timed_out": ("⏱️", "TIMED OUT", 0xEF4444),
+        "cancelled": ("🛑", "CANCELLED", 0x6B7280),
+    }
+    b_emoji, b_label, color = status_meta.get(status, ("⚙️", status.upper(), 0x3B82F6))
+
+    origin_ref = _format_channel_mention(meta.get("channel", "zero-chat"))
+    cwd = meta.get("cwd", "/workspace")
+    repo_name = Path(cwd).name or "Zero-Agent"
+    if repo_name == "workspace":
+        raw_ch = str(meta.get("channel", "")).strip().lstrip("#")
+        is_ivy_origin = raw_ch in ("baseball", str(BASEBALL_CHANNEL_ID)) or os.getenv("DISCORD_CHANNEL_ID", "").strip() == str(BASEBALL_CHANNEL_ID)
+        repo_name = "Ivy-Agent" if is_ivy_origin else "Zero-Agent"
+
+    dur_val = meta.get("duration_seconds")
+    if dur_val is not None:
+        dur_str = _format_duration(dur_val)
+    elif meta.get("start_time"):
+        dur_str = _format_duration(time.time() - float(meta["start_time"]))
+    else:
+        dur_str = "0s"
+
+    header_line = f"**{b_label}** · `{repo_name}` · {origin_ref} · ⏱️ {dur_str}"
+
+    command = meta.get("command", "").strip()
+    cmd_snippet = command[:180] + ("..." if len(command) > 180 else "")
+    cmd_line = f"**Command:** `{cmd_snippet}`" if cmd_snippet else ""
+
+    # Tail up to 4 non-banner lines from log_file
+    tail_lines = []
+    log_file = meta.get("log_file")
+    if log_file:
+        lp = Path(log_file)
+        if lp.exists():
+            try:
+                with open(lp, "r", encoding="utf-8", errors="replace") as lf:
+                    for line in lf:
+                        s = line.rstrip()
+                        if s and not s.startswith("--- [Detached Runner]") and not s.startswith("[Detached Runner]"):
+                            tail_lines.append(s)
+            except Exception:
+                pass
+    tail_lines = tail_lines[-4:]
+
+    desc_parts = [header_line]
+    if cmd_line:
+        desc_parts.append(cmd_line)
+    if tail_lines:
+        desc_parts.append("**Recent Output:**\n```text\n" + "\n".join(tail_lines) + "\n```")
+    elif status in ("starting", "running"):
+        desc_parts.append("*Initializing process output...*")
+
+    desc = "\n\n".join(desc_parts)
+
+    footer_time = meta.get("end_time") or meta.get("start_time") or time.time()
+    return {
+        "title": f"{b_emoji} {meta.get('name', 'Background Task')[:220]}",
+        "description": desc[:4000],
+        "color": color,
+        "footer": {
+            "text": f"{task_id} · {_now_pt_str(footer_time)}"
+        },
+    }
+
+
+def post_or_update_job_widget(
+    task_id: str,
+    db_path: Path | str = FORGE_DB_PATH,
+    forge_channel_id: int = FORGE_CHANNEL_ID,
+) -> Optional[int]:
+    """Post or edit the single live Discord Embed card for `task_id` inside #forge via REST API v10."""
+    meta = _read_job_meta(task_id, db_path=db_path)
+    if not meta:
+        return None
+
+    embed = render_job_widget_embed(task_id, db_path=db_path)
+    token = _get_discord_token(for_forge_channel=True)
+    if not token:
+        return None
+
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+    msg_id = meta.get("forge_message_id")
+    if not msg_id:
+        try:
+            with get_db_connection(db_path) as conn:
+                row = conn.execute("SELECT forge_message_id FROM forge_jobs WHERE id = ?", (task_id,)).fetchone()
+                if row and row["forge_message_id"]:
+                    msg_id = row["forge_message_id"]
+        except Exception:
+            pass
+
+    payload = {"content": "", "embeds": [embed]}
+    try:
+        if msg_id:
+            url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
+            resp = requests.patch(url, headers=headers, json=payload, timeout=10)
+            if resp.status_code < 300:
+                return int(msg_id)
+
+        url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages"
+        resp = requests.post(url, headers=headers, json=payload, timeout=10)
+        if resp.status_code < 300:
+            new_msg_id = int(resp.json()["id"])
+            try:
+                with get_db_connection(db_path) as conn:
+                    conn.execute(
+                        "UPDATE forge_jobs SET forge_message_id = ? WHERE id = ?",
+                        (new_msg_id, task_id),
+                    )
+            except Exception:
+                pass
+            meta["forge_message_id"] = new_msg_id
+            _write_job_meta(task_id, meta, db_path=db_path)
+            return new_msg_id
+    except Exception as e:
+        print(f"[FORGE] Warning updating #forge widget for job {task_id}: {e}")
+    return None
+
+
+def prune_completed_job_widgets(
+    ttl_seconds: float = COMPLETED_WIDGET_TTL_SECONDS,
+    db_path: Path | str = FORGE_DB_PATH,
+    forge_channel_id: int = FORGE_CHANNEL_ID,
+    delete_remote: bool = True,
+) -> list[str]:
+    """Delete Discord embed cards in #forge for completed background jobs older than `ttl_seconds` (default 1h)."""
+    cutoff = time.time() - float(ttl_seconds)
+    pruned_ids: list[str] = []
+    with get_db_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, forge_message_id FROM forge_jobs
+            WHERE status = 'completed'
+              AND forge_message_id IS NOT NULL
+              AND COALESCE(end_time, start_time) <= ?
+            """,
+            (cutoff,),
+        ).fetchall()
+
+    token = _get_discord_token(for_forge_channel=True) if delete_remote else None
+    headers = {"Authorization": f"Bot {token}"} if token else {}
+    for r in rows:
+        j_id = r["id"]
+        msg_id = r["forge_message_id"]
+        deleted_ok = not delete_remote
+        if delete_remote and token and msg_id:
+            try:
+                url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
+                resp = requests.delete(url, headers=headers, timeout=10)
+                if resp.status_code in (200, 204, 404):
+                    deleted_ok = True
+            except Exception:
+                pass
+        if deleted_ok:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE forge_jobs SET forge_message_id = NULL WHERE id = ?",
+                    (j_id,),
+                )
+            meta_file = _get_job_dir(j_id) / "meta.json"
+            if meta_file.exists():
+                try:
+                    m = json.loads(meta_file.read_text(encoding="utf-8"))
+                    m["forge_message_id"] = None
+                    meta_file.write_text(json.dumps(m, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+            pruned_ids.append(j_id)
+
+    return pruned_ids
+
+
 def prune_completed_build_widgets(
     ttl_seconds: float = COMPLETED_WIDGET_TTL_SECONDS,
     db_path: Path | str = FORGE_DB_PATH,
     forge_channel_id: int = FORGE_CHANNEL_ID,
     delete_remote: bool = True,
 ) -> list[str]:
-    """Delete Discord embed cards in #forge for completed builds older than `ttl_seconds` (default 1h)."""
+    """Delete Discord embed cards in #forge for completed builds and background jobs older than `ttl_seconds` (default 1h)."""
     cutoff = time.time() - float(ttl_seconds)
     pruned_ids: list[str] = []
     with get_db_connection(db_path) as conn:
@@ -1131,9 +1430,6 @@ def prune_completed_build_widgets(
             """,
             (cutoff,),
         ).fetchall()
-
-    if not rows:
-        return pruned_ids
 
     token = _get_discord_token(for_forge_channel=True) if delete_remote else None
 
@@ -1158,7 +1454,13 @@ def prune_completed_build_widgets(
                 )
             pruned_ids.append(b_id)
 
-    return pruned_ids
+    pruned_job_ids = prune_completed_job_widgets(
+        ttl_seconds=ttl_seconds,
+        db_path=db_path,
+        forge_channel_id=forge_channel_id,
+        delete_remote=delete_remote,
+    )
+    return pruned_ids + pruned_job_ids
 
 
 def enqueue_build(
@@ -1984,12 +2286,24 @@ def _get_job_dir(task_id: str) -> Path:
     return TASKS_DIR / task_id
 
 
+def _is_prod_forge_env(db_path: Path | str = FORGE_DB_PATH) -> bool:
+    """Return True if executing against the production FORGE SQLite DB and TASKS_DIR."""
+    try:
+        return (
+            Path(db_path).resolve() == FORGE_DB_PATH.resolve()
+            and TASKS_DIR.resolve() == (WORKSPACE_DIR / "data" / "detached_tasks").resolve()
+        )
+    except Exception:
+        return False
+
+
 def _read_job_meta(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> Optional[dict]:
     """Read job metadata from `forge_jobs` in SQLite (with legacy `meta.json` fallback)."""
     meta_file = _get_job_dir(task_id) / "meta.json"
+    meta = None
     if meta_file.exists():
         try:
-            return json.loads(meta_file.read_text(encoding="utf-8"))
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
         except Exception:
             pass
     try:
@@ -2000,10 +2314,15 @@ def _read_job_meta(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> Optiona
                 d["task_id"] = d["id"]
                 d["notify_on_success"] = bool(d.get("notify_on_success"))
                 d["synthesize"] = bool(d.get("synthesize", 1))
+                if meta:
+                    for field in ("status", "exit_code", "end_time", "duration_seconds", "forge_message_id", "worker_pid", "child_pid"):
+                        if d.get(field) is not None:
+                            meta[field] = d[field]
+                    return meta
                 return d
     except Exception:
         pass
-    return None
+    return meta
 
 
 def _write_job_meta(task_id: str, meta: dict, db_path: Path | str = FORGE_DB_PATH) -> None:
@@ -2024,16 +2343,17 @@ def _write_job_meta(task_id: str, meta: dict, db_path: Path | str = FORGE_DB_PAT
                     """
                     INSERT INTO forge_jobs (
                         id, name, command, cwd, channel, timeout, status,
-                        worker_pid, child_pid, exit_code, log_file,
+                        worker_pid, child_pid, exit_code, log_file, forge_message_id,
                         notify_on_success, synthesize, start_time, end_time, duration_seconds
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         status=excluded.status,
                         worker_pid=excluded.worker_pid,
                         child_pid=excluded.child_pid,
                         exit_code=excluded.exit_code,
                         end_time=excluded.end_time,
-                        duration_seconds=excluded.duration_seconds
+                        duration_seconds=excluded.duration_seconds,
+                        forge_message_id=COALESCE(excluded.forge_message_id, forge_jobs.forge_message_id)
                     """,
                     (
                         task_id,
@@ -2047,6 +2367,7 @@ def _write_job_meta(task_id: str, meta: dict, db_path: Path | str = FORGE_DB_PAT
                         meta.get("child_pid"),
                         meta.get("exit_code"),
                         str(meta.get("log_file", "")),
+                        meta.get("forge_message_id"),
                         1 if meta.get("notify_on_success") else 0,
                         1 if meta.get("synthesize", True) else 0,
                         float(meta.get("start_time") or time.time()),
@@ -2189,6 +2510,8 @@ def start_job(
             if not updated_meta.get("worker_pid"):
                 updated_meta["worker_pid"] = proc.pid
                 _write_job_meta(task_id, updated_meta, db_path=db_path)
+            if _is_prod_forge_env(db_path):
+                post_or_update_job_widget(task_id, db_path=db_path)
             sync_forge_channel_header(db_path=db_path)
 
             return updated_meta
@@ -2226,6 +2549,9 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
     meta["worker_pid"] = os.getpid()
     meta["status"] = "running"
     _write_job_meta(task_id, meta, db_path=db_path)
+    if _is_prod_forge_env(db_path):
+        post_or_update_job_widget(task_id, db_path=db_path)
+        sync_forge_channel_header(db_path=db_path)
 
     command = meta["command"]
     timeout = meta.get("timeout", 3600)
@@ -2262,7 +2588,28 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
             _write_job_meta(task_id, meta, db_path=db_path)
 
             try:
-                exit_code = child_proc.wait(timeout=timeout)
+                while True:
+                    elapsed = time.time() - start_ts
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(cmd=command, timeout=timeout)
+                    wait_slice = min(15.0, remaining)
+                    try:
+                        exit_code = child_proc.wait(timeout=wait_slice)
+                        break
+                    except subprocess.TimeoutExpired:
+                        lf.flush()
+                        fresh = _read_job_meta(task_id, db_path=db_path)
+                        if fresh and fresh.get("status") == "cancelled":
+                            cancelled = True
+                            try:
+                                os.killpg(os.getpgid(child_proc.pid), signal.SIGTERM)
+                            except Exception:
+                                pass
+                            exit_code = -15
+                            break
+                        if _is_prod_forge_env(db_path):
+                            post_or_update_job_widget(task_id, db_path=db_path)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 lf.write(f"\n--- [Detached Runner] ERROR: Task exceeded {timeout}s timeout. Terminating... ---\n")
@@ -2293,6 +2640,8 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
     fresh_meta["end_time"] = end_ts
     fresh_meta["duration_seconds"] = duration
     _write_job_meta(task_id, fresh_meta, db_path=db_path)
+    if _is_prod_forge_env(db_path):
+        post_or_update_job_widget(task_id, db_path=db_path)
     sync_forge_channel_header(db_path=db_path)
 
     dur_str = _format_duration(duration)
@@ -2429,6 +2778,10 @@ def cancel_job(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
                 except Exception:
                     pass
 
+    if _is_prod_forge_env(db_path):
+        post_or_update_job_widget(task_id, db_path=db_path)
+        sync_forge_channel_header(db_path=db_path)
+
     return {"task_id": task_id, "status": "cancelled", "process_killed": killed}
 
 
@@ -2459,17 +2812,18 @@ def list_jobs(limit: int = 15, db_path: Path | str = FORGE_DB_PATH) -> list[dict
     tasks: list[dict] = []
     seen: set[str] = set()
     try:
-        with get_db_connection(db_path) as conn:
-            rows = conn.execute(
-                "SELECT * FROM forge_jobs ORDER BY start_time DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-            for r in rows:
-                d = dict(r)
-                d["task_id"] = d["id"]
-                d["is_running"] = _is_pid_running(d.get("child_pid")) or _is_pid_running(d.get("worker_pid"))
-                tasks.append(d)
-                seen.add(d["id"])
+        rows = _query_unified_rows(
+            "SELECT * FROM forge_jobs",
+            db_path=db_path,
+            sort_key="start_time",
+            reverse=True,
+            limit=limit,
+        )
+        for d in rows:
+            d["task_id"] = d["id"]
+            d["is_running"] = _is_pid_running(d.get("child_pid")) or _is_pid_running(d.get("worker_pid"))
+            tasks.append(d)
+            seen.add(d["id"])
     except Exception:
         pass
 
@@ -2855,24 +3209,41 @@ def format_queue_digest(
     is_private_channel = (request_channel_id is not None and int(request_channel_id) == ZERO_CHAT_CHANNEL_ID)
     expire_stale_decisions(db_path=db_path)
 
-    with get_db_connection(db_path) as conn:
-        builds = conn.execute(
-            "SELECT * FROM forge_builds WHERE status IN ('queued', 'running', 'awaiting_approval') ORDER BY created_at DESC LIMIT 10"
-        ).fetchall()
-        recent_builds = conn.execute(
-            "SELECT * FROM forge_builds WHERE status IN ('completed', 'failed') ORDER BY updated_at DESC LIMIT 3"
-        ).fetchall()
-        jobs = conn.execute(
-            "SELECT * FROM forge_jobs WHERE status IN ('starting', 'running') ORDER BY start_time DESC LIMIT 10"
-        ).fetchall()
-        if is_private_channel:
-            decisions = conn.execute(
-                "SELECT * FROM forge_decisions WHERE status = 'pending' ORDER BY created_at ASC"
-            ).fetchall()
-        else:
-            decisions = conn.execute(
-                "SELECT * FROM forge_decisions WHERE status = 'pending' AND is_private = 0 ORDER BY created_at ASC"
-            ).fetchall()
+    builds = _query_unified_rows(
+        "SELECT * FROM forge_builds WHERE status IN ('queued', 'running', 'awaiting_approval')",
+        db_path=db_path,
+        sort_key="created_at",
+        reverse=True,
+        limit=10,
+    )
+    recent_builds = _query_unified_rows(
+        "SELECT * FROM forge_builds WHERE status IN ('completed', 'failed')",
+        db_path=db_path,
+        sort_key="updated_at",
+        reverse=True,
+        limit=3,
+    )
+    jobs = _query_unified_rows(
+        "SELECT * FROM forge_jobs WHERE status IN ('starting', 'running')",
+        db_path=db_path,
+        sort_key="start_time",
+        reverse=True,
+        limit=10,
+    )
+    if is_private_channel:
+        decisions = _query_unified_rows(
+            "SELECT * FROM forge_decisions WHERE status = 'pending'",
+            db_path=db_path,
+            sort_key="created_at",
+            reverse=False,
+        )
+    else:
+        decisions = _query_unified_rows(
+            "SELECT * FROM forge_decisions WHERE status = 'pending' AND is_private = 0",
+            db_path=db_path,
+            sort_key="created_at",
+            reverse=False,
+        )
 
     lines = [f"### 🛠️ FORGE Queue & Decisions Rollup (<#{FORGE_CHANNEL_ID}>)"]
 
@@ -2915,16 +3286,26 @@ def format_queue_digest(
 
 def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
     """Render the live #forge top header message with backronym and active queues."""
-    with get_db_connection(db_path) as conn:
-        builds = conn.execute(
-            "SELECT * FROM forge_builds WHERE status IN ('queued', 'running', 'awaiting_approval') ORDER BY created_at DESC LIMIT 10"
-        ).fetchall()
-        jobs = conn.execute(
-            "SELECT * FROM forge_jobs WHERE status IN ('starting', 'running') ORDER BY start_time DESC LIMIT 10"
-        ).fetchall()
-        decisions = conn.execute(
-            "SELECT * FROM forge_decisions WHERE status = 'pending' AND is_private = 0 ORDER BY created_at ASC"
-        ).fetchall()
+    builds = _query_unified_rows(
+        "SELECT * FROM forge_builds WHERE status IN ('queued', 'running', 'awaiting_approval')",
+        db_path=db_path,
+        sort_key="created_at",
+        reverse=True,
+        limit=10,
+    )
+    jobs = _query_unified_rows(
+        "SELECT * FROM forge_jobs WHERE status IN ('starting', 'running')",
+        db_path=db_path,
+        sort_key="start_time",
+        reverse=True,
+        limit=10,
+    )
+    decisions = _query_unified_rows(
+        "SELECT * FROM forge_decisions WHERE status = 'pending' AND is_private = 0",
+        db_path=db_path,
+        sort_key="created_at",
+        reverse=False,
+    )
 
     lines = [
         "### ⚒️ FORGE — **F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution",
