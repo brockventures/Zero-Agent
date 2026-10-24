@@ -1267,7 +1267,7 @@ def render_job_widget_embed(task_id: str, db_path: Path | str = FORGE_DB_PATH) -
     cmd_snippet = command[:180] + ("..." if len(command) > 180 else "")
     cmd_line = f"**Command:** `{cmd_snippet}`" if cmd_snippet else ""
 
-    # Tail up to 4 non-banner lines from log_file
+    # Tail up to 4 non-banner lines from log_file, bounding per-line & total output length
     tail_lines = []
     log_file = meta.get("log_file")
     if log_file:
@@ -1277,8 +1277,14 @@ def render_job_widget_embed(task_id: str, db_path: Path | str = FORGE_DB_PATH) -
                 with open(lp, "r", encoding="utf-8", errors="replace") as lf:
                     for line in lf:
                         s = line.rstrip()
-                        if s and not s.startswith("--- [Detached Runner]") and not s.startswith("[Detached Runner]"):
-                            tail_lines.append(s)
+                        if (
+                            s
+                            and not s.startswith("--- [Detached Runner]")
+                            and not s.startswith("[Detached Runner]")
+                            and not s.startswith("--- Command:")
+                            and not s.startswith("--- Target Channel:")
+                        ):
+                            tail_lines.append(s[:100] + ("..." if len(s) > 100 else ""))
             except Exception:
                 pass
     tail_lines = tail_lines[-4:]
@@ -1287,7 +1293,10 @@ def render_job_widget_embed(task_id: str, db_path: Path | str = FORGE_DB_PATH) -
     if cmd_line:
         desc_parts.append(cmd_line)
     if tail_lines:
-        desc_parts.append("**Recent Output:**\n```text\n" + "\n".join(tail_lines) + "\n```")
+        recent_out = "\n".join(tail_lines)
+        if len(recent_out) > 280:
+            recent_out = recent_out[:277] + "..."
+        desc_parts.append("**Recent Output:**\n```text\n" + recent_out + "\n```")
     elif status in ("starting", "running"):
         desc_parts.append("*Initializing process output...*")
 

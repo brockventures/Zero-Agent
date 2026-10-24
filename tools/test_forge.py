@@ -610,8 +610,25 @@ class TestForgeEngine(unittest.TestCase):
             # Should have the last 4 non-banner lines: Line B, Line C, Line D, Line E
             self.assertIn("Line B\nLine C\nLine D\nLine E", embed["description"])
             self.assertNotIn("--- [Detached Runner]", embed["description"])
+            self.assertNotIn("--- Command:", embed["description"])
             self.assertNotIn("[Detached Runner] Starting worker", embed["description"])
             self.assertNotIn("Line A", embed["description"])
+
+            # Verify single-line and total Recent Output character caps (100/line, 280 total)
+            log_file.write_text(
+                "--- [Detached Runner] Started ---\n"
+                "--- Command: python3 script.py ---\n"
+                "--- Target Channel: 123 | Timeout: 60s ---\n"
+                + ("X" * 500) + "\n"
+                + ("Y" * 500) + "\n"
+                + ("Z" * 500) + "\n",
+                encoding="utf-8",
+            )
+            capped_embed = render_job_widget_embed(task_id, db_path=self.db_path)
+            recent_block = capped_embed["description"].split("**Recent Output:**\n```text\n")[1].split("\n```")[0]
+            self.assertLessEqual(len(recent_block), 280)
+            for ln in recent_block.splitlines():
+                self.assertLessEqual(len(ln), 103)
 
             # Test unknown task embed
             unknown_embed = render_job_widget_embed("non-existent-task", db_path=self.db_path)
