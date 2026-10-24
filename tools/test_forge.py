@@ -752,6 +752,67 @@ class TestForgeEngine(unittest.TestCase):
                 self.assertIn("fg-1792819519-epic-40", swept)
                 self.assertTrue(mock_del.called)
 
+    def test_09_failure_envelope_and_job_failure_circuit_breaker(self):
+        # 1. Test 3-strike build failure envelope & origin dispatch
+        plan = {
+            "title": "Broken Build Test",
+            "repo": "/workspace",
+            "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["Test failure envelope"],
+            "chunks": [
+                {
+                    "title": "Failing Chunk",
+                    "target_files": ["tools/forge.py"],
+                    "instructions": "Fail verification.",
+                    "verification_cmd": "pytest tools/test_forge.py",
+                }
+            ],
+        }
+        enq = enqueue_build(plan, db_path=self.db_path, post_widget=False)
+        build_id = enq["build_id"]
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            conn.execute(
+                "UPDATE forge_chunks SET status = 'failed', last_error = 'AssertionError: expected 1 == 2' WHERE build_id = ?",
+                (build_id,),
+            )
+            conn.execute("UPDATE forge_builds SET status = 'failed' WHERE id = ?", (build_id,))
+
+        fail_env = forge_mod.format_origin_failure_envelope(build_id, db_path=self.db_path)
+        self.assertIn("FORGE BUILD FAILURE ENVELOPE", fail_env)
+        self.assertIn("Failing Chunk", fail_env)
+        self.assertIn("AssertionError: expected 1 == 2", fail_env)
+
+        with patch("tools.outbox.queue_outbox_message") as mock_outbox:
+            self.assertTrue(forge_mod.dispatch_build_failure_to_origin(build_id, db_path=self.db_path))
+            mock_outbox.assert_called_once()
+            self.assertEqual(mock_outbox.call_args.kwargs["channel"], ZERO_OPS_CHANNEL_ID)
+
+        # 2. Test repeated detached job failure circuit breaker
+        now = time.time()
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            for idx in (1, 2):
+                conn.execute(
+                    """
+                    INSERT INTO forge_jobs (id, name, command, start_time, end_time, status, exit_code)
+                    VALUES (?, 'Configure Hardcover', 'python3 /workspace/scratch/configure_hardcover.py', ?, ?, 'failed', 1)
+                    """,
+                    (f"dt-fail-{idx}", now - 60.0 + idx, now - 50.0 + idx),
+                )
+
+        ok_cb, cb_reason = forge_mod._check_recent_repeated_job_failures(
+            "python3 /workspace/scratch/configure_hardcover.py",
+            "Configure Hardcover",
+            db_path=self.db_path,
+        )
+        self.assertFalse(ok_cb)
+        self.assertIn("Circuit Breaker Triggered", cb_reason)
+        with self.assertRaises(RuntimeError):
+            forge_mod.start_job(
+                command="python3 /workspace/scratch/configure_hardcover.py",
+                name="Configure Hardcover",
+                db_path=self.db_path,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

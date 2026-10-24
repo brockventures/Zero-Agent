@@ -2010,6 +2010,63 @@ def format_origin_completion_envelope(build_id: str, db_path: Path | str = FORGE
     return "\n".join(lines)
 
 
+def format_origin_failure_envelope(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> str:
+    """Format the structured FORGE Failure Envelope sent to the originating channel Orchestrator when a build 3-strikes."""
+    with get_db_connection(db_path) as conn:
+        build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
+        if not build:
+            return ""
+        chunks = conn.execute(
+            "SELECT * FROM forge_chunks WHERE build_id = ? ORDER BY chunk_index ASC",
+            (build_id,),
+        ).fetchall()
+
+    failed_chunk = next((c for c in chunks if c["status"] == "failed"), None)
+    lines = [
+        f"[FORGE BUILD FAILURE ENVELOPE — `{build['id']}`]",
+        f"**Build Title:** {build['title']}",
+        f"**Repository:** `{build['repo']}`",
+        "**Status:** ❌ Build halted after exhausting 3 Maker-Checker attempts (including Argon Medium escalation).",
+    ]
+    if failed_chunk:
+        lines.extend([
+            f"**Failed Chunk:** Chunk {failed_chunk['chunk_index'] + 1} of {len(chunks)} — **{failed_chunk['title']}**",
+            f"**Verification Gate:** `{failed_chunk['verification_cmd'] or 'auto-baseline'}`",
+        ])
+        if failed_chunk["last_error"]:
+            lines.append(f"\n### Final Verification Error Traceback:\n```text\n{failed_chunk['last_error'][-1200:]}\n```")
+
+    lines.append(
+        "\nInspect the failure traceback above, diagnose why the chunk failed Maker-Checker verification, "
+        "and either enqueue a corrected `ForgePlan` or report the concrete blocker concisely to Ryan in this channel."
+    )
+    return "\n".join(lines)
+
+
+def dispatch_build_failure_to_origin(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> bool:
+    """Wake the Argon Orchestrator in the originating channel/thread when a FORGE build fails after 3 attempts."""
+    with get_db_connection(db_path) as conn:
+        build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
+        if not build:
+            return False
+
+    envelope = format_origin_failure_envelope(build_id, db_path=db_path)
+    target_ch = build["origin_thread_id"] or build["origin_channel_id"]
+    try:
+        from tools.outbox import queue_outbox_message
+        queue_outbox_message(
+            channel=int(target_ch),
+            content=envelope,
+            source_turn=f"forge-failed-{build_id}",
+            msg_type="agent_turn",
+            force=True,
+        )
+        return True
+    except Exception as e:
+        print(f"[FORGE] Failed dispatching build failure to origin {target_ch}: {e}")
+        return False
+
+
 def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> bool:
     """Wake the Argon Orchestrator in the originating channel/thread when all chunks complete."""
     with get_db_connection(db_path) as conn:
@@ -2443,6 +2500,8 @@ class ForgeSupervisor:
             conn.execute("UPDATE forge_chunks SET status = 'failed', completed_at = ? WHERE id = ?", (time.time(), chunk_id))
             conn.execute("UPDATE forge_builds SET status = 'failed', updated_at = ? WHERE id = ?", (time.time(), build_id))
         post_or_update_build_widget(build_id, db_path=self.db_path)
+        sync_forge_channel_header(db_path=self.db_path)
+        dispatch_build_failure_to_origin(build_id, db_path=self.db_path)
         return False
 
 
@@ -2607,6 +2666,59 @@ def _find_active_duplicate_job(command: str, cwd: str, db_path: Path | str = FOR
     return None
 
 
+def _check_recent_repeated_job_failures(
+    command: str,
+    name: str,
+    db_path: Path | str = FORGE_DB_PATH,
+    window_seconds: float = 600.0,
+    max_failures: int = 2,
+) -> tuple[bool, str]:
+    """Circuit breaker: block spawning detached jobs if the same command or job name failed >= max_failures times in the last window_seconds."""
+    now = time.time()
+    cutoff = now - window_seconds
+    norm_cmd = command.strip()
+    norm_name = name.strip().lower()
+    generic_names = {"", "ad-hoc background task", "background task", "job", "test"}
+
+    script_match = re.search(r"\b(?:python[0-9.]*|bash|sh)\s+([^\s;\"'|&>]+\.(?:py|sh))\b", norm_cmd)
+    target_script = script_match.group(1) if script_match else ""
+
+    try:
+        with get_db_connection(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, name, command, exit_code, end_time
+                FROM forge_jobs
+                WHERE status IN ('failed', 'timed_out') AND start_time >= ?
+                ORDER BY start_time DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+    except Exception:
+        return True, ""
+
+    matching_failures = []
+    for r in rows:
+        r_cmd = str(r["command"] or "").strip()
+        r_name = str(r["name"] or "").strip().lower()
+        same_cmd = (r_cmd == norm_cmd)
+        same_script = bool(target_script and target_script in r_cmd)
+        same_name = bool(norm_name and norm_name not in generic_names and r_name == norm_name)
+        if same_cmd or same_script or same_name:
+            matching_failures.append(r)
+
+    if len(matching_failures) >= max_failures:
+        recent_ids = ", ".join(r["id"] for r in matching_failures[:3])
+        return False, (
+            f"FORGE Detached Job Failure Circuit Breaker Triggered: Job '{name or norm_cmd[:60]}' has already failed "
+            f"{len(matching_failures)} times in the last {int(window_seconds // 60)} minutes ({recent_ids}). "
+            "Do NOT repeatedly edit and re-fire 'forge.py job start' in a loop. "
+            "Verify your fix locally with a targeted test, enqueue a structured ForgePlan via 'forge.py enqueue', "
+            "or surface the concrete root-cause blocker to Ryan."
+        )
+    return True, ""
+
+
 def start_job(
     command: str,
     channel: str = "",
@@ -2632,6 +2744,10 @@ def start_job(
                     dup_meta = dict(existing)
                     dup_meta["deduplicated"] = True
                     return dup_meta
+
+                ok_cb, cb_reason = _check_recent_repeated_job_failures(command, name, db_path=db_path)
+                if not ok_cb:
+                    raise RuntimeError(cb_reason)
 
             name_clean = name.strip() or "Ad-Hoc Background Task"
             slug = re.sub(r"[^a-zA-Z0-9_-]", "", name_clean.lower().replace(" ", "-"))[:20] or "job"

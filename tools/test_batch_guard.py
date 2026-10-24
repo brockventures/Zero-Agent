@@ -269,14 +269,16 @@ class TestBatchGuard(unittest.TestCase):
             )[0]
         )
 
-        # Enqueueing a FORGE plan resets the inline production file counter
+        # Enqueueing a FORGE plan activates the Post-Offload Turn Lock so the agent must end its turn
         self.assertTrue(
             check_tool_use(
                 "run_command",
                 {"CommandLine": "python3 /workspace/tools/forge.py enqueue /workspace/scratch/forge_plan.json"},
             )[0]
         )
-        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/delta.py"})[0])
+        allowed_after_enqueue, lock_reason = check_tool_use("edit_file", {"Path": "/workspace/tools/delta.py"})
+        self.assertFalse(allowed_after_enqueue)
+        self.assertIn("FORGE Post-Offload Turn Lock Triggered", lock_reason)
 
     def test_45s_idle_reset_preserves_inline_prod_files_until_15m_expiry(self):
         from unittest.mock import patch
@@ -310,12 +312,14 @@ class TestBatchGuard(unittest.TestCase):
         self.assertIn("FORGE Scratch Loop Gate Triggered", reason)
         self.assertIn("forge.py job start", reason)
 
-        # Launching via forge.py job start is allowed and resets scratch_script_runs
+        # Launching via forge.py job start is allowed and activates the Post-Offload Turn Lock for the rest of the turn
         allowed, _ = check_batching(
             'python3 /workspace/tools/forge.py job start --name "Tune K" --command "python3 /workspace/scratch/tune_k.py"'
         )
         self.assertTrue(allowed)
-        self.assertTrue(check_batching("python3 /workspace/scratch/tune_k.py")[0])
+        allowed_after_job, reason_after_job = check_batching("python3 /workspace/scratch/tune_k.py")
+        self.assertFalse(allowed_after_job)
+        self.assertIn("FORGE Post-Offload Turn Lock Triggered", reason_after_job)
 
     def test_heavy_inline_benchmark_and_migration_blocked_outside_forge(self):
         for heavy_cmd in [

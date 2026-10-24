@@ -58,6 +58,7 @@ _PROD_SOURCE_PATH_RE = re.compile(
 
 def _default_state(now: float = 0.0) -> dict:
     return {
+        "agy_ppid": 0,
         "last_time": now,
         "turn_start_time": now,
         "cmd_inspections": 0,
@@ -74,6 +75,8 @@ def _default_state(now: float = 0.0) -> dict:
         "scratch_script_runs": {},
         "total_scratch_runs": 0,
         "turn_run_commands": 0,
+        "offload_dispatched": False,
+        "offload_kind": "",
     }
 
 
@@ -549,6 +552,8 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
         preserved_runs = dict(state.get("scratch_script_runs", {}))
         preserved_total_scratch = int(state.get("total_scratch_runs", 0))
         preserved_turn_cmds = int(state.get("turn_run_commands", 0))
+        preserved_offload = bool(state.get("offload_dispatched", False))
+        preserved_offload_kind = str(state.get("offload_kind", ""))
         preserved_start = float(state.get("turn_start_time", now) or now)
         state = _default_state(now)
         state["inline_prod_files"] = preserved_prod
@@ -556,8 +561,10 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
         state["scratch_script_runs"] = preserved_runs
         state["total_scratch_runs"] = preserved_total_scratch
         state["turn_run_commands"] = preserved_turn_cmds
+        state["offload_dispatched"] = preserved_offload
+        state["offload_kind"] = preserved_offload_kind
         # Keep original turn_start_time if the turn has already started mutating files, running commands, or running scratch sweeps
-        if preserved_total_scratch > 0 or len(preserved_prod) > 0 or preserved_turn_cmds > 0:
+        if preserved_total_scratch > 0 or len(preserved_prod) > 0 or preserved_turn_cmds > 0 or preserved_offload:
             state["turn_start_time"] = preserved_start
         else:
             state["turn_start_time"] = now
@@ -572,20 +579,37 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
             "Stop calling tools silently and let the background task completion notification wake you automatically."
         )
 
+    # 0b. Post-Offload Turn Lock: Once a FORGE build (`forge.py enqueue`) or detached background job (`forge.py job start`)
+    # is dispatched in an interactive turn, block all subsequent mutating/execution tool calls so the agent cannot
+    # loop or abuse `forge.py job start` as an inline `run_command` counter reset.
+    if (
+        state.get("offload_dispatched")
+        and os.environ.get("FORGE_WORKER_ACTIVE") != "1"
+        and not os.path.abspath(cwd or "/workspace").replace("\\", "/").startswith("/tmp/forge-wt-")
+    ):
+        if name in ("run_command", "edit_file", "replace_file_content", "write_file", "write_to_file"):
+            kind_label = state.get("offload_kind") or "FORGE job/build"
+            save_state(state, state_file)
+            return False, (
+                f"FORGE Post-Offload Turn Lock Triggered: A {kind_label} was already dispatched in this turn. "
+                "Do not continue executing commands, editing scripts, or spawning additional jobs in the same turn. "
+                "End your turn immediately (output your brief launch status to Ryan) and wait for the asynchronous completion wakeup."
+            )
+
     # 1. run_command check
     if name == "run_command":
         cmd = args.get("CommandLine", "")
-        if "forge.py" in cmd and ("enqueue" in cmd or "job" in cmd or "stage-decision" in cmd):
+        is_forge_enqueue = bool(re.search(r"\bforge\.py\s+enqueue\b", cmd))
+        is_forge_job_start = bool(
+            re.search(r"\bforge\.py\s+job\s+start\b", cmd) or re.search(r"\bdetached_runner\.py\s+start\b", cmd)
+        )
+        if is_forge_enqueue:
             state["inline_prod_files"] = []
-            state["scratch_script_runs"] = {}
-            state["total_scratch_runs"] = 0
-            state["turn_run_commands"] = 0
-            state["turn_start_time"] = now
-        elif "detached_runner.py" in cmd and "start" in cmd:
-            state["scratch_script_runs"] = {}
-            state["total_scratch_runs"] = 0
-            state["turn_run_commands"] = 0
-            state["turn_start_time"] = now
+            state["offload_dispatched"] = True
+            state["offload_kind"] = "FORGE multi-chunk build (forge.py enqueue)"
+        elif is_forge_job_start:
+            state["offload_dispatched"] = True
+            state["offload_kind"] = "FORGE background job (forge.py job start)"
 
         # A00-del. File Deletion & Decision Card Tamper Gate
         ok_del, del_reason = check_file_deletion_gate(cmd, cwd=cwd)
