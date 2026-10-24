@@ -425,6 +425,51 @@ class TestBatchGuard(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("Hook Self-Preservation Syntax Guard", reason)
 
+    def test_sql_query_guard_blocks_select_star_missing_limit_and_invalid_columns(self):
+        import sqlite3
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "baseball_test.db")
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE projections (player_id TEXT, player_name TEXT, woba REAL, hr INTEGER)")
+            conn.commit()
+            conn.close()
+
+            # 1. SELECT * is blocked and returns valid columns
+            allowed, reason = check_batching(f'sqlite3 {db_path} "SELECT * FROM projections LIMIT 10"')
+            self.assertFalse(allowed)
+            self.assertIn("'SELECT *' is prohibited", reason)
+            self.assertIn("projections(player_id, player_name, woba, hr)", reason)
+
+            # 2. SELECT without LIMIT is blocked and returns valid columns
+            allowed, reason = check_batching(f'sqlite3 {db_path} "SELECT player_name, woba FROM projections WHERE hr > 20"')
+            self.assertFalse(allowed)
+            self.assertIn("without a LIMIT clause is prohibited", reason)
+            self.assertIn("projections(player_id, player_name, woba, hr)", reason)
+
+            # 3. Invalid column name is caught pre-execution via EXPLAIN QUERY PLAN and returns valid schema
+            allowed, reason = check_batching(f'sqlite3 {db_path} "SELECT player_name, xwoba_guessed FROM projections LIMIT 10"')
+            self.assertFalse(allowed)
+            self.assertIn("SQLite Schema Validation Failed", reason)
+            self.assertIn("no such column: xwoba_guessed", reason)
+            self.assertIn("projections(player_id, player_name, woba, hr)", reason)
+
+            # 4. Inline python sqlite3.connect(...).execute(...) with invalid column or missing LIMIT is blocked
+            py_bad = f"python3 -c \"import sqlite3; c=sqlite3.connect('{db_path}'); print(c.execute('SELECT bad_col FROM projections LIMIT 5').fetchall())\""
+            allowed, reason = check_batching(py_bad)
+            self.assertFalse(allowed)
+            self.assertIn("no such column: bad_col", reason)
+            self.assertIn("projections(player_id, player_name, woba, hr)", reason)
+
+            # 5. Scalar aggregate (SELECT COUNT(*)) without LIMIT is allowed
+            allowed, _ = check_batching(f'sqlite3 {db_path} "SELECT COUNT(*) FROM projections"')
+            self.assertTrue(allowed)
+
+            # 6. Valid explicit-column query with LIMIT is allowed
+            allowed, _ = check_batching(f'sqlite3 {db_path} "SELECT player_name, woba, hr FROM projections ORDER BY woba DESC LIMIT 15"')
+            self.assertTrue(allowed)
+
 
 if __name__ == "__main__":
     unittest.main()

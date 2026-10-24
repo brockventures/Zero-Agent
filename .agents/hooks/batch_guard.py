@@ -334,6 +334,169 @@ def is_unbounded_ha_sqlite_query(cmd: str) -> bool:
     return False
 
 
+_SQL_SELECT_STAR_RE = re.compile(r"\bSELECT\s+(?:DISTINCT\s+)?\*\s+FROM\b", re.IGNORECASE)
+_SQL_AGGREGATE_ONLY_RE = re.compile(
+    r"^\s*(?:EXPLAIN(?:\s+QUERY\s+PLAN)?\s+)?SELECT\s+(?:COUNT|MIN|MAX|SUM|AVG|TOTAL|GROUP_CONCAT)\s*\(",
+    re.IGNORECASE,
+)
+_SQL_TABLE_EXTRACT_RE = re.compile(r"\b(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", re.IGNORECASE)
+_SQL_CTE_NAME_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(", re.IGNORECASE)
+_DB_PATH_EXTRACT_RE = re.compile(r"(?P<db>[^\s'\"()]+?\.(?:db|sqlite|sqlite3))\b")
+
+
+def _extract_sql_queries_from_cmd(cmd: str) -> list[tuple[str | None, str]]:
+    """Extract (db_path, sql_query) pairs from sqlite3 CLI invocations and Python sqlite3 calls."""
+    if not cmd or "SELECT" not in cmd.upper():
+        return []
+    results: list[tuple[str | None, str]] = []
+
+    # 1. sqlite3 CLI invocations: sqlite3 [options] <db_path> "<sql>" or '<sql>'
+    for m in re.finditer(
+        r"\bsqlite3\s+(?:-[a-zA-Z0-9_-]+(?:\s+\"[^\"]*\"|\s+'[^']*')?\s+)*([^\s'\"|;&]+\.(?:db|sqlite|sqlite3))\s+(\"([^\"]+)\"|'([^']+)')",
+        cmd,
+    ):
+        db_p = m.group(1)
+        sql_q = m.group(3) if m.group(3) is not None else m.group(4)
+        if sql_q and re.search(r"\bSELECT\b", sql_q, re.IGNORECASE):
+            results.append((db_p, sql_q.strip()))
+
+    if results:
+        return results
+
+    # 2. Inline Python / script strings with sqlite3.connect / .execute / pd.read_sql
+    db_match = _DB_PATH_EXTRACT_RE.search(cmd)
+    db_path = db_match.group("db") if db_match else None
+    if db_path and db_path.startswith("file:"):
+        db_path = db_path[5:].split("?")[0]
+
+    for m in re.finditer(
+        r"(?:\.execute|\.executemany|read_sql(?:_query)?)\s*\(\s*([fFrR]*)(['\"]{3}|['\"])([\s\S]*?)\2",
+        cmd,
+    ):
+        sql_q = m.group(3).strip()
+        if re.search(r"\bSELECT\b", sql_q, re.IGNORECASE):
+            results.append((db_path, sql_q))
+
+    return results
+
+
+def _introspect_sqlite_table_columns(db_path: str, table_names: list[str], cwd: str = "/workspace") -> str:
+    """Return formatted 'table(col1, col2, ...)' hints for existing local SQLite tables."""
+    if not db_path:
+        return ""
+    clean_db = db_path[5:].split("?")[0] if db_path.startswith("file:") else db_path
+    norm_cwd = os.path.abspath(cwd or "/workspace")
+    abs_db = os.path.abspath(os.path.join(norm_cwd, clean_db))
+    if not os.path.exists(abs_db):
+        return ""
+    hints: list[str] = []
+    try:
+        conn = sqlite3.connect(f"file:{abs_db}?mode=ro", uri=True, timeout=1.5)
+        try:
+            if not table_names:
+                cur = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 25"
+                )
+                tables = [r[0] for r in cur.fetchall()]
+                if tables:
+                    return f"Available tables in '{os.path.basename(abs_db)}': {', '.join(tables)}"
+                return ""
+            for tbl in table_names[:5]:
+                if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", tbl):
+                    continue
+                cur = conn.execute(f"PRAGMA table_info({tbl})")
+                cols = [r[1] for r in cur.fetchall()]
+                if cols:
+                    hints.append(f"{tbl}({', '.join(cols)})")
+            if not hints:
+                cur = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 25"
+                )
+                tables = [r[0] for r in cur.fetchall()]
+                if tables:
+                    return f"Available tables in '{os.path.basename(abs_db)}': {', '.join(tables)}"
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+    return "; ".join(hints)
+
+
+def check_sql_query_guard(cmd: str, cwd: str = "/workspace") -> tuple[bool, str]:
+    """
+    SQLite Query Discipline & Pre-Execution Schema Validator:
+    1. Ban 'SELECT * FROM ...' (forces explicit column projection and returns live table schema).
+    2. Ban top-level SELECT queries without a LIMIT clause (unless purely scalar aggregate or WHERE ... IN (SELECT ...)).
+    3. Pre-validate SQL syntax and column/table names against local SQLite databases via EXPLAIN QUERY PLAN,
+       returning exact valid column names on mismatch so the LLM never plays 20-questions with field names.
+    """
+    extracted = _extract_sql_queries_from_cmd(cmd)
+    if not extracted:
+        return True, ""
+
+    for db_path, raw_sql in extracted:
+        # Split multi-statement SQL strings safely
+        statements = [s.strip() for s in raw_sql.split(";") if s.strip()]
+        for stmt in statements:
+            if not re.search(r"^\s*(?:WITH\b[\s\S]+?\bSELECT\b|SELECT\b)", stmt, re.IGNORECASE):
+                continue
+
+            cte_names = {m.group(1).lower() for m in _SQL_CTE_NAME_RE.finditer(stmt)}
+            tables = [
+                m.group(1)
+                for m in _SQL_TABLE_EXTRACT_RE.finditer(stmt)
+                if m.group(1).lower() not in cte_names
+            ]
+            # Deduplicate preserving order
+            seen_t: set[str] = set()
+            unique_tables: list[str] = []
+            for t in tables:
+                if t.lower() not in seen_t:
+                    seen_t.add(t.lower())
+                    unique_tables.append(t)
+
+            # 1. Outright ban on SELECT * FROM
+            if _SQL_SELECT_STAR_RE.search(stmt):
+                schema_hint = _introspect_sqlite_table_columns(db_path or "", unique_tables, cwd=cwd)
+                hint_suffix = f" Valid columns: {schema_hint}" if schema_hint else ""
+                return False, (
+                    "SQLite Query Guard Triggered: 'SELECT *' is prohibited because it wastes tokens and dumps wide rows. "
+                    f"Specify the exact column names you need and include a LIMIT clause.{hint_suffix}"
+                )
+
+            # 2. Outright ban on top-level SELECT without LIMIT (unless scalar aggregate like COUNT/MIN/MAX/SUM/AVG)
+            if not re.search(r"\bLIMIT\s+(?:\d+|\?|\:[a-zA-Z_][a-zA-Z0-9_]*)", stmt, re.IGNORECASE):
+                if not _SQL_AGGREGATE_ONLY_RE.search(stmt):
+                    schema_hint = _introspect_sqlite_table_columns(db_path or "", unique_tables, cwd=cwd)
+                    hint_suffix = f" Valid columns: {schema_hint}" if schema_hint else ""
+                    return False, (
+                        "SQLite Query Guard Triggered: Unbounded SELECT query without a LIMIT clause is prohibited. "
+                        f"Append 'LIMIT <N>' (e.g. LIMIT 25) to bound output token volume.{hint_suffix}"
+                    )
+
+            # 3. Live SQLite schema validation via EXPLAIN QUERY PLAN (when local DB exists and no f-string placeholders)
+            if db_path and "{" not in stmt and "}" not in stmt:
+                clean_db = db_path[5:].split("?")[0] if db_path.startswith("file:") else db_path
+                norm_cwd = os.path.abspath(cwd or "/workspace")
+                abs_db = os.path.abspath(os.path.join(norm_cwd, clean_db))
+                if os.path.exists(abs_db):
+                    try:
+                        conn = sqlite3.connect(f"file:{abs_db}?mode=ro", uri=True, timeout=1.5)
+                        try:
+                            conn.execute(f"EXPLAIN QUERY PLAN {stmt}")
+                        finally:
+                            conn.close()
+                    except sqlite3.Error as e:
+                        err_msg = str(e)
+                        if "no such column" in err_msg.lower() or "no such table" in err_msg.lower() or "ambiguous column" in err_msg.lower():
+                            schema_hint = _introspect_sqlite_table_columns(abs_db, unique_tables, cwd=cwd)
+                            hint_suffix = f" Valid schema: {schema_hint}" if schema_hint else ""
+                            return False, (
+                                f"SQLite Schema Validation Failed ({err_msg}). Do not guess column or table names.{hint_suffix}"
+                            )
+    return True, ""
+
+
 _DESTRUCTIVE_GIT_WIPE_RE = re.compile(
     r"\bgit\s+(?:"
     r"reset\s+--hard\b|"
@@ -744,6 +907,11 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                 "lower bound causes multi-minute table scans and write-lock stalls. Prefer the Home Assistant REST API "
                 "(/api/states or /api/history/period) or include an indexed 'last_updated_ts >' filter with '-readonly'."
             )
+
+        # A0b-2. SQLite Query Guard (Ban SELECT *, Ban SELECT without LIMIT, Pre-Validate Schema & Columns)
+        ok_sql, sql_reason = check_sql_query_guard(cmd, cwd=cwd)
+        if not ok_sql:
+            return False, sql_reason
 
         # A0c. Destructive Git Working-Tree Wipe Guard
         if is_destructive_git_working_tree_wipe(cmd, cwd):
