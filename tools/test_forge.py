@@ -681,11 +681,11 @@ class TestForgeEngine(unittest.TestCase):
                 row_after = conn.execute("SELECT forge_message_id FROM forge_jobs WHERE id = ?", (task_id,)).fetchone()
                 self.assertIsNone(row_after["forge_message_id"])
 
-            # Also verify prune_completed_build_widgets prunes completed jobs
+            # Also verify prune_completed_build_widgets prunes completed, failed (>1h), and cancelled (immediate) jobs
             with forge_mod.get_db_connection(self.db_path) as conn:
                 conn.execute(
-                    "UPDATE forge_jobs SET status = 'completed', forge_message_id = 99887766, end_time = ? WHERE id = ?",
-                    (time.time() - 3700.0, task_id),
+                    "UPDATE forge_jobs SET status = 'cancelled', forge_message_id = 99887766, end_time = ? WHERE id = ?",
+                    (time.time(), task_id),
                 )
             pruned_all = prune_completed_build_widgets(ttl_seconds=3600.0, db_path=self.db_path, delete_remote=False)
             self.assertIn(task_id, pruned_all)
@@ -693,7 +693,7 @@ class TestForgeEngine(unittest.TestCase):
                 row_all = conn.execute("SELECT forge_message_id FROM forge_jobs WHERE id = ?", (task_id,)).fetchone()
                 self.assertIsNone(row_all["forge_message_id"])
 
-            # 5. Verify remote channel sweep catches completed cards from unmounted peer containers
+            # 5. Verify remote channel sweep catches completed/failed cards and duplicate STARTING cards
             mock_get_resp = MagicMock()
             mock_get_resp.status_code = 200
             mock_get_resp.json.return_value = [
@@ -703,13 +703,36 @@ class TestForgeEngine(unittest.TestCase):
                     "embeds": [],
                 },
                 {
+                    "id": "1563660794455924747",
+                    "timestamp": "2099-10-24T21:09:44.811000+00:00",
+                    "edited_timestamp": "2099-10-24T21:09:56.158000+00:00",
+                    "embeds": [
+                        {
+                            "title": "✅ Doorbell Frame Grab Setup",
+                            "description": "**COMPLETED** · `Zero-Agent`",
+                            "footer": {"text": "dt-1792876183-doorbell · 2026-10-24 02:09:55 PM PT"},
+                        }
+                    ],
+                },
+                {
+                    "id": "1563660792941912097",
+                    "timestamp": "2099-10-24T21:09:44.450000+00:00",
+                    "embeds": [
+                        {
+                            "title": "⏳ Doorbell Frame Grab Setup",
+                            "description": "**STARTING** · `Zero-Agent`",
+                            "footer": {"text": "dt-1792876183-doorbell · 2026-10-24 02:09:43 PM PT"},
+                        }
+                    ],
+                },
+                {
                     "id": "1563423123603324939",
                     "timestamp": "2026-10-20T00:00:00.000000+00:00",
                     "edited_timestamp": "2026-10-20T01:00:00.000000+00:00",
                     "embeds": [
                         {
-                            "title": "✅ Epic 40: Refresh BIG Peak",
-                            "description": "**COMPLETED** · `big-projections`",
+                            "title": "❌ Epic 40: Refresh BIG Peak",
+                            "description": "**FAILED** · `big-projections`",
                             "footer": {"text": "Build ID: fg-1792819519-epic-40 · Auto-clears in 1h"},
                         }
                     ],

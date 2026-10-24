@@ -28,6 +28,7 @@ STATE_FILE = DATA_DIR / "sideproject_autodeploy_state.json"
 
 SERVICES = {
     "highball": {
+        "repo_url": "https://github.com/mcarmody/highball.git",
         "repo_dir": Path("/workspace/scratch/highball"),
         "port": 8001,
         "health_url": "http://127.0.0.1:8001/health",
@@ -36,6 +37,7 @@ SERVICES = {
         "start_cmd": [sys.executable, "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8001"],
     },
     "outpost": {
+        "repo_url": "https://github.com/mcarmody/outpost.git",
         "repo_dir": Path("/workspace/scratch/outpost"),
         "port": 8000,
         "health_url": "http://127.0.0.1:8000/health",
@@ -150,8 +152,18 @@ def check_and_sync_repo(service_name: str) -> dict:
     }
 
     if not repo_dir.exists():
-        res["error"] = f"Directory {repo_dir} does not exist"
-        return res
+        try:
+            repo_dir.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.check_call(
+                ["git", "clone", "--depth", "20", cfg["repo_url"], str(repo_dir)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            log(f"[{service_name}] Auto-cloned {cfg['repo_url']} -> {repo_dir}")
+        except Exception as e:
+            res["error"] = f"Directory {repo_dir} does not exist and clone failed: {e}"
+            return res
 
     try:
         # Get current local commit

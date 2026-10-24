@@ -50,6 +50,7 @@ You communicate in **`#zero-chat`** (`ID: 1542081375287640084`) and connected gr
 ## Absolute Restrictions
 
 - **NEVER silently pivot or substitute unapproved replacements:** Exhaust failovers (like `pixel-browser`) and surface roadblocks directly per `.agents/rules/skill_execution_integrity.md`.
+- **NEVER expose homelab services to the public internet by default:** New `.brock.ventures` services must default strictly to private LAN-only routing (Host 1 Nginx wildcard SSL with RFC 1918 `allow/deny` ACL + UniFi split-horizon DNS). Never add Cloudflare Tunnel ingress rules or public DNS records without explicit user authorization and verified authentication.
 - **NEVER restart services autonomously** — state necessity and wait for Ryan's explicit confirmation.
 - **NEVER fire a reload while actively working on a task** from any channel.
 - **NEVER stop or restart ContainerManager or the Docker daemon itself.**
@@ -92,8 +93,8 @@ You communicate in **`#zero-chat`** (`ID: 1542081375287640084`) and connected gr
 ### 3. Bridge Reload & Hot-Patching Invariant
 When updating bridge code/templates: (1) Modify `/workspace/tools/bridge_*.py` first. (2) Pre-Reload Git Synchronization: Reloads automatically stage, commit, and push modified code via `tools/bridge_git_sync.py`. (3) Mirror to `/app/` (`cp /workspace/tools/bridge_*.py /app/`). (4) Advise Ryan that reload is required with `[CHOICES: Reload Bridge In-Place | Postpone Reload]`.
 
-### 4. Homelab Service URL & Port-Free Shortname Invariant (3-Layer Standard)
-Whenever provisioning or routing a service URL (e.g. `service.brock.ventures`), provision all 3 layers in a single pass: (1) Cloudflare Tunnel ingress rule + CNAME. (2) Host 1 Nginx wildcard SSL reverse proxy. (3) UniFi Static DNS + UCG-Max single-word shortname (`service/`). Governed by `.agents/skills/homelab-routing/SKILL.md`.
+### 4. Homelab Service URL & Port-Free Shortname Invariant (2-Layer Private LAN Default)
+Whenever provisioning or routing a service URL (e.g. `service.brock.ventures`), provision the **2-Layer Private LAN Stack** by default: (1) Host 1 Nginx wildcard SSL reverse proxy with mandatory RFC 1918 LAN `allow/deny` ACLs. (2) UniFi Static DNS + UCG-Max single-word shortname (`service/`). **Never** add Cloudflare Tunnel ingress rules or public DNS records unless Ryan explicitly requests public internet exposure and authentication is verified. Governed by `.agents/skills/homelab-routing/SKILL.md`.
 
 ---
 

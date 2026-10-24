@@ -487,8 +487,8 @@ class TestZeroPrinterWatcher(unittest.TestCase):
         self.assertLessEqual(details_locked["head_x_err"], 45.0)
         self.assertTrue(is_frame_unoccluded(details_locked))
 
-        # 2. Out-of-phase bed Y frame (bed_y=1450, err=65.0 > 14.0)
-        f_bed_out = _make_frame(1450.0, DEFAULT_TARGET_HEAD_X, 800.0)
+        # 2. Out-of-phase bed Y frame (bed_y=1350, err=145.0 > 14.0)
+        f_bed_out = _make_frame(1350.0, DEFAULT_TARGET_HEAD_X, 800.0)
         score_bed_out, details_bed_out = score_burst_frame(f_bed_out)
         self.assertGreater(details_bed_out["bed_y_err"], 14.0)
         self.assertFalse(is_frame_unoccluded(details_bed_out))
@@ -527,22 +527,18 @@ class TestZeroPrinterWatcher(unittest.TestCase):
         tl_dir = self.tmp_path / "timelapse" / "stab_job"
         tl_dir.mkdir(parents=True, exist_ok=True)
 
-        # 3 frames with bed jitter: 1375, 1385, 1395
-        f1 = _make_frame(1375.0)
-        f2 = _make_frame(1385.0)
-        f3 = _make_frame(1395.0)
-        f1.save(tl_dir / "frame_0001.jpg")
-        f2.save(tl_dir / "frame_0002.jpg")
-        f3.save(tl_dir / "frame_0003.jpg")
+        # 6 frames: 5 near nominal 1385, 1 extreme out-of-phase outlier at 1280
+        test_ys = [1380.0, 1385.0, 1280.0, 1390.0, 1382.0, 1388.0]
+        for idx, by in enumerate(test_ys, start=1):
+            _make_frame(by).save(tl_dir / f"frame_{idx:04d}.jpg")
 
         with patch("tools.zero_printer_watcher.TIMELAPSE_ROOT", self.tmp_path / "timelapse"):
-            # Compile with stabilization
+            # Compile with stationary-camera outlier filtering (zero 2D canvas translation)
             out_gif = compile_timelapse_gif("stab_job.gcode", max_width=540, frame_ms=100, final_hold_ms=500, stabilize_bed=True)
             self.assertIsNotNone(out_gif)
             self.assertTrue(out_gif.exists())
             self.assertGreater(out_gif.stat().st_size, 0)
 
-            # Inspect registered frames from output GIF
             gif_img = Image.open(out_gif)
             detected_ys = []
             for i in range(gif_img.n_frames):
@@ -551,11 +547,11 @@ class TestZeroPrinterWatcher(unittest.TestCase):
                 pose = detect_bed_and_toolhead_pose(fr)
                 detected_ys.append(pose["bed_y"])
 
-            # Bed Y positions should now be registered closely around the median (1385.0)
-            self.assertEqual(len(detected_ys), 3)
-            raw_variance = float(np.var([1375.0, 1385.0, 1395.0]))
+            # The 1280.0 outlier frame should be dropped while keeping the 5 phase-locked frames
+            self.assertEqual(len(detected_ys), 5)
+            raw_variance = float(np.var(test_ys))
             stab_variance = float(np.var(detected_ys))
-            self.assertLess(stab_variance, raw_variance / 2.0)
+            self.assertLess(stab_variance, raw_variance / 5.0)
 
 
 if __name__ == "__main__":

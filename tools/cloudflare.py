@@ -52,11 +52,36 @@ def _zone_id(zone_name: str) -> tuple[str | None, dict | None]:
 
 def cloudflare_dns(action: str, zone_name: str = "", record_id: str = "",
                    record_type: str = "", record_name: str = "", content: str = "",
-                   proxied: bool = False, ttl: int = 1) -> dict:
-    """Manage Cloudflare DNS records across zones."""
+                   proxied: bool = False, ttl: int = 1,
+                   confirm_public_exposure: bool = False) -> dict:
+    """Manage Cloudflare DNS records across zones.
+
+    SECURITY INVARIANT (LAN-Only Default):
+    Creating or updating records that expose services publicly (proxied=True,
+    cfargotunnel.com, or DDNS endpoints) requires confirm_public_exposure=True,
+    which may only be set when Ryan explicitly requests public internet access.
+    """
     token = _get_api_token()
     if not token:
         return {"ok": False, "error": "CLOUDFLARE_API_TOKEN is not set."}
+
+    if action in ("create_record", "update_record"):
+        is_tunnel_or_public = (
+            proxied
+            or "cfargotunnel.com" in (content or "").lower()
+            or "synology.me" in (content or "").lower()
+            or record_type.upper() in ("A", "AAAA", "CNAME")
+        )
+        if is_tunnel_or_public and not confirm_public_exposure:
+            return {
+                "ok": False,
+                "error": (
+                    "PUBLIC EXPOSURE GUARD BLOCKED: Homelab services are strictly LAN-only by default "
+                    "(.agents/skills/homelab-routing/SKILL.md). Do NOT create public Cloudflare DNS or "
+                    "Tunnel records unless Ryan explicitly requested public internet access and auth is verified. "
+                    "Pass confirm_public_exposure=True only when explicitly authorized."
+                ),
+            }
 
     try:
         if action == "list_zones":

@@ -40,7 +40,7 @@ if not WIFI_DEVICE and os.path.exists("/secrets/env.json"):
 # Model and bed coordinate anchors for 1080x1920 portrait frames
 MODEL_CENTER_X = 540
 MODEL_CENTER_Y = 1120
-DEFAULT_TARGET_BED_Y = 1385.0
+DEFAULT_TARGET_BED_Y = 1495.0
 DEFAULT_TARGET_HEAD_X = 370.0
 BED_RAIL_DX_DY = -0.35
 
@@ -208,42 +208,32 @@ def detect_bed_and_toolhead_pose(img: Image.Image) -> Dict[str, Any]:
     edge_y = DEFAULT_TARGET_BED_Y
 
     if x2_pei > x1_pei and y2_pei > y1_pei:
-        pei_roi = arr[y1_pei:y2_pei, x1_pei:x2_pei]
+        pei_roi = arr[y1_pei:y2_pei, x1_pei:x2_pei].astype(np.float32)
         luma = 0.299 * pei_roi[:, :, 0] + 0.587 * pei_roi[:, :, 1] + 0.114 * pei_roi[:, :, 2]
-
-        column_edges = []
-        for c in range(luma.shape[1]):
-            col = luma[:, c]
-            valid = (col[:-1] > 75) & (col[1:] < 75)
+        row_luma = luma.mean(axis=1)
+        win = max(2, int(round(14 * sy)))
+        if len(row_luma) > 2 * win:
+            # Compute mean luma in window above vs window below each row to reject PEI surface speckles
+            csum = np.concatenate([[0.0], np.cumsum(row_luma)])
+            idx_range = np.arange(win, len(row_luma) - win)
+            above_mean = (csum[idx_range] - csum[idx_range - win]) / float(win)
+            below_mean = (csum[idx_range + win] - csum[idx_range]) / float(win)
+            drops = above_mean - below_mean
+            valid = (above_mean > 80.0) & (below_mean < 68.0) & (drops > 20.0)
             if np.any(valid):
-                drops = col[:-1] - col[1:]
-                idx = np.where(valid)[0]
-                best_r = idx[np.argmax(drops[idx])]
-                column_edges.append(best_r + 1)
-
-        min_cols = max(3, int(0.02 * (x2_pei - x1_pei)))
-        if len(column_edges) >= min_cols:
-            detected_y_px = y1_pei + float(np.median(column_edges))
-            edge_y = detected_y_px / sy
-            edge_found = True
-        else:
-            row_luma = luma.mean(axis=1)
-            row_valid = (row_luma[:-1] > 75) & (row_luma[1:] < 75)
-            if np.any(row_valid):
-                row_drops = row_luma[:-1] - row_luma[1:]
-                idx = np.where(row_valid)[0]
-                best_r = idx[np.argmax(row_drops[idx])]
-                edge_y = (y1_pei + best_r + 1) / sy
+                valid_indices = idx_range[valid]
+                best_r = int(valid_indices[np.argmax(drops[valid])])
+                edge_y = (y1_pei + best_r) / sy
                 edge_found = True
 
-    # 2. White COMGROW silkscreen centroid detection in x=20..490 above the lip
+    # 2. White COMGROW silkscreen centroid detection in x=20..490 strictly on the front lip bezel
     # Neutral white pixels: min(R,G,B) > 170 and max(R,G,B) - min(R,G,B) < 40
-    # Mask out desk objects below edge_y
+    # Strictly bounded to [edge_y - 145*sy, edge_y - 5*sy] so the white 3D model on the bed is never included
     x1_cg = max(0, min(w - 1, int(round(20 * sx))))
     x2_cg = max(x1_cg + 1, min(w, int(round(490 * sx))))
     edge_y_px = int(round(edge_y * sy))
-    y2_cg = max(0, min(h, edge_y_px))
-    y1_cg = max(0, min(int(round(900 * sy)), max(0, y2_cg - 1)))
+    y2_cg = max(0, min(h, edge_y_px - max(1, int(round(5 * sy)))))
+    y1_cg = max(0, min(y2_cg - 1, edge_y_px - max(4, int(round(145 * sy)))))
 
     logo_px = 0
     logo_x: Optional[float] = None

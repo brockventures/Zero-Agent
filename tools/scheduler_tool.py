@@ -11,9 +11,9 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 if "/workspace" not in sys.path:
@@ -864,13 +864,17 @@ def load_schedule() -> list[dict]:
         return DEFAULT_JOBS
 
 def save_schedule(jobs: list[dict]):
-    """Persist schedule safely with an atomic write."""
+    """Persist schedule safely with a process/thread-isolated atomic write."""
     bs.DATA_DIR.mkdir(parents=True, exist_ok=True)
     sched_file = bs.DATA_DIR / "schedule.json"
-    tmp = sched_file.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(jobs, f, indent=2)
-    tmp.replace(sched_file)
+    tmp = sched_file.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(jobs, f, indent=2)
+        tmp.replace(sched_file)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
 
 def format_schedule_summary() -> str:
     """Format upcoming schedule in clean Option 3 inline bullets."""

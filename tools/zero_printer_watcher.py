@@ -18,7 +18,6 @@ import sys
 import time
 import json
 import signal
-import numpy as np
 import argparse
 import urllib.request
 import urllib.error
@@ -172,53 +171,41 @@ def compile_timelapse_gif(
         from tools.webcam_control import detect_bed_and_toolhead_pose
 
         raw_frames = []
+        bed_ys = []
         for fp in frame_paths:
             with Image.open(fp) as im:
                 im_rgb = im.convert("RGB")
+                if stabilize_bed:
+                    try:
+                        p = detect_bed_and_toolhead_pose(im_rgb)
+                        bed_ys.append(float(p["edge_y"]) if p.get("edge_y", 0.0) != 1495.0 else float(p["bed_y"]))
+                    except Exception:
+                        bed_ys.append(0.0)
                 w, h = im_rgb.size
                 if w > max_width:
                     new_h = int(round(h * (max_width / float(w))))
                     im_rgb = im_rgb.resize((max_width, new_h), Image.Resampling.LANCZOS)
                 raw_frames.append(im_rgb)
 
-        if stabilize_bed and raw_frames:
-            poses = []
-            for frame in raw_frames:
-                try:
-                    p = detect_bed_and_toolhead_pose(frame)
-                    poses.append((p["bed_x"], p["bed_y"]))
-                except Exception as e:
-                    print(f"[Timelapse] Warning: bed pose detection failed on frame: {e}")
-                    poses.append((0.0, 0.0))
-
-            valid_poses = [p for p in poses if p[0] != 0.0 and p[1] != 0.0]
-            if valid_poses:
-                ref_bed_x = float(np.median([p[0] for p in valid_poses]))
-                ref_bed_y = float(np.median([p[1] for p in valid_poses]))
-
-                stabilized_frames = []
-                for frame, (bx, by) in zip(raw_frames, poses):
-                    if bx == 0.0 and by == 0.0:
-                        stabilized_frames.append(frame)
-                        continue
-                    fw, fh = frame.size
-                    sx = fw / 1080.0
-                    sy = fh / 1920.0
-                    dx = (ref_bed_x - bx) * sx
-                    dy = (ref_bed_y - by) * sy
-
-                    clamped_dx = max(-45.0, min(45.0, dx))
-                    clamped_dy = max(-95.0, min(95.0, dy))
-                    shift_x = int(round(clamped_dx))
-                    shift_y = int(round(clamped_dy))
-
-                    if shift_x != 0 or shift_y != 0:
-                        bg = Image.new("RGB", (fw, fh), (28, 28, 30))
-                        bg.paste(frame, (shift_x, shift_y))
-                        stabilized_frames.append(bg)
-                    else:
-                        stabilized_frames.append(frame)
-                raw_frames = stabilized_frames
+        if stabilize_bed and len(raw_frames) >= 6:
+            # Find the dominant bed-Y cluster mode (densest +-35px window) across active print frames
+            # and drop out-of-phase frames while keeping the camera 100% stationary (zero canvas shifting).
+            valid_ys = [y for y in bed_ys[:-1] if y > 0.0]
+            if len(valid_ys) >= 4:
+                mode_bed_y = max(
+                    valid_ys,
+                    key=lambda c: (sum(1 for y in valid_ys if abs(y - c) <= 35.0), c),
+                )
+                filtered_frames = []
+                for idx, (frame, by) in enumerate(zip(raw_frames, bed_ys)):
+                    if idx == len(raw_frames) - 1 or by <= 0.0 or abs(by - mode_bed_y) <= 40.0:
+                        filtered_frames.append(frame)
+                if len(filtered_frames) >= max(4, len(raw_frames) // 3):
+                    print(
+                        f"[Timelapse] Phase-filtered {len(raw_frames)} -> {len(filtered_frames)} frames "
+                        f"around dominant bed_y={mode_bed_y:.1f}px (±40px, stationary camera)"
+                    )
+                    raw_frames = filtered_frames
 
         frames = [f.quantize(colors=256, method=Image.Quantize.FASTOCTREE) for f in raw_frames]
         durations = [frame_ms] * (len(frames) - 1) + [final_hold_ms]

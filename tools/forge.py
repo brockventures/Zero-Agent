@@ -1151,7 +1151,7 @@ def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH
             chunk_lines.append(f"  ⚠️ `{err_snip}`")
 
     desc = header_line + ("\n\n" + "\n".join(chunk_lines) if chunk_lines else "")
-    footer_suffix = " · Auto-clears in 1h" if build["status"] == "completed" else ""
+    footer_suffix = " · Auto-clears in 1h" if build["status"] in ("completed", "failed", "cancelled") else ""
     return {
         "title": f"{b_emoji} {build['title'][:220]}",
         "description": desc[:4000],
@@ -1303,12 +1303,13 @@ def render_job_widget_embed(task_id: str, db_path: Path | str = FORGE_DB_PATH) -
     desc = "\n\n".join(desc_parts)
 
     footer_time = meta.get("end_time") or meta.get("start_time") or time.time()
+    footer_suffix = " · Auto-clears in 1h" if status in ("completed", "failed", "cancelled", "timed_out") else ""
     return {
         "title": f"{b_emoji} {meta.get('name', 'Background Task')[:220]}",
         "description": desc[:4000],
         "color": color,
         "footer": {
-            "text": f"{task_id} · {_now_pt_str(footer_time)}"
+            "text": f"{task_id} · {_now_pt_str(footer_time)}{footer_suffix}"
         },
     }
 
@@ -1318,57 +1319,79 @@ def post_or_update_job_widget(
     db_path: Path | str = FORGE_DB_PATH,
     forge_channel_id: int = FORGE_CHANNEL_ID,
 ) -> Optional[int]:
-    """Post or edit the single live Discord Embed card for `task_id` inside #forge via REST API v10."""
-    meta = _read_job_meta(task_id, db_path=db_path)
-    if not meta:
-        return None
+    """Post or edit the single live Discord Embed card for `task_id` inside #forge via REST API v10.
 
-    embed = render_job_widget_embed(task_id, db_path=db_path)
-    token = _get_discord_token(for_forge_channel=True)
-    if not token:
-        return None
+    Serializes concurrent caller updates (e.g. `start_job` parent vs `_run_job_worker_locked` child)
+    under an exclusive per-task `widget.lock` so a job never double-posts an orphaned `STARTING` card.
+    """
+    task_dir = _get_job_dir(task_id)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    wlock_path = task_dir / "widget.lock"
 
-    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-    msg_id = meta.get("forge_message_id")
-    if not msg_id:
+    with open(wlock_path, "a+", encoding="utf-8") as wlock:
         try:
-            with get_db_connection(db_path) as conn:
-                row = conn.execute("SELECT forge_message_id FROM forge_jobs WHERE id = ?", (task_id,)).fetchone()
-                if row and row["forge_message_id"]:
-                    msg_id = row["forge_message_id"]
+            fcntl.flock(wlock.fileno(), fcntl.LOCK_EX)
         except Exception:
             pass
+        try:
+            meta = _read_job_meta(task_id, db_path=db_path)
+            if not meta:
+                return None
 
-    payload = {"content": "", "embeds": [embed]}
-    try:
-        if msg_id:
-            url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
-            resp = requests.patch(url, headers=headers, json=payload, timeout=10)
+            embed = render_job_widget_embed(task_id, db_path=db_path)
+            token = _get_discord_token(for_forge_channel=True)
+            if not token:
+                return None
+
+            headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+            msg_id = meta.get("forge_message_id")
+            if not msg_id:
+                try:
+                    with get_db_connection(db_path) as conn:
+                        row = conn.execute("SELECT forge_message_id FROM forge_jobs WHERE id = ?", (task_id,)).fetchone()
+                        if row and row["forge_message_id"]:
+                            msg_id = row["forge_message_id"]
+                except Exception:
+                    pass
+
+            payload = {"content": "", "embeds": [embed]}
+            if msg_id:
+                url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
+                resp = requests.patch(url, headers=headers, json=payload, timeout=10)
+                if resp.status_code < 300:
+                    return int(msg_id)
+                if resp.status_code != 404:
+                    return int(msg_id)
+
+            url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages"
+            resp = requests.post(url, headers=headers, json=payload, timeout=10)
             if resp.status_code < 300:
-                return int(msg_id)
-
-        url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages"
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
-        if resp.status_code < 300:
-            new_msg_id = int(resp.json()["id"])
+                new_msg_id = int(resp.json()["id"])
+                try:
+                    with get_db_connection(db_path) as conn:
+                        conn.execute(
+                            "UPDATE forge_jobs SET forge_message_id = ? WHERE id = ?",
+                            (new_msg_id, task_id),
+                        )
+                except Exception:
+                    pass
+                meta["forge_message_id"] = new_msg_id
+                _write_job_meta(task_id, meta, db_path=db_path)
+                return new_msg_id
+        except Exception as e:
+            print(f"[FORGE] Warning updating #forge widget for job {task_id}: {e}")
+        finally:
             try:
-                with get_db_connection(db_path) as conn:
-                    conn.execute(
-                        "UPDATE forge_jobs SET forge_message_id = ? WHERE id = ?",
-                        (new_msg_id, task_id),
-                    )
+                fcntl.flock(wlock.fileno(), fcntl.LOCK_UN)
             except Exception:
                 pass
-            meta["forge_message_id"] = new_msg_id
-            _write_job_meta(task_id, meta, db_path=db_path)
-            return new_msg_id
-    except Exception as e:
-        print(f"[FORGE] Warning updating #forge widget for job {task_id}: {e}")
     return None
 
 
 _LAST_REMOTE_CHANNEL_SWEEP_TS: float = 0.0
 REMOTE_CHANNEL_SWEEP_INTERVAL_SECONDS: float = 300.0
+TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled", "timed_out")
+TERMINAL_BUILD_STATUSES = ("completed", "failed", "cancelled")
 
 
 def prune_completed_job_widgets(
@@ -1377,7 +1400,7 @@ def prune_completed_job_widgets(
     forge_channel_id: int = FORGE_CHANNEL_ID,
     delete_remote: bool = True,
 ) -> list[str]:
-    """Delete Discord embed cards in #forge for completed background jobs older than `ttl_seconds` (default 1h)."""
+    """Delete Discord embed cards in #forge for terminal background jobs (`completed`, `failed`, `cancelled`, `timed_out`) older than `ttl_seconds` (or immediately if `cancelled`)."""
     cutoff = time.time() - float(ttl_seconds)
     pruned_ids: list[str] = []
     db_paths = [Path(db_path)] + _get_peer_forge_db_paths(db_path)
@@ -1390,10 +1413,10 @@ def prune_completed_job_widgets(
             with get_db_connection(target_db) as conn:
                 rows = conn.execute(
                     """
-                    SELECT id, forge_message_id FROM forge_jobs
-                    WHERE status = 'completed'
+                    SELECT id, status, forge_message_id FROM forge_jobs
+                    WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out')
                       AND forge_message_id IS NOT NULL
-                      AND COALESCE(end_time, start_time) <= ?
+                      AND (status = 'cancelled' OR COALESCE(end_time, start_time) <= ?)
                     """,
                     (cutoff,),
                 ).fetchall()
@@ -1441,15 +1464,13 @@ def _sweep_stale_forge_channel_embeds(
     token: str,
     db_paths: list[Path],
 ) -> list[str]:
-    """Fallback channel-level sweep: delete completed #forge embed cards older than `cutoff` directly via Discord API.
-
-    Catches completed build/job cards whose originating SQLite DB lives inside an unmounted peer container
-    (e.g. `/baseball/data/forge.db` when inspected from `discord-antigravity-agent`).
+    """Channel-level sweep: delete terminal (`completed`, `failed`, `cancelled`, `timed_out`) #forge embed cards older than `cutoff`,
+    immediately delete `cancelled` cards, and immediately delete duplicate or orphaned `STARTING` cards.
     """
     swept_ids: list[str] = []
     headers = {"Authorization": f"Bot {token}"}
     try:
-        url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages?limit=30"
+        url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages?limit=50"
         resp = requests.get(url, headers=headers, timeout=10)
         if resp.status_code != 200:
             return swept_ids
@@ -1458,6 +1479,9 @@ def _sweep_stale_forge_channel_embeds(
             return swept_ids
     except Exception:
         return swept_ids
+
+    now = time.time()
+    seen_entity_ids: set[str] = set()
 
     for msg in messages:
         try:
@@ -1470,35 +1494,59 @@ def _sweep_stale_forge_channel_embeds(
             emb = embeds[0]
             title = str(emb.get("title") or "")
             desc = str(emb.get("description") or "")
-            if not (title.startswith("✅") or desc.startswith("**COMPLETED**")):
-                continue
+            footer_text = str((emb.get("footer") or {}).get("text") or "")
+            id_match = re.search(r"(?:Build\s+ID:\s*|Job\s+ID:\s*|\b)((?:fg|dt)-[A-Za-z0-9_-]+)", footer_text)
+            entity_id = id_match.group(1) if id_match else f"msg-{msg_id_raw}"
+
             ts_str = msg.get("edited_timestamp") or msg.get("timestamp")
-            if not ts_str:
-                continue
-            msg_ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).timestamp()
-            if msg_ts > cutoff:
+            msg_ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00")).timestamp() if ts_str else 0.0
+
+            is_duplicate_entity = False
+            if id_match:
+                if entity_id in seen_entity_ids:
+                    is_duplicate_entity = True
+                else:
+                    seen_entity_ids.add(entity_id)
+
+            is_cancelled = title.startswith("🛑") or desc.startswith("**CANCELLED**")
+            is_terminal = (
+                is_cancelled
+                or title.startswith(("✅", "❌", "⏱️"))
+                or desc.startswith(("**COMPLETED**", "**FAILED**", "**TIMED OUT**"))
+            )
+            is_stuck_starting = (
+                (title.startswith("⏳") or desc.startswith("**STARTING**"))
+                and msg_ts > 0
+                and (now - msg_ts) >= 120.0
+            )
+
+            should_delete = (
+                is_duplicate_entity
+                or is_cancelled
+                or is_stuck_starting
+                or (is_terminal and msg_ts > 0 and msg_ts <= cutoff)
+            )
+            if not should_delete:
                 continue
 
             del_url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id_raw}"
             del_resp = requests.delete(del_url, headers=headers, timeout=10)
             if del_resp.status_code in (200, 204, 404):
-                footer_text = str((emb.get("footer") or {}).get("text") or "")
-                id_match = re.search(r"(?:Build|Job)\s+ID:\s*([A-Za-z0-9_-]+)", footer_text)
-                entity_id = id_match.group(1) if id_match else f"msg-{msg_id_raw}"
                 swept_ids.append(entity_id)
-                for target_db in db_paths:
-                    try:
-                        with get_db_connection(target_db) as conn:
-                            conn.execute(
-                                "UPDATE forge_builds SET forge_message_id = NULL WHERE forge_message_id = ? OR id = ?",
-                                (int(msg_id_raw), entity_id),
-                            )
-                            conn.execute(
-                                "UPDATE forge_jobs SET forge_message_id = NULL WHERE forge_message_id = ? OR id = ?",
-                                (int(msg_id_raw), entity_id),
-                            )
-                    except Exception:
-                        pass
+                if not is_duplicate_entity:
+                    for target_db in db_paths:
+                        try:
+                            with get_db_connection(target_db) as conn:
+                                conn.execute(
+                                    "UPDATE forge_builds SET forge_message_id = NULL WHERE forge_message_id = ?",
+                                    (int(msg_id_raw),),
+                                )
+                                conn.execute(
+                                    "UPDATE forge_jobs SET forge_message_id = NULL WHERE forge_message_id = ?",
+                                    (int(msg_id_raw),),
+                                )
+                        except Exception:
+                            pass
         except Exception:
             continue
 
@@ -1512,7 +1560,7 @@ def prune_completed_build_widgets(
     delete_remote: bool = True,
     force_channel_sweep: bool = False,
 ) -> list[str]:
-    """Delete Discord embed cards in #forge for completed builds and background jobs older than `ttl_seconds` (default 1h)."""
+    """Delete Discord embed cards in #forge for terminal builds and background jobs older than `ttl_seconds` (default 1h), or immediately when cancelled."""
     global _LAST_REMOTE_CHANNEL_SWEEP_TS
     now = time.time()
     cutoff = now - float(ttl_seconds)
@@ -1527,10 +1575,10 @@ def prune_completed_build_widgets(
             with get_db_connection(target_db) as conn:
                 rows = conn.execute(
                     """
-                    SELECT id, forge_message_id FROM forge_builds
-                    WHERE status = 'completed'
+                    SELECT id, status, forge_message_id FROM forge_builds
+                    WHERE status IN ('completed', 'failed', 'cancelled')
                       AND forge_message_id IS NOT NULL
-                      AND updated_at <= ?
+                      AND (status = 'cancelled' OR updated_at <= ?)
                     """,
                     (cutoff,),
                 ).fetchall()
@@ -2453,6 +2501,13 @@ def _write_job_meta(task_id: str, meta: dict, db_path: Path | str = FORGE_DB_PAT
     task_dir = _get_job_dir(task_id)
     task_dir.mkdir(parents=True, exist_ok=True)
     meta_file = task_dir / "meta.json"
+    if meta.get("forge_message_id") is None and meta_file.exists():
+        try:
+            existing = json.loads(meta_file.read_text(encoding="utf-8"))
+            if existing.get("forge_message_id") is not None:
+                meta["forge_message_id"] = existing["forge_message_id"]
+        except Exception:
+            pass
     temp_file = task_dir / "meta.json.tmp"
     temp_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     temp_file.replace(meta_file)
@@ -2877,7 +2932,7 @@ Directive:
 
 
 def cancel_job(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
-    """Cancel an active background job."""
+    """Cancel an active background job and immediately prune its #forge embed card."""
     meta = _read_job_meta(task_id, db_path=db_path)
     if not meta:
         return {"error": f"Task '{task_id}' not found."}
@@ -2886,6 +2941,7 @@ def cancel_job(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
     worker_pid = meta.get("worker_pid")
 
     meta["status"] = "cancelled"
+    meta["end_time"] = meta.get("end_time") or time.time()
     _write_job_meta(task_id, meta, db_path=db_path)
 
     killed = False
@@ -2902,7 +2958,7 @@ def cancel_job(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> dict:
                     pass
 
     if _is_prod_forge_env(db_path):
-        post_or_update_job_widget(task_id, db_path=db_path)
+        prune_completed_job_widgets(db_path=db_path)
         sync_forge_channel_header(db_path=db_path)
 
     return {"task_id": task_id, "status": "cancelled", "process_killed": killed}
@@ -3448,7 +3504,8 @@ def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
         lines.append("- *No detached background tasks currently running.*")
     else:
         for j in jobs:
-            lines.append(f"- ⚙️ **`{j['id']}` — {j['name']}** (`{j['status']}` · `{j['channel']}`)")
+            ch_ref = _format_channel_mention(j["channel"])
+            lines.append(f"- ⚙️ **`{j['id']}` — {j['name']}** (`{j['status']}` · {ch_ref})")
 
     lines.append("\n**Pending Action Approvals (Decisions):**")
     if not decisions:
@@ -3460,6 +3517,91 @@ def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
             )
 
     return "\n".join(lines)
+
+
+def _merge_remote_active_embeds_into_header(
+    content: str,
+    forge_channel_id: int,
+    token: str,
+) -> str:
+    """Supplement header content with any active build/job embeds currently live in #forge from an unmounted peer container."""
+    headers = {"Authorization": f"Bot {token}"}
+    try:
+        resp = requests.get(
+            f"https://discord.com/api/v10/channels/{forge_channel_id}/messages?limit=30",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code != 200 or not isinstance(resp.json(), list):
+            return content
+        messages = resp.json()
+    except Exception:
+        return content
+
+    remote_build_lines: list[str] = []
+    remote_job_lines: list[str] = []
+    seen_ids: set[str] = set()
+
+    for msg in messages:
+        try:
+            if int(msg.get("id", 0)) == FORGE_HEADER_MESSAGE_ID:
+                continue
+            embeds = msg.get("embeds") or []
+            if not embeds:
+                continue
+            emb = embeds[0]
+            title = str(emb.get("title") or "").strip()
+            desc = str(emb.get("description") or "").strip()
+            footer_text = str((emb.get("footer") or {}).get("text") or "")
+            id_match = re.search(r"(?:Build\s+ID:\s*|Job\s+ID:\s*|\b)((?:fg|dt)-[A-Za-z0-9_-]+)", footer_text)
+            if not id_match:
+                continue
+            entity_id = id_match.group(1)
+            if entity_id in seen_ids or f"`{entity_id}`" in content:
+                seen_ids.add(entity_id)
+                continue
+            seen_ids.add(entity_id)
+
+            first_line = desc.splitlines()[0] if desc else ""
+            ch_match = re.search(r"(<#\d+>)", first_line)
+            ch_ref = ch_match.group(1) if ch_match else "`#forge`"
+            clean_title = re.sub(r"^[^\w\s]+\s*", "", title).strip()
+
+            if entity_id.startswith("fg-") and desc.startswith(("**RUNNING**", "**QUEUED**", "**AWAITING APPROVAL**")):
+                st_label = first_line.split("**")[1] if "**" in first_line else "RUNNING"
+                remote_build_lines.append(f"- 🔨 **`{entity_id}` — {clean_title}** (`{st_label}` · {ch_ref})")
+            elif entity_id.startswith("dt-") and desc.startswith("**RUNNING**"):
+                remote_job_lines.append(f"- ⚙️ **`{entity_id}` — {clean_title}** (`running` · {ch_ref})")
+        except Exception:
+            continue
+
+    if remote_build_lines:
+        if "- *No active multi-chunk builds in queue.*" in content:
+            content = content.replace(
+                "- *No active multi-chunk builds in queue.*",
+                "\n".join(remote_build_lines),
+            )
+        else:
+            content = content.replace(
+                "**Active FORGE Builds:**\n",
+                "**Active FORGE Builds:**\n" + "\n".join(remote_build_lines) + "\n",
+                1,
+            )
+
+    if remote_job_lines:
+        if "- *No detached background tasks currently running.*" in content:
+            content = content.replace(
+                "- *No detached background tasks currently running.*",
+                "\n".join(remote_job_lines),
+            )
+        else:
+            content = content.replace(
+                "**Active Background Tasks:**\n",
+                "**Active Background Tasks:**\n" + "\n".join(remote_job_lines) + "\n",
+                1,
+            )
+
+    return content
 
 
 def sync_forge_channel_header(
@@ -3478,7 +3620,11 @@ def sync_forge_channel_header(
         except Exception:
             pass
 
+    token = _get_discord_token(for_forge_channel=True)
     content = format_forge_channel_header(db_path=db_path)
+    if not force and token and _is_prod_forge_env(db_path):
+        content = _merge_remote_active_embeds_into_header(content, forge_channel_id, token)
+
     cache_file = DATA_DIR / ".forge_header_cache.txt"
     if not force and cache_file.exists():
         try:
@@ -3487,14 +3633,14 @@ def sync_forge_channel_header(
         except Exception:
             pass
 
-    token = _get_discord_token(for_forge_channel=True)
     if not token:
         return False
 
     headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
     url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{header_message_id}"
+    rendered_payload = f"{content}\n\n*Last synced: {_now_pt_str()}*"
     try:
-        resp = requests.patch(url, headers=headers, json={"content": content[:1990], "embeds": []}, timeout=10)
+        resp = requests.patch(url, headers=headers, json={"content": rendered_payload[:1990], "embeds": []}, timeout=10)
         if resp.status_code < 300:
             cache_file.write_text(content, encoding="utf-8")
             return True
