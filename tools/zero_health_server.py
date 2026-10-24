@@ -599,9 +599,195 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
     def _evaluate_ivy(self, force: bool = False, strict: bool = False) -> tuple[int, dict]:
         return _evaluate_ivy(force=force, strict=strict)
 
+    @staticmethod
+    def _is_public_landing_host(host_header: str) -> bool:
+        clean_host = (host_header or "").split(":")[0].strip().lower()
+        return clean_host in ("brock.ventures", "www.brock.ventures")
+
+    @staticmethod
+    def _render_public_landing_html() -> str:
+        return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Brock Ventures · Media & Library Portal</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card: rgba(17, 24, 39, 0.82);
+      --card-hover: rgba(30, 41, 59, 0.92);
+      --border: rgba(148, 163, 184, 0.16);
+      --border-hover: rgba(56, 189, 248, 0.48);
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+      background: radial-gradient(circle at 50% 0%, #172554 0%, var(--bg) 60%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem 1.25rem;
+    }
+    .container {
+      width: 100%;
+      max-width: 780px;
+    }
+    header {
+      text-align: center;
+      margin-bottom: 2.5rem;
+    }
+    .badge {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.25);
+      padding: 0.3rem 0.75rem;
+      border-radius: 999px;
+      margin-bottom: 0.9rem;
+    }
+    h1 {
+      font-size: 2.1rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.5rem;
+    }
+    p.subtitle {
+      color: var(--muted);
+      font-size: 1rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 1.15rem;
+    }
+    a.card {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      text-decoration: none;
+      color: inherit;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 1.5rem;
+      backdrop-filter: blur(12px);
+      transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+    }
+    a.card:hover {
+      transform: translateY(-3px);
+      background: var(--card-hover);
+      border-color: var(--border-hover);
+    }
+    .icon {
+      font-size: 1.9rem;
+      margin-bottom: 1rem;
+    }
+    .card h2 {
+      font-size: 1.2rem;
+      font-weight: 600;
+      margin-bottom: 0.45rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .arrow {
+      color: var(--accent);
+      font-size: 1.1rem;
+      transition: transform 0.18s ease;
+    }
+    a.card:hover .arrow {
+      transform: translateX(3px);
+    }
+    .card p {
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.45;
+      margin-bottom: 1.1rem;
+    }
+    .host-tag {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.76rem;
+      color: #cbd5e1;
+      background: rgba(15, 23, 42, 0.7);
+      padding: 0.3rem 0.55rem;
+      border-radius: 6px;
+      align-self: flex-start;
+    }
+    footer {
+      text-align: center;
+      margin-top: 2.5rem;
+      font-size: 0.8rem;
+      color: #64748b;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="badge">Brock Ventures</div>
+      <h1>Media &amp; Library Directory</h1>
+      <p class="subtitle">Quick links for movies, TV requests, digital books, and automated downloads.</p>
+    </header>
+    <div class="grid">
+      <a class="card" href="https://plexrequests.ryanbrock.org" target="_blank" rel="noopener">
+        <div>
+          <div class="icon">🎬</div>
+          <h2>Seerr <span class="arrow">→</span></h2>
+          <p>Request movies and TV series for Plex and track active downloads.</p>
+        </div>
+        <span class="host-tag">plexrequests.ryanbrock.org</span>
+      </a>
+      <a class="card" href="https://books.ryanbrock.org" target="_blank" rel="noopener">
+        <div>
+          <div class="icon">📚</div>
+          <h2>Books Library <span class="arrow">→</span></h2>
+          <p>Browse, read in-browser, or send EPUBs &amp; audiobooks to your e-reader via Calibre-Web.</p>
+        </div>
+        <span class="host-tag">books.ryanbrock.org</span>
+      </a>
+      <a class="card" href="https://bookrequests.ryanbrock.org" target="_blank" rel="noopener">
+        <div>
+          <div class="icon">🔖</div>
+          <h2>Shelfmark <span class="arrow">→</span></h2>
+          <p>Search and grab new books &amp; audiobooks directly into the library.</p>
+        </div>
+        <span class="host-tag">bookrequests.ryanbrock.org</span>
+      </a>
+      <a class="card" href="https://app.plex.tv" target="_blank" rel="noopener">
+        <div>
+          <div class="icon">🍿</div>
+          <h2>Plex <span class="arrow">→</span></h2>
+          <p>Stream movies, shows, and live channels in the Plex web player.</p>
+        </div>
+        <span class="host-tag">app.plex.tv</span>
+      </a>
+    </div>
+    <footer>
+      Brock Ventures Portal
+    </footer>
+  </div>
+</body>
+</html>"""
+
     def do_HEAD(self):
         strict = self._parse_strict()
         clean_path = self.path.split("?")[0].rstrip("/")
+        host_header = self.headers.get("Host", "").lower()
+        if self._is_public_landing_host(host_header):
+            self.send_response(200 if clean_path in ("", "/") else 404)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            return
         if clean_path in ("/api/ivy", "/ivy"):
             code, _ = self._evaluate_ivy(strict=strict)
             content_type = "application/json"
@@ -615,7 +801,6 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             code, _ = self._evaluate_health(strict=strict)
             content_type = "application/json"
         elif clean_path in ("", "/", "/dashboard"):
-            host_header = self.headers.get("Host", "").lower()
             accept_header = self.headers.get("Accept", "")
             if "probe." in host_header or "status." in host_header:
                 code, _ = self._evaluate_health(strict=strict)
@@ -648,6 +833,23 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         query_params = urllib.parse.parse_qs(query_str) if query_str else {}
         host_header = self.headers.get("Host", "").lower()
         accept_header = self.headers.get("Accept", "")
+
+        # Public Landing Portal Guard: brock.ventures / www.brock.ventures serves ONLY the static directory portal
+        if self._is_public_landing_host(host_header):
+            if clean_path in ("", "/"):
+                body = self._render_public_landing_html().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=300")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"Not Found")
+            return
 
         is_ivy = (
             "ivy." in host_header
