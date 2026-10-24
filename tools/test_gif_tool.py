@@ -16,13 +16,10 @@ from tools.gif_tool import (
     is_valid_gif_url,
     detect_franchise,
     check_cooldown,
-    get_cooldown_summary,
     get_history_urls,
-    load_history,
     log_gif_failure,
     get_recent_failures,
     score_candidate,
-    FAILURE_LOG_FILE,
 )
 
 class TestGifTool(unittest.TestCase):
@@ -440,12 +437,13 @@ class TestGifTool(unittest.TestCase):
         self.assertEqual(r7["source"], "canonical_registry")
         self.assertEqual(r7["canonical_id"], "seinfeld_costanza_high_note")
 
+    @patch("tools.gif_tool._call_gemini_api_direct", return_value=None)
     @patch("subprocess.run")
     @patch("tools.gif_tool.is_valid_gif_url", return_value=True)
     @patch("tools.gif_tool.load_history", return_value=[])
     @patch("tools.gif_tool.record_history")
-    def test_llm_semantic_selection_mocked(self, mock_rec, mock_hist, mock_valid, mock_subproc):
-        # 1. Mock LLM returning a specific canonical ID via agy subprocess
+    def test_llm_semantic_selection_mocked(self, mock_rec, mock_hist, mock_valid, mock_subproc, mock_direct):
+        # 1. Mock LLM returning a specific canonical ID via agy subprocess fallback
         mock_proc = MagicMock()
         mock_proc.returncode = 0
         mock_proc.stdout = "office_jim_welp\n"
@@ -455,9 +453,9 @@ class TestGifTool(unittest.TestCase):
         self.assertEqual(res["source"], "canonical_registry")
         self.assertEqual(res["canonical_id"], "office_jim_welp")
 
-        # 2. Verify fallback to FTS5 if subprocess fails
-        mock_proc.stdout = ""
-        mock_proc.returncode = 1
+        # 2. Verify fallback to FTS5 if subprocess fails or returns NONE
+        mock_proc.stdout = "NONE\n"
+        mock_proc.returncode = 0
         res_fallback = get_contextual_gif("kermit sipping tea", run_ocr=False, force=True, use_llm=True)
         self.assertEqual(res_fallback["source"], "canonical_registry")
         self.assertEqual(res_fallback["canonical_id"], "kermit_sipping_tea")
@@ -503,12 +501,12 @@ class TestGifTool(unittest.TestCase):
                 f"Query {q!r} should have matched matrix_neo_kung_fu"
             )
 
-    def test_history_window_limit_15(self):
-        # Verify default limit=15 filters out the last 15 items, but not older items
-        history = [{"url": f"https://tenor.com/view/gif-{i}"} for i in range(25)]
+    def test_history_window_limit_35(self):
+        # Verify default limit=35 filters out the last 35 items, but not older items
+        history = [{"url": f"https://tenor.com/view/gif-{i}"} for i in range(45)]
         excluded = get_history_urls(history)
-        self.assertEqual(len(excluded), 15)
-        self.assertIn("https://tenor.com/view/gif-24", excluded)
+        self.assertEqual(len(excluded), 35)
+        self.assertIn("https://tenor.com/view/gif-44", excluded)
         self.assertIn("https://tenor.com/view/gif-10", excluded)
         self.assertNotIn("https://tenor.com/view/gif-9", excluded)
         self.assertNotIn("https://tenor.com/view/gif-0", excluded)

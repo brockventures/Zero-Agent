@@ -4,7 +4,15 @@ Reaction GIF Tool for Discord Banter (Dynamic-First with OCR Safety & Anti-Repet
 Prioritizes contextual live search, verifies HTTP 200, runs OCR over animation frames
 to reject toxic/out-of-pocket text, tracks recent history, and formats properly titled markdown links.
 """
-import sys, os, re, json, random, urllib.request, urllib.parse, io, sqlite3
+import sys
+import os
+import re
+import json
+import random
+import urllib.request
+import urllib.parse
+import io
+import sqlite3
 from pathlib import Path
 
 HISTORY_FILE = Path("/workspace/data/gif_history.json")
@@ -305,7 +313,7 @@ def extract_gif_ocr(media_url: str, max_samples: int = 2) -> str:
                 break
 
         return " | ".join(extracted)
-    except Exception as e:
+    except Exception:
         return ""
 
 
@@ -376,7 +384,7 @@ def load_history() -> list[dict]:
     return []
 
 
-def get_history_urls(history: list[dict | str] | None = None, limit: int = 15) -> set[str]:
+def get_history_urls(history: list[dict | str] | None = None, limit: int = 35) -> set[str]:
     """Extract set of URLs from recent history records (supports dicts and raw strings)."""
     if history is None:
         history = load_history()
@@ -902,6 +910,23 @@ def _call_gemini_api_direct(prompt: str, timeout: float = 3.0) -> str | None:
     return None
 
 
+def _get_vector_canonical_scores(query: str) -> dict[str, float]:
+    """Query persistent health server's cached FastEmbed canonical GIF matrix in <15ms."""
+    if not query or os.environ.get("GIF_DISABLE_VECTOR_PROXY") == "1":
+        return {}
+    try:
+        port = int(os.environ.get("ZERO_HEALTH_PORT", 8769))
+        url = f"http://127.0.0.1:{port}/api/gif_rank?q={urllib.parse.quote(query)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Zero-GifTool/1.0"})
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            if resp.getcode() == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                return data.get("scores", {}) or {}
+    except Exception:
+        pass
+    return {}
+
+
 def llm_select_canonical_gif(
     query: str,
     registry: list[dict],
@@ -909,10 +934,10 @@ def llm_select_canonical_gif(
     history: list[dict | str] | None = None,
     force: bool = False,
     timeout: int = 15
-) -> dict | None:
+) -> dict | str | None:
     """
-    Use Gemini Flash (direct REST API fast-path, falling back to agy CLI) to select
-    the single best canonical reaction GIF based on conversational situation, subtext, and irony.
+    Use Gemini Flash (direct REST API fast-path, falling back to agy CLI only if unconfigured)
+    to select the single best canonical reaction GIF based on conversational situation, subtext, and irony.
     """
     if not query or not registry:
         return None
@@ -948,37 +973,38 @@ CANONICAL GIF CATALOG:
 {catalog_str}
 
 CRITICAL INSTRUCTIONS:
-1. Select the SINGLE BEST GIF ID from the catalog that genuinely fits the tone, humor, or situation.
-2. If NO GIF in the catalog genuinely fits the context or tone (e.g. serious technical explanation, architectural menu, outage, or no matching comedic trope), return "NONE". Do NOT force an unfitting GIF.
+1. Select the SINGLE BEST GIF ID from the catalog that fits the tone, humor, metaphor, or situation.
+2. Map creative or metaphorical queries to their closest comedic equivalent (e.g. "shield/dodge" -> matrix_neo_bullet_dodge, "conspiracy/math" -> iasip_charlie_pepe_silvia). Only return "NONE" if the query is completely unrelated to any reaction in the catalog.
 3. Return ONLY the chosen GIF ID (or "NONE") on a line by itself. Do not include markdown, explanations, or quotes.
-4. DIVERSIFY SELECTION: Prefer underutilized or fresh gems from the catalog over repeated staples when multiple GIFs fit the tone.
+4. DIVERSIFY SELECTION: Prefer underutilized or fresh gems from the catalog over generic nod/thumbs-up staples when a specific comedic scene fits.
 """
-    raw_out = None
-    import subprocess
-    try:
-        res = subprocess.run(
-            [
-                "agy",
-                "--model=gemini-3.8-flash-low",
-                "--disable-slash-commands",
-                f"-p={prompt}"
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            raw_out = res.stdout.strip()
-    except Exception as e:
-        print(f"[GIF] agy LLM selection error or timeout: {e}", file=sys.stderr)
-        raw_out = None
+    raw_out = _call_gemini_api_direct(prompt, timeout=min(float(timeout), 3.5))
+    if not raw_out:
+        import subprocess
+        try:
+            res = subprocess.run(
+                [
+                    "agy",
+                    "--model=gemini-3.8-flash-low",
+                    "--disable-slash-commands",
+                    f"-p={prompt}"
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                raw_out = res.stdout.strip()
+        except Exception as e:
+            print(f"[GIF] agy LLM selection error or timeout: {e}", file=sys.stderr)
+            raw_out = None
 
     if not raw_out:
         return None
 
     cleaned_out = raw_out.strip()
     if cleaned_out.upper() == "NONE" or re.search(r"\bNONE\b", cleaned_out, re.IGNORECASE):
-        print(f"[GIF] LLM explicitly abstained (returned NONE for situation: '{query}').", file=sys.stderr)
+        print(f"[GIF] LLM abstained for '{query}'; falling through to vector/FTS5 matcher.", file=sys.stderr)
         return "ABSTAIN"
 
     try:
@@ -1064,15 +1090,13 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
                     "vibes": entry.get("vibes")
                 }
 
-    # 2. LLM Semantic Selection (Primary)
+    # 2. LLM Semantic Selection (Primary — falls through on ABSTAIN to vector/FTS5 matcher)
     if use_llm:
         llm_pick = llm_select_canonical_gif(query, registry, history_urls, history=history, force=force)
         if isinstance(llm_pick, dict):
             return llm_pick
-        if llm_pick == "ABSTAIN":
-            return None
 
-    # 2. FTS5 BM25 search
+    # 3. FTS5 BM25 + FastEmbed Vector Hybrid Search
     fts_ranks = {}
     words = [w for w in re.findall(r"[a-z0-9]+", query.lower()) if len(w) > 1 and w not in STOP_WORDS]
     if words:
@@ -1085,11 +1109,12 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
                 WHERE gifs_fts MATCH ?
             """, (fts_q,))
             fts_ranks = {row[0]: row[1] for row in cur.fetchall()}
-        except Exception as e:
-            # Fall back to pure token matching
+        except Exception:
             pass
 
-    # 3. Score all candidates with historical frequency decay penalty
+    vec_scores = _get_vector_canonical_scores(query)
+
+    # 4. Score all candidates with historical frequency decay penalty
     if history is None:
         history = load_history()
     recent_30 = history[-30:] if history else []
@@ -1109,10 +1134,13 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
         if not url:
             continue
 
-        s = score_canonical_candidate(query, entry, fts_score=fts_ranks.get(entry.get("id")))
+        cid = entry.get("id")
+        s = score_canonical_candidate(query, entry, fts_score=fts_ranks.get(cid))
+        v_sim = vec_scores.get(cid, 0.0) if cid else 0.0
+        if v_sim >= 0.62:
+            s += (v_sim - 0.50) * 140.0
         if s >= 35.0:
             # Frequency decay penalty: penalize GIFs that have been used multiple times in the last 30 deliveries
-            cid = entry.get("id")
             freq = max(recent_freq.get(cid, 0), recent_freq.get(url, 0))
             if freq > 0 and not force:
                 s = max(0.0, s - (freq * 35.0))
@@ -1316,7 +1344,7 @@ def get_contextual_gif(query: str, run_ocr: bool = True, force: bool = False, al
         return canonical_pick
 
     rules = get_runtime_gif_rules()
-    canonical_only = rules.get("canonical_only", False) and not allow_dynamic
+    canonical_only = rules.get("canonical_only", False) and not allow_dynamic and not rules.get("dynamic_fallback_on_miss", True)
 
     if canonical_only:
         log_gif_failure(

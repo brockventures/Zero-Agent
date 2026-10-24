@@ -763,6 +763,50 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             body = json.dumps(payload).encode("utf-8")
             content_type = "application/json"
 
+        elif clean_path in ("/api/gif_rank",):
+            q = query_params.get("q", [""])[0]
+            try:
+                import numpy as np
+                from tools.transcript_index import get_embedding_model
+                from tools.gif_tool import load_canonical_registry
+                model = get_embedding_model()
+                reg = load_canonical_registry()
+                if model is None or not reg:
+                    payload = {"error": "Model or canonical registry unavailable"}
+                    status_code = 503
+                else:
+                    global _GIF_MATRIX_CACHE
+                    if "_GIF_MATRIX_CACHE" not in globals() or _GIF_MATRIX_CACHE.get("count") != len(reg):
+                        texts = [
+                            f"{g.get('title', '')} | {g.get('character', '')} | {g.get('franchise', '')} | {g.get('situation', '')} | {' '.join(g.get('vibes', []))} | {' '.join(g.get('tags', []))}"
+                            for g in reg
+                        ]
+                        embs = np.array(list(model.embed(texts)), dtype=np.float32)
+                        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+                        norms[norms == 0] = 1.0
+                        _GIF_MATRIX_CACHE = {
+                            "count": len(reg),
+                            "ids": [g.get("id", "") for g in reg],
+                            "matrix": embs / norms,
+                        }
+                    q_vec = np.array(list(model.embed([q]))[0], dtype=np.float32)
+                    q_norm = float(np.linalg.norm(q_vec))
+                    if q_norm > 0:
+                        q_vec = q_vec / q_norm
+                    sims = np.dot(_GIF_MATRIX_CACHE["matrix"], q_vec)
+                    scores = {
+                        gid: round(float(sim), 4)
+                        for gid, sim in zip(_GIF_MATRIX_CACHE["ids"], sims)
+                        if gid
+                    }
+                    payload = {"scores": scores}
+                    status_code = 200
+            except Exception as e:
+                payload = {"error": str(e)}
+                status_code = 500
+            body = json.dumps(payload).encode("utf-8")
+            content_type = "application/json"
+
         # 4. Health JSON Endpoint
         elif clean_path in ("/api/health", "/health", "/api/status", "/status"):
             if agent == "ivy":
