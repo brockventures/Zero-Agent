@@ -406,8 +406,8 @@ class PersistentChannelWorker:
                     if self.mode == "home":
                         try:
                             from tools.session_summarizer import generate_summary, get_carryforward_context
-                            generate_summary(conv_id=old_conv_id, sess_key=self.sess_key)
-                            carry_ctx = get_carryforward_context(sess_key=self.sess_key)
+                            await asyncio.to_thread(generate_summary, conv_id=old_conv_id, sess_key=self.sess_key)
+                            carry_ctx = await asyncio.to_thread(get_carryforward_context, sess_key=self.sess_key)
                             if carry_ctx:
                                 prompt = f"[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\n{carry_ctx}\n\n[CURRENT USER PROMPT]: {prompt}"
                                 print(f"[BridgeDaemon] 🔄 Auto-compacted home worker #{self.name} ({compact_reason or 'manual reset'}).")
@@ -416,8 +416,8 @@ class PersistentChannelWorker:
                     else:
                         try:
                             from tools.session_summarizer import generate_summary, get_engineering_carryforward_context
-                            generate_summary(conv_id=old_conv_id, sess_key=self.sess_key)
-                            eng_ctx = get_engineering_carryforward_context(sess_key=self.sess_key)
+                            await asyncio.to_thread(generate_summary, conv_id=old_conv_id, sess_key=self.sess_key)
+                            eng_ctx = await asyncio.to_thread(get_engineering_carryforward_context, sess_key=self.sess_key)
                             if eng_ctx:
                                 eng_carry_block = f"\n[PREVIOUS SESSION ENGINEERING DELTA]:\n{eng_ctx}\n\n"
                         except Exception as ce:
@@ -429,7 +429,7 @@ class PersistentChannelWorker:
                 if self.mode == "home":
                     try:
                         from tools.session_summarizer import get_carryforward_context
-                        carry_ctx = get_carryforward_context(sess_key=self.sess_key)
+                        carry_ctx = await asyncio.to_thread(get_carryforward_context, sess_key=self.sess_key)
                         if carry_ctx:
                             prompt = f"[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\n{carry_ctx}\n\n[CURRENT USER PROMPT]: {prompt}"
                             print(f"[BridgeDaemon] 📥 Injected pending carry-forward context for #{self.name} from overnight rollover.")
@@ -438,7 +438,7 @@ class PersistentChannelWorker:
                 else:
                     try:
                         from tools.session_summarizer import get_engineering_carryforward_context
-                        eng_ctx = get_engineering_carryforward_context(sess_key=self.sess_key)
+                        eng_ctx = await asyncio.to_thread(get_engineering_carryforward_context, sess_key=self.sess_key)
                         if eng_ctx:
                             eng_carry_block = f"\n[PREVIOUS SESSION ENGINEERING DELTA]:\n{eng_ctx}\n\n"
                             print(f"[BridgeDaemon] 📥 Injected pending engineering carry-forward delta for #{self.name} from overnight rollover.")
@@ -485,7 +485,8 @@ class PersistentChannelWorker:
                 except Exception as fe:
                     print(f"[BridgeDaemon] Warning pre-resolving message reference {ref_id}: {fe}")
 
-            prepared_prompt = prepare_turn_prompt(
+            prepared_prompt = await asyncio.to_thread(
+                prepare_turn_prompt,
                 prompt=prompt,
                 mode=self.mode,
                 channel_id=self.channel_id,
