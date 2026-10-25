@@ -32,7 +32,9 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -783,6 +785,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
         _ensure_column(conn, "forge_chunks", "target_symbols_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "forge_chunks", "shared_context_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "forge_chunks", "live_status", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "forge_chunks", "depends_on_json", "TEXT NOT NULL DEFAULT '[]'")
 
 
 # Initialize schema on import
@@ -2016,13 +2019,15 @@ def enqueue_build(
             ch_shared_ctx = _normalize_shared_context(ch.get("shared_context"))
             p_files = _normalize_file_list(ch.get("prohibited_files", []))
             v_cmd = str(ch.get("verification_cmd") or "").strip()
+            raw_deps = ch.get("depends_on") or []
+            norm_deps = [int(d) for d in raw_deps if str(d).isdigit() and 0 <= int(d) < len(plan["chunks"])] if isinstance(raw_deps, (list, tuple, set)) else []
             conn.execute(
                 """
                 INSERT INTO forge_chunks (
                     id, build_id, chunk_index, title, repo, worker_model,
                     target_files_json, target_symbols_json, shared_context_json,
-                    prohibited_files_json, instructions, verification_cmd, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                    prohibited_files_json, depends_on_json, instructions, verification_cmd, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
                 """,
                 (
                     chunk_id,
@@ -2035,6 +2040,7 @@ def enqueue_build(
                     json.dumps(t_symbols),
                     json.dumps(ch_shared_ctx),
                     json.dumps(p_files),
+                    json.dumps(norm_deps),
                     ch["instructions"].strip(),
                     v_cmd,
                 ),
@@ -2483,12 +2489,131 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
     return {"cleaned_worktrees": cleaned_wts, "reset_chunks": reset_chunks, "pruned_jobs": pruned_jobs}
 
 
-class ForgeSupervisor:
-    """Asynchronous background supervisor for FORGE build chunks and Decision Card expiry."""
+MAX_PARALLEL_BUILDS_PER_AGENT = 3
+MAX_PARALLEL_CHUNKS_PER_BUILD = 3
 
-    def __init__(self, db_path: Path | str = FORGE_DB_PATH):
+
+def _acquire_repo_git_lock(repo_dir: Path | str):
+    """Acquire an exclusive file lock for git ref/branch/worktree mutations on `repo_dir`."""
+    rp = Path(repo_dir).resolve()
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(rp)).strip("_")
+    lock_path = DATA_DIR / f".forge_git_repo_{slug}.lock"
+    fh = open(lock_path, "a+", encoding="utf-8")
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+    return fh
+
+
+def _release_file_lock(fh) -> None:
+    if not fh:
+        return
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
+def _is_build_worker_lock_held(lock_path: Path) -> bool:
+    if not lock_path.exists():
+        return False
+    try:
+        with open(lock_path, "a+", encoding="utf-8") as lf:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                return True
+            else:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                return False
+    except Exception:
+        return False
+
+
+def _chunks_are_eligible_in_parallel(
+    cand_chunk: sqlite3.Row,
+    all_chunks: list[sqlite3.Row],
+    running_chunks: list[sqlite3.Row],
+) -> bool:
+    """Return True if `cand_chunk` has all explicit dependencies merged and shares zero target files with unmerged earlier or currently running chunks."""
+    cand_idx = int(cand_chunk["chunk_index"])
+    deps_raw = cand_chunk["depends_on_json"] if "depends_on_json" in cand_chunk.keys() else "[]"
+    try:
+        explicit_deps = {int(x) for x in json.loads(deps_raw or "[]")}
+    except Exception:
+        explicit_deps = set()
+
+    merged_indices = {int(c["chunk_index"]) for c in all_chunks if c["status"] == "merged"}
+    if not explicit_deps.issubset(merged_indices):
+        return False
+
+    cand_repo = str(cand_chunk["repo"] or "").strip()
+    cand_files = {str(f).strip().lstrip("./") for f in json.loads(cand_chunk["target_files_json"] or "[]") if str(f).strip()}
+
+    # Implicit dependency: if an earlier unmerged chunk touches any of the same files in the same repo, wait for it
+    for c in all_chunks:
+        c_idx = int(c["chunk_index"])
+        if c_idx >= cand_idx or c["status"] == "merged":
+            continue
+        c_repo = str(c["repo"] or "").strip()
+        if c_repo != cand_repo:
+            continue
+        c_files = {str(f).strip().lstrip("./") for f in json.loads(c["target_files_json"] or "[]") if str(f).strip()}
+        if cand_files & c_files:
+            return False
+
+    # Also ensure zero overlap with any currently running chunk in this build
+    for rc in running_chunks:
+        rc_repo = str(rc["repo"] or "").strip()
+        if rc_repo != cand_repo:
+            continue
+        rc_files = {str(f).strip().lstrip("./") for f in json.loads(rc["target_files_json"] or "[]") if str(f).strip()}
+        if cand_files & rc_files:
+            return False
+
+    return True
+
+
+class ForgeSupervisor:
+    """Asynchronous background supervisor for FORGE build chunks (up to 3 parallel builds x 3 parallel chunks) and Decision Card expiry."""
+
+    def __init__(
+        self,
+        db_path: Path | str = FORGE_DB_PATH,
+        max_parallel_builds: int = MAX_PARALLEL_BUILDS_PER_AGENT,
+        max_parallel_chunks: int = MAX_PARALLEL_CHUNKS_PER_BUILD,
+    ):
         self.db_path = Path(db_path)
-        self._active_build_proc: Optional[subprocess.Popen] = None
+        self.max_parallel_builds = max_parallel_builds
+        self.max_parallel_chunks = max_parallel_chunks
+        self._active_build_procs: dict[str, subprocess.Popen] = {}
+        self._state_lock = threading.Lock()
+
+    def _build_lock_path(self, build_id: str) -> Path:
+        in_ivy = is_ivy_container()
+        prefix = ".forge_build_worker_ivy_" if in_ivy else ".forge_build_worker_"
+        return self.db_path.parent / f"{prefix}{build_id}.lock"
+
+    def _count_active_build_workers(self) -> set[str]:
+        """Return the set of build_ids currently holding an active per-build worker flock for this container."""
+        in_ivy = is_ivy_container()
+        prefix = ".forge_build_worker_ivy_" if in_ivy else ".forge_build_worker_"
+        active_ids: set[str] = set()
+        for bid, proc in list(self._active_build_procs.items()):
+            if proc.poll() is None:
+                active_ids.add(bid)
+            else:
+                self._active_build_procs.pop(bid, None)
+        try:
+            for p in self.db_path.parent.glob(f"{prefix}*.lock"):
+                bid = p.name[len(prefix):-len(".lock")]
+                if _is_build_worker_lock_held(p):
+                    active_ids.add(bid)
+        except Exception:
+            pass
+        return active_ids
 
     def tick_sync(self) -> dict:
         """Synchronous housekeeping tick: expire stale decisions, prune 1h completed #forge cards, sync header, dispatch SDK tasks, and advance queued builds."""
@@ -2502,66 +2627,69 @@ class ForgeSupervisor:
         except Exception:
             pass
 
-        spawned_build = self.maybe_spawn_next_build_worker()
+        spawned_builds: list[str] = []
+        while len(self._count_active_build_workers()) < self.max_parallel_builds:
+            b_id = self.maybe_spawn_next_build_worker()
+            if not b_id:
+                break
+            spawned_builds.append(b_id)
+
         return {
             "expired_decisions": expired,
             "pruned_widgets": pruned_widgets,
             "dispatched_sdk_tasks": len(dispatched_sdk),
-            "spawned_build": spawned_build,
+            "spawned_build": spawned_builds[0] if spawned_builds else None,
+            "spawned_builds": spawned_builds,
         }
 
     def maybe_spawn_next_build_worker(self) -> Optional[str]:
-        """If a build for this container is queued in SQLite and no build worker is currently running, spawn a detached worker."""
-        if self._active_build_proc is not None and self._active_build_proc.poll() is None:
+        """If a build for this container is queued/running in SQLite and active build workers < max_parallel_builds, spawn a detached worker."""
+        active_ids = self._count_active_build_workers()
+        if len(active_ids) >= self.max_parallel_builds:
             return None
 
         in_ivy = is_ivy_container()
-        lock_name = ".forge_build_worker_ivy.lock" if in_ivy else ".forge_build_worker.lock"
-        lock_path = self.db_path.parent / lock_name
-        try:
-            with open(lock_path, "a+", encoding="utf-8") as lf:
-                try:
-                    fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except (BlockingIOError, OSError):
-                    return None
-                else:
-                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-
         with get_db_connection(self.db_path) as conn:
             if in_ivy:
-                row = conn.execute(
-                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND origin_channel_id = ? ORDER BY created_at ASC LIMIT 1",
+                rows = conn.execute(
+                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND origin_channel_id = ? ORDER BY created_at ASC",
                     (BASEBALL_CHANNEL_ID,),
-                ).fetchone()
+                ).fetchall()
             else:
-                row = conn.execute(
-                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND origin_channel_id != ? ORDER BY created_at ASC LIMIT 1",
+                rows = conn.execute(
+                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND origin_channel_id != ? ORDER BY created_at ASC",
                     (BASEBALL_CHANNEL_ID,),
-                ).fetchone()
-            if not row:
-                return None
-            build_id = row["id"]
+                ).fetchall()
 
-        log_path = FORGE_LOGS_DIR / f"build-{build_id}.log"
+        target_build_id: Optional[str] = None
+        for r in rows:
+            cand_id = r["id"]
+            if cand_id in active_ids:
+                continue
+            if _is_build_worker_lock_held(self._build_lock_path(cand_id)):
+                continue
+            target_build_id = cand_id
+            break
+
+        if not target_build_id:
+            return None
+
+        log_path = FORGE_LOGS_DIR / f"build-{target_build_id}.log"
         lf_out = open(log_path, "a", encoding="utf-8")
         proc = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "_build_worker", build_id, "--db-path", str(self.db_path)],
+            [sys.executable, str(Path(__file__).resolve()), "_build_worker", target_build_id, "--db-path", str(self.db_path)],
             cwd=str(WORKSPACE_DIR),
             stdin=subprocess.DEVNULL,
             stdout=lf_out,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        self._active_build_proc = proc
-        return build_id
+        self._active_build_procs[target_build_id] = proc
+        return target_build_id
 
     def run_build_pipeline(self, build_id: str) -> bool:
-        """Execute all pending chunks for `build_id` sequentially under an exclusive file lock."""
-        in_ivy = is_ivy_container()
-        lock_name = ".forge_build_worker_ivy.lock" if in_ivy else ".forge_build_worker.lock"
-        lock_path = self.db_path.parent / lock_name
+        """Execute pending chunks for `build_id` with up to `max_parallel_chunks` concurrent Vulcan worktree workers."""
+        lock_path = self._build_lock_path(build_id)
         lock_fh = open(lock_path, "a+", encoding="utf-8")
         try:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2570,40 +2698,111 @@ class ForgeSupervisor:
             return False
 
         try:
-            while True:
-                with get_db_connection(self.db_path) as conn:
-                    build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
-                    if not build or build["status"] in ("cancelled", "failed", "completed"):
-                        break
-                    next_chunk = conn.execute(
-                        "SELECT * FROM forge_chunks WHERE build_id = ? AND status != 'merged' ORDER BY chunk_index ASC LIMIT 1",
-                        (build_id,),
-                    ).fetchone()
-                    if not next_chunk:
-                        conn.execute(
-                            "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
-                            (time.time(), build_id),
-                        )
+            with get_db_connection(self.db_path) as conn:
+                build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
+                if not build or build["status"] in ("cancelled", "failed", "completed"):
+                    return False
+                chunks = conn.execute(
+                    "SELECT * FROM forge_chunks WHERE build_id = ? ORDER BY chunk_index ASC",
+                    (build_id,),
+                ).fetchall()
+
+            # Initialize release branch for each distinct repo in the build if no chunks have merged yet
+            any_merged = any(c["status"] == "merged" for c in chunks)
+            if not any_merged:
+                repos_seen: set[Path] = set()
+                for c in chunks:
+                    eff_r = Path((c["repo"] if "repo" in c.keys() and c["repo"] else build["repo"]) or "/workspace").resolve()
+                    repos_seen.add(eff_r)
+                for r_dir in repos_seen:
+                    git_lk = _acquire_repo_git_lock(r_dir)
+                    try:
+                        def_br = _get_repo_default_branch(r_dir)
+                        staging_ref = f"forge/release-{build_id}"
+                        subprocess.run(["git", "fetch", "origin", def_br], cwd=str(r_dir), capture_output=True, timeout=30)
+                        chk_ref = subprocess.run(["git", "rev-parse", "--verify", f"origin/{def_br}"], cwd=str(r_dir), capture_output=True)
+                        start_ref = f"origin/{def_br}" if chk_ref.returncode == 0 else "HEAD"
+                        subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(r_dir), capture_output=True, timeout=10)
+                    finally:
+                        _release_file_lock(git_lk)
+
+            active_futures: dict[Any, sqlite3.Row] = {}
+            failed_pipeline = False
+
+            with ThreadPoolExecutor(max_workers=self.max_parallel_chunks) as pool:
+                while True:
+                    with get_db_connection(self.db_path) as conn:
+                        build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
+                        if not build or build["status"] in ("cancelled", "failed", "completed"):
+                            failed_pipeline = build is None or build["status"] != "completed"
+                            break
+                        all_chunks = conn.execute(
+                            "SELECT * FROM forge_chunks WHERE build_id = ? ORDER BY chunk_index ASC",
+                            (build_id,),
+                        ).fetchall()
+
+                    unmerged = [c for c in all_chunks if c["status"] != "merged"]
+                    if not unmerged and not active_futures:
+                        with get_db_connection(self.db_path) as conn:
+                            conn.execute(
+                                "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
+                                (time.time(), build_id),
+                            )
                         post_or_update_build_widget(build_id, db_path=self.db_path)
                         dispatch_build_completion_to_origin(build_id, db_path=self.db_path)
                         return True
 
-                ok = self.execute_chunk_in_worktree(build_id, next_chunk)
-                if not ok:
-                    return False
-            return True
+                    in_flight_ids = {r["id"] for r in active_futures.values()}
+                    running_rows = [c for c in all_chunks if c["id"] in in_flight_ids]
+
+                    for cand in all_chunks:
+                        if len(active_futures) >= self.max_parallel_chunks:
+                            break
+                        if cand["status"] != "pending" or cand["id"] in in_flight_ids:
+                            continue
+                        if _chunks_are_eligible_in_parallel(cand, all_chunks, running_rows):
+                            fut = pool.submit(self.execute_chunk_in_worktree, build_id, cand)
+                            active_futures[fut] = cand
+                            in_flight_ids.add(cand["id"])
+                            running_rows.append(cand)
+
+                    if not active_futures:
+                        # Fallback if remaining pending chunks exist but none matched parallel eligibility
+                        fallback_cand = next((c for c in all_chunks if c["status"] == "pending"), None)
+                        if fallback_cand:
+                            fut = pool.submit(self.execute_chunk_in_worktree, build_id, fallback_cand)
+                            active_futures[fut] = fallback_cand
+                        else:
+                            break
+
+                    done, _ = wait(list(active_futures.keys()), return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        active_futures.pop(fut, None)
+                        try:
+                            ok = fut.result()
+                        except Exception:
+                            ok = False
+                        if not ok:
+                            failed_pipeline = True
+
+                    if failed_pipeline:
+                        # Wait for any remaining in-flight chunks to finish cleanly before exiting
+                        for rem_fut in list(active_futures.keys()):
+                            try:
+                                rem_fut.result()
+                            except Exception:
+                                pass
+                        return False
+
+            return not failed_pipeline
         finally:
-            try:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass
-            lock_fh.close()
+            _release_file_lock(lock_fh)
 
     def execute_chunk_in_worktree(self, build_id: str, chunk_row: sqlite3.Row) -> bool:
         """Execute a single FORGE chunk inside an isolated git worktree with Maker-Checker verification."""
         chunk_id = chunk_row["id"]
         chunk_idx = int(chunk_row["chunk_index"])
-        with get_db_connection(self.db_path) as conn:
+        with self._state_lock, get_db_connection(self.db_path) as conn:
             build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
             if not build or build["status"] in ("cancelled", "failed"):
                 return False
@@ -2625,31 +2824,35 @@ class ForgeSupervisor:
         branch_name = f"forge/{build_id}-c{chunk_idx}"
         staging_ref = f"forge/release-{build_id}"
 
-        # Ensure base ref exists and carries prior chunks forward
-        subprocess.run(["git", "fetch", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=30)
-        if chunk_idx == 0:
-            chk_ref = subprocess.run(["git", "rev-parse", "--verify", f"origin/{default_branch}"], cwd=str(repo_dir), capture_output=True)
-            start_ref = f"origin/{default_branch}" if chk_ref.returncode == 0 else "HEAD"
-            subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
-        base_ref = staging_ref
+        git_lk = _acquire_repo_git_lock(repo_dir)
+        try:
+            chk_stg = subprocess.run(["git", "rev-parse", "--verify", staging_ref], cwd=str(repo_dir), capture_output=True)
+            if chk_stg.returncode != 0:
+                subprocess.run(["git", "fetch", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=30)
+                chk_ref = subprocess.run(["git", "rev-parse", "--verify", f"origin/{default_branch}"], cwd=str(repo_dir), capture_output=True)
+                start_ref = f"origin/{default_branch}" if chk_ref.returncode == 0 else "HEAD"
+                subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
+            base_ref = staging_ref
 
-        shutil.rmtree(wt_dir, ignore_errors=True)
-        subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
-        wt_res = subprocess.run(
-            ["git", "worktree", "add", "-B", branch_name, str(wt_dir), base_ref],
-            cwd=str(repo_dir),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if wt_res.returncode != 0:
-            subprocess.run(
-                ["git", "worktree", "add", "-B", branch_name, str(wt_dir), "HEAD"],
+            shutil.rmtree(wt_dir, ignore_errors=True)
+            subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
+            wt_res = subprocess.run(
+                ["git", "worktree", "add", "-B", branch_name, str(wt_dir), base_ref],
                 cwd=str(repo_dir),
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
+            if wt_res.returncode != 0:
+                subprocess.run(
+                    ["git", "worktree", "add", "-B", branch_name, str(wt_dir), "HEAD"],
+                    cwd=str(repo_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+        finally:
+            _release_file_lock(git_lk)
 
         prohibited = json.loads(chunk_row["prohibited_files_json"] or "[]")
         target_files = json.loads(chunk_row["target_files_json"] or "[]")
@@ -2657,7 +2860,7 @@ class ForgeSupervisor:
 
         for attempt in range(1, max_attempts + 1):
             model = ESCALATION_WORKER_MODEL if attempt == max_attempts else (chunk_row["worker_model"] or DEFAULT_WORKER_MODEL)
-            with get_db_connection(self.db_path) as conn:
+            with self._state_lock, get_db_connection(self.db_path) as conn:
                 conn.execute(
                     "UPDATE forge_chunks SET attempt_count = ?, worker_model = ?, status = 'running', live_status = ? WHERE id = ?",
                     (attempt, model, f"Booting Vulcan ({model})...", chunk_id),
@@ -2703,7 +2906,7 @@ class ForgeSupervisor:
                         now_ts = time.time()
                         if status_str and (now_ts - last_widget_patch >= 12.0 or step_cnt == 1):
                             last_widget_patch = now_ts
-                            with get_db_connection(self.db_path) as conn:
+                            with self._state_lock, get_db_connection(self.db_path) as conn:
                                 conn.execute(
                                     "UPDATE forge_chunks SET live_status = ? WHERE id = ?",
                                     (status_str[:220], chunk_id),
@@ -2719,16 +2922,16 @@ class ForgeSupervisor:
                 ret_code = proc.wait(timeout=30)
                 if ret_code != 0:
                     err_msg = "".join(tail_lines).strip() or f"agy exited {ret_code}"
-                    with get_db_connection(self.db_path) as conn:
+                    with self._state_lock, get_db_connection(self.db_path) as conn:
                         conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (err_msg[-1500:], chunk_id))
             except Exception as e:
-                with get_db_connection(self.db_path) as conn:
+                with self._state_lock, get_db_connection(self.db_path) as conn:
                     conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (str(e), chunk_id))
                 continue
             finally:
                 restore_vulcan_worktree_profile(wt_dir, profile_snapshot)
 
-            with get_db_connection(self.db_path) as conn:
+            with self._state_lock, get_db_connection(self.db_path) as conn:
                 conn.execute("UPDATE forge_chunks SET status = 'verifying', live_status = '' WHERE id = ?", (chunk_id,))
             post_or_update_build_widget(build_id, db_path=self.db_path)
 
@@ -2740,75 +2943,112 @@ class ForgeSupervisor:
                 require_changes=True,
             )
             if passed:
-                # Collect short diff stat against base_ref before committing
-                diff_proc = subprocess.run(
-                    ["git", "diff", "--shortstat", base_ref],
-                    cwd=str(wt_dir),
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if diff_proc.stdout.strip():
-                    diff_stat = diff_proc.stdout.strip()
-                subprocess.run(["git", "add", "-A"], cwd=str(wt_dir), capture_output=True, timeout=30)
+                git_lk = _acquire_repo_git_lock(repo_dir)
                 try:
-                    commit_proc = subprocess.run(
-                        ["git", "commit", "-m", f"feat(forge): {chunk_row['title']} [{chunk_id}]"],
+                    diff_proc = subprocess.run(
+                        ["git", "diff", "--shortstat", "HEAD"],
                         cwd=str(wt_dir),
                         capture_output=True,
                         text=True,
-                        timeout=120,
+                        timeout=10,
                     )
-                    if commit_proc.returncode != 0:
-                        c_err = f"{commit_proc.stdout}\n{commit_proc.stderr}".strip()
-                        with get_db_connection(self.db_path) as conn:
+                    if diff_proc.stdout.strip():
+                        diff_stat = diff_proc.stdout.strip()
+                    subprocess.run(["git", "add", "-A"], cwd=str(wt_dir), capture_output=True, timeout=30)
+                    try:
+                        commit_proc = subprocess.run(
+                            ["git", "commit", "-m", f"feat(forge): {chunk_row['title']} [{chunk_id}]"],
+                            cwd=str(wt_dir),
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                        )
+                        if commit_proc.returncode != 0:
+                            c_err = f"{commit_proc.stdout}\n{commit_proc.stderr}".strip()
+                            with self._state_lock, get_db_connection(self.db_path) as conn:
+                                conn.execute(
+                                    "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
+                                    (f"git commit / pre-commit hook failed (exit {commit_proc.returncode}):\n{c_err[-1400:]}", chunk_id),
+                                )
+                            continue
+                    except Exception as ce:
+                        with self._state_lock, get_db_connection(self.db_path) as conn:
                             conn.execute(
                                 "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
-                                (f"git commit / pre-commit hook failed (exit {commit_proc.returncode}):\n{c_err[-1400:]}", chunk_id),
+                                (f"git commit failed/timed out: {ce}", chunk_id),
                             )
                         continue
-                except Exception as ce:
-                    with get_db_connection(self.db_path) as conn:
-                        conn.execute(
-                            "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
-                            (f"git commit failed/timed out: {ce}", chunk_id),
-                        )
-                    continue
-                # Fast-forward staging branch so subsequent chunks inherit this chunk's commits
-                subprocess.run(
-                    ["git", "branch", "-f", base_ref, branch_name],
-                    cwd=str(repo_dir),
-                    capture_output=True,
-                    timeout=10,
-                )
-                shutil.rmtree(wt_dir, ignore_errors=True)
-                subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
 
-                with get_db_connection(self.db_path) as conn:
-                    conn.execute(
-                        "UPDATE forge_chunks SET status = 'merged', branch_name = ?, diff_stat = ?, completed_at = ?, live_status = '', last_error = '' WHERE id = ?",
-                        (branch_name, diff_stat, time.time(), chunk_id),
+                    # If a parallel sibling chunk already advanced base_ref since this worktree branched,
+                    # rebase this chunk's commit onto the latest base_ref before fast-forwarding base_ref.
+                    anc_chk = subprocess.run(
+                        ["git", "merge-base", "--is-ancestor", base_ref, branch_name],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        timeout=10,
                     )
-                    remaining = conn.execute(
-                        "SELECT COUNT(*) AS cnt FROM forge_chunks WHERE build_id = ? AND status != 'merged'",
-                        (build_id,),
-                    ).fetchone()["cnt"]
-                    if remaining == 0:
-                        conn.execute(
-                            "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
-                            (time.time(), build_id),
+                    if anc_chk.returncode != 0:
+                        rb_proc = subprocess.run(
+                            ["git", "rebase", base_ref],
+                            cwd=str(wt_dir),
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
                         )
+                        if rb_proc.returncode != 0:
+                            subprocess.run(["git", "rebase", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
+                            with self._state_lock, get_db_connection(self.db_path) as conn:
+                                conn.execute(
+                                    "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
+                                    (f"git rebase onto {base_ref} failed:\n{rb_proc.stdout}\n{rb_proc.stderr}"[-1400:], chunk_id),
+                                )
+                            continue
 
-                # If final chunk completed and not touching core bridge, sync staging branch into local default branch
-                if remaining == 0 and not build["touches_core_bridge"]:
-                    try:
-                        subprocess.run(["git", "merge", "--ff-only", base_ref], cwd=str(repo_dir), capture_output=True, timeout=20)
-                    except Exception as e:
-                        print(f"[FORGE] Warning: git merge --ff-only {base_ref} failed/timed out: {e}", file=sys.stderr)
-                    try:
-                        subprocess.run(["git", "push", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=60)
-                    except Exception as e:
-                        print(f"[FORGE] Warning: git push origin {default_branch} failed/timed out: {e}", file=sys.stderr)
+                    subprocess.run(
+                        ["git", "branch", "-f", base_ref, branch_name],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    shutil.rmtree(wt_dir, ignore_errors=True)
+                    subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
+
+                    with self._state_lock, get_db_connection(self.db_path) as conn:
+                        conn.execute(
+                            "UPDATE forge_chunks SET status = 'merged', branch_name = ?, diff_stat = ?, completed_at = ?, live_status = '', last_error = '' WHERE id = ?",
+                            (branch_name, diff_stat, time.time(), chunk_id),
+                        )
+                        remaining = conn.execute(
+                            "SELECT COUNT(*) AS cnt FROM forge_chunks WHERE build_id = ? AND status != 'merged'",
+                            (build_id,),
+                        ).fetchone()["cnt"]
+                        if remaining == 0:
+                            conn.execute(
+                                "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
+                                (time.time(), build_id),
+                            )
+
+                    # If final chunk completed and not touching core bridge, sync staging branch into local default branch
+                    if remaining == 0 and not build["touches_core_bridge"]:
+                        try:
+                            anc_main = subprocess.run(
+                                ["git", "merge-base", "--is-ancestor", default_branch, base_ref],
+                                cwd=str(repo_dir),
+                                capture_output=True,
+                                timeout=10,
+                            )
+                            if anc_main.returncode == 0:
+                                subprocess.run(["git", "merge", "--ff-only", base_ref], cwd=str(repo_dir), capture_output=True, timeout=20)
+                            else:
+                                subprocess.run(["git", "cherry-pick", f"{default_branch}..{base_ref}"], cwd=str(repo_dir), capture_output=True, timeout=30)
+                        except Exception as e:
+                            print(f"[FORGE] Warning: git merge/cherry-pick {base_ref} failed/timed out: {e}", file=sys.stderr)
+                        try:
+                            subprocess.run(["git", "push", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=60)
+                        except Exception as e:
+                            print(f"[FORGE] Warning: git push origin {default_branch} failed/timed out: {e}", file=sys.stderr)
+                finally:
+                    _release_file_lock(git_lk)
 
                 post_or_update_build_widget(build_id, db_path=self.db_path)
                 sync_forge_channel_header(db_path=self.db_path)
@@ -2816,13 +3056,17 @@ class ForgeSupervisor:
                     dispatch_build_completion_to_origin(build_id, db_path=self.db_path)
                 return True
             else:
-                with get_db_connection(self.db_path) as conn:
+                with self._state_lock, get_db_connection(self.db_path) as conn:
                     conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (err_out, chunk_id))
 
         # Exhausted all attempts
-        shutil.rmtree(wt_dir, ignore_errors=True)
-        subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
-        with get_db_connection(self.db_path) as conn:
+        git_lk = _acquire_repo_git_lock(repo_dir)
+        try:
+            shutil.rmtree(wt_dir, ignore_errors=True)
+            subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
+        finally:
+            _release_file_lock(git_lk)
+        with self._state_lock, get_db_connection(self.db_path) as conn:
             conn.execute("UPDATE forge_chunks SET status = 'failed', completed_at = ? WHERE id = ?", (time.time(), chunk_id))
             conn.execute("UPDATE forge_builds SET status = 'failed', updated_at = ? WHERE id = ?", (time.time(), build_id))
         post_or_update_build_widget(build_id, db_path=self.db_path)

@@ -875,6 +875,99 @@ class TestForgeEngine(unittest.TestCase):
         st_bb = subprocess.run(["git", "status", "--porcelain"], cwd=str(wt_bb), capture_output=True, text=True)
         self.assertEqual(st_bb.stdout.strip(), "")
 
+    def test_11_parallel_builds_and_intra_build_parallel_chunks(self):
+        # 1. Verify _chunks_are_eligible_in_parallel respects disjoint target_files, shared files, and explicit depends_on
+        plan_parallel = {
+            "title": "Parallel 3-Chunk Feature",
+            "repo": "/workspace",
+            "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["Disjoint chunks run in parallel up to 3x."],
+            "chunks": [
+                {
+                    "title": "Chunk A (file_a.py)",
+                    "target_files": ["tools/file_a.py"],
+                    "instructions": "Implement module A with unit tests in file_a.py.",
+                },
+                {
+                    "title": "Chunk B (file_b.py - disjoint)",
+                    "target_files": ["tools/file_b.py"],
+                    "instructions": "Implement module B with unit tests in file_b.py.",
+                },
+                {
+                    "title": "Chunk C (file_a.py - overlaps Chunk A)",
+                    "target_files": ["tools/file_a.py"],
+                    "instructions": "Extend module A after Chunk A merges.",
+                },
+                {
+                    "title": "Chunk D (file_d.py - explicit depends_on Chunk B)",
+                    "target_files": ["tools/file_d.py"],
+                    "depends_on": [1],
+                    "instructions": "Implement module D depending on Chunk B.",
+                },
+            ],
+        }
+        enq = enqueue_build(plan_parallel, db_path=self.db_path, post_widget=False)
+        build_id = enq["build_id"]
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM forge_chunks WHERE build_id = ? ORDER BY chunk_index ASC",
+                (build_id,),
+            ).fetchall()
+
+        # Initially: Chunk 0 (A) and Chunk 1 (B) are both eligible in parallel; Chunk 2 overlaps Chunk 0; Chunk 3 depends_on Chunk 1
+        self.assertTrue(forge_mod._chunks_are_eligible_in_parallel(rows[0], rows, []))
+        self.assertTrue(forge_mod._chunks_are_eligible_in_parallel(rows[1], rows, [rows[0]]))
+        self.assertFalse(forge_mod._chunks_are_eligible_in_parallel(rows[2], rows, [rows[0]]))
+        self.assertFalse(forge_mod._chunks_are_eligible_in_parallel(rows[3], rows, [rows[0], rows[1]]))
+
+        # Once Chunk 0 and Chunk 1 mark 'merged', Chunk 2 and Chunk 3 both become eligible in parallel
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            conn.execute("UPDATE forge_chunks SET status = 'merged' WHERE build_id = ? AND chunk_index IN (0, 1)", (build_id,))
+            rows_after = conn.execute(
+                "SELECT * FROM forge_chunks WHERE build_id = ? ORDER BY chunk_index ASC",
+                (build_id,),
+            ).fetchall()
+        self.assertTrue(forge_mod._chunks_are_eligible_in_parallel(rows_after[2], rows_after, []))
+        self.assertTrue(forge_mod._chunks_are_eligible_in_parallel(rows_after[3], rows_after, [rows_after[2]]))
+
+        # 2. Verify ForgeSupervisor spawns up to max_parallel_builds (3) concurrent build workers
+        for idx in range(2, 5):
+            p = {
+                "title": f"Concurrent Build {idx}",
+                "repo": "/workspace",
+                "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+                "context_fact_sheet": ["Parallel build test"],
+                "chunks": [
+                    {
+                        "title": f"Chunk for Build {idx}",
+                        "target_files": [f"tools/parallel_mod_{idx}.py"],
+                        "instructions": f"Implement parallel_mod_{idx}.py cleanly.",
+                    }
+                ],
+            }
+            enqueue_build(p, db_path=self.db_path, post_widget=False)
+
+        sup = forge_mod.ForgeSupervisor(db_path=self.db_path, max_parallel_builds=3, max_parallel_chunks=3)
+        mock_procs = []
+
+        def _fake_popen(*args, **kwargs):
+            mp = MagicMock()
+            mp.poll.return_value = None
+            mock_procs.append(mp)
+            return mp
+
+        with patch("subprocess.Popen", side_effect=_fake_popen), patch("builtins.open", unittest.mock.mock_open()):
+            b1 = sup.maybe_spawn_next_build_worker()
+            b2 = sup.maybe_spawn_next_build_worker()
+            b3 = sup.maybe_spawn_next_build_worker()
+            b4 = sup.maybe_spawn_next_build_worker()
+
+        self.assertIsNotNone(b1)
+        self.assertIsNotNone(b2)
+        self.assertIsNotNone(b3)
+        self.assertEqual(len({b1, b2, b3}), 3)
+        self.assertIsNone(b4)  # Capped at 3 concurrent builds per agent
+
 
 if __name__ == "__main__":
     unittest.main()
