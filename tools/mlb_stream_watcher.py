@@ -53,7 +53,7 @@ def run():
                 if stream_url:
                     print(f"Stream URL live: {stream_url}")
                     # Dispatch to Living Room TV
-                    success = cast_to_home_assistant(stream_url, "media_player.living_room_tv_2")
+                    success = cast_to_home_assistant(stream_url, "media_player.living_room_tv")
                     status_text = "successfully dispatched to Living Room TV" if success else "failed to cast to TV"
                     msg = (
                         f"⚾ **Cubs @ Padres is live!**\n"

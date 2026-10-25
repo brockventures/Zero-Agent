@@ -154,7 +154,7 @@ def resolve_stream_url(media_event_id: int, flavor_id: str = "free.live.sportsne
 
 def cast_to_home_assistant(
     stream_url: str,
-    entity_id: str = "media_player.living_room_tv_2",
+    entity_id: str = "media_player.living_room_tv",
     cold_start_delay: float = 12.0
 ) -> bool:
     """Wake device, wait for HDMI/CEC handshake if cold, and dispatch stream URL to Home Assistant.
@@ -181,7 +181,12 @@ def cast_to_home_assistant(
         except Exception:
             return {}
 
-    # 1. Determine if device is cold starting
+    # 1. Auto-fallback if legacy media_player.living_room_tv_2 was requested after HA entity rename
+    if entity_id == "media_player.living_room_tv_2" and not _get_state(entity_id):
+        if _get_state("media_player.living_room_tv"):
+            entity_id = "media_player.living_room_tv"
+
+    # 2. Determine if device is cold starting
     remote_entity = "remote.living_room_tv" if "living_room" in entity_id else None
     is_cold = False
     if remote_entity:
@@ -198,8 +203,14 @@ def cast_to_home_assistant(
         except Exception as e:
             sys.stderr.write(f"Notice: Failed to send remote.turn_on: {e}\n")
 
-    # 2. Clear any stale Google Cast receiver so it does not conflict with native VLC
-    cast_entity = "media_player.living_room_tv" if "living_room" in entity_id else None
+    # 3. Clear any stale Google Cast receiver so it does not conflict with native VLC
+    # (Never turn off entity_id itself!)
+    cast_entity = None
+    if "living_room" in entity_id:
+        for cand_cast in ("media_player.living_room_living_room_tv", "media_player.living_room_tv"):
+            if cand_cast != entity_id:
+                cast_entity = cand_cast
+                break
     if cast_entity:
         try:
             cast_st = _get_state(cast_entity)
@@ -262,7 +273,7 @@ def main():
     parser.add_argument("--team", default="cubs", help="Team name to look for (default: cubs)")
     parser.add_argument("--feed", choices=["auto", "home", "away", "national"], default="auto", help="Broadcast feed preference (default: auto)")
     parser.add_argument("--cast", action="store_true", help="Automatically cast to Home Assistant media player")
-    parser.add_argument("--entity", default="media_player.living_room_tv_2", help="Target HA media player entity")
+    parser.add_argument("--entity", default="media_player.living_room_tv", help="Target HA media player entity")
     parser.add_argument("--json", action="store_true", dest="output_json", help="Output full JSON metadata")
     parser.add_argument("--url-only", action="store_true", help="Print only the resolved .m3u8 URL")
     args = parser.parse_args()
