@@ -568,3 +568,19 @@ class TestBatchGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_no_synthesize_probe_does_not_trigger_post_offload_lock(tmp_path):
+    state_file = str(tmp_path / "bg_state.json")
+    ok1, _ = check_tool_use(
+        "run_command",
+        {"CommandLine": 'python3 /workspace/tools/forge.py job start --silent-on-success --no-synthesize --name "Probe" --command "python3 /tmp/p.py"'},
+        state_file=state_file,
+    )
+    assert ok1 is True
+    ok2, reason2 = check_tool_use(
+        "edit_file",
+        {"Path": "/workspace/scratch/fix_probe.py", "Target": "a", "Replacement": "b"},
+        state_file=state_file,
+    )
+    assert ok2 is True, f"Expected --no-synthesize probe not to lock turn, got: {reason2}"

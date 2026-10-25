@@ -968,6 +968,200 @@ class TestForgeEngine(unittest.TestCase):
         self.assertEqual(len({b1, b2, b3}), 3)
         self.assertIsNone(b4)  # Capped at 3 concurrent builds per agent
 
+    def test_12_active_worker_worktree_preservation_and_superseded_job_pruning(self):
+        import fcntl
+        import shutil
+
+        plan = {
+            "title": "Active Worker Preservation Test",
+            "repo": "/workspace",
+            "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["Active worker test"],
+            "chunks": [
+                {
+                    "title": "Chunk 0",
+                    "target_files": ["tools/forge.py"],
+                    "instructions": "Keep worktree alive across reload.",
+                }
+            ],
+        }
+        enq = enqueue_build(plan, db_path=self.db_path, post_widget=False)
+        bid = enq["build_id"]
+        wt_path = Path(f"/tmp/forge-wt-{bid}-c0")
+        wt_path.mkdir(parents=True, exist_ok=True)
+        try:
+            with forge_mod.get_db_connection(self.db_path) as conn:
+                conn.execute("UPDATE forge_builds SET status = 'running' WHERE id = ?", (bid,))
+                conn.execute("UPDATE forge_chunks SET status = 'running' WHERE build_id = ?", (bid,))
+
+            lock_path = self.db_path.parent / f".forge_build_worker_{bid}.lock"
+            with open(lock_path, "a+", encoding="utf-8") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    forge_mod.reconcile_forge_on_boot(db_path=self.db_path)
+                    self.assertTrue(wt_path.exists())
+                    with forge_mod.get_db_connection(self.db_path) as conn:
+                        b_row = conn.execute("SELECT status FROM forge_builds WHERE id = ?", (bid,)).fetchone()
+                        c_row = conn.execute("SELECT status FROM forge_chunks WHERE build_id = ?", (bid,)).fetchone()
+                        self.assertEqual(b_row["status"], "running")
+                        self.assertEqual(c_row["status"], "running")
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        finally:
+            shutil.rmtree(wt_path, ignore_errors=True)
+
+        # Verify superseded failed job is pruned immediately when a newer job in the same channel completes
+        now = time.time()
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time, forge_message_id)
+                VALUES (?, 'Failed Probe', 'python3 probe.py', '1542081375287640084', '/workspace', 60, 'failed', ?, ?, 777001)
+                """,
+                ("dt-superseded-fail", now - 30.0, now - 25.0),
+            )
+            conn.execute(
+                """
+                INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time, forge_message_id)
+                VALUES (?, 'Fixed Probe', 'python3 probe.py', '1542081375287640084', '/workspace', 60, 'completed', ?, ?, 777002)
+                """,
+                ("dt-superseded-ok", now - 20.0, now - 10.0),
+            )
+        pruned_sup = prune_completed_job_widgets(ttl_seconds=3600.0, db_path=self.db_path, delete_remote=False)
+        self.assertIn("dt-superseded-fail", pruned_sup)
+        self.assertNotIn("dt-superseded-ok", pruned_sup)
+
+    def test_13_complexity_and_calibration_approval_thresholds(self):
+        # 1. Fast Tier 2 (1 chunk, <=3 non-core files, no >90s calibration) auto-executes without requiring approval
+        fast_plan = {
+            "title": "Fast Single-Chunk Feature",
+            "repo": "/workspace",
+            "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["Fast Tier 2 build"],
+            "chunks": [
+                {
+                    "title": "Single Chunk",
+                    "target_files": ["tools/fast_mod_a.py", "tools/test_fast_mod_a.py"],
+                    "instructions": "Implement fast_mod_a.py.",
+                }
+            ],
+        }
+        res_fast = enqueue_build(
+            fast_plan,
+            db_path=self.db_path,
+            post_widget=False,
+            check_approval_gate=True,
+            batch_state_path="/tmp/nonexistent_batch_state.json",
+        )
+        self.assertTrue(res_fast["ok"])
+        self.assertIn("build_id", res_fast)
+        self.assertFalse(res_fast.get("requires_approval", False))
+
+        # 2. Multi-chunk Tier 3 (>=2 chunks) automatically stages an Approve | Edit | Dismiss Decision Card
+        tier3_plan = {
+            "title": "Multi-Chunk Pipeline Build",
+            "repo": "/workspace",
+            "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["Tier 3 build"],
+            "chunks": [
+                {
+                    "title": "Chunk 1",
+                    "target_files": ["tools/t3_a.py"],
+                    "instructions": "Implement t3_a.py.",
+                },
+                {
+                    "title": "Chunk 2",
+                    "target_files": ["tools/t3_b.py"],
+                    "instructions": "Implement t3_b.py.",
+                },
+            ],
+        }
+        res_t3 = enqueue_build(
+            tier3_plan,
+            db_path=self.db_path,
+            post_widget=False,
+            check_approval_gate=True,
+            batch_state_path="/tmp/nonexistent_batch_state.json",
+        )
+        self.assertTrue(res_t3["ok"])
+        self.assertEqual(res_t3["status"], "awaiting_approval")
+        self.assertTrue(res_t3["requires_approval"])
+        self.assertIn("decision_id", res_t3)
+
+        # Clicking Approve on the staged Decision Card deterministically enqueues the build into forge_builds
+        with patch.object(forge_mod, "post_or_update_build_widget", return_value=999111), patch.object(
+            forge_mod, "sync_forge_channel_header", return_value=True
+        ):
+            exec_res = execute_decision(res_t3["decision_id"], user_id=OWNER_USER_ID, db_path=self.db_path)
+        self.assertTrue(exec_res["ok"])
+        self.assertEqual(exec_res["status"], "approved")
+        self.assertIn("2 chunk(s)", exec_res["receipt"])
+
+        # 3. Wide blast radius (>=4 files) or core bridge or >90s calibration also triggers approval gate
+        wide_plan = {
+            "title": "Four File Refactor",
+            "repo": "/workspace",
+            "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["4 files"],
+            "chunks": [
+                {
+                    "title": "Wide Chunk",
+                    "target_files": ["tools/w1.py", "tools/w2.py", "tools/w3.py", "tools/w4.py"],
+                    "instructions": "Refactor 4 files.",
+                }
+            ],
+        }
+        req_wide, reasons_wide = forge_mod.evaluate_plan_approval_gate(wide_plan, batch_state_path="/tmp/nonexistent.json")
+        self.assertTrue(req_wide)
+        self.assertTrue(any("4 target files" in r for r in reasons_wide))
+
+        bs_file = Path(self.tmp_dir.name) / "calib_state.json"
+        now_ts = time.time()
+        bs_file.write_text(
+            json.dumps({"last_time": now_ts, "turn_start_time": now_ts - 120.0, "total_scratch_runs": 3}),
+            encoding="utf-8",
+        )
+        req_cal, reasons_cal = forge_mod.evaluate_plan_approval_gate(fast_plan, batch_state_path=bs_file)
+        self.assertTrue(req_cal)
+        self.assertTrue(any("Post-calibration" in r for r in reasons_cal))
+
+
+def test_no_synthesize_short_failed_probe_suppressed_when_turn_in_flight(tmp_path, monkeypatch):
+    import tools.forge as forge
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    monkeypatch.setattr(forge, "FORGE_DB_PATH", db_p)
+    monkeypatch.setattr(forge, "TASKS_DIR", tmp_path / "detached_tasks")
+    monkeypatch.setattr(forge, "_is_prod_forge_env", lambda *a, **kw: False)
+    monkeypatch.setattr(forge, "_is_channel_turn_actively_in_flight", lambda ch: True)
+
+    outbox_calls = []
+    import tools.outbox as outbox
+    monkeypatch.setattr(outbox, "queue_outbox_message", lambda **kw: outbox_calls.append(kw))
+
+    task_id = "dt-test-nosynth-fail"
+    tdir = forge._get_job_dir(task_id)
+    tdir.mkdir(parents=True, exist_ok=True)
+    log_p = tdir / "run.log"
+    meta = {
+        "task_id": task_id,
+        "name": "Quick Probe",
+        "command": "python3 -c 'import sys; sys.exit(1)'",
+        "channel": "baseball",
+        "timeout": 60,
+        "cwd": str(tmp_path),
+        "status": "starting",
+        "start_time": time.time(),
+        "notify_on_success": False,
+        "synthesize": False,
+        "log_file": str(log_p),
+    }
+    forge._write_job_meta(task_id, meta, db_path=db_p)
+    forge._run_job_worker(task_id, db_path=db_p)
+
+    assert len(outbox_calls) == 0
+    assert "Suppressing raw outbox notification" in log_p.read_text(encoding="utf-8")
+
 
 if __name__ == "__main__":
     unittest.main()

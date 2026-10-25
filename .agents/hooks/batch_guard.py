@@ -898,6 +898,7 @@ def check_tool_use(
         is_forge_job_start = bool(
             re.search(r"\bforge\.py\s+job\s+start\b", cmd) or re.search(r"\bdetached_runner\.py\s+start\b", cmd)
         )
+        is_no_synthesize_probe = bool(is_forge_job_start and "--no-synthesize" in cmd)
         if is_forge_enqueue:
             state["inline_prod_files"] = []
             state["offload_dispatched"] = True
@@ -906,7 +907,7 @@ def check_tool_use(
             state["inline_prod_files"] = []
             state["offload_dispatched"] = True
             state["offload_kind"] = "FORGE Two-Stage Decision Card (forge.py stage-decision --handler forge_enqueue)"
-        elif is_forge_job_start:
+        elif is_forge_job_start and not is_no_synthesize_probe:
             state["offload_dispatched"] = True
             state["offload_kind"] = "FORGE background job (forge.py job start)"
 
@@ -1029,7 +1030,7 @@ def check_tool_use(
                             f"FORGE Scratch Loop Gate Triggered: Executed '{os.path.basename(norm_script)}' {run_cnt} times in this turn "
                             f"(inline limit: {MAX_SAME_SCRATCH_SCRIPT_RUNS}). Do not run iterative edit-and-rerun loops on the same scratch script "
                             "inline in chat. Consolidate parameter sweeps into a single vectorized pass, offload to Modal, or launch long jobs via:\n"
-                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\""
+                            "python3 /workspace/tools/forge.py job start --silent-on-success --no-synthesize --name \"<Job Name>\" --command \"python3 " + norm_script + "\""
                         )
 
                     if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
@@ -1039,7 +1040,7 @@ def check_tool_use(
                             f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {total_scratch} scratch/tmp scripts "
                             f"(latest: '{os.path.basename(norm_script)}'). Do not run multi-minute iterative script sweeps inline by renaming scripts "
                             "or moving them to /tmp/. Launch long calibration/benchmark jobs via:\n"
-                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\"\n"
+                            "python3 /workspace/tools/forge.py job start --silent-on-success --no-synthesize --name \"<Job Name>\" --command \"python3 " + norm_script + "\"\n"
                             "(or offload to '/baseball/big-projections/modal_harness.py' / enqueue a ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
                         )
                 elif is_inline_python_probe(cmd):
@@ -1051,7 +1052,7 @@ def check_tool_use(
                             f"FORGE 90s Calibration Offload Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
                             f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {total_scratch} inline Python / scratch probes. "
                             "Do not run multi-minute iterative heredoc or SSH loops inline in chat. Package the task into a script and launch via:\n"
-                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
+                            "python3 /workspace/tools/forge.py job start --silent-on-success --no-synthesize --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
                             "(or enqueue a multi-chunk ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
                         )
 
@@ -1062,7 +1063,7 @@ def check_tool_use(
                         f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {turn_cmds} inline shell commands "
                         f"(limit after 90s: {MAX_INLINE_RUN_COMMANDS_AFTER_90S}). Long-running multi-step builds, remote patches, and "
                         "iterative debugging must be offloaded to #forge via:\n"
-                        "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
+                        "python3 /workspace/tools/forge.py job start --silent-on-success --no-synthesize --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
                         "(or 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
                     )
 

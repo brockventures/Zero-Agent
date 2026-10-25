@@ -1711,6 +1711,7 @@ def post_or_update_job_widget(
 
 _LAST_REMOTE_CHANNEL_SWEEP_TS: float = 0.0
 REMOTE_CHANNEL_SWEEP_INTERVAL_SECONDS: float = 300.0
+FAILED_JOB_WIDGET_TTL_SECONDS: float = 600.0
 TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled", "timed_out")
 TERMINAL_BUILD_STATUSES = ("completed", "failed", "cancelled")
 
@@ -1721,8 +1722,10 @@ def prune_completed_job_widgets(
     forge_channel_id: int = FORGE_CHANNEL_ID,
     delete_remote: bool = True,
 ) -> list[str]:
-    """Delete Discord embed cards in #forge for terminal background jobs (`completed`, `failed`, `cancelled`, `timed_out`) older than `ttl_seconds` (or immediately if `cancelled`)."""
-    cutoff = time.time() - float(ttl_seconds)
+    """Delete Discord embed cards in #forge for terminal background jobs (`completed`, `failed`, `cancelled`, `timed_out`) older than `ttl_seconds` (or 10m for failed jobs, or immediately if `cancelled` or superseded by a newer completed job in the same channel)."""
+    now = time.time()
+    cutoff = now - float(ttl_seconds)
+    failed_cutoff = now - min(float(ttl_seconds), float(FAILED_JOB_WIDGET_TTL_SECONDS))
     pruned_ids: list[str] = []
     db_paths = [Path(db_path)] + _get_peer_forge_db_paths(db_path)
 
@@ -1737,9 +1740,23 @@ def prune_completed_job_widgets(
                     SELECT id, status, forge_message_id FROM forge_jobs
                     WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out')
                       AND forge_message_id IS NOT NULL
-                      AND (status = 'cancelled' OR COALESCE(end_time, start_time) <= ?)
+                      AND (
+                          status = 'cancelled'
+                          OR COALESCE(end_time, start_time) <= ?
+                          OR (status IN ('failed', 'timed_out') AND COALESCE(end_time, start_time) <= ?)
+                          OR (
+                              status IN ('failed', 'timed_out')
+                              AND EXISTS (
+                                  SELECT 1 FROM forge_jobs j2
+                                  WHERE j2.channel = forge_jobs.channel
+                                    AND j2.status = 'completed'
+                                    AND j2.id != forge_jobs.id
+                                    AND COALESCE(j2.end_time, j2.start_time) >= COALESCE(forge_jobs.end_time, forge_jobs.start_time)
+                              )
+                          )
+                      )
                     """,
-                    (cutoff,),
+                    (cutoff, failed_cutoff),
                 ).fetchall()
         except Exception:
             continue
@@ -1830,6 +1847,10 @@ def _sweep_stale_forge_channel_embeds(
                     seen_entity_ids.add(entity_id)
 
             is_cancelled = title.startswith("🛑") or desc.startswith("**CANCELLED**")
+            is_failed_dt = (
+                entity_id.startswith("dt-")
+                and (title.startswith(("❌", "⏱️")) or desc.startswith(("**FAILED**", "**TIMED OUT**")))
+            )
             is_terminal = (
                 is_cancelled
                 or title.startswith(("✅", "❌", "⏱️"))
@@ -1840,11 +1861,13 @@ def _sweep_stale_forge_channel_embeds(
                 and msg_ts > 0
                 and (now - msg_ts) >= 120.0
             )
+            failed_dt_cutoff = now - min(max(0.0, now - cutoff), float(FAILED_JOB_WIDGET_TTL_SECONDS))
 
             should_delete = (
                 is_duplicate_entity
                 or is_cancelled
                 or is_stuck_starting
+                or (is_failed_dt and msg_ts > 0 and msg_ts <= failed_dt_cutoff)
                 or (is_terminal and msg_ts > 0 and msg_ts <= cutoff)
             )
             if not should_delete:
@@ -1955,16 +1978,169 @@ def prune_completed_build_widgets(
     return all_pruned
 
 
+def evaluate_plan_approval_gate(
+    plan: dict,
+    batch_state_path: Path | str = "/tmp/batch_guard_state.json",
+) -> tuple[bool, list[str]]:
+    """Evaluate whether a ForgePlan requires an interactive Approve | Edit | Dismiss Decision Card before execution.
+
+    Thresholds:
+    - Auto-Execute Immediately (Fast Tier 2): 1 chunk, <=3 target files, touches_core_bridge=False, no >90s calibration pass.
+    - Require Approval (Stage Decision Card):
+      1. Multi-chunk pipeline (>=2 chunks or tier >= 3).
+      2. Wide blast radius (>=4 distinct target files across chunks) or touches_core_bridge=True.
+      3. Explicit requires_approval=True or enqueued after a >90s calibration/analysis pass in the current turn.
+    """
+    if plan.get("approved") is True or plan.get("skip_approval") is True:
+        return False, []
+
+    reasons: list[str] = []
+    if plan.get("requires_approval") is True:
+        reasons.append("Explicit requires_approval flag set on plan")
+
+    chunks = plan.get("chunks") or []
+    tier = int(plan.get("tier") or (3 if len(chunks) > 1 else 2))
+    if len(chunks) >= 2 or tier >= 3:
+        reasons.append(f"Multi-chunk Tier 3 pipeline ({len(chunks)} chunks)")
+
+    all_files: list[str] = []
+    for ch in chunks:
+        for tf in _normalize_file_list(ch.get("target_files", [])):
+            if tf not in all_files:
+                all_files.append(tf)
+    if len(all_files) >= 4:
+        reasons.append(f"Wide file blast radius ({len(all_files)} target files)")
+
+    if _detect_touches_core_bridge(plan):
+        reasons.append("Touches core bridge or hook infrastructure")
+
+    try:
+        bs_path = Path(batch_state_path)
+        if bs_path.exists():
+            st = json.loads(bs_path.read_text(encoding="utf-8"))
+            now_ts = time.time()
+            last_t = float(st.get("last_time", 0.0) or 0.0)
+            start_t = float(st.get("turn_start_time", now_ts) or now_ts)
+            total_scratch = int(st.get("total_scratch_runs", 0) or 0)
+            if (now_ts - last_t) <= 900.0 and (now_ts - start_t) > 90.0 and total_scratch >= 2:
+                reasons.append(
+                    f"Post-calibration code changes ({total_scratch} calibration/scratch runs over {int(now_ts - start_t)}s)"
+                )
+    except Exception:
+        pass
+
+    return len(reasons) > 0, reasons
+
+
+def stage_plan_approval_decision(
+    plan: dict,
+    reasons: list[str],
+    db_path: Path | str = FORGE_DB_PATH,
+    post_to_discord: bool = True,
+    allow_overlap: bool = False,
+) -> dict:
+    """Validate a ForgePlan, persist it toforge_plans/, and stage an Approve | Edit | Dismiss Decision Card."""
+    valid, reason = validate_forge_plan(plan)
+    if not valid:
+        raise ValueError(f"Invalid ForgePlan: {reason}")
+
+    if not allow_overlap and not plan.get("allow_overlap"):
+        overlaps = check_target_file_overlap(plan, db_path=db_path)
+        if overlaps:
+            ov = overlaps[0]
+            raise ValueError(
+                f"Target file overlap detected: '{ov['file']}' is already queued/running in build "
+                f"'{ov['build_id']}' ({ov['build_title']} / {ov['chunk_title']}). "
+                "Wait for the active build to complete or pass allow_overlap=True."
+            )
+
+    now = time.time()
+    slug = re.sub(r"[^a-z0-9]+", "-", plan["title"].lower()).strip("-")[:24] or "build"
+    plans_dir = Path(db_path).parent / "forge_plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    plan_copy = dict(plan)
+    plan_copy["approved"] = True
+    if allow_overlap:
+        plan_copy["allow_overlap"] = True
+    plan_file_path = plans_dir / f"plan-{int(now)}-{slug}.json"
+    plan_file_path.write_text(json.dumps(plan_copy, indent=2), encoding="utf-8")
+
+    chunks = plan.get("chunks") or []
+    all_files: list[str] = []
+    chunk_bullets: list[str] = []
+    for idx, ch in enumerate(chunks):
+        t_files = _normalize_file_list(ch.get("target_files", []))
+        for tf in t_files:
+            if tf not in all_files:
+                all_files.append(tf)
+        files_str = ", ".join(f"`{Path(f).name}`" for f in t_files[:3])
+        if len(t_files) > 3:
+            files_str += f" (+{len(t_files) - 3} more)"
+        chunk_bullets.append(f"  - **Chunk {idx + 1}:** {ch['title'].strip()} ({files_str})")
+
+    objective = str(plan.get("objective") or plan["title"]).strip()
+    summary_lines = [
+        f"**Objective:** {objective}",
+        f"**Gate Trigger:** {'; '.join(reasons)}",
+        f"**Scope:** {len(chunks)} chunk(s) across {len(all_files)} target file(s):",
+        *chunk_bullets[:6],
+        "Tap **Approve** to enqueue and launch isolated `#forge` worktree workers.",
+    ]
+    summary_text = "\n".join(summary_lines)
+    target_ch = int(plan.get("origin_thread_id") or plan["origin_channel_id"])
+
+    dec = stage_decision(
+        category="forge",
+        title=f"FORGE Build Plan: {plan['title'].strip()[:85]}",
+        summary=summary_text,
+        handler_type="forge_enqueue",
+        payload={
+            "plan_file": str(plan_file_path),
+            "title": plan["title"].strip(),
+            "chunk_count": len(chunks),
+            "allow_overlap": bool(allow_overlap or plan.get("allow_overlap")),
+        },
+        channel_id=target_ch,
+        db_path=db_path,
+        post_to_discord=post_to_discord,
+    )
+    return {
+        "ok": True,
+        "status": "awaiting_approval",
+        "requires_approval": True,
+        "approval_reasons": reasons,
+        "decision_id": dec["decision_id"],
+        "plan_file": str(plan_file_path),
+        "chunk_count": len(chunks),
+        "origin_channel_id": target_ch,
+        "discord_message_id": dec.get("discord_message_id"),
+        "turn_action": "end_turn",
+    }
+
+
 def enqueue_build(
     plan: dict,
     db_path: Path | str = FORGE_DB_PATH,
     post_widget: bool = True,
     allow_overlap: bool = False,
+    check_approval_gate: bool = False,
+    batch_state_path: Path | str = "/tmp/batch_guard_state.json",
 ) -> dict:
-    """Validate and enqueue a multi-chunk FORGE build plan with pre-enqueue target-file overlap deduplication."""
+    """Validate and enqueue a multi-chunk FORGE build plan with pre-enqueue target-file overlap deduplication and complexity approval gate."""
     valid, reason = validate_forge_plan(plan)
     if not valid:
         raise ValueError(f"Invalid ForgePlan: {reason}")
+
+    if check_approval_gate:
+        needs_approval, gate_reasons = evaluate_plan_approval_gate(plan, batch_state_path=batch_state_path)
+        if needs_approval:
+            return stage_plan_approval_decision(
+                plan,
+                reasons=gate_reasons,
+                db_path=db_path,
+                post_to_discord=post_widget,
+                allow_overlap=allow_overlap,
+            )
 
     if not allow_overlap and not plan.get("allow_overlap"):
         overlaps = check_target_file_overlap(plan, db_path=db_path)
@@ -2429,10 +2605,35 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
         return False
 
 
+def _get_active_build_worker_ids(db_path: Path | str = FORGE_DB_PATH) -> set[str]:
+    """Return all build_ids across local and peer data dirs whose per-build worker flock is currently held."""
+    active_ids: set[str] = set()
+    db_dirs = {Path(db_path).parent} | {p.parent for p in _get_peer_forge_db_paths(db_path)}
+    for ddir in db_dirs:
+        if not ddir.exists():
+            continue
+        try:
+            for p in ddir.glob(".forge_build_worker_*.lock"):
+                name = p.name
+                for pref in (".forge_build_worker_ivy_", ".forge_build_worker_"):
+                    if name.startswith(pref) and name.endswith(".lock"):
+                        bid = name[len(pref):-len(".lock")]
+                        if bid and _is_build_worker_lock_held(p):
+                            active_ids.add(bid)
+                        break
+        except Exception:
+            pass
+    return active_ids
+
+
 def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
-    """Clean up stale /tmp/forge-wt-* worktrees and reset interrupted running chunks on startup."""
+    """Clean up stale /tmp/forge-wt-* worktrees and reset interrupted running chunks on startup, preserving active worker worktrees."""
+    active_build_ids = _get_active_build_worker_ids(db_path)
     cleaned_wts = []
     for wt_path in glob.glob("/tmp/forge-wt-*"):
+        wt_base = os.path.basename(wt_path)
+        if any(wt_base.startswith(f"forge-wt-{bid}-") for bid in active_build_ids):
+            continue
         try:
             shutil.rmtree(wt_path, ignore_errors=True)
             cleaned_wts.append(wt_path)
@@ -2454,14 +2655,30 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
     reset_chunks = 0
     pruned_jobs = 0
     with get_db_connection(db_path) as conn:
-        cur = conn.execute(
-            "UPDATE forge_chunks SET status = 'pending' WHERE status IN ('running', 'verifying') AND attempt_count < 3"
-        )
-        reset_chunks = cur.rowcount
-        conn.execute(
-            "UPDATE forge_builds SET status = 'queued', updated_at = ? WHERE status = 'running'",
-            (time.time(),),
-        )
+        running_builds = conn.execute(
+            "SELECT id FROM forge_builds WHERE status IN ('running', 'queued')"
+        ).fetchall()
+        stale_build_ids = [r["id"] for r in running_builds if r["id"] not in active_build_ids]
+        if stale_build_ids:
+            placeholders = ",".join("?" for _ in stale_build_ids)
+            cur = conn.execute(
+                f"UPDATE forge_chunks SET status = 'pending' WHERE status IN ('running', 'verifying') AND attempt_count < 3 AND build_id IN ({placeholders})",
+                tuple(stale_build_ids),
+            )
+            reset_chunks = cur.rowcount
+            conn.execute(
+                f"UPDATE forge_builds SET status = 'queued', updated_at = ? WHERE status = 'running' AND id IN ({placeholders})",
+                (time.time(), *stale_build_ids),
+            )
+        elif not active_build_ids:
+            cur = conn.execute(
+                "UPDATE forge_chunks SET status = 'pending' WHERE status IN ('running', 'verifying') AND attempt_count < 3"
+            )
+            reset_chunks = cur.rowcount
+            conn.execute(
+                "UPDATE forge_builds SET status = 'queued', updated_at = ? WHERE status = 'running'",
+                (time.time(),),
+            )
         # Reconcile stale/dead forge_jobs and remove leaked /tmp test fixtures
         del_cur = conn.execute("DELETE FROM forge_jobs WHERE log_file LIKE '/tmp/%' OR id LIKE 'dt-test-%'")
         pruned_jobs += del_cur.rowcount
@@ -2824,41 +3041,48 @@ class ForgeSupervisor:
         branch_name = f"forge/{build_id}-c{chunk_idx}"
         staging_ref = f"forge/release-{build_id}"
 
-        git_lk = _acquire_repo_git_lock(repo_dir)
-        try:
-            chk_stg = subprocess.run(["git", "rev-parse", "--verify", staging_ref], cwd=str(repo_dir), capture_output=True)
-            if chk_stg.returncode != 0:
-                subprocess.run(["git", "fetch", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=30)
-                chk_ref = subprocess.run(["git", "rev-parse", "--verify", f"origin/{default_branch}"], cwd=str(repo_dir), capture_output=True)
-                start_ref = f"origin/{default_branch}" if chk_ref.returncode == 0 else "HEAD"
-                subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
-            base_ref = staging_ref
+        base_ref = staging_ref
 
-            shutil.rmtree(wt_dir, ignore_errors=True)
-            subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
-            wt_res = subprocess.run(
-                ["git", "worktree", "add", "-B", branch_name, str(wt_dir), base_ref],
-                cwd=str(repo_dir),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if wt_res.returncode != 0:
-                subprocess.run(
-                    ["git", "worktree", "add", "-B", branch_name, str(wt_dir), "HEAD"],
+        def _ensure_chunk_worktree(force_recreate: bool = False) -> None:
+            if not force_recreate and wt_dir.exists() and (wt_dir / ".git").exists():
+                return
+            git_lk = _acquire_repo_git_lock(repo_dir)
+            try:
+                chk_stg = subprocess.run(["git", "rev-parse", "--verify", staging_ref], cwd=str(repo_dir), capture_output=True)
+                if chk_stg.returncode != 0:
+                    subprocess.run(["git", "fetch", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=30)
+                    chk_ref = subprocess.run(["git", "rev-parse", "--verify", f"origin/{default_branch}"], cwd=str(repo_dir), capture_output=True)
+                    start_ref = f"origin/{default_branch}" if chk_ref.returncode == 0 else "HEAD"
+                    subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
+
+                shutil.rmtree(wt_dir, ignore_errors=True)
+                subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
+                wt_res = subprocess.run(
+                    ["git", "worktree", "add", "-B", branch_name, str(wt_dir), base_ref],
                     cwd=str(repo_dir),
                     capture_output=True,
                     text=True,
                     timeout=30,
                 )
-        finally:
-            _release_file_lock(git_lk)
+                if wt_res.returncode != 0:
+                    subprocess.run(
+                        ["git", "worktree", "add", "-B", branch_name, str(wt_dir), "HEAD"],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+            finally:
+                _release_file_lock(git_lk)
+
+        _ensure_chunk_worktree(force_recreate=True)
 
         prohibited = json.loads(chunk_row["prohibited_files_json"] or "[]")
         target_files = json.loads(chunk_row["target_files_json"] or "[]")
         max_attempts = 3
 
         for attempt in range(1, max_attempts + 1):
+            _ensure_chunk_worktree(force_recreate=False)
             model = ESCALATION_WORKER_MODEL if attempt == max_attempts else (chunk_row["worker_model"] or DEFAULT_WORKER_MODEL)
             with self._state_lock, get_db_connection(self.db_path) as conn:
                 conn.execute(
@@ -3374,7 +3598,8 @@ def start_job(
             if not updated_meta.get("worker_pid"):
                 updated_meta["worker_pid"] = proc.pid
                 _write_job_meta(task_id, updated_meta, db_path=db_path)
-            if _is_prod_forge_env(db_path):
+            is_quiet_probe = not bool(notify_on_success) and not bool(synthesize)
+            if _is_prod_forge_env(db_path) and not is_quiet_probe:
                 post_or_update_job_widget(task_id, db_path=db_path)
             sync_forge_channel_header(db_path=db_path)
 
@@ -3413,7 +3638,8 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
     meta["worker_pid"] = os.getpid()
     meta["status"] = "running"
     _write_job_meta(task_id, meta, db_path=db_path)
-    if _is_prod_forge_env(db_path):
+    is_quiet_probe = not bool(meta.get("notify_on_success", True)) and not bool(meta.get("synthesize", True))
+    if _is_prod_forge_env(db_path) and not is_quiet_probe:
         post_or_update_job_widget(task_id, db_path=db_path)
         sync_forge_channel_header(db_path=db_path)
 
@@ -3505,7 +3731,10 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
     fresh_meta["duration_seconds"] = duration
     _write_job_meta(task_id, fresh_meta, db_path=db_path)
     if _is_prod_forge_env(db_path):
-        post_or_update_job_widget(task_id, db_path=db_path)
+        if not is_quiet_probe or fresh_meta.get("forge_message_id"):
+            post_or_update_job_widget(task_id, db_path=db_path)
+        if final_status == "completed":
+            prune_completed_job_widgets(db_path=db_path)
     sync_forge_channel_header(db_path=db_path)
 
     dur_str = _format_duration(duration)
@@ -3536,6 +3765,18 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
         return
 
     synthesize = fresh_meta.get("synthesize", True)
+    # When --no-synthesize is explicitly passed on a short (<25s) inline probe and the
+    # originating channel's interactive turn is still actively in-flight, suppress raw
+    # outbox failure dumps so the active turn can inspect and recover inline without spamming Discord.
+    if not synthesize and duration < 25.0 and _is_channel_turn_actively_in_flight(channel):
+        with open(log_file_path, "a", encoding="utf-8") as lf:
+            lf.write(
+                f"\n[Detached Runner] Short --no-synthesize probe ({dur_str}, status={final_status}) finished while "
+                f"origin channel ({channel}) turn is still actively in-flight. "
+                "Suppressing raw outbox notification so active turn handles result inline.\n"
+            )
+        return
+
     persona_name = "Ivy" if str(channel).strip().lstrip("#") in ("baseball", str(BASEBALL_CHANNEL_ID)) else "Zero"
     if synthesize and final_status in ("completed", "failed", "timed_out"):
         status_banner = (
@@ -3949,10 +4190,16 @@ def execute_decision(
             if not isinstance(plan_data, dict):
                 return {"ok": False, "error": "forge_enqueue payload requires 'plan_file' or 'plan' dict."}
             allow_overlap = bool(payload.get("allow_overlap", False))
-            enq_res = enqueue_build(plan_data, db_path=db_path, post_widget=True, allow_overlap=allow_overlap)
+            enq_res = enqueue_build(
+                plan_data,
+                db_path=db_path,
+                post_widget=True,
+                allow_overlap=allow_overlap,
+                check_approval_gate=False,
+            )
             ok = bool(enq_res.get("ok"))
             if ok:
-                receipt = f"Enqueued FORGE build `{enq_res['build_id']}` ({enq_res.get('chunks_count', 1)} chunk(s)) in <#{FORGE_CHANNEL_ID}>"
+                receipt = f"Enqueued FORGE build `{enq_res['build_id']}` ({enq_res.get('chunk_count', 1)} chunk(s)) in <#{FORGE_CHANNEL_ID}>"
             else:
                 receipt = f"FORGE enqueue failed: {enq_res.get('error', 'unknown error')}"
 
@@ -4429,7 +4676,12 @@ def main():
     args = parser.parse_args()
     if args.cmd == "enqueue":
         plan_data = json.loads(Path(args.plan_file).read_text(encoding="utf-8"))
-        res = enqueue_build(plan_data, post_widget=not args.no_widget, allow_overlap=args.allow_overlap)
+        res = enqueue_build(
+            plan_data,
+            post_widget=not args.no_widget,
+            allow_overlap=args.allow_overlap,
+            check_approval_gate=True,
+        )
         print(json.dumps(res, indent=2))
     elif args.cmd == "status":
         if args.build_id:
