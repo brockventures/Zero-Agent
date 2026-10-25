@@ -9,8 +9,11 @@ import subprocess
 import sys
 import tempfile
 
-sys.path.insert(0, "/workspace/tools")
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, "/workspace/.agents/hooks")
+sys.path.insert(0, "/workspace/tools")
+sys.path.insert(0, os.path.join(ROOT_DIR, ".agents", "hooks"))
+sys.path.insert(0, os.path.join(ROOT_DIR, "tools"))
 
 import batch_guard
 import output_shaper
@@ -129,6 +132,117 @@ def test_rewrite_command_for_shaping_and_git_quiet():
     assert output_shaper.rewrite_command_for_shaping(piped) == piped
 
 
+def test_rewrite_command_sqlite3_compact():
+    # 1. Injects -list when no explicit mode flag is present
+    cmd = 'sqlite3 /workspace/data/test.db "SELECT * FROM users"'
+    rewritten = output_shaper.rewrite_command_for_shaping(cmd)
+    assert rewritten == 'sqlite3 -list /workspace/data/test.db "SELECT * FROM users"'
+    # Idempotent
+    assert output_shaper.rewrite_command_for_shaping(rewritten) == rewritten
+
+    # Bare sqlite3
+    assert output_shaper.rewrite_command_for_shaping("sqlite3") == "sqlite3 -list"
+    assert output_shaper.rewrite_command_for_shaping("sqlite3 -list") == "sqlite3 -list"
+
+    # sqlite3 with other options like -header or -readonly still gets -list
+    header_cmd = 'sqlite3 -header -readonly /tmp/test.db "SELECT 1"'
+    assert output_shaper.rewrite_command_for_shaping(header_cmd) == 'sqlite3 -list -header -readonly /tmp/test.db "SELECT 1"'
+
+    # 2. Preserves explicit formatting flags
+    explicit_flags = [
+        "-list",
+        "-csv",
+        "--csv",
+        "-json",
+        "--json",
+        "-line",
+        "-column",
+        "-box",
+        "-table",
+        "-markdown",
+        "-html",
+        "--help",
+        "-help",
+        "-h",
+        "-version",
+        "--version",
+    ]
+    for flag in explicit_flags:
+        explicit_cmd = f'sqlite3 {flag} /tmp/test.db "SELECT 1"'
+        assert output_shaper.rewrite_command_for_shaping(explicit_cmd) == explicit_cmd, f"Failed for {flag}"
+
+
+def test_rewrite_command_psql_compact():
+    # 1. Injects -A -P pager=off when no explicit mode flag is present
+    cmd = 'psql -c "SELECT 1"'
+    rewritten = output_shaper.rewrite_command_for_shaping(cmd)
+    assert rewritten == 'psql -A -P pager=off -c "SELECT 1"'
+    # Idempotent
+    assert output_shaper.rewrite_command_for_shaping(rewritten) == rewritten
+
+    # Bare psql
+    assert output_shaper.rewrite_command_for_shaping("psql") == "psql -A -P pager=off"
+    assert output_shaper.rewrite_command_for_shaping("psql -A -P pager=off") == "psql -A -P pager=off"
+
+    # psql with db/user flags
+    app_cmd = 'psql -U postgres -d app -c "SELECT * FROM orders"'
+    rewritten_app = output_shaper.rewrite_command_for_shaping(app_cmd)
+    assert rewritten_app == 'psql -A -P pager=off -U postgres -d app -c "SELECT * FROM orders"'
+    assert output_shaper.rewrite_command_for_shaping(rewritten_app) == rewritten_app
+
+    # If pager=off is already present, injects -A without duplicating -P pager=off
+    pager_cmd = 'psql -P pager=off -c "SELECT 1"'
+    rewritten_pager = output_shaper.rewrite_command_for_shaping(pager_cmd)
+    assert rewritten_pager == 'psql -A -P pager=off -c "SELECT 1"'
+
+    # 2. Preserves explicit flags
+    explicit_psql_flags = [
+        "-A",
+        "--no-align",
+        "--csv",
+        "-H",
+        "--html",
+        "-x",
+        "--expanded",
+        "-t",
+        "--tuples-only",
+        "--help",
+        "-h",
+        "-?",
+        "-V",
+        "--version",
+    ]
+    for flag in explicit_psql_flags:
+        explicit_cmd = f'psql {flag} -c "SELECT 1"'
+        assert output_shaper.rewrite_command_for_shaping(explicit_cmd) == explicit_cmd, f"Failed for {flag}"
+
+
+def test_rewrite_command_compound_db_chains():
+    cmd = 'sqlite3 /workspace/data/test.db "SELECT 1" && psql -U postgres -d app -c "SELECT 2"'
+    rewritten = output_shaper.rewrite_command_for_shaping(cmd)
+    expected = (
+        'sqlite3 -list /workspace/data/test.db "SELECT 1" && '
+        'psql -A -P pager=off -U postgres -d app -c "SELECT 2"'
+    )
+    assert rewritten == expected
+    # Idempotent on compound chain
+    assert output_shaper.rewrite_command_for_shaping(rewritten) == expected
+
+    # Mixed chain with git and pytest
+    multi_cmd = (
+        'git pull origin main && '
+        'sqlite3 db.sqlite "SELECT 1" && '
+        'psql -c "SELECT 2" && '
+        'pytest tools/test_output_shaper.py'
+    )
+    rewritten_multi = output_shaper.rewrite_command_for_shaping(multi_cmd)
+    assert "git pull -q origin main" in rewritten_multi
+    assert 'sqlite3 -list db.sqlite "SELECT 1"' in rewritten_multi
+    assert 'psql -A -P pager=off -c "SELECT 2"' in rewritten_multi
+    assert "output_shaper.py --run -- pytest tools/test_output_shaper.py" in rewritten_multi
+    assert output_shaper.rewrite_command_for_shaping(rewritten_multi) == rewritten_multi
+
+
 def test_batch_guard_unscoped_test_and_overwrite():
     assert batch_guard.is_unscoped_pytest("pytest") is True
     assert batch_guard.is_unscoped_pytest("cd /workspace && pytest tests/") is True
@@ -184,6 +298,9 @@ if __name__ == "__main__":
     test_shape_coverage_output_and_ast_functions()
     test_run_with_temp_log_preserves_exit_code()
     test_rewrite_command_for_shaping_and_git_quiet()
+    test_rewrite_command_sqlite3_compact()
+    test_rewrite_command_psql_compact()
+    test_rewrite_command_compound_db_chains()
     test_batch_guard_unscoped_test_and_overwrite()
     test_shape_log_tail_extracts_traceback()
     print("All output_shaper tests passed.")

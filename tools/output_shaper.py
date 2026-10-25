@@ -651,6 +651,16 @@ _GIT_QUIET_ELIGIBLE_RE = re.compile(
     r"^git\s+(?P<subcmd>fetch|pull|checkout|switch|rebase|merge)\b(?P<rest>.*)$"
 )
 
+_SQLITE_COMPACT_ELIGIBLE_RE = re.compile(r"^sqlite3(?P<rest>\s+.*|$)")
+_SQLITE_EXPLICIT_FLAGS_RE = re.compile(
+    r"(?:^|\s)(?:-(?:-?(?:help|version|csv|json|line|column|box|table|markdown|html|list)|h))\b"
+)
+
+_PSQL_COMPACT_ELIGIBLE_RE = re.compile(r"^psql(?P<rest>\s+.*|$)")
+_PSQL_EXPLICIT_FLAGS_RE = re.compile(
+    r"(?:^|\s)(?:-(?:A|H|x|t|h|V|\?)|--(?:no-align|csv|html|expanded|tuples-only|help|version))(?=\s|$)"
+)
+
 
 def _segment_has_redirection_or_pipe(seg: str) -> bool:
     """Return True if an unquoted pipe `|`, redirection `>`/`<`, or background `&` exists in `seg`."""
@@ -678,8 +688,9 @@ def _segment_has_redirection_or_pipe(seg: str) -> bool:
 def rewrite_command_for_shaping(cmd: str) -> str:
     """
     Inspect a shell command string and safely wrap eligible test/coverage/linter segments
-    with `python3 /workspace/tools/output_shaper.py --run -- <segment>` and inject `-q`
-    into noisy git operations when safe.
+    with `python3 /workspace/tools/output_shaper.py --run -- <segment>`, inject `-q`
+    into noisy git operations, and inject compact unaligned output flags into sqlite3 and
+    psql CLI commands when safe.
     Returns the rewritten command string (or the original `cmd` if no changes apply).
     """
     if not cmd or "output_shaper.py --run" in cmd or "output_shaper.py --log" in cmd:
@@ -712,6 +723,27 @@ def rewrite_command_for_shaping(cmd: str) -> str:
                     ):
                         new_seg = f"git {subcmd} -q{rest}"
                         changed = True
+                else:
+                    m_sqlite = _SQLITE_COMPACT_ELIGIBLE_RE.match(stripped)
+                    if m_sqlite:
+                        rest = m_sqlite.group("rest") or ""
+                        if not _SQLITE_EXPLICIT_FLAGS_RE.search(rest):
+                            new_seg = f"sqlite3 -list{rest}" if rest else "sqlite3 -list"
+                            changed = True
+                    else:
+                        m_psql = _PSQL_COMPACT_ELIGIBLE_RE.match(stripped)
+                        if m_psql:
+                            rest = m_psql.group("rest") or ""
+                            if not _PSQL_EXPLICIT_FLAGS_RE.search(rest):
+                                if "pager=off" in rest:
+                                    new_seg = f"psql -A{rest}" if rest else "psql -A"
+                                else:
+                                    new_seg = (
+                                        f"psql -A -P pager=off{rest}"
+                                        if rest
+                                        else "psql -A -P pager=off"
+                                    )
+                                changed = True
 
         if op == ";":
             rebuilt.append(f"{new_seg.strip()}; ")
