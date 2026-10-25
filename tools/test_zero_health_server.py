@@ -227,6 +227,17 @@ class TestZeroHealthServer(unittest.TestCase):
         self.assertEqual(code1, code2)
         self.assertEqual(payload1, payload2)
 
+    def test_public_landing_host_and_html(self):
+        self.assertTrue(zhealth.ZeroHealthHandler._is_public_landing_host("brock.ventures"))
+        self.assertTrue(zhealth.ZeroHealthHandler._is_public_landing_host("www.brock.ventures:443"))
+        self.assertFalse(zhealth.ZeroHealthHandler._is_public_landing_host("status.brock.ventures"))
+        html = zhealth.ZeroHealthHandler._render_public_landing_html()
+        self.assertIn("upgrade-insecure-requests", html)
+        self.assertIn("rel=\"icon\"", html)
+        self.assertLess(html.index("Seerr"), html.index("Plex"))
+        self.assertLess(html.index("Plex"), html.index("Shelfmark"))
+        self.assertLess(html.index("Shelfmark"), html.index("Books Library"))
+
 
 if __name__ == "__main__":
     unittest.main()

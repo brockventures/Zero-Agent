@@ -611,6 +611,8 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎬</text></svg>" />
   <title>Brock Ventures · Media & Library Portal</title>
   <style>
     :root {
@@ -784,7 +786,13 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         clean_path = self.path.split("?")[0].rstrip("/")
         host_header = self.headers.get("Host", "").lower()
         if self._is_public_landing_host(host_header):
-            self.send_response(200 if clean_path in ("", "/") else 404)
+            clean_host = (host_header or "").split(":")[0].strip().lower()
+            if clean_host == "brock.ventures":
+                self.send_response(301)
+                self.send_header("Location", f"https://www.brock.ventures{self.path or '/'}")
+                self.end_headers()
+                return
+            self.send_response(200 if clean_path in ("", "/") else (204 if clean_path == "/favicon.ico" else 404))
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             return
@@ -836,14 +844,27 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
 
         # Public Landing Portal Guard: brock.ventures / www.brock.ventures serves ONLY the static directory portal
         if self._is_public_landing_host(host_header):
+            clean_host = (host_header or "").split(":")[0].strip().lower()
+            if clean_host == "brock.ventures":
+                self.send_response(301)
+                self.send_header("Location", f"https://www.brock.ventures{self.path or '/'}")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
             if clean_path in ("", "/"):
                 body = self._render_public_landing_html().encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Security-Policy", "upgrade-insecure-requests")
+                self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
                 self.send_header("Cache-Control", "public, max-age=300")
                 self.end_headers()
                 self.wfile.write(body)
+            elif clean_path == "/favicon.ico":
+                self.send_response(204)
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
             else:
                 self.send_response(404)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
