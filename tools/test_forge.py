@@ -813,6 +813,68 @@ class TestForgeEngine(unittest.TestCase):
                 db_path=self.db_path,
             )
 
+    def test_10_vulcan_worktree_profile_staging_and_restoration(self):
+        # 1. Test /workspace-style repo with tracked GEMINI.md and chat rules
+        wt_zero = Path(self.tmp_dir.name) / "wt_zero"
+        (wt_zero / ".agents" / "rules").mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(wt_zero), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(wt_zero), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Zero"], cwd=str(wt_zero), check=True, capture_output=True)
+
+        (wt_zero / "agents.md").write_text("# Zero Persona\n", encoding="utf-8")
+        (wt_zero / "GEMINI.md").symlink_to("agents.md")
+        (wt_zero / ".agents" / "rules" / "discord_formatting.md").write_text("# Discord Rules\n", encoding="utf-8")
+        (wt_zero / ".agents" / "rules" / "tool_roundtrip_minimization.md").write_text("# Batching\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(wt_zero), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init zero"], cwd=str(wt_zero), check=True, capture_output=True)
+
+        snap_zero = forge_mod.stage_vulcan_worktree_profile(
+            wt_zero,
+            repo_dir="/workspace",
+            target_files=["tools/forge.py"],
+            origin_channel_id=ZERO_OPS_CHANNEL_ID,
+        )
+        self.assertFalse(snap_zero["is_baseball"])
+        self.assertIn("Vulcan", (wt_zero / "GEMINI.md").read_text(encoding="utf-8"))
+        self.assertFalse((wt_zero / ".agents" / "rules" / "discord_formatting.md").exists())
+        self.assertTrue((wt_zero / ".agents" / "rules" / "tool_roundtrip_minimization.md").exists())
+        self.assertTrue((wt_zero / ".agents" / "hooks.json").exists())
+
+        forge_mod.restore_vulcan_worktree_profile(wt_zero, snap_zero)
+        self.assertTrue((wt_zero / "GEMINI.md").is_symlink())
+        self.assertEqual((wt_zero / "agents.md").read_text(encoding="utf-8"), "# Zero Persona\n")
+        self.assertTrue((wt_zero / ".agents" / "rules" / "discord_formatting.md").exists())
+        st_zero = subprocess.run(["git", "status", "--porcelain"], cwd=str(wt_zero), capture_output=True, text=True)
+        self.assertEqual(st_zero.stdout.strip(), "")
+
+        # 2. Test /baseball-style repo with zero tracked GEMINI.md or .agents/
+        wt_bb = Path(self.tmp_dir.name) / "wt_baseball"
+        wt_bb.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(wt_bb), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(wt_bb), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Ivy"], cwd=str(wt_bb), check=True, capture_output=True)
+        (wt_bb / "engine.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(wt_bb), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init bb"], cwd=str(wt_bb), check=True, capture_output=True)
+
+        snap_bb = forge_mod.stage_vulcan_worktree_profile(
+            wt_bb,
+            repo_dir="/baseball/big-projections",
+            target_files=["engine.py"],
+            origin_channel_id=1548196929308065893,
+        )
+        self.assertTrue(snap_bb["is_baseball"])
+        self.assertIn("Vulcan", (wt_bb / "GEMINI.md").read_text(encoding="utf-8"))
+        self.assertTrue((wt_bb / ".agents" / "hooks.json").exists())
+        if Path("/baseball/data/vulcan_baseball_rules/big_projection_engine_invariants.md").exists():
+            self.assertTrue((wt_bb / ".agents" / "rules" / "big_projection_engine_invariants.md").exists())
+
+        forge_mod.restore_vulcan_worktree_profile(wt_bb, snap_bb)
+        self.assertFalse((wt_bb / "GEMINI.md").exists())
+        self.assertFalse((wt_bb / ".agents").exists())
+        st_bb = subprocess.run(["git", "status", "--porcelain"], cwd=str(wt_bb), capture_output=True, text=True)
+        self.assertEqual(st_bb.stdout.strip(), "")
+
 
 if __name__ == "__main__":
     unittest.main()

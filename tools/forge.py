@@ -59,7 +59,7 @@ DEFAULT_BRAIN_DIR = Path("/root/.gemini/antigravity-cli/brain")
 PT_TZ = ZoneInfo("America/Los_Angeles")
 
 FORGE_CHANNEL_ID = 1562899941595160657
-FORGE_HEADER_MESSAGE_ID = 1562903902188208212
+FORGE_HEADER_MESSAGE_ID = 1563745944485232704
 ZERO_CHAT_CHANNEL_ID = 1542081375287640084
 ZERO_OPS_CHANNEL_ID = 1544953279664889888
 BASEBALL_CHANNEL_ID = 1548196929308065893
@@ -298,10 +298,24 @@ def get_default_origin_channel() -> str:
 def _get_discord_token(for_forge_channel: bool = False) -> Optional[str]:
     """Retrieve Discord bot token across Zero (/secrets) and Ivy (.env) environments.
 
-    When `for_forge_channel=True` inside `discord-ivy-agent`, prefers Zero's bot token
-    from `/opt/zero/.env` so Ivy can post/edit #forge build cards and the #forge header
-    message (which is authored by Zero and restricted by #forge channel overwrites).
+    When `for_forge_channel=True`, prefers `VULCAN_BOT_TOKEN` / `FORGE_BOT_TOKEN` if
+    configured, or Zero's bot token from `/opt/zero/.env` inside `discord-ivy-agent`.
     """
+    if for_forge_channel:
+        for env_key in ("VULCAN_BOT_TOKEN", "FORGE_BOT_TOKEN"):
+            val = os.getenv(env_key, "").strip()
+            if val:
+                return val
+        for sec_p in (Path("/secrets/env.json"), Path("/opt/zero/secrets/env.json")):
+            if sec_p.exists():
+                try:
+                    sec_data = json.loads(sec_p.read_text(encoding="utf-8"))
+                    for env_key in ("VULCAN_BOT_TOKEN", "FORGE_BOT_TOKEN"):
+                        val = str(sec_data.get(env_key) or "").strip()
+                        if val:
+                            return val
+                except Exception:
+                    pass
     if for_forge_channel and is_ivy_container():
         zero_env = Path("/opt/zero/.env")
         if zero_env.exists():
@@ -329,6 +343,294 @@ def _get_discord_token(for_forge_channel: bool = False) -> Optional[str]:
             except Exception:
                 pass
     return None
+
+
+VULCAN_WEBHOOK_CACHE_PATHS: tuple[Path, ...] = (
+    Path("/baseball/data/.vulcan_webhook.json"),
+    DATA_DIR / ".vulcan_webhook.json",
+    Path("/opt/zero/workspace/data/.vulcan_webhook.json"),
+)
+
+VULCAN_PROFILE_PATHS: tuple[Path, ...] = (
+    WORKSPACE_DIR / ".agents" / "profiles" / "vulcan" / "GEMINI.md",
+    Path("/opt/zero/workspace/.agents/profiles/vulcan/GEMINI.md"),
+)
+
+VULCAN_CORE_RULES: tuple[str, ...] = (
+    "tool_roundtrip_minimization.md",
+    "no_server_wide_search.md",
+    "no_hardcoded_topology.md",
+    "silent_background_execution.md",
+    "autonomous_github_management.md",
+)
+
+VULCAN_BASEBALL_RULES: tuple[str, ...] = (
+    "big_projection_engine_invariants.md",
+    "sabermetric_modeling_invariants.md",
+    "big_board_pro_invariants.md",
+    "player_id_identity_invariants.md",
+    "git_and_infrastructure_hygiene.md",
+)
+
+DEFAULT_VULCAN_GEMINI_MD = """# Vulcan (Verified Unit & Lifecycle Code Autonomous Node) — FORGE Builder Profile
+
+You are **Vulcan**, the autonomous headless build engineer for the FORGE pipeline.
+Operate strictly inside your isolated git worktree, modify only Allowed Target Files,
+run the Mandatory Verification Gate before finishing, and leave verified changes uncommitted for the FORGE supervisor.
+"""
+
+
+def _get_vulcan_webhook(
+    db_path: Path | str = FORGE_DB_PATH,
+    forge_channel_id: int = FORGE_CHANNEL_ID,
+) -> Optional[dict]:
+    """Return Vulcan's #forge Discord Webhook credentials (`{'id': ..., 'token': ...}`) in production."""
+    if int(forge_channel_id) != FORGE_CHANNEL_ID or not _is_prod_forge_env(db_path):
+        return None
+    for cand in VULCAN_WEBHOOK_CACHE_PATHS:
+        try:
+            if cand.exists() and cand.is_file():
+                data = json.loads(cand.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data.get("id") and data.get("token"):
+                    return {"id": str(data["id"]), "token": str(data["token"]), "name": str(data.get("name") or "Vulcan")}
+        except Exception:
+            pass
+    return None
+
+
+def _post_forge_channel_message(
+    payload: dict,
+    forge_channel_id: int,
+    token: Optional[str],
+    db_path: Path | str = FORGE_DB_PATH,
+) -> Optional[int]:
+    """Post a message/embed to #forge using Vulcan's webhook profile (with bot token fallback)."""
+    wh = _get_vulcan_webhook(db_path=db_path, forge_channel_id=forge_channel_id)
+    if wh:
+        try:
+            wh_url = f"https://discord.com/api/v10/webhooks/{wh['id']}/{wh['token']}?wait=true"
+            wh_payload = {"username": wh.get("name", "Vulcan"), **payload}
+            resp = requests.post(wh_url, json=wh_payload, timeout=10)
+            if resp.status_code < 300:
+                return int(resp.json()["id"])
+        except Exception:
+            pass
+
+    if not token:
+        return None
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+    url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages"
+    resp = requests.post(url, headers=headers, json=payload, timeout=10)
+    if resp.status_code < 300:
+        return int(resp.json()["id"])
+    return None
+
+
+def _patch_forge_channel_message(
+    msg_id: int,
+    payload: dict,
+    forge_channel_id: int,
+    token: Optional[str],
+    db_path: Path | str = FORGE_DB_PATH,
+) -> tuple[bool, int]:
+    """Patch an existing #forge message using Vulcan's webhook (falling back to bot token for legacy messages)."""
+    wh = _get_vulcan_webhook(db_path=db_path, forge_channel_id=forge_channel_id)
+    if wh:
+        try:
+            wh_url = f"https://discord.com/api/v10/webhooks/{wh['id']}/{wh['token']}/messages/{msg_id}"
+            resp = requests.patch(wh_url, json=payload, timeout=10)
+            if resp.status_code < 300:
+                return True, resp.status_code
+            if resp.status_code == 404 and not token:
+                return False, 404
+        except Exception:
+            pass
+
+    if not token:
+        return False, 0
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+    url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
+    resp = requests.patch(url, headers=headers, json=payload, timeout=10)
+    return (resp.status_code < 300), resp.status_code
+
+
+def stage_vulcan_worktree_profile(
+    worktree_dir: Path | str,
+    repo_dir: Optional[Path | str] = None,
+    target_files: Optional[list[str]] = None,
+    origin_channel_id: Optional[int] = None,
+) -> dict:
+    """Inject Vulcan's isolated headless builder GEMINI.md, hooks.json, and scoped engineering rules into a worktree.
+
+    Snapshots all pre-existing root instruction files and `.agents/` entries so `restore_vulcan_worktree_profile()`
+    can restore the exact pre-run git state before `verify_chunk_worktree()` and `git commit` execute.
+    Files explicitly listed in `target_files` are never overwritten or stripped.
+    """
+    wt = Path(worktree_dir)
+    if not wt.exists():
+        return {"files": {}, "had_agents_dir": False, "had_rules_dir": False, "staged_rules": []}
+
+    norm_targets = {str(f).strip().lstrip("./") for f in (target_files or []) if str(f).strip()}
+    root_doc_names = {"GEMINI.md", "AGENTS.md", "agents.md"}
+    root_docs_targeted = bool(norm_targets & root_doc_names)
+
+    eff_repo_str = str(Path(repo_dir or wt).resolve())
+    is_baseball = (
+        eff_repo_str.startswith("/baseball")
+        or (origin_channel_id is not None and int(origin_channel_id) == BASEBALL_CHANNEL_ID)
+        or is_ivy_container()
+    )
+    allowed_rules = set(VULCAN_CORE_RULES) | (set(VULCAN_BASEBALL_RULES) if is_baseball else set())
+
+    had_agents_dir = (wt / ".agents").exists()
+    had_rules_dir = (wt / ".agents" / "rules").exists()
+    files_snap: dict[str, dict] = {}
+
+    def _record_snap(rel_p: str) -> None:
+        if rel_p in files_snap:
+            return
+        p = wt / rel_p
+        try:
+            if p.is_symlink():
+                files_snap[rel_p] = {"state": "symlink", "target": os.readlink(p)}
+            elif p.is_file():
+                files_snap[rel_p] = {"state": "file", "bytes": p.read_bytes(), "mode": p.stat().st_mode}
+            else:
+                files_snap[rel_p] = {"state": "absent"}
+        except Exception:
+            files_snap[rel_p] = {"state": "absent"}
+
+    for rdoc in ("GEMINI.md", "AGENTS.md", "agents.md", "AGY.md", ".agents/hooks.json"):
+        _record_snap(rdoc)
+
+    rules_dir = wt / ".agents" / "rules"
+    if rules_dir.exists() and rules_dir.is_dir():
+        for entry in rules_dir.iterdir():
+            if entry.is_file() or entry.is_symlink():
+                _record_snap(f".agents/rules/{entry.name}")
+
+    for rname in allowed_rules:
+        _record_snap(f".agents/rules/{rname}")
+
+    # 1. Stage Vulcan's headless builder GEMINI.md / AGENTS.md / agents.md
+    if not root_docs_targeted:
+        vulcan_md = DEFAULT_VULCAN_GEMINI_MD
+        for cand_p in VULCAN_PROFILE_PATHS:
+            if cand_p.exists() and cand_p.is_file():
+                try:
+                    vulcan_md = cand_p.read_text(encoding="utf-8")
+                    break
+                except Exception:
+                    pass
+        for rdoc in ("GEMINI.md", "AGENTS.md", "agents.md"):
+            p = wt / rdoc
+            try:
+                if p.is_symlink() or p.is_file():
+                    p.unlink()
+                p.write_text(vulcan_md, encoding="utf-8")
+            except Exception:
+                pass
+
+    # 2. Ensure .agents/hooks.json is staged (batch_guard.py + output_shaper.py)
+    if ".agents/hooks.json" not in norm_targets:
+        for hooks_src in (
+            WORKSPACE_DIR / ".agents" / "hooks.json",
+            Path("/opt/zero/workspace/.agents/hooks.json"),
+        ):
+            if hooks_src.exists() and hooks_src.is_file():
+                try:
+                    (wt / ".agents").mkdir(parents=True, exist_ok=True)
+                    hp = wt / ".agents" / "hooks.json"
+                    if hp.is_symlink() or hp.is_file():
+                        hp.unlink()
+                    hp.write_bytes(hooks_src.read_bytes())
+                except Exception:
+                    pass
+                break
+
+    # 3. Scope .agents/rules/ to Vulcan engineering rules (+ baseball invariants when applicable)
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    for entry in list(rules_dir.iterdir()):
+        rel_e = f".agents/rules/{entry.name}"
+        if entry.name not in allowed_rules and rel_e not in norm_targets:
+            try:
+                if entry.is_symlink() or entry.is_file():
+                    entry.unlink()
+            except Exception:
+                pass
+
+    rule_search_dirs = (
+        WORKSPACE_DIR / ".agents" / "rules",
+        Path("/opt/zero/workspace/.agents/rules"),
+        Path("/baseball/data/vulcan_baseball_rules"),
+    )
+    staged_rules: list[str] = []
+    for rname in sorted(allowed_rules):
+        rel_r = f".agents/rules/{rname}"
+        if rel_r in norm_targets:
+            staged_rules.append(rname)
+            continue
+        dest_r = wt / rel_r
+        for sdir in rule_search_dirs:
+            src_r = sdir / rname
+            if src_r.exists() and src_r.is_file():
+                try:
+                    if dest_r.is_symlink() or dest_r.is_file():
+                        dest_r.unlink()
+                    dest_r.write_bytes(src_r.read_bytes())
+                    staged_rules.append(rname)
+                except Exception:
+                    pass
+                break
+
+    return {
+        "files": files_snap,
+        "had_agents_dir": had_agents_dir,
+        "had_rules_dir": had_rules_dir,
+        "staged_rules": staged_rules,
+        "is_baseball": is_baseball,
+    }
+
+
+def restore_vulcan_worktree_profile(worktree_dir: Path | str, snapshot: dict) -> None:
+    """Restore a worktree's pre-existing instruction files and `.agents/` directory after Vulcan finishes."""
+    wt = Path(worktree_dir)
+    if not wt.exists() or not isinstance(snapshot, dict):
+        return
+
+    files_snap: dict[str, dict] = snapshot.get("files") or {}
+    for rel_p, info in files_snap.items():
+        p = wt / rel_p
+        state = info.get("state", "absent")
+        try:
+            if p.is_symlink() or p.is_file():
+                p.unlink()
+            if state == "symlink":
+                p.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(info["target"], p)
+            elif state == "file":
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(info["bytes"])
+                if "mode" in info:
+                    os.chmod(p, int(info["mode"]) & 0o777)
+        except Exception:
+            pass
+
+    rules_dir = wt / ".agents" / "rules"
+    if not snapshot.get("had_rules_dir") and rules_dir.exists():
+        try:
+            if not any(rules_dir.iterdir()):
+                rules_dir.rmdir()
+        except Exception:
+            pass
+
+    agents_dir = wt / ".agents"
+    if not snapshot.get("had_agents_dir") and agents_dir.exists():
+        try:
+            if not any(agents_dir.iterdir()):
+                agents_dir.rmdir()
+        except Exception:
+            pass
 
 
 def _get_repo_default_branch(repo_dir: Path | str) -> str:
@@ -1192,13 +1494,13 @@ def post_or_update_build_widget(
     db_path: Path | str = FORGE_DB_PATH,
     forge_channel_id: int = FORGE_CHANNEL_ID,
 ) -> Optional[int]:
-    """Post or edit the single live Discord Embed card for `build_id` inside #forge via REST API v10."""
+    """Post or edit the single live Discord Embed card for `build_id` inside #forge via Vulcan's webhook or REST API v10."""
     embed = render_build_widget_embed(build_id, db_path=db_path)
     token = _get_discord_token(for_forge_channel=True)
-    if not token:
+    wh = _get_vulcan_webhook(db_path=db_path, forge_channel_id=forge_channel_id)
+    if not token and not wh:
         return None
 
-    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
     with get_db_connection(db_path) as conn:
         row = conn.execute("SELECT forge_message_id FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
         if not row:
@@ -1208,15 +1510,23 @@ def post_or_update_build_widget(
     payload = {"content": "", "embeds": [embed]}
     try:
         if msg_id:
-            url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
-            resp = requests.patch(url, headers=headers, json=payload, timeout=10)
-            if resp.status_code < 300:
+            ok_patch, _ = _patch_forge_channel_message(
+                int(msg_id),
+                payload=payload,
+                forge_channel_id=forge_channel_id,
+                token=token,
+                db_path=db_path,
+            )
+            if ok_patch:
                 return int(msg_id)
 
-        url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages"
-        resp = requests.post(url, headers=headers, json=payload, timeout=10)
-        if resp.status_code < 300:
-            new_msg_id = int(resp.json()["id"])
+        new_msg_id = _post_forge_channel_message(
+            payload=payload,
+            forge_channel_id=forge_channel_id,
+            token=token,
+            db_path=db_path,
+        )
+        if new_msg_id:
             with get_db_connection(db_path) as conn:
                 conn.execute(
                     "UPDATE forge_builds SET forge_message_id = ?, updated_at = ? WHERE id = ?",
@@ -1340,10 +1650,10 @@ def post_or_update_job_widget(
 
             embed = render_job_widget_embed(task_id, db_path=db_path)
             token = _get_discord_token(for_forge_channel=True)
-            if not token:
+            wh = _get_vulcan_webhook(db_path=db_path, forge_channel_id=forge_channel_id)
+            if not token and not wh:
                 return None
 
-            headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
             msg_id = meta.get("forge_message_id")
             if not msg_id:
                 try:
@@ -1356,17 +1666,25 @@ def post_or_update_job_widget(
 
             payload = {"content": "", "embeds": [embed]}
             if msg_id:
-                url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{msg_id}"
-                resp = requests.patch(url, headers=headers, json=payload, timeout=10)
-                if resp.status_code < 300:
+                ok_patch, patch_code = _patch_forge_channel_message(
+                    int(msg_id),
+                    payload=payload,
+                    forge_channel_id=forge_channel_id,
+                    token=token,
+                    db_path=db_path,
+                )
+                if ok_patch:
                     return int(msg_id)
-                if resp.status_code != 404:
+                if patch_code != 404:
                     return int(msg_id)
 
-            url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages"
-            resp = requests.post(url, headers=headers, json=payload, timeout=10)
-            if resp.status_code < 300:
-                new_msg_id = int(resp.json()["id"])
+            new_msg_id = _post_forge_channel_message(
+                payload=payload,
+                forge_channel_id=forge_channel_id,
+                token=token,
+                db_path=db_path,
+            )
+            if new_msg_id:
                 try:
                     with get_db_connection(db_path) as conn:
                         conn.execute(
@@ -2342,7 +2660,7 @@ class ForgeSupervisor:
             with get_db_connection(self.db_path) as conn:
                 conn.execute(
                     "UPDATE forge_chunks SET attempt_count = ?, worker_model = ?, status = 'running', live_status = ? WHERE id = ?",
-                    (attempt, model, f"Booting worker ({model})...", chunk_id),
+                    (attempt, model, f"Booting Vulcan ({model})...", chunk_id),
                 )
             post_or_update_build_widget(build_id, db_path=self.db_path)
 
@@ -2356,6 +2674,12 @@ class ForgeSupervisor:
                 "--print-timeout=4h",
                 f"--model={model}",
             ]
+            profile_snapshot = stage_vulcan_worktree_profile(
+                wt_dir,
+                repo_dir=repo_dir,
+                target_files=target_files,
+                origin_channel_id=int(build["origin_channel_id"]) if build["origin_channel_id"] else None,
+            )
             try:
                 proc = subprocess.Popen(
                     agy_cmd,
@@ -2401,6 +2725,8 @@ class ForgeSupervisor:
                 with get_db_connection(self.db_path) as conn:
                     conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (str(e), chunk_id))
                 continue
+            finally:
+                restore_vulcan_worktree_profile(wt_dir, profile_snapshot)
 
             with get_db_connection(self.db_path) as conn:
                 conn.execute("UPDATE forge_chunks SET status = 'verifying', live_status = '' WHERE id = ?", (chunk_id,))
@@ -3621,7 +3947,7 @@ def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
     )
 
     lines = [
-        "### ⚒️ FORGE — **F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution",
+        "### ⚒️ VULCAN — FORGE Build Floor (**F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution)",
         "",
         "**Active FORGE Builds:**",
     ]
@@ -3767,15 +4093,20 @@ def sync_forge_channel_header(
         except Exception:
             pass
 
-    if not token:
+    wh = _get_vulcan_webhook(db_path=db_path, forge_channel_id=forge_channel_id)
+    if not token and not wh:
         return False
 
-    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-    url = f"https://discord.com/api/v10/channels/{forge_channel_id}/messages/{header_message_id}"
     rendered_payload = f"{content}\n\n*Last synced: {_now_pt_str()}*"
     try:
-        resp = requests.patch(url, headers=headers, json={"content": rendered_payload[:1990], "embeds": []}, timeout=10)
-        if resp.status_code < 300:
+        ok_patch, _ = _patch_forge_channel_message(
+            int(header_message_id),
+            payload={"content": rendered_payload[:1990], "embeds": []},
+            forge_channel_id=forge_channel_id,
+            token=token,
+            db_path=db_path,
+        )
+        if ok_patch:
             cache_file.write_text(content, encoding="utf-8")
             return True
     except Exception:
