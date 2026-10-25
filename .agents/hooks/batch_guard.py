@@ -12,6 +12,7 @@ CONSECUTIVE anti-pattern counters and 90-second FORGE Tier 1/2/3 gates:
 7. Self-preservation AST syntax validation on hook edits and Decision Card file deletion gate.
 """
 import ast
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import sys
 import time
 
 STATE_FILE = "/tmp/batch_guard_state.json"
+IN_FLIGHT_TURN_FILE = "/workspace/data/in_flight_turn.json"
 MAX_CONSECUTIVE_SHELL_INSPECTIONS = 3
 MAX_CONSECUTIVE_INLINE_PYTHON = 2
 MAX_CONSECUTIVE_SAME_FILE_VIEWS = 2
@@ -130,31 +132,76 @@ def _get_agy_ancestor_pid() -> int:
     return os.getppid()
 
 
-def _get_current_turn_Step_anchor(agy_pid: int) -> str:
-    """Return 'agy_pid:last_user_input_step' so state resets only when a new user turn arrives on the warm worker."""
+def _get_current_turn_Step_anchor(
+    agy_pid: int | None = None,
+    in_flight_file: str = IN_FLIGHT_TURN_FILE,
+) -> str:
+    """Return a deterministic per-turn anchor combining agy_pid, in_flight_turn metadata, and transcript USER_INPUT step."""
+    if agy_pid is None:
+        agy_pid = _get_agy_ancestor_pid()
+    cid = ""
+    in_flight_sig = ""
     try:
-        cmdline = open(f"/proc/{agy_pid}/cmdline", "r", encoding="utf-8", errors="ignore").read().replace("\x00", " ")
-        m = re.search(r"--conversation=([a-f0-9-]+)", cmdline)
-        if m:
-            cid = m.group(1)
+        if in_flight_file and os.path.exists(in_flight_file):
+            with open(in_flight_file, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                matched_entry = None
+                env_ch = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
+                if env_ch and isinstance(data.get(env_ch), dict):
+                    matched_entry = data[env_ch]
+                if matched_entry is None:
+                    for v in data.values():
+                        if isinstance(v, dict) and v.get("pid") == agy_pid:
+                            matched_entry = v
+                            break
+                if matched_entry is None and ("prompt" in data or "ts" in data or "status_msg_id" in data):
+                    matched_entry = data
+                if isinstance(matched_entry, dict):
+                    cid = str(matched_entry.get("conv_id") or data.get("conv_id") or "")
+                    status_msg_id = str(matched_entry.get("status_msg_id") or "")
+                    attempts = str(matched_entry.get("attempts") or 1)
+                    prompt_raw = str(matched_entry.get("prompt") or "")
+                    prompt_hash = hashlib.sha1(prompt_raw.encode("utf-8", errors="ignore")).hexdigest()[:10] if prompt_raw else ""
+                    in_flight_sig = f"{status_msg_id}:{attempts}:{prompt_hash}"
+    except Exception:
+        pass
+
+    user_step = ""
+    try:
+        if not cid:
+            cmdline = open(f"/proc/{agy_pid}/cmdline", "r", encoding="utf-8", errors="ignore").read().replace("\x00", " ")
+            m = re.search(r"--conversation=([a-f0-9-]+)", cmdline)
+            if m:
+                cid = m.group(1)
+        if cid:
             tpath = f"/root/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl"
             if os.path.exists(tpath):
                 with open(tpath, "rb") as f:
                     f.seek(0, os.SEEK_END)
                     size = f.tell()
-                    f.seek(max(0, size - 65536))
+                    f.seek(max(0, size - 524288))
                     tail = f.read().decode("utf-8", errors="ignore").splitlines()
                 for line in reversed(tail):
                     if '"USER_INPUT"' in line:
                         try:
                             d = json.loads(line)
                             if d.get("type") == "USER_INPUT":
-                                return f"{agy_pid}:{d.get('step_index', 0)}"
+                                user_step = str(d.get("step_index", 0))
+                                break
                         except Exception:
                             pass
     except Exception:
         pass
-    return str(agy_pid)
+
+    parts = [str(agy_pid)]
+    if cid:
+        parts.append(cid)
+    if user_step:
+        parts.append(f"s{user_step}")
+    if in_flight_sig:
+        parts.append(in_flight_sig)
+    return ":".join(parts)
 
 
 def load_state(state_file: str = STATE_FILE) -> dict:
@@ -774,15 +821,23 @@ def is_heavy_inline_benchmark_or_migration(cmd: str, cwd: str = "/workspace") ->
     return bool(_HEAVY_CLI_BENCHMARK_OR_MIGRATE_RE.search(cmd))
 
 
-def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str = "/workspace") -> tuple[bool, str]:
+def check_tool_use(
+    name: str,
+    args: dict,
+    state_file: str = STATE_FILE,
+    cwd: str = "/workspace",
+    in_flight_file: str = IN_FLIGHT_TURN_FILE,
+) -> tuple[bool, str]:
     now = time.time()
     state = load_state(state_file)
+    turn_anchor = _get_current_turn_Step_anchor(in_flight_file=in_flight_file)
+    prev_anchor = str(state.get("agy_ppid") or "")
     idle_delta = now - state.get("last_time", 0.0)
 
-    # Full turn state expiry after extended inactivity (15m); short idle gaps (45s)
-    # reset short-window consecutive anti-polling counters while preserving active turn-level
-    # FORGE gates (inline_prod_files, versioned_scratch_sweeps, scratch_script_runs, total_scratch_runs).
-    if idle_delta > TURN_STATE_EXPIRY_SECONDS or state.get("last_time", 0.0) == 0.0:
+    # Reset turn state immediately when a new user turn / prompt arrives (turn_anchor changes)
+    # or after extended inactivity (15m); short idle gaps (45s) within the SAME turn reset
+    # short-window consecutive anti-polling counters while preserving active turn-level FORGE gates.
+    if (prev_anchor and prev_anchor != str(turn_anchor)) or idle_delta > TURN_STATE_EXPIRY_SECONDS or state.get("last_time", 0.0) == 0.0:
         state = _default_state(now)
     elif idle_delta > TURN_RESET_IDLE_SECONDS:
         preserved_prod = list(state.get("inline_prod_files", []))
@@ -808,6 +863,7 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
             state["turn_start_time"] = now
     if not state.get("turn_start_time"):
         state["turn_start_time"] = now
+    state["agy_ppid"] = turn_anchor
     state["last_time"] = now
 
     # 0. Runtime schedule tool is prohibited in Discord bridge turns
@@ -873,67 +929,6 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                 "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"<cmd>\"\n"
                 "(or enqueue a multi-chunk ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
             )
-
-        # A00b. Repeated Same-Scratch-Script, Inline Heredoc & >90s Calibration / Command Loop Gate
-        if os.environ.get("FORGE_WORKER_ACTIVE") != "1" and not os.path.abspath(cwd or "/workspace").replace("\\", "/").startswith("/tmp/forge-wt-"):
-            if "forge.py" not in cmd and "detached_runner.py" not in cmd and "modal_harness.py" not in cmd:
-                turn_cmds = int(state.get("turn_run_commands", 0)) + 1
-                state["turn_run_commands"] = turn_cmds
-                turn_elapsed = now - float(state.get("turn_start_time", now) or now)
-
-                scratch_m = _SCRATCH_SCRIPT_EXEC_RE.search(cmd)
-                if scratch_m:
-                    raw_script = scratch_m.group("script")
-                    norm_script = os.path.abspath(os.path.join(cwd or "/workspace", raw_script)).replace("\\", "/")
-                    runs_map = dict(state.get("scratch_script_runs", {}))
-                    run_cnt = int(runs_map.get(norm_script, 0)) + 1
-                    runs_map[norm_script] = run_cnt
-                    state["scratch_script_runs"] = runs_map
-                    total_scratch = int(state.get("total_scratch_runs", 0)) + 1
-                    state["total_scratch_runs"] = total_scratch
-
-                    if run_cnt > MAX_SAME_SCRATCH_SCRIPT_RUNS:
-                        save_state(state, state_file)
-                        return False, (
-                            f"FORGE Scratch Loop Gate Triggered: Executed '{os.path.basename(norm_script)}' {run_cnt} times in this turn "
-                            f"(inline limit: {MAX_SAME_SCRATCH_SCRIPT_RUNS}). Do not run iterative edit-and-rerun loops on the same scratch script "
-                            "inline in chat. Consolidate parameter sweeps into a single vectorized pass, offload to Modal, or launch long jobs via:\n"
-                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\""
-                        )
-
-                    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
-                        save_state(state, state_file)
-                        return False, (
-                            f"FORGE 90s Calibration Offload Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
-                            f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {total_scratch} scratch/tmp scripts "
-                            f"(latest: '{os.path.basename(norm_script)}'). Do not run multi-minute iterative script sweeps inline by renaming scripts "
-                            "or moving them to /tmp/. Launch long calibration/benchmark jobs via:\n"
-                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\"\n"
-                            "(or offload to '/baseball/big-projections/modal_harness.py' / enqueue a ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
-                        )
-                elif is_inline_python_probe(cmd):
-                    total_scratch = int(state.get("total_scratch_runs", 0)) + 1
-                    state["total_scratch_runs"] = total_scratch
-                    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
-                        save_state(state, state_file)
-                        return False, (
-                            f"FORGE 90s Calibration Offload Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
-                            f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {total_scratch} inline Python / scratch probes. "
-                            "Do not run multi-minute iterative heredoc or SSH loops inline in chat. Package the task into a script and launch via:\n"
-                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
-                            "(or enqueue a multi-chunk ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
-                        )
-
-                if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and turn_cmds > MAX_INLINE_RUN_COMMANDS_AFTER_90S:
-                    save_state(state, state_file)
-                    return False, (
-                        f"FORGE 90s Command Budget Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
-                        f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {turn_cmds} inline shell commands "
-                        f"(limit after 90s: {MAX_INLINE_RUN_COMMANDS_AFTER_90S}). Long-running multi-step builds, remote patches, and "
-                        "iterative debugging must be offloaded to #forge via:\n"
-                        "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
-                        "(or 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
-                    )
 
         # Agora Fast-Path Invariant
         if re.search(r"agora_play\.py\s+(?:order|move)\b", cmd):
@@ -1009,6 +1004,67 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
                 "Scope test execution to the specific test file or function under test (e.g. 'pytest tests/test_feature.py' or 'pytest -k test_name') "
                 "to avoid multi-minute turn latency. Let GitHub Actions CI run the full regression suite in the cloud."
             )
+
+        # A00b. Repeated Same-Scratch-Script, Inline Heredoc & >90s Calibration / Command Loop Gate
+        if os.environ.get("FORGE_WORKER_ACTIVE") != "1" and not os.path.abspath(cwd or "/workspace").replace("\\", "/").startswith("/tmp/forge-wt-"):
+            if "forge.py" not in cmd and "detached_runner.py" not in cmd and "modal_harness.py" not in cmd:
+                turn_cmds = int(state.get("turn_run_commands", 0)) + 1
+                state["turn_run_commands"] = turn_cmds
+                turn_elapsed = now - float(state.get("turn_start_time", now) or now)
+
+                scratch_m = _SCRATCH_SCRIPT_EXEC_RE.search(cmd)
+                if scratch_m:
+                    raw_script = scratch_m.group("script")
+                    norm_script = os.path.abspath(os.path.join(cwd or "/workspace", raw_script)).replace("\\", "/")
+                    runs_map = dict(state.get("scratch_script_runs", {}))
+                    run_cnt = int(runs_map.get(norm_script, 0)) + 1
+                    runs_map[norm_script] = run_cnt
+                    state["scratch_script_runs"] = runs_map
+                    total_scratch = int(state.get("total_scratch_runs", 0)) + 1
+                    state["total_scratch_runs"] = total_scratch
+
+                    if run_cnt > MAX_SAME_SCRATCH_SCRIPT_RUNS:
+                        save_state(state, state_file)
+                        return False, (
+                            f"FORGE Scratch Loop Gate Triggered: Executed '{os.path.basename(norm_script)}' {run_cnt} times in this turn "
+                            f"(inline limit: {MAX_SAME_SCRATCH_SCRIPT_RUNS}). Do not run iterative edit-and-rerun loops on the same scratch script "
+                            "inline in chat. Consolidate parameter sweeps into a single vectorized pass, offload to Modal, or launch long jobs via:\n"
+                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\""
+                        )
+
+                    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
+                        save_state(state, state_file)
+                        return False, (
+                            f"FORGE 90s Calibration Offload Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
+                            f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {total_scratch} scratch/tmp scripts "
+                            f"(latest: '{os.path.basename(norm_script)}'). Do not run multi-minute iterative script sweeps inline by renaming scripts "
+                            "or moving them to /tmp/. Launch long calibration/benchmark jobs via:\n"
+                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\"\n"
+                            "(or offload to '/baseball/big-projections/modal_harness.py' / enqueue a ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
+                        )
+                elif is_inline_python_probe(cmd):
+                    total_scratch = int(state.get("total_scratch_runs", 0)) + 1
+                    state["total_scratch_runs"] = total_scratch
+                    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
+                        save_state(state, state_file)
+                        return False, (
+                            f"FORGE 90s Calibration Offload Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
+                            f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {total_scratch} inline Python / scratch probes. "
+                            "Do not run multi-minute iterative heredoc or SSH loops inline in chat. Package the task into a script and launch via:\n"
+                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
+                            "(or enqueue a multi-chunk ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
+                        )
+
+                if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and turn_cmds > MAX_INLINE_RUN_COMMANDS_AFTER_90S:
+                    save_state(state, state_file)
+                    return False, (
+                        f"FORGE 90s Command Budget Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
+                        f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {turn_cmds} inline shell commands "
+                        f"(limit after 90s: {MAX_INLINE_RUN_COMMANDS_AFTER_90S}). Long-running multi-step builds, remote patches, and "
+                        "iterative debugging must be offloaded to #forge via:\n"
+                        "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
+                        "(or 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
+                    )
 
         # B. Consecutive inline Python probe check (python3 -c / heredoc loops)
         if is_inline_python_probe(cmd):

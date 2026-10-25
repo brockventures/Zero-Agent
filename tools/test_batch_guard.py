@@ -481,6 +481,90 @@ class TestBatchGuard(unittest.TestCase):
         pid = _get_agy_ancestor_pid()
         self.assertGreater(pid, 1)
 
+    def test_per_turn_in_flight_reset_clears_90s_calibration_and_offload_lock(self):
+        import json
+        import tempfile
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            in_flight_path = os.path.join(tmpdir, "in_flight_turn.json")
+            base_now = 1_800_300_000.0
+
+            # Turn 1: runs 2 calibration scripts and dispatches a FORGE job
+            with open(in_flight_path, "w") as f:
+                json.dump(
+                    {
+                        "channel_id": 1544955535722545253,
+                        "conv_id": "conv-1111",
+                        "status_msg_id": 1001,
+                        "attempts": 1,
+                        "prompt": "First turn prompt",
+                        "ts": base_now,
+                    },
+                    f,
+                )
+
+            with patch("time.time", return_value=base_now):
+                self.assertTrue(
+                    check_tool_use(
+                        "run_command",
+                        {"CommandLine": "python3 /workspace/scratch/diag_a.py"},
+                        in_flight_file=in_flight_path,
+                    )[0]
+                )
+                self.assertTrue(
+                    check_tool_use(
+                        "run_command",
+                        {"CommandLine": "python3 /workspace/scratch/diag_b.py"},
+                        in_flight_file=in_flight_path,
+                    )[0]
+                )
+                self.assertTrue(
+                    check_tool_use(
+                        "run_command",
+                        {"CommandLine": 'python3 /workspace/tools/forge.py job start --name "Job 1" --command "echo ok"'},
+                        in_flight_file=in_flight_path,
+                    )[0]
+                )
+
+            # Still in Turn 1: Post-Offload Turn Lock blocks further commands
+            with patch("time.time", return_value=base_now + 10.0):
+                allowed_same, reason_same = check_tool_use(
+                    "run_command",
+                    {"CommandLine": "python3 /workspace/scratch/diag_c.py"},
+                    in_flight_file=in_flight_path,
+                )
+                self.assertFalse(allowed_same)
+                self.assertIn("FORGE Post-Offload Turn Lock Triggered", reason_same)
+
+            # Turn 2 arrives 120s later (<15m expiry, >90s from Turn 1 start):
+            # New status_msg_id / prompt in in_flight_turn.json resets turn_start_time, scratch counts, and offload lock!
+            with open(in_flight_path, "w") as f:
+                json.dump(
+                    {
+                        "channel_id": 1544955535722545253,
+                        "conv_id": "conv-1111",
+                        "status_msg_id": 1002,
+                        "attempts": 1,
+                        "prompt": "Second turn prompt",
+                        "ts": base_now + 120.0,
+                    },
+                    f,
+                )
+
+            with patch("time.time", return_value=base_now + 120.0):
+                allowed_t2, reason_t2 = check_tool_use(
+                    "run_command",
+                    {"CommandLine": "python3 /workspace/scratch/diag_c.py"},
+                    in_flight_file=in_flight_path,
+                )
+                self.assertTrue(allowed_t2, f"Turn 2 should start with a clean slate, got: {reason_t2}")
+                st = load_state()
+                self.assertEqual(st["total_scratch_runs"], 1)
+                self.assertEqual(st["turn_run_commands"], 1)
+                self.assertFalse(st["offload_dispatched"])
+                self.assertEqual(st["turn_start_time"], base_now + 120.0)
+
 
 if __name__ == "__main__":
     unittest.main()
