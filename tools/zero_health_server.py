@@ -612,7 +612,9 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests" />
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎬</text></svg>" />
+  <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png?v=2" />
+  <link rel="shortcut icon" type="image/png" href="/favicon.ico?v=2" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=2" />
   <title>Brock Ventures · Media & Library Portal</title>
   <style>
     :root {
@@ -644,18 +646,31 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
       text-align: center;
       margin-bottom: 2.5rem;
     }
+    .brand-row {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.65rem;
+      margin-bottom: 0.95rem;
+    }
+    .brand-avatar {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(56, 189, 248, 0.55);
+      box-shadow: 0 0 14px rgba(56, 189, 248, 0.28);
+      object-fit: cover;
+    }
     .badge {
       display: inline-block;
-      font-size: 0.75rem;
+      font-size: 0.78rem;
       font-weight: 600;
       letter-spacing: 0.08em;
       text-transform: uppercase;
       color: var(--accent);
       background: rgba(56, 189, 248, 0.12);
       border: 1px solid rgba(56, 189, 248, 0.25);
-      padding: 0.3rem 0.75rem;
+      padding: 0.35rem 0.85rem;
       border-radius: 999px;
-      margin-bottom: 0.9rem;
     }
     h1 {
       font-size: 2.1rem;
@@ -725,6 +740,76 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
       border-radius: 6px;
       align-self: flex-start;
     }
+    .guide-section {
+      margin-top: 2.25rem;
+      padding-top: 2rem;
+      border-top: 1px solid var(--border);
+    }
+    .guide-header {
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .guide-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1.15rem;
+    }
+    .guide-box {
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.35rem;
+    }
+    .guide-box h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 0.75rem;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+    .guide-steps {
+      list-style: none;
+      counter-reset: step-counter;
+      display: flex;
+      flex-direction: column;
+      gap: 0.65rem;
+    }
+    .guide-steps li {
+      counter-increment: step-counter;
+      font-size: 0.87rem;
+      color: var(--muted);
+      line-height: 1.45;
+      display: flex;
+      align-items: flex-start;
+      gap: 0.6rem;
+    }
+    .guide-steps li::before {
+      content: counter(step-counter);
+      font-size: 0.72rem;
+      font-weight: 700;
+      color: var(--accent);
+      background: rgba(56, 189, 248, 0.14);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      min-width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 0.1rem;
+      flex-shrink: 0;
+    }
+    .guide-steps strong {
+      color: var(--text);
+      font-weight: 600;
+    }
     footer {
       text-align: center;
       margin-top: 2.5rem;
@@ -736,7 +821,10 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
 <body>
   <div class="container">
     <header>
-      <div class="badge">Brock Ventures</div>
+      <div class="brand-row">
+        <img class="brand-avatar" src="/apple-touch-icon.png?v=2" alt="Brock Ventures" />
+        <div class="badge">Brock Ventures</div>
+      </div>
       <h1>Media &amp; Library Directory</h1>
       <p class="subtitle">Quick links for movies, TV requests, digital books, and automated downloads.</p>
     </header>
@@ -774,6 +862,29 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         <span class="host-tag">books.ryanbrock.org</span>
       </a>
     </div>
+    <section class="guide-section">
+      <div class="guide-header">✨ First-Time Setup Guide</div>
+      <div class="guide-grid">
+        <div class="guide-box">
+          <h3>🍿 Getting Connected to Plex &amp; Seerr</h3>
+          <ol class="guide-steps">
+            <li><span>Create a free account at <strong>plex.tv</strong> (Google, Apple, or email) and let Ryan know the email address you used so he can send a server invite.</span></li>
+            <li><span>Click the link in the invite email to accept library access, then sign in to <strong>Plex</strong> on your TV, phone, or browser.</span></li>
+            <li><span><em>Tip:</em> In your Plex app sidebar, pin our <strong>Movies</strong> and <strong>TV Shows</strong> libraries (and unpin Plex's free ad-supported rows) so our catalog stays front and center.</span></li>
+            <li><span>To request new movies or shows, open <strong>Seerr</strong> above and click <strong>Sign In with Plex</strong> using that same account.</span></li>
+          </ol>
+        </div>
+        <div class="guide-box">
+          <h3>📚 Getting Connected to Books &amp; Shelfmark</h3>
+          <ol class="guide-steps">
+            <li><span>Ping Ryan for a <strong>Books Library</strong> username and temporary password (that single login works on both <strong>Books Library</strong> and <strong>Shelfmark</strong>).</span></li>
+            <li><span>Sign in to <strong>Books Library</strong> to read in your browser, download EPUBs/audiobooks, or update your password under your profile.</span></li>
+            <li><span><strong>Send to Kindle:</strong> Add your <em>@kindle.com</em> address in your Books Library profile and approve our sender address in your Amazon Content &amp; Devices settings for 1-click wireless delivery.</span></li>
+            <li><span>Missing a title? Sign in to <strong>Shelfmark</strong> to search and grab any book or audiobook automatically into the library.</span></li>
+          </ol>
+        </div>
+      </div>
+    </section>
     <footer>
       Brock Ventures Portal
     </footer>
@@ -792,8 +903,15 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 self.send_header("Location", f"https://www.brock.ventures{self.path or '/'}")
                 self.end_headers()
                 return
-            self.send_response(200 if clean_path in ("", "/") else (204 if clean_path == "/favicon.ico" else 404))
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            if clean_path in ("", "/"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+            elif clean_path in ("/favicon.ico", "/favicon.png", "/apple-touch-icon.png"):
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+            else:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             return
         if clean_path in ("/api/ivy", "/ivy"):
@@ -861,10 +979,25 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "public, max-age=300")
                 self.end_headers()
                 self.wfile.write(body)
-            elif clean_path == "/favicon.ico":
-                self.send_response(204)
-                self.send_header("Cache-Control", "public, max-age=86400")
-                self.end_headers()
+            elif clean_path in ("/favicon.ico", "/favicon.png", "/apple-touch-icon.png"):
+                icon_file = (
+                    DATA_DIR / "portal_apple_touch_icon.png"
+                    if clean_path == "/apple-touch-icon.png"
+                    else DATA_DIR / "portal_favicon.png"
+                )
+                if not icon_file.exists():
+                    icon_file = DATA_DIR / "ryan_avatar.png"
+                if icon_file.exists():
+                    icon_bytes = icon_file.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(icon_bytes)))
+                    self.send_header("Cache-Control", "public, max-age=86400")
+                    self.end_headers()
+                    self.wfile.write(icon_bytes)
+                else:
+                    self.send_response(204)
+                    self.end_headers()
             else:
                 self.send_response(404)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")

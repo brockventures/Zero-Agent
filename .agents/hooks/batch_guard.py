@@ -107,6 +107,56 @@ def is_forge_worktree_or_exempt_path(target_file: str, cwd: str = "/workspace") 
     return False
 
 
+def _get_agy_ancestor_pid() -> int:
+    """Resolve the persistent agy worker ancestor PID (instead of the transient bash -c wrapper PID)."""
+    cur = os.getppid()
+    for _ in range(8):
+        if cur <= 1:
+            break
+        try:
+            cmdline = open(f"/proc/{cur}/cmdline", "r", encoding="utf-8", errors="ignore").read().replace("\x00", " ")
+            if "agy " in cmdline or cmdline.startswith("agy"):
+                return cur
+            stat_txt = open(f"/proc/{cur}/stat", "r", encoding="utf-8", errors="ignore").read()
+            rparen = stat_txt.rfind(")")
+            if rparen != -1:
+                fields = stat_txt[rparen + 2 :].split()
+                if len(fields) >= 2 and fields[1].isdigit():
+                    cur = int(fields[1])
+                    continue
+        except Exception:
+            pass
+        break
+    return os.getppid()
+
+
+def _get_current_turn_Step_anchor(agy_pid: int) -> str:
+    """Return 'agy_pid:last_user_input_step' so state resets only when a new user turn arrives on the warm worker."""
+    try:
+        cmdline = open(f"/proc/{agy_pid}/cmdline", "r", encoding="utf-8", errors="ignore").read().replace("\x00", " ")
+        m = re.search(r"--conversation=([a-f0-9-]+)", cmdline)
+        if m:
+            cid = m.group(1)
+            tpath = f"/root/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl"
+            if os.path.exists(tpath):
+                with open(tpath, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 65536))
+                    tail = f.read().decode("utf-8", errors="ignore").splitlines()
+                for line in reversed(tail):
+                    if '"USER_INPUT"' in line:
+                        try:
+                            d = json.loads(line)
+                            if d.get("type") == "USER_INPUT":
+                                return f"{agy_pid}:{d.get('step_index', 0)}"
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    return str(agy_pid)
+
+
 def load_state(state_file: str = STATE_FILE) -> dict:
     if os.path.exists(state_file):
         try:
@@ -1195,14 +1245,15 @@ def main():
 
         # 2. Tool Batching Guard (reset turn state automatically when a new agy process/turn starts)
         try:
-            cur_ppid = os.getppid()
+            agy_pid = _get_agy_ancestor_pid()
+            turn_anchor = _get_current_turn_Step_anchor(agy_pid)
             st = load_state(STATE_FILE)
-            if st.get("agy_ppid") and st.get("agy_ppid") != cur_ppid:
+            if st.get("agy_ppid") and str(st.get("agy_ppid")) != str(turn_anchor):
                 fresh = _default_state(time.time())
-                fresh["agy_ppid"] = cur_ppid
+                fresh["agy_ppid"] = turn_anchor
                 save_state(fresh, STATE_FILE)
             elif not st.get("agy_ppid"):
-                st["agy_ppid"] = cur_ppid
+                st["agy_ppid"] = turn_anchor
                 save_state(st, STATE_FILE)
         except Exception:
             pass
@@ -1213,7 +1264,7 @@ def main():
             return
         try:
             st_after = load_state(STATE_FILE)
-            st_after["agy_ppid"] = os.getppid()
+            st_after["agy_ppid"] = _get_current_turn_Step_anchor(_get_agy_ancestor_pid())
             save_state(st_after, STATE_FILE)
         except Exception:
             pass

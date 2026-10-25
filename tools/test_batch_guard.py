@@ -8,11 +8,17 @@ from batch_guard import check_batching, check_tool_use, STATE_FILE, load_state
 
 class TestBatchGuard(unittest.TestCase):
     def setUp(self):
+        self._orig_state = None
         if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                self._orig_state = f.read()
             os.remove(STATE_FILE)
 
     def tearDown(self):
-        if os.path.exists(STATE_FILE):
+        if self._orig_state is not None:
+            with open(STATE_FILE, "w") as f:
+                f.write(self._orig_state)
+        elif os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)
 
     def test_consecutive_inspections_blocked(self):
@@ -469,6 +475,11 @@ class TestBatchGuard(unittest.TestCase):
             # 6. Valid explicit-column query with LIMIT is allowed
             allowed, _ = check_batching(f'sqlite3 {db_path} "SELECT player_name, woba, hr FROM projections ORDER BY woba DESC LIMIT 15"')
             self.assertTrue(allowed)
+
+    def test_agy_ancestor_pid_resolves_persistent_worker(self):
+        from batch_guard import _get_agy_ancestor_pid
+        pid = _get_agy_ancestor_pid()
+        self.assertGreater(pid, 1)
 
 
 if __name__ == "__main__":
