@@ -1216,12 +1216,16 @@ def strip_markdown_for_push_preview(text: str, preview_chars: int = 280) -> str:
             cleaned_head.append(line)
             continue
 
+        # 1. Strip leading horizontal rules (---, ***, ___) so push previews don't lead with "---"
+        if re.match(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", line):
+            continue
+
         s = line
-        # 1. Strip leading markdown headers (#, ##, ###) and blockquotes (>)
+        # 2. Strip leading markdown headers (#, ##, ###) and blockquotes (>)
         s = re.sub(r"^(\s*)(?:>{1,3}\s*)?#{1,6}\s+", r"\1", s)
         s = re.sub(r"^(\s*)>{1,3}\s+", r"\1", s)
 
-        # 2. Convert markdown hyperlinks [label](<url>) or [label](url) (except [GIF]) to plain label
+        # 3. Convert markdown hyperlinks [label](<url>) or [label](url) (except [GIF]) to plain label
         s = re.sub(
             r"\[(?!GIF\])([^\[\]]+)\]\(\s*<?https?://[^)\s>]+>?\s*\)",
             r"\1",
@@ -1229,13 +1233,13 @@ def strip_markdown_for_push_preview(text: str, preview_chars: int = 280) -> str:
             flags=re.IGNORECASE,
         )
 
-        # 3. Unwrap angle-bracketed bare URLs <https://...> -> https://...
+        # 4. Unwrap angle-bracketed bare URLs <https://...> -> https://...
         s = re.sub(r"<(https?://[^\s>]+)>", r"\1", s)
 
-        # 4. Strip inline code backticks `code` -> code
+        # 5. Strip inline code backticks `code` -> code
         s = re.sub(r"`([^`\n]+)`", r"\1", s)
 
-        # 5. Strip bold/italic/strikethrough/underline wrappers (**, __, ~~, *)
+        # 6. Strip bold/italic/strikethrough/underline wrappers (**, __, ~~, *)
         s = re.sub(r"\*\*\*([^\*\n]+)\*\*\*", r"\1", s)
         s = re.sub(r"\*\*([^\*\n]+)\*\*", r"\1", s)
         s = re.sub(r"__([^_\n]+)__", r"\1", s)
@@ -1245,9 +1249,9 @@ def strip_markdown_for_push_preview(text: str, preview_chars: int = 280) -> str:
 
         cleaned_head.append(s)
 
-    rebuilt_head = "\n".join(cleaned_head)
+    rebuilt_head = "\n".join(cleaned_head).lstrip("\n")
     if tail_lines:
-        return rebuilt_head + "\n" + "\n".join(tail_lines)
+        return (rebuilt_head + "\n" + "\n".join(tail_lines)) if rebuilt_head else "\n".join(tail_lines)
     return rebuilt_head
 
 

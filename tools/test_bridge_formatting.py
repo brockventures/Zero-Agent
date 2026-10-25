@@ -1063,6 +1063,24 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertIn("`<@1794077724335988736>`", formatted)
         self.assertIn("<@1468012353206354197>", formatted)
 
+    def test_strip_markdown_for_push_preview(self):
+        """Verify strip_markdown_for_push_preview strips headers, horizontal rules, bold, and backticks from initial push preview."""
+        from tools.bridge_formatting import strip_markdown_for_push_preview
+
+        chunk = (
+            "---\n\n"
+            "### 3. Starting Pitchers (`SP`) — 2027 Before vs. After\n"
+            "- **Reid Detmers** (`27468`, LAA, SP, Age 27): 161.3 IP in 22.7 GS\n"
+            "- **Kyle Leahy** (`24763`, STL, SP, Age 30): 129.9 IP in 14.1 GS"
+        )
+        preview = strip_markdown_for_push_preview(chunk)
+        self.assertFalse(preview.startswith("---"))
+        self.assertTrue(preview.startswith("3. Starting Pitchers (SP) — 2027 Before vs. After"))
+        self.assertIn("- Reid Detmers (27468, LAA, SP, Age 27): 161.3 IP in 22.7 GS", preview)
+        self.assertNotIn("###", preview)
+        self.assertNotIn("**", preview)
+        self.assertNotIn("`", preview)
+
 
 if __name__ == "__main__":
     unittest.main()

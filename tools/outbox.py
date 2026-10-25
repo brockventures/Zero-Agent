@@ -490,12 +490,18 @@ def dispatch_via_rest(omsg: dict) -> bool:
         except Exception:
             chunks = [raw_content] if len(raw_content) <= 1900 else [raw_content[i:i+1900] for i in range(0, len(raw_content), 1900)]
 
+        try:
+            from tools.bridge_formatting import strip_markdown_for_push_preview
+        except Exception:
+            strip_markdown_for_push_preview = lambda x: x
+
         all_ok = True
         for chunk_idx, chunk in enumerate(chunks):
             if chunk_idx > 0:
                 time.sleep(0.5)
             is_last = (chunk_idx == len(chunks) - 1)
-            body_dict = {"content": chunk}
+            initial_chunk = strip_markdown_for_push_preview(chunk) if not is_banana_stand else chunk
+            body_dict = {"content": initial_chunk}
             if is_last and choice_components:
                 body_dict["components"] = choice_components
             payload = json.dumps(body_dict).encode("utf-8")
@@ -509,9 +515,37 @@ def dispatch_via_rest(omsg: dict) -> bool:
                 },
                 method="POST"
             )
+            sent_msg_id = None
             with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status not in (200, 201):
                     all_ok = False
+                else:
+                    try:
+                        resp_json = json.loads(resp.read().decode("utf-8"))
+                        sent_msg_id = resp_json.get("id")
+                    except Exception:
+                        pass
+
+            if sent_msg_id and initial_chunk != chunk:
+                try:
+                    edit_url = f"https://discord.com/api/v10/channels/{target_cid}/messages/{sent_msg_id}"
+                    edit_dict = {"content": chunk}
+                    if is_last and choice_components:
+                        edit_dict["components"] = choice_components
+                    edit_req = urllib.request.Request(
+                        edit_url,
+                        data=json.dumps(edit_dict).encode("utf-8"),
+                        headers={
+                            "Authorization": f"Bot {token}",
+                            "Content-Type": "application/json",
+                            "User-Agent": "DiscordBot (https://github.com/brockventures/zero-agent, 1.0)"
+                        },
+                        method="PATCH"
+                    )
+                    with urllib.request.urlopen(edit_req, timeout=15):
+                        pass
+                except Exception as pe:
+                    print(f"[Outbox] Warning restoring markdown after plain push preview: {pe}", file=sys.stderr)
 
         if all_ok:
             record_dispatched_history(omsg)
