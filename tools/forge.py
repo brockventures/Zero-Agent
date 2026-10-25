@@ -3278,9 +3278,11 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
             lf.write(f"\n[Detached Runner] Task completed successfully in {dur_str}. Suppressing success notification (failure-only policy active).\n")
         return
 
-    # Suppress redundant outbox synthesis/failure alerts when a short (<25s) task finishes
+    # Suppress redundant outbox synthesis alerts ONLY when a short (<25s) task COMPLETED successfully
     # while the originating channel's interactive turn is still actively in-flight and polling it directly.
-    if duration < 25.0 and _is_channel_turn_actively_in_flight(channel):
+    # NEVER suppress failed or timed_out task wakeups, because an agent that spawns a detached job and ends
+    # its turn immediately will otherwise never be woken up when the job crashes at 2s.
+    if final_status == "completed" and duration < 25.0 and _is_channel_turn_actively_in_flight(channel):
         with open(log_file_path, "a", encoding="utf-8") as lf:
             lf.write(
                 f"\n[Detached Runner] Short task ({dur_str}, status={final_status}) finished while "
