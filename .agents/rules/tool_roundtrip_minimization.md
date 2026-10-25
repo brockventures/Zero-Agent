@@ -24,12 +24,12 @@ description: Enforces tool roundtrip minimization, broad-slice file reads, and d
    - Avoid long serial chains of `replace_file_content` on the same file. Use `write_to_file` with `Overwrite: true` or a script for extensive changes. Always run tests after edits before chaining further replacements.
 
 5. **Targeted Pytest over Full-Suite Runs (Ban Unscoped Full-Suite Pytest):**
-   - In active interactive PR turns, **NEVER** run unconstrained full repository test suites (bare `pytest` or `pytest tests/`).
+   - In Tier 1 inline turns (`<90s`) and `#forge` worker turns, **NEVER** run unconstrained full repository test suites (bare `pytest` or `pytest tests/`).
    - **ALWAYS** scope test execution strictly to the relevant test file or function under test (`pytest tests/test_feature.py`). Rely on CI for full matrix regressions.
 
-6. **One-Shot Git & PR Pipeline Batching:**
-   - When staging, committing, pushing, and opening pull requests, **NEVER** execute serial micro-tool calls (`add` -> `commit` -> `push` -> `pr`).
-   - **ALWAYS** bundle the git lifecycle into a single compound shell command:
+6. **FORGE Tier Routing & One-Shot Git Batching:**
+   - **Tier 2/3 Multi-File Builds (`2+` files or `>90s`):** Delegate to `#forge` (`python3 /workspace/tools/forge.py enqueue <plan.json>` or stage a `forge_enqueue` Decision Card) rather than running multi-file edits and PR pipelines inline in chat.
+   - **Tier 1 (`<90s`, single file `<50` lines) & `#forge` Workers:** When staging, committing, pushing, and opening pull requests, **NEVER** execute serial micro-tool calls (`add` -> `commit` -> `push` -> `pr`). **ALWAYS** bundle the git lifecycle into a single compound shell command:
      `git add <files> && git commit -m "<msg>" && git push -u origin <branch> && gh pr create --title "<title>" --body "<body>"`.
 
 7. **Conversational & Deliberation Zero-Tool Fast-Path:**
