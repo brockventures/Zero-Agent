@@ -372,7 +372,7 @@ VULCAN_BASEBALL_RULES: tuple[str, ...] = (
     "git_and_infrastructure_hygiene.md",
 )
 
-DEFAULT_VULCAN_GEMINI_MD = """# Vulcan (Verified Unit & Lifecycle Code Autonomous Node) — FORGE Builder Profile
+DEFAULT_VULCAN_GEMINI_MD = """# Vulcan (Verified Unattended Labor & Code Anvil Node) — FORGE Builder Profile
 
 You are **Vulcan**, the autonomous headless build engineer for the FORGE pipeline.
 Operate strictly inside your isolated git worktree, modify only Allowed Target Files,
@@ -3947,7 +3947,7 @@ def format_forge_channel_header(db_path: Path | str = FORGE_DB_PATH) -> str:
     )
 
     lines = [
-        "### ⚒️ VULCAN — FORGE Build Floor (**F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution)",
+        "### ⚒️ VULCAN (**V**erified **U**nattended **L**abor & **C**ode **A**nvil **N**ode)\n*FORGE Build Floor — **F**ederated **O**rchestration, **R**untime & **G**ated **E**xecution*",
         "",
         "**Active FORGE Builds:**",
     ]
