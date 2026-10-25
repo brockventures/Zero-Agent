@@ -20,20 +20,36 @@ log = logging.getLogger("cloudflare")
 BASE = "https://api.cloudflare.com/client/v4"
 TIMEOUT = 20
 
-def _get_api_token() -> str:
+def _get_auth_config() -> tuple[str, str, str]:
     token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-    if not token and os.path.exists("/secrets/env.json"):
+    global_key = os.environ.get("CLOUDFLARE_GLOBAL_API_KEY", "")
+    email = os.environ.get("CLOUDFLARE_EMAIL", "")
+    if os.path.exists("/secrets/env.json"):
         try:
             with open("/secrets/env.json") as f:
-                token = json.load(f).get("CLOUDFLARE_API_TOKEN", "")
+                env = json.load(f)
+                token = token or env.get("CLOUDFLARE_API_TOKEN", "")
+                global_key = global_key or env.get("CLOUDFLARE_GLOBAL_API_KEY", "")
+                email = email or env.get("CLOUDFLARE_EMAIL", "")
         except Exception:
             pass
-    return token
+    return token, global_key, email
+
+def _get_api_token() -> str:
+    token, global_key, _ = _get_auth_config()
+    return global_key or token
 
 def _headers() -> dict:
+    token, global_key, email = _get_auth_config()
+    if global_key and email:
+        return {
+            "X-Auth-Email": email,
+            "X-Auth-Key": global_key,
+            "Content-Type": "application/json",
+        }
     return {
-        "Authorization": f"Bearer {_get_api_token()}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
     }
 
 def _zone_id(zone_name: str) -> tuple[str | None, dict | None]:
