@@ -460,9 +460,32 @@ def dispatch_via_rest(omsg: dict) -> bool:
                 raw_content,
                 flags=re.DOTALL,
             ).rstrip()
+        choice_components = None
         try:
-            from tools.bridge_formatting import format_for_discord, chunk_text
+            from tools.bridge_formatting import format_for_discord, chunk_text, _CODE_OR_CHOICES_RE, mask_code_spans, restore_code_spans, strip_unquoted_choices
             formatted_content = format_for_discord(raw_content)
+            if not is_banana_stand:
+                masked_c, c_spans = mask_code_spans(formatted_content, prefix="\x00OUTBOX_CHOICES_")
+                matches = [m for m in _CODE_OR_CHOICES_RE.finditer(masked_c) if m.group(2) is not None]
+                parsed_choices = []
+                for m in matches:
+                    raw_c = m.group(3).strip()
+                    delim = "|" if "|" in raw_c else ","
+                    opts = [
+                        restore_code_spans(c, c_spans, prefix="\x00OUTBOX_CHOICES_").strip().strip("'\"`“”‘’").strip()
+                        for c in raw_c.split(delim)
+                        if c.strip()
+                    ]
+                    opts = [c for c in opts if c]
+                    if opts and not all(c in ("...", "…", "Option 1", "Option 2", "Option 3") for c in opts):
+                        parsed_choices = opts
+                if parsed_choices:
+                    formatted_content = strip_unquoted_choices(formatted_content)
+                    btns = []
+                    for opt in parsed_choices[:5]:
+                        btn_label = (opt[:77] + "...") if len(opt) > 80 else opt
+                        btns.append({"type": 2, "style": 1, "label": btn_label, "custom_id": f"choice:{btn_label}"})
+                    choice_components = [{"type": 1, "components": btns}]
             chunks = chunk_text(formatted_content, max_len=1900)
         except Exception:
             chunks = [raw_content] if len(raw_content) <= 1900 else [raw_content[i:i+1900] for i in range(0, len(raw_content), 1900)]
@@ -471,7 +494,11 @@ def dispatch_via_rest(omsg: dict) -> bool:
         for chunk_idx, chunk in enumerate(chunks):
             if chunk_idx > 0:
                 time.sleep(0.5)
-            payload = json.dumps({"content": chunk}).encode("utf-8")
+            is_last = (chunk_idx == len(chunks) - 1)
+            body_dict = {"content": chunk}
+            if is_last and choice_components:
+                body_dict["components"] = choice_components
+            payload = json.dumps(body_dict).encode("utf-8")
             req = urllib.request.Request(
                 url,
                 data=payload,

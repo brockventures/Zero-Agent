@@ -3366,6 +3366,24 @@ def execute_decision(
                 target_label = ", ".join(str(x) for x in paths) if paths else str(payload.get("target", "target files"))
                 receipt = f"Approved file deletion for `{target_label[:120]}`"
 
+        elif handler == "forge_enqueue":
+            plan_file = payload.get("plan_file") or payload.get("plan_path")
+            plan_data = payload.get("plan")
+            if plan_file and not plan_data:
+                p_obj = Path(plan_file)
+                if not p_obj.is_absolute():
+                    p_obj = WORKSPACE_DIR / p_obj
+                plan_data = json.loads(p_obj.read_text(encoding="utf-8"))
+            if not isinstance(plan_data, dict):
+                return {"ok": False, "error": "forge_enqueue payload requires 'plan_file' or 'plan' dict."}
+            allow_overlap = bool(payload.get("allow_overlap", False))
+            enq_res = enqueue_build(plan_data, db_path=db_path, post_widget=True, allow_overlap=allow_overlap)
+            ok = bool(enq_res.get("ok"))
+            if ok:
+                receipt = f"Enqueued FORGE build `{enq_res['build_id']}` ({enq_res.get('chunks_count', 1)} chunk(s)) in <#{FORGE_CHANNEL_ID}>"
+            else:
+                receipt = f"FORGE enqueue failed: {enq_res.get('error', 'unknown error')}"
+
         elif handler in ("noop", "approval"):
             ok = True
             receipt = str(payload.get("receipt") or payload.get("note") or "Approved by Ryan")

@@ -652,7 +652,8 @@ def _check_inline_production_edit_gate(
             f"FORGE 90s Tier 2/3 Gate Triggered: Interactive turn has already spent {int(turn_elapsed)}s "
             f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) running {total_scratch} inline calibration/scratch scripts "
             f"before mutating '{os.path.basename(norm_target)}'. Tasks requiring >90s of calibration must be packaged into a "
-            "validated ForgePlan JSON (with your calibrated parameters in shared_context) and enqueued via "
+            "validated ForgePlan JSON (with your calibrated parameters in shared_context) and staged via an inline Decision Card "
+            "('python3 /workspace/tools/forge.py stage-decision --handler forge_enqueue ... --post') or enqueued directly via "
             "'python3 /workspace/tools/forge.py enqueue scratch/forge_plan.json' so #forge workers execute and verify them in isolated git worktrees."
         )
 
@@ -666,8 +667,9 @@ def _check_inline_production_edit_gate(
         return False, (
             f"FORGE Tier 2/3 Gate Triggered: Interactive turn attempted to mutate {len(prod_files)} distinct production files inline "
             f"({short_list}; inline Tier 1 limit: {MAX_INLINE_PRODUCTION_FILES}). "
-            "Multi-file features and refactors must be decomposed into a validated ForgePlan JSON (e.g. scratch/forge_plan.json) "
-            "and enqueued via 'python3 /workspace/tools/forge.py enqueue scratch/forge_plan.json' so #forge workers execute them in isolated git worktrees."
+            "Multi-file features and refactors must be decomposed into a validated ForgePlan JSON (e.g. /workspace/data/forge_plans/<slug>.json) "
+            "and staged via 'python3 /workspace/tools/forge.py stage-decision --handler forge_enqueue ... --post' (or enqueued directly via "
+            "'python3 /workspace/tools/forge.py enqueue scratch/forge_plan.json') so #forge workers execute them in isolated git worktrees."
         )
     return True, ""
 
@@ -786,6 +788,7 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
     if name == "run_command":
         cmd = args.get("CommandLine", "")
         is_forge_enqueue = bool(re.search(r"\bforge\.py\s+enqueue\b", cmd))
+        is_forge_stage_decision = bool(re.search(r"\bforge\.py\s+stage-decision\b", cmd) and "forge_enqueue" in cmd)
         is_forge_job_start = bool(
             re.search(r"\bforge\.py\s+job\s+start\b", cmd) or re.search(r"\bdetached_runner\.py\s+start\b", cmd)
         )
@@ -793,6 +796,10 @@ def check_tool_use(name: str, args: dict, state_file: str = STATE_FILE, cwd: str
             state["inline_prod_files"] = []
             state["offload_dispatched"] = True
             state["offload_kind"] = "FORGE multi-chunk build (forge.py enqueue)"
+        elif is_forge_stage_decision:
+            state["inline_prod_files"] = []
+            state["offload_dispatched"] = True
+            state["offload_kind"] = "FORGE Two-Stage Decision Card (forge.py stage-decision --handler forge_enqueue)"
         elif is_forge_job_start:
             state["offload_dispatched"] = True
             state["offload_kind"] = "FORGE background job (forge.py job start)"

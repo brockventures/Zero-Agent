@@ -86,9 +86,26 @@ python3 /workspace/tools/forge.py job cancel <task_id>
 
 ---
 
-## 4. Staging Inline Decision Cards (`Approve | Edit | Dismiss`)
+## 4. Staging Inline Decision Cards (`Approve | Edit | Dismiss`) & Two-Stage FORGE Gate
 
-Stage deterministic approval cards for proactive sidecars or human gates:
+### Two-Stage Analysis -> Approve -> FORGE Build Pattern (`forge_enqueue`)
+When a task requires data analysis, calibration, or investigation before modifying multi-file production code (or >2 files / >90s build work):
+1. **Stage 1 (Interactive Turn = Analysis & Proposal Only):** Complete the investigation/math inline, write the validated `ForgePlan` JSON to `/workspace/data/forge_plans/<slug>.json`, and stage an inline Decision Card with `--handler "forge_enqueue"` and `--post` so Ryan gets real `Approve | Edit | Dismiss` buttons.
+2. **Stage 2 (1-Click Enqueue to `#forge`):** Clicking **Approve** deterministically invokes `enqueue_build()` on that saved `ForgePlan` in <1s with zero LLM tokens, launching isolated `#forge` worktree workers cleanly.
+
+```bash
+# Stage a Two-Stage FORGE Build Proposal Card
+python3 /workspace/tools/forge.py stage-decision \
+  --category "forge" \
+  --title "Calibrate Pitcher Stuff+ Weights & Ship Tests" \
+  --summary "Completed 5-fold CV calibration (RMSE -4.2%). Tap Approve to enqueue the 2-chunk FORGE build." \
+  --handler "forge_enqueue" \
+  --payload '{"plan_file": "/workspace/data/forge_plans/pitcher_stuff_plus.json"}' \
+  --channel-id 1542081375287640084 \
+  --post
+```
+
+### Other Proactive Action Cards
 ```bash
 python3 /workspace/tools/forge.py stage-decision \
   --category "homelab" \
@@ -99,4 +116,4 @@ python3 /workspace/tools/forge.py stage-decision \
   --channel-id 1544955535722545253 \
   --post
 ```
-Supported `--handler` types: `shell`, `send_mail`, `docker_compose`, `gh_merge`, `bridge_reload`.
+Supported `--handler` types: `forge_enqueue`, `shell`, `send_mail`, `docker_compose`, `gh_merge`, `bridge_reload`, `file_delete`.
