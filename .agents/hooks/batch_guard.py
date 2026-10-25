@@ -1305,13 +1305,10 @@ def main():
             agy_pid = _get_agy_ancestor_pid()
             turn_anchor = _get_current_turn_Step_anchor(agy_pid)
             st = load_state(STATE_FILE)
+            # Reset turn state when a new user turn / prompt arrives (turn_anchor changes)
             if st.get("agy_ppid") and str(st.get("agy_ppid")) != str(turn_anchor):
                 fresh = _default_state(time.time())
-                fresh["agy_ppid"] = turn_anchor
                 save_state(fresh, STATE_FILE)
-            elif not st.get("agy_ppid"):
-                st["agy_ppid"] = turn_anchor
-                save_state(st, STATE_FILE)
         except Exception:
             pass
 
