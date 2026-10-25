@@ -1178,4 +1178,78 @@ def format_steering_prompt(
     )
 
 
+def strip_markdown_for_push_preview(text: str, preview_chars: int = 280) -> str:
+    """
+    Strip Markdown formatting tokens (**, *, __, ~~, `, ###, and [label](<url>)) from the
+    opening lines of a Discord message (covering at least `preview_chars` characters) so
+    Discord's initial POST payload produces a clean plain-text Android FCM push notification
+    before the rich Markdown version is edited in place.
+    Preserves Discord mentions (<@...>, <#...>), [GIF](url) embeds, and fenced code blocks.
+    """
+    if not text or not text.strip():
+        return text
+
+    lines = text.split("\n")
+    head_lines: list[str] = []
+    tail_lines: list[str] = []
+    acc_len = 0
+    in_tail = False
+
+    for line in lines:
+        if not in_tail and line.lstrip().startswith("```"):
+            in_tail = True
+        if in_tail:
+            tail_lines.append(line)
+        else:
+            head_lines.append(line)
+            acc_len += len(line) + 1
+            if acc_len >= preview_chars:
+                in_tail = True
+
+    if not head_lines:
+        return text
+
+    cleaned_head: list[str] = []
+    for line in head_lines:
+        # Preserve [GIF](...) lines untouched so Discord unfurls embeds immediately on POST
+        if re.match(r"^\s*\[GIF\]\(https?://[^\s)]+\)\s*$", line, flags=re.IGNORECASE):
+            cleaned_head.append(line)
+            continue
+
+        s = line
+        # 1. Strip leading markdown headers (#, ##, ###) and blockquotes (>)
+        s = re.sub(r"^(\s*)(?:>{1,3}\s*)?#{1,6}\s+", r"\1", s)
+        s = re.sub(r"^(\s*)>{1,3}\s+", r"\1", s)
+
+        # 2. Convert markdown hyperlinks [label](<url>) or [label](url) (except [GIF]) to plain label
+        s = re.sub(
+            r"\[(?!GIF\])([^\[\]]+)\]\(\s*<?https?://[^)\s>]+>?\s*\)",
+            r"\1",
+            s,
+            flags=re.IGNORECASE,
+        )
+
+        # 3. Unwrap angle-bracketed bare URLs <https://...> -> https://...
+        s = re.sub(r"<(https?://[^\s>]+)>", r"\1", s)
+
+        # 4. Strip inline code backticks `code` -> code
+        s = re.sub(r"`([^`\n]+)`", r"\1", s)
+
+        # 5. Strip bold/italic/strikethrough/underline wrappers (**, __, ~~, *)
+        s = re.sub(r"\*\*\*([^\*\n]+)\*\*\*", r"\1", s)
+        s = re.sub(r"\*\*([^\*\n]+)\*\*", r"\1", s)
+        s = re.sub(r"__([^_\n]+)__", r"\1", s)
+        s = re.sub(r"~~([^~\n]+)~~", r"\1", s)
+        # Single asterisk italic (avoiding bullet hyphens/asterisks at start of line)
+        s = re.sub(r"(?<!\*)\*([^\*\s][^\*\n]*?[^\*\s]|[^\*\s])\*(?!\*)", r"\1", s)
+
+        cleaned_head.append(s)
+
+    rebuilt_head = "\n".join(cleaned_head)
+    if tail_lines:
+        return rebuilt_head + "\n" + "\n".join(tail_lines)
+    return rebuilt_head
+
+
+
 

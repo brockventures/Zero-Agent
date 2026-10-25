@@ -65,3 +65,30 @@ for t in tests:
     print("INPUT: ", t)
     print("OUTPUT:", clean_discord_latex(t))
     print("-" * 40)
+
+
+def test_strip_markdown_for_push_preview():
+    import sys
+    sys.path.insert(0, "/workspace")
+    from tools.bridge_formatting import strip_markdown_for_push_preview
+
+    sample = (
+        "**Shipped** and live across `/workspace/tools/bridge.py` at **4:45 PM PT** "
+        "via [PR #97](<https://github.com/brockventures/Zero-Agent/pull/97>).\n\n"
+        "### What Changed\n"
+        "- **Step 1:** Plain push preview\n"
+        "[GIF](https://tenor.com/view/test-gif-123)"
+    )
+    cleaned = strip_markdown_for_push_preview(sample, preview_chars=160)
+    first_line = cleaned.splitlines()[0]
+    assert "**" not in first_line
+    assert "`" not in first_line
+    assert "[PR #97]" not in first_line
+    assert "Shipped and live across /workspace/tools/bridge.py at 4:45 PM PT via PR #97." == first_line
+    # Tail lines past preview_chars remain untouched
+    assert "[GIF](https://tenor.com/view/test-gif-123)" in cleaned
+
+
+if __name__ == "__main__":
+    test_strip_markdown_for_push_preview()
+

@@ -1206,15 +1206,32 @@ async def deliver_turn_output(
 
     try:
         if chunks:
-            async def _reply_or_send(dest, text_chunk: str, view_obj=None):
+            from tools.bridge_formatting import strip_markdown_for_push_preview
+
+            async def _reply_or_send(dest, text_chunk: str, view_obj=None, clean_push_preview: bool = True):
+                initial_payload = (
+                    strip_markdown_for_push_preview(text_chunk)
+                    if clean_push_preview and not is_banana_stand
+                    else text_chunk
+                )
+                sent_m = None
                 try:
                     if hasattr(dest, "reply"):
-                        return await dest.reply(text_chunk, view=view_obj)
-                    return await dest.send(text_chunk, view=view_obj)
+                        sent_m = await dest.reply(initial_payload, view=view_obj)
+                    else:
+                        sent_m = await dest.send(initial_payload, view=view_obj)
                 except Exception as reply_err:
                     print(f"[BridgePipeline] target_dest.reply failed ({reply_err}), falling back to channel.send...")
                     target_ch = getattr(dest, "channel", dest)
-                    return await target_ch.send(text_chunk, view=view_obj)
+                    sent_m = await target_ch.send(initial_payload, view=view_obj)
+
+                if sent_m is not None and initial_payload != text_chunk:
+                    try:
+                        edited_m = await sent_m.edit(content=text_chunk, view=view_obj)
+                        return edited_m or sent_m
+                    except Exception as edit_err:
+                        print(f"[BridgePipeline] Warning restoring markdown after plain push preview: {edit_err}")
+                return sent_m
 
             if existing_messages:
                 for idx, ch in enumerate(chunks):
