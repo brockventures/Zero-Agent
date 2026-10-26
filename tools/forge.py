@@ -236,8 +236,8 @@ def _is_channel_turn_actively_in_flight(channel_id_or_name: str, max_age_s: floa
         else:
             target_cid = raw_ch
             try:
-                from tools.outbox import resolve_channel_id
-                res_id = resolve_channel_id(raw_ch)
+                from tools.outbox import resolve_channel
+                _, res_id = resolve_channel(raw_ch)
                 if res_id:
                     target_cid = str(res_id)
             except Exception:
@@ -3749,6 +3749,38 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
             prune_completed_job_widgets(db_path=db_path)
     sync_forge_channel_header(db_path=db_path)
 
+    # Check if log_file_path has zero non-header lines due to stdout/stderr file redirection in command
+    try:
+        if log_file_path.exists():
+            log_content = log_file_path.read_text(encoding="utf-8", errors="replace")
+            non_header_lines = [
+                line for line in log_content.splitlines()
+                if line.strip() and not (
+                    line.strip().startswith("--- [Detached Runner]")
+                    or line.strip().startswith("--- Command:")
+                    or line.strip().startswith("--- Target Channel:")
+                )
+            ]
+            if not non_header_lines:
+                redir_target = None
+                for m in re.finditer(r'(?:^|\s)[12]?>>?\s*([^\s;&|>]+)', command):
+                    cand = m.group(1).strip().strip("'\"")
+                    if cand not in ("/dev/null", "&1", "&2"):
+                        redir_target = cand
+                        break
+                if redir_target:
+                    redir_path = Path(redir_target)
+                    if not redir_path.is_absolute():
+                        redir_path = Path(cwd) / redir_path
+                    if redir_path.exists() and redir_path.is_file():
+                        redir_lines = redir_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                        tail_lines = redir_lines[-40:]
+                        if tail_lines:
+                            with open(log_file_path, "a", encoding="utf-8") as lf:
+                                lf.write("\n".join(tail_lines) + "\n")
+    except Exception:
+        pass
+
     dur_str = _format_duration(duration)
     notify_on_success = fresh_meta.get("notify_on_success", False)
     if not notify_on_success:
@@ -3777,15 +3809,27 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
         return
 
     synthesize = fresh_meta.get("synthesize", True)
-    # When --no-synthesize is explicitly passed on a short (<25s) inline probe and the
-    # originating channel's interactive turn is still actively in-flight, suppress raw
-    # outbox failure dumps so the active turn can inspect and recover inline without spamming Discord.
-    if not synthesize and duration < 25.0 and _is_channel_turn_actively_in_flight(channel):
+    is_quiet_probe = not notify_on_success and not synthesize
+    # When --no-synthesize is explicitly passed and the originating channel's
+    # interactive turn is still actively in-flight, suppress raw outbox failure dumps so
+    # the active turn can inspect and recover inline without spamming Discord.
+    if not synthesize and _is_channel_turn_actively_in_flight(channel):
         with open(log_file_path, "a", encoding="utf-8") as lf:
             lf.write(
-                f"\n[Detached Runner] Short --no-synthesize probe ({dur_str}, status={final_status}) finished while "
+                f"\n[Detached Runner] --no-synthesize probe ({dur_str}, status={final_status}) finished while "
                 f"origin channel ({channel}) turn is still actively in-flight. "
                 "Suppressing raw outbox notification so active turn handles result inline.\n"
+            )
+        return
+
+    # Internal diagnostic probes launched with --silent-on-success --no-synthesize must never post
+    # raw failure banners to Discord even if the originating channel turn has already finished.
+    if is_quiet_probe:
+        with open(log_file_path, "a", encoding="utf-8") as lf:
+            lf.write(
+                f"\n[Detached Runner] Quiet probe ({dur_str}, status={final_status}) finished while "
+                f"origin channel ({channel}) turn is not in-flight. "
+                "Suppressing raw outbox failure banner to prevent false-alarm Discord spam.\n"
             )
         return
 

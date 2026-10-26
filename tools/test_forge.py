@@ -12,6 +12,7 @@ Covers:
 """
 
 import json
+import os
 import subprocess
 import tempfile
 import time
@@ -1161,6 +1162,149 @@ def test_no_synthesize_short_failed_probe_suppressed_when_turn_in_flight(tmp_pat
 
     assert len(outbox_calls) == 0
     assert "Suppressing raw outbox notification" in log_p.read_text(encoding="utf-8")
+
+
+def test_no_synthesize_homelab_channel_resolution(tmp_path, monkeypatch):
+    import tools.forge as forge
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(forge, "DATA_DIR", data_dir)
+    in_flight_file = data_dir / "in_flight_turn.json"
+    in_flight = {
+        "1544955535722545253": {
+            "channel_id": "1544955535722545253",
+            "ts": time.time(),
+            "pid": os.getpid(),
+        }
+    }
+    in_flight_file.write_text(json.dumps(in_flight), encoding="utf-8")
+    assert forge._is_channel_turn_actively_in_flight("homelab") is True
+    assert forge._is_channel_turn_actively_in_flight("#homelab") is True
+    assert forge._is_channel_turn_actively_in_flight("unknown_channel_xyz") is False
+
+
+def test_no_synthesize_failed_probe_suppressed_duration_over_25s(tmp_path, monkeypatch):
+    import tools.forge as forge
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    monkeypatch.setattr(forge, "FORGE_DB_PATH", db_p)
+    monkeypatch.setattr(forge, "TASKS_DIR", tmp_path / "detached_tasks")
+    monkeypatch.setattr(forge, "_is_prod_forge_env", lambda *a, **kw: False)
+    monkeypatch.setattr(forge, "_is_channel_turn_actively_in_flight", lambda ch: True)
+
+    outbox_calls = []
+    import tools.outbox as outbox
+    monkeypatch.setattr(outbox, "queue_outbox_message", lambda **kw: outbox_calls.append(kw))
+
+    task_id = "dt-test-nosynth-long-fail"
+    tdir = forge._get_job_dir(task_id)
+    tdir.mkdir(parents=True, exist_ok=True)
+    log_p = tdir / "run.log"
+
+    base_time = 1000.0
+    call_idx = [0]
+
+    def mock_time():
+        call_idx[0] += 1
+        if call_idx[0] >= 3:
+            return base_time + 30.0
+        return base_time
+
+    monkeypatch.setattr(time, "time", mock_time)
+
+    meta = {
+        "task_id": task_id,
+        "name": "Long Probe",
+        "command": "python3 -c 'import sys; sys.exit(1)'",
+        "channel": "baseball",
+        "timeout": 60,
+        "cwd": str(tmp_path),
+        "status": "starting",
+        "start_time": base_time,
+        "notify_on_success": False,
+        "synthesize": False,
+        "log_file": str(log_p),
+    }
+    forge._write_job_meta(task_id, meta, db_path=db_p)
+    forge._run_job_worker(task_id, db_path=db_p)
+
+    assert len(outbox_calls) == 0
+    assert "Suppressing raw outbox notification" in log_p.read_text(encoding="utf-8")
+
+
+def test_no_synthesize_failed_probe_suppressed_when_turn_not_in_flight(tmp_path, monkeypatch):
+    import tools.forge as forge
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    monkeypatch.setattr(forge, "FORGE_DB_PATH", db_p)
+    monkeypatch.setattr(forge, "TASKS_DIR", tmp_path / "detached_tasks")
+    monkeypatch.setattr(forge, "_is_prod_forge_env", lambda *a, **kw: False)
+    monkeypatch.setattr(forge, "_is_channel_turn_actively_in_flight", lambda ch: False)
+
+    outbox_calls = []
+    import tools.outbox as outbox
+    monkeypatch.setattr(outbox, "queue_outbox_message", lambda **kw: outbox_calls.append(kw))
+
+    task_id = "dt-test-nosynth-not-in-flight"
+    tdir = forge._get_job_dir(task_id)
+    tdir.mkdir(parents=True, exist_ok=True)
+    log_p = tdir / "run.log"
+    meta = {
+        "task_id": task_id,
+        "name": "Quiet Probe Off-Turn",
+        "command": "python3 -c 'import sys; sys.exit(1)'",
+        "channel": "baseball",
+        "timeout": 60,
+        "cwd": str(tmp_path),
+        "status": "starting",
+        "start_time": time.time(),
+        "notify_on_success": False,
+        "synthesize": False,
+        "log_file": str(log_p),
+    }
+    forge._write_job_meta(task_id, meta, db_path=db_p)
+    forge._run_job_worker(task_id, db_path=db_p)
+
+    assert len(outbox_calls) == 0
+    log_content = log_p.read_text(encoding="utf-8")
+    assert "Suppressing raw outbox failure banner" in log_content
+
+
+def test_no_synthesize_redirected_log_captured_in_run_log(tmp_path, monkeypatch):
+    import tools.forge as forge
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    monkeypatch.setattr(forge, "FORGE_DB_PATH", db_p)
+    monkeypatch.setattr(forge, "TASKS_DIR", tmp_path / "detached_tasks")
+    monkeypatch.setattr(forge, "_is_prod_forge_env", lambda *a, **kw: False)
+    monkeypatch.setattr(forge, "_is_channel_turn_actively_in_flight", lambda ch: True)
+
+    outbox_calls = []
+    import tools.outbox as outbox
+    monkeypatch.setattr(outbox, "queue_outbox_message", lambda **kw: outbox_calls.append(kw))
+
+    task_id = "dt-test-redirected-log"
+    tdir = forge._get_job_dir(task_id)
+    tdir.mkdir(parents=True, exist_ok=True)
+    log_p = tdir / "run.log"
+    out_file = tmp_path / "redirected_output.txt"
+    meta = {
+        "task_id": task_id,
+        "name": "Redirect Probe",
+        "command": f"python3 -c 'print(\"CUSTOM_REDIRECTED_LINE_FORGE_PROBE\")' > {out_file} 2>&1",
+        "channel": "baseball",
+        "timeout": 60,
+        "cwd": str(tmp_path),
+        "status": "starting",
+        "start_time": time.time(),
+        "notify_on_success": False,
+        "synthesize": False,
+        "log_file": str(log_p),
+    }
+    forge._write_job_meta(task_id, meta, db_path=db_p)
+    forge._run_job_worker(task_id, db_path=db_p)
+
+    assert "CUSTOM_REDIRECTED_LINE_FORGE_PROBE" in log_p.read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":
