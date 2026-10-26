@@ -17,6 +17,11 @@ import py_compile
 import subprocess
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Baseline generic security detection rules (no literal private tokens/PII stored in code)
 BASE_SECURITY_RULES = [
     # Private IPs & Network Infrastructure
@@ -84,7 +89,7 @@ def get_staged_python_files() -> list[str]:
 
 def validate_python_file(rel_path: str) -> list[str]:
     """Compile and AST-check a python file for syntax errors and module shadowing."""
-    full_path = Path("/workspace") / rel_path
+    full_path = Path(REPO_PATH) / rel_path
     if not full_path.exists():
         return []
 
@@ -114,18 +119,29 @@ def validate_python_file(rel_path: str) -> list[str]:
 
 def run_automated_tests() -> list[str]:
     """Run regression unit test scripts."""
+    base = Path(REPO_PATH) / "tools"
     test_scripts = [
-        "/workspace/tools/test_bridge_safety.py",
-        "/workspace/tools/test_formatter.py",
-        "/workspace/tools/test_enhanced_title.py",
-        "/workspace/tools/test_latex_cleaner.py",
-        "/workspace/tools/test_title.py",
-        "/workspace/tools/test_agents_file_size.py",
+        str(base / "test_bridge_safety.py"),
+        str(base / "test_formatter.py"),
+        str(base / "test_enhanced_title.py"),
+        str(base / "test_latex_cleaner.py"),
+        str(base / "test_title.py"),
+        str(base / "test_agents_file_size.py"),
     ]
     failures = []
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONPATH"] = str(Path(REPO_PATH).resolve())
     for test_script in test_scripts:
         if os.path.exists(test_script):
-            res = subprocess.run([sys.executable, test_script], capture_output=True, text=True)
+            res = subprocess.run(
+                [sys.executable, test_script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
             if res.returncode != 0:
                 failures.append(f"Unit test failed: {os.path.basename(test_script)}\n{res.stderr.strip() or res.stdout.strip()}")
     return failures

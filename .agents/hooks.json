@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /workspace/.agents/hooks/search_guard.py",
+            "command": "python3 -c \"import os,runpy; p='hooks/search_guard.py'; runpy.run_path(p if os.path.exists(p) else ('.agents/hooks/search_guard.py' if os.path.exists('.agents/hooks/search_guard.py') else '/workspace/.agents/hooks/search_guard.py'), run_name='__main__')\"",
             "timeout": 5
           }
         ]
@@ -22,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 /workspace/.agents/hooks/batch_guard.py",
+            "command": "python3 -c \"import os,runpy; p='hooks/batch_guard.py'; runpy.run_path(p if os.path.exists(p) else ('.agents/hooks/batch_guard.py' if os.path.exists('.agents/hooks/batch_guard.py') else '/workspace/.agents/hooks/batch_guard.py'), run_name='__main__')\"",
             "timeout": 5
           }
         ]
@@ -34,7 +34,7 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "python3 /workspace/.agents/hooks/time_context.py",
+        "command": "python3 -c \"import os,runpy; p='hooks/time_context.py'; runpy.run_path(p if os.path.exists(p) else ('.agents/hooks/time_context.py' if os.path.exists('.agents/hooks/time_context.py') else '/workspace/.agents/hooks/time_context.py'), run_name='__main__')\"",
         "timeout": 5
       }
     ]

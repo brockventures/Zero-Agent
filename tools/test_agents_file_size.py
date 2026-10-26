@@ -5,7 +5,7 @@ import unittest
 
 
 class TestAgentsFileSize(unittest.TestCase):
-    WORKSPACE = "/workspace"
+    WORKSPACE = "/workspace" if os.path.exists("/workspace/agents.md") else os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     MAX_BYTES = 24000  # Hard ceiling enforced by Antigravity runtime
 
     def test_draft_or_live_agents_file_size(self):
@@ -29,9 +29,9 @@ class TestAgentsFileSize(unittest.TestCase):
     def test_referenced_memory_files_exist(self):
         """Verify all extracted memory documents referenced in agents.md exist on disk."""
         referenced_files = [
-            "/workspace/memory/public/protocol_crab_cavern_peer_operations.md",
-            "/workspace/memory/public/reference_native_maintenance_tools.md",
-            "/workspace/memory/public/known_non_issues.md",
+            os.path.join(self.WORKSPACE, "memory/public/protocol_crab_cavern_peer_operations.md"),
+            os.path.join(self.WORKSPACE, "memory/public/reference_native_maintenance_tools.md"),
+            os.path.join(self.WORKSPACE, "memory/public/known_non_issues.md"),
         ]
         for path in referenced_files:
             self.assertTrue(os.path.exists(path), f"Referenced memory file missing: {path}")

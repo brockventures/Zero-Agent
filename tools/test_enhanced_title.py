@@ -2,7 +2,7 @@ import sys
 if "/workspace" not in sys.path:
     sys.path.insert(0, "/workspace")
 import re
-from tools.bridge import generate_concise_thread_title
+from tools.bridge_formatting import generate_concise_thread_title
 
 tests = [
     "ok so heres a new issue - it looks like when your output from the threaded request concluded, you outputted to the main thread, and when you did that, it cut off your response to my new request i had started in the main thread",

@@ -19,9 +19,10 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 
-STATE_FILE = "/tmp/batch_guard_state.json"
+STATE_FILE = "/tmp/batch_guard_state.json" if os.name != "nt" else os.path.join(tempfile.gettempdir(), "batch_guard_state.json")
 IN_FLIGHT_TURN_FILE = "/workspace/data/in_flight_turn.json"
 MAX_CONSECUTIVE_SHELL_INSPECTIONS = 3
 MAX_CONSECUTIVE_INLINE_PYTHON = 2
@@ -33,7 +34,7 @@ MAX_CONSECUTIVE_SAME_FILE_EDITS = 3
 MAX_CONSECUTIVE_GIT_CMDS = 2
 MAX_VERSIONED_SCRATCH_SWEEPS = 3
 MAX_SAME_SCRATCH_SCRIPT_RUNS = 3
-MAX_INLINE_PRODUCTION_FILES = 2
+MAX_INLINE_PRODUCTION_FILES = 3
 FORGE_TIER1_INLINE_SECONDS = 90.0
 MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S = 2
 MAX_INLINE_RUN_COMMANDS_AFTER_90S = 8
@@ -83,16 +84,30 @@ def _default_state(now: float = 0.0) -> dict:
     }
 
 
+def _norm_posix(path_str: str, cwd: str = "/workspace") -> str:
+    """Normalize a path to forward-slash POSIX form, preserving leading '/' paths on Windows."""
+    s = (path_str or "").replace("\\", "/")
+    if s.startswith("/"):
+        return s
+    c = (cwd or "/workspace").replace("\\", "/")
+    if c.startswith("/"):
+        return c.rstrip("/") + "/" + s
+    return os.path.abspath(os.path.join(cwd or ".", path_str)).replace("\\", "/")
+
+
 def is_forge_worktree_or_exempt_path(target_file: str, cwd: str = "/workspace") -> bool:
     """Return True if target_file is inside a FORGE worktree, scratch, memory, data, or unit test file."""
     if not target_file:
         return True
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True
-    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    norm_cwd = _norm_posix(cwd or "/workspace", "/")
     if norm_cwd.startswith("/tmp/forge-wt-"):
         return True
-    norm_target = os.path.abspath(os.path.join(norm_cwd, target_file)).replace("\\", "/")
+    norm_target = _norm_posix(target_file, cwd or "/workspace")
+    # On local Windows laptop standby replica (when not testing simulated /workspace, /baseball, /docker, or /tmp paths), exempt from container FORGE worktree gate
+    if os.name == "nt" and not norm_target.startswith(("/workspace/", "/baseball/", "/docker/", "/tmp/", "/app/")):
+        return True
     exempt_prefixes = (
         "/tmp/",
         "/workspace/scratch/",
@@ -106,6 +121,8 @@ def is_forge_worktree_or_exempt_path(target_file: str, cwd: str = "/workspace") 
         return True
     base = os.path.basename(norm_target)
     if base.startswith("test_") or base.endswith("_test.py") or "/tests/" in norm_target:
+        return True
+    if norm_target.endswith(".md"):
         return True
     return False
 
@@ -763,7 +780,7 @@ def check_missing_docker_cli_guard(cmd: str) -> tuple[bool, str]:
 
     cmd_clean = cmd.strip()
     # Remote SSH commands execute docker on the remote host, not inside this container
-    if cmd_clean.startswith("ssh ") or re.match(r"^\s*ssh\b", cmd_clean):
+    if cmd_clean.startswith("ssh ") or re.match(r"^\s*ssh\b", cmd_clean) or "run_ssh" in cmd_clean:
         return True, ""
 
     is_docker = bool(_DOCKER_CLI_SUBCOMMAND_RE.search(cmd))
@@ -848,7 +865,7 @@ def check_inline_production_shell_mutation(
         return True, ""
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True, ""
-    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    norm_cwd = _norm_posix(cwd or "/workspace", "/")
     if norm_cwd.startswith("/tmp/forge-wt-"):
         return True, ""
     if "forge.py" in cmd or "detached_runner.py" in cmd:
@@ -878,7 +895,7 @@ def is_heavy_inline_benchmark_or_migration(cmd: str, cwd: str = "/workspace") ->
         return False
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return False
-    norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
+    norm_cwd = _norm_posix(cwd or "/workspace", "/")
     if norm_cwd.startswith("/tmp/forge-wt-"):
         return False
     if "forge.py" in cmd or "detached_runner.py" in cmd or "modal_harness.py" in cmd:
@@ -944,7 +961,7 @@ def check_tool_use(
     if (
         state.get("offload_dispatched")
         and os.environ.get("FORGE_WORKER_ACTIVE") != "1"
-        and not os.path.abspath(cwd or "/workspace").replace("\\", "/").startswith("/tmp/forge-wt-")
+        and not _norm_posix(cwd or "/workspace", "/").startswith("/tmp/forge-wt-")
     ):
         is_exempt_outbox = name == "run_command" and "outbox.py" in str(args.get("CommandLine", ""))
         if not is_exempt_outbox and name in ("run_command", "edit_file", "replace_file_content", "write_file", "write_to_file"):

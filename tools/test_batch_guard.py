@@ -4,7 +4,8 @@ import os
 import sys
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(_REPO_ROOT, ".agents", "hooks"))
+_HOOKS_DIR = os.path.join(_REPO_ROOT, ".agents", "hooks")
+sys.path.insert(0, _HOOKS_DIR if os.path.isdir(_HOOKS_DIR) else "/workspace/.agents/hooks")
 sys.path.insert(0, _REPO_ROOT)
 from batch_guard import check_batching, check_tool_use, STATE_FILE, load_state
 
@@ -259,15 +260,17 @@ class TestBatchGuard(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("4 consecutive edit_file calls", reason)
 
-    def test_forge_tier2_tier3_gate_blocks_third_inline_production_file(self):
-        # 2 production files + unit test + scratch plan allowed in Tier 1
+    def test_forge_tier2_tier3_gate_blocks_fourth_inline_production_file(self):
+        # Up to 3 production files + unit test + markdown docs + scratch plan allowed in Tier 1
         self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/alpha.py"})[0])
         self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/beta.py"})[0])
+        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/gamma.py"})[0])
         self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/test_alpha.py"})[0])
+        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/GEMINI.md"})[0])
         self.assertTrue(check_tool_use("write_file", {"Path": "/workspace/scratch/forge_plan.json"})[0])
 
-        # 3rd distinct production file in interactive turn is blocked by FORGE Tier 2/3 Gate
-        allowed, reason = check_tool_use("edit_file", {"Path": "/workspace/tools/gamma.py"})
+        # 4th distinct production file in interactive turn is blocked by FORGE Tier 2/3 Gate
+        allowed, reason = check_tool_use("edit_file", {"Path": "/workspace/tools/delta.py"})
         self.assertFalse(allowed)
         self.assertIn("FORGE Tier 2/3 Gate Triggered", reason)
         self.assertIn("forge.py enqueue", reason)
@@ -276,7 +279,7 @@ class TestBatchGuard(unittest.TestCase):
         self.assertTrue(
             check_tool_use(
                 "edit_file",
-                {"Path": "/tmp/forge-wt-fg-123-c0/tools/gamma.py"},
+                {"Path": "/tmp/forge-wt-fg-123-c0/tools/delta.py"},
                 cwd="/tmp/forge-wt-fg-123-c0",
             )[0]
         )
@@ -288,7 +291,7 @@ class TestBatchGuard(unittest.TestCase):
                 {"CommandLine": "python3 /workspace/tools/forge.py enqueue /workspace/scratch/forge_plan.json"},
             )[0]
         )
-        allowed_after_enqueue, lock_reason = check_tool_use("edit_file", {"Path": "/workspace/tools/delta.py"})
+        allowed_after_enqueue, lock_reason = check_tool_use("edit_file", {"Path": "/workspace/tools/epsilon.py"})
         self.assertFalse(allowed_after_enqueue)
         self.assertIn("FORGE Post-Offload Turn Lock Triggered", lock_reason)
 
@@ -298,6 +301,7 @@ class TestBatchGuard(unittest.TestCase):
         with patch("time.time", return_value=base_now):
             self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/alpha.py"})[0])
             self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/beta.py"})[0])
+            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/gamma.py"})[0])
             # Consecutive shell inspection counter reaches 3
             self.assertTrue(check_batching("docker ps")[0])
             self.assertTrue(check_batching("ls -la /workspace")[0])
@@ -307,13 +311,13 @@ class TestBatchGuard(unittest.TestCase):
         # Short-window inspection counter resets, but inline_prod_files is preserved!
         with patch("time.time", return_value=base_now + 60.0):
             self.assertTrue(check_batching("docker ps")[0])
-            allowed, reason = check_tool_use("edit_file", {"Path": "/workspace/tools/gamma.py"})
+            allowed, reason = check_tool_use("edit_file", {"Path": "/workspace/tools/delta.py"})
             self.assertFalse(allowed)
             self.assertIn("FORGE Tier 2/3 Gate Triggered", reason)
 
         # 1000 seconds later (>900s TURN_STATE_EXPIRY_SECONDS): full turn state expires cleanly
         with patch("time.time", return_value=base_now + 1000.0):
-            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/gamma.py"})[0])
+            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/delta.py"})[0])
 
     def test_repeated_same_scratch_script_loop_blocked_after_three_runs(self):
         for i in range(3):

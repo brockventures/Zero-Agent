@@ -36,8 +36,26 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
     host_2 = os.environ.get("NAS_HOST_2_IP")
     ssh_user = os.environ.get("NAS_SSH_USER", "Brock")
     
-    default_key = "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519"
-    ssh_key = os.environ.get("NAS_SSH_KEY", default_key)
+    win_ssh_key = Path.home() / ".ssh" / "synology_key"
+    if os.path.exists("/secrets/id_ed25519"):
+        default_key = "/secrets/id_ed25519"
+    elif win_ssh_key.exists():
+        default_key = str(win_ssh_key)
+    else:
+        default_key = "/root/.ssh/id_ed25519"
+
+    env_key = os.environ.get("NAS_SSH_KEY")
+    if env_key and (os.path.exists(env_key) or os.name != "nt"):
+        ssh_key = env_key
+    else:
+        ssh_key = default_key
+
+    # Treat loopback placeholders on Windows standby laptop as unresolved so ~/.ssh/config or LAN derivation kicks in
+    if os.name == "nt":
+        if host_1 in ("127.0.0.1", "localhost"):
+            host_1 = None
+        if host_2 in ("127.0.0.1", "localhost"):
+            host_2 = None
 
     # 1. Read secrets/env.json if present
     if os.path.exists("/secrets/env.json"):
@@ -66,6 +84,21 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
                     host_1 = urllib.parse.urlparse(d["url"]).hostname
         except Exception:
             pass
+
+    # 2b. On Windows standby laptop, inspect ~/.ssh/config if host_1 is still unresolved
+    if not host_1:
+        ssh_cfg = Path.home() / ".ssh" / "config"
+        if ssh_cfg.exists():
+            try:
+                for line in ssh_cfg.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    s = line.strip()
+                    if s.lower().startswith("hostname "):
+                        cand = s.split(None, 1)[1].strip()
+                        if cand and cand not in ("127.0.0.1", "localhost"):
+                            host_1 = cand
+                            break
+            except Exception:
+                pass
 
     # 3. Derive host_2 from host_1 if host_1 is resolved but host_2 is not
     # In standard topology, Host 1 ends in .82 (DS1821+) and Host 2 ends in .84 (DS1525+)
@@ -134,8 +167,15 @@ def run_ssh(
     """Execute a remote command via SSH synchronously."""
     cmd = build_ssh_cmd(host, remote_cmd, user=user, port=port, key=key, batch_mode=batch_mode)
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return res.returncode, res.stdout, res.stderr
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        return res.returncode, res.stdout or "", res.stderr or ""
     except subprocess.TimeoutExpired:
         return -1, "", f"SSH command timed out after {timeout}s: {remote_cmd[:60]}"
     except Exception as e:

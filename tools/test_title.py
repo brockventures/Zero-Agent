@@ -2,7 +2,7 @@ import sys
 if "/workspace" not in sys.path:
     sys.path.insert(0, "/workspace")
 import re
-from tools.bridge import generate_concise_thread_title
+from tools.bridge_formatting import generate_concise_thread_title
 
 tests = [
     "We are falling into threaded convos TOO often for my liking. How should we adjust the triggers?",
