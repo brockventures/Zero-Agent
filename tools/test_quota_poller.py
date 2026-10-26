@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for tools/quota_poller.py."""
 
-import json
 import sqlite3
 import sys
 import tempfile
@@ -10,20 +9,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 _WORKSPACE = Path(__file__).resolve().parent.parent
-if str(_WORKSPACE) not in sys.path:
-    sys.path.insert(0, str(_WORKSPACE))
-
-import sys
 if "/workspace" not in sys.path:
     sys.path.insert(0, "/workspace")
+if str(_WORKSPACE) not in sys.path or sys.path[0] != str(_WORKSPACE):
+    sys.path.insert(0, str(_WORKSPACE))
 from tools.quota_poller import (
+    DAILY_QUOTA_DOLLAR_BUDGET,
+    DEFAULT_RATE_CARD_MODEL,
+    RATE_CARDS,
+    WEEKLY_QUOTA_DOLLAR_POOL,
+    compute_rate_card_cost,
     format_attribution_text,
     format_quota_status_text,
     get_latest_quota,
     get_quota_attribution,
     init_db,
     sample_quota,
-    throttled_post_turn_sample,
 )
 
 
@@ -223,6 +224,12 @@ class TestQuotaPoller(unittest.TestCase):
         self.assertAlmostEqual(channels["zero-chat"]["quota_pct_burned"], 3.2, places=2)
         self.assertAlmostEqual(channels["lounge"]["quota_pct_burned"], 0.8, places=2)
         self.assertAlmostEqual(channels["ivy_or_external"]["quota_pct_burned"], 1.0, places=2)
+        self.assertAlmostEqual(channels["zero-chat"]["rate_card_cost_usd"], 0.96, places=2)
+        self.assertAlmostEqual(channels["lounge"]["rate_card_cost_usd"], 0.24, places=2)
+        self.assertAlmostEqual(attr["total_rate_card_cost_usd"], 1.20, places=2)
+        self.assertAlmostEqual(attr["rate_card_cost_usd"], 1.20, places=2)
+        self.assertEqual(attr["weekly_dollar_pool"], 6000.0)
+        self.assertEqual(attr["daily_dollar_budget"], 857.14)
 
     def test_format_attribution_and_status(self):
         latest = {
@@ -294,6 +301,130 @@ class TestQuotaPoller(unittest.TestCase):
 
         attr = get_quota_attribution(hours=1.0, bucket_id="gemini-weekly", conn=self.conn, db_path=self.db_path)
         self.assertAlmostEqual(attr["total_quota_pct_burned"], 1.1, places=2)
+
+    def test_compute_rate_card_cost_argon_and_flash(self):
+        # Gemini 4 Argon: $6.00 input / $30.00 output+thinking / $0.30 cache_read per 1M
+        self.assertEqual(DEFAULT_RATE_CARD_MODEL, "gemini-4-argon")
+        self.assertIn("gemini-4-argon", RATE_CARDS)
+        self.assertIn("gemini-3.8-flash", RATE_CARDS)
+
+        # 1M wire tokens individual tests (Argon)
+        self.assertAlmostEqual(compute_rate_card_cost(input_tokens=1_000_000, model="gemini-4-argon"), 6.00)
+        self.assertAlmostEqual(compute_rate_card_cost(output_tokens=1_000_000, model="gemini-4-argon"), 30.00)
+        self.assertAlmostEqual(compute_rate_card_cost(thinking_tokens=1_000_000, model="gemini-4-argon"), 30.00)
+        self.assertAlmostEqual(compute_rate_card_cost(cache_read_tokens=1_000_000, model="gemini-4-argon"), 0.30)
+
+        # Combined Argon calculation:
+        # 500k input ($3.00) + 100k out ($3.00) + 100k thinking ($3.00) + 2M cache ($0.60) = $9.60
+        cost_argon = compute_rate_card_cost(
+            input_tokens=500_000,
+            output_tokens=100_000,
+            thinking_tokens=100_000,
+            cache_read_tokens=2_000_000,
+            model="gemini-4-argon",
+        )
+        self.assertAlmostEqual(cost_argon, 9.60)
+
+        # Gemini 3.8 Flash: $0.75 input / $3.75 output+thinking / $0.075 cache_read per 1M
+        self.assertAlmostEqual(compute_rate_card_cost(input_tokens=1_000_000, model="gemini-3.8-flash"), 0.75)
+        self.assertAlmostEqual(compute_rate_card_cost(output_tokens=1_000_000, model="gemini-3.8-flash"), 3.75)
+        self.assertAlmostEqual(compute_rate_card_cost(thinking_tokens=1_000_000, model="gemini-3.8-flash"), 3.75)
+        self.assertAlmostEqual(compute_rate_card_cost(cache_read_tokens=1_000_000, model="gemini-3.8-flash"), 0.075)
+
+        # Flash model string resolution (e.g. 'flash' resolves to 'gemini-3.8-flash')
+        cost_flash = compute_rate_card_cost(
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            model="flash",
+        )
+        self.assertAlmostEqual(cost_flash, 4.50)
+
+        # Default fallback to Argon
+        cost_default = compute_rate_card_cost(input_tokens=1_000_000)
+        self.assertAlmostEqual(cost_default, 6.00)
+
+        # Edge cases: negatives and zeros
+        self.assertAlmostEqual(compute_rate_card_cost(input_tokens=-1000, output_tokens=-500), 0.0)
+
+    def test_quota_attribution_weights_cache_and_thinking_by_rate_card(self):
+        t0 = 5000.0
+        t1 = 5600.0
+
+        # Snapshot 1 at t0
+        self.conn.execute(
+            """
+            INSERT INTO quota_snapshots (
+                timestamp, datetime_utc, bucket_id, window, remaining_fraction,
+                reset_time, prev_fraction, delta_fraction, is_reset, source
+            ) VALUES (?, '2026-10-16T12:00:00Z', 'gemini-weekly', 'weekly', 0.50, '2026-10-19T21:43:03Z', NULL, 0.0, 0, 'test');
+            """,
+            (t0,),
+        )
+
+        # Channel 1: #chat-heavy-cache has high wire tokens (1.02M) mostly in cache reads ($0.30/1M)
+        # 10k in ($0.06) + 10k out ($0.30) + 1M cache ($0.30) = $0.66
+        self.conn.execute(
+            """
+            INSERT INTO token_usage (
+                timestamp, channel_name, input_tokens, output_tokens, cache_read_tokens, thinking_tokens, total_tokens
+            ) VALUES (?, 'chat-heavy-cache', 10000, 10000, 1000000, 0, 1020000);
+            """,
+            (t0 + 100,),
+        )
+
+        # Channel 2: #deep-thinker has lower wire tokens (110k) but high thinking tokens ($30.00/1M)
+        # 10k in ($0.06) + 20k out + 80k thinking ($3.00) + 0 cache = $3.06
+        self.conn.execute(
+            """
+            INSERT INTO token_usage (
+                timestamp, channel_name, input_tokens, output_tokens, cache_read_tokens, thinking_tokens, total_tokens
+            ) VALUES (?, 'deep-thinker', 10000, 20000, 0, 80000, 110000);
+            """,
+            (t0 + 200,),
+        )
+
+        # Snapshot 2 at t1: burned 0.10 (10% of weekly quota)
+        self.conn.execute(
+            """
+            INSERT INTO quota_snapshots (
+                timestamp, datetime_utc, bucket_id, window, remaining_fraction,
+                reset_time, prev_fraction, delta_fraction, is_reset, source
+            ) VALUES (?, '2026-10-16T12:10:00Z', 'gemini-weekly', 'weekly', 0.40, '2026-10-19T21:43:03Z', 0.50, 0.10, 0, 'test');
+            """,
+            (t1,),
+        )
+        self.conn.commit()
+
+        # Total cost = 0.66 + 3.06 = 3.72
+        # Deep-thinker share = 3.06 / 3.72 = ~82.26%
+        # Chat-heavy-cache share = 0.66 / 3.72 = ~17.74%
+        with patch("time.time", return_value=t1 + 50):
+            attr = get_quota_attribution(hours=1.0, bucket_id="gemini-weekly", conn=self.conn, db_path=self.db_path)
+
+        self.assertAlmostEqual(attr["total_quota_pct_burned"], 10.0, places=2)
+        self.assertAlmostEqual(attr["rate_card_cost_usd"], 3.72, places=2)
+        self.assertEqual(attr["weekly_dollar_pool"], WEEKLY_QUOTA_DOLLAR_POOL)
+        self.assertEqual(attr["daily_dollar_budget"], DAILY_QUOTA_DOLLAR_BUDGET)
+
+        channels = {b["channel"]: b for b in attr["breakdown"]}
+        self.assertIn("chat-heavy-cache", channels)
+        self.assertIn("deep-thinker", channels)
+
+        # Without rate cards, chat-heavy-cache would have 90% of tokens and 90% of attribution.
+        # With rate cards, deep-thinker correctly receives ~82.3% of the burned quota!
+        self.assertGreater(channels["deep-thinker"]["quota_pct_burned"], channels["chat-heavy-cache"]["quota_pct_burned"])
+        self.assertAlmostEqual(channels["deep-thinker"]["quota_pct_burned"], 8.226, places=2)
+        self.assertAlmostEqual(channels["chat-heavy-cache"]["quota_pct_burned"], 1.774, places=2)
+        self.assertEqual(channels["chat-heavy-cache"]["cache_tokens"], 1_000_000)
+        self.assertEqual(channels["deep-thinker"]["thinking_tokens"], 80_000)
+        self.assertAlmostEqual(channels["deep-thinker"]["rate_card_cost_usd"], 3.06, places=2)
+        self.assertAlmostEqual(channels["chat-heavy-cache"]["rate_card_cost_usd"], 0.66, places=2)
+
+        # Test format_attribution_text displays rate card equivalent cost
+        text = format_attribution_text(attr)
+        self.assertIn("$3.72", text)
+        self.assertIn("$3.06 eq.", text)
+        self.assertIn("$0.66 eq.", text)
 
 
 if __name__ == "__main__":

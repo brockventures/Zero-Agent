@@ -24,8 +24,15 @@ WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
     sys.path.insert(0, str(WORKSPACE))
 
+_WORKSPACE = Path(__file__).resolve().parent.parent
+if str(_WORKSPACE) not in sys.path or sys.path[0] != str(_WORKSPACE):
+    sys.path.insert(0, str(_WORKSPACE))
+
 from tools.ivy_telemetry import _run_host2_python
 from tools.outbox import flush_pending_messages, queue_outbox_message
+from tools.quota_poller import (
+    compute_rate_card_cost,
+)
 
 logger = logging.getLogger("token_budget_watchdog")
 
@@ -34,6 +41,8 @@ DB_PATH = Path("/workspace/data/telemetry.db")
 
 DAILY_BUDGET_CEILING = 62_857_143  # ~62.9M wire tokens / day (Argon-weighted weekly ceiling / 7)
 WEEKLY_TOKEN_CEILING = 440_000_000  # 440M weekly wire ceiling (calibrated to Argon 55% @ 240M empirical burn)
+WEEKLY_QUOTA_DOLLAR_POOL = 6000.0
+DAILY_QUOTA_DOLLAR_BUDGET = 857.14
 DEFAULT_TARGET_CHANNEL = "zero-ops"
 DEFAULT_TARGET_CHANNEL_ID = 1544953279664889888
 
@@ -98,7 +107,8 @@ def query_zero_tokens(
                 SUM(total_tokens) as wire_tokens,
                 SUM(input_tokens) as in_tokens,
                 SUM(output_tokens) as out_tokens,
-                SUM(cache_read_tokens) as cache_tokens
+                SUM(cache_read_tokens) as cache_tokens,
+                SUM(thinking_tokens) as think_tokens
             FROM token_usage
             WHERE timestamp >= ? AND timestamp <= ?
             GROUP BY ch
@@ -111,14 +121,26 @@ def query_zero_tokens(
             d = dict(r)
             wt = d["wire_tokens"] or 0
             tc = d["turn_count"] or 0
+            in_tok = d["in_tokens"] or 0
+            out_tok = d["out_tokens"] or 0
+            cache_tok = d["cache_tokens"] or 0
+            think_tok = d["think_tokens"] or 0
             total_wire += wt
             total_turns += tc
+            ch_cost = compute_rate_card_cost(
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                cache_read_tokens=cache_tok,
+                thinking_tokens=think_tok,
+            )
             channels.append({
                 "channel": d["ch"],
                 "wire_tokens": wt,
-                "input_tokens": d["in_tokens"] or 0,
-                "output_tokens": d["out_tokens"] or 0,
-                "cache_tokens": d["cache_tokens"] or 0,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cache_tokens": cache_tok,
+                "thinking_tokens": think_tok,
+                "rate_card_cost_usd": round(ch_cost, 4),
                 "turns": tc,
             })
         conn.close()
@@ -233,13 +255,22 @@ def evaluate_daily_token_budget(
     rolling_7d = query_rolling_7d_total()
     pct_weekly = round((rolling_7d / WEEKLY_TOKEN_CEILING) * 100, 1)
 
+    # Rate-card dollar cost evaluation
+    zero_cost_usd = round(sum(c.get("rate_card_cost_usd", 0.0) for c in channels), 2)
+    if zero_cost_usd == 0.0 and zero_wire > 0:
+        zero_cost_usd = round(compute_rate_card_cost(input_tokens=zero_wire), 2)
+
+    ivy_cost_usd = round(compute_rate_card_cost(input_tokens=ivy_wire), 2) if ivy_wire > 0 else 0.0
+    fleet_cost_usd = round(zero_cost_usd + ivy_cost_usd, 2)
+    pct_daily_cost = round((fleet_cost_usd / DAILY_QUOTA_DOLLAR_BUDGET) * 100, 1) if DAILY_QUOTA_DOLLAR_BUDGET else 0.0
+
     # Format warning message if exceeded or warning threshold reached (>=85%)
     alert_lines = []
     if is_exceeded or is_warning:
         icon = "⚠️" if is_exceeded else "🟡"
         status_label = "Exceeded" if is_exceeded else "Approaching Ceiling"
         alert_lines = [
-            f"{icon} **Daily Token Budget {status_label}: {fleet_wire:,} / {budget_ceiling // 1_000_000}M ({pct_daily}%)**",
+            f"{icon} **Daily Token Budget {status_label}: {fleet_wire:,} / {budget_ceiling // 1_000_000}M ({pct_daily}%) | ${fleet_cost_usd:.2f} eq. ({pct_daily_cost}% of ${DAILY_QUOTA_DOLLAR_BUDGET:.0f}/d budget)**",
             (
                 f"The combined fleet exceeded the **{budget_ceiling // 1_000_000}M daily ceiling** by **{overage:,} tokens** for {day_label} (Pacific Time)."
                 if is_exceeded else
@@ -250,19 +281,21 @@ def evaluate_daily_token_budget(
         ]
         for c in channels[:6]:
             c_pct = round((c["wire_tokens"] / fleet_wire) * 100, 1) if fleet_wire else 0.0
+            cost_str = f" | ${c['rate_card_cost_usd']:.2f} eq." if "rate_card_cost_usd" in c else ""
             alert_lines.append(
-                f"- **#{c['channel']}:** {c['wire_tokens']:,} tokens ({c_pct}% of day | {c['turns']} turns)"
+                f"- **#{c['channel']}:** {c['wire_tokens']:,} tokens ({c_pct}% of day | {c['turns']} turns{cost_str})"
             )
         if ivy_wire > 0:
             ivy_pct = round((ivy_wire / fleet_wire) * 100, 1) if fleet_wire else 0.0
             alert_lines.append(
-                f"- **Ivy (#baseball):** {ivy_wire:,} tokens ({ivy_pct}% of day | {ivy_turns} turns)"
+                f"- **Ivy (#baseball):** {ivy_wire:,} tokens ({ivy_pct}% of day | {ivy_turns} turns | ${ivy_cost_usd:.2f} eq.)"
             )
 
         alert_lines.extend([
             "",
             "### 📈 Rolling 7-Day Context",
             f"- **Cumulative 7-Day Burn:** {rolling_7d:,} / {WEEKLY_TOKEN_CEILING / 1e9:.3f}B ({pct_weekly}% of weekly ceiling)",
+            f"- **Daily Rate-Card Cost:** `${fleet_cost_usd:.2f}` ({pct_daily_cost}% of ${DAILY_QUOTA_DOLLAR_BUDGET:.2f} daily quota budget)",
             f"- **Fleet Turn Velocity:** {fleet_turns} turns today",
             "- **Risk Assessment:** High sustained burn velocity accelerates approach to Google Gemini weekly subscription rate limits.",
         ])
@@ -282,8 +315,15 @@ def evaluate_daily_token_budget(
         "overage_tokens": overage,
         "zero_tokens": zero_wire,
         "zero_turns": zero_turns,
+        "zero_cost_usd": zero_cost_usd,
         "ivy_tokens": ivy_wire,
         "ivy_turns": ivy_turns,
+        "ivy_cost_usd": ivy_cost_usd,
+        "fleet_cost_usd": fleet_cost_usd,
+        "rate_card_cost_usd": fleet_cost_usd,
+        "pct_daily_cost": pct_daily_cost,
+        "weekly_dollar_pool": WEEKLY_QUOTA_DOLLAR_POOL,
+        "daily_dollar_budget": DAILY_QUOTA_DOLLAR_BUDGET,
         "total_turns": fleet_turns,
         "rolling_7d_tokens": rolling_7d,
         "pct_weekly": pct_weekly,
@@ -309,9 +349,10 @@ def dispatch_token_budget_alert(
     if not alert_text:
         ceiling_m = report.get("budget_ceiling", DAILY_BUDGET_CEILING) // 1_000_000
         weekly_b = f"{WEEKLY_TOKEN_CEILING / 1e9:.3f}B"
+        cost_usd = report.get("fleet_cost_usd", 0.0)
         # If forced nominal alert
         alert_text = (
-            f"📊 **Daily Token Budget Nominal: {report.get('fleet_wire_tokens'):,} / {ceiling_m}M ({report.get('pct_daily')}%)**\n"
+            f"📊 **Daily Token Budget Nominal: {report.get('fleet_wire_tokens'):,} / {ceiling_m}M ({report.get('pct_daily')}%) | ${cost_usd:.2f} eq.**\n"
             f"Daily consumption for {report.get('day_label')} is well within allocation. "
             f"Rolling 7-day is at **{report.get('pct_weekly')}%** of the {weekly_b} weekly ceiling. ✅"
         )
@@ -349,7 +390,8 @@ def main():
         status_sym = "⚠️ EXCEEDED" if report["is_exceeded"] else "🟢 NOMINAL"
         print(
             f"[{status_sym}] Fleet Wire: {report['fleet_wire_tokens']:,} / {report['budget_ceiling']:,} "
-            f"({report['pct_daily']}%) for {report['day_label']} PT (Turns: {report['total_turns']})"
+            f"({report['pct_daily']}%) | ${report.get('fleet_cost_usd', 0.0):.2f} ({report.get('pct_daily_cost', 0.0)}%) "
+            f"for {report['day_label']} PT (Turns: {report['total_turns']})"
         )
         if report["is_exceeded"]:
             print("\n" + report["alert_text"])

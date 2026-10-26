@@ -29,8 +29,45 @@ logger = logging.getLogger("quota_poller")
 PT = ZoneInfo("America/Los_Angeles")
 DB_PATH = Path("/workspace/data/telemetry.db")
 
+# Antigravity subscription rate cards per 1M tokens
+RATE_CARDS: Dict[str, Dict[str, float]] = {
+    "gemini-4-argon": {"input": 6.00, "output": 30.00, "cache_read": 0.30},
+    "gemini-3.8-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
+}
+DEFAULT_RATE_CARD_MODEL = "gemini-4-argon"
+
+WEEKLY_QUOTA_DOLLAR_POOL = 6000.0
+DAILY_QUOTA_DOLLAR_BUDGET = 857.14
+
 # In-memory throttle tracker for post-turn sampling
 _LAST_SAMPLE_TS: float = 0.0
+
+
+def compute_rate_card_cost(
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    thinking_tokens: int = 0,
+    model: str = DEFAULT_RATE_CARD_MODEL,
+) -> float:
+    """Calculate empirical rate-card USD cost for token usage based on model pricing."""
+    m = (model or "").lower()
+    if m in RATE_CARDS:
+        card = RATE_CARDS[m]
+    elif "flash" in m:
+        card = RATE_CARDS["gemini-3.8-flash"]
+    else:
+        card = RATE_CARDS[DEFAULT_RATE_CARD_MODEL]
+
+    inp = max(0, input_tokens or 0)
+    out_think = max(0, (output_tokens or 0) + (thinking_tokens or 0))
+    cache = max(0, cache_read_tokens or 0)
+
+    in_cost = (inp / 1e6) * card["input"]
+    out_cost = (out_think / 1e6) * card["output"]
+    cache_cost = (cache / 1e6) * card["cache_read"]
+
+    return in_cost + out_cost + cache_cost
 
 
 def get_db_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
@@ -346,6 +383,7 @@ def get_quota_attribution(
     bucket_id: str = "gemini-weekly",
     conn: Optional[sqlite3.Connection] = None,
     db_path: Path | str = DB_PATH,
+    model: str = DEFAULT_RATE_CARD_MODEL,
 ) -> Dict[str, Any]:
     """Correlate snapshot deltas against token_usage records to attribute quota burn."""
     should_close = False
@@ -372,7 +410,7 @@ def get_quota_attribution(
 
         total_burn_fraction = 0.0
         channel_burn_fractions: Dict[str, float] = {}
-        channel_tokens: Dict[str, Dict[str, int]] = {}
+        channel_tokens: Dict[str, Dict[str, Any]] = {}
         external_burn_fraction = 0.0
 
         low_water_frac: Optional[float] = (
@@ -427,13 +465,39 @@ def get_quota_attribution(
             interval_turns = [dict(r) for r in cur.fetchall()]
             interval_total_tokens = sum((t["tot_tok"] or 0) for t in interval_turns)
 
-            if interval_total_tokens > 0:
+            # Compute rate-card costs for each channel turn group
+            channel_costs = {}
+            for t in interval_turns:
+                ch = t["ch_name"]
+                in_tok = t["in_tok"] or 0
+                cache_tok = t["cache_tok"] or 0
+                out_tok = t["out_tok"] or 0
+                think_tok = t["think_tok"] or 0
+                c_cost = compute_rate_card_cost(
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    cache_read_tokens=cache_tok,
+                    thinking_tokens=think_tok,
+                    model=model,
+                )
+                channel_costs[ch] = c_cost
+
+            interval_total_cost = sum(channel_costs.values())
+
+            if interval_total_cost > 0 or interval_total_tokens > 0:
                 for t in interval_turns:
                     ch = t["ch_name"]
                     ch_tokens = t["tot_tok"] or 0
-                    share = ch_tokens / interval_total_tokens
-                    ch_delta = delta * share
+                    ch_cost = channel_costs.get(ch, 0.0)
 
+                    if interval_total_cost > 0:
+                        share = ch_cost / interval_total_cost
+                    elif interval_total_tokens > 0:
+                        share = ch_tokens / interval_total_tokens
+                    else:
+                        share = 0.0
+
+                    ch_delta = delta * share
                     channel_burn_fractions[ch] = channel_burn_fractions.get(ch, 0.0) + ch_delta
 
                     if ch not in channel_tokens:
@@ -444,6 +508,7 @@ def get_quota_attribution(
                             "output_tokens": 0,
                             "thinking_tokens": 0,
                             "total_tokens": 0,
+                            "rate_card_cost_usd": 0.0,
                         }
                     channel_tokens[ch]["turns"] += t["turn_count"] or 0
                     channel_tokens[ch]["input_tokens"] += t["in_tok"] or 0
@@ -451,6 +516,7 @@ def get_quota_attribution(
                     channel_tokens[ch]["output_tokens"] += t["out_tok"] or 0
                     channel_tokens[ch]["thinking_tokens"] += t["think_tok"] or 0
                     channel_tokens[ch]["total_tokens"] += ch_tokens
+                    channel_tokens[ch]["rate_card_cost_usd"] += ch_cost
             else:
                 # Quota decreased with zero Zero turns logged: consumed by Ivy or external sessions
                 external_burn_fraction += delta
@@ -459,16 +525,20 @@ def get_quota_attribution(
         total_pct = round(total_burn_fraction * 100.0, 3)
         ext_pct = round(external_burn_fraction * 100.0, 3)
 
+        total_rate_card_cost = 0.0
         breakdown = []
         for ch, burn_frac in sorted(channel_burn_fractions.items(), key=lambda x: x[1], reverse=True):
             pct = round(burn_frac * 100.0, 3)
             tok_stats = channel_tokens.get(ch, {})
             share_of_burn = round((burn_frac / total_burn_fraction * 100.0), 1) if total_burn_fraction > 0 else 0.0
+            ch_cost_usd = round(tok_stats.get("rate_card_cost_usd", 0.0), 4)
+            total_rate_card_cost += ch_cost_usd
             breakdown.append({
                 "channel": ch,
                 "quota_pct_burned": pct,
                 "share_of_total_burn_pct": share_of_burn,
                 **tok_stats,
+                "rate_card_cost_usd": ch_cost_usd,
             })
 
         if external_burn_fraction > 0:
@@ -483,7 +553,10 @@ def get_quota_attribution(
                 "output_tokens": 0,
                 "thinking_tokens": 0,
                 "total_tokens": 0,
+                "rate_card_cost_usd": 0.0,
             })
+
+        total_rate_card_cost = round(total_rate_card_cost, 4)
 
         return {
             "bucket_id": bucket_id,
@@ -492,6 +565,10 @@ def get_quota_attribution(
             "total_quota_pct_burned": total_pct,
             "external_quota_pct_burned": ext_pct,
             "zero_quota_pct_burned": round((total_pct - ext_pct), 3),
+            "total_rate_card_cost_usd": total_rate_card_cost,
+            "rate_card_cost_usd": total_rate_card_cost,
+            "weekly_dollar_pool": WEEKLY_QUOTA_DOLLAR_POOL,
+            "daily_dollar_budget": DAILY_QUOTA_DOLLAR_BUDGET,
             "breakdown": breakdown,
         }
     finally:
@@ -533,16 +610,24 @@ def format_attribution_text(attr: Dict[str, Any]) -> str:
         f"- **Total Burned:** `{tot:.2f}%` of weekly cap",
         f"- **Zero Channels:** `{attr.get('zero_quota_pct_burned', 0.0):.2f}%`",
         f"- **Ivy / External:** `{attr.get('external_quota_pct_burned', 0.0):.2f}%`",
+    ]
+    tot_cost = attr.get("total_rate_card_cost_usd") or attr.get("rate_card_cost_usd")
+    if tot_cost is not None and tot_cost > 0:
+        lines.append(f"- **Rate-Card Equivalent:** `${tot_cost:.2f}`")
+
+    lines.extend([
         "",
         "### Channel Breakdown",
-    ]
+    ])
     for b in attr.get("breakdown", []):
         ch = b["channel"]
         pct = b["quota_pct_burned"]
         share = b["share_of_total_burn_pct"]
         tok = b.get("total_tokens", 0)
         tok_str = f"{tok:,} tokens" if tok > 0 else "external"
-        lines.append(f"- **{ch}:** `{pct:.2f}%` burned ({share}% of cycle delta, {tok_str})")
+        cost = b.get("rate_card_cost_usd")
+        cost_str = f", ${cost:.2f} eq." if cost is not None and cost > 0 else ""
+        lines.append(f"- **{ch}:** `{pct:.2f}%` burned ({share}% of cycle delta, {tok_str}{cost_str})")
 
     return "\n".join(lines)
 
@@ -589,6 +674,7 @@ def main() -> int:
     parser.add_argument("--status", action="store_true", help="Show current live quota status across buckets")
     parser.add_argument("--attribution", "-a", action="store_true", help="Display per-channel quota attribution")
     parser.add_argument("--hours", type=float, default=24.0, help="Hours window for attribution (default: 24)")
+    parser.add_argument("--model", "-m", default=DEFAULT_RATE_CARD_MODEL, help=f"Model for rate card (default: {DEFAULT_RATE_CARD_MODEL})")
     parser.add_argument("--include-3p", action="store_true", help="Include 3P models (Claude/GPT) in status output")
     parser.add_argument("--json", action="store_true", help="Output raw JSON data")
     args = parser.parse_args()
@@ -602,7 +688,7 @@ def main() -> int:
         return 0
 
     if args.attribution:
-        attr = get_quota_attribution(hours=args.hours)
+        attr = get_quota_attribution(hours=args.hours, model=args.model)
         if args.json:
             print(json.dumps(attr, indent=2))
         else:
