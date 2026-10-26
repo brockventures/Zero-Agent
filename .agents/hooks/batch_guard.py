@@ -140,6 +140,14 @@ def _get_current_turn_Step_anchor(
     if agy_pid is None:
         agy_pid = _get_agy_ancestor_pid()
     cid = ""
+    cid_from_proc = ""
+    try:
+        cmdline = open(f"/proc/{agy_pid}/cmdline", "r", encoding="utf-8", errors="ignore").read().replace("\x00", " ")
+        m = re.search(r"--conversation=([a-f0-9-]+)", cmdline)
+        if m:
+            cid_from_proc = m.group(1)
+    except Exception:
+        pass
     in_flight_sig = ""
     try:
         if in_flight_file and os.path.exists(in_flight_file):
@@ -155,6 +163,18 @@ def _get_current_turn_Step_anchor(
                         if isinstance(v, dict) and v.get("pid") == agy_pid:
                             matched_entry = v
                             break
+                if matched_entry is None and cid_from_proc:
+                    for v in data.values():
+                        if isinstance(v, dict) and str(v.get("conv_id") or "") == cid_from_proc:
+                            matched_entry = v
+                            break
+                if matched_entry is None:
+                    # Fallback: pick the most recently updated active turn entry
+                    dict_entries = [v for v in data.values() if isinstance(v, dict) and ("prompt" in v or "ts" in v or "status_msg_id" in v)]
+                    if len(dict_entries) == 1:
+                        matched_entry = dict_entries[0]
+                    elif dict_entries:
+                        matched_entry = max(dict_entries, key=lambda x: float(x.get("ts") or 0.0))
                 if matched_entry is None and ("prompt" in data or "ts" in data or "status_msg_id" in data):
                     matched_entry = data
                 if isinstance(matched_entry, dict):

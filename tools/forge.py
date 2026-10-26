@@ -3951,6 +3951,51 @@ def list_jobs(limit: int = 15, db_path: Path | str = FORGE_DB_PATH) -> list[dict
 # 5. Pillar 4: Deterministic Decisions Framework (Inline Approval Cards)
 # ---------------------------------------------------------------------------
 
+def _validate_decision_shell_payload(handler_type: str, payload: dict) -> tuple[bool, str]:
+    """Pre-flight validate `shell` Decision Card payloads so malformed bash/python quoting fails at stage time rather than on Approve click."""
+    if handler_type != "shell":
+        return True, ""
+    cmd = str(payload.get("command") or "").strip()
+    if not cmd:
+        return False, "Decision Card with handler 'shell' requires a non-empty 'command' in payload."
+
+    # 1. Bash syntax pre-flight (`bash -n`)
+    try:
+        chk = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True, text=True, timeout=5)
+        if chk.returncode != 0:
+            err_msg = (chk.stderr or chk.stdout or "syntax error").strip().splitlines()[0]
+            return False, (
+                f"Decision Card shell command has invalid bash syntax ({err_msg}). "
+                "Write multi-line Python/shell logic to a standalone script in /workspace/scratch/<name>.py and stage 'python3 /workspace/scratch/<name>.py' instead."
+            )
+    except Exception:
+        pass
+
+    # 2. If `python3 -c` is used inline, block multi-line inline scripts or verify AST syntax via shlex
+    if re.search(r"\bpython[0-9.]*\s+-c\b", cmd):
+        if "\n" in cmd or '"""' in cmd or "'''" in cmd:
+            return False, (
+                "Decision Card 'shell' payload contains a multi-line or triple-quoted inline 'python3 -c' string, "
+                "which breaks under '/bin/sh -c' quoting when clicked. Write the script to '/workspace/scratch/<name>.py' "
+                "and stage 'python3 /workspace/scratch/<name>.py' as the command."
+            )
+        try:
+            import shlex
+            tokens = shlex.split(cmd)
+            for idx, tok in enumerate(tokens):
+                if tok == "-c" and idx + 1 < len(tokens) and idx > 0 and "python" in tokens[idx - 1]:
+                    ast.parse(tokens[idx + 1])
+        except SyntaxError as e:
+            return False, (
+                f"Decision Card inline 'python3 -c' payload has a Python SyntaxError ({e.msg} at line {e.lineno}). "
+                "Write the script to '/workspace/scratch/<name>.py' and stage 'python3 /workspace/scratch/<name>.py' instead."
+            )
+        except ValueError as e:
+            return False, f"Decision Card shell command has unbalanced quotes ({e})."
+
+    return True, ""
+
+
 def stage_decision(
     category: str,
     title: str,
@@ -3964,6 +4009,9 @@ def stage_decision(
     post_to_discord: bool = False,
 ) -> dict:
     """Stage a deterministic Decision Card in SQLite (and optionally post directly to Discord)."""
+    ok_val, val_err = _validate_decision_shell_payload(handler_type.strip(), payload)
+    if not ok_val:
+        raise ValueError(val_err)
     now = time.time()
     slug = re.sub(r"[^a-z0-9]+", "", category.lower())[:8] or "act"
     decision_id = f"dec-{int(now * 1000) % 100000000}-{slug}"
