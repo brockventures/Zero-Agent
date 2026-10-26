@@ -179,11 +179,13 @@ def format_for_discord(text: str) -> str:
     if not text:
         return ""
 
-    # 0b. Pre-shield link hygiene for accidental backticks around bare URLs or inside http(s) link labels:
+    # 0b. Pre-shield link & mention hygiene for accidental backticks around bare URLs, inside http(s) link labels, or around line-leading Discord mentions:
     # - Single-backticked bare URLs: `<https://...>` or `https://...` -> <https://...>
     # - Backticked labels on web links: [`label`](https://...) -> [label](https://...)
+    # - Line-leading single-backticked Discord snowflakes: `<@123456>` -> <@123456>
     text = re.sub(r"(?<!`)`<?(https?://[^\s`>]+)>?`(?!`)", r"<\1>", text)
     text = re.sub(r"\[\s*`+([^`\]\n]+)`+\s*\]\((<?https?://[^\)\n]+)\)", r"[\1](\2)", text)
+    text = re.sub(r"(?m)^([ \t>]*(?:🍌[ \t]*)?)`(<@!?&?\d{15,22}>)`(?=\s|[,:;]|$)", r"\1\2", text)
 
     # 0c. Global Code-Span Shield: mask all fenced code blocks and N-backtick inline code spans
     # so zero prose regexes can mutate code, regex patterns, or bash snippets.

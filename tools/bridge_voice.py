@@ -52,7 +52,7 @@ except ImportError:
 from google import genai
 from google.genai import types
 
-from tools.bridge_state import BROCK_GUILD_ID, OWNER_USER_ID, TARGET_CHANNEL_ID
+from tools.bridge_state import OWNER_USER_ID, TARGET_CHANNEL_ID
 
 log = logging.getLogger("bridge_voice")
 PT_TZ = ZoneInfo("America/Los_Angeles")
@@ -267,8 +267,9 @@ class GeminiLiveAudioSink(voice_recv.AudioSink):
                         except Exception:
                             pass
                 except Exception as de:
-                    log.debug(f"[ZeroVoice] DAVE decrypt skipped/failed for packet (len={len(opus_bytes)}): {de}")
-                    return
+                    # During fast reconnects, SSRC key ratcheting can briefly lag behind early RTP packets;
+                    # fall through to Opus decode attempt instead of silently dropping the stream.
+                    log.debug(f"[ZeroVoice] DAVE decrypt fallback to passthrough (len={len(opus_bytes)}): {de}")
 
         # Decode Opus -> 48kHz 16-bit stereo PCM
         try:
@@ -286,16 +287,16 @@ class GeminiLiveAudioSink(voice_recv.AudioSink):
 
             # Echo & Self-Cutoff Prevention:
             # Only forward incoming audio while Zero is speaking if it has real sustained speech energy
-            # (>= 8 consecutive 20ms packets = 160ms of RMS > 1600, i.e., genuine human barge-in).
+            # (>= 5 consecutive 20ms packets = 100ms of RMS > 900, i.e., genuine human barge-in).
             is_zero_speaking = bool(
                 self.audio_source
-                and (self.audio_source.is_speaking_out or (time.monotonic() - self.audio_source.last_spoke_out_ts < 0.25))
+                and (self.audio_source.is_speaking_out or (time.monotonic() - self.audio_source.last_spoke_out_ts < 0.10))
             )
             if is_zero_speaking:
                 rms = audioop.rms(pcm_16k_mono, 2)
-                if rms > 1600:
+                if rms > 900:
                     self._consecutive_barge_packets += 1
-                    if self._consecutive_barge_packets >= 8 and self.audio_source:
+                    if self._consecutive_barge_packets >= 5 and self.audio_source:
                         self.audio_source.clear_buffer()
                 else:
                     self._consecutive_barge_packets = 0
@@ -433,6 +434,8 @@ def _build_zero_live_system_prompt() -> str:
         "SSH, Home Assistant, and research tools as the regular Discord text agent!\n"
         "- NEVER claim you don't have access to local files, repositories, task boards, or homelab systems.\n"
         "- Use `search_zero_memory` to search durable memory or past transcripts (`memory` or `transcripts`).\n"
+        "- Use `search_gmail` whenever Ryan asks about an email, alert, receipt, or message in his Gmail inbox.\n"
+        "- Keep tool usage fast and bounded: call at most 1 to 2 tools per spoken turn, then speak your answer immediately. NEVER chain long silent sequences of shell guesses.\n"
         "- Use `check_tasks_and_repos` to inspect `/workspace/data/tasks.json`, Google Tasks, and GitHub issues "
         "across `brockventures/big-projections`, `brockventures/sharkfin`, and `brockventures/homeassistant-config`.\n"
         "- Use `run_shell_command` to run ANY bash command in `/workspace` (e.g. `gh`, `git`, `python3`, `curl`, "
@@ -462,6 +465,24 @@ def _build_live_tools() -> list[types.Tool]:
                             "target": types.Schema(
                                 type="STRING",
                                 description="Search target: 'memory' (default, durable memory files) or 'transcripts' (past session logs).",
+                            ),
+                        },
+                        required=["query"],
+                    ),
+                ),
+                types.FunctionDeclaration(
+                    name="search_gmail",
+                    description="Search Ryan's Gmail inbox using the authenticated Gmail API and return matching emails (Date, From, Subject, Snippet, and plain-text body).",
+                    parameters=types.Schema(
+                        type="OBJECT",
+                        properties={
+                            "query": types.Schema(
+                                type="STRING",
+                                description="Gmail search query (e.g. 'from:cloudflare', 'cloudflare tunnel', 'subject:invoice').",
+                            ),
+                            "max_results": types.Schema(
+                                type="INTEGER",
+                                description="Maximum emails to fetch (default 4).",
                             ),
                         },
                         required=["query"],
@@ -780,6 +801,62 @@ class ZeroVoiceSessionManager:
             except Exception as e:
                 return {"error": str(e)}
 
+        if name == "search_gmail":
+            query = str(args.get("query", "")).strip()
+            max_results = min(int(args.get("max_results", 4) or 4), 8)
+            if not query:
+                return {"error": "Empty query."}
+
+            def _fetch_gmail() -> str:
+                import base64
+                import urllib.parse
+                import urllib.request
+                from tools.zero_mail_listener import get_access_token
+
+                tok = get_access_token()
+                q_enc = urllib.parse.quote(query)
+                list_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={q_enc}&maxResults={max_results}"
+                req = urllib.request.Request(list_url, headers={"Authorization": f"Bearer {tok}"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    msgs = json.loads(resp.read().decode()).get("messages", [])
+                if not msgs:
+                    return f"No Gmail messages found matching '{query}'."
+
+                def _extract_plain(payload: dict[str, Any]) -> str:
+                    if payload.get("mimeType") == "text/plain" and payload.get("body", {}).get("data"):
+                        return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
+                    for part in payload.get("parts", []):
+                        sub = _extract_plain(part)
+                        if sub:
+                            return sub
+                    if payload.get("body", {}).get("data"):
+                        return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
+                    return ""
+
+                summaries = []
+                for m in msgs[:max_results]:
+                    mid = m["id"]
+                    m_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=full"
+                    r2 = urllib.request.Request(m_url, headers={"Authorization": f"Bearer {tok}"})
+                    with urllib.request.urlopen(r2, timeout=10) as resp2:
+                        detail = json.loads(resp2.read().decode())
+                    hdrs = {h["name"].lower(): h["value"] for h in detail.get("payload", {}).get("headers", [])}
+                    body = _extract_plain(detail.get("payload", {})).strip()
+                    summaries.append(
+                        f"Date: {hdrs.get('date')}\n"
+                        f"From: {hdrs.get('from')}\n"
+                        f"Subject: {hdrs.get('subject')}\n"
+                        f"Snippet: {detail.get('snippet')}\n"
+                        f"Body:\n{body[:1200]}"
+                    )
+                return "\n---\n".join(summaries)[:3800]
+
+            try:
+                out_str = await asyncio.to_thread(_fetch_gmail)
+                return {"result": out_str}
+            except Exception as e:
+                return {"error": str(e)}
+
         if name == "check_tasks_and_repos":
             repo_filter = str(args.get("repo_or_filter", "all")).strip().lower()
             out_parts = []
@@ -1085,6 +1162,8 @@ class ZeroVoiceSessionManager:
                         audio=types.Blob(data=silence_40ms, mime_type="audio/pcm;rate=16000")
                     )
 
+    MAX_VOICE_TOOL_ROUNDS = 3
+
     async def _pump_output_events(
         self,
         session: Any,
@@ -1092,6 +1171,7 @@ class ZeroVoiceSessionManager:
     ) -> None:
         user_transcript_buf: list[str] = []
         zero_transcript_buf: list[str] = []
+        tool_rounds_this_turn = 0
 
         while not self._stop_event.is_set():
             try:
@@ -1119,8 +1199,10 @@ class ZeroVoiceSessionManager:
                                 inline = getattr(part, "inline_data", None)
                                 if inline and getattr(inline, "data", None) and self.audio_source:
                                     self.audio_source.feed_gemini_pcm_24k_mono(inline.data)
+                                    tool_rounds_this_turn = 0
 
                         if getattr(sc, "turn_complete", False) or getattr(sc, "interrupted", False):
+                            tool_rounds_this_turn = 0
                             if user_transcript_buf:
                                 _append_voice_turn_to_history("Ryan", "".join(user_transcript_buf))
                                 user_transcript_buf.clear()
@@ -1133,9 +1215,23 @@ class ZeroVoiceSessionManager:
                         if user_transcript_buf:
                             _append_voice_turn_to_history("Ryan", "".join(user_transcript_buf))
                             user_transcript_buf.clear()
+                        tool_rounds_this_turn += 1
                         func_responses = []
                         for fc in tool_call.function_calls:
-                            res_dict = await self._execute_tool_call(fc, notify_channel)
+                            if tool_rounds_this_turn > self.MAX_VOICE_TOOL_ROUNDS:
+                                log.warning(
+                                    f"[ZeroVoice] Suppressing tool call {fc.name} (round {tool_rounds_this_turn} > {self.MAX_VOICE_TOOL_ROUNDS})"
+                                )
+                                res_dict = {
+                                    "result": "Tool budget (3 rounds) reached for this voice turn. Speak your findings to Ryan immediately in plain English."
+                                }
+                            else:
+                                res_dict = await self._execute_tool_call(fc, notify_channel)
+                                if tool_rounds_this_turn >= self.MAX_VOICE_TOOL_ROUNDS and isinstance(res_dict, dict):
+                                    res_dict = dict(res_dict)
+                                    res_dict["_voice_directive"] = (
+                                        "Tool budget (3 rounds) reached for this voice turn. Speak your answer to Ryan immediately without calling more tools."
+                                    )
                             func_responses.append(
                                 types.FunctionResponse(
                                     id=getattr(fc, "id", None),

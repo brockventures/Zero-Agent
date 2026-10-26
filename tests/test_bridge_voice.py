@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests for tools/bridge_voice.py (Discord Voice + Gemini Live API)."""
 
-import asyncio
 import sys
 import unittest
 from unittest.mock import MagicMock
@@ -54,7 +53,9 @@ class TestBridgeVoice(unittest.TestCase):
         self.assertEqual(len(tools), 1)
         fn_names = [f.name for f in tools[0].function_declarations]
         self.assertIn("search_zero_memory", fn_names)
+        self.assertIn("search_gmail", fn_names)
         self.assertIn("post_note_to_zero_chat", fn_names)
+        self.assertEqual(ZeroVoiceSessionManager.MAX_VOICE_TOOL_ROUNDS, 3)
 
     def test_session_manager_idle_status(self):
         bot = MagicMock()

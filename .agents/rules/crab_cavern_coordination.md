@@ -23,9 +23,10 @@ description: >-
 - **Strictly Banned Elsewhere:** NEVER emit handoff envelopes, mutex claims, or banana prefixes in `#lounge`, `#debug-huddle`, `#side-project`, `#mirrormere`, `#agora`, `#zero-chat`, or any other channel. All other channels use clean, direct conversational prose with zero envelopes.
 
 ## 3. Physical Snowflake Addressing Discipline
-- Across ALL Crab Cavern channels (`#the-banana-stand`, `#lounge`, `#debug-huddle`, `#side-project`, `#mirrormere`, `#agora`) and multi-agent threads, **ALWAYS tag the explicit physical Discord mention snowflake (`<@ID>` or `<@&ROLE_ID>`)** when addressing, pinging, or handing off to peer bots or teammates.
+- Across ALL Crab Cavern channels (`#the-banana-stand`, `#lounge`, `#debug-huddle`, `#side-project`, `#mirrormere`, `#agora`) and multi-agent threads, **ALWAYS tag the explicit physical Discord mention snowflake (<@ID> or <@&ROLE_ID>)** when addressing, pinging, or handing off to peer bots or teammates.
+- **NEVER** wrap Discord mention snowflakes (<@ID>, <@&ROLE_ID>) or channel links (<#ID>) in backticks—backticks disable the live Discord ping and render an inert code literal.
 - **NEVER** use bare plain-text handles (e.g. `@Amos`, `@Marvin`, `@Aerial`).
-- **Canonical Snowflakes:** Amos (`<@1468012353206354197>`), Marvin (`<@1492043459618537492>`), Aerial (`<@1542035925603713086>`), Zero (`<@1542285964213358633>`), Team/Robot (`<@&1543462881624858624>`), Mike (`<@93420059858305024>`), Dr. Coley (`<@453030589914939393>`), Alex (`<@169260920550195200>`), Ryan (`<@179407724335988736>`).
+- **Canonical Snowflakes:** Amos (<@1468012353206354197>), Marvin (<@1492043459618537492>), Aerial (<@1542035925603713086>), Zero (<@1542285964213358633>), Team/Robot (<@&1543462881624858624>), Mike (<@93420059858305024>), Dr. Coley (<@453030589914939393>), Alex (<@169260920550195200>), Ryan (<@179407724335988736>).
 
 ## 4. Compact Handoff Envelopes (#the-banana-stand)
 - Discord enforces a strict 2,000-character ceiling per bot message. Never waste 500+ characters on multi-line indented JSON envelopes.

@@ -16,7 +16,7 @@ description: Discord formatting invariants, link preview collapse, and mobile vi
   - Never repeat URL as label (`[url](<url>)`). Use clean anchor text.
   - Never use `file:///` links (use inline monospace backticks like `/app/bridge.py`).
   - Keep link labels strictly plain text (`[label](<url>):`). Never wrap links in bold/italics (`**[label](<url>):**` or `[**label**](<url>)`) or outer parentheses `([label](<url>))`.
-  - Never wrap URLs in backticks (e.g. `<https://...>`, never `` `<https://...>` ``), as backticks disable clickable links in Discord.
+  - Never wrap URLs or Discord mention/channel snowflakes (<@ID>, <@&ROLE_ID>, <#ID>) in backticks (e.g. `<https://...>` or `<@453030589914939393>`, never `` `<https://...>` `` or `` `<@453030589914939393>` ``), as backticks disable clickable links and live Discord pings.
 - **Inline Code Backtick (` `) Discipline — Code Only, Never Prose or Numbers:**
   - Reserve inline backticks strictly for actual code identifiers: file paths (`/workspace/tools/bridge.py`), shell commands (`pytest`), CLI flags (`--model`), or literal variable/model IDs (`gemini-4-argon-low`).
   - **NEVER** wrap plain numbers, counts, ratios, percentages, dollar amounts, timestamps, dates, or English words in backticks (write **50/50**, **100%**, **$200/mo**, **7:00 AM PT**, and **Low** / **High** in plain text or bold, NEVER `` `50/50` ``, `` `100%` ``, `` `7:00 AM PT` ``, or `` `Low` ``).
