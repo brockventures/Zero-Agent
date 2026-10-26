@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 import time
@@ -21,13 +23,26 @@ PT = ZoneInfo("America/Los_Angeles")
 WEEK_SECONDS = 7 * 86400  # 604,800 seconds
 
 
+def _build_low_priority_prefix() -> list[str]:
+    """Return nice/ionice prefix when available so background CLI probes yield to interactive turns."""
+    prefix: list[str] = []
+    if shutil.which("nice"):
+        prefix.extend(["nice", "-n", "15"])
+    if shutil.which("ionice"):
+        prefix.extend(["ionice", "-c", "2", "-n", "7"])
+    return prefix
+
+
 def fetch_usage_data(timeout: int = 30, retries: int = 1) -> dict:
     """Invoke `agy -p "/usage" --output-format=json` and return parsed JSON."""
     last_err: Exception | None = None
+    cmd = _build_low_priority_prefix() + ["agy", "-p", "/usage", "--output-format=json"]
+    run_cwd = "/tmp" if os.path.isdir("/tmp") else None
     for attempt in range(max(0, retries) + 1):
         try:
             res = subprocess.run(
-                ["agy", "-p", "/usage", "--output-format=json"],
+                cmd,
+                cwd=run_cwd,
                 capture_output=True,
                 text=True,
                 timeout=timeout,

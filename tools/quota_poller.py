@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sqlite3
 import sys
 import time
@@ -41,6 +42,16 @@ DAILY_QUOTA_DOLLAR_BUDGET = 857.14
 
 # In-memory throttle tracker for post-turn sampling
 _LAST_SAMPLE_TS: float = 0.0
+MAX_POLLER_LOAD_1M: float = 12.0
+
+
+def is_system_load_elevated(threshold: float = MAX_POLLER_LOAD_1M) -> Tuple[bool, float]:
+    """Return (is_elevated, load_1m) so background quota polling can defer during heavy Host 2 load spikes."""
+    try:
+        load_1m = float(os.getloadavg()[0])
+        return load_1m >= threshold, round(load_1m, 2)
+    except Exception:
+        return False, 0.0
 
 
 def compute_rate_card_cost(
@@ -296,10 +307,14 @@ def sample_quota(
 
 
 def throttled_post_turn_sample(min_interval: float = 60.0) -> Optional[Dict[str, Any]]:
-    """Safe post-turn hook: samples quota if at least min_interval seconds elapsed."""
+    """Safe post-turn hook: samples quota if at least min_interval seconds elapsed and host load is nominal."""
     global _LAST_SAMPLE_TS
     now = time.time()
     if (now - _LAST_SAMPLE_TS) < min_interval:
+        return None
+    elevated, load_1m = is_system_load_elevated()
+    if elevated:
+        logger.info(f"Deferring post-turn quota sample due to elevated 1m load ({load_1m} >= {MAX_POLLER_LOAD_1M}).")
         return None
     try:
         return sample_quota(source="post_turn")
@@ -632,9 +647,15 @@ def format_attribution_text(attr: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def run_quota_poller(test: bool = False, quiet: bool = False) -> Tuple[bool, str, Dict[str, Any]]:
+def run_quota_poller(test: bool = False, quiet: bool = False, force: bool = False) -> Tuple[bool, str, Dict[str, Any]]:
     """Entry point for sidecars.py, bridge_scheduler.py, and manual CLI runs."""
     try:
+        if not test and not force:
+            elevated, load_1m = is_system_load_elevated()
+            if elevated:
+                msg = f"Deferred quota poller: Host 2 1m load ({load_1m}) >= {MAX_POLLER_LOAD_1M}."
+                logger.info(msg)
+                return True, "" if quiet else msg, {"status": "deferred_high_load", "load_1m": load_1m}
         res = sample_quota(source="sidecar" if not test else "test", dry_run=test)
         snapshots = res.get("snapshots", [])
 

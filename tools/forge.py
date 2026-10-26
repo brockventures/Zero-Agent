@@ -72,6 +72,34 @@ ESCALATION_WORKER_MODEL = "gemini-4-argon-medium"
 DEFAULT_LEASE_TTL_SECONDS = 300.0
 
 
+def _build_low_priority_prefix() -> list[str]:
+    """Return nice/ionice prefix when available so background FORGE workers yield CPU/IO to interactive turns."""
+    prefix: list[str] = []
+    if shutil.which("nice"):
+        prefix.extend(["nice", "-n", "15"])
+    if shutil.which("ionice"):
+        prefix.extend(["ionice", "-c", "2", "-n", "7"])
+    return prefix
+
+
+def _apply_low_priority() -> None:
+    """Lower CPU/IO scheduling priority inside a forked child process (preexec_fn)."""
+    try:
+        os.nice(15)
+    except Exception:
+        pass
+    try:
+        if shutil.which("ionice"):
+            subprocess.run(
+                ["ionice", "-c", "2", "-n", "7", "-p", str(os.getpid())],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+    except Exception:
+        pass
+
+
 def resolve_default_forge_db_path() -> Path:
     """Resolve the shared cross-container FORGE SQLite path on Host 2 (/baseball/data/forge.db) when present."""
     env_override = os.getenv("FORGE_DB_PATH", "").strip()
@@ -2440,6 +2468,7 @@ def verify_chunk_worktree(
         capture_output=True,
         text=True,
         timeout=300,
+        preexec_fn=_apply_low_priority if hasattr(os, "nice") else None,
     )
     if v_proc.returncode != 0:
         combined = f"{v_proc.stdout}\n{v_proc.stderr}".strip()
@@ -3104,7 +3133,7 @@ class ForgeSupervisor:
             post_or_update_build_widget(build_id, db_path=self.db_path)
 
             prompt = format_chunk_prompt(build_id, chunk_idx, db_path=self.db_path, worktree_dir=str(wt_dir))
-            agy_cmd = [
+            agy_cmd = _build_low_priority_prefix() + [
                 "/usr/local/bin/agy",
                 f"--add-dir={wt_dir}",
                 f"-p={prompt}",
@@ -3685,6 +3714,7 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
                 stdout=lf,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                preexec_fn=_apply_low_priority if hasattr(os, "nice") else None,
             )
             meta["child_pid"] = child_proc.pid
             _write_job_meta(task_id, meta, db_path=db_path)

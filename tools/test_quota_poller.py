@@ -426,6 +426,22 @@ class TestQuotaPoller(unittest.TestCase):
         self.assertIn("$3.06 eq.", text)
         self.assertIn("$0.66 eq.", text)
 
+    @patch("tools.quota_poller.is_system_load_elevated", return_value=(True, 28.4))
+    @patch("tools.quota_poller.sample_quota")
+    def test_high_load_defers_poller_and_post_turn_sample(self, mock_sample, _mock_load):
+        from tools.quota_poller import run_quota_poller, throttled_post_turn_sample
+        import tools.quota_poller as qp
+
+        qp._LAST_SAMPLE_TS = 0.0
+        self.assertIsNone(throttled_post_turn_sample(min_interval=0.0))
+        mock_sample.assert_not_called()
+
+        ok, msg, data = run_quota_poller(test=False, quiet=False)
+        self.assertTrue(ok)
+        self.assertEqual(data.get("status"), "deferred_high_load")
+        self.assertIn("28.4", msg)
+        mock_sample.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
