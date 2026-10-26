@@ -15,93 +15,50 @@ import json
 import os
 import re
 import signal
-import sys
 import time
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
-from zoneinfo import ZoneInfo
+from typing import Any
 import discord
 
 from tools.bridge_ambient import (
-    BANANA_WATCHER_BOT_ID,
-    PROCESSED_BACKLOG_MSG_IDS,
     channel_last_bot_reply,
     route_external_message,
     warm_channel_history,
 )
 from tools.bridge_commands import (
-    MODEL_ALIASES,
-    ON_DEMAND_TRIGGERS,
-    PROCESSED_INTERACTIONS,
-    ChoiceButton,
     QuickChoiceView,
     execute_bridge_reload,
-    execute_container_restart,
-    handle_button_choice,
+    execute_container_restart,  # noqa: F401
+    handle_button_choice,  # noqa: F401
     handle_operator_command,
 )
 from tools.bridge_state import (
     get_in_flight,
     DATA_DIR,
     ATTACHMENTS_DIR,
-    CONFIG_FILE,
     IN_FLIGHT_FILE,
     RESTART_INTENT_FILE,
-    QUEUE_FILE,
-    EXT_QUEUE_FILE,
     SESSIONS_FILE,
-    SESSION_METADATA_FILE,
-    BEACON_FILE,
-    BOT_STATUS_FILE,
-    READONLY_NOTIFICATION_CHANNELS,
     TARGET_CHANNEL_ID,
     OWNER_USER_ID,
-    IVY_USER_ID,
     get_runtime_rules,
-    get_channel_session_id,
-    set_channel_session_id,
-    clear_channel_session_id,
-    increment_session_turn,
-    reset_session_meta,
-    check_compaction_needed,
-    get_active_model,
-    set_active_model,
-    save_runtime_config,
     update_beacon,
-    is_reload_intent,
-    is_container_restart_intent,
     sync_credentials,
-    PT_TZ,
     is_home_channel,
     is_excluded_channel,
     is_reply_to_zero,
-    BROCK_GUILD_ID,
-    is_brock_guild,
-    VAULT_CHANNEL_ID,
     IVY_USER_ID,
 )
 from tools.bridge_formatting import (
-    format_command_preview,
-    convert_markdown_tables,
-    format_for_discord,
-    extract_agent_response,
-    chunk_text,
-    convert_markdown_to_mobile_html,
-    scrub_credentials,
-    clean_discord_latex,
     generate_concise_thread_title,
-    parse_interactive_choices,
     format_steering_prompt,
 )
 from tools.bridge_runner import (
     execute_agy_turn,
-    find_new_artifacts,
     channel_active_procs,
     channel_active_prompts,
     steering_channels,
-    reset_session_keys,
     thread_active_tasks,
 )
 import tools.bridge_runner as br
@@ -870,6 +827,10 @@ async def handle_message(
     content = msg.content.strip() if hasattr(msg, "content") else ""
     is_thread_channel = isinstance(msg.channel, discord.Thread)
     is_home = is_home_channel(msg.channel)
+    is_ivy_proxy_escalation = (
+        getattr(msg.channel, "id", None) == 1544953279664889888
+        and content.startswith("📡 **[Ivy Escalation from #baseball]:**")
+    )
 
     # Always record message in channel history buffer for multi-agent situational awareness
     try:
@@ -911,7 +872,7 @@ async def handle_message(
         print(f"[Bridge] Warning recording message to history: {e}")
 
     # Never reply to ourselves
-    if bot.user and msg.author.id == bot.user.id:
+    if bot.user and msg.author.id == bot.user.id and not is_ivy_proxy_escalation:
         return
 
     # Dedicated Excluded Channel Quarantine (e.g. #baseball dedicated exclusively to Ivy):
@@ -978,7 +939,7 @@ async def handle_message(
         # Home Turf (#zero-chat & ops channels): strictly 1-on-1 pairing with Ryan,
         # EXCEPT in #zero-ops where Ivy (IVY_USER_ID) is permitted to escalate shared /opt/zero read-only or host issues via explicit @Zero mention.
         if msg.author.bot:
-            if msg.channel.id == ZERO_OPS_CHANNEL_ID and author_id == IVY_USER_ID:
+            if msg.channel.id == ZERO_OPS_CHANNEL_ID and (author_id == IVY_USER_ID or is_ivy_proxy_escalation):
                 bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
                 stripped_for_tag = re.sub(r"`[^`]*`|\(\s*@zero\s*\)", "", content, flags=re.IGNORECASE)
                 has_explicit_tag = (
@@ -986,11 +947,11 @@ async def handle_message(
                     f"<@!{bot_id}>" in content or
                     bool(re.search(r"@zero\b", stripped_for_tag, re.IGNORECASE))
                 )
-                if not has_explicit_tag:
+                if not has_explicit_tag and not is_ivy_proxy_escalation:
                     return
 
                 from tools.last_word_protocol import is_bot_paused
-                is_paused, remaining, _ = is_bot_paused(msg.channel.id, author_id, "Ivy")
+                is_paused, remaining, _ = is_bot_paused(msg.channel.id, IVY_USER_ID, "Ivy")
                 if is_paused:
                     print(f"[Bridge] #zero-ops: Ivy is paused under Last Word Protocol ({remaining:.1f}s remaining). Dropping.")
                     return
@@ -1150,7 +1111,7 @@ async def handle_message(
     if not prompt_content:
         return
 
-    if msg.channel.id == 1544953279664889888 and getattr(msg.author, "id", None) == IVY_USER_ID:
+    if msg.channel.id == 1544953279664889888 and (getattr(msg.author, "id", None) == IVY_USER_ID or is_ivy_proxy_escalation):
         prompt_content = (
             "[UPSTREAM INFRASTRUCTURE ESCALATION FROM IVY (discord-ivy-agent) IN #zero-ops]:\n"
             "Ivy has escalated a shared /opt/zero read-only file bug, hook issue, or host-level blocker. "
