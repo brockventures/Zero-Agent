@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -750,6 +751,44 @@ def is_opt_zero_symlink_tamper(cmd: str) -> bool:
     return False
 
 
+_DOCKER_CLI_SUBCOMMAND_RE = re.compile(
+    r'(?:^|[;&|]\s*|["\']\s*|\bsudo\s+|--command(?:=|\s+))docker\s+(?:exec|run|compose|ps|logs|restart|stop|start|inspect|build|cp|pull)\b'
+)
+
+
+def check_missing_docker_cli_guard(cmd: str) -> tuple[bool, str]:
+    """Block execution of docker CLI subcommands when docker is not installed inside this container."""
+    if not cmd:
+        return True, ""
+
+    cmd_clean = cmd.strip()
+    # Remote SSH commands execute docker on the remote host, not inside this container
+    if cmd_clean.startswith("ssh ") or re.match(r"^\s*ssh\b", cmd_clean):
+        return True, ""
+
+    is_docker = bool(_DOCKER_CLI_SUBCOMMAND_RE.search(cmd))
+    if not is_docker:
+        m_cmd = re.search(r'--command(?:=|\s+)(["\']?)(.*?)\1(?:\s+--|\s*$)', cmd)
+        if m_cmd:
+            inner_cmd = m_cmd.group(2).strip()
+            if _DOCKER_CLI_SUBCOMMAND_RE.search(inner_cmd) or re.search(
+                r"\bdocker\s+(?:exec|run|compose|ps|logs|restart|stop|start|inspect|build|cp|pull)\b",
+                inner_cmd,
+            ):
+                is_docker = True
+
+    if is_docker and shutil.which("docker") is None:
+        return False, (
+            "Container Environment Guard Triggered: The 'docker' CLI binary is not installed inside this container "
+            "(invoking 'docker' fails with exit code 127: 'docker: not found'). "
+            "Note: in discord-ivy-agent, 'predict_big.py --migrate-db' already executes 'calculate_dollar_values.R' "
+            "and updates PostgreSQL natively without needing 'docker exec big_board_pro'. "
+            "Remove the 'docker' subcommand before running or launching the job."
+        )
+
+    return True, ""
+
+
 def _check_inline_production_edit_gate(
     target_file: str,
     cwd: str,
@@ -920,6 +959,13 @@ def check_tool_use(
     # 1. run_command check
     if name == "run_command":
         cmd = args.get("CommandLine", "")
+
+        # A00-docker. Missing Container Docker CLI Guard
+        ok_dk, dk_reason = check_missing_docker_cli_guard(cmd)
+        if not ok_dk:
+            save_state(state, state_file)
+            return False, dk_reason
+
         is_forge_enqueue = bool(re.search(r"\bforge\.py\s+enqueue\b", cmd))
         is_forge_stage_decision = bool(re.search(r"\bforge\.py\s+stage-decision\b", cmd) and "forge_enqueue" in cmd)
         is_forge_job_start = bool(

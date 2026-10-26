@@ -1,8 +1,11 @@
 import unittest
+import unittest.mock
 import os
 import sys
 
-sys.path.insert(0, "/workspace/.agents/hooks")
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(_REPO_ROOT, ".agents", "hooks"))
+sys.path.insert(0, _REPO_ROOT)
 from batch_guard import check_batching, check_tool_use, STATE_FILE, load_state
 
 
@@ -13,8 +16,11 @@ class TestBatchGuard(unittest.TestCase):
             with open(STATE_FILE, "r") as f:
                 self._orig_state = f.read()
             os.remove(STATE_FILE)
+        self._docker_patcher = unittest.mock.patch("shutil.which", return_value="/usr/bin/docker")
+        self._docker_patcher.start()
 
     def tearDown(self):
+        self._docker_patcher.stop()
         if self._orig_state is not None:
             with open(STATE_FILE, "w") as f:
                 f.write(self._orig_state)
@@ -639,4 +645,65 @@ def test_invalid_forge_plan_does_not_lock_turn_and_outbox_allowed_after_enqueue(
         state_file=state_file,
     )
     assert ok_outbox is True, f"Expected outbox.py to be exempt from Post-Offload Turn Lock, got: {reason_outbox}"
+
+
+def test_missing_docker_cli_guard_blocks_docker_exec_when_binary_absent(tmp_path):
+    from unittest.mock import patch
+
+    state_file = str(tmp_path / "bg_state_docker.json")
+    direct_cmd = "docker exec big_board_pro Rscript calculate_dollar_values.R"
+    forge_cmd = (
+        'python3 /workspace/tools/forge.py job start --name "BIG Migration" '
+        '--command "predict_big.py --migrate-db && docker exec big_board_pro Rscript calculate_dollar_values.R"'
+    )
+
+    # 1. When docker CLI is absent (shutil.which('docker') is None):
+    with patch("shutil.which", return_value=None):
+        # Direct docker exec is blocked
+        ok1, reason1 = check_tool_use(
+            "run_command",
+            {"CommandLine": direct_cmd},
+            state_file=state_file,
+        )
+        assert ok1 is False
+        assert "Container Environment Guard Triggered" in reason1
+        st1 = load_state(state_file)
+        assert st1.get("offload_dispatched") is False
+
+        # forge.py job start containing docker exec is blocked without locking turn
+        ok2, reason2 = check_tool_use(
+            "run_command",
+            {"CommandLine": forge_cmd},
+            state_file=state_file,
+        )
+        assert ok2 is False
+        assert "Container Environment Guard Triggered" in reason2
+        st2 = load_state(state_file)
+        assert st2.get("offload_dispatched") is False
+
+        # Subsequent tool calls are not locked by Post-Offload Turn Lock
+        ok_next, reason_next = check_tool_use(
+            "edit_file",
+            {"Path": "/workspace/scratch/fix.py", "Target": "a", "Replacement": "b"},
+            state_file=state_file,
+        )
+        assert ok_next is True, f"Expected edit_file not to be locked after denied forge command, got: {reason_next}"
+
+    # 2. When docker CLI is present (shutil.which('docker') returns '/usr/bin/docker'):
+    state_file_allowed = str(tmp_path / "bg_state_docker_allowed.json")
+    with patch("shutil.which", return_value="/usr/bin/docker"):
+        ok_direct, reason_direct = check_tool_use(
+            "run_command",
+            {"CommandLine": direct_cmd},
+            state_file=state_file_allowed,
+        )
+        assert ok_direct is True, f"Expected direct docker command to be allowed when docker CLI exists, got: {reason_direct}"
+
+        state_file_allowed_forge = str(tmp_path / "bg_state_docker_allowed_forge.json")
+        ok_forge, reason_forge = check_tool_use(
+            "run_command",
+            {"CommandLine": forge_cmd},
+            state_file=state_file_allowed_forge,
+        )
+        assert ok_forge is True, f"Expected forge command to be allowed when docker CLI exists, got: {reason_forge}"
 
