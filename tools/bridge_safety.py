@@ -192,6 +192,11 @@ _MONOLOGUE_INDICATORS = (
     "deliver the response in a single inference pass",
     "let's write a punchy one-liner",
     "let's make it a lethal ",
+    "strict short-by-default rule",
+    "zero engineering telemetry",
+    "remember `#zero-chat`",
+    "remember #zero-chat",
+    "now we have the complete picture",
     "wait—rule ",
     "wait: rule ",
     "wait - rule ",
@@ -230,10 +235,10 @@ def strip_leaked_chain_of_thought(text: str) -> str:
     )
 
     if has_monologue_marker:
-        # 2a. Self-dispatch cue ("Let's send it!", "Let's post it!", "Let's ship it!") followed by the final reply
+        # 2a. Self-dispatch cue ("Let's send it!", "Let's deliver that cleanly!", "Let's ship it!") followed by the final reply
         dispatch_matches = list(
             re.finditer(
-                r"(?is)(?:let's\s+(?:send|post|deliver|emit|ship)\s+(?:it|this|that)|here\s+goes)\s*[!.:]*\s*",
+                r"(?is)(?:let's\s+(?:send|post|deliver|emit|ship)\s+(?:it|this|that|the\s+response|the\s+reply)(?:\s+[a-z0-9_\-]+){0,4}|here\s+goes)\s*[!.:]+\s*",
                 text,
             )
         )
