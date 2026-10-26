@@ -27,6 +27,7 @@ from tools.bridge_ambient import (
     warm_channel_history,
 )
 from tools.bridge_commands import (
+    ChoiceButton,  # noqa: F401
     QuickChoiceView,
     execute_bridge_reload,
     execute_container_restart,  # noqa: F401
