@@ -584,3 +584,59 @@ def test_no_synthesize_probe_does_not_trigger_post_offload_lock(tmp_path):
         state_file=state_file,
     )
     assert ok2 is True, f"Expected --no-synthesize probe not to lock turn, got: {reason2}"
+
+
+def test_invalid_forge_plan_does_not_lock_turn_and_outbox_allowed_after_enqueue(tmp_path):
+    import json
+    from tools.forge import validate_forge_plan
+
+    state_file = str(tmp_path / "bg_state_invalid.json")
+    bad_plan = tmp_path / "bad_plan.json"
+    bad_plan.write_text(json.dumps({"title": "Missing Chunks"}), encoding="utf-8")
+
+    # 1. Enqueue with invalid plan file on disk does not set offload_dispatched
+    ok1, _ = check_tool_use(
+        "run_command",
+        {"CommandLine": f"python3 /workspace/tools/forge.py enqueue {bad_plan}"},
+        state_file=state_file,
+    )
+    assert ok1 is True
+    ok_fix, reason_fix = check_tool_use(
+        "write_file",
+        {"Path": str(bad_plan), "Content": "{}"},
+        state_file=state_file,
+    )
+    assert ok_fix is True, f"Expected write_file after invalid plan not to be locked, got: {reason_fix}"
+
+    # 2. Plan with shared_context instead of context_fact_sheet passes validate_forge_plan
+    valid_plan = {
+        "title": "Shared Context Fallback Plan",
+        "origin_channel_id": 1548196929308065893,
+        "repo": "/workspace",
+        "shared_context": ["Invariant 1"],
+        "chunks": [
+            {
+                "title": "Chunk 1",
+                "target_files": ["tools/forge.py"],
+                "instructions": "Update forge.py validation logic and run unit tests.",
+            }
+        ],
+    }
+    is_valid, val_msg = validate_forge_plan(valid_plan)
+    assert is_valid is True, f"Expected shared_context fallback to validate, got: {val_msg}"
+
+    # 3. Once a valid enqueue sets offload_dispatched, outbox.py is still allowed
+    good_plan = tmp_path / "good_plan.json"
+    good_plan.write_text(json.dumps(valid_plan), encoding="utf-8")
+    check_tool_use(
+        "run_command",
+        {"CommandLine": f"python3 /workspace/tools/forge.py enqueue {good_plan}"},
+        state_file=state_file,
+    )
+    ok_outbox, reason_outbox = check_tool_use(
+        "run_command",
+        {"CommandLine": 'python3 /workspace/tools/outbox.py --channel zero-ops --message "test" --force && python3 /workspace/tools/outbox.py --flush'},
+        state_file=state_file,
+    )
+    assert ok_outbox is True, f"Expected outbox.py to be exempt from Post-Offload Turn Lock, got: {reason_outbox}"
+

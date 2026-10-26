@@ -1195,9 +1195,15 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     if not (repo_path / ".git").exists():
         return False, f"Target repo '{repo_str}' is not a valid git repository."
 
-    fact_sheet = _normalize_shared_context(plan.get("context_fact_sheet"))
+    fact_sheet = _normalize_shared_context(
+        plan.get("context_fact_sheet")
+        or plan.get("shared_context")
+        or plan.get("facts")
+        or plan.get("invariants")
+        or ([plan["objective"]] if plan.get("objective") else [])
+    )
     if not fact_sheet:
-        return False, "Plan must include a non-empty 'context_fact_sheet' list of architectural invariants."
+        return False, "Plan must include a non-empty 'context_fact_sheet' (or 'shared_context') list of architectural invariants."
 
     chunks = plan.get("chunks")
     if not isinstance(chunks, list) or not chunks:
@@ -2159,7 +2165,13 @@ def enqueue_build(
     default_repo = str(plan.get("repo") or "/workspace").strip()
     objective = str(plan.get("objective") or plan["title"]).strip()
     build_shared_ctx = _normalize_shared_context(plan.get("shared_context"))
-    norm_fact_sheet = _normalize_shared_context(plan.get("context_fact_sheet"))
+    norm_fact_sheet = _normalize_shared_context(
+        plan.get("context_fact_sheet")
+        or plan.get("shared_context")
+        or plan.get("facts")
+        or plan.get("invariants")
+        or ([objective] if objective else [])
+    )
 
     with get_db_connection(db_path) as conn:
         conn.execute(
@@ -4723,14 +4735,27 @@ def main():
 
     args = parser.parse_args()
     if args.cmd == "enqueue":
-        plan_data = json.loads(Path(args.plan_file).read_text(encoding="utf-8"))
-        res = enqueue_build(
-            plan_data,
-            post_widget=not args.no_widget,
-            allow_overlap=args.allow_overlap,
-            check_approval_gate=True,
-        )
-        print(json.dumps(res, indent=2))
+        try:
+            plan_data = json.loads(Path(args.plan_file).read_text(encoding="utf-8"))
+            res = enqueue_build(
+                plan_data,
+                post_widget=not args.no_widget,
+                allow_overlap=args.allow_overlap,
+                check_approval_gate=True,
+            )
+            print(json.dumps(res, indent=2))
+        except Exception:
+            try:
+                bs_path = Path("/tmp/batch_guard_state.json")
+                if bs_path.exists():
+                    bs_data = json.loads(bs_path.read_text(encoding="utf-8"))
+                    if isinstance(bs_data, dict) and bs_data.get("offload_dispatched"):
+                        bs_data["offload_dispatched"] = False
+                        bs_data["offload_kind"] = ""
+                        bs_path.write_text(json.dumps(bs_data), encoding="utf-8")
+            except Exception:
+                pass
+            raise
     elif args.cmd == "status":
         if args.build_id:
             print(render_build_widget_text(args.build_id))

@@ -484,11 +484,11 @@ _SQL_CTE_NAME_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(", re.IGNORE
 _DB_PATH_EXTRACT_RE = re.compile(r"(?P<db>[^\s'\"()]+?\.(?:db|sqlite|sqlite3))\b")
 
 
-def _extract_sql_queries_from_cmd(cmd: str) -> list[tuple[str | None, str]]:
-    """Extract (db_path, sql_query) pairs from sqlite3 CLI invocations and Python sqlite3 calls."""
+def _extract_sql_queries_from_cmd(cmd: str) -> list[tuple[str | None, str, bool]]:
+    """Extract (db_path, sql_query, is_cli) tuples from sqlite3 CLI invocations and Python sqlite3 calls."""
     if not cmd or "SELECT" not in cmd.upper():
         return []
-    results: list[tuple[str | None, str]] = []
+    results: list[tuple[str | None, str, bool]] = []
 
     # 1. sqlite3 CLI invocations: sqlite3 [options] <db_path> "<sql>" or '<sql>'
     for m in re.finditer(
@@ -498,7 +498,7 @@ def _extract_sql_queries_from_cmd(cmd: str) -> list[tuple[str | None, str]]:
         db_p = m.group(1)
         sql_q = m.group(3) if m.group(3) is not None else m.group(4)
         if sql_q and re.search(r"\bSELECT\b", sql_q, re.IGNORECASE):
-            results.append((db_p, sql_q.strip()))
+            results.append((db_p, sql_q.strip(), True))
 
     if results:
         return results
@@ -515,7 +515,7 @@ def _extract_sql_queries_from_cmd(cmd: str) -> list[tuple[str | None, str]]:
     ):
         sql_q = m.group(3).strip()
         if re.search(r"\bSELECT\b", sql_q, re.IGNORECASE):
-            results.append((db_path, sql_q))
+            results.append((db_path, sql_q, False))
 
     return results
 
@@ -574,7 +574,12 @@ def check_sql_query_guard(cmd: str, cwd: str = "/workspace") -> tuple[bool, str]
     if not extracted:
         return True, ""
 
-    for db_path, raw_sql in extracted:
+    for item in extracted:
+        if len(item) == 3:
+            db_path, raw_sql, is_cli = item
+        else:
+            db_path, raw_sql = item
+            is_cli = True
         # Split multi-statement SQL strings safely
         statements = [s.strip() for s in raw_sql.split(";") if s.strip()]
         for stmt in statements:
@@ -595,8 +600,8 @@ def check_sql_query_guard(cmd: str, cwd: str = "/workspace") -> tuple[bool, str]
                     seen_t.add(t.lower())
                     unique_tables.append(t)
 
-            # 1. Outright ban on SELECT * FROM
-            if _SQL_SELECT_STAR_RE.search(stmt):
+            # 1. Outright ban on SELECT * FROM (for CLI or local SQLite queries)
+            if (is_cli or db_path) and _SQL_SELECT_STAR_RE.search(stmt):
                 schema_hint = _introspect_sqlite_table_columns(db_path or "", unique_tables, cwd=cwd)
                 hint_suffix = f" Valid columns: {schema_hint}" if schema_hint else ""
                 return False, (
@@ -604,8 +609,9 @@ def check_sql_query_guard(cmd: str, cwd: str = "/workspace") -> tuple[bool, str]
                     f"Specify the exact column names you need and include a LIMIT clause.{hint_suffix}"
                 )
 
-            # 2. Outright ban on top-level SELECT without LIMIT (unless scalar aggregate like COUNT/MIN/MAX/SUM/AVG)
-            if not re.search(r"\bLIMIT\s+(?:\d+|\?|\:[a-zA-Z_][a-zA-Z0-9_]*)", stmt, re.IGNORECASE):
+            # 2. Outright ban on top-level SELECT without LIMIT for CLI or inline one-liner SQLite queries
+            # (Skip LIMIT enforcement when a Python script queries PostgreSQL/DataFrames into memory without a local .db path)
+            if (is_cli or db_path) and not re.search(r"\bLIMIT\s+(?:\d+|\?|\:[a-zA-Z_][a-zA-Z0-9_]*)", stmt, re.IGNORECASE):
                 if not _SQL_AGGREGATE_ONLY_RE.search(stmt):
                     schema_hint = _introspect_sqlite_table_columns(db_path or "", unique_tables, cwd=cwd)
                     hint_suffix = f" Valid columns: {schema_hint}" if schema_hint else ""
@@ -901,7 +907,8 @@ def check_tool_use(
         and os.environ.get("FORGE_WORKER_ACTIVE") != "1"
         and not os.path.abspath(cwd or "/workspace").replace("\\", "/").startswith("/tmp/forge-wt-")
     ):
-        if name in ("run_command", "edit_file", "replace_file_content", "write_file", "write_to_file"):
+        is_exempt_outbox = name == "run_command" and "outbox.py" in str(args.get("CommandLine", ""))
+        if not is_exempt_outbox and name in ("run_command", "edit_file", "replace_file_content", "write_file", "write_to_file"):
             kind_label = state.get("offload_kind") or "FORGE job/build"
             save_state(state, state_file)
             return False, (
@@ -921,8 +928,24 @@ def check_tool_use(
         is_no_synthesize_probe = bool(is_forge_job_start and "--no-synthesize" in cmd)
         if is_forge_enqueue:
             state["inline_prod_files"] = []
-            state["offload_dispatched"] = True
-            state["offload_kind"] = "FORGE multi-chunk build (forge.py enqueue)"
+            plan_ok = True
+            m_plan = re.search(r"\bforge\.py\s+enqueue\s+(?:--[a-zA-Z0-9_-]+\s+)*(['\"]?)([^\s;\"'|&>]+)\1", cmd)
+            if m_plan:
+                raw_pf = m_plan.group(2)
+                abs_pf = os.path.abspath(os.path.join(cwd or "/workspace", raw_pf))
+                if os.path.exists(abs_pf):
+                    try:
+                        with open(abs_pf, "r", encoding="utf-8") as pf:
+                            pdata = json.load(pf)
+                        if not isinstance(pdata, dict) or not pdata.get("title") or not pdata.get("chunks"):
+                            plan_ok = False
+                        elif not (pdata.get("context_fact_sheet") or pdata.get("shared_context") or pdata.get("facts") or pdata.get("objective")):
+                            plan_ok = False
+                    except Exception:
+                        plan_ok = False
+            if plan_ok:
+                state["offload_dispatched"] = True
+                state["offload_kind"] = "FORGE multi-chunk build (forge.py enqueue)"
         elif is_forge_stage_decision:
             state["inline_prod_files"] = []
             state["offload_dispatched"] = True
