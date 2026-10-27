@@ -68,11 +68,16 @@ from tools.vault_sync import decrypt_secrets_archive, encrypt_secrets_archive
 
 class TestForgeEngine(unittest.TestCase):
     def setUp(self):
+        self._saved_channel_id = os.environ.pop("DISCORD_CHANNEL_ID", None)
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp_dir.name) / "test_forge.db"
         init_forge_db(self.db_path)
 
     def tearDown(self):
+        if self._saved_channel_id is not None:
+            os.environ["DISCORD_CHANNEL_ID"] = self._saved_channel_id
+        else:
+            os.environ.pop("DISCORD_CHANNEL_ID", None)
         self.tmp_dir.cleanup()
 
     def test_01_validate_and_enqueue_forge_plan_v1_1_features(self):
@@ -1125,6 +1130,142 @@ class TestForgeEngine(unittest.TestCase):
         req_cal, reasons_cal = forge_mod.evaluate_plan_approval_gate(fast_plan, batch_state_path=bs_file)
         self.assertTrue(req_cal)
         self.assertTrue(any("Post-calibration" in r for r in reasons_cal))
+
+    def test_14_fifo_serialization_of_overlapping_builds_and_silent_hang_watchdog(self):
+        # 1. Verify maybe_spawn_next_build_worker holds overlapping builds in queued state (FIFO)
+        # while allowing disjoint builds to spawn in parallel, then spawns the overlapping build
+        # once the first build finishes.
+        plan_first = {
+            "title": "Standings Build 1 (Vegas Removal)",
+            "repo": "/workspace",
+            "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["First standings build"],
+            "chunks": [
+                {
+                    "title": "Update Standings Page",
+                    "target_files": ["tools/standings_page.py", "tools/predict_teams.py"],
+                    "instructions": "Remove Vegas benchmark tab and round totals.",
+                }
+            ],
+        }
+        plan_overlap = {
+            "title": "Standings Build 2 (Horizon Toggle)",
+            "repo": "/workspace",
+            "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["Second overlapping standings build"],
+            "chunks": [
+                {
+                    "title": "Add Horizon Dropdown",
+                    "target_files": ["tools/standings_page.py"],
+                    "instructions": "Add Preseason / Actual to Date / Rest of Season dropdown.",
+                }
+            ],
+        }
+        plan_disjoint = {
+            "title": "Unrelated Audio Build 3",
+            "repo": "/workspace",
+            "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["Disjoint build"],
+            "chunks": [
+                {
+                    "title": "Update Audio Module",
+                    "target_files": ["tools/audio_sink.py"],
+                    "instructions": "Update audio reconnect.",
+                }
+            ],
+        }
+
+        r1 = enqueue_build(plan_first, db_path=self.db_path, post_widget=False)
+        r2 = enqueue_build(plan_overlap, db_path=self.db_path, post_widget=False, allow_overlap=True)
+        r3 = enqueue_build(plan_disjoint, db_path=self.db_path, post_widget=False)
+
+        b1_id = r1["build_id"]
+        b2_id = r2["build_id"]
+        b3_id = r3["build_id"]
+
+        sup = forge_mod.ForgeSupervisor(db_path=self.db_path, max_parallel_builds=3, max_parallel_chunks=3)
+
+        def _fake_popen(*args, **kwargs):
+            mp = MagicMock()
+            mp.poll.return_value = None
+            return mp
+
+        with patch("subprocess.Popen", side_effect=_fake_popen), patch("builtins.open", unittest.mock.mock_open()):
+            spawned_1 = sup.maybe_spawn_next_build_worker()
+            # Second call must skip b2_id (overlaps b1_id on tools/standings_page.py) and spawn disjoint b3_id
+            spawned_2 = sup.maybe_spawn_next_build_worker()
+            # Third call must return None because b2_id is still blocked by active b1_id
+            spawned_3 = sup.maybe_spawn_next_build_worker()
+
+        self.assertEqual(spawned_1, b1_id)
+        self.assertEqual(spawned_2, b3_id)
+        self.assertIsNone(spawned_3)
+
+        # Now mark b1_id completed and remove its active worker proc -> b2_id becomes eligible and spawns
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            conn.execute("UPDATE forge_builds SET status = 'completed' WHERE id = ?", (b1_id,))
+        sup._active_build_procs.pop(b1_id, None)
+
+        with patch("subprocess.Popen", side_effect=_fake_popen), patch("builtins.open", unittest.mock.mock_open()):
+            spawned_after = sup.maybe_spawn_next_build_worker()
+        self.assertEqual(spawned_after, b2_id)
+
+        # 2. Verify non-blocking watchdog terminates silent stdout hangs inside execute_chunk_in_worktree
+        wt_repo = Path(self.tmp_dir.name) / "hang_repo"
+        wt_repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(wt_repo), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(wt_repo), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Zero"], cwd=str(wt_repo), check=True, capture_output=True)
+        (wt_repo / "mod.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(wt_repo), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(wt_repo), check=True, capture_output=True)
+
+        hang_plan = {
+            "title": "Silent Hang Watchdog Test",
+            "repo": str(wt_repo),
+            "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["Watchdog test"],
+            "chunks": [
+                {
+                    "title": "Hanging Chunk",
+                    "repo": str(wt_repo),
+                    "target_files": ["mod.py"],
+                    "instructions": "Simulate a silent DB lock hang with zero stdout.",
+                }
+            ],
+        }
+        rh = enqueue_build(hang_plan, db_path=self.db_path, post_widget=False)
+        hb_id = rh["build_id"]
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            h_chunk = conn.execute("SELECT * FROM forge_chunks WHERE build_id = ?", (hb_id,)).fetchone()
+
+        # Spawn a real silent sleeping subprocess in place of agy and set stall timeout to 0.25s
+        real_popen = subprocess.Popen
+
+        def _sleeping_agy_popen(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and any("agy" in str(x) for x in cmd):
+                return real_popen(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    *args,
+                    **kwargs,
+                )
+            return real_popen(cmd, *args, **kwargs)
+
+        with patch.object(forge_mod, "CHUNK_SILENT_STALL_TIMEOUT_SECONDS", 0.25), patch.object(
+            forge_mod, "post_or_update_build_widget", return_value=None
+        ), patch.object(forge_mod, "sync_forge_channel_header", return_value=False), patch.object(
+            forge_mod, "dispatch_build_failure_to_origin", return_value=True
+        ), patch("subprocess.Popen", side_effect=_sleeping_agy_popen):
+            t_start = time.time()
+            ok_hang = sup.execute_chunk_in_worktree(hb_id, h_chunk)
+            elapsed = time.time() - t_start
+
+        self.assertFalse(ok_hang)
+        self.assertLess(elapsed, 8.0)
+        with forge_mod.get_db_connection(self.db_path) as conn:
+            c_after = conn.execute("SELECT status, last_error FROM forge_chunks WHERE id = ?", (h_chunk["id"],)).fetchone()
+            self.assertEqual(c_after["status"], "failed")
+            self.assertIn("stalled silently", c_after["last_error"])
 
 
 def test_no_synthesize_short_failed_probe_suppressed_when_turn_in_flight(tmp_path, monkeypatch):

@@ -2460,19 +2460,36 @@ def verify_chunk_worktree(
 
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{wt}:{env.get('PYTHONPATH', '')}".strip(":")
-    v_proc = subprocess.run(
+    v_proc = subprocess.Popen(
         effective_cmd,
         shell=True,
         cwd=str(wt),
         env=env,
-        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=300,
+        start_new_session=True,
         preexec_fn=_apply_low_priority if hasattr(os, "nice") else None,
     )
-    if v_proc.returncode != 0:
-        combined = f"{v_proc.stdout}\n{v_proc.stderr}".strip()
-        return False, "", f"Verification command failed (exit {v_proc.returncode}):\n{combined[-1500:]}"
+    try:
+        v_stdout, v_stderr = v_proc.communicate(timeout=VERIFY_CMD_TIMEOUT_SECONDS)
+        v_ret = v_proc.returncode
+    except subprocess.TimeoutExpired:
+        _kill_process_group(v_proc)
+        try:
+            v_stdout, v_stderr = v_proc.communicate(timeout=5)
+        except Exception:
+            v_stdout, v_stderr = "", ""
+        combined = f"{v_stdout}\n{v_stderr}".strip()
+        return (
+            False,
+            "",
+            f"Verification command timed out after {int(VERIFY_CMD_TIMEOUT_SECONDS)}s:\n{combined[-1500:]}",
+        )
+    if v_ret != 0:
+        combined = f"{v_stdout}\n{v_stderr}".strip()
+        return False, "", f"Verification command failed (exit {v_ret}):\n{combined[-1500:]}"
 
     # 3. Run commit safety scanner if present
     safety_script = wt / "tools" / "validate_commit_safety.py"
@@ -2749,6 +2766,101 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
 
 MAX_PARALLEL_BUILDS_PER_AGENT = 3
 MAX_PARALLEL_CHUNKS_PER_BUILD = 3
+CHUNK_WORKER_TIMEOUT_SECONDS = 1200.0
+CHUNK_SILENT_STALL_TIMEOUT_SECONDS = 300.0
+VERIFY_CMD_TIMEOUT_SECONDS = 300.0
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Force-terminate a subprocess and its entire process group so orphaned grandchildren cannot hold pipes open."""
+    try:
+        if hasattr(os, "killpg") and proc.pid and proc.pid > 1:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
+def _resolve_latest_branch_ref(repo_dir: Path | str, default_branch: str) -> str:
+    """Resolve the newest starting ref between local `<default_branch>` and `origin/<default_branch>` after fetch."""
+    rp = Path(repo_dir)
+    subprocess.run(["git", "fetch", "origin", default_branch], cwd=str(rp), capture_output=True, timeout=30)
+    chk_origin = subprocess.run(
+        ["git", "rev-parse", "--verify", f"origin/{default_branch}"],
+        cwd=str(rp),
+        capture_output=True,
+    )
+    chk_local = subprocess.run(
+        ["git", "rev-parse", "--verify", default_branch],
+        cwd=str(rp),
+        capture_output=True,
+    )
+    has_origin = chk_origin.returncode == 0
+    has_local = chk_local.returncode == 0
+    if has_origin and has_local:
+        # If local default_branch contains origin/default_branch (i.e. local is equal or ahead), use local default_branch
+        anc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", f"origin/{default_branch}", default_branch],
+            cwd=str(rp),
+            capture_output=True,
+        )
+        if anc.returncode == 0:
+            return default_branch
+        return f"origin/{default_branch}"
+    if has_origin:
+        return f"origin/{default_branch}"
+    if has_local:
+        return default_branch
+    return "HEAD"
+
+
+def _get_build_target_pairs(
+    conn: sqlite3.Connection,
+    build_id: str,
+) -> set[tuple[str, str]]:
+    """Return the set of `(resolved_repo_path, normalized_target_file)` across all chunks of `build_id`."""
+    b_row = conn.execute("SELECT repo FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
+    default_repo = str(Path(str((b_row["repo"] if b_row else None) or "/workspace").strip()).resolve())
+    c_rows = conn.execute(
+        "SELECT repo, target_files_json FROM forge_chunks WHERE build_id = ?",
+        (build_id,),
+    ).fetchall()
+    pairs: set[tuple[str, str]] = set()
+    for r in c_rows:
+        ch_repo = str(Path(str(r["repo"] or default_repo).strip()).resolve())
+        for tf in _normalize_file_list(json.loads(r["target_files_json"] or "[]")):
+            norm_tf = str(tf).strip().lstrip("./")
+            if norm_tf:
+                pairs.add((ch_repo, norm_tf))
+    return pairs
+
+
+def _build_overlaps_earlier_builds(
+    cand_build_id: str,
+    earlier_build_ids: set[str] | list[str],
+    db_path: Path | str = FORGE_DB_PATH,
+) -> bool:
+    """Return True if `cand_build_id` shares any `(repo, target_file)` with any build in `earlier_build_ids`."""
+    other_ids = [str(bid) for bid in earlier_build_ids if str(bid) and str(bid) != str(cand_build_id)]
+    if not other_ids:
+        return False
+    with get_db_connection(db_path) as conn:
+        cand_pairs = _get_build_target_pairs(conn, cand_build_id)
+        if not cand_pairs:
+            return False
+        for obid in other_ids:
+            if cand_pairs & _get_build_target_pairs(conn, obid):
+                return True
+    return False
 
 
 def _acquire_repo_git_lock(repo_dir: Path | str):
@@ -2910,21 +3022,25 @@ class ForgeSupervisor:
         with get_db_connection(self.db_path) as conn:
             if in_ivy:
                 rows = conn.execute(
-                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND origin_channel_id = ? ORDER BY created_at ASC",
+                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND origin_channel_id = ? ORDER BY created_at ASC, rowid ASC",
                     (BASEBALL_CHANNEL_ID,),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND origin_channel_id != ? ORDER BY created_at ASC",
+                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND origin_channel_id != ? ORDER BY created_at ASC, rowid ASC",
                     (BASEBALL_CHANNEL_ID,),
                 ).fetchall()
 
         target_build_id: Optional[str] = None
+        earlier_incomplete_ids: set[str] = set(active_ids)
         for r in rows:
             cand_id = r["id"]
-            if cand_id in active_ids:
+            if cand_id in active_ids or _is_build_worker_lock_held(self._build_lock_path(cand_id)):
+                earlier_incomplete_ids.add(cand_id)
                 continue
-            if _is_build_worker_lock_held(self._build_lock_path(cand_id)):
+            if _build_overlaps_earlier_builds(cand_id, earlier_incomplete_ids, db_path=self.db_path):
+                # Hold overlapping follow-up build in queued state until earlier build finishes and merges
+                earlier_incomplete_ids.add(cand_id)
                 continue
             target_build_id = cand_id
             break
@@ -2977,9 +3093,7 @@ class ForgeSupervisor:
                     try:
                         def_br = _get_repo_default_branch(r_dir)
                         staging_ref = f"forge/release-{build_id}"
-                        subprocess.run(["git", "fetch", "origin", def_br], cwd=str(r_dir), capture_output=True, timeout=30)
-                        chk_ref = subprocess.run(["git", "rev-parse", "--verify", f"origin/{def_br}"], cwd=str(r_dir), capture_output=True)
-                        start_ref = f"origin/{def_br}" if chk_ref.returncode == 0 else "HEAD"
+                        start_ref = _resolve_latest_branch_ref(r_dir, def_br)
                         subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(r_dir), capture_output=True, timeout=10)
                     finally:
                         _release_file_lock(git_lk)
@@ -3055,6 +3169,11 @@ class ForgeSupervisor:
             return not failed_pipeline
         finally:
             _release_file_lock(lock_fh)
+            if _is_prod_forge_env(self.db_path):
+                try:
+                    self.maybe_spawn_next_build_worker()
+                except Exception:
+                    pass
 
     def execute_chunk_in_worktree(self, build_id: str, chunk_row: sqlite3.Row) -> bool:
         """Execute a single FORGE chunk inside an isolated git worktree with Maker-Checker verification."""
@@ -3091,9 +3210,7 @@ class ForgeSupervisor:
             try:
                 chk_stg = subprocess.run(["git", "rev-parse", "--verify", staging_ref], cwd=str(repo_dir), capture_output=True)
                 if chk_stg.returncode != 0:
-                    subprocess.run(["git", "fetch", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=30)
-                    chk_ref = subprocess.run(["git", "rev-parse", "--verify", f"origin/{default_branch}"], cwd=str(repo_dir), capture_output=True)
-                    start_ref = f"origin/{default_branch}" if chk_ref.returncode == 0 else "HEAD"
+                    start_ref = _resolve_latest_branch_ref(repo_dir, default_branch)
                     subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
 
                 shutil.rmtree(wt_dir, ignore_errors=True)
@@ -3157,33 +3274,68 @@ class ForgeSupervisor:
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
+                    start_new_session=True,
                 )
                 tail_lines: list[str] = []
                 step_cnt = 0
                 last_widget_patch = time.time()
                 start_ts = time.time()
-                if proc.stdout:
-                    for raw_line in proc.stdout:
-                        tail_lines.append(raw_line)
-                        if len(tail_lines) > 80:
-                            tail_lines.pop(0)
-                        status_str, step_cnt = extract_live_chunk_telemetry(raw_line, step_count=step_cnt)
-                        now_ts = time.time()
-                        if status_str and (now_ts - last_widget_patch >= 12.0 or step_cnt == 1):
-                            last_widget_patch = now_ts
-                            with self._state_lock, get_db_connection(self.db_path) as conn:
-                                conn.execute(
-                                    "UPDATE forge_chunks SET live_status = ? WHERE id = ?",
-                                    (status_str[:220], chunk_id),
-                                )
-                                conn.execute(
-                                    "UPDATE forge_builds SET updated_at = ? WHERE id = ?",
-                                    (now_ts, build_id),
-                                )
-                            post_or_update_build_widget(build_id, db_path=self.db_path)
-                        if (now_ts - start_ts) > 1200.0:
-                            proc.kill()
-                            raise TimeoutError("Chunk worker exceeded 1200s execution timeout")
+                last_activity_ts = [start_ts]
+                timed_out_reason: list[Optional[str]] = [None]
+                watchdog_stop = threading.Event()
+
+                def _chunk_watchdog() -> None:
+                    while not watchdog_stop.wait(0.15):
+                        if proc.poll() is not None:
+                            return
+                        now_w = time.time()
+                        if (now_w - start_ts) > CHUNK_WORKER_TIMEOUT_SECONDS:
+                            timed_out_reason[0] = (
+                                f"Chunk worker exceeded {int(CHUNK_WORKER_TIMEOUT_SECONDS)}s execution timeout"
+                            )
+                            _kill_process_group(proc)
+                            return
+                        if (now_w - last_activity_ts[0]) > CHUNK_SILENT_STALL_TIMEOUT_SECONDS:
+                            timed_out_reason[0] = (
+                                f"Chunk worker stalled silently with zero stdout output for "
+                                f"{int(CHUNK_SILENT_STALL_TIMEOUT_SECONDS)}s"
+                            )
+                            _kill_process_group(proc)
+                            return
+
+                wd_thread = threading.Thread(target=_chunk_watchdog, daemon=True)
+                wd_thread.start()
+                try:
+                    if proc.stdout:
+                        try:
+                            for raw_line in proc.stdout:
+                                now_ts = time.time()
+                                last_activity_ts[0] = now_ts
+                                tail_lines.append(raw_line)
+                                if len(tail_lines) > 80:
+                                    tail_lines.pop(0)
+                                status_str, step_cnt = extract_live_chunk_telemetry(raw_line, step_count=step_cnt)
+                                if status_str and (now_ts - last_widget_patch >= 12.0 or step_cnt == 1):
+                                    last_widget_patch = now_ts
+                                    with self._state_lock, get_db_connection(self.db_path) as conn:
+                                        conn.execute(
+                                            "UPDATE forge_chunks SET live_status = ? WHERE id = ?",
+                                            (status_str[:220], chunk_id),
+                                        )
+                                        conn.execute(
+                                            "UPDATE forge_builds SET updated_at = ? WHERE id = ?",
+                                            (now_ts, build_id),
+                                        )
+                                    post_or_update_build_widget(build_id, db_path=self.db_path)
+                        except (ValueError, OSError):
+                            if not timed_out_reason[0]:
+                                raise
+                finally:
+                    watchdog_stop.set()
+                    wd_thread.join(timeout=1.0)
+
+                if timed_out_reason[0]:
+                    raise TimeoutError(timed_out_reason[0])
                 ret_code = proc.wait(timeout=30)
                 if ret_code != 0:
                     err_msg = "".join(tail_lines).strip() or f"agy exited {ret_code}"
