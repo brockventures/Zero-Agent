@@ -116,13 +116,18 @@ SEEDING_SUBREDDITS = [
     "homelab",
 ]
 
-# Seeding rate limits & quality bar (max 2 posts/day, >=6h spacing, >=85.0 Flash LLM relevance score)
+# Seeding rate limits & quality bar (max 2 posts/day, >=6h spacing, >=85.0 Flash High LLM relevance score)
 SEEDING_MAX_POSTS_PER_DAY = 2
 SEEDING_MIN_POST_INTERVAL_SEC = 21600  # 6 hours
 SEEDING_SCAN_INTERVAL_SEC = 14400      # 4 hours
 SEEDING_MIN_SCORE = 85.0
+SEEDING_MIN_AGE_HOURS = 0.5            # >=30m seasoning window so AutoMod/mods filter spam first
 SEEDING_MAX_AGE_HOURS = 12.0
 SEEDING_MAX_COMMENTS = 50
+SEEDING_MIN_VELOCITY_SCORE = 3
+SEEDING_MIN_VELOCITY_COMMENTS = 3
+SEEDING_PIGGYBACK_MIN_COMMENTS = 15
+SEEDING_PIGGYBACK_MAX_CANDIDATES = 4
 
 
 def load_state() -> Dict[str, Any]:
@@ -437,28 +442,94 @@ def check_and_assign_daily_links(
 
 
 def is_eligible_seeding_metadata(post_data: Dict[str, Any], now_utc: Optional[float] = None) -> Tuple[bool, str]:
-    """Check pure structural Reddit API metadata (stickied, locked, NSFW, age, comment count) without keyword/regex heuristics."""
+    """Check structural Reddit API metadata, moderation state, minimum seasoning age, and proven traction."""
     now_ts = now_utc or time.time()
     if post_data.get("stickied") or post_data.get("locked") or post_data.get("over_18"):
         return False, "Stickied/Locked/NSFW"
+    if (
+        post_data.get("removed_by_category")
+        or post_data.get("removed")
+        or post_data.get("spam")
+        or post_data.get("banned_by")
+    ):
+        return False, "Removed/Auto-moderated"
+    selftext_clean = (post_data.get("selftext") or "").strip().lower()
+    if selftext_clean in ("[removed]", "[deleted]"):
+        return False, "Removed/Deleted selftext"
     title = (post_data.get("title") or "").strip()
     if len(title) < 15:
         return False, "Title too short"
     created_utc = float(post_data.get("created_utc") or 0)
     age_hours = (now_ts - created_utc) / 3600.0 if created_utc > 0 else 999.0
+    if age_hours < SEEDING_MIN_AGE_HOURS:
+        return False, f"Unseasoned brand-new post ({age_hours * 60:.0f}m old < {SEEDING_MIN_AGE_HOURS * 60:.0f}m floor)"
     if age_hours > SEEDING_MAX_AGE_HOURS:
         return False, f"Stale thread ({age_hours:.1f}h old)"
     num_comments = int(post_data.get("num_comments") or 0)
     if num_comments > SEEDING_MAX_COMMENTS:
         return False, f"Crowded ({num_comments} comments)"
+    ups = int(post_data.get("score") or post_data.get("ups") or 1)
+    is_rising = bool(post_data.get("is_rising"))
+    if not is_rising and ups < SEEDING_MIN_VELOCITY_SCORE and num_comments < SEEDING_MIN_VELOCITY_COMMENTS:
+        return False, f"No traction ({ups} pts, {num_comments} comments after {age_hours:.1f}h)"
+    if is_rising and ups < 2 and num_comments < 2:
+        return False, f"Zero-traction rising entry ({ups} pts, {num_comments} comments)"
     return True, "Eligible metadata"
+
+
+def compute_seeding_velocity_priority(post_data: Dict[str, Any], now_utc: Optional[float] = None) -> float:
+    """Compute velocity priority with a 1.0h denominator floor so brand-new posts never outrank proven threads."""
+    now_ts = now_utc or time.time()
+    created_utc = float(post_data.get("created_utc") or 0)
+    age_hours = max(1.0, (now_ts - created_utc) / 3600.0) if created_utc > 0 else 6.0
+    ups = max(1, int(post_data.get("score") or post_data.get("ups") or 1))
+    comments = int(post_data.get("num_comments") or 0)
+    rising_bonus = 15.0 if post_data.get("is_rising") else 0.0
+    return round(rising_bonus + ((ups + comments * 2.0) / age_hours), 2)
+
+
+def extract_top_comments_from_thread_json(thread_json: Any, limit: int = 2) -> List[Dict[str, Any]]:
+    """Extract the top N non-bot, non-stickied comments from a Reddit comments/{id}.json payload for piggybacking."""
+    if not isinstance(thread_json, list) or len(thread_json) < 2:
+        return []
+    listing = thread_json[1]
+    if not isinstance(listing, dict):
+        return []
+    children = listing.get("data", {}).get("children", [])
+    if not isinstance(children, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for child in children:
+        if not isinstance(child, dict) or child.get("kind") != "t1":
+            continue
+        d = child.get("data", {})
+        cname = d.get("name")
+        cauthor = (d.get("author") or "").strip()
+        cbody = (d.get("body") or "").strip()
+        if not cname or not cauthor or not cbody:
+            continue
+        if cauthor in ("[deleted]", "AutoModerator") or cauthor.lower() in KNOWN_PEER_ACCOUNTS:
+            continue
+        if d.get("stickied") or d.get("collapsed"):
+            continue
+        out.append(
+            {
+                "fullname": cname,
+                "author": cauthor,
+                "score": int(d.get("score") or d.get("ups") or 1),
+                "body": cbody[:380],
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
 
 
 def evaluate_seeding_candidates_llm(
     candidates: List[Dict[str, Any]],
     now_utc: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Use Gemini 3.8 Flash (Low) to semantically evaluate candidate threads and draft a grounded comment ONLY if genuinely about resident agents."""
+    """Use Gemini 3.8 Flash (High) to semantically evaluate rising candidate threads and draft a sharp, OP-focused comment."""
     now_ts = now_utc or time.time()
     eligible: List[Dict[str, Any]] = []
     for idx, c in enumerate(candidates[:20]):
@@ -467,6 +538,7 @@ def evaluate_seeding_candidates_llm(
             continue
         created_utc = float(c.get("created_utc") or 0)
         age_hours = round((now_ts - created_utc) / 3600.0, 1) if created_utc > 0 else 0.0
+        top_comments = c.get("top_comments") or []
         eligible.append(
             {
                 "index": idx,
@@ -476,7 +548,10 @@ def evaluate_seeding_candidates_llm(
                 "title": (c.get("title") or "").strip(),
                 "selftext": (c.get("selftext") or "").strip()[:500],
                 "age_hours": age_hours,
+                "upvotes": int(c.get("score") or c.get("ups") or 1),
                 "num_comments": int(c.get("num_comments") or 0),
+                "is_rising": bool(c.get("is_rising", False)),
+                "top_comments": top_comments[:2],
                 "url": c.get("url") or "",
             }
         )
@@ -486,33 +561,32 @@ def evaluate_seeding_candidates_llm(
 
     from tools.llm_sidecar import call_sidecar_llm_json, get_sidecar_model
 
-    model = get_sidecar_model("resident_agents_seeding", "gemini-3.8-flash-low")
+    model = get_sidecar_model("resident_agents_seeding", "gemini-3.8-flash-high")
     prompt = (
-        f"You are Ryan (u/prime416), a tech PM and homelab builder, using a semantic LLM evaluator ({model}) to review recent Reddit posts.\n"
-        f"Your task is to decide if ANY thread in the batch is a genuine, natural fit for a comment about running a persistent 'resident agent', and if so, pick the single best thread and draft the comment.\n\n"
+        f"You are Ryan (u/prime416), an opinionated engineer and homelab builder browsing Reddit on mobile, using {model} to spot high-signal threads.\n"
+        f"Decide if ANY thread in the batch is a natural fit for a sharp, engaging reply that casually uses the term 'resident agent', and if so, pick the single best thread and write the reply.\n\n"
         f"Candidate Reddit Threads (JSON):\n"
         f"{json.dumps(eligible, indent=2)}\n\n"
-        f"1. STRICT SEMANTIC RELEVANCE CRITERIA (score >= {SEEDING_MIN_SCORE} out of 100 required):\n"
-        f"   - APPROVE (score 85–100) ONLY if the thread is genuinely and centrally about: running persistent/always-on AI agents or autonomous daemons, long-term agent memory / context compaction / memory decay, scheduled agent cron jobs / background sidecars, or multi-agent state coordination.\n"
-        f"   - REJECT (set \"selected_index\": null) if the thread is about: workplace/enterprise IT (e.g. hosting apps built by non-dev colleagues), generic coding/vibe-coding questions, LLM benchmarks/model releases, hardware buying advice, memes, or general self-hosting unrelated to autonomous agents. NEVER force a connection where it doesn't naturally exist.\n"
-        f"   - Prefer fresh, rising threads (<3 hours old, <=15 comments) where a substantive technical comment will sit near the top.\n\n"
-        f"2. STRICT FACTUAL TRUTH (NEVER FABRICATE):\n"
-        f"   - Only state facts that are 100% true of Ryan's actual setup:\n"
-        f"     * You run a persistent resident agent (Zero) 24/7 in a Docker container on your home Synology NAS, bridged to Discord.\n"
-        f"     * Memory is split into recent verbatim turns plus markdown files indexed in local SQLite FTS5 (BM25 + vector hybrid search) with rolling session compaction.\n"
-        f"     * Recurring checks run as silent Python cron/sidecar scripts that only wake the LLM when an alert condition triggers, avoiding token burn.\n"
-        f"     * A few friends also run their own resident agents (Amos, Aerial, Marvin) and coordinate in a shared Discord server.\n"
-        f"   - NEVER invent fake workplace stories, fake metrics, or setups you do not actually run.\n\n"
-        f"3. COMMENT STYLE RULES (IF A THREAD QUALIFIES):\n"
-        f"   - Write 2 to 3 short, natural sentences in first-person ('I'). Open directly with a concrete production observation or gotcha that answers the OP's specific problem (NO generic 'Great post!' or 'This is super cool!' intros).\n"
-        f"   - Casually use the phrase 'resident agent' (or 'resident agents') ONCE as a normal noun.\n"
-        f"   - NEVER link to or mention 'r/ResidentAgents', NEVER use bullet points or bold markdown headers, and NEVER lecture.\n\n"
+        f"1. STRICT SEMANTIC RELEVANCE & VELOCITY CRITERIA (score >= {SEEDING_MIN_SCORE} out of 100 required):\n"
+        f"   - APPROVE (score 85–100) ONLY if the thread is genuinely a technical engineering discussion or question about: persistent/always-on AI agents or daemons, long-term agent memory / context compaction / memory decay, scheduled agent background tasks, or multi-agent coordination.\n"
+        f"   - REJECT (set \"selected_index\": null) if the thread is: self-promotional product/SaaS/starter-kit show-and-tell ('I built an AI team to run my company', 'in a box', landing-page/template pitches), workplace/enterprise IT, generic coding questions, LLM benchmarks/model releases, hardware buying advice, memes, or non-agent self-hosting.\n"
+        f"   - Favor threads with active momentum (`is_rising: true`, solid `upvotes` / `num_comments` velocity in the first 1–4 hours).\n\n"
+        f"2. TARGETING: TOP-LEVEL vs TOP-COMMENT PIGGYBACKING (`reply_to_fullname`):\n"
+        f"   - On young threads (<15 comments), reply directly to the OP's post (set `reply_to_fullname` to the thread's `fullname`, e.g. `t3_...`).\n"
+        f"   - On bustling threads (>=15 comments) where `top_comments` are provided, if one of the `top_comments` makes a great technical point related to persistent agents, memory, or token burn, piggyback on that top comment for 10x higher visibility (set `reply_to_fullname` to that comment's `fullname`, e.g. `t1_...`, and engage directly with that commenter's point).\n\n"
+        f"3. ANTI-MAD-LIBS & 80/20 ENGAGEMENT RULE (CRITICAL FOR UPVOTES):\n"
+        f"   - NEVER open with 'I run a persistent resident agent 24/7 in Docker on my home Synology NAS...' or recite a laundry list of your stack (Docker + NAS + SQLite FTS5 + Python sidecars). Unsolicited stack flexes look like bots and get 0 upvotes.\n"
+        f"   - Spend 80% of the comment engaging directly with a specific detail, metric, or tradeoff in the OP's post (or the top comment you are replying to).\n"
+        f"   - Drop AT MOST ONE concrete detail from your own experience (e.g. 'when I wired up my resident agent...', or 'had my resident agent eat 300k tokens doing X before...') as supporting texture.\n"
+        f"   - ALWAYS end with a specific, curious technical question about THEIR implementation or edge cases so they actually reply and upvote.\n"
+        f"   - Write 2 to 3 punchy, casual human sentences (like a dev typing on a phone—contractions, direct tone, zero AI symmetry or corporate polish). Casually use 'resident agent' (or 'resident agents') ONCE as a normal noun. NEVER mention 'r/ResidentAgents'.\n\n"
         f"Respond with valid JSON ONLY in this exact schema:\n"
         f"{{\n"
         f"  \"selected_index\": <int index from Candidate Reddit Threads, or null if none score >= {SEEDING_MIN_SCORE}>,\n"
+        f"  \"reply_to_fullname\": \"<t3_... or t1_... fullname to reply to, or empty string if rejected>\",\n"
         f"  \"score\": <float 0-100>,\n"
-        f"  \"rationale\": \"<1-sentence explanation of why this thread qualifies or why all were rejected>\",\n"
-        f"  \"comment_draft\": \"<2-3 sentence comment text, or empty string if rejected>\"\n"
+        f"  \"rationale\": \"<1-sentence explanation of why this thread/comment qualifies or why all were rejected>\",\n"
+        f"  \"comment_draft\": \"<2-3 sentence casual comment ending with a specific question for the author, or empty string if rejected>\"\n"
         f"}}"
     )
 
@@ -520,7 +594,7 @@ def evaluate_seeding_candidates_llm(
         job_key="resident_agents_seeding",
         prompt=prompt,
         model=model,
-        timeout=35,
+        timeout=45,
     )
     if not isinstance(res, dict):
         return None
@@ -529,11 +603,12 @@ def evaluate_seeding_candidates_llm(
     score = float(res.get("score") or 0.0)
     draft = str(res.get("comment_draft") or "").strip().strip('"')
     rationale = str(res.get("rationale") or "").strip()
+    raw_reply_to = str(res.get("reply_to_fullname") or "").strip()
 
     if sel_idx is None or score < SEEDING_MIN_SCORE or not draft:
         return None
 
-    if "resident agent" not in draft.lower() or "r/residentagents" in draft.lower() or len(draft.split()) < 12:
+    if "resident agent" not in draft.lower() or "r/residentagents" in draft.lower() or len(draft.split()) < 10:
         return None
 
     matched_cand = next((c for c in eligible if c["index"] == sel_idx), None)
@@ -542,15 +617,26 @@ def evaluate_seeding_candidates_llm(
     if not matched_cand:
         return None
 
+    valid_top_ids = {tc.get("fullname"): tc for tc in (matched_cand.get("top_comments") or []) if tc.get("fullname")}
+    if raw_reply_to and raw_reply_to in valid_top_ids:
+        reply_to_fullname = raw_reply_to
+        reply_target_comment = valid_top_ids[raw_reply_to]
+    else:
+        reply_to_fullname = matched_cand["fullname"]
+        reply_target_comment = None
+
     return {
         "candidate": {
             **matched_cand,
             "score": round(score, 1),
-            "reasons": [rationale] if rationale else ["Flash LLM semantic evaluation"],
+            "reply_to_fullname": reply_to_fullname,
+            "reply_target_comment": reply_target_comment,
+            "reasons": [rationale] if rationale else ["Flash High LLM semantic evaluation"],
         },
         "draft": draft,
         "score": round(score, 1),
         "rationale": rationale,
+        "reply_to_fullname": reply_to_fullname,
     }
 
 
@@ -580,10 +666,18 @@ def format_seeding_card(candidate: Dict[str, Any], draft: str, posted_url: Optio
     if len(snip) > 200:
         snip = snip[:197] + "..."
     quote_line = f"> {snip}\n" if snip else ""
+    reply_target = candidate.get("reply_target_comment")
+    target_line = ""
+    if isinstance(reply_target, dict) and reply_target.get("fullname"):
+        tc_snip = (reply_target.get("body") or "").strip().replace("\n", " ")
+        if len(tc_snip) > 140:
+            tc_snip = tc_snip[:137] + "..."
+        target_line = f"- **Target:** Top Comment `{reply_target['fullname']}` by `u/{reply_target.get('author', 'user')}` ({reply_target.get('score', 1)} pts): *{tc_snip}*\n"
     return (
         f"🌱 **Resident Agent Term Seeding — `r/{candidate['subreddit']}`** (Score: **{candidate['score']}**)\n"
         f"- **Thread:** [{candidate['title']}](<{candidate['url']}>) by `u/{candidate['author']}`\n"
         f"{quote_line}"
+        f"{target_line}"
         f"- **Status:** {status_badge}\n"
         f"- **Comment (`u/prime416`):**\n"
         f"> {draft}"
@@ -598,7 +692,8 @@ def format_daily_tip_prompt(slot: Dict[str, str], date_str: str) -> str:
         f"- **Target Thread:** [{MEGATHREAD_TITLE}](<{MEGATHREAD_URL}>) (`{MEGATHREAD_FULLNAME}`)\n"
         f"- **Action:** Post one concrete engineering recipe comment (`The Problem / Scar -> The Pattern / Fix -> Question`) "
         f"to the sticky megathread (distilled from [mcarmody/agent-playbook](<https://github.com/mcarmody/agent-playbook>) "
-        f"or a real production scar from your harness), **upvote the megathread (`{MEGATHREAD_FULLNAME}`)**, and drop your comment link here."
+        f"or a real production scar from your harness), **upvote the megathread (`{MEGATHREAD_FULLNAME}`)**, and drop your comment link here.\n"
+        f"- **OPSEC Guardrail (Fight Club Rule):** Never post about automating Reddit, feed scanners, term seeding, or using AI to post on Reddit—keep recipes strictly focused on agent infrastructure, memory, tooling, and runtime engineering."
     )
 
 
@@ -954,57 +1049,113 @@ def poll_and_remediate_via_pixel(
                         """async (subs) => {
                             const out = {};
                             for (const sub of subs) {
+                                out[sub] = {rising: null, new: null};
                                 try {
-                                    const r = await fetch(`https://old.reddit.com/r/${sub}/new.json?limit=25`, {credentials: 'include'});
-                                    if (r.ok) {
-                                        out[sub] = await r.json();
-                                    }
+                                    const [rRising, rNew] = await Promise.all([
+                                        fetch(`https://old.reddit.com/r/${sub}/rising.json?limit=15`, {credentials: 'include'}),
+                                        fetch(`https://old.reddit.com/r/${sub}/new.json?limit=25`, {credentials: 'include'}),
+                                    ]);
+                                    if (rRising && rRising.ok) out[sub].rising = await rRising.json();
+                                    if (rNew && rNew.ok) out[sub].new = await rNew.json();
                                 } catch (e) {}
                             }
                             return out;
                         }""",
                         SEEDING_SUBREDDITS,
                     )
-                    raw_candidates: List[Dict[str, Any]] = []
+                    candidates_by_fname: Dict[str, Dict[str, Any]] = {}
                     if isinstance(sub_payload, dict):
-                        for sub_name, sub_json in sub_payload.items():
-                            children = sub_json.get("data", {}).get("children", []) if isinstance(sub_json, dict) else []
-                            for child in children:
-                                if not isinstance(child, dict) or child.get("kind") != "t3":
-                                    continue
-                                d = child.get("data", {})
-                                fname = d.get("name")
-                                author_name = (d.get("author") or "").strip()
-                                if not fname or fname in seen_seeding_set:
-                                    continue
-                                if author_name.lower() in KNOWN_PEER_ACCOUNTS or author_name in ("[deleted]", "AutoModerator"):
-                                    seen_seeding_set.add(fname)
-                                    continue
-                                ok_meta, _ = is_eligible_seeding_metadata(d, now_utc=now_ts)
-                                if not ok_meta:
-                                    continue
-                                permalink = d.get("permalink") or f"/r/{sub_name}/comments/{d.get('id', '')}/"
-                                raw_candidates.append(
-                                    {
+                        for sub_name, sub_feeds in sub_payload.items():
+                            if not isinstance(sub_feeds, dict):
+                                continue
+                            for feed_key in ("rising", "new"):
+                                sub_json = sub_feeds.get(feed_key)
+                                is_rising_feed = feed_key == "rising"
+                                children = sub_json.get("data", {}).get("children", []) if isinstance(sub_json, dict) else []
+                                for child in children:
+                                    if not isinstance(child, dict) or child.get("kind") != "t3":
+                                        continue
+                                    d = child.get("data", {})
+                                    fname = d.get("name")
+                                    author_name = (d.get("author") or "").strip()
+                                    if not fname or fname in seen_seeding_set:
+                                        continue
+                                    if author_name.lower() in KNOWN_PEER_ACCOUNTS or author_name in ("[deleted]", "AutoModerator"):
+                                        seen_seeding_set.add(fname)
+                                        continue
+                                    if fname in candidates_by_fname:
+                                        if is_rising_feed:
+                                            candidates_by_fname[fname]["is_rising"] = True
+                                        continue
+                                    d_with_rising = {**d, "is_rising": is_rising_feed}
+                                    ok_meta, _ = is_eligible_seeding_metadata(d_with_rising, now_utc=now_ts)
+                                    if not ok_meta:
+                                        continue
+                                    permalink = d.get("permalink") or f"/r/{sub_name}/comments/{d.get('id', '')}/"
+                                    candidates_by_fname[fname] = {
                                         "fullname": fname,
                                         "name": fname,
+                                        "id": d.get("id") or fname.replace("t3_", ""),
                                         "subreddit": d.get("subreddit") or sub_name,
                                         "author": author_name,
                                         "title": d.get("title") or "",
                                         "selftext": d.get("selftext") or "",
                                         "created_utc": d.get("created_utc") or 0,
-                                        "num_comments": d.get("num_comments") or 0,
+                                        "score": int(d.get("score") or d.get("ups") or 1),
+                                        "ups": int(d.get("ups") or d.get("score") or 1),
+                                        "num_comments": int(d.get("num_comments") or 0),
+                                        "is_rising": is_rising_feed,
                                         "stickied": d.get("stickied", False),
                                         "locked": d.get("locked", False),
                                         "over_18": d.get("over_18", False),
+                                        "removed_by_category": d.get("removed_by_category"),
+                                        "removed": d.get("removed", False),
+                                        "spam": d.get("spam", False),
+                                        "banned_by": d.get("banned_by"),
+                                        "permalink": permalink,
                                         "url": f"https://www.reddit.com{permalink}",
                                     }
-                                )
 
+                    raw_candidates = list(candidates_by_fname.values())
                     if raw_candidates:
-                        # Sort freshest first so the Flash LLM evaluator sees the newest rising discussions
-                        raw_candidates.sort(key=lambda x: float(x.get("created_utc") or 0), reverse=True)
+                        # Sort by velocity priority so rising/active discussions lead over flat /new posts
+                        raw_candidates.sort(
+                            key=lambda x: (
+                                compute_seeding_velocity_priority(x, now_utc=now_ts),
+                                float(x.get("created_utc") or 0),
+                            ),
+                            reverse=True,
+                        )
                         evaluated_batch = raw_candidates[:20]
+
+                        # Pre-fetch top comments for bustling threads (>=15 comments) to enable top-comment piggybacking
+                        piggyback_targets = [
+                            {"fullname": c["fullname"], "permalink": c["permalink"]}
+                            for c in evaluated_batch
+                            if int(c.get("num_comments") or 0) >= SEEDING_PIGGYBACK_MIN_COMMENTS and c.get("permalink")
+                        ][:SEEDING_PIGGYBACK_MAX_CANDIDATES]
+                        if piggyback_targets:
+                            top_com_payload = page.evaluate(
+                                """async (targets) => {
+                                    const out = {};
+                                    for (const t of targets) {
+                                        try {
+                                            const r = await fetch(`https://old.reddit.com${t.permalink}.json?sort=top&limit=6`, {credentials: 'include'});
+                                            if (r.ok) {
+                                                out[t.fullname] = await r.json();
+                                            }
+                                        } catch (e) {}
+                                    }
+                                    return out;
+                                }""",
+                                piggyback_targets,
+                            )
+                            if isinstance(top_com_payload, dict):
+                                for c in evaluated_batch:
+                                    t_json = top_com_payload.get(c["fullname"])
+                                    if t_json:
+                                        c["top_comments"] = extract_top_comments_from_thread_json(t_json, limit=2)
+
                         eval_res = evaluate_seeding_candidates_llm(evaluated_batch, now_utc=now_ts)
                         if not eval_res:
                             # Mark evaluated batch seen so rejected threads aren't re-evaluated every cycle
@@ -1013,21 +1164,35 @@ def poll_and_remediate_via_pixel(
                         else:
                             best_cand = eval_res["candidate"]
                             draft_text = eval_res["draft"]
+                            reply_thing_id = eval_res.get("reply_to_fullname") or best_cand["fullname"]
                             posted_url = None
+                            aborted_removed = False
                             if auto_post_seeding and not dry_run and uh:
                                 post_res = page.evaluate(
-                                    """async ({uh, thing_id, text}) => {
+                                    """async ({uh, thread_id, reply_thing_id, text}) => {
                                         try {
-                                            const voteParams = new URLSearchParams({uh, id: thing_id, dir: '1'});
-                                            await fetch('https://old.reddit.com/api/vote', {
-                                                method: 'POST',
-                                                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                                                body: voteParams.toString(),
-                                                credentials: 'include'
-                                            });
+                                            const checkRes = await fetch(`https://old.reddit.com/by_id/${thread_id}.json`, {credentials: 'include'});
+                                            if (checkRes && checkRes.ok) {
+                                                const checkJson = await checkRes.json();
+                                                const postData = checkJson?.data?.children?.[0]?.data || {};
+                                                const selftext = String(postData.selftext || '').trim().toLowerCase();
+                                                if (postData.removed_by_category || postData.removed || postData.spam || postData.banned_by || postData.locked || selftext === '[removed]' || selftext === '[deleted]') {
+                                                    return {aborted_removed: true};
+                                                }
+                                            }
+                                            const voteIds = reply_thing_id !== thread_id ? [thread_id, reply_thing_id] : [thread_id];
+                                            for (const vid of voteIds) {
+                                                const voteParams = new URLSearchParams({uh, id: vid, dir: '1'});
+                                                await fetch('https://old.reddit.com/api/vote', {
+                                                    method: 'POST',
+                                                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                                                    body: voteParams.toString(),
+                                                    credentials: 'include'
+                                                });
+                                            }
                                             const commentParams = new URLSearchParams({
                                                 uh,
-                                                thing_id,
+                                                thing_id: reply_thing_id,
                                                 text,
                                                 api_type: 'json'
                                             });
@@ -1042,29 +1207,40 @@ def poll_and_remediate_via_pixel(
                                             return {error: String(e)};
                                         }
                                     }""",
-                                    {"uh": uh, "thing_id": best_cand["fullname"], "text": draft_text},
+                                    {
+                                        "uh": uh,
+                                        "thread_id": best_cand["fullname"],
+                                        "reply_thing_id": reply_thing_id,
+                                        "text": draft_text,
+                                    },
                                 )
-                                errors = (
-                                    post_res.get("json", {}).get("errors", [])
-                                    if isinstance(post_res, dict)
-                                    else [["error"]]
-                                )
-                                if isinstance(post_res, dict) and not errors and not post_res.get("error"):
-                                    posted_url = best_cand["url"]
+                                if isinstance(post_res, dict) and post_res.get("aborted_removed"):
+                                    aborted_removed = True
                                     seen_seeding_set.add(best_cand["fullname"])
-                                    state["last_seeding_post_ts"] = int(now_ts)
-                                    seeding_posts_by_date[today_str] = today_seeding_count + 1
-                                    state["seeding_posts_by_date"] = seeding_posts_by_date
+                                else:
+                                    errors = (
+                                        post_res.get("json", {}).get("errors", [])
+                                        if isinstance(post_res, dict)
+                                        else [["error"]]
+                                    )
+                                    if isinstance(post_res, dict) and not errors and not post_res.get("error"):
+                                        posted_url = best_cand["url"]
+                                        seen_seeding_set.add(best_cand["fullname"])
+                                        state["last_seeding_post_ts"] = int(now_ts)
+                                        seeding_posts_by_date[today_str] = today_seeding_count + 1
+                                        state["seeding_posts_by_date"] = seeding_posts_by_date
                             elif dry_run:
                                 seen_seeding_set.add(best_cand["fullname"])
 
-                            seeding_card = format_seeding_card(best_cand, draft_text, posted_url=posted_url)
-                            seeding_result = {
-                                "candidate": best_cand,
-                                "draft": draft_text,
-                                "posted_url": posted_url,
-                                "card": seeding_card,
-                            }
+                            if not aborted_removed:
+                                seeding_card = format_seeding_card(best_cand, draft_text, posted_url=posted_url)
+                                seeding_result = {
+                                    "candidate": best_cand,
+                                    "draft": draft_text,
+                                    "reply_to_fullname": reply_thing_id,
+                                    "posted_url": posted_url,
+                                    "card": seeding_card,
+                                }
             finally:
                 browser.close()
 
