@@ -26,6 +26,25 @@ ZHA_RELOAD_TIMEOUT_SECONDS = 35
 ZHA_RADIO_RESET_SETTLE_SECONDS = 6.0
 ZHA_SOCKET_RELEASE_SETTLE_SECONDS = 0.5
 
+ZWAVE_JS_DEFAULT_ENTRY_ID = "01M37PHFHNTF4C9D4R108R95N3"
+ZWAVE_RELOAD_TIMEOUT_SECONDS = 35
+ZWAVE_RADIO_RESET_SETTLE_SECONDS = 8.0
+ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS = 38.0
+ZWAVE_SOCKET_RELEASE_SETTLE_SECONDS = 0.5
+ZWAVE_BLIND_ENTITIES = ("cover.living_room_blinds_1", "cover.living_room_blinds_2")
+ZWAVE_FATAL_LOG_SIGNATURES = (
+    "ZW0103",
+    "The controller is not yet ready",
+    "The driver is not ready or has been destroyed",
+    "Failed to initialize the driver",
+    "Serial port closed unexpectedly",
+)
+ZWAVE_READY_LOG_SIGNATURES = (
+    "Z-Wave JS initialized",
+    "all queues idle",
+    "Controller status: Ready",
+)
+
 # Devices that routinely enter setup_retry when powered off at the wall
 BENIGN_STANDBY_DOMAINS = {"octoprint", "android_ip_webcam", "androidtv_remote"}
 
@@ -292,6 +311,234 @@ def _auto_heal_zha_entry(base_url: str, token: str, entry_id: str) -> bool:
     return False
 
 
+def _zwave_logs_indicate_wedged_driver(log_output: str) -> bool:
+    """Return True if fatal Z-Wave JS driver signatures appear after the last ready event."""
+    if not log_output:
+        return False
+    last_ready_idx = -1
+    last_fatal_idx = -1
+    for idx, line in enumerate(log_output.splitlines()):
+        if any(sig in line for sig in ZWAVE_READY_LOG_SIGNATURES):
+            last_ready_idx = idx
+        if any(sig in line for sig in ZWAVE_FATAL_LOG_SIGNATURES):
+            last_fatal_idx = idx
+    return last_fatal_idx > last_ready_idx
+
+
+def _check_zwave_js_logs_wedged() -> bool:
+    """Check recent zwave-js-ui logs on Host 1 for unrecovered fatal driver errors."""
+    try:
+        from tools import nas_config
+    except ImportError:
+        try:
+            import nas_config  # type: ignore
+        except ImportError:
+            return False
+
+    rc, out, err = nas_config.run_ssh(
+        nas_config.HOST_1_IP,
+        "sudo /usr/local/bin/docker logs --tail 250 zwave-js-ui 2>&1",
+        timeout=15,
+    )
+    combined = f"{out or ''}\n{err or ''}".strip()
+    if rc != 0 and not combined:
+        return False
+    return _zwave_logs_indicate_wedged_driver(combined)
+
+
+def _get_tubeszb_zw_ip(states: list[dict] | None = None) -> str:
+    """Resolve TubesZB Z-Wave coordinator IP from HA states, env, or fallback."""
+    if states:
+        for s in states:
+            if isinstance(s, dict) and s.get("entity_id") == "sensor.tubeszb_2026_zw_esp_ip_address":
+                val = str(s.get("state") or "").strip()
+                if val and val.lower() not in ("unavailable", "unknown", "none"):
+                    return val
+    zw_ip = os.environ.get("TUBESZB_ZW_IP")
+    if not zw_ip and os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json") as ef:
+                ed = json.load(ef)
+                zw_ip = ed.get("TUBESZB_ZW_IP")
+        except Exception:
+            pass
+    return zw_ip or "127.0.0.1"
+
+
+def _reconcile_living_room_blinds(
+    base_url: str,
+    token: str,
+    states: list[dict] | None = None,
+    now_pt: datetime | None = None,
+) -> list[str]:
+    """Re-apply missed open/close schedules for living room blinds after Z-Wave JS recovery."""
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    effective_states = list(states) if states else []
+
+    if effective_states and any(
+        isinstance(s, dict)
+        and s.get("entity_id") in ZWAVE_BLIND_ENTITIES
+        and s.get("state") in ("unavailable", "unknown")
+        for s in effective_states
+    ):
+        try:
+            st_req = urllib.request.Request(f"{base_url}/api/states", headers=headers)
+            with urllib.request.urlopen(st_req, timeout=10) as st_resp:
+                if st_resp.status == 200:
+                    refreshed = json.loads(st_resp.read().decode())
+                    if isinstance(refreshed, list):
+                        effective_states = refreshed
+        except (Exception, AssertionError):
+            pass
+
+    if not effective_states:
+        return []
+
+    blind_state_map = {
+        s.get("entity_id"): s.get("state")
+        for s in effective_states
+        if isinstance(s, dict) and s.get("entity_id") in ZWAVE_BLIND_ENTITIES
+    }
+    if not blind_state_map:
+        return []
+
+    current_pt = now_pt or datetime.now(PT)
+    minutes = current_pt.hour * 60 + current_pt.minute
+    is_close_window = minutes >= (18 * 60) or minutes <= (6 * 60 + 30)
+    open_start = (7 * 60 + 5) if current_pt.weekday() < 5 else (8 * 60 + 5)
+    is_open_window = open_start <= minutes <= (16 * 60)
+
+    service: str | None = None
+    targets: list[str] = []
+    if is_close_window:
+        targets = [eid for eid in ZWAVE_BLIND_ENTITIES if blind_state_map.get(eid) == "open"]
+        service = "close_cover"
+    elif is_open_window:
+        targets = [eid for eid in ZWAVE_BLIND_ENTITIES if blind_state_map.get(eid) == "closed"]
+        service = "open_cover"
+
+    if not service or not targets:
+        return []
+
+    payload_entity: str | list[str] = targets[0] if len(targets) == 1 else targets
+    try:
+        cov_req = urllib.request.Request(
+            f"{base_url}/api/services/cover/{service}",
+            data=json.dumps({"entity_id": payload_entity}).encode(),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(cov_req, timeout=10) as cov_resp:
+            if cov_resp.status == 200:
+                print(
+                    f"[HAReauthWatchdog] 🔄 Reconciled living room blinds via cover/{service}: {targets}",
+                    file=sys.stderr,
+                )
+                return targets
+    except Exception as cov_ex:
+        print(f"[HAReauthWatchdog] Note: Blind reconciliation skipped: {cov_ex}", file=sys.stderr)
+    return []
+
+
+def _auto_heal_zwave_js(
+    base_url: str,
+    token: str,
+    entry_id: str,
+    states: list[dict] | None = None,
+) -> bool:
+    """Attempt to recover a wedged Z-Wave JS / TubesZB setup and reconcile living room blinds.
+
+    1. Resolves the TubesZB Z-Wave coordinator IP from `states`, `TUBESZB_ZW_IP`, or `127.0.0.1`
+       and probes TCP port 6053. If unreachable, pulses `button.tubeszb_2026_zw_restart_the_device`
+       and waits `ZWAVE_RADIO_RESET_SETTLE_SECONDS` (8.0s).
+    2. Restarts `zwave-js-ui` on Host 1 via Docker Compose, waits
+       `ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS` (38.0s for its 30s entrypoint sleep),
+       reloads the HA `zwave_js` config entry, and verifies `state == 'loaded'`.
+    3. Reconciles `cover.living_room_blinds_1` and `cover.living_room_blinds_2` if they missed
+       their scheduled close/open window while the bridge was wedged.
+    """
+    try:
+        from tools import nas_config
+    except ImportError:
+        try:
+            import nas_config  # type: ignore
+        except ImportError:
+            return False
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    zw_ip = _get_tubeszb_zw_ip(states)
+    try:
+        reachable = False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(2.0)
+                if sock.connect_ex((zw_ip, 6053)) == 0:
+                    reachable = True
+            time.sleep(ZWAVE_SOCKET_RELEASE_SETTLE_SECONDS)
+        except Exception:
+            reachable = False
+
+        if not reachable:
+            try:
+                btn_req = urllib.request.Request(
+                    f"{base_url}/api/services/button/press",
+                    data=json.dumps({"entity_id": "button.tubeszb_2026_zw_restart_the_device"}).encode(),
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib.request.urlopen(btn_req, timeout=10) as btn_resp:
+                    if btn_resp.status == 200:
+                        print(
+                            "[HAReauthWatchdog] 🔄 Pulsed button.tubeszb_2026_zw_restart_the_device (port 6053 unreachable).",
+                            file=sys.stderr,
+                        )
+                        time.sleep(ZWAVE_RADIO_RESET_SETTLE_SECONDS)
+            except Exception as btn_ex:
+                print(f"[HAReauthWatchdog] Note: TubesZB restart button press skipped: {btn_ex}", file=sys.stderr)
+
+        restart_cmd = (
+            f"cd {nas_config.DOCKER_ROOT}/homeassistant && "
+            "sudo /usr/local/bin/docker compose restart zwave-js-ui"
+        )
+        rc, _, err = nas_config.run_ssh(nas_config.HOST_1_IP, restart_cmd, timeout=45)
+        if rc != 0:
+            print(
+                f"[HAReauthWatchdog] Failed to restart zwave-js-ui on Host 1 (rc={rc}): {err}",
+                file=sys.stderr,
+            )
+            return False
+        time.sleep(ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS)
+
+        reload_url = f"{base_url}/api/config/config_entries/entry/{entry_id}/reload"
+        rel_req = urllib.request.Request(
+            reload_url,
+            data=b"{}",
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(rel_req, timeout=ZWAVE_RELOAD_TIMEOUT_SECONDS) as rel_resp:
+            if rel_resp.status != 200:
+                return False
+
+        verify_req = urllib.request.Request(
+            f"{base_url}/api/config/config_entries/entry",
+            headers=headers,
+        )
+        with urllib.request.urlopen(verify_req, timeout=10) as verify_resp:
+            entries = json.loads(verify_resp.read().decode())
+            for item in entries:
+                if item.get("entry_id") == entry_id and item.get("state") == "loaded":
+                    print(
+                        f"[HAReauthWatchdog] 🔄 Auto-healed Z-Wave JS config entry {entry_id} (verified state=loaded).",
+                        file=sys.stderr,
+                    )
+                    _reconcile_living_room_blinds(base_url, token, states=states)
+                    return True
+    except Exception as ex:
+        print(f"[HAReauthWatchdog] Z-Wave JS auto-heal error: {ex}", file=sys.stderr)
+    return False
+
+
 def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
     base_url, token = _get_ha_config()
     if not token:
@@ -311,6 +558,9 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
     except Exception as e:
         return False, f"⚠️ Error querying HA config entries: {e}", []
 
+    zwave_entry_id = ZWAVE_JS_DEFAULT_ENTRY_ID
+    zwave_healed = False
+
     for e in entries:
         st = e.get("state")
         domain = e.get("domain", "")
@@ -318,6 +568,9 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
         entry_id = e.get("entry_id", "")
         reason = e.get("reason") or ""
         disabled = bool(e.get("disabled_by"))
+
+        if domain == "zwave_js" and entry_id:
+            zwave_entry_id = entry_id
 
         if disabled or st in ("loaded", "not_loaded", "setup_in_progress"):
             continue
@@ -329,6 +582,12 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
         # Auto-heal ZHA if coordinator is back online
         if domain == "zha" and st in ("setup_retry", "setup_error"):
             if _auto_heal_zha_entry(base_url, token, entry_id):
+                continue
+
+        # Auto-heal Z-Wave JS if config entry is in setup_retry or setup_error
+        if domain == "zwave_js" and st in ("setup_retry", "setup_error"):
+            if _auto_heal_zwave_js(base_url, token, entry_id):
+                zwave_healed = True
                 continue
 
         is_reauth = "reauth" in str(reason).lower() or "authentication" in str(reason).lower() or st == "setup_error"
@@ -344,13 +603,26 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
             "key": unique_key
         })
 
-    # 2. Check Persistent Notifications & Matter-over-Thread Dead Subscriptions
+    # 2. Check Persistent Notifications, Matter-over-Thread & Z-Wave JS Blinds
     try:
         url = f"{base_url}/api/states"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             states = json.loads(resp.read().decode())
         _auto_heal_matter_thread_nodes(states)
+        if not zwave_healed:
+            blinds_unavailable = any(
+                isinstance(s, dict)
+                and s.get("entity_id") in ZWAVE_BLIND_ENTITIES
+                and s.get("state") in ("unavailable", "unknown")
+                for s in states
+            )
+            has_blinds = any(
+                isinstance(s, dict) and s.get("entity_id") in ZWAVE_BLIND_ENTITIES
+                for s in states
+            )
+            if blinds_unavailable or (has_blinds and _check_zwave_js_logs_wedged()):
+                _auto_heal_zwave_js(base_url, token, zwave_entry_id, states=states)
         for s in states:
             eid = s.get("entity_id", "")
             if eid.startswith("persistent_notification."):

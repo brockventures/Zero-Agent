@@ -1,13 +1,21 @@
 """Unit tests for Home Assistant Re-Auth & Generalized Matter-over-Thread Self-Healing Watchdog."""
 
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 from tools.ha_reauth_watchdog import (
+    PT,
     ZHA_RELOAD_TIMEOUT_SECONDS,
+    ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS,
+    ZWAVE_JS_DEFAULT_ENTRY_ID,
+    ZWAVE_RADIO_RESET_SETTLE_SECONDS,
+    ZWAVE_RELOAD_TIMEOUT_SECONDS,
     _auto_heal_matter_thread_nodes,
     _auto_heal_zha_entry,
+    _auto_heal_zwave_js,
     _find_stale_matter_thread_services,
     _parse_active_srp_matter_services,
+    _zwave_logs_indicate_wedged_driver,
 )
 
 SAMPLE_SRP_OUTPUT = """\
@@ -161,3 +169,107 @@ def test_auto_heal_zha_entry_returns_false_when_still_setup_retry():
         patch("tools.ha_reauth_watchdog.time.sleep"),
     ):
         assert _auto_heal_zha_entry("http://198.51.100.10:8123", "test_token", "zha_entry_1") is False
+
+
+def test_zwave_logs_indicate_wedged_driver():
+    unrecovered = (
+        "2026-10-26 10:00:00 INFO Z-Wave: Controller status: Ready\n"
+        "2026-10-26 18:10:00 ERROR Z-Wave: The driver is not ready or has been destroyed (ZW0103)\n"
+    )
+    assert _zwave_logs_indicate_wedged_driver(unrecovered) is True
+
+    recovered = (
+        "2026-10-26 18:10:00 ERROR Z-Wave: Serial port closed unexpectedly\n"
+        "2026-10-26 18:11:00 INFO Z-Wave: Z-Wave JS initialized\n"
+    )
+    assert _zwave_logs_indicate_wedged_driver(recovered) is False
+
+
+def test_auto_heal_zwave_js_resets_unreachable_radio_restarts_container_and_closes_blinds():
+    events: list[str] = []
+    sleeps: list[float] = []
+
+    class FakeSocket:
+        def __enter__(self):
+            events.append("socket_enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("socket_closed")
+
+        def settimeout(self, t):
+            pass
+
+        def connect_ex(self, addr):
+            events.append(f"connect_ex:{addr[0]}:{addr[1]}")
+            return 111  # Unreachable -> triggers button.tubeszb_2026_zw_restart_the_device
+
+    def fake_urlopen(req, timeout=10):
+        url = req.full_url
+        if url.endswith("/api/services/button/press"):
+            body = req.data.decode()
+            events.append(f"button_press:{body}")
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith(f"/api/config/config_entries/entry/{ZWAVE_JS_DEFAULT_ENTRY_ID}/reload"):
+            events.append(f"reload:timeout={timeout}")
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith("/api/config/config_entries/entry"):
+            events.append("verify_entries")
+            resp = MagicMock()
+            resp.status = 200
+            resp.read.return_value = (
+                f'[{{"entry_id": "{ZWAVE_JS_DEFAULT_ENTRY_ID}", "state": "loaded"}}]'
+            ).encode()
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith("/api/services/cover/close_cover"):
+            body = req.data.decode()
+            events.append(f"close_cover:{body}")
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    sample_states = [
+        {"entity_id": "sensor.tubeszb_2026_zw_esp_ip_address", "state": "198.51.100.50"},
+        {"entity_id": "cover.living_room_blinds_1", "state": "open"},
+        {"entity_id": "cover.living_room_blinds_2", "state": "open"},
+    ]
+
+    evening_pt = datetime(2026, 10, 26, 19, 30, tzinfo=PT)
+    with (
+        patch("tools.nas_config.run_ssh", return_value=(0, "Restarted", "")) as mock_ssh,
+        patch("tools.ha_reauth_watchdog.socket.socket", return_value=FakeSocket()),
+        patch("tools.ha_reauth_watchdog.urllib.request.urlopen", side_effect=fake_urlopen),
+        patch("tools.ha_reauth_watchdog.time.sleep", side_effect=lambda s: sleeps.append(s)),
+        patch("tools.ha_reauth_watchdog.datetime") as mock_dt,
+    ):
+        mock_dt.now.return_value = evening_pt
+        ok = _auto_heal_zwave_js(
+            "http://198.51.100.10:8123",
+            "test_token",
+            ZWAVE_JS_DEFAULT_ENTRY_ID,
+            states=sample_states,
+        )
+        assert ok is True
+        assert mock_ssh.call_count == 1
+        assert "docker compose restart zwave-js-ui" in mock_ssh.call_args[0][1]
+        assert ZWAVE_RADIO_RESET_SETTLE_SECONDS in sleeps
+        assert ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS in sleeps
+        assert events == [
+            "socket_enter",
+            "connect_ex:198.51.100.50:6053",
+            "socket_closed",
+            'button_press:{"entity_id": "button.tubeszb_2026_zw_restart_the_device"}',
+            f"reload:timeout={ZWAVE_RELOAD_TIMEOUT_SECONDS}",
+            "verify_entries",
+            'close_cover:{"entity_id": ["cover.living_room_blinds_1", "cover.living_room_blinds_2"]}',
+        ]
+
