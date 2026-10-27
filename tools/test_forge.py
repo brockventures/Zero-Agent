@@ -1448,5 +1448,149 @@ def test_no_synthesize_redirected_log_captured_in_run_log(tmp_path, monkeypatch)
     assert "CUSTOM_REDIRECTED_LINE_FORGE_PROBE" in log_p.read_text(encoding="utf-8")
 
 
+def test_absolute_vs_relative_target_files_overlap_detection(tmp_path):
+    import tools.forge as forge
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+
+    # Verify _normalize_repo_target_file collapses absolute, repo-prefixed, and relative paths
+    repo = "/baseball/big-projections"
+    assert forge._normalize_repo_target_file(repo, "/baseball/big-projections/build_public_standings_page.py") == "build_public_standings_page.py"
+    assert forge._normalize_repo_target_file(repo, "baseball/big-projections/build_public_standings_page.py") == "build_public_standings_page.py"
+    assert forge._normalize_repo_target_file(repo, "./build_public_standings_page.py") == "build_public_standings_page.py"
+    assert forge._normalize_repo_target_file(repo, "build_public_standings_page.py") == "build_public_standings_page.py"
+
+    fake_repo = tmp_path / "baseball" / "big-projections"
+    (fake_repo / ".git").mkdir(parents=True, exist_ok=True)
+    repo_str = str(fake_repo)
+
+    plan_a = {
+        "title": "Build A (Absolute Target Path)",
+        "repo": repo_str,
+        "origin_channel_id": forge.BASEBALL_CHANNEL_ID,
+        "context_fact_sheet": ["Test overlap normalization."],
+        "chunks": [
+            {
+                "title": "Chunk A",
+                "target_files": [f"{repo_str}/build_public_standings_page.py"],
+                "instructions": "Update standings page A with full unit test coverage.",
+                "verification_cmd": "pytest",
+            }
+        ],
+    }
+    res_a = forge.enqueue_build(plan_a, db_path=db_p, post_widget=False)
+    assert res_a["ok"]
+
+    plan_b = {
+        "title": "Build B (Relative Target Path)",
+        "repo": repo_str,
+        "origin_channel_id": forge.BASEBALL_CHANNEL_ID,
+        "context_fact_sheet": ["Test overlap normalization."],
+        "chunks": [
+            {
+                "title": "Chunk B",
+                "target_files": ["build_public_standings_page.py"],
+                "instructions": "Update standings page B with full unit test coverage.",
+                "verification_cmd": "pytest",
+            }
+        ],
+    }
+    overlaps = forge.check_target_file_overlap(plan_b, db_path=db_p)
+    assert len(overlaps) == 1
+    assert overlaps[0]["file"] == "build_public_standings_page.py"
+    assert overlaps[0]["build_id"] == res_a["build_id"]
+
+    # Enqueue with allow_overlap=True and verify _build_overlaps_earlier_builds also catches it
+    res_b = forge.enqueue_build(plan_b, db_path=db_p, post_widget=False, allow_overlap=True)
+    assert forge._build_overlaps_earlier_builds(res_b["build_id"], [res_a["build_id"]], db_path=db_p) is True
+
+
+def test_execute_chunk_in_worktree_conflict_with_advanced_main_aborts_cleanly(tmp_path, monkeypatch):
+    import subprocess
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    monkeypatch.setattr(forge, "FORGE_DB_PATH", db_p)
+    monkeypatch.setattr(forge, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "sync_forge_channel_header", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "dispatch_build_completion_to_origin", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "dispatch_build_failure_to_origin", lambda *a, **kw: None)
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Ivy"], cwd=str(repo_dir), check=True, capture_output=True)
+    target_f = repo_dir / "standings.py"
+    target_f.write_text("LINE = 'initial'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+
+    plan = {
+        "title": "Test Conflict Handling",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge.BASEBALL_CHANNEL_ID,
+        "context_fact_sheet": ["Test conflict handling."],
+        "chunks": [
+            {
+                "title": "Modify standings.py",
+                "target_files": ["standings.py"],
+                "instructions": "Update LINE constant in standings.py and verify import.",
+                "verification_cmd": "python3 -c 'import standings'",
+            }
+        ],
+    }
+    res = forge.enqueue_build(plan, db_path=db_p, post_widget=False)
+    build_id = res["build_id"]
+
+    # FakePopen simulates Vulcan editing standings.py inside wt_dir while main in repo_dir advances with a conflicting commit on attempt 1,
+    # then resolving cleanly on attempt 2 once wt_dir is recreated on top of latest main.
+    attempt_counter = [0]
+
+    class FakePopen:
+        def __init__(self, cmd, cwd=None, **kwargs):
+            self.cwd = Path(cwd)
+            attempt_counter[0] += 1
+            if attempt_counter[0] == 1:
+                # Advance main in repo_dir concurrently with a conflicting line change
+                (repo_dir / "standings.py").write_text("LINE = 'main_advanced'\n", encoding="utf-8")
+                subprocess.run(["git", "add", "-A"], cwd=str(repo_dir), check=True, capture_output=True)
+                subprocess.run(["git", "commit", "-m", "concurrent main advance"], cwd=str(repo_dir), check=True, capture_output=True)
+                # Vulcan writes its change on top of old base
+                (self.cwd / "standings.py").write_text("LINE = 'chunk_attempt_1'\n", encoding="utf-8")
+            else:
+                # On attempt 2, wt_dir was recreated on top of latest main ('main_advanced')
+                assert (self.cwd / "standings.py").read_text(encoding="utf-8") == "LINE = 'main_advanced'\n"
+                (self.cwd / "standings.py").write_text("LINE = 'chunk_attempt_2_resolved'\n", encoding="utf-8")
+            self.stdout = iter([])
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    real_popen = subprocess.Popen
+
+    def side_effect_popen(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and any("/usr/local/bin/agy" in str(x) for x in cmd):
+            return FakePopen(cmd, *args, **kwargs)
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", side_effect_popen)
+
+    sup = forge.ForgeSupervisor(db_path=db_p)
+    with forge.get_db_connection(db_p) as conn:
+        chunk_row = conn.execute("SELECT * FROM forge_chunks WHERE build_id = ?", (build_id,)).fetchone()
+
+    ok = sup.execute_chunk_in_worktree(build_id, chunk_row)
+    assert ok is True
+    assert attempt_counter[0] == 2
+    assert (repo_dir / "standings.py").read_text(encoding="utf-8") == "LINE = 'chunk_attempt_2_resolved'\n"
+    st = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo_dir), capture_output=True, text=True).stdout.strip()
+    assert st == ""
+
+
 if __name__ == "__main__":
     unittest.main()

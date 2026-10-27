@@ -1157,6 +1157,28 @@ def _normalize_shared_context(raw: Any) -> list[str]:
     return out
 
 
+def _normalize_repo_target_file(repo_dir: Path | str, tf: Any) -> str:
+    """Normalize a target file path relative to `repo_dir` so relative and absolute notations always collide."""
+    raw = str(tf or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    repo_norm = os.path.normpath(str(Path(str(repo_dir or "/workspace").strip()).resolve())).replace("\\", "/")
+    repo_rel = repo_norm.lstrip("/")
+    if raw.startswith("/"):
+        cand_norm = os.path.normpath(raw).replace("\\", "/")
+        if cand_norm == repo_norm:
+            return ""
+        if cand_norm.startswith(f"{repo_norm}/"):
+            return cand_norm[len(repo_norm) + 1 :]
+        return cand_norm.lstrip("/")
+    rel = os.path.normpath(raw).replace("\\", "/").lstrip("./")
+    if rel == ".":
+        return ""
+    if repo_rel and rel.startswith(f"{repo_rel}/"):
+        rel = rel[len(repo_rel) + 1 :]
+    return rel
+
+
 def check_target_file_overlap(
     plan: dict,
     db_path: Path | str = FORGE_DB_PATH,
@@ -1167,7 +1189,7 @@ def check_target_file_overlap(
     for ch in plan.get("chunks", []):
         ch_repo = str(Path(str(ch.get("repo") or default_repo).strip()).resolve())
         for tf in _normalize_file_list(ch.get("target_files", [])):
-            norm_tf = str(tf).strip().lstrip("./")
+            norm_tf = _normalize_repo_target_file(ch_repo, tf)
             if norm_tf:
                 planned_pairs.add((ch_repo, norm_tf))
 
@@ -1192,8 +1214,8 @@ def check_target_file_overlap(
         active_repo = str(Path(str(r["chunk_repo"] or r["build_repo"] or "/workspace").strip()).resolve())
         t_files = json.loads(r["target_files_json"] or "[]")
         for tf in t_files:
-            norm_tf = str(tf).strip().lstrip("./")
-            if (active_repo, norm_tf) in planned_pairs:
+            norm_tf = _normalize_repo_target_file(active_repo, tf)
+            if norm_tf and (active_repo, norm_tf) in planned_pairs:
                 overlaps.append({
                     "repo": active_repo,
                     "file": norm_tf,
@@ -2230,10 +2252,18 @@ def enqueue_build(
         for idx, ch in enumerate(plan["chunks"]):
             chunk_id = f"{build_id}-c{idx}"
             ch_repo = str(ch.get("repo") or default_repo).strip()
-            t_files = _normalize_file_list(ch.get("target_files", []))
+            t_files = [
+                nf
+                for nf in (_normalize_repo_target_file(ch_repo, f) for f in _normalize_file_list(ch.get("target_files", [])))
+                if nf
+            ]
             t_symbols = _normalize_target_symbols(ch.get("target_symbols"))
             ch_shared_ctx = _normalize_shared_context(ch.get("shared_context"))
-            p_files = _normalize_file_list(ch.get("prohibited_files", []))
+            p_files = [
+                nf
+                for nf in (_normalize_repo_target_file(ch_repo, f) for f in _normalize_file_list(ch.get("prohibited_files", [])))
+                if nf
+            ]
             v_cmd = str(ch.get("verification_cmd") or "").strip()
             raw_deps = ch.get("depends_on") or []
             norm_deps = [int(d) for d in raw_deps if str(d).isdigit() and 0 <= int(d) < len(plan["chunks"])] if isinstance(raw_deps, (list, tuple, set)) else []
@@ -2838,7 +2868,7 @@ def _get_build_target_pairs(
     for r in c_rows:
         ch_repo = str(Path(str(r["repo"] or default_repo).strip()).resolve())
         for tf in _normalize_file_list(json.loads(r["target_files_json"] or "[]")):
-            norm_tf = str(tf).strip().lstrip("./")
+            norm_tf = _normalize_repo_target_file(ch_repo, tf)
             if norm_tf:
                 pairs.add((ch_repo, norm_tf))
     return pairs
@@ -2919,27 +2949,39 @@ def _chunks_are_eligible_in_parallel(
     if not explicit_deps.issubset(merged_indices):
         return False
 
-    cand_repo = str(cand_chunk["repo"] or "").strip()
-    cand_files = {str(f).strip().lstrip("./") for f in json.loads(cand_chunk["target_files_json"] or "[]") if str(f).strip()}
+    cand_repo = str(Path(str(cand_chunk["repo"] or "/workspace").strip()).resolve())
+    cand_files = {
+        nf
+        for nf in (_normalize_repo_target_file(cand_repo, f) for f in json.loads(cand_chunk["target_files_json"] or "[]"))
+        if nf
+    }
 
     # Implicit dependency: if an earlier unmerged chunk touches any of the same files in the same repo, wait for it
     for c in all_chunks:
         c_idx = int(c["chunk_index"])
         if c_idx >= cand_idx or c["status"] == "merged":
             continue
-        c_repo = str(c["repo"] or "").strip()
+        c_repo = str(Path(str(c["repo"] or "/workspace").strip()).resolve())
         if c_repo != cand_repo:
             continue
-        c_files = {str(f).strip().lstrip("./") for f in json.loads(c["target_files_json"] or "[]") if str(f).strip()}
+        c_files = {
+            nf
+            for nf in (_normalize_repo_target_file(c_repo, f) for f in json.loads(c["target_files_json"] or "[]"))
+            if nf
+        }
         if cand_files & c_files:
             return False
 
     # Also ensure zero overlap with any currently running chunk in this build
     for rc in running_chunks:
-        rc_repo = str(rc["repo"] or "").strip()
+        rc_repo = str(Path(str(rc["repo"] or "/workspace").strip()).resolve())
         if rc_repo != cand_repo:
             continue
-        rc_files = {str(f).strip().lstrip("./") for f in json.loads(rc["target_files_json"] or "[]") if str(f).strip()}
+        rc_files = {
+            nf
+            for nf in (_normalize_repo_target_file(rc_repo, f) for f in json.loads(rc["target_files_json"] or "[]"))
+            if nf
+        }
         if cand_files & rc_files:
             return False
 
@@ -3208,10 +3250,19 @@ class ForgeSupervisor:
                 return
             git_lk = _acquire_repo_git_lock(repo_dir)
             try:
+                latest_def_ref = _resolve_latest_branch_ref(repo_dir, default_branch)
                 chk_stg = subprocess.run(["git", "rev-parse", "--verify", staging_ref], cwd=str(repo_dir), capture_output=True)
                 if chk_stg.returncode != 0:
-                    start_ref = _resolve_latest_branch_ref(repo_dir, default_branch)
-                    subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
+                    subprocess.run(["git", "branch", "-f", staging_ref, latest_def_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
+                else:
+                    stg_is_anc = subprocess.run(
+                        ["git", "merge-base", "--is-ancestor", staging_ref, latest_def_ref],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    if stg_is_anc.returncode == 0:
+                        subprocess.run(["git", "branch", "-f", staging_ref, latest_def_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
 
                 shutil.rmtree(wt_dir, ignore_errors=True)
                 subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
@@ -3230,6 +3281,22 @@ class ForgeSupervisor:
                         text=True,
                         timeout=30,
                     )
+                def_is_anc = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", latest_def_ref, branch_name],
+                    cwd=str(repo_dir),
+                    capture_output=True,
+                    timeout=10,
+                )
+                if def_is_anc.returncode != 0 and wt_dir.exists():
+                    rb_init = subprocess.run(
+                        ["git", "rebase", latest_def_ref],
+                        cwd=str(wt_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    if rb_init.returncode != 0:
+                        subprocess.run(["git", "rebase", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
             finally:
                 _release_file_lock(git_lk)
 
@@ -3414,10 +3481,38 @@ class ForgeSupervisor:
                         )
                         if rb_proc.returncode != 0:
                             subprocess.run(["git", "rebase", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
+                            shutil.rmtree(wt_dir, ignore_errors=True)
+                            subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
                             with self._state_lock, get_db_connection(self.db_path) as conn:
                                 conn.execute(
                                     "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
                                     (f"git rebase onto {base_ref} failed:\n{rb_proc.stdout}\n{rb_proc.stderr}"[-1400:], chunk_id),
+                                )
+                            continue
+
+                    # Also ensure the chunk worktree is rebased onto the latest default_branch if default_branch advanced in repo_dir
+                    anc_def = subprocess.run(
+                        ["git", "merge-base", "--is-ancestor", default_branch, branch_name],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    if anc_def.returncode != 0:
+                        rb_def = subprocess.run(
+                            ["git", "rebase", default_branch],
+                            cwd=str(wt_dir),
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        if rb_def.returncode != 0:
+                            subprocess.run(["git", "rebase", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
+                            shutil.rmtree(wt_dir, ignore_errors=True)
+                            subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
+                            with self._state_lock, get_db_connection(self.db_path) as conn:
+                                conn.execute(
+                                    "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
+                                    (f"git rebase onto {default_branch} failed:\n{rb_def.stdout}\n{rb_def.stderr}"[-1400:], chunk_id),
                                 )
                             continue
 
@@ -3427,6 +3522,76 @@ class ForgeSupervisor:
                         capture_output=True,
                         timeout=10,
                     )
+
+                    with self._state_lock, get_db_connection(self.db_path) as conn:
+                        other_unmerged = conn.execute(
+                            "SELECT COUNT(*) AS cnt FROM forge_chunks WHERE build_id = ? AND id != ? AND status != 'merged'",
+                            (build_id, chunk_id),
+                        ).fetchone()["cnt"]
+
+                    # If final chunk completed and not touching core bridge, sync staging branch into local default branch
+                    # BEFORE marking the chunk/build completed so a merge/cherry-pick conflict never leaves repo_dir dirty or drops commits
+                    if other_unmerged == 0 and not build["touches_core_bridge"]:
+                        for abort_cmd in (
+                            ["git", "cherry-pick", "--abort"],
+                            ["git", "merge", "--abort"],
+                            ["git", "rebase", "--abort"],
+                        ):
+                            subprocess.run(abort_cmd, cwd=str(repo_dir), capture_output=True, timeout=10)
+
+                        sync_err = ""
+                        try:
+                            anc_main = subprocess.run(
+                                ["git", "merge-base", "--is-ancestor", default_branch, base_ref],
+                                cwd=str(repo_dir),
+                                capture_output=True,
+                                timeout=10,
+                            )
+                            if anc_main.returncode == 0:
+                                ff_proc = subprocess.run(
+                                    ["git", "merge", "--ff-only", base_ref],
+                                    cwd=str(repo_dir),
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=20,
+                                )
+                                if ff_proc.returncode != 0:
+                                    cp_proc = subprocess.run(
+                                        ["git", "cherry-pick", f"{default_branch}..{base_ref}"],
+                                        cwd=str(repo_dir),
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=30,
+                                    )
+                                    if cp_proc.returncode != 0:
+                                        subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(repo_dir), capture_output=True, timeout=10)
+                                        sync_err = f"git merge --ff-only and cherry-pick failed:\n{ff_proc.stdout}\n{ff_proc.stderr}\n{cp_proc.stdout}\n{cp_proc.stderr}".strip()
+                            else:
+                                cp_proc = subprocess.run(
+                                    ["git", "cherry-pick", f"{default_branch}..{base_ref}"],
+                                    cwd=str(repo_dir),
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=30,
+                                )
+                                if cp_proc.returncode != 0:
+                                    subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(repo_dir), capture_output=True, timeout=10)
+                                    sync_err = f"git cherry-pick {default_branch}..{base_ref} failed:\n{cp_proc.stdout}\n{cp_proc.stderr}".strip()
+                        except Exception as e:
+                            subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(repo_dir), capture_output=True, timeout=10)
+                            sync_err = f"git merge/cherry-pick {base_ref} failed/timed out: {e}"
+
+                        if sync_err:
+                            print(f"[FORGE] Warning: {sync_err}", file=sys.stderr)
+                            shutil.rmtree(wt_dir, ignore_errors=True)
+                            subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
+                            with self._state_lock, get_db_connection(self.db_path) as conn:
+                                conn.execute(
+                                    "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
+                                    (sync_err[-1400:], chunk_id),
+                                )
+                            continue
+
                     shutil.rmtree(wt_dir, ignore_errors=True)
                     subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
 
@@ -3445,21 +3610,7 @@ class ForgeSupervisor:
                                 (time.time(), build_id),
                             )
 
-                    # If final chunk completed and not touching core bridge, sync staging branch into local default branch
                     if remaining == 0 and not build["touches_core_bridge"]:
-                        try:
-                            anc_main = subprocess.run(
-                                ["git", "merge-base", "--is-ancestor", default_branch, base_ref],
-                                cwd=str(repo_dir),
-                                capture_output=True,
-                                timeout=10,
-                            )
-                            if anc_main.returncode == 0:
-                                subprocess.run(["git", "merge", "--ff-only", base_ref], cwd=str(repo_dir), capture_output=True, timeout=20)
-                            else:
-                                subprocess.run(["git", "cherry-pick", f"{default_branch}..{base_ref}"], cwd=str(repo_dir), capture_output=True, timeout=30)
-                        except Exception as e:
-                            print(f"[FORGE] Warning: git merge/cherry-pick {base_ref} failed/timed out: {e}", file=sys.stderr)
                         try:
                             subprocess.run(["git", "push", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=60)
                         except Exception as e:
