@@ -1468,7 +1468,8 @@ def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH
         "failed": "❌",
     }
 
-    b_emoji, b_label, color = status_meta.get(build["status"], ("⚙️", build["status"].upper(), 0x3B82F6))
+    b_status = str(build["status"] or "").strip().lower()
+    b_emoji, b_label, color = status_meta.get(b_status, ("⚙️", b_status.upper(), 0x3B82F6))
     origin_ref = f"<#{build['origin_thread_id'] or build['origin_channel_id']}>"
     repo_name = Path(build["repo"]).name or "Zero-Agent"
     if repo_name == "workspace":
@@ -1476,43 +1477,44 @@ def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH
         repo_name = "Ivy-Agent" if is_ivy_origin else "Zero-Agent"
 
     total = len(chunks)
-    merged_count = sum(1 for c in chunks if c["status"] == "merged")
+    merged_count = sum(1 for c in chunks if str(c["status"] or "").strip().lower() == "merged")
     header_line = f"**{b_label}** · `{repo_name}` · {origin_ref} · **{merged_count}/{total}** chunks"
 
     display_chunks = list(chunks)
     chunk_lines: list[str] = []
     if len(display_chunks) > 8:
-        merged_indices = [i for i, c in enumerate(display_chunks) if c["status"] == "merged"]
+        merged_indices = [i for i, c in enumerate(display_chunks) if str(c["status"] or "").strip().lower() == "merged"]
         if len(merged_indices) > 3:
             hidden_count = len(merged_indices) - 2
             chunk_lines.append(f"✅ *+{hidden_count} earlier chunk(s) merged*")
-            keep_set = set(merged_indices[-2:]) | {i for i, c in enumerate(display_chunks) if c["status"] != "merged"}
+            keep_set = set(merged_indices[-2:]) | {i for i, c in enumerate(display_chunks) if str(c["status"] or "").strip().lower() != "merged"}
             display_chunks = [c for i, c in enumerate(display_chunks) if i in keep_set]
 
     for c in display_chunks:
-        c_emoji = chunk_badge_map.get(c["status"], "•")
+        c_status = str(c["status"] or "").strip().lower()
+        c_emoji = chunk_badge_map.get(c_status, "•")
         idx_num = c["chunk_index"] + 1
         pr_suffix = f" (PR #{c['pr_number']})" if c["pr_number"] else ""
         compact_diff = _compact_diff_stat(c["diff_stat"])
         diff_suffix = f" (`{compact_diff}`)" if compact_diff else ""
         chunk_lines.append(f"{c_emoji} **{idx_num}.** {c['title']}{pr_suffix}{diff_suffix}")
-        if c["status"] in ("running", "verifying"):
+        if c_status in ("running", "verifying"):
             live_st = (c["live_status"] if "live_status" in c.keys() and c["live_status"] else "").strip()
             elapsed_prefix = ""
             if c["started_at"]:
                 elapsed_s = max(0, int(time.time() - float(c["started_at"])))
                 elapsed_prefix = f"({_format_duration(elapsed_s)}) · "
-            if c["status"] == "verifying" and not live_st.startswith("Running Maker-Checker"):
+            if c_status == "verifying" and not live_st.startswith("Running Maker-Checker"):
                 v_cmd_short = (c["verification_cmd"] or "auto-baseline").strip()[:50]
                 chunk_lines.append(f"  ↳ 🧪 {elapsed_prefix}Running Maker-Checker gate (`{v_cmd_short}`)...")
             elif live_st:
                 chunk_lines.append(f"  ↳ ⚡ {elapsed_prefix}{live_st[:130]}")
-        elif c["status"] == "failed" and c["last_error"]:
+        elif c_status == "failed" and c["last_error"]:
             err_snip = c["last_error"].strip().splitlines()[-1][:110]
             chunk_lines.append(f"  ⚠️ `{err_snip}`")
 
     desc = header_line + ("\n\n" + "\n".join(chunk_lines) if chunk_lines else "")
-    footer_suffix = " · Auto-clears in 1h" if build["status"] in ("completed", "failed", "cancelled") else ""
+    footer_suffix = " · Auto-clears in 1h" if b_status in ("completed", "failed", "cancelled") else ""
     return {
         "title": f"{b_emoji} {build['title'][:220]}",
         "description": desc[:4000],
@@ -1536,7 +1538,7 @@ def render_build_widget_text(build_id: str, db_path: Path | str = FORGE_DB_PATH)
 
     embed = render_build_widget_embed(build_id, db_path=db_path)
     total = len(chunks)
-    merged_count = sum(1 for c in chunks if c["status"] == "merged")
+    merged_count = sum(1 for c in chunks if str(c["status"] or "").strip().lower() == "merged")
     models = sorted({c["worker_model"] for c in chunks if c["worker_model"]})
     obj_line = f"\n- **Objective:** {build['objective'].strip()}" if build["objective"] else ""
     return (
@@ -1603,7 +1605,7 @@ def render_job_widget_embed(task_id: str, db_path: Path | str = FORGE_DB_PATH) -
     if not meta:
         return {"title": f"⚠️ Job {task_id} not found", "color": 0xEF4444}
 
-    status = meta.get("status", "starting")
+    status = str(meta.get("status") or "starting").strip().lower()
     status_meta = {
         "starting": ("⏳", "STARTING", 0xF59E0B),
         "running": ("⚙️", "RUNNING", 0x3B82F6),
@@ -1794,18 +1796,18 @@ def prune_completed_job_widgets(
                 rows = conn.execute(
                     """
                     SELECT id, status, forge_message_id FROM forge_jobs
-                    WHERE status IN ('completed', 'failed', 'cancelled', 'timed_out')
+                    WHERE LOWER(status) IN ('completed', 'failed', 'cancelled', 'timed_out')
                       AND forge_message_id IS NOT NULL
                       AND (
-                          status = 'cancelled'
+                          LOWER(status) = 'cancelled'
                           OR COALESCE(end_time, start_time) <= ?
-                          OR (status IN ('failed', 'timed_out') AND COALESCE(end_time, start_time) <= ?)
+                          OR (LOWER(status) IN ('failed', 'timed_out') AND COALESCE(end_time, start_time) <= ?)
                           OR (
-                              status IN ('failed', 'timed_out')
+                              LOWER(status) IN ('failed', 'timed_out')
                               AND EXISTS (
                                   SELECT 1 FROM forge_jobs j2
                                   WHERE j2.channel = forge_jobs.channel
-                                    AND j2.status = 'completed'
+                                    AND LOWER(j2.status) = 'completed'
                                     AND j2.id != forge_jobs.id
                                     AND COALESCE(j2.end_time, j2.start_time) >= COALESCE(forge_jobs.end_time, forge_jobs.start_time)
                               )
@@ -1912,19 +1914,61 @@ def _sweep_stale_forge_channel_embeds(
                 or title.startswith(("✅", "❌", "⏱️"))
                 or desc.startswith(("**COMPLETED**", "**FAILED**", "**TIMED OUT**"))
             )
+
+            db_ts = 0.0
+            if id_match:
+                found_in_db = False
+                db_status = ""
+                for target_db in db_paths:
+                    try:
+                        with get_db_connection(target_db) as conn:
+                            if entity_id.startswith("fg-"):
+                                row = conn.execute(
+                                    "SELECT status, updated_at, created_at FROM forge_builds WHERE id = ?",
+                                    (entity_id,),
+                                ).fetchone()
+                                if row:
+                                    found_in_db = True
+                                    db_status = str(row["status"] or "").strip().lower()
+                                    db_ts = float(row["updated_at"] or row["created_at"] or 0.0)
+                                    break
+                            elif entity_id.startswith("dt-"):
+                                row = conn.execute(
+                                    "SELECT status, end_time, start_time FROM forge_jobs WHERE id = ?",
+                                    (entity_id,),
+                                ).fetchone()
+                                if row:
+                                    found_in_db = True
+                                    db_status = str(row["status"] or "").strip().lower()
+                                    db_ts = float(row["end_time"] or row["start_time"] or 0.0)
+                                    break
+                    except Exception:
+                        continue
+
+                if found_in_db:
+                    if db_status == "cancelled":
+                        is_cancelled = True
+                    if entity_id.startswith("dt-") and db_status in ("failed", "timed_out"):
+                        is_failed_dt = True
+                    if db_status in ("completed", "failed", "cancelled", "timed_out"):
+                        is_terminal = True
+                elif msg_ts > 0 and (now - msg_ts) >= 7200.0:
+                    is_terminal = True
+
             is_stuck_starting = (
                 (title.startswith("⏳") or desc.startswith("**STARTING**"))
                 and msg_ts > 0
                 and (now - msg_ts) >= 120.0
             )
             failed_dt_cutoff = now - min(max(0.0, now - cutoff), float(FAILED_JOB_WIDGET_TTL_SECONDS))
+            effective_ts = db_ts if (db_ts > 0 and (msg_ts <= 0 or db_ts < msg_ts)) else msg_ts
 
             should_delete = (
                 is_duplicate_entity
                 or is_cancelled
                 or is_stuck_starting
-                or (is_failed_dt and msg_ts > 0 and msg_ts <= failed_dt_cutoff)
-                or (is_terminal and msg_ts > 0 and msg_ts <= cutoff)
+                or (is_failed_dt and effective_ts > 0 and effective_ts <= failed_dt_cutoff)
+                or (is_terminal and effective_ts > 0 and effective_ts <= cutoff)
             )
             if not should_delete:
                 continue
@@ -1976,9 +2020,9 @@ def prune_completed_build_widgets(
                 rows = conn.execute(
                     """
                     SELECT id, status, forge_message_id FROM forge_builds
-                    WHERE status IN ('completed', 'failed', 'cancelled')
+                    WHERE LOWER(status) IN ('completed', 'failed', 'cancelled')
                       AND forge_message_id IS NOT NULL
-                      AND (status = 'cancelled' OR updated_at <= ?)
+                      AND (LOWER(status) = 'cancelled' OR updated_at <= ?)
                     """,
                     (cutoff,),
                 ).fetchall()

@@ -1592,5 +1592,108 @@ def test_execute_chunk_in_worktree_conflict_with_advanced_main_aborts_cleanly(tm
     assert st == ""
 
 
+def test_uppercase_status_and_stuck_running_embed_sweep(tmp_path, monkeypatch):
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+
+    plan = {
+        "title": "Epic 43 Public Standings",
+        "repo": "/workspace",
+        "origin_channel_id": forge.BASEBALL_CHANNEL_ID,
+        "context_fact_sheet": ["Test uppercase status handling."],
+        "chunks": [
+            {
+                "title": "Chunk 1",
+                "target_files": ["tools/standings.py"],
+                "instructions": "Update standings page.",
+                "verification_cmd": "pytest",
+            }
+        ],
+    }
+    res = forge.enqueue_build(plan, db_path=db_p, post_widget=False)
+    build_id = res["build_id"]
+    old_ts = time.time() - 7500.0
+
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            "UPDATE forge_builds SET status = 'COMPLETED', forge_message_id = 1564468993128009871, updated_at = ? WHERE id = ?",
+            (old_ts, build_id),
+        )
+        conn.execute(
+            "UPDATE forge_chunks SET status = 'MERGED' WHERE build_id = ?",
+            (build_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time, forge_message_id)
+            VALUES (?, 'Uppercase Job', 'python3 job.py', 'baseball', '/workspace', 60, 'COMPLETED', ?, ?, 1564468993128009872)
+            """,
+            ("dt-upper-job", old_ts, old_ts),
+        )
+
+    embed = forge.render_build_widget_embed(build_id, db_path=db_p)
+    assert embed["title"].startswith("✅")
+    assert "**COMPLETED**" in embed["description"]
+    assert "**1/1** chunks" in embed["description"]
+    assert "Auto-clears in 1h" in embed["footer"]["text"]
+
+    pruned = forge.prune_completed_build_widgets(ttl_seconds=3600.0, db_path=db_p, delete_remote=False)
+    assert build_id in pruned
+    assert "dt-upper-job" in pruned
+
+    # Also test _sweep_stale_forge_channel_embeds when card is stuck showing 🔨 RUNNING in Discord
+    # (a) for a build whose DB row is COMPLETED, and (b) for an orphaned build missing from DB and >2h old
+    iso_old = "2026-10-27T01:00:00+00:00"
+    fake_messages = [
+        {
+            "id": "1564468993128009871",
+            "timestamp": iso_old,
+            "embeds": [
+                {
+                    "title": "🔨 Epic 43 Public Standings",
+                    "description": "**RUNNING** · `Ivy-Agent` · <#1548196929308065893> · **0/1** chunks",
+                    "footer": {"text": f"{build_id} · Updated Oct 26"},
+                }
+            ],
+        },
+        {
+            "id": "1564468993128009899",
+            "timestamp": iso_old,
+            "embeds": [
+                {
+                    "title": "🔨 Orphaned Missing Build",
+                    "description": "**RUNNING** · `Ivy-Agent` · <#1548196929308065893> · **0/1** chunks",
+                    "footer": {"text": "fg-missing-from-db-999 · Updated Oct 26"},
+                }
+            ],
+        },
+    ]
+
+    deleted_urls = []
+
+    class FakeResp:
+        def __init__(self, status_code, data=None):
+            self.status_code = status_code
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    monkeypatch.setattr(forge.requests, "get", lambda url, **kw: FakeResp(200, fake_messages))
+    monkeypatch.setattr(forge.requests, "delete", lambda url, **kw: (deleted_urls.append(url), FakeResp(204))[1])
+
+    swept = forge._sweep_stale_forge_channel_embeds(
+        cutoff=time.time() - 3600.0,
+        forge_channel_id=forge.FORGE_CHANNEL_ID,
+        token="fake-token",
+        db_paths=[db_p],
+    )
+    assert build_id in swept
+    assert "fg-missing-from-db-999" in swept
+    assert len(deleted_urls) == 2
+
+
 if __name__ == "__main__":
     unittest.main()
