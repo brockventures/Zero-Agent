@@ -4,7 +4,6 @@ Exercises UI choice views, operator commands, model switching, sidecar triggers,
 """
 
 import asyncio
-import os
 import sys
 import unittest
 from pathlib import Path
@@ -16,14 +15,11 @@ import sys
 if "/workspace" not in sys.path:
     sys.path.insert(0, "/workspace")
 from tools.bridge_commands import (
-    MODEL_ALIASES,
     ON_DEMAND_TRIGGERS,
-    ChoiceButton,
     QuickChoiceView,
     handle_button_choice,
     handle_operator_command,
 )
-from tools.bridge_state import VAULT_CHANNEL_ID
 
 
 class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
@@ -256,6 +252,37 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
             self.assertIn("-p", cmd)
             self.assertEqual(cmd[cmd.index("-p") + 1], "2222")
             self.assertTrue(any("mock-host-2" in arg for arg in cmd))
+
+    def test_nas_docker_mcp_ssh_evicts_mux_and_retries_on_timeout_and_rc255(self):
+        import subprocess
+        from tools.nas_docker_mcp import _ssh
+
+        ok_proc = subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout="dockhand\tUp 2 days\t3866\n", stderr="")
+        fail_255 = subprocess.CompletedProcess(
+            args=["ssh"],
+            returncode=255,
+            stdout="",
+            stderr="Connection timed out during banner exchange",
+        )
+
+        with patch("tools.nas_docker_mcp._resolve_nas_config", return_value=("198.51.100.10", "198.51.100.20", "2222")), \
+             patch("tools.nas_docker_mcp.evict_ssh_mux_socket") as mock_evict, \
+             patch("tools.nas_docker_mcp.subprocess.run", side_effect=[subprocess.TimeoutExpired(cmd="ssh", timeout=60), ok_proc]) as mock_run:
+            res = _ssh("198.51.100.10", "docker ps", timeout=60)
+            self.assertEqual(res.returncode, 0)
+            self.assertEqual(mock_run.call_count, 2)
+            mock_evict.assert_called_once()
+            retry_cmd = mock_run.call_args_list[1][0][0]
+            self.assertIn("ControlMaster=no", retry_cmd)
+            self.assertIn("ControlPath=none", retry_cmd)
+
+        with patch("tools.nas_docker_mcp._resolve_nas_config", return_value=("198.51.100.10", "198.51.100.20", "2222")), \
+             patch("tools.nas_docker_mcp.evict_ssh_mux_socket") as mock_evict2, \
+             patch("tools.nas_docker_mcp.subprocess.run", side_effect=[fail_255, ok_proc]) as mock_run2:
+            res2 = _ssh("198.51.100.10", "docker ps", timeout=60)
+            self.assertEqual(res2.returncode, 0)
+            self.assertEqual(mock_run2.call_count, 2)
+            mock_evict2.assert_called_once()
 
 
 if __name__ == "__main__":

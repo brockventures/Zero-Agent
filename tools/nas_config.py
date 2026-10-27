@@ -138,6 +138,7 @@ def build_ssh_cmd(
     key: str = None,
     connect_timeout: int = 5,
     batch_mode: bool = True,
+    disable_mux: bool = False,
 ) -> list[str]:
     """Construct a clean SSH command line."""
     u = user or SSH_USER
@@ -150,10 +151,43 @@ def build_ssh_cmd(
         "-o", "StrictHostKeyChecking=no",
         "-o", f"ConnectTimeout={connect_timeout}",
     ]
+    if disable_mux:
+        cmd.extend(["-o", "ControlMaster=no", "-o", "ControlPath=none"])
     if batch_mode:
         cmd.extend(["-o", "BatchMode=yes"])
     cmd.extend([f"{u}@{host}", remote_cmd])
     return cmd
+
+
+def evict_ssh_mux_socket(
+    host: str,
+    user: str = None,
+    port: str = None,
+) -> bool:
+    """Evict a stale or wedged OpenSSH ControlMaster socket for a target host."""
+    u = user or SSH_USER
+    p = port or SSH_PORT
+    evicted = False
+    try:
+        subprocess.run(
+            ["ssh", "-p", str(p), "-O", "exit", f"{u}@{host}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        evicted = True
+    except Exception:
+        pass
+
+    mux_path = Path(f"/tmp/ssh_mux_{host}_{p}_{u}")
+    try:
+        if mux_path.exists() or mux_path.is_socket():
+            mux_path.unlink(missing_ok=True)
+            evicted = True
+    except Exception:
+        pass
+    return evicted
+
 
 def run_ssh(
     host: str,
@@ -163,9 +197,19 @@ def run_ssh(
     port: str = None,
     key: str = None,
     batch_mode: bool = False,
+    disable_mux: bool = False,
+    retry_without_mux_on_timeout: bool = True,
 ) -> Tuple[int, str, str]:
-    """Execute a remote command via SSH synchronously."""
-    cmd = build_ssh_cmd(host, remote_cmd, user=user, port=port, key=key, batch_mode=batch_mode)
+    """Execute a remote command via SSH synchronously, with automatic mux eviction fallback on timeout."""
+    cmd = build_ssh_cmd(
+        host,
+        remote_cmd,
+        user=user,
+        port=port,
+        key=key,
+        batch_mode=batch_mode,
+        disable_mux=disable_mux,
+    )
     try:
         res = subprocess.run(
             cmd,
@@ -175,8 +219,61 @@ def run_ssh(
             errors="replace",
             timeout=timeout,
         )
+        if (
+            res.returncode == 255
+            and not disable_mux
+            and retry_without_mux_on_timeout
+            and any(
+                k in (res.stderr or "").lower()
+                for k in ("timed out", "mux_client", "connection reset", "broken pipe", "control socket")
+            )
+        ):
+            evict_ssh_mux_socket(host, user=user, port=port)
+            fallback_cmd = build_ssh_cmd(
+                host,
+                remote_cmd,
+                user=user,
+                port=port,
+                key=key,
+                batch_mode=batch_mode,
+                disable_mux=True,
+            )
+            res = subprocess.run(
+                fallback_cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
         return res.returncode, res.stdout or "", res.stderr or ""
     except subprocess.TimeoutExpired:
+        if not disable_mux:
+            evict_ssh_mux_socket(host, user=user, port=port)
+            if retry_without_mux_on_timeout:
+                fallback_cmd = build_ssh_cmd(
+                    host,
+                    remote_cmd,
+                    user=user,
+                    port=port,
+                    key=key,
+                    batch_mode=batch_mode,
+                    disable_mux=True,
+                )
+                try:
+                    res = subprocess.run(
+                        fallback_cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout,
+                    )
+                    return res.returncode, res.stdout or "", res.stderr or ""
+                except subprocess.TimeoutExpired:
+                    return -1, "", f"SSH command timed out after {timeout}s (including mux-bypass retry): {remote_cmd[:60]}"
+                except Exception as e:
+                    return -1, "", f"SSH fallback execution exception: {e}"
         return -1, "", f"SSH command timed out after {timeout}s: {remote_cmd[:60]}"
     except Exception as e:
         return -1, "", f"SSH execution exception: {e}"

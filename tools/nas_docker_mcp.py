@@ -10,13 +10,12 @@ import re
 import shlex
 import subprocess
 import threading
-import urllib.parse
 from mcp.server.mcpserver import MCPServer
 
 try:
-    from tools.nas_config import resolve_nas_config, _resolve_nas_config
+    from tools.nas_config import resolve_nas_config, _resolve_nas_config, evict_ssh_mux_socket, build_ssh_cmd
 except ImportError:
-    from nas_config import resolve_nas_config, _resolve_nas_config
+    from nas_config import resolve_nas_config, _resolve_nas_config, evict_ssh_mux_socket, build_ssh_cmd
 
 HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
@@ -42,19 +41,56 @@ _docker_lock = threading.Lock()
 
 server = MCPServer("nas-docker")
 
-def _ssh(host: str, remote_cmd: str, timeout: int) -> subprocess.CompletedProcess:
+def _ssh(host: str, remote_cmd: str, timeout: int, retry_without_mux: bool = True) -> subprocess.CompletedProcess:
     _, _, port = _resolve_nas_config()
-    cmd = [
-        "ssh",
-        "-i", SSH_KEY,
-        "-p", port,
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=10",
-        f"{SSH_USER}@{host}",
-        remote_cmd
-    ]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    cmd = build_ssh_cmd(
+        host,
+        remote_cmd,
+        user=SSH_USER,
+        port=port,
+        key=SSH_KEY,
+        connect_timeout=10,
+        batch_mode=True,
+        disable_mux=False,
+    )
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if (
+            res.returncode == 255
+            and retry_without_mux
+            and any(
+                k in (res.stderr or "").lower()
+                for k in ("timed out", "mux_client", "connection reset", "broken pipe", "control socket")
+            )
+        ):
+            evict_ssh_mux_socket(host, user=SSH_USER, port=port)
+            fallback_cmd = build_ssh_cmd(
+                host,
+                remote_cmd,
+                user=SSH_USER,
+                port=port,
+                key=SSH_KEY,
+                connect_timeout=10,
+                batch_mode=True,
+                disable_mux=True,
+            )
+            return subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=timeout)
+        return res
+    except subprocess.TimeoutExpired:
+        evict_ssh_mux_socket(host, user=SSH_USER, port=port)
+        if retry_without_mux:
+            fallback_cmd = build_ssh_cmd(
+                host,
+                remote_cmd,
+                user=SSH_USER,
+                port=port,
+                key=SSH_KEY,
+                connect_timeout=10,
+                batch_mode=True,
+                disable_mux=True,
+            )
+            return subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=timeout)
+        raise
 
 def _validate_dir(compose_dir: str) -> str:
     if not compose_dir:
