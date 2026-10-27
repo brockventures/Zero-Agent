@@ -699,6 +699,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             prompt="[SYSTEM NOTIFICATION: DETACHED TASK COMPLETE]\nDirective: Synthesize this.",
             job_name="Detached Task: Test Task",
             channel_id=1542081375287640084,
+            job_id="outbox_turn_outbox-agent-turn-1",
         )
         mock_channel.send.assert_not_called()
 
@@ -964,6 +965,34 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             mock_sidecar.assert_called_once()
             self.assertEqual(mock_sidecar.call_args[0][0], "weekly_grocery_staging")
             mock_turn_queue.put.assert_not_called()
+
+    async def test_outbox_agent_turn_bypasses_sidecar_substring_interceptors(self):
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_turn_queue = AsyncMock()
+
+        forge_envelope = (
+            "[FORGE BUILD COMPLETION ENVELOPE — `fg-1793065628-z-wave-js-living-r`]\n"
+            "**Build Title:** Z-Wave JS & Living Room Blinds Self-Healing\n"
+            "- **Chunk 1:** Merged [verified via `pytest tools/test_ha_reauth_watchdog.py && kalshi_check`]"
+        )
+        with patch("tools.sidecars.run_sidecar_job") as mock_sidecar:
+            await bshed.dispatch_scheduled_prompt(
+                forge_envelope,
+                "forge-complete-fg-1793065628-z-wave-js-living-r",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue,
+                channel_id=bs.TARGET_CHANNEL_ID,
+                job_id="outbox_turn_outbox-1793066592989-1234",
+            )
+            mock_sidecar.assert_not_called()
+            mock_turn_queue.put.assert_awaited_once()
+            queued = mock_turn_queue.put.call_args[0][0]
+            self.assertEqual(queued["prompt"], forge_envelope)
+            self.assertEqual(queued["channel_id"], bs.TARGET_CHANNEL_ID)
+            self.assertIsNone(queued["model_override"])
 
 if __name__ == "__main__":
     unittest.main()

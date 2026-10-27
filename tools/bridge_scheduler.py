@@ -123,7 +123,10 @@ async def dispatch_scheduled_prompt(
 
 
     # Strictly isolate all Kalshi quant paper trading sidecars to #vault
-    if (job_id and "kalshi" in job_id.lower()) or "kalshi" in job_name.lower() or "kalshi" in prompt.lower():
+    is_outbox_turn = bool(job_id and str(job_id).startswith("outbox_turn_"))
+
+    # Strictly isolate all Kalshi quant paper trading sidecars to #vault (except outbox agent turns)
+    if not is_outbox_turn and ((job_id and "kalshi" in job_id.lower()) or "kalshi" in job_name.lower() or "kalshi" in prompt.lower()):
         channel_id = VAULT_CHANNEL_ID
 
     # Anti-storm guard: prevent any job from dispatching more than once per 5 minutes
@@ -145,6 +148,29 @@ async def dispatch_scheduled_prompt(
         except Exception as e:
             print(f"[Scheduler] Could not fetch channel {dest_id}: {e}")
             return None
+
+    # Fast-path for Outbox Agent Turns (FORGE completion/failure envelopes, detached task synthesis):
+    # Never match prompt substrings (like "ha_reauth" or "nest_lock" inside a FORGE completion envelope)
+    # against scheduled sidecar interceptors. Route straight to the target channel's turn_queue.
+    if is_outbox_turn:
+        if bot and turn_queue:
+            target_cid = channel_id or TARGET_CHANNEL_ID
+            ch = await get_dest_channel()
+            if not ch:
+                print(f"[Scheduler] Could not fetch channel {target_cid} for outbox agent turn")
+                return
+            mode = "home" if target_cid == TARGET_CHANNEL_ID else "external"
+            await turn_queue.put({
+                "prompt": prompt,
+                "status_msg": None,
+                "reply_target": ch,
+                "attachments": [],
+                "is_steer": False,
+                "mode": mode,
+                "channel_id": target_cid,
+                "model_override": None,
+            })
+        return
 
     if job_id == "session_rollover" or prompt == "[INTERNAL_SESSION_ROLLOVER]" or job_name in ("Session Rollover", "Daily Session Rollover"):
         try:
