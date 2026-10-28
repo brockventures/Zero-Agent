@@ -711,3 +711,16 @@ def test_missing_docker_cli_guard_blocks_docker_exec_when_binary_absent(tmp_path
         )
         assert ok_forge is True, f"Expected forge command to be allowed when docker CLI exists, got: {reason_forge}"
 
+
+def test_throttle_heavy_compiler_command():
+    from batch_guard import throttle_heavy_compiler_command
+
+    rewritten = throttle_heavy_compiler_command("cd /workspace/gotchi/firmware && python3 -m platformio run")
+    assert "-j 2" in rewritten
+    assert "nice -n 10" in rewritten
+
+    clamped = throttle_heavy_compiler_command("pio run -e seeed_xiao_esp32s3 -j 8")
+    assert "-j 2" in clamped
+    assert "-j 8" not in clamped
+
+

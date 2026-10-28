@@ -1356,6 +1356,33 @@ def check_tool_use(
     return True, ""
 
 
+def throttle_heavy_compiler_command(cmd: str) -> str:
+    """Cap PlatformIO / C++ firmware builds to -j 2 and nice -n 10 on Host 2 so 8-job xtensa-esp32s3-elf-g++ swarms never thrash swap."""
+    if not cmd or not re.search(r"\b(?:platformio|pio)\s+run\b", cmd):
+        return cmd
+
+    def _rewrite_pio_seg(match: re.Match) -> str:
+        full = match.group(0)
+        # Clamp explicit -j N / --jobs N > 2 down to 2
+        if re.search(r"(?:-j|--jobs)(?:\s+|=)\d+", full):
+            throttled = re.sub(
+                r"(-j|--jobs)(\s+|=)(\d+)",
+                lambda m: f"{m.group(1)}{m.group(2)}{min(2, max(1, int(m.group(3))))}",
+                full,
+            )
+        else:
+            throttled = f"{full} -j 2"
+        if os.name != "nt" and not re.match(r"^\s*nice\b", throttled):
+            throttled = f"nice -n 10 {throttled}"
+        return throttled
+
+    return re.sub(
+        r"(?:nice\s+-n\s+\d+\s+)?(?:python[0-9.]*\s+-m\s+)?(?:platformio|pio)\s+run(?:\s+[^\n;&|]+)?",
+        _rewrite_pio_seg,
+        cmd,
+    )
+
+
 def check_batching(cmd: str) -> tuple[bool, str]:
     return check_tool_use("run_command", {"CommandLine": cmd})
 
@@ -1437,14 +1464,17 @@ def main():
                 overwrites["WaitMsBeforeAsync"] = 10000
 
             try:
+                raw_cmd = args.get("CommandLine", "")
+                throttled_cmd = throttle_heavy_compiler_command(raw_cmd)
                 for tools_dir in ("/workspace/tools", "/opt/zero/workspace/tools"):
                     if os.path.isdir(tools_dir) and tools_dir not in sys.path:
                         sys.path.insert(0, tools_dir)
                 from output_shaper import rewrite_command_for_shaping
-                raw_cmd = args.get("CommandLine", "")
-                shaped_cmd = rewrite_command_for_shaping(raw_cmd)
+                shaped_cmd = rewrite_command_for_shaping(throttled_cmd)
                 if shaped_cmd and shaped_cmd != raw_cmd:
                     overwrites["CommandLine"] = shaped_cmd
+                elif throttled_cmd and throttled_cmd != raw_cmd:
+                    overwrites["CommandLine"] = throttled_cmd
             except Exception:
                 pass
 

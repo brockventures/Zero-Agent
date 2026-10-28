@@ -1546,13 +1546,17 @@ class BridgeScheduler:
                         pass
 
                 # FORGE Supervisor Tick: expire stale Decision Cards & dispatch completed SDK tasks via Outbox
+                # Offloaded to a worker thread with a bounded timeout so synchronous SQLite/HTTP calls inside
+                # tick_sync() never block the main Discord gateway asyncio event loop past the 30s heartbeat window.
                 try:
                     from tools.forge import forge_supervisor
-                    forge_supervisor.tick_sync()
+                    await asyncio.wait_for(asyncio.to_thread(forge_supervisor.tick_sync), timeout=12.0)
+                except asyncio.TimeoutError:
+                    print("[BridgeScheduler] Warning: forge_supervisor.tick_sync() timed out after 12s (offloaded thread)")
                 except Exception:
                     try:
                         from tools.task_settle import check_and_dispatch_completed_tasks
-                        check_and_dispatch_completed_tasks()
+                        await asyncio.wait_for(asyncio.to_thread(check_and_dispatch_completed_tasks), timeout=8.0)
                     except Exception:
                         pass
 
