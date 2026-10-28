@@ -1695,5 +1695,66 @@ def test_uppercase_status_and_stuck_running_embed_sweep(tmp_path, monkeypatch):
     assert len(deleted_urls) == 2
 
 
+def test_short_job_suppresses_forge_widget_until_90s(tmp_path, monkeypatch):
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    monkeypatch.setattr(forge, "FORGE_DB_PATH", db_p)
+    monkeypatch.setattr(forge, "TASKS_DIR", tmp_path / "detached_tasks")
+    monkeypatch.setattr(forge, "_is_prod_forge_env", lambda *a, **kw: True)
+    monkeypatch.setattr(forge, "sync_forge_channel_header", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "prune_completed_job_widgets", lambda *a, **kw: [])
+    monkeypatch.setattr(forge, "_is_channel_turn_actively_in_flight", lambda ch: True)
+
+    widget_calls = []
+    monkeypatch.setattr(forge, "post_or_update_job_widget", lambda tid, **kw: widget_calls.append(tid))
+
+    # 1. Short job (<90s) that fails should NOT post a #forge widget card
+    short_id = "dt-test-short-no-widget"
+    tdir = forge._get_job_dir(short_id)
+    tdir.mkdir(parents=True, exist_ok=True)
+    log_p = tdir / "run.log"
+    meta_short = {
+        "task_id": short_id,
+        "name": "Short 20s Probe",
+        "command": "python3 -c 'import sys; sys.exit(1)'",
+        "channel": "baseball",
+        "timeout": 60,
+        "cwd": str(tmp_path),
+        "status": "starting",
+        "start_time": time.time(),
+        "notify_on_success": False,
+        "synthesize": False,
+        "log_file": str(log_p),
+    }
+    forge._write_job_meta(short_id, meta_short, db_path=db_p)
+    forge._run_job_worker(short_id, db_path=db_p)
+    assert widget_calls == []
+
+    # 2. Long job (>=90s, non-quiet) SHOULD post a #forge widget card
+    long_id = "dt-test-long-widget"
+    tdir_long = forge._get_job_dir(long_id)
+    tdir_long.mkdir(parents=True, exist_ok=True)
+    log_long = tdir_long / "run.log"
+    monkeypatch.setattr(forge, "JOB_WIDGET_MIN_DURATION_SECONDS", 0.0)
+    meta_long = {
+        "task_id": long_id,
+        "name": "Long Pipeline Job",
+        "command": "python3 -c 'print(123)'",
+        "channel": "baseball",
+        "timeout": 60,
+        "cwd": str(tmp_path),
+        "status": "starting",
+        "start_time": time.time(),
+        "notify_on_success": False,
+        "synthesize": True,
+        "log_file": str(log_long),
+    }
+    forge._write_job_meta(long_id, meta_long, db_path=db_p)
+    forge._run_job_worker(long_id, db_path=db_p)
+    assert long_id in widget_calls
+
+
 if __name__ == "__main__":
     unittest.main()

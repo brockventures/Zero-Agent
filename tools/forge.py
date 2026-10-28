@@ -3986,10 +3986,8 @@ def start_job(
             if not updated_meta.get("worker_pid"):
                 updated_meta["worker_pid"] = proc.pid
                 _write_job_meta(task_id, updated_meta, db_path=db_path)
-            is_quiet_probe = not bool(notify_on_success) and not bool(synthesize)
-            if _is_prod_forge_env(db_path) and not is_quiet_probe:
-                post_or_update_job_widget(task_id, db_path=db_path)
-            sync_forge_channel_header(db_path=db_path)
+            if not (not bool(notify_on_success) and not bool(synthesize)):
+                sync_forge_channel_header(db_path=db_path)
 
             return updated_meta
         finally:
@@ -4022,13 +4020,15 @@ def _run_job_worker(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> None:
         lock_fh.close()
 
 
+JOB_WIDGET_MIN_DURATION_SECONDS: float = 90.0
+
+
 def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE_DB_PATH) -> None:
     meta["worker_pid"] = os.getpid()
     meta["status"] = "running"
     _write_job_meta(task_id, meta, db_path=db_path)
     is_quiet_probe = not bool(meta.get("notify_on_success", True)) and not bool(meta.get("synthesize", True))
     if _is_prod_forge_env(db_path) and not is_quiet_probe:
-        post_or_update_job_widget(task_id, db_path=db_path)
         sync_forge_channel_header(db_path=db_path)
 
     command = meta["command"]
@@ -4087,7 +4087,8 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
                                 pass
                             exit_code = -15
                             break
-                        if _is_prod_forge_env(db_path):
+                        elapsed_now = time.time() - start_ts
+                        if _is_prod_forge_env(db_path) and not is_quiet_probe and elapsed_now >= JOB_WIDGET_MIN_DURATION_SECONDS:
                             post_or_update_job_widget(task_id, db_path=db_path)
             except subprocess.TimeoutExpired:
                 timed_out = True
@@ -4120,7 +4121,11 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
     fresh_meta["duration_seconds"] = duration
     _write_job_meta(task_id, fresh_meta, db_path=db_path)
     if _is_prod_forge_env(db_path):
-        if not is_quiet_probe or fresh_meta.get("forge_message_id"):
+        should_post_terminal_card = bool(
+            fresh_meta.get("forge_message_id")
+            or (not is_quiet_probe and duration >= JOB_WIDGET_MIN_DURATION_SECONDS)
+        )
+        if should_post_terminal_card:
             post_or_update_job_widget(task_id, db_path=db_path)
         if final_status == "completed":
             prune_completed_job_widgets(db_path=db_path)
