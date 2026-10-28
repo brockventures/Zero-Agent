@@ -1358,6 +1358,22 @@ def check_target_file_overlap(
     return overlaps
 
 
+MAX_SINGLE_CHUNK_TARGET_FILES = 3
+MAX_CHUNK_TARGET_FILES = 5
+MAX_CHUNK_INSTRUCTION_CHARS = 1800
+MAX_CHUNK_NUMBERED_TASKS = 3
+
+
+def _count_numbered_workstreams(instructions: str) -> int:
+    """Count top-level numbered task items (e.g. '1. ...', '### 1. ...', '1) ...') in chunk instructions."""
+    if not instructions:
+        return 0
+    matches = re.findall(r"(?m)^\s*(?:###?\s*)?(\d+)[\.\)]\s+\S", instructions)
+    if not matches:
+        return 0
+    return len(set(matches))
+
+
 def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     """Deterministically validate a ForgePlan JSON dictionary before enqueueing."""
     if not isinstance(plan, dict):
@@ -1390,6 +1406,9 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     if not isinstance(chunks, list) or not chunks:
         return False, "Plan must include a non-empty 'chunks' list."
 
+    allow_large_chunk = bool(plan.get("allow_large_chunk", False))
+    is_single_chunk = len(chunks) == 1
+
     for idx, ch in enumerate(chunks):
         if not isinstance(ch, dict):
             return False, f"Chunk at index {idx} must be an object."
@@ -1406,6 +1425,31 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
         instr = str(ch.get("instructions") or "").strip()
         if len(instr) < 15:
             return False, f"Chunk {idx} ('{ch_title}') must include detailed TDD 'instructions'."
+
+        if not allow_large_chunk and not ch.get("allow_large_chunk"):
+            max_files = MAX_SINGLE_CHUNK_TARGET_FILES if is_single_chunk else MAX_CHUNK_TARGET_FILES
+            if len(t_files) > max_files:
+                return (
+                    False,
+                    f"Chunk-Split Gate: Chunk {idx} ('{ch_title}') bundles {len(t_files)} target_files "
+                    f"(max {max_files} per chunk). Decompose the ForgePlan into smaller sequential chunks "
+                    "(e.g. c0: schema/data + unit tests -> c1: core logic + tests -> c2: docs/publish).",
+                )
+            if len(instr) > MAX_CHUNK_INSTRUCTION_CHARS:
+                return (
+                    False,
+                    f"Chunk-Split Gate: Chunk {idx} ('{ch_title}') instructions are {len(instr)} chars "
+                    f"(max {MAX_CHUNK_INSTRUCTION_CHARS} chars per chunk). Split multi-step workstreams into "
+                    "separate sequential chunks so no single chunk hits the 1200s worker timeout.",
+                )
+            num_tasks = _count_numbered_workstreams(instr)
+            if num_tasks > MAX_CHUNK_NUMBERED_TASKS:
+                return (
+                    False,
+                    f"Chunk-Split Gate: Chunk {idx} ('{ch_title}') packs {num_tasks} numbered tasks/workstreams "
+                    f"into a single chunk (max {MAX_CHUNK_NUMBERED_TASKS}). Split independent or sequential "
+                    "tasks into separate chunks (c0, c1, c2...).",
+                )
         # Note: verification_cmd is now optional (auto-falls back to deterministic baseline checks)
 
     return True, "Valid ForgePlan."
@@ -2597,6 +2641,38 @@ def format_chunk_prompt(
             lines.append("\n### Pre-Hydrated Target Symbol Slices (Turn-0 Fast-Path Context):")
             lines.extend(hydrated_blocks)
 
+    if worktree_dir and wt_path.exists() and (wt_path / ".git").exists():
+        try:
+            st_proc = subprocess.run(
+                ["git", "status", "--short"],
+                cwd=str(wt_path),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            status_short = st_proc.stdout.strip()
+            if status_short:
+                df_proc = subprocess.run(
+                    ["git", "diff", "--stat"],
+                    cwd=str(wt_path),
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                diff_stat_str = df_proc.stdout.strip()
+                resume_preview = status_short
+                if diff_stat_str:
+                    resume_preview = f"{status_short}\n\n{diff_stat_str}"
+                lines.append("\n### 🔄 Worktree Resume State (Preserved From Previous Attempt):")
+                lines.append(
+                    "This worktree already contains uncommitted edits from the previous attempt:\n"
+                    f"```text\n{resume_preview[-1200:]}\n```\n"
+                    "**RESUME DIRECTIVE:** Do NOT redo completed edits from scratch. Inspect `git diff` / `git status` "
+                    f"and run `{effective_v_cmd}` first, then finish only remaining unverified items or failing tests."
+                )
+        except Exception:
+            pass
+
     lines.append("\n### Implementation Instructions:")
     lines.append(target_chunk["instructions"])
 
@@ -3590,6 +3666,7 @@ class ForgeSupervisor:
                 target_files=target_files,
                 origin_channel_id=int(build["origin_channel_id"]) if build["origin_channel_id"] else None,
             )
+            worker_exc: Optional[Exception] = None
             try:
                 vulcan_env = os.environ.copy()
                 vulcan_env["FORGE_WORKER_ACTIVE"] = "1"
@@ -3680,17 +3757,33 @@ class ForgeSupervisor:
                     with self._state_lock, get_db_connection(self.db_path) as conn:
                         conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (err_msg[-1500:], chunk_id))
             except Exception as e:
+                worker_exc = e
                 if not timed_out_reason[0]:
                     tail_last_15 = "".join(tail_lines[-15:]).rstrip()
                     _log_build(
                         f"[Attempt {attempt}/{max_attempts}] Worker error: {e} (steps: {step_cnt})\n"
                         f"Tail lines (last 15):\n{tail_last_15}"
                     )
-                with self._state_lock, get_db_connection(self.db_path) as conn:
-                    conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (str(e), chunk_id))
-                continue
             finally:
                 restore_vulcan_worktree_profile(wt_dir, profile_snapshot)
+
+            if worker_exc is not None:
+                has_dirty_edits = False
+                try:
+                    st_chk = subprocess.run(
+                        ["git", "status", "--porcelain"],
+                        cwd=str(wt_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    has_dirty_edits = bool(st_chk.stdout.strip())
+                except Exception:
+                    has_dirty_edits = False
+                if not has_dirty_edits:
+                    with self._state_lock, get_db_connection(self.db_path) as conn:
+                        conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (str(worker_exc), chunk_id))
+                    continue
 
             with self._state_lock, get_db_connection(self.db_path) as conn:
                 conn.execute("UPDATE forge_chunks SET status = 'verifying', live_status = '' WHERE id = ?", (chunk_id,))
@@ -3703,6 +3796,8 @@ class ForgeSupervisor:
                 target_files=target_files,
                 require_changes=True,
             )
+            if worker_exc is not None and not passed:
+                err_out = f"{worker_exc}\n\nWorktree edits preserved for resume; verification output:\n{err_out}".strip()
             v_status = "PASSED" if passed else "FAILED"
             _log_build(
                 f"[Attempt {attempt}/{max_attempts}] verify_chunk_worktree result: {v_status}\n"

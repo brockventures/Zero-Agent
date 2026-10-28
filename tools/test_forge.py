@@ -1941,5 +1941,168 @@ def test_execute_chunk_in_worktree_persists_build_log(tmp_path, monkeypatch):
     assert "Worker finished with exit code 0" in content
 
 
+def test_chunk_split_gate_and_worktree_resume_salvage(tmp_path, monkeypatch):
+    """Verify Chunk-Split Gate in validate_forge_plan and worktree preservation/salvage on worker timeout."""
+    import tools.forge as forge
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    logs_dir = tmp_path / "forge_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(forge, "FORGE_LOGS_DIR", logs_dir)
+    monkeypatch.setattr(forge, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "sync_forge_channel_header", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "dispatch_build_completion_to_origin", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "dispatch_build_failure_to_origin", lambda *a, **kw: None)
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Vulcan"], cwd=str(repo_dir), check=True, capture_output=True)
+    (repo_dir / "mod_a.py").write_text("A = 1\n", encoding="utf-8")
+    (repo_dir / "mod_b.py").write_text("B = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+
+    # 1. Single-chunk plan with > 3 target_files is rejected
+    over_files_plan = {
+        "title": "Mega File Bundle",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Enforce atomic chunks"],
+        "chunks": [
+            {
+                "title": "All Files in One",
+                "target_files": ["a.py", "b.py", "c.py", "d.py"],
+                "instructions": "Update all four files in a single chunk.",
+            }
+        ],
+    }
+    ok_f, msg_f = forge.validate_forge_plan(over_files_plan)
+    assert not ok_f
+    assert "Chunk-Split Gate" in msg_f
+    assert "4 target_files" in msg_f
+
+    # 2. Chunk with > 1800 chars of instructions is rejected
+    over_chars_plan = {
+        "title": "Mega Prose Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Enforce atomic chunks"],
+        "chunks": [
+            {
+                "title": "Giant Instruction Block",
+                "target_files": ["mod_a.py"],
+                "instructions": "Implement feature: " + ("x" * 1850),
+            }
+        ],
+    }
+    ok_c, msg_c = forge.validate_forge_plan(over_chars_plan)
+    assert not ok_c
+    assert "Chunk-Split Gate" in msg_c
+    assert "1800 chars" in msg_c
+
+    # 3. Chunk packing 4+ numbered tasks is rejected
+    over_tasks_plan = {
+        "title": "Five Tasks in One Chunk",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Enforce atomic chunks"],
+        "chunks": [
+            {
+                "title": "Everything at Once",
+                "target_files": ["mod_a.py", "mod_b.py"],
+                "instructions": (
+                    "1. Consolidate DB tables.\n"
+                    "2. Upsert 2027 contracts.\n"
+                    "3. Cap backup catchers.\n"
+                    "4. Update README and rebuild standings.\n"
+                ),
+            }
+        ],
+    }
+    ok_t, msg_t = forge.validate_forge_plan(over_tasks_plan)
+    assert not ok_t
+    assert "Chunk-Split Gate" in msg_t
+    assert "4 numbered tasks" in msg_t
+
+    # 4. Worktree Resume across timeout retry: Attempt 1 writes mod_a.py then times out;
+    # Attempt 2 sees the Worktree Resume State prompt with mod_a.py already modified and finishes mod_b.py
+    valid_plan = {
+        "title": "Timeout Resume Test",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Preserve worktree across timeout"],
+        "chunks": [
+            {
+                "title": "Update mod_a and mod_b",
+                "target_files": ["mod_a.py", "mod_b.py"],
+                "instructions": "Set A = 10 in mod_a.py and B = 20 in mod_b.py.",
+                "verification_cmd": "python3 -c 'import mod_a, mod_b; assert mod_a.A == 10 and mod_b.B == 20'",
+            }
+        ],
+    }
+    res = forge.enqueue_build(valid_plan, db_path=db_p, post_widget=False)
+    build_id = res["build_id"]
+    monkeypatch.setattr(forge, "CHUNK_WORKER_TIMEOUT_SECONDS", 0.3)
+
+    prompts_seen: list[str] = []
+    attempt_counter = [0]
+
+    class TimeoutThenResumeProc:
+        def __init__(self, cmd, cwd=None, **kwargs):
+            attempt_counter[0] += 1
+            self.att = attempt_counter[0]
+            self.cwd = Path(cwd)
+            self.pid = 99999
+            for arg in cmd:
+                if str(arg).startswith("-p="):
+                    prompts_seen.append(str(arg)[3:])
+            if self.att == 1:
+                # Partial progress before hitting timeout
+                (self.cwd / "mod_a.py").write_text("A = 10\n", encoding="utf-8")
+            else:
+                # Assert mod_a.py from Attempt 1 was preserved in the worktree!
+                assert (self.cwd / "mod_a.py").read_text(encoding="utf-8") == "A = 10\n"
+                (self.cwd / "mod_b.py").write_text("B = 20\n", encoding="utf-8")
+
+            def _gen():
+                yield f"Vulcan attempt {self.att} step 1\n"
+                if self.att == 1:
+                    time.sleep(0.55)
+                yield f"Vulcan attempt {self.att} done\n"
+
+            self.stdout = _gen()
+
+        def poll(self):
+            return None if self.att == 1 else 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    real_popen = subprocess.Popen
+
+    def fake_popen(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and any("/usr/local/bin/agy" in str(x) for x in cmd):
+            return TimeoutThenResumeProc(cmd, *args, **kwargs)
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    sup = forge.ForgeSupervisor(db_path=db_p)
+    with forge.get_db_connection(db_p) as conn:
+        chunk_row = conn.execute("SELECT * FROM forge_chunks WHERE build_id = ? LIMIT 1", (build_id,)).fetchone()
+
+    ok = sup.execute_chunk_in_worktree(build_id, chunk_row)
+    assert ok is True
+    assert attempt_counter[0] == 2
+    assert len(prompts_seen) == 2
+    assert "Worktree Resume State (Preserved From Previous Attempt)" in prompts_seen[1]
+    assert "mod_a.py" in prompts_seen[1]
+
+
 if __name__ == "__main__":
     unittest.main()
