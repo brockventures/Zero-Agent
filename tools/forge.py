@@ -514,6 +514,7 @@ def stage_vulcan_worktree_profile(
 
     had_agents_dir = (wt / ".agents").exists()
     had_rules_dir = (wt / ".agents" / "rules").exists()
+    had_hooks_dir = (wt / ".agents" / "hooks").exists()
     files_snap: dict[str, dict] = {}
 
     def _record_snap(rel_p: str) -> None:
@@ -530,8 +531,11 @@ def stage_vulcan_worktree_profile(
         except Exception:
             files_snap[rel_p] = {"state": "absent"}
 
+    hook_script_names = ("batch_guard.py", "search_guard.py", "time_context.py")
     for rdoc in ("GEMINI.md", "AGENTS.md", "agents.md", "AGY.md", ".agents/hooks.json"):
         _record_snap(rdoc)
+    for hname in hook_script_names:
+        _record_snap(f".agents/hooks/{hname}")
 
     rules_dir = wt / ".agents" / "rules"
     if rules_dir.exists() and rules_dir.is_dir():
@@ -561,7 +565,7 @@ def stage_vulcan_worktree_profile(
             except Exception:
                 pass
 
-    # 2. Ensure .agents/hooks.json is staged (batch_guard.py + output_shaper.py)
+    # 2. Ensure .agents/hooks.json and .agents/hooks/*.py are staged (so relative 'python hooks/batch_guard.py' works in repos without tracked .agents/hooks/)
     if ".agents/hooks.json" not in norm_targets:
         for hooks_src in (
             WORKSPACE_DIR / ".agents" / "hooks.json",
@@ -574,6 +578,28 @@ def stage_vulcan_worktree_profile(
                     if hp.is_symlink() or hp.is_file():
                         hp.unlink()
                     hp.write_bytes(hooks_src.read_bytes())
+                except Exception:
+                    pass
+                break
+
+    hooks_dir = wt / ".agents" / "hooks"
+    hook_search_dirs = (
+        WORKSPACE_DIR / ".agents" / "hooks",
+        Path("/opt/zero/workspace/.agents/hooks"),
+    )
+    for hname in hook_script_names:
+        rel_h = f".agents/hooks/{hname}"
+        if rel_h in norm_targets:
+            continue
+        dest_h = wt / rel_h
+        for hdir in hook_search_dirs:
+            src_h = hdir / hname
+            if src_h.exists() and src_h.is_file():
+                try:
+                    hooks_dir.mkdir(parents=True, exist_ok=True)
+                    if dest_h.is_symlink() or dest_h.is_file():
+                        dest_h.unlink()
+                    dest_h.write_bytes(src_h.read_bytes())
                 except Exception:
                     pass
                 break
@@ -617,6 +643,7 @@ def stage_vulcan_worktree_profile(
         "files": files_snap,
         "had_agents_dir": had_agents_dir,
         "had_rules_dir": had_rules_dir,
+        "had_hooks_dir": had_hooks_dir,
         "staged_rules": staged_rules,
         "is_baseball": is_baseball,
     }
@@ -643,6 +670,15 @@ def restore_vulcan_worktree_profile(worktree_dir: Path | str, snapshot: dict) ->
                 p.write_bytes(info["bytes"])
                 if "mode" in info:
                     os.chmod(p, int(info["mode"]) & 0o777)
+        except Exception:
+            pass
+
+    hooks_dir = wt / ".agents" / "hooks"
+    if not snapshot.get("had_hooks_dir") and hooks_dir.exists():
+        try:
+            shutil.rmtree(hooks_dir / "__pycache__", ignore_errors=True)
+            if not any(hooks_dir.iterdir()):
+                hooks_dir.rmdir()
         except Exception:
             pass
 
@@ -2867,7 +2903,10 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 def _resolve_latest_branch_ref(repo_dir: Path | str, default_branch: str) -> str:
     """Resolve the newest starting ref between local `<default_branch>` and `origin/<default_branch>` after fetch."""
     rp = Path(repo_dir)
-    subprocess.run(["git", "fetch", "origin", default_branch], cwd=str(rp), capture_output=True, timeout=30)
+    try:
+        subprocess.run(["git", "fetch", "origin", default_branch], cwd=str(rp), capture_output=True, timeout=30)
+    except Exception:
+        pass
     chk_origin = subprocess.run(
         ["git", "rev-parse", "--verify", f"origin/{default_branch}"],
         cwd=str(rp),
@@ -3377,9 +3416,12 @@ class ForgeSupervisor:
                 origin_channel_id=int(build["origin_channel_id"]) if build["origin_channel_id"] else None,
             )
             try:
+                vulcan_env = os.environ.copy()
+                vulcan_env["FORGE_WORKER_ACTIVE"] = "1"
                 proc = subprocess.Popen(
                     agy_cmd,
                     cwd=str(wt_dir),
+                    env=vulcan_env,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,

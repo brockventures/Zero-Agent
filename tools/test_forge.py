@@ -872,6 +872,8 @@ class TestForgeEngine(unittest.TestCase):
         self.assertTrue(snap_bb["is_baseball"])
         self.assertIn("Vulcan", (wt_bb / "GEMINI.md").read_text(encoding="utf-8"))
         self.assertTrue((wt_bb / ".agents" / "hooks.json").exists())
+        self.assertTrue((wt_bb / ".agents" / "hooks" / "batch_guard.py").exists())
+        self.assertTrue((wt_bb / ".agents" / "hooks" / "search_guard.py").exists())
         if Path("/baseball/data/vulcan_baseball_rules/big_projection_engine_invariants.md").exists():
             self.assertTrue((wt_bb / ".agents" / "rules" / "big_projection_engine_invariants.md").exists())
 
