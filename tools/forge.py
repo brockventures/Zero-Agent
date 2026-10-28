@@ -500,7 +500,13 @@ def stage_vulcan_worktree_profile(
     if not wt.exists():
         return {"files": {}, "had_agents_dir": False, "had_rules_dir": False, "staged_rules": []}
 
-    norm_targets = {str(f).strip().lstrip("./") for f in (target_files or []) if str(f).strip()}
+    def _strip_dot_slash(p: Any) -> str:
+        s = str(p or "").strip()
+        while s.startswith("./"):
+            s = s[2:]
+        return s
+
+    norm_targets = {_strip_dot_slash(f) for f in (target_files or []) if _strip_dot_slash(f)}
     root_doc_names = {"GEMINI.md", "AGENTS.md", "agents.md"}
     root_docs_targeted = bool(norm_targets & root_doc_names)
 
@@ -856,6 +862,89 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
 init_forge_db()
 
 
+def consolidate_legacy_forge_db(
+    primary_db_path: Path | str = FORGE_DB_PATH,
+    legacy_db_path: Path | str = DATA_DIR / "forge.db",
+) -> dict:
+    """Migrate missing rows from legacy_db into primary_db and replace legacy_db with a symlink."""
+    primary = Path(primary_db_path)
+    legacy = Path(legacy_db_path)
+
+    if not primary.exists() or not legacy.exists():
+        return {"migrated_rows": {}, "symlinked": False, "status": "missing_db"}
+
+    if legacy.is_symlink():
+        return {"migrated_rows": {}, "symlinked": False, "status": "already_symlink"}
+
+    try:
+        if primary.resolve() == legacy.resolve():
+            return {"migrated_rows": {}, "symlinked": False, "status": "same_file"}
+    except Exception:
+        return {"migrated_rows": {}, "symlinked": False, "status": "resolve_error"}
+
+    tables = ("forge_builds", "forge_chunks", "forge_jobs", "forge_decisions")
+    init_forge_db(primary)
+
+    migrated_rows: dict[str, int] = {}
+    legacy_conn = sqlite3.connect(str(legacy), timeout=10.0)
+    primary_conn = sqlite3.connect(str(primary), timeout=10.0)
+    try:
+        primary_conn.execute("PRAGMA foreign_keys=OFF;")
+        legacy_tables = {
+            r[0] for r in legacy_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        primary_tables = {
+            r[0] for r in primary_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+
+        for table in tables:
+            if table not in legacy_tables or table not in primary_tables:
+                continue
+            leg_cols = [r[1] for r in legacy_conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            pri_cols = [r[1] for r in primary_conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            common = [c for c in leg_cols if c in pri_cols]
+            if not common:
+                continue
+            col_str = ", ".join(f'"{c}"' for c in common)
+            placeholders = ", ".join("?" for _ in common)
+            rows = legacy_conn.execute(f"SELECT {col_str} FROM {table}").fetchall()
+            if rows:
+                cur = primary_conn.executemany(
+                    f"INSERT OR IGNORE INTO {table} ({col_str}) VALUES ({placeholders})",
+                    rows,
+                )
+                migrated_rows[table] = cur.rowcount
+            else:
+                migrated_rows[table] = 0
+
+        primary_conn.commit()
+        try:
+            legacy_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except Exception:
+            pass
+    finally:
+        legacy_conn.close()
+        primary_conn.close()
+
+    try:
+        legacy.unlink()
+    except FileNotFoundError:
+        pass
+    for sidecar in (Path(f"{legacy}-wal"), Path(f"{legacy}-shm")):
+        try:
+            sidecar.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    legacy.symlink_to(primary.resolve())
+    return {
+        "migrated_rows": migrated_rows,
+        "symlinked": True,
+        "primary": str(primary.resolve()),
+        "legacy": str(legacy),
+    }
+
+
 def _now_pt_str(ts: Optional[float] = None) -> str:
     dt = datetime.fromtimestamp(ts if ts is not None else time.time(), tz=timezone.utc).astimezone(PT_TZ)
     return dt.strftime("%Y-%m-%d %I:%M:%S %p PT")
@@ -1071,6 +1160,10 @@ def _normalize_file_list(raw: Any) -> list[str]:
             val = item.strip()
         elif isinstance(item, dict):
             val = str(item.get("file") or item.get("path") or item.get("target_file") or item.get("name") or "").strip()
+        while val.startswith("./"):
+            val = val[2:]
+        if val == ".":
+            val = ""
         if val and val not in out:
             out.append(val)
     return out
@@ -1207,7 +1300,9 @@ def _normalize_repo_target_file(repo_dir: Path | str, tf: Any) -> str:
         if cand_norm.startswith(f"{repo_norm}/"):
             return cand_norm[len(repo_norm) + 1 :]
         return cand_norm.lstrip("/")
-    rel = os.path.normpath(raw).replace("\\", "/").lstrip("./")
+    rel = os.path.normpath(raw).replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
     if rel == ".":
         return ""
     if repo_rel and rel.startswith(f"{repo_rel}/"):
@@ -2796,6 +2891,12 @@ def _get_active_build_worker_ids(db_path: Path | str = FORGE_DB_PATH) -> set[str
 
 def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
     """Clean up stale /tmp/forge-wt-* worktrees and reset interrupted running chunks on startup, preserving active worker worktrees."""
+    if _is_prod_forge_env(db_path):
+        try:
+            consolidate_legacy_forge_db(primary_db_path=db_path)
+        except Exception as e:
+            print(f"[FORGE] consolidate_legacy_forge_db error: {e}", file=sys.stderr)
+
     active_build_ids = _get_active_build_worker_ids(db_path)
     cleaned_wts = []
     for wt_path in glob.glob("/tmp/forge-wt-*"):
@@ -3327,6 +3428,16 @@ class ForgeSupervisor:
         staging_ref = f"forge/release-{build_id}"
 
         base_ref = staging_ref
+        build_log_path = FORGE_LOGS_DIR / f"build-{build_id}.log"
+
+        def _log_build(msg: str) -> None:
+            try:
+                FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+                with open(build_log_path, "a", encoding="utf-8") as lf:
+                    lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}] {msg}\n")
+                    lf.flush()
+            except Exception:
+                pass
 
         def _ensure_chunk_worktree(force_recreate: bool = False) -> None:
             if not force_recreate and wt_dir.exists() and (wt_dir / ".git").exists():
@@ -3350,7 +3461,7 @@ class ForgeSupervisor:
                 shutil.rmtree(wt_dir, ignore_errors=True)
                 subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
                 wt_res = subprocess.run(
-                    ["git", "worktree", "add", "-B", branch_name, str(wt_dir), base_ref],
+                    ["git", "worktree", "add", "--force", "-B", branch_name, str(wt_dir), base_ref],
                     cwd=str(repo_dir),
                     capture_output=True,
                     text=True,
@@ -3358,7 +3469,7 @@ class ForgeSupervisor:
                 )
                 if wt_res.returncode != 0:
                     subprocess.run(
-                        ["git", "worktree", "add", "-B", branch_name, str(wt_dir), "HEAD"],
+                        ["git", "worktree", "add", "--force", "-B", branch_name, str(wt_dir), "HEAD"],
                         cwd=str(repo_dir),
                         capture_output=True,
                         text=True,
@@ -3390,7 +3501,7 @@ class ForgeSupervisor:
         max_attempts = 3
 
         for attempt in range(1, max_attempts + 1):
-            _ensure_chunk_worktree(force_recreate=False)
+            _ensure_chunk_worktree(force_recreate=not wt_dir.exists())
             model = ESCALATION_WORKER_MODEL if attempt == max_attempts else (chunk_row["worker_model"] or DEFAULT_WORKER_MODEL)
             with self._state_lock, get_db_connection(self.db_path) as conn:
                 conn.execute(
@@ -3398,6 +3509,9 @@ class ForgeSupervisor:
                     (attempt, model, f"Booting Vulcan ({model})...", chunk_id),
                 )
             post_or_update_build_widget(build_id, db_path=self.db_path)
+            _log_build(
+                f"[Attempt {attempt}/{max_attempts}] Starting chunk {chunk_id} (index {chunk_idx}: '{chunk_row['title']}') model={model}"
+            )
 
             prompt = format_chunk_prompt(build_id, chunk_idx, db_path=self.db_path, worktree_dir=str(wt_dir))
             agy_cmd = _build_low_priority_prefix() + [
@@ -3488,13 +3602,29 @@ class ForgeSupervisor:
                     wd_thread.join(timeout=1.0)
 
                 if timed_out_reason[0]:
+                    tail_last_15 = "".join(tail_lines[-15:]).rstrip()
+                    _log_build(
+                        f"[Attempt {attempt}/{max_attempts}] Worker timed out: {timed_out_reason[0]} (steps: {step_cnt})\n"
+                        f"Tail lines (last 15):\n{tail_last_15}"
+                    )
                     raise TimeoutError(timed_out_reason[0])
                 ret_code = proc.wait(timeout=30)
+                tail_last_15 = "".join(tail_lines[-15:]).rstrip()
+                _log_build(
+                    f"[Attempt {attempt}/{max_attempts}] Worker finished with exit code {ret_code} (steps: {step_cnt})\n"
+                    f"Tail lines (last 15):\n{tail_last_15}"
+                )
                 if ret_code != 0:
                     err_msg = "".join(tail_lines).strip() or f"agy exited {ret_code}"
                     with self._state_lock, get_db_connection(self.db_path) as conn:
                         conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (err_msg[-1500:], chunk_id))
             except Exception as e:
+                if not timed_out_reason[0]:
+                    tail_last_15 = "".join(tail_lines[-15:]).rstrip()
+                    _log_build(
+                        f"[Attempt {attempt}/{max_attempts}] Worker error: {e} (steps: {step_cnt})\n"
+                        f"Tail lines (last 15):\n{tail_last_15}"
+                    )
                 with self._state_lock, get_db_connection(self.db_path) as conn:
                     conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (str(e), chunk_id))
                 continue
@@ -3511,6 +3641,13 @@ class ForgeSupervisor:
                 prohibited_files=prohibited,
                 target_files=target_files,
                 require_changes=True,
+            )
+            v_status = "PASSED" if passed else "FAILED"
+            _log_build(
+                f"[Attempt {attempt}/{max_attempts}] verify_chunk_worktree result: {v_status}\n"
+                f"Command: {chunk_row['verification_cmd']}\n"
+                f"Diff stat: {diff_stat}\n"
+                f"Verification output:\n{err_out.strip()}"
             )
             if passed:
                 git_lk = _acquire_repo_git_lock(repo_dir)
@@ -3535,6 +3672,7 @@ class ForgeSupervisor:
                         )
                         if commit_proc.returncode != 0:
                             c_err = f"{commit_proc.stdout}\n{commit_proc.stderr}".strip()
+                            _log_build(f"[Attempt {attempt}/{max_attempts}] Git commit failed (code {commit_proc.returncode}): {c_err}")
                             with self._state_lock, get_db_connection(self.db_path) as conn:
                                 conn.execute(
                                     "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
@@ -3542,6 +3680,7 @@ class ForgeSupervisor:
                                 )
                             continue
                     except Exception as ce:
+                        _log_build(f"[Attempt {attempt}/{max_attempts}] Git commit exception: {ce}")
                         with self._state_lock, get_db_connection(self.db_path) as conn:
                             conn.execute(
                                 "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
@@ -3569,10 +3708,12 @@ class ForgeSupervisor:
                             subprocess.run(["git", "rebase", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
                             shutil.rmtree(wt_dir, ignore_errors=True)
                             subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
+                            rb_err = f"{rb_proc.stdout}\n{rb_proc.stderr}".strip()
+                            _log_build(f"[Attempt {attempt}/{max_attempts}] Git rebase onto {base_ref} failed: {rb_err}")
                             with self._state_lock, get_db_connection(self.db_path) as conn:
                                 conn.execute(
                                     "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
-                                    (f"git rebase onto {base_ref} failed:\n{rb_proc.stdout}\n{rb_proc.stderr}"[-1400:], chunk_id),
+                                    (f"git rebase onto {base_ref} failed:\n{rb_err}"[-1400:], chunk_id),
                                 )
                             continue
 
@@ -3595,10 +3736,12 @@ class ForgeSupervisor:
                             subprocess.run(["git", "rebase", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
                             shutil.rmtree(wt_dir, ignore_errors=True)
                             subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
+                            rb_def_err = f"{rb_def.stdout}\n{rb_def.stderr}".strip()
+                            _log_build(f"[Attempt {attempt}/{max_attempts}] Git rebase onto {default_branch} failed: {rb_def_err}")
                             with self._state_lock, get_db_connection(self.db_path) as conn:
                                 conn.execute(
                                     "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
-                                    (f"git rebase onto {default_branch} failed:\n{rb_def.stdout}\n{rb_def.stderr}"[-1400:], chunk_id),
+                                    (f"git rebase onto {default_branch} failed:\n{rb_def_err}"[-1400:], chunk_id),
                                 )
                             continue
 
@@ -3704,6 +3847,7 @@ class ForgeSupervisor:
                 finally:
                     _release_file_lock(git_lk)
 
+                _log_build(f"Chunk {chunk_id} successfully merged into {branch_name} (diff: {diff_stat})")
                 post_or_update_build_widget(build_id, db_path=self.db_path)
                 sync_forge_channel_header(db_path=self.db_path)
                 if remaining == 0:
@@ -3714,6 +3858,7 @@ class ForgeSupervisor:
                     conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (err_out, chunk_id))
 
         # Exhausted all attempts
+        _log_build(f"Chunk {chunk_id} failed after exhausting all {max_attempts} attempts.")
         git_lk = _acquire_repo_git_lock(repo_dir)
         try:
             shutil.rmtree(wt_dir, ignore_errors=True)

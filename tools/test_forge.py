@@ -1758,5 +1758,188 @@ def test_short_job_suppresses_forge_widget_until_90s(tmp_path, monkeypatch):
     assert long_id in widget_calls
 
 
+def test_normalize_file_list_preserves_leading_dot_on_hidden_paths():
+    import tools.forge as forge
+
+    raw_items = [
+        "./.agents/hooks/batch_guard.py",
+        ".agents/rules/no_server_wide_search.md",
+        "./tools/forge.py",
+        {"file": "./.agents/hooks.json"},
+        {"path": ".agents/skills/SKILL.md"},
+    ]
+    norm = forge._normalize_file_list(raw_items)
+    assert norm == [
+        ".agents/hooks/batch_guard.py",
+        ".agents/rules/no_server_wide_search.md",
+        "tools/forge.py",
+        ".agents/hooks.json",
+        ".agents/skills/SKILL.md",
+    ]
+
+    # Also verify _normalize_repo_target_file preserves leading dot
+    assert (
+        forge._normalize_repo_target_file("/workspace", "./.agents/hooks/batch_guard.py")
+        == ".agents/hooks/batch_guard.py"
+    )
+    assert (
+        forge._normalize_repo_target_file("/workspace", "/workspace/.agents/hooks/batch_guard.py")
+        == ".agents/hooks/batch_guard.py"
+    )
+    assert (
+        forge._normalize_repo_target_file("/workspace", ".agents/hooks/batch_guard.py")
+        == ".agents/hooks/batch_guard.py"
+    )
+
+
+def test_consolidate_legacy_forge_db_migrates_rows_and_symlinks(tmp_path):
+    import sqlite3
+    import tools.forge as forge
+
+    pri = tmp_path / "baseball" / "data" / "forge.db"
+    leg = tmp_path / "workspace" / "data" / "forge.db"
+    pri.parent.mkdir(parents=True)
+    leg.parent.mkdir(parents=True)
+
+    forge.init_forge_db(pri)
+    forge.init_forge_db(leg)
+
+    now = time.time()
+    with sqlite3.connect(str(leg)) as conn:
+        conn.execute(
+            "INSERT INTO forge_builds (id, title, origin_channel_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("b-legacy", "Legacy Title", 100, now, now),
+        )
+        conn.execute(
+            "INSERT INTO forge_chunks (id, build_id, chunk_index, title, instructions) VALUES (?, ?, ?, ?, ?)",
+            ("c-legacy", "b-legacy", 0, "Legacy Chunk", "Do work"),
+        )
+        conn.execute(
+            "INSERT INTO forge_jobs (id, name, command, start_time) VALUES (?, ?, ?, ?)",
+            ("j-legacy", "Legacy Job", "echo test", now),
+        )
+        conn.execute(
+            "INSERT INTO forge_decisions (id, category, title, summary, handler_type, payload_json, channel_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("d-legacy", "cat", "Legacy Decision", "summary", "handler", "{}", 100, now + 100, now),
+        )
+        conn.commit()
+
+    # Pre-seed primary with an existing build to verify INSERT OR IGNORE behavior
+    with sqlite3.connect(str(pri)) as conn:
+        conn.execute(
+            "INSERT INTO forge_builds (id, title, origin_channel_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("b-legacy", "Primary Existing Title", 100, now, now),
+        )
+        conn.commit()
+
+    res = forge.consolidate_legacy_forge_db(primary_db_path=pri, legacy_db_path=leg)
+    assert res["symlinked"] is True
+    assert leg.is_symlink()
+    assert leg.resolve() == pri.resolve()
+
+    with sqlite3.connect(str(pri)) as conn:
+        b = conn.execute("SELECT id, title FROM forge_builds WHERE id = 'b-legacy' LIMIT 1").fetchone()
+        assert b[1] == "Primary Existing Title"  # Preserved original primary title via INSERT OR IGNORE
+        c = conn.execute("SELECT id, title FROM forge_chunks WHERE id = 'c-legacy' LIMIT 1").fetchone()
+        assert c is not None
+        assert c[1] == "Legacy Chunk"
+        j = conn.execute("SELECT id, name FROM forge_jobs WHERE id = 'j-legacy' LIMIT 1").fetchone()
+        assert j is not None
+        assert j[1] == "Legacy Job"
+        d = conn.execute("SELECT id, title FROM forge_decisions WHERE id = 'd-legacy' LIMIT 1").fetchone()
+        assert d is not None
+        assert d[1] == "Legacy Decision"
+
+    # Idempotent call on already-symlinked path
+    res2 = forge.consolidate_legacy_forge_db(primary_db_path=pri, legacy_db_path=leg)
+    assert res2["symlinked"] is False
+    assert res2["status"] == "already_symlink"
+
+
+def test_execute_chunk_in_worktree_persists_build_log(tmp_path, monkeypatch):
+    import subprocess
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    monkeypatch.setattr(forge, "FORGE_DB_PATH", db_p)
+
+    logs_dir = tmp_path / "forge_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(forge, "FORGE_LOGS_DIR", logs_dir)
+
+    monkeypatch.setattr(forge, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "sync_forge_channel_header", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "dispatch_build_completion_to_origin", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "dispatch_build_failure_to_origin", lambda *a, **kw: None)
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Vulcan"], cwd=str(repo_dir), check=True, capture_output=True)
+    target_f = repo_dir / "math_util.py"
+    target_f.write_text("VAL = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+
+    plan = {
+        "title": "Log Persistence Test",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Persist non-empty build telemetry."],
+        "chunks": [
+            {
+                "title": "Update math_util.py",
+                "target_files": ["math_util.py"],
+                "instructions": "Update VAL = 42 in math_util.py and verify with assertion.",
+                "verification_cmd": "python3 -c 'import math_util; assert math_util.VAL == 42'",
+            }
+        ],
+    }
+    res = forge.enqueue_build(plan, db_path=db_p, post_widget=False)
+    build_id = res["build_id"]
+
+    class FakeAgProc:
+        def __init__(self, cmd, cwd=None, **kwargs):
+            self.cwd = Path(cwd)
+            (self.cwd / "math_util.py").write_text("VAL = 42\n", encoding="utf-8")
+            self.stdout = iter(["Vulcan step 1: edit math_util.py\n", "Vulcan step 2: verification ready\n"])
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    real_popen = subprocess.Popen
+
+    def fake_popen(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and any("/usr/local/bin/agy" in str(x) for x in cmd):
+            return FakeAgProc(cmd, *args, **kwargs)
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    sup = forge.ForgeSupervisor(db_path=db_p)
+    with forge.get_db_connection(db_p) as conn:
+        chunk_row = conn.execute(
+            "SELECT id, chunk_index, build_id, title, repo, instructions, verification_cmd, "
+            "prohibited_files_json, target_files_json, worker_model FROM forge_chunks WHERE build_id = ? LIMIT 1",
+            (build_id,),
+        ).fetchone()
+
+    ok = sup.execute_chunk_in_worktree(build_id, chunk_row)
+    assert ok is True
+
+    log_path = logs_dir / f"build-{build_id}.log"
+    assert log_path.exists()
+    content = log_path.read_text(encoding="utf-8")
+    assert len(content) > 0
+    assert "Attempt 1" in content
+    assert "verify_chunk_worktree result: PASSED" in content
+    assert "Worker finished with exit code 0" in content
+
+
 if __name__ == "__main__":
     unittest.main()
