@@ -9,19 +9,12 @@ channel context isolation and air-gap boundaries.
 import asyncio
 import json
 import os
-import re
-import sys
 import time
 from collections import deque
-from datetime import datetime, timezone
-from pathlib import Path
 import discord
 
 from tools.bridge_state import (
-    DATA_DIR,
-    IN_FLIGHT_FILE,
     TARGET_CHANNEL_ID,
-    PT_TZ,
     get_runtime_rules,
     get_channel_session_id,
     set_channel_session_id,
@@ -31,29 +24,12 @@ from tools.bridge_state import (
     check_compaction_needed,
     get_active_model,
     update_beacon,
-    sync_credentials,
-    get_gif_turn_count,
-    increment_gif_turn,
-    reset_gif_turn,
-    has_reaction_gif,
-    get_gif_prompt_guidance,
     record_in_flight,
-    clear_in_flight,
     record_daemon_pids,
 )
 from tools.bridge_formatting import (
-    format_command_preview,
-    format_for_discord,
-    extract_agent_response,
-    harvest_transcript_response,
     AgyStreamParser,
-    chunk_text,
-    scrub_credentials,
-    clean_discord_latex,
-    generate_concise_thread_title,
     parse_agy_error,
-    format_agy_error_message,
-    is_internal_cli_leak,
 )
 from tools.bridge_engine import (
     TurnCoordinator,
@@ -111,7 +87,6 @@ from tools.bridge_pipeline import (
     TurnTimer,
     prepare_turn_prompt,
     deliver_turn_output,
-    find_new_artifacts,
 )
 
 class PersistentChannelWorker:
@@ -718,20 +693,48 @@ class PersistentDaemonManager:
             return None
         return self.workers.get(cid)
 
-    async def start_all(self):
+    async def start_all(self, include_classifier: bool | None = None):
         """Warm up all dedicated persistent daemons on bot ready."""
         if not is_persistent_daemons_enabled():
             print("[BridgeDaemon] Persistent worker daemons disabled in runtime rules.")
             return
         tasks = [w.start() for w in self.workers.values()]
+        run_classifier = (
+            include_classifier
+            if include_classifier is not None
+            else (os.getenv("TESTING") != "1")
+        )
+        if run_classifier:
+            try:
+                from tools.classifier import warm_classifier
+
+                tasks.append(asyncio.to_thread(warm_classifier.start))
+            except Exception as e:
+                print(f"[BridgeDaemon] ⚠️ Failed to warm warm_classifier: {e}")
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for w, res in zip(self.workers.values(), results):
+        for w, res in zip(self.workers.values(), results[: len(self.workers)]):
             if isinstance(res, Exception):
                 print(f"[BridgeDaemon] ⚠️ Failed to warm worker #{w.name}: {res}")
+        if run_classifier and len(results) > len(self.workers):
+            warm_res = results[-1]
+            if isinstance(warm_res, Exception):
+                print(f"[BridgeDaemon] ⚠️ Failed to warm warm_classifier: {warm_res}")
 
-    async def shutdown_all(self):
+    async def shutdown_all(self, include_classifier: bool | None = None):
         """Cleanly terminate all persistent workers before bridge reload."""
         tasks = [w.shutdown() for w in self.workers.values()]
+        run_classifier = (
+            include_classifier
+            if include_classifier is not None
+            else (os.getenv("TESTING") != "1")
+        )
+        if run_classifier:
+            try:
+                from tools.classifier import warm_classifier
+
+                tasks.append(asyncio.to_thread(warm_classifier.shutdown))
+            except Exception as e:
+                print(f"[BridgeDaemon] ⚠️ Failed to shutdown warm_classifier: {e}")
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def recycle_worker(self, channel_id: int | str, new_conv_id: str | None = None):
@@ -740,12 +743,24 @@ class PersistentDaemonManager:
         if worker:
             await worker.recycle(new_conv_id=new_conv_id)
 
-    async def recycle_all(self):
+    async def recycle_all(self, include_classifier: bool | None = None):
         """Recycle all persistent workers (e.g. after model switch)."""
         tasks = [w.recycle() for w in self.workers.values()]
+        run_classifier = (
+            include_classifier
+            if include_classifier is not None
+            else (os.getenv("TESTING") != "1")
+        )
+        if run_classifier:
+            try:
+                from tools.classifier import warm_classifier
+
+                tasks.append(asyncio.to_thread(warm_classifier.recycle))
+            except Exception as e:
+                print(f"[BridgeDaemon] ⚠️ Failed to recycle warm_classifier: {e}")
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def proactive_nightly_recycle(self):
+    async def proactive_nightly_recycle(self, include_classifier: bool | None = None):
         """Proactively recycle and re-warm all persistent workers overnight (e.g. during 2:00 AM PT rollover).
 
         Immediately terminates yesterday's workers, boots fresh warm sessions, and evicts
@@ -768,6 +783,18 @@ class PersistentDaemonManager:
                 print(f"[BridgeDaemon] ⚠️ Error recycling worker #{w.name} during overnight rollover: {err}")
 
         tasks = [_recycle_one(w) for w in self.workers.values()]
+        run_classifier = (
+            include_classifier
+            if include_classifier is not None
+            else (os.getenv("TESTING") != "1")
+        )
+        if run_classifier:
+            try:
+                from tools.classifier import warm_classifier
+
+                tasks.append(asyncio.to_thread(warm_classifier.recycle))
+            except Exception as err:
+                print(f"[BridgeDaemon] ⚠️ Error recycling warm_classifier during overnight rollover: {err}")
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 

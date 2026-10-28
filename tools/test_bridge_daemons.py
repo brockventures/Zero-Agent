@@ -12,16 +12,22 @@ Validates:
 
 import asyncio
 import json
+import os
 import shutil
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import sys
-if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+repo_root = str(Path(__file__).resolve().parent.parent)
+while "/workspace" in sys.path:
+    sys.path.remove("/workspace")
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+elif sys.path[0] != repo_root:
+    sys.path.remove(repo_root)
+    sys.path.insert(0, repo_root)
 
 import tools.bridge_daemons as bd
 import tools.bridge_state as bs
@@ -30,12 +36,29 @@ import tools.bridge_state as bs
 class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
+        # Ensure sys.path prioritizes this worktree over /workspace
+        r_root = str(Path(__file__).resolve().parent.parent)
+        while "/workspace" in sys.path:
+            sys.path.remove("/workspace")
+        if sys.path[0] != r_root:
+            if r_root in sys.path:
+                sys.path.remove(r_root)
+            sys.path.insert(0, r_root)
+        for mod_name in ["tools.classifier", "tools.bridge_daemons"]:
+            if mod_name in sys.modules:
+                m = sys.modules[mod_name]
+                if getattr(m, "__file__", "").startswith("/workspace"):
+                    import importlib
+                    importlib.reload(m)
+
         self.temp_dir = tempfile.mkdtemp()
         self.temp_path = Path(self.temp_dir)
         self.orig_data_dir = bs.DATA_DIR
         self.orig_sessions_file = bs.SESSIONS_FILE
         self.orig_session_meta_file = bs.SESSION_METADATA_FILE
         self.orig_runtime_rules = bs.RUNTIME_RULES_FILE
+        self.orig_testing = os.environ.get("TESTING")
+        os.environ["TESTING"] = "1"
 
         bs.DATA_DIR = self.temp_path
         bs.SESSIONS_FILE = self.temp_path / "sessions.json"
@@ -45,6 +68,10 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
         bs.DATA_DIR = self.orig_data_dir
         bs.SESSIONS_FILE = self.orig_sessions_file
         bs.SESSION_METADATA_FILE = self.orig_session_meta_file
+        if self.orig_testing is None:
+            os.environ.pop("TESTING", None)
+        else:
+            os.environ["TESTING"] = self.orig_testing
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_01_dedicated_channel_detection(self):
@@ -273,6 +300,7 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             mock_worker_home.recycle.assert_awaited_once_with(new_conv_id=None)
             mock_worker_banana.recycle.assert_awaited_once_with(new_conv_id=None)
             self.assertEqual(mock_reset_meta.call_count, 2)
+            self.assertEqual(mock_rm_key.call_count, 2)
             self.assertNotIn("home", mock_keys)
             self.assertNotIn(str(bd.BANANA_STAND_CHANNEL_ID), mock_keys)
 
@@ -311,6 +339,7 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
 
             # Recycle MUST NOT be called on this turn
             mock_recycle.assert_not_awaited()
+            mock_deliver.assert_called_once()
             # Carryforward MUST be retrieved and injected into prompt passed to worker stdin
             mock_get_cf.assert_called_once_with(sess_key="home")
             written_bytes = test_worker.proc.stdin.write.call_args[0][0]
@@ -476,6 +505,177 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(result)
             mock_deliver.assert_not_called()
             mock_recycle.assert_called_once_with(keep_conv_id=True)
+
+    async def test_12_warm_classifier_daemon_lifecycle(self):
+        """Verify WarmClassifierDaemon initialization, start, shutdown, and recycle."""
+        from tools.classifier import WarmClassifierDaemon
+
+        daemon = WarmClassifierDaemon(work_dir=str(self.temp_path / "clf"), max_turns=5)
+        self.assertEqual(daemon.work_dir, str(self.temp_path / "clf"))
+        self.assertEqual(daemon.max_turns, 5)
+        self.assertIsNone(daemon.proc)
+        self.assertIsNone(daemon.pid)
+        self.assertEqual(daemon.turn_count, 0)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 98765
+        mock_proc.poll.return_value = None
+
+        with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+            daemon.start()
+            mock_popen.assert_called_once()
+            call_args = mock_popen.call_args
+            self.assertEqual(
+                call_args[0][0],
+                [
+                    "agy",
+                    "--input-format=stream-json",
+                    "--output-format=stream-json",
+                    "--model=gemini-3.8-flash-low",
+                    "--disable-slash-commands",
+                    "--print-timeout=4h",
+                    "--print=",
+                ],
+            )
+            self.assertEqual(call_args[1]["cwd"], str(self.temp_path / "clf"))
+            self.assertEqual(daemon.pid, 98765)
+
+            # Test recycle
+            daemon.recycle()
+            mock_proc.terminate.assert_called_once()
+            self.assertEqual(mock_popen.call_count, 2)
+
+            # Test shutdown
+            daemon.shutdown()
+            self.assertIsNone(daemon.proc)
+            self.assertIsNone(daemon.pid)
+            self.assertEqual(daemon.turn_count, 0)
+
+    async def test_13_warm_classifier_classify_streaming(self):
+        """Verify WarmClassifierDaemon.classify streams NDJSON lines and extracts response."""
+        from tools.classifier import WarmClassifierDaemon
+
+        daemon = WarmClassifierDaemon(work_dir=str(self.temp_path / "clf"), max_turns=10)
+        mock_proc = MagicMock()
+        mock_proc.pid = 54321
+        mock_proc.poll.return_value = None
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = MagicMock()
+
+        lines = [
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"0."}}\n',
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"85 | REACT: 🚀"}}\n',
+            '{"event":"result","result":{"response":"0.85 | REACT: 🚀"}}\n',
+            "",
+        ]
+        mock_proc.stdout.readline.side_effect = lines
+        daemon.proc = mock_proc
+
+        with patch("select.select", return_value=([mock_proc.stdout], [], [])):
+            res = daemon.classify("Check container logs on Synology")
+            self.assertEqual(res, "0.85 | REACT: 🚀")
+            self.assertEqual(daemon.turn_count, 1)
+
+            # Verify stdin received user event
+            mock_proc.stdin.write.assert_called_once()
+            written_str = mock_proc.stdin.write.call_args[0][0]
+            written_data = json.loads(written_str)
+            self.assertEqual(written_data["event"], "user")
+            self.assertEqual(written_data["message"]["content"], "Check container logs on Synology")
+
+    async def test_14_warm_classifier_auto_recycle_at_max_turns(self):
+        """Verify WarmClassifierDaemon automatically triggers background recycle at max_turns."""
+        from tools.classifier import WarmClassifierDaemon
+
+        daemon = WarmClassifierDaemon(work_dir=str(self.temp_path / "clf"), max_turns=2)
+        mock_proc = MagicMock()
+        mock_proc.pid = 55555
+        mock_proc.poll.return_value = None
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = MagicMock()
+
+        lines = [
+            '{"event":"result","result":{"response":"0.50"}}\n',
+            '{"event":"result","result":{"response":"0.50"}}\n',
+        ]
+        mock_proc.stdout.readline.side_effect = lines
+        daemon.proc = mock_proc
+
+        recycle_called = asyncio.Event()
+
+        def fake_recycle():
+            recycle_called.set()
+
+        with patch("select.select", return_value=([mock_proc.stdout], [], [])), \
+             patch.object(daemon, "recycle", side_effect=fake_recycle):
+            # First turn: turn_count reaches 1, no recycle
+            res1 = daemon.classify("Turn 1 prompt")
+            self.assertEqual(res1, "0.50")
+            self.assertEqual(daemon.turn_count, 1)
+            self.assertFalse(recycle_called.is_set())
+
+            # Second turn: turn_count reaches 2 (max_turns=2), auto-recycle triggered in background thread
+            res2 = daemon.classify("Turn 2 prompt")
+            self.assertEqual(res2, "0.50")
+            self.assertEqual(daemon.turn_count, 2)
+
+            # Wait for background recycle thread
+            await asyncio.wait_for(recycle_called.wait(), timeout=2.0)
+            self.assertTrue(recycle_called.is_set())
+
+    async def test_15_score_relevance_warm_and_fallback(self):
+        """Verify score_relevance uses warm_classifier and falls back to cold subprocess.run on failure."""
+        from tools.classifier import pop_last_reaction, score_relevance, warm_classifier
+
+        content = "Has anyone seen containerd drop sockets under high IO?"
+
+        # 1. Warm classifier success path
+        with patch.object(warm_classifier, "classify", return_value="0.95 | REACT: 🔥") as mock_clf, \
+             patch("subprocess.run") as mock_subproc:
+            score = score_relevance(content, use_warm=True)
+            self.assertEqual(score, 0.95)
+            self.assertEqual(pop_last_reaction(), "🔥")
+            mock_clf.assert_called_once()
+            mock_subproc.assert_not_called()
+
+        # 2. Warm classifier timeout/None fallback to subprocess.run
+        mock_subproc_res = MagicMock()
+        mock_subproc_res.stdout = "0.75 | REACT: 👍"
+        with patch.object(warm_classifier, "classify", return_value=None) as mock_clf, \
+             patch("subprocess.run", return_value=mock_subproc_res) as mock_subproc:
+            score = score_relevance(content, use_warm=True)
+            self.assertEqual(score, 0.75)
+            self.assertEqual(pop_last_reaction(), "👍")
+            mock_clf.assert_called_once()
+            mock_subproc.assert_called_once()
+
+    async def test_16_persistent_daemon_manager_warm_classifier_integration(self):
+        """Verify PersistentDaemonManager integrates warm_classifier in lifecycle methods."""
+        mgr = bd.PersistentDaemonManager()
+        for w in mgr.workers.values():
+            w.start = AsyncMock()
+            w.shutdown = AsyncMock()
+            w.recycle = AsyncMock()
+
+        from tools.classifier import warm_classifier
+
+        with patch.object(warm_classifier, "start") as mock_w_start, \
+             patch.object(warm_classifier, "shutdown") as mock_w_shutdown, \
+             patch.object(warm_classifier, "recycle") as mock_w_recycle:
+            await mgr.start_all(include_classifier=True)
+            mock_w_start.assert_called_once()
+
+            await mgr.shutdown_all(include_classifier=True)
+            mock_w_shutdown.assert_called_once()
+
+            await mgr.recycle_all(include_classifier=True)
+            mock_w_recycle.assert_called_once()
+
+            mock_w_recycle.reset_mock()
+            with patch("tools.bridge_state.reset_session_meta"), \
+                 patch("tools.bridge_state.remove_reset_session_key"):
+                await mgr.proactive_nightly_recycle(include_classifier=True)
+                mock_w_recycle.assert_called_once()
 
 
 if __name__ == "__main__":
