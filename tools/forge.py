@@ -2980,7 +2980,10 @@ def format_origin_completion_envelope(build_id: str, db_path: Path | str = FORGE
     )
     lines.append(
         "\nEvaluate the completed build ledger above against the original user request. "
-        "Deliver a concise final completion summary directly to Ryan in this channel focusing on what changed for him (do NOT recite commit SHAs, test pass counts, or internal verification gates unless asked)."
+        "Deliver a brief, single-message completion summary (1 short paragraph or 2–3 bullets, under 120 words) "
+        "focusing strictly on WHAT changed for Ryan and WHY it works conceptually. "
+        "Do NOT mention Python file names, function/method names, database table/column names, CSS/DOM selectors, "
+        "internal variable names, FORGE build IDs, commit SHAs, or unit test pass counts unless Ryan explicitly asked where something lives in the code."
         + reload_note
     )
     return "\n".join(lines)
