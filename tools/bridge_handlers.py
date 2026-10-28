@@ -36,6 +36,7 @@ from tools.bridge_commands import (
 )
 from tools.bridge_state import (
     get_in_flight,
+    reap_stale_in_flight_entries,
     DATA_DIR,
     ATTACHMENTS_DIR,
     IN_FLIGHT_FILE,
@@ -230,6 +231,10 @@ async def apply_bot_presence(bot: discord.Client, custom_activity: str = None, s
 
 def is_bridge_busy(home_queue=None, ext_queue=None, exclude_channel_id: int | None = None) -> list[str]:
     """Check if any task is actively running or queued across home and external channels."""
+    try:
+        reap_stale_in_flight_entries()
+    except Exception:
+        pass
     home_busy = (br.active_proc is not None and br.active_proc.returncode is None) or (home_queue is not None and not home_queue.empty())
     ext_busy = (br.ext_active_proc is not None and br.ext_active_proc.returncode is None) or (ext_queue is not None and not ext_queue.empty())
     busy = []

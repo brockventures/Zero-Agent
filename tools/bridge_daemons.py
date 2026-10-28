@@ -508,9 +508,9 @@ class PersistentChannelWorker:
                 status_msg_id=status_msg.id if status_msg else None,
                 pid=self.proc.pid if self.proc else None,
             )
-            if self.mode == "home":
+            if self.mode == "home" and self.channel_id == TARGET_CHANNEL_ID:
                 br.active_proc = self.proc
-            else:
+            elif self.mode != "home":
                 br.ext_active_proc = self.proc
 
             ch_title = resolve_channel_label(reply_target, fallback_name=self.name)

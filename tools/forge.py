@@ -2975,11 +2975,55 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
     return {"cleaned_worktrees": cleaned_wts, "reset_chunks": reset_chunks, "pruned_jobs": pruned_jobs}
 
 
-MAX_PARALLEL_BUILDS_PER_AGENT = 3
-MAX_PARALLEL_CHUNKS_PER_BUILD = 3
+MAX_PARALLEL_BUILDS_PER_AGENT = 2
+MAX_PARALLEL_CHUNKS_PER_BUILD = 2
+ACTIVE_CHAT_MAX_PARALLEL_BUILDS = 1
+ACTIVE_CHAT_MAX_PARALLEL_CHUNKS = 1
 CHUNK_WORKER_TIMEOUT_SECONDS = 1200.0
 CHUNK_SILENT_STALL_TIMEOUT_SECONDS = 300.0
 VERIFY_CMD_TIMEOUT_SECONDS = 300.0
+
+
+def _has_active_interactive_turns(max_age_s: float = 600.0) -> bool:
+    """Return True if any interactive conversational turn is currently active on Host 2 (after reaping stale entries)."""
+    try:
+        from tools.bridge_state import reap_stale_in_flight_entries
+        reap_stale_in_flight_entries()
+    except Exception:
+        pass
+
+    now = time.time()
+    has_proc = Path("/proc/1").exists()
+    candidates = [
+        DATA_DIR / "in_flight_turn.json",
+        Path("/opt/zero/workspace/data/in_flight_turn.json"),
+    ]
+    seen: set[Path] = set()
+    for p in candidates:
+        try:
+            if not p.exists():
+                continue
+            rp = p.resolve()
+            if rp in seen:
+                continue
+            seen.add(rp)
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            for k, v in data.items():
+                if not str(k).isdigit() or not isinstance(v, dict):
+                    continue
+                ts = float(v.get("ts") or 0.0)
+                if (now - ts) > max_age_s:
+                    continue
+                pid = v.get("pid")
+                if has_proc and isinstance(pid, int) and pid > 1 and rp == (DATA_DIR / "in_flight_turn.json").resolve():
+                    if not Path(f"/proc/{pid}").exists():
+                        continue
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -3211,8 +3255,23 @@ class ForgeSupervisor:
             pass
         return active_ids
 
+    def _effective_max_builds(self) -> int:
+        if _is_prod_forge_env(self.db_path) and _has_active_interactive_turns():
+            return min(self.max_parallel_builds, ACTIVE_CHAT_MAX_PARALLEL_BUILDS)
+        return self.max_parallel_builds
+
+    def _effective_max_chunks(self) -> int:
+        if _is_prod_forge_env(self.db_path) and _has_active_interactive_turns():
+            return min(self.max_parallel_chunks, ACTIVE_CHAT_MAX_PARALLEL_CHUNKS)
+        return self.max_parallel_chunks
+
     def tick_sync(self) -> dict:
         """Synchronous housekeeping tick: expire stale decisions, prune 1h completed #forge cards, sync header, dispatch SDK tasks, and advance queued builds."""
+        try:
+            from tools.bridge_state import reap_stale_in_flight_entries
+            reap_stale_in_flight_entries()
+        except Exception:
+            pass
         expired = expire_stale_decisions(db_path=self.db_path)
         pruned_widgets = prune_completed_build_widgets(db_path=self.db_path)
         sync_forge_channel_header(db_path=self.db_path)
@@ -3224,7 +3283,7 @@ class ForgeSupervisor:
             pass
 
         spawned_builds: list[str] = []
-        while len(self._count_active_build_workers()) < self.max_parallel_builds:
+        while len(self._count_active_build_workers()) < self._effective_max_builds():
             b_id = self.maybe_spawn_next_build_worker()
             if not b_id:
                 break
@@ -3241,7 +3300,7 @@ class ForgeSupervisor:
     def maybe_spawn_next_build_worker(self) -> Optional[str]:
         """If a build for this container is queued/running in SQLite and active build workers < max_parallel_builds, spawn a detached worker."""
         active_ids = self._count_active_build_workers()
-        if len(active_ids) >= self.max_parallel_builds:
+        if len(active_ids) >= self._effective_max_builds():
             return None
 
         in_ivy = is_ivy_container()
@@ -3283,6 +3342,7 @@ class ForgeSupervisor:
             stdout=lf_out,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            preexec_fn=_apply_low_priority if hasattr(os, "nice") else None,
         )
         self._active_build_procs[target_build_id] = proc
         return target_build_id
@@ -3352,9 +3412,10 @@ class ForgeSupervisor:
 
                     in_flight_ids = {r["id"] for r in active_futures.values()}
                     running_rows = [c for c in all_chunks if c["id"] in in_flight_ids]
+                    eff_max_chunks = self._effective_max_chunks()
 
                     for cand in all_chunks:
-                        if len(active_futures) >= self.max_parallel_chunks:
+                        if len(active_futures) >= eff_max_chunks:
                             break
                         if cand["status"] != "pending" or cand["id"] in in_flight_ids:
                             continue

@@ -365,6 +365,83 @@ def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, st
         print(f"[BridgeState] Error recording in-flight: {e}")
 
 
+def reap_stale_in_flight_entries(max_age_seconds: float = 1800.0) -> list[str]:
+    """Evict stale or already-completed channel entries from in_flight_turn.json."""
+    if not IN_FLIGHT_FILE.exists():
+        return []
+    reaped: list[str] = []
+    try:
+        with open(IN_FLIGHT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return []
+
+        now = time.time()
+        has_proc = Path("/proc/1").exists()
+        brain_root = Path("/root/.gemini/antigravity-cli/brain")
+
+        for k in list(data.keys()):
+            if not str(k).isdigit():
+                continue
+            entry = data.get(k)
+            if not isinstance(entry, dict):
+                continue
+            ts = float(entry.get("ts") or now)
+            age = now - ts
+            should_reap = False
+
+            if age > max_age_seconds:
+                should_reap = True
+            elif has_proc and age > 15.0:
+                pid = entry.get("pid")
+                if isinstance(pid, int) and pid > 1 and not Path(f"/proc/{pid}").exists():
+                    should_reap = True
+
+            if not should_reap and age > 30.0:
+                conv_id = entry.get("conv_id")
+                if conv_id:
+                    tpath = brain_root / str(conv_id) / ".system_generated" / "logs" / "transcript.jsonl"
+                    if tpath.exists() and (now - tpath.stat().st_mtime) > 20.0:
+                        try:
+                            lines = [ln.strip() for ln in tpath.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+                            if lines:
+                                last_step = json.loads(lines[-1])
+                                if (
+                                    last_step.get("type") == "PLANNER_RESPONSE"
+                                    and last_step.get("status") == "DONE"
+                                    and not last_step.get("tool_calls")
+                                ):
+                                    should_reap = True
+                        except Exception:
+                            pass
+
+            if should_reap:
+                data.pop(k, None)
+                reaped.append(str(k))
+
+        if reaped:
+            remaining_channels = [v for k, v in data.items() if str(k).isdigit() and isinstance(v, dict)]
+            if not remaining_channels:
+                IN_FLIGHT_FILE.unlink(missing_ok=True)
+            else:
+                latest = max(remaining_channels, key=lambda x: float(x.get("ts") or 0.0))
+                data["prompt"] = latest.get("prompt", "")
+                data["channel_id"] = latest.get("channel_id", TARGET_CHANNEL_ID)
+                data["conv_id"] = latest.get("conv_id")
+                data["attempts"] = latest.get("attempts", 1)
+                data["ts"] = latest.get("ts", now)
+                data["status_msg_id"] = latest.get("status_msg_id")
+                if latest.get("pid") is not None:
+                    data["pid"] = latest["pid"]
+                tmp = IN_FLIGHT_FILE.with_suffix(".tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                tmp.replace(IN_FLIGHT_FILE)
+    except Exception as e:
+        print(f"[BridgeState] Warning reaping stale in-flight entries: {e}")
+    return reaped
+
+
 def record_daemon_pids(pids: list[int] | set[int] | dict[str, int]) -> None:
     """Atomically record persistent worker PIDs for watchdog discovery."""
     try:
