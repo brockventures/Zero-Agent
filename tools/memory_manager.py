@@ -11,7 +11,6 @@ Provides:
 
 import json
 import logging
-import os
 import re
 import subprocess
 import sys
@@ -362,7 +361,7 @@ def run_memory_doctor(auto_remediate: bool = False) -> tuple[bool, str]:
     priv_count = len([f for f in PRIV_DIR.glob("*.md") if f.name != "MEMORY.md"])
 
     if unresolved_leaks:
-        issues.append(f"🚨 **Security Air-Gap Violations in Public Memory:**\n  " + "\n  ".join(unresolved_leaks))
+        issues.append("🚨 **Security Air-Gap Violations in Public Memory:**\n  " + "\n  ".join(unresolved_leaks))
 
     if not issues:
         if remediated_actions:
@@ -655,6 +654,13 @@ def run_dreaming_consolidation(dry_run: bool = False, hours_back: int = 24) -> t
                 f"Compacted `decisions.md`: pruned {compact_res['removed']} duplicate/superseded/noise blocks ({compact_res['kept']} canonical blocks kept)"
             )
         rebuild_indexes(sync_fts=True, embed=True)
+        try:
+            import vault_sync
+            vs_res = vault_sync.sync_vault(push=True)
+            if vs_res.get("changed_files", 0) > 0:
+                consolidated_items.append("Synced memory, schedule.json, and encrypted secrets to `Zero-Vault`.")
+        except Exception as e:
+            log.warning(f"Error syncing to Zero-Vault during dreaming: {e}")
 
     if not consolidated_items:
         return False, f"Dream pass complete ({hours_back}h window): no new long-term memories required consolidation."

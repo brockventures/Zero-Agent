@@ -1395,6 +1395,52 @@ def is_batched_or_mutating(cmd: str) -> bool:
     return is_batched_or_mutating_cmd(cmd)
 
 
+def _maybe_trigger_workstation_auto_wake(cwd: str) -> None:
+    """Debounced auto-wake sync for workstation replicas on Windows.
+    Spawns background vault auto-wake sync if last_vault_pull.json is missing or older than 6 hours.
+    """
+    try:
+        data_dir = os.path.join(cwd, "data")
+        pull_file = os.path.join(data_dir, "last_vault_pull.json")
+        now = time.time()
+        if os.path.exists(pull_file):
+            try:
+                with open(pull_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                ts = float(data.get("timestamp", 0.0))
+                if (now - ts) < 21600:
+                    return
+            except Exception:
+                pass
+
+        os.makedirs(data_dir, exist_ok=True)
+        payload = {"timestamp": now, "status": "waking"}
+        if os.path.exists(pull_file):
+            try:
+                with open(pull_file, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict):
+                    existing["timestamp"] = now
+                    payload = existing
+            except Exception:
+                pass
+        with open(pull_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+        vault_sync_script = os.path.join(cwd, "tools", "vault_sync.py")
+        if os.path.exists(vault_sync_script):
+            import subprocess
+
+            subprocess.Popen(
+                [sys.executable, vault_sync_script, "auto-wake"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=cwd,
+            )
+    except Exception:
+        pass
+
+
 def main():
     try:
         raw = sys.stdin.read()
@@ -1442,6 +1488,11 @@ def main():
             if st.get("agy_ppid") and str(st.get("agy_ppid")) != str(turn_anchor):
                 fresh = _default_state(time.time())
                 save_state(fresh, STATE_FILE)
+                if os.name == "nt":
+                    _maybe_trigger_workstation_auto_wake(cwd)
+            elif not st.get("agy_ppid"):
+                if os.name == "nt":
+                    _maybe_trigger_workstation_auto_wake(cwd)
         except Exception:
             pass
 
