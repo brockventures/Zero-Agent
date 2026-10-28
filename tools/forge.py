@@ -1100,12 +1100,21 @@ def check_runaway_tool_loop(
 # 3. Pillar 2: FORGE Build Queue, Symbol Pre-Hydration & Spec Validation
 # ---------------------------------------------------------------------------
 
+_EXPLICIT_LINE_RANGE_RE = re.compile(
+    r"^(?:[A-Za-z0-9_.]+\s*:\s*)?[Ll]?(\d+)(?:\s*[-–]\s*[Ll]?(\d+))?$"
+)
+_INSTRUCTION_LINE_REF_RE = re.compile(
+    r"(?:\b(?:lines?|around\s+lines?)\s+[Ll]?(\d+)(?:\s*[-–]\s*[Ll]?(\d+))?\b|\bL(\d+)\s*[-–]\s*L?(\d+)\b)",
+    re.IGNORECASE,
+)
+
+
 def extract_symbol_snippet(
     file_path: Path | str,
     symbol_name: str,
     max_lines: int = 90,
 ) -> str:
-    """Extract a line-numbered AST or regex snippet for `symbol_name` from `file_path`."""
+    """Extract a line-numbered AST, explicit line-range ('1980-2020' / 'sym:1980-2020'), or regex snippet from `file_path`."""
     p = Path(file_path)
     if not p.exists() or not p.is_file():
         return ""
@@ -1118,14 +1127,30 @@ def extract_symbol_snippet(
     if not lines:
         return ""
 
+    sym_clean = str(symbol_name or "").strip()
+    if not sym_clean:
+        return ""
+
+    # 0. Explicit line-range or line-number lookup (e.g. "1980-2020", "L1985-L2012", "func:1980-2020")
+    m_range = _EXPLICIT_LINE_RANGE_RE.match(sym_clean)
+    if m_range:
+        l_start = max(1, int(m_range.group(1)))
+        l_end = max(l_start, int(m_range.group(2))) if m_range.group(2) else l_start
+        pad = 8 if l_end > l_start else 15
+        start_idx = max(0, l_start - 1 - pad)
+        end_idx = min(len(lines), max(start_idx + 1, min(l_end + pad, start_idx + max_lines)))
+        if start_idx < len(lines):
+            return "\n".join(f"{i + 1:4d}: {lines[i]}" for i in range(start_idx, end_idx))
+        return ""
+
     # 1. Try Python AST lookup for exact class/function/method boundaries
     if p.suffix == ".py":
         try:
             tree = ast.parse(src)
-            target_part = symbol_name.split(".")[-1]
+            target_part = sym_clean.split(".")[-1]
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    if node.name == symbol_name or node.name == target_part:
+                    if node.name == sym_clean or node.name == target_part:
                         start_idx = max(0, (getattr(node, "lineno", 1) or 1) - 1)
                         end_lineno = getattr(node, "end_lineno", start_idx + 35) or (start_idx + 35)
                         end_idx = min(len(lines), start_idx + max_lines, end_lineno)
@@ -1137,7 +1162,7 @@ def extract_symbol_snippet(
             pass
 
     # 2. Fallback to regex/substring search with surrounding context
-    pattern = re.compile(rf"\b{re.escape(symbol_name.split('.')[-1])}\b")
+    pattern = re.compile(rf"\b{re.escape(sym_clean.split('.')[-1])}\b")
     for idx, line in enumerate(lines):
         if pattern.search(line):
             start_idx = max(0, idx - 3)
@@ -1146,6 +1171,103 @@ def extract_symbol_snippet(
             return "\n".join(numbered)
 
     return ""
+
+
+def _deduplicate_fact_sheet_against_instructions(fact_sheet: list[str], instructions: str) -> list[str]:
+    """Deduplicate long fact_sheet items that copy-paste the chunk instructions verbatim (>65% word overlap)."""
+    if not fact_sheet or not instructions:
+        return list(fact_sheet or [])
+    instr_words = set(re.findall(r"[a-zA-Z0-9_]{4,}", instructions.lower()))
+    if not instr_words:
+        return list(fact_sheet)
+
+    deduped: list[str] = []
+    for fact in fact_sheet:
+        f_str = str(fact or "").strip()
+        if not f_str:
+            continue
+        if len(f_str) > 220:
+            f_words = set(re.findall(r"[a-zA-Z0-9_]{4,}", f_str.lower()))
+            overlap = len(f_words & instr_words) / max(1, len(f_words)) if f_words else 0.0
+            if f_str in instructions or (len(f_words) >= 25 and overlap >= 0.65):
+                first_line = f_str.splitlines()[0].strip()
+                summary = first_line[:220] if len(first_line) > 15 else f_str[:180]
+                deduped.append(f"{summary} *(full specification in Implementation Instructions below)*")
+                continue
+        deduped.append(f_str)
+    return deduped
+
+
+def _extract_instruction_line_slices(
+    instructions: str,
+    target_files: list[str],
+    search_roots: list[Path],
+    existing_blocks: list[str],
+) -> list[str]:
+    """Auto-hydrate line windows cited in `instructions` (e.g. 'around L1985-L2012', 'lines 2395-2420') on target_files."""
+    if not instructions or not target_files:
+        return []
+
+    non_test_files = [
+        f for f in target_files
+        if not Path(f).name.startswith("test_") and not Path(f).name.endswith("_test.py") and Path(f).name.lower() != "readme.md"
+    ]
+    default_file = non_test_files[0] if len(non_test_files) == 1 else (target_files[0] if len(target_files) == 1 else None)
+
+    raw_windows: list[tuple[str, int, int]] = []
+    for m in _INSTRUCTION_LINE_REF_RE.finditer(instructions):
+        l1 = int(m.group(1) or m.group(3))
+        l2 = int(m.group(2) or m.group(4) or l1)
+        if l1 < 1 or l2 < l1 or (l2 - l1) > 250:
+            continue
+        ctx_before = instructions[max(0, m.start() - 180):m.start()]
+        ctx_after = instructions[m.end():min(len(instructions), m.end() + 80)]
+        matched_file: Optional[str] = None
+        best_pos = -1
+        for tf in target_files:
+            bname = Path(tf).name
+            pos = max(ctx_before.rfind(tf), ctx_before.rfind(bname))
+            if pos > best_pos:
+                best_pos = pos
+                matched_file = tf
+        if not matched_file:
+            for tf in target_files:
+                bname = Path(tf).name
+                if tf in ctx_after or bname in ctx_after:
+                    matched_file = tf
+                    break
+        if not matched_file:
+            matched_file = default_file
+        if matched_file:
+            raw_windows.append((matched_file, l1, l2))
+
+    if not raw_windows:
+        return []
+
+    # Merge nearby/overlapping windows per file
+    merged: list[tuple[str, int, int]] = []
+    for rel_f, s_line, e_line in sorted(raw_windows, key=lambda x: (x[0], x[1], x[2])):
+        if merged and merged[-1][0] == rel_f and s_line <= (merged[-1][2] + 20):
+            prev_f, prev_s, prev_e = merged[-1]
+            merged[-1] = (prev_f, prev_s, max(prev_e, e_line))
+        else:
+            merged.append((rel_f, s_line, e_line))
+
+    existing_text = "\n".join(existing_blocks)
+    auto_blocks: list[str] = []
+    for rel_f, s_line, e_line in merged[:4]:
+        # Skip if start line is already visible in existing hydrated blocks
+        if f"{s_line:4d}:" in existing_text and f"{e_line:4d}:" in existing_text:
+            continue
+        for root in search_roots:
+            cand_p = (root / rel_f).resolve()
+            if cand_p.exists() and cand_p.is_file():
+                snippet = extract_symbol_snippet(cand_p, f"{s_line}-{e_line}", max_lines=90)
+                if snippet:
+                    label = f"L{s_line}-L{e_line}" if e_line > s_line else f"L{s_line}"
+                    auto_blocks.append(f"#### `{rel_f}` — `{label}`\n```python\n{snippet}\n```")
+                    break
+    return auto_blocks
 
 
 def _normalize_file_list(raw: Any) -> list[str]:
@@ -2555,7 +2677,10 @@ def format_chunk_prompt(
 
     prior_chunks = [c for c in chunks if c["chunk_index"] < chunk_index]
     upcoming_chunks = [c for c in chunks if c["chunk_index"] > chunk_index]
-    fact_sheet = _normalize_shared_context(json.loads(build["fact_sheet_json"] or "[]"))
+    fact_sheet = _deduplicate_fact_sheet_against_instructions(
+        _normalize_shared_context(json.loads(build["fact_sheet_json"] or "[]")),
+        target_chunk["instructions"] or "",
+    )
     build_shared_ctx = _normalize_shared_context(
         json.loads(build["shared_context_json"] or "[]") if "shared_context_json" in build.keys() else []
     )
@@ -2609,37 +2734,49 @@ def format_chunk_prompt(
         lines.append(f"- **Prohibited Files (DO NOT MODIFY):** `{', '.join(prohibited_files)}`")
     lines.append(f"- **Mandatory Verification Gate:** `{effective_v_cmd}`")
 
-    # Pre-hydrate target_symbols AST/line-slice snippets so Flash workers skip discovery reads
-    if target_symbols:
-        hydrated_blocks: list[str] = []
-        search_roots = [wt_path]
-        if Path(effective_repo).resolve() != wt_path.resolve():
-            search_roots.append(Path(effective_repo))
-        for sym in target_symbols:
-            sym_str = str(sym).strip()
-            if not sym_str:
-                continue
-            # Support optional "path/to/file.py:symbol_name" or search across target_files
-            if ":" in sym_str and not sym_str.startswith(":"):
-                f_hint, s_name = sym_str.split(":", 1)
+    # Pre-hydrate target_symbols AST/line-slice snippets + instruction-referenced line windows so Flash workers skip discovery reads
+    hydrated_blocks: list[str] = []
+    search_roots = [wt_path]
+    if Path(effective_repo).resolve() != wt_path.resolve():
+        search_roots.append(Path(effective_repo))
+    for sym in target_symbols:
+        sym_str = str(sym).strip()
+        if not sym_str:
+            continue
+        # Support optional "path/to/file.py:symbol_name" or "path/to/file.py:1980-2020" or search across target_files
+        if ":" in sym_str and not sym_str.startswith(":"):
+            first_part, rest_part = sym_str.split(":", 1)
+            if first_part.endswith((".py", ".md", ".js", ".ts", ".json", ".sql", ".sh")) or "/" in first_part:
+                f_hint, s_name = first_part, rest_part
                 cand_files = [f_hint.strip()]
             else:
                 s_name = sym_str
                 cand_files = list(target_files)
-            for rel_f in cand_files:
-                snippet = ""
-                for root in search_roots:
-                    cand_p = (root / rel_f).resolve()
-                    if cand_p.exists():
-                        snippet = extract_symbol_snippet(cand_p, s_name)
-                        if snippet:
-                            hydrated_blocks.append(f"#### `{rel_f}` — `{s_name}`\n```python\n{snippet}\n```")
-                            break
-                if snippet:
-                    break
-        if hydrated_blocks:
-            lines.append("\n### Pre-Hydrated Target Symbol Slices (Turn-0 Fast-Path Context):")
-            lines.extend(hydrated_blocks)
+        else:
+            s_name = sym_str
+            cand_files = list(target_files)
+        for rel_f in cand_files:
+            snippet = ""
+            for root in search_roots:
+                cand_p = (root / rel_f).resolve()
+                if cand_p.exists():
+                    snippet = extract_symbol_snippet(cand_p, s_name)
+                    if snippet:
+                        hydrated_blocks.append(f"#### `{rel_f}` — `{s_name}`\n```python\n{snippet}\n```")
+                        break
+            if snippet:
+                break
+
+    auto_line_blocks = _extract_instruction_line_slices(
+        target_chunk["instructions"] or "",
+        target_files,
+        search_roots,
+        hydrated_blocks,
+    )
+    hydrated_blocks.extend(auto_line_blocks)
+    if hydrated_blocks:
+        lines.append("\n### Pre-Hydrated Target Symbol Slices (Turn-0 Fast-Path Context):")
+        lines.extend(hydrated_blocks)
 
     if worktree_dir and wt_path.exists() and (wt_path / ".git").exists():
         try:

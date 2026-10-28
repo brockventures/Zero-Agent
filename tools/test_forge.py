@@ -2103,6 +2103,34 @@ def test_chunk_split_gate_and_worktree_resume_salvage(tmp_path, monkeypatch):
     assert "Worktree Resume State (Preserved From Previous Attempt)" in prompts_seen[1]
     assert "mod_a.py" in prompts_seen[1]
 
+    # 5. Verify explicit line-range hydration, instruction line-reference auto-hydration, and fact_sheet deduplication
+    big_lines = ["def giant_allocator():"] + [f"    step_{i} = {i}" for i in range(1, 150)]
+    (repo_dir / "giant_mod.py").write_text("\n".join(big_lines) + "\n", encoding="utf-8")
+    dup_spec = (
+        "In giant_mod.py (around L120-L130), update step_120 and step_125 inside giant_allocator so that "
+        "part-time catchers are capped at 0.25 share while primary catchers retain full playing time allocation "
+        "across all 30 MLB depth charts and verify zero-sum win closure."
+    )
+    line_plan = {
+        "title": "Line Range Auto-Hydration & Fact Dedup Test",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge.FORGE_CHANNEL_ID,
+        "context_fact_sheet": [dup_spec],
+        "chunks": [
+            {
+                "title": "Patch giant_mod around L120-L130",
+                "target_files": ["giant_mod.py"],
+                "target_symbols": ["giant_mod.py:giant_allocator"],
+                "instructions": dup_spec,
+            }
+        ],
+    }
+    res_l = forge.enqueue_build(line_plan, db_path=db_p, post_widget=False)
+    prompt_l = forge.format_chunk_prompt(res_l["build_id"], 0, db_path=db_p, worktree_dir=str(repo_dir))
+    assert "*(full specification in Implementation Instructions below)*" in prompt_l
+    assert "L120-L130" in prompt_l
+    assert "step_122 = 122" in prompt_l
+
 
 if __name__ == "__main__":
     unittest.main()
