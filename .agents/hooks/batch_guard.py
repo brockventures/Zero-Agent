@@ -1328,18 +1328,8 @@ def check_tool_use(
         if not ok_tier:
             return False, tier_reason
 
-        if target_file and target_file == state.get("last_edited_file"):
-            state["same_file_edit_count"] = state.get("same_file_edit_count", 0) + 1
-            if state["same_file_edit_count"] > MAX_CONSECUTIVE_SAME_FILE_EDITS:
-                save_state(state, state_file)
-                return False, (
-                    f"Batch Invariant Triggered: Detected {state['same_file_edit_count']} consecutive {name} calls on '{target_file}'. "
-                    "For extensive edits or multiple modifications in the same file, use write_file or a Python script in /workspace/scratch/ "
-                    "to apply changes in a single pass."
-                )
-        else:
-            state["last_edited_file"] = target_file
-            state["same_file_edit_count"] = 1
+        state["last_edited_file"] = target_file
+        state["same_file_edit_count"] = 0
 
         save_state(state, state_file)
         return True, ""

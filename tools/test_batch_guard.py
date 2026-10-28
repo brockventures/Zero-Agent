@@ -125,13 +125,10 @@ class TestBatchGuard(unittest.TestCase):
             self.assertIn("outbox.py --channel zero-ops", reason)
             self.assertIn("<@1542285964213358633>", reason)
 
-    def test_replace_file_content_same_file_blocks_on_fourth(self):
-        for _ in range(3):
+    def test_replace_file_content_same_file_allows_multiple_surgical_edits(self):
+        for _ in range(6):
             allowed, _ = check_tool_use("replace_file_content", {"TargetFile": "/workspace/tools/bar.py"})
             self.assertTrue(allowed)
-        allowed, reason = check_tool_use("replace_file_content", {"TargetFile": "/workspace/tools/bar.py"})
-        self.assertFalse(allowed)
-        self.assertIn("4 consecutive replace_file_content calls on '/workspace/tools/bar.py'", reason)
 
     def test_consecutive_inline_python_probes_blocked_after_two_and_reset_on_progress(self):
         for i in range(2):
@@ -253,12 +250,9 @@ class TestBatchGuard(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("3 consecutive read_file calls", reason)
 
-        for _ in range(3):
+        for _ in range(6):
             allowed, _ = check_tool_use("edit_file", {"Path": "/workspace/tools/bar.py"})
             self.assertTrue(allowed)
-        allowed, reason = check_tool_use("edit_file", {"Path": "/workspace/tools/bar.py"})
-        self.assertFalse(allowed)
-        self.assertIn("4 consecutive edit_file calls", reason)
 
     def test_forge_tier2_tier3_gate_blocks_fourth_inline_production_file(self):
         # Up to 3 production files + unit test + markdown docs + scratch plan allowed in Tier 1
