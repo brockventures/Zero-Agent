@@ -37,7 +37,8 @@ MAX_SAME_SCRATCH_SCRIPT_RUNS = 3
 MAX_INLINE_PRODUCTION_FILES = 3
 FORGE_TIER1_INLINE_SECONDS = 90.0
 MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S = 2
-MAX_INLINE_RUN_COMMANDS_AFTER_90S = 8
+MAX_DIAGNOSTIC_SCRATCH_RUNS_AFTER_90S = 8
+MAX_INLINE_RUN_COMMANDS_AFTER_90S = 15
 TURN_RESET_IDLE_SECONDS = 45.0
 TURN_STATE_EXPIRY_SECONDS = 900.0
 
@@ -46,9 +47,21 @@ _VERSIONED_SCRATCH_SWEEP_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CALIBRATION_SCRATCH_SCRIPT_RE = re.compile(
+    r"(?:^|/)(?:baseball/.*|(?:scratch|brain/[^/]+/scratch|tmp)/[a-zA-Z0-9_-]*?(?:sim|sweep|grid|solve|tune|calib|opt|bench|migrate)[a-zA-Z0-9_-]*\.py)$",
+    re.IGNORECASE,
+)
+
 _SCRATCH_SCRIPT_EXEC_RE = re.compile(
     r"\bpython[0-9.]*\s+(?P<script>[^\s;\"'|&>]*?(?:/scratch/|^scratch/|/tmp/(?!forge-wt-))[^\s;\"'|&>]+?\.py)\b"
 )
+
+
+def is_calibration_scratch_script(script_path: str) -> bool:
+    """Return True if a scratch/tmp script path looks like a calibration, optimization, simulation, or benchmark sweep."""
+    if not script_path:
+        return False
+    return bool(_CALIBRATION_SCRATCH_SCRIPT_RE.search(script_path.replace("\\", "/")))
 
 _HEAVY_CLI_BENCHMARK_OR_MIGRATE_RE = re.compile(
     r"(?:run_unified_benchmark_gate\.py|build_locked_evaluation_datasets|--migrate-db\b|fast_migrate_[a-zA-Z0-9_-]*\.py\b|backfill_[a-zA-Z0-9_-]*?splits[a-zA-Z0-9_-]*\.py\b)"
@@ -78,6 +91,7 @@ def _default_state(now: float = 0.0) -> dict:
         "inline_prod_files": [],
         "scratch_script_runs": {},
         "total_scratch_runs": 0,
+        "calibration_scratch_runs": 0,
         "turn_run_commands": 0,
         "offload_dispatched": False,
         "offload_kind": "",
@@ -819,13 +833,17 @@ def _check_inline_production_edit_gate(
     norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
     norm_target = os.path.abspath(os.path.join(norm_cwd, target_file)).replace("\\", "/")
 
-    # 90-second calibration coupling: if turn has spent >90s running >=2 scratch/tmp scripts,
+    # 90-second calibration coupling: if turn has spent >90s running >=2 calibration scripts (or >=8 diagnostic scripts),
     # inline production mutations are closed and must be enqueued via FORGE.
     cur_now = now or time.time()
     turn_start = float(state.get("turn_start_time", cur_now) or cur_now)
     turn_elapsed = cur_now - turn_start
     total_scratch = int(state.get("total_scratch_runs", 0))
-    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch >= MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
+    calib_scratch = int(state.get("calibration_scratch_runs", 0))
+    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and (
+        calib_scratch >= MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S
+        or total_scratch >= MAX_DIAGNOSTIC_SCRATCH_RUNS_AFTER_90S
+    ):
         save_state(state, state_file)
         return False, (
             f"FORGE 90s Tier 2/3 Gate Triggered: Interactive turn has already spent {int(turn_elapsed)}s "
@@ -926,6 +944,7 @@ def check_tool_use(
         preserved_sweeps = list(state.get("versioned_scratch_sweeps", []))
         preserved_runs = dict(state.get("scratch_script_runs", {}))
         preserved_total_scratch = int(state.get("total_scratch_runs", 0))
+        preserved_calib_scratch = int(state.get("calibration_scratch_runs", 0))
         preserved_turn_cmds = int(state.get("turn_run_commands", 0))
         preserved_offload = bool(state.get("offload_dispatched", False))
         preserved_offload_kind = str(state.get("offload_kind", ""))
@@ -935,6 +954,7 @@ def check_tool_use(
         state["versioned_scratch_sweeps"] = preserved_sweeps
         state["scratch_script_runs"] = preserved_runs
         state["total_scratch_runs"] = preserved_total_scratch
+        state["calibration_scratch_runs"] = preserved_calib_scratch
         state["turn_run_commands"] = preserved_turn_cmds
         state["offload_dispatched"] = preserved_offload
         state["offload_kind"] = preserved_offload_kind
@@ -1129,36 +1149,50 @@ def check_tool_use(
                     state["scratch_script_runs"] = runs_map
                     total_scratch = int(state.get("total_scratch_runs", 0)) + 1
                     state["total_scratch_runs"] = total_scratch
+                    is_calib_script = is_calibration_scratch_script(norm_script)
+                    if is_calib_script:
+                        calib_runs = int(state.get("calibration_scratch_runs", 0)) + 1
+                        if total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
+                            calib_runs = max(calib_runs, total_scratch)
+                        state["calibration_scratch_runs"] = calib_runs
 
                     if run_cnt > MAX_SAME_SCRATCH_SCRIPT_RUNS:
                         save_state(state, state_file)
                         return False, (
                             f"FORGE Scratch Loop Gate Triggered: Executed '{os.path.basename(norm_script)}' {run_cnt} times in this turn "
                             f"(inline limit: {MAX_SAME_SCRATCH_SCRIPT_RUNS}). Do not run iterative edit-and-rerun loops on the same scratch script "
-                            "inline in chat. Consolidate parameter sweeps into a single vectorized pass, offload to Modal, or launch long jobs via:\n"
-                            "python3 /workspace/tools/forge.py job start --silent-on-success --no-synthesize --name \"<Job Name>\" --command \"python3 " + norm_script + "\""
+                            "inline in chat. Consolidate parameter sweeps into a single vectorized pass, offload to Modal, or launch genuine long jobs (>90s) via:\n"
+                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\"\n"
+                            "(or enqueue multi-file edits via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
                         )
 
-                    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
+                    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and (
+                        (is_calib_script and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S)
+                        or total_scratch > MAX_DIAGNOSTIC_SCRATCH_RUNS_AFTER_90S
+                    ):
                         save_state(state, state_file)
                         return False, (
                             f"FORGE 90s Calibration Offload Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
                             f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {total_scratch} scratch/tmp scripts "
                             f"(latest: '{os.path.basename(norm_script)}'). Do not run multi-minute iterative script sweeps inline by renaming scripts "
-                            "or moving them to /tmp/. Launch long calibration/benchmark jobs via:\n"
-                            "python3 /workspace/tools/forge.py job start --silent-on-success --no-synthesize --name \"<Job Name>\" --command \"python3 " + norm_script + "\"\n"
+                            "or moving them to /tmp/. Launch genuine long calibration/benchmark jobs (>90s) via:\n"
+                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 " + norm_script + "\"\n"
                             "(or offload to '/baseball/big-projections/modal_harness.py' / enqueue a ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
                         )
                 elif is_inline_python_probe(cmd):
                     total_scratch = int(state.get("total_scratch_runs", 0)) + 1
                     state["total_scratch_runs"] = total_scratch
-                    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
+                    calib_runs = int(state.get("calibration_scratch_runs", 0)) + 1
+                    if total_scratch > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
+                        calib_runs = max(calib_runs, total_scratch)
+                    state["calibration_scratch_runs"] = calib_runs
+                    if turn_elapsed > FORGE_TIER1_INLINE_SECONDS and calib_runs > MAX_CALIBRATION_SCRATCH_RUNS_AFTER_90S:
                         save_state(state, state_file)
                         return False, (
                             f"FORGE 90s Calibration Offload Gate Triggered: Interactive turn has been running for {int(turn_elapsed)}s "
                             f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {total_scratch} inline Python / scratch probes. "
-                            "Do not run multi-minute iterative heredoc or SSH loops inline in chat. Package the task into a script and launch via:\n"
-                            "python3 /workspace/tools/forge.py job start --silent-on-success --no-synthesize --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
+                            "Do not run multi-minute iterative heredoc or SSH loops inline in chat. For genuine long jobs (>90s), package the task into a script and launch via:\n"
+                            "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
                             "(or enqueue a multi-chunk ForgePlan via 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
                         )
 
@@ -1169,7 +1203,7 @@ def check_tool_use(
                         f"(>{int(FORGE_TIER1_INLINE_SECONDS)}s Tier 1 ceiling) and executed {turn_cmds} inline shell commands "
                         f"(limit after 90s: {MAX_INLINE_RUN_COMMANDS_AFTER_90S}). Long-running multi-step builds, remote patches, and "
                         "iterative debugging must be offloaded to #forge via:\n"
-                        "python3 /workspace/tools/forge.py job start --silent-on-success --no-synthesize --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
+                        "python3 /workspace/tools/forge.py job start --name \"<Job Name>\" --command \"python3 /workspace/scratch/<script>.py\"\n"
                         "(or 'python3 /workspace/tools/forge.py enqueue <plan.json>')."
                     )
 

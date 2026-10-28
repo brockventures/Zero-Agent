@@ -419,16 +419,52 @@ class TestBatchGuard(unittest.TestCase):
             self.assertFalse(allowed)
             self.assertIn("FORGE 90s Calibration Offload Gate Triggered", reason)
 
-        # Command budget gate: >8 non-probe run_command steps after 90s are blocked
+        # Command budget gate: >15 non-probe run_command steps after 90s are blocked
         if os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)
         with patch("time.time", return_value=base_now):
-            for i in range(8):
+            for i in range(15):
                 self.assertTrue(check_batching(f"curl -s http://127.0.0.1:8769/health && echo {i}")[0])
         with patch("time.time", return_value=base_now + 100.0):
-            allowed, reason = check_batching("curl -s http://127.0.0.1:8769/health && echo 9")
+            allowed, reason = check_batching("curl -s http://127.0.0.1:8769/health && echo 16")
             self.assertFalse(allowed)
             self.assertIn("FORGE 90s Command Budget Gate Triggered", reason)
+            self.assertNotIn("--no-synthesize", reason)
+
+    def test_diagnostic_scratch_scripts_allowed_up_to_8_after_90s_while_calibration_gated_at_3(self):
+        from unittest.mock import patch
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        base_now = 1_800_250_000.0
+        with patch("time.time", return_value=base_now):
+            self.assertTrue(check_batching("python3 /workspace/scratch/diag_1.py")[0])
+        with patch("time.time", return_value=base_now + 100.0):
+            # Up to 8 diagnostic scratch scripts are permitted after 90s without triggering the calibration gate
+            for i in range(2, 9):
+                allowed, reason = check_batching(f"python3 /workspace/scratch/diag_{i}.py")
+                self.assertTrue(allowed, f"Diagnostic script diag_{i}.py should be allowed after 90s, got: {reason}")
+
+            # 9th diagnostic script after 90s triggers the 90s Calibration Offload Gate
+            allowed_9, reason_9 = check_batching("python3 /workspace/scratch/diag_9.py")
+            self.assertFalse(allowed_9)
+            self.assertIn("FORGE 90s Calibration Offload Gate Triggered", reason_9)
+            self.assertNotIn("--no-synthesize", reason_9)
+
+        # Reset and verify that a 3rd script matching calibration naming (opt_renamed_3.py) still triggers at 3
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        with patch("time.time", return_value=base_now):
+            self.assertTrue(check_batching("python3 /workspace/scratch/diag_1.py")[0])
+            self.assertTrue(check_batching("python3 /workspace/scratch/diag_2.py")[0])
+        with patch("time.time", return_value=base_now + 100.0):
+            allowed_cal, reason_cal = check_batching("python3 /workspace/scratch/opt_renamed_3.py")
+            self.assertFalse(allowed_cal)
+            self.assertIn("FORGE 90s Calibration Offload Gate Triggered", reason_cal)
+            allowed_edit, edit_reason = check_tool_use(
+                "edit_file", {"Path": "/baseball/big-projections/hitter_components.py"}
+            )
+            self.assertFalse(allowed_edit)
+            self.assertIn("FORGE 90s Tier 2/3 Gate Triggered", edit_reason)
 
     def test_hook_self_preservation_syntax_guard(self):
         allowed, reason = check_tool_use(
