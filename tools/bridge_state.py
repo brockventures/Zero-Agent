@@ -33,7 +33,12 @@ BEACON_FILE = DATA_DIR / "liveness_beacon.json"
 BOT_STATUS_FILE = DATA_DIR / "bot_status.json"
 DAEMON_PIDS_FILE = DATA_DIR / "daemon_pids.json"
 BOT_STATS_FILE = DATA_DIR / "bot_stats.json"
-RUNTIME_RULES_FILE = Path("/workspace/config/runtime_rules.json")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RUNTIME_RULES_FILE = (
+    REPO_ROOT / "config" / "runtime_rules.json"
+    if (REPO_ROOT / "config" / "runtime_rules.json").exists()
+    else Path("/workspace/config/runtime_rules.json")
+)
 
 READONLY_NOTIFICATION_CHANNELS = {
     1330447543477338202,  # #server-updates
@@ -62,6 +67,7 @@ FINANCES_CHANNEL_ID = 1544955532765560924        # #finances
 BROCK_HOUSE_CHANNEL_ID = 1550577908811178095  # #brock-house
 VAULT_CHANNEL_ID = 1550577910757458015        # #vault (isolated memory tier)
 FORGE_CHANNEL_ID = 1562899941595160657        # #forge (build queue & background task telemetry)
+GOTCHI_CHAT_CHANNEL_ID = 1562246590943461429  # #gotchi-chat (Ryan's private Gotchi transcript channel)
 DEFAULT_EXCLUDED_HOME_CHANNELS = {
     1548196929308065893,  # #baseball (dedicated to Ivy)
 }
@@ -78,6 +84,7 @@ DEFAULT_HOME_CHANNELS = {
     BROCK_HOUSE_CHANNEL_ID,  # #brock-house
     VAULT_CHANNEL_ID,        # #vault
     FORGE_CHANNEL_ID,        # #forge
+    GOTCHI_CHAT_CHANNEL_ID,  # #gotchi-chat
 }
 RETITLED_THREADS_FILE = DATA_DIR / "retitled_threads.json"
 
