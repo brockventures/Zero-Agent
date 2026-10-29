@@ -387,5 +387,27 @@ class TestBridgeStream(unittest.TestCase):
         self.assertEqual(parser.get_final_response(), "")
 
 
+    def test_pre_completion_draft_redraft_deduplication_and_reset(self):
+        parser = AgyStreamParser(conv_id="conv-bg-dup")
+        # Step 1: Premature draft before background task finishes
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "Done—projected `RS` and `RA` in the standings are now colored using our 5-tier 30-team scale on [2027 Standings](<https://standings.mikecarmody.net>).",
+                "state": "DONE",
+            },
+        })
+        # Intermediate result arrives while background task is still running -> reset_pre_completion_draft
+        parser.reset_pre_completion_draft()
+        self.assertEqual(parser.get_final_response(), "")
+
+        # Even if not reset (e.g. transcript harvest), reconcile_step_segments deduplicates Done— vs Added— redrafts
+        from tools.bridge_stream import reconcile_step_segments
+        earlier = "Done—projected `RS` and `RA` in the standings are now colored using our 5-tier 30-team scale on [2027 Standings](<https://standings.mikecarmody.net>)."
+        latest = "Added—projected `RS` and `RA` in the standings are now colored using our 5-tier 30-team scale on [2027 Standings](<https://standings.mikecarmody.net>)."
+        self.assertEqual(reconcile_step_segments(earlier, latest), latest)
+
+
 if __name__ == "__main__":
     unittest.main()

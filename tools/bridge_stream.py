@@ -76,12 +76,25 @@ def reconcile_step_segments(
 
     first_e_line = e_strip.splitlines()[0].strip()
     first_l_line = l_strip.splitlines()[0].strip()
+    lead_status_re = r"^(?:done|added|updated|shipped|fixed|completed|handled|live|applied)\s*(?:—|--|-|:|,)\s*"
+    norm_first_e = re.sub(lead_status_re, "", first_e_line, flags=re.IGNORECASE).strip()
+    norm_first_l = re.sub(lead_status_re, "", first_l_line, flags=re.IGNORECASE).strip()
     if (
         (e_strip.startswith("🍌") and l_strip.startswith("🍌"))
         or (first_e_line and first_l_line and first_e_line == first_l_line)
+        or (norm_first_e and norm_first_l and len(norm_first_e) >= 18 and norm_first_e[:24] == norm_first_l[:24])
         or (len(e_strip) >= 24 and len(l_strip) >= 24 and e_strip[:24] == l_strip[:24])
     ):
         return l_strip
+
+    # 1b. Post-task redraft overlap detection (when earlier was a premature pre-completion draft)
+    if not is_interrupted and len(e_strip) >= 40 and len(l_strip) >= 60:
+        words_e = {w for w in re.findall(r"[a-z0-9_]{4,}", e_strip.lower())}
+        words_l = {w for w in re.findall(r"[a-z0-9_]{4,}", l_strip.lower())}
+        if len(words_e) >= 5 and len(words_l) >= 5:
+            overlap_ratio = len(words_e & words_l) / float(min(len(words_e), len(words_l)))
+            if overlap_ratio >= 0.45:
+                return l_strip
 
     # Trailing generic task-completion stub discard
     if (
@@ -352,6 +365,15 @@ class AgyStreamParser:
         self.is_explicit_silence: bool = False
         self.current_agent_step_index: Optional[int] = None
         self.interrupted_since_last_step: bool = False
+
+    def reset_pre_completion_draft(self) -> None:
+        """Discard premature response drafts emitted before an active background task or tool completed."""
+        self.accumulated_segment.clear()
+        self.last_substantive_response = ""
+        self.interrupted_draft = ""
+        self.final_result_response = ""
+        self.is_explicit_silence = False
+        self.current_agent_step_index = None
 
     @staticmethod
     def _is_silence_or_placeholder(text: str) -> bool:

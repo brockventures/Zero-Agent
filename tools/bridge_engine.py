@@ -812,7 +812,11 @@ class TurnCoordinator:
 
                 res_cid = res_data.get("conversation_id")
                 active_cid = res_cid or self.conv_id
-                if active_cid:
+                last_err_now = self.last_agy_error or (
+                    get_last_agy_error() if get_last_agy_error else None
+                )
+                has_terminal_error = bool(last_err_now or res_data.get("error"))
+                if active_cid and not has_terminal_error:
                     try:
                         from tools.task_settle import get_turn_pending_tasks
                         pending_sdk_tasks = get_turn_pending_tasks(str(active_cid))
@@ -825,7 +829,7 @@ class TurnCoordinator:
                                 f"(tasks={len(pending_sdk_tasks)}, reason={t_status.get('reason')}); continuing stdout stream..."
                             )
                             self.result_received_at = None
-                            stream_parser.final_result_response = ""
+                            stream_parser.reset_pre_completion_draft()
                             continue
                     except Exception as pte:
                         print(f"[BridgeEngine] Warning checking pending tasks on result: {pte}")
@@ -847,6 +851,9 @@ class TurnCoordinator:
                         "INVALID_ARGUMENT",
                         "invalid argument",
                         "code 400",
+                        "NOT_FOUND",
+                        "not found",
+                        "code 404",
                     )
                 ):
                     print(
@@ -918,7 +925,7 @@ class TurnCoordinator:
                 or self.agent_response_done_at is not None
                 or is_silence
             )
-            and proc_rc in (-15, 143, 255)
+            and proc_rc in (-15, 143, 255, -9, 137)
             and not self.timed_out
             and not self.wedged_diagnostic
             and not self.last_agy_error
