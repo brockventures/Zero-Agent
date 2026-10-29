@@ -61,6 +61,44 @@ channel_last_bot_reply: dict[int, float] = {}
 NON_NAME_NOUNS = r"(?:day|shot|downtime|errors?|detections?|latency|tolerance|cost|percent|sum|crossing|emission|point|index|out|wrapping|layout|config|leakage|padding|margin|trust|knowledge|defect|defects|risk|budget|drift|progress)\b"
 
 
+async def collect_message_and_reply_attachments(msg: discord.Message) -> list[str]:
+    """Download attachments on the inbound message and, if it is a reply, any attachments on the referenced parent message."""
+    saved_attachments: list[str] = []
+    if getattr(msg, "attachments", None):
+        for att in msg.attachments:
+            safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", att.filename)
+            dest = ATTACHMENTS_DIR / f"{uuid.uuid4().hex[:8]}_{safe_name}"
+            try:
+                await att.save(dest)
+                saved_attachments.append(str(dest))
+            except Exception as e:
+                print(f"[Bridge] Failed saving attachment: {e}")
+
+    ref = getattr(msg, "reference", None)
+    if ref:
+        resolved = getattr(ref, "resolved", None)
+        if resolved is None:
+            ref_id = getattr(ref, "message_id", None)
+            ch = getattr(msg, "channel", None)
+            if ref_id and ch and hasattr(ch, "fetch_message"):
+                try:
+                    resolved = await ch.fetch_message(ref_id)
+                    ref.resolved = resolved
+                except Exception as fe:
+                    print(f"[Bridge] Warning resolving reply reference {ref_id} for attachments: {fe}")
+        if resolved and getattr(resolved, "attachments", None):
+            for att in resolved.attachments:
+                safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", att.filename)
+                dest = ATTACHMENTS_DIR / f"{uuid.uuid4().hex[:8]}_ref_{safe_name}"
+                try:
+                    await att.save(dest)
+                    saved_attachments.append(str(dest))
+                except Exception as e:
+                    print(f"[Bridge] Failed saving referenced message attachment: {e}")
+
+    return saved_attachments
+
+
 def contains_zero_mention(text: str) -> bool:
     """Check if text addresses Zero via @Zero, snowflake, vocative, or bare 'Zero' text."""
     if not text:
@@ -257,16 +295,7 @@ async def route_external_message(
         cleaned = re.sub(r"@robot\b", "", cleaned, flags=re.IGNORECASE)
         cleaned = cleaned.strip()
 
-        saved_attachments = []
-        if msg.attachments:
-            for att in msg.attachments:
-                safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", att.filename)
-                dest = ATTACHMENTS_DIR / f"{uuid.uuid4().hex[:8]}_{safe_name}"
-                try:
-                    await att.save(dest)
-                    saved_attachments.append(str(dest))
-                except Exception as e:
-                    print(f"[Bridge] Failed saving attachment: {e}")
+        saved_attachments = await collect_message_and_reply_attachments(msg)
 
         if not is_ivy:
             if cleaned.lower() in ("!reset", "/reset", "!new", "/new"):
@@ -686,16 +715,7 @@ async def route_external_message(
             f"You MUST respond to Banana Watcher. NEVER emit [NO_REPLY] to a Banana Watcher prompt."
         )
 
-    saved_attachments = []
-    if msg.attachments:
-        for att in msg.attachments:
-            safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", att.filename)
-            dest = ATTACHMENTS_DIR / f"{uuid.uuid4().hex[:8]}_{safe_name}"
-            try:
-                await att.save(dest)
-                saved_attachments.append(str(dest))
-            except Exception as e:
-                print(f"[Bridge] Failed saving attachment: {e}")
+    saved_attachments = await collect_message_and_reply_attachments(msg)
 
     # Administrative commands in external channels
     if cleaned.lower() in ("!reset", "/reset", "!new", "/new"):

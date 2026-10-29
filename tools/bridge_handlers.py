@@ -1021,16 +1021,8 @@ async def handle_message(
         if cmd_handled:
             return
 
-    saved_attachments = []
-    if msg.attachments:
-        for att in msg.attachments:
-            safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", att.filename)
-            dest = ATTACHMENTS_DIR / f"{uuid.uuid4().hex[:8]}_{safe_name}"
-            try:
-                await att.save(dest)
-                saved_attachments.append(str(dest))
-            except Exception as e:
-                print(f"[Antigravity] Failed to save attachment {att.filename}: {e}")
+    from tools.bridge_ambient import collect_message_and_reply_attachments
+    saved_attachments = await collect_message_and_reply_attachments(msg)
 
     # Explicit Thread Triggers in #zero-chat root
     if is_home and not is_thread_channel and content:

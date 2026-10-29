@@ -292,6 +292,49 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
         finally:
             self.silence_patcher.start()
 
+    async def test_reply_to_message_with_attachment_downloads_parent_attachment(self):
+        """Verify replying to an older message that has an image attachment automatically downloads and passes the parent attachment."""
+        parent_att = MagicMock()
+        parent_att.filename = "haos_thermals.jpg"
+        parent_att.save = AsyncMock()
+
+        parent_msg = MagicMock()
+        parent_msg.id = 1565093592026841219
+        parent_msg.attachments = [parent_att]
+
+        msg = MagicMock()
+        msg.guild.id = 1534436119888793740
+        msg.author.id = 169260920550195200
+        msg.author.bot = False
+        msg.channel.id = 1534452820995080192  # #lounge
+        msg.channel.name = "lounge"
+        msg.content = "Hmmm <@1542285964213358633> how are your temps if you're on a similar tier CPU"
+        msg.attachments = []
+        msg.reference = MagicMock()
+        msg.reference.message_id = parent_msg.id
+        msg.reference.resolved = None
+        msg.channel.fetch_message = AsyncMock(return_value=parent_msg)
+        msg.role_mentions = []
+        msg.mentions = []
+
+        bot = MagicMock()
+        bot.user.id = 1542285964213358633
+        home_queue = asyncio.Queue()
+        ext_queue = asyncio.Queue()
+
+        with patch("tools.bridge_ambient.is_brock_guild", return_value=False):
+            handled = await route_external_message(
+                msg, bot, msg.content, "Arcane", home_queue, ext_queue
+            )
+            self.assertTrue(handled)
+            msg.channel.fetch_message.assert_awaited_once_with(parent_msg.id)
+            parent_att.save.assert_awaited_once()
+            self.assertFalse(ext_queue.empty())
+            item = await ext_queue.get()
+            self.assertEqual(len(item["attachments"]), 1)
+            self.assertTrue(item["attachments"][0].endswith("_ref_haos_thermals.jpg"))
+            self.assertIn("[CRITICAL IMAGE INPUT INVARIANT]:", item["prompt"])
+
 
 if __name__ == "__main__":
     unittest.main()
