@@ -215,8 +215,7 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         # 6. Prompt guidance formatting & overrides
         guidance_low = bs.get_gif_prompt_guidance("chan_a")
         self.assertIn("Nominal (0/5-7 turns)", guidance_low)
-        self.assertIn("Serious / Critical Override", guidance_low)
-        self.assertIn("Social / Banter Override", guidance_low)
+        self.assertIn("skip on serious/outage/ping turns", guidance_low)
 
         for _ in range(5):
             bs.increment_gif_turn("chan_a")

@@ -1758,6 +1758,50 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(chan.typing.call_count, 2)
 
+    async def test_detect_recent_container_oom_and_on_ready_prompt(self):
+        """Verify that handle_on_ready detects recent container OOM events and labels startup reason accurately."""
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%S-07:00", time.localtime())
+        sample_log = (
+            f"{now_iso} AppHost02 kernel: [1465143.304953] oom-kill:constraint=CONSTRAINT_MEMCG,"
+            "cpuset=cef027e8ab10b9e28d9a5ad150dc83273b000a1d1ea556e4c9980450e7ce9630,task=python3,pid=63486,uid=0\n"
+            f"{now_iso} AppHost02 kernel: [1465143.779559] Memory cgroup out of memory: Killed process 63486 (python3)\n"
+        )
+        with patch("tools.nas_config.run_ssh", return_value=(0, sample_log, "")), \
+             patch.object(Path, "read_text", return_value="12:memory:/docker/cef027e8ab10b9e28d9a5ad150dc83273b000a1d1ea556e4c9980450e7ce9630\n"):
+            reason = bh.detect_recent_container_oom(window_seconds=900.0)
+            self.assertIsNotNone(reason)
+            self.assertIn("OOM killer terminated `python3`", reason)
+
+        bh.has_notified_ready = False
+        if bs.RESTART_INTENT_FILE.exists():
+            bs.RESTART_INTENT_FILE.unlink()
+
+        mock_channel = MagicMock()
+        mock_bot = MagicMock()
+        mock_bot.get_channel.return_value = mock_channel
+        turn_queue = AsyncMock()
+
+        with patch("tools.mcp_daemon.ensure_mcp_daemon_running"), \
+             patch("tools.zero_mail_listener.ensure_mail_listener_running"), \
+             patch("tools.amazon_order_listener.ensure_amazon_listener_running"), \
+             patch("tools.zero_health_server.ensure_health_server_running"), \
+             patch("tools.banana_watcher.ensure_banana_watcher_running"), \
+             patch("tools.forge.reconcile_forge_on_boot", return_value={}), \
+             patch("tools.bridge_daemons.warmup_persistent_daemons", new_callable=AsyncMock), \
+             patch("tools.bridge_handlers.detect_recent_container_oom", return_value="Automatic container restart after hitting Docker memory limit (OOM killer terminated `python3`)"):
+            await bh.handle_on_ready(
+                mock_bot,
+                turn_queue=turn_queue,
+                ext_turn_queue=AsyncMock(),
+                start_workers_fn=MagicMock(),
+                start_scheduler_fn=AsyncMock(),
+            )
+
+        turn_queue.put.assert_awaited_once()
+        queued_prompt = turn_queue.put.call_args[0][0]["prompt"]
+        self.assertIn("(Unplanned Container OOM Restart)", queued_prompt)
+        self.assertIn("OOM killer terminated `python3`", queued_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

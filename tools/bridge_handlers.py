@@ -91,13 +91,58 @@ def get_channel_queue(channel_id: int | str) -> asyncio.Queue:
 
 
 def get_concurrency_semaphore() -> asyncio.Semaphore:
-    """Shared concurrency limiter for background/secondary channels."""
+    """Shared concurrency limiter for background/secondary channels and threads."""
     global channel_concurrency_semaphore
     if channel_concurrency_semaphore is None:
         rules = get_runtime_rules()
-        max_workers = int(rules.get("max_parallel_workers", 3))
+        max_workers = int(rules.get("max_parallel_workers", 2))
         channel_concurrency_semaphore = asyncio.Semaphore(max_workers)
     return channel_concurrency_semaphore
+
+
+def detect_recent_container_oom(window_seconds: float = 900.0) -> str | None:
+    """Inspect Host 2 kernel logs for a recent memory cgroup OOM kill in this container."""
+    try:
+        cgroup_id = None
+        cg_path = Path("/proc/1/cgroup")
+        if cg_path.exists():
+            m = re.search(r"/docker/([0-9a-f]{12,64})", cg_path.read_text(encoding="utf-8", errors="ignore"))
+            if m:
+                cgroup_id = m.group(1)
+
+        from tools import nas_config
+        cmd = "sudo grep -E 'Memory cgroup out of memory|oom-kill:constraint=CONSTRAINT_MEMCG' /var/log/messages 2>/dev/null | tail -n 10"
+        rc, out, _ = nas_config.run_ssh(nas_config.HOST_2_IP, cmd, timeout=5)
+        if rc != 0 or not out.strip():
+            return None
+
+        lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+        from datetime import datetime
+        now_ts = time.time()
+        matched_proc = None
+        for ln in reversed(lines):
+            if cgroup_id and ("oom-kill:" in ln) and (cgroup_id[:12] not in ln):
+                continue
+            ts_m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})", ln)
+            if ts_m:
+                try:
+                    ev_ts = datetime.fromisoformat(ts_m.group(1)).timestamp()
+                    if (now_ts - ev_ts) > window_seconds:
+                        continue
+                except Exception:
+                    pass
+            km = re.search(r"Killed process \d+ \(([^)]+)\)", ln)
+            if km:
+                matched_proc = km.group(1)
+            elif "oom-kill:" in ln and (not cgroup_id or cgroup_id[:12] in ln):
+                tm = re.search(r"task=([^,\s]+)", ln)
+                matched_proc = matched_proc or (tm.group(1) if tm else "python3")
+                break
+        if matched_proc:
+            return f"Automatic container restart after hitting Docker memory limit (OOM killer terminated `{matched_proc}`)"
+    except Exception as e:
+        print(f"[Bridge] Warning checking recent container OOM state: {e}")
+    return None
 
 
 def try_coalesce_pending_turn(
@@ -376,8 +421,10 @@ async def run_thread_turn_worker(item, bot: discord.Client, presence_fn=None, bu
         }
         if item.get("model_override"):
             kwargs["model_override"] = item["model_override"]
-        async with resilient_typing(reply_target):
-            await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
+        sem = get_concurrency_semaphore()
+        async with sem:
+            async with resilient_typing(reply_target):
+                await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
     except Exception as e:
         print(f"[Thread Worker] Error in thread turn execution: {e}")
         try:
@@ -726,6 +773,7 @@ async def handle_on_ready(
         # Check restart context
         restart_reason = "System startup / container boot"
         is_intentional = False
+        is_oom_crash = False
         if RESTART_INTENT_FILE.exists():
             try:
                 with open(RESTART_INTENT_FILE) as f:
@@ -735,12 +783,25 @@ async def handle_on_ready(
                 RESTART_INTENT_FILE.unlink()
             except Exception:
                 pass
+        else:
+            try:
+                oom_reason = await asyncio.to_thread(detect_recent_container_oom)
+                if oom_reason:
+                    restart_reason = oom_reason
+                    is_oom_crash = True
+            except Exception:
+                pass
 
         host_name = os.environ.get("NAS_HOST_2_NAME", "Host2")
+        reason_tag = (
+            "(Planned Feature Deploy/Update)"
+            if is_intentional
+            else ("(Unplanned Container OOM Restart)" if is_oom_crash else "(System/Container Boot)")
+        )
         startup_prompt = (
             "[SYSTEM REBOOT & STARTUP EVENT]\n"
             f"You (Zero) just completed a reboot/reload on {host_name}.\n"
-            f"• Restart Reason: {restart_reason} {'(Planned Feature Deploy/Update)' if is_intentional else '(System/Container Boot)'}\n"
+            f"• Restart Reason: {restart_reason} {reason_tag}\n"
         )
 
         if interrupted_prompt:

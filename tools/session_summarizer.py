@@ -250,6 +250,22 @@ def synthesize_session_milestones(dialogue: list[dict], sess_key: str) -> tuple[
         f"}}"
     )
     try:
+        try:
+            from tools.classifier import _should_use_warm_classifier, warm_classifier
+            if _should_use_warm_classifier():
+                resp = warm_classifier.classify(prompt, timeout=12.0)
+                if resp:
+                    m_json = re.search(r"\{[\s\S]*\}", resp)
+                    if m_json:
+                        data = json.loads(m_json.group(0))
+                        ms = "\n".join(data.get("milestones", []))
+                        dr = "\n".join(data.get("directives", []))
+                        ed = "\n".join(data.get("eng_delta", []))
+                        if ms and dr:
+                            return ms, dr, ed or ms
+        except Exception as we:
+            print(f"[Summarizer] Warm classifier synthesis fallback to Popen: {we}")
+
         proc = subprocess.Popen(
             ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={prompt}"],
             stdout=subprocess.PIPE,

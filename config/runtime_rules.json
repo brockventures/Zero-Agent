@@ -3,7 +3,7 @@
     "anti_cascade_delay_seconds": 4.0,
     "bot_word_floor": 4,
     "worker_memory_cap_mb": 2048,
-    "max_parallel_workers": 5,
+    "max_parallel_workers": 2,
     "persistent_daemons_enabled": true,
     "morning_discussion_max_rounds": 3,
     "turn_step_idle_seconds": 150.0,

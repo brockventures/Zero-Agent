@@ -595,7 +595,7 @@ def get_runtime_rules() -> dict:
         "anti_cascade_delay_seconds": 4.0,
         "bot_word_floor": 4,
         "worker_memory_cap_mb": 2048,
-        "max_parallel_workers": 5,
+        "max_parallel_workers": 2,
         "ambient_classifier_enabled": True,
         "ambient_relevance_threshold": 0.80,
         "auto_thread_escalation_enabled": False,
