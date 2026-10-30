@@ -838,6 +838,8 @@ class TurnCoordinator:
                     fallback_result=res_data.get("response", "")
                 )
                 err_check = (stream_parser.error_response or output_response or "").strip()
+                if not output_response and getattr(stream_parser, "interrupted_since_last_step", False):
+                    err_check = "Error: The stream was interrupted (EOF)"
                 if err_check.startswith("Error:") and any(
                     t_marker in err_check
                     for t_marker in (

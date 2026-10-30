@@ -575,7 +575,16 @@ async def execute_agy_turn(
         ])
         is_transient_model_err = (not has_substantive) and is_model_error(full_raw)
         is_retryable_stall = (not has_substantive) and timed_out and not is_hard_ceiling
-        if (is_transient_auth or is_transient_model_err or is_retryable_stall) and attempt < max_retries:
+        is_transient_stream_drop = (not has_substantive) and (
+            "the stream was interrupted" in full_raw.lower()
+            or "transient upstream api error" in full_raw.lower()
+        )
+        if (
+            is_transient_auth
+            or is_transient_model_err
+            or is_retryable_stall
+            or is_transient_stream_drop
+        ) and attempt < max_retries:
             if is_transient_model_err and attempt >= 1 and active_model:
                 avail_now = await asyncio.to_thread(list_available_models, True)
                 fb_cand = get_fallback_model(avail_now, exclude=active_model) if avail_now else None
@@ -583,9 +592,13 @@ async def execute_agy_turn(
                     forced_retry_model = fb_cand
                     print(f"[BridgeRunner] ⚠️ CLI rejected {active_model} on retry; falling back to {fb_cand} for final attempt.")
             reason_label = (
-                "Step inactivity / API stall"
-                if is_retryable_stall
-                else ("Transient CLI model registry hiccup" if is_transient_model_err else "Transient Google auth/API handshake hiccup")
+                "Upstream stream interruption"
+                if is_transient_stream_drop
+                else (
+                    "Step inactivity / API stall"
+                    if is_retryable_stall
+                    else ("Transient CLI model registry hiccup" if is_transient_model_err else "Transient Google auth/API handshake hiccup")
+                )
             )
             backoff_s = (attempt + 1) * 2.0
             print(f"[BridgeRunner] 🔄 {reason_label} on attempt {attempt+1}/{max_retries}. Retrying in {backoff_s:.1f}s...")

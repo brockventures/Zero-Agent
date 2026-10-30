@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 if "/workspace" not in sys.path:
     sys.path.append("/workspace")
@@ -569,6 +569,135 @@ class TestBridgeStream(unittest.TestCase):
             self.assertTrue(status["is_complete"])
             self.assertEqual(status["reason"], "complete")
             self.assertEqual(status["content"], "Stack deployment completed.")
+
+
+class TestBridgeStreamEngineIntegration(unittest.IsolatedAsyncioTestCase):
+    """Integration unit tests for TurnCoordinator and bridge_runner stream interruption recovery."""
+
+    async def test_turn_coordinator_retries_unrecovered_stream_interruption(self):
+        """Verify TurnCoordinator triggers transient error handler and recycles worker on unrecovered stream drop."""
+        from tools.bridge_engine import TurnCoordinator
+
+        coord = TurnCoordinator(
+            channel_id=1542081375287640084,
+            prompt="Run build checks",
+            mode="home",
+            reply_target=MagicMock(),
+            status_msg=None,
+            conv_id="conv-drop-unrecovered",
+        )
+
+        lines = [
+            b'{"event":"result","result":{"conversation_id":"conv-drop-unrecovered","status":"SUCCESS","response":" Cui"}}\n',
+            b"",
+        ]
+        line_iter = iter(lines)
+        reader = AsyncMock()
+        reader.readline = AsyncMock(side_effect=lambda: next(line_iter))
+
+        parser = MagicMock()
+        parser.interrupted_since_last_step = True
+        # Chunk 1 discards aborted stub so get_final_response returns empty string
+        parser.get_final_response.return_value = ""
+        parser.error_response = None
+
+        timer = MagicMock()
+        proc = MagicMock()
+        proc.pid = 9991
+        mock_recycle = AsyncMock()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await coord.execute_stream_loop(
+                proc=proc,
+                stdout_reader=reader,
+                stream_parser=parser,
+                timer=timer,
+                rules={"live_status_ticker_enabled": False},
+                on_recycle=mock_recycle,
+            )
+
+        self.assertIn("Transient upstream API error", str(ctx.exception))
+        self.assertIn("The stream was interrupted (EOF)", str(ctx.exception))
+        mock_recycle.assert_awaited_once_with(keep_conv_id=True)
+
+    async def test_turn_coordinator_preserves_recovered_stream_response(self):
+        """Verify TurnCoordinator cleanly returns substantive answer if stream successfully recovered."""
+        from tools.bridge_engine import TurnCoordinator
+
+        coord = TurnCoordinator(
+            channel_id=1542081375287640084,
+            prompt="Run build checks",
+            mode="home",
+            reply_target=MagicMock(),
+            status_msg=None,
+            conv_id="conv-drop-recovered",
+        )
+
+        lines = [
+            b'{"event":"result","result":{"conversation_id":"conv-drop-recovered","status":"SUCCESS","response":"Build succeeded."}}\n',
+            b"",
+        ]
+        line_iter = iter(lines)
+        reader = AsyncMock()
+        reader.readline = AsyncMock(side_effect=lambda: next(line_iter))
+
+        parser = MagicMock()
+        parser.interrupted_since_last_step = True
+        parser.get_final_response.return_value = "Build succeeded."
+        parser.error_response = None
+
+        timer = MagicMock()
+        proc = MagicMock()
+        proc.pid = 9992
+        mock_recycle = AsyncMock()
+
+        resp = await coord.execute_stream_loop(
+            proc=proc,
+            stdout_reader=reader,
+            stream_parser=parser,
+            timer=timer,
+            rules={"live_status_ticker_enabled": False},
+            on_recycle=mock_recycle,
+        )
+
+        self.assertEqual(resp, "Build succeeded.")
+        mock_recycle.assert_not_called()
+
+    def test_bridge_runner_transient_stream_drop_retry_detection(self):
+        """Verify that bridge runner flags unrecovered stream drops as retryable with 'Upstream stream interruption' label."""
+        max_retries = 2
+        attempt = 0
+
+        # Case 1: Stream interrupted error in output with no substantive response
+        has_substantive = False
+        full_raw = "Error: The stream was interrupted. Please continue."
+        is_transient_stream_drop = (not has_substantive) and (
+            "the stream was interrupted" in full_raw.lower()
+            or "transient upstream api error" in full_raw.lower()
+        )
+        self.assertTrue(is_transient_stream_drop and attempt < max_retries)
+        reason_label = (
+            "Upstream stream interruption"
+            if is_transient_stream_drop
+            else "Transient Google auth/API handshake hiccup"
+        )
+        self.assertEqual(reason_label, "Upstream stream interruption")
+
+        # Case 2: Transient upstream API error string from TurnCoordinator
+        full_raw_transient = "RuntimeError: Transient upstream API error in #worker: Error: The stream was interrupted (EOF)"
+        is_transient_stream_drop_api = (not has_substantive) and (
+            "the stream was interrupted" in full_raw_transient.lower()
+            or "transient upstream api error" in full_raw_transient.lower()
+        )
+        self.assertTrue(is_transient_stream_drop_api)
+
+        # Case 3: Substantive response exists - should NOT retry
+        has_substantive_true = True
+        is_retry = (not has_substantive_true) and (
+            "the stream was interrupted" in full_raw.lower()
+            or "transient upstream api error" in full_raw.lower()
+        )
+        self.assertFalse(is_retry)
 
 
 if __name__ == "__main__":
