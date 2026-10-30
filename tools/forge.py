@@ -4094,8 +4094,22 @@ class ForgeSupervisor:
                                 )
                             continue
 
+                    wt_head_proc = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=str(wt_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    wt_head_ref = wt_head_proc.stdout.strip() if wt_head_proc.returncode == 0 and wt_head_proc.stdout.strip() else branch_name
                     subprocess.run(
-                        ["git", "branch", "-f", base_ref, branch_name],
+                        ["git", "branch", "-f", branch_name, wt_head_ref],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    subprocess.run(
+                        ["git", "branch", "-f", base_ref, wt_head_ref],
                         cwd=str(repo_dir),
                         capture_output=True,
                         timeout=10,
@@ -4109,7 +4123,7 @@ class ForgeSupervisor:
 
                     # If final chunk completed and not touching core bridge, sync staging branch into local default branch
                     # BEFORE marking the chunk/build completed so a merge/cherry-pick conflict never leaves repo_dir dirty or drops commits
-                    if other_unmerged == 0 and not build["touches_core_bridge"]:
+                    if other_unmerged == 0:
                         for abort_cmd in (
                             ["git", "cherry-pick", "--abort"],
                             ["git", "merge", "--abort"],
@@ -4188,7 +4202,7 @@ class ForgeSupervisor:
                                 (time.time(), build_id),
                             )
 
-                    if remaining == 0 and not build["touches_core_bridge"]:
+                    if remaining == 0:
                         try:
                             subprocess.run(["git", "push", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=60)
                         except Exception as e:
