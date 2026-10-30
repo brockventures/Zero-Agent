@@ -45,6 +45,24 @@ def format_command_preview(cmd_raw: str, max_len: int = 80) -> str:
     return f"Running: {snip}..."
 
 
+def is_aborted_stream_stub(text: str) -> bool:
+    """Return True if text is a tiny unpunctuated 1-2 token fragment from a stream interruption."""
+    if not text or not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if (
+        stripped.startswith("[REACT:")
+        or stripped.startswith("[NO_REPLY")
+        or stripped.upper() in ("[NO_REPLY]", "[NO_OP]", "NO_REPLY", "NO_OP")
+    ):
+        return False
+    if stripped.endswith((".", "!", "?", "]")):
+        return False
+    return len(stripped) < 16 or len(stripped.split()) <= 2
+
+
 def reconcile_step_segments(
     earlier: str,
     latest: str,
@@ -59,6 +77,8 @@ def reconcile_step_segments(
     """
     e_strip = (earlier or "").strip()
     l_strip = (latest or "").strip()
+    if is_interrupted and is_aborted_stream_stub(e_strip):
+        return l_strip
     if not e_strip:
         return l_strip
     if not l_strip:
@@ -166,6 +186,7 @@ def harvest_transcript_response(
             with open(tpath, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
             candidates = []
+            post_interruption_count = 0
             saw_interruption = False
             for line in reversed(lines):
                 line_s = line.strip()
@@ -201,12 +222,29 @@ def harvest_transcript_response(
                             stripped = content.strip()
                             if is_internal_cli_leak(stripped):
                                 continue
+
+                            if saw_interruption:
+                                out_tok = data.get("output_tokens")
+                                if (
+                                    (out_tok is not None and int(out_tok) <= 2)
+                                    or is_aborted_stream_stub(stripped)
+                                ):
+                                    continue
+                                if post_interruption_count == 0 and len(stripped) < 40:
+                                    continue
+                            else:
+                                post_interruption_count += 1
+
                             candidates.append(stripped)
                 except Exception:
                     continue
 
             if not candidates:
                 continue
+
+            if saw_interruption and post_interruption_count == 0:
+                if all(len(c) < 40 for c in candidates):
+                    return None
 
             if len(candidates) == 1:
                 return candidates[0]
@@ -271,6 +309,9 @@ def check_transcript_turn_status(
         try:
             with open(tpath, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
+            saw_interruption = False
+            interrupted_sidx = None
+            empty_or_leak_sidx = None
             for line in reversed(lines):
                 line_s = line.strip()
                 if not line_s:
@@ -289,9 +330,36 @@ def check_transcript_turn_status(
                         or source in ("USER_EXPLICIT", "USER")
                         or role in ("user", "USER")
                     ):
+                        if saw_interruption:
+                            return {
+                                "is_complete": False,
+                                "content": None,
+                                "reason": "stream_interrupted",
+                                "step_index": interrupted_sidx or sidx,
+                            }
+                        if empty_or_leak_sidx is not None:
+                            return {
+                                "is_complete": False,
+                                "content": None,
+                                "reason": "empty_or_leak_content",
+                                "step_index": empty_or_leak_sidx,
+                            }
                         return {"is_complete": False, "content": None, "reason": "user_input_boundary"}
 
+                    if stype == "ERROR_MESSAGE" or "stream was interrupted" in line_s.lower():
+                        saw_interruption = True
+                        interrupted_sidx = sidx
+                        continue
+
                     if stype == "PLANNER_RESPONSE":
+                        if saw_interruption:
+                            return {
+                                "is_complete": False,
+                                "content": None,
+                                "reason": "stream_interrupted",
+                                "step_index": sidx,
+                            }
+
                         tool_calls = data.get("tool_calls", [])
                         if tool_calls:
                             return {
@@ -328,14 +396,21 @@ def check_transcript_turn_status(
                                 }
 
                         cleaned_test = strip_internal_cli_chatter(content).strip() if content else ""
-                        if content and not is_internal_cli_leak(content) and cleaned_test and not is_internal_cli_leak(cleaned_test):
+                        if (
+                            content
+                            and not is_aborted_stream_stub(content)
+                            and not is_internal_cli_leak(content)
+                            and cleaned_test
+                            and not is_internal_cli_leak(cleaned_test)
+                        ):
                             return {
                                 "is_complete": True,
                                 "content": content,
                                 "step_index": sidx,
                                 "reason": "complete",
                             }
-                        return {"is_complete": False, "content": None, "reason": "empty_or_leak_content"}
+                        empty_or_leak_sidx = sidx
+                        continue
 
                     if stype in ("GENERIC", "tool"):
                         return {
@@ -347,6 +422,21 @@ def check_transcript_turn_status(
                         }
                 except Exception:
                     continue
+
+            if saw_interruption:
+                return {
+                    "is_complete": False,
+                    "content": None,
+                    "reason": "stream_interrupted",
+                    "step_index": interrupted_sidx,
+                }
+            if empty_or_leak_sidx is not None:
+                return {
+                    "is_complete": False,
+                    "content": None,
+                    "reason": "empty_or_leak_content",
+                    "step_index": empty_or_leak_sidx,
+                }
         except Exception as e:
             print(f"[BridgeStream] Error checking transcript status {tpath}: {e}")
     return {"is_complete": False, "content": None, "reason": "no_entries"}
@@ -385,7 +475,12 @@ class AgyStreamParser:
         """Rotate current accumulated_segment into interrupted_draft (if interrupted) or last_substantive_response."""
         curr = "".join(self.accumulated_segment).strip()
         if interrupted:
-            if curr and not self._is_silence_or_placeholder(curr):
+            self.final_result_response = ""
+            if (
+                curr
+                and not self._is_silence_or_placeholder(curr)
+                and not is_aborted_stream_stub(curr)
+            ):
                 if self.interrupted_draft and not self._is_silence_or_placeholder(self.interrupted_draft):
                     self.interrupted_draft = reconcile_step_segments(
                         self.interrupted_draft, curr, is_interrupted=True
@@ -617,6 +712,9 @@ class AgyStreamParser:
 
         # 3. Check final result response from agy
         frr = self.final_result_response.strip() or fallback_result.strip()
+        if self.interrupted_since_last_step and not clean_curr and not self.last_substantive_response:
+            if is_aborted_stream_stub(frr) or (self.interrupted_draft and frr == self.interrupted_draft.strip()):
+                return ""
         if frr:
             if frr.lower() in (
                 "[no_reply]",

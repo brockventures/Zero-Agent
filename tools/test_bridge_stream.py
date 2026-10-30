@@ -11,17 +11,18 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import sys
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.bridge_stream import (
     AgyStreamParser,
+    check_transcript_turn_status,
     format_agy_error_message,
     format_command_preview,
     harvest_transcript_response,
+    is_aborted_stream_stub,
     parse_agy_error,
+    reconcile_step_segments,
 )
 
 
@@ -407,6 +408,167 @@ class TestBridgeStream(unittest.TestCase):
         earlier = "Done—projected `RS` and `RA` in the standings are now colored using our 5-tier 30-team scale on [2027 Standings](<https://standings.mikecarmody.net>)."
         latest = "Added—projected `RS` and `RA` in the standings are now colored using our 5-tier 30-team scale on [2027 Standings](<https://standings.mikecarmody.net>)."
         self.assertEqual(reconcile_step_segments(earlier, latest), latest)
+
+    def test_is_aborted_stream_stub(self):
+        """Verify is_aborted_stream_stub identifies 1-token fragments and preserves valid tags."""
+        self.assertTrue(is_aborted_stream_stub(" Cui"))
+        self.assertTrue(is_aborted_stream_stub("Cui"))
+        self.assertTrue(is_aborted_stream_stub(" The"))
+        self.assertTrue(is_aborted_stream_stub("Hello world"))
+        self.assertFalse(is_aborted_stream_stub("[REACT: 👍]"))
+        self.assertFalse(is_aborted_stream_stub("[REACT: 🚀]"))
+        self.assertFalse(is_aborted_stream_stub("[NO_REPLY]"))
+        self.assertFalse(is_aborted_stream_stub("[NO_OP]"))
+        self.assertFalse(is_aborted_stream_stub("Done."))
+        self.assertFalse(is_aborted_stream_stub("Yes!"))
+        self.assertFalse(is_aborted_stream_stub("Why?"))
+        self.assertFalse(is_aborted_stream_stub(""))
+        self.assertFalse(is_aborted_stream_stub(None))
+        self.assertFalse(
+            is_aborted_stream_stub(
+                "This is a full sentence with sufficient length that was cut off mid"
+            )
+        )
+
+    def test_reconcile_step_segments_discards_cui_stub_on_interruption(self):
+        """Verify reconcile_step_segments discards 1-token pre-interruption stubs."""
+        earlier = " Cui"
+        latest = "All verification gates passed cleanly."
+        # When interrupted, ' Cui' must be discarded in favor of latest
+        self.assertEqual(
+            reconcile_step_segments(earlier, latest, is_interrupted=True),
+            "All verification gates passed cleanly.",
+        )
+
+    def test_agy_stream_parser_discards_cui_stub_on_stream_interruption(self):
+        """Verify AgyStreamParser discards ' Cui' stream stubs on interruption and returns empty if unrecovered."""
+        parser = AgyStreamParser(conv_id="conv-cui-test")
+        # Step 1: 1-token fragment emitted before stream drop
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": " Cui",
+            },
+        })
+        # Step 2: Stream interruption event
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "system_message",
+                "content": "Error: The stream was interrupted. Please continue.",
+            },
+        })
+        # Verify stub was NOT stored as interrupted_draft
+        self.assertEqual(parser.interrupted_draft, "")
+        self.assertEqual(len(parser.accumulated_segment), 0)
+        self.assertTrue(parser.interrupted_since_last_step)
+
+        # Step 3: Unrecovered turn exits with fallback or result event matching stub
+        parser.process_event({
+            "event": "result",
+            "result": {
+                "conversation_id": "conv-cui-test",
+                "response": " Cui",
+            },
+        })
+        # get_final_response must discard the stub and return empty string
+        self.assertEqual(parser.get_final_response(fallback_result=" Cui"), "")
+
+        # Now test recovered stream: subsequent auto-continuation step produces real answer
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "Here is the completed analysis.",
+                "state": "DONE",
+            },
+        })
+        self.assertEqual(parser.get_final_response(), "Here is the completed analysis.")
+
+    def test_harvest_transcript_response_discards_cui_stub_on_interruption(self):
+        """Verify harvest_transcript_response skips ' Cui' pre-interruption stubs and handles recovery."""
+        conv_id = "test-conv-harvest-cui"
+        log_dir = self.temp_path / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript_full.jsonl"
+
+        # Case 1: Unrecovered stream drop (' Cui' pre-interruption, no post-interruption candidate)
+        steps_unrecovered = [
+            {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Run checks"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": " Cui", "output_tokens": 1},
+            {"step_index": 2, "type": "ERROR_MESSAGE", "content": "Error: The stream was interrupted. Please continue."},
+        ]
+        with open(transcript_file, "w") as f:
+            for s in steps_unrecovered:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            harvested = harvest_transcript_response(conv_id)
+            self.assertIsNone(harvested)
+
+        # Case 2: Recovered stream drop (' Cui' pre-interruption followed by substantive continuation)
+        steps_recovered = list(steps_unrecovered) + [
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "All checks passed successfully."},
+        ]
+        with open(transcript_file, "w") as f:
+            for s in steps_recovered:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            harvested = harvest_transcript_response(conv_id)
+            self.assertEqual(harvested, "All checks passed successfully.")
+
+    def test_check_transcript_turn_status_stream_interrupted_on_cui_stub(self):
+        """Verify check_transcript_turn_status returns stream_interrupted on unrecovered ' Cui' stream drops."""
+        conv_id = "test-conv-turn-status-cui"
+        log_dir = self.temp_path / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript_full.jsonl"
+
+        # Case 1: Unrecovered drop (stream interrupted immediately after ' Cui')
+        steps_unrecovered = [
+            {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Deploy stack"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": " Cui", "output_tokens": 1},
+            {"step_index": 2, "type": "ERROR_MESSAGE", "content": "Error: The stream was interrupted. Please continue."},
+        ]
+        with open(transcript_file, "w") as f:
+            for s in steps_unrecovered:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            status = check_transcript_turn_status(conv_id)
+            self.assertFalse(status["is_complete"])
+            self.assertEqual(status["reason"], "stream_interrupted")
+            self.assertIsNone(status["content"])
+
+        # Case 2: Auto-continuation step produces only internal thinking (empty content)
+        steps_thinking_only = list(steps_unrecovered) + [
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "", "thinking": "Internal reasoning only..."},
+        ]
+        with open(transcript_file, "w") as f:
+            for s in steps_thinking_only:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            status = check_transcript_turn_status(conv_id)
+            self.assertFalse(status["is_complete"])
+            self.assertEqual(status["reason"], "stream_interrupted")
+            self.assertIsNone(status["content"])
+
+        # Case 3: Post-interruption auto-continuation finishes with substantive answer
+        steps_completed = list(steps_unrecovered) + [
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Stack deployment completed."},
+        ]
+        with open(transcript_file, "w") as f:
+            for s in steps_completed:
+                f.write(json.dumps(s) + "\n")
+
+        with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
+            status = check_transcript_turn_status(conv_id)
+            self.assertTrue(status["is_complete"])
+            self.assertEqual(status["reason"], "complete")
+            self.assertEqual(status["content"], "Stack deployment completed.")
 
 
 if __name__ == "__main__":
