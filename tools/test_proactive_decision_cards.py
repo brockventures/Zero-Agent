@@ -906,9 +906,12 @@ def test_evening_pm_build_dry_run(test_db: Path, isolate_forge_plans_dir: Path) 
 # ==============================================================================
 # CLI Entrypoint Tests
 # ==============================================================================
-def test_cli_entrypoint_all_test_mode(capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_entrypoint_all_test_mode(test_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Verifies that running CLI with --test and --workflow all completes cleanly for all 7 workflows."""
-    with patch.object(sys, "argv", ["proactive_decision_cards.py", "--test", "--workflow", "all"]):
+    with (
+        patch("tools.proactive_decision_cards.FORGE_DB_PATH", test_db),
+        patch.object(sys, "argv", ["proactive_decision_cards.py", "--test", "--workflow", "all"]),
+    ):
         main()
     captured = capsys.readouterr()
     assert "[TRIAGE] OK" in captured.out
@@ -920,9 +923,12 @@ def test_cli_entrypoint_all_test_mode(capsys: pytest.CaptureFixture[str]) -> Non
     assert "[PM_BUILD] OK" in captured.out
 
 
-def test_cli_entrypoint_single_workflow_dry_run(capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_entrypoint_single_workflow_dry_run(test_db: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """Verifies that running CLI with --dry-run and a single workflow completes cleanly."""
-    with patch.object(sys, "argv", ["proactive_decision_cards.py", "--dry-run", "--workflow", "budget"]):
+    with (
+        patch("tools.proactive_decision_cards.FORGE_DB_PATH", test_db),
+        patch.object(sys, "argv", ["proactive_decision_cards.py", "--dry-run", "--workflow", "budget"]),
+    ):
         main()
     captured = capsys.readouterr()
     assert "[BUDGET] OK" in captured.out

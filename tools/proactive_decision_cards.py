@@ -1413,33 +1413,49 @@ def main() -> None:
 
     results: list[tuple[str, bool, str, dict[str, Any]]] = []
 
+    db_override: Path | str = FORGE_DB_PATH
+    if args.test and str(db_override) == "/workspace/data/forge.db":
+        import tempfile
+        db_override = Path(tempfile.gettempdir()) / f"forge_test_cli_{os.getpid()}.db"
+        try:
+            from tools.forge import init_forge_db
+            init_forge_db(db_override)
+        except Exception:
+            pass
+
     if args.workflow in ("triage", "all"):
-        ok, summary, meta = run_inbox_rcs_action_triage_card(slot=args.slot, dry_run=args.dry_run, test=args.test)
+        ok, summary, meta = run_inbox_rcs_action_triage_card(slot=args.slot, dry_run=args.dry_run, test=args.test, db_path=db_override)
         results.append(("triage", ok, summary, meta))
 
     if args.workflow in ("calendar", "all"):
-        ok, summary, meta = run_family_calendar_radar_card(dry_run=args.dry_run, test=args.test)
+        ok, summary, meta = run_family_calendar_radar_card(dry_run=args.dry_run, test=args.test, db_path=db_override)
         results.append(("calendar", ok, summary, meta))
 
     if args.workflow in ("dinner", "all"):
-        ok, summary, meta = run_dinner_pivot_card(dry_run=args.dry_run, test=args.test)
+        ok, summary, meta = run_dinner_pivot_card(dry_run=args.dry_run, test=args.test, db_path=db_override)
         results.append(("dinner", ok, summary, meta))
 
     if args.workflow in ("budget", "actual_budget", "all"):
-        ok, summary, meta = run_actual_budget_anomaly_card(dry_run=args.dry_run, test=args.test)
+        ok, summary, meta = run_actual_budget_anomaly_card(dry_run=args.dry_run, test=args.test, db_path=db_override)
         results.append(("budget", ok, summary, meta))
 
     if args.workflow in ("weather", "weather_energy", "all"):
-        ok, summary, meta = run_weather_energy_card(dry_run=args.dry_run, test=args.test)
+        ok, summary, meta = run_weather_energy_card(dry_run=args.dry_run, test=args.test, db_path=db_override)
         results.append(("weather", ok, summary, meta))
 
     if args.workflow in ("grocery", "midweek_grocery", "all"):
-        ok, summary, meta = run_midweek_grocery_card(dry_run=args.dry_run, test=args.test)
+        ok, summary, meta = run_midweek_grocery_card(dry_run=args.dry_run, test=args.test, db_path=db_override)
         results.append(("grocery", ok, summary, meta))
 
     if args.workflow in ("pm_build", "evening_pm", "all"):
-        ok, summary, meta = run_evening_pm_build_card(dry_run=args.dry_run, test=args.test)
+        ok, summary, meta = run_evening_pm_build_card(dry_run=args.dry_run, test=args.test, db_path=db_override)
         results.append(("pm_build", ok, summary, meta))
+
+    if args.test and str(db_override).startswith("/tmp") and Path(db_override).exists():
+        try:
+            Path(db_override).unlink()
+        except Exception:
+            pass
 
     for name, ok, summary, meta in results:
         status = "OK" if ok else "FAILED"
