@@ -497,18 +497,34 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
     failures = []
     now_str = datetime.now(PT).strftime("%Y-%m-%d %I:%M %p PT")
 
-    # 1. Host1 (.82) Containers
+    # 1. Host1 (.82) Containers (with automatic self-heal for unhealthy containers)
     sb_res = json.loads(nas_docker("ps", HOST_1_IP))
     if not sb_res.get("ok"):
         failures.append(f"Host1 ({HOST_1_IP}) Docker unreachable: {sb_res.get('error')}")
     else:
+        docker_root = os.environ.get("NAS_DOCKER_ROOT", "/docker")
         for line in sb_res.get("output", "").splitlines():
             parts = [p.strip() for p in line.split("\t") if p.strip()]
             if parts:
                 name = parts[0]
                 status = parts[1] if len(parts) > 1 else ""
-                if name not in SERVERBROCK_STOPPED_ALLOWLIST and not status.startswith("Up"):
+                if name in SERVERBROCK_STOPPED_ALLOWLIST:
+                    continue
+                if not status.startswith("Up"):
                     failures.append(f"Host1 ({HOST_1_IP}) container `{name}` is {status}")
+                elif "(unhealthy)" in status.lower():
+                    heal_res = json.loads(
+                        nas_docker(
+                            "compose_restart",
+                            host=HOST_1_IP,
+                            compose_dir=f"{docker_root}/appdata",
+                            service=name,
+                        )
+                    )
+                    if not heal_res.get("ok"):
+                        failures.append(
+                            f"Host1 ({HOST_1_IP}) container `{name}` is {status} and self-heal failed: {heal_res.get('error')}"
+                        )
 
     # 2. Host2 (.84) Containers
     bs2_res = json.loads(nas_docker("ps", HOST_2_IP))
@@ -557,6 +573,19 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
             failures.append(f"Persistent MCP Daemon degraded or stopped: {mcp_stat.get('servers')}")
     except Exception as me:
         failures.append(f"Persistent MCP Daemon check failed: {me}")
+
+    # 7. Zero Health Server (port 8769 / probe.brock.ventures) with auto-heal
+    try:
+        from tools.zero_health_server import ensure_health_server_running, get_status as get_health_server_status
+        hs_stat = get_health_server_status()
+        if not hs_stat.get("running") or not check_tcp_port("127.0.0.1", int(hs_stat.get("port", 8769))):
+            ensure_health_server_running()
+            time.sleep(0.5)
+            hs_stat = get_health_server_status()
+        if not hs_stat.get("running") or not check_tcp_port("127.0.0.1", int(hs_stat.get("port", 8769))):
+            failures.append("Zero Health Server (`zero_health_server.py` on port `8769`) is offline and failed auto-heal")
+    except Exception as he:
+        failures.append(f"Zero Health Server check failed: {he}")
 
 
     if not failures:
@@ -804,7 +833,6 @@ def run_nightly_triage() -> str:
     sb_up = sum(1 for line in (sb_res.get("output") or "").splitlines() if "\t" in line and "Up" in line)
     bs2_up = sum(1 for line in (bs2_res.get("output") or "").splitlines() if "\t" in line and "Up" in line)
     total_jobs = len(health.get("latest_by_job", {}))
-    failing_count = len(active_failures)
 
     # 5. Open P0 Emergency Issues Only (P1/P2 saved for Weekly Digest)
     p0_lines = []
@@ -1226,7 +1254,7 @@ def run_nest_lock_watchdog(force: bool = False) -> tuple[bool, str]:
         import tools.nest_lock_watchdog as nlw
         importlib.reload(nlw)
         healthy, summary, details = nlw.run_watchdog(force_heal=force)
-        if healthy and details.get("heal_ok"):
+        if healthy and details.get("heal_ok") and force:
             return True, f"🛠️ {summary}"
         elif healthy:
             return True, "(nominal - 0 lock failures)"
@@ -1418,27 +1446,17 @@ def _cap_quant_summary(text: str, max_chars: int = 1850) -> str:
 
 
 def run_kalshi_paper_bot():
-    """Execute unified quantitative paper trading bot: weather CLOB + all 4 multi-venue expansion tracks."""
+    """Execute unified quantitative paper trading bot (Books 1 & 2 decommissioned 2026-10-27; runs active expansion tracks)."""
     import subprocess
     try:
-        # 1. Settle resolved contracts silently
+        # 1. Settle any remaining resolved contracts silently (Book 1 trading decommissioned)
         subprocess.run(["python3", "/workspace/tools/kalshi_paper_bot.py", "settle"], capture_output=True, text=True, check=False)
-        subprocess.run(["python3", "/workspace/tools/baseball_daily_quant.py", "settle"], capture_output=True, text=True, check=False)
-
-        # 2. Weather CLOB Scan & Trade
-        res_w = subprocess.run(["python3", "/workspace/tools/kalshi_paper_bot.py", "trade"], capture_output=True, text=True, check=False)
         fills = []
-        if res_w.stdout:
-            for line in res_w.stdout.splitlines():
-                if "New Weather Fills" in line or "[EXEC]" in line or "New fills:" in line:
-                    clean_l = line.strip().lstrip("-* ").rstrip("*")
-                    if clean_l and clean_l not in fills:
-                        fills.append(clean_l)
 
-        # 3. Multi-Venue Quantitative Expansion (Tracks 1–4)
+        # 2. Multi-Venue Quantitative Expansion (Active Books 3–5; Book 2 decommissioned)
         run_quant_expansion_sidecar("all", include_header=False)
 
-        # 4. Generate clean, unified scan summary & refresh equity chart
+        # 3. Generate clean, unified scan summary & refresh equity chart
         from tools.kalshi_performance_review import get_db, compute_portfolio_metrics, compute_quant_expansion_metrics, format_scan_summary
         from tools.quant_equity_chart import render_quant_equity_chart
         conn = get_db()
@@ -1456,10 +1474,7 @@ def run_kalshi_performance_review(phase="all"):
     """Execute Kalshi paper trading settlement, performance review, and task board sync."""
     import subprocess
     try:
-        if phase == "night":
-            # At 6:45 PM PT (silent sweep), also scan Book 1 weather before running Books 2-5 and settlement
-            subprocess.run(["python3", "/workspace/tools/kalshi_paper_bot.py", "trade"], capture_output=True, text=True, check=False)
-        # Trigger quant expansion sweep to settle positions, compound funding, and ratchet trailing stops
+        # Trigger quant expansion sweep to settle positions, compound funding, and ratchet trailing stops (Book 1 & 2 trading decommissioned)
         subprocess.run(["python3", "/workspace/tools/sidecars.py", "quant"], capture_output=True, text=True, check=False)
         cmd = ["python3", "/workspace/tools/kalshi_performance_review.py", f"--phase={phase}"]
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -1487,16 +1502,17 @@ def run_kalshi_autoworker():
 def run_quant_expansion_sidecar(target="all", include_header=True):
     """Execute multi-venue quantitative paper trading expansion tracks.
     target: 'all', 'cross_venue', 'polymarket', 'hyperliquid', 'trend'
+    Note: Books 2 ('cross_venue') and 3 ('polymarket') are decommissioned from 'all' sweeps as of 2026-10-27.
     """
     import subprocess
     success = True
 
-    if target in ("all", "cross_venue"):
+    if target == "cross_venue":
         res1 = subprocess.run(["python3", "/workspace/tools/quant_cross_venue_arb.py"], capture_output=True, text=True, check=False)
         if res1.returncode != 0:
             success = False
 
-    if target in ("all", "polymarket"):
+    if target == "polymarket":
         res2 = subprocess.run(["python3", "/workspace/tools/quant_polymarket_standalone.py"], capture_output=True, text=True, check=False)
         if res2.returncode != 0:
             success = False
@@ -1917,6 +1933,13 @@ if __name__ == "__main__":
     elif action in ("plex_weekly_digest", "plex_digest"):
         post = "--no-post" not in sys.argv and "--test" not in sys.argv
         ok, rep, _ = run_sidecar_job("plex_weekly_digest", "Plex Weekly New Media Digest", run_plex_weekly_digest, post=post, tag_all=True)
+        if rep:
+            print(rep)
+    elif action in ("plex_audiobook_enricher", "audiobook_enricher", "audiobooks"):
+        from tools.plex_audiobook_enricher import run_plex_audiobook_enricher
+        force = "--force" in sys.argv or "-f" in sys.argv
+        quiet = "--quiet" in sys.argv or "-q" in sys.argv
+        ok, rep, _ = run_sidecar_job("plex_audiobook_enricher", "Plex Audiobook Enricher & Cover Badges", run_plex_audiobook_enricher, force=force, quiet=quiet)
         if rep:
             print(rep)
     elif action in ("weekly_proactive_digest", "weekly_digest"):

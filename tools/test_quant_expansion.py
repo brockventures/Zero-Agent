@@ -4,10 +4,8 @@ if "/workspace" not in sys.path:
 #!/usr/bin/env python3
 """Unit and integration test suite for the Multi-Venue Quant Paper Trading Expansion."""
 
-import json
 import sqlite3
 import unittest
-from pathlib import Path
 
 # Add tools to path
 import quant_cross_venue_arb as track1
@@ -356,25 +354,29 @@ class TestQuantExpansion(unittest.TestCase):
         self.assertEqual(dom_opps[0]["strategy"], "strike_dominance_arb")
 
     def test_track3_reverse_basis_and_reentry_without_unique_crash(self):
-        """Track 3: Verify Reverse Basis (LONG_PERP) on negative funding and clean SQLite asset re-entry."""
+        """Track 3: Verify Forward Basis (SHORT_PERP) on verified spot assets, rejection of Reverse Basis, and clean SQLite re-entry."""
         track3.init_db(self.mem_conn)
-        assets_cycle1 = [
+        neg_assets = [
             {"name": "BLUR", "mark_px": 0.20, "oracle_px": 0.20, "funding_8h": -0.0005, "annualized_yield": -0.5475, "open_interest_usd": 1_500_000.0}
+        ]
+        track3.manage_basis_portfolio(self.mem_conn, neg_assets)
+        self.assertEqual(len(self.mem_conn.execute("SELECT * FROM hyperliquid_positions WHERE status='OPEN'").fetchall()), 0)
+
+        assets_cycle1 = [
+            {"name": "SOL", "mark_px": 150.0, "oracle_px": 150.0, "funding_8h": 0.0002, "annualized_yield": 0.219, "open_interest_usd": 5_000_000.0}
         ]
         track3.manage_basis_portfolio(self.mem_conn, assets_cycle1)
         open_pos = self.mem_conn.execute("SELECT * FROM hyperliquid_positions WHERE status='OPEN'").fetchall()
         self.assertEqual(len(open_pos), 1)
-        self.assertEqual(open_pos[0]["asset"], "BLUR")
-        self.assertEqual(open_pos[0]["direction"], "LONG_PERP")
+        self.assertEqual(open_pos[0]["asset"], "SOL")
+        self.assertEqual(open_pos[0]["direction"], "SHORT_PERP")
 
-        # Flip funding to 0 -> unwinds BLUR
         assets_cycle2 = [
-            {"name": "BLUR", "mark_px": 0.20, "oracle_px": 0.20, "funding_8h": 0.0, "annualized_yield": 0.0, "open_interest_usd": 1_500_000.0}
+            {"name": "SOL", "mark_px": 150.0, "oracle_px": 150.0, "funding_8h": 0.0, "annualized_yield": 0.0, "open_interest_usd": 5_000_000.0}
         ]
         track3.manage_basis_portfolio(self.mem_conn, assets_cycle2)
         self.assertEqual(len(self.mem_conn.execute("SELECT * FROM hyperliquid_positions WHERE status='OPEN'").fetchall()), 0)
 
-        # Spike BLUR again -> must re-enter cleanly without sqlite3.IntegrityError
         track3.manage_basis_portfolio(self.mem_conn, assets_cycle1)
         self.assertEqual(len(self.mem_conn.execute("SELECT * FROM hyperliquid_positions WHERE status='OPEN'").fetchall()), 1)
 
@@ -421,6 +423,12 @@ class TestQuantExpansion(unittest.TestCase):
         }
         summary = format_review_summary(mock_metrics, [], [])
         self.assertLessEqual(len(summary), 2000)
+        self.assertIn("Book 4 (Hyperliquid Spot-Perp Carry)", summary)
+        self.assertIn("Book 5 (Crypto Factor L/S & Macro Regime)", summary)
+        self.assertNotIn("Kalshi Weather & Events", summary)
+        self.assertNotIn("Cross-Venue Arbitrage", summary)
+        self.assertNotIn("Polymarket Standalone", summary)
+        self.assertNotIn("Books 1–3", summary)
         self.assertLessEqual(len(_cap_summary_length("line\n" * 600)), 2000)
         self.assertLessEqual(len(_cap_quant_summary("line\n" * 600)), 2000)
 
@@ -431,11 +439,11 @@ class TestQuantExpansion(unittest.TestCase):
         self.assertGreaterEqual(k_params["max_trade_risk"], 100.0)
         self.assertGreaterEqual(k_params["max_total_exposure"], 400.0)
 
-        # Hyperliquid dynamic yield/OI scaling: high-APY deep-OI asset should allocate > $250
+        # Hyperliquid dynamic yield/OI scaling: high-APY deep-OI verified spot asset should allocate > $250
         track3.init_db(self.mem_conn)
         assets = [
             {
-                "name": "HIGH_YIELD",
+                "name": "HYPE",
                 "mark_px": 10.0,
                 "oracle_px": 10.0,
                 "funding_8h": 0.0008,
@@ -580,6 +588,27 @@ class TestQuantExpansion(unittest.TestCase):
         self.assertIsNotNone(sig)
         self.assertEqual(sig[0], "LONG")
         self.assertEqual(sig[1], "trend_pullback")
+
+    def test_active_books_equity_chart_from_oct27_rebuild(self):
+        """Verify daily equity chart tracks strictly active Books 4 and 5 starting from the Oct 27 rebuild."""
+        import tempfile
+        from pathlib import Path
+        from tools.quant_equity_chart import ACTIVE_REBUILD_START_PT, build_book_timeseries, render_quant_equity_chart
+
+        data = build_book_timeseries()
+        self.assertEqual(set(data.keys()), {"now_pt", "start_pt", "total", "track3", "track4"})
+        self.assertEqual(data["total"]["baseline"], 2000.0)
+        self.assertEqual(data["track3"]["baseline"], 1000.0)
+        self.assertEqual(data["track4"]["baseline"], 1000.0)
+        self.assertGreaterEqual(data["total"]["dates"][0], ACTIVE_REBUILD_START_PT)
+        self.assertGreaterEqual(data["track3"]["dates"][0], ACTIVE_REBUILD_START_PT)
+        self.assertGreaterEqual(data["track4"]["dates"][0], ACTIVE_REBUILD_START_PT)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_img = Path(tmpdir) / "test_chart.png"
+            rendered = render_quant_equity_chart(out_img)
+            self.assertTrue(rendered.exists())
+            self.assertGreater(rendered.stat().st_size, 10000)
 
 if __name__ == "__main__":
     unittest.main()

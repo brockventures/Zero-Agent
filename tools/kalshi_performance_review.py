@@ -10,7 +10,6 @@ Runs as a time-gated sidecar:
 
 import argparse
 import json
-import math
 import os
 import re
 import shutil
@@ -397,20 +396,13 @@ def evaluate_open_positions(open_pos):
 QUANT_DB_PATH = Path("/workspace/data/quant_paper.db")
 
 def compute_quant_expansion_metrics():
-    """Compute performance and position telemetry across the 4 quantitative expansion tracks."""
+    """Compute performance and position telemetry across the quantitative expansion tracks."""
     if not QUANT_DB_PATH.exists():
         return None
     try:
         import sqlite3
         conn = sqlite3.connect(str(QUANT_DB_PATH))
         conn.row_factory = sqlite3.Row
-        try:
-            from tools.quant_cross_venue_arb import settle_resolved_cross_venue_trades
-            from tools.quant_polymarket_standalone import settle_resolved_polymarket_trades
-            settle_resolved_cross_venue_trades(conn)
-            settle_resolved_polymarket_trades(conn)
-        except Exception:
-            pass
         
         t1_port = conn.execute("SELECT * FROM cross_venue_portfolio WHERE id=1").fetchone()
         t1_trades = conn.execute("SELECT * FROM cross_venue_trades WHERE status='OPEN'").fetchall()
@@ -438,6 +430,7 @@ def compute_quant_expansion_metrics():
         t2_expected_equity = t2_cash + t2_open_cost + t2_locked_pnl
 
         t3_total_equity = float(t3_port["total_equity"]) if t3_port else 1000.0
+        t3_realized = float(t3_port["realized_pnl"]) if t3_port else 0.0
 
         t4_unrealized = sum(p["unrealized_pnl"] or 0.0 for p in t4_positions)
         t4_total_equity = (float(t4_port["total_equity"]) if t4_port else 1000.0) + t4_unrealized
@@ -466,6 +459,7 @@ def compute_quant_expansion_metrics():
             "track3": {
                 "cash": float(t3_port["cash"]) if t3_port else 0.0,
                 "cumulative_funding": float(t3_port["cumulative_funding"]) if t3_port else 0.0,
+                "realized_pnl": t3_realized,
                 "total_equity": t3_total_equity,
                 "expected_equity": t3_total_equity,
                 "open_count": len(t3_positions),
@@ -638,42 +632,43 @@ def recalibrate_models(params, metrics, dry_run=False):
                     domain_cfg["shrinkage_alpha"] = new_alpha
                     domain_cfg["min_edge_threshold"] = new_edge
                     
-    # 3. LLM Quant Portfolio Manager Post-Mortem & Calibration Synthesis (Gemini 4 Argon High)
-    try:
-        from tools.llm_sidecar import call_sidecar_llm_json, get_sidecar_model
-        model_id = get_sidecar_model("kalshi_night_audit", "gemini-4-argon-high")
-        llm_prompt = (
-            f"You are Zero's Quantitative Portfolio Manager ({model_id}) conducting the daily Kalshi & Multi-Venue Quant calibration review.\n\n"
-            f"Current Portfolio Metrics & Brier Calibration:\n{json.dumps(metrics, indent=2, default=str)}\n\n"
-            f"Current Model Parameters:\n{json.dumps(params.get('domains', {}), indent=2, default=str)}\n\n"
-            f"Baseline Rule Adjustments Proposed:\n{json.dumps(adjustments, indent=2, default=str)}\n\n"
-            "Analyze the settled performance, Brier calibration drift, and 5-book exposure. "
-            "Provide:\n"
-            "1. `pm_postmortem`: A sharp 2-3 sentence quantitative post-mortem on model calibration, edge realization, and risk posture across the 5 books.\n"
-            "2. `recommended_kelly`: Optional float between 0.10 and 0.30 if Kelly fraction should be adjusted.\n\n"
-            "Respond ONLY with valid JSON:\n"
-            '{"pm_postmortem": "...", "recommended_kelly": 0.25}'
-        )
-        llm_res = call_sidecar_llm_json("kalshi_night_audit", llm_prompt, timeout=75)
-        if isinstance(llm_res, dict) and llm_res.get("pm_postmortem"):
-            metrics["llm_pm_postmortem"] = str(llm_res["pm_postmortem"]).strip()
-            metrics["llm_pm_model"] = model_id
-            rec_k = llm_res.get("recommended_kelly")
-            if isinstance(rec_k, (int, float)):
-                bounded_k = max(0.10, min(0.30, round(float(rec_k), 2)))
-                curr_k = params.get("global", {}).get("kelly_fraction", 0.25)
-                if abs(bounded_k - curr_k) >= 0.02:
-                    adjustments.append({
-                        "scope": "global (LLM PM)",
-                        "parameter": "kelly_fraction",
-                        "old": curr_k,
-                        "new": bounded_k,
-                        "reason": f"Quant PM ({model_id}) calibration adjustment",
-                    })
-                    if not dry_run:
-                        params.setdefault("global", {})["kelly_fraction"] = bounded_k
-    except Exception as e:
-        print(f"[KalshiReview] LLM post-mortem note: {e}", file=sys.stderr)
+    # 3. LLM Quant Portfolio Manager Post-Mortem & Calibration Synthesis (only when Book 1 has active/settled positions)
+    if metrics.get("open_count", 0) > 0 or metrics.get("today_settled_count", 0) > 0:
+        try:
+            from tools.llm_sidecar import call_sidecar_llm_json, get_sidecar_model
+            model_id = get_sidecar_model("kalshi_night_audit", "gemini-4-argon-high")
+            llm_prompt = (
+                f"You are Zero's Quantitative Portfolio Manager ({model_id}) conducting the daily Kalshi & Multi-Venue Quant calibration review.\n\n"
+                f"Current Portfolio Metrics & Brier Calibration:\n{json.dumps(metrics, indent=2, default=str)}\n\n"
+                f"Current Model Parameters:\n{json.dumps(params.get('domains', {}), indent=2, default=str)}\n\n"
+                f"Baseline Rule Adjustments Proposed:\n{json.dumps(adjustments, indent=2, default=str)}\n\n"
+                "Analyze the settled performance, Brier calibration drift, and active exposure. "
+                "Provide:\n"
+                "1. `pm_postmortem`: A sharp 2-3 sentence quantitative post-mortem on model calibration, edge realization, and risk posture.\n"
+                "2. `recommended_kelly`: Optional float between 0.10 and 0.30 if Kelly fraction should be adjusted.\n\n"
+                "Respond ONLY with valid JSON:\n"
+                '{"pm_postmortem": "...", "recommended_kelly": 0.25}'
+            )
+            llm_res = call_sidecar_llm_json("kalshi_night_audit", llm_prompt, timeout=75)
+            if isinstance(llm_res, dict) and llm_res.get("pm_postmortem"):
+                metrics["llm_pm_postmortem"] = str(llm_res["pm_postmortem"]).strip()
+                metrics["llm_pm_model"] = model_id
+                rec_k = llm_res.get("recommended_kelly")
+                if isinstance(rec_k, (int, float)):
+                    bounded_k = max(0.10, min(0.30, round(float(rec_k), 2)))
+                    curr_k = params.get("global", {}).get("kelly_fraction", 0.25)
+                    if abs(bounded_k - curr_k) >= 0.02:
+                        adjustments.append({
+                            "scope": "global (LLM PM)",
+                            "parameter": "kelly_fraction",
+                            "old": curr_k,
+                            "new": bounded_k,
+                            "reason": f"Quant PM ({model_id}) calibration adjustment",
+                        })
+                        if not dry_run:
+                            params.setdefault("global", {})["kelly_fraction"] = bounded_k
+        except Exception as e:
+            print(f"[KalshiReview] LLM post-mortem note: {e}", file=sys.stderr)
 
     if adjustments and not dry_run:
         params.setdefault("calibration_history", []).append({
@@ -834,16 +829,28 @@ def sync_repository(dry_run=False):
         return False
 
 def update_vault_doc(metrics):
-    """Update vault documentation with latest metrics."""
+    """Update vault documentation with latest active portfolio metrics (Books 4–5)."""
     if not VAULT_DOC.exists():
         return
     try:
         now_str = datetime.now(PT).strftime("%Y-%m-%d %I:%M %p PT")
         content = VAULT_DOC.read_text()
-        
-        # Replace or append portfolio line
+        qm = compute_quant_expansion_metrics()
+        if qm:
+            t3 = qm["track3"]
+            t4 = qm["track4"]
+            tot_eq = t3["expected_equity"] + t4["expected_equity"]
+            open_cnt = t3["open_count"] + t4["open_count"]
+            cash_tot = t3["cash"] + t4["cash"]
+            new_line = (
+                f"- Portfolio Status ({now_str}): {open_cnt} active positions across Books 4–5 "
+                f"(Book 4: ${t3['expected_equity']:,.2f}, Book 5: ${t4['expected_equity']:,.2f}), "
+                f"${cash_tot:,.2f} idle cash, ${tot_eq:,.2f} total active equity ($2,000.00 baseline)."
+            )
+        else:
+            new_line = f"- Portfolio Status ({now_str}): {metrics['open_count']} open positions, ${metrics['open_exposure']:.2f} open exposure, ${metrics['cash']:.2f} cash, ${metrics['total_equity']:.2f} total equity."
+
         pattern = r"- Portfolio Status.*"
-        new_line = f"- Portfolio Status ({now_str}): {metrics['open_count']} open positions, ${metrics['open_exposure']:.2f} open exposure, ${metrics['cash']:.2f} cash, ${metrics['total_equity']:.2f} total equity."
         if re.search(pattern, content):
             content = re.sub(pattern, new_line, content)
         else:
@@ -886,85 +893,48 @@ def _fmt_signed_usd(val: float) -> str:
 
 def format_review_summary(metrics, settled, adjustments, max_chars=1850):
     now_str = datetime.now(PT).strftime("%b %d, %I:%M %p PT")
-    open_cnt = metrics.get("open_count", 0)
-    open_exp = metrics.get("open_exposure", 0.0)
 
     qm = compute_quant_expansion_metrics()
-    k_eq = metrics["total_equity"]
-    k_delta = k_eq - 1000.0
-    tot_eq = k_eq
     if qm:
-        tot_eq += (
-            qm["track1"]["expected_equity"]
-            + qm["track2"]["expected_equity"]
-            + qm["track3"]["expected_equity"]
-            + qm["track4"]["expected_equity"]
-        )
-        tot_delta = tot_eq - 5000.0
-        tot_pct = (tot_delta / 5000.0) * 100.0
+        t3 = qm["track3"]
+        t4 = qm["track4"]
+        tot_eq = t3["expected_equity"] + t4["expected_equity"]
+        tot_delta = tot_eq - 2000.0
+        tot_pct = (tot_delta / 2000.0) * 100.0
     else:
-        tot_delta = k_delta
+        tot_eq = metrics["total_equity"]
+        tot_delta = tot_eq - 1000.0
         tot_pct = (tot_delta / 1000.0) * 100.0
 
     lines = [
         f"### 📈 Daily Quant Portfolio Update • {now_str}",
-        f"**Total Equity:** **${tot_eq:,.2f}** (**{_fmt_signed_usd(tot_delta)}** / **{tot_pct:+.1f}%**)",
+        f"**Active Portfolio Equity (Books 4–5):** **${tot_eq:,.2f}** (**{_fmt_signed_usd(tot_delta)}** / **{tot_pct:+.1f}%**)",
         "",
     ]
 
-    # 1. Book 1: Kalshi Weather & Events
-    k_realized = metrics.get("realized_pnl", 0.0)
-    lines.append(f"1. **Kalshi Weather & Events:** **${k_eq:,.2f}** (**{_fmt_signed_usd(k_delta)}**)")
-    if open_cnt > 0:
-        wins = metrics.get("open_tracking_wins", [])
-        losses = metrics.get("open_tracking_losses", [])
-        in_progress = metrics.get("open_in_progress", [])
-        parts = [f"{w['label']} ({_fmt_signed_usd(w['pnl'])})" for w in wins[:2]]
-        parts += [f"{l['label']} ({_fmt_signed_usd(l['pnl'])})" for l in losses[:2]]
-        parts += [f"{ip['label']} ({ip['obs']}°F)" for ip in in_progress[:2]]
-        detail = f": {', '.join(parts)}" if parts else ""
-        lines.append(f"   - {_fmt_signed_usd(k_realized)} realized · {open_cnt} open (${open_exp:,.2f} risk{detail})")
-    else:
-        lines.append(f"   - {_fmt_signed_usd(k_realized)} realized · 0 open positions")
-
     if qm:
-        # 2. Book 2: Cross-Venue Arbitrage
-        t1 = qm["track1"]
-        t1_eq = t1["expected_equity"]
-        t1_delta = t1_eq - 1000.0
-        lines.append(f"2. **Cross-Venue Arbitrage:** **${t1_eq:,.2f}** (**{_fmt_signed_usd(t1_delta)}**)")
-        lines.append(
-            f"   - {_fmt_signed_usd(t1['realized_pnl'])} realized · {_fmt_signed_usd(t1['locked_pnl'])} locked across {t1['open_count']} open pairs"
-        )
-
-        # 3. Book 3: Polymarket Standalone
-        t2 = qm["track2"]
-        t2_eq = t2["expected_equity"]
-        t2_delta = t2_eq - 1000.0
-        lines.append(f"3. **Polymarket Standalone:** **${t2_eq:,.2f}** (**{_fmt_signed_usd(t2_delta)}**)")
-        lines.append(
-            f"   - {_fmt_signed_usd(t2['realized_pnl'])} realized · {_fmt_signed_usd(t2['locked_pnl'])} locked across {t2['open_count']} open positions"
-        )
-
-        # 4. Book 4: Hyperliquid Basis
+        # Book 4: Hyperliquid Spot-Perp Carry
         t3 = qm["track3"]
         t3_eq = t3["expected_equity"]
         t3_delta = t3_eq - 1000.0
         fund = t3.get("cumulative_funding", 0.0)
-        pos_items = [f"{p['asset']} ({p['annualized_yield']*100:.0f}% APY)" for p in t3.get("positions", [])[:4]]
+        fees = t3.get("realized_pnl", 0.0)
+        pos_items = [f"{p['asset']} ({p['annualized_yield']*100:.1f}% APY)" for p in t3.get("positions", [])[:4]]
         pos_str = f": {', '.join(pos_items)}" if pos_items else ""
-        lines.append(f"4. **Hyperliquid Basis:** **${t3_eq:,.2f}** (**{_fmt_signed_usd(t3_delta)}**)")
-        lines.append(f"   - {_fmt_signed_usd(fund)} accrued funding · {t3['open_count']} active perps{pos_str}")
+        lines.append(f"1. **Book 4 (Hyperliquid Spot-Perp Carry):** **${t3_eq:,.2f}** (**{_fmt_signed_usd(t3_delta)}**)")
+        lines.append(
+            f"   - {_fmt_signed_usd(fund)} accrued funding · {_fmt_signed_usd(fees)} fee friction · {t3['open_count']} active pairs{pos_str}"
+        )
 
-        # 5. Book 5: Trend Momentum
+        # Book 5: Crypto Factor L/S & Macro Regime
         t4 = qm["track4"]
         t4_eq = t4["expected_equity"]
         t4_delta = t4_eq - 1000.0
         unreal = t4.get("unrealized_pnl", 0.0)
-        swings = [f"{p['symbol']} ({_fmt_signed_usd(p['unrealized_pnl'] or 0.0)})" for p in t4.get("positions", [])[:5]]
+        swings = [f"{p['symbol']} {p.get('direction', 'LONG')} ({_fmt_signed_usd(p['unrealized_pnl'] or 0.0)})" for p in t4.get("positions", [])[:5]]
         swing_str = f": {', '.join(swings)}" if swings else ""
-        lines.append(f"5. **Trend Momentum:** **${t4_eq:,.2f}** (**{_fmt_signed_usd(t4_delta)}**)")
-        lines.append(f"   - {_fmt_signed_usd(t4['realized_pnl'])} realized · {_fmt_signed_usd(unreal)} unrealized across {t4['open_count']} swings{swing_str}")
+        lines.append(f"2. **Book 5 (Crypto Factor L/S & Macro Regime):** **${t4_eq:,.2f}** (**{_fmt_signed_usd(t4_delta)}**)")
+        lines.append(f"   - {_fmt_signed_usd(t4['realized_pnl'])} net realized · {_fmt_signed_usd(unreal)} unrealized across {t4['open_count']} positions{swing_str}")
 
     return _cap_summary_length("\n".join(lines), max_chars=max_chars)
 
