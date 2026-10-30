@@ -54,6 +54,33 @@ def _resolve_mealie_base() -> str:
 
 MEALIE_BASE = _resolve_mealie_base()
 FAMILY_CALENDAR_ID = "family05249951047154432652@group.calendar.google.com"
+SHOPPING_CHANNEL_ID = 1544955538033348618
+
+
+def stage_meal_proposal_decision(plan: dict) -> dict | None:
+    """Stage a Decision Card for locking in the weekly dinner proposal."""
+    try:
+        from tools.forge import stage_decision
+
+        meals = plan.get("meals", {})
+        t_name = meals.get("tuesday", {}).get("recipe", {}).get("name", "Tuesday Dinner")
+        th_name = meals.get("thursday", {}).get("recipe", {}).get("name", "Thursday Dinner")
+        s_name = meals.get("sunday", {}).get("recipe", {}).get("name", "Sunday Dinner")
+        summary = (
+            f"Weekly dinner rotation: {t_name} (Tue), {th_name} (Thu), and {s_name} (Sun). "
+            "Approving locks in the menu, syncs events to the Family Google Calendar, and stages ingredients for Whole Foods delivery."
+        )
+        return stage_decision(
+            category="meal_plan",
+            title="Lock In Weekly 3-Dinner Menu",
+            summary=summary,
+            handler_type="shell",
+            payload={"command": "python3 /workspace/tools/meal_planner_proposal.py lock-in", "cwd": "/workspace"},
+            channel_id=SHOPPING_CHANNEL_ID,
+            post_to_discord=True,
+        )
+    except Exception:
+        return None
 
 
 def refresh_recipes_cache(force: bool = False) -> list[dict]:
@@ -280,12 +307,15 @@ def filter_eligible_recipes(recipes: list[dict], recent_slugs: set[str], slot: s
     return eligible
 
 
-def generate_proposal(ref_date: datetime | None = None, force: bool = False) -> dict:
+def generate_proposal(ref_date: datetime | None = None, force: bool = False, stage: bool | None = None) -> dict:
     """Generates a 3-meal proposal adhering to all constraints.
     Reuses existing active proposed plan if valid for current target cycle and force=False.
     """
     now = ref_date or datetime.now(PT)
     dates = get_target_cooking_dates(now)
+
+    is_pytest = "pytest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    should_stage = stage if stage is not None else (not is_pytest)
 
     if not force:
         active = load_active_plan()
@@ -301,6 +331,11 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False) -> 
                         all_valid_dinners = False
                         break
                 if all_valid_dinners:
+                    if should_stage and not active.get("decision_staged"):
+                        dec = stage_meal_proposal_decision(active)
+                        if dec:
+                            active["decision_staged"] = True
+                            save_active_plan(active)
                     return active
 
     recipes = load_recipes()
@@ -388,6 +423,11 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False) -> 
     }
 
     save_active_plan(plan)
+    if should_stage:
+        dec = stage_meal_proposal_decision(plan)
+        if dec:
+            plan["decision_staged"] = True
+            save_active_plan(plan)
     return plan
 
 
@@ -570,6 +610,7 @@ def swap_slot(slot: str) -> tuple[bool, str]:
 
 def main():
     parser = argparse.ArgumentParser(description="Weekly Meal Planning Proposal & Calendar Sync")
+    parser.add_argument("action", nargs="?", default="", help="Positional action e.g. lock-in")
     parser.add_argument("--generate", action="store_true", help="Generate 3-dinner proposal")
     parser.add_argument("--force", "-f", action="store_true", help="Force regenerate proposal")
     parser.add_argument("--lock", action="store_true", help="Lock in active menu and sync to Family Calendar")
@@ -577,13 +618,13 @@ def main():
     parser.add_argument("--json-out", action="store_true", help="Output raw JSON")
     args = parser.parse_args()
 
-    if args.lock:
+    if args.lock or args.action in ("lock", "lock-in"):
         ok, rep = lock_in_menu()
         print(rep)
     elif args.swap:
         ok, rep = swap_slot(args.swap)
         print(rep)
-    elif args.generate or not len(sys.argv) > 1:
+    elif args.generate or args.action in ("generate", "proposal") or not len(sys.argv) > 1:
         plan = generate_proposal(force=args.force)
         if args.json_out:
             print(json.dumps(plan, indent=2))

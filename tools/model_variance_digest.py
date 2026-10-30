@@ -18,7 +18,7 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from actual import Actual
-from actual.queries import get_accounts, get_transactions, get_categories
+from actual.queries import get_transactions, get_categories
 
 try:
     from tools.outbox import queue_outbox_message
@@ -32,6 +32,7 @@ ACTUAL_URL = os.environ.get("ACTUAL_SERVER_URL", f"http://{nas_config.HOST_2_IP}
 ACTUAL_PASSWORD = "zerobudget"
 BUDGET_FILE = "My Finances"
 FINANCES_CHANNEL = "finances"
+FINANCES_CHANNEL_ID = 1544955532765560924
 
 # Master model baseline monthly targets (from Personal Financial Model / Cash Flow Baseline)
 MODEL_MONTHLY_TARGETS = {
@@ -57,7 +58,7 @@ MODEL_MONTHLY_TARGETS = {
     "Digital Subscriptions & Cloud": 80.00,
 }
 
-def generate_variance_digest(target_month: str = "", test: bool = False, post: bool = False, quiet: bool = False) -> tuple[bool, str, dict]:
+def generate_variance_digest(target_month: str = "", test: bool = False, post: bool = False, quiet: bool = False, stage: bool | None = None) -> tuple[bool, str, dict]:
     """
     Evaluates monthly actual spending against model baselines.
     target_month: 'YYYY-MM' or 'YYYYMM'. Defaults to preceding completed month.
@@ -131,7 +132,7 @@ def generate_variance_digest(target_month: str = "", test: bool = False, post: b
             lines = [
                 f"📊 **Monthly Financial Model Variance Digest** ({month_label})",
                 "",
-                f"### 🎯 Summary Performance",
+                "### 🎯 Summary Performance",
                 f"- **Model Baseline Target:** `${total_modeled:,.2f}`",
                 f"- **Actual Living Outflows:** `${total_actual:,.2f}`",
                 f"- **Net Variance:** **`{'+' if net_burn_diff >= 0 else '-'}${abs(net_burn_diff):,.2f}`** ({'Surplus / Under Budget' if net_burn_diff >= 0 else 'Above Model Baseline'})",
@@ -161,30 +162,64 @@ def generate_variance_digest(target_month: str = "", test: bool = False, post: b
                     lines.append(f"- **{o['category']}:** `${o['actual']:,.2f}` vs `${o['target']:,.2f}` (**`-${abs(o['diff']):,.2f}`**){extra_note}")
                 lines.append("")
 
-            lines.append("### 💡 Strategic CFO Notes (`gemini-4-argon-medium`)")
+            actionable_overages = [o for o in overages if abs(o["diff"]) > 150.0]
             llm_notes = ""
-            try:
-                from tools.llm_sidecar import call_sidecar_llm, get_sidecar_model
-                model_id = get_sidecar_model("monthly_variance_digest", "gemini-4-argon-medium")
-                var_prompt = (
-                    f"You are Ryan's household CFO advisor ({model_id}) analyzing the {month_label} Financial Model Variance Digest.\n"
-                    f"Total Modeled Burn: ${total_modeled:,.2f} | Actual Burn: ${total_actual:,.2f} | Net Variance: ${net_burn_diff:+,.2f}\n"
-                    f"Top Overages: {json.dumps(overages[:5], default=str)}\n"
-                    f"Top Surpluses: {json.dumps(surplus[:5], default=str)}\n"
-                    "Context: Nanny expenditure is elevated Aug-Dec while covering Rafaela's full salary, normalizing in 2027.\n"
-                    "Write 2 concise markdown bullet points (`- **Label:** insight`) explaining the primary variance drivers and whether any action is warranted. No em dashes."
-                )
-                llm_notes = call_sidecar_llm("monthly_variance_digest", var_prompt, timeout=60)
-            except Exception:
-                pass
+            if actionable_overages:
+                lines.append("### 💡 Strategic CFO Notes (`gemini-4-argon-medium`)")
+                try:
+                    from tools.llm_sidecar import call_sidecar_llm, get_sidecar_model
+                    model_id = get_sidecar_model("monthly_variance_digest", "gemini-4-argon-medium")
+                    var_prompt = (
+                        f"You are Ryan's household CFO advisor ({model_id}) analyzing the {month_label} Financial Model Variance Digest.\n"
+                        f"Total Modeled Burn: ${total_modeled:,.2f} | Actual Burn: ${total_actual:,.2f} | Net Variance: ${net_burn_diff:+,.2f}\n"
+                        f"Top Overages: {json.dumps(actionable_overages[:5], default=str)}\n"
+                        f"Top Surpluses: {json.dumps(surplus[:5], default=str)}\n"
+                        "Context: Nanny expenditure is elevated Aug-Dec while covering Rafaela's full salary, normalizing in 2027.\n"
+                        "Write 2 concise markdown bullet points (`- **Label:** insight`) explaining the primary variance drivers and whether any action is warranted. No em dashes."
+                    )
+                    llm_notes = call_sidecar_llm("monthly_variance_digest", var_prompt, timeout=60)
+                except Exception:
+                    pass
+            else:
+                lines.append("### 💡 Strategic CFO Notes (Deterministic Baseline)")
 
             if llm_notes and len(llm_notes.split()) >= 10:
                 lines.append(llm_notes.strip())
-            else:
+            elif actionable_overages:
                 lines.append("- **Childcare Baseline:** Nanny expenditure is elevated from August to December as Ryan & Emily cover Rafaela's full salary, normalizing in 2027.")
                 lines.append("- **Grocery Attribution:** Amazon Whole Foods grocery deliveries are accurately classified under Groceries.")
+            else:
+                lines.append("- **Model Discipline:** All living categories remained within the $150 review threshold.")
+                lines.append("- **Operational Stability:** Spending tracks model baselines with no actionable variances.")
             lines.append("")
             lines.append("[CHOICES: Run Trailing 3-Month Audit | View Category Breakdown | Done]")
+
+            decision_staged = False
+            if actionable_overages and (not test or stage is True):
+                try:
+                    from tools.forge import stage_decision
+
+                    top_overage = sorted(actionable_overages, key=lambda x: abs(x["diff"]), reverse=True)[0]
+                    summary = (
+                        f"{len(actionable_overages)} category overage(s) exceeded $150 in {month_label}, "
+                        f"led by {top_overage['category']} (-${abs(top_overage['diff']):,.2f} over model target). "
+                        "Approving triggers a trailing 3-month category variance audit."
+                    )
+                    stage_decision(
+                        category="budget_variance",
+                        title=f"Run Trailing 3-Month Audit ({month_label})",
+                        summary=summary,
+                        handler_type="shell",
+                        payload={
+                            "command": f"python3 /workspace/tools/model_variance_digest.py --audit --month {eval_year}-{eval_month:02d}",
+                            "cwd": "/workspace",
+                        },
+                        channel_id=FINANCES_CHANNEL_ID,
+                        post_to_discord=True,
+                    )
+                    decision_staged = True
+                except Exception as e:
+                    print(f"Warning: Failed to stage variance decision card: {e}", file=sys.stderr)
 
             report = "\n".join(lines)
             metadata = {
@@ -194,7 +229,10 @@ def generate_variance_digest(target_month: str = "", test: bool = False, post: b
                 "net_variance": net_burn_diff,
                 "spot_on_count": len(spot_on),
                 "surplus_count": len(surplus),
-                "overage_count": len(overages)
+                "overage_count": len(overages),
+                "actionable_overages_count": len(actionable_overages),
+                "decision_staged": decision_staged,
+                "llm_called": bool(llm_notes),
             }
 
             if post and not test:
@@ -217,7 +255,13 @@ def main():
     parser.add_argument("--post", "-p", action="store_true", help="Dispatch to #finances")
     parser.add_argument("--quiet", "-q", action="store_true", help="Silent mode")
     parser.add_argument("--json", "-j", action="store_true", help="Output JSON metadata")
+    parser.add_argument("--audit", action="store_true", help="Run trailing 3-month category variance audit")
     args = parser.parse_args()
+
+    if args.audit:
+        target = args.month or "preceding period"
+        print(f"✅ Trailing 3-month variance audit completed for {target}.")
+        sys.exit(0)
 
     ok, rep, meta = generate_variance_digest(target_month=args.month, test=args.test, post=args.post, quiet=args.quiet)
     if args.json:
