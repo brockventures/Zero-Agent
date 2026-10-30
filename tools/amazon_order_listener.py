@@ -340,7 +340,7 @@ def run_loop():
 
     env = load_env()
     bot_token = env.get("DISCORD_BOT_TOKEN")
-    channel_id = env.get("ZERO_CHAT_CHANNEL", "1542081375287640084")
+    channel_id = env.get("SHOPPING_CHANNEL") or env.get("SHOPPING_CHANNEL_ID") or env.get("AMAZON_ORDER_CHANNEL") or "1544955538033348618"
 
     if not bot_token:
         log("Warning: DISCORD_BOT_TOKEN not found in environment. Order logging will be local only.")
@@ -492,7 +492,7 @@ def sync_recent(limit: int = 5, notify: bool = False):
 
     env = load_env()
     bot_token = env.get("DISCORD_BOT_TOKEN")
-    channel_id = env.get("ZERO_CHAT_CHANNEL", "1542081375287640084")
+    channel_id = env.get("SHOPPING_CHANNEL") or env.get("SHOPPING_CHANNEL_ID") or env.get("AMAZON_ORDER_CHANNEL") or "1544955538033348618"
 
     synced = []
     for m in messages:

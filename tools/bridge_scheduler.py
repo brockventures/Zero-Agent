@@ -23,6 +23,10 @@ from tools.bridge_state import (
     PT_TZ,
     update_beacon,
 )
+
+ZERO_OPS_CHANNEL_ID = 1544953279664889888
+SHOPPING_CHANNEL_ID = 1544955538033348618
+HOME_ASSISTANT_CHANNEL_ID = 1544953275877556334
 from tools.bridge_formatting import (
     chunk_text,
     parse_interactive_choices,
@@ -88,6 +92,13 @@ INTERNAL_SYSTEM_MAINTENANCE_NAMES = {
     "resident_agents_watcher",
     "r/ResidentAgents Daily Tips & Tricks Megathread Rotation",
     "resident_agents_daily_tip",
+    "Kalshi Midday Heating & Euro Pre-Kickoff Sweep",
+    "kalshi_midday_heating",
+    "Quant US Pre-Game Lineup & Afternoon Peak Sweep",
+    "quant_pregame_sweep",
+    "Weekly Plex Audiobook Enricher & Cover Badges",
+    "Plex Audiobook Enricher & Cover Badges",
+    "plex_audiobook_enricher",
 }
 
 INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
@@ -99,11 +110,14 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "pid_watchdog",
     "plex_cleanup",
     "kalshi_paper_bot",
+    "kalshi_midday_heating",
+    "quant_pregame_sweep",
     "quant_daily_sweep",
     "quant_expansion_sweep",
     "kalshi_night_audit",
     "resident_agents_watcher",
     "resident_agents_daily_tip",
+    "plex_audiobook_enricher",
 }
 
 
@@ -176,11 +190,14 @@ async def dispatch_scheduled_prompt(
     global LAST_SCHEDULED_DISPATCH
 
 
-    # Strictly isolate all Kalshi quant paper trading sidecars to #vault
+    # Strictly isolate all Kalshi and Quant paper trading sidecars to #vault (except outbox agent turns)
     is_outbox_turn = bool(job_id and str(job_id).startswith("outbox_turn_"))
 
-    # Strictly isolate all Kalshi quant paper trading sidecars to #vault (except outbox agent turns)
-    if not is_outbox_turn and ((job_id and "kalshi" in job_id.lower()) or "kalshi" in job_name.lower() or "kalshi" in prompt.lower()):
+    if not is_outbox_turn and (
+        (job_id and any(k in job_id.lower() for k in ("kalshi", "quant")))
+        or any(k in job_name.lower() for k in ("kalshi", "quant"))
+        or any(k in prompt.lower() for k in ("sidecars.py kalshi", "sidecars.py quant", "kalshi_bot"))
+    ):
         channel_id = VAULT_CHANNEL_ID
 
     # Anti-storm guard: prevent any job from dispatching more than once per 5 minutes
@@ -231,7 +248,7 @@ async def dispatch_scheduled_prompt(
             from tools.session_rollover import run_daily_session_rollover
             ok, rep, details = await _run_sidecar_job_async("session_rollover", "Daily Session Rollover", run_daily_session_rollover, bot=bot, dry_run=False)
             if not ok and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
                     await ch.send(rep)
             rolled_count = len(details.get("rolled_over", [])) if isinstance(details, dict) else 0
@@ -247,7 +264,7 @@ async def dispatch_scheduled_prompt(
         except Exception as e:
             print(f"[Scheduler] Error executing daily multi-channel session rollover: {e}")
             if bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
                     await ch.send(f"⚠️ **Daily Session Rollover Error**: {e}")
         return
@@ -415,14 +432,14 @@ async def dispatch_scheduled_prompt(
         return
 
     # Heartbeat sweep: silent execution unless degraded
-    if job_name == "Heartbeat Sweep" or "sidecars.py heartbeat" in prompt:
+    if job_name == "Heartbeat Sweep" or "sidecars.py heartbeat" in prompt or job_id in ("heartbeat_sweep", "heartbeat"):
         try:
             import importlib
             import tools.sidecars
             importlib.reload(tools.sidecars)
             healthy, report, _ = await _run_sidecar_job_async("heartbeat", "Heartbeat Sweep", tools.sidecars.run_heartbeat_sweep)
             if not healthy and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
                     await ch.send(report)
         except Exception as e:
@@ -445,12 +462,12 @@ async def dispatch_scheduled_prompt(
         return
 
     # EV9 listing monitor: silent execution on Mon-Sat; only posts Sunday digest
-    if job_name == "EV9 Listing Monitor" or "sidecars.py ev9" in prompt:
+    if job_name == "EV9 Listing Monitor" or "sidecars.py ev9" in prompt or job_id == "ev9_monitor":
         try:
             from tools.sidecars import run_ev9_monitor
             has_digest, rep, plot_path = await _run_sidecar_job_async("ev9", "EV9 Listing Monitor", run_ev9_monitor, force_digest=False)
             if has_digest and rep and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(SHOPPING_CHANNEL_ID)
                 if ch:
                     file = discord.File(plot_path) if plot_path and os.path.exists(plot_path) else None
                     await ch.send(rep, file=file)
@@ -461,17 +478,17 @@ async def dispatch_scheduled_prompt(
         return
 
     # Marketing email sweep: biweekly promotional sweep
-    if job_name in ("Biweekly Marketing Sweep", "Marketing Email Sweep") or "sidecars.py marketing" in prompt:
+    if job_name in ("Biweekly Marketing Sweep", "Marketing Email Sweep") or "sidecars.py marketing" in prompt or job_id == "marketing_sweep":
         try:
             from tools.sidecars import run_marketing_sweep
             ok, rep, extra = await _run_sidecar_job_async("marketing", "Marketing Email Sweep", run_marketing_sweep, force=False)
             should_post = extra.get("should_post", False) if isinstance(extra, dict) else (ok and bool(rep and rep.strip()))
-            if should_post and rep and rep.strip() and bot:
+            if should_post and rep and rep.strip() and "No promotional emails" not in rep and bot:
                 ch = await get_dest_channel()
                 if ch:
                     await ch.send(rep)
             else:
-                print("[Scheduler] Marketing sweep: off-week or not due yet (silent).")
+                print("[Scheduler] Marketing sweep: off-week, not due, or 0 senders (silent).")
         except Exception as e:
             print(f"[Scheduler] Marketing sweep execution error: {e}")
         return
@@ -491,7 +508,7 @@ async def dispatch_scheduled_prompt(
         return
 
     # Nightly NAS log review: autonomous closed-loop triage
-    if job_name in ("NAS Log Review", "NAS Log Review Check") or "sidecars.py nas_logs" in prompt or "nas_log_triage" in prompt:
+    if job_name in ("NAS Log Review", "NAS Log Review Check") or "sidecars.py nas_logs" in prompt or "nas_log_triage" in prompt or job_id == "nas_logs":
         try:
             import importlib
             import tools.nas_log_triage
@@ -503,15 +520,12 @@ async def dispatch_scheduled_prompt(
 
             ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
             if total_issues == 0:
-                # Nominal state: Crisp 1-line confirmation (or silent if empty)
-                if rep and bot and ch:
-                    await ch.send(rep)
-                print("[Scheduler] NAS log review: 0 actionable errors across all containers (nominal).")
+                print("[Scheduler] NAS log review: 0 actionable errors across all containers (silent nominal).")
                 return
 
             # Candidate issues flagged: hand off to Zero for autonomous forensic investigation & safe remediation
             if bot and turn_queue:
-                target_cid = HOMELAB_CHANNEL_ID
+                target_cid = channel_id or HOMELAB_CHANNEL_ID
                 dest_ch = await get_dest_channel(target_cid)
                 if not dest_ch:
                     print(f"[Scheduler] Could not fetch channel {target_cid}")
@@ -536,12 +550,12 @@ async def dispatch_scheduled_prompt(
 
 
     # Plex transcode cache cleanup: silent unless warning/error
-    if job_name == "Plex Transcode Cleanup" or "sidecars.py plex" in prompt:
+    if job_name in ("Plex Transcode Cleanup", "plex_cleanup") or ("sidecars.py plex" in prompt and "plex_audiobook" not in prompt and "audiobook" not in prompt) or job_id == "plex_cleanup":
         try:
             from tools.sidecars import run_plex_session_cleanup
             ok, rep, _ = await _run_sidecar_job_async("plex", "Plex Transcode Cleanup", run_plex_session_cleanup)
             if not ok and rep and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
                     await ch.send(rep)
         except Exception as e:
@@ -549,36 +563,47 @@ async def dispatch_scheduled_prompt(
         return
 
     # Dreaming memory consolidation: headless nightly consolidation
-    if job_name in ("Dreaming Memory Consolidation", "Dreaming Consolidation") or "sidecars.py dream" in prompt:
+    if job_name in ("Dreaming Memory Consolidation", "Dreaming Consolidation") or "sidecars.py dream" in prompt or job_id in ("dreaming", "dream"):
         try:
             from tools.memory_manager import run_dreaming_consolidation
             ok, rep, _ = await _run_sidecar_job_async("dream", "Dreaming Consolidation", run_dreaming_consolidation)
+            if not ok and rep and bot:
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
+                if ch:
+                    await ch.send(f"⚠️ **Dreaming Consolidation Error**: {rep}")
             print(f"[Scheduler] Dreaming memory consolidation completed: ok={ok}")
         except Exception as e:
             print(f"[Scheduler] Dreaming consolidation execution error: {e}")
+            if bot:
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
+                if ch:
+                    await ch.send(f"⚠️ **Dreaming Consolidation Exception**: {e}")
         return
 
     # Memory doctor weekly audit
-    if job_name in ("Memory Doctor Audit", "Memory Doctor") or "sidecars.py doctor" in prompt:
+    if job_name in ("Memory Doctor Audit", "Memory Doctor") or "sidecars.py doctor" in prompt or job_id in ("memory_doctor", "doctor"):
         try:
             from tools.memory_manager import run_memory_doctor
             ok, rep, _ = await _run_sidecar_job_async("doctor", "Memory Doctor Audit", lambda: run_memory_doctor(auto_remediate=True))
-            if rep and bot:
-                ch = await get_dest_channel()
+            has_issues = bool(not ok or (rep and any(tag in rep for tag in ("🚨", "⚠️", "Auto-remediated", "unresolved"))))
+            if has_issues and rep and bot:
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
                     for chunk in chunk_text(rep):
                         await ch.send(chunk)
+            else:
+                print("[Scheduler] Memory doctor audit: 0 issues/warnings (silent nominal).")
         except Exception as e:
             print(f"[Scheduler] Memory doctor audit execution error: {e}")
         return
 
     # Antigravity CLI update check: silent execution unless a new version is available
-    if "update_antigravity.py" in prompt or job_name == "Antigravity CLI Check" or job_name == "Antigravity Release Check":
+    if "update_antigravity.py" in prompt or job_name in ("Antigravity CLI Check", "Antigravity Release Check") or job_id == "antigravity_check":
         try:
             from tools.sidecars import run_antigravity_check
             ok, out, _ = await _run_sidecar_job_async("update_antigravity", "Antigravity CLI Check", run_antigravity_check)
             if out and out.strip() and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
                     await _send_chunked_content(ch, clean_content, choice_view)
@@ -589,12 +614,12 @@ async def dispatch_scheduled_prompt(
         return
 
     # Dockhand container image check: silent execution unless an update is available
-    if "dockhand_update.py" in prompt or job_name in ("Dockhand Image Check", "Dockhand Image Update Check"):
+    if "dockhand_update.py" in prompt or job_name in ("Dockhand Image Check", "Dockhand Image Update Check") or job_id == "dockhand_update":
         try:
             from tools.sidecars import run_dockhand_update_check
             ok, out, _ = await _run_sidecar_job_async("dockhand_check", "Dockhand Image Check", run_dockhand_update_check)
             if out and out.strip() and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
                     clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
                     await _send_chunked_content(ch, clean_content, choice_view)
@@ -661,12 +686,12 @@ async def dispatch_scheduled_prompt(
         return
 
     # Synology storage & RAID health check: silent unless volume >85% or RAID degraded
-    if "nas_storage_check.py" in prompt or job_name in ("Synology Storage & Array Health Check", "NAS Storage Check"):
+    if "nas_storage_check.py" in prompt or job_name in ("Synology Storage & Array Health Check", "NAS Storage Check") or job_id == "nas_storage_check":
         try:
             from tools.sidecars import run_nas_storage_check
             ok, out, _ = await _run_sidecar_job_async("nas_storage", "NAS Storage Check", run_nas_storage_check)
             if not ok and out and out.strip() and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
                     await ch.send(out)
         except Exception as e:
@@ -795,12 +820,12 @@ async def dispatch_scheduled_prompt(
         return
 
     # Host 2 Local USB Backup: silent unless error
-    if "backup_host2" in prompt or job_name in ("Host 2 Local USB Backup", "Host 2 Backup"):
+    if job_id == "host2_backup" or "backup_host2" in prompt or job_name in ("Host 2 Local USB Backup", "Host 2 Backup"):
         try:
             from tools.sidecars import run_host2_backup
             ok, out, _ = await _run_sidecar_job_async("host2_backup", "Host 2 Local USB Backup", run_host2_backup)
             if not ok and out and out.strip() and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
                     await ch.send(out)
             else:
@@ -810,12 +835,12 @@ async def dispatch_scheduled_prompt(
         return
 
     # Host 1 Local USB Backup: silent unless error
-    if "backup_host1" in prompt or job_name in ("Host 1 Local USB Backup", "Host 1 Backup"):
+    if job_id == "host1_backup" or "backup_host1" in prompt or job_name in ("Host 1 Local USB Backup", "Host 1 Backup"):
         try:
             from tools.sidecars import run_host1_backup
             ok, out, _ = await _run_sidecar_job_async("host1_backup", "Host 1 Local USB Backup", run_host1_backup)
             if not ok and out and out.strip() and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
                     await ch.send(out)
             else:
@@ -825,12 +850,12 @@ async def dispatch_scheduled_prompt(
         return
 
     # PID & Process Headroom Watchdog: silent unless warning/critical
-    if "pid_watchdog" in prompt or job_name in ("PID & Process Headroom Watchdog", "PID Watchdog"):
+    if job_id == "pid_watchdog" or "pid_watchdog" in prompt or job_name in ("PID & Process Headroom Watchdog", "PID Watchdog"):
         try:
             from tools.sidecars import run_pid_watchdog
             ok, out, _ = await _run_sidecar_job_async("pid_watchdog", "PID & Process Headroom Watchdog", run_pid_watchdog)
             if not ok and out and out.strip() and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
                     await ch.send(out)
             else:
@@ -840,12 +865,12 @@ async def dispatch_scheduled_prompt(
         return
 
     # Bridge Liveness Watchdog: silent unless error / degraded
-    if "bridge_watchdog" in prompt or job_name in ("Bridge Liveness Watchdog", "Bridge Watchdog"):
+    if job_id == "bridge_watchdog" or "bridge_watchdog" in prompt or job_name in ("Bridge Liveness Watchdog", "Bridge Watchdog"):
         try:
             from tools.sidecars import run_bridge_watchdog
             ok, out, _ = await _run_sidecar_job_async("bridge_watchdog", "Bridge Liveness Watchdog", run_bridge_watchdog)
             if not ok and out and out.strip() and bot:
-                ch = await get_dest_channel()
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
                     await ch.send(out)
             else:
@@ -1201,11 +1226,14 @@ async def dispatch_scheduled_prompt(
         try:
             from tools.sidecars import run_hardcode_regex_audit
             ok, rep, _ = await _run_sidecar_job_async("monthly_hardcode_regex_audit", "Monthly Hardcoded Rule & Regex Audit", run_hardcode_regex_audit)
-            if rep and bot:
-                ch = await get_dest_channel()
+            has_findings = bool(not ok or (rep and ("Findings Detected" in rep or "⚠️" in rep or "🔴" in rep or "🟡" in rep)))
+            if has_findings and rep and bot:
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
                 if ch:
                     for chunk in chunk_text(rep):
                         await ch.send(chunk)
+            else:
+                print("[Scheduler] Monthly hardcoded rule audit: 0 findings (silent nominal).")
         except Exception as e:
             print(f"[Scheduler] Monthly hardcoded rule audit execution error: {e}")
         return
@@ -1267,19 +1295,35 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Kalshi night audit execution error: {e}")
         return
 
-    # Kalshi Weather Quant Paper Bot (silent morning trade execution; alerts #vault only on error)
-    if job_id == "kalshi_paper_bot" or prompt.strip().endswith("sidecars.py kalshi") or "sidecars.py kalshi_bot" in prompt or job_name in ("Kalshi Weather Quant Paper Bot", "kalshi_paper_bot"):
+    # Kalshi Weather Quant Paper Bot & Intra-Day Sweeps (silent execution; alerts #vault only on error)
+    if (
+        job_id in ("kalshi_paper_bot", "kalshi_midday_heating", "quant_pregame_sweep")
+        or prompt.strip().endswith("sidecars.py kalshi")
+        or "sidecars.py kalshi_bot" in prompt
+        or job_name in (
+            "Kalshi Weather Quant Paper Bot",
+            "kalshi_paper_bot",
+            "Kalshi Midday Heating & Euro Pre-Kickoff Sweep",
+            "kalshi_midday_heating",
+            "Quant US Pre-Game Lineup & Afternoon Peak Sweep",
+            "quant_pregame_sweep",
+        )
+    ):
         try:
             from tools.sidecars import run_kalshi_paper_bot
-            ok, rep, _ = await _run_sidecar_job_async("kalshi_paper_bot", "Kalshi Weather Quant Paper Bot", run_kalshi_paper_bot)
+            ok, rep, _ = await _run_sidecar_job_async("kalshi_paper_bot", job_name or "Kalshi Weather Quant Paper Bot", run_kalshi_paper_bot)
             if not ok and rep and rep.strip() and bot:
                 ch = await get_dest_channel(default_cid=VAULT_CHANNEL_ID)
                 if ch:
-                    await _send_chunked_content(ch, f"⚠️ **Kalshi Morning Scan Error:**\n{rep}")
+                    await _send_chunked_content(ch, f"⚠️ **Kalshi Quant Scan Error:**\n{rep}")
             else:
-                print(f"[Scheduler] Kalshi paper bot completed: ok={ok} (silent background).")
+                print(f"[Scheduler] Kalshi paper bot completed ({job_id or job_name}): ok={ok} (silent background).")
         except Exception as e:
             print(f"[Scheduler] Kalshi paper bot execution error: {e}")
+            if bot:
+                ch = await get_dest_channel(default_cid=VAULT_CHANNEL_ID)
+                if ch:
+                    await ch.send(f"⚠️ **Kalshi Paper Bot Exception**: {e}")
         return
 
     # Multi-Venue Quant Paper Trading Sweep (silent morning 4-track sweep; alerts #vault only on error)
@@ -1301,6 +1345,45 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Quant daily sweep execution error: {e}")
         return
 
+    # Weekly Plex Audiobook Enricher & Cover Badges
+    if (
+        job_id == "plex_audiobook_enricher"
+        or "plex_audiobook_enricher" in prompt
+        or "audiobook_enricher" in prompt
+        or job_name in (
+            "Weekly Plex Audiobook Enricher & Cover Badges",
+            "Plex Audiobook Enricher & Cover Badges",
+            "Plex Audiobook Enricher",
+        )
+    ):
+        try:
+            try:
+                from tools.plex_audiobook_enricher import run_plex_audiobook_enricher
+            except ImportError:
+                import sys as _sys
+                if "/workspace" not in _sys.path:
+                    _sys.path.insert(0, "/workspace")
+                from tools.plex_audiobook_enricher import run_plex_audiobook_enricher
+            ok, rep, extra = await _run_sidecar_job_async(
+                "plex_audiobook_enricher",
+                "Plex Audiobook Enricher & Cover Badges",
+                lambda: run_plex_audiobook_enricher(quiet=True),
+            )
+            has_new = bool(rep and ("newly enriched" in rep.lower() or (isinstance(extra, dict) and extra.get("newly_enriched"))))
+            if (not ok or has_new) and rep and rep.strip() and bot:
+                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
+                if ch:
+                    await ch.send(rep)
+            else:
+                print("[Scheduler] Plex audiobook enricher: 0 new books (silent nominal).")
+        except Exception as e:
+            print(f"[Scheduler] Plex audiobook enricher execution error: {e}")
+            if bot:
+                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
+                if ch:
+                    await ch.send(f"⚠️ **Plex Audiobook Enricher Error**: {e}")
+        return
+
     # Monthly Cash Sweep Policy Monitor
     if job_id == "cash_sweep_monitor" or "cash_sweep" in prompt or "sidecars.py sweep" in prompt or job_name == "Monthly Cash Sweep Policy Monitor":
         try:
@@ -1309,6 +1392,10 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Cash sweep monitor completed: ok={ok}")
         except Exception as e:
             print(f"[Scheduler] Cash sweep monitor execution error: {e}")
+            if bot:
+                ch = await get_dest_channel(FINANCES_CHANNEL_ID)
+                if ch:
+                    await ch.send(f"⚠️ **Cash Sweep Monitor Error**: {e}")
         return
 
     # Monthly Financial Model Variance Digest
@@ -1319,6 +1406,10 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Model variance digest completed: ok={ok}")
         except Exception as e:
             print(f"[Scheduler] Model variance digest execution error: {e}")
+            if bot:
+                ch = await get_dest_channel(FINANCES_CHANNEL_ID)
+                if ch:
+                    await ch.send(f"⚠️ **Monthly Variance Digest Error**: {e}")
         return
 
     # Daily Token Budget Watchdog

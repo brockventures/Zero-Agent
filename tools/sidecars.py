@@ -1066,6 +1066,7 @@ def run_marketing_sweep(force: bool = False) -> tuple[bool, str]:
 
     if not senders:
         msg = f"📬 **Biweekly Marketing Report** — {date_str}\nNo promotional emails in the last 2 weeks. ✅"
+        should_post = False
     else:
         lines = [f"{i}. {s['name']} — {s['count']} email{'s' if s['count'] != 1 else ''}" for i, s in enumerate(senders, 1)]
         msg = (
@@ -1074,6 +1075,7 @@ def run_marketing_sweep(force: bool = False) -> tuple[bool, str]:
             + "\n".join(lines)
             + "\n\nReply with sender numbers or names to unsubscribe."
         )
+        should_post = True
 
     try:
         os.makedirs(os.path.dirname(MARKETING_STATE_FILE), exist_ok=True)
@@ -1084,7 +1086,7 @@ def run_marketing_sweep(force: bool = False) -> tuple[bool, str]:
     except Exception:
         pass
 
-    return True, msg
+    return should_post, msg
 
 # --------------------------------------------------------------------------
 # 8-14. Additional Maintenance Tasks
