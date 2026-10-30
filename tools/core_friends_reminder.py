@@ -22,8 +22,15 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
+TARGET_CHANNEL_ID = 1542081375287640084
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 CSV_PATH = Path(os.environ.get("FRIENDS_CSV_PATH", "/workspace/data/friends_and_family_master.csv"))
+
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+if str(TOOLS_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR.parent))
 
 HOUSEHOLD_MEMBERS = {
     "Ryan Brock",
@@ -71,17 +78,51 @@ def parse_last_seen_date(last_seen_str: str) -> date | None:
 
 def find_partner(person: dict, all_contacts: list[dict]) -> dict | None:
     """Identify if the person has a partner or spouse in the contacts database."""
-    notes = person.get("Notes & Connections", "")
     pname = person.get("Name", "").strip()
     paddr = person.get("Physical Address", "").strip()
 
+    # 1. Structured 'Partner' column in person's record
+    partner_val = person.get("Partner", "").strip()
+    if partner_val:
+        candidate = re.sub(r"\(.*?\)", "", partner_val).strip()
+        for c in all_contacts:
+            cname = c.get("Name", "").strip()
+            if cname == pname:
+                continue
+            cname_clean = re.sub(r"\(.*?\)", "", cname).strip()
+            if candidate.lower() == cname_clean.lower():
+                return c
+            if len(candidate) > 2 and (candidate.lower() in cname_clean.lower() or cname_clean.lower() in candidate.lower()):
+                return c
+            if candidate.split() and candidate.split()[0].lower() == cname.split()[0].lower():
+                if paddr and paddr == c.get("Physical Address", "").strip():
+                    return c
+        return {"Name": candidate, "Last Seen": ""}
+
+    # 2. Check if another contact lists this person in their structured 'Partner' column
+    for c in all_contacts:
+        cname = c.get("Name", "").strip()
+        if cname == pname:
+            continue
+        c_partner = c.get("Partner", "").strip()
+        if c_partner:
+            c_candidate = re.sub(r"\(.*?\)", "", c_partner).strip()
+            pname_clean = re.sub(r"\(.*?\)", "", pname).strip()
+            if c_candidate.lower() == pname_clean.lower() or (len(c_candidate) > 2 and c_candidate.lower() in pname_clean.lower()):
+                return c
+            if c_candidate.split() and c_candidate.split()[0].lower() == pname.split()[0].lower():
+                if paddr and paddr == c.get("Physical Address", "").strip():
+                    return c
+
+    # 3. Fallback to notes regex patterns
+    notes = person.get("Notes & Connections", "")
     patterns = [
         r"(?:married to|married/partner to|spouse(?:\s+to|\s+is)?|husband(?:\s+to|\s+is)?|wife(?:\s+to|\s+is)?|life partner(?:\s+to|\s+is)?)\s+([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
         r"(?:partner to)\s+([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
         r"(?<!business\s)(?<!managing\s)(?<!equity\s)(?<!law\s)(?<!senior\s)(?<!junior\s)(?<!founding\s)(?<!practice\s)(?<!trading\s)\bpartner[:\s]+([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
     ]
 
-    # 1. Partner in person's notes
+    # Partner in person's notes
     for pat in patterns:
         m = re.search(pat, notes, re.IGNORECASE)
         if m:
@@ -100,7 +141,7 @@ def find_partner(person: dict, all_contacts: list[dict]) -> dict | None:
                     if paddr and paddr == c.get("Physical Address", "").strip():
                         return c
 
-    # 2. Check if another contact lists this person as spouse / partner
+    # Check if another contact lists this person as spouse / partner in notes
     for c in all_contacts:
         cname = c.get("Name", "").strip()
         if cname == pname:
@@ -250,7 +291,41 @@ def check_core_friends_unseen(weeks: int = 8, as_of_date: str | None = None) -> 
         lines.append(f"   • **Last Seen:** {p['time_str']}\n")
 
     lines.append("_Consider reaching out to organize dinner, drinks, playdates, or weekend plans!_")
-    lines.append("\n[CHOICES: View Full Friends Sheet | Remind Me in 2 Weeks | Dismiss]")
+
+    decision_staged = False
+    try:
+        from tools.forge import stage_decision
+
+        summary_names = ", ".join(p.get("display_name") or p["name"] for p in qualifying[:3])
+        if len(qualifying) > 3:
+            summary_names += f" and {len(qualifying) - 3} more"
+        summary_text = (
+            f"Identified {len(qualifying)} local Core friend(s) ({summary_names}) "
+            f"not seen in >= {weeks} weeks. Consider reaching out to organize dinner, drinks, or weekend plans."
+        )
+
+        cmd = f"python3 /workspace/tools/core_friends_reminder.py --weeks {weeks}"
+        if as_of_date:
+            cmd += f" --as-of-date {as_of_date}"
+
+        stage_decision(
+            category="core_friends",
+            title=f"Core Friends Reconnect Reminder ({len(qualifying)} unseen)",
+            summary=summary_text,
+            handler_type="shell",
+            payload={
+                "command": cmd,
+                "cwd": "/workspace",
+            },
+            channel_id=TARGET_CHANNEL_ID,
+            post_to_discord=True,
+        )
+        decision_staged = True
+    except Exception as e:
+        print(f"[CoreFriends] Decision Card staging fallback: {e}", file=sys.stderr)
+
+    if not decision_staged:
+        lines.append("\n[CHOICES: View Full Friends Sheet | Remind Me in 2 Weeks | Dismiss]")
 
     return True, "\n".join(lines).strip(), qualifying
 

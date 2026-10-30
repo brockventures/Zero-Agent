@@ -18,7 +18,43 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
+TARGET_CHANNEL_ID = 1542081375287640084
 CSV_PATH = Path(os.environ.get("FRIENDS_CSV_PATH", "/workspace/data/friends_and_family_master.csv"))
+
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+if str(TOOLS_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR.parent))
+
+def find_partner(person: dict, all_contacts: list[dict] | None = None) -> str | None:
+    """Resolve partner name from structured 'Partner' column or notes regex."""
+    partner_val = person.get("Partner", "").strip()
+    if partner_val:
+        return re.sub(r"\(.*?\)", "", partner_val).strip()
+
+    pname = person.get("Name", "").strip()
+    if all_contacts:
+        for c in all_contacts:
+            cname = c.get("Name", "").strip()
+            if cname == pname:
+                continue
+            c_partner = c.get("Partner", "").strip()
+            if c_partner:
+                c_part = re.sub(r"\(.*?\)", "", c_partner).strip()
+                if c_part.lower() == pname.lower():
+                    return cname
+
+    notes = person.get("Notes & Connections", "")
+    if notes:
+        m = re.search(
+            r"(?:married to|married/partner to|spouse(?:\s+to|\s+is)?|husband(?:\s+to|\s+is)?|wife(?:\s+to|\s+is)?|life partner(?:\s+to|\s+is)?|partner to)\s+([A-Za-z\s\(\)\'\-]+?)(?:;|,|\(|\.|\n|$)",
+            notes,
+            re.IGNORECASE,
+        )
+        if m:
+            return re.sub(r"\(.*?\)", "", m.group(1)).strip()
+    return None
 
 def check_birthdays(target_date: str | None = None) -> tuple[bool, str, list[dict]]:
     """Check for birthdays matching target_date (default: today in PT).
@@ -47,9 +83,11 @@ def check_birthdays(target_date: str | None = None) -> tuple[bool, str, list[dic
         return False, f"⚠️ Contacts file not found at {CSV_PATH}", []
 
     matched = []
+    all_contacts = []
     with open(CSV_PATH, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            all_contacts.append(row)
             bday = row.get("Birthday", "").strip()
             if not bday or bday.startswith("Expected"):
                 continue
@@ -71,12 +109,17 @@ def check_birthdays(target_date: str | None = None) -> tuple[bool, str, list[dic
         name = person.get("Name", "Unknown")
         phone = person.get("Phone Number", "")
         notes = person.get("Notes & Connections", "")
+        partner = find_partner(person, all_contacts)
+        if partner and "Partner" not in person:
+            person["Partner"] = partner
         
         first_name = name.split()[0]
         if "(" in first_name:
             first_name = first_name.split("(")[0].strip()
         
         lines.append(f"• **{name}** turns a year older today!")
+        if partner:
+            lines.append(f"  💍 **Partner:** {partner}")
         if phone:
             lines.append(f"  📞 **Phone:** `{phone}`")
         if notes:
@@ -91,8 +134,34 @@ def check_birthdays(target_date: str | None = None) -> tuple[bool, str, list[dic
     elif len(buttons) == 1:
         buttons.append("Remind Me Later")
 
-    choices_tag = f"[CHOICES: '" + " | ".join(buttons) + "]"
-    message = "\n".join(lines).strip() + f"\n\n[CHOICES: " + " | ".join(buttons) + "]"
+    decision_staged = False
+    try:
+        from tools.forge import stage_decision
+
+        names = ", ".join(p.get("Name", "Friend") for p in matched)
+        summary_text = f"Birthday alert for {names} today ({display_date}). Send birthday wishes!"
+        cmd = f"python3 /workspace/tools/birthday_reminder.py --date {today_mm_dd}"
+
+        stage_decision(
+            category="birthday",
+            title=f"Birthday Alert: {names}",
+            summary=summary_text,
+            handler_type="shell",
+            payload={
+                "command": cmd,
+                "cwd": "/workspace",
+            },
+            channel_id=TARGET_CHANNEL_ID,
+            post_to_discord=True,
+        )
+        decision_staged = True
+    except Exception as e:
+        print(f"[BirthdayReminder] Decision Card staging fallback: {e}", file=sys.stderr)
+
+    if not decision_staged:
+        message = "\n".join(lines).strip() + "\n\n[CHOICES: " + " | ".join(buttons) + "]"
+    else:
+        message = "\n".join(lines).strip()
 
     return True, message, matched
 

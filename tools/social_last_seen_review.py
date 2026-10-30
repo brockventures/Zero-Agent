@@ -24,6 +24,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
+TARGET_CHANNEL_ID = 1542081375287640084
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 CSV_PATH = Path(os.environ.get("FRIENDS_CSV_PATH", "/workspace/data/friends_and_family_master.csv"))
 MD_PATH = Path(os.environ.get("FRIENDS_MD_PATH", "/workspace/memory/private/private_friends_and_family.md"))
@@ -36,7 +37,7 @@ if str(TOOLS_DIR.parent) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR.parent))
 
 try:
-    from workspace_mcp import _auth_headers, CALENDAR_BASE, GMAIL_BASE, FAMILY_CALENDARS
+    from workspace_mcp import _auth_headers, CALENDAR_BASE
 except Exception:
     _auth_headers = None
 
@@ -464,11 +465,41 @@ def format_review_message(updates: list[dict]) -> tuple[bool, str]:
         lines.append(f"   • **Proposed Update:** `{u['current_last_seen']}` ➔ `{u['proposed_last_seen']}`{qualifier}\n")
 
     lines.append("_Please confirm accuracy before I write these updates to the master dataset and Google Sheet._")
-    lines.append("\n[CHOICES: Confirm & Apply Last Seen Updates | Ignore Last Seen Updates]")
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(PENDING_FILE, "w", encoding="utf-8") as f:
         json.dump(updates, f, indent=2)
+
+    decision_staged = False
+    try:
+        from tools.forge import stage_decision
+
+        summary_names = ", ".join(u.get("name", "") for u in updates[:3])
+        if len(updates) > 3:
+            summary_names += f" and {len(updates) - 3} more"
+        summary_text = (
+            f"Identified {len(updates)} candidate social interaction(s) ({summary_names}) "
+            "from the past week. Approving applies Last Seen dates to contacts master and Google Sheet."
+        )
+
+        stage_decision(
+            category="social_review",
+            title="Confirm & Apply Last Seen Updates",
+            summary=summary_text,
+            handler_type="shell",
+            payload={
+                "command": "python3 /workspace/tools/social_last_seen_review.py --apply",
+                "cwd": "/workspace",
+            },
+            channel_id=TARGET_CHANNEL_ID,
+            post_to_discord=True,
+        )
+        decision_staged = True
+    except Exception as e:
+        print(f"[SocialReview] Decision Card staging fallback: {e}", file=sys.stderr)
+
+    if not decision_staged:
+        lines.append("\n[CHOICES: Confirm & Apply Last Seen Updates | Ignore Last Seen Updates]")
 
     return True, "\n".join(lines)
 
