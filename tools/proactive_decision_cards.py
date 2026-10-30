@@ -663,11 +663,10 @@ def run_dinner_pivot_card(
 ) -> tuple[bool, str, dict[str, Any]]:
     """Check tonight's Mealie dinner against evening calendar density (16:30-20:00 PT).
 
-    Stages a swap/push Decision Card in #shopping (1544955538033348618) if:
-      - Tonight's dinner is unscheduled in Mealie, OR
-      - >=2 evening events collide with a >30m recipe.
+    Stages a swap/push Decision Card in #brock-house (1550577908811178095) ONLY if:
+      - Tonight's dinner is scheduled in Mealie AND >=2 evening events collide with a >30m recipe.
 
-    Strictly event-driven: returns (True, '', {'cards_staged': 0}) when nominal.
+    Strictly event-driven: returns (True, '', {'cards_staged': 0}) when nominal or when no dinner is scheduled.
     """
     now_pt = datetime.now(PT)
     today = now_pt.date()
@@ -769,10 +768,7 @@ def run_dinner_pivot_card(
     trigger = False
     trigger_reason = ""
 
-    if not is_scheduled:
-        trigger = True
-        trigger_reason = "Tonight's dinner is currently unscheduled in Mealie."
-    elif len(evening_events) >= 2 and recipe_minutes > 30:
+    if is_scheduled and len(evening_events) >= 2 and recipe_minutes > 30:
         trigger = True
         ev_names = ", ".join(f"'{e['summary']}'" for e in evening_events)
         trigger_reason = (
@@ -780,7 +776,7 @@ def run_dinner_pivot_card(
             f"(16:30-20:00 PT: {ev_names}), while tonight's planned meal ('{recipe_name}') takes {recipe_minutes} mins (>30m)."
         )
 
-    # 4. Silent exit if nominal
+    # 4. Silent exit if nominal or unscheduled
     if not trigger:
         return True, "", {
             "cards_staged": 0,
@@ -790,26 +786,15 @@ def run_dinner_pivot_card(
         }
 
     # 5. Format Decision Card
-    if not is_scheduled:
-        title = "🍽️ Dinner Pivot: No dinner scheduled tonight"
-        summary_lines = [
-            "### 🍽️ Dinner Pivot Card",
-            "Tonight's dinner is currently **unscheduled** in Mealie.",
-            "",
-            "• **Evening Events:** "
-            + (", ".join(f"'{e['summary']}'" for e in evening_events) if evening_events else "None"),
-            "• **Recommendation:** Choose a quick pantry staple or stage Whole Foods / takeout delivery.",
-        ]
-    else:
-        title = f"🍽️ Dinner Pivot: High evening density ({len(evening_events)} events) vs '{recipe_name}' ({recipe_minutes}m)"
-        summary_lines = [
-            "### 🍽️ Dinner Pivot Card",
-            f"**Collision Detected:** {trigger_reason}",
-            "",
-            "• **Planned Recipe:** " + f"{recipe_name} ({recipe_minutes} minutes)",
-            "• **Colliding Events:** " + ", ".join(f"'{e['summary']}'" for e in evening_events),
-            "• **Recommendation:** Swap tonight's recipe with a 15-minute quick meal or push to tomorrow.",
-        ]
+    title = f"🍽️ Dinner Pivot: High evening density ({len(evening_events)} events) vs '{recipe_name}' ({recipe_minutes}m)"
+    summary_lines = [
+        "### 🍽️ Dinner Pivot Card",
+        f"**Collision Detected:** {trigger_reason}",
+        "",
+        "• **Planned Recipe:** " + f"{recipe_name} ({recipe_minutes} minutes)",
+        "• **Colliding Events:** " + ", ".join(f"'{e['summary']}'" for e in evening_events),
+        "• **Recommendation:** Swap tonight's recipe with a 15-minute quick meal or push to tomorrow.",
+    ]
 
     summary_text = "\n".join(summary_lines)
 
@@ -822,7 +807,7 @@ def run_dinner_pivot_card(
             "evening_events": len(evening_events),
         }
 
-    # 7. Stage Decision Card in #shopping
+    # 7. Stage Decision Card in #brock-house
     clean_reason = re.sub(r"[^a-zA-Z0-9 _-]", "", trigger_reason)[:50].strip()
     payload = {
         "command": f"echo 'Dinner pivot acknowledged: {clean_reason}'",
@@ -838,7 +823,7 @@ def run_dinner_pivot_card(
         summary=summary_text,
         handler_type="shell",
         payload=payload,
-        channel_id=CHANNEL_SHOPPING,
+        channel_id=CHANNEL_BROCK_HOUSE,
         db_path=db_path,
         post_to_discord=should_post,
     )

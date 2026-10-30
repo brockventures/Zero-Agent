@@ -444,8 +444,8 @@ def test_dinner_pivot_silent_when_single_evening_event_long_recipe(test_db: Path
     assert meta["cards_staged"] == 0
 
 
-def test_dinner_pivot_stages_card_on_unscheduled(test_db: Path) -> None:
-    """Dinner pivot triggers when dinner is unscheduled."""
+def test_dinner_pivot_silent_when_unscheduled(test_db: Path) -> None:
+    """Dinner pivot remains silent when dinner is unscheduled in Mealie."""
     plan = {"unscheduled": True}
 
     ok, summary, meta = run_dinner_pivot_card(
@@ -456,22 +456,9 @@ def test_dinner_pivot_stages_card_on_unscheduled(test_db: Path) -> None:
         events_override=[],
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
-    assert "unscheduled" in summary.lower()
-
-    conn = sqlite3.connect(test_db)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (meta["decision_id"],)).fetchone()
-    conn.close()
-
-    assert row is not None
-    assert row["category"] == "mealie"
-    assert row["channel_id"] == CHANNEL_SHOPPING
-    assert row["handler_type"] == "shell"
-
-    payload = json.loads(row["payload_json"])
-    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-    assert valid_sh is True, f"Shell payload invalid: {val_err}"
+    assert summary == ""
+    assert meta["cards_staged"] == 0
+    assert meta["scheduled"] is False
 
 
 def test_dinner_pivot_stages_card_on_density_collision(test_db: Path) -> None:
@@ -511,7 +498,7 @@ def test_dinner_pivot_stages_card_on_density_collision(test_db: Path) -> None:
 
     assert row is not None
     assert row["category"] == "mealie"
-    assert row["channel_id"] == CHANNEL_SHOPPING
+    assert row["channel_id"] == CHANNEL_BROCK_HOUSE
     assert row["handler_type"] == "shell"
 
     payload = json.loads(row["payload_json"])
@@ -520,17 +507,32 @@ def test_dinner_pivot_stages_card_on_density_collision(test_db: Path) -> None:
 
 
 def test_dinner_pivot_dry_run(test_db: Path) -> None:
-    plan = {"unscheduled": True}
+    now_pt = datetime.now(PT)
+    today = now_pt.date()
+    events = [
+        {
+            "summary": "Soccer Practice",
+            "start": datetime(today.year, today.month, today.day, 16, 30, tzinfo=PT).isoformat(),
+            "end": datetime(today.year, today.month, today.day, 17, 30, tzinfo=PT).isoformat(),
+        },
+        {
+            "summary": "School Board Meeting",
+            "start": datetime(today.year, today.month, today.day, 18, 0, tzinfo=PT).isoformat(),
+            "end": datetime(today.year, today.month, today.day, 19, 30, tzinfo=PT).isoformat(),
+        },
+    ]
+    plan = {"name": "Homemade Lasagna", "total_time": 60}
     ok, summary, meta = run_dinner_pivot_card(
         dry_run=True,
         test=True,
         db_path=test_db,
         plan_override=plan,
+        events_override=events,
     )
     assert ok is True
     assert meta["cards_staged"] == 0
     assert meta["dry_run"] is True
-    assert "unscheduled" in summary.lower()
+    assert "Homemade Lasagna" in summary
 
 
 # ==============================================================================
