@@ -1258,7 +1258,6 @@ def analyze_anomalies(
         "has_anomalies": bool(
             zombies
             or amplitude_anomalies
-            or healed_events
             or network_anomalies
             or solar_anomalies
             or circuit_anomalies
@@ -1289,28 +1288,29 @@ def format_report(res: dict[str, Any], quiet: bool = False) -> str:
     circuit_cnt = res.get("circuit_energy_count", 0)
     bat_cnt = res.get("battery_checked_count", 0)
 
-    if not zombies and not amp and not healed and not net_active and not solar_anom and not circuit_anom and not bat_anom and vm_ok:
+    if not zombies and not amp and not net_active and not solar_anom and not circuit_anom and not bat_anom and vm_ok:
         if quiet:
             return ""
-        src = f"VictoriaMetrics ({vm_series} series)" if vm_series > 0 else "HA 7d Recorder + VictoriaMetrics (:8428 online)"
-        extras = []
-        if solar_cnt:
-            extras.append(f"{solar_cnt} solar microinverters")
-        if circuit_cnt:
-            extras.append(f"{circuit_cnt} energy circuits")
-        if bat_cnt:
-            extras.append(f"{bat_cnt} battery curves")
-        if unifi_cnt:
-            extras.append(f"{unifi_cnt} UniFi clients")
-        extra_str = (", " + ", ".join(extras)) if extras else ""
-        base_msg = f"✅ **HA & Network Telemetry Nominal:** {monitored} climate/power/voltage sensors{extra_str} within rolling MAD & cadence baselines ({src})."
-        if net_subsided:
-            sub_items = ", ".join(
-                f"**{n['name']}** ({n['current_24h_gb']:.1f} GB 24h {n['direction'].lower()}, subsided to {n['last_3h_gb']:.2f} GB in last 3h)"
-                for n in net_subsided
-            )
-            base_msg += f"\n- ℹ️ *Subsided 24h Network Spike:* {sub_items}"
-        return base_msg
+        if not healed:
+            src = f"VictoriaMetrics ({vm_series} series)" if vm_series > 0 else "HA 7d Recorder + VictoriaMetrics (:8428 online)"
+            extras = []
+            if solar_cnt:
+                extras.append(f"{solar_cnt} solar microinverters")
+            if circuit_cnt:
+                extras.append(f"{circuit_cnt} energy circuits")
+            if bat_cnt:
+                extras.append(f"{bat_cnt} battery curves")
+            if unifi_cnt:
+                extras.append(f"{unifi_cnt} UniFi clients")
+            extra_str = (", " + ", ".join(extras)) if extras else ""
+            base_msg = f"✅ **HA & Network Telemetry Nominal:** {monitored} climate/power/voltage sensors{extra_str} within rolling MAD & cadence baselines ({src})."
+            if net_subsided:
+                sub_items = ", ".join(
+                    f"**{n['name']}** ({n['current_24h_gb']:.1f} GB 24h {n['direction'].lower()}, subsided to {n['last_3h_gb']:.2f} GB in last 3h)"
+                    for n in net_subsided
+                )
+                base_msg += f"\n- ℹ️ *Subsided 24h Network Spike:* {sub_items}"
+            return base_msg
 
     lines = ["📡 **Home Assistant & Network Telemetry Anomaly Report**\n"]
 

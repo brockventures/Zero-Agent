@@ -28,8 +28,8 @@ description: Enforces tool roundtrip minimization, broad-slice file reads, and d
    - **ALWAYS** scope test execution strictly to the relevant test file or function under test (`pytest tests/test_feature.py`). Rely on CI for full matrix regressions.
 
 6. **FORGE Tier Routing & One-Shot Git Batching:**
-   - **Tier 2/3 Multi-File Builds (`2+` files or `>90s`):** Delegate to `#forge` (`python3 /workspace/tools/forge.py enqueue <plan.json>` or stage a `forge_enqueue` Decision Card) rather than running multi-file edits and PR pipelines inline in chat.
-   - **Tier 1 (`<90s`, single file `<50` lines) & `#forge` Workers:** When staging, committing, pushing, and opening pull requests, **NEVER** execute serial micro-tool calls (`add` -> `commit` -> `push` -> `pr`). **ALWAYS** bundle the git lifecycle into a single compound shell command:
+   - **Tier 2/3 Multi-File Builds (`4+` files or `>90s`):** Delegate to `#forge` (`python3 /workspace/tools/forge.py enqueue <plan.json>` or stage a `forge_enqueue` Decision Card) rather than running large multi-file refactors and iterative TDD loops inline in chat.
+   - **Tier 1 (`<90s`, 1–3 files `<150` lines) & `#forge` Workers:** When staging, committing, pushing, and opening pull requests, **NEVER** execute serial micro-tool calls (`add` -> `commit` -> `push` -> `pr`). **ALWAYS** bundle the git lifecycle into a single compound shell command:
      `git add <files> && git commit -m "<msg>" && git push -u origin <branch> && gh pr create --title "<title>" --body "<body>"`.
 
 7. **Conversational & Deliberation Zero-Tool Fast-Path:**

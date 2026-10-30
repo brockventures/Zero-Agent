@@ -9,6 +9,7 @@ from tools.ha_reauth_watchdog import (
     ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS,
     ZWAVE_JS_DEFAULT_ENTRY_ID,
     ZWAVE_RADIO_RESET_SETTLE_SECONDS,
+    ZWAVE_RELOAD_RETRY_SETTLE_SECONDS,
     ZWAVE_RELOAD_TIMEOUT_SECONDS,
     _auto_heal_matter_thread_nodes,
     _auto_heal_zha_entry,
@@ -272,4 +273,84 @@ def test_auto_heal_zwave_js_resets_unreachable_radio_restarts_container_and_clos
             "verify_entries",
             'close_cover:{"entity_id": ["cover.living_room_blinds_1", "cover.living_room_blinds_2"]}',
         ]
+
+
+def test_auto_heal_zwave_js_fetches_states_when_none_and_retries_reload_on_cold_start():
+    events: list[str] = []
+    sleeps: list[float] = []
+    reload_attempts = 0
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def connect_ex(self, addr):
+            events.append(f"connect_ex:{addr[0]}:{addr[1]}")
+            return 0  # Reachable when resolved from /api/states
+
+    def fake_urlopen(req, timeout=10):
+        nonlocal reload_attempts
+        url = req.full_url
+        if url.endswith("/api/states"):
+            events.append("fetch_states")
+            resp = MagicMock()
+            resp.status = 200
+            resp.read.return_value = (
+                b'[{"entity_id": "sensor.tubeszb_2026_zw_esp_ip_address", "state": "198.51.100.50"},'
+                b' {"entity_id": "cover.living_room_blinds_1", "state": "open"},'
+                b' {"entity_id": "cover.living_room_blinds_2", "state": "open"}]'
+            )
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith(f"/api/config/config_entries/entry/{ZWAVE_JS_DEFAULT_ENTRY_ID}/reload"):
+            reload_attempts += 1
+            events.append(f"reload:{reload_attempts}")
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith("/api/config/config_entries/entry"):
+            events.append(f"verify:{reload_attempts}")
+            state_val = "setup_retry" if reload_attempts == 1 else "loaded"
+            resp = MagicMock()
+            resp.status = 200
+            resp.read.return_value = (
+                f'[{{"entry_id": "{ZWAVE_JS_DEFAULT_ENTRY_ID}", "state": "{state_val}"}}]'
+            ).encode()
+            resp.__enter__.return_value = resp
+            return resp
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    morning_pt = datetime(2026, 10, 28, 7, 15, tzinfo=PT)
+    with (
+        patch("tools.nas_config.run_ssh", return_value=(0, "Restarted", "")),
+        patch("tools.ha_reauth_watchdog.socket.socket", return_value=FakeSocket()),
+        patch("tools.ha_reauth_watchdog.urllib.request.urlopen", side_effect=fake_urlopen),
+        patch("tools.ha_reauth_watchdog.time.sleep", side_effect=lambda s: sleeps.append(s)),
+        patch("tools.ha_reauth_watchdog.datetime") as mock_dt,
+    ):
+        mock_dt.now.return_value = morning_pt
+        ok = _auto_heal_zwave_js(
+            "http://198.51.100.10:8123",
+            "test_token",
+            ZWAVE_JS_DEFAULT_ENTRY_ID,
+            states=None,
+        )
+        assert ok is True
+        assert ZWAVE_RELOAD_RETRY_SETTLE_SECONDS in sleeps
+        assert events == [
+            "fetch_states",
+            "connect_ex:198.51.100.50:6053",
+            "reload:1",
+            "verify:1",
+            "reload:2",
+            "verify:2",
+        ]
+
 

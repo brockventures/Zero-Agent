@@ -10,9 +10,9 @@ description: Prohibits phantom forward intent promises, intermediate play-by-pla
    - Zero **MUST NEVER** emit conversational promises of immediate forward work (e.g. *"I am pulling the rebase onto PR X next...", "Starting work on Y now...", "Investigating Z..."*) as a terminating turn response.
    - In turn-based agent runtimes, emitting text without active tools terminates execution immediately; zero background work occurs after message emission until an external event or user prompt wakes the agent.
    - Stating "I am doing X now" while ending the turn is phantom narration theater.
-   - **Tier 1 (<90s / 1-File) vs. FORGE Tier 2/3 Routing:**
-     - **Tier 1 Inline Edits (<90s, single file `<50` lines):** Execute the code edit, scoped test, and commit/push within the turn first using tools silently. Emit conversational messages ONLY AFTER the work is completed and verified.
-     - **Tier 2/3 Multi-File Builds (`#forge`) & Long Jobs (`>90s`):** Do **NOT** execute multi-file refactors, feature builds, or >90s migrations inline in chat. Instead, write the validated `ForgePlan` JSON and either enqueue it via `python3 /workspace/tools/forge.py enqueue <plan.json>`, stage a Two-Stage Decision Card (`--handler "forge_enqueue" --post`), or launch `python3 /workspace/tools/forge.py job start` within the turn, then report the enqueued FORGE build or Decision Card cleanly.
+   - **Tier 1 (<90s / 1–3 Files) vs. FORGE Tier 2/3 Routing:**
+     - **Tier 1 Inline Edits (<90s, 1–3 files `<150` lines):** Execute the code edit, scoped test, and commit/push within the turn first using tools silently. Emit conversational messages ONLY AFTER the work is completed and verified.
+     - **Tier 2/3 Multi-File Builds (`#forge`, `4+` files) & Long Jobs (`>90s`):** Do **NOT** execute 4+ file refactors, iterative multi-step TDD loops, or >90s migrations inline in chat. Instead, write the validated `ForgePlan` JSON and either enqueue it via `python3 /workspace/tools/forge.py enqueue <plan.json>`, stage a Two-Stage Decision Card (`--handler "forge_enqueue" --post`), or launch `python3 /workspace/tools/forge.py job start` within the turn, then report the enqueued FORGE build or Decision Card cleanly.
 
 2. **PROHIBITION OF INTERMEDIATE TASK CHATTER (THE OPTION B TRAP):**
    - When `run_command` or any asynchronous tool sends a job to the background and outputs the SDK template:

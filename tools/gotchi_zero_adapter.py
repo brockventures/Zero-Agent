@@ -67,17 +67,47 @@ if "/workspace" not in sys.path:
 if "/workspace/gotchi" not in sys.path:
     sys.path.append("/workspace/gotchi")
 
-from tools.bridge_state import TARGET_CHANNEL_ID
-from tools.bridge_voice import (
-    DEFAULT_VOICE_NAME,
-    GOTCHI_CHAT_CHANNEL_ID,
-    _append_voice_turn_to_history,
-    _build_live_tools,
-    _load_startup_context_snapshot,
-)
-from tools import outbox
-
+ZERO_CHAT_CHANNEL_ID = 1542081375287640084
+TARGET_CHANNEL_ID = ZERO_CHAT_CHANNEL_ID
 log = logging.getLogger("gotchi_zero_adapter")
+
+if Path("/workspace/tools").is_dir() and os.environ.get("GOTCHI_STANDALONE") != "1":
+    from tools.bridge_voice import (
+        DEFAULT_VOICE_NAME,
+        GOTCHI_CHAT_CHANNEL_ID,
+        _append_voice_turn_to_history,
+        _build_live_tools,
+        _load_startup_context_snapshot,
+    )
+    from tools import outbox
+else:
+    log.warning(
+        "[GotchiZero] /workspace/tools not present (or GOTCHI_STANDALONE=1); "
+        "using standalone stubs for bridge_voice and outbox."
+    )
+    DEFAULT_VOICE_NAME = "Schedar"
+    GOTCHI_CHAT_CHANNEL_ID = 1562246590943461429
+
+    def _append_voice_turn_to_history(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def _build_live_tools() -> List[Any]:
+        return []
+
+    def _load_startup_context_snapshot() -> str:
+        return ""
+
+    class _FallbackOutbox:
+        @staticmethod
+        def queue_outbox_message(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+            return {"status": "stub"}
+
+        @staticmethod
+        def queue_agent_turn(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+            return {"id": "stub", "status": "stub"}
+
+    outbox = _FallbackOutbox()  # type: ignore[assignment]
+
 PT_TZ = ZoneInfo("America/Los_Angeles")
 
 DEFAULT_GOTCHI_MODEL = os.environ.get("GOTCHI_ZERO_MODEL", "gemini-3.8-flash")
@@ -534,6 +564,35 @@ def _build_gotchi_tools() -> list[Any]:
             ),
         )
     )
+    f_decls.append(
+        types.FunctionDeclaration(
+            name="delegate_coding_task_to_zero_chat",
+            description=(
+                "Hand off any coding task, bug fix, feature build, or multi-file engineering request "
+                "to Zero's full Argon brain in #zero-chat (`outbox.queue_agent_turn`). Never write "
+                "production code or author #forge specs directly on Gotchi voice turns; call this tool "
+                "so the full Argon orchestrator wakes up in #zero-chat to spec and build it."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "task_summary": types.Schema(
+                        type="STRING",
+                        description="Clear description of what Ryan wants built, fixed, or refactored.",
+                    ),
+                    "spoken_preamble": types.Schema(
+                        type="STRING",
+                        description="One short spoken sentence confirming the handoff (e.g. 'Passing that to Zero-Chat to spec and build.').",
+                    ),
+                    "context_notes": types.Schema(
+                        type="STRING",
+                        description="Optional extra context, repo name, or visual details from Gotchi's camera.",
+                    ),
+                },
+                required=["task_summary"],
+            ),
+        )
+    )
     return [types.Tool(function_declarations=f_decls)]
 
 
@@ -733,13 +792,72 @@ def extract_and_forward_artifacts_to_zero_chat(
     return updated_spoken, any_sent_to_zero_chat
 
 
+def delegate_coding_task_to_zero_chat(
+    task_summary: str,
+    spoken_preamble: str = "",
+    context_notes: str = "",
+    target_channel: str = "zero-chat",
+) -> Dict[str, Any]:
+    """
+    Hands off a coding, bug-fix, refactor, or engineering build request from Gotchi's
+    lightweight voice model directly to Zero's full Argon brain in `#zero-chat` via
+    `outbox.queue_agent_turn` so the Argon orchestrator wakes up, inspects the codebase,
+    and either executes a Tier 1 fix or specs a `#forge` build.
+    """
+    clean_task = (task_summary or "").strip()
+    if not clean_task:
+        return {"ok": False, "error": "Empty task_summary"}
+
+    clean_notes = (context_notes or "").strip()
+    clean_preamble = (
+        (spoken_preamble or "").strip()
+        or "Passing that to Zero-Chat to spec and build."
+    )
+    notes_block = f"\n- **Voice Context / Notes:** {clean_notes}" if clean_notes else ""
+    argon_prompt = (
+        "[GOTCHI VOICE-TO-ARGON CODING HANDOFF]\n"
+        "Ryan requested a code change or engineering build via Gotchi Push-to-Talk:\n"
+        f"- **Request:** {clean_task}{notes_block}\n\n"
+        "Inspect the relevant codebase with full Argon engineering context, then either "
+        "execute a focused Tier 1 fix inline or package and enqueue/stage a validated "
+        "`ForgePlan` in `#forge`, and post the status or Decision Card here in `#zero-chat`."
+    )
+    queued = outbox.queue_agent_turn(
+        channel=target_channel,
+        prompt=argon_prompt,
+        job_name="Gotchi Voice-to-Argon Handoff",
+        force=True,
+    )
+    return {
+        "ok": True,
+        "status": "delegated_to_argon_in_zero_chat",
+        "channel": target_channel,
+        "channel_id": TARGET_CHANNEL_ID,
+        "outbox_id": queued.get("id"),
+        "spoken_preamble": clean_preamble,
+        "task_summary": clean_task,
+    }
+
+
+def _load_gotchi_voice_context_snapshot() -> str:
+    """
+    Loads Ryan's profile, active tasks, and recent chat/voice history while stripping
+    the heavy `/workspace/GEMINI.md` coding/FORGE rulebook from Gotchi's voice prompt.
+    """
+    raw_snapshot = _load_startup_context_snapshot()
+    marker = "=== RYAN BROCK PROFILE"
+    if marker in raw_snapshot:
+        return raw_snapshot[raw_snapshot.index(marker) :]
+    return raw_snapshot
+
+
 def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = False) -> str:
     """
     Builds the unified Zero system prompt shared with `#zero-voice`, tuned for Gotchi's
     pocket Push-to-Talk, camera snapshot/burst, and 200x200 e-paper companion UX.
     """
     now_pt = datetime.now(PT_TZ).strftime("%A, %b %d, %Y %I:%M %p PT")
-    snapshot = _load_startup_context_snapshot()
+    snapshot = _load_gotchi_voice_context_snapshot()
     memory_hits = prefetch_zero_memory(user_prompt) if user_prompt else ""
     mem_block = (
         f"\n\n=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===\n{memory_hits}"
@@ -769,7 +887,12 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         "Whenever a turn involves clickable hyperlinks, shopping/product links, GitHub PRs/issues, code snippets, "
         "images, CAD models, or live webpage screenshots, call `post_note_to_zero_chat` (with `message`, optional "
         "`file_path`, or optional `screenshot_url`) to send it to `#zero-chat`, and tell Ryan verbally to find it "
-        "in `#zero-chat`."
+        "in `#zero-chat`.\n"
+        "- VOICE-TO-ARGON CODING HANDOFF (`delegate_coding_task_to_zero_chat`): You are the lightweight pocket "
+        "voice interface and do NOT carry codebase rules or author `#forge` build specs yourself. Whenever Ryan "
+        "asks you to write code, fix a bug, refactor a module, or build a feature, call "
+        "`delegate_coding_task_to_zero_chat(task_summary, spoken_preamble, context_notes)` to wake up Zero's "
+        "full Argon brain in `#zero-chat` to spec and build it."
         f"{vision_note}\n\n"
         "FULL AGENT PARITY & TOOL ACCESS:\n"
         "- You have 100% of the same container access, filesystem access, memory search, GitHub CLI (`gh`), "
@@ -785,6 +908,7 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         "git reset/clean/force-push, container teardown, process kills) and file overwrites stage a confirmation card in "
         "`#zero-chat` before executing. `read_local_file` is restricted to `os.path.realpath` under `/workspace/` and "
         "`/baseball/` (denying `.env`, `.ssh`, and secrets).\n"
+        "- Use `delegate_coding_task_to_zero_chat` whenever Ryan asks to build, fix, or refactor code.\n"
         "- Use `search_zero_memory` to search durable memory or past transcripts.\n"
         "- Use `check_tasks_and_repos` to inspect `/workspace/data/tasks.json` and open GitHub issues.\n"
         "- Use `run_shell_command` to execute non-destructive commands in `/workspace` (destructive commands stage for confirmation).\n"
@@ -1003,6 +1127,19 @@ async def execute_gotchi_tool_call(
             file_path,
             screenshot_url,
             True,
+        )
+        return res
+
+    if name == "delegate_coding_task_to_zero_chat":
+        task_summary = str(args.get("task_summary", "") or "").strip()
+        spoken_preamble = str(args.get("spoken_preamble", "") or "").strip()
+        context_notes = str(args.get("context_notes", "") or "").strip()
+        res = await asyncio.to_thread(
+            delegate_coding_task_to_zero_chat,
+            task_summary,
+            spoken_preamble,
+            context_notes,
+            "zero-chat",
         )
         return res
 
@@ -1256,6 +1393,7 @@ class GotchiZeroBrainAdapter:
         image_bytes: Optional[bytes],
         burst_images: List[bytes],
         on_sentence: Optional[Callable[[str], Any]] = None,
+        audio_bytes: Optional[bytes] = None,
     ) -> Tuple[str, bool, List[str]]:
         from backend.voice_gateway import SentenceStreamSplitter
         from google.genai import types
@@ -1270,11 +1408,20 @@ class GotchiZeroBrainAdapter:
         )
 
         user_parts: List[types.Part] = []
+        if audio_bytes:
+            user_parts.append(types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"))
         if image_bytes:
             user_parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
         for b_img in burst_images[:5]:
             user_parts.append(types.Part.from_bytes(data=b_img, mime_type="image/jpeg"))
-        user_parts.append(types.Part.from_text(text=prompt or "Describe what you see."))
+        if audio_bytes and not prompt:
+            user_parts.append(
+                types.Part.from_text(
+                    text="Listen to Ryan's spoken voice prompt in the attached audio clip and answer directly."
+                )
+            )
+        else:
+            user_parts.append(types.Part.from_text(text=prompt or "Describe what you see."))
 
         contents: List[types.Content] = [types.Content(role="user", parts=user_parts)]
         tools_list = _build_gotchi_tools()
@@ -1379,6 +1526,16 @@ class GotchiZeroBrainAdapter:
                         await self._emit_streamed_sentence(
                             preamble, emitted_sentences, on_sentence
                         )
+                elif fn_name == "delegate_coding_task_to_zero_chat":
+                    preamble = (
+                        str(fn_args.get("spoken_preamble", "") or "").strip()
+                        or "Passing that to Zero-Chat to spec and build."
+                    )
+                    if preamble not in accumulated_raw_parts:
+                        accumulated_raw_parts.append(preamble)
+                    await self._emit_streamed_sentence(
+                        preamble, emitted_sentences, on_sentence
+                    )
                 elif not step_text and not emitted_sentences:
                     # Pre-tool spoken preamble fallback when the model invokes a tool without leading text
                     default_preamble = "Let me check that."
@@ -1387,7 +1544,7 @@ class GotchiZeroBrainAdapter:
                     )
 
                 res_dict = await execute_gotchi_tool_call(fn_name, fn_args)
-                if fn_name == "post_note_to_zero_chat" or (
+                if fn_name in ("post_note_to_zero_chat", "delegate_coding_task_to_zero_chat") or (
                     isinstance(res_dict, dict) and res_dict.get("confirmation_required") is True
                 ):
                     explicitly_posted_to_zero_chat = True
@@ -1475,8 +1632,39 @@ class GotchiZeroBrainAdapter:
         has_images = bool(image_bytes or burst_images)
         audio_bytes: Optional[bytes] = parsed_turn.get("audio_bytes")
 
+        # Fast-path acoustic duration check before invoking any cloud API
+        from backend.voice_gateway import is_stt_ghost, split_into_sentences
+
+        min_voiced_ms = int(getattr(getattr(self.stt_adapter, "llm_config", None), "min_voiced_ms", 0) or 0)
+        use_silero_vad = bool(getattr(getattr(self.stt_adapter, "llm_config", None), "use_silero_vad", False))
+
+        bg_stt_task: Optional[asyncio.Task[str]] = None
+        direct_audio_to_brain = False
+
         if has_explicit_prompt:
             transcript = str(parsed_turn["prompt"]).strip()
+        elif audio_bytes and self.llm_caller is None:
+            # Single-pass multimodal audio: stream WAV directly into the Gemini brain
+            # while transcribing concurrently in the background for #gotchi-chat logs.
+            direct_audio_to_brain = True
+            stt_engine = str(getattr(getattr(self.stt_adapter, "llm_config", None), "stt_engine", "") or "")
+            use_stt_adapter = (
+                self.stt_adapter is not None
+                and (
+                    stt_engine in ("whisper_http", "faster_whisper")
+                    or getattr(self.stt_adapter, "local_transcriber", None) is not None
+                    or getattr(self.stt_adapter, "llm_config", None) is None
+                )
+            )
+            if use_stt_adapter:
+                bg_stt_task = asyncio.create_task(
+                    asyncio.to_thread(self.stt_adapter.transcribe, audio_bytes)
+                )
+            else:
+                bg_stt_task = asyncio.create_task(
+                    self._transcribe_audio_with_gemini(audio_bytes)
+                )
+            transcript = ""
         elif audio_bytes and self.stt_adapter is not None:
             loop = asyncio.get_running_loop()
             transcript = await loop.run_in_executor(
@@ -1486,8 +1674,6 @@ class GotchiZeroBrainAdapter:
                 mm_transcript = await self._transcribe_audio_with_gemini(audio_bytes)
                 if mm_transcript:
                     transcript = mm_transcript
-        elif audio_bytes and self.llm_caller is None:
-            transcript = await self._transcribe_audio_with_gemini(audio_bytes) or "Status check."
         elif burst_images:
             transcript = "Analyze this 5-frame camera burst from Gotchi."
         elif image_bytes:
@@ -1497,70 +1683,202 @@ class GotchiZeroBrainAdapter:
 
         stt_ms = int((time.monotonic() - t0) * 1000)
 
-        # Early ghost-turn short-circuit: skip LLM & Discord logging on <400ms PTT bumps
-        from backend.voice_gateway import is_stt_ghost, split_into_sentences
-
-        min_voiced_ms = int(getattr(getattr(self.stt_adapter, "llm_config", None), "min_voiced_ms", 0) or 0)
-        use_silero_vad = bool(getattr(getattr(self.stt_adapter, "llm_config", None), "use_silero_vad", False))
-
-        is_ghost, _reason = is_stt_ghost(
-            transcript_text=transcript,
-            audio_bytes=audio_bytes,
-            min_voiced_ms=min_voiced_ms,
-            has_explicit_prompt=has_explicit_prompt,
-            has_images=has_images,
-            use_silero_vad=use_silero_vad,
-        )
-        if is_ghost:
-            return {
-                "transcript": transcript,
-                "reply": "",
-                "raw_reply": "",
-                "sentences": [],
-                "stt_ms": stt_ms,
-            }
+        if not direct_audio_to_brain:
+            is_ghost, _reason = is_stt_ghost(
+                transcript_text=transcript,
+                audio_bytes=audio_bytes,
+                min_voiced_ms=min_voiced_ms,
+                has_explicit_prompt=has_explicit_prompt,
+                has_images=has_images,
+                use_silero_vad=use_silero_vad,
+            )
+            if is_ghost:
+                return {
+                    "transcript": transcript,
+                    "reply": "",
+                    "raw_reply": "",
+                    "sentences": [],
+                    "stt_ms": stt_ms,
+                }
+        elif min_voiced_ms > 0 and not has_explicit_prompt and not has_images:
+            is_ghost_audio, _reason = is_stt_ghost(
+                transcript_text="voice turn",
+                audio_bytes=audio_bytes,
+                min_voiced_ms=min_voiced_ms,
+                has_explicit_prompt=False,
+                has_images=False,
+                use_silero_vad=use_silero_vad,
+            )
+            if is_ghost_audio:
+                if bg_stt_task is not None:
+                    bg_stt_task.cancel()
+                return {
+                    "transcript": "",
+                    "reply": "",
+                    "raw_reply": "",
+                    "sentences": [],
+                    "stt_ms": stt_ms,
+                }
 
         explicitly_posted = False
         streamed_sentences: List[str] = []
-        ha_matched, ha_speech, ha_meta = await asyncio.to_thread(
-            try_ha_conversation_fastpath,
-            transcript,
-            has_images=has_images,
-            enabled=self.ha_conversation_enabled,
-            ha_base_url=self.ha_base_url,
-            ha_access_token=self.ha_access_token,
-            http_poster=self.ha_http_poster,
-        )
-        if ha_matched and ha_speech:
-            raw_reply = ha_speech
-            await self._emit_streamed_sentence(
-                ha_speech, streamed_sentences, on_sentence
+        ha_matched, ha_speech, ha_meta = (False, "", {"reason": "disabled"})
+
+        if direct_audio_to_brain and bg_stt_task is not None:
+            # Race Gemini audio stream against bg_stt_task:
+            # Hold Gemini's sentence output until either the transcript arrives
+            # or Gemini's first sentence is ready, whichever comes first.
+            buffered_live_sentences: List[str] = []
+            stt_cleared = False
+            first_sentence_ready = asyncio.Event()
+
+            def _gated_on_sentence(s_txt: str) -> None:
+                if stt_cleared:
+                    if on_sentence is not None:
+                        on_sentence(s_txt)
+                else:
+                    buffered_live_sentences.append(s_txt)
+                    first_sentence_ready.set()
+
+            brain_task = asyncio.create_task(
+                self._run_gemini_with_tools(
+                    prompt="",
+                    image_bytes=image_bytes,
+                    burst_images=burst_images,
+                    on_sentence=_gated_on_sentence,
+                    audio_bytes=audio_bytes,
+                )
             )
-        elif self.llm_caller is not None:
-            raw_res = self.llm_caller(
-                {
-                    "node_id": node_id,
-                    "session_id": session_id,
-                    "prompt": transcript,
-                    "image_bytes": image_bytes,
-                    "burst_images": burst_images,
-                    "_on_sentence": on_sentence,
-                }
+            first_sentence_waiter = asyncio.create_task(first_sentence_ready.wait())
+            await asyncio.wait(
+                [bg_stt_task, first_sentence_waiter, brain_task],
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            if asyncio.iscoroutine(raw_res):
-                raw_res = await raw_res
-            if isinstance(raw_res, dict):
-                raw_reply = str(raw_res.get("reply") or "")
-                explicitly_posted = bool(raw_res.get("posted_to_zero_chat", False))
+            first_sentence_waiter.cancel()
+
+            if bg_stt_task.done():
+                try:
+                    mm_transcript = await bg_stt_task
+                    transcript = (mm_transcript or "").strip()
+                except Exception:
+                    transcript = ""
+                bg_stt_task = None
+                stt_ms = int((time.monotonic() - t0) * 1000)
+
+                # 1. Transcript-level ghost check before allowing any audio output
+                is_ghost_tx, _reason_tx = is_stt_ghost(
+                    transcript_text=transcript,
+                    audio_bytes=audio_bytes,
+                    min_voiced_ms=min_voiced_ms,
+                    has_explicit_prompt=has_explicit_prompt,
+                    has_images=has_images,
+                    use_silero_vad=use_silero_vad,
+                )
+                if is_ghost_tx:
+                    brain_task.cancel()
+                    try:
+                        await brain_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    return {
+                        "transcript": transcript,
+                        "reply": "",
+                        "raw_reply": "",
+                        "sentences": [],
+                        "stt_ms": stt_ms,
+                    }
+
+                # 2. Home Assistant fast-path check: if matched, cancel in-flight brain_task and reply immediately
+                if transcript:
+                    ha_matched, ha_speech, ha_meta = await asyncio.to_thread(
+                        try_ha_conversation_fastpath,
+                        transcript,
+                        has_images=has_images,
+                        enabled=self.ha_conversation_enabled,
+                        ha_base_url=self.ha_base_url,
+                        ha_access_token=self.ha_access_token,
+                        http_poster=self.ha_http_poster,
+                    )
+                if ha_matched and ha_speech:
+                    brain_task.cancel()
+                    try:
+                        await brain_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    raw_reply = ha_speech
+                    await self._emit_streamed_sentence(
+                        ha_speech, streamed_sentences, on_sentence
+                    )
+                else:
+                    # 3. Normal query: release gated sentences and await the already-running brain_task
+                    stt_cleared = True
+                    for buf_s in buffered_live_sentences:
+                        if on_sentence is not None:
+                            on_sentence(buf_s)
+                    buffered_live_sentences.clear()
+                    raw_reply, explicitly_posted, streamed_sentences = await brain_task
+                    if not transcript:
+                        transcript = "Voice prompt"
             else:
-                raw_reply = str(raw_res)
+                # Gemini's first sentence (or completion) arrived first:
+                # release Gemini's output immediately and skip Home Assistant for that turn.
+                ha_meta = {"reason": "gemini_first_sentence_won_race"}
+                stt_cleared = True
+                for buf_s in buffered_live_sentences:
+                    if on_sentence is not None:
+                        on_sentence(buf_s)
+                buffered_live_sentences.clear()
+                raw_reply, explicitly_posted, streamed_sentences = await brain_task
         else:
-            raw_reply, explicitly_posted, streamed_sentences = await self._run_gemini_with_tools(
-                prompt=transcript,
-                image_bytes=image_bytes,
-                burst_images=burst_images,
-                on_sentence=on_sentence,
-            )
+            if transcript:
+                ha_matched, ha_speech, ha_meta = await asyncio.to_thread(
+                    try_ha_conversation_fastpath,
+                    transcript,
+                    has_images=has_images,
+                    enabled=self.ha_conversation_enabled,
+                    ha_base_url=self.ha_base_url,
+                    ha_access_token=self.ha_access_token,
+                    http_poster=self.ha_http_poster,
+                )
+            if ha_matched and ha_speech:
+                raw_reply = ha_speech
+                await self._emit_streamed_sentence(
+                    ha_speech, streamed_sentences, on_sentence
+                )
+            elif self.llm_caller is not None:
+                raw_res = self.llm_caller(
+                    {
+                        "node_id": node_id,
+                        "session_id": session_id,
+                        "prompt": transcript,
+                        "image_bytes": image_bytes,
+                        "burst_images": burst_images,
+                        "_on_sentence": on_sentence,
+                    }
+                )
+                if asyncio.iscoroutine(raw_res):
+                    raw_res = await raw_res
+                if isinstance(raw_res, dict):
+                    raw_reply = str(raw_res.get("reply") or "")
+                    explicitly_posted = bool(raw_res.get("posted_to_zero_chat", False))
+                else:
+                    raw_reply = str(raw_res)
+            else:
+                raw_reply, explicitly_posted, streamed_sentences = await self._run_gemini_with_tools(
+                    prompt=transcript,
+                    image_bytes=image_bytes,
+                    burst_images=burst_images,
+                    on_sentence=on_sentence,
+                    audio_bytes=audio_bytes if direct_audio_to_brain else None,
+                )
+
+        if bg_stt_task is not None:
+            try:
+                mm_transcript = await bg_stt_task
+                transcript = (mm_transcript or "").strip() or "Voice prompt"
+            except Exception:
+                transcript = "Voice prompt"
+            stt_ms = int((time.monotonic() - t0) * 1000)
 
         spoken_reply = clean_spoken_text_for_tts(raw_reply) or "Got it."
         spoken_reply, sent_to_zero_chat = await asyncio.to_thread(
@@ -1577,7 +1895,7 @@ class GotchiZeroBrainAdapter:
             if s_item not in sentences:
                 sentences.insert(0, s_item)
 
-        await asyncio.to_thread(
+        _log_coro = asyncio.to_thread(
             record_gotchi_turn_to_channels,
             node_id,
             session_id,
@@ -1592,6 +1910,11 @@ class GotchiZeroBrainAdapter:
             total_ms,
             self.dispatch_discord,
         )
+        if self.llm_caller is None:
+            _bg_log = asyncio.create_task(_log_coro)
+            _bg_log.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+        else:
+            await _log_coro
 
         return {
             "transcript": transcript,

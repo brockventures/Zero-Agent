@@ -233,7 +233,7 @@ def main():
     print(json.dumps(result, indent=2))
 
     if args.channel:
-        caption = args.caption or f"🎨 **{args.name}**\n`{args.prompt}`"
+        caption = args.caption.strip() if args.caption else None
         delivery = deliver_image(result["path"], channel_input=args.channel, caption=caption)
         print(json.dumps(delivery, indent=2))
         if not (delivery.get("delivered") or delivery.get("success")):

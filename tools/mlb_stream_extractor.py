@@ -50,6 +50,21 @@ def fetch_stateshot() -> Dict[str, Any]:
 def resolve_team_game(data: Dict[str, Any], team_query: str) -> Tuple[Dict[str, Any], Dict[str, str], int]:
     """Find the active/upcoming game for the requested team."""
     teams = {t["id"]: t["name"] for t in data.get("teams", [])}
+    games = data.get("games", [])
+    status_priority = {"L": 0, "W": 1, "P": 2, "S": 3, "F": 99}
+
+    if team_query.lower() in ("any", "live", "world_series", "ws", "postseason") and games:
+        sorted_games = sorted(
+            games,
+            key=lambda g: (
+                status_priority.get(g.get("status"), 50),
+                -int(g.get("id") or 0),
+            ),
+        )
+        chosen_game = sorted_games[0]
+        target_team_id = chosen_game.get("home_team_id") or chosen_game.get("away_team_id")
+        return chosen_game, teams, target_team_id
+
     team_matches = [
         (tid, name) for tid, name in teams.items()
         if team_query.lower() in name.lower()
@@ -60,7 +75,6 @@ def resolve_team_game(data: Dict[str, Any], team_query: str) -> Tuple[Dict[str, 
     target_team_id, target_team_name = team_matches[0]
 
     # Look for games with target team, prioritize Live ('L'), then Starting Soon ('S'/'P'), then Final ('F')
-    games = data.get("games", [])
     matching_games = [
         g for g in games
         if target_team_id in (g.get("away_team_id"), g.get("home_team_id"))
@@ -70,11 +84,34 @@ def resolve_team_game(data: Dict[str, Any], team_query: str) -> Tuple[Dict[str, 
         raise ValueError(f"No games scheduled for {target_team_name}.")
 
     # Sort by priority: Live ('L') > Warmup ('W') > Pre-game ('P') > Scheduled ('S') > Final ('F')
-    status_priority = {"L": 0, "W": 1, "P": 2, "S": 3, "F": 99}
     matching_games.sort(key=lambda g: status_priority.get(g.get("status"), 50))
     chosen_game = matching_games[0]
 
     return chosen_game, teams, target_team_id
+
+
+def _find_matching_media_events(data: Dict[str, Any], game: Dict[str, Any]) -> list:
+    """Find media events bound to game['id'] or unbound ('game_id': null) live/matching feeds."""
+    exact = [
+        me for me in data.get("media_events", [])
+        if me.get("game_id") == game["id"]
+    ]
+    if exact:
+        return exact
+
+    teams = {t["id"]: t["name"] for t in data.get("teams", [])}
+    away_name = (teams.get(game.get("away_team_id")) or "").lower()
+    home_name = (teams.get(game.get("home_team_id")) or "").lower()
+    tokens = [w for w in (away_name.split() + home_name.split()) if len(w) > 3]
+
+    unbound = []
+    for me in data.get("media_events", []):
+        if me.get("game_id") is not None:
+            continue
+        blob = f"{me.get('title', '')} {me.get('description', '')}".lower()
+        if any(tok in blob for tok in tokens) or me.get("status") == "L":
+            unbound.append(me)
+    return unbound
 
 
 def resolve_media_event(
@@ -85,12 +122,17 @@ def resolve_media_event(
     feed_override: Optional[str] = None
 ) -> Dict[str, Any]:
     """Select the best media event (broadcast feed) for the target team."""
-    media_events = [
-        me for me in data.get("media_events", [])
-        if me.get("game_id") == game["id"]
-    ]
+    media_events = _find_matching_media_events(data, game)
 
     if not media_events:
+        if game.get("status") in ("W", "P", "S"):
+            return {
+                "id": None,
+                "game_id": game["id"],
+                "title": "National",
+                "status": "P",
+                "description": "Pre-game / Scheduled",
+            }
         raise ValueError(f"No media events found for game ID {game['id']}.")
 
     is_away = (game.get("away_team_id") == target_team_id)
@@ -214,7 +256,14 @@ def cast_to_home_assistant(
     if cast_entity:
         try:
             cast_st = _get_state(cast_entity)
-            if cast_st.get("state") in ("playing", "paused", "idle") and cast_st.get("attributes", {}).get("app_id"):
+            cast_attrs = cast_st.get("attributes", {})
+            cast_app_id = cast_attrs.get("app_id")
+            if (
+                cast_st.get("state") in ("playing", "paused", "idle")
+                and cast_app_id
+                and cast_app_id != "AndroidNativeApp"
+                and cast_attrs.get("app_name") != "VLC"
+            ):
                 stop_payload = json.dumps({"entity_id": cast_entity}).encode("utf-8")
                 stop_req = urllib.request.Request(f"{base_url}/api/services/media_player/turn_off", data=stop_payload, headers=headers)
                 urllib.request.urlopen(stop_req, timeout=4)
@@ -256,12 +305,11 @@ def cast_to_home_assistant(
 
     # 4. If cold starting, Google TV launcher boot initialization can swallow the initial intent.
     # Check once after a short delay: if stuck on launcher, re-fire once and release.
-    if is_cold:
-        time.sleep(2.5)
-        current_app = _get_state(entity_id).get("attributes", {}).get("app_id")
-        if current_app and current_app != "org.videolan.vlc":
-            sys.stderr.write(f"Launcher retained focus ({current_app}); re-dispatching VLC intent once...\n")
-            _send_play()
+    time.sleep(2.5)
+    current_app = _get_state(entity_id).get("attributes", {}).get("app_id")
+    if current_app and current_app != "org.videolan.vlc":
+        sys.stderr.write(f"Launcher retained focus ({current_app}); re-dispatching VLC intent once...\n")
+        _send_play()
 
     # 5. Decoupled dispatch: do NOT continue polling/re-dispatching as it tramples active VLC playback
     return success
@@ -290,30 +338,74 @@ def main():
         feed_override=feed_pref
     )
 
-    # Determine flavor dynamically
+    # Determine flavor dynamically across all media events for this game
     flavors = data.get("flavors", [])
+    game_media_events = _find_matching_media_events(data, game)
+    # Put preferred media_event first, then any other media_events for this game
+    ordered_events = [media_event] + [
+        me for me in game_media_events if me.get("id") != media_event.get("id")
+    ]
+
     chosen_flavor = None
-    for fl in flavors:
-        if "free" in fl.get("id", "").lower() and media_event["id"] in fl.get("media_event_ids", []):
-            chosen_flavor = fl["id"]
+    stream_url = None
+    last_err = None
+
+    for cand_me in ordered_events:
+        me_id = cand_me.get("id")
+        if not me_id:
+            continue
+        cand_flavors = []
+        # 1. Flavors explicitly listing this media_event_id (prefer 'free' first, then any)
+        for fl in flavors:
+            if me_id in fl.get("media_event_ids", []) and "free" in fl.get("id", "").lower():
+                cand_flavors.append(fl["id"])
+        for fl in flavors:
+            if me_id in fl.get("media_event_ids", []) and fl.get("id") not in cand_flavors:
+                cand_flavors.append(fl["id"])
+        # 2. Check if media_event itself specifies flavor(s)
+        if cand_me.get("flavor_id") and cand_me["flavor_id"] not in cand_flavors:
+            cand_flavors.append(cand_me["flavor_id"])
+        for fl_id in cand_me.get("flavor_ids", []) or []:
+            if fl_id not in cand_flavors:
+                cand_flavors.append(fl_id)
+
+        for fl_id in cand_flavors:
+            try:
+                stream_url = resolve_stream_url(me_id, fl_id)
+                if stream_url:
+                    media_event = cand_me
+                    chosen_flavor = fl_id
+                    break
+            except Exception as e:
+                last_err = e
+        if stream_url:
             break
 
-    if not chosen_flavor:
-        for fl in flavors:
-            if "free.live" in fl.get("id", "").lower():
-                chosen_flavor = fl["id"]
-                break
-        if not chosen_flavor:
-            chosen_flavor = "free.live.sportsnet"
+    if not stream_url and media_event.get("id"):
+        # Fallback: try all free.live flavors against the primary media_event
+        fallback_flavors = [
+            fl["id"] for fl in flavors if "free" in fl.get("id", "").lower()
+        ] or ["free.live.sportsnet"]
+        for fl_id in fallback_flavors:
+            try:
+                stream_url = resolve_stream_url(media_event["id"], fl_id)
+                if stream_url:
+                    chosen_flavor = fl_id
+                    break
+            except Exception as e:
+                last_err = e
 
-    stream_url = None
-    try:
-        stream_url = resolve_stream_url(media_event["id"], chosen_flavor)
-    except Exception as e:
-        if game.get("status") in ("W", "P", "S") or media_event.get("status") == "P":
-            stream_url = None
-        else:
-            raise
+    if not chosen_flavor:
+        chosen_flavor = "free.live.sportsnet"
+
+    if not stream_url and last_err:
+        sys.stderr.write(
+            f"Debug stateshot: game={json.dumps(game)} "
+            f"events={json.dumps(game_media_events)} "
+            f"flavors={json.dumps(flavors)}\n"
+        )
+        if game.get("status") not in ("W", "P", "S") and media_event.get("status") != "P":
+            raise last_err
 
     result = {
         "team": teams.get(target_team_id),

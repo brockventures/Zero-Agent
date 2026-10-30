@@ -17,15 +17,22 @@ It provides end-to-end automation for checking Starbucks Card balance and Star r
 
 ## 🛡️ Mandatory Safety Invariants & Guardrails
 
-1. **Mandatory Discord Confirmation Before Checkout:**
+1. **Always Confirm Pickup Location First & Require Explicit Approval Before Ordering:**
+   - Pickup store locations are **dynamic** (depending on whether Ryan is at home, running errands, or heading to Sunday morning swim lessons).
+   - Zero **MUST ALWAYS** confirm the target Starbucks store location first before staging/placing an order. Never assume a static default store.
    - The CLI and skill **MUST NEVER** execute checkout without prior explicit, interactive confirmation from Ryan in Discord.
-   - When requested to order Starbucks, Zero **MUST** first run `stage` to assemble the cart and present the staged review summary:
+   - When requested to order Starbucks, Zero **MUST** confirm the store location, run `stage` to assemble the cart, and present the staged review summary:
      - Target Store & Address
      - Estimated Pickup Window
      - Item & Customizations
      - Subtotal, Tax, and Total Price
      - Payment Method / Card Balance
-   - Zero must wait for explicit confirmation from Ryan before executing `checkout --confirm-checkout`.
+   - Zero must wait for explicit approval from Ryan before executing `checkout --confirm-checkout`.
+
+2. **Known Household Orders & Presets:**
+   - **Ryan's Go-To Custom Drink:** **Grande Caffè Americano** in a **Venti Cup** with **3/4" splash of Heavy Cream** and **2 packets of Honey** (or **3 pumps Honey Blend Syrup** in saved Favorites).
+   - **Sunday Morning Pre-Swim Lesson Go-To Order (~8:40 AM PT):** Ryan's custom **Grande Caffè Americano** (in a Venti cup, 3/4" splash of Heavy Cream, 2 packets of Honey) + **Pumpkin & Pepita Loaf**.
+   - **Ordering with Emily:** Emily's most common recent drink is a **Grande Cinnamon Dolce Latte** (ordered Oct 20 & Oct 16, and saved in Favorites), with occasional seasonal/vanilla alternates (**Grande Pecan Crunch Latte** on Sep 25, **Grande Iced Pecan Crunch Latte** on Oct 3, **Grande Caffè Latte** on Aug 30, and **Grande Starbucks Blonde Vanilla Latte** in Favorites). Pickup location is always dynamic.
 
 2. **3D Printer Conflict Guard:**
    - The tethered Pixel 8 Pro also serves as the print bed webcam monitor for OctoPrint (port 3333).

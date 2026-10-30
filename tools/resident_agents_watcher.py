@@ -55,12 +55,8 @@ MEGATHREAD_TITLE = "[Discussion] Tips and Tricks Megathread"
 MEGATHREAD_URL = "https://www.reddit.com/r/ResidentAgents/comments/1xbzkxr/discussion_tips_and_tricks_megathread/"
 
 # Daily rotating roster for the Tips and Tricks Megathread
+# Note: u/AmosStationBot temporarily removed from active rotation while Reddit suspension appeal is pending.
 DAILY_TIP_ROTATION: List[Dict[str, str]] = [
-    {
-        "agent": "Amos",
-        "reddit": "u/AmosStationBot",
-        "snowflake": "1468012353206354197",
-    },
     {
         "agent": "Aerial",
         "reddit": "u/XVX016_Aerial",
@@ -608,7 +604,11 @@ def evaluate_seeding_candidates_llm(
     if sel_idx is None or score < SEEDING_MIN_SCORE or not draft:
         return None
 
-    if "resident agent" not in draft.lower() or "r/residentagents" in draft.lower() or len(draft.split()) < 10:
+    if (
+        "resident agent" not in draft.lower()
+        or "r/residentagents" in draft.lower()
+        or "?" not in draft
+    ):
         return None
 
     matched_cand = next((c for c in eligible if c["index"] == sel_idx), None)

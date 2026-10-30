@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-import sys, subprocess, json, urllib.request, time
+import sys
+import json
+import urllib.request
+import time
 import os
 import urllib.parse
 
@@ -83,9 +86,9 @@ def check_updates(quiet: bool = False):
             print(f"\n[CHOICES: Backup & Upgrade Smart Home Stack | Snooze 1 Week | Skip] ({e})")
     else:
         if not quiet:
-            print(f"✅ **Smart Home Stack is up to date:**")
+            print("✅ **Smart Home Stack is up to date:**")
             print(f"• Home Assistant Core: `v{ha_curr}` (latest stable patch)")
-            print(f"• Matter Server & OTBR: Aligned with active Thread mesh.")
+            print("• Matter Server & OTBR: Aligned with active Thread mesh.")
 
 def perform_upgrade(target_service: str = "all"):
     print("📦 **Initiating Smart Home Stack Upgrade...**\n")
@@ -126,6 +129,15 @@ def perform_upgrade(target_service: str = "all"):
     
     # Pull and recreate
     run_ssh(f"cd '{DOCKER_ROOT}' && docker compose pull homeassistant && docker compose up -d homeassistant", timeout=120)
+    # Patch python-kasa IoT HomeKit probe immediately so 2020 Kasa HS200/HS105 firmware does not hang on startup
+    kasa_patch_cmd = (
+        "docker exec home-assistant python3 -c \""
+        "import pathlib; "
+        "[p.write_text(p.read_text().replace('return {\\\"smartlife.iot.homekit\\\": {\\\"setup_info_get\\\": {}}}', 'return {}')) "
+        "for p in pathlib.Path('/usr/local/lib').glob('python*/site-packages/kasa/iot/modules/homekit.py')]"
+        "\" 2>/dev/null || true"
+    )
+    run_ssh(kasa_patch_cmd, timeout=20)
     run_ssh(f"cd '{DOCKER_ROOT}/homeassistant' && docker compose pull matter-server otbr go2rtc && docker compose up -d matter-server otbr go2rtc", timeout=120)
 
     # 3. Verify health & state

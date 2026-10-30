@@ -369,7 +369,7 @@ def execute_self_heal(
 
     alert_content = "\n".join(msg_lines)
 
-    if queue_outbox_message:
+    if queue_outbox_message and force:
         queue_outbox_message(
             channel=str(HOME_ASSISTANT_CHANNEL_ID),
             content=alert_content,

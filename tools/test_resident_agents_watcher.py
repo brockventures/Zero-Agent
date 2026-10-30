@@ -22,8 +22,10 @@ from tools.resident_agents_watcher import (
     SEEDING_SCAN_INTERVAL_SEC,
     build_upvote_targets_for_reply,
     classify_item_needs_approval,
+    compute_seeding_velocity_priority,
     detect_desired_flair,
     evaluate_seeding_candidates_llm,
+    extract_top_comments_from_thread_json,
     find_unassigned_daily_links_message,
     format_daily_tip_prompt,
     format_notification_card,
@@ -77,8 +79,7 @@ def test_daily_tip_rotation_and_dispatcher(tmp_path: Path) -> None:
     fake_state_file = tmp_path / "state.json"
     s1 = get_daily_tip_assignee("2026-10-21")
     s2 = get_daily_tip_assignee("2026-10-22")
-    s3 = get_daily_tip_assignee("2026-10-23")
-    assert {s1["agent"], s2["agent"], s3["agent"]} == {"Amos", "Aerial", "Zero"}
+    assert {s1["agent"], s2["agent"]} == {"Aerial", "Zero"}
 
     prompt = format_daily_tip_prompt(s1, "2026-10-21")
     assert MEGATHREAD_TITLE in prompt
@@ -192,11 +193,89 @@ def test_seeding_thread_scoring_and_draft_generation() -> None:
     assert SEEDING_MIN_POST_INTERVAL_SEC >= 21600
     assert SEEDING_SCAN_INTERVAL_SEC >= 14400
 
-    # Pure structural metadata checks (no regex/keyword heuristics)
+    # Structural metadata and velocity checks
     ok_meta, _ = is_eligible_seeding_metadata(high_signal_post, now_utc=now_ts)
     assert ok_meta is True
     ok_locked, _ = is_eligible_seeding_metadata({**high_signal_post, "locked": True}, now_utc=now_ts)
     assert ok_locked is False
+
+    # Unseasoned brand-new post (<30m old) must be rejected so AutoMod/mods filter spam first
+    brand_new_post = {
+        **high_signal_post,
+        "created_utc": now_ts - 300,
+        "score": 1,
+        "ups": 1,
+        "num_comments": 1,
+        "is_rising": False,
+    }
+    ok_new, new_reason = is_eligible_seeding_metadata(brand_new_post, now_utc=now_ts)
+    assert ok_new is False
+    assert "Unseasoned brand-new post" in new_reason
+
+    # Auto-moderated / removed posts must be rejected immediately
+    ok_rem, rem_reason = is_eligible_seeding_metadata(
+        {**high_signal_post, "removed_by_category": "moderator"},
+        now_utc=now_ts,
+    )
+    assert ok_rem is False
+    assert "Removed/Auto-moderated" in rem_reason
+
+    # No-traction /new thread (1 pt, 0 comments, not rising) should be filtered out
+    dead_new_post = {
+        **high_signal_post,
+        "created_utc": now_ts - 7200,
+        "score": 1,
+        "ups": 1,
+        "num_comments": 0,
+        "is_rising": False,
+    }
+    ok_dead, dead_reason = is_eligible_seeding_metadata(dead_new_post, now_utc=now_ts)
+    assert ok_dead is False
+    assert "No traction" in dead_reason
+
+    # Rising feed threads with real traction rank higher in velocity priority
+    rising_post = {**dead_new_post, "is_rising": True, "score": 6, "num_comments": 4}
+    ok_rising, _ = is_eligible_seeding_metadata(rising_post, now_utc=now_ts)
+    assert ok_rising is True
+    assert compute_seeding_velocity_priority(rising_post, now_utc=now_ts) > compute_seeding_velocity_priority(
+        high_signal_post, now_utc=now_ts
+    )
+
+    # Top comment extraction for piggybacking on bustling threads
+    fake_thread_json = [
+        {"kind": "Listing", "data": {"children": []}},
+        {
+            "kind": "Listing",
+            "data": {
+                "children": [
+                    {
+                        "kind": "t1",
+                        "data": {
+                            "name": "t1_auto",
+                            "author": "AutoModerator",
+                            "body": "Pinned mod note",
+                            "score": 1,
+                            "stickied": True,
+                        },
+                    },
+                    {
+                        "kind": "t1",
+                        "data": {
+                            "name": "t1_top1",
+                            "author": "keen_hacker",
+                            "body": "The real killer is tool output staying in the prompt across 50 turns.",
+                            "score": 42,
+                            "stickied": False,
+                        },
+                    },
+                ]
+            },
+        },
+    ]
+    top_comments = extract_top_comments_from_thread_json(fake_thread_json, limit=2)
+    assert len(top_comments) == 1
+    assert top_comments[0]["fullname"] == "t1_top1"
+    assert top_comments[0]["author"] == "keen_hacker"
 
     workplace_post = {
         "name": "t3_work1",
@@ -210,25 +289,33 @@ def test_seeding_thread_scoring_and_draft_generation() -> None:
         "url": "https://www.reddit.com/r/ClaudeAI/comments/work1/when_nondev/",
     }
 
-    # Verify Flash LLM semantic evaluator selects genuine resident-agent thread and drafts grounded reply
+    # Verify Flash High LLM semantic evaluator selects genuine resident-agent thread (or top comment) and drafts grounded reply
+    bustling_post = {
+        **high_signal_post,
+        "num_comments": 22,
+        "top_comments": top_comments,
+    }
     mock_approve_json = {
         "selected_index": 1,
+        "reply_to_fullname": "t1_top1",
         "score": 94.0,
-        "rationale": "Directly discusses long-term memory compaction and cron scheduling for a 24/7 home server agent.",
+        "rationale": "Directly discusses long-term memory compaction and tool output bloat in persistent agent sessions.",
         "comment_draft": (
-            "Ran into this exact wall once I moved from one-off chat tabs to running a resident agent 24/7 in Docker on my home NAS. "
-            "Splitting recent verbatim turns from a local SQLite FTS5 index over markdown notes stopped the context rot—how are you deciding what gets compacted vs kept verbatim?"
+            "Tool stdout lingering in the context window was the #1 thing that blew up my resident agent sessions too. "
+            "Are you stripping raw tool payloads after each turn or summarizing them inline before the next tool call?"
         ),
     }
     with patch("tools.llm_sidecar.call_sidecar_llm_json", return_value=mock_approve_json):
-        eval_res = evaluate_seeding_candidates_llm([workplace_post, high_signal_post], now_utc=now_ts)
+        eval_res = evaluate_seeding_candidates_llm([workplace_post, bustling_post], now_utc=now_ts)
         assert eval_res is not None
         assert eval_res["candidate"]["fullname"] == "t3_seed1"
+        assert eval_res["reply_to_fullname"] == "t1_top1"
+        assert eval_res["candidate"]["reply_target_comment"]["author"] == "keen_hacker"
         assert eval_res["score"] == 94.0
         assert "resident agent" in eval_res["draft"].lower()
         assert "r/residentagents" not in eval_res["draft"].lower()
 
-        score, reasons = score_seeding_thread(high_signal_post, now_utc=now_ts)
+        score, reasons = score_seeding_thread(bustling_post, now_utc=now_ts)
         assert score >= SEEDING_MIN_SCORE
 
     # Verify Flash LLM semantic evaluator cleanly rejects off-topic workplace / non-resident threads

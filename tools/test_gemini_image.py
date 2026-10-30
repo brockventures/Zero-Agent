@@ -126,6 +126,16 @@ class TestGeminiImage(unittest.TestCase):
         self.assertEqual(res["model"], "gemini-3.1-flash-image-preview")
         self.assertEqual(mock_post.call_count, 2)
 
+    @patch("tools.gemini_image.deliver_image")
+    @patch("tools.gemini_image.generate_image_api")
+    def test_main_no_default_prompt_caption(self, mock_gen, mock_deliver):
+        mock_gen.return_value = {"success": True, "path": "/tmp/test.jpg"}
+        mock_deliver.return_value = {"success": True}
+        with patch("sys.argv", ["gemini_image.py", "--prompt", "secret internal prompt", "--channel", "lounge"]):
+            from tools.gemini_image import main
+            main()
+        mock_deliver.assert_called_once_with("/tmp/test.jpg", channel_input="lounge", caption=None)
+
 
 if __name__ == "__main__":
     unittest.main()

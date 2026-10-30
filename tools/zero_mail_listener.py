@@ -253,6 +253,15 @@ def is_process_running(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
+        cmdline_path = f"/proc/{pid}/cmdline"
+        status_path = f"/proc/{pid}/status"
+        if os.path.exists(cmdline_path) and os.path.exists(status_path):
+            with open(cmdline_path, "rb") as f:
+                cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            with open(status_path, "r", encoding="utf-8", errors="ignore") as f:
+                tgid_lines = [line.split()[1] for line in f if line.startswith("Tgid:")]
+            if (tgid_lines and int(tgid_lines[0]) != pid) or "zero_mail_listener" not in cmdline:
+                return False
         return True
     except (OSError, ProcessLookupError):
         return False

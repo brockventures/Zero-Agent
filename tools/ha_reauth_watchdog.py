@@ -29,7 +29,8 @@ ZHA_SOCKET_RELEASE_SETTLE_SECONDS = 0.5
 ZWAVE_JS_DEFAULT_ENTRY_ID = "01M37PHFHNTF4C9D4R108R95N3"
 ZWAVE_RELOAD_TIMEOUT_SECONDS = 35
 ZWAVE_RADIO_RESET_SETTLE_SECONDS = 8.0
-ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS = 38.0
+ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS = 45.0
+ZWAVE_RELOAD_RETRY_SETTLE_SECONDS = 8.0
 ZWAVE_SOCKET_RELEASE_SETTLE_SECONDS = 0.5
 ZWAVE_BLIND_ENTITIES = ("cover.living_room_blinds_1", "cover.living_room_blinds_2")
 ZWAVE_FATAL_LOG_SIGNATURES = (
@@ -466,6 +467,16 @@ def _auto_heal_zwave_js(
             return False
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    if states is None:
+        try:
+            st_req = urllib.request.Request(f"{base_url}/api/states", headers=headers)
+            with urllib.request.urlopen(st_req, timeout=10) as st_resp:
+                if st_resp.status == 200:
+                    fetched_states = json.loads(st_resp.read().decode())
+                    if isinstance(fetched_states, list):
+                        states = fetched_states
+        except Exception:
+            pass
     zw_ip = _get_tubeszb_zw_ip(states)
     try:
         reachable = False
@@ -510,30 +521,39 @@ def _auto_heal_zwave_js(
         time.sleep(ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS)
 
         reload_url = f"{base_url}/api/config/config_entries/entry/{entry_id}/reload"
-        rel_req = urllib.request.Request(
-            reload_url,
-            data=b"{}",
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(rel_req, timeout=ZWAVE_RELOAD_TIMEOUT_SECONDS) as rel_resp:
-            if rel_resp.status != 200:
-                return False
+        for attempt in range(2):
+            if attempt > 0:
+                time.sleep(ZWAVE_RELOAD_RETRY_SETTLE_SECONDS)
+            try:
+                rel_req = urllib.request.Request(
+                    reload_url,
+                    data=b"{}",
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib.request.urlopen(rel_req, timeout=ZWAVE_RELOAD_TIMEOUT_SECONDS) as rel_resp:
+                    if rel_resp.status != 200:
+                        continue
+            except Exception as rel_ex:
+                if attempt == 0:
+                    print(f"[HAReauthWatchdog] Z-Wave JS reload attempt 1 transient error, retrying: {rel_ex}", file=sys.stderr)
+                    continue
+                raise
 
-        verify_req = urllib.request.Request(
-            f"{base_url}/api/config/config_entries/entry",
-            headers=headers,
-        )
-        with urllib.request.urlopen(verify_req, timeout=10) as verify_resp:
-            entries = json.loads(verify_resp.read().decode())
-            for item in entries:
-                if item.get("entry_id") == entry_id and item.get("state") == "loaded":
-                    print(
-                        f"[HAReauthWatchdog] 🔄 Auto-healed Z-Wave JS config entry {entry_id} (verified state=loaded).",
-                        file=sys.stderr,
-                    )
-                    _reconcile_living_room_blinds(base_url, token, states=states)
-                    return True
+            verify_req = urllib.request.Request(
+                f"{base_url}/api/config/config_entries/entry",
+                headers=headers,
+            )
+            with urllib.request.urlopen(verify_req, timeout=10) as verify_resp:
+                entries = json.loads(verify_resp.read().decode())
+                for item in entries:
+                    if item.get("entry_id") == entry_id and item.get("state") == "loaded":
+                        print(
+                            f"[HAReauthWatchdog] 🔄 Auto-healed Z-Wave JS config entry {entry_id} (verified state=loaded).",
+                            file=sys.stderr,
+                        )
+                        _reconcile_living_room_blinds(base_url, token, states=states)
+                        return True
     except Exception as ex:
         print(f"[HAReauthWatchdog] Z-Wave JS auto-heal error: {ex}", file=sys.stderr)
     return False
@@ -560,6 +580,7 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
 
     zwave_entry_id = ZWAVE_JS_DEFAULT_ENTRY_ID
     zwave_healed = False
+    zwave_heal_attempted = False
 
     for e in entries:
         st = e.get("state")
@@ -586,6 +607,7 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
 
         # Auto-heal Z-Wave JS if config entry is in setup_retry or setup_error
         if domain == "zwave_js" and st in ("setup_retry", "setup_error"):
+            zwave_heal_attempted = True
             if _auto_heal_zwave_js(base_url, token, entry_id):
                 zwave_healed = True
                 continue
@@ -610,7 +632,7 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
         with urllib.request.urlopen(req, timeout=10) as resp:
             states = json.loads(resp.read().decode())
         _auto_heal_matter_thread_nodes(states)
-        if not zwave_healed:
+        if not zwave_healed and not zwave_heal_attempted:
             blinds_unavailable = any(
                 isinstance(s, dict)
                 and s.get("entity_id") in ZWAVE_BLIND_ENTITIES
@@ -622,7 +644,10 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
                 for s in states
             )
             if blinds_unavailable or (has_blinds and _check_zwave_js_logs_wedged()):
-                _auto_heal_zwave_js(base_url, token, zwave_entry_id, states=states)
+                if _auto_heal_zwave_js(base_url, token, zwave_entry_id, states=states):
+                    zwave_key = f"entry:{zwave_entry_id}"
+                    active_keys.discard(zwave_key)
+                    issues = [i for i in issues if i.get("key") != zwave_key]
         for s in states:
             eid = s.get("entity_id", "")
             if eid.startswith("persistent_notification."):

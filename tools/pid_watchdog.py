@@ -17,13 +17,15 @@ from typing import Tuple, Dict, Any
 
 sys.path.insert(0, "/workspace/tools")
 try:
-    from nas_config import run_ssh, HOST_2_IP, HOST_1_IP, SSH_USER, SSH_PORT, SSH_KEY
+    from nas_config import run_ssh, evict_ssh_mux_socket, HOST_2_IP, HOST_1_IP, SSH_USER, SSH_PORT, SSH_KEY
 except Exception:
     HOST_2_IP = os.environ.get("NAS_HOST_2_IP", "127.0.0.1")
     HOST_1_IP = os.environ.get("NAS_HOST_1_IP", "127.0.0.1")
     SSH_USER = os.environ.get("NAS_SSH_USER", "Brock")
     SSH_PORT = int(os.environ.get("NAS_SSH_PORT", "22"))
     SSH_KEY = "/root/.ssh/id_ed25519"
+    def evict_ssh_mux_socket(*args, **kwargs) -> bool:
+        return False
 
 DEFAULT_THREAD_THRESHOLD = 0.75  # 75% of threads-max
 DEFAULT_PROC_WARNING = 1500      # 1,500 running processes
@@ -42,10 +44,23 @@ def check_host_pid_health(ip: str, host_name: str, threshold: float = DEFAULT_TH
     )
     code, out, err = -1, "", ""
     for attempt in range(1, 4):
-        code, out, err = run_ssh(ip, cmd, timeout=20, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
-        if code == 0 and len([l.strip() for l in out.strip().split("\n") if l.strip()]) >= 4:
+        try:
+            code, out, err = run_ssh(
+                ip,
+                cmd,
+                timeout=20,
+                user=SSH_USER,
+                port=SSH_PORT,
+                key=SSH_KEY,
+                disable_mux=(attempt > 1),
+                retry_without_mux_on_timeout=(attempt == 1),
+            )
+        except TypeError:
+            code, out, err = run_ssh(ip, cmd, timeout=20, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
+        if code == 0 and len([line.strip() for line in out.strip().split("\n") if line.strip()]) >= 4:
             break
         if attempt < 3:
+            evict_ssh_mux_socket(ip, user=SSH_USER, port=SSH_PORT)
             time.sleep(2.0 * attempt)
     if code != 0:
         return {
@@ -61,7 +76,7 @@ def check_host_pid_health(ip: str, host_name: str, threshold: float = DEFAULT_TH
             "last_pid": 0,
         }
 
-    lines = [l.strip() for l in out.strip().split("\n") if l.strip()]
+    lines = [line.strip() for line in out.strip().split("\n") if line.strip()]
     if len(lines) < 4:
         return {
             "host": host_name,
@@ -149,8 +164,13 @@ def audit_pid_headroom(force: bool = False, threshold: float = DEFAULT_THREAD_TH
 
     # Format Discord alert
     lines = []
-    header_emoji = "🚨" if any(r["status"] == "critical" for r in results) else "⚠️"
-    lines.append(f"### {header_emoji} PID & Process Headroom Alert")
+    has_pid_breach = any(r["status"] in ("warning", "critical") for r in results)
+    has_ssh_error = any(r["status"] == "error" for r in results)
+    if has_ssh_error and not has_pid_breach:
+        lines.append("### ⚠️ PID Watchdog SSH Transport Alert")
+    else:
+        header_emoji = "🚨" if any(r["status"] == "critical" for r in results) else "⚠️"
+        lines.append(f"### {header_emoji} PID & Process Headroom Alert")
 
     for r in results:
         status_emoji = "🟢" if r["status"] == "nominal" else ("🔴" if r["status"] == "critical" else "🟡")

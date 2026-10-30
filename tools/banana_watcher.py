@@ -834,8 +834,17 @@ def get_daemon_status() -> dict:
         try:
             pid = int(PID_FILE.read_text().strip())
             os.kill(pid, 0)
+            cmdline_path = Path(f"/proc/{pid}/cmdline")
+            status_path = Path(f"/proc/{pid}/status")
+            if cmdline_path.exists() and status_path.exists():
+                cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                status_text = status_path.read_text(encoding="utf-8", errors="ignore")
+                tgid_lines = [line.split()[1] for line in status_text.splitlines() if line.startswith("Tgid:")]
+                if (tgid_lines and int(tgid_lines[0]) != pid) or "banana_watcher" not in cmdline:
+                    PID_FILE.unlink(missing_ok=True)
+                    return {"running": False, "pid": None}
             return {"running": True, "pid": pid}
-        except (ValueError, ProcessLookupError, PermissionError):
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
             pass
     return {"running": False, "pid": None}
 

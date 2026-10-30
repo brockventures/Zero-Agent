@@ -188,7 +188,7 @@ def trigger_arr_refresh(port: int, api_key: str):
         headers={"X-Api-Key": api_key, "Content-Type": "application/json"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=8):
             return True
     except Exception:
         return False
@@ -214,7 +214,7 @@ def _auto_remediate_allowed_hosts(app_name: str, port: int, api_key: str) -> boo
             headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
             method="PUT"
         )
-        with urllib.request.urlopen(req_put, timeout=8) as put_resp:
+        with urllib.request.urlopen(req_put, timeout=8):
             pass
 
         cmd_url = f"http://{HOST_1_IP}:{port}/api/v3/command"
@@ -223,7 +223,7 @@ def _auto_remediate_allowed_hosts(app_name: str, port: int, api_key: str) -> boo
             data=json.dumps({"name": "CheckHealth"}).encode("utf-8"),
             headers={"X-Api-Key": api_key, "Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req_cmd, timeout=8) as cmd_resp:
+        with urllib.request.urlopen(req_cmd, timeout=8):
             pass
 
         _log_triage_action(
@@ -248,7 +248,7 @@ def _auto_remediate_notification_health(app_name: str, port: int, api_key: str) 
             data=json.dumps({"name": "CheckHealth"}).encode("utf-8"),
             headers={"X-Api-Key": api_key, "Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req_cmd, timeout=8) as cmd_resp:
+        with urllib.request.urlopen(req_cmd, timeout=8):
             pass
 
         time.sleep(1)
@@ -356,7 +356,7 @@ def _auto_remediate_media_management(app_name: str, port: int, api_key: str) -> 
             headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
             method="PUT"
         )
-        with urllib.request.urlopen(req_put, timeout=8) as put_resp:
+        with urllib.request.urlopen(req_put, timeout=8):
             pass
 
         _log_triage_action(
@@ -591,6 +591,7 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                             "path": "General Settings",
                             "reason": "AllowedHosts was unconfigured. Auto-applied LAN host whitelist and triggered health refresh."
                         })
+                        continue
                 # Suppress from user-facing outage alerts
                 continue
 
@@ -675,13 +676,9 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
     state["last_check_at"] = now_str
     _save_state(state)
 
+    # Successful Tier 1 auto-remediations are logged silently to AUDIT_LOG_FILE (0 chat noise).
+    # Only surface un-remediated queue warnings, sustained health alerts, or outage resolutions.
     lines = []
-    if remediated:
-        lines.append("🛠️ **Arr Import Auto-Remediation Live**")
-        for r in remediated:
-            lines.append(f"• **{r['app']}**: `{r['title']}`")
-            lines.append(f"  ──► Path: `{r['path']}`")
-            lines.append(f"  ──► Action: {r['reason']}")
 
     if new_warnings:
         if lines:
@@ -717,7 +714,7 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
             lines.append(f"  ──► The following issue is resolved (cleared after {hr['duration_mins']} mins): {hr['message']}")
 
     summary_text = "\n".join(lines)
-    has_activity = bool(remediated or new_warnings or health_alerts or health_resolutions)
+    has_activity = bool(new_warnings or health_alerts or health_resolutions)
 
     return has_activity, summary_text, findings + remediated + health_alerts + health_resolutions
 

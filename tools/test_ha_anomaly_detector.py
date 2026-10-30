@@ -114,6 +114,18 @@ def test_format_report_outputs_clean_markdown():
     assert "HA & Network Telemetry Nominal" in format_report(nominal, quiet=False)
     assert "68 UniFi clients" in format_report(nominal, quiet=False)
 
+    healed_only = {
+        **nominal,
+        "healed_events": [
+            {
+                "entity_id": "sensor.patio_temp",
+                "name": "Patio Temp",
+                "heal_note": "Auto-healed via `update_entity + reload:switchbot` (`65.0` -> `70.2`)",
+            }
+        ],
+    }
+    assert format_report(healed_only, quiet=True) == ""
+
     alert = {
         "ok": True,
         "vm_healthy": True,

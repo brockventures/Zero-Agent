@@ -28,6 +28,7 @@ from tools.gotchi_zero_adapter import (
     build_thinking_config,
     clean_spoken_text_for_tts,
     create_zero_gotchi_app,
+    delegate_coding_task_to_zero_chat,
     execute_gotchi_tool_call,
     extract_and_forward_artifacts_to_zero_chat,
     is_allowed_voice_read_path,
@@ -112,14 +113,45 @@ def test_select_thinking_budget_and_fast_memory_prefetch():
     assert elapsed_ms < 50.0
 
 
-def test_build_gotchi_zero_system_prompt_shares_zero_voice_context():
+def test_build_gotchi_zero_system_prompt_shares_zero_voice_context(monkeypatch):
     prompt = build_gotchi_zero_system_prompt("What is on my task list?", has_vision=True)
     assert "GOTCHI & ZERO-VOICE UNIFIED PERSONA INVARIANTS" in prompt
     assert "Schedar" in prompt
     assert "live camera snapshot or 5-frame burst" in prompt
     assert "post_note_to_zero_chat" in prompt
+    assert "delegate_coding_task_to_zero_chat" in prompt
     assert "request_deep_thinking(spoken_preamble, reason)" in prompt
     assert "PRE-TOOL SPOKEN PREAMBLE" in prompt
+    assert "ZERO CORE OPERATIONAL REFERENCE (/workspace/GEMINI.md)" not in prompt
+
+    queued_turns: List[Any] = []
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_agent_turn",
+        lambda channel, prompt, job_name="Detached Task Synthesis", force=False: (
+            queued_turns.append((channel, prompt, job_name, force))
+            or {"id": "outbox-turn-123", "status": "queued"}
+        ),
+    )
+    res = asyncio.run(
+        execute_gotchi_tool_call(
+            "delegate_coding_task_to_zero_chat",
+            {
+                "task_summary": "Add battery percentage overlay to the Gotchi sleep screen",
+                "spoken_preamble": "Passing that to Zero-Chat to spec and build.",
+                "context_notes": "Display in top-right corner of 200x200 e-paper.",
+            },
+        )
+    )
+    assert res["ok"] is True
+    assert res["status"] == "delegated_to_argon_in_zero_chat"
+    assert res["outbox_id"] == "outbox-turn-123"
+    assert len(queued_turns) == 1
+    assert queued_turns[0][0] == "zero-chat"
+    assert "Add battery percentage overlay" in queued_turns[0][1]
+    assert queued_turns[0][3] is True
+
+    empty_res = delegate_coding_task_to_zero_chat("")
+    assert empty_res["ok"] is False
 
 
 def test_voice_security_gate_and_realpath_read_allowlist(monkeypatch, tmp_path):
@@ -701,3 +733,145 @@ def test_adapter_ha_fastpath_falls_back_to_llm_on_no_intent():
     assert res["ha_fastpath"] is False
     assert llm_called is True
     assert "Zero LLM handled" in res["reply"]
+
+
+def test_direct_audio_race_both_arrival_orders_and_ghost_filter():
+    from poc.gotchi_poc import wrap_pcm16_to_wav
+    import time
+
+    # 1. Transcript arrives before Gemini's first sentence -> HA fast-path runs & cancels Gemini
+    gemini_cancelled = False
+
+    class FastTranscriber:
+        llm_config = None
+
+        def transcribe(self, _wav_bytes: bytes) -> str:
+            time.sleep(0.01)
+            return "Turn on the workbench lamp"
+
+    async def slow_gemini(prompt, image_bytes, burst_images, on_sentence=None, audio_bytes=None):
+        nonlocal gemini_cancelled
+        try:
+            await asyncio.sleep(0.15)
+            if on_sentence:
+                on_sentence("Gemini late sentence.")
+            return "Gemini late sentence.", False, ["Gemini late sentence."]
+        except asyncio.CancelledError:
+            gemini_cancelled = True
+            raise
+
+    def fake_ha_poster(url, headers, payload, timeout_s):
+        return {
+            "response": {
+                "response_type": "action_done",
+                "speech": {"plain": {"speech": "Turned on the workbench lamp."}},
+                "data": {},
+            },
+            "conversation_id": "ha-race-1",
+        }
+
+    adapter1 = GotchiZeroBrainAdapter(
+        api_key="fake-key",
+        dispatch_discord=False,
+        stt_adapter=FastTranscriber(),
+        ha_conversation_enabled=True,
+        ha_base_url="http://198.51.100.10:8123",
+        ha_access_token="test-token",
+        ha_http_poster=fake_ha_poster,
+    )
+    adapter1._run_gemini_with_tools = slow_gemini
+    streamed1: List[str] = []
+    wav = wrap_pcm16_to_wav(b"\x18\x00" * 8000)
+    res1 = asyncio.run(
+        adapter1.handle_turn(
+            {
+                "node_id": "gotchi-ryan-01",
+                "session_id": "sess-race-1",
+                "audio_bytes": wav,
+                "_on_sentence": streamed1.append,
+            }
+        )
+    )
+    assert res1["ha_fastpath"] is True
+    assert res1["reply"] == "Turned on the workbench lamp."
+    assert streamed1 == ["Turned on the workbench lamp."]
+    assert gemini_cancelled is True
+
+    # 2. Gemini's first sentence arrives before transcript -> releases Gemini immediately and skips HA
+    ha_called = False
+
+    class SlowTranscriber:
+        llm_config = None
+
+        def transcribe(self, _wav_bytes: bytes) -> str:
+            time.sleep(0.08)
+            return "Turn on the workbench lamp"
+
+    async def fast_gemini(prompt, image_bytes, burst_images, on_sentence=None, audio_bytes=None):
+        await asyncio.sleep(0.01)
+        if on_sentence:
+            on_sentence("Gemini first sentence.")
+        return "Gemini first sentence.", False, ["Gemini first sentence."]
+
+    def should_not_call_ha(url, headers, payload, timeout_s):
+        nonlocal ha_called
+        ha_called = True
+        return {}
+
+    adapter2 = GotchiZeroBrainAdapter(
+        api_key="fake-key",
+        dispatch_discord=False,
+        stt_adapter=SlowTranscriber(),
+        ha_conversation_enabled=True,
+        ha_base_url="http://198.51.100.10:8123",
+        ha_access_token="test-token",
+        ha_http_poster=should_not_call_ha,
+    )
+    adapter2._run_gemini_with_tools = fast_gemini
+    streamed2: List[str] = []
+    res2 = asyncio.run(
+        adapter2.handle_turn(
+            {
+                "node_id": "gotchi-ryan-01",
+                "session_id": "sess-race-2",
+                "audio_bytes": wav,
+                "_on_sentence": streamed2.append,
+            }
+        )
+    )
+    assert res2["ha_fastpath"] is False
+    assert ha_called is False
+    assert streamed2 == ["Gemini first sentence."]
+    assert res2["reply"] == "Gemini first sentence."
+
+    # 3. When WhisperSTTAdapter is in default "mock" mode (llm_config.stt_engine == "mock"),
+    # handle_turn must use _transcribe_audio_with_gemini instead of logging "What is the status?"
+    from backend.llm_config import LLMConfig
+    from backend.voice_gateway import WhisperSTTAdapter
+
+    mock_stt = WhisperSTTAdapter(
+        llm_config=LLMConfig(stt_engine="mock", min_voiced_ms=0, use_silero_vad=False)
+    )
+    adapter3 = GotchiZeroBrainAdapter(
+        api_key="fake-key",
+        dispatch_discord=False,
+        stt_adapter=mock_stt,
+    )
+    adapter3._run_gemini_with_tools = fast_gemini
+
+    async def fake_mm_transcribe(_wav: bytes) -> str:
+        return "Hello from the real microphone"
+
+    adapter3._transcribe_audio_with_gemini = fake_mm_transcribe
+    res3 = asyncio.run(
+        adapter3.handle_turn(
+            {
+                "node_id": "gotchi-ryan-01",
+                "session_id": "sess-mock-stt-bypass",
+                "audio_bytes": wav,
+            }
+        )
+    )
+    assert res3["transcript"] == "Hello from the real microphone"
+
+

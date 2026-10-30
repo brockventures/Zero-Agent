@@ -2,12 +2,8 @@
 """Comprehensive test suite for Autonomous Arr & Prowlarr Health Triage Watchdogs."""
 
 import json
-import os
 import sys
-import tempfile
-import time
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 
 if "/workspace" not in sys.path:
     sys.path.insert(0, "/workspace")
@@ -77,9 +73,9 @@ def test_arr_allowed_hosts_auto_remediation(temp_env, monkeypatch):
     has_activity, summary, items = aqw.run_watchdog(auto_fix=True, force_dispatch=True)
 
     assert auto_remed_mock.call_count == 2  # Once for Radarr, once for Sonarr
-    assert "AllowedHostsCheck" in summary
-    assert "Auto-applied LAN host whitelist" in summary
-    assert "🚨 **Arr Health Outage Alert" not in summary  # No false outage alert!
+    assert not has_activity
+    assert summary == ""
+    assert any(it.get("title") == "AllowedHostsCheck" for it in items)
 
 
 def test_arr_ignored_sources_suppression(temp_env, monkeypatch):
@@ -294,9 +290,9 @@ def test_arr_non_upgrade_auto_purged_and_blocklisted(temp_env, monkeypatch):
     assert remove_mock.call_args[0][2] == 1495902780
     assert remove_mock.call_args[1]["remove_from_client"] is True
     assert remove_mock.call_args[1]["blocklist"] is True
-    assert "⚠️ **Arr Queue Warnings Detected**" not in summary
-    assert "🛠️ **Arr Import Auto-Remediation Live**" in summary
-    assert "inferior non-upgrade" in summary
+    assert not has_activity
+    assert summary == ""
+    assert any("inferior non-upgrade" in it.get("reason", "") for it in items)
 
     # Verify audit receipt was written
     assert audit_file.exists()
@@ -460,9 +456,9 @@ def test_arr_notification_status_auto_remediation(temp_env, monkeypatch):
     has_activity, summary, items = aqw.run_watchdog(auto_fix=True, force_dispatch=True)
 
     assert auto_remed_mock.call_count == 2
-    assert "NotificationStatusCheck" in summary
-    assert "Transient notification timeout detected" in summary
-    assert "🚨 **Arr Health Outage Alert" not in summary
+    assert not has_activity
+    assert summary == ""
+    assert any(it.get("title") == "NotificationStatusCheck" for it in items)
 
 
 def test_arr_notification_status_unresolved_advisory_not_critical(temp_env, monkeypatch):
@@ -550,10 +546,13 @@ def test_arr_id_mismatch_poison_grab_auto_remediated(temp_env, monkeypatch):
     assert remove_mock.call_count == 2
     assert search_mock.call_count == 1
     assert search_mock.call_args[1]["episode_ids"] == [32874, 32875]
-    assert "⚠️ **Arr Queue Warnings Detected**" not in summary
-    assert "🛠️ **Arr Import Auto-Remediation Live**" in summary
-    assert "Indexer ID-mismatch poison grab" in summary
-    assert "+1 poisoned sibling grab(s)" in summary
+    assert not has_activity
+    assert summary == ""
+    assert any(
+        "Indexer ID-mismatch poison grab" in it.get("reason", "")
+        and "+1 poisoned sibling grab(s)" in it.get("reason", "")
+        for it in items
+    )
 
     assert audit_file.exists()
     with open(audit_file) as f:

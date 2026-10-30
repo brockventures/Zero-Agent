@@ -871,6 +871,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             <li><span>Create a free account at <strong>plex.tv</strong> (Google, Apple, or email) and let Ryan know the email address you used so he can send a server invite.</span></li>
             <li><span>Click the link in the invite email to accept library access, then sign in to <strong>Plex</strong> on your TV, phone, or browser.</span></li>
             <li><span><em>Tip:</em> In your Plex app sidebar, pin our <strong>Movies</strong> and <strong>TV Shows</strong> libraries (and unpin Plex's free ad-supported rows) so our catalog stays front and center.</span></li>
+            <li><span><strong>Audiobooks Pro Tip:</strong> For a dedicated Audible-style player with chapter navigation, sleep timers, and progress sync across our <strong>Audiobooks</strong> library in Plex, use <strong>Prologue</strong> (iOS / CarPlay) or <strong>Chronicle</strong> / <strong>Epilogue</strong> (Android / Android Auto).</span></li>
             <li><span>To request new movies or shows, open <strong>Seerr</strong> above and click <strong>Sign In with Plex</strong> using that same account.</span></li>
           </ol>
         </div>
@@ -917,6 +918,12 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         if clean_path in ("/api/ivy", "/ivy"):
             code, _ = self._evaluate_ivy(strict=strict)
             content_type = "application/json"
+        elif clean_path in ("/gotchi", "/gotchi/assembly"):
+            code = 200
+            content_type = "text/html; charset=utf-8"
+        elif clean_path.startswith("/gotchi/assets/"):
+            code = 200
+            content_type = "image/png"
         elif clean_path in ("/api/avatar", "/avatar.png", "/zero_avatar.png"):
             code = 200
             content_type = "image/png"
@@ -945,11 +952,107 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.end_headers()
 
+    def _ensure_gotchi_gateway_up(self) -> None:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            if s.connect_ex(("127.0.0.1", 8771)) == 0:
+                return
+        try:
+            with open("/secrets/env.json", "r", encoding="utf-8") as sf:
+                sec = json.load(sf)
+        except Exception:
+            sec = {}
+        env = os.environ.copy()
+        env["GEMINI_API_KEY"] = sec.get("GEMINI_API_KEY", "")
+        env["GOTCHI_LLM_CONFIG_FILE"] = "/workspace/gotchi/backend/gateway_config.json"
+        env["PYTHONPATH"] = "/workspace:/workspace/gotchi"
+        log_f = open("/workspace/data/gotchi_gateway.log", "a")
+        subprocess.Popen(
+            [
+                sys.executable, "-m", "uvicorn",
+                "tools.gotchi_zero_adapter:create_zero_gotchi_app",
+                "--factory",
+                "--host", "127.0.0.1",
+                "--port", "8771",
+            ],
+            cwd="/workspace/gotchi",
+            env=env,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        for _ in range(15):
+            time.sleep(0.2)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.2)
+                if s.connect_ex(("127.0.0.1", 8771)) == 0:
+                    break
+
+    def _proxy_to_gotchi_gateway(self, method: str) -> None:
+        self._ensure_gotchi_gateway_up()
+        import http.client
+        content_len = int(self.headers.get("Content-Length", "0") or "0")
+        req_body = self.rfile.read(content_len) if content_len > 0 else b""
+        fwd_headers = {
+            k: v for k, v in self.headers.items()
+            if k.lower() not in ("host", "connection", "transfer-encoding")
+        }
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", 8771, timeout=65)
+            conn.request(method, self.path, body=req_body, headers=fwd_headers)
+            resp = conn.getresponse()
+            self.send_response(resp.status)
+            is_sse = False
+            for hk, hv in resp.getheaders():
+                if hk.lower() in ("transfer-encoding", "connection", "date", "server"):
+                    continue
+                if hk.lower() == "content-type" and "text/event-stream" in hv.lower():
+                    is_sse = True
+                self.send_header(hk, hv)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            if is_sse:
+                while True:
+                    chunk = resp.fp.read1(4096) if hasattr(resp, 'fp') and hasattr(resp.fp, 'read1') else resp.read(256)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            else:
+                data = resp.read()
+                if data:
+                    self.wfile.write(data)
+            conn.close()
+        except Exception as exc:
+            err_bytes = json.dumps({"ok": False, "error": "gateway_unavailable", "message": str(exc)}).encode("utf-8")
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err_bytes)))
+            self.end_headers()
+            self.wfile.write(err_bytes)
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
+        self.end_headers()
+
+    def do_POST(self):
+        clean_path = self.path.split("?")[0].rstrip("/")
+        if clean_path.startswith("/api/voice") or clean_path.startswith("/api/config") or clean_path.startswith("/api/journal"):
+            self._proxy_to_gotchi_gateway("POST")
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PUT(self):
+        clean_path = self.path.split("?")[0].rstrip("/")
+        if clean_path.startswith("/api/voice") or clean_path.startswith("/api/config") or clean_path.startswith("/api/journal"):
+            self._proxy_to_gotchi_gateway("PUT")
+            return
+        self.send_response(404)
         self.end_headers()
 
     def do_GET(self):
@@ -1018,6 +1121,37 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             status_code, payload = self._evaluate_ivy(strict=strict)
             body = json.dumps(payload, indent=2).encode("utf-8")
             content_type = "application/json"
+
+        # 1b. Gotchi V4.4 Interactive Hardware Assembly & Wiring Guide
+        elif clean_path in ("/gotchi", "/gotchi/assembly"):
+            import importlib
+            import tools.gotchi_assembly_portal as gap
+            importlib.reload(gap)
+            body = gap.render_gotchi_assembly_html().encode("utf-8")
+            content_type = "text/html; charset=utf-8"
+            status_code = 200
+
+        elif clean_path.startswith("/api/voice") or clean_path.startswith("/api/config") or clean_path.startswith("/api/journal"):
+            self._proxy_to_gotchi_gateway("GET")
+            return
+
+        elif clean_path.startswith("/gotchi/assets/"):
+            import importlib
+            import tools.gotchi_assembly_portal as gap
+            importlib.reload(gap)
+            asset_name = clean_path.split("/gotchi/assets/", 1)[1]
+            asset_bytes = gap.resolve_asset_bytes(asset_name)
+            if asset_bytes is not None:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(asset_bytes)))
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.end_headers()
+                self.wfile.write(asset_bytes)
+                return
+            self.send_response(404)
+            self.end_headers()
+            return
 
         # Avatar Endpoint
         elif clean_path in ("/api/avatar", "/avatar.png", "/zero_avatar.png", "/ivy_avatar.png"):
@@ -1247,6 +1381,15 @@ def is_running() -> int | None:
     try:
         pid = int(PID_FILE.read_text().strip())
         os.kill(pid, 0)
+        cmdline_path = Path(f"/proc/{pid}/cmdline")
+        status_path = Path(f"/proc/{pid}/status")
+        if cmdline_path.exists() and status_path.exists():
+            cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+            status_text = status_path.read_text(encoding="utf-8", errors="ignore")
+            tgid_lines = [line.split()[1] for line in status_text.splitlines() if line.startswith("Tgid:")]
+            if (tgid_lines and int(tgid_lines[0]) != pid) or "zero_health_server" not in cmdline:
+                PID_FILE.unlink(missing_ok=True)
+                return None
         return pid
     except (ValueError, OSError):
         try:

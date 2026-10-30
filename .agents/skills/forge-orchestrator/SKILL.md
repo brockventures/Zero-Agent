@@ -14,8 +14,8 @@ description: >-
 
 ## 1. Complexity Routing Tiers
 
-- **Tier 1 (Inline Fast-Path — `<90s`):** Single-file edits (`<50` lines), config tweaks, and targeted 1-file test runs stay inline in the current turn.
-- **Tier 2 (Single-Chunk FORGE Build — `1 Atomic PR`):** Multi-file features or refactors (`2–4` files) taking `2–15` minutes.
+- **Tier 1 (Inline Fast-Path — `<90s`):** Focused 1–3 file edits (`<150` lines), config tweaks, and targeted test runs stay inline in the current turn when files are already in context.
+- **Tier 2 (Single-Chunk FORGE Build — `1 Atomic PR`):** Multi-file features or refactors (`4+` files or iterative `>90s` TDD cycles) taking `2–15` minutes.
 - **Tier 3 (Multi-Chunk FORGE Pipeline — `N Ordered PRs`):** Cross-module architectures or new subsystems decomposed into ordered TDD chunks (`1 chunk = 1 PR`).
 - **Ad-Hoc Background Shell Jobs (`>90s`):** Long-running scripts, migrations, or sweeps run via `python3 /workspace/tools/forge.py job start --command "..."` (with `tools/detached_runner.py` retained as a backwards-compatible delegation shim).
 

@@ -47,11 +47,10 @@ python3 /workspace/tools/gemini_image.py \
   --prompt "<detailed descriptive prompt>" \
   --aspect-ratio "1:1" \
   --name "docker_lemons_meme" \
-  --channel lounge \
-  --caption "Why can't I hold all these containers?"
+  --channel lounge
 ```
 * Renders in ~5–9 seconds.
-* Automatically verifies the JPEG and delivers to Discord via `deliver_image.py`.
+* Automatically verifies the JPEG and delivers to Discord via `deliver_image.py` with zero prompt dump (omit `--caption` or pass `""` so only the clean image is uploaded; never echo the raw generation prompt into Discord).
 * Multi-model cascade fallback: `gemini-3.1-flash-image` -> `gemini-3.1-flash-image-preview` -> `gemini-2.5-flash-image`.
 
 #### Option B: Native Tool Execution (`generate_image` — Fallback)
