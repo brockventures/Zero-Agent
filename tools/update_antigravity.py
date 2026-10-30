@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
-import os, sys, json, subprocess, urllib.parse, urllib.request, tarfile, shutil
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import urllib.parse
+import urllib.request
+
+for _p in ["/workspace", "/workspace/tools"]:
+    if _p not in sys.path:
+        sys.path.append(_p)
+
 
 def get_current_version() -> str:
     try:
         out = subprocess.check_output(["agy", "--version"], stderr=subprocess.STDOUT).decode().strip()
         return out.lstrip("v")
-    except Exception as e:
+    except Exception:
         return "unknown"
+
 
 def get_latest_version() -> str:
     url = "https://github.com/google-antigravity/antigravity-cli/releases/latest"
@@ -15,19 +28,49 @@ def get_latest_version() -> str:
         tag = resp.geturl().split("/")[-1]
         return tag.lstrip("v")
 
+
 def check_updates(quiet: bool = False):
     curr = get_current_version()
     latest = get_latest_version()
-    
+
     if curr != "unknown" and latest != "unknown" and curr != latest:
-        print(f"🔔 **New Antigravity CLI Release Available!**\n")
-        print(f"• **Installed Version:** `v{curr}`")
-        print(f"• **Latest Release:** `v{latest}`")
-        print(f"• **Release Notes:** https://github.com/google-antigravity/antigravity-cli/releases/tag/{latest}\n")
-        print(f"[CHOICES: Update Antigravity to v{latest} | Skip For Now]")
+        msg_lines = [
+            "🔔 **New Antigravity CLI Release Available!**\n",
+            f"• **Installed Version:** `v{curr}`",
+            f"• **Latest Release:** `v{latest}`",
+            f"• **Release Notes:** https://github.com/google-antigravity/antigravity-cli/releases/tag/{latest}\n",
+        ]
+        msg = "\n".join(msg_lines)
+
+        decision_staged = False
+        try:
+            from tools.forge import ZERO_OPS_CHANNEL_ID, stage_decision
+
+            stage_decision(
+                category="ops_upgrade",
+                title=f"Update Antigravity CLI to v{latest}",
+                summary=(
+                    f"Antigravity CLI `v{curr}` → `v{latest}` is available. Approving downloads the release binary, "
+                    "updates the host Dockerfile, and triggers container restart."
+                ),
+                handler_type="shell",
+                payload={
+                    "command": f"python3 /workspace/tools/update_antigravity.py upgrade {latest}",
+                    "cwd": "/workspace",
+                },
+                channel_id=ZERO_OPS_CHANNEL_ID,
+                post_to_discord=True,
+            )
+            decision_staged = True
+        except Exception as e:
+            msg += f"\n[CHOICES: Update Antigravity to v{latest} | Skip For Now] ({e})"
+
+        if not (quiet and decision_staged):
+            print(msg)
     else:
         if not quiet:
             print(f"✅ **Antigravity CLI is up to date:** `v{curr}` (latest release).")
+
 
 def perform_upgrade(target_version: str = None):
     curr = get_current_version()
@@ -45,7 +88,7 @@ def perform_upgrade(target_version: str = None):
     shutil.rmtree(tmp_dir, ignore_errors=True)
     os.makedirs(tmp_dir, exist_ok=True)
 
-    arch = "x64" # Default for amd64
+    arch = "x64"  # Default for amd64
     tar_url = f"https://github.com/google-antigravity/antigravity-cli/releases/download/{target_version}/agy_cli_linux_{arch}.tar.gz"
     tar_path = os.path.join(tmp_dir, "agy.tar.gz")
 
@@ -53,7 +96,7 @@ def perform_upgrade(target_version: str = None):
         req = urllib.request.Request(tar_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as resp, open(tar_path, "wb") as f:
             f.write(resp.read())
-            
+
         with tarfile.open(tar_path, "r:gz") as tar:
             tar.extractall(path=tmp_dir)
 
@@ -79,7 +122,7 @@ def perform_upgrade(target_version: str = None):
                     break
 
         if not new_binary or not os.path.exists(new_binary):
-            print(f"❌ Error: Could not locate `agy` executable in release archive.")
+            print("❌ Error: Could not locate `agy` executable in release archive.")
             return
 
         # Verify test execution
@@ -96,6 +139,7 @@ def perform_upgrade(target_version: str = None):
 
         # Update Dockerfile on host for immutability
         try:
+
             def _resolve_nas_config():
                 ssh_port = os.environ.get("NAS_SSH_PORT") or str(49000 + 876)
                 host_1 = os.environ.get("NAS_HOST_1_IP")
@@ -128,16 +172,33 @@ def perform_upgrade(target_version: str = None):
                     if len(parts) == 4 and parts[-1] == "82":
                         host_2 = ".".join(parts[:3] + ["84"])
 
-                return host_1 or os.environ.get("NAS_HOST_1_IP", "127.0.0.1"), host_2 or os.environ.get("NAS_HOST_2_IP", "127.0.0.1"), ssh_port
+                return (
+                    host_1 or os.environ.get("NAS_HOST_1_IP", "127.0.0.1"),
+                    host_2 or os.environ.get("NAS_HOST_2_IP", "127.0.0.1"),
+                    ssh_port,
+                )
 
             _, host_2, ssh_port = _resolve_nas_config()
-            ssh_key = os.environ.get("NAS_SSH_KEY", "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519")
+            ssh_key = os.environ.get(
+                "NAS_SSH_KEY",
+                "/secrets/id_ed25519" if os.path.exists("/secrets/id_ed25519") else "/root/.ssh/id_ed25519",
+            )
             ssh_user = os.environ.get("NAS_SSH_USER", "Brock")
             host_agent_dir = os.environ.get("HOST_AGENT_DIR", "/docker/discord-agy-agent")
 
             update_dockerfile_cmd = [
-                "ssh", "-i", ssh_key, "-p", ssh_port, "-o", "BatchMode=yes", f"{ssh_user}@{host_2}",
-                f"sed -i -E 's|antigravity-cli/releases/download/[^/]+/|antigravity-cli/releases/download/{target_version}/|g' {host_agent_dir}/Dockerfile"
+                "ssh",
+                "-i",
+                ssh_key,
+                "-p",
+                ssh_port,
+                "-o",
+                "BatchMode=yes",
+                f"{ssh_user}@{host_2}",
+                (
+                    f"sed -i -E 's|antigravity-cli/releases/download/[^/]+/|antigravity-cli/releases/download/"
+                    f"{target_version}/|g' {host_agent_dir}/Dockerfile"
+                ),
             ]
             subprocess.run(update_dockerfile_cmd, timeout=5, check=True)
             print("Updated host Dockerfile with new version reference.")
@@ -146,17 +207,28 @@ def perform_upgrade(target_version: str = None):
 
         # Trigger detached restart in 3 seconds
         restart_cmd = [
-            "ssh", "-i", ssh_key, "-p", ssh_port, "-o", "BatchMode=yes", f"{ssh_user}@{host_2}",
-            "nohup sh -c 'sleep 3 && docker restart discord-antigravity-agent' >/dev/null 2>&1 &"
+            "ssh",
+            "-i",
+            ssh_key,
+            "-p",
+            ssh_port,
+            "-o",
+            "BatchMode=yes",
+            f"{ssh_user}@{host_2}",
+            "nohup sh -c 'sleep 3 && docker restart discord-antigravity-agent' >/dev/null 2>&1 &",
         ]
         subprocess.run(restart_cmd, timeout=5, check=True)
 
-        print(f"\n🚀 **Antigravity Upgraded Successfully!**\n• Version: `v{curr}` → `v{target_version}`\n• Container is restarting in 3s to load the new binary.")
+        print(
+            f"\n🚀 **Antigravity Upgraded Successfully!**\n• Version: `v{curr}` → `v{target_version}`\n"
+            "• Container is restarting in 3s to load the new binary."
+        )
 
     except Exception as e:
         print(f"❌ Upgrade failed: {e}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "check"
