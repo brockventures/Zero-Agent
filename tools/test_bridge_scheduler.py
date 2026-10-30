@@ -14,9 +14,21 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) in sys.path:
+    sys.path.remove(str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT))
 WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE))
+    sys.path.append(str(WORKSPACE))
+
+# Ensure tools.bridge_commands reflects current worktree implementation in-place
+if "tools.bridge_commands" in sys.modules:
+    wt_cmd_file = REPO_ROOT / "tools" / "bridge_commands.py"
+    if wt_cmd_file.exists():
+        with open(wt_cmd_file, "r") as f:
+            code = compile(f.read(), str(wt_cmd_file), "exec")
+        exec(code, sys.modules["tools.bridge_commands"].__dict__)
 
 import tools.bridge_scheduler as bshed
 import tools.bridge_state as bs
@@ -993,6 +1005,35 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(queued["prompt"], forge_envelope)
             self.assertEqual(queued["channel_id"], bs.TARGET_CHANNEL_ID)
             self.assertIsNone(queued["model_override"])
+
+    async def test_execute_bridge_reload_clears_pending_reload_flag_before_bot_close(self):
+        """Verify calling execute_bridge_reload() unlinks reload_bridge.flag before closing bot."""
+        from tools.bridge_commands import execute_bridge_reload
+
+        flag_path = bs.DATA_DIR / "reload_bridge.flag"
+        flag_path.write_text("pending reload")
+        self.assertTrue(flag_path.exists())
+
+        flag_state_before_bot_close = None
+        mock_bot = MagicMock()
+
+        async def fake_close():
+            nonlocal flag_state_before_bot_close
+            flag_state_before_bot_close = flag_path.exists()
+
+        mock_bot.close = AsyncMock(side_effect=fake_close)
+
+        with patch("tools.bridge_commands.DATA_DIR", bs.DATA_DIR), \
+             patch("tools.bridge_commands.record_restart_intent"), \
+             patch("tools.bridge_git_sync.sync_git_on_reload"), \
+             patch("tools.bridge_daemons.daemon_manager.shutdown_all", new_callable=AsyncMock), \
+             patch("os.execv") as mock_execv:
+            await execute_bridge_reload(bot=mock_bot, announce=False)
+
+        self.assertFalse(flag_path.exists())
+        self.assertIs(flag_state_before_bot_close, False)
+        mock_bot.close.assert_awaited_once()
+        mock_execv.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

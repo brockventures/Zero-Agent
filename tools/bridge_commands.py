@@ -27,6 +27,7 @@ from tools.bridge_formatting import parse_interactive_choices
 from tools.bridge_runner import channel_active_procs
 import tools.bridge_runner as br
 from tools.bridge_state import (
+    DATA_DIR,
     IN_FLIGHT_FILE,
     OWNER_USER_ID,
     TARGET_CHANNEL_ID,
@@ -244,6 +245,22 @@ async def execute_bridge_reload(
             IN_FLIGHT_FILE.unlink()
         except Exception:
             pass
+
+    # Clean pending reload flag so immediate reloads do not re-trigger post-turn
+    reload_flag = DATA_DIR / "reload_bridge.flag"
+    if reload_flag.exists():
+        try:
+            reload_flag.unlink()
+        except Exception:
+            pass
+    import tools.bridge_state as _bs
+    if getattr(_bs, "DATA_DIR", None) and _bs.DATA_DIR != DATA_DIR:
+        alt_reload_flag = _bs.DATA_DIR / "reload_bridge.flag"
+        if alt_reload_flag.exists():
+            try:
+                alt_reload_flag.unlink()
+            except Exception:
+                pass
 
     if bot:
         try:
