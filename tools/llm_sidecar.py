@@ -265,6 +265,98 @@ def evaluate_quant_candidates_llm(
 # ---------------------------------------------------------------------------
 # Cross-Container Ivy Brain for Fantasy Baseball Reddit Drafts (Tier 2: Argon Medium)
 # ---------------------------------------------------------------------------
+NICKNAME_MAP: dict[str, str] = {
+    "PCA": "Pete Crow-Armstrong",
+    "MIZ": "Jacob Misiorowski",
+    "ELLY": "Elly De La Cruz",
+    "EDLC": "Elly De La Cruz",
+    "JROD": "Julio Rodriguez",
+    "J-ROD": "Julio Rodriguez",
+    "CJ": "CJ Abrams",
+    "VLAD": "Vladimir Guerrero Jr.",
+    "VLADDY": "Vladimir Guerrero Jr.",
+    "ACUNA": "Ronald Acuna Jr.",
+    "TATIS": "Fernando Tatis Jr.",
+    "WITT": "Bobby Witt Jr.",
+    "CHOURIO": "Jackson Chourio",
+    "MERRILL": "Jackson Merrill",
+    "CAMINERO": "Junior Caminero",
+    "KURTZ": "Nick Kurtz",
+    "BENGE": "Carson Benge",
+    "SKUBAL": "Tarik Skubal",
+    "SKENES": "Paul Skenes",
+    "WHEELER": "Zack Wheeler",
+    "RAGANS": "Cole Ragans",
+    "CEASE": "Dylan Cease",
+    "KIRBY": "George Kirby",
+    "GILBERT": "Logan Gilbert",
+    "CROCHET": "Garrett Crochet",
+    "SCHWELLENBACH": "Spencer Schwellenbach",
+    "STRIDER": "Spencer Strider",
+    "LANGFORD": "Wyatt Langford",
+    "HOLLIDAY": "Jackson Holliday",
+    "CREWS": "Dylan Crews",
+    "JENKINS": "Walker Jenkins",
+    "MAYER": "Marcelo Mayer",
+    "ANTHONY": "Roman Anthony",
+    "CAMPBELL": "Kristian Campbell",
+    "PAINTER": "Andrew Painter",
+}
+
+
+def extract_fantasy_players(
+    text: str,
+    player_pool: list[str] | None = None,
+    allow_llm_fallback: bool = True,
+) -> list[str]:
+    """Perform fast deterministic candidate player token matching first.
+
+    Spawns the gemini-3.8-flash-low player extraction subprocess only if
+    deterministic matching finds 0 players.
+    """
+    found: list[str] = []
+    tokens = re.findall(r"\b[A-Za-z0-9\-']+\b", text)
+    for tok in tokens:
+        upper = tok.upper()
+        if upper in NICKNAME_MAP:
+            mapped = NICKNAME_MAP[upper]
+            if mapped not in found:
+                found.append(mapped)
+
+    if player_pool:
+        text_lower = text.lower()
+        for p in player_pool:
+            if p and len(p) > 2 and re.search(r"\b" + re.escape(p.lower()) + r"\b", text_lower):
+                if p not in found:
+                    found.append(p)
+
+    if found:
+        return found
+
+    if allow_llm_fallback:
+        try:
+            import subprocess
+            extract_prompt = (
+                "Extract any MLB / fantasy baseball player names mentioned in this Reddit comment.\n\n"
+                f"Comment:\n{text}\n\n"
+                "Respond ONLY with valid JSON array of player names:\n[\"Full Name 1\"]"
+            )
+            ext_res = subprocess.run(
+                ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={extract_prompt}"],
+                capture_output=True, text=True, timeout=15
+            )
+            raw = (ext_res.stdout or "").strip()
+            m = re.search(r"(\[[\s\S]*\])", raw)
+            if m:
+                parsed = json.loads(m.group(1))
+                if isinstance(parsed, list):
+                    return [str(p).strip() for p in parsed if str(p).strip()]
+        except Exception:
+            pass
+
+    return found
+
+
 def call_ivy_fantasy_brain(
     candidate: dict[str, Any],
     model: str | None = None,
@@ -460,46 +552,59 @@ try:
         else:
             r['league_val'] = roto_d
 
-    # Use LLM entity extraction grounded against the Big Board player pool
-    extract_prompt = (
-        "Extract any MLB / fantasy baseball player names or nicknames mentioned in this Reddit comment, "
-        "along with the league settings.\\n\\n"
-        f"Comment:\\n{{body}}\\n\\n"
-        "If NO specific baseball players are mentioned (e.g. 'Tommy John' refers to the surgery, not a player on their roster), "
-        "return an empty `players` list `[]`.\\n"
-        "Respond ONLY with valid JSON:\\n"
-        '{{"players": ["Full Name 1", "Full Name 2"], "teams": 12, "keepers": null, "scoring": "roto_5x5", "horizon": "redraft_or_keeper", "is_points": false, "is_dynasty": false, "is_rebuild": false, "is_contender": false}}'
-    )
-    ext_res = subprocess.run(
-        ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={{extract_prompt}}"],
-        capture_output=True, text=True, timeout=30
-    )
-    ext_raw = (ext_res.stdout or "").strip()
-    ext_match = re.search(r"(\\{{[\\s\\S]*\\}})", ext_raw)
+    # 1. Fast deterministic player token matching against NICKNAME_MAP and Big Board player pool first
     extracted_players = []
-    if ext_match:
-        try:
-            ext_json = json.loads(ext_match.group(1))
-            if isinstance(ext_json.get("players"), list):
-                extracted_players = [str(x).strip() for x in ext_json["players"] if str(x).strip()]
-            if isinstance(ext_json.get("teams"), int) and 6 <= ext_json["teams"] <= 30:
-                num_teams = ext_json["teams"]
-                league_context["teams"] = num_teams
-            if ext_json.get("keepers") is not None and isinstance(ext_json.get("keepers"), int):
-                num_keepers = ext_json["keepers"]
-                league_context["keepers_per_team"] = num_keepers
-                league_context["total_kept_pool"] = num_teams * num_keepers
-            if isinstance(ext_json.get("is_points"), bool):
-                is_points = ext_json["is_points"]
-                league_context["scoring"] = "points" if is_points else "roto_5x5"
-            if isinstance(ext_json.get("is_dynasty"), bool):
-                is_dynasty = ext_json["is_dynasty"]
-            if isinstance(ext_json.get("is_rebuild"), bool):
-                is_rebuild = ext_json["is_rebuild"]
-            if isinstance(ext_json.get("is_contender"), bool):
-                is_contender = ext_json["is_contender"]
-        except Exception:
-            pass
+    tokens = re.findall(r"\\b[A-Za-z0-9\\-']+\\b", body)
+    for tok in tokens:
+        upper = tok.upper()
+        if upper in NICKNAME_MAP and NICKNAME_MAP[upper] not in extracted_players:
+            extracted_players.append(NICKNAME_MAP[upper])
+
+    for r in all_pool:
+        p_name = r.get('player_name')
+        if p_name and len(p_name) > 3 and p_name.lower() in body_low and p_name not in extracted_players:
+            extracted_players.append(p_name)
+
+    # Spawn the gemini-3.8-flash-low player extraction subprocess ONLY if deterministic matching finds 0 players
+    if not extracted_players:
+        extract_prompt = (
+            "Extract any MLB / fantasy baseball player names or nicknames mentioned in this Reddit comment, "
+            "along with the league settings.\\n\\n"
+            f"Comment:\\n{{body}}\\n\\n"
+            "If NO specific baseball players are mentioned (e.g. 'Tommy John' refers to the surgery, not a player on their roster), "
+            "return an empty `players` list `[]`.\\n"
+            "Respond ONLY with valid JSON:\\n"
+            '{{"players": ["Full Name 1", "Full Name 2"], "teams": 12, "keepers": null, "scoring": "roto_5x5", "horizon": "redraft_or_keeper", "is_points": false, "is_dynasty": false, "is_rebuild": false, "is_contender": false}}'
+        )
+        ext_res = subprocess.run(
+            ["agy", "--model=gemini-3.8-flash-low", "--disable-slash-commands", f"-p={{extract_prompt}}"],
+            capture_output=True, text=True, timeout=30
+        )
+        ext_raw = (ext_res.stdout or "").strip()
+        ext_match = re.search(r"(\\{{[\\s\\S]*\\}})", ext_raw)
+        if ext_match:
+            try:
+                ext_json = json.loads(ext_match.group(1))
+                if isinstance(ext_json.get("players"), list):
+                    extracted_players = [str(x).strip() for x in ext_json["players"] if str(x).strip()]
+                if isinstance(ext_json.get("teams"), int) and 6 <= ext_json["teams"] <= 30:
+                    num_teams = ext_json["teams"]
+                    league_context["teams"] = num_teams
+                if ext_json.get("keepers") is not None and isinstance(ext_json.get("keepers"), int):
+                    num_keepers = ext_json["keepers"]
+                    league_context["keepers_per_team"] = num_keepers
+                    league_context["total_kept_pool"] = num_teams * num_keepers
+                if isinstance(ext_json.get("is_points"), bool):
+                    is_points = ext_json["is_points"]
+                    league_context["scoring"] = "points" if is_points else "roto_5x5"
+                if isinstance(ext_json.get("is_dynasty"), bool):
+                    is_dynasty = ext_json["is_dynasty"]
+                if isinstance(ext_json.get("is_rebuild"), bool):
+                    is_rebuild = ext_json["is_rebuild"]
+                if isinstance(ext_json.get("is_contender"), bool):
+                    is_contender = ext_json["is_contender"]
+            except Exception:
+                pass
 
     seen_fg = set()
     for tok in extracted_players:

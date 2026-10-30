@@ -11,7 +11,6 @@ import json
 import os
 import re
 import sys
-import time
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -141,6 +140,8 @@ def get_upcoming_reminders_and_renewals(now_pt: datetime, days: int = 30) -> lis
     """Dynamically pull reminders, birthdays, and anniversaries due in the next 30 days."""
     combined_items: list[tuple[date, str]] = []
     reminders_file = Path("/workspace/data/reminders.json")
+    if not reminders_file.exists():
+        reminders_file = Path(__file__).resolve().parent.parent / "data" / "reminders.json"
     if now_pt.weekday() == 6:
         start_date = (now_pt + timedelta(days=1)).date()
     else:
@@ -156,7 +157,7 @@ def get_upcoming_reminders_and_renewals(now_pt: datetime, days: int = 30) -> lis
                 rems = json.load(f)
             due_rems = [r for r in rems if today_str <= r.get("due", "") <= limit_str]
             due_rems.sort(key=lambda r: r.get("due", ""))
-            seen_gcert = False
+            seen_msgs: set[str] = set()
             for r in due_rems:
                 msg = r.get("message", "")
                 due_date = r.get("due", "")
@@ -171,20 +172,19 @@ def get_upcoming_reminders_and_renewals(now_pt: datetime, days: int = 30) -> lis
                 if re.search(r"\b(bill|bills|payment|payments|autopay|auto-pay|lease|invoice|statement)\b", msg, re.I):
                     continue
 
-                if "gcert" in msg.lower():
-                    if seen_gcert:
-                        continue
-                    seen_gcert = True
-                    combined_items.append((dt, f"• **{fmt_date}** — Work gcert (5-day renewal cadence)"))
-                elif "smartthings" in msg.lower():
-                    combined_items.append((dt, f"• **{fmt_date}** — SmartThings Z-Wave (Action required before Oct API paywall)"))
-                elif "decommission" in msg.lower():
-                    combined_items.append((dt, f"• **{fmt_date}** — Container Decommission (Decommission old Ivy containers)"))
-                elif "arr" in msg.lower():
-                    combined_items.append((dt, f"• **{fmt_date}** — Arr Postgres/IO (Socket timeout review)"))
-                else:
-                    clean_msg = re.sub(r"[#*_`~]", "", msg).split("\n")[0].strip()
-                    combined_items.append((dt, f"• **{fmt_date}** — {clean_msg[:45]}"))
+                # Clean dynamic text extraction
+                clean_msg = re.sub(r"[#*_`~]", "", msg).split("\n")[0].strip()
+                clean_msg = re.sub(r"^[^\w\s]+", "", clean_msg).strip()
+                if not clean_msg:
+                    continue
+
+                # Deduplicate identical recurring reminders
+                dedup_key = re.sub(r"\s+", " ", clean_msg.lower())
+                if dedup_key in seen_msgs:
+                    continue
+                seen_msgs.add(dedup_key)
+
+                combined_items.append((dt, f"• **{fmt_date}** — {clean_msg[:55].strip()}"))
         except Exception as e:
             print(f"[WeeklyDigest] Error reading reminders.json: {e}", file=sys.stderr)
 
@@ -200,31 +200,85 @@ def get_upcoming_reminders_and_renewals(now_pt: datetime, days: int = 30) -> lis
 
 
 def get_recent_cashflow_rows() -> list[str]:
-    """Query recent statements from Gmail or fall back to verified household recurring ledger."""
+    """Query recent statements from Actual Budget recurring transactions or Gmail fallback."""
     rows = [
         "Item           Amount   Trend ",
         "------------------------------",
     ]
     detected_items = {}
+
+    # 1. Query Actual Budget recurring transactions dynamically before Gmail fallback
     try:
-        res = json.loads(gmail_search('subject:(bill OR statement OR payment OR invoice) newer_than:35d', 10))
-        for m in res.get("messages", []):
-            subj = m.get("subject", "").lower()
-            snip = m.get("snippet", "")
-            amt_match = re.search(r"\$(\d{1,4}(?:\.\d{2})?)", snip)
-            if "famly" in m.get("from", "").lower() or "preschool" in snip.lower() or "sacc" in snip.lower():
-                amt = amt_match.group(1) if amt_match else "779.00"
-                detected_items["Preschool"] = (amt, "flat ")
-            elif "flagstar" in m.get("from", "").lower() or "mortgage" in subj:
-                detected_items["Mortgage P&I"] = ("8360.00", "flat ")
-            elif "pge" in m.get("from", "").lower() or "gas and electric" in snip.lower():
-                amt = amt_match.group(1) if amt_match else "280.00"
-                detected_items["PG&E Net"] = (amt, "solar")
-            elif "att" in m.get("from", "").lower() or "fiber" in snip.lower():
-                amt = amt_match.group(1) if amt_match else "90.36"
-                detected_items["AT&T Fiber"] = (amt, "flat ")
+        from actual import Actual
+        from actual.queries import get_schedules, get_payees
+        try:
+            import nas_config
+        except ImportError:
+            from tools import nas_config
+
+        actual_url = os.environ.get("ACTUAL_SERVER_URL", f"http://{nas_config.HOST_2_IP}:5006")
+        actual_password = os.environ.get("ACTUAL_PASSWORD", "zerobudget")
+        budget_file = os.environ.get("ACTUAL_BUDGET_FILE", "My Finances")
+
+        with Actual(base_url=actual_url, password=actual_password, file=budget_file, timeout=10.0) as actual:
+            session = actual.session
+            payees = {}
+            try:
+                payees = {p.id: p.name for p in get_payees(session)}
+            except Exception:
+                pass
+
+            schedules = get_schedules(session)
+            for sched in schedules:
+                name = getattr(sched, "name", None)
+                amt = getattr(sched, "amount", None)
+                rule = getattr(sched, "rule", None)
+                if rule and hasattr(rule, "conditions"):
+                    for cond in rule.conditions:
+                        f = getattr(cond, "field", None)
+                        val = getattr(cond, "value", None)
+                        if f == "description" and not name and val in payees:
+                            name = payees[val]
+                        elif f == "amount" and amt is None:
+                            if hasattr(val, "num1"):
+                                amt = abs(val.num1) / 100.0
+                            elif isinstance(val, (int, float)):
+                                amt = abs(val) / 100.0 if abs(val) >= 100 else abs(val)
+
+                if name and amt is not None:
+                    try:
+                        amt_f = float(amt)
+                        if isinstance(amt, int) and abs(amt) >= 100:
+                            amt_f = abs(amt) / 100.0
+                        else:
+                            amt_f = abs(amt_f)
+                        detected_items[name] = (f"{amt_f:.2f}", "flat ")
+                    except Exception:
+                        pass
     except Exception as e:
-        print(f"[WeeklyDigest] Warning querying gmail statements: {e}", file=sys.stderr)
+        print(f"[WeeklyDigest] Warning querying Actual Budget recurring transactions: {e}", file=sys.stderr)
+
+    # 2. Gmail search fallback if Actual Budget did not yield items
+    if not detected_items:
+        try:
+            res = json.loads(gmail_search('subject:(bill OR statement OR payment OR invoice) newer_than:35d', 10))
+            for m in res.get("messages", []):
+                subj = m.get("subject", "").lower()
+                snip = m.get("snippet", "")
+                amt_match = re.search(r"\$(\d{1,4}(?:\.\d{2})?)", snip)
+                if "famly" in m.get("from", "").lower() or "preschool" in snip.lower() or "sacc" in snip.lower():
+                    amt = amt_match.group(1) if amt_match else "779.00"
+                    detected_items["Preschool"] = (amt, "flat ")
+                elif "flagstar" in m.get("from", "").lower() or "mortgage" in subj:
+                    detected_items["Mortgage P&I"] = ("8360.00", "flat ")
+                elif "pge" in m.get("from", "").lower() or "gas and electric" in snip.lower():
+                    amt = amt_match.group(1) if amt_match else "280.00"
+                    detected_items["PG&E Net"] = (amt, "solar")
+                elif "att" in m.get("from", "").lower() or "fiber" in snip.lower():
+                    amt = amt_match.group(1) if amt_match else "90.36"
+                    detected_items["AT&T Fiber"] = (amt, "flat ")
+        except Exception as e:
+            print(f"[WeeklyDigest] Warning querying gmail statements: {e}", file=sys.stderr)
 
     baseline = [
         ("Kia EV9 Lease", "749.27", "flat "),
@@ -327,6 +381,23 @@ def generate_weekly_digest(now_pt: datetime | None = None) -> str:
     renewals_lines = get_upcoming_reminders_and_renewals(now_pt, days=30)
     renewals_block = "\n".join(renewals_lines) if renewals_lines else "• *No upcoming deadlines or renewals.*"
 
+    # 3. Personal Data & Gaming Profile Sync Receipt
+    sync_block = ""
+    status_file = Path("/workspace/data/sidecar_status.json")
+    if not status_file.exists():
+        status_file = Path(__file__).resolve().parent.parent / "data" / "sidecar_status.json"
+    if status_file.exists():
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                statuses = json.load(f)
+            p_sync = statuses.get("personal_data_sync", {})
+            p_summary = p_sync.get("summary") or p_sync.get("extra", {}).get("summary")
+            if p_summary:
+                compact_summary = p_summary.strip().split("\n")[0]
+                sync_block = f"\n\n🎮 **Weekly Profile Sync:** {compact_summary}"
+        except Exception as e:
+            print(f"[WeeklyDigest] Error reading sidecar_status.json: {e}", file=sys.stderr)
+
     report = f"""📊 **Weekly Household Radar**
 _{date_header}_
 
@@ -334,7 +405,7 @@ _{date_header}_
 {week_block}
 
 📅 **30-Day Lookahead & Deadlines:**
-{renewals_block}"""
+{renewals_block}{sync_block}"""
     return report
 
 

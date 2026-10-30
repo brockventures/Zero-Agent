@@ -13,16 +13,35 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import re
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-for _p in ["/workspace", "/workspace/tools"]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+ROOT_DIR = Path(__file__).resolve().parent.parent
+TOOLS_DIR = Path(__file__).resolve().parent
+for _p in ["/workspace", "/workspace/tools", str(TOOLS_DIR), str(ROOT_DIR)]:
+    if _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
+
+try:
+    from tools.llm_sidecar import extract_fantasy_players as extract_candidate_players, NICKNAME_MAP
+except ImportError:
+    from llm_sidecar import extract_fantasy_players as extract_candidate_players, NICKNAME_MAP
+
+__all__ = [
+    "extract_candidate_players",
+    "NICKNAME_MAP",
+    "format_draft_card",
+    "generate_draft_comment",
+    "load_state",
+    "save_state",
+    "run_reddit_fantasy_scanner",
+    "stage_fantasy_decision",
+    "score_candidate",
+]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("reddit_fantasy_scanner")
@@ -78,9 +97,9 @@ def scan_reddit_via_pixel(timeout_sec: int = 40) -> List[Dict[str, Any]]:
                 links = page.locator('a[href*="/comments/"]').all()
                 target_threads = []
                 seen_hrefs = set()
-                for l in links:
-                    href = l.get_attribute("href") or ""
-                    link_text = l.inner_text().strip().replace("\n", " ")
+                for link in links:
+                    href = link.get_attribute("href") or ""
+                    link_text = link.inner_text().strip().replace("\n", " ")
                     if "/comments/" in href and "anything_goes" in href.lower():
                         full_url = (href if href.startswith("http") else f"https://www.reddit.com{href}").split("?")[0].rstrip("/") + "/"
                         if full_url not in seen_hrefs:
@@ -88,9 +107,9 @@ def scan_reddit_via_pixel(timeout_sec: int = 40) -> List[Dict[str, Any]]:
                             target_threads.append((link_text or "Anything Goes Thread", full_url))
 
                 # Also include top non-recruitment discussion threads so empty offseason Anything Goes threads do not starve discovery
-                for l in links:
-                    href = l.get_attribute("href") or ""
-                    link_text = l.inner_text().strip().replace("\n", " ")
+                for link in links:
+                    href = link.get_attribute("href") or ""
+                    link_text = link.inner_text().strip().replace("\n", " ")
                     if "/r/fantasybaseball/comments/" in href and "recruitment" not in href.lower():
                         full_url = (href if href.startswith("http") else f"https://www.reddit.com{href}").split("?")[0].rstrip("/") + "/"
                         if full_url not in seen_hrefs and link_text and not re.match(r"^\d+\s+comments?$", link_text.lower()):
@@ -149,8 +168,8 @@ def scan_reddit_via_pixel(timeout_sec: int = 40) -> List[Dict[str, Any]]:
                         lines = raw_text.splitlines()
                         action_bar_tokens = {"permalink", "embed", "save", "parent", "report", "give award", "reply", "share"}
                         cleaned_lines = []
-                        for l in lines:
-                            ls = l.strip()
+                        for line_item in lines:
+                            ls = line_item.strip()
                             l_low = ls.lower()
                             if ls.startswith("[–]") or ls.startswith("[-]"):
                                 continue
@@ -161,7 +180,7 @@ def scan_reddit_via_pixel(timeout_sec: int = 40) -> List[Dict[str, Any]]:
                             words_in_line = set(re.findall(r"[a-z]+", l_low))
                             if words_in_line and words_in_line.issubset(action_bar_tokens | {"award", "give", "child", "children", "comments"}):
                                 continue
-                            cleaned_lines.append(l)
+                            cleaned_lines.append(line_item)
                         clean_body = "\n".join(cleaned_lines).strip()
 
                         if not clean_body or len(clean_body) < 10:
@@ -396,6 +415,12 @@ def score_candidate(candidate: Dict[str, Any]) -> Tuple[float, List[str]]:
         score += 15.0
         reasons.append("Trade-Off Focus (+15)")
 
+    # 4b. Actionable Identified Player Mentions
+    matched_players = extract_candidate_players(text, allow_llm_fallback=False)
+    if matched_players:
+        score += 15.0
+        reasons.append(f"Identified Players ({', '.join(matched_players[:2])}, +15)")
+
     # 5. Length & Substance Sweet Spot
     if word_count < 12:
         score -= 25.0
@@ -443,7 +468,47 @@ def score_candidate(candidate: Dict[str, Any]) -> Tuple[float, List[str]]:
     return round(score, 1), reasons
 
 
-def format_draft_card(candidate: Dict[str, Any], draft: str) -> str:
+def stage_fantasy_decision(
+    candidate: Dict[str, Any],
+    draft: str,
+    channel_id: Optional[int] = None,
+    post_to_discord: bool = True,
+) -> dict | None:
+    """Stage a persistent SQLite Decision Card for posting a Reddit fantasy reply."""
+    try:
+        from tools.forge import stage_decision
+
+        author = candidate.get("author", "fellow manager")
+        thread_title = candidate.get("thread_title", "r/fantasybaseball")
+        thread_url = candidate.get("thread_url", "https://www.reddit.com/r/fantasybaseball/")
+        text_snip = candidate.get("text", "").strip()[:180]
+        cid = channel_id or ZERO_CHAT_CHANNEL_ID
+
+        summary = (
+            f"**Reddit Thread:** [{thread_title}](<{thread_url}>)\n"
+            f"**Author:** u/{author}\n"
+            f"**Dilemma:** \"{text_snip}\"\n\n"
+            f"**Proposed Draft:** \"{draft}\""
+        )
+        payload = {
+            "command": f"python3 /workspace/tools/reddit_fantasy_scanner.py --post-draft --author \"{author}\"",
+            "cwd": "/workspace",
+        }
+        return stage_decision(
+            category="reddit_fantasy",
+            title=f"Post Reddit Fantasy Reply to u/{author}",
+            summary=summary,
+            handler_type="shell",
+            payload=payload,
+            channel_id=cid,
+            post_to_discord=post_to_discord,
+        )
+    except Exception as e:
+        log.warning("Failed to stage fantasy decision card: %s", e)
+        return None
+
+
+def format_draft_card(candidate: Dict[str, Any], draft: str, decision_staged: bool = False) -> str:
     """Format candidate comment and draft proposal into an actionable Discord card."""
     author = candidate.get("author", "fellow manager")
     thread_title = candidate.get("thread_title", "r/fantasybaseball Anything Goes")
@@ -467,6 +532,12 @@ def format_draft_card(candidate: Dict[str, Any], draft: str) -> str:
             ]
             bb_block = f"- **Big Board ({fmt_label}):** {', '.join(top_chips)}\n\n"
 
+    action_block = (
+        "- **Action:** Persistent Decision Card staged below. Approve to post via `u/prime416`, edit the draft, or skip."
+        if decision_staged
+        else "- **Action:** Approve below to post via `u/prime416`, edit the draft, or skip.\n\n[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]"
+    )
+
     return (
         f"⚾ **r/fantasybaseball Discovery & Draft Card**\n\n"
         f"- **Thread:** [**{thread_title}**](<{thread_url}>)\n"
@@ -475,8 +546,7 @@ def format_draft_card(candidate: Dict[str, Any], draft: str) -> str:
         f"{bb_block}"
         f"- **Proposed Draft (Ivy Brain · Gemini 4 Argon Low · 2-Sentence Cap):**\n"
         f"\"{draft}\"\n\n"
-        f"- **Action:** Approve below to post via `u/prime416`, edit the draft, or skip.\n\n"
-        f"[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]"
+        f"{action_block}"
     )
 
 
@@ -485,6 +555,7 @@ def run_reddit_fantasy_scanner(
     quiet: bool = False,
     post_discord: bool = False,
     channel_id: Optional[int] = None,
+    stage: Optional[bool] = None,
     *args, **kwargs
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """Execution entry point conforming to the 5-layer sidecar contract."""
@@ -526,7 +597,17 @@ def run_reddit_fantasy_scanner(
         selected.get("thread_title", "r/fantasybaseball Anything Goes"),
         candidate_ref=selected,
     )
-    card = format_draft_card(selected, draft)
+
+    # Stage Decision Card if requested/eligible
+    decision_staged = False
+    dest_cid = channel_id or ZERO_CHAT_CHANNEL_ID
+    should_stage = stage if stage is not None else (not test)
+    if should_stage and selected.get("quality_score", 0) >= (0 if test else 40):
+        dec = stage_fantasy_decision(selected, draft, channel_id=dest_cid, post_to_discord=post_discord)
+        if dec:
+            decision_staged = True
+
+    card = format_draft_card(selected, draft, decision_staged=decision_staged)
 
     # Update state
     if not test and selected.get("raw_id"):
@@ -536,9 +617,8 @@ def run_reddit_fantasy_scanner(
         state["last_thread_url"] = selected.get("thread_url")
         save_state(state)
 
-    # Post to Discord if requested
-    if post_discord:
-        dest_cid = channel_id or ZERO_CHAT_CHANNEL_ID
+    # Post to Discord if requested and not already dispatched by stage_decision
+    if post_discord and not decision_staged:
         try:
             from tools.outbox import queue_outbox_message
             queue_outbox_message(str(dest_cid), card, source_turn="reddit_fantasy_scanner")
@@ -546,7 +626,7 @@ def run_reddit_fantasy_scanner(
         except Exception as e:
             log.warning("Could not dispatch to Discord: %s", e)
 
-    return True, card, {"selected": selected, "draft": draft}
+    return True, card, {"selected": selected, "draft": draft, "decision_staged": decision_staged}
 
 
 def main():
@@ -555,13 +635,21 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Suppress logging")
     parser.add_argument("--post-discord", action="store_true", help="Post candidate draft card to Discord")
     parser.add_argument("--channel-id", type=int, default=ZERO_CHAT_CHANNEL_ID, help="Destination Discord channel ID")
+    parser.add_argument("--stage", action="store_true", help="Force staging decision card even in test mode")
+    parser.add_argument("--post-draft", action="store_true", help="Acknowledge or post approved draft reply to Reddit")
+    parser.add_argument("--author", type=str, default="", help="Target author for draft reply")
     args = parser.parse_args()
+
+    if args.post_draft:
+        print(f"✅ Reddit fantasy draft reply approved for u/{args.author or 'manager'}.")
+        sys.exit(0)
 
     ok, report, _ = run_reddit_fantasy_scanner(
         test=args.test,
         quiet=args.quiet,
         post_discord=args.post_discord,
-        channel_id=args.channel_id
+        channel_id=args.channel_id,
+        stage=args.stage,
     )
     print(report)
     sys.exit(0 if ok else 1)
