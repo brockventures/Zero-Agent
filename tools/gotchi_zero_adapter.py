@@ -1113,6 +1113,78 @@ def record_gotchi_turn_to_channels(
     }
 
 
+def _load_ha_credentials_from_env_or_secrets() -> Tuple[bool, str, str, float]:
+    """
+    Resolves `(enabled, ha_base_url, ha_access_token, timeout_s)` for Task #98.
+    Defaults strictly to `enabled=False` unless `HA_CONVERSATION_ENABLED` or
+    `GOTCHI_HA_CONVERSATION_ENABLED` is explicitly set to truthy (`1`, `true`, `yes`, `on`).
+    When enabled, loads `HA_BASE_URL` and `HA_ACCESS_TOKEN` from environment or `/secrets/env.json`.
+    """
+    raw_flag = os.environ.get(
+        "HA_CONVERSATION_ENABLED",
+        os.environ.get("GOTCHI_HA_CONVERSATION_ENABLED", ""),
+    ).strip().lower()
+    enabled = raw_flag in ("1", "true", "yes", "on")
+    base_url = os.environ.get(
+        "GOTCHI_HA_BASE_URL", os.environ.get("HA_BASE_URL", "")
+    ).strip()
+    token = os.environ.get(
+        "GOTCHI_HA_ACCESS_TOKEN", os.environ.get("HA_ACCESS_TOKEN", "")
+    ).strip()
+    try:
+        timeout_s = float(os.environ.get("GOTCHI_HA_CONVERSATION_TIMEOUT_S", "2.5") or 2.5)
+    except ValueError:
+        timeout_s = 2.5
+
+    if enabled and (not base_url or not token):
+        sec_path = Path("/secrets/env.json")
+        if sec_path.is_file():
+            try:
+                sec_data = json.loads(sec_path.read_text(encoding="utf-8"))
+                if not base_url:
+                    base_url = str(sec_data.get("HA_BASE_URL") or "").strip()
+                if not token:
+                    token = str(sec_data.get("HA_ACCESS_TOKEN") or "").strip()
+            except Exception:
+                pass
+    return enabled, base_url, token, timeout_s
+
+
+def try_ha_conversation_fastpath(
+    transcript: str,
+    *,
+    has_images: bool = False,
+    enabled: Optional[bool] = None,
+    ha_base_url: Optional[str] = None,
+    ha_access_token: Optional[str] = None,
+    timeout_s: Optional[float] = None,
+    http_poster: Optional[Callable[[str, Dict[str, str], Dict[str, Any], float], Dict[str, Any]]] = None,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Evaluates a transcribed Gotchi voice utterance against Home Assistant's local
+    `/api/conversation/process` endpoint when `HA_CONVERSATION_ENABLED` is True.
+    Falls back cleanly `(False, "", meta)` on `no_intent_matched`, vision turns, or errors.
+    """
+    from backend.llm_config import LLMConfig
+    from backend.voice_gateway import HomeAssistantConversationFastPath
+
+    env_enabled, env_url, env_token, env_timeout = _load_ha_credentials_from_env_or_secrets()
+    eff_enabled = env_enabled if enabled is None else bool(enabled)
+    eff_url = env_url if ha_base_url is None else str(ha_base_url).strip()
+    eff_token = env_token if ha_access_token is None else str(ha_access_token).strip()
+    eff_timeout = env_timeout if timeout_s is None else float(timeout_s)
+
+    cfg = LLMConfig(
+        ha_conversation_enabled=eff_enabled,
+        ha_base_url=eff_url,
+        ha_access_token=eff_token,
+        ha_conversation_timeout_s=eff_timeout,
+    )
+    fastpath = HomeAssistantConversationFastPath(llm_config=cfg, http_poster=http_poster)
+    return fastpath.try_process(transcript, has_images=has_images)
+
+
+
 class GotchiZeroBrainAdapter:
     """
     Zero Brain Adapter for Gotchi (`POST /api/voice/interact` and `/api/gotchi/brain`).
@@ -1128,6 +1200,10 @@ class GotchiZeroBrainAdapter:
         llm_caller: Optional[Callable[[Dict[str, Any]], Any]] = None,
         dispatch_discord: bool = True,
         thinking_budget: int = 0,
+        ha_conversation_enabled: Optional[bool] = None,
+        ha_base_url: Optional[str] = None,
+        ha_access_token: Optional[str] = None,
+        ha_http_poster: Optional[Callable[[str, Dict[str, str], Dict[str, Any], float], Dict[str, Any]]] = None,
     ):
         self.model = model
         self.api_key = (
@@ -1139,6 +1215,10 @@ class GotchiZeroBrainAdapter:
         self.llm_caller = llm_caller
         self.dispatch_discord = dispatch_discord
         self.thinking_budget = thinking_budget
+        self.ha_conversation_enabled = ha_conversation_enabled
+        self.ha_base_url = ha_base_url
+        self.ha_access_token = ha_access_token
+        self.ha_http_poster = ha_http_poster
         self._genai_client: Optional[Any] = None
 
     def _get_genai_client(self) -> Any:
@@ -1332,6 +1412,45 @@ class GotchiZeroBrainAdapter:
         fallback_raw = " ".join(accumulated_raw_parts).strip() or "Handled. I sent that over to Zero-Chat."
         return fallback_raw, explicitly_posted_to_zero_chat, emitted_sentences
 
+    async def _transcribe_audio_with_gemini(self, wav_bytes: bytes) -> str:
+        """
+        Transcribes raw WAV audio via Gemini multimodal (`audio/wav`) when `stt_adapter`
+        is in mock mode or returns the default placeholder (`What is the status?`).
+        """
+        from google.genai import types
+
+        client = self._get_genai_client()
+        if client is None or not wav_bytes:
+            return ""
+        try:
+            resp = await client.aio.models.generate_content(
+                model=self.model,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
+                            types.Part.from_text(
+                                text=(
+                                    "Transcribe the spoken English speech in this audio verbatim. "
+                                    "Return ONLY the spoken words (no quotes, no commentary). "
+                                    "If there is no intelligible speech, return an empty string."
+                                )
+                            ),
+                        ],
+                    )
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    thinking_config=build_thinking_config(self.model, "", step=0),
+                ),
+            )
+            return (getattr(resp, "text", None) or "").strip()
+        except Exception as exc:
+            log.warning(f"[GotchiZero] Multimodal audio transcription fallback failed: {exc}")
+            return ""
+
+
     async def handle_turn(self, parsed_turn: Dict[str, Any]) -> Dict[str, Any]:
         """
         Compatible directly with `VoiceGatewayService(turn_handler=adapter.handle_turn)`
@@ -1354,14 +1473,21 @@ class GotchiZeroBrainAdapter:
 
         has_explicit_prompt = bool(parsed_turn.get("prompt"))
         has_images = bool(image_bytes or burst_images)
+        audio_bytes: Optional[bytes] = parsed_turn.get("audio_bytes")
 
         if has_explicit_prompt:
             transcript = str(parsed_turn["prompt"]).strip()
-        elif parsed_turn.get("audio_bytes") and self.stt_adapter is not None:
+        elif audio_bytes and self.stt_adapter is not None:
             loop = asyncio.get_running_loop()
             transcript = await loop.run_in_executor(
-                None, self.stt_adapter.transcribe, parsed_turn["audio_bytes"]
+                None, self.stt_adapter.transcribe, audio_bytes
             )
+            if transcript == "What is the status?" and self.llm_caller is None:
+                mm_transcript = await self._transcribe_audio_with_gemini(audio_bytes)
+                if mm_transcript:
+                    transcript = mm_transcript
+        elif audio_bytes and self.llm_caller is None:
+            transcript = await self._transcribe_audio_with_gemini(audio_bytes) or "Status check."
         elif burst_images:
             transcript = "Analyze this 5-frame camera burst from Gotchi."
         elif image_bytes:
@@ -1374,11 +1500,16 @@ class GotchiZeroBrainAdapter:
         # Early ghost-turn short-circuit: skip LLM & Discord logging on <400ms PTT bumps
         from backend.voice_gateway import is_stt_ghost, split_into_sentences
 
+        min_voiced_ms = int(getattr(getattr(self.stt_adapter, "llm_config", None), "min_voiced_ms", 0) or 0)
+        use_silero_vad = bool(getattr(getattr(self.stt_adapter, "llm_config", None), "use_silero_vad", False))
+
         is_ghost, _reason = is_stt_ghost(
             transcript_text=transcript,
-            audio_bytes=parsed_turn.get("audio_bytes"),
+            audio_bytes=audio_bytes,
+            min_voiced_ms=min_voiced_ms,
             has_explicit_prompt=has_explicit_prompt,
             has_images=has_images,
+            use_silero_vad=use_silero_vad,
         )
         if is_ghost:
             return {
@@ -1391,7 +1522,21 @@ class GotchiZeroBrainAdapter:
 
         explicitly_posted = False
         streamed_sentences: List[str] = []
-        if self.llm_caller is not None:
+        ha_matched, ha_speech, ha_meta = await asyncio.to_thread(
+            try_ha_conversation_fastpath,
+            transcript,
+            has_images=has_images,
+            enabled=self.ha_conversation_enabled,
+            ha_base_url=self.ha_base_url,
+            ha_access_token=self.ha_access_token,
+            http_poster=self.ha_http_poster,
+        )
+        if ha_matched and ha_speech:
+            raw_reply = ha_speech
+            await self._emit_streamed_sentence(
+                ha_speech, streamed_sentences, on_sentence
+            )
+        elif self.llm_caller is not None:
             raw_res = self.llm_caller(
                 {
                     "node_id": node_id,
@@ -1455,6 +1600,8 @@ class GotchiZeroBrainAdapter:
             "sentences": sentences,
             "stt_ms": stt_ms,
             "sent_to_zero_chat": sent_to_zero_chat,
+            "ha_fastpath": bool(ha_matched and ha_speech),
+            "ha_meta": ha_meta,
         }
 
 

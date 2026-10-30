@@ -619,3 +619,85 @@ def test_gotchi_zero_adapter_end_to_end_and_channel_logging(monkeypatch, tmp_pat
     assert "https://" not in data["reply"]
     assert data["sent_to_zero_chat"] is True
     assert any("Zero-Chat" in s for s in data["sentences"])
+
+
+def test_adapter_ha_fastpath_short_circuits_llm():
+    llm_called = False
+
+    def fake_llm(_turn):
+        nonlocal llm_called
+        llm_called = True
+        return {"reply": "LLM fallback reply"}
+
+    def fake_ha_poster(url, headers, payload, timeout_s):
+        return {
+            "response": {
+                "response_type": "action_done",
+                "speech": {"plain": {"speech": "Turned on the workbench lamp."}},
+                "data": {},
+            },
+            "conversation_id": "ha-conv-1",
+        }
+
+    streamed = []
+    adapter = GotchiZeroBrainAdapter(
+        llm_caller=fake_llm,
+        dispatch_discord=False,
+        ha_conversation_enabled=True,
+        ha_base_url="http://198.51.100.10:8123",
+        ha_access_token="test-token",
+        ha_http_poster=fake_ha_poster,
+    )
+    res = asyncio.run(
+        adapter.handle_turn(
+            {
+                "node_id": "gotchi-ryan-01",
+                "session_id": "sess-ha-fast",
+                "prompt": "Turn on the workbench lamp",
+                "_on_sentence": lambda s: streamed.append(s),
+            }
+        )
+    )
+    assert res["ha_fastpath"] is True
+    assert res["reply"] == "Turned on the workbench lamp."
+    assert streamed == ["Turned on the workbench lamp."]
+    assert llm_called is False
+
+
+def test_adapter_ha_fastpath_falls_back_to_llm_on_no_intent():
+    llm_called = False
+
+    def fake_llm(_turn):
+        nonlocal llm_called
+        llm_called = True
+        return {"reply": "Zero LLM handled your general question."}
+
+    def fake_ha_poster(url, headers, payload, timeout_s):
+        return {
+            "response": {
+                "response_type": "error",
+                "speech": {"plain": {"speech": "Sorry, I couldn't understand that"}},
+                "data": {"code": "no_intent_matched"},
+            }
+        }
+
+    adapter = GotchiZeroBrainAdapter(
+        llm_caller=fake_llm,
+        dispatch_discord=False,
+        ha_conversation_enabled=True,
+        ha_base_url="http://198.51.100.10:8123",
+        ha_access_token="test-token",
+        ha_http_poster=fake_ha_poster,
+    )
+    res = asyncio.run(
+        adapter.handle_turn(
+            {
+                "node_id": "gotchi-ryan-01",
+                "session_id": "sess-ha-fallback",
+                "prompt": "What is the pinout for the MAX98357A?",
+            }
+        )
+    )
+    assert res["ha_fastpath"] is False
+    assert llm_called is True
+    assert "Zero LLM handled" in res["reply"]
