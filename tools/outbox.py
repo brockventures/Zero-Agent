@@ -30,7 +30,7 @@ KNOWN_CHANNELS = {
     "lounge": 1534452820995080192,
     "zero-chat": 1542081375287640084,
     "forge": 1562899941595160657,
-    "steam-deck": 1544953277592899615,
+    "steam-deck": 1542081375287640084,  # retired -> routed to #zero-chat
     "home-assistant": 1544953275877556334,
     "finances": 1544955532765560924,
     "homelab": 1544955535722545253,
