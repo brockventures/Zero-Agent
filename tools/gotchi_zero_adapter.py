@@ -57,10 +57,15 @@ except ImportError:
     Request = Any  # type: ignore
     JSONResponse = Any  # type: ignore
 
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+if f"{_REPO_ROOT}/gotchi" not in sys.path:
+    sys.path.insert(1, f"{_REPO_ROOT}/gotchi")
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
 if "/workspace/gotchi" not in sys.path:
-    sys.path.insert(0, "/workspace/gotchi")
+    sys.path.append("/workspace/gotchi")
 
 from tools.bridge_state import TARGET_CHANNEL_ID
 from tools.bridge_voice import (
@@ -85,7 +90,8 @@ _LOCAL_ARTIFACT_RE = re.compile(
     r"(/workspace/[^\s)>\]\"'`]+\.(?:png|jpg|jpeg|webp|gif|stl|3mf|step|pdf|svg))",
     re.IGNORECASE,
 )
-_ALLOWED_VOICE_READ_PREFIXES = ("/workspace/", "/baseball/")
+_ALLOWED_VOICE_READ_PREFIXES_DEFAULT = ("/workspace/", "/baseball/")
+_ALLOWED_VOICE_READ_PREFIXES = _ALLOWED_VOICE_READ_PREFIXES_DEFAULT
 _DENIED_VOICE_READ_BASENAMES = {
     ".env",
     ".ssh",
@@ -144,6 +150,8 @@ def is_allowed_voice_read_path(
     3. Denies `.env`, `.env.*`, `.ssh`, `secrets`, `credentials`, `token`, and SSH keys by both
        basename and path component so secrets are never read aloud over TTS.
     """
+    if allowed_prefixes is _ALLOWED_VOICE_READ_PREFIXES_DEFAULT:
+        allowed_prefixes = _ALLOWED_VOICE_READ_PREFIXES
     raw = (file_path or "").strip()
     if not raw:
         return False, "Empty file_path"
@@ -173,6 +181,163 @@ def is_allowed_voice_read_path(
                 return False, f"Denied sensitive path segment '{seg}' on voice turn"
 
     return True, resolved
+
+
+DESTRUCTIVE_COMMAND_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    # 1. File deletion / truncation
+    (
+        re.compile(r"(?<![a-zA-Z0-9_\-])(rm|rmdir|unlink|shred|truncate)\b"),
+        "File deletion or truncation command",
+    ),
+    (
+        re.compile(r"\bfind\b.*?\s-delete\b"),
+        "find with destructive -delete flag",
+    ),
+    (
+        re.compile(r"\b(os\.remove|os\.unlink|shutil\.rmtree)\b"),
+        "Destructive Python filesystem deletion",
+    ),
+    # 2. Destructive git operations
+    (
+        re.compile(r"\bgit\s+reset\b.*?\s--hard\b"),
+        "Destructive git reset --hard",
+    ),
+    (
+        re.compile(r"\bgit\s+clean\b"),
+        "Destructive git clean",
+    ),
+    (
+        re.compile(r"\bgit\s+push\b.*?\s(--force|-f|--force-with-lease)\b"),
+        "Destructive git push --force/-f",
+    ),
+    (
+        re.compile(r"\bgit\s+checkout\b.*?\s--(?:\s|$)"),
+        "Destructive git checkout -- discard",
+    ),
+    (
+        re.compile(r"\bgit\s+restore\b"),
+        "Destructive git restore",
+    ),
+    (
+        re.compile(r"\bgit\s+branch\b.*?\s-D\b"),
+        "Destructive git branch -D force deletion",
+    ),
+    (
+        re.compile(r"\bgit\s+rebase\b"),
+        "Destructive git rebase",
+    ),
+    # 3. Service / container / system power or teardown
+    (
+        re.compile(r"(?<![a-zA-Z0-9_\-])(reboot|shutdown|poweroff|halt)\b"),
+        "System power or shutdown operation",
+    ),
+    (
+        re.compile(r"\b(systemctl|service)\b.*?\b(stop|restart|disable|mask|kill)\b"),
+        "System service teardown or restart",
+    ),
+    (
+        re.compile(
+            r"\bdocker(-compose|\s+compose)?\b.*?\b(down|stop|restart|kill|rm|rmi|system\s+prune)\b"
+        ),
+        "Docker container or image teardown/prune",
+    ),
+    (
+        re.compile(r"(?<![a-zA-Z0-9_\-])(kill|pkill|killall)(?![a-zA-Z0-9_\-])"),
+        "Process termination command",
+    ),
+    # 4. Disk / permission sweeps
+    (
+        re.compile(r"(?<![a-zA-Z0-9_\-])(mkfs(\.[a-zA-Z0-9]+)?|fdisk|parted|wipefs)\b"),
+        "Disk partitioning or filesystem format command",
+    ),
+    (
+        re.compile(r"\bdd\b.*?\bif="),
+        "Raw disk writing operation (dd)",
+    ),
+    (
+        re.compile(r"\bchmod\b.*?\s-[a-zA-Z]*R[a-zA-Z]*\b"),
+        "Recursive permission modification (chmod -R)",
+    ),
+    (
+        re.compile(r"\bchown\b.*?\s-[a-zA-Z]*R[a-zA-Z]*\b"),
+        "Recursive ownership modification (chown -R)",
+    ),
+    # 5. Destructive SQL
+    (
+        re.compile(
+            r"\b(drop\s+table|drop\s+database|truncate\s+table|delete\s+from)\b",
+            re.IGNORECASE,
+        ),
+        "Destructive SQL query",
+    ),
+    # 6. Package removal
+    (
+        re.compile(r"\bapt(-get)?\b.*?\b(remove|purge)\b"),
+        "Package removal via apt/apt-get",
+    ),
+    (
+        re.compile(r"\bpip[0-9.]*\b.*?\buninstall\b"),
+        "Package uninstallation via pip",
+    ),
+    (
+        re.compile(r"\bnpm\b.*?\buninstall\b"),
+        "Package uninstallation via npm",
+    ),
+    # 7. Sensitive output redirection
+    (
+        re.compile(
+            r"(?:>+|\btee\b(?:[\s\w-]*))\s*.*?(?:\.env|\.ssh|/?secrets/|credentials|token\.json|pii_rules\.json)",
+            re.IGNORECASE,
+        ),
+        "Redirecting output to sensitive configuration or secret file",
+    ),
+)
+
+
+def is_destructive_voice_command(command: str) -> Tuple[bool, str]:
+    """
+    Evaluates whether a shell command on a voice turn is destructive or dangerous.
+    Returns (True, reason) ONLY for destructive operations (file deletion, destructive git,
+    service teardown, power off, process termination, disk formatting, destructive SQL,
+    package uninstalls, or redirects to sensitive paths).
+    Returns (False, "") for safe, non-destructive commands (e.g. git status/diff, find,
+    grep, ls, cat, curl, python3, etc.).
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return False, ""
+    for pattern, reason in DESTRUCTIVE_COMMAND_PATTERNS:
+        m = pattern.search(cmd)
+        if m:
+            return True, f"{reason}: matched '{m.group(0)}'"
+    return False, ""
+
+
+def is_destructive_voice_write(
+    file_path: str,
+    allowed_prefixes: Tuple[str, ...] = _ALLOWED_VOICE_READ_PREFIXES,
+) -> Tuple[bool, str]:
+    """
+    Evaluates whether writing to `file_path` on a voice turn is destructive or unauthorized:
+    1. If `is_allowed_voice_read_path` fails (outside allowed roots, sensitive files like .env or .ssh),
+       returns (True, reason).
+    2. If Path(resolved).exists() is True (overwriting an existing file),
+       returns (True, f"Overwriting existing file '{resolved}' requires confirmation").
+    3. If creating a new file inside an allowed root, returns (False, resolved).
+    """
+    if allowed_prefixes is _ALLOWED_VOICE_READ_PREFIXES_DEFAULT:
+        allowed_prefixes = _ALLOWED_VOICE_READ_PREFIXES
+    allowed, reason_or_resolved = is_allowed_voice_read_path(
+        file_path, allowed_prefixes=allowed_prefixes
+    )
+    if not allowed:
+        return True, reason_or_resolved
+
+    resolved = reason_or_resolved
+    if Path(resolved).exists():
+        return True, f"Overwriting existing file '{resolved}' requires confirmation"
+
+    return False, resolved
 
 
 def stage_voice_mutation_confirmation(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -615,13 +780,15 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         "Whenever a turn requires multi-step math, architecture tradeoffs, or deep root-cause debugging, call "
         "`request_deep_thinking(spoken_preamble, reason)` on Step 0 before answering so Gotchi speaks your preamble "
         "immediately while Step 1 escalates to `HIGH` thinking.\n"
-        "- VOICE MUTATION GATE & READ ALLOWLIST: On voice turns, `run_shell_command` and `write_local_file` stage a "
-        "confirmation card in `#zero-chat` before executing, and `read_local_file` is restricted to `os.path.realpath` "
-        "under `/workspace/` and `/baseball/` (denying `.env`, `.ssh`, and secrets).\n"
+        "- VOICE MUTATION GATE & READ ALLOWLIST: On voice turns, non-destructive shell commands (e.g. git status/diff, "
+        "ls, find, python3, curl) and new file writes in allowed roots run directly. Destructive shell commands (file deletion, "
+        "git reset/clean/force-push, container teardown, process kills) and file overwrites stage a confirmation card in "
+        "`#zero-chat` before executing. `read_local_file` is restricted to `os.path.realpath` under `/workspace/` and "
+        "`/baseball/` (denying `.env`, `.ssh`, and secrets).\n"
         "- Use `search_zero_memory` to search durable memory or past transcripts.\n"
         "- Use `check_tasks_and_repos` to inspect `/workspace/data/tasks.json` and open GitHub issues.\n"
-        "- Use `run_shell_command` to stage non-interactive bash commands in `/workspace` for confirmation.\n"
-        "- Use `read_local_file` and `write_local_file` to inspect or stage file updates on disk.\n"
+        "- Use `run_shell_command` to execute non-destructive commands in `/workspace` (destructive commands stage for confirmation).\n"
+        "- Use `read_local_file` and `write_local_file` to inspect or write files on disk (overwrites stage for confirmation).\n"
         "- Use `web_and_reddit_search` for live Reddit or Amazon SerpApi queries.\n"
         "- Use `get_recent_discord_context` to read recent messages across Discord channels.\n"
         "- Use `post_note_to_zero_chat` to send clickable links, notes, code blocks, local images/files (`file_path`), "
@@ -721,11 +888,12 @@ async def execute_gotchi_tool_call(
         cmd_str = str(args.get("command", "")).strip()
         if not cmd_str:
             return {"error": "Empty command"}
-        if not allow_unconfirmed_mutations:
+        destructive, reason = is_destructive_voice_command(cmd_str)
+        if destructive and not allow_unconfirmed_mutations:
             return await asyncio.to_thread(
                 stage_voice_mutation_confirmation,
                 "run_shell_command",
-                {"command": cmd_str},
+                {"command": cmd_str, "reason": reason},
             )
         try:
             res = await asyncio.to_thread(
@@ -761,16 +929,17 @@ async def execute_gotchi_tool_call(
         content = str(args.get("content", ""))
         if not fpath:
             return {"error": "Empty file_path"}
-        if not allow_unconfirmed_mutations:
+        destructive, reason_or_resolved = is_destructive_voice_write(fpath)
+        if destructive and not allow_unconfirmed_mutations:
             return await asyncio.to_thread(
                 stage_voice_mutation_confirmation,
                 "write_local_file",
-                {"file_path": fpath, "content": content},
+                {"file_path": fpath, "content": content, "reason": reason_or_resolved},
             )
         try:
-            p = Path(fpath)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content)
+            target_path = Path(reason_or_resolved if not destructive else fpath)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(content)
             return {"status": f"Successfully wrote {len(content)} chars to {fpath}"}
         except Exception as e:
             return {"error": str(e)}
@@ -1121,8 +1290,6 @@ class GotchiZeroBrainAdapter:
             for fc in step_fcalls:
                 fn_name = getattr(fc, "name", "")
                 fn_args = dict(getattr(fc, "args", {}) or {})
-                if fn_name in ("post_note_to_zero_chat", "run_shell_command", "write_local_file"):
-                    explicitly_posted_to_zero_chat = True
                 if fn_name == "request_deep_thinking":
                     model_requested_deep_thinking = True
                     preamble = str(fn_args.get("spoken_preamble", "") or "").strip()
@@ -1140,6 +1307,11 @@ class GotchiZeroBrainAdapter:
                     )
 
                 res_dict = await execute_gotchi_tool_call(fn_name, fn_args)
+                if fn_name == "post_note_to_zero_chat" or (
+                    isinstance(res_dict, dict) and res_dict.get("confirmation_required") is True
+                ):
+                    explicitly_posted_to_zero_chat = True
+
                 if (
                     isinstance(res_dict, dict)
                     and (
@@ -1295,7 +1467,6 @@ def create_zero_gotchi_app(
     `POST /api/journal/ingest`, `GET /api/voice/logs`, plus `POST /api/gotchi/brain`) wired
     directly to Zero's brain and `#gotchi-chat` transcript recorder.
     """
-    from fastapi import Request
     from fastapi.responses import JSONResponse
     from backend.live_gateway import LiveGatewayService
     from backend.llm_config import LLMConfig

