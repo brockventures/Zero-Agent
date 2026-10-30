@@ -418,7 +418,6 @@ FAMILY_CALENDARS = {
     "primary": "Ryan",
     (os.environ.get("EMILY_EMAIL") or _ENV_SECRETS.get("EMILY_EMAIL", "emily@example.com")): "Emily",
     "family05249951047154432652@group.calendar.google.com": "Family",
-    "c_f713b3055b57e1d48ca0962e78773a57b609cad582b1bf714d84b0b8c8af0e2c@group.calendar.google.com": "Roy Cloud",
 }
 
 @server.tool()
