@@ -107,6 +107,60 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
 }
 
 
+def run_morning_inbox_triage_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute morning Inbox & RCS actionable triage Decision Card workflow."""
+    from tools.sidecars import run_morning_inbox_triage_card as _fn
+    return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+
+
+def run_commute_inbox_triage_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute commute Inbox & RCS actionable triage Decision Card workflow."""
+    from tools.sidecars import run_commute_inbox_triage_card as _fn
+    return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+
+
+def run_family_calendar_radar_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute 48-hour Family Calendar & Action Radar Decision Card workflow."""
+    from tools.sidecars import run_family_calendar_radar_card as _fn
+    return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+
+
+def run_dinner_pivot_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute afternoon Dinner Defrost & Calendar Conflict Pivot Decision Card workflow."""
+    from tools.sidecars import run_dinner_pivot_card as _fn
+    return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+
+
+def run_actual_budget_anomaly_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute Actual Budget Anomaly & Overspend Detection Decision Card workflow."""
+    from tools.sidecars import run_actual_budget_anomaly_card as _fn
+    return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+
+
+def run_weather_energy_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute morning Weather, Air Quality & Pre-Adjustment Energy Decision Card workflow."""
+    from tools.sidecars import run_weather_energy_card as _fn
+    return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+
+
+def run_midweek_grocery_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute Wednesday Mid-Week Staple & Voice Grocery Replenishment Decision Card workflow."""
+    from tools.sidecars import run_midweek_grocery_card as _fn
+    return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+
+
+def run_evening_pm_build_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute evening PM Hobby & Build Decision Card workflow."""
+    from tools.sidecars import run_evening_pm_build_card as _fn
+    return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+
+
+def run_usage_telemetry_audit(days: int | float = 7, dry_run: bool = False, test: bool = False, post_cards: bool = True) -> tuple[bool, str, dict]:
+    """Execute weekly Usage Pattern & Signal-to-Noise Telemetry Engine audit."""
+    from tools.sidecars import run_usage_telemetry_audit as _fn
+    return _fn(days=days, dry_run=dry_run, test=test, post_cards=post_cards)
+
+
 async def dispatch_scheduled_prompt(
     prompt: str,
     job_name: str = "Sidecar",
@@ -196,6 +250,168 @@ async def dispatch_scheduled_prompt(
                 ch = await get_dest_channel()
                 if ch:
                     await ch.send(f"⚠️ **Daily Session Rollover Error**: {e}")
+        return
+
+    # Morning Inbox & RCS Triage Decision Card
+    if job_id == "morning_inbox_triage_card" or "morning_inbox_triage_card" in prompt or job_name == "Morning Inbox & RCS Triage Card":
+        try:
+            from tools.sidecars import run_morning_inbox_triage_card
+            ok, rep, details = await _run_sidecar_job_async("morning_inbox_triage_card", "Morning Inbox & RCS Triage Card", run_morning_inbox_triage_card)
+            staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
+            if staged > 0:
+                print(f"[Scheduler] Morning inbox triage card staged {staged} cards.")
+            else:
+                print("[Scheduler] Morning inbox triage card checked: nominal (0 actionable items).")
+            if not ok and rep and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(rep)
+        except Exception as e:
+            print(f"[Scheduler] Morning inbox triage card execution error: {e}")
+        return
+
+    # Commute Inbox & RCS Triage Decision Card
+    if job_id == "commute_inbox_triage_card" or "commute_inbox_triage_card" in prompt or job_name == "Commute Inbox & RCS Triage Card":
+        try:
+            from tools.sidecars import run_commute_inbox_triage_card
+            ok, rep, details = await _run_sidecar_job_async("commute_inbox_triage_card", "Commute Inbox & RCS Triage Card", run_commute_inbox_triage_card)
+            staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
+            if staged > 0:
+                print(f"[Scheduler] Commute inbox triage card staged {staged} cards.")
+            else:
+                print("[Scheduler] Commute inbox triage card checked: nominal (0 actionable items).")
+            if not ok and rep and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(rep)
+        except Exception as e:
+            print(f"[Scheduler] Commute inbox triage card execution error: {e}")
+        return
+
+    # 48h Family Calendar Radar Card
+    if job_id == "family_calendar_radar_card" or "family_calendar_radar_card" in prompt or job_name == "48h Family Calendar Radar Card":
+        try:
+            from tools.sidecars import run_family_calendar_radar_card
+            ok, rep, details = await _run_sidecar_job_async("family_calendar_radar_card", "48h Family Calendar Radar Card", run_family_calendar_radar_card)
+            staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
+            if staged > 0:
+                print(f"[Scheduler] Family calendar radar card staged {staged} cards.")
+            else:
+                print("[Scheduler] Family calendar radar card checked: nominal (0 actionable items).")
+            if not ok and rep and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(rep)
+        except Exception as e:
+            print(f"[Scheduler] Family calendar radar card execution error: {e}")
+        return
+
+    # Afternoon Dinner Pivot Card
+    if job_id == "dinner_pivot_card" or "dinner_pivot_card" in prompt or job_name == "Afternoon Dinner Pivot Card":
+        try:
+            from tools.sidecars import run_dinner_pivot_card
+            ok, rep, details = await _run_sidecar_job_async("dinner_pivot_card", "Afternoon Dinner Pivot Card", run_dinner_pivot_card)
+            staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
+            if staged > 0:
+                print(f"[Scheduler] Dinner pivot card staged {staged} cards.")
+            else:
+                print("[Scheduler] Dinner pivot card checked: nominal (0 actionable items).")
+            if not ok and rep and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(rep)
+        except Exception as e:
+            print(f"[Scheduler] Dinner pivot card execution error: {e}")
+        return
+
+    # Actual Budget Anomaly Card
+    if job_id == "actual_budget_anomaly_card" or "actual_budget_anomaly_card" in prompt or job_name == "Actual Budget Anomaly Card":
+        try:
+            from tools.sidecars import run_actual_budget_anomaly_card
+            ok, rep, details = await _run_sidecar_job_async("actual_budget_anomaly_card", "Actual Budget Anomaly Card", run_actual_budget_anomaly_card)
+            staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
+            if staged > 0:
+                print(f"[Scheduler] Actual budget anomaly card staged {staged} cards.")
+            else:
+                print("[Scheduler] Actual budget anomaly card checked: nominal (0 actionable items).")
+            if not ok and rep and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(rep)
+        except Exception as e:
+            print(f"[Scheduler] Actual budget anomaly card execution error: {e}")
+        return
+
+    # Weather & Energy Pre-Adjustment Card
+    if job_id == "weather_energy_card" or "weather_energy_card" in prompt or job_name == "Weather & Energy Pre-Adjustment Card":
+        try:
+            from tools.sidecars import run_weather_energy_card
+            ok, rep, details = await _run_sidecar_job_async("weather_energy_card", "Weather & Energy Pre-Adjustment Card", run_weather_energy_card)
+            staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
+            if staged > 0:
+                print(f"[Scheduler] Weather energy card staged {staged} cards.")
+            else:
+                print("[Scheduler] Weather energy card checked: nominal (0 actionable items).")
+            if not ok and rep and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(rep)
+        except Exception as e:
+            print(f"[Scheduler] Weather energy card execution error: {e}")
+        return
+
+    # Mid-Week Staple & Voice Grocery Card
+    if job_id == "midweek_grocery_card" or "midweek_grocery_card" in prompt or job_name == "Mid-Week Staple & Voice Grocery Card":
+        try:
+            from tools.sidecars import run_midweek_grocery_card
+            ok, rep, details = await _run_sidecar_job_async("midweek_grocery_card", "Mid-Week Staple & Voice Grocery Card", run_midweek_grocery_card)
+            staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
+            if staged > 0:
+                print(f"[Scheduler] Midweek grocery card staged {staged} cards.")
+            else:
+                print("[Scheduler] Midweek grocery card checked: nominal (0 actionable items).")
+            if not ok and rep and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(rep)
+        except Exception as e:
+            print(f"[Scheduler] Midweek grocery card execution error: {e}")
+        return
+
+    # Evening PM Hobby Build Card
+    if job_id == "evening_pm_build_card" or "evening_pm_build_card" in prompt or job_name == "Evening PM Hobby Build Card":
+        try:
+            from tools.sidecars import run_evening_pm_build_card
+            ok, rep, details = await _run_sidecar_job_async("evening_pm_build_card", "Evening PM Hobby Build Card", run_evening_pm_build_card)
+            staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
+            if staged > 0:
+                print(f"[Scheduler] Evening PM build card staged {staged} cards.")
+            else:
+                print("[Scheduler] Evening PM build card checked: nominal (0 actionable items).")
+            if not ok and rep and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(rep)
+        except Exception as e:
+            print(f"[Scheduler] Evening PM build card execution error: {e}")
+        return
+
+    # Usage Pattern & Signal-to-Noise Telemetry Audit
+    if job_id == "usage_telemetry_audit" or "usage_telemetry_audit" in prompt or job_name == "Usage Pattern & Signal-to-Noise Telemetry Audit":
+        try:
+            from tools.sidecars import run_usage_telemetry_audit
+            ok, rep, details = await _run_sidecar_job_async("usage_telemetry_audit", "Usage Pattern & Signal-to-Noise Telemetry Audit", run_usage_telemetry_audit)
+            staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
+            if staged > 0:
+                print(f"[Scheduler] Usage telemetry audit staged {staged} self-tuning cards.")
+            else:
+                print("[Scheduler] Usage telemetry audit completed: nominal (0 self-tuning recommendations).")
+            if not ok and rep and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(rep)
+        except Exception as e:
+            print(f"[Scheduler] Usage telemetry audit execution error: {e}")
         return
 
     # Heartbeat sweep: silent execution unless degraded
@@ -290,7 +506,7 @@ async def dispatch_scheduled_prompt(
                 # Nominal state: Crisp 1-line confirmation (or silent if empty)
                 if rep and bot and ch:
                     await ch.send(rep)
-                print(f"[Scheduler] NAS log review: 0 actionable errors across all containers (nominal).")
+                print("[Scheduler] NAS log review: 0 actionable errors across all containers (nominal).")
                 return
 
             # Candidate issues flagged: hand off to Zero for autonomous forensic investigation & safe remediation
@@ -1461,7 +1677,7 @@ class BridgeScheduler:
                     from tools.bridge_state import update_gateway_heartbeat
                     gw_status = "connected" if (self.bot and getattr(self.bot, "is_ready", lambda: False)()) else "disconnected"
                     update_gateway_heartbeat(self.bot, status=gw_status)
-                except Exception as he:
+                except Exception:
                     pass
 
                 # Autonomous Subprocess Watchdog & Reaper
@@ -1484,7 +1700,7 @@ class BridgeScheduler:
                     except Exception:
                         pass
                     reap_stale_agy_processes(allowed_active_pids=allowed_pids)
-                except Exception as re_err:
+                except Exception:
                     pass
 
                 # Liveness Beacon & Wedge Check (Scheduler Pattern: >420s unbroken silence while PROCESSING)

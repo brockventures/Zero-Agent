@@ -118,6 +118,51 @@ run_sidecar_job("unregistered_ghost_job", "Ghost", lambda: (True, ""))
         finally:
             sa.SIDECARS_FILE = orig_sidecars
 
+    def test_nine_workday_proactive_decision_card_sidecars(self):
+        """Assert all 9 workday proactive decision card sidecars pass 5-layer audit."""
+        repo_root = Path(__file__).resolve().parent.parent
+        sched_file = repo_root / "data" / "schedule.json"
+        sidecars_file = repo_root / "tools" / "sidecars.py"
+        commands_file = repo_root / "tools" / "bridge_commands.py"
+
+        orig_schedule = sa.SCHEDULE_FILE
+        orig_sidecars = sa.SIDECARS_FILE
+        orig_commands = sa.COMMANDS_FILE
+        try:
+            sa.SCHEDULE_FILE = sched_file
+            sa.SIDECARS_FILE = sidecars_file
+            sa.COMMANDS_FILE = commands_file
+
+            ok, results, collisions, orphans = sa.audit_sidecars(check_orphans=True)
+
+            expected_jobs = [
+                "morning_inbox_triage_card",
+                "commute_inbox_triage_card",
+                "family_calendar_radar_card",
+                "dinner_pivot_card",
+                "actual_budget_anomaly_card",
+                "weather_energy_card",
+                "midweek_grocery_card",
+                "evening_pm_build_card",
+                "usage_telemetry_audit",
+            ]
+
+            self.assertTrue(ok, f"Sidecar audit reported failures: {[r for r in results if r['status'] == 'FAIL']}")
+            self.assertEqual(len(collisions), 0, f"Unexpected schedule collisions: {collisions}")
+            self.assertEqual(len(orphans), 0, f"Unexpected orphaned sidecars: {orphans}")
+
+            result_map = {r["id"]: r for r in results}
+            for jid in expected_jobs:
+                self.assertIn(jid, result_map, f"Expected job {jid} missing from audit results")
+                r = result_map[jid]
+                self.assertEqual(r["status"], "PASS", f"Job {jid} did not pass: issues={r['issues']}, warnings={r['warnings']}")
+                self.assertEqual(len(r["issues"]), 0, f"Job {jid} had issues: {r['issues']}")
+                self.assertEqual(len(r["warnings"]), 0, f"Job {jid} had warnings: {r['warnings']}")
+        finally:
+            sa.SCHEDULE_FILE = orig_schedule
+            sa.SIDECARS_FILE = orig_sidecars
+            sa.COMMANDS_FILE = orig_commands
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1643,6 +1643,99 @@ def run_weekly_proactive_digest() -> tuple[bool, str]:
         return False, f"⚠️ Weekly proactive digest failed: {e}"
 
 
+# --------------------------------------------------------------------------
+# Workday Proactive Decision Cards & Self-Tuning Telemetry Engine Runners
+# --------------------------------------------------------------------------
+def run_morning_inbox_triage_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute morning Inbox & RCS actionable triage Decision Card workflow."""
+    try:
+        from tools.proactive_decision_cards import run_inbox_rcs_action_triage_card
+        return run_inbox_rcs_action_triage_card(slot="morning", dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+    except Exception as e:
+        log.error(f"Morning inbox triage card failed: {e}", exc_info=True)
+        return False, f"⚠️ Morning inbox triage card error: {e}", {"error": str(e)}
+
+
+def run_commute_inbox_triage_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute commute Inbox & RCS actionable triage Decision Card workflow."""
+    try:
+        from tools.proactive_decision_cards import run_inbox_rcs_action_triage_card
+        return run_inbox_rcs_action_triage_card(slot="commute", dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+    except Exception as e:
+        log.error(f"Commute inbox triage card failed: {e}", exc_info=True)
+        return False, f"⚠️ Commute inbox triage card error: {e}", {"error": str(e)}
+
+
+def run_family_calendar_radar_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute 48-hour Family Calendar & Action Radar Decision Card workflow."""
+    try:
+        from tools.proactive_decision_cards import run_family_calendar_radar_card as _run_radar
+        return _run_radar(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+    except Exception as e:
+        log.error(f"Family calendar radar card failed: {e}", exc_info=True)
+        return False, f"⚠️ Family calendar radar card error: {e}", {"error": str(e)}
+
+
+def run_dinner_pivot_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute afternoon Dinner Defrost & Calendar Conflict Pivot Decision Card workflow."""
+    try:
+        from tools.proactive_decision_cards import run_dinner_pivot_card as _run_pivot
+        return _run_pivot(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+    except Exception as e:
+        log.error(f"Dinner pivot card failed: {e}", exc_info=True)
+        return False, f"⚠️ Dinner pivot card error: {e}", {"error": str(e)}
+
+
+def run_actual_budget_anomaly_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute Actual Budget Anomaly & Overspend Detection Decision Card workflow."""
+    try:
+        from tools.proactive_decision_cards import run_actual_budget_anomaly_card as _run_budget
+        return _run_budget(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+    except Exception as e:
+        log.error(f"Actual budget anomaly card failed: {e}", exc_info=True)
+        return False, f"⚠️ Actual budget anomaly card error: {e}", {"error": str(e)}
+
+
+def run_weather_energy_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute morning Weather, Air Quality & Pre-Adjustment Energy Decision Card workflow."""
+    try:
+        from tools.proactive_decision_cards import run_weather_energy_card as _run_weather
+        return _run_weather(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+    except Exception as e:
+        log.error(f"Weather energy card failed: {e}", exc_info=True)
+        return False, f"⚠️ Weather energy card error: {e}", {"error": str(e)}
+
+
+def run_midweek_grocery_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute Wednesday Mid-Week Staple & Voice Grocery Replenishment Decision Card workflow."""
+    try:
+        from tools.proactive_decision_cards import run_midweek_grocery_card as _run_midweek
+        return _run_midweek(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+    except Exception as e:
+        log.error(f"Midweek grocery card failed: {e}", exc_info=True)
+        return False, f"⚠️ Midweek grocery card error: {e}", {"error": str(e)}
+
+
+def run_evening_pm_build_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
+    """Execute evening PM Hobby & Build Decision Card workflow."""
+    try:
+        from tools.proactive_decision_cards import run_evening_pm_build_card as _run_pm
+        return _run_pm(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
+    except Exception as e:
+        log.error(f"Evening PM build card failed: {e}", exc_info=True)
+        return False, f"⚠️ Evening PM build card error: {e}", {"error": str(e)}
+
+
+def run_usage_telemetry_audit(days: int | float = 7, dry_run: bool = False, test: bool = False, post_cards: bool = True) -> tuple[bool, str, dict]:
+    """Execute weekly Usage Pattern & Signal-to-Noise Telemetry Engine audit."""
+    try:
+        from tools.usage_telemetry import run_usage_telemetry_audit as _run_audit
+        return _run_audit(days=days, dry_run=dry_run, test=test, post_cards=post_cards)
+    except Exception as e:
+        log.error(f"Usage telemetry audit failed: {e}", exc_info=True)
+        return False, f"⚠️ Usage telemetry audit error: {e}", {"error": str(e)}
+
+
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "heartbeat"
     if action in ("cubs", "cubs_game", "cubs_notifier"):
@@ -2007,6 +2100,60 @@ if __name__ == "__main__":
             post_discord=not no_post,
             force=force,
         )
+        if rep:
+            print(rep)
+    elif action in ("morning_inbox_triage_card", "morning_inbox_triage"):
+        dry_run = "--dry-run" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("morning_inbox_triage_card", "Morning Inbox & RCS Triage Card", run_morning_inbox_triage_card, dry_run=dry_run, test=test)
+        if rep:
+            print(rep)
+    elif action in ("commute_inbox_triage_card", "commute_inbox_triage"):
+        dry_run = "--dry-run" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("commute_inbox_triage_card", "Commute Inbox & RCS Triage Card", run_commute_inbox_triage_card, dry_run=dry_run, test=test)
+        if rep:
+            print(rep)
+    elif action in ("family_calendar_radar_card", "family_calendar_radar"):
+        dry_run = "--dry-run" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("family_calendar_radar_card", "48h Family Calendar Radar Card", run_family_calendar_radar_card, dry_run=dry_run, test=test)
+        if rep:
+            print(rep)
+    elif action in ("dinner_pivot_card", "dinner_pivot"):
+        dry_run = "--dry-run" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("dinner_pivot_card", "Afternoon Dinner Pivot Card", run_dinner_pivot_card, dry_run=dry_run, test=test)
+        if rep:
+            print(rep)
+    elif action in ("actual_budget_anomaly_card", "budget_anomaly_card"):
+        dry_run = "--dry-run" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("actual_budget_anomaly_card", "Actual Budget Anomaly Card", run_actual_budget_anomaly_card, dry_run=dry_run, test=test)
+        if rep:
+            print(rep)
+    elif action in ("weather_energy_card", "weather_energy"):
+        dry_run = "--dry-run" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("weather_energy_card", "Weather & Energy Pre-Adjustment Card", run_weather_energy_card, dry_run=dry_run, test=test)
+        if rep:
+            print(rep)
+    elif action in ("midweek_grocery_card", "midweek_grocery"):
+        dry_run = "--dry-run" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("midweek_grocery_card", "Mid-Week Staple & Voice Grocery Card", run_midweek_grocery_card, dry_run=dry_run, test=test)
+        if rep:
+            print(rep)
+    elif action in ("evening_pm_build_card", "evening_pm_build"):
+        dry_run = "--dry-run" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("evening_pm_build_card", "Evening PM Hobby Build Card", run_evening_pm_build_card, dry_run=dry_run, test=test)
+        if rep:
+            print(rep)
+    elif action in ("usage_telemetry_audit", "usage_telemetry"):
+        dry_run = "--dry-run" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        ok, rep, _ = run_sidecar_job("usage_telemetry_audit", "Usage Pattern & Signal-to-Noise Telemetry Audit", run_usage_telemetry_audit, dry_run=dry_run, test=test)
         if rep:
             print(rep)
     elif action == "status":

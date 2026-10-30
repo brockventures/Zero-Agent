@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import discord
 
@@ -159,6 +159,15 @@ ON_DEMAND_TRIGGERS: dict[str, str] = {
     "/context_digest": "Send and auto-archive the Zero & Ivy daily context digest email using /workspace/tools/sidecars.py context_digest.",
     "/resident_agents": "Run the r/ResidentAgents subreddit watcher and auto-approver using /workspace/tools/sidecars.py resident_agents_watcher.",
     "/resident_agents_tip": "Run the daily r/ResidentAgents Tips and Tricks Megathread rotation prompt using /workspace/tools/sidecars.py resident_agents_daily_tip --force.",
+    "/morning_inbox_triage_card": "Run the morning Inbox & RCS actionable triage Decision Card workflow using /workspace/tools/sidecars.py morning_inbox_triage_card.",
+    "/commute_inbox_triage_card": "Run the commute Inbox & RCS actionable triage Decision Card workflow using /workspace/tools/sidecars.py commute_inbox_triage_card.",
+    "/family_calendar_radar_card": "Run the 48h Family Calendar & Action Radar Decision Card workflow using /workspace/tools/sidecars.py family_calendar_radar_card.",
+    "/dinner_pivot_card": "Run the afternoon Dinner Defrost & Calendar Conflict Pivot Decision Card workflow using /workspace/tools/sidecars.py dinner_pivot_card.",
+    "/actual_budget_anomaly_card": "Run the Actual Budget Anomaly & Overspend Detection Decision Card workflow using /workspace/tools/sidecars.py actual_budget_anomaly_card.",
+    "/weather_energy_card": "Run the morning Weather, Air Quality & Pre-Adjustment Energy Decision Card workflow using /workspace/tools/sidecars.py weather_energy_card.",
+    "/midweek_grocery_card": "Run the Wednesday Mid-Week Staple & Voice Grocery Replenishment Decision Card workflow using /workspace/tools/sidecars.py midweek_grocery_card.",
+    "/evening_pm_build_card": "Run the evening PM Hobby & Build Decision Card workflow using /workspace/tools/sidecars.py evening_pm_build_card.",
+    "/usage_telemetry_audit": "Run the weekly Usage Pattern & Signal-to-Noise Telemetry Engine audit using /workspace/tools/sidecars.py usage_telemetry_audit.",
 }
 
 
