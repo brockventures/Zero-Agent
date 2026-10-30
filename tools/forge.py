@@ -2375,14 +2375,40 @@ def prune_completed_build_widgets(
     return all_pruned
 
 
+def _is_explicit_approval_prompt(prompt_text: str) -> bool:
+    """Return True if prompt_text matches an explicit approval/enqueue directive."""
+    if not prompt_text:
+        return False
+    pt = prompt_text.strip().lower()
+    directives = (
+        "queue fix",
+        "queue build",
+        "queue this",
+        "queue plan",
+        "approve",
+        "approved",
+        "ship it",
+        "do it",
+        "fix it",
+        "go ahead",
+        "proceed",
+        "lgtm",
+    )
+    return any(d in pt for d in directives)
+
+
 def evaluate_plan_approval_gate(
     plan: dict,
     batch_state_path: Path | str = "/tmp/batch_guard_state.json",
+    in_flight_path: Path | str = DATA_DIR / "in_flight_turn.json",
 ) -> tuple[bool, list[str]]:
     """Evaluate whether a ForgePlan requires an interactive Approve | Edit | Dismiss Decision Card before execution.
 
     Thresholds:
     - Auto-Execute Immediately (Fast Tier 2): 1 chunk, <=3 target files, touches_core_bridge=False, no >90s calibration pass.
+    - Explicit Bypass:
+      1. plan['approved'] is True or plan['skip_approval'] is True.
+      2. Active in-flight turn prompt matches an explicit approval/enqueue directive (e.g. 'queue fix', 'approve', 'ship it', 'do it', 'fix it').
     - Require Approval (Stage Decision Card):
       1. Multi-chunk pipeline (>=2 chunks or tier >= 3).
       2. Wide blast radius (>=4 distinct target files across chunks) or touches_core_bridge=True.
@@ -2390,6 +2416,29 @@ def evaluate_plan_approval_gate(
     """
     if plan.get("approved") is True or plan.get("skip_approval") is True:
         return False, []
+
+    # Check for explicit approval directive in active in_flight_turn.json
+    try:
+        ifp = Path(in_flight_path)
+        if ifp.exists():
+            st_raw = ifp.read_text(encoding="utf-8")
+            if_data = json.loads(st_raw) if st_raw.strip() else {}
+            if isinstance(if_data, dict):
+                prompts_to_check: list[str] = []
+                target_cid = str(plan.get("origin_thread_id") or plan.get("origin_channel_id") or "")
+                if target_cid and isinstance(if_data.get(target_cid), dict):
+                    prompts_to_check.append(str(if_data[target_cid].get("prompt") or ""))
+                if if_data.get("prompt"):
+                    prompts_to_check.append(str(if_data["prompt"]))
+                for k, v in if_data.items():
+                    if isinstance(v, dict) and v.get("prompt"):
+                        prompts_to_check.append(str(v["prompt"]))
+
+                for p in prompts_to_check:
+                    if _is_explicit_approval_prompt(p):
+                        return False, []
+    except Exception:
+        pass
 
     reasons: list[str] = []
     if plan.get("requires_approval") is True:
@@ -2476,19 +2525,15 @@ def stage_plan_approval_decision(
         chunk_bullets.append(f"  - **Chunk {idx + 1}:** {ch['title'].strip()} ({files_str})")
 
     objective = str(plan.get("objective") or plan["title"]).strip()
-    summary_lines = [
-        f"**Objective:** {objective}",
-        f"**Gate Trigger:** {'; '.join(reasons)}",
-        f"**Scope:** {len(chunks)} chunk(s) across {len(all_files)} target file(s):",
-        *chunk_bullets[:6],
-        "Tap **Approve** to enqueue and launch isolated `#forge` worktree workers.",
-    ]
+    summary_lines = [objective]
+    if chunk_bullets:
+        summary_lines.extend(chunk_bullets[:6])
     summary_text = "\n".join(summary_lines)
     target_ch = int(plan.get("origin_thread_id") or plan["origin_channel_id"])
 
     dec = stage_decision(
         category="forge",
-        title=f"FORGE Build Plan: {plan['title'].strip()[:85]}",
+        title=plan["title"].strip()[:100],
         summary=summary_text,
         handler_type="forge_enqueue",
         payload={
@@ -2522,6 +2567,7 @@ def enqueue_build(
     allow_overlap: bool = False,
     check_approval_gate: bool = False,
     batch_state_path: Path | str = "/tmp/batch_guard_state.json",
+    in_flight_path: Path | str = DATA_DIR / "in_flight_turn.json",
 ) -> dict:
     """Validate and enqueue a multi-chunk FORGE build plan with pre-enqueue target-file overlap deduplication and complexity approval gate."""
     valid, reason = validate_forge_plan(plan)
@@ -2529,7 +2575,11 @@ def enqueue_build(
         raise ValueError(f"Invalid ForgePlan: {reason}")
 
     if check_approval_gate:
-        needs_approval, gate_reasons = evaluate_plan_approval_gate(plan, batch_state_path=batch_state_path)
+        needs_approval, gate_reasons = evaluate_plan_approval_gate(
+            plan,
+            batch_state_path=batch_state_path,
+            in_flight_path=in_flight_path,
+        )
         if needs_approval:
             return stage_plan_approval_decision(
                 plan,
@@ -3059,8 +3109,8 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
         try:
             stage_decision(
                 category="bridge_reload",
-                title=f"Reload Bridge After Build {build_id}",
-                summary=f"FORGE build `{build_id}` (**{build['title']}**) modified core bridge files (`touches_core_bridge=true`). Approve to trigger an in-place bridge reload.",
+                title=f"Reload Bridge ({build_id})",
+                summary=f"Build `{build_id}` ({build['title']}) modified bridge infrastructure. Reload bridge in-place.",
                 handler_type="bridge_reload",
                 payload={"build_id": build_id, "reason": f"FORGE build {build_id} ({build['title']})"},
                 channel_id=int(target_ch),
@@ -3113,9 +3163,12 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
         except Exception as e:
             print(f"[FORGE] consolidate_legacy_forge_db error: {e}", file=sys.stderr)
 
-    active_build_ids = _get_active_build_worker_ids(db_path)
+    active_build_ids = _get_active_build_worker_ids(db_path) | _get_active_build_worker_ids(FORGE_DB_PATH)
     cleaned_wts = []
+    cur_cwd = os.getcwd()
     for wt_path in glob.glob("/tmp/forge-wt-*"):
+        if wt_path == cur_cwd or cur_cwd.startswith(wt_path.rstrip("/") + "/"):
+            continue
         wt_base = os.path.basename(wt_path)
         if any(wt_base.startswith(f"forge-wt-{bid}-") for bid in active_build_ids):
             continue
@@ -4971,44 +5024,93 @@ def stage_decision(
     }
 
 
-def format_decision_card_text(decision: sqlite3.Row | dict) -> str:
-    """Format the Discord markdown text for a staged Decision Card."""
-    status = decision["status"]
-    cat = str(decision["category"]).upper()
+def render_decision_card_embed(decision: sqlite3.Row | dict) -> dict:
+    """Render a staged Decision Card as a native Discord Embed dictionary."""
+    status = (decision.get("status") if isinstance(decision, dict) else decision["status"]) or "pending"
+    cat = str((decision.get("category") if isinstance(decision, dict) else decision["category"]) or "FORGE").upper()
+    title = str((decision.get("title") if isinstance(decision, dict) else decision["title"]) or "").strip()
+    summary = str((decision.get("summary") if isinstance(decision, dict) else decision["summary"]) or "").strip()
+    receipt = (decision.get("receipt_text") if isinstance(decision, dict) else decision["receipt_text"]) or ""
+
     if status == "pending":
-        exp_str = _now_pt_str(decision["expires_at"])
-        return (
-            f"### 🛡️ Decision Required [{cat}]: {decision['title']}\n"
-            f"{decision['summary']}\n"
-            f"- **ID:** `{decision['id']}` | **Handler:** `{decision['handler_type']}` | **Expires:** {exp_str}"
-        )
+        exp = decision.get("expires_at") if isinstance(decision, dict) else decision["expires_at"]
+        exp_str = _now_pt_str(exp) if exp else "in 2 hours"
+        return {
+            "title": f"🛡️ {title}",
+            "description": summary,
+            "color": 0xF59E0B,
+            "footer": {"text": f"{cat} · Expires {exp_str}"},
+        }
     if status in ("approved", "edited_approved"):
-        res_str = _now_pt_str(decision["resolved_at"] or time.time())
         label = "Approved & Executed (Edited)" if status == "edited_approved" else "Approved & Executed"
-        receipt = f"\n- **Receipt:** {decision['receipt_text']}" if decision["receipt_text"] else ""
-        return (
-            f"### ✅ {label} [{cat}]: {decision['title']}\n"
-            f"{decision['summary']}\n"
-            f"- **ID:** `{decision['id']}` | **Resolved:** {res_str}{receipt}"
-        )
+        resolved_ts = decision.get("resolved_at") if isinstance(decision, dict) else decision["resolved_at"]
+        res_str = _now_pt_str(resolved_ts or time.time())
+        desc = summary
+        if receipt:
+            desc = f"{desc}\n\n**Result:** {receipt}"
+        return {
+            "title": f"✅ {title}",
+            "description": desc,
+            "color": 0x10B981,
+            "footer": {"text": f"{label} · {res_str}"},
+        }
     if status == "dismissed":
-        res_str = _now_pt_str(decision["resolved_at"] or time.time())
-        return (
-            f"### 🛑 Dismissed [{cat}]: {decision['title']}\n"
-            f"~{decision['summary']}~\n"
-            f"- **ID:** `{decision['id']}` | **Dismissed:** {res_str}"
-        )
+        resolved_ts = decision.get("resolved_at") if isinstance(decision, dict) else decision["resolved_at"]
+        res_str = _now_pt_str(resolved_ts or time.time())
+        return {
+            "title": f"🛑 {title}",
+            "description": f"~{summary}~",
+            "color": 0x6B7280,
+            "footer": {"text": f"Dismissed · {res_str}"},
+        }
     if status == "expired":
-        return (
-            f"### ⏱️ Expired [{cat}]: {decision['title']}\n"
-            f"~{decision['summary']}~\n"
-            f"- **ID:** `{decision['id']}` | **Status:** Expired without action"
-        )
-    return (
-        f"### ❌ Execution Failed [{cat}]: {decision['title']}\n"
-        f"{decision['summary']}\n"
-        f"- **ID:** `{decision['id']}` | **Error:** `{decision['receipt_text'][:200]}`"
-    )
+        return {
+            "title": f"⏱️ {title}",
+            "description": f"~{summary}~",
+            "color": 0x6B7280,
+            "footer": {"text": "Expired without action"},
+        }
+    resolved_ts = decision.get("resolved_at") if isinstance(decision, dict) else decision["resolved_at"]
+    res_str = _now_pt_str(resolved_ts or time.time())
+    desc = summary
+    if receipt:
+        desc = f"{desc}\n\n**Error:** {receipt[:200]}"
+    return {
+        "title": f"❌ {title}",
+        "description": desc,
+        "color": 0xEF4444,
+        "footer": {"text": f"Failed · {res_str}"},
+    }
+
+
+def format_decision_card_text(decision: sqlite3.Row | dict) -> str:
+    """Format the concise fallback Discord markdown text for a staged Decision Card."""
+    status = (decision.get("status") if isinstance(decision, dict) else decision["status"]) or "pending"
+    cat = str((decision.get("category") if isinstance(decision, dict) else decision["category"]) or "FORGE").upper()
+    title = str((decision.get("title") if isinstance(decision, dict) else decision["title"]) or "").strip()
+    summary = str((decision.get("summary") if isinstance(decision, dict) else decision["summary"]) or "").strip()
+    receipt = (decision.get("receipt_text") if isinstance(decision, dict) else decision["receipt_text"]) or ""
+
+    if status == "pending":
+        exp = decision.get("expires_at") if isinstance(decision, dict) else decision["expires_at"]
+        exp_str = _now_pt_str(exp) if exp else "in 2 hours"
+        return f"🛡️ **{title}** [{cat} · Expires {exp_str}]\n{summary}"
+    if status in ("approved", "edited_approved"):
+        label = "Approved & Executed (Edited)" if status == "edited_approved" else "Approved & Executed"
+        resolved_ts = decision.get("resolved_at") if isinstance(decision, dict) else decision["resolved_at"]
+        res_str = _now_pt_str(resolved_ts or time.time())
+        receipt_str = f"\n**Result:** {receipt}" if receipt else ""
+        return f"✅ **{title}** [{label} · {res_str}]\n{summary}{receipt_str}"
+    if status == "dismissed":
+        resolved_ts = decision.get("resolved_at") if isinstance(decision, dict) else decision["resolved_at"]
+        res_str = _now_pt_str(resolved_ts or time.time())
+        return f"🛑 **{title}** [Dismissed · {res_str}]\n~{summary}~"
+    if status == "expired":
+        return f"⏱️ **{title}** [Expired without action]\n~{summary}~"
+    resolved_ts = decision.get("resolved_at") if isinstance(decision, dict) else decision["resolved_at"]
+    res_str = _now_pt_str(resolved_ts or time.time())
+    err_str = f"\n**Error:** {receipt[:200]}" if receipt else ""
+    return f"❌ **{title}** [Failed · {res_str}]\n{summary}{err_str}"
 
 
 def _post_decision_card_rest(decision_id: str, db_path: Path | str = FORGE_DB_PATH) -> Optional[int]:
@@ -5022,7 +5124,7 @@ def _post_decision_card_rest(decision_id: str, db_path: Path | str = FORGE_DB_PA
     if not token:
         return None
 
-    text = format_decision_card_text(row)
+    embed_data = render_decision_card_embed(row)
     components = [
         {
             "type": 1,
@@ -5036,7 +5138,12 @@ def _post_decision_card_rest(decision_id: str, db_path: Path | str = FORGE_DB_PA
     headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
     url = f"https://discord.com/api/v10/channels/{row['channel_id']}/messages"
     try:
-        resp = requests.post(url, headers=headers, json={"content": text[:1990], "components": components}, timeout=10)
+        resp = requests.post(
+            url,
+            headers=headers,
+            json={"content": "", "embeds": [embed_data], "components": components},
+            timeout=10,
+        )
         if resp.status_code < 300:
             msg_id = int(resp.json()["id"])
             with get_db_connection(db_path) as conn:
@@ -5199,6 +5306,7 @@ def execute_decision(
         "status": final_status,
         "receipt": receipt,
         "formatted_card": format_decision_card_text(updated_row) if updated_row else "",
+        "formatted_embed": render_decision_card_embed(updated_row) if updated_row else {},
     }
 
 
@@ -5226,6 +5334,7 @@ def dismiss_decision(
         "decision_id": decision_id,
         "status": "dismissed",
         "formatted_card": format_decision_card_text(updated_row) if updated_row else "",
+        "formatted_embed": render_decision_card_embed(updated_row) if updated_row else {},
     }
 
 
@@ -5276,12 +5385,16 @@ class ForgeDecisionEditModal(discord.ui.Modal):
             override_payload=new_payload,
             db_path=self.db_path,
         )
-        if interaction.message and res.get("formatted_card"):
+        if interaction.message:
             try:
                 view = discord.ui.View.from_message(interaction.message)
                 for item in view.children:
                     item.disabled = True
-                await interaction.message.edit(content=res["formatted_card"], view=view)
+                if res.get("formatted_embed"):
+                    embed = discord.Embed.from_dict(res["formatted_embed"])
+                    await interaction.message.edit(content="", embed=embed, view=view)
+                elif res.get("formatted_card"):
+                    await interaction.message.edit(content=res["formatted_card"], view=view)
             except Exception:
                 pass
 
@@ -5588,6 +5701,8 @@ def main():
     p_enq.add_argument("plan_file", help="Path to ForgePlan JSON file")
     p_enq.add_argument("--no-widget", action="store_true", help="Skip posting initial #forge Discord widget")
     p_enq.add_argument("--allow-overlap", action="store_true", help="Allow enqueueing even if target_files overlap an active build")
+    p_enq.add_argument("--approved", action="store_true", help="Mark plan as pre-approved to bypass approval gate")
+    p_enq.add_argument("--skip-approval", action="store_true", help="Alias for --approved")
 
     p_st = sub.add_parser("status", help="Show FORGE queue digest or specific build status")
     p_st.add_argument("--build-id", default="", help="Specific build ID")
@@ -5646,6 +5761,8 @@ def main():
     if args.cmd == "enqueue":
         try:
             plan_data = json.loads(Path(args.plan_file).read_text(encoding="utf-8"))
+            if getattr(args, "approved", False) or getattr(args, "skip_approval", False):
+                plan_data["approved"] = True
             res = enqueue_build(
                 plan_data,
                 post_widget=not args.no_widget,

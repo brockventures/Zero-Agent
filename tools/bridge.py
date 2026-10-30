@@ -850,12 +850,16 @@ async def on_button_interaction(interaction: discord.Interaction):
             else:
                 res = await asyncio.to_thread(dismiss_decision, decision_id, interaction.user.id)
 
-            if interaction.message and res.get("formatted_card"):
+            if interaction.message:
                 try:
                     view = discord.ui.View.from_message(interaction.message)
                     for item in view.children:
                         item.disabled = True
-                    await interaction.message.edit(content=res["formatted_card"], view=view)
+                    if res.get("formatted_embed"):
+                        embed = discord.Embed.from_dict(res["formatted_embed"])
+                        await interaction.message.edit(content="", embed=embed, view=view)
+                    elif res.get("formatted_card"):
+                        await interaction.message.edit(content=res["formatted_card"], view=view)
                 except Exception:
                     pass
 

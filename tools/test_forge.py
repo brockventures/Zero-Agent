@@ -44,10 +44,12 @@ from tools.forge import (
     dismiss_decision,
     dispatch_build_completion_to_origin,
     enqueue_build,
+    evaluate_plan_approval_gate,
     execute_decision,
     expire_stale_decisions,
     extract_symbol_snippet,
     format_chunk_prompt,
+    format_decision_card_text,
     format_origin_completion_envelope,
     format_queue_digest,
     get_job_status,
@@ -57,10 +59,12 @@ from tools.forge import (
     prune_completed_build_widgets,
     prune_completed_job_widgets,
     render_build_widget_embed,
+    render_decision_card_embed,
     render_job_widget_embed,
     render_build_widget_text,
     stage_decision,
-     validate_forge_plan,
+    stage_plan_approval_decision,
+    validate_forge_plan,
     verify_chunk_worktree,
 )
 from tools.vault_sync import decrypt_secrets_archive, encrypt_secrets_archive
@@ -2130,6 +2134,229 @@ def test_chunk_split_gate_and_worktree_resume_salvage(tmp_path, monkeypatch):
     assert "*(full specification in Implementation Instructions below)*" in prompt_l
     assert "L120-L130" in prompt_l
     assert "step_122 = 122" in prompt_l
+
+
+def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
+    db_p = tmp_path / "forge.db"
+    init_forge_db(db_p)
+
+    # 1. Pending Decision Card Embed and Text
+    d_staged = stage_decision(
+        category="forge",
+        title="Deploy Test Pipeline",
+        summary="Automated build for testing native Discord embeds.",
+        handler_type="shell",
+        payload={"command": "echo 'deployed'", "cwd": "/tmp"},
+        channel_id=ZERO_OPS_CHANNEL_ID,
+        db_path=db_p,
+    )
+    with forge_mod.get_db_connection(db_p) as conn:
+        row_pending = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (d_staged["decision_id"],)).fetchone()
+    embed_pending = render_decision_card_embed(row_pending)
+    assert embed_pending["title"] == "🛡️ Deploy Test Pipeline"
+    assert embed_pending["color"] == 0xF59E0B
+    assert embed_pending["description"] == "Automated build for testing native Discord embeds."
+    assert "FORGE · Expires" in embed_pending["footer"]["text"]
+
+    text_pending = format_decision_card_text(row_pending)
+    assert text_pending.startswith("🛡️ **Deploy Test Pipeline** [FORGE · Expires")
+    assert "Automated build for testing native Discord embeds." in text_pending
+
+    # 2. Approved & Executed Decision Card Embed and Text
+    exec_res = execute_decision(d_staged["decision_id"], user_id=OWNER_USER_ID, db_path=db_p)
+    assert exec_res["ok"] is True
+    assert exec_res["status"] == "approved"
+    assert "formatted_embed" in exec_res
+    embed_approved = exec_res["formatted_embed"]
+    assert embed_approved["title"] == "✅ Deploy Test Pipeline"
+    assert embed_approved["color"] == 0x10B981
+    assert "**Result:**" in embed_approved["description"]
+    assert "deployed" in embed_approved["description"]
+    assert "Approved & Executed ·" in embed_approved["footer"]["text"]
+
+    text_approved = exec_res["formatted_card"]
+    assert text_approved.startswith("✅ **Deploy Test Pipeline** [Approved & Executed ·")
+    assert "**Result:**" in text_approved
+
+    # 3. Dismissed Decision Card Embed and Text
+    d_dismiss = stage_decision(
+        category="homelab",
+        title="Reboot Gateway",
+        summary="Planned maintenance reboot.",
+        handler_type="shell",
+        payload={"command": "true"},
+        channel_id=ZERO_OPS_CHANNEL_ID,
+        db_path=db_p,
+    )
+    dis_res = dismiss_decision(d_dismiss["decision_id"], user_id=OWNER_USER_ID, db_path=db_p)
+    assert dis_res["ok"] is True
+    assert dis_res["status"] == "dismissed"
+    assert "formatted_embed" in dis_res
+    embed_dismissed = dis_res["formatted_embed"]
+    assert embed_dismissed["title"] == "🛑 Reboot Gateway"
+    assert embed_dismissed["color"] == 0x6B7280
+    assert embed_dismissed["description"] == "~Planned maintenance reboot.~"
+    assert "Dismissed ·" in embed_dismissed["footer"]["text"]
+
+    # 4. Expired and Failed Decision Card Embed
+    d_expired = stage_decision(
+        category="misc",
+        title="Old Action",
+        summary="Action that timed out.",
+        handler_type="shell",
+        payload={"command": "true"},
+        channel_id=ZERO_OPS_CHANNEL_ID,
+        ttl_seconds=-10.0,
+        db_path=db_p,
+    )
+    expire_stale_decisions(db_path=db_p)
+    with forge_mod.get_db_connection(db_p) as conn:
+        row_exp = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (d_expired["decision_id"],)).fetchone()
+    embed_exp = render_decision_card_embed(row_exp)
+    assert embed_exp["title"] == "⏱️ Old Action"
+    assert embed_exp["color"] == 0x6B7280
+    assert embed_exp["description"] == "~Action that timed out.~"
+    assert embed_exp["footer"]["text"] == "Expired without action"
+
+    d_fail = stage_decision(
+        category="shell",
+        title="Failing Shell Command",
+        summary="Command that returns non-zero.",
+        handler_type="shell",
+        payload={"command": "exit 42", "cwd": "/tmp"},
+        channel_id=ZERO_OPS_CHANNEL_ID,
+        db_path=db_p,
+    )
+    fail_res = execute_decision(d_fail["decision_id"], user_id=OWNER_USER_ID, db_path=db_p)
+    assert fail_res["ok"] is False
+    assert fail_res["status"] == "failed"
+    embed_fail = fail_res["formatted_embed"]
+    assert embed_fail["title"] == "❌ Failing Shell Command"
+    assert embed_fail["color"] == 0xEF4444
+    assert "**Error:**" in embed_fail["description"]
+
+    # 5. Explicit Approval Bypass: plan['approved'] = True or plan['skip_approval'] = True
+    multi_chunk_plan = {
+        "title": "Large Multi-Chunk Pipeline",
+        "repo": "/workspace",
+        "origin_channel_id": ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Multi-chunk test"],
+        "chunks": [
+            {"title": "Chunk 1", "target_files": ["tools/m1.py"], "instructions": "c1"},
+            {"title": "Chunk 2", "target_files": ["tools/m2.py"], "instructions": "c2"},
+        ],
+    }
+    # Without bypass, multi-chunk requires approval
+    req, reasons = evaluate_plan_approval_gate(multi_chunk_plan, batch_state_path="/tmp/nonexistent.json")
+    assert req is True
+    assert any("Multi-chunk" in r for r in reasons)
+
+    # With approved=True
+    plan_appr = dict(multi_chunk_plan, approved=True)
+    req_a, reasons_a = evaluate_plan_approval_gate(plan_appr, batch_state_path="/tmp/nonexistent.json")
+    assert req_a is False
+    assert reasons_a == []
+
+    # With skip_approval=True
+    plan_skip = dict(multi_chunk_plan, skip_approval=True)
+    req_s, reasons_s = evaluate_plan_approval_gate(plan_skip, batch_state_path="/tmp/nonexistent.json")
+    assert req_s is False
+    assert reasons_s == []
+
+    # 6. Explicit Approval Directives in in_flight_turn.json
+    in_flight_file = tmp_path / "in_flight_turn.json"
+
+    test_directives = [
+        "queue fix",
+        "approve",
+        "approved",
+        "ship it",
+        "do it",
+        "fix it",
+        "please queue fix for this issue",
+        "LGTM, ship it now",
+    ]
+    for directive in test_directives:
+        in_flight_file.write_text(json.dumps({"prompt": directive}), encoding="utf-8")
+        req_d, reasons_d = evaluate_plan_approval_gate(
+            multi_chunk_plan,
+            batch_state_path="/tmp/nonexistent.json",
+            in_flight_path=in_flight_file,
+        )
+        assert req_d is False, f"Directive '{directive}' should have bypassed approval gate"
+        assert reasons_d == []
+
+    # Target channel nested prompt in in_flight_turn.json
+    in_flight_file.write_text(
+        json.dumps({str(ZERO_OPS_CHANNEL_ID): {"prompt": "queue plan please"}}),
+        encoding="utf-8",
+    )
+    req_nested, _ = evaluate_plan_approval_gate(
+        multi_chunk_plan,
+        batch_state_path="/tmp/nonexistent.json",
+        in_flight_path=in_flight_file,
+    )
+    assert req_nested is False
+
+    # Non-directive prompt should NOT bypass
+    in_flight_file.write_text(json.dumps({"prompt": "Can you check why the home assistant entity is offline?"}), encoding="utf-8")
+    req_non, _ = evaluate_plan_approval_gate(
+        multi_chunk_plan,
+        batch_state_path="/tmp/nonexistent.json",
+        in_flight_path=in_flight_file,
+    )
+    assert req_non is True
+
+    # 7. CLI flag parsing and execution for forge.py enqueue (--approved and --skip-approval)
+    plan_file = tmp_path / "test_plan.json"
+    plan_file.write_text(json.dumps(multi_chunk_plan), encoding="utf-8")
+
+    import argparse
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_enq = sub.add_parser("enqueue")
+    p_enq.add_argument("plan_file")
+    p_enq.add_argument("--no-widget", action="store_true")
+    p_enq.add_argument("--allow-overlap", action="store_true")
+    p_enq.add_argument("--approved", action="store_true")
+    p_enq.add_argument("--skip-approval", action="store_true")
+
+    args_appr = parser.parse_args(["enqueue", str(plan_file), "--approved"])
+    assert args_appr.approved is True
+    args_skip = parser.parse_args(["enqueue", str(plan_file), "--skip-approval"])
+    assert args_skip.skip_approval is True
+
+    # Test CLI invocation through forge_mod.main()
+    with patch("sys.argv", ["forge.py", "enqueue", str(plan_file), "--approved"]), \
+         patch.object(forge_mod, "enqueue_build") as mock_enq:
+        mock_enq.return_value = {"ok": True, "build_id": "test-build-appr"}
+        forge_mod.main()
+        mock_enq.assert_called_once()
+        passed_plan = mock_enq.call_args[0][0]
+        assert passed_plan.get("approved") is True
+
+    with patch("sys.argv", ["forge.py", "enqueue", str(plan_file), "--skip-approval"]), \
+         patch.object(forge_mod, "enqueue_build") as mock_enq2:
+        mock_enq2.return_value = {"ok": True, "build_id": "test-build-skip"}
+        forge_mod.main()
+        mock_enq2.assert_called_once()
+        passed_plan2 = mock_enq2.call_args[0][0]
+        assert passed_plan2.get("approved") is True
+
+    # 8. Edited approved status formatting
+    row_edited = {
+        "status": "edited_approved",
+        "category": "forge",
+        "title": "Edited Plan",
+        "summary": "Plan edited by Ryan.",
+        "receipt_text": "Enqueued cleanly",
+        "resolved_at": time.time(),
+    }
+    embed_ed = render_decision_card_embed(row_edited)
+    assert embed_ed["title"] == "✅ Edited Plan"
+    assert "Approved & Executed (Edited) ·" in embed_ed["footer"]["text"]
+    text_ed = format_decision_card_text(row_edited)
+    assert "Approved & Executed (Edited)" in text_ed
 
 
 if __name__ == "__main__":
