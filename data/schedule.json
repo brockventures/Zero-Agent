@@ -471,9 +471,9 @@
     "interval_seconds": 300,
     "prompt": "Run the bridge liveness & gateway watchdog check using /workspace/tools/sidecars.py bridge_watchdog. Auto-heals and alerts only if degraded (silent when nominal).",
     "catchup_if_missed": false,
-    "last_run_ts": 1793393262,
-    "last_run_at": "2026-10-30 01:47 PM PT",
-    "next_run_ts": 1793393562.0,
+    "last_run_ts": 1793394195,
+    "last_run_at": "2026-10-30 02:03 PM PT",
+    "next_run_ts": 1793394495.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -485,9 +485,9 @@
     "channel_id": 1544953279664889888,
     "prompt": "Run the Host 2 and Host 1 PID & process headroom watchdog using /workspace/tools/sidecars.py pid_watchdog. Silent execution unless warning or critical threshold exceeded.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793392718,
-    "last_run_at": "2026-10-30 01:38 PM PT",
-    "next_run_ts": 1793393618.0
+    "last_run_ts": 1793393620,
+    "last_run_at": "2026-10-30 01:53 PM PT",
+    "next_run_ts": 1793394520.0
   },
   {
     "id": "agora_roguelike_pm",
@@ -642,7 +642,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1793372765,
     "last_run_at": "2026-10-30 08:06 AM PT",
-    "next_run_ts": 1793394000.0
+    "next_run_ts": 1793480400.0
   },
   {
     "id": "kalshi_night_audit",
@@ -698,9 +698,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the Prowlarr indexer health watchdog using /workspace/tools/sidecars.py prowlarr.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793390700,
-    "last_run_at": "2026-10-30 01:05 PM PT",
-    "next_run_ts": 1793394300.0
+    "last_run_ts": 1793394304,
+    "last_run_at": "2026-10-30 02:05 PM PT",
+    "next_run_ts": 1793397904.0
   },
   {
     "id": "sabnzbd_watchdog",
@@ -711,9 +711,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the SABnzbd downloader & unpack watchdog using /workspace/tools/sidecars.py sabnzbd.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793390685,
-    "last_run_at": "2026-10-30 01:04 PM PT",
-    "next_run_ts": 1793394285.0
+    "last_run_ts": 1793394288,
+    "last_run_at": "2026-10-30 02:04 PM PT",
+    "next_run_ts": 1793397888.0
   },
   {
     "id": "nest_lock_watchdog",
@@ -761,9 +761,9 @@
     "interval_seconds": 600,
     "prompt": "Run the 10-minute ground-truth quota usage poller using /workspace/tools/sidecars.py quota_poller. Captures live remaining fractions and cycle burn deltas.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793393126,
-    "last_run_at": "2026-10-30 01:45 PM PT",
-    "next_run_ts": 1793393726.0
+    "last_run_ts": 1793394338,
+    "last_run_at": "2026-10-30 02:05 PM PT",
+    "next_run_ts": 1793394938.0
   },
   {
     "id": "personal_data_sync",
@@ -794,9 +794,9 @@
       23,
       7
     ],
-    "last_run_ts": 1793393157,
-    "last_run_at": "2026-10-30 01:45 PM PT",
-    "next_run_ts": 1793393457.0
+    "last_run_ts": 1793394401,
+    "last_run_at": "2026-10-30 02:06 PM PT",
+    "next_run_ts": 1793394701.0
   },
   {
     "id": "resident_agents_daily_tip",
@@ -840,7 +840,8 @@
     "catchup_if_missed": false,
     "last_run_ts": 1793393294,
     "next_run_ts": 1793457900.0,
-    "last_run_at": "2026-10-30 01:48 PM PT"
+    "last_run_at": "2026-10-30 01:48 PM PT",
+    "channel_id": 1544953279664889888
   },
   {
     "id": "commute_inbox_triage_card",
@@ -852,7 +853,8 @@
     "prompt": "Run the commute Inbox & RCS actionable triage Decision Card workflow using /workspace/tools/sidecars.py commute_inbox_triage_card.",
     "catchup_if_missed": false,
     "last_run_ts": null,
-    "next_run_ts": 1793396867.549539
+    "next_run_ts": 1793403900.0,
+    "channel_id": 1544953279664889888
   },
   {
     "id": "family_calendar_radar_card",
@@ -864,7 +866,8 @@
     "prompt": "Run the 48h Family Calendar & Action Radar Decision Card workflow using /workspace/tools/sidecars.py family_calendar_radar_card.",
     "catchup_if_missed": false,
     "last_run_ts": null,
-    "next_run_ts": 1793400467.549539
+    "next_run_ts": 1793408400.0,
+    "channel_id": 1550577908811178095
   },
   {
     "id": "dinner_pivot_card",
@@ -876,7 +879,8 @@
     "prompt": "Run the afternoon Dinner Defrost & Calendar Conflict Pivot Decision Card workflow using /workspace/tools/sidecars.py dinner_pivot_card.",
     "catchup_if_missed": false,
     "last_run_ts": null,
-    "next_run_ts": 1793395067.549539
+    "next_run_ts": 1793402100.0,
+    "channel_id": 1550577908811178095
   },
   {
     "id": "actual_budget_anomaly_card",
@@ -887,8 +891,10 @@
     "minute_pt": 0,
     "prompt": "Run the Actual Budget Anomaly & Overspend Detection Decision Card workflow using /workspace/tools/sidecars.py actual_budget_anomaly_card.",
     "catchup_if_missed": false,
-    "last_run_ts": null,
-    "next_run_ts": 1793394167.549539
+    "last_run_ts": 1793394186,
+    "next_run_ts": 1793458800.0,
+    "last_run_at": "2026-10-30 02:03 PM PT",
+    "channel_id": 1544955532765560924
   },
   {
     "id": "weather_energy_card",
@@ -900,7 +906,8 @@
     "prompt": "Run the morning Weather, Air Quality & Pre-Adjustment Energy Decision Card workflow using /workspace/tools/sidecars.py weather_energy_card.",
     "catchup_if_missed": false,
     "last_run_ts": null,
-    "next_run_ts": 1793457000.0
+    "next_run_ts": 1793457000.0,
+    "channel_id": 1544953275877556334
   },
   {
     "id": "midweek_grocery_card",
@@ -913,7 +920,8 @@
     "prompt": "Run the Wednesday Mid-Week Staple & Voice Grocery Replenishment Decision Card workflow using /workspace/tools/sidecars.py midweek_grocery_card.",
     "catchup_if_missed": false,
     "last_run_ts": null,
-    "next_run_ts": 1793476067.549539
+    "next_run_ts": 1793844900.0,
+    "channel_id": 1544955538033348618
   },
   {
     "id": "evening_pm_build_card",
@@ -925,7 +933,8 @@
     "prompt": "Run the evening PM Hobby & Build Decision Card workflow using /workspace/tools/sidecars.py evening_pm_build_card.",
     "catchup_if_missed": false,
     "last_run_ts": null,
-    "next_run_ts": 1793404067.549539
+    "next_run_ts": 1793416500.0,
+    "channel_id": 1548196930788524094
   },
   {
     "id": "usage_telemetry_audit",
@@ -938,6 +947,7 @@
     "prompt": "Run the weekly Usage Pattern & Signal-to-Noise Telemetry Engine audit using /workspace/tools/sidecars.py usage_telemetry_audit.",
     "catchup_if_missed": false,
     "last_run_ts": null,
-    "next_run_ts": 1793562467.549539
+    "next_run_ts": 1793590200.0,
+    "channel_id": 1544953279664889888
   }
 ]
