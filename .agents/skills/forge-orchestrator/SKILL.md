@@ -12,12 +12,14 @@ description: >-
 
 ---
 
-## 1. Complexity Routing Tiers
+## 1. Complexity Routing Tiers (Execution Loop & Verification Cost Heuristic — Home & Crab Cavern)
 
-- **Tier 1 (Inline Fast-Path — `<90s`):** Focused 1–3 file edits (`<150` lines), config tweaks, and targeted test runs stay inline in the current turn when files are already in context.
-- **Tier 2 (Single-Chunk FORGE Build — `1 Atomic PR`):** Multi-file features or refactors (`4+` files or iterative `>90s` TDD cycles) taking `2–15` minutes.
-- **Tier 3 (Multi-Chunk FORGE Pipeline — `N Ordered PRs`):** Cross-module architectures or new subsystems decomposed into ordered TDD chunks (`1 chunk = 1 PR`).
-- **Ad-Hoc Background Shell Jobs (`>90s`):** Long-running scripts, migrations, or sweeps run via `python3 /workspace/tools/forge.py job start --command "..."` (with `tools/detached_runner.py` retained as a backwards-compatible delegation shim).
+Gated strictly on **Execution Loop & Verification Cost** (never raw file count) across both Home operations channels and Crab Cavern channels (`#gotchi`, `#gotchi-chat`, `#side-project`, `#debug-huddle`, `#the-banana-stand`):
+
+- **Tier 1 (Inline Fast-Path — `<= 3 Tool Steps` & `< 45s` Total):** Stay inline ONLY when exact target lines are already known, verification is a fast local lint/unit check (`< 15s`), and the entire edit + test + commit/PR finishes in **2–3 tool calls** (`< 45s`).
+- **Tier 2 (Single-Chunk FORGE Build — `1 Atomic PR`, Even 1 File):** Any single-PR feature, bugfix, or firmware change that requires a compiled toolchain (ESP32 PlatformIO C++ builds), hardware/OTA flash, Docker build, CAD render, `> 15s` test/benchmark sweep, writing a new test suite, or iterating across edit-test-fix loops (`4+ tool steps` or `> 45s`).
+- **Tier 3 (Multi-Chunk FORGE Pipeline — `N Ordered PRs`):** Cross-module architectures, multi-subsystem features, or contract changes decomposed into ordered TDD chunks (`1 chunk = 1 PR`).
+- **Ad-Hoc Background Shell Jobs (`> 45s`):** Long-running non-PR scripts, wireless OTA flash sweeps, migrations, or benchmarks run via `python3 /workspace/tools/forge.py job start --command "..."` (with `tools/detached_runner.py` retained as a backwards-compatible delegation shim).
 
 ---
 

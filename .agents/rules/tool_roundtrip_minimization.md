@@ -27,9 +27,9 @@ description: Enforces tool roundtrip minimization, broad-slice file reads, and d
    - In Tier 1 inline turns (`<90s`) and `#forge` worker turns, **NEVER** run unconstrained full repository test suites (bare `pytest` or `pytest tests/`).
    - **ALWAYS** scope test execution strictly to the relevant test file or function under test (`pytest tests/test_feature.py`). Rely on CI for full matrix regressions.
 
-6. **FORGE Tier Routing & One-Shot Git Batching:**
-   - **Tier 2/3 Multi-File Builds (`4+` files or `>90s`):** Delegate to `#forge` (`python3 /workspace/tools/forge.py enqueue <plan.json>` or stage a `forge_enqueue` Decision Card) rather than running large multi-file refactors and iterative TDD loops inline in chat.
-   - **Tier 1 (`<90s`, 1–3 files `<150` lines) & `#forge` Workers:** When staging, committing, pushing, and opening pull requests, **NEVER** execute serial micro-tool calls (`add` -> `commit` -> `push` -> `pr`). **ALWAYS** bundle the git lifecycle into a single compound shell command:
+6. **Unified FORGE Routing (Execution Loop & Verification Cost) & One-Shot Git Batching:**
+   - **Gate on Execution Loop & Verification Cost (Never Raw File Count — Home & Crab Cavern):** Delegate to `#forge` (`python3 /workspace/tools/forge.py enqueue <plan.json>` or stage a `forge_enqueue` Decision Card) whenever a task requires a compiled toolchain (ESP32 PlatformIO firmware), hardware/OTA flash, Docker build, CAD render, `> 15s` verification sweep, writing a new test suite, iterative edit-test-fix loops (`4+ tool steps` or `> 45s`), or cross-module changes—even if it only touches 1 file.
+   - **Tier 1 Inline Fast-Path (`<= 3 Tool Steps` & `< 45s` Total) & `#forge` Workers:** Stay inline ONLY when exact target lines are known, local verification is `< 15s`, and the entire edit + verify + git lifecycle finishes in **2–3 tool calls**. When staging, committing, pushing, and opening pull requests, **NEVER** execute serial micro-tool calls (`add` -> `commit` -> `push` -> `pr`). **ALWAYS** bundle the git lifecycle into a single compound shell command:
      `git add <files> && git commit -m "<msg>" && git push -u origin <branch> && gh pr create --title "<title>" --body "<body>"`.
 
 7. **Conversational & Deliberation Zero-Tool Fast-Path:**

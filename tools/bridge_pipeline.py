@@ -561,7 +561,8 @@ def prepare_turn_prompt(
         return (
             "[CRAB CAVERN MULTI-AGENT COLLABORATION ENVIRONMENT — RESUMED TURN]\n"
             "• Keep responses under 2,000 chars (in #lounge: 1–3 sentences max in plain conversational prose, zero headers/bullets; in #the-banana-stand: v1.1 handoff envelope <=180 chars).\n"
-            "• Use physical Discord snowflakes (<@ID>) when addressing peers; never leak private homelab data.\n\n"
+            "• Use physical Discord snowflakes (<@ID>) when addressing peers; never leak private homelab data.\n"
+            "• Unified FORGE Routing (Execution Loop & Verification Cost): Stay inline ONLY if exact target lines are known, local lint/unit check is <15s, and edit+test+PR finishes in <=3 tool steps (<45s). Dispatch compiled builds (ESP32 PlatformIO), OTA flashes, >15s test sweeps, new test suites, or 4+ step TDD loops (even 1 file) to #forge (`forge.py enqueue` or `forge.py job start`).\n\n"
             f"{carry_section}"
             f"{time_block}\n\n"
             f"{gif_guidance}\n\n"
