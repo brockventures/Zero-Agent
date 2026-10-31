@@ -7,8 +7,14 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import sys
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+elif sys.path[0] != _REPO_ROOT:
+    sys.path.remove(_REPO_ROOT)
+    sys.path.insert(0, _REPO_ROOT)
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
 from tools.bridge_pipeline import (
     TurnTimer,
     prepare_turn_prompt,
