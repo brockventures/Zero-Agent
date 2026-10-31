@@ -516,7 +516,7 @@ async def dispatch_scheduled_prompt(
             run_nas_log_review = tools.nas_log_triage.run_nas_log_review
             format_autonomous_triage_prompt = tools.nas_log_triage.format_autonomous_triage_prompt
             ok, rep, extra = await _run_sidecar_job_async("nas_logs", "NAS Log Review", run_nas_log_review)
-            total_issues = extra.get("total_issues", 0) if isinstance(extra, dict) else 0
+            total_issues = extra.get("total_issues") if isinstance(extra, dict) else None
 
             ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
             if total_issues == 0:
@@ -633,12 +633,19 @@ async def dispatch_scheduled_prompt(
     if "reddit_fantasy" in prompt or "reddit_scan" in prompt or "Reddit Fantasy Baseball" in job_name:
         try:
             from tools.reddit_fantasy_scanner import run_reddit_fantasy_scanner
-            ok, out, _ = await _run_sidecar_job_async("reddit_fantasy_scanner", "Reddit Fantasy Baseball Scanner", run_reddit_fantasy_scanner)
+            ok, out, extra = await _run_sidecar_job_async(
+                "reddit_fantasy_scanner",
+                "Reddit Fantasy Baseball Scanner",
+                run_reddit_fantasy_scanner,
+                post_discord=True,
+            )
+            decision_staged = isinstance(extra, dict) and extra.get("decision_staged") is True
             if ok and out and not out.startswith("No new") and not out.startswith("Scanned active") and bot:
-                ch = await get_dest_channel()
-                if ch:
-                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    await _send_chunked_content(ch, clean_content, choice_view)
+                if not decision_staged:
+                    ch = await get_dest_channel()
+                    if ch:
+                        clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                        await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print(f"[Scheduler] Reddit fantasy baseball scanner checked: {out}")
         except Exception as e:
@@ -894,12 +901,14 @@ async def dispatch_scheduled_prompt(
     if job_id == "weekly_meal_proposal" or "meal_proposal" in prompt or "meal_planner" in prompt or job_name in ("Weekly 3-Dinner Meal Proposal", "Weekly Meal Proposal"):
         try:
             from tools.sidecars import run_weekly_meal_proposal
-            ok, out, _ = await _run_sidecar_job_async("weekly_meal_proposal", "Weekly 3-Dinner Meal Proposal", run_weekly_meal_proposal)
+            ok, out, extra = await _run_sidecar_job_async("weekly_meal_proposal", "Weekly 3-Dinner Meal Proposal", run_weekly_meal_proposal)
+            decision_staged = isinstance(extra, dict) and extra.get("decision_staged") is True
             if out and out.strip() and bot:
-                ch = await get_dest_channel()
-                if ch:
-                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    await _send_chunked_content(ch, clean_content, choice_view)
+                if not decision_staged:
+                    ch = await get_dest_channel()
+                    if ch:
+                        clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                        await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Weekly meal proposal checked: nominal (silent).")
         except Exception as e:
@@ -1105,11 +1114,13 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_birthday_reminders
             ok, out, extra = await _run_sidecar_job_async("daily_birthday_reminder", "Daily Birthday Reminder", run_birthday_reminders)
             has_bday = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
+            decision_staged = isinstance(extra, dict) and extra.get("decision_staged") is True
             if has_bday and out and out.strip() and bot:
-                ch = await get_dest_channel()
-                if ch:
-                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    await _send_chunked_content(ch, clean_content, choice_view)
+                if not decision_staged:
+                    ch = await get_dest_channel()
+                    if ch:
+                        clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                        await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Daily birthday reminder checked: 0 birthdays today (silent).")
         except Exception as e:
@@ -1122,11 +1133,13 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_social_last_seen_review
             ok, out, extra = await _run_sidecar_job_async("weekly_social_review", "Weekly Social & Last Seen Review", run_social_last_seen_review)
             has_events = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
+            decision_staged = isinstance(extra, dict) and extra.get("decision_staged") is True
             if has_events and out and out.strip() and bot:
-                ch = await get_dest_channel()
-                if ch:
-                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    await _send_chunked_content(ch, clean_content, choice_view)
+                if not decision_staged:
+                    ch = await get_dest_channel()
+                    if ch:
+                        clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                        await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Weekly social review checked: 0 updates (silent).")
         except Exception as e:
@@ -1139,11 +1152,13 @@ async def dispatch_scheduled_prompt(
             from tools.sidecars import run_core_friends_reminder
             ok, out, extra = await _run_sidecar_job_async("monthly_core_friends_reminder", "Monthly Core Friends Social Reminder", run_core_friends_reminder)
             has_friends = extra.get("has_items", False) if isinstance(extra, dict) else bool(out and out.strip())
+            decision_staged = isinstance(extra, dict) and extra.get("decision_staged") is True
             if has_friends and out and out.strip() and bot:
-                ch = await get_dest_channel()
-                if ch:
-                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                    await _send_chunked_content(ch, clean_content, choice_view)
+                if not decision_staged:
+                    ch = await get_dest_channel()
+                    if ch:
+                        clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                        await _send_chunked_content(ch, clean_content, choice_view)
             else:
                 print("[Scheduler] Monthly core friends reminder checked: all caught up (silent).")
         except Exception as e:

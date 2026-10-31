@@ -9,6 +9,7 @@ Covers:
 
 import os
 import sys
+import pytest
 from unittest.mock import MagicMock, patch
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -295,3 +296,293 @@ class TestMealPlannerProposalDecisionCards:
                     # Explicit stage=True: stages decision
                     generate_proposal(force=True, stage=True)
                     mock_stage_meal.assert_called_once()
+
+
+# ==============================================================================
+# 4. SCHEDULE PROMPT SILENCE GUARDS & [NO_REPLY] INVARIANTS
+# ==============================================================================
+
+class TestSchedulePromptSilenceGuards:
+    """Verifies that all silent/event-driven decision card sidecars enforce [NO_REPLY] fallback."""
+
+    def test_schedule_prompts_contain_no_reply_guard(self):
+        import json
+        sched_path = os.path.join(REPO_ROOT, "data", "schedule.json")
+        assert os.path.exists(sched_path)
+        with open(sched_path, "r") as f:
+            sched = json.load(f)
+
+        target_ids = [
+            "morning_inbox_triage_card",
+            "commute_inbox_triage_card",
+            "family_calendar_radar_card",
+            "dinner_pivot_card",
+            "actual_budget_anomaly_card",
+            "weather_energy_card",
+            "midweek_grocery_card",
+            "evening_pm_build_card",
+            "usage_telemetry_audit",
+        ]
+        sched_map = {item["id"]: item for item in sched if "id" in item}
+
+        expected_suffix = "Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text."
+
+        for jid in target_ids:
+            assert jid in sched_map, f"Job {jid} missing from data/schedule.json"
+            prompt = sched_map[jid].get("prompt", "")
+            assert expected_suffix in prompt, (
+                f"Job {jid} prompt missing [NO_REPLY] silence guard suffix:\n  Prompt: {prompt}"
+            )
+
+
+# ==============================================================================
+# 5. SIDECAR 3-TUPLE RETURN & DECISION_STAGED METADATA TESTS
+# ==============================================================================
+
+class TestSidecarDecisionStagedMetadata:
+    """Verifies run_* sidecar functions return 3-tuples containing decision_staged metadata."""
+
+    @patch("tools.birthday_reminder.check_birthdays")
+    def test_run_birthday_reminders_returns_3_tuple_with_decision_staged(self, mock_check):
+        from tools.sidecars import run_birthday_reminders
+        import tools.birthday_reminder as br
+
+        # 1. When decision_staged is True
+        mock_check.return_value = (True, "🎂 Birthday Alert", [{"name": "Friend"}])
+        br.LAST_DECISION_STAGED = True
+
+        ok, msg, extra = run_birthday_reminders("09-02")
+        assert ok is True
+        assert msg == "🎂 Birthday Alert"
+        assert isinstance(extra, dict)
+        assert extra["has_items"] is True
+        assert extra["decision_staged"] is True
+
+        # 2. When decision_staged is False
+        br.LAST_DECISION_STAGED = False
+        ok, msg, extra = run_birthday_reminders("09-02")
+        assert ok is True
+        assert extra["has_items"] is True
+        assert extra["decision_staged"] is False
+
+    @patch("tools.social_last_seen_review.identify_social_updates")
+    @patch("tools.social_last_seen_review.format_review_message")
+    def test_run_social_last_seen_review_returns_3_tuple_with_decision_staged(
+        self, mock_format, mock_identify
+    ):
+        from tools.sidecars import run_social_last_seen_review
+        import tools.social_last_seen_review as slr
+
+        mock_identify.return_value = [{"event": "Dinner"}]
+        mock_format.return_value = (True, "🗓️ Social Review")
+        slr.LAST_DECISION_STAGED = True
+
+        ok, msg, extra = run_social_last_seen_review(days=7)
+        assert ok is True
+        assert msg == "🗓️ Social Review"
+        assert isinstance(extra, dict)
+        assert extra["has_items"] is True
+        assert extra["decision_staged"] is True
+
+        slr.LAST_DECISION_STAGED = False
+        ok, msg, extra = run_social_last_seen_review(days=7)
+        assert ok is True
+        assert extra["has_items"] is True
+        assert extra["decision_staged"] is False
+
+    @patch("tools.core_friends_reminder.check_core_friends_unseen")
+    def test_run_core_friends_reminder_returns_3_tuple_with_decision_staged(self, mock_check):
+        from tools.sidecars import run_core_friends_reminder
+        import tools.core_friends_reminder as cfr
+
+        mock_check.return_value = (True, "👥 Core Friends Reminder", [{"name": "Pal"}])
+        cfr.LAST_DECISION_STAGED = True
+
+        ok, msg, extra = run_core_friends_reminder(weeks=8)
+        assert ok is True
+        assert msg == "👥 Core Friends Reminder"
+        assert isinstance(extra, dict)
+        assert extra["has_items"] is True
+        assert extra["decision_staged"] is True
+
+        cfr.LAST_DECISION_STAGED = False
+        ok, msg, extra = run_core_friends_reminder(weeks=8)
+        assert ok is True
+        assert extra["has_items"] is True
+        assert extra["decision_staged"] is False
+
+    @patch("tools.meal_planner_proposal.generate_proposal")
+    @patch("tools.meal_planner_proposal.format_proposal_markdown")
+    def test_run_weekly_meal_proposal_returns_3_tuple_with_decision_staged(
+        self, mock_format, mock_gen
+    ):
+        from tools.sidecars import run_weekly_meal_proposal
+
+        mock_gen.return_value = {"meals": {}, "decision_staged": True}
+        mock_format.return_value = "🍽️ Meal Plan Markdown"
+
+        ok, msg, extra = run_weekly_meal_proposal()
+        assert ok is True
+        assert msg == "🍽️ Meal Plan Markdown"
+        assert isinstance(extra, dict)
+        assert extra["has_items"] is True
+        assert extra["decision_staged"] is True
+
+        mock_gen.return_value = {"meals": {}, "decision_staged": False}
+        ok, msg, extra = run_weekly_meal_proposal()
+        assert ok is True
+        assert extra["has_items"] is True
+        assert extra["decision_staged"] is False
+
+
+# ==============================================================================
+# 6. SCHEDULER DOUBLE-POST SUPPRESSION TESTS
+# ==============================================================================
+
+class TestSchedulerDoublePostSuppression:
+    """Verifies that bridge_scheduler suppresses duplicate plain-text messages when decision_staged=True."""
+
+    @pytest.mark.asyncio
+    async def test_birthday_reminder_double_post_suppressed(self):
+        import tools.bridge_scheduler as bshed
+        from unittest.mock import AsyncMock
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        # Staged is True -> send should NOT be called
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🎂 Birthday Alert", {"has_items": True, "decision_staged": True})):
+            await bshed.dispatch_scheduled_prompt(
+                "Check for friend & family birthdays today",
+                "Daily Birthday Reminder",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_not_called()
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        # Staged is False -> send SHOULD be called
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🎂 Birthday Alert", {"has_items": True, "decision_staged": False})):
+            await bshed.dispatch_scheduled_prompt(
+                "Check for friend & family birthdays today",
+                "Daily Birthday Reminder",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_social_last_seen_review_double_post_suppressed(self):
+        import tools.bridge_scheduler as bshed
+        from unittest.mock import AsyncMock
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        # Staged is True -> send should NOT be called
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🗓️ Social Review", {"has_items": True, "decision_staged": True})):
+            await bshed.dispatch_scheduled_prompt(
+                "Review past week for social gatherings using /workspace/tools/social_last_seen_review.py",
+                "Weekly Social & Last Seen Review",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_not_called()
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        # Staged is False -> send SHOULD be called
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🗓️ Social Review", {"has_items": True, "decision_staged": False})):
+            await bshed.dispatch_scheduled_prompt(
+                "Review past week for social gatherings using /workspace/tools/social_last_seen_review.py",
+                "Weekly Social & Last Seen Review",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_core_friends_reminder_double_post_suppressed(self):
+        import tools.bridge_scheduler as bshed
+        from unittest.mock import AsyncMock
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        # Staged is True -> send should NOT be called
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "👥 Core Friends Alert", {"has_items": True, "decision_staged": True})):
+            await bshed.dispatch_scheduled_prompt(
+                "Monthly check for local Core friends not seen using /workspace/tools/core_friends_reminder.py",
+                "Monthly Core Friends Social Planning Reminder",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_not_called()
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        # Staged is False -> send SHOULD be called
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "👥 Core Friends Alert", {"has_items": True, "decision_staged": False})):
+            await bshed.dispatch_scheduled_prompt(
+                "Monthly check for local Core friends not seen using /workspace/tools/core_friends_reminder.py",
+                "Monthly Core Friends Social Planning Reminder",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_weekly_meal_proposal_double_post_suppressed(self):
+        import tools.bridge_scheduler as bshed
+        from unittest.mock import AsyncMock
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        # Staged is True -> send should NOT be called
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🍽️ Menu Proposal", {"has_items": True, "decision_staged": True})):
+            await bshed.dispatch_scheduled_prompt(
+                "Generate the weekly meal proposal using /workspace/tools/meal_planner_proposal.py",
+                "Weekly 3-Dinner Meal Proposal",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_not_called()
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        # Staged is False -> send SHOULD be called
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🍽️ Menu Proposal", {"has_items": True, "decision_staged": False})):
+            await bshed.dispatch_scheduled_prompt(
+                "Generate the weekly meal proposal using /workspace/tools/meal_planner_proposal.py",
+                "Weekly 3-Dinner Meal Proposal",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reddit_fantasy_scanner_double_post_suppressed(self):
+        import tools.bridge_scheduler as bshed
+        from unittest.mock import AsyncMock
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        # Staged is True -> send should NOT be called
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "⚾ Draft Dilemma Card", {"selected": {}, "decision_staged": True})):
+            await bshed.dispatch_scheduled_prompt(
+                "Scan r/fantasybaseball comments using /workspace/tools/reddit_fantasy_scanner.py",
+                "Reddit Fantasy Baseball Scanner",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_not_called()
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        # Staged is False -> send SHOULD be called
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "⚾ Draft Dilemma Card", {"selected": {}, "decision_staged": False})):
+            await bshed.dispatch_scheduled_prompt(
+                "Scan r/fantasybaseball comments using /workspace/tools/reddit_fantasy_scanner.py",
+                "Reddit Fantasy Baseball Scanner",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_called_once()

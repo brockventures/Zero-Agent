@@ -277,7 +277,8 @@ def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> 
             has_items = ok
             ok = True
             status = "ok"
-            extra = {"has_items": has_items, "has_due": has_items}
+            base_extra = extra if isinstance(extra, dict) else {}
+            extra = {**base_extra, "has_items": has_items, "has_due": has_items}
         elif job_id == "ev9":
             # (has_digest, msg, plot): daily silent capture is normal healthy operation
             if message and any(err_tag in message for err_tag in ("⚠️", "🚨", "Error", "Exception")):
@@ -1188,33 +1189,39 @@ def run_antigravity_check() -> tuple[bool, str]:
     except Exception as e:
         return False, f"⚠️ Antigravity CLI check failed: {e}"
 
-def run_birthday_reminders(date_str: str | None = None) -> tuple[bool, str]:
+def run_birthday_reminders(date_str: str | None = None) -> tuple[bool, str, dict]:
     """Check for friend & family birthdays today and format interactive text reminder."""
     try:
         from tools.birthday_reminder import check_birthdays
+        import tools.birthday_reminder as birthday_reminder
         has_bday, msg, _ = check_birthdays(date_str)
-        return has_bday, msg if has_bday else ""
+        decision_staged = getattr(birthday_reminder, "LAST_DECISION_STAGED", False)
+        return has_bday, msg if has_bday else "", {"has_items": bool(has_bday), "decision_staged": decision_staged}
     except Exception as e:
-        return False, f"⚠️ Birthday reminder check failed: {e}"
+        return False, f"⚠️ Birthday reminder check failed: {e}", {"has_items": False, "decision_staged": False}
 
-def run_social_last_seen_review(days: int = 7) -> tuple[bool, str]:
+def run_social_last_seen_review(days: int = 7) -> tuple[bool, str, dict]:
     """Review past week of calendar & communications for social gatherings and proposed Last Seen updates."""
     try:
         from tools.social_last_seen_review import identify_social_updates, format_review_message
+        import tools.social_last_seen_review as social_last_seen_review
         updates = identify_social_updates(days=days)
         has_events, msg = format_review_message(updates)
-        return has_events, msg if has_events else ""
+        decision_staged = getattr(social_last_seen_review, "LAST_DECISION_STAGED", False)
+        return has_events, msg if has_events else "", {"has_items": bool(has_events), "decision_staged": decision_staged}
     except Exception as e:
-        return False, f"⚠️ Social review check failed: {e}"
+        return False, f"⚠️ Social review check failed: {e}", {"has_items": False, "decision_staged": False}
 
-def run_core_friends_reminder(weeks: int = 8, as_of_date: str | None = None) -> tuple[bool, str]:
+def run_core_friends_reminder(weeks: int = 8, as_of_date: str | None = None) -> tuple[bool, str, dict]:
     """Monthly check for local Core friends not seen in >= 8 weeks."""
     try:
         from tools.core_friends_reminder import check_core_friends_unseen
+        import tools.core_friends_reminder as core_friends_reminder
         has_friends, msg, _ = check_core_friends_unseen(weeks=weeks, as_of_date=as_of_date)
-        return has_friends, msg if has_friends else ""
+        decision_staged = getattr(core_friends_reminder, "LAST_DECISION_STAGED", False)
+        return has_friends, msg if has_friends else "", {"has_items": bool(has_friends), "decision_staged": decision_staged}
     except Exception as e:
-        return False, f"⚠️ Core friends reminder check failed: {e}"
+        return False, f"⚠️ Core friends reminder check failed: {e}", {"has_items": False, "decision_staged": False}
 
 def run_hardcode_regex_audit() -> tuple[bool, str]:
     """Monthly codebase audit for hardcoded rules and brittle regex heuristics."""
@@ -1363,14 +1370,15 @@ def run_weekly_grocery_staging() -> tuple[bool, str]:
     except Exception as e:
         return False, f"⚠️ Weekly grocery staging failed: {e}"
 
-def run_weekly_meal_proposal() -> tuple[bool, str]:
+def run_weekly_meal_proposal() -> tuple[bool, str, dict]:
     """Generates the 3-dinner weekly rotation proposal for Tuesday, Thursday, and Sunday."""
     try:
         from tools.meal_planner_proposal import generate_proposal, format_proposal_markdown
         plan = generate_proposal()
-        return True, format_proposal_markdown(plan)
+        decision_staged = bool(plan.get("decision_staged", False)) if isinstance(plan, dict) else False
+        return True, format_proposal_markdown(plan), {"has_items": True, "decision_staged": decision_staged}
     except Exception as e:
-        return False, f"⚠️ Weekly meal planning proposal failed: {e}"
+        return False, f"⚠️ Weekly meal planning proposal failed: {e}", {"has_items": False, "decision_staged": False}
 
 def run_tasks_sync(quiet: bool = True, *args, **kwargs) -> tuple[bool, str, dict]:
     """Execute two-way synchronization between tasks.json and Google Tasks."""

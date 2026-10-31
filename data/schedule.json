@@ -9,8 +9,8 @@
     "prompt": "Run NYSE/Nasdaq closing-bell power-hour quantitative paper trading sweep across Books 2-5: python3 /workspace/tools/sidecars.py quant. Silent background execution (alerts #vault only on error).",
     "catchup_if_missed": false,
     "quiet_hours": null,
-    "last_run_ts": 1793335647,
-    "last_run_at": "2026-10-29 09:47 PM PT",
+    "last_run_ts": 1793411115,
+    "last_run_at": "2026-10-30 06:45 PM PT",
     "next_run_ts": 1793475900.0,
     "channel_id": 1550577910757458015
   },
@@ -471,9 +471,9 @@
     "interval_seconds": 300,
     "prompt": "Run the bridge liveness & gateway watchdog check using /workspace/tools/sidecars.py bridge_watchdog. Auto-heals and alerts only if degraded (silent when nominal).",
     "catchup_if_missed": false,
-    "last_run_ts": 1793408495,
-    "last_run_at": "2026-10-30 06:01 PM PT",
-    "next_run_ts": 1793408795.0,
+    "last_run_ts": 1793411620,
+    "last_run_at": "2026-10-30 06:53 PM PT",
+    "next_run_ts": 1793412501.4142754,
     "channel_id": 1544953279664889888
   },
   {
@@ -485,9 +485,9 @@
     "channel_id": 1544953279664889888,
     "prompt": "Run the Host 2 and Host 1 PID & process headroom watchdog using /workspace/tools/sidecars.py pid_watchdog. Silent execution unless warning or critical threshold exceeded.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793408121,
-    "last_run_at": "2026-10-30 05:55 PM PT",
-    "next_run_ts": 1793409021.0
+    "last_run_ts": 1793411761,
+    "last_run_at": "2026-10-30 06:56 PM PT",
+    "next_run_ts": 1793412661.0
   },
   {
     "id": "agora_roguelike_pm",
@@ -657,9 +657,9 @@
       23,
       7
     ],
-    "last_run_ts": 1793324883,
-    "last_run_at": "2026-10-29 06:48 PM PT",
-    "next_run_ts": 1793411100.0,
+    "last_run_ts": 1793411124,
+    "last_run_at": "2026-10-30 06:45 PM PT",
+    "next_run_ts": 1793497500.0,
     "channel_id": 1550577910757458015
   },
   {
@@ -685,9 +685,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the Arr queue & health watchdog using /workspace/tools/sidecars.py arr_queue.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793405899,
-    "last_run_at": "2026-10-30 05:18 PM PT",
-    "next_run_ts": 1793409499.0
+    "last_run_ts": 1793409512,
+    "last_run_at": "2026-10-30 06:18 PM PT",
+    "next_run_ts": 1793413112.0
   },
   {
     "id": "prowlarr_watchdog",
@@ -724,9 +724,9 @@
     "channel_id": 1544953275877556334,
     "prompt": "Run the Nest lock & Homebridge self-healing watchdog using /workspace/tools/sidecars.py nest_lock.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793405976,
-    "last_run_at": "2026-10-30 05:19 PM PT",
-    "next_run_ts": 1793409576.0
+    "last_run_ts": 1793409591,
+    "last_run_at": "2026-10-30 06:19 PM PT",
+    "next_run_ts": 1793413191.0
   },
   {
     "id": "ha_reauth_watchdog",
@@ -737,9 +737,9 @@
     "channel_id": 1544953275877556334,
     "prompt": "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793405868,
-    "last_run_at": "2026-10-30 05:17 PM PT",
-    "next_run_ts": 1793409468.0
+    "last_run_ts": 1793409481,
+    "last_run_at": "2026-10-30 06:18 PM PT",
+    "next_run_ts": 1793413081.0
   },
   {
     "id": "google_tasks_sync",
@@ -749,9 +749,9 @@
     "interval_seconds": 1800,
     "prompt": "Run the Google Tasks two-way sync using /workspace/tools/sidecars.py tasks_sync. Silent sidecar execution (silent unless error).",
     "catchup_if_missed": false,
-    "last_run_ts": 1793407622,
-    "last_run_at": "2026-10-30 05:47 PM PT",
-    "next_run_ts": 1793409422.0
+    "last_run_ts": 1793411243,
+    "last_run_at": "2026-10-30 06:47 PM PT",
+    "next_run_ts": 1793413043.0
   },
   {
     "id": "quota_poller",
@@ -761,9 +761,9 @@
     "interval_seconds": 600,
     "prompt": "Run the 10-minute ground-truth quota usage poller using /workspace/tools/sidecars.py quota_poller. Captures live remaining fractions and cycle burn deltas.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793408362,
-    "last_run_at": "2026-10-30 05:59 PM PT",
-    "next_run_ts": 1793408962.0
+    "last_run_ts": 1793412037,
+    "last_run_at": "2026-10-30 07:00 PM PT",
+    "next_run_ts": 1793412637.0
   },
   {
     "id": "personal_data_sync",
@@ -794,9 +794,9 @@
       23,
       7
     ],
-    "last_run_ts": 1793408757.797521,
-    "last_run_at": "2026-10-30 06:05 PM PT",
-    "next_run_ts": 1793409057.797521
+    "last_run_ts": 1793412221,
+    "last_run_at": "2026-10-30 07:03 PM PT",
+    "next_run_ts": 1793412521.0
   },
   {
     "id": "resident_agents_daily_tip",
@@ -836,7 +836,7 @@
     "schedule_type": "daily",
     "hour_pt": 7,
     "minute_pt": 45,
-    "prompt": "Run the morning Inbox & RCS actionable triage Decision Card workflow using /workspace/tools/sidecars.py morning_inbox_triage_card.",
+    "prompt": "Run the morning Inbox & RCS actionable triage Decision Card workflow using /workspace/tools/sidecars.py morning_inbox_triage_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": 1793393294,
     "next_run_ts": 1793457900.0,
@@ -850,7 +850,7 @@
     "schedule_type": "daily",
     "hour_pt": 16,
     "minute_pt": 45,
-    "prompt": "Run the commute Inbox & RCS actionable triage Decision Card workflow using /workspace/tools/sidecars.py commute_inbox_triage_card.",
+    "prompt": "Run the commute Inbox & RCS actionable triage Decision Card workflow using /workspace/tools/sidecars.py commute_inbox_triage_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": 1793403925,
     "next_run_ts": 1793490300.0,
@@ -864,7 +864,7 @@
     "schedule_type": "daily",
     "hour_pt": 18,
     "minute_pt": 0,
-    "prompt": "Run the 48h Family Calendar & Action Radar Decision Card workflow using /workspace/tools/sidecars.py family_calendar_radar_card.",
+    "prompt": "Run the 48h Family Calendar & Action Radar Decision Card workflow using /workspace/tools/sidecars.py family_calendar_radar_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": 1793408418,
     "next_run_ts": 1793494800.0,
@@ -878,7 +878,7 @@
     "schedule_type": "daily",
     "hour_pt": 16,
     "minute_pt": 15,
-    "prompt": "Run the afternoon Dinner Defrost & Calendar Conflict Pivot Decision Card workflow using /workspace/tools/sidecars.py dinner_pivot_card.",
+    "prompt": "Run the afternoon Dinner Defrost & Calendar Conflict Pivot Decision Card workflow using /workspace/tools/sidecars.py dinner_pivot_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": 1793402315,
     "next_run_ts": 1793488500.0,
@@ -892,7 +892,7 @@
     "schedule_type": "daily",
     "hour_pt": 8,
     "minute_pt": 0,
-    "prompt": "Run the Actual Budget Anomaly & Overspend Detection Decision Card workflow using /workspace/tools/sidecars.py actual_budget_anomaly_card.",
+    "prompt": "Run the Actual Budget Anomaly & Overspend Detection Decision Card workflow using /workspace/tools/sidecars.py actual_budget_anomaly_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": 1793394186,
     "next_run_ts": 1793458800.0,
@@ -906,7 +906,7 @@
     "schedule_type": "daily",
     "hour_pt": 7,
     "minute_pt": 30,
-    "prompt": "Run the morning Weather, Air Quality & Pre-Adjustment Energy Decision Card workflow using /workspace/tools/sidecars.py weather_energy_card.",
+    "prompt": "Run the morning Weather, Air Quality & Pre-Adjustment Energy Decision Card workflow using /workspace/tools/sidecars.py weather_energy_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": null,
     "next_run_ts": 1793457000.0,
@@ -920,7 +920,7 @@
     "day_of_week": 2,
     "hour_pt": 18,
     "minute_pt": 15,
-    "prompt": "Run the Wednesday Mid-Week Staple & Voice Grocery Replenishment Decision Card workflow using /workspace/tools/sidecars.py midweek_grocery_card.",
+    "prompt": "Run the Wednesday Mid-Week Staple & Voice Grocery Replenishment Decision Card workflow using /workspace/tools/sidecars.py midweek_grocery_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": null,
     "next_run_ts": 1793844900.0,
@@ -933,7 +933,7 @@
     "schedule_type": "daily",
     "hour_pt": 20,
     "minute_pt": 15,
-    "prompt": "Run the evening PM Hobby & Build Decision Card workflow using /workspace/tools/sidecars.py evening_pm_build_card.",
+    "prompt": "Run the evening PM Hobby & Build Decision Card workflow using /workspace/tools/sidecars.py evening_pm_build_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": null,
     "next_run_ts": 1793416500.0,
@@ -947,7 +947,7 @@
     "day_of_week": 6,
     "hour_pt": 19,
     "minute_pt": 30,
-    "prompt": "Run the weekly Usage Pattern & Signal-to-Noise Telemetry Engine audit using /workspace/tools/sidecars.py usage_telemetry_audit.",
+    "prompt": "Run the weekly Usage Pattern & Signal-to-Noise Telemetry Engine audit using /workspace/tools/sidecars.py usage_telemetry_audit. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": null,
     "next_run_ts": 1793590200.0,
