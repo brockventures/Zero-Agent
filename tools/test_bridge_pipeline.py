@@ -745,6 +745,100 @@ class TestBridgeEmojiReactions(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[REACT", delivered_content)
         self.assertEqual(timer.status, "SUCCESS")
 
+    async def test_deliver_crab_cavern_gotchi_routes_choices_to_zero_chat(self):
+        """Verify interactive choice buttons generated in #gotchi are stripped from public reply and routed to #zero-chat."""
+        from tools.bridge_state import TARGET_CHANNEL_ID
+        gotchi_cid = 1561509863018856468
+
+        status_msg = AsyncMock()
+        reply_target = AsyncMock()
+        reply_target.channel = MagicMock()
+        reply_target.channel.id = gotchi_cid
+
+        bot = MagicMock()
+        zero_chat_mock = AsyncMock()
+        gotchi_mock = AsyncMock()
+
+        def get_channel_side_effect(cid):
+            if cid == TARGET_CHANNEL_ID:
+                return zero_chat_mock
+            elif cid == gotchi_cid:
+                return gotchi_mock
+            return None
+
+        bot.get_channel.side_effect = get_channel_side_effect
+        mock_view_cls = MagicMock(return_value="MOCK_GOTCHI_VIEW")
+        mock_btn_fn = MagicMock()
+
+        output_text = "Analysis complete for Gotchi game mechanics.\n\n[CHOICES: Deploy Update | Review Logs]"
+
+        await deliver_turn_output(
+            output_text=output_text,
+            status_msg=status_msg,
+            reply_target=reply_target,
+            mode="home",
+            channel_id=gotchi_cid,
+            conv_id="conv-gotchi-99",
+            turn_start_time=time.time(),
+            button_choice_fn=mock_btn_fn,
+            quick_choice_view_cls=mock_view_cls,
+            bot=bot,
+        )
+
+        # Public channel message must have choices stripped and view=None
+        status_msg.edit.assert_awaited_once()
+        pub_kwargs = status_msg.edit.call_args[1]
+        self.assertIn("Analysis complete for Gotchi game mechanics.", pub_kwargs["content"])
+        self.assertNotIn("[CHOICES:", pub_kwargs["content"])
+        self.assertIsNone(pub_kwargs["view"])
+
+        # #zero-chat receives routed decision card with origin attribution
+        zero_chat_mock.send.assert_awaited_once()
+        zc_args, zc_kwargs = zero_chat_mock.send.call_args
+        self.assertIn(f"📍 **Decision routed from <#{gotchi_cid}>:**", zc_args[0])
+        self.assertIn("Analysis complete for Gotchi game mechanics.", zc_args[0])
+        self.assertEqual(zc_kwargs["view"], "MOCK_GOTCHI_VIEW")
+
+    async def test_deliver_external_mode_routes_choices_to_zero_chat(self):
+        """Verify choices in mode='external' (e.g. #lounge) are routed to #zero-chat."""
+        from tools.bridge_state import TARGET_CHANNEL_ID
+        lounge_cid = 1534452820995080192
+
+        status_msg = AsyncMock()
+        reply_target = AsyncMock()
+        reply_target.channel = MagicMock()
+        reply_target.channel.id = lounge_cid
+
+        bot = MagicMock()
+        zero_chat_mock = AsyncMock()
+        bot.get_channel.side_effect = lambda cid: zero_chat_mock if cid == TARGET_CHANNEL_ID else None
+        mock_view_cls = MagicMock(return_value="MOCK_LOUNGE_VIEW")
+        mock_btn_fn = MagicMock()
+
+        output_text = "Discussion summary in lounge.\n\n[CHOICES: Create Task | Dismiss]"
+
+        await deliver_turn_output(
+            output_text=output_text,
+            status_msg=status_msg,
+            reply_target=reply_target,
+            mode="external",
+            channel_id=lounge_cid,
+            conv_id="conv-lounge-99",
+            turn_start_time=time.time(),
+            button_choice_fn=mock_btn_fn,
+            quick_choice_view_cls=mock_view_cls,
+            bot=bot,
+        )
+
+        status_msg.edit.assert_awaited_once()
+        self.assertIn("Discussion summary in lounge.", status_msg.edit.call_args[1]["content"])
+        self.assertNotIn("[CHOICES:", status_msg.edit.call_args[1]["content"])
+
+        zero_chat_mock.send.assert_awaited_once()
+        zc_args, zc_kwargs = zero_chat_mock.send.call_args
+        self.assertIn(f"📍 **Decision routed from <#{lounge_cid}>:**", zc_args[0])
+        self.assertEqual(zc_kwargs["view"], "MOCK_LOUNGE_VIEW")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -632,6 +632,63 @@ def prepare_turn_prompt(
         )
 
 
+async def _send_routed_choice_card(
+    bot: Any,
+    dest_cid: int | None,
+    chunk_excerpt: str,
+    choice_view: Any,
+    target_dest: Any = None,
+    reply_target: Any = None,
+    status_msg: Any = None,
+) -> None:
+    """Send a routed decision choice view to #zero-chat with origin attribution."""
+    try:
+        target_bot = bot
+        if target_bot is None:
+            target_bot = getattr(target_dest, "bot", None) or getattr(reply_target, "bot", None)
+        if target_bot is None:
+            try:
+                from tools.bridge import bot as _bridge_bot
+                target_bot = _bridge_bot
+            except Exception:
+                target_bot = None
+
+        zero_chat_ch = None
+        if target_bot is not None and hasattr(target_bot, "get_channel"):
+            zero_chat_ch = target_bot.get_channel(TARGET_CHANNEL_ID)
+            if zero_chat_ch is not None and asyncio.iscoroutine(zero_chat_ch):
+                zero_chat_ch = await zero_chat_ch
+            if zero_chat_ch is None and hasattr(target_bot, "fetch_channel"):
+                try:
+                    zero_chat_ch = await target_bot.fetch_channel(TARGET_CHANNEL_ID)
+                except Exception:
+                    zero_chat_ch = None
+
+        if zero_chat_ch is None:
+            for candidate in (target_dest, reply_target, status_msg):
+                if candidate is not None:
+                    g = getattr(candidate, "guild", None)
+                    if g and hasattr(g, "get_channel"):
+                        zero_chat_ch = g.get_channel(TARGET_CHANNEL_ID)
+                        if zero_chat_ch is not None and asyncio.iscoroutine(zero_chat_ch):
+                            zero_chat_ch = await zero_chat_ch
+                        if zero_chat_ch:
+                            break
+                    state = getattr(candidate, "_state", None)
+                    if state and hasattr(state, "get_channel"):
+                        zero_chat_ch = state.get_channel(TARGET_CHANNEL_ID)
+                        if zero_chat_ch is not None and asyncio.iscoroutine(zero_chat_ch):
+                            zero_chat_ch = await zero_chat_ch
+                        if zero_chat_ch:
+                            break
+
+        if zero_chat_ch and hasattr(zero_chat_ch, "send"):
+            header_text = f"📍 **Decision routed from <#{dest_cid}>:**\n{chunk_excerpt}"
+            await zero_chat_ch.send(header_text, view=choice_view)
+    except Exception as route_err:
+        print(f"[BridgePipeline] Error routing choice card to #zero-chat: {route_err}")
+
+
 async def deliver_turn_output(
     output_text: str,
     status_msg: discord.Message | None,
@@ -653,6 +710,7 @@ async def deliver_turn_output(
     is_physical_mention: bool = False,
     timer: TurnTimer | None = None,
     existing_messages: list[discord.Message] | None = None,
+    bot: Any = None,
 ) -> list[discord.Message]:
     """Unified Discord response delivery engine across persistent daemons and dynamic turns."""
     if timer:
@@ -696,6 +754,23 @@ async def deliver_turn_output(
         final_text = strip_reaction_gifs(final_text)
 
     if mode == "external":
+        ext_choice_view = None
+        if quick_choice_view_cls and button_choice_fn:
+            from tools.bridge_safety import mask_code_spans, restore_code_spans
+            masked_ext, ext_choice_spans = mask_code_spans(final_text, prefix="\x00PIPE_CHOICES_")
+            ext_matches = [m for m in _CODE_OR_CHOICES_RE.finditer(masked_ext) if m.group(2) is not None]
+            for m in reversed(ext_matches):
+                raw_c = m.group(3).strip()
+                delim = "|" if "|" in raw_c else ","
+                parsed_c = [
+                    restore_code_spans(c, ext_choice_spans, prefix="\x00PIPE_CHOICES_").strip()
+                    for c in raw_c.split(delim)
+                    if c.strip()
+                ]
+                if parsed_c and not all(c in ("...", "…", "Option 1", "Option 2", "Option 3") for c in parsed_c):
+                    ext_choice_view = quick_choice_view_cls(parsed_c, button_choice_fn)
+                    break
+
         clean_ext_text = re.sub(r":\s*(?:\n\s*)*\[(?:CHOICES|OPTIONS):\s*(?:[^\[\]]|\[[^\]]*\])+\]\s*$", ".", final_text, flags=re.IGNORECASE).strip()
         clean_ext_text = strip_unquoted_choices(clean_ext_text)
         clean_ext_text = scrub_credentials(clean_ext_text)
@@ -976,6 +1051,18 @@ async def deliver_turn_output(
                         sent_messages.append(m)
 
             increment_bot_messages(len(chunks))
+
+            if ext_choice_view:
+                last_chunk = chunks[-1][:400] if chunks else ""
+                await _send_routed_choice_card(
+                    bot=bot,
+                    dest_cid=dest_cid,
+                    chunk_excerpt=last_chunk,
+                    choice_view=ext_choice_view,
+                    target_dest=target_dest,
+                    reply_target=reply_target,
+                    status_msg=status_msg,
+                )
         finally:
             if held_turn_banana:
                 try:
@@ -1193,6 +1280,11 @@ async def deliver_turn_output(
         except (ValueError, TypeError):
             dest_cid = None
 
+    routed_choice_view = None
+    if choice_view and (mode != "home" or (dest_cid is not None and not is_home_channel(dest_cid))):
+        routed_choice_view = choice_view
+        choice_view = None
+
     is_banana_stand = (dest_cid == BANANA_STAND_CHANNEL_ID)
     held_turn_banana = False
 
@@ -1284,6 +1376,18 @@ async def deliver_turn_output(
                         sent_messages.append(m_last)
 
             increment_bot_messages(len(chunks))
+
+        if routed_choice_view:
+            last_chunk = chunks[-1][:400] if chunks else ""
+            await _send_routed_choice_card(
+                bot=bot,
+                dest_cid=dest_cid,
+                chunk_excerpt=last_chunk,
+                choice_view=routed_choice_view,
+                target_dest=target_dest,
+                reply_target=reply_target,
+                status_msg=status_msg,
+            )
 
         if artifact_files:
             try:
