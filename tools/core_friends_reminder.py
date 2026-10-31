@@ -25,6 +25,16 @@ PT = ZoneInfo("America/Los_Angeles")
 TARGET_CHANNEL_ID = 1542081375287640084
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 CSV_PATH = Path(os.environ.get("FRIENDS_CSV_PATH", "/workspace/data/friends_and_family_master.csv"))
+LAST_DECISION_STAGED: bool = False
+
+
+def _should_stage(stage: bool | None) -> bool:
+    """Determine whether a Decision Card should be staged."""
+    if stage is True:
+        return True
+    if stage is False:
+        return False
+    return "pytest" not in sys.modules and not os.environ.get("PYTEST_CURRENT_TEST")
 
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
@@ -186,12 +196,18 @@ def format_couple_display_name(person: dict, partner: dict | None) -> str:
     else:
         return f"{c1} & {c2}"
 
-def check_core_friends_unseen(weeks: int = 8, as_of_date: str | None = None) -> tuple[bool, str, list[dict]]:
+def check_core_friends_unseen(
+    weeks: int = 8,
+    as_of_date: str | None = None,
+    stage: bool | None = None,
+) -> tuple[bool, str, list[dict]]:
     """Identify Core local friends who have not been seen in >= weeks.
     
     Returns:
         (has_friends: bool, formatted_message: str, qualifying_friends: list[dict])
     """
+    global LAST_DECISION_STAGED
+    LAST_DECISION_STAGED = False
     contacts = load_contacts()
     if not contacts:
         return False, "No contacts found in master database.", []
@@ -293,36 +309,41 @@ def check_core_friends_unseen(weeks: int = 8, as_of_date: str | None = None) -> 
     lines.append("_Consider reaching out to organize dinner, drinks, playdates, or weekend plans!_")
 
     decision_staged = False
-    try:
-        from tools.forge import stage_decision
+    if _should_stage(stage):
+        try:
+            from tools.forge import stage_decision
 
-        summary_names = ", ".join(p.get("display_name") or p["name"] for p in qualifying[:3])
-        if len(qualifying) > 3:
-            summary_names += f" and {len(qualifying) - 3} more"
-        summary_text = (
-            f"Identified {len(qualifying)} local Core friend(s) ({summary_names}) "
-            f"not seen in >= {weeks} weeks. Consider reaching out to organize dinner, drinks, or weekend plans."
-        )
+            summary_names = ", ".join(p.get("display_name") or p["name"] for p in qualifying[:3])
+            if len(qualifying) > 3:
+                summary_names += f" and {len(qualifying) - 3} more"
+            summary_text = (
+                f"Identified {len(qualifying)} local Core friend(s) ({summary_names}) "
+                f"not seen in >= {weeks} weeks. Consider reaching out to organize dinner, drinks, or weekend plans."
+            )
 
-        cmd = f"python3 /workspace/tools/core_friends_reminder.py --weeks {weeks}"
-        if as_of_date:
-            cmd += f" --as-of-date {as_of_date}"
+            cmd = f"python3 /workspace/tools/core_friends_reminder.py --weeks {weeks}"
+            if as_of_date:
+                cmd += f" --as-of-date {as_of_date}"
 
-        stage_decision(
-            category="core_friends",
-            title=f"Core Friends Reconnect Reminder ({len(qualifying)} unseen)",
-            summary=summary_text,
-            handler_type="shell",
-            payload={
-                "command": cmd,
-                "cwd": "/workspace",
-            },
-            channel_id=TARGET_CHANNEL_ID,
-            post_to_discord=True,
-        )
-        decision_staged = True
-    except Exception as e:
-        print(f"[CoreFriends] Decision Card staging fallback: {e}", file=sys.stderr)
+            res = stage_decision(
+                category="core_friends",
+                title=f"Core Friends Reconnect Reminder ({len(qualifying)} unseen)",
+                summary=summary_text,
+                handler_type="shell",
+                payload={
+                    "command": cmd,
+                    "cwd": "/workspace",
+                },
+                channel_id=TARGET_CHANNEL_ID,
+                post_to_discord=True,
+            )
+            decision_staged = bool(res.get("ok", True) if isinstance(res, dict) else True)
+        except Exception as e:
+            print(f"[CoreFriends] Decision Card staging fallback: {e}", file=sys.stderr)
+
+    LAST_DECISION_STAGED = decision_staged
+    for p in qualifying:
+        p["_decision_staged"] = decision_staged
 
     if not decision_staged:
         lines.append("\n[CHOICES: View Full Friends Sheet | Remind Me in 2 Weeks | Dismiss]")

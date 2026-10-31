@@ -29,6 +29,16 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 CSV_PATH = Path(os.environ.get("FRIENDS_CSV_PATH", "/workspace/data/friends_and_family_master.csv"))
 MD_PATH = Path(os.environ.get("FRIENDS_MD_PATH", "/workspace/memory/private/private_friends_and_family.md"))
 PENDING_FILE = DATA_DIR / "pending_last_seen_updates.json"
+LAST_DECISION_STAGED: bool = False
+
+
+def _should_stage(stage: bool | None) -> bool:
+    """Determine whether a Decision Card should be staged."""
+    if stage is True:
+        return True
+    if stage is False:
+        return False
+    return "pytest" not in sys.modules and not os.environ.get("PYTEST_CURRENT_TEST")
 
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
@@ -447,7 +457,9 @@ def identify_social_updates(days: int = 7) -> list[dict]:
 
     return proposed_updates
 
-def format_review_message(updates: list[dict]) -> tuple[bool, str]:
+def format_review_message(updates: list[dict], stage: bool | None = None) -> tuple[bool, str]:
+    global LAST_DECISION_STAGED
+    LAST_DECISION_STAGED = False
     if not updates:
         return False, "No qualifying social events or new interactions identified in the past week."
 
@@ -471,32 +483,37 @@ def format_review_message(updates: list[dict]) -> tuple[bool, str]:
         json.dump(updates, f, indent=2)
 
     decision_staged = False
-    try:
-        from tools.forge import stage_decision
+    if _should_stage(stage):
+        try:
+            from tools.forge import stage_decision
 
-        summary_names = ", ".join(u.get("name", "") for u in updates[:3])
-        if len(updates) > 3:
-            summary_names += f" and {len(updates) - 3} more"
-        summary_text = (
-            f"Identified {len(updates)} candidate social interaction(s) ({summary_names}) "
-            "from the past week. Approving applies Last Seen dates to contacts master and Google Sheet."
-        )
+            summary_names = ", ".join(u.get("name", "") for u in updates[:3])
+            if len(updates) > 3:
+                summary_names += f" and {len(updates) - 3} more"
+            summary_text = (
+                f"Identified {len(updates)} candidate social interaction(s) ({summary_names}) "
+                "from the past week. Approving applies Last Seen dates to contacts master and Google Sheet."
+            )
 
-        stage_decision(
-            category="social_review",
-            title="Confirm & Apply Last Seen Updates",
-            summary=summary_text,
-            handler_type="shell",
-            payload={
-                "command": "python3 /workspace/tools/social_last_seen_review.py --apply",
-                "cwd": "/workspace",
-            },
-            channel_id=TARGET_CHANNEL_ID,
-            post_to_discord=True,
-        )
-        decision_staged = True
-    except Exception as e:
-        print(f"[SocialReview] Decision Card staging fallback: {e}", file=sys.stderr)
+            res = stage_decision(
+                category="social_review",
+                title="Confirm & Apply Last Seen Updates",
+                summary=summary_text,
+                handler_type="shell",
+                payload={
+                    "command": "python3 /workspace/tools/social_last_seen_review.py --apply",
+                    "cwd": "/workspace",
+                },
+                channel_id=TARGET_CHANNEL_ID,
+                post_to_discord=True,
+            )
+            decision_staged = bool(res.get("ok", True) if isinstance(res, dict) else True)
+        except Exception as e:
+            print(f"[SocialReview] Decision Card staging fallback: {e}", file=sys.stderr)
+
+    LAST_DECISION_STAGED = decision_staged
+    for u in updates:
+        u["_decision_staged"] = decision_staged
 
     if not decision_staged:
         lines.append("\n[CHOICES: Confirm & Apply Last Seen Updates | Ignore Last Seen Updates]")

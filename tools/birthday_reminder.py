@@ -20,6 +20,16 @@ from zoneinfo import ZoneInfo
 PT = ZoneInfo("America/Los_Angeles")
 TARGET_CHANNEL_ID = 1542081375287640084
 CSV_PATH = Path(os.environ.get("FRIENDS_CSV_PATH", "/workspace/data/friends_and_family_master.csv"))
+LAST_DECISION_STAGED: bool = False
+
+
+def _should_stage(stage: bool | None) -> bool:
+    """Determine whether a Decision Card should be staged."""
+    if stage is True:
+        return True
+    if stage is False:
+        return False
+    return "pytest" not in sys.modules and not os.environ.get("PYTEST_CURRENT_TEST")
 
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
@@ -56,12 +66,17 @@ def find_partner(person: dict, all_contacts: list[dict] | None = None) -> str | 
             return re.sub(r"\(.*?\)", "", m.group(1)).strip()
     return None
 
-def check_birthdays(target_date: str | None = None) -> tuple[bool, str, list[dict]]:
+def check_birthdays(
+    target_date: str | None = None,
+    stage: bool | None = None,
+) -> tuple[bool, str, list[dict]]:
     """Check for birthdays matching target_date (default: today in PT).
     
     target_date format: 'MM-DD' or 'YYYY-MM-DD'
     Returns: (has_birthdays: bool, formatted_message: str, matched_contacts: list[dict])
     """
+    global LAST_DECISION_STAGED
+    LAST_DECISION_STAGED = False
     now_pt = datetime.now(PT)
     if not target_date:
         today_mm_dd = now_pt.strftime("%m-%d")
@@ -135,28 +150,33 @@ def check_birthdays(target_date: str | None = None) -> tuple[bool, str, list[dic
         buttons.append("Remind Me Later")
 
     decision_staged = False
-    try:
-        from tools.forge import stage_decision
+    if _should_stage(stage):
+        try:
+            from tools.forge import stage_decision
 
-        names = ", ".join(p.get("Name", "Friend") for p in matched)
-        summary_text = f"Birthday alert for {names} today ({display_date}). Send birthday wishes!"
-        cmd = f"python3 /workspace/tools/birthday_reminder.py --date {today_mm_dd}"
+            names = ", ".join(p.get("Name", "Friend") for p in matched)
+            summary_text = f"Birthday alert for {names} today ({display_date}). Send birthday wishes!"
+            cmd = f"python3 /workspace/tools/birthday_reminder.py --date {today_mm_dd}"
 
-        stage_decision(
-            category="birthday",
-            title=f"Birthday Alert: {names}",
-            summary=summary_text,
-            handler_type="shell",
-            payload={
-                "command": cmd,
-                "cwd": "/workspace",
-            },
-            channel_id=TARGET_CHANNEL_ID,
-            post_to_discord=True,
-        )
-        decision_staged = True
-    except Exception as e:
-        print(f"[BirthdayReminder] Decision Card staging fallback: {e}", file=sys.stderr)
+            res = stage_decision(
+                category="birthday",
+                title=f"Birthday Alert: {names}",
+                summary=summary_text,
+                handler_type="shell",
+                payload={
+                    "command": cmd,
+                    "cwd": "/workspace",
+                },
+                channel_id=TARGET_CHANNEL_ID,
+                post_to_discord=True,
+            )
+            decision_staged = bool(res.get("ok", True) if isinstance(res, dict) else True)
+        except Exception as e:
+            print(f"[BirthdayReminder] Decision Card staging fallback: {e}", file=sys.stderr)
+
+    LAST_DECISION_STAGED = decision_staged
+    for person in matched:
+        person["_decision_staged"] = decision_staged
 
     if not decision_staged:
         message = "\n".join(lines).strip() + "\n\n[CHOICES: " + " | ".join(buttons) + "]"
