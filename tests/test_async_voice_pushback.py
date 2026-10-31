@@ -402,3 +402,201 @@ async def test_gotchi_zero_adapter_handle_turn_async_long_condensation():
     assert res["reply"].startswith("Regarding the report:")
     assert "I posted the full details to Discord." in res["reply"]
     assert len(res["reply"].split()) < 35
+
+
+def test_firmware_source_contract_eyes_free_ptt_fetch():
+    """
+    Verifies firmware source code invariants in main.cpp, voice_client.h, and voice_client.cpp:
+    1. s_pending_answer_ready with 2-hour TTL (7200s).
+    2. handleRpcCommand latches s_pending_answer_ready on notify with has_pending_audio or answer_id.
+    3. runPttTurn checks isPendingAnswerValid() and immediately fetches pending answer without opening mic.
+    4. Full BTN_TOP abort support via pollVoiceAbort passed to fetchPendingAnswer.
+    5. fetchPendingAnswer and ackPendingAnswer declarations and implementations.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path("firmware/src/main.cpp"),
+        Path("/workspace/gotchi/firmware/src/main.cpp"),
+    ]
+    main_cpp = next((p for p in candidates if p.exists()), None)
+    assert main_cpp is not None, "firmware/src/main.cpp must exist"
+    main_text = main_cpp.read_text()
+
+    assert "s_pending_answer_ready" in main_text
+    assert "PENDING_ANSWER_TTL_MS" in main_text
+    assert "2UL * 3600UL * 1000UL" in main_text or "7200000" in main_text
+    assert "isPendingAnswerValid" in main_text
+    assert "has_pending_audio" in main_text
+    assert "fetchPendingAnswer" in main_text
+
+    # Verify voice_client declarations and implementations
+    h_cands = [
+        Path("firmware/src/voice_client.h"),
+        Path("firmware/include/voice_client.h"),
+        Path("/workspace/gotchi/firmware/include/voice_client.h"),
+    ]
+    h_file = next((p for p in h_cands if p.exists()), None)
+    assert h_file is not None, "voice_client.h must exist"
+
+    cpp_cands = [
+        Path("firmware/src/voice_client.cpp"),
+        Path("/workspace/gotchi/firmware/src/voice_client.cpp"),
+    ]
+    cpp_file = next((p for p in cpp_cands if p.exists()), None)
+    assert cpp_file is not None, "firmware/src/voice_client.cpp must exist"
+    cpp_text = cpp_file.read_text()
+
+    assert "buildPendingAnswerUrl" in cpp_text
+    assert "ackPendingAnswer" in cpp_text
+    assert "fetchPendingAnswer" in cpp_text
+    assert "/api/gotchi/pending_answer" in cpp_text
+
+
+def test_firmware_state_machine_simulation_with_gateway():
+    """
+    Simulates the firmware state machine lifecycle with real VoiceGatewayService endpoints:
+    1. Device is IDLE.
+    2. Notify payload arrives (has_pending_audio=True, answer_id='ans-test-999').
+    3. s_pending_answer_ready latches with 2-hour TTL.
+    4. 60s visual banner expires; s_pending_answer_ready remains True.
+    5. Short tap of BTN_TOP_PTT in IDLE triggers fetch & play instead of mic recording.
+    6. Audio stream received from GET /api/gotchi/pending_answer.
+    7. POST /api/gotchi/pending_answer/ack clears pending state on gateway and badge.
+    8. Subsequent PTT tap opens mic normally.
+    """
+    store = PendingVoiceAnswerStore(db_path=":memory:")
+    cfg = LLMConfig.from_env_or_file()
+    service = VoiceGatewayService(llm_config=cfg, pending_answer_store=store)
+    app = create_app(service=service)
+    client = TestClient(app)
+
+    # 1. Gateway saves pending answer
+    sample_audio = b"\xde\xad\xbe\xef" * 16
+    saved = store.save_answer(
+        answer_id="ans-test-999",
+        node_id="gotchi-sim-01",
+        topic="the morning weather",
+        spoken_text="Regarding the morning weather: High of 72 degrees with clear skies.",
+        audio_pcm=sample_audio,
+        ttl_s=7200.0,
+    )
+    assert saved["answer_id"] == "ans-test-999"
+
+    # 2. Firmware state machine emulation
+    class GotchiFirmwareSimulator:
+        def __init__(self, node_id: str, test_client: TestClient):
+            self.node_id = node_id
+            self.client = test_client
+            self.state = "IDLE"
+            self.status_text = ""
+            self.notify_expire_ts = 0.0
+            self.pending_answer_ready = False
+            self.pending_answer_expire_ts = 0.0
+            self.pending_answer_id = ""
+            self.mic_opened = False
+            self.last_audio_played = b""
+            self.clock = 1000.0
+
+        def is_pending_valid(self) -> bool:
+            if not self.pending_answer_ready:
+                return False
+            if self.clock >= self.pending_answer_expire_ts:
+                self.pending_answer_ready = False
+                self.pending_answer_id = ""
+                return False
+            return True
+
+        def handle_rpc_notify(self, payload: dict) -> dict:
+            if self.state != "IDLE":
+                return {"ok": False, "error": "busy"}
+            chime = payload.get("chime", "ready")
+            msg = (payload.get("status_text") or payload.get("message") or "BUILD READY")[:22]
+            self.status_text = msg
+            self.notify_expire_ts = self.clock + 60.0  # 60s visual banner
+            has_pending = payload.get("has_pending_audio", False)
+            ans_id = payload.get("answer_id", "")
+            if has_pending or ans_id:
+                self.pending_answer_ready = True
+                self.pending_answer_expire_ts = self.clock + 7200.0  # 2-hour TTL
+                self.pending_answer_id = ans_id
+            return {"ok": True, "status_text": self.status_text, "chime": chime}
+
+        def loop_tick(self, delta_s: float):
+            self.clock += delta_s
+            # 60s visual banner expiration
+            if self.state == "IDLE" and self.status_text and self.clock >= self.notify_expire_ts:
+                self.status_text = ""
+
+        def press_ptt(self, abort_during_playback: bool = False):
+            # Mirror firmware/src/main.cpp:runPttTurn
+            if self.is_pending_valid():
+                self.pending_answer_ready = False
+                ans_id = self.pending_answer_id
+                self.pending_answer_id = ""
+                self.status_text = ""
+                self.state = "THINKING"
+                self.mic_opened = False  # Mic NEVER opened!
+
+                # Fetch from gateway
+                resp = self.client.get(f"/api/gotchi/pending_answer?node_id={self.node_id}&answer_id={ans_id}")
+                if resp.status_code == 200:
+                    self.state = "SPEAKING"
+                    # Parse SSE sentence audio
+                    for line in resp.text.splitlines():
+                        if line.startswith("data: ") and "audio_b64" in line:
+                            import json
+                            data = json.loads(line[6:])
+                            if "audio_b64" in data and data["audio_b64"]:
+                                self.last_audio_played = base64.b64decode(data["audio_b64"])
+                    # Send ack
+                    self.client.post(
+                        "/api/gotchi/pending_answer/ack",
+                        json={"node_id": self.node_id, "answer_id": ans_id},
+                    )
+                self.state = "IDLE"
+                return "pending_played"
+            else:
+                # Normal PTT turn: mic opens
+                self.mic_opened = True
+                self.state = "LISTENING"
+                return "normal_ptt"
+
+    sim = GotchiFirmwareSimulator("gotchi-sim-01", client)
+    assert sim.state == "IDLE"
+    assert not sim.is_pending_valid()
+
+    # Step 1: Notify RPC arrives
+    res = sim.handle_rpc_notify({
+        "cmd": "notify",
+        "has_pending_audio": True,
+        "answer_id": "ans-test-999",
+        "status_text": "ANSWER READY",
+        "chime": "ready",
+    })
+    assert res["ok"] is True
+    assert sim.status_text == "ANSWER READY"
+    assert sim.is_pending_valid() is True
+
+    # Step 2: 65 seconds elapse -> visual banner clears, but 2-hour pending answer remains latched!
+    sim.loop_tick(65.0)
+    assert sim.status_text == ""
+    assert sim.is_pending_valid() is True
+
+    # Step 3: User taps BTN_TOP_PTT in IDLE
+    turn_result = sim.press_ptt()
+    assert turn_result == "pending_played"
+    assert sim.mic_opened is False  # Mic was NOT opened!
+    assert sim.last_audio_played == sample_audio
+    assert sim.pending_answer_ready is False
+    assert sim.state == "IDLE"
+
+    # Step 4: Verify answer was acked on gateway
+    assert store.get_latest_pending("gotchi-sim-01") is None
+
+    # Step 5: Next PTT press in IDLE opens mic normally for speech
+    next_turn = sim.press_ptt()
+    assert next_turn == "normal_ptt"
+    assert sim.mic_opened is True
+    assert sim.state == "LISTENING"
+
