@@ -366,6 +366,9 @@ def test_calendar_radar_detects_overlap_tight_buffer_and_prep(test_db: Path) -> 
     payload = json.loads(row["payload_json"])
     valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
     assert valid_sh is True, f"Shell payload invalid: {val_err}"
+    assert "task_manager.py add" in payload["command"]
+    assert len(payload.get("tasks_to_create", [])) == 3
+    assert any("Rosie 4th Birthday Party" in t for t in payload["tasks_to_create"])
 
 
 def test_calendar_radar_dry_run(test_db: Path) -> None:

@@ -625,10 +625,29 @@ def run_family_calendar_radar_card(
             "issues": issues,
         }
 
-    # 7. Stage Decision Card in #brock-house
+    # 7. Stage Decision Card in #brock-house (Approve adds task(s) to Google Tasks via task_manager.py)
+    import shlex as _shlex
+    task_cmds: list[str] = []
+    task_titles: list[str] = []
+    for issue in issues[:8]:
+        itype = issue["type"]
+        evs = issue.get("events") or []
+        if itype == "prep" and evs:
+            t_title = f"Prep for {evs[0]} ({issue.get('details', '').split(' requires')[0]})"
+        elif itype == "overlap" and len(evs) >= 2:
+            t_title = f"Resolve calendar overlap: {evs[0]} & {evs[1]}"
+        elif itype == "tight_buffer" and len(evs) >= 2:
+            t_title = f"Check tight schedule buffer: {evs[0]} -> {evs[1]}"
+        else:
+            t_title = issue.get("title", "Calendar radar follow-up")
+        task_titles.append(t_title)
+        task_cmds.append(f"python3 /workspace/tools/task_manager.py add {_shlex.quote(t_title)} --priority p1")
+
+    shell_cmd = " && ".join(task_cmds) if task_cmds else f"echo 'Calendar radar acknowledged: {count} alerts'"
     payload = {
-        "command": f"echo 'Calendar radar acknowledged: {count} alerts'",
+        "command": shell_cmd,
         "issue_count": count,
+        "tasks_to_create": task_titles,
     }
 
     should_post = post_to_discord and not test
