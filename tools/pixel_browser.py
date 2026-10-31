@@ -170,9 +170,9 @@ def wake_and_unlock():
 
 
 def sleep_screen():
-    """Put display to sleep (KEYCODE_POWER = 26) to preserve OLED panel and battery."""
+    """Put display to sleep unconditionally (KEYCODE_SLEEP = 223) to preserve OLED panel and battery."""
     prefix, _ = get_adb_command_prefix()
-    subprocess.run(prefix + ["shell", "input", "keyevent", "26"], capture_output=True, timeout=3)
+    subprocess.run(prefix + ["shell", "input", "keyevent", "223"], capture_output=True, timeout=3)
 
 
 def setup_cdp_forwarding() -> bool:
