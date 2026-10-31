@@ -24,10 +24,47 @@ class TestGoogleTasksSync(unittest.TestCase):
 
     def test_extract_task_id_from_notes(self):
         self.assertEqual(extract_task_id_from_notes("[Zero Task #4 | Priority: P2]"), 4)
+        self.assertEqual(extract_task_id_from_notes("[Zero Task #4 | Priority: P2 | Target: Sat Oct 31 @ 10:00 AM PT]"), 4)
         self.assertEqual(extract_task_id_from_notes("[Zero Task #123 | Priority: P1]\nSome extra notes"), 123)
         self.assertIsNone(extract_task_id_from_notes(None))
         self.assertIsNone(extract_task_id_from_notes("Regular note without zero tag"))
         self.assertIsNone(extract_task_id_from_notes("[Some other tag #5]"))
+
+    def test_infer_appropriate_due_datetime(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from tools.google_tasks_sync import infer_appropriate_due_datetime
+
+        pt = ZoneInfo("America/Los_Angeles")
+        now = datetime(2026, 10, 30, 18, 0, tzinfo=pt)  # Friday Oct 30, 6:00 PM PT
+
+        # Prep task for Sun Nov 01 at 1:30 PM -> scheduled day before (Sat Oct 31 @ 10:00 AM PT)
+        due_rfc, disp = infer_appropriate_due_datetime(
+            "Prep for Vanessa's birthday party ('Vanessa's birthday party' on Sun Nov 01 at 01:30 PM)",
+            priority="p1",
+            now_pt=now,
+        )
+        self.assertEqual(due_rfc, "2026-10-31T00:00:00.000Z")
+        self.assertIn("Sat Oct 31 @ 10:00 AM PT", disp)
+
+        # Explicit due datetime
+        due_rfc2, disp2 = infer_appropriate_due_datetime(
+            "Call contractor",
+            priority="p2",
+            explicit_due="2026-11-02T14:30:00",
+            now_pt=now,
+        )
+        self.assertEqual(due_rfc2, "2026-11-02T00:00:00.000Z")
+        self.assertIn("Mon Nov 02 @ 2:30 PM PT", disp2)
+
+        # Default P1 after 3 PM -> tomorrow at 9:00 AM PT
+        due_rfc3, disp3 = infer_appropriate_due_datetime(
+            "Check sump pump",
+            priority="p1",
+            now_pt=now,
+        )
+        self.assertEqual(due_rfc3, "2026-10-31T00:00:00.000Z")
+        self.assertIn("Sat Oct 31 @ 9:00 AM PT", disp3)
 
     @patch("tools.google_tasks_sync.get_or_create_target_list", return_value="list_123")
     @patch("tools.google_tasks_sync.fetch_all_google_tasks")
@@ -57,7 +94,8 @@ class TestGoogleTasksSync(unittest.TestCase):
         call_kwargs = mock_create.call_args.kwargs
         self.assertEqual(call_kwargs["title"], "Buy Cat6 cables")
         self.assertEqual(call_kwargs["status"], "needsAction")
-        self.assertIn("[Zero Task #101 | Priority: P2]", call_kwargs["notes"])
+        self.assertIn("[Zero Task #101 | Priority: P2", call_kwargs["notes"])
+        self.assertTrue(call_kwargs.get("due", "").endswith("T00:00:00.000Z"))
 
     @patch("tools.google_tasks_sync.get_or_create_target_list", return_value="list_123")
     @patch("tools.google_tasks_sync.fetch_all_google_tasks")

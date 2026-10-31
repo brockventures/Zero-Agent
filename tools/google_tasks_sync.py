@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -135,13 +135,142 @@ def fetch_all_google_tasks(list_id: str) -> list[dict]:
     return tasks
 
 
-def create_google_task(list_id: str, title: str, notes: str = "", status: str = "needsAction") -> dict:
+def infer_appropriate_due_datetime(
+    title: str,
+    priority: str = "p2",
+    explicit_due: str | None = None,
+    now_pt: datetime | None = None,
+) -> tuple[str, str]:
+    """Infer an appropriate due date and target PT time for a task.
+
+    Returns:
+        (due_rfc3339_utc, target_time_pt_display)
+        - Google Tasks REST API v1 stores the date portion of `due` in RFC 3339 UTC (`YYYY-MM-DDT00:00:00.000Z`).
+        - Also returns a human-readable PT date/time string (e.g. `Sat Oct 31 @ 10:00 AM PT`) for task notes/metadata.
+    """
+    now = now_pt or datetime.now(PT)
+    t_lower = (title or "").lower()
+
+    target_dt: datetime | None = None
+
+    # 1. Explicit ISO date or datetime passed via --due
+    if explicit_due:
+        exp = explicit_due.strip()
+        try:
+            if "T" in exp or " " in exp:
+                cleaned = exp.replace(" ", "T")
+                dt = datetime.fromisoformat(cleaned)
+                target_dt = dt.astimezone(PT) if dt.tzinfo else dt.replace(tzinfo=PT)
+            else:
+                d = datetime.strptime(exp[:10], "%Y-%m-%d")
+                target_dt = datetime(d.year, d.month, d.day, 9, 0, tzinfo=PT)
+        except Exception:
+            target_dt = None
+
+    # 2. Parse embedded date/time in title, e.g. "(Sun Nov 01 at 01:30 PM)" or "Nov 01" or "2026-11-01"
+    if target_dt is None:
+        m_iso = re.search(r"\b(202\d-\d{2}-\d{2})\b", title)
+        if m_iso:
+            try:
+                d = datetime.strptime(m_iso.group(1), "%Y-%m-%d")
+                target_dt = datetime(d.year, d.month, d.day, 9, 0, tzinfo=PT)
+            except Exception:
+                pass
+
+    if target_dt is None:
+        months = {
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        }
+        m_mon = re.search(
+            r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})\b",
+            t_lower,
+        )
+        if m_mon:
+            mon_num = months[m_mon.group(1)[:3]]
+            day_num = int(m_mon.group(2))
+            year_num = now.year
+            try:
+                cand = datetime(year_num, mon_num, day_num, 9, 0, tzinfo=PT)
+                if cand.date() < (now.date() - timedelta(days=30)):
+                    cand = datetime(year_num + 1, mon_num, day_num, 9, 0, tzinfo=PT)
+                # Parse optional time like "at 01:30 PM" or "at 9:00 AM"
+                m_time = re.search(r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", t_lower)
+                if m_time:
+                    hr = int(m_time.group(1))
+                    mn = int(m_time.group(2) or 0)
+                    ampm = m_time.group(3)
+                    if ampm == "pm" and hr < 12:
+                        hr += 12
+                    elif ampm == "am" and hr == 12:
+                        hr = 0
+                    cand = cand.replace(hour=hr, minute=mn)
+                # If this is a "prep for" task for a future event, schedule prep the day before at 10:00 AM PT (or morning of if tomorrow/today)
+                if t_lower.startswith("prep ") or "prep for" in t_lower or "gift" in t_lower:
+                    if cand.date() > now.date():
+                        prep_day = cand.date() - timedelta(days=1)
+                        if prep_day < now.date():
+                            prep_day = now.date()
+                        cand = datetime(prep_day.year, prep_day.month, prep_day.day, 10, 0, tzinfo=PT)
+                    else:
+                        cand = cand.replace(hour=9, minute=0)
+                target_dt = cand
+            except Exception:
+                pass
+
+    # 3. Relative keywords ("today", "tonight", "tomorrow")
+    if target_dt is None:
+        if "tonight" in t_lower:
+            target_dt = now.replace(hour=18, minute=0, second=0, microsecond=0)
+        elif "today" in t_lower:
+            hr = 17 if now.hour < 17 else min(21, now.hour + 1)
+            target_dt = now.replace(hour=hr, minute=0, second=0, microsecond=0)
+        elif "tomorrow" in t_lower:
+            tmr = now + timedelta(days=1)
+            target_dt = tmr.replace(hour=9, minute=0, second=0, microsecond=0)
+
+    # 4. Priority-based smart default when no explicit date is mentioned
+    if target_dt is None:
+        prio = (priority or "p2").lower()
+        if prio == "p1":
+            # P1: today at 5:00 PM PT if before 3:00 PM, otherwise tomorrow at 9:00 AM PT
+            if now.hour < 15:
+                target_dt = now.replace(hour=17, minute=0, second=0, microsecond=0)
+            else:
+                tmr = now + timedelta(days=1)
+                target_dt = tmr.replace(hour=9, minute=0, second=0, microsecond=0)
+        elif prio == "p2":
+            # P2: tomorrow at 10:00 AM PT
+            tmr = now + timedelta(days=1)
+            target_dt = tmr.replace(hour=10, minute=0, second=0, microsecond=0)
+        else:
+            # P3: upcoming Saturday at 10:00 AM PT
+            days_until_sat = (5 - now.weekday()) % 7
+            if days_until_sat == 0:
+                days_until_sat = 7
+            sat = now + timedelta(days=days_until_sat)
+            target_dt = sat.replace(hour=10, minute=0, second=0, microsecond=0)
+
+    due_rfc3339 = f"{target_dt.strftime('%Y-%m-%d')}T00:00:00.000Z"
+    disp_pt = target_dt.strftime("%a %b %d @ %-I:%M %p PT")
+    return due_rfc3339, disp_pt
+
+
+def create_google_task(
+    list_id: str,
+    title: str,
+    notes: str = "",
+    status: str = "needsAction",
+    due: str | None = None,
+) -> dict:
     """Create a task in Google Tasks."""
-    payload = {
+    payload: dict = {
         "title": title.strip(),
         "notes": notes.strip(),
         "status": status,
     }
+    if due:
+        payload["due"] = due
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(f"{TASKS_BASE}/lists/{list_id}/tasks", data=data, headers=_headers(), method="POST")
     return json.loads(_api_request(req).decode("utf-8"))
@@ -364,6 +493,7 @@ def sync_tasks(quiet: bool = False) -> dict:
             tag = f"[Zero Task #{new_id} | Priority: P2]"
             current_notes = gt.get("notes", "")
             updated_notes = f"{tag}\n{current_notes}".strip()
+            gt["notes"] = updated_notes
             try:
                 patch_google_task(list_id, gid, {"notes": updated_notes})
             except Exception:
@@ -400,7 +530,14 @@ def sync_tasks(quiet: bool = False) -> dict:
         is_completed = loc.get("status") in ("completed", "retired")
         target_g_status = "completed" if is_completed else "needsAction"
         prio_label = loc.get("priority", "p2").upper()
-        tag = f"[Zero Task #{loc['id']} | Priority: {prio_label}]"
+        due_rfc3339, disp_pt = infer_appropriate_due_datetime(
+            title=loc.get("title", ""),
+            priority=loc.get("priority", "p2"),
+            explicit_due=loc.get("due"),
+            now_pt=start_time,
+        )
+        time_label = loc.get("target_time_pt") or disp_pt
+        tag = f"[Zero Task #{loc['id']} | Priority: {prio_label} | Target: {time_label}]"
 
         if map_entry:
             gid = map_entry.get("google_id")
@@ -413,10 +550,16 @@ def sync_tasks(quiet: bool = False) -> dict:
                 # Status change in Zero
                 if target_g_status != map_entry.get("last_google_status") and target_g_status != gt.get("status"):
                     patch_data["status"] = target_g_status
-                # Notes priority update
+                # Assign due date if explicitly set/updated in Zero
+                if not is_completed and loc.get("due") and (
+                    not gt.get("due")
+                    or (map_entry.get("last_due") and loc.get("due") != map_entry.get("last_due"))
+                ):
+                    patch_data["due"] = due_rfc3339
+                # Notes priority update (only update if Zero Task tag is completely missing)
                 gt_notes = gt.get("notes") or ""
-                if tag not in gt_notes:
-                    base_notes = re.sub(r"\[Zero Task #\d+ \| Priority: [^\]]+\]\n?", "", gt_notes).strip()
+                if f"[Zero Task #{loc['id']}" not in gt_notes:
+                    base_notes = re.sub(r"\[Zero Task #\d+[^\]]*\]\n?", "", gt_notes).strip()
                     patch_data["notes"] = f"{tag}\n{base_notes}".strip()
 
                 if patch_data:
@@ -427,6 +570,8 @@ def sync_tasks(quiet: bool = False) -> dict:
                             map_entry["last_title"] = patch_data["title"]
                         if "status" in patch_data:
                             map_entry["last_google_status"] = patch_data["status"]
+                        if "due" in patch_data:
+                            map_entry["last_due"] = loc.get("due")
                     except Exception as e:
                         log.warning(f"Error patching Google task #{loc['id']}: {e}")
             else:
@@ -438,13 +583,18 @@ def sync_tasks(quiet: bool = False) -> dict:
                     map_entry["last_status"] = "retired"
                     map_entry["last_google_status"] = "completed"
         else:
-            # New task in Zero: create in Google Tasks
+            # New task in Zero: create in Google Tasks with appropriate due date & target time
+            if not loc.get("due"):
+                loc["due"] = due_rfc3339[:10]
+            if not loc.get("target_time_pt"):
+                loc["target_time_pt"] = disp_pt
             try:
                 res = create_google_task(
                     list_id=list_id,
                     title=loc["title"],
                     notes=tag,
                     status=target_g_status,
+                    due=due_rfc3339,
                 )
                 gid = res["id"]
                 loc["google_task_id"] = gid
@@ -453,8 +603,9 @@ def sync_tasks(quiet: bool = False) -> dict:
                     "last_title": loc["title"],
                     "last_status": loc.get("status", "pending"),
                     "last_google_status": target_g_status,
+                    "last_due": loc.get("due"),
                 }
-                changes["created_in_google"].append(f"Exported #{loc['id']}: {loc['title']}")
+                changes["created_in_google"].append(f"Exported #{loc['id']}: {loc['title']} (due {time_label})")
             except Exception as e:
                 log.error(f"Error exporting task #{loc['id']} to Google Tasks: {e}")
 

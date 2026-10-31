@@ -30,7 +30,14 @@ def _try_sync():
     except Exception:
         pass
 
-def task_manage(action: str = "list", title: str = "", priority: str | None = None, status: str | None = None, task_id: int | None = None) -> dict:
+def task_manage(
+    action: str = "list",
+    title: str = "",
+    priority: str | None = None,
+    status: str | None = None,
+    task_id: int | None = None,
+    due: str | None = None,
+) -> dict:
     """Manage lightweight task tracker.
     action: 'list' | 'add' | 'update' | 'delete' | 'clear_completed'
     """
@@ -51,13 +58,30 @@ def task_manage(action: str = "list", title: str = "", priority: str | None = No
         if not title:
             return {"ok": False, "error": "title required to add task"}
         new_id = max([t.get("id", 0) for t in tasks], default=0) + 1
+        prio = (priority or "p2").lower()
+        due_date = due
+        target_time_pt = ""
+        try:
+            from tools.google_tasks_sync import infer_appropriate_due_datetime
+            due_rfc3339, target_time_pt = infer_appropriate_due_datetime(
+                title=title.strip(),
+                priority=prio,
+                explicit_due=due,
+            )
+            due_date = due_rfc3339[:10]
+        except Exception:
+            pass
         new_task = {
             "id": new_id,
             "title": title.strip(),
-            "priority": (priority or "p2").lower(),
+            "priority": prio,
             "status": (status or "pending").lower(),
             "updated": datetime.now(PT).strftime("%Y-%m-%d %H:%M"),
         }
+        if due_date:
+            new_task["due"] = due_date
+        if target_time_pt:
+            new_task["target_time_pt"] = target_time_pt
         tasks.append(new_task)
         with open(TASKS_FILE, "w") as f:
             json.dump(tasks, f, indent=2)
@@ -75,6 +99,18 @@ def task_manage(action: str = "list", title: str = "", priority: str | None = No
                     t["priority"] = priority.lower()
                 if status is not None:
                     t["status"] = status.lower()
+                if due is not None:
+                    try:
+                        from tools.google_tasks_sync import infer_appropriate_due_datetime
+                        due_rfc3339, target_time_pt = infer_appropriate_due_datetime(
+                            title=t.get("title", ""),
+                            priority=t.get("priority", "p2"),
+                            explicit_due=due,
+                        )
+                        t["due"] = due_rfc3339[:10]
+                        t["target_time_pt"] = target_time_pt
+                    except Exception:
+                        t["due"] = due
                 t["updated"] = datetime.now(PT).strftime("%Y-%m-%d %H:%M")
                 with open(TASKS_FILE, "w") as f:
                     json.dump(tasks, f, indent=2)
@@ -160,6 +196,7 @@ if __name__ == "__main__":
     add_p.add_argument("title", help="Task title")
     add_p.add_argument("--priority", "-p", default="p2", help="Priority (p1, p2, p3)")
     add_p.add_argument("--status", "-s", default="pending", help="Status (pending, in_progress, completed, etc.)")
+    add_p.add_argument("--due", "-d", default=None, help="Explicit due date/time (e.g. 2026-10-31T10:00:00 or 2026-10-31)")
 
     # update
     upd_p = subparsers.add_parser("update", help="Update an existing task")
@@ -167,6 +204,7 @@ if __name__ == "__main__":
     upd_p.add_argument("--title", "-t", default=None, help="New title")
     upd_p.add_argument("--priority", "-p", default=None, help="New priority")
     upd_p.add_argument("--status", "-s", default=None, help="New status")
+    upd_p.add_argument("--due", "-d", default=None, help="Updated due date/time")
 
     # delete
     del_p = subparsers.add_parser("delete", help="Delete a task")
@@ -186,9 +224,9 @@ if __name__ == "__main__":
     elif action == "list":
         print(json.dumps(task_manage("list"), indent=2))
     elif action == "add":
-        print(json.dumps(task_manage("add", title=args.title, priority=args.priority, status=args.status), indent=2))
+        print(json.dumps(task_manage("add", title=args.title, priority=args.priority, status=args.status, due=args.due), indent=2))
     elif action == "update":
-        print(json.dumps(task_manage("update", task_id=args.task_id, title=args.title, priority=args.priority, status=args.status), indent=2))
+        print(json.dumps(task_manage("update", task_id=args.task_id, title=args.title, priority=args.priority, status=args.status, due=args.due), indent=2))
     elif action == "delete":
         print(json.dumps(task_manage("delete", task_id=args.task_id), indent=2))
     elif action == "clear_completed":
