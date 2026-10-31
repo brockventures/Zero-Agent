@@ -5,8 +5,10 @@ test_forge_goldfish.py — Unit tests for FORGE Goldfish Plan Pre-Flight & Blind
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -14,7 +16,11 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from tools.forge import (
+    detect_skill_and_rule_drift,
+    format_origin_completion_envelope,
+    get_db_connection,
     grade_chunk_diff_blind,
+    init_forge_db,
     run_goldfish_plan_preflight,
     validate_forge_plan,
     verify_chunk_worktree,
@@ -389,3 +395,230 @@ def test_verify_chunk_worktree_blind_diff_integration(tmp_path: Path) -> None:
     assert passed is False
     assert "Blind diff grading failed" in err
     assert "breakpoint()" in err
+
+
+# ==============================================================================
+# 5. detect_skill_and_rule_drift Tests
+# ==============================================================================
+
+def test_drift_audit_clean_match(tmp_path: Path) -> None:
+    """A repo with a skill citing valid CLI flags and defined functions reports 0 drift warnings."""
+    # Setup skill
+    sk_dir = tmp_path / ".agents" / "skills" / "demo-skill"
+    sk_dir.mkdir(parents=True)
+    (sk_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\n---\n# Demo Skill\n"
+        "Run `tools/demo.py` via:\n"
+        "```bash\n"
+        "python3 /workspace/tools/demo.py --count 5\n"
+        "```\n"
+        "Call `calculate_score(data)` to retrieve results.\n",
+        encoding="utf-8",
+    )
+
+    # Setup rule
+    rule_dir = tmp_path / ".agents" / "rules"
+    rule_dir.mkdir(parents=True)
+    (rule_dir / "demo_rule.md").write_text(
+        "# Demo Rule\n"
+        "Enforces `tools/demo.py:calculate_score` usage.\n",
+        encoding="utf-8",
+    )
+
+    # Setup target file
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "demo.py").write_text(
+        "import sys\n\n"
+        "def calculate_score(data):\n"
+        "    return len(data)\n\n"
+        "if '--count' in sys.argv:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    warnings = detect_skill_and_rule_drift(tmp_path, ["tools/demo.py"])
+    assert warnings == []
+
+
+def test_drift_audit_stale_cli_flag(tmp_path: Path) -> None:
+    """A skill citing a removed/stale CLI flag triggers a drift warning."""
+    sk_dir = tmp_path / ".agents" / "skills" / "demo-skill"
+    sk_dir.mkdir(parents=True)
+    (sk_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\n---\n# Demo Skill\n"
+        "Run `tools/demo.py`:\n"
+        "```bash\n"
+        "python3 /workspace/tools/demo.py --stale-flag\n"
+        "```\n",
+        encoding="utf-8",
+    )
+
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "demo.py").write_text(
+        "def main():\n    pass\n",
+        encoding="utf-8",
+    )
+
+    warnings = detect_skill_and_rule_drift(tmp_path, ["tools/demo.py"])
+    assert len(warnings) == 1
+    assert "SKILL.md (demo-skill) references removed flag/symbol --stale-flag in tools/demo.py" in warnings[0]
+
+
+def test_drift_audit_stale_python_function(tmp_path: Path) -> None:
+    """A skill citing a removed Python function triggers a drift warning."""
+    sk_dir = tmp_path / ".agents" / "skills" / "math-skill"
+    sk_dir.mkdir(parents=True)
+    (sk_dir / "SKILL.md").write_text(
+        "---\nname: math-skill\n---\n# Math Skill\n"
+        "In `tools/math_tool.py`, call `stale_helper_func(items)` to sum.\n",
+        encoding="utf-8",
+    )
+
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "math_tool.py").write_text(
+        "def new_helper(items):\n    return sum(items)\n",
+        encoding="utf-8",
+    )
+
+    warnings = detect_skill_and_rule_drift(tmp_path, ["tools/math_tool.py"])
+    assert len(warnings) == 1
+    assert "SKILL.md (math-skill) references removed flag/symbol stale_helper_func in tools/math_tool.py" in warnings[0]
+
+
+def test_drift_audit_rule_drift(tmp_path: Path) -> None:
+    """A rule document citing a stale symbol and removed CLI flag triggers drift warnings."""
+    rule_dir = tmp_path / ".agents" / "rules"
+    rule_dir.mkdir(parents=True)
+    (rule_dir / "strict_rule.md").write_text(
+        "# Strict Rule\n"
+        "Reference `tools/ops.py:vanished_symbol` or run `tools/ops.py --removed-flag`.\n",
+        encoding="utf-8",
+    )
+
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "ops.py").write_text(
+        "def remaining_symbol():\n    pass\n",
+        encoding="utf-8",
+    )
+
+    warnings = detect_skill_and_rule_drift(tmp_path, ["tools/ops.py"])
+    assert len(warnings) == 2
+    assert any("strict_rule.md references removed flag/symbol vanished_symbol in tools/ops.py" in w for w in warnings)
+    assert any("strict_rule.md references removed flag/symbol --removed-flag in tools/ops.py" in w for w in warnings)
+
+
+def test_drift_audit_ignores_test_files(tmp_path: Path) -> None:
+    """Target test files are ignored by drift audit so unit test edits don't trigger false alarms."""
+    sk_dir = tmp_path / ".agents" / "skills" / "test-skill"
+    sk_dir.mkdir(parents=True)
+    (sk_dir / "SKILL.md").write_text(
+        "# Test Skill\n"
+        "Inspects `tools/test_ops.py` for `test_old_case()`.\n",
+        encoding="utf-8",
+    )
+
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "test_ops.py").write_text("def test_new_case(): pass\n", encoding="utf-8")
+
+    warnings = detect_skill_and_rule_drift(tmp_path, ["tools/test_ops.py"])
+    assert warnings == []
+
+
+def test_drift_audit_nonexistent_repo(tmp_path: Path) -> None:
+    """Non-existent repo directory gracefully returns empty warning list."""
+    warnings = detect_skill_and_rule_drift(tmp_path / "nonexistent", ["tools/demo.py"])
+    assert warnings == []
+
+
+# ==============================================================================
+# 6. format_origin_completion_envelope Drift Section Tests
+# ==============================================================================
+
+def test_format_origin_completion_envelope_with_drift_warnings(tmp_path: Path) -> None:
+    """Completion envelope appends a bulleted drift warnings section when drift is detected."""
+    db_path = tmp_path / "forge.db"
+    init_forge_db(db_path)
+
+    # Setup repo with skill containing stale flag
+    sk_dir = tmp_path / ".agents" / "skills" / "drift-skill"
+    sk_dir.mkdir(parents=True)
+    (sk_dir / "SKILL.md").write_text(
+        "---\nname: drift-skill\n---\n# Drift Skill\n"
+        "Run `tools/api.py`:\n"
+        "```bash\n"
+        "python3 /workspace/tools/api.py --deleted-flag\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "api.py").write_text("def run(): pass\n", encoding="utf-8")
+
+    build_id = "fg-drift-test-01"
+    now = time.time()
+    with get_db_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_builds (id, title, repo, origin_channel_id, fact_sheet_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (build_id, "Drift Test Build", str(tmp_path), 12345, json.dumps(["Context Fact 1"]), now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_chunks (id, build_id, chunk_index, title, repo, status, target_files_json, instructions)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (f"{build_id}-c0", build_id, 0, "Chunk 0", str(tmp_path), "merged", json.dumps(["tools/api.py"]), "Run tasks"),
+        )
+
+    envelope = format_origin_completion_envelope(build_id, db_path=db_path)
+    assert "### Skill & Rule Drift Warnings:" in envelope
+    assert "SKILL.md (drift-skill) references removed flag/symbol --deleted-flag in tools/api.py" in envelope
+    assert "Original Context Fact Sheet:" in envelope
+
+
+def test_format_origin_completion_envelope_clean_no_warnings(tmp_path: Path) -> None:
+    """Completion envelope omits drift warnings section when no drift is detected."""
+    db_path = tmp_path / "forge.db"
+    init_forge_db(db_path)
+
+    # Setup clean repo
+    sk_dir = tmp_path / ".agents" / "skills" / "clean-skill"
+    sk_dir.mkdir(parents=True)
+    (sk_dir / "SKILL.md").write_text(
+        "---\nname: clean-skill\n---\n# Clean Skill\n"
+        "Run `tools/api.py` with `execute_api()`.\n",
+        encoding="utf-8",
+    )
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "api.py").write_text("def execute_api(): pass\n", encoding="utf-8")
+
+    build_id = "fg-clean-test-02"
+    now = time.time()
+    with get_db_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_builds (id, title, repo, origin_channel_id, fact_sheet_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (build_id, "Clean Test Build", str(tmp_path), 12345, json.dumps(["Clean Fact"]), now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_chunks (id, build_id, chunk_index, title, repo, status, target_files_json, instructions)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (f"{build_id}-c0", build_id, 0, "Chunk 0", str(tmp_path), "merged", json.dumps(["tools/api.py"]), "Run tasks"),
+        )
+
+    envelope = format_origin_completion_envelope(build_id, db_path=db_path)
+    assert "### Skill & Rule Drift Warnings:" not in envelope
+    assert "Original Context Fact Sheet:" in envelope
+

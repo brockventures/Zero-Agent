@@ -3264,6 +3264,226 @@ def verify_chunk_worktree(
     return True, diff_stat, ""
 
 
+_DRIFT_BUILTIN_NAMES = {
+    "print", "len", "open", "range", "str", "int", "dict", "list", "set", "tuple",
+    "bool", "float", "bytes", "type", "super", "id", "hash", "dir", "help", "input",
+    "format", "repr", "iter", "next", "filter", "map", "zip", "enumerate", "any", "all",
+    "min", "max", "sum", "abs", "round", "sorted", "reversed", "isinstance", "issubclass",
+    "callable", "getattr", "setattr", "hasattr", "delattr", "self", "cls", "args", "kwargs",
+    "true", "false", "none",
+}
+
+_DRIFT_PROSE_STOPWORDS = {
+    "e.g", "ie", "see", "note", "warning", "tip", "caution", "important",
+    "default", "optional", "required", "example", "including", "using",
+    "with", "and", "or", "if", "when", "where", "why", "how", "what",
+    "the", "a", "an", "in", "on", "at", "by", "for", "to", "from",
+    "of", "as", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "can", "could", "should",
+    "would", "may", "might", "must", "will", "shall", "not", "no",
+    "but", "so", "such", "than", "too", "very", "just", "also",
+    "step", "steps", "chunk", "chunks", "tier", "tiers", "mode", "version",
+    "bash", "python", "python3", "sh", "git", "cd", "ls", "cat", "echo",
+}
+
+
+def detect_skill_and_rule_drift(repo_dir: Path | str, target_files: list[str]) -> list[str]:
+    """Scan .agents/skills/*/SKILL.md and .agents/rules/*.md for references to modified non-test files
+
+    and verify whether any cited CLI flags (--flag) or Python function names (def_name() / symbol)
+    no longer exist in the target files on disk. Returns concise drift warning strings.
+    """
+    repo_path = Path(repo_dir).resolve()
+    if not repo_path.is_dir():
+        return []
+
+    def _is_test_path(f: str) -> bool:
+        p = Path(f)
+        name = p.name.lower()
+        if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
+            return True
+        if any(part in ("tests", "test") for part in p.parts):
+            return True
+        return False
+
+    non_test_targets: list[tuple[str, Path]] = []
+    for tf in target_files:
+        if not tf or _is_test_path(tf):
+            continue
+        p = Path(tf)
+        full_path = (repo_path / p).resolve() if not p.is_absolute() else p.resolve()
+        if full_path.exists() and full_path.is_file():
+            try:
+                rel = full_path.relative_to(repo_path).as_posix()
+            except ValueError:
+                rel = tf
+            non_test_targets.append((rel, full_path))
+
+    if not non_test_targets:
+        return []
+
+    doc_files: list[tuple[str, Path]] = []
+    skills_dir = repo_path / ".agents" / "skills"
+    if skills_dir.exists():
+        for sk in sorted(skills_dir.glob("*/SKILL.md")):
+            doc_files.append((f"SKILL.md ({sk.parent.name})", sk))
+
+    rules_dir = repo_path / ".agents" / "rules"
+    if rules_dir.exists():
+        for r in sorted(rules_dir.glob("*.md")):
+            doc_files.append((r.name, r))
+
+    if not doc_files:
+        return []
+
+    def _extract_file_symbols(file_path: Path, content: str) -> set[str]:
+        symbols: set[str] = set()
+        if file_path.suffix == ".py":
+            try:
+                tree = ast.parse(content, filename=str(file_path))
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        symbols.add(node.name)
+                    elif isinstance(node, ast.Assign):
+                        for t in node.targets:
+                            if isinstance(t, ast.Name):
+                                symbols.add(t.id)
+                    elif isinstance(node, ast.AnnAssign):
+                        if isinstance(node.target, ast.Name):
+                            symbols.add(node.target.id)
+            except Exception:
+                for m in re.finditer(r'^(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', content, re.M):
+                    symbols.add(m.group(1))
+                for m in re.finditer(r'^class\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', content, re.M):
+                    symbols.add(m.group(1))
+                for m in re.finditer(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*=', content, re.M):
+                    symbols.add(m.group(1))
+        return symbols
+
+    def _flag_present(flag: str, content: str) -> bool:
+        if flag in content:
+            return True
+        if flag.replace("-", "_") in content:
+            return True
+        return False
+
+    warnings: list[str] = []
+    seen_warnings: set[str] = set()
+
+    for rel_target, full_target in non_test_targets:
+        target_name = full_target.name
+        try:
+            target_content = full_target.read_text(encoding="utf-8")
+        except Exception:
+            continue
+
+        defined_symbols = _extract_file_symbols(full_target, target_content)
+        file_pattern = re.compile(r'(?:\b|/)' + re.escape(target_name) + r'\b')
+
+        for doc_label, doc_path in doc_files:
+            try:
+                doc_text = doc_path.read_text(encoding="utf-8")
+            except Exception:
+                continue
+
+            if not file_pattern.search(doc_text):
+                continue
+
+            doc_lines = doc_text.splitlines()
+            n_lines = len(doc_lines)
+
+            flags_to_check: set[str] = set()
+            symbols_to_check: set[str] = set()
+
+            for idx, line in enumerate(doc_lines):
+                if not file_pattern.search(line):
+                    continue
+
+                # 1. Explicit target symbol citation: `tool.py:symbol_name`
+                for sym in re.findall(
+                    r'(?:' + re.escape(rel_target) + r'|' + re.escape(target_name) + r'):([a-zA-Z_][a-zA-Z0-9_]*)',
+                    line,
+                ):
+                    symbols_to_check.add(sym)
+
+                # 2. Scope context lines for this mention
+                context_lines = [line]
+                is_bullet = line.strip().startswith(("*", "-", "+")) or bool(re.match(r'^\s*\d+\.', line))
+
+                for j in range(idx + 1, min(idx + 15, n_lines)):
+                    nxt = doc_lines[j]
+                    s_nxt = nxt.strip()
+                    if s_nxt.startswith("#"):
+                        break
+                    if is_bullet and (s_nxt.startswith(("*", "-", "+")) or bool(re.match(r'^\d+\.', s_nxt))):
+                        break
+                    if re.search(r'(?:\b|/)[a-zA-Z0-9_-]+\.py\b', nxt) and not file_pattern.search(nxt):
+                        break
+                    context_lines.append(nxt)
+
+                # Extract flags and function citations from context_lines
+                in_code_block = False
+                for c_line in context_lines:
+                    s_cline = c_line.strip()
+                    if s_cline.startswith("```"):
+                        in_code_block = not in_code_block
+                        continue
+
+                    # CLI flags: --foo-bar
+                    for flag in re.findall(r'(--[a-zA-Z0-9][a-zA-Z0-9_-]*)', c_line):
+                        flags_to_check.add(flag)
+
+                    # Form A: in backticks, e.g. `func()` or `func(...)`
+                    for m in re.finditer(r'`([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^`]*\)`', c_line):
+                        sym = m.group(1)
+                        low = sym.lower()
+                        if low not in _DRIFT_BUILTIN_NAMES and low not in _DRIFT_PROSE_STOPWORDS:
+                            symbols_to_check.add(sym)
+
+                    # Form B: in code blocks or `def func_name(`
+                    if in_code_block or "def " in c_line:
+                        for m in re.finditer(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', c_line):
+                            sym = m.group(1)
+                            low = sym.lower()
+                            if low not in _DRIFT_BUILTIN_NAMES and low not in _DRIFT_PROSE_STOPWORDS:
+                                if not (sym.isupper() and len(sym) > 1):
+                                    symbols_to_check.add(sym)
+
+                    # Form C: In prose, empty parentheses directly attached to identifier: `func_name()`
+                    for m in re.finditer(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\(\)', c_line):
+                        sym = m.group(1)
+                        low = sym.lower()
+                        if low not in _DRIFT_BUILTIN_NAMES and low not in _DRIFT_PROSE_STOPWORDS:
+                            if not (sym.isupper() and len(sym) > 1):
+                                symbols_to_check.add(sym)
+
+            # Check CLI flags
+            for flag in sorted(flags_to_check):
+                if not _flag_present(flag, target_content):
+                    warn = f"{doc_label} references removed flag/symbol {flag} in {rel_target}"
+                    if warn not in seen_warnings:
+                        seen_warnings.add(warn)
+                        warnings.append(warn)
+
+            # Check symbols
+            for sym in sorted(symbols_to_check):
+                if sym in defined_symbols:
+                    continue
+                if f"def {sym}(" in target_content or f"def {sym} (" in target_content:
+                    continue
+                if f"class {sym}" in target_content:
+                    continue
+                if re.search(r'\b' + re.escape(sym) + r'\s*=', target_content):
+                    continue
+
+                warn = f"{doc_label} references removed flag/symbol {sym} in {rel_target}"
+                if warn not in seen_warnings:
+                    seen_warnings.add(warn)
+                    warnings.append(warn)
+
+    return warnings
+
+
 def format_origin_completion_envelope(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> str:
     """Format the structured FORGE Completion Envelope sent to the originating channel Orchestrator."""
     with get_db_connection(db_path) as conn:
@@ -3298,6 +3518,30 @@ def format_origin_completion_envelope(build_id: str, db_path: Path | str = FORGE
         lines.append("\n### Original Context Fact Sheet:")
         for f in fact_sheet:
             lines.append(f"- {f}")
+
+    # Skill and rule drift audit across target files of merged chunks
+    merged_chunks = [c for c in chunks if str(c["status"] or "").strip().lower() == "merged"]
+    target_chunks = merged_chunks if merged_chunks else chunks
+    all_target_files: list[str] = []
+    for c in target_chunks:
+        try:
+            c_files = json.loads(c["target_files_json"] or "[]")
+        except Exception:
+            c_files = []
+        if isinstance(c_files, list):
+            for f in c_files:
+                if isinstance(f, str) and f not in all_target_files:
+                    all_target_files.append(f)
+
+    repo_dir = build["repo"] or WORKSPACE_DIR
+    try:
+        drift_warnings = detect_skill_and_rule_drift(repo_dir, all_target_files)
+    except Exception:
+        drift_warnings = []
+    if drift_warnings:
+        lines.append("\n### Skill & Rule Drift Warnings:")
+        for w in drift_warnings:
+            lines.append(f"- {w}")
 
     reload_note = (
         "\nThis build modified core bridge files (`touches_core_bridge=true`). A FORGE Decision Card (`bridge_reload`) has been posted to this channel so Ryan can approve an in-place reload with one click."
