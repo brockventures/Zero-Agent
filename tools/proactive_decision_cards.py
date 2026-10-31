@@ -26,6 +26,8 @@ from pathlib import Path
 import re
 import sys
 from typing import Any, Optional
+import urllib.error
+import urllib.request
 from zoneinfo import ZoneInfo
 
 # Ensure tools and workspace are on sys.path
@@ -232,6 +234,60 @@ def _save_seen_triage_ids(seen_ids: set[str], seen_path: Optional[Path] = None) 
         target_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def _get_calendar_seen_path() -> Path:
+    """Resolve the persistence path for calendar_radar_seen.json."""
+    custom_path = os.environ.get("CALENDAR_RADAR_SEEN_FILE_PATH")
+    if custom_path:
+        return Path(custom_path)
+    data_dir = os.environ.get("DATA_DIR")
+    if data_dir:
+        return Path(data_dir) / "calendar_radar_seen.json"
+    candidate = Path("/workspace/data/calendar_radar_seen.json")
+    if candidate.parent.exists() and os.access(str(candidate.parent), os.W_OK):
+        return candidate
+    local_data = _WORKSPACE_DIR / "data"
+    local_data.mkdir(parents=True, exist_ok=True)
+    return local_data / "calendar_radar_seen.json"
+
+
+def _load_seen_calendar_keys(seen_path: Optional[Path] = None) -> set[str]:
+    """Load seen issue keys from calendar_radar_seen.json."""
+    target_path = seen_path or _get_calendar_seen_path()
+    if not target_path.exists():
+        return set()
+    try:
+        content = target_path.read_text(encoding="utf-8")
+        data = json.loads(content)
+        if isinstance(data, list):
+            return {str(x) for x in data}
+        if isinstance(data, dict):
+            return {str(x) for x in data.get("seen_keys", data.get("seen_ids", []))}
+    except Exception:
+        pass
+    return set()
+
+
+def _save_seen_calendar_keys(seen_keys: set[str], seen_path: Optional[Path] = None) -> None:
+    """Persist seen issue keys to calendar_radar_seen.json."""
+    target_path = seen_path or _get_calendar_seen_path()
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "updated_at": datetime.now(PT).isoformat(),
+            "seen_keys": sorted(list(seen_keys)),
+        }
+        target_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _make_calendar_issue_key(issue_type: str, events: list[str], start_date_str: str) -> str:
+    """Generate deterministic sha256 issue key from type, sorted event summaries, and start date."""
+    sorted_summaries = sorted(str(s).strip() for s in events)
+    raw = f"{issue_type}:{','.join(sorted_summaries)}:{start_date_str}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _classify_comms_item(item: dict[str, Any]) -> Optional[str]:
@@ -543,6 +599,9 @@ def run_family_calendar_radar_card(
                 break
             # ev2 starts before ev1 ends -> overlap
             if ev1["start_dt"] < ev2["end_dt"] and ev2["start_dt"] < ev1["end_dt"]:
+                start_date_str = ev1["start_dt"].strftime("%Y-%m-%d")
+                ev_list = [ev1["summary"], ev2["summary"]]
+                issue_key = _make_calendar_issue_key("overlap", ev_list, start_date_str)
                 issues.append({
                     "type": "overlap",
                     "title": f"Overlap: '{ev1['summary']}' & '{ev2['summary']}'",
@@ -550,7 +609,9 @@ def run_family_calendar_radar_card(
                         f"'{ev1['summary']}' ({ev1['start_dt'].strftime('%a %I:%M%p')}-{ev1['end_dt'].strftime('%I:%M%p')}) "
                         f"overlaps with '{ev2['summary']}' ({ev2['start_dt'].strftime('%a %I:%M%p')}-{ev2['end_dt'].strftime('%I:%M%p')})"
                     ),
-                    "events": [ev1["summary"], ev2["summary"]],
+                    "events": ev_list,
+                    "key": issue_key,
+                    "start_date": start_date_str,
                 })
 
     # B. Tight Buffers (<15m) between consecutive timed events
@@ -561,6 +622,9 @@ def run_family_calendar_radar_card(
             gap_seconds = (ev2["start_dt"] - ev1["end_dt"]).total_seconds()
             if 0 <= gap_seconds < 15 * 60:
                 gap_mins = int(gap_seconds // 60)
+                start_date_str = ev1["start_dt"].strftime("%Y-%m-%d")
+                ev_list = [ev1["summary"], ev2["summary"]]
+                issue_key = _make_calendar_issue_key("tight_buffer", ev_list, start_date_str)
                 issues.append({
                     "type": "tight_buffer",
                     "title": f"Tight buffer: {gap_mins}m between '{ev1['summary']}' & '{ev2['summary']}'",
@@ -569,7 +633,9 @@ def run_family_calendar_radar_card(
                         f"and '{ev2['summary']}' (starts {ev2['start_dt'].strftime('%I:%M%p')})"
                     ),
                     "buffer_minutes": gap_mins,
-                    "events": [ev1["summary"], ev2["summary"]],
+                    "events": ev_list,
+                    "key": issue_key,
+                    "start_date": start_date_str,
                 })
 
     # C. Events needing prep (birthday, party, trip, doctor, camp, etc.)
@@ -578,6 +644,9 @@ def run_family_calendar_radar_card(
         matched_prep = [kw for kw in CALENDAR_PREP_KEYWORDS if kw in haystack]
         if matched_prep:
             kw = matched_prep[0]
+            start_date_str = ev["start_dt"].strftime("%Y-%m-%d")
+            ev_list = [ev["summary"]]
+            issue_key = _make_calendar_issue_key("prep", ev_list, start_date_str)
             time_disp = (
                 ev["start_dt"].strftime("%a %b %d at %I:%M %p")
                 if not ev["is_all_day"]
@@ -588,8 +657,17 @@ def run_family_calendar_radar_card(
                 "title": f"Prep needed ({kw}): '{ev['summary']}'",
                 "details": f"'{ev['summary']}' on {time_disp} requires prep or logistics readiness.",
                 "prep_keyword": kw,
-                "events": [ev["summary"]],
+                "events": ev_list,
+                "key": issue_key,
+                "start_date": start_date_str,
             })
+
+    # Filter out previously seen issues if deduplication is active
+    should_dedup = bool(os.environ.get("CALENDAR_RADAR_SEEN_FILE_PATH")) or (events_override is None and not test)
+    seen_keys: set[str] = set()
+    if should_dedup:
+        seen_keys = _load_seen_calendar_keys()
+        issues = [iss for iss in issues if iss.get("key") not in seen_keys]
 
     # 4. Silent exit if 0 issues
     if not issues:
@@ -661,6 +739,15 @@ def run_family_calendar_radar_card(
         db_path=db_path,
         post_to_discord=should_post,
     )
+
+    # Persist updated seen keys
+    if should_dedup:
+        updated_seen = set(seen_keys)
+        for iss in issues:
+            k = iss.get("key")
+            if k:
+                updated_seen.add(k)
+        _save_seen_calendar_keys(updated_seen)
 
     return True, summary_text, {
         "cards_staged": 1,
@@ -856,6 +943,40 @@ def run_dinner_pivot_card(
     }
 
 
+def _fetch_live_budget_anomalies() -> list[dict[str, Any]]:
+    """Read pending budget anomalies from /workspace/data/actual_anomalies.json.
+
+    Returns a list of anomaly dicts or [] on error / if file does not exist.
+    """
+    custom = os.environ.get("ACTUAL_ANOMALIES_FILE_PATH")
+    if custom:
+        path = Path(custom)
+    else:
+        data_dir = os.environ.get("DATA_DIR")
+        if data_dir:
+            path = Path(data_dir) / "actual_anomalies.json"
+        else:
+            path = Path("/workspace/data/actual_anomalies.json")
+            if not path.exists():
+                local_candidate = _WORKSPACE_DIR / "data" / "actual_anomalies.json"
+                if local_candidate.exists():
+                    path = local_candidate
+
+    if not path.exists():
+        return []
+
+    try:
+        content = path.read_text(encoding="utf-8")
+        data = json.loads(content)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("anomalies", data.get("items", []))
+    except Exception:
+        pass
+    return []
+
+
 # ==============================================================================
 # Workflow 4: Actual Budget Anomaly Card
 # ==============================================================================
@@ -875,8 +996,7 @@ def run_actual_budget_anomaly_card(
     if anomalies_override is not None:
         candidates = list(anomalies_override)
     elif not test:
-        # In live run, query Actual Budget if available
-        pass
+        candidates = _fetch_live_budget_anomalies()
 
     detected_anomalies: list[dict[str, Any]] = []
     for item in candidates:
@@ -999,6 +1119,79 @@ def run_actual_budget_anomaly_card(
     }
 
 
+def _get_ha_credentials() -> tuple[Optional[str], Optional[str]]:
+    """Resolve HA_BASE_URL and HA_ACCESS_TOKEN from os.environ or /secrets/env.json."""
+    base_url = os.environ.get("HA_BASE_URL")
+    token = os.environ.get("HA_ACCESS_TOKEN")
+    if base_url and token:
+        return base_url.rstrip("/"), token
+
+    secrets_path = os.environ.get("SECRETS_FILE_PATH", "/secrets/env.json")
+    secrets_file = Path(secrets_path)
+    if secrets_file.exists():
+        try:
+            secrets = json.loads(secrets_file.read_text(encoding="utf-8"))
+            if not base_url:
+                base_url = secrets.get("HA_BASE_URL")
+            if not token:
+                token = secrets.get("HA_ACCESS_TOKEN")
+        except Exception:
+            pass
+
+    if base_url and token:
+        return base_url.rstrip("/"), token
+    return None, None
+
+
+def _fetch_live_weather_data() -> dict[str, Any]:
+    """Fetch live weather conditions from Home Assistant REST API.
+
+    Queries HA REST /api/states/weather.forecast_home or weather.home via HA_BASE_URL
+    and HA_ACCESS_TOKEN with a 5s timeout, returning {} on error.
+    """
+    base_url, token = _get_ha_credentials()
+    if not base_url or not token:
+        return {}
+
+    for entity_id in ["weather.forecast_home", "weather.home"]:
+        url = f"{base_url}/api/states/{entity_id}"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    raw_data = resp.read().decode("utf-8")
+                    data = json.loads(raw_data)
+                    attrs = data.get("attributes", {})
+                    result: dict[str, Any] = dict(attrs)
+                    result["state"] = data.get("state")
+                    if "temperature" in attrs:
+                        result.setdefault("temp", attrs["temperature"])
+                    if "precipitation" in attrs:
+                        result.setdefault("precip_inches", attrs["precipitation"])
+
+                    forecasts = attrs.get("forecast", [])
+                    if forecasts and isinstance(forecasts, list):
+                        today_fc = forecasts[0]
+                        if isinstance(today_fc, dict):
+                            if "temperature" in today_fc:
+                                result.setdefault("temp_high", today_fc["temperature"])
+                            if "templow" in today_fc:
+                                result.setdefault("temp_low", today_fc["templow"])
+                            if "precipitation" in today_fc:
+                                result.setdefault("precip_inches", today_fc["precipitation"])
+                    return result
+        except Exception:
+            continue
+
+    return {}
+
+
 # ==============================================================================
 # Workflow 5: Weather / Energy Pre-Adjustment Card
 # ==============================================================================
@@ -1022,8 +1215,7 @@ def run_weather_energy_card(
     if weather_override is not None:
         weather_data = dict(weather_override)
     elif not test:
-        # In live run, query HA weather or NWS if available
-        pass
+        weather_data = _fetch_live_weather_data()
 
     triggers: list[dict[str, Any]] = []
 

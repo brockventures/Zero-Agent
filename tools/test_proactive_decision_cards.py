@@ -21,18 +21,29 @@ import sqlite3
 import sys
 from typing import Any
 from unittest.mock import patch
+import urllib.error
 from zoneinfo import ZoneInfo
 
 import pytest
 
-# Ensure tools and workspace on sys.path
+# Ensure tools and workspace on sys.path with worktree prioritization
 _CURRENT_DIR = Path(__file__).resolve().parent
 _WORKSPACE_DIR = _CURRENT_DIR.parent
-for _p in [str(_WORKSPACE_DIR), str(_CURRENT_DIR)]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+for _p in [str(_CURRENT_DIR), str(_WORKSPACE_DIR)]:
+    if _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
 
 from tools.forge import _validate_decision_shell_payload, init_forge_db
+
+# Re-ensure worktree is at the head of sys.path after forge import
+for _p in [str(_CURRENT_DIR), str(_WORKSPACE_DIR)]:
+    if _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
+if "tools" in sys.modules:
+    sys.modules["tools"].__path__ = [str(_CURRENT_DIR)]
+
 from tools.proactive_decision_cards import (
     CHANNEL_BROCK_HOUSE,
     CHANNEL_FINANCES,
@@ -41,8 +52,15 @@ from tools.proactive_decision_cards import (
     CHANNEL_SHOPPING,
     CHANNEL_ZERO_CHAT,
     _classify_comms_item,
+    _fetch_live_budget_anomalies,
+    _fetch_live_weather_data,
+    _get_calendar_seen_path,
+    _get_ha_credentials,
+    _load_seen_calendar_keys,
+    _make_calendar_issue_key,
     _parse_event_datetime,
     _parse_recipe_minutes,
+    _save_seen_calendar_keys,
     main,
     run_actual_budget_anomaly_card,
     run_dinner_pivot_card,
@@ -69,6 +87,14 @@ def isolate_triage_seen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     """Direct triage_card_seen.json to an isolated temp path."""
     seen_path = tmp_path / "triage_card_seen.json"
     monkeypatch.setenv("TRIAGE_SEEN_FILE_PATH", str(seen_path))
+    return seen_path
+
+
+@pytest.fixture
+def isolate_calendar_seen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Direct calendar_radar_seen.json to an isolated temp path."""
+    seen_path = tmp_path / "calendar_radar_seen.json"
+    monkeypatch.setenv("CALENDAR_RADAR_SEEN_FILE_PATH", str(seen_path))
     return seen_path
 
 
@@ -391,6 +417,117 @@ def test_calendar_radar_dry_run(test_db: Path) -> None:
     assert "Summer Camp Check-in" in summary
 
 
+def test_calendar_radar_deduplicates_across_consecutive_runs(
+    test_db: Path, isolate_calendar_seen: Path
+) -> None:
+    """Stages card on initial run, updates seen keys, and suppresses duplicates on consecutive run."""
+    # Verify deterministic helper key generation and order invariance
+    k1 = _make_calendar_issue_key("overlap", ["Sync", "Doctor"], "2026-10-31")
+    k2 = _make_calendar_issue_key("overlap", ["Doctor", "Sync"], "2026-10-31")
+    assert k1 == k2
+    assert len(k1) == 64
+
+    # Verify path resolver and save/load helpers
+    assert _get_calendar_seen_path() == isolate_calendar_seen
+    _save_seen_calendar_keys({k1}, isolate_calendar_seen)
+    assert _load_seen_calendar_keys(isolate_calendar_seen) == {k1}
+    # Clear for execution run
+    isolate_calendar_seen.unlink()
+
+    now_pt = datetime.now(PT)
+    event_prep = {
+        "id": "ev-birthday",
+        "summary": "Rosie 4th Birthday Party",
+        "start": (now_pt + timedelta(hours=20)).isoformat(),
+        "end": (now_pt + timedelta(hours=22)).isoformat(),
+    }
+    event_overlap_1 = {
+        "id": "ev-overlap-1",
+        "summary": "Doctor Appointment",
+        "start": (now_pt + timedelta(hours=5)).isoformat(),
+        "end": (now_pt + timedelta(hours=6)).isoformat(),
+    }
+    event_overlap_2 = {
+        "id": "ev-overlap-2",
+        "summary": "Contractor Sync",
+        "start": (now_pt + timedelta(hours=5, minutes=30)).isoformat(),
+        "end": (now_pt + timedelta(hours=6, minutes=30)).isoformat(),
+    }
+    events = [event_prep, event_overlap_1, event_overlap_2]
+
+    # Run 1: Should detect prep + overlap, stage Decision Card, write seen file
+    ok1, summary1, meta1 = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events,
+    )
+    assert ok1 is True
+    assert meta1["cards_staged"] == 1
+    assert len(meta1["issues"]) >= 2
+    assert isolate_calendar_seen.exists()
+
+    seen_data = json.loads(isolate_calendar_seen.read_text(encoding="utf-8"))
+    assert "seen_keys" in seen_data
+    assert len(seen_data["seen_keys"]) >= 2
+
+    # Run 2: Exact same events on next run -> all issues filtered out -> silent exit
+    ok2, summary2, meta2 = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events,
+    )
+    assert ok2 is True
+    assert summary2 == ""
+    assert meta2["cards_staged"] == 0
+    assert meta2["issues"] == []
+
+    # Run 3: Introduce a new event with prep keyword
+    new_event = {
+        "id": "ev-camp",
+        "summary": "Soccer Camp Registration",
+        "start": (now_pt + timedelta(hours=30)).isoformat(),
+        "end": (now_pt + timedelta(hours=31)).isoformat(),
+    }
+    events_with_new = events + [new_event]
+
+    ok3, summary3, meta3 = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events_with_new,
+    )
+    assert ok3 is True
+    assert meta3["cards_staged"] == 1
+    # Only the new soccer camp issue should be staged
+    assert len(meta3["issues"]) == 1
+    assert "Soccer Camp" in meta3["issues"][0]["title"]
+
+
+def test_calendar_radar_dedup_bypassed_without_seen_env(
+    test_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When test=True and CALENDAR_RADAR_SEEN_FILE_PATH is not set, dedup is bypassed."""
+    monkeypatch.delenv("CALENDAR_RADAR_SEEN_FILE_PATH", raising=False)
+    now_pt = datetime.now(PT)
+    events = [{
+        "id": "ev-prep",
+        "summary": "Rosie Birthday Party",
+        "start": (now_pt + timedelta(hours=12)).isoformat(),
+        "end": (now_pt + timedelta(hours=14)).isoformat(),
+    }]
+    # Run twice
+    ok1, _, meta1 = run_family_calendar_radar_card(
+        test=True, db_path=test_db, post_to_discord=False, events_override=events
+    )
+    ok2, _, meta2 = run_family_calendar_radar_card(
+        test=True, db_path=test_db, post_to_discord=False, events_override=events
+    )
+    assert meta1["cards_staged"] == 1
+    assert meta2["cards_staged"] == 1
+
+
 # ==============================================================================
 # Workflow 3: Afternoon Dinner Pivot Card Tests
 # ==============================================================================
@@ -657,6 +794,45 @@ def test_actual_budget_anomaly_dry_run(test_db: Path) -> None:
     assert count == 0
 
 
+def test_actual_budget_anomaly_live_fetcher_fallback_and_read(
+    test_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies safe fallback when anomalies file is missing or invalid, and staging when file exists."""
+    missing_file = tmp_path / "nonexistent_anomalies.json"
+    monkeypatch.setenv("ACTUAL_ANOMALIES_FILE_PATH", str(missing_file))
+
+    # Missing file returns [] safely
+    assert _fetch_live_budget_anomalies() == []
+
+    # Invalid JSON returns [] safely
+    missing_file.write_text("invalid json content", encoding="utf-8")
+    assert _fetch_live_budget_anomalies() == []
+
+    # Nominal run when live file has 0 anomalies
+    missing_file.write_text("[]", encoding="utf-8")
+    ok, summary, meta = run_actual_budget_anomaly_card(test=False, db_path=test_db, post_to_discord=False)
+    assert ok is True
+    assert summary == ""
+    assert meta["cards_staged"] == 0
+
+    # Populated file stages Decision Card
+    valid_anomalies = [
+        {
+            "type": "uncategorized_merchant",
+            "merchant": "Electrician Express",
+            "amount": 185.00,
+            "account": "Checking",
+        }
+    ]
+    missing_file.write_text(json.dumps(valid_anomalies), encoding="utf-8")
+    assert len(_fetch_live_budget_anomalies()) == 1
+
+    ok2, summary2, meta2 = run_actual_budget_anomaly_card(test=False, db_path=test_db, post_to_discord=False)
+    assert ok2 is True
+    assert meta2["cards_staged"] == 1
+    assert "Electrician Express" in summary2
+
+
 # ==============================================================================
 # Workflow 5: Weather / Energy Pre-Adjustment Card Tests
 # ==============================================================================
@@ -750,6 +926,75 @@ def test_weather_energy_dry_run(test_db: Path) -> None:
     assert meta["cards_staged"] == 0
     assert meta["dry_run"] is True
     assert "Extreme Heat" in summary
+
+
+def test_weather_energy_live_fetcher_fallback_and_read(
+    test_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies safe fallback when HA credentials or server are offline, and staging on trigger."""
+    # 1. No credentials -> returns {}
+    monkeypatch.setenv("SECRETS_FILE_PATH", str(tmp_path / "nonexistent_secrets.json"))
+    monkeypatch.delenv("HA_BASE_URL", raising=False)
+    monkeypatch.delenv("HA_ACCESS_TOKEN", raising=False)
+    assert _fetch_live_weather_data() == {}
+
+    # Calling run_weather_energy_card with test=False and no credentials stays silent
+    ok, summary, meta = run_weather_energy_card(test=False, db_path=test_db, post_to_discord=False)
+    assert ok is True
+    assert summary == ""
+    assert meta["cards_staged"] == 0
+
+    # 2. Mock HA responding with extreme heat alert
+    # Note: Using RFC 5737 documentation address per no_hardcoded_topology rule
+    monkeypatch.setenv("HA_BASE_URL", "http://198.51.100.1:8123")
+    monkeypatch.setenv("HA_ACCESS_TOKEN", "mock-token-secret")
+    assert _get_ha_credentials() == ("http://198.51.100.1:8123", "mock-token-secret")
+
+    mock_ha_payload = {
+        "entity_id": "weather.forecast_home",
+        "state": "sunny",
+        "attributes": {
+            "temperature": 75.0,
+            "forecast": [
+                {
+                    "datetime": "2026-10-31T12:00:00+00:00",
+                    "condition": "sunny",
+                    "temperature": 96.5,
+                    "templow": 65.0,
+                    "precipitation": 0.0,
+                }
+            ],
+        },
+    }
+
+    class MockHTTPResponse:
+        def __init__(self, data: dict[str, Any]):
+            self.status = 200
+            self._raw = json.dumps(data).encode("utf-8")
+
+        def read(self) -> bytes:
+            return self._raw
+
+        def __enter__(self) -> MockHTTPResponse:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+    with patch("urllib.request.urlopen", return_value=MockHTTPResponse(mock_ha_payload)):
+        fetched = _fetch_live_weather_data()
+        assert fetched.get("temp_high") == 96.5
+        assert fetched.get("temp_low") == 65.0
+
+        ok2, summary2, meta2 = run_weather_energy_card(test=False, db_path=test_db, post_to_discord=False)
+        assert ok2 is True
+        assert meta2["cards_staged"] == 1
+        assert "Extreme Heat" in summary2
+        assert "96.5°F" in summary2
+
+    # 3. Connection error / timeout in urlopen falls back to {} safely
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Connection refused")):
+        assert _fetch_live_weather_data() == {}
 
 
 # ==============================================================================
