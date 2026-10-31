@@ -258,7 +258,9 @@ class TestForgeEngine(unittest.TestCase):
         self.assertIn("touches_core_bridge=true", env_text)
         self.assertIn("auto-baseline", env_text)
 
-        with patch("tools.outbox.queue_outbox_message") as mock_outbox:
+        with patch("tools.outbox.queue_outbox_message") as mock_outbox, patch.object(
+            forge_mod, "_post_decision_card_rest", return_value=None
+        ):
             ok = dispatch_build_completion_to_origin(build_id, db_path=self.db_path)
             self.assertTrue(ok)
             mock_outbox.assert_called_once()
