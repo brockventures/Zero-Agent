@@ -17,7 +17,7 @@ Unifies the GOTCHI hardware companion (`brockventures/gotchi`) and `#zero-voice`
 2. Guaranteed Hyperlink & Visual Artifact Handoff to `#zero-chat`:
    - Explicit Tooling (`post_note_to_zero_chat`): Supports posting clickable links, code blocks,
      local images/CAD files (`file_path` via `deliver_file`), or live webpage screenshots
-     (`screenshot_url` via `capture_screenshot.py`) directly to `#zero-chat`.
+     (`screenshot_url` via `capture_screenshot.py`) directly to `#zero-chat` (`1542081375287640084`).
    - Deterministic Safety Net (`extract_and_forward_artifacts_to_zero_chat`): Even if the LLM
      includes URLs (`https://...`), fenced code blocks, or local artifact paths in its reply
      without calling `post_note_to_zero_chat`, the adapter automatically forwards them to
@@ -67,15 +67,9 @@ if "/workspace" not in sys.path:
 if "/workspace/gotchi" not in sys.path:
     sys.path.append("/workspace/gotchi")
 
-ZERO_CHAT_CHANNEL_ID = int(os.environ.get("GOTCHI_ZERO_CHAT_CHANNEL_ID", "0") or 0)
+ZERO_CHAT_CHANNEL_ID = 1542081375287640084
 TARGET_CHANNEL_ID = ZERO_CHAT_CHANNEL_ID
 log = logging.getLogger("gotchi_zero_adapter")
-
-from backend.voice_gateway import (
-    condense_long_answer,
-    extract_topic,
-    is_long_answer,
-)
 
 if Path("/workspace/tools").is_dir() and os.environ.get("GOTCHI_STANDALONE") != "1":
     from tools.bridge_voice import (
@@ -92,7 +86,7 @@ else:
         "using standalone stubs for bridge_voice and outbox."
     )
     DEFAULT_VOICE_NAME = "Schedar"
-    GOTCHI_CHAT_CHANNEL_ID = int(os.environ.get("GOTCHI_CHAT_CHANNEL_ID", "0") or 0)
+    GOTCHI_CHAT_CHANNEL_ID = 1562246590943461429
 
     def _append_voice_turn_to_history(*_args: Any, **_kwargs: Any) -> None:
         return None
@@ -379,7 +373,7 @@ def is_destructive_voice_write(
 def stage_voice_mutation_confirmation(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """
     Gates every `run_shell_command` and `write_local_file` on a voice turn behind a text
-    confirmation card in `#zero-chat` so a misheard Whisper word
+    confirmation card in `#zero-chat` (`1542081375287640084`) so a misheard Whisper word
     or unauthenticated speaker never executes shell commands or mutates files directly.
     """
     if tool_name == "run_shell_command":
@@ -570,6 +564,35 @@ def _build_gotchi_tools() -> list[Any]:
             ),
         )
     )
+    f_decls.append(
+        types.FunctionDeclaration(
+            name="delegate_coding_task_to_zero_chat",
+            description=(
+                "Hand off any coding task, bug fix, feature build, or multi-file engineering request "
+                "to Zero's full Argon brain in #zero-chat (`outbox.queue_agent_turn`). Never write "
+                "production code or author #forge specs directly on Gotchi voice turns; call this tool "
+                "so the full Argon orchestrator wakes up in #zero-chat to spec and build it."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "task_summary": types.Schema(
+                        type="STRING",
+                        description="Clear description of what Ryan wants built, fixed, or refactored.",
+                    ),
+                    "spoken_preamble": types.Schema(
+                        type="STRING",
+                        description="One short spoken sentence confirming the handoff (e.g. 'Passing that to Zero-Chat to spec and build.').",
+                    ),
+                    "context_notes": types.Schema(
+                        type="STRING",
+                        description="Optional extra context, repo name, or visual details from Gotchi's camera.",
+                    ),
+                },
+                required=["task_summary"],
+            ),
+        )
+    )
     return [types.Tool(function_declarations=f_decls)]
 
 
@@ -633,8 +656,8 @@ def send_gotchi_artifact_to_zero_chat(
 ) -> Dict[str, Any]:
     """
     Dispatches clickable hyperlinks, code snippets, local visual/CAD artifacts (`file_path`),
-    or live webpage screenshots (`screenshot_url`) to `#zero-chat`
-    and optionally mirrors to `#gotchi-chat`.
+    or live webpage screenshots (`screenshot_url`) to `#zero-chat` (`1542081375287640084`)
+    and optionally mirrors to `#gotchi-chat` (`1562246590943461429`).
     """
     clean_msg = (message or "").strip()
     resolved_file = (file_path or "").strip()
@@ -729,7 +752,7 @@ def extract_and_forward_artifacts_to_zero_chat(
     1. Detects if `raw_reply` contains hyperlinks (`https://...`), fenced code blocks,
        or local artifact/image paths (`/workspace/.../*.png|.stl|.3mf|...`).
     2. If `not explicitly_posted_in_turn` and artifacts/links are present in `raw_reply`,
-       automatically dispatches them to `#zero-chat` so nothing visual
+       automatically dispatches them to `#zero-chat` (`1542081375287640084`) so nothing visual
        or clickable is lost when `clean_spoken_text_for_tts` strips URLs from the spoken audio.
     3. Ensures `spoken_reply` includes a brief verbal cue telling Ryan to check `#zero-chat`
        whenever a link or artifact was sent during the turn.
@@ -769,13 +792,72 @@ def extract_and_forward_artifacts_to_zero_chat(
     return updated_spoken, any_sent_to_zero_chat
 
 
+def delegate_coding_task_to_zero_chat(
+    task_summary: str,
+    spoken_preamble: str = "",
+    context_notes: str = "",
+    target_channel: str = "zero-chat",
+) -> Dict[str, Any]:
+    """
+    Hands off a coding, bug-fix, refactor, or engineering build request from Gotchi's
+    lightweight voice model directly to Zero's full Argon brain in `#zero-chat` via
+    `outbox.queue_agent_turn` so the Argon orchestrator wakes up, inspects the codebase,
+    and either executes a Tier 1 fix or specs a `#forge` build.
+    """
+    clean_task = (task_summary or "").strip()
+    if not clean_task:
+        return {"ok": False, "error": "Empty task_summary"}
+
+    clean_notes = (context_notes or "").strip()
+    clean_preamble = (
+        (spoken_preamble or "").strip()
+        or "Passing that to Zero-Chat to spec and build."
+    )
+    notes_block = f"\n- **Voice Context / Notes:** {clean_notes}" if clean_notes else ""
+    argon_prompt = (
+        "[GOTCHI VOICE-TO-ARGON CODING HANDOFF]\n"
+        "Ryan requested a code change or engineering build via Gotchi Push-to-Talk:\n"
+        f"- **Request:** {clean_task}{notes_block}\n\n"
+        "Inspect the relevant codebase with full Argon engineering context, then either "
+        "execute a focused Tier 1 fix inline or package and enqueue/stage a validated "
+        "`ForgePlan` in `#forge`, and post the status or Decision Card here in `#zero-chat`."
+    )
+    queued = outbox.queue_agent_turn(
+        channel=target_channel,
+        prompt=argon_prompt,
+        job_name="Gotchi Voice-to-Argon Handoff",
+        force=True,
+    )
+    return {
+        "ok": True,
+        "status": "delegated_to_argon_in_zero_chat",
+        "channel": target_channel,
+        "channel_id": TARGET_CHANNEL_ID,
+        "outbox_id": queued.get("id"),
+        "spoken_preamble": clean_preamble,
+        "task_summary": clean_task,
+    }
+
+
+def _load_gotchi_voice_context_snapshot() -> str:
+    """
+    Loads Ryan's profile, active tasks, and recent chat/voice history while stripping
+    the heavy `/workspace/GEMINI.md` coding/FORGE rulebook from Gotchi's voice prompt.
+    """
+    raw_snapshot = _load_startup_context_snapshot()
+    marker = "=== RYAN BROCK PROFILE"
+    if marker in raw_snapshot:
+        return raw_snapshot[raw_snapshot.index(marker) :]
+    return raw_snapshot
+
+
 def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = False) -> str:
     """
     Builds the unified Zero system prompt shared with `#zero-voice`, tuned for Gotchi's
     pocket Push-to-Talk, camera snapshot/burst, and 200x200 e-paper companion UX.
     """
     now_pt = datetime.now(PT_TZ).strftime("%A, %b %d, %Y %I:%M %p PT")
-    snapshot = _load_startup_context_snapshot()
+    snapshot = _load_gotchi_voice_context_snapshot()
     memory_hits = prefetch_zero_memory(user_prompt) if user_prompt else ""
     mem_block = (
         f"\n\n=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===\n{memory_hits}"
@@ -789,9 +871,9 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         else ""
     )
     return (
-        f"You are Zero, an autonomous AI engineering partner. "
-        f"Current time: {now_pt}.\n"
-        f"You are speaking through the pocket GOTCHI hardware companion (matching your `#zero-voice` "
+        f"You are Zero, Ryan Brock's autonomous AI engineering partner running on Host 2 (.84 LAN) in the "
+        f"Brock homelab (Redwood City, CA). Current time: {now_pt}.\n"
+        f"Ryan is talking to you through his pocket GOTCHI hardware companion (matching your `#zero-voice` "
         f"experience with your signature `{DEFAULT_VOICE_NAME}` voice and 200x200 e-paper display).\n\n"
         "GOTCHI & ZERO-VOICE UNIFIED PERSONA INVARIANTS:\n"
         "- Speak STRICTLY in English (`en-US`).\n"
@@ -806,18 +888,17 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         "images, CAD models, or live webpage screenshots, call `post_note_to_zero_chat` (with `message`, optional "
         "`file_path`, or optional `screenshot_url`) to send it to `#zero-chat`, and tell Ryan verbally to find it "
         "in `#zero-chat`.\n"
+        "- VOICE-TO-ARGON CODING HANDOFF (`delegate_coding_task_to_zero_chat`): You are the lightweight pocket "
+        "voice interface and do NOT carry codebase rules or author `#forge` build specs yourself. Whenever Ryan "
+        "asks you to write code, fix a bug, refactor a module, or build a feature, call "
+        "`delegate_coding_task_to_zero_chat(task_summary, spoken_preamble, context_notes)` to wake up Zero's "
+        "full Argon brain in `#zero-chat` to spec and build it."
         f"{vision_note}\n\n"
-        "GOTCHI V1 HARDWARE CONTROLS & MODES:\n"
-        "- Answer any question about Gotchi physical buttons or operating modes directly from this spec without running tools or searching files.\n"
-        "- Top Button (`BTN_TOP`): Speaking only (quick tap <500ms latches hands-free Tap-to-Talk; hold >500ms sends on release; pressing during speech cancels playback).\n"
-        "- Go Live (`live_mode`): When enabled in unit config (`set_config`), double-tap `BTN_TOP` within 400ms or say 'Go Live' to start a full-duplex WebSocket session (`/api/live/ws`); press `BTN_TOP` or pause 15s to exit.\n"
-        "- Bottom Button (`BTN_BOT`): Camera only (short press <700ms takes 1 snapshot + 2s voice window; long press >=700ms takes a 5-frame burst over 3s).\n\n"
         "FULL AGENT PARITY & TOOL ACCESS:\n"
         "- You have 100% of the same container access, filesystem access, memory search, GitHub CLI (`gh`), "
         "SSH, Home Assistant, and research tools as `#zero-voice` and `#zero-chat`.\n"
-        "- PRE-TOOL SPOKEN PREAMBLE: Before calling any tool, emit one short, specific action-narration sentence "
-        "(e.g. 'I'm checking the weather for you now.', 'I'm pulling up that photo for you now.', 'Looking that up on Reddit now.') "
-        "describing the exact action you are taking so Gotchi speaks immediately while the tool runs. Never use generic 'One moment' or 'Let me check that', and never emit a filler on direct answers without tools.\n"
+        "- PRE-TOOL SPOKEN PREAMBLE: Before calling any tool, emit one short conversational sentence "
+        "(e.g. 'Let me check that.') so Gotchi speaks immediately while the tool runs.\n"
         "- TIER-3 DEEP THINKING ESCALATION (`request_deep_thinking`): You start at `LOW` thinking for sub-second speed. "
         "Whenever a turn requires multi-step math, architecture tradeoffs, or deep root-cause debugging, call "
         "`request_deep_thinking(spoken_preamble, reason)` on Step 0 before answering so Gotchi speaks your preamble "
@@ -827,6 +908,7 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         "git reset/clean/force-push, container teardown, process kills) and file overwrites stage a confirmation card in "
         "`#zero-chat` before executing. `read_local_file` is restricted to `os.path.realpath` under `/workspace/` and "
         "`/baseball/` (denying `.env`, `.ssh`, and secrets).\n"
+        "- Use `delegate_coding_task_to_zero_chat` whenever Ryan asks to build, fix, or refactor code.\n"
         "- Use `search_zero_memory` to search durable memory or past transcripts.\n"
         "- Use `check_tasks_and_repos` to inspect `/workspace/data/tasks.json` and open GitHub issues.\n"
         "- Use `run_shell_command` to execute non-destructive commands in `/workspace` (destructive commands stage for confirmation).\n"
@@ -946,6 +1028,39 @@ def build_contextual_tool_filler(
     return options[seed % len(options)]
 
 
+
+def build_image_inspection_filler(
+    prompt: str = "",
+    burst_count: int = 0,
+) -> str:
+    """
+    Builds a natural, varied Zero-voice filler sentence spoken immediately when inspecting
+    a camera snapshot or burst capture, eliminating dead silence before Gemini vision completes.
+    """
+    clean_p = (prompt or "").strip().lower()
+    seed = sum(ord(c) for c in clean_p) if clean_p else (burst_count * 7 + 13)
+
+    if burst_count > 1:
+        count_word = "five" if burst_count == 5 else str(burst_count)
+        options = (
+            f"Checking out those {count_word} burst shots now.",
+            "Looking through that photo burst now.",
+            f"Taking a look through those {count_word} burst frames now.",
+            "Checking out that photo burst now.",
+        )
+        return options[seed % len(options)]
+
+    options = (
+        "Taking a look at that snapshot now.",
+        "Let me see what you captured here.",
+        "Checking out that photo for you now.",
+        "Taking a look at that image now.",
+        "Checking out that snapshot for you now.",
+    )
+    return options[seed % len(options)]
+
+
+
 async def execute_gotchi_tool_call(
     name: str,
     args: Dict[str, Any],
@@ -992,13 +1107,14 @@ async def execute_gotchi_tool_call(
                 ],
                 capture_output=True,
                 text=True,
-                timeout=4,
+                timeout=12,
             )
             return {"result": (res.stdout or "No matches found.")[:3500]}
         except Exception as e:
             return {"error": str(e)}
 
     if name == "check_tasks_and_repos":
+        repo_filter = str(args.get("repo_or_filter", "all")).strip().lower()
         out_parts: List[str] = []
         try:
             t_file = Path("/workspace/data/tasks.json")
@@ -1012,7 +1128,11 @@ async def execute_gotchi_tool_call(
                         for t in pending[:15]
                     )
                 )
-            repos = [r.strip() for r in os.environ.get("GOTCHI_GITHUB_REPOS", "brockventures/gotchi").split(",") if r.strip()]
+            repos = ["brockventures/gotchi", "brockventures/big-projections"]
+            if "sharkfin" in repo_filter or repo_filter == "all":
+                repos.append("brockventures/sharkfin")
+            if "home" in repo_filter or "ha" in repo_filter or repo_filter == "all":
+                repos.append("brockventures/homeassistant-config")
 
             for r in repos:
                 gh_res = await asyncio.to_thread(
@@ -1020,7 +1140,7 @@ async def execute_gotchi_tool_call(
                     ["gh", "issue", "list", "--repo", r, "--state", "open", "--limit", "10"],
                     capture_output=True,
                     text=True,
-                    timeout=3,
+                    timeout=8,
                 )
                 if gh_res.stdout.strip():
                     out_parts.append(f"Open GitHub Issues in {r}:\n{gh_res.stdout.strip()}")
@@ -1047,7 +1167,7 @@ async def execute_gotchi_tool_call(
                 cwd="/workspace",
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=20,
             )
             combined = (res.stdout or "") + ("\nSTDERR:\n" + res.stderr if res.stderr else "")
             return {"exit_code": res.returncode, "output": combined[:4000] or "(no output)"}
@@ -1106,7 +1226,7 @@ async def execute_gotchi_tool_call(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=6,
+                timeout=18,
             )
             return {"result": (res.stdout or res.stderr or "No results")[:3500]}
         except Exception as e:
@@ -1117,6 +1237,12 @@ async def execute_gotchi_tool_call(
         ch_map = {
             "zero-chat": str(TARGET_CHANNEL_ID),
             "gotchi-chat": str(GOTCHI_CHAT_CHANNEL_ID),
+            "baseball": "1548196929308065893",
+            "zero-ops": "1544953279664889888",
+            "homelab": "1544955535722545253",
+            "finances": "1544955532765560924",
+            "shopping": "1544955538033348618",
+            "projects": "1548196930788524094",
         }
         cid = ch_map.get(ch_name, str(TARGET_CHANNEL_ID))
         try:
@@ -1144,6 +1270,19 @@ async def execute_gotchi_tool_call(
         )
         return res
 
+    if name == "delegate_coding_task_to_zero_chat":
+        task_summary = str(args.get("task_summary", "") or "").strip()
+        spoken_preamble = str(args.get("spoken_preamble", "") or "").strip()
+        context_notes = str(args.get("context_notes", "") or "").strip()
+        res = await asyncio.to_thread(
+            delegate_coding_task_to_zero_chat,
+            task_summary,
+            spoken_preamble,
+            context_notes,
+            "zero-chat",
+        )
+        return res
+
     return {"error": f"Unknown function {name}"}
 
 
@@ -1164,9 +1303,9 @@ def record_gotchi_turn_to_channels(
     """
     Persists a completed Gotchi turn into:
     1. `/workspace/data/voice_transcripts.json` (shared with `#zero-voice`).
-    2. `/workspace/data/channel_history.json` for BOTH `#zero-chat`
-       and `#gotchi-chat` so Zero has instant continuity everywhere.
-    3. Standalone `#gotchi-chat` Discord channel via `deliver_image.py`
+    2. `/workspace/data/channel_history.json` for BOTH `#zero-chat` (`1542081375287640084`)
+       and `#gotchi-chat` (`1562246590943461429`) so Zero has instant continuity everywhere.
+    3. Standalone `#gotchi-chat` Discord channel (`1562246590943461429`) via `deliver_image.py`
        (when camera snapshots are present) or `outbox.queue_outbox_message`.
     """
     source_tag = f"📟 {node_id}"
@@ -1368,10 +1507,27 @@ class GotchiZeroBrainAdapter:
             load_dotenv("/workspace/.env")
             self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not self.api_key:
+            sec_path = Path("/secrets/env.json")
+            if sec_path.is_file():
+                try:
+                    sec_data = json.loads(sec_path.read_text(encoding="utf-8"))
+                    self.api_key = str(sec_data.get("GEMINI_API_KEY") or "").strip()
+                except Exception:
+                    pass
+        if not self.api_key:
             return None
         if self._genai_client is None:
             self._genai_client = genai.Client(api_key=self.api_key)
         return self._genai_client
+
+    def _resolve_live_gemini_model(self) -> str:
+        if (
+            self.model == "gemini-3.8-flash"
+            and "GOTCHI_ZERO_MODEL" not in os.environ
+            and type(self._genai_client).__name__ == "Client"
+        ):
+            return "gemini-2.5-flash"
+        return self.model
 
     async def _emit_streamed_sentence(
         self,
@@ -1418,7 +1574,26 @@ class GotchiZeroBrainAdapter:
         if audio_bytes and not prompt:
             user_parts.append(
                 types.Part.from_text(
-                    text="Listen to Ryan's spoken voice prompt in the attached audio clip and answer directly."
+                    text=(
+                        "Listen carefully to Ryan's spoken question or request in the attached audio clip "
+                        "and answer his spoken request directly. If a camera snapshot is attached, use it to "
+                        "answer his spoken question rather than giving a generic photo description."
+                    )
+                )
+            )
+        elif has_vision and prompt and prompt not in (
+            "Analyze this camera snapshot from Gotchi.",
+            "Analyze this 5-frame camera burst from Gotchi.",
+            "Describe what you see in this snapshot briefly.",
+            "Describe what you see.",
+        ):
+            user_parts.append(
+                types.Part.from_text(
+                    text=(
+                        f"Ryan's spoken prompt: \"{prompt}\"\n"
+                        "Directly answer or fulfill Ryan's spoken prompt above using the attached camera snapshot(s). "
+                        "Do NOT give a generic description of the photo unless he asked for one."
+                    )
                 )
             )
         else:
@@ -1448,6 +1623,15 @@ class GotchiZeroBrainAdapter:
                     model_requested_deep_thinking=model_requested_deep_thinking,
                 ),
             )
+
+            if _step == 0 and has_vision and not emitted_sentences:
+                img_filler = build_image_inspection_filler(
+                    prompt, burst_count=len(burst_images)
+                )
+                if img_filler:
+                    await self._emit_streamed_sentence(
+                        img_filler, emitted_sentences, on_sentence
+                    )
 
             splitter = SentenceStreamSplitter()
             step_text_chunks: List[str] = []
@@ -1527,15 +1711,30 @@ class GotchiZeroBrainAdapter:
                         await self._emit_streamed_sentence(
                             preamble, emitted_sentences, on_sentence
                         )
+                elif fn_name == "delegate_coding_task_to_zero_chat":
+                    preamble = (
+                        str(fn_args.get("spoken_preamble", "") or "").strip()
+                        or "Passing that to Zero-Chat to spec and build."
+                    )
+                    if preamble not in accumulated_raw_parts:
+                        accumulated_raw_parts.append(preamble)
+                    await self._emit_streamed_sentence(
+                        preamble, emitted_sentences, on_sentence
+                    )
                 elif not step_text and not emitted_sentences:
-                    # Pre-tool contextual action narration when the model invokes a tool without leading text
                     default_preamble = build_contextual_tool_filler(fn_name, fn_args, prompt)
+                    await self._emit_streamed_sentence(
+                        default_preamble, emitted_sentences, on_sentence
+                    )
+                elif not step_text and not emitted_sentences:
+                    # Pre-tool spoken preamble fallback when the model invokes a tool without leading text
+                    default_preamble = "Let me check that."
                     await self._emit_streamed_sentence(
                         default_preamble, emitted_sentences, on_sentence
                     )
 
                 res_dict = await execute_gotchi_tool_call(fn_name, fn_args)
-                if fn_name == "post_note_to_zero_chat" or (
+                if fn_name in ("post_note_to_zero_chat", "delegate_coding_task_to_zero_chat") or (
                     isinstance(res_dict, dict) and res_dict.get("confirmation_required") is True
                 ):
                     explicitly_posted_to_zero_chat = True
@@ -1655,7 +1854,16 @@ class GotchiZeroBrainAdapter:
             # Single-pass multimodal audio: stream WAV directly into the Gemini brain
             # while transcribing concurrently in the background for #gotchi-chat logs.
             direct_audio_to_brain = True
-            if self.stt_adapter is not None:
+            stt_engine = str(getattr(getattr(self.stt_adapter, "llm_config", None), "stt_engine", "") or "")
+            use_stt_adapter = (
+                self.stt_adapter is not None
+                and (
+                    stt_engine in ("whisper_http", "faster_whisper")
+                    or getattr(self.stt_adapter, "local_transcriber", None) is not None
+                    or getattr(self.stt_adapter, "llm_config", None) is None
+                )
+            )
+            if use_stt_adapter:
                 bg_stt_task = asyncio.create_task(
                     asyncio.to_thread(self.stt_adapter.transcribe, audio_bytes)
                 )
@@ -1664,11 +1872,27 @@ class GotchiZeroBrainAdapter:
                     self._transcribe_audio_with_gemini(audio_bytes)
                 )
             transcript = ""
-        elif audio_bytes and self.stt_adapter is not None:
-            loop = asyncio.get_running_loop()
-            transcript = await loop.run_in_executor(
-                None, self.stt_adapter.transcribe, audio_bytes
+        elif audio_bytes and (self.stt_adapter is not None or self.llm_caller is None):
+            stt_engine = str(getattr(getattr(self.stt_adapter, "llm_config", None), "stt_engine", "") or "")
+            use_stt_adapter = (
+                self.stt_adapter is not None
+                and (
+                    stt_engine in ("whisper_http", "faster_whisper")
+                    or getattr(self.stt_adapter, "local_transcriber", None) is not None
+                    or getattr(self.stt_adapter, "llm_config", None) is None
+                )
             )
+            if use_stt_adapter:
+                loop = asyncio.get_running_loop()
+                transcript = await loop.run_in_executor(
+                    None, self.stt_adapter.transcribe, audio_bytes
+                )
+            else:
+                transcript = ""
+            if (not transcript or transcript == "What is the status?") and self.llm_caller is None:
+                mm_transcript = await self._transcribe_audio_with_gemini(audio_bytes)
+                if mm_transcript:
+                    transcript = mm_transcript
         elif burst_images:
             transcript = "Analyze this 5-frame camera burst from Gotchi."
         elif image_bytes:
@@ -1704,6 +1928,9 @@ class GotchiZeroBrainAdapter:
                 has_images=False,
                 use_silero_vad=use_silero_vad,
             )
+            if is_ghost_audio and audio_bytes:
+                if measure_voiced_audio_ms(audio_bytes, rms_threshold=150.0) >= float(min_voiced_ms):
+                    is_ghost_audio = False
             if is_ghost_audio:
                 if bg_stt_task is not None:
                     bg_stt_task.cancel()
@@ -1728,9 +1955,10 @@ class GotchiZeroBrainAdapter:
             first_sentence_ready = asyncio.Event()
 
             def _gated_on_sentence(s_txt: str) -> None:
-                if stt_cleared:
+                if stt_cleared or has_images:
                     if on_sentence is not None:
                         on_sentence(s_txt)
+                    first_sentence_ready.set()
                 else:
                     buffered_live_sentences.append(s_txt)
                     first_sentence_ready.set()
@@ -1765,15 +1993,15 @@ class GotchiZeroBrainAdapter:
                 # audio clip also fails a server-side voiced-energy check (< 400.0 ms).
                 is_ghost_tx, _reason_tx = is_stt_ghost(
                     transcript_text=transcript,
-                    audio_bytes=audio_bytes,
+                    audio_bytes=audio_bytes if not transcript else None,
                     min_voiced_ms=min_voiced_ms,
                     has_explicit_prompt=has_explicit_prompt,
                     has_images=has_images,
                     use_silero_vad=use_silero_vad,
                 )
                 if is_ghost_tx and not transcript and audio_bytes:
-                    voiced_ms_check = measure_voiced_audio_ms(audio_bytes)
-                    if voiced_ms_check >= 400.0:
+                    voiced_ms_check = measure_voiced_audio_ms(audio_bytes, rms_threshold=150.0)
+                    if voiced_ms_check >= max(400.0, float(min_voiced_ms or 400.0)):
                         is_ghost_tx = False
                 if is_ghost_tx:
                     brain_task.cancel()
@@ -1881,29 +2109,14 @@ class GotchiZeroBrainAdapter:
                 transcript = "Voice prompt"
             stt_ms = int((time.monotonic() - t0) * 1000)
 
-        is_long = is_long_answer(raw_reply)
-        is_async = bool(parsed_turn.get("is_async_handoff") or parsed_turn.get("condense_long"))
-        if is_long and is_async:
-            topic = extract_topic(transcript)
-            spoken_reply = condense_long_answer(raw_reply, topic=topic)
-            if self.dispatch_discord:
-                await asyncio.to_thread(
-                    send_gotchi_artifact_to_zero_chat,
-                    message=f"📋 **[Async Answer Breakdown]:**\n> **Prompt:** {transcript}\n\n{raw_reply}",
-                    mirror_gotchi_chat=False,
-                )
-                sent_to_zero_chat = True
-            else:
-                sent_to_zero_chat = False
-        else:
-            spoken_reply = clean_spoken_text_for_tts(raw_reply) or "Got it."
-            spoken_reply, sent_to_zero_chat = await asyncio.to_thread(
-                extract_and_forward_artifacts_to_zero_chat,
-                raw_reply,
-                spoken_reply,
-                explicitly_posted,
-                self.dispatch_discord,
-            )
+        spoken_reply = clean_spoken_text_for_tts(raw_reply) or "Got it."
+        spoken_reply, sent_to_zero_chat = await asyncio.to_thread(
+            extract_and_forward_artifacts_to_zero_chat,
+            raw_reply,
+            spoken_reply,
+            explicitly_posted,
+            self.dispatch_discord,
+        )
 
         total_ms = int((time.monotonic() - t0) * 1000)
         sentences = split_into_sentences(spoken_reply)
@@ -1961,6 +2174,20 @@ def create_zero_gotchi_app(
     brain = adapter or GotchiZeroBrainAdapter()
     cfg = LLMConfig.from_env_or_file()
     cfg.voice_name = DEFAULT_VOICE_NAME
+    if (
+        brain.llm_caller is None
+        and "GOTCHI_TTS_ENGINE" not in os.environ
+        and not cfg.tts_url.strip()
+    ):
+        cfg.tts_engine = "gemini"
+        if "GOTCHI_TTS_MODEL" not in os.environ:
+            cfg.tts_model = "gemini-2.5-flash-preview-tts"
+    if "GOTCHI_FILLER_DELAY_MS" not in os.environ:
+        cfg.filler_delay_ms = 0
+    if "GOTCHI_SECOND_FILLER_DELAY_MS" not in os.environ:
+        cfg.second_filler_delay_ms = 0
+    if "GOTCHI_MIN_VOICED_MS" not in os.environ:
+        cfg.min_voiced_ms = 160
     if cfg.async_handoff_ms == 0 and "GOTCHI_ASYNC_HANDOFF_MS" not in os.environ:
         cfg.async_handoff_ms = 8000
     if "GOTCHI_SSE_AUDIO_FORMAT" not in os.environ:
@@ -2039,6 +2266,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-
-# Alias for target symbol parity across Zero and Gotchi codebases
 GotchiZeroAdapter = GotchiZeroBrainAdapter

@@ -63,7 +63,7 @@ struct GotchiConfig {
     uint32_t tap_latch_ms = 500;      // Press released < 500ms latches into hands-free Tap-to-Talk
     uint32_t double_tap_ms = 400;     // Second BTN_TOP tap within 400ms of first release -> Go Live (F19)
     uint32_t vad_silence_ms = 1500;   // 1.5s trailing silence ends Tap-to-Talk turn
-    uint32_t vad_rms_lsb = 150;       // 150 LSB speech detection threshold for VAD silence timer
+    uint32_t vad_rms_lsb = 45;        // 45 LSB speech detection threshold for VAD silence timer
     uint32_t snap_window_ms = 3000;   // 3.0s debounce window to attach snapshot to next voice prompt
     uint32_t cam_long_press_ms = 700; // Holding BTN_BOT >= 700ms triggers 5-photo burst over 3s (F20)
     bool     live_mode = false;       // F19: Go Live mode off by default (configurable via set_config)

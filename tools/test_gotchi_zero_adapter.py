@@ -875,3 +875,92 @@ def test_direct_audio_race_both_arrival_orders_and_ghost_filter():
     assert res3["transcript"] == "Hello from the real microphone"
 
 
+def test_image_inspection_spoken_filler_and_burst_turn(monkeypatch):
+    """
+    Verifies that handle_turn and _run_gemini_with_tools emit an immediate spoken
+    filler at T=0ms via _on_sentence when image_bytes or burst_images are present,
+    eliminating dead silence before Gemini vision completes.
+    """
+    for mod_name in ("backend.gotchi_zero_adapter", "tools.gotchi_zero_adapter"):
+        try:
+            monkeypatch.setattr(f"{mod_name}.outbox.queue_outbox_message", lambda *a, **kw: None)
+            monkeypatch.setattr(f"{mod_name}._append_voice_turn_to_history", lambda *a, **kw: None)
+        except Exception:
+            pass
+
+    # 1. Unit test helper build_image_inspection_filler
+    try:
+        from backend.gotchi_zero_adapter import (
+            GotchiZeroBrainAdapter as AdapterCls,
+            build_image_inspection_filler,
+        )
+    except (ImportError, AttributeError):
+        from tools.gotchi_zero_adapter import (
+            GotchiZeroBrainAdapter as AdapterCls,
+            build_image_inspection_filler,
+        )
+
+    single_filler = build_image_inspection_filler(prompt="", burst_count=0)
+    assert any(w in single_filler.lower() for w in ["snapshot", "captured", "photo", "image"])
+
+    burst_filler = build_image_inspection_filler(prompt="", burst_count=5)
+    assert any(w in burst_filler.lower() for w in ["burst", "shots", "frames"])
+
+    # 2. Test handle_turn with image_bytes emits the filler via _on_sentence
+    class FakeChunk:
+        def __init__(self, text: str = ""):
+            self.text = text
+            self.function_calls = None
+            self.candidates = []
+
+    class FakeModels:
+        async def generate_content_stream(self, model: str, contents: Any, config: Any):
+            yield FakeChunk(text="I see a black coffee mug on the wooden desk.")
+
+    class FakeAio:
+        def __init__(self):
+            self.models = FakeModels()
+
+    class FakeGenaiClient:
+        def __init__(self):
+            self.aio = FakeAio()
+
+    adapter = AdapterCls(api_key="fake-key", dispatch_discord=False)
+    adapter._genai_client = FakeGenaiClient()
+
+    streamed_sentences: List[str] = []
+    res = asyncio.run(
+        adapter.handle_turn(
+            {
+                "node_id": "gotchi-ryan-01",
+                "session_id": "sess-snapshot-filler-1",
+                "image_bytes": b"\xff\xd8\xff\xe0" + b"\x00" * 64,
+                "_on_sentence": streamed_sentences.append,
+            }
+        )
+    )
+
+    assert len(streamed_sentences) >= 2
+    assert any(w in streamed_sentences[0].lower() for w in ["snapshot", "captured", "photo", "image"])
+    assert "coffee mug" in streamed_sentences[1].lower()
+    assert res["sentences"][0] == streamed_sentences[0]
+    assert "coffee mug" in res["reply"].lower()
+
+    # 3. Test handle_turn with burst_images emits the burst filler via _on_sentence
+    burst_streamed: List[str] = []
+    res_burst = asyncio.run(
+        adapter.handle_turn(
+            {
+                "node_id": "gotchi-ryan-01",
+                "session_id": "sess-burst-filler-1",
+                "burst_images": [b"\xff\xd8\xff\xe0" + b"\x00" * 32] * 5,
+                "_on_sentence": burst_streamed.append,
+            }
+        )
+    )
+    assert len(burst_streamed) >= 2
+    assert any(w in burst_streamed[0].lower() for w in ["burst", "shots", "frames"])
+    assert "coffee mug" in burst_streamed[1].lower()
+
+
+
