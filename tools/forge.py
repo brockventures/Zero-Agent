@@ -1496,6 +1496,155 @@ def _count_numbered_workstreams(instructions: str) -> int:
     return len(set(matches))
 
 
+def _is_new_symbol_in_instructions(sym_name: str, instructions: str) -> bool:
+    """Return True if `sym_name` is explicitly mentioned in `instructions` as being created/implemented."""
+    if not instructions or not sym_name:
+        return False
+    raw_sym = sym_name.split("(")[0].strip()
+    if not raw_sym:
+        return False
+    pattern = rf"\b{re.escape(raw_sym)}\b"
+    if not re.search(pattern, instructions):
+        return False
+    action_words = (
+        r"(?:create|creating|created|implement|implementing|implemented|"
+        r"add|adding|added|define|defining|defined|introduce|introducing|new|write|writing)"
+    )
+    for m in re.finditer(pattern, instructions):
+        start = max(0, m.start() - 120)
+        end = min(len(instructions), m.end() + 120)
+        window = instructions[start:end].lower()
+        if re.search(rf"\b{action_words}\b", window):
+            return True
+    return False
+
+
+def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
+    """Validate a ForgePlan with zero chat context against existing repository symbols and chunk dependencies."""
+    if not isinstance(plan, dict):
+        return False, ["Plan must be a JSON object."]
+
+    chunks = plan.get("chunks")
+    if not isinstance(chunks, list):
+        return False, ["Plan must include a 'chunks' list."]
+
+    findings: list[str] = []
+    default_repo_str = str(plan.get("repo") or "/workspace").strip()
+    n_chunks = len(chunks)
+
+    # 1. Target symbols validation
+    for idx, ch in enumerate(chunks):
+        if not isinstance(ch, dict):
+            continue
+        ch_repo_str = str(ch.get("repo") or default_repo_str).strip()
+        ch_repo = Path(ch_repo_str).resolve()
+        instructions = str(ch.get("instructions") or "")
+        raw_symbols = ch.get("target_symbols")
+        if not raw_symbols:
+            continue
+
+        norm_symbols = _normalize_target_symbols(raw_symbols)
+        expanded_symbols: list[str] = []
+        for s in norm_symbols:
+            if "," in s:
+                for part in s.split(","):
+                    p_clean = part.strip()
+                    if p_clean and p_clean not in expanded_symbols:
+                        expanded_symbols.append(p_clean)
+            else:
+                if s not in expanded_symbols:
+                    expanded_symbols.append(s)
+
+        for sym_str in expanded_symbols:
+            if ":" not in sym_str or sym_str.startswith(":"):
+                continue
+            rel_file, sym_name = sym_str.split(":", 1)
+            rel_file = rel_file.strip()
+            sym_name = sym_name.strip()
+            while rel_file.startswith("./"):
+                rel_file = rel_file[2:]
+
+            target_path = (ch_repo / rel_file).resolve() if not Path(rel_file).is_absolute() else Path(rel_file).resolve()
+            if not target_path.exists() or not target_path.is_file():
+                continue
+
+            clean_sym = sym_name.split("(")[0].strip()
+            snippet = extract_symbol_snippet(target_path, sym_name) or (
+                extract_symbol_snippet(target_path, clean_sym) if clean_sym != sym_name else ""
+            )
+
+            if not snippet:
+                if not _is_new_symbol_in_instructions(sym_name, instructions):
+                    findings.append(
+                        f"Chunk {idx} target symbol '{sym_str}' not found in '{rel_file}' and not marked as a new symbol in instructions."
+                    )
+
+    # 2. Dependency validation (out-of-range, non-integer, self/circular dependencies)
+    dep_graph: dict[int, list[int]] = {i: [] for i in range(n_chunks)}
+    for idx, ch in enumerate(chunks):
+        if not isinstance(ch, dict):
+            continue
+        raw_deps = ch.get("depends_on")
+        if raw_deps is None or raw_deps == []:
+            continue
+
+        if isinstance(raw_deps, (int, str)):
+            dep_list = [raw_deps]
+        elif isinstance(raw_deps, (list, tuple, set)):
+            dep_list = list(raw_deps)
+        else:
+            findings.append(f"Chunk {idx} 'depends_on' must be a list of integer chunk indices, got {type(raw_deps).__name__}.")
+            continue
+
+        for d in dep_list:
+            try:
+                d_int = int(d)
+            except (ValueError, TypeError):
+                findings.append(f"Chunk {idx} has invalid non-integer depends_on value: {d!r}")
+                continue
+
+            if d_int < 0 or d_int >= n_chunks:
+                findings.append(
+                    f"Chunk {idx} depends_on index {d_int} is out of range (valid range: 0..{n_chunks - 1})."
+                )
+                continue
+
+            if d_int == idx:
+                findings.append(f"Chunk {idx} depends on itself (circular dependency).")
+                continue
+
+            if d_int not in dep_graph[idx]:
+                dep_graph[idx].append(d_int)
+
+    # Detect cycles in dep_graph using DFS
+    color = [0] * n_chunks  # 0=unvisited, 1=visiting, 2=visited
+    cycle_path: list[int] = []
+
+    def _dfs_cycle(u: int, path: list[int]) -> bool:
+        color[u] = 1
+        path.append(u)
+        for v in dep_graph[u]:
+            if color[v] == 1:
+                start_i = path.index(v)
+                cycle_path.extend(path[start_i:] + [v])
+                return True
+            elif color[v] == 0:
+                if _dfs_cycle(v, path):
+                    return True
+        path.pop()
+        color[u] = 2
+        return False
+
+    for i in range(n_chunks):
+        if color[i] == 0:
+            if _dfs_cycle(i, []):
+                cycle_str = " -> ".join(f"Chunk {c}" for c in cycle_path)
+                findings.append(f"Circular chunk dependency detected: {cycle_str}")
+                break
+
+    return len(findings) == 0, findings
+
+
 def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     """Deterministically validate a ForgePlan JSON dictionary before enqueueing."""
     if not isinstance(plan, dict):
@@ -1573,6 +1722,11 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
                     "tasks into separate chunks (c0, c1, c2...).",
                 )
         # Note: verification_cmd is now optional (auto-falls back to deterministic baseline checks)
+
+    if not plan.get("skip_goldfish_preflight"):
+        gf_ok, gf_findings = run_goldfish_plan_preflight(plan)
+        if not gf_ok:
+            return False, f"Goldfish Plan Pre-Flight Gate failed: {'; '.join(gf_findings)}"
 
     return True, "Valid ForgePlan."
 
@@ -2885,6 +3039,122 @@ def format_chunk_prompt(
     return "\n".join(lines)
 
 
+def _is_comment_or_blank_line(text: str, is_markdown: bool = False) -> bool:
+    """Return True if `text` is an empty line or a full-line comment."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if is_markdown:
+        return stripped.startswith("<!--") or stripped.endswith("-->")
+    if stripped.startswith(("#", "//", "/*", "*/", "*", "--", "<!--", ";")):
+        return True
+    if stripped in ('"""', "'''", '"""#', '""" #'):
+        return True
+    return False
+
+
+def grade_chunk_diff_blind(
+    worktree_dir: Path | str,
+    target_files: Optional[list[str]] = None,
+    require_changes: bool = False,
+) -> tuple[bool, str]:
+    """Inspect raw git diff in worktree_dir, rejecting merge conflicts, debugger traps, or comment-only diffs."""
+    wt = Path(worktree_dir).resolve()
+    if not wt.exists():
+        return False, f"Worktree directory does not exist: {wt}"
+
+    # Auto-index untracked files with intent-to-add so raw git diff HEAD sees them
+    st_proc = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(wt),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if st_proc.returncode == 0 and "??" in st_proc.stdout:
+        subprocess.run(["git", "add", "-N", "."], cwd=str(wt), capture_output=True, timeout=15)
+
+    cmd = ["git", "diff", "HEAD"]
+    if target_files:
+        clean_targets: list[str] = []
+        for tf in target_files:
+            tf_str = str(tf).strip()
+            if tf_str.startswith(str(wt)):
+                tf_str = os.path.relpath(tf_str, str(wt))
+            while tf_str.startswith("./"):
+                tf_str = tf_str[2:]
+            if tf_str:
+                clean_targets.append(tf_str)
+        if clean_targets:
+            cmd.extend(["--"] + clean_targets)
+
+    diff_proc = subprocess.run(
+        cmd,
+        cwd=str(wt),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if diff_proc.returncode != 0:
+        fallback_cmd = [c for c in cmd if c != "HEAD"]
+        diff_proc = subprocess.run(
+            fallback_cmd,
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if diff_proc.returncode != 0:
+            return False, f"git diff failed: {diff_proc.stderr.strip()}"
+
+    diff_text = diff_proc.stdout
+    diff_lines = diff_text.splitlines()
+
+    delta_lines: list[tuple[str, str]] = []  # (line, current_file)
+    current_file = ""
+
+    for line in diff_lines:
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                current_file = parts[3].lstrip("b/")
+            continue
+
+        is_added = line.startswith("+") and not line.startswith("+++")
+        is_removed = line.startswith("-") and not line.startswith("---")
+
+        if is_added:
+            content = line[1:]
+            if "<<<<<<< " in content or ">>>>>>> " in content:
+                marker = "<<<<<<< " if "<<<<<<< " in content else ">>>>>>> "
+                return False, f"Diff contains merge conflict marker '{marker.strip()}' in added line: {content.strip()[:80]}"
+            if re.search(r"\bbreakpoint\s*\(", content):
+                return False, f"Diff contains interactive debugger trap 'breakpoint()' in added line: {content.strip()[:80]}"
+            if re.search(r"\bpdb\.set_trace\s*\(", content):
+                return False, f"Diff contains interactive debugger trap 'pdb.set_trace()' in added line: {content.strip()[:80]}"
+
+        if is_added or is_removed:
+            delta_lines.append((line, current_file))
+
+    if require_changes:
+        if not delta_lines:
+            scope_desc = f" in target_files ({', '.join(target_files)})" if target_files else ""
+            return False, f"Worker produced zero file changes{scope_desc} (git diff is empty)."
+
+        all_comments_or_blank = True
+        for d_line, c_file in delta_lines:
+            text = d_line[1:]
+            is_md_txt = c_file.lower().endswith((".md", ".markdown", ".rst", ".txt"))
+            if not _is_comment_or_blank_line(text, is_markdown=is_md_txt):
+                all_comments_or_blank = False
+                break
+
+        if all_comments_or_blank:
+            return False, "Diff contains only comments or blank lines (no substantive changes)."
+
+    return True, "Diff grading passed clean."
+
+
 def verify_chunk_worktree(
     worktree_dir: Path | str,
     verification_cmd: Optional[str] = None,
@@ -2920,7 +3190,13 @@ def verify_chunk_worktree(
         if violated:
             return False, "", f"Boundary violation: chunk modified prohibited file(s): {', '.join(violated)}"
 
-    # 2. Execute verification_cmd (or synthesized baseline gate if omitted)
+    # 2. Blind diff grading (merge conflicts, debugger traps, comment-only diffs)
+    if require_changes or changed:
+        diff_ok, diff_err = grade_chunk_diff_blind(wt, target_files=target_files, require_changes=require_changes)
+        if not diff_ok:
+            return False, "", f"Blind diff grading failed: {diff_err}"
+
+    # 3. Execute verification_cmd (or synthesized baseline gate if omitted)
     effective_cmd = (verification_cmd or "").strip()
     if not effective_cmd:
         files_to_check = list(target_files) if target_files else changed
