@@ -8,9 +8,8 @@ import unittest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
 
-WORKSPACE = Path("/workspace")
-if str(WORKSPACE) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE))
+WORKSPACE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(WORKSPACE))
 
 from tools.bridge_formatting import (
     format_command_preview,
@@ -1057,11 +1056,22 @@ class TestBridgeFormatting(unittest.TestCase):
     def test_repair_corrupted_snowflakes_and_ryan_mention(self):
         """Verify LLM digit-stuttered snowflakes (e.g. extra '7' in Ryan's ID) are deterministically repaired while code spans stay untouched."""
         # Stuttered 19-digit snowflake with extra '7'
-        corrupted = "🍌 <@1794077724335988736> and @Ryan, check `<@1794077724335988736>` vs <@1468012353206354198>."
+        corrupted = "🍌 <@1794077724335988736> and @Ryan, check ``<@1794077724335988736>`` vs <@1468012353206354198>."
         formatted = format_for_discord(corrupted)
         self.assertIn("🍌 <@179407724335988736> and <@179407724335988736>", formatted)
-        self.assertIn("`<@1794077724335988736>`", formatted)
+        self.assertIn("``<@1794077724335988736>``", formatted)
         self.assertIn("<@1468012353206354197>", formatted)
+
+    def test_unwrap_backticked_discord_mentions_mid_sentence(self):
+        """Verify mid-sentence backticked Discord mentions are unwrapped before code-span shielding."""
+        text = "Please reach out to `<@93420059858305024>` regarding this issue, or check `<#1542294519914037341>` and `<@&1543462881624858624>`."
+        formatted = format_for_discord(text)
+        self.assertIn("<@93420059858305024>", formatted)
+        self.assertNotIn("`<@93420059858305024>`", formatted)
+        self.assertIn("<#1542294519914037341>", formatted)
+        self.assertNotIn("`<#1542294519914037341>`", formatted)
+        self.assertIn("<@&1543462881624858624>", formatted)
+        self.assertNotIn("`<@&1543462881624858624>`", formatted)
 
     def test_strip_markdown_for_push_preview(self):
         """Verify strip_markdown_for_push_preview strips headers, horizontal rules, bold, and backticks from initial push preview."""

@@ -535,8 +535,9 @@ async def route_external_message(
         is_tagged_role = True
 
     # Conversational follow-up detection:
+    is_reply_to_other = bool(getattr(msg, "reference", None) is not None and not is_reply_to_zero)
     is_conversational_follow_up = False
-    if not msg.author.bot and not is_reply_to_zero:
+    if not msg.author.bot and not is_reply_to_zero and not is_reply_to_other:
         try:
             from tools.classifier import is_explicitly_addressed_to_other
             if not is_explicitly_addressed_to_other(content):
@@ -597,6 +598,9 @@ async def route_external_message(
         is_conversational_follow_up
     )
     if not is_mentioned:
+        if is_reply_to_other:
+            print(f"[Bridge] Message from {author_name} is an inline reply to another user without explicit Zero tag. Ignoring.")
+            return True
         if rules.get("ambient_classifier_enabled", False):
             try:
                 from tools.classifier import pop_last_reaction, score_relevance
