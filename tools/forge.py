@@ -3122,6 +3122,7 @@ def grade_chunk_diff_blind(
 
         is_added = line.startswith("+") and not line.startswith("+++")
         is_removed = line.startswith("-") and not line.startswith("---")
+        is_binary = line.startswith("Binary files ") and "differ" in line
 
         if is_added:
             content = line[1:]
@@ -3133,7 +3134,7 @@ def grade_chunk_diff_blind(
             if re.search(r"\bpdb\.set_trace\s*\(", content):
                 return False, f"Diff contains interactive debugger trap 'pdb.set_trace()' in added line: {content.strip()[:80]}"
 
-        if is_added or is_removed:
+        if is_added or is_removed or is_binary:
             delta_lines.append((line, current_file))
 
     if require_changes:
