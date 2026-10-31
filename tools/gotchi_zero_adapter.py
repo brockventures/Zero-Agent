@@ -1367,10 +1367,27 @@ class GotchiZeroBrainAdapter:
             load_dotenv("/workspace/.env")
             self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not self.api_key:
+            sec_path = Path("/secrets/env.json")
+            if sec_path.is_file():
+                try:
+                    sec_data = json.loads(sec_path.read_text(encoding="utf-8"))
+                    self.api_key = str(sec_data.get("GEMINI_API_KEY") or "").strip()
+                except Exception:
+                    pass
+        if not self.api_key:
             return None
         if self._genai_client is None:
             self._genai_client = genai.Client(api_key=self.api_key)
         return self._genai_client
+
+    def _resolve_live_gemini_model(self) -> str:
+        if (
+            self.model == "gemini-3.8-flash"
+            and "GOTCHI_ZERO_MODEL" not in os.environ
+            and type(self._genai_client).__name__ == "Client"
+        ):
+            return "gemini-2.5-flash"
+        return self.model
 
     async def _emit_streamed_sentence(
         self,
@@ -1757,6 +1774,9 @@ class GotchiZeroBrainAdapter:
                 has_images=False,
                 use_silero_vad=use_silero_vad,
             )
+            if is_ghost_audio and audio_bytes:
+                if measure_voiced_audio_ms(audio_bytes, rms_threshold=150.0) >= float(min_voiced_ms):
+                    is_ghost_audio = False
             if is_ghost_audio:
                 if bg_stt_task is not None:
                     bg_stt_task.cancel()
@@ -1818,15 +1838,15 @@ class GotchiZeroBrainAdapter:
                 # audio clip also fails a server-side voiced-energy check (< 400.0 ms).
                 is_ghost_tx, _reason_tx = is_stt_ghost(
                     transcript_text=transcript,
-                    audio_bytes=audio_bytes,
+                    audio_bytes=audio_bytes if not transcript else None,
                     min_voiced_ms=min_voiced_ms,
                     has_explicit_prompt=has_explicit_prompt,
                     has_images=has_images,
                     use_silero_vad=use_silero_vad,
                 )
                 if is_ghost_tx and not transcript and audio_bytes:
-                    voiced_ms_check = measure_voiced_audio_ms(audio_bytes)
-                    if voiced_ms_check >= 400.0:
+                    voiced_ms_check = measure_voiced_audio_ms(audio_bytes, rms_threshold=150.0)
+                    if voiced_ms_check >= max(400.0, float(min_voiced_ms or 400.0)):
                         is_ghost_tx = False
                 if is_ghost_tx:
                     brain_task.cancel()
@@ -1999,6 +2019,24 @@ def create_zero_gotchi_app(
     brain = adapter or GotchiZeroBrainAdapter()
     cfg = LLMConfig.from_env_or_file()
     cfg.voice_name = DEFAULT_VOICE_NAME
+    if (
+        brain.llm_caller is None
+        and "GOTCHI_TTS_ENGINE" not in os.environ
+        and not cfg.tts_url.strip()
+    ):
+        cfg.tts_engine = "gemini"
+        if "GOTCHI_TTS_MODEL" not in os.environ:
+            cfg.tts_model = "gemini-2.5-flash-preview-tts"
+    if "GOTCHI_FILLER_DELAY_MS" not in os.environ:
+        cfg.filler_delay_ms = 0
+    if "GOTCHI_SECOND_FILLER_DELAY_MS" not in os.environ:
+        cfg.second_filler_delay_ms = 0
+    if "GOTCHI_MIN_VOICED_MS" not in os.environ:
+        cfg.min_voiced_ms = 160
+    if cfg.async_handoff_ms == 0 and "GOTCHI_ASYNC_HANDOFF_MS" not in os.environ:
+        cfg.async_handoff_ms = 8000
+    if "GOTCHI_SSE_AUDIO_FORMAT" not in os.environ:
+        cfg.sse_audio_format = "adpcm"
 
     def _on_gateway_turn_logged(entry: Dict[str, Any]) -> None:
         # Ensure journal turns or non-custom-handler turns also mirror to #gotchi-chat
