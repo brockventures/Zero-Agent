@@ -1417,7 +1417,26 @@ class GotchiZeroBrainAdapter:
         if audio_bytes and not prompt:
             user_parts.append(
                 types.Part.from_text(
-                    text="Listen to Ryan's spoken voice prompt in the attached audio clip and answer directly."
+                    text=(
+                        "Listen carefully to Ryan's spoken question or request in the attached audio clip "
+                        "and answer his spoken request directly. If a camera snapshot is attached, use it to "
+                        "answer his spoken question rather than giving a generic photo description."
+                    )
+                )
+            )
+        elif has_vision and prompt and prompt not in (
+            "Analyze this camera snapshot from Gotchi.",
+            "Analyze this 5-frame camera burst from Gotchi.",
+            "Describe what you see in this snapshot briefly.",
+            "Describe what you see.",
+        ):
+            user_parts.append(
+                types.Part.from_text(
+                    text=(
+                        f"Ryan's spoken prompt: \"{prompt}\"\n"
+                        "Directly answer or fulfill Ryan's spoken prompt above using the attached camera snapshot(s). "
+                        "Do NOT give a generic description of the photo unless he asked for one."
+                    )
                 )
             )
         else:
@@ -1632,8 +1651,25 @@ class GotchiZeroBrainAdapter:
         has_images = bool(image_bytes or burst_images)
         audio_bytes: Optional[bytes] = parsed_turn.get("audio_bytes")
 
+        # Archive latest uploaded WAV clip for forensic inspection (cap at 10 recent turn files)
+        if audio_bytes:
+            try:
+                tmp_dir = Path("/tmp")
+                (tmp_dir / "gotchi_last_turn.wav").write_bytes(audio_bytes)
+                safe_sid = re.sub(r"[^a-zA-Z0-9_.-]", "_", session_id)[:64]
+                (tmp_dir / f"gotchi_turn_{safe_sid}.wav").write_bytes(audio_bytes)
+                turn_wavs = sorted(
+                    tmp_dir.glob("gotchi_turn_*.wav"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                for old_wav in turn_wavs[10:]:
+                    old_wav.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         # Fast-path acoustic duration check before invoking any cloud API
-        from backend.voice_gateway import is_stt_ghost, split_into_sentences
+        from backend.voice_gateway import is_stt_ghost, measure_voiced_audio_ms, split_into_sentences
 
         min_voiced_ms = int(getattr(getattr(self.stt_adapter, "llm_config", None), "min_voiced_ms", 0) or 0)
         use_silero_vad = bool(getattr(getattr(self.stt_adapter, "llm_config", None), "use_silero_vad", False))
@@ -1643,7 +1679,7 @@ class GotchiZeroBrainAdapter:
 
         if has_explicit_prompt:
             transcript = str(parsed_turn["prompt"]).strip()
-        elif audio_bytes and self.llm_caller is None:
+        elif audio_bytes and not has_images and self.llm_caller is None:
             # Single-pass multimodal audio: stream WAV directly into the Gemini brain
             # while transcribing concurrently in the background for #gotchi-chat logs.
             direct_audio_to_brain = True
@@ -1665,12 +1701,24 @@ class GotchiZeroBrainAdapter:
                     self._transcribe_audio_with_gemini(audio_bytes)
                 )
             transcript = ""
-        elif audio_bytes and self.stt_adapter is not None:
-            loop = asyncio.get_running_loop()
-            transcript = await loop.run_in_executor(
-                None, self.stt_adapter.transcribe, audio_bytes
+        elif audio_bytes and (self.stt_adapter is not None or self.llm_caller is None):
+            stt_engine = str(getattr(getattr(self.stt_adapter, "llm_config", None), "stt_engine", "") or "")
+            use_stt_adapter = (
+                self.stt_adapter is not None
+                and (
+                    stt_engine in ("whisper_http", "faster_whisper")
+                    or getattr(self.stt_adapter, "local_transcriber", None) is not None
+                    or getattr(self.stt_adapter, "llm_config", None) is None
+                )
             )
-            if transcript == "What is the status?" and self.llm_caller is None:
+            if use_stt_adapter:
+                loop = asyncio.get_running_loop()
+                transcript = await loop.run_in_executor(
+                    None, self.stt_adapter.transcribe, audio_bytes
+                )
+            else:
+                transcript = ""
+            if (not transcript or transcript == "What is the status?") and self.llm_caller is None:
                 mm_transcript = await self._transcribe_audio_with_gemini(audio_bytes)
                 if mm_transcript:
                     transcript = mm_transcript
@@ -1765,7 +1813,9 @@ class GotchiZeroBrainAdapter:
                 bg_stt_task = None
                 stt_ms = int((time.monotonic() - t0) * 1000)
 
-                # 1. Transcript-level ghost check before allowing any audio output
+                # 1. Transcript-level ghost check before allowing any audio output.
+                # Do not let an empty bg_stt_task transcript cancel brain_task unless the
+                # audio clip also fails a server-side voiced-energy check (< 400.0 ms).
                 is_ghost_tx, _reason_tx = is_stt_ghost(
                     transcript_text=transcript,
                     audio_bytes=audio_bytes,
@@ -1774,6 +1824,10 @@ class GotchiZeroBrainAdapter:
                     has_images=has_images,
                     use_silero_vad=use_silero_vad,
                 )
+                if is_ghost_tx and not transcript and audio_bytes:
+                    voiced_ms_check = measure_voiced_audio_ms(audio_bytes)
+                    if voiced_ms_check >= 400.0:
+                        is_ghost_tx = False
                 if is_ghost_tx:
                     brain_task.cancel()
                     try:
