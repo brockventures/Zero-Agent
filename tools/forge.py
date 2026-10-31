@@ -1929,7 +1929,19 @@ def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH
 
     total = len(chunks)
     merged_count = sum(1 for c in chunks if str(c["status"] or "").strip().lower() == "merged")
-    header_line = f"**{b_label}** · `{repo_name}` · {origin_ref} · **{merged_count}/{total}** chunks"
+    build_dur_suffix = ""
+    if b_status in ("completed", "failed", "cancelled"):
+        chunk_starts = [float(c["started_at"]) for c in chunks if c["started_at"] is not None]
+        chunk_ends = [float(c["completed_at"]) for c in chunks if c["completed_at"] is not None]
+        if chunk_starts and chunk_ends and max(chunk_ends) >= min(chunk_starts):
+            build_dur_s = max(0.0, max(chunk_ends) - min(chunk_starts))
+        elif build["created_at"] is not None and build["updated_at"] is not None:
+            build_dur_s = max(0.0, float(build["updated_at"]) - float(build["created_at"]))
+        else:
+            build_dur_s = None
+        if build_dur_s is not None:
+            build_dur_suffix = f" · ⏱️ {_format_duration(build_dur_s)}"
+    header_line = f"**{b_label}** · `{repo_name}` · {origin_ref} · **{merged_count}/{total}** chunks{build_dur_suffix}"
 
     display_chunks = list(chunks)
     chunk_lines: list[str] = []
@@ -1948,7 +1960,11 @@ def render_build_widget_embed(build_id: str, db_path: Path | str = FORGE_DB_PATH
         pr_suffix = f" (PR #{c['pr_number']})" if c["pr_number"] else ""
         compact_diff = _compact_diff_stat(c["diff_stat"])
         diff_suffix = f" (`{compact_diff}`)" if compact_diff else ""
-        chunk_lines.append(f"{c_emoji} **{idx_num}.** {c['title']}{pr_suffix}{diff_suffix}")
+        chunk_dur_suffix = ""
+        if c_status in ("merged", "completed", "failed") and c["started_at"] is not None and c["completed_at"] is not None:
+            c_dur_s = max(0.0, float(c["completed_at"]) - float(c["started_at"]))
+            chunk_dur_suffix = f" · ⏱️ {_format_duration(c_dur_s)}"
+        chunk_lines.append(f"{c_emoji} **{idx_num}.** {c['title']}{pr_suffix}{diff_suffix}{chunk_dur_suffix}")
         if c_status in ("running", "verifying"):
             live_st = (c["live_status"] if "live_status" in c.keys() and c["live_status"] else "").strip()
             elapsed_prefix = ""

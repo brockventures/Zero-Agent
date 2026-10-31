@@ -196,12 +196,25 @@ class TestForgeEngine(unittest.TestCase):
         self.assertIn("↳ ⚡", embed_running["description"])
         self.assertIn("Step 4 · Editing `forge.py`", embed_running["description"])
 
-        # Verify 1h TTL auto-delete for completed build cards
+        # Verify completed chunk and completed build card duration rendering, plus 1h TTL auto-delete
+        now_done = time.time()
         with forge_mod.get_db_connection(self.db_path) as conn:
             conn.execute(
-                "UPDATE forge_builds SET status = 'completed', forge_message_id = 123456789, updated_at = ? WHERE id = ?",
-                (time.time() - 3700.0, build_id),
+                "UPDATE forge_chunks SET status = 'merged', started_at = ?, completed_at = ?, diff_stat = '1 file changed, 18 insertions(+), 2 deletions(-)' WHERE build_id = ? AND chunk_index = 0",
+                (now_done - 3825.0, now_done - 3750.0, build_id),
             )
+            conn.execute(
+                "UPDATE forge_chunks SET status = 'merged', started_at = ?, completed_at = ?, diff_stat = '1 file changed, 10 insertions(+)' WHERE build_id = ? AND chunk_index = 1",
+                (now_done - 3750.0, now_done - 3700.0, build_id),
+            )
+            conn.execute(
+                "UPDATE forge_builds SET status = 'completed', forge_message_id = 123456789, updated_at = ? WHERE id = ?",
+                (now_done - 3700.0, build_id),
+            )
+        embed_completed = render_build_widget_embed(build_id, db_path=self.db_path)
+        self.assertIn("· ⏱️ 2m 5s", embed_completed["description"].splitlines()[0])
+        self.assertIn("· ⏱️ 1m 15s", embed_completed["description"])
+        self.assertIn("· ⏱️ 50s", embed_completed["description"])
         pruned = prune_completed_build_widgets(ttl_seconds=3600.0, db_path=self.db_path, delete_remote=False)
         self.assertIn(build_id, pruned)
         with forge_mod.get_db_connection(self.db_path) as conn:
