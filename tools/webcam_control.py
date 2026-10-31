@@ -61,16 +61,17 @@ def get_adb_context(ensure_forward: bool = True):
     except Exception:
         pass
 
-    # Check already connected adb devices
+    # Check already connected adb devices ONLY if they match USB_SERIAL or WIFI_DEVICE
     try:
         res = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, timeout=2)
         for line in res.stdout.splitlines():
             if "\tdevice" in line:
                 dev = line.split("\t")[0].strip()
-                dev_ip = dev.split(":")[0] if ":" in dev else dev
-                if ensure_forward:
-                    subprocess.run([ADB_BIN, "-s", dev, "forward", "tcp:3333", "tcp:3333"], capture_output=True, timeout=2)
-                return [ADB_BIN, "-s", dev], f"http://{dev_ip}:3333", "wifi"
+                if dev and (dev == USB_SERIAL or (WIFI_DEVICE and dev == WIFI_DEVICE)):
+                    dev_ip = dev.split(":")[0] if ":" in dev else dev
+                    if ensure_forward:
+                        subprocess.run([ADB_BIN, "-s", dev, "forward", "tcp:3333", "tcp:3333"], capture_output=True, timeout=2)
+                    return [ADB_BIN, "-s", dev], f"http://{dev_ip}:3333", "wifi"
     except Exception:
         pass
 

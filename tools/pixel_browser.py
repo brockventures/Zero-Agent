@@ -61,19 +61,8 @@ IP_WEBCAM_URL = f"http://{HOST2_IP}:3333/status.json"
 
 
 def get_adb_command_prefix() -> Tuple[List[str], str]:
-    """Resolve ADB command prefix, checking local connected devices, Host 2 USB, then Wi-Fi."""
-    # 1. Check local connected devices
-    try:
-        res = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, timeout=2)
-        for line in res.stdout.splitlines():
-            if "	device" in line and not line.startswith("List"):
-                dev = line.split("	")[0].strip()
-                if dev:
-                    return [ADB_BIN, "-s", dev], "local"
-    except Exception:
-        pass
-
-    # 2. Try USB via Host 2 ADB server
+    """Resolve ADB command prefix, strictly targeting the Pixel 8 Pro (husky) via Host 2 USB, local USB, or configuredPIXEL_WIFI_ADB."""
+    # 1. Try USB via Host 2 ADB server first (explicitly pinned to USB_SERIAL)
     try:
         res = subprocess.run(
             [ADB_BIN, "-H", HOST2_IP, "-P", ADB_PORT, "devices"],
@@ -83,6 +72,17 @@ def get_adb_command_prefix() -> Tuple[List[str], str]:
         )
         if f"{USB_SERIAL}	device" in res.stdout:
             return [ADB_BIN, "-H", HOST2_IP, "-P", ADB_PORT, "-s", USB_SERIAL], "usb"
+    except Exception:
+        pass
+
+    # 2. Check local connected devices ONLY if they match USB_SERIAL or WIFI_DEVICE (never hijack unrelated ADB devices like ApoloSign)
+    try:
+        res = subprocess.run([ADB_BIN, "devices"], capture_output=True, text=True, timeout=2)
+        for line in res.stdout.splitlines():
+            if "	device" in line and not line.startswith("List"):
+                dev = line.split("	")[0].strip()
+                if dev and (dev == USB_SERIAL or (WIFI_DEVICE and dev == WIFI_DEVICE)):
+                    return [ADB_BIN, "-s", dev], "local"
     except Exception:
         pass
 
