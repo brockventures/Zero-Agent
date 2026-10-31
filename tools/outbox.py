@@ -315,7 +315,17 @@ def queue_outbox_message(
     }
 
     OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
-    
+
+    # Pytest production-outbox guard: never write to the live production pending.jsonl
+    # during unit test runs unless the test explicitly redirected PENDING_FILE to a temp path.
+    if (
+        os.environ.get("PYTEST_CURRENT_TEST")
+        and Path(PENDING_FILE).resolve() == Path("/workspace/data/outbox/pending.jsonl").resolve()
+    ):
+        msg_record["status"] = "suppressed_pytest"
+        msg_record["suppressed"] = True
+        return msg_record
+
     # Atomic write to line
     with open(PENDING_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(msg_record) + "\n")
