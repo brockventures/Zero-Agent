@@ -35,7 +35,9 @@ from backend.gotchi_zero_adapter import (
     is_destructive_voice_command,
     is_destructive_voice_write,
     is_filler_or_silent,
+    load_zero_skills_catalog,
     prefetch_zero_memory,
+    read_zero_skill,
     record_gotchi_turn_to_channels,
     select_thinking_budget,
     select_thinking_level,
@@ -45,7 +47,7 @@ from poc.gotchi_poc import wrap_pcm16_to_wav
 
 
 def test_get_weather_forecast_tool_declared():
-    """Verifies that _build_gotchi_tools declares get_weather_forecast, request_deep_thinking, and delegate_coding_task_to_zero_chat."""
+    """Verifies that _build_gotchi_tools declares get_weather_forecast, request_deep_thinking, delegate_coding_task_to_zero_chat, and read_zero_skill."""
     tools = _build_gotchi_tools()
     assert len(tools) >= 1
     t = tools[0]
@@ -54,12 +56,151 @@ def test_get_weather_forecast_tool_declared():
     assert "request_deep_thinking" in decl_names
     assert "delegate_coding_task_to_zero_chat" in decl_names
     assert "web_and_reddit_search" in decl_names
+    assert "read_zero_skill" in decl_names
 
     weather_decl = next(d for d in t.function_declarations if d.name == "get_weather_forecast")
     assert "location" in weather_decl.parameters.properties
 
     web_decl = next(d for d in t.function_declarations if d.name == "web_and_reddit_search")
     assert "mode='web'" in web_decl.description
+
+    skill_decl = next(d for d in t.function_declarations if d.name == "read_zero_skill")
+    assert "skill_name" in skill_decl.parameters.properties
+
+
+def test_zero_skills_catalog_and_read_zero_skill():
+    """Verifies cached skills catalog loading, alias resolution, and read_zero_skill tool execution."""
+    catalog = load_zero_skills_catalog()
+    assert len(catalog) >= 30, f"Expected at least 30 skills in catalog, found {len(catalog)}"
+    assert "crontab-verify" in catalog
+    assert "whole-foods-cart" in catalog
+    assert "api-and-interface-design" in catalog
+
+    # Verify 0ms caching: repeated calls return the same in-memory dictionary instance
+    catalog2 = load_zero_skills_catalog()
+    assert catalog is catalog2, "load_zero_skills_catalog must return cached instance"
+
+    # Verify read_zero_skill exact match
+    crontab_content = read_zero_skill("crontab-verify")
+    assert "crontab-verify" in crontab_content
+    assert ("Sidecar" in crontab_content or "cron" in crontab_content)
+
+    # Verify normalized alias resolution (underscore to hyphen)
+    wf_content = read_zero_skill("whole_foods_cart")
+    assert "whole-foods-cart" in wf_content
+
+    # Verify missing/unknown skill handling
+    unknown_res = read_zero_skill("non_existent_skill_xyz")
+    assert "Skill 'non_existent_skill_xyz' not found" in unknown_res
+    assert "crontab-verify" in unknown_res
+
+    empty_res = read_zero_skill("")
+    assert "Error: skill_name must not be empty" in empty_res
+
+    # Verify tool execution via execute_gotchi_tool_call
+    t_res = asyncio.run(execute_gotchi_tool_call("read_zero_skill", {"skill_name": "crontab-verify"}))
+    assert "result" in t_res
+    assert "crontab-verify" in t_res["result"]
+
+    t_empty = asyncio.run(execute_gotchi_tool_call("read_zero_skill", {}))
+    assert "error" in t_empty
+
+    # Verify contextual spoken filler
+    filler = build_contextual_tool_filler("read_zero_skill", {"skill_name": "crontab-verify"})
+    assert "crontab-verify" in filler
+
+
+def test_gotchi_zero_system_prompt_skills_and_on_demand_memory(monkeypatch):
+    """Verifies that the system prompt includes the Zero Skills Catalog and configures on-demand memory search."""
+    # 1. Default (pre_search_memory=False / On-Demand mode)
+    monkeypatch.delenv("GOTCHI_PRE_SEARCH_MEMORY", raising=False)
+    sys_prompt = build_gotchi_zero_system_prompt("Tell me about my tasks and projects")
+    assert "ZERO SKILLS CATALOG (ON-DEMAND VIA read_zero_skill)" in sys_prompt
+    assert "read_zero_skill" in sys_prompt
+    assert "ON-DEMAND MEMORY SEARCH" in sys_prompt
+    assert "crontab-verify" in sys_prompt
+    assert "whole-foods-cart" in sys_prompt
+    assert "=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===" not in sys_prompt
+
+    # 2. Configurable pre_search_memory=True
+    monkeypatch.setattr(
+        "backend.gotchi_zero_adapter.prefetch_zero_memory",
+        lambda q, limit=4: f"- Mocked recall for query: {q}",
+    )
+    prompt_with_pre_fetch = build_gotchi_zero_system_prompt(
+        "Tell me about my tasks and projects", pre_search_memory=True
+    )
+    assert "=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===" in prompt_with_pre_fetch
+    assert "Mocked recall for query: Tell me about my tasks and projects" in prompt_with_pre_fetch
+
+    # 3. Environment variable toggle GOTCHI_PRE_SEARCH_MEMORY=1
+    monkeypatch.setenv("GOTCHI_PRE_SEARCH_MEMORY", "1")
+    prompt_env_toggle = build_gotchi_zero_system_prompt("What is my dog's name?")
+    assert "=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===" in prompt_env_toggle
+    assert "Mocked recall for query: What is my dog's name?" in prompt_env_toggle
+
+
+def test_gotchi_zero_brain_adapter_pre_search_memory_toggle(monkeypatch):
+    """Verifies GotchiZeroBrainAdapter constructor, env toggle, and audio turn routing with pre_search_memory."""
+    # 1. Constructor defaults
+    monkeypatch.delenv("GOTCHI_PRE_SEARCH_MEMORY", raising=False)
+    adapter_default = GotchiZeroBrainAdapter(api_key="fake-key", dispatch_discord=False)
+    assert adapter_default.pre_search_memory is False
+
+    adapter_explicit_true = GotchiZeroBrainAdapter(
+        api_key="fake-key", dispatch_discord=False, pre_search_memory=True
+    )
+    assert adapter_explicit_true.pre_search_memory is True
+
+    monkeypatch.setenv("GOTCHI_PRE_SEARCH_MEMORY", "1")
+    adapter_env = GotchiZeroBrainAdapter(api_key="fake-key", dispatch_discord=False)
+    assert adapter_env.pre_search_memory is True
+
+    # 2. Audio turn routing: pre_search_memory=False (0ms direct-audio streaming)
+    fake_wav = wrap_pcm16_to_wav(b"\x00\x00" * 4000)
+
+    async def mock_transcribe(audio_bytes):
+        return "What is the status of the homelab?"
+
+    gemini_calls_off = []
+    async def mock_run_gemini_off(prompt, image_bytes, burst_images, on_sentence=None, audio_bytes=None):
+        gemini_calls_off.append({"prompt": prompt, "audio_bytes": audio_bytes})
+        return "Simulated direct audio reply", False, []
+
+    adapter_off = GotchiZeroBrainAdapter(
+        api_key="fake-key", dispatch_discord=False, pre_search_memory=False
+    )
+    adapter_off._run_gemini_with_tools = mock_run_gemini_off
+    adapter_off._transcribe_audio_with_gemini = mock_transcribe
+
+    res_off = asyncio.run(adapter_off.handle_turn({"audio_bytes": fake_wav}))
+    assert len(gemini_calls_off) == 1
+    assert gemini_calls_off[0]["audio_bytes"] is not None, "Direct audio mode must pass audio_bytes to brain"
+    assert gemini_calls_off[0]["prompt"] == "", "Direct audio mode must start with prompt=''"
+    assert res_off["reply"] == "Simulated direct audio reply"
+
+    # 3. Audio turn routing: pre_search_memory=True (upfront STT + Turn-0 memory pre-fetch)
+    gemini_calls_on = []
+    async def mock_run_gemini_on(prompt, image_bytes, burst_images, on_sentence=None, audio_bytes=None):
+        gemini_calls_on.append({"prompt": prompt, "audio_bytes": audio_bytes})
+        return "Simulated upfront STT reply", False, []
+
+    adapter_on = GotchiZeroBrainAdapter(
+        api_key="fake-key", dispatch_discord=False, pre_search_memory=True
+    )
+    adapter_on._run_gemini_with_tools = mock_run_gemini_on
+    adapter_on._transcribe_audio_with_gemini = mock_transcribe
+
+    res_on = asyncio.run(adapter_on.handle_turn({"audio_bytes": fake_wav}))
+    assert len(gemini_calls_on) == 1
+    assert gemini_calls_on[0]["audio_bytes"] is None, "Upfront STT mode must not pass audio_bytes to brain"
+    assert gemini_calls_on[0]["prompt"] == "What is the status of the homelab?"
+    assert res_on["transcript"] == "What is the status of the homelab?"
+    assert res_on["reply"] == "Simulated upfront STT reply"
+
+    # 4. App factory toggle
+    app_default = create_zero_gotchi_app()
+    assert app_default is not None
 
 
 def test_clean_spoken_text_for_tts():

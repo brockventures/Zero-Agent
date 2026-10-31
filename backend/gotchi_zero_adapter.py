@@ -966,6 +966,27 @@ def _build_gotchi_tools() -> list[Any]:
                 ),
             )
         )
+    if not any(getattr(d, "name", None) == "read_zero_skill" for d in f_decls):
+        f_decls.append(
+            types.FunctionDeclaration(
+                name="read_zero_skill",
+                description=(
+                    "Load and read the full instructions, workflow, and procedures of any Zero skill "
+                    "from the Zero Skills Catalog (e.g. 'crontab-verify', 'whole-foods-cart', 'starbucks-order', "
+                    "'transcript-search', etc.). Call this to understand how Zero executes specialized tasks."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "skill_name": types.Schema(
+                            type="STRING",
+                            description="Name of the skill to read (e.g. 'whole-foods-cart', 'crontab-verify').",
+                        ),
+                    },
+                    required=["skill_name"],
+                ),
+            )
+        )
     return [types.Tool(function_declarations=f_decls)]
 
 
@@ -1019,6 +1040,134 @@ def prefetch_zero_memory(query: str, limit: int = 4) -> str:
             _MEM_FTS_CONN = None
             log.debug(f"[GotchiZero] In-process FTS5 recall skipped: {exc}")
     return ""
+
+
+_ZERO_SKILLS_CATALOG_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_ZERO_SKILLS_CATALOG_SUMMARY: Optional[str] = None
+
+
+def _find_zero_skills_dir() -> Optional[Path]:
+    """Resolves the `.agents/skills` root directory across local worktree and workspace locations."""
+    candidate_dirs = [
+        Path(__file__).resolve().parent.parent / ".agents" / "skills",
+        Path("/workspace/.agents/skills"),
+        Path.cwd() / ".agents" / "skills",
+    ]
+    for c in candidate_dirs:
+        if c.is_dir():
+            return c
+    return None
+
+
+def load_zero_skills_catalog(reload: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    Loads and caches the catalog of all Zero skills found in `.agents/skills/*/SKILL.md`.
+    Returns a dictionary mapping skill_name -> {
+        "name": str,
+        "description": str,
+        "path": str,
+    }
+    Cached in memory to provide 0ms overhead on Gotchi turns.
+    """
+    global _ZERO_SKILLS_CATALOG_CACHE, _ZERO_SKILLS_CATALOG_SUMMARY
+    if _ZERO_SKILLS_CATALOG_CACHE is not None and not reload:
+        return _ZERO_SKILLS_CATALOG_CACHE
+
+    catalog: Dict[str, Dict[str, Any]] = {}
+    skills_dir = _find_zero_skills_dir()
+
+    if skills_dir and skills_dir.is_dir():
+        for skill_file in sorted(skills_dir.glob("*/SKILL.md")):
+            dir_name = skill_file.parent.name
+            skill_name = dir_name
+            description = ""
+            try:
+                text = skill_file.read_text(encoding="utf-8", errors="replace")
+                fm_match = re.match(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+                if fm_match:
+                    fm_text = fm_match.group(1)
+                    try:
+                        import yaml
+                        data = yaml.safe_load(fm_text) or {}
+                        if isinstance(data, dict):
+                            skill_name = str(data.get("name") or dir_name).strip()
+                            description = str(data.get("description") or "").strip()
+                    except Exception:
+                        pass
+                    if not description:
+                        m_desc = re.search(r"^description:\s*(?:>-\s*|\|-\s*)?(.*)", fm_text, re.MULTILINE)
+                        if m_desc:
+                            description = m_desc.group(1).strip()
+                if not description:
+                    for line in text.splitlines():
+                        line_s = line.strip()
+                        if line_s and not line_s.startswith("#") and not line_s.startswith("---"):
+                            description = line_s
+                            break
+            except Exception as e:
+                log.warning(f"[GotchiZero] Error reading skill {skill_file}: {e}")
+
+            clean_desc = " ".join(description.split())
+            catalog[skill_name] = {
+                "name": skill_name,
+                "description": clean_desc,
+                "path": str(skill_file),
+            }
+
+    _ZERO_SKILLS_CATALOG_CACHE = catalog
+
+    summary_lines = [
+        "=== ZERO SKILLS CATALOG (ON-DEMAND VIA read_zero_skill) ===",
+        "Zero has specialized operational skills in `.agents/skills/`. You have full 0ms awareness of them. "
+        "Call `read_zero_skill(skill_name)` whenever Ryan's turn involves or requests any of these domains:",
+    ]
+    for s_name in sorted(catalog.keys()):
+        s_desc = catalog[s_name].get("description", "")
+        summary_lines.append(f"- {s_name}: {s_desc}")
+    _ZERO_SKILLS_CATALOG_SUMMARY = "\n".join(summary_lines)
+
+    return _ZERO_SKILLS_CATALOG_CACHE
+
+
+def read_zero_skill(skill_name: str, max_chars: int = 5000) -> str:
+    """
+    Reads the full markdown instructions for a skill from `.agents/skills/<skill_name>/SKILL.md`.
+    Supports exact matching and normalized hyphen/underscore aliases.
+    """
+    raw_name = (skill_name or "").strip()
+    if not raw_name:
+        return "Error: skill_name must not be empty."
+
+    catalog = load_zero_skills_catalog()
+    norm = raw_name.lower().replace("_", "-").replace(" ", "-")
+
+    target_info = catalog.get(raw_name) or catalog.get(norm)
+    if not target_info:
+        for k, v in catalog.items():
+            if k.lower().replace("_", "-") == norm:
+                target_info = v
+                break
+    if not target_info:
+        for k, v in catalog.items():
+            if norm in k.lower().replace("_", "-"):
+                target_info = v
+                break
+
+    if not target_info:
+        avail = ", ".join(sorted(catalog.keys())) if catalog else "(none)"
+        return f"Skill '{raw_name}' not found. Available skills: {avail}"
+
+    path = Path(target_info["path"])
+    if not path.is_file():
+        return f"Error: Skill file for '{raw_name}' does not exist at {path}."
+
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+        if len(content) > max_chars:
+            return content[:max_chars] + f"\n\n... (truncated {len(content) - max_chars} characters)"
+        return content
+    except Exception as e:
+        return f"Error reading skill file '{path}': {e}"
 
 
 def send_gotchi_artifact_to_zero_chat(
@@ -1228,6 +1377,7 @@ def build_gotchi_zero_system_prompt(
     user_prompt: str = "",
     has_vision: bool = False,
     is_silent_vision: bool = False,
+    pre_search_memory: Optional[bool] = None,
 ) -> str:
     """
     Builds the unified Zero system prompt shared with `#zero-voice`, tuned for Gotchi's
@@ -1235,12 +1385,25 @@ def build_gotchi_zero_system_prompt(
     """
     now_pt = datetime.now(PT_TZ).strftime("%A, %b %d, %Y %I:%M %p PT")
     snapshot = _load_gotchi_voice_context_snapshot()
-    memory_hits = prefetch_zero_memory(user_prompt) if user_prompt else ""
-    mem_block = (
-        f"\n\n=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===\n{memory_hits}"
-        if memory_hits
-        else ""
+
+    should_pre_search = (
+        bool(pre_search_memory)
+        if pre_search_memory is not None
+        else (os.environ.get("GOTCHI_PRE_SEARCH_MEMORY", "0").lower() in ("1", "true", "yes"))
     )
+    if should_pre_search and user_prompt:
+        memory_hits = prefetch_zero_memory(user_prompt)
+        mem_block = (
+            f"\n\n=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===\n{memory_hits}"
+            if memory_hits
+            else ""
+        )
+    else:
+        mem_block = ""
+
+    load_zero_skills_catalog()
+    skills_block = f"\n\n{_ZERO_SKILLS_CATALOG_SUMMARY}" if _ZERO_SKILLS_CATALOG_SUMMARY else ""
+
     if is_silent_vision:
         vision_note = (
             "\n- Ryan attached a live camera snapshot or burst from Gotchi's onboard camera without a spoken question "
@@ -1297,8 +1460,14 @@ def build_gotchi_zero_system_prompt(
         "git reset/clean/force-push, container teardown, process kills) and file overwrites stage a confirmation card in "
         "`#zero-chat` before executing. `read_local_file` is restricted to `os.path.realpath` under `/workspace/` and "
         "`/baseball/` (denying `.env`, `.ssh`, and secrets).\n"
+        "- ZERO SKILLS ON-DEMAND (`read_zero_skill`): You have instant, 0ms awareness of all specialized Zero skills. "
+        "Call `read_zero_skill(skill_name)` to view the full workflow, instructions, and tools for any skill in the catalog.\n"
+        "- ON-DEMAND MEMORY SEARCH (`search_zero_memory`): Voice memory search runs on-demand (0ms Turn-0 latency). "
+        "Whenever Ryan asks about past projects, personal preferences, homelab facts, historical decisions, or notes, "
+        "call `search_zero_memory(query)` immediately to retrieve relevant context.\n"
         "- Use `delegate_coding_task_to_zero_chat` whenever Ryan asks to build, fix, or refactor code.\n"
-        "- Use `search_zero_memory` to search durable memory or past transcripts.\n"
+        "- Use `search_zero_memory` on-demand to search durable memory or past transcripts.\n"
+        "- Use `read_zero_skill` to load full skill instructions and procedures from the Zero Skills Catalog.\n"
         "- Use `check_tasks_and_repos` to inspect `/workspace/data/tasks.json` and open GitHub issues.\n"
         "- Use `run_shell_command` to execute non-destructive commands in `/workspace` (destructive commands stage for confirmation).\n"
         "- Use `read_local_file` and `write_local_file` to inspect or write files on disk (overwrites stage for confirmation).\n"
@@ -1307,7 +1476,7 @@ def build_gotchi_zero_system_prompt(
         "- Use `get_recent_discord_context` to read recent messages across Discord channels.\n"
         "- Use `post_note_to_zero_chat` to send clickable links, notes, code blocks, local images/files (`file_path`), "
         "or webpage screenshots (`screenshot_url`) directly to `#zero-chat`.\n\n"
-        f"{snapshot}{mem_block}"
+        f"{snapshot}{skills_block}{mem_block}"
     )
 
 
@@ -1334,6 +1503,18 @@ def build_contextual_tool_filler(
             "I'm checking the weather for you now.",
             "Pulling up the live weather forecast now.",
             "Checking the current conditions for you now.",
+        )
+        return options[seed % len(options)]
+
+    if (
+        fn_name == "read_zero_skill"
+        or "skill" in combined_text
+    ):
+        skill = str(args.get("skill_name", "") or "").strip()
+        options = (
+            f"Checking the {skill or 'Zero'} skill instructions now.",
+            f"Loading the {skill or 'Zero'} skill procedures now.",
+            f"Reviewing the {skill or 'Zero'} skill workflow now.",
         )
         return options[seed % len(options)]
 
@@ -1511,6 +1692,14 @@ async def execute_gotchi_tool_call(
             return {"result": (res.stdout or "No matches found.")[:3500]}
         except Exception as e:
             return {"error": str(e)}
+
+    if name == "read_zero_skill":
+        skill_name = str(args.get("skill_name", "")).strip()
+        max_chars = int(args.get("max_chars", 5000) or 5000)
+        if not skill_name:
+            return {"error": "Missing skill_name parameter."}
+        content = await asyncio.to_thread(read_zero_skill, skill_name, max_chars)
+        return {"result": content, "content": content}
 
     if name == "check_tasks_and_repos":
         repo_filter = str(args.get("repo_or_filter", "all")).strip().lower()
@@ -1915,6 +2104,7 @@ class GotchiZeroBrainAdapter:
         ha_base_url: Optional[str] = None,
         ha_access_token: Optional[str] = None,
         ha_http_poster: Optional[Callable[[str, Dict[str, str], Dict[str, Any], float], Dict[str, Any]]] = None,
+        pre_search_memory: Optional[bool] = None,
     ):
         self.model = model
         self.api_key = (
@@ -1930,6 +2120,13 @@ class GotchiZeroBrainAdapter:
         self.ha_base_url = ha_base_url
         self.ha_access_token = ha_access_token
         self.ha_http_poster = ha_http_poster
+        if pre_search_memory is not None:
+            self.pre_search_memory = bool(pre_search_memory)
+        else:
+            self.pre_search_memory = (
+                os.environ.get("GOTCHI_PRE_SEARCH_MEMORY", "0").lower()
+                in ("1", "true", "yes")
+            )
         self._genai_client: Optional[Any] = None
 
     def _get_genai_client(self) -> Any:
@@ -2006,7 +2203,11 @@ class GotchiZeroBrainAdapter:
         )
 
         sys_prompt = await asyncio.to_thread(
-            build_gotchi_zero_system_prompt, prompt, has_vision, is_silent_vision
+            build_gotchi_zero_system_prompt,
+            prompt,
+            has_vision,
+            is_silent_vision,
+            self.pre_search_memory,
         )
 
         user_parts: List[types.Part] = []
@@ -2310,7 +2511,7 @@ class GotchiZeroBrainAdapter:
                     if burst_images
                     else "Analyze this camera snapshot from Gotchi."
                 )
-        elif audio_bytes and self.llm_caller is None:
+        elif audio_bytes and not self.pre_search_memory and self.llm_caller is None:
             direct_audio_to_brain = True
             if use_stt_adapter:
                 bg_stt_task = asyncio.create_task(
@@ -2321,7 +2522,7 @@ class GotchiZeroBrainAdapter:
                     self._transcribe_audio_with_gemini(audio_bytes)
                 )
             transcript = ""
-        elif audio_bytes and (use_stt_adapter or self.llm_caller is None):
+        elif audio_bytes and (use_stt_adapter or self.llm_caller is None or self.pre_search_memory):
             if use_stt_adapter:
                 loop = asyncio.get_running_loop()
                 transcript = await loop.run_in_executor(
@@ -2634,6 +2835,7 @@ class GotchiZeroBrainAdapter:
 def create_zero_gotchi_app(
     adapter: Optional[GotchiZeroBrainAdapter] = None,
     live_mode_enabled: bool = True,
+    pre_search_memory: Optional[bool] = None,
 ):
     """
     Creates the full FastAPI Gotchi Gateway (`POST /api/voice/interact`, `WebSocket /api/live/ws`,
@@ -2645,7 +2847,7 @@ def create_zero_gotchi_app(
     from backend.llm_config import LLMConfig
     from backend.voice_gateway import VoiceGatewayService, create_app
 
-    brain = adapter or GotchiZeroBrainAdapter()
+    brain = adapter or GotchiZeroBrainAdapter(pre_search_memory=pre_search_memory)
     cfg = LLMConfig.from_env_or_file()
     cfg.voice_name = DEFAULT_VOICE_NAME
     if (
