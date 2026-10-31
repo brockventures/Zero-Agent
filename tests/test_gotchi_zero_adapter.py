@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""Unit tests for `backend/gotchi_zero_adapter.py`."""
+
+import asyncio
+import base64
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any, Dict, List
+
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, _REPO_ROOT)
+if "/workspace" not in sys.path:
+    sys.path.append("/workspace")
+
+from backend.gotchi_zero_adapter import (
+    DEFAULT_GOTCHI_MODEL,
+    GOTCHI_THINKING_TELEMETRY,
+    GotchiZeroBrainAdapter,
+    _build_gotchi_tools,
+    build_contextual_tool_filler,
+    build_gotchi_zero_system_prompt,
+    build_image_inspection_filler,
+    build_thinking_config,
+    clean_spoken_text_for_tts,
+    create_zero_gotchi_app,
+    delegate_coding_task_to_zero_chat,
+    execute_gotchi_tool_call,
+    extract_and_forward_artifacts_to_zero_chat,
+    fetch_live_weather,
+    fetch_web_search_results,
+    is_allowed_voice_read_path,
+    is_destructive_voice_command,
+    is_destructive_voice_write,
+    is_filler_or_silent,
+    prefetch_zero_memory,
+    record_gotchi_turn_to_channels,
+    select_thinking_budget,
+    select_thinking_level,
+    send_gotchi_artifact_to_zero_chat,
+)
+from poc.gotchi_poc import wrap_pcm16_to_wav
+
+
+def test_get_weather_forecast_tool_declared():
+    """Verifies that _build_gotchi_tools declares get_weather_forecast, request_deep_thinking, and delegate_coding_task_to_zero_chat."""
+    tools = _build_gotchi_tools()
+    assert len(tools) >= 1
+    t = tools[0]
+    decl_names = [getattr(d, "name", "") for d in getattr(t, "function_declarations", [])]
+    assert "get_weather_forecast" in decl_names
+    assert "request_deep_thinking" in decl_names
+    assert "delegate_coding_task_to_zero_chat" in decl_names
+    assert "web_and_reddit_search" in decl_names
+
+    weather_decl = next(d for d in t.function_declarations if d.name == "get_weather_forecast")
+    assert "location" in weather_decl.parameters.properties
+
+    web_decl = next(d for d in t.function_declarations if d.name == "web_and_reddit_search")
+    assert "mode='web'" in web_decl.description
+
+
+def test_clean_spoken_text_for_tts():
+    raw = (
+        "### Status Update\n"
+        "- **Printer:** Ready at [OctoPrint](<https://198.51.100.10:8888>)!\n"
+        "- Check `build_case.py` or <https://example.com/test>."
+    )
+    cleaned = clean_spoken_text_for_tts(raw)
+    assert "###" not in cleaned
+    assert "**" not in cleaned
+    assert "`" not in cleaned
+    assert "https://" not in cleaned
+    assert "OctoPrint" in cleaned
+    assert "build_case.py" in cleaned
+
+
+def test_select_thinking_budget_and_fast_memory_prefetch():
+    assert DEFAULT_GOTCHI_MODEL == "gemini-3.8-flash"
+    assert select_thinking_level("How warm is the garage?", step=0) == "LOW"
+    assert select_thinking_level("Summarize the memory lookup", step=1) == "LOW"
+    assert select_thinking_budget("How warm is the garage?", step=0) == 0
+    assert select_thinking_budget("Summarize the memory lookup", step=1) == 0
+
+    assert select_thinking_level("Retry after error", step=1, tool_had_error=True) == "MEDIUM"
+    assert select_thinking_level("Chained multi-tool step", step=2) == "MEDIUM"
+    assert select_thinking_level("Burst analysis", step=0, burst_count=5) == "MEDIUM"
+    assert select_thinking_budget("Retry after error", step=1, tool_had_error=True) == 512
+
+    assert select_thinking_level("Deep math", step=0, model_requested_deep_thinking=True) == "HIGH"
+    assert select_thinking_budget("Deep math", step=0, model_requested_deep_thinking=True) == 1024
+
+
+def test_record_gotchi_turn_sandboxing(monkeypatch, tmp_path):
+    """Verifies that dispatch_discord=False suppresses _append_voice_turn_to_history and ATTACHMENTS_DIR writes."""
+    appended: List[Any] = []
+    monkeypatch.setattr(
+        "backend.gotchi_zero_adapter._append_voice_turn_to_history",
+        lambda *args, **kwargs: appended.append((args, kwargs)),
+    )
+    test_attach_dir = tmp_path / "attachments"
+    monkeypatch.setattr("backend.gotchi_zero_adapter.ATTACHMENTS_DIR", test_attach_dir)
+
+    fake_img = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+
+    # 1. Turn with dispatch_discord=False (unit test mode)
+    res_sandboxed = record_gotchi_turn_to_channels(
+        node_id="gotchi-test",
+        session_id="sess-sandbox",
+        transcript="Test transcript",
+        reply="Test reply",
+        image_bytes=fake_img,
+        dispatch_discord=False,
+    )
+    assert res_sandboxed["ok"] is True
+    assert res_sandboxed["dispatched"] is False
+    assert len(appended) == 0, "No turns should be appended when dispatch_discord=False"
+    assert not test_attach_dir.exists(), "No attachment directory should be created when dispatch_discord=False"
+    assert res_sandboxed["saved_image_path"] is None
+
+    # 2. Turn with dispatch_discord=True (live mode)
+    outbox_calls: List[Any] = []
+    monkeypatch.setattr(
+        "backend.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda ch, msg, **kw: outbox_calls.append((ch, msg)),
+    )
+    monkeypatch.setattr("tools.deliver_image.deliver_image", lambda path, channel_input, caption: {"success": True})
+
+    res_live = record_gotchi_turn_to_channels(
+        node_id="gotchi-test",
+        session_id="sess-live",
+        transcript="Live transcript",
+        reply="Live reply",
+        image_bytes=fake_img,
+        dispatch_discord=True,
+    )
+    assert res_live["ok"] is True
+    assert res_live["dispatched"] is True
+    assert len(appended) == 2, "Both Ryan and Zero turns should be recorded when dispatch_discord=True"
+    assert test_attach_dir.exists(), "Attachment directory should be created when dispatch_discord=True"
+    assert res_live["saved_image_path"] is not None
+
+
+def test_fetch_web_search_results_and_modes(monkeypatch):
+    """Verifies fetch_web_search_results and mode routing in execute_gotchi_tool_call."""
+    # 1. Test fetch_web_search_results with empty query
+    assert "Empty search query" in fetch_web_search_results("")
+
+    # 2. Mock SerpApi query inside fetch_web_search_results
+    def mock_urlopen(req, timeout=12.0):
+        class MockResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+            def read(self):
+                data = {
+                    "answer_box": {"answer": "42 is the answer."},
+                    "organic_results": [
+                        {
+                            "title": "FastAPI Lifespan Events",
+                            "link": "https://fastapi.tiangolo.com/advanced/events/",
+                            "snippet": "Use asynccontextmanager for lifespan events.",
+                        }
+                    ],
+                }
+                return json.dumps(data).encode("utf-8")
+        return MockResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen)
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+
+    res_str = fetch_web_search_results("FastAPI lifespan")
+    assert "Direct Answer: 42 is the answer." in res_str
+    assert "FastAPI Lifespan Events" in res_str
+    assert "https://fastapi.tiangolo.com" in res_str
+
+    # 3. Test mode='web' in execute_gotchi_tool_call
+    web_res = asyncio.run(
+        execute_gotchi_tool_call("web_and_reddit_search", {"query": "FastAPI lifespan", "mode": "web"})
+    )
+    assert "FastAPI Lifespan Events" in web_res.get("result", "")
+
+    # 4. Test mode='reddit' empty-results fallback to web search
+    class MockSubprocessRun:
+        def __init__(self, *a, **kw):
+            self.stdout = json.dumps({"ok": True, "count": 0, "threads": []})
+            self.stderr = ""
+            self.returncode = 0
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: MockSubprocessRun())
+    reddit_fallback_res = asyncio.run(
+        execute_gotchi_tool_call("web_and_reddit_search", {"query": "FastAPI lifespan", "mode": "reddit"})
+    )
+    assert "falling back to web search" in reddit_fallback_res.get("result", "")
+    assert "FastAPI Lifespan Events" in reddit_fallback_res.get("result", "")
+
+
+def test_silent_and_filler_camera_snapshot_grounding():
+    """Verifies that silent or filler-only camera snapshots ground the prompt to describe the photo directly."""
+    # 1. is_filler_or_silent checks
+    assert is_filler_or_silent("") is True
+    assert is_filler_or_silent("   ") is True
+    assert is_filler_or_silent("Ah") is True
+    assert is_filler_or_silent("um") is True
+    assert is_filler_or_silent("uh") is True
+    assert is_filler_or_silent("Uh...") is True
+    assert is_filler_or_silent("Ah, um") is True
+    assert is_filler_or_silent("What is the printer doing?") is False
+    assert is_filler_or_silent("Describe this component") is False
+
+    # 2. System prompt includes silent vision grounding note when is_silent_vision=True
+    sys_prompt = build_gotchi_zero_system_prompt("", has_vision=True, is_silent_vision=True)
+    assert "Do NOT attempt to answer or resume past conversation topics from chat history" in sys_prompt
+    assert "Describe what you see in the photo directly" in sys_prompt
+
+    # 3. handle_turn with filler prompt and image normalizes transcript and describes photo directly
+    received_turn: Dict[str, Any] = {}
+    def mock_llm_caller(turn_payload):
+        received_turn.update(turn_payload)
+        return {"reply": "I see a 3D printer hotend with blue filament loaded."}
+
+    adapter = GotchiZeroBrainAdapter(
+        api_key="fake-key",
+        dispatch_discord=False,
+        llm_caller=mock_llm_caller,
+    )
+
+    fake_img = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+    res = asyncio.run(
+        adapter.handle_turn(
+            {
+                "node_id": "gotchi-test",
+                "session_id": "sess-photo-1",
+                "prompt": "Um...",
+                "image_bytes": fake_img,
+            }
+        )
+    )
+    assert res["transcript"] == "Analyze this camera snapshot from Gotchi."
+    assert received_turn["prompt"] == "Analyze this camera snapshot from Gotchi."
+    assert "3D printer hotend" in res["reply"]
+
+    # 4. Burst mode filler prompt
+    res_burst = asyncio.run(
+        adapter.handle_turn(
+            {
+                "node_id": "gotchi-test",
+                "session_id": "sess-burst-1",
+                "prompt": "Ah",
+                "burst_images": [fake_img, fake_img],
+            }
+        )
+    )
+    assert res_burst["transcript"] == "Analyze this 5-frame camera burst from Gotchi."
+
+
+def test_voice_security_gate_and_realpath_read_allowlist(monkeypatch, tmp_path):
+    staged_msgs: List[Any] = []
+    monkeypatch.setattr(
+        "backend.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda ch, content, **kw: staged_msgs.append((int(ch), content)),
+    )
+
+    find_res = asyncio.run(
+        execute_gotchi_tool_call(
+            "run_shell_command",
+            {"command": "find /workspace/tools -maxdepth 1 -name gotchi_zero_adapter.py"},
+        )
+    )
+    assert find_res.get("confirmation_required") is not True
+    assert "exit_code" in find_res
+
+    destructive_cmds = [
+        "rm -rf /workspace/tmp_test",
+        "git reset --hard HEAD~1",
+        "docker compose down",
+    ]
+    for d_cmd in destructive_cmds:
+        d_res = asyncio.run(
+            execute_gotchi_tool_call("run_shell_command", {"command": d_cmd})
+        )
+        assert d_res["confirmation_required"] is True
+
+
+def test_is_destructive_voice_command_and_write(tmp_path):
+    for safe_cmd in [
+        "git status -s",
+        "git log -n 5",
+        "git diff HEAD~1",
+        "find /workspace/tools -maxdepth 1 -name gotchi_zero_adapter.py",
+        "ls -la /workspace",
+        "cat /workspace/README.md",
+        "grep -rn 'Zero' /workspace/tools",
+        "python3 -c 'print(1+1)'",
+        "curl https://198.51.100.10:8123/api/states",
+    ]:
+        is_destr, _ = is_destructive_voice_command(safe_cmd)
+        assert is_destr is False, f"Expected safe: {safe_cmd}"
+
+    for bad_cmd in [
+        "rm -rf /workspace/tmp_test",
+        "rm file.txt",
+        "rmdir old_dir",
+        "unlink test.link",
+        "git reset --hard HEAD~1",
+        "git clean -fd",
+        "git push --force origin main",
+        "docker compose down",
+        "systemctl stop homeassistant",
+        "reboot",
+    ]:
+        is_destr, _ = is_destructive_voice_command(bad_cmd)
+        assert is_destr is True, f"Expected destructive: {bad_cmd}"
+
+
+def test_extract_and_forward_artifacts_to_zero_chat(monkeypatch, tmp_path):
+    dispatched: List[Any] = []
+    monkeypatch.setattr(
+        "backend.gotchi_zero_adapter.send_gotchi_artifact_to_zero_chat",
+        lambda message, file_path=None, screenshot_url=None, mirror_gotchi_chat=True: dispatched.append(
+            {"message": message, "file": file_path, "shot": screenshot_url}
+        ),
+    )
+
+    raw1 = "Here is the documentation: https://example.com/spec."
+    spoken1 = "Here is the documentation."
+    new_spk1, sent1 = extract_and_forward_artifacts_to_zero_chat(raw1, spoken1)
+    assert sent1 is True
+    assert "I sent the link to Zero-Chat." in new_spk1
+    assert len(dispatched) == 1
