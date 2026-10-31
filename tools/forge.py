@@ -5521,6 +5521,35 @@ def _validate_decision_shell_payload(handler_type: str, payload: dict) -> tuple[
     return True, ""
 
 
+def _resolve_decision_channel(channel_id: int) -> tuple[int, Optional[int]]:
+    """Check if channel_id is a non-home / Crab Cavern channel and resolve destination channel.
+
+    If channel_id is not a Home Turf channel (e.g. in CRAB_CAVERN_CHANNEL_IDS or
+    not is_home_channel(int(channel_id))), redirects to ZERO_CHAT_CHANNEL_ID and
+    returns (ZERO_CHAT_CHANNEL_ID, orig_channel_id).
+    Otherwise returns (int(channel_id), None).
+    """
+    try:
+        cid = int(channel_id)
+    except (ValueError, TypeError):
+        return ZERO_CHAT_CHANNEL_ID, None
+
+    try:
+        from tools.bridge_state import CRAB_CAVERN_CHANNEL_IDS, is_home_channel
+    except ImportError:
+        try:
+            from bridge_state import CRAB_CAVERN_CHANNEL_IDS, is_home_channel
+        except ImportError:
+            CRAB_CAVERN_CHANNEL_IDS = set()
+
+            def is_home_channel(ch):
+                return int(ch) == ZERO_CHAT_CHANNEL_ID
+
+    if cid in CRAB_CAVERN_CHANNEL_IDS or not is_home_channel(cid):
+        return ZERO_CHAT_CHANNEL_ID, cid
+    return cid, None
+
+
 def stage_decision(
     category: str,
     title: str,
@@ -5540,7 +5569,17 @@ def stage_decision(
     now = time.time()
     slug = re.sub(r"[^a-z0-9]+", "", category.lower())[:8] or "act"
     decision_id = f"dec-{int(now * 1000) % 100000000}-{slug}"
-    priv_flag = 1 if (is_private if is_private is not None else (int(channel_id) == ZERO_CHAT_CHANNEL_ID)) else 0
+
+    target_channel_id, orig_ch = _resolve_decision_channel(channel_id)
+    if orig_ch is not None:
+        channel_id = target_channel_id
+        priv_flag = 1
+        orig_tag = f"<#{orig_ch}>"
+        if orig_tag not in summary:
+            summary = f"📍 **Origin:** {orig_tag}\n{summary}"
+    else:
+        channel_id = target_channel_id
+        priv_flag = 1 if (is_private if is_private is not None else (int(channel_id) == ZERO_CHAT_CHANNEL_ID)) else 0
 
     with get_db_connection(db_path) as conn:
         conn.execute(
@@ -5564,13 +5603,15 @@ def stage_decision(
             ),
         )
 
+    msg_id = None
     if post_to_discord:
-        _post_decision_card_rest(decision_id, db_path=db_path)
+        msg_id = _post_decision_card_rest(decision_id, db_path=db_path)
 
     return {
         "ok": True,
         "decision_id": decision_id,
         "channel_id": int(channel_id),
+        "discord_message_id": msg_id,
         "expires_at": now + float(ttl_seconds),
     }
 

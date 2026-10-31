@@ -2371,6 +2371,123 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
     text_ed = format_decision_card_text(row_edited)
     assert "Approved & Executed (Edited)" in text_ed
 
+    # 9. Route Public / Crab Cavern Decision Cards to #zero-chat & preserve origin_channel_id
+    banana_stand_ch = 1534436119888793750
+    gotchi_ch = 1561509863018856468
+
+    # Test direct _resolve_decision_channel resolution
+    res_crab, orig_crab = forge_mod._resolve_decision_channel(banana_stand_ch)
+    assert res_crab == ZERO_CHAT_CHANNEL_ID
+    assert orig_crab == banana_stand_ch
+
+    res_home, orig_home = forge_mod._resolve_decision_channel(ZERO_OPS_CHANNEL_ID)
+    assert res_home == ZERO_OPS_CHANNEL_ID
+    assert orig_home is None
+
+    # Test direct stage_decision from Crab Cavern (#the-banana-stand)
+    d_crab = stage_decision(
+        category="homelab",
+        title="Sync Storage Node",
+        summary="Sync storage node requested from banana stand.",
+        handler_type="shell",
+        payload={"command": "echo 'synced'"},
+        channel_id=banana_stand_ch,
+        db_path=db_p,
+    )
+    assert d_crab["channel_id"] == ZERO_CHAT_CHANNEL_ID
+    with forge_mod.get_db_connection(db_p) as conn:
+        row_crab = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (d_crab["decision_id"],)).fetchone()
+    assert row_crab["channel_id"] == ZERO_CHAT_CHANNEL_ID
+    assert row_crab["is_private"] == 1
+    assert row_crab["summary"].startswith(f"📍 **Origin:** <#{banana_stand_ch}>\n")
+    assert f"<#{banana_stand_ch}>" in row_crab["summary"]
+    embed_crab = render_decision_card_embed(row_crab)
+    assert f"📍 **Origin:** <#{banana_stand_ch}>" in embed_crab["description"]
+
+    # Verify origin tag is not prepended if already present in summary
+    d_crab_dup = stage_decision(
+        category="homelab",
+        title="Sync Storage Node 2",
+        summary=f"📍 **Origin:** <#{banana_stand_ch}>\nAlready tagged summary.",
+        handler_type="shell",
+        payload={"command": "echo 'synced2'"},
+        channel_id=banana_stand_ch,
+        db_path=db_p,
+    )
+    with forge_mod.get_db_connection(db_p) as conn:
+        row_crab_dup = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (d_crab_dup["decision_id"],)).fetchone()
+    assert row_crab_dup["summary"].count(f"<#{banana_stand_ch}>") == 1
+
+    # Test direct stage_decision from Crab Cavern (#gotchi) with post_to_discord mock
+    with patch.object(forge_mod, "_post_decision_card_rest") as mock_post_rest:
+        mock_post_rest.return_value = 998877
+        d_gotchi = stage_decision(
+            category="gotchi",
+            title="Deploy Gotchi Sprint",
+            summary="Deploy gotchi sprint updates.",
+            handler_type="shell",
+            payload={"command": "echo 'gotchi'"},
+            channel_id=gotchi_ch,
+            db_path=db_p,
+            post_to_discord=True,
+        )
+        assert d_gotchi["channel_id"] == ZERO_CHAT_CHANNEL_ID
+        assert d_gotchi["discord_message_id"] == 998877
+        mock_post_rest.assert_called_once_with(d_gotchi["decision_id"], db_path=db_p)
+        with forge_mod.get_db_connection(db_p) as conn:
+            row_gotchi = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (d_gotchi["decision_id"],)).fetchone()
+        assert row_gotchi["channel_id"] == ZERO_CHAT_CHANNEL_ID
+        assert row_gotchi["is_private"] == 1
+        assert row_gotchi["summary"].startswith(f"📍 **Origin:** <#{gotchi_ch}>\n")
+
+    # Test stage_plan_approval_decision from Crab Cavern (#the-banana-stand)
+    crab_plan = {
+        "title": "Crab Cavern Multi-Chunk Feature",
+        "repo": "/workspace",
+        "origin_channel_id": banana_stand_ch,
+        "context_fact_sheet": ["Build initiated from Crab Cavern"],
+        "chunks": [
+            {"title": "Chunk 1", "target_files": ["tools/crab1.py"], "instructions": "Implement first chunk module for crab cavern."},
+            {"title": "Chunk 2", "target_files": ["tools/crab2.py"], "instructions": "Implement second chunk module for crab cavern."},
+        ],
+    }
+    with patch.object(forge_mod, "_post_decision_card_rest") as mock_plan_post:
+        mock_plan_post.return_value = 112233
+        staged_plan = stage_plan_approval_decision(
+            crab_plan,
+            reasons=["Multi-chunk build requires human sign-off"],
+            db_path=db_p,
+            post_to_discord=True,
+        )
+        assert staged_plan["ok"] is True
+        assert staged_plan["status"] == "awaiting_approval"
+        assert staged_plan["requires_approval"] is True
+        # Build's origin_channel_id remains the original Crab Cavern channel for completion notifications
+        assert staged_plan["origin_channel_id"] == banana_stand_ch
+        assert staged_plan["discord_message_id"] == 112233
+        mock_plan_post.assert_called_once_with(staged_plan["decision_id"], db_path=db_p)
+
+        # Plan file JSON on disk retains origin_channel_id
+        plan_disk_data = json.loads(Path(staged_plan["plan_file"]).read_text(encoding="utf-8"))
+        assert plan_disk_data["origin_channel_id"] == banana_stand_ch
+
+        # Staged decision row in SQLite is routed to ZERO_CHAT_CHANNEL_ID
+        with forge_mod.get_db_connection(db_p) as conn:
+            row_plan_dec = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (staged_plan["decision_id"],)).fetchone()
+        assert row_plan_dec["channel_id"] == ZERO_CHAT_CHANNEL_ID
+        assert row_plan_dec["is_private"] == 1
+        assert row_plan_dec["summary"].startswith(f"📍 **Origin:** <#{banana_stand_ch}>\n")
+
+        # When executed/approved, forge_enqueue passes the saved plan with original origin_channel_id
+        with patch.object(forge_mod, "enqueue_build") as mock_enq_approved:
+            mock_enq_approved.return_value = {"ok": True, "build_id": "test-crab-approved"}
+            exec_res = execute_decision(staged_plan["decision_id"], user_id=OWNER_USER_ID, db_path=db_p)
+            assert exec_res["ok"] is True
+            assert exec_res["status"] == "approved"
+            mock_enq_approved.assert_called_once()
+            passed_plan = mock_enq_approved.call_args[0][0]
+            assert passed_plan["origin_channel_id"] == banana_stand_ch
+
 
 if __name__ == "__main__":
     unittest.main()

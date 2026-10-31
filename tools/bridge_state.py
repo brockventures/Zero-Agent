@@ -58,6 +58,7 @@ CRAB_CAVERN_CHANNEL_IDS = {
     1551465050072416286,  # #side-project
     1552732003076669460,  # #mirrormere
     1558202642663211169,  # #agora
+    1561509863018856468,  # #gotchi
     1562544598423965856,  # #r-residentagents
 }
 
