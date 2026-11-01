@@ -604,6 +604,7 @@ def test_epd_panel_ghosting_fix_and_core_link():
 
     # 3. Clean line-art Zero portrait header and symbol
     assert "Clean Line-Art Paper-White Zero portrait" in zero_skin_h
+    assert "ZERO_BASE_PORTRAIT_196x134" in zero_skin_h
     assert "ZERO_IDLE_PORTRAIT_196x134" in zero_skin_h
 
     # 4. Shared core link

@@ -273,6 +273,7 @@ bool EpdPanel::drawFrame(const GotchiUIState& ui, const char* mode) {
             rails_warm_ = true;
         }
 
+        // Keep mid-turn animation partial refreshes un-clamped to avoid ghosting.
         uint32_t flipped = 0;
         for (uint32_t i = 0; i < EPD_BUF_BYTES; ++i) {
             flipped += __builtin_popcount(static_cast<unsigned int>(s_prev_frame[i] ^ raw[i]));
