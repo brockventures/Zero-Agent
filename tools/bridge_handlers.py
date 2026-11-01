@@ -16,7 +16,6 @@ import os
 import re
 import signal
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 import discord
@@ -38,7 +37,7 @@ from tools.bridge_state import (
     get_in_flight,
     reap_stale_in_flight_entries,
     DATA_DIR,
-    ATTACHMENTS_DIR,
+    ATTACHMENTS_DIR,  # noqa: F401
     IN_FLIGHT_FILE,
     RESTART_INTENT_FILE,
     SESSIONS_FILE,
@@ -79,7 +78,20 @@ channel_queues = {}             # channel_id -> asyncio.Queue
 channel_worker_tasks = {}       # channel_id -> asyncio.Task (worker daemon loop)
 channel_active_tasks = {}       # channel_id -> asyncio.Task (active turn processing)
 channel_active_status_msgs = {} # channel_id -> discord.Message
+channel_waiting_items: dict[int, dict] = {}
 channel_concurrency_semaphore = None
+
+FAST_LANE_CHANNEL_IDS = {1561509863018856468, 1562246590943461429, 1544953279664889888}
+
+
+def is_fast_lane_channel(channel_id: int | str) -> bool:
+    """Return True if channel is an interactive or dedicated channel with priority fast-lane routing."""
+    try:
+        cid = int(channel_id)
+    except (ValueError, TypeError):
+        return False
+    from tools.bridge_daemons import is_dedicated_channel
+    return cid == TARGET_CHANNEL_ID or cid in FAST_LANE_CHANNEL_IDS or is_dedicated_channel(channel_id)
 
 
 def get_channel_queue(channel_id: int | str) -> asyncio.Queue:
@@ -95,7 +107,7 @@ def get_concurrency_semaphore() -> asyncio.Semaphore:
     global channel_concurrency_semaphore
     if channel_concurrency_semaphore is None:
         rules = get_runtime_rules()
-        max_workers = int(rules.get("max_parallel_workers", 2))
+        max_workers = int(rules.get("max_parallel_workers", 4))
         channel_concurrency_semaphore = asyncio.Semaphore(max_workers)
     return channel_concurrency_semaphore
 
@@ -173,6 +185,12 @@ def try_coalesce_pending_turn(
                 queues_to_check.append(extra_queue.queue._queue)
             elif hasattr(extra_queue, "_queue"):
                 queues_to_check.append(extra_queue._queue)
+
+        waiting_item = channel_waiting_items.get(cid)
+        if waiting_item is None and isinstance(cid, int):
+            waiting_item = channel_waiting_items.get(str(cid))
+        if waiting_item is not None:
+            queues_to_check.append([waiting_item])
 
         for q_deque in queues_to_check:
             for item in reversed(q_deque):
@@ -422,9 +440,12 @@ async def run_thread_turn_worker(item, bot: discord.Client, presence_fn=None, bu
         if item.get("model_override"):
             kwargs["model_override"] = item["model_override"]
         sem = get_concurrency_semaphore()
-        async with sem:
-            async with resilient_typing(reply_target):
-                await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
+        async with resilient_typing(lambda: item.get("reply_target") or reply_target):
+            async with sem:
+                exec_prompt = item.get("prompt", prompt)
+                exec_reply_target = item.get("reply_target") or reply_target
+                exec_attachments = item.get("attachments", attachments)
+                await execute_agy_turn(exec_prompt, status_msg, exec_reply_target, exec_attachments, **kwargs)
     except Exception as e:
         print(f"[Thread Worker] Error in thread turn execution: {e}")
         try:
@@ -464,7 +485,6 @@ async def run_channel_turn_worker(
             prompt = item["prompt"]
             status_msg = item.get("status_msg")
             reply_target = item.get("reply_target")
-            attachments = item.get("attachments", [])
 
             turn_mode = item.get("mode", "home" if is_home_root else "external")
             author_name = item.get("author_name", "")
@@ -492,6 +512,11 @@ async def run_channel_turn_worker(
 
             try:
                 async def _exec():
+                    channel_waiting_items.pop(channel_id, None)
+                    prompt = item["prompt"]
+                    reply_target = item.get("reply_target")
+                    attachments = item.get("attachments", [])
+                    channel_active_prompts[channel_id] = prompt
                     kwargs = {
                         "mode": turn_mode,
                         "channel_id": channel_id,
@@ -508,34 +533,40 @@ async def run_channel_turn_worker(
                     }
                     if item.get("model_override"):
                         kwargs["model_override"] = item["model_override"]
-                    async with resilient_typing(reply_target):
-                        await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
+                    await execute_agy_turn(prompt, status_msg, reply_target, attachments, **kwargs)
 
                 # Priority Fast-Lane: Dedicated persistent channels (#zero-chat, #the-banana-stand, #lounge)
-                # run immediately without semaphore gating. Secondary background channels acquire semaphore.
-                from tools.bridge_daemons import is_dedicated_channel
-                if is_home_root or is_dedicated_channel(channel_id):
-                    await _exec()
-                else:
-                    async with sem:
+                # and interactive channels (#gotchi, #gotchi-chat, #zero-ops) run immediately without semaphore gating.
+                # Secondary background channels acquire semaphore with typing heartbeats active while waiting.
+                async with resilient_typing(lambda: item.get("reply_target") or reply_target):
+                    if is_fast_lane_channel(channel_id):
                         await _exec()
+                    else:
+                        channel_waiting_items[channel_id] = item
+                        try:
+                            async with sem:
+                                await _exec()
+                        finally:
+                            channel_waiting_items.pop(channel_id, None)
 
             except Exception as e:
                 print(f"[Channel Worker {channel_id}] Error in turn execution: {e}")
                 if not is_excluded_channel(channel_id):
                     try:
-                        if hasattr(reply_target, "reply"):
-                            await reply_target.reply(f"⚠️ **Error executing task:** {e}")
-                        elif hasattr(reply_target, "send"):
-                            await reply_target.send(f"⚠️ **Error executing task:** {e}")
+                        err_target = item.get("reply_target") or reply_target
+                        if hasattr(err_target, "reply"):
+                            await err_target.reply(f"⚠️ **Error executing task:** {e}")
+                        elif hasattr(err_target, "send"):
+                            await err_target.send(f"⚠️ **Error executing task:** {e}")
                     except Exception:
                         try:
-                            target_ch = getattr(reply_target, "channel", reply_target)
+                            target_ch = getattr(err_target, "channel", err_target)
                             if hasattr(target_ch, "send"):
                                 await target_ch.send(f"⚠️ **Error executing task:** {e}")
                         except Exception:
                             pass
             finally:
+                channel_waiting_items.pop(channel_id, None)
                 channel_active_tasks.pop(channel_id, None)
                 channel_active_prompts.pop(channel_id, None)
                 if is_home_root:
