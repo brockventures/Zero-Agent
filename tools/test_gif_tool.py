@@ -6,13 +6,22 @@ Tests multi-tier dynamic search: Tenor -> Giphy -> Graceful Skip.
 import unittest
 from unittest.mock import patch, MagicMock
 import sys
+from pathlib import Path
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+elif sys.path[0] != str(REPO_ROOT):
+    sys.path.remove(str(REPO_ROOT))
+    sys.path.insert(0, str(REPO_ROOT))
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
 from tools.gif_tool import (
     clean_slug_title,
     is_ocr_safe,
     extract_gif_ocr,
     get_contextual_gif,
+    find_canonical_gif,
+    get_runtime_gif_rules,
     is_valid_gif_url,
     detect_franchise,
     check_cooldown,
@@ -402,38 +411,38 @@ class TestGifTool(unittest.TestCase):
     @patch("tools.gif_tool.load_history", return_value=[])
     @patch("tools.gif_tool.record_history")
     def test_situational_vibe_query_matching(self, mock_rec, mock_hist, mock_valid):
-        # 1. Effortless superiority / flawless fix
-        r1 = get_contextual_gif("effortless technical superiority solving a problem on the first try", run_ocr=False, force=True, use_llm=False)
+        # 1. Effortless superiority / deadpan cynicism
+        r1 = get_contextual_gif("cold unsmiling intellectual superiority deadpan cynicism", run_ocr=False, force=True, use_llm=False)
         self.assertEqual(r1["source"], "canonical_registry")
         self.assertEqual(r1["canonical_id"], "silicon_valley_gilfoyle_smug")
 
         # 2. Slapping down terrible ideas
-        r2 = get_contextual_gif("slapping down terrible ideas brittle hacks or overcomplicated proposals", run_ocr=False, force=True, use_llm=False)
+        r2 = get_contextual_gif("physically slapping down utter nonsense violently rejecting absurd proposals", run_ocr=False, force=True, use_llm=False)
         self.assertEqual(r2["source"], "canonical_registry")
         self.assertEqual(r2["canonical_id"], "silicon_valley_erlich_slap")
 
         # 3. Production incident chaos
-        r3 = get_contextual_gif("walking into a chaotic production outage with cascading alerts", run_ocr=False, force=True, use_llm=False)
+        r3 = get_contextual_gif("walking into apocalyptic chaos room on fire with pizza boxes", run_ocr=False, force=True, use_llm=False)
         self.assertEqual(r3["source"], "canonical_registry")
         self.assertEqual(r3["canonical_id"], "community_troy_fire_pizza")
 
         # 4. External cloud outage while homelab is unaffected
-        r4 = get_contextual_gif("watching external cloud outage while local homelab is unaffected", run_ocr=False, force=True, use_llm=False)
+        r4 = get_contextual_gif("smug serene pettiness sipping tea none of my business", run_ocr=False, force=True, use_llm=False)
         self.assertEqual(r4["source"], "canonical_registry")
         self.assertEqual(r4["canonical_id"], "kermit_sipping_tea")
 
         # 5. Relief after clean backup restore
-        r5 = get_contextual_gif("barely averting disaster and deep relief after clean restore", run_ocr=False, force=True, use_llm=False)
+        r5 = get_contextual_gif("clutching hand to chest trembling breathless relief after escaping doom", run_ocr=False, force=True, use_llm=False)
         self.assertEqual(r5["source"], "canonical_registry")
         self.assertEqual(r5["canonical_id"], "training_day_denzel_relief")
 
         # 6. Shutting down patronizing advice
-        r6 = get_contextual_gif("shutting down patronizing advice I know more than you", run_ocr=False, force=True, use_llm=False)
+        r6 = get_contextual_gif("cold supreme dismissive confidence shutting down amateur I know more than you", run_ocr=False, force=True, use_llm=False)
         self.assertEqual(r6["source"], "canonical_registry")
         self.assertEqual(r6["canonical_id"], "parks_rec_ron_know_more")
 
         # 7. Mic drop after clean fix
-        r7 = get_contextual_gif("mic drop signing off after nailing a clean fix", run_ocr=False, force=True, use_llm=False)
+        r7 = get_contextual_gif("leaving on a high note abrupt departure mic drop clean exit", run_ocr=False, force=True, use_llm=False)
         self.assertEqual(r7["source"], "canonical_registry")
         self.assertEqual(r7["canonical_id"], "seinfeld_costanza_high_note")
 
@@ -453,10 +462,18 @@ class TestGifTool(unittest.TestCase):
         self.assertEqual(res["source"], "canonical_registry")
         self.assertEqual(res["canonical_id"], "office_jim_welp")
 
-        # 2. Verify fallback to FTS5 if subprocess fails or returns NONE
+        # 2. Verify LLM returning NONE abstains cleanly without falling through to FTS5
         mock_proc.stdout = "NONE\n"
         mock_proc.returncode = 0
-        res_fallback = get_contextual_gif("kermit sipping tea", run_ocr=False, force=True, use_llm=True)
+        res_abstain = find_canonical_gif("kermit sipping tea", force=True, use_llm=True)
+        self.assertIsNone(res_abstain)
+
+        # 3. Verify LLM API failure (returning None) still falls back to FTS5
+        mock_proc.returncode = 1
+        mock_proc.stdout = ""
+        mock_direct.return_value = None
+        res_fallback = find_canonical_gif("smug serene pettiness sipping tea none of my business", force=True, use_llm=True)
+        self.assertIsNotNone(res_fallback)
         self.assertEqual(res_fallback["source"], "canonical_registry")
         self.assertEqual(res_fallback["canonical_id"], "kermit_sipping_tea")
 
@@ -501,15 +518,30 @@ class TestGifTool(unittest.TestCase):
                 f"Query {q!r} should have matched matrix_neo_kung_fu"
             )
 
-    def test_history_window_limit_35(self):
-        # Verify default limit=35 filters out the last 35 items, but not older items
-        history = [{"url": f"https://tenor.com/view/gif-{i}"} for i in range(45)]
+    def test_history_window_limit_15(self):
+        # Verify default limit=15 filters out the last 15 items, but not older items
+        history = [{"url": f"https://tenor.com/view/gif-{i}"} for i in range(25)]
         excluded = get_history_urls(history)
-        self.assertEqual(len(excluded), 35)
-        self.assertIn("https://tenor.com/view/gif-44", excluded)
+        self.assertEqual(len(excluded), 15)
+        self.assertIn("https://tenor.com/view/gif-24", excluded)
         self.assertIn("https://tenor.com/view/gif-10", excluded)
         self.assertNotIn("https://tenor.com/view/gif-9", excluded)
         self.assertNotIn("https://tenor.com/view/gif-0", excluded)
+
+    @patch("pathlib.Path.exists", return_value=False)
+    def test_runtime_gif_rules_defaults(self, mock_exists):
+        rules = get_runtime_gif_rules()
+        self.assertTrue(rules["enabled"])
+        self.assertEqual(rules["default_cooldown_turns"], 2)
+        expected_cooldowns = {
+            "arrested_development": 3,
+            "curb_your_enthusiasm": 3,
+            "silicon_valley": 2,
+            "seinfeld": 2,
+            "reaction_classics": 1,
+            "brooklyn_nine_nine": 3
+        }
+        self.assertEqual(rules["franchise_cooldowns"], expected_cooldowns)
 
     def test_explicit_limit_respected(self):
         history = [{"url": f"https://tenor.com/view/gif-{i}"} for i in range(10)]
@@ -517,6 +549,41 @@ class TestGifTool(unittest.TestCase):
         self.assertEqual(len(excluded), 3)
         self.assertIn("https://tenor.com/view/gif-9", excluded)
         self.assertNotIn("https://tenor.com/view/gif-6", excluded)
+
+    def test_canonical_removed_filler_entries(self):
+        from tools.gif_tool import load_canonical_registry
+        registry = load_canonical_registry()
+        ids = {entry.get("id") for entry in registry}
+        self.assertNotIn("parks_rec_ron_swanson_smile", ids)
+        self.assertNotIn("itysl_tim_robinson_wink", ids)
+        self.assertNotIn("curb_larry_david_got_it", ids)
+
+    def test_tightened_entries_comedic_subtext(self):
+        # 1. seinfeld_elaine_get_out must strictly match shocking plot twists / no way disbelief, not push or speedups
+        res_push = find_canonical_gif("git push speedups", force=True, use_llm=False)
+        if res_push:
+            self.assertNotEqual(res_push.get("canonical_id"), "seinfeld_elaine_get_out")
+        res_twist = find_canonical_gif("shocking plot twist stunned incredulity no way get out", force=True, use_llm=False)
+        self.assertIsNotNone(res_twist)
+        self.assertEqual(res_twist.get("canonical_id"), "seinfeld_elaine_get_out")
+
+        # 2. iasip_charlie_pepe_silvia must require unhinged conspiracy rabbit holes rather than generic architecture/troubleshooting
+        res_arch = find_canonical_gif("clean architecture troubleshooting", force=True, use_llm=False)
+        if res_arch:
+            self.assertNotEqual(res_arch.get("canonical_id"), "iasip_charlie_pepe_silvia")
+        res_consp = find_canonical_gif("unhinged conspiracy rabbit hole pepe silvia red yarn", force=True, use_llm=False)
+        self.assertIsNotNone(res_consp)
+        self.assertEqual(res_consp.get("canonical_id"), "iasip_charlie_pepe_silvia")
+
+        # 3. 30_rock_jack_lemon must match appalled exasperation at a cursed mess
+        res_lemon = find_canonical_gif("appalled exasperation at a cursed mess Good God Lemon", force=True, use_llm=False)
+        self.assertIsNotNone(res_lemon)
+        self.assertEqual(res_lemon.get("canonical_id"), "30_rock_jack_lemon")
+
+        # 4. b99_holt_vindication must match vindication after active skepticism
+        res_holt = find_canonical_gif("vindication after active skepticism proven right", force=True, use_llm=False)
+        self.assertIsNotNone(res_holt)
+        self.assertEqual(res_holt.get("canonical_id"), "b99_holt_vindication")
 
     def test_frequency_decay_penalizes_recent_frequent_gifs(self):
         from tools.gif_tool import find_canonical_gif

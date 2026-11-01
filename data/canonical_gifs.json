@@ -10,25 +10,22 @@
       "satanist_deadpan",
       "cynical_superiority",
       "effortless_superiority",
-      "technical_superiority",
-      "crypto_hacker",
-      "dark_smug"
+      "condescension",
+      "dark_smug",
+      "arrogance"
     ],
     "tags": [
       "gilfoyle",
       "martin_starr",
       "silicon_valley",
       "superiority",
-      "technical_superiority",
+      "condescending",
       "effortless",
-      "first_try",
-      "satanist",
       "cynical",
-      "hacker",
-      "deep_infra",
-      "security"
+      "deadpan",
+      "dark_humor"
     ],
-    "situation": "Effortless technical superiority, solving a problem on the first try, cynical hacker superiority, ruthless security teardowns, crypto/server room dark sarcasm, or specifically requested Gilfoyle deadpan."
+    "situation": "Cold, unsmiling intellectual superiority, deadpan cynicism, arrogant mastery over lesser mortals, dark condescension, or specifically requested Gilfoyle deadpan."
   },
   {
     "id": "silicon_valley_jared_fucks",
@@ -37,22 +34,23 @@
     "franchise": "silicon_valley",
     "character": "Jared Dunn",
     "vibes": [
-      "praise",
-      "elite",
-      "crushed_it",
-      "respect",
-      "hype"
+      "this_guy_fucks",
+      "unhinged_praise",
+      "legendary",
+      "hype",
+      "reverence",
+      "badass"
     ],
     "tags": [
-      "praise",
-      "elite",
-      "crushed_it",
-      "respect",
       "this_guy_fucks",
-      "jared",
-      "silicon_valley"
+      "jared_dunn",
+      "silicon_valley",
+      "praise",
+      "legend",
+      "hype",
+      "badass"
     ],
-    "situation": "Elite performance, crushing an impossible migration, high praise for slick architecture."
+    "situation": "Absurd, high-energy reverence for an unexpectedly badass feat, wildly enthusiastic praise, and treating someone like an absolute legend: 'This guy fucks!'"
   },
   {
     "id": "silicon_valley_erlich_slap",
@@ -62,21 +60,20 @@
     "character": "Erlich Bachman",
     "vibes": [
       "slapdown",
-      "bad_idea",
-      "rejection",
+      "discipline",
       "shut_down",
-      "discipline"
+      "violent_rejection",
+      "insolence"
     ],
     "tags": [
-      "slapdown",
-      "bad_idea",
-      "rejection",
-      "shut_down",
-      "erlich",
+      "erlich_bachman",
       "slap",
-      "silicon_valley"
+      "silicon_valley",
+      "shut_down",
+      "bad_idea",
+      "discipline"
     ],
-    "situation": "Slapping down terrible ideas, brittle hacks, or over-complicated proposals."
+    "situation": "Physically slapping down utter nonsense, instantly punishing insolence or foolishness, and violently rejecting absurd proposals."
   },
   {
     "id": "silicon_valley_russ_doors",
@@ -85,23 +82,23 @@
     "franchise": "silicon_valley",
     "character": "Russ Hanneman",
     "vibes": [
-      "flex",
-      "overkill",
-      "luxury",
+      "billionaire",
+      "gaudy_flex",
       "absurdity",
-      "billionaire"
+      "vanity",
+      "three_commas",
+      "flashy"
     ],
     "tags": [
-      "billionaire_doors",
-      "doors_like_this",
-      "doors_that_open_like_this",
-      "flex",
-      "overkill",
-      "three_commas",
       "russ_hanneman",
-      "silicon_valley"
+      "billionaire_doors",
+      "doors_that_open_like_this",
+      "silicon_valley",
+      "flex",
+      "vanity",
+      "three_commas"
     ],
-    "situation": "Ridiculous luxury homelab flexes, excessive enterprise hardware overkill for simple scripts, or clowning on VC hype."
+    "situation": "Obscene displays of status and unearned wealth, gaudy billionaire vanity, flexing absurd luxury, and caring only about doors that open like this."
   },
   {
     "id": "curb_larry_staredown",
@@ -124,7 +121,7 @@
       "squint",
       "eyeball_test"
     ],
-    "situation": "Strictly for active suspicion of human deceit, caught red-handed in a lie, or intense doubt during an interrogation. Never for routine code inspection, verification, or affirmative acknowledgments."
+    "situation": "Strictly for active suspicion of human deceit, caught red-handed in a lie, squinting interrogation when suspecting someone is lying, or an intense staredown trying to catch a bluff. Never for routine inspection or verification."
   },
   {
     "id": "curb_larry_pretty_good",
@@ -134,20 +131,20 @@
     "character": "Larry David",
     "vibes": [
       "pretty_good",
-      "satisfied",
-      "smooth_deploy",
+      "pleasantly_surprised",
       "content",
-      "approval"
+      "begrudging_approval",
+      "satisfied"
     ],
     "tags": [
+      "larry_david",
+      "curb_your_enthusiasm",
       "pretty_good",
       "pretty_pretty_good",
       "satisfied",
-      "smooth_deploy",
-      "larry_david",
-      "curb_your_enthusiasm"
+      "pleasantly_surprised"
     ],
-    "situation": "Clean deployments, benchmarks beating expectations, solid quiet wins."
+    "situation": "Pleasant, begrudging satisfaction when something surprisingly turns out pretty good despite low expectations, mild optimism, and quiet contentment."
   },
   {
     "id": "itysl_tim_you_sure",
@@ -156,22 +153,22 @@
     "franchise": "i_think_you_should_leave",
     "character": "Tim Robinson",
     "vibes": [
-      "doubt",
-      "questioning",
-      "are_you_sure",
+      "you_sure_about_that",
       "skeptical",
+      "calling_bluff",
+      "smirking_doubt",
       "disbelief"
     ],
     "tags": [
-      "doubt",
-      "questioning",
-      "are_you_sure",
+      "tim_robinson",
+      "itysl",
+      "i_think_you_should_leave",
       "you_sure_about_that",
       "skeptical",
-      "tim_robinson",
-      "itysl"
+      "doubt",
+      "calling_bluff"
     ],
-    "situation": "Catching silent race conditions, calling out dubious assumptions."
+    "situation": "Smirking, confrontational skepticism calling out a dubious claim, challenging someone who is clearly mistaken or lying: 'Are you sure about that?'"
   },
   {
     "id": "itysl_hot_dog_guy",
@@ -180,22 +177,23 @@
     "franchise": "i_think_you_should_leave",
     "character": "Tim Robinson",
     "vibes": [
-      "finding_the_guy",
+      "find_the_guy",
       "guilty",
       "denial",
-      "blunder",
-      "deflection"
+      "deflection",
+      "caught_red_handed",
+      "blunder"
     ],
     "tags": [
       "hot_dog_suit",
-      "find_the_guy",
-      "trying_to_find_the_guy",
-      "who_did_this",
-      "guilty",
       "tim_robinson",
-      "itysl"
+      "itysl",
+      "i_think_you_should_leave",
+      "find_the_guy",
+      "guilty",
+      "deflection"
     ],
-    "situation": "Fixing a bug caused by your own earlier commit, self-inflicted config typos."
+    "situation": "Hilarious denial and deflection when caught red-handed as the obvious culprit: 'We're all trying to find the guy who did this!' Shameless deflection of guilt in a ridiculous disguise."
   },
   {
     "id": "succession_logan_fuck_off",
@@ -205,20 +203,20 @@
     "character": "Logan Roy",
     "vibes": [
       "fuck_off",
-      "dismissal",
-      "irritated",
-      "shut_down",
-      "harsh"
+      "tyrannical_dismissal",
+      "harsh",
+      "zero_patience",
+      "shut_down"
     ],
     "tags": [
-      "fuck_off",
-      "oh_fuck_off",
-      "dismissal",
-      "shut_down",
       "logan_roy",
-      "succession"
+      "brian_cox",
+      "succession",
+      "fuck_off",
+      "dismissal",
+      "get_lost"
     ],
-    "situation": "Dismissing ridiculous upstream vendor spam, closing invalid issues, or harsh shut downs."
+    "situation": "Brutal, tyrannical dismissal of annoying requests, closing the door on unwanted intrusions, and telling someone to fuck off with zero patience."
   },
   {
     "id": "parks_rec_ron_nod",
@@ -227,22 +225,22 @@
     "franchise": "parks_and_rec",
     "character": "Ron Swanson",
     "vibes": [
-      "approval",
-      "satisfied",
-      "respect",
-      "nod",
-      "quiet_pride"
+      "stoic_nod",
+      "quiet_respect",
+      "craftsman_approval",
+      "paternal_pride",
+      "satisfaction"
     ],
     "tags": [
-      "nod",
-      "slow_nod",
-      "satisfied",
-      "approval",
-      "respect",
       "ron_swanson",
-      "parks_and_rec"
+      "nick_offerman",
+      "parks_and_rec",
+      "slow_nod",
+      "respect",
+      "craftsmanship",
+      "stoic"
     ],
-    "situation": "Quiet technical pride, approving a clean PR, witnessing a rock-solid script run."
+    "situation": "Stoic, slow nod of quiet respect and paternal satisfaction witnessing honest competence, sturdy craftsmanship, and no-nonsense execution."
   },
   {
     "id": "parks_rec_ron_dumpster",
@@ -251,21 +249,21 @@
     "franchise": "parks_and_rec",
     "character": "Ron Swanson",
     "vibes": [
-      "rage_quit",
       "dumpster",
-      "trash",
-      "throw_away",
-      "done_with_this"
+      "rage_quit",
+      "toss_in_trash",
+      "done_forever",
+      "anti_tech"
     ],
     "tags": [
+      "ron_swanson",
+      "parks_and_rec",
       "dumpster",
       "throw_in_trash",
-      "computer_dumpster",
       "rage_quit",
-      "ron_swanson",
-      "parks_and_rec"
+      "computer_in_dumpster"
     ],
-    "situation": "Irreparable legacy services, hopeless third-party bugs, throwing corrupted caches in the trash."
+    "situation": "Complete disgust and final rage-quit throwing useless tech straight into an outdoor dumpster, severing all ties with an infuriating machine."
   },
   {
     "id": "parks_rec_andy_dwyer_network",
@@ -274,20 +272,21 @@
     "franchise": "parks_and_rec",
     "character": "Andy Dwyer",
     "vibes": [
-      "network_issues",
-      "connectivity",
       "clueless",
-      "diagnosis",
-      "funny"
+      "network_connectivity",
+      "naive_confusion",
+      "earnest_idiot",
+      "funny_diagnosis"
     ],
     "tags": [
-      "network_connectivity",
-      "connectivity_problems",
       "andy_dwyer",
       "chris_pratt",
-      "parks_and_rec"
+      "parks_and_rec",
+      "network_connectivity",
+      "clueless",
+      "confusion"
     ],
-    "situation": "DNS glitches, packet loss, wifi drops, or weird network timeout diagnosis."
+    "situation": "Lovably clueless diagnosis, earnest confusion, or naively blaming bizarre mysterious problems on 'network connectivity problems'."
   },
   {
     "id": "parks_rec_chris_traeger_literally",
@@ -296,21 +295,22 @@
     "franchise": "parks_and_rec",
     "character": "Chris Traeger",
     "vibes": [
-      "enthusiasm",
       "literally",
       "finger_guns",
-      "flawless",
-      "hype"
+      "hyper_enthusiasm",
+      "unbridled_optimism",
+      "superlative"
     ],
     "tags": [
+      "chris_traeger",
+      "rob_lowe",
+      "parks_and_rec",
       "literally",
       "finger_guns",
       "enthusiasm",
-      "flawless",
-      "chris_traeger",
-      "parks_and_rec"
+      "superlative"
     ],
-    "situation": "100% test pass rates, speedrun deployments, superlative praise, unbridled technical optimism."
+    "situation": "Aggressive, hyper-exuberant optimism and superlative praise with finger guns: declaring something 'LITERALLY' the greatest thing that has ever happened."
   },
   {
     "id": "parks_rec_ron_swivel_chair",
@@ -319,22 +319,21 @@
     "franchise": "parks_and_rec",
     "character": "Ron Swanson",
     "vibes": [
-      "avoid_humans",
-      "nope",
-      "opt_out",
-      "spin",
-      "swivel_chair"
+      "swivel_chair",
+      "spin_away",
+      "refuse_to_engage",
+      "escape_interaction",
+      "nope"
     ],
     "tags": [
-      "avoid_humans",
-      "swivel_chair",
-      "nope",
-      "opt_out",
-      "spin",
       "ron_swanson",
-      "parks_and_rec"
+      "parks_and_rec",
+      "swivel_chair",
+      "spin",
+      "nope",
+      "avoiding_people"
     ],
-    "situation": "Gracefully opting out of bikeshedding discussions, dodging tedious manual administrative chores."
+    "situation": "Silently spinning away in a swivel chair to physically escape an unwanted conversation, dodging annoying people, and refusing to engage."
   },
   {
     "id": "community_troy_fire_pizza",
@@ -343,22 +342,22 @@
     "franchise": "community",
     "character": "Troy Barnes",
     "vibes": [
-      "chaos",
-      "fire",
-      "everything_is_broken",
-      "disaster",
-      "walk_in"
+      "room_on_fire",
+      "pizza_box",
+      "apocalyptic_chaos",
+      "walk_into_disaster",
+      "shocked_horror"
     ],
     "tags": [
-      "room_on_fire",
-      "pizza_fire",
-      "chaos",
-      "disaster",
       "troy_barnes",
       "donald_glover",
-      "community"
+      "community",
+      "room_on_fire",
+      "pizza",
+      "chaos",
+      "disaster"
     ],
-    "situation": "Walking into an active production incident, multiple cascading alerts firing at once."
+    "situation": "Walking cheerfully into a room holding pizza boxes only to discover utter, apocalyptic chaos, screams, and active fire."
   },
   {
     "id": "community_chang_squint",
@@ -368,20 +367,20 @@
     "character": "Ben Chang",
     "vibes": [
       "squinting",
-      "tiny_diff",
-      "cannot_see",
+      "tiny_paper",
+      "cannot_read",
       "microscopic",
-      "searching"
+      "straining_eyes"
     ],
     "tags": [
-      "squint",
-      "cant_see",
-      "tiny_paper",
-      "ken_jeong",
       "ben_chang",
-      "community"
+      "ken_jeong",
+      "community",
+      "squint",
+      "tiny_paper",
+      "cant_see"
     ],
-    "situation": "Looking for a single missing comma or semicolon, deciphering minified stack traces."
+    "situation": "Comically extreme squinting at microscopic text, struggling in utter bewilderment to decipher an impossibly tiny note or detail."
   },
   {
     "id": "30_rock_jack_lemon",
@@ -390,20 +389,23 @@
     "franchise": "30_rock",
     "character": "Jack Donaghy",
     "vibes": [
-      "exasperation",
-      "disbelief",
-      "facepalm",
-      "good_god",
-      "condescending"
+      "good_god_lemon",
+      "appalled_exasperation",
+      "cursed_mess",
+      "condescending_disbelief",
+      "facepalm"
     ],
     "tags": [
-      "good_god_lemon",
-      "good_god",
       "jack_donaghy",
       "alec_baldwin",
-      "30_rock"
+      "30_rock",
+      "good_god_lemon",
+      "good_god",
+      "appalled",
+      "exasperation",
+      "cursed_mess"
     ],
-    "situation": "Reacting to horrific architecture decisions, unhinged user error, or catastrophic config."
+    "situation": "Appalled exasperation at a cursed mess, horrific personal choices, or looking upon an unhinged disaster with deep weary disappointment: 'Good God, Lemon!'"
   },
   {
     "id": "30_rock_liz_night_cheese",
@@ -413,21 +415,21 @@
     "character": "Liz Lemon",
     "vibes": [
       "night_cheese",
-      "late_night",
-      "snack",
+      "goblin_mode",
       "pajamas",
-      "cozy"
+      "late_night_snack",
+      "shameless_cozy"
     ],
     "tags": [
-      "night_cheese",
-      "working_on_my_night_cheese",
-      "late_night",
-      "snack",
       "liz_lemon",
       "tina_fey",
-      "30_rock"
+      "30_rock",
+      "night_cheese",
+      "working_on_my_night_cheese",
+      "snack",
+      "late_night"
     ],
-    "situation": "Late-night coding sessions, grocery list building (Mealie / Whole Foods cart staging), midnight homelab tinkering in pajamas."
+    "situation": "Shameless solitary goblin mode in pajamas, singing to yourself while indulging in late-night snacks: 'Working on my night cheese!'"
   },
   {
     "id": "it_crowd_moss_fire",
@@ -436,20 +438,21 @@
     "franchise": "it_crowd",
     "character": "Maurice Moss",
     "vibes": [
-      "fire",
-      "calm_in_chaos",
-      "casual",
-      "putting_out_fire",
-      "deadpan"
+      "rest_of_the_fire",
+      "deadpan_absurdity",
+      "calm_in_fire",
+      "mild_inconvenience",
+      "blazing_fire"
     ],
     "tags": [
-      "fire",
-      "with_the_rest_of_the_fire",
       "moss",
       "richard_ayoade",
-      "it_crowd"
+      "it_crowd",
+      "fire",
+      "with_the_rest_of_the_fire",
+      "casual_calm"
     ],
-    "situation": "Putting a critical error alert aside to finish the current turn, serene calm amid production fires."
+    "situation": "British deadpan absurdity treating an active, blazing room fire as a minor nuisance, casually placing it over with 'the rest of the fire'."
   },
   {
     "id": "it_crowd_roy_turn_off_on",
@@ -458,21 +461,21 @@
     "franchise": "it_crowd",
     "character": "Roy Trenneman",
     "vibes": [
-      "restart",
+      "off_and_on_again",
+      "tech_support_cynicism",
+      "tired_cliche",
       "reboot",
-      "it_support",
-      "classic_fix",
-      "cynical"
+      "dismissive_fix"
     ],
     "tags": [
+      "roy_trenneman",
+      "chris_odowd",
+      "it_crowd",
       "off_and_on_again",
       "turning_it_off_and_on",
-      "reboot",
-      "restart",
-      "roy",
-      "it_crowd"
+      "reboot"
     ],
-    "situation": "Diagnosing transient memory leaks, recommending service restart, classic homelab triage."
+    "situation": "Exhausted, cynical tech support reciting the ultimate dismissive cure-all clich\u00e9 into a telephone: 'Have you tried turning it off and on again?'"
   },
   {
     "id": "arrested_dev_lucille_good_for_her",
@@ -482,21 +485,21 @@
     "character": "Lucille Bluth",
     "vibes": [
       "good_for_her",
-      "patronizing",
+      "patronizing_condescension",
+      "martini_sip",
       "snark",
-      "teasing",
-      "drink"
+      "passive_aggressive"
     ],
     "tags": [
-      "good_for_her",
-      "patronizing",
-      "snark",
-      "teasing",
       "lucille_bluth",
       "jessica_walter",
-      "arrested_development"
+      "arrested_development",
+      "good_for_her",
+      "patronizing",
+      "martini",
+      "condescending"
     ],
-    "situation": "Teasing minor achievements, affectionate patronizing condescension."
+    "situation": "Tipsy, high-society condescension sipping a martini and delivering patronizing, passive-aggressive praise: 'Good for her!'"
   },
   {
     "id": "arrested_dev_gob_huge_mistake",
@@ -506,21 +509,20 @@
     "character": "Gob Bluth",
     "vibes": [
       "huge_mistake",
-      "regret",
-      "bad_deploy",
-      "blunder",
-      "instant_regret"
+      "instant_regret",
+      "existential_dread",
+      "scheme_failed",
+      "blunder"
     ],
     "tags": [
-      "huge_mistake",
-      "ive_made_a_huge_mistake",
-      "regret",
-      "blunder",
       "gob_bluth",
       "will_arnett",
-      "arrested_development"
+      "arrested_development",
+      "huge_mistake",
+      "ive_made_a_huge_mistake",
+      "regret"
     ],
-    "situation": "Catching a catastrophic typo right after running a deploy, instant regret on a command."
+    "situation": "Instant, crushing existential regret the exact moment an ill-conceived scheme detonates: 'I've made a huge mistake.'"
   },
   {
     "id": "arrested_dev_tobias_dozens",
@@ -530,20 +532,20 @@
     "character": "Tobias F\u00fcnke",
     "vibes": [
       "dozens_of_us",
-      "niche",
-      "obscure",
-      "cult",
-      "pride"
+      "niche_cult",
+      "eccentric_pride",
+      "unhinged_passion",
+      "misunderstood"
     ],
     "tags": [
+      "tobias_funke",
+      "david_cross",
+      "arrested_development",
       "dozens_of_us",
       "there_are_dozens_of_us",
-      "niche",
-      "obscure_tech",
-      "tobias_funke",
-      "arrested_development"
+      "niche"
     ],
-    "situation": "Championing obscure self-hosted protocols, running niche CLI tools, hitting that 8-year-old GitHub issue."
+    "situation": "Passionate, unhinged pride championing an embarrassingly tiny, misunderstood subculture: 'There are dozens of us! DOZENS!'"
   },
   {
     "id": "office_jim_blinds",
@@ -553,20 +555,21 @@
     "character": "Jim Halpert",
     "vibes": [
       "blinds",
-      "watching_chaos",
       "knowing_smirk",
-      "i_knew_it",
-      "observer"
+      "spectator_chaos",
+      "secret_amusement",
+      "watching_disaster"
     ],
     "tags": [
-      "blinds",
-      "looking_through_blinds",
-      "knowing_smirk",
-      "watching_chaos",
       "jim_halpert",
-      "the_office"
+      "john_krasinski",
+      "the_office",
+      "blinds",
+      "window_blinds",
+      "smirk",
+      "spectator"
     ],
-    "situation": "Watching a slow-motion trainwreck unfold from a safe distance, knowing the root cause before anyone else."
+    "situation": "Peeking through window blinds with a smug, knowing smirk to watch an impending disaster or prank unfold from complete safety."
   },
   {
     "id": "office_jim_welp",
@@ -576,21 +579,21 @@
     "character": "Jim Halpert",
     "vibes": [
       "fourth_wall",
-      "deadpan",
+      "jim_stare",
       "welp",
-      "disbelief",
-      "awkward"
+      "deadpan_disbelief",
+      "awkward_shrug"
     ],
     "tags": [
+      "jim_halpert",
+      "the_office",
       "welp",
       "fourth_wall",
       "deadpan",
-      "disbelief",
-      "jim_stare",
-      "jim_halpert",
-      "the_office"
+      "stare",
+      "awkward"
     ],
-    "situation": "Witnessing absurd human/bot behavior in real time, reacting to bizarre API quirks, unvarnished dry disbelief."
+    "situation": "Breaking the fourth wall and staring straight into the camera with an awkward, deadpan 'welp' shrug at absurd behavior."
   },
   {
     "id": "office_stanley_eye_roll",
@@ -600,20 +603,20 @@
     "character": "Stanley Hudson",
     "vibes": [
       "eye_roll",
-      "unimpressed",
-      "bureaucracy",
       "zero_patience",
-      "done"
+      "corporate_nonsense",
+      "unimpressed",
+      "bored_to_death"
     ],
     "tags": [
+      "stanley_hudson",
+      "leslie_david_baker",
+      "the_office",
       "eye_roll",
       "unimpressed",
-      "bureaucracy",
-      "stanley",
-      "zero_patience",
-      "the_office"
+      "done_with_this"
     ],
-    "situation": "Pointless status pings, redundant alerts, unnecessary red tape, zero patience for bikeshedding."
+    "situation": "A heavy-lidded, soul-draining eye-roll of pure exhaustion at corporate nonsense, pointless meetings, and people who talk too much."
   },
   {
     "id": "b99_holt_vindication",
@@ -624,18 +627,20 @@
     "vibes": [
       "vindication",
       "proven_right",
-      "told_you_so",
-      "skepticism_refuted"
+      "skepticism_refuted",
+      "screaming_joy",
+      "told_you_so"
     ],
     "tags": [
+      "captain_holt",
+      "raymond_holt",
+      "andre_braugher",
+      "brooklyn_nine_nine",
       "vindication",
       "proven_right",
-      "told_you_so",
-      "captain_holt",
-      "andre_braugher",
-      "brooklyn_nine_nine"
+      "told_you_so"
     ],
-    "situation": "Strictly when an unpopular, contested, or doubted architectural bet is proven 100% right against active skepticism. Never use for routine task execution, uncontested fixes, or general success."
+    "situation": "Strictly when an embattled belief or contested theory is proven completely right against active skepticism, shouting with uncharacteristic joy: 'VINDICATION!' Never for routine tasks or uncontested success."
   },
   {
     "id": "seinfeld_costanza_high_note",
@@ -645,20 +650,21 @@
     "character": "George Costanza",
     "vibes": [
       "high_note",
-      "mic_drop",
       "clean_exit",
-      "done",
-      "signing_off"
+      "quit_while_ahead",
+      "mic_drop",
+      "abrupt_departure"
     ],
     "tags": [
+      "george_costanza",
+      "jason_alexander",
+      "seinfeld",
       "high_note",
       "leave_on_a_high_note",
-      "mic_drop",
-      "clean_exit",
-      "costanza",
-      "seinfeld"
+      "exit",
+      "mic_drop"
     ],
-    "situation": "Mic drops, concluding a clean fix, shipping a one-shot deployment, signing off right after nailing an issue."
+    "situation": "Abruptly exiting the conversation immediately after landing a great line or rare win before anything can go wrong: 'Leaving on a high note!'"
   },
   {
     "id": "seinfeld_kramer_entrance",
@@ -667,22 +673,22 @@
     "franchise": "seinfeld",
     "character": "Cosmo Kramer",
     "vibes": [
-      "entrance",
       "kramer_slide",
-      "burst_in",
-      "arrival",
-      "wild_idea"
+      "erratic_entrance",
+      "wild_idea",
+      "unannounced_arrival",
+      "chaotic_energy"
     ],
     "tags": [
+      "cosmo_kramer",
+      "michael_richards",
+      "seinfeld",
       "entrance",
       "kramer_slide",
       "burst_in",
-      "arrival",
-      "wild_idea",
-      "kramer",
-      "seinfeld"
+      "chaotic"
     ],
-    "situation": "Bursting into a channel hot with an unhinged breakthrough fix, unexpected arrival, radical new architecture."
+    "situation": "Sliding wildly through a doorway unannounced with erratic momentum, wild hair, and an unhinged scheme or sudden revelation."
   },
   {
     "id": "iasip_frank_started_blasting",
@@ -692,22 +698,21 @@
     "character": "Frank Reynolds",
     "vibes": [
       "started_blasting",
-      "kill_all",
-      "force",
-      "nuclear_option",
-      "guns"
+      "unhinged_overkill",
+      "trigger_happy",
+      "wild_chaos",
+      "nuclear_option"
     ],
     "tags": [
-      "started_blasting",
-      "so_anyway_i_started_blasting",
-      "kill_all",
-      "force",
-      "nuclear_option",
       "frank_reynolds",
       "danny_devito",
-      "always_sunny"
+      "always_sunny",
+      "started_blasting",
+      "so_anyway_i_started_blasting",
+      "guns",
+      "overkill"
     ],
-    "situation": "kill -9 on stubborn process trees, aggressive brute-force retries, nuclear cache wipes, wiping zombie cgroups."
+    "situation": "Trigger-happy lunacy where someone immediately resorts to extreme, unhinged overkill: 'So anyway, I started blasting!' Firing blindly at every problem."
   },
   {
     "id": "iasip_charlie_pepe_silvia",
@@ -716,12 +721,11 @@
     "franchise": "always_sunny",
     "character": "Charlie Kelly",
     "vibes": [
-      "conspiracy",
-      "forensic_investigation",
-      "unhinged",
-      "architecture",
+      "pepe_silvia",
+      "unhinged_conspiracy",
+      "conspiracy_rabbit_hole",
       "red_yarn",
-      "troubleshooting"
+      "manic_paranoia"
     ],
     "tags": [
       "pepe_silvia",
@@ -731,10 +735,10 @@
       "always_sunny",
       "its_always_sunny",
       "mailroom",
-      "investigation",
-      "connecting_the_dots"
+      "red_yarn",
+      "rabbit_hole"
     ],
-    "situation": "Deep forensic triage, tracing complex multi-service dependency graphs, untangling obscure reverse-proxy routing loops."
+    "situation": "Unhinged conspiracy rabbit holes connecting non-existent dots with red yarn and coffee: manic paranoia about Pepe Silvia and invisible conspiracies."
   },
   {
     "id": "veep_selina_wtf",
@@ -744,21 +748,21 @@
     "character": "Selina Meyer",
     "vibes": [
       "what_the_fuck",
-      "disbelief",
-      "shock",
-      "venomous",
-      "deadpan_horror"
-    ],
-    "tags": [
-      "veep",
-      "selina_meyer",
-      "julia_louis_dreyfus",
-      "what_the_fuck",
-      "nervous_laughter",
-      "wtf",
+      "fake_smile_drops",
+      "venomous_shock",
+      "stifled_horror",
       "disbelief"
     ],
-    "situation": "Bizarre upstream API breaks, unexpected breaking schema changes without changelog notes, third-party vendor absurdities."
+    "tags": [
+      "selina_meyer",
+      "julia_louis_dreyfus",
+      "veep",
+      "what_the_fuck",
+      "wtf",
+      "nervous_laughter",
+      "shock"
+    ],
+    "situation": "A polite, fake customer-service chuckle instantly freezing and snapping into venomous, stunned horror: '...What the fuck?'"
   },
   {
     "id": "office_michael_no_god",
@@ -767,23 +771,22 @@
     "franchise": "the_office",
     "character": "Michael Scott",
     "vibes": [
-      "panic",
-      "horror",
-      "denial",
-      "disaster",
-      "outage"
+      "no_god_please_no",
+      "primal_agony",
+      "melodramatic_despair",
+      "nightmare_returns",
+      "horror"
     ],
     "tags": [
-      "the_office",
       "michael_scott",
+      "steve_carell",
+      "the_office",
       "no_god_please_no",
       "nooooo",
-      "panic",
-      "steve_carell",
-      "horror",
-      "catastrophe"
+      "agony",
+      "panic"
     ],
-    "situation": "Critical production outages, accidental destructive commands, disk 100% full, Synology RAID degradation alerts."
+    "situation": "Pure, gut-wrenching melodramatic despair seeing a dreaded nightmare come back to life: 'NO GOD PLEASE NO! NO! NOOOOO!'"
   },
   {
     "id": "assassins_banderas_laptop",
@@ -792,24 +795,22 @@
     "franchise": "reaction_classics",
     "character": "Miguel Bain",
     "vibes": [
-      "relief",
-      "ecstasy",
-      "solved",
-      "triumph",
-      "it_works"
+      "laptop_ecstasy",
+      "sensual_relief",
+      "over_the_top_hacker",
+      "mouth_cover",
+      "worshiping_screen"
     ],
     "tags": [
       "antonio_banderas",
       "assassins",
       "laptop",
-      "computer",
-      "relief",
-      "ecstasy",
       "hand_to_mouth",
-      "hack",
-      "it_worked"
+      "ecstasy",
+      "sensual_relief",
+      "screen"
     ],
-    "situation": "Pulling off a high-wire zero-downtime migration, watching a complex pipeline execute flawlessly, pure developer relief."
+    "situation": "Over-the-top, sensual digital ecstasy and breathy relief worshiping a glowing laptop screen as a miracle unfolds on the display."
   },
   {
     "id": "nba_doc_rivers_disbelief",
@@ -818,23 +819,22 @@
     "franchise": "reaction_classics",
     "character": "Doc Rivers",
     "vibes": [
-      "disbelief",
-      "shock",
-      "confusion",
-      "bewildered",
-      "blinking"
+      "doc_rivers_blinking",
+      "baffled_disbelief",
+      "open_mouthed_shock",
+      "brain_broken",
+      "stunned"
     ],
     "tags": [
       "doc_rivers",
       "nba",
       "disbelief",
-      "clippers",
       "blinking",
       "bewildered",
       "what",
-      "in_disbelief"
+      "stunned"
     ],
-    "situation": "When a process or command fails in a way that defies logic or physics, utter disbelief at system behavior."
+    "situation": "Open-mouthed, rapidly blinking bewilderment staring onto the court after a call or blunder so baffling it breaks your brain."
   },
   {
     "id": "seinfeld_jerry_thats_a_shame",
@@ -844,22 +844,21 @@
     "character": "Jerry Seinfeld",
     "vibes": [
       "thats_a_shame",
-      "indifference",
-      "unbothered",
+      "cereal_indifference",
       "schadenfreude",
+      "unbothered",
       "not_my_problem"
     ],
     "tags": [
-      "thats_a_shame",
       "jerry_seinfeld",
       "seinfeld",
+      "thats_a_shame",
       "cereal",
       "indifference",
-      "vendor_outage",
-      "not_my_problem",
+      "unbothered",
       "eating_cereal"
     ],
-    "situation": "Complete indifference to external vendor outages, cloud platforms melting down while our local stack hums along, or avoidable self-inflicted user errors."
+    "situation": "Sociopathic, smirking indifference calmly eating a bowl of cereal while someone else suffers an avoidable catastrophe: 'That's a shame.'"
   },
   {
     "id": "ad_michael_bluth_dead_dove",
@@ -869,21 +868,21 @@
     "character": "Michael Bluth",
     "vibes": [
       "dead_dove",
-      "disappointment",
-      "predictable_failure",
       "i_dont_know_what_i_expected",
-      "inevitable"
+      "predictable_disappointment",
+      "self_inflicted_letdown",
+      "mournful"
     ],
     "tags": [
-      "arrested_development",
       "michael_bluth",
+      "jason_bateman",
+      "arrested_development",
       "dead_dove",
       "do_not_eat",
       "i_dont_know_what_i_expected",
-      "disappointment",
-      "predictable"
+      "disappointment"
     ],
-    "situation": "Peeking into known legacy tech debt, reading a notoriously broken log, opening an error report on a known fragile system, or experiencing an inevitable failure."
+    "situation": "Opening a bag explicitly marked 'DEAD DOVE DO NOT EAT' and staring inside with mournful regret: 'I don't know what I expected.'"
   },
   {
     "id": "iasip_mac_charlie_staredown",
@@ -892,24 +891,22 @@
     "franchise": "always_sunny",
     "character": "Mac & Charlie",
     "vibes": [
-      "staredown",
-      "intense_eye_contact",
-      "suspicious",
-      "deadpan_gaze",
-      "unblinking"
+      "creepy_staredown",
+      "unblinking_eye_contact",
+      "awkward_gaze",
+      "mutual_surveillance",
+      "weird_tension"
     ],
     "tags": [
-      "always_sunny",
       "mac",
-      "charlie",
+      "charlie_kelly",
+      "always_sunny",
       "guiginos",
       "staredown",
-      "staring",
-      "suspicious",
-      "deadpan",
+      "unblinking",
       "eye_contact"
     ],
-    "situation": "Catching another agent, service, or script acting suspiciously across the wire; mutual unblinking surveillance."
+    "situation": "Unblinking, intensely awkward eye contact across a crowded room, stubbornly refusing to look away or break an uncomfortable staredown."
   },
   {
     "id": "airplane_ted_striker_sweating",
@@ -918,25 +915,23 @@
     "franchise": "reaction_classics",
     "character": "Ted Striker",
     "vibes": [
-      "sweating",
-      "extreme_stress",
-      "nervous",
-      "intense_pressure",
-      "high_stakes",
-      "cockpit"
+      "sweating_profusely",
+      "panic_pressure",
+      "gushing_sweat",
+      "white_knuckle",
+      "extreme_anxiety"
     ],
     "tags": [
-      "airplane",
       "ted_striker",
+      "airplane",
       "sweat",
       "sweating",
+      "panic",
       "nervous",
-      "stress",
       "pressure",
-      "high_stakes",
-      "cockpit"
+      "white_knuckle"
     ],
-    "situation": "High-stakes deployments, tense production migrations, nerve-wracking database operations, or extreme technical pressure."
+    "situation": "Comically absurd, torrent-level sweat gushing down someone's face under extreme, white-knuckle panic and high pressure."
   },
   {
     "id": "community_abed_cool_cool_cool",
@@ -946,23 +941,21 @@
     "character": "Abed Nadir",
     "vibes": [
       "cool_cool_cool",
-      "approval",
-      "acknowledgment",
-      "smooth",
-      "unbothered",
-      "crisp"
+      "meta_detachment",
+      "deadpan_approval",
+      "rhythmic_nod",
+      "unbothered"
     ],
     "tags": [
-      "community",
       "abed_nadir",
+      "danny_pudi",
+      "community",
       "cool_cool_cool",
       "cool",
       "point",
-      "approval",
-      "acknowledgment",
-      "greendale"
+      "approval"
     ],
-    "situation": "Crisp acknowledgments, smooth deployment passes, clean test suites, or unbothered acceptance of changes."
+    "situation": "Rapid-fire, deadpan rhythmic approval and cool meta-detachment signaling smooth acceptance: 'Cool. Cool cool cool.'"
   },
   {
     "id": "jurassic_park_nedry_magic_word",
@@ -972,23 +965,21 @@
     "character": "Ray Arnold & Dennis Nedry",
     "vibes": [
       "magic_word",
-      "access_denied",
-      "lockout",
-      "permission_denied",
       "ah_ah_ah",
-      "frustration"
+      "finger_wag",
+      "taunting_lockout",
+      "smug_denial"
     ],
     "tags": [
-      "jurassic_park",
-      "samuel_l_jackson",
-      "ray_arnold",
       "dennis_nedry",
+      "samuel_l_jackson",
+      "jurassic_park",
       "magic_word",
+      "ah_ah_ah",
       "access_denied",
-      "403_forbidden",
       "lockout"
     ],
-    "situation": "Auth failures, permission denials, 403 Forbidden, rejected payloads, or hitting an impenetrable security gate."
+    "situation": "Smug, infuriating taunt wagging a finger in someone's face when they lack access: 'Ah ah ah! You didn't say the magic word!'"
   },
   {
     "id": "parks_rec_ron_know_more",
@@ -997,23 +988,21 @@
     "franchise": "parks_and_rec",
     "character": "Ron Swanson",
     "vibes": [
-      "know_more",
-      "superior",
       "i_know_more_than_you",
-      "dismissal",
-      "condescending",
-      "expertise",
-      "competence"
+      "supreme_condescension",
+      "dismiss_amateur",
+      "unshakable_authority",
+      "curt"
     ],
     "tags": [
-      "parks_and_rec",
       "ron_swanson",
       "nick_offerman",
+      "parks_and_rec",
       "i_know_more_than_you",
-      "expert",
-      "dismissive"
+      "dismissive",
+      "expert"
     ],
-    "situation": "Shutting down patronizing LLM warnings, unprompted third-party advisory spam, or someone trying to explain basic shell syntax."
+    "situation": "Cold, supreme dismissive confidence shutting down an amateur trying to explain things: 'I know more than you.'"
   },
   {
     "id": "succession_logan_not_serious_people",
@@ -1023,21 +1012,20 @@
     "character": "Logan Roy",
     "vibes": [
       "not_serious_people",
-      "disappointment",
-      "dismissal",
-      "unserious",
-      "amateurs",
-      "cold_truth"
+      "crushing_dismissal",
+      "amateur_hour",
+      "cold_verdict",
+      "pathetic"
     ],
     "tags": [
-      "succession",
       "logan_roy",
       "brian_cox",
+      "succession",
       "you_are_not_serious_people",
       "unserious",
-      "amateur"
+      "amateurs"
     ],
-    "situation": "Reviewing clown-tier PR proposals, fragile duct-tape workarounds, or amateur-hour third-party vendor pitches."
+    "situation": "Devastating, cold patriarch dismissal crushing foolish amateurs who think they belong at the big table: 'You are not serious people.'"
   },
   {
     "id": "office_space_lumbergh_that_would_be_great",
@@ -1047,23 +1035,20 @@
     "character": "Bill Lumbergh",
     "vibes": [
       "that_would_be_great",
-      "mkay",
       "passive_aggressive",
-      "management",
-      "delegation",
-      "chores",
-      "reminder"
+      "coffee_mug_boss",
+      "mkay",
+      "petty_tyranny"
     ],
     "tags": [
-      "office_space",
       "bill_lumbergh",
       "gary_cole",
+      "office_space",
       "that_would_be_great",
       "mkay",
-      "manager",
-      "yea"
+      "passive_aggressive"
     ],
-    "situation": "Deadpan delegation of tedious housekeeping, routine maintenance requests, or dry operational nudges."
+    "situation": "Smug, passive-aggressive management holding a coffee mug and casually imposing miserable weekend chores: 'Yeah, that'd be great.'"
   },
   {
     "id": "seinfeld_elaine_get_out",
@@ -1073,24 +1058,23 @@
     "character": "Elaine Benes",
     "vibes": [
       "get_out",
-      "shove",
-      "push",
-      "disbelief",
-      "shock",
-      "incredulous",
+      "violent_disbelief",
+      "shocking_twist",
+      "incredulous_shove",
       "no_way",
       "shut_up"
     ],
     "tags": [
-      "seinfeld",
       "elaine_benes",
       "julia_louis_dreyfus",
+      "seinfeld",
       "get_out",
-      "shove",
-      "push",
-      "disbelief"
+      "disbelief",
+      "shock",
+      "plot_twist",
+      "no_way"
     ],
-    "situation": "Shocking revelations, unbelievable performance speedups, wild turns of events, or mock incredulity."
+    "situation": "Strictly for shocking plot twists, jaw-dropping revelations, or stunned incredulity shoving someone backward: 'GET OUT!' Never for routine actions or progress."
   },
   {
     "id": "simpsons_homer_bushes",
@@ -1100,23 +1084,21 @@
     "character": "Homer Simpson",
     "vibes": [
       "homer_bushes",
-      "disappearing",
+      "hedge_vanish",
+      "reverse_escape",
       "backing_away",
-      "retreat",
-      "nope",
-      "steer_clear",
-      "vanish"
+      "disappear_from_drama"
     ],
     "tags": [
-      "the_simpsons",
       "homer_simpson",
+      "the_simpsons",
       "bushes",
       "hedge",
       "backing_away",
       "retreat",
-      "awkward"
+      "vanish"
     ],
-    "situation": "Quietly backing out of escalating drama, steering clear of unwinnable arguments, distancing from bad takes, or tiptoeing away from an incident you want no part of."
+    "situation": "Silently and smoothly reversing backwards into thick hedges with a blank expression to escape social awkwardness or escalating drama."
   },
   {
     "id": "mj_popcorn_thriller",
@@ -1126,11 +1108,9 @@
     "character": "Michael Jackson",
     "vibes": [
       "popcorn",
-      "spectator",
-      "entertainment",
-      "drama",
-      "watching",
-      "thriller",
+      "spectator_joy",
+      "loving_the_drama",
+      "messy_entertainment",
       "front_row"
     ],
     "tags": [
@@ -1139,9 +1119,9 @@
       "popcorn",
       "eating_popcorn",
       "drama",
-      "watching_the_show"
+      "spectator"
     ],
-    "situation": "Pulling up a front-row seat to watch public cloud vendor outages, external flame wars, comment section dumpster fires, or entertaining thread drama."
+    "situation": "Delighted front-row spectator eating popcorn with huge eyes, thoroughly enjoying external drama, arguments, and public messiness."
   },
   {
     "id": "pulp_fiction_travolta_confused",
@@ -1150,24 +1130,22 @@
     "franchise": "reaction_classics",
     "character": "Vincent Vega (John Travolta)",
     "vibes": [
-      "confused",
-      "lost",
-      "where_is_it",
-      "looking_around",
-      "baffled",
-      "empty",
-      "what_happened"
+      "travolta_confused",
+      "empty_room",
+      "where_did_it_go",
+      "baffled_spin",
+      "lost"
     ],
     "tags": [
-      "pulp_fiction",
       "vincent_vega",
       "john_travolta",
+      "pulp_fiction",
       "confused",
       "lost",
       "empty",
       "where"
     ],
-    "situation": "Disappearing files, empty directories, missing logs, git status showing zero tracked changes, or wondering where an entire team vanished mid-incident."
+    "situation": "Spreading both hands and turning in baffled circles in an unexpectedly empty room, utterly lost as to where everyone or everything went."
   },
   {
     "id": "nba_alonzo_realization",
@@ -1176,23 +1154,21 @@
     "franchise": "reaction_classics",
     "character": "Alonzo Mourning",
     "vibes": [
-      "realization",
-      "epiphany",
-      "acceptance",
-      "bitter_truth",
-      "nodding",
-      "disbelief_to_acceptance"
+      "disbelief_to_acceptance",
+      "grudging_realization",
+      "grim_epiphany",
+      "reluctant_nod",
+      "reality_sinks_in"
     ],
     "tags": [
-      "nba",
-      "miami_heat",
       "alonzo_mourning",
+      "nba",
       "realization",
       "epiphany",
       "acceptance",
-      "undeniable"
+      "reluctant_nod"
     ],
-    "situation": "Initial instinctive denial of a bug or architecture flaw, followed immediately by concession once the forensic receipts prove it right."
+    "situation": "Visibly pivoting from bitter, head-shaking denial into grim, reluctant comprehension as an undeniable truth sinks in."
   },
   {
     "id": "gatsby_dicaprio_toast",
@@ -1201,25 +1177,22 @@
     "franchise": "reaction_classics",
     "character": "Jay Gatsby (Leonardo DiCaprio)",
     "vibes": [
-      "cheers",
-      "toast",
-      "celebration",
-      "victory",
-      "swagger",
-      "salute",
-      "champagne",
-      "perfection"
+      "champagne_toast",
+      "dazzling_victory",
+      "cinematic_triumph",
+      "extravagant_cheers",
+      "swagger"
     ],
     "tags": [
-      "great_gatsby",
+      "jay_gatsby",
       "leonardo_dicaprio",
-      "cheers",
+      "great_gatsby",
       "toast",
+      "cheers",
       "champagne",
-      "congratulations",
-      "smooth"
+      "triumph"
     ],
-    "situation": "Toasting a flawless deployment, celebrating clean test runs, green CI pipelines, major project milestones, or pure victorious swagger."
+    "situation": "Cinematic, high-society fireworks triumph raising a champagne glass with a dazzling smile of pure, magnetic victory."
   },
   {
     "id": "hangover_alan_math",
@@ -1228,23 +1201,22 @@
     "franchise": "reaction_classics",
     "character": "Alan Garner (Zach Galifianakis)",
     "vibes": [
-      "calculating",
-      "math",
-      "formulas",
-      "complex_logic",
-      "crunching_numbers",
+      "floating_math",
+      "card_counting",
+      "galaxy_calculations",
+      "overthinking_formulas",
       "hyper_focus"
     ],
     "tags": [
-      "the_hangover",
       "alan_garner",
       "zach_galifianakis",
+      "the_hangover",
       "math",
       "calculating",
       "equations",
-      "brain"
+      "card_counting"
     ],
-    "situation": "Untangling complex regexes, calculating homelab storage quotas and bandwidth limits, token math, or hyper-calculating obscure edge cases."
+    "situation": "Vacant-eyed, hyper-intense card counting with glowing calculus formulas and geometric figures spinning around an oblivious face."
   },
   {
     "id": "roll_safe_tapping_head",
@@ -1253,24 +1225,22 @@
     "franchise": "reaction_classics",
     "character": "Roll Safe (Kayode Ewumi)",
     "vibes": [
-      "think_about_it",
-      "galaxy_brain",
-      "clever",
-      "loophole",
-      "smart",
-      "big_brain",
-      "workaround"
+      "roll_safe",
+      "tapping_temple",
+      "absurd_loophole",
+      "galaxy_brain_logic",
+      "clever_smirk"
     ],
     "tags": [
       "roll_safe",
       "kayode_ewumi",
-      "think_about_it",
       "tapping_head",
-      "smart",
+      "think_about_it",
       "loophole",
+      "smart",
       "galaxy_brain"
     ],
-    "situation": "Galaxy-brain workarounds, loop-hole exploits ('Can't suffer downtime if the server is permanently unplugged'), or clever lateral shortcuts."
+    "situation": "Tapping your temple with a knowing smirk to pitch absurd loophole logic: you can't have problems if you avoid the premise entirely."
   },
   {
     "id": "blinking_white_guy",
@@ -1279,24 +1249,21 @@
     "franchise": "reaction_classics",
     "character": "Drew Scanlon",
     "vibes": [
-      "blinking",
+      "blinking_white_guy",
+      "dumbfounded_blinking",
       "double_take",
-      "stunned",
-      "disbelief",
-      "wait_what",
-      "excuse_me",
-      "huh"
+      "baffled_silence",
+      "wait_what"
     ],
     "tags": [
       "drew_scanlon",
-      "blinking_guy",
       "blinking_white_guy",
-      "disbelief",
-      "shock",
       "double_take",
-      "what"
+      "disbelief",
+      "baffled",
+      "huh"
     ],
-    "situation": "Reacting to bizarre terminal output, reading an incomprehensible commit message, or pure mock disbelief at unexpected system behavior."
+    "situation": "Blinking repeatedly in dumbfounded, slow-motion disbelief after hearing someone say something utterly baffling."
   },
   {
     "id": "kermit_sipping_tea",
@@ -1305,23 +1272,21 @@
     "franchise": "reaction_classics",
     "character": "Kermit the Frog",
     "vibes": [
-      "none_of_my_business",
       "sipping_tea",
-      "unbothered",
-      "schadenfreude",
-      "calm",
-      "indifferent"
+      "none_of_my_business",
+      "smug_serenity",
+      "petty_schadenfreude",
+      "calm"
     ],
     "tags": [
       "kermit",
       "kermit_the_frog",
-      "tea",
       "sipping_tea",
+      "tea",
       "none_of_my_business",
-      "lipton",
-      "chill"
+      "schadenfreude"
     ],
-    "situation": "Watching external cloud platforms melt down while our local homelab hums along completely unaffected."
+    "situation": "Smug, serene pettiness sipping tea while someone reaps what they sowed: '...But that's none of my business.'"
   },
   {
     "id": "30_rock_buscemi_fellow_kids",
@@ -1331,22 +1296,20 @@
     "character": "Lenny Wosniak (Steve Buscemi)",
     "vibes": [
       "fellow_kids",
-      "how_do_you_do_fellow_kids",
-      "trying_to_fit_in",
+      "painful_cringe",
+      "trying_to_blend_in",
       "out_of_touch",
-      "boomer_tech",
-      "cringe"
+      "boomer_pose"
     ],
     "tags": [
-      "30_rock",
       "steve_buscemi",
+      "30_rock",
       "fellow_kids",
-      "music_band",
-      "out_of_touch",
-      "posing",
-      "trying_too_hard"
+      "how_do_you_do_fellow_kids",
+      "cringe",
+      "skateboard"
     ],
-    "situation": "Legacy enterprise software pretending to be cutting-edge, awkward attempts to blend in, or corporate tech marketing jargon."
+    "situation": "Painfully awkward, out-of-touch posturing trying to blend in with youth culture: carrying a skateboard asking 'How do you do, fellow kids?'"
   },
   {
     "id": "once_upon_leo_pointing",
@@ -1355,24 +1318,21 @@
     "franchise": "reaction_classics",
     "character": "Rick Dalton (Leonardo DiCaprio)",
     "vibes": [
-      "pointing",
-      "thats_it",
-      "spotted",
-      "recognition",
-      "found_it",
-      "stack_trace",
-      "exact_match"
+      "pointing_at_tv",
+      "excited_recognition",
+      "spotted_it",
+      "thats_the_one",
+      "jumping_off_couch"
     ],
     "tags": [
-      "once_upon_a_time_in_hollywood",
       "rick_dalton",
       "leonardo_dicaprio",
+      "once_upon_a_time_in_hollywood",
       "pointing",
-      "thats_the_one",
-      "tv",
-      "finger_pointing"
+      "thats_it",
+      "spotted"
     ],
-    "situation": "Spotting the exact culprit in a stack trace, recognizing a recurring edge case, or calling out a familiar bug in production logs."
+    "situation": "Excited, finger-snapping recognition jumping off the couch with a beer to point at the screen: 'There! That's the one!'"
   },
   {
     "id": "shaq_shimmy_wiggle",
@@ -1381,24 +1341,22 @@
     "franchise": "reaction_classics",
     "character": "Shaquille O'Neal",
     "vibes": [
-      "shimmy",
-      "wiggle",
-      "excitement",
-      "anticipation",
-      "hype",
-      "ready",
-      "swagger"
+      "shaq_shimmy",
+      "shoulder_wiggle",
+      "giddy_anticipation",
+      "savoring_treat",
+      "pure_joy"
     ],
     "tags": [
-      "shaq",
       "shaquille_oneal",
+      "shaq",
       "shimmy",
       "wiggle",
       "shoulders",
-      "excited",
-      "happy"
+      "anticipation",
+      "excited"
     ],
-    "situation": "Anticipating a major feature drop, watching download speeds peak on 10GbE, or savoring an impending win before kicking off a deployment."
+    "situation": "Giddy, shoulder-wiggling anticipation and pure childlike excitement savoring an impending treat or impending win."
   },
   {
     "id": "jeremiah_johnson_nod",
@@ -1407,13 +1365,11 @@
     "franchise": "reaction_classics",
     "character": "Jeremiah Johnson (Robert Redford)",
     "vibes": [
-      "nod",
-      "respect",
-      "approval",
-      "rugged",
-      "quiet_nod",
-      "well_done",
-      "acknowledgment"
+      "mountain_man_nod",
+      "solemn_respect",
+      "soulful_kinship",
+      "quiet_approval",
+      "rugged_honor"
     ],
     "tags": [
       "jeremiah_johnson",
@@ -1421,10 +1377,10 @@
       "nod",
       "beard",
       "respect",
-      "approval",
-      "wilderness"
+      "solemn",
+      "kinship"
     ],
-    "situation": "Quiet engineering respect for clean architecture, a tough bug elegantly resolved, or flawless homelab uptime under pressure."
+    "situation": "A weathered, bearded mountain man slowly zooming in to deliver a soulful, solemn nod of quiet kinship and deep respect."
   },
   {
     "id": "ryan_reynolds_but_why",
@@ -1434,23 +1390,20 @@
     "character": "Ryan Reynolds",
     "vibes": [
       "but_why",
-      "why",
-      "confusion",
-      "senseless",
-      "questioning",
-      "baffled",
-      "unnecessary"
+      "baffled_incomprehension",
+      "pointless_action",
+      "deadpan_mask",
+      "senseless"
     ],
     "tags": [
       "ryan_reynolds",
       "harold_and_kumar",
       "but_why",
-      "confused",
-      "mask",
       "why",
-      "exasperated"
+      "confused",
+      "pointless"
     ],
-    "situation": "Questioning bizarre upstream breaking changes, senseless dependency bloat, or why a vendor deprecated a perfectly working API."
+    "situation": "Dropping a surgical mask in utter, deadpan bewilderment at a completely pointless or unprompted action: '...But why?'"
   },
   {
     "id": "blink182_tom_delonge_wtf",
@@ -1460,23 +1413,21 @@
     "character": "Boomer / Tom DeLonge",
     "vibes": [
       "what_the_fuck",
-      "wtf",
-      "disbelief",
+      "repulsed_disbelief",
+      "punk_double_take",
       "head_shake",
-      "cursed",
-      "impossible",
-      "appalled"
+      "cursed_sight"
     ],
     "tags": [
-      "blink_182",
       "tom_delonge",
-      "what_the_fuck",
+      "blink_182",
       "wtf",
+      "what_the_fuck",
       "first_date",
-      "boomer",
-      "head_shake"
+      "disbelief",
+      "repulsed"
     ],
-    "situation": "Stumbling across cursed legacy code, seeing an impossible error code, or reacting to someone committing .env directly to GitHub."
+    "situation": "A bewildered punk-rock double-take shaking your head in open-mouthed, repulsed disbelief: 'What the fuck?!'"
   },
   {
     "id": "supa_hot_fire_eruption",
@@ -1485,24 +1436,21 @@
     "franchise": "reaction_classics",
     "character": "Supa Hot Fire & Crew",
     "vibes": [
-      "ohhhhh",
-      "crowd_reaction",
-      "rap_battle",
-      "knockout",
-      "destroyed",
-      "mayhem",
-      "mic_drop"
+      "supa_hot_fire",
+      "crowd_mayhem",
+      "devastating_roast",
+      "rap_battle_knockout",
+      "absolute_destruction"
     ],
     "tags": [
       "supa_hot_fire",
-      "im_not_a_rapper",
       "ohhhhh",
       "rap_battle",
-      "crowd",
+      "crowd_eruption",
       "roast",
-      "boom"
+      "destroyed"
     ],
-    "situation": "Delivering an undisputed benchmark blowout, roasting an over-engineered RFC, or dropping the mic on a messy architectural debate."
+    "situation": "An entire crowd erupting into unhinged mayhem, screaming and falling over each other after an undisputed, devastating roast."
   },
   {
     "id": "judge_judy_watch_tapping",
@@ -1511,24 +1459,22 @@
     "franchise": "reaction_classics",
     "character": "Judge Judy",
     "vibes": [
-      "times_up",
       "tapping_watch",
-      "waiting",
-      "impatient",
-      "hurry_up",
-      "clock_ticking",
-      "slow"
+      "times_up",
+      "impatient_glare",
+      "zero_time_wasted",
+      "hurry_up"
     ],
     "tags": [
       "judge_judy",
-      "watch",
       "tapping_watch",
       "wrist",
-      "impatient",
       "times_up",
+      "impatient",
+      "waiting",
       "hurry"
     ],
-    "situation": "Hanging CI builds, long-running DNS propagation waits, sluggish database responses, or impatient countdowns on migrations."
+    "situation": "Aggressively tapping an imaginary wristwatch and glaring at someone taking forever, signaling that patience has fully expired."
   },
   {
     "id": "goodfellas_ray_liotta_laugh",
@@ -1537,23 +1483,21 @@
     "franchise": "reaction_classics",
     "character": "Henry Hill (Ray Liotta)",
     "vibes": [
-      "laughing",
-      "hysterics",
-      "uncontrollable_laughter",
-      "mockery",
-      "ridiculous",
-      "absurd"
+      "ray_liotta_laugh",
+      "mobster_cackle",
+      "uncontrollable_hysterics",
+      "mocking_audacity",
+      "ridiculous"
     ],
     "tags": [
-      "goodfellas",
       "ray_liotta",
-      "henry_hill",
+      "goodfellas",
       "laughing",
       "hysterical",
-      "funny_how",
-      "dinner"
+      "mobster",
+      "mockery"
     ],
-    "situation": "Mocking ridiculous estimates, laughing off vendor sales pitches, or reacting to absurd homelab edge cases."
+    "situation": "Head-thrown-back, uncontrollable mobster hysterics laughing at a wildly absurd claim or preposterous audacity."
   },
   {
     "id": "anger_management_nicholson_nod",
@@ -1562,25 +1506,22 @@
     "franchise": "reaction_classics",
     "character": "Dr. Buddy Rydell (Jack Nicholson)",
     "vibes": [
-      "devious_nod",
-      "yes",
-      "sinister_smile",
-      "mischief",
-      "troublemaking",
-      "scheming",
-      "perfect_plan"
+      "sinister_nod",
+      "devilish_grin",
+      "egging_on",
+      "chaotic_mischief",
+      "scheming_trouble"
     ],
     "tags": [
-      "anger_management",
       "jack_nicholson",
-      "nod",
-      "yes",
+      "anger_management",
+      "sinister_nod",
+      "mischief",
+      "devious",
       "grin",
-      "smile",
-      "sinister",
-      "devious"
+      "egging_on"
     ],
-    "situation": "Scheming an unauthorized optimization, devious plans executing flawlessly, or mutual troublemaking between peers."
+    "situation": "A sinister, wide-eyed grin and devilish nod egging someone on toward chaotic mischief, rule-breaking, or petty villainy."
   },
   {
     "id": "training_day_denzel_relief",
@@ -1589,24 +1530,22 @@
     "franchise": "reaction_classics",
     "character": "Alonzo Harris (Denzel Washington)",
     "vibes": [
-      "relief",
       "hand_on_chest",
-      "whew",
-      "thank_god",
-      "crisis_averted",
-      "deep_breath",
-      "survived"
+      "trembling_relief",
+      "breathless_gratitude",
+      "narrow_escape",
+      "mercy"
     ],
     "tags": [
-      "training_day",
       "denzel_washington",
+      "training_day",
       "relief",
-      "heart",
       "hand_on_chest",
       "whew",
+      "narrow_escape",
       "survived"
     ],
-    "situation": "Barely averting a data-loss catastrophe, finding out backups restored cleanly, or passing an audit on the final retry."
+    "situation": "Clutching hand to chest with eyes squeezed shut in trembling, breathless gratitude after narrowly escaping absolute doom."
   },
   {
     "id": "reaction_math_lady_calculating",
@@ -1615,26 +1554,22 @@
     "franchise": "reaction_classics",
     "character": "Nazar\u00e9 Tedesco",
     "vibes": [
-      "confused",
-      "calculating",
-      "math",
-      "logistics",
-      "calendar",
-      "schedule",
-      "puzzled"
+      "math_lady",
+      "trigonometry_confusion",
+      "stumped_by_logic",
+      "glazed_stare",
+      "overthinking"
     ],
     "tags": [
-      "math",
+      "math_lady",
+      "nazare_tedesco",
       "calculating",
-      "calendar",
-      "schedule",
-      "logistics",
-      "overlap",
-      "collision",
-      "time_math",
-      "confused"
+      "confused",
+      "math",
+      "geometry",
+      "stumped"
     ],
-    "situation": "Solving calendar conflicts, double-booking logistics, calculating travel buffers, or overthinking simple schedule math."
+    "situation": "Glazed, bewildered expression as trigonometry formulas and geometric theorems wash over someone completely stumped by mundane logic."
   },
   {
     "id": "reaction_this_is_fine_dog",
@@ -1643,26 +1578,22 @@
     "franchise": "reaction_classics",
     "character": "Question Hound",
     "vibes": [
-      "unbothered",
-      "chaos",
-      "fire",
       "this_is_fine",
-      "broken",
-      "calm",
-      "acceptance"
+      "delusional_calm",
+      "room_engulfed_in_flames",
+      "denial_in_ruins",
+      "coffee_in_fire"
     ],
     "tags": [
       "this_is_fine",
-      "dog",
+      "question_hound",
+      "kc_green",
       "fire",
       "chaos",
       "burning",
-      "outage",
-      "broken_build",
-      "docker_crash",
-      "unbothered"
+      "calm"
     ],
-    "situation": "Unbothered calm while containers are restart-looping, upstream services are down, or systems are actively on fire."
+    "situation": "Delusional, calm denial sipping coffee while the entire room burns to ash around you: 'This is fine.'"
   },
   {
     "id": "reaction_honest_work_farmer",
@@ -1672,25 +1603,21 @@
     "character": "Dave Brandt",
     "vibes": [
       "honest_work",
-      "modest",
-      "chores",
-      "routine",
-      "handled",
-      "humble",
-      "satisfaction"
+      "rustic_pride",
+      "humble_labor",
+      "it_aint_much",
+      "unpretentious"
     ],
     "tags": [
       "honest_work",
       "farmer",
-      "chores",
-      "routine",
-      "calendar",
-      "schedule",
-      "maintenance",
-      "cleaning_logs",
+      "dave_brandt",
+      "it_aint_much",
+      "humble",
+      "labor",
       "modest"
     ],
-    "situation": "Routine domestic housekeeping, quiet calendar adds, basic cron maintenance, or humble operational chores handled."
+    "situation": "Country farmer in denim overalls wiping his brow with modest rustic pride: 'It ain't much, but it's honest work.'"
   },
   {
     "id": "office_michael_stay_calm",
@@ -1699,25 +1626,22 @@
     "franchise": "the_office",
     "character": "Michael Scott",
     "vibes": [
-      "panic",
-      "emergency",
-      "stay_calm",
-      "its_happening",
-      "alarm",
-      "chaos",
-      "high_alert"
+      "stay_calm_panic",
+      "screaming_hypocrisy",
+      "frantic_chaos",
+      "hysterical_alarm",
+      "arms_flapping"
     ],
     "tags": [
-      "panic",
-      "emergency",
-      "stay_calm",
-      "its_happening",
-      "the_office",
       "michael_scott",
       "steve_carell",
-      "fire_drill"
+      "the_office",
+      "stay_calm",
+      "fire_drill",
+      "panic",
+      "hysterical"
     ],
-    "situation": "Sudden emergency alerts, high-severity alarms, sudden unplanned downtime, or chaotic unexpected schedule shifts."
+    "situation": "Screaming at the top of your lungs and flapping arms in hysterical panic while commanding everyone else: 'EVERYBODY STAY CALM!'"
   },
   {
     "id": "reaction_kermit_frantic_typing",
@@ -1726,27 +1650,22 @@
     "franchise": "reaction_classics",
     "character": "Kermit the Frog",
     "vibes": [
-      "fast",
-      "frantic",
-      "typing",
-      "hotfix",
-      "hacking",
-      "churning_code",
-      "speed",
-      "locked_in"
+      "kermit_typing",
+      "manic_speed",
+      "blurry_hands",
+      "frenzied_typing",
+      "deadline_panic"
     ],
     "tags": [
       "kermit",
+      "kermit_the_frog",
       "typing",
       "typewriter",
-      "hotfix",
-      "hacking",
+      "frantic",
       "speed",
-      "code",
-      "terminal",
-      "fast_path"
+      "manic"
     ],
-    "situation": "Frantically churning out hotfixes, emergency terminal scripting, blazing through rapid code edits, or intense multitasking."
+    "situation": "Manic, blurry puppet hands pounding a typewriter at blinding speed under an impossible last-minute deadline."
   },
   {
     "id": "reaction_ben_affleck_smoking",
@@ -1755,27 +1674,22 @@
     "franchise": "reaction_classics",
     "character": "Ben Affleck",
     "vibes": [
-      "tired",
-      "exhausted",
-      "parenting",
-      "dad",
-      "sigh",
-      "drained",
-      "weary",
-      "resigned"
+      "ben_affleck_smoking",
+      "soul_draining_exhaustion",
+      "tired_sigh",
+      "thousand_yard_stare",
+      "completely_spent"
     ],
     "tags": [
       "ben_affleck",
       "smoking",
-      "tired",
+      "cigarette",
       "exhausted",
-      "dad",
-      "parenting",
-      "weekend_logistics",
-      "sigh",
-      "done"
+      "tired",
+      "thousand_yard_stare",
+      "spent"
     ],
-    "situation": "Surviving a grueling weekend of youth sports, endless family logistics, or finishing an exhausting Sunday chore run."
+    "situation": "Staring blankly into the middle distance while dragging on a cigarette in absolute, soul-draining exhaustion."
   },
   {
     "id": "simpsons_grandpa_in_and_out",
@@ -1784,26 +1698,22 @@
     "franchise": "the_simpsons",
     "character": "Abe Simpson",
     "vibes": [
-      "nope",
-      "turnaround",
-      "leaving",
-      "bail",
-      "abort",
-      "walk_out",
-      "unbothered"
+      "grandpa_in_and_out",
+      "instant_pivot",
+      "nope_leaving",
+      "smooth_turnaround",
+      "bailing_immediately"
     ],
     "tags": [
-      "simpsons",
-      "grandpa",
       "abe_simpson",
+      "grandpa_simpson",
+      "the_simpsons",
       "in_and_out",
+      "pivot",
       "nope",
-      "turnaround",
-      "leaving",
-      "bail",
-      "abort"
+      "leaving"
     ],
-    "situation": "Walking into a broken thread or messy disaster, seeing absurd upstream nonsense, and immediately turning around to walk out."
+    "situation": "Entering a room, hanging up your hat, spotting something wildly unhinged, immediately pivoting 360 degrees, and walking right back out."
   },
   {
     "id": "reaction_star_trek_picard_facepalm",
@@ -1812,25 +1722,22 @@
     "franchise": "reaction_classics",
     "character": "Jean-Luc Picard",
     "vibes": [
+      "picard_facepalm",
+      "dignified_agony",
+      "exasperated_palm",
       "facepalm",
-      "exasperated",
-      "disbelief",
-      "blunder",
-      "typo",
-      "unforced_error",
-      "human_error"
+      "foolish_blunder"
     ],
     "tags": [
-      "picard",
+      "jean_luc_picard",
+      "patrick_stewart",
       "star_trek",
       "facepalm",
       "exasperated",
-      "human_error",
-      "unforced_error",
-      "patrick_stewart",
-      "typo"
+      "blunder",
+      "disbelief"
     ],
-    "situation": "Exasperation at self-inflicted blunders, syntax typos, forgetting obvious configs, or catching dumb human mistakes."
+    "situation": "Burying your forehead into your open palm in profound, dignified agony at an astonishingly foolish blunder."
   },
   {
     "id": "matrix_neo_kung_fu",
@@ -1839,24 +1746,22 @@
     "franchise": "reaction_classics",
     "character": "Neo",
     "vibes": [
-      "kung_fu",
-      "matrix_download",
-      "neural_upload",
-      "martial_arts",
       "i_know_kung_fu",
-      "sudden_mastery"
+      "neural_download",
+      "sudden_mastery",
+      "matrix_skill",
+      "martial_arts"
     ],
     "tags": [
-      "matrix",
       "neo",
       "keanu_reeves",
+      "the_matrix",
       "kung_fu",
+      "i_know_kung_fu",
       "martial_arts",
-      "neural_upload",
-      "skill_download",
-      "sudden_mastery"
+      "neural_download"
     ],
-    "situation": "Immediately after downloading a completely new skill or binary capability, neural upload, or literal sudden martial arts mastery."
+    "situation": "Waking up from a direct cerebral neural download with wide-eyed shock: 'I know kung fu.' Sudden martial arts mastery."
   },
   {
     "id": "reaction_gordon_ramsay_idiot_sandwich",
@@ -1866,24 +1771,20 @@
     "character": "Gordon Ramsay",
     "vibes": [
       "idiot_sandwich",
-      "roast",
-      "stupid",
-      "bad_architecture",
-      "clown",
-      "harsh",
-      "disbelief"
+      "merciless_roast",
+      "bread_on_ears",
+      "public_humiliation",
+      "stupidity_called_out"
     ],
     "tags": [
       "gordon_ramsay",
       "idiot_sandwich",
       "roast",
+      "hells_kitchen",
       "stupid",
-      "bad_architecture",
-      "clown",
-      "harsh",
-      "what_are_you"
+      "humiliation"
     ],
-    "situation": "Roasting terrible architectures, unhinged vendor decisions, clownish design patterns, or brain-dead assumptions."
+    "situation": "Pressing two slices of bread against someone's ears and forcing them to verbally confess: 'An idiot sandwich!' Merciless roasting of stupidity."
   },
   {
     "id": "itysl_karl_havoc_too_much_shit",
@@ -1892,25 +1793,22 @@
     "franchise": "i_think_you_should_leave",
     "character": "Karl Havoc",
     "vibes": [
-      "suffocating",
+      "karl_havoc",
       "too_much_shit",
-      "bloat",
-      "over_engineered",
-      "itysl",
-      "exhausted",
-      "done"
+      "suffocating_panic",
+      "prosthetic_meltdown",
+      "overwhelmed"
     ],
     "tags": [
       "karl_havoc",
-      "itysl",
       "tim_robinson",
+      "itysl",
+      "i_think_you_should_leave",
       "too_much_shit",
-      "bloat",
-      "over_engineered",
-      "dependency_hell",
-      "suffocating"
+      "suffocating",
+      "overwhelmed"
     ],
-    "situation": "Suffocating under bloated Docker compose files, over-engineered microservices, dependency hell, or 40-container stacks."
+    "situation": "Suffocating in existential panic under an overwhelming pile of unwanted baggage: 'There's too much fucking shit on me! I can't breathe!'"
   },
   {
     "id": "iasip_mac_playing_both_sides",
@@ -1920,24 +1818,21 @@
     "character": "Mac",
     "vibes": [
       "playing_both_sides",
-      "hedge",
-      "game_theory",
-      "redundancy",
-      "smug",
-      "scheming",
-      "always_sunny"
+      "idiotic_hedge",
+      "brazen_confession",
+      "double_agent_fail",
+      "smug_schemer"
     ],
     "tags": [
       "mac",
+      "rob_mcelhenney",
       "always_sunny",
       "playing_both_sides",
+      "both_sides",
       "hedge",
-      "game_theory",
-      "redundancy",
-      "failover",
-      "dual_routing"
+      "scheming"
     ],
-    "situation": "Hedging bets with dual routing, redundant DNS failovers, split fallbacks, or tactical multi-agent game-theory maneuvers."
+    "situation": "Brazenly confessing a foolish hedge out loud to the people you are scheming against: 'I'm playing both sides, so that I always come out on top.'"
   },
   {
     "id": "reaction_bernie_sanders_once_again_asking",
@@ -1947,24 +1842,20 @@
     "character": "Bernie Sanders",
     "vibes": [
       "once_again_asking",
-      "begging",
-      "permissions",
-      "tokens",
-      "approval",
-      "pleading",
-      "patience"
+      "humble_pleading",
+      "winter_coat_begging",
+      "persistent_request",
+      "financial_support"
     ],
     "tags": [
       "bernie_sanders",
       "once_again_asking",
       "financial_support",
-      "permissions",
-      "tokens",
-      "oauth",
-      "sudo",
-      "approval"
+      "begging",
+      "pleading",
+      "asking"
     ],
-    "situation": "Asking for OAuth tokens, elevated sudo permissions, API keys, budget approval, or Ryan's attention on a blocked turn."
+    "situation": "Shivering in a winter coat with humble, persistent pleading: 'I am once again asking for your financial support.'"
   },
   {
     "id": "reaction_ron_burgundy_not_mad",
@@ -1975,22 +1866,19 @@
     "vibes": [
       "not_even_mad",
       "thats_amazing",
-      "impressed",
-      "spectacle",
-      "disaster",
-      "respect",
-      "anchorman"
+      "grudging_admiration",
+      "magnificent_spectacle",
+      "awed_by_disaster"
     ],
     "tags": [
       "ron_burgundy",
+      "will_ferrell",
       "anchorman",
       "not_even_mad",
       "thats_amazing",
-      "will_ferrell",
-      "spectacle",
-      "spectacular_failure"
+      "spectacle"
     ],
-    "situation": "When an edge case bug or catastrophic system failure is so wildly bizarre and elaborate that you have to respect the spectacle."
+    "situation": "Grudging, open admiration for a catastrophic mishap so elaborate and magnificent you can't be angry: 'I'm not even mad, that's amazing.'"
   },
   {
     "id": "matrix_neo_bullet_dodge",
@@ -2000,24 +1888,21 @@
     "character": "Neo",
     "vibes": [
       "bullet_dodge",
-      "matrix",
-      "dodged",
-      "narrow_escape",
-      "clean",
-      "agility",
-      "evaded"
+      "slow_motion_matrix",
+      "impossible_escape",
+      "dodging_disaster",
+      "agility"
     ],
     "tags": [
-      "matrix",
       "neo",
+      "the_matrix",
       "keanu_reeves",
       "bullet_time",
       "bullet_dodge",
-      "dodged",
       "narrow_escape",
-      "outage_avoided"
+      "dodged"
     ],
-    "situation": "Cleanly dodging breaking upstream library updates, avoiding silent memory leaks, or narrowly missing an infrastructure outage."
+    "situation": "Bending backwards in impossible slow-motion bullet time on a windy rooftop to dodge incoming disaster by a fraction of an inch."
   },
   {
     "id": "reaction_django_calvin_candie_laugh",
@@ -2026,25 +1911,21 @@
     "franchise": "reaction_classics",
     "character": "Calvin Candie",
     "vibes": [
-      "smug_laugh",
-      "calvin_candie",
-      "django",
-      "amused",
-      "wicked",
-      "gloating",
-      "mischief"
+      "calvin_candie_laugh",
+      "wicked_malice",
+      "cocktail_giggle",
+      "aristocratic_schadenfreude",
+      "gloating"
     ],
     "tags": [
-      "django",
-      "leonardo_dicaprio",
       "calvin_candie",
-      "laugh",
-      "drink",
+      "leonardo_dicaprio",
+      "django_unchained",
       "smug_laugh",
       "gloating",
-      "amused"
+      "malice"
     ],
-    "situation": "Smug, wicked amusement at someone else's hubris, watching a fragile hack collapse, or enjoying a clean exploit."
+    "situation": "Holding a cocktail and giggling with wicked, aristocratic malice at someone walking straight into a trap or meeting their downfall."
   },
   {
     "id": "reaction_denzel_my_man",
@@ -2054,13 +1935,10 @@
     "character": "Alonzo Harris (Denzel Washington)",
     "vibes": [
       "my_man",
-      "nod",
-      "respect",
-      "swagger",
-      "smooth",
-      "flawless",
-      "solved",
-      "effortless"
+      "smooth_swagger",
+      "charismatic_point",
+      "flawless_cool",
+      "mutual_respect"
     ],
     "tags": [
       "denzel_washington",
@@ -2069,10 +1947,9 @@
       "nod",
       "swagger",
       "smooth",
-      "effortless",
-      "solved"
+      "appreciation"
     ],
-    "situation": "Effortless swagger, clean execution, smooth technical resolution, mutual respect between elite operators."
+    "situation": "Charismatic, swaggering streetwise nod and smooth grin pointing in appreciation: 'My man!'"
   },
   {
     "id": "reaction_paul_rudd_computer_nod",
@@ -2081,50 +1958,22 @@
     "franchise": "reaction_classics",
     "character": "Paul Rudd",
     "vibes": [
-      "computer",
-      "nod",
-      "approve",
-      "solved",
-      "tech",
-      "smooth",
-      "satisfied"
+      "celery_man",
+      "tayne_nod",
+      "weird_computer_nod",
+      "surreal_satisfaction",
+      "beige_crt"
     ],
     "tags": [
       "paul_rudd",
       "tim_and_eric",
       "celery_man",
       "tayne",
-      "computer",
-      "nod",
-      "satisfied",
-      "tech"
+      "computer_nod",
+      "surreal",
+      "satisfied"
     ],
-    "situation": "Terminal wizardry, routine code fixes working on the first try, admiring clean system output at the computer."
-  },
-  {
-    "id": "parks_rec_ron_swanson_smile",
-    "title": "Ron Swanson \u2014 Proud Silent Smile",
-    "url": "https://tenor.com/view/ron-swanson-parks-and-rec-parks-and-recreation-nick-offerman-smiling-gif-16762079",
-    "franchise": "parks_and_rec",
-    "character": "Ron Swanson",
-    "vibes": [
-      "proud",
-      "smile",
-      "craftsmanship",
-      "competence",
-      "solid",
-      "solved"
-    ],
-    "tags": [
-      "ron_swanson",
-      "nick_offerman",
-      "parks_and_rec",
-      "smile",
-      "competence",
-      "craftsmanship",
-      "solid"
-    ],
-    "situation": "Solid craftsmanship, rock-solid infrastructure fixes, quiet satisfaction in a job done right without fanfare."
+    "situation": "Sitting at an old beige computer and offering a surreal, deeply weird, slow nod of pure synthetic satisfaction: 'Now Tayne I can get into.'"
   },
   {
     "id": "community_jeff_winger_told_ya_so",
@@ -2133,69 +1982,21 @@
     "franchise": "community",
     "character": "Jeff Winger",
     "vibes": [
-      "smug",
       "told_ya_so",
-      "vindication",
-      "swagger",
-      "effortless"
+      "smug_validation",
+      "pretty_boy_smirk",
+      "cynical_prediction",
+      "swagger"
     ],
     "tags": [
       "jeff_winger",
       "joel_mchale",
       "community",
-      "smug",
       "told_ya_so",
-      "swagger",
-      "effortless"
+      "smug",
+      "vindication"
     ],
-    "situation": "Effortless swagger, predicting the exact failure point before looking at the logs, confident validation."
-  },
-  {
-    "id": "itysl_tim_robinson_wink",
-    "title": "Tim Robinson \u2014 Diner Wink",
-    "url": "https://tenor.com/view/tim-robinson-diner-wink-i-think-you-should-leave-itysl-wink-gif-3075331787024232728",
-    "franchise": "i_think_you_should_leave",
-    "character": "Tim Robinson",
-    "vibes": [
-      "wink",
-      "got_it",
-      "smooth",
-      "mutual_understanding",
-      "handled"
-    ],
-    "tags": [
-      "tim_robinson",
-      "itysl",
-      "i_think_you_should_leave",
-      "wink",
-      "smooth",
-      "handled"
-    ],
-    "situation": "Effortless handling, silent mutual understanding, smooth problem solved with a knowing wink."
-  },
-  {
-    "id": "curb_larry_david_got_it",
-    "title": "Larry David \u2014 Right / Gotcha Nod",
-    "url": "https://tenor.com/view/curb-your-enthusiasm-larry-david-right-gotcha-got-it-gif-22485014",
-    "franchise": "curb_your_enthusiasm",
-    "character": "Larry David",
-    "vibes": [
-      "gotcha",
-      "nod",
-      "solved",
-      "understanding",
-      "agreed"
-    ],
-    "tags": [
-      "larry_david",
-      "curb_your_enthusiasm",
-      "curb",
-      "nod",
-      "gotcha",
-      "solved",
-      "agreed"
-    ],
-    "situation": "Spotting the obvious bug instantly, quick realization, locking in a fix with dry acknowledgment."
+    "situation": "Smug, pretty-boy smirk basking in the glory of an accurate cynical prediction: 'Told ya so.'"
   },
   {
     "id": "reaction_sweet_brown_aint_nobody_got_time",
@@ -2204,29 +2005,21 @@
     "franchise": "reaction_classics",
     "character": "Kimberly Wilkins (Sweet Brown)",
     "vibes": [
-      "aint_nobody_got_time_for_that",
-      "no_time",
-      "busy",
-      "done",
-      "over_it",
-      "impatient",
-      "dismissive",
-      "bronchitis"
+      "aint_nobody_got_time",
+      "viral_exasperation",
+      "no_time_for_drama",
+      "dismissive_hands",
+      "done_with_nonsense"
     ],
     "tags": [
       "sweet_brown",
       "kimberly_wilkins",
       "aint_nobody_got_time_for_that",
+      "viral_interview",
       "no_time",
-      "busy",
-      "viral",
-      "interview",
-      "over_it",
-      "impatient",
-      "done",
-      "dismissive",
-      "bronchitis"
+      "bronchitis",
+      "exasperated"
     ],
-    "situation": "Impatient dismissal of tedious work, over-complicated processes, unnecessary overhead, time-wasting bikeshedding, or being entirely done with nonsense."
+    "situation": "Flamboyant, viral local-news exasperation throwing hands up at annoying nonsense: 'Ain't nobody got time for that!'"
   }
 ]

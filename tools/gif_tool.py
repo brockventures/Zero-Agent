@@ -15,9 +15,10 @@ import io
 import sqlite3
 from pathlib import Path
 
-HISTORY_FILE = Path("/workspace/data/gif_history.json")
-FAILURE_LOG_FILE = Path("/workspace/data/gif_failures.jsonl")
-CANONICAL_GIFS_FILE = Path("/workspace/data/canonical_gifs.json")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+HISTORY_FILE = REPO_ROOT / "data/gif_history.json" if (REPO_ROOT / "data/gif_history.json").exists() else Path("/workspace/data/gif_history.json")
+FAILURE_LOG_FILE = REPO_ROOT / "data/gif_failures.jsonl" if (REPO_ROOT / "data/gif_failures.jsonl").exists() else Path("/workspace/data/gif_failures.jsonl")
+CANONICAL_GIFS_FILE = REPO_ROOT / "data/canonical_gifs.json" if (REPO_ROOT / "data/canonical_gifs.json").exists() else Path("/workspace/data/canonical_gifs.json")
 
 FILLER_WORDS = {
     "gif", "gifs", "quality", "intergalactic", "thumbnail", "reaction",
@@ -206,12 +207,17 @@ def detect_franchise(text: str | None) -> str | None:
 
 def get_runtime_gif_rules() -> dict:
     """Load GIF diversity rules from runtime_rules.json with robust fallbacks."""
-    rules_path = Path("/workspace/config/runtime_rules.json")
+    rules_path = REPO_ROOT / "config/runtime_rules.json" if (REPO_ROOT / "config/runtime_rules.json").exists() else Path("/workspace/config/runtime_rules.json")
     default_rules = {
         "enabled": True,
         "default_cooldown_turns": 2,
         "franchise_cooldowns": {
-            "arrested_development": 4
+            "arrested_development": 3,
+            "curb_your_enthusiasm": 3,
+            "silicon_valley": 2,
+            "seinfeld": 2,
+            "reaction_classics": 1,
+            "brooklyn_nine_nine": 3
         },
         "quarantined_franchises": [],
         "rotation_pool": [
@@ -384,7 +390,7 @@ def load_history() -> list[dict]:
     return []
 
 
-def get_history_urls(history: list[dict | str] | None = None, limit: int = 35) -> set[str]:
+def get_history_urls(history: list[dict | str] | None = None, limit: int = 15) -> set[str]:
     """Extract set of URLs from recent history records (supports dicts and raw strings)."""
     if history is None:
         history = load_history()
@@ -973,10 +979,11 @@ CANONICAL GIF CATALOG:
 {catalog_str}
 
 CRITICAL INSTRUCTIONS:
-1. Select the SINGLE BEST GIF ID from the catalog that fits the tone, humor, metaphor, or situation.
-2. Map creative or metaphorical queries to their closest comedic equivalent (e.g. "shield/dodge" -> matrix_neo_bullet_dodge, "conspiracy/math" -> iasip_charlie_pepe_silvia). Only return "NONE" if the query is completely unrelated to any reaction in the catalog.
-3. Return ONLY the chosen GIF ID (or "NONE") on a line by itself. Do not include markdown, explanations, or quotes.
-4. DIVERSIFY SELECTION: Prefer underutilized or fresh gems from the catalog over generic nod/thumbs-up staples when a specific comedic scene fits.
+1. Select the SINGLE BEST GIF ID from the catalog that fits both the specific comedic premise and emotional polarity of the situation. Never pick a negative/disaster GIF for a positive query, or a positive/celebratory GIF for a negative or failure query.
+2. STRICT ABSTENTION: If no eligible GIF genuinely matches both the comedic premise and emotional polarity of the query, you MUST return "NONE". Do not force-fit or settle for weak thematic tangents.
+3. Map creative or metaphorical queries to their closest comedic equivalent only when the comedic subtext and emotional polarity genuinely align (e.g. "shield/dodge" -> matrix_neo_bullet_dodge, "unhinged conspiracy rabbit hole" -> iasip_charlie_pepe_silvia).
+4. Return ONLY the chosen GIF ID (or "NONE") on a line by itself. Do not include markdown, explanations, or quotes.
+5. DIVERSIFY SELECTION: Prefer underutilized or fresh gems from the catalog over generic staples when a specific comedic scene fits.
 """
     raw_out = _call_gemini_api_direct(prompt, timeout=min(float(timeout), 3.5))
     if not raw_out:
@@ -1004,7 +1011,7 @@ CRITICAL INSTRUCTIONS:
 
     cleaned_out = raw_out.strip()
     if cleaned_out.upper() == "NONE" or re.search(r"\bNONE\b", cleaned_out, re.IGNORECASE):
-        print(f"[GIF] LLM abstained for '{query}'; falling through to vector/FTS5 matcher.", file=sys.stderr)
+        print(f"[GIF] LLM abstained for '{query}'; returning None (no match).", file=sys.stderr)
         return "ABSTAIN"
 
     try:
@@ -1090,11 +1097,14 @@ def find_canonical_gif(query: str, history: list[dict | str] | None = None, forc
                     "vibes": entry.get("vibes")
                 }
 
-    # 2. LLM Semantic Selection (Primary — falls through on ABSTAIN to vector/FTS5 matcher)
+    # 2. LLM Semantic Selection (Primary — returns None immediately on ABSTAIN)
     if use_llm:
         llm_pick = llm_select_canonical_gif(query, registry, history_urls, history=history, force=force)
         if isinstance(llm_pick, dict):
             return llm_pick
+        if llm_pick == "ABSTAIN":
+            return None
+        # If llm_pick is None, the LLM API call failed or timed out; fall through to FTS5 / vector search.
 
     # 3. FTS5 BM25 + FastEmbed Vector Hybrid Search
     fts_ranks = {}
