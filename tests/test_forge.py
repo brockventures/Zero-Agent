@@ -16,13 +16,18 @@ if _REPO_ROOT not in sys.path:
 
 from tools.forge import (
     MAX_WHOLE_CLASS_SYMBOL_LINES,
+    OWNER_USER_ID,
     _check_oversized_class_symbol,
     _is_explicit_approval_prompt,
     evaluate_plan_approval_gate,
+    execute_decision,
+    format_decision_card_text,
     format_origin_failure_envelope,
     get_db_connection,
     init_forge_db,
+    render_decision_card_embed,
     run_goldfish_plan_preflight,
+    stage_decision,
     validate_forge_plan,
 )
 
@@ -393,3 +398,144 @@ def test_format_origin_failure_envelope_missing_build_returns_empty(tmp_path: Pa
     db_file = tmp_path / "forge_test.db"
     init_forge_db(db_file)
     assert format_origin_failure_envelope("nonexistent-id", db_path=db_file) == ""
+
+
+# ==============================================================================
+# 4. Immediate Decision Card Button Lock & Atomic Execution Tests
+# ==============================================================================
+
+
+def test_decision_card_executing_embed_and_text_rendering(tmp_path: Path) -> None:
+    """render_decision_card_embed and format_decision_card_text render executing state cleanly."""
+    db_file = tmp_path / "forge_test.db"
+    init_forge_db(db_file)
+
+    d = stage_decision(
+        category="ops",
+        title="Deploy Test Service",
+        summary="Automated deployment of test container.",
+        handler_type="shell",
+        payload={"command": "echo 'ok'"},
+        db_path=db_file,
+    )
+
+    # 1. Test from database row in executing status
+    with get_db_connection(db_file) as conn:
+        conn.execute("UPDATE forge_decisions SET status = 'executing' WHERE id = ?", (d["decision_id"],))
+        row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (d["decision_id"],)).fetchone()
+
+    embed = render_decision_card_embed(row)
+    assert embed["title"] == "⏳ Deploy Test Service"
+    assert embed["color"] == 0x3B82F6
+    assert embed["footer"]["text"] == "OPS · Executing..."
+    assert "Automated deployment of test container." in embed["description"]
+    assert "**Approve Action:** Run `echo 'ok'`" in embed["description"]
+
+    text = format_decision_card_text(row)
+    assert text.startswith("⏳ **Deploy Test Service** [OPS · Executing...]")
+    assert "Automated deployment of test container." in text
+
+    # 2. Test from raw dictionary in executing status
+    raw_dict = {
+        "status": "executing",
+        "category": "FORGE",
+        "title": "Build Chunk 0",
+        "summary": "Building chunk 0 in worktree",
+    }
+    embed_raw = render_decision_card_embed(raw_dict)
+    assert embed_raw["title"] == "⏳ Build Chunk 0"
+    assert embed_raw["color"] == 0x3B82F6
+    assert embed_raw["footer"]["text"] == "FORGE · Executing..."
+    assert embed_raw["description"] == "Building chunk 0 in worktree"
+
+    text_raw = format_decision_card_text(raw_dict)
+    assert text_raw == "⏳ **Build Chunk 0** [FORGE · Executing...]\nBuilding chunk 0 in worktree"
+
+
+def test_execute_decision_atomic_claim_rejection_when_executing(tmp_path: Path) -> None:
+    """execute_decision rejects execution if decision is already in status 'executing'."""
+    db_file = tmp_path / "forge_test.db"
+    init_forge_db(db_file)
+
+    d = stage_decision(
+        category="ops",
+        title="Atomic Claim Guard",
+        summary="Testing atomic claim race prevention.",
+        handler_type="shell",
+        payload={"command": "echo 'atomic'"},
+        db_path=db_file,
+    )
+
+    # Set status directly to 'executing' to simulate an active in-flight worker
+    with get_db_connection(db_file) as conn:
+        conn.execute("UPDATE forge_decisions SET status = 'executing' WHERE id = ?", (d["decision_id"],))
+
+    res = execute_decision(d["decision_id"], user_id=OWNER_USER_ID, db_path=db_file)
+    assert res["ok"] is False
+    assert f"Decision {d['decision_id']} is already executing." in res["error"]
+
+    # Verify atomic update with rowcount == 0 guard
+    # If the row was pending but another transaction claimed it first:
+    d2 = stage_decision(
+        category="ops",
+        title="Concurrent Execution Race",
+        summary="Testing rowcount race check.",
+        handler_type="shell",
+        payload={"command": "echo 'race'"},
+        db_path=db_file,
+    )
+    # First execution succeeds and marks status 'approved'
+    res1 = execute_decision(d2["decision_id"], user_id=OWNER_USER_ID, db_path=db_file)
+    assert res1["ok"] is True
+    assert res1["status"] == "approved"
+
+    # Second execution is rejected because status is no longer pending
+    res2 = execute_decision(d2["decision_id"], user_id=OWNER_USER_ID, db_path=db_file)
+    assert res2["ok"] is False
+    assert f"Decision {d2['decision_id']} is already approved." in res2["error"]
+
+
+def test_execute_decision_custom_shell_timeout(tmp_path: Path) -> None:
+    """execute_decision respects configurable payload timeout for shell commands."""
+    db_file = tmp_path / "forge_test.db"
+    init_forge_db(db_file)
+
+    # 1. Command times out when payload specifies a short timeout
+    d_timeout = stage_decision(
+        category="shell",
+        title="Slow Shell Job",
+        summary="Command that exceeds configured timeout.",
+        handler_type="shell",
+        payload={
+            "command": f"{sys.executable} -c 'import time; time.sleep(5)'",
+            "timeout": 1,
+        },
+        db_path=db_file,
+    )
+
+    t0 = time.time()
+    res_timeout = execute_decision(d_timeout["decision_id"], user_id=OWNER_USER_ID, db_path=db_file)
+    elapsed = time.time() - t0
+
+    assert res_timeout["ok"] is False
+    assert res_timeout["status"] == "failed"
+    assert "timed out" in res_timeout["receipt"].lower()
+    assert elapsed < 4.0  # Finished well before 5s
+
+    # 2. Command succeeds within configured timeout
+    d_fast = stage_decision(
+        category="shell",
+        title="Fast Shell Job",
+        summary="Command that completes within configured timeout.",
+        handler_type="shell",
+        payload={
+            "command": "echo 'fast success'",
+            "timeout": 30,
+        },
+        db_path=db_file,
+    )
+    res_fast = execute_decision(d_fast["decision_id"], user_id=OWNER_USER_ID, db_path=db_file)
+    assert res_fast["ok"] is True
+    assert res_fast["status"] == "approved"
+    assert "Exit 0" in res_fast["receipt"]
+    assert "fast success" in res_fast["receipt"]

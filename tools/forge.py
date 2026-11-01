@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import asyncio
 import fcntl
 import glob
 import json
@@ -5971,6 +5972,13 @@ def render_decision_card_embed(decision: sqlite3.Row | dict) -> dict:
             "color": 0xF59E0B,
             "footer": {"text": f"{cat} · Expires {exp_str}"},
         }
+    if status == "executing":
+        return {
+            "title": f"⏳ {title}",
+            "description": summary,
+            "color": 0x3B82F6,
+            "footer": {"text": f"{cat} · Executing..."},
+        }
     if status in ("approved", "edited_approved"):
         label = "Approved & Executed (Edited)" if status == "edited_approved" else "Approved & Executed"
         resolved_ts = decision.get("resolved_at") if isinstance(decision, dict) else decision["resolved_at"]
@@ -6042,6 +6050,8 @@ def format_decision_card_text(decision: sqlite3.Row | dict) -> str:
         exp = decision.get("expires_at") if isinstance(decision, dict) else decision["expires_at"]
         exp_str = _now_pt_str(exp) if exp else "in 2 hours"
         return f"🛡️ **{title}** [{cat} · Expires {exp_str}]\n{summary}"
+    if status == "executing":
+        return f"⏳ **{title}** [{cat} · Executing...]\n{summary}"
     if status in ("approved", "edited_approved"):
         label = "Approved & Executed (Edited)" if status == "edited_approved" else "Approved & Executed"
         resolved_ts = decision.get("resolved_at") if isinstance(decision, dict) else decision["resolved_at"]
@@ -6124,6 +6134,13 @@ def execute_decision(
             )
             return {"ok": False, "error": f"Decision {decision_id} has expired."}
 
+        cur = conn.execute(
+            "UPDATE forge_decisions SET status = 'executing' WHERE id = ? AND status = 'pending'",
+            (decision_id,),
+        )
+        if cur.rowcount == 0:
+            return {"ok": False, "error": f"Decision {decision_id} is already executing."}
+
         payload = override_payload if override_payload is not None else json.loads(row["payload_json"] or "{}")
         if override_payload is not None:
             conn.execute(
@@ -6139,7 +6156,8 @@ def execute_decision(
         if handler == "shell":
             cmd = payload.get("command", "")
             cwd = payload.get("cwd", "/workspace")
-            proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60)
+            timeout_sec = int(payload.get("timeout", 180) or 180)
+            proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout_sec)
             ok = proc.returncode == 0
             out = (proc.stdout or proc.stderr or "").strip()
             receipt = f"Exit 0 (`{out[:120]}`)" if ok and out else ("Exit 0" if ok else f"Exit {proc.returncode}: {out[:160]}")
@@ -6326,7 +6344,17 @@ class ForgeDecisionEditModal(discord.ui.Modal):
             await interaction.followup.send(f"⚠️ Invalid JSON in edited payload: `{e}`", ephemeral=True)
             return
 
-        res = execute_decision(
+        if interaction.message:
+            try:
+                view = discord.ui.View.from_message(interaction.message)
+                for item in view.children:
+                    item.disabled = True
+                await interaction.message.edit(view=view)
+            except Exception:
+                pass
+
+        res = await asyncio.to_thread(
+            execute_decision,
             self.decision_id,
             user_id=interaction.user.id,
             override_payload=new_payload,
