@@ -119,3 +119,8 @@ python3 /workspace/tools/forge.py stage-decision \
   --post
 ```
 Supported `--handler` types: `forge_enqueue`, `shell`, `send_mail`, `docker_compose`, `gh_merge`, `bridge_reload`, `file_delete`.
+
+### Mandatory Decision Card Action-Clarity Invariant
+1. **Explicit Approval Action Required:** Every Decision Card (`Approve | Edit | Dismiss`) **MUST** explicitly state in its visible `summary` what concrete action clicking **Approve** will execute (e.g., `**Approve Action:** ...` or *"Approving [executes X]..."*).
+2. **No Fake/Read-Only Approval Cards:** Never stage an approval card for a purely informational reminder or read-only check that has no real side-effect action when approved (or whose payload merely re-runs the reminder script itself).
+3. **Engine Fallback Enforcement (`forge.py`):** `render_decision_card_embed()` and `format_decision_card_text()` deterministically ensure that every pending Decision Card displays a clear `**Approve Action:**` line if the summary does not already explicitly state what `Approve` will execute.
