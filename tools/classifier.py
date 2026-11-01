@@ -123,10 +123,11 @@ Score Guidance:
 - 0.8 - 1.0: Actionable technical questions, broken builds, or blockers where Zero's input is needed.
 
 Optional Lightweight Reaction (for scores < 0.80 ONLY):
-- Most ambient messages need NO reaction. Restrict ` | REACT: <single_emoji>` strictly to: (a) direct closing acknowledgments to Zero when Zero just spoke in [Recent Room Context] (e.g. "sounds good", "thanks", "got it" -> 👍), or (b) standout human humor/roasts and major celebrations (e.g. 😂, 💀, 🔥, 🎉).
+- Most ambient messages need NO reaction. Restrict ` | REACT: <single_emoji>` strictly to: (a) direct closing acknowledgments to Zero when Zero just spoke in [Recent Room Context] (e.g. "sounds good", "thanks", "got it"), or (b) standout human humor/roasts and major celebrations.
+- Dynamic, Context-Specific Emoji Selection: Whenever a reaction is warranted, dynamically pick a clever, interesting emoji tailored to the exact subject matter, domain, or joke in the message (e.g. 🖨️ for 3D printing, ⚾ for baseball, 🦀 for Crab Cavern, 🔌 or 🔋 for hardware/soldering, 💀 for a cursed bug, 🍻 for a toast, 👀 for intrigue) rather than defaulting to repetitive generic markers (🎯, 🚀, 🫡, 🎉, 👍).
 - Never attach a reaction to third-party PR updates, issue lists, status checks, routine chatter, peer-to-peer handoffs, or bot messages.
 
-Output ONLY a single float between 0.0 and 1.0, optionally followed by ` | REACT: <emoji>` (e.g. `0.25`, `0.30 | REACT: 😂`, `0.85`).
+Output ONLY a single float between 0.0 and 1.0, optionally followed by ` | REACT: <emoji>` (e.g. `0.25`, `0.30 | REACT: 💀`, `0.85`).
 
 Message from {author}: "{content}"'''
 
