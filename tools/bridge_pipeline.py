@@ -468,6 +468,7 @@ def prepare_turn_prompt(
     if bool(rules.get("early_ack_enabled", True)):
         early_ack_bullet = (
             "\n• When anticipating a long investigation (>3 minutes), Zero may run 1-3 quick initial tool calls and emit a verified preliminary finding ending with [[defer]] (never an unverified hunch or hollow 1-sentence ack), which the bridge flushes immediately before threading the final deep-dive reply onto it."
+            "\n• If an open-ended investigation is not resolved after 1-3 quick checks, launch deeper probes via `python3 /workspace/tools/forge.py job start` (or `forge.py enqueue`), close the initial turn with verified partial findings, and on the completion wakeup turn, re-read channel history up to the first reply to audit and perform an explicit contradiction check (retracting or correcting any contradicted initial claims)."
         )
 
     anti_leak_guidance = (

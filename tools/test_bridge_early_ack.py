@@ -336,6 +336,28 @@ class TestBridgeEarlyAck(unittest.IsolatedAsyncioTestCase):
             )
             self.assertNotIn("[[defer]]", ext_prompt_disabled)
 
+    def test_prepare_turn_prompt_includes_detached_investigation_and_contradiction_check(self):
+        """Verify prepare_turn_prompt includes forge.py job start handoff and contradiction-check guidance."""
+        with patch("tools.bridge_pipeline.get_runtime_rules", return_value={"early_ack_enabled": True}):
+            home_prompt = prepare_turn_prompt(
+                prompt="Diagnose the redis connection timeout",
+                mode="home",
+                channel_id=123456789,
+                sess_key="test-sess",
+            )
+            self.assertIn("forge.py job start", home_prompt)
+            self.assertIn("contradiction check", home_prompt)
+
+        with patch("tools.bridge_pipeline.get_runtime_rules", return_value={"early_ack_enabled": False}):
+            home_prompt_disabled = prepare_turn_prompt(
+                prompt="Diagnose the redis connection timeout",
+                mode="home",
+                channel_id=123456789,
+                sess_key="test-sess",
+            )
+            self.assertNotIn("forge.py job start", home_prompt_disabled)
+            self.assertNotIn("contradiction check", home_prompt_disabled)
+
 
 if __name__ == "__main__":
     unittest.main()
