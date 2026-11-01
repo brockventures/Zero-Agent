@@ -32,6 +32,8 @@ static uint32_t       s_turn_start_ms     = 0;
 static int32_t        s_stt_ms            = -1;
 static int32_t        s_first_text_ms     = -1;
 static int32_t        s_first_audio_ms    = -1;
+static bool           s_continue_session  = false; // set by setContinueSession(); consumed by interact()
+static char           s_last_session[24]  = "";   // session_id of the most recent interact() turn
 
 static void resetTurnTimings() {
     s_turn_start_ms  = millis();
@@ -49,21 +51,40 @@ static void logTurnTimings() {
     gotchi_log::RingLogger.info("voice", msg);
 }
 
-static uint32_t s_last_abort_poll_ms = 0;
+static GotchiUIState* s_active_ui = nullptr;
+static StateCb        s_active_cb = nullptr;
+static uint32_t       s_last_anim_step_ms = 0;
+static bool           s_in_anim_step = false;
+static uint32_t       s_last_abort_poll_ms = 0;
+static volatile bool  s_sse_can_step_thinking = false;
 
 bool checkAbortFlag() {
     if (s_active_abort_kind != InteractResult::DONE) return true;
     // Only poll hardware buttons, HTTP server, and Serial JSON-RPC on Core 1 (Arduino loop core).
     // Core 0 background audio tasks read only the latched s_active_abort_kind flag.
-    if (xPortGetCoreID() != 1) return false;
-    uint32_t now = millis();
-    if (now - s_last_abort_poll_ms < 25) return false;
-    s_last_abort_poll_ms = now;
-    if (s_active_abort_poll) {
-        InteractResult r = s_active_abort_poll();
-        if (r != InteractResult::DONE) {
-            s_active_abort_kind = r;
-            return true;
+    if (xPortGetCoreID() == 1) {
+        uint32_t now = millis();
+        if (now - s_last_abort_poll_ms >= 25) {
+            s_last_abort_poll_ms = now;
+            if (s_active_abort_poll) {
+                InteractResult r = s_active_abort_poll();
+                if (r != InteractResult::DONE) {
+                    s_active_abort_kind = r;
+                    return true;
+                }
+            }
+        }
+        if (!s_in_anim_step && s_active_ui && s_active_cb) {
+            if (s_active_ui->state == UiState::THINKING || s_active_ui->state == UiState::SPEAKING) {
+                if (s_active_ui->state != UiState::THINKING || s_sse_can_step_thinking) {
+                    if (now - s_last_anim_step_ms >= 550) {
+                        s_in_anim_step = true;
+                        s_active_cb(*s_active_ui);
+                        s_last_anim_step_ms = millis();
+                        s_in_anim_step = false;
+                    }
+                }
+            }
         }
     }
     return false;
@@ -81,6 +102,8 @@ public:
     explicit Reader(WiFiClient& c) : c_(c) {}
 
     void setChunked(bool on) { chunked_ = on; }
+
+    bool hasBufferedBytes() const { return pos_ < len_ || c_.available() > 0; }
 
     // Next body byte, or -1 on EOF / idle timeout / terminating chunk / user abort.
     int next() {
@@ -124,9 +147,11 @@ private:
     bool fill() {
         uint32_t t0 = millis();
         while (true) {
+            s_sse_can_step_thinking = !hasBufferedBytes();
             if (checkAbortFlag()) return false;
             int avail = c_.available();
             if (avail > 0) {
+                s_sse_can_step_thinking = false;
                 size_t want = (size_t)avail < sizeof(s_reader_buf) ? (size_t)avail : sizeof(s_reader_buf);
                 int got = c_.read(s_reader_buf, want);
                 if (got <= 0) return false;
@@ -146,6 +171,8 @@ private:
     size_t pos_ = 0;
     size_t len_ = 0;
 };
+
+using LineReader = Reader;
 
 // Splits "http(s)://host[:port]/path". Supports https:// (443 default for Tailscale-free
 // mobile roaming over Cloudflare Tunnel / reverse proxy) and http:// (80/8765 on LAN).
@@ -275,13 +302,6 @@ bool handleEvent(const char* event, const char* line, const JsonDocument& filter
         ui.last_sample_rate = rate;
         if (!mute_local_speaker) {
             gotchi_audio::appendBase64PcmToTurn(b64, b64_len, rate, is_adpcm);
-            const bool sentence_done = is_sentence && (
-                (strstr(line, "\"sentence_done\":true") != nullptr) ||
-                (strstr(line, "\"sentence_done\": true") != nullptr)
-            );
-            if (sentence_done && gotchi_audio::getTurnPcmSamples() > 0) {
-                gotchi_audio::commitTurnSentenceForPlayback();
-            }
         }
         if (checkAbortFlag()) return true;
         return false;
@@ -304,9 +324,11 @@ bool handleEvent(const char* event, const char* line, const JsonDocument& filter
         text.toUpperCase();
         ui.status_text = text;
         // Defer SPEAKING e-paper refresh until the SSE stream finishes and Wi-Fi closes
-        if (next != ui.state && next != UiState::SPEAKING) {
+        // Allow state events in THINKING to invoke cb(ui) so frames step on server transitions.
+        if ((next != ui.state || next == UiState::THINKING) && next != UiState::SPEAKING) {
             ui.state = next;
             if (cb) cb(ui);
+            s_last_anim_step_ms = millis();
         }
     } else if (strcmp(event, "transcript") == 0) {
         if (s_stt_ms < 0) s_stt_ms = (int32_t)(millis() - s_turn_start_ms);
@@ -321,6 +343,7 @@ bool handleEvent(const char* event, const char* line, const JsonDocument& filter
     } else if (strcmp(event, "reply") == 0) {
         if (s_first_text_ms < 0) s_first_text_ms = (int32_t)(millis() - s_turn_start_ms);
         ui.reply = doc["reply"] | "";
+        ui.expects_reply = doc["expects_reply"] | false;
         if (ui.skin != "zero" && cb) cb(ui);
     } else if (is_sentence || is_legacy) {
         if (!b64 || b64_len < 4) {
@@ -376,14 +399,23 @@ bool streamEvents(Reader& rd, char* buf, GotchiUIState& ui, StateCb cb, bool mut
     filter["format"] = true;
     filter["error"] = true;
     filter["message"] = true;
+    filter["expects_reply"] = true;
 
     char event[24] = "";
     size_t len = 0;
     bool overflow = false;
     while (true) {
-        if (checkAbortFlag()) return true;
+        s_sse_can_step_thinking = !rd.hasBufferedBytes();
+        if (checkAbortFlag()) {
+            s_sse_can_step_thinking = false;
+            return true;
+        }
+        s_sse_can_step_thinking = false;
         int b = rd.next();
-        if (b < 0) return checkAbortFlag();
+        if (b < 0) {
+            s_sse_can_step_thinking = false;
+            return checkAbortFlag();
+        }
         if (b == '\r') continue;
         if (b != '\n') {
             if (len < SSE_BUF_BYTES - 1) buf[len++] = (char)b;
@@ -512,6 +544,7 @@ bool interactOverBle(const gotchi_audio::WavView& wav, const String& url, const 
     filter["message"] = true;
     filter["event"] = true;
     filter["detail"] = true;
+    filter["expects_reply"] = true;
 
     const bool mute_local = (audio_out_mode == "discord_voice" || audio_out_mode == "ble_phone");
     gotchi_audio::setPlaybackAbortCheck(checkAbortFlag);
@@ -578,8 +611,10 @@ bool interactOverBle(const gotchi_audio::WavView& wav, const String& url, const 
             ui.state = UiState::SPEAKING;
             ui.status_text = "SPEAKING";
             if (cb) cb(ui);
+            s_last_anim_step_ms = millis();
         }
         if (!mute_local) {
+            gotchi_audio::commitTurnSentenceForPlayback();
             gotchi_audio::playTurnPcm();
         } else {
             gotchi_audio::clearTurnPcm();
@@ -599,6 +634,10 @@ bool interactOverBle(const gotchi_audio::WavView& wav, const String& url, const 
 
 } // namespace
 
+void setContinueSession(bool on) {
+    s_continue_session = on;
+}
+
 bool interact(const gotchi_audio::WavView& wav, const String& url, const String& node_id,
               GotchiUIState& ui, StateCb cb, const String& bearer_token,
               const ImageAttachment* image, AbortPollFn abort_poll,
@@ -607,6 +646,18 @@ bool interact(const gotchi_audio::WavView& wav, const String& url, const String&
     gotchi_audio::clearTurnPcm();
     s_active_abort_poll = abort_poll;
     s_active_abort_kind = InteractResult::DONE;
+    s_active_ui = &ui;
+    s_active_cb = cb;
+    s_last_anim_step_ms = millis();
+    struct ActiveTurnGuard {
+        ~ActiveTurnGuard() {
+            s_active_ui = nullptr;
+            s_active_cb = nullptr;
+            s_active_abort_poll = nullptr;
+            s_sse_can_step_thinking = false;
+            gotchi_audio::setPlaybackAbortCheck(nullptr);
+        }
+    } turn_guard;
     if (out_result) *out_result = InteractResult::ERROR;
 
     String host, path;
@@ -648,7 +699,15 @@ bool interact(const gotchi_audio::WavView& wav, const String& url, const String&
         : audio_out_mode;
 
     char session[24];
-    snprintf(session, sizeof(session), "gotchi-%lu", (unsigned long)millis());
+    if (s_continue_session && s_last_session[0] != '\0') {
+        strncpy(session, s_last_session, sizeof(session) - 1);
+        session[sizeof(session) - 1] = '\0';
+    } else {
+        snprintf(session, sizeof(session), "gotchi-%lu", (unsigned long)millis());
+    }
+    strncpy(s_last_session, session, sizeof(s_last_session) - 1);
+    s_last_session[sizeof(s_last_session) - 1] = '\0';
+    s_continue_session = false;
 
     String head;
     String pre;
@@ -870,8 +929,10 @@ bool interact(const gotchi_audio::WavView& wav, const String& url, const String&
             ui.state = UiState::SPEAKING;
             ui.status_text = "SPEAKING";
             if (cb) cb(ui);
+            s_last_anim_step_ms = millis();
         }
         if (!mute_local) {
+            gotchi_audio::commitTurnSentenceForPlayback();
             gotchi_audio::playTurnPcm();
         } else {
             gotchi_audio::clearTurnPcm();
@@ -1070,6 +1131,144 @@ bool fetchPendingAnswer(const String& voice_url, const String& node_id,
         ackPendingAnswer(voice_url, node_id, answer_id, bearer_token);
     }
     return ok;
+}
+
+bool ackGotchiNotify(const String& voice_url, const String& node_id,
+                     const String& notify_id, const String& bearer_token) {
+    if (WiFi.status() != WL_CONNECTED || notify_id.length() == 0) return false;
+
+    String host, path;
+    uint16_t port = 80;
+    bool is_tls = false;
+    if (!parseUrl(voice_url, host, port, path, &is_tls)) return false;
+
+    JsonDocument doc;
+    doc["node_id"] = node_id;
+    doc["notify_id"] = notify_id;
+    String body;
+    serializeJson(doc, body);
+
+    String req = "POST /api/gotchi/notify/ack HTTP/1.1\r\n";
+    req += "Host: " + host;
+    if ((!is_tls && port != 80) || (is_tls && port != 443)) req += ":" + String(port);
+    req += "\r\n";
+    req += "Content-Type: application/json\r\n";
+    req += "Content-Length: " + String((unsigned long)body.length()) + "\r\n";
+    req += "X-Gotchi-Node: " + node_id + "\r\n";
+    if (bearer_token.length() > 0) {
+        req += "Authorization: Bearer " + bearer_token + "\r\n";
+    }
+    req += "Connection: close\r\n\r\n";
+    req += body;
+
+    WiFiClient plain_client;
+    WiFiClientSecure tls_client;
+    if (is_tls) tls_client.setCACert(GOTCHI_TLS_ROOT_CA_PEM);
+    WiFiClient& client = is_tls ? static_cast<WiFiClient&>(tls_client) : plain_client;
+    if (!client.connect(host.c_str(), port, CONNECT_TIMEOUT_MS)) {
+        return false;
+    }
+    writeAll(client, (const uint8_t*)req.c_str(), req.length());
+    Reader rd(client);
+    char line[128];
+    rd.readLine(line, sizeof(line));
+    client.stop();
+    return true;
+}
+
+bool pollPendingNotification(const String& voice_url, const String& node_id,
+                             const String& bearer_token, String* out_notify_json) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    String host, path;
+    uint16_t port = 80;
+    bool is_tls = false;
+    if (!parseUrl(voice_url, host, port, path, &is_tls)) return false;
+
+    String req = "GET /api/gotchi/notify?node_id=" + node_id + " HTTP/1.1\r\n";
+    req += "Host: " + host;
+    if ((!is_tls && port != 80) || (is_tls && port != 443)) req += ":" + String(port);
+    req += "\r\n";
+    req += "Accept: application/json\r\n";
+    req += "X-Gotchi-Node: " + node_id + "\r\n";
+    if (bearer_token.length() > 0) {
+        req += "Authorization: Bearer " + bearer_token + "\r\n";
+    }
+    req += "Connection: close\r\n\r\n";
+
+    WiFiClient plain_client;
+    WiFiClientSecure tls_client;
+    if (is_tls) tls_client.setCACert(GOTCHI_TLS_ROOT_CA_PEM);
+    WiFiClient& client = is_tls ? static_cast<WiFiClient&>(tls_client) : plain_client;
+    if (!client.connect(host.c_str(), port, CONNECT_TIMEOUT_MS)) {
+        return false;
+    }
+    if (!writeAll(client, (const uint8_t*)req.c_str(), req.length())) {
+        client.stop();
+        return false;
+    }
+
+    Reader rd(client);
+    char line[256];
+    int n = rd.readLine(line, sizeof(line));
+    if (n < 0) {
+        client.stop();
+        return false;
+    }
+    int status = 0;
+    if (strncmp(line, "HTTP/", 5) == 0) {
+        const char* sp = strchr(line, ' ');
+        if (sp) status = atoi(sp + 1);
+    }
+    if (status != 200) {
+        client.stop();
+        return false;
+    }
+
+    bool chunked = false;
+    while (true) {
+        n = rd.readLine(line, sizeof(line));
+        if (n < 0) {
+            client.stop();
+            return false;
+        }
+        if (n == 0) break;
+        if (strncasecmp(line, "Transfer-Encoding:", 18) == 0 && containsIgnoreCase(line, "chunked")) {
+            chunked = true;
+        }
+    }
+    rd.setChunked(chunked);
+
+    String body = "";
+    int b;
+    while ((b = rd.next()) >= 0) {
+        body += (char)b;
+        if (body.length() >= 8192) break;
+    }
+    client.stop();
+
+    if (body.length() == 0) return false;
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) return false;
+
+    JsonArray notifications = doc["notifications"].as<JsonArray>();
+    if (notifications.isNull() || notifications.size() == 0) {
+        return false;
+    }
+
+    JsonObject first_ntf = notifications[0];
+    String notify_id = first_ntf["notify_id"] | "";
+
+    if (out_notify_json) {
+        serializeJson(first_ntf, *out_notify_json);
+    }
+
+    if (notify_id.length() > 0) {
+        ackGotchiNotify(voice_url, node_id, notify_id, bearer_token);
+    }
+    return true;
 }
 
 } // namespace gotchi_voice

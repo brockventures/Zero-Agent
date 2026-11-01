@@ -45,6 +45,11 @@ bool interact(const gotchi_audio::WavView& wav, const String& url, const String&
               const ImageAttachment* image = nullptr, AbortPollFn abort_poll = nullptr,
               InteractResult* out_result = nullptr, const String& audio_out_mode = "speaker");
 
+// The next interact() reuses the previous turn's session_id instead of minting a new one.
+// Used by the follow-up mic window so a reply and its answer share one gateway session.
+// Consumed (reset) by each interact() call.
+void setContinueSession(bool on);
+
 // Silently uploads a passive All-Day Journal speech segment (`mode="journal"`, F24 / T3.5)
 // over BLE (when bonded to the phone relay with Wi-Fi off) or Wi-Fi HTTP without waking
 // the speaker or refreshing the e-paper display.
@@ -66,5 +71,15 @@ bool fetchPendingAnswer(const String& voice_url, const String& node_id,
                         GotchiUIState& ui, StateCb cb, const String& bearer_token = "",
                         const String& answer_id = "", AbortPollFn abort_poll = nullptr,
                         InteractResult* out_result = nullptr, const String& audio_out_mode = "speaker");
+
+// Polls the gateway for pending async notifications/answers (GET /api/gotchi/notify?node_id=...),
+// and acknowledges receipt via POST /api/gotchi/notify/ack.
+// Returns true if a notification was retrieved and acknowledged, writing the JSON item into out_notify_json.
+bool pollPendingNotification(const String& voice_url, const String& node_id,
+                             const String& bearer_token = "", String* out_notify_json = nullptr);
+
+// Acknowledges receipt of a notification (POST /api/gotchi/notify/ack).
+bool ackGotchiNotify(const String& voice_url, const String& node_id,
+                     const String& notify_id, const String& bearer_token = "");
 
 } // namespace gotchi_voice
