@@ -78,8 +78,8 @@ from backend.llm_config import (
 
 logger = logging.getLogger("gotchi_gateway")
 
-DEFAULT_WATCH_APK_VERSION_CODE = int(os.environ.get("GOTCHI_WATCH_APK_VERSION", "4"))
-DEFAULT_FORWARDER_APK_VERSION_CODE = 3
+DEFAULT_WATCH_APK_VERSION_CODE = int(os.environ.get("GOTCHI_WATCH_APK_VERSION", "5"))
+DEFAULT_FORWARDER_APK_VERSION_CODE = 4
 
 NODE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 

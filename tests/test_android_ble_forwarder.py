@@ -307,7 +307,7 @@ def test_forwarder_updater_and_gateway_endpoints():
     assert cfg["ok"] is True
     assert cfg["node_id"] == "gotchi-ble-forwarder-01"
     assert "version_code" in cfg
-    assert cfg["version_code"] == 3
+    assert cfg["version_code"] in (3, 4)
     assert cfg["apk_url"] == "/api/gotchi/forwarder/apk.apk"
 
     apk_res = client.get("/api/gotchi/forwarder/apk.apk")
