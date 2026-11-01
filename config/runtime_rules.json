@@ -56,6 +56,8 @@
     "ambient_relevance_threshold": 0.6,
     "auto_thread_escalation_enabled": false,
     "auto_thread_escalation_seconds": 180,
+    "early_ack_enabled": true,
+    "early_ack_seconds": 180.0,
     "ratified_peer_checklist": [
         "Don't wake someone for nothing.",
         "Ship the thing, don't narrate getting there.",

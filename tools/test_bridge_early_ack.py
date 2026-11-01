@@ -14,9 +14,10 @@ Verifies:
    early_ack_seconds with >= 4 tool calls.
 """
 
+import json
 import time
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pathlib import Path
 import sys
@@ -27,7 +28,7 @@ if "/workspace" not in sys.path:
     sys.path.append("/workspace")
 
 from tools.bridge_engine import TurnCoordinator
-from tools.bridge_pipeline import TurnTimer
+from tools.bridge_pipeline import TurnTimer, prepare_turn_prompt
 from tools.bridge_stream import AgyStreamParser
 
 
@@ -278,6 +279,62 @@ class TestBridgeEarlyAck(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.coordinator.delivery_target, self.mock_sent_msg)
         self.reply_target.reply.assert_called_once()
         self.assertIn("Still investigating", self.reply_target.reply.call_args[0][0])
+
+    def test_runtime_rules_early_ack_defaults(self):
+        """Verify runtime_rules.json includes early_ack_enabled=True and early_ack_seconds=180.0."""
+        rules_path = Path(worktree_root) / "config" / "runtime_rules.json"
+        self.assertTrue(rules_path.exists())
+        with open(rules_path, "r", encoding="utf-8") as f:
+            rules = json.load(f)
+        self.assertIn("early_ack_enabled", rules)
+        self.assertIn("early_ack_seconds", rules)
+        self.assertIs(rules["early_ack_enabled"], True)
+        self.assertEqual(rules["early_ack_seconds"], 180.0)
+
+    def test_prepare_turn_prompt_includes_defer_guidance_when_enabled(self):
+        """Verify prepare_turn_prompt includes [[defer]] guidance when early_ack_enabled is True."""
+        with patch("tools.bridge_pipeline.get_runtime_rules", return_value={"early_ack_enabled": True}):
+            home_prompt = prepare_turn_prompt(
+                prompt="Diagnose the redis connection timeout",
+                mode="home",
+                channel_id=123456789,
+                sess_key="test-sess",
+            )
+            self.assertIn("[[defer]]", home_prompt)
+            self.assertIn(">3 minutes", home_prompt)
+            self.assertIn("1-3 quick initial tool calls", home_prompt)
+
+    def test_prepare_turn_prompt_omits_defer_guidance_when_disabled(self):
+        """Verify prepare_turn_prompt omits [[defer]] guidance when early_ack_enabled is False."""
+        with patch("tools.bridge_pipeline.get_runtime_rules", return_value={"early_ack_enabled": False}):
+            home_prompt = prepare_turn_prompt(
+                prompt="Diagnose the redis connection timeout",
+                mode="home",
+                channel_id=123456789,
+                sess_key="test-sess",
+            )
+            self.assertNotIn("[[defer]]", home_prompt)
+            self.assertNotIn(">3 minutes", home_prompt)
+
+    def test_prepare_turn_prompt_external_mode_toggling(self):
+        """Verify prepare_turn_prompt toggles [[defer]] guidance in external mode."""
+        with patch("tools.bridge_pipeline.get_runtime_rules", return_value={"early_ack_enabled": True}):
+            ext_prompt_enabled = prepare_turn_prompt(
+                prompt="Review PR #456",
+                mode="external",
+                channel_id=987654321,
+                sess_key="ext-sess",
+            )
+            self.assertIn("[[defer]]", ext_prompt_enabled)
+
+        with patch("tools.bridge_pipeline.get_runtime_rules", return_value={"early_ack_enabled": False}):
+            ext_prompt_disabled = prepare_turn_prompt(
+                prompt="Review PR #456",
+                mode="external",
+                channel_id=987654321,
+                sess_key="ext-sess",
+            )
+            self.assertNotIn("[[defer]]", ext_prompt_disabled)
 
 
 if __name__ == "__main__":

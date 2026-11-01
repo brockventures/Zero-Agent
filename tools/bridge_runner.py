@@ -13,30 +13,14 @@ import select
 import signal
 import sys
 import time
-from datetime import datetime, timezone
-from pathlib import Path
 import discord
 
 from tools.bridge_formatting import (
-    format_command_preview,
-    format_for_discord,
     extract_agent_response,
-    chunk_text,
-    scrub_credentials,
-    clean_discord_latex,
-    generate_concise_thread_title,
-    synthesize_thread_title,
-    parse_thread_title_tag,
     is_internal_cli_leak,
-    strip_internal_cli_chatter,
-    parse_agy_error,
-    format_agy_error_message,
 )
 from tools.bridge_state import (
-    DATA_DIR,
-    IN_FLIGHT_FILE,
     TARGET_CHANNEL_ID,
-    PT_TZ,
     get_runtime_rules,
     get_channel_session_id,
     set_channel_session_id,
@@ -47,15 +31,7 @@ from tools.bridge_state import (
     get_active_model,
     update_beacon,
     sync_credentials,
-    get_gif_turn_count,
-    increment_gif_turn,
-    reset_gif_turn,
-    has_reaction_gif,
-    get_gif_prompt_guidance,
-    is_thread_retitled,
-    mark_thread_retitled,
     record_in_flight,
-    clear_in_flight,
     PersistentSessionKeySet,
     get_reset_session_keys,
 )
@@ -71,26 +47,21 @@ from tools.bridge_engine import (
     TurnCoordinator,
     channel_active_procs,
     channel_active_prompts,
-    channel_active_presence,
     steering_channels,
-    GENERAL_ACTIVITY_VERBS,
-    CHANNEL_ACTIVITY_VERBS,
     resolve_channel_label,
-    pick_activity_verb,
-    format_active_presence_text,
     register_active_presence,
-    unregister_active_presence,
 )
 reset_session_keys = PersistentSessionKeySet(get_reset_session_keys())    # session keys (persisted to disk) to reset on next turn
 thread_active_tasks = {}     # thread_id -> asyncio.Task
 
 
 from tools.bridge_pipeline import (
-    find_new_artifacts,
+    find_new_artifacts as find_new_artifacts,
     prepare_turn_prompt,
     deliver_turn_output,
     TurnTimer,
 )
+from tools.bridge_stream import AgyStreamParser
 
 
 def kill_process_tree(proc, sig=signal.SIGTERM):
@@ -111,7 +82,6 @@ def kill_process_tree(proc, sig=signal.SIGTERM):
 
 
 
-from tools.bridge_stream import harvest_transcript_response
 
 
 async def execute_agy_turn(
@@ -290,9 +260,7 @@ async def execute_agy_turn(
 
         output_chunks = []
         auth_detected = False
-        last_status_edit = time.time()
         turn_start_time = time.time()
-        current_action = "Processing..."
 
         # Record in-flight turn for restart recovery
         if mode == "home":
@@ -352,14 +320,15 @@ async def execute_agy_turn(
                 notify_root_channel=notify_root_channel,
                 thread_jump_url=thread_jump_url,
             )
+            stream_parser = AgyStreamParser(conv_id=conv_id)
             step_idle_timeout = float(rules.get("turn_step_idle_seconds", 150.0))
             turn_timeout_seconds = float(rules.get("turn_watchdog_seconds", 300.0))
             agent_done_window = float(rules.get("agent_done_cutoff_seconds", 15.0))
             max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 0.0))
+            early_ack_enabled = bool(rules.get("early_ack_enabled", True))
+            early_ack_seconds = float(rules.get("early_ack_seconds", 180.0))
             timed_out = False
             is_hard_ceiling = False
-            wedged_diagnostic = None
-            last_agy_error = None
             init_received = False
             line_buffer = ""
 
@@ -383,7 +352,6 @@ async def execute_agy_turn(
 
                 # Early wedge detection: If process tree has been completely silent for >= 45s, probe kernel wait states
                 if coord.probe_process_wedge(proc.pid, output_snippet="".join(output_chunks[-5:])):
-                    wedged_diagnostic = coord.wedged_diagnostic
                     timed_out = True
                     kill_process_tree(proc, signal.SIGTERM)
                     try:
@@ -428,6 +396,14 @@ async def execute_agy_turn(
                     thread_jump_url = coord.thread_jump_url
                     active_proc = None
 
+                # Early ack check (e.g. check-in after early_ack_seconds during long tool execution)
+                await coord.maybe_send_early_ack(
+                    stream_parser=stream_parser,
+                    timer=timer,
+                    early_ack_enabled=early_ack_enabled,
+                    early_ack_seconds=early_ack_seconds,
+                )
+
                 if master_fd in r:
                     try:
                         data = os.read(master_fd, 8192)
@@ -435,21 +411,25 @@ async def execute_agy_turn(
                             break
                         text = data.decode("utf-8", errors="replace")
                         output_chunks.append(text)
-                        last_activity_time = time.time()
                         line_buffer += text
 
                         # Touch liveness beacon so long active turns never trip false wedge alerts
-                        if mode == "home":
-                            now_touch = time.time()
                         coord.touch_activity()
                         coord.maybe_touch_beacon()
 
                         # Extract current progress/action from stream-json or raw text using robust line buffering
                         while "\n" in line_buffer:
                             line, line_buffer = line_buffer.split("\n", 1)
-                            ev = coord.handle_line(line, timer=timer)
+                            ev = coord.handle_line(line, stream_parser=stream_parser, timer=timer)
                             if ev and (ev.get("event") == "init" or ev.get("type") == "init"):
                                 init_received = True
+
+                        await coord.maybe_send_early_ack(
+                            stream_parser=stream_parser,
+                            timer=timer,
+                            early_ack_enabled=early_ack_enabled,
+                            early_ack_seconds=early_ack_seconds,
+                        )
 
                         # Throttle progress updates to Discord (every 1.5s)
                         ticker_enabled = rules.get("live_status_ticker_enabled", False)
@@ -666,7 +646,7 @@ async def execute_agy_turn(
                 channel_id=channel_id,
                 mode=mode,
                 status_msg=coord.status_msg,
-                reply_target=reply_target,
+                reply_target=coord.early_ack_msg or reply_target,
                 reinvoke_coro_fn=execute_agy_turn,
                 timeout_seconds=settle_timeout,
                 current_text=final_text,
@@ -701,7 +681,7 @@ async def execute_agy_turn(
     await deliver_turn_output(
         output_text=final_text,
         status_msg=coord.status_msg,
-        reply_target=reply_target,
+        reply_target=coord.early_ack_msg or reply_target,
         mode=mode,
         channel_id=channel_id,
         conv_id=active_cid,

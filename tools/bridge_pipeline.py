@@ -463,10 +463,18 @@ def prepare_turn_prompt(
     now_pt = now_utc.astimezone(PT_TZ)
     gif_guidance = get_gif_prompt_guidance(sess_key, channel_id=channel_id)
 
+    rules = get_runtime_rules()
+    early_ack_bullet = ""
+    if bool(rules.get("early_ack_enabled", True)):
+        early_ack_bullet = (
+            "\n• When anticipating a long investigation (>3 minutes), Zero may run 1-3 quick initial tool calls and emit a verified preliminary finding ending with [[defer]] (never an unverified hunch or hollow 1-sentence ack), which the bridge flushes immediately before threading the final deep-dive reply onto it."
+        )
+
     anti_leak_guidance = (
         "[Bridge Execution Invariant - Strictly Zero Internal Chatter Leaks]:\n"
         "• Never choose SDK Option B or emit intermediate wait/status chatter; stop calling tools silently while waiting for background tasks, and reserve '[NO_REPLY]' strictly for unaddressed ambient chatter (never when tagged).\n"
         "• Never emit internal chain-of-thought, prompt rule citations, or draft rehearsals into visible response text; output ONLY the final user-facing message."
+        f"{early_ack_bullet}"
     )
 
     reply_ctx = extract_reply_context(reply_target, channel_id=channel_id)
