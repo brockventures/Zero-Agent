@@ -510,8 +510,8 @@ def _resolve_plex_token(state: dict[str, Any]) -> str:
     # Dynamically query Plex Preferences.xml on Host 1 via SSH
     rc, out, _ = nas_config.run_ssh(
         nas_config.HOST_1_IP,
-        f"sudo grep -o 'PlexOnlineToken=\"[^\"]*\"' '{DOCKER_ROOT.rsplit('/', 1)[0]}/Plex/Library/Application Support/Plex Media Server/Preferences.xml' 2>/dev/null || "
-        f"sudo find {DOCKER_ROOT.rsplit('/', 1)[0]} -maxdepth 4 -name 'Preferences.xml' -exec grep -o 'PlexOnlineToken=\"[^\"]*\"' {{}} + 2>/dev/null | head -n 1",
+        f"sudo grep -o 'PlexOnlineToken=\"[^\"]*\"' '{nas_config.DOCKER_ROOT.rsplit('/', 1)[0]}/Plex/Library/Application Support/Plex Media Server/Preferences.xml' 2>/dev/null || "
+        f"sudo find {nas_config.DOCKER_ROOT.rsplit('/', 1)[0]} -maxdepth 4 -name 'Preferences.xml' -exec grep -o 'PlexOnlineToken=\"[^\"]*\"' {{}} + 2>/dev/null | head -n 1",
         timeout=20,
     )
     m = re.search(r'PlexOnlineToken="([^"]+)"', out or "")
@@ -1047,7 +1047,7 @@ def run_plex_audiobook_enricher(force: bool = False, quiet: bool = False) -> tup
     # 1. Ensure all audiobook files on Host 1 have world-readable permissions (fixes 0600 files skipped by Plex)
     nas_config.run_ssh(
         nas_config.HOST_1_IP,
-        f"sudo chmod -R a+rX {DOCKER_ROOT.rsplit('/', 1)[0]}/data/media/audiobooks 2>/dev/null || true",
+        f"sudo chmod -R a+rX {nas_config.DOCKER_ROOT.rsplit('/', 1)[0]}/data/media/audiobooks 2>/dev/null || true",
         timeout=20,
     )
 
@@ -1285,7 +1285,6 @@ def run_plex_audiobook_enricher(force: bool = False, quiet: bool = False) -> tup
     )
     if newly_enriched:
         summary += "\nNewly Enriched: " + ", ".join(newly_enriched)
-    return True, summary
     return True, summary
 
 
