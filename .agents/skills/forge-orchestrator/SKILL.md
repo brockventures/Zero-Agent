@@ -120,7 +120,8 @@ python3 /workspace/tools/forge.py stage-decision \
 ```
 Supported `--handler` types: `forge_enqueue`, `shell`, `send_mail`, `docker_compose`, `gh_merge`, `bridge_reload`, `file_delete`.
 
-### Mandatory Decision Card Action-Clarity Invariant
+### Mandatory Decision Card Action-Clarity & Atomic Scope Invariants
 1. **Explicit Approval Action Required:** Every Decision Card (`Approve | Edit | Dismiss`) **MUST** explicitly state in its visible `summary` what concrete action clicking **Approve** will execute (e.g., `**Approve Action:** ...` or *"Approving [executes X]..."*).
-2. **No Fake/Read-Only Approval Cards:** Never stage an approval card for a purely informational reminder or read-only check that has no real side-effect action when approved (or whose payload merely re-runs the reminder script itself).
-3. **Engine Fallback Enforcement (`forge.py`):** `render_decision_card_embed()` and `format_decision_card_text()` deterministically ensure that every pending Decision Card displays a clear `**Approve Action:**` line if the summary does not already explicitly state what `Approve` will execute.
+2. **No Fake/Read-Only or `echo` Approval Cards:** Never stage an approval card for a purely informational reminder or read-only check that has no real side-effect action when approved (or whose payload merely runs `echo '...'` or re-runs the reminder script itself).
+3. **One Decision Per Card (Atomic Scope):** Never bundle multiple independent choices (e.g., multiple separate contacts in Social Last Seen Review, multiple distinct inbox threads, or multiple unrelated calendar/budget items) into a single all-or-nothing Decision Card. Stage **one Decision Card per independent decision** so each item can be approved or dismissed individually.
+4. **Engine Enforcement (`forge.py`):** `stage_decision()`, `render_decision_card_embed()`, and `format_decision_card_text()` deterministically reject no-op `echo` shell payloads and ensure every pending Decision Card displays a clear `**Approve Action:**` line.
