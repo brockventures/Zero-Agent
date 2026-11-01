@@ -1525,6 +1525,47 @@ def _is_new_symbol_in_instructions(sym_name: str, instructions: str) -> bool:
     return False
 
 
+MAX_WHOLE_CLASS_SYMBOL_LINES = 150
+
+
+def _check_oversized_class_symbol(
+    file_path: Path,
+    sym_name: str,
+    max_class_lines: int = MAX_WHOLE_CLASS_SYMBOL_LINES,
+) -> str | None:
+    """Return an error string if `sym_name` targets a whole Python class exceeding `max_class_lines` lines."""
+    p = Path(file_path)
+    if p.suffix != ".py" or not p.exists() or not p.is_file():
+        return None
+    if "." in sym_name:
+        return None
+    if _EXPLICIT_LINE_RANGE_RE.match(sym_name):
+        return None
+    clean_sym = sym_name.split("(")[0].strip()
+    if not clean_sym or _EXPLICIT_LINE_RANGE_RE.match(clean_sym):
+        return None
+
+    try:
+        src = p.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(src)
+    except Exception:
+        return None
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == clean_sym:
+            start_lineno = getattr(node, "lineno", 1) or 1
+            end_lineno = getattr(node, "end_lineno", start_lineno) or start_lineno
+            span = end_lineno - start_lineno + 1
+            if span > max_class_lines:
+                return (
+                    f"target symbol '{sym_name}' in '{p.name}' is an oversized whole-class target "
+                    f"({span} lines > {max_class_lines} max). Whole-class targeting on large classes "
+                    f"causes worker timeouts; pin a specific method (e.g. '{clean_sym}.method_name') or "
+                    f"an explicit line range (e.g. '{clean_sym}:{start_lineno}-{end_lineno}')."
+                )
+    return None
+
+
 def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
     """Validate a ForgePlan with zero chat context against existing repository symbols and chunk dependencies."""
     if not isinstance(plan, dict):
@@ -1584,6 +1625,10 @@ def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
                     findings.append(
                         f"Chunk {idx} target symbol '{sym_str}' not found in '{rel_file}' and not marked as a new symbol in instructions."
                     )
+            else:
+                oversized_err = _check_oversized_class_symbol(target_path, sym_name)
+                if oversized_err:
+                    findings.append(f"Chunk {idx} {oversized_err}")
 
     # 2. Dependency validation (out-of-range, non-integer, self/circular dependencies)
     dep_graph: dict[int, list[int]] = {i: [] for i in range(n_chunks)}
@@ -2552,7 +2597,7 @@ def prune_completed_build_widgets(
 
 
 def _is_explicit_approval_prompt(prompt_text: str) -> bool:
-    """Return True if prompt_text matches an explicit approval/enqueue directive."""
+    """Return True if prompt_text matches an explicit approval/enqueue directive or build failure envelope."""
     if not prompt_text:
         return False
     pt = prompt_text.strip().lower()
@@ -2561,6 +2606,7 @@ def _is_explicit_approval_prompt(prompt_text: str) -> bool:
         "queue build",
         "queue this",
         "queue plan",
+        "queue retry",
         "approve",
         "approved",
         "ship it",
@@ -2569,6 +2615,9 @@ def _is_explicit_approval_prompt(prompt_text: str) -> bool:
         "go ahead",
         "proceed",
         "lgtm",
+        "retry",
+        "re-try",
+        "[forge build failure envelope",
     )
     return any(d in pt for d in directives)
 
@@ -2577,6 +2626,7 @@ def evaluate_plan_approval_gate(
     plan: dict,
     batch_state_path: Path | str = "/tmp/batch_guard_state.json",
     in_flight_path: Path | str = DATA_DIR / "in_flight_turn.json",
+    db_path: Path | str = FORGE_DB_PATH,
 ) -> tuple[bool, list[str]]:
     """Evaluate whether a ForgePlan requires an interactive Approve | Edit | Dismiss Decision Card before execution.
 
@@ -2584,37 +2634,75 @@ def evaluate_plan_approval_gate(
     - Auto-Execute Immediately (Fast Tier 2): 1 chunk, <=3 target files, touches_core_bridge=False, no >90s calibration pass.
     - Explicit Bypass:
       1. plan['approved'] is True or plan['skip_approval'] is True.
-      2. Active in-flight turn prompt matches an explicit approval/enqueue directive (e.g. 'queue fix', 'approve', 'ship it', 'do it', 'fix it').
+      2. Plan is a retry: plan['is_retry'] is True or bool(str(plan.get('retry_of_build_id') or '').strip()).
+      3. Active in-flight turn prompt contains '[FORGE BUILD FAILURE ENVELOPE' or matches an explicit approval directive.
+      4. Recent failed build in forge_builds for the same origin_channel_id and repo updated within 7200s.
     - Require Approval (Stage Decision Card):
-      1. Multi-chunk pipeline (>=2 chunks or tier >= 3).
-      2. Wide blast radius (>=4 distinct target files across chunks) or touches_core_bridge=True.
-      3. Explicit requires_approval=True or enqueued after a >90s calibration/analysis pass in the current turn.
+      1. Explicit requires_approval=True (overrides retry bypass).
+      2. Multi-chunk pipeline (>=2 chunks or tier >= 3).
+      3. Wide blast radius (>=4 distinct target files across chunks) or touches_core_bridge=True.
+      4. Enqueued after a >90s calibration/analysis pass in the current turn.
     """
     if plan.get("approved") is True or plan.get("skip_approval") is True:
         return False, []
 
-    # Check for explicit approval directive in active in_flight_turn.json
-    try:
-        ifp = Path(in_flight_path)
-        if ifp.exists():
-            st_raw = ifp.read_text(encoding="utf-8")
-            if_data = json.loads(st_raw) if st_raw.strip() else {}
-            if isinstance(if_data, dict):
-                prompts_to_check: list[str] = []
-                target_cid = str(plan.get("origin_thread_id") or plan.get("origin_channel_id") or "")
-                if target_cid and isinstance(if_data.get(target_cid), dict):
-                    prompts_to_check.append(str(if_data[target_cid].get("prompt") or ""))
-                if if_data.get("prompt"):
-                    prompts_to_check.append(str(if_data["prompt"]))
-                for k, v in if_data.items():
-                    if isinstance(v, dict) and v.get("prompt"):
-                        prompts_to_check.append(str(v["prompt"]))
+    # Check for retry auto-start and explicit approval bypasses (unless plan explicitly requires approval)
+    if not plan.get("requires_approval"):
+        # 1. Direct retry flags in plan
+        if plan.get("is_retry") is True or bool(str(plan.get("retry_of_build_id") or "").strip()):
+            return False, []
 
-                for p in prompts_to_check:
-                    if _is_explicit_approval_prompt(p):
-                        return False, []
-    except Exception:
-        pass
+        # 2. Check for failure envelope or approval directives in in_flight_turn.json
+        try:
+            ifp = Path(in_flight_path)
+            if ifp.exists():
+                st_raw = ifp.read_text(encoding="utf-8")
+                if_data = json.loads(st_raw) if st_raw.strip() else {}
+                if isinstance(if_data, dict):
+                    prompts_to_check: list[str] = []
+                    target_cid = str(plan.get("origin_thread_id") or plan.get("origin_channel_id") or "")
+                    if target_cid and isinstance(if_data.get(target_cid), dict):
+                        prompts_to_check.append(str(if_data[target_cid].get("prompt") or ""))
+                    if if_data.get("prompt"):
+                        prompts_to_check.append(str(if_data["prompt"]))
+                    for k, v in if_data.items():
+                        if isinstance(v, dict) and v.get("prompt"):
+                            prompts_to_check.append(str(v["prompt"]))
+
+                    for p in prompts_to_check:
+                        p_lower = p.lower()
+                        if "[forge build failure envelope" in p_lower:
+                            return False, []
+                        if _is_explicit_approval_prompt(p):
+                            return False, []
+        except Exception:
+            pass
+
+        # 3. Check for recent failed build in forge_builds for same origin_channel_id and repo within 7200s
+        origin_cid = plan.get("origin_channel_id")
+        repo_str = str(plan.get("repo") or "/workspace").strip()
+        if origin_cid and db_path:
+            try:
+                db_p = Path(db_path)
+                if db_p.exists():
+                    with get_db_connection(db_path) as conn:
+                        cutoff_ts = time.time() - 7200.0
+                        cid_val = int(origin_cid) if str(origin_cid).isdigit() else origin_cid
+                        row = conn.execute(
+                            """
+                            SELECT 1 FROM forge_builds
+                            WHERE origin_channel_id = ?
+                              AND repo = ?
+                              AND status = 'failed'
+                              AND updated_at >= ?
+                            LIMIT 1
+                            """,
+                            (cid_val, repo_str, cutoff_ts),
+                        ).fetchone()
+                        if row:
+                            return False, []
+            except Exception:
+                pass
 
     reasons: list[str] = []
     if plan.get("requires_approval") is True:
@@ -2755,6 +2843,7 @@ def enqueue_build(
             plan,
             batch_state_path=batch_state_path,
             in_flight_path=in_flight_path,
+            db_path=db_path,
         )
         if needs_approval:
             return stage_plan_approval_decision(
@@ -3609,8 +3698,12 @@ def format_origin_failure_envelope(build_id: str, db_path: Path | str = FORGE_DB
             lines.append(f"\n### Final Verification Error Traceback:\n```text\n{failed_chunk['last_error'][-1200:]}\n```")
 
     lines.append(
-        "\nInspect the failure traceback above, diagnose why the chunk failed Maker-Checker verification, "
-        "and either enqueue a corrected `ForgePlan` or report the concrete blocker concisely to Ryan in this channel."
+        "\n### Orchestrator Self-Healing & Silent Retry Protocol:\n"
+        "1. Inspect the failure traceback above and diagnose why the chunk failed Maker-Checker verification.\n"
+        f"2. When re-queueing a corrected `ForgePlan`, set `\"is_retry\": true` and `\"retry_of_build_id\": \"{build['id']}\"` in the plan dictionary so it auto-starts without requiring an interactive approval card.\n"
+        "3. **SILENT RETRY INVARIANT:** You MUST emit strictly `[NO_REPLY]` when re-queueing a self-healing retry. "
+        "Do NOT post intermediate failure chatter, worker timeout commentary, or retry announcements to this channel. "
+        "Emit conversational messages ONLY if an unresolvable external blocker requires human input."
     )
     return "\n".join(lines)
 
