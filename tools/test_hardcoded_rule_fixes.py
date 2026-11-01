@@ -8,8 +8,13 @@ from unittest.mock import patch, MagicMock
 
 import sys
 from pathlib import Path
+
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if REPO_ROOT in sys.path:
+    sys.path.remove(REPO_ROOT)
+sys.path.insert(0, REPO_ROOT)
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
 
 PT = ZoneInfo("America/Los_Angeles")
 
@@ -69,6 +74,25 @@ class TestHardcodedRuleFixes(unittest.TestCase):
             self.assertEqual(score_followup, 0.92)
             called_cmd = mock_run.call_args[0][0]
             self.assertTrue(any("[Recent Room Context]" in arg for arg in called_cmd))
+
+        # Explicit peer targeting drops at pre-filter without model call
+        with patch("subprocess.run") as mock_run:
+            score_aerial_tag = score_relevance(
+                "<@1542035925603713086> can you take this up?",
+                author="Arcane",
+            )
+            self.assertEqual(score_aerial_tag, 0.0)
+            mock_run.assert_not_called()
+
+            score_aerial_vocative = score_relevance(
+                "Hey Aerial, what is next on our list?",
+                author="Arcane",
+            )
+            self.assertEqual(score_aerial_vocative, 0.0)
+            mock_run.assert_not_called()
+
+        from tools.classifier import WarmClassifierDaemon
+        self.assertEqual(WarmClassifierDaemon().max_turns, 8)
 
     def test_thread_titling_rate_limit_collision_removed(self):
         """Verify rate limit and 429 prompts do not get misattributed to Arr Media Indexer."""

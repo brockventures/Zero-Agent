@@ -123,8 +123,8 @@ Score Guidance:
 - 0.8 - 1.0: Actionable technical questions, broken builds, or blockers where Zero's input is needed.
 
 Optional Lightweight Reaction (for scores < 0.80 ONLY):
-- Most ambient messages need NO reaction. However, if the message is a genuinely funny joke/roast, a shipped milestone/win, or a warm acknowledgment where a single native Discord emoji reaction from Zero would be natural (e.g. 😂, 💀, 🔥, 🎉, 👍, 👀, 🍻), you may append ` | REACT: <single_emoji>` after the float.
-- Never attach a reaction to routine chatter or peer-to-peer handoffs.
+- Most ambient messages need NO reaction. Restrict ` | REACT: <single_emoji>` strictly to standout human humor/roasts or major celebrations where a single native Discord emoji reaction from Zero is natural (e.g. 😂, 💀, 🔥, 🎉).
+- Never attach a reaction to routine PR updates, issue lists, status checks, routine chatter, peer-to-peer handoffs, or bot messages.
 
 Output ONLY a single float between 0.0 and 1.0, optionally followed by ` | REACT: <emoji>` (e.g. `0.25`, `0.30 | REACT: 😂`, `0.85`).
 
@@ -200,7 +200,7 @@ def _should_use_warm_classifier() -> bool:
 class WarmClassifierDaemon:
     """Persistent warm agy worker for low-latency ambient classification."""
 
-    def __init__(self, work_dir: str = "/tmp/agy-classifier", max_turns: int = 40):
+    def __init__(self, work_dir: str = "/tmp/agy-classifier", max_turns: int = 8):
         self.work_dir = work_dir
         self.max_turns = max_turns
         self.proc: subprocess.Popen | None = None
@@ -492,6 +492,10 @@ def score_relevance(
     text_for_targeting = re.sub(
         r"```(?:handoff)?.*?```", "", content_clean, flags=re.DOTALL
     ).strip()
+
+    if not zero_spoke_recently and is_explicitly_addressed_to_other(text_for_targeting):
+        print("[Classifier] Drop reason=addressed_to_other", file=sys.stderr)
+        return 0.0
 
     # Detect open questions with reply: "optional"
     is_open_optional_question = False
