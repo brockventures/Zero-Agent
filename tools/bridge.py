@@ -46,8 +46,11 @@ try:
 except Exception as e:
     print(f"[Bridge] Warning setting SIGCHLD reaper: {e}")
 
-if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+from pathlib import Path
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+sys.path = [p for p in sys.path if p not in ("/workspace", "/workspace/tools")]
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 # Re-exports for backward compatibility with existing tests and scripts
 from tools.bridge_state import (
@@ -811,7 +814,10 @@ async def on_button_interaction(interaction: discord.Interaction):
         if cid.startswith("choice:"):
             choice_text = cid[7:]
             try:
-                if not interaction.response.is_done():
+                is_done = interaction.response.is_done()
+                if asyncio.iscoroutine(is_done):
+                    is_done = await is_done
+                if not is_done:
                     await interaction.response.defer()
             except Exception:
                 pass
@@ -828,29 +834,70 @@ async def on_button_interaction(interaction: discord.Interaction):
             action_prefix, decision_id = cid.split(":", 1)
             if action_prefix == "forge_edit":
                 try:
-                    from tools.forge import ForgeDecisionEditModal, get_db_connection
-                    with get_db_connection() as conn:
+                    import tools.forge
+                    with tools.forge.get_db_connection(tools.forge.FORGE_DB_PATH) as conn:
                         row = conn.execute("SELECT payload_json FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
                     cur_payload = json.loads(row["payload_json"]) if row and row["payload_json"] else {}
-                    await interaction.response.send_modal(ForgeDecisionEditModal(decision_id, cur_payload))
+                    await interaction.response.send_modal(tools.forge.ForgeDecisionEditModal(decision_id, cur_payload))
                 except Exception as me:
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message(f"⚠️ Could not open edit modal: {me}", ephemeral=True)
+                    try:
+                        is_done = interaction.response.is_done()
+                        if asyncio.iscoroutine(is_done):
+                            is_done = await is_done
+                        if not is_done:
+                            await interaction.response.send_message(f"⚠️ Could not open edit modal: {me}", ephemeral=True)
+                    except Exception:
+                        pass
                 return
 
             try:
-                if not interaction.response.is_done():
+                is_done = interaction.response.is_done()
+                if asyncio.iscoroutine(is_done):
+                    is_done = await is_done
+                if not is_done:
                     await interaction.response.defer()
             except Exception:
                 pass
 
-            from tools.forge import dismiss_decision, execute_decision
-            if action_prefix == "forge_approve":
-                res = await asyncio.to_thread(execute_decision, decision_id, interaction.user.id)
-            else:
-                res = await asyncio.to_thread(dismiss_decision, decision_id, interaction.user.id)
-
             if interaction.message:
+                try:
+                    view = discord.ui.View.from_message(interaction.message)
+                    for item in view.children:
+                        item.disabled = True
+                    if action_prefix == "forge_approve":
+                        import tools.forge
+                        with tools.forge.get_db_connection(tools.forge.FORGE_DB_PATH) as conn:
+                            row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
+                        if row:
+                            row_dict = dict(row)
+                            row_dict["status"] = "executing"
+                            embed_dict = tools.forge.render_decision_card_embed(row_dict)
+                            embed = discord.Embed.from_dict(embed_dict) if embed_dict else None
+                            if getattr(interaction.message, "embeds", None):
+                                await interaction.message.edit(content="", embed=embed, view=view)
+                            elif getattr(interaction.message, "content", None):
+                                card_text = tools.forge.format_decision_card_text(row_dict)
+                                await interaction.message.edit(content=card_text, view=view)
+                            else:
+                                await interaction.message.edit(content="", embed=embed, view=view)
+                        else:
+                            await interaction.message.edit(view=view)
+                    else:
+                        await interaction.message.edit(view=view)
+                except Exception as e:
+                    print(f"[Bridge] Error setting in-progress state for Decision Card {decision_id}: {e}")
+
+            import tools.forge
+            try:
+                if action_prefix == "forge_approve":
+                    res = await asyncio.to_thread(tools.forge.execute_decision, decision_id, interaction.user.id)
+                else:
+                    res = await asyncio.to_thread(tools.forge.dismiss_decision, decision_id, interaction.user.id)
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)}
+
+            is_already_executing = (not res.get("ok")) and ("already executing" in str(res.get("error", "")))
+            if not is_already_executing and interaction.message:
                 try:
                     view = discord.ui.View.from_message(interaction.message)
                     for item in view.children:
