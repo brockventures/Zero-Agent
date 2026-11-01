@@ -5521,6 +5521,71 @@ def _validate_decision_shell_payload(handler_type: str, payload: dict) -> tuple[
     return True, ""
 
 
+def _ensure_decision_action_clarity(
+    summary: str,
+    handler_type: str,
+    payload: Optional[dict] = None,
+) -> str:
+    """Ensure that every pending Decision Card explicitly states an '**Approve Action:**' line.
+
+    If the summary already contains an explicit '**Approve Action:**' line, it is returned as-is.
+    Otherwise, an explicit '**Approve Action:**' line is deterministically derived from the handler and payload.
+    """
+    clean_summary = (summary or "").strip()
+    if re.search(r"\*\*Approve Action:\*\*", clean_summary, re.IGNORECASE):
+        return clean_summary
+
+    handler = (handler_type or "").strip().lower()
+    p = payload if isinstance(payload, dict) else {}
+
+    action_text = ""
+    if handler == "docker_compose":
+        service = p.get("service") or "service"
+        act = p.get("action") or "up -d"
+        action_text = f"Execute `docker compose {act} {service}`"
+    elif handler == "shell":
+        cmd = str(p.get("command") or "").strip()
+        if p.get("action"):
+            action_text = str(p["action"]).strip()
+        elif cmd:
+            action_text = f"Run `{cmd}`"
+        else:
+            action_text = "Execute shell command"
+    elif handler == "send_mail":
+        to_addr = p.get("to") or "recipient"
+        subj = p.get("subject") or ""
+        subj_str = f" (Subject: {subj})" if subj else ""
+        action_text = f"Send email to `{to_addr}`{subj_str}"
+    elif handler == "gh_merge":
+        pr_num = p.get("pr_number") or ""
+        action_text = f"Merge PR #{pr_num}" if pr_num else "Merge pull request"
+    elif handler == "bridge_reload":
+        action_text = "Trigger in-place bridge reload"
+    elif handler == "file_delete":
+        paths = p.get("paths") or p.get("files") or ([p["path"]] if p.get("path") else [])
+        if paths:
+            action_text = f"Delete {', '.join(str(path_item) for path_item in paths[:3])}"
+        elif p.get("command"):
+            action_text = f"Delete via `{p['command']}`"
+        else:
+            action_text = "Delete target files"
+    elif handler == "forge_enqueue":
+        title = p.get("title") or p.get("plan_file") or "build"
+        action_text = f"Enqueue FORGE build `{title}`"
+    elif handler in ("noop", "approval"):
+        action_text = str(p.get("action") or p.get("receipt") or p.get("note") or "Approve requested action")
+    elif p.get("action"):
+        action_text = str(p["action"]).strip()
+    elif handler:
+        action_text = f"Execute {handler_type}"
+    else:
+        action_text = "Confirm requested action"
+
+    if not clean_summary:
+        return f"**Approve Action:** {action_text}"
+    return f"{clean_summary}\n\n**Approve Action:** {action_text}"
+
+
 def _resolve_decision_channel(channel_id: int) -> tuple[int, Optional[int]]:
     """Check if channel_id is a non-home / Crab Cavern channel and resolve destination channel.
 
@@ -5566,6 +5631,7 @@ def stage_decision(
     ok_val, val_err = _validate_decision_shell_payload(handler_type.strip(), payload)
     if not ok_val:
         raise ValueError(val_err)
+    summary = _ensure_decision_action_clarity(summary, handler_type, payload)
     now = time.time()
     slug = re.sub(r"[^a-z0-9]+", "", category.lower())[:8] or "act"
     decision_id = f"dec-{int(now * 1000) % 100000000}-{slug}"
@@ -5625,6 +5691,23 @@ def render_decision_card_embed(decision: sqlite3.Row | dict) -> dict:
     receipt = (decision.get("receipt_text") if isinstance(decision, dict) else decision["receipt_text"]) or ""
 
     if status == "pending":
+        handler = str(
+            (decision.get("handler_type") if isinstance(decision, dict) else decision["handler_type"]) or ""
+        ).strip()
+        payload_raw = decision.get("payload_json") if isinstance(decision, dict) else decision["payload_json"]
+        if isinstance(payload_raw, str):
+            try:
+                payload_dict = json.loads(payload_raw)
+            except Exception:
+                payload_dict = {}
+        elif isinstance(payload_raw, dict):
+            payload_dict = payload_raw
+        elif isinstance(decision, dict) and isinstance(decision.get("payload"), dict):
+            payload_dict = decision["payload"]
+        else:
+            payload_dict = {}
+        summary = _ensure_decision_action_clarity(summary, handler, payload_dict)
+
         exp = decision.get("expires_at") if isinstance(decision, dict) else decision["expires_at"]
         exp_str = _now_pt_str(exp) if exp else "in 2 hours"
         return {
@@ -5684,6 +5767,23 @@ def format_decision_card_text(decision: sqlite3.Row | dict) -> str:
     receipt = (decision.get("receipt_text") if isinstance(decision, dict) else decision["receipt_text"]) or ""
 
     if status == "pending":
+        handler = str(
+            (decision.get("handler_type") if isinstance(decision, dict) else decision["handler_type"]) or ""
+        ).strip()
+        payload_raw = decision.get("payload_json") if isinstance(decision, dict) else decision["payload_json"]
+        if isinstance(payload_raw, str):
+            try:
+                payload_dict = json.loads(payload_raw)
+            except Exception:
+                payload_dict = {}
+        elif isinstance(payload_raw, dict):
+            payload_dict = payload_raw
+        elif isinstance(decision, dict) and isinstance(decision.get("payload"), dict):
+            payload_dict = decision["payload"]
+        else:
+            payload_dict = {}
+        summary = _ensure_decision_action_clarity(summary, handler, payload_dict)
+
         exp = decision.get("expires_at") if isinstance(decision, dict) else decision["expires_at"]
         exp_str = _now_pt_str(exp) if exp else "in 2 hours"
         return f"🛡️ **{title}** [{cat} · Expires {exp_str}]\n{summary}"

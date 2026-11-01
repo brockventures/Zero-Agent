@@ -16,6 +16,7 @@ import csv
 import json
 import os
 import re
+import shlex
 import sys
 import urllib.parse
 import urllib.request
@@ -487,40 +488,59 @@ def format_review_message(updates: list[dict], stage: bool | None = None) -> tup
         try:
             from tools.forge import stage_decision
 
-            summary_names = ", ".join(u.get("name", "") for u in updates[:3])
-            if len(updates) > 3:
-                summary_names += f" and {len(updates) - 3} more"
-            summary_text = (
-                f"Identified {len(updates)} candidate social interaction(s) ({summary_names}) "
-                "from the past week. Approving applies Last Seen dates to contacts master and Google Sheet."
-            )
+            staged_all = True
+            for u in updates:
+                c_name = u["name"]
+                c_proposed = u["proposed_last_seen"]
+                c_current = u.get("current_last_seen", "-")
+                loc_str = f" at {u['location']}" if u.get("location") else ""
+                src_str = f" `[{u.get('source', 'Interaction')}]`" if u.get("source") else ""
+                event_summary = u.get("event_summary", "Interaction")
+                event_date = u.get("event_date", c_proposed)
 
-            res = stage_decision(
-                category="social_review",
-                title="Confirm & Apply Last Seen Updates",
-                summary=summary_text,
-                handler_type="shell",
-                payload={
-                    "command": "python3 /workspace/tools/social_last_seen_review.py --apply",
-                    "cwd": "/workspace",
-                },
-                channel_id=TARGET_CHANNEL_ID,
-                post_to_discord=True,
-            )
-            decision_staged = bool(res.get("ok", True) if isinstance(res, dict) else True)
+                summary_text = (
+                    f"Candidate interaction for **{c_name}**: _{event_summary}_{loc_str} on `{event_date}`{src_str}.\n"
+                    f"Proposed update: `{c_current}` ➔ `{c_proposed}`.\n\n"
+                    f"**Approve Action:** Update {c_name}'s Last Seen date to {c_proposed} in master contacts and Google Sheet."
+                )
+
+                cmd = f"python3 /workspace/tools/social_last_seen_review.py --apply-name {shlex.quote(c_name)}"
+                res = stage_decision(
+                    category="social_review",
+                    title=f"Confirm Last Seen: {c_name}",
+                    summary=summary_text,
+                    handler_type="shell",
+                    payload={
+                        "command": cmd,
+                        "cwd": "/workspace",
+                    },
+                    channel_id=TARGET_CHANNEL_ID,
+                    post_to_discord=True,
+                )
+                ok_stage = bool(res.get("ok", True) if isinstance(res, dict) else True)
+                u["_decision_staged"] = ok_stage
+                if not ok_stage:
+                    staged_all = False
+
+            decision_staged = staged_all and len(updates) > 0
         except Exception as e:
             print(f"[SocialReview] Decision Card staging fallback: {e}", file=sys.stderr)
+            decision_staged = False
+            for u in updates:
+                u["_decision_staged"] = False
 
     LAST_DECISION_STAGED = decision_staged
-    for u in updates:
-        u["_decision_staged"] = decision_staged
+    if not _should_stage(stage):
+        for u in updates:
+            u["_decision_staged"] = False
 
     if not decision_staged:
         lines.append("\n[CHOICES: Confirm & Apply Last Seen Updates | Ignore Last Seen Updates]")
 
     return True, "\n".join(lines)
 
-def apply_pending_updates() -> tuple[bool, str]:
+
+def apply_pending_updates(target_name: str | None = None) -> tuple[bool, str]:
     if not PENDING_FILE.exists():
         return False, "No pending Last Seen updates found."
     with open(PENDING_FILE, "r", encoding="utf-8") as f:
@@ -528,13 +548,29 @@ def apply_pending_updates() -> tuple[bool, str]:
     if not pending:
         return False, "Pending updates file is empty."
 
+    if target_name:
+        norm_target = target_name.strip().lower()
+        matched_entry = None
+        remaining_pending = []
+        for item in pending:
+            if item.get("name", "").strip().lower() == norm_target and matched_entry is None:
+                matched_entry = item
+            else:
+                remaining_pending.append(item)
+        if not matched_entry:
+            return False, f"No pending Last Seen update found for '{target_name}'."
+        pending_to_apply = [matched_entry]
+    else:
+        pending_to_apply = pending
+        remaining_pending = []
+
     # 1. Update CSV
     with open(CSV_PATH, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames
         rows = list(reader)
 
-    update_map = {item["name"]: item["proposed_last_seen"] for item in pending}
+    update_map = {item["name"]: item["proposed_last_seen"] for item in pending_to_apply}
     applied_count = 0
 
     for r in rows:
@@ -577,22 +613,38 @@ def apply_pending_updates() -> tuple[bool, str]:
     sheets_synced = False
     try:
         from push_friends_to_sheets import push_to_google_sheets
+
         push_to_google_sheets()
         sheets_synced = True
     except Exception as e:
         print(f"[SocialReview] Warning pushing to Google Sheets: {e}")
 
-    PENDING_FILE.unlink(missing_ok=True)
+    # 4. Clean or update pending file
+    if target_name and remaining_pending:
+        with open(PENDING_FILE, "w", encoding="utf-8") as f:
+            json.dump(remaining_pending, f, indent=2)
+    else:
+        PENDING_FILE.unlink(missing_ok=True)
+
     sheet_note = " and synced to live Google Sheet." if sheets_synced else " (Google Sheet sync failed)."
+    if target_name:
+        return True, f"✅ Successfully updated Last Seen for {matched_entry['name']}{sheet_note}"
     return True, f"✅ Successfully updated Last Seen for {applied_count} contact(s){sheet_note}"
+
 
 def main():
     parser = argparse.ArgumentParser(description="Zero Weekly Social & Last Seen Review")
     parser.add_argument("--days", type=int, default=7, help="Lookback window in days (default: 7)")
     parser.add_argument("--apply", action="store_true", help="Apply currently pending updates")
+    parser.add_argument("--apply-name", type=str, default=None, help="Apply pending Last Seen update for a specific contact")
     parser.add_argument("--quiet", action="store_true", help="Suppress output if no events")
     parser.add_argument("--json", action="store_true", help="Output results in JSON")
     args = parser.parse_args()
+
+    if args.apply_name:
+        ok, msg = apply_pending_updates(target_name=args.apply_name)
+        print(msg)
+        return
 
     if args.apply:
         ok, msg = apply_pending_updates()
@@ -615,6 +667,7 @@ def main():
         print(msg)
     elif not args.quiet:
         print(msg)
+
 
 if __name__ == "__main__":
     main()

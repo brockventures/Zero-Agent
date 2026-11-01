@@ -10,11 +10,27 @@ from pathlib import Path
 from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+sys.path = [p for p in sys.path if p not in ("/workspace", "/workspace/tools")]
+sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(REPO_ROOT))
+
+for _m in list(sys.modules.keys()):
+    if _m == "tools" or _m.startswith("tools."):
+        del sys.modules[_m]
+
+import tools
+
+tools.__path__ = [str(REPO_ROOT / "tools")]
 
 from tools import birthday_reminder, core_friends_reminder, social_last_seen_review
-from tools.forge import _validate_decision_shell_payload
+from tools.forge import (
+    _ensure_decision_action_clarity,
+    _validate_decision_shell_payload,
+    format_decision_card_text,
+    init_forge_db,
+    render_decision_card_embed,
+    stage_decision,
+)
 
 
 # ==============================================================================
@@ -23,7 +39,7 @@ from tools.forge import _validate_decision_shell_payload
 
 
 def test_social_last_seen_review_stages_decision_card(tmp_path: Path):
-    """Verify format_review_message stages a Decision Card when updates are identified."""
+    """Verify format_review_message stages one atomic Decision Card per contact with action clarity."""
     test_pending = tmp_path / "pending_last_seen.json"
     updates = [
         {
@@ -59,28 +75,202 @@ def test_social_last_seen_review_stages_decision_card(tmp_path: Path):
         assert social_last_seen_review.LAST_DECISION_STAGED is True
         assert all(u.get("_decision_staged") is True for u in updates)
 
-        # Verify staged Decision Card parameters
-        assert mock_stage.called
-        kwargs = mock_stage.call_args[1]
-        assert kwargs["category"] == "social_review"
-        assert kwargs["title"] == "Confirm & Apply Last Seen Updates"
-        assert kwargs["handler_type"] == "shell"
-        assert kwargs["channel_id"] == 1542081375287640084
-        assert kwargs["post_to_discord"] is True
+        # Verify staged Decision Cards - one per contact
+        assert mock_stage.call_count == 2
 
-        payload = kwargs["payload"]
-        assert payload["command"] == "python3 /workspace/tools/social_last_seen_review.py --apply"
-        assert payload["cwd"] == "/workspace"
-
-        # Validate shell command syntax
-        ok_cmd, err_cmd = _validate_decision_shell_payload("shell", payload)
+        # Card 1: Alex Rivers
+        call_1 = mock_stage.call_args_list[0][1]
+        assert call_1["category"] == "social_review"
+        assert "Alex Rivers" in call_1["title"]
+        assert call_1["handler_type"] == "shell"
+        assert call_1["channel_id"] == 1542081375287640084
+        assert call_1["post_to_discord"] is True
+        assert "**Approve Action:** Update Alex Rivers's Last Seen date to 2026-10-25 in master contacts and Google Sheet." in call_1["summary"]
+        assert call_1["payload"]["command"] == "python3 /workspace/tools/social_last_seen_review.py --apply-name 'Alex Rivers'"
+        ok_cmd, err_cmd = _validate_decision_shell_payload("shell", call_1["payload"])
         assert ok_cmd is True, err_cmd
+
+        # Card 2: Jordan Hayes
+        call_2 = mock_stage.call_args_list[1][1]
+        assert call_2["category"] == "social_review"
+        assert "Jordan Hayes" in call_2["title"]
+        assert call_2["handler_type"] == "shell"
+        assert call_2["channel_id"] == 1542081375287640084
+        assert call_2["post_to_discord"] is True
+        assert "**Approve Action:** Update Jordan Hayes's Last Seen date to 2026-10-26 in master contacts and Google Sheet." in call_2["summary"]
+        assert call_2["payload"]["command"] == "python3 /workspace/tools/social_last_seen_review.py --apply-name 'Jordan Hayes'"
+        ok_cmd2, err_cmd2 = _validate_decision_shell_payload("shell", call_2["payload"])
+        assert ok_cmd2 is True, err_cmd2
 
         # Verify pending file written
         assert test_pending.exists()
         with open(test_pending, "r", encoding="utf-8") as f:
             staged_data = json.load(f)
         assert len(staged_data) == 2
+
+
+def test_social_last_seen_review_apply_single_name(tmp_path: Path):
+    """Verify apply_pending_updates with target_name updates only the specified contact."""
+    test_csv = tmp_path / "friends_master.csv"
+    test_pending = tmp_path / "pending_last_seen.json"
+    fieldnames = [
+        "Name", "Partner", "Core", "Out of Town", "Last Seen", "Birthday",
+        "Phone Number", "Email Address", "Physical Address", "Notes & Connections",
+    ]
+    rows = [
+        {
+            "Name": "Alex Rivers", "Partner": "", "Core": "TRUE", "Out of Town": "FALSE",
+            "Last Seen": "2026-05-01", "Birthday": "01-01", "Phone Number": "",
+            "Email Address": "", "Physical Address": "", "Notes & Connections": "",
+        },
+        {
+            "Name": "Jordan Hayes", "Partner": "", "Core": "TRUE", "Out of Town": "FALSE",
+            "Last Seen": "-", "Birthday": "02-02", "Phone Number": "",
+            "Email Address": "", "Physical Address": "", "Notes & Connections": "",
+        },
+    ]
+    with open(test_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    pending_data = [
+        {"name": "Alex Rivers", "proposed_last_seen": "2026-10-25"},
+        {"name": "Jordan Hayes", "proposed_last_seen": "2026-10-26"},
+    ]
+    with open(test_pending, "w", encoding="utf-8") as f:
+        json.dump(pending_data, f, indent=2)
+
+    with (
+        patch.object(social_last_seen_review, "CSV_PATH", test_csv),
+        patch.object(social_last_seen_review, "PENDING_FILE", test_pending),
+        patch.object(social_last_seen_review, "MD_PATH", tmp_path / "nonexistent.md"),
+        patch("push_friends_to_sheets.push_to_google_sheets", create=True),
+    ):
+        # 1. Apply single contact update
+        ok, msg = social_last_seen_review.apply_pending_updates(target_name="Alex Rivers")
+        assert ok is True
+        assert "Alex Rivers" in msg
+
+        # Verify CSV state: Alex updated, Jordan not updated
+        with open(test_csv, "r", encoding="utf-8") as f:
+            reader = list(csv.DictReader(f))
+        csv_map = {r["Name"]: r["Last Seen"] for r in reader}
+        assert csv_map["Alex Rivers"] == "2026-10-25"
+        assert csv_map["Jordan Hayes"] == "-"
+
+        # Verify pending file still contains Jordan Hayes
+        assert test_pending.exists()
+        with open(test_pending, "r", encoding="utf-8") as f:
+            remaining = json.load(f)
+        assert len(remaining) == 1
+        assert remaining[0]["name"] == "Jordan Hayes"
+
+        # 2. Apply remaining contact update
+        ok2, msg2 = social_last_seen_review.apply_pending_updates(target_name="Jordan Hayes")
+        assert ok2 is True
+        assert "Jordan Hayes" in msg2
+
+        with open(test_csv, "r", encoding="utf-8") as f:
+            reader2 = list(csv.DictReader(f))
+        csv_map2 = {r["Name"]: r["Last Seen"] for r in reader2}
+        assert csv_map2["Jordan Hayes"] == "2026-10-26"
+
+        # Verify pending file removed when empty
+        assert not test_pending.exists()
+
+
+def test_social_last_seen_review_apply_name_not_found(tmp_path: Path):
+    """Verify apply_pending_updates returns error if target_name is not in pending file."""
+    test_pending = tmp_path / "pending_last_seen.json"
+    with open(test_pending, "w", encoding="utf-8") as f:
+        json.dump([{"name": "Alex Rivers", "proposed_last_seen": "2026-10-25"}], f)
+
+    with patch.object(social_last_seen_review, "PENDING_FILE", test_pending):
+        ok, msg = social_last_seen_review.apply_pending_updates(target_name="Nonexistent Contact")
+        assert ok is False
+        assert "No pending Last Seen update found for 'Nonexistent Contact'" in msg
+
+
+def test_forge_ensure_decision_action_clarity_direct(tmp_path: Path):
+    """Verify _ensure_decision_action_clarity preserves explicit action lines and derives missing ones."""
+    # 1. Existing explicit Approve Action line preserved
+    explicit_summary = "Candidate review.\n\n**Approve Action:** Update contacts master."
+    res = _ensure_decision_action_clarity(explicit_summary, "shell", {"command": "echo 1"})
+    assert res == explicit_summary
+
+    # 2. Shell command derived
+    res_shell = _ensure_decision_action_clarity("Review candidate.", "shell", {"command": "python3 script.py"})
+    assert "**Approve Action:** Run `python3 script.py`" in res_shell
+
+    # 3. Explicit payload action overrides default derivation
+    res_custom = _ensure_decision_action_clarity(
+        "Deploy update.", "shell", {"command": "deploy.sh", "action": "Deploy v2 stack to production"}
+    )
+    assert "**Approve Action:** Deploy v2 stack to production" in res_custom
+
+    # 4. Email handler derived
+    res_mail = _ensure_decision_action_clarity("Send notice.", "send_mail", {"to": "ops@example.com", "subject": "Alert"})
+    assert "**Approve Action:** Send email to `ops@example.com` (Subject: Alert)" in res_mail
+
+    # 5. Docker compose handler derived
+    res_docker = _ensure_decision_action_clarity("Restart service.", "docker_compose", {"service": "homeassistant", "action": "restart"})
+    assert "**Approve Action:** Execute `docker compose restart homeassistant`" in res_docker
+
+    # 6. GitHub PR merge derived
+    res_pr = _ensure_decision_action_clarity("Merge branch.", "gh_merge", {"pr_number": 42})
+    assert "**Approve Action:** Merge PR #42" in res_pr
+
+    # 7. Bridge reload derived
+    res_reload = _ensure_decision_action_clarity("Modified bridge.", "bridge_reload", {})
+    assert "**Approve Action:** Trigger in-place bridge reload" in res_reload
+
+    # 8. File delete derived
+    res_del = _ensure_decision_action_clarity("Clean scratch.", "file_delete", {"paths": ["/tmp/a.log", "/tmp/b.log"]})
+    assert "**Approve Action:** Delete /tmp/a.log, /tmp/b.log" in res_del
+
+    # 9. Forge enqueue derived
+    res_enq = _ensure_decision_action_clarity("Plan ready.", "forge_enqueue", {"title": "Build Sensor Hub"})
+    assert "**Approve Action:** Enqueue FORGE build `Build Sensor Hub`" in res_enq
+
+
+def test_forge_stage_decision_enforces_action_clarity_in_db_and_embed(tmp_path: Path):
+    """Verify stage_decision enriches summary with **Approve Action:** and renders in embeds."""
+    db_p = tmp_path / "forge_test.db"
+    init_forge_db(db_p)
+
+    staged = stage_decision(
+        category="homelab",
+        title="Restart Plex Container",
+        summary="Plex Transcoder wedged on GPU session.",
+        handler_type="docker_compose",
+        payload={"service": "plex", "action": "restart"},
+        channel_id=1542081375287640084,
+        db_path=db_p,
+    )
+    assert staged["ok"] is True
+
+    # Check embed rendering
+    embed = render_decision_card_embed({
+        "status": "pending",
+        "category": "homelab",
+        "title": "Restart Plex Container",
+        "summary": "Plex Transcoder wedged on GPU session.",
+        "handler_type": "docker_compose",
+        "payload_json": json.dumps({"service": "plex", "action": "restart"}),
+    })
+    assert "**Approve Action:** Execute `docker compose restart plex`" in embed["description"]
+
+    # Check text formatting
+    text = format_decision_card_text({
+        "status": "pending",
+        "category": "homelab",
+        "title": "Restart Plex Container",
+        "summary": "Plex Transcoder wedged on GPU session.",
+        "handler_type": "docker_compose",
+        "payload_json": json.dumps({"service": "plex", "action": "restart"}),
+    })
+    assert "**Approve Action:** Execute `docker compose restart plex`" in text
 
 
 def test_social_last_seen_review_empty_updates_no_decision_card():
