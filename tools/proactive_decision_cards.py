@@ -3,7 +3,7 @@
 
 Wires all 7 event-driven workday Decision Card workflows:
 1. Morning/Commute Inbox & RCS Action Triage Card
-2. 48h Family Calendar Radar Card
+2. 24h Family Calendar Radar Card
 3. Afternoon Dinner Pivot Card
 4. Actual Budget Anomaly Card
 5. Weather/Energy Pre-Adjustment Card
@@ -81,6 +81,14 @@ except ImportError:
         from ha_shopping_list import get_pending_groceries
     except ImportError:
         get_pending_groceries = None  # type: ignore
+
+try:
+    from tools.outbox import queue_outbox_message
+except ImportError:
+    try:
+        from outbox import queue_outbox_message
+    except ImportError:
+        queue_outbox_message = None  # type: ignore
 
 # Target Discord Channels
 CHANNEL_ZERO_CHAT = 1542081375287640084
@@ -288,6 +296,51 @@ def _make_calendar_issue_key(issue_type: str, events: list[str], start_date_str:
     sorted_summaries = sorted(str(s).strip() for s in events)
     raw = f"{issue_type}:{','.join(sorted_summaries)}:{start_date_str}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _extract_assigned_parent(ev: dict[str, Any]) -> str:
+    """Extract assigned parent ('ryan', 'emily', 'both', or 'unassigned') from event."""
+    parts: list[str] = []
+    for key in ("summary", "description"):
+        val = ev.get(key)
+        if val:
+            parts.append(str(val))
+
+    org = ev.get("organizer")
+    if isinstance(org, dict):
+        parts.extend(str(v) for v in org.values() if v)
+    elif org:
+        parts.append(str(org))
+
+    att = ev.get("attendees")
+    if isinstance(att, list):
+        for a in att:
+            if isinstance(a, dict):
+                parts.extend(str(v) for v in a.values() if v)
+            elif a:
+                parts.append(str(a))
+    elif isinstance(att, dict):
+        parts.extend(str(v) for v in att.values() if v)
+    elif att:
+        parts.append(str(att))
+
+    text = " ".join(parts)
+    has_ryan = bool(re.search(r"\bryan\b", text, re.IGNORECASE))
+    has_emily = bool(re.search(r"\bemily\b", text, re.IGNORECASE))
+
+    if has_ryan and has_emily:
+        return "both"
+    if has_ryan:
+        return "ryan"
+    if has_emily:
+        return "emily"
+    return "unassigned"
+
+
+def _is_dropoff_pickup_block(ev: dict[str, Any]) -> bool:
+    """Check if event summary is a dropoff, pickup, or handoff block."""
+    summary = str(ev.get("summary", ""))
+    return bool(re.search(r"\b(drop-?off|drop\s+off|pick-?up|pick\s+up|handoff)\b", summary, re.IGNORECASE))
 
 
 def _classify_comms_item(item: dict[str, Any]) -> Optional[str]:
@@ -543,7 +596,7 @@ def run_inbox_rcs_action_triage_card(
 
 
 # ==============================================================================
-# Workflow 2: 48h Family Calendar Radar Card
+# Workflow 2: 24h Family Calendar Radar Card
 # ==============================================================================
 def run_family_calendar_radar_card(
     dry_run: bool = False,
@@ -551,14 +604,16 @@ def run_family_calendar_radar_card(
     db_path: Path | str = FORGE_DB_PATH,
     post_to_discord: bool = True,
     events_override: Optional[list[dict[str, Any]]] = None,
+    window_hours: int = 24,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Scan next 48h of family calendar events for overlaps, tight buffers (<15m), and prep items.
+    """Scan next 24h of family calendar events for overlaps, tight buffers (<15m), and prep items.
 
-    Stages a Decision Card in #brock-house (1550577908811178095).
-    Strictly event-driven: returns (True, '', {'cards_staged': 0}) when 0 conflicts/prep alerts.
+    Stages a Decision Card in #brock-house (1550577908811178095) for concrete prep actions.
+    Dispatches read-only timing alerts to #brock-house via queue_outbox_message.
+    Strictly event-driven: returns (True, '', {'cards_staged': 0, 'read_only_alerts': 0}) when 0 conflicts/prep alerts.
     """
     now_pt = datetime.now(PT)
-    window_end_pt = now_pt + timedelta(hours=48)
+    window_end_pt = now_pt + timedelta(hours=window_hours)
 
     # 1. Fetch events
     raw_events: list[dict[str, Any]] = []
@@ -578,7 +633,7 @@ def run_family_calendar_radar_card(
             except Exception:
                 pass
 
-    # 2. Parse & normalize events within 48h window
+    # 2. Parse & normalize events within window
     normalized_events: list[dict[str, Any]] = []
     for ev in raw_events:
         summary = str(ev.get("summary", "(Untitled)")).strip()
@@ -599,6 +654,8 @@ def run_family_calendar_radar_card(
             "summary": summary,
             "description": ev.get("description", ""),
             "location": ev.get("location", ""),
+            "organizer": ev.get("organizer"),
+            "attendees": ev.get("attendees"),
             "start_dt": start_dt,
             "end_dt": end_dt,
             "is_all_day": is_all_day,
@@ -614,12 +671,16 @@ def run_family_calendar_radar_card(
     # A. Overlaps between timed events
     for i in range(len(timed_events)):
         ev1 = timed_events[i]
+        p1 = _extract_assigned_parent(ev1)
         for j in range(i + 1, len(timed_events)):
             ev2 = timed_events[j]
             if ev2["start_dt"] >= ev1["end_dt"]:
                 break
             # ev2 starts before ev1 ends -> overlap
             if ev1["start_dt"] < ev2["end_dt"] and ev2["start_dt"] < ev1["end_dt"]:
+                p2 = _extract_assigned_parent(ev2)
+                if {p1, p2} == {"ryan", "emily"}:
+                    continue
                 start_date_str = ev1["start_dt"].strftime("%Y-%m-%d")
                 ev_list = [ev1["summary"], ev2["summary"]]
                 issue_key = _make_calendar_issue_key("overlap", ev_list, start_date_str)
@@ -633,6 +694,9 @@ def run_family_calendar_radar_card(
                     "events": ev_list,
                     "key": issue_key,
                     "start_date": start_date_str,
+                    "read_only": True,
+                    "actionable": False,
+                    "assigned_parents": [p1, p2],
                 })
 
     # B. Tight Buffers (<15m) between consecutive timed events
@@ -642,6 +706,17 @@ def run_family_calendar_radar_card(
         if ev1["end_dt"] <= ev2["start_dt"]:
             gap_seconds = (ev2["start_dt"] - ev1["end_dt"]).total_seconds()
             if 0 <= gap_seconds < 15 * 60:
+                p1 = _extract_assigned_parent(ev1)
+                p2 = _extract_assigned_parent(ev2)
+                if {p1, p2} == {"ryan", "emily"}:
+                    continue
+                if _is_dropoff_pickup_block(ev1) and _is_dropoff_pickup_block(ev2):
+                    continue
+                loc1 = str(ev1.get("location") or "").strip()
+                loc2 = str(ev2.get("location") or "").strip()
+                if loc1 and loc2 and loc1.lower() == loc2.lower():
+                    continue
+
                 gap_mins = int(gap_seconds // 60)
                 start_date_str = ev1["start_dt"].strftime("%Y-%m-%d")
                 ev_list = [ev1["summary"], ev2["summary"]]
@@ -657,6 +732,9 @@ def run_family_calendar_radar_card(
                     "events": ev_list,
                     "key": issue_key,
                     "start_date": start_date_str,
+                    "read_only": True,
+                    "actionable": False,
+                    "assigned_parents": [p1, p2],
                 })
 
     # C. Events needing prep (birthday, party, trip, doctor, camp, etc.)
@@ -681,6 +759,10 @@ def run_family_calendar_radar_card(
                 "events": ev_list,
                 "key": issue_key,
                 "start_date": start_date_str,
+                "read_only": False,
+                "actionable": True,
+                "summary": ev["summary"],
+                "description": ev["description"],
             })
 
     # Filter out previously seen issues if deduplication is active
@@ -690,28 +772,35 @@ def run_family_calendar_radar_card(
         seen_keys = _load_seen_calendar_keys()
         issues = [iss for iss in issues if iss.get("key") not in seen_keys]
 
+    actionable_issues = [iss for iss in issues if iss.get("actionable", False)]
+    read_only_issues = [iss for iss in issues if iss.get("read_only", False)]
+
     # 4. Silent exit if 0 issues
     if not issues:
-        return True, "", {"cards_staged": 0, "issues": []}
+        return True, "", {
+            "cards_staged": 0,
+            "read_only_alerts": 0,
+            "issues": [],
+        }
 
-    # 5. Format Decision Card
+    # 5. Format Decision Card summary text
     count = len(issues)
 
     summary_lines = [
-        f"### 🗓️ 48h Family Calendar Radar ({count})",
+        f"### 🗓️ 24h Family Calendar Radar ({count})",
         "Upcoming schedule collisions, tight buffers, and prep items requiring attention:",
         "",
     ]
     for issue in issues[:8]:
         itype = issue["type"]
         if itype == "overlap":
-            summary_lines.append(f"• ⚠️ **Overlap:** {issue['details']}")
+            summary_lines.append(f"- ⚠️ **Overlap:** {issue['details']}")
         elif itype == "tight_buffer":
-            summary_lines.append(f"• ⏳ **Tight Buffer:** {issue['details']}")
+            summary_lines.append(f"- ⏳ **Tight Buffer:** {issue['details']}")
         elif itype == "prep":
-            summary_lines.append(f"• 🎒 **Prep Needed:** {issue['details']}")
+            summary_lines.append(f"- 🎒 **Prep Needed:** {issue['details']}")
     if count > 8:
-        summary_lines.append(f"• *... and {count - 8} additional alerts*")
+        summary_lines.append(f"- *... and {count - 8} additional alerts*")
 
     summary_text = "\n".join(summary_lines)
 
@@ -719,42 +808,64 @@ def run_family_calendar_radar_card(
     if dry_run:
         return True, summary_text, {
             "cards_staged": 0,
+            "read_only_alerts": len(read_only_issues),
             "dry_run": True,
             "issues": issues,
         }
 
-    # 7. Stage Decision Cards in #brock-house (One atomic card per conflict/prep item)
+    # 7. Stage Decision Cards ONLY for actionable issues (type == 'prep')
+    # and dispatch read-only timing alerts to #brock-house via queue_outbox_message
     import shlex as _shlex
 
     decision_ids: list[str] = []
     should_post = post_to_discord and not test
 
-    for issue in issues:
+    for issue in actionable_issues:
         itype = issue["type"]
         evs = issue.get("events") or []
-        if itype == "prep" and evs:
-            t_title = f"Prep for {evs[0]} ({issue.get('details', '').split(' requires')[0]})"
-        elif itype == "overlap" and len(evs) >= 2:
-            t_title = f"Resolve calendar overlap: {evs[0]} & {evs[1]}"
-        elif itype == "tight_buffer" and len(evs) >= 2:
-            t_title = f"Check tight schedule buffer: {evs[0]} -> {evs[1]}"
-        else:
-            t_title = issue.get("title", "Calendar radar follow-up")
+        ev_summary = evs[0] if evs else str(issue.get("summary") or issue.get("title") or "Event")
+        kw = issue.get("prep_keyword", "")
+        haystack = f"{issue.get('summary', '')} {issue.get('description', '')}".lower()
+        supply_keywords = ("ice cream", "cake", "gift", "present", "snacks", "supplies")
+        has_supply_kw = any(re.search(rf"\b{re.escape(skw)}\b", haystack) for skw in supply_keywords)
+        is_party_celebration = kw in ("birthday", "party", "celebration")
 
-        card_title = f"🗓️ {issue['title']}"
-        card_summary = (
-            f"### 🗓️ Calendar Radar Alert\n"
-            f"{issue['details']}\n\n"
-            f"**Approve Action:** Create task in task manager: '{t_title}'"
-        )
-        cmd = f"python3 /workspace/tools/task_manager.py add {_shlex.quote(t_title)} --priority p1"
-        payload = {
-            "command": cmd,
-            "issue_type": itype,
-            "events": evs,
-            "key": issue.get("key"),
-            "task_title": t_title,
-        }
+        if is_party_celebration or has_supply_kw:
+            if "supplies" in ev_summary.lower():
+                item_name = ev_summary
+            else:
+                item_name = f"{ev_summary} supplies"
+            cmd = f"python3 /workspace/tools/ha_shopping_list.py --add {_shlex.quote(item_name)}"
+            card_title = f"🗓️ Add to Shopping List: {item_name}"
+            card_summary = (
+                f"### 🗓️ Calendar Radar Prep\n"
+                f"{issue['details']}\n\n"
+                f"**Approve Action:** Add '{item_name}' to the household shopping list"
+            )
+            payload = {
+                "command": cmd,
+                "issue_type": itype,
+                "events": evs,
+                "key": issue.get("key"),
+                "item": item_name,
+            }
+        else:
+            t_title = f"Prep for {ev_summary} ({issue.get('details', '').split(' requires')[0]})"
+            card_title = f"🗓️ {issue['title']}"
+            card_summary = (
+                f"### 🗓️ Calendar Radar Alert\n"
+                f"{issue['details']}\n\n"
+                f"**Approve Action:** Create task in task manager: '{t_title}'"
+            )
+            cmd = f"python3 /workspace/tools/task_manager.py add {_shlex.quote(t_title)} --priority p1"
+            payload = {
+                "command": cmd,
+                "issue_type": itype,
+                "events": evs,
+                "key": issue.get("key"),
+                "task_title": t_title,
+            }
+
         stage_res = stage_decision(
             category="calendar",
             title=card_title,
@@ -768,7 +879,33 @@ def run_family_calendar_radar_card(
         if stage_res.get("decision_id"):
             decision_ids.append(stage_res["decision_id"])
 
-    # Persist updated seen keys
+    # Dispatch read-only timing alerts to #brock-house via queue_outbox_message
+    if read_only_issues and should_post and queue_outbox_message is not None:
+        read_only_lines = [
+            f"### 🗓️ 24h Calendar Timing Alerts ({len(read_only_issues)})",
+            "Upcoming schedule timing collisions and tight transitions in the next 24 hours:",
+            "",
+        ]
+        for r_issue in read_only_issues[:8]:
+            r_type = r_issue["type"]
+            if r_type == "overlap":
+                read_only_lines.append(f"- ⚠️ **Overlap:** {r_issue['details']}")
+            elif r_type == "tight_buffer":
+                read_only_lines.append(f"- ⏳ **Tight Buffer:** {r_issue['details']}")
+        if len(read_only_issues) > 8:
+            read_only_lines.append(f"- *... and {len(read_only_issues) - 8} additional timing alerts*")
+        read_only_text = "\n".join(read_only_lines)
+
+        try:
+            queue_outbox_message(
+                channel="brock-house",
+                content=read_only_text,
+                source_turn="family_calendar_radar",
+            )
+        except Exception as e:
+            print(f"[CalendarRadar] Failed to queue read-only outbox alert: {e}", file=sys.stderr)
+
+    # Persist updated seen keys (for both read-only timing alerts and staged prep cards)
     if should_dedup:
         updated_seen = set(seen_keys)
         for iss in issues:
@@ -779,6 +916,7 @@ def run_family_calendar_radar_card(
 
     return True, summary_text, {
         "cards_staged": len(decision_ids),
+        "read_only_alerts": len(read_only_issues),
         "decision_id": decision_ids[0] if decision_ids else None,
         "decision_ids": decision_ids,
         "issues": issues,

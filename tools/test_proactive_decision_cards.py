@@ -336,7 +336,10 @@ def test_calendar_radar_silent_when_no_conflicts(test_db: Path) -> None:
 
 
 def test_calendar_radar_detects_overlap_tight_buffer_and_prep(test_db: Path) -> None:
-    """Detects overlap conflict, tight buffer (<15m), and prep keyword."""
+    """Detects overlap conflict, tight buffer (<15m), and prep keyword.
+
+    Only actionable prep items stage Decision Cards; overlaps and tight buffers emit read-only timing alerts.
+    """
     now_pt = datetime.now(PT)
     events: list[dict[str, Any]] = [
         # Event 1 & 2 overlap
@@ -363,8 +366,8 @@ def test_calendar_radar_detects_overlap_tight_buffer_and_prep(test_db: Path) -> 
         {
             "id": "ev-prep",
             "summary": "Rosie 4th Birthday Party",
-            "start": (now_pt + timedelta(hours=24)).isoformat(),
-            "end": (now_pt + timedelta(hours=26)).isoformat(),
+            "start": (now_pt + timedelta(hours=20)).isoformat(),
+            "end": (now_pt + timedelta(hours=22)).isoformat(),
         },
     ]
 
@@ -375,7 +378,8 @@ def test_calendar_radar_detects_overlap_tight_buffer_and_prep(test_db: Path) -> 
         events_override=events,
     )
     assert ok is True
-    assert meta["cards_staged"] == 3
+    assert meta["cards_staged"] == 1
+    assert meta["read_only_alerts"] == 2
     issues = meta["issues"]
     issue_types = {iss["type"] for iss in issues}
     assert "overlap" in issue_types
@@ -387,17 +391,18 @@ def test_calendar_radar_detects_overlap_tight_buffer_and_prep(test_db: Path) -> 
     rows = conn.execute("SELECT * FROM forge_decisions ORDER BY id ASC").fetchall()
     conn.close()
 
-    assert len(rows) == 3
-    for row in rows:
-        assert row["category"] == "calendar"
-        assert row["channel_id"] == CHANNEL_BROCK_HOUSE
-        assert row["handler_type"] == "shell"
-        assert "**Approve Action:**" in row["summary"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["category"] == "calendar"
+    assert row["channel_id"] == CHANNEL_BROCK_HOUSE
+    assert row["handler_type"] == "shell"
+    assert "**Approve Action:**" in row["summary"]
+    assert "Add 'Rosie 4th Birthday Party supplies' to the household shopping list" in row["summary"]
 
-        payload = json.loads(row["payload_json"])
-        valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-        assert valid_sh is True, f"Shell payload invalid: {val_err}"
-        assert "task_manager.py add" in payload["command"]
+    payload = json.loads(row["payload_json"])
+    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
+    assert valid_sh is True, f"Shell payload invalid: {val_err}"
+    assert "ha_shopping_list.py --add" in payload["command"]
 
 
 def test_calendar_radar_dry_run(test_db: Path) -> None:
@@ -441,8 +446,8 @@ def test_calendar_radar_deduplicates_across_consecutive_runs(
     event_prep = {
         "id": "ev-birthday",
         "summary": "Rosie 4th Birthday Party",
-        "start": (now_pt + timedelta(hours=20)).isoformat(),
-        "end": (now_pt + timedelta(hours=22)).isoformat(),
+        "start": (now_pt + timedelta(hours=18)).isoformat(),
+        "end": (now_pt + timedelta(hours=20)).isoformat(),
     }
     event_overlap_1 = {
         "id": "ev-overlap-1",
@@ -458,7 +463,7 @@ def test_calendar_radar_deduplicates_across_consecutive_runs(
     }
     events = [event_prep, event_overlap_1, event_overlap_2]
 
-    # Run 1: Should detect prep + overlap, stage Decision Card, write seen file
+    # Run 1: Should detect prep + overlap, stage Decision Cards for prep, write seen file
     ok1, summary1, meta1 = run_family_calendar_radar_card(
         test=True,
         db_path=test_db,
@@ -466,7 +471,8 @@ def test_calendar_radar_deduplicates_across_consecutive_runs(
         events_override=events,
     )
     assert ok1 is True
-    assert meta1["cards_staged"] == 3
+    assert meta1["cards_staged"] == 2
+    assert meta1["read_only_alerts"] == 1
     assert len(meta1["issues"]) == 3
     assert isolate_calendar_seen.exists()
 
@@ -484,14 +490,15 @@ def test_calendar_radar_deduplicates_across_consecutive_runs(
     assert ok2 is True
     assert summary2 == ""
     assert meta2["cards_staged"] == 0
+    assert meta2["read_only_alerts"] == 0
     assert meta2["issues"] == []
 
-    # Run 3: Introduce a new event with prep keyword
+    # Run 3: Introduce a new event with prep keyword within 24h
     new_event = {
         "id": "ev-camp",
         "summary": "Soccer Camp Registration",
-        "start": (now_pt + timedelta(hours=30)).isoformat(),
-        "end": (now_pt + timedelta(hours=31)).isoformat(),
+        "start": (now_pt + timedelta(hours=21)).isoformat(),
+        "end": (now_pt + timedelta(hours=22)).isoformat(),
     }
     events_with_new = events + [new_event]
 
@@ -529,6 +536,316 @@ def test_calendar_radar_dedup_bypassed_without_seen_env(
     )
     assert meta1["cards_staged"] == 1
     assert meta2["cards_staged"] == 1
+
+
+def test_calendar_radar_ignores_events_beyond_24h(test_db: Path) -> None:
+    """Events starting outside the 24h scan window are ignored by default."""
+    now_pt = datetime.now(PT)
+    events = [
+        {
+            "id": "ev-within",
+            "summary": "Team Sync",
+            "start": (now_pt + timedelta(hours=4)).isoformat(),
+            "end": (now_pt + timedelta(hours=5)).isoformat(),
+        },
+        {
+            "id": "ev-outside-prep",
+            "summary": "Dentist Appointment",
+            "start": (now_pt + timedelta(hours=30)).isoformat(),
+            "end": (now_pt + timedelta(hours=31)).isoformat(),
+        },
+        {
+            "id": "ev-outside-party",
+            "summary": "Rosie Birthday Party",
+            "start": (now_pt + timedelta(hours=35)).isoformat(),
+            "end": (now_pt + timedelta(hours=37)).isoformat(),
+        },
+    ]
+
+    # Default 24h window -> ignores +30h and +35h events
+    ok, summary, meta = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events,
+    )
+    assert ok is True
+    assert summary == ""
+    assert meta["cards_staged"] == 0
+    assert meta["read_only_alerts"] == 0
+    assert meta["issues"] == []
+
+    # Expanding window to 48h picks up both outside events
+    ok_48, summary_48, meta_48 = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events,
+        window_hours=48,
+    )
+    assert ok_48 is True
+    assert meta_48["cards_staged"] == 2
+
+
+def test_calendar_radar_parent_aware_overlap_suppressed(test_db: Path) -> None:
+    """Overlapping events assigned to Ryan and Emily (divide-and-conquer) do not trigger an overlap alert."""
+    now_pt = datetime.now(PT)
+    events_cross_parents = [
+        {
+            "id": "ev-ryan",
+            "summary": "Isaac pickup (Ryan)",
+            "start": (now_pt + timedelta(hours=2)).isoformat(),
+            "end": (now_pt + timedelta(hours=3)).isoformat(),
+        },
+        {
+            "id": "ev-emily",
+            "summary": "Rosie gymnastics (Emily)",
+            "start": (now_pt + timedelta(hours=2, minutes=30)).isoformat(),
+            "end": (now_pt + timedelta(hours=3, minutes=30)).isoformat(),
+        },
+    ]
+
+    ok, summary, meta = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events_cross_parents,
+    )
+    assert ok is True
+    assert summary == ""
+    assert meta["cards_staged"] == 0
+    assert meta["read_only_alerts"] == 0
+    assert meta["issues"] == []
+
+    # Same parent collision (both Ryan) DOES trigger an overlap alert
+    events_same_parent = [
+        {
+            "id": "ev-ryan-1",
+            "summary": "Isaac pickup (Ryan)",
+            "start": (now_pt + timedelta(hours=2)).isoformat(),
+            "end": (now_pt + timedelta(hours=3)).isoformat(),
+        },
+        {
+            "id": "ev-ryan-2",
+            "summary": "Hardware Store Run (Ryan)",
+            "start": (now_pt + timedelta(hours=2, minutes=30)).isoformat(),
+            "end": (now_pt + timedelta(hours=3, minutes=30)).isoformat(),
+        },
+    ]
+    ok_same, _, meta_same = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events_same_parent,
+    )
+    assert ok_same is True
+    assert meta_same["cards_staged"] == 0
+    assert meta_same["read_only_alerts"] == 1
+    assert "Overlap" in meta_same["issues"][0]["title"]
+
+    # At least one unassigned parent collision DOES trigger an overlap alert
+    events_unassigned = [
+        {
+            "id": "ev-ryan-3",
+            "summary": "Isaac pickup (Ryan)",
+            "start": (now_pt + timedelta(hours=2)).isoformat(),
+            "end": (now_pt + timedelta(hours=3)).isoformat(),
+        },
+        {
+            "id": "ev-unassigned",
+            "summary": "Appliance Delivery",
+            "start": (now_pt + timedelta(hours=2, minutes=30)).isoformat(),
+            "end": (now_pt + timedelta(hours=3, minutes=30)).isoformat(),
+        },
+    ]
+    ok_un, _, meta_un = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events_unassigned,
+    )
+    assert ok_un is True
+    assert meta_un["cards_staged"] == 0
+    assert meta_un["read_only_alerts"] == 1
+
+
+def test_calendar_radar_back_to_back_dropoff_and_same_location_suppressed(test_db: Path) -> None:
+    """Back-to-back dropoff/pickup chains, same-location, and cross-parent transitions do not trigger tight buffers."""
+    now_pt = datetime.now(PT)
+
+    # 1. Consecutive dropoff blocks
+    events_dropoff = [
+        {
+            "id": "ev-dropoff-1",
+            "summary": "Isaac-Rafaela dropoff",
+            "start": (now_pt + timedelta(hours=1)).isoformat(),
+            "end": (now_pt + timedelta(hours=1, minutes=5)).isoformat(),
+        },
+        {
+            "id": "ev-dropoff-2",
+            "summary": "Rosie dropoff",
+            "start": (now_pt + timedelta(hours=1, minutes=5)).isoformat(),
+            "end": (now_pt + timedelta(hours=1, minutes=20)).isoformat(),
+        },
+    ]
+    ok, _, meta = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events_dropoff,
+    )
+    assert ok is True
+    assert meta["read_only_alerts"] == 0
+    assert meta["cards_staged"] == 0
+
+    # 2. Same location transitions (<15m)
+    events_same_loc = [
+        {
+            "id": "ev-loc-1",
+            "summary": "Guitar Lesson",
+            "location": "Community Center Room 101",
+            "start": (now_pt + timedelta(hours=3)).isoformat(),
+            "end": (now_pt + timedelta(hours=4)).isoformat(),
+        },
+        {
+            "id": "ev-loc-2",
+            "summary": "Chess Club",
+            "location": "Community Center Room 101",
+            "start": (now_pt + timedelta(hours=4, minutes=5)).isoformat(),
+            "end": (now_pt + timedelta(hours=5)).isoformat(),
+        },
+    ]
+    ok_loc, _, meta_loc = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events_same_loc,
+    )
+    assert ok_loc is True
+    assert meta_loc["read_only_alerts"] == 0
+
+    # 3. Cross-parent transition (<15m)
+    events_cross_parent = [
+        {
+            "id": "ev-cp-1",
+            "summary": "Swim Practice (Ryan)",
+            "start": (now_pt + timedelta(hours=6)).isoformat(),
+            "end": (now_pt + timedelta(hours=7)).isoformat(),
+        },
+        {
+            "id": "ev-cp-2",
+            "summary": "Dance Class (Emily)",
+            "start": (now_pt + timedelta(hours=7, minutes=5)).isoformat(),
+            "end": (now_pt + timedelta(hours=8)).isoformat(),
+        },
+    ]
+    ok_cp, _, meta_cp = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events_cross_parent,
+    )
+    assert ok_cp is True
+    assert meta_cp["read_only_alerts"] == 0
+
+    # 4. Genuine tight buffer between different locations with same parent
+    events_genuine_tight = [
+        {
+            "id": "ev-gt-1",
+            "summary": "Piano Lesson (Ryan)",
+            "location": "Music Academy",
+            "start": (now_pt + timedelta(hours=8)).isoformat(),
+            "end": (now_pt + timedelta(hours=9)).isoformat(),
+        },
+        {
+            "id": "ev-gt-2",
+            "summary": "Karate (Ryan)",
+            "location": "Dojo Downtown",
+            "start": (now_pt + timedelta(hours=9, minutes=5)).isoformat(),
+            "end": (now_pt + timedelta(hours=10)).isoformat(),
+        },
+    ]
+    ok_gt, _, meta_gt = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events_genuine_tight,
+    )
+    assert ok_gt is True
+    assert meta_gt["read_only_alerts"] == 1
+    assert "Tight buffer" in meta_gt["issues"][0]["title"]
+
+
+def test_calendar_radar_read_only_timing_alerts_dispatch(
+    test_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Genuine tight buffers and overlaps emit read-only alerts without creating forge_decisions rows,
+
+    and dispatch read-only timing alerts via queue_outbox_message when post_to_discord is active.
+    """
+    outbox_calls: list[dict[str, Any]] = []
+
+    def mock_queue_outbox(channel: str, content: str, source_turn: str = "zero", **kwargs: Any) -> dict[str, Any]:
+        call_info = {"channel": channel, "content": content, "source_turn": source_turn}
+        outbox_calls.append(call_info)
+        return {"status": "queued", "id": "msg-123"}
+
+    monkeypatch.setattr(
+        "tools.proactive_decision_cards.queue_outbox_message",
+        mock_queue_outbox,
+    )
+
+    now_pt = datetime.now(PT)
+    events = [
+        # Overlapping unassigned events
+        {
+            "id": "ev-1",
+            "summary": "Quarterly Review",
+            "start": (now_pt + timedelta(hours=2)).isoformat(),
+            "end": (now_pt + timedelta(hours=3)).isoformat(),
+        },
+        {
+            "id": "ev-2",
+            "summary": "Strategy Sync",
+            "start": (now_pt + timedelta(hours=2, minutes=30)).isoformat(),
+            "end": (now_pt + timedelta(hours=3, minutes=30)).isoformat(),
+        },
+        # Tight buffer unassigned event (10m gap)
+        {
+            "id": "ev-3",
+            "summary": "Coffee Chat",
+            "start": (now_pt + timedelta(hours=3, minutes=40)).isoformat(),
+            "end": (now_pt + timedelta(hours=4, minutes=10)).isoformat(),
+        },
+    ]
+
+    ok, summary, meta = run_family_calendar_radar_card(
+        test=False,
+        db_path=test_db,
+        post_to_discord=True,
+        events_override=events,
+    )
+
+    assert ok is True
+    assert meta["cards_staged"] == 0
+    assert meta["read_only_alerts"] == 2
+    assert len(meta["issues"]) == 2
+
+    # Zero rows staged in database
+    conn = sqlite3.connect(test_db)
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
+    conn.close()
+    assert count == 0
+
+    # Read-only timing alert dispatched to outbox
+    assert len(outbox_calls) == 1
+    call = outbox_calls[0]
+    assert call["channel"] == "brock-house"
+    assert call["source_turn"] == "family_calendar_radar"
+    assert "24h Calendar Timing Alerts" in call["content"]
+    assert "Quarterly Review" in call["content"]
+    assert "Strategy Sync" in call["content"]
+
 
 
 # ==============================================================================
