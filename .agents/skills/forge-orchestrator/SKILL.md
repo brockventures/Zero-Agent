@@ -59,6 +59,9 @@ Gated strictly on **Execution Loop & Verification Cost** (never raw file count) 
 }
 ```
 - **Turn-0 Symbol Pre-Hydration (`target_symbols`):** `forge.py` extracts exact AST/line-slice code blocks for listed classes/functions and embeds them directly into the worker prompt so Flash skips file-discovery roundtrips.
+  - **150-Line Whole-Class Symbol Guard:** `run_goldfish_plan_preflight()` rejects whole-class `ast.ClassDef` targets exceeding 150 lines (e.g. `VoiceGatewayService`). Target symbols on large classes MUST be pinned to a specific dotted method (`ClassName.method_name`) or explicit line range (`ClassName:start-end`) to prevent workers dropping at class headers and timing out during file scans.
+- **Retry Auto-Start & Approval Gate Bypass:** Scoped retries of failed builds (flagged via `is_retry: true`, `retry_of_build_id`, an in-flight prompt containing `[FORGE BUILD FAILURE ENVELOPE]`, or a recent failed build in `forge_builds` for the same channel and repo within 7200s) automatically bypass the interactive Decision Card approval gate and auto-start immediately.
+- **Silent Failure-Retry Self-Healing (`[NO_REPLY]`):** When woken by a `[FORGE BUILD FAILURE ENVELOPE]` in an originating channel, the orchestrator diagnoses the error, re-enqueues a corrected `ForgePlan` (`is_retry: true`), and emits strictly `[NO_REPLY]`. Internal `#forge` worker timeout or retry commentary must never be posted into the channel; communicate only when the final substantive deliverable is complete or an external roadblock requires human input.
 - **Optional `verification_cmd`:** If omitted, `forge.py` automatically synthesizes a baseline `py_compile` + matching `pytest` verification command from `target_files`.
 - **Target-File Overlap Guard:** `enqueue_build()` automatically blocks concurrent builds whose `target_files` overlap an active `queued` or `running` build (override with `--allow-overlap`).
 
@@ -94,6 +97,7 @@ python3 /workspace/tools/forge.py job cancel <task_id>
 When a task requires data analysis, calibration, or investigation before modifying multi-file production code (or >2 files / >90s build work):
 1. **Stage 1 (Interactive Turn = Analysis & Proposal Only):** Complete the investigation/math inline, write the validated `ForgePlan` JSON to `/workspace/data/forge_plans/<slug>.json`, and stage an inline Decision Card with `--handler "forge_enqueue"` and `--post` so Ryan gets real `Approve | Edit | Dismiss` buttons.
 2. **Stage 2 (1-Click Enqueue to `#forge`):** Clicking **Approve** deterministically invokes `enqueue_build()` on that saved `ForgePlan` in <1s with zero LLM tokens, launching isolated `#forge` worktree workers cleanly.
+3. **Build Retry Auto-Start Exemption:** Scoped retry plans (`is_retry: true` or referencing `retry_of_build_id`) bypass the Decision Card approval gate and auto-start immediately, eliminating redundant approval cycles during automated recovery.
 
 ```bash
 # Stage a Two-Stage FORGE Build Proposal Card
