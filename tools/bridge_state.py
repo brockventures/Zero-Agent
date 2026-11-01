@@ -834,9 +834,9 @@ def check_compaction_needed(
       - 1.0 MB (1,024 KB) compact transcript.jsonl size (~50k-65k trajectory tokens)
     """
     rules = get_runtime_rules()
-    max_turns = int(rules.get("compaction_max_turns", 15))
-    max_steps = int(rules.get("compaction_max_steps", 800))
-    max_mb = float(rules.get("compaction_max_mb", 1.0))
+    max_turns = int(rules.get("compaction_max_turns", 10))
+    max_steps = int(rules.get("compaction_max_steps", 200))
+    max_mb = float(rules.get("compaction_max_mb", 0.35))
 
     if current_turns >= max_turns:
         return True, f"turn count reached {current_turns}/{max_turns}"

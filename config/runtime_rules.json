@@ -17,8 +17,8 @@
     "task_settle_max_resumptions": 1,
     "detached_notify_on_success": false,
     "compaction_max_turns": 10,
-    "compaction_max_steps": 600,
-    "compaction_max_mb": 0.5,
+    "compaction_max_steps": 200,
+    "compaction_max_mb": 0.35,
     "channel_tag_requirements": {
         "1534452820995080192": [
             "1543285916506783799",
