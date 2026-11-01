@@ -812,11 +812,19 @@ def get_gif_prompt_guidance(sess_key: str, channel_id: int | str | None = None) 
         )
 
     count = get_gif_turn_count(sess_key)
-    status_str = "⚠️ DUE (>=5 turns without GIF)" if count >= 5 else f"Nominal ({count}/5-7 turns)"
+    if count < 4:
+        status_str = f"Cooldown ({count}/4 min turns — do NOT include a reaction GIF on this turn so GIFs never cluster)"
+    else:
+        status_str = (
+            f"Eligible ({count} turns since last GIF — optional ONLY if this turn has a genuine joke, roast, absurd bug, "
+            f"or standout comedic moment via `python3 /workspace/tools/gif_tool.py \"<specific comedic scene or vibe>\"`; "
+            f"skip on routine status updates, serious/outage turns, or if no GIF genuinely fits; "
+            f"place `[GIF](url)` at very end before `[CHOICES: ...]\\)"
+        )
 
     return (
         f"[GIF Cadence Tracker (Channel: {sess_key})]: {count} message(s) since last reaction GIF in this channel.\n"
-        f"• Status: {status_str} (Target ~1 in 5-7 turns via `python3 /workspace/tools/gif_tool.py \"<situation or vibe>\"`; skip on serious/outage/ping turns; place `[GIF](url)` at very end before `[CHOICES: ...]`)."
+        f"• Status: {status_str}"
     )
 
 

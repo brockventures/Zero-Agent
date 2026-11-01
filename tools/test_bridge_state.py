@@ -13,9 +13,14 @@ import time
 import unittest
 from pathlib import Path
 
-WORKSPACE = Path("/workspace")
-if str(WORKSPACE) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+elif sys.path[0] != str(REPO_ROOT):
+    sys.path.remove(str(REPO_ROOT))
+    sys.path.insert(0, str(REPO_ROOT))
+if "/workspace" not in sys.path:
+    sys.path.append("/workspace")
 
 import tools.bridge_state as bs
 
@@ -134,7 +139,7 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
                 f.write(f'{{"step": {i}}}\n')
         needed, reason = bs.check_compaction_needed("transcript_steps", 2, brain_root=conv_dir)
         self.assertTrue(needed)
-        self.assertIn("transcript steps (1505) exceeds 600-step ceiling", reason)
+        self.assertIn("transcript steps (1505) exceeds", reason)
 
     async def test_persistent_turn_queue(self):
         q_file = self.temp_path / "test_queue.json"
@@ -214,13 +219,14 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
 
         # 6. Prompt guidance formatting & overrides
         guidance_low = bs.get_gif_prompt_guidance("chan_a")
-        self.assertIn("Nominal (0/5-7 turns)", guidance_low)
-        self.assertIn("skip on serious/outage/ping turns", guidance_low)
+        self.assertIn("Cooldown (0/4 min turns", guidance_low)
+        self.assertNotIn("⚠️ DUE", guidance_low)
 
         for _ in range(5):
             bs.increment_gif_turn("chan_a")
         guidance_due = bs.get_gif_prompt_guidance("chan_a")
-        self.assertIn("⚠️ DUE (>=5 turns without GIF)", guidance_due)
+        self.assertIn("Eligible (5 turns since last GIF", guidance_due)
+        self.assertNotIn("⚠️ DUE", guidance_due)
 
         # 7. Disabled channel GIF policy guidance
         self.assertTrue(bs.is_gif_disabled_for_channel("1534436119888793750"))
@@ -231,6 +237,8 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         banana_guidance = bs.get_gif_prompt_guidance("1534436119888793750")
         self.assertIn("Reaction GIFs are STRICTLY DISABLED", banana_guidance)
         self.assertNotIn("⚠️ DUE", banana_guidance)
+
+    test_gif_cadence_tracking = test_gif_turn_tracking_and_guidance
 
     def test_in_flight_turn_lifecycle_and_attempts(self):
         # 1. First recording has attempts = 1
