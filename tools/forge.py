@@ -524,7 +524,13 @@ def stage_vulcan_worktree_profile(
     files_snap: dict[str, dict] = {}
 
     def _record_snap(rel_p: str) -> None:
-        if rel_p in files_snap:
+        if (
+            rel_p in files_snap
+            or rel_p in norm_targets
+            or any(t.endswith("/" + rel_p) for t in norm_targets)
+        ):
+            return
+        if root_docs_targeted and rel_p in ("GEMINI.md", "AGENTS.md", "agents.md", "AGY.md"):
             return
         p = wt / rel_p
         try:
