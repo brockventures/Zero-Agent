@@ -8,7 +8,15 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _HOOKS_DIR = os.path.join(_REPO_ROOT, ".agents", "hooks")
 sys.path.insert(0, _HOOKS_DIR if os.path.isdir(_HOOKS_DIR) else "/workspace/.agents/hooks")
 sys.path.insert(0, _REPO_ROOT)
-from batch_guard import check_batching, check_tool_use, STATE_FILE, load_state
+from batch_guard import (
+    STATE_FILE,
+    check_batching,
+    check_interactive_investigation_gate,
+    check_tool_use,
+    is_exempt_from_investigation_gate,
+    load_state,
+    FORGE_CHANNEL_ID_STR,
+)
 import pytest
 
 
@@ -846,5 +854,191 @@ def test_throttle_heavy_compiler_command():
     clamped = throttle_heavy_compiler_command("pio run -e seeed_xiao_esp32s3 -j 8")
     assert "-j 2" in clamped
     assert "-j 8" not in clamped
+
+
+def test_is_exempt_from_investigation_gate():
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        # FORGE worker worktree and env var exemptions
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "ls"}, cwd="/tmp/forge-wt-chunk1") is True
+        with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": "1"}):
+            assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "ls"}) is True
+
+        # Mutating file operations are exempt
+        assert is_exempt_from_investigation_gate("edit_file", {"Path": "/foo.py"}) is True
+        assert is_exempt_from_investigation_gate("replace_file_content", {"Path": "/foo.py"}) is True
+        assert is_exempt_from_investigation_gate("write_file", {"Path": "/foo.py"}) is True
+        assert is_exempt_from_investigation_gate("write_to_file", {"Path": "/foo.py"}) is True
+
+        # Detached runner, FORGE offload, lifecycle, outbox, and testing commands are exempt
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/forge.py job start --name x"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/forge.py enqueue plan.json"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/detached_runner.py start"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/modal_harness.py --mode run"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/outbox.py --channel zero-ops"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/gif_tool.py"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "git commit -m 'feat'"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "git status"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "gh pr create --title t"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "pytest tests/test_foo.py"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "ruff check ."}) is True
+
+        # Non-exempt diagnostic commands and read tools
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "cat /workspace/config.json"}) is False
+        assert is_exempt_from_investigation_gate("view_file", {"Path": "/workspace/tools/foo.py"}) is False
+        assert is_exempt_from_investigation_gate("read_file", {"Path": "/workspace/tools/foo.py"}) is False
+        assert is_exempt_from_investigation_gate("grep_search", {"SearchPath": "/workspace/tools"}) is False
+        assert is_exempt_from_investigation_gate("find_by_name", {"SearchDirectory": "/workspace/tools"}) is False
+
+        # Direct check_interactive_investigation_gate returns True when in_flight_file is missing
+        ok_gate, _ = check_interactive_investigation_gate("read_file", {"Path": "/foo.py"}, state={}, in_flight_file="/nonexistent")
+        assert ok_gate is True
+
+
+def test_interactive_investigation_gate_steps_1_to_3_allowed_and_step_4_blocked_after_30s(tmp_path):
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        in_flight = tmp_path / "in_flight.json"
+        in_flight.write_text(json.dumps({"channel_id": 1542081375287640084, "prompt": "investigate memory spike"}))
+        state_file = str(tmp_path / "bg_state.json")
+        t0 = 1_800_000_000.0
+
+        # Steps 1 to 3 are allowed
+        ok1, _ = check_tool_use("read_file", {"Path": "/workspace/tools/a.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 5.0)
+        assert ok1 is True
+        ok2, _ = check_tool_use("grep_search", {"SearchPath": "/workspace/tools"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 10.0)
+        assert ok2 is True
+        ok3, _ = check_tool_use("run_command", {"CommandLine": "cat /workspace/data/log1.txt"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 20.0)
+        assert ok3 is True
+
+        st = load_state(state_file)
+        assert st["interactive_diag_steps"] == 3
+
+        # Step 4 after 30 seconds is blocked with detached-investigation handoff instructions
+        ok4, reason4 = check_tool_use("run_command", {"CommandLine": "cat /workspace/data/log2.txt"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 35.0)
+        assert ok4 is False
+        assert "Interactive Investigation Gate Triggered" in reason4
+        assert "forge.py job start" in reason4
+        assert "partial findings" in reason4
+        assert "contradiction check" in reason4
+
+
+def test_interactive_investigation_gate_handoff_and_lifecycle_exemptions(tmp_path):
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        in_flight = tmp_path / "in_flight.json"
+        in_flight.write_text(json.dumps({"channel_id": 1542081375287640084, "prompt": "investigate slow query"}))
+        state_file = str(tmp_path / "bg_state.json")
+        t0 = 1_800_000_000.0
+
+        # Run 3 diagnostic steps
+        check_tool_use("read_file", {"Path": "/workspace/tools/a.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 5.0)
+        check_tool_use("read_file", {"Path": "/workspace/tools/b.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 10.0)
+        check_tool_use("read_file", {"Path": "/workspace/tools/c.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 20.0)
+
+        # 3a. git commit is exempt even after 30s
+        ok_git, r_git = check_tool_use("run_command", {"CommandLine": 'git commit -m "chore: snapshot"'}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 36.0)
+        assert ok_git is True, f"git commit should be exempt from investigation gate, got: {r_git}"
+
+        # 3b. forge.py job start is exempt and executes cleanly
+        ok_forge, r_forge = check_tool_use(
+            "run_command",
+            {"CommandLine": 'python3 /workspace/tools/forge.py job start --name "Deep probe" --command "python3 /workspace/scratch/probe.py"'},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 37.0,
+        )
+        assert ok_forge is True, f"forge.py job start should be exempt from investigation gate, got: {r_forge}"
+
+        # 3c. outbox.py status report is exempt from post-offload lock
+        ok_outbox, r_outbox = check_tool_use(
+            "run_command",
+            {"CommandLine": 'python3 /workspace/tools/outbox.py --channel zero-ops --message "status"'},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 38.0,
+        )
+        assert ok_outbox is True, f"outbox.py should be exempt from post-offload lock, got: {r_outbox}"
+
+
+def test_interactive_investigation_gate_hard_limit_after_5_steps_even_under_30s(tmp_path):
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        state_file = str(tmp_path / "bg_state.json")
+        in_flight = tmp_path / "in_flight.json"
+        in_flight.write_text(json.dumps({"channel_id": 1542081375287640084, "prompt": "rapid investigation"}))
+        t0 = 1_800_000_000.0
+
+        for i in range(5):
+            ok, r = check_tool_use("read_file", {"Path": f"/workspace/tools/{i}.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + i * 2.0)
+            assert ok is True, f"Step {i+1} should be allowed, got: {r}"
+
+        # Step 6 under 30s triggers the hard limit
+        ok6, reason6 = check_tool_use("read_file", {"Path": "/workspace/tools/5.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 12.0)
+        assert ok6 is False
+        assert "Interactive Investigation Gate Triggered" in reason6
+
+
+def test_interactive_investigation_gate_exempt_in_forge_channel(tmp_path):
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        state_file = str(tmp_path / "bg_state.json")
+        in_flight = tmp_path / "in_flight.json"
+        in_flight.write_text(json.dumps({"channel_id": int(FORGE_CHANNEL_ID_STR), "prompt": "build job"}))
+        t0 = 1_800_000_000.0
+
+        # 4 diagnostic steps after 40s in #forge channel are not gated
+        for i in range(4):
+            ok_f, r_f = check_tool_use("read_file", {"Path": f"/workspace/tools/{i}.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 40.0 + i)
+            assert ok_f is True, f"Step {i+1} in #forge should be allowed, got: {r_f}"
+
+
+def test_interactive_investigation_gate_exempt_for_forge_worker(tmp_path):
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        state_file = str(tmp_path / "bg_state.json")
+        in_flight = tmp_path / "in_flight.json"
+        in_flight.write_text(json.dumps({"channel_id": 1542081375287640084, "prompt": "interactive turn"}))
+        t0 = 1_800_000_000.0
+
+        # Allowed when cwd starts with /tmp/forge-wt-
+        ok_wt, _ = check_tool_use("read_file", {"Path": "/workspace/tools/x.py"}, state_file=state_file, cwd="/tmp/forge-wt-chunk1", in_flight_file=str(in_flight), now=t0 + 40.0)
+        assert ok_wt is True
+
+    # Allowed when FORGE_WORKER_ACTIVE == "1"
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": "1"}):
+        state_file2 = str(tmp_path / "bg_state2.json")
+        ok_env, _ = check_tool_use("read_file", {"Path": "/workspace/tools/y.py"}, state_file=state_file2, in_flight_file=str(in_flight), now=t0 + 40.0)
+        assert ok_env is True
+
+
+def test_interactive_diag_steps_preserved_across_short_idle_resets(tmp_path):
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        state_file = str(tmp_path / "bg_state.json")
+        in_flight = tmp_path / "in_flight.json"
+        in_flight.write_text(json.dumps({"channel_id": 1542081375287640084, "prompt": "idle test"}))
+        t_idle = 1_800_100_000.0
+
+        check_tool_use("read_file", {"Path": "/workspace/tools/1.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t_idle)
+        check_tool_use("read_file", {"Path": "/workspace/tools/2.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t_idle + 5.0)
+
+        # 50s idle gap (>45s reset) within same turn preserves interactive_diag_steps
+        check_tool_use("read_file", {"Path": "/workspace/tools/3.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t_idle + 55.0)
+        st = load_state(state_file)
+        assert st["interactive_diag_steps"] == 3
+
+        # Step 4 at 60s elapsed (>30s) is blocked
+        ok4, reason4 = check_tool_use("read_file", {"Path": "/workspace/tools/4.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t_idle + 60.0)
+        assert ok4 is False
+        assert "Interactive Investigation Gate Triggered" in reason4
+
 
 

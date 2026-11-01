@@ -42,6 +42,11 @@ MAX_INLINE_RUN_COMMANDS_AFTER_90S = 15
 TURN_RESET_IDLE_SECONDS = 45.0
 TURN_STATE_EXPIRY_SECONDS = 900.0
 
+INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S = 3
+INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT = 5
+INTERACTIVE_DIAG_TIME_WINDOW_SECONDS = 30.0
+FORGE_CHANNEL_ID_STR = "1562899941595160657"
+
 _VERSIONED_SCRATCH_SWEEP_RE = re.compile(
     r"(?:^|/)(?:scratch|brain/[^/]+/scratch|tmp)/(?:(?P<stem>[a-zA-Z0-9_-]*?(?:sim|sweep|grid|solve|tune|calib|opt)[a-zA-Z0-9_-]*?)_v\d+|v\d+)\.py$",
     re.IGNORECASE,
@@ -95,6 +100,7 @@ def _default_state(now: float = 0.0) -> dict:
         "turn_run_commands": 0,
         "offload_dispatched": False,
         "offload_kind": "",
+        "interactive_diag_steps": 0,
     }
 
 
@@ -254,6 +260,158 @@ def _get_current_turn_Step_anchor(
     if in_flight_sig:
         parts.append(in_flight_sig)
     return ":".join(parts)
+
+
+def _get_in_flight_channel_id(in_flight_file: str = IN_FLIGHT_TURN_FILE) -> int | str | None:
+    """Extract active channel ID from in_flight_turn.json if present."""
+    if not in_flight_file or not os.path.exists(in_flight_file):
+        return None
+    try:
+        with open(in_flight_file, "r", encoding="utf-8", errors="ignore") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not data:
+            return None
+
+        agy_pid = _get_agy_ancestor_pid()
+
+        # 1. Match ancestor PID in nested dicts
+        for k, v in data.items():
+            if isinstance(v, dict):
+                if v.get("pid") and v.get("pid") == agy_pid and v.get("channel_id") is not None:
+                    return v.get("channel_id")
+
+        # 2. Key matching DISCORD_CHANNEL_ID env
+        env_ch = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
+        if env_ch and env_ch in data and isinstance(data[env_ch], dict):
+            entry_pid = data[env_ch].get("pid")
+            if not entry_pid or entry_pid == agy_pid:
+                return data[env_ch].get("channel_id", env_ch)
+
+        # 3. Direct channel_id field if pid matches or is omitted
+        top_pid = data.get("pid")
+        if "channel_id" in data and data["channel_id"] is not None:
+            if not top_pid or top_pid == agy_pid:
+                return data["channel_id"]
+
+        # 4. Check nested entries without a pid conflict (e.g. test fixtures where pid is None)
+        dict_entries = [
+            (k, v)
+            for k, v in data.items()
+            if isinstance(v, dict) and ("prompt" in v or "ts" in v or "status_msg_id" in v or "channel_id" in v)
+        ]
+        eligible_entries = [
+            (k, v) for k, v in dict_entries
+            if not v.get("pid") or v.get("pid") == agy_pid
+        ]
+        if len(eligible_entries) == 1:
+            k, v = eligible_entries[0]
+            return v.get("channel_id", k)
+        elif eligible_entries:
+            k, recent = max(eligible_entries, key=lambda item: float(item[1].get("ts") or 0.0))
+            return recent.get("channel_id", k)
+
+        for k, v in data.items():
+            if isinstance(v, dict):
+                entry_pid = v.get("pid")
+                if not entry_pid or entry_pid == agy_pid:
+                    return v.get("channel_id", k)
+            elif not top_pid or top_pid == agy_pid:
+                return k
+    except Exception:
+        return None
+    return None
+
+
+def is_exempt_from_investigation_gate(name: str, args: dict, cwd: str = "/workspace") -> bool:
+    """Return True if tool invocation is exempt from interactive investigation step limits."""
+    if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
+        return True
+    norm_cwd = _norm_posix(cwd or "/workspace", "/")
+    if norm_cwd.startswith("/tmp/forge-wt-"):
+        return True
+    if name in ("edit_file", "replace_file_content", "write_file", "write_to_file"):
+        return True
+    if name == "run_command":
+        cmd = str(args.get("CommandLine") or "")
+        exempt_tokens = (
+            "forge.py",
+            "detached_runner.py",
+            "modal_harness.py",
+            "outbox.py",
+            "gif_tool.py",
+            "git ",
+            "gh ",
+            "pytest",
+            "ruff",
+        )
+        if any(tok in cmd for tok in exempt_tokens):
+            return True
+        if re.search(r"\b(?:git|gh)\b", cmd):
+            return True
+    return False
+
+
+def check_interactive_investigation_gate(
+    name: str,
+    args: dict,
+    state: dict,
+    state_file: str = STATE_FILE,
+    cwd: str = "/workspace",
+    now: float = 0.0,
+    in_flight_file: str = IN_FLIGHT_TURN_FILE,
+) -> tuple[bool, str]:
+    """Check deterministic tool-step/elapsed-time gate for interactive Discord bridge turns.
+
+    Open-ended investigations (>3 diagnostic steps after 30s or >5 total diagnostic steps)
+    must wrap up initial verified findings, hand heavy probes to forge.py job start, and
+    perform an explicit contradiction check against the first reply when woken on completion.
+    """
+    if now <= 0.0:
+        now = time.time()
+
+    if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
+        return True, ""
+    norm_cwd = _norm_posix(cwd or "/workspace", "/")
+    if norm_cwd.startswith("/tmp/forge-wt-"):
+        return True, ""
+
+    if not in_flight_file or not os.path.exists(in_flight_file):
+        return True, ""
+
+    channel_id = _get_in_flight_channel_id(in_flight_file)
+    if not channel_id or str(channel_id).strip() == FORGE_CHANNEL_ID_STR:
+        return True, ""
+
+    if is_exempt_from_investigation_gate(name, args, cwd=cwd):
+        return True, ""
+
+    diagnostic_tools = ("run_command", "view_file", "read_file", "grep_search", "find_by_name")
+    if name not in diagnostic_tools:
+        return True, ""
+
+    current_steps = int(state.get("interactive_diag_steps", 0)) + 1
+    state["interactive_diag_steps"] = current_steps
+
+    turn_start = float(state.get("turn_start_time", now) or now)
+    elapsed = max(0.0, now - turn_start)
+
+    if (
+        current_steps > INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S
+        and elapsed >= INTERACTIVE_DIAG_TIME_WINDOW_SECONDS
+    ) or current_steps > INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT:
+        save_state(state, state_file)
+        reason = (
+            f"Interactive Investigation Gate Triggered: Detected {current_steps} diagnostic tool steps "
+            f"over {elapsed:.1f}s (ceiling: 3 steps after 30.0s, max 5 steps). "
+            "Open-ended investigations in interactive Discord turns must wrap up initial verified findings immediately. "
+            "Close your initial turn now with a clear summary of verified partial findings and hand off deeper diagnostic probes "
+            "to a detached background task via `python3 /workspace/tools/forge.py job start` "
+            "(or `python3 /workspace/tools/forge.py enqueue` for multi-file code builds). "
+            "When woken on completion, reread the channel history and perform an explicit contradiction check against your initial reply."
+        )
+        return False, reason
+
+    return True, ""
 
 
 def load_state(state_file: str = STATE_FILE) -> dict:
@@ -926,9 +1084,13 @@ def check_tool_use(
     args: dict,
     state_file: str = STATE_FILE,
     cwd: str = "/workspace",
-    in_flight_file: str = IN_FLIGHT_TURN_FILE,
+    in_flight_file: str | None = None,
+    now: float | None = None,
 ) -> tuple[bool, str]:
-    now = time.time()
+    if in_flight_file is None:
+        in_flight_file = IN_FLIGHT_TURN_FILE
+    if now is None or now <= 0.0:
+        now = time.time()
     state = load_state(state_file)
     turn_anchor = _get_current_turn_Step_anchor(in_flight_file=in_flight_file)
     prev_anchor = str(state.get("agy_ppid") or "")
@@ -949,6 +1111,7 @@ def check_tool_use(
         preserved_offload = bool(state.get("offload_dispatched", False))
         preserved_offload_kind = str(state.get("offload_kind", ""))
         preserved_start = float(state.get("turn_start_time", now) or now)
+        preserved_diag_steps = int(state.get("interactive_diag_steps", 0))
         state = _default_state(now)
         state["inline_prod_files"] = preserved_prod
         state["versioned_scratch_sweeps"] = preserved_sweeps
@@ -958,8 +1121,15 @@ def check_tool_use(
         state["turn_run_commands"] = preserved_turn_cmds
         state["offload_dispatched"] = preserved_offload
         state["offload_kind"] = preserved_offload_kind
+        state["interactive_diag_steps"] = preserved_diag_steps
         # Keep original turn_start_time if the turn has already started mutating files, running commands, or running scratch sweeps
-        if preserved_total_scratch > 0 or len(preserved_prod) > 0 or preserved_turn_cmds > 0 or preserved_offload:
+        if (
+            preserved_total_scratch > 0
+            or len(preserved_prod) > 0
+            or preserved_turn_cmds > 0
+            or preserved_offload
+            or preserved_diag_steps > 0
+        ):
             state["turn_start_time"] = preserved_start
         else:
             state["turn_start_time"] = now
@@ -992,6 +1162,22 @@ def check_tool_use(
                 "Do not continue executing commands, editing scripts, or spawning additional jobs in the same turn. "
                 "End your turn immediately (output your brief launch status to Ryan) and wait for the asynchronous completion wakeup."
             )
+
+    # 0c. Deterministic Interactive Investigation Gate:
+    # Wrap up open-ended investigations (>3 diagnostic steps after 30s or >5 steps) in interactive Discord turns
+    if in_flight_file and os.path.exists(in_flight_file):
+        ok_gate, gate_reason = check_interactive_investigation_gate(
+            name=name,
+            args=args,
+            state=state,
+            state_file=state_file,
+            cwd=cwd,
+            now=now,
+            in_flight_file=in_flight_file,
+        )
+        if not ok_gate:
+            save_state(state, state_file)
+            return False, gate_reason
 
     # 1. run_command check
     if name == "run_command":
