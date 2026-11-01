@@ -1109,6 +1109,10 @@ def check_runaway_tool_loop(
 _EXPLICIT_LINE_RANGE_RE = re.compile(
     r"^(?:[A-Za-z0-9_.]+\s*:\s*)?[Ll]?(\d+)(?:\s*[-–]\s*[Ll]?(\d+))?$"
 )
+_PARENTHETICAL_LINE_RANGE_RE = re.compile(
+    r"^.*?\(\s*(?:(?:lines?|around\s+lines?|[Ll])\s*(\d+)(?:\s*[-–]\s*(?:lines?|[Ll])?\s*(\d+))?|(\d+)\s*[-–]\s*(\d+))\s*\)$",
+    re.IGNORECASE,
+)
 _INSTRUCTION_LINE_REF_RE = re.compile(
     r"(?:\b(?:lines?|around\s+lines?)\s+[Ll]?(\d+)(?:\s*[-–]\s*[Ll]?(\d+))?\b|\bL(\d+)\s*[-–]\s*L?(\d+)\b)",
     re.IGNORECASE,
@@ -1137,7 +1141,20 @@ def extract_symbol_snippet(
     if not sym_clean:
         return ""
 
-    # 0. Explicit line-range or line-number lookup (e.g. "1980-2020", "L1985-L2012", "func:1980-2020")
+    # 0. Parenthetical line-range lookup (e.g. "BIGModelSuite.predict_pitcher (lines 1643-1653)", "func (L120-L150)")
+    m_paren = _PARENTHETICAL_LINE_RANGE_RE.match(sym_clean)
+    if m_paren:
+        g1 = m_paren.group(1) or m_paren.group(3)
+        g2 = m_paren.group(2) or m_paren.group(4)
+        l_start = max(1, int(g1))
+        l_end = max(l_start, int(g2)) if g2 else l_start
+        start_idx = max(0, l_start - 1)
+        end_idx = min(len(lines), max(start_idx + 1, min(l_end, start_idx + max_lines)))
+        if start_idx < len(lines):
+            return "\n".join(f"{i + 1:4d}: {lines[i]}" for i in range(start_idx, end_idx))
+        return ""
+
+    # 1. Explicit line-range or line-number lookup (e.g. "1980-2020", "L1985-L2012", "func:1980-2020")
     m_range = _EXPLICIT_LINE_RANGE_RE.match(sym_clean)
     if m_range:
         l_start = max(1, int(m_range.group(1)))
@@ -1149,7 +1166,7 @@ def extract_symbol_snippet(
             return "\n".join(f"{i + 1:4d}: {lines[i]}" for i in range(start_idx, end_idx))
         return ""
 
-    # 1. Try Python AST lookup for exact class/function/method boundaries
+    # 2. Try Python AST lookup for exact class/function/method boundaries
     if p.suffix == ".py":
         try:
             tree = ast.parse(src)
@@ -1488,8 +1505,8 @@ def check_target_file_overlap(
 
 MAX_SINGLE_CHUNK_TARGET_FILES = 3
 MAX_CHUNK_TARGET_FILES = 5
-MAX_CHUNK_INSTRUCTION_CHARS = 1800
-MAX_CHUNK_NUMBERED_TASKS = 3
+MAX_CHUNK_INSTRUCTION_CHARS = 4000
+MAX_CHUNK_NUMBERED_TASKS = 6
 
 
 def _count_numbered_workstreams(instructions: str) -> int:
@@ -1539,10 +1556,10 @@ def _check_oversized_class_symbol(
         return None
     if "." in sym_name:
         return None
-    if _EXPLICIT_LINE_RANGE_RE.match(sym_name):
+    if _EXPLICIT_LINE_RANGE_RE.match(sym_name) or _PARENTHETICAL_LINE_RANGE_RE.match(sym_name):
         return None
     clean_sym = sym_name.split("(")[0].strip()
-    if not clean_sym or _EXPLICIT_LINE_RANGE_RE.match(clean_sym):
+    if not clean_sym or _EXPLICIT_LINE_RANGE_RE.match(clean_sym) or _PARENTHETICAL_LINE_RANGE_RE.match(clean_sym):
         return None
 
     try:
@@ -1566,6 +1583,98 @@ def _check_oversized_class_symbol(
     return None
 
 
+def _is_chunk_0_present_in_plan(all_chunks: list) -> bool:
+    """Return True if chunk 0 (0-indexing) is explicitly referenced or present in all_chunks."""
+    for c in all_chunks:
+        if not isinstance(c, dict):
+            continue
+        for key in ("id", "chunk_id"):
+            val = str(c.get(key) or "").strip().lower()
+            if val in ("0", "c0", "c-0", "chunk-0", "chunk_0", "chunk0"):
+                return True
+        raw = c.get("depends_on")
+        if raw is not None:
+            raw_list = [raw] if isinstance(raw, (int, str)) else list(raw)
+            for item in raw_list:
+                item_str = str(item).strip().lower()
+                if item_str in ("0", "c0", "c-0", "chunk-0", "chunk_0", "chunk0") or item == 0:
+                    return True
+        title = str(c.get("title") or "").lower()
+        if re.search(r"\bchunk[-_\s]*0\b", title) or re.search(r"\bc0\b", title):
+            return True
+    return False
+
+
+def _coerce_dependency_ref(
+    d: Any,
+    chunk_idx: int,
+    n_chunks: int,
+    chunk_0_present: bool,
+    id_to_index: dict[str, int],
+) -> Any:
+    """Coerce string/integer chunk dependency reference to integer 0-indexed chunk index."""
+    if isinstance(d, int):
+        if d == 0:
+            return 0
+        if chunk_idx == 1 and d == 1 and not chunk_0_present:
+            return 0
+        return d
+
+    d_str = str(d).strip()
+    d_lower = d_str.lower()
+    if d_lower in id_to_index:
+        return id_to_index[d_lower]
+
+    m = re.match(r"^(?:c(?:hunk)?[-_ ]?)?(\d+)$", d_lower)
+    if m:
+        num = int(m.group(1))
+        if num == 0:
+            return 0
+        if chunk_idx == 1 and num == 1 and not chunk_0_present:
+            return 0
+        if not chunk_0_present and 1 <= num <= n_chunks and num <= chunk_idx:
+            return num - 1
+        return num
+
+    return d
+
+
+def _normalize_chunk_dict_in_place(ch: dict, idx: int, all_chunks: list) -> None:
+    """Auto-normalize chunk aliases (files -> target_files, description/prompt -> instructions, depends_on coercion)."""
+    if not isinstance(ch, dict):
+        return
+
+    # 1. Normalize target_files from target_files or files
+    t_files = ch.get("target_files") or ch.get("files")
+    if t_files is not None:
+        ch["target_files"] = t_files
+
+    # 2. Normalize instructions from instructions, description, or prompt
+    instr = ch.get("instructions") or ch.get("description") or ch.get("prompt")
+    if instr is not None:
+        ch["instructions"] = instr
+
+    # 3. Normalize depends_on string / 1-indexed references to integer 0-indexed indices
+    raw_deps = ch.get("depends_on")
+    if raw_deps is not None:
+        chunk_0_present = _is_chunk_0_present_in_plan(all_chunks)
+        id_to_index: dict[str, int] = {}
+        for c_idx, c_obj in enumerate(all_chunks):
+            if isinstance(c_obj, dict):
+                cid = c_obj.get("id")
+                if cid is not None:
+                    id_to_index[str(cid).strip().lower()] = c_idx
+                c_chunk_id = c_obj.get("chunk_id")
+                if c_chunk_id is not None:
+                    id_to_index[str(c_chunk_id).strip().lower()] = c_idx
+
+        raw_list = [raw_deps] if isinstance(raw_deps, (int, str)) else list(raw_deps)
+        norm_list = []
+        for d in raw_list:
+            norm_list.append(_coerce_dependency_ref(d, idx, len(all_chunks), chunk_0_present, id_to_index))
+        ch["depends_on"] = norm_list
+
+
 def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
     """Validate a ForgePlan with zero chat context against existing repository symbols and chunk dependencies."""
     if not isinstance(plan, dict):
@@ -1578,6 +1687,10 @@ def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
     findings: list[str] = []
     default_repo_str = str(plan.get("repo") or "/workspace").strip()
     n_chunks = len(chunks)
+
+    for idx, ch in enumerate(chunks):
+        if isinstance(ch, dict):
+            _normalize_chunk_dict_in_place(ch, idx, chunks)
 
     # 1. Target symbols validation
     for idx, ch in enumerate(chunks):
@@ -1734,6 +1847,7 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     for idx, ch in enumerate(chunks):
         if not isinstance(ch, dict):
             return False, f"Chunk at index {idx} must be an object."
+        _normalize_chunk_dict_in_place(ch, idx, chunks)
         ch_title = str(ch.get("title") or "").strip()
         if not ch_title:
             return False, f"Chunk {idx} is missing 'title'."
@@ -2834,6 +2948,48 @@ def enqueue_build(
     in_flight_path: Path | str = DATA_DIR / "in_flight_turn.json",
 ) -> dict:
     """Validate and enqueue a multi-chunk FORGE build plan with pre-enqueue target-file overlap deduplication and complexity approval gate."""
+    def _clear_offload_dispatched():
+        try:
+            bs_p = Path(batch_state_path)
+            if bs_p.exists():
+                bs_data = json.loads(bs_p.read_text(encoding="utf-8"))
+                if isinstance(bs_data, dict) and bs_data.get("offload_dispatched"):
+                    bs_data["offload_dispatched"] = False
+                    bs_data["offload_kind"] = ""
+                    bs_p.write_text(json.dumps(bs_data), encoding="utf-8")
+        except Exception:
+            pass
+
+    try:
+        return _enqueue_build_impl(
+            plan=plan,
+            db_path=db_path,
+            post_widget=post_widget,
+            allow_overlap=allow_overlap,
+            check_approval_gate=check_approval_gate,
+            batch_state_path=batch_state_path,
+            in_flight_path=in_flight_path,
+        )
+    except Exception:
+        _clear_offload_dispatched()
+        raise
+
+
+def _enqueue_build_impl(
+    plan: dict,
+    db_path: Path | str = FORGE_DB_PATH,
+    post_widget: bool = True,
+    allow_overlap: bool = False,
+    check_approval_gate: bool = False,
+    batch_state_path: Path | str = "/tmp/batch_guard_state.json",
+    in_flight_path: Path | str = DATA_DIR / "in_flight_turn.json",
+) -> dict:
+    chunks = plan.get("chunks") if isinstance(plan, dict) else None
+    if isinstance(chunks, list):
+        for idx, ch in enumerate(chunks):
+            if isinstance(ch, dict):
+                _normalize_chunk_dict_in_place(ch, idx, chunks)
+
     valid, reason = validate_forge_plan(plan)
     if not valid:
         raise ValueError(f"Invalid ForgePlan: {reason}")

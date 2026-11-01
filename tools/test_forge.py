@@ -1073,12 +1073,14 @@ class TestForgeEngine(unittest.TestCase):
                 }
             ],
         }
+        nonexistent_ifp = Path(self.tmp_dir.name) / "nonexistent_in_flight.json"
         res_fast = enqueue_build(
             fast_plan,
             db_path=self.db_path,
             post_widget=False,
             check_approval_gate=True,
             batch_state_path="/tmp/nonexistent_batch_state.json",
+            in_flight_path=nonexistent_ifp,
         )
         self.assertTrue(res_fast["ok"])
         self.assertIn("build_id", res_fast)
@@ -1109,6 +1111,7 @@ class TestForgeEngine(unittest.TestCase):
             post_widget=False,
             check_approval_gate=True,
             batch_state_path="/tmp/nonexistent_batch_state.json",
+            in_flight_path=nonexistent_ifp,
         )
         self.assertTrue(res_t3["ok"])
         self.assertEqual(res_t3["status"], "awaiting_approval")
@@ -1138,7 +1141,13 @@ class TestForgeEngine(unittest.TestCase):
                 }
             ],
         }
-        req_wide, reasons_wide = forge_mod.evaluate_plan_approval_gate(wide_plan, batch_state_path="/tmp/nonexistent.json")
+        nonexistent_ifp = Path(self.tmp_dir.name) / "nonexistent_in_flight.json"
+        req_wide, reasons_wide = forge_mod.evaluate_plan_approval_gate(
+            wide_plan,
+            batch_state_path="/tmp/nonexistent.json",
+            in_flight_path=nonexistent_ifp,
+            db_path=self.db_path,
+        )
         self.assertTrue(req_wide)
         self.assertTrue(any("4 target files" in r for r in reasons_wide))
 
@@ -1148,7 +1157,12 @@ class TestForgeEngine(unittest.TestCase):
             json.dumps({"last_time": now_ts, "turn_start_time": now_ts - 120.0, "total_scratch_runs": 3}),
             encoding="utf-8",
         )
-        req_cal, reasons_cal = forge_mod.evaluate_plan_approval_gate(fast_plan, batch_state_path=bs_file)
+        req_cal, reasons_cal = forge_mod.evaluate_plan_approval_gate(
+            fast_plan,
+            batch_state_path=bs_file,
+            in_flight_path=nonexistent_ifp,
+            db_path=self.db_path,
+        )
         self.assertTrue(req_cal)
         self.assertTrue(any("Post-calibration" in r for r in reasons_cal))
 
@@ -2002,7 +2016,7 @@ def test_chunk_split_gate_and_worktree_resume_salvage(tmp_path, monkeypatch):
     assert "Chunk-Split Gate" in msg_f
     assert "4 target_files" in msg_f
 
-    # 2. Chunk with > 1800 chars of instructions is rejected
+    # 2. Chunk with > 4000 chars of instructions is rejected
     over_chars_plan = {
         "title": "Mega Prose Plan",
         "repo": str(repo_dir),
@@ -2012,18 +2026,18 @@ def test_chunk_split_gate_and_worktree_resume_salvage(tmp_path, monkeypatch):
             {
                 "title": "Giant Instruction Block",
                 "target_files": ["mod_a.py"],
-                "instructions": "Implement feature: " + ("x" * 1850),
+                "instructions": "Implement feature: " + ("x" * 4050),
             }
         ],
     }
     ok_c, msg_c = forge.validate_forge_plan(over_chars_plan)
     assert not ok_c
     assert "Chunk-Split Gate" in msg_c
-    assert "1800 chars" in msg_c
+    assert "4000 chars" in msg_c
 
-    # 3. Chunk packing 4+ numbered tasks is rejected
+    # 3. Chunk packing 7+ numbered tasks is rejected (> 6 max)
     over_tasks_plan = {
-        "title": "Five Tasks in One Chunk",
+        "title": "Seven Tasks in One Chunk",
         "repo": str(repo_dir),
         "origin_channel_id": forge.FORGE_CHANNEL_ID,
         "context_fact_sheet": ["Enforce atomic chunks"],
@@ -2036,6 +2050,9 @@ def test_chunk_split_gate_and_worktree_resume_salvage(tmp_path, monkeypatch):
                     "2. Upsert 2027 contracts.\n"
                     "3. Cap backup catchers.\n"
                     "4. Update README and rebuild standings.\n"
+                    "5. Run migration tests.\n"
+                    "6. Clean temporary tables.\n"
+                    "7. Verify final stats.\n"
                 ),
             }
         ],
@@ -2043,7 +2060,7 @@ def test_chunk_split_gate_and_worktree_resume_salvage(tmp_path, monkeypatch):
     ok_t, msg_t = forge.validate_forge_plan(over_tasks_plan)
     assert not ok_t
     assert "Chunk-Split Gate" in msg_t
-    assert "4 numbered tasks" in msg_t
+    assert "7 numbered tasks" in msg_t
 
     # 4. Worktree Resume across timeout retry: Attempt 1 writes mod_a.py then times out;
     # Attempt 2 sees the Worktree Resume State prompt with mod_a.py already modified and finishes mod_b.py
@@ -2170,7 +2187,8 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
     embed_pending = render_decision_card_embed(row_pending)
     assert embed_pending["title"] == "🛡️ Deploy Test Pipeline"
     assert embed_pending["color"] == 0xF59E0B
-    assert embed_pending["description"] == "Automated build for testing native Discord embeds."
+    assert "Automated build for testing native Discord embeds." in embed_pending["description"]
+    assert "**Approve Action:** Run `echo 'deployed'`" in embed_pending["description"]
     assert "FORGE · Expires" in embed_pending["footer"]["text"]
 
     text_pending = format_decision_card_text(row_pending)
@@ -2210,7 +2228,8 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
     embed_dismissed = dis_res["formatted_embed"]
     assert embed_dismissed["title"] == "🛑 Reboot Gateway"
     assert embed_dismissed["color"] == 0x6B7280
-    assert embed_dismissed["description"] == "~Planned maintenance reboot.~"
+    assert "Planned maintenance reboot." in embed_dismissed["description"]
+    assert "**Approve Action:** Run `true`" in embed_dismissed["description"]
     assert "Dismissed ·" in embed_dismissed["footer"]["text"]
 
     # 4. Expired and Failed Decision Card Embed
@@ -2230,7 +2249,8 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
     embed_exp = render_decision_card_embed(row_exp)
     assert embed_exp["title"] == "⏱️ Old Action"
     assert embed_exp["color"] == 0x6B7280
-    assert embed_exp["description"] == "~Action that timed out.~"
+    assert "Action that timed out." in embed_exp["description"]
+    assert "**Approve Action:** Run `true`" in embed_exp["description"]
     assert embed_exp["footer"]["text"] == "Expired without action"
 
     d_fail = stage_decision(
@@ -2262,19 +2282,35 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
         ],
     }
     # Without bypass, multi-chunk requires approval
-    req, reasons = evaluate_plan_approval_gate(multi_chunk_plan, batch_state_path="/tmp/nonexistent.json")
+    nonexistent_ifp = tmp_path / "nonexistent_in_flight.json"
+    req, reasons = evaluate_plan_approval_gate(
+        multi_chunk_plan,
+        batch_state_path="/tmp/nonexistent.json",
+        in_flight_path=nonexistent_ifp,
+        db_path=db_p,
+    )
     assert req is True
     assert any("Multi-chunk" in r for r in reasons)
 
     # With approved=True
     plan_appr = dict(multi_chunk_plan, approved=True)
-    req_a, reasons_a = evaluate_plan_approval_gate(plan_appr, batch_state_path="/tmp/nonexistent.json")
+    req_a, reasons_a = evaluate_plan_approval_gate(
+        plan_appr,
+        batch_state_path="/tmp/nonexistent.json",
+        in_flight_path=nonexistent_ifp,
+        db_path=db_p,
+    )
     assert req_a is False
     assert reasons_a == []
 
     # With skip_approval=True
     plan_skip = dict(multi_chunk_plan, skip_approval=True)
-    req_s, reasons_s = evaluate_plan_approval_gate(plan_skip, batch_state_path="/tmp/nonexistent.json")
+    req_s, reasons_s = evaluate_plan_approval_gate(
+        plan_skip,
+        batch_state_path="/tmp/nonexistent.json",
+        in_flight_path=nonexistent_ifp,
+        db_path=db_p,
+    )
     assert req_s is False
     assert reasons_s == []
 
@@ -2297,6 +2333,7 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
             multi_chunk_plan,
             batch_state_path="/tmp/nonexistent.json",
             in_flight_path=in_flight_file,
+            db_path=db_p,
         )
         assert req_d is False, f"Directive '{directive}' should have bypassed approval gate"
         assert reasons_d == []
@@ -2310,6 +2347,7 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
         multi_chunk_plan,
         batch_state_path="/tmp/nonexistent.json",
         in_flight_path=in_flight_file,
+        db_path=db_p,
     )
     assert req_nested is False
 
@@ -2319,6 +2357,7 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
         multi_chunk_plan,
         batch_state_path="/tmp/nonexistent.json",
         in_flight_path=in_flight_file,
+        db_path=db_p,
     )
     assert req_non is True
 
@@ -2489,6 +2528,231 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
             mock_enq_approved.assert_called_once()
             passed_plan = mock_enq_approved.call_args[0][0]
             assert passed_plan["origin_channel_id"] == banana_stand_ch
+
+
+def test_forge_plan_alias_normalization_and_depends_on_coercion(tmp_path):
+    """Verify validate_forge_plan and preflight auto-normalize chunk aliases and string depends_on."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "vulcan@example.com"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Vulcan"], cwd=str(repo_dir), check=True, capture_output=True)
+    (repo_dir / "mod_a.py").write_text("x = 1\n", encoding="utf-8")
+    (repo_dir / "mod_b.py").write_text("y = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+
+    # 1. Alias normalization: files -> target_files, description/prompt -> instructions, depends_on: "c0"
+    plan_aliases = {
+        "title": "Alias Normalization Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Architectural fact 1"],
+        "chunks": [
+            {
+                "title": "Chunk 0",
+                "files": ["mod_a.py"],
+                "description": "Implement feature A with unit tests in mod_a.py.",
+            },
+            {
+                "title": "Chunk 1",
+                "files": ["mod_b.py"],
+                "prompt": "Implement feature B with unit tests in mod_b.py.",
+                "depends_on": "c0",
+            },
+        ],
+    }
+    ok, msg = forge_mod.validate_forge_plan(plan_aliases)
+    assert ok is True, f"Validation failed: {msg}"
+    assert plan_aliases["chunks"][0]["target_files"] == ["mod_a.py"]
+    assert plan_aliases["chunks"][0]["instructions"] == "Implement feature A with unit tests in mod_a.py."
+    assert plan_aliases["chunks"][1]["target_files"] == ["mod_b.py"]
+    assert plan_aliases["chunks"][1]["instructions"] == "Implement feature B with unit tests in mod_b.py."
+    assert plan_aliases["chunks"][1]["depends_on"] == [0]
+
+    # 2. String depends_on coercion: "chunk-0", "0", 0
+    for dep_val in ("chunk-0", "0", 0, ["chunk-0"], ["0"], [0]):
+        ch_test = {
+            "title": "Chunk 1",
+            "files": ["mod_b.py"],
+            "instructions": "Implement feature B in mod_b.py.",
+            "depends_on": dep_val,
+        }
+        all_c = [{"title": "Chunk 0", "files": ["mod_a.py"], "instructions": "Impl A"}, ch_test]
+        forge_mod._normalize_chunk_dict_in_place(ch_test, 1, all_c)
+        assert ch_test["depends_on"] == [0], f"Failed for dep_val={dep_val}: {ch_test['depends_on']}"
+
+    # 3. 1-indexed "chunk-1" on chunk index 1 (when "chunk-0" is not present in the plan)
+    plan_1indexed = {
+        "title": "1-Indexed Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Setup Step",
+                "target_files": ["mod_a.py"],
+                "instructions": "Run setup steps.",
+            },
+            {
+                "title": "Build Step",
+                "target_files": ["mod_b.py"],
+                "instructions": "Run build steps.",
+                "depends_on": ["chunk-1"],
+            },
+        ],
+    }
+    ok_1i, msg_1i = forge_mod.validate_forge_plan(plan_1indexed)
+    assert ok_1i is True, f"1-indexed validation failed: {msg_1i}"
+    assert plan_1indexed["chunks"][1]["depends_on"] == [0]
+
+
+def test_forge_plan_split_caps_4000_chars_and_6_tasks(tmp_path):
+    """Verify relaxed split caps (4000 chars instructions and 6 numbered tasks)."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "vulcan@example.com"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Vulcan"], cwd=str(repo_dir), check=True, capture_output=True)
+    (repo_dir / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+
+    # 1. 3500 chars and 6 numbered tasks passes
+    detailed_instructions = (
+        "1. First task with detailed specification.\n"
+        "2. Second task with detailed architectural rules.\n"
+        "3. Third task with full error handling.\n"
+        "4. Fourth task with edge cases and guards.\n"
+        "5. Fifth task with verification commands.\n"
+        "6. Sixth task with documentation updates.\n"
+        + ("Additional detailed context: " * 80)
+    )
+    assert 2000 < len(detailed_instructions) <= 4000
+
+    pass_plan = {
+        "title": "Detailed Single-Chunk Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Atomic chunk with 3500 chars and 6 tasks"],
+        "chunks": [
+            {
+                "title": "Detailed Chunk",
+                "target_files": ["mod.py"],
+                "instructions": detailed_instructions,
+            }
+        ],
+    }
+    ok, msg = forge_mod.validate_forge_plan(pass_plan)
+    assert ok is True, f"Expected pass, got error: {msg}"
+
+    # 2. > 4000 chars is rejected
+    over_chars_plan = {
+        "title": "Over Chars Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Chunk",
+                "target_files": ["mod.py"],
+                "instructions": "x" * 4050,
+            }
+        ],
+    }
+    ok_c, msg_c = forge_mod.validate_forge_plan(over_chars_plan)
+    assert ok_c is False
+    assert "4000 chars" in msg_c
+
+    # 3. > 6 numbered tasks is rejected
+    seven_tasks = "\n".join(f"{i}. Task item {i}." for i in range(1, 8))
+    over_tasks_plan = {
+        "title": "Over Tasks Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Chunk",
+                "target_files": ["mod.py"],
+                "instructions": seven_tasks,
+            }
+        ],
+    }
+    ok_t, msg_t = forge_mod.validate_forge_plan(over_tasks_plan)
+    assert ok_t is False
+    assert "7 numbered tasks" in msg_t
+
+
+def test_extract_symbol_snippet_parenthetical_line_ranges(tmp_path):
+    """Verify extract_symbol_snippet supports parenthetical line ranges in target_symbols."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "vulcan@example.com"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Vulcan"], cwd=str(repo_dir), check=True, capture_output=True)
+
+    code_lines = [f"def func_{i}(): pass  # line {i}" for i in range(1, 40)]
+    py_file = repo_dir / "models.py"
+    py_file.write_text("\n".join(code_lines) + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(repo_dir), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+
+    # 1. extract_symbol_snippet with (lines 10-20)
+    snip_lines = forge_mod.extract_symbol_snippet(py_file, "BIGModelSuite.predict_pitcher (lines 10-20)")
+    assert "  10: def func_10(): pass" in snip_lines
+    assert "  20: def func_20(): pass" in snip_lines
+    assert "   9: def func_9(): pass" not in snip_lines
+    assert "  21: def func_21(): pass" not in snip_lines
+
+    # 2. extract_symbol_snippet with (L5-L15)
+    snip_l = forge_mod.extract_symbol_snippet(py_file, "func (L5-L15)")
+    assert "   5: def func_5(): pass" in snip_l
+    assert "  15: def func_15(): pass" in snip_l
+    assert "   4: def func_4(): pass" not in snip_l
+    assert "  16: def func_16(): pass" not in snip_l
+
+    # 3. Goldfish pre-flight passes with parenthetical line range in target_symbols
+    plan_paren = {
+        "title": "Parenthetical Symbols Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Chunk with paren symbol",
+                "target_files": ["models.py"],
+                "target_symbols": ["models.py:BIGModelSuite.predict_pitcher (lines 10-20)"],
+                "instructions": "Optimize predict_pitcher in models.py.",
+            }
+        ],
+    }
+    ok, findings = forge_mod.run_goldfish_plan_preflight(plan_paren)
+    assert ok is True, f"Preflight findings: {findings}"
+
+
+def test_enqueue_build_clears_offload_dispatched_on_exception(tmp_path):
+    """Verify enqueue_build clears offload_dispatched in batch_guard_state.json if validation raises ValueError."""
+    bs_file = tmp_path / "batch_guard_state.json"
+    bs_file.write_text(json.dumps({"offload_dispatched": True, "offload_kind": "forge_enqueue"}), encoding="utf-8")
+
+    invalid_plan = {
+        "title": "Invalid Plan Without Chunks",
+        "repo": "/workspace",
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [],
+    }
+
+    try:
+        forge_mod.enqueue_build(invalid_plan, batch_state_path=bs_file)
+        assert False, "Expected ValueError"
+    except ValueError:
+        pass
+
+    state_data = json.loads(bs_file.read_text(encoding="utf-8"))
+    assert state_data.get("offload_dispatched") is False
+    assert state_data.get("offload_kind") == ""
 
 
 if __name__ == "__main__":
