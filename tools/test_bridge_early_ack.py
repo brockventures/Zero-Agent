@@ -292,7 +292,7 @@ class TestBridgeEarlyAck(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rules["early_ack_seconds"], 180.0)
 
     def test_prepare_turn_prompt_includes_defer_guidance_when_enabled(self):
-        """Verify prepare_turn_prompt includes [[defer]] guidance when early_ack_enabled is True."""
+        """Verify prepare_turn_prompt includes single unified FORGE investigation guidance without redundant [[defer]] prompt instructions."""
         with patch("tools.bridge_pipeline.get_runtime_rules", return_value={"early_ack_enabled": True}):
             home_prompt = prepare_turn_prompt(
                 prompt="Diagnose the redis connection timeout",
@@ -300,12 +300,13 @@ class TestBridgeEarlyAck(unittest.IsolatedAsyncioTestCase):
                 channel_id=123456789,
                 sess_key="test-sess",
             )
-            self.assertIn("[[defer]]", home_prompt)
-            self.assertIn(">3 minutes", home_prompt)
-            self.assertIn("1-3 quick initial tool calls", home_prompt)
+            self.assertNotIn("[[defer]]", home_prompt)
+            self.assertIn("1-3 quick initial checks", home_prompt)
+            self.assertIn("forge.py job start", home_prompt)
+            self.assertIn("contradiction check", home_prompt)
 
     def test_prepare_turn_prompt_omits_defer_guidance_when_disabled(self):
-        """Verify prepare_turn_prompt omits [[defer]] guidance when early_ack_enabled is False."""
+        """Verify prepare_turn_prompt omits FORGE early-ack investigation guidance when early_ack_enabled is False."""
         with patch("tools.bridge_pipeline.get_runtime_rules", return_value={"early_ack_enabled": False}):
             home_prompt = prepare_turn_prompt(
                 prompt="Diagnose the redis connection timeout",
@@ -314,10 +315,11 @@ class TestBridgeEarlyAck(unittest.IsolatedAsyncioTestCase):
                 sess_key="test-sess",
             )
             self.assertNotIn("[[defer]]", home_prompt)
-            self.assertNotIn(">3 minutes", home_prompt)
+            self.assertNotIn("1-3 quick initial checks", home_prompt)
+            self.assertNotIn("forge.py job start", home_prompt)
 
     def test_prepare_turn_prompt_external_mode_toggling(self):
-        """Verify prepare_turn_prompt toggles [[defer]] guidance in external mode."""
+        """Verify prepare_turn_prompt toggles unified FORGE investigation guidance in external mode."""
         with patch("tools.bridge_pipeline.get_runtime_rules", return_value={"early_ack_enabled": True}):
             ext_prompt_enabled = prepare_turn_prompt(
                 prompt="Review PR #456",
@@ -325,7 +327,8 @@ class TestBridgeEarlyAck(unittest.IsolatedAsyncioTestCase):
                 channel_id=987654321,
                 sess_key="ext-sess",
             )
-            self.assertIn("[[defer]]", ext_prompt_enabled)
+            self.assertNotIn("[[defer]]", ext_prompt_enabled)
+            self.assertIn("forge.py job start", ext_prompt_enabled)
 
         with patch("tools.bridge_pipeline.get_runtime_rules", return_value={"early_ack_enabled": False}):
             ext_prompt_disabled = prepare_turn_prompt(
@@ -335,6 +338,7 @@ class TestBridgeEarlyAck(unittest.IsolatedAsyncioTestCase):
                 sess_key="ext-sess",
             )
             self.assertNotIn("[[defer]]", ext_prompt_disabled)
+            self.assertNotIn("forge.py job start", ext_prompt_disabled)
 
     def test_prepare_turn_prompt_includes_detached_investigation_and_contradiction_check(self):
         """Verify prepare_turn_prompt includes forge.py job start handoff and contradiction-check guidance."""
