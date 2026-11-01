@@ -18,18 +18,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import random
 import re
-import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import discord
 
-from tools.bridge_formatting import generate_concise_thread_title
+from tools.bridge_formatting import format_for_discord, generate_concise_thread_title
 from tools.bridge_safety import is_internal_cli_leak
 from tools.bridge_stream import (
     AgyStreamParser,
@@ -41,7 +39,6 @@ from tools.bridge_stream import (
 )
 from tools.bridge_pipeline import TurnTimer
 from tools.bridge_state import (
-    DATA_DIR,
     TARGET_CHANNEL_ID,
     clear_channel_session_id,
     clear_in_flight,
@@ -260,6 +257,8 @@ class TurnCoordinator:
     had_substantive_delta: bool = False
     current_action: str = "Processing..."
     recorded_usage: bool = False
+    early_ack_sent: bool = False
+    early_ack_msg: Optional[Any] = None
 
     def __post_init__(self):
         now = self.turn_start_time if self.turn_start_time > 0 else time.time()
@@ -345,6 +344,77 @@ class TurnCoordinator:
                     return True
                 except Exception:
                     pass
+        return False
+
+    async def maybe_send_early_ack(
+        self,
+        stream_parser: Optional[AgyStreamParser] = None,
+        timer: Optional[TurnTimer] = None,
+        early_ack_enabled: bool = True,
+        early_ack_seconds: float = 180.0,
+    ) -> bool:
+        """Deliver initial preliminary finding or check-in when early_ack_enabled is True.
+
+        If disabled, discards any buffered deferred ack token from the stream parser immediately.
+        When sent, updates self.early_ack_msg, self.delivery_target, and self.reply_target to the
+        sent Discord Message so that subsequent responses thread cleanly onto the initial message.
+        """
+        if not early_ack_enabled:
+            if stream_parser is not None:
+                stream_parser.pop_deferred_ack()
+            return False
+
+        if not self.early_ack_sent:
+            ack = stream_parser.pop_deferred_ack() if stream_parser else ""
+            if ack and isinstance(ack, str) and ack.strip():
+                text = format_for_discord(ack)
+                if text:
+                    target = self.delivery_target or self.reply_target
+                    if target is not None:
+                        try:
+                            if hasattr(target, "reply"):
+                                sent_m = await target.reply(text)
+                            elif hasattr(target, "send"):
+                                sent_m = await target.send(text)
+                            else:
+                                sent_m = None
+                            self.early_ack_sent = True
+                            if sent_m is not None:
+                                self.early_ack_msg = sent_m
+                                self.delivery_target = sent_m
+                                self.reply_target = sent_m
+                            return True
+                        except Exception as e:
+                            print(f"[TurnCoordinator] Failed sending early ack: {e}")
+                            return False
+
+            elif (
+                self.mode == "home"
+                and early_ack_seconds > 0
+                and (time.time() - self.turn_start_time) >= early_ack_seconds
+                and timer is not None
+                and timer.num_tools >= 4
+            ):
+                target = self.delivery_target or self.reply_target
+                if target is not None:
+                    checkin_text = "⏳ *Still investigating — running detailed analysis, will follow up shortly.*"
+                    try:
+                        if hasattr(target, "reply"):
+                            sent_m = await target.reply(checkin_text)
+                        elif hasattr(target, "send"):
+                            sent_m = await target.send(checkin_text)
+                        else:
+                            sent_m = None
+                        self.early_ack_sent = True
+                        if sent_m is not None:
+                            self.early_ack_msg = sent_m
+                            self.delivery_target = sent_m
+                            self.reply_target = sent_m
+                        return True
+                    except Exception as e:
+                        print(f"[TurnCoordinator] Failed sending early check-in: {e}")
+                        return False
+
         return False
 
     async def check_thread_escalation(
@@ -590,7 +660,6 @@ class TurnCoordinator:
 
         elif ev_name == "result" or "result" in event:
             res_data = event.get("result", {}) if isinstance(event.get("result"), dict) else event
-            res_resp = str(res_data.get("response") or event.get("response") or "").strip()
             res_cid = res_data.get("conversation_id")
             if res_cid:
                 if self.escalated_to_thread and self.thread and hasattr(self.thread, "id"):
@@ -703,8 +772,15 @@ class TurnCoordinator:
                     )
                     self.touch_activity()
                 except asyncio.TimeoutError:
-                    now_wait = time.time()
                     proc_pid = getattr(proc, "pid", None) if proc else None
+
+                    # Early ack check (e.g. check-in after early_ack_seconds during long tool execution)
+                    await self.maybe_send_early_ack(
+                        stream_parser=stream_parser,
+                        timer=timer,
+                        early_ack_enabled=bool(rules.get("early_ack_enabled", True)),
+                        early_ack_seconds=float(rules.get("early_ack_seconds", 180.0)),
+                    )
 
                     # Check for wedged interactive subprocess at >= 45s of silence
                     if self.probe_process_wedge(proc_pid):
@@ -794,6 +870,12 @@ class TurnCoordinator:
                 continue
 
             ev = self.handle_line(line_s, stream_parser=stream_parser, timer=timer)
+            await self.maybe_send_early_ack(
+                stream_parser=stream_parser,
+                timer=timer,
+                early_ack_enabled=bool(rules.get("early_ack_enabled", True)),
+                early_ack_seconds=float(rules.get("early_ack_seconds", 180.0)),
+            )
             if ev and (ev.get("event") == "result" or "result" in ev):
                 now_res = time.time()
                 res_data = ev.get("result", {}) if isinstance(ev.get("result"), dict) else ev
@@ -885,7 +967,15 @@ class TurnCoordinator:
             # 5. Live status ticker update
             await self.update_status_ticker(ticker_enabled=ticker_enabled)
 
-            # 6. Beacon update
+            # 6. Early ack check
+            await self.maybe_send_early_ack(
+                stream_parser=stream_parser,
+                timer=timer,
+                early_ack_enabled=bool(rules.get("early_ack_enabled", True)),
+                early_ack_seconds=float(rules.get("early_ack_seconds", 180.0)),
+            )
+
+            # 7. Beacon update
             self.maybe_touch_beacon()
 
         return output_response

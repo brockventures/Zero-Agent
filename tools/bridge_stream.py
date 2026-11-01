@@ -455,6 +455,22 @@ class AgyStreamParser:
         self.is_explicit_silence: bool = False
         self.current_agent_step_index: Optional[int] = None
         self.interrupted_since_last_step: bool = False
+        self.deferred_ack_text: str = ""
+
+    def _capture_deferred_ack(self) -> None:
+        """Capture preliminary finding ending with [[defer]] before accumulated segment is cleared for a tool."""
+        curr = "".join(self.accumulated_segment).strip()
+        if "[[defer]]" in curr.lower() and not self.deferred_ack_text:
+            cleaned = re.sub(r"\[\[defer\]\]", "", curr, flags=re.IGNORECASE).strip()
+            cleaned = strip_internal_cli_chatter(cleaned)
+            if cleaned and not self._is_silence_or_placeholder(cleaned):
+                self.deferred_ack_text = cleaned
+
+    def pop_deferred_ack(self) -> str:
+        """Return and clear deferred ack text captured before a tool execution."""
+        ack = self.deferred_ack_text
+        self.deferred_ack_text = ""
+        return ack
 
     def reset_pre_completion_draft(self) -> None:
         """Discard premature response drafts emitted before an active background task or tool completed."""
@@ -541,6 +557,7 @@ class AgyStreamParser:
 
             if (stype in ("tool",) or tname):
                 # Tool execution: clear pre-tool narration and any stale intermediate result, preserving substantive response across system tasks
+                self._capture_deferred_ack()
                 self.accumulated_segment.clear()
                 self.interrupted_draft = ""
                 self.final_result_response = ""
@@ -596,6 +613,7 @@ class AgyStreamParser:
                             self.is_explicit_silence = False
 
         elif ev_type in ("tool", "tool_call", "tool_use"):
+            self._capture_deferred_ack()
             self.accumulated_segment.clear()
             self.interrupted_draft = ""
             self.final_result_response = ""
@@ -652,6 +670,8 @@ class AgyStreamParser:
 
     def get_final_response(self, fallback_result: str = "") -> str:
         curr = "".join(self.accumulated_segment).strip()
+        if "[[defer]]" in curr.lower():
+            curr = re.sub(r"\[\[defer\]\]", "", curr, flags=re.IGNORECASE).strip()
 
         # Check if the current segment is an explicit silence request or internal CLI leak
         if curr and (
@@ -682,6 +702,8 @@ class AgyStreamParser:
                 clean_curr = ""
 
         prior_draft = self.last_substantive_response or self.interrupted_draft
+        if prior_draft and "[[defer]]" in prior_draft.lower():
+            prior_draft = re.sub(r"\[\[defer\]\]", "", prior_draft, flags=re.IGNORECASE).strip()
         clean_last = ""
         if prior_draft and not self._is_silence_or_placeholder(prior_draft):
             clean_last = re.sub(
@@ -696,22 +718,25 @@ class AgyStreamParser:
 
         # 1. Both prior draft (pre-interruption/pre-system-event) and current segment exist
         if clean_last and clean_curr:
-            return reconcile_step_segments(
+            reconciled = reconcile_step_segments(
                 clean_last,
                 clean_curr,
                 is_interrupted=self.interrupted_since_last_step or bool(self.interrupted_draft),
             )
+            return re.sub(r"\[\[defer\]\]", "", reconciled, flags=re.IGNORECASE).strip()
 
         # 2. Only current segment exists
         if clean_curr:
-            return clean_curr
+            return re.sub(r"\[\[defer\]\]", "", clean_curr, flags=re.IGNORECASE).strip()
 
         # 3. Only last substantive response exists (not an uncompleted interrupted fragment)
         if self.last_substantive_response and clean_last:
-            return clean_last
+            return re.sub(r"\[\[defer\]\]", "", clean_last, flags=re.IGNORECASE).strip()
 
         # 3. Check final result response from agy
         frr = self.final_result_response.strip() or fallback_result.strip()
+        if frr and "[[defer]]" in frr.lower():
+            frr = re.sub(r"\[\[defer\]\]", "", frr, flags=re.IGNORECASE).strip()
         if self.interrupted_since_last_step and not clean_curr and not self.last_substantive_response:
             if is_aborted_stream_stub(frr) or (self.interrupted_draft and frr == self.interrupted_draft.strip()):
                 return ""
@@ -734,7 +759,7 @@ class AgyStreamParser:
             ).strip()
             clean_frr = strip_internal_cli_chatter(clean_frr)
             if clean_frr and not self._is_silence_or_placeholder(clean_frr):
-                return clean_frr
+                return re.sub(r"\[\[defer\]\]", "", clean_frr, flags=re.IGNORECASE).strip()
 
         if self.is_explicit_silence:
             return "[NO_REPLY]"
