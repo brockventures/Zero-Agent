@@ -311,39 +311,49 @@ def check_core_friends_unseen(
     decision_staged = False
     if _should_stage(stage):
         try:
+            import shlex
             from tools.forge import stage_decision
 
-            summary_names = ", ".join(p.get("display_name") or p["name"] for p in qualifying[:3])
-            if len(qualifying) > 3:
-                summary_names += f" and {len(qualifying) - 3} more"
-            summary_text = (
-                f"Identified {len(qualifying)} local Core friend(s) ({summary_names}) "
-                f"not seen in >= {weeks} weeks. Consider reaching out to organize dinner, drinks, or weekend plans."
-            )
+            staged_count = 0
+            for p in qualifying:
+                disp = p.get("display_name") or p["name"]
+                summary_text = (
+                    f"Friend {disp} has not been seen in >= {weeks} weeks ({p['time_str']}).\n\n"
+                    f"**Approve Action:** Create follow-up task to reach out to {disp}"
+                )
+                task_title = f"Reach out to {disp}"
+                cmd = f"python3 /workspace/tools/task_manager.py add {shlex.quote(task_title)}"
 
-            cmd = f"python3 /workspace/tools/core_friends_reminder.py --weeks {weeks}"
-            if as_of_date:
-                cmd += f" --as-of-date {as_of_date}"
+                try:
+                    res = stage_decision(
+                        category="core_friends",
+                        title=f"Core Friend Outreach: {disp}",
+                        summary=summary_text,
+                        handler_type="shell",
+                        payload={
+                            "command": cmd,
+                            "cwd": "/workspace",
+                            "friend": disp,
+                        },
+                        channel_id=TARGET_CHANNEL_ID,
+                        post_to_discord=True,
+                    )
+                    is_ok = bool(res.get("ok", True) if isinstance(res, dict) else True)
+                    p["_decision_staged"] = is_ok
+                    if is_ok:
+                        staged_count += 1
+                except Exception as e:
+                    print(f"[CoreFriends] Decision Card staging fallback for {disp}: {e}", file=sys.stderr)
+                    p["_decision_staged"] = False
 
-            res = stage_decision(
-                category="core_friends",
-                title=f"Core Friends Reconnect Reminder ({len(qualifying)} unseen)",
-                summary=summary_text,
-                handler_type="shell",
-                payload={
-                    "command": cmd,
-                    "cwd": "/workspace",
-                },
-                channel_id=TARGET_CHANNEL_ID,
-                post_to_discord=True,
-            )
-            decision_staged = bool(res.get("ok", True) if isinstance(res, dict) else True)
+            decision_staged = staged_count > 0 and staged_count == len(qualifying)
         except Exception as e:
             print(f"[CoreFriends] Decision Card staging fallback: {e}", file=sys.stderr)
 
     LAST_DECISION_STAGED = decision_staged
     for p in qualifying:
-        p["_decision_staged"] = decision_staged
+        if "_decision_staged" not in p:
+            p["_decision_staged"] = decision_staged
 
     if not decision_staged:
         lines.append("\n[CHOICES: View Full Friends Sheet | Remind Me in 2 Weeks | Dismiss]")

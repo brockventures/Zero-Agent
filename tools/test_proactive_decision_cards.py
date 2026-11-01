@@ -233,7 +233,7 @@ def test_inbox_rcs_triage_stages_card_and_deduplicates(test_db: Path, isolate_tr
         items_override=items,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 2
     assert meta["detected_items"] == 2
     assert "Preschool" in summary
     assert "Pediatrician" in summary
@@ -241,17 +241,20 @@ def test_inbox_rcs_triage_stages_card_and_deduplicates(test_db: Path, isolate_tr
     # Verify staged in SQLite
     conn = sqlite3.connect(test_db)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (meta["decision_id"],)).fetchone()
+    rows = conn.execute("SELECT * FROM forge_decisions ORDER BY id ASC").fetchall()
     conn.close()
 
-    assert row is not None
-    assert row["category"] == "comms"
-    assert row["channel_id"] == CHANNEL_ZERO_CHAT
-    assert row["handler_type"] == "shell"
+    assert len(rows) == 2
+    for row in rows:
+        assert row["category"] == "comms"
+        assert row["channel_id"] == CHANNEL_ZERO_CHAT
+        assert row["handler_type"] == "shell"
+        assert "**Approve Action:**" in row["summary"]
 
-    payload = json.loads(row["payload_json"])
-    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-    assert valid_sh is True, f"Shell payload invalid: {val_err}"
+        payload = json.loads(row["payload_json"])
+        valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
+        assert valid_sh is True, f"Shell payload invalid: {val_err}"
+        assert "task_manager.py add" in payload["command"]
 
     # Verify seen file was written
     assert isolate_triage_seen.exists()
@@ -372,7 +375,7 @@ def test_calendar_radar_detects_overlap_tight_buffer_and_prep(test_db: Path) -> 
         events_override=events,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 3
     issues = meta["issues"]
     issue_types = {iss["type"] for iss in issues}
     assert "overlap" in issue_types
@@ -381,20 +384,20 @@ def test_calendar_radar_detects_overlap_tight_buffer_and_prep(test_db: Path) -> 
 
     conn = sqlite3.connect(test_db)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (meta["decision_id"],)).fetchone()
+    rows = conn.execute("SELECT * FROM forge_decisions ORDER BY id ASC").fetchall()
     conn.close()
 
-    assert row is not None
-    assert row["category"] == "calendar"
-    assert row["channel_id"] == CHANNEL_BROCK_HOUSE
-    assert row["handler_type"] == "shell"
+    assert len(rows) == 3
+    for row in rows:
+        assert row["category"] == "calendar"
+        assert row["channel_id"] == CHANNEL_BROCK_HOUSE
+        assert row["handler_type"] == "shell"
+        assert "**Approve Action:**" in row["summary"]
 
-    payload = json.loads(row["payload_json"])
-    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-    assert valid_sh is True, f"Shell payload invalid: {val_err}"
-    assert "task_manager.py add" in payload["command"]
-    assert len(payload.get("tasks_to_create", [])) == 3
-    assert any("Rosie 4th Birthday Party" in t for t in payload["tasks_to_create"])
+        payload = json.loads(row["payload_json"])
+        valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
+        assert valid_sh is True, f"Shell payload invalid: {val_err}"
+        assert "task_manager.py add" in payload["command"]
 
 
 def test_calendar_radar_dry_run(test_db: Path) -> None:
@@ -463,8 +466,8 @@ def test_calendar_radar_deduplicates_across_consecutive_runs(
         events_override=events,
     )
     assert ok1 is True
-    assert meta1["cards_staged"] == 1
-    assert len(meta1["issues"]) >= 2
+    assert meta1["cards_staged"] == 3
+    assert len(meta1["issues"]) == 3
     assert isolate_calendar_seen.exists()
 
     seen_data = json.loads(isolate_calendar_seen.read_text(encoding="utf-8"))
@@ -640,10 +643,12 @@ def test_dinner_pivot_stages_card_on_density_collision(test_db: Path) -> None:
     assert row["category"] == "mealie"
     assert row["channel_id"] == CHANNEL_BROCK_HOUSE
     assert row["handler_type"] == "shell"
+    assert "**Approve Action:**" in row["summary"]
 
     payload = json.loads(row["payload_json"])
     valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
     assert valid_sh is True, f"Shell payload invalid: {val_err}"
+    assert "task_manager.py add" in payload["command"]
 
 
 def test_dinner_pivot_dry_run(test_db: Path) -> None:
@@ -724,7 +729,7 @@ def test_actual_budget_anomaly_stages_card_for_uncategorized_and_spike(test_db: 
         anomalies_override=anomalies,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 3
     assert len(meta["anomalies"]) == 3
     assert "Pacific Hardware" in summary
     assert "CleanPower Electric" in summary
@@ -733,17 +738,20 @@ def test_actual_budget_anomaly_stages_card_for_uncategorized_and_spike(test_db: 
     # Verify staged in SQLite
     conn = sqlite3.connect(test_db)
     conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (meta["decision_id"],)).fetchone()
+    rows = conn.execute("SELECT * FROM forge_decisions ORDER BY id ASC").fetchall()
     conn.close()
 
-    assert row is not None
-    assert row["category"] == "finances"
-    assert row["channel_id"] == CHANNEL_FINANCES
-    assert row["handler_type"] == "shell"
+    assert len(rows) == 3
+    for row in rows:
+        assert row["category"] == "finances"
+        assert row["channel_id"] == CHANNEL_FINANCES
+        assert row["handler_type"] == "shell"
+        assert "**Approve Action:**" in row["summary"]
 
-    payload = json.loads(row["payload_json"])
-    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-    assert valid_sh is True, f"Shell payload invalid: {val_err}"
+        payload = json.loads(row["payload_json"])
+        valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
+        assert valid_sh is True, f"Shell payload invalid: {val_err}"
+        assert "task_manager.py add" in payload["command"]
 
 
 def test_actual_budget_anomaly_ignores_nominal_utility_increase(test_db: Path) -> None:
@@ -878,10 +886,12 @@ def test_weather_energy_triggers_on_rain(test_db: Path) -> None:
     assert row["category"] == "home_assistant"
     assert row["channel_id"] == CHANNEL_HOME_ASSISTANT
     assert row["handler_type"] == "shell"
+    assert "**Approve Action:**" in row["summary"]
 
     payload = json.loads(row["payload_json"])
     valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
     assert valid_sh is True, f"Shell payload invalid: {val_err}"
+    assert "task_manager.py add" in payload["command"]
 
 
 def test_weather_energy_triggers_on_heat(test_db: Path) -> None:
@@ -912,6 +922,36 @@ def test_weather_energy_triggers_on_cold(test_db: Path) -> None:
     assert meta["cards_staged"] == 1
     assert "Near-Freezing Cold" in summary
     assert "34.0°F" in summary
+
+
+def test_weather_energy_stages_atomic_cards_for_multiple_triggers(test_db: Path) -> None:
+    """Verifies that multiple weather triggers (rain + extreme heat) stage separate atomic Decision Cards."""
+    weather = {"rain_inches": 0.45, "temp_high": 95.0}
+    ok, summary, meta = run_weather_energy_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        weather_override=weather,
+    )
+    assert ok is True
+    assert meta["cards_staged"] == 2
+    assert len(meta["triggers"]) == 2
+
+    conn = sqlite3.connect(test_db)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM forge_decisions ORDER BY id ASC").fetchall()
+    conn.close()
+
+    assert len(rows) == 2
+    for row in rows:
+        assert row["category"] == "home_assistant"
+        assert row["channel_id"] == CHANNEL_HOME_ASSISTANT
+        assert row["handler_type"] == "shell"
+        assert "**Approve Action:**" in row["summary"]
+        payload = json.loads(row["payload_json"])
+        valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
+        assert valid_sh is True, f"Shell payload invalid: {val_err}"
+        assert "task_manager.py add" in payload["command"]
 
 
 def test_weather_energy_dry_run(test_db: Path) -> None:
@@ -1049,10 +1089,13 @@ def test_midweek_grocery_stages_card_with_staples_and_tasks(test_db: Path) -> No
     assert row["category"] == "shopping"
     assert row["channel_id"] == CHANNEL_SHOPPING
     assert row["handler_type"] == "shell"
+    assert "**Approve Action:**" in row["summary"]
 
     payload = json.loads(row["payload_json"])
     valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
     assert valid_sh is True, f"Shell payload invalid: {val_err}"
+    assert "whole_foods_afx.py" in payload["command"]
+    assert "task_manager.py add" in payload["command"]
 
 
 def test_midweek_grocery_dry_run(test_db: Path) -> None:
@@ -1123,6 +1166,7 @@ def test_evening_pm_build_stages_card_and_writes_plan(test_db: Path, isolate_for
     assert row["category"] == "forge"
     assert row["channel_id"] == CHANNEL_PROJECTS
     assert row["handler_type"] == "forge_enqueue"
+    assert "**Approve Action:**" in row["summary"]
 
     payload = json.loads(row["payload_json"])
     assert payload["plan_file"] == str(plan_file)

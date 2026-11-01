@@ -465,7 +465,6 @@ def run_inbox_rcs_action_triage_card(
     # 4. Format Decision Card
     count = len(actionable_items)
     slot_title = slot.capitalize()
-    title = f"📬 {slot_title} Comms Action Triage ({count} item{'s' if count != 1 else ''})"
 
     summary_lines = [
         f"### 📬 {slot_title} Actionable Comms Triage ({count})",
@@ -477,6 +476,7 @@ def run_inbox_rcs_action_triage_card(
         sender = it.get("sender") or it.get("from") or "Unknown"
         subj = it.get("subject") or it.get("snippet") or it.get("text") or "(no subject)"
         summary_lines.append(f"• **[{cat_disp}]** `{sender}`: {subj[:80]}")
+        summary_lines.append(f"  **Approve Action:** Create task to follow up with {sender}")
     if count > 10:
         summary_lines.append(f"• *... and {count - 10} additional items*")
 
@@ -491,31 +491,52 @@ def run_inbox_rcs_action_triage_card(
             "slot": slot,
         }
 
-    # 6. Stage Decision Card in #zero-chat
-    payload = {
-        "command": f"echo 'Triage acknowledged for {count} {slot} items'",
-        "detected_ids": [it["id"] for it in actionable_items],
-        "slot": slot,
-    }
+    # 6. Stage Decision Cards in #zero-chat (One atomic card per actionable item)
+    import shlex as _shlex
 
+    decision_ids: list[str] = []
     should_post = post_to_discord and not test
-    stage_res = stage_decision(
-        category="comms",
-        title=title,
-        summary=summary_text,
-        handler_type="shell",
-        payload=payload,
-        channel_id=CHANNEL_ZERO_CHAT,
-        db_path=db_path,
-        post_to_discord=should_post,
-    )
+
+    for it in actionable_items:
+        cat_disp = it.get("category_display", "Action")
+        sender = it.get("sender") or it.get("from") or "Unknown"
+        subj = it.get("subject") or it.get("snippet") or it.get("text") or "(no subject)"
+        card_title = f"📬 [{cat_disp}] Follow-up: {sender}"
+        task_title = f"Follow up with {sender} on {cat_disp}: {subj[:60]}"
+        card_summary = (
+            f"### 📬 Comms Action Triage ({cat_disp})\n"
+            f"**From:** {sender}\n"
+            f"**Message:** {subj[:120]}\n\n"
+            f"**Approve Action:** Create task in task manager: '{task_title}'"
+        )
+        cmd = f"python3 /workspace/tools/task_manager.py add {_shlex.quote(task_title)} --priority p2"
+        payload = {
+            "command": cmd,
+            "item_id": it["id"],
+            "source": it.get("source"),
+            "sender": sender,
+            "task_title": task_title,
+        }
+        stage_res = stage_decision(
+            category="comms",
+            title=card_title,
+            summary=card_summary,
+            handler_type="shell",
+            payload=payload,
+            channel_id=CHANNEL_ZERO_CHAT,
+            db_path=db_path,
+            post_to_discord=should_post,
+        )
+        if stage_res.get("decision_id"):
+            decision_ids.append(stage_res["decision_id"])
 
     # Persist updated seen IDs
     _save_seen_triage_ids(new_seen_ids)
 
     return True, summary_text, {
-        "cards_staged": 1,
-        "decision_id": stage_res.get("decision_id"),
+        "cards_staged": len(decision_ids),
+        "decision_id": decision_ids[0] if decision_ids else None,
+        "decision_ids": decision_ids,
         "detected_items": count,
         "slot": slot,
     }
@@ -675,7 +696,6 @@ def run_family_calendar_radar_card(
 
     # 5. Format Decision Card
     count = len(issues)
-    title = f"🗓️ 48h Family Calendar Radar ({count} alert{'s' if count != 1 else ''})"
 
     summary_lines = [
         f"### 🗓️ 48h Family Calendar Radar ({count})",
@@ -703,11 +723,13 @@ def run_family_calendar_radar_card(
             "issues": issues,
         }
 
-    # 7. Stage Decision Card in #brock-house (Approve adds task(s) to Google Tasks via task_manager.py)
+    # 7. Stage Decision Cards in #brock-house (One atomic card per conflict/prep item)
     import shlex as _shlex
-    task_cmds: list[str] = []
-    task_titles: list[str] = []
-    for issue in issues[:8]:
+
+    decision_ids: list[str] = []
+    should_post = post_to_discord and not test
+
+    for issue in issues:
         itype = issue["type"]
         evs = issue.get("events") or []
         if itype == "prep" and evs:
@@ -718,27 +740,33 @@ def run_family_calendar_radar_card(
             t_title = f"Check tight schedule buffer: {evs[0]} -> {evs[1]}"
         else:
             t_title = issue.get("title", "Calendar radar follow-up")
-        task_titles.append(t_title)
-        task_cmds.append(f"python3 /workspace/tools/task_manager.py add {_shlex.quote(t_title)} --priority p1")
 
-    shell_cmd = " && ".join(task_cmds) if task_cmds else f"echo 'Calendar radar acknowledged: {count} alerts'"
-    payload = {
-        "command": shell_cmd,
-        "issue_count": count,
-        "tasks_to_create": task_titles,
-    }
-
-    should_post = post_to_discord and not test
-    stage_res = stage_decision(
-        category="calendar",
-        title=title,
-        summary=summary_text,
-        handler_type="shell",
-        payload=payload,
-        channel_id=CHANNEL_BROCK_HOUSE,
-        db_path=db_path,
-        post_to_discord=should_post,
-    )
+        card_title = f"🗓️ {issue['title']}"
+        card_summary = (
+            f"### 🗓️ Calendar Radar Alert\n"
+            f"{issue['details']}\n\n"
+            f"**Approve Action:** Create task in task manager: '{t_title}'"
+        )
+        cmd = f"python3 /workspace/tools/task_manager.py add {_shlex.quote(t_title)} --priority p1"
+        payload = {
+            "command": cmd,
+            "issue_type": itype,
+            "events": evs,
+            "key": issue.get("key"),
+            "task_title": t_title,
+        }
+        stage_res = stage_decision(
+            category="calendar",
+            title=card_title,
+            summary=card_summary,
+            handler_type="shell",
+            payload=payload,
+            channel_id=CHANNEL_BROCK_HOUSE,
+            db_path=db_path,
+            post_to_discord=should_post,
+        )
+        if stage_res.get("decision_id"):
+            decision_ids.append(stage_res["decision_id"])
 
     # Persist updated seen keys
     if should_dedup:
@@ -750,8 +778,9 @@ def run_family_calendar_radar_card(
         _save_seen_calendar_keys(updated_seen)
 
     return True, summary_text, {
-        "cards_staged": 1,
-        "decision_id": stage_res.get("decision_id"),
+        "cards_staged": len(decision_ids),
+        "decision_id": decision_ids[0] if decision_ids else None,
+        "decision_ids": decision_ids,
         "issues": issues,
     }
 
@@ -900,6 +929,8 @@ def run_dinner_pivot_card(
         "• **Planned Recipe:** " + f"{recipe_name} ({recipe_minutes} minutes)",
         "• **Colliding Events:** " + ", ".join(f"'{e['summary']}'" for e in evening_events),
         "• **Recommendation:** Swap tonight's recipe with a 15-minute quick meal or push to tomorrow.",
+        "",
+        f"**Approve Action:** Create task in task manager: 'Dinner pivot: Quick alternative or takeout (replace {recipe_name})'",
     ]
 
     summary_text = "\n".join(summary_lines)
@@ -914,12 +945,15 @@ def run_dinner_pivot_card(
         }
 
     # 7. Stage Decision Card in #brock-house
-    clean_reason = re.sub(r"[^a-zA-Z0-9 _-]", "", trigger_reason)[:50].strip()
+    import shlex as _shlex
+    task_title = f"Dinner pivot: Quick alternative or takeout (replace {recipe_name})"
+    cmd = f"python3 /workspace/tools/task_manager.py add {_shlex.quote(task_title)} --priority p1"
     payload = {
-        "command": f"echo 'Dinner pivot acknowledged: {clean_reason}'",
+        "command": cmd,
         "recipe_name": recipe_name,
         "recipe_minutes": recipe_minutes,
         "evening_events_count": len(evening_events),
+        "task_title": task_title,
     }
 
     should_post = post_to_discord and not test
@@ -934,9 +968,11 @@ def run_dinner_pivot_card(
         post_to_discord=should_post,
     )
 
+    decision_id = stage_res.get("decision_id")
     return True, summary_text, {
-        "cards_staged": 1,
-        "decision_id": stage_res.get("decision_id"),
+        "cards_staged": 1 if decision_id else 0,
+        "decision_id": decision_id,
+        "decision_ids": [decision_id] if decision_id else [],
         "trigger_reason": trigger_reason,
         "recipe_name": recipe_name,
         "evening_events": len(evening_events),
@@ -1068,7 +1104,6 @@ def run_actual_budget_anomaly_card(
         return True, "", {"cards_staged": 0, "anomalies": []}
 
     count = len(detected_anomalies)
-    title = f"💳 Actual Budget Anomaly Alert ({count} issue{'s' if count != 1 else ''})"
     summary_lines = [
         f"### 💳 Actual Budget Anomaly Alert ({count})",
         "Detected budget anomalies requiring review or categorization:",
@@ -1094,27 +1129,70 @@ def run_actual_budget_anomaly_card(
             "anomalies": detected_anomalies,
         }
 
-    payload = {
-        "command": f"echo 'Budget anomalies acknowledged: {count} issues'",
-        "anomalies_count": count,
-        "anomaly_types": [a["type"] for a in detected_anomalies],
-    }
+    # Stage one atomic card per anomaly
+    import shlex as _shlex
 
+    decision_ids: list[str] = []
     should_post = post_to_discord and not test
-    stage_res = stage_decision(
-        category="finances",
-        title=title,
-        summary=summary_text,
-        handler_type="shell",
-        payload=payload,
-        channel_id=CHANNEL_FINANCES,
-        db_path=db_path,
-        post_to_discord=should_post,
-    )
+
+    for anomaly in detected_anomalies:
+        atype = anomaly.get("type", "unknown")
+        if atype == "uncategorized_merchant":
+            merch = anomaly.get("merchant", "Unknown")
+            amt = float(anomaly.get("amount", 0.0))
+            card_title = f"💳 Categorize Merchant: {merch}"
+            task_title = f"Categorize transaction: {merch} (${amt:.2f})"
+            detail_line = f"Uncategorized transaction of **${amt:.2f}** at **{merch}** ({anomaly.get('account', 'Account')})."
+        elif atype == "utility_spike":
+            merch = anomaly.get("merchant", "Utility")
+            amt = float(anomaly.get("amount", 0.0))
+            base = float(anomaly.get("baseline", 0.0))
+            pct = ((amt - base) / base * 100) if base else 0
+            card_title = f"⚡ Utility Spike: {merch}"
+            task_title = f"Investigate utility spike: {merch} (${amt:.2f} vs ${base:.2f})"
+            detail_line = f"Utility bill of **${amt:.2f}** is **{pct:.0f}%** above baseline of **${base:.2f}**."
+        elif atype == "cash_reserve_drift":
+            acct = anomaly.get("account", "Reserve")
+            bal = float(anomaly.get("current_balance", 0.0))
+            floor = float(anomaly.get("target_floor", 0.0))
+            drift = float(anomaly.get("drift_amount", 0.0))
+            card_title = f"💰 Reserve Drift: {acct}"
+            task_title = f"Rebalance cash reserve: {acct} (${abs(drift):.2f} below target)"
+            detail_line = f"Balance of **${bal:.2f}** is **${abs(drift):.2f}** below target floor of **${floor:.2f}**."
+        else:
+            card_title = f"💳 Budget Anomaly: {atype}"
+            task_title = f"Review budget anomaly: {atype}"
+            detail_line = f"Anomaly detected: {anomaly}"
+
+        card_summary = (
+            f"### 💳 Budget Anomaly Alert\n"
+            f"{detail_line}\n\n"
+            f"**Approve Action:** Create task in task manager: '{task_title}'"
+        )
+        cmd = f"python3 /workspace/tools/task_manager.py add {_shlex.quote(task_title)} --priority p2"
+        payload = {
+            "command": cmd,
+            "anomaly_type": atype,
+            "details": anomaly,
+            "task_title": task_title,
+        }
+        stage_res = stage_decision(
+            category="finances",
+            title=card_title,
+            summary=card_summary,
+            handler_type="shell",
+            payload=payload,
+            channel_id=CHANNEL_FINANCES,
+            db_path=db_path,
+            post_to_discord=should_post,
+        )
+        if stage_res.get("decision_id"):
+            decision_ids.append(stage_res["decision_id"])
 
     return True, summary_text, {
-        "cards_staged": 1,
-        "decision_id": stage_res.get("decision_id"),
+        "cards_staged": len(decision_ids),
+        "decision_id": decision_ids[0] if decision_ids else None,
+        "decision_ids": decision_ids,
         "anomalies": detected_anomalies,
     }
 
@@ -1284,8 +1362,6 @@ def run_weather_energy_card(
     if not triggers:
         return True, "", {"cards_staged": 0, "triggers": []}
 
-    trigger_labels = ", ".join(t["type"].title() for t in triggers)
-    title = f"⚡ Weather & Energy Pre-Adjustment ({trigger_labels})"
     summary_lines = [
         f"### ⚡ Weather & Energy Pre-Adjustment Radar ({len(triggers)})",
         "Environmental triggers detected requiring homelab / HVAC / irrigation pre-adjustments:",
@@ -1309,27 +1385,61 @@ def run_weather_energy_card(
             "triggers": triggers,
         }
 
-    clean_triggers = "_".join(t["type"] for t in triggers)
-    payload = {
-        "command": f"echo 'Weather/energy adjustment acknowledged: {clean_triggers}'",
-        "triggers": [t["type"] for t in triggers],
-    }
+    # Stage one atomic card per weather trigger
+    import shlex as _shlex
 
+    decision_ids: list[str] = []
     should_post = post_to_discord and not test
-    stage_res = stage_decision(
-        category="home_assistant",
-        title=title,
-        summary=summary_text,
-        handler_type="shell",
-        payload=payload,
-        channel_id=CHANNEL_HOME_ASSISTANT,
-        db_path=db_path,
-        post_to_discord=should_post,
-    )
+
+    for t in triggers:
+        ttype = t.get("type")
+        val = t.get("value")
+        if ttype == "rain":
+            card_title = f"🌧️ Weather Adjustment: Rain ({val} in)"
+            task_title = f"Weather alert: Check yard drains & pause irrigation ({val} in rain)"
+            detail_line = f"Forecast calls for **{val} in** of precipitation (threshold: >=0.25 in)."
+        elif ttype == "heat":
+            card_title = f"☀️ Energy Pre-Cool: High Temp ({val}°F)"
+            task_title = f"Energy alert: Pre-cool home before peak hours ({val}°F heat)"
+            detail_line = f"Forecast high temperature is **{val}°F** (threshold: >=90°F)."
+        elif ttype == "cold":
+            card_title = f"❄️ Energy Pre-Heat: Low Temp ({val}°F)"
+            task_title = f"Energy alert: Pre-heat home & protect outdoor spigots ({val}°F cold)"
+            detail_line = f"Forecast low temperature is **{val}°F** (threshold: <=38°F)."
+        else:
+            card_title = f"🌡️ Weather Alert: {ttype}"
+            task_title = f"Weather alert: Review home settings for {ttype}"
+            detail_line = f"Weather trigger: {t}"
+
+        card_summary = (
+            f"### 🌡️ Weather & Energy Alert\n"
+            f"{detail_line}\n\n"
+            f"**Approve Action:** Create task in task manager: '{task_title}'"
+        )
+        cmd = f"python3 /workspace/tools/task_manager.py add {_shlex.quote(task_title)} --priority p2"
+        payload = {
+            "command": cmd,
+            "trigger_type": ttype,
+            "trigger_value": val,
+            "task_title": task_title,
+        }
+        stage_res = stage_decision(
+            category="home_assistant",
+            title=card_title,
+            summary=card_summary,
+            handler_type="shell",
+            payload=payload,
+            channel_id=CHANNEL_HOME_ASSISTANT,
+            db_path=db_path,
+            post_to_discord=should_post,
+        )
+        if stage_res.get("decision_id"):
+            decision_ids.append(stage_res["decision_id"])
 
     return True, summary_text, {
-        "cards_staged": 1,
-        "decision_id": stage_res.get("decision_id"),
+        "cards_staged": len(decision_ids),
+        "decision_id": decision_ids[0] if decision_ids else None,
+        "decision_ids": decision_ids,
         "triggers": triggers,
     }
 
@@ -1406,7 +1516,9 @@ def run_midweek_grocery_card(
             summary_lines.append(f"• *... and {len(task_items) - 6} more task items*")
         summary_lines.append("")
 
-    summary_lines.append("Tap **Approve** to acknowledge and stage 1-click Whole Foods AFX cart.")
+    import shlex as _shlex
+    task_title = f"Review Whole Foods AFX cart ({total_count} items)"
+    summary_lines.append(f"**Approve Action:** Stage 1-click Whole Foods AFX cart and create task: '{task_title}'")
     summary_text = "\n".join(summary_lines).strip()
 
     if dry_run:
@@ -1418,11 +1530,13 @@ def run_midweek_grocery_card(
             "total_items": total_count,
         }
 
+    cmd = f"python3 /workspace/tools/whole_foods_afx.py && python3 /workspace/tools/task_manager.py add {_shlex.quote(task_title)} --priority p2"
     payload = {
-        "command": f"echo 'Midweek grocery radar acknowledged: {total_count} items'",
+        "command": cmd,
         "due_staples_count": len(due_staples),
         "task_items_count": len(task_items),
         "total_items": total_count,
+        "task_title": task_title,
     }
 
     should_post = post_to_discord and not test
@@ -1437,9 +1551,11 @@ def run_midweek_grocery_card(
         post_to_discord=should_post,
     )
 
+    decision_id = stage_res.get("decision_id")
     return True, summary_text, {
-        "cards_staged": 1,
-        "decision_id": stage_res.get("decision_id"),
+        "cards_staged": 1 if decision_id else 0,
+        "decision_id": decision_id,
+        "decision_ids": [decision_id] if decision_id else [],
         "due_staples_count": len(due_staples),
         "task_items_count": len(task_items),
         "total_items": total_count,
@@ -1536,7 +1652,7 @@ def run_evening_pm_build_card(
         f"• **Target Scope:** {len(chunks)} chunk(s) across {files_disp}",
         f"• **Instructions:** {instructions[:120]}",
         "",
-        "Tap **Approve** to enqueue and launch isolated `#forge` worktree workers.",
+        "**Approve Action:** Enqueue and launch isolated `#forge` worktree workers.",
     ]
     summary_text = "\n".join(summary_lines)
 

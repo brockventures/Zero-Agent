@@ -494,11 +494,92 @@ def test_core_friends_stages_decision_card(tmp_path: Path):
         assert kwargs["handler_type"] == "shell"
 
         payload = kwargs["payload"]
-        assert "python3 /workspace/tools/core_friends_reminder.py --weeks 8" in payload["command"]
+        assert "python3 /workspace/tools/task_manager.py add" in payload["command"]
+        assert "Reach out to Jordan & Taylor Blake" in payload["command"]
         assert payload["cwd"] == "/workspace"
+        assert "**Approve Action:** Create follow-up task to reach out to Jordan & Taylor Blake" in kwargs["summary"]
 
         ok_cmd, err_cmd = _validate_decision_shell_payload("shell", payload)
         assert ok_cmd is True, err_cmd
+
+
+def test_core_friends_stages_atomic_cards_for_multiple_friends(tmp_path: Path):
+    """Verify check_core_friends_unseen stages separate atomic Decision Cards for each friend."""
+    csv_file = tmp_path / "friends_master.csv"
+    fieldnames = [
+        "Name",
+        "Partner",
+        "Core",
+        "Out of Town",
+        "Last Seen",
+        "Birthday",
+        "Phone Number",
+        "Email Address",
+        "Physical Address",
+        "Notes & Connections",
+    ]
+    rows = [
+        {
+            "Name": "Jordan Blake",
+            "Partner": "",
+            "Core": "TRUE",
+            "Out of Town": "FALSE",
+            "Last Seen": "2026-01-01",
+            "Birthday": "07-15",
+            "Phone Number": "555-0101",
+            "Email Address": "jordan@example.com",
+            "Physical Address": "101 Documentation St",
+            "Notes & Connections": "Local close friend.",
+        },
+        {
+            "Name": "Morgan Stone",
+            "Partner": "",
+            "Core": "TRUE",
+            "Out of Town": "FALSE",
+            "Last Seen": "2026-02-01",
+            "Birthday": "08-20",
+            "Phone Number": "555-0102",
+            "Email Address": "morgan@example.com",
+            "Physical Address": "102 Documentation St",
+            "Notes & Connections": "Local close friend.",
+        },
+    ]
+    with open(csv_file, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with (
+        patch.object(core_friends_reminder, "CSV_PATH", csv_file),
+        patch("tools.forge.stage_decision", side_effect=[
+            {"ok": True, "id": "dec-core-1"},
+            {"ok": True, "id": "dec-core-2"},
+        ]) as mock_stage,
+    ):
+        has_friends, msg, qualifying = core_friends_reminder.check_core_friends_unseen(
+            weeks=8, as_of_date="2026-10-30", stage=True
+        )
+
+        assert has_friends is True
+        assert len(qualifying) == 2
+        assert mock_stage.call_count == 2
+        assert core_friends_reminder.LAST_DECISION_STAGED is True
+        assert all(p.get("_decision_staged") is True for p in qualifying)
+
+        calls = mock_stage.call_args_list
+        # Call 1: Jordan Blake
+        kwargs1 = calls[0][1]
+        assert kwargs1["category"] == "core_friends"
+        assert "Jordan Blake" in kwargs1["title"]
+        assert "**Approve Action:** Create follow-up task to reach out to Jordan Blake" in kwargs1["summary"]
+        assert "Reach out to Jordan Blake" in kwargs1["payload"]["command"]
+
+        # Call 2: Morgan Stone
+        kwargs2 = calls[1][1]
+        assert kwargs2["category"] == "core_friends"
+        assert "Morgan Stone" in kwargs2["title"]
+        assert "**Approve Action:** Create follow-up task to reach out to Morgan Stone" in kwargs2["summary"]
+        assert "Reach out to Morgan Stone" in kwargs2["payload"]["command"]
 
 
 def test_core_friends_no_unseen_no_decision_card(tmp_path: Path):
