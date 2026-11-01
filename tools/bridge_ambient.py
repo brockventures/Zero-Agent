@@ -99,27 +99,36 @@ async def collect_message_and_reply_attachments(msg: discord.Message) -> list[st
     return saved_attachments
 
 
-def contains_zero_mention(text: str) -> bool:
-    """Check if text addresses Zero via @Zero, snowflake, vocative, or bare 'Zero' text."""
-    if not text:
-        return False
-    # 1. Explicit @zero mention anywhere
-    if re.search(r"@zero\b", text, re.IGNORECASE):
+from tools.classifier import (
+    contains_robot_mention,
+    contains_team_mention,
+    contains_zero_mention,
+    is_short_directive_or_followup,
+)
+
+_LEAD_INVOCATION_RE = re.compile(r"^(?:@(?:zero|robot)\b|(?:hey\s+)?(?:zero|robot)\b[:,\s]*)+", re.IGNORECASE)
+_INLINE_BOT_TAG_RE = re.compile(r"@(?:zero|robot)\b", re.IGNORECASE)
+_LAZY_PING_SET = frozenset({"^", "^^", "^^^", "this", "look", "see", "what?", "check this"})
+
+
+def is_lazy_ping_text(text: str) -> bool:
+    """Return True if text is empty or a minimal pointer/punctuation ping."""
+    stripped = (text or "").strip()
+    if not stripped or stripped.lower() in _LAZY_PING_SET:
         return True
-    # 2. Greetings: 'hey/hi/hello zero'
-    if re.search(r"\b(?:hey|hi|hello)\s+zero\b", text, re.IGNORECASE):
-        return True
-    # 3. Punctuation vocative: 'Zero:', 'Zero,', 'Zero -', 'Zero?'
-    # Note: For dashes, require whitespace or end of string to prevent false-positives on hyphenated words (zero-leakage, zero-shot, zero-sum)
-    if re.search(r"(?:^|[\n.!?\s,;])zero\s*(?:[:,]|--?(?:\s+|$))", text, re.IGNORECASE) or re.search(r"\bzero\s*[?!]", text, re.IGNORECASE):
-        return True
-    # 4. Directive verbs targeting Zero: 'ask Zero', 'tag Zero', 'tell Zero', 'cc Zero'
-    if re.search(r"\b(?:ask|tag|tell|ping|cc)\s+zero\b", text, re.IGNORECASE):
-        return True
-    # 5. Sentence starter: 'Zero <verb/query>' at start of message, line, or sentence
-    if re.search(r"(?:^|[\n.!?]\s*)zero\b(?:\s+(?!" + NON_NAME_NOUNS + r")\S+|$)", text, re.IGNORECASE):
-        return True
-    return False
+    return all(ch in "^.?! " or ch.isspace() for ch in stripped)
+
+
+def strip_bot_invocation_tokens(text: str, bot_id: str, preserve_zero_tag: bool = False) -> str:
+    """Normalize or strip bot/role invocation mentions in a single pass."""
+    out = text.replace(f"<@{bot_id}>", "@Zero" if preserve_zero_tag else "").replace(f"<@!{bot_id}>", "@Zero" if preserve_zero_tag else "")
+    if not preserve_zero_tag:
+        out = _LEAD_INVOCATION_RE.sub("", out)
+        out = _INLINE_BOT_TAG_RE.sub("", out)
+    else:
+        out = re.sub(r"^(?:hey\s+)?robot[:,\s]*", "", out, flags=re.IGNORECASE)
+        out = re.sub(r"@robot\b", "", out, flags=re.IGNORECASE)
+    return out.strip()
 
 
 async def warm_channel_history(
@@ -261,7 +270,7 @@ async def route_external_message(
                 f"<@{bot_id}>" in content or
                 f"<@!{bot_id}>" in content or
                 contains_zero_mention(content) or
-                re.search(r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])", content, re.IGNORECASE) is not None
+                contains_robot_mention(content)
             )
 
         if not is_tagged:
@@ -287,13 +296,7 @@ async def route_external_message(
             )
 
         # Clean invocation prefix
-        cleaned = content
-        cleaned = re.sub(rf"<@!?{bot_id}>", "", cleaned)
-        cleaned = re.sub(r"^(hey\s+)?zero[:,\s]*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"@zero\b", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"^(hey\s+)?robot[:,\s]*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"@robot\b", "", cleaned, flags=re.IGNORECASE)
-        cleaned = cleaned.strip()
+        cleaned = strip_bot_invocation_tokens(content, bot_id, preserve_zero_tag=False)
 
         saved_attachments = await collect_message_and_reply_attachments(msg)
 
@@ -317,11 +320,7 @@ async def route_external_message(
                 return True
 
         prompt_content = cleaned
-        is_lazy = bool(
-            not prompt_content or
-            re.fullmatch(r"[\^\s\.\?!]+", prompt_content) or
-            prompt_content.lower() in ("^", "^^", "^^^", "this", "look", "see", "what?", "check this")
-        )
+        is_lazy = is_lazy_ping_text(prompt_content)
         if is_lazy and not saved_attachments:
             prompt_content = (
                 "[OPERATIONAL DIRECTIVE - LAZY TYPER ADDRESSING]:\n"
@@ -503,14 +502,12 @@ async def route_external_message(
         "1543285916506783799" in role_ids or
         "<@&1542294519914037341>" in content or
         "1542294519914037341" in role_ids or
-        re.search(r"(?:^|[\s,;])@robot\b", content, re.IGNORECASE) is not None or
-        re.search(r"^(?:hey\s+)?robot[:,\s]", content, re.IGNORECASE) is not None
+        contains_robot_mention(content)
     )
     is_team_tagged = (
         "<@&1543462881624858624>" in content or
         "1543462881624858624" in role_ids or
-        re.search(r"(?:^|[\s,;])@team\b", content, re.IGNORECASE) is not None or
-        re.search(r"^(?:hey\s+)?team[:,\s]", content, re.IGNORECASE) is not None
+        contains_team_mention(content)
     )
 
     if req_tag:
@@ -537,6 +534,8 @@ async def route_external_message(
     # Conversational follow-up detection:
     is_reply_to_other = bool(getattr(msg, "reference", None) is not None and not is_reply_to_zero)
     is_conversational_follow_up = False
+    zero_spoke_recently = False
+    recent_ctx_snippet = ""
     if not msg.author.bot and not is_reply_to_zero and not is_reply_to_other:
         try:
             from tools.classifier import is_explicitly_addressed_to_other
@@ -567,18 +566,10 @@ async def route_external_message(
                         elapsed = (now_ts - last_msg_ts) if last_msg_ts > 0 else 0
                         if isinstance(elapsed, (int, float)) and 0 <= elapsed <= 300:
                             last_content = last_msg.get("content", "")
+                            zero_spoke_recently = True
+                            recent_ctx_snippet = f"Zero ({int(elapsed)}s ago): {last_content[-300:]}"
                             asked_question = ("?" in last_content[-400:]) or ('"reply": "optional"' in last_content) or ('"floor": "open"' in last_content)
-                            is_action_or_affirmative = bool(re.search(
-                                r"^(?:yep|yeah|yes|sure|go ahead|sounds good|do it|proceed|approved|lgtm|update|check|push|fix|please|pls|thanks|thank you|can you|could you|what about|how about|also|no|nope|wait|try|use|make|let|revert|rollback|deploy|show|tell|why|explain|see|look|run|stop|start|restart|reload|clean|add|remove|delete|set|get|test|verify|option|choice|step|ship|merge|rebase|pull|diff|rebuild|build|stage|commit|pr|audit|diagnose|investigate|benchmark|sync)\b",
-                                content.strip(),
-                                re.IGNORECASE,
-                            ))
-                            is_direct_query = bool(re.search(
-                                r"^(?:done|status|ready|finished|how'?s|is\s+(?:it|there|this|that)|did\s+(?:it|you|this|that|the)|any\s+update|which|where|what|why|who|when|can\s+(?:we|you)|could\s+(?:we|you)|should\s+(?:we|you))\b",
-                                content.strip(),
-                                re.IGNORECASE,
-                            ))
-                            if asked_question or is_action_or_affirmative or is_direct_query:
+                            if asked_question or is_short_directive_or_followup(content):
                                 is_conversational_follow_up = True
                                 print(f"[Bridge] Conversational follow-up to Zero detected from {author_name} ({elapsed:.1f}s after Zero's turn) in channel {msg.channel.id}")
         except Exception as fe:
@@ -592,7 +583,6 @@ async def route_external_message(
         is_robot_tagged or
         is_team_tagged or
         contains_zero_mention(content) or
-        re.search(r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])", content, re.IGNORECASE) is not None or
         is_reply_to_zero or
         handoff_for_zero or
         is_conversational_follow_up
@@ -604,7 +594,16 @@ async def route_external_message(
         if rules.get("ambient_classifier_enabled", False):
             try:
                 from tools.classifier import pop_last_reaction, score_relevance
-                score = await asyncio.to_thread(score_relevance, content, author_name)
+                if zero_spoke_recently:
+                    score = await asyncio.to_thread(
+                        score_relevance,
+                        content,
+                        author_name,
+                        recent_context=recent_ctx_snippet,
+                        zero_spoke_recently=True,
+                    )
+                else:
+                    score = await asyncio.to_thread(score_relevance, content, author_name)
                 ambient_rx = pop_last_reaction()
                 threshold = float(rules.get("ambient_relevance_threshold", 0.80))
                 if score >= threshold:
@@ -793,11 +792,7 @@ async def route_external_message(
         return True
 
     # Check for minimal / lazy pings
-    is_lazy_pointer = bool(
-        not cleaned or
-        re.fullmatch(r"[\^\s\.\?!]+", cleaned) or
-        cleaned.lower() in ("^", "^^", "^^^", "this", "look", "see", "what?", "check this")
-    )
+    is_lazy_pointer = is_lazy_ping_text(cleaned)
     if is_lazy_pointer and not saved_attachments:
         cleaned = (
             f"[OPERATIONAL DIRECTIVE - LAZY TYPER ADDRESSING]:\n"

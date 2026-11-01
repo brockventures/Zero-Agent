@@ -45,6 +45,31 @@ class TestHardcodedRuleFixes(unittest.TestCase):
             self.assertEqual(score_chatter, 0.0)
             mock_run.assert_not_called()
 
+        # Hyphenated technical terms ('zero-leakage', 'zero-trust') must not false-trigger 1.0 mention fast-path
+        with patch("subprocess.run") as mock_run:
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.stdout = "0.15"
+            mock_run.return_value = mock_proc
+            score_tech = score_relevance("We verified zero-leakage and zero-trust in the build")
+            self.assertEqual(score_tech, 0.15)
+
+        # Short natural replies when Zero spoke recently bypass the <4 word drop and pass recent_context
+        with patch("subprocess.run") as mock_run:
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.stdout = "0.92"
+            mock_run.return_value = mock_proc
+            score_followup = score_relevance(
+                "44057 is it",
+                author="Ryan",
+                recent_context="Zero (15s ago): Drop the port here.",
+                zero_spoke_recently=True,
+            )
+            self.assertEqual(score_followup, 0.92)
+            called_cmd = mock_run.call_args[0][0]
+            self.assertTrue(any("[Recent Room Context]" in arg for arg in called_cmd))
+
     def test_thread_titling_rate_limit_collision_removed(self):
         """Verify rate limit and 429 prompts do not get misattributed to Arr Media Indexer."""
         from tools.bridge_formatting import generate_concise_thread_title
@@ -200,6 +225,24 @@ class TestHardcodedRuleFixes(unittest.TestCase):
         with patch("subprocess.Popen", side_effect=OSError("offline fallback")):
             ms, dr, ed = synthesize_session_milestones(dialogue, "crab_cavern_test")
         self.assertIn("benchmark", dr.lower())
+
+    def test_declarative_dispatch_and_formatter_rules(self):
+        """Verify forge.py and bridge_formatting.py declarative dispatch tables and token rules."""
+        from tools import forge, bridge_formatting
+
+        for cmd_key in ("enqueue", "status", "stage-decision", "reconcile", "_build_worker", "_job_worker", "job"):
+            self.assertIn(cmd_key, forge._CLI_CMD_HANDLERS)
+        for job_key in ("start", "status", "list", "cancel", "logs"):
+            self.assertIn(job_key, forge._CLI_JOB_HANDLERS)
+        for h_key in ("shell", "send_mail", "docker_compose", "gh_merge", "bridge_reload", "file_delete", "forge_enqueue", "noop"):
+            self.assertIn(h_key, forge._DECISION_HANDLERS)
+
+        formatted = bridge_formatting.format_for_discord("> [!WARNING]\n> Check `<b>code</b>` and <b>bold</b>\n- **1. First:** item")
+        self.assertIn("> ⚠️ **Warning:**", formatted)
+        self.assertIn("`<b>code</b>`", formatted)
+        self.assertIn("**bold**", formatted)
+        self.assertIn("- **First:** item", formatted)
+
 
 if __name__ == "__main__":
     unittest.main()

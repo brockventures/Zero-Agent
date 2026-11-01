@@ -971,7 +971,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         subprocess.Popen(
             [
                 sys.executable, "-m", "uvicorn",
-                "tools.gotchi_zero_adapter:create_zero_gotchi_app",
+                "backend.gotchi_zero_adapter:create_zero_gotchi_app",
                 "--factory",
                 "--host", "127.0.0.1",
                 "--port", "8771",

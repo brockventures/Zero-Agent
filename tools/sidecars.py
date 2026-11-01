@@ -1229,7 +1229,7 @@ def run_hardcode_regex_audit() -> tuple[bool, str]:
         from tools.hardcode_regex_auditor import CodebaseAuditor, format_audit_report
         auditor = CodebaseAuditor(TOOLS_DIR)
         findings = auditor.run_audit()
-        report = format_audit_report(findings, TOOLS_DIR)
+        report = format_audit_report(findings, TOOLS_DIR, stage_card=True)
         return True, report
     except Exception as e:
         return False, f"⚠️ Hardcoded rule & regex audit failed: {e}"

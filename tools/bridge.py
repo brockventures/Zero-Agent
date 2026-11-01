@@ -47,7 +47,8 @@ except Exception as e:
     print(f"[Bridge] Warning setting SIGCHLD reaper: {e}")
 
 from pathlib import Path
-_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+_RESOLVED_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = "/workspace" if str(_RESOLVED_DIR) == "/app" else str(_RESOLVED_DIR.parent)
 sys.path = [p for p in sys.path if p not in ("/workspace", "/workspace/tools")]
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)

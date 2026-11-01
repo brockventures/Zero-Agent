@@ -18,7 +18,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 DEFAULT_TARGET_DIR = Path("/workspace/tools")
 
@@ -191,16 +191,182 @@ def run_llm_semantic_audit(target_path: Path, static_findings: List[Dict[str, An
         return ""
 
 
-def format_audit_report(findings: List[Dict[str, Any]], target_path: Path) -> str:
-    """Format findings into a high-signal markdown audit report with Gemini 4 Argon High synthesis."""
+def collect_module_density_summaries(target_path: Path, limit: int = 15) -> List[Dict[str, Any]]:
+    """Collect AST/regex branching density stats for recently modified Python modules."""
+    py_files = sorted(target_path.glob("*.py")) if target_path.is_dir() else [target_path]
+    py_files = [p for p in py_files if "test_" not in p.name and p.name != "hardcode_regex_auditor.py"]
+    py_files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    summaries: List[Dict[str, Any]] = []
+    for p in py_files[:limit]:
+        try:
+            src = p.read_text(encoding="utf-8", errors="replace")
+            elif_chains = len(re.findall(r"^\s*elif\s+", src, flags=re.M))
+            regex_compiles = len(re.findall(r"re\.(?:compile|search|match|sub)\(", src))
+            if elif_chains >= 4 or regex_compiles >= 5:
+                summaries.append({
+                    "file": p.name,
+                    "path": f"tools/{p.name}",
+                    "lines": len(src.splitlines()),
+                    "elif_branches": elif_chains,
+                    "regex_calls": regex_compiles,
+                })
+        except Exception:
+            pass
+    return summaries
+
+
+def build_audit_forge_plan(
+    findings: List[Dict[str, Any]],
+    summaries: List[Dict[str, Any]],
+    origin_channel_id: int = 1544953279664889888,
+) -> Dict[str, Any]:
+    """Synthesize a concrete multi-chunk ForgePlan JSON from static findings and high-density modules."""
+    chunks: List[Dict[str, Any]] = []
+    seen_files = set()
+
+    for f in findings[:3]:
+        fname = f["filename"]
+        rel_path = f"tools/{fname}"
+        if rel_path in seen_files:
+            continue
+        seen_files.add(rel_path)
+        test_file = f"tools/test_{fname}"
+        target_files = [rel_path]
+        if (DEFAULT_TARGET_DIR / f"test_{fname}").exists():
+            target_files.append(test_file)
+        chunks.append({
+            "chunk_index": len(chunks),
+            "title": f"Remediate {f['rule_id']} in {fname}",
+            "repo": "/workspace",
+            "worker_model": "gemini-3.8-flash-high",
+            "target_files": target_files,
+            "target_symbols": [rel_path],
+            "prohibited_files": ["tools/bridge.py"],
+            "shared_context": [f"Line {f['line']}: {f['content']}"],
+            "instructions": (
+                f"Replace {f['rule_id']} ({f['category']}) at {rel_path}:{f['line']} per audit guidance: "
+                f"{f['recommendation']} Add or update unit tests to lock in the behavior."
+            ),
+            "verification_cmd": f"python3 -m py_compile {rel_path}" + (f" && pytest {test_file}" if len(target_files) > 1 else ""),
+        })
+
+    for s in summaries:
+        rel_path = s["path"]
+        if rel_path in seen_files or len(chunks) >= 3:
+            continue
+        seen_files.add(rel_path)
+        fname = s["file"]
+        test_file = f"tools/test_{fname}"
+        target_files = [rel_path]
+        if (DEFAULT_TARGET_DIR / f"test_{fname}").exists():
+            target_files.append(test_file)
+        chunks.append({
+            "chunk_index": len(chunks),
+            "title": f"Simplify branching & regex density in {fname}",
+            "repo": "/workspace",
+            "worker_model": "gemini-3.8-flash-high",
+            "target_files": target_files,
+            "target_symbols": [rel_path],
+            "prohibited_files": ["tools/bridge.py"],
+            "shared_context": [
+                f"{fname} currently has {s['elif_branches']} elif branches and {s['regex_calls']} regex calls across {s['lines']} lines."
+            ],
+            "instructions": (
+                f"Refactor brittle procedural elif chains or overlapping regex rules in {rel_path} into "
+                "declarative dispatch tables or structured helpers without altering public function signatures."
+            ),
+            "verification_cmd": f"python3 -m py_compile {rel_path}" + (f" && pytest {test_file}" if len(target_files) > 1 else ""),
+        })
+
+    return {
+        "title": "Hardcoded Rule & Brittle Regex Audit Remediation",
+        "objective": "Eliminate fragile static heuristics, high-density regex chains, and procedural elif branching identified by the monthly architecture audit.",
+        "origin_channel_id": origin_channel_id,
+        "origin_thread_id": None,
+        "repo": "/workspace",
+        "tier": 2 if len(chunks) <= 1 else 3,
+        "touches_core_bridge": False,
+        "context_fact_sheet": [
+            f"Static findings detected: {len(findings)}",
+            f"High-density modules identified: {len(summaries)}",
+        ],
+        "shared_context": [
+            "Preserve all existing public function signatures and unit test contracts."
+        ],
+        "chunks": chunks,
+    }
+
+
+def stage_audit_decision_card(
+    findings: List[Dict[str, Any]],
+    target_path: Path,
+    channel_id: int = 1544953279664889888,
+    post_to_discord: bool = True,
+) -> Optional[str]:
+    """Write the audit ForgePlan JSON to disk and stage an inline FORGE Decision Card."""
+    summaries = collect_module_density_summaries(target_path)
+    plan = build_audit_forge_plan(findings, summaries, origin_channel_id=channel_id)
+    if not plan.get("chunks"):
+        return None
+
+    plan_dir = Path("/workspace/data/forge_plans")
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    plan_file = plan_dir / "hardcode_regex_audit_plan.json"
+    plan_file.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+
+    chunk_titles = ", ".join(c["title"] for c in plan["chunks"])
+    summary_text = (
+        f"Staged {len(plan['chunks'])}-chunk remediation plan ({chunk_titles}). "
+        "Tap Approve to enqueue the refactor build to #forge."
+    )
+    try:
+        from tools.forge import stage_decision
+        decision_id = stage_decision(
+            category="forge",
+            title="Enqueue Hardcode & Regex Audit Remediation Plan",
+            summary=summary_text,
+            handler="forge_enqueue",
+            payload={"plan_file": str(plan_file)},
+            channel_id=channel_id,
+            post_to_discord=post_to_discord,
+        )
+        return decision_id
+    except Exception:
+        return None
+
+
+def format_audit_report(
+    findings: List[Dict[str, Any]],
+    target_path: Path,
+    stage_card: bool = False,
+    channel_id: int = 1544953279664889888,
+) -> str:
+    """Format findings into a high-signal markdown audit report with Action Plan and optional Decision Card."""
+    summaries = collect_module_density_summaries(target_path)
     llm_review = run_llm_semantic_audit(target_path, findings)
     llm_block = f"\n\n### 🧠 Semantic Architecture Review (`gemini-4-argon-high`)\n{llm_review}" if llm_review else ""
+
+    plan = build_audit_forge_plan(findings, summaries, origin_channel_id=channel_id)
+    plan_lines: List[str] = []
+    if plan.get("chunks"):
+        plan_lines.append("\n### 📋 Proposed Action Plan")
+        for idx, c in enumerate(plan["chunks"], start=1):
+            tfiles = ", ".join(f"`{tf}`" for tf in c.get("target_files", []))
+            plan_lines.append(f"{idx}. **{c['title']}** ({tfiles}): {c['instructions']}")
+
+    decision_id = None
+    if stage_card and plan.get("chunks"):
+        decision_id = stage_audit_decision_card(findings, target_path, channel_id=channel_id, post_to_discord=True)
+        if decision_id:
+            plan_lines.append(f"\n✅ **Decision Card Staged (`{decision_id}`):** Tap **Approve** on the card to enqueue this plan to <#1562899941595160657>.")
+
+    plan_block = "\n".join(plan_lines)
 
     if not findings:
         return (
             f"🔍 **Hardcoded Rule & Brittle Regex Audit** (`{target_path}`)\n"
             f"✅ **Zero Fragile Static Heuristics Detected.** Codebase adheres to dynamic state and LLM intent routing protocols."
-            f"{llm_block}"
+            f"{llm_block}{plan_block}"
         )
 
     high_count = sum(1 for f in findings if f["severity"] == "HIGH")
@@ -222,6 +388,8 @@ def format_audit_report(findings: List[Dict[str, Any]], target_path: Path) -> st
 
     if llm_block:
         lines.append(llm_block.strip())
+    if plan_block:
+        lines.append(plan_block.strip())
 
     return "\n".join(lines)
 

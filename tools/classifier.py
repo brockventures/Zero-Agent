@@ -43,14 +43,61 @@ def is_explicitly_addressed_to_other(content: str) -> bool:
     return False
 
 
+NON_NAME_NOUNS = (
+    r"(?:day|shot|downtime|errors?|detections?|latency|tolerance|cost|percent|sum|"
+    r"crossing|emission|point|index|out|wrapping|layout|config|leakage|padding|margin|"
+    r"trust|knowledge|defect|defects|risk|budget|drift|progress)\b"
+)
+
+_ZERO_VOCATIVE_RE = re.compile(
+    r"(?:"
+    r"@zero\b"
+    r"|\b(?:hey|hi|hello|ask|tag|tell|ping|cc)\s+zero\b"
+    r"|(?:^|[\n.!?\s,;])zero\s*(?:[:,]|--?(?:\s+|$))"
+    r"|\bzero\s*[?!]"
+    r"|(?:^|[\n.!?]\s*)zero\b(?:\s+(?!" + NON_NAME_NOUNS + r")\S+|$)"
+    r")",
+    re.IGNORECASE,
+)
+
+_ROBOT_VOCATIVE_RE = re.compile(
+    r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])",
+    re.IGNORECASE,
+)
+
+_TEAM_VOCATIVE_RE = re.compile(
+    r"(?:(?:^|[\s,;])@team\b|^(?:hey\s+)?team[:,\s])",
+    re.IGNORECASE,
+)
+
+
+def contains_zero_mention(text: str) -> bool:
+    """Check if text addresses Zero via @Zero, vocative greeting/punctuation, or sentence starter (excluding technical 'zero-X' compounds)."""
+    if not text:
+        return False
+    return bool(_ZERO_VOCATIVE_RE.search(text))
+
+
+def contains_robot_mention(text: str) -> bool:
+    """Check if text addresses @robot via vocative or tag."""
+    if not text:
+        return False
+    return bool(_ROBOT_VOCATIVE_RE.search(text))
+
+
+def contains_team_mention(text: str) -> bool:
+    """Check if text addresses @team via vocative or tag."""
+    if not text:
+        return False
+    return bool(_TEAM_VOCATIVE_RE.search(text))
+
+
 ZERO_TAGS = [
     r"<@1542285964213358633>",
     r"<@!1542285964213358633>",
     r"<@&1543462881624858624>",  # Team role
     r"<@&1543285916506783799>",  # Robot role (Crab Cavern)
     r"<@&1542294519914037341>",  # Robot role (legacy/alt)
-    r"(?:@zero\b|\b(?:hey|hi|hello)\s+zero\b|(?:^|[\n.!?\s,;])zero\s*[:,-]|\bzero\s*[?!]|\b(?:ask|tag|tell|ping|cc)\s+zero\b|(?:^|[\n.!?]\s*)zero\b(?:\s+(?!(?:day|shot|downtime|errors?|detections?|latency|tolerance|cost|percent|sum|crossing|emission|point|index|out|wrapping|layout|config)\b)\S+|$))",
-    r"(?:@robot\b|\b(?:hey|hi|hello)\s+@?robot\b|^\s*@?robot\s*[:,-])",
 ]
 
 CLASSIFY_PROMPT = '''You are evaluating inbound chat messages in a shared multi-agent engineering channel (Crab Cavern) with Zero (systems engineer, SWE, Linux, Docker, Python), Amos, Marvin, and Aerial.
@@ -363,31 +410,56 @@ class WarmClassifierDaemon:
 warm_classifier = WarmClassifierDaemon()
 
 
-def score_relevance(content: str, author: str = "user", use_warm: bool | None = None) -> float:
+_DIRECTIVE_OR_FOLLOWUP_RE = re.compile(
+    r"^(?:ship|run|deploy|push|update|test|proceed|rollback|revert|fix|merge|build|"
+    r"restart|reload|check|verify|clean|sync|retry|stop|start|cancel|go ahead|lgtm|"
+    r"approved|do it|yep|yeah|yes|sure|sounds good|please|pls|can you|could you|"
+    r"what about|how about|also|no|nope|wait|try|use|make|let|show|tell|why|explain|"
+    r"see|look|add|remove|delete|set|get|option|choice|step|rebase|pull|diff|rebuild|"
+    r"stage|commit|pr|audit|diagnose|investigate|benchmark|done|status|ready|finished|"
+    r"how'?s|is\s+(?:it|there|this|that)|did\s+(?:it|you|this|that|the)|any\s+update|"
+    r"which|where|what|who|when|should\s+(?:we|you))\b",
+    re.IGNORECASE,
+)
+
+
+def is_short_directive_or_followup(text: str) -> bool:
+    """Return True if text begins with an actionable directive, confirmation, or follow-up query starter."""
+    if not text:
+        return False
+    return bool(_DIRECTIVE_OR_FOLLOWUP_RE.search(text.strip()))
+
+
+def score_relevance(
+    content: str,
+    author: str = "user",
+    use_warm: bool | None = None,
+    recent_context: str = "",
+    zero_spoke_recently: bool = False,
+) -> float:
     """Score message relevance for Zero using ambient classifier."""
     global _LAST_AMBIENT_REACTION
     _LAST_AMBIENT_REACTION = None
     content_clean = content.strip()
 
     # Fast-path: Explicit Zero mentions or @Robot snowflake tags immediately score 1.0
-    if any(re.search(tag, content_clean, re.I) for tag in ZERO_TAGS):
+    if (
+        any(re.search(tag, content_clean, re.I) for tag in ZERO_TAGS)
+        or contains_zero_mention(content_clean)
+        or contains_robot_mention(content_clean)
+    ):
         return 1.0
 
     words = content_clean.split()
 
-    # Pre-filtering heuristics to save model calls:
-    is_directive = bool(
-        re.search(
-            r"^(?:ship|run|deploy|push|update|test|proceed|rollback|revert|fix|merge|build|restart|reload|check|verify|clean|sync|retry|stop|start|cancel|go ahead|lgtm|approved|do it)\b",
-            content_clean,
-            re.I,
-        )
-    )
+    # Pre-filtering heuristics to save model calls (bypassed when Zero spoke recently or on directive/followup starters):
+    is_directive = is_short_directive_or_followup(content_clean)
     if (
         len(words) < 4
         and "?" not in content_clean
         and "```" not in content_clean
         and not is_directive
+        and not zero_spoke_recently
     ):
         print("[Classifier] Drop reason=short_non_directive", file=sys.stderr)
         return 0.0
@@ -432,7 +504,12 @@ def score_relevance(content: str, author: str = "user", use_warm: bool | None = 
         ) and (not target or "team" in target):
             is_open_optional_question = True
 
-    prompt = CLASSIFY_PROMPT.format(author=author or "user", content=content_clean)
+    formatted_content = (
+        f"[Recent Room Context]\n{recent_context.strip()}\n\n[New Message]\n{content_clean}"
+        if recent_context and recent_context.strip()
+        else content_clean
+    )
+    prompt = CLASSIFY_PROMPT.format(author=author or "user", content=formatted_content)
 
     # 1. Warm persistent classifier path
     decide_warm = use_warm if use_warm is not None else _should_use_warm_classifier()

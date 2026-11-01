@@ -17,7 +17,7 @@ Unifies the GOTCHI hardware companion (`brockventures/gotchi`) and `#zero-voice`
 2. Guaranteed Hyperlink & Visual Artifact Handoff to `#zero-chat`:
    - Explicit Tooling (`post_note_to_zero_chat`): Supports posting clickable links, code blocks,
      local images/CAD files (`file_path` via `deliver_file`), or live webpage screenshots
-     (`screenshot_url` via `capture_screenshot.py`) directly to `#zero-chat` (`1542081375287640084`).
+     (`screenshot_url` via `capture_screenshot.py`) directly to `#zero-chat`.
    - Deterministic Safety Net (`extract_and_forward_artifacts_to_zero_chat`): Even if the LLM
      includes URLs (`https://...`), fenced code blocks, or local artifact paths in its reply
      without calling `post_note_to_zero_chat`, the adapter automatically forwards them to
@@ -25,8 +25,9 @@ Unifies the GOTCHI hardware companion (`brockventures/gotchi`) and `#zero-voice`
      ensures Gotchi verbally tells Ryan to check `#zero-chat`.
 
 3. Speed & Latency Optimizations:
-   - `ThinkingConfig(thinking_budget=0)` by default on `gemini-2.5-flash` (matches `#zero-voice`,
-     saving 1.2s–3.5s of thinking delay on conversational turns; auto-elevates to `1024` on deep queries).
+   - `ThinkingConfig(thinking_budget=128)` by default on `gemini-2.5-flash` (ensures fact
+     connection and tool reliability with ~50ms latency; auto-elevates to `256` on tool synthesis,
+     `512` on errors/bursts/step 2+, and `1024` on deep queries).
    - Persistent `genai.Client` singleton keeps HTTP/2 TLS connections warm across turns.
    - Sub-2ms in-process SQLite FTS5 (`memory_fts`) recall instead of spawning a subprocess.
    - Early `is_stt_ghost` check aborts `<400ms` accidental PTT bumps before invoking Gemini.
@@ -45,6 +46,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -67,26 +70,36 @@ if "/workspace" not in sys.path:
 if "/workspace/gotchi" not in sys.path:
     sys.path.append("/workspace/gotchi")
 
-ZERO_CHAT_CHANNEL_ID = 1542081375287640084
+ZERO_CHAT_CHANNEL_ID = int(os.environ.get("GOTCHI_ZERO_CHAT_CHANNEL_ID", "0") or 0)
 TARGET_CHANNEL_ID = ZERO_CHAT_CHANNEL_ID
 log = logging.getLogger("gotchi_zero_adapter")
+
+from backend.voice_gateway import (
+    condense_long_answer,
+    extract_topic,
+    is_long_answer,
+)
 
 if Path("/workspace/tools").is_dir() and os.environ.get("GOTCHI_STANDALONE") != "1":
     from tools.bridge_voice import (
         DEFAULT_VOICE_NAME,
         GOTCHI_CHAT_CHANNEL_ID,
+        TARGET_CHANNEL_ID as _BRIDGE_ZERO_CHAT_ID,
         _append_voice_turn_to_history,
         _build_live_tools,
         _load_startup_context_snapshot,
     )
     from tools import outbox
+    if not ZERO_CHAT_CHANNEL_ID:
+        ZERO_CHAT_CHANNEL_ID = int(outbox.resolve_channel("zero-chat")[1] or _BRIDGE_ZERO_CHAT_ID or 0)
+        TARGET_CHANNEL_ID = ZERO_CHAT_CHANNEL_ID
 else:
     log.warning(
         "[GotchiZero] /workspace/tools not present (or GOTCHI_STANDALONE=1); "
         "using standalone stubs for bridge_voice and outbox."
     )
     DEFAULT_VOICE_NAME = "Schedar"
-    GOTCHI_CHAT_CHANNEL_ID = 1562246590943461429
+    GOTCHI_CHAT_CHANNEL_ID = int(os.environ.get("GOTCHI_CHAT_CHANNEL_ID", "0") or 0)
 
     def _append_voice_turn_to_history(*_args: Any, **_kwargs: Any) -> None:
         return None
@@ -111,8 +124,34 @@ else:
 PT_TZ = ZoneInfo("America/Los_Angeles")
 
 DEFAULT_GOTCHI_MODEL = os.environ.get("GOTCHI_ZERO_MODEL", "gemini-3.8-flash")
+DEFAULT_THINKING_BUDGET = 128
 ATTACHMENTS_DIR = Path("/workspace/data/attachments")
 TRANSCRIPT_INDEX_DB = Path("/workspace/data/transcript_index.db")
+
+DEFAULT_HOME_LOCATION = os.environ.get("HOME_LOCATION_LABEL", "Local Home Area")
+DEFAULT_HOME_LAT = 37.4852
+DEFAULT_HOME_LON = -122.2364
+DEFAULT_HOME_TIMEZONE = "America/Los_Angeles"
+
+PLACEHOLDER_PROMPTS = frozenset({
+    "voice prompt",
+    "what is the status?",
+    "what is the status",
+    "describe what you see in this snapshot briefly.",
+    "describe what you see in this snapshot briefly",
+})
+
+
+def is_placeholder_prompt(prompt: Optional[str]) -> bool:
+    """Returns True if prompt is one of the generic client placeholder strings."""
+    if not prompt:
+        return False
+    norm = str(prompt).strip().lower()
+    return norm in PLACEHOLDER_PROMPTS or norm.rstrip(".?") in {
+        "voice prompt",
+        "what is the status",
+        "describe what you see in this snapshot briefly",
+    }
 
 _URL_RE = re.compile(r"https?://[^\s)>\]\"'`]+", re.IGNORECASE)
 _CODE_BLOCK_RE = re.compile(r"```[\s\S]+?```")
@@ -373,7 +412,7 @@ def is_destructive_voice_write(
 def stage_voice_mutation_confirmation(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """
     Gates every `run_shell_command` and `write_local_file` on a voice turn behind a text
-    confirmation card in `#zero-chat` (`1542081375287640084`) so a misheard Whisper word
+    confirmation card in `#zero-chat` so a misheard Whisper word
     or unauthenticated speaker never executes shell commands or mutates files directly.
     """
     if tool_name == "run_shell_command":
@@ -417,6 +456,7 @@ def clean_spoken_text_for_tts(text: str) -> str:
     if not text:
         return ""
     cleaned = text.strip()
+    cleaned = re.sub(r"\[\[defer\]\]", "", cleaned, flags=re.I)
     # Replace markdown links [label](<url>) or [label](url) with just the spoken label
     cleaned = re.sub(r"\[([^\]]+)\]\(<?https?://[^)\s>]+>?\)", r"\1", cleaned)
     # Remove bare URLs in angle brackets or plain text so TTS doesn't read 'https colon slash slash'
@@ -431,6 +471,36 @@ def clean_spoken_text_for_tts(text: str) -> str:
     cleaned = re.sub(r"(?m)^\s*[-*•]\s+", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+NODE_SPEAKER_PROFILES: Dict[str, str] = {
+    "mike": "Mike",
+    "coley": "Dr. Coley",
+    "alex": "Alex",
+    "ryan": "Ryan",
+}
+
+
+def resolve_speaker_for_node(node_id: str = "gotchi-v1-01", speaker: Optional[str] = None) -> str:
+    if speaker is not None and str(speaker).strip():
+        raw_s = str(speaker).strip()
+        low_s = raw_s.lower()
+        if low_s in NODE_SPEAKER_PROFILES:
+            return NODE_SPEAKER_PROFILES[low_s]
+        return raw_s
+    nid_low = (node_id or "").lower()
+    for key, label in NODE_SPEAKER_PROFILES.items():
+        if key in nid_low:
+            return label
+    return "Ryan"
+
+
+def format_voice_turn_prefix(node_id: str = "gotchi-v1-01", speaker: Optional[str] = None) -> str:
+    resolved_speaker = resolve_speaker_for_node(node_id, speaker)
+    return (
+        f"[VOICE TURN node={node_id} speaker={resolved_speaker} — reply for speech in 1-2 short natural sentences, "
+        "plain text, no markdown; prefix sentence 1 with [[defer]] if multi-step background work is needed]"
+    )
 
 
 def select_thinking_level(
@@ -471,7 +541,7 @@ def select_thinking_level(
 
 def select_thinking_budget(
     prompt: str = "",
-    default_budget: int = 0,
+    default_budget: int = DEFAULT_THINKING_BUDGET,
     *,
     step: int = 0,
     tool_had_error: bool = False,
@@ -480,7 +550,7 @@ def select_thinking_budget(
 ) -> int:
     """
     3-Tier Thinking Budget equivalent for `gemini-2.5-flash`:
-    - Tier 1 (`LOW`): `0` tokens on Step 0 and Step 1.
+    - Tier 1 (`LOW`): `128` tokens on Step 0, `256` tokens on Step 1 (tool synthesis).
     - Tier 2 (`MEDIUM`): `512` tokens on tool error, Step 2+, or 5-frame camera burst.
     - Tier 3 (`HIGH`): `1024` tokens when `request_deep_thinking` is invoked.
     """
@@ -489,13 +559,15 @@ def select_thinking_budget(
         return max(default_budget, 1024)
     if tool_had_error or step >= 2 or burst_count > 1:
         return max(default_budget, 512)
+    if step == 1:
+        return max(default_budget, 256)
     return default_budget
 
 
 def build_thinking_config(
     model: str,
     prompt: str = "",
-    default_budget: int = 0,
+    default_budget: int = DEFAULT_THINKING_BUDGET,
     *,
     step: int = 0,
     tool_had_error: bool = False,
@@ -527,11 +599,270 @@ def build_thinking_config(
     return types.ThinkingConfig(thinking_budget=budget)
 
 
+WMO_WEATHER_CODES: Dict[int, str] = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Slight snow fall",
+    73: "Moderate snow fall",
+    75: "Heavy snow fall",
+    77: "Snow grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    85: "Slight snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail",
+}
+
+
+def _is_home_location_query(location: Optional[str]) -> bool:
+    """Checks whether the requested location is empty or refers to Redwood City/home/outside."""
+    if not location:
+        return True
+    loc = str(location).strip().lower()
+    if not loc:
+        return True
+    loc_clean = re.sub(r"[^\w\s]", " ", loc)
+    tokens = set(loc_clean.split())
+    home_tokens = {
+        "home",
+        "here",
+        "outside",
+        "local",
+        "current",
+        "house",
+        "backyard",
+        "patio",
+        "redwood",
+        "",
+    }
+    if tokens & home_tokens:
+        return True
+    if "redwood city" in loc:
+        return True
+    return False
+
+
+def _fetch_open_meteo_forecast(
+    lat: float,
+    lon: float,
+    timezone: str = DEFAULT_HOME_TIMEZONE,
+    location_name: str = DEFAULT_HOME_LOCATION,
+) -> Dict[str, Any]:
+    """Queries Open-Meteo REST API for current conditions and daily high/low forecast."""
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat}&longitude={lon}&"
+        f"current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&"
+        f"daily=temperature_2m_max,temperature_2m_min&"
+        f"temperature_unit=fahrenheit&wind_speed_unit=mph&"
+        f"timezone={urllib.parse.quote(timezone)}"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "GotchiZero/1.0"})
+    with urllib.request.urlopen(req, timeout=3.5) as resp:
+        if resp.status != 200:
+            return {"error": f"Open-Meteo returned status {resp.status}", "location": location_name}
+        data = json.loads(resp.read().decode("utf-8"))
+
+    current = data.get("current", {})
+    daily = data.get("daily", {})
+    weather_code = current.get("weather_code")
+    condition = WMO_WEATHER_CODES.get(weather_code, "Unknown")
+    temp = current.get("temperature_2m")
+    apparent_temp = current.get("apparent_temperature")
+    humidity = current.get("relative_humidity_2m")
+    wind_speed = current.get("wind_speed_10m")
+
+    highs = daily.get("temperature_2m_max", [])
+    lows = daily.get("temperature_2m_min", [])
+    high = highs[0] if (highs and isinstance(highs, list)) else None
+    low = lows[0] if (lows and isinstance(lows, list)) else None
+
+    summary_parts = [f"Currently {condition.lower()}, {temp}°F in {location_name}."]
+    if high is not None and low is not None:
+        summary_parts.append(f"Today's high is {high}°F with a low of {low}°F.")
+    if humidity is not None:
+        summary_parts.append(f"Humidity {humidity}%.")
+    if wind_speed is not None:
+        summary_parts.append(f"Wind {wind_speed} mph.")
+
+    return {
+        "location": location_name,
+        "temperature": temp,
+        "temperature_unit": "°F",
+        "condition": condition,
+        "feels_like": apparent_temp,
+        "humidity": humidity,
+        "wind_speed": wind_speed,
+        "wind_speed_unit": "mph",
+        "high": high,
+        "low": low,
+        "source": "open-meteo",
+        "summary": " ".join(summary_parts),
+    }
+
+
+def _geocode_location(location: str) -> Optional[Tuple[float, float, str, str]]:
+    """Geocodes a city/location name via Open-Meteo geocoding API. Returns (lat, lon, resolved_name, timezone)."""
+    geo_url = (
+        f"https://geocoding-api.open-meteo.com/v1/search?"
+        f"name={urllib.parse.quote(location)}&count=1&language=en&format=json"
+    )
+    req = urllib.request.Request(geo_url, headers={"User-Agent": "GotchiZero/1.0"})
+    with urllib.request.urlopen(req, timeout=3.0) as resp:
+        if resp.status != 200:
+            return None
+        data = json.loads(resp.read().decode("utf-8"))
+
+    results = data.get("results")
+    if not results or not isinstance(results, list):
+        return None
+
+    top = results[0]
+    lat = float(top["latitude"])
+    lon = float(top["longitude"])
+    name = top.get("name") or location
+    admin1 = top.get("admin1") or ""
+    country = top.get("country") or ""
+    parts = [name]
+    if admin1 and admin1 != name:
+        parts.append(admin1)
+    elif country and country != name:
+        parts.append(country)
+    resolved_name = ", ".join(parts)
+    tz = top.get("timezone") or "auto"
+    return lat, lon, resolved_name, tz
+
+
+def fetch_live_weather(location: str = DEFAULT_HOME_LOCATION) -> Dict[str, Any]:
+    """
+    Fetches live weather conditions and high/low forecast:
+    - If location is empty or refers to home/outside/Redwood City, defaults to Local Home Area.
+      First attempts to query Home Assistant live weather entities (weather.openweathermap,
+      weather.forecast_home, weather.home) via HA REST API. If HA entities are not configured,
+      404, or unavailable, falls back to Open-Meteo in <300ms.
+    - If location is another city, geocodes via Open-Meteo geocoding and fetches forecast.
+    """
+    is_home = _is_home_location_query(location)
+
+    if is_home:
+        # 1. Try Home Assistant weather entities first
+        try:
+            _, base_url, token, _ = _load_ha_credentials_from_env_or_secrets()
+            if base_url and token:
+                for entity_id in ("weather.openweathermap", "weather.forecast_home", "weather.home"):
+                    try:
+                        url = f"{base_url.rstrip('/')}/api/states/{entity_id}"
+                        req = urllib.request.Request(
+                            url,
+                            headers={
+                                "Authorization": f"Bearer {token}",
+                                "Content-Type": "application/json",
+                            },
+                        )
+                        with urllib.request.urlopen(req, timeout=1.5) as resp:
+                            if resp.status == 200:
+                                data = json.loads(resp.read().decode("utf-8"))
+                                state = data.get("state")
+                                if state and state.lower() not in ("unavailable", "unknown"):
+                                    attrs = data.get("attributes", {})
+                                    temp = attrs.get("temperature")
+                                    if temp is not None:
+                                        temp_unit = attrs.get("temperature_unit", "°F")
+                                        condition = (attrs.get("condition") or state).replace("-", " ").title()
+                                        humidity = attrs.get("humidity")
+                                        wind_speed = attrs.get("wind_speed")
+                                        wind_unit = attrs.get("wind_speed_unit", "mph")
+                                        apparent_temp = attrs.get("apparent_temperature")
+                                        forecasts = attrs.get("forecast", [])
+                                        high = None
+                                        low = None
+                                        if forecasts and isinstance(forecasts, list):
+                                            fc0 = forecasts[0]
+                                            if isinstance(fc0, dict):
+                                                high = fc0.get("temperature")
+                                                low = fc0.get("templow")
+                                        summary_parts = [
+                                            f"Currently {condition.lower()}, {temp}{temp_unit} in {DEFAULT_HOME_LOCATION}."
+                                        ]
+                                        if high is not None and low is not None:
+                                            summary_parts.append(
+                                                f"Today's high is {high}{temp_unit} with a low of {low}{temp_unit}."
+                                            )
+                                        if humidity is not None:
+                                            summary_parts.append(f"Humidity {humidity}%.")
+                                        if wind_speed is not None:
+                                            summary_parts.append(f"Wind {wind_speed} {wind_unit}.")
+                                        return {
+                                            "location": DEFAULT_HOME_LOCATION,
+                                            "temperature": temp,
+                                            "temperature_unit": temp_unit,
+                                            "condition": condition,
+                                            "feels_like": apparent_temp,
+                                            "humidity": humidity,
+                                            "wind_speed": wind_speed,
+                                            "wind_speed_unit": wind_unit,
+                                            "high": high,
+                                            "low": low,
+                                            "source": f"home_assistant ({entity_id})",
+                                            "summary": " ".join(summary_parts),
+                                        }
+                    except Exception as exc:
+                        log.debug(f"[GotchiZero] HA weather query failed for {entity_id}: {exc}")
+        except Exception as e:
+            log.debug(f"[GotchiZero] HA credentials check failed: {e}")
+
+        # 2. Fallback to Open-Meteo for Local Home Area
+        try:
+            return _fetch_open_meteo_forecast(
+                DEFAULT_HOME_LAT,
+                DEFAULT_HOME_LON,
+                DEFAULT_HOME_TIMEZONE,
+                DEFAULT_HOME_LOCATION,
+            )
+        except Exception as exc:
+            log.warning(f"[GotchiZero] Open-Meteo forecast failed for {DEFAULT_HOME_LOCATION}: {exc}")
+            return {
+                "error": f"Failed to fetch weather: {exc}",
+                "location": DEFAULT_HOME_LOCATION,
+            }
+
+    # Non-home location query: Geocode + fetch
+    clean_loc = (location or "").strip()
+    try:
+        geo = _geocode_location(clean_loc)
+        if not geo:
+            return {"error": f"Could not find location: {clean_loc}", "location": clean_loc}
+        lat, lon, resolved_name, tz = geo
+        return _fetch_open_meteo_forecast(lat, lon, tz, resolved_name)
+    except Exception as exc:
+        log.warning(f"[GotchiZero] Weather lookup failed for {clean_loc}: {exc}")
+        return {
+            "error": f"Failed to fetch weather for {clean_loc}: {exc}",
+            "location": clean_loc,
+        }
+
+
 def _build_gotchi_tools() -> list[Any]:
     """
-    Extends `_build_live_tools()` with the `request_deep_thinking(spoken_preamble, reason)`
-    tool so the Step 0 `LOW` model can immediately stream a spoken preamble to Gotchi's speaker
-    while escalating Step 1 to `HIGH` thinking.
+    Extends `_build_live_tools()` with `request_deep_thinking`, `get_weather_forecast`,
+    and updated `get_recent_discord_context` supporting Crab Cavern and Home channels.
     """
     from google.genai import types
 
@@ -540,59 +871,84 @@ def _build_gotchi_tools() -> list[Any]:
     for t in base_tools:
         if getattr(t, "function_declarations", None):
             f_decls.extend(list(t.function_declarations))
+
+    # Ensure get_recent_discord_context is present and documents Crab Cavern and Home channels
+    f_decls = [d for d in f_decls if getattr(d, "name", None) != "get_recent_discord_context"]
     f_decls.append(
         types.FunctionDeclaration(
-            name="request_deep_thinking",
+            name="get_recent_discord_context",
             description=(
-                "Escalate from LOW thinking to HIGH thinking for complex math, multi-constraint "
-                "architecture tradeoffs, or deep root-cause debugging. Streams `spoken_preamble` "
-                "immediately to Gotchi's speaker while Step 1 runs with HIGH thinking."
+                "Fetch the most recent messages from Discord channels. "
+                "Supports Crab Cavern channels ('crab-cavern' rollup across all rooms, or specific rooms: "
+                "'lounge', 'gotchi', 'gotchi-chat', 'the-banana-stand', 'side-project', 'mirrormere', "
+                "'debug-huddle', 'agora', 'r-residentagents') and Home channels "
+                "('zero-chat', 'zero-ops', 'homelab', 'home-assistant', 'finances', 'shopping', "
+                "'projects', '3d-print', 'steam-deck', 'baseball')."
             ),
             parameters=types.Schema(
                 type="OBJECT",
                 properties={
-                    "spoken_preamble": types.Schema(
+                    "channel_name": types.Schema(
                         type="STRING",
-                        description="One short spoken sentence to play immediately while thinking (e.g. 'Give me a second to run the numbers on that.').",
-                    ),
-                    "reason": types.Schema(
-                        type="STRING",
-                        description="Brief reason why HIGH thinking is needed.",
+                        description=(
+                            "Channel name or rollup to inspect: 'crab-cavern' (multi-channel rollup across Crab Cavern rooms), "
+                            "'lounge', 'gotchi', 'gotchi-chat', 'the-banana-stand', 'side-project', 'mirrormere', "
+                            "'debug-huddle', 'agora', 'r-residentagents', 'zero-chat', 'zero-ops', 'homelab', "
+                            "'home-assistant', 'finances', 'shopping', 'projects', '3d-print', 'steam-deck', or 'baseball'. "
+                            "Defaults to 'zero-chat' if omitted."
+                        ),
                     ),
                 },
-                required=["spoken_preamble", "reason"],
+                required=[],
             ),
         )
     )
-    f_decls.append(
-        types.FunctionDeclaration(
-            name="delegate_coding_task_to_zero_chat",
-            description=(
-                "Hand off any coding task, bug fix, feature build, or multi-file engineering request "
-                "to Zero's full Argon brain in #zero-chat (`outbox.queue_agent_turn`). Never write "
-                "production code or author #forge specs directly on Gotchi voice turns; call this tool "
-                "so the full Argon orchestrator wakes up in #zero-chat to spec and build it."
-            ),
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "task_summary": types.Schema(
-                        type="STRING",
-                        description="Clear description of what Ryan wants built, fixed, or refactored.",
-                    ),
-                    "spoken_preamble": types.Schema(
-                        type="STRING",
-                        description="One short spoken sentence confirming the handoff (e.g. 'Passing that to Zero-Chat to spec and build.').",
-                    ),
-                    "context_notes": types.Schema(
-                        type="STRING",
-                        description="Optional extra context, repo name, or visual details from Gotchi's camera.",
-                    ),
-                },
-                required=["task_summary"],
-            ),
+    if not any(getattr(d, "name", None) == "request_deep_thinking" for d in f_decls):
+        f_decls.append(
+            types.FunctionDeclaration(
+                name="request_deep_thinking",
+                description=(
+                    "Escalate from LOW thinking to HIGH thinking for complex math, multi-constraint "
+                    "architecture tradeoffs, or deep root-cause debugging. Streams `spoken_preamble` "
+                    "immediately to Gotchi's speaker while Step 1 runs with HIGH thinking."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "spoken_preamble": types.Schema(
+                            type="STRING",
+                            description="One short spoken sentence to play immediately while thinking (e.g. 'Give me a second to run the numbers on that.').",
+                        ),
+                        "reason": types.Schema(
+                            type="STRING",
+                            description="Brief reason why HIGH thinking is needed.",
+                        ),
+                    },
+                    required=["spoken_preamble", "reason"],
+                ),
+            )
         )
-    )
+    if not any(getattr(d, "name", None) == "get_weather_forecast" for d in f_decls):
+        f_decls.append(
+            types.FunctionDeclaration(
+                name="get_weather_forecast",
+                description=(
+                    "Get current weather conditions and daily high/low forecast. "
+                    "Defaults to Ryan's home in Local Home Area when no city is specified. "
+                    "NEVER ask Ryan what city he is in—call this tool immediately."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "location": types.Schema(
+                            type="STRING",
+                            description="Target city and state (e.g. 'Local Home Area', 'San Francisco, CA', 'Chicago, IL'). Defaults to 'Local Home Area' if omitted or asking about local/outside conditions.",
+                        ),
+                    },
+                    required=[],
+                ),
+            )
+        )
     return [types.Tool(function_declarations=f_decls)]
 
 
@@ -656,8 +1012,8 @@ def send_gotchi_artifact_to_zero_chat(
 ) -> Dict[str, Any]:
     """
     Dispatches clickable hyperlinks, code snippets, local visual/CAD artifacts (`file_path`),
-    or live webpage screenshots (`screenshot_url`) to `#zero-chat` (`1542081375287640084`)
-    and optionally mirrors to `#gotchi-chat` (`1562246590943461429`).
+    or live webpage screenshots (`screenshot_url`) to `#zero-chat`
+    and optionally mirrors to `#gotchi-chat`.
     """
     clean_msg = (message or "").strip()
     resolved_file = (file_path or "").strip()
@@ -752,7 +1108,7 @@ def extract_and_forward_artifacts_to_zero_chat(
     1. Detects if `raw_reply` contains hyperlinks (`https://...`), fenced code blocks,
        or local artifact/image paths (`/workspace/.../*.png|.stl|.3mf|...`).
     2. If `not explicitly_posted_in_turn` and artifacts/links are present in `raw_reply`,
-       automatically dispatches them to `#zero-chat` (`1542081375287640084`) so nothing visual
+       automatically dispatches them to `#zero-chat` so nothing visual
        or clickable is lost when `clean_spoken_text_for_tts` strips URLs from the spoken audio.
     3. Ensures `spoken_reply` includes a brief verbal cue telling Ryan to check `#zero-chat`
        whenever a link or artifact was sent during the turn.
@@ -792,72 +1148,13 @@ def extract_and_forward_artifacts_to_zero_chat(
     return updated_spoken, any_sent_to_zero_chat
 
 
-def delegate_coding_task_to_zero_chat(
-    task_summary: str,
-    spoken_preamble: str = "",
-    context_notes: str = "",
-    target_channel: str = "zero-chat",
-) -> Dict[str, Any]:
-    """
-    Hands off a coding, bug-fix, refactor, or engineering build request from Gotchi's
-    lightweight voice model directly to Zero's full Argon brain in `#zero-chat` via
-    `outbox.queue_agent_turn` so the Argon orchestrator wakes up, inspects the codebase,
-    and either executes a Tier 1 fix or specs a `#forge` build.
-    """
-    clean_task = (task_summary or "").strip()
-    if not clean_task:
-        return {"ok": False, "error": "Empty task_summary"}
-
-    clean_notes = (context_notes or "").strip()
-    clean_preamble = (
-        (spoken_preamble or "").strip()
-        or "Passing that to Zero-Chat to spec and build."
-    )
-    notes_block = f"\n- **Voice Context / Notes:** {clean_notes}" if clean_notes else ""
-    argon_prompt = (
-        "[GOTCHI VOICE-TO-ARGON CODING HANDOFF]\n"
-        "Ryan requested a code change or engineering build via Gotchi Push-to-Talk:\n"
-        f"- **Request:** {clean_task}{notes_block}\n\n"
-        "Inspect the relevant codebase with full Argon engineering context, then either "
-        "execute a focused Tier 1 fix inline or package and enqueue/stage a validated "
-        "`ForgePlan` in `#forge`, and post the status or Decision Card here in `#zero-chat`."
-    )
-    queued = outbox.queue_agent_turn(
-        channel=target_channel,
-        prompt=argon_prompt,
-        job_name="Gotchi Voice-to-Argon Handoff",
-        force=True,
-    )
-    return {
-        "ok": True,
-        "status": "delegated_to_argon_in_zero_chat",
-        "channel": target_channel,
-        "channel_id": TARGET_CHANNEL_ID,
-        "outbox_id": queued.get("id"),
-        "spoken_preamble": clean_preamble,
-        "task_summary": clean_task,
-    }
-
-
-def _load_gotchi_voice_context_snapshot() -> str:
-    """
-    Loads Ryan's profile, active tasks, and recent chat/voice history while stripping
-    the heavy `/workspace/GEMINI.md` coding/FORGE rulebook from Gotchi's voice prompt.
-    """
-    raw_snapshot = _load_startup_context_snapshot()
-    marker = "=== RYAN BROCK PROFILE"
-    if marker in raw_snapshot:
-        return raw_snapshot[raw_snapshot.index(marker) :]
-    return raw_snapshot
-
-
 def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = False) -> str:
     """
     Builds the unified Zero system prompt shared with `#zero-voice`, tuned for Gotchi's
     pocket Push-to-Talk, camera snapshot/burst, and 200x200 e-paper companion UX.
     """
     now_pt = datetime.now(PT_TZ).strftime("%A, %b %d, %Y %I:%M %p PT")
-    snapshot = _load_gotchi_voice_context_snapshot()
+    snapshot = _load_startup_context_snapshot()
     memory_hits = prefetch_zero_memory(user_prompt) if user_prompt else ""
     mem_block = (
         f"\n\n=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===\n{memory_hits}"
@@ -871,9 +1168,9 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         else ""
     )
     return (
-        f"You are Zero, Ryan Brock's autonomous AI engineering partner running on Host 2 (.84 LAN) in the "
-        f"Brock homelab (Redwood City, CA). Current time: {now_pt}.\n"
-        f"Ryan is talking to you through his pocket GOTCHI hardware companion (matching your `#zero-voice` "
+        f"You are Zero, an autonomous AI engineering partner. "
+        f"Current time: {now_pt}.\n"
+        f"You are speaking through the pocket GOTCHI hardware companion (matching your `#zero-voice` "
         f"experience with your signature `{DEFAULT_VOICE_NAME}` voice and 200x200 e-paper display).\n\n"
         "GOTCHI & ZERO-VOICE UNIFIED PERSONA INVARIANTS:\n"
         "- Speak STRICTLY in English (`en-US`).\n"
@@ -883,22 +1180,32 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         "'Let me know if you need anything else!'\n"
         "- SPOKEN BREVITY FOR POCKET HARDWARE: Keep your spoken answer tight, punchy, and natural "
         "(1 to 3 sentences by default) so it plays cleanly through Gotchi's speaker without monologue fatigue.\n"
+        "- HOME LOCATION & WEATHER DEFAULT (Local Home Area: Ryan's home and default location is Local Home Area. "
+        "Whenever Ryan asks 'what is the weather outside?' or any local query without naming a city, NEVER ask what city he is in—immediately "
+        "call get_weather_forecast(location='Local Home Area'). Ryan lives in Local Home Area; never ask Ryan what city he is in "
+        "when he asks about the weather, local time, or outside conditions.\n"
+        "- DISCORD CHANNEL & CRAB CAVERN ACCESS: You have full access to read messages across BOTH Crab Cavern and Home Discord channels. "
+        "NEVER claim that you lack access to Crab Cavern, that you cannot read Crab Cavern channels, or that you are restricted to Home channels. "
+        "When asked about Crab Cavern, call `get_recent_discord_context(channel_name='crab-cavern')` for a multi-channel rollup across Crab Cavern rooms "
+        "('lounge', 'gotchi', 'gotchi-chat', 'the-banana-stand', 'side-project', 'mirrormere', 'debug-huddle', 'agora', 'r-residentagents'), "
+        "or pass a specific Crab Cavern channel name. For Home channels, pass 'zero-chat', 'zero-ops', 'homelab', 'home-assistant', 'finances', 'shopping', 'projects', '3d-print', 'steam-deck', or 'baseball'.\n"
         "- HYPERLINKS & VISUAL ARTIFACTS -> #zero-chat: Never read raw URLs, file paths, or code blocks out loud. "
         "Whenever a turn involves clickable hyperlinks, shopping/product links, GitHub PRs/issues, code snippets, "
         "images, CAD models, or live webpage screenshots, call `post_note_to_zero_chat` (with `message`, optional "
         "`file_path`, or optional `screenshot_url`) to send it to `#zero-chat`, and tell Ryan verbally to find it "
         "in `#zero-chat`.\n"
-        "- VOICE-TO-ARGON CODING HANDOFF (`delegate_coding_task_to_zero_chat`): You are the lightweight pocket "
-        "voice interface and do NOT carry codebase rules or author `#forge` build specs yourself. Whenever Ryan "
-        "asks you to write code, fix a bug, refactor a module, or build a feature, call "
-        "`delegate_coding_task_to_zero_chat(task_summary, spoken_preamble, context_notes)` to wake up Zero's "
-        "full Argon brain in `#zero-chat` to spec and build it."
         f"{vision_note}\n\n"
+        "GOTCHI V1 HARDWARE CONTROLS & MODES:\n"
+        "- Answer any question about Gotchi physical buttons or operating modes directly from this spec without running tools or searching files.\n"
+        "- Top Button (`BTN_TOP`): Speaking only (quick tap <500ms latches hands-free Tap-to-Talk; hold >500ms sends on release; pressing during speech cancels playback).\n"
+        "- Go Live (`live_mode`): When enabled in unit config (`set_config`), double-tap `BTN_TOP` within 400ms or say 'Go Live' to start a full-duplex WebSocket session (`/api/live/ws`); press `BTN_TOP` or pause 15s to exit.\n"
+        "- Bottom Button (`BTN_BOT`): Camera only (short press <700ms takes 1 snapshot + 2s voice window; long press >=700ms takes a 5-frame burst over 3s).\n\n"
         "FULL AGENT PARITY & TOOL ACCESS:\n"
         "- You have 100% of the same container access, filesystem access, memory search, GitHub CLI (`gh`), "
         "SSH, Home Assistant, and research tools as `#zero-voice` and `#zero-chat`.\n"
-        "- PRE-TOOL SPOKEN PREAMBLE: Before calling any tool, emit one short conversational sentence "
-        "(e.g. 'Let me check that.') so Gotchi speaks immediately while the tool runs.\n"
+        "- PRE-TOOL SPOKEN PREAMBLE: Before calling any tool, emit one short, specific action-narration sentence "
+        "(e.g. 'I'm checking the weather for you now.', 'I'm pulling up that photo for you now.', 'Looking that up on Reddit now.') "
+        "describing the exact action you are taking so Gotchi speaks immediately while the tool runs. Never use generic 'One moment' or 'Let me check that', and never emit a filler on direct answers without tools.\n"
         "- TIER-3 DEEP THINKING ESCALATION (`request_deep_thinking`): You start at `LOW` thinking for sub-second speed. "
         "Whenever a turn requires multi-step math, architecture tradeoffs, or deep root-cause debugging, call "
         "`request_deep_thinking(spoken_preamble, reason)` on Step 0 before answering so Gotchi speaks your preamble "
@@ -908,17 +1215,190 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         "git reset/clean/force-push, container teardown, process kills) and file overwrites stage a confirmation card in "
         "`#zero-chat` before executing. `read_local_file` is restricted to `os.path.realpath` under `/workspace/` and "
         "`/baseball/` (denying `.env`, `.ssh`, and secrets).\n"
-        "- Use `delegate_coding_task_to_zero_chat` whenever Ryan asks to build, fix, or refactor code.\n"
         "- Use `search_zero_memory` to search durable memory or past transcripts.\n"
         "- Use `check_tasks_and_repos` to inspect `/workspace/data/tasks.json` and open GitHub issues.\n"
         "- Use `run_shell_command` to execute non-destructive commands in `/workspace` (destructive commands stage for confirmation).\n"
         "- Use `read_local_file` and `write_local_file` to inspect or write files on disk (overwrites stage for confirmation).\n"
         "- Use `web_and_reddit_search` for live Reddit or Amazon SerpApi queries.\n"
-        "- Use `get_recent_discord_context` to read recent messages across Discord channels.\n"
+        "- Use `get_recent_discord_context` to read recent messages across Discord channels. Supports 'crab-cavern' multi-channel rollup across all Crab Cavern rooms, individual Crab Cavern channels ('lounge', 'gotchi', 'gotchi-chat', 'the-banana-stand', 'side-project', 'mirrormere', 'debug-huddle', 'agora', 'r-residentagents'), and Home channels ('zero-chat', 'zero-ops', 'homelab', 'home-assistant', 'finances', 'shopping', 'projects', '3d-print', 'steam-deck', 'baseball'). Never claim you lack access to Crab Cavern.\n"
         "- Use `post_note_to_zero_chat` to send clickable links, notes, code blocks, local images/files (`file_path`), "
-        "or webpage screenshots (`screenshot_url`) directly to `#zero-chat`.\n\n"
+        "or webpage screenshots (`screenshot_url`) directly to `#zero-chat`.\n"
+        "- Use `get_weather_forecast` to check live weather conditions and high/low forecasts (defaults immediately to Local Home Area without asking for a city).\n\n"
         f"{snapshot}{mem_block}"
     )
+
+
+def build_contextual_tool_filler(
+    fn_name: str,
+    fn_args: Optional[Dict[str, Any]] = None,
+    prompt: str = "",
+) -> str:
+    """
+    Builds a natural, varied, action-specific spoken filler describing the exact tool
+    action about to run (never generic 'One moment' or 'Let me check that').
+    """
+    args = fn_args or {}
+    combined_text = f"{prompt} {args.get('query', '')} {args.get('command', '')} {args.get('path', '')} {args.get('repo_or_filter', '')} {args.get('location', '')}".lower()
+    seed = sum(ord(c) for c in (combined_text or fn_name))
+
+    if (
+        "weather" in combined_text
+        or "forecast" in combined_text
+        or "temperature" in combined_text
+        or fn_name == "get_weather_forecast"
+    ):
+        options = (
+            "I'm checking the weather for you now.",
+            "Pulling up the live weather forecast now.",
+            "Checking the current conditions for you now.",
+        )
+        return options[seed % len(options)]
+
+    if "photo" in combined_text or "picture" in combined_text or "image" in combined_text or "snapshot" in combined_text:
+        options = (
+            "I'm pulling up that picture for you now.",
+            "Checking that snapshot for you now.",
+            "Taking a look at that image now.",
+        )
+        return options[seed % len(options)]
+
+    if fn_name == "search_zero_memory":
+        target = str(args.get("target", "all")).lower()
+        if target == "transcripts":
+            options = (
+                "I'm searching our past conversations for that now.",
+                "Pulling up the chat history on that for you now.",
+                "Checking recent transcripts for that now.",
+            )
+        else:
+            options = (
+                "I'm checking your notes and memory for that now.",
+                "Pulling up our saved notes on that for you now.",
+                "Searching my memory for those details now.",
+            )
+        return options[seed % len(options)]
+
+    if fn_name == "web_and_reddit_search":
+        source = str(args.get("source", "reddit")).lower()
+        if source == "amazon":
+            options = (
+                "I'm checking Amazon pricing and reviews for you now.",
+                "Pulling up those product details on Amazon now.",
+                "Looking up the current Amazon listings for you now.",
+            )
+        else:
+            options = (
+                "I'm looking that up on Reddit for you now.",
+                "Pulling up the latest community threads on that now.",
+                "Searching recent discussions on that for you now.",
+            )
+        return options[seed % len(options)]
+
+    if fn_name == "check_tasks_and_repos":
+        options = (
+            "I'm checking the open tasks and repository status now.",
+            "Pulling up the active GitHub issues for you now.",
+            "Checking the project queue for you now.",
+        )
+        return options[seed % len(options)]
+
+    if fn_name == "read_local_file":
+        options = (
+            "I'm pulling up that file for you now.",
+            "Reading through that file for you now.",
+            "Opening that document to check the details now.",
+        )
+        return options[seed % len(options)]
+
+    if fn_name == "write_local_file":
+        options = (
+            "I'm writing those updates to disk for you now.",
+            "Saving that file for you now.",
+        )
+        return options[seed % len(options)]
+
+    if fn_name == "get_recent_discord_context":
+        ch_arg = str((fn_args or {}).get("channel_name", "") or "").lower()
+        if any(term in ch_arg for term in ("crab", "cavern", "krab", "kvern", "lounge")):
+            options = (
+                "I'm checking recent messages across Crab Cavern for you now.",
+                "Pulling up the latest Crab Cavern updates for you now.",
+                "Reading the Crab Cavern room scrollback for you now.",
+            )
+            return options[seed % len(options)]
+        options = (
+            "I'm checking the recent Discord messages for you now.",
+            "Pulling up the latest channel updates for you now.",
+            "Reading the recent room scrollback for you now.",
+        )
+        return options[seed % len(options)]
+
+    if fn_name == "post_note_to_zero_chat":
+        options = (
+            "I'm sending those details over to Zero-Chat for you now.",
+            "Posting that link to Zero-Chat for you now.",
+        )
+        return options[seed % len(options)]
+
+    options = (
+        "I'm running a quick system check on that for you now.",
+        "Pulling up those live system details for you now.",
+        "Checking the live status on that for you now.",
+    )
+    return options[seed % len(options)]
+
+
+CRAB_CAVERN_ROLLUP_CHANNELS: List[Tuple[str, str]] = [
+    ("lounge", "1534452820995080192"),
+    ("gotchi", "1561509863018856468"),
+    ("the-banana-stand", "1534436119888793750"),
+    ("side-project", "1551465050072416286"),
+    ("mirrormere", "1552732003076669460"),
+    ("debug-huddle", "1549555629222404096"),
+    ("agora", "1558202642663211169"),
+    ("r-residentagents", "1562544598423965856"),
+]
+
+
+def normalize_discord_channel_input(raw: str) -> Tuple[bool, str]:
+    """
+    Normalizes a Discord channel name/identifier from text or STT.
+    Strips leading '#', removes leading/trailing whitespace, and handles STT variants
+    for Crab Cavern ('crab cavern', 'krab kvern', 'crabcavern', etc.).
+
+    Returns:
+        (is_crab_cavern_rollup, normalized_name_or_id)
+    """
+    clean = (raw or "").strip().lower()
+    if clean.startswith("#"):
+        clean = clean[1:].strip()
+    if not clean:
+        clean = "zero-chat"
+
+    compact = clean.replace(" ", "").replace("-", "").replace("_", "")
+
+    # STT variants for crab cavern rollup
+    is_rollup = (
+        compact in {
+            "crabcavern",
+            "krabkvern",
+            "crabkvern",
+            "krabcavern",
+            "crabcaverns",
+            "krabkverns",
+            "thecrabcavern",
+            "thekrabkvern",
+            "crab",
+            "cavern",
+            "crabcavernrollup",
+        }
+        or any(k in compact for k in ("crabcavern", "krabkvern", "crabkvern", "krabcavern"))
+        or (("crab" in clean or "krab" in clean) and ("cavern" in clean or "kvern" in clean or "tavern" in clean))
+    )
+    if is_rollup:
+        return True, "crab-cavern"
+
+    return False, clean
 
 
 async def execute_gotchi_tool_call(
@@ -940,6 +1420,10 @@ async def execute_gotchi_tool_call(
             "spoken_preamble": preamble,
             "reason": reason,
         }
+
+    if name == "get_weather_forecast":
+        loc = str(args.get("location", "") or "").strip() or DEFAULT_HOME_LOCATION
+        return await asyncio.to_thread(fetch_live_weather, loc)
 
     if name == "search_zero_memory":
         query = str(args.get("query", "")).strip()
@@ -967,14 +1451,13 @@ async def execute_gotchi_tool_call(
                 ],
                 capture_output=True,
                 text=True,
-                timeout=12,
+                timeout=4,
             )
             return {"result": (res.stdout or "No matches found.")[:3500]}
         except Exception as e:
             return {"error": str(e)}
 
     if name == "check_tasks_and_repos":
-        repo_filter = str(args.get("repo_or_filter", "all")).strip().lower()
         out_parts: List[str] = []
         try:
             t_file = Path("/workspace/data/tasks.json")
@@ -988,11 +1471,7 @@ async def execute_gotchi_tool_call(
                         for t in pending[:15]
                     )
                 )
-            repos = ["brockventures/gotchi", "brockventures/big-projections"]
-            if "sharkfin" in repo_filter or repo_filter == "all":
-                repos.append("brockventures/sharkfin")
-            if "home" in repo_filter or "ha" in repo_filter or repo_filter == "all":
-                repos.append("brockventures/homeassistant-config")
+            repos = [r.strip() for r in os.environ.get("GOTCHI_GITHUB_REPOS", "brockventures/gotchi").split(",") if r.strip()]
 
             for r in repos:
                 gh_res = await asyncio.to_thread(
@@ -1000,7 +1479,7 @@ async def execute_gotchi_tool_call(
                     ["gh", "issue", "list", "--repo", r, "--state", "open", "--limit", "10"],
                     capture_output=True,
                     text=True,
-                    timeout=8,
+                    timeout=3,
                 )
                 if gh_res.stdout.strip():
                     out_parts.append(f"Open GitHub Issues in {r}:\n{gh_res.stdout.strip()}")
@@ -1027,7 +1506,7 @@ async def execute_gotchi_tool_call(
                 cwd="/workspace",
                 capture_output=True,
                 text=True,
-                timeout=20,
+                timeout=5,
             )
             combined = (res.stdout or "") + ("\nSTDERR:\n" + res.stderr if res.stderr else "")
             return {"exit_code": res.returncode, "output": combined[:4000] or "(no output)"}
@@ -1086,36 +1565,107 @@ async def execute_gotchi_tool_call(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=18,
+                timeout=6,
             )
             return {"result": (res.stdout or res.stderr or "No results")[:3500]}
         except Exception as e:
             return {"error": str(e)}
 
     if name == "get_recent_discord_context":
-        ch_name = str(args.get("channel_name", "zero-chat")).strip().lower()
-        ch_map = {
-            "zero-chat": str(TARGET_CHANNEL_ID),
-            "gotchi-chat": str(GOTCHI_CHAT_CHANNEL_ID),
-            "baseball": "1548196929308065893",
+        raw_ch = str(args.get("channel_name", "zero-chat") or "zero-chat")
+        is_rollup, clean_ch = normalize_discord_channel_input(raw_ch)
+
+        ch_file = Path("/workspace/data/channel_history.json")
+        if not ch_file.exists():
+            return {"result": "No channel history available."}
+
+        try:
+            history_data = json.loads(ch_file.read_text())
+        except Exception as e:
+            return {"error": f"Failed to load channel history: {e}"}
+
+        if is_rollup:
+            sections = []
+            for ch_label, cid in CRAB_CAVERN_ROLLUP_CHANNELS:
+                msgs = history_data.get(str(cid), [])[-4:]
+                if msgs:
+                    formatted_msgs = "\n".join(
+                        f"[{m.get('timestamp_pt') or m.get('timestamp') or 'recent'}] {m.get('author', 'Unknown')}: {str(m.get('content', ''))[:300]}"
+                        for m in msgs
+                    )
+                    sections.append(f"#{ch_label}:\n{formatted_msgs}")
+            if sections:
+                return {"result": "\n\n".join(sections)}
+            return {"result": "No recent messages across Crab Cavern channels."}
+
+        # Single channel resolution
+        fallback_zero_chat = str(TARGET_CHANNEL_ID) if TARGET_CHANNEL_ID else "1542081375287640084"
+        fallback_gotchi_chat = str(GOTCHI_CHAT_CHANNEL_ID) if GOTCHI_CHAT_CHANNEL_ID else "1562246590943461429"
+
+        ch_map: Dict[str, str] = {
+            # Crab Cavern channels
+            "lounge": "1534452820995080192",
+            "gotchi": "1561509863018856468",
+            "gotchi-chat": fallback_gotchi_chat,
+            "gotchichat": fallback_gotchi_chat,
+            "the-banana-stand": "1534436119888793750",
+            "banana-stand": "1534436119888793750",
+            "thebananastand": "1534436119888793750",
+            "bananastand": "1534436119888793750",
+            "side-project": "1551465050072416286",
+            "sideproject": "1551465050072416286",
+            "mirrormere": "1552732003076669460",
+            "debug-huddle": "1549555629222404096",
+            "debughuddle": "1549555629222404096",
+            "agora": "1558202642663211169",
+            "r-residentagents": "1562544598423965856",
+            "residentagents": "1562544598423965856",
+            "resident-agents": "1562544598423965856",
+            "rresidentagents": "1562544598423965856",
+            # Home channels
+            "zero-chat": fallback_zero_chat,
+            "zerochat": fallback_zero_chat,
             "zero-ops": "1544953279664889888",
+            "zeroops": "1544953279664889888",
             "homelab": "1544955535722545253",
+            "home-assistant": "1544953275877556334",
+            "homeassistant": "1544953275877556334",
             "finances": "1544955532765560924",
             "shopping": "1544955538033348618",
             "projects": "1548196930788524094",
+            "3d-print": "1555973316752449576",
+            "3dprint": "1555973316752449576",
+            "steam-deck": fallback_zero_chat,
+            "steamdeck": fallback_zero_chat,
+            "baseball": "1548196929308065893",
+            # Aliases
+            "general": "1534452820995080192",
         }
-        cid = ch_map.get(ch_name, str(TARGET_CHANNEL_ID))
-        try:
-            ch_file = Path("/workspace/data/channel_history.json")
-            if ch_file.exists():
-                msgs = json.loads(ch_file.read_text()).get(cid, [])[-12:]
-                formatted = "\n".join(
-                    f"[{m.get('timestamp_pt') or m.get('timestamp')}] {m.get('author')}: {str(m.get('content'))[:300]}"
-                    for m in msgs
-                )
-                return {"result": formatted or "No recent messages."}
-        except Exception as e:
-            return {"error": str(e)}
+
+        if clean_ch.isdigit():
+            cid = clean_ch
+        else:
+            hyphenated_ch = clean_ch.replace(" ", "-").replace("_", "-")
+            compact_ch = clean_ch.replace(" ", "").replace("-", "").replace("_", "")
+            cid = (
+                ch_map.get(clean_ch)
+                or ch_map.get(hyphenated_ch)
+                or ch_map.get(compact_ch)
+            )
+            if not cid:
+                for k, v in ch_map.items():
+                    if k.replace("-", "") == compact_ch:
+                        cid = v
+                        break
+            if not cid:
+                cid = fallback_zero_chat
+
+        msgs = history_data.get(str(cid), [])[-12:]
+        formatted = "\n".join(
+            f"[{m.get('timestamp_pt') or m.get('timestamp') or 'recent'}] {m.get('author', 'Unknown')}: {str(m.get('content', ''))[:300]}"
+            for m in msgs
+        )
+        return {"result": formatted or "No recent messages."}
 
     if name == "post_note_to_zero_chat":
         msg_text = str(args.get("message", "") or "").strip()
@@ -1127,19 +1677,6 @@ async def execute_gotchi_tool_call(
             file_path,
             screenshot_url,
             True,
-        )
-        return res
-
-    if name == "delegate_coding_task_to_zero_chat":
-        task_summary = str(args.get("task_summary", "") or "").strip()
-        spoken_preamble = str(args.get("spoken_preamble", "") or "").strip()
-        context_notes = str(args.get("context_notes", "") or "").strip()
-        res = await asyncio.to_thread(
-            delegate_coding_task_to_zero_chat,
-            task_summary,
-            spoken_preamble,
-            context_notes,
-            "zero-chat",
         )
         return res
 
@@ -1163,9 +1700,9 @@ def record_gotchi_turn_to_channels(
     """
     Persists a completed Gotchi turn into:
     1. `/workspace/data/voice_transcripts.json` (shared with `#zero-voice`).
-    2. `/workspace/data/channel_history.json` for BOTH `#zero-chat` (`1542081375287640084`)
-       and `#gotchi-chat` (`1562246590943461429`) so Zero has instant continuity everywhere.
-    3. Standalone `#gotchi-chat` Discord channel (`1562246590943461429`) via `deliver_image.py`
+    2. `/workspace/data/channel_history.json` for BOTH `#zero-chat`
+       and `#gotchi-chat` so Zero has instant continuity everywhere.
+    3. Standalone `#gotchi-chat` Discord channel via `deliver_image.py`
        (when camera snapshots are present) or `outbox.queue_outbox_message`.
     """
     source_tag = f"📟 {node_id}"
@@ -1273,7 +1810,7 @@ def _load_ha_credentials_from_env_or_secrets() -> Tuple[bool, str, str, float]:
     except ValueError:
         timeout_s = 2.5
 
-    if enabled and (not base_url or not token):
+    if not base_url or not token:
         sec_path = Path("/secrets/env.json")
         if sec_path.is_file():
             try:
@@ -1336,11 +1873,13 @@ class GotchiZeroBrainAdapter:
         stt_adapter: Optional[Any] = None,
         llm_caller: Optional[Callable[[Dict[str, Any]], Any]] = None,
         dispatch_discord: bool = True,
-        thinking_budget: int = 0,
+        thinking_budget: int = DEFAULT_THINKING_BUDGET,
         ha_conversation_enabled: Optional[bool] = None,
         ha_base_url: Optional[str] = None,
         ha_access_token: Optional[str] = None,
         ha_http_poster: Optional[Callable[[str, Dict[str, str], Dict[str, Any], float], Dict[str, Any]]] = None,
+        warm_worker: Optional[Any] = None,
+        brain_mode: Optional[str] = None,
     ):
         self.model = model
         self.api_key = (
@@ -1356,7 +1895,13 @@ class GotchiZeroBrainAdapter:
         self.ha_base_url = ha_base_url
         self.ha_access_token = ha_access_token
         self.ha_http_poster = ha_http_poster
+        self.warm_worker = warm_worker
+        self.brain_mode = (brain_mode or "").strip().lower()
         self._genai_client: Optional[Any] = None
+
+    def _is_subscription_mode(self) -> bool:
+        mode = self.brain_mode or os.environ.get("GOTCHI_BRAIN_MODE", "").strip().lower()
+        return mode == "subscription" or self.warm_worker is not None
 
     def _get_genai_client(self) -> Any:
         from google import genai
@@ -1395,12 +1940,13 @@ class GotchiZeroBrainAdapter:
         emitted_sentences: List[str],
         on_sentence: Optional[Callable[[str], Any]],
     ) -> None:
+        had_defer = "[[defer]]" in (sentence or "").lower()
         cleaned = clean_spoken_text_for_tts(sentence)
         if not cleaned or cleaned in emitted_sentences:
             return
         emitted_sentences.append(cleaned)
         if on_sentence is not None:
-            res = on_sentence(cleaned)
+            res = on_sentence(f"[[defer]] {cleaned}" if had_defer else cleaned)
             if asyncio.iscoroutine(res):
                 await res
 
@@ -1420,8 +1966,10 @@ class GotchiZeroBrainAdapter:
             return "Zero is online, but GEMINI_API_KEY is not configured in the environment.", False, []
 
         has_vision = bool(image_bytes or burst_images)
+        prompt_is_placeholder = is_placeholder_prompt(prompt)
+        sys_prompt_text = "" if (audio_bytes and prompt_is_placeholder) else prompt
         sys_prompt = await asyncio.to_thread(
-            build_gotchi_zero_system_prompt, prompt, has_vision
+            build_gotchi_zero_system_prompt, sys_prompt_text, has_vision
         )
 
         user_parts: List[types.Part] = []
@@ -1431,29 +1979,11 @@ class GotchiZeroBrainAdapter:
             user_parts.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
         for b_img in burst_images[:5]:
             user_parts.append(types.Part.from_bytes(data=b_img, mime_type="image/jpeg"))
-        if audio_bytes and not prompt:
+        if audio_bytes and (not prompt or prompt_is_placeholder):
+            prefix_txt = prompt if (prompt and prompt.startswith("[VOICE TURN")) else format_voice_turn_prefix()
             user_parts.append(
                 types.Part.from_text(
-                    text=(
-                        "Listen carefully to Ryan's spoken question or request in the attached audio clip "
-                        "and answer his spoken request directly. If a camera snapshot is attached, use it to "
-                        "answer his spoken question rather than giving a generic photo description."
-                    )
-                )
-            )
-        elif has_vision and prompt and prompt not in (
-            "Analyze this camera snapshot from Gotchi.",
-            "Analyze this 5-frame camera burst from Gotchi.",
-            "Describe what you see in this snapshot briefly.",
-            "Describe what you see.",
-        ):
-            user_parts.append(
-                types.Part.from_text(
-                    text=(
-                        f"Ryan's spoken prompt: \"{prompt}\"\n"
-                        "Directly answer or fulfill Ryan's spoken prompt above using the attached camera snapshot(s). "
-                        "Do NOT give a generic description of the photo unless he asked for one."
-                    )
+                    text=f"{prefix_txt}\nListen to Ryan's spoken voice prompt in the attached audio clip and answer directly."
                 )
             )
         else:
@@ -1469,12 +1999,13 @@ class GotchiZeroBrainAdapter:
         accumulated_raw_parts: List[str] = []
 
         for _step in range(4):
+            live_model = self._resolve_live_gemini_model()
             config = types.GenerateContentConfig(
                 system_instruction=sys_prompt,
                 tools=tools_list,
                 temperature=0.4,
                 thinking_config=build_thinking_config(
-                    self.model,
+                    live_model,
                     prompt,
                     default_budget=self.thinking_budget,
                     step=_step,
@@ -1492,7 +2023,7 @@ class GotchiZeroBrainAdapter:
             stream_fn = getattr(client.aio.models, "generate_content_stream", None)
             if callable(stream_fn):
                 stream_obj = stream_fn(
-                    model=self.model,
+                    model=live_model,
                     contents=contents,
                     config=config,
                 )
@@ -1515,7 +2046,7 @@ class GotchiZeroBrainAdapter:
                         step_model_parts.extend(list(c_parts))
             else:
                 resp = await client.aio.models.generate_content(
-                    model=self.model,
+                    model=live_model,
                     contents=contents,
                     config=config,
                 )
@@ -1562,25 +2093,15 @@ class GotchiZeroBrainAdapter:
                         await self._emit_streamed_sentence(
                             preamble, emitted_sentences, on_sentence
                         )
-                elif fn_name == "delegate_coding_task_to_zero_chat":
-                    preamble = (
-                        str(fn_args.get("spoken_preamble", "") or "").strip()
-                        or "Passing that to Zero-Chat to spec and build."
-                    )
-                    if preamble not in accumulated_raw_parts:
-                        accumulated_raw_parts.append(preamble)
-                    await self._emit_streamed_sentence(
-                        preamble, emitted_sentences, on_sentence
-                    )
                 elif not step_text and not emitted_sentences:
-                    # Pre-tool spoken preamble fallback when the model invokes a tool without leading text
-                    default_preamble = "Let me check that."
+                    # Pre-tool contextual action narration when the model invokes a tool without leading text
+                    default_preamble = build_contextual_tool_filler(fn_name, fn_args, prompt)
                     await self._emit_streamed_sentence(
                         default_preamble, emitted_sentences, on_sentence
                     )
 
                 res_dict = await execute_gotchi_tool_call(fn_name, fn_args)
-                if fn_name in ("post_note_to_zero_chat", "delegate_coding_task_to_zero_chat") or (
+                if fn_name == "post_note_to_zero_chat" or (
                     isinstance(res_dict, dict) and res_dict.get("confirmation_required") is True
                 ):
                     explicitly_posted_to_zero_chat = True
@@ -1615,9 +2136,10 @@ class GotchiZeroBrainAdapter:
         client = self._get_genai_client()
         if client is None or not wav_bytes:
             return ""
+        live_model = self._resolve_live_gemini_model()
         try:
             resp = await client.aio.models.generate_content(
-                model=self.model,
+                model=live_model,
                 contents=[
                     types.Content(
                         role="user",
@@ -1635,7 +2157,7 @@ class GotchiZeroBrainAdapter:
                 ],
                 config=types.GenerateContentConfig(
                     temperature=0.0,
-                    thinking_config=build_thinking_config(self.model, "", step=0),
+                    thinking_config=build_thinking_config(live_model, "", default_budget=0, step=0),
                 ),
             )
             return (getattr(resp, "text", None) or "").strip()
@@ -1651,6 +2173,7 @@ class GotchiZeroBrainAdapter:
         """
         t0 = time.monotonic()
         node_id = str(parsed_turn.get("node_id") or "gotchi-ryan-01")
+        speaker = resolve_speaker_for_node(node_id, parsed_turn.get("speaker"))
         session_id = str(parsed_turn.get("session_id") or f"sess-{int(time.time()*1000)}")
         on_sentence: Optional[Callable[[str], Any]] = parsed_turn.get("_on_sentence")
 
@@ -1664,9 +2187,10 @@ class GotchiZeroBrainAdapter:
                 base64.b64decode(b) for b in parsed_turn["burst_images_b64"] if b
             ]
 
-        has_explicit_prompt = bool(parsed_turn.get("prompt"))
+        raw_prompt = str(parsed_turn.get("prompt") or "").strip()
         has_images = bool(image_bytes or burst_images)
         audio_bytes: Optional[bytes] = parsed_turn.get("audio_bytes")
+        has_explicit_prompt = bool(raw_prompt) and not (audio_bytes and is_placeholder_prompt(raw_prompt))
 
         # Archive latest uploaded WAV clip for forensic inspection (cap at 10 recent turn files)
         if audio_bytes:
@@ -1693,23 +2217,19 @@ class GotchiZeroBrainAdapter:
 
         bg_stt_task: Optional[asyncio.Task[str]] = None
         direct_audio_to_brain = False
+        _stt_cfg = getattr(self.stt_adapter, "llm_config", None)
+        _has_real_stt = self.stt_adapter is not None and not (
+            getattr(_stt_cfg, "stt_engine", "mock") == "mock"
+            and getattr(self.stt_adapter, "local_transcriber", None) is None
+        )
 
         if has_explicit_prompt:
-            transcript = str(parsed_turn["prompt"]).strip()
-        elif audio_bytes and not has_images and self.llm_caller is None:
+            transcript = raw_prompt
+        elif audio_bytes and self.llm_caller is None and not self._is_subscription_mode():
             # Single-pass multimodal audio: stream WAV directly into the Gemini brain
             # while transcribing concurrently in the background for #gotchi-chat logs.
             direct_audio_to_brain = True
-            stt_engine = str(getattr(getattr(self.stt_adapter, "llm_config", None), "stt_engine", "") or "")
-            use_stt_adapter = (
-                self.stt_adapter is not None
-                and (
-                    stt_engine in ("whisper_http", "faster_whisper")
-                    or getattr(self.stt_adapter, "local_transcriber", None) is not None
-                    or getattr(self.stt_adapter, "llm_config", None) is None
-                )
-            )
-            if use_stt_adapter:
+            if _has_real_stt:
                 bg_stt_task = asyncio.create_task(
                     asyncio.to_thread(self.stt_adapter.transcribe, audio_bytes)
                 )
@@ -1718,27 +2238,33 @@ class GotchiZeroBrainAdapter:
                     self._transcribe_audio_with_gemini(audio_bytes)
                 )
             transcript = ""
-        elif audio_bytes and (self.stt_adapter is not None or self.llm_caller is None):
-            stt_engine = str(getattr(getattr(self.stt_adapter, "llm_config", None), "stt_engine", "") or "")
-            use_stt_adapter = (
-                self.stt_adapter is not None
-                and (
-                    stt_engine in ("whisper_http", "faster_whisper")
-                    or getattr(self.stt_adapter, "local_transcriber", None) is not None
-                    or getattr(self.stt_adapter, "llm_config", None) is None
-                )
+        elif audio_bytes and _has_real_stt:
+            loop = asyncio.get_running_loop()
+            raw_tx = await loop.run_in_executor(
+                None, self.stt_adapter.transcribe, audio_bytes
             )
-            if use_stt_adapter:
-                loop = asyncio.get_running_loop()
-                transcript = await loop.run_in_executor(
-                    None, self.stt_adapter.transcribe, audio_bytes
+            raw_tx = (raw_tx or "").strip()
+            transcript = raw_tx or (
+                (
+                    "Analyze this 5-frame camera burst from Gotchi."
+                    if burst_images
+                    else "Analyze this camera snapshot from Gotchi."
                 )
-            else:
-                transcript = ""
-            if (not transcript or transcript == "What is the status?") and self.llm_caller is None:
-                mm_transcript = await self._transcribe_audio_with_gemini(audio_bytes)
-                if mm_transcript:
-                    transcript = mm_transcript
+                if has_images
+                else "Voice prompt"
+            )
+        elif audio_bytes:
+            raw_tx = await self._transcribe_audio_with_gemini(audio_bytes)
+            raw_tx = (raw_tx or "").strip()
+            transcript = raw_tx or (
+                (
+                    "Analyze this 5-frame camera burst from Gotchi."
+                    if burst_images
+                    else "Analyze this camera snapshot from Gotchi."
+                )
+                if has_images
+                else "Voice prompt"
+            )
         elif burst_images:
             transcript = "Analyze this 5-frame camera burst from Gotchi."
         elif image_bytes:
@@ -1810,7 +2336,7 @@ class GotchiZeroBrainAdapter:
 
             brain_task = asyncio.create_task(
                 self._run_gemini_with_tools(
-                    prompt="",
+                    prompt=format_voice_turn_prefix(node_id=node_id, speaker=speaker),
                     image_bytes=image_bytes,
                     burst_images=burst_images,
                     on_sentence=_gated_on_sentence,
@@ -1827,24 +2353,33 @@ class GotchiZeroBrainAdapter:
             if bg_stt_task.done():
                 try:
                     mm_transcript = await bg_stt_task
-                    transcript = (mm_transcript or "").strip()
+                    raw_tx = (mm_transcript or "").strip()
                 except Exception:
-                    transcript = ""
+                    raw_tx = ""
                 bg_stt_task = None
+                transcript = raw_tx or (
+                    (
+                        "Analyze this 5-frame camera burst from Gotchi."
+                        if burst_images
+                        else "Analyze this camera snapshot from Gotchi."
+                    )
+                    if has_images
+                    else "Voice prompt"
+                )
                 stt_ms = int((time.monotonic() - t0) * 1000)
 
                 # 1. Transcript-level ghost check before allowing any audio output.
                 # Do not let an empty bg_stt_task transcript cancel brain_task unless the
                 # audio clip also fails a server-side voiced-energy check (< 400.0 ms).
                 is_ghost_tx, _reason_tx = is_stt_ghost(
-                    transcript_text=transcript,
-                    audio_bytes=audio_bytes if not transcript else None,
+                    transcript_text=raw_tx,
+                    audio_bytes=audio_bytes if not raw_tx else None,
                     min_voiced_ms=min_voiced_ms,
                     has_explicit_prompt=has_explicit_prompt,
                     has_images=has_images,
                     use_silero_vad=use_silero_vad,
                 )
-                if is_ghost_tx and not transcript and audio_bytes:
+                if is_ghost_tx and not raw_tx and audio_bytes:
                     voiced_ms_check = measure_voiced_audio_ms(audio_bytes, rms_threshold=150.0)
                     if voiced_ms_check >= max(400.0, float(min_voiced_ms or 400.0)):
                         is_ghost_tx = False
@@ -1863,10 +2398,10 @@ class GotchiZeroBrainAdapter:
                     }
 
                 # 2. Home Assistant fast-path check: if matched, cancel in-flight brain_task and reply immediately
-                if transcript:
+                if raw_tx:
                     ha_matched, ha_speech, ha_meta = await asyncio.to_thread(
                         try_ha_conversation_fastpath,
-                        transcript,
+                        raw_tx,
                         has_images=has_images,
                         enabled=self.ha_conversation_enabled,
                         ha_base_url=self.ha_base_url,
@@ -1892,7 +2427,15 @@ class GotchiZeroBrainAdapter:
                     buffered_live_sentences.clear()
                     raw_reply, explicitly_posted, streamed_sentences = await brain_task
                     if not transcript:
-                        transcript = "Voice prompt"
+                        transcript = raw_tx or (
+                            (
+                                "Analyze this 5-frame camera burst from Gotchi."
+                                if burst_images
+                                else "Analyze this camera snapshot from Gotchi."
+                            )
+                            if has_images
+                            else "Voice prompt"
+                        )
             else:
                 # Gemini's first sentence (or completion) arrived first:
                 # release Gemini's output immediately and skip Home Assistant for that turn.
@@ -1920,11 +2463,15 @@ class GotchiZeroBrainAdapter:
                     ha_speech, streamed_sentences, on_sentence
                 )
             elif self.llm_caller is not None:
+                prefix = format_voice_turn_prefix(node_id=node_id, speaker=speaker)
+                framed_prompt = f"{prefix}\n{transcript}" if transcript else prefix
                 raw_res = self.llm_caller(
                     {
                         "node_id": node_id,
+                        "speaker": speaker,
                         "session_id": session_id,
-                        "prompt": transcript,
+                        "prompt": framed_prompt,
+                        "raw_prompt": transcript,
                         "image_bytes": image_bytes,
                         "burst_images": burst_images,
                         "_on_sentence": on_sentence,
@@ -1937,9 +2484,32 @@ class GotchiZeroBrainAdapter:
                     explicitly_posted = bool(raw_res.get("posted_to_zero_chat", False))
                 else:
                     raw_reply = str(raw_res)
+            elif self._is_subscription_mode():
+                from backend.voice_gateway import WarmSubscriptionVoiceWorker
+
+                if self.warm_worker is None:
+                    self.warm_worker = WarmSubscriptionVoiceWorker()
+                prefix = format_voice_turn_prefix(node_id=node_id, speaker=speaker)
+                base_prompt = "" if (audio_bytes and is_placeholder_prompt(transcript)) else transcript
+                call_prompt = f"{prefix}\n{base_prompt}" if base_prompt else prefix
+
+                async def _forward_sentence(s_txt: str) -> None:
+                    await self._emit_streamed_sentence(s_txt, streamed_sentences, on_sentence)
+
+                worker_res = await self.warm_worker.run_turn(
+                    call_prompt,
+                    node_id=node_id,
+                    session_id=session_id,
+                    on_sentence=_forward_sentence,
+                    on_tool_start=parsed_turn.get("_on_tool_start"),
+                )
+                raw_reply = str(worker_res.get("reply") or "")
             else:
+                prefix = format_voice_turn_prefix(node_id=node_id, speaker=speaker)
+                base_prompt = "" if (audio_bytes and is_placeholder_prompt(transcript)) else transcript
+                call_prompt = f"{prefix}\n{base_prompt}" if base_prompt else prefix
                 raw_reply, explicitly_posted, streamed_sentences = await self._run_gemini_with_tools(
-                    prompt=transcript,
+                    prompt=call_prompt,
                     image_bytes=image_bytes,
                     burst_images=burst_images,
                     on_sentence=on_sentence,
@@ -1949,19 +2519,43 @@ class GotchiZeroBrainAdapter:
         if bg_stt_task is not None:
             try:
                 mm_transcript = await bg_stt_task
-                transcript = (mm_transcript or "").strip() or "Voice prompt"
+                raw_tx = (mm_transcript or "").strip()
             except Exception:
-                transcript = "Voice prompt"
+                raw_tx = ""
+            transcript = raw_tx or (
+                (
+                    "Analyze this 5-frame camera burst from Gotchi."
+                    if burst_images
+                    else "Analyze this camera snapshot from Gotchi."
+                )
+                if has_images
+                else "Voice prompt"
+            )
             stt_ms = int((time.monotonic() - t0) * 1000)
 
-        spoken_reply = clean_spoken_text_for_tts(raw_reply) or "Got it."
-        spoken_reply, sent_to_zero_chat = await asyncio.to_thread(
-            extract_and_forward_artifacts_to_zero_chat,
-            raw_reply,
-            spoken_reply,
-            explicitly_posted,
-            self.dispatch_discord,
-        )
+        is_long = is_long_answer(raw_reply)
+        is_async = bool(parsed_turn.get("is_async_handoff") or parsed_turn.get("condense_long"))
+        if is_long and is_async:
+            topic = extract_topic(transcript)
+            spoken_reply = condense_long_answer(raw_reply, topic=topic)
+            if self.dispatch_discord:
+                await asyncio.to_thread(
+                    send_gotchi_artifact_to_zero_chat,
+                    message=f"📋 **[Async Answer Breakdown]:**\n> **Prompt:** {transcript}\n\n{raw_reply}",
+                    mirror_gotchi_chat=False,
+                )
+                sent_to_zero_chat = True
+            else:
+                sent_to_zero_chat = False
+        else:
+            spoken_reply = clean_spoken_text_for_tts(raw_reply) or "Got it."
+            spoken_reply, sent_to_zero_chat = await asyncio.to_thread(
+                extract_and_forward_artifacts_to_zero_chat,
+                raw_reply,
+                spoken_reply,
+                explicitly_posted,
+                self.dispatch_discord,
+            )
 
         total_ms = int((time.monotonic() - t0) * 1000)
         sentences = split_into_sentences(spoken_reply)
@@ -2057,6 +2651,35 @@ def create_zero_gotchi_app(
         turn_log_router=_on_gateway_turn_logged,
     )
     brain.stt_adapter = voice_srv.stt_adapter
+
+    if (
+        brain.llm_caller is None
+        and "PYTEST_CURRENT_TEST" not in os.environ
+        and os.environ.get("GOTCHI_ALLOW_MOCK_FALLBACK") != "1"
+    ):
+        if cfg.tts_engine == "mock" or (
+            cfg.tts_engine == "kokoro"
+            and not cfg.tts_url.strip()
+            and getattr(voice_srv.kokoro_tts, "local_synthesizer", None) is None
+        ):
+            msg = (
+                f"Refusing to start Gotchi gateway with unconfigured TTS stub "
+                f"(tts_engine={cfg.tts_engine!r}, tts_url={cfg.tts_url!r})"
+            )
+            log.error(msg)
+            raise RuntimeError(msg)
+        if cfg.tts_engine == "gemini" and brain._get_genai_client() is None and not cfg.tts_url.strip():
+            msg = "Refusing to start Gotchi gateway: tts_engine='gemini' but GEMINI_API_KEY is missing"
+            log.error(msg)
+            raise RuntimeError(msg)
+        if (
+            cfg.stt_engine == "mock"
+            and getattr(voice_srv.stt_adapter, "local_transcriber", None) is None
+            and brain._get_genai_client() is None
+        ):
+            msg = "Refusing to start Gotchi gateway: stt_engine='mock' and GEMINI_API_KEY is missing for multimodal STT"
+            log.error(msg)
+            raise RuntimeError(msg)
     live_srv = LiveGatewayService(
         verifier=voice_srv.verifier,
         auth_required=voice_srv.auth_required,
@@ -2110,3 +2733,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# Alias for target symbol parity across Zero and Gotchi codebases
+GotchiZeroAdapter = GotchiZeroBrainAdapter

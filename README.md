@@ -105,3 +105,13 @@ python3 /workspace/tools/bridge.py
 * **Pre-Commit Security Validator:** Enforces cryptographic blocking of private IPs, custom ports, API keys, and personal PII before any commit can be staged (`tools/validate_commit_safety.py`).
 * **Default-Deny Repository Defense:** Strict `.gitignore` blocks memory stores, OAuth credentials, and local databases from repository history.
 * **Role-Based Command Authorization:** Critical administrative actions (`!reload`, interactive PTY authentication) are cryptographically restricted to the bot owner.
+
+---
+
+## ⌚ Gotchi Wear OS & Hardware Companion
+
+- **Pixel Watch Companion App (`android-gotchi-watch/` v1.2.0):** Standalone Wear OS companion application (`ventures.brock.gotchi.watch`) providing full hardware parity with the GOTCHI voice client ecosystem on Google Pixel Watch (Wear OS 3–5).
+- **Thinking A1 Animation:** Illustrated humanoid robot hand stroking Zero's chin across HD and 1-bit monochrome frames.
+- **Transcribing 1 Animation:** Focused visor eyes looking down-left with an active golden scribbling pencil generating a progressive waveform line.
+- **Centered Viewport & Frame Stepping:** Perfect circular OLED alignment (`hdCx = cx`, `hdCy = cy - innerRadius * 0.04f`) eliminating thought cloud collisions with header text, stepped smoothly at `(animFrame / 16) % 3`.
+

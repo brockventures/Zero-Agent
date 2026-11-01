@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys
+import unicodedata
 from pathlib import Path
 
 # Ensure gotchi backend packages resolve if running from repo root
@@ -77,6 +78,9 @@ from backend.llm_config import (
 
 logger = logging.getLogger("gotchi_gateway")
 
+DEFAULT_WATCH_APK_VERSION_CODE = int(os.environ.get("GOTCHI_WATCH_APK_VERSION", "4"))
+DEFAULT_FORWARDER_APK_VERSION_CODE = 3
+
 NODE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 WHISPER_GHOST_PHRASES = frozenset({
@@ -92,6 +96,26 @@ WHISPER_GHOST_PHRASES = frozenset({
     "bye",
     "mbc",
 })
+
+PLACEHOLDER_PROMPTS = frozenset({
+    "voice prompt",
+    "what is the status?",
+    "what is the status",
+    "describe what you see in this snapshot briefly.",
+    "describe what you see in this snapshot briefly",
+})
+
+
+def is_placeholder_prompt(prompt: Optional[str]) -> bool:
+    """Returns True if prompt is one of the generic client placeholder strings."""
+    if not prompt:
+        return False
+    norm = str(prompt).strip().lower()
+    return norm in PLACEHOLDER_PROMPTS or norm.rstrip(".?") in {
+        "voice prompt",
+        "what is the status",
+        "describe what you see in this snapshot briefly",
+    }
 
 
 def validate_node_id(node_id: str) -> str:
@@ -416,6 +440,30 @@ def cap_reply_words(text: str, max_words: int = 0) -> str:
     return capped
 
 
+_TRAILING_QUOTE_CHARS = "\"'\u201c\u201d\u2018\u2019\u00bb\u00ab`"
+_TRAILING_EMOJI_JOINERS = {"\u200d", "\ufe0f", "\ufe0e", "\u20e3"}
+
+
+def reply_expects_reply(text: str) -> bool:
+    """
+    True when the spoken reply ends with a question mark: the text is trimmed of
+    whitespace, trailing quotes and trailing emoji, then checked for a final `?`.
+    The firmware reopens the mic after playback when this is true (no PTT press).
+    """
+    s = (text or "").rstrip()
+    while s:
+        last = s[-1]
+        if last.isspace() or last in _TRAILING_QUOTE_CHARS:
+            s = s[:-1]
+        elif last in _TRAILING_EMOJI_JOINERS or 0x1F3FB <= ord(last) <= 0x1F3FF:
+            s = s[:-1]
+        elif unicodedata.category(last) == "So" or unicodedata.category(last) == "Sk":
+            s = s[:-1]
+        else:
+            break
+    return s.endswith("?")
+
+
 def split_into_sentences(text: str) -> List[str]:
     """
     Splits a reply into complete sentences so TTS starts streaming on sentence 1
@@ -627,6 +675,13 @@ class WhisperSTTAdapter:
             segments, _ = self._fw_model.transcribe(io.BytesIO(wav_bytes), beam_size=1)
             return " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
 
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            logger.error(
+                "WhisperSTTAdapter hit mock fallback ('What is the status?') outside pytest "
+                "(stt_engine=%r, stt_url=%r)",
+                engine,
+                self.llm_config.stt_url,
+            )
         return "What is the status?"
 
 
@@ -719,6 +774,10 @@ class GeminiTTSAdapter:
             except Exception:
                 pass
         if not api_key and not self.llm_config.tts_url.strip():
+            if "PYTEST_CURRENT_TEST" not in os.environ:
+                logger.error(
+                    "GeminiTTSAdapter falling back to silent PCM stub: missing GEMINI_API_KEY and tts_url"
+                )
             return generate_synthetic_pcm(duration_s=0.25, sample_rate=sample_rate)
 
         url = self.build_endpoint()
@@ -747,6 +806,10 @@ class GeminiTTSAdapter:
                 res = self.http_poster(
                     url, headers, self.build_payload(f"Say aloud verbatim: {sentence_text}")
                 )
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            logger.error(
+                "GeminiTTSAdapter returned no audio parts after retry; falling back to silent PCM stub"
+            )
         return generate_synthetic_pcm(duration_s=0.25, sample_rate=sample_rate)
 
 
@@ -835,6 +898,13 @@ class KokoroTTSAdapter:
             if raw:
                 return extract_pcm_from_wav_or_raw(raw)
 
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            logger.error(
+                "KokoroTTSAdapter falling back to silent PCM stub outside pytest "
+                "(tts_url=%r, voice=%r)",
+                self.llm_config.tts_url,
+                voice,
+            )
         return generate_synthetic_pcm(duration_s=0.25, sample_rate=sample_rate)
 
 
@@ -966,6 +1036,460 @@ class HomeAssistantConversationFastPath:
         }
 
 
+class WarmSubscriptionVoiceWorker:
+    """
+    Persistent warm `agy` / `claude` `stream-json` subprocess worker in a dedicated
+    `gotchi-voice` session.
+    Streams partial text deltas into `SentenceStreamSplitter` (`on_sentence` callback),
+    invokes `on_tool_start(tool_name)` as soon as a tool call begins, continuously drains
+    stderr so the subprocess pipe never blocks, and enforces per-turn timeouts with automatic
+    process kill/restart on hang.
+    """
+
+    DEFAULT_SESSION_ID = "gotchi-voice"
+    DEFAULT_TURN_TIMEOUT_S = 45.0
+    DEFAULT_DEFERRED_TIMEOUT_S = 600.0
+    DEFAULT_COMMAND = (
+        "agy --input-format=stream-json --output-format=stream-json --print="
+    )
+
+    def __init__(
+        self,
+        command: Optional[str] = None,
+        session_id: str = DEFAULT_SESSION_ID,
+        process_factory: Optional[Callable[..., Any]] = None,
+        turn_timeout_s: float = DEFAULT_TURN_TIMEOUT_S,
+        deferred_timeout_s: float = DEFAULT_DEFERRED_TIMEOUT_S,
+    ) -> None:
+        from collections import deque
+
+        self.session_id = session_id or self.DEFAULT_SESSION_ID
+        self.command = (command or os.environ.get("GOTCHI_WARM_SUBSCRIPTION_CMD") or self.DEFAULT_COMMAND).strip()
+        self.process_factory = process_factory
+        self.turn_timeout_s = float(turn_timeout_s) if turn_timeout_s and turn_timeout_s > 0 else self.DEFAULT_TURN_TIMEOUT_S
+        self.deferred_timeout_s = (
+            float(deferred_timeout_s)
+            if deferred_timeout_s and deferred_timeout_s > 0
+            else self.DEFAULT_DEFERRED_TIMEOUT_S
+        )
+        self._proc: Optional[Any] = None
+        self._stderr_task: Optional[asyncio.Task[None]] = None
+        self.recent_stderr: Any = deque(maxlen=50)
+        self._lock = asyncio.Lock()
+
+    async def _drain_stderr(self, proc: Any) -> None:
+        """Continuously drain stderr so pipe buffer never fills and blocks the CLI worker."""
+        stderr = getattr(proc, "stderr", None)
+        if stderr is None:
+            return
+        try:
+            if hasattr(stderr, "readline"):
+                while True:
+                    line_bytes = await stderr.readline()
+                    if not line_bytes:
+                        break
+                    line_s = (
+                        line_bytes.decode("utf-8", errors="replace").strip()
+                        if isinstance(line_bytes, (bytes, bytearray))
+                        else str(line_bytes).strip()
+                    )
+                    if line_s:
+                        self.recent_stderr.append(line_s)
+            elif hasattr(stderr, "__aiter__"):
+                async for line_bytes in stderr:
+                    line_s = (
+                        line_bytes.decode("utf-8", errors="replace").strip()
+                        if isinstance(line_bytes, (bytes, bytearray))
+                        else str(line_bytes).strip()
+                    )
+                    if line_s:
+                        self.recent_stderr.append(line_s)
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def ensure_started(self) -> Any:
+        if self._proc is not None and getattr(self._proc, "returncode", None) is None:
+            return self._proc
+        await self._kill_proc()
+        validate_subscription_command(self.command)
+        argv = shlex.split(self.command)
+        if self.process_factory is not None:
+            proc = self.process_factory(argv)
+            if inspect.isawaitable(proc):
+                proc = await proc
+            self._proc = proc
+        else:
+            self._proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        if getattr(self._proc, "stderr", None) is not None:
+            self._stderr_task = asyncio.create_task(self._drain_stderr(self._proc))
+        return self._proc
+
+    async def _kill_proc_instance(self, proc: Optional[Any], stderr_task: Optional[asyncio.Task[None]] = None) -> None:
+        if stderr_task is not None and not stderr_task.done():
+            stderr_task.cancel()
+        if proc is None:
+            return
+        try:
+            if getattr(proc, "returncode", None) is None:
+                if hasattr(proc, "kill"):
+                    proc.kill()
+                elif hasattr(proc, "terminate"):
+                    proc.terminate()
+                if hasattr(proc, "wait"):
+                    wait_res = proc.wait()
+                    if inspect.isawaitable(wait_res):
+                        try:
+                            await asyncio.wait_for(wait_res, timeout=1.0)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    async def _kill_proc(self) -> None:
+        stderr_task = self._stderr_task
+        self._stderr_task = None
+        proc = self._proc
+        self._proc = None
+        await self._kill_proc_instance(proc, stderr_task)
+
+    async def stop(self) -> None:
+        if self._stderr_task is not None and not self._stderr_task.done():
+            self._stderr_task.cancel()
+        self._stderr_task = None
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            if getattr(proc, "returncode", None) is None:
+                if hasattr(proc, "terminate"):
+                    proc.terminate()
+                elif hasattr(proc, "kill"):
+                    proc.kill()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _extract_stream_event(obj: Dict[str, Any]) -> Tuple[str, Optional[str], bool, Optional[str]]:
+        """
+        Returns (delta_text, tool_name, is_done, final_result_text) from a stream-json event dict.
+        Supports both `agy` stream-json events (`event: step_update` / `event: result`) and
+        Anthropic/Claude stream-json events (`type: content_block_delta` / `content_block_start`).
+        Strictly takes text only from `text_delta` / `agent_response` and ignores `input_json_delta` / `partial_json`.
+        """
+        ev_type = str(obj.get("type") or obj.get("event") or "")
+        if ev_type == "stream_event" and isinstance(obj.get("event"), dict):
+            obj = obj["event"]
+            ev_type = str(obj.get("type") or obj.get("event") or "")
+
+        delta_text = ""
+        tool_name: Optional[str] = None
+        is_done = False
+        final_text: Optional[str] = None
+
+        if ev_type == "step_update" or isinstance(obj.get("step_update"), dict):
+            step = obj.get("step_update") if isinstance(obj.get("step_update"), dict) else {}
+            stype = str(step.get("step_type") or "")
+            state = str(step.get("state") or "")
+            t_info = step.get("tool_info") if isinstance(step.get("tool_info"), dict) else {}
+            tname = str(step.get("tool_name") or t_info.get("name") or "").strip()
+            if (stype == "tool" or tname) and state in ("ACTIVE", "START", ""):
+                tool_name = tname or None
+            elif stype == "agent_response":
+                td = step.get("text_delta") if "text_delta" in step else step.get("text")
+                if isinstance(td, str):
+                    delta_text = td
+        elif ev_type in ("content_block_delta", "delta", "text_delta", "assistant_delta"):
+            delta_obj = obj.get("delta")
+            if isinstance(delta_obj, dict):
+                delta_type = str(delta_obj.get("type") or "")
+                if delta_type in ("text_delta", "text", ""):
+                    raw_txt = delta_obj.get("text")
+                    if isinstance(raw_txt, str):
+                        delta_text = raw_txt
+            elif isinstance(delta_obj, str):
+                delta_text = delta_obj
+            elif ev_type in ("text_delta", "assistant_delta") and isinstance(obj.get("text"), str):
+                delta_text = obj["text"]
+        elif ev_type in ("content_block_start", "tool_use", "tool_start", "tool_call"):
+            cb = obj.get("content_block") if isinstance(obj.get("content_block"), dict) else obj
+            if str(cb.get("type") or ev_type) in ("tool_use", "tool_start", "tool_call"):
+                tool_name = str(cb.get("name") or cb.get("tool_name") or "").strip() or None
+        elif ev_type == "assistant" and isinstance(obj.get("message"), dict):
+            msg_content = obj["message"].get("content")
+            if isinstance(msg_content, list):
+                for block in msg_content:
+                    if isinstance(block, dict):
+                        b_type = str(block.get("type") or "")
+                        if b_type in ("tool_use", "tool_call") and not tool_name:
+                            tool_name = str(block.get("name") or "").strip() or None
+                        elif b_type == "text":
+                            final_text = (final_text or "") + str(block.get("text") or "")
+        elif ev_type in ("result", "done", "turn_complete", "turn_end"):
+            is_done = True
+            res_obj = obj.get("result")
+            if isinstance(res_obj, dict):
+                res_val = res_obj.get("response") or res_obj.get("result") or res_obj.get("text")
+            else:
+                res_val = res_obj or obj.get("response") or obj.get("reply") or obj.get("text")
+            if isinstance(res_val, str) and res_val.strip():
+                final_text = res_val.strip()
+
+        if not tool_name and isinstance(obj.get("tool_calls"), list) and obj["tool_calls"]:
+            first_tc = obj["tool_calls"][0]
+            if isinstance(first_tc, dict):
+                tool_name = str(first_tc.get("name") or "").strip() or None
+
+        return delta_text, tool_name, is_done, final_text
+
+    @staticmethod
+    def _is_block_boundary_event(obj: Dict[str, Any], prev_step_index: Optional[int]) -> Tuple[bool, Optional[int]]:
+        """Detect boundaries between distinct content blocks or agent steps so adjacent blocks get a space."""
+        ev_type = str(obj.get("type") or obj.get("event") or "")
+        if ev_type == "stream_event" and isinstance(obj.get("event"), dict):
+            obj = obj["event"]
+            ev_type = str(obj.get("type") or obj.get("event") or "")
+
+        if ev_type in ("content_block_start", "content_block_stop", "tool_use", "tool_start", "tool_call"):
+            return True, prev_step_index
+
+        if ev_type == "step_update" or isinstance(obj.get("step_update"), dict):
+            step = obj.get("step_update") if isinstance(obj.get("step_update"), dict) else {}
+            stype = str(step.get("step_type") or "")
+            if stype == "tool" or step.get("tool_name"):
+                return True, prev_step_index
+            if stype == "agent_response" and step.get("step_index") is not None:
+                try:
+                    sidx = int(step["step_index"])
+                    if prev_step_index is not None and sidx != prev_step_index:
+                        return True, sidx
+                    return False, sidx
+                except (ValueError, TypeError):
+                    pass
+
+        return False, prev_step_index
+
+    async def run_turn(
+        self,
+        prompt: str,
+        *,
+        node_id: str = "gotchi-device",
+        session_id: Optional[str] = None,
+        on_sentence: Optional[Callable[[str], Any]] = None,
+        on_tool_start: Optional[Callable[[str], Any]] = None,
+        line_stream: Optional[Any] = None,
+        timeout_s: Optional[float] = None,
+        deferred_timeout_s: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        effective_timeout = (
+            float(timeout_s)
+            if timeout_s is not None and timeout_s > 0
+            else self.turn_timeout_s
+        )
+        effective_deferred_timeout = (
+            float(deferred_timeout_s)
+            if deferred_timeout_s is not None and deferred_timeout_s > 0
+            else self.deferred_timeout_s
+        )
+        await self._lock.acquire()
+        lock_held = True
+        active_proc: Optional[Any] = None
+        active_stderr_task: Optional[asyncio.Task[None]] = None
+        detached_for_defer = False
+        deadline = time.monotonic() + effective_timeout
+
+        try:
+            splitter = SentenceStreamSplitter()
+            emitted_sentences: List[str] = []
+            tool_calls: List[str] = []
+            accumulated_deltas: List[str] = []
+            final_result_text: Optional[str] = None
+            pending_block_space = False
+            prev_step_index: Optional[int] = None
+
+            def _promote_to_deferred() -> None:
+                nonlocal detached_for_defer, deadline, lock_held
+                if detached_for_defer:
+                    return
+                detached_for_defer = True
+                deadline = max(deadline, time.monotonic() + effective_deferred_timeout)
+                # Detach active process from the warm voice slot and release _lock so
+                # subsequent interactive voice turns spawn a fresh worker without waiting.
+                if active_proc is not None and self._proc is active_proc:
+                    self._proc = None
+                    self._stderr_task = None
+                if lock_held:
+                    lock_held = False
+                    self._lock.release()
+
+            async def _emit_sentence(s_txt: str) -> None:
+                cleaned = s_txt.strip()
+                if not cleaned:
+                    return
+                if has_defer_marker(cleaned):
+                    _promote_to_deferred()
+                emitted_sentences.append(cleaned)
+                if on_sentence is not None:
+                    res = on_sentence(cleaned)
+                    if inspect.isawaitable(res):
+                        await res
+
+            async def _emit_tool(t_name: str) -> None:
+                tool_calls.append(t_name)
+                if on_tool_start is not None:
+                    res = on_tool_start(t_name)
+                    if inspect.isawaitable(res):
+                        await res
+
+            async def _process_event_obj(obj: Dict[str, Any]) -> bool:
+                nonlocal final_result_text, pending_block_space, prev_step_index
+                is_boundary, prev_step_index = self._is_block_boundary_event(obj, prev_step_index)
+                if is_boundary and accumulated_deltas:
+                    pending_block_space = True
+
+                delta_text, tool_name, is_done, final_text = self._extract_stream_event(obj)
+                if tool_name:
+                    if accumulated_deltas:
+                        pending_block_space = True
+                    await _emit_tool(tool_name)
+                if delta_text:
+                    if has_defer_marker(delta_text):
+                        _promote_to_deferred()
+                    if pending_block_space:
+                        if (
+                            accumulated_deltas
+                            and accumulated_deltas[-1]
+                            and not accumulated_deltas[-1][-1].isspace()
+                            and not delta_text[0].isspace()
+                        ):
+                            delta_text = " " + delta_text
+                        pending_block_space = False
+                    accumulated_deltas.append(delta_text)
+                    for ready_s in splitter.feed(delta_text):
+                        await _emit_sentence(ready_s)
+                    if not detached_for_defer and has_defer_marker("".join(accumulated_deltas)):
+                        _promote_to_deferred()
+                if final_text is not None:
+                    final_result_text = final_text
+                return is_done
+
+            async def _consume_stream() -> None:
+                nonlocal active_proc, active_stderr_task
+                if line_stream is None:
+                    proc = await self.ensure_started()
+                    active_proc = proc
+                    active_stderr_task = self._stderr_task
+                    req_line = json.dumps(
+                        {
+                            "event": "user",
+                            "type": "user",
+                            "session_id": session_id or self.session_id,
+                            "node_id": node_id,
+                            "message": {"role": "user", "content": prompt},
+                        }
+                    ) + "\n"
+                    if proc.stdin is not None:
+                        proc.stdin.write(req_line.encode("utf-8"))
+                        if hasattr(proc.stdin, "drain"):
+                            res_drain = proc.stdin.drain()
+                            if inspect.isawaitable(res_drain):
+                                await res_drain
+                    stdout_stream = proc.stdout
+                else:
+                    stdout_stream = line_stream
+
+                if hasattr(stdout_stream, "__aiter__"):
+                    async for raw_line in stdout_stream:
+                        line_str = (
+                            raw_line.decode("utf-8", errors="replace").strip()
+                            if isinstance(raw_line, (bytes, bytearray))
+                            else str(raw_line).strip()
+                        )
+                        if not line_str:
+                            continue
+                        try:
+                            obj = json.loads(line_str)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(obj, dict):
+                            continue
+                        if await _process_event_obj(obj):
+                            break
+                elif stdout_stream is not None:
+                    for raw_line in stdout_stream:
+                        line_str = (
+                            raw_line.decode("utf-8", errors="replace").strip()
+                            if isinstance(raw_line, (bytes, bytearray))
+                            else str(raw_line).strip()
+                        )
+                        if not line_str:
+                            continue
+                        try:
+                            obj = json.loads(line_str)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(obj, dict):
+                            continue
+                        if await _process_event_obj(obj):
+                            break
+
+            consume_task = asyncio.create_task(_consume_stream())
+            try:
+                while not consume_task.done():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        consume_task.cancel()
+                        try:
+                            await consume_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        raise asyncio.TimeoutError()
+                    done, _ = await asyncio.wait(
+                        {consume_task},
+                        timeout=min(remaining, 0.05),
+                    )
+                    if done:
+                        await consume_task
+                        break
+            except asyncio.TimeoutError as exc:
+                if detached_for_defer:
+                    await self._kill_proc_instance(active_proc, active_stderr_task)
+                    raise TimeoutError(
+                        f"WarmSubscriptionVoiceWorker deferred turn timed out after {effective_deferred_timeout}s"
+                    ) from exc
+                await self._kill_proc()
+                raise TimeoutError(
+                    f"WarmSubscriptionVoiceWorker turn timed out after {effective_timeout}s"
+                ) from exc
+
+            if detached_for_defer and active_proc is not None:
+                await self._kill_proc_instance(active_proc, active_stderr_task)
+
+            if not accumulated_deltas and final_result_text:
+                for ready_s in splitter.feed(final_result_text):
+                    await _emit_sentence(ready_s)
+
+            for trailing_s in splitter.flush():
+                await _emit_sentence(trailing_s)
+
+            full_reply = "".join(accumulated_deltas).strip() or (final_result_text or "").strip()
+            return {
+                "reply": full_reply,
+                "sentences": emitted_sentences,
+                "tool_calls": tool_calls,
+                "session_id": session_id or self.session_id,
+                "deferred": detached_for_defer,
+            }
+        finally:
+            if lock_held:
+                self._lock.release()
+
+
 class SubscriptionBrainAdapter:
     """
     Executes GOTCHI push-to-talk LLM reasoning turns over the regular `agy` or `claude`
@@ -979,24 +1503,49 @@ class SubscriptionBrainAdapter:
         stt_adapter: Optional[WhisperSTTAdapter] = None,
         cli_runner: Optional[Callable[[List[str], bytes], Any]] = None,
         http_poster: Optional[Callable[[str, Dict[str, str], Dict[str, Any]], Dict[str, Any]]] = None,
+        warm_worker: Optional[WarmSubscriptionVoiceWorker] = None,
     ):
         self.llm_config = llm_config
         self.stt_adapter = stt_adapter or WhisperSTTAdapter(llm_config=llm_config)
         self.cli_runner = cli_runner
         self.http_poster = http_poster
+        self.warm_worker = warm_worker
 
     async def __call__(self, parsed_turn: Dict[str, Any]) -> Dict[str, Any]:
         t0 = time.monotonic()
         loop = asyncio.get_running_loop()
-        if parsed_turn.get("prompt"):
-            transcript = str(parsed_turn["prompt"])
-        elif parsed_turn.get("audio_bytes"):
+        raw_p = str(parsed_turn.get("prompt") or "").strip()
+        has_audio = bool(parsed_turn.get("audio_bytes"))
+        if raw_p and not (has_audio and is_placeholder_prompt(raw_p)):
+            transcript = raw_p
+        elif has_audio:
             transcript = await loop.run_in_executor(
                 None, self.stt_adapter.transcribe, parsed_turn["audio_bytes"]
             )
+        elif parsed_turn.get("prompt"):
+            transcript = str(parsed_turn["prompt"])
         else:
             transcript = "Analyzing camera snapshot"
         stt_ms = int((time.monotonic() - t0) * 1000)
+
+        on_sentence: Optional[Callable[[str], Any]] = parsed_turn.get("_on_sentence")
+        on_tool_start: Optional[Callable[[str], Any]] = parsed_turn.get("_on_tool_start")
+
+        if self.warm_worker is not None:
+            worker_res = await self.warm_worker.run_turn(
+                transcript,
+                node_id=str(parsed_turn.get("node_id", "gotchi-device")),
+                session_id=str(parsed_turn.get("session_id", WarmSubscriptionVoiceWorker.DEFAULT_SESSION_ID)),
+                on_sentence=on_sentence,
+                on_tool_start=on_tool_start,
+            )
+            return {
+                "transcript": transcript,
+                "reply": str(worker_res.get("reply") or ""),
+                "sentences": list(worker_res.get("sentences") or []),
+                "tool_calls": list(worker_res.get("tool_calls") or []),
+                "stt_ms": stt_ms,
+            }
 
         payload: Dict[str, Any] = {
             "node_id": parsed_turn.get("node_id", "gotchi-device"),
@@ -1033,7 +1582,9 @@ class SubscriptionBrainAdapter:
                 else str(res_raw).strip()
             )
             if "event: sentence" in text_out or "event: reply" in text_out:
-                reply, streamed_sentences = consume_streaming_sse(text_out)
+                reply, streamed_sentences = consume_streaming_sse(
+                    text_out, on_sentence=on_sentence
+                )
                 return {
                     "transcript": transcript,
                     "reply": reply,
@@ -1134,10 +1685,12 @@ class GeminiBrainAdapter:
                 }
             })
 
-        prompt_text = parsed_turn.get("prompt") or ""
-        if prompt_text:
+        prompt_text = str(parsed_turn.get("prompt") or "").strip()
+        has_audio = bool(parsed_turn.get("audio_bytes"))
+        has_explicit = bool(prompt_text) and not (has_audio and is_placeholder_prompt(prompt_text))
+        if has_explicit:
             parts.append({"text": f"User prompt: {prompt_text}"})
-        elif parsed_turn.get("audio_bytes"):
+        elif has_audio:
             parts.append({
                 "text": (
                     "Transcribe the user's spoken audio into 'transcript' (if only silence or noise is "
@@ -1145,6 +1698,8 @@ class GeminiBrainAdapter:
                     "concisely as Zero in 'reply'."
                 )
             })
+        elif prompt_text:
+            parts.append({"text": f"User prompt: {prompt_text}"})
         else:
             parts.append({"text": "Describe what you see in the camera snapshot concisely as Zero."})
 
@@ -1171,7 +1726,7 @@ class GeminiBrainAdapter:
                 if p.get("text"):
                     raw_text += str(p["text"])
         raw_text = raw_text.strip()
-        transcript = prompt_text or "Voice turn"
+        transcript = prompt_text if has_explicit else "Voice turn"
         reply = "Loud and clear."
         if raw_text:
             try:
@@ -1314,6 +1869,7 @@ def clean_spoken_text_for_tts(text: str) -> str:
     if not text:
         return ""
     cleaned = text.strip()
+    cleaned = re.sub(r"\[\[defer\]\]", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\[([^\]]+)\]\(<?https?://[^)\s>]+>?\)", r"\1", cleaned)
     cleaned = re.sub(r"<https?://[^>]+>", "", cleaned)
     cleaned = re.sub(r"https?://\S+", "", cleaned)
@@ -1323,6 +1879,10 @@ def clean_spoken_text_for_tts(text: str) -> str:
     cleaned = re.sub(r"(?m)^\s*[-*•]\s+", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def has_defer_marker(text: str) -> bool:
+    return "[[defer]]" in (text or "").lower()
 
 
 def extract_topic(prompt: str) -> str:
@@ -1479,6 +2039,135 @@ class PendingVoiceAnswerStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_pending_node_ack ON pending_voice_answers(node_id, acked, expires_at)"
             )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS gotchi_notifications (
+                    notify_id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL,
+                    status_text TEXT NOT NULL,
+                    chime TEXT NOT NULL DEFAULT 'ready',
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    acked INTEGER DEFAULT 0,
+                    has_pending_audio INTEGER DEFAULT 0,
+                    answer_id TEXT DEFAULT '',
+                    auto_speak INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_notify_node_ack ON gotchi_notifications(node_id, acked, expires_at)"
+            )
+
+    def save_notification(
+        self,
+        notify_id: str,
+        node_id: str,
+        status_text: str,
+        chime: str = "ready",
+        has_pending_audio: bool = False,
+        answer_id: str = "",
+        auto_speak: bool = False,
+        created_at: Optional[float] = None,
+        ttl_s: float = 900.0,
+    ) -> Dict[str, Any]:
+        now = created_at if created_at is not None else time.time()
+        expires_at = now + ttl_s
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO gotchi_notifications (
+                    notify_id, node_id, status_text, chime,
+                    created_at, expires_at, acked,
+                    has_pending_audio, answer_id, auto_speak
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                """,
+                (
+                    notify_id,
+                    node_id,
+                    status_text,
+                    chime,
+                    now,
+                    expires_at,
+                    1 if has_pending_audio else 0,
+                    answer_id or "",
+                    1 if auto_speak else 0,
+                ),
+            )
+        return {
+            "notify_id": notify_id,
+            "node_id": node_id,
+            "status_text": status_text,
+            "chime": chime,
+            "created_at": now,
+            "expires_at": expires_at,
+            "has_pending_audio": bool(has_pending_audio),
+            "answer_id": answer_id or "",
+            "auto_speak": bool(auto_speak),
+        }
+
+    def get_active_notifications(
+        self, node_id: str, now: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        ts = now if now is not None else time.time()
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT notify_id, node_id, status_text, chime, created_at, expires_at,
+                       acked, has_pending_audio, answer_id, auto_speak
+                FROM gotchi_notifications
+                WHERE node_id = ? AND acked = 0 AND expires_at > ?
+                ORDER BY created_at ASC
+                LIMIT 32
+                """,
+                (node_id, ts),
+            )
+            rows = cur.fetchall()
+            result = []
+            for r in rows:
+                result.append({
+                    "notify_id": r["notify_id"],
+                    "node_id": r["node_id"],
+                    "status_text": r["status_text"],
+                    "chime": r["chime"],
+                    "created_at": r["created_at"],
+                    "has_pending_audio": bool(r["has_pending_audio"]),
+                    "answer_id": r["answer_id"] or "",
+                    "auto_speak": bool(r["auto_speak"]),
+                })
+            return result
+
+    def ack_notification(self, node_id: str, notify_id: str) -> bool:
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "UPDATE gotchi_notifications SET acked = 1 WHERE node_id = ? AND notify_id = ? AND acked = 0",
+                (node_id, notify_id),
+            )
+            if cur.rowcount > 0:
+                return True
+            if notify_id.startswith("syn-"):
+                ans_id = notify_id[4:]
+                now = time.time()
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO gotchi_notifications (
+                        notify_id, node_id, status_text, chime,
+                        created_at, expires_at, acked,
+                        has_pending_audio, answer_id, auto_speak
+                    ) VALUES (?, ?, 'ANSWER READY', '', ?, ?, 1, 1, ?, 0)
+                    """,
+                    (notify_id, node_id, now, now + 7200.0, ans_id),
+                )
+                return True
+            return False
+
+    def has_any_notification_for_answer(self, node_id: str, answer_id: str) -> bool:
+        if not answer_id:
+            return False
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT 1 FROM gotchi_notifications WHERE node_id = ? AND answer_id = ? LIMIT 1",
+                (node_id, answer_id),
+            )
+            return cur.fetchone() is not None
 
     def save_answer(
         self,
@@ -1590,11 +2279,15 @@ class PendingVoiceAnswerStore:
     def prune_expired(self) -> int:
         now = time.time()
         with self._get_connection() as conn:
-            cur = conn.execute(
+            cur1 = conn.execute(
                 "DELETE FROM pending_voice_answers WHERE expires_at <= ?",
                 (now,),
             )
-            return cur.rowcount
+            cur2 = conn.execute(
+                "DELETE FROM gotchi_notifications WHERE expires_at <= ?",
+                (now,),
+            )
+            return cur1.rowcount + cur2.rowcount
 
 class TurnTranscriptSink:
     """
@@ -1707,6 +2400,7 @@ class VoiceGatewayService:
         ha_fastpath: Optional[HomeAssistantConversationFastPath] = None,
         pending_answer_store: Optional[PendingVoiceAnswerStore] = None,
         pending_answers_db_path: Optional[str] = None,
+        lan_rpc_sender: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
     ):
         self.verifier = verifier or BearerTokenVerifier.from_env_or_file()
         self.auth_required = auth_required or bool(self.verifier.device_tokens)
@@ -1751,12 +2445,143 @@ class VoiceGatewayService:
             db_path=pending_answers_db_path
         )
         self.pending_notifications: Dict[str, List[Dict[str, Any]]] = {}
+        self.node_last_seen_ip: Dict[str, str] = {}
+        self.node_last_seen_token: Dict[str, str] = {}
+        self.lan_rpc_sender: Optional[Callable[[str, Dict[str, Any]], Any]] = lan_rpc_sender
 
-    def enqueue_notification(self, node_id: str, item: Dict[str, Any]) -> None:
+    def record_node_ip(
+        self,
+        node_id: str,
+        client_ip: Optional[str],
+        auth_header: Optional[str] = None,
+    ) -> None:
+        clean_node = str(node_id or "").strip()
+        if clean_node and client_ip and client_ip not in ("0.0.0.0", ""):
+            self.node_last_seen_ip[clean_node] = str(client_ip).strip()
+        if clean_node and auth_header:
+            tok = str(auth_header).strip()
+            if tok.lower().startswith("bearer "):
+                tok = tok[7:].strip()
+            if tok:
+                self.node_last_seen_token[clean_node] = tok
+
+    def _resolve_node_bearer_token(self, node_id: str) -> str:
+        clean_node = str(node_id or "").strip()
+        if clean_node and clean_node in self.node_last_seen_token:
+            return self.node_last_seen_token[clean_node]
+        dev_tokens = getattr(self.verifier, "device_tokens", None) or {}
+        if clean_node and clean_node in dev_tokens:
+            return str(dev_tokens[clean_node]).strip()
+        return os.environ.get("GOTCHI_BEARER_TOKEN", "").strip()
+
+    def mark_notification_delivered(self, node_id: str, notify_id: str) -> bool:
+        if not node_id or not notify_id:
+            return False
+        db_acked = self.pending_answer_store.ack_notification(node_id, notify_id)
+        q = self.pending_notifications.get(node_id, [])
+        before = len(q)
+        self.pending_notifications[node_id] = [
+            n for n in q if n.get("notify_id") != notify_id
+        ]
+        return db_acked or (len(self.pending_notifications[node_id]) < before)
+
+    async def push_lan_rpc_notify(
+        self,
+        node_id: str,
+        payload: Dict[str, Any],
+        client_ip: Optional[str] = None,
+        timeout_s: float = 2.0,
+    ) -> bool:
+        target_ip = client_ip or self.node_last_seen_ip.get(node_id)
+        if not target_ip or target_ip in ("0.0.0.0", "unknown"):
+            return False
+
+        notify_id = str(payload.get("notify_id") or "").strip()
+
+        if self.lan_rpc_sender is not None:
+            try:
+                res = self.lan_rpc_sender(target_ip, payload)
+                if inspect.isawaitable(res):
+                    res = await res
+                if isinstance(res, dict):
+                    ok = bool(res.get("ok"))
+                else:
+                    ok = bool(res)
+                if ok and notify_id:
+                    self.mark_notification_delivered(node_id, notify_id)
+                return ok
+            except Exception as exc:
+                logger.debug("Custom lan_rpc_sender failed for %s (%s): %s", node_id, target_ip, exc)
+                return False
+
+        url = f"http://{target_ip}/api/rpc"
+        req_headers: Dict[str, str] = {"Content-Type": "application/json"}
+        token = self._resolve_node_bearer_token(node_id)
+        if token:
+            req_headers["Authorization"] = f"Bearer {token}"
+
+        try:
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=timeout_s) as client:
+                    resp = await client.post(url, json=payload, headers=req_headers)
+                    ok = False
+                    if resp.status_code == 200:
+                        try:
+                            body_json = resp.json()
+                            ok = isinstance(body_json, dict) and bool(body_json.get("ok"))
+                        except Exception:
+                            ok = False
+            except ImportError:
+                def _sync_post():
+                    data = json.dumps(payload).encode("utf-8")
+                    req = urllib.request.Request(
+                        url,
+                        data=data,
+                        headers=req_headers,
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout_s) as r:
+                        if r.status != 200:
+                            return False
+                        try:
+                            raw = r.read().decode("utf-8", errors="replace")
+                            body_json = json.loads(raw)
+                            return isinstance(body_json, dict) and bool(body_json.get("ok"))
+                        except Exception:
+                            return False
+                ok = await asyncio.to_thread(_sync_post)
+            if ok and notify_id:
+                self.mark_notification_delivered(node_id, notify_id)
+            return ok
+        except Exception as exc:
+            logger.debug("Best-effort LAN RPC notify to %s failed: %s", url, exc)
+            return False
+
+    def enqueue_notification(self, node_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
+        notify_id = str(item.get("notify_id") or f"ntf-{int(time.time() * 1000)}")
+        item["notify_id"] = notify_id
+        item["node_id"] = node_id
+        created_at = float(item.get("created_at") or time.time())
+        item["created_at"] = created_at
+
+        self.pending_answer_store.save_notification(
+            notify_id=notify_id,
+            node_id=node_id,
+            status_text=str(item.get("status_text") or item.get("message") or "")[:22],
+            chime=str(item.get("chime") or "ready"),
+            has_pending_audio=bool(item.get("has_pending_audio", False)),
+            answer_id=str(item.get("answer_id") or ""),
+            auto_speak=bool(item.get("auto_speak", False)),
+            created_at=created_at,
+            ttl_s=float(item.get("ttl_s", 900.0)),
+        )
+
         q = self.pending_notifications.setdefault(node_id, [])
         q.append(item)
         if len(q) > 32:
             del q[:-32]
+        return item
 
     def verify_admin_auth(self, headers: Mapping[str, str]) -> Tuple[bool, int, Dict[str, Any]]:
         """
@@ -2035,6 +2860,9 @@ class VoiceGatewayService:
         self.interactions_count += 1
         t_start = time.monotonic()
         node_id = str(node_id or parsed_turn.get("node_id") or "gotchi-device").strip()
+        client_ip = parsed_turn.get("client_ip")
+        if client_ip:
+            self.record_node_ip(node_id, client_ip)
         session_id = parsed_turn.get("session_id", "sess-0")
         audio_out_mode = parsed_turn.get("audio_out_mode", "speaker")
 
@@ -2043,7 +2871,9 @@ class VoiceGatewayService:
         await asyncio.sleep(0.005)
 
         has_images = bool(parsed_turn.get("image_bytes") or parsed_turn.get("burst_images"))
-        has_prompt = parsed_turn.get("prompt") is not None
+        raw_prompt = str(parsed_turn.get("prompt") or "").strip()
+        has_audio = bool(parsed_turn.get("audio_bytes"))
+        has_prompt = bool(raw_prompt) and not (has_audio and is_placeholder_prompt(raw_prompt))
         active_handler = self.turn_handler
         if active_handler is None:
             if self.llm_config.auth_mode == "subscription":
@@ -2055,9 +2885,9 @@ class VoiceGatewayService:
 
         # Pre-check voiced audio duration for audio-only turns without a custom turn_handler
         if active_handler is None:
-            if parsed_turn.get("audio_bytes") and has_prompt:
-                transcript_text = parsed_turn["prompt"]
-            elif parsed_turn.get("audio_bytes"):
+            if has_audio and has_prompt:
+                transcript_text = raw_prompt
+            elif has_audio:
                 if (
                     self.llm_config.stt_engine in ("whisper_http", "faster_whisper")
                     or self.stt_adapter.local_transcriber is not None
@@ -2069,7 +2899,7 @@ class VoiceGatewayService:
                 else:
                     transcript_text = "What is the status?"
             elif has_prompt:
-                transcript_text = parsed_turn["prompt"]
+                transcript_text = raw_prompt
             elif parsed_turn.get("burst_images"):
                 transcript_text = "Analyzing 5-frame burst capture"
             else:
@@ -2160,9 +2990,13 @@ class VoiceGatewayService:
             live_streamed_sentences: List[str] = []
             live_streamed_count = 0
             speaking_state_emitted = False
+            early_defer_triggered = False
 
             def _on_live_sentence(sent_text: str) -> None:
-                cleaned_s = (sent_text or "").strip()
+                nonlocal early_defer_triggered
+                if has_defer_marker(sent_text):
+                    early_defer_triggered = True
+                cleaned_s = clean_spoken_text_for_tts(sent_text)
                 if cleaned_s:
                     # Launch TTS synthesis in parallel immediately as each sentence streams from the brain
                     tts_fut = loop.run_in_executor(
@@ -2172,6 +3006,8 @@ class VoiceGatewayService:
                     live_sentence_queue.put_nowait((cleaned_s, tts_fut))
 
             turn_input = dict(parsed_turn)
+            if has_audio and is_placeholder_prompt(raw_prompt):
+                turn_input["prompt"] = None
             turn_input["_on_sentence"] = _on_live_sentence
             handler_task = asyncio.create_task(self._invoke_turn_handler(turn_input))
             filler_1_sent = False
@@ -2182,6 +3018,160 @@ class VoiceGatewayService:
             handoff_s = self.llm_config.async_handoff_ms / 1000.0
             active_tts_engine = self.llm_config.tts_engine or "kokoro"
             active_voice_name = self.llm_config.voice_name or DEFAULT_VOICE_NAME
+            t_handoff = brain_start
+
+            async def _supervise_detached_turn() -> None:
+                try:
+                    bg_res = await handler_task
+                    bg_total_ms = int((time.monotonic() - t_start) * 1000)
+                    elapsed_since_handoff = time.monotonic() - t_handoff
+                    completed_within_20s = (elapsed_since_handoff <= 20.0)
+
+                    prompt = str(bg_res.get("transcript") or parsed_turn.get("prompt") or "").strip()
+                    raw_reply = str(bg_res.get("raw_reply") or bg_res.get("reply") or "").strip()
+                    topic = extract_topic(prompt)
+
+                    long_reply = is_long_answer(raw_reply)
+                    if long_reply:
+                        spoken_text = condense_long_answer(raw_reply, topic=topic)
+                        discord_body = (
+                            f"📋 **[{node_id} · Async Answer Breakdown]:**\n"
+                            f"> **Prompt:** {prompt}\n\n"
+                            f"{raw_reply}"
+                        )
+                        discord_entry = {
+                            "node_id": node_id,
+                            "session_id": session_id,
+                            "mode": "async_handoff_long",
+                            "audio_out_mode": audio_out_mode,
+                            "transcript": prompt,
+                            "reply": raw_reply,
+                            "content": discord_body,
+                            "voice_name": self.llm_config.voice_name or DEFAULT_VOICE_NAME,
+                            "tts_engine": self.llm_config.tts_engine or "kokoro",
+                            "has_image": bool(parsed_turn.get("image_bytes")),
+                            "burst_count": len(parsed_turn.get("burst_images") or []),
+                            "stt_ms": int(bg_res.get("stt_ms", 0)),
+                            "first_text_ms": bg_total_ms,
+                            "first_audio_ms": first_audio_ms,
+                            "total_ms": bg_total_ms,
+                        }
+                        rec = await self.turn_log_sink.adispatch(discord_entry)
+                        self.turn_logs.append(rec)
+                        try:
+                            from tools import outbox
+                            outbox.queue_outbox_message(
+                                "1542081375287640084",
+                                discord_body,
+                                source_turn="gotchi-async-voice-long",
+                                dedupe_window=5,
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        clean_reply = clean_spoken_text_for_tts(raw_reply) or "Task completed."
+                        spoken_text = build_spoken_context(topic, clean_reply)
+                        bg_entry = {
+                            "node_id": node_id,
+                            "session_id": session_id,
+                            "mode": "async_handoff",
+                            "audio_out_mode": audio_out_mode,
+                            "transcript": prompt,
+                            "reply": raw_reply,
+                            "voice_name": self.llm_config.voice_name or DEFAULT_VOICE_NAME,
+                            "tts_engine": self.llm_config.tts_engine or "kokoro",
+                            "has_image": bool(parsed_turn.get("image_bytes")),
+                            "burst_count": len(parsed_turn.get("burst_images") or []),
+                            "stt_ms": int(bg_res.get("stt_ms", 0)),
+                            "first_text_ms": bg_total_ms,
+                            "first_audio_ms": first_audio_ms,
+                            "total_ms": bg_total_ms,
+                        }
+                        rec = await self.turn_log_sink.adispatch(bg_entry)
+                        self.turn_logs.append(rec)
+
+                    # Pre-synthesize and cache spoken audio in SQLite
+                    pcm_bytes = self._synthesize_sentence_pcm(spoken_text, is_filler=False, audio_out_mode=audio_out_mode)
+                    if self.llm_config.sse_audio_format == "adpcm" and pcm_bytes:
+                        audio_bytes = encode_wav_to_adpcm(pcm_bytes, default_sample_rate=self.mock_sample_rate)
+                        audio_fmt = "adpcm"
+                    else:
+                        audio_bytes = pcm_bytes
+                        audio_fmt = "pcm"
+
+                    answer_id = f"ans-{int(time.time() * 1000)}"
+                    self.pending_answer_store.save_answer(
+                        answer_id=answer_id,
+                        node_id=node_id,
+                        session_id=session_id,
+                        topic=topic,
+                        prompt=prompt,
+                        full_answer=raw_reply,
+                        spoken_text=spoken_text,
+                        audio_pcm=audio_bytes,
+                        audio_format=audio_fmt,
+                        sample_rate=self.mock_sample_rate,
+                        auto_spoken=completed_within_20s,
+                        ttl_s=7200.0,
+                    )
+
+                    # Enqueue chime notification via notify queue
+                    notify_item = {
+                        "notify_id": f"ntf-{int(time.time() * 1000)}",
+                        "node_id": node_id,
+                        "status_text": "ANSWER READY"[:22],
+                        "chime": "ready",
+                        "created_at": time.time(),
+                        "has_pending_audio": True,
+                        "answer_id": answer_id,
+                        "auto_speak": completed_within_20s,
+                    }
+                    self.enqueue_notification(node_id, notify_item)
+
+                    # Direct LAN RPC notify push to idle badge
+                    target_ip = parsed_turn.get("client_ip") or self.node_last_seen_ip.get(node_id)
+                    if target_ip:
+                        rpc_payload = {
+                            "cmd": "notify",
+                            "notify_id": notify_item["notify_id"],
+                            "text": "ANSWER READY"[:22],
+                            "status_text": "ANSWER READY"[:22],
+                            "chime": "ready",
+                            "has_pending_audio": True,
+                            "answer_id": answer_id,
+                            "auto_speak": completed_within_20s,
+                        }
+                        await self.push_lan_rpc_notify(node_id, rpc_payload, client_ip=target_ip)
+
+                    if self.turn_log_router is not None:
+                        cb_res = self.turn_log_router(rec)
+                        if inspect.isawaitable(cb_res):
+                            await cb_res
+                except Exception as exc:
+                    logger.error("Detached async handoff task failed for node_id=%s: %s", node_id, exc)
+                    err_entry = {
+                        "node_id": node_id,
+                        "session_id": session_id,
+                        "mode": "error",
+                        "audio_out_mode": audio_out_mode,
+                        "transcript": parsed_turn.get("prompt") or "voice turn",
+                        "reply": "",
+                        "error": str(exc),
+                        "voice_name": self.llm_config.voice_name or DEFAULT_VOICE_NAME,
+                        "tts_engine": self.llm_config.tts_engine or "kokoro",
+                        "has_image": bool(parsed_turn.get("image_bytes")),
+                        "burst_count": len(parsed_turn.get("burst_images") or []),
+                        "stt_ms": 0,
+                        "first_text_ms": -1,
+                        "first_audio_ms": first_audio_ms or -1,
+                        "total_ms": int((time.monotonic() - t_start) * 1000),
+                    }
+                    rec = await self.turn_log_sink.adispatch(err_entry)
+                    self.turn_logs.append(rec)
+                    if self.turn_log_router is not None:
+                        cb_res = self.turn_log_router(rec)
+                        if inspect.isawaitable(cb_res):
+                            await cb_res
 
             while not handler_task.done() or not live_sentence_queue.empty():
                 # Drain any sentences streamed early by the brain (pre-tool preamble or token stream)
@@ -2241,6 +3231,21 @@ class VoiceGatewayService:
                         )
                     live_streamed_count += 1
 
+                if early_defer_triggered and not handler_task.done():
+                    t_handoff = time.monotonic()
+                    yield build_sse_event(
+                        "done",
+                        {
+                            "duration_ms": int((time.monotonic() - t_start) * 1000),
+                            "async_handoff": True,
+                            "early_defer": True,
+                            "first_audio_ms": first_audio_ms,
+                            "total_ms": int((time.monotonic() - t_start) * 1000),
+                        },
+                    )
+                    asyncio.create_task(_supervise_detached_turn())
+                    return
+
                 if handler_task.done():
                     break
 
@@ -2252,8 +3257,8 @@ class VoiceGatewayService:
                     and elapsed_s >= filler_1_s
                 ):
                     filler_1_sent = True
-                    from backend.gotchi_zero_adapter import build_contextual_filler
-                    _timed_filler_text = build_contextual_filler("research", str(parsed_turn.get("transcript") or ""))
+                    from backend.gotchi_zero_adapter import build_contextual_tool_filler
+                    _timed_filler_text = build_contextual_tool_filler("research", {}, str(parsed_turn.get("transcript") or ""))
                     filler_pcm = self._synthesize_sentence_pcm(_timed_filler_text, is_filler=True)
                     if first_audio_ms is None:
                         first_audio_ms = int((time.monotonic() - t_start) * 1000)
@@ -2354,145 +3359,6 @@ class VoiceGatewayService:
                             "total_ms": handoff_ms,
                         },
                     )
-
-                    async def _supervise_detached_turn() -> None:
-                        try:
-                            bg_res = await handler_task
-                            bg_total_ms = int((time.monotonic() - t_start) * 1000)
-                            elapsed_since_handoff = time.monotonic() - t_handoff
-                            completed_within_20s = (elapsed_since_handoff <= 20.0)
-
-                            prompt = str(bg_res.get("transcript") or parsed_turn.get("prompt") or "").strip()
-                            raw_reply = str(bg_res.get("raw_reply") or bg_res.get("reply") or "").strip()
-                            topic = extract_topic(prompt)
-
-                            long_reply = is_long_answer(raw_reply)
-                            if long_reply:
-                                spoken_text = condense_long_answer(raw_reply, topic=topic)
-                                discord_body = (
-                                    f"📋 **[{node_id} · Async Answer Breakdown]:**\n"
-                                    f"> **Prompt:** {prompt}\n\n"
-                                    f"{raw_reply}"
-                                )
-                                discord_entry = {
-                                    "node_id": node_id,
-                                    "session_id": session_id,
-                                    "mode": "async_handoff_long",
-                                    "audio_out_mode": audio_out_mode,
-                                    "transcript": prompt,
-                                    "reply": raw_reply,
-                                    "content": discord_body,
-                                    "voice_name": self.llm_config.voice_name or DEFAULT_VOICE_NAME,
-                                    "tts_engine": self.llm_config.tts_engine or "kokoro",
-                                    "has_image": bool(parsed_turn.get("image_bytes")),
-                                    "burst_count": len(parsed_turn.get("burst_images") or []),
-                                    "stt_ms": int(bg_res.get("stt_ms", 0)),
-                                    "first_text_ms": bg_total_ms,
-                                    "first_audio_ms": first_audio_ms,
-                                    "total_ms": bg_total_ms,
-                                }
-                                rec = await self.turn_log_sink.adispatch(discord_entry)
-                                self.turn_logs.append(rec)
-                                try:
-                                    from tools import outbox
-                                    outbox.queue_outbox_message(
-                                        "1542081375287640084",
-                                        discord_body,
-                                        source_turn="gotchi-async-voice-long",
-                                        dedupe_window=5,
-                                    )
-                                except Exception:
-                                    pass
-                            else:
-                                clean_reply = clean_spoken_text_for_tts(raw_reply) or "Task completed."
-                                spoken_text = build_spoken_context(topic, clean_reply)
-                                bg_entry = {
-                                    "node_id": node_id,
-                                    "session_id": session_id,
-                                    "mode": "async_handoff",
-                                    "audio_out_mode": audio_out_mode,
-                                    "transcript": prompt,
-                                    "reply": raw_reply,
-                                    "voice_name": self.llm_config.voice_name or DEFAULT_VOICE_NAME,
-                                    "tts_engine": self.llm_config.tts_engine or "kokoro",
-                                    "has_image": bool(parsed_turn.get("image_bytes")),
-                                    "burst_count": len(parsed_turn.get("burst_images") or []),
-                                    "stt_ms": int(bg_res.get("stt_ms", 0)),
-                                    "first_text_ms": bg_total_ms,
-                                    "first_audio_ms": first_audio_ms,
-                                    "total_ms": bg_total_ms,
-                                }
-                                rec = await self.turn_log_sink.adispatch(bg_entry)
-                                self.turn_logs.append(rec)
-
-                            # Pre-synthesize and cache spoken audio in SQLite
-                            pcm_bytes = self._synthesize_sentence_pcm(spoken_text, is_filler=False, audio_out_mode=audio_out_mode)
-                            if self.llm_config.sse_audio_format == "adpcm" and pcm_bytes:
-                                audio_bytes = encode_wav_to_adpcm(pcm_bytes, default_sample_rate=self.mock_sample_rate)
-                                audio_fmt = "adpcm"
-                            else:
-                                audio_bytes = pcm_bytes
-                                audio_fmt = "pcm"
-
-                            answer_id = f"ans-{int(time.time() * 1000)}"
-                            self.pending_answer_store.save_answer(
-                                answer_id=answer_id,
-                                node_id=node_id,
-                                session_id=session_id,
-                                topic=topic,
-                                prompt=prompt,
-                                full_answer=raw_reply,
-                                spoken_text=spoken_text,
-                                audio_pcm=audio_bytes,
-                                audio_format=audio_fmt,
-                                sample_rate=self.mock_sample_rate,
-                                auto_spoken=completed_within_20s,
-                                ttl_s=7200.0,
-                            )
-
-                            # Enqueue chime notification via notify queue
-                            notify_item = {
-                                "notify_id": f"ntf-{int(time.time() * 1000)}",
-                                "node_id": node_id,
-                                "status_text": "ANSWER READY"[:22],
-                                "chime": "ready",
-                                "created_at": time.time(),
-                                "has_pending_audio": True,
-                                "answer_id": answer_id,
-                                "auto_speak": completed_within_20s,
-                            }
-                            self.enqueue_notification(node_id, notify_item)
-
-                            if self.turn_log_router is not None:
-                                cb_res = self.turn_log_router(rec)
-                                if inspect.isawaitable(cb_res):
-                                    await cb_res
-                        except Exception as exc:
-                            logger.error("Detached async handoff task failed for node_id=%s: %s", node_id, exc)
-                            err_entry = {
-                                "node_id": node_id,
-                                "session_id": session_id,
-                                "mode": "error",
-                                "audio_out_mode": audio_out_mode,
-                                "transcript": parsed_turn.get("prompt") or "voice turn",
-                                "reply": "",
-                                "error": str(exc),
-                                "voice_name": self.llm_config.voice_name or DEFAULT_VOICE_NAME,
-                                "tts_engine": self.llm_config.tts_engine or "kokoro",
-                                "has_image": bool(parsed_turn.get("image_bytes")),
-                                "burst_count": len(parsed_turn.get("burst_images") or []),
-                                "stt_ms": 0,
-                                "first_text_ms": -1,
-                                "first_audio_ms": first_audio_ms or -1,
-                                "total_ms": int((time.monotonic() - t_start) * 1000),
-                            }
-                            rec = await self.turn_log_sink.adispatch(err_entry)
-                            self.turn_logs.append(rec)
-                            if self.turn_log_router is not None:
-                                cb_res = self.turn_log_router(rec)
-                                if inspect.isawaitable(cb_res):
-                                    await cb_res
-
                     asyncio.create_task(_supervise_detached_turn())
                     return
                 try:
@@ -2558,11 +3424,17 @@ class VoiceGatewayService:
                 live_streamed_count += 1
 
             stt_ms = int(result.get("stt_ms", (time.monotonic() - t_start) * 1000))
-            transcript_text = result.get("transcript", parsed_turn.get("prompt") or "")
+            fallback_tx = "" if (has_audio and is_placeholder_prompt(raw_prompt)) else (parsed_turn.get("prompt") or "")
+            transcript_text = result.get("transcript") or fallback_tx
+            _handler_answered = (
+                self.turn_handler is not None
+                and bool((result.get("reply") or "").strip())
+                and bool((transcript_text or "").strip())
+            )
 
             is_ghost, ghost_reason = is_stt_ghost(
                 transcript_text=transcript_text,
-                audio_bytes=parsed_turn.get("audio_bytes"),
+                audio_bytes=None if _handler_answered else parsed_turn.get("audio_bytes"),
                 min_voiced_ms=self.llm_config.min_voiced_ms,
                 has_explicit_prompt=has_prompt,
                 has_images=has_images,
@@ -2651,6 +3523,7 @@ class VoiceGatewayService:
                 "reply": reply_text,
                 "tts_engine": active_tts_engine,
                 "voice_name": active_voice_name,
+                "expects_reply": reply_expects_reply(reply_text),
             },
         )
         await asyncio.sleep(0.005)
@@ -2920,6 +3793,12 @@ def create_app(
         try:
             form = await request.form()
             parsed_turn = srv.parse_multipart_data(form)
+            parsed_turn["client_ip"] = client_ip
+            srv.record_node_ip(
+                parsed_turn.get("node_id", ""),
+                client_ip,
+                auth_header=authorization or headers.get("authorization"),
+            )
         except ValueError as ve:
             return JSONResponse(status_code=400, content={"error": "bad_request", "message": str(ve)})
         except Exception as e:
@@ -3011,11 +3890,11 @@ def create_app(
             "status_text": status_text,
             "chime": chime,
             "created_at": time.time(),
+            "has_pending_audio": bool(body.get("has_pending_audio", False)),
+            "answer_id": str(body.get("answer_id") or ""),
+            "auto_speak": bool(body.get("auto_speak", False)),
         }
-        q = app.state.pending_notifications.setdefault(node_id, [])
-        q.append(item)
-        if len(q) > 32:
-            del q[:-32]
+        srv.enqueue_notification(node_id, item)
         return {"ok": True, "queued": True, "notification": item}
 
     @app.get("/api/gotchi/notify")
@@ -3029,10 +3908,52 @@ def create_app(
                 if not admin_ok:
                     return JSONResponse(status_code=code, content=err)
         now = time.time()
-        q = app.state.pending_notifications.get(node_id, [])
-        # Drop notifications older than 15 minutes
-        active = [n for n in q if (now - n.get("created_at", now)) < 900]
-        app.state.pending_notifications[node_id] = active
+
+        stored_notifications = srv.pending_answer_store.get_active_notifications(node_id, now=now)
+
+        mem_q = app.state.pending_notifications.get(node_id, [])
+        active_mem = [n for n in mem_q if (now - n.get("created_at", now)) < 900]
+        app.state.pending_notifications[node_id] = active_mem
+
+        seen_ids = set()
+        active: List[Dict[str, Any]] = []
+        for n in stored_notifications:
+            nid = n.get("notify_id")
+            if nid and nid not in seen_ids:
+                seen_ids.add(nid)
+                active.append(n)
+        for n in active_mem:
+            nid = n.get("notify_id")
+            if nid and nid not in seen_ids:
+                seen_ids.add(nid)
+                active.append(n)
+
+        # Fallback check: if an unconsumed answer exists in pending_voice_answers,
+        # synthesize a notification record (has_pending_audio: true, answer_id, status_text, chime: 'ready')
+        # if no active notification already represents this answer.
+        unconsumed_ans = srv.pending_answer_store.get_latest_pending(node_id=node_id)
+        if unconsumed_ans:
+            ans_id = unconsumed_ans.get("answer_id")
+            already_notified = (
+                any(
+                    n.get("answer_id") == ans_id and n.get("has_pending_audio")
+                    for n in active
+                )
+                or srv.pending_answer_store.has_any_notification_for_answer(node_id, ans_id)
+            )
+            if not already_notified:
+                syn_item = {
+                    "notify_id": f"syn-{ans_id}",
+                    "node_id": node_id,
+                    "status_text": "ANSWER READY"[:22],
+                    "chime": "ready",
+                    "created_at": unconsumed_ans.get("created_at", now),
+                    "has_pending_audio": True,
+                    "answer_id": ans_id,
+                    "auto_speak": bool(unconsumed_ans.get("auto_spoken", 0)),
+                }
+                active.append(syn_item)
+
         return {"ok": True, "node_id": node_id, "notifications": list(active)}
 
     @app.post("/api/gotchi/notify/ack")
@@ -3051,10 +3972,15 @@ def create_app(
             return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_json"})
         node_id = str(body.get("node_id") or "gotchi-v1-01").strip()
         notify_id = str(body.get("notify_id") or "").strip()
+
+        db_acked = srv.pending_answer_store.ack_notification(node_id, notify_id)
+
         q = app.state.pending_notifications.get(node_id, [])
         before = len(q)
         app.state.pending_notifications[node_id] = [n for n in q if n.get("notify_id") != notify_id]
-        acked = len(app.state.pending_notifications[node_id]) < before
+        mem_acked = len(app.state.pending_notifications[node_id]) < before
+
+        acked = db_acked or mem_acked or notify_id.startswith("syn-")
         return {"ok": True, "acked": acked, "notify_id": notify_id}
 
     @app.get("/api/gotchi/pending_answer")
@@ -3132,6 +4058,90 @@ def create_app(
         answer_id = str(body.get("answer_id") or "").strip() or None
         acked = srv.pending_answer_store.ack_answer(node_id=node_id, answer_id=answer_id)
         return {"ok": True, "acked": acked, "answer_id": answer_id or "", "node_id": node_id}
+
+    @app.get("/api/gotchi/watch/config")
+    def get_gotchi_watch_config(request: Request, node_id: str = "gotchi-pixel-watch-01"):
+        if srv.auth_required or (
+            srv.verifier.device_tokens
+            and ("authorization" in request.headers or "x-gotchi-token" in request.headers)
+        ):
+            headers = dict(request.headers)
+            client_ip = request.client.host if request.client else "0.0.0.0"
+            ok, code, err = srv.verifier.verify(headers, client_ip=client_ip)
+            if not ok:
+                admin_ok, _, _ = srv.verify_admin_auth(headers)
+                if not admin_ok:
+                    return JSONResponse(status_code=code, content=err)
+        return {
+            "ok": True,
+            "node_id": node_id,
+            "version_code": int(os.environ.get("GOTCHI_WATCH_APK_VERSION", DEFAULT_WATCH_APK_VERSION_CODE)),
+            "min_linear_accel": 3.4,
+            "max_gyro": 1.2,
+            "require_double_impulse": True,
+            "ptt_silence_ms": 1500,
+            "apk_url": "/api/gotchi/watch/apk.apk",
+        }
+
+    @app.get("/api/gotchi/watch/apk.apk")
+    def get_gotchi_watch_apk(request: Request):
+        apk_candidates = [
+            Path("/workspace/scratch/gotchi-watch-debug.apk"),
+            Path(__file__).resolve().parent.parent / "scratch" / "gotchi-watch-debug.apk",
+            Path("/tmp/gotchi-watch-debug.apk"),
+        ]
+        apk_path = next((p for p in apk_candidates if p.is_file()), None)
+        if not apk_path:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "apk_not_found"})
+        from fastapi.responses import FileResponse
+
+        return FileResponse(
+            str(apk_path),
+            media_type="application/vnd.android.package-archive",
+            filename="gotchi-watch-debug.apk",
+        )
+
+    @app.get("/api/gotchi/forwarder/config")
+    def get_gotchi_forwarder_config(request: Request, node_id: str = "gotchi-ble-forwarder-01"):
+        if srv.auth_required or (
+            srv.verifier.device_tokens
+            and ("authorization" in request.headers or "x-gotchi-token" in request.headers)
+        ):
+            headers = dict(request.headers)
+            client_ip = request.client.host if request.client else "0.0.0.0"
+            ok, code, err = srv.verifier.verify(headers, client_ip=client_ip)
+            if not ok:
+                admin_ok, _, _ = srv.verify_admin_auth(headers)
+                if not admin_ok:
+                    return JSONResponse(status_code=code, content=err)
+        return {
+            "ok": True,
+            "node_id": node_id,
+            "version_code": int(os.environ.get("GOTCHI_FORWARDER_APK_VERSION", DEFAULT_FORWARDER_APK_VERSION_CODE)),
+            "apk_url": "/api/gotchi/forwarder/apk.apk",
+        }
+
+    @app.get("/api/gotchi/forwarder/apk.apk")
+    @app.get("/api/app/forwarder/apk")
+    @app.get("/api/app/forwarder/apk.apk")
+    def get_gotchi_forwarder_apk(request: Request):
+        apk_candidates = [
+            Path("/workspace/scratch/gotchi-ble-forwarder-debug.apk"),
+            Path(__file__).resolve().parent.parent / "scratch" / "gotchi-ble-forwarder-debug.apk",
+            Path(__file__).resolve().parent.parent / "android-ble-forwarder" / "releases" / "gotchi-ble-forwarder-debug.apk",
+            Path("android-ble-forwarder/releases/gotchi-ble-forwarder-debug.apk"),
+            Path("/tmp/gotchi-ble-forwarder-debug.apk"),
+        ]
+        apk_path = next((p for p in apk_candidates if p.is_file()), None)
+        if not apk_path:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "apk_not_found"})
+        from fastapi.responses import FileResponse
+
+        return FileResponse(
+            str(apk_path),
+            media_type="application/vnd.android.package-archive",
+            filename="gotchi-ble-forwarder-debug.apk",
+        )
 
     register_live_routes(app, live_srv)
     register_journal_routes(app, journal_srv)

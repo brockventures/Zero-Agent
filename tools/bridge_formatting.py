@@ -288,16 +288,20 @@ def format_for_discord(text: str) -> str:
     # 2. Strip internal action/progress pseudo-tags (e.g. <Action: ...>)
     text = re.sub(r"<\s*action:[^>]+>", "", text, flags=re.IGNORECASE)
 
-    # 3. Convert GitHub-style alerts to emoji blockquotes
-    alerts = {
+    # 3. Convert GitHub-style alerts to emoji blockquotes in a single token pass
+    _alert_labels = {
         "NOTE": "ℹ️ **Note:**",
         "TIP": "💡 **Tip:**",
         "IMPORTANT": "📌 **Important:**",
         "WARNING": "⚠️ **Warning:**",
         "CAUTION": "🛑 **Caution:**",
     }
-    for alert, emoji in alerts.items():
-        text = re.sub(rf"^>\s*\[!{alert}\]", f"> {emoji}", text, flags=re.MULTILINE | re.IGNORECASE)
+    text = re.sub(
+        r"^>\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]",
+        lambda m: f"> {_alert_labels[m.group(1).upper()]}",
+        text,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
 
     # 3b. Collapse unsupported h4+ headers (####+) to h3 (###) so Discord renders them as headings
     text = re.sub(r"^(#{4,})\s*(.*)$", r"### \2", text, flags=re.MULTILINE)
@@ -305,12 +309,9 @@ def format_for_discord(text: str) -> str:
     # 4. Convert markdown pipe tables to clean Discord mobile cards
     text = convert_markdown_tables(text)
 
-    # 4b. Normalize literal Unicode bullets (•) to native Discord markdown list syntax (-)
+    # 4b. Normalize literal Unicode bullets (•) and strip redundant numbering inside bulleted items
     text = re.sub(r"^([ \t]*(?:>[ \t]*)*)•[ \t]*", r"\1- ", text, flags=re.MULTILINE)
-
-    # 4b-ii. Strip redundant numbering inside bulleted list items (e.g. "- **1. Gold:**" -> "- **Gold:**" or "- 1. Gold" -> "- Gold")
-    text = re.sub(r"^([ \t]*[-*]\s+\*\*)\d+\.\s+", r"\1", text, flags=re.MULTILINE)
-    text = re.sub(r"^([ \t]*[-*]\s+)\d+\.\s+", r"\1", text, flags=re.MULTILINE)
+    text = re.sub(r"^([ \t]*[-*]\s+(?:\*\*)?)\d+\.\s+", r"\1", text, flags=re.MULTILINE)
 
     # 4c. Tighten loose lists where a parent list item is followed by an empty line before its sub-bullets
     text = re.sub(r"(^[ \t]*(?:[-*]|\d+\.)\s+[^\n]+)\n\n+([ \t]{2,}(?:[-*]|\d+\.)\s+)", r"\1\n\2", text, flags=re.MULTILINE)
@@ -884,16 +885,57 @@ def clean_discord_latex(text: str) -> str:
         text,
     )
 
-    # 5. Clean HTML tags into Discord markdown (no raw <br> or <b>)
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<(b|strong)>", "**", text, flags=re.IGNORECASE)
-    text = re.sub(r"</(b|strong)>", "**", text, flags=re.IGNORECASE)
-    text = re.sub(r"<(i|em)>", "*", text, flags=re.IGNORECASE)
-    text = re.sub(r"</(i|em)>", "*", text, flags=re.IGNORECASE)
-    text = re.sub(r"<code>", "`", text, flags=re.IGNORECASE)
-    text = re.sub(r"</code>", "`", text, flags=re.IGNORECASE)
+    _html_tag_map = {
+        "b": "**", "/b": "**", "strong": "**", "/strong": "**",
+        "i": "*", "/i": "*", "em": "*", "/em": "*",
+        "code": "`", "/code": "`",
+    }
+
+    def _replace_html_tag(m: re.Match) -> str:
+        tag = m.group(1).lower().strip()
+        if tag.startswith("br"):
+            return "\n"
+        return _html_tag_map.get(tag, m.group(0))
+
+    # 5. Clean HTML tags into Discord markdown in a single pass (no raw <br> or <b>)
+    text = re.sub(
+        r"<(br\s*/?|/?(?:b|strong|i|em|code))>",
+        _replace_html_tag,
+        text,
+        flags=re.IGNORECASE,
+    )
 
     return restore_code_spans(text, code_spans, prefix="\x00LATEX_SPAN_")
+
+
+_THREAD_TITLE_DOMAIN_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("birthday", "birthdays", "bday", "friends and family", "friends & family"), "Friends and Family Contacts and Birthdays"),
+    (("ev9", "kia ev9", "marketcheck"), "Kia EV9 Dealership Listings Market Monitor"),
+    (("compaction", "rolling context", "context size", "wedged", "turn counter", "prefill"), "Context Compaction and Rolling Memory Architecture"),
+    (("tautulli", "plex status", "plex transcode", "plex down", "pms"), "Plex Media Server Alerts and Transcoding"),
+    (("sonarr", "radarr", "prowlarr", "indexer"), "Arr Media Indexer and Server Alerts"),
+    (("youtube music", "liked songs", "music playlist", "prime416"), "YouTube Music Playlist Sync and Discovery"),
+    (("google sheet", "sheets api", "push friends to sheets"), "Google Sheets Friends and Family Sync"),
+    (("openmessage", "sms", "rcs", "google message"), "Google Messages RCS and SMS Integration"),
+    (("d&d", "dungeons and dragons", "tabletop", "campaign lore"), "Dungeons and Dragons Lore and Notes"),
+    (("memory doctor", "doctor audit", "audit sidecar"), "Homelab Memory Store Health and Audit"),
+    (("reboot", "restart", "beacon", "in-flight"), "Bridge Lifecycle and Restart Architecture Engine"),
+    (("baseball", "big board", "stat blast", "scrapegurus"), "Baseball Analytics and Big Board Scraping"),
+    (("thread naming", "naming triggers", "auto-rename", "threaded convos"), "Thread Naming and Escalation Timeout Tuning"),
+)
+
+_THREAD_PROMPT_CLEAN_RULES: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"^(thread:|parallel:|\/goal|\/plan|\/deep-research)\s*", re.IGNORECASE), ""),
+    (re.compile(r"\[Attached file\(s\)[^\]]+\]"), ""),
+    (re.compile(r"\[PREVIOUS SESSION CARRY-FORWARD CONTEXT\]:.*?(?=\[CURRENT USER PROMPT\]:|$)", re.DOTALL), ""),
+    (re.compile(r"\[CURRENT USER PROMPT\]:\s*"), ""),
+    (re.compile(r"[#*_`~]"), ""),
+)
+
+_THREAD_CONVERSATIONAL_PREFIX_RE = re.compile(
+    r"^(we talked about|i'm concerned because|immediately some of those are|can you|could you|please|i need|i want to|i want|how do we|why would|what about|did we get|hey also|ok so|let's|lets|can we|we should|i think|is there a way to)\s+",
+    re.IGNORECASE,
+)
 
 
 def generate_concise_thread_title(prompt: str, target_words: int = 6) -> str:
@@ -901,49 +943,16 @@ def generate_concise_thread_title(prompt: str, target_words: int = 6) -> str:
     if not prompt:
         return "General Task Execution"
 
-    clean = re.sub(r"^(thread:|parallel:|\/goal|\/plan|\/deep-research)\s*", "", prompt, flags=re.IGNORECASE).strip()
-    clean = re.sub(r"\[Attached file\(s\)[^\]]+\]", "", clean).strip()
-    clean = re.sub(r"\[PREVIOUS SESSION CARRY-FORWARD CONTEXT\]:.*?(?=\[CURRENT USER PROMPT\]:|$)", "", clean, flags=re.DOTALL)
-    clean = re.sub(r"\[CURRENT USER PROMPT\]:\s*", "", clean).strip()
-    clean = re.sub(r"[#*_`~]", "", clean).strip()
+    clean = prompt
+    for pat, repl in _THREAD_PROMPT_CLEAN_RULES:
+        clean = pat.sub(repl, clean).strip()
 
-    # Conversational Intent Cleaner
-    clean_stripped = re.sub(
-        r"^(we talked about|i'm concerned because|immediately some of those are|can you|could you|please|i need|i want to|i want|how do we|why would|what about|did we get|hey also|ok so|let's|lets|can we|we should|i think|is there a way to)\s+",
-        "",
-        clean,
-        flags=re.IGNORECASE
-    ).strip()
-
+    clean_stripped = _THREAD_CONVERSATIONAL_PREFIX_RE.sub("", clean).strip()
     low = clean_stripped.lower()
 
-    # High-Confidence Domain Intent Mappings (5-6 words)
-    if any(k in low for k in ["birthday", "birthdays", "bday", "friends and family", "friends & family"]):
-        return "Friends and Family Contacts and Birthdays"
-    elif any(k in low for k in ["ev9", "kia ev9", "marketcheck"]):
-        return "Kia EV9 Dealership Listings Market Monitor"
-    elif any(k in low for k in ["compaction", "rolling context", "context size", "wedged", "turn counter", "prefill"]):
-        return "Context Compaction and Rolling Memory Architecture"
-    elif any(k in low for k in ["tautulli", "plex status", "plex transcode", "plex down", "pms"]):
-        return "Plex Media Server Alerts and Transcoding"
-    elif any(k in low for k in ["sonarr", "radarr", "prowlarr", "indexer"]):
-        return "Arr Media Indexer and Server Alerts"
-    elif any(k in low for k in ["youtube music", "liked songs", "music playlist", "prime416"]):
-        return "YouTube Music Playlist Sync and Discovery"
-    elif any(k in low for k in ["google sheet", "sheets api", "push friends to sheets"]):
-        return "Google Sheets Friends and Family Sync"
-    elif any(k in low for k in ["openmessage", "sms", "rcs", "google message"]):
-        return "Google Messages RCS and SMS Integration"
-    elif any(k in low for k in ["d&d", "dungeons and dragons", "tabletop", "campaign lore"]):
-        return "Dungeons and Dragons Lore and Notes"
-    elif any(k in low for k in ["memory doctor", "doctor audit", "audit sidecar"]):
-        return "Homelab Memory Store Health and Audit"
-    elif any(k in low for k in ["reboot", "restart", "beacon", "in-flight"]):
-        return "Bridge Lifecycle and Restart Architecture Engine"
-    elif any(k in low for k in ["baseball", "big board", "stat blast", "scrapegurus"]):
-        return "Baseball Analytics and Big Board Scraping"
-    elif any(k in low for k in ["thread naming", "naming triggers", "auto-rename", "threaded convos"]):
-        return "Thread Naming and Escalation Timeout Tuning"
+    for keywords, domain_title in _THREAD_TITLE_DOMAIN_RULES:
+        if any(k in low for k in keywords):
+            return domain_title
 
     stopwords = {
         "ok", "so", "heres", "here", "a", "an", "the", "new", "issue", "problem",
@@ -964,11 +973,11 @@ def generate_concise_thread_title(prompt: str, target_words: int = 6) -> str:
 
     if len(meaningful) >= 4:
         return " ".join(meaningful[:target_words])
-    elif meaningful:
+    if meaningful:
         context_words = [w.capitalize() for w in words if len(w) > 1 and w.capitalize() not in meaningful]
         combined = meaningful + context_words
         return " ".join(combined[:target_words])
-    elif words:
+    if words:
         return " ".join([w.capitalize() for w in words[:target_words]])
     return "General Task Execution"
 
@@ -1180,6 +1189,22 @@ def format_steering_prompt(
     )
 
 
+_PUSH_PREVIEW_STRIP_RULES: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"^(\s*)(?:>{1,3}\s*)?#{1,6}\s+"), r"\1"),
+    (re.compile(r"^(\s*)>{1,3}\s+"), r"\1"),
+    (re.compile(r"\[(?!GIF\])([^\[\]]+)\]\(\s*<?https?://[^)\s>]+>?\s*\)", re.IGNORECASE), r"\1"),
+    (re.compile(r"<(https?://[^\s>]+)>"), r"\1"),
+    (re.compile(r"`([^`\n]+)`"), r"\1"),
+    (re.compile(r"\*\*\*([^\*\n]+)\*\*\*"), r"\1"),
+    (re.compile(r"\*\*([^\*\n]+)\*\*"), r"\1"),
+    (re.compile(r"__([^_\n]+)__"), r"\1"),
+    (re.compile(r"~~([^~\n]+)~~"), r"\1"),
+    (re.compile(r"(?<!\*)\*([^\*\s][^\*\n]*?[^\*\s]|[^\*\s])\*(?!\*)"), r"\1"),
+)
+_PUSH_PREVIEW_GIF_RE = re.compile(r"^\s*\[GIF\]\(https?://[^\s)]+\)\s*$", re.IGNORECASE)
+_PUSH_PREVIEW_HR_RE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+
+
 def strip_markdown_for_push_preview(text: str, preview_chars: int = 280) -> str:
     """
     Strip Markdown formatting tokens (**, *, __, ~~, `, ###, and [label](<url>)) from the
@@ -1214,40 +1239,17 @@ def strip_markdown_for_push_preview(text: str, preview_chars: int = 280) -> str:
     cleaned_head: list[str] = []
     for line in head_lines:
         # Preserve [GIF](...) lines untouched so Discord unfurls embeds immediately on POST
-        if re.match(r"^\s*\[GIF\]\(https?://[^\s)]+\)\s*$", line, flags=re.IGNORECASE):
+        if _PUSH_PREVIEW_GIF_RE.match(line):
             cleaned_head.append(line)
             continue
 
-        # 1. Strip leading horizontal rules (---, ***, ___) so push previews don't lead with "---"
-        if re.match(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$", line):
+        # Strip leading horizontal rules (---, ***, ___) so push previews don't lead with "---"
+        if _PUSH_PREVIEW_HR_RE.match(line):
             continue
 
         s = line
-        # 2. Strip leading markdown headers (#, ##, ###) and blockquotes (>)
-        s = re.sub(r"^(\s*)(?:>{1,3}\s*)?#{1,6}\s+", r"\1", s)
-        s = re.sub(r"^(\s*)>{1,3}\s+", r"\1", s)
-
-        # 3. Convert markdown hyperlinks [label](<url>) or [label](url) (except [GIF]) to plain label
-        s = re.sub(
-            r"\[(?!GIF\])([^\[\]]+)\]\(\s*<?https?://[^)\s>]+>?\s*\)",
-            r"\1",
-            s,
-            flags=re.IGNORECASE,
-        )
-
-        # 4. Unwrap angle-bracketed bare URLs <https://...> -> https://...
-        s = re.sub(r"<(https?://[^\s>]+)>", r"\1", s)
-
-        # 5. Strip inline code backticks `code` -> code
-        s = re.sub(r"`([^`\n]+)`", r"\1", s)
-
-        # 6. Strip bold/italic/strikethrough/underline wrappers (**, __, ~~, *)
-        s = re.sub(r"\*\*\*([^\*\n]+)\*\*\*", r"\1", s)
-        s = re.sub(r"\*\*([^\*\n]+)\*\*", r"\1", s)
-        s = re.sub(r"__([^_\n]+)__", r"\1", s)
-        s = re.sub(r"~~([^~\n]+)~~", r"\1", s)
-        # Single asterisk italic (avoiding bullet hyphens/asterisks at start of line)
-        s = re.sub(r"(?<!\*)\*([^\*\s][^\*\n]*?[^\*\s]|[^\*\s])\*(?!\*)", r"\1", s)
+        for pat, repl in _PUSH_PREVIEW_STRIP_RULES:
+            s = pat.sub(repl, s)
 
         cleaned_head.append(s)
 
