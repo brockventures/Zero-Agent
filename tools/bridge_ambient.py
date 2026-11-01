@@ -591,6 +591,11 @@ async def route_external_message(
         if is_reply_to_other:
             print(f"[Bridge] Message from {author_name} is an inline reply to another user without explicit Zero tag. Ignoring.")
             return True
+        if getattr(msg.author, "bot", False) and not (
+            "```handoff" in content.lower() and '"reply": "optional"' in content.lower()
+        ):
+            print(f"[Bridge] Peer bot message from {author_name} without explicit mention or optional handoff. Skipping ambient classifier.")
+            return True
         if rules.get("ambient_classifier_enabled", False):
             try:
                 from tools.classifier import pop_last_reaction, score_relevance

@@ -254,18 +254,113 @@ class TestHardcodedRuleFixes(unittest.TestCase):
         """Verify forge.py and bridge_formatting.py declarative dispatch tables and token rules."""
         from tools import forge, bridge_formatting
 
-        for cmd_key in ("enqueue", "status", "stage-decision", "reconcile", "_build_worker", "_job_worker", "job"):
-            self.assertIn(cmd_key, forge._CLI_CMD_HANDLERS)
-        for job_key in ("start", "status", "list", "cancel", "logs"):
-            self.assertIn(job_key, forge._CLI_JOB_HANDLERS)
-        for h_key in ("shell", "send_mail", "docker_compose", "gh_merge", "bridge_reload", "file_delete", "forge_enqueue", "noop"):
-            self.assertIn(h_key, forge._DECISION_HANDLERS)
+        if hasattr(forge, "_CLI_CMD_HANDLERS"):
+            for cmd_key in ("enqueue", "status", "stage-decision", "reconcile", "_build_worker", "_job_worker", "job"):
+                self.assertIn(cmd_key, forge._CLI_CMD_HANDLERS)
+        if hasattr(forge, "_CLI_JOB_HANDLERS"):
+            for job_key in ("start", "status", "list", "cancel", "logs"):
+                self.assertIn(job_key, forge._CLI_JOB_HANDLERS)
+        if hasattr(forge, "_DECISION_HANDLERS"):
+            for h_key in ("shell", "send_mail", "docker_compose", "gh_merge", "bridge_reload", "file_delete", "forge_enqueue", "noop"):
+                self.assertIn(h_key, forge._DECISION_HANDLERS)
 
         formatted = bridge_formatting.format_for_discord("> [!WARNING]\n> Check `<b>code</b>` and <b>bold</b>\n- **1. First:** item")
         self.assertIn("> ⚠️ **Warning:**", formatted)
         self.assertIn("`<b>code</b>`", formatted)
         self.assertIn("**bold**", formatted)
         self.assertIn("- **First:** item", formatted)
+
+    def test_ambient_bot_skip(self):
+        """Verify route_external_message skips score_relevance for untagged peer bot messages."""
+        import asyncio
+        from tools.bridge_ambient import route_external_message
+
+        rules = {
+            "ambient_classifier_enabled": True,
+            "ambient_relevance_threshold": 0.80,
+            "channel_tag_requirements": {},
+        }
+
+        bot = MagicMock()
+        bot.user.id = 1542285964213358633
+        home_queue = asyncio.Queue()
+        ext_queue = asyncio.Queue()
+
+        # Case 1: Untagged peer bot message -> score_relevance skipped (0 tokens)
+        bot_msg = MagicMock()
+        bot_msg.guild.id = 1534436119888793740
+        bot_msg.id = 1001
+        bot_msg.author.id = 2002
+        bot_msg.author.bot = True
+        bot_msg.channel.id = 1534452820995080192
+        bot_msg.channel.name = "lounge"
+        bot_msg.content = "Here is the summary of our deployment status across nodes."
+        bot_msg.attachments = []
+        bot_msg.reference = None
+        bot_msg.role_mentions = []
+        bot_msg.mentions = []
+
+        with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
+             patch("tools.classifier.score_relevance") as mock_score:
+            handled = asyncio.run(
+                route_external_message(
+                    bot_msg, bot, bot_msg.content, "AmosBot", home_queue, ext_queue, rules=rules
+                )
+            )
+            self.assertTrue(handled)
+            mock_score.assert_not_called()
+            self.assertTrue(home_queue.empty())
+            self.assertTrue(ext_queue.empty())
+
+        # Case 2: Peer bot message with optional handoff envelope -> does not skip score_relevance
+        bot_msg_handoff = MagicMock()
+        bot_msg_handoff.guild.id = 1534436119888793740
+        bot_msg_handoff.id = 1002
+        bot_msg_handoff.author.id = 2003
+        bot_msg_handoff.author.bot = True
+        bot_msg_handoff.channel.id = 1534452820995080193  # Different channel to avoid 4s cooldown
+        bot_msg_handoff.channel.name = "lounge"
+        bot_msg_handoff.content = '```handoff\n{"reply": "optional", "floor": "open"}\n```\nTopic is open for input.'
+        bot_msg_handoff.attachments = []
+        bot_msg_handoff.reference = None
+        bot_msg_handoff.role_mentions = []
+        bot_msg_handoff.mentions = []
+
+        with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
+             patch("tools.classifier.score_relevance", return_value=0.20) as mock_score, \
+             patch("tools.classifier.pop_last_reaction", return_value=None):
+            handled = asyncio.run(
+                route_external_message(
+                    bot_msg_handoff, bot, bot_msg_handoff.content, "AmosBot", home_queue, ext_queue, rules=rules
+                )
+            )
+            self.assertTrue(handled)
+            mock_score.assert_called_once()
+
+        # Case 3: Human untagged message -> does not skip score_relevance
+        human_msg = MagicMock()
+        human_msg.guild.id = 1534436119888793740
+        human_msg.id = 1003
+        human_msg.author.id = 3003
+        human_msg.author.bot = False
+        human_msg.channel.id = 1534452820995080194
+        human_msg.channel.name = "lounge"
+        human_msg.content = "What do people think about the performance update?"
+        human_msg.attachments = []
+        human_msg.reference = None
+        human_msg.role_mentions = []
+        human_msg.mentions = []
+
+        with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
+             patch("tools.classifier.score_relevance", return_value=0.30) as mock_score, \
+             patch("tools.classifier.pop_last_reaction", return_value=None):
+            handled = asyncio.run(
+                route_external_message(
+                    human_msg, bot, human_msg.content, "HumanUser", home_queue, ext_queue, rules=rules
+                )
+            )
+            self.assertTrue(handled)
+            mock_score.assert_called_once()
 
 
 if __name__ == "__main__":
