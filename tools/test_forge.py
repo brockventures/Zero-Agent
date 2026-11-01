@@ -2755,5 +2755,149 @@ def test_enqueue_build_clears_offload_dispatched_on_exception(tmp_path):
     assert state_data.get("offload_kind") == ""
 
 
+def test_record_forge_telemetry(tmp_path, monkeypatch):
+    """Verify that FORGE worker and reviewer token telemetry is recorded into token_usage with parent_channel_name='forge' and mode='forge', and stored in chunk/build metadata."""
+    import sqlite3
+    import tools.forge as forge_mod
+
+    telemetry_db = tmp_path / "telemetry.db"
+    forge_db = tmp_path / "forge.db"
+    forge_mod.init_forge_db(forge_db)
+
+    # 1. Mock extract_sqlite_step_tokens to verify exact token recording for a worker invocation
+    mock_step_tokens = {
+        1: {
+            "input_tokens": 4200,
+            "output_tokens": 350,
+            "thinking_tokens": 120,
+            "cache_read_tokens": 300,
+            "total_tokens": 4550,
+        },
+        3: {
+            "input_tokens": 1000,
+            "output_tokens": 150,
+            "thinking_tokens": 30,
+            "cache_read_tokens": 0,
+            "total_tokens": 1150,
+        },
+    }
+
+    import tools.backfill_telemetry as bt
+    monkeypatch.setattr(bt, "extract_sqlite_step_tokens", lambda cid: mock_step_tokens)
+
+    worker_res = forge_mod.record_forge_telemetry(
+        build_id="bg-alpha",
+        chunk_id="chk-001",
+        conv_id="conv-vulcan-worker-abc",
+        model="gemini-3.8-flash-high",
+        role="worker",
+        elapsed_s=14.2,
+        db_path=telemetry_db,
+    )
+
+    assert worker_res["input_tokens"] == 5200
+    assert worker_res["output_tokens"] == 500
+    assert worker_res["cache_read_tokens"] == 300
+    assert worker_res["thinking_tokens"] == 150
+    assert worker_res["total_tokens"] == 5700
+    assert worker_res["role"] == "worker"
+    assert worker_res["model"] == "gemini-3.8-flash-high"
+    assert worker_res["channel_name"] == "forge:bg-alpha:chk-001:worker"
+    assert worker_res["parent_channel_name"] == "forge"
+    assert worker_res["mode"] == "forge"
+    assert worker_res["conv_id"] == "conv-vulcan-worker-abc"
+
+    # 2. Verify fallback estimation when conv_id is None (e.g. Maker-Checker reviewer invocation)
+    review_res = forge_mod.record_forge_telemetry(
+        build_id="bg-alpha",
+        chunk_id="chk-001",
+        conv_id=None,
+        model="gemini-3.8-flash-high",
+        role="reviewer",
+        elapsed_s=6.5,
+        db_path=telemetry_db,
+    )
+
+    assert review_res["role"] == "reviewer"
+    assert review_res["channel_name"] == "forge:bg-alpha:chk-001:reviewer"
+    assert review_res["parent_channel_name"] == "forge"
+    assert review_res["mode"] == "forge"
+    assert review_res["conv_id"] == "forge-bg-alpha-chk-001"
+    assert review_res["total_tokens"] > 0
+    assert review_res["input_tokens"] > 0
+    assert review_res["output_tokens"] > 0
+
+    # 3. Verify SQLite token_usage rows in telemetry_db
+    with sqlite3.connect(str(telemetry_db)) as tconn:
+        tconn.row_factory = sqlite3.Row
+        rows = tconn.execute(
+            "SELECT * FROM token_usage WHERE parent_channel_name = 'forge' AND mode = 'forge' ORDER BY id ASC"
+        ).fetchall()
+
+    assert len(rows) == 2
+
+    # Worker row
+    w_row = rows[0]
+    assert w_row["channel_id"] == forge_mod.FORGE_CHANNEL_ID
+    assert w_row["channel_name"] == "forge:bg-alpha:chk-001:worker"
+    assert w_row["parent_channel_name"] == "forge"
+    assert w_row["mode"] == "forge"
+    assert w_row["conv_id"] == "conv-vulcan-worker-abc"
+    assert w_row["input_tokens"] == 5200
+    assert w_row["output_tokens"] == 500
+    assert w_row["cache_read_tokens"] == 300
+    assert w_row["thinking_tokens"] == 150
+    assert w_row["total_tokens"] == 5700
+    assert w_row["is_backfill"] == 0
+
+    # Reviewer row
+    r_row = rows[1]
+    assert r_row["channel_id"] == forge_mod.FORGE_CHANNEL_ID
+    assert r_row["channel_name"] == "forge:bg-alpha:chk-001:reviewer"
+    assert r_row["parent_channel_name"] == "forge"
+    assert r_row["mode"] == "forge"
+    assert r_row["conv_id"] == "forge-bg-alpha-chk-001"
+    assert r_row["total_tokens"] == review_res["total_tokens"]
+
+    # 4. Verify storing cumulative token stats in chunk & build metadata
+    with sqlite3.connect(str(forge_db)) as fconn:
+        now_ts = 1700000000.0
+        fconn.execute(
+            """
+            INSERT INTO forge_builds (id, title, origin_channel_id, created_at, updated_at)
+            VALUES ('bg-alpha', 'Test Build', 1562899941595160657, ?, ?)
+            """,
+            (now_ts, now_ts),
+        )
+        fconn.execute(
+            """
+            INSERT INTO forge_chunks (id, build_id, chunk_index, title, instructions)
+            VALUES ('chk-001', 'bg-alpha', 0, 'Test Chunk', 'Do work')
+            """
+        )
+        fconn.commit()
+
+    forge_mod.update_chunk_and_build_tokens("bg-alpha", "chk-001", worker_res, db_path=forge_db)
+    forge_mod.update_chunk_and_build_tokens("bg-alpha", "chk-001", review_res, db_path=forge_db)
+
+    with sqlite3.connect(str(forge_db)) as fconn:
+        fconn.row_factory = sqlite3.Row
+        c_row = fconn.execute("SELECT * FROM forge_chunks WHERE id = 'chk-001'").fetchone()
+        b_row = fconn.execute("SELECT * FROM forge_builds WHERE id = 'bg-alpha'").fetchone()
+
+    expected_total = worker_res["total_tokens"] + review_res["total_tokens"]
+    assert c_row["total_tokens"] == expected_total
+    assert b_row["total_tokens"] == expected_total
+
+    c_meta = json.loads(c_row["tokens_json"])
+    assert c_meta["total_tokens"] == expected_total
+    assert len(c_meta["history"]) == 2
+    assert c_meta["history"][0]["role"] == "worker"
+    assert c_meta["history"][1]["role"] == "reviewer"
+
+    b_meta = json.loads(b_row["tokens_json"])
+    assert b_meta["total_tokens"] == expected_total
+
+
 if __name__ == "__main__":
     unittest.main()
