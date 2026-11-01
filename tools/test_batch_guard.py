@@ -2,12 +2,19 @@ import unittest
 import unittest.mock
 import os
 import sys
+import json
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _HOOKS_DIR = os.path.join(_REPO_ROOT, ".agents", "hooks")
 sys.path.insert(0, _HOOKS_DIR if os.path.isdir(_HOOKS_DIR) else "/workspace/.agents/hooks")
 sys.path.insert(0, _REPO_ROOT)
 from batch_guard import check_batching, check_tool_use, STATE_FILE, load_state
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolate_forge_worker_env(monkeypatch):
+    monkeypatch.delenv("FORGE_WORKER_ACTIVE", raising=False)
 
 
 class TestBatchGuard(unittest.TestCase):
@@ -19,9 +26,17 @@ class TestBatchGuard(unittest.TestCase):
             os.remove(STATE_FILE)
         self._docker_patcher = unittest.mock.patch("shutil.which", return_value="/usr/bin/docker")
         self._docker_patcher.start()
+        self._env_patcher = unittest.mock.patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""})
+        self._env_patcher.start()
 
     def tearDown(self):
+        self._env_patcher.stop()
         self._docker_patcher.stop()
+        if os.path.exists("/workspace/scratch/forge_plan.json"):
+            try:
+                os.remove("/workspace/scratch/forge_plan.json")
+            except OSError:
+                pass
         if self._orig_state is not None:
             with open(STATE_FILE, "w") as f:
                 f.write(self._orig_state)
@@ -279,15 +294,39 @@ class TestBatchGuard(unittest.TestCase):
         )
 
         # Enqueueing a FORGE plan activates the Post-Offload Turn Lock so the agent must end its turn
-        self.assertTrue(
-            check_tool_use(
-                "run_command",
-                {"CommandLine": "python3 /workspace/tools/forge.py enqueue /workspace/scratch/forge_plan.json"},
-            )[0]
-        )
-        allowed_after_enqueue, lock_reason = check_tool_use("edit_file", {"Path": "/workspace/tools/epsilon.py"})
-        self.assertFalse(allowed_after_enqueue)
-        self.assertIn("FORGE Post-Offload Turn Lock Triggered", lock_reason)
+        plan_path = "/workspace/scratch/forge_plan.json"
+        valid_plan = {
+            "title": "Valid Tier2 Plan",
+            "origin_channel_id": "123456789",
+            "repo": "/workspace",
+            "context_fact_sheet": ["Fact 1"],
+            "chunks": [
+                {
+                    "chunk_id": "c0",
+                    "title": "Chunk 0",
+                    "instructions": "Implement feature and tests deterministically",
+                    "target_files": ["tools/test_batch_guard.py"],
+                    "target_symbols": ["TestBatchGuard"],
+                    "verification_gate": "pytest tools/test_batch_guard.py",
+                }
+            ],
+        }
+        os.makedirs(os.path.dirname(plan_path), exist_ok=True)
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(valid_plan, f)
+        try:
+            self.assertTrue(
+                check_tool_use(
+                    "run_command",
+                    {"CommandLine": f"python3 /workspace/tools/forge.py enqueue {plan_path}"},
+                )[0]
+            )
+            allowed_after_enqueue, lock_reason = check_tool_use("edit_file", {"Path": "/workspace/tools/epsilon.py"})
+            self.assertFalse(allowed_after_enqueue)
+            self.assertIn("FORGE Post-Offload Turn Lock Triggered", lock_reason)
+        finally:
+            if os.path.exists(plan_path):
+                os.remove(plan_path)
 
     def test_45s_idle_reset_preserves_inline_prod_files_until_15m_expiry(self):
         from unittest.mock import patch
@@ -641,12 +680,53 @@ def test_invalid_forge_plan_does_not_lock_turn_and_outbox_allowed_after_enqueue(
         state_file=state_file,
     )
     assert ok1 is True
+    st_bad = load_state(state_file)
+    assert st_bad.get("offload_dispatched") is False
     ok_fix, reason_fix = check_tool_use(
         "write_file",
         {"Path": str(bad_plan), "Content": "{}"},
         state_file=state_file,
     )
     assert ok_fix is True, f"Expected write_file after invalid plan not to be locked, got: {reason_fix}"
+
+    # 1b. Enqueue with missing plan file on disk does not set offload_dispatched
+    missing_plan = tmp_path / "missing_plan.json"
+    ok_miss, _ = check_tool_use(
+        "run_command",
+        {"CommandLine": f"python3 /workspace/tools/forge.py enqueue {missing_plan}"},
+        state_file=state_file,
+    )
+    assert ok_miss is True
+    st_miss = load_state(state_file)
+    assert st_miss.get("offload_dispatched") is False
+    ok_edit_miss, reason_miss = check_tool_use(
+        "edit_file",
+        {"Path": "/workspace/tools/alpha.py"},
+        state_file=state_file,
+    )
+    assert ok_edit_miss is True, f"Expected edit_file after missing plan not to be locked, got: {reason_miss}"
+
+    # 1c. Inline shell generation with cat << EOF ... && forge.py enqueue does not set offload_dispatched
+    inline_cmd = (
+        f"cat << 'EOF' > {bad_plan}\n"
+        f'{{"title": "Inline Plan"}}\n'
+        f"EOF\n"
+        f"python3 /workspace/tools/forge.py enqueue {bad_plan}"
+    )
+    ok_inline, _ = check_tool_use(
+        "run_command",
+        {"CommandLine": inline_cmd},
+        state_file=state_file,
+    )
+    assert ok_inline is True
+    st_inline = load_state(state_file)
+    assert st_inline.get("offload_dispatched") is False
+    ok_edit_inline, reason_inline = check_tool_use(
+        "edit_file",
+        {"Path": "/workspace/tools/alpha.py"},
+        state_file=state_file,
+    )
+    assert ok_edit_inline is True, f"Expected edit_file after inline shell gen not to be locked, got: {reason_inline}"
 
     # 2. Plan with shared_context instead of context_fact_sheet passes validate_forge_plan
     valid_plan = {
@@ -665,14 +745,28 @@ def test_invalid_forge_plan_does_not_lock_turn_and_outbox_allowed_after_enqueue(
     is_valid, val_msg = validate_forge_plan(valid_plan)
     assert is_valid is True, f"Expected shared_context fallback to validate, got: {val_msg}"
 
-    # 3. Once a valid enqueue sets offload_dispatched, outbox.py is still allowed
+    # 3. Once a valid pre-existing enqueue sets offload_dispatched, turn is locked but outbox.py is still allowed
     good_plan = tmp_path / "good_plan.json"
     good_plan.write_text(json.dumps(valid_plan), encoding="utf-8")
-    check_tool_use(
+    ok_good, _ = check_tool_use(
         "run_command",
         {"CommandLine": f"python3 /workspace/tools/forge.py enqueue {good_plan}"},
         state_file=state_file,
     )
+    assert ok_good is True
+    st_good = load_state(state_file)
+    assert st_good.get("offload_dispatched") is True
+
+    # Mutating tool calls are now locked by Post-Offload Turn Lock
+    ok_locked, lock_reason = check_tool_use(
+        "edit_file",
+        {"Path": "/workspace/tools/beta.py"},
+        state_file=state_file,
+    )
+    assert ok_locked is False
+    assert "FORGE Post-Offload Turn Lock Triggered" in lock_reason
+
+    # Outbox.py is exempt from the Post-Offload Turn Lock
     ok_outbox, reason_outbox = check_tool_use(
         "run_command",
         {"CommandLine": 'python3 /workspace/tools/outbox.py --channel zero-ops --message "test" --force && python3 /workspace/tools/outbox.py --flush'},

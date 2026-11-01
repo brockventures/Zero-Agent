@@ -1010,23 +1010,61 @@ def check_tool_use(
         )
         is_no_synthesize_probe = bool(is_forge_job_start and "--no-synthesize" in cmd)
         if is_forge_enqueue:
-            state["inline_prod_files"] = []
-            plan_ok = True
-            m_plan = re.search(r"\bforge\.py\s+enqueue\s+(?:--[a-zA-Z0-9_-]+\s+)*(['\"]?)([^\s;\"'|&>]+)\1", cmd)
-            if m_plan:
-                raw_pf = m_plan.group(2)
-                abs_pf = os.path.abspath(os.path.join(cwd or "/workspace", raw_pf))
-                if os.path.exists(abs_pf):
-                    try:
-                        with open(abs_pf, "r", encoding="utf-8") as pf:
-                            pdata = json.load(pf)
-                        if not isinstance(pdata, dict) or not pdata.get("title") or not pdata.get("chunks"):
-                            plan_ok = False
-                        elif not (pdata.get("context_fact_sheet") or pdata.get("shared_context") or pdata.get("facts") or pdata.get("objective")):
-                            plan_ok = False
-                    except Exception:
-                        plan_ok = False
+            plan_ok = False
+            m_enq = re.search(r"\bforge\.py\s+enqueue\b", cmd)
+            cmd_before = cmd[: m_enq.start()] if m_enq else ""
+            has_preceding_shell_gen = bool(
+                re.search(r"(?:<<|>>?|\b(?:cat|echo|printf|tee|python3?|cp|mv)\b)[^;&|\n]*[;&|\n]", cmd_before, re.DOTALL)
+            )
+            if not has_preceding_shell_gen:
+                m_plan = re.search(
+                    r"\bforge\.py\s+enqueue\s+(?:--[a-zA-Z0-9_-]+(?:\s+[^\s;\"'|&>]+)?\s+)*(?:\"([^\"]+)\"|'([^']+)'|([^\s;\"'|&>]+))",
+                    cmd,
+                )
+                if m_plan:
+                    raw_pf = m_plan.group(1) or m_plan.group(2) or m_plan.group(3) or ""
+                    if raw_pf and not raw_pf.startswith("-"):
+                        abs_pf = os.path.abspath(os.path.join(cwd or "/workspace", raw_pf))
+                        if os.path.isfile(abs_pf):
+                            try:
+                                with open(abs_pf, "r", encoding="utf-8") as pf:
+                                    pdata = json.load(pf)
+                                if isinstance(pdata, dict):
+                                    val_fn = None
+                                    try:
+                                        from tools.forge import validate_forge_plan
+                                        val_fn = validate_forge_plan
+                                    except Exception:
+                                        try:
+                                            _repo_root = os.path.abspath(
+                                                os.path.join(os.path.dirname(__file__), "..", "..")
+                                            )
+                                            if _repo_root not in sys.path:
+                                                sys.path.insert(0, _repo_root)
+                                            from tools.forge import validate_forge_plan
+                                            val_fn = validate_forge_plan
+                                        except Exception:
+                                            val_fn = None
+
+                                    if callable(val_fn):
+                                        is_valid, _ = val_fn(pdata)
+                                        plan_ok = bool(is_valid)
+                                    else:
+                                        if not pdata.get("title") or not pdata.get("chunks"):
+                                            plan_ok = False
+                                        elif not (
+                                            pdata.get("context_fact_sheet")
+                                            or pdata.get("shared_context")
+                                            or pdata.get("facts")
+                                            or pdata.get("objective")
+                                        ):
+                                            plan_ok = False
+                                        else:
+                                            plan_ok = True
+                            except Exception:
+                                plan_ok = False
             if plan_ok:
+                state["inline_prod_files"] = []
                 state["offload_dispatched"] = True
                 state["offload_kind"] = "FORGE multi-chunk build (forge.py enqueue)"
         elif is_forge_stage_decision:
