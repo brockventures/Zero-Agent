@@ -20,9 +20,12 @@ from pathlib import Path
 import urllib.parse
 from zoneinfo import ZoneInfo
 
+CURRENT_DIR = Path(__file__).resolve().parent.parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
 WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE))
+    sys.path.append(str(WORKSPACE))
 
 try:
     import tools.zero_dashboard as zero_dashboard
@@ -927,7 +930,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         elif clean_path in ("/api/avatar", "/avatar.png", "/zero_avatar.png"):
             code = 200
             content_type = "image/png"
-        elif clean_path in ("/api/telemetry", "/api/context", "/api/sessions"):
+        elif clean_path in ("/api/telemetry", "/api/context", "/api/sessions", "/api/vulcan", "/api/forge"):
             code = 200
             content_type = "application/json"
         elif clean_path in ("/api/health", "/health", "/api/status", "/status"):
@@ -1296,6 +1299,22 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 status_code = 500
             body = json.dumps(payload).encode("utf-8")
             content_type = "application/json"
+
+        # 3c. Vulcan & FORGE Build Queue API
+        elif clean_path in ("/api/vulcan", "/api/forge"):
+            limit = 30
+            try:
+                limit = int(query_params.get("limit", ["30"])[0])
+            except (ValueError, TypeError):
+                limit = 30
+            zd = _get_zero_dashboard()
+            if zd and hasattr(zd, "get_vulcan_forge_payload"):
+                payload = zd.get_vulcan_forge_payload(limit=limit)
+            else:
+                payload = {"error": "zero_dashboard.get_vulcan_forge_payload unavailable"}
+            body = json.dumps(payload, indent=2).encode("utf-8")
+            content_type = "application/json"
+            status_code = 200
 
         # 4. Health JSON Endpoint
         elif clean_path in ("/api/health", "/health", "/api/status", "/status"):
