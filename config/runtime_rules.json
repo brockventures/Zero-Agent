@@ -81,13 +81,14 @@
     "gif_diversity": {
         "enabled": true,
         "canonical_only": true,
-        "default_cooldown_turns": 4,
+        "default_cooldown_turns": 2,
         "franchise_cooldowns": {
-            "curb_your_enthusiasm": 6,
-            "silicon_valley": 4,
-            "seinfeld": 4,
-            "reaction_classics": 3,
-            "brooklyn_nine_nine": 6
+            "arrested_development": 3,
+            "curb_your_enthusiasm": 3,
+            "silicon_valley": 2,
+            "seinfeld": 2,
+            "reaction_classics": 1,
+            "brooklyn_nine_nine": 3
         },
         "quarantined_franchises": [],
         "rotation_pool": [
