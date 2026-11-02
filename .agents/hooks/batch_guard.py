@@ -262,7 +262,44 @@ def _get_current_turn_Step_anchor(
     return ":".join(parts)
 
 
-def _get_in_flight_channel_id(in_flight_file: str = IN_FLIGHT_TURN_FILE) -> int | str | None:
+def _has_conv_id(turn_anchor: str, in_flight_file: str | None = None, agy_pid: int | None = None) -> bool:
+    """Check whether turn_anchor contains a conversation ID."""
+    if not turn_anchor:
+        return False
+    parts = str(turn_anchor).split(":")
+    if len(parts) >= 2:
+        cand = parts[1]
+        # Standard conversation ID: non-empty, not purely digits, and not a step index
+        if cand and not cand.isdigit() and not re.match(r"^s\d+$", cand):
+            return True
+    if in_flight_file and os.path.exists(in_flight_file):
+        try:
+            with open(in_flight_file, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                matched = None
+                env_ch = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
+                if env_ch and isinstance(data.get(env_ch), dict):
+                    matched = data[env_ch]
+                if matched is None and agy_pid is not None:
+                    for v in data.values():
+                        if isinstance(v, dict) and v.get("pid") == agy_pid:
+                            matched = v
+                            break
+                if matched is None:
+                    dict_entries = [v for v in data.values() if isinstance(v, dict) and ("prompt" in v or "ts" in v or "status_msg_id" in v)]
+                    if len(dict_entries) == 1:
+                        matched = dict_entries[0]
+                if matched is None and ("prompt" in data or "ts" in data or "status_msg_id" in data):
+                    matched = data
+                if isinstance(matched, dict) and matched.get("conv_id"):
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _get_in_flight_channel_id(in_flight_file: str = IN_FLIGHT_TURN_FILE, agy_pid: int | None = None) -> int | str | None:
     """Extract active channel ID from in_flight_turn.json if present."""
     if not in_flight_file or not os.path.exists(in_flight_file):
         return None
@@ -272,7 +309,8 @@ def _get_in_flight_channel_id(in_flight_file: str = IN_FLIGHT_TURN_FILE) -> int 
         if not isinstance(data, dict) or not data:
             return None
 
-        agy_pid = _get_agy_ancestor_pid()
+        if agy_pid is None:
+            agy_pid = _get_agy_ancestor_pid()
 
         # 1. Match ancestor PID in nested dicts
         for k, v in data.items():
@@ -366,6 +404,7 @@ def check_interactive_investigation_gate(
     cwd: str = "/workspace",
     now: float = 0.0,
     in_flight_file: str = IN_FLIGHT_TURN_FILE,
+    agy_pid: int | None = None,
 ) -> tuple[bool, str]:
     """Check deterministic tool-step/elapsed-time gate for interactive Discord bridge turns.
 
@@ -385,7 +424,7 @@ def check_interactive_investigation_gate(
     if not in_flight_file or not os.path.exists(in_flight_file):
         return True, ""
 
-    channel_id = _get_in_flight_channel_id(in_flight_file)
+    channel_id = _get_in_flight_channel_id(in_flight_file, agy_pid=agy_pid)
     if not channel_id or str(channel_id).strip() == FORGE_CHANNEL_ID_STR:
         return True, ""
 
@@ -421,25 +460,79 @@ def check_interactive_investigation_gate(
     return True, ""
 
 
-def load_state(state_file: str = STATE_FILE) -> dict:
+def load_state(state_file: str = STATE_FILE, session_id: str | None = None) -> dict:
     if os.path.exists(state_file):
         try:
             with open(state_file, "r") as f:
                 data = json.load(f)
-                base = _default_state(data.get("last_time", 0.0))
+            if isinstance(data, dict):
+                source = data
+                if session_id:
+                    sessions = data.get("sessions")
+                    if isinstance(sessions, dict) and session_id in sessions and isinstance(sessions[session_id], dict):
+                        source = sessions[session_id]
+                    else:
+                        fresh = _default_state(0.0)
+                        fresh["_session_id"] = session_id
+                        return fresh
+
+                base = _default_state(source.get("last_time", 0.0))
                 for k in base:
-                    if k in data:
-                        base[k] = data[k]
+                    if k in source:
+                        base[k] = source[k]
+                if session_id:
+                    base["_session_id"] = session_id
                 return base
         except Exception:
             pass
-    return _default_state(0.0)
+    fresh = _default_state(0.0)
+    if session_id:
+        fresh["_session_id"] = session_id
+    return fresh
 
 
-def save_state(state: dict, state_file: str = STATE_FILE):
+def save_state(state: dict, state_file: str = STATE_FILE, session_id: str | None = None):
     try:
+        data = {}
+        if os.path.exists(state_file):
+            try:
+                with open(state_file, "r") as f:
+                    content = json.load(f)
+                    if isinstance(content, dict):
+                        data = content
+            except Exception:
+                data = {}
+
+        sessions = data.get("sessions")
+        if not isinstance(sessions, dict):
+            sessions = {}
+
+        now_ts = time.time()
+        # Prune sessions older than TURN_STATE_EXPIRY_SECONDS
+        for s_key in list(sessions.keys()):
+            s_val = sessions.get(s_key)
+            if isinstance(s_val, dict):
+                s_last = float(s_val.get("last_time", 0.0) or s_val.get("turn_start_time", 0.0) or 0.0)
+                if s_last > 0.0 and (now_ts - s_last) > TURN_STATE_EXPIRY_SECONDS:
+                    sessions.pop(s_key, None)
+
+        sid = session_id or (state.get("_session_id") if isinstance(state, dict) else None)
+        if sid:
+            sess_copy = {k: v for k, v in state.items() if not k.startswith("_")}
+            sessions[str(sid)] = sess_copy
+
+        # Sync current state to top-level fields for backwards compatibility
+        for k, v in state.items():
+            if not k.startswith("_"):
+                data[k] = v
+        data["sessions"] = sessions
+
+        parent_dir = os.path.dirname(state_file)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+
         with open(state_file, "w") as f:
-            json.dump(state, f)
+            json.dump(data, f)
     except Exception:
         pass
 
@@ -1093,13 +1186,16 @@ def check_tool_use(
     cwd: str = "/workspace",
     in_flight_file: str | None = None,
     now: float | None = None,
+    agy_pid: int | None = None,
 ) -> tuple[bool, str]:
     if in_flight_file is None:
         in_flight_file = IN_FLIGHT_TURN_FILE
     if now is None or now <= 0.0:
         now = time.time()
-    state = load_state(state_file)
-    turn_anchor = _get_current_turn_Step_anchor(in_flight_file=in_flight_file)
+    turn_anchor = _get_current_turn_Step_anchor(agy_pid=agy_pid, in_flight_file=in_flight_file)
+    has_conv_id = _has_conv_id(turn_anchor, in_flight_file=in_flight_file, agy_pid=agy_pid)
+    session_id = ":".join(str(turn_anchor).split(":")[:2]) if has_conv_id else str(turn_anchor)
+    state = load_state(state_file, session_id=session_id)
     prev_anchor = str(state.get("agy_ppid") or "")
     idle_delta = now - state.get("last_time", 0.0)
 
@@ -1108,6 +1204,7 @@ def check_tool_use(
     # short-window consecutive anti-polling counters while preserving active turn-level FORGE gates.
     if (prev_anchor and prev_anchor != str(turn_anchor)) or idle_delta > TURN_STATE_EXPIRY_SECONDS or state.get("last_time", 0.0) == 0.0:
         state = _default_state(now)
+        state["_session_id"] = session_id
     elif idle_delta > TURN_RESET_IDLE_SECONDS:
         preserved_prod = list(state.get("inline_prod_files", []))
         preserved_sweeps = list(state.get("versioned_scratch_sweeps", []))
@@ -1120,6 +1217,7 @@ def check_tool_use(
         preserved_start = float(state.get("turn_start_time", now) or now)
         preserved_diag_steps = int(state.get("interactive_diag_steps", 0))
         state = _default_state(now)
+        state["_session_id"] = session_id
         state["inline_prod_files"] = preserved_prod
         state["versioned_scratch_sweeps"] = preserved_sweeps
         state["scratch_script_runs"] = preserved_runs
@@ -1142,6 +1240,7 @@ def check_tool_use(
             state["turn_start_time"] = now
     if not state.get("turn_start_time"):
         state["turn_start_time"] = now
+    state["_session_id"] = session_id
     state["agy_ppid"] = turn_anchor
     state["last_time"] = now
 
@@ -1181,6 +1280,7 @@ def check_tool_use(
             cwd=cwd,
             now=now,
             in_flight_file=in_flight_file,
+            agy_pid=agy_pid,
         )
         if not ok_gate:
             save_state(state, state_file)
@@ -1738,11 +1838,14 @@ def main():
         try:
             agy_pid = _get_agy_ancestor_pid()
             turn_anchor = _get_current_turn_Step_anchor(agy_pid)
-            st = load_state(STATE_FILE)
+            has_conv = _has_conv_id(turn_anchor, agy_pid=agy_pid)
+            sess_id = ":".join(str(turn_anchor).split(":")[:2]) if has_conv else str(turn_anchor)
+            st = load_state(STATE_FILE, session_id=sess_id)
             # Reset turn state when a new user turn / prompt arrives (turn_anchor changes)
             if st.get("agy_ppid") and str(st.get("agy_ppid")) != str(turn_anchor):
                 fresh = _default_state(time.time())
-                save_state(fresh, STATE_FILE)
+                fresh["_session_id"] = sess_id
+                save_state(fresh, STATE_FILE, session_id=sess_id)
                 if os.name == "nt":
                     _maybe_trigger_workstation_auto_wake(cwd)
             elif not st.get("agy_ppid"):
@@ -1751,14 +1854,15 @@ def main():
         except Exception:
             pass
 
-        allowed, reason = check_tool_use(name, args, cwd=cwd)
+        allowed, reason = check_tool_use(name, args, cwd=cwd, agy_pid=agy_pid)
         if not allowed:
             print(json.dumps({"decision": "deny", "reason": reason}))
             return
         try:
-            st_after = load_state(STATE_FILE)
+            st_after = load_state(STATE_FILE, session_id=sess_id)
             st_after["agy_ppid"] = _get_current_turn_Step_anchor(_get_agy_ancestor_pid())
-            save_state(st_after, STATE_FILE)
+            st_after["_session_id"] = sess_id
+            save_state(st_after, STATE_FILE, session_id=sess_id)
         except Exception:
             pass
 

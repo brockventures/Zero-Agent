@@ -1116,4 +1116,200 @@ def test_interactive_diag_steps_preserved_across_short_idle_resets(tmp_path):
         assert "Interactive Investigation Gate Triggered" in reason4
 
 
+def test_concurrent_turns_hook_state_isolated_per_session(tmp_path):
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        state_file = str(tmp_path / "bg_state.json")
+        in_flight = tmp_path / "in_flight.json"
+
+        t0 = 1_800_200_000.0
+        pid_ch1 = 12001
+        pid_ch2 = 12002
+        ch1_id = 1544955535722545253
+        ch2_id = 1544955535722545254
+
+        # Two active turns in concurrent channels with distinct conv_id and pid
+        in_flight_data = {
+            str(ch1_id): {
+                "channel_id": ch1_id,
+                "pid": pid_ch1,
+                "conv_id": "conv-channel-1",
+                "status_msg_id": 1001,
+                "attempts": 1,
+                "prompt": "Investigate DB contention in ch1",
+                "ts": t0,
+            },
+            str(ch2_id): {
+                "channel_id": ch2_id,
+                "pid": pid_ch2,
+                "conv_id": "conv-channel-2",
+                "status_msg_id": 2001,
+                "attempts": 1,
+                "prompt": "Investigate HA webhook failure in ch2",
+                "ts": t0,
+            },
+        }
+        in_flight.write_text(json.dumps(in_flight_data))
+
+        # Interleaved diagnostic steps across the two concurrent sessions:
+        # Step 1: Channel 1
+        ok1_1, r1_1 = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/ch1_step1.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 1.0,
+            agy_pid=pid_ch1,
+        )
+        assert ok1_1 is True, f"ch1 step 1 failed: {r1_1}"
+
+        # Step 1: Channel 2
+        ok2_1, r2_1 = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/ch2_step1.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 2.0,
+            agy_pid=pid_ch2,
+        )
+        assert ok2_1 is True, f"ch2 step 1 failed: {r2_1}"
+
+        # Step 2: Channel 1 (should NOT be reset by ch2's interleaved call)
+        ok1_2, r1_2 = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/ch1_step2.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 3.0,
+            agy_pid=pid_ch1,
+        )
+        assert ok1_2 is True, f"ch1 step 2 failed: {r1_2}"
+
+        # Step 2: Channel 2 (should NOT be reset by ch1's interleaved call)
+        ok2_2, r2_2 = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/ch2_step2.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 4.0,
+            agy_pid=pid_ch2,
+        )
+        assert ok2_2 is True, f"ch2 step 2 failed: {r2_2}"
+
+        # Step 3: Channel 1
+        ok1_3, r1_3 = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/ch1_step3.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 5.0,
+            agy_pid=pid_ch1,
+        )
+        assert ok1_3 is True, f"ch1 step 3 failed: {r1_3}"
+
+        # Step 3: Channel 2
+        ok2_3, r2_3 = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/ch2_step3.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 6.0,
+            agy_pid=pid_ch2,
+        )
+        assert ok2_3 is True, f"ch2 step 3 failed: {r2_3}"
+
+        # Step 4 for Channel 1 at t0 + 35.0 (elapsed > 30s): triggers gate!
+        ok1_4, r1_4 = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/ch1_step4.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 35.0,
+            agy_pid=pid_ch1,
+        )
+        assert ok1_4 is False
+        assert "Interactive Investigation Gate Triggered" in r1_4
+
+        # Channel 2 at t0 + 7.0 (elapsed 5s < 30s) is NOT gated by Channel 1's gate!
+        ok2_4, r2_4 = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/ch2_step4.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 7.0,
+            agy_pid=pid_ch2,
+        )
+        assert ok2_4 is True, f"ch2 step 4 should be allowed (<30s), got: {r2_4}"
+
+        # Channel 2 step 5 (allowed: hard limit is >5 steps)
+        ok2_5, r2_5 = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/ch2_step5.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 8.0,
+            agy_pid=pid_ch2,
+        )
+        assert ok2_5 is True, f"ch2 step 5 should be allowed (step 5 of 5), got: {r2_5}"
+
+        # Channel 2 step 6 (exceeds hard limit 5 steps): triggers gate!
+        ok2_6, r2_6 = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/ch2_step6.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 9.0,
+            agy_pid=pid_ch2,
+        )
+        assert ok2_6 is False
+        assert "Interactive Investigation Gate Triggered" in r2_6
+
+        # Verify state_file contains sessions map with both sessions
+        with open(state_file, "r") as f:
+            raw_state = json.load(f)
+        assert "sessions" in raw_state
+        sess1_key = f"{pid_ch1}:conv-channel-1"
+        sess2_key = f"{pid_ch2}:conv-channel-2"
+        assert sess1_key in raw_state["sessions"]
+        assert sess2_key in raw_state["sessions"]
+        assert raw_state["sessions"][sess1_key]["interactive_diag_steps"] == 4
+        assert raw_state["sessions"][sess2_key]["interactive_diag_steps"] == 6
+
+        # Verify load_state with session_id loads the respective counters
+        st1 = load_state(state_file, session_id=sess1_key)
+        assert st1["interactive_diag_steps"] == 4
+        st2 = load_state(state_file, session_id=sess2_key)
+        assert st2["interactive_diag_steps"] == 6
+
+
+def test_save_state_prunes_expired_sessions(tmp_path):
+    from unittest.mock import patch
+    from batch_guard import save_state, TURN_STATE_EXPIRY_SECONDS
+
+    state_file = str(tmp_path / "bg_state.json")
+    t0 = 1_800_000_000.0
+
+    with patch("time.time", return_value=t0):
+        # Save session A
+        st_a = {"last_time": t0, "interactive_diag_steps": 2}
+        save_state(st_a, state_file, session_id="sess_a")
+
+    # Save session B after TURN_STATE_EXPIRY_SECONDS + 10s
+    t1 = t0 + TURN_STATE_EXPIRY_SECONDS + 10.0
+    with patch("time.time", return_value=t1):
+        st_b = {"last_time": t1, "interactive_diag_steps": 1}
+        save_state(st_b, state_file, session_id="sess_b")
+
+    with open(state_file, "r") as f:
+        data = json.load(f)
+
+    assert "sess_b" in data["sessions"]
+    # sess_a must have been pruned because it is older than 900s
+    assert "sess_a" not in data["sessions"]
+    # Backwards-compatible top-level keys match most recent save
+    assert data["interactive_diag_steps"] == 1
+
+
+
 

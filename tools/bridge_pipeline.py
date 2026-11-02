@@ -451,14 +451,6 @@ def prepare_turn_prompt(
     eng_carry_block: str = "",
 ) -> str:
     """Format prompt with time context, gif cadence guidance, channel context, and air-gapped system prompts."""
-    # Reset per-turn batch_guard state at the start of every new user turn
-    try:
-        bg_state_path = Path("/tmp/batch_guard_state.json")
-        if bg_state_path.exists():
-            bg_state_path.unlink()
-    except Exception:
-        pass
-
     now_utc = datetime.now(timezone.utc)
     now_pt = now_utc.astimezone(PT_TZ)
     gif_guidance = get_gif_prompt_guidance(sess_key, channel_id=channel_id)
