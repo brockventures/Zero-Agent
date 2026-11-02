@@ -6,9 +6,14 @@ import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from pathlib import Path
 import sys
-if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+repo_root = str(Path(__file__).resolve().parent.parent)
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+elif sys.path[0] != repo_root:
+    sys.path.remove(repo_root)
+    sys.path.insert(0, repo_root)
 from tools.bridge_engine import TurnCoordinator
 
 
@@ -512,6 +517,35 @@ class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(format_active_presence_text())
         finally:
             channel_active_presence.clear()
+
+    def test_channel_active_reply_targets_lifecycle(self):
+        from tools.bridge_engine import (
+            channel_active_reply_targets,
+            unregister_active_presence,
+        )
+        import tools.bridge_runner as br
+
+        self.assertIs(br.channel_active_reply_targets, channel_active_reply_targets)
+
+        mock_target = MagicMock()
+        coord = TurnCoordinator(
+            channel_id=987654321,
+            prompt="Test active reply target",
+            mode="home",
+            reply_target=mock_target,
+            status_msg=None,
+            conv_id="conv-rt-1",
+        )
+        self.assertEqual(channel_active_reply_targets.get(987654321), mock_target)
+
+        # Teardown clears it
+        coord.teardown()
+        self.assertNotIn(987654321, channel_active_reply_targets)
+
+        # Unregister active presence also clears it
+        channel_active_reply_targets[987654321] = mock_target
+        unregister_active_presence(987654321)
+        self.assertNotIn(987654321, channel_active_reply_targets)
 
 
 if __name__ == "__main__":

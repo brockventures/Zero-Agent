@@ -56,6 +56,9 @@ channel_active_procs: dict[int, Any] = {}
 # Global active prompt map: channel_id -> prompt string (for mid-turn steering preservation)
 channel_active_prompts: dict[int, str] = {}
 
+# Global active reply target map: channel_id -> Message/Thread/Channel (for mid-turn steering preservation)
+channel_active_reply_targets: dict[int, Any] = {}
+
 # Global steering tracking: channel/thread IDs actively being steered mid-turn
 steering_channels: set[int] = set()
 
@@ -220,8 +223,10 @@ def register_active_presence(
 def unregister_active_presence(channel_id: int, thread_id: Optional[int] = None) -> Optional[str]:
     """Unregister a finished turn's channel/thread and return the remaining active status text (or None)."""
     channel_active_presence.pop(int(channel_id), None)
+    channel_active_reply_targets.pop(int(channel_id), None)
     if thread_id is not None:
         channel_active_presence.pop(int(thread_id), None)
+        channel_active_reply_targets.pop(int(thread_id), None)
     return format_active_presence_text()
 
 
@@ -278,6 +283,8 @@ class TurnCoordinator:
 
         if self.prompt:
             channel_active_prompts[self.channel_id] = self.prompt
+        if self.reply_target is not None:
+            channel_active_reply_targets[self.channel_id] = self.reply_target
         self._heartbeat_tracker: Any = None
         self._last_heartbeat_poll: float = 0.0
 
@@ -430,6 +437,10 @@ class TurnCoordinator:
                 if self.prompt:
                     channel_active_prompts[self.thread.id] = self.prompt
                     channel_active_prompts.pop(TARGET_CHANNEL_ID, None)
+                if self.delivery_target is not None or self.reply_target is not None:
+                    target_to_store = self.delivery_target if self.delivery_target is not None else self.reply_target
+                    channel_active_reply_targets[self.thread.id] = target_to_store
+                    channel_active_reply_targets.pop(TARGET_CHANNEL_ID, None)
                 if TARGET_CHANNEL_ID in channel_active_presence:
                     channel_active_presence[self.thread.id] = channel_active_presence.pop(TARGET_CHANNEL_ID)
                 return True
@@ -1063,11 +1074,16 @@ class TurnCoordinator:
 
         return final_text, was_harvested
 
+    def teardown(self, proc: Any = None, br_module: Any = None):
+        """Teardown active turn state and process registrations."""
+        self.cleanup_process(proc=proc, br_module=br_module)
+
     def cleanup_process(self, proc: Any = None, br_module: Any = None):
         """Clean up active process mapping, in-flight state, and restore beacon to IDLE if all workers are idle."""
         if self.channel_id in channel_active_procs:
             del channel_active_procs[self.channel_id]
         channel_active_prompts.pop(self.channel_id, None)
+        channel_active_reply_targets.pop(self.channel_id, None)
         thread_id = (
             getattr(self.thread, "id", None)
             if (self.escalated_to_thread and self.thread and hasattr(self.thread, "id"))
@@ -1077,6 +1093,7 @@ class TurnCoordinator:
             if thread_id in channel_active_procs:
                 del channel_active_procs[thread_id]
             channel_active_prompts.pop(thread_id, None)
+            channel_active_reply_targets.pop(thread_id, None)
         unregister_active_presence(self.channel_id, thread_id=thread_id)
 
         if self.mode == "home":

@@ -13,6 +13,7 @@ import select
 import signal
 import sys
 import time
+from pathlib import Path as Path
 import discord
 
 from tools.bridge_formatting import (
@@ -47,6 +48,7 @@ from tools.bridge_engine import (
     TurnCoordinator,
     channel_active_procs,
     channel_active_prompts,
+    channel_active_reply_targets,
     steering_channels,
     resolve_channel_label,
     register_active_presence,
@@ -61,7 +63,10 @@ from tools.bridge_pipeline import (
     deliver_turn_output,
     TurnTimer,
 )
-from tools.bridge_stream import AgyStreamParser
+from tools.bridge_stream import (
+    AgyStreamParser,
+    harvest_transcript_response as harvest_transcript_response,
+)
 
 
 def kill_process_tree(proc, sig=signal.SIGTERM):
@@ -107,6 +112,7 @@ async def execute_agy_turn(
 ):
     """Execute a single agy CLI turn with streaming status and output delivery."""
     global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session_keys
+    channel_active_reply_targets[channel_id] = reply_target
 
     # Thread Escalation State (Home Turf Root Channel Only) - preserved across retry attempts
     from tools.bridge_daemons import daemon_manager
@@ -144,6 +150,8 @@ async def execute_agy_turn(
                     await worker.recycle()
                 except Exception:
                     pass
+            finally:
+                channel_active_reply_targets.pop(channel_id, None)
 
     ch_name_label = getattr(reply_target.channel, "name", "") if (reply_target and hasattr(reply_target, "channel")) else str(channel_id)
     timer = TurnTimer(
@@ -293,6 +301,7 @@ async def execute_agy_turn(
                     pass
             channel_active_procs[channel_id] = proc
             channel_active_prompts[channel_id] = prompt
+            channel_active_reply_targets[channel_id] = reply_target
             try:
                 record_in_flight(
                     channel_id=channel_id,
@@ -513,7 +522,8 @@ async def execute_agy_turn(
                 return
 
         finally:
-            coord.cleanup_process(proc=proc, br_module=sys.modules[__name__])
+            coord.teardown(proc=proc, br_module=sys.modules[__name__])
+            channel_active_reply_targets.pop(channel_id, None)
             if mode == "home" and channel_id == TARGET_CHANNEL_ID:
                 active_proc = None
             elif mode == "external":
@@ -699,3 +709,4 @@ async def execute_agy_turn(
         is_physical_mention=is_physical_mention,
         timer=timer,
     )
+    channel_active_reply_targets.pop(channel_id, None)

@@ -14,8 +14,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-WORKSPACE = Path("/workspace")
+WORKSPACE = Path(__file__).resolve().parent.parent
 if str(WORKSPACE) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE))
+elif sys.path[0] != str(WORKSPACE):
+    sys.path.remove(str(WORKSPACE))
     sys.path.insert(0, str(WORKSPACE))
 
 import tools.bridge_runner as br
@@ -121,6 +124,7 @@ class TestBridgeRunner(unittest.TestCase):
         
         # Test state retention pattern
         escalated_to_thread = True
+        self.assertTrue(escalated_to_thread)
         delivery_target = mock_thread
         
         target_dest = delivery_target if delivery_target else mock_msg
@@ -331,6 +335,34 @@ class TestBridgeRunner(unittest.TestCase):
         is_hard_ceiling = True
         is_retryable_stall = timed_out and not is_hard_ceiling
         self.assertFalse(is_retryable_stall and attempt < max_retries)
+
+    @patch("tools.bridge_daemons.daemon_manager")
+    def test_execute_agy_turn_channel_active_reply_targets_lifecycle(self, mock_dm):
+        mock_dm.is_dedicated_channel.return_value = True
+        mock_worker = AsyncMock()
+        mock_dm.get_worker.return_value = mock_worker
+
+        target_ch_id = 123456789
+        mock_reply_target = MagicMock()
+
+        async def worker_exec(**kwargs):
+            self.assertEqual(br.channel_active_reply_targets.get(target_ch_id), mock_reply_target)
+            return "OK"
+
+        mock_worker.execute_turn.side_effect = worker_exec
+
+        asyncio.run(
+            br.execute_agy_turn(
+                prompt="Hello",
+                status_msg=None,
+                reply_target=mock_reply_target,
+                attachments=[],
+                mode="home",
+                channel_id=target_ch_id,
+            )
+        )
+
+        self.assertNotIn(target_ch_id, br.channel_active_reply_targets)
 
 
 if __name__ == "__main__":
