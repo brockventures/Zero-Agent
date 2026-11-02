@@ -1592,6 +1592,81 @@ def _check_oversized_class_symbol(
     return None
 
 
+def _get_available_symbols_hint(
+    target_path: Path,
+    sym_name: str,
+    rel_file: str,
+    max_symbols: int = 25,
+) -> str:
+    """Return a concise hint listing available top-level symbols or class methods for a missing symbol."""
+    p = Path(target_path)
+    if p.suffix != ".py" or not p.exists() or not p.is_file():
+        return ""
+
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(content, filename=str(p))
+    except Exception:
+        tree = None
+        content = ""
+        try:
+            content = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    clean_sym = str(sym_name or "").split("(")[0].split(":")[0].strip()
+
+    # 1. If a class method was requested (e.g. ClassName.method), list methods on the matched class
+    if tree is not None and "." in clean_sym:
+        parts = [part.strip() for part in clean_sym.split(".") if part.strip()]
+        if len(parts) >= 2:
+            target_class = None
+            class_name = ""
+            for cand in reversed(parts[:-1]):
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ClassDef) and node.name == cand:
+                        target_class = node
+                        class_name = cand
+                        break
+                if target_class is not None:
+                    break
+
+            if target_class is not None:
+                methods: list[str] = []
+                for item in target_class.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if item.name not in methods:
+                            methods.append(item.name)
+                if methods:
+                    displayed = methods[:max_symbols]
+                    more = f" (+{len(methods) - max_symbols} more)" if len(methods) > max_symbols else ""
+                    return f"Available symbols in '{rel_file}' (methods on '{class_name}'): {', '.join(displayed)}{more}."
+
+    # 2. Top-level function and class symbols
+    top_symbols: list[str] = []
+    if tree is not None:
+        for node in getattr(tree, "body", []):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name not in top_symbols:
+                    top_symbols.append(node.name)
+
+    # 3. Fallback regex extraction if AST parsing failed
+    if not top_symbols and content:
+        for m in re.finditer(r'^(?:async\s+)?def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', content, re.M):
+            if m.group(1) not in top_symbols:
+                top_symbols.append(m.group(1))
+        for m in re.finditer(r'^class\s+([a-zA-Z_][a-zA-Z0-9_]*)\b', content, re.M):
+            if m.group(1) not in top_symbols:
+                top_symbols.append(m.group(1))
+
+    if not top_symbols:
+        return ""
+
+    displayed = top_symbols[:max_symbols]
+    more = f" (+{len(top_symbols) - max_symbols} more)" if len(top_symbols) > max_symbols else ""
+    return f"Available symbols in '{rel_file}': {', '.join(displayed)}{more}."
+
+
 def _is_chunk_0_present_in_plan(all_chunks: list) -> bool:
     """Return True if chunk 0 (0-indexing) is explicitly referenced or present in all_chunks."""
     for c in all_chunks:
@@ -1744,8 +1819,10 @@ def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
 
             if not snippet:
                 if not _is_new_symbol_in_instructions(sym_name, instructions):
+                    hint = _get_available_symbols_hint(target_path, sym_name, rel_file)
+                    hint_suffix = f" {hint}" if hint else ""
                     findings.append(
-                        f"Chunk {idx} target symbol '{sym_str}' not found in '{rel_file}' and not marked as a new symbol in instructions."
+                        f"Chunk {idx} target symbol '{sym_str}' not found in '{rel_file}' and not marked as a new symbol in instructions.{hint_suffix}"
                     )
             else:
                 oversized_err = _check_oversized_class_symbol(target_path, sym_name)

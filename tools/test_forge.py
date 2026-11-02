@@ -2731,6 +2731,113 @@ def test_extract_symbol_snippet_parenthetical_line_ranges(tmp_path):
     assert ok is True, f"Preflight findings: {findings}"
 
 
+def test_goldfish_plan_preflight_available_symbols_hint(tmp_path):
+    """Verify run_goldfish_plan_preflight includes available top-level symbols or class methods on miss."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+
+    service_code = """
+def start_server(port: int = 8080):
+    pass
+
+def stop_server():
+    pass
+
+class ServerConfig:
+    def __init__(self, host: str):
+        self.host = host
+
+    def validate(self):
+        return True
+
+    async def reload_async(self):
+        pass
+"""
+    (repo_dir / "service.py").write_text(service_code.strip() + "\n", encoding="utf-8")
+
+    # 1. Missing top-level symbol lists top-level functions and classes
+    plan_top_miss = {
+        "title": "Missing Top Symbol Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "chunks": [
+            {
+                "title": "Chunk missing top symbol",
+                "target_files": ["service.py"],
+                "target_symbols": ["service.py:restart_server"],
+                "instructions": "Restart the server using existing helpers.",
+            }
+        ],
+    }
+    ok, findings = forge_mod.run_goldfish_plan_preflight(plan_top_miss)
+    assert ok is False
+    assert len(findings) == 1
+    assert "target symbol 'service.py:restart_server' not found in 'service.py'" in findings[0]
+    assert "Available symbols in 'service.py': start_server, stop_server, ServerConfig." in findings[0]
+
+    # 2. Missing class method lists methods on the target class
+    plan_method_miss = {
+        "title": "Missing Method Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "chunks": [
+            {
+                "title": "Chunk missing method",
+                "target_files": ["service.py"],
+                "target_symbols": ["service.py:ServerConfig.missing_method"],
+                "instructions": "Call missing_method on ServerConfig.",
+            }
+        ],
+    }
+    ok, findings = forge_mod.run_goldfish_plan_preflight(plan_method_miss)
+    assert ok is False
+    assert len(findings) == 1
+    assert "target symbol 'service.py:ServerConfig.missing_method' not found in 'service.py'" in findings[0]
+    assert "Available symbols in 'service.py' (methods on 'ServerConfig'): __init__, validate, reload_async." in findings[0]
+
+    # 3. Truncation when a file has > 25 symbols
+    many_funcs = "\n".join(f"def func_{i:02d}(): pass" for i in range(30))
+    (repo_dir / "many.py").write_text(many_funcs + "\n", encoding="utf-8")
+    plan_many = {
+        "title": "Many Symbols Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "chunks": [
+            {
+                "title": "Chunk with many symbols",
+                "target_files": ["many.py"],
+                "target_symbols": ["many.py:nonexistent_func"],
+                "instructions": "Do something.",
+            }
+        ],
+    }
+    ok, findings = forge_mod.run_goldfish_plan_preflight(plan_many)
+    assert ok is False
+    assert len(findings) == 1
+    assert "Available symbols in 'many.py':" in findings[0]
+    assert "(+5 more)" in findings[0]
+    assert "func_24" in findings[0]
+    assert "func_25" not in findings[0]
+
+    # 4. Explicitly marked new symbol in instructions passes without error
+    plan_new = {
+        "title": "New Symbol Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "chunks": [
+            {
+                "title": "Chunk creating new symbol",
+                "target_files": ["service.py"],
+                "target_symbols": ["service.py:restart_server"],
+                "instructions": "Implement and create restart_server in service.py.",
+            }
+        ],
+    }
+    ok, findings = forge_mod.run_goldfish_plan_preflight(plan_new)
+    assert ok is True
+    assert findings == []
+
+
 def test_enqueue_build_clears_offload_dispatched_on_exception(tmp_path):
     """Verify enqueue_build clears offload_dispatched in batch_guard_state.json if validation raises ValueError."""
     bs_file = tmp_path / "batch_guard_state.json"
