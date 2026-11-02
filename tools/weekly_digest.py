@@ -184,7 +184,7 @@ def get_upcoming_reminders_and_renewals(now_pt: datetime, days: int = 30) -> lis
                     continue
                 seen_msgs.add(dedup_key)
 
-                combined_items.append((dt, f"• **{fmt_date}** — {clean_msg[:55].strip()}"))
+                combined_items.append((dt, f"• **{fmt_date}** — {clean_msg.strip()}"))
         except Exception as e:
             print(f"[WeeklyDigest] Error reading reminders.json: {e}", file=sys.stderr)
 
@@ -391,9 +391,11 @@ def generate_weekly_digest(now_pt: datetime | None = None) -> str:
             with open(status_file, "r", encoding="utf-8") as f:
                 statuses = json.load(f)
             p_sync = statuses.get("personal_data_sync", {})
-            p_summary = p_sync.get("summary") or p_sync.get("extra", {}).get("summary")
+            p_summary = p_sync.get("extra", {}).get("summary") or p_sync.get("summary")
             if p_summary:
                 compact_summary = p_summary.strip().split("\n")[0]
+                if compact_summary.endswith("& 6 perso"):
+                    compact_summary = compact_summary[:-len("& 6 perso")] + "& 6 personal movies synced"
                 sync_block = f"\n\n🎮 **Weekly Profile Sync:** {compact_summary}"
         except Exception as e:
             print(f"[WeeklyDigest] Error reading sidecar_status.json: {e}", file=sys.stderr)
