@@ -142,6 +142,14 @@ except ImportError:
     except ImportError:
         sanitize_discord_display = None
 
+try:
+    from tools.gh_pr_watcher import process_github_email_doorbell
+except ImportError:
+    try:
+        from gh_pr_watcher import process_github_email_doorbell
+    except ImportError:
+        process_github_email_doorbell = None
+
 def sanitize_text(text: str, max_len: int = 150) -> str:
     if not text:
         return ""
@@ -239,6 +247,65 @@ def post_discord(bot_token: str, channel_id: str, content: str):
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
         return resp.status in (200, 201)
 
+def process_message_payload(
+    m_data: dict,
+    bot_token: str | None = None,
+    channel_id: str | None = None,
+) -> str:
+    """Process a single Gmail message payload dictionary.
+
+    Returns:
+        'github_doorbell': If message was from notifications@github.com and passed to gh_pr_watcher.
+        'discord_notified': If message was addressed to TARGET_EMAIL and posted to Discord.
+        'ready_for_dispatch': If message was addressed to TARGET_EMAIL but bot_token/channel_id not provided.
+        'ignored_recipient': If message was not addressed to TARGET_EMAIL and not from notifications@github.com.
+    """
+    raw_h = m_data.get("payload", {}).get("headers", [])
+    headers = {h["name"]: h["value"] for h in raw_h}
+    headers_lower = {h["name"].lower(): h["value"] for h in raw_h}
+    sender = headers_lower.get("from", "Unknown")
+
+    if "notifications@github.com" in sender.lower():
+        if process_github_email_doorbell:
+            try:
+                process_github_email_doorbell(headers)
+            except Exception as d_err:
+                log(f"GitHub email doorbell processing error: {d_err}")
+        return "github_doorbell"
+
+    to_addr = headers_lower.get("to", "").lower()
+    cc_addr = headers_lower.get("cc", "").lower()
+    delivered = headers_lower.get("delivered-to", "").lower()
+    x_fwd = headers_lower.get("x-forwarded-to", "").lower()
+    all_recipients = f"{to_addr} {cc_addr} {delivered} {x_fwd}"
+
+    if TARGET_EMAIL.lower() not in all_recipients:
+        return "ignored_recipient"
+
+    if bot_token and channel_id:
+        subject = headers_lower.get("subject", "(No Subject)")
+        snippet = m_data.get("snippet", "")
+        clean_sender = sanitize_text(sender, 50)
+        clean_subj = sanitize_text(subject, 70)
+        clean_snippet = sanitize_text(snippet, 120)
+
+        log(f"New email from {clean_sender}: '{clean_subj}'")
+
+        msg_body = (
+            f"📬 **New Email Received for Zero** (`{TARGET_EMAIL}`)\n"
+            f"• **From:** `{clean_sender}`\n"
+            f"• **Subject:** *\"{clean_subj}\"*\n"
+            f"• **Preview:** {clean_snippet}\n\n"
+            f"-# 🔒 *Operational Guardrail Active: Presented for human review. No autonomous actions taken.*"
+        )
+        try:
+            post_discord(bot_token, channel_id, msg_body)
+        except Exception as de:
+            log(f"Failed to post to Discord: {de}")
+        return "discord_notified"
+
+    return "ready_for_dispatch"
+
 PID_FILE = os.path.join(STATE_DIR, "zero_mail_listener.pid")
 
 _running = True
@@ -331,12 +398,12 @@ def run_loop():
             except Exception as e:
                 log(f"Error during seeding: {e}")
 
-        log(f"Listener active (polling every {POLL_INTERVAL}s for 'to:{TARGET_EMAIL} is:unread')...")
+        log(f"Listener active (polling every {POLL_INTERVAL}s for '(to:{TARGET_EMAIL} OR from:notifications@github.com) is:unread')...")
 
         while _running:
             try:
                 tok = get_access_token()
-                query = urllib.parse.quote(f"to:{TARGET_EMAIL} is:unread")
+                query = urllib.parse.quote(f"(to:{TARGET_EMAIL} OR from:notifications@github.com) is:unread")
                 url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={query}&maxResults=20"
                 req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
                 
@@ -358,16 +425,24 @@ def run_loop():
                         senders = []
                         for m in new_msgs:
                             mid = m["id"]
-                            seen_ids.add(mid)
                             try:
                                 m_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=metadata"
                                 m_req = urllib.request.Request(m_url, headers={"Authorization": f"Bearer {tok}"})
                                 with urllib.request.urlopen(m_req, timeout=TIMEOUT) as m_resp:
                                     m_data = json.loads(m_resp.read().decode())
-                                    headers = {h["name"].lower(): h["value"] for h in m_data.get("payload", {}).get("headers", [])}
-                                    senders.append(sanitize_text(headers.get("from", "Unknown"), 40))
+                                    raw_h = m_data.get("payload", {}).get("headers", [])
+                                    headers = {h["name"]: h["value"] for h in raw_h}
+                                    headers_lower = {h["name"].lower(): h["value"] for h in raw_h}
+                                    from_addr = headers_lower.get("from", "Unknown")
+                                    if "notifications@github.com" in from_addr.lower() and process_github_email_doorbell:
+                                        try:
+                                            process_github_email_doorbell(headers)
+                                        except Exception as d_err:
+                                            log(f"GitHub email doorbell error in surge: {d_err}")
+                                    senders.append(sanitize_text(from_addr, 40))
                             except Exception:
                                 pass
+                            seen_ids.add(mid)
 
                         save_seen(seen_ids)
 
@@ -396,42 +471,11 @@ def run_loop():
                             with urllib.request.urlopen(m_req, timeout=TIMEOUT) as m_resp:
                                 m_data = json.loads(m_resp.read().decode())
 
-                            snippet = m_data.get("snippet", "")
-                            headers = {h["name"].lower(): h["value"] for h in m_data.get("payload", {}).get("headers", [])}
-                            sender = headers.get("from", "Unknown")
-                            subject = headers.get("subject", "(No Subject)")
-                            to_addr = headers.get("to", "").lower()
-                            cc_addr = headers.get("cc", "").lower()
-                            delivered = headers.get("delivered-to", "").lower()
-                            x_fwd = headers.get("x-forwarded-to", "").lower()
-                            all_recipients = f"{to_addr} {cc_addr} {delivered} {x_fwd}"
-
-                            if TARGET_EMAIL.lower() not in all_recipients:
-                                seen_ids.add(mid)
-                                continue
-
-                            clean_sender = sanitize_text(sender, 50)
-                            clean_subj = sanitize_text(subject, 70)
-                            clean_snippet = sanitize_text(snippet, 120)
-
-                            log(f"New email from {clean_sender}: '{clean_subj}'")
-
-                            msg_body = (
-                                f"📬 **New Email Received for Zero** (`{TARGET_EMAIL}`)\n"
-                                f"• **From:** `{clean_sender}`\n"
-                                f"• **Subject:** *\"{clean_subj}\"*\n"
-                                f"• **Preview:** {clean_snippet}\n\n"
-                                f"-# 🔒 *Operational Guardrail Active: Presented for human review. No autonomous actions taken.*"
-                            )
-
-                            try:
-                                post_discord(bot_token, channel_id, msg_body)
-                                log(f"Discord notification posted for message {mid}")
-                            except Exception as de:
-                                log(f"Failed to post to Discord: {de}")
-
+                            res = process_message_payload(m_data, bot_token=bot_token, channel_id=channel_id)
                             seen_ids.add(mid)
-                            time.sleep(DISCORD_POST_DELAY)
+                            if res == "discord_notified":
+                                log(f"Discord notification posted for message {mid}")
+                                time.sleep(DISCORD_POST_DELAY)
 
                         save_seen(seen_ids)
 

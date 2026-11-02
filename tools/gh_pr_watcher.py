@@ -102,13 +102,25 @@ def ensure_schedule_registered(
         return False
     try:
         raw = schedule_file.read_text(encoding="utf-8")
-        entries = json.loads(raw)
-        if not isinstance(entries, list):
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            if "jobs" in parsed:
+                if not isinstance(parsed["jobs"], list):
+                    return False
+                job_list = parsed["jobs"]
+            else:
+                job_list = []
+                parsed["jobs"] = job_list
+        elif isinstance(parsed, list):
+            job_list = parsed
+        else:
             return False
-        for item in entries:
+
+        for item in job_list:
             if isinstance(item, dict) and item.get("id") == "gh_pr_watcher":
                 return False
-        entries.append(
+
+        job_list.append(
             {
                 "id": "gh_pr_watcher",
                 "name": "GitHub PR Watcher & Auto-Merge",
@@ -122,7 +134,7 @@ def ensure_schedule_registered(
             }
         )
         tmp_file = schedule_file.with_suffix(f".tmp.{os.getpid()}")
-        tmp_file.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+        tmp_file.write_text(json.dumps(parsed, indent=2) + "\n", encoding="utf-8")
         tmp_file.replace(schedule_file)
         return True
     except Exception as exc:
@@ -341,6 +353,8 @@ def load_state(state_file: Path) -> dict[str, Any]:
         "seen_review_ids": [],
         "seen_comment_ids": [],
         "seen_review_requests": [],
+        "seen_ci_failures": [],
+        "seen_merge_conflicts": [],
         "review_decisions": {},
         "auto_merged_prs": [],
         "active_notifications": {},
@@ -375,6 +389,8 @@ def save_state(state: dict[str, Any], state_file: Path) -> None:
         "seen_review_ids",
         "seen_comment_ids",
         "seen_review_requests",
+        "seen_ci_failures",
+        "seen_merge_conflicts",
         "auto_merged_prs",
     ):
         if isinstance(state.get(k), (set, list)):
@@ -804,7 +820,7 @@ def get_pr_details(repo: str, number: int) -> dict[str, Any] | None:
             "--repo",
             repo,
             "--json",
-            "number,title,url,author,reviewDecision,reviews,latestReviews,reviewRequests,comments,statusCheckRollup,headRefOid,state,merged",
+            "number,title,url,author,reviewDecision,reviews,latestReviews,reviewRequests,comments,statusCheckRollup,headRefOid,state,merged,mergeable,mergeStateStatus",
         ])
         if res.returncode != 0:
             log.warning(
@@ -904,6 +920,111 @@ def format_comment_message(
     ])
 
 
+def format_ci_failure_message(
+    repo: str,
+    pr_number: int,
+    title: str,
+    url: str,
+    check_name: str,
+    details_url: str = "",
+) -> str:
+    """Build structured Discord notification card for a CI check failure."""
+    lines = [
+        "❌ **GitHub CI Check Failure**",
+        f"**Repo:** `{repo}` | **PR:** [#{pr_number} {title}]({url})",
+        f"**Failed Check:** `{check_name}`",
+    ]
+    if details_url:
+        lines.append(f"**Details:** [View Log / Run]({details_url})")
+    lines.append("")
+    lines.append("> ⚠️ CI workflow failed on head commit. Action required before merge.")
+    return "\n".join(lines)
+
+
+def format_merge_conflict_message(
+    repo: str,
+    pr_number: int,
+    title: str,
+    url: str,
+) -> str:
+    """Build structured Discord notification card for a PR merge conflict."""
+    return "\n".join([
+        "⚠️ **GitHub PR Merge Conflict**",
+        f"**Repo:** `{repo}` | **PR:** [#{pr_number} {title}]({url})",
+        "",
+        "> 💥 This branch has merge conflicts that must be resolved before merging.",
+    ])
+
+
+def extract_failed_checks(status_rollup: Any) -> list[dict[str, Any]]:
+    """Extract failed CI checks from statusCheckRollup."""
+    if not status_rollup:
+        return []
+
+    failed: list[dict[str, Any]] = []
+    checks: list[Any] = []
+
+    if isinstance(status_rollup, list):
+        checks = status_rollup
+    elif isinstance(status_rollup, dict):
+        contexts = status_rollup.get("contexts") or status_rollup.get("checks")
+        if isinstance(contexts, list) and contexts:
+            checks = contexts
+        else:
+            state = str(status_rollup.get("state") or status_rollup.get("status") or "").upper()
+            conclusion = str(status_rollup.get("conclusion") or "").upper()
+            if state in ("FAILURE", "ERROR") or conclusion in (
+                "FAILURE",
+                "TIMED_OUT",
+                "ACTION_REQUIRED",
+                "CANCELLED",
+                "STARTUP_FAILURE",
+            ):
+                name = str(
+                    status_rollup.get("name")
+                    or status_rollup.get("context")
+                    or status_rollup.get("workflowName")
+                    or "status_check"
+                )
+                failed.append({
+                    "name": name,
+                    "url": status_rollup.get("targetUrl")
+                    or status_rollup.get("detailsUrl")
+                    or status_rollup.get("url")
+                    or "",
+                    "conclusion": conclusion or state,
+                })
+
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        conclusion = str(check.get("conclusion") or "").upper()
+        state = str(check.get("state") or "").upper()
+        if conclusion in (
+            "FAILURE",
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+            "CANCELLED",
+            "STARTUP_FAILURE",
+        ) or state in ("FAILURE", "ERROR"):
+            name = str(
+                check.get("name")
+                or check.get("context")
+                or check.get("workflowName")
+                or "unnamed_check"
+            )
+            failed.append({
+                "name": name,
+                "url": check.get("targetUrl")
+                or check.get("detailsUrl")
+                or check.get("url")
+                or "",
+                "conclusion": conclusion or state,
+            })
+
+    return failed
+
+
 def dispatch_notification(
     content: str,
     channels: list[str | int] | None = None,
@@ -961,6 +1082,8 @@ def check_pr(
     seen_reviews: set[str] = set(state.setdefault("seen_review_ids", []))
     seen_comments: set[str] = set(state.setdefault("seen_comment_ids", []))
     seen_reqs: set[str] = set(state.setdefault("seen_review_requests", []))
+    seen_ci_failures: set[str] = set(state.setdefault("seen_ci_failures", []))
+    seen_merge_conflicts: set[str] = set(state.setdefault("seen_merge_conflicts", []))
     review_decisions: dict[str, str] = state.setdefault("review_decisions", {})
     active_notifications: dict[str, list[dict[str, Any]]] = state.setdefault(
         "active_notifications", {}
@@ -971,6 +1094,8 @@ def check_pr(
         "reviews_notified": 0,
         "comments_notified": 0,
         "review_requests_notified": 0,
+        "ci_failures_notified": 0,
+        "conflicts_notified": 0,
         "decision_changed": False,
         "auto_merged": False,
         "notifications_cleaned": 0,
@@ -1043,6 +1168,8 @@ def check_pr(
         state["seen_review_ids"] = list(seen_reviews)
         state["seen_comment_ids"] = list(seen_comments)
         state["seen_review_requests"] = list(seen_reqs)
+        state["seen_ci_failures"] = list(seen_ci_failures)
+        state["seen_merge_conflicts"] = list(seen_merge_conflicts)
         state["review_decisions"] = review_decisions
         state["active_notifications"] = active_notifications
         state["pr_head_ref_oids"] = pr_head_ref_oids
@@ -1165,7 +1292,118 @@ def check_pr(
     if old_decision and old_decision != review_decision and review_decision != "NONE":
         stats["decision_changed"] = True
 
-    # 5. Check and attempt auto-merge for whitelisted authors
+    # 5. Check CI check failures and merge conflicts on authored/contributed PRs
+    author_obj = pr_details.get("author")
+    if isinstance(author_obj, dict):
+        pr_author = str(author_obj.get("login") or "").strip().lower()
+    else:
+        pr_author = str(author_obj or "").strip().lower()
+
+    is_authored = bool(
+        pr_author and (pr_author in zero_users or pr_author == (current_user or "").lower())
+    )
+    is_contributed = False
+
+    if not is_authored:
+        if (
+            pr_details.get("viewerDidAuthor")
+            or pr_details.get("contributed")
+            or pr_details.get("is_contributed")
+        ):
+            is_contributed = True
+        else:
+            for rev in pr_details.get("reviews", []):
+                rev_a = rev.get("author")
+                rev_login = (
+                    rev_a.get("login") if isinstance(rev_a, dict) else str(rev_a or "")
+                ).strip().lower()
+                if rev_login and (
+                    rev_login in zero_users or rev_login == (current_user or "").lower()
+                ):
+                    is_contributed = True
+                    break
+            if not is_contributed:
+                for com in pr_details.get("comments", []):
+                    com_a = com.get("author")
+                    com_login = (
+                        com_a.get("login") if isinstance(com_a, dict) else str(com_a or "")
+                    ).strip().lower()
+                    if com_login and (
+                        com_login in zero_users or com_login == (current_user or "").lower()
+                    ):
+                        is_contributed = True
+                        break
+            if not is_contributed:
+                for assignee in pr_details.get("assignees", []):
+                    a_login = (
+                        assignee.get("login")
+                        if isinstance(assignee, dict)
+                        else str(assignee or "")
+                    ).strip().lower()
+                    if a_login and (
+                        a_login in zero_users or a_login == (current_user or "").lower()
+                    ):
+                        is_contributed = True
+                        break
+
+    if is_authored or is_contributed:
+        # A) Check CI check failures
+        failed_checks = extract_failed_checks(pr_details.get("statusCheckRollup"))
+        for chk in failed_checks:
+            check_name = chk.get("name") or "unnamed_check"
+            fail_key = f"ci_fail:{repo}#{pr_number}:{current_head}:{check_name}"
+            if fail_key not in seen_ci_failures:
+                seen_ci_failures.add(fail_key)
+                if not seed_only:
+                    msg = format_ci_failure_message(
+                        repo=repo,
+                        pr_number=pr_number,
+                        title=title,
+                        url=url,
+                        check_name=check_name,
+                        details_url=chk.get("url") or "",
+                    )
+                    dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
+                    stats["ci_failures_notified"] += 1
+                    if not dry_run:
+                        notif_list = active_notifications.setdefault(pr_key, [])
+                        for d_res in dispatch_res:
+                            notif_list.append({
+                                "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
+                                "message_id": d_res.get("message_id") or 0,
+                                "event_id": fail_key,
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                                "head_ref_oid": current_head,
+                            })
+
+        # B) Check merge conflicts
+        mergeable = str(pr_details.get("mergeable") or "").upper()
+        merge_state = str(pr_details.get("mergeStateStatus") or "").upper()
+        if mergeable == "CONFLICTING" or merge_state == "DIRTY":
+            conflict_key = f"conflict:{repo}#{pr_number}:{current_head}"
+            if conflict_key not in seen_merge_conflicts:
+                seen_merge_conflicts.add(conflict_key)
+                if not seed_only:
+                    msg = format_merge_conflict_message(
+                        repo=repo,
+                        pr_number=pr_number,
+                        title=title,
+                        url=url,
+                    )
+                    dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
+                    stats["conflicts_notified"] += 1
+                    if not dry_run:
+                        notif_list = active_notifications.setdefault(pr_key, [])
+                        for d_res in dispatch_res:
+                            notif_list.append({
+                                "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
+                                "message_id": d_res.get("message_id") or 0,
+                                "event_id": conflict_key,
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                                "head_ref_oid": current_head,
+                            })
+
+    # 6. Check and attempt auto-merge for whitelisted authors
     if not seed_only:
         auto_merged_prs = state.setdefault("auto_merged_prs", [])
         if review_decision == "CHANGES_REQUESTED":
@@ -1187,6 +1425,8 @@ def check_pr(
     state["seen_review_ids"] = list(seen_reviews)
     state["seen_comment_ids"] = list(seen_comments)
     state["seen_review_requests"] = list(seen_reqs)
+    state["seen_ci_failures"] = list(seen_ci_failures)
+    state["seen_merge_conflicts"] = list(seen_merge_conflicts)
     state["review_decisions"] = review_decisions
     state["active_notifications"] = active_notifications
     state["pr_head_ref_oids"] = pr_head_ref_oids
@@ -1229,6 +1469,8 @@ def poll_and_notify(
         "reviews_notified": 0,
         "comments_notified": 0,
         "review_requests_notified": 0,
+        "ci_failures_notified": 0,
+        "conflicts_notified": 0,
         "decisions_changed": 0,
         "auto_merged": 0,
         "notifications_cleaned": 0,
@@ -1254,6 +1496,8 @@ def poll_and_notify(
         total_stats["reviews_notified"] += st["reviews_notified"]
         total_stats["comments_notified"] += st["comments_notified"]
         total_stats["review_requests_notified"] += st["review_requests_notified"]
+        total_stats["ci_failures_notified"] += st.get("ci_failures_notified", 0)
+        total_stats["conflicts_notified"] += st.get("conflicts_notified", 0)
         total_stats["notifications_cleaned"] += st.get("notifications_cleaned", 0)
         if st["decision_changed"]:
             total_stats["decisions_changed"] += 1
