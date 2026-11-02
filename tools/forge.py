@@ -7,7 +7,7 @@ Unifies four core runtime pillars in a single WAL-mode SQLite state machine (/wo
    ground-truth progress leases (stdout deltas, child PIDs, SDK task logs, subagent transcripts)
    plus a 3-strike runaway tool-loop circuit breaker.
 2. Multi-Chunk Spec-Driven Build Queue (#forge): Executes Tier 2/3 engineering plans in isolated
-   git worktrees using gemini-3.8-flash-high (with escalation to gemini-4-argon-medium), enforcing
+   git worktrees using gemini-4-argon-low (with escalation to gemini-4-argon-medium), enforcing
    pre-enqueue target-file overlap guards, Turn-0 AST/symbol snippet hydration (target_symbols +
    shared_context), per-chunk multi-repo routing, optional verification_cmd with auto-baseline
    lint/test fallback, live #forge widget updates, and originating-channel completion wakeups.
@@ -46,11 +46,16 @@ import discord
 import requests
 
 WORKSPACE_DIR = Path("/workspace")
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+if str(_REPO_ROOT / "tools") not in sys.path:
+    sys.path.insert(1, str(_REPO_ROOT / "tools"))
 if str(WORKSPACE_DIR) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE_DIR))
+    sys.path.append(str(WORKSPACE_DIR))
 TOOLS_DIR = WORKSPACE_DIR / "tools"
 if str(TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(TOOLS_DIR))
+    sys.path.append(str(TOOLS_DIR))
 
 DATA_DIR = WORKSPACE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,9 +74,49 @@ ZERO_OPS_CHANNEL_ID = 1544953279664889888
 BASEBALL_CHANNEL_ID = 1548196929308065893
 OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
 
-DEFAULT_WORKER_MODEL = "gemini-3.8-flash-high"
+DEFAULT_WORKER_MODEL = "gemini-4-argon-low"
 ESCALATION_WORKER_MODEL = "gemini-4-argon-medium"
 DEFAULT_LEASE_TTL_SECONDS = 300.0
+
+WORKER_MODEL_FALLBACK_MAP: dict[str, str] = {
+    "gemini-3.8-flash-high": "gemini-4-argon-low",
+    "gemini-3.8-flash-medium": "gemini-4-argon-low",
+    "gemini-3.8-flash-low": "gemini-4-argon-low",
+    "gemini-3.8-flash": "gemini-4-argon-low",
+    "gemini-4-argon-low": "gemini-4-argon-medium",
+}
+
+
+def is_unrecognized_model_error(output_text: str) -> bool:
+    """Return True if agy output indicates the requested --model is not recognized as a known model."""
+    if not output_text:
+        return False
+    lower = output_text.lower()
+    return (
+        "is not recognized as a known model" in lower
+        or "invalid model selection" in lower
+    )
+
+
+def resolve_worker_model_fallback(
+    failed_model: str,
+    attempt: int = 1,
+    max_attempts: int = 3,
+    rejected_models: Optional[set[str]] = None,
+) -> str:
+    """Resolve fallback worker model when agy rejects a model as unrecognized without burning an attempt."""
+    rej = set(rejected_models or set())
+    if failed_model:
+        rej.add(failed_model)
+    if attempt >= max_attempts and ESCALATION_WORKER_MODEL not in rej:
+        return ESCALATION_WORKER_MODEL
+    mapped = WORKER_MODEL_FALLBACK_MAP.get(failed_model, DEFAULT_WORKER_MODEL)
+    if mapped not in rej:
+        return mapped
+    for candidate in (DEFAULT_WORKER_MODEL, ESCALATION_WORKER_MODEL):
+        if candidate not in rej:
+            return candidate
+    return ESCALATION_WORKER_MODEL
 
 
 def _build_low_priority_prefix() -> list[str]:
@@ -796,7 +841,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
                 chunk_index INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 repo TEXT NOT NULL DEFAULT '',
-                worker_model TEXT NOT NULL DEFAULT 'gemini-3.8-flash-high',
+                worker_model TEXT NOT NULL DEFAULT 'gemini-4-argon-low',
                 target_files_json TEXT NOT NULL DEFAULT '[]',
                 target_symbols_json TEXT NOT NULL DEFAULT '[]',
                 shared_context_json TEXT NOT NULL DEFAULT '[]',
@@ -5561,147 +5606,186 @@ class ForgeSupervisor:
         prohibited = json.loads(chunk_row["prohibited_files_json"] or "[]")
         target_files = json.loads(chunk_row["target_files_json"] or "[]")
         max_attempts = 3
+        rejected_models: set[str] = set()
+        fallback_override_model: Optional[str] = None
 
         for attempt in range(1, max_attempts + 1):
             _ensure_chunk_worktree(force_recreate=not wt_dir.exists())
-            model = ESCALATION_WORKER_MODEL if attempt == max_attempts else (chunk_row["worker_model"] or DEFAULT_WORKER_MODEL)
-            with self._state_lock, get_db_connection(self.db_path) as conn:
-                conn.execute(
-                    "UPDATE forge_chunks SET attempt_count = ?, worker_model = ?, status = 'running', live_status = ? WHERE id = ?",
-                    (attempt, model, f"Booting Vulcan ({model})...", chunk_id),
-                )
-            post_or_update_build_widget(build_id, db_path=self.db_path)
-            _log_build(
-                f"[Attempt {attempt}/{max_attempts}] Starting chunk {chunk_id} (index {chunk_idx}: '{chunk_row['title']}') model={model}"
-            )
-
-            prompt = format_chunk_prompt(build_id, chunk_idx, db_path=self.db_path, worktree_dir=str(wt_dir))
-            agy_cmd = _build_low_priority_prefix() + [
-                "/usr/local/bin/agy",
-                f"--add-dir={wt_dir}",
-                f"-p={prompt}",
-                "--output-format=stream-json",
-                "--dangerously-skip-permissions",
-                "--print-timeout=4h",
-                f"--model={model}",
-            ]
-            profile_snapshot = stage_vulcan_worktree_profile(
-                wt_dir,
-                repo_dir=repo_dir,
-                target_files=target_files,
-                origin_channel_id=int(build["origin_channel_id"]) if build["origin_channel_id"] else None,
-            )
             worker_exc: Optional[Exception] = None
             worker_conv_id: Optional[str] = None
             start_ts = time.time()
             tail_lines: list[str] = []
             step_cnt = 0
-            last_widget_patch = start_ts
-            last_activity_ts = [start_ts]
-            timed_out_reason: list[Optional[str]] = [None]
-            try:
-                vulcan_env = os.environ.copy()
-                vulcan_env["FORGE_WORKER_ACTIVE"] = "1"
-                proc = subprocess.Popen(
-                    agy_cmd,
-                    cwd=str(wt_dir),
-                    env=vulcan_env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    start_new_session=True,
-                )
-                watchdog_stop = threading.Event()
+            model = DEFAULT_WORKER_MODEL
 
-                def _chunk_watchdog() -> None:
-                    while not watchdog_stop.wait(0.15):
-                        if proc.poll() is not None:
-                            return
-                        now_w = time.time()
-                        if (now_w - start_ts) > CHUNK_WORKER_TIMEOUT_SECONDS:
-                            timed_out_reason[0] = (
-                                f"Chunk worker exceeded {int(CHUNK_WORKER_TIMEOUT_SECONDS)}s execution timeout"
-                            )
-                            _kill_process_group(proc)
-                            return
-                        if (now_w - last_activity_ts[0]) > CHUNK_SILENT_STALL_TIMEOUT_SECONDS:
-                            timed_out_reason[0] = (
-                                f"Chunk worker stalled silently with zero stdout output for "
-                                f"{int(CHUNK_SILENT_STALL_TIMEOUT_SECONDS)}s"
-                            )
-                            _kill_process_group(proc)
-                            return
-
-                wd_thread = threading.Thread(target=_chunk_watchdog, daemon=True)
-                wd_thread.start()
-                try:
-                    if proc.stdout:
-                        try:
-                            for raw_line in proc.stdout:
-                                now_ts = time.time()
-                                last_activity_ts[0] = now_ts
-                                tail_lines.append(raw_line)
-                                if len(tail_lines) > 80:
-                                    tail_lines.pop(0)
-                                if not worker_conv_id and "conversation_id" in raw_line:
-                                    try:
-                                        line_obj = json.loads(raw_line.strip())
-                                        if isinstance(line_obj, dict):
-                                            worker_conv_id = (
-                                                line_obj.get("conversation_id")
-                                                or (line_obj.get("result") or {}).get("conversation_id")
-                                            )
-                                    except Exception:
-                                        pass
-                                status_str, step_cnt = extract_live_chunk_telemetry(raw_line, step_count=step_cnt)
-                                if status_str and (now_ts - last_widget_patch >= 12.0 or step_cnt == 1):
-                                    last_widget_patch = now_ts
-                                    with self._state_lock, get_db_connection(self.db_path) as conn:
-                                        conn.execute(
-                                            "UPDATE forge_chunks SET live_status = ? WHERE id = ?",
-                                            (status_str[:220], chunk_id),
-                                        )
-                                        conn.execute(
-                                            "UPDATE forge_builds SET updated_at = ? WHERE id = ?",
-                                            (now_ts, build_id),
-                                        )
-                                    post_or_update_build_widget(build_id, db_path=self.db_path)
-                        except (ValueError, OSError):
-                            if not timed_out_reason[0]:
-                                raise
-                finally:
-                    watchdog_stop.set()
-                    wd_thread.join(timeout=1.0)
-
-                if timed_out_reason[0]:
-                    tail_last_15 = "".join(tail_lines[-15:]).rstrip()
-                    _log_build(
-                        f"[Attempt {attempt}/{max_attempts}] Worker timed out: {timed_out_reason[0]} (steps: {step_cnt})\n"
-                        f"Tail lines (last 15):\n{tail_last_15}"
+            for _model_try in range(3):
+                base_model = fallback_override_model or chunk_row["worker_model"] or DEFAULT_WORKER_MODEL
+                model = ESCALATION_WORKER_MODEL if attempt == max_attempts else base_model
+                if model in rejected_models:
+                    model = resolve_worker_model_fallback(
+                        model,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        rejected_models=rejected_models,
                     )
-                    raise TimeoutError(timed_out_reason[0])
-                ret_code = proc.wait(timeout=30)
-                tail_last_15 = "".join(tail_lines[-15:]).rstrip()
+                with self._state_lock, get_db_connection(self.db_path) as conn:
+                    conn.execute(
+                        "UPDATE forge_chunks SET attempt_count = ?, worker_model = ?, status = 'running', live_status = ? WHERE id = ?",
+                        (attempt, model, f"Booting Vulcan ({model})...", chunk_id),
+                    )
+                post_or_update_build_widget(build_id, db_path=self.db_path)
                 _log_build(
-                    f"[Attempt {attempt}/{max_attempts}] Worker finished with exit code {ret_code} (steps: {step_cnt})\n"
-                    f"Tail lines (last 15):\n{tail_last_15}"
+                    f"[Attempt {attempt}/{max_attempts}] Starting chunk {chunk_id} (index {chunk_idx}: '{chunk_row['title']}') model={model}"
                 )
-                if ret_code != 0:
-                    err_msg = "".join(tail_lines).strip() or f"agy exited {ret_code}"
-                    with self._state_lock, get_db_connection(self.db_path) as conn:
-                        conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (err_msg[-1500:], chunk_id))
-            except Exception as e:
-                worker_exc = e
-                if not timed_out_reason[0]:
+
+                prompt = format_chunk_prompt(build_id, chunk_idx, db_path=self.db_path, worktree_dir=str(wt_dir))
+                agy_cmd = _build_low_priority_prefix() + [
+                    "/usr/local/bin/agy",
+                    f"--add-dir={wt_dir}",
+                    f"-p={prompt}",
+                    "--output-format=stream-json",
+                    "--dangerously-skip-permissions",
+                    "--print-timeout=4h",
+                    f"--model={model}",
+                ]
+                profile_snapshot = stage_vulcan_worktree_profile(
+                    wt_dir,
+                    repo_dir=repo_dir,
+                    target_files=target_files,
+                    origin_channel_id=int(build["origin_channel_id"]) if build["origin_channel_id"] else None,
+                )
+                worker_exc = None
+                worker_conv_id = None
+                start_ts = time.time()
+                tail_lines = []
+                step_cnt = 0
+                last_widget_patch = start_ts
+                last_activity_ts = [start_ts]
+                timed_out_reason: list[Optional[str]] = [None]
+                ret_code = 0
+                try:
+                    vulcan_env = os.environ.copy()
+                    vulcan_env["FORGE_WORKER_ACTIVE"] = "1"
+                    proc = subprocess.Popen(
+                        agy_cmd,
+                        cwd=str(wt_dir),
+                        env=vulcan_env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        start_new_session=True,
+                    )
+                    watchdog_stop = threading.Event()
+
+                    def _chunk_watchdog() -> None:
+                        while not watchdog_stop.wait(0.15):
+                            if proc.poll() is not None:
+                                return
+                            now_w = time.time()
+                            if (now_w - start_ts) > CHUNK_WORKER_TIMEOUT_SECONDS:
+                                timed_out_reason[0] = (
+                                    f"Chunk worker exceeded {int(CHUNK_WORKER_TIMEOUT_SECONDS)}s execution timeout"
+                                )
+                                _kill_process_group(proc)
+                                return
+                            if (now_w - last_activity_ts[0]) > CHUNK_SILENT_STALL_TIMEOUT_SECONDS:
+                                timed_out_reason[0] = (
+                                    f"Chunk worker stalled silently with zero stdout output for "
+                                    f"{int(CHUNK_SILENT_STALL_TIMEOUT_SECONDS)}s"
+                                )
+                                _kill_process_group(proc)
+                                return
+
+                    wd_thread = threading.Thread(target=_chunk_watchdog, daemon=True)
+                    wd_thread.start()
+                    try:
+                        if proc.stdout:
+                            try:
+                                for raw_line in proc.stdout:
+                                    now_ts = time.time()
+                                    last_activity_ts[0] = now_ts
+                                    tail_lines.append(raw_line)
+                                    if len(tail_lines) > 80:
+                                        tail_lines.pop(0)
+                                    if not worker_conv_id and "conversation_id" in raw_line:
+                                        try:
+                                            line_obj = json.loads(raw_line.strip())
+                                            if isinstance(line_obj, dict):
+                                                worker_conv_id = (
+                                                    line_obj.get("conversation_id")
+                                                    or (line_obj.get("result") or {}).get("conversation_id")
+                                                )
+                                        except Exception:
+                                            pass
+                                    status_str, step_cnt = extract_live_chunk_telemetry(raw_line, step_count=step_cnt)
+                                    if status_str and (now_ts - last_widget_patch >= 12.0 or step_cnt == 1):
+                                        last_widget_patch = now_ts
+                                        with self._state_lock, get_db_connection(self.db_path) as conn:
+                                            conn.execute(
+                                                "UPDATE forge_chunks SET live_status = ? WHERE id = ?",
+                                                (status_str[:220], chunk_id),
+                                            )
+                                            conn.execute(
+                                                "UPDATE forge_builds SET updated_at = ? WHERE id = ?",
+                                                (now_ts, build_id),
+                                            )
+                                        post_or_update_build_widget(build_id, db_path=self.db_path)
+                            except (ValueError, OSError):
+                                if not timed_out_reason[0]:
+                                    raise
+                    finally:
+                        watchdog_stop.set()
+                        wd_thread.join(timeout=1.0)
+
+                    if timed_out_reason[0]:
+                        tail_last_15 = "".join(tail_lines[-15:]).rstrip()
+                        _log_build(
+                            f"[Attempt {attempt}/{max_attempts}] Worker timed out: {timed_out_reason[0]} (steps: {step_cnt})\n"
+                            f"Tail lines (last 15):\n{tail_last_15}"
+                        )
+                        raise TimeoutError(timed_out_reason[0])
+                    ret_code = proc.wait(timeout=30)
                     tail_last_15 = "".join(tail_lines[-15:]).rstrip()
                     _log_build(
-                        f"[Attempt {attempt}/{max_attempts}] Worker error: {e} (steps: {step_cnt})\n"
+                        f"[Attempt {attempt}/{max_attempts}] Worker finished with exit code {ret_code} (steps: {step_cnt})\n"
                         f"Tail lines (last 15):\n{tail_last_15}"
                     )
-            finally:
-                restore_vulcan_worktree_profile(wt_dir, profile_snapshot)
+                    if ret_code != 0:
+                        err_msg = "".join(tail_lines).strip() or f"agy exited {ret_code}"
+                        with self._state_lock, get_db_connection(self.db_path) as conn:
+                            conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (err_msg[-1500:], chunk_id))
+                except Exception as e:
+                    worker_exc = e
+                    if not timed_out_reason[0]:
+                        tail_last_15 = "".join(tail_lines[-15:]).rstrip()
+                        _log_build(
+                            f"[Attempt {attempt}/{max_attempts}] Worker error: {e} (steps: {step_cnt})\n"
+                            f"Tail lines (last 15):\n{tail_last_15}"
+                        )
+                finally:
+                    restore_vulcan_worktree_profile(wt_dir, profile_snapshot)
+
+                combined_out = "".join(tail_lines).strip()
+                if (ret_code != 0 or worker_exc is not None) and is_unrecognized_model_error(
+                    f"{combined_out}\n{worker_exc or ''}"
+                ):
+                    rejected_models.add(model)
+                    next_model = resolve_worker_model_fallback(
+                        model,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        rejected_models=rejected_models,
+                    )
+                    if next_model != model and _model_try < 2:
+                        fallback_override_model = next_model
+                        _log_build(
+                            f"[Attempt {attempt}/{max_attempts}] Model '{model}' rejected by agy (is not recognized as a known model); "
+                            f"falling back to '{next_model}' without burning an attempt."
+                        )
+                        continue
+                break
 
             # Record chunk worker invocation telemetry
             worker_elapsed = max(0.0, time.time() - start_ts)

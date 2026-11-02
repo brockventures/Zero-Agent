@@ -1091,6 +1091,94 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertNotIn("**", preview)
         self.assertNotIn("`", preview)
 
+    def test_forge_worker_model_default_and_fallback(self):
+        """Verify forge.py uses gemini-4-argon-low default and falls back when gemini-3.8-flash-high is rejected."""
+        from tools.forge import (
+            DEFAULT_WORKER_MODEL,
+            ESCALATION_WORKER_MODEL,
+            is_unrecognized_model_error,
+            resolve_worker_model_fallback,
+        )
+
+        self.assertEqual(DEFAULT_WORKER_MODEL, "gemini-4-argon-low")
+        self.assertEqual(ESCALATION_WORKER_MODEL, "gemini-4-argon-medium")
+
+        err_line = (
+            'error: invalid model selection (--model "gemini-3.8-flash-high" --effort ""): '
+            "model gemini-3.8-flash-high is not recognized as a known model or custom model in settings"
+        )
+        self.assertTrue(is_unrecognized_model_error(err_line))
+        self.assertFalse(is_unrecognized_model_error("Normal build output"))
+
+        fb1 = resolve_worker_model_fallback("gemini-3.8-flash-high", attempt=1, max_attempts=3)
+        self.assertIn(fb1, ("gemini-4-argon-low", "gemini-4-argon-medium"))
+        self.assertEqual(fb1, "gemini-4-argon-low")
+
+        fb2 = resolve_worker_model_fallback(
+            "gemini-4-argon-low",
+            attempt=1,
+            max_attempts=3,
+            rejected_models={"gemini-3.8-flash-high", "gemini-4-argon-low"},
+        )
+        self.assertEqual(fb2, "gemini-4-argon-medium")
+
+
+class TestBridgeTurnHoldRace(unittest.IsolatedAsyncioTestCase):
+    async def test_result_event_does_not_hold_stream_on_unflushed_tool_output_pending(self):
+        """Verify result event with substantive response and tasks=0 finishes cleanly even if transcript says tool_output_pending."""
+        from unittest.mock import AsyncMock
+        from tools.bridge_engine import TurnCoordinator
+        from tools.bridge_stream import AgyStreamParser
+
+        coord = TurnCoordinator(
+            channel_id=1542081375287640084,
+            prompt="Check status",
+            mode="home",
+            reply_target=MagicMock(),
+            status_msg=None,
+            conv_id="conv-race-123",
+        )
+        coord.turn_start_time = 100.0
+
+        lines = [
+            b'{"event":"step_update","step_update":{"step_type":"tool","tool_name":"run_command"}}\n',
+            b'{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"All services are healthy and verified.","state":"DONE"}}\n',
+            b'{"event":"result","result":{"conversation_id":"conv-race-123","status":"DONE","response":"All services are healthy and verified."}}\n',
+        ]
+        line_iter = iter(lines)
+        reader = AsyncMock()
+        reader.readline = AsyncMock(side_effect=lambda: next(line_iter, b""))
+
+        parser = AgyStreamParser(conv_id="conv-race-123")
+        timer = MagicMock()
+        proc = MagicMock()
+        proc.pid = 4321
+
+        with (
+            patch("tools.task_settle.get_turn_pending_tasks", return_value=[]),
+            patch(
+                "tools.bridge_engine.check_transcript_turn_status",
+                return_value={
+                    "is_complete": False,
+                    "content": None,
+                    "has_active_tool": True,
+                    "reason": "tool_output_pending",
+                    "step_index": 4,
+                },
+            ),
+            patch("tools.bridge_engine.set_channel_session_id"),
+        ):
+            out = await coord.execute_stream_loop(
+                proc=proc,
+                stdout_reader=reader,
+                stream_parser=parser,
+                timer=timer,
+                rules={"live_status_ticker_enabled": False, "auto_thread_escalation_enabled": False},
+            )
+
+        self.assertEqual(out, "All services are healthy and verified.")
+        self.assertIsNotNone(coord.result_received_at)
+
 
 if __name__ == "__main__":
     unittest.main()

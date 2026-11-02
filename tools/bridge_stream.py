@@ -413,6 +413,20 @@ def check_transcript_turn_status(
                         continue
 
                     if stype in ("GENERIC", "tool"):
+                        if saw_interruption:
+                            return {
+                                "is_complete": False,
+                                "content": None,
+                                "reason": "stream_interrupted",
+                                "step_index": interrupted_sidx or sidx,
+                            }
+                        if empty_or_leak_sidx is not None:
+                            return {
+                                "is_complete": False,
+                                "content": None,
+                                "reason": "empty_or_leak_content",
+                                "step_index": empty_or_leak_sidx,
+                            }
                         return {
                             "is_complete": False,
                             "content": None,

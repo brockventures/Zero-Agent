@@ -553,7 +553,12 @@ class TurnCoordinator:
                     str(self.conv_id), min_step_index=self.baseline_step_index
                 )
                 if t_status.get("has_active_tool"):
-                    return False, ""
+                    if not (
+                        t_status.get("reason") == "tool_output_pending"
+                        and self.result_received_at is not None
+                        and self.had_substantive_delta
+                    ):
+                        return False, ""
             except Exception:
                 pass
 
@@ -889,7 +894,39 @@ class TurnCoordinator:
                         t_status = check_transcript_turn_status(
                             str(active_cid), min_step_index=self.baseline_step_index
                         )
-                        if pending_sdk_tasks or t_status.get("has_active_tool"):
+                        candidate_resp = (
+                            stream_parser.get_final_response(fallback_result=res_resp)
+                            or res_resp
+                        ).strip()
+                        has_substantive_resp = bool(
+                            candidate_resp
+                            and not is_internal_cli_leak(candidate_resp)
+                            and not any(
+                                phrase in candidate_resp.lower()
+                                for phrase in (
+                                    "no tools were called",
+                                    "summary of accomplishments will be delivered",
+                                    "will wait for it to finish",
+                                    "i have launched the command",
+                                    "completing silently",
+                                    "executing silently",
+                                )
+                            )
+                        )
+                        has_result_done = (
+                            res_data.get("status") in ("DONE", "SUCCESS")
+                            or bool(res_resp.strip())
+                        )
+                        is_unflushed_tool_output_race = (
+                            len(pending_sdk_tasks) == 0
+                            and t_status.get("reason") == "tool_output_pending"
+                            and has_result_done
+                            and has_substantive_resp
+                        )
+                        if pending_sdk_tasks or (
+                            t_status.get("has_active_tool")
+                            and not is_unflushed_tool_output_race
+                        ):
                             print(
                                 f"[BridgeEngine] ⏳ Intermediate result received in #{worker_name} while background task/tool active "
                                 f"(tasks={len(pending_sdk_tasks)}, reason={t_status.get('reason')}); continuing stdout stream..."
