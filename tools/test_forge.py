@@ -1582,8 +1582,8 @@ def test_execute_chunk_in_worktree_conflict_with_advanced_main_aborts_cleanly(tm
     res = forge.enqueue_build(plan, db_path=db_p, post_widget=False)
     build_id = res["build_id"]
 
-    # FakePopen simulates Vulcan editing standings.py inside wt_dir while main in repo_dir advances with a conflicting commit on attempt 1,
-    # then resolving cleanly on attempt 2 once wt_dir is recreated on top of latest main.
+    # FakePopen simulates Vulcan editing standings.py inside wt_dir while main in repo_dir advances with a conflicting commit on attempt 1.
+    # FORGE preserves the verified commit and completes cleanly without discarding work and re-running the worker.
     attempt_counter = [0]
 
     class FakePopen:
@@ -1598,7 +1598,6 @@ def test_execute_chunk_in_worktree_conflict_with_advanced_main_aborts_cleanly(tm
                 # Vulcan writes its change on top of old base
                 (self.cwd / "standings.py").write_text("LINE = 'chunk_attempt_1'\n", encoding="utf-8")
             else:
-                # On attempt 2, wt_dir was recreated on top of latest main ('main_advanced')
                 assert (self.cwd / "standings.py").read_text(encoding="utf-8") == "LINE = 'main_advanced'\n"
                 (self.cwd / "standings.py").write_text("LINE = 'chunk_attempt_2_resolved'\n", encoding="utf-8")
             self.stdout = iter([])
@@ -1624,8 +1623,8 @@ def test_execute_chunk_in_worktree_conflict_with_advanced_main_aborts_cleanly(tm
 
     ok = sup.execute_chunk_in_worktree(build_id, chunk_row)
     assert ok is True
-    assert attempt_counter[0] == 2
-    assert (repo_dir / "standings.py").read_text(encoding="utf-8") == "LINE = 'chunk_attempt_2_resolved'\n"
+    assert attempt_counter[0] == 1
+    assert (repo_dir / "standings.py").read_text(encoding="utf-8") == "LINE = 'chunk_attempt_1'\n"
     st = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo_dir), capture_output=True, text=True).stdout.strip()
     assert st == ""
 
@@ -3239,6 +3238,226 @@ def test_record_forge_telemetry(tmp_path, monkeypatch):
 
     b_meta = json.loads(b_row["tokens_json"])
     assert b_meta["total_tokens"] == expected_total
+
+
+def _init_test_git_repo(repo_path: Path) -> Path:
+    """Helper to initialize a clean git repository for testing."""
+    repo_path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main", str(repo_path)], capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(repo_path), capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_path), capture_output=True, check=True)
+    (repo_path / "README.md").write_text("# Test Repo\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo_path), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=str(repo_path), capture_output=True, check=True)
+    return repo_path
+
+
+def test_prepare_clean_repo_aborts_wedged_operations(tmp_path):
+    """Verify _prepare_clean_repo_and_sync_base aborts any wedged git merge/rebase/cherry-pick."""
+    repo = _init_test_git_repo(tmp_path / "repo")
+
+    # Create a conflict merge state
+    subprocess.run(["git", "checkout", "-b", "feat"], cwd=str(repo), capture_output=True, check=True)
+    (repo / "README.md").write_text("# Feat Branch\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-am", "Feat commit"], cwd=str(repo), capture_output=True, check=True)
+
+    subprocess.run(["git", "checkout", "main"], cwd=str(repo), capture_output=True, check=True)
+    (repo / "README.md").write_text("# Main Branch\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-am", "Main commit"], cwd=str(repo), capture_output=True, check=True)
+
+    # Trigger a conflicting merge
+    merge_res = subprocess.run(["git", "merge", "feat"], cwd=str(repo), capture_output=True)
+    assert merge_res.returncode != 0
+    assert (repo / ".git" / "MERGE_HEAD").exists()
+
+    # Call _prepare_clean_repo_and_sync_base to clear the wedged merge
+    resolved_ref = forge_mod._prepare_clean_repo_and_sync_base(repo, "main")
+    assert resolved_ref in ("main", "HEAD")
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+
+
+def test_prepare_clean_repo_autostashes_dirty_tracked_files(tmp_path, monkeypatch):
+    """Verify _prepare_clean_repo_and_sync_base auto-stashes dirty tracked files in repo_dir."""
+    repo = _init_test_git_repo(tmp_path / "repo")
+
+    # Dirty a tracked file
+    (repo / "README.md").write_text("# Modified Content\n", encoding="utf-8")
+
+    # When repo != WORKSPACE_DIR, auto-stash executes
+    forge_mod._prepare_clean_repo_and_sync_base(repo, "main")
+    diff_chk = subprocess.run(["git", "diff", "--quiet"], cwd=str(repo), capture_output=True)
+    assert diff_chk.returncode == 0  # Clean after autostash
+
+    stash_list = subprocess.run(["git", "stash", "list"], cwd=str(repo), capture_output=True, text=True)
+    assert "forge-autostash-" in stash_list.stdout
+
+    # When repo == WORKSPACE_DIR and before_merge=False, auto-stash is skipped
+    (repo / "README.md").write_text("# Another Dirty Content\n", encoding="utf-8")
+    monkeypatch.setattr(forge_mod, "WORKSPACE_DIR", repo)
+    forge_mod._prepare_clean_repo_and_sync_base(repo, "main", before_merge=False)
+    diff_chk2 = subprocess.run(["git", "diff", "--quiet"], cwd=str(repo), capture_output=True)
+    assert diff_chk2.returncode != 0  # Still dirty
+
+    # When repo == WORKSPACE_DIR and before_merge=True, auto-stash runs
+    forge_mod._prepare_clean_repo_and_sync_base(repo, "main", before_merge=True)
+    diff_chk3 = subprocess.run(["git", "diff", "--quiet"], cwd=str(repo), capture_output=True)
+    assert diff_chk3.returncode == 0  # Clean after autostash before merge
+
+
+def test_prepare_clean_repo_aligns_default_branch_to_origin(tmp_path):
+    """Verify _prepare_clean_repo_and_sync_base aligns local default_branch to origin/<default_branch> when behind."""
+    bare_remote = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], capture_output=True, check=True)
+
+    local_repo = tmp_path / "local"
+    subprocess.run(["git", "clone", str(bare_remote), str(local_repo)], capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(local_repo), capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(local_repo), capture_output=True, check=True)
+    (local_repo / "README.md").write_text("# Initial\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(local_repo), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial"], cwd=str(local_repo), capture_output=True, check=True)
+    subprocess.run(["git", "push", "origin", "main"], cwd=str(local_repo), capture_output=True, check=True)
+
+    # Push a newer commit to remote from a peer clone
+    peer_repo = tmp_path / "peer"
+    subprocess.run(["git", "clone", str(bare_remote), str(peer_repo)], capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Peer User"], cwd=str(peer_repo), capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "peer@example.com"], cwd=str(peer_repo), capture_output=True, check=True)
+    (peer_repo / "README.md").write_text("# Updated from Peer\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-am", "Peer update"], cwd=str(peer_repo), capture_output=True, check=True)
+    subprocess.run(["git", "push", "origin", "main"], cwd=str(peer_repo), capture_output=True, check=True)
+    peer_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(peer_repo), capture_output=True, text=True).stdout.strip()
+
+    # In local_repo, main is behind origin/main
+    # Calling _prepare_clean_repo_and_sync_base should fetch and align local main
+    latest_ref = forge_mod._prepare_clean_repo_and_sync_base(local_repo, "main")
+    assert latest_ref == "origin/main"
+    local_main_head = subprocess.run(["git", "rev-parse", "main"], cwd=str(local_repo), capture_output=True, text=True).stdout.strip()
+    assert local_main_head == peer_head
+
+
+def test_propagate_build_branches(tmp_path):
+    """Verify _propagate_build_branches deterministically creates or updates downstream branches."""
+    repo = _init_test_git_repo(tmp_path / "repo")
+    head_rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo), capture_output=True, text=True).stdout.strip()
+
+    # Propagate from JSON string in sqlite row or dict
+    build_meta = {"propagate_branches_json": json.dumps(["staging", "release-candidate"])}
+    propagated = forge_mod._propagate_build_branches(repo, "HEAD", build_meta)
+    assert "staging" in propagated
+    assert "release-candidate" in propagated
+
+    stg_rev = subprocess.run(["git", "rev-parse", "staging"], cwd=str(repo), capture_output=True, text=True).stdout.strip()
+    rc_rev = subprocess.run(["git", "rev-parse", "release-candidate"], cwd=str(repo), capture_output=True, text=True).stdout.strip()
+    assert stg_rev == head_rev
+    assert rc_rev == head_rev
+
+    # Propagate from direct list in dict
+    propagated2 = forge_mod._propagate_build_branches(repo, "HEAD", {"propagate_branches": ["preview"]})
+    assert "preview" in propagated2
+    prev_rev = subprocess.run(["git", "rev-parse", "preview"], cwd=str(repo), capture_output=True, text=True).stdout.strip()
+    assert prev_rev == head_rev
+
+
+def test_validate_forge_plan_propagate_branches():
+    """Verify validate_forge_plan validates optional propagate_branches list."""
+    base_plan = {
+        "title": "Branch Propagation Plan",
+        "repo": "/workspace",
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Chunk 0",
+                "target_files": ["tools/forge.py"],
+                "instructions": "Implement feature in forge.py.",
+            }
+        ],
+    }
+
+    # Valid propagate_branches
+    plan_valid = dict(base_plan, propagate_branches=["staging", "feat/release-preview"])
+    ok_v, reason_v = forge_mod.validate_forge_plan(plan_valid)
+    assert ok_v is True
+
+    # Invalid propagate_branches (string instead of list)
+    plan_invalid_str = dict(base_plan, propagate_branches="staging")
+    ok_is, reason_is = forge_mod.validate_forge_plan(plan_invalid_str)
+    assert ok_is is False
+    assert "must be a list of branch name strings" in reason_is
+
+    # Invalid propagate_branches (empty item)
+    plan_invalid_empty = dict(base_plan, propagate_branches=["staging", ""])
+    ok_ie, reason_ie = forge_mod.validate_forge_plan(plan_invalid_empty)
+    assert ok_ie is False
+    assert "must be a list of branch name strings" in reason_ie
+
+
+def test_post_verification_commit_preservation_in_worktree(tmp_path, monkeypatch):
+    """Verify execute_chunk_in_worktree preserves verified commit wt_head_ref even if base_ref rebase conflicts."""
+    repo = _init_test_git_repo(tmp_path / "repo")
+    db_path = tmp_path / "forge.db"
+    forge_mod.init_forge_db(db_path)
+
+    build_id = "fg-test-preserve"
+    chunk_id = f"{build_id}-c0"
+
+    plan = {
+        "id": build_id,
+        "title": "Preserve Commit Test",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "propagate_branches": ["staging"],
+        "chunks": [
+            {
+                "title": "Test Chunk",
+                "target_files": ["README.md"],
+                "instructions": "Update README.md with changes.",
+                "verification_cmd": "true",
+            }
+        ],
+    }
+    forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+
+    supervisor = forge_mod.ForgeSupervisor(db_path=db_path)
+
+    orig_popen = subprocess.Popen
+
+    def _mock_popen(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and any("/usr/local/bin/agy" in str(x) for x in cmd):
+            cwd = kwargs.get("cwd") or (args[1] if len(args) > 1 else None)
+            if cwd and "forge-wt-" in str(cwd):
+                # Simulate worker modifying README.md in wt_dir
+                p = Path(cwd) / "README.md"
+                p.write_text("# Worker Verified Content\n", encoding="utf-8")
+            # Return a process that exits 0
+            return orig_popen(["true"], *args, **kwargs)
+        return orig_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _mock_popen)
+
+    # In repo, advance base_ref (forge/release-fg-test-preserve) with a commit
+    staging_ref = f"forge/release-{build_id}"
+    subprocess.run(["git", "branch", "-f", staging_ref, "main"], cwd=str(repo), capture_output=True)
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        chunk_row = conn.execute("SELECT * FROM forge_chunks WHERE id = ?", (chunk_id,)).fetchone()
+
+    # Execute chunk in worktree
+    success = supervisor.execute_chunk_in_worktree(build_id, chunk_row)
+    assert success is True
+
+    # Verify chunk was marked as merged and build completed
+    with forge_mod.get_db_connection(db_path) as conn:
+        c_row = conn.execute("SELECT * FROM forge_chunks WHERE id = ?", (chunk_id,)).fetchone()
+        b_row = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
+    assert c_row["status"] == "merged"
+    assert b_row["status"] == "completed"
+
+    # Verify downstream branch propagation occurred
+    stg_content = subprocess.run(["git", "show", "staging:README.md"], cwd=str(repo), capture_output=True, text=True).stdout
+    assert "Worker Verified Content" in stg_content
 
 
 if __name__ == "__main__":

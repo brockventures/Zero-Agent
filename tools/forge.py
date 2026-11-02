@@ -782,6 +782,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
                 forge_message_id INTEGER,
                 fact_sheet_json TEXT NOT NULL DEFAULT '[]',
                 shared_context_json TEXT NOT NULL DEFAULT '[]',
+                propagate_branches_json TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL DEFAULT 'queued',
                 tokens_json TEXT NOT NULL DEFAULT '{}',
                 total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -863,6 +864,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
         # Idempotent v1.1 migrations for existing forge.db files
         _ensure_column(conn, "forge_builds", "objective", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "forge_builds", "shared_context_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "forge_builds", "propagate_branches_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "forge_builds", "tokens_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "forge_builds", "total_tokens", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "forge_chunks", "repo", "TEXT NOT NULL DEFAULT ''")
@@ -2200,6 +2202,11 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     )
     if not fact_sheet:
         return False, "Plan must include a non-empty 'context_fact_sheet' (or 'shared_context') list of architectural invariants."
+
+    if "propagate_branches" in plan and plan["propagate_branches"] is not None:
+        pb = plan["propagate_branches"]
+        if not isinstance(pb, list) or not all(isinstance(b, str) and b.strip() for b in pb):
+            return False, "Plan 'propagate_branches' must be a list of branch name strings."
 
     chunks = plan.get("chunks")
     if not isinstance(chunks, list) or not chunks:
@@ -3669,14 +3676,17 @@ def _enqueue_build_impl(
         or ([objective] if objective else [])
     )
 
+    raw_pb = plan.get("propagate_branches") or []
+    norm_pb = [str(b).strip() for b in raw_pb if isinstance(b, str) and str(b).strip()]
+
     with get_db_connection(db_path) as conn:
         conn.execute(
             """
             INSERT INTO forge_builds (
                 id, title, objective, repo, tier, touches_core_bridge,
                 origin_channel_id, origin_thread_id, origin_conv_id,
-                fact_sheet_json, shared_context_json, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                fact_sheet_json, shared_context_json, propagate_branches_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
             """,
             (
                 build_id,
@@ -3690,6 +3700,7 @@ def _enqueue_build_impl(
                 plan.get("origin_conv_id"),
                 json.dumps(norm_fact_sheet),
                 json.dumps(build_shared_ctx),
+                json.dumps(norm_pb),
                 now,
                 now,
             ),
@@ -4776,6 +4787,140 @@ def _resolve_latest_branch_ref(repo_dir: Path | str, default_branch: str) -> str
     return "HEAD"
 
 
+def _prepare_clean_repo_and_sync_base(
+    repo_dir: Path | str,
+    default_branch: str,
+    before_merge: bool = False,
+) -> str:
+    """Ensure base repo has no wedged git operations, auto-stash dirty tracked files, and align local default_branch to latest_def_ref."""
+    rp = Path(repo_dir).resolve()
+
+    # 1. Abort any wedged rebase, merge, or cherry-pick in repo_dir
+    for abort_cmd in (
+        ["git", "cherry-pick", "--abort"],
+        ["git", "merge", "--abort"],
+        ["git", "rebase", "--abort"],
+    ):
+        try:
+            subprocess.run(abort_cmd, cwd=str(rp), capture_output=True, timeout=10)
+        except Exception:
+            pass
+
+    # 2. Auto-stash dirty tracked files in repo_dir when repo_dir != WORKSPACE_DIR or before final merge
+    is_workspace = (rp == Path(WORKSPACE_DIR).resolve())
+    if not is_workspace or before_merge:
+        try:
+            st_diff = subprocess.run(["git", "diff", "--quiet"], cwd=str(rp), capture_output=True)
+            st_cached = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(rp), capture_output=True)
+            if st_diff.returncode != 0 or st_cached.returncode != 0:
+                stash_msg = f"forge-autostash-{int(time.time())}"
+                subprocess.run(
+                    ["git", "stash", "push", "-m", stash_msg],
+                    cwd=str(rp),
+                    capture_output=True,
+                    timeout=15,
+                )
+        except Exception:
+            pass
+
+    # 3. Resolve latest starting ref (fetch origin/<default_branch> and compare with local)
+    latest_def_ref = _resolve_latest_branch_ref(rp, default_branch)
+
+    # 4. Align local default_branch to latest_def_ref when local default_branch is behind or diverged
+    try:
+        rev_local = subprocess.run(
+            ["git", "rev-parse", default_branch],
+            cwd=str(rp),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        rev_latest = subprocess.run(
+            ["git", "rev-parse", latest_def_ref],
+            cwd=str(rp),
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        if rev_local and rev_latest and rev_local != rev_latest:
+            anc = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", latest_def_ref, default_branch],
+                cwd=str(rp),
+                capture_output=True,
+            )
+            if anc.returncode != 0 or latest_def_ref != default_branch:
+                cur_branch = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=str(rp),
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                ).stdout.strip()
+                if cur_branch == default_branch:
+                    subprocess.run(["git", "reset", "--hard", latest_def_ref], cwd=str(rp), capture_output=True, timeout=15)
+                else:
+                    subprocess.run(["git", "branch", "-f", default_branch, latest_def_ref], cwd=str(rp), capture_output=True, timeout=15)
+    except Exception:
+        pass
+
+    return latest_def_ref
+
+
+def _propagate_build_branches(
+    repo_dir: Path | str,
+    target_ref: str,
+    build_row: Any,
+) -> list[str]:
+    """Deterministically propagate the completed build ref to the branches specified in propagate_branches."""
+    if not build_row:
+        return []
+    branch_list: list[str] = []
+    try:
+        if isinstance(build_row, dict):
+            raw_pb = build_row.get("propagate_branches_json") or build_row.get("propagate_branches")
+        elif hasattr(build_row, "keys") and "propagate_branches_json" in build_row.keys():
+            raw_pb = build_row["propagate_branches_json"]
+        else:
+            raw_pb = None
+
+        if isinstance(raw_pb, list):
+            branch_list = raw_pb
+        elif isinstance(raw_pb, str):
+            branch_list = json.loads(raw_pb or "[]")
+    except Exception:
+        branch_list = []
+
+    if not isinstance(branch_list, list) or not branch_list:
+        return []
+
+    rp = Path(repo_dir).resolve()
+    propagated: list[str] = []
+    for br in branch_list:
+        br_name = str(br).strip()
+        if not br_name:
+            continue
+        try:
+            res = subprocess.run(
+                ["git", "branch", "-f", br_name, target_ref],
+                cwd=str(rp),
+                capture_output=True,
+                timeout=10,
+            )
+            if res.returncode == 0:
+                propagated.append(br_name)
+            try:
+                subprocess.run(
+                    ["git", "push", "origin", br_name],
+                    cwd=str(rp),
+                    capture_output=True,
+                    timeout=60,
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[FORGE] Warning: propagate branch {br_name} to {target_ref} failed: {e}", file=sys.stderr)
+    return propagated
+
+
 def _get_build_target_pairs(
     conn: sqlite3.Connection,
     build_id: str,
@@ -5074,7 +5219,7 @@ class ForgeSupervisor:
                     try:
                         def_br = _get_repo_default_branch(r_dir)
                         staging_ref = f"forge/release-{build_id}"
-                        start_ref = _resolve_latest_branch_ref(r_dir, def_br)
+                        start_ref = _prepare_clean_repo_and_sync_base(r_dir, def_br)
                         subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(r_dir), capture_output=True, timeout=10)
                     finally:
                         _release_file_lock(git_lk)
@@ -5101,6 +5246,8 @@ class ForgeSupervisor:
                                 "UPDATE forge_builds SET status = 'completed', updated_at = ? WHERE id = ?",
                                 (time.time(), build_id),
                             )
+                        eff_r = (chunks[0]["repo"] if chunks and "repo" in chunks[0].keys() and chunks[0]["repo"] else build["repo"]) or "/workspace"
+                        _propagate_build_branches(eff_r, f"forge/release-{build_id}", build)
                         post_or_update_build_widget(build_id, db_path=self.db_path)
                         dispatch_build_completion_to_origin(build_id, db_path=self.db_path)
                         return True
@@ -5200,7 +5347,7 @@ class ForgeSupervisor:
                 return
             git_lk = _acquire_repo_git_lock(repo_dir)
             try:
-                latest_def_ref = _resolve_latest_branch_ref(repo_dir, default_branch)
+                latest_def_ref = _prepare_clean_repo_and_sync_base(repo_dir, default_branch)
                 chk_stg = subprocess.run(["git", "rev-parse", "--verify", staging_ref], cwd=str(repo_dir), capture_output=True)
                 if chk_stg.returncode != 0:
                     subprocess.run(["git", "branch", "-f", staging_ref, latest_def_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
@@ -5288,6 +5435,11 @@ class ForgeSupervisor:
             worker_exc: Optional[Exception] = None
             worker_conv_id: Optional[str] = None
             start_ts = time.time()
+            tail_lines: list[str] = []
+            step_cnt = 0
+            last_widget_patch = start_ts
+            last_activity_ts = [start_ts]
+            timed_out_reason: list[Optional[str]] = [None]
             try:
                 vulcan_env = os.environ.copy()
                 vulcan_env["FORGE_WORKER_ACTIVE"] = "1"
@@ -5302,12 +5454,6 @@ class ForgeSupervisor:
                     bufsize=1,
                     start_new_session=True,
                 )
-                tail_lines: list[str] = []
-                step_cnt = 0
-                last_widget_patch = time.time()
-                start_ts = time.time()
-                last_activity_ts = [start_ts]
-                timed_out_reason: list[Optional[str]] = [None]
                 watchdog_stop = threading.Event()
 
                 def _chunk_watchdog() -> None:
@@ -5504,6 +5650,20 @@ class ForgeSupervisor:
                             )
                         continue
 
+                    # Resolve verified commit hash in wt_dir
+                    wt_head_proc = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=str(wt_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    wt_head_ref = (
+                        wt_head_proc.stdout.strip()
+                        if wt_head_proc.returncode == 0 and wt_head_proc.stdout.strip()
+                        else branch_name
+                    )
+
                     # If a parallel sibling chunk already advanced base_ref since this worktree branched,
                     # rebase this chunk's commit onto the latest base_ref before fast-forwarding base_ref.
                     anc_chk = subprocess.run(
@@ -5522,53 +5682,36 @@ class ForgeSupervisor:
                         )
                         if rb_proc.returncode != 0:
                             subprocess.run(["git", "rebase", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
-                            shutil.rmtree(wt_dir, ignore_errors=True)
-                            subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
                             rb_err = f"{rb_proc.stdout}\n{rb_proc.stderr}".strip()
-                            _log_build(f"[Attempt {attempt}/{max_attempts}] Git rebase onto {base_ref} failed: {rb_err}")
-                            with self._state_lock, get_db_connection(self.db_path) as conn:
-                                conn.execute(
-                                    "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
-                                    (f"git rebase onto {base_ref} failed:\n{rb_err}"[-1400:], chunk_id),
+                            _log_build(
+                                f"[Attempt {attempt}/{max_attempts}] Git rebase onto {base_ref} failed ({rb_err}); "
+                                "attempting cherry-pick / git branch -f recovery to preserve verified commit"
+                            )
+                            # Attempt cherry-pick recovery of verified commit wt_head_ref onto base_ref
+                            subprocess.run(["git", "reset", "--hard", base_ref], cwd=str(wt_dir), capture_output=True, timeout=10)
+                            cp_rec = subprocess.run(
+                                ["git", "cherry-pick", wt_head_ref],
+                                cwd=str(wt_dir),
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
+                            )
+                            if cp_rec.returncode != 0:
+                                subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
+                                # git branch -f recovery: keep verified commit at wt_head_ref
+                                subprocess.run(["git", "reset", "--hard", wt_head_ref], cwd=str(wt_dir), capture_output=True, timeout=10)
+                                _log_build(f"[Attempt {attempt}/{max_attempts}] Preserving verified commit via branch -f: {wt_head_ref}")
+                            else:
+                                wt_head_rec = subprocess.run(
+                                    ["git", "rev-parse", "HEAD"],
+                                    cwd=str(wt_dir),
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=10,
                                 )
-                            continue
+                                if wt_head_rec.returncode == 0 and wt_head_rec.stdout.strip():
+                                    wt_head_ref = wt_head_rec.stdout.strip()
 
-                    # Also ensure the chunk worktree is rebased onto the latest default_branch if default_branch advanced in repo_dir
-                    anc_def = subprocess.run(
-                        ["git", "merge-base", "--is-ancestor", default_branch, branch_name],
-                        cwd=str(repo_dir),
-                        capture_output=True,
-                        timeout=10,
-                    )
-                    if anc_def.returncode != 0:
-                        rb_def = subprocess.run(
-                            ["git", "rebase", default_branch],
-                            cwd=str(wt_dir),
-                            capture_output=True,
-                            text=True,
-                            timeout=30,
-                        )
-                        if rb_def.returncode != 0:
-                            subprocess.run(["git", "rebase", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
-                            shutil.rmtree(wt_dir, ignore_errors=True)
-                            subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
-                            rb_def_err = f"{rb_def.stdout}\n{rb_def.stderr}".strip()
-                            _log_build(f"[Attempt {attempt}/{max_attempts}] Git rebase onto {default_branch} failed: {rb_def_err}")
-                            with self._state_lock, get_db_connection(self.db_path) as conn:
-                                conn.execute(
-                                    "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
-                                    (f"git rebase onto {default_branch} failed:\n{rb_def_err}"[-1400:], chunk_id),
-                                )
-                            continue
-
-                    wt_head_proc = subprocess.run(
-                        ["git", "rev-parse", "HEAD"],
-                        cwd=str(wt_dir),
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    wt_head_ref = wt_head_proc.stdout.strip() if wt_head_proc.returncode == 0 and wt_head_proc.stdout.strip() else branch_name
                     subprocess.run(
                         ["git", "branch", "-f", branch_name, wt_head_ref],
                         cwd=str(repo_dir),
@@ -5591,12 +5734,7 @@ class ForgeSupervisor:
                     # If final chunk completed and not touching core bridge, sync staging branch into local default branch
                     # BEFORE marking the chunk/build completed so a merge/cherry-pick conflict never leaves repo_dir dirty or drops commits
                     if other_unmerged == 0:
-                        for abort_cmd in (
-                            ["git", "cherry-pick", "--abort"],
-                            ["git", "merge", "--abort"],
-                            ["git", "rebase", "--abort"],
-                        ):
-                            subprocess.run(abort_cmd, cwd=str(repo_dir), capture_output=True, timeout=10)
+                        _prepare_clean_repo_and_sync_base(repo_dir, default_branch, before_merge=True)
 
                         sync_err = ""
                         try:
@@ -5624,7 +5762,29 @@ class ForgeSupervisor:
                                     )
                                     if cp_proc.returncode != 0:
                                         subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(repo_dir), capture_output=True, timeout=10)
-                                        sync_err = f"git merge --ff-only and cherry-pick failed:\n{ff_proc.stdout}\n{ff_proc.stderr}\n{cp_proc.stdout}\n{cp_proc.stderr}".strip()
+                                        # Auto-stash dirty files and retry cherry-pick
+                                        _prepare_clean_repo_and_sync_base(repo_dir, default_branch, before_merge=True)
+                                        cp_retry = subprocess.run(
+                                            ["git", "cherry-pick", f"{default_branch}..{base_ref}"],
+                                            cwd=str(repo_dir),
+                                            capture_output=True,
+                                            text=True,
+                                            timeout=30,
+                                        )
+                                        if cp_retry.returncode != 0:
+                                            subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(repo_dir), capture_output=True, timeout=10)
+                                            # Attempt git branch -f recovery of verified commit
+                                            cur_b = subprocess.run(
+                                                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                                cwd=str(repo_dir),
+                                                capture_output=True,
+                                                text=True,
+                                                timeout=10,
+                                            ).stdout.strip()
+                                            if cur_b == default_branch:
+                                                subprocess.run(["git", "reset", "--hard", base_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
+                                            else:
+                                                subprocess.run(["git", "branch", "-f", default_branch, base_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
                             else:
                                 cp_proc = subprocess.run(
                                     ["git", "cherry-pick", f"{default_branch}..{base_ref}"],
@@ -5635,21 +5795,34 @@ class ForgeSupervisor:
                                 )
                                 if cp_proc.returncode != 0:
                                     subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(repo_dir), capture_output=True, timeout=10)
-                                    sync_err = f"git cherry-pick {default_branch}..{base_ref} failed:\n{cp_proc.stdout}\n{cp_proc.stderr}".strip()
+                                    _prepare_clean_repo_and_sync_base(repo_dir, default_branch, before_merge=True)
+                                    cp_retry = subprocess.run(
+                                        ["git", "cherry-pick", f"{default_branch}..{base_ref}"],
+                                        cwd=str(repo_dir),
+                                        capture_output=True,
+                                        text=True,
+                                        timeout=30,
+                                    )
+                                    if cp_retry.returncode != 0:
+                                        subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(repo_dir), capture_output=True, timeout=10)
+                                        cur_b = subprocess.run(
+                                            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                                            cwd=str(repo_dir),
+                                            capture_output=True,
+                                            text=True,
+                                            timeout=10,
+                                        ).stdout.strip()
+                                        if cur_b == default_branch:
+                                            subprocess.run(["git", "reset", "--hard", base_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
+                                        else:
+                                            subprocess.run(["git", "branch", "-f", default_branch, base_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
                         except Exception as e:
                             subprocess.run(["git", "cherry-pick", "--abort"], cwd=str(repo_dir), capture_output=True, timeout=10)
                             sync_err = f"git merge/cherry-pick {base_ref} failed/timed out: {e}"
 
                         if sync_err:
                             print(f"[FORGE] Warning: {sync_err}", file=sys.stderr)
-                            shutil.rmtree(wt_dir, ignore_errors=True)
-                            subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
-                            with self._state_lock, get_db_connection(self.db_path) as conn:
-                                conn.execute(
-                                    "UPDATE forge_chunks SET last_error = ? WHERE id = ?",
-                                    (sync_err[-1400:], chunk_id),
-                                )
-                            continue
+                            _log_build(f"[Attempt {attempt}/{max_attempts}] Warning syncing {base_ref} to {default_branch}: {sync_err}")
 
                     shutil.rmtree(wt_dir, ignore_errors=True)
                     subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
@@ -5674,6 +5847,8 @@ class ForgeSupervisor:
                             subprocess.run(["git", "push", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=60)
                         except Exception as e:
                             print(f"[FORGE] Warning: git push origin {default_branch} failed/timed out: {e}", file=sys.stderr)
+
+                        _propagate_build_branches(repo_dir, base_ref, build)
                 finally:
                     _release_file_lock(git_lk)
 
