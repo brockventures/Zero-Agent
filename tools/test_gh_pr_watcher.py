@@ -11,30 +11,34 @@ import unittest
 from unittest.mock import MagicMock, call, patch
 from typing import Any
 
-# Ensure paths
-for _p in (
-    str(Path(__file__).resolve().parent.parent),
-    "/workspace",
-    "/workspace/tools",
-):
+# Ensure local repo path takes precedence over global /workspace
+_local_repo = str(Path(__file__).resolve().parent.parent)
+if _local_repo in sys.path:
+    sys.path.remove(_local_repo)
+sys.path.insert(0, _local_repo)
+for _p in ("/workspace", "/workspace/tools"):
     if _p not in sys.path:
-        sys.path.insert(0, _p)
+        sys.path.append(_p)
 
 from tools.gh_pr_watcher import (
     FORGE_CHANNEL_ID,
+    WHITELISTED_AUTHORS,
     ZERO_OPS_CHANNEL_ID,
     check_pr,
     discover_open_prs,
     dispatch_notification,
+    ensure_schedule_registered,
     format_comment_message,
     format_review_message,
     format_review_request_message,
     get_authenticated_user,
     get_pr_details,
+    is_ci_passing_or_empty,
     load_state,
     poll_and_notify,
     save_state,
     truncate_body,
+    try_auto_merge_pr,
 )
 
 
@@ -667,6 +671,489 @@ class TestGhPrWatcherEndToEnd(unittest.TestCase):
             mock_outbox.assert_not_called()
         finally:
             tmp_state.unlink(missing_ok=True)
+
+
+class TestGhPrWatcherAutoMerge(unittest.TestCase):
+    """Test whitelisted author auto-merge and gate conditions."""
+
+    def test_whitelisted_authors_set(self) -> None:
+        """Verify all whitelisted Crab Cavern authors are present in WHITELISTED_AUTHORS."""
+        expected = {
+            "mcarmody",
+            "arcane103",
+            "aerial-bot",
+            "amos-bot",
+            "marvin-bot",
+            "ryanbrock",
+            "zero-brock",
+        }
+        for author in expected:
+            self.assertIn(author, WHITELISTED_AUTHORS)
+
+    def test_is_ci_passing_or_empty(self) -> None:
+        """Test CI rollup status evaluator across various shapes."""
+        # Empty or None
+        self.assertTrue(is_ci_passing_or_empty(None))
+        self.assertTrue(is_ci_passing_or_empty([]))
+        self.assertTrue(is_ci_passing_or_empty({}))
+
+        # Passing check run list
+        self.assertTrue(
+            is_ci_passing_or_empty([
+                {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"status": "COMPLETED", "conclusion": "NEUTRAL"},
+                {"status": "COMPLETED", "conclusion": "SKIPPED"},
+            ])
+        )
+
+        # Passing state list
+        self.assertTrue(
+            is_ci_passing_or_empty([{"state": "SUCCESS"}, {"state": "SUCCESS"}])
+        )
+
+        # Failing conclusion
+        self.assertFalse(
+            is_ci_passing_or_empty([
+                {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"status": "COMPLETED", "conclusion": "FAILURE"},
+            ])
+        )
+
+        # Failing state
+        self.assertFalse(
+            is_ci_passing_or_empty([
+                {"state": "SUCCESS"},
+                {"state": "FAILURE"},
+            ])
+        )
+
+        # In-progress / pending status
+        self.assertFalse(
+            is_ci_passing_or_empty([{"status": "IN_PROGRESS"}])
+        )
+        self.assertFalse(
+            is_ci_passing_or_empty([{"state": "PENDING"}])
+        )
+
+        # Dict summaries
+        self.assertTrue(is_ci_passing_or_empty({"state": "SUCCESS"}))
+        self.assertFalse(is_ci_passing_or_empty({"state": "FAILURE"}))
+        self.assertFalse(is_ci_passing_or_empty({"state": "PENDING"}))
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_approved_green_ci_triggers_auto_merge(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """Approved PR from whitelisted author with passing CI triggers squash auto-merge."""
+        mock_run_gh.return_value = subprocess.CompletedProcess(
+            args=["gh", "pr", "merge"],
+            returncode=0,
+            stdout="Merged",
+            stderr="",
+        )
+
+        pr_data = {
+            "number": 5,
+            "author": {"login": "mcarmody"},
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "SUCCESS"},
+            ],
+            "reviews": [],
+            "latestReviews": [],
+        }
+
+        result = try_auto_merge_pr("mcarmody/lomin", 5, pr_data)
+        self.assertTrue(result)
+        mock_run_gh.assert_called_once_with([
+            "pr",
+            "merge",
+            "5",
+            "--repo",
+            "mcarmody/lomin",
+            "--squash",
+            "--auto",
+        ])
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_approved_empty_ci_triggers_auto_merge(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """Approved PR from whitelisted author with empty CI rollup triggers squash auto-merge."""
+        mock_run_gh.return_value = subprocess.CompletedProcess(
+            args=["gh", "pr", "merge"],
+            returncode=0,
+            stdout="Merged",
+            stderr="",
+        )
+
+        pr_data = {
+            "number": 10,
+            "author": "ryanbrock",
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [],
+            "reviews": [],
+            "latestReviews": [],
+        }
+
+        result = try_auto_merge_pr("brockventures/gotchi", 10, pr_data)
+        self.assertTrue(result)
+        mock_run_gh.assert_called_once_with([
+            "pr",
+            "merge",
+            "10",
+            "--repo",
+            "brockventures/gotchi",
+            "--squash",
+            "--auto",
+        ])
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_fallback_when_auto_disabled(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """When repo has auto-merge disabled, falls back to --squash --delete-branch."""
+        # First call fails, second call succeeds
+        mock_run_gh.side_effect = [
+            subprocess.CompletedProcess(
+                args=["gh", "pr", "merge", "--auto"],
+                returncode=1,
+                stdout="",
+                stderr="pull request auto merge is not allowed for this repository",
+            ),
+            subprocess.CompletedProcess(
+                args=["gh", "pr", "merge", "--delete-branch"],
+                returncode=0,
+                stdout="Merged and deleted branch",
+                stderr="",
+            ),
+        ]
+
+        pr_data = {
+            "number": 42,
+            "author": {"login": "aerial-bot"},
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [{"state": "SUCCESS"}],
+            "reviews": [],
+            "latestReviews": [],
+        }
+
+        result = try_auto_merge_pr("brockventures/gotchi", 42, pr_data)
+        self.assertTrue(result)
+        self.assertEqual(mock_run_gh.call_count, 2)
+        mock_run_gh.assert_has_calls([
+            call([
+                "pr",
+                "merge",
+                "42",
+                "--repo",
+                "brockventures/gotchi",
+                "--squash",
+                "--auto",
+            ]),
+            call([
+                "pr",
+                "merge",
+                "42",
+                "--repo",
+                "brockventures/gotchi",
+                "--squash",
+                "--delete-branch",
+            ]),
+        ])
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_fallback_fails(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """When both auto-merge and fallback merge fail, returns False."""
+        mock_run_gh.side_effect = [
+            subprocess.CompletedProcess(
+                args=["gh", "pr", "merge", "--auto"],
+                returncode=1,
+                stdout="",
+                stderr="auto merge disabled",
+            ),
+            subprocess.CompletedProcess(
+                args=["gh", "pr", "merge", "--delete-branch"],
+                returncode=1,
+                stdout="",
+                stderr="branch protection merge error",
+            ),
+        ]
+
+        pr_data = {
+            "number": 42,
+            "author": {"login": "aerial-bot"},
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [],
+            "reviews": [],
+            "latestReviews": [],
+        }
+
+        result = try_auto_merge_pr("brockventures/gotchi", 42, pr_data)
+        self.assertFalse(result)
+        self.assertEqual(mock_run_gh.call_count, 2)
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_peer_approval_without_review_decision(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """PR without official reviewDecision but approved by peer collaborator auto-merges."""
+        mock_run_gh.return_value = subprocess.CompletedProcess(
+            args=["gh", "pr", "merge"],
+            returncode=0,
+            stdout="Merged",
+            stderr="",
+        )
+
+        pr_data = {
+            "number": 15,
+            "author": {"login": "amos-bot"},
+            "reviewDecision": "REVIEW_REQUIRED",
+            "statusCheckRollup": [],
+            "latestReviews": [
+                {
+                    "id": "REV_PEER_1",
+                    "author": {"login": "zero-brock"},
+                    "state": "APPROVED",
+                }
+            ],
+        }
+
+        result = try_auto_merge_pr("brockventures/Zero-Agent", 15, pr_data)
+        self.assertTrue(result)
+        mock_run_gh.assert_called_once()
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_blocked_by_changes_requested(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """PR with CHANGES_REQUESTED is blocked from auto-merging."""
+        pr_data = {
+            "number": 5,
+            "author": {"login": "mcarmody"},
+            "reviewDecision": "CHANGES_REQUESTED",
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "SUCCESS"}
+            ],
+            "reviews": [],
+            "latestReviews": [],
+        }
+
+        result = try_auto_merge_pr("mcarmody/lomin", 5, pr_data)
+        self.assertFalse(result)
+        mock_run_gh.assert_not_called()
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_blocked_by_review_with_changes_requested(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """PR with active CHANGES_REQUESTED in reviews is blocked even if reviewDecision is empty."""
+        pr_data = {
+            "number": 5,
+            "author": {"login": "mcarmody"},
+            "reviewDecision": "NONE",
+            "statusCheckRollup": [],
+            "latestReviews": [
+                {
+                    "author": {"login": "arcane103"},
+                    "state": "CHANGES_REQUESTED",
+                }
+            ],
+        }
+
+        result = try_auto_merge_pr("mcarmody/lomin", 5, pr_data)
+        self.assertFalse(result)
+        mock_run_gh.assert_not_called()
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_blocked_by_failing_ci_conclusion(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """PR with failing CI conclusion blocks auto-merge."""
+        pr_data = {
+            "number": 5,
+            "author": {"login": "mcarmody"},
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [
+                {"status": "COMPLETED", "conclusion": "FAILURE"}
+            ],
+            "reviews": [],
+            "latestReviews": [],
+        }
+
+        result = try_auto_merge_pr("mcarmody/lomin", 5, pr_data)
+        self.assertFalse(result)
+        mock_run_gh.assert_not_called()
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_blocked_by_failing_ci_state(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """PR with failing CI state blocks auto-merge."""
+        pr_data = {
+            "number": 5,
+            "author": {"login": "mcarmody"},
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [
+                {"state": "FAILURE"}
+            ],
+            "reviews": [],
+            "latestReviews": [],
+        }
+
+        result = try_auto_merge_pr("mcarmody/lomin", 5, pr_data)
+        self.assertFalse(result)
+        mock_run_gh.assert_not_called()
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_blocked_by_pending_ci(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """PR with in-progress/pending CI checks blocks auto-merge until green."""
+        pr_data = {
+            "number": 5,
+            "author": {"login": "marvin-bot"},
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [
+                {"status": "IN_PROGRESS"}
+            ],
+            "reviews": [],
+            "latestReviews": [],
+        }
+
+        result = try_auto_merge_pr("mcarmody/lomin", 5, pr_data)
+        self.assertFalse(result)
+        mock_run_gh.assert_not_called()
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_non_whitelisted_author_never_merged(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """PR from a non-whitelisted author is never auto-merged."""
+        pr_data = {
+            "number": 99,
+            "author": {"login": "untrusted-user"},
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [],
+            "reviews": [],
+            "latestReviews": [],
+        }
+
+        result = try_auto_merge_pr("brockventures/gotchi", 99, pr_data)
+        self.assertFalse(result)
+        mock_run_gh.assert_not_called()
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_try_auto_merge_pr_dry_run(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """Dry-run mode returns True without calling gh pr merge."""
+        pr_data = {
+            "number": 12,
+            "author": {"login": "mcarmody"},
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [],
+            "reviews": [],
+            "latestReviews": [],
+        }
+
+        result = try_auto_merge_pr("mcarmody/lomin", 12, pr_data, dry_run=True)
+        self.assertTrue(result)
+        mock_run_gh.assert_not_called()
+
+    @patch("tools.gh_pr_watcher.try_auto_merge_pr")
+    @patch("tools.gh_pr_watcher.queue_outbox_message")
+    def test_check_pr_auto_merge_integration_and_dedupe(
+        self, mock_outbox: MagicMock, mock_auto_merge: MagicMock
+    ) -> None:
+        """check_pr executes auto-merge for approved PRs and records state to prevent duplicate merges."""
+        mock_outbox.return_value = {"status": "queued"}
+        mock_auto_merge.return_value = True
+
+        state: dict[str, Any] = {
+            "version": 1,
+            "seen_review_ids": [],
+            "seen_comment_ids": [],
+            "seen_review_requests": [],
+            "review_decisions": {},
+            "auto_merged_prs": [],
+        }
+
+        pr_details = {
+            "repo": "mcarmody/lomin",
+            "number": 5,
+            "title": "feat: auto-merge test",
+            "url": "https://github.com/mcarmody/lomin/pull/5",
+            "author": {"login": "mcarmody"},
+            "reviewDecision": "APPROVED",
+            "reviews": [
+                {
+                    "id": "REV_APPROVED_1",
+                    "author": {"login": "arcane103"},
+                    "state": "APPROVED",
+                    "submittedAt": "2026-11-02T04:50:00Z",
+                    "body": "LGTM!",
+                }
+            ],
+            "reviewRequests": [],
+            "comments": [],
+            "statusCheckRollup": [],
+        }
+
+        # First run: triggers auto-merge and records in state
+        stats1 = check_pr(
+            pr_details=pr_details,
+            state=state,
+            current_user="zero-brock",
+        )
+        self.assertTrue(stats1["auto_merged"])
+        mock_auto_merge.assert_called_once_with(
+            repo="mcarmody/lomin",
+            pr_number=5,
+            pr_data=pr_details,
+            dry_run=False,
+        )
+        self.assertIn("mcarmody/lomin#5", state["auto_merged_prs"])
+
+        # Second run: does not re-merge already merged PR
+        mock_auto_merge.reset_mock()
+        stats2 = check_pr(
+            pr_details=pr_details,
+            state=state,
+            current_user="zero-brock",
+        )
+        self.assertFalse(stats2["auto_merged"])
+        mock_auto_merge.assert_not_called()
+
+        # If changes are requested subsequently, removes from auto_merged_prs
+        pr_details["reviewDecision"] = "CHANGES_REQUESTED"
+        check_pr(
+            pr_details=pr_details,
+            state=state,
+            current_user="zero-brock",
+        )
+        self.assertNotIn("mcarmody/lomin#5", state["auto_merged_prs"])
+
+    def test_ensure_schedule_registered_idempotent(self) -> None:
+        """ensure_schedule_registered adds gh_pr_watcher with */3 * * * * and is idempotent."""
+        tmp_sched = Path("/tmp/test_gh_pr_watcher_schedule.json")
+        tmp_sched.write_text(json.dumps([{"id": "existing_job"}]), encoding="utf-8")
+        try:
+            added1 = ensure_schedule_registered(tmp_sched)
+            self.assertTrue(added1)
+            entries = json.loads(tmp_sched.read_text(encoding="utf-8"))
+            self.assertEqual(len(entries), 2)
+            watcher_entry = [e for e in entries if e.get("id") == "gh_pr_watcher"][0]
+            self.assertEqual(watcher_entry["cron_expression"], "*/3 * * * *")
+            self.assertEqual(watcher_entry["interval_seconds"], 180)
+            self.assertTrue(watcher_entry["enabled"])
+
+            added2 = ensure_schedule_registered(tmp_sched)
+            self.assertFalse(added2)
+        finally:
+            tmp_sched.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

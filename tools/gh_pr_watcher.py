@@ -21,14 +21,14 @@ import sys
 import time
 from typing import Any
 
-# Ensure workspace paths are present
-for _p in (
-    str(Path(__file__).resolve().parent.parent),
-    "/workspace",
-    "/workspace/tools",
-):
+# Ensure local repo path takes precedence over global /workspace
+_local_repo = str(Path(__file__).resolve().parent.parent)
+if _local_repo in sys.path:
+    sys.path.remove(_local_repo)
+sys.path.insert(0, _local_repo)
+for _p in ("/workspace", "/workspace/tools"):
     if _p not in sys.path:
-        sys.path.insert(0, _p)
+        sys.path.append(_p)
 
 try:
     from tools.outbox import queue_outbox_message
@@ -59,11 +59,234 @@ ZERO_OPS_CHANNEL_ID = 1544953279664889888
 DEFAULT_CHANNELS: list[str | int] = [FORGE_CHANNEL_ID, ZERO_OPS_CHANNEL_ID]
 
 DEFAULT_STATE_FILE = Path("/workspace/data/gh_pr_watcher_state.json")
+DEFAULT_SCHEDULE_FILE = Path("/workspace/data/schedule.json")
 DEFAULT_TARGET_REPOS = [
     "mcarmody/lomin",
     "brockventures/*",
     "arcane103/*",
 ]
+
+# Whitelisted Crab Cavern authors for automated review and squash auto-merges
+WHITELISTED_AUTHORS: set[str] = {
+    "mcarmody",
+    "arcane103",
+    "aerial-bot",
+    "amos-bot",
+    "marvin-bot",
+    "ryanbrock",
+    "zero-brock",
+    "brockventures",
+}
+
+
+def ensure_schedule_registered(
+    schedule_file: Path = DEFAULT_SCHEDULE_FILE,
+) -> bool:
+    """Register gh_pr_watcher in /workspace/data/schedule.json (every 3m) if not present."""
+    if not schedule_file.exists():
+        return False
+    try:
+        raw = schedule_file.read_text(encoding="utf-8")
+        entries = json.loads(raw)
+        if not isinstance(entries, list):
+            return False
+        for item in entries:
+            if isinstance(item, dict) and item.get("id") == "gh_pr_watcher":
+                return False
+        entries.append(
+            {
+                "id": "gh_pr_watcher",
+                "name": "GitHub PR Watcher & Auto-Merge",
+                "enabled": True,
+                "schedule_type": "interval",
+                "interval_seconds": 180,
+                "cron_expression": "*/3 * * * *",
+                "prompt": "Run GitHub PR review and auto-merge watcher using python3 /workspace/tools/gh_pr_watcher.py",
+                "catchup_if_missed": False,
+                "channel_id": FORGE_CHANNEL_ID,
+            }
+        )
+        tmp_file = schedule_file.with_suffix(f".tmp.{os.getpid()}")
+        tmp_file.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+        tmp_file.replace(schedule_file)
+        return True
+    except Exception as exc:
+        log.warning("Failed ensuring gh_pr_watcher in %s: %s", schedule_file, exc)
+        return False
+
+
+def is_ci_passing_or_empty(status_rollup: Any) -> bool:
+    """Return True if CI status checks are all passing or empty/unconfigured."""
+    if not status_rollup:
+        return True
+
+    # Handle single dictionary summary
+    if isinstance(status_rollup, dict):
+        state = str(status_rollup.get("state") or status_rollup.get("status") or "").upper()
+        if state in ("FAILURE", "ERROR"):
+            return False
+        if state in ("PENDING", "IN_PROGRESS", "QUEUED"):
+            return False
+        checks = status_rollup.get("contexts") or status_rollup.get("checks") or []
+        if not checks:
+            return state in ("SUCCESS", "COMPLETED", "")
+        status_rollup = checks
+
+    if isinstance(status_rollup, list):
+        for check in status_rollup:
+            if not isinstance(check, dict):
+                continue
+            conclusion = str(check.get("conclusion") or "").upper()
+            state = str(check.get("state") or "").upper()
+            status = str(check.get("status") or "").upper()
+
+            # Definite failure states
+            if conclusion in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "STARTUP_FAILURE"):
+                return False
+            if state in ("FAILURE", "ERROR"):
+                return False
+
+            # In-progress / pending states block merge until finished
+            if status in ("IN_PROGRESS", "QUEUED", "WAITING", "REQUESTED"):
+                return False
+            if state in ("PENDING", "EXPECTED"):
+                return False
+
+    return True
+
+
+def try_auto_merge_pr(
+    repo: str,
+    pr_number: int | str,
+    pr_data: dict[str, Any],
+    dry_run: bool = False,
+) -> bool:
+    """Attempt squash auto-merge on an approved PR from a whitelisted author with green CI.
+
+    Checks:
+    1. Author is in WHITELISTED_AUTHORS.
+    2. reviewDecision == 'APPROVED' or clean peer review from a whitelisted collaborator.
+    3. CI status rollup is passing or empty.
+
+    Executes:
+    gh pr merge <num> --repo <repo> --squash --auto
+    (with fallback to gh pr merge <num> --repo <repo> --squash --delete-branch if
+    auto-merge setting is disabled on that repository).
+    """
+    try:
+        num = int(pr_number)
+    except (ValueError, TypeError):
+        return False
+
+    # 1. Author must be whitelisted
+    author = pr_data.get("author")
+    if isinstance(author, dict):
+        author_login = str(author.get("login") or "").strip().lower()
+    else:
+        author_login = str(author or "").strip().lower()
+
+    if not author_login or author_login not in WHITELISTED_AUTHORS:
+        log.info(
+            "PR %s#%s author '%s' is not whitelisted for auto-merge",
+            repo,
+            num,
+            author_login,
+        )
+        return False
+
+    # 2. Check review decision & clean whitelisted peer approval
+    review_decision = str(pr_data.get("reviewDecision") or "").upper()
+    if review_decision == "CHANGES_REQUESTED":
+        log.info(
+            "PR %s#%s has CHANGES_REQUESTED; blocking auto-merge",
+            repo,
+            num,
+        )
+        return False
+
+    # Check for any active CHANGES_REQUESTED in reviews
+    latest_reviews = pr_data.get("latestReviews") or []
+    all_reviews = latest_reviews if latest_reviews else (pr_data.get("reviews") or [])
+    combined_reviews = list(latest_reviews) + [
+        r for r in (pr_data.get("reviews") or []) if r not in latest_reviews
+    ]
+    for rev in all_reviews:
+        if str(rev.get("state") or "").upper() == "CHANGES_REQUESTED":
+            log.info(
+                "PR %s#%s has active CHANGES_REQUESTED review; blocking auto-merge",
+                repo,
+                num,
+            )
+            return False
+
+    is_approved = (review_decision == "APPROVED")
+    if not is_approved:
+        # Check if there is a clean peer approval from a whitelisted collaborator / Zero
+        # (including when Zero approves a whitelisted collaborator PR on brockventures/* repos)
+        for rev in combined_reviews:
+            if str(rev.get("state") or "").upper() == "APPROVED":
+                rev_author = rev.get("author")
+                if isinstance(rev_author, dict):
+                    rev_login = str(rev_author.get("login") or "").strip().lower()
+                else:
+                    rev_login = str(rev_author or "").strip().lower()
+                if rev_login in WHITELISTED_AUTHORS and rev_login != author_login:
+                    is_approved = True
+                    break
+
+    if not is_approved:
+        log.info(
+            "PR %s#%s is not approved (decision=%s); skipping auto-merge",
+            repo,
+            num,
+            review_decision or "NONE",
+        )
+        return False
+
+    # 3. Check CI status rollup (must be passing or empty)
+    ci_rollup = pr_data.get("statusCheckRollup")
+    if not is_ci_passing_or_empty(ci_rollup):
+        log.info(
+            "PR %s#%s CI checks are not passing/complete; skipping auto-merge",
+            repo,
+            num,
+        )
+        return False
+
+    # 4. Execute squash auto-merge
+    if dry_run:
+        log.info(
+            "[DRY-RUN] gh pr merge %s --repo %s --squash --auto",
+            num,
+            repo,
+        )
+        return True
+
+    log.info("Executing auto-merge for %s#%s (author: %s)...", repo, num, author_login)
+    auto_res = run_gh(["pr", "merge", str(num), "--repo", repo, "--squash", "--auto"])
+    if auto_res.returncode == 0:
+        log.info("Armed squash auto-merge for %s#%s", repo, num)
+        return True
+
+    log.warning(
+        "gh pr merge --auto failed for %s#%s (%s); attempting fallback --squash --delete-branch",
+        repo,
+        num,
+        auto_res.stderr.strip(),
+    )
+
+    fallback_res = run_gh(["pr", "merge", str(num), "--repo", repo, "--squash", "--delete-branch"])
+    if fallback_res.returncode == 0:
+        log.info("Successfully merged %s#%s with fallback --squash --delete-branch", repo, num)
+        return True
+
+    log.error(
+        "gh pr merge fallback failed for %s#%s: %s",
+        repo,
+        num,
+        fallback_res.stderr.strip(),
+    )
+    return False
 
 
 def run_gh(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -99,6 +322,7 @@ def load_state(state_file: Path) -> dict[str, Any]:
         "seen_comment_ids": [],
         "seen_review_requests": [],
         "review_decisions": {},
+        "auto_merged_prs": [],
     }
     if not state_file.exists():
         return default_state
@@ -126,7 +350,12 @@ def save_state(state: dict[str, Any], state_file: Path) -> None:
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state["last_run"] = datetime.now(timezone.utc).isoformat()
 
-    for k in ("seen_review_ids", "seen_comment_ids", "seen_review_requests"):
+    for k in (
+        "seen_review_ids",
+        "seen_comment_ids",
+        "seen_review_requests",
+        "auto_merged_prs",
+    ):
         if isinstance(state.get(k), (set, list)):
             state[k] = sorted(list(set(state[k])))
 
@@ -317,7 +546,7 @@ def get_pr_details(repo: str, number: int) -> dict[str, Any] | None:
             "--repo",
             repo,
             "--json",
-            "number,title,url,author,reviewDecision,reviews,latestReviews,reviewRequests,comments",
+            "number,title,url,author,reviewDecision,reviews,latestReviews,reviewRequests,comments,statusCheckRollup",
         ])
         if res.returncode != 0:
             log.warning(
@@ -479,6 +708,7 @@ def check_pr(
         "comments_notified": 0,
         "review_requests_notified": 0,
         "decision_changed": False,
+        "auto_merged": False,
     }
 
     # 1. Check reviews (CHANGES_REQUESTED, APPROVED, COMMENTED, etc.)
@@ -569,11 +799,31 @@ def check_pr(
     if old_decision and old_decision != review_decision and review_decision != "NONE":
         stats["decision_changed"] = True
 
+    # 5. Check and attempt auto-merge for whitelisted authors
+    if not seed_only:
+        auto_merged_prs = state.setdefault("auto_merged_prs", [])
+        if review_decision == "CHANGES_REQUESTED":
+            while pr_key in auto_merged_prs:
+                auto_merged_prs.remove(pr_key)
+        elif pr_key not in auto_merged_prs:
+            did_merge = try_auto_merge_pr(
+                repo=repo,
+                pr_number=pr_number,
+                pr_data=pr_details,
+                dry_run=dry_run,
+            )
+            if did_merge:
+                stats["auto_merged"] = True
+                if not dry_run:
+                    auto_merged_prs.append(pr_key)
+
     # Sync back to state dict
     state["seen_review_ids"] = list(seen_reviews)
     state["seen_comment_ids"] = list(seen_comments)
     state["seen_review_requests"] = list(seen_reqs)
     state["review_decisions"] = review_decisions
+    if not seed_only:
+        state["auto_merged_prs"] = list(state.get("auto_merged_prs", []))
 
     return stats
 
@@ -612,6 +862,7 @@ def poll_and_notify(
         "comments_notified": 0,
         "review_requests_notified": 0,
         "decisions_changed": 0,
+        "auto_merged": 0,
     }
 
     for pr_info in open_prs:
@@ -635,6 +886,8 @@ def poll_and_notify(
         total_stats["review_requests_notified"] += st["review_requests_notified"]
         if st["decision_changed"]:
             total_stats["decisions_changed"] += 1
+        if st.get("auto_merged"):
+            total_stats["auto_merged"] += 1
 
     if not dry_run:
         save_state(state, state_file)
@@ -694,6 +947,8 @@ def main() -> int:
             parsed_channels.append(int(c_clean) if c_clean.isdigit() else c_clean)
 
     channels = parsed_channels or DEFAULT_CHANNELS
+    if not args.dry_run:
+        ensure_schedule_registered()
 
     if args.interval <= 0:
         stats = poll_and_notify(
