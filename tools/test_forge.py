@@ -1512,7 +1512,7 @@ def test_absolute_vs_relative_target_files_overlap_detection(tmp_path):
                 "title": "Chunk A",
                 "target_files": [f"{repo_str}/build_public_standings_page.py"],
                 "instructions": "Update standings page A with full unit test coverage.",
-                "verification_cmd": "pytest",
+                "verification_cmd": "true",
             }
         ],
     }
@@ -1529,7 +1529,7 @@ def test_absolute_vs_relative_target_files_overlap_detection(tmp_path):
                 "title": "Chunk B",
                 "target_files": ["build_public_standings_page.py"],
                 "instructions": "Update standings page B with full unit test coverage.",
-                "verification_cmd": "pytest",
+                "verification_cmd": "true",
             }
         ],
     }
@@ -1645,7 +1645,7 @@ def test_uppercase_status_and_stuck_running_embed_sweep(tmp_path, monkeypatch):
                 "title": "Chunk 1",
                 "target_files": ["tools/standings.py"],
                 "instructions": "Update standings page.",
-                "verification_cmd": "pytest",
+                "verification_cmd": 'pytest "tools/test_forge.py"',
             }
         ],
     }
@@ -3458,6 +3458,231 @@ def test_post_verification_commit_preservation_in_worktree(tmp_path, monkeypatch
     # Verify downstream branch propagation occurred
     stg_content = subprocess.run(["git", "show", "staging:README.md"], cwd=str(repo), capture_output=True, text=True).stdout
     assert "Worker Verified Content" in stg_content
+
+
+def test_short_job_wakes_channel_when_turn_lock_active(tmp_path, monkeypatch):
+    """Verify that short completed jobs (<15s) still dispatch completion wakeup when Post-Offload Turn Lock is active."""
+    import tools.forge as forge
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    monkeypatch.setattr(forge, "FORGE_DB_PATH", db_p)
+    monkeypatch.setattr(forge, "TASKS_DIR", tmp_path / "detached_tasks")
+    monkeypatch.setattr(forge, "_is_prod_forge_env", lambda *a, **kw: False)
+    monkeypatch.setattr(forge, "_is_channel_turn_actively_in_flight", lambda ch: True)
+
+    bs_file = tmp_path / "batch_guard_state.json"
+    bs_file.write_text(json.dumps({"offload_dispatched": True, "offload_kind": "forge.py job start"}), encoding="utf-8")
+
+    outbox_calls = []
+    import tools.outbox as outbox
+    monkeypatch.setattr(outbox, "queue_agent_turn", lambda **kw: outbox_calls.append(kw))
+    monkeypatch.setattr(outbox, "queue_outbox_message", lambda **kw: outbox_calls.append(kw))
+
+    task_id = "dt-test-short-turnlock"
+    tdir = forge._get_job_dir(task_id)
+    tdir.mkdir(parents=True, exist_ok=True)
+    log_p = tdir / "run.log"
+    meta = {
+        "task_id": task_id,
+        "name": "Short Locked Task",
+        "command": "python3 -c 'print(\"done\")'",
+        "channel": "zero-chat",
+        "timeout": 60,
+        "cwd": str(tmp_path),
+        "status": "starting",
+        "start_time": time.time() - 2.0,
+        "notify_on_success": True,
+        "synthesize": True,
+        "log_file": str(log_p),
+    }
+    forge._write_job_meta(task_id, meta, db_path=db_p)
+    forge._run_job_worker(task_id, db_path=db_p, batch_state_path=bs_file)
+
+    assert len(outbox_calls) > 0
+    assert "Suppressing duplicate outbox notification" not in log_p.read_text(encoding="utf-8")
+
+
+def test_start_job_clears_offload_dispatched_on_exception(tmp_path, monkeypatch):
+    """Verify start_job clears offload_dispatched in batch_guard_state.json if job spawn fails."""
+    import tools.forge as forge
+    bs_file = tmp_path / "batch_guard_state.json"
+    bs_file.write_text(json.dumps({"offload_dispatched": True, "offload_kind": "forge.py job start"}), encoding="utf-8")
+
+    monkeypatch.setattr(forge, "_check_recent_repeated_job_failures", lambda *a, **kw: (False, "Circuit breaker tripped"))
+
+    try:
+        forge.start_job(
+            command="python3 -c 'exit(0)'",
+            batch_state_path=bs_file,
+            db_path=tmp_path / "forge.db",
+        )
+        assert False, "Expected RuntimeError from circuit breaker"
+    except RuntimeError:
+        pass
+
+    state_data = json.loads(bs_file.read_text(encoding="utf-8"))
+    assert state_data.get("offload_dispatched") is False
+    assert state_data.get("offload_kind") == ""
+
+
+def test_unscoped_pytest_guard_in_goldfish_preflight(tmp_path):
+    """Verify run_goldfish_plan_preflight rejects unconstrained full-suite pytest in verification_cmd."""
+    import tools.forge as forge
+
+    unscoped_commands = [
+        "pytest",
+        "pytest -v",
+        "pytest tests",
+        "pytest tests/",
+        "pytest tools",
+        "pytest tools/",
+        "pytest .",
+        "python3 -m pytest",
+        "ruff check . && pytest tests/",
+    ]
+
+    for cmd in unscoped_commands:
+        plan = {
+            "title": f"Plan with {cmd}",
+            "repo": "/workspace",
+            "origin_channel_id": "1234567890",
+            "context_fact_sheet": ["Fact 1"],
+            "chunks": [
+                {
+                    "title": "Chunk 0",
+                    "target_files": ["tools/forge.py"],
+                    "instructions": "Implement fix and run verification with full suite.",
+                    "verification_cmd": cmd,
+                }
+            ],
+        }
+        ok, findings = forge.run_goldfish_plan_preflight(plan)
+        assert not ok, f"Expected {cmd} to fail goldfish preflight"
+        assert any("unscoped full-suite pytest" in f for f in findings), f"Expected unscoped finding for {cmd}"
+
+    scoped_plan = {
+        "title": "Scoped Plan",
+        "repo": "/workspace",
+        "origin_channel_id": "1234567890",
+        "context_fact_sheet": ["Fact 1"],
+        "chunks": [
+            {
+                "title": "Chunk 0",
+                "target_files": ["tools/forge.py"],
+                "instructions": "Implement scoped fix and verify.",
+                "verification_cmd": 'pytest "tools/test_forge.py"',
+            }
+        ],
+    }
+    ok_scoped, findings_scoped = forge.run_goldfish_plan_preflight(scoped_plan)
+    assert ok_scoped is True, f"Expected scoped plan to pass, got: {findings_scoped}"
+
+
+def test_stacked_branch_per_chunk_checkout_and_isolation(tmp_path, monkeypatch):
+    """Verify multi-chunk builds with stacked target_branch checkout cleanly without bleeding uncommitted files."""
+    import subprocess
+    import tools.forge as forge_mod
+
+    repo = tmp_path / "stacked_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "forge@brock.ventures"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "Forge Test"], cwd=str(repo), check=True)
+    (repo / "README.md").write_text("# Main\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=str(repo), check=True)
+
+    db_path = tmp_path / "forge.db"
+    forge_mod.init_forge_db(db_path)
+    supervisor = forge_mod.ForgeSupervisor(db_path=db_path, max_parallel_chunks=1)
+
+    plan = {
+        "title": "Stacked PR Multi-Chunk Build",
+        "repo": str(repo),
+        "origin_channel_id": "1234567890",
+        "context_fact_sheet": ["Architectural invariant"],
+        "chunks": [
+            {
+                "title": "Chunk 1: Add Feature A",
+                "target_files": ["feature_a.py"],
+                "target_branch": "feat/part-1",
+                "instructions": "Create feature_a.py and unit test.",
+                "verification_cmd": "true",
+            },
+            {
+                "title": "Chunk 2: Add Feature B stacked on A",
+                "target_files": ["feature_b.py"],
+                "target_branch": "feat/part-2",
+                "depends_on": [0],
+                "instructions": "Create feature_b.py stacked on Part 1.",
+                "verification_cmd": "true",
+            },
+        ],
+    }
+
+    enqueued = forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+    build_id = enqueued["build_id"]
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        chunk_rows = conn.execute(
+            "SELECT id, chunk_index, target_branch FROM forge_chunks WHERE build_id = ? ORDER BY chunk_index",
+            (build_id,),
+        ).fetchall()
+
+    assert len(chunk_rows) == 2
+    assert chunk_rows[0]["target_branch"] == "feat/part-1"
+    assert chunk_rows[1]["target_branch"] == "feat/part-2"
+
+    # Create an uncommitted dirty test file in repo that should NOT bleed into chunk branches
+    (repo / "dirty_uncommitted_test.py").write_text("# Dirty\n", encoding="utf-8")
+
+    orig_popen = subprocess.Popen
+
+    def _mock_popen(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and any("/usr/local/bin/agy" in str(x) for x in cmd):
+            cwd = kwargs.get("cwd") or (args[1] if len(args) > 1 else None)
+            if cwd and "forge-wt-" in str(cwd):
+                wt_p = Path(cwd)
+                if "c0" in wt_p.name:
+                    (wt_p / "feature_a.py").write_text("def feature_a(): return True\n", encoding="utf-8")
+                elif "c1" in wt_p.name:
+                    (wt_p / "feature_b.py").write_text("def feature_b(): return True\n", encoding="utf-8")
+            return orig_popen(["true"], *args, **kwargs)
+        return orig_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _mock_popen)
+
+    # Execute chunk 0
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0_row = conn.execute("SELECT * FROM forge_chunks WHERE id = ?", (f"{build_id}-c0",)).fetchone()
+    ok0 = supervisor.execute_chunk_in_worktree(build_id, c0_row)
+    assert ok0 is True
+
+    # Verify feat/part-1 branch was created
+    res1 = subprocess.run(["git", "rev-parse", "--verify", "feat/part-1"], cwd=str(repo), capture_output=True)
+    assert res1.returncode == 0
+
+    # Execute chunk 1
+    with forge_mod.get_db_connection(db_path) as conn:
+        c1_row = conn.execute("SELECT * FROM forge_chunks WHERE id = ?", (f"{build_id}-c1",)).fetchone()
+    ok1 = supervisor.execute_chunk_in_worktree(build_id, c1_row)
+    assert ok1 is True
+
+    # Verify feat/part-2 branch was created
+    res2 = subprocess.run(["git", "rev-parse", "--verify", "feat/part-2"], cwd=str(repo), capture_output=True)
+    assert res2.returncode == 0
+
+    # Verify default branch ('main') was NOT fast-forwarded by stacked branch build
+    main_files = subprocess.run(["git", "ls-tree", "-r", "--name-only", "main"], cwd=str(repo), capture_output=True, text=True).stdout
+    assert "feature_a.py" not in main_files
+    assert "feature_b.py" not in main_files
+    assert "README.md" in main_files
+
+    # Verify feat/part-2 has feature_a and feature_b but NOT dirty_uncommitted_test.py
+    feat2_files = subprocess.run(["git", "ls-tree", "-r", "--name-only", "feat/part-2"], cwd=str(repo), capture_output=True, text=True).stdout
+    assert "feature_a.py" in feat2_files
+    assert "feature_b.py" in feat2_files
+    assert "dirty_uncommitted_test.py" not in feat2_files
 
 
 if __name__ == "__main__":

@@ -807,6 +807,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 pr_number INTEGER,
                 branch_name TEXT,
+                target_branch TEXT NOT NULL DEFAULT '',
                 diff_stat TEXT NOT NULL DEFAULT '',
                 live_status TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',
@@ -872,6 +873,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
         _ensure_column(conn, "forge_chunks", "shared_context_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "forge_chunks", "live_status", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "forge_chunks", "depends_on_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "forge_chunks", "target_branch", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "forge_chunks", "tokens_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "forge_chunks", "total_tokens", "INTEGER NOT NULL DEFAULT 0")
 
@@ -1938,6 +1940,50 @@ def _normalize_chunk_dict_in_place(ch: dict, idx: int, all_chunks: list) -> None
             norm_list.append(_coerce_dependency_ref(d, idx, len(all_chunks), chunk_0_present, id_to_index))
         ch["depends_on"] = norm_list
 
+    # 4. Normalize target_branch from target_branch or branch
+    tb = ch.get("target_branch") or ch.get("branch")
+    if tb is not None:
+        ch["target_branch"] = str(tb).strip()
+
+
+def _is_single_segment_unscoped_test(seg: str) -> bool:
+    seg_clean = seg.strip()
+    m_go = re.match(r"^go\s+test(?:\s+(.*))?$", seg_clean)
+    if m_go:
+        go_args = (m_go.group(1) or "").strip()
+        go_tokens = [t for t in go_args.split() if not t.startswith("-")]
+        if not go_tokens or "./..." in go_tokens or "..." in go_tokens:
+            return True
+        return False
+
+    m = re.match(r"^(?:pytest|python[0-9.]*\s+-m\s+pytest)(?:\s+(.*))?$", seg_clean)
+    if not m:
+        return False
+    args = m.group(1) or ""
+    tokens = args.split()
+    if not tokens:
+        return True
+    if any(t.endswith(".py") or ".py::" in t or t.startswith("-k") or t.startswith("-m") for t in tokens):
+        return False
+    if "-k" in tokens or "-m" in tokens:
+        return False
+    generic_targets = {"tests", "tests/", "tools", "tools/", ".", "./"}
+    return all(t.startswith("-") or t in generic_targets for t in tokens)
+
+
+def is_unscoped_pytest(cmd: str) -> bool:
+    """Detect unconstrained full repository test suite runs (e.g. bare pytest or pytest tests/)."""
+    cmd_clean = cmd.strip()
+    if not cmd_clean:
+        return False
+    unquoted = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "'quoted'", cmd_clean)
+    if "&&" not in unquoted and ";" not in unquoted and "||" not in unquoted and "\n" not in unquoted:
+        return _is_single_segment_unscoped_test(cmd_clean)
+    for seg in re.split(r"(?:&&|\|\||;|\n)", cmd_clean):
+        if _is_single_segment_unscoped_test(seg):
+            return True
+    return False
+
 
 def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
     """Validate a ForgePlan with zero chat context against existing repository symbols and chunk dependencies."""
@@ -2020,6 +2066,11 @@ def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
 
         # C. Verification command test file validation
         verification_cmd = str(ch.get("verification_cmd") or "")
+        if verification_cmd and is_unscoped_pytest(verification_cmd):
+            findings.append(
+                f"Chunk {idx} verification command contains unscoped full-suite pytest ('{verification_cmd}'). "
+                "Scope test execution strictly to the relevant test file or function under test (e.g. 'pytest tests/test_feature.py')."
+            )
         if ch_repo.exists() and verification_cmd:
             test_matches = re.findall(
                 r"(?:(?:\./)?(?:tests|tools)/(?:[\w\-]+/)*test_[\w\-]+\.py)",
@@ -2208,6 +2259,9 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
         if not isinstance(pb, list) or not all(isinstance(b, str) and b.strip() for b in pb):
             return False, "Plan 'propagate_branches' must be a list of branch name strings."
 
+    if "target_branch" in plan and plan["target_branch"] is not None and not isinstance(plan["target_branch"], str):
+        return False, "Plan 'target_branch' must be a string."
+
     chunks = plan.get("chunks")
     if not isinstance(chunks, list) or not chunks:
         return False, "Plan must include a non-empty 'chunks' list."
@@ -2222,6 +2276,9 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
         ch_title = str(ch.get("title") or "").strip()
         if not ch_title:
             return False, f"Chunk {idx} is missing 'title'."
+        ch_tb = ch.get("target_branch")
+        if ch_tb is not None and not isinstance(ch_tb, str):
+            return False, f"Chunk {idx} 'target_branch' must be a string."
         ch_repo_str = str(ch.get("repo") or repo_str).strip()
         ch_repo_path = Path(ch_repo_str).resolve()
         if not (ch_repo_path / ".git").exists():
@@ -3579,6 +3636,35 @@ def stage_plan_approval_decision(
     }
 
 
+def clear_offload_dispatched(batch_state_path: Path | str = "/tmp/batch_guard_state.json") -> bool:
+    """Clear offload_dispatched flag in batch_guard_state.json if set."""
+    try:
+        bs_p = Path(batch_state_path)
+        if bs_p.exists():
+            bs_data = json.loads(bs_p.read_text(encoding="utf-8"))
+            if isinstance(bs_data, dict) and bs_data.get("offload_dispatched"):
+                bs_data["offload_dispatched"] = False
+                bs_data["offload_kind"] = ""
+                bs_p.write_text(json.dumps(bs_data), encoding="utf-8")
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_post_offload_turn_lock_active(batch_state_path: Path | str = "/tmp/batch_guard_state.json") -> bool:
+    """Return True if FORGE Post-Offload Turn Lock is active in batch_guard_state.json."""
+    try:
+        bs_p = Path(batch_state_path)
+        if bs_p.exists():
+            bs_data = json.loads(bs_p.read_text(encoding="utf-8"))
+            if isinstance(bs_data, dict) and bs_data.get("offload_dispatched"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def enqueue_build(
     plan: dict,
     db_path: Path | str = FORGE_DB_PATH,
@@ -3589,18 +3675,6 @@ def enqueue_build(
     in_flight_path: Path | str = DATA_DIR / "in_flight_turn.json",
 ) -> dict:
     """Validate and enqueue a multi-chunk FORGE build plan with pre-enqueue target-file overlap deduplication and complexity approval gate."""
-    def _clear_offload_dispatched():
-        try:
-            bs_p = Path(batch_state_path)
-            if bs_p.exists():
-                bs_data = json.loads(bs_p.read_text(encoding="utf-8"))
-                if isinstance(bs_data, dict) and bs_data.get("offload_dispatched"):
-                    bs_data["offload_dispatched"] = False
-                    bs_data["offload_kind"] = ""
-                    bs_p.write_text(json.dumps(bs_data), encoding="utf-8")
-        except Exception:
-            pass
-
     try:
         return _enqueue_build_impl(
             plan=plan,
@@ -3611,8 +3685,8 @@ def enqueue_build(
             batch_state_path=batch_state_path,
             in_flight_path=in_flight_path,
         )
-    except Exception:
-        _clear_offload_dispatched()
+    except BaseException:
+        clear_offload_dispatched(batch_state_path)
         raise
 
 
@@ -3722,6 +3796,9 @@ def _enqueue_build_impl(
                 if nf
             ]
             v_cmd = str(ch.get("verification_cmd") or "").strip()
+            ch_target_branch = str(
+                ch.get("target_branch") or ch.get("branch") or plan.get("target_branch") or plan.get("branch") or ""
+            ).strip()
             raw_deps = ch.get("depends_on") or []
             norm_deps = [int(d) for d in raw_deps if str(d).isdigit() and 0 <= int(d) < len(plan["chunks"])] if isinstance(raw_deps, (list, tuple, set)) else []
             conn.execute(
@@ -3729,8 +3806,8 @@ def _enqueue_build_impl(
                 INSERT INTO forge_chunks (
                     id, build_id, chunk_index, title, repo, worker_model,
                     target_files_json, target_symbols_json, shared_context_json,
-                    prohibited_files_json, depends_on_json, instructions, verification_cmd, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                    prohibited_files_json, depends_on_json, instructions, verification_cmd, target_branch, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
                 """,
                 (
                     chunk_id,
@@ -3746,6 +3823,7 @@ def _enqueue_build_impl(
                     json.dumps(norm_deps),
                     ch["instructions"].strip(),
                     v_cmd,
+                    ch_target_branch,
                 ),
             )
 
@@ -4867,10 +4945,11 @@ def _prepare_clean_repo_and_sync_base(
         try:
             st_diff = subprocess.run(["git", "diff", "--quiet"], cwd=str(rp), capture_output=True)
             st_cached = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(rp), capture_output=True)
-            if st_diff.returncode != 0 or st_cached.returncode != 0:
+            st_status = subprocess.run(["git", "status", "--porcelain"], cwd=str(rp), capture_output=True, text=True)
+            if st_diff.returncode != 0 or st_cached.returncode != 0 or st_status.stdout.strip():
                 stash_msg = f"forge-autostash-{int(time.time())}"
                 subprocess.run(
-                    ["git", "stash", "push", "-m", stash_msg],
+                    ["git", "stash", "push", "-u", "-m", stash_msg],
                     cwd=str(rp),
                     capture_output=True,
                     timeout=15,
@@ -5382,7 +5461,11 @@ class ForgeSupervisor:
         repo_dir = Path(effective_repo).resolve()
         default_branch = _get_repo_default_branch(repo_dir)
         wt_dir = Path(f"/tmp/forge-wt-{chunk_id}")
-        branch_name = f"forge/{build_id}-c{chunk_idx}"
+        ch_target_branch = str(
+            (chunk_row["target_branch"] if ("target_branch" in chunk_row.keys() and chunk_row["target_branch"]) else "")
+            or ""
+        ).strip()
+        branch_name = ch_target_branch if ch_target_branch else f"forge/{build_id}-c{chunk_idx}"
         staging_ref = f"forge/release-{build_id}"
 
         base_ref = staging_ref
@@ -5418,13 +5501,29 @@ class ForgeSupervisor:
 
                 shutil.rmtree(wt_dir, ignore_errors=True)
                 subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
-                wt_res = subprocess.run(
-                    ["git", "worktree", "add", "--force", "-B", branch_name, str(wt_dir), base_ref],
+
+                br_exists = subprocess.run(
+                    ["git", "rev-parse", "--verify", branch_name],
                     cwd=str(repo_dir),
                     capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
+                ).returncode == 0
+
+                if ch_target_branch and br_exists:
+                    wt_res = subprocess.run(
+                        ["git", "worktree", "add", "--force", str(wt_dir), branch_name],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                else:
+                    wt_res = subprocess.run(
+                        ["git", "worktree", "add", "--force", "-B", branch_name, str(wt_dir), base_ref],
+                        cwd=str(repo_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
                 if wt_res.returncode != 0:
                     subprocess.run(
                         ["git", "worktree", "add", "--force", "-B", branch_name, str(wt_dir), "HEAD"],
@@ -5433,13 +5532,18 @@ class ForgeSupervisor:
                         text=True,
                         timeout=30,
                     )
+
+                # Clean untracked files in worktree immediately so no uncommitted test files bleed
+                subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=str(wt_dir), capture_output=True, timeout=10)
+                subprocess.run(["git", "clean", "-fd"], cwd=str(wt_dir), capture_output=True, timeout=10)
+
                 def_is_anc = subprocess.run(
                     ["git", "merge-base", "--is-ancestor", latest_def_ref, branch_name],
                     cwd=str(repo_dir),
                     capture_output=True,
                     timeout=10,
                 )
-                if def_is_anc.returncode != 0 and wt_dir.exists():
+                if def_is_anc.returncode != 0 and wt_dir.exists() and not ch_target_branch:
                     rb_init = subprocess.run(
                         ["git", "rebase", latest_def_ref],
                         cwd=str(wt_dir),
@@ -5779,16 +5883,31 @@ class ForgeSupervisor:
                         capture_output=True,
                         timeout=10,
                     )
+                    if ch_target_branch:
+                        try:
+                            subprocess.run(
+                                ["git", "push", "origin", ch_target_branch],
+                                cwd=str(repo_dir),
+                                capture_output=True,
+                                timeout=60,
+                            )
+                        except Exception:
+                            pass
 
                     with self._state_lock, get_db_connection(self.db_path) as conn:
                         other_unmerged = conn.execute(
                             "SELECT COUNT(*) AS cnt FROM forge_chunks WHERE build_id = ? AND id != ? AND status != 'merged'",
                             (build_id, chunk_id),
                         ).fetchone()["cnt"]
+                        has_stacked_branches = conn.execute(
+                            "SELECT COUNT(*) AS cnt FROM forge_chunks WHERE build_id = ? AND target_branch != ''",
+                            (build_id,),
+                        ).fetchone()["cnt"] > 0
 
-                    # If final chunk completed and not touching core bridge, sync staging branch into local default branch
+                    # If final chunk completed and not touching core bridge and not targeting stacked PR branches,
+                    # sync staging branch into local default branch
                     # BEFORE marking the chunk/build completed so a merge/cherry-pick conflict never leaves repo_dir dirty or drops commits
-                    if other_unmerged == 0:
+                    if other_unmerged == 0 and not has_stacked_branches:
                         _prepare_clean_repo_and_sync_base(repo_dir, default_branch, before_merge=True)
 
                         sync_err = ""
@@ -5897,7 +6016,7 @@ class ForgeSupervisor:
                                 (time.time(), build_id),
                             )
 
-                    if remaining == 0:
+                    if remaining == 0 and not has_stacked_branches:
                         try:
                             subprocess.run(["git", "push", "origin", default_branch], cwd=str(repo_dir), capture_output=True, timeout=60)
                         except Exception as e:
@@ -6158,90 +6277,99 @@ def start_job(
     synthesize: bool = True,
     allow_duplicate: bool = False,
     db_path: Path | str = FORGE_DB_PATH,
+    batch_state_path: Path | str = "/tmp/batch_guard_state.json",
 ) -> dict:
     """Spawn a detached background shell job backed by `forge_jobs` and return its metadata immediately."""
-    channel = channel or get_default_origin_channel()
-    TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    enqueue_lock_path = TASKS_DIR / ".enqueue.lock"
+    try:
+        channel = channel or get_default_origin_channel()
+        TASKS_DIR.mkdir(parents=True, exist_ok=True)
+        enqueue_lock_path = TASKS_DIR / ".enqueue.lock"
 
-    with open(enqueue_lock_path, "a+", encoding="utf-8") as elock:
-        fcntl.flock(elock.fileno(), fcntl.LOCK_EX)
-        try:
-            if not allow_duplicate:
-                existing = _find_active_duplicate_job(command, cwd, db_path=db_path)
-                if existing:
-                    dup_meta = dict(existing)
-                    dup_meta["deduplicated"] = True
-                    return dup_meta
+        with open(enqueue_lock_path, "a+", encoding="utf-8") as elock:
+            fcntl.flock(elock.fileno(), fcntl.LOCK_EX)
+            try:
+                if not allow_duplicate:
+                    existing = _find_active_duplicate_job(command, cwd, db_path=db_path)
+                    if existing:
+                        dup_meta = dict(existing)
+                        dup_meta["deduplicated"] = True
+                        return dup_meta
 
-                ok_cb, cb_reason = _check_recent_repeated_job_failures(command, name, db_path=db_path)
-                if not ok_cb:
-                    raise RuntimeError(cb_reason)
+                    ok_cb, cb_reason = _check_recent_repeated_job_failures(command, name, db_path=db_path)
+                    if not ok_cb:
+                        raise RuntimeError(cb_reason)
 
-            name_clean = name.strip() or "Ad-Hoc Background Task"
-            slug = re.sub(r"[^a-zA-Z0-9_-]", "", name_clean.lower().replace(" ", "-"))[:20] or "job"
-            task_id = f"dt-{int(time.time())}-{slug}"
-            task_dir = _get_job_dir(task_id)
-            if task_dir.exists():
-                task_id = f"dt-{int(time.time() * 1000)}-{slug}"
+                name_clean = name.strip() or "Ad-Hoc Background Task"
+                slug = re.sub(r"[^a-zA-Z0-9_-]", "", name_clean.lower().replace(" ", "-"))[:20] or "job"
+                task_id = f"dt-{int(time.time())}-{slug}"
                 task_dir = _get_job_dir(task_id)
-            task_dir.mkdir(parents=True, exist_ok=True)
+                if task_dir.exists():
+                    task_id = f"dt-{int(time.time() * 1000)}-{slug}"
+                    task_dir = _get_job_dir(task_id)
+                task_dir.mkdir(parents=True, exist_ok=True)
 
-            log_file = task_dir / "run.log"
-            log_file.touch(exist_ok=True)
+                log_file = task_dir / "run.log"
+                log_file.touch(exist_ok=True)
 
-            meta = {
-                "task_id": task_id,
-                "name": name_clean,
-                "command": command,
-                "channel": channel,
-                "timeout": int(timeout),
-                "cwd": cwd,
-                "status": "starting",
-                "worker_pid": None,
-                "child_pid": None,
-                "start_time": time.time(),
-                "start_time_iso": datetime.now(timezone.utc).isoformat(),
-                "end_time": None,
-                "duration_seconds": None,
-                "exit_code": None,
-                "notify_on_success": bool(notify_on_success),
-                "synthesize": bool(synthesize),
-                "log_file": str(log_file),
-            }
-            _write_job_meta(task_id, meta, db_path=db_path)
+                meta = {
+                    "task_id": task_id,
+                    "name": name_clean,
+                    "command": command,
+                    "channel": channel,
+                    "timeout": int(timeout),
+                    "cwd": cwd,
+                    "status": "starting",
+                    "worker_pid": None,
+                    "child_pid": None,
+                    "start_time": time.time(),
+                    "start_time_iso": datetime.now(timezone.utc).isoformat(),
+                    "end_time": None,
+                    "duration_seconds": None,
+                    "exit_code": None,
+                    "notify_on_success": bool(notify_on_success),
+                    "synthesize": bool(synthesize),
+                    "log_file": str(log_file),
+                }
+                _write_job_meta(task_id, meta, db_path=db_path)
 
-            worker_cmd = [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "_job_worker",
-                task_id,
-                "--db-path",
-                str(db_path),
-            ]
-            proc = subprocess.Popen(
-                worker_cmd,
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+                worker_cmd = [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "_job_worker",
+                    task_id,
+                    "--db-path",
+                    str(db_path),
+                ]
+                proc = subprocess.Popen(
+                    worker_cmd,
+                    cwd=cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
 
-            time.sleep(0.15)
-            updated_meta = _read_job_meta(task_id, db_path=db_path) or meta
-            if not updated_meta.get("worker_pid"):
-                updated_meta["worker_pid"] = proc.pid
-                _write_job_meta(task_id, updated_meta, db_path=db_path)
-            if not (not bool(notify_on_success) and not bool(synthesize)):
-                sync_forge_channel_header(db_path=db_path)
+                time.sleep(0.15)
+                updated_meta = _read_job_meta(task_id, db_path=db_path) or meta
+                if not updated_meta.get("worker_pid"):
+                    updated_meta["worker_pid"] = proc.pid
+                    _write_job_meta(task_id, updated_meta, db_path=db_path)
+                if not (not bool(notify_on_success) and not bool(synthesize)):
+                    sync_forge_channel_header(db_path=db_path)
 
-            return updated_meta
-        finally:
-            fcntl.flock(elock.fileno(), fcntl.LOCK_UN)
+                return updated_meta
+            finally:
+                fcntl.flock(elock.fileno(), fcntl.LOCK_UN)
+    except BaseException:
+        clear_offload_dispatched(batch_state_path)
+        raise
 
 
-def _run_job_worker(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> None:
+def _run_job_worker(
+    task_id: str,
+    db_path: Path | str = FORGE_DB_PATH,
+    batch_state_path: Path | str = "/tmp/batch_guard_state.json",
+) -> None:
     """Internal entrypoint executed in the detached background job worker process."""
     meta = _read_job_meta(task_id, db_path=db_path)
     if not meta:
@@ -6258,7 +6386,7 @@ def _run_job_worker(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> None:
         return
 
     try:
-        _run_job_worker_locked(task_id, meta, db_path=db_path)
+        _run_job_worker_locked(task_id, meta, db_path=db_path, batch_state_path=batch_state_path)
     finally:
         try:
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
@@ -6270,7 +6398,12 @@ def _run_job_worker(task_id: str, db_path: Path | str = FORGE_DB_PATH) -> None:
 JOB_WIDGET_MIN_DURATION_SECONDS: float = 90.0
 
 
-def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE_DB_PATH) -> None:
+def _run_job_worker_locked(
+    task_id: str,
+    meta: dict,
+    db_path: Path | str = FORGE_DB_PATH,
+    batch_state_path: Path | str = "/tmp/batch_guard_state.json",
+) -> None:
     meta["worker_pid"] = os.getpid()
     meta["status"] = "running"
     _write_job_meta(task_id, meta, db_path=db_path)
@@ -6424,11 +6557,13 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
             lf.write(f"\n[Detached Runner] Task completed successfully in {dur_str}. Suppressing success notification (failure-only policy active).\n")
         return
 
+    turn_lock_active = _is_post_offload_turn_lock_active(batch_state_path)
+
     # Suppress redundant outbox synthesis alerts ONLY when a short (<25s) task COMPLETED successfully
     # while the originating channel's interactive turn is still actively in-flight and polling it directly.
-    # NEVER suppress failed or timed_out task wakeups, because an agent that spawns a detached job and ends
-    # its turn immediately will otherwise never be woken up when the job crashes at 2s.
-    if final_status == "completed" and duration < 25.0 and _is_channel_turn_actively_in_flight(channel):
+    # NEVER suppress failed or timed_out task wakeups, and NEVER suppress when the active turn was locked
+    # by FORGE Post-Offload Turn Lock (since the agent cannot execute inline and requires a completion wakeup turn).
+    if final_status == "completed" and duration < 25.0 and _is_channel_turn_actively_in_flight(channel) and not turn_lock_active:
         with open(log_file_path, "a", encoding="utf-8") as lf:
             lf.write(
                 f"\n[Detached Runner] Short task ({dur_str}, status={final_status}) finished while "
@@ -6442,7 +6577,7 @@ def _run_job_worker_locked(task_id: str, meta: dict, db_path: Path | str = FORGE
     # When --no-synthesize is explicitly passed and the originating channel's
     # interactive turn is still actively in-flight, suppress raw outbox failure dumps so
     # the active turn can inspect and recover inline without spamming Discord.
-    if not synthesize and _is_channel_turn_actively_in_flight(channel):
+    if not synthesize and _is_channel_turn_actively_in_flight(channel) and not turn_lock_active:
         with open(log_file_path, "a", encoding="utf-8") as lf:
             lf.write(
                 f"\n[Detached Runner] --no-synthesize probe ({dur_str}, status={final_status}) finished while "
@@ -7657,17 +7792,8 @@ def main():
                 check_approval_gate=True,
             )
             print(json.dumps(res, indent=2))
-        except Exception:
-            try:
-                bs_path = Path("/tmp/batch_guard_state.json")
-                if bs_path.exists():
-                    bs_data = json.loads(bs_path.read_text(encoding="utf-8"))
-                    if isinstance(bs_data, dict) and bs_data.get("offload_dispatched"):
-                        bs_data["offload_dispatched"] = False
-                        bs_data["offload_kind"] = ""
-                        bs_path.write_text(json.dumps(bs_data), encoding="utf-8")
-            except Exception:
-                pass
+        except BaseException:
+            clear_offload_dispatched()
             raise
     elif args.cmd == "status":
         if args.build_id:
@@ -7695,17 +7821,21 @@ def main():
         _run_job_worker(args.task_id, db_path=args.db_path)
     elif args.cmd == "job":
         if args.job_action == "start":
-            res = start_job(
-                command=args.command,
-                channel=args.channel,
-                name=args.name,
-                timeout=args.timeout,
-                cwd=args.cwd,
-                notify_on_success=args.notify_on_success,
-                synthesize=args.synthesize,
-                allow_duplicate=args.allow_duplicate,
-            )
-            print(json.dumps(res, indent=2))
+            try:
+                res = start_job(
+                    command=args.command,
+                    channel=args.channel,
+                    name=args.name,
+                    timeout=args.timeout,
+                    cwd=args.cwd,
+                    notify_on_success=args.notify_on_success,
+                    synthesize=args.synthesize,
+                    allow_duplicate=args.allow_duplicate,
+                )
+                print(json.dumps(res, indent=2))
+            except BaseException:
+                clear_offload_dispatched()
+                raise
         elif args.job_action == "status":
             print(json.dumps(get_job_status(args.task_id), indent=2))
         elif args.job_action == "list":
