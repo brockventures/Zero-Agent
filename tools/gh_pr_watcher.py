@@ -16,6 +16,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -65,6 +66,15 @@ DEFAULT_TARGET_REPOS = [
     "brockventures/*",
     "arcane103/*",
 ]
+
+# Whitelisted repositories for event-driven webhooks, email doorbells, and auto-merge
+WHITELISTED_REPOS: set[str] = {
+    "mcarmody/lomin",
+    "arcane103/mirrormere",
+    "brockventures/Zero-Gotchi",
+    "brockventures/market-sandbox",
+    "brockventures/Zero-Agent",
+}
 
 # Whitelisted Crab Cavern authors for automated review and squash auto-merges
 WHITELISTED_AUTHORS: set[str] = {
@@ -289,11 +299,16 @@ def try_auto_merge_pr(
     return False
 
 
-def run_gh(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+def run_gh(
+    args: list[str],
+    timeout: int = 30,
+    input: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Execute gh command safely with standard timeouts and capture output."""
     cmd = ["gh"] + args
     return subprocess.run(
         cmd,
+        input=input,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -896,6 +911,401 @@ def poll_and_notify(
     return total_stats
 
 
+def handle_event_pr(
+    repo: str,
+    pr_number: int,
+    state_file: Path = DEFAULT_STATE_FILE,
+    channels: list[str | int] | None = None,
+    dry_run: bool = False,
+    current_user: str | None = None,
+) -> dict[str, Any] | None:
+    """Fetch authenticated PR details via gh pr view and evaluate reviews/auto-merge."""
+    if current_user is None:
+        current_user = get_authenticated_user()
+    if channels is None:
+        channels = DEFAULT_CHANNELS
+
+    details = get_pr_details(repo, pr_number)
+    if not details:
+        log.warning("Could not fetch PR details for %s#%s", repo, pr_number)
+        return None
+
+    state = load_state(state_file)
+    stats = check_pr(
+        pr_details=details,
+        state=state,
+        current_user=current_user,
+        channels=channels,
+        dry_run=dry_run,
+    )
+    if not dry_run:
+        save_state(state, state_file)
+    return stats
+
+
+def parse_github_email_doorbell(
+    raw_headers: dict[str, Any],
+    trigger_eval: bool = False,
+    state_file: Path = DEFAULT_STATE_FILE,
+    channels: list[str | int] | None = None,
+    dry_run: bool = False,
+    current_user: str | None = None,
+) -> tuple[str, int] | None:
+    """Zero-trust dumb doorbell: verify github.com DKIM and extract (repo, pr_number).
+
+    Verifies:
+    1. Authentication-Results contains dkim=pass for github.com.
+    2. From header contains notifications@github.com.
+    3. Extracts (repo, pr_number) strictly from List-ID, Message-ID, In-Reply-To, References.
+    4. Validates repo is in WHITELISTED_REPOS.
+    5. NEVER reads or returns the email body.
+    """
+    if not isinstance(raw_headers, dict):
+        return None
+
+    def _get_val(key: str) -> str:
+        k_lower = key.lower()
+        for k, v in raw_headers.items():
+            if k.lower() == k_lower:
+                if isinstance(v, list):
+                    return "\n".join(str(item) for item in v)
+                return str(v or "")
+        return ""
+
+    # 1. Verify DKIM
+    auth_results = (
+        _get_val("Authentication-Results")
+        or _get_val("ARC-Authentication-Results")
+        or _get_val("Authentication-Results-Original")
+    ).lower()
+
+    if "dkim=pass" not in auth_results:
+        log.warning("Email doorbell rejected: dkim=pass not found in Authentication-Results")
+        return None
+
+    # If domain attribution is present in Authentication-Results, ensure it references github.com
+    if any(marker in auth_results for marker in ("header.i", "header.d", "domain=")):
+        if "github.com" not in auth_results:
+            log.warning(
+                "Email doorbell rejected: DKIM pass is not for github.com (%s)",
+                auth_results,
+            )
+            return None
+
+    # 2. Verify From header
+    from_header = _get_val("From").lower()
+    if "notifications@github.com" not in from_header:
+        log.warning(
+            "Email doorbell rejected: From header is not notifications@github.com (%s)",
+            from_header,
+        )
+        return None
+
+    # 3. Extract (repo, pr_number) strictly from safe headers
+    candidate_keys = ["List-ID", "Message-ID", "In-Reply-To", "References"]
+    pr_regex = re.compile(
+        r"(?:https?://github\.com/|<)?([a-zA-Z0-9_\-\.]+/[a-zA-Z0-9_\-\.]+)/pull/(\d+)",
+        re.IGNORECASE,
+    )
+
+    repo_cand: str | None = None
+    pr_num: int | None = None
+
+    for key in candidate_keys:
+        val = _get_val(key)
+        if not val:
+            continue
+        match = pr_regex.search(val)
+        if match:
+            repo_cand = match.group(1).strip()
+            try:
+                pr_num = int(match.group(2))
+                break
+            except (ValueError, TypeError):
+                continue
+
+    # Fallback for List-ID: <repo.owner.github.com> + Message-ID /pull/(\d+)
+    if not repo_cand:
+        list_id = _get_val("List-ID")
+        list_match = re.search(
+            r"<([a-zA-Z0-9_\-\.]+)\.([a-zA-Z0-9_\-\.]+)\.github\.com>", list_id
+        )
+        if list_match:
+            potential_repo = f"{list_match.group(2)}/{list_match.group(1)}"
+            for k in ["Message-ID", "In-Reply-To", "References"]:
+                num_match = re.search(r"/pull/(\d+)", _get_val(k))
+                if num_match:
+                    repo_cand = potential_repo
+                    pr_num = int(num_match.group(1))
+                    break
+
+    if not repo_cand or pr_num is None:
+        log.info("Email doorbell: no repo/pull/number found in headers")
+        return None
+
+    # 4. Whitelist validation
+    matched_repo: str | None = None
+    for allowed_repo in WHITELISTED_REPOS:
+        if repo_cand.lower() == allowed_repo.lower():
+            matched_repo = allowed_repo
+            break
+
+    if not matched_repo:
+        log.warning(
+            "Email doorbell rejected: repository '%s' is not in WHITELISTED_REPOS",
+            repo_cand,
+        )
+        return None
+
+    if trigger_eval:
+        handle_event_pr(
+            repo=matched_repo,
+            pr_number=pr_num,
+            state_file=state_file,
+            channels=channels,
+            dry_run=dry_run,
+            current_user=current_user,
+        )
+
+    return (matched_repo, pr_num)
+
+
+def parse_discord_github_webhook_embed(
+    embed: dict[str, Any],
+    trigger_eval: bool = False,
+    state_file: Path = DEFAULT_STATE_FILE,
+    channels: list[str | int] | None = None,
+    dry_run: bool = False,
+    current_user: str | None = None,
+) -> tuple[str, int] | None:
+    """Extract (repo, pr_number) from Discord /github webhook embed validated against WHITELISTED_REPOS."""
+    if not isinstance(embed, dict):
+        return None
+
+    pr_url_pattern = re.compile(
+        r"https?://github\.com/([a-zA-Z0-9_\-\.]+/[a-zA-Z0-9_\-\.]+)/pull/(\d+)",
+        re.IGNORECASE,
+    )
+
+    repo_cand: str | None = None
+    pr_num: int | None = None
+
+    # 1. Check direct url field
+    url = str(embed.get("url") or "")
+    match = pr_url_pattern.search(url)
+    if match:
+        repo_cand = match.group(1)
+        pr_num = int(match.group(2))
+
+    # 2. Check title field
+    if not repo_cand:
+        title = str(embed.get("title") or "")
+        match = pr_url_pattern.search(title)
+        if match:
+            repo_cand = match.group(1)
+            pr_num = int(match.group(2))
+        else:
+            repo_match = re.search(
+                r"\[([a-zA-Z0-9_\-\.]+/[a-zA-Z0-9_\-\.]+)(?::[^\]]+)?\]",
+                title,
+            )
+            pr_match = re.search(r"#(\d+)", title)
+            if repo_match and pr_match:
+                repo_cand = repo_match.group(1)
+                pr_num = int(pr_match.group(1))
+
+    # 3. Check author.url
+    if not repo_cand:
+        author_url = str((embed.get("author") or {}).get("url") or "")
+        match = pr_url_pattern.search(author_url)
+        if match:
+            repo_cand = match.group(1)
+            pr_num = int(match.group(2))
+
+    # 4. Check description or fields
+    if not repo_cand:
+        desc = str(embed.get("description") or "")
+        match = pr_url_pattern.search(desc)
+        if match:
+            repo_cand = match.group(1)
+            pr_num = int(match.group(2))
+
+    if not repo_cand and "fields" in embed and isinstance(embed["fields"], list):
+        for f in embed["fields"]:
+            if isinstance(f, dict):
+                f_val = str(f.get("value") or "")
+                match = pr_url_pattern.search(f_val)
+                if match:
+                    repo_cand = match.group(1)
+                    pr_num = int(match.group(2))
+                    break
+
+    if not repo_cand or pr_num is None:
+        return None
+
+    # Validate against WHITELISTED_REPOS
+    matched_repo: str | None = None
+    for allowed_repo in WHITELISTED_REPOS:
+        if repo_cand.lower() == allowed_repo.lower():
+            matched_repo = allowed_repo
+            break
+
+    if not matched_repo:
+        log.info(
+            "Discord webhook embed: repository '%s' is not in WHITELISTED_REPOS",
+            repo_cand,
+        )
+        return None
+
+    if trigger_eval:
+        handle_event_pr(
+            repo=matched_repo,
+            pr_number=pr_num,
+            state_file=state_file,
+            channels=channels,
+            dry_run=dry_run,
+            current_user=current_user,
+        )
+
+    return (matched_repo, pr_num)
+
+
+def process_discord_webhook_embed(
+    embed: dict[str, Any],
+    state_file: Path = DEFAULT_STATE_FILE,
+    channels: list[str | int] | None = None,
+    dry_run: bool = False,
+    current_user: str | None = None,
+) -> dict[str, Any] | None:
+    """Parse Discord webhook embed and trigger authenticated gh pr view + auto-merge evaluation."""
+    parsed = parse_discord_github_webhook_embed(embed)
+    if not parsed:
+        return None
+    repo, pr_num = parsed
+    return handle_event_pr(
+        repo=repo,
+        pr_number=pr_num,
+        state_file=state_file,
+        channels=channels,
+        dry_run=dry_run,
+        current_user=current_user,
+    )
+
+
+def process_github_email_doorbell(
+    raw_headers: dict[str, Any],
+    state_file: Path = DEFAULT_STATE_FILE,
+    channels: list[str | int] | None = None,
+    dry_run: bool = False,
+    current_user: str | None = None,
+) -> dict[str, Any] | None:
+    """Parse verified DKIM email headers and trigger authenticated gh pr view + auto-merge evaluation."""
+    parsed = parse_github_email_doorbell(raw_headers)
+    if not parsed:
+        return None
+    repo, pr_num = parsed
+    return handle_event_pr(
+        repo=repo,
+        pr_number=pr_num,
+        state_file=state_file,
+        channels=channels,
+        dry_run=dry_run,
+        current_user=current_user,
+    )
+
+
+def ensure_repo_discord_webhook(
+    repo: str,
+    discord_webhook_url: str,
+) -> bool:
+    """Idempotently register /github webhook on a GitHub repo using gh api repos/{repo}/hooks.
+
+    Verifies if a webhook pointing to the target Discord webhook URL already exists.
+    If not, creates an active webhook subscribed to pull_request, pull_request_review,
+    pull_request_review_comment, and issue_comment events.
+    """
+    clean_url = (discord_webhook_url or "").strip()
+    if not clean_url:
+        log.warning("No discord_webhook_url provided for %s", repo)
+        return False
+
+    if not clean_url.endswith("/github"):
+        clean_url = clean_url.rstrip("/") + "/github"
+
+    # 1. Query existing hooks
+    res = run_gh(["api", f"repos/{repo}/hooks"])
+    if res.returncode != 0:
+        log.warning("Failed listing hooks for %s: %s", repo, res.stderr.strip())
+        return False
+
+    try:
+        hooks = json.loads(res.stdout or "[]")
+        if not isinstance(hooks, list):
+            hooks = []
+    except Exception as exc:
+        log.warning("Failed parsing hooks response for %s: %s", repo, exc)
+        return False
+
+    # Check for existing hook matching target URL (or base URL)
+    for hook in hooks:
+        if not isinstance(hook, dict):
+            continue
+        config = hook.get("config") or {}
+        existing_url = str(config.get("url") or "").rstrip("/")
+        if existing_url in (clean_url.rstrip("/"), discord_webhook_url.strip().rstrip("/")):
+            log.info("Webhook already exists for %s: %s", repo, existing_url)
+            return True
+
+    # 2. Register hook via POST
+    payload = {
+        "name": "web",
+        "active": True,
+        "events": [
+            "pull_request",
+            "pull_request_review",
+            "pull_request_review_comment",
+            "issue_comment",
+        ],
+        "config": {
+            "url": clean_url,
+            "content_type": "json",
+            "insecure_ssl": "0",
+        },
+    }
+
+    create_res = run_gh(
+        ["api", f"repos/{repo}/hooks", "-X", "POST", "--input", "-"],
+        input=json.dumps(payload),
+    )
+    if create_res.returncode == 0:
+        log.info("Registered Discord GitHub webhook for %s", repo)
+        return True
+
+    log.warning("Failed registering webhook for %s: %s", repo, create_res.stderr.strip())
+    return False
+
+
+def ensure_repo_discord_webhooks(
+    discord_webhook_url: str | None = None,
+    repos: list[str] | None = None,
+) -> dict[str, bool]:
+    """Idempotently register Discord GitHub webhooks across multiple repositories.
+
+    Defaults to owned brockventures/* repositories in WHITELISTED_REPOS.
+    """
+    if discord_webhook_url is None:
+        discord_webhook_url = os.environ.get("DISCORD_GITHUB_WEBHOOK_URL", "")
+
+    if repos is None:
+        repos = [r for r in sorted(WHITELISTED_REPOS) if r.startswith("brockventures/")]
+
+    results: dict[str, bool] = {}
+    for repo in repos:
+        results[repo] = ensure_repo_discord_webhook(repo, discord_webhook_url)
+
+    return results
+
+
 def main() -> int:
     """CLI entry point for gh_pr_watcher."""
     parser = argparse.ArgumentParser(
@@ -935,6 +1345,29 @@ def main() -> int:
         default=0,
         help="Interval in seconds for continuous polling daemon mode (0 = run once)",
     )
+    parser.add_argument(
+        "--register-webhooks",
+        action="store_true",
+        help="Register Discord /github webhooks on owned brockventures repos",
+    )
+    parser.add_argument(
+        "--webhook-url",
+        type=str,
+        default="",
+        help="Discord webhook URL to register",
+    )
+    parser.add_argument(
+        "--process-embed",
+        type=str,
+        default="",
+        help="JSON string or file path containing Discord webhook embed to process",
+    )
+    parser.add_argument(
+        "--process-email-headers",
+        type=str,
+        default="",
+        help="JSON string or file path containing raw email headers to process",
+    )
     args = parser.parse_args()
 
     target_patterns = [p.strip() for p in args.repos.split(",") if p.strip()]
@@ -947,6 +1380,42 @@ def main() -> int:
             parsed_channels.append(int(c_clean) if c_clean.isdigit() else c_clean)
 
     channels = parsed_channels or DEFAULT_CHANNELS
+
+    if args.register_webhooks:
+        res_hooks = ensure_repo_discord_webhooks(discord_webhook_url=args.webhook_url or None)
+        print(f"Webhook registration completed: {res_hooks}")
+        return 0 if all(res_hooks.values()) else 1
+
+    if args.process_embed:
+        raw_embed = args.process_embed
+        embed_p = Path(raw_embed)
+        if embed_p.is_file():
+            raw_embed = embed_p.read_text(encoding="utf-8")
+        embed_data = json.loads(raw_embed)
+        res_embed = process_discord_webhook_embed(
+            embed=embed_data,
+            state_file=args.state_file,
+            channels=channels,
+            dry_run=args.dry_run,
+        )
+        print(f"Processed embed: {res_embed}")
+        return 0
+
+    if args.process_email_headers:
+        raw_headers = args.process_email_headers
+        headers_p = Path(raw_headers)
+        if headers_p.is_file():
+            raw_headers = headers_p.read_text(encoding="utf-8")
+        headers_data = json.loads(raw_headers)
+        res_email = process_github_email_doorbell(
+            raw_headers=headers_data,
+            state_file=args.state_file,
+            channels=channels,
+            dry_run=args.dry_run,
+        )
+        print(f"Processed email headers: {res_email}")
+        return 0
+
     if not args.dry_run:
         ensure_schedule_registered()
 
