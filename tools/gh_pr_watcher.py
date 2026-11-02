@@ -23,6 +23,8 @@ import sys
 import time
 from typing import Any
 
+import requests
+
 # Ensure local repo path takes precedence over global /workspace
 _local_repo = str(Path(__file__).resolve().parent.parent)
 if _local_repo in sys.path:
@@ -66,12 +68,14 @@ DEFAULT_TARGET_REPOS = [
     "mcarmody/lomin",
     "brockventures/*",
     "arcane103/*",
+    "azylman/mirrormere",
 ]
 
 # Whitelisted repositories for event-driven webhooks, email doorbells, and auto-merge
 WHITELISTED_REPOS: set[str] = {
     "mcarmody/lomin",
     "arcane103/mirrormere",
+    "azylman/mirrormere",
     "brockventures/Zero-Gotchi",
     "brockventures/market-sandbox",
     "brockventures/Zero-Agent",
@@ -94,7 +98,7 @@ def ensure_schedule_registered(
     schedule_file: Path = DEFAULT_SCHEDULE_FILE,
 ) -> bool:
     """Register gh_pr_watcher in /workspace/data/schedule.json (every 3m) if not present."""
-    if not schedule_file.exists() or schedule_file.resolve() == DEFAULT_SCHEDULE_FILE.resolve():
+    if not schedule_file.exists():
         return False
     try:
         raw = schedule_file.read_text(encoding="utf-8")
@@ -339,6 +343,7 @@ def load_state(state_file: Path) -> dict[str, Any]:
         "seen_review_requests": [],
         "review_decisions": {},
         "auto_merged_prs": [],
+        "active_notifications": {},
     }
     if not state_file.exists():
         return default_state
@@ -387,6 +392,170 @@ def save_state(state: dict[str, Any], state_file: Path) -> None:
         raise
 
 
+def get_discord_bot_token(token: str | None = None) -> str | None:
+    """Resolve Discord bot token from parameter, env, or /secrets/env.json."""
+    if token and str(token).strip():
+        return str(token).strip()
+    env_token = os.environ.get("DISCORD_BOT_TOKEN")
+    if env_token and env_token.strip():
+        return env_token.strip()
+    secrets_file = Path("/secrets/env.json")
+    if secrets_file.exists():
+        try:
+            data = json.loads(secrets_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                tok = data.get("DISCORD_BOT_TOKEN")
+                if tok and str(tok).strip():
+                    return str(tok).strip()
+        except Exception as exc:
+            log.warning("Failed loading DISCORD_BOT_TOKEN from %s: %s", secrets_file, exc)
+    return None
+
+
+def cleanup_pr_notifications(
+    repo: str | None = None,
+    pr_number: int | str | None = None,
+    state_file: Path = DEFAULT_STATE_FILE,
+    token: str | None = None,
+    sweep_channels: bool = True,
+    state: dict[str, Any] | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Delete tracked Discord notification cards for a PR and/or sweep Discord channels.
+
+    Returns the number of notification messages deleted.
+    """
+    bot_token = get_discord_bot_token(token)
+
+    if state is None:
+        state = load_state(state_file)
+
+    active_notifs: dict[str, list[dict[str, Any]]] = state.setdefault(
+        "active_notifications", {}
+    )
+
+    num: int | None = None
+    if pr_number is not None:
+        try:
+            num = int(pr_number)
+        except (ValueError, TypeError):
+            num = None
+
+    clean_repo = repo.strip().lower() if repo else None
+
+    # 1. Identify matching keys in active_notifications
+    matching_keys: list[str] = []
+    for k in list(active_notifs.keys()):
+        k_repo, _, k_num_str = k.partition("#")
+        k_repo_clean = k_repo.strip().lower()
+        try:
+            k_num = int(k_num_str)
+        except ValueError:
+            k_num = None
+
+        repo_matches = (clean_repo is None) or (k_repo_clean == clean_repo)
+        num_matches = (num is None) or (k_num == num)
+        if repo_matches and num_matches:
+            matching_keys.append(k)
+
+    deleted_count = 0
+    deleted_message_ids: set[str] = set()
+
+    # 2. Delete tracked message IDs via REST
+    for k in matching_keys:
+        records = active_notifs.get(k, [])
+        for item in records:
+            cid = item.get("channel_id")
+            mid = item.get("message_id")
+            if mid and cid and bot_token:
+                mid_str = str(mid)
+                if mid_str not in deleted_message_ids:
+                    if not dry_run:
+                        url = f"https://discord.com/api/v10/channels/{cid}/messages/{mid_str}"
+                        try:
+                            res = requests.delete(
+                                url,
+                                headers={"Authorization": f"Bot {bot_token}"},
+                                timeout=10,
+                            )
+                            if res.status_code in (200, 204, 404):
+                                deleted_count += 1
+                                deleted_message_ids.add(mid_str)
+                        except Exception as exc:
+                            log.warning(
+                                "Failed deleting notification message %s in channel %s: %s",
+                                mid,
+                                cid,
+                                exc,
+                            )
+                    else:
+                        deleted_count += 1
+                        deleted_message_ids.add(mid_str)
+        active_notifs.pop(k, None)
+
+    # 3. Sweep Discord channels for PR cards
+    if sweep_channels and bot_token:
+        for cid in (FORGE_CHANNEL_ID, ZERO_OPS_CHANNEL_ID):
+            get_url = f"https://discord.com/api/v10/channels/{cid}/messages?limit=30"
+            try:
+                res = requests.get(
+                    get_url,
+                    headers={"Authorization": f"Bot {bot_token}"},
+                    timeout=10,
+                )
+                if res.status_code == 200:
+                    messages = res.json()
+                    if isinstance(messages, list):
+                        for m in messages:
+                            mid = m.get("id")
+                            if not mid or str(mid) in deleted_message_ids:
+                                continue
+                            content = str(m.get("content") or "")
+                            is_pr_card = any(
+                                marker in content
+                                for marker in (
+                                    "**GitHub PR Comment**",
+                                    "**GitHub PR Review:",
+                                    "**GitHub Review Requested**",
+                                )
+                            )
+                            if not is_pr_card:
+                                continue
+                            if clean_repo and clean_repo not in content.lower():
+                                continue
+                            if num is not None and f"[#{num} " not in content:
+                                continue
+
+                            mid_str = str(mid)
+                            if not dry_run:
+                                del_url = f"https://discord.com/api/v10/channels/{cid}/messages/{mid_str}"
+                                del_res = requests.delete(
+                                    del_url,
+                                    headers={"Authorization": f"Bot {bot_token}"},
+                                    timeout=10,
+                                )
+                                if del_res.status_code in (200, 204, 404):
+                                    deleted_count += 1
+                                    deleted_message_ids.add(mid_str)
+                            else:
+                                deleted_count += 1
+                                deleted_message_ids.add(mid_str)
+            except Exception as exc:
+                log.warning(
+                    "Failed sweeping channel %s for PR notification cards: %s",
+                    cid,
+                    exc,
+                )
+
+    if not dry_run:
+        try:
+            save_state(state, state_file)
+        except Exception as exc:
+            log.warning("Failed saving state after cleanup: %s", exc)
+
+    return deleted_count
+
+
 def matches_target_patterns(repo: str, target_patterns: list[str] | None) -> bool:
     """Return True if repo matches any pattern in target_patterns.
 
@@ -417,6 +586,7 @@ def discover_open_prs(
     current_user: str | None = None,
 ) -> list[dict[str, Any]]:
     """Discover all open PRs authored by user, requesting review, or in target repos."""
+    is_default_patterns = (target_patterns is None) or (target_patterns == DEFAULT_TARGET_REPOS)
     if target_patterns is None:
         target_patterns = DEFAULT_TARGET_REPOS
     if current_user is None:
@@ -431,11 +601,12 @@ def discover_open_prs(
         url: str = "",
         author: str = "",
         review_decision: str | None = None,
+        enforce_pattern: bool = True,
     ) -> None:
         repo_clean = str(repo or "").strip()
         if not repo_clean or not number:
             return
-        if not matches_target_patterns(repo_clean, target_patterns):
+        if enforce_pattern and not matches_target_patterns(repo_clean, target_patterns):
             return
         try:
             num = int(number)
@@ -452,6 +623,8 @@ def discover_open_prs(
                 "author": author,
                 "reviewDecision": review_decision,
             }
+
+    enforce = not is_default_patterns
 
     # 1. Search PRs authored by @me across all repos
     try:
@@ -472,6 +645,7 @@ def discover_open_prs(
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     author=(item.get("author") or {}).get("login", current_user),
+                    enforce_pattern=enforce,
                 )
     except Exception as exc:
         log.warning("Failed querying prs authored by @me: %s", exc)
@@ -495,11 +669,36 @@ def discover_open_prs(
                     title=item.get("title", ""),
                     url=item.get("url", ""),
                     author=(item.get("author") or {}).get("login", ""),
+                    enforce_pattern=enforce,
                 )
     except Exception as exc:
         log.warning("Failed querying prs review-requested: %s", exc)
 
-    # 3. Target repo patterns
+    # 3. Search PRs that involve @me
+    try:
+        res = run_gh([
+            "search",
+            "prs",
+            "--state=open",
+            "--involves=@me",
+            "--json",
+            "repository,number,title,url,author",
+        ])
+        if res.returncode == 0:
+            for item in json.loads(res.stdout or "[]"):
+                repo_name = (item.get("repository") or {}).get("nameWithOwner", "")
+                _add_pr(
+                    repo=repo_name,
+                    number=item.get("number"),
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    author=(item.get("author") or {}).get("login", ""),
+                    enforce_pattern=enforce,
+                )
+    except Exception as exc:
+        log.warning("Failed querying prs involves=@me: %s", exc)
+
+    # 4. Target repo patterns
     for pat in target_patterns:
         pat = pat.strip()
         if not pat:
@@ -524,6 +723,7 @@ def discover_open_prs(
                             title=item.get("title", ""),
                             url=item.get("url", ""),
                             author=(item.get("author") or {}).get("login", ""),
+                            enforce_pattern=True,
                         )
             except Exception as exc:
                 log.warning("Failed querying prs for owner %s: %s", owner, exc)
@@ -548,17 +748,19 @@ def discover_open_prs(
                             url=item.get("url", ""),
                             author=(item.get("author") or {}).get("login", ""),
                             review_decision=item.get("reviewDecision"),
+                            enforce_pattern=True,
                         )
             except Exception as exc:
                 log.warning("Failed querying pr list for repo %s: %s", pat, exc)
 
-    # 4. Ingest unread/recent PullRequest notifications
+    # 5. Ingest unread/recent PullRequest notifications
     try:
         res = run_gh(["api", "/notifications"])
         if res.returncode == 0:
             for notif in json.loads(res.stdout or "[]"):
                 subj = notif.get("subject") or {}
                 if subj.get("type") == "PullRequest":
+                    notif_reason = notif.get("reason")
                     api_url = subj.get("url") or ""
                     parts = api_url.split("/repos/")
                     if len(parts) == 2:
@@ -566,12 +768,25 @@ def discover_open_prs(
                         if len(subparts) == 2 and subparts[1].isdigit():
                             r_name = subparts[0]
                             num = int(subparts[1])
+                            if notif_reason is not None:
+                                valid_reason = notif_reason in (
+                                    "author",
+                                    "review_requested",
+                                    "mention",
+                                    "assign",
+                                    "comment",
+                                    "team_mention",
+                                    "state_change",
+                                )
+                                if not (valid_reason or r_name.startswith("brockventures/")):
+                                    continue
                             _add_pr(
                                 repo=r_name,
                                 number=num,
                                 title=subj.get("title", ""),
                                 url=f"https://github.com/{r_name}/pull/{num}",
                                 author="",
+                                enforce_pattern=True,
                             )
     except Exception as exc:
         log.warning("Failed querying notifications: %s", exc)
@@ -589,7 +804,7 @@ def get_pr_details(repo: str, number: int) -> dict[str, Any] | None:
             "--repo",
             repo,
             "--json",
-            "number,title,url,author,reviewDecision,reviews,latestReviews,reviewRequests,comments,statusCheckRollup",
+            "number,title,url,author,reviewDecision,reviews,latestReviews,reviewRequests,comments,statusCheckRollup,headRefOid,state,merged",
         ])
         if res.returncode != 0:
             log.warning(
@@ -730,6 +945,7 @@ def check_pr(
     channels: list[str | int] | None = None,
     dry_run: bool = False,
     seed_only: bool = False,
+    state_file: Path = DEFAULT_STATE_FILE,
 ) -> dict[str, Any]:
     """Check a single PR for new reviews, comments, or review requests and notify."""
     if channels is None:
@@ -740,11 +956,16 @@ def check_pr(
     title = pr_details.get("title", f"PR #{pr_number}")
     url = pr_details.get("url", f"https://github.com/{repo}/pull/{pr_number}")
     review_decision = pr_details.get("reviewDecision") or "NONE"
+    pr_key = f"{repo}#{pr_number}"
 
     seen_reviews: set[str] = set(state.setdefault("seen_review_ids", []))
     seen_comments: set[str] = set(state.setdefault("seen_comment_ids", []))
     seen_reqs: set[str] = set(state.setdefault("seen_review_requests", []))
     review_decisions: dict[str, str] = state.setdefault("review_decisions", {})
+    active_notifications: dict[str, list[dict[str, Any]]] = state.setdefault(
+        "active_notifications", {}
+    )
+    pr_head_ref_oids: dict[str, str] = state.setdefault("pr_head_ref_oids", {})
 
     stats = {
         "reviews_notified": 0,
@@ -752,7 +973,80 @@ def check_pr(
         "review_requests_notified": 0,
         "decision_changed": False,
         "auto_merged": False,
+        "notifications_cleaned": 0,
     }
+
+    # Detect if Zero responded, headRefOid changed, or PR is MERGED/CLOSED
+    zero_users = {current_user.lower(), "brockventures", "zero-brock"}
+    latest_external_ts: str | None = None
+    latest_zero_ts: str | None = None
+
+    for rev in pr_details.get("reviews", []):
+        author_login = (rev.get("author") or {}).get("login", "")
+        ts = str(rev.get("submittedAt") or rev.get("createdAt") or "")
+        if not ts:
+            continue
+        if author_login and author_login.lower() in zero_users:
+            if latest_zero_ts is None or ts > latest_zero_ts:
+                latest_zero_ts = ts
+        elif author_login:
+            if latest_external_ts is None or ts > latest_external_ts:
+                latest_external_ts = ts
+
+    for com in pr_details.get("comments", []):
+        author_login = (com.get("author") or {}).get("login", "")
+        ts = str(com.get("createdAt") or "")
+        if not ts:
+            continue
+        if author_login and author_login.lower() in zero_users:
+            if latest_zero_ts is None or ts > latest_zero_ts:
+                latest_zero_ts = ts
+        elif author_login:
+            if latest_external_ts is None or ts > latest_external_ts:
+                latest_external_ts = ts
+
+    zero_responded = bool(
+        latest_external_ts and latest_zero_ts and latest_zero_ts >= latest_external_ts
+    )
+
+    current_head = str(pr_details.get("headRefOid") or "")
+    head_changed = False
+    tracked_notifs = active_notifications.get(pr_key, [])
+    if current_head and tracked_notifs:
+        for notif in tracked_notifs:
+            notif_head = notif.get("head_ref_oid")
+            if notif_head and notif_head != current_head:
+                head_changed = True
+                break
+    if current_head and pr_key in pr_head_ref_oids:
+        if pr_head_ref_oids[pr_key] and pr_head_ref_oids[pr_key] != current_head:
+            head_changed = True
+
+    pr_state = str(pr_details.get("state") or "").upper()
+    is_closed_or_merged = pr_state in ("MERGED", "CLOSED") or pr_details.get("merged") is True or pr_details.get("closed") is True
+
+    if zero_responded or head_changed or is_closed_or_merged:
+        if not seed_only:
+            cleaned = cleanup_pr_notifications(
+                repo=repo,
+                pr_number=pr_number,
+                state_file=state_file,
+                state=state,
+                dry_run=dry_run,
+            )
+            stats["notifications_cleaned"] = cleaned
+
+    if current_head:
+        pr_head_ref_oids[pr_key] = current_head
+
+    if is_closed_or_merged:
+        state["seen_review_ids"] = list(seen_reviews)
+        state["seen_comment_ids"] = list(seen_comments)
+        state["seen_review_requests"] = list(seen_reqs)
+        state["review_decisions"] = review_decisions
+        state["active_notifications"] = active_notifications
+        state["pr_head_ref_oids"] = pr_head_ref_oids
+        return stats
 
     # 1. Check reviews (CHANGES_REQUESTED, APPROVED, COMMENTED, etc.)
     for rev in pr_details.get("reviews", []):
@@ -782,8 +1076,18 @@ def check_pr(
                     review=rev,
                     current_decision=review_decision,
                 )
-                dispatch_notification(msg, channels=channels, dry_run=dry_run)
+                dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
                 stats["reviews_notified"] += 1
+                if not dry_run:
+                    notif_list = active_notifications.setdefault(pr_key, [])
+                    for d_res in dispatch_res:
+                        notif_list.append({
+                            "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
+                            "message_id": d_res.get("message_id") or 0,
+                            "event_id": rev_id,
+                            "created_at": submitted_at or datetime.now(timezone.utc).isoformat(),
+                            "head_ref_oid": current_head,
+                        })
 
     # 2. Check review requests
     for req in pr_details.get("reviewRequests", []):
@@ -805,8 +1109,18 @@ def check_pr(
                 reviewer=req_login,
                 author=pr_author,
             )
-            dispatch_notification(msg, channels=channels, dry_run=dry_run)
+            dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
             stats["review_requests_notified"] += 1
+            if not dry_run:
+                notif_list = active_notifications.setdefault(pr_key, [])
+                for d_res in dispatch_res:
+                    notif_list.append({
+                        "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
+                        "message_id": d_res.get("message_id") or 0,
+                        "event_id": req_key,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "head_ref_oid": current_head,
+                    })
 
     # 3. Check comments
     for com in pr_details.get("comments", []):
@@ -832,11 +1146,20 @@ def check_pr(
                 url=url,
                 comment=com,
             )
-            dispatch_notification(msg, channels=channels, dry_run=dry_run)
+            dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
             stats["comments_notified"] += 1
+            if not dry_run:
+                notif_list = active_notifications.setdefault(pr_key, [])
+                for d_res in dispatch_res:
+                    notif_list.append({
+                        "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
+                        "message_id": d_res.get("message_id") or 0,
+                        "event_id": com_id,
+                        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+                        "head_ref_oid": current_head,
+                    })
 
     # 4. Check reviewDecision transition
-    pr_key = f"{repo}#{pr_number}"
     old_decision = review_decisions.get(pr_key)
     review_decisions[pr_key] = review_decision
     if old_decision and old_decision != review_decision and review_decision != "NONE":
@@ -865,6 +1188,8 @@ def check_pr(
     state["seen_comment_ids"] = list(seen_comments)
     state["seen_review_requests"] = list(seen_reqs)
     state["review_decisions"] = review_decisions
+    state["active_notifications"] = active_notifications
+    state["pr_head_ref_oids"] = pr_head_ref_oids
     if not seed_only:
         state["auto_merged_prs"] = list(state.get("auto_merged_prs", []))
 
@@ -906,6 +1231,7 @@ def poll_and_notify(
         "review_requests_notified": 0,
         "decisions_changed": 0,
         "auto_merged": 0,
+        "notifications_cleaned": 0,
     }
 
     for pr_info in open_prs:
@@ -922,11 +1248,13 @@ def poll_and_notify(
             channels=channels,
             dry_run=dry_run,
             seed_only=seed_only,
+            state_file=state_file,
         )
         total_stats["prs_checked"] += 1
         total_stats["reviews_notified"] += st["reviews_notified"]
         total_stats["comments_notified"] += st["comments_notified"]
         total_stats["review_requests_notified"] += st["review_requests_notified"]
+        total_stats["notifications_cleaned"] += st.get("notifications_cleaned", 0)
         if st["decision_changed"]:
             total_stats["decisions_changed"] += 1
         if st.get("auto_merged"):
@@ -965,6 +1293,7 @@ def handle_event_pr(
         current_user=current_user,
         channels=channels,
         dry_run=dry_run,
+        state_file=state_file,
     )
     if not dry_run:
         save_state(state, state_file)
@@ -1079,6 +1408,10 @@ def parse_github_email_doorbell(
             break
 
     if not matched_repo:
+        if repo_cand.lower().startswith("brockventures/") or repo_cand.lower() == "azylman/mirrormere":
+            matched_repo = repo_cand
+
+    if not matched_repo:
         log.warning(
             "Email doorbell rejected: repository '%s' is not in WHITELISTED_REPOS",
             repo_cand,
@@ -1177,6 +1510,10 @@ def parse_discord_github_webhook_embed(
         if repo_cand.lower() == allowed_repo.lower():
             matched_repo = allowed_repo
             break
+
+    if not matched_repo:
+        if repo_cand.lower().startswith("brockventures/") or repo_cand.lower() == "azylman/mirrormere":
+            matched_repo = repo_cand
 
     if not matched_repo:
         log.info(
@@ -1396,6 +1733,18 @@ def main() -> int:
         default="",
         help="JSON string or file path containing raw email headers to process",
     )
+    parser.add_argument(
+        "--cleanup-repo",
+        type=str,
+        default="",
+        help="Repository to clean up notifications for",
+    )
+    parser.add_argument(
+        "--cleanup-pr",
+        type=str,
+        default="",
+        help="PR number to clean up notifications for",
+    )
     args = parser.parse_args()
 
     target_patterns = [p.strip() for p in args.repos.split(",") if p.strip()]
@@ -1408,6 +1757,16 @@ def main() -> int:
             parsed_channels.append(int(c_clean) if c_clean.isdigit() else c_clean)
 
     channels = parsed_channels or DEFAULT_CHANNELS
+
+    if args.cleanup_repo or args.cleanup_pr:
+        cleaned = cleanup_pr_notifications(
+            repo=args.cleanup_repo or None,
+            pr_number=args.cleanup_pr or None,
+            state_file=args.state_file,
+            dry_run=args.dry_run,
+        )
+        print(f"Cleaned {cleaned} notifications")
+        return 0
 
     if args.register_webhooks:
         res_hooks = ensure_repo_discord_webhooks(discord_webhook_url=args.webhook_url or None)

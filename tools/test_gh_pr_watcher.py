@@ -21,11 +21,13 @@ for _p in ("/workspace", "/workspace/tools"):
         sys.path.append(_p)
 
 from tools.gh_pr_watcher import (
+    DEFAULT_TARGET_REPOS,
     FORGE_CHANNEL_ID,
     WHITELISTED_AUTHORS,
     WHITELISTED_REPOS,
     ZERO_OPS_CHANNEL_ID,
     check_pr,
+    cleanup_pr_notifications,
     discover_open_prs,
     dispatch_notification,
     ensure_repo_discord_webhook,
@@ -35,6 +37,7 @@ from tools.gh_pr_watcher import (
     format_review_message,
     format_review_request_message,
     get_authenticated_user,
+    get_discord_bot_token,
     get_pr_details,
     handle_event_pr,
     is_ci_passing_or_empty,
@@ -1614,6 +1617,498 @@ class TestEventDrivenPipeline(unittest.TestCase):
             dry_run=False,
             current_user=None,
         )
+
+
+class TestGhPrNotificationCleanup(unittest.TestCase):
+    """Test automatic Discord notification card tracking and REST cleanup."""
+
+    @patch("requests.delete")
+    def test_cleanup_pr_notifications_tracked_messages(
+        self, mock_delete: MagicMock
+    ) -> None:
+        """Tracked message IDs matching (repo, pr_number) are deleted via REST."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 204
+        mock_delete.return_value = mock_resp
+
+        state = {
+            "version": 1,
+            "active_notifications": {
+                "mcarmody/lomin#5": [
+                    {
+                        "channel_id": FORGE_CHANNEL_ID,
+                        "message_id": 111222,
+                        "event_id": "rev:1",
+                        "created_at": "2026-11-02T05:00:00Z",
+                    },
+                    {
+                        "channel_id": ZERO_OPS_CHANNEL_ID,
+                        "message_id": 333444,
+                        "event_id": "rev:1",
+                        "created_at": "2026-11-02T05:00:00Z",
+                    },
+                ],
+                "other/repo#10": [
+                    {
+                        "channel_id": FORGE_CHANNEL_ID,
+                        "message_id": 555666,
+                        "event_id": "rev:2",
+                        "created_at": "2026-11-02T05:00:00Z",
+                    },
+                ],
+            },
+        }
+
+        tmp_state = Path("/tmp/test_cleanup_state.json")
+        try:
+            count = cleanup_pr_notifications(
+                repo="mcarmody/lomin",
+                pr_number=5,
+                state_file=tmp_state,
+                token="test_token_abc",
+                sweep_channels=False,
+                state=state,
+            )
+            self.assertEqual(count, 2)
+            self.assertEqual(mock_delete.call_count, 2)
+            mock_delete.assert_has_calls([
+                call(
+                    f"https://discord.com/api/v10/channels/{FORGE_CHANNEL_ID}/messages/111222",
+                    headers={"Authorization": "Bot test_token_abc"},
+                    timeout=10,
+                ),
+                call(
+                    f"https://discord.com/api/v10/channels/{ZERO_OPS_CHANNEL_ID}/messages/333444",
+                    headers={"Authorization": "Bot test_token_abc"},
+                    timeout=10,
+                ),
+            ], any_order=True)
+            self.assertNotIn("mcarmody/lomin#5", state["active_notifications"])
+            self.assertIn("other/repo#10", state["active_notifications"])
+        finally:
+            tmp_state.unlink(missing_ok=True)
+
+    @patch("requests.delete")
+    @patch("requests.get")
+    def test_cleanup_pr_notifications_channel_sweep(
+        self, mock_get: MagicMock, mock_delete: MagicMock
+    ) -> None:
+        """Channel sweep detects and deletes matching PR cards in FORGE and ZERO_OPS."""
+        mock_del_resp = MagicMock()
+        mock_del_resp.status_code = 204
+        mock_delete.return_value = mock_del_resp
+
+        def get_side_effect(url: str, **kwargs: Any):
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            if str(FORGE_CHANNEL_ID) in url:
+                mock_resp.json.return_value = [
+                    {
+                        "id": "1001",
+                        "content": "💬 **GitHub PR Comment**\n**Repo:** `mcarmody/lomin` | **PR:** [#5 feat: camera](https://github.com/mcarmody/lomin/pull/5)\n>>> Please rebase",
+                    },
+                    {
+                        "id": "1002",
+                        "content": "💬 **GitHub PR Comment**\n**Repo:** `mcarmody/lomin` | **PR:** [#6 other pr](https://github.com/mcarmody/lomin/pull/6)\n>>> Different PR",
+                    },
+                    {
+                        "id": "1003",
+                        "content": "Some chat message without PR markers",
+                    },
+                ]
+            else:
+                mock_resp.json.return_value = [
+                    {
+                        "id": "1004",
+                        "content": "⚠️ **GitHub PR Review: CHANGES_REQUESTED**\n**Repo:** `mcarmody/lomin` | **PR:** [#5 feat: camera](https://github.com/mcarmody/lomin/pull/5)\n>>> Needs fix",
+                    }
+                ]
+            return mock_resp
+
+        mock_get.side_effect = get_side_effect
+
+        tmp_state = Path("/tmp/test_cleanup_sweep_state.json")
+        try:
+            count = cleanup_pr_notifications(
+                repo="mcarmody/lomin",
+                pr_number=5,
+                state_file=tmp_state,
+                token="test_token_abc",
+                sweep_channels=True,
+            )
+            self.assertEqual(count, 2)
+            self.assertEqual(mock_delete.call_count, 2)
+            deleted_urls = [c[0][0] for c in mock_delete.call_args_list]
+            self.assertIn(f"https://discord.com/api/v10/channels/{FORGE_CHANNEL_ID}/messages/1001", deleted_urls)
+            self.assertIn(f"https://discord.com/api/v10/channels/{ZERO_OPS_CHANNEL_ID}/messages/1004", deleted_urls)
+        finally:
+            tmp_state.unlink(missing_ok=True)
+
+    @patch("requests.delete")
+    @patch("requests.get")
+    def test_cleanup_pr_notifications_dedupes_tracked_and_sweep(
+        self, mock_get: MagicMock, mock_delete: MagicMock
+    ) -> None:
+        """Message IDs present in active_notifications and channel sweep are not deleted twice."""
+        mock_del_resp = MagicMock()
+        mock_del_resp.status_code = 204
+        mock_delete.return_value = mock_del_resp
+
+        state = {
+            "version": 1,
+            "active_notifications": {
+                "mcarmody/lomin#5": [
+                    {
+                        "channel_id": FORGE_CHANNEL_ID,
+                        "message_id": 999111,
+                        "event_id": "rev:1",
+                        "created_at": "2026-11-02T05:00:00Z",
+                    }
+                ]
+            },
+        }
+
+        mock_get_resp = MagicMock()
+        mock_get_resp.status_code = 200
+        mock_get_resp.json.return_value = [
+            {
+                "id": "999111",
+                "content": "👀 **GitHub Review Requested**\n**Repo:** `mcarmody/lomin` | **PR:** [#5 title](url)",
+            }
+        ]
+        mock_get.return_value = mock_get_resp
+
+        tmp_state = Path("/tmp/test_cleanup_dedupe_state.json")
+        try:
+            count = cleanup_pr_notifications(
+                repo="mcarmody/lomin",
+                pr_number=5,
+                state_file=tmp_state,
+                token="test_token",
+                sweep_channels=True,
+                state=state,
+            )
+            self.assertEqual(count, 1)
+            self.assertEqual(mock_delete.call_count, 1)
+        finally:
+            tmp_state.unlink(missing_ok=True)
+
+    @patch("requests.delete")
+    def test_cleanup_pr_notifications_dry_run(
+        self, mock_delete: MagicMock
+    ) -> None:
+        """Dry-run mode counts matching messages without executing REST DELETE."""
+        state = {
+            "version": 1,
+            "active_notifications": {
+                "mcarmody/lomin#5": [
+                    {
+                        "channel_id": FORGE_CHANNEL_ID,
+                        "message_id": 12345,
+                        "event_id": "rev:1",
+                        "created_at": "2026-11-02T05:00:00Z",
+                    }
+                ]
+            },
+        }
+        count = cleanup_pr_notifications(
+            repo="mcarmody/lomin",
+            pr_number=5,
+            token="test_token",
+            state=state,
+            dry_run=True,
+            sweep_channels=False,
+        )
+        self.assertEqual(count, 1)
+        mock_delete.assert_not_called()
+
+    def test_get_discord_bot_token_resolution(self) -> None:
+        """Token resolves from parameter first, env second, secrets third."""
+        self.assertEqual(get_discord_bot_token("direct_param"), "direct_param")
+        with patch.dict("os.environ", {"DISCORD_BOT_TOKEN": "from_env"}):
+            self.assertEqual(get_discord_bot_token(), "from_env")
+
+
+class TestContributedRepoDiscovery(unittest.TestCase):
+    """Test discovery of owned and contributed PRs across repos including azylman/mirrormere."""
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_discover_open_prs_default_patterns_includes_contributed_and_involves(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """With default target_patterns, PRs from --author=@me, --review-requested=@me, and --involves=@me are discovered."""
+        def side_effect(args: list[str], timeout: int = 30):
+            if "search" in args and "--author=@me" in args:
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=0,
+                    stdout=json.dumps([
+                        {
+                            "repository": {"nameWithOwner": "azylman/mirrormere"},
+                            "number": 15,
+                            "title": "fix: camera bounds",
+                            "url": "https://github.com/azylman/mirrormere/pull/15",
+                            "author": {"login": "zero-brock"},
+                        }
+                    ]),
+                    stderr="",
+                )
+            if "search" in args and "--review-requested=@me" in args:
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=0,
+                    stdout=json.dumps([
+                        {
+                            "repository": {"nameWithOwner": "external-org/cool-project"},
+                            "number": 88,
+                            "title": "feat: review please",
+                            "url": "https://github.com/external-org/cool-project/pull/88",
+                            "author": {"login": "contributor"},
+                        }
+                    ]),
+                    stderr="",
+                )
+            if "search" in args and "--involves=@me" in args:
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=0,
+                    stdout=json.dumps([
+                        {
+                            "repository": {"nameWithOwner": "azylman/mirrormere"},
+                            "number": 20,
+                            "title": "chore: dependency bump",
+                            "url": "https://github.com/azylman/mirrormere/pull/20",
+                            "author": {"login": "azylman"},
+                        }
+                    ]),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="[]", stderr=""
+            )
+
+        mock_run_gh.side_effect = side_effect
+
+        prs = discover_open_prs(current_user="zero-brock")
+        pr_keys = {(p["repo"], p["number"]) for p in prs}
+
+        self.assertIn(("azylman/mirrormere", 15), pr_keys)
+        self.assertIn(("external-org/cool-project", 88), pr_keys)
+        self.assertIn(("azylman/mirrormere", 20), pr_keys)
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_notification_reason_filtering(self, mock_run_gh: MagicMock) -> None:
+        """Notifications API only ingests relevant reasons or brockventures/ repos."""
+        mock_run_gh.return_value = subprocess.CompletedProcess(
+            args=["gh", "api", "/notifications"],
+            returncode=0,
+            stdout=json.dumps([
+                {
+                    "reason": "mention",
+                    "subject": {
+                        "type": "PullRequest",
+                        "title": "PR Mentioned",
+                        "url": "https://api.github.com/repos/mcarmody/lomin/pulls/10",
+                    },
+                },
+                {
+                    "reason": "subscribed",  # Passive watch noise
+                    "subject": {
+                        "type": "PullRequest",
+                        "title": "Passive noise PR",
+                        "url": "https://api.github.com/repos/mcarmody/lomin/pulls/11",
+                    },
+                },
+                {
+                    "reason": "subscribed",  # Owned repo: keep even if subscribed
+                    "subject": {
+                        "type": "PullRequest",
+                        "title": "Owned repo PR",
+                        "url": "https://api.github.com/repos/brockventures/Zero-Gotchi/pulls/12",
+                    },
+                },
+            ]),
+            stderr="",
+        )
+
+        prs = discover_open_prs(
+            target_patterns=["mcarmody/lomin", "brockventures/*"],
+            current_user="zero-brock",
+        )
+        pr_numbers = {p["number"] for p in prs}
+        self.assertIn(10, pr_numbers)
+        self.assertNotIn(11, pr_numbers)
+        self.assertIn(12, pr_numbers)
+
+    def test_azylman_mirrormere_in_whitelisted_repos_and_targets(self) -> None:
+        """azylman/mirrormere is in WHITELISTED_REPOS and DEFAULT_TARGET_REPOS."""
+        self.assertIn("azylman/mirrormere", WHITELISTED_REPOS)
+        self.assertIn("azylman/mirrormere", DEFAULT_TARGET_REPOS)
+
+    def test_email_doorbell_and_webhook_embed_accepts_azylman_mirrormere_and_owned_repos(self) -> None:
+        """Verified email doorbell and Discord webhook accept azylman/mirrormere and any brockventures/ repo."""
+        email_headers = {
+            "Authentication-Results": "dkim=pass header.i=@github.com",
+            "From": "notifications@github.com",
+            "Message-ID": "<azylman/mirrormere/pull/99@github.com>",
+        }
+        self.assertEqual(
+            parse_github_email_doorbell(email_headers),
+            ("azylman/mirrormere", 99),
+        )
+
+        owned_headers = {
+            "Authentication-Results": "dkim=pass header.i=@github.com",
+            "From": "notifications@github.com",
+            "Message-ID": "<brockventures/new-unlisted-repo/pull/3@github.com>",
+        }
+        self.assertEqual(
+            parse_github_email_doorbell(owned_headers),
+            ("brockventures/new-unlisted-repo", 3),
+        )
+
+        webhook_embed = {
+            "title": "[azylman/mirrormere] Pull request #77 opened",
+            "url": "https://github.com/azylman/mirrormere/pull/77",
+        }
+        self.assertEqual(
+            parse_discord_github_webhook_embed(webhook_embed),
+            ("azylman/mirrormere", 77),
+        )
+
+
+class TestAutoCleanupOnResponse(unittest.TestCase):
+    """Test automatic card cleanup in check_pr when Zero responds, headRefOid changes, or PR merges/closes."""
+
+    @patch("tools.gh_pr_watcher.cleanup_pr_notifications")
+    def test_check_pr_auto_cleanup_when_zero_responds(
+        self, mock_cleanup: MagicMock
+    ) -> None:
+        """When Zero posts a comment/review >= latest external review, triggers cleanup."""
+        mock_cleanup.return_value = 2
+        state: dict[str, Any] = {
+            "version": 1,
+            "active_notifications": {
+                "mcarmody/lomin#5": [
+                    {"channel_id": FORGE_CHANNEL_ID, "message_id": 12345}
+                ]
+            },
+        }
+
+        pr_details = {
+            "repo": "mcarmody/lomin",
+            "number": 5,
+            "title": "feat: camera frames",
+            "url": "https://github.com/mcarmody/lomin/pull/5",
+            "reviews": [
+                {
+                    "id": "rev_1",
+                    "author": {"login": "mcarmody"},
+                    "state": "CHANGES_REQUESTED",
+                    "submittedAt": "2026-11-02T04:00:00Z",
+                    "body": "Fix this please",
+                }
+            ],
+            "comments": [
+                {
+                    "id": "com_1",
+                    "author": {"login": "zero-brock"},  # Zero responded later
+                    "createdAt": "2026-11-02T04:10:00Z",
+                    "body": "Fixed in latest push!",
+                }
+            ],
+            "reviewRequests": [],
+        }
+
+        stats = check_pr(
+            pr_details=pr_details,
+            state=state,
+            current_user="zero-brock",
+        )
+        self.assertEqual(stats["notifications_cleaned"], 2)
+        mock_cleanup.assert_called_once_with(
+            repo="mcarmody/lomin",
+            pr_number=5,
+            state_file=ANY,
+            state=state,
+            dry_run=False,
+        )
+
+    @patch("tools.gh_pr_watcher.cleanup_pr_notifications")
+    def test_check_pr_auto_cleanup_when_head_ref_oid_changes(
+        self, mock_cleanup: MagicMock
+    ) -> None:
+        """When headRefOid changes after a notification was posted, triggers cleanup."""
+        mock_cleanup.return_value = 1
+        state: dict[str, Any] = {
+            "version": 1,
+            "pr_head_ref_oids": {
+                "mcarmody/lomin#5": "commit_sha_old",
+            },
+            "active_notifications": {
+                "mcarmody/lomin#5": [
+                    {
+                        "channel_id": FORGE_CHANNEL_ID,
+                        "message_id": 12345,
+                        "head_ref_oid": "commit_sha_old",
+                    }
+                ]
+            },
+        }
+
+        pr_details = {
+            "repo": "mcarmody/lomin",
+            "number": 5,
+            "title": "feat: camera frames",
+            "url": "https://github.com/mcarmody/lomin/pull/5",
+            "headRefOid": "commit_sha_new",
+            "reviews": [],
+            "comments": [],
+            "reviewRequests": [],
+        }
+
+        stats = check_pr(
+            pr_details=pr_details,
+            state=state,
+            current_user="zero-brock",
+        )
+        self.assertEqual(stats["notifications_cleaned"], 1)
+        mock_cleanup.assert_called_once()
+        self.assertEqual(state["pr_head_ref_oids"]["mcarmody/lomin#5"], "commit_sha_new")
+
+    @patch("tools.gh_pr_watcher.cleanup_pr_notifications")
+    def test_check_pr_auto_cleanup_when_pr_merged_or_closed(
+        self, mock_cleanup: MagicMock
+    ) -> None:
+        """When PR state is MERGED or CLOSED, triggers cleanup and exits cleanly."""
+        mock_cleanup.return_value = 1
+        state: dict[str, Any] = {
+            "version": 1,
+            "active_notifications": {
+                "mcarmody/lomin#5": [
+                    {"channel_id": FORGE_CHANNEL_ID, "message_id": 12345}
+                ]
+            },
+        }
+
+        pr_details = {
+            "repo": "mcarmody/lomin",
+            "number": 5,
+            "title": "feat: camera frames",
+            "url": "https://github.com/mcarmody/lomin/pull/5",
+            "state": "MERGED",
+            "reviews": [],
+            "comments": [],
+            "reviewRequests": [],
+        }
+
+        stats = check_pr(
+            pr_details=pr_details,
+            state=state,
+            current_user="zero-brock",
+        )
+        self.assertEqual(stats["notifications_cleaned"], 1)
+        mock_cleanup.assert_called_once()
 
 
 if __name__ == "__main__":
