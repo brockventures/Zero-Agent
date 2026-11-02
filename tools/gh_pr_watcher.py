@@ -4,7 +4,7 @@
 Monitors open PRs authored by Zero or requesting Zero's review across active repositories
 (mcarmody/lomin, brockventures/*, arcane103/*).
 Tracks seen reviews, comments, and reviewDecision states in /workspace/data/gh_pr_watcher_state.json.
-Dispatches actionable Discord wake-ups to #forge and #zero-ops via tools/outbox.py
+Dispatches actionable Discord wake-ups to #forge via tools/outbox.py
 when new reviews (CHANGES_REQUESTED, APPROVED, COMMENTED) or review requests arrive.
 """
 
@@ -60,7 +60,7 @@ log = logging.getLogger("gh_pr_watcher")
 # Channel configuration
 FORGE_CHANNEL_ID = 1562899941595160657
 ZERO_OPS_CHANNEL_ID = 1544953279664889888
-DEFAULT_CHANNELS: list[str | int] = [FORGE_CHANNEL_ID, ZERO_OPS_CHANNEL_ID]
+DEFAULT_CHANNELS: list[str | int] = [FORGE_CHANNEL_ID]
 
 DEFAULT_STATE_FILE = Path("/workspace/data/gh_pr_watcher_state.json")
 DEFAULT_SCHEDULE_FILE = Path("/workspace/data/schedule.json")
@@ -1692,7 +1692,7 @@ def main() -> int:
         "--channels",
         type=str,
         default="",
-        help="Comma-separated channel names or numeric IDs",
+        help="Comma-separated channel names or numeric IDs (default: #forge)",
     )
     parser.add_argument(
         "--dry-run",

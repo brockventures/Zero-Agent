@@ -23,6 +23,7 @@ for _p in ("/workspace", "/workspace/tools"):
         sys.path.append(_p)
 
 from tools.gh_pr_watcher import (
+    DEFAULT_CHANNELS,
     DEFAULT_TARGET_REPOS,
     FORGE_CHANNEL_ID,
     WHITELISTED_AUTHORS,
@@ -377,8 +378,25 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
         self.assertIn("@mcarmody", msg)
         self.assertIn("Please rebase onto main.", msg)
 
+    def test_default_channels_is_forge_only(self) -> None:
+        """DEFAULT_CHANNELS routes strictly to FORGE_CHANNEL_ID, keeping ZERO_OPS free of PR spam."""
+        self.assertEqual(DEFAULT_CHANNELS, [FORGE_CHANNEL_ID])
+        self.assertNotIn(ZERO_OPS_CHANNEL_ID, DEFAULT_CHANNELS)
+
     @patch("tools.gh_pr_watcher.queue_outbox_message")
     def test_dispatch_notification(self, mock_queue: MagicMock) -> None:
+        mock_queue.return_value = {"status": "queued"}
+        # Default invocation: routes strictly to FORGE_CHANNEL_ID
+        results = dispatch_notification("Test notification")
+        self.assertEqual(len(results), 1)
+        mock_queue.assert_called_once_with(
+            channel=FORGE_CHANNEL_ID,
+            content="Test notification",
+            source_turn="gh_pr_watcher",
+        )
+
+    @patch("tools.gh_pr_watcher.queue_outbox_message")
+    def test_dispatch_notification_explicit_channels(self, mock_queue: MagicMock) -> None:
         mock_queue.return_value = {"status": "queued"}
         results = dispatch_notification(
             "Test notification", channels=[FORGE_CHANNEL_ID, ZERO_OPS_CHANNEL_ID]
@@ -521,7 +539,12 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
             current_user="brockventures",
         )
         self.assertEqual(stats["review_requests_notified"], 1)
-        self.assertEqual(mock_queue.call_count, 2)
+        self.assertEqual(mock_queue.call_count, 1)
+        mock_queue.assert_called_once_with(
+            channel=FORGE_CHANNEL_ID,
+            content=ANY,
+            source_turn="gh_pr_watcher",
+        )
         self.assertIn(
             "mcarmody/lomin#12:req:brockventures",
             state["seen_review_requests"],
@@ -572,7 +595,12 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
             current_user="brockventures",
         )
         self.assertEqual(stats["comments_notified"], 1)
-        self.assertEqual(mock_queue.call_count, 2)
+        self.assertEqual(mock_queue.call_count, 1)
+        mock_queue.assert_called_once_with(
+            channel=FORGE_CHANNEL_ID,
+            content=ANY,
+            source_turn="gh_pr_watcher",
+        )
         self.assertIn("COM_100", state["seen_comment_ids"])
 
         # Second run dedupes
@@ -729,7 +757,12 @@ class TestGhPrWatcherEndToEnd(unittest.TestCase):
             )
             self.assertEqual(stats["prs_checked"], 1)
             self.assertEqual(stats["reviews_notified"], 1)
-            self.assertEqual(mock_outbox.call_count, 2)
+            self.assertEqual(mock_outbox.call_count, 1)
+            mock_outbox.assert_called_once_with(
+                channel=FORGE_CHANNEL_ID,
+                content=ANY,
+                source_turn="gh_pr_watcher",
+            )
             self.assertTrue(tmp_state.exists())
 
             # Verify persisted state
