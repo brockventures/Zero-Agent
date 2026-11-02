@@ -373,7 +373,7 @@ def run_loop():
         log("Starting Zero Inbound Email Listener Daemon (Anti-Flood Guard Active)...")
         env = load_env()
         bot_token = env.get("DISCORD_BOT_TOKEN")
-        channel_id = env.get("DISCORD_CHANNEL_ID", "1542081375287640084")
+        channel_id = env.get("ZERO_MAIL_CHANNEL_ID", "1542081375287640084")
 
         if not bot_token:
             log("ERROR: DISCORD_BOT_TOKEN missing in .env. Exiting.")
@@ -417,42 +417,42 @@ def run_loop():
                 if new_msgs:
                     log(f"Detected {len(new_msgs)} new unread email(s) for Zero.")
 
-                    # CIRCUIT BREAKER: Surge / Flood Detection
-                    if len(new_msgs) >= FLOOD_SURGE_THRESHOLD:
-                        log(f"⚠️ SURGE DETECTED: {len(new_msgs)} emails in single tick. Collapsing into flood digest.")
-                        
-                        # Fetch metadata for summary
-                        senders = []
-                        for m in new_msgs:
-                            mid = m["id"]
-                            try:
-                                m_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=metadata"
-                                m_req = urllib.request.Request(m_url, headers={"Authorization": f"Bearer {tok}"})
-                                with urllib.request.urlopen(m_req, timeout=TIMEOUT) as m_resp:
-                                    m_data = json.loads(m_resp.read().decode())
-                                    raw_h = m_data.get("payload", {}).get("headers", [])
-                                    headers = {h["name"]: h["value"] for h in raw_h}
-                                    headers_lower = {h["name"].lower(): h["value"] for h in raw_h}
-                                    from_addr = headers_lower.get("from", "Unknown")
-                                    if "notifications@github.com" in from_addr.lower() and process_github_email_doorbell:
+                    human_payloads = []
+                    for m in new_msgs:
+                        mid = m["id"]
+                        try:
+                            m_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=metadata"
+                            m_req = urllib.request.Request(m_url, headers={"Authorization": f"Bearer {tok}"})
+                            with urllib.request.urlopen(m_req, timeout=TIMEOUT) as m_resp:
+                                m_data = json.loads(m_resp.read().decode())
+                                raw_h = m_data.get("payload", {}).get("headers", [])
+                                headers = {h["name"]: h["value"] for h in raw_h}
+                                headers_lower = {h["name"].lower(): h["value"] for h in raw_h}
+                                from_addr = headers_lower.get("from", "Unknown")
+                                if "notifications@github.com" in from_addr.lower():
+                                    if process_github_email_doorbell:
                                         try:
                                             process_github_email_doorbell(headers)
                                         except Exception as d_err:
-                                            log(f"GitHub email doorbell error in surge: {d_err}")
-                                    senders.append(sanitize_text(from_addr, 40))
-                            except Exception:
-                                pass
-                            seen_ids.add(mid)
+                                            log(f"GitHub email doorbell error: {d_err}")
+                                else:
+                                    human_payloads.append((mid, m_data, from_addr))
+                        except Exception:
+                            pass
+                        seen_ids.add(mid)
 
-                        save_seen(seen_ids)
+                    save_seen(seen_ids)
 
-                        # Tally top senders
+                    # CIRCUIT BREAKER: Surge / Flood Detection (strictly for non-GitHub human mail)
+                    if len(human_payloads) >= FLOOD_SURGE_THRESHOLD:
+                        log(f"⚠️ SURGE DETECTED: {len(human_payloads)} human emails in single tick. Collapsing into flood digest.")
+                        senders = [sanitize_text(from_addr, 40) for _, _, from_addr in human_payloads]
                         top_senders = Counter(senders).most_common(3)
                         senders_str = ", ".join([f"`{s}` ({cnt})" for s, cnt in top_senders])
 
                         surge_msg = (
                             f"🛡️ **Inbound Email Surge Suppressed (`{TARGET_EMAIL}`)**\n"
-                            f"• **Volume:** `{len(new_msgs)}` new emails received in last {POLL_INTERVAL}s.\n"
+                            f"• **Volume:** `{len(human_payloads)}` new emails received in last {POLL_INTERVAL}s.\n"
                             f"• **Top Senders:** {senders_str}\n"
                             f"• **Action Taken:** Individual alert cards suppressed to protect Discord channel. Details preserved for Nightly Assistant.\n\n"
                             f"-# 🔒 *Anti-DDoS Circuit Breaker Active.*"
@@ -462,22 +462,13 @@ def run_loop():
                         except Exception as de:
                             log(f"Failed to post surge digest: {de}")
 
-                    else:
+                    elif human_payloads:
                         # Normal volume: post individual cards (capped at MAX_INDIVIDUAL_PER_CYCLE)
-                        for m in new_msgs[:MAX_INDIVIDUAL_PER_CYCLE]:
-                            mid = m["id"]
-                            m_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=metadata"
-                            m_req = urllib.request.Request(m_url, headers={"Authorization": f"Bearer {tok}"})
-                            with urllib.request.urlopen(m_req, timeout=TIMEOUT) as m_resp:
-                                m_data = json.loads(m_resp.read().decode())
-
+                        for mid, m_data, _ in human_payloads[:MAX_INDIVIDUAL_PER_CYCLE]:
                             res = process_message_payload(m_data, bot_token=bot_token, channel_id=channel_id)
-                            seen_ids.add(mid)
                             if res == "discord_notified":
                                 log(f"Discord notification posted for message {mid}")
                                 time.sleep(DISCORD_POST_DELAY)
-
-                        save_seen(seen_ids)
 
             except Exception as e:
                 log_error_throttled("poll_loop_exception", f"Polling loop exception: {e}", interval=3600)
