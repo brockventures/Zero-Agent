@@ -700,8 +700,9 @@ def format_proposal_markdown(plan: dict) -> str:
         desc = r.get("description", "")
         slug = r.get("slug", "")
         link = f"{MEALIE_BASE}/g/home/r/{slug}" if slug else f"{MEALIE_BASE}/household/mealplan/planner/"
+        skip_badge = " *(Ingredients on hand — skipped from shopping list)*" if m_info.get("skip_shopping") else ""
         return (
-            f"- **{m_info.get('date_display')}** ({m_info.get('slot_type')}):\n"
+            f"- **{m_info.get('date_display')}** ({m_info.get('slot_type')}):{skip_badge}\n"
             f"  🍽️ **[{name}](<{link}>)** — ⏱️ {total_time} | _{tags_str}_\n"
             f"  _{desc}_"
         )

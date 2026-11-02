@@ -317,9 +317,22 @@ def extract_active_meal_plan_items() -> tuple[list[dict], list[str], list[dict],
         day_str = data.get("date_display") or data.get("day_name") or slot.title()
         url = f"https://mealie.brock.ventures/g/home/r/{r_slug}" if r_slug else "https://mealie.brock.ventures/household/mealplan/planner/"
         costco_meal = is_costco_recipe(rec)
+        skip_shopping = bool(data.get("skip_shopping") or rec.get("skip_shopping"))
 
         recipes_loaded.append(r_name)
         meal_cart_items = []
+
+        if skip_shopping:
+            meal_breakdowns.append({
+                "name": r_name,
+                "slug": r_slug,
+                "day": day_str,
+                "url": url,
+                "store": "costco" if costco_meal else "whole_foods",
+                "items": [],
+                "skip_shopping": True,
+            })
+            continue
 
         for line in rec.get("ingredients", []):
             parsed = parse_raw_ingredient(line)
