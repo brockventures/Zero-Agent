@@ -403,7 +403,7 @@ def test_synthesize_recommendations_rules(temp_schedule: Path) -> None:
         },
     }
 
-    # Rule 2B: Unengaged channel streak >= 4 -> Job disable
+    # Unengaged channel streak >= 4 must NOT generate job_disable recommendation
     engagement = {
         "active_hours_pt": [8, 17, 18],
         "unengaged_channels": [
@@ -435,7 +435,7 @@ def test_synthesize_recommendations_rules(temp_schedule: Path) -> None:
     disable_recs = [r for r in recs if r["type"] == "job_disable"]
     disable_jobs = [r["job_id"] for r in disable_recs]
     assert "actual_budget_anomaly" in disable_jobs  # from finances dismissal
-    assert "midweek_grocery" in disable_jobs  # from shopping unengaged channel
+    assert "midweek_grocery" not in disable_jobs  # unengaged channels must not auto-disable
 
     # Inspect parameter calibration rec
     calib_rec = next(r for r in recs if r["type"] == "parameter_calibration")
@@ -506,7 +506,7 @@ def test_run_usage_telemetry_audit_end_to_end(temp_db: Path, temp_schedule: Path
     )
 
     assert ok is True
-    assert data["cards_staged"] >= 2
+    assert data["cards_staged"] >= 1
     assert len(data["decision_ids"]) == data["cards_staged"]
 
     # Verify staged cards in SQLite at CHANNEL_ZERO_OPS

@@ -511,7 +511,7 @@ def synthesize_tuning_recommendations(
     """
     Synthesize 1-click self-tuning recommendations based on telemetry:
     1. Propose schedule shifts (--apply-shift <job_id> --hour <h> --minute <m>) when total >= 3 and expiration_rate >= 0.60
-    2. Propose job disables (--disable-job <job_id>) when dismissal_rate >= 0.60 or consecutive_bot_msgs >= 4
+    2. Propose job disables (--disable-job <job_id>) when dismissal_rate >= 0.60
     3. Propose parameter calibration (--calibrate <category>) when edit_friction_rate >= 0.40
     """
     recommendations: list[dict[str, Any]] = []
@@ -619,44 +619,6 @@ def synthesize_tuning_recommendations(
                     },
                     "reason": f"High edit friction ({friction_rate*100:.0f}% >= 40%)",
                     "metric_value": friction_rate,
-                })
-
-    # Rule 2B: Job Disables from Unengaged Channels (consecutive_bot_msgs >= 4)
-    for unengaged in engagement.get("unengaged_channels", []):
-        streak = unengaged.get("consecutive_bot_msgs", 0)
-        ch_id = int(unengaged.get("channel_id", 0))
-        ch_name = unengaged.get("channel_name", str(ch_id))
-
-        if streak >= 4:
-            # Find job that targets this channel
-            job_id = CHANNEL_JOB_MAP.get(ch_id)
-            if not job_id:
-                matched_job = _find_job_in_schedule(ch_name, schedule_path=schedule_path)
-                job_id = matched_job["id"] if matched_job else f"job_channel_{ch_id}"
-
-            key = ("job_disable", job_id)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                cmd = f"python3 /workspace/tools/usage_telemetry.py --disable-job {job_id}"
-                recommendations.append({
-                    "type": "job_disable",
-                    "job_id": job_id,
-                    "category": ch_name,
-                    "channel_id": ch_id,
-                    "title": f"Disable Unengaged Channel Job {job_id}",
-                    "summary": (
-                        f"Channel #{ch_name} has {streak} consecutive bot messages with zero human interactions. "
-                        f"Proposing disabling '{job_id}' to eliminate unengaged channel spam."
-                    ),
-                    "command": cmd,
-                    "handler_type": "shell",
-                    "payload": {
-                        "command": cmd,
-                        "cwd": "/workspace",
-                        "job_id": job_id,
-                    },
-                    "reason": f"Unengaged channel streak ({streak} consecutive bot msgs >= 4)",
-                    "metric_value": streak,
                 })
 
     return recommendations

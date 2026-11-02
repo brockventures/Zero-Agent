@@ -661,10 +661,9 @@ def run_quota_poller(test: bool = False, quiet: bool = False, force: bool = Fals
 
         # Check if any bucket had non-zero burn delta
         max_delta = max((s.get("delta_fraction", 0.0) for s in snapshots), default=0.0)
-        has_reset = any(s.get("is_reset", 0) for s in snapshots)
-
-        gw = next((s for s in snapshots if s["bucket_id"] == "gemini-weekly"), None)
+        gw = next((s for s in snapshots if s.get("bucket_id") == "gemini-weekly"), None)
         rem_pct = round(gw["remaining_fraction"] * 100, 1) if gw else 0.0
+        has_reset = bool(gw and gw.get("is_reset", 0))
 
         if test:
             msg = f"🧪 [TEST] Quota poller dry-run nominal ({len(snapshots)} buckets sampled; Gemini weekly at {rem_pct}%)."
