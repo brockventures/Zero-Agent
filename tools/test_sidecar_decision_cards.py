@@ -19,9 +19,13 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
 sys.path.insert(0, REPO_ROOT)
 
 # Ensure worktree tools package is loaded rather than /workspace
-for _m in list(sys.modules.keys()):
-    if _m == "tools" or _m.startswith("tools."):
-        del sys.modules[_m]
+if "tools" in sys.modules:
+    tools_mod = sys.modules["tools"]
+    tools_path = getattr(tools_mod, "__file__", "") or (tools_mod.__path__[0] if hasattr(tools_mod, "__path__") and tools_mod.__path__ else "")
+    if not tools_path.startswith(REPO_ROOT):
+        for _m in list(sys.modules.keys()):
+            if _m == "tools" or _m.startswith("tools."):
+                del sys.modules[_m]
 
 import tools
 tools.__path__ = [os.path.join(REPO_ROOT, "tools")]

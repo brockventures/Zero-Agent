@@ -588,6 +588,14 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
     except Exception as he:
         failures.append(f"Zero Health Server check failed: {he}")
 
+    # 8. Hearth Upstream Mirrormere Auto-Sync (deterministic background sync, silent on update)
+    try:
+        from tools.hearth_sync import sync_hearth
+        h_ok, h_msg = sync_hearth(force=False)
+        if not h_ok:
+            failures.append(f"Hearth upstream auto-sync failed: {h_msg}")
+    except Exception as hse:
+        failures.append(f"Hearth upstream auto-sync check failed: {hse}")
 
     if not failures:
         return True, f"🟢 **Heartbeat Sweep Healthy** — {now_str}\nAll containers, ports, Home Assistant, and external monitors healthy across `.82` and `.84`."
