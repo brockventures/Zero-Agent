@@ -350,10 +350,10 @@ class TurnCoordinator:
         self,
         stream_parser: Optional[AgyStreamParser] = None,
         timer: Optional[TurnTimer] = None,
-        early_ack_enabled: bool = True,
+        early_ack_enabled: bool = False,
         early_ack_seconds: float = 180.0,
     ) -> bool:
-        """Deliver initial preliminary finding or check-in when early_ack_enabled is True.
+        """Deliver initial preliminary finding when early_ack_enabled is True.
 
         If disabled, discards any buffered deferred ack token from the stream parser immediately.
         When sent, updates self.early_ack_msg, self.delivery_target, and self.reply_target to the
@@ -387,33 +387,6 @@ class TurnCoordinator:
                         except Exception as e:
                             print(f"[TurnCoordinator] Failed sending early ack: {e}")
                             return False
-
-            elif (
-                self.mode == "home"
-                and early_ack_seconds > 0
-                and (time.time() - self.turn_start_time) >= early_ack_seconds
-                and timer is not None
-                and timer.num_tools >= 4
-            ):
-                target = self.delivery_target or self.reply_target
-                if target is not None:
-                    checkin_text = "⏳ *Still investigating — running detailed analysis, will follow up shortly.*"
-                    try:
-                        if hasattr(target, "reply"):
-                            sent_m = await target.reply(checkin_text)
-                        elif hasattr(target, "send"):
-                            sent_m = await target.send(checkin_text)
-                        else:
-                            sent_m = None
-                        self.early_ack_sent = True
-                        if sent_m is not None:
-                            self.early_ack_msg = sent_m
-                            self.delivery_target = sent_m
-                            self.reply_target = sent_m
-                        return True
-                    except Exception as e:
-                        print(f"[TurnCoordinator] Failed sending early check-in: {e}")
-                        return False
 
         return False
 
@@ -778,7 +751,7 @@ class TurnCoordinator:
                     await self.maybe_send_early_ack(
                         stream_parser=stream_parser,
                         timer=timer,
-                        early_ack_enabled=bool(rules.get("early_ack_enabled", True)),
+                        early_ack_enabled=bool(rules.get("early_ack_enabled", False)),
                         early_ack_seconds=float(rules.get("early_ack_seconds", 180.0)),
                     )
 
@@ -873,7 +846,7 @@ class TurnCoordinator:
             await self.maybe_send_early_ack(
                 stream_parser=stream_parser,
                 timer=timer,
-                early_ack_enabled=bool(rules.get("early_ack_enabled", True)),
+                early_ack_enabled=bool(rules.get("early_ack_enabled", False)),
                 early_ack_seconds=float(rules.get("early_ack_seconds", 180.0)),
             )
             if ev and (ev.get("event") == "result" or "result" in ev):
@@ -971,7 +944,7 @@ class TurnCoordinator:
             await self.maybe_send_early_ack(
                 stream_parser=stream_parser,
                 timer=timer,
-                early_ack_enabled=bool(rules.get("early_ack_enabled", True)),
+                early_ack_enabled=bool(rules.get("early_ack_enabled", False)),
                 early_ack_seconds=float(rules.get("early_ack_seconds", 180.0)),
             )
 

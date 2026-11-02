@@ -10,8 +10,8 @@ Verifies:
 4. TurnCoordinator.maybe_send_early_ack() delivers preliminary finding when enabled,
    records early_ack_msg, and points delivery_target to sent_m so downstream deep-dive
    responses thread natively as replies to the first message.
-5. TurnCoordinator.maybe_send_early_ack() delivers home-turf progress check-in after
-   early_ack_seconds with >= 4 tool calls.
+5. TurnCoordinator.maybe_send_early_ack() returns False and sends no message when stream_parser
+   has no deferred ack even after early_ack_seconds and >= 4 tool calls.
 """
 
 import json
@@ -261,24 +261,47 @@ class TestBridgeEarlyAck(unittest.IsolatedAsyncioTestCase):
         send_target.send.assert_called_once()
 
     async def test_maybe_send_early_ack_progress_checkin_fallback(self):
-        """Verify progress check-in triggers after early_ack_seconds with >= 4 tool calls."""
+        """Verify maybe_send_early_ack returns False and sends no message when stream_parser has no deferred ack even after early_ack_seconds and >= 4 tool calls."""
         timer = TurnTimer(channel_id=123456789)
         timer.num_tools = 4
 
         # Simulate turn running for 200 seconds
         self.coordinator.turn_start_time = time.time() - 200.0
 
+        # With stream_parser=None
         sent = await self.coordinator.maybe_send_early_ack(
             stream_parser=None,
             timer=timer,
             early_ack_enabled=True,
             early_ack_seconds=180.0,
         )
-        self.assertTrue(sent)
-        self.assertTrue(self.coordinator.early_ack_sent)
-        self.assertEqual(self.coordinator.delivery_target, self.mock_sent_msg)
-        self.reply_target.reply.assert_called_once()
-        self.assertIn("Still investigating", self.reply_target.reply.call_args[0][0])
+        self.assertFalse(sent)
+        self.assertFalse(self.coordinator.early_ack_sent)
+        self.assertIsNone(self.coordinator.early_ack_msg)
+        self.reply_target.reply.assert_not_called()
+
+        # With stream_parser having no deferred ack
+        parser = AgyStreamParser(conv_id="conv-no-ack")
+        sent_parser = await self.coordinator.maybe_send_early_ack(
+            stream_parser=parser,
+            timer=timer,
+            early_ack_enabled=True,
+            early_ack_seconds=180.0,
+        )
+        self.assertFalse(sent_parser)
+        self.assertFalse(self.coordinator.early_ack_sent)
+        self.assertIsNone(self.coordinator.early_ack_msg)
+        self.reply_target.reply.assert_not_called()
+
+    async def test_maybe_send_early_ack_defaults_to_disabled(self):
+        """Verify maybe_send_early_ack defaults early_ack_enabled to False."""
+        parser = AgyStreamParser(conv_id="conv-default-disabled")
+        parser.deferred_ack_text = "Preliminary finding"
+        sent = await self.coordinator.maybe_send_early_ack(stream_parser=parser)
+        self.assertFalse(sent)
+        self.assertFalse(self.coordinator.early_ack_sent)
+        self.reply_target.reply.assert_not_called()
+        self.assertEqual(parser.pop_deferred_ack(), "")
 
     def test_runtime_rules_early_ack_defaults(self):
         """Verify runtime_rules.json includes early_ack_enabled=True and early_ack_seconds=180.0."""

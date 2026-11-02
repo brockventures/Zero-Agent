@@ -325,7 +325,7 @@ async def execute_agy_turn(
             turn_timeout_seconds = float(rules.get("turn_watchdog_seconds", 300.0))
             agent_done_window = float(rules.get("agent_done_cutoff_seconds", 15.0))
             max_turn_ceiling = float(rules.get("turn_max_ceiling_seconds", 0.0))
-            early_ack_enabled = bool(rules.get("early_ack_enabled", True))
+            early_ack_enabled = bool(rules.get("early_ack_enabled", False))
             early_ack_seconds = float(rules.get("early_ack_seconds", 180.0))
             timed_out = False
             is_hard_ceiling = False
