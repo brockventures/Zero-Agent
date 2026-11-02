@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import difflib
 import fcntl
 import glob
 import json
@@ -1551,6 +1552,183 @@ def _is_new_symbol_in_instructions(sym_name: str, instructions: str) -> bool:
     return False
 
 
+def _is_new_file_in_instructions(rel_file: str, instructions: str, title: str = "") -> bool:
+    """Return True if `rel_file` is explicitly described as being created/added/written in `instructions` or `title`."""
+    if not rel_file:
+        return False
+    raw_file = rel_file.strip()
+    while raw_file.startswith("./"):
+        raw_file = raw_file[2:]
+    if not raw_file:
+        return False
+    basename = Path(raw_file).name
+
+    targets = [re.escape(raw_file)]
+    if basename and basename != raw_file:
+        targets.append(re.escape(basename))
+    target_pattern = r"(?:" + "|".join(targets) + r")"
+
+    action_words = (
+        r"(?:create|creating|created|add|adding|added|new|write|writing|written|"
+        r"implement|implementing|implemented|introduce|introducing|introduced|scaffold|scaffolding)"
+    )
+
+    # 1. Check title
+    if title:
+        if re.search(target_pattern, title, re.IGNORECASE) and re.search(rf"\b{action_words}\b", title, re.IGNORECASE):
+            return True
+
+    if not instructions:
+        return False
+
+    # 2. Check explicit direct creation phrases like "create <file>", "add <file>", "write <file>", "new file <file>"
+    direct_creation = (
+        rf"\b(?:create|creating|created|add|adding|added|write|writing|written|scaffold|scaffolding|implement|implementing)\s+"
+        rf"(?:a\s+|the\s+)?(?:new\s+)?(?:file|module|script|test|test\s+file)?\s*[`'\"]?{target_pattern}\b[`'\"]?"
+    )
+    if re.search(direct_creation, instructions, re.IGNORECASE):
+        return True
+
+    new_file_phrase = rf"\b(?:new\s+file|new\s+module|new\s+script|new\s+test)\s+[`'\"]?{target_pattern}\b[`'\"]?"
+    if re.search(new_file_phrase, instructions, re.IGNORECASE):
+        return True
+
+    # 3. Check existing-file reference phrases like "In <file>" or "Update <file>"
+    existing_verbs = r"(?:update|updating|modify|modifying|edit|editing)"
+    existing_pattern = rf"\b{existing_verbs}\s+[`'\"]?{target_pattern}\b[`'\"]?"
+    in_file_pattern = rf"(?:^|[\n\.\;\:\-]\s*|\b(?:and|then)\s+)in\s+[`'\"]?{target_pattern}\b[`'\"]?"
+
+    has_existing_ref = bool(
+        re.search(existing_pattern, instructions, re.IGNORECASE)
+        or re.search(in_file_pattern, instructions, re.IGNORECASE)
+    )
+
+    if has_existing_ref:
+        return False
+
+    # 4. Check if file is mentioned and windows around it contain creation verbs
+    for m in re.finditer(target_pattern, instructions, re.IGNORECASE):
+        start = max(0, m.start() - 120)
+        end = min(len(instructions), m.end() + 120)
+        window = instructions[start:end].lower()
+        if re.search(rf"\b{action_words}\b", window):
+            return True
+
+    return False
+
+
+def _matches_existing_file_reference(rel_file: str, instructions: str) -> bool:
+    """Return True if instructions explicitly say 'In <file>', 'Update <file>', or 'Modify <file>'."""
+    if not rel_file or not instructions:
+        return False
+    raw_file = rel_file.strip()
+    while raw_file.startswith("./"):
+        raw_file = raw_file[2:]
+    if not raw_file:
+        return False
+    basename = Path(raw_file).name
+
+    targets = [re.escape(raw_file)]
+    if basename and basename != raw_file:
+        targets.append(re.escape(basename))
+    target_pattern = r"(?:" + "|".join(targets) + r")"
+
+    in_pattern = rf"(?:^|[\n\.\;\:\-]\s*|\b(?:and|then)\s+)in\s+[`'\"]?{target_pattern}\b[`'\"]?"
+    update_pattern = rf"\b(?:update|updating|updates\s+to|modify|modifying|edit|editing)\s+[`'\"]?{target_pattern}\b[`'\"]?"
+
+    return bool(
+        re.search(in_pattern, instructions, re.IGNORECASE)
+        or re.search(update_pattern, instructions, re.IGNORECASE)
+    )
+
+
+def _get_close_files_hint(ch_repo: Path, rel_file: str) -> str:
+    """Return a hint suggesting closely matching files if a target or test file is missing."""
+    try:
+        raw_file = rel_file.strip()
+        while raw_file.startswith("./"):
+            raw_file = raw_file[2:]
+        target_path = (ch_repo / raw_file).resolve() if not Path(raw_file).is_absolute() else Path(raw_file).resolve()
+        search_dir = target_path.parent if target_path.parent.exists() else ch_repo
+        if not search_dir.exists():
+            return ""
+
+        candidates: list[str] = []
+        for p in search_dir.iterdir():
+            if p.is_file():
+                try:
+                    rel_p = str(p.relative_to(ch_repo))
+                except ValueError:
+                    rel_p = p.name
+                candidates.append(rel_p)
+
+        matches = difflib.get_close_matches(raw_file, candidates, n=3, cutoff=0.5)
+        if not matches:
+            base = Path(raw_file).name
+            base_candidates = [Path(c).name for c in candidates]
+            base_matches = difflib.get_close_matches(base, base_candidates, n=3, cutoff=0.5)
+            if base_matches:
+                matches = [c for c in candidates if Path(c).name in base_matches]
+
+        if matches:
+            if len(matches) == 1:
+                return f"Did you mean '{matches[0]}'?"
+            return f"Did you mean one of: {', '.join(repr(m) for m in matches)}?"
+    except Exception:
+        pass
+    return ""
+
+
+def _detect_multi_branch_git_surgery(instructions: str) -> str | None:
+    """Detect if chunk instructions instruct the worker to manually push, cherry-pick, or sync multiple git branches."""
+    if not instructions:
+        return None
+
+    # 1. Phrases explicitly mentioning syncing/pushing multiple/stacked branches
+    stacked_phrase = re.search(
+        r"(?:push|sync|propagate|cherry-pick|cherry\s+pick|merge)\s+(?:commits?\s+)?(?:(?:across|from|between|into)\s+)?(?:both|multiple|stacked)\s+(?:git\s+)?branches",
+        instructions,
+        re.IGNORECASE,
+    )
+    if stacked_phrase:
+        return f"instruction directs worker to {stacked_phrase.group(0)}"
+
+    stacked_surgery = re.search(
+        r"(?:stacked[- ]branch|multi[- ]branch)\s+(?:git\s+)?(?:surgery|push|sync|cherry-pick|propagation)",
+        instructions,
+        re.IGNORECASE,
+    )
+    if stacked_surgery:
+        return f"instruction directs '{stacked_surgery.group(0)}'"
+
+    # 2. git push with multiple branch arguments (e.g. 'git push origin feat/a feat/b' or 'git push origin br1 br2')
+    git_push_matches = re.finditer(r"\bgit\s+push\b([^\n;&|]*)", instructions, re.IGNORECASE)
+    for m in git_push_matches:
+        line = m.group(1).strip()
+        tokens = [t for t in line.split() if not t.startswith("-")]
+        if not tokens:
+            continue
+        remotes = {"origin", "upstream"}
+        if tokens[0].lower() in remotes:
+            branch_tokens = tokens[1:]
+        else:
+            branch_tokens = tokens
+        if len(branch_tokens) >= 2:
+            return f"instruction contains multi-branch push ('git push ... {' '.join(branch_tokens)}')"
+
+    # 3. Mentioning multiple distinct feat/ or feature/ branches alongside git push/cherry-pick/sync
+    feat_branches = set(re.findall(r"\b(?:feat|feature)/[a-zA-Z0-9_\-\./]+", instructions, re.IGNORECASE))
+    if len(feat_branches) >= 2:
+        if re.search(
+            r"\b(?:git\s+push|git\s+cherry-pick|git\s+merge|cherry-pick|sync|propagate)\b",
+            instructions,
+            re.IGNORECASE,
+        ):
+            return f"instruction instructs syncing or pushing multiple stacked branches ({', '.join(sorted(feat_branches))})"
+
+    return None
+
+
 MAX_WHOLE_CLASS_SYMBOL_LINES = 150
 
 
@@ -1775,6 +1953,106 @@ def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
     for idx, ch in enumerate(chunks):
         if isinstance(ch, dict):
             _normalize_chunk_dict_in_place(ch, idx, chunks)
+
+    # 0. Multi-branch git surgery guard & Target/Verification file pre-flight
+    accumulated_target_files: set[str] = set()
+    accumulated_target_basenames: set[str] = set()
+
+    for idx, ch in enumerate(chunks):
+        if not isinstance(ch, dict):
+            continue
+        ch_repo_str = str(ch.get("repo") or default_repo_str).strip()
+        ch_repo = Path(ch_repo_str).resolve()
+        instructions = str(ch.get("instructions") or "")
+        title = str(ch.get("title") or "")
+        target_files = ch.get("target_files") or []
+
+        # A. Guard against manual multi-branch git surgery in instructions
+        surgery_reason = _detect_multi_branch_git_surgery(instructions)
+        if surgery_reason:
+            findings.append(
+                f"Chunk {idx} instructions instruct manual multi-branch git surgery or stacked-branch propagation "
+                f"({surgery_reason}). Keep stacked branch propagation out of worker prompts; the FORGE "
+                f"supervisor automatically manages worktree commits and branch synchronization."
+            )
+
+        # Current chunk normalized target files
+        curr_target_files: set[str] = set()
+        curr_target_basenames: set[str] = set()
+        if isinstance(target_files, list):
+            for f in target_files:
+                f_str = str(f).strip()
+                while f_str.startswith("./"):
+                    f_str = f_str[2:]
+                if f_str:
+                    curr_target_files.add(f_str)
+                    curr_target_basenames.add(Path(f_str).name)
+
+        # B. Target files validation
+        if ch_repo.exists() and isinstance(target_files, list):
+            for f in target_files:
+                rel_f = str(f).strip()
+                while rel_f.startswith("./"):
+                    rel_f = rel_f[2:]
+                if not rel_f:
+                    continue
+                target_p = (ch_repo / rel_f).resolve() if not Path(rel_f).is_absolute() else Path(rel_f).resolve()
+
+                # (a) Exists on disk
+                if target_p.exists() and target_p.is_file():
+                    continue
+                # (b) Listed in earlier chunks
+                if rel_f in accumulated_target_files or Path(rel_f).name in accumulated_target_basenames:
+                    continue
+                # (c) Marked as new file
+                if _is_new_file_in_instructions(rel_f, instructions, title):
+                    continue
+
+                # Missing file: check if parent directory exists and instructions say In/Update/Modify
+                if target_p.parent.exists() and _matches_existing_file_reference(rel_f, instructions):
+                    hint = _get_close_files_hint(ch_repo, rel_f)
+                    hint_suffix = f" {hint}" if hint else ""
+                    findings.append(
+                        f"Chunk {idx} target file '{rel_f}' does not exist in repository and is not marked as a new file in instructions.{hint_suffix}"
+                    )
+
+        # C. Verification command test file validation
+        verification_cmd = str(ch.get("verification_cmd") or "")
+        if ch_repo.exists() and verification_cmd:
+            test_matches = re.findall(
+                r"(?:(?:\./)?(?:tests|tools)/(?:[\w\-]+/)*test_[\w\-]+\.py)",
+                verification_cmd,
+            )
+            for t_raw in test_matches:
+                t_str = t_raw.strip()
+                while t_str.startswith("./"):
+                    t_str = t_str[2:]
+                t_p = (ch_repo / t_str).resolve() if not Path(t_str).is_absolute() else Path(t_str).resolve()
+
+                # (a) Exists on disk
+                if t_p.exists() and t_p.is_file():
+                    continue
+                # (b) Listed in target_files across chunks[0..idx]
+                if (
+                    t_str in accumulated_target_files
+                    or t_str in curr_target_files
+                    or Path(t_str).name in accumulated_target_basenames
+                    or Path(t_str).name in curr_target_basenames
+                ):
+                    continue
+                # (c) Marked as new file in instructions/title
+                if _is_new_file_in_instructions(t_str, instructions, title):
+                    continue
+
+                hint = _get_close_files_hint(ch_repo, t_str)
+                hint_suffix = f" {hint}" if hint else ""
+                findings.append(
+                    f"Chunk {idx} verification command references test file '{t_str}' which does not exist on disk and is not listed in target_files.{hint_suffix}"
+                )
+
+        # Update accumulated target files after chunk validation
+        accumulated_target_files.update(curr_target_files)
+        accumulated_target_basenames.update(curr_target_basenames)
 
     # 1. Target symbols validation
     for idx, ch in enumerate(chunks):

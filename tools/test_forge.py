@@ -2882,6 +2882,197 @@ class ServerConfig:
     assert findings == []
 
 
+def test_goldfish_plan_preflight_missing_existing_target_file(tmp_path):
+    """Verify run_goldfish_plan_preflight rejects target_files that don't exist when instructions refer to them as existing."""
+    repo_dir = tmp_path / "repo"
+    tools_dir = repo_dir / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "forge.py").write_text("# existing forge\n", encoding="utf-8")
+
+    # 1. Typo in target_files where instructions say 'Update tools/forge_worker.py'
+    plan_missing = {
+        "title": "Missing Target File Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Chunk updating missing file",
+                "target_files": ["tools/forge_worker.py"],
+                "instructions": "Update tools/forge_worker.py to support new lease options.",
+            }
+        ],
+    }
+    ok, findings = forge_mod.run_goldfish_plan_preflight(plan_missing)
+    assert ok is False
+    assert len(findings) == 1
+    assert "target file 'tools/forge_worker.py' does not exist in repository" in findings[0]
+    assert "Did you mean 'tools/forge.py'?" in findings[0]
+
+    # 2. 'In tools/forge_worker.py' also triggers rejection
+    plan_in = {
+        "title": "Missing Target File In Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Chunk in missing file",
+                "target_files": ["tools/forge_worker.py"],
+                "instructions": "In tools/forge_worker.py, add new helper functions.",
+            }
+        ],
+    }
+    ok_in, findings_in = forge_mod.run_goldfish_plan_preflight(plan_in)
+    assert ok_in is False
+    assert len(findings_in) == 1
+    assert "target file 'tools/forge_worker.py' does not exist in repository" in findings_in[0]
+
+
+def test_goldfish_plan_preflight_missing_verification_cmd_test_file(tmp_path):
+    """Verify run_goldfish_plan_preflight rejects verification_cmd referencing non-existent test file not in target_files."""
+    repo_dir = tmp_path / "repo"
+    tools_dir = repo_dir / "tools"
+    tools_dir.mkdir(parents=True)
+    (tools_dir / "forge.py").write_text("# existing forge\n", encoding="utf-8")
+    (tools_dir / "test_forge.py").write_text("# existing test_forge\n", encoding="utf-8")
+
+    plan_missing_test = {
+        "title": "Missing Test File Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Chunk referencing non-existent test file",
+                "target_files": ["tools/forge.py"],
+                "instructions": "Implement feature in forge.py.",
+                "verification_cmd": "pytest tools/test_forge_typo.py -k test_foo",
+            }
+        ],
+    }
+    ok, findings = forge_mod.run_goldfish_plan_preflight(plan_missing_test)
+    assert ok is False
+    assert len(findings) == 1
+    assert "verification command references test file 'tools/test_forge_typo.py' which does not exist on disk" in findings[0]
+    assert "Did you mean" in findings[0]
+    assert "tools/test_forge.py" in findings[0]
+
+
+def test_goldfish_plan_preflight_new_file_allowance(tmp_path):
+    """Verify run_goldfish_plan_preflight allows missing files when explicitly described as new or in prior chunks."""
+    repo_dir = tmp_path / "repo"
+    tools_dir = repo_dir / "tools"
+    tools_dir.mkdir(parents=True)
+
+    plan_new = {
+        "title": "Create New File Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Create new module tools/module_x.py",
+                "target_files": ["tools/module_x.py", "tools/test_module_x.py"],
+                "instructions": "Create tools/module_x.py with implementation and add unit tests in tools/test_module_x.py.",
+                "verification_cmd": "pytest tools/test_module_x.py",
+            },
+            {
+                "title": "Extend module_x in downstream chunk",
+                "target_files": ["tools/module_x.py"],
+                "instructions": "Update tools/module_x.py to add secondary methods.",
+                "verification_cmd": "pytest tools/test_module_x.py",
+            },
+        ],
+    }
+    ok, findings = forge_mod.run_goldfish_plan_preflight(plan_new)
+    assert ok is True, f"Expected pass, got findings: {findings}"
+    assert findings == []
+
+
+def test_goldfish_plan_preflight_multi_branch_git_surgery_rejection():
+    """Verify run_goldfish_plan_preflight rejects instructions directing multi-branch git surgery or stacked branch pushes."""
+    # 1. git push origin with 2+ branch names
+    plan_push = {
+        "title": "Multi-Branch Push Plan",
+        "repo": "/workspace",
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Chunk directing multi-branch push",
+                "target_files": ["tools/forge.py"],
+                "instructions": "Finish changes then run git push origin feat/branch-1 feat/branch-2 to sync both.",
+            }
+        ],
+    }
+    ok_p, findings_p = forge_mod.run_goldfish_plan_preflight(plan_push)
+    assert ok_p is False
+    assert len(findings_p) == 1
+    assert "instruct manual multi-branch git surgery or stacked-branch propagation" in findings_p[0]
+    assert "Keep stacked branch propagation out of worker prompts" in findings_p[0]
+
+    # 2. Instructing to sync/push multiple stacked branches
+    plan_sync = {
+        "title": "Stacked Branch Sync Plan",
+        "repo": "/workspace",
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Chunk directing stacked branch sync",
+                "target_files": ["tools/forge.py"],
+                "instructions": "Sync and push multiple feat/step1 and feat/step2 stacked branches.",
+            }
+        ],
+    }
+    ok_s, findings_s = forge_mod.run_goldfish_plan_preflight(plan_sync)
+    assert ok_s is False
+    assert "instruct manual multi-branch git surgery or stacked-branch propagation" in findings_s[0]
+
+    # 3. Instructing cherry-picking across multiple branches
+    plan_cherry = {
+        "title": "Cherry-Pick Plan",
+        "repo": "/workspace",
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Chunk directing cherry-pick across branches",
+                "target_files": ["tools/forge.py"],
+                "instructions": "Cherry-pick commits across multiple branches to keep them aligned.",
+            }
+        ],
+    }
+    ok_c, findings_c = forge_mod.run_goldfish_plan_preflight(plan_cherry)
+    assert ok_c is False
+    assert "instruct manual multi-branch git surgery or stacked-branch propagation" in findings_c[0]
+
+
+def test_goldfish_preflight_is_new_file_in_instructions_helper():
+    """Verify _is_new_file_in_instructions accurately identifies new vs existing file intent."""
+    # Direct creation verbs in instructions
+    assert forge_mod._is_new_file_in_instructions("tools/new.py", "Create tools/new.py with classes.") is True
+    assert forge_mod._is_new_file_in_instructions("tools/new.py", "Add tools/new.py with unit tests.") is True
+    assert forge_mod._is_new_file_in_instructions("tools/new.py", "Write tools/new.py to export helper.") is True
+    assert forge_mod._is_new_file_in_instructions("tools/new.py", "Scaffold tools/new.py.") is True
+    assert forge_mod._is_new_file_in_instructions("tools/new.py", "New file tools/new.py will be added.") is True
+
+    # Title-based creation
+    assert forge_mod._is_new_file_in_instructions("tools/new.py", "", title="Create tools/new.py") is True
+    assert forge_mod._is_new_file_in_instructions("tools/new.py", "", title="Add new.py") is True
+
+    # Existing file references
+    assert forge_mod._is_new_file_in_instructions("tools/existing.py", "In tools/existing.py, add new function.") is False
+    assert forge_mod._is_new_file_in_instructions("tools/existing.py", "Update tools/existing.py with new logic.") is False
+    assert forge_mod._is_new_file_in_instructions("tools/existing.py", "Modify tools/existing.py to fix bug.") is False
+    assert forge_mod._is_new_file_in_instructions("tools/existing.py", "Edit tools/existing.py.") is False
+
+    # Empty or unrelated
+    assert forge_mod._is_new_file_in_instructions("tools/existing.py", "") is False
+    assert forge_mod._is_new_file_in_instructions("tools/existing.py", "Create tools/other.py.") is False
+
+
 def test_enqueue_build_clears_offload_dispatched_on_exception(tmp_path):
     """Verify enqueue_build clears offload_dispatched in batch_guard_state.json if validation raises ValueError."""
     bs_file = tmp_path / "batch_guard_state.json"
