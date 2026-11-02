@@ -11,13 +11,20 @@ the shared Family Google Calendar and Mealie.
 
 import argparse
 from datetime import datetime, timedelta
+import io
 import json
 import os
 import random
 import re
 import sys
+import urllib.request
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = ImageDraw = ImageFont = None
 
 WORKSPACE = "/workspace"
 DATA_DIR = os.path.join(WORKSPACE, "data")
@@ -307,15 +314,240 @@ def filter_eligible_recipes(recipes: list[dict], recent_slugs: set[str], slot: s
     return eligible
 
 
-def generate_proposal(ref_date: datetime | None = None, force: bool = False, stage: bool | None = None) -> dict:
+def _get_font(size: int, bold: bool = False):
+    candidate_paths = [
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf" if bold else "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ]
+    for p in candidate_paths:
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _wrap_text_to_lines(text: str, font, max_width: int, draw) -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+    lines = []
+    curr = []
+    for word in words:
+        test_line = " ".join(curr + [word])
+        bbox = draw.textbbox((0, 0), test_line, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            curr.append(word)
+        else:
+            if curr:
+                lines.append(" ".join(curr))
+                curr = [word]
+            else:
+                lines.append(word)
+                curr = []
+    if curr:
+        lines.append(" ".join(curr))
+    return lines
+
+
+def _create_culinary_fallback(width: int = 500, height: int = 600) -> "Image.Image":
+    base = Image.new("RGB", (width, height), color=(24, 28, 36))
+    draw = ImageDraw.Draw(base)
+    for y in range(height):
+        r = int(28 - 14 * (y / height))
+        g = int(32 - 16 * (y / height))
+        b = int(40 - 20 * (y / height))
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+    cx, cy = width // 2, 220
+    draw.ellipse([(cx - 55, cy - 55), (cx + 55, cy + 55)], outline=(60, 70, 85), width=2)
+    draw.ellipse([(cx - 44, cy - 44), (cx + 44, cy + 44)], outline=(45, 53, 65), width=1)
+    font_sub = _get_font(13, bold=True)
+    draw.text((cx, cy), "MEALIE", fill=(90, 105, 125), font=font_sub, anchor="mm")
+    return base
+
+
+def _fetch_recipe_image(recipe: dict, panel_w: int = 500, panel_h: int = 600) -> "Image.Image":
+    recipe_id = recipe.get("id")
+    if not recipe_id:
+        return _create_culinary_fallback(panel_w, panel_h)
+
+    # 1. Try Mealie REST API
+    candidate_urls = [
+        f"{MEALIE_BASE}/api/media/recipes/{recipe_id}/images/min-original.webp",
+        f"{MEALIE_BASE}/api/media/recipes/{recipe_id}/images/original.webp",
+    ]
+    for url in candidate_urls:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Zero-Agent/1.0"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status == 200:
+                    raw = resp.read()
+                    if raw:
+                        img = Image.open(io.BytesIO(raw))
+                        return img.convert("RGB")
+        except Exception:
+            continue
+
+    # 2. Try SSH docker exec fallback
+    try:
+        import subprocess
+        clean_id = recipe_id.replace("-", "")
+        dash_id = f"{clean_id[:8]}-{clean_id[8:12]}-{clean_id[12:16]}-{clean_id[16:20]}-{clean_id[20:]}" if len(clean_id) == 32 else recipe_id
+        cmd = [
+            "ssh", "-i", str(SSH_KEY), "-p", str(SSH_PORT),
+            "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3",
+            f"{SSH_USER}@{HOST_2_IP}",
+            f"docker exec mealie cat /app/data/recipes/{dash_id}/images/min-original.webp || "
+            f"docker exec mealie cat /app/data/recipes/{dash_id}/images/original.webp || "
+            f"docker exec mealie cat /app/data/recipes/{clean_id}/images/min-original.webp || "
+            f"docker exec mealie cat /app/data/recipes/{clean_id}/images/original.webp"
+        ]
+        res = subprocess.run(cmd, capture_output=True, timeout=5)
+        if res.returncode == 0 and res.stdout:
+            img = Image.open(io.BytesIO(res.stdout))
+            return img.convert("RGB")
+    except Exception:
+        pass
+
+    # 3. Clean dark culinary card fallback
+    return _create_culinary_fallback(panel_w, panel_h)
+
+
+def build_three_panel_menu_image(plan: dict, out_path: str = "/workspace/data/weekly_menu_triptych.jpg") -> str | None:
+    """Builds a 1500x600 3-panel collage from Tuesday, Thursday, Sunday recipe images."""
+    if Image is None:
+        return None
+
+    meals = plan.get("meals", {})
+    if not meals:
+        return None
+
+    canvas_w = 1500
+    canvas_h = 600
+    panel_w = 500
+    panel_h = 600
+
+    def _render_panel(slot_key: str, slot_data: dict) -> "Image.Image":
+        recipe = slot_data.get("recipe", {})
+        raw_img = _fetch_recipe_image(recipe, panel_w, panel_h)
+
+        # Center-crop into 500x600
+        w, h = raw_img.size
+        target_aspect = panel_w / panel_h
+        curr_aspect = w / h if h else 1.0
+
+        if curr_aspect > target_aspect:
+            scale = panel_h / h
+            new_w = int(round(w * scale))
+            new_h = panel_h
+            resized = raw_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            left = (new_w - panel_w) // 2
+            panel = resized.crop((left, 0, left + panel_w, panel_h))
+        else:
+            scale = panel_w / w if w else 1.0
+            new_w = panel_w
+            new_h = int(round(h * scale))
+            resized = raw_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            top = (new_h - panel_h) // 2
+            panel = resized.crop((0, top, panel_w, top + panel_h))
+
+        panel = panel.convert("RGBA")
+
+        # Dark gradient footer overlay
+        fade_start = 280
+        fade_range = panel_h - fade_start
+        alpha_bytes = bytearray(panel_h)
+        for y in range(fade_start, panel_h):
+            progress = (y - fade_start) / fade_range
+            alpha = int(245 * (progress ** 1.3))
+            alpha_bytes[y] = min(255, max(0, alpha))
+        alpha_mask = Image.frombytes("L", (1, panel_h), bytes(alpha_bytes)).resize((panel_w, panel_h))
+        black_layer = Image.new("RGBA", (panel_w, panel_h), (0, 0, 0, 255))
+        gradient_overlay = Image.composite(black_layer, Image.new("RGBA", (panel_w, panel_h), (0, 0, 0, 0)), alpha_mask)
+        panel = Image.alpha_composite(panel, gradient_overlay)
+
+        draw = ImageDraw.Draw(panel)
+
+        # Day badge: ('TUESDAY • NOV 03', 'THURSDAY • NOV 05', 'SUNDAY • NOV 08')
+        date_str = slot_data.get("date", "")
+        day_badge = ""
+        if date_str:
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+                day_badge = dt.strftime("%A • %b %d").upper()
+            except Exception:
+                pass
+        if not day_badge:
+            day_name = slot_data.get("day_name", slot_key).upper()
+            date_disp = slot_data.get("date_display", "").upper()
+            day_badge = f"{day_name} • {date_disp}" if date_disp else day_name
+
+        # Recipe title wrapping
+        title = recipe.get("name", "Unknown Recipe").strip()
+        title_font = _get_font(23, bold=True)
+        max_text_w = panel_w - 56  # 28px padding on each side
+        lines = _wrap_text_to_lines(title, title_font, max_text_w, draw)
+        if len(lines) > 3:
+            lines = lines[:2] + [lines[2].rstrip(".") + "..."]
+
+        line_h = 30
+        total_title_h = len(lines) * line_h
+        bottom_margin = 28
+        title_start_y = panel_h - bottom_margin - total_title_h
+
+        # Draw Day Badge above title (amber/gold accent)
+        badge_font = _get_font(15, bold=True)
+        badge_y = title_start_y - 28
+        draw.text((28, badge_y), day_badge, font=badge_font, fill=(245, 158, 11, 255))
+
+        # Draw Recipe Title lines
+        y_cursor = title_start_y
+        for line in lines:
+            draw.text((28, y_cursor), line, font=title_font, fill=(255, 255, 255, 255))
+            y_cursor += line_h
+
+        return panel.convert("RGB")
+
+    try:
+        canvas = Image.new("RGB", (canvas_w, canvas_h), color=(18, 18, 20))
+        slots = ["tuesday", "thursday", "sunday"]
+
+        for i, slot in enumerate(slots):
+            slot_data = meals.get(slot, {})
+            panel_img = _render_panel(slot, slot_data)
+            canvas.paste(panel_img, (i * panel_w, 0))
+
+        # 4px vertical divider between panels
+        draw_canvas = ImageDraw.Draw(canvas)
+        divider_color = (24, 24, 27)
+        draw_canvas.rectangle([(panel_w - 2, 0), (panel_w + 1, canvas_h)], fill=divider_color)
+        draw_canvas.rectangle([(panel_w * 2 - 2, 0), (panel_w * 2 + 1, canvas_h)], fill=divider_color)
+
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        canvas.save(out_path, format="JPEG", quality=92)
+        return out_path
+    except Exception:
+        try:
+            tmp_path = "/tmp/weekly_menu_triptych.jpg"
+            canvas.save(tmp_path, format="JPEG", quality=92)
+            return tmp_path
+        except Exception:
+            return None
+
+
+def generate_proposal(ref_date: datetime | None = None, force: bool = False, stage: bool = False) -> dict:
     """Generates a 3-meal proposal adhering to all constraints.
     Reuses existing active proposed plan if valid for current target cycle and force=False.
     """
     now = ref_date or datetime.now(PT)
     dates = get_target_cooking_dates(now)
 
-    is_pytest = "pytest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
-    should_stage = stage if stage is not None else (not is_pytest)
+    should_stage = bool(stage)
 
     if not force:
         active = load_active_plan()
@@ -331,7 +563,18 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False, sta
                         all_valid_dinners = False
                         break
                 if all_valid_dinners:
-                    if should_stage and not active.get("decision_staged"):
+                    if not active.get("image_path") or not os.path.exists(active.get("image_path", "")):
+                        try:
+                            img_path = build_three_panel_menu_image(active)
+                            if img_path:
+                                active["image_path"] = img_path
+                                save_active_plan(active)
+                        except Exception:
+                            pass
+                    if not should_stage and active.get("decision_staged"):
+                        active["decision_staged"] = False
+                        save_active_plan(active)
+                    elif should_stage and not active.get("decision_staged"):
                         dec = stage_meal_proposal_decision(active)
                         if dec:
                             active["decision_staged"] = True
@@ -396,6 +639,7 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False, sta
     plan = {
         "generated_at": now.strftime("%Y-%m-%d %I:%M %p PT"),
         "status": "proposed",
+        "decision_staged": False,
         "chef_note": chef_note,
         "meals": {
             "tuesday": {
@@ -421,6 +665,13 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False, sta
             },
         },
     }
+
+    try:
+        img_path = build_three_panel_menu_image(plan)
+        if img_path:
+            plan["image_path"] = img_path
+    except Exception:
+        pass
 
     save_active_plan(plan)
     if should_stage:
@@ -603,6 +854,13 @@ def swap_slot(slot: str) -> tuple[bool, str]:
     new_pick = random.choice(pool)
     plan["meals"][slot]["recipe"] = new_pick
     plan["status"] = "proposed"
+    plan["decision_staged"] = False
+    try:
+        img_path = build_three_panel_menu_image(plan)
+        if img_path:
+            plan["image_path"] = img_path
+    except Exception:
+        pass
     save_active_plan(plan)
 
     return True, format_proposal_markdown(plan)

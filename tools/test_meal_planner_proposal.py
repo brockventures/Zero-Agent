@@ -1,18 +1,21 @@
-import asyncio
-import json
+import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import sys
+from pathlib import Path
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
 from tools.meal_planner_proposal import (
     is_dinner_recipe,
     filter_eligible_recipes,
     generate_proposal,
     swap_slot,
     format_proposal_markdown,
-    get_target_cooking_dates,
+    build_three_panel_menu_image,
 )
 from tools.bridge_handlers import handle_button_choice
 
@@ -110,7 +113,8 @@ class TestMealPlannerDinnerFilter(unittest.TestCase):
 
 class TestMealPlanGenerationAndSwap(unittest.TestCase):
     def setUp(self):
-        import tempfile, os
+        import tempfile
+        import os
         self.test_dir = tempfile.mkdtemp()
         self.temp_plan = os.path.join(self.test_dir, "test_active_plan.json")
         self.patcher = patch("tools.meal_planner_proposal.ACTIVE_PLAN_FILE", self.temp_plan)
@@ -154,6 +158,165 @@ class TestMealPlanGenerationAndSwap(unittest.TestCase):
         self.assertEqual(plan_after["meals"]["sunday"]["recipe"]["slug"], sun_before)
         self.assertEqual(plan_after["meals"]["thursday"]["recipe"]["slug"], thu_before)
         self.assertTrue(is_dinner_recipe(plan_after["meals"]["tuesday"]["recipe"]))
+
+    def test_default_stage_false_behavior(self):
+        plan = generate_proposal(force=True)
+        self.assertFalse(plan.get("decision_staged", False))
+
+        with patch("tools.meal_planner_proposal.stage_meal_proposal_decision", return_value={"id": "mock_dec"}) as mock_stage:
+            plan_staged = generate_proposal(force=True, stage=True)
+            self.assertTrue(plan_staged.get("decision_staged", False))
+            mock_stage.assert_called_once()
+
+    def test_plan_and_swap_populate_image_path(self):
+        plan = generate_proposal(force=False)
+        self.assertIn("image_path", plan)
+        self.assertTrue(os.path.exists(plan["image_path"]))
+
+        ok, _ = swap_slot("thursday")
+        self.assertTrue(ok)
+        plan_after = generate_proposal(force=False)
+        self.assertIn("image_path", plan_after)
+        self.assertTrue(os.path.exists(plan_after["image_path"]))
+
+    def test_build_three_panel_menu_image_creates_valid_collage(self):
+        from PIL import Image
+        plan = {
+            "meals": {
+                "tuesday": {
+                    "day_name": "Tuesday",
+                    "date": "2026-11-03",
+                    "date_display": "Tue, Nov 03",
+                    "recipe": {"name": "Tuesday Test Tacos", "id": "none_123"},
+                },
+                "thursday": {
+                    "day_name": "Thursday",
+                    "date": "2026-11-05",
+                    "date_display": "Thu, Nov 05",
+                    "recipe": {"name": "Thursday Slow Stew", "id": "none_456"},
+                },
+                "sunday": {
+                    "day_name": "Sunday",
+                    "date": "2026-11-08",
+                    "date_display": "Sun, Nov 08",
+                    "recipe": {"name": "Sunday Roast Chicken", "id": "none_789"},
+                },
+            }
+        }
+        out_path = os.path.join(self.test_dir, "test_triptych.jpg")
+        res = build_three_panel_menu_image(plan, out_path=out_path)
+        self.assertEqual(res, out_path)
+        self.assertTrue(os.path.exists(out_path))
+
+        with Image.open(out_path) as img:
+            self.assertEqual(img.size, (1500, 600))
+            self.assertEqual(img.format, "JPEG")
+            self.assertEqual(img.mode, "RGB")
+
+    def test_build_three_panel_menu_image_empty_meals(self):
+        self.assertIsNone(build_three_panel_menu_image({}))
+        self.assertIsNone(build_three_panel_menu_image({"meals": {}}))
+
+    def test_build_three_panel_menu_image_with_mocked_images(self):
+        import io
+        import urllib.error
+        from PIL import Image
+
+        landscape_img = Image.new("RGB", (1200, 600), color=(200, 100, 50))
+        buf_l = io.BytesIO()
+        landscape_img.save(buf_l, format="JPEG")
+        landscape_bytes = buf_l.getvalue()
+
+        portrait_img = Image.new("RGB", (400, 800), color=(50, 150, 200))
+        buf_p = io.BytesIO()
+        portrait_img.save(buf_p, format="JPEG")
+        portrait_bytes = buf_p.getvalue()
+
+        mock_resp_l = MagicMock()
+        mock_resp_l.status = 200
+        mock_resp_l.read.return_value = landscape_bytes
+        mock_resp_l.__enter__.return_value = mock_resp_l
+
+        mock_resp_p = MagicMock()
+        mock_resp_p.status = 200
+        mock_resp_p.read.return_value = portrait_bytes
+        mock_resp_p.__enter__.return_value = mock_resp_p
+
+        plan = {
+            "meals": {
+                "tuesday": {
+                    "day_name": "Tuesday",
+                    "date": "2026-11-03",
+                    "date_display": "Tue, Nov 03",
+                    "recipe": {"name": "Very Long Recipe Name That Wraps Cleanly Across Multiple Lines For Testing Typography", "id": "recipe_l"},
+                },
+                "thursday": {
+                    "day_name": "Thursday",
+                    "date": "2026-11-05",
+                    "date_display": "Thu, Nov 05",
+                    "recipe": {"name": "Thursday Stew", "id": "recipe_p"},
+                },
+                "sunday": {
+                    "day_name": "Sunday",
+                    "date": "2026-11-08",
+                    "date_display": "Sun, Nov 08",
+                    "recipe": {"name": "Sunday Roast"},
+                },
+            }
+        }
+        out_path = os.path.join(self.test_dir, "mocked_triptych.jpg")
+
+        def _fake_urlopen(req, timeout=3):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            if "recipe_l" in url:
+                return mock_resp_l
+            elif "recipe_p" in url:
+                return mock_resp_p
+            raise urllib.error.URLError("Not found")
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            res = build_three_panel_menu_image(plan, out_path=out_path)
+            self.assertEqual(res, out_path)
+            self.assertTrue(os.path.exists(out_path))
+            with Image.open(out_path) as img:
+                self.assertEqual(img.size, (1500, 600))
+                self.assertEqual(img.format, "JPEG")
+
+    def test_format_proposal_markdown_rich_content(self):
+        plan = {
+            "chef_note": "A bright citrus glaze on Thursday balances the rich Sunday braise.",
+            "meals": {
+                "tuesday": {
+                    "day_name": "Tuesday",
+                    "date": "2026-11-03",
+                    "date_display": "Tue, Nov 03",
+                    "slot_type": "Fast Weeknight (<30m)",
+                    "recipe": {"name": "Quick Salmon Bowl", "slug": "quick-salmon-bowl", "total_time": "25 mins", "tags": ["Gluten-Free", "Quick"], "description": "Crispy salmon over rice"},
+                },
+                "thursday": {
+                    "day_name": "Thursday",
+                    "date": "2026-11-05",
+                    "date_display": "Thu, Nov 05",
+                    "slot_type": "Kid-Friendly Family Staple",
+                    "recipe": {"name": "Chicken Tacos", "slug": "chicken-tacos", "total_time": "30 mins", "tags": ["Gluten-Free", "Kid-Friendly"], "description": "Tacos for the family"},
+                },
+                "sunday": {
+                    "day_name": "Sunday",
+                    "date": "2026-11-08",
+                    "date_display": "Sun, Nov 08",
+                    "slot_type": "Comfort Batch / Weekend Classic",
+                    "recipe": {"name": "Braised Short Ribs", "slug": "braised-short-ribs", "total_time": "3 hours", "tags": ["Comfort Food", "Gluten-Free"], "description": "Tender beef ribs"},
+                },
+            }
+        }
+        md = format_proposal_markdown(plan)
+        self.assertIn("Weekly Dinner Rotation Proposal (3 Meals)", md)
+        self.assertIn("[Quick Salmon Bowl]", md)
+        self.assertIn("[Chicken Tacos]", md)
+        self.assertIn("[Braised Short Ribs]", md)
+        self.assertIn("Chef's Pairing Note", md)
+        self.assertIn("A bright citrus glaze on Thursday balances the rich Sunday braise.", md)
+        self.assertIn("[CHOICES: Lock In Menu | Swap Tuesday | Swap Thursday | Swap Sunday]", md)
 
 
 class TestButtonInterception(unittest.IsolatedAsyncioTestCase):
