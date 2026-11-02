@@ -3761,6 +3761,61 @@ def _enqueue_build_impl(
         except Exception:
             pass
 
+    # Best-effort auto-cleanup of Discord PR notification cards if this build responds to a PR
+    if not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("FORGE_TEST_CLEANUP_PR"):
+        try:
+            search_parts = [
+                str(plan.get("title") or ""),
+                str(plan.get("objective") or ""),
+                str(plan.get("repo") or ""),
+            ]
+            for ch in plan.get("chunks", []):
+                search_parts.append(str(ch.get("instructions") or ""))
+                search_parts.append(str(ch.get("title") or ""))
+                search_parts.append(str(ch.get("repo") or ""))
+            search_text = " ".join(search_parts)
+
+            pr_nums: set[int] = set()
+            for pat in (r"#(\d+)", r"pull/(\d+)", r"(?i)\bpr\s+#?(\d+)\b"):
+                for m in re.finditer(pat, search_text):
+                    try:
+                        val = int(m.group(1))
+                        if 0 < val < 100_000_000:
+                            pr_nums.add(val)
+                    except (ValueError, TypeError):
+                        pass
+
+            if pr_nums:
+                repo_candidates: set[str] = set()
+                default_repo_clean = str(plan.get("repo") or "").strip()
+                if default_repo_clean and "/" in default_repo_clean and not default_repo_clean.startswith("/"):
+                    repo_candidates.add(default_repo_clean.lower())
+
+                for ch in plan.get("chunks", []):
+                    ch_repo = str(ch.get("repo") or "").strip()
+                    if ch_repo and "/" in ch_repo and not ch_repo.startswith("/"):
+                        repo_candidates.add(ch_repo.lower())
+
+                for pat in (
+                    r"\b(azylman/[A-Za-z0-9_.-]+)\b",
+                    r"\b(mcarmody/[A-Za-z0-9_.-]+)\b",
+                    r"\b(arcane103/[A-Za-z0-9_.-]+)\b",
+                    r"\b(brockventures/[A-Za-z0-9_.-]+)\b",
+                    r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
+                ):
+                    for m in re.finditer(pat, search_text, re.IGNORECASE):
+                        repo_candidates.add(m.group(1).lower().rstrip(".git"))
+
+                from tools.gh_pr_watcher import cleanup_pr_notifications
+                for num in pr_nums:
+                    if repo_candidates:
+                        for r in repo_candidates:
+                            cleanup_pr_notifications(repo=r, pr_number=num)
+                    else:
+                        cleanup_pr_notifications(repo=None, pr_number=num)
+        except Exception:
+            pass
+
     return {
         "ok": True,
         "build_id": build_id,

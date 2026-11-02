@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
-from unittest.mock import ANY, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 from typing import Any
 
 # Ensure local repo path takes precedence over global /workspace
@@ -2109,6 +2111,178 @@ class TestAutoCleanupOnResponse(unittest.TestCase):
         )
         self.assertEqual(stats["notifications_cleaned"], 1)
         mock_cleanup.assert_called_once()
+
+
+class TestForgeEnqueuePrCleanupAndSchedulerInterceptor(unittest.TestCase):
+    """Test auto-cleanup of PR notification cards on FORGE enqueue and silent sidecar interceptor in bridge scheduler."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_forge.db"
+        from tools.forge import init_forge_db
+        init_forge_db(self.db_path)
+        from tools.bridge_scheduler import LAST_SCHEDULED_DISPATCH
+        LAST_SCHEDULED_DISPATCH.clear()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    @patch("tools.gh_pr_watcher.cleanup_pr_notifications")
+    def test_forge_enqueue_cleans_up_pr_notifications_with_repo_and_number(
+        self, mock_cleanup: MagicMock
+    ) -> None:
+        from tools.forge import enqueue_build
+        plan = {
+            "title": "Fix mirrormere issue in azylman/mirrormere PR #14",
+            "objective": "Resolve review feedback on azylman/mirrormere PR #14",
+            "repo": _local_repo,
+            "chunks": [
+                {
+                    "title": "Address comments",
+                    "instructions": "Fix bug reported in https://github.com/azylman/mirrormere/pull/14 with detailed unit tests",
+                    "target_files": ["README.md"],
+                }
+            ],
+            "origin_channel_id": FORGE_CHANNEL_ID,
+        }
+        with patch.dict(os.environ, {"FORGE_TEST_CLEANUP_PR": "1"}):
+            res = enqueue_build(plan, db_path=self.db_path, post_widget=False)
+            self.assertTrue(res["ok"])
+            mock_cleanup.assert_called_with(repo="azylman/mirrormere", pr_number=14)
+
+    @patch("tools.gh_pr_watcher.cleanup_pr_notifications")
+    def test_forge_enqueue_cleans_up_pr_notifications_generic_number(
+        self, mock_cleanup: MagicMock
+    ) -> None:
+        from tools.forge import enqueue_build
+        plan = {
+            "title": "Address PR #42 review",
+            "objective": "Fix comments on PR #42",
+            "repo": _local_repo,
+            "chunks": [
+                {
+                    "title": "Fix code",
+                    "instructions": "Implement changes requested in PR 42 with robust tests",
+                    "target_files": ["tools/bridge_scheduler.py"],
+                }
+            ],
+            "origin_channel_id": FORGE_CHANNEL_ID,
+        }
+        with patch.dict(os.environ, {"FORGE_TEST_CLEANUP_PR": "1"}):
+            res = enqueue_build(plan, db_path=self.db_path, post_widget=False)
+            self.assertTrue(res["ok"])
+            mock_cleanup.assert_called_with(repo=None, pr_number=42)
+
+    @patch("tools.gh_pr_watcher.cleanup_pr_notifications")
+    def test_forge_enqueue_cleans_up_lomin_and_gotchi_prs(
+        self, mock_cleanup: MagicMock
+    ) -> None:
+        from tools.forge import enqueue_build
+        plan = {
+            "title": "Fix mcarmody/lomin camera frame handling pull/5",
+            "objective": "Address review comments on mcarmody/lomin pull/5",
+            "repo": _local_repo,
+            "chunks": [
+                {
+                    "title": "Camera frames",
+                    "instructions": "Fix camera frame handling in mcarmody/lomin pull/5 and tests",
+                    "target_files": ["README.md"],
+                }
+            ],
+            "origin_channel_id": FORGE_CHANNEL_ID,
+        }
+        with patch.dict(os.environ, {"FORGE_TEST_CLEANUP_PR": "1"}):
+            res = enqueue_build(plan, db_path=self.db_path, post_widget=False)
+            self.assertTrue(res["ok"])
+            mock_cleanup.assert_called_with(repo="mcarmody/lomin", pr_number=5)
+
+    @patch("tools.gh_pr_watcher.cleanup_pr_notifications")
+    def test_forge_enqueue_skipped_when_no_pr_referenced(
+        self, mock_cleanup: MagicMock
+    ) -> None:
+        from tools.forge import enqueue_build
+        plan = {
+            "title": "Refactor database migrations",
+            "objective": "Clean up unused tables",
+            "repo": _local_repo,
+            "chunks": [
+                {
+                    "title": "Drop table",
+                    "instructions": "Run drop table sql migration script cleanly",
+                    "target_files": ["tools/db.py"],
+                }
+            ],
+            "origin_channel_id": FORGE_CHANNEL_ID,
+        }
+        with patch.dict(os.environ, {"FORGE_TEST_CLEANUP_PR": "1"}):
+            res = enqueue_build(plan, db_path=self.db_path, post_widget=False)
+            self.assertTrue(res["ok"])
+            mock_cleanup.assert_not_called()
+
+    @patch("tools.gh_pr_watcher.cleanup_pr_notifications")
+    def test_forge_enqueue_skipped_by_default_under_pytest(
+        self, mock_cleanup: MagicMock
+    ) -> None:
+        from tools.forge import enqueue_build
+        plan = {
+            "title": "Fix bug in PR #99",
+            "objective": "PR #99 fix",
+            "repo": _local_repo,
+            "chunks": [
+                {
+                    "title": "Fix",
+                    "instructions": "Fix PR #99 issues with detailed instructions",
+                    "target_files": ["tools/test.py"],
+                }
+            ],
+            "origin_channel_id": FORGE_CHANNEL_ID,
+        }
+        # Simulate pytest environment: PYTEST_CURRENT_TEST set, FORGE_TEST_CLEANUP_PR not set
+        with patch.dict(os.environ, {"PYTEST_CURRENT_TEST": "test_case"}, clear=False):
+            os.environ.pop("FORGE_TEST_CLEANUP_PR", None)
+            res = enqueue_build(plan, db_path=self.db_path, post_widget=False)
+            self.assertTrue(res["ok"])
+            mock_cleanup.assert_not_called()
+
+    def test_bridge_scheduler_gh_pr_watcher_interceptor_job_id(self) -> None:
+        from tools.bridge_scheduler import dispatch_scheduled_prompt
+        import asyncio
+
+        turn_queue = asyncio.Queue()
+        with patch("tools.bridge_scheduler._run_sidecar_job_async", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (True, "OK", {"notifications_cleaned": 1, "auto_merged": 0})
+            asyncio.run(
+                dispatch_scheduled_prompt(
+                    prompt="Run GitHub PR watcher",
+                    job_name="GitHub PR Watcher & Auto-Merge",
+                    job_id="gh_pr_watcher",
+                    turn_queue=turn_queue,
+                )
+            )
+            mock_run.assert_called_once()
+            call_args = mock_run.call_args[0]
+            self.assertEqual(call_args[0], "gh_pr_watcher")
+            # Verify no LLM turn queued
+            self.assertTrue(turn_queue.empty())
+
+    def test_bridge_scheduler_gh_pr_watcher_interceptor_prompt_match(self) -> None:
+        from tools.bridge_scheduler import dispatch_scheduled_prompt
+        import asyncio
+
+        turn_queue = asyncio.Queue()
+        with patch("tools.bridge_scheduler._run_sidecar_job_async", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (True, "OK", {})
+            asyncio.run(
+                dispatch_scheduled_prompt(
+                    prompt="python3 /workspace/tools/gh_pr_watcher.py --cron",
+                    job_name="Sidecar",
+                    turn_queue=turn_queue,
+                )
+            )
+            mock_run.assert_called_once()
+            call_args = mock_run.call_args[0]
+            self.assertEqual(call_args[0], "gh_pr_watcher")
+            self.assertTrue(turn_queue.empty())
 
 
 if __name__ == "__main__":

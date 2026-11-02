@@ -431,6 +431,21 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Usage telemetry audit execution error: {e}")
         return
 
+    # GitHub PR & Review Watcher Sidecar: silent deterministic background execution
+    if job_id == "gh_pr_watcher" or "gh_pr_watcher.py" in prompt or job_name in ("GitHub PR Watcher & Auto-Merge", "gh_pr_watcher"):
+        try:
+            from tools.gh_pr_watcher import poll_and_notify
+            ok, rep, details = await _run_sidecar_job_async("gh_pr_watcher", "GitHub PR Watcher & Auto-Merge", poll_and_notify)
+            cleaned = details.get("notifications_cleaned", 0) if isinstance(details, dict) else 0
+            merged = details.get("auto_merged", 0) if isinstance(details, dict) else 0
+            log_msg = f"[Scheduler] GitHub PR Watcher completed: ok={ok}"
+            if cleaned or merged:
+                log_msg += f" (cleaned={cleaned}, merged={merged})"
+            print(log_msg)
+        except Exception as e:
+            print(f"[Scheduler] GitHub PR Watcher execution error: {e}")
+        return
+
     # Heartbeat sweep: silent execution unless degraded
     if job_name == "Heartbeat Sweep" or "sidecars.py heartbeat" in prompt or job_id in ("heartbeat_sweep", "heartbeat"):
         try:
