@@ -277,6 +277,9 @@ class TestForgeEngine(unittest.TestCase):
             channel_id=ZERO_OPS_CHANNEL_ID,
             db_path=self.db_path,
         )
+        self.assertFalse(d_ops["redirected_to_zero_chat"])
+        self.assertIsNone(d_ops["origin_channel_id"])
+        self.assertIsNone(d_ops["routing_note"])
         d_priv = stage_decision(
             category="email",
             title="Send Contractor Reply",
@@ -2436,6 +2439,9 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
         db_path=db_p,
     )
     assert d_crab["channel_id"] == ZERO_CHAT_CHANNEL_ID
+    assert d_crab["redirected_to_zero_chat"] is True
+    assert d_crab["origin_channel_id"] == banana_stand_ch
+    assert d_crab["routing_note"] == "Decision Card routed to #zero-chat (never say Click below in origin channel)"
     with forge_mod.get_db_connection(db_p) as conn:
         row_crab = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (d_crab["decision_id"],)).fetchone()
     assert row_crab["channel_id"] == ZERO_CHAT_CHANNEL_ID
@@ -2444,6 +2450,21 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
     assert f"<#{banana_stand_ch}>" in row_crab["summary"]
     embed_crab = render_decision_card_embed(row_crab)
     assert f"📍 **Origin:** <#{banana_stand_ch}>" in embed_crab["description"]
+
+    # Verify home channel stage_decision is not redirected
+    d_home = stage_decision(
+        category="homelab",
+        title="Sync Home Node",
+        summary="Sync home node requested from ops.",
+        handler_type="shell",
+        payload={"command": "echo 'home'"},
+        channel_id=ZERO_OPS_CHANNEL_ID,
+        db_path=db_p,
+    )
+    assert d_home["channel_id"] == ZERO_OPS_CHANNEL_ID
+    assert d_home["redirected_to_zero_chat"] is False
+    assert d_home["origin_channel_id"] is None
+    assert d_home["routing_note"] is None
 
     # Verify origin tag is not prepended if already present in summary
     d_crab_dup = stage_decision(
@@ -2473,6 +2494,9 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
             post_to_discord=True,
         )
         assert d_gotchi["channel_id"] == ZERO_CHAT_CHANNEL_ID
+        assert d_gotchi["redirected_to_zero_chat"] is True
+        assert d_gotchi["origin_channel_id"] == gotchi_ch
+        assert d_gotchi["routing_note"] == "Decision Card routed to #zero-chat (never say Click below in origin channel)"
         assert d_gotchi["discord_message_id"] == 998877
         mock_post_rest.assert_called_once_with(d_gotchi["decision_id"], db_path=db_p)
         with forge_mod.get_db_connection(db_p) as conn:
@@ -2505,8 +2529,28 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
         assert staged_plan["requires_approval"] is True
         # Build's origin_channel_id remains the original Crab Cavern channel for completion notifications
         assert staged_plan["origin_channel_id"] == banana_stand_ch
+        assert staged_plan["channel_id"] == ZERO_CHAT_CHANNEL_ID
+        assert staged_plan["redirected_to_zero_chat"] is True
+        assert staged_plan["routing_note"] == "Decision Card routed to #zero-chat (never say Click below in origin channel)"
+        assert "zero-chat" in staged_plan.get("message", "")
         assert staged_plan["discord_message_id"] == 112233
         mock_plan_post.assert_called_once_with(staged_plan["decision_id"], db_path=db_p)
+
+        # Test enqueue_build directly returns redirected_to_zero_chat and note when approval gate triggers for Crab Cavern
+        with patch.object(forge_mod, "evaluate_plan_approval_gate", return_value=(True, ["Crab cavern complexity gate"])):
+            enq_crab_res = enqueue_build(
+                crab_plan,
+                db_path=db_p,
+                post_widget=False,
+                check_approval_gate=True,
+            )
+            assert enq_crab_res["ok"] is True
+            assert enq_crab_res["status"] == "awaiting_approval"
+            assert enq_crab_res["origin_channel_id"] == banana_stand_ch
+            assert enq_crab_res["channel_id"] == ZERO_CHAT_CHANNEL_ID
+            assert enq_crab_res["redirected_to_zero_chat"] is True
+            assert enq_crab_res["routing_note"] == "Decision Card routed to #zero-chat (never say Click below in origin channel)"
+            assert "zero-chat" in enq_crab_res["message"]
 
         # Plan file JSON on disk retains origin_channel_id
         plan_disk_data = json.loads(Path(staged_plan["plan_file"]).read_text(encoding="utf-8"))

@@ -124,8 +124,14 @@ python3 /workspace/tools/forge.py stage-decision \
 ```
 Supported `--handler` types: `forge_enqueue`, `shell`, `send_mail`, `docker_compose`, `gh_merge`, `bridge_reload`, `file_delete`.
 
+### Non-Home Turf / Crab Cavern Routing (`#zero-chat` Redirection)
+Decision Cards staged from Crab Cavern channels (`#the-banana-stand`, `#gotchi`, `#gotchi-chat`, `#side-project`, `#debug-huddle`) or any non-home channel automatically decouple and route to `#zero-chat` (`1542081375287640084`) for private sign-off by Ryan.
+- Both `stage_decision()` and `enqueue_build()` return `redirected_to_zero_chat: true`, `origin_channel_id`, and `routing_note: "Decision Card routed to #zero-chat (never say Click below in origin channel)"`.
+- **CRITICAL MESSAGING INVARIANT (Never Say "Click below"):** In Crab Cavern channel responses, you **MUST NEVER** say *"Click below"*, *"Click Approve below"*, or imply the card rendered inline in the channel. Always state that the Decision Card has been dispatched to `#zero-chat` for Ryan's approval (e.g., *"I've staged the approval Decision Card in #zero-chat for sign-off"*).
+
 ### Mandatory Decision Card Action-Clarity & Atomic Scope Invariants
 1. **Explicit Approval Action Required:** Every Decision Card (`Approve | Edit | Dismiss`) **MUST** explicitly state in its visible `summary` what concrete action clicking **Approve** will execute (e.g., `**Approve Action:** ...` or *"Approving [executes X]..."*).
 2. **No Fake/Read-Only or `echo` Approval Cards:** Never stage an approval card for a purely informational reminder or read-only check that has no real side-effect action when approved (or whose payload merely runs `echo '...'` or re-runs the reminder script itself).
 3. **One Decision Per Card (Atomic Scope):** Never bundle multiple independent choices (e.g., multiple separate contacts in Social Last Seen Review, multiple distinct inbox threads, or multiple unrelated calendar/budget items) into a single all-or-nothing Decision Card. Stage **one Decision Card per independent decision** so each item can be approved or dismissed individually.
 4. **Engine Enforcement (`forge.py`):** `stage_decision()`, `render_decision_card_embed()`, and `format_decision_card_text()` deterministically reject no-op `echo` shell payloads and ensure every pending Decision Card displays a clear `**Approve Action:**` line.
+5. **Crab Cavern & Non-Home Decoupled Routing (Never "Click below"):** Decision Cards staged from Crab Cavern channels or any non-home channel automatically decouple and route to `#zero-chat` (`1542081375287640084`) with private visibility and an origin channel reference (`📍 Origin: <#channel_id>`). In Crab Cavern turns, **NEVER** say *"Click below"* or imply the card rendered inline in the channel; explicitly reference `#zero-chat` (e.g., *"I've routed the approval Decision Card to #zero-chat for sign-off"*) or omit directionals.

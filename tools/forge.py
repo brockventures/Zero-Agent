@@ -3271,6 +3271,7 @@ def stage_plan_approval_decision(
         db_path=db_path,
         post_to_discord=post_to_discord,
     )
+    redirected = bool(dec.get("redirected_to_zero_chat", False))
     return {
         "ok": True,
         "status": "awaiting_approval",
@@ -3280,6 +3281,14 @@ def stage_plan_approval_decision(
         "plan_file": str(plan_file_path),
         "chunk_count": len(chunks),
         "origin_channel_id": target_ch,
+        "channel_id": int(dec.get("channel_id", target_ch)),
+        "redirected_to_zero_chat": redirected,
+        "routing_note": dec.get("routing_note"),
+        "message": (
+            "Approval Decision Card routed to #zero-chat (never say Click below in origin channel)"
+            if redirected
+            else f"Approval Decision Card staged in <#{target_ch}>"
+        ),
         "discord_message_id": dec.get("discord_message_id"),
         "turn_action": "end_turn",
     }
@@ -6316,10 +6325,18 @@ def stage_decision(
     if post_to_discord:
         msg_id = _post_decision_card_rest(decision_id, db_path=db_path)
 
+    redirected = orig_ch is not None
     return {
         "ok": True,
         "decision_id": decision_id,
         "channel_id": int(channel_id),
+        "origin_channel_id": int(orig_ch) if redirected else None,
+        "redirected_to_zero_chat": bool(redirected),
+        "routing_note": (
+            "Decision Card routed to #zero-chat (never say Click below in origin channel)"
+            if redirected
+            else None
+        ),
         "discord_message_id": msg_id,
         "expires_at": now + float(ttl_seconds),
     }
