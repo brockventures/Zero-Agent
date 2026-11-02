@@ -874,12 +874,22 @@ def test_is_exempt_from_investigation_gate():
         # Detached runner, FORGE offload, lifecycle, outbox, and testing commands are exempt
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/forge.py job start --name x"}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/forge.py enqueue plan.json"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/forge.py status"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/forge.py stage-decision --plan plan.json"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "forge.py status"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "forge status"}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/detached_runner.py start"}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/modal_harness.py --mode run"}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/outbox.py --channel zero-ops"}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/gif_tool.py"}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "git commit -m 'feat'"}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "git status"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "git branch --show-current"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "git branch -a"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "git rev-parse HEAD"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "git rev-parse --abbrev-ref HEAD"}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": 'python3 -c "import ast; tree = ast.parse(open(\'tools/forge.py\').read())"'}) is True
+        assert is_exempt_from_investigation_gate("run_command", {"CommandLine": 'python3 -c "import ast; [n.name for n in ast.walk(ast.parse(open(\'tools/forge.py\').read())) if isinstance(n, ast.FunctionDef)]"'}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "gh pr create --title t"}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "pytest tests/test_foo.py"}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "ruff check ."}) is True
@@ -962,6 +972,71 @@ def test_interactive_investigation_gate_handoff_and_lifecycle_exemptions(tmp_pat
             now=t0 + 38.0,
         )
         assert ok_outbox is True, f"outbox.py should be exempt from post-offload lock, got: {r_outbox}"
+
+
+def test_interactive_investigation_gate_forge_plan_staging_exemptions(tmp_path):
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        in_flight = tmp_path / "in_flight.json"
+        in_flight.write_text(json.dumps({"channel_id": 1542081375287640084, "prompt": "build feature"}))
+        state_file = str(tmp_path / "bg_state.json")
+        t0 = 1_800_000_000.0
+
+        # Run 3 initial diagnostic steps
+        check_tool_use("read_file", {"Path": "/workspace/tools/a.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 5.0)
+        check_tool_use("read_file", {"Path": "/workspace/tools/b.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 10.0)
+        check_tool_use("read_file", {"Path": "/workspace/tools/c.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 20.0)
+
+        # After 30s, forge.py status check is exempt
+        ok_status, r_status = check_tool_use(
+            "run_command",
+            {"CommandLine": "python3 /workspace/tools/forge.py status"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 35.0,
+        )
+        assert ok_status is True, f"forge.py status should be exempt from investigation gate, got: {r_status}"
+
+        # Git branch and rev-parse lookups for plan staging are exempt
+        ok_branch, r_branch = check_tool_use(
+            "run_command",
+            {"CommandLine": "git branch --show-current"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 36.0,
+        )
+        assert ok_branch is True, f"git branch should be exempt from investigation gate, got: {r_branch}"
+
+        ok_rev, r_rev = check_tool_use(
+            "run_command",
+            {"CommandLine": "git rev-parse --abbrev-ref HEAD"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 37.0,
+        )
+        assert ok_rev is True, f"git rev-parse should be exempt from investigation gate, got: {r_rev}"
+
+        # AST symbol discovery lookup is exempt
+        ok_ast, r_ast = check_tool_use(
+            "run_command",
+            {"CommandLine": 'python3 -c "import ast; tree = ast.parse(open(\'tools/forge.py\').read())"'},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 38.0,
+        )
+        assert ok_ast is True, f"AST symbol discovery should be exempt from investigation gate, got: {r_ast}"
+
+        # Non-exempt diagnostic command is blocked after 30s ceiling
+        ok_blocked, r_blocked = check_tool_use(
+            "run_command",
+            {"CommandLine": "cat /workspace/data/log2.txt"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 39.0,
+        )
+        assert ok_blocked is False
+        assert "Interactive Investigation Gate Triggered" in r_blocked
 
 
 def test_interactive_investigation_gate_hard_limit_after_5_steps_even_under_30s(tmp_path):

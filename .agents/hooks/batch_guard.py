@@ -335,6 +335,7 @@ def is_exempt_from_investigation_gate(name: str, args: dict, cwd: str = "/worksp
         cmd = str(args.get("CommandLine") or "")
         exempt_tokens = (
             "forge.py",
+            "tools.forge",
             "detached_runner.py",
             "modal_harness.py",
             "outbox.py",
@@ -343,10 +344,16 @@ def is_exempt_from_investigation_gate(name: str, args: dict, cwd: str = "/worksp
             "gh ",
             "pytest",
             "ruff",
+            "ast.parse",
+            "ast.walk",
         )
         if any(tok in cmd for tok in exempt_tokens):
             return True
-        if re.search(r"\b(?:git|gh)\b", cmd):
+        if re.search(r"\b(?:git|gh|forge)\b", cmd):
+            return True
+        if re.search(r"\bast\.(?:parse|walk)\b", cmd):
+            return True
+        if re.search(r"\b(?:from\s+ast\s+import|import\s+ast)\b", cmd):
             return True
     return False
 
