@@ -30,6 +30,7 @@ LOG_FILE = os.environ.get("ZERO_MAIL_LOG", os.path.join(STATE_DIR, "zero_mail_li
 
 POLL_INTERVAL = 15  # seconds
 TIMEOUT = 15
+STARTUP_EPOCH = int(time.time())
 
 _last_throttled_errors: dict[str, float] = {}
 
@@ -50,6 +51,7 @@ TARGET_EMAIL = _resolve_target_email()
 
 # Anti-Flood & Rate Limiting Thresholds
 MAX_INDIVIDUAL_PER_CYCLE = 3   # Max individual Discord alerts per 15s tick
+MAX_GITHUB_DOORBELLS_PER_CYCLE = 3  # Max GitHub doorbell evaluations per 15s tick
 FLOOD_SURGE_THRESHOLD = 5      # If >5 new emails in a tick, collapse into a single digest alert
 DISCORD_POST_DELAY = 1.2       # Sleep between Discord calls to avoid HTTP 429
 
@@ -398,13 +400,13 @@ def run_loop():
             except Exception as e:
                 log(f"Error during seeding: {e}")
 
-        log(f"Listener active (polling every {POLL_INTERVAL}s for '(to:{TARGET_EMAIL} OR from:notifications@github.com) is:unread')...")
+        log(f"Listener active (polling every {POLL_INTERVAL}s for '(to:{TARGET_EMAIL} OR (from:notifications@github.com after:{STARTUP_EPOCH})) is:unread')...")
 
         while _running:
             try:
                 tok = get_access_token()
-                query = urllib.parse.quote(f"(to:{TARGET_EMAIL} OR from:notifications@github.com) is:unread")
-                url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={query}&maxResults=20"
+                query = urllib.parse.quote(f"(to:{TARGET_EMAIL} OR (from:notifications@github.com after:{STARTUP_EPOCH})) is:unread")
+                url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={query}&maxResults=5"
                 req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
                 
                 with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
@@ -418,6 +420,7 @@ def run_loop():
                     log(f"Detected {len(new_msgs)} new unread email(s) for Zero.")
 
                     human_payloads = []
+                    github_doorbells_processed = 0
                     for m in new_msgs:
                         mid = m["id"]
                         try:
@@ -430,11 +433,15 @@ def run_loop():
                                 headers_lower = {h["name"].lower(): h["value"] for h in raw_h}
                                 from_addr = headers_lower.get("from", "Unknown")
                                 if "notifications@github.com" in from_addr.lower():
-                                    if process_github_email_doorbell:
-                                        try:
-                                            process_github_email_doorbell(headers)
-                                        except Exception as d_err:
-                                            log(f"GitHub email doorbell error: {d_err}")
+                                    if github_doorbells_processed < MAX_GITHUB_DOORBELLS_PER_CYCLE:
+                                        github_doorbells_processed += 1
+                                        if process_github_email_doorbell:
+                                            try:
+                                                process_github_email_doorbell(headers)
+                                            except Exception as d_err:
+                                                log(f"GitHub email doorbell error: {d_err}")
+                                    else:
+                                        log(f"GitHub email doorbell cap ({MAX_GITHUB_DOORBELLS_PER_CYCLE}) reached for this tick; skipping eval for {mid}")
                                 else:
                                     human_payloads.append((mid, m_data, from_addr))
                         except Exception:

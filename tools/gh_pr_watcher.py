@@ -820,7 +820,7 @@ def get_pr_details(repo: str, number: int) -> dict[str, Any] | None:
             "--repo",
             repo,
             "--json",
-            "number,title,url,author,reviewDecision,reviews,latestReviews,reviewRequests,comments,statusCheckRollup,headRefOid,state,merged,mergeable,mergeStateStatus",
+            "number,title,url,author,reviewDecision,reviews,latestReviews,reviewRequests,comments,statusCheckRollup,headRefOid,state,mergedAt,mergeable,mergeStateStatus",
         ])
         if res.returncode != 0:
             log.warning(
@@ -833,6 +833,7 @@ def get_pr_details(repo: str, number: int) -> dict[str, Any] | None:
 
         data = json.loads(res.stdout or "{}")
         data["repo"] = repo
+        data["merged"] = bool(data.get("mergedAt")) or str(data.get("state") or "").upper() == "MERGED"
         return data
     except Exception as exc:
         log.warning("Failed fetching PR details for %s#%s: %s", repo, number, exc)
@@ -1148,7 +1149,8 @@ def check_pr(
             head_changed = True
 
     pr_state = str(pr_details.get("state") or "").upper()
-    is_closed_or_merged = pr_state in ("MERGED", "CLOSED") or pr_details.get("merged") is True or pr_details.get("closed") is True
+    merged = bool(pr_details.get("mergedAt")) or pr_details.get("state") == "MERGED" or pr_state == "MERGED" or pr_details.get("merged") is True
+    is_closed_or_merged = merged or pr_state in ("MERGED", "CLOSED") or pr_details.get("closed") is True
 
     if zero_responded or head_changed or is_closed_or_merged:
         if not seed_only:

@@ -305,6 +305,8 @@ class TestGhPrWatcherDiscovery(unittest.TestCase):
                 "latestReviews": [],
                 "reviewRequests": [],
                 "comments": [],
+                "state": "OPEN",
+                "mergedAt": None,
             }),
             stderr="",
         )
@@ -314,6 +316,48 @@ class TestGhPrWatcherDiscovery(unittest.TestCase):
         self.assertEqual(details["repo"], "mcarmody/lomin")
         self.assertEqual(details["number"], 5)
         self.assertEqual(details["reviewDecision"], "CHANGES_REQUESTED")
+        self.assertFalse(details["merged"])
+
+        # Verify 'merged' is NOT passed to gh pr view --json (replaced by 'mergedAt')
+        call_args = mock_run_gh.call_args[0][0]
+        json_idx = call_args.index("--json") + 1
+        json_fields = [f.strip() for f in call_args[json_idx].split(",")]
+        self.assertNotIn("merged", json_fields)
+        self.assertIn("mergedAt", json_fields)
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_get_pr_details_derives_merged_from_merged_at_or_state(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        mock_run_gh.return_value = subprocess.CompletedProcess(
+            args=["gh", "pr", "view"],
+            returncode=0,
+            stdout=json.dumps({
+                "number": 6,
+                "title": "feat: merged pr",
+                "state": "OPEN",
+                "mergedAt": "2026-11-02T12:00:00Z",
+            }),
+            stderr="",
+        )
+        details = get_pr_details("mcarmody/lomin", 6)
+        assert details is not None
+        self.assertTrue(details["merged"])
+
+        mock_run_gh.return_value = subprocess.CompletedProcess(
+            args=["gh", "pr", "view"],
+            returncode=0,
+            stdout=json.dumps({
+                "number": 7,
+                "title": "feat: state merged pr",
+                "state": "MERGED",
+                "mergedAt": None,
+            }),
+            stderr="",
+        )
+        details2 = get_pr_details("mcarmody/lomin", 7)
+        assert details2 is not None
+        self.assertTrue(details2["merged"])
 
 
 class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
@@ -2316,6 +2360,74 @@ class TestForgeEnqueuePrCleanupAndSchedulerInterceptor(unittest.TestCase):
             call_args = mock_run.call_args[0]
             self.assertEqual(call_args[0], "gh_pr_watcher")
             self.assertTrue(turn_queue.empty())
+
+
+class TestZeroMailListenerDoorbellWatermarkAndCap(unittest.TestCase):
+    """Test zero_mail_listener startup epoch watermark, maxResults=5, and 3-doorbell-per-tick cap."""
+
+    def test_startup_epoch_and_doorbell_cap_in_run_loop(self) -> None:
+        import urllib.parse
+        import tools.zero_mail_listener as zml
+
+        self.assertIsInstance(zml.STARTUP_EPOCH, int)
+        self.assertGreater(zml.STARTUP_EPOCH, 1700000000)
+        self.assertEqual(zml.MAX_GITHUB_DOORBELLS_PER_CYCLE, 3)
+
+        captured_urls: list[str] = []
+        doorbell_calls: list[dict[str, Any]] = []
+        saved_seen: list[set[str]] = []
+
+        def fake_urlopen(req: Any, timeout: int = 15):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            captured_urls.append(url)
+            resp = MagicMock()
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            if "messages?q=" in url:
+                # Return 5 unread GitHub doorbell messages
+                resp.read.return_value = json.dumps({
+                    "messages": [{"id": f"gh_msg_{i}"} for i in range(5)]
+                }).encode("utf-8")
+            else:
+                resp.read.return_value = json.dumps({
+                    "payload": {
+                        "headers": [
+                            {"name": "From", "value": "notifications@github.com"},
+                            {"name": "Authentication-Results", "value": "dkim=pass header.i=@github.com"},
+                            {"name": "Message-ID", "value": "<mcarmody/lomin/pull/5@github.com>"},
+                        ]
+                    }
+                }).encode("utf-8")
+            return resp
+
+        def fake_save_seen(seen_set: set[str]):
+            saved_seen.append(set(seen_set))
+            zml._running = False
+
+        with (
+            patch.object(zml, "load_env", return_value={"DISCORD_BOT_TOKEN": "test_tok"}),
+            patch.object(zml, "load_seen", return_value={"already_seen_1"}),
+            patch.object(zml, "save_seen", side_effect=fake_save_seen),
+            patch.object(zml, "get_access_token", return_value="oauth_tok"),
+            patch.object(zml, "process_github_email_doorbell", side_effect=lambda h: doorbell_calls.append(h)),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("signal.signal"),
+            patch("time.sleep"),
+        ):
+            zml._running = True
+            zml.run_loop()
+
+        list_urls = [u for u in captured_urls if "messages?q=" in u]
+        self.assertEqual(len(list_urls), 1)
+        unquoted_list_url = urllib.parse.unquote(list_urls[0])
+        self.assertIn(f"(to:{zml.TARGET_EMAIL} OR (from:notifications@github.com after:{zml.STARTUP_EPOCH})) is:unread", unquoted_list_url)
+        self.assertIn("maxResults=5", list_urls[0])
+        # Only 3 of the 5 GitHub doorbell notifications should trigger process_github_email_doorbell
+        self.assertEqual(len(doorbell_calls), 3)
+        # All 5 message IDs must still be added to seen_ids so they never flood subsequent ticks
+        self.assertEqual(len(saved_seen), 1)
+        for i in range(5):
+            self.assertIn(f"gh_msg_{i}", saved_seen[0])
 
 
 if __name__ == "__main__":
