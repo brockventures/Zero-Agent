@@ -418,7 +418,11 @@ class TestSidecarDecisionStagedMetadata:
     ):
         from tools.sidecars import run_weekly_meal_proposal
 
-        mock_gen.return_value = {"meals": {}, "decision_staged": True}
+        mock_gen.return_value = {
+            "meals": {},
+            "decision_staged": True,
+            "image_path": "/workspace/data/weekly_menu_triptych.jpg",
+        }
         mock_format.return_value = "🍽️ Meal Plan Markdown"
 
         ok, msg, extra = run_weekly_meal_proposal()
@@ -427,12 +431,14 @@ class TestSidecarDecisionStagedMetadata:
         assert isinstance(extra, dict)
         assert extra["has_items"] is True
         assert extra["decision_staged"] is True
+        assert extra["image_path"] == "/workspace/data/weekly_menu_triptych.jpg"
 
         mock_gen.return_value = {"meals": {}, "decision_staged": False}
         ok, msg, extra = run_weekly_meal_proposal()
         assert ok is True
         assert extra["has_items"] is True
         assert extra["decision_staged"] is False
+        assert extra["image_path"] is None
 
 
 # ==============================================================================
@@ -557,6 +563,57 @@ class TestSchedulerDoublePostSuppression:
                 bot=mock_bot
             )
             mock_channel.send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_weekly_meal_proposal_with_image_attachment(self, tmp_path):
+        import tools.bridge_scheduler as bshed
+        from unittest.mock import AsyncMock
+        import discord
+
+        test_img = tmp_path / "weekly_menu_triptych.jpg"
+        test_img.write_text("mock image bytes")
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🍽️ Menu Proposal", {"has_items": True, "decision_staged": False, "image_path": str(test_img)})):
+            await bshed.dispatch_scheduled_prompt(
+                "Generate the weekly meal proposal using /workspace/tools/meal_planner_proposal.py",
+                "Weekly 3-Dinner Meal Proposal",
+                bot=mock_bot
+            )
+            mock_channel.send.assert_called_once()
+            _, kwargs = mock_channel.send.call_args
+            assert "file" in kwargs
+            assert isinstance(kwargs["file"], discord.File)
+            assert kwargs["file"].filename == "weekly_menu_triptych.jpg"
+
+    @pytest.mark.asyncio
+    async def test_swap_button_choice_with_image_attachment(self, tmp_path):
+        import asyncio
+        import tools.bridge_commands as bcmd
+        from unittest.mock import AsyncMock
+
+        test_img = tmp_path / "weekly_menu_triptych.jpg"
+        test_img.write_text("mock image bytes")
+
+        mock_interaction = MagicMock()
+        mock_channel = AsyncMock()
+        mock_interaction.channel = mock_channel
+
+        mock_plan = {"image_path": str(test_img)}
+        turn_queue = asyncio.Queue()
+        with patch("tools.meal_planner_proposal.swap_slot", return_value=(True, "Swapped menu proposal [CHOICES: Lock In Menu]")), \
+             patch("tools.meal_planner_proposal.load_active_plan", return_value=mock_plan):
+            await bcmd.handle_button_choice("Swap Tuesday", mock_interaction, turn_queue)
+            # Expect 2 channel sends: the '🔘 Selected:' message and the proposal message with attachment
+            assert mock_channel.send.call_count == 2
+            second_call = mock_channel.send.call_args_list[1]
+            kwargs = second_call.kwargs
+            assert "file" in kwargs
+            assert kwargs["file"].filename == "weekly_menu_triptych.jpg"
 
     @pytest.mark.asyncio
     async def test_reddit_fantasy_scanner_double_post_suppressed(self):

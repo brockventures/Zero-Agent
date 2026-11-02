@@ -420,7 +420,7 @@ async def handle_button_choice(
         await interaction.channel.send(f"🔘 **Selected:** `{choice_text}`")
         slot = choice_lower.split()[1]
         try:
-            from tools.meal_planner_proposal import swap_slot
+            from tools.meal_planner_proposal import swap_slot, load_active_plan
             ok, rep = await asyncio.to_thread(swap_slot, slot)
             if ok:
                 clean_rep, choice_view = parse_interactive_choices(
@@ -428,10 +428,19 @@ async def handle_button_choice(
                     quick_choice_view_cls=QuickChoiceView,
                     button_choice_fn=None,
                 )
+                plan = await asyncio.to_thread(load_active_plan)
+                image_path = plan.get("image_path") if isinstance(plan, dict) else None
+                file = None
+                if image_path and Path(image_path).is_file():
+                    file = discord.File(str(image_path), filename=Path(image_path).name)
+
+                send_kwargs = {}
                 if choice_view:
-                    await interaction.channel.send(clean_rep, view=choice_view)
-                else:
-                    await interaction.channel.send(clean_rep)
+                    send_kwargs["view"] = choice_view
+                if file:
+                    send_kwargs["file"] = file
+
+                await interaction.channel.send(clean_rep, **send_kwargs)
             else:
                 await interaction.channel.send(rep)
         except Exception as se:

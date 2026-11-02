@@ -908,7 +908,8 @@ async def dispatch_scheduled_prompt(
                     ch = await get_dest_channel()
                     if ch:
                         clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
-                        await _send_chunked_content(ch, clean_content, choice_view)
+                        image_path = extra.get("image_path") if isinstance(extra, dict) else None
+                        await _send_chunked_content(ch, clean_content, choice_view, file_path=image_path)
             else:
                 print("[Scheduler] Weekly meal proposal checked: nominal (silent).")
         except Exception as e:

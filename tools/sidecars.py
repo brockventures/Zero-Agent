@@ -1376,7 +1376,12 @@ def run_weekly_meal_proposal() -> tuple[bool, str, dict]:
         from tools.meal_planner_proposal import generate_proposal, format_proposal_markdown
         plan = generate_proposal()
         decision_staged = bool(plan.get("decision_staged", False)) if isinstance(plan, dict) else False
-        return True, format_proposal_markdown(plan), {"has_items": True, "decision_staged": decision_staged}
+        image_path = plan.get("image_path") if isinstance(plan, dict) else None
+        return True, format_proposal_markdown(plan), {
+            "has_items": True,
+            "decision_staged": decision_staged,
+            "image_path": image_path,
+        }
     except Exception as e:
         return False, f"⚠️ Weekly meal planning proposal failed: {e}", {"has_items": False, "decision_staged": False}
 
