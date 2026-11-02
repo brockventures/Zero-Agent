@@ -39,6 +39,7 @@ from tools.gh_pr_watcher import (
     handle_event_pr,
     is_ci_passing_or_empty,
     load_state,
+    matches_target_patterns,
     parse_discord_github_webhook_embed,
     parse_github_email_doorbell,
     poll_and_notify,
@@ -208,7 +209,7 @@ class TestGhPrWatcherDiscovery(unittest.TestCase):
         mock_run_gh.side_effect = side_effect
 
         prs = discover_open_prs(
-            target_patterns=["mcarmody/lomin", "arcane103/*"],
+            target_patterns=["mcarmody/lomin", "arcane103/*", "brockventures/*"],
             current_user="brockventures",
         )
         pr_numbers = {p["number"] for p in prs}
@@ -219,6 +220,69 @@ class TestGhPrWatcherDiscovery(unittest.TestCase):
         # Check deduplication on PR 5
         pr5_list = [p for p in prs if p["number"] == 5 and p["repo"] == "mcarmody/lomin"]
         self.assertEqual(len(pr5_list), 1)
+
+    def test_matches_target_patterns(self) -> None:
+        """Verify pattern matching for exact, wildcard, and empty targets."""
+        patterns = ["mcarmody/lomin", "brockventures/*", "arcane103/*"]
+        self.assertTrue(matches_target_patterns("mcarmody/lomin", patterns))
+        self.assertTrue(matches_target_patterns("brockventures/Zero-Agent", patterns))
+        self.assertTrue(matches_target_patterns("arcane103/mirrormere", patterns))
+        self.assertFalse(matches_target_patterns("azylman/mirrormere", patterns))
+        self.assertFalse(matches_target_patterns("unknown/repo", patterns))
+        # Empty patterns matches everything
+        self.assertTrue(matches_target_patterns("azylman/mirrormere", []))
+        self.assertTrue(matches_target_patterns("azylman/mirrormere", None))
+
+    @patch("tools.gh_pr_watcher.run_gh")
+    def test_discover_open_prs_filters_non_target_repos(
+        self, mock_run_gh: MagicMock
+    ) -> None:
+        """Verify discover_open_prs filters out non-whitelisted repos like azylman/mirrormere."""
+        def side_effect(args: list[str], timeout: int = 30):
+            if "search" in args and "--review-requested=@me" in args:
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=0,
+                    stdout=json.dumps([
+                        {
+                            "repository": {"nameWithOwner": "azylman/mirrormere"},
+                            "number": 42,
+                            "title": "Spam PR",
+                            "url": "https://github.com/azylman/mirrormere/pull/42",
+                            "author": {"login": "spammer"},
+                        },
+                        {
+                            "repository": {"nameWithOwner": "brockventures/Zero-Gotchi"},
+                            "number": 10,
+                            "title": "Legit PR",
+                            "url": "https://github.com/brockventures/Zero-Gotchi/pull/10",
+                            "author": {"login": "ryanbrock"},
+                        },
+                    ]),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="[]", stderr=""
+            )
+
+        mock_run_gh.side_effect = side_effect
+
+        # When target_patterns is provided, non-matching repos are excluded
+        prs = discover_open_prs(
+            target_patterns=["mcarmody/lomin", "brockventures/*", "arcane103/*"],
+            current_user="zero-brock",
+        )
+        pr_repos = {p["repo"] for p in prs}
+        self.assertIn("brockventures/Zero-Gotchi", pr_repos)
+        self.assertNotIn("azylman/mirrormere", pr_repos)
+
+        # When target_patterns is empty, all repos are allowed
+        prs_empty = discover_open_prs(
+            target_patterns=[],
+            current_user="zero-brock",
+        )
+        pr_repos_empty = {p["repo"] for p in prs_empty}
+        self.assertIn("azylman/mirrormere", pr_repos_empty)
 
     @patch("tools.gh_pr_watcher.run_gh")
     def test_get_pr_details(self, mock_run_gh: MagicMock) -> None:

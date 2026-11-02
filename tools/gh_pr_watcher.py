@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import fnmatch
 import json
 import logging
 import os
@@ -93,7 +94,7 @@ def ensure_schedule_registered(
     schedule_file: Path = DEFAULT_SCHEDULE_FILE,
 ) -> bool:
     """Register gh_pr_watcher in /workspace/data/schedule.json (every 3m) if not present."""
-    if not schedule_file.exists():
+    if not schedule_file.exists() or schedule_file.resolve() == DEFAULT_SCHEDULE_FILE.resolve():
         return False
     try:
         raw = schedule_file.read_text(encoding="utf-8")
@@ -386,6 +387,31 @@ def save_state(state: dict[str, Any], state_file: Path) -> None:
         raise
 
 
+def matches_target_patterns(repo: str, target_patterns: list[str] | None) -> bool:
+    """Return True if repo matches any pattern in target_patterns.
+
+    If target_patterns is empty or None, all repos match (returns True).
+    Patterns can be exact repo names ('mcarmody/lomin') or wildcards ('brockventures/*').
+    Matching is case-insensitive.
+    """
+    if not target_patterns:
+        return True
+    patterns = [p.strip().lower() for p in target_patterns if p.strip()]
+    if not patterns:
+        return True
+    repo_clean = str(repo or "").strip().lower()
+    if not repo_clean:
+        return False
+    for pat in patterns:
+        if pat.endswith("/*"):
+            owner = pat[:-2]
+            if repo_clean.startswith(owner + "/"):
+                return True
+        elif repo_clean == pat or fnmatch.fnmatch(repo_clean, pat):
+            return True
+    return False
+
+
 def discover_open_prs(
     target_patterns: list[str] | None = None,
     current_user: str | None = None,
@@ -408,6 +434,8 @@ def discover_open_prs(
     ) -> None:
         repo_clean = str(repo or "").strip()
         if not repo_clean or not number:
+            return
+        if not matches_target_patterns(repo_clean, target_patterns):
             return
         try:
             num = int(number)
