@@ -249,6 +249,16 @@ def post_discord(bot_token: str, channel_id: str, content: str):
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
         return resp.status in (200, 201)
 
+def is_silent_system_email(headers_lower: dict, snippet: str = "") -> bool:
+    """Return True when the email is an automated [WORK-CAL-SYNC] payload that should not alert Discord."""
+    subject = (headers_lower.get("subject") or "").lower()
+    if "[work-cal-sync]" in subject:
+        return True
+    if snippet and "zero.work_cal_sync" in snippet.lower():
+        return True
+    return False
+
+
 def process_message_payload(
     m_data: dict,
     bot_token: str | None = None,
@@ -258,6 +268,7 @@ def process_message_payload(
 
     Returns:
         'github_doorbell': If message was from notifications@github.com and passed to gh_pr_watcher.
+        'ignored_work_cal_sync': If message is an automated [WORK-CAL-SYNC] payload.
         'discord_notified': If message was addressed to TARGET_EMAIL and posted to Discord.
         'ready_for_dispatch': If message was addressed to TARGET_EMAIL but bot_token/channel_id not provided.
         'ignored_recipient': If message was not addressed to TARGET_EMAIL and not from notifications@github.com.
@@ -274,6 +285,11 @@ def process_message_payload(
             except Exception as d_err:
                 log(f"GitHub email doorbell processing error: {d_err}")
         return "github_doorbell"
+
+    snippet = m_data.get("snippet", "")
+    if is_silent_system_email(headers_lower, snippet):
+        log("Silently ingested automated [WORK-CAL-SYNC] payload (Discord notification suppressed).")
+        return "ignored_work_cal_sync"
 
     to_addr = headers_lower.get("to", "").lower()
     cc_addr = headers_lower.get("cc", "").lower()
@@ -442,6 +458,8 @@ def run_loop():
                                                 log(f"GitHub email doorbell error: {d_err}")
                                     else:
                                         log(f"GitHub email doorbell cap ({MAX_GITHUB_DOORBELLS_PER_CYCLE}) reached for this tick; skipping eval for {mid}")
+                                elif is_silent_system_email(headers_lower, m_data.get("snippet", "")):
+                                    log(f"Silently ingested automated [WORK-CAL-SYNC] email ({mid}); suppressing Discord alert.")
                                 else:
                                     human_payloads.append((mid, m_data, from_addr))
                         except Exception:

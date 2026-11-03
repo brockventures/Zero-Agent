@@ -12,9 +12,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE))
+    sys.path.append(str(WORKSPACE))
 
 import tools.zero_mail_listener as zmail
 
@@ -111,6 +114,65 @@ class TestZeroMailListener(unittest.TestCase):
             # Different key passes through
             zmail.log_error_throttled("other_key", "Different error", interval=60)
             self.assertEqual(len(logged), 2)
+
+    def test_is_silent_system_email_subject_and_snippet(self):
+        self.assertTrue(
+            zmail.is_silent_system_email(
+                {"subject": "[WORK-CAL-SYNC] Rolling 14-Day Window"}, ""
+            )
+        )
+        self.assertTrue(
+            zmail.is_silent_system_email(
+                {"subject": "Re: [work-cal-sync] Rolling 14-Day Window"}, ""
+            )
+        )
+        self.assertTrue(
+            zmail.is_silent_system_email(
+                {"subject": "Calendar Update"},
+                '{"schema": "zero.work_cal_sync.v1", "events": []}',
+            )
+        )
+        self.assertFalse(
+            zmail.is_silent_system_email(
+                {"subject": "Hello Zero"}, "Normal human email body"
+            )
+        )
+
+    def test_process_message_payload_ignores_work_cal_sync_subject(self):
+        m_data = {
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "user@example.com"},
+                    {"name": "To", "value": zmail.TARGET_EMAIL},
+                    {"name": "Subject", "value": "[WORK-CAL-SYNC] Rolling 14-Day Window"},
+                ]
+            },
+            "snippet": '{"generated_at": "2026-04-12T19:00:08Z"}',
+        }
+        with patch("tools.zero_mail_listener.post_discord") as mock_post:
+            res = zmail.process_message_payload(
+                m_data, bot_token="fake-token", channel_id="123456"
+            )
+            self.assertEqual(res, "ignored_work_cal_sync")
+            mock_post.assert_not_called()
+
+    def test_process_message_payload_ignores_work_cal_sync_snippet(self):
+        m_data = {
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "user@example.com"},
+                    {"name": "To", "value": zmail.TARGET_EMAIL},
+                    {"name": "Subject", "value": "Daily Digest"},
+                ]
+            },
+            "snippet": '{"schema": "zero.work_cal_sync.v1", "window_days": 14}',
+        }
+        with patch("tools.zero_mail_listener.post_discord") as mock_post:
+            res = zmail.process_message_payload(
+                m_data, bot_token="fake-token", channel_id="123456"
+            )
+            self.assertEqual(res, "ignored_work_cal_sync")
+            mock_post.assert_not_called()
 
 
 if __name__ == "__main__":
