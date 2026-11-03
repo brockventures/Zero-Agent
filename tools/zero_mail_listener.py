@@ -152,6 +152,14 @@ except ImportError:
     except ImportError:
         process_github_email_doorbell = None
 
+try:
+    from tools.work_cal_sync import ingest_work_cal_message
+except ImportError:
+    try:
+        from work_cal_sync import ingest_work_cal_message
+    except ImportError:
+        ingest_work_cal_message = None
+
 def sanitize_text(text: str, max_len: int = 150) -> str:
     if not text:
         return ""
@@ -288,6 +296,11 @@ def process_message_payload(
 
     snippet = m_data.get("snippet", "")
     if is_silent_system_email(headers_lower, snippet):
+        if ingest_work_cal_message:
+            try:
+                ingest_work_cal_message(m_data)
+            except Exception as wc_err:
+                log(f"Work calendar sync ingestion error: {wc_err}")
         log("Silently ingested automated [WORK-CAL-SYNC] payload (Discord notification suppressed).")
         return "ignored_work_cal_sync"
 
@@ -459,6 +472,17 @@ def run_loop():
                                     else:
                                         log(f"GitHub email doorbell cap ({MAX_GITHUB_DOORBELLS_PER_CYCLE}) reached for this tick; skipping eval for {mid}")
                                 elif is_silent_system_email(headers_lower, m_data.get("snippet", "")):
+                                    if ingest_work_cal_message:
+                                        try:
+                                            ingested = ingest_work_cal_message(m_data)
+                                            if not ingested:
+                                                full_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=full"
+                                                full_req = urllib.request.Request(full_url, headers={"Authorization": f"Bearer {tok}"})
+                                                with urllib.request.urlopen(full_req, timeout=TIMEOUT) as full_resp:
+                                                    full_data = json.loads(full_resp.read().decode())
+                                                ingest_work_cal_message(full_data)
+                                        except Exception as wc_err:
+                                            log(f"Work calendar sync ingestion error for {mid}: {wc_err}")
                                     log(f"Silently ingested automated [WORK-CAL-SYNC] email ({mid}); suppressing Discord alert.")
                                 else:
                                     human_payloads.append((mid, m_data, from_addr))

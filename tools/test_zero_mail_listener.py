@@ -12,13 +12,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REMO_ROOT = Path(__file__).resolve().parent.parent
+if str(REMO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REMO_ROOT))
 WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
     sys.path.append(str(WORKSPACE))
 
+import tools.work_cal_sync as wcs
 import tools.zero_mail_listener as zmail
 
 
@@ -64,7 +65,7 @@ class TestZeroMailListener(unittest.TestCase):
 
         with patch("tools.zero_mail_listener.os.path.exists") as mock_exists, \
              patch("tools.zero_mail_listener.os.path.getsize") as mock_size, \
-             patch("builtins.open", unittest.mock.mock_open()) as mock_open:
+             patch("builtins.open", unittest.mock.mock_open()):
 
             def custom_exists(p):
                 return p in ("/secrets/google_oauth.json", "/workspace/config/google_oauth.json")
@@ -167,12 +168,87 @@ class TestZeroMailListener(unittest.TestCase):
             },
             "snippet": '{"schema": "zero.work_cal_sync.v1", "window_days": 14}',
         }
-        with patch("tools.zero_mail_listener.post_discord") as mock_post:
+        with patch("tools.zero_mail_listener.post_discord") as mock_post, \
+             patch("tools.zero_mail_listener.ingest_work_cal_message") as mock_ingest:
             res = zmail.process_message_payload(
                 m_data, bot_token="fake-token", channel_id="123456"
             )
             self.assertEqual(res, "ignored_work_cal_sync")
             mock_post.assert_not_called()
+            mock_ingest.assert_called_once_with(m_data)
+
+    def test_extract_and_ingest_work_cal_message_base64_plain(self):
+        import base64
+
+        raw_payload = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-09T23:59:59-08:00",
+            "events": [
+                {
+                    "uid_hash": "aa01cfd50d77c851",
+                    "summary": "Work Meeting",
+                    "start": "2026-11-03T20:30:00-08:00",
+                    "end": "2026-11-03T21:30:00-08:00",
+                },
+                {
+                    "uid_hash": "5a376ff081497f74",
+                    "summary": "Work Meeting",
+                    "start": "2026-11-04T17:05:00-08:00",
+                    "end": "2026-11-04T17:45:00-08:00",
+                },
+            ],
+        }
+        encoded = base64.urlsafe_b64encode(json.dumps(raw_payload).encode("utf-8")).decode("ascii")
+        m_data = {
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    {"name": "Subject", "value": "[WORK-CAL-SYNC] Rolling 14-Day Window"}
+                ],
+                "body": {"data": encoded},
+            },
+            "snippet": "",
+        }
+        state_file = self.temp_path / "work_calendar_sync.json"
+        extracted = wcs.extract_work_cal_json_from_message(m_data)
+        self.assertIsNotNone(extracted)
+        self.assertEqual(extracted["schema"], "zero.work_cal_sync.v1")
+
+        ok = wcs.ingest_work_cal_message(m_data, state_path=state_file)
+        self.assertTrue(ok)
+        self.assertTrue(state_file.exists())
+
+        events = wcs.get_cached_work_events(
+            time_min_iso="2026-11-03T00:00:00-08:00",
+            time_max_iso="2026-11-04T00:00:00-08:00",
+            state_path=state_file,
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["id"], "work_aa01cfd50d77c851")
+        self.assertEqual(events[0]["calendar"], "Work (Ryan)")
+        self.assertEqual(events[0]["summary"], "Work Meeting")
+        self.assertEqual(events[0]["description"], "Synced via [WORK-CAL-SYNC]")
+
+    def test_extract_work_cal_json_from_html_and_snippet(self):
+        import base64
+
+        html_body = '<div><p>Header</p><pre>{&quot;schema&quot;: &quot;zero.work_cal_sync.v1&quot;, &quot;events&quot;: [{&quot;uid_hash&quot;: &quot;h1&quot;, &quot;summary&quot;: &quot;Sync&quot;, &quot;start&quot;: &quot;2026-11-03T09:00:00-08:00&quot;, &quot;end&quot;: &quot;2026-11-03T10:00:00-08:00&quot;}]}</pre></div>'
+        encoded = base64.urlsafe_b64encode(html_body.encode("utf-8")).decode("ascii")
+        m_data = {
+            "payload": {
+                "mimeType": "multipart/alternative",
+                "parts": [
+                    {"mimeType": "text/html", "body": {"data": encoded}},
+                ],
+            }
+        }
+        extracted = wcs.extract_work_cal_json_from_message(m_data)
+        self.assertIsNotNone(extracted)
+        self.assertEqual(len(extracted["events"]), 1)
+        self.assertEqual(extracted["events"][0]["uid_hash"], "h1")
 
 
 if __name__ == "__main__":
