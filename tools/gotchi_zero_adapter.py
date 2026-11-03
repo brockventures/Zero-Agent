@@ -69,6 +69,9 @@ if "/workspace" not in sys.path:
     sys.path.append("/workspace")
 if "/workspace/gotchi" not in sys.path:
     sys.path.append("/workspace/gotchi")
+for _lomin_path in ("/tmp/lomin-parity-repo", "/workspace/gotchi/lomin"):
+    if Path(_lomin_path).is_dir() and _lomin_path not in sys.path:
+        sys.path.append(_lomin_path)
 
 ZERO_CHAT_CHANNEL_ID = int(os.environ.get("GOTCHI_ZERO_CHAT_CHANNEL_ID", "0") or 0)
 TARGET_CHANNEL_ID = ZERO_CHAT_CHANNEL_ID
@@ -1148,6 +1151,102 @@ def extract_and_forward_artifacts_to_zero_chat(
     return updated_spoken, any_sent_to_zero_chat
 
 
+_CACHED_FULL_ZERO_PERSONA_AND_RULES: Optional[str] = None
+
+
+def _load_full_zero_persona_and_rules() -> str:
+    """
+    Reads `/workspace/GEMINI.md` and `/workspace/.agents/rules/*.md` once in memory
+    (falling back to `_REPO_ROOT` if `/workspace` is absent) and returns the formatted
+    block for inclusion in `build_gotchi_zero_system_prompt`.
+    """
+    global _CACHED_FULL_ZERO_PERSONA_AND_RULES
+    if _CACHED_FULL_ZERO_PERSONA_AND_RULES is not None:
+        return _CACHED_FULL_ZERO_PERSONA_AND_RULES
+
+    sections: List[str] = []
+    gemini_candidates = [Path("/workspace/GEMINI.md"), Path(_REPO_ROOT) / "GEMINI.md"]
+    for g_path in gemini_candidates:
+        if g_path.is_file():
+            try:
+                content = g_path.read_text(encoding="utf-8").strip()
+                if content:
+                    sections.append(
+                        f"=== ZERO CORE OPERATIONAL REFERENCE (/workspace/GEMINI.md) ===\n{content}"
+                    )
+                    break
+            except Exception:
+                pass
+
+    rules_dirs = [Path("/workspace/.agents/rules"), Path(_REPO_ROOT) / ".agents" / "rules"]
+    for r_dir in rules_dirs:
+        if r_dir.is_dir():
+            try:
+                rule_files = sorted(r_dir.glob("*.md"))
+                rule_blocks: List[str] = []
+                for rf in rule_files:
+                    try:
+                        r_text = rf.read_text(encoding="utf-8").strip()
+                        if r_text:
+                            rule_blocks.append(f"--- RULE: {rf.name} ---\n{r_text}")
+                    except Exception:
+                        pass
+                if rule_blocks:
+                    sections.append(
+                        "=== ZERO MANDATORY OPERATIONAL RULES (/workspace/.agents/rules/*.md) ===\n"
+                        + "\n\n".join(rule_blocks)
+                    )
+                    break
+            except Exception:
+                pass
+
+    _CACHED_FULL_ZERO_PERSONA_AND_RULES = ("\n\n" + "\n\n".join(sections)) if sections else ""
+    return _CACHED_FULL_ZERO_PERSONA_AND_RULES
+
+
+def resolve_lomin_client_lockout_key(
+    headers: Dict[str, str], client_host: str = "127.0.0.1"
+) -> str:
+    """
+    Proxy-safe client lockout key resolver for Lomin/Gotchi gateway endpoints.
+    Keys on a SHA-256 fingerprint of the Bearer token or `X-Forwarded-For` / `X-Real-IP`
+    rather than locking out `127.0.0.1` globally behind a local reverse proxy or tunnel.
+    """
+    import hashlib
+
+    norm_headers = {str(k).lower(): str(v).strip() for k, v in (headers or {}).items() if k}
+    auth_val = norm_headers.get("authorization", "")
+    token_part = ""
+    if auth_val.lower().startswith("bearer "):
+        token_part = auth_val[7:].strip()
+    elif auth_val:
+        token_part = auth_val.strip()
+
+    xff = norm_headers.get("x-forwarded-for", "")
+    forwarded_ip = xff.split(",")[0].strip() if xff else norm_headers.get("x-real-ip", "").strip()
+    node_hdr = norm_headers.get("x-node-id", "").strip()
+
+    if token_part:
+        digest = hashlib.sha256(token_part.encode("utf-8")).hexdigest()[:16]
+        if forwarded_ip:
+            return f"ip:{forwarded_ip}:tok:{digest}"
+        return f"tok:{digest}"
+
+    if forwarded_ip:
+        return f"ip:{forwarded_ip}"
+
+    if node_hdr:
+        return f"node:{node_hdr}:host:{client_host or '127.0.0.1'}"
+
+    host_clean = (client_host or "127.0.0.1").strip()
+    if host_clean in ("127.0.0.1", "::1", "localhost"):
+        ua_digest = hashlib.sha256(
+            norm_headers.get("user-agent", "anon").encode("utf-8")
+        ).hexdigest()[:12]
+        return f"loopback:{host_clean}:ua:{ua_digest}"
+    return f"ip:{host_clean}"
+
+
 def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = False) -> str:
     """
     Builds the unified Zero system prompt shared with `#zero-voice`, tuned for Gotchi's
@@ -1224,7 +1323,7 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         "- Use `post_note_to_zero_chat` to send clickable links, notes, code blocks, local images/files (`file_path`), "
         "or webpage screenshots (`screenshot_url`) directly to `#zero-chat`.\n"
         "- Use `get_weather_forecast` to check live weather conditions and high/low forecasts (defaults immediately to Local Home Area without asking for a city).\n\n"
-        f"{snapshot}{mem_block}"
+        f"{snapshot}{_load_full_zero_persona_and_rules()}{mem_block}"
     )
 
 
@@ -1790,20 +1889,30 @@ def record_gotchi_turn_to_channels(
 def _load_ha_credentials_from_env_or_secrets() -> Tuple[bool, str, str, float]:
     """
     Resolves `(enabled, ha_base_url, ha_access_token, timeout_s)` for Task #98.
-    Defaults strictly to `enabled=False` unless `HA_CONVERSATION_ENABLED` or
-    `GOTCHI_HA_CONVERSATION_ENABLED` is explicitly set to truthy (`1`, `true`, `yes`, `on`).
+    Defaults strictly to `enabled=False` unless `HA_CONVERSATION_ENABLED`,
+    `GOTCHI_HA_CONVERSATION_ENABLED`, `MVG_HA_ENABLED`, or `MVG_HA_FASTPATH` is
+    explicitly set to truthy (`1`, `true`, `yes`, `on`).
     When enabled, loads `HA_BASE_URL` and `HA_ACCESS_TOKEN` from environment or `/secrets/env.json`.
     """
-    raw_flag = os.environ.get(
-        "HA_CONVERSATION_ENABLED",
-        os.environ.get("GOTCHI_HA_CONVERSATION_ENABLED", ""),
+    raw_flag = (
+        os.environ.get("HA_CONVERSATION_ENABLED")
+        or os.environ.get("GOTCHI_HA_CONVERSATION_ENABLED")
+        or os.environ.get("MVG_HA_ENABLED")
+        or os.environ.get("MVG_HA_FASTPATH")
+        or ""
     ).strip().lower()
     enabled = raw_flag in ("1", "true", "yes", "on")
-    base_url = os.environ.get(
-        "GOTCHI_HA_BASE_URL", os.environ.get("HA_BASE_URL", "")
+    base_url = (
+        os.environ.get("GOTCHI_HA_BASE_URL")
+        or os.environ.get("MVG_HA_URL")
+        or os.environ.get("HA_BASE_URL")
+        or ""
     ).strip()
-    token = os.environ.get(
-        "GOTCHI_HA_ACCESS_TOKEN", os.environ.get("HA_ACCESS_TOKEN", "")
+    token = (
+        os.environ.get("GOTCHI_HA_ACCESS_TOKEN")
+        or os.environ.get("MVG_HA_TOKEN")
+        or os.environ.get("HA_ACCESS_TOKEN")
+        or ""
     ).strip()
     try:
         timeout_s = float(os.environ.get("GOTCHI_HA_CONVERSATION_TIMEOUT_S", "2.5") or 2.5)
@@ -1822,6 +1931,83 @@ def _load_ha_credentials_from_env_or_secrets() -> Tuple[bool, str, str, float]:
             except Exception:
                 pass
     return enabled, base_url, token, timeout_s
+
+
+def is_lomin_vision_enabled() -> bool:
+    """Return True if Lomin vision ingest is enabled via any dual-named flag."""
+    for k in ("MVG_ENABLE_VISION", "MVG_VISION_ENABLED", "MVG_VISION_ADPCM"):
+        if os.environ.get(k, "").strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def is_lomin_adpcm_enabled() -> bool:
+    """Return True if Lomin ADPCM audio codec is enabled via any dual-named flag."""
+    for k in ("MVG_ENABLE_ADPCM", "MVG_ADPCM_ENABLED", "MVG_VISION_ADPCM"):
+        if os.environ.get(k, "").strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def is_lomin_direct_audio_enabled() -> bool:
+    """Return True if Lomin direct audio to brain is enabled via any dual-named flag."""
+    for k in ("MVG_BRAIN_DIRECT_AUDIO", "MVG_DIRECT_AUDIO"):
+        if os.environ.get(k, "").strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def is_lomin_ha_fastpath_enabled() -> bool:
+    """Return True if Lomin HA conversation fast-path is enabled via any dual-named flag."""
+    for k in ("MVG_HA_FASTPATH", "MVG_HA_ENABLED", "HA_CONVERSATION_ENABLED", "GOTCHI_HA_CONVERSATION_ENABLED"):
+        if os.environ.get(k, "").strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def is_lomin_mic_reopen_enabled() -> bool:
+    """Return True if Lomin auto-mic reopen is enabled via any dual-named flag."""
+    for k in ("MVG_ENABLE_MIC_REOPEN", "MVG_MIC_REOPEN_ENABLED"):
+        if os.environ.get(k, "").strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def is_lomin_defer_enabled() -> bool:
+    """Return True if Lomin deferred async voice answers are enabled via any dual-named flag."""
+    for k in ("MVG_ENABLE_DEFER", "MVG_DEFER_ENABLED"):
+        if os.environ.get(k, "").strip().lower() in ("1", "true", "yes", "on"):
+            return True
+    return False
+
+
+def shutdown_lomin_background_workers(timeout_s: float = 2.0) -> bool:
+    """
+    Gracefully flushes and shuts down Lomin side-channel daemon worker threads
+    (`SideChannelWebhookWorker` and `SideChannelTranscriptWorker`) by sending
+    `None` sentinel tasks so daemon threads terminate cleanly on app shutdown.
+    """
+    try:
+        import side_channel as sc  # type: ignore
+
+        ok = sc.flush_side_channel_queue(timeout_s=timeout_s)
+        with getattr(sc, "_worker_lock", asyncio.Lock()):
+            if getattr(sc, "_webhook_worker_started", False):
+                try:
+                    sc._webhook_queue.put_nowait(None)
+                except Exception:
+                    pass
+                sc._webhook_worker_started = False
+            if getattr(sc, "_transcript_worker_started", False):
+                try:
+                    sc._transcript_queue.put_nowait(None)
+                except Exception:
+                    pass
+                sc._transcript_worker_started = False
+            sc._worker_started = False
+        return bool(ok)
+    except Exception:
+        return True
 
 
 def try_ha_conversation_fastpath(
@@ -1926,12 +2112,6 @@ class GotchiZeroBrainAdapter:
         return self._genai_client
 
     def _resolve_live_gemini_model(self) -> str:
-        if (
-            self.model == "gemini-3.8-flash"
-            and "GOTCHI_ZERO_MODEL" not in os.environ
-            and type(self._genai_client).__name__ == "Client"
-        ):
-            return "gemini-2.5-flash"
         return self.model
 
     async def _emit_streamed_sentence(
@@ -2596,29 +2776,135 @@ class GotchiZeroBrainAdapter:
         }
 
 
+def apply_defaults() -> None:
+    """Lomin plugin hook (`MVG_PLUGIN=gotchi_zero_adapter`): applies Zero's default env settings."""
+    os.environ.setdefault("MVG_PORT", "8771")
+    os.environ.setdefault("GOTCHI_ZERO_MODEL", DEFAULT_GOTCHI_MODEL)
+    os.environ.setdefault("MVG_GEMINI_VOICE", DEFAULT_VOICE_NAME)
+
+
+def brain_call(target: str, prompt: str, timeout: int = 45) -> str:
+    """Lomin plugin synchronous brain hook."""
+    adapter = GotchiZeroBrainAdapter()
+    res = asyncio.run(adapter.handle_turn({"prompt": prompt, "node_id": target or "gotchi-ryan-01"}))
+    return str(res.get("reply") or "")
+
+
+def brain_call_stream(
+    target: str,
+    prompt: str,
+    timeout: int = 45,
+    on_partial: Optional[Callable[[str], None]] = None,
+    stages_out: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Lomin plugin streaming brain hook."""
+    adapter = GotchiZeroBrainAdapter()
+    running_sentences: List[str] = []
+
+    def _on_s(s_txt: str) -> None:
+        running_sentences.append(s_txt)
+        if on_partial is not None:
+            on_partial(" ".join(running_sentences))
+
+    res = asyncio.run(
+        adapter.handle_turn(
+            {
+                "prompt": prompt,
+                "node_id": target or "gotchi-ryan-01",
+                "_on_sentence": _on_s,
+            }
+        )
+    )
+    reply = str(res.get("reply") or "")
+    if on_partial is not None and not running_sentences and reply:
+        on_partial(reply)
+    return reply
+
+
+async def _parse_json_or_empty_body(request: Request) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Safely parses a request body as a JSON dict, falling back cleanly to `{}` when the
+    request body is empty or whitespace-only instead of raising `JSONDecodeError`.
+    Returns `(parsed_dict, error_message)`.
+    """
+    try:
+        raw_bytes = await request.body()
+    except Exception:
+        return {}, None
+    if not raw_bytes or not raw_bytes.strip():
+        return {}, None
+    try:
+        parsed = json.loads(raw_bytes.decode("utf-8"))
+    except Exception:
+        return None, "invalid JSON body"
+    if not isinstance(parsed, dict):
+        return None, "request body must be a JSON object"
+    return parsed, None
+
+
 def create_zero_gotchi_app(
     adapter: Optional[GotchiZeroBrainAdapter] = None,
     live_mode_enabled: bool = True,
 ):
     """
-    Creates the full FastAPI Gotchi Gateway (`POST /api/voice/interact`, `WebSocket /api/live/ws`,
+    Creates the full FastAPI Gotchi + Lomin Unified Gateway (`POST /api/voice/interact`,
+    `POST /voice/turn`, `POST /ask`, `POST /ask/stream`, `GET/POST /voice/pending`,
+    `GET/POST /voice/pending/{node_id}`, `POST /v1/audio/speech`, `WebSocket /api/live/ws`,
     `POST /api/journal/ingest`, `GET /api/voice/logs`, plus `POST /api/gotchi/brain`) wired
     directly to Zero's brain and `#gotchi-chat` transcript recorder.
     """
-    from fastapi.responses import JSONResponse
+    for _lomin_dir in ("/tmp/lomin-parity-repo", "/workspace/gotchi/lomin"):
+        if Path(_lomin_dir).is_dir() and _lomin_dir not in sys.path:
+            sys.path.insert(0, _lomin_dir)
+
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
     from backend.live_gateway import LiveGatewayService
     from backend.llm_config import LLMConfig
-    from backend.voice_gateway import VoiceGatewayService, create_app
+    from backend.voice_gateway import VoiceGatewayService, build_sse_event, create_app
+
+    try:
+        from pending_and_auth import (  # type: ignore
+            get_device_token_verifier as get_lomin_verifier,
+            get_pending_store as get_lomin_pending_store,
+            has_defer_marker as lomin_has_defer_marker,
+            strip_defer_marker as lomin_strip_defer_marker,
+        )
+    except Exception:
+        get_lomin_verifier = None
+        get_lomin_pending_store = None
+        lomin_has_defer_marker = None
+        lomin_strip_defer_marker = None
+
+    try:
+        from side_channel import (  # type: ignore
+            emit_turn_transcript as lomin_emit_turn_transcript,
+            forward_artifacts_to_webhook as lomin_forward_artifacts,
+            reply_expects_reply as lomin_reply_expects_reply,
+        )
+    except Exception:
+        lomin_emit_turn_transcript = None
+        lomin_forward_artifacts = None
+        lomin_reply_expects_reply = None
+
+    try:
+        from vision_adpcm import decode_adpcm_to_wav as lomin_decode_adpcm_to_wav  # type: ignore
+    except Exception:
+        lomin_decode_adpcm_to_wav = None
+
+    try:
+        from audio_utils import pcm_to_wav as lomin_pcm_to_wav  # type: ignore
+    except Exception:
+        lomin_pcm_to_wav = None
 
     brain = adapter or GotchiZeroBrainAdapter()
     cfg = LLMConfig.from_env_or_file()
-    cfg.voice_name = DEFAULT_VOICE_NAME
+    cfg.voice_name = os.environ.get("MVG_GEMINI_VOICE", DEFAULT_VOICE_NAME) or DEFAULT_VOICE_NAME
     if (
         brain.llm_caller is None
         and "GOTCHI_TTS_ENGINE" not in os.environ
         and not cfg.tts_url.strip()
     ):
-        cfg.tts_engine = "gemini"
+        cfg.tts_engine = os.environ.get("MVG_TTS", "gemini") or "gemini"
         if "GOTCHI_TTS_MODEL" not in os.environ:
             cfg.tts_model = "gemini-2.5-flash-preview-tts"
     if "GOTCHI_FILLER_DELAY_MS" not in os.environ:
@@ -2688,11 +2974,414 @@ def create_zero_gotchi_app(
     )
     app = create_app(service=voice_srv, live_service=live_srv)
 
+    def _check_unified_auth(request: Request, node_id: str = "") -> Tuple[bool, int, Dict[str, Any]]:
+        headers = dict(request.headers)
+        client_host = request.client.host if request.client else "127.0.0.1"
+        lockout_key = resolve_lomin_client_lockout_key(headers, client_host)
+
+        # 1. Check Lomin MVG_DEVICE_TOKENS verifier if configured
+        if get_lomin_verifier is not None:
+            lomin_v = get_lomin_verifier()
+            if lomin_v.is_enabled:
+                auth_hdr = headers.get("authorization") or headers.get("Authorization") or ""
+                if lomin_v.verify(auth_hdr, node_id):
+                    lomin_v.record_success(lockout_key)
+                    return True, 200, {}
+                if lomin_v.is_locked_out(lockout_key):
+                    return False, 429, {"error": "too many failed attempts, locked out"}
+                lomin_v.record_failure(lockout_key)
+                return False, 401, {"error": "unauthorized"}
+
+        # 2. Check Gotchi device_tokens verifier if configured
+        if voice_srv.auth_required or voice_srv.verifier.device_tokens:
+            ok, code, err = voice_srv.verifier.verify(headers, client_ip=lockout_key)
+            if not ok:
+                return False, code, err
+        return True, 200, {}
+
+    @app.on_event("shutdown")
+    async def _on_app_shutdown() -> None:
+        shutdown_lomin_background_workers(timeout_s=2.0)
+
     @app.post("/api/gotchi/brain")
     async def gotchi_brain_endpoint(request: Request):
-        body = await request.json()
+        body, err = await _parse_json_or_empty_body(request)
+        if err is not None or body is None:
+            return JSONResponse(status_code=400, content={"error": "bad_request", "message": err})
         res = await brain.handle_turn(body)
         return JSONResponse(status_code=200, content=res)
+
+    @app.post("/voice/turn")
+    async def lomin_voice_turn_endpoint(request: Request):
+        headers = dict(request.headers)
+        content_type = (headers.get("content-type") or headers.get("Content-Type") or "").lower()
+        client_host = request.client.host if request.client else "127.0.0.1"
+        qs = request.query_params
+        node_hint = (qs.get("node_id") or qs.get("node") or headers.get("x-node-id") or "").strip()
+
+        ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=node_hint)
+        if not ok_auth:
+            return JSONResponse(status_code=auth_code, content=auth_err)
+
+        parsed_turn: Dict[str, Any] = {}
+        if "multipart/form-data" in content_type:
+            try:
+                form = await request.form()
+                parsed_turn = voice_srv.parse_multipart_data(form)
+            except ValueError as ve:
+                msg = str(ve)
+                code = 413 if "exceeds" in msg.lower() or "too large" in msg.lower() else 400
+                return JSONResponse(status_code=code, content={"error": "bad_request", "message": msg})
+            except Exception as exc:
+                return JSONResponse(status_code=400, content={"error": "bad_request", "message": str(exc)})
+        elif "application/json" in content_type:
+            body_dict, err = await _parse_json_or_empty_body(request)
+            if err is not None or body_dict is None:
+                return JSONResponse(status_code=400, content={"error": err or "invalid JSON body"})
+            parsed_turn = dict(body_dict)
+            if not parsed_turn.get("node_id"):
+                parsed_turn["node_id"] = node_hint or "gotchi-ryan-01"
+            if not parsed_turn.get("session_id"):
+                parsed_turn["session_id"] = f"sess-{int(time.time() * 1000)}"
+        else:
+            raw_body = await request.body()
+            audio_bytes = raw_body if raw_body else None
+            if audio_bytes and audio_bytes.startswith(b"APCM"):
+                if lomin_decode_adpcm_to_wav is not None:
+                    try:
+                        audio_bytes = lomin_decode_adpcm_to_wav(audio_bytes)
+                    except ValueError as ve:
+                        return JSONResponse(
+                            status_code=413,
+                            content={"error": "payload_too_large", "message": str(ve)},
+                        )
+            parsed_turn = {
+                "node_id": node_hint or "gotchi-ryan-01",
+                "session_id": qs.get("session_id") or f"sess-{int(time.time() * 1000)}",
+                "prompt": qs.get("prompt") or "",
+                "audio_bytes": audio_bytes,
+            }
+
+        node_id = str(parsed_turn.get("node_id") or node_hint or "gotchi-ryan-01")
+        if node_id != node_hint:
+            ok_auth2, auth_code2, auth_err2 = _check_unified_auth(request, node_id=node_id)
+            if not ok_auth2:
+                return JSONResponse(status_code=auth_code2, content=auth_err2)
+
+        parsed_turn["client_ip"] = client_host
+        generator = voice_srv.generate_sse_stream(parsed_turn)
+        return StreamingResponse(
+            generator,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/ask")
+    async def lomin_ask_endpoint(request: Request):
+        t0 = time.monotonic()
+        req, err = await _parse_json_or_empty_body(request)
+        if err is not None or req is None:
+            return JSONResponse(status_code=400, content={"error": err or "invalid JSON body"})
+
+        node_id = str(req.get("node_id") or req.get("node") or request.headers.get("x-node-id") or "gotchi-ryan-01").strip()
+        ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=node_id)
+        if not ok_auth:
+            return JSONResponse(status_code=auth_code, content=auth_err)
+
+        prompt = str(req.get("prompt") or "").strip()
+        session_id = str(req.get("session_id") or f"sess-{int(time.time() * 1000)}")
+        turn_input = dict(req)
+        turn_input["node_id"] = node_id
+        turn_input["session_id"] = session_id
+        turn_input["prompt"] = prompt
+
+        res = await brain.handle_turn(turn_input)
+        raw_reply = str(res.get("raw_reply") or res.get("reply") or "")
+        spoken_reply = str(res.get("reply") or "")
+
+        if lomin_forward_artifacts is not None and os.environ.get("MVG_ARTIFACT_WEBHOOK_URL"):
+            spoken_reply, _ = lomin_forward_artifacts(raw_reply, spoken_reply)
+
+        if is_lomin_defer_enabled() and lomin_has_defer_marker is not None and get_lomin_pending_store is not None:
+            if lomin_has_defer_marker(raw_reply) or lomin_has_defer_marker(spoken_reply):
+                clean_ans = lomin_strip_defer_marker(spoken_reply) if lomin_strip_defer_marker else spoken_reply
+                get_lomin_pending_store().store(node_id=node_id, prompt=prompt, answer=clean_ans)
+                voice_srv.pending_answer_store.save_answer(
+                    node_id=node_id,
+                    session_id=session_id,
+                    prompt=prompt,
+                    spoken_text=clean_ans,
+                    full_text=raw_reply,
+                )
+
+        if lomin_strip_defer_marker is not None:
+            spoken_reply = lomin_strip_defer_marker(spoken_reply)
+
+        mic_reopen = is_lomin_mic_reopen_enabled()
+        expects = (
+            lomin_reply_expects_reply(spoken_reply)
+            if lomin_reply_expects_reply is not None
+            else spoken_reply.rstrip().endswith("?")
+        )
+
+        reply_payload: Dict[str, Any] = {"reply": spoken_reply, "transcript": res.get("transcript", prompt)}
+        done_payload: Dict[str, Any] = {"total_ms": int((time.monotonic() - t0) * 1000)}
+        if mic_reopen:
+            reply_payload["expects_reply"] = expects
+            done_payload["expects_reply"] = expects
+
+        if lomin_emit_turn_transcript is not None and (
+            os.environ.get("MVG_TRANSCRIPT_SINK_URL") or os.environ.get("MVG_TRANSCRIPT_LOG_PATH")
+        ):
+            tr_rec: Dict[str, Any] = {
+                "kind": "ask",
+                "endpoint": "/ask",
+                "node_id": node_id,
+                "prompt": prompt,
+                "transcript": res.get("transcript", prompt),
+                "reply": spoken_reply,
+                "outcome": "ok",
+                "total_ms": done_payload["total_ms"],
+                "timestamp": time.time(),
+            }
+            if mic_reopen:
+                tr_rec["expects_reply"] = expects
+            lomin_emit_turn_transcript(tr_rec)
+
+        async def _ask_sse():
+            yield build_sse_event("status", {"status": "thinking"})
+            yield build_sse_event("reply", reply_payload)
+            yield build_sse_event("done", done_payload)
+
+        return StreamingResponse(
+            _ask_sse(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    @app.post("/ask/stream")
+    async def lomin_ask_stream_endpoint(request: Request):
+        t0 = time.monotonic()
+        req, err = await _parse_json_or_empty_body(request)
+        if err is not None or req is None:
+            return JSONResponse(status_code=400, content={"error": err or "invalid JSON body"})
+
+        node_id = str(req.get("node_id") or req.get("node") or request.headers.get("x-node-id") or "gotchi-ryan-01").strip()
+        ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=node_id)
+        if not ok_auth:
+            return JSONResponse(status_code=auth_code, content=auth_err)
+
+        prompt = str(req.get("prompt") or "").strip()
+        session_id = str(req.get("session_id") or f"sess-{int(time.time() * 1000)}")
+        want_voice = req.get("voice") not in (False, 0, "false", "0") and req.get("tts") != "none"
+
+        turn_input = dict(req)
+        turn_input["node_id"] = node_id
+        turn_input["session_id"] = session_id
+        turn_input["prompt"] = prompt
+
+        res = await brain.handle_turn(turn_input)
+        raw_reply = str(res.get("raw_reply") or res.get("reply") or "")
+        spoken_reply = str(res.get("reply") or "")
+        if lomin_strip_defer_marker is not None:
+            spoken_reply = lomin_strip_defer_marker(spoken_reply)
+        sentences = list(res.get("sentences") or ([spoken_reply] if spoken_reply else []))
+
+        mic_reopen = is_lomin_mic_reopen_enabled()
+        expects = (
+            lomin_reply_expects_reply(spoken_reply)
+            if lomin_reply_expects_reply is not None
+            else spoken_reply.rstrip().endswith("?")
+        )
+
+        async def _ask_stream_sse():
+            yield build_sse_event("turn", {"turn_id": session_id})
+            yield build_sse_event("status", {"status": "thinking"})
+            for idx, sent in enumerate(sentences):
+                clean_s = lomin_strip_defer_marker(sent) if lomin_strip_defer_marker else sent
+                if not clean_s:
+                    continue
+                ev_data: Dict[str, Any] = {
+                    "text": clean_s,
+                    "index": idx,
+                    "is_final": idx == len(sentences) - 1,
+                }
+                if want_voice:
+                    try:
+                        pcm_bytes = await asyncio.to_thread(voice_srv._synthesize_sentence_pcm, clean_s)
+                        if pcm_bytes:
+                            ev_data["audio_b64"] = base64.b64encode(pcm_bytes).decode("ascii")
+                            ev_data["format"] = "pcm"
+                            ev_data["sample_rate"] = 24000
+                    except Exception:
+                        pass
+                yield build_sse_event("sentence", ev_data)
+
+            reply_payload: Dict[str, Any] = {
+                "reply": spoken_reply,
+                "raw_reply": raw_reply,
+                "transcript": res.get("transcript", prompt),
+            }
+            done_payload: Dict[str, Any] = {"total_ms": int((time.monotonic() - t0) * 1000)}
+            if mic_reopen:
+                reply_payload["expects_reply"] = expects
+                done_payload["expects_reply"] = expects
+            yield build_sse_event("reply", reply_payload)
+            yield build_sse_event("done", done_payload)
+
+        return StreamingResponse(
+            _ask_stream_sse(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    def _get_pending_for_node_sync(node_id: str, should_pop: bool = True) -> Dict[str, Any]:
+        clean_node = (node_id or "").strip()
+        item: Optional[Dict[str, Any]] = None
+        if get_lomin_pending_store is not None:
+            lomin_store = get_lomin_pending_store()
+            item = lomin_store.pop_for_node(clean_node) if should_pop else lomin_store.peek_for_node(clean_node)
+        if item is None:
+            gotchi_ans = voice_srv.pending_answer_store.get_latest_pending(node_id=clean_node)
+            if gotchi_ans:
+                item = {
+                    "id": gotchi_ans.get("answer_id", ""),
+                    "node_id": clean_node,
+                    "prompt": gotchi_ans.get("prompt", ""),
+                    "answer": gotchi_ans.get("spoken_text") or gotchi_ans.get("full_text") or "",
+                    "topic": gotchi_ans.get("topic", ""),
+                    "created_at": gotchi_ans.get("created_at", time.time()),
+                }
+                if should_pop:
+                    voice_srv.pending_answer_store.ack_answer(
+                        node_id=clean_node, answer_id=gotchi_ans.get("answer_id")
+                    )
+        has_pending = item is not None
+        return {
+            "status": "ok",
+            "node": clean_node,
+            "node_id": clean_node,
+            "has_pending": has_pending,
+            "pending": item,
+            "item": item,
+            "popped": bool(should_pop and has_pending),
+        }
+
+    @app.get("/voice/pending")
+    async def lomin_voice_pending_query_get(request: Request):
+        qs = request.query_params
+        node_id = (qs.get("node") or qs.get("node_id") or "").strip()
+        ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=node_id)
+        if not ok_auth:
+            return JSONResponse(status_code=auth_code, content=auth_err)
+        if not node_id:
+            return JSONResponse(status_code=400, content={"error": "node parameter required"})
+        pop_param = (qs.get("pop") or "1").lower()
+        peek_param = (qs.get("peek") or "0").lower()
+        should_pop = pop_param in ("1", "true", "yes") and peek_param not in ("1", "true", "yes")
+        return JSONResponse(status_code=200, content=_get_pending_for_node_sync(node_id, should_pop=should_pop))
+
+    @app.get("/voice/pending/{node_id}")
+    async def lomin_voice_pending_path_get(node_id: str, request: Request):
+        clean_node = (node_id or "").strip()
+        ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=clean_node)
+        if not ok_auth:
+            return JSONResponse(status_code=auth_code, content=auth_err)
+        qs = request.query_params
+        pop_param = (qs.get("pop") or "1").lower()
+        peek_param = (qs.get("peek") or "0").lower()
+        should_pop = pop_param in ("1", "true", "yes") and peek_param not in ("1", "true", "yes")
+        return JSONResponse(status_code=200, content=_get_pending_for_node_sync(clean_node, should_pop=should_pop))
+
+    @app.post("/voice/pending")
+    async def lomin_voice_pending_post(request: Request):
+        req, err = await _parse_json_or_empty_body(request)
+        if err is not None or req is None:
+            return JSONResponse(status_code=400, content={"error": err or "invalid JSON body"})
+        node_id = str(req.get("node_id") or req.get("node") or "").strip()
+        ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=node_id)
+        if not ok_auth:
+            return JSONResponse(status_code=auth_code, content=auth_err)
+        answer = str(req.get("answer") or "").strip()
+        prompt = str(req.get("prompt") or "").strip()
+        topic = str(req.get("topic") or "").strip()
+        if not node_id:
+            return JSONResponse(status_code=400, content={"error": "node_id required"})
+        if not answer:
+            return JSONResponse(status_code=400, content={"error": "answer required"})
+        item: Dict[str, Any] = {}
+        if get_lomin_pending_store is not None:
+            item = get_lomin_pending_store().store(node_id=node_id, prompt=prompt, answer=answer, topic=topic)
+        voice_srv.pending_answer_store.save_answer(
+            node_id=node_id,
+            session_id=f"pending-{int(time.time() * 1000)}",
+            prompt=prompt,
+            spoken_text=answer,
+            full_text=answer,
+            topic=topic,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ok", "stored": True, "pending": item, "item": item, "node": node_id},
+        )
+
+    @app.post("/v1/audio/speech")
+    async def lomin_audio_speech_endpoint(request: Request):
+        req, err = await _parse_json_or_empty_body(request)
+        if err is not None or req is None:
+            return JSONResponse(status_code=400, content={"error": err or "invalid JSON body"})
+        node_id = str(req.get("node") or req.get("node_id") or request.headers.get("x-node-id") or "").strip()
+        ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=node_id)
+        if not ok_auth:
+            return JSONResponse(status_code=auth_code, content=auth_err)
+
+        text = str(req.get("input") or req.get("text") or "").strip()
+        if lomin_strip_defer_marker is not None:
+            text = lomin_strip_defer_marker(text)
+        if not text:
+            return JSONResponse(status_code=400, content={"error": "input is required"})
+
+        resp_format = str(req.get("response_format") or "wav").strip().lower()
+        try:
+            pcm_bytes = await asyncio.to_thread(voice_srv._synthesize_sentence_pcm, text)
+        except Exception as exc:
+            return JSONResponse(status_code=502, content={"error": f"tts failed: {exc}"})
+
+        if resp_format == "pcm":
+            return Response(
+                content=pcm_bytes,
+                media_type="audio/pcm",
+                headers={"X-TTS-Engine": cfg.tts_engine or "gemini"},
+            )
+        if resp_format == "adpcm" and lomin_decode_adpcm_to_wav is not None:
+            try:
+                from vision_adpcm import encode_adpcm  # type: ignore
+
+                adpcm_bytes = encode_adpcm(pcm_bytes, sample_rate=24000)
+                return Response(
+                    content=adpcm_bytes,
+                    media_type="application/octet-stream",
+                    headers={"X-TTS-Engine": cfg.tts_engine or "gemini"},
+                )
+            except Exception:
+                pass
+
+        if lomin_pcm_to_wav is not None:
+            wav_bytes = lomin_pcm_to_wav(pcm_bytes, sample_rate=24000)
+        else:
+            from backend.ble_framing import _wrap_pcm_in_wav
+
+            wav_bytes = _wrap_pcm_in_wav(pcm_bytes, sample_rate=24000)
+
+        return Response(
+            content=wav_bytes,
+            media_type="audio/wav",
+            headers={"X-TTS-Engine": cfg.tts_engine or "gemini"},
+        )
 
     return app
 
@@ -2709,8 +3398,17 @@ def main() -> None:
         action="store_true",
         help="Run the unified Gotchi + Zero FastAPI gateway server",
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host for --serve (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8765, help="Bind port for --serve (default: 8765)")
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("MVG_BIND", "0.0.0.0"),
+        help="Bind host for --serve (default: MVG_BIND or 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("MVG_PORT", "8771")),
+        help="Bind port for --serve (default: MVG_PORT or 8771)",
+    )
     args = parser.parse_args()
 
     if args.stdin:
