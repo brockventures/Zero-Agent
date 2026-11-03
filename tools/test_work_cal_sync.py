@@ -226,6 +226,100 @@ class TestWorkCalSync(unittest.TestCase):
                 self.assertEqual(res_all["events"][1]["id"], "work_aa01cfd50d77c851")
                 self.assertEqual(res_all["events"][1]["calendar"], "Work (Ryan)")
 
+    def test_archive_work_cal_message_removes_inbox_unread_important(self):
+        captured_requests = []
+
+        def fake_urlopen(req, timeout=15):
+            captured_requests.append(req)
+            resp = MagicMock()
+            resp.status = 200
+            resp.read.return_value = b"{}"
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = False
+            return cm
+
+        with patch("tools.work_cal_sync.urllib.request.urlopen", side_effect=fake_urlopen):
+            ok = wcs.archive_work_cal_message("msg_123", tok="test_token", thread_id="thr_456")
+            self.assertTrue(ok)
+            self.assertEqual(len(captured_requests), 2)
+
+            msg_req, thr_req = captured_requests
+            self.assertEqual(msg_req.full_url, f"{wcs.GMAIL_BASE}/messages/msg_123/modify")
+            self.assertEqual(msg_req.get_method(), "POST")
+            self.assertEqual(msg_req.get_header("Authorization"), "Bearer test_token")
+            msg_body = json.loads(msg_req.data.decode("utf-8"))
+            self.assertEqual(msg_body, {"removeLabelIds": ["INBOX", "UNREAD", "IMPORTANT"]})
+
+            self.assertEqual(thr_req.full_url, f"{wcs.GMAIL_BASE}/threads/thr_456/modify")
+            self.assertEqual(thr_req.get_method(), "POST")
+            thr_body = json.loads(thr_req.data.decode("utf-8"))
+            self.assertEqual(thr_body, {"removeLabelIds": ["INBOX", "UNREAD", "IMPORTANT"]})
+
+    def test_sync_latest_from_gmail_ingests_newest_and_archives_all_matches(self):
+        payload = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-17T23:59:59-08:00",
+            "events": [
+                {
+                    "uid_hash": "ev_latest",
+                    "summary": "Newest Sync Event",
+                    "start": "2026-11-03T20:30:00-08:00",
+                    "end": "2026-11-03T21:30:00-08:00",
+                }
+            ],
+        }
+        b64_plain = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+        full_msg_1 = {
+            "id": "m1",
+            "threadId": "t1",
+            "payload": {
+                "mimeType": "text/plain",
+                "body": {"data": b64_plain},
+            },
+        }
+        listing_data = {
+            "messages": [
+                {"id": "m1", "threadId": "t1"},
+                {"id": "m2", "threadId": "t2"},
+            ]
+        }
+
+        captured_urls = []
+
+        def fake_urlopen(req, timeout=15):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            captured_urls.append((req.get_method(), url))
+            resp = MagicMock()
+            resp.status = 200
+            if "/messages?q=" in url:
+                resp.read.return_value = json.dumps(listing_data).encode("utf-8")
+            elif "/messages/m1?format=full" in url:
+                resp.read.return_value = json.dumps(full_msg_1).encode("utf-8")
+            else:
+                resp.read.return_value = b"{}"
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = False
+            return cm
+
+        with patch("tools.zero_mail_listener.get_access_token", return_value="tok_abc"), \
+             patch("tools.work_cal_sync.urllib.request.urlopen", side_effect=fake_urlopen):
+            state = wcs.sync_latest_from_gmail(state_path=self.state_path)
+            self.assertIsNotNone(state)
+            self.assertEqual(len(state["events"]), 1)
+            self.assertEqual(state["events"][0]["uid_hash"], "ev_latest")
+
+            # Verify maxResults=20 in listing query and both m1 and m2 (and t1, t2) were modified
+            self.assertTrue(any("maxResults=20" in u for _, u in captured_urls))
+            self.assertIn(("POST", f"{wcs.GMAIL_BASE}/messages/m1/modify"), captured_urls)
+            self.assertIn(("POST", f"{wcs.GMAIL_BASE}/threads/t1/modify"), captured_urls)
+            self.assertIn(("POST", f"{wcs.GMAIL_BASE}/messages/m2/modify"), captured_urls)
+            self.assertIn(("POST", f"{wcs.GMAIL_BASE}/threads/t2/modify"), captured_urls)
+
 
 if __name__ == "__main__":
     unittest.main()

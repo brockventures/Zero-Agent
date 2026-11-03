@@ -153,11 +153,12 @@ except ImportError:
         process_github_email_doorbell = None
 
 try:
-    from tools.work_cal_sync import ingest_work_cal_message
+    from tools.work_cal_sync import archive_work_cal_message, ingest_work_cal_message
 except ImportError:
     try:
-        from work_cal_sync import ingest_work_cal_message
+        from work_cal_sync import archive_work_cal_message, ingest_work_cal_message
     except ImportError:
+        archive_work_cal_message = None
         ingest_work_cal_message = None
 
 def sanitize_text(text: str, max_len: int = 150) -> str:
@@ -483,7 +484,12 @@ def run_loop():
                                                 ingest_work_cal_message(full_data)
                                         except Exception as wc_err:
                                             log(f"Work calendar sync ingestion error for {mid}: {wc_err}")
-                                    log(f"Silently ingested automated [WORK-CAL-SYNC] email ({mid}); suppressing Discord alert.")
+                                    if archive_work_cal_message:
+                                        try:
+                                            archive_work_cal_message(mid, tok=tok, thread_id=m_data.get("threadId"))
+                                        except Exception as arch_err:
+                                            log(f"Work calendar sync archive error for {mid}: {arch_err}")
+                                    log(f"Silently ingested and archived automated [WORK-CAL-SYNC] email ({mid}); suppressing Discord alert.")
                                 else:
                                     human_payloads.append((mid, m_data, from_addr))
                         except Exception:
@@ -546,11 +552,14 @@ def start_daemon_background() -> bool:
     log_fp = open(LOG_FILE, "a")
     proc = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "run"],
+        stdin=subprocess.DEVNULL,
         stdout=log_fp,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        close_fds=True,
         cwd="/workspace"
     )
+    log_fp.close()
 
     # Verify process started
     for _ in range(20):
@@ -602,7 +611,7 @@ def ensure_mail_listener_running() -> bool:
     return start_daemon_background()
 
 if __name__ == "__main__":
-    cmd = sys.argv[1].lower() if len(sys.argv) > 1 else "status"
+    cmd = sys.argv[1].lower().lstrip("-") if len(sys.argv) > 1 else "status"
     if cmd == "run":
         run_loop()
     elif cmd == "start":

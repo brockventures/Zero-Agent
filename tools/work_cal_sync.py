@@ -315,8 +315,54 @@ def get_cached_work_events(
     return results
 
 
+def archive_work_cal_message(
+    mid: str,
+    tok: str | None = None,
+    thread_id: str | None = None,
+) -> bool:
+    """Remove INBOX, UNREAD, and IMPORTANT labels from a [WORK-CAL-SYNC] message (and thread)."""
+    if not mid:
+        return False
+    if tok is None:
+        repo_root = Path(__file__).resolve().parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        try:
+            from tools.zero_mail_listener import get_access_token
+        except ImportError:
+            from zero_mail_listener import get_access_token
+        tok = get_access_token()
+
+    body = json.dumps({"removeLabelIds": ["INBOX", "UNREAD", "IMPORTANT"]}).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {tok}",
+        "Content-Type": "application/json",
+    }
+    ok = False
+    try:
+        mod_url = f"{GMAIL_BASE}/messages/{mid}/modify"
+        mod_req = urllib.request.Request(mod_url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(mod_req, timeout=TIMEOUT) as resp:
+            ok = resp.status in (200, 204) or True
+    except Exception:
+        return False
+
+    if thread_id:
+        try:
+            t_url = f"{GMAIL_BASE}/threads/{thread_id}/modify"
+            t_req = urllib.request.Request(t_url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(t_req, timeout=TIMEOUT):
+                pass
+        except Exception:
+            pass
+
+    return ok
+
+
 def sync_latest_from_gmail(state_path: Path | None = None) -> dict | None:
-    """Fetch the latest subject:\"[WORK-CAL-SYNC]\" message from Gmail and ingest it."""
+    """Fetch recent subject:\"[WORK-CAL-SYNC]\" messages from Gmail, ingest the newest valid payload,
+    and archive/mark read all matching [WORK-CAL-SYNC] messages.
+    """
     repo_root = Path(__file__).resolve().parent.parent
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
@@ -327,24 +373,30 @@ def sync_latest_from_gmail(state_path: Path | None = None) -> dict | None:
 
     tok = get_access_token()
     query = urllib.parse.quote('subject:"[WORK-CAL-SYNC]"')
-    list_url = f"{GMAIL_BASE}/messages?q={query}&maxResults=5"
+    list_url = f"{GMAIL_BASE}/messages?q={query}&maxResults=20"
     req = urllib.request.Request(list_url, headers={"Authorization": f"Bearer {tok}"})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
         listing = json.loads(resp.read().decode("utf-8"))
 
     messages = listing.get("messages", [])
+    ingested_state: dict | None = None
     for m in messages:
         mid = m.get("id")
         if not mid:
             continue
-        msg_url = f"{GMAIL_BASE}/messages/{mid}?format=full"
-        msg_req = urllib.request.Request(msg_url, headers={"Authorization": f"Bearer {tok}"})
-        with urllib.request.urlopen(msg_req, timeout=TIMEOUT) as msg_resp:
-            m_data = json.loads(msg_resp.read().decode("utf-8"))
-        payload = extract_work_cal_json_from_message(m_data)
-        if payload:
-            return ingest_work_cal_payload(payload, state_path=state_path)
-    return None
+        thread_id = m.get("threadId")
+        if ingested_state is None:
+            msg_url = f"{GMAIL_BASE}/messages/{mid}?format=full"
+            msg_req = urllib.request.Request(msg_url, headers={"Authorization": f"Bearer {tok}"})
+            with urllib.request.urlopen(msg_req, timeout=TIMEOUT) as msg_resp:
+                m_data = json.loads(msg_resp.read().decode("utf-8"))
+            if not thread_id:
+                thread_id = m_data.get("threadId")
+            payload = extract_work_cal_json_from_message(m_data)
+            if payload:
+                ingested_state = ingest_work_cal_payload(payload, state_path=state_path)
+        archive_work_cal_message(mid, tok=tok, thread_id=thread_id)
+    return ingested_state
 
 
 def main(argv: list[str] | None = None) -> int:
