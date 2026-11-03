@@ -28,7 +28,6 @@ from tools.gotchi_zero_adapter import (
     build_thinking_config,
     clean_spoken_text_for_tts,
     create_zero_gotchi_app,
-    delegate_coding_task_to_zero_chat,
     execute_gotchi_tool_call,
     extract_and_forward_artifacts_to_zero_chat,
     is_allowed_voice_read_path,
@@ -59,11 +58,11 @@ def test_clean_spoken_text_for_tts():
 
 def test_select_thinking_budget_and_fast_memory_prefetch():
     assert DEFAULT_GOTCHI_MODEL == "gemini-3.8-flash"
-    # Tier 1: Step 0 and Step 1 default to LOW / 0
+    # Tier 1: Step 0 and Step 1 default to LOW / 128 -> 256
     assert select_thinking_level("How warm is the garage?", step=0) == "LOW"
     assert select_thinking_level("Summarize the memory lookup", step=1) == "LOW"
-    assert select_thinking_budget("How warm is the garage?", step=0) == 0
-    assert select_thinking_budget("Summarize the memory lookup", step=1) == 0
+    assert select_thinking_budget("How warm is the garage?", step=0) == 128
+    assert select_thinking_budget("Summarize the memory lookup", step=1) == 256
 
     # Tier 2: Escalates to MEDIUM / 512 on tool error, Step 2+, or 5-frame camera burst
     assert select_thinking_level("Retry after error", step=1, tool_had_error=True) == "MEDIUM"
@@ -113,45 +112,16 @@ def test_select_thinking_budget_and_fast_memory_prefetch():
     assert elapsed_ms < 50.0
 
 
-def test_build_gotchi_zero_system_prompt_shares_zero_voice_context(monkeypatch):
+def test_build_gotchi_zero_system_prompt_shares_zero_voice_context():
     prompt = build_gotchi_zero_system_prompt("What is on my task list?", has_vision=True)
     assert "GOTCHI & ZERO-VOICE UNIFIED PERSONA INVARIANTS" in prompt
     assert "Schedar" in prompt
     assert "live camera snapshot or 5-frame burst" in prompt
     assert "post_note_to_zero_chat" in prompt
-    assert "delegate_coding_task_to_zero_chat" in prompt
     assert "request_deep_thinking(spoken_preamble, reason)" in prompt
     assert "PRE-TOOL SPOKEN PREAMBLE" in prompt
-    assert "ZERO CORE OPERATIONAL REFERENCE (/workspace/GEMINI.md)" not in prompt
-
-    queued_turns: List[Any] = []
-    monkeypatch.setattr(
-        "tools.gotchi_zero_adapter.outbox.queue_agent_turn",
-        lambda channel, prompt, job_name="Detached Task Synthesis", force=False: (
-            queued_turns.append((channel, prompt, job_name, force))
-            or {"id": "outbox-turn-123", "status": "queued"}
-        ),
-    )
-    res = asyncio.run(
-        execute_gotchi_tool_call(
-            "delegate_coding_task_to_zero_chat",
-            {
-                "task_summary": "Add battery percentage overlay to the Gotchi sleep screen",
-                "spoken_preamble": "Passing that to Zero-Chat to spec and build.",
-                "context_notes": "Display in top-right corner of 200x200 e-paper.",
-            },
-        )
-    )
-    assert res["ok"] is True
-    assert res["status"] == "delegated_to_argon_in_zero_chat"
-    assert res["outbox_id"] == "outbox-turn-123"
-    assert len(queued_turns) == 1
-    assert queued_turns[0][0] == "zero-chat"
-    assert "Add battery percentage overlay" in queued_turns[0][1]
-    assert queued_turns[0][3] is True
-
-    empty_res = delegate_coding_task_to_zero_chat("")
-    assert empty_res["ok"] is False
+    assert "ZERO CORE OPERATIONAL REFERENCE (/workspace/GEMINI.md)" in prompt
+    assert "ZERO MANDATORY OPERATIONAL RULES (/workspace/.agents/rules/*.md)" in prompt
 
 
 def test_voice_security_gate_and_realpath_read_allowlist(monkeypatch, tmp_path):
@@ -744,6 +714,7 @@ def test_direct_audio_race_both_arrival_orders_and_ghost_filter():
 
     class FastTranscriber:
         llm_config = None
+        local_transcriber = True
 
         def transcribe(self, _wav_bytes: bytes) -> str:
             time.sleep(0.01)
@@ -781,7 +752,7 @@ def test_direct_audio_race_both_arrival_orders_and_ghost_filter():
     )
     adapter1._run_gemini_with_tools = slow_gemini
     streamed1: List[str] = []
-    wav = wrap_pcm16_to_wav(b"\x18\x00" * 8000)
+    wav = wrap_pcm16_to_wav(b"\x18\x01" * 8000)
     res1 = asyncio.run(
         adapter1.handle_turn(
             {
@@ -802,6 +773,7 @@ def test_direct_audio_race_both_arrival_orders_and_ghost_filter():
 
     class SlowTranscriber:
         llm_config = None
+        local_transcriber = True
 
         def transcribe(self, _wav_bytes: bytes) -> str:
             time.sleep(0.08)
@@ -877,9 +849,8 @@ def test_direct_audio_race_both_arrival_orders_and_ghost_filter():
 
 def test_image_inspection_spoken_filler_and_burst_turn(monkeypatch):
     """
-    Verifies that handle_turn and _run_gemini_with_tools emit an immediate spoken
-    filler at T=0ms via _on_sentence when image_bytes or burst_images are present,
-    eliminating dead silence before Gemini vision completes.
+    Verifies that handle_turn and _run_gemini_with_tools process image_bytes and
+    burst_images cleanly via _on_sentence.
     """
     for mod_name in ("backend.gotchi_zero_adapter", "tools.gotchi_zero_adapter"):
         try:
@@ -888,25 +859,15 @@ def test_image_inspection_spoken_filler_and_burst_turn(monkeypatch):
         except Exception:
             pass
 
-    # 1. Unit test helper build_image_inspection_filler
-    try:
-        from backend.gotchi_zero_adapter import (
-            GotchiZeroBrainAdapter as AdapterCls,
-            build_image_inspection_filler,
-        )
-    except (ImportError, AttributeError):
-        from tools.gotchi_zero_adapter import (
-            GotchiZeroBrainAdapter as AdapterCls,
-            build_image_inspection_filler,
-        )
+    from tools.gotchi_zero_adapter import (
+        GotchiZeroBrainAdapter as AdapterCls,
+        build_contextual_tool_filler,
+    )
 
-    single_filler = build_image_inspection_filler(prompt="", burst_count=0)
-    assert any(w in single_filler.lower() for w in ["snapshot", "captured", "photo", "image"])
+    single_filler = build_contextual_tool_filler("read_local_file", {"path": "snapshot.jpg"}, "check snapshot")
+    assert any(w in single_filler.lower() for w in ["snapshot", "picture", "image"])
 
-    burst_filler = build_image_inspection_filler(prompt="", burst_count=5)
-    assert any(w in burst_filler.lower() for w in ["burst", "shots", "frames"])
-
-    # 2. Test handle_turn with image_bytes emits the filler via _on_sentence
+    # 2. Test handle_turn with image_bytes streams sentences via _on_sentence
     class FakeChunk:
         def __init__(self, text: str = ""):
             self.text = text
@@ -940,13 +901,11 @@ def test_image_inspection_spoken_filler_and_burst_turn(monkeypatch):
         )
     )
 
-    assert len(streamed_sentences) >= 2
-    assert any(w in streamed_sentences[0].lower() for w in ["snapshot", "captured", "photo", "image"])
-    assert "coffee mug" in streamed_sentences[1].lower()
-    assert res["sentences"][0] == streamed_sentences[0]
+    assert len(streamed_sentences) >= 1
+    assert "coffee mug" in streamed_sentences[-1].lower()
     assert "coffee mug" in res["reply"].lower()
 
-    # 3. Test handle_turn with burst_images emits the burst filler via _on_sentence
+    # 3. Test handle_turn with burst_images streams sentences via _on_sentence
     burst_streamed: List[str] = []
     res_burst = asyncio.run(
         adapter.handle_turn(
@@ -958,9 +917,208 @@ def test_image_inspection_spoken_filler_and_burst_turn(monkeypatch):
             }
         )
     )
-    assert len(burst_streamed) >= 2
-    assert any(w in burst_streamed[0].lower() for w in ["burst", "shots", "frames"])
-    assert "coffee mug" in burst_streamed[1].lower()
+    assert len(burst_streamed) >= 1
+    assert "coffee mug" in burst_streamed[-1].lower()
+    assert "coffee mug" in res_burst["reply"].lower()
+
+
+def test_lomin_env_and_dual_flag_aliases(monkeypatch):
+    env_path = Path(_REPO_ROOT) / "config" / "lomin.env"
+    if not env_path.is_file():
+        env_path = Path("/workspace/config/lomin.env")
+    assert env_path.is_file()
+    content = env_path.read_text(encoding="utf-8")
+    for expected_line in (
+        "MVG_PORT=8771",
+        "GOTCHI_ZERO_MODEL=gemini-3.8-flash",
+        "MVG_ENABLE_VISION=1",
+        "MVG_VISION_ENABLED=1",
+        "MVG_ENABLE_ADPCM=1",
+        "MVG_ADPCM_ENABLED=1",
+        "MVG_HA_FASTPATH=1",
+        "MVG_HA_ENABLED=1",
+        "MVG_ENABLE_MIC_REOPEN=1",
+        "MVG_MIC_REOPEN_ENABLED=1",
+        "MVG_ENABLE_DEFER=1",
+        "MVG_DEFER_ENABLED=1",
+    ):
+        assert expected_line in content
+
+    from tools.gotchi_zero_adapter import (
+        is_lomin_adpcm_enabled,
+        is_lomin_defer_enabled,
+        is_lomin_direct_audio_enabled,
+        is_lomin_ha_fastpath_enabled,
+        is_lomin_mic_reopen_enabled,
+        is_lomin_vision_enabled,
+    )
+
+    for k in (
+        "MVG_ENABLE_VISION",
+        "MVG_VISION_ENABLED",
+        "MVG_VISION_ADPCM",
+        "MVG_ENABLE_ADPCM",
+        "MVG_ADPCM_ENABLED",
+        "MVG_BRAIN_DIRECT_AUDIO",
+        "MVG_DIRECT_AUDIO",
+        "MVG_HA_FASTPATH",
+        "MVG_HA_ENABLED",
+        "HA_CONVERSATION_ENABLED",
+        "GOTCHI_HA_CONVERSATION_ENABLED",
+        "MVG_ENABLE_MIC_REOPEN",
+        "MVG_MIC_REOPEN_ENABLED",
+        "MVG_ENABLE_DEFER",
+        "MVG_DEFER_ENABLED",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+    assert is_lomin_vision_enabled() is False
+    monkeypatch.setenv("MVG_VISION_ENABLED", "1")
+    assert is_lomin_vision_enabled() is True
+    monkeypatch.delenv("MVG_VISION_ENABLED")
+    monkeypatch.setenv("MVG_ENABLE_VISION", "1")
+    assert is_lomin_vision_enabled() is True
+
+    assert is_lomin_adpcm_enabled() is False
+    monkeypatch.setenv("MVG_ADPCM_ENABLED", "1")
+    assert is_lomin_adpcm_enabled() is True
+    monkeypatch.delenv("MVG_ADPCM_ENABLED")
+    monkeypatch.setenv("MVG_ENABLE_ADPCM", "1")
+    assert is_lomin_adpcm_enabled() is True
+
+    assert is_lomin_direct_audio_enabled() is False
+    monkeypatch.setenv("MVG_DIRECT_AUDIO", "1")
+    assert is_lomin_direct_audio_enabled() is True
+
+    assert is_lomin_ha_fastpath_enabled() is False
+    monkeypatch.setenv("MVG_HA_FASTPATH", "1")
+    assert is_lomin_ha_fastpath_enabled() is True
+    monkeypatch.delenv("MVG_HA_FASTPATH")
+    monkeypatch.setenv("MVG_HA_ENABLED", "1")
+    assert is_lomin_ha_fastpath_enabled() is True
+
+    assert is_lomin_mic_reopen_enabled() is False
+    monkeypatch.setenv("MVG_MIC_REOPEN_ENABLED", "1")
+    assert is_lomin_mic_reopen_enabled() is True
+
+    assert is_lomin_defer_enabled() is False
+    monkeypatch.setenv("MVG_DEFER_ENABLED", "1")
+    assert is_lomin_defer_enabled() is True
+
+
+def test_resolve_live_gemini_model_never_downgrades_to_25_flash():
+    adapter = GotchiZeroBrainAdapter(api_key="fake-key", dispatch_discord=False)
+    assert adapter.model == "gemini-3.8-flash"
+    assert adapter._resolve_live_gemini_model() == "gemini-3.8-flash"
+    assert "2.5-flash" not in adapter._resolve_live_gemini_model()
+
+
+def test_load_full_zero_persona_and_rules_in_voice_prompt():
+    from tools.gotchi_zero_adapter import _load_full_zero_persona_and_rules
+
+    block = _load_full_zero_persona_and_rules()
+    assert "ZERO CORE OPERATIONAL REFERENCE (/workspace/GEMINI.md)" in block
+    assert "ZERO MANDATORY OPERATIONAL RULES (/workspace/.agents/rules/*.md)" in block
+    assert "RULE:" in block
+
+    prompt = build_gotchi_zero_system_prompt("Check status", has_vision=False)
+    assert "ZERO CORE OPERATIONAL REFERENCE (/workspace/GEMINI.md)" in prompt
+    assert "ZERO MANDATORY OPERATIONAL RULES (/workspace/.agents/rules/*.md)" in prompt
+
+
+def test_resolve_lomin_client_lockout_key_and_redteam_routes(monkeypatch):
+    from tools.gotchi_zero_adapter import (
+        resolve_lomin_client_lockout_key,
+        shutdown_lomin_background_workers,
+    )
+
+    # 1. Proxy-safe client lockout key isolates distinct tokens/IPs behind 127.0.0.1
+    k_bad_tok = resolve_lomin_client_lockout_key(
+        {"Authorization": "Bearer bad-token-1"}, client_host="127.0.0.1"
+    )
+    k_good_tok = resolve_lomin_client_lockout_key(
+        {"Authorization": "Bearer good-token-2"}, client_host="127.0.0.1"
+    )
+    k_xff_a = resolve_lomin_client_lockout_key(
+        {"X-Forwarded-For": "198.51.100.10"}, client_host="127.0.0.1"
+    )
+    k_xff_b = resolve_lomin_client_lockout_key(
+        {"X-Forwarded-For": "198.51.100.20"}, client_host="127.0.0.1"
+    )
+    assert k_bad_tok != k_good_tok
+    assert k_xff_a != k_xff_b
+    assert k_bad_tok != k_xff_a
+
+    # 2. Lomin native routes (/ask, /ask/stream, /voice/pending, /voice/turn, /v1/audio/speech)
+    # and empty body fallback
+    monkeypatch.setenv("MVG_ENABLE_DEFER", "1")
+    monkeypatch.setenv("MVG_ENABLE_MIC_REOPEN", "1")
+
+    def fake_llm(turn: Dict[str, Any]) -> Dict[str, Any]:
+        return {"reply": "All systems nominal. Would you like details?"}
+
+    adapter = GotchiZeroBrainAdapter(llm_caller=fake_llm, dispatch_discord=False)
+    app = create_zero_gotchi_app(adapter=adapter)
+    client = TestClient(app)
+
+    # Empty body on /ask and /voice/pending does not raise 500 JSONDecodeError
+    empty_ask = client.post("/ask", content=b"")
+    assert empty_ask.status_code == 200
+    assert "event: reply" in empty_ask.text
+
+    empty_pending = client.post("/voice/pending", content=b"")
+    assert empty_pending.status_code == 400
+    assert empty_pending.json()["error"] == "node_id required"
+
+    # /ask sets expects_reply when mic reopen is enabled and reply ends with '?'
+    ask_resp = client.post(
+        "/ask",
+        json={"node_id": "gotchi-lomin-01", "prompt": "Status check"},
+    )
+    assert ask_resp.status_code == 200
+    assert "expects_reply" in ask_resp.text
+
+    # Store pending item via Lomin pending store and retrieve via /voice/pending/{node_id}
+    from pending_and_auth import get_pending_store  # type: ignore
+
+    get_pending_store().store(
+        node_id="gotchi-lomin-01",
+        prompt="Please defer this check",
+        answer="Checking the build queue now.",
+    )
+    pend_get = client.get("/voice/pending/gotchi-lomin-01")
+    assert pend_get.status_code == 200
+    pend_data = pend_get.json()
+    assert pend_data["has_pending"] is True
+    assert "Checking the build queue now." in pend_data["pending"]["answer"]
+
+    # /ask/stream emits sentence and reply SSE events
+    stream_resp = client.post(
+        "/ask/stream",
+        json={"node_id": "gotchi-lomin-01", "prompt": "Status check", "voice": False},
+    )
+    assert stream_resp.status_code == 200
+    assert "event: sentence" in stream_resp.text
+    assert "event: done" in stream_resp.text
+
+    # /voice/turn supports JSON body
+    vt_resp = client.post(
+        "/voice/turn",
+        json={"node_id": "gotchi-lomin-01", "prompt": "Quick turn check"},
+    )
+    assert vt_resp.status_code == 200
+    assert "event: done" in vt_resp.text
+
+    # /v1/audio/speech returns WAV audio
+    tts_resp = client.post(
+        "/v1/audio/speech",
+        json={"input": "Zero voice online.", "response_format": "wav"},
+    )
+    assert tts_resp.status_code == 200
+    assert tts_resp.content[:4] == b"RIFF"
+
+    assert shutdown_lomin_background_workers(timeout_s=0.5) is True
+
 
 
 
