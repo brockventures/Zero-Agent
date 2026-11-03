@@ -5,10 +5,13 @@ import sys
 import json
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_TOOLS_DIR = os.path.join(_REPO_ROOT, "tools")
 _HOOKS_DIR = os.path.join(_REPO_ROOT, ".agents", "hooks")
 if "/workspace" in sys.path:
     sys.path.remove("/workspace")
 sys.path.insert(0, _HOOKS_DIR if os.path.isdir(_HOOKS_DIR) else "/workspace/.agents/hooks")
+if os.path.isfile(os.path.join(_TOOLS_DIR, "batch_guard.py")):
+    sys.path.insert(0, _TOOLS_DIR)
 sys.path.insert(0, _REPO_ROOT)
 from batch_guard import (
     STATE_FILE,
@@ -1411,6 +1414,68 @@ def test_forge_enqueue_exempt_from_prior_job_start_post_offload_lock(tmp_path):
         )
         assert ok_enq2 is False
         assert "FORGE Post-Offload Turn Lock Triggered" in r_enq2
+
+
+def test_crab_cavern_airgap_guard_directs_propose_to_zero_chat(tmp_path):
+    from unittest.mock import patch
+    import importlib.util
+
+    bp_path = os.path.join(_REPO_ROOT, "tools", "bridge_prompts.py")
+    spec = importlib.util.spec_from_file_location("bridge_prompts", bp_path)
+    bp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bp)
+
+    assert "1542081375287640084" in bp.get_crab_cavern_escalation_directive()
+    assert "forge.py propose --channel 1542081375287640084" in bp.CRAB_CAVERN_HOMELAB_ESCALATION_DIRECTIVE
+    assert "forge.py propose --channel 1542081375287640084" in bp.CRAB_CAVERN_AIRGAP_RULE_TEXT
+    assert "forge.py propose --channel 1542081375287640084" in bp.load_crab_cavern_system_prompt()
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": "", "DISCORD_CHANNEL_ID": "1534452820995080192"}):
+        state_file = str(tmp_path / "bg_state_cc_airgap.json")
+        in_flight = tmp_path / "in_flight_cc.json"
+        in_flight.write_text(json.dumps({"channel_id": 1534452820995080192, "prompt": "restart plex on host 1"}))
+
+        # 1. SSH / NAS command in Crab Cavern is blocked and directs staging a #zero-chat Decision Card via forge.py propose --post
+        ok_ssh, reason_ssh = check_tool_use(
+            "run_command",
+            {"CommandLine": "ssh testuser@NasHost01 'docker restart plex'"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            cwd="/workspace",
+        )
+        assert ok_ssh is False
+        assert "Crab Cavern Air-Gap Sandbox Guard Triggered" in reason_ssh
+        assert "forge.py propose --channel 1542081375287640084" in reason_ssh
+        assert "--post" in reason_ssh
+
+        # 2. Reading /secrets/ or private memory in Crab Cavern is blocked with the same #zero-chat Decision Card directive
+        ok_sec, reason_sec = check_tool_use(
+            "read_file",
+            {"Path": "/secrets/env.json"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            cwd="/workspace",
+        )
+        assert ok_sec is False
+        assert "forge.py propose --channel 1542081375287640084" in reason_sec
+        assert "--post" in reason_sec
+
+        # 3. Staging the Decision Card itself via forge.py propose --channel 1542081375287640084 ... --post is allowed
+        ok_prop, reason_prop = check_tool_use(
+            "run_command",
+            {
+                "CommandLine": (
+                    'python3 /workspace/tools/forge.py propose --channel 1542081375287640084 '
+                    '--category "homelab_action" --title "Restart Plex" --summary "Restart Plex on Host 1" '
+                    '--handler "shell_cmd" --payload \'{"command": "ssh testuser@NasHost01 docker restart plex"}\' --post'
+                )
+            },
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            cwd="/workspace",
+        )
+        assert ok_prop is True, f"Expected forge.py propose to be allowed in Crab Cavern, got: {reason_prop}"
+
 
 
 

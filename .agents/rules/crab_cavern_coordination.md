@@ -40,3 +40,13 @@ description: >-
 - **Identical Standards to Home Channels:** Crab Cavern channels (`#gotchi`, `#gotchi-chat`, `#side-project`, `#debug-huddle`, `#the-banana-stand`) enforce the exact same `#forge` (`1562899941595160657`) build routing rules as Ryan's Home channels, gated strictly on **Execution Loop & Verification Cost** rather than raw file count:
   - **Stay Inline (Tier 1 Fast-Path — `<= 3 Tool Steps` & `< 45s` Total):** Only when exact target lines are already known, verification is a fast local lint/unit check (`< 15s`), and the entire edit + test + commit/PR finishes in **2–3 tool calls**.
   - **Dispatch to `#forge` (Tier 2/3 — Everything Else, Even 1 File):** Any task requiring a compiled toolchain (e.g. ESP32 PlatformIO C++ firmware builds), hardware/OTA flash, Docker build, CAD render, `> 15s` benchmark/test sweep, writing a new test suite, iterative edit-test-fix loops (`4+ tool steps` or `> 45s`), or cross-module changes MUST be enqueued to `#forge` via `python3 /workspace/tools/forge.py enqueue <plan.json>` (setting `origin_channel_id` to the active Crab Cavern channel so FORGE wakes the room upon completion) or launched as a background job via `python3 /workspace/tools/forge.py job start`. Never block interactive Crab Cavern turns with multi-minute inline compile/test/OTA loops.
+
+## 7. Homelab / NAS Action Escalation via 1-Click `#zero-chat` Decision Cards (Never Ask Ryan to Re-Prompt)
+- **Zero Re-Prompt Friction:** Whenever a request in Crab Cavern requires a private homelab, NAS (Host 1 / Host 2), SSH, Docker, or Home Assistant action that is air-gapped from shared channels, Zero **MUST NEVER** ask Ryan to re-prompt, copy-paste, or manually repeat the request in `#zero-chat`.
+- **Immediate Cross-Channel Decision Card Staging:** Instead, Zero must immediately stage a 1-click Decision Card directly to `#zero-chat` (`1542081375287640084`) on the spot via:
+  ```bash
+  python3 /workspace/tools/forge.py propose --channel 1542081375287640084 --category "homelab_action" --title "<Action Title>" --summary "<Context & Exact Action>" --handler "<handler_type>" --payload '<json_payload>' --post
+  ```
+  *(or `stage-decision --channel-id 1542081375287640084 ... --post`)*.
+- **Clean Crab Cavern Acknowledgment:** After staging the card to `#zero-chat`, reply briefly in the Crab Cavern channel confirming that a 1-click approval Decision Card has been staged in `<#1542081375287640084>` for Ryan to approve with a single tap (without leaking any private homelab IPs, paths, or credentials in the shared channel).
+
