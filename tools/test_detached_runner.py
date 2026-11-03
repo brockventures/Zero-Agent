@@ -3,21 +3,23 @@
 test_detached_runner.py - Unit tests for detached_runner failure-only notifications and task lifecycle.
 """
 
-import json
-import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+elif sys.path[0] != _REPO_ROOT:
+    sys.path.remove(_REPO_ROOT)
+    sys.path.insert(0, _REPO_ROOT)
+
 from tools.detached_runner import (
-    start_task,
-    get_task_status,
-    cancel_task,
     _run_worker,
     _write_meta,
     _read_meta,
-    _format_duration,
 )
 
 
@@ -177,16 +179,15 @@ class TestDetachedRunner(unittest.TestCase):
         with patch("subprocess.Popen", return_value=mock_proc):
             _run_worker(task_id)
 
-        # Verification: Outbox notification MUST be sent on failure
+        # Verification: Outbox notification MUST be sent on failure (as agent synthesis turn by default)
         mock_queue.assert_called_once()
         args, kwargs = mock_queue.call_args
         content = kwargs.get("content") or args[1]
-        self.assertIn("❌ **Background Task Failed: DB Migration**", content)
+        msg_type = kwargs.get("msg_type") or "text"
+        self.assertIn("[SYSTEM NOTIFICATION: DETACHED TASK FAILED]", content)
+        self.assertIn("Task Name: DB Migration", content)
         self.assertIn("Exit Code: 1", content)
-        self.assertIn("Connection to database failed", content)
-        # Runner banner line must be filtered out
-        self.assertNotIn("--- [Detached Runner] Started at", content)
-        self.assertIn("• *Inspect full logs:* `python3 /workspace/tools/detached_runner.py logs dt-test-failure-alert`", content)
+        self.assertEqual(msg_type, "agent_turn")
 
     @patch("tools.outbox.queue_outbox_message")
     def test_timeout_always_sends_alert(self, mock_queue):
@@ -219,11 +220,15 @@ class TestDetachedRunner(unittest.TestCase):
         with patch("subprocess.Popen", return_value=mock_proc), patch("os.killpg"):
             _run_worker(task_id)
 
-        # Verification: Timeout notification MUST be sent
+        # Verification: Timeout notification MUST be sent (as agent synthesis turn by default)
         mock_queue.assert_called_once()
         args, kwargs = mock_queue.call_args
         content = kwargs.get("content") or args[1]
-        self.assertIn("⏱️ **Background Task Timed Out: Infinite Test** (Limit: 5s)", content)
+        msg_type = kwargs.get("msg_type") or "text"
+        self.assertIn("[SYSTEM NOTIFICATION: DETACHED TASK TIMED OUT]", content)
+        self.assertIn("Task Name: Infinite Test", content)
+        self.assertIn("Exit Code: -99", content)
+        self.assertEqual(msg_type, "agent_turn")
 
 
 if __name__ == "__main__":

@@ -1824,19 +1824,22 @@ def test_uppercase_status_and_stuck_running_embed_sweep(tmp_path, monkeypatch):
 def test_short_job_suppresses_forge_widget_until_90s(tmp_path, monkeypatch):
     import tools.forge as forge
 
+    assert forge.JOB_WIDGET_MIN_DURATION_SECONDS == 0.0
+
     db_p = tmp_path / "forge.db"
     forge.init_forge_db(db_p)
     monkeypatch.setattr(forge, "FORGE_DB_PATH", db_p)
     monkeypatch.setattr(forge, "TASKS_DIR", tmp_path / "detached_tasks")
     monkeypatch.setattr(forge, "_is_prod_forge_env", lambda *a, **kw: True)
     monkeypatch.setattr(forge, "sync_forge_channel_header", lambda *a, **kw: None)
-    monkeypatch.setattr(forge, "prune_completed_job_widgets", lambda *a, **kw: [])
+    prune_calls = []
+    monkeypatch.setattr(forge, "prune_completed_job_widgets", lambda *a, **kw: prune_calls.append(True) or [])
     monkeypatch.setattr(forge, "_is_channel_turn_actively_in_flight", lambda ch: True)
 
     widget_calls = []
     monkeypatch.setattr(forge, "post_or_update_job_widget", lambda tid, **kw: widget_calls.append(tid))
 
-    # 1. Short job (<90s) that fails should NOT post a #forge widget card
+    # 1. Quiet probe (notify_on_success=False, synthesize=False) should NOT post a #forge widget card
     short_id = "dt-test-short-no-widget"
     tdir = forge._get_job_dir(short_id)
     tdir.mkdir(parents=True, exist_ok=True)
@@ -1858,12 +1861,11 @@ def test_short_job_suppresses_forge_widget_until_90s(tmp_path, monkeypatch):
     forge._run_job_worker(short_id, db_path=db_p)
     assert widget_calls == []
 
-    # 2. Long job (>=90s, non-quiet) SHOULD post a #forge widget card
+    # 2. Non-quiet job SHOULD post a #forge widget card immediately on start and on completion, and prune completed widgets
     long_id = "dt-test-long-widget"
     tdir_long = forge._get_job_dir(long_id)
     tdir_long.mkdir(parents=True, exist_ok=True)
     log_long = tdir_long / "run.log"
-    monkeypatch.setattr(forge, "JOB_WIDGET_MIN_DURATION_SECONDS", 0.0)
     meta_long = {
         "task_id": long_id,
         "name": "Long Pipeline Job",
@@ -1880,6 +1882,8 @@ def test_short_job_suppresses_forge_widget_until_90s(tmp_path, monkeypatch):
     forge._write_job_meta(long_id, meta_long, db_path=db_p)
     forge._run_job_worker(long_id, db_path=db_p)
     assert long_id in widget_calls
+    assert widget_calls.count(long_id) >= 2
+    assert len(prune_calls) >= 1
 
 
 def test_normalize_file_list_preserves_leading_dot_on_hidden_paths():
@@ -3550,7 +3554,7 @@ def test_post_verification_commit_preservation_in_worktree(tmp_path, monkeypatch
 
 
 def test_short_job_wakes_channel_when_turn_lock_active(tmp_path, monkeypatch):
-    """Verify that short completed jobs (<15s) still dispatch completion wakeup when Post-Offload Turn Lock is active."""
+    """Verify that short completed jobs (<15s) still dispatch completion wakeup when Post-Offload Turn Lock is active or notify_on_success=True, and wait up to 15s for closing origin turns."""
     import tools.forge as forge
     db_p = tmp_path / "forge.db"
     forge.init_forge_db(db_p)
@@ -3589,6 +3593,45 @@ def test_short_job_wakes_channel_when_turn_lock_active(tmp_path, monkeypatch):
 
     assert len(outbox_calls) > 0
     assert "Suppressing duplicate outbox notification" not in log_p.read_text(encoding="utf-8")
+
+    # Also verify that when offload_dispatched=True in meta and _is_prod_forge_env=True, worker polls/waits for closing turn
+    outbox_calls.clear()
+    in_flight_checks = [0]
+
+    def _closing_turn(ch):
+        in_flight_checks[0] += 1
+        return in_flight_checks[0] < 3
+
+    monkeypatch.setattr(forge, "_is_prod_forge_env", lambda *a, **kw: True)
+    monkeypatch.setattr(forge, "_is_channel_turn_actively_in_flight", _closing_turn)
+    monkeypatch.setattr(forge, "post_or_update_job_widget", lambda *a, **kw: 12345)
+    monkeypatch.setattr(forge, "prune_completed_job_widgets", lambda *a, **kw: [])
+    monkeypatch.setattr(forge, "sync_forge_channel_header", lambda *a, **kw: None)
+
+    empty_bs = tmp_path / "empty_batch.json"
+    task_id2 = "dt-test-closing-turn-wait"
+    tdir2 = forge._get_job_dir(task_id2)
+    tdir2.mkdir(parents=True, exist_ok=True)
+    log_p2 = tdir2 / "run.log"
+    meta2 = {
+        "task_id": task_id2,
+        "name": "Closing Turn Wait Task",
+        "command": "python3 -c 'print(\"done2\")'",
+        "channel": "zero-chat",
+        "timeout": 60,
+        "cwd": str(tmp_path),
+        "status": "starting",
+        "start_time": time.time() - 1.0,
+        "notify_on_success": True,
+        "synthesize": True,
+        "offload_dispatched": True,
+        "log_file": str(log_p2),
+    }
+    forge._write_job_meta(task_id2, meta2, db_path=db_p)
+    forge._run_job_worker(task_id2, db_path=db_p, batch_state_path=empty_bs)
+
+    assert in_flight_checks[0] >= 3
+    assert len(outbox_calls) == 1
 
 
 def test_start_job_clears_offload_dispatched_on_exception(tmp_path, monkeypatch):

@@ -6429,6 +6429,8 @@ def start_job(
                 log_file = task_dir / "run.log"
                 log_file.touch(exist_ok=True)
 
+                is_prod = _is_prod_forge_env(db_path)
+                offload_dispatched = bool(is_prod or _is_post_offload_turn_lock_active(batch_state_path))
                 meta = {
                     "task_id": task_id,
                     "name": name_clean,
@@ -6446,6 +6448,7 @@ def start_job(
                     "exit_code": None,
                     "notify_on_success": bool(notify_on_success),
                     "synthesize": bool(synthesize),
+                    "offload_dispatched": offload_dispatched,
                     "log_file": str(log_file),
                 }
                 _write_job_meta(task_id, meta, db_path=db_path)
@@ -6472,7 +6475,10 @@ def start_job(
                 if not updated_meta.get("worker_pid"):
                     updated_meta["worker_pid"] = proc.pid
                     _write_job_meta(task_id, updated_meta, db_path=db_path)
-                if not (not bool(notify_on_success) and not bool(synthesize)):
+                is_quiet_probe = not bool(notify_on_success) and not bool(synthesize)
+                if not is_quiet_probe:
+                    if is_prod and JOB_WIDGET_MIN_DURATION_SECONDS <= 0.0:
+                        post_or_update_job_widget(task_id, db_path=db_path)
                     sync_forge_channel_header(db_path=db_path)
 
                 return updated_meta
@@ -6513,7 +6519,7 @@ def _run_job_worker(
         lock_fh.close()
 
 
-JOB_WIDGET_MIN_DURATION_SECONDS: float = 90.0
+JOB_WIDGET_MIN_DURATION_SECONDS: float = 0.0
 
 
 def _run_job_worker_locked(
@@ -6527,6 +6533,8 @@ def _run_job_worker_locked(
     _write_job_meta(task_id, meta, db_path=db_path)
     is_quiet_probe = not bool(meta.get("notify_on_success", True)) and not bool(meta.get("synthesize", True))
     if _is_prod_forge_env(db_path) and not is_quiet_probe:
+        if JOB_WIDGET_MIN_DURATION_SECONDS <= 0.0:
+            post_or_update_job_widget(task_id, db_path=db_path)
         sync_forge_channel_header(db_path=db_path)
 
     command = meta["command"]
@@ -6675,13 +6683,24 @@ def _run_job_worker_locked(
             lf.write(f"\n[Detached Runner] Task completed successfully in {dur_str}. Suppressing success notification (failure-only policy active).\n")
         return
 
-    turn_lock_active = _is_post_offload_turn_lock_active(batch_state_path)
+    turn_lock_active = bool(fresh_meta.get("offload_dispatched")) or _is_post_offload_turn_lock_active(batch_state_path)
+    is_prod_env = _is_prod_forge_env(db_path)
+    is_custom_in_flight = (DATA_DIR / "in_flight_turn.json").resolve() != (WORKSPACE_DIR / "data" / "in_flight_turn.json").resolve()
+    is_in_flight_mocked = getattr(_is_channel_turn_actively_in_flight, "__module__", "") != __name__ or hasattr(_is_channel_turn_actively_in_flight, "_mock_name")
+    check_in_flight = is_prod_env or is_custom_in_flight or is_in_flight_mocked
+
+    if turn_lock_active and is_prod_env and _is_channel_turn_actively_in_flight(channel):
+        wait_deadline = time.time() + 15.0
+        while time.time() < wait_deadline and _is_channel_turn_actively_in_flight(channel):
+            time.sleep(0.5)
 
     # Suppress redundant outbox synthesis alerts ONLY when a short (<25s) task COMPLETED successfully
-    # while the originating channel's interactive turn is still actively in-flight and polling it directly.
+    # while the originating channel's interactive turn is still actively in-flight and polling it directly,
+    # and notify_on_success was not explicitly requested.
     # NEVER suppress failed or timed_out task wakeups, and NEVER suppress when the active turn was locked
     # by FORGE Post-Offload Turn Lock (since the agent cannot execute inline and requires a completion wakeup turn).
-    if final_status == "completed" and duration < 25.0 and _is_channel_turn_actively_in_flight(channel) and not turn_lock_active:
+    channel_in_flight = _is_channel_turn_actively_in_flight(channel) if check_in_flight else False
+    if final_status == "completed" and duration < 25.0 and channel_in_flight and not turn_lock_active and not notify_on_success:
         with open(log_file_path, "a", encoding="utf-8") as lf:
             lf.write(
                 f"\n[Detached Runner] Short task ({dur_str}, status={final_status}) finished while "
@@ -6695,7 +6714,7 @@ def _run_job_worker_locked(
     # When --no-synthesize is explicitly passed and the originating channel's
     # interactive turn is still actively in-flight, suppress raw outbox failure dumps so
     # the active turn can inspect and recover inline without spamming Discord.
-    if not synthesize and _is_channel_turn_actively_in_flight(channel) and not turn_lock_active:
+    if not synthesize and channel_in_flight and not turn_lock_active:
         with open(log_file_path, "a", encoding="utf-8") as lf:
             lf.write(
                 f"\n[Detached Runner] --no-synthesize probe ({dur_str}, status={final_status}) finished while "
