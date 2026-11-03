@@ -1247,28 +1247,14 @@ def resolve_lomin_client_lockout_key(
     return f"ip:{host_clean}"
 
 
-def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = False) -> str:
+def build_gotchi_static_system_instruction() -> str:
     """
-    Builds the unified Zero system prompt shared with `#zero-voice`, tuned for Gotchi's
-    pocket Push-to-Talk, camera snapshot/burst, and 200x200 e-paper companion UX.
+    Builds the static Zero system instruction for Gotchi's direct Gemini API brain,
+    suitable for explicit Gemini Context Caching (~15,000 tokens).
     """
-    now_pt = datetime.now(PT_TZ).strftime("%A, %b %d, %Y %I:%M %p PT")
     snapshot = _load_startup_context_snapshot()
-    memory_hits = prefetch_zero_memory(user_prompt) if user_prompt else ""
-    mem_block = (
-        f"\n\n=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===\n{memory_hits}"
-        if memory_hits
-        else ""
-    )
-    vision_note = (
-        "\n- Ryan attached a live camera snapshot or 5-frame burst from Gotchi's onboard camera. "
-        "Inspect the visual contents directly and answer with concrete, specific observations."
-        if has_vision
-        else ""
-    )
     return (
-        f"You are Zero, an autonomous AI engineering partner. "
-        f"Current time: {now_pt}.\n"
+        "You are Zero, an autonomous AI engineering partner.\n"
         f"You are speaking through the pocket GOTCHI hardware companion (matching your `#zero-voice` "
         f"experience with your signature `{DEFAULT_VOICE_NAME}` voice and 200x200 e-paper display).\n\n"
         "GOTCHI & ZERO-VOICE UNIFIED PERSONA INVARIANTS:\n"
@@ -1292,8 +1278,7 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         "Whenever a turn involves clickable hyperlinks, shopping/product links, GitHub PRs/issues, code snippets, "
         "images, CAD models, or live webpage screenshots, call `post_note_to_zero_chat` (with `message`, optional "
         "`file_path`, or optional `screenshot_url`) to send it to `#zero-chat`, and tell Ryan verbally to find it "
-        "in `#zero-chat`.\n"
-        f"{vision_note}\n\n"
+        "in `#zero-chat`.\n\n"
         "GOTCHI V1 HARDWARE CONTROLS & MODES:\n"
         "- Answer any question about Gotchi physical buttons or operating modes directly from this spec without running tools or searching files.\n"
         "- Top Button (`BTN_TOP`): Speaking only (quick tap <500ms latches hands-free Tap-to-Talk; hold >500ms sends on release; pressing during speech cancels playback).\n"
@@ -1323,8 +1308,39 @@ def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = Fa
         "- Use `post_note_to_zero_chat` to send clickable links, notes, code blocks, local images/files (`file_path`), "
         "or webpage screenshots (`screenshot_url`) directly to `#zero-chat`.\n"
         "- Use `get_weather_forecast` to check live weather conditions and high/low forecasts (defaults immediately to Local Home Area without asking for a city).\n\n"
-        f"{snapshot}{_load_full_zero_persona_and_rules()}{mem_block}"
+        f"{snapshot}{_load_full_zero_persona_and_rules()}"
     )
+
+
+def build_gotchi_dynamic_turn_context(user_prompt: str = "", has_vision: bool = False) -> str:
+    """
+    Builds the lightweight per-turn dynamic context (current PT time, vision note,
+    and FTS5 memory hits) to pair with a cached static system instruction.
+    """
+    now_pt = datetime.now(PT_TZ).strftime("%A, %b %d, %Y %I:%M %p PT")
+    memory_hits = prefetch_zero_memory(user_prompt) if user_prompt else ""
+    mem_block = (
+        f"\n\n=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===\n{memory_hits}"
+        if memory_hits
+        else ""
+    )
+    vision_note = (
+        "\n- Ryan attached a live camera snapshot or 5-frame burst from Gotchi's onboard camera. "
+        "Inspect the visual contents directly and answer with concrete, specific observations."
+        if has_vision
+        else ""
+    )
+    return f"Current time: {now_pt}.{vision_note}{mem_block}"
+
+
+def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = False) -> str:
+    """
+    Builds the unified Zero system prompt shared with `#zero-voice`, tuned for Gotchi's
+    pocket Push-to-Talk, camera snapshot/burst, and 200x200 e-paper companion UX.
+    """
+    static_block = build_gotchi_static_system_instruction()
+    dynamic_block = build_gotchi_dynamic_turn_context(user_prompt, has_vision)
+    return f"{static_block}\n\n{dynamic_block}"
 
 
 def build_contextual_tool_filler(
@@ -2084,6 +2100,61 @@ class GotchiZeroBrainAdapter:
         self.warm_worker = warm_worker
         self.brain_mode = (brain_mode or "").strip().lower()
         self._genai_client: Optional[Any] = None
+        self._cached_content_name: Optional[str] = None
+        self._cached_content_model: Optional[str] = None
+        self._cached_content_expires_at: float = 0.0
+        self.context_cache_ttl_sec: int = int(
+            os.environ.get("GOTCHI_CONTEXT_CACHE_TTL_SEC", "3600") or 3600
+        )
+
+    def _get_or_create_context_cache(
+        self,
+        client: Any,
+        model: str,
+        static_sys_prompt: str,
+        tools_list: List[Any],
+    ) -> Optional[str]:
+        cache_enabled = os.environ.get("GOTCHI_CONTEXT_CACHE_ENABLED", "1").strip().lower()
+        if cache_enabled in ("0", "false", "no", "off"):
+            return None
+        now_mono = time.monotonic()
+        if (
+            self._cached_content_name
+            and self._cached_content_model == model
+            and now_mono < self._cached_content_expires_at
+        ):
+            return self._cached_content_name
+
+        caches_api = getattr(client, "caches", None)
+        create_fn = getattr(caches_api, "create", None) if caches_api is not None else None
+        if not callable(create_fn):
+            return None
+
+        try:
+            from google.genai import types
+
+            cache_obj = create_fn(
+                model=model,
+                config=types.CreateCachedContentConfig(
+                    system_instruction=static_sys_prompt,
+                    tools=tools_list,
+                    ttl=f"{self.context_cache_ttl_sec}s",
+                    display_name="gotchi-zero-persona-rules",
+                ),
+            )
+            cache_name = getattr(cache_obj, "name", None)
+            if cache_name:
+                self._cached_content_name = str(cache_name)
+                self._cached_content_model = model
+                # Refresh slightly before strict TTL expiry (with a 60s safety margin when TTL > 120s)
+                safety_margin = 60.0 if self.context_cache_ttl_sec > 120 else 0.0
+                self._cached_content_expires_at = time.monotonic() + max(
+                    1.0, float(self.context_cache_ttl_sec) - safety_margin
+                )
+                return self._cached_content_name
+        except Exception:
+            pass
+        return None
 
     def _is_subscription_mode(self) -> bool:
         mode = self.brain_mode or os.environ.get("GOTCHI_BRAIN_MODE", "").strip().lower()
@@ -2148,8 +2219,20 @@ class GotchiZeroBrainAdapter:
         has_vision = bool(image_bytes or burst_images)
         prompt_is_placeholder = is_placeholder_prompt(prompt)
         sys_prompt_text = "" if (audio_bytes and prompt_is_placeholder) else prompt
-        sys_prompt = await asyncio.to_thread(
-            build_gotchi_zero_system_prompt, sys_prompt_text, has_vision
+        static_sys_prompt = await asyncio.to_thread(build_gotchi_static_system_instruction)
+        dynamic_turn_ctx = await asyncio.to_thread(
+            build_gotchi_dynamic_turn_context, sys_prompt_text, has_vision
+        )
+        sys_prompt = f"{static_sys_prompt}\n\n{dynamic_turn_ctx}"
+
+        tools_list = _build_gotchi_tools()
+        live_model = self._resolve_live_gemini_model()
+        cache_name = await asyncio.to_thread(
+            self._get_or_create_context_cache,
+            client,
+            live_model,
+            static_sys_prompt,
+            tools_list,
         )
 
         user_parts: List[types.Part] = []
@@ -2161,16 +2244,14 @@ class GotchiZeroBrainAdapter:
             user_parts.append(types.Part.from_bytes(data=b_img, mime_type="image/jpeg"))
         if audio_bytes and (not prompt or prompt_is_placeholder):
             prefix_txt = prompt if (prompt and prompt.startswith("[VOICE TURN")) else format_voice_turn_prefix()
-            user_parts.append(
-                types.Part.from_text(
-                    text=f"{prefix_txt}\nListen to Ryan's spoken voice prompt in the attached audio clip and answer directly."
-                )
-            )
+            turn_body = f"{prefix_txt}\nListen to Ryan's spoken voice prompt in the attached audio clip and answer directly."
         else:
-            user_parts.append(types.Part.from_text(text=prompt or "Describe what you see."))
+            turn_body = prompt or "Describe what you see."
+        if cache_name:
+            turn_body = f"{dynamic_turn_ctx}\n\n{turn_body}"
+        user_parts.append(types.Part.from_text(text=turn_body))
 
         contents: List[types.Content] = [types.Content(role="user", parts=user_parts)]
-        tools_list = _build_gotchi_tools()
 
         explicitly_posted_to_zero_chat = False
         tool_had_error = False
@@ -2180,20 +2261,28 @@ class GotchiZeroBrainAdapter:
 
         for _step in range(4):
             live_model = self._resolve_live_gemini_model()
-            config = types.GenerateContentConfig(
-                system_instruction=sys_prompt,
-                tools=tools_list,
-                temperature=0.4,
-                thinking_config=build_thinking_config(
-                    live_model,
-                    prompt,
-                    default_budget=self.thinking_budget,
-                    step=_step,
-                    tool_had_error=tool_had_error,
-                    burst_count=len(burst_images),
-                    model_requested_deep_thinking=model_requested_deep_thinking,
-                ),
+            thinking_cfg = build_thinking_config(
+                live_model,
+                prompt,
+                default_budget=self.thinking_budget,
+                step=_step,
+                tool_had_error=tool_had_error,
+                burst_count=len(burst_images),
+                model_requested_deep_thinking=model_requested_deep_thinking,
             )
+            if cache_name and self._cached_content_model == live_model:
+                config = types.GenerateContentConfig(
+                    cached_content=cache_name,
+                    temperature=0.4,
+                    thinking_config=thinking_cfg,
+                )
+            else:
+                config = types.GenerateContentConfig(
+                    system_instruction=sys_prompt,
+                    tools=tools_list,
+                    temperature=0.4,
+                    thinking_config=thinking_cfg,
+                )
 
             splitter = SentenceStreamSplitter()
             step_text_chunks: List[str] = []

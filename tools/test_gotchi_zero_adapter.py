@@ -1120,5 +1120,134 @@ def test_resolve_lomin_client_lockout_key_and_redteam_routes(monkeypatch):
     assert shutdown_lomin_background_workers(timeout_s=0.5) is True
 
 
+def test_explicit_gemini_context_caching_lifecycle_and_fallback(monkeypatch):
+    from tools.gotchi_zero_adapter import (
+        build_gotchi_dynamic_turn_context,
+        build_gotchi_static_system_instruction,
+    )
+
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._append_voice_turn_to_history",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setenv("GOTCHI_CONTEXT_CACHE_ENABLED", "1")
+    monkeypatch.setenv("GOTCHI_CONTEXT_CACHE_TTL_SEC", "3600")
+
+    static_prompt = build_gotchi_static_system_instruction()
+    dynamic_ctx = build_gotchi_dynamic_turn_context("What is the weather?", has_vision=True)
+    assert "GOTCHI & ZERO-VOICE UNIFIED PERSONA INVARIANTS" in static_prompt
+    assert "ZERO CORE OPERATIONAL REFERENCE (/workspace/GEMINI.md)" in static_prompt
+    assert "Current time:" in dynamic_ctx
+    assert "live camera snapshot or 5-frame burst" in dynamic_ctx
+
+    created_caches: List[Dict[str, Any]] = []
+    recorded_gen_configs: List[Any] = []
+    recorded_gen_contents: List[Any] = []
+
+    class FakeCacheObj:
+        def __init__(self, name: str):
+            self.name = name
+
+    class FakeCaches:
+        def __init__(self, should_fail: bool = False):
+            self.should_fail = should_fail
+            self.counter = 0
+
+        def create(self, model: str, config: Any) -> Any:
+            if self.should_fail:
+                raise RuntimeError("Context caching unsupported on this tier")
+            self.counter += 1
+            cname = f"cachedContents/gotchi-zero-cache-{self.counter}"
+            created_caches.append({"model": model, "config": config, "name": cname})
+            return FakeCacheObj(cname)
+
+    class FakeChunk:
+        def __init__(self, text: str = ""):
+            self.text = text
+            self.function_calls = None
+            self.candidates = []
+
+    class FakeModels:
+        async def generate_content_stream(self, model: str, contents: Any, config: Any):
+            recorded_gen_configs.append(config)
+            recorded_gen_contents.append(contents)
+            yield FakeChunk(text="Context cache active and verified.")
+
+    class FakeAio:
+        def __init__(self):
+            self.models = FakeModels()
+
+    class FakeGenaiClientWithCache:
+        def __init__(self, should_fail: bool = False):
+            self.caches = FakeCaches(should_fail=should_fail)
+            self.aio = FakeAio()
+
+    adapter = GotchiZeroBrainAdapter(api_key="fake-key", dispatch_discord=False)
+    adapter._genai_client = FakeGenaiClientWithCache(should_fail=False)
+
+    # 1. Turn 1 creates the cache and passes cached_content (omitting system_instruction & tools)
+    reply1, _, _ = asyncio.run(
+        adapter._run_gemini_with_tools(
+            prompt="Check workshop status",
+            image_bytes=None,
+            burst_images=[],
+        )
+    )
+    assert "Context cache active" in reply1
+    assert len(created_caches) == 1
+    assert created_caches[0]["name"] == "cachedContents/gotchi-zero-cache-1"
+    cfg1 = recorded_gen_configs[-1]
+    assert cfg1.cached_content == "cachedContents/gotchi-zero-cache-1"
+    assert cfg1.system_instruction is None
+    assert cfg1.tools is None
+    first_user_text = recorded_gen_contents[-1][0].parts[0].text
+    assert "Current time:" in first_user_text
+    assert "Check workshop status" in first_user_text
+
+    # 2. Turn 2 reuses the existing unexpired cache without calling caches.create again
+    asyncio.run(
+        adapter._run_gemini_with_tools(
+            prompt="Second turn prompt",
+            image_bytes=None,
+            burst_images=[],
+        )
+    )
+    assert len(created_caches) == 1
+    assert recorded_gen_configs[-1].cached_content == "cachedContents/gotchi-zero-cache-1"
+
+    # 3. Simulate TTL expiration -> Turn 3 refreshes the cache automatically
+    adapter._cached_content_expires_at = time.monotonic() - 10.0
+    asyncio.run(
+        adapter._run_gemini_with_tools(
+            prompt="Third turn after expiry",
+            image_bytes=None,
+            burst_images=[],
+        )
+    )
+    assert len(created_caches) == 2
+    assert recorded_gen_configs[-1].cached_content == "cachedContents/gotchi-zero-cache-2"
+
+    # 4. Graceful fallback when caches.create raises an exception
+    adapter_fail = GotchiZeroBrainAdapter(api_key="fake-key", dispatch_discord=False)
+    adapter_fail._genai_client = FakeGenaiClientWithCache(should_fail=True)
+    reply_fallback, _, _ = asyncio.run(
+        adapter_fail._run_gemini_with_tools(
+            prompt="Fallback turn",
+            image_bytes=None,
+            burst_images=[],
+        )
+    )
+    assert "Context cache active" in reply_fallback
+    cfg_fb = recorded_gen_configs[-1]
+    assert cfg_fb.cached_content is None
+    assert cfg_fb.system_instruction is not None
+    assert cfg_fb.tools is not None
+
+
+
 
 
