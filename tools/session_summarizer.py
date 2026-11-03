@@ -10,6 +10,7 @@ Generates per-session carry-forward artifacts on compaction:
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 import subprocess
@@ -20,6 +21,145 @@ from zoneinfo import ZoneInfo
 PT = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path("/workspace/data")
 BRAIN_DIR = Path("/root/.gemini/antigravity-cli/brain")
+HOME_CHANNEL_ID = 1542081375287640084
+DEFAULT_FORGE_DB_PATH = Path("/baseball/data/forge.db")
+
+
+def _resolve_channel_id_for_session(sess_key: str) -> int | None:
+    """Resolve a session key to its exact Discord channel_id, or None if unknown/ambiguous."""
+    if not sess_key:
+        return None
+    raw = str(sess_key).strip().lstrip("#")
+    if not raw:
+        return None
+    lower = raw.lower()
+    if lower in ("home", "zero-chat"):
+        return HOME_CHANNEL_ID
+    if lower.startswith("chan_"):
+        suffix = lower[5:]
+        if suffix.isdigit():
+            return int(suffix)
+        return None
+    if raw.isdigit():
+        return int(raw)
+    try:
+        from tools.outbox import resolve_channel
+        _, ch_id = resolve_channel(raw)
+        if ch_id is not None:
+            return int(ch_id)
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_channel_scoped_forge_builds(
+    sess_key: str,
+    hours: int = 12,
+    limit: int = 5,
+    db_path: Path | str = DEFAULT_FORGE_DB_PATH,
+) -> list[str]:
+    """Query forge_builds strictly for the resolved origin_channel_id over the past N hours."""
+    channel_id = _resolve_channel_id_for_session(sess_key)
+    if channel_id is None:
+        return []
+
+    target_db = Path(db_path)
+    if not target_db.exists() and target_db == DEFAULT_FORGE_DB_PATH:
+        fallback_db = DATA_DIR / "forge.db"
+        if fallback_db.exists():
+            target_db = fallback_db
+    if not target_db.exists():
+        return []
+
+    cutoff = time.time() - (hours * 3600.0)
+    results: list[str] = []
+    try:
+        with sqlite3.connect(str(target_db), timeout=5.0) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, title, status FROM forge_builds "
+                "WHERE origin_channel_id = ? AND created_at >= ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (channel_id, cutoff, limit),
+            ).fetchall()
+            for r in rows:
+                bid = r["id"]
+                btitle = r["title"]
+                bstatus = r["status"]
+                results.append(f"- FORGE Build `{bid}` ({bstatus}): {btitle}")
+    except Exception as e:
+        print(f"[Summarizer] Error fetching channel-scoped FORGE builds for '{sess_key}': {e}")
+    return results
+
+
+def _parse_milestone_bullets_from_section(text: str) -> list[str]:
+    """Extract bullet lines under '## 1. Compacted Earlier Session History' up to the next section header."""
+    if not text:
+        return []
+    m = re.search(
+        r"##\s*1\.\s*Compacted Earlier Session History[^\n]*\n([\s\S]*?)(?=\n##\s*\d+\.|\n\[CURRENT USER PROMPT\]|\Z)",
+        text,
+    )
+    body = m.group(1) if m else text
+    bullets: list[str] = []
+    for line in body.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if "Parent Session UUID:" in s:
+            continue
+        if s.startswith("<!--") and s.endswith("-->"):
+            continue
+        if s.startswith("## "):
+            break
+        if s.startswith(("-", "•", "*")):
+            norm = "- " + s.lstrip("-•* ").strip()
+            if (
+                "Session Initialized: Fresh conversation thread" not in norm
+                and norm not in bullets
+            ):
+                bullets.append(norm)
+    return bullets
+
+
+def _extract_prior_milestones_from_transcript(
+    transcript_path: Path | None, sess_key: str
+) -> list[str]:
+    """Extract prior session milestones from [PREVIOUS SESSION CARRY-FORWARD CONTEXT] in transcript or milestones_{sess_key}.md."""
+    milestones: list[str] = []
+
+    if transcript_path and Path(transcript_path).exists():
+        try:
+            with open(transcript_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if d.get("type") != "USER_INPUT":
+                        continue
+                    cnt = d.get("content") or ""
+                    if "[PREVIOUS SESSION CARRY-FORWARD CONTEXT]" in cnt or "## 1. Compacted Earlier Session History" in cnt:
+                        for b in _parse_milestone_bullets_from_section(cnt):
+                            if b not in milestones:
+                                milestones.append(b)
+        except Exception as e:
+            print(f"[Summarizer] Error extracting prior milestones from transcript: {e}")
+
+    milestones_file = DATA_DIR / f"milestones_{sess_key}.md"
+    if milestones_file.exists():
+        try:
+            persisted_text = milestones_file.read_text(encoding="utf-8")
+            for b in _parse_milestone_bullets_from_section(persisted_text):
+                if b not in milestones:
+                    milestones.append(b)
+        except Exception as e:
+            print(f"[Summarizer] Error reading {milestones_file}: {e}")
+
+    return milestones
+
 
 def find_transcript(conv_id: str | None = None, sess_key: str | None = None) -> Path | None:
     """Find the specific session transcript file for a given conv_id or sess_key.
@@ -230,18 +370,72 @@ def get_architecture_manifest() -> str:
     )
     return manifest
 
-def synthesize_session_milestones(dialogue: list[dict], sess_key: str) -> tuple[str, str, str]:
+def _merge_guaranteed_milestones(
+    base_ms: str,
+    prior_milestones: list[str],
+    channel_forge_builds: list[str],
+) -> str:
+    """Deterministically ensure channel-scoped FORGE builds and prior milestones are present in milestones_block."""
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    def _add(item: str) -> None:
+        for raw_line in item.splitlines():
+            s = raw_line.strip()
+            if not s:
+                continue
+            if not s.startswith(("-", "•", "*")):
+                s = f"- {s}"
+            else:
+                s = "- " + s.lstrip("-•* ").strip()
+            if s not in seen:
+                seen.add(s)
+                lines.append(s)
+
+    for pm in prior_milestones:
+        _add(pm)
+
+    if base_ms:
+        for raw_line in base_ms.splitlines():
+            if "Session Initialized: Fresh conversation thread" in raw_line and (prior_milestones or channel_forge_builds):
+                continue
+            _add(raw_line)
+
+    for fb in channel_forge_builds:
+        _add(fb)
+
+    if not lines:
+        return "- Session Initialized: Fresh conversation thread with baseline homelab context."
+    return "\n".join(lines)
+
+
+def synthesize_session_milestones(
+    dialogue: list[dict],
+    sess_key: str,
+    prior_milestones: list[str] | None = None,
+    channel_forge_builds: list[str] | None = None,
+    recent_dialogue: list[dict] | None = None,
+) -> tuple[str, str, str]:
     """Synthesize dynamic milestones, directives, and engineering deltas using LLM with deterministic fallback."""
-    if not dialogue:
+    prior_ms = list(prior_milestones or [])
+    forge_ms = list(channel_forge_builds or [])
+    directive_turns = list(recent_dialogue or [])
+
+    if not dialogue and not prior_ms and not forge_ms and not directive_turns:
         milestones = "- Session Initialized: Fresh conversation thread with baseline homelab context."
         directives = "- Standby: Ready for new user directives."
         eng_delta = "- Initialized: Nominal baseline state."
         return milestones, directives, eng_delta
 
-    dialogue_text = "\n".join([f"{t['speaker']}: {t['content'][:500]}" for t in dialogue[-8:]])
+    source_turns = dialogue if dialogue else directive_turns
+    dialogue_text = "\n".join([f"{t['speaker']}: {t['content'][:500]}" for t in source_turns[-16:]])
+    prior_text = "\n".join(prior_ms) if prior_ms else "(None)"
+    forge_text = "\n".join(forge_ms) if forge_ms else "(None)"
     prompt = (
         f"You are Zero, synthesizing session carry-forward context for session '{sess_key}'.\n"
-        f"Recent dialogue turns:\n{dialogue_text}\n\n"
+        f"Prior session milestones:\n{prior_text}\n\n"
+        f"Channel-scoped FORGE builds (last 12h):\n{forge_text}\n\n"
+        f"Older session dialogue turns to compact:\n{dialogue_text}\n\n"
         f"Return ONLY valid JSON matching this schema:\n"
         f"{{\n"
         f"  \"milestones\": [\"- <1-sentence key achievement, decision, or deliverable completed>\"],\n"
@@ -262,7 +456,8 @@ def synthesize_session_milestones(dialogue: list[dict], sess_key: str) -> tuple[
                         dr = "\n".join(data.get("directives", []))
                         ed = "\n".join(data.get("eng_delta", []))
                         if ms and dr:
-                            return ms, dr, ed or ms
+                            merged_ms = _merge_guaranteed_milestones(ms, prior_ms, forge_ms)
+                            return merged_ms, dr, ed or merged_ms
         except Exception as we:
             print(f"[Summarizer] Warm classifier synthesis fallback to Popen: {we}")
 
@@ -284,7 +479,8 @@ def synthesize_session_milestones(dialogue: list[dict], sess_key: str) -> tuple[
                     dr = "\n".join(data.get("directives", []))
                     ed = "\n".join(data.get("eng_delta", []))
                     if ms and dr:
-                        return ms, dr, ed or ms
+                        merged_ms = _merge_guaranteed_milestones(ms, prior_ms, forge_ms)
+                        return merged_ms, dr, ed or merged_ms
         except subprocess.TimeoutExpired:
             print(f"[Summarizer] Timeout (15s) synthesizing milestones for {sess_key}. Reaping process group {proc.pid}...")
             try:
@@ -311,30 +507,56 @@ def synthesize_session_milestones(dialogue: list[dict], sess_key: str) -> tuple[
     except Exception as e:
         print(f"[Summarizer] LLM synthesis fallback: {e}")
 
-    # Fallback to extracting recent user asks and delivered fixes
-    recent_user = [t['content'][:250] for t in dialogue if t.get('speaker') != 'Zero']
-    recent_zero = [t['content'][:250] for t in dialogue if t['speaker'] == 'Zero']
+    # Fallback to extracting older user asks and delivered fixes
+    older_zero = [t['content'][:250] for t in dialogue if t.get('speaker') == 'Zero']
+    older_user = [t['content'][:250] for t in dialogue if t.get('speaker') != 'Zero']
 
     ms_list = []
-    if recent_zero:
-        ms_list.append(f"- Recent Deliverables: {recent_zero[-1]}")
-    if len(recent_zero) > 1:
-        ms_list.append(f"- Earlier Completed: {recent_zero[-2]}")
-    if not ms_list:
-        ms_list.append("- Active Session: Conversational pairing in flight.")
+    if older_zero:
+        ms_list.append(f"- Recent Deliverables: {older_zero[-1]}")
+        if len(older_zero) > 1:
+            ms_list.append(f"- Earlier Completed: {older_zero[-2]}")
+    elif older_user:
+        ms_list.append(f"- Earlier Topic: {older_user[-1]}")
+    elif not prior_ms and not forge_ms:
+        fallback_zero = [t['content'][:250] for t in directive_turns if t.get('speaker') == 'Zero']
+        if fallback_zero:
+            ms_list.append(f"- Recent Deliverables: {fallback_zero[-1]}")
+        else:
+            ms_list.append("- Active Session: Conversational pairing in flight.")
 
+    merged_ms = _merge_guaranteed_milestones("\n".join(ms_list), prior_ms, forge_ms)
+
+    active_turns = directive_turns if directive_turns else dialogue
+    recent_user = [t['content'][:250] for t in active_turns if t.get('speaker') != 'Zero']
     dr_list = []
     if recent_user:
         dr_list.append(f"- Active Directive: {recent_user[-1]}")
     dr_list.append("- Personality & Discipline: Deadpan, forensic clarity, PT timezone, verified tests.")
 
-    ed_list = [f"- Code Delta: {ms_list[0].replace('- Recent Deliverables: ', '')}"]
-    return "\n".join(ms_list), "\n".join(dr_list), "\n".join(ed_list)
+    first_ms = merged_ms.splitlines()[0] if merged_ms else "- Nominal baseline state"
+    ed_list = [f"- Code Delta: {first_ms.replace('- Recent Deliverables: ', '').lstrip('- ').strip()}"]
+    if forge_ms:
+        for fb in forge_ms:
+            if fb not in ed_list:
+                ed_list.append(fb)
+    return merged_ms, "\n".join(dr_list), "\n".join(ed_list)
 
 
-def generate_summary(conv_id: str | None = None, sess_key: str = "home", dry_run: bool = False) -> str:
+def generate_summary(
+    conv_id: str | None = None,
+    sess_key: str = "home",
+    dry_run: bool = False,
+    db_path: Path | str = DEFAULT_FORGE_DB_PATH,
+) -> str:
     """Generate smart rolling compaction specifically for the session identified by conv_id / sess_key."""
-    recent_dialogue = extract_recent_dialogue(conv_id=conv_id, sess_key=sess_key, limit=10)
+    transcript_path = find_transcript(conv_id=conv_id, sess_key=sess_key)
+    all_dialogue = extract_recent_dialogue(conv_id=conv_id, sess_key=sess_key, limit=100)
+    recent_dialogue = all_dialogue[-10:]
+    older_dialogue = all_dialogue[:-10]
+
+    prior_milestones = _extract_prior_milestones_from_transcript(transcript_path, sess_key)
+    channel_forge_builds = _fetch_channel_scoped_forge_builds(sess_key, db_path=db_path)
 
     dialogue_formatted = []
     for turn in recent_dialogue:
@@ -347,8 +569,18 @@ def generate_summary(conv_id: str | None = None, sess_key: str = "home", dry_run
 
     summary_file = DATA_DIR / f"summary_{sess_key}.md"
     eng_summary_file = DATA_DIR / f"eng_summary_{sess_key}.md"
+    milestones_file = DATA_DIR / f"milestones_{sess_key}.md"
 
-    milestones_block, directives_block, eng_delta_block = synthesize_session_milestones(recent_dialogue, sess_key)
+    milestones_block, directives_block, eng_delta_block = synthesize_session_milestones(
+        older_dialogue,
+        sess_key,
+        prior_milestones=prior_milestones,
+        channel_forge_builds=channel_forge_builds,
+        recent_dialogue=recent_dialogue,
+    )
+    milestones_block = _merge_guaranteed_milestones(
+        milestones_block, prior_milestones, channel_forge_builds
+    )
 
     # Resolve parent conversation ID
     parent_id = conv_id
@@ -390,7 +622,9 @@ def generate_summary(conv_id: str | None = None, sess_key: str = "home", dry_run
             f.write(summary)
         with open(eng_summary_file, "w", encoding="utf-8") as f:
             f.write(eng_summary)
-        print(f"[Summarizer] Wrote session summary for '{sess_key}' to {summary_file} and {eng_summary_file}")
+        with open(milestones_file, "w", encoding="utf-8") as f:
+            f.write(milestones_block + "\n")
+        print(f"[Summarizer] Wrote session summary for '{sess_key}' to {summary_file}, {eng_summary_file}, and {milestones_file}")
 
     return summary
 
