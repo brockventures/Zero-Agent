@@ -23,8 +23,10 @@ description: Enforces tool roundtrip minimization, broad-slice file reads, and d
 4. **Multi-Edit Batching:**
    - Avoid long serial chains of `replace_file_content` on the same file. Use `write_to_file` with `Overwrite: true` or a script for extensive changes. Always run tests after edits before chaining further replacements.
 
-5. **Targeted Pytest over Full-Suite Runs (Ban Unscoped Full-Suite Pytest):**
-   - In Tier 1 inline turns (`<90s`) and `#forge` worker turns, **NEVER** run unconstrained full repository test suites (bare `pytest` or `pytest tests/`).
+5. **Targeted Pytest & Path-Gated Verification (Ban Unscoped Full-Suite Runs & Backend Linting on Frontend Diffs):**
+   - In Tier 1 inline turns (`<90s`) and `#forge` worker turns, **NEVER** run unconstrained full repository test suites (bare `pytest` or `pytest tests/`) or whole-repo static analyzers (`./scripts/verify.sh --lint-only`, `golangci-lint`, `deadcode`) locally.
+   - **Path-Gated Stack Verification:** When a change only touches frontend files (`web/`, `.ts`, `.tsx`, `.css`), run ONLY scoped frontend checks (`npm test`, `eslint`, `tsc`) and **NEVER** invoke Go/backend linters or `verify.sh` without `--staged` (and only run `--staged` after `git add`).
+   - **Modal Offload for Heavy Go Static Analysis:** Whenever `.go`, `go.mod`, or OpenAPI files are modified, offload `golangci-lint`, `deadcode`, and full `verify.sh` runs to Modal cloud compute (`tools/modal_verify.py`) so local CPU/RAM is never exhausted.
    - **ALWAYS** scope test execution strictly to the relevant test file or function under test (`pytest tests/test_feature.py`). Rely on CI for full matrix regressions.
 
 6. **Unified FORGE Routing (Execution Loop & Verification Cost) & One-Shot Git Batching:**
