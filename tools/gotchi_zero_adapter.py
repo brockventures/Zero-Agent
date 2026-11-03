@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -1040,7 +1041,153 @@ def _build_gotchi_tools() -> list[Any]:
                 ),
             )
         )
+    if not any(getattr(d, "name", None) == "home_assistant_control" for d in f_decls):
+        f_decls.append(
+            types.FunctionDeclaration(
+                name="home_assistant_control",
+                description=(
+                    "Fast inline Home Assistant device state lookup or service execution (<1.5s). "
+                    "Query entity states ('state' or 'query') or invoke a service ('call_service', 'turn_on', "
+                    "'turn_off', 'toggle') across lights, switches, climate, locks, covers, fans, or sensors."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "action": types.Schema(
+                            type="STRING",
+                            description="Action to perform: 'state' / 'query' to inspect entities, or 'call_service' / 'turn_on' / 'turn_off' / 'toggle' to control a device.",
+                        ),
+                        "entity_id_or_query": types.Schema(
+                            type="STRING",
+                            description="Exact Home Assistant entity_id (e.g. 'light.workbench_lamp', 'sensor.garage_temperature') or natural search query ('garage', 'living room lights').",
+                        ),
+                        "domain": types.Schema(
+                            type="STRING",
+                            description="Optional HA service domain (e.g. 'light', 'switch', 'climate', 'media_player', 'homeassistant'). Auto-inferred from entity_id if omitted.",
+                        ),
+                        "service": types.Schema(
+                            type="STRING",
+                            description="Optional HA service name (e.g. 'turn_on', 'turn_off', 'toggle', 'set_temperature').",
+                        ),
+                        "service_data_json": types.Schema(
+                            type="STRING",
+                            description="Optional JSON object string of additional service_data fields (e.g. '{\"brightness_pct\": 50}').",
+                        ),
+                    },
+                    required=["action", "entity_id_or_query"],
+                ),
+            )
+        )
+    if not any(getattr(d, "name", None) == "check_calendar" for d in f_decls):
+        f_decls.append(
+            types.FunctionDeclaration(
+                name="check_calendar",
+                description=(
+                    "Check upcoming scheduled reminders and jobs from `/workspace/data/schedule.json` "
+                    "and upcoming Google Calendar events for Ryan and the family."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "days_ahead": types.Schema(
+                            type="INTEGER",
+                            description="Number of days ahead to inspect (default: 2).",
+                        ),
+                        "query": types.Schema(
+                            type="STRING",
+                            description="Optional keyword filter for events or reminders.",
+                        ),
+                    },
+                    required=[],
+                ),
+            )
+        )
+    if not any(getattr(d, "name", None) == "tv_and_plex_control" for d in f_decls):
+        f_decls.append(
+            types.FunctionDeclaration(
+                name="tv_and_plex_control",
+                description=(
+                    "Control the Living Room TV via Home Assistant `media_player` (pause, play, stop, power off/on, "
+                    "volume, status) or launch movies/shows via Plex (`plex_play.py`) and live MLB games (`mlb_stream_extractor.py`)."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "action": types.Schema(
+                            type="STRING",
+                            description="Action: 'status', 'pause', 'play', 'stop', 'turn_off', 'turn_on', 'mute', 'volume_up', 'volume_down', 'plex', or 'mlb'.",
+                        ),
+                        "media_query": types.Schema(
+                            type="STRING",
+                            description="Movie/show title for Plex playback or MLB team name (e.g. 'Cubs', 'Dodgers', 'Bluey').",
+                        ),
+                    },
+                    required=["action"],
+                ),
+            )
+        )
+    if not any(getattr(d, "name", None) == "check_3d_printer" for d in f_decls):
+        f_decls.append(
+            types.FunctionDeclaration(
+                name="check_3d_printer",
+                description=(
+                    "Check live 3D printer (Ender-3 V2) job progress, completion percentage, time remaining, "
+                    "and nozzle/bed temperatures from OctoPrint/Moonraker API and local watcher state."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={},
+                    required=[],
+                ),
+            )
+        )
+    if not any(getattr(d, "name", None) == "grocery_list_action" for d in f_decls):
+        f_decls.append(
+            types.FunctionDeclaration(
+                name="grocery_list_action",
+                description=(
+                    "Manage the household grocery list (`/workspace/data/grocery_list.json`): "
+                    "add items ('add'), list current items ('list'), remove/clear items ('remove'/'clear'), "
+                    "or compile a 1-click Whole Foods AFX cart link and post it to `#zero-chat` ('cart'/'afx')."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "action": types.Schema(
+                            type="STRING",
+                            description="Action: 'add', 'list', 'remove', 'clear', or 'cart' (builds Whole Foods AFX cart link and posts to #zero-chat).",
+                        ),
+                        "items": types.Schema(
+                            type="STRING",
+                            description="Comma-separated or newline-separated grocery items (e.g. 'organic whole milk, eggs, avocados').",
+                        ),
+                    },
+                    required=["action"],
+                ),
+            )
+        )
     return [types.Tool(function_declarations=f_decls)]
+
+
+def _compute_context_cache_fingerprint(sys_prompt: str, tools_list: List[Any]) -> str:
+    """Computes a deterministic SHA-256 fingerprint of `sys_prompt` and declared tool names."""
+    tool_names: List[str] = []
+    for t in tools_list or []:
+        decls = getattr(t, "function_declarations", None)
+        if decls:
+            for d in decls:
+                name = getattr(d, "name", None)
+                if name:
+                    tool_names.append(str(name))
+        elif isinstance(t, dict):
+            for d in t.get("function_declarations", []):
+                name = d.get("name") if isinstance(d, dict) else getattr(d, "name", None)
+                if name:
+                    tool_names.append(str(name))
+        elif isinstance(t, str):
+            tool_names.append(t)
+    payload = f"{sys_prompt or ''}\n--TOOLS--\n{','.join(sorted(tool_names))}"
+    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
 _MEM_FTS_CONN: Optional[sqlite3.Connection] = None
@@ -1693,6 +1840,46 @@ def build_contextual_tool_filler(
         )
         return options[seed % len(options)]
 
+    if fn_name == "home_assistant_control":
+        options = (
+            "I'm checking Home Assistant on that for you now.",
+            "Running that smart home command for you now.",
+            "Checking the live device status in Home Assistant now.",
+        )
+        return options[seed % len(options)]
+
+    if fn_name == "check_calendar":
+        options = (
+            "I'm checking your calendar and schedule for you now.",
+            "Pulling up your upcoming events and reminders now.",
+            "Checking the schedule for you now.",
+        )
+        return options[seed % len(options)]
+
+    if fn_name == "tv_and_plex_control":
+        options = (
+            "I'm sending that command to the living room TV now.",
+            "Updating the living room media playback for you now.",
+            "Checking the living room TV for you now.",
+        )
+        return options[seed % len(options)]
+
+    if fn_name == "check_3d_printer":
+        options = (
+            "I'm checking the 3D printer status and temperatures now.",
+            "Pulling up the live print job progress for you now.",
+            "Checking OctoPrint for the printer status now.",
+        )
+        return options[seed % len(options)]
+
+    if fn_name == "grocery_list_action":
+        options = (
+            "I'm updating the grocery list for you now.",
+            "Checking the grocery list and Whole Foods cart for you now.",
+            "Handling that grocery list update for you now.",
+        )
+        return options[seed % len(options)]
+
     options = (
         "I'm running a quick system check on that for you now.",
         "Pulling up those live system details for you now.",
@@ -1795,6 +1982,696 @@ def _queue_zero_runtime_turn(prompt_text: str, source: str = "gotchi-voice-hando
         return outbox.queue_agent_turn(ch_str, prompt_text, job_name=source)
 
 
+def _format_handoff_dual_delivery_prompt(task_prompt: str, node_id: str = "gotchi-ryan-01") -> str:
+    """
+    Formats a detached `#zero-chat` handoff prompt so Zero BOTH posts the detailed answer
+    in `#zero-chat` AND invokes `--push-pending-answer` to chime and speak the completion
+    summary on Gotchi (`get_lomin_pending_store()` + `/voice/pending`).
+    """
+    clean_task = (task_prompt or "").strip()
+    base = (
+        clean_task
+        if clean_task.startswith("[GOTCHI VOICE HANDOFF]:")
+        else f"[GOTCHI VOICE HANDOFF]: {clean_task}"
+    )
+    if "--push-pending-answer" in base:
+        return base
+    clean_node = (node_id or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
+    return (
+        f"{base}\n\n"
+        f"[DUAL-DELIVERY COMPLETION REQUIREMENT]:\n"
+        f"1) Post the full, detailed response/links in `#zero-chat` (`1542081375287640084`).\n"
+        f"2) Also push a concise 1-to-2 sentence spoken completion summary back to Gotchi so it chimes and speaks the result by running:\n"
+        f"   `python3 /workspace/tools/gotchi_zero_adapter.py --push-pending-answer "
+        f'\'{{"node_id": "{clean_node}", "prompt": {json.dumps(clean_task[:160])}, "answer": "<1-2 sentence spoken summary>"}}\'`'
+    )
+
+
+def push_gotchi_pending_notification(
+    node_id: str,
+    prompt: str,
+    answer: str,
+    topic: str = "",
+) -> Dict[str, Any]:
+    """
+    Stores a completed async voice answer in `get_lomin_pending_store()` and POSTs to
+    `http://127.0.0.1:8771/voice/pending` (with graceful local fallback if the gateway HTTP
+    endpoint is unreachable) so Gotchi's next `/api/voice/heartbeat` or `/voice/pending` poll
+    chimes and delivers the spoken summary.
+    """
+    clean_node = (node_id or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
+    clean_prompt = (prompt or "").strip()
+    clean_answer = clean_spoken_text_for_tts(answer) or (answer or "").strip()
+    clean_topic = (topic or "").strip() or (extract_topic(clean_prompt) if clean_prompt else "")
+
+    stored_item: Optional[Dict[str, Any]] = None
+    try:
+        from pending_and_auth import get_pending_store as _get_lomin_store  # type: ignore
+
+        stored_item = _get_lomin_store().store(
+            node_id=clean_node,
+            prompt=clean_prompt,
+            answer=clean_answer,
+            topic=clean_topic,
+        )
+    except Exception as exc:
+        log.debug(f"[GotchiZero] Local lomin pending store fallback note: {exc}")
+
+    try:
+        from backend.voice_gateway import PendingVoiceAnswerStore
+
+        gotchi_store = PendingVoiceAnswerStore()
+        ans_rec = gotchi_store.save_answer(
+            node_id=clean_node,
+            session_id=f"pending-{int(time.time() * 1000)}",
+            prompt=clean_prompt,
+            spoken_text=clean_answer,
+            full_text=answer or clean_answer,
+            topic=clean_topic,
+        )
+        gotchi_store.save_notification(
+            notify_id=f"notif-{ans_rec.get('answer_id', int(time.time() * 1000))}",
+            node_id=clean_node,
+            status_text=(clean_topic or "ANSWER READY")[:22].upper(),
+            chime="ready",
+            created_at=time.time(),
+            has_pending_audio=True,
+            answer_id=str(ans_rec.get("answer_id") or ""),
+            auto_speak=True,
+        )
+    except Exception as exc:
+        log.debug(f"[GotchiZero] Local PendingVoiceAnswerStore fallback note: {exc}")
+
+    port = int(os.environ.get("MVG_PORT", "8771") or 8771)
+    url = os.environ.get("GOTCHI_PENDING_URL") or f"http://127.0.0.1:{port}/voice/pending"
+    payload_bytes = json.dumps(
+        {
+            "node_id": clean_node,
+            "prompt": clean_prompt,
+            "answer": clean_answer,
+            "topic": clean_topic,
+        }
+    ).encode("utf-8")
+
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    try:
+        from pending_and_auth import get_device_token_verifier as _get_verifier  # type: ignore
+
+        verifier = _get_verifier()
+        if verifier.is_enabled:
+            tok = verifier.get_expected_token(clean_node)
+            if tok:
+                headers["Authorization"] = f"Bearer {tok}"
+    except Exception:
+        pass
+
+    http_posted = False
+    http_resp_data: Optional[Dict[str, Any]] = None
+    try:
+        req = urllib.request.Request(url, data=payload_bytes, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            if resp.status in (200, 201, 204):
+                http_posted = True
+                raw_body = resp.read().decode("utf-8", errors="replace").strip()
+                if raw_body:
+                    http_resp_data = json.loads(raw_body)
+                    if not stored_item and isinstance(http_resp_data, dict):
+                        stored_item = http_resp_data.get("pending") or http_resp_data.get("item")
+    except Exception as exc:
+        log.debug(f"[GotchiZero] POST {url} failed (using local pending store fallback): {exc}")
+
+    if stored_item is None:
+        stored_item = {
+            "id": f"local-{int(time.time() * 1000)}",
+            "node_id": clean_node,
+            "prompt": clean_prompt,
+            "answer": clean_answer,
+            "topic": clean_topic,
+            "created_at": time.time(),
+        }
+
+    return {
+        "ok": True,
+        "status": "ok",
+        "stored": True,
+        "http_posted": http_posted,
+        "node_id": clean_node,
+        "pending": stored_item,
+        "item": stored_item,
+    }
+
+
+GROCERY_LIST_FILE = Path("/workspace/data/grocery_list.json")
+
+
+def _run_home_assistant_control_sync(
+    action: str,
+    entity_id_or_query: str,
+    domain: str = "",
+    service: str = "",
+    service_data_json: str = "",
+) -> Dict[str, Any]:
+    """
+    Fast inline Home Assistant device state lookup or service call using `HA_BASE_URL` and
+    `HA_ACCESS_TOKEN` from environment or `/secrets/env.json` with a 3s timeout.
+    """
+    _, base_url, token, _ = _load_ha_credentials_from_env_or_secrets()
+    if not base_url or not token:
+        return {"error": "Home Assistant credentials (HA_BASE_URL / HA_ACCESS_TOKEN) are not configured."}
+
+    clean_action = (action or "state").strip().lower()
+    target = (entity_id_or_query or "").strip()
+    clean_domain = (domain or "").strip().lower()
+    clean_service = (service or "").strip().lower()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    is_service_call = clean_action in (
+        "call_service",
+        "service",
+        "turn_on",
+        "turn_off",
+        "toggle",
+        "lock",
+        "unlock",
+        "open_cover",
+        "close_cover",
+        "media_play",
+        "media_pause",
+        "media_play_pause",
+        "media_stop",
+        "volume_mute",
+        "volume_up",
+        "volume_down",
+        "set_temperature",
+    ) or bool(clean_service)
+
+    if is_service_call:
+        if not clean_service:
+            clean_service = clean_action if clean_action not in ("call_service", "service") else "toggle"
+        if not clean_domain:
+            if "." in target:
+                clean_domain = target.split(".", 1)[0].strip().lower()
+            else:
+                clean_domain = "homeassistant"
+        payload: Dict[str, Any] = {}
+        if service_data_json:
+            try:
+                parsed_sd = json.loads(service_data_json)
+                if isinstance(parsed_sd, dict):
+                    payload.update(parsed_sd)
+            except Exception as exc:
+                return {"error": f"Invalid service_data_json: {exc}"}
+        if target and "entity_id" not in payload:
+            payload["entity_id"] = target
+
+        svc_url = f"{base_url.rstrip('/')}/api/services/{clean_domain}/{clean_service}"
+        try:
+            req = urllib.request.Request(
+                svc_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                raw_resp = resp.read().decode("utf-8", errors="replace").strip()
+                changed = json.loads(raw_resp) if raw_resp else []
+            return {
+                "ok": True,
+                "action": "call_service",
+                "domain": clean_domain,
+                "service": clean_service,
+                "entity_id": payload.get("entity_id", target),
+                "changed_states_count": len(changed) if isinstance(changed, list) else 0,
+                "summary": f"Executed {clean_domain}.{clean_service} on {payload.get('entity_id', target)}.",
+            }
+        except Exception as exc:
+            return {"error": f"Home Assistant service call failed: {exc}"}
+
+    # State query path
+    try:
+        if "." in target and " " not in target:
+            state_url = f"{base_url.rstrip('/')}/api/states/{urllib.parse.quote(target)}"
+            req = urllib.request.Request(state_url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                st = json.loads(resp.read().decode("utf-8", errors="replace"))
+            attrs = st.get("attributes") or {}
+            friendly = attrs.get("friendly_name") or target
+            unit = attrs.get("unit_of_measurement") or ""
+            val = st.get("state", "unknown")
+            return {
+                "ok": True,
+                "entity_id": st.get("entity_id", target),
+                "state": val,
+                "unit": unit,
+                "friendly_name": friendly,
+                "attributes": {
+                    k: v
+                    for k, v in attrs.items()
+                    if k in ("friendly_name", "unit_of_measurement", "temperature", "current_temperature", "hvac_action", "brightness", "battery_level", "device_class")
+                },
+                "summary": f"{friendly} ({target}) is {val}{(' ' + unit) if unit else ''}.",
+            }
+
+        # Search across /api/states
+        all_url = f"{base_url.rstrip('/')}/api/states"
+        req = urllib.request.Request(all_url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            all_states = json.loads(resp.read().decode("utf-8", errors="replace"))
+        q_tokens = [t for t in re.split(r"[\s_.-]+", target.lower()) if t]
+        matches: List[Dict[str, Any]] = []
+        for st in all_states if isinstance(all_states, list) else []:
+            eid = str(st.get("entity_id") or "")
+            if clean_domain and not eid.startswith(f"{clean_domain}."):
+                continue
+            attrs = st.get("attributes") or {}
+            fname = str(attrs.get("friendly_name") or "")
+            hay = f"{eid} {fname}".lower()
+            if not q_tokens or all(tok in hay for tok in q_tokens):
+                unit = str(attrs.get("unit_of_measurement") or "")
+                matches.append(
+                    {
+                        "entity_id": eid,
+                        "friendly_name": fname or eid,
+                        "state": st.get("state"),
+                        "unit": unit,
+                    }
+                )
+        return {
+            "ok": True,
+            "query": target,
+            "count": len(matches),
+            "matches": matches[:15],
+        }
+    except Exception as exc:
+        return {"error": f"Home Assistant state lookup failed: {exc}"}
+
+
+def _run_check_calendar_sync(days_ahead: int = 2, query: str = "") -> Dict[str, Any]:
+    """
+    Reads upcoming scheduled reminders/jobs from `/workspace/data/schedule.json`
+    and Google Calendar events (if credentials are available).
+    """
+    try:
+        days = max(1, min(int(days_ahead or 2), 30))
+    except (ValueError, TypeError):
+        days = 2
+    clean_q = (query or "").strip().lower()
+    now_pt = datetime.now(PT_TZ)
+    cutoff_ts = now_pt.timestamp() + days * 86400
+
+    scheduled_items: List[Dict[str, Any]] = []
+    sched_path = Path(os.environ.get("GOTCHI_SCHEDULE_PATH", "/workspace/data/schedule.json"))
+    if sched_path.is_file():
+        try:
+            raw_sched = json.loads(sched_path.read_text(encoding="utf-8", errors="replace"))
+            jobs = raw_sched if isinstance(raw_sched, list) else raw_sched.get("jobs", [])
+            for job in jobs:
+                if not isinstance(job, dict) or not job.get("enabled", True):
+                    continue
+                name = str(job.get("name") or job.get("id") or "")
+                prompt_txt = str(job.get("prompt") or "")
+                stype = str(job.get("schedule_type") or "")
+                next_ts = job.get("next_run_ts")
+                if clean_q and clean_q not in f"{name} {prompt_txt} {stype}".lower():
+                    continue
+                if isinstance(next_ts, (int, float)) and next_ts > cutoff_ts and not clean_q:
+                    continue
+                when_str = ""
+                if isinstance(next_ts, (int, float)) and next_ts > 0:
+                    when_str = datetime.fromtimestamp(float(next_ts), tz=PT_TZ).strftime(
+                        "%a %b %d %-I:%M %p PT"
+                    )
+                elif "hour_pt" in job:
+                    when_str = f"{stype} at {int(job.get('hour_pt', 0)):02d}:{int(job.get('minute_pt', 0)):02d} PT"
+                scheduled_items.append(
+                    {
+                        "id": job.get("id"),
+                        "name": name,
+                        "schedule_type": stype,
+                        "when": when_str,
+                        "next_run_ts": next_ts,
+                    }
+                )
+        except Exception as exc:
+            log.debug(f"[GotchiZero] schedule.json read warning: {exc}")
+
+    gcal_events: List[Dict[str, Any]] = []
+    try:
+        from tools.workspace_mcp import _auth_headers, CALENDAR_BASE  # type: ignore
+
+        headers = _auth_headers()
+        time_min = datetime.now(ZoneInfo("UTC")).isoformat()
+        time_max = datetime.fromtimestamp(cutoff_ts, tz=ZoneInfo("UTC")).isoformat()
+        for cid, cal_label in (
+            ("primary", "Ryan"),
+            ("family05249951047154432652@group.calendar.google.com", "Family"),
+        ):
+            params = urllib.parse.urlencode(
+                {
+                    "timeMin": time_min,
+                    "timeMax": time_max,
+                    "singleEvents": "true",
+                    "orderBy": "startTime",
+                    "maxResults": 20,
+                }
+            )
+            url = f"{CALENDAR_BASE}/calendars/{urllib.parse.quote(cid)}/events?{params}"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            for ev in data.get("items", []):
+                summary = str(ev.get("summary") or "Untitled").strip()
+                start_val = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date") or ""
+                loc = str(ev.get("location") or "").strip()
+                if clean_q and clean_q not in f"{summary} {loc}".lower():
+                    continue
+                gcal_events.append(
+                    {
+                        "calendar": cal_label,
+                        "summary": summary,
+                        "start": start_val,
+                        "location": loc,
+                    }
+                )
+    except Exception as exc:
+        log.debug(f"[GotchiZero] Google Calendar lookup skipped/failed: {exc}")
+
+    return {
+        "ok": True,
+        "days_ahead": days,
+        "query": query,
+        "calendar_events": gcal_events[:20],
+        "scheduled_reminders": scheduled_items[:20],
+    }
+
+
+def _run_tv_and_plex_control_sync(action: str, media_query: str = "") -> Dict[str, Any]:
+    """
+    Controls the Living Room TV via Home Assistant `media_player` or launches Plex movies/shows
+    (`plex_play.py` / `plex_playback.py`) or live MLB streams (`mlb_stream_extractor.py` / `mlb_stream.py`).
+    """
+    clean_action = (action or "status").strip().lower()
+    clean_query = (media_query or "").strip()
+
+    if clean_action in ("mlb", "baseball", "mlb_stream") or (
+        clean_action in ("play", "watch", "stream")
+        and any(w in clean_query.lower() for w in ("cubs", "dodgers", "giants", "yankees", "mlb", "baseball", "red sox", "padres", "mets", "braves", "phillies", "astros", "mariners"))
+    ):
+        team = clean_query or "cubs"
+        script = (
+            "/workspace/tools/mlb_stream_extractor.py"
+            if Path("/workspace/tools/mlb_stream_extractor.py").exists()
+            else "/workspace/tools/mlb_stream.py"
+        )
+        try:
+            res = subprocess.run(
+                ["python3", script, "--team", team, "--cast"],
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+            return {
+                "ok": res.returncode == 0,
+                "action": "mlb_stream",
+                "team": team,
+                "exit_code": res.returncode,
+                "output": (res.stdout or res.stderr or "").strip()[:1500],
+            }
+        except Exception as exc:
+            return {"error": f"MLB stream launch failed: {exc}"}
+
+    if clean_action in ("plex", "play_plex", "movie", "show") or (
+        clean_action in ("play", "watch", "put_on") and clean_query
+    ):
+        if not clean_query:
+            return {"error": "media_query is required to play a title on Plex."}
+        script = (
+            "/workspace/tools/plex_play.py"
+            if Path("/workspace/tools/plex_play.py").exists()
+            else "/workspace/tools/plex_playback.py"
+        )
+        try:
+            res = subprocess.run(
+                ["python3", script, clean_query],
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+            return {
+                "ok": res.returncode == 0,
+                "action": "plex_playback",
+                "media_query": clean_query,
+                "exit_code": res.returncode,
+                "output": (res.stdout or res.stderr or "").strip()[:1500],
+            }
+        except Exception as exc:
+            return {"error": f"Plex playback failed: {exc}"}
+
+    tv_entity = os.environ.get("GOTCHI_LIVING_ROOM_TV_ENTITY", "media_player.living_room_tv_2")
+    if clean_action in ("status", "state", "check"):
+        return _run_home_assistant_control_sync("state", tv_entity)
+
+    service_map = {
+        "pause": ("media_player", "media_pause"),
+        "play": ("media_player", "media_play"),
+        "resume": ("media_player", "media_play"),
+        "play_pause": ("media_player", "media_play_pause"),
+        "stop": ("media_player", "media_stop"),
+        "turn_off": ("media_player", "turn_off"),
+        "off": ("media_player", "turn_off"),
+        "power_off": ("media_player", "turn_off"),
+        "turn_on": ("media_player", "turn_on"),
+        "on": ("media_player", "turn_on"),
+        "power_on": ("media_player", "turn_on"),
+        "volume_up": ("media_player", "volume_up"),
+        "volume_down": ("media_player", "volume_down"),
+        "mute": ("media_player", "volume_mute"),
+    }
+    dom, svc = service_map.get(clean_action, ("media_player", clean_action))
+    extra_json = json.dumps({"is_volume_muted": True}) if svc == "volume_mute" else ""
+    return _run_home_assistant_control_sync(
+        action="call_service",
+        entity_id_or_query=tv_entity,
+        domain=dom,
+        service=svc,
+        service_data_json=extra_json,
+    )
+
+
+def _run_check_3d_printer_sync() -> Dict[str, Any]:
+    """
+    Queries OctoPrint / Moonraker API (resolved from environment, `/secrets/env.json`, or `nas_config`)
+    with a 2s timeout for live print job progress and nozzle/bed temperatures.
+    """
+    base_url = (
+        os.environ.get("OCTOPRINT_URL")
+        or os.environ.get("MOONRAKER_URL")
+        or ""
+    ).strip()
+    api_key = (os.environ.get("OCTOPRINT_API_KEY") or "").strip()
+
+    sec_path = Path("/secrets/env.json")
+    if sec_path.is_file():
+        try:
+            sec = json.loads(sec_path.read_text(encoding="utf-8", errors="replace"))
+            if not base_url:
+                base_url = str(
+                    sec.get("OCTOPRINT_URL")
+                    or sec.get("OCTOPRINT_BASE_URL")
+                    or sec.get("MOONRAKER_URL")
+                    or ""
+                ).strip()
+            if not api_key:
+                api_key = str(sec.get("OCTOPRINT_API_KEY") or sec.get("OCTOPRINT_KEY") or "").strip()
+        except Exception:
+            pass
+
+    if not base_url:
+        try:
+            import tools.nas_config as _nc
+
+            base_url = f"http://{_nc.HOST_2_IP}:8888"
+        except Exception:
+            base_url = "http://127.0.0.1:8888"
+    if not api_key:
+        try:
+            from tools.zero_printer_watcher import OCTOPRINT_DEFAULT_KEY
+
+            api_key = OCTOPRINT_DEFAULT_KEY
+        except Exception:
+            api_key = ""
+
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["X-Api-Key"] = api_key
+
+    job_data: Dict[str, Any] = {}
+    printer_data: Dict[str, Any] = {}
+    errors: List[str] = []
+
+    try:
+        req_job = urllib.request.Request(f"{base_url.rstrip('/')}/api/job", headers=headers, method="GET")
+        with urllib.request.urlopen(req_job, timeout=2.0) as resp:
+            job_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as exc:
+        errors.append(f"job: {exc}")
+
+    try:
+        req_prn = urllib.request.Request(f"{base_url.rstrip('/')}/api/printer", headers=headers, method="GET")
+        with urllib.request.urlopen(req_prn, timeout=2.0) as resp:
+            printer_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as exc:
+        errors.append(f"printer: {exc}")
+
+    if not job_data and not printer_data:
+        watcher_status = Path("/workspace/data/3dprint/watcher_status.json")
+        if watcher_status.is_file():
+            try:
+                cached = json.loads(watcher_status.read_text(encoding="utf-8", errors="replace"))
+                return {"ok": True, "source": "watcher_status.json", **cached}
+            except Exception:
+                pass
+        return {
+            "ok": False,
+            "state": "Offline / Unreachable",
+            "error": "; ".join(errors) or "Printer API unreachable",
+        }
+
+    state = str(job_data.get("state") or (printer_data.get("state") or {}).get("text") or "Unknown")
+    prog = job_data.get("progress") or {}
+    completion = prog.get("completion")
+    print_time = prog.get("printTime")
+    print_time_left = prog.get("printTimeLeft")
+    file_name = ((job_data.get("job") or {}).get("file") or {}).get("name") or ""
+
+    temps = printer_data.get("temperature") or {}
+    tool0 = temps.get("tool0") or {}
+    bed = temps.get("bed") or {}
+
+    return {
+        "ok": True,
+        "state": state,
+        "file": file_name,
+        "completion_pct": round(float(completion), 1) if isinstance(completion, (int, float)) else None,
+        "print_time_s": print_time,
+        "print_time_left_s": print_time_left,
+        "nozzle_temp_c": tool0.get("actual"),
+        "nozzle_target_c": tool0.get("target"),
+        "bed_temp_c": bed.get("actual"),
+        "bed_target_c": bed.get("target"),
+    }
+
+
+def _run_grocery_list_action_sync(action: str, items: str = "") -> Dict[str, Any]:
+    """
+    Adds/lists/clears items in `/workspace/data/grocery_list.json` or builds a 1-click
+    Whole Foods AFX cart link (`tools/whole_foods_afx.py`) and posts it to `#zero-chat`.
+    """
+    clean_action = (action or "list").strip().lower()
+    raw_items = [
+        i.strip()
+        for i in re.split(r"[,;\n]+", str(items or ""))
+        if i and i.strip()
+    ]
+
+    list_path = GROCERY_LIST_FILE
+    list_path.parent.mkdir(parents=True, exist_ok=True)
+    current_items: List[str] = []
+    if list_path.is_file():
+        try:
+            loaded = json.loads(list_path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(loaded, list):
+                current_items = [str(x).strip() for x in loaded if str(x).strip()]
+            elif isinstance(loaded, dict):
+                current_items = [str(x).strip() for x in loaded.get("items", []) if str(x).strip()]
+        except Exception:
+            current_items = []
+
+    if clean_action in ("add", "append"):
+        if not raw_items:
+            return {"error": "No items provided to add."}
+        existing_lower = {x.lower() for x in current_items}
+        added: List[str] = []
+        for it in raw_items:
+            if it.lower() not in existing_lower:
+                current_items.append(it)
+                existing_lower.add(it.lower())
+                added.append(it)
+        list_path.write_text(
+            json.dumps({"items": current_items, "updated_at": time.time()}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "ok": True,
+            "action": "add",
+            "added": added,
+            "items": current_items,
+            "count": len(current_items),
+        }
+
+    if clean_action in ("remove", "delete"):
+        remove_lower = {x.lower() for x in raw_items}
+        kept = [x for x in current_items if x.lower() not in remove_lower]
+        list_path.write_text(
+            json.dumps({"items": kept, "updated_at": time.time()}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return {"ok": True, "action": "remove", "items": kept, "count": len(kept)}
+
+    if clean_action == "clear":
+        list_path.write_text(
+            json.dumps({"items": [], "updated_at": time.time()}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return {"ok": True, "action": "clear", "items": [], "count": 0}
+
+    if clean_action in ("cart", "afx", "whole_foods", "stage_cart", "build_cart"):
+        cart_source = raw_items or current_items
+        if not cart_source:
+            return {"error": "Grocery list is empty; provide items or add items first."}
+        if raw_items:
+            existing_lower = {x.lower() for x in current_items}
+            for it in raw_items:
+                if it.lower() not in existing_lower:
+                    current_items.append(it)
+                    existing_lower.add(it.lower())
+            list_path.write_text(
+                json.dumps({"items": current_items, "updated_at": time.time()}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        from tools.whole_foods_afx import generate_afx_url, normalize_ingredient_name
+
+        manifest = [
+            {"name": normalize_ingredient_name(it), "amount": 1.0, "unit": "COUNT"}
+            for it in cart_source
+        ]
+        afx_url = generate_afx_url(manifest)
+        bullet_list = "\n".join(f"- {m['name']}" for m in manifest)
+        msg = (
+            f"🛒 **[Whole Foods 1-Click Cart Ready](<{afx_url}>)** ({len(manifest)} items):\n"
+            f"{bullet_list}"
+        )
+        send_gotchi_artifact_to_zero_chat(message=msg, mirror_gotchi_chat=False)
+        return {
+            "ok": True,
+            "action": "cart",
+            "afx_url": afx_url,
+            "items": [m["name"] for m in manifest],
+            "count": len(manifest),
+            "posted_to_zero_chat": True,
+        }
+
+    return {
+        "ok": True,
+        "action": "list",
+        "items": current_items,
+        "count": len(current_items),
+    }
+
+
 async def execute_gotchi_tool_call(
     name: str,
     args: Dict[str, Any],
@@ -1851,13 +2728,10 @@ async def execute_gotchi_tool_call(
     if name == "handoff_to_zero_runtime":
         task_prompt = str(args.get("task_prompt") or args.get("prompt") or "").strip()
         spoken_ack = str(args.get("spoken_ack") or "I'm kicking that off in Zero-Chat for you now.").strip()
+        node_id = str(args.get("node_id") or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
         if not task_prompt:
             return {"error": "Empty task_prompt"}
-        handoff_payload = (
-            task_prompt
-            if task_prompt.startswith("[GOTCHI VOICE HANDOFF]:")
-            else f"[GOTCHI VOICE HANDOFF]: {task_prompt}"
-        )
+        handoff_payload = _format_handoff_dual_delivery_prompt(task_prompt, node_id=node_id)
         queued = await asyncio.to_thread(
             _queue_zero_runtime_turn,
             handoff_payload,
@@ -1871,6 +2745,40 @@ async def execute_gotchi_tool_call(
             "spoken_ack": spoken_ack,
             "queued": queued,
         }
+
+    if name == "home_assistant_control":
+        return await asyncio.to_thread(
+            _run_home_assistant_control_sync,
+            str(args.get("action") or "state"),
+            str(args.get("entity_id_or_query") or args.get("entity_id") or args.get("query") or ""),
+            str(args.get("domain") or ""),
+            str(args.get("service") or ""),
+            str(args.get("service_data_json") or ""),
+        )
+
+    if name == "check_calendar":
+        return await asyncio.to_thread(
+            _run_check_calendar_sync,
+            int(args.get("days_ahead", 2) or 2),
+            str(args.get("query") or ""),
+        )
+
+    if name == "tv_and_plex_control":
+        return await asyncio.to_thread(
+            _run_tv_and_plex_control_sync,
+            str(args.get("action") or "status"),
+            str(args.get("media_query") or args.get("query") or ""),
+        )
+
+    if name == "check_3d_printer":
+        return await asyncio.to_thread(_run_check_3d_printer_sync)
+
+    if name == "grocery_list_action":
+        return await asyncio.to_thread(
+            _run_grocery_list_action_sync,
+            str(args.get("action") or "list"),
+            str(args.get("items") or ""),
+        )
 
     if name == "get_weather_forecast":
         loc = str(args.get("location", "") or "").strip() or DEFAULT_HOME_LOCATION
@@ -2466,6 +3374,7 @@ class GotchiZeroBrainAdapter:
         self._genai_client: Optional[Any] = None
         self._cached_content_name: Optional[str] = None
         self._cached_content_model: Optional[str] = None
+        self._cached_content_fingerprint: Optional[str] = None
         self._cached_content_expires_at: float = 0.0
         self.context_cache_ttl_sec: int = int(
             os.environ.get("GOTCHI_CONTEXT_CACHE_TTL_SEC", "3600") or 3600
@@ -2482,9 +3391,11 @@ class GotchiZeroBrainAdapter:
         if cache_enabled in ("0", "false", "no", "off"):
             return None
         now_mono = time.monotonic()
+        current_fingerprint = _compute_context_cache_fingerprint(static_sys_prompt, tools_list)
         if (
             self._cached_content_name
             and self._cached_content_model == model
+            and self._cached_content_fingerprint == current_fingerprint
             and now_mono < self._cached_content_expires_at
         ):
             return self._cached_content_name
@@ -2510,6 +3421,7 @@ class GotchiZeroBrainAdapter:
             if cache_name:
                 self._cached_content_name = str(cache_name)
                 self._cached_content_model = model
+                self._cached_content_fingerprint = current_fingerprint
                 # Refresh slightly before strict TTL expiry (with a 60s safety margin when TTL > 120s)
                 safety_margin = 60.0 if self.context_cache_ttl_sec > 120 else 0.0
                 self._cached_content_expires_at = time.monotonic() + max(
@@ -2519,6 +3431,8 @@ class GotchiZeroBrainAdapter:
         except Exception:
             pass
         return None
+
+    _get_or_create_cached_content = _get_or_create_context_cache
 
     def _is_subscription_mode(self) -> bool:
         mode = self.brain_mode or os.environ.get("GOTCHI_BRAIN_MODE", "").strip().lower()
