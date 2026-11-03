@@ -694,7 +694,7 @@ class TestAmbientMemoryPreFetch(unittest.TestCase):
         )
         if res:
             self.assertIn("[ACTIVE MEMORY CONTEXT]:", res)
-            self.assertIn("amazon_purchasing_patterns", res)
+            self.assertIn("Memory Grounding Directive", res)
 
 
 class TestBridgeEmojiReactions(unittest.IsolatedAsyncioTestCase):
@@ -844,6 +844,82 @@ class TestBridgeEmojiReactions(unittest.IsolatedAsyncioTestCase):
         zc_args, zc_kwargs = zero_chat_mock.send.call_args
         self.assertIn(f"📍 **Decision routed from <#{lounge_cid}>:**", zc_args[0])
         self.assertEqual(zc_kwargs["view"], "MOCK_LOUNGE_VIEW")
+
+    async def test_deliver_projects_home_channel_keeps_choices_in_channel_even_if_external_mode(self):
+        """Verify deliver_turn_output for #projects (1548196930788524094) keeps [CHOICES: ...] buttons in #projects even if mode='external' and never posts a routed decision card to #zero-chat."""
+        from tools.bridge_state import TARGET_CHANNEL_ID
+        projects_cid = 1548196930788524094
+
+        status_msg = AsyncMock()
+        reply_target = AsyncMock()
+        reply_target.channel = MagicMock()
+        reply_target.channel.id = projects_cid
+
+        bot = MagicMock()
+        zero_chat_mock = AsyncMock()
+        bot.get_channel.side_effect = lambda cid: zero_chat_mock if cid == TARGET_CHANNEL_ID else None
+        mock_view_cls = MagicMock(return_value="MOCK_PROJECTS_VIEW")
+        mock_btn_fn = MagicMock()
+
+        output_text = "FORGE build completed in #projects.\n\n[CHOICES: Merge PR | Run Follow-up]"
+
+        await deliver_turn_output(
+            output_text=output_text,
+            status_msg=status_msg,
+            reply_target=reply_target,
+            mode="external",
+            channel_id=projects_cid,
+            conv_id="conv-projects-1",
+            turn_start_time=time.time(),
+            button_choice_fn=mock_btn_fn,
+            quick_choice_view_cls=mock_view_cls,
+            bot=bot,
+        )
+
+        status_msg.edit.assert_awaited_once()
+        edit_kwargs = status_msg.edit.call_args[1]
+        self.assertIn("FORGE build completed in #projects.", edit_kwargs["content"])
+        self.assertNotIn("[CHOICES:", edit_kwargs["content"])
+        self.assertEqual(edit_kwargs["view"], "MOCK_PROJECTS_VIEW")
+        zero_chat_mock.send.assert_not_called()
+
+    async def test_deliver_projects_home_channel_mode_home_keeps_choices_in_channel(self):
+        """Verify deliver_turn_output for #projects (1548196930788524094) in mode='home' keeps [CHOICES: ...] buttons attached in #projects and never routes to #zero-chat."""
+        from tools.bridge_state import TARGET_CHANNEL_ID
+        projects_cid = 1548196930788524094
+
+        status_msg = None
+        reply_target = MagicMock(spec=["send", "id"])
+        reply_target.id = projects_cid
+        reply_target.send = AsyncMock()
+
+        bot = MagicMock()
+        zero_chat_mock = AsyncMock()
+        bot.get_channel.side_effect = lambda cid: zero_chat_mock if cid == TARGET_CHANNEL_ID else None
+        mock_view_cls = MagicMock(return_value="MOCK_PROJECTS_HOME_VIEW")
+        mock_btn_fn = MagicMock()
+
+        output_text = "Outbox synthesis turn completed in #projects.\n\n[CHOICES: Approve Plan | Dismiss]"
+
+        await deliver_turn_output(
+            output_text=output_text,
+            status_msg=status_msg,
+            reply_target=reply_target,
+            mode="home",
+            channel_id=projects_cid,
+            conv_id="conv-projects-2",
+            turn_start_time=time.time(),
+            button_choice_fn=mock_btn_fn,
+            quick_choice_view_cls=mock_view_cls,
+            bot=bot,
+        )
+
+        reply_target.send.assert_awaited_once()
+        send_args, send_kwargs = reply_target.send.call_args
+        self.assertIn("Outbox synthesis turn completed in #projects.", send_args[0])
+        self.assertNotIn("[CHOICES:", send_args[0])
+        self.assertEqual(send_kwargs["view"], "MOCK_PROJECTS_HOME_VIEW")
+        zero_chat_mock.send.assert_not_called()
 
 
 if __name__ == "__main__":

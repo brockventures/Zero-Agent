@@ -643,6 +643,8 @@ async def _send_routed_choice_card(
     status_msg: Any = None,
 ) -> None:
     """Send a routed decision choice view to #zero-chat with origin attribution."""
+    if dest_cid is not None and is_home_channel(dest_cid):
+        return
     try:
         target_bot = bot
         if target_bot is None:
@@ -977,6 +979,7 @@ async def deliver_turn_output(
                 dest_cid = None
 
         is_banana_stand = (dest_cid == BANANA_STAND_CHANNEL_ID)
+        dest_is_home = is_home_channel(target_dest) or (dest_cid is not None and is_home_channel(dest_cid)) or is_home_channel(channel_id)
         held_turn_banana = False
 
         if is_banana_stand:
@@ -991,21 +994,26 @@ async def deliver_turn_output(
         try:
             if existing_messages:
                 for idx, ch in enumerate(chunks):
+                    is_last_chunk = (idx == len(chunks) - 1)
+                    v_arg = (ext_choice_view if (dest_is_home and is_last_chunk) else None)
                     if idx < len(existing_messages):
                         try:
-                            await existing_messages[idx].edit(content=ch)
+                            if v_arg is not None:
+                                await existing_messages[idx].edit(content=ch, view=v_arg)
+                            else:
+                                await existing_messages[idx].edit(content=ch)
                             sent_messages.append(existing_messages[idx])
                             continue
                         except Exception as edit_err:
                             print(f"[BridgePipeline] Failed to edit existing message {idx} ({edit_err}), sending new...")
                     try:
                         if hasattr(target_dest, "reply"):
-                            m = await target_dest.reply(ch)
+                            m = await (target_dest.reply(ch, view=v_arg) if v_arg is not None else target_dest.reply(ch))
                         else:
-                            m = await target_dest.send(ch)
+                            m = await (target_dest.send(ch, view=v_arg) if v_arg is not None else target_dest.send(ch))
                     except Exception:
                         target_ch = getattr(target_dest, "channel", target_dest)
-                        m = await target_ch.send(ch)
+                        m = await (target_ch.send(ch, view=v_arg) if v_arg is not None else target_ch.send(ch))
                     if m:
                         sent_messages.append(m)
                 for extra_msg in existing_messages[len(chunks):]:
@@ -1014,46 +1022,52 @@ async def deliver_turn_output(
                     except Exception:
                         pass
             else:
+                v_arg0 = ext_choice_view if (dest_is_home and len(chunks) == 1) else None
                 if status_msg:
                     try:
-                        m0 = await status_msg.edit(content=chunks[0])
+                        if v_arg0 is not None:
+                            m0 = await status_msg.edit(content=chunks[0], view=v_arg0)
+                        else:
+                            m0 = await status_msg.edit(content=chunks[0])
                         sent_messages.append(m0 or status_msg)
                     except Exception as edit_err:
                         print(f"[BridgePipeline] Failed to edit status message ({edit_err}), falling back to reply...")
                         if hasattr(target_dest, "reply"):
-                            m0 = await target_dest.reply(chunks[0])
+                            m0 = await (target_dest.reply(chunks[0], view=v_arg0) if v_arg0 is not None else target_dest.reply(chunks[0]))
                         else:
-                            m0 = await target_dest.send(chunks[0])
+                            m0 = await (target_dest.send(chunks[0], view=v_arg0) if v_arg0 is not None else target_dest.send(chunks[0]))
                         if m0:
                             sent_messages.append(m0)
                 else:
                     try:
                         if hasattr(target_dest, "reply"):
-                            m0 = await target_dest.reply(chunks[0])
+                            m0 = await (target_dest.reply(chunks[0], view=v_arg0) if v_arg0 is not None else target_dest.reply(chunks[0]))
                         else:
-                            m0 = await target_dest.send(chunks[0])
+                            m0 = await (target_dest.send(chunks[0], view=v_arg0) if v_arg0 is not None else target_dest.send(chunks[0]))
                     except Exception as reply_err:
                         print(f"[BridgePipeline] target_dest delivery failed ({reply_err}), falling back to channel.send...")
                         target_ch = getattr(target_dest, "channel", target_dest)
-                        m0 = await target_ch.send(chunks[0])
+                        m0 = await (target_ch.send(chunks[0], view=v_arg0) if v_arg0 is not None else target_ch.send(chunks[0]))
                     if m0:
                         sent_messages.append(m0)
 
-                for ch in chunks[1:]:
+                for idx_extra, ch in enumerate(chunks[1:]):
+                    is_last_extra = (idx_extra == len(chunks[1:]) - 1)
+                    v_extra = ext_choice_view if (dest_is_home and is_last_extra) else None
                     try:
                         if hasattr(target_dest, "reply"):
-                            m = await target_dest.reply(ch)
+                            m = await (target_dest.reply(ch, view=v_extra) if v_extra is not None else target_dest.reply(ch))
                         else:
-                            m = await target_dest.send(ch)
+                            m = await (target_dest.send(ch, view=v_extra) if v_extra is not None else target_dest.send(ch))
                     except Exception:
                         target_ch = getattr(target_dest, "channel", target_dest)
-                        m = await target_ch.send(ch)
+                        m = await (target_ch.send(ch, view=v_extra) if v_extra is not None else target_ch.send(ch))
                     if m:
                         sent_messages.append(m)
 
             increment_bot_messages(len(chunks))
 
-            if ext_choice_view:
+            if ext_choice_view and not dest_is_home:
                 last_chunk = chunks[-1][:400] if chunks else ""
                 await _send_routed_choice_card(
                     bot=bot,
@@ -1282,7 +1296,8 @@ async def deliver_turn_output(
             dest_cid = None
 
     routed_choice_view = None
-    if choice_view and (mode != "home" or (dest_cid is not None and not is_home_channel(dest_cid))):
+    dest_is_home = is_home_channel(target_dest) or (dest_cid is not None and is_home_channel(dest_cid)) or is_home_channel(channel_id)
+    if choice_view and not dest_is_home:
         routed_choice_view = choice_view
         choice_view = None
 

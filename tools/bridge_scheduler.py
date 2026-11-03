@@ -21,6 +21,7 @@ from tools.bridge_state import (
     FINANCES_CHANNEL_ID,
     VAULT_CHANNEL_ID,
     PT_TZ,
+    is_home_channel,
     update_beacon,
 )
 
@@ -230,7 +231,7 @@ async def dispatch_scheduled_prompt(
             if not ch:
                 print(f"[Scheduler] Could not fetch channel {target_cid} for outbox agent turn")
                 return
-            mode = "home" if target_cid == TARGET_CHANNEL_ID else "external"
+            mode = "home" if (target_cid == TARGET_CHANNEL_ID or is_home_channel(ch) or is_home_channel(target_cid)) else "external"
             await turn_queue.put({
                 "prompt": prompt,
                 "status_msg": None,
@@ -1461,7 +1462,7 @@ async def dispatch_scheduled_prompt(
             return
 
         # Do not send noisy interstitial "scheduled" placeholder messages into Discord scrollback
-        mode = "home" if target_cid == TARGET_CHANNEL_ID else "external"
+        mode = "home" if (target_cid == TARGET_CHANNEL_ID or is_home_channel(ch) or is_home_channel(target_cid)) else "external"
         is_outbox_turn = bool(job_id and str(job_id).startswith("outbox_turn_"))
         _model_override = None if is_outbox_turn else "gemini-3.8-flash-low"
         if not is_outbox_turn:
