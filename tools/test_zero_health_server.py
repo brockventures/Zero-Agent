@@ -13,9 +13,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+CURRENT_DIR = Path(__file__).resolve().parent.parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
 WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE))
+    sys.path.append(str(WORKSPACE))
 
 import tools.zero_health_server as zhealth
 
@@ -237,6 +240,98 @@ class TestZeroHealthServer(unittest.TestCase):
         self.assertLess(html.index("Seerr"), html.index("Plex"))
         self.assertLess(html.index("Plex"), html.index("Shelfmark"))
         self.assertLess(html.index("Shelfmark"), html.index("Books Library"))
+
+    def test_check_gotchi_external_auth_and_strip_headers(self):
+        import io
+        from unittest.mock import MagicMock
+
+        (self.temp_path / "gotchi_bearer_token.json").write_text(json.dumps({"token": "secret-gotchi-tok-123"}))
+
+        def make_handler(path: str, headers: dict):
+            h = zhealth.ZeroHealthHandler.__new__(zhealth.ZeroHealthHandler)
+            h.path = path
+            h.headers = headers
+            h.rfile = io.BytesIO(b"")
+            h.wfile = io.BytesIO()
+            h.send_response = MagicMock()
+            h.send_header = MagicMock()
+            h.end_headers = MagicMock()
+            return h
+
+        # 1. Local/LAN request without Cf-Connecting-Ip passes
+        h1 = make_handler("/api/voice/logs", {})
+        self.assertTrue(h1._check_gotchi_external_auth())
+
+        # 2. External request with case-insensitive / whitespace-padded Bearer token passes
+        h2 = make_handler(
+            "/api/voice/logs",
+            {"Cf-Connecting-Ip": "198.51.100.42", "authorization": "  bEaReR   secret-gotchi-tok-123  "},
+        )
+        self.assertTrue(h2._check_gotchi_external_auth())
+
+        # 3. External request to /api/voice/interact, /api/gotchi/*, and /gotchi.apk passes without token
+        for exempt_path in ("/api/voice/interact", "/api/gotchi/notify?node_id=gotchi-v1", "/gotchi.apk"):
+            hx = make_handler(exempt_path, {"CF-Connecting-IP": "198.51.100.42"})
+            self.assertTrue(hx._check_gotchi_external_auth(), f"Expected {exempt_path} to pass")
+
+        # 4. External request to non-exempt endpoint with invalid token returns False and 401
+        h4 = make_handler(
+            "/api/config/llm",
+            {"Cf-Connecting-Ip": "198.51.100.42", "Authorization": "Bearer wrong-token"},
+        )
+        self.assertFalse(h4._check_gotchi_external_auth())
+        h4.send_response.assert_called_once_with(401)
+
+        # 5. _proxy_to_gotchi_gateway strips Authorization header before forwarding to 127.0.0.1:8771
+        hp = make_handler(
+            "/api/voice/interact",
+            {
+                "Cf-Connecting-Ip": "198.51.100.42",
+                "Authorization": "Bearer stale-phone-token",
+                "Content-Type": "multipart/form-data; boundary=abc",
+                "Content-Length": "4",
+            },
+        )
+        hp.rfile = io.BytesIO(b"test")
+        with patch.object(hp, "_ensure_gotchi_gateway_up"), patch("http.client.HTTPConnection") as mock_conn_cls:
+            mock_conn = MagicMock()
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.getheaders.return_value = [("Content-Type", "application/json")]
+            mock_resp.read.return_value = b'{"ok":true}'
+            mock_conn.getresponse.return_value = mock_resp
+            mock_conn_cls.return_value = mock_conn
+
+            hp._proxy_to_gotchi_gateway("POST")
+
+            self.assertTrue(mock_conn.request.called)
+            _, kwargs = mock_conn.request.call_args
+            forwarded_headers = {k.lower(): v for k, v in kwargs["headers"].items()}
+            self.assertNotIn("authorization", forwarded_headers)
+
+    def test_serve_gotchi_forwarder_apk(self):
+        import io
+        from unittest.mock import MagicMock
+
+        dummy_apk = self.temp_path / "dummy.apk"
+        dummy_apk.write_bytes(b"PK\x03\x04dummy-apk-payload")
+
+        h = zhealth.ZeroHealthHandler.__new__(zhealth.ZeroHealthHandler)
+        h.path = "/gotchi.apk"
+        h.headers = {"Host": "gotchi.brock.ventures"}
+        h.wfile = io.BytesIO()
+        h.send_response = MagicMock()
+        h.send_header = MagicMock()
+        h.end_headers = MagicMock()
+
+        with patch.object(zhealth.ZeroHealthHandler, "_resolve_gotchi_forwarder_apk", return_value=dummy_apk):
+            h.do_GET()
+
+        h.send_response.assert_called_once_with(200)
+        sent_headers = {call.args[0]: call.args[1] for call in h.send_header.call_args_list}
+        self.assertEqual(sent_headers.get("Content-Type"), "application/vnd.android.package-archive")
+        self.assertEqual(sent_headers.get("Content-Disposition"), 'attachment; filename="gotchi-v2.apk"')
+        self.assertEqual(h.wfile.getvalue(), b"PK\x03\x04dummy-apk-payload")
 
 
 if __name__ == "__main__":

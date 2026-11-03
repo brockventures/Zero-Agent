@@ -924,6 +924,15 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         elif clean_path in ("/gotchi", "/gotchi/assembly"):
             code = 200
             content_type = "text/html; charset=utf-8"
+        elif clean_path in (
+            "/gotchi.apk",
+            "/api/gotchi/forwarder/apk.apk",
+            "/api/app/forwarder/apk",
+            "/api/app/forwarder/apk.apk",
+        ):
+            apk_path = self._resolve_gotchi_forwarder_apk()
+            code = 200 if apk_path else 404
+            content_type = "application/vnd.android.package-archive" if apk_path else "application/json"
         elif clean_path.startswith("/gotchi/assets/"):
             code = 200
             content_type = "image/png"
@@ -1004,14 +1013,123 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 if s.connect_ex(("127.0.0.1", 8771)) == 0:
                     break
 
+    @staticmethod
+    def _resolve_gotchi_forwarder_apk() -> Path | None:
+        apk_candidates = [
+            Path("/workspace/data/gotchi-ble-forwarder-debug.apk"),
+            Path("/workspace/gotchi/android-ble-forwarder/releases/gotchi-ble-forwarder-debug.apk"),
+            Path("/workspace/scratch/gotchi-ble-forwarder-debug.apk"),
+            Path("/workspace/gotchi/android-ble-forwarder/app/build/outputs/apk/debug/app-debug.apk"),
+            Path("/tmp/gotchi-ble-forwarder-debug.apk"),
+        ]
+        existing = [p for p in apk_candidates if p.is_file()]
+        if not existing:
+            return None
+        return max(existing, key=lambda p: p.stat().st_mtime)
+
+    def _serve_gotchi_forwarder_apk(self) -> None:
+        apk_path = self._resolve_gotchi_forwarder_apk()
+        if not apk_path:
+            err_bytes = json.dumps({"ok": False, "error": "apk_not_found"}).encode("utf-8")
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err_bytes)))
+            self.end_headers()
+            self.wfile.write(err_bytes)
+            return
+        apk_bytes = apk_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.android.package-archive")
+        self.send_header("Content-Disposition", 'attachment; filename="gotchi-v2.apk"')
+        self.send_header("Content-Length", str(len(apk_bytes)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.end_headers()
+        self.wfile.write(apk_bytes)
+
+    def _check_gotchi_external_auth(self) -> bool:
+        cf_ip = None
+        for k, v in self.headers.items():
+            if k.lower() == "cf-connecting-ip" and v:
+                cf_ip = v.strip()
+                break
+        if not cf_ip:
+            return True
+
+        clean_path = self.path.split("?")[0].rstrip("/")
+        if (
+            clean_path == "/api/voice/interact"
+            or clean_path.startswith("/api/gotchi/")
+            or clean_path in (
+                "/api/gotchi",
+                "/gotchi.apk",
+                "/api/app/forwarder/apk",
+                "/api/app/forwarder/apk.apk",
+            )
+            or "node_id=gotchi-" in self.path
+        ):
+            return True
+
+        expected_tokens: list[str] = []
+        try:
+            token_file = DATA_DIR / "gotchi_bearer_token.json"
+            if not token_file.exists():
+                token_file = Path("/workspace/data/gotchi_bearer_token.json")
+            if token_file.exists():
+                with open(token_file, "r", encoding="utf-8") as tf:
+                    tok = json.load(tf).get("token", "").strip()
+                    if tok:
+                        expected_tokens.append(tok)
+            if os.path.exists("/secrets/env.json"):
+                with open("/secrets/env.json", "r", encoding="utf-8") as sf:
+                    sec_tok = json.load(sf).get("GOTCHI_BEARER_TOKEN", "").strip()
+                    if sec_tok and sec_tok not in expected_tokens:
+                        expected_tokens.append(sec_tok)
+        except Exception:
+            pass
+
+        env_tok = os.environ.get("GOTCHI_BEARER_TOKEN", "").strip()
+        if env_tok and env_tok not in expected_tokens:
+            expected_tokens.append(env_tok)
+
+        auth_hdr = ""
+        for k, v in self.headers.items():
+            if k.lower() == "authorization" and isinstance(v, str):
+                auth_hdr = v.strip()
+                break
+
+        provided = ""
+        if auth_hdr:
+            parts = auth_hdr.split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                provided = parts[1].strip()
+            else:
+                provided = auth_hdr.strip()
+
+        if provided and expected_tokens:
+            import hmac
+            for exp in expected_tokens:
+                if hmac.compare_digest(provided.encode("utf-8"), exp.encode("utf-8")):
+                    return True
+
+        err_bytes = json.dumps({"ok": False, "error": "unauthorized", "message": "Valid Bearer token required"}).encode("utf-8")
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(err_bytes)))
+        self.end_headers()
+        self.wfile.write(err_bytes)
+        return False
+
     def _proxy_to_gotchi_gateway(self, method: str) -> None:
+        if not self._check_gotchi_external_auth():
+            return
         self._ensure_gotchi_gateway_up()
         import http.client
         content_len = int(self.headers.get("Content-Length", "0") or "0")
         req_body = self.rfile.read(content_len) if content_len > 0 else b""
         fwd_headers = {
             k: v for k, v in self.headers.items()
-            if k.lower() not in ("host", "connection", "transfer-encoding")
+            if k.lower() not in ("host", "connection", "transfer-encoding", "authorization")
         }
         try:
             conn = http.client.HTTPConnection("127.0.0.1", 8771, timeout=65)
@@ -1056,7 +1174,12 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         clean_path = self.path.split("?")[0].rstrip("/")
-        if clean_path.startswith("/api/voice") or clean_path.startswith("/api/config") or clean_path.startswith("/api/journal"):
+        if (
+            clean_path.startswith("/api/voice")
+            or clean_path.startswith("/api/gotchi")
+            or clean_path.startswith("/api/config")
+            or clean_path.startswith("/api/journal")
+        ):
             self._proxy_to_gotchi_gateway("POST")
             return
         self.send_response(404)
@@ -1064,7 +1187,12 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         clean_path = self.path.split("?")[0].rstrip("/")
-        if clean_path.startswith("/api/voice") or clean_path.startswith("/api/config") or clean_path.startswith("/api/journal"):
+        if (
+            clean_path.startswith("/api/voice")
+            or clean_path.startswith("/api/gotchi")
+            or clean_path.startswith("/api/config")
+            or clean_path.startswith("/api/journal")
+        ):
             self._proxy_to_gotchi_gateway("PUT")
             return
         self.send_response(404)
@@ -1146,7 +1274,21 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             content_type = "text/html; charset=utf-8"
             status_code = 200
 
-        elif clean_path.startswith("/api/voice") or clean_path.startswith("/api/config") or clean_path.startswith("/api/journal"):
+        elif clean_path in (
+            "/gotchi.apk",
+            "/api/gotchi/forwarder/apk.apk",
+            "/api/app/forwarder/apk",
+            "/api/app/forwarder/apk.apk",
+        ):
+            self._serve_gotchi_forwarder_apk()
+            return
+
+        elif (
+            clean_path.startswith("/api/voice")
+            or clean_path.startswith("/api/gotchi")
+            or clean_path.startswith("/api/config")
+            or clean_path.startswith("/api/journal")
+        ):
             self._proxy_to_gotchi_gateway("GET")
             return
 
