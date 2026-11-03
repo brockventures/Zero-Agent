@@ -39,8 +39,10 @@ from tools.forge import (
     HeartbeatTracker,
     _run_job_worker,
     _write_job_meta,
+    build_default_verification_cmd,
     check_runaway_tool_loop,
     check_target_file_overlap,
+    detect_repo_verification_script,
     dismiss_decision,
     dispatch_build_completion_to_origin,
     enqueue_build,
@@ -405,6 +407,93 @@ class TestForgeEngine(unittest.TestCase):
         # Verify AST symbol extractor on allowed.py
         snip = extract_symbol_snippet(wt_dir / "allowed.py", "greet")
         self.assertIn("def greet():", snip)
+
+    def test_04b_repo_verify_script_support(self):
+        wt_dir = Path(self.tmp_dir.name) / "wt_repo_verify"
+        wt_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. detect_repo_verification_script on empty / non-repo directory
+        self.assertIsNone(detect_repo_verification_script(None))
+        self.assertIsNone(detect_repo_verification_script(wt_dir))
+
+        # Add scripts/verify.sh
+        scripts_dir = wt_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        verify_script = scripts_dir / "verify.sh"
+        verify_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+        # Default detection without FORGE_FULL_REPO_VERIFY
+        self.assertEqual(detect_repo_verification_script(wt_dir), "sh scripts/verify.sh --lint-only")
+
+        # Detection with FORGE_FULL_REPO_VERIFY=1
+        with patch.dict(os.environ, {"FORGE_FULL_REPO_VERIFY": "1"}):
+            self.assertEqual(detect_repo_verification_script(wt_dir), "sh scripts/verify.sh")
+
+        # 2. build_default_verification_cmd with verify.sh present
+        cmd_no_py = build_default_verification_cmd(["main.go"], worktree_dir=wt_dir)
+        self.assertEqual(cmd_no_py, "sh scripts/verify.sh --lint-only")
+
+        cmd_with_py = build_default_verification_cmd(["tools/mod.py"], worktree_dir=wt_dir)
+        self.assertEqual(
+            cmd_with_py,
+            'python3 -m py_compile "tools/mod.py" && sh scripts/verify.sh --lint-only',
+        )
+
+        with patch.dict(os.environ, {"FORGE_FULL_REPO_VERIFY": "1"}):
+            cmd_full = build_default_verification_cmd(["tools/mod.py"], worktree_dir=wt_dir)
+            self.assertEqual(
+                cmd_full,
+                'python3 -m py_compile "tools/mod.py" && sh scripts/verify.sh',
+            )
+
+        # 3. verify_chunk_worktree maker-checker gate integration
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(wt_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(wt_dir), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Zero"], cwd=str(wt_dir), check=True, capture_output=True)
+
+        marker = wt_dir / "verify_marker.txt"
+        verify_script.write_text(f"#!/bin/sh\necho 'verify ran' > '{marker}'\nexit 0\n", encoding="utf-8")
+
+        (wt_dir / "allowed.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(wt_dir), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=str(wt_dir), check=True, capture_output=True)
+
+        # Omitted verification_cmd: invokes scripts/verify.sh automatically via default cmd
+        (wt_dir / "allowed.py").write_text("x = 2\n", encoding="utf-8")
+        passed, diff_stat, err = verify_chunk_worktree(
+            wt_dir,
+            "",
+            target_files=["allowed.py"],
+            require_changes=True,
+        )
+        self.assertTrue(passed, err)
+        self.assertTrue(marker.exists())
+        self.assertIn("1 file changed", diff_stat)
+
+        # Custom verification_cmd without scripts/verify.sh: still automatically invokes scripts/verify.sh
+        marker.unlink()
+        (wt_dir / "allowed.py").write_text("x = 3\n", encoding="utf-8")
+        passed, _, err = verify_chunk_worktree(
+            wt_dir,
+            "echo custom_gate_ok",
+            target_files=["allowed.py"],
+            require_changes=True,
+        )
+        self.assertTrue(passed, err)
+        self.assertTrue(marker.exists())
+
+        # Failing verify.sh blocks verification gate
+        verify_script.write_text("#!/bin/sh\necho 'lint ratchet violation' >&2\nexit 1\n", encoding="utf-8")
+        (wt_dir / "allowed.py").write_text("x = 4\n", encoding="utf-8")
+        passed, _, err = verify_chunk_worktree(
+            wt_dir,
+            "",
+            target_files=["allowed.py"],
+            require_changes=True,
+        )
+        self.assertFalse(passed)
+        self.assertIn("Verification command failed", err)
+        self.assertIn("lint ratchet violation", err)
 
     def test_05_native_forge_job_runner(self):
         tasks_tmp = Path(self.tmp_dir.name) / "tasks"

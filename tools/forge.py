@@ -2369,35 +2369,62 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     return True, "Valid ForgePlan."
 
 
+def detect_repo_verification_script(worktree_dir: Path | str) -> Optional[str]:
+    """Detect repo-level deterministic verification script if present in worktree.
+
+    Checks if `scripts/verify.sh` exists in the worktree and returns `sh scripts/verify.sh --lint-only`
+    (or `sh scripts/verify.sh` when `FORGE_FULL_REPO_VERIFY=1` is set).
+    """
+    if not worktree_dir:
+        return None
+    try:
+        wt = Path(worktree_dir)
+        script_path = wt / "scripts" / "verify.sh"
+        if script_path.is_file():
+            if os.environ.get("FORGE_FULL_REPO_VERIFY") == "1":
+                return "sh scripts/verify.sh"
+            return "sh scripts/verify.sh --lint-only"
+    except Exception:
+        pass
+    return None
+
+
 def build_default_verification_cmd(target_files: list[str], worktree_dir: Optional[Path | str] = None) -> str:
     """Synthesize a deterministic baseline verification command when `verification_cmd` is omitted."""
-    py_files = [str(f).strip() for f in target_files if str(f).strip().endswith(".py")]
-    if not py_files:
-        return "true"
-
     cmds: list[str] = []
-    quoted_py = " ".join(f'"{f}"' for f in py_files)
-    cmds.append(f"python3 -m py_compile {quoted_py}")
+    py_files = [str(f).strip() for f in target_files if str(f).strip().endswith(".py")]
 
-    # Find matching or explicitly targeted test files
-    test_files: list[str] = []
-    for f in py_files:
-        p = Path(f)
-        if p.name.startswith("test_") or p.name.endswith("_test.py"):
-            if f not in test_files:
-                test_files.append(f)
-        else:
-            cand = p.parent / f"test_{p.name}"
-            if worktree_dir and (Path(worktree_dir) / cand).exists():
-                if str(cand) not in test_files:
-                    test_files.append(str(cand))
-            elif (WORKSPACE_DIR / cand).exists():
-                if str(cand) not in test_files:
-                    test_files.append(str(cand))
+    if py_files:
+        quoted_py = " ".join(f'"{f}"' for f in py_files)
+        cmds.append(f"python3 -m py_compile {quoted_py}")
 
-    if test_files:
-        quoted_tests = " ".join(f'"{tf}"' for tf in test_files)
-        cmds.append(f"pytest {quoted_tests}")
+        # Find matching or explicitly targeted test files
+        test_files: list[str] = []
+        for f in py_files:
+            p = Path(f)
+            if p.name.startswith("test_") or p.name.endswith("_test.py"):
+                if f not in test_files:
+                    test_files.append(f)
+            else:
+                cand = p.parent / f"test_{p.name}"
+                if worktree_dir and (Path(worktree_dir) / cand).exists():
+                    if str(cand) not in test_files:
+                        test_files.append(str(cand))
+                elif (WORKSPACE_DIR / cand).exists():
+                    if str(cand) not in test_files:
+                        test_files.append(str(cand))
+
+        if test_files:
+            quoted_tests = " ".join(f'"{tf}"' for tf in test_files)
+            cmds.append(f"pytest {quoted_tests}")
+
+    if worktree_dir:
+        repo_verify = detect_repo_verification_script(worktree_dir)
+        if repo_verify and "scripts/verify.sh" not in " ".join(cmds):
+            cmds.append(repo_verify)
+
+    if not cmds:
+        return "true"
 
     return " && ".join(cmds)
 
@@ -4292,6 +4319,13 @@ def verify_chunk_worktree(
     if not effective_cmd:
         files_to_check = list(target_files) if target_files else changed
         effective_cmd = build_default_verification_cmd(files_to_check, worktree_dir=wt)
+
+    repo_verify_cmd = detect_repo_verification_script(wt)
+    if repo_verify_cmd and "scripts/verify.sh" not in effective_cmd:
+        if effective_cmd and effective_cmd != "true":
+            effective_cmd = f"{effective_cmd} && {repo_verify_cmd}"
+        else:
+            effective_cmd = repo_verify_cmd
 
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{wt}:{env.get('PYTHONPATH', '')}".strip(":")
