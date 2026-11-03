@@ -441,7 +441,7 @@ def calendar_list_calendars() -> str:
 
 @server.tool()
 def calendar_list_events(calendar_id: str = "primary", time_min_iso: str = "", time_max_iso: str = "", max_results: int = 30) -> str:
-    """List Google Calendar events. calendar_id can be 'primary', 'all' (sweeps Ryan, Emily, family, home, nanny share), or a specific calendar ID."""
+    """List Google Calendar events. calendar_id can be 'primary', 'all' (sweeps Ryan, Emily, family, home, nanny share), 'work' (cached work calendar), or a specific calendar ID."""
     try:
         now = datetime.now(timezone.utc)
         if not time_min_iso:
@@ -450,9 +450,12 @@ def calendar_list_events(calendar_id: str = "primary", time_min_iso: str = "", t
             from datetime import timedelta
             time_max_iso = (now + timedelta(days=1)).isoformat()
 
+        cal_id_norm = (calendar_id or "primary").strip().lower()
         cals_to_query = []
-        if calendar_id.lower() == "all":
+        if cal_id_norm == "all":
             cals_to_query = list(FAMILY_CALENDARS.items())
+        elif cal_id_norm == "work":
+            cals_to_query = []
         else:
             cid = calendar_id if calendar_id else "primary"
             cname = FAMILY_CALENDARS.get(cid, cid)
@@ -493,6 +496,22 @@ def calendar_list_events(calendar_id: str = "primary", time_min_iso: str = "", t
                         })
             except Exception as ce:
                 print(f"[Calendar] Warning fetching {cid}: {ce}", file=sys.stderr)
+
+        if cal_id_norm in ("all", "primary", "work"):
+            try:
+                try:
+                    from tools.work_cal_sync import get_cached_work_events
+                except ImportError:
+                    from work_cal_sync import get_cached_work_events
+
+                for wev in get_cached_work_events(time_min_iso=time_min_iso, time_max_iso=time_max_iso):
+                    ev_key = (wev.get("summary", "(no title)"), wev.get("start"))
+                    if ev_key in seen_events:
+                        continue
+                    seen_events.add(ev_key)
+                    all_events.append(wev)
+            except Exception as we:
+                print(f"[Calendar] Warning loading cached work events: {we}", file=sys.stderr)
 
         all_events.sort(key=lambda x: x.get("start", ""))
         return json.dumps({"ok": True, "count": len(all_events), "events": all_events[:max_results]})
