@@ -1030,6 +1030,7 @@ def dispatch_notification(
     content: str,
     channels: list[str | int] | None = None,
     dry_run: bool = False,
+    is_agent_turn: bool = False,
 ) -> list[dict[str, Any]]:
     """Dispatch formatted alert card to configured Discord channels via outbox."""
     if channels is None:
@@ -1052,6 +1053,7 @@ def dispatch_notification(
                 channel=ch,
                 content=content,
                 source_turn="gh_pr_watcher",
+                is_agent_turn=is_agent_turn,
             )
             results.append(res)
         except Exception as exc:
@@ -1205,7 +1207,12 @@ def check_pr(
                     review=rev,
                     current_decision=review_decision,
                 )
-                dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
+                dispatch_res = dispatch_notification(
+                    msg,
+                    channels=channels,
+                    dry_run=dry_run,
+                    is_agent_turn=(rev_state == "CHANGES_REQUESTED"),
+                )
                 stats["reviews_notified"] += 1
                 if not dry_run:
                     notif_list = active_notifications.setdefault(pr_key, [])
@@ -1275,7 +1282,17 @@ def check_pr(
                 url=url,
                 comment=com,
             )
-            dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
+            com_body_lower = str(com.get("body") or "").lower()
+            is_roborev_fail = (
+                "agent assessment: fail" in com_body_lower
+                or "**agent assessment:** fail" in com_body_lower
+            )
+            dispatch_res = dispatch_notification(
+                msg,
+                channels=channels,
+                dry_run=dry_run,
+                is_agent_turn=is_roborev_fail,
+            )
             stats["comments_notified"] += 1
             if not dry_run:
                 notif_list = active_notifications.setdefault(pr_key, [])
@@ -1365,7 +1382,12 @@ def check_pr(
                         check_name=check_name,
                         details_url=chk.get("url") or "",
                     )
-                    dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
+                    dispatch_res = dispatch_notification(
+                        msg,
+                        channels=channels,
+                        dry_run=dry_run,
+                        is_agent_turn=True,
+                    )
                     stats["ci_failures_notified"] += 1
                     if not dry_run:
                         notif_list = active_notifications.setdefault(pr_key, [])
@@ -1392,7 +1414,12 @@ def check_pr(
                         title=title,
                         url=url,
                     )
-                    dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
+                    dispatch_res = dispatch_notification(
+                        msg,
+                        channels=channels,
+                        dry_run=dry_run,
+                        is_agent_turn=True,
+                    )
                     stats["conflicts_notified"] += 1
                     if not dry_run:
                         notif_list = active_notifications.setdefault(pr_key, [])

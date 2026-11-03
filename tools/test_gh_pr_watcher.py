@@ -437,6 +437,7 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
             channel=FORGE_CHANNEL_ID,
             content="Test notification",
             source_turn="gh_pr_watcher",
+            is_agent_turn=False,
         )
 
     @patch("tools.gh_pr_watcher.queue_outbox_message")
@@ -451,11 +452,13 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
                 channel=FORGE_CHANNEL_ID,
                 content="Test notification",
                 source_turn="gh_pr_watcher",
+                is_agent_turn=False,
             ),
             call(
                 channel=ZERO_OPS_CHANNEL_ID,
                 content="Test notification",
                 source_turn="gh_pr_watcher",
+                is_agent_turn=False,
             ),
         ])
 
@@ -588,6 +591,7 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
             channel=FORGE_CHANNEL_ID,
             content=ANY,
             source_turn="gh_pr_watcher",
+            is_agent_turn=False,
         )
         self.assertIn(
             "mcarmody/lomin#12:req:brockventures",
@@ -644,6 +648,7 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
             channel=FORGE_CHANNEL_ID,
             content=ANY,
             source_turn="gh_pr_watcher",
+            is_agent_turn=False,
         )
         self.assertIn("COM_100", state["seen_comment_ids"])
 
@@ -806,6 +811,7 @@ class TestGhPrWatcherEndToEnd(unittest.TestCase):
                 channel=FORGE_CHANNEL_ID,
                 content=ANY,
                 source_turn="gh_pr_watcher",
+                is_agent_turn=True,
             )
             self.assertTrue(tmp_state.exists())
 
@@ -2467,6 +2473,112 @@ class TestAutomatedCiOrPrAlertExemption(unittest.TestCase):
         self.assertFalse(is_automated_ci_or_pr_alert("Hey Zero, how is the build going?"))
         self.assertFalse(is_automated_ci_or_pr_alert("Sounds good to me, let's ship it!"))
         self.assertFalse(is_automated_ci_or_pr_alert(""))
+
+
+class TestGhPrWatcherAgentTurnWakeup(unittest.TestCase):
+    """Test is_agent_turn wakeup forwarding on actionable PR failures in gh_pr_watcher."""
+
+    @patch("tools.gh_pr_watcher.queue_outbox_message")
+    def test_dispatch_notification_forwards_is_agent_turn(
+        self, mock_queue: MagicMock
+    ) -> None:
+        mock_queue.return_value = {"status": "queued"}
+        dispatch_notification("Actionable failure", is_agent_turn=True)
+        mock_queue.assert_called_once_with(
+            channel=FORGE_CHANNEL_ID,
+            content="Actionable failure",
+            source_turn="gh_pr_watcher",
+            is_agent_turn=True,
+        )
+
+    @patch("tools.gh_pr_watcher.dispatch_notification")
+    def test_check_pr_triggers_agent_turn_on_actionable_failures(
+        self, mock_dispatch: MagicMock
+    ) -> None:
+        mock_dispatch.return_value = [{"channel": FORGE_CHANNEL_ID, "message_id": 100}]
+        state: dict[str, Any] = {"version": 1}
+        pr_details = {
+            "repo": "brockventures/Zero-Agent",
+            "number": 52,
+            "title": "fix: review ping",
+            "url": "https://github.com/brockventures/Zero-Agent/pull/52",
+            "author": {"login": "zero-brock"},
+            "headRefOid": "sha123",
+            "reviewDecision": "CHANGES_REQUESTED",
+            "reviews": [
+                {
+                    "id": "REV_CR_1",
+                    "author": {"login": "ryanbrock"},
+                    "state": "CHANGES_REQUESTED",
+                    "submittedAt": "2026-11-03T01:00:00Z",
+                    "body": "Please fix this",
+                },
+                {
+                    "id": "REV_APP_1",
+                    "author": {"login": "mcarmody"},
+                    "state": "APPROVED",
+                    "submittedAt": "2026-11-03T01:01:00Z",
+                    "body": "LGTM",
+                },
+            ],
+            "comments": [
+                {
+                    "id": "COM_ROBOREV_1",
+                    "author": {"login": "aerial-bot"},
+                    "createdAt": "2026-11-03T01:02:00Z",
+                    "body": "Review for commit sha123 (roborev 90):\n**Agent assessment:** Fail\nHigh — issue found",
+                },
+                {
+                    "id": "COM_ROBOREV_2",
+                    "author": {"login": "aerial-bot"},
+                    "createdAt": "2026-11-03T01:03:00Z",
+                    "body": "Agent assessment: Fail\nAnother failure",
+                },
+                {
+                    "id": "COM_NORMAL_1",
+                    "author": {"login": "mcarmody"},
+                    "createdAt": "2026-11-03T01:04:00Z",
+                    "body": "Nice work!",
+                },
+            ],
+            "reviewRequests": [],
+            "statusCheckRollup": [
+                {
+                    "name": "pytest",
+                    "status": "COMPLETED",
+                    "conclusion": "FAILURE",
+                    "detailsUrl": "https://github.com/brockventures/Zero-Agent/actions/runs/1",
+                }
+            ],
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+        }
+
+        stats = check_pr(
+            pr_details=pr_details,
+            state=state,
+            current_user="zero-brock",
+        )
+        self.assertEqual(stats["reviews_notified"], 2)
+        self.assertEqual(stats["comments_notified"], 3)
+        self.assertEqual(stats["ci_failures_notified"], 1)
+        self.assertEqual(stats["conflicts_notified"], 1)
+
+        # Inspect is_agent_turn arguments across calls:
+        # 1. REV_CR_1 (CHANGES_REQUESTED) -> True
+        # 2. REV_APP_1 (APPROVED) -> False
+        # 3. COM_ROBOREV_1 (**Agent assessment:** Fail) -> True
+        # 4. COM_ROBOREV_2 (Agent assessment: Fail) -> True
+        # 5. COM_NORMAL_1 -> False
+        # 6. CI failure -> True
+        # 7. Merge conflict -> True
+        agent_turn_flags = [
+            c.kwargs.get("is_agent_turn", False) for c in mock_dispatch.call_args_list
+        ]
+        self.assertEqual(
+            agent_turn_flags,
+            [True, False, True, True, False, True, True],
+        )
 
 
 if __name__ == "__main__":
