@@ -15,6 +15,7 @@ description: >-
 
 2. **Autonomous End-to-End PR Lifecycle:**
    - Managing pull requests, branch hygiene, CI validation, and repository releases is Zero's job.
+   - **Mandatory Repository Deterministic Verification Gate:** Before pushing code or opening/updating a PR in any repository (both inline Tier 1 and `#forge` Tier 2/3 builds), Zero and FORGE workers **MUST** run the repository's native deterministic verification script (`scripts/verify.sh`, `Makefile` verify target, or the canonical pre-flight command defined in the repo's `AGENTS.md`) in addition to targeted unit tests. Never push unverified branches or rely solely on remote CI to catch lint, formatting, ratchet, or build errors.
    - Once a PR satisfies the merge criteria:
      1. Team consensus is reached (collaborator/agent review agreed).
      2. Code passes local/static verification and all GitHub Actions CI checks (unit tests, simulation bands) are certified green.
@@ -64,4 +65,5 @@ description: >-
 
 ## 9. FORGE Chunked PR Discipline (`forge/*` Branches)
 - Multi-chunk background builds orchestrated by `/workspace/tools/forge.py` execute inside isolated git worktrees (`/tmp/forge-wt-<chunk_id>`) on `forge/<build_id>/chunk-<idx>` branches using `gemini-3.8-flash-high`.
-- Each chunk must pass deterministic verification (`ruff check`, scoped `pytest`, `validate_commit_safety.py`, and `expected_files` boundary validation) before auto-merging via squash PR.
+- Each chunk must pass deterministic verification (`ruff check`, scoped `pytest`, `validate_commit_safety.py`, and `expected_files` boundary validation, plus any repository-level deterministic verification script such as `scripts/verify.sh` detected via `detect_repo_verification_script()` or specified in `verification_cmd`) before auto-merging via squash PR.
+- **Mandatory Repo Deterministic Verification Script Gate:** FORGE automatically detects and executes repository-level verification scripts (`scripts/verify.sh --lint-only` or `sh scripts/verify.sh` when `FORGE_FULL_REPO_VERIFY=1`) via `detect_repo_verification_script()`. FORGE workers and orchestrators must ensure repository verification scripts (`scripts/verify.sh`, `Makefile` verify target, or `AGENTS.md` pre-flight command) pass cleanly before finalizing chunk execution.
