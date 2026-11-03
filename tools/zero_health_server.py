@@ -966,10 +966,22 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 sec = json.load(sf)
         except Exception:
             sec = {}
+        try:
+            from tools.lomin_runtime import (
+                ensure_single_adapter_shim,
+                load_lomin_env_file,
+                sync_lomin_modules_to_gotchi,
+            )
+            sync_lomin_modules_to_gotchi()
+            ensure_single_adapter_shim()
+            lomin_env = load_lomin_env_file("/workspace/config/lomin.env")
+        except Exception:
+            lomin_env = {}
         env = os.environ.copy()
-        env["GEMINI_API_KEY"] = sec.get("GEMINI_API_KEY", "")
+        env.update(lomin_env)
+        env["GEMINI_API_KEY"] = sec.get("GEMINI_API_KEY", "") or env.get("GEMINI_API_KEY", "")
         env["GOTCHI_LLM_CONFIG_FILE"] = "/workspace/gotchi/backend/gateway_config.json"
-        env["PYTHONPATH"] = "/workspace:/workspace/gotchi"
+        env["PYTHONPATH"] = "/workspace:/workspace/gotchi:/workspace/gotchi/lomin"
         log_f = open("/workspace/data/gotchi_gateway.log", "a")
         subprocess.Popen(
             [
