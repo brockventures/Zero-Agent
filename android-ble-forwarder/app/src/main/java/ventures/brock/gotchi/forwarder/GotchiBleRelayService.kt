@@ -120,7 +120,7 @@ class GotchiBleRelayService : Service() {
         const val KEY_NODE_ID = "node_id"
         const val KEY_AUDIO_OUT_MODE = "audio_out_mode"
 
-        const val DEFAULT_GATEWAY_URL = "http://gotchi.local:8765"
+        const val DEFAULT_GATEWAY_URL = "https://gotchi.brock.ventures"
         const val DEFAULT_NODE_ID = "gotchi-v1"
         const val DEFAULT_AUDIO_OUT_MODE = "speaker"
 
@@ -410,11 +410,6 @@ class GotchiBleRelayService : Service() {
                 ?: device.address
                 ?: "Gotchi"
             connectedDeviceName = devName
-            connectionStatus = "BONDING"
-
-            if (device.bondState == BluetoothDevice.BOND_NONE) {
-                runCatching { device.createBond() }
-            }
 
             connectionStatus = "CONNECTING"
             updateForegroundNotification("Connecting to $devName...")

@@ -195,8 +195,9 @@ def test_gotchi_ble_relay_service_capabilities():
     assert "PHY_LE_2M_MASK" in service_src
     assert "requestMtu(BleFramingCodec.DEFAULT_GATT_MTU)" in service_src
 
-    # BLE OS bonding, dynamic rescan, and disconnect/disable relay actions
-    assert "createBond()" in service_src
+    # Direct BLE GATT connection without simultaneous createBond() race, dynamic rescan, and disconnect/disable relay actions
+    assert "createBond()" not in service_src
+    assert 'DEFAULT_GATEWAY_URL = "https://gotchi.brock.ventures"' in service_src
     assert "ACTION_RESCAN" in service_src
     assert "ACTION_DISCONNECT" in service_src
     assert "KEY_RELAY_ENABLED" in service_src

@@ -87,7 +87,7 @@ class GotchiPhoneEngine(
         const val LIVE_VAD_HANGOVER_MS = 600L
         const val BARGE_IN_SPEECH_MS = 300L
         const val DEFAULT_RMS_THRESHOLD = 50.0
-        const val DEFAULT_GATEWAY_URL = "http://gotchi.local:8765"
+        const val DEFAULT_GATEWAY_URL = "https://gotchi.brock.ventures"
         const val DEFAULT_NODE_ID = "gotchi-pixel-phone-01"
         const val DEFAULT_NOTIFY_POLL_INTERVAL_MS = 180000L // 3 minutes
 
