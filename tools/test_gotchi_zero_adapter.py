@@ -1248,6 +1248,212 @@ def test_explicit_gemini_context_caching_lifecycle_and_fallback(monkeypatch):
     assert cfg_fb.tools is not None
 
 
+def test_web_search_mode_recency_fallback_and_clean_discord_turn_log(monkeypatch):
+    import json
+    from tools.gotchi_zero_adapter import (
+        _build_gotchi_tools,
+        _run_general_web_search,
+        record_gotchi_turn_to_channels,
+    )
+
+    tools = _build_gotchi_tools()
+    decls = {d.name: d for t in tools for d in (t.function_declarations or [])}
+    assert "web_and_reddit_search" in decls
+    web_props = decls["web_and_reddit_search"].parameters.properties
+    assert "mode" in web_props
+    assert "recency" in web_props
+
+    # 1. Direct mode='web' calls _run_general_web_search
+    monkeypatch.setattr(
+        "tools.reddit_extractor._query_serpapi",
+        lambda params: {
+            "organic_results": [
+                {
+                    "title": "ESP32-S3 Datasheet",
+                    "link": "https://example.com/esp32s3",
+                    "snippet": "Dual-core XTensa LX7 MCU.",
+                }
+            ]
+        },
+    )
+    web_direct = json.loads(_run_general_web_search("ESP32-S3 datasheet", limit=3))
+    assert web_direct["count"] == 1
+    assert web_direct["organic_results"][0]["title"] == "ESP32-S3 Datasheet"
+
+    res_web = asyncio.run(
+        execute_gotchi_tool_call(
+            "web_and_reddit_search",
+            {"query": "ESP32-S3 datasheet", "mode": "web"},
+        )
+    )
+    assert "ESP32-S3 Datasheet" in res_web["result"]
+
+    # 2. Automatic 'all'-time fallback when 1-year Reddit search returns '"count": 0'
+    recorded_cmds: List[List[str]] = []
+
+    class FakeProc:
+        def __init__(self, stdout: str):
+            self.stdout = stdout
+            self.stderr = ""
+            self.returncode = 0
+
+    def fake_run(cmd, *a, **kw):
+        recorded_cmds.append(list(cmd))
+        if "--recency" in cmd and "all" in cmd:
+            return FakeProc('{"count": 1, "items": [{"title": "All-time thread"}]}')
+        return FakeProc('{"count": 0, "items": []}')
+
+    monkeypatch.setattr("tools.gotchi_zero_adapter.subprocess.run", fake_run)
+    res_fallback = asyncio.run(
+        execute_gotchi_tool_call(
+            "web_and_reddit_search",
+            {"query": "rare vintage synth", "mode": "reddit"},
+        )
+    )
+    assert len(recorded_cmds) == 2
+    assert "--recency" in recorded_cmds[1] and "all" in recorded_cmds[1]
+    assert "All-time thread" in res_fallback["result"]
+
+    # 3. Clean Discord turn formatting without node_id / voice_name / session_id
+    outbox_msgs: List[Any] = []
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda ch, content, **kw: outbox_msgs.append((ch, content)),
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._append_voice_turn_to_history",
+        lambda *a, **kw: None,
+    )
+    rec = record_gotchi_turn_to_channels(
+        node_id="gotchi-ryan-01",
+        session_id="sess-clean-99",
+        transcript="What is the status?",
+        reply="Everything is green.",
+        stt_ms=110,
+        first_audio_ms=420,
+        total_ms=650,
+        dispatch_discord=True,
+    )
+    msg = rec["discord_message"]
+    assert "🎙️ **Ryan:** What is the status?" in msg
+    assert "🔊 **Zero:** Everything is green." in msg
+    assert "gotchi-ryan-01" not in msg
+    assert "Schedar" not in msg
+    assert "sess-clean-99" not in msg
+    assert "-# stt: 110ms · first_audio: 420ms · total: 650ms" in msg
+
+
+def test_skill_discovery_index_and_load_skill_playbook():
+    from tools.gotchi_zero_adapter import (
+        _build_gotchi_tools,
+        _discover_skill_playbook_paths,
+        _load_skills_index_summary,
+        build_gotchi_static_system_instruction,
+    )
+
+    skills_map = _discover_skill_playbook_paths()
+    unique_skill_files = {p.resolve() for p in skills_map.values()}
+    assert len(unique_skill_files) >= 38
+
+    index_summary = _load_skills_index_summary()
+    assert "AVAILABLE ZERO SKILLS INDEX" in index_summary
+    assert "whole-foods-cart" in index_summary
+    assert "crontab-verify" in index_summary
+    assert "forge-orchestrator" in index_summary
+
+    static_sys = build_gotchi_static_system_instruction()
+    assert "AVAILABLE ZERO SKILLS INDEX" in static_sys
+    assert "load_skill_playbook" in static_sys
+    assert "handoff_to_zero_runtime" in static_sys
+
+    tools = _build_gotchi_tools()
+    decls = {d.name: d for t in tools for d in (t.function_declarations or [])}
+    assert "load_skill_playbook" in decls
+    assert "handoff_to_zero_runtime" in decls
+
+    # Load a workspace skill and a root CLI skill via load_skill_playbook
+    wf_res = asyncio.run(
+        execute_gotchi_tool_call("load_skill_playbook", {"skill_name": "whole-foods-cart"})
+    )
+    assert wf_res.get("skill_name") == "whole-foods-cart"
+    assert "Whole Foods" in wf_res.get("content", "")
+
+    cron_res = asyncio.run(
+        execute_gotchi_tool_call("load_skill_playbook", {"skill_name": "crontab-verify"})
+    )
+    assert cron_res.get("skill_name") == "crontab-verify"
+    assert "crontab" in cron_res.get("content", "").lower()
+
+    # Also verify read_local_file allows /root/.gemini/antigravity-cli/skills/
+    ok_cli_skill, _ = is_allowed_voice_read_path(
+        "/root/.gemini/antigravity-cli/skills/crontab-verify/SKILL.md"
+    )
+    assert ok_cli_skill is True
+
+
+def test_handoff_to_zero_runtime_and_defer_marker_wakes_zero_chat(monkeypatch):
+    queued_turns: List[Dict[str, Any]] = []
+
+    def fake_queue_agent_turn(channel: str, prompt: str, **kwargs: Any) -> Dict[str, Any]:
+        entry = {"channel": str(channel), "prompt": prompt, **kwargs}
+        queued_turns.append(entry)
+        return {"id": "turn-1", "status": "pending", **entry}
+
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_agent_turn",
+        fake_queue_agent_turn,
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._append_voice_turn_to_history",
+        lambda *a, **kw: None,
+    )
+
+    # 1. Direct tool execution of handoff_to_zero_runtime
+    handoff_res = asyncio.run(
+        execute_gotchi_tool_call(
+            "handoff_to_zero_runtime",
+            {
+                "task_prompt": "Stage my Whole Foods cart from the family list and post the link.",
+                "spoken_ack": "I'm staging your Whole Foods cart in Zero-Chat now.",
+            },
+        )
+    )
+    assert handoff_res["ok"] is True
+    assert handoff_res["status"] == "handed_off_to_zero_runtime"
+    assert len(queued_turns) == 1
+    assert queued_turns[0]["prompt"].startswith("[GOTCHI VOICE HANDOFF]: Stage my Whole Foods cart")
+    assert queued_turns[0].get("source") == "gotchi-voice-handoff"
+
+    # 2. [[defer]] marker in voice reply automatically triggers queue_agent_turn into #zero-chat
+    queued_turns.clear()
+
+    def fake_defer_llm(_turn: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "reply": "[[defer]] I am kicking off that multi-step build in Zero-Chat right now."
+        }
+
+    adapter = GotchiZeroBrainAdapter(llm_caller=fake_defer_llm, dispatch_discord=False)
+    res = asyncio.run(
+        adapter.handle_turn(
+            {
+                "node_id": "gotchi-ryan-01",
+                "session_id": "sess-defer-handoff",
+                "prompt": "Run the full CAD render and slice the enclosure.",
+            }
+        )
+    )
+    assert "I am kicking off that multi-step build" in res["reply"]
+    assert "[[defer]]" not in res["reply"]
+    assert res["sent_to_zero_chat"] is True
+    assert len(queued_turns) == 1
+    assert "[GOTCHI VOICE HANDOFF]: Run the full CAD render and slice the enclosure." in queued_turns[0]["prompt"]
+
+
+
 
 
 

@@ -162,7 +162,12 @@ _LOCAL_ARTIFACT_RE = re.compile(
     r"(/workspace/[^\s)>\]\"'`]+\.(?:png|jpg|jpeg|webp|gif|stl|3mf|step|pdf|svg))",
     re.IGNORECASE,
 )
-_ALLOWED_VOICE_READ_PREFIXES_DEFAULT = ("/workspace/", "/baseball/")
+_ALLOWED_VOICE_READ_PREFIXES_DEFAULT = (
+    "/workspace/",
+    "/baseball/",
+    "/root/.gemini/antigravity-cli/skills/",
+    "/root/.gemini/antigravity-cli/builtin/skills/",
+)
 _ALLOWED_VOICE_READ_PREFIXES = _ALLOWED_VOICE_READ_PREFIXES_DEFAULT
 _DENIED_VOICE_READ_BASENAMES = {
     ".env",
@@ -906,6 +911,89 @@ def _build_gotchi_tools() -> list[Any]:
             ),
         )
     )
+    # Ensure web_and_reddit_search is present and documents reddit, web, and amazon modes + recency
+    f_decls = [d for d in f_decls if getattr(d, "name", None) != "web_and_reddit_search"]
+    f_decls.append(
+        types.FunctionDeclaration(
+            name="web_and_reddit_search",
+            description=(
+                "Search Reddit, Google Web, or Amazon for live community discussions, web articles, "
+                "active subreddits, or products."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "query": types.Schema(
+                        type="STRING",
+                        description="Search query string.",
+                    ),
+                    "subreddit": types.Schema(
+                        type="STRING",
+                        description="Optional specific subreddit name (without r/) to scope Reddit search.",
+                    ),
+                    "mode": types.Schema(
+                        type="STRING",
+                        description=(
+                            "Search mode: 'reddit' (default, community discussions), "
+                            "'web' (general Google web search for articles, documentation, or news), "
+                            "or 'amazon' (product prices and reviews)."
+                        ),
+                    ),
+                    "recency": types.Schema(
+                        type="STRING",
+                        description="Optional time filter: 'year', 'all', 'month', or 'week'. Defaults to 'year' for Reddit.",
+                    ),
+                },
+                required=["query"],
+            ),
+        )
+    )
+    if not any(getattr(d, "name", None) == "load_skill_playbook" for d in f_decls):
+        f_decls.append(
+            types.FunctionDeclaration(
+                name="load_skill_playbook",
+                description=(
+                    "Load the full SKILL.md playbook instructions for any of Zero's specialized skills "
+                    "(e.g. 'whole-foods-cart', 'starbucks-order', 'mlb-stream', 'plex-playback', "
+                    "'print3d-slicer', 'forge-orchestrator', 'shopping-advisor', etc.) in a single step."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "skill_name": types.Schema(
+                            type="STRING",
+                            description="Skill folder name from the AVAILABLE SKILLS INDEX (e.g. 'whole-foods-cart', 'mlb-stream', 'plex-playback').",
+                        ),
+                    },
+                    required=["skill_name"],
+                ),
+            )
+        )
+    if not any(getattr(d, "name", None) == "handoff_to_zero_runtime" for d in f_decls):
+        f_decls.append(
+            types.FunctionDeclaration(
+                name="handoff_to_zero_runtime",
+                description=(
+                    "Immediately acknowledge a complex, multi-step, or long-running (>5s) request on Gotchi's "
+                    "speaker (`spoken_ack`) and hand off the task to wake the full `#zero-chat` Antigravity "
+                    "runtime asynchronously via `outbox.queue_agent_turn`."
+                ),
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "task_prompt": types.Schema(
+                            type="STRING",
+                            description="Detailed task prompt and context to execute asynchronously in the full `#zero-chat` runtime.",
+                        ),
+                        "spoken_ack": types.Schema(
+                            type="STRING",
+                            description="Short 1-sentence spoken acknowledgment to play immediately on Gotchi (e.g. 'I am kicking that off in Zero-Chat for you now.').",
+                        ),
+                    },
+                    required=["task_prompt", "spoken_ack"],
+                ),
+            )
+        )
     if not any(getattr(d, "name", None) == "request_deep_thinking" for d in f_decls):
         f_decls.append(
             types.FunctionDeclaration(
@@ -1204,6 +1292,129 @@ def _load_full_zero_persona_and_rules() -> str:
     return _CACHED_FULL_ZERO_PERSONA_AND_RULES
 
 
+_CACHED_SKILLS_INDEX_SUMMARY: Optional[str] = None
+
+
+def _parse_skill_frontmatter(skill_md_path: Path) -> Tuple[str, str]:
+    """Extracts `(name, description)` from YAML frontmatter of a `SKILL.md` file."""
+    fallback_name = skill_md_path.parent.name
+    try:
+        raw = skill_md_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return fallback_name, ""
+    if not raw.startswith("---"):
+        return fallback_name, ""
+    end_idx = raw.find("\n---", 3)
+    if end_idx == -1:
+        return fallback_name, ""
+    fm_block = raw[3:end_idx].strip()
+    name_val = fallback_name
+    desc_lines: List[str] = []
+    in_desc = False
+    for line in fm_block.splitlines():
+        stripped = line.strip()
+        if line.startswith("name:"):
+            val = line.split(":", 1)[1].strip().strip("\"'")
+            if val:
+                name_val = val
+            in_desc = False
+        elif line.startswith("description:"):
+            val = line.split(":", 1)[1].strip()
+            if val in ("|", ">", "|+", "|-", ">+", ">-"):
+                in_desc = True
+            else:
+                desc_lines.append(val.strip("\"'"))
+                in_desc = True
+        elif in_desc and (line.startswith(" ") or line.startswith("\t")):
+            if stripped:
+                desc_lines.append(stripped)
+        elif ":" in line and not line.startswith(" ") and not line.startswith("\t"):
+            in_desc = False
+    desc_val = " ".join(desc_lines).strip()
+    return name_val, desc_val
+
+
+def _discover_skill_playbook_paths() -> Dict[str, Path]:
+    """
+    Scans `/workspace/.agents/skills/*/SKILL.md`, `/root/.gemini/antigravity-cli/skills/*/SKILL.md`,
+    and `/root/.gemini/antigravity-cli/builtin/skills/*/SKILL.md` (with `_REPO_ROOT` fallback)
+    and returns a mapping of normalized skill name -> `SKILL.md` Path.
+    """
+    skill_roots = [
+        Path("/workspace/.agents/skills"),
+        Path(_REPO_ROOT) / ".agents" / "skills",
+        Path("/root/.gemini/antigravity-cli/skills"),
+        Path("/root/.gemini/antigravity-cli/builtin/skills"),
+    ]
+    found: Dict[str, Path] = {}
+    for root in skill_roots:
+        if not root.is_dir():
+            continue
+        try:
+            for skill_md in sorted(root.glob("*/SKILL.md")):
+                if not skill_md.is_file():
+                    continue
+                folder_key = skill_md.parent.name.strip().lower()
+                fm_name, _ = _parse_skill_frontmatter(skill_md)
+                fm_key = fm_name.strip().lower()
+                if folder_key and folder_key not in found:
+                    found[folder_key] = skill_md
+                if fm_key and fm_key not in found:
+                    found[fm_key] = skill_md
+        except Exception:
+            pass
+    return found
+
+
+def _load_skills_index_summary() -> str:
+    """
+    Scans `/workspace/.agents/skills/*/SKILL.md` and `/root/.gemini/antigravity-cli/skills/*/SKILL.md`
+    (plus builtin skills) once in memory and returns the formatted skill index for inclusion in
+    `build_gotchi_static_system_instruction()`.
+    """
+    global _CACHED_SKILLS_INDEX_SUMMARY
+    if _CACHED_SKILLS_INDEX_SUMMARY is not None:
+        return _CACHED_SKILLS_INDEX_SUMMARY
+
+    skill_roots = [
+        Path("/workspace/.agents/skills"),
+        Path(_REPO_ROOT) / ".agents" / "skills",
+        Path("/root/.gemini/antigravity-cli/skills"),
+        Path("/root/.gemini/antigravity-cli/builtin/skills"),
+    ]
+    seen_names: set[str] = set()
+    entries: List[str] = []
+    for root in skill_roots:
+        if not root.is_dir():
+            continue
+        try:
+            for skill_md in sorted(root.glob("*/SKILL.md")):
+                if not skill_md.is_file():
+                    continue
+                folder_name = skill_md.parent.name.strip()
+                fm_name, fm_desc = _parse_skill_frontmatter(skill_md)
+                canonical = folder_name or fm_name
+                norm_key = canonical.lower()
+                if norm_key in seen_names:
+                    continue
+                seen_names.add(norm_key)
+                if fm_desc:
+                    entries.append(f"- `{canonical}` ({skill_md}): {fm_desc}")
+                else:
+                    entries.append(f"- `{canonical}` ({skill_md})")
+        except Exception:
+            pass
+
+    if entries:
+        _CACHED_SKILLS_INDEX_SUMMARY = (
+            "\n\n=== AVAILABLE ZERO SKILLS INDEX (Call `load_skill_playbook(skill_name)` to load full SKILL.md) ===\n"
+            + "\n".join(entries)
+        )
+    else:
+        _CACHED_SKILLS_INDEX_SUMMARY = ""
+    return _CACHED_SKILLS_INDEX_SUMMARY
+
+
 def resolve_lomin_client_lockout_key(
     headers: Dict[str, str], client_host: str = "127.0.0.1"
 ) -> str:
@@ -1297,18 +1508,25 @@ def build_gotchi_static_system_instruction() -> str:
         "- VOICE MUTATION GATE & READ ALLOWLIST: On voice turns, non-destructive shell commands (e.g. git status/diff, "
         "ls, find, python3, curl) and new file writes in allowed roots run directly. Destructive shell commands (file deletion, "
         "git reset/clean/force-push, container teardown, process kills) and file overwrites stage a confirmation card in "
-        "`#zero-chat` before executing. `read_local_file` is restricted to `os.path.realpath` under `/workspace/` and "
-        "`/baseball/` (denying `.env`, `.ssh`, and secrets).\n"
+        "`#zero-chat` before executing. `read_local_file` is restricted to `os.path.realpath` under `/workspace/`, "
+        "`/baseball/`, and `/root/.gemini/antigravity-cli/skills/` (denying `.env`, `.ssh`, and secrets).\n"
+        "- SKILL PLAYBOOK DISCOVERY (`load_skill_playbook`): You have access to all of Zero's specialized skills listed in "
+        "the AVAILABLE ZERO SKILLS INDEX below. Call `load_skill_playbook(skill_name)` to load the full `SKILL.md` "
+        "instructions for any skill in one step before executing skill-specific workflows.\n"
+        "- ASYNC ZERO RUNTIME HANDOFF (`handoff_to_zero_runtime` & `[[defer]]`): Whenever a request involves complex "
+        "multi-step workflows, heavy builds, browser automation, or tasks taking >5s, call "
+        "`handoff_to_zero_runtime(task_prompt, spoken_ack)` (or prefix your spoken reply with `[[defer]]`) so Gotchi "
+        "speaks a crisp acknowledgment immediately while waking the full `#zero-chat` Antigravity runtime asynchronously.\n"
         "- Use `search_zero_memory` to search durable memory or past transcripts.\n"
         "- Use `check_tasks_and_repos` to inspect `/workspace/data/tasks.json` and open GitHub issues.\n"
         "- Use `run_shell_command` to execute non-destructive commands in `/workspace` (destructive commands stage for confirmation).\n"
         "- Use `read_local_file` and `write_local_file` to inspect or write files on disk (overwrites stage for confirmation).\n"
-        "- Use `web_and_reddit_search` for live Reddit or Amazon SerpApi queries.\n"
+        "- Use `web_and_reddit_search` for live Reddit, Google Web (`mode='web'`), or Amazon (`mode='amazon'`) SerpApi queries.\n"
         "- Use `get_recent_discord_context` to read recent messages across Discord channels. Supports 'crab-cavern' multi-channel rollup across all Crab Cavern rooms, individual Crab Cavern channels ('lounge', 'gotchi', 'gotchi-chat', 'the-banana-stand', 'side-project', 'mirrormere', 'debug-huddle', 'agora', 'r-residentagents'), and Home channels ('zero-chat', 'zero-ops', 'homelab', 'home-assistant', 'finances', 'shopping', 'projects', '3d-print', 'steam-deck', 'baseball'). Never claim you lack access to Crab Cavern.\n"
         "- Use `post_note_to_zero_chat` to send clickable links, notes, code blocks, local images/files (`file_path`), "
         "or webpage screenshots (`screenshot_url`) directly to `#zero-chat`.\n"
         "- Use `get_weather_forecast` to check live weather conditions and high/low forecasts (defaults immediately to Local Home Area without asking for a city).\n\n"
-        f"{snapshot}{_load_full_zero_persona_and_rules()}"
+        f"{snapshot}{_load_full_zero_persona_and_rules()}{_load_skills_index_summary()}"
     )
 
 
@@ -1394,12 +1612,18 @@ def build_contextual_tool_filler(
         return options[seed % len(options)]
 
     if fn_name == "web_and_reddit_search":
-        source = str(args.get("source", "reddit")).lower()
+        source = str(args.get("mode") or args.get("source") or "reddit").lower()
         if source == "amazon":
             options = (
                 "I'm checking Amazon pricing and reviews for you now.",
                 "Pulling up those product details on Amazon now.",
                 "Looking up the current Amazon listings for you now.",
+            )
+        elif source in ("web", "google", "general", "broad"):
+            options = (
+                "I'm searching the web for that now.",
+                "Pulling up the latest web results on that for you now.",
+                "Looking up those details online for you now.",
             )
         else:
             options = (
@@ -1408,6 +1632,20 @@ def build_contextual_tool_filler(
                 "Searching recent discussions on that for you now.",
             )
         return options[seed % len(options)]
+
+    if fn_name == "load_skill_playbook":
+        options = (
+            "I'm loading that skill playbook now.",
+            "Pulling up the workflow instructions for that skill now.",
+            "Checking the playbook steps for you now.",
+        )
+        return options[seed % len(options)]
+
+    if fn_name == "handoff_to_zero_runtime":
+        ack = str(args.get("spoken_ack", "") or "").strip()
+        if ack:
+            return ack
+        return "I'm kicking that off in Zero-Chat for you now."
 
     if fn_name == "check_tasks_and_repos":
         options = (
@@ -1516,6 +1754,47 @@ def normalize_discord_channel_input(raw: str) -> Tuple[bool, str]:
     return False, clean
 
 
+def _run_general_web_search(query: str, limit: int = 5) -> str:
+    """
+    Executes general Google web search via SerpApi and formats top organic results as JSON string.
+    """
+    clean_q = (query or "").strip()
+    if not clean_q:
+        return json.dumps({"error": "Empty query"})
+    try:
+        try:
+            import tools.reddit_extractor as _re
+        except ImportError:
+            from tools import reddit_extractor as _re  # type: ignore[no-redef]
+        raw_res = _re._query_serpapi({"q": clean_q, "num": limit, "hl": "en", "gl": "us"})
+        if isinstance(raw_res, dict) and raw_res.get("error"):
+            return json.dumps(raw_res)
+        raw_items = raw_res.get("organic_results", []) if isinstance(raw_res, dict) else []
+        formatted = []
+        for item in raw_items[:limit]:
+            if isinstance(item, dict):
+                formatted.append({
+                    "title": item.get("title", ""),
+                    "link": item.get("link", ""),
+                    "snippet": item.get("snippet", ""),
+                })
+        return json.dumps({"query": clean_q, "count": len(formatted), "organic_results": formatted})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _queue_zero_runtime_turn(prompt_text: str, source: str = "gotchi-voice-handoff") -> Dict[str, Any]:
+    """
+    Invokes `outbox.queue_agent_turn` into `#zero-chat` (`TARGET_CHANNEL_ID`), accepting either
+    `source=` or `job_name=` parameter conventions cleanly across real and monkeypatched outbox.
+    """
+    ch_str = str(TARGET_CHANNEL_ID) if TARGET_CHANNEL_ID else "1542081375287640084"
+    try:
+        return outbox.queue_agent_turn(ch_str, prompt_text, source=source)  # type: ignore[call-arg]
+    except TypeError:
+        return outbox.queue_agent_turn(ch_str, prompt_text, job_name=source)
+
+
 async def execute_gotchi_tool_call(
     name: str,
     args: Dict[str, Any],
@@ -1534,6 +1813,63 @@ async def execute_gotchi_tool_call(
             "thinking_level": "HIGH",
             "spoken_preamble": preamble,
             "reason": reason,
+        }
+
+    if name == "load_skill_playbook":
+        raw_skill = str(args.get("skill_name") or args.get("name") or "").strip()
+        if not raw_skill:
+            return {"error": "Empty skill_name"}
+        norm_skill = raw_skill.lower().strip()
+        if norm_skill.endswith("/skill.md"):
+            norm_skill = Path(norm_skill).parent.name.lower()
+        playbook_map = await asyncio.to_thread(_discover_skill_playbook_paths)
+        matched_path = (
+            playbook_map.get(norm_skill)
+            or playbook_map.get(norm_skill.replace("_", "-"))
+            or playbook_map.get(norm_skill.replace("-", "_"))
+        )
+        if matched_path is None:
+            for k, p in playbook_map.items():
+                if norm_skill in k or k in norm_skill:
+                    matched_path = p
+                    break
+        if matched_path is None or not matched_path.is_file():
+            return {
+                "error": f"Skill playbook not found: {raw_skill}",
+                "available_skills": sorted({p.parent.name for p in playbook_map.values()}),
+            }
+        try:
+            content = await asyncio.to_thread(matched_path.read_text, "utf-8", "replace")
+            return {
+                "skill_name": matched_path.parent.name,
+                "path": str(matched_path),
+                "content": content[:12000],
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    if name == "handoff_to_zero_runtime":
+        task_prompt = str(args.get("task_prompt") or args.get("prompt") or "").strip()
+        spoken_ack = str(args.get("spoken_ack") or "I'm kicking that off in Zero-Chat for you now.").strip()
+        if not task_prompt:
+            return {"error": "Empty task_prompt"}
+        handoff_payload = (
+            task_prompt
+            if task_prompt.startswith("[GOTCHI VOICE HANDOFF]:")
+            else f"[GOTCHI VOICE HANDOFF]: {task_prompt}"
+        )
+        queued = await asyncio.to_thread(
+            _queue_zero_runtime_turn,
+            handoff_payload,
+            "gotchi-voice-handoff",
+        )
+        return {
+            "ok": True,
+            "status": "handed_off_to_zero_runtime",
+            "channel_id": TARGET_CHANNEL_ID or 1542081375287640084,
+            "task_prompt": task_prompt,
+            "spoken_ack": spoken_ack,
+            "queued": queued,
         }
 
     if name == "get_weather_forecast":
@@ -1621,7 +1957,7 @@ async def execute_gotchi_tool_call(
                 cwd="/workspace",
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=15,
             )
             combined = (res.stdout or "") + ("\nSTDERR:\n" + res.stderr if res.stderr else "")
             return {"exit_code": res.returncode, "output": combined[:4000] or "(no output)"}
@@ -1665,16 +2001,30 @@ async def execute_gotchi_tool_call(
     if name == "web_and_reddit_search":
         query = str(args.get("query", "")).strip()
         sub = str(args.get("subreddit", "")).strip()
-        mode = str(args.get("mode", "reddit")).strip().lower()
+        mode = str(args.get("mode") or args.get("source") or "reddit").strip().lower()
+        recency = str(args.get("recency") or "").strip().lower()
         if not query:
             return {"error": "Empty query"}
         try:
             if mode == "amazon":
                 cmd = ["python3", "/workspace/tools/amazon_serpapi.py", query]
-            else:
-                cmd = ["python3", "/workspace/tools/reddit_extractor.py", "search", query, "-n", "5"]
-                if sub:
-                    cmd.extend(["--sub", sub])
+                res = await asyncio.to_thread(
+                    subprocess.run,
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=6,
+                )
+                return {"result": (res.stdout or res.stderr or "No results")[:3500]}
+            if mode in ("web", "google", "general", "broad"):
+                web_res = await asyncio.to_thread(_run_general_web_search, query)
+                return {"result": web_res[:3500]}
+
+            cmd = ["python3", "/workspace/tools/reddit_extractor.py", "search", query, "-n", "5"]
+            if sub:
+                cmd.extend(["--sub", sub])
+            if recency in ("year", "all", "month", "week"):
+                cmd.extend(["--recency", recency])
             res = await asyncio.to_thread(
                 subprocess.run,
                 cmd,
@@ -1682,7 +2032,21 @@ async def execute_gotchi_tool_call(
                 text=True,
                 timeout=6,
             )
-            return {"result": (res.stdout or res.stderr or "No results")[:3500]}
+            stdout = res.stdout or ""
+            if '"count": 0' in stdout and recency != "all":
+                retry_cmd = [c for c in cmd if c not in ("--recency", "year", "month", "week")] + ["--recency", "all"]
+                res = await asyncio.to_thread(
+                    subprocess.run,
+                    retry_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=6,
+                )
+                stdout = res.stdout or ""
+            if '"count": 0' in stdout:
+                web_res = await asyncio.to_thread(_run_general_web_search, query)
+                return {"result": web_res[:3500]}
+            return {"result": (stdout or res.stderr or "No results")[:3500]}
         except Exception as e:
             return {"error": str(e)}
 
@@ -1859,14 +2223,14 @@ def record_gotchi_turn_to_channels(
     timing_footer = ""
     if total_ms is not None and total_ms > 0:
         fa_str = f" · first_audio: {first_audio_ms}ms" if first_audio_ms is not None else ""
-        timing_footer = f"\n-# session: {session_id} · stt: {stt_ms}ms{fa_str} · total: {total_ms}ms"
+        timing_footer = f"\n-# stt: {stt_ms}ms{fa_str} · total: {total_ms}ms"
 
     if mode == "journal":
-        discord_msg = f"📓 **[{node_id} · All-Day Journal]{img_badge}:**\n> {transcript}{timing_footer}"
+        discord_msg = f"📓 **[All-Day Journal]{img_badge}:**\n> {transcript}{timing_footer}"
     else:
         discord_msg = (
-            f"🎙️ **Ryan ({node_id}){img_badge}:** {transcript}\n"
-            f"🔊 **Zero ({voice_name}):** {reply}{timing_footer}"
+            f"🎙️ **Ryan{img_badge}:** {transcript}\n"
+            f"🔊 **Zero:** {reply}{timing_footer}"
         )
 
     dispatched = False
@@ -2291,21 +2655,42 @@ class GotchiZeroBrainAdapter:
 
             stream_fn = getattr(client.aio.models, "generate_content_stream", None)
             if callable(stream_fn):
-                stream_obj = stream_fn(
-                    model=live_model,
-                    contents=contents,
-                    config=config,
-                )
-                if asyncio.iscoroutine(stream_obj):
-                    stream_obj = await stream_obj
-                async for chunk in stream_obj:
+                async def _iter_stream_with_fallback():
+                    models_to_try = [live_model]
+                    for fb in ("gemini-2.5-flash", "gemini-2.0-flash"):
+                        if fb not in models_to_try:
+                            models_to_try.append(fb)
+                    last_err = None
+                    for idx, m_name in enumerate(models_to_try):
+                        try:
+                            m_cfg = config if idx == 0 else types.GenerateContentConfig(
+                                system_instruction=sys_prompt,
+                                tools=tools_list,
+                                temperature=0.4,
+                            )
+                            s_obj = stream_fn(model=m_name, contents=contents, config=m_cfg)
+                            if asyncio.iscoroutine(s_obj):
+                                s_obj = await s_obj
+                            async for c_item in s_obj:
+                                yield c_item
+                            return
+                        except Exception as s_err:
+                            last_err = s_err
+                            if any(code in str(s_err) for code in ("503", "429", "500", "UNAVAILABLE", "overloaded")) and idx + 1 < len(models_to_try):
+                                continue
+                            raise
+                    if last_err:
+                        raise last_err
+
+                async for chunk in _iter_stream_with_fallback():
                     chunk_text = getattr(chunk, "text", None) or ""
                     if chunk_text:
                         step_text_chunks.append(chunk_text)
-                        for ready_s in splitter.feed(chunk_text):
-                            await self._emit_streamed_sentence(
-                                ready_s, emitted_sentences, on_sentence
-                            )
+                        if _step == 0:
+                            for ready_s in splitter.feed(chunk_text):
+                                await self._emit_streamed_sentence(
+                                    ready_s, emitted_sentences, on_sentence
+                                )
                     chunk_fcalls = getattr(chunk, "function_calls", None)
                     if chunk_fcalls:
                         step_fcalls.extend(list(chunk_fcalls))
@@ -2322,28 +2707,47 @@ class GotchiZeroBrainAdapter:
                 resp_text = getattr(resp, "text", None) or ""
                 if resp_text:
                     step_text_chunks.append(resp_text)
-                    for ready_s in splitter.feed(resp_text):
-                        await self._emit_streamed_sentence(
-                            ready_s, emitted_sentences, on_sentence
-                        )
+                    if _step == 0:
+                        for ready_s in splitter.feed(resp_text):
+                            await self._emit_streamed_sentence(
+                                ready_s, emitted_sentences, on_sentence
+                            )
                 if getattr(resp, "function_calls", None):
                     step_fcalls.extend(list(resp.function_calls))
                 if getattr(resp, "candidates", None) and getattr(resp.candidates[0], "content", None):
                     c_parts = getattr(resp.candidates[0].content, "parts", None) or []
                     step_model_parts.extend(list(c_parts))
 
-            for trailing_s in splitter.flush():
-                await self._emit_streamed_sentence(
-                    trailing_s, emitted_sentences, on_sentence
-                )
+            if _step == 0:
+                for trailing_s in splitter.flush():
+                    await self._emit_streamed_sentence(
+                        trailing_s, emitted_sentences, on_sentence
+                    )
 
             step_text = "".join(step_text_chunks).strip()
-            if step_text:
-                accumulated_raw_parts.append(step_text)
 
-            if not step_fcalls:
-                final_raw = " ".join(accumulated_raw_parts).strip()
-                return final_raw, explicitly_posted_to_zero_chat, emitted_sentences
+            if _step == 0:
+                if step_text:
+                    accumulated_raw_parts.append(step_text)
+                if not step_fcalls:
+                    final_raw = " ".join(accumulated_raw_parts).strip()
+                    return final_raw, explicitly_posted_to_zero_chat, emitted_sentences
+            else:
+                if step_fcalls:
+                    step_text = ""
+                else:
+                    if step_text:
+                        accumulated_raw_parts.append(step_text)
+                        for ready_s in splitter.feed(step_text):
+                            await self._emit_streamed_sentence(
+                                ready_s, emitted_sentences, on_sentence
+                            )
+                        for trailing_s in splitter.flush():
+                            await self._emit_streamed_sentence(
+                                trailing_s, emitted_sentences, on_sentence
+                            )
+                    final_raw = step_text or " ".join(accumulated_raw_parts).strip()
+                    return final_raw, explicitly_posted_to_zero_chat, emitted_sentences
 
             if step_model_parts:
                 contents.append(types.Content(role="model", parts=step_model_parts))
@@ -2362,7 +2766,18 @@ class GotchiZeroBrainAdapter:
                         await self._emit_streamed_sentence(
                             preamble, emitted_sentences, on_sentence
                         )
-                elif not step_text and not emitted_sentences:
+                elif fn_name == "handoff_to_zero_runtime":
+                    ack_text = str(
+                        fn_args.get("spoken_ack")
+                        or "I'm kicking that off in Zero-Chat for you now."
+                    ).strip()
+                    if ack_text:
+                        if ack_text not in accumulated_raw_parts:
+                            accumulated_raw_parts.append(ack_text)
+                        await self._emit_streamed_sentence(
+                            ack_text, emitted_sentences, on_sentence
+                        )
+                elif _step == 0 and not step_text and not emitted_sentences:
                     # Pre-tool contextual action narration when the model invokes a tool without leading text
                     default_preamble = build_contextual_tool_filler(fn_name, fn_args, prompt)
                     await self._emit_streamed_sentence(
@@ -2370,7 +2785,7 @@ class GotchiZeroBrainAdapter:
                     )
 
                 res_dict = await execute_gotchi_tool_call(fn_name, fn_args)
-                if fn_name == "post_note_to_zero_chat" or (
+                if fn_name in ("post_note_to_zero_chat", "handoff_to_zero_runtime") or (
                     isinstance(res_dict, dict) and res_dict.get("confirmation_required") is True
                 ):
                     explicitly_posted_to_zero_chat = True
@@ -2391,6 +2806,43 @@ class GotchiZeroBrainAdapter:
                     )
                 )
             contents.append(types.Content(role="user", parts=fn_parts))
+
+        if step_fcalls:
+            live_model = self._resolve_live_gemini_model()
+            synth_config = types.GenerateContentConfig(
+                system_instruction=sys_prompt,
+                tools=[],
+                temperature=0.4,
+                thinking_config=build_thinking_config(
+                    live_model,
+                    prompt,
+                    default_budget=self.thinking_budget,
+                    step=4,
+                    tool_had_error=tool_had_error,
+                    burst_count=len(burst_images),
+                    model_requested_deep_thinking=model_requested_deep_thinking,
+                ),
+            )
+            try:
+                synth_resp = await client.aio.models.generate_content(
+                    model=live_model,
+                    contents=contents,
+                    config=synth_config,
+                )
+                synth_text = getattr(synth_resp, "text", None) or ""
+                if synth_text:
+                    accumulated_raw_parts.append(synth_text)
+                    synth_splitter = SentenceStreamSplitter()
+                    for ready_s in synth_splitter.feed(synth_text):
+                        await self._emit_streamed_sentence(
+                            ready_s, emitted_sentences, on_sentence
+                        )
+                    for trailing_s in synth_splitter.flush():
+                        await self._emit_streamed_sentence(
+                            trailing_s, emitted_sentences, on_sentence
+                        )
+            except Exception as exc:
+                log.warning(f"[GotchiZero] Final synthesis pass after tool exhaustion failed: {exc}")
 
         fallback_raw = " ".join(accumulated_raw_parts).strip() or "Handled. I sent that over to Zero-Chat."
         return fallback_raw, explicitly_posted_to_zero_chat, emitted_sentences
@@ -2801,6 +3253,18 @@ class GotchiZeroBrainAdapter:
                 else "Voice prompt"
             )
             stt_ms = int((time.monotonic() - t0) * 1000)
+
+        has_defer_in_reply = "[[defer]]" in (raw_reply or "").lower() or any(
+            "[[defer]]" in (s or "").lower() for s in streamed_sentences
+        )
+        if has_defer_in_reply and not explicitly_posted:
+            defer_prompt = (transcript or raw_prompt or "Deferred voice request").strip()
+            await asyncio.to_thread(
+                _queue_zero_runtime_turn,
+                f"[GOTCHI VOICE HANDOFF]: {defer_prompt}",
+                "gotchi-voice-handoff",
+            )
+            explicitly_posted = True
 
         is_long = is_long_answer(raw_reply)
         is_async = bool(parsed_turn.get("is_async_handoff") or parsed_turn.get("condense_long"))
