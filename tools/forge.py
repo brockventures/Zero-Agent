@@ -4423,35 +4423,72 @@ def verify_chunk_worktree(
         else:
             effective_cmd = repo_verify_cmd
 
-    env = os.environ.copy()
-    env["PYTHONPATH"] = f"{wt}:{env.get('PYTHONPATH', '')}".strip(":")
-    v_proc = subprocess.Popen(
-        effective_cmd,
-        shell=True,
-        cwd=str(wt),
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-        preexec_fn=_apply_low_priority if hasattr(os, "nice") else None,
+    combined_changed_files: list[str] = []
+    for f in (list(target_files or []) + list(changed)):
+        if f and f not in combined_changed_files:
+            combined_changed_files.append(f)
+
+    from tools.modal_verify import (
+        filter_verify_cmd_for_changed_files,
+        get_clamped_verify_env,
+        has_heavy_go_static_analysis,
+        run_or_offload_verify_cmd,
     )
-    try:
-        v_stdout, v_stderr = v_proc.communicate(timeout=VERIFY_CMD_TIMEOUT_SECONDS)
-        v_ret = v_proc.returncode
-    except subprocess.TimeoutExpired:
-        _kill_process_group(v_proc)
-        try:
-            v_stdout, v_stderr = v_proc.communicate(timeout=5)
-        except Exception:
-            v_stdout, v_stderr = "", ""
-        combined = f"{v_stdout}\n{v_stderr}".strip()
-        return (
-            False,
-            "",
-            f"Verification command timed out after {int(VERIFY_CMD_TIMEOUT_SECONDS)}s:\n{combined[-1500:]}",
+
+    effective_cmd = filter_verify_cmd_for_changed_files(
+        effective_cmd,
+        combined_changed_files,
+        cwd=wt,
+    )
+
+    env = get_clamped_verify_env(os.environ.copy(), verify_cmd=effective_cmd)
+    env["PYTHONPATH"] = f"{wt}:{env.get('PYTHONPATH', '')}".strip(":")
+
+    modal_offload_enabled = os.environ.get("ZERO_MODAL_VERIFY_OFFLOAD", "").strip().lower() in ("1", "true", "yes")
+    if modal_offload_enabled or has_heavy_go_static_analysis(effective_cmd):
+        v_ret, v_stdout, v_stderr = run_or_offload_verify_cmd(
+            effective_cmd,
+            cwd=wt,
+            changed_files=combined_changed_files,
+            timeout=int(VERIFY_CMD_TIMEOUT_SECONDS),
+            prefer_modal=modal_offload_enabled or has_heavy_go_static_analysis(effective_cmd),
+            base_env=env,
         )
+        if v_ret == 124 and "timed out" in v_stderr.lower():
+            combined = f"{v_stdout}\n{v_stderr}".strip()
+            return (
+                False,
+                "",
+                f"Verification command timed out after {int(VERIFY_CMD_TIMEOUT_SECONDS)}s:\n{combined[-1500:]}",
+            )
+    else:
+        v_proc = subprocess.Popen(
+            effective_cmd,
+            shell=True,
+            cwd=str(wt),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            preexec_fn=_apply_low_priority if hasattr(os, "nice") else None,
+        )
+        try:
+            v_stdout, v_stderr = v_proc.communicate(timeout=VERIFY_CMD_TIMEOUT_SECONDS)
+            v_ret = v_proc.returncode
+        except subprocess.TimeoutExpired:
+            _kill_process_group(v_proc)
+            try:
+                v_stdout, v_stderr = v_proc.communicate(timeout=5)
+            except Exception:
+                v_stdout, v_stderr = "", ""
+            combined = f"{v_stdout}\n{v_stderr}".strip()
+            return (
+                False,
+                "",
+                f"Verification command timed out after {int(VERIFY_CMD_TIMEOUT_SECONDS)}s:\n{combined[-1500:]}",
+            )
     if v_ret != 0:
         combined = f"{v_stdout}\n{v_stderr}".strip()
         return False, "", f"Verification command failed (exit {v_ret}):\n{combined[-1500:]}"
