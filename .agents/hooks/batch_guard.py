@@ -450,9 +450,10 @@ def check_interactive_investigation_gate(
             f"Interactive Investigation Gate Triggered: Detected {current_steps} diagnostic tool steps "
             f"over {elapsed:.1f}s (ceiling: 3 steps after 30.0s, max 5 steps). "
             "Open-ended investigations in interactive Discord turns must wrap up initial verified findings immediately. "
-            "Close your initial turn now with a clear summary of verified partial findings and hand off deeper diagnostic probes "
-            "to a detached background task via `python3 /workspace/tools/forge.py job start` "
-            "(or `python3 /workspace/tools/forge.py enqueue` for multi-file code builds). "
+            "**Code/Feature/Bugfix Builds:** MUST immediately write a ForgePlan JSON and call `python3 /workspace/tools/forge.py enqueue <plan.json>` — "
+            "NEVER call `forge.py job start` for code/asset changes, as `job start` locks the turn without staging a FORGE build or Decision Card. "
+            "**Open-Ended Read-Only System Diagnostics:** Close your initial turn now with a clear summary of verified partial findings and hand off deeper diagnostic probes "
+            "to a detached background task via `python3 /workspace/tools/forge.py job start`. "
             "When woken on completion, reread the channel history and perform an explicit contradiction check against your initial reply."
         )
         return False, reason
@@ -1165,6 +1166,63 @@ def check_inline_production_shell_mutation(
     return True, ""
 
 
+def is_forge_plan_file_path(target_file: str, cwd: str = "/workspace") -> bool:
+    """Return True if target_file looks like a ForgePlan JSON file being written or edited."""
+    if not target_file:
+        return False
+    norm = _norm_posix(target_file, cwd or "/workspace").lower()
+    if not norm.endswith(".json"):
+        return False
+    base = os.path.basename(norm)
+    if "/forge_plans/" in norm or "forge_plan" in base or "plan" in base:
+        return True
+    if norm.startswith(("/tmp/", "/workspace/scratch/")) or "/scratch/" in norm:
+        return True
+    return False
+
+
+def check_forge_post_offload_lock(
+    name: str,
+    args: dict,
+    state: dict,
+    cwd: str = "/workspace",
+) -> tuple[bool, str]:
+    """Enforce FORGE Post-Offload Turn Lock while allowing forge.py enqueue / stage-decision after an earlier diagnostic job start."""
+    if (
+        not state.get("offload_dispatched")
+        or os.environ.get("FORGE_WORKER_ACTIVE") == "1"
+        or _norm_posix(cwd or "/workspace", "/").startswith("/tmp/forge-wt-")
+    ):
+        return True, ""
+
+    if name not in ("run_command", "edit_file", "replace_file_content", "write_file", "write_to_file"):
+        return True, ""
+
+    cmd = str(args.get("CommandLine", "")) if name == "run_command" else ""
+    if name == "run_command" and "outbox.py" in cmd:
+        return True, ""
+
+    kind_label = str(state.get("offload_kind") or "FORGE job/build")
+    is_prior_job_start = "job start" in kind_label.lower() and "enqueue" not in kind_label.lower()
+
+    if is_prior_job_start:
+        if name == "run_command" and (
+            re.search(r"\bforge\.py\s+enqueue\b", cmd)
+            or (re.search(r"\bforge\.py\s+stage-decision\b", cmd) and "forge_enqueue" in cmd)
+        ):
+            return True, ""
+        if name in ("write_file", "write_to_file", "edit_file", "replace_file_content"):
+            target_p = str(args.get("TargetFile") or args.get("Path") or "")
+            if is_forge_plan_file_path(target_p, cwd=cwd):
+                return True, ""
+
+    return False, (
+        f"FORGE Post-Offload Turn Lock Triggered: A {kind_label} was already dispatched in this turn. "
+        "Do not continue executing commands, editing scripts, or spawning additional jobs in the same turn. "
+        "End your turn immediately (output your brief launch status to Ryan) and wait for the asynchronous completion wakeup."
+    )
+
+
 def is_heavy_inline_benchmark_or_migration(cmd: str, cwd: str = "/workspace") -> bool:
     """Detect heavy multi-minute benchmark or database migration commands run inline outside FORGE."""
     if not cmd:
@@ -1253,21 +1311,12 @@ def check_tool_use(
 
     # 0b. Post-Offload Turn Lock: Once a FORGE build (`forge.py enqueue`) or detached background job (`forge.py job start`)
     # is dispatched in an interactive turn, block all subsequent mutating/execution tool calls so the agent cannot
-    # loop or abuse `forge.py job start` as an inline `run_command` counter reset.
-    if (
-        state.get("offload_dispatched")
-        and os.environ.get("FORGE_WORKER_ACTIVE") != "1"
-        and not _norm_posix(cwd or "/workspace", "/").startswith("/tmp/forge-wt-")
-    ):
-        is_exempt_outbox = name == "run_command" and "outbox.py" in str(args.get("CommandLine", ""))
-        if not is_exempt_outbox and name in ("run_command", "edit_file", "replace_file_content", "write_file", "write_to_file"):
-            kind_label = state.get("offload_kind") or "FORGE job/build"
-            save_state(state, state_file)
-            return False, (
-                f"FORGE Post-Offload Turn Lock Triggered: A {kind_label} was already dispatched in this turn. "
-                "Do not continue executing commands, editing scripts, or spawning additional jobs in the same turn. "
-                "End your turn immediately (output your brief launch status to Ryan) and wait for the asynchronous completion wakeup."
-            )
+    # loop or abuse `forge.py job start` as an inline `run_command` counter reset (while still permitting `forge.py enqueue`
+    # after a diagnostic `forge.py job start`).
+    ok_lock, lock_reason = check_forge_post_offload_lock(name=name, args=args, state=state, cwd=cwd)
+    if not ok_lock:
+        save_state(state, state_file)
+        return False, lock_reason
 
     # 0c. Deterministic Interactive Investigation Gate:
     # Wrap up open-ended investigations (>3 diagnostic steps after 30s or >5 steps) in interactive Discord turns
@@ -1325,16 +1374,21 @@ def check_tool_use(
                                 if isinstance(pdata, dict):
                                     val_fn = None
                                     try:
-                                        from tools.forge import validate_forge_plan
+                                        _repo_root = os.path.abspath(
+                                            os.path.join(os.path.dirname(__file__), "..", "..")
+                                        )
+                                        if _repo_root not in sys.path:
+                                            sys.path.insert(0, _repo_root)
+                                        elif sys.path[0] != _repo_root:
+                                            sys.path.remove(_repo_root)
+                                            sys.path.insert(0, _repo_root)
+                                        from tools.forge import _normalize_forge_plan_in_place, validate_forge_plan
+                                        _normalize_forge_plan_in_place(pdata, from_enqueue=True)
                                         val_fn = validate_forge_plan
                                     except Exception:
                                         try:
-                                            _repo_root = os.path.abspath(
-                                                os.path.join(os.path.dirname(__file__), "..", "..")
-                                            )
-                                            if _repo_root not in sys.path:
-                                                sys.path.insert(0, _repo_root)
-                                            from tools.forge import validate_forge_plan
+                                            from tools.forge import _normalize_forge_plan_in_place, validate_forge_plan
+                                            _normalize_forge_plan_in_place(pdata, from_enqueue=True)
                                             val_fn = validate_forge_plan
                                         except Exception:
                                             val_fn = None
@@ -1346,10 +1400,16 @@ def check_tool_use(
                                         if not pdata.get("title") or not pdata.get("chunks"):
                                             plan_ok = False
                                         elif not (
+                                            pdata.get("origin_channel_id")
+                                            or pdata.get("channel_id")
+                                        ):
+                                            plan_ok = False
+                                        elif not (
                                             pdata.get("context_fact_sheet")
                                             or pdata.get("shared_context")
                                             or pdata.get("facts")
                                             or pdata.get("objective")
+                                            or pdata.get("chunks")
                                         ):
                                             plan_ok = False
                                         else:

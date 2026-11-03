@@ -6,11 +6,14 @@ import json
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _HOOKS_DIR = os.path.join(_REPO_ROOT, ".agents", "hooks")
+if "/workspace" in sys.path:
+    sys.path.remove("/workspace")
 sys.path.insert(0, _HOOKS_DIR if os.path.isdir(_HOOKS_DIR) else "/workspace/.agents/hooks")
 sys.path.insert(0, _REPO_ROOT)
 from batch_guard import (
     STATE_FILE,
     check_batching,
+    check_forge_post_offload_lock,
     check_interactive_investigation_gate,
     check_tool_use,
     is_exempt_from_investigation_gate,
@@ -930,6 +933,10 @@ def test_interactive_investigation_gate_steps_1_to_3_allowed_and_step_4_blocked_
         ok4, reason4 = check_tool_use("run_command", {"CommandLine": "cat /workspace/data/log2.txt"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 35.0)
         assert ok4 is False
         assert "Interactive Investigation Gate Triggered" in reason4
+        assert "Code/Feature/Bugfix Builds" in reason4
+        assert "MUST immediately write a ForgePlan JSON and call `python3 /workspace/tools/forge.py enqueue <plan.json>`" in reason4
+        assert "NEVER call `forge.py job start` for code/asset changes" in reason4
+        assert "Open-Ended Read-Only System Diagnostics" in reason4
         assert "forge.py job start" in reason4
         assert "partial findings" in reason4
         assert "contradiction check" in reason4
@@ -1309,6 +1316,102 @@ def test_save_state_prunes_expired_sessions(tmp_path):
     assert "sess_a" not in data["sessions"]
     # Backwards-compatible top-level keys match most recent save
     assert data["interactive_diag_steps"] == 1
+
+
+def test_forge_enqueue_exempt_from_prior_job_start_post_offload_lock(tmp_path):
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        state_file = str(tmp_path / "bg_state_job_then_enq.json")
+        in_flight = tmp_path / "in_flight.json"
+        in_flight.write_text(json.dumps({"channel_id": 1542081375287640084, "prompt": "fix bug"}))
+        t0 = 1_800_500_000.0
+
+        # 1. Agent calls forge.py job start earlier in the turn -> activates Post-Offload Turn Lock for job start
+        ok_job, r_job = check_tool_use(
+            "run_command",
+            {"CommandLine": 'python3 /workspace/tools/forge.py job start --name "Diag" --command "echo diag"'},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0,
+        )
+        assert ok_job is True, f"job start failed: {r_job}"
+        st1 = load_state(state_file)
+        assert st1["offload_dispatched"] is True
+        assert "job start" in st1["offload_kind"]
+
+        # 2. Normal shell commands or non-plan production edits remain blocked by Post-Offload Turn Lock
+        ok_cmd, r_cmd = check_tool_use(
+            "run_command",
+            {"CommandLine": "python3 /workspace/scratch/another_probe.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 2.0,
+        )
+        assert ok_cmd is False
+        assert "FORGE Post-Offload Turn Lock Triggered" in r_cmd
+
+        ok_prod_edit, r_prod_edit = check_tool_use(
+            "edit_file",
+            {"Path": "/workspace/tools/bridge.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 3.0,
+        )
+        assert ok_prod_edit is False
+        assert "FORGE Post-Offload Turn Lock Triggered" in r_prod_edit
+
+        # 3. Writing a ForgePlan JSON file and calling forge.py enqueue is ALLOWED despite the prior job start lock
+        plan_file = tmp_path / "forge_plan.json"
+        plan_payload = {
+            "title": "Fix After Job Start",
+            "channel_id": 1542081375287640084,
+            "repo": "/workspace",
+            "chunks": [
+                {
+                    "title": "Apply Fix",
+                    "target_files": ["tools/forge.py", "tools/test_forge.py", ".agents/hooks/batch_guard.py", "README.md"],
+                    "description": "Implement fix for schema normalization and add regression tests.",
+                }
+            ],
+        }
+        ok_write_plan, r_write_plan = check_tool_use(
+            "write_file",
+            {"Path": str(plan_file), "Content": json.dumps(plan_payload)},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 4.0,
+        )
+        assert ok_write_plan is True, f"Writing ForgePlan JSON should be allowed after job start, got: {r_write_plan}"
+        plan_file.write_text(json.dumps(plan_payload), encoding="utf-8")
+
+        ok_enq, r_enq = check_tool_use(
+            "run_command",
+            {"CommandLine": f"python3 /workspace/tools/forge.py enqueue {plan_file}"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 5.0,
+        )
+        assert ok_enq is True, f"forge.py enqueue should be allowed after prior job start, got: {r_enq}"
+
+        # 4. After forge.py enqueue succeeds, offload_kind transitions to enqueue and a second enqueue is blocked
+        st2 = load_state(state_file)
+        assert st2["offload_dispatched"] is True
+        assert "enqueue" in st2["offload_kind"]
+        ok_direct, r_direct = check_forge_post_offload_lock("run_command", {"CommandLine": "ls"}, state=st2)
+        assert ok_direct is False
+        assert "FORGE Post-Offload Turn Lock Triggered" in r_direct
+
+        ok_enq2, r_enq2 = check_tool_use(
+            "run_command",
+            {"CommandLine": f"python3 /workspace/tools/forge.py enqueue {plan_file}"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 6.0,
+        )
+        assert ok_enq2 is False
+        assert "FORGE Post-Offload Turn Lock Triggered" in r_enq2
+
 
 
 

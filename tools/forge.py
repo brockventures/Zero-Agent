@@ -1991,6 +1991,101 @@ def _normalize_chunk_dict_in_place(ch: dict, idx: int, all_chunks: list) -> None
         ch["target_branch"] = str(tb).strip()
 
 
+def _normalize_forge_plan_in_place(plan: dict, from_enqueue: bool = False) -> None:
+    """Auto-normalize a ForgePlan dict in-place before validation or enqueueing.
+
+    1. Auto-populates `origin_channel_id` from `channel_id` when `origin_channel_id` is missing/empty/0.
+    2. Auto-synthesizes `context_fact_sheet` from plan `title` and chunk `title`/`description`/`instructions`
+       when `context_fact_sheet` and `shared_context` are missing or empty.
+    3. Normalizes chunk aliases and, when `from_enqueue=True` (or `auto_split_chunks=True`), auto-caps
+       oversized `target_files` lists (>3 files in single-chunk or >max_files) by keeping the top 3 primary
+       code files in `target_files` and appending secondary asset/data paths into the chunk instructions notes.
+    """
+    if not isinstance(plan, dict):
+        return
+
+    # 1. Auto-default origin_channel_id from channel_id
+    origin_cid = plan.get("origin_channel_id")
+    if not origin_cid or str(origin_cid).strip() in ("", "0", "None"):
+        cand_cid = plan.get("channel_id")
+        if cand_cid and str(cand_cid).strip().isdigit() and int(str(cand_cid).strip()) != 0:
+            plan["origin_channel_id"] = cand_cid
+
+    # Normalize chunk dicts first so instructions/target_files are populated from description/files aliases
+    chunks = plan.get("chunks")
+    if isinstance(chunks, list):
+        for idx, ch in enumerate(chunks):
+            if isinstance(ch, dict):
+                _normalize_chunk_dict_in_place(ch, idx, chunks)
+
+    # 2. Auto-synthesize context_fact_sheet when missing/empty (unless context_fact_sheet was explicitly passed as [] with 0 chunks)
+    existing_facts = _normalize_shared_context(
+        plan.get("context_fact_sheet")
+        or plan.get("shared_context")
+        or plan.get("facts")
+        or plan.get("invariants")
+        or ([plan["objective"]] if plan.get("objective") else [])
+    )
+    if not existing_facts:
+        has_explicit_empty = "context_fact_sheet" in plan and plan.get("context_fact_sheet") == [] and not chunks
+        if not has_explicit_empty:
+            synth_facts: list[str] = []
+            p_title = str(plan.get("title") or "").strip()
+            if p_title:
+                synth_facts.append(f"Build Objective: {p_title}")
+            if isinstance(chunks, list):
+                for ch in chunks:
+                    if not isinstance(ch, dict):
+                        continue
+                    c_title = str(ch.get("title") or "").strip()
+                    c_desc = str(ch.get("description") or ch.get("instructions") or ch.get("prompt") or "").strip()
+                    if c_title and f"Chunk: {c_title}" not in synth_facts and c_title != p_title:
+                        synth_facts.append(f"Chunk: {c_title}")
+                    if c_desc:
+                        for raw_line in c_desc.splitlines():
+                            clean_line = re.sub(r"^[\s\-\*\d\.\)\#]+", "", raw_line).strip()
+                            if len(clean_line) >= 15 and clean_line not in synth_facts:
+                                synth_facts.append(clean_line[:240])
+                                if len(synth_facts) >= 3:
+                                    break
+                    if len(synth_facts) >= 3:
+                        break
+            if synth_facts:
+                plan["context_fact_sheet"] = synth_facts[:3]
+
+    # 3. Auto-cap oversized target_files during enqueue (or when auto_split_chunks / channel_id shorthand is used)
+    allow_large = bool(plan.get("allow_large_chunk", False))
+    should_cap_files = from_enqueue or bool(plan.get("auto_split_chunks")) or ("channel_id" in plan and "origin_channel_id" not in plan)
+    if should_cap_files and not allow_large and isinstance(chunks, list) and chunks:
+        is_single = len(chunks) == 1
+        max_f = MAX_SINGLE_CHUNK_TARGET_FILES if is_single else MAX_CHUNK_TARGET_FILES
+        for ch in chunks:
+            if not isinstance(ch, dict) or ch.get("allow_large_chunk"):
+                continue
+            t_files = _normalize_file_list(ch.get("target_files"))
+            if len(t_files) > max_f:
+                code_exts = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".c", ".cpp", ".h", ".R", ".sh")
+                primary = [
+                    f for f in t_files
+                    if f.endswith(code_exts) and not Path(f).name.startswith("test_") and not Path(f).name.endswith("_test.py")
+                ]
+                tests = [
+                    f for f in t_files
+                    if f not in primary and (Path(f).name.startswith("test_") or Path(f).name.endswith("_test.py") or f.endswith(code_exts))
+                ]
+                others = [f for f in t_files if f not in primary and f not in tests]
+                ordered = primary + tests + others
+                kept = ordered[:max_f]
+                overflow = ordered[max_f:]
+                ch["target_files"] = kept
+                note = f"\n\nAdditional secondary/companion paths in scope: {', '.join(overflow)}"
+                cur_instr = str(ch.get("instructions") or "").strip()
+                if overflow and note.strip() not in cur_instr and (len(cur_instr) + len(note) <= MAX_CHUNK_INSTRUCTION_CHARS):
+                    ch["instructions"] = f"{cur_instr}{note}".strip()
+                if "description" in ch and isinstance(ch["description"], str):
+                    ch["description"] = ch["instructions"]
+
+
 def _is_single_segment_unscoped_test(seg: str) -> bool:
     seg_clean = seg.strip()
     m_go = re.match(r"^go\s+test(?:\s+(.*))?$", seg_clean)
@@ -2275,6 +2370,8 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     """Deterministically validate a ForgePlan JSON dictionary before enqueueing."""
     if not isinstance(plan, dict):
         return False, "Plan must be a JSON object."
+
+    _normalize_forge_plan_in_place(plan, from_enqueue=False)
 
     title = str(plan.get("title") or "").strip()
     if not title:
@@ -3625,6 +3722,8 @@ def stage_plan_approval_decision(
     allow_overlap: bool = False,
 ) -> dict:
     """Validate a ForgePlan, persist it toforge_plans/, and stage an Approve | Edit | Dismiss Decision Card."""
+    if isinstance(plan, dict):
+        _normalize_forge_plan_in_place(plan, from_enqueue=True)
     valid, reason = validate_forge_plan(plan)
     if not valid:
         raise ValueError(f"Invalid ForgePlan: {reason}")
@@ -3771,11 +3870,8 @@ def _enqueue_build_impl(
     batch_state_path: Path | str = "/tmp/batch_guard_state.json",
     in_flight_path: Path | str = DATA_DIR / "in_flight_turn.json",
 ) -> dict:
-    chunks = plan.get("chunks") if isinstance(plan, dict) else None
-    if isinstance(chunks, list):
-        for idx, ch in enumerate(chunks):
-            if isinstance(ch, dict):
-                _normalize_chunk_dict_in_place(ch, idx, chunks)
+    if isinstance(plan, dict):
+        _normalize_forge_plan_in_place(plan, from_enqueue=True)
 
     valid, reason = validate_forge_plan(plan)
     if not valid:
