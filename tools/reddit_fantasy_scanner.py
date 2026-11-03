@@ -598,16 +598,7 @@ def run_reddit_fantasy_scanner(
         candidate_ref=selected,
     )
 
-    # Stage Decision Card if requested/eligible
-    decision_staged = False
-    dest_cid = channel_id or ZERO_CHAT_CHANNEL_ID
-    should_stage = stage if stage is not None else (not test)
-    if should_stage and selected.get("quality_score", 0) >= (0 if test else 40):
-        dec = stage_fantasy_decision(selected, draft, channel_id=dest_cid, post_to_discord=post_discord)
-        if dec:
-            decision_staged = True
-
-    card = format_draft_card(selected, draft, decision_staged=decision_staged)
+    card = format_draft_card(selected, draft, decision_staged=False)
 
     # Update state
     if not test and selected.get("raw_id"):
@@ -617,8 +608,15 @@ def run_reddit_fantasy_scanner(
         state["last_thread_url"] = selected.get("thread_url")
         save_state(state)
 
-    # Post to Discord if requested and not already dispatched by stage_decision
-    if post_discord and not decision_staged:
+    # Post formatted draft card directly to Discord (legacy format with [CHOICES: ...] buttons)
+    dest_cid = channel_id or ZERO_CHAT_CHANNEL_ID
+    decision_staged = False
+    if stage is True and selected.get("quality_score", 0) >= (0 if test else 40):
+        dec = stage_fantasy_decision(selected, draft, channel_id=dest_cid, post_to_discord=False)
+        if dec:
+            decision_staged = True
+
+    if post_discord:
         try:
             from tools.outbox import queue_outbox_message
             queue_outbox_message(str(dest_cid), card, source_turn="reddit_fantasy_scanner")

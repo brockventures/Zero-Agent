@@ -1,15 +1,12 @@
 import sys
-sys.path.insert(0, "/workspace")
-"""Unit tests for Reddit Fantasy Baseball Scanner sidecar."""
-
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from tools.reddit_fantasy_scanner import (
+sys.path.insert(0, "/workspace")
+
+from tools.reddit_fantasy_scanner import (  # noqa: E402
     generate_draft_comment,
     format_draft_card,
-    load_state,
-    save_state,
     run_reddit_fantasy_scanner,
 )
 
@@ -202,28 +199,6 @@ class TestRedditFantasyScanner(unittest.TestCase):
             "permalinkembedsaveparentreportreply"
         )
         own_entry_text = re.split(r"\n\s*\[[–-]\]", raw_entry_text.strip())[0]
-        self.assertIsNone(re.search(r"permalink.*?\bparent\b.*?reply", own_entry_text.lower()))
-
-        child_entry_text = (
-            "[–]Penstripedsox 1 point 18 hours ago \n\n"
-            "who is seth hernandez? tolle is a top 20 dynasty pitcher already.\n\n"
-            "permalinkembedsaveparentreportreply"
-        )
-        own_child_text = re.split(r"\n\s*\[[–-]\]", child_entry_text.strip())[0]
-        self.assertIsNotNone(re.search(r"permalink.*?\bparent\b.*?reply", own_child_text.lower()))
-
-    def test_old_reddit_top_level_with_child_parent_button_not_disqualified(self):
-        """Verify Old Reddit top-level comment whose child reply has a 'parent' link is kept at depth=0."""
-        import re
-        raw_entry_text = (
-            "[–]AverageKhorneWorship 10 man points league yahoo 2 points 23 hours ago \n\n"
-            "Tolle or Seth Hernandez?\n\n"
-            "permalinkembedsavereportreply\n\n"
-            "[–]Penstripedsox 1 point 18 hours ago \n\n"
-            "who is seth hernandez? tolle is a top 20 dynasty pitcher already.\n\n"
-            "permalinkembedsaveparentreportreply"
-        )
-        own_entry_text = re.split(r"\n\s*\[[–-]\]", raw_entry_text.strip())[0]
         self.assertIsNone(re.search(r"permalink.*?parent.*?reply", own_entry_text.lower()))
 
         child_entry_text = (
@@ -239,6 +214,31 @@ class TestRedditFantasyScanner(unittest.TestCase):
         self.assertLess(meta_score, 0)
         versus_score, _ = score_candidate({"text": "Tolle or Seth Hernandez?", "reply_count": 0, "depth": 0, "time_ago": "2h ago"})
         self.assertGreaterEqual(versus_score, 60)
+
+    @patch("tools.reddit_fantasy_scanner.scan_reddit_via_pixel")
+    @patch("tools.outbox.queue_outbox_message")
+    @patch("tools.reddit_fantasy_scanner.save_state")
+    def test_production_run_uses_legacy_card_format_not_decision_card(self, mock_save, mock_outbox, mock_scan):
+        """Verify non-test runs post the full readable draft card with [CHOICES: ...] instead of a truncated Decision Card."""
+        mock_scan.return_value = [
+            {
+                "thread_title": "Daily Anything Goes Thread",
+                "thread_url": "https://www.reddit.com/r/fantasybaseball/comments/999/",
+                "author": "Shiny_Rattata",
+                "text": "In our 12-team keeper league, should I trade Ragans for Merrill or hold my pitching depth?",
+                "raw_id": "t1_shiny_999",
+                "reply_count": 0,
+                "depth": 0,
+                "time_ago": "15m ago",
+            }
+        ]
+        ok, card, extra = run_reddit_fantasy_scanner(test=False, post_discord=True)
+        self.assertTrue(ok)
+        self.assertFalse(extra.get("decision_staged"))
+        self.assertIn("⚾ **r/fantasybaseball Discovery & Draft Card**", card)
+        self.assertIn("[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]", card)
+        self.assertNotIn("Approve Action:", card)
+        mock_outbox.assert_called_once()
 
 
 if __name__ == "__main__":
