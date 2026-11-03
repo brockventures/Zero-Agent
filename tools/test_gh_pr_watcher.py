@@ -2430,5 +2430,44 @@ class TestZeroMailListenerDoorbellWatermarkAndCap(unittest.TestCase):
             self.assertIn(f"gh_msg_{i}", saved_seen[0])
 
 
+class TestAutomatedCiOrPrAlertExemption(unittest.TestCase):
+    """Test is_automated_ci_or_pr_alert in tools.bridge_ambient."""
+
+    def test_is_automated_ci_or_pr_alert(self) -> None:
+        from tools.bridge_ambient import is_automated_ci_or_pr_alert
+
+        # Automated CI/conflict/roborev/CHANGES_REQUESTED strings should match True
+        self.assertTrue(
+            is_automated_ci_or_pr_alert(
+                'CI check "build-and-test" failed for PR #52 in brockventures/Zero-Agent'
+            )
+        )
+        self.assertTrue(
+            is_automated_ci_or_pr_alert(
+                "Merge conflict with `main` detected on PR #18"
+            )
+        )
+        self.assertTrue(
+            is_automated_ci_or_pr_alert(
+                "Review comment by roborev: Assessment: Fail"
+            )
+        )
+        self.assertTrue(
+            is_automated_ci_or_pr_alert(
+                "⚠️ GitHub PR Review: CHANGES_REQUESTED on brockventures/gotchi#109"
+            )
+        )
+        self.assertTrue(
+            is_automated_ci_or_pr_alert(
+                "Notice: automatic branch update could not resolve conflicts on PR #42"
+            )
+        )
+
+        # Normal chat should return False
+        self.assertFalse(is_automated_ci_or_pr_alert("Hey Zero, how is the build going?"))
+        self.assertFalse(is_automated_ci_or_pr_alert("Sounds good to me, let's ship it!"))
+        self.assertFalse(is_automated_ci_or_pr_alert(""))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-import os
 from pathlib import Path
 import re
 import signal
@@ -59,6 +58,19 @@ PROCESSED_BACKLOG_MSG_IDS: set[int] = set()
 channel_last_bot_reply: dict[int, float] = {}
 
 NON_NAME_NOUNS = r"(?:day|shot|downtime|errors?|detections?|latency|tolerance|cost|percent|sum|crossing|emission|point|index|out|wrapping|layout|config|leakage|padding|margin|trust|knowledge|defect|defects|risk|budget|drift|progress)\b"
+
+_AUTOMATED_CI_OR_PR_ALERT_RE = re.compile(
+    r"(?:CI check .* failed for|Merge conflict with .* detected on|\broborev\b|CHANGES_REQUESTED|automatic branch update could not resolve conflicts)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def is_automated_ci_or_pr_alert(content: str) -> bool:
+    """Return True when content matches automated GitHub/CI alert patterns."""
+    if not content:
+        return False
+    return bool(_AUTOMATED_CI_OR_PR_ALERT_RE.search(content))
+
 
 
 async def collect_message_and_reply_attachments(msg: discord.Message) -> list[str]:
@@ -453,7 +465,7 @@ async def route_external_message(
         print(f"[Bridge] Error checking topic resolution: {te}")
 
     # Loop prevention for peer bots (Amos, Marvin, etc.)
-    if msg.author.bot and not is_banana_watcher:
+    if msg.author.bot and not is_banana_watcher and not is_automated_ci_or_pr_alert(content):
         try:
             from tools.last_word_protocol import is_bot_paused, is_last_word_in_flight
             paused, rem, rec = is_bot_paused(msg.channel.id, msg.author.id, author_name)
@@ -916,7 +928,7 @@ async def route_external_message(
 
     is_last_word = False
     last_word_streak = 0
-    if msg.author.bot and not is_banana_watcher and rules.get("last_word_protocol_enabled", True):
+    if msg.author.bot and not is_banana_watcher and not is_automated_ci_or_pr_alert(content) and rules.get("last_word_protocol_enabled", True):
         lw_channels = rules.get("last_word_channels", [1534452820995080192])
         if not lw_channels or msg.channel.id in lw_channels:
             try:
