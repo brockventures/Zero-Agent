@@ -13,9 +13,11 @@ import sys
 import os
 import time
 import argparse
+from pathlib import Path
 from typing import Tuple, Dict, Any
 
 sys.path.insert(0, "/workspace/tools")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     from nas_config import run_ssh, evict_ssh_mux_socket, HOST_2_IP, HOST_1_IP, SSH_USER, SSH_PORT, SSH_KEY
 except Exception:
@@ -48,7 +50,8 @@ def check_host_pid_health(ip: str, host_name: str, threshold: float = DEFAULT_TH
             code, out, err = run_ssh(
                 ip,
                 cmd,
-                timeout=20,
+                timeout=25,
+                connect_timeout=15,
                 user=SSH_USER,
                 port=SSH_PORT,
                 key=SSH_KEY,
@@ -56,7 +59,7 @@ def check_host_pid_health(ip: str, host_name: str, threshold: float = DEFAULT_TH
                 retry_without_mux_on_timeout=(attempt == 1),
             )
         except TypeError:
-            code, out, err = run_ssh(ip, cmd, timeout=20, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
+            code, out, err = run_ssh(ip, cmd, timeout=25, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
         if code == 0 and len([line.strip() for line in out.strip().split("\n") if line.strip()]) >= 4:
             break
         if attempt < 3:

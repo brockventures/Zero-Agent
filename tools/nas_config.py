@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Tuple
 
 # Ensure workspace paths are present in sys.path
-for _path in ["/workspace", "/workspace/tools"]:
+for _path in [str(Path(__file__).resolve().parent.parent), str(Path(__file__).resolve().parent), "/workspace", "/workspace/tools"]:
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
@@ -136,7 +136,7 @@ def build_ssh_cmd(
     user: str = None,
     port: str = None,
     key: str = None,
-    connect_timeout: int = 5,
+    connect_timeout: int = 15,
     batch_mode: bool = True,
     disable_mux: bool = False,
 ) -> list[str]:
@@ -196,17 +196,22 @@ def run_ssh(
     user: str = None,
     port: str = None,
     key: str = None,
+    connect_timeout: int = None,
     batch_mode: bool = False,
     disable_mux: bool = False,
     retry_without_mux_on_timeout: bool = True,
 ) -> Tuple[int, str, str]:
     """Execute a remote command via SSH synchronously, with automatic mux eviction fallback on timeout."""
+    effective_connect_timeout = (
+        connect_timeout if connect_timeout is not None else min(max(15, timeout // 2), 30)
+    )
     cmd = build_ssh_cmd(
         host,
         remote_cmd,
         user=user,
         port=port,
         key=key,
+        connect_timeout=effective_connect_timeout,
         batch_mode=batch_mode,
         disable_mux=disable_mux,
     )
@@ -235,6 +240,7 @@ def run_ssh(
                 user=user,
                 port=port,
                 key=key,
+                connect_timeout=effective_connect_timeout,
                 batch_mode=batch_mode,
                 disable_mux=True,
             )
@@ -257,6 +263,7 @@ def run_ssh(
                     user=user,
                     port=port,
                     key=key,
+                    connect_timeout=effective_connect_timeout,
                     batch_mode=batch_mode,
                     disable_mux=True,
                 )
