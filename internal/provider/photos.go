@@ -1210,8 +1210,8 @@ func hasVideoMarker(val any) bool {
 	case []any:
 		return slices.ContainsFunc(v, hasVideoMarker)
 	case map[string]any:
-		for k, child := range v {
-			if (k == "76647426" && child != nil) || hasVideoMarker(child) {
+		for _, child := range v {
+			if hasVideoMarker(child) {
 				return true
 			}
 		}
