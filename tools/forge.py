@@ -1991,13 +1991,87 @@ def _normalize_chunk_dict_in_place(ch: dict, idx: int, all_chunks: list) -> None
         ch["target_branch"] = str(tb).strip()
 
 
+def _resolve_child_git_repo_for_targets(base_repo: Path, target_files: list[str]) -> Optional[Path]:
+    """If none of `target_files` exist under `base_repo` (or have existing parent dirs under `base_repo`),
+    check immediate child git repositories under `base_repo` (e.g. `/workspace/mirrormere`) and return
+    the child repository path if the target files (or their parent directories) exist there.
+    """
+    if not base_repo.exists() or not base_repo.is_dir():
+        return None
+
+    clean_files: list[str] = []
+    for f in target_files:
+        rel = str(f or "").strip().replace("\\", "/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        if not rel or Path(rel).is_absolute():
+            continue
+        clean_files.append(rel)
+
+    if not clean_files:
+        return None
+
+    # If any target file already exists in base_repo, keep base_repo
+    for rel in clean_files:
+        if (base_repo / rel).exists():
+            return None
+
+    try:
+        child_repos = sorted(
+            p for p in base_repo.iterdir()
+            if p.is_dir() and not p.name.startswith(".") and (p / ".git").exists()
+        )
+    except Exception:
+        return None
+
+    if not child_repos:
+        return None
+
+    # 1. Check if a target file starts with "<child_repo_name>/" (e.g. "mirrormere/internal/foo.go")
+    for child in child_repos:
+        prefix = f"{child.name}/"
+        if any(rel.startswith(prefix) and (child / rel[len(prefix):]).exists() for rel in clean_files):
+            return child
+
+    # 2. Check if any target file exists directly inside a child git repository
+    for child in child_repos:
+        if any((child / rel).exists() for rel in clean_files):
+            return child
+
+    # 3. If files are new, check if none of their parent dirs exist in base_repo (other than '.')
+    #    while at least one parent dir exists in a child git repository
+    non_dot_parents = [str(Path(rel).parent) for rel in clean_files if str(Path(rel).parent) not in ("", ".")]
+    if non_dot_parents and not any((base_repo / p).exists() for p in non_dot_parents):
+        for child in child_repos:
+            if any((child / p).exists() for p in non_dot_parents):
+                return child
+
+    return None
+
+
+def _detect_manual_git_commit_or_push_in_cmd(cmd: str) -> Optional[str]:
+    """Detect if a verification command contains manual git commit or git push subcommands."""
+    if not cmd:
+        return None
+    m = re.search(
+        r"\bgit\s+(?:(?:-C|-c|--git-dir|--work-tree)\s+\S+\s+|-[^\s]+\s+)*(commit|push)\b",
+        cmd,
+        re.IGNORECASE,
+    )
+    if m:
+        return f"git {m.group(1).lower()}"
+    return None
+
+
 def _normalize_forge_plan_in_place(plan: dict, from_enqueue: bool = False) -> None:
     """Auto-normalize a ForgePlan dict in-place before validation or enqueueing.
 
     1. Auto-populates `origin_channel_id` from `channel_id` when `origin_channel_id` is missing/empty/0.
-    2. Auto-synthesizes `context_fact_sheet` from plan `title` and chunk `title`/`description`/`instructions`
+    2. Auto-resolves sub-repositories (e.g. `/workspace/mirrormere`) when `repo` defaults to `/workspace`
+       and `target_files` exist in a child git repository under `/workspace` rather than `/workspace`.
+    3. Auto-synthesizes `context_fact_sheet` from plan `title` and chunk `title`/`description`/`instructions`
        when `context_fact_sheet` and `shared_context` are missing or empty.
-    3. Normalizes chunk aliases and, when `from_enqueue=True` (or `auto_split_chunks=True`), auto-caps
+    4. Normalizes chunk aliases and, when `from_enqueue=True` (or `auto_split_chunks=True`), auto-caps
        oversized `target_files` lists (>3 files in single-chunk or >max_files) by keeping the top 3 primary
        code files in `target_files` and appending secondary asset/data paths into the chunk instructions notes.
     """
@@ -2017,6 +2091,60 @@ def _normalize_forge_plan_in_place(plan: dict, from_enqueue: bool = False) -> No
         for idx, ch in enumerate(chunks):
             if isinstance(ch, dict):
                 _normalize_chunk_dict_in_place(ch, idx, chunks)
+
+    # 1b. Auto-resolve child git repositories under /workspace when repo defaults to /workspace
+    ws_str = str(WORKSPACE_DIR)
+    ws_resolved = WORKSPACE_DIR.resolve()
+    plan_repo_raw = str(plan.get("repo") or "").strip()
+    is_default_plan_repo = not plan_repo_raw or plan_repo_raw == "/workspace" or Path(plan_repo_raw).resolve() == ws_resolved
+    if not plan_repo_raw or plan_repo_raw == "/workspace":
+        base_search_repo = ws_resolved
+    else:
+        base_search_repo = Path(plan_repo_raw).resolve()
+
+    if isinstance(chunks, list) and chunks:
+        resolved_chunk_repos: list[str] = []
+        for ch in chunks:
+            if not isinstance(ch, dict):
+                continue
+            ch_repo_raw = str(ch.get("repo") or "").strip()
+            ch_is_default = (
+                not ch_repo_raw
+                or ch_repo_raw == "/workspace"
+                or Path(ch_repo_raw).resolve() == ws_resolved
+                or (is_default_plan_repo and ch_repo_raw == plan_repo_raw)
+            )
+            if ch_is_default and is_default_plan_repo:
+                t_files = _normalize_file_list(ch.get("target_files"))
+                sub_repo = _resolve_child_git_repo_for_targets(base_search_repo, t_files)
+                if sub_repo is not None:
+                    sub_repo_str = str(sub_repo)
+                    ch["repo"] = sub_repo_str
+                    # Strip leading "<child_repo_name>/" prefix from target_files if present
+                    prefix = f"{sub_repo.name}/"
+                    if isinstance(ch.get("target_files"), list):
+                        new_t_files = []
+                        for tf in ch["target_files"]:
+                            tf_s = str(tf).strip()
+                            while tf_s.startswith("./"):
+                                tf_s = tf_s[2:]
+                            if tf_s.startswith(prefix) and (sub_repo / tf_s[len(prefix):]).exists():
+                                new_t_files.append(tf_s[len(prefix):])
+                            else:
+                                new_t_files.append(tf)
+                        ch["target_files"] = new_t_files
+                    resolved_chunk_repos.append(sub_repo_str)
+                else:
+                    resolved_chunk_repos.append(ch_repo_raw or plan_repo_raw or ws_str)
+            else:
+                resolved_chunk_repos.append(ch_repo_raw or plan_repo_raw or ws_str)
+
+        if is_default_plan_repo and resolved_chunk_repos:
+            unique_repos = set(resolved_chunk_repos)
+            if len(unique_repos) == 1:
+                only_repo = next(iter(unique_repos))
+                if only_repo and only_repo != (plan_repo_raw or ws_str):
+                    plan["repo"] = only_repo
 
     # 2. Auto-synthesize context_fact_sheet when missing/empty (unless context_fact_sheet was explicitly passed as [] with 0 chunks)
     existing_facts = _normalize_shared_context(
@@ -2135,6 +2263,7 @@ def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
         return False, ["Plan must include a 'chunks' list."]
 
     findings: list[str] = []
+    _normalize_forge_plan_in_place(plan, from_enqueue=False)
     default_repo_str = str(plan.get("repo") or "/workspace").strip()
     n_chunks = len(chunks)
 
@@ -2196,16 +2325,22 @@ def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
                 if _is_new_file_in_instructions(rel_f, instructions, title):
                     continue
 
-                # Missing file: check if parent directory exists and instructions say In/Update/Modify
-                if target_p.parent.exists() and _matches_existing_file_reference(rel_f, instructions):
+                # Missing file: flag if parent directory does not exist in ch_repo OR instructions refer to it as existing
+                if not target_p.parent.exists() or _matches_existing_file_reference(rel_f, instructions):
                     hint = _get_close_files_hint(ch_repo, rel_f)
                     hint_suffix = f" {hint}" if hint else ""
                     findings.append(
                         f"Chunk {idx} target file '{rel_f}' does not exist in repository and is not marked as a new file in instructions.{hint_suffix}"
                     )
 
-        # C. Verification command test file validation
+        # C. Verification command test file & manual git commit/push validation
         verification_cmd = str(ch.get("verification_cmd") or "")
+        manual_git_sub = _detect_manual_git_commit_or_push_in_cmd(verification_cmd)
+        if manual_git_sub:
+            findings.append(
+                f"Chunk {idx} verification command contains manual git commit/push subcommand ('{manual_git_sub}' in '{verification_cmd}'). "
+                "Do not run git commit or git push inside verification_cmd; the FORGE supervisor commits and merges verified worktrees automatically."
+            )
         if verification_cmd and is_unscoped_pytest(verification_cmd):
             findings.append(
                 f"Chunk {idx} verification command contains unscoped full-suite pytest ('{verification_cmd}'). "

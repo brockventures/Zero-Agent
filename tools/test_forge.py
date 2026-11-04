@@ -3817,5 +3817,136 @@ def test_stacked_branch_per_chunk_checkout_and_isolation(tmp_path, monkeypatch):
     assert "dirty_uncommitted_test.py" not in feat2_files
 
 
+def test_normalize_subrepo_auto_resolution(tmp_path, monkeypatch):
+    """Verify _normalize_forge_plan_in_place and run_goldfish_plan_preflight auto-resolve child git repos under /workspace."""
+    import tools.forge as forge_mod
+
+    ws_root = _init_test_git_repo(tmp_path / "workspace")
+    sub_repo = _init_test_git_repo(ws_root / "mirrormere")
+    internal_dir = sub_repo / "internal" / "game"
+    internal_dir.mkdir(parents=True, exist_ok=True)
+    target_go = internal_dir / "engine.go"
+    target_go.write_text("package game\n\nfunc RunEngine() {}\n", encoding="utf-8")
+
+    monkeypatch.setattr(forge_mod, "WORKSPACE_DIR", ws_root)
+
+    # 1. Plan defaults repo to /workspace, target_files exist in /workspace/mirrormere
+    plan = {
+        "title": "Mirrormere Sub-Repo Feature",
+        "repo": "/workspace",
+        "origin_channel_id": str(forge_mod.FORGE_CHANNEL_ID),
+        "context_fact_sheet": ["Auto-resolve child git repositories under /workspace"],
+        "chunks": [
+            {
+                "title": "Update engine.go",
+                "target_files": ["internal/game/engine.go"],
+                "target_symbols": ["internal/game/engine.go:RunEngine"],
+                "instructions": "Update internal/game/engine.go to improve tick rate.",
+                "verification_cmd": "go test ./internal/game/...",
+            }
+        ],
+    }
+
+    forge_mod._normalize_forge_plan_in_place(plan)
+    assert Path(plan["repo"]).resolve() == sub_repo.resolve()
+    assert Path(plan["chunks"][0]["repo"]).resolve() == sub_repo.resolve()
+
+    ok, msg = forge_mod.validate_forge_plan(plan)
+    assert ok is True, f"Expected plan validation to pass after sub-repo resolution, got: {msg}"
+
+    # 2. Direct call to run_goldfish_plan_preflight also auto-resolves child git repo
+    plan_direct = {
+        "title": "Mirrormere Direct Preflight",
+        "repo": str(ws_root),
+        "origin_channel_id": str(forge_mod.FORGE_CHANNEL_ID),
+        "chunks": [
+            {
+                "title": "Update engine.go",
+                "target_files": ["internal/game/engine.go"],
+                "instructions": "Update internal/game/engine.go with new logic.",
+            }
+        ],
+    }
+    gf_ok, gf_findings = forge_mod.run_goldfish_plan_preflight(plan_direct)
+    assert gf_ok is True, f"Expected direct preflight to pass, got: {gf_findings}"
+    assert Path(plan_direct["repo"]).resolve() == sub_repo.resolve()
+    assert Path(plan_direct["chunks"][0]["repo"]).resolve() == sub_repo.resolve()
+
+
+def test_goldfish_preflight_missing_parent_directory_target_file(tmp_path):
+    """Verify run_goldfish_plan_preflight flags target files whose parent directory does not exist in ch_repo unless marked as new."""
+    import tools.forge as forge_mod
+
+    repo_dir = _init_test_git_repo(tmp_path / "repo")
+
+    # 1. Target file in non-existent parent directory without creation verb is flagged
+    plan_missing_dir = {
+        "title": "Missing Parent Dir Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": str(forge_mod.FORGE_CHANNEL_ID),
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Fix handler logic",
+                "target_files": ["nonexistent_pkg/sub/handler.py"],
+                "instructions": "Fix timeout handling in nonexistent_pkg/sub/handler.py.",
+            }
+        ],
+    }
+    ok, findings = forge_mod.run_goldfish_plan_preflight(plan_missing_dir)
+    assert ok is False
+    assert any("target file 'nonexistent_pkg/sub/handler.py' does not exist in repository" in f for f in findings)
+
+    # 2. Target file in non-existent parent directory explicitly marked as a new file passes
+    plan_new_in_missing_dir = {
+        "title": "New File in New Dir Plan",
+        "repo": str(repo_dir),
+        "origin_channel_id": str(forge_mod.FORGE_CHANNEL_ID),
+        "context_fact_sheet": ["Fact"],
+        "chunks": [
+            {
+                "title": "Create nonexistent_pkg/sub/handler.py",
+                "target_files": ["nonexistent_pkg/sub/handler.py"],
+                "instructions": "Create nonexistent_pkg/sub/handler.py with timeout handler.",
+            }
+        ],
+    }
+    ok_new, findings_new = forge_mod.run_goldfish_plan_preflight(plan_new_in_missing_dir)
+    assert ok_new is True, f"Expected new file to pass, got: {findings_new}"
+
+
+def test_goldfish_preflight_rejects_manual_commit_or_push_in_verification_cmd(tmp_path):
+    """Verify run_goldfish_plan_preflight rejects verification_cmd strings containing manual git commit or push subcommands."""
+    import tools.forge as forge_mod
+
+    repo_dir = _init_test_git_repo(tmp_path / "repo")
+    (repo_dir / "mod.py").write_text("X = 1\n", encoding="utf-8")
+
+    bad_cmds = [
+        "pytest tools/test_forge.py && git commit -m 'done'",
+        "pytest tools/test_forge.py && git push origin main",
+        "git -C /workspace commit -am 'manual'",
+        "python3 -m py_compile mod.py; git push",
+    ]
+    for bad_cmd in bad_cmds:
+        plan = {
+            "title": "Manual Git Commit/Push Verification Plan",
+            "repo": str(repo_dir),
+            "origin_channel_id": str(forge_mod.FORGE_CHANNEL_ID),
+            "context_fact_sheet": ["Fact"],
+            "chunks": [
+                {
+                    "title": "Update mod.py",
+                    "target_files": ["mod.py"],
+                    "instructions": "Update X = 2 in mod.py.",
+                    "verification_cmd": bad_cmd,
+                }
+            ],
+        }
+        ok, findings = forge_mod.run_goldfish_plan_preflight(plan)
+        assert ok is False, f"Expected verification_cmd '{bad_cmd}' to be rejected"
+        assert any("manual git commit/push" in f.lower() or "git commit" in f.lower() or "git push" in f.lower() for f in findings)
+
+
 if __name__ == "__main__":
     unittest.main()
