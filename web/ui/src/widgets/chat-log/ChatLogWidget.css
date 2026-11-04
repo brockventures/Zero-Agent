@@ -1,0 +1,89 @@
+.widget-chat-log {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  color: var(--mm-text-primary);
+}
+
+.chat-log-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding-bottom: 4px;
+  border-bottom: 2px solid var(--mm-text-primary);
+  margin-bottom: 6px;
+  flex-shrink: 0;
+}
+
+.chat-log-session {
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.chat-log-updated {
+  font-size: 0.95rem;
+  font-family: var(--mm-font-mono, monospace);
+}
+
+.chat-log-messages {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.chat-log-message {
+  flex-shrink: 0;
+  padding-left: 8px;
+}
+
+.chat-log-message.chat-log-human,
+.chat-log-human {
+  border-left: 5px solid var(--mm-text-primary);
+}
+
+.chat-log-message.chat-log-agent,
+.chat-log-agent {
+  border-left: 2px dotted var(--mm-text-primary);
+}
+
+.chat-log-meta {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.chat-log-author {
+  font-weight: 700;
+}
+
+.chat-log-ts {
+  font-weight: 400;
+  font-family: var(--mm-font-mono, monospace);
+}
+
+.chat-log-text {
+  font-size: 1.1rem;
+  line-height: 1.25;
+  word-break: break-word;
+}
+
+.chat-log-human .chat-log-text {
+  font-weight: 600;
+}
+
+.chat-log-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-size: 1.1rem;
+  color: var(--mm-text-dim, #888);
+}

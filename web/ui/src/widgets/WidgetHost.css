@@ -1,0 +1,13 @@
+.widget-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--mm-error-bg, rgba(239, 68, 68, 0.15));
+  color: var(--mm-error-text, #ef4444);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+  flex-shrink: 0;
+}

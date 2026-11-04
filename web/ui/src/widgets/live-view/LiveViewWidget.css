@@ -1,0 +1,124 @@
+/* ==========================================================================
+   Live View Widget Styles
+   ========================================================================== */
+
+.widget-card[data-widget-type="live-view"] {
+  padding: 0;
+}
+
+.widget-card[data-widget-type="live-view"] > .widget-live-view {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: none;
+  box-shadow: none;
+}
+
+.widget-live-view {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+  border-radius: 8px;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.widget-live-view[data-expand="false"] {
+  cursor: default;
+}
+
+.live-view-viewport {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.live-view-media,
+.live-view-mjpeg {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.widget-live-view[data-fit="cover"] .live-view-media,
+.widget-live-view[data-fit="cover"] .live-view-mjpeg {
+  object-fit: cover;
+}
+
+.live-view-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 2;
+  pointer-events: none;
+}
+
+.live-view-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #4ade80;
+  box-shadow: 0 0 6px rgba(74, 222, 128, 0.8);
+}
+
+.live-view-title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fff;
+  letter-spacing: 0.03em;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+
+.live-view-spinner {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(9, 5, 20, 0.7);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 10;
+  pointer-events: none;
+}
+
+.widget-live-view.loading .live-view-spinner {
+  display: flex;
+}
+
+.live-view-spinner .video-spinner-ring {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 3px solid rgba(168, 85, 247, 0.2);
+  border-top-color: var(--mm-accent-purple, #a855f7);
+  box-shadow: 0 0 12px var(--mm-accent-purple-glow, rgba(168, 85, 247, 0.4));
+  animation: mm-spin 0.8s linear infinite;
+}
+
+@keyframes mm-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}

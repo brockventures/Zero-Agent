@@ -1,0 +1,25 @@
+/*
+ * React display overrides (#779). Imported by src/main.tsx only, so the legacy UI never
+ * loads these rules. Loaded after hud.css, so these rules win on equal specificity.
+ *
+ * Paint audit: only the state limits that need no measurement are here. The
+ * backdrop-filter and filter: blur rules in hud.css are unchanged. Kiosk paint
+ * audit (blur rules): to be measured by a maintainer.
+ */
+
+/* Hidden tab (html[data-visible] is set from the visibility slice): stop the compositor
+   heartbeat and the infinite voicePulse and mm-spin animations. */
+html[data-visible="false"] .mm-compositor-heartbeat,
+html[data-visible="false"] .voice-pulse-ring,
+html[data-visible="false"] .header-video-spinner,
+html[data-visible="false"] .video-spinner-ring {
+  animation-play-state: paused;
+}
+
+/* Neighbour panes of the carousel are off-screen: their voicePulse and mm-spin users stop.
+   The current pane is #grid-canvas and keeps running. */
+.grid-pane:not(#grid-canvas) .voice-pulse-ring,
+.grid-pane:not(#grid-canvas) .video-spinner-ring,
+.grid-pane:not(#grid-canvas) .header-video-spinner {
+  animation-play-state: paused;
+}

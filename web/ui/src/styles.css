@@ -1,0 +1,150 @@
+@import './styles/overlays.css';
+
+:root,
+:root[data-theme="day"] {
+  color-scheme: light;
+}
+
+:root[data-theme="night"],
+body[data-theme="night"] {
+  color-scheme: dark;
+}
+
+#header-clock,
+.next-event-countdown,
+.hud-time,
+.progress-times,
+.countdown-days,
+.cal-event-time,
+.cf-event-time {
+  font-variant-numeric: tabular-nums;
+}
+
+.cf-modal-description,
+.plex-poster-grid,
+.detail-summary,
+.media-grid,
+.tasks-list,
+.chat-log-list {
+  overscroll-behavior: contain;
+}
+
+/* Scaffold only. The React shell still uses hud.css from style.css (see display_react.html). */
+#mirrormere-app {
+  position: fixed;
+  inset: 0;
+}
+
+
+/* Carousel. The viewport takes the space legacy .grid-canvas took (a flex item of the
+   #mirrormere-app column, so the indicator below it lands where legacy puts it). Panes
+   sit at -100%, 0 and +100% of the track; the track carries the finger offset. */
+.carousel-viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  overflow: clip;
+}
+
+.carousel-viewport.is-hidden {
+  display: none;
+}
+
+.carousel-track {
+  position: absolute;
+  inset: 0;
+  touch-action: pan-y;
+}
+
+/* Override hud.css touch-action: manipulation so horizontal touch drags on the indicator
+   pill are not claimed by the browser as a pan (which fires pointercancel before pointerup). */
+.screen-indicator {
+  touch-action: none;
+}
+
+.screen-indicator-pin {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  min-height: 0;
+  height: 100%;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  touch-action: manipulation;
+  color: var(--mm-text-dim, #8b819f);
+  opacity: 0.6;
+  transition: opacity 0.25s cubic-bezier(0.25, 1, 0.5, 1), color 0.25s cubic-bezier(0.25, 1, 0.5, 1), filter 0.25s cubic-bezier(0.25, 1, 0.5, 1);
+  -webkit-tap-highlight-color: transparent;
+}
+
+.screen-indicator-pin::before {
+  content: '';
+  position: absolute;
+  top: -8px;
+  bottom: -8px;
+  left: 0;
+  right: 0;
+}
+
+.screen-indicator-pin:hover {
+  opacity: 0.85;
+}
+
+.screen-indicator-pin.active {
+  color: var(--mm-lavender, #8b60ed);
+  opacity: 1;
+  filter: drop-shadow(0 0 6px var(--mm-accent-purple-glow, rgba(139, 96, 237, 0.45)));
+}
+
+:root[data-theme="night"] .screen-indicator-pin.active,
+body[data-theme="night"] .screen-indicator-pin.active,
+#mirrormere-app[data-theme="night"] .screen-indicator-pin.active {
+  color: var(--mm-lavender, #c5a3ff);
+  filter: drop-shadow(0 0 8px rgba(197, 163, 255, 0.55));
+}
+
+/* Same grid as the legacy .grid-canvas (hud.css). Every pane has this geometry. */
+.grid-pane {
+  position: absolute;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+  gap: var(--mm-grid-gap);
+}
+
+body[data-grid="3x6"] .grid-pane {
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(6, 1fr);
+}
+
+/* A legacy fragment brings its own .widget-card. The grid cell around it stays bare, so the card is not drawn twice. */
+.widget-card:has(> .widget-legacy) {
+  padding: 0;
+  background: none;
+  border: none;
+  box-shadow: none;
+}
+
+.widget-legacy {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.widget-legacy > .widget-card {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+

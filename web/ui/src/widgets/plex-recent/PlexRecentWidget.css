@@ -1,0 +1,201 @@
+/* Plex Recent Widget */
+.widget-card[data-widget-type="plex-recent"] {
+  padding: 0;
+}
+
+.widget-plex-recent {
+  --pr-text-main: #f8fafc;
+  --pr-text-sub: rgba(226, 232, 240, 0.72);
+  --pr-card-bg: rgba(30, 41, 59, 0.55);
+  --pr-pill-bg: rgba(255, 255, 255, 0.08);
+  --pr-pill-active: #e5a00d;
+  --pr-modal-bg: rgba(15, 23, 42, 0.96);
+  --pr-input-bg: rgba(15, 23, 42, 0.35);
+  --pr-input-border: rgba(148, 163, 184, 0.35);
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  padding: 8px 12px 10px;
+  box-sizing: border-box;
+  user-select: none;
+  font-family: inherit;
+  color: var(--pr-text-main);
+}
+
+body.theme-day .widget-plex-recent,
+[data-theme="day"] .widget-plex-recent,
+body.theme-day .widget-card[data-widget-type="plex-recent"],
+[data-theme="day"] .widget-card[data-widget-type="plex-recent"] {
+  --pr-text-main: #1e293b;
+  --pr-text-sub: #64748b;
+  --pr-card-bg: rgba(255, 255, 255, 0.72);
+  --pr-pill-bg: rgba(15, 23, 42, 0.07);
+  --pr-modal-bg: rgba(248, 250, 252, 0.97);
+  --pr-input-bg: #ffffff;
+  --pr-input-border: rgba(148, 163, 184, 0.4);
+}
+
+.widget-plex-recent .toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
+
+.widget-plex-recent .tabs {
+  display: flex;
+  gap: 5px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  touch-action: pan-x;
+}
+
+.widget-plex-recent .tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.widget-plex-recent .tab-btn {
+  border: 0;
+  background: var(--pr-pill-bg);
+  color: var(--pr-text-main);
+  font-family: inherit;
+  font-size: 0.73rem;
+  font-weight: 700;
+  padding: 5px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  touch-action: manipulation;
+}
+
+.widget-plex-recent .tab-btn.active {
+  background: var(--pr-pill-active);
+  color: #0f172a;
+}
+
+.widget-plex-recent .req-open-btn {
+  border: 0;
+  background: #6366f1;
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 0.73rem;
+  font-weight: 800;
+  padding: 5px 11px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  touch-action: manipulation;
+}
+
+.widget-plex-recent .plex-poster-grid,
+.widget-plex-recent .poster-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+  gap: 9px;
+  overflow-y: auto;
+  padding-right: 4px;
+  flex: 1;
+  touch-action: pan-y;
+  scrollbar-width: thin;
+}
+
+.widget-plex-recent .plex-poster-grid::-webkit-scrollbar,
+.widget-plex-recent .poster-grid::-webkit-scrollbar {
+  width: 5px;
+}
+
+.widget-plex-recent .plex-poster-grid::-webkit-scrollbar-thumb,
+.widget-plex-recent .poster-grid::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 99px;
+}
+
+.widget-plex-recent .item-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--pr-card-bg);
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  cursor: pointer;
+  transition: transform 0.12s ease;
+  touch-action: manipulation;
+}
+
+.widget-plex-recent .item-card:active {
+  transform: scale(0.96);
+}
+
+.widget-plex-recent .poster-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  background: rgba(15, 23, 42, 0.6);
+  overflow: hidden;
+}
+
+.widget-plex-recent .poster-wrap img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.widget-plex-recent .type-pill {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  background: rgba(15, 23, 42, 0.84);
+  color: #f8fafc;
+  font-size: 0.60rem;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 5px;
+  text-transform: uppercase;
+}
+
+.widget-plex-recent .rating-pill {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: rgba(229, 160, 13, 0.92);
+  color: #0f172a;
+  font-size: 0.62rem;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 5px;
+}
+
+.widget-plex-recent .meta {
+  padding: 6px 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.widget-plex-recent .title {
+  font-size: 0.74rem;
+  font-weight: 800;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--pr-text-main);
+}
+
+.widget-plex-recent .sub {
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: var(--pr-text-sub);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

@@ -1,0 +1,9 @@
+name: legacy-test
+version: "1.0.0"
+description: Test fixture for a custom widget package with only a legacy HTML template.
+provider: spacer
+
+capabilities:
+  - ambient-static
+
+default_dimensions: [2, 1]

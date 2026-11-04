@@ -1,0 +1,198 @@
+.widget-card[data-widget-type="photo-carousel"] {
+  padding: 0;
+}
+
+.widget-card[data-widget-type="photo-carousel"] > .widget-photo-carousel {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: none;
+  box-shadow: none;
+}
+
+.photo-transport-controls {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1.5px solid var(--mm-card-border, rgba(90, 60, 30, 0.08));
+  box-shadow: 0 12px 28px -4px rgba(0, 0, 0, 0.25);
+  box-sizing: border-box;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease, background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.photo-transport-controls.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.photo-nav-btn,
+.photo-pause-pill {
+  width: 42px;
+  height: 42px;
+  min-width: 42px;
+  min-height: 42px;
+  padding: 0;
+  border-radius: 50%;
+  background: #faf7f2;
+  border: 1.5px solid rgba(90, 60, 30, 0.08);
+  color: var(--mm-coral, #ff6f59);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: transform 0.1s ease, background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.photo-nav-btn svg,
+.photo-pause-pill svg {
+  display: block;
+  pointer-events: none;
+  flex-shrink: 0;
+}
+
+.photo-nav-btn:hover,
+.photo-pause-pill:hover {
+  background: #ffffff;
+  border-color: rgba(255, 111, 89, 0.35);
+}
+
+.photo-nav-btn:active,
+.photo-pause-pill:active {
+  transform: scale(0.94);
+}
+
+.photo-pause-pill[data-paused="true"] {
+  background: var(--mm-coral, #ff6f59);
+  border-color: var(--mm-coral, #ff6f59);
+  color: #ffffff;
+  box-shadow: 0 4px 14px rgba(255, 111, 89, 0.35);
+}
+
+.photo-pause-pill[data-paused="true"]:hover {
+  background: #ff5a43;
+  border-color: #ff5a43;
+  color: #ffffff;
+}
+
+:root[data-theme="night"] .photo-transport-controls,
+body[data-theme="night"] .photo-transport-controls,
+#mirrormere-app[data-theme="night"] .photo-transport-controls {
+  background: rgba(71, 65, 94, 0.90);
+  border-color: rgba(197, 163, 255, 0.25);
+  box-shadow: 0 12px 32px rgba(20, 16, 32, 0.6);
+  color: var(--mm-text-title, #f8f8f2);
+}
+
+:root[data-theme="night"] .photo-nav-btn,
+body[data-theme="night"] .photo-nav-btn,
+#mirrormere-app[data-theme="night"] .photo-nav-btn,
+:root[data-theme="night"] .photo-pause-pill,
+body[data-theme="night"] .photo-pause-pill,
+#mirrormere-app[data-theme="night"] .photo-pause-pill {
+  background: rgba(90, 84, 117, 0.85);
+  border-color: rgba(197, 163, 255, 0.2);
+  color: var(--mm-lavender, #c5a3ff);
+}
+
+:root[data-theme="night"] .photo-nav-btn:hover,
+body[data-theme="night"] .photo-nav-btn:hover,
+#mirrormere-app[data-theme="night"] .photo-nav-btn:hover,
+:root[data-theme="night"] .photo-pause-pill:hover,
+body[data-theme="night"] .photo-pause-pill:hover,
+#mirrormere-app[data-theme="night"] .photo-pause-pill:hover {
+  background: #5a5475;
+  border-color: rgba(197, 163, 255, 0.5);
+  color: var(--mm-lavender, #c5a3ff);
+}
+
+:root[data-theme="night"] .photo-pause-pill[data-paused="true"],
+body[data-theme="night"] .photo-pause-pill[data-paused="true"],
+#mirrormere-app[data-theme="night"] .photo-pause-pill[data-paused="true"] {
+  background: var(--mm-coral, #ff857f);
+  border-color: var(--mm-coral, #ff857f);
+  color: #3b364c;
+  box-shadow: 0 4px 16px rgba(255, 133, 127, 0.45);
+}
+
+:root[data-theme="night"] .photo-pause-pill[data-paused="true"]:hover,
+body[data-theme="night"] .photo-pause-pill[data-paused="true"]:hover,
+#mirrormere-app[data-theme="night"] .photo-pause-pill[data-paused="true"]:hover {
+  background: #ff9994;
+  border-color: #ff9994;
+  color: #3b364c;
+}
+
+.photo-connect-btn {
+  margin-top: 8px;
+  background: var(--mm-accent-purple, #a855f7);
+  color: #fff;
+  border: none;
+  border-radius: 9999px;
+  padding: 8px 18px;
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(168, 85, 247, 0.4);
+  touch-action: manipulation;
+  user-select: none;
+  transition: transform 0.15s ease, filter 0.15s ease;
+}
+
+.photo-connect-btn:hover {
+  filter: brightness(1.1);
+}
+
+.photo-connect-btn:active {
+  transform: scale(0.96);
+}
+
+.photo-metadata-overlay {
+  position: absolute;
+  bottom: 12px;
+  right: 16px;
+  z-index: 3;
+  max-width: calc(100% - 32px);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1.3;
+  text-align: right;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: rgba(255, 255, 255, 0.88);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.82), 0 0 10px rgba(0, 0, 0, 0.48);
+  pointer-events: none;
+  user-select: none;
+}
+
+.photo-preload-pool,
+.photo-preload-pool img {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: -1;
+}

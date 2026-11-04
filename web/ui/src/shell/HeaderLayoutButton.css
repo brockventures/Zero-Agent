@@ -1,0 +1,41 @@
+/* ==========================================================================
+   Header Layout Editor Trigger Button
+   ========================================================================== */
+
+.header-layout {
+  display: inline-flex;
+  align-items: center;
+  position: relative;
+}
+
+.header-layout-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 9999px;
+  background: var(--mm-bg-card);
+  border: 1.5px solid var(--mm-card-border);
+  color: var(--mm-text-title);
+  box-shadow: var(--mm-card-shadow);
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.2s cubic-bezier(0.4, 0, 0.2, 1), color 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s cubic-bezier(0.4, 0, 0.2, 1), transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.header-layout-btn:hover {
+  background: var(--mm-lavender-light);
+  border-color: var(--mm-lavender);
+  color: var(--mm-text-title);
+  transform: translateY(-1px);
+}
+
+.header-layout-btn:active {
+  transform: scale(0.94);
+}
+
+.header-layout-icon {
+  width: 22px;
+  height: 22px;
+}

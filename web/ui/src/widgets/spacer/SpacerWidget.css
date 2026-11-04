@@ -1,0 +1,9 @@
+/* Spacer widgets have no card border/background and ignore pointer events. */
+.widget-card[data-widget-type="spacer"],
+.widget-card:has(> .widget-spacer) {
+  padding: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  pointer-events: none;
+}

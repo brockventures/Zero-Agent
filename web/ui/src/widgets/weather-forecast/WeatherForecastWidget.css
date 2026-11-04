@@ -1,0 +1,89 @@
+.widget-weather {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.weather-hourly-graph text {
+  user-select: none;
+  pointer-events: none;
+}
+
+.weather-school-day-strip {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  width: 100%;
+  align-items: stretch;
+}
+
+.weather-school-day-slot {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto auto 1fr;
+  column-gap: 12px;
+  row-gap: 4px;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 18px;
+  overflow: hidden;
+}
+
+.weather-school-day-name {
+  grid-column: 1;
+  grid-row: 1;
+  font-size: 0.85rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  align-self: start;
+}
+
+.weather-school-day-temp {
+  grid-column: 1;
+  grid-row: 2;
+  font-size: 2.6rem;
+  font-weight: 900;
+  line-height: 1.02;
+  letter-spacing: -0.03em;
+  align-self: center;
+}
+
+.weather-school-day-state {
+  display: none;
+}
+
+.weather-school-day-copy {
+  grid-column: 1;
+  grid-row: 3;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-self: end;
+  gap: 2px;
+}
+
+.weather-school-day-outfit {
+  font-size: 0.95rem;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.weather-school-day-forecast {
+  font-size: 0.82rem;
+  font-weight: 700;
+  line-height: 1.2;
+  opacity: 0.85;
+}
+
+.weather-school-day-sprite {
+  grid-column: 2;
+  grid-row: 1 / span 3;
+  width: 176px;
+  height: 176px;
+  object-fit: cover;
+  border-radius: 16px;
+}
