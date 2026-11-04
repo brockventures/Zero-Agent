@@ -23,6 +23,82 @@ DATA_DIR = Path("/workspace/data")
 BRAIN_DIR = Path("/root/.gemini/antigravity-cli/brain")
 HOME_CHANNEL_ID = 1542081375287640084
 DEFAULT_FORGE_DB_PATH = Path("/baseball/data/forge.db")
+GIT_RECONCILIATION_REPOS = (
+    Path("/workspace/repos/mirrormere"),
+    Path("/workspace"),
+)
+
+_FORGE_BUILD_BULLET_RE = re.compile(
+    r"FORGE Build\s+`?(fg-[a-zA-Z0-9_-]+)`?\s*\(([^)]+)\)",
+    re.IGNORECASE,
+)
+_OPEN_PR_MENTION_RE = re.compile(
+    r"\b(opened|submitted(?:\s+upstream)?)\s+PR\s+#(\d+)\b(?!\s*\(merged\))",
+    re.IGNORECASE,
+)
+_FORGE_STATUS_PRIORITY = {
+    "queued": 1,
+    "pending": 1,
+    "running": 2,
+    "in_progress": 2,
+    "cancelled": 3,
+    "canceled": 3,
+    "failed": 4,
+    "completed": 5,
+    "merged": 5,
+}
+
+
+def _get_merged_pr_numbers(
+    repos: tuple[Path, ...] | list[Path] = GIT_RECONCILIATION_REPOS,
+) -> set[int]:
+    """Inspect recent git commit history across local repos for merged PR numbers `(#<N>)`."""
+    merged: set[int] = set()
+    for repo in repos:
+        repo_path = Path(repo)
+        if not repo_path.exists():
+            continue
+        try:
+            res = subprocess.run(
+                ["git", "-C", str(repo_path), "log", "--oneline", "-n", "50"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+            if res.returncode == 0 and res.stdout:
+                for m in re.finditer(r"\(#(\d+)\)", res.stdout):
+                    merged.add(int(m.group(1)))
+                for m in re.finditer(r"Merge pull request #(\d+)\b", res.stdout, re.IGNORECASE):
+                    merged.add(int(m.group(1)))
+        except Exception:
+            continue
+    return merged
+
+
+def _reconcile_open_pr_mentions(
+    line: str,
+    merged_prs: set[int] | None = None,
+) -> str:
+    """Annotate `opened PR #<N>` or `submitted upstream PR #<N>` with `(merged)` when #<N> is in git log."""
+    if not line or "PR #" not in line.upper() and "pr #" not in line.lower():
+        return line
+    if not _OPEN_PR_MENTION_RE.search(line):
+        return line
+    if merged_prs is None:
+        merged_prs = _get_merged_pr_numbers()
+    if not merged_prs:
+        return line
+
+    def _repl(match: re.Match) -> str:
+        pr_num = int(match.group(2))
+        full = match.group(0)
+        if pr_num in merged_prs:
+            return f"{full} (merged)"
+        return full
+
+    return _OPEN_PR_MENTION_RE.sub(_repl, line)
+
 
 
 def _resolve_channel_id_for_session(sess_key: str) -> int | None:
@@ -374,12 +450,19 @@ def _merge_guaranteed_milestones(
     base_ms: str,
     prior_milestones: list[str],
     channel_forge_builds: list[str],
+    merged_prs: set[int] | None = None,
 ) -> str:
     """Deterministically ensure channel-scoped FORGE builds and prior milestones are present in milestones_block."""
     lines: list[str] = []
     seen: set[str] = set()
+    build_index: dict[str, tuple[int, int]] = {}  # build_id -> (line_idx, status_priority)
 
-    def _add(item: str) -> None:
+    # Only run git log check if any candidate line mentions an open/submitted PR
+    all_raw_text = "\n".join([*prior_milestones, base_ms or "", *channel_forge_builds])
+    if merged_prs is None and _OPEN_PR_MENTION_RE.search(all_raw_text):
+        merged_prs = _get_merged_pr_numbers()
+
+    def _add(item: str, is_authoritative_db: bool = False) -> None:
         for raw_line in item.splitlines():
             s = raw_line.strip()
             if not s:
@@ -388,6 +471,30 @@ def _merge_guaranteed_milestones(
                 s = f"- {s}"
             else:
                 s = "- " + s.lstrip("-•* ").strip()
+
+            s = _reconcile_open_pr_mentions(s, merged_prs=merged_prs)
+
+            m_build = _FORGE_BUILD_BULLET_RE.search(s)
+            if m_build:
+                build_id = m_build.group(1)
+                status_raw = m_build.group(2).strip().lower()
+                prio = _FORGE_STATUS_PRIORITY.get(status_raw, 0)
+                if build_id in build_index:
+                    prev_idx, prev_prio = build_index[build_id]
+                    if is_authoritative_db or prio >= prev_prio:
+                        old_line = lines[prev_idx]
+                        seen.discard(old_line)
+                        lines[prev_idx] = s
+                        seen.add(s)
+                        build_index[build_id] = (prev_idx, prio)
+                    continue
+                if s not in seen:
+                    idx = len(lines)
+                    seen.add(s)
+                    lines.append(s)
+                    build_index[build_id] = (idx, prio)
+                continue
+
             if s not in seen:
                 seen.add(s)
                 lines.append(s)
@@ -402,7 +509,7 @@ def _merge_guaranteed_milestones(
             _add(raw_line)
 
     for fb in channel_forge_builds:
-        _add(fb)
+        _add(fb, is_authoritative_db=True)
 
     if not lines:
         return "- Session Initialized: Fresh conversation thread with baseline homelab context."

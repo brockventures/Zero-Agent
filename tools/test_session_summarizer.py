@@ -298,6 +298,75 @@ class TestSessionSummarizer(unittest.TestCase):
             self.assertIn("- Completed Phase 1 database schema migration.", persisted)
             self.assertIn("fg-home-99", persisted)
 
+    def test_deduplicate_superseded_forge_build_status_bullets(self):
+        prior = [
+            "- Completed Phase 1 setup.",
+            "- FORGE Build `fg-1793800001-alpha` (queued): Alpha Feature Build",
+            "- FORGE Build `fg-1793800002-beta` (running): Beta Refactor Build",
+            "- FORGE Build `fg-1793800003-gamma` (completed): Gamma Already Done",
+        ]
+        base_ms = (
+            "- FORGE Build `fg-1793800001-alpha` (running): Alpha Feature Build\n"
+            "- FORGE Build `fg-1793800003-gamma` (running): Gamma Already Done\n"
+            "- Verified unit tests."
+        )
+        channel_forge_builds = [
+            "- FORGE Build `fg-1793800001-alpha` (completed): Alpha Feature Build",
+            "- FORGE Build `fg-1793800002-beta` (failed): Beta Refactor Build",
+        ]
+
+        merged = session_summarizer._merge_guaranteed_milestones(
+            base_ms, prior, channel_forge_builds, merged_prs=set()
+        )
+        lines = merged.splitlines()
+
+        # Non-terminal statuses for alpha and beta are dropped; only latest terminal status remains
+        self.assertIn("- FORGE Build `fg-1793800001-alpha` (completed): Alpha Feature Build", lines)
+        self.assertNotIn("- FORGE Build `fg-1793800001-alpha` (queued): Alpha Feature Build", lines)
+        self.assertNotIn("- FORGE Build `fg-1793800001-alpha` (running): Alpha Feature Build", lines)
+
+        self.assertIn("- FORGE Build `fg-1793800002-beta` (failed): Beta Refactor Build", lines)
+        self.assertNotIn("- FORGE Build `fg-1793800002-beta` (running): Beta Refactor Build", lines)
+
+        # Gamma was already (completed) in prior; LLM base_ms hallucinating (running) does not downgrade it
+        self.assertIn("- FORGE Build `fg-1793800003-gamma` (completed): Gamma Already Done", lines)
+        self.assertNotIn("- FORGE Build `fg-1793800003-gamma` (running): Gamma Already Done", lines)
+
+        # Each build ID appears exactly once
+        self.assertEqual(sum(1 for l in lines if "fg-1793800001-alpha" in l), 1)
+        self.assertEqual(sum(1 for l in lines if "fg-1793800002-beta" in l), 1)
+        self.assertEqual(sum(1 for l in lines if "fg-1793800003-gamma" in l), 1)
+
+    def test_reconcile_open_pr_mentions_against_git_log(self):
+        fake_git_log = (
+            "a1b2c3d feat: add mirrormere telemetry (#412)\n"
+            "e4f5g6h fix: resolve compaction race (#89)\n"
+            "9988776 docs: update readme\n"
+        )
+        with patch("tools.session_summarizer.subprocess.run") as mock_run, \
+             patch("tools.session_summarizer.Path.exists", return_value=True):
+            mock_run.return_value = unittest.mock.MagicMock(
+                returncode=0, stdout=fake_git_log
+            )
+            prior = [
+                "- Implemented telemetry hook and opened PR #412 for review.",
+                "- Fixed bridge race and submitted upstream PR #89.",
+                "- Drafted follow-up changes and opened PR #999.",
+                "- Already annotated opened PR #412 (merged) in prior run.",
+            ]
+            merged = session_summarizer._merge_guaranteed_milestones(
+                "", prior, []
+            )
+
+        lines = merged.splitlines()
+        self.assertIn("- Implemented telemetry hook and opened PR #412 (merged) for review.", lines)
+        self.assertIn("- Fixed bridge race and submitted upstream PR #89 (merged).", lines)
+        # Unmerged PR #999 stays untouched
+        self.assertIn("- Drafted follow-up changes and opened PR #999.", lines)
+        self.assertNotIn("PR #999 (merged)", merged)
+        # Already annotated PR #412 is deduplicated and not double-annotated
+        self.assertNotIn("(merged) (merged)", merged)
+
 
 if __name__ == "__main__":
     unittest.main()
