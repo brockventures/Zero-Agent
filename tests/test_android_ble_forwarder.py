@@ -146,6 +146,7 @@ def test_android_manifest_permissions_and_foreground_service():
     assert ".GotchiBleRelayService" in services
     relay_service = services[".GotchiBleRelayService"]
     assert relay_service.attrib.get(f"{android_ns}foregroundServiceType") == "connectedDevice"
+    assert relay_service.attrib.get(f"{android_ns}exported") == "true"
 
     receivers = {
         r.attrib.get(f"{android_ns}name"): r
@@ -191,8 +192,7 @@ def test_kotlin_ble_framing_codec_wire_parity():
 def test_gotchi_ble_relay_service_capabilities():
     service_src = SERVICE_PATH.read_text(encoding="utf-8")
 
-    # BLE 5.0 2M PHY and 512 MTU negotiation
-    assert "PHY_LE_2M_MASK" in service_src
+    # BLE 5.0 512 MTU negotiation (after CCCD subscription)
     assert "requestMtu(BleFramingCodec.DEFAULT_GATT_MTU)" in service_src
 
     # Direct BLE GATT connection without simultaneous createBond() race, dynamic rescan, and disconnect/disable relay actions
@@ -261,6 +261,14 @@ def test_gotchi_ble_relay_service_capabilities():
     assert 'addFormDataPart("lon"' in service_src
     assert 'addFormDataPart("location_accuracy_m"' in service_src
     assert 'addFormDataPart("offline_replay", "true")' in service_src
+
+    # 4. v11 SMP bonding wait, mDeviceBusy reflection un-wedging, and discoverServices -> CCCD -> requestMtu ordering
+    assert "SMP_INITIAL_SETTLE_DELAY_MS = 1200L" in service_src
+    assert "SMP_BONDING_MAX_WAIT_MS = 20000L" in service_src
+    assert "SMP_POST_BOND_DISC_SETTLE_DELAY_MS = 1200L" in service_src
+    assert 'getDeclaredField("mDeviceBusy")' in service_src
+    assert "clearDeviceBusyFlag" in service_src
+    assert "gatt.setPreferredPhy(" not in service_src
 
 
 def test_compiled_apk_validity():
@@ -440,12 +448,12 @@ def test_gotchi_phone_engine_and_viewport_parity():
 
 
 def test_atomic_purple_v2_handheld_ui_and_settings_drawer():
-    # 1. build.gradle.kts version bump to 2.1.0 (versionCode 4)
+    # 1. build.gradle.kts version bump to 1.0.11 (versionCode 11)
     gradle_file = ANDROID_DIR / "app" / "build.gradle.kts"
     assert gradle_file.is_file()
     gradle_src = gradle_file.read_text(encoding="utf-8")
-    assert "versionCode = 4" in gradle_src
-    assert 'versionName = "2.1.0"' in gradle_src
+    assert "versionCode = 11" in gradle_src
+    assert 'versionName = "1.0.11"' in gradle_src
 
     # 2. GotchiBleBondingActivity UI & Chassis verification
     act_src = ACTIVITY_PATH.read_text(encoding="utf-8")

@@ -214,6 +214,10 @@ class GotchiBleRelayService : Service() {
 
         const val HANDSHAKE_RETRY_INTERVAL_MS = 3000L
         const val HANDSHAKE_MAX_ATTEMPTS = 6
+        const val SMP_INITIAL_SETTLE_DELAY_MS = 1200L
+        const val SMP_BONDING_POLL_INTERVAL_MS = 250L
+        const val SMP_BONDING_MAX_WAIT_MS = 20000L
+        const val SMP_POST_BOND_DISC_SETTLE_DELAY_MS = 1200L
 
         val SERVICE_UUID: UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
         val CHAR_TX_UUID: UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E") // GOTCHI -> Phone (Notify)
@@ -562,13 +566,36 @@ class GotchiBleRelayService : Service() {
         }
     }
 
+    internal fun clearDeviceBusyFlag(gatt: BluetoothGatt?): Boolean {
+        val targetGatt = gatt ?: return false
+        return try {
+            BluetoothGatt::class.java.getDeclaredField("mDeviceBusy").apply {
+                isAccessible = true
+                setBoolean(targetGatt, false)
+            }
+            true
+        } catch (e: Exception) {
+            try {
+                targetGatt.javaClass.getDeclaredField("mDeviceBusy").apply {
+                    isAccessible = true
+                    setBoolean(targetGatt, false)
+                }
+                true
+            } catch (inner: Exception) {
+                Log.w(TAG, "Unable to clear mDeviceBusy via reflection: ${inner.message}")
+                false
+            }
+        }
+    }
+
     internal fun writeCccdNotificationDescriptor(
         gatt: BluetoothGatt,
         txChar: BluetoothGattCharacteristic
     ): Boolean {
+        clearDeviceBusyFlag(gatt)
         gatt.setCharacteristicNotification(txChar, true)
         val desc = txChar.getDescriptor(CCCD_UUID) ?: return false
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val initiated = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothGatt.GATT_SUCCESS
         } else {
             @Suppress("DEPRECATION")
@@ -576,26 +603,60 @@ class GotchiBleRelayService : Service() {
             @Suppress("DEPRECATION")
             gatt.writeDescriptor(desc)
         }
+        Log.i(TAG, "writeCccdNotificationDescriptor initiated=$initiated on ${txChar.uuid}")
+        return initiated
     }
 
     private fun launchHandshakeSupervisor(gatt: BluetoothGatt) {
         handshakeSupervisorJob?.cancel()
         handshakeSupervisorJob = serviceScope.launch {
-            gatt.requestMtu(BleFramingCodec.DEFAULT_GATT_MTU)
-            delay(600)
+            // (b) Wait 1200ms after STATE_CONNECTED so any status=6 LE_ENCRYPT_FAILURE transitions bondState to BOND_BONDING
+            delay(SMP_INITIAL_SETTLE_DELAY_MS)
+            if (isTxSubscribed || activeGatt !== gatt || relayDisabled) {
+                return@launch
+            }
+            var waitedBondingMs = 0L
+            var sawBonding = false
+            while (runCatching { gatt.device?.bondState }.getOrNull() == BluetoothDevice.BOND_BONDING &&
+                waitedBondingMs < SMP_BONDING_MAX_WAIT_MS
+            ) {
+                if (!sawBonding) {
+                    Log.i(TAG, "Device in BOND_BONDING; waiting up to ${SMP_BONDING_MAX_WAIT_MS}ms for BOND_BONDED...")
+                    sawBonding = true
+                }
+                delay(SMP_BONDING_POLL_INTERVAL_MS)
+                waitedBondingMs += SMP_BONDING_POLL_INTERVAL_MS
+                if (isTxSubscribed || activeGatt !== gatt || relayDisabled) {
+                    return@launch
+                }
+            }
+            if (sawBonding) {
+                val postBondState = runCatching { gatt.device?.bondState }.getOrNull()
+                Log.i(TAG, "SMP bonding wait finished after ${waitedBondingMs}ms (bondState=$postBondState); waiting ${SMP_POST_BOND_DISC_SETTLE_DELAY_MS}ms for internal bta_dm_disc_gatt")
+                delay(SMP_POST_BOND_DISC_SETTLE_DELAY_MS)
+            }
             for (attempt in 1..HANDSHAKE_MAX_ATTEMPTS) {
                 if (isTxSubscribed || activeGatt !== gatt || relayDisabled) {
                     return@launch
+                }
+                while (runCatching { gatt.device?.bondState }.getOrNull() == BluetoothDevice.BOND_BONDING &&
+                    waitedBondingMs < SMP_BONDING_MAX_WAIT_MS
+                ) {
+                    delay(SMP_BONDING_POLL_INTERVAL_MS)
+                    waitedBondingMs += SMP_BONDING_POLL_INTERVAL_MS
                 }
                 val service = gatt.getService(SERVICE_UUID)
                 val txChar = service?.getCharacteristic(CHAR_TX_UUID)
                 rxCharacteristic = service?.getCharacteristic(CHAR_RX_UUID) ?: rxCharacteristic
                 if (txChar != null) {
-                    Log.d(TAG, "Handshake supervisor attempt $attempt/$HANDSHAKE_MAX_ATTEMPTS: writing CCCD (0x2902)")
+                    Log.i(TAG, "Handshake supervisor attempt $attempt/$HANDSHAKE_MAX_ATTEMPTS: clearing mDeviceBusy and writing CCCD (0x2902)")
+                    clearDeviceBusyFlag(gatt)
                     writeCccdNotificationDescriptor(gatt, txChar)
                 } else {
-                    Log.d(TAG, "Handshake supervisor attempt $attempt/$HANDSHAKE_MAX_ATTEMPTS: calling discoverServices()")
-                    gatt.discoverServices()
+                    Log.i(TAG, "Handshake supervisor attempt $attempt/$HANDSHAKE_MAX_ATTEMPTS: clearing mDeviceBusy and calling discoverServices()")
+                    clearDeviceBusyFlag(gatt)
+                    val started = gatt.discoverServices()
+                    Log.i(TAG, "gatt.discoverServices() returned $started (attempt $attempt)")
                 }
                 delay(HANDSHAKE_RETRY_INTERVAL_MS)
                 if (isTxSubscribed || activeGatt !== gatt || relayDisabled) {
@@ -603,11 +664,8 @@ class GotchiBleRelayService : Service() {
                 }
             }
             if (!isTxSubscribed && activeGatt === gatt && !relayDisabled) {
-                Log.w(TAG, "CCCD subscription failed after $HANDSHAKE_MAX_ATTEMPTS attempts (SMP encryption stall)")
-                val dev = runCatching { gatt.device }.getOrNull()
-                if (dev != null && dev.bondState == BluetoothDevice.BOND_BONDED) {
-                    clearStaleBondIfNeeded(dev)
-                }
+                val currentBondState = runCatching { gatt.device?.bondState }.getOrNull()
+                Log.w(TAG, "CCCD subscription failed after $HANDSHAKE_MAX_ATTEMPTS attempts (bondState=$currentBondState); disconnecting without removeBond()")
                 runCatching { gatt.disconnect() }
                 runCatching { gatt.close() }
                 if (activeGatt === gatt) {
@@ -619,8 +677,9 @@ class GotchiBleRelayService : Service() {
         }
     }
 
-    private val gattCallback = object : BluetoothGattCallback() {
+    internal val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            Log.i(TAG, "onConnectionStateChange: status=$status newState=$newState bondState=${runCatching { gatt.device?.bondState }.getOrNull()}")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 isTxSubscribed = false
                 connectionStatus = "CONNECTED"
@@ -629,13 +688,7 @@ class GotchiBleRelayService : Service() {
                     ?: "Gotchi"
                 connectedDeviceName = devName
                 updateForegroundNotification("Connected to $devName")
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    gatt.setPreferredPhy(
-                        BluetoothDevice.PHY_LE_2M_MASK,
-                        BluetoothDevice.PHY_LE_2M_MASK,
-                        BluetoothDevice.PHY_OPTION_NO_PREFERRED
-                    )
-                }
+                // Note: Do NOT call setPreferredPhy(PHY_LE_2M_MASK) or requestMtu(512) here before SMP encryption/bonding settles
                 launchHandshakeSupervisor(gatt)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isRelayTurnActive = false
@@ -661,6 +714,7 @@ class GotchiBleRelayService : Service() {
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            Log.i(TAG, "onMtuChanged: mtu=$mtu status=$status isTxSubscribed=$isTxSubscribed")
             if (status == BluetoothGatt.GATT_SUCCESS && mtu > BleFramingCodec.OVERHEAD_BYTES + 3) {
                 negotiatedMaxPayload = minOf(
                     mtu - 3 - BleFramingCodec.OVERHEAD_BYTES,
@@ -668,15 +722,24 @@ class GotchiBleRelayService : Service() {
                 )
             }
             if (!isTxSubscribed) {
+                clearDeviceBusyFlag(gatt)
                 gatt.discoverServices()
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            Log.i(TAG, "onServicesDiscovered: status=$status services=${gatt.services?.size ?: 0}")
             if (status != BluetoothGatt.GATT_SUCCESS) return
-            val service = gatt.getService(SERVICE_UUID) ?: return
+            val service = gatt.getService(SERVICE_UUID) ?: run {
+                Log.w(TAG, "onServicesDiscovered: GOTCHI service $SERVICE_UUID not found")
+                return
+            }
             rxCharacteristic = service.getCharacteristic(CHAR_RX_UUID)
-            val txChar = service.getCharacteristic(CHAR_TX_UUID) ?: return
+            val txChar = service.getCharacteristic(CHAR_TX_UUID) ?: run {
+                Log.w(TAG, "onServicesDiscovered: CHAR_TX $CHAR_TX_UUID not found")
+                return
+            }
+            clearDeviceBusyFlag(gatt)
             writeCccdNotificationDescriptor(gatt, txChar)
             startNotifyPollLoop()
         }
@@ -686,12 +749,15 @@ class GotchiBleRelayService : Service() {
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
+            Log.i(TAG, "onDescriptorWrite: uuid=${descriptor.uuid} status=$status")
             if (descriptor.uuid == CCCD_UUID) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     isTxSubscribed = true
                     handshakeSupervisorJob?.cancel()
                     handshakeSupervisorJob = null
-                    Log.i(TAG, "CCCD (0x2902) notification subscription confirmed (GATT_SUCCESS)")
+                    Log.i(TAG, "CCCD (0x2902) notification subscription confirmed (GATT_SUCCESS); requesting MTU ${BleFramingCodec.DEFAULT_GATT_MTU}")
+                    clearDeviceBusyFlag(gatt)
+                    gatt.requestMtu(BleFramingCodec.DEFAULT_GATT_MTU)
                     startNotifyPollLoop()
                 } else {
                     Log.w(TAG, "CCCD (0x2902) write failed with status=$status; supervisor will retry")
@@ -704,6 +770,7 @@ class GotchiBleRelayService : Service() {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
+            Log.i(TAG, "onCharacteristicChanged(API33+): uuid=${characteristic.uuid} len=${value.size}")
             if (characteristic.uuid == CHAR_TX_UUID) {
                 handleIncomingBlePacket(value)
             }
@@ -714,9 +781,11 @@ class GotchiBleRelayService : Service() {
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
+            @Suppress("DEPRECATION")
+            val raw = characteristic.value ?: return
+            Log.i(TAG, "onCharacteristicChanged(legacy): uuid=${characteristic.uuid} len=${raw.size}")
             if (characteristic.uuid == CHAR_TX_UUID) {
-                @Suppress("DEPRECATION")
-                handleIncomingBlePacket(characteristic.value ?: return)
+                handleIncomingBlePacket(raw)
             }
         }
     }
@@ -1460,7 +1529,7 @@ class GotchiBleRelayService : Service() {
             put("adb_tls_port", port)
             put("device", Build.MODEL ?: "Android")
             put("device_model", Build.MODEL ?: "Android")
-            put("version_code", 10)
+            put("version_code", 11)
             put("timestamp", System.currentTimeMillis() / 1000.0)
         }
 
