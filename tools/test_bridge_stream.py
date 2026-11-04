@@ -570,6 +570,47 @@ class TestBridgeStream(unittest.TestCase):
             self.assertEqual(status["reason"], "complete")
             self.assertEqual(status["content"], "Stack deployment completed.")
 
+    def test_check_transcript_turn_status_reads_tail_on_large_transcript(self):
+        """Verify check_transcript_turn_status seeks to the tail on transcripts > 64KB without reading full file."""
+        conv_id = "test-conv-tail-read"
+        log_dir = self.temp_path / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript.jsonl"
+
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            # Write > 100 KB of historical turns
+            for i in range(250):
+                f.write(json.dumps({
+                    "step_index": i * 2,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "Historical prompt " + ("x" * 350),
+                }) + "\n")
+                f.write(json.dumps({
+                    "step_index": i * 2 + 1,
+                    "type": "PLANNER_RESPONSE",
+                    "content": "Historical answer " + ("y" * 350),
+                }) + "\n")
+            # Active turn at the tail
+            f.write(json.dumps({
+                "step_index": 500,
+                "type": "USER_INPUT",
+                "source": "USER_EXPLICIT",
+                "content": "Latest prompt",
+            }) + "\n")
+            f.write(json.dumps({
+                "step_index": 501,
+                "type": "PLANNER_RESPONSE",
+                "content": "Tail answer verified cleanly.",
+            }) + "\n")
+
+        self.assertGreater(transcript_file.stat().st_size, 100_000)
+        status = check_transcript_turn_status(conv_id, min_step_index=499, brain_base_dir=self.temp_path)
+        self.assertTrue(status["is_complete"])
+        self.assertEqual(status["reason"], "complete")
+        self.assertEqual(status["content"], "Tail answer verified cleanly.")
+        self.assertEqual(status["step_index"], 501)
+
 
 class TestBridgeStreamEngineIntegration(unittest.IsolatedAsyncioTestCase):
     """Integration unit tests for TurnCoordinator and bridge_runner stream interruption recovery."""

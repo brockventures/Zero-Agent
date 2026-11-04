@@ -292,6 +292,28 @@ def get_latest_transcript_step_index(
     return -1
 
 
+_TRANSCRIPT_TAIL_BYTES = 65536
+
+
+def _read_transcript_tail_lines(tpath: Path, max_bytes: int = _TRANSCRIPT_TAIL_BYTES) -> list[str]:
+    """Read the last max_bytes of a transcript file, dropping any partial leading line if truncated."""
+    with open(tpath, "rb") as f:
+        f.seek(0, 2)
+        fsize = f.tell()
+        if fsize <= max_bytes:
+            f.seek(0)
+            raw = f.read()
+            text = raw.decode("utf-8", errors="replace")
+            return text.splitlines()
+        f.seek(fsize - max_bytes)
+        raw = f.read()
+        nl_idx = raw.find(b"\n")
+        if nl_idx != -1:
+            raw = raw[nl_idx + 1 :]
+        text = raw.decode("utf-8", errors="replace")
+        return text.splitlines()
+
+
 def check_transcript_turn_status(
     conv_id: Optional[str],
     min_step_index: int = -1,
@@ -307,8 +329,7 @@ def check_transcript_turn_status(
         if not tpath.exists():
             continue
         try:
-            with open(tpath, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            lines = _read_transcript_tail_lines(tpath)
             saw_interruption = False
             interrupted_sidx = None
             empty_or_leak_sidx = None

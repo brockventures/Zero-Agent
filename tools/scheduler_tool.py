@@ -780,21 +780,50 @@ SIDECAR_ALIASES = {
     "resident_agents_daily_tip": ["resident_agents_daily_tip", "resident_agents_tip", "ra_daily_tip"],
 }
 
-def get_last_execution_for_job(job_info: str | dict) -> tuple[float | None, str | None]:
+_SIDECAR_STATUS_CACHE: dict = {"path": None, "mtime": None, "data": {}}
+
+
+def _load_sidecar_status_map() -> dict:
+    """Load and cache sidecar_status.json keyed by path and mtime_ns to avoid redundant disk reads."""
+    status_file = bs.DATA_DIR / "sidecar_status.json"
+    if not status_file.exists():
+        return {}
+    try:
+        st = status_file.stat()
+        mtime_ns = getattr(st, "st_mtime_ns", st.st_mtime)
+        if (
+            _SIDECAR_STATUS_CACHE.get("path") == str(status_file)
+            and _SIDECAR_STATUS_CACHE.get("mtime") == mtime_ns
+        ):
+            return _SIDECAR_STATUS_CACHE.get("data", {})
+        with open(status_file, "r") as f:
+            smap = json.load(f)
+        if isinstance(smap, dict):
+            _SIDECAR_STATUS_CACHE["path"] = str(status_file)
+            _SIDECAR_STATUS_CACHE["mtime"] = mtime_ns
+            _SIDECAR_STATUS_CACHE["data"] = smap
+            return smap
+    except Exception:
+        pass
+    return {}
+
+
+def get_last_execution_for_job(
+    job_info: str | dict,
+    status_map: dict | None = None,
+) -> tuple[float | None, str | None]:
     """Retrieve the latest known execution timestamp and formatted PT string for a job across all sources."""
     job_id = job_info.get("id", job_info) if isinstance(job_info, dict) else str(job_info)
     aliases = list(SIDECAR_ALIASES.get(job_id, [job_id]))
     if job_id not in aliases:
         aliases.insert(0, job_id)
 
-    status_file = bs.DATA_DIR / "sidecar_status.json"
     latest_epoch = None
     latest_pt = None
 
-    if status_file.exists():
+    smap = status_map if status_map is not None else _load_sidecar_status_map()
+    if smap:
         try:
-            with open(status_file, "r") as f:
-                smap = json.load(f)
             for a in aliases:
                 if a in smap:
                     entry = smap[a]
@@ -819,10 +848,11 @@ def load_schedule() -> list[dict]:
     """Load schedule.json, seeding defaults if missing and reconciling with sidecar_status.json."""
     bs.DATA_DIR.mkdir(parents=True, exist_ok=True)
     sched_file = bs.DATA_DIR / "schedule.json"
+    status_map = _load_sidecar_status_map()
     if not sched_file.exists():
         jobs = [dict(d) for d in DEFAULT_JOBS]
         for j in jobs:
-            last_epoch, last_pt = get_last_execution_for_job(j)
+            last_epoch, last_pt = get_last_execution_for_job(j, status_map=status_map)
             if last_epoch:
                 j["last_run_ts"] = last_epoch
                 j["last_run_at"] = last_pt
@@ -840,7 +870,7 @@ def load_schedule() -> list[dict]:
         for d in DEFAULT_JOBS:
             if d["id"] not in existing_ids:
                 job_entry = dict(d)
-                last_epoch, last_pt = get_last_execution_for_job(job_entry)
+                last_epoch, last_pt = get_last_execution_for_job(job_entry, status_map=status_map)
                 if last_epoch:
                     job_entry["last_run_ts"] = last_epoch
                     job_entry["last_run_at"] = last_pt
@@ -850,7 +880,7 @@ def load_schedule() -> list[dict]:
 
         # Reconcile historical executions from sidecar_status.json
         for j in jobs:
-            last_epoch, last_pt = get_last_execution_for_job(j)
+            last_epoch, last_pt = get_last_execution_for_job(j, status_map=status_map)
             if last_epoch and (not j.get("last_run_ts") or last_epoch > j.get("last_run_ts", 0)):
                 j["last_run_ts"] = last_epoch
                 j["last_run_at"] = last_pt

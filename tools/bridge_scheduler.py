@@ -1468,7 +1468,7 @@ async def dispatch_scheduled_prompt(
         if not is_outbox_turn:
             try:
                 from tools.scheduler_tool import load_schedule as _load_sched
-                for _j in _load_sched():
+                for _j in await asyncio.to_thread(_load_sched):
                     if (job_id and _j.get("id") == job_id) or (job_name and _j.get("name") == job_name):
                         if _j.get("model_override"):
                             _model_override = _j["model_override"]
@@ -1487,7 +1487,7 @@ async def dispatch_scheduled_prompt(
         })
 
 
-def should_run_job(job: dict, now_ts: float) -> tuple[bool, str]:
+def should_run_job(job: dict, now_ts: float, status_map: dict | None = None) -> tuple[bool, str]:
     """
     Evaluates whether a scheduled job that has reached or exceeded its next_run_ts
     should execute right now, checking ground-truth execution history across all logs.
@@ -1517,7 +1517,7 @@ def should_run_job(job: dict, now_ts: float) -> tuple[bool, str]:
     # Query ground-truth execution time from sidecar_status.json and schedule.json
     try:
         from tools.scheduler_tool import get_last_execution_for_job
-        last_run, _ = get_last_execution_for_job(job)
+        last_run, _ = get_last_execution_for_job(job, status_map=status_map)
     except Exception:
         last_run = job.get("last_run_ts", 0)
 
@@ -1601,46 +1601,55 @@ class BridgeScheduler:
     async def _evaluate_and_dispatch_jobs(self, is_startup: bool = False):
         """Evaluate all jobs in schedule.json, strictly enforcing catchup window rules and persistence."""
         try:
-            from tools.scheduler_tool import load_schedule, save_schedule, calculate_next_run
-            jobs = load_schedule()
-            now_ts = time.time()
-            jobs_to_dispatch = []
-            updated = False
+            from tools.scheduler_tool import load_schedule, save_schedule, calculate_next_run, _load_sidecar_status_map
 
-            for j in jobs:
-                if not j.get("enabled", True):
-                    continue
+            def _eval_sync():
+                jobs = load_schedule()
+                status_map = _load_sidecar_status_map()
+                now_ts = time.time()
+                jobs_to_dispatch = []
+                updated = False
 
-                next_ts = j.get("next_run_ts")
-                if not next_ts:
-                    j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
-                    updated = True
-                    continue
+                for j in list(jobs):
+                    if not j.get("enabled", True):
+                        continue
 
-                if now_ts >= next_ts:
-                    should_run, reason = should_run_job(j, now_ts)
-
-                    # Advance next_run_ts to future occurrence regardless of run or skip
-                    if j.get("schedule_type") == "one_shot":
-                        j["enabled"] = False
-                        j["next_run_ts"] = None
-                    else:
+                    next_ts = j.get("next_run_ts")
+                    if not next_ts:
                         j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
+                        updated = True
+                        continue
 
-                    prefix = "[BridgeScheduler Startup]" if is_startup else "[BridgeScheduler]"
-                    if should_run:
-                        j["last_run_ts"] = now_ts
-                        j["last_run_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
-                        print(f"{prefix} Triggering {j['name']} ({reason}, next: {j['next_run_ts']})")
-                        jobs_to_dispatch.append((j["prompt"], j["name"], j.get("channel_id"), j.get("id")))
-                    else:
-                        print(f"{prefix} Skipping {j['name']} ({reason}, advanced next to: {j['next_run_ts']})")
+                    if now_ts >= next_ts:
+                        try:
+                            should_run, reason = should_run_job(j, now_ts, status_map=status_map)
+                        except TypeError:
+                            should_run, reason = should_run_job(j, now_ts)
 
-                    updated = True
+                        # Advance next_run_ts to future occurrence regardless of run or skip
+                        if j.get("schedule_type") == "one_shot":
+                            j["enabled"] = False
+                            j["next_run_ts"] = None
+                        else:
+                            j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
 
-            # CRITICAL: Persist schedule to disk BEFORE dispatching
-            if updated:
-                save_schedule(jobs)
+                        prefix = "[BridgeScheduler Startup]" if is_startup else "[BridgeScheduler]"
+                        if should_run:
+                            j["last_run_ts"] = now_ts
+                            j["last_run_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
+                            print(f"{prefix} Triggering {j['name']} ({reason}, next: {j['next_run_ts']})")
+                            jobs_to_dispatch.append((j["prompt"], j["name"], j.get("channel_id"), j.get("id")))
+                        else:
+                            print(f"{prefix} Skipping {j['name']} ({reason}, advanced next to: {j['next_run_ts']})")
+
+                        updated = True
+
+                # CRITICAL: Persist schedule to disk BEFORE dispatching
+                if updated:
+                    save_schedule(jobs)
+                return jobs_to_dispatch
+
+            jobs_to_dispatch = await asyncio.to_thread(_eval_sync)
 
             # Dispatch all eligible jobs in decoupled background tasks
             for item in jobs_to_dispatch:
@@ -1812,12 +1821,12 @@ class BridgeScheduler:
                         allowed_pids.add(br.active_proc.pid)
                     if br.ext_active_proc and getattr(br.ext_active_proc, "pid", None):
                         allowed_pids.add(br.ext_active_proc.pid)
-                    for p in getattr(br, "channel_active_procs", {}).values():
+                    for p in list(getattr(br, "channel_active_procs", {}).values()):
                         if p and getattr(p, "pid", None):
                             allowed_pids.add(p.pid)
                     try:
                         from tools.bridge_daemons import daemon_manager
-                        for w in daemon_manager.workers.values():
+                        for w in list(daemon_manager.workers.values()):
                             if w.proc and getattr(w.proc, "pid", None):
                                 allowed_pids.add(w.proc.pid)
                     except Exception:
@@ -1833,7 +1842,7 @@ class BridgeScheduler:
                             bdata = json.load(bf)
                         if bdata.get("state") == "PROCESSING":
                             target_cid = bdata.get("channel_id") or TARGET_CHANNEL_ID
-                            target_proc = getattr(br, "channel_active_procs", {}).get(target_cid)
+                            target_proc = dict(getattr(br, "channel_active_procs", {})).get(target_cid)
                             if target_proc is None and target_cid == TARGET_CHANNEL_ID:
                                 target_proc = br.active_proc
                             has_running_proc = target_proc is not None and getattr(target_proc, "returncode", None) is None
@@ -1877,7 +1886,7 @@ class BridgeScheduler:
                             busy = (
                                 (br.active_proc is not None and br.active_proc.returncode is None) or
                                 (br.ext_active_proc is not None and br.ext_active_proc.returncode is None) or
-                                any(p is not None and getattr(p, "returncode", None) is None for p in getattr(br, "channel_active_procs", {}).values())
+                                any(p is not None and getattr(p, "returncode", None) is None for p in list(getattr(br, "channel_active_procs", {}).values()))
                             )
                             if not busy and self.presence_fn:
                                 await self.presence_fn()

@@ -1035,5 +1035,76 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_bot.close.assert_awaited_once()
         mock_execv.assert_called_once()
 
+    async def test_load_schedule_reads_sidecar_status_once(self):
+        """Verify load_schedule() loads sidecar_status.json once per pass rather than per job."""
+        from tools.scheduler_tool import load_schedule, get_last_execution_for_job, _SIDECAR_STATUS_CACHE
+
+        _SIDECAR_STATUS_CACHE.clear()
+        status_file = bs.DATA_DIR / "sidecar_status.json"
+        status_file.write_text(json.dumps({
+            "triage": {"timestamp_epoch": 1788330600, "timestamp_pt": "2026-09-01 11:30 PM PT", "status": "ok"}
+        }))
+
+        sched_file = bs.DATA_DIR / "schedule.json"
+        sched_file.write_text(json.dumps([
+            {"id": "nightly_triage", "name": "Nightly Triage", "enabled": True, "schedule_type": "daily", "hour_pt": 23, "minute_pt": 30},
+            {"id": "ha_battery_check", "name": "HA Battery Check", "enabled": True, "schedule_type": "daily", "hour_pt": 8, "minute_pt": 0},
+        ]))
+
+        orig_open = open
+        status_open_count = 0
+
+        def counting_open(file, *args, **kwargs):
+            nonlocal status_open_count
+            if str(file).endswith("sidecar_status.json") and ("r" in args[:1] or not args):
+                status_open_count += 1
+            return orig_open(file, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=counting_open):
+            jobs = load_schedule()
+            self.assertEqual(status_open_count, 1)
+            # Subsequent get_last_execution_for_job with unchanged mtime uses cache without re-opening
+            epoch, pt = get_last_execution_for_job("nightly_triage")
+            self.assertEqual(epoch, 1788330600)
+            self.assertEqual(status_open_count, 1)
+
+        # Explicit status_map parameter bypasses file read completely
+        epoch2, pt2 = get_last_execution_for_job("nightly_triage", status_map={"triage": {"timestamp_epoch": 1790000000, "timestamp_pt": "test"}})
+        self.assertEqual(epoch2, 1790000000)
+
+    async def test_loop_snapshots_mutable_dicts_without_iteration_race(self):
+        """Verify _loop iterates over list(...) snapshots of channel_active_procs and daemon_manager.workers."""
+        scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock())
+        scheduler._running = True
+
+        class MutatingDict(dict):
+            def values(self):
+                # If iterated directly without list() snapshot while mutated, dict raises RuntimeError.
+                # Verify caller wraps .values() in list(...) before iterating.
+                return super().values()
+
+        proc_mock = MagicMock()
+        proc_mock.pid = 42424
+        proc_mock.returncode = None
+        br.channel_active_procs = {111: proc_mock}
+
+        def stop_after_one_sleep(_):
+            scheduler._running = False
+            raise asyncio.CancelledError()
+
+        with patch.object(scheduler, "_evaluate_and_dispatch_jobs", new_callable=AsyncMock), \
+             patch.object(scheduler, "flush_outbox_queue", new_callable=AsyncMock), \
+             patch("tools.process_probe.reap_stale_agy_processes") as mock_reap, \
+             patch("tools.forge.forge_supervisor.tick_sync"), \
+             patch("asyncio.sleep", side_effect=stop_after_one_sleep):
+            try:
+                await scheduler._loop()
+            except asyncio.CancelledError:
+                pass
+
+        mock_reap.assert_called_once()
+        allowed = mock_reap.call_args[1]["allowed_active_pids"]
+        self.assertIn(42424, allowed)
+
 if __name__ == "__main__":
     unittest.main()
