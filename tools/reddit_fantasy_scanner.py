@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ __all__ = [
     "generate_draft_comment",
     "load_state",
     "save_state",
+    "post_draft_reply_via_pixel",
     "run_reddit_fantasy_scanner",
     "stage_fantasy_decision",
     "score_candidate",
@@ -57,7 +59,13 @@ def load_state() -> dict:
                 return json.load(f)
         except Exception as e:
             log.warning("Could not read state file: %s", e)
-    return {"seen_comments": [], "last_run_at": None, "last_thread_url": None}
+    return {
+        "seen_comments": [],
+        "last_run_at": None,
+        "last_thread_url": None,
+        "last_candidate": None,
+        "last_draft": None,
+    }
 
 
 def save_state(state: dict) -> None:
@@ -468,6 +476,161 @@ def score_candidate(candidate: Dict[str, Any]) -> Tuple[float, List[str]]:
     return round(score, 1), reasons
 
 
+def post_draft_reply_via_pixel(
+    thread_url: str,
+    author: str,
+    draft_text: str,
+    thing_id: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Upvote the target dilemma comment and submit the approved draft reply via u/prime416 on Old Reddit."""
+    if not thread_url or not draft_text or not draft_text.strip():
+        return False, "Missing thread_url or draft_text"
+
+    try:
+        from playwright.sync_api import sync_playwright
+        from tools.pixel_browser import pixel_session
+    except ImportError:
+        return False, "Pixel browser or Playwright dependencies unavailable"
+
+    clean_url = thread_url.split("?")[0].rstrip("/") + "/"
+    old_url = re.sub(r"^https?://(www\.|old\.|new\.|sh\.)?reddit\.com", "https://old.reddit.com", clean_url)
+    if not old_url.startswith("https://old.reddit.com"):
+        old_url = f"https://old.reddit.com/r/fantasybaseball/{clean_url.lstrip('/')}"
+    json_url = old_url.rstrip("/") + ".json?limit=500"
+
+    norm_thing_id = ""
+    if thing_id:
+        ts = str(thing_id).strip()
+        if "::" not in ts and not ts.startswith("http"):
+            norm_thing_id = ts if ts.startswith("t1_") else f"t1_{ts}"
+
+    try:
+        with pixel_session(force=True) as cdp_url:
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(cdp_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.pages[0] if context.pages else context.new_page()
+
+                if "old.reddit.com" not in (page.url or ""):
+                    page.goto(old_url, timeout=25000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+
+                js_payload = {
+                    "jsonUrl": json_url,
+                    "author": (author or "").strip().lstrip("u/"),
+                    "thingId": norm_thing_id,
+                    "draftText": draft_text.strip(),
+                }
+
+                res = page.evaluate(
+                    """async (args) => {
+                        try {
+                            const r = await fetch(args.jsonUrl, { credentials: 'include' });
+                            if (!r.ok) {
+                                return { ok: false, error: `Thread JSON fetch HTTP ${r.status}` };
+                            }
+                            const data = await r.json();
+                            const modhash = (data && data[0] && data[0].data && data[0].data.modhash) || '';
+                            if (!modhash) {
+                                return { ok: false, error: 'Missing modhash (not logged into old.reddit.com as u/prime416)' };
+                            }
+                            const children = (data && data[1] && data[1].data && data[1].data.children) || [];
+                            let targetFullname = '';
+                            let targetPermalink = '';
+
+                            const findComment = (items) => {
+                                for (const item of items) {
+                                    if (!item || !item.data) continue;
+                                    const c = item.data;
+                                    const fullname = c.name || (c.id ? `t1_${c.id}` : '');
+                                    if (args.thingId && (fullname === args.thingId || c.id === args.thingId.replace(/^t1_/, ''))) {
+                                        targetFullname = fullname;
+                                        targetPermalink = c.permalink || '';
+                                        return true;
+                                    }
+                                    if (!targetFullname && args.author && c.author && c.author.toLowerCase() === args.author.toLowerCase()) {
+                                        targetFullname = fullname;
+                                        targetPermalink = c.permalink || '';
+                                    }
+                                    if (c.replies && c.replies.data && Array.isArray(c.replies.data.children)) {
+                                        if (findComment(c.replies.data.children)) return true;
+                                    }
+                                }
+                                return false;
+                            };
+                            findComment(children);
+
+                            if (!targetFullname && args.thingId) {
+                                targetFullname = args.thingId;
+                            }
+                            if (!targetFullname) {
+                                return { ok: false, error: `Could not locate target comment for u/${args.author} in thread JSON` };
+                            }
+
+                            // 1. Upvote the comment via /api/vote
+                            const voteParams = new URLSearchParams({
+                                id: targetFullname,
+                                dir: '1',
+                                uh: modhash,
+                                api_type: 'json'
+                            });
+                            await fetch('https://old.reddit.com/api/vote', {
+                                method: 'POST',
+                                credentials: 'include',
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                body: voteParams.toString()
+                            });
+
+                            // 2. Submit reply via /api/comment
+                            const commentParams = new URLSearchParams({
+                                api_type: 'json',
+                                text: args.draftText,
+                                thing_id: targetFullname,
+                                uh: modhash
+                            });
+                            const cr = await fetch('https://old.reddit.com/api/comment', {
+                                method: 'POST',
+                                credentials: 'include',
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                body: commentParams.toString()
+                            });
+                            if (!cr.ok) {
+                                return { ok: false, error: `Comment POST HTTP ${cr.status}` };
+                            }
+                            const cjson = await cr.json();
+                            const errors = (cjson && cjson.json && cjson.json.errors) || [];
+                            if (errors.length > 0) {
+                                return { ok: false, error: JSON.stringify(errors) };
+                            }
+                            const things = (cjson && cjson.json && cjson.json.data && cjson.json.data.things) || [];
+                            let newPermalink = '';
+                            if (things.length > 0 && things[0].data) {
+                                newPermalink = things[0].data.permalink || '';
+                                if (!newPermalink && things[0].data.id && targetPermalink) {
+                                    const base = targetPermalink.replace(/\\/[^/]+\\/?$/, '/');
+                                    newPermalink = `${base}${things[0].data.id}/`;
+                                }
+                            }
+                            const finalUrl = newPermalink
+                                ? (newPermalink.startsWith('http') ? newPermalink : `https://www.reddit.com${newPermalink}`)
+                                : (targetPermalink ? `https://www.reddit.com${targetPermalink}` : args.jsonUrl.replace(/\\.json.*$/, '/'));
+                            return { ok: true, permalink: finalUrl, thing_id: targetFullname };
+                        } catch (err) {
+                            return { ok: false, error: String(err) };
+                        }
+                    }""",
+                    js_payload,
+                )
+
+                if isinstance(res, dict) and res.get("ok"):
+                    return True, str(res.get("permalink") or clean_url)
+                err_msg = res.get("error") if isinstance(res, dict) else "Unknown evaluation failure"
+                return False, str(err_msg or "Failed to post Reddit comment")
+    except Exception as e:
+        log.warning("post_draft_reply_via_pixel error: %s", e)
+        return False, str(e)
+
+
 def stage_fantasy_decision(
     candidate: Dict[str, Any],
     draft: str,
@@ -481,18 +644,38 @@ def stage_fantasy_decision(
         author = candidate.get("author", "fellow manager")
         thread_title = candidate.get("thread_title", "r/fantasybaseball")
         thread_url = candidate.get("thread_url", "https://www.reddit.com/r/fantasybaseball/")
-        text_snip = candidate.get("text", "").strip()[:180]
+        raw_id = str(candidate.get("raw_id") or "")
+        thing_id = raw_id if (raw_id.startswith("t1_") or (raw_id and "::" not in raw_id and not raw_id.startswith("http"))) else str(candidate.get("thing_id") or "")
+        text_snip = candidate.get("text", "").strip()[:280]
         cid = channel_id or ZERO_CHAT_CHANNEL_ID
 
         summary = (
             f"**Reddit Thread:** [{thread_title}](<{thread_url}>)\n"
             f"**Author:** u/{author}\n"
             f"**Dilemma:** \"{text_snip}\"\n\n"
-            f"**Proposed Draft:** \"{draft}\""
+            f"**Proposed Draft:** \"{draft}\"\n\n"
+            f"**Approve Action:** Post this reply to `r/fantasybaseball` via `u/prime416`"
         )
+        cmd_parts = [
+            "python3",
+            "/workspace/tools/reddit_fantasy_scanner.py",
+            "--post-draft",
+            "--author",
+            shlex.quote(author),
+            "--thread-url",
+            shlex.quote(thread_url),
+        ]
+        if thing_id:
+            cmd_parts.extend(["--thing-id", shlex.quote(thing_id)])
+        cmd_parts.extend(["--draft", shlex.quote(draft)])
+
         payload = {
-            "command": f"python3 /workspace/tools/reddit_fantasy_scanner.py --post-draft --author \"{author}\"",
+            "command": " ".join(cmd_parts),
             "cwd": "/workspace",
+            "author": author,
+            "thread_url": thread_url,
+            "thing_id": thing_id,
+            "draft": draft,
         }
         return stage_decision(
             category="reddit_fantasy",
@@ -598,25 +781,28 @@ def run_reddit_fantasy_scanner(
         candidate_ref=selected,
     )
 
-    card = format_draft_card(selected, draft, decision_staged=False)
-
-    # Update state
+    # Persist state including last_candidate and last_draft so approval handlers have full context
     if not test and selected.get("raw_id"):
         seen.add(selected.get("raw_id"))
         state["seen_comments"] = list(seen)
         state["last_run_at"] = time.strftime("%Y-%m-%d %I:%M %p PT")
         state["last_thread_url"] = selected.get("thread_url")
+        state["last_candidate"] = selected
+        state["last_draft"] = draft
         save_state(state)
 
-    # Post formatted draft card directly to Discord (legacy format with [CHOICES: ...] buttons)
     dest_cid = channel_id or ZERO_CHAT_CHANNEL_ID
+    should_stage = stage if stage is not None else (not test)
     decision_staged = False
-    if stage is True and selected.get("quality_score", 0) >= (0 if test else 40):
-        dec = stage_fantasy_decision(selected, draft, channel_id=dest_cid, post_to_discord=False)
+    if should_stage and selected.get("quality_score", 0) >= (0 if test else 40):
+        dec = stage_fantasy_decision(selected, draft, channel_id=dest_cid, post_to_discord=post_discord)
         if dec:
             decision_staged = True
 
-    if post_discord:
+    card = format_draft_card(selected, draft, decision_staged=decision_staged)
+
+    # Only fall back to legacy outbox [CHOICES: ...] message if persistent Decision Card was not staged
+    if post_discord and not decision_staged:
         try:
             from tools.outbox import queue_outbox_message
             queue_outbox_message(str(dest_cid), card, source_turn="reddit_fantasy_scanner")
@@ -633,14 +819,46 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Suppress logging")
     parser.add_argument("--post-discord", action="store_true", help="Post candidate draft card to Discord")
     parser.add_argument("--channel-id", type=int, default=ZERO_CHAT_CHANNEL_ID, help="Destination Discord channel ID")
-    parser.add_argument("--stage", action="store_true", help="Force staging decision card even in test mode")
-    parser.add_argument("--post-draft", action="store_true", help="Acknowledge or post approved draft reply to Reddit")
+    parser.add_argument("--stage", action="store_true", default=None, help="Force staging decision card even in test mode")
+    parser.add_argument("--no-stage", dest="stage", action="store_false", help="Disable staging persistent decision card")
+    parser.add_argument("--post-draft", action="store_true", help="Post approved draft reply to Reddit via u/prime416")
     parser.add_argument("--author", type=str, default="", help="Target author for draft reply")
+    parser.add_argument("--thread-url", type=str, default="", help="Target Reddit thread URL")
+    parser.add_argument("--thing-id", type=str, default="", help="Target Reddit comment fullname (t1_...)")
+    parser.add_argument("--draft", type=str, default="", help="Draft reply text to post")
+    parser.add_argument("--draft-file", type=str, default="", help="Path to file containing draft reply text")
     args = parser.parse_args()
 
     if args.post_draft:
-        print(f"✅ Reddit fantasy draft reply approved for u/{args.author or 'manager'}.")
-        sys.exit(0)
+        state = load_state()
+        last_cand = state.get("last_candidate") or {}
+        target_author = args.author or last_cand.get("author") or "manager"
+        target_url = args.thread_url or last_cand.get("thread_url") or state.get("last_thread_url") or ""
+        raw_id = str(last_cand.get("raw_id") or "")
+        fallback_thing = raw_id if (raw_id.startswith("t1_") or (raw_id and "::" not in raw_id and not raw_id.startswith("http"))) else ""
+        target_thing = args.thing_id or last_cand.get("thing_id") or fallback_thing
+
+        draft_text = args.draft
+        if not draft_text and args.draft_file:
+            try:
+                draft_text = Path(args.draft_file).read_text(encoding="utf-8").strip()
+            except Exception as e:
+                log.warning("Failed to read draft file %s: %s", args.draft_file, e)
+        if not draft_text:
+            draft_text = str(state.get("last_draft") or "").strip()
+
+        ok_post, detail = post_draft_reply_via_pixel(
+            thread_url=target_url,
+            author=target_author,
+            draft_text=draft_text,
+            thing_id=target_thing or None,
+        )
+        if ok_post:
+            print(f"✅ Posted reply to u/{target_author} via u/prime416: {detail}")
+            sys.exit(0)
+        else:
+            print(f"❌ Failed to post reply to u/{target_author}: {detail}", file=sys.stderr)
+            sys.exit(1)
 
     ok, report, _ = run_reddit_fantasy_scanner(
         test=args.test,

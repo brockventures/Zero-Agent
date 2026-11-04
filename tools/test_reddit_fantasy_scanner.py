@@ -1,13 +1,19 @@
+from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, "/workspace")
+for _p in ("/workspace", str(Path(__file__).resolve().parent.parent)):
+    if _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
 
 from tools.reddit_fantasy_scanner import (  # noqa: E402
     generate_draft_comment,
     format_draft_card,
+    post_draft_reply_via_pixel,
     run_reddit_fantasy_scanner,
+    stage_fantasy_decision,
 )
 
 
@@ -217,9 +223,12 @@ class TestRedditFantasyScanner(unittest.TestCase):
 
     @patch("tools.reddit_fantasy_scanner.scan_reddit_via_pixel")
     @patch("tools.outbox.queue_outbox_message")
+    @patch("tools.reddit_fantasy_scanner.stage_fantasy_decision")
     @patch("tools.reddit_fantasy_scanner.save_state")
-    def test_production_run_uses_legacy_card_format_not_decision_card(self, mock_save, mock_outbox, mock_scan):
-        """Verify non-test runs post the full readable draft card with [CHOICES: ...] instead of a truncated Decision Card."""
+    def test_production_run_stages_persistent_decision_card_by_default(
+        self, mock_save, mock_stage, mock_outbox, mock_scan
+    ):
+        """Verify non-test runs stage a persistent SQLite Decision Card and persist last_candidate / last_draft."""
         mock_scan.return_value = [
             {
                 "thread_title": "Daily Anything Goes Thread",
@@ -232,13 +241,105 @@ class TestRedditFantasyScanner(unittest.TestCase):
                 "time_ago": "15m ago",
             }
         ]
+        mock_stage.return_value = {"ok": True, "decision_id": "dec-123-reddit"}
         ok, card, extra = run_reddit_fantasy_scanner(test=False, post_discord=True)
         self.assertTrue(ok)
-        self.assertFalse(extra.get("decision_staged"))
+        self.assertTrue(extra.get("decision_staged"))
         self.assertIn("⚾ **r/fantasybaseball Discovery & Draft Card**", card)
-        self.assertIn("[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]", card)
-        self.assertNotIn("Approve Action:", card)
-        mock_outbox.assert_called_once()
+        self.assertIn("Persistent Decision Card staged below", card)
+        self.assertNotIn("[CHOICES: Post Draft to Reddit", card)
+        mock_stage.assert_called_once()
+        _, kwargs = mock_stage.call_args
+        self.assertTrue(kwargs.get("post_to_discord"))
+        mock_outbox.assert_not_called()
+        mock_save.assert_called_once()
+        saved_state = mock_save.call_args[0][0]
+        self.assertEqual(saved_state["last_candidate"]["author"], "Shiny_Rattata")
+        self.assertTrue(saved_state["last_draft"])
+
+    @patch("tools.forge.stage_decision")
+    def test_stage_fantasy_decision_includes_approve_action_and_cli_args(self, mock_forge_stage):
+        """Verify stage_fantasy_decision builds an explicit Approve Action and passes thread_url, thing_id, author, and draft."""
+        mock_forge_stage.return_value = {"ok": True, "decision_id": "dec-456-reddit"}
+        cand = {
+            "thread_title": "Nightly Anything Goes Thread",
+            "thread_url": "https://www.reddit.com/r/fantasybaseball/comments/abc123/nightly/",
+            "author": "KeeperKing",
+            "text": "Should I keep Chourio or Merrill in a 12-team 5x5 roto league?",
+            "raw_id": "t1_xyz789",
+        }
+        draft = "Merrill gives you the higher batting average floor, while Chourio has the 30/30 ceiling."
+        res = stage_fantasy_decision(cand, draft, post_to_discord=True)
+        self.assertIsNotNone(res)
+        mock_forge_stage.assert_called_once()
+        kwargs = mock_forge_stage.call_args.kwargs
+        self.assertEqual(kwargs["category"], "reddit_fantasy")
+        self.assertIn("**Approve Action:** Post this reply to `r/fantasybaseball` via `u/prime416`", kwargs["summary"])
+        cmd = kwargs["payload"]["command"]
+        self.assertIn("--post-draft", cmd)
+        self.assertIn("--author KeeperKing", cmd)
+        self.assertIn("--thread-url https://www.reddit.com/r/fantasybaseball/comments/abc123/nightly/", cmd)
+        self.assertIn("--thing-id t1_xyz789", cmd)
+        self.assertIn("--draft", cmd)
+
+    @patch("tools.pixel_browser.pixel_session")
+    @patch("playwright.sync_api.sync_playwright")
+    def test_post_draft_reply_via_pixel_upvotes_and_posts_comment(self, mock_pw, mock_pixel_session):
+        """Verify post_draft_reply_via_pixel evaluates Old Reddit API upvote + comment and returns permalink."""
+        mock_pixel_session.return_value.__enter__.return_value = "http://127.0.0.1:9223"
+        mock_page = mock_pw.return_value.__enter__.return_value.chromium.connect_over_cdp.return_value.contexts[0].pages[0]
+        mock_page.url = "https://old.reddit.com/r/fantasybaseball/"
+        mock_page.evaluate.return_value = {
+            "ok": True,
+            "permalink": "https://www.reddit.com/r/fantasybaseball/comments/abc123/nightly/new_reply_1/",
+            "thing_id": "t1_xyz789",
+        }
+
+        ok, permalink = post_draft_reply_via_pixel(
+            thread_url="https://www.reddit.com/r/fantasybaseball/comments/abc123/nightly/",
+            author="KeeperKing",
+            draft_text="Hold Merrill for the elite contact floor.",
+            thing_id="t1_xyz789",
+        )
+        self.assertTrue(ok)
+        self.assertIn("/comments/abc123/nightly/new_reply_1/", permalink)
+        mock_page.evaluate.assert_called_once()
+        eval_args = mock_page.evaluate.call_args[0][1]
+        self.assertEqual(eval_args["author"], "KeeperKing")
+        self.assertEqual(eval_args["thingId"], "t1_xyz789")
+        self.assertEqual(eval_args["draftText"], "Hold Merrill for the elite contact floor.")
+        self.assertTrue(eval_args["jsonUrl"].startswith("https://old.reddit.com/r/fantasybaseball/comments/abc123/nightly.json"))
+
+    @patch("tools.reddit_fantasy_scanner.post_draft_reply_via_pixel")
+    @patch("tools.reddit_fantasy_scanner.load_state")
+    def test_main_post_draft_executes_live_reply_with_state_fallback(self, mock_load_state, mock_post_pixel):
+        """Verify CLI --post-draft invokes post_draft_reply_via_pixel using CLI args or state fallback."""
+        from tools.reddit_fantasy_scanner import main
+
+        mock_load_state.return_value = {
+            "last_candidate": {
+                "author": "StateManager",
+                "thread_url": "https://www.reddit.com/r/fantasybaseball/comments/state123/",
+                "raw_id": "t1_statecomment",
+            },
+            "last_draft": "Fallback draft from state.",
+        }
+        mock_post_pixel.return_value = (
+            True,
+            "https://www.reddit.com/r/fantasybaseball/comments/state123/reply999/",
+        )
+
+        with patch.object(sys, "argv", ["reddit_fantasy_scanner.py", "--post-draft", "--author", "StateManager"]):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+            self.assertEqual(cm.exception.code, 0)
+
+        mock_post_pixel.assert_called_once_with(
+            thread_url="https://www.reddit.com/r/fantasybaseball/comments/state123/",
+            author="StateManager",
+            draft_text="Fallback draft from state.",
+            thing_id="t1_statecomment",
+        )
 
 
 if __name__ == "__main__":
