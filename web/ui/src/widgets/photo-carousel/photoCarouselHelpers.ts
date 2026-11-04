@@ -3,7 +3,7 @@ import { beginAnimation, endAnimation } from '../../perf/animating';
 import { useDisplayStore } from '../../store';
 
 export interface PhotoItem {
-  id?: string; url?: string; URL?: string; width?: number; height?: number;
+  id?: string; url?: string; URL?: string; width?: number; height?: number; aspect_ratio?: number;
   timestamp?: string; location?: string; album_name?: string; dominant_color?: string;
 }
 
@@ -38,13 +38,31 @@ export function hasMultiplePhotoAlbums(photos: readonly PhotoItem[]): boolean {
   return false;
 }
 
-export function formatPhotoMetadataLabel(photo?: PhotoItem, showAlbumName = false): { date: string; location: string; album: string; text: string } | null {
-  const date = formatPhotoOverlayDate(photo?.timestamp);
-  const location = (photo?.location || '').trim();
-  const album = showAlbumName ? (photo?.album_name || '').trim() : '';
+function joinDistinctLabels(a: string, b: string): string {
+  return a && b && a !== b ? `${a} • ${b}` : a || b;
+}
+
+export function formatPhotoMetadataLabel(
+  photo?: PhotoItem, showAlbumName = false, secondaryPhoto?: PhotoItem,
+): { date: string; location: string; album: string; text: string } | null {
+  const date = joinDistinctLabels(formatPhotoOverlayDate(photo?.timestamp), formatPhotoOverlayDate(secondaryPhoto?.timestamp));
+  const location = joinDistinctLabels((photo?.location || '').trim(), (secondaryPhoto?.location || '').trim());
+  const album = showAlbumName
+    ? joinDistinctLabels((photo?.album_name || '').trim(), (secondaryPhoto?.album_name || '').trim())
+    : '';
   const secondary = location && album ? `${location} • ${album}` : location || album;
   const text = date && secondary ? `${date}\n${secondary}` : date || secondary;
   return text ? { date, location, album, text } : null;
+}
+
+export function isPortraitPhoto(photo?: PhotoItem): boolean {
+  if (!photo) return false;
+  if (typeof photo.aspect_ratio === 'number' && photo.aspect_ratio > 0) return photo.aspect_ratio < 0.95;
+  return Boolean(photo.width && photo.height && photo.width < photo.height);
+}
+
+export function isWideContainer(size: ContainerSize): boolean {
+  return (size.width > 0 && size.height > 0 && size.width / size.height >= 1.15) || (size.width === 0 && size.height === 0);
 }
 
 export function parsePhotoCarouselData(raw: unknown): PhotoCarouselData {
@@ -127,6 +145,27 @@ export function selectPrevPhotoIndex(photos: readonly PhotoItem[], baseIndex: nu
   return (((baseIndex % photos.length) + photos.length) % photos.length - 1 + photos.length) % photos.length;
 }
 
+export function selectCompanionPortraitIndex(
+  photos: readonly PhotoItem[], primaryIndex: number, seenKeys?: ReadonlySet<string>,
+): number | null {
+  if (photos.length <= 1) return null;
+  const safePrimary = ((primaryIndex % photos.length) + photos.length) % photos.length;
+  if (!isPortraitPhoto(photos[safePrimary])) return null;
+  const primaryKey = getPhotoItemKey(photos[safePrimary], safePrimary);
+  let firstFallbackPortrait: number | null = null;
+  for (let i = 1; i < photos.length; i++) {
+    const idx = (safePrimary + i) % photos.length;
+    const candidate = photos[idx];
+    const rawUrl = candidate?.url ?? candidate?.URL;
+    if (!rawUrl || !isPortraitPhoto(candidate)) continue;
+    const key = getPhotoItemKey(candidate, idx);
+    if (key === primaryKey) continue;
+    if (firstFallbackPortrait === null) firstFallbackPortrait = idx;
+    if (!seenKeys || !seenKeys.has(key)) return idx;
+  }
+  return firstFallbackPortrait;
+}
+
 export function selectPreloadPhotoIndices(photos: readonly PhotoItem[], baseIndex: number, seenKeys?: ReadonlySet<string>, count = 8): number[] {
   if (photos.length <= 1 || count <= 0) return [];
   const simSeen = new Set<string>(seenKeys);
@@ -152,20 +191,14 @@ function scheduleCycleTick(
   timerRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>,
   activeDelayMsRef: React.MutableRefObject<number>,
   cycleStartedAtRef: React.MutableRefObject<number | null>,
-  deck: WidgetPhotoDeckState,
-  cycleIntervalSeconds: number,
-  triggerAdvance: () => void,
-  delayMs: number,
+  deck: WidgetPhotoDeckState, cycleIntervalSeconds: number, triggerAdvance: () => void, delayMs: number,
 ) {
   timerRef.current = setTimeout(() => {
     deck.remainingMs = cycleIntervalSeconds * 1000;
     activeDelayMsRef.current = cycleIntervalSeconds * 1000;
     cycleStartedAtRef.current = Date.now();
     triggerAdvance();
-    scheduleCycleTick(
-      timerRef, activeDelayMsRef, cycleStartedAtRef, deck,
-      cycleIntervalSeconds, triggerAdvance, cycleIntervalSeconds * 1000,
-    );
+    scheduleCycleTick(timerRef, activeDelayMsRef, cycleStartedAtRef, deck, cycleIntervalSeconds, triggerAdvance, cycleIntervalSeconds * 1000);
   }, delayMs);
 }
 
@@ -174,12 +207,7 @@ function preloadAndDecode(src: string): Promise<boolean> {
   preload.src = src;
   return new Promise<boolean>((resolve) => {
     let settled = false;
-    const finish = (ok: boolean) => {
-      if (!settled) {
-        settled = true;
-        resolve(ok);
-      }
-    };
+    const finish = (ok: boolean) => { if (!settled) { settled = true; resolve(ok); } };
     if (typeof preload.decode === 'function') {
       preload.decode().then(() => finish(true), () => finish(false));
       preload.onerror = () => finish(false);
@@ -190,23 +218,14 @@ function preloadAndDecode(src: string): Promise<boolean> {
   });
 }
 
-function resolveInitialPhotoIndex(
-  photos: readonly PhotoItem[],
-  deck: WidgetPhotoDeckState,
-): number {
+function resolveInitialPhotoIndex(photos: readonly PhotoItem[], deck: WidgetPhotoDeckState): number {
   if (photos.length === 0) return 0;
   if (deck.currentKey) {
     const idx = photos.findIndex((p, i) => getPhotoItemKey(p, i) === deck.currentKey);
-    if (idx !== -1) {
-      deck.seenKeys.add(deck.currentKey);
-      return idx;
-    }
+    if (idx !== -1) { deck.seenKeys.add(deck.currentKey); return idx; }
   }
   let unseenIdx = photos.findIndex((p, i) => !deck.seenKeys.has(getPhotoItemKey(p, i)));
-  if (unseenIdx === -1) {
-    deck.seenKeys.clear();
-    unseenIdx = 0;
-  }
+  if (unseenIdx === -1) { deck.seenKeys.clear(); unseenIdx = 0; }
   const key = getPhotoItemKey(photos[unseenIdx], unseenIdx);
   deck.currentKey = key;
   deck.seenKeys.add(key);
@@ -217,10 +236,7 @@ export function useContainerSize() {
   const [containerSize, setContainerSize] = useState<ContainerSize>({ width: 0, height: 0 });
   const containerSizeRef = useRef<ContainerSize>({ width: 0, height: 0 });
   const [element, setElement] = useState<HTMLDivElement | null>(null);
-
-  const rootRef = (node: HTMLDivElement | null) => {
-    setElement(node);
-  };
+  const rootRef = (node: HTMLDivElement | null) => { setElement(node); };
 
   useEffect(() => {
     if (!element || typeof ResizeObserver !== 'function') return;
@@ -258,9 +274,7 @@ export function registerEmberSyncListener(listener: EmberSyncListener): () => vo
   if (typeof window !== 'undefined') window.onEmberPhotosSynced = handleGlobalEmberPhotosSynced;
   return () => {
     emberSyncListeners.delete(listener);
-    if (emberSyncListeners.size === 0 && typeof window !== 'undefined') {
-      delete window.onEmberPhotosSynced;
-    }
+    if (emberSyncListeners.size === 0 && typeof window !== 'undefined') delete window.onEmberPhotosSynced;
   };
 }
 
@@ -299,28 +313,29 @@ export function usePhotoSlideshowTransition({
   const triggerAdvance = (direction: 'next' | 'prev' = 'next') => {
     const currentPhotos = photosRef.current;
     if (currentPhotos.length <= 1) return;
-
     const baseIndex = transitionStateRef.current?.active
       ? transitionStateRef.current.nextIndex
       : (probeIndexRef.current ?? currentIndexRef.current);
 
     const deck = getWidgetPhotoDeckState(id);
+    const wide = isWideContainer(containerSizeRef.current);
     const baseKey = getPhotoItemKey(currentPhotos[baseIndex], baseIndex);
+    const baseSecIdx = wide ? selectCompanionPortraitIndex(currentPhotos, baseIndex, deck.seenKeys) : null;
+    const baseSecKey = baseSecIdx !== null ? getPhotoItemKey(currentPhotos[baseSecIdx], baseSecIdx) : null;
     deck.currentKey = baseKey;
     if (direction === 'prev') {
       deck.seenKeys.delete(baseKey);
+      if (baseSecKey) deck.seenKeys.delete(baseSecKey);
     } else {
       deck.seenKeys.add(baseKey);
+      if (baseSecKey) deck.seenKeys.add(baseSecKey);
     }
 
     if (transitionStateRef.current?.active) {
       setCurrentIndex(baseIndex);
       currentIndexRef.current = baseIndex;
       stopAnimation();
-      if (transitionTimeoutRef.current) {
-        clearTimeout(transitionTimeoutRef.current);
-        transitionTimeoutRef.current = null;
-      }
+      if (transitionTimeoutRef.current) { clearTimeout(transitionTimeoutRef.current); transitionTimeoutRef.current = null; }
       transitionStateRef.current = null;
       setTransitionState(null);
     }
@@ -341,17 +356,25 @@ export function usePhotoSlideshowTransition({
       return;
     }
 
-    const nextFgUrl = getSizedPhotoURL(nextRawUrl, containerSizeRef.current);
-    const seq = ++cycleSeqRef.current;
-    if (transitionTimeoutRef.current) {
-      clearTimeout(transitionTimeoutRef.current);
-      transitionTimeoutRef.current = null;
-    }
+    const nextSecIdx = wide ? selectCompanionPortraitIndex(currentPhotos, nextIndex, deck.seenKeys) : null;
+    const nextSecPhoto = nextSecIdx !== null ? currentPhotos[nextSecIdx] : undefined;
+    const nextSecRawUrl = nextSecPhoto?.url ?? nextSecPhoto?.URL;
+    const nextSecKey = nextSecIdx !== null ? getPhotoItemKey(nextSecPhoto, nextSecIdx) : null;
 
-    preloadAndDecode(nextFgUrl).then((ok) => {
+    const nextFgUrl = getSizedPhotoURL(nextRawUrl, containerSizeRef.current);
+    const nextSecFgUrl = nextSecRawUrl ? getSizedPhotoURL(nextSecRawUrl, containerSizeRef.current) : '';
+    const seq = ++cycleSeqRef.current;
+    if (transitionTimeoutRef.current) { clearTimeout(transitionTimeoutRef.current); transitionTimeoutRef.current = null; }
+
+    const decodePromise = nextSecFgUrl
+      ? Promise.all([preloadAndDecode(nextFgUrl), preloadAndDecode(nextSecFgUrl)]).then(([ok1, ok2]) => ok1 && ok2)
+      : preloadAndDecode(nextFgUrl);
+
+    decodePromise.then((ok) => {
       if (cycleSeqRef.current !== seq) return;
       if (!ok) {
         deck.seenKeys.add(nextKey);
+        if (nextSecKey) deck.seenKeys.add(nextSecKey);
         probeIndexRef.current = nextIndex;
         deck.remainingMs = cycleIntervalSeconds * 1000;
         clearPendingTransition();
@@ -369,6 +392,7 @@ export function usePhotoSlideshowTransition({
         if (cycleSeqRef.current !== seq) return;
         deck.currentKey = nextKey;
         deck.seenKeys.add(nextKey);
+        if (nextSecKey) deck.seenKeys.add(nextSecKey);
         setCurrentIndex(nextIndex);
         currentIndexRef.current = nextIndex;
         stopAnimation();
@@ -383,17 +407,11 @@ export function usePhotoSlideshowTransition({
     const deck = getWidgetPhotoDeckState(id);
     deck.remainingMs = cycleIntervalSeconds * 1000;
     triggerAdvance(direction);
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
     if (isCurrentPane && isDocumentVisible && !isVideoMode && !isPaused) {
       activeDelayMsRef.current = cycleIntervalSeconds * 1000;
       cycleStartedAtRef.current = Date.now();
-      scheduleCycleTick(
-        timerRef, activeDelayMsRef, cycleStartedAtRef, deck,
-        cycleIntervalSeconds, triggerAdvance, cycleIntervalSeconds * 1000,
-      );
+      scheduleCycleTick(timerRef, activeDelayMsRef, cycleStartedAtRef, deck, cycleIntervalSeconds, triggerAdvance, cycleIntervalSeconds * 1000);
     }
   };
 
@@ -421,17 +439,13 @@ export function usePhotoSlideshowTransition({
   });
 
   useEffect(() => {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
     const shouldRun = isCurrentPane && isDocumentVisible && !isVideoMode && !isPaused && photos.length > 1;
     const deck = getWidgetPhotoDeckState(id);
 
     if (!shouldRun) {
       if (cycleStartedAtRef.current !== null) {
-        const elapsed = Date.now() - cycleStartedAtRef.current;
-        deck.remainingMs = Math.max(1, activeDelayMsRef.current - elapsed);
+        deck.remainingMs = Math.max(1, activeDelayMsRef.current - (Date.now() - cycleStartedAtRef.current));
         cycleStartedAtRef.current = null;
       }
       const pausedOnly = isPaused && isCurrentPane && isDocumentVisible && !isVideoMode && photos.length > 1;
@@ -442,29 +456,18 @@ export function usePhotoSlideshowTransition({
     const initialDelayMs = deck.remainingMs ?? cycleIntervalSeconds * 1000;
     activeDelayMsRef.current = initialDelayMs;
     cycleStartedAtRef.current = Date.now();
-    scheduleCycleTick(
-      timerRef, activeDelayMsRef, cycleStartedAtRef, deck,
-      cycleIntervalSeconds, () => triggerAdvanceRef.current(), initialDelayMs,
-    );
+    scheduleCycleTick(timerRef, activeDelayMsRef, cycleStartedAtRef, deck, cycleIntervalSeconds, () => triggerAdvanceRef.current(), initialDelayMs);
 
     return () => {
       if (cycleStartedAtRef.current !== null) {
-        const elapsed = Date.now() - cycleStartedAtRef.current;
-        deck.remainingMs = Math.max(1, activeDelayMsRef.current - elapsed);
+        deck.remainingMs = Math.max(1, activeDelayMsRef.current - (Date.now() - cycleStartedAtRef.current));
         cycleStartedAtRef.current = null;
       }
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
+      if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
     };
   }, [isCurrentPane, isDocumentVisible, isVideoMode, isPaused, photos.length, cycleIntervalSeconds, retryTick, id]);
 
-  useEffect(() => {
-    return () => {
-      clearPendingTransitionRef.current();
-    };
-  }, []);
+  useEffect(() => () => { clearPendingTransitionRef.current(); }, []);
 
   return { safeIndex, transitionState, stepPhoto };
 }

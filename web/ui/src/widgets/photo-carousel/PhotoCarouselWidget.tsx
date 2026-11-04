@@ -12,6 +12,7 @@ import {
   parsePhotoCarouselData, getBackdropPhotoURL, getSizedPhotoURL, useContainerSize,
   registerEmberSyncListener, usePhotoSlideshowTransition, resolvePhotoCarouselSourceAndUrl,
   formatPhotoMetadataLabel, hasMultiplePhotoAlbums,
+  isWideContainer, selectCompanionPortraitIndex,
   type ContainerSize, type EmberSyncListener, type PhotoCarouselConfig, type PhotoItem,
 } from './photoCarouselHelpers';
 
@@ -19,6 +20,7 @@ export {
   parsePhotoCarouselData, getBackdropPhotoURL, getSizedPhotoURL, photoDeckStateById,
   getPhotoItemKey, selectNextPhotoIndex, selectPrevPhotoIndex, selectPreloadPhotoIndices,
   formatPhotoOverlayDate, formatPhotoMetadataLabel, hasMultiplePhotoAlbums,
+  isPortraitPhoto, isWideContainer, selectCompanionPortraitIndex,
   PHOTO_CONTROLS_HIDE_MS, PHOTO_PAUSE_INACTIVITY_MS,
 } from './photoCarouselHelpers';
 
@@ -37,13 +39,8 @@ function PhotoCarouselLoading() {
     <div
       className="photo-loading"
       style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        height: '100%',
-        color: 'var(--mm-text-dim, #8b819f)',
-        fontSize: '0.95rem',
-        fontWeight: 700,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        height: '100%', color: 'var(--mm-text-dim, #8b819f)', fontSize: '0.95rem', fontWeight: 700,
       }}
     >
       <span>Loading photos...</span>
@@ -61,13 +58,9 @@ interface PhotoCarouselEmptyProps {
 function PhotoCarouselEmpty({ source, needsAuth, syncError, albumUrl }: PhotoCarouselEmptyProps) {
   let emptyTitle = 'No photos in shared album';
   if (source === 'ember_bridge') {
-    if (needsAuth) {
-      emptyTitle = 'Google Photos sign-in required';
-    } else if (syncError) {
-      emptyTitle = 'Photo sync failed';
-    } else {
-      emptyTitle = 'No photos available';
-    }
+    if (needsAuth) emptyTitle = 'Google Photos sign-in required';
+    else if (syncError) emptyTitle = 'Photo sync failed';
+    else emptyTitle = 'No photos available';
   }
 
   const canConnect =
@@ -80,15 +73,8 @@ function PhotoCarouselEmpty({ source, needsAuth, syncError, albumUrl }: PhotoCar
     <div className="photo-empty">
       <span className="empty-icon">
         <svg
-          width="24"
-          height="24"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
+          width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
         >
           <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
           <circle cx="9" cy="9" r="2" />
@@ -113,13 +99,9 @@ function PhotoCarouselEmpty({ source, needsAuth, syncError, albumUrl }: PhotoCar
 }
 
 function PhotoBackdrop({
-  currentUrl,
-  nextUrl,
-  isTransitioning,
+  currentUrl, nextUrl, isTransitioning,
 }: {
-  currentUrl: string;
-  nextUrl: string;
-  isTransitioning: boolean;
+  currentUrl: string; nextUrl: string; isTransitioning: boolean;
 }) {
   return (
     <div className="photo-backdrop-container" aria-hidden="true">
@@ -146,40 +128,66 @@ function PhotoBackdrop({
 }
 
 function PhotoForeground({
-  currentUrl,
-  nextUrl,
-  isTransitioning,
+  currentUrl, currentSecondaryUrl, nextUrl, nextSecondaryUrl, isTransitioning,
 }: {
-  currentUrl: string;
-  nextUrl: string;
-  isTransitioning: boolean;
+  currentUrl: string; currentSecondaryUrl?: string; nextUrl: string; nextSecondaryUrl?: string; isTransitioning: boolean;
 }) {
   return (
     <div className="photo-foreground-container">
-      <img
-        className="photo-layer photo-current dither"
-        src={currentUrl}
-        alt="Photo"
-        style={{
-          opacity: isTransitioning ? 0 : 1,
-          transition: isTransitioning ? 'opacity 0.85s ease-in-out' : 'none',
-        }}
-      />
-      <img
-        className="photo-layer photo-next dither"
-        src={isTransitioning ? nextUrl : undefined}
-        alt="Photo"
-        style={{
-          opacity: isTransitioning ? 1 : 0,
-          transition: isTransitioning ? 'opacity 0.85s ease-in-out' : 'none',
-        }}
-      />
+      {currentSecondaryUrl ? (
+        <div
+          className="photo-layer photo-current photo-foreground-diptych dither"
+          style={{
+            opacity: isTransitioning ? 0 : 1,
+            transition: isTransitioning ? 'opacity 0.85s ease-in-out' : 'none',
+          }}
+        >
+          <img className="photo-diptych-item photo-current dither" src={currentUrl} alt="Photo" />
+          <img className="photo-diptych-item photo-current-secondary dither" src={currentSecondaryUrl} alt="Photo" />
+        </div>
+      ) : (
+        <img
+          className="photo-layer photo-current dither"
+          src={currentUrl}
+          alt="Photo"
+          style={{
+            opacity: isTransitioning ? 0 : 1,
+            transition: isTransitioning ? 'opacity 0.85s ease-in-out' : 'none',
+          }}
+        />
+      )}
+      {nextSecondaryUrl ? (
+        <div
+          className="photo-layer photo-next photo-foreground-diptych dither"
+          style={{
+            opacity: isTransitioning ? 1 : 0,
+            transition: isTransitioning ? 'opacity 0.85s ease-in-out' : 'none',
+          }}
+        >
+          <img className="photo-diptych-item photo-next dither" src={isTransitioning ? nextUrl : undefined} alt="Photo" />
+          <img className="photo-diptych-item photo-next-secondary dither" src={isTransitioning ? nextSecondaryUrl : undefined} alt="Photo" />
+        </div>
+      ) : (
+        <img
+          className="photo-layer photo-next dither"
+          src={isTransitioning ? nextUrl : undefined}
+          alt="Photo"
+          style={{
+            opacity: isTransitioning ? 1 : 0,
+            transition: isTransitioning ? 'opacity 0.85s ease-in-out' : 'none',
+          }}
+        />
+      )}
     </div>
   );
 }
 
-function PhotoMetadataOverlay({ photo, showAlbumName }: { photo?: PhotoItem; showAlbumName: boolean }) {
-  const meta = formatPhotoMetadataLabel(photo, showAlbumName);
+function PhotoMetadataOverlay({
+  photo, secondaryPhoto, showAlbumName,
+}: {
+  photo?: PhotoItem; secondaryPhoto?: PhotoItem; showAlbumName: boolean;
+}) {
+  const meta = formatPhotoMetadataLabel(photo, showAlbumName, secondaryPhoto);
   if (!meta) return null;
   return (
     <div className="photo-metadata-overlay" aria-label={meta.text}>
@@ -188,14 +196,17 @@ function PhotoMetadataOverlay({ photo, showAlbumName }: { photo?: PhotoItem; sho
   );
 }
 
-function PhotoPreloadPool({ photos, baseIndex, widgetId, containerSize }: {
-  photos: readonly PhotoItem[]; baseIndex: number; widgetId: string; containerSize: ContainerSize;
+function PhotoPreloadPool({ photos, baseIndex, companionIndex, widgetId, containerSize }: {
+  photos: readonly PhotoItem[]; baseIndex: number; companionIndex?: number | null; widgetId: string; containerSize: ContainerSize;
 }) {
   const indices = selectPreloadPhotoIndices(photos, baseIndex, photoDeckStateById.get(widgetId)?.seenKeys);
-  if (indices.length === 0) return null;
+  const allIndices = companionIndex !== undefined && companionIndex !== null && !indices.includes(companionIndex)
+    ? [companionIndex, ...indices]
+    : indices;
+  if (allIndices.length === 0) return null;
   return (
     <div className="photo-preload-pool" aria-hidden="true">
-      {indices.map((idx) => {
+      {allIndices.map((idx) => {
         const p = photos[idx];
         const rawUrl = p?.url ?? p?.URL;
         return (
@@ -218,27 +229,18 @@ interface PhotoTransportControlsProps {
 }
 
 function PhotoTransportControls({
-  visible,
-  isPaused,
-  onPrev,
-  onNext,
-  onTogglePause,
+  visible, isPaused, onPrev, onNext, onTogglePause,
 }: PhotoTransportControlsProps) {
   return (
     <div
       className={`photo-transport-controls${visible ? ' visible' : ''}`}
-      onClick={(e) => {
-        e.stopPropagation();
-      }}
+      onClick={(e) => { e.stopPropagation(); }}
     >
       <button
         type="button"
         className="photo-nav-btn photo-nav-prev"
         aria-label="Previous photo"
-        onClick={(e) => {
-          e.stopPropagation();
-          onPrev();
-        }}
+        onClick={(e) => { e.stopPropagation(); onPrev(); }}
       >
         <HudPrevIcon />
       </button>
@@ -248,10 +250,7 @@ function PhotoTransportControls({
         aria-label={isPaused ? 'Resume slideshow' : 'Pause slideshow'}
         aria-pressed={isPaused}
         data-paused={isPaused ? 'true' : 'false'}
-        onClick={(e) => {
-          e.stopPropagation();
-          onTogglePause();
-        }}
+        onClick={(e) => { e.stopPropagation(); onTogglePause(); }}
       >
         {isPaused ? <HudPlayIcon /> : <HudPauseIcon />}
       </button>
@@ -259,10 +258,7 @@ function PhotoTransportControls({
         type="button"
         className="photo-nav-btn photo-nav-next"
         aria-label="Next photo"
-        onClick={(e) => {
-          e.stopPropagation();
-          onNext();
-        }}
+        onClick={(e) => { e.stopPropagation(); onNext(); }}
       >
         <HudNextIcon />
       </button>
@@ -309,31 +305,15 @@ function usePhotoControls(
     }
   };
 
-  useEffect(() => {
-    return () => {
-      if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
-      if (pauseInactivityTimerRef.current) clearTimeout(pauseInactivityTimerRef.current);
-    };
+  useEffect(() => () => {
+    if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
+    if (pauseInactivityTimerRef.current) clearTimeout(pauseInactivityTimerRef.current);
   }, []);
 
   return { controlsVisible, showControls, resetPauseInactivityTimer, togglePause };
 }
 
-export function PhotoCarouselWidget({ id }: WidgetComponentProps) {
-  const entry = useWidget(id);
-  const isCurrentPane = useIsCurrentPane();
-  const isDocumentVisible = useDocumentVisible();
-  const isVideoMode = useDisplayStore(
-    (s) => (s.video?.mode || (s.video?.primary ? 'video' : 'widgets')) === 'video',
-  );
-
-  const config = entry?.meta?.config as PhotoCarouselConfig | undefined;
-  const rawData = entry?.data;
-  const data = parsePhotoCarouselData(rawData);
-  const hasLoaded = entry?.state !== 'loading' && Array.isArray(data.photos);
-
-  const { source, albumUrl } = resolvePhotoCarouselSourceAndUrl(config, data);
-
+function useEmberAlbumSync(id: string, source: 'share_url' | 'ember_bridge', albumUrl: string) {
   const [needsAuth, setNeedsAuth] = useState(false);
   const [syncError, setSyncError] = useState(false);
 
@@ -383,28 +363,62 @@ export function PhotoCarouselWidget({ id }: WidgetComponentProps) {
     };
   }, [source, albumUrl, id]);
 
-  const photos = Array.isArray(data.photos) ? data.photos : EMPTY_PHOTOS;
-  const cycleIntervalSeconds = Math.max(
-    5,
-    Number(data?.cycle_interval_seconds) || DEFAULT_CYCLE_SECONDS,
+  return { needsAuth, syncError };
+}
+
+function resolveSlideLayerState(
+  photos: readonly PhotoItem[],
+  safeIndex: number,
+  transitionState: { nextIndex: number; active: boolean } | null,
+  containerSize: ContainerSize,
+  seenKeys?: ReadonlySet<string>,
+) {
+  const wide = isWideContainer(containerSize);
+  const resolveSlide = (idx: number | null) => {
+    if (idx === null) return { photo: undefined, fgUrl: '', backdropUrl: '', companionIdx: null, companionPhoto: undefined, companionFgUrl: '' };
+    const photo = photos[idx];
+    const rawUrl = photo?.url ?? photo?.URL;
+    const fgUrl = rawUrl ? getSizedPhotoURL(rawUrl, containerSize) : '';
+    const backdropUrl = rawUrl ? getBackdropPhotoURL(rawUrl) : '';
+    const companionIdx = wide ? selectCompanionPortraitIndex(photos, idx, seenKeys) : null;
+    const companionPhoto = companionIdx !== null ? photos[companionIdx] : undefined;
+    const companionRawUrl = companionPhoto?.url ?? companionPhoto?.URL;
+    const companionFgUrl = companionRawUrl ? getSizedPhotoURL(companionRawUrl, containerSize) : '';
+    return { photo, fgUrl, backdropUrl, companionIdx, companionPhoto, companionFgUrl };
+  };
+
+  const isTransitioning = Boolean(transitionState?.active);
+  const current = resolveSlide(safeIndex);
+  const next = resolveSlide(isTransitioning && transitionState ? transitionState.nextIndex : null);
+  const active = isTransitioning && next.photo ? next : current;
+  const activeIndex = isTransitioning && transitionState ? transitionState.nextIndex : safeIndex;
+
+  return { isTransitioning, current, next, active, activeIndex };
+}
+
+export function PhotoCarouselWidget({ id }: WidgetComponentProps) {
+  const entry = useWidget(id);
+  const isCurrentPane = useIsCurrentPane();
+  const isDocumentVisible = useDocumentVisible();
+  const isVideoMode = useDisplayStore(
+    (s) => (s.video?.mode || (s.video?.primary ? 'video' : 'widgets')) === 'video',
   );
 
+  const config = entry?.meta?.config as PhotoCarouselConfig | undefined;
+  const data = parsePhotoCarouselData(entry?.data);
+  const hasLoaded = entry?.state !== 'loading' && Array.isArray(data.photos);
+  const { source, albumUrl } = resolvePhotoCarouselSourceAndUrl(config, data);
+  const { needsAuth, syncError } = useEmberAlbumSync(id, source, albumUrl);
+
+  const photos = Array.isArray(data.photos) ? data.photos : EMPTY_PHOTOS;
+  const cycleIntervalSeconds = Math.max(5, Number(data?.cycle_interval_seconds) || DEFAULT_CYCLE_SECONDS);
+
   const [isPaused, setIsPaused] = useState(false);
-  const { controlsVisible, showControls, resetPauseInactivityTimer, togglePause } = usePhotoControls(
-    isPaused,
-    setIsPaused,
-  );
+  const { controlsVisible, showControls, resetPauseInactivityTimer, togglePause } = usePhotoControls(isPaused, setIsPaused);
   const { rootRef, containerSize, containerSizeRef } = useContainerSize();
 
   const { safeIndex, transitionState, stepPhoto } = usePhotoSlideshowTransition({
-    id,
-    photos,
-    cycleIntervalSeconds,
-    isCurrentPane,
-    isDocumentVisible,
-    isVideoMode,
-    isPaused,
-    containerSizeRef,
+    id, photos, cycleIntervalSeconds, isCurrentPane, isDocumentVisible, isVideoMode, isPaused, containerSizeRef,
   });
 
   const handleStep = (direction: 'prev' | 'next') => {
@@ -425,18 +439,10 @@ export function PhotoCarouselWidget({ id }: WidgetComponentProps) {
     handleStep('next');
   };
 
-  const currentPhoto = photos[safeIndex];
-  const currentRawUrl = currentPhoto?.url ?? currentPhoto?.URL;
-  const currentFgUrl = getSizedPhotoURL(currentRawUrl, containerSize);
-  const currentBackdropUrl = getBackdropPhotoURL(currentRawUrl);
-
-  const isTransitioning = Boolean(transitionState?.active);
-  const nextPhoto = transitionState ? photos[transitionState.nextIndex] : undefined;
-  const activeIndex = isTransitioning && transitionState ? transitionState.nextIndex : safeIndex;
-  const activePhoto = isTransitioning && nextPhoto ? nextPhoto : currentPhoto;
-  const nextRawUrl = nextPhoto?.url ?? nextPhoto?.URL;
-  const nextFgUrl = nextRawUrl ? getSizedPhotoURL(nextRawUrl, containerSize) : '';
-  const nextBackdropUrl = nextRawUrl ? getBackdropPhotoURL(nextRawUrl) : '';
+  const seenKeys = photoDeckStateById.get(id)?.seenKeys;
+  const { isTransitioning, current, next, active, activeIndex } = resolveSlideLayerState(
+    photos, safeIndex, transitionState, containerSize, seenKeys,
+  );
   const showAlbumName = (Array.isArray(config?.albums) && config.albums.length > 1) || hasMultiplePhotoAlbums(photos);
 
   return (
@@ -449,31 +455,25 @@ export function PhotoCarouselWidget({ id }: WidgetComponentProps) {
       {!hasLoaded ? (
         <PhotoCarouselLoading />
       ) : photos.length === 0 ? (
-        <PhotoCarouselEmpty
-          source={source}
-          needsAuth={needsAuth}
-          syncError={syncError}
-          albumUrl={albumUrl}
-        />
+        <PhotoCarouselEmpty source={source} needsAuth={needsAuth} syncError={syncError} albumUrl={albumUrl} />
       ) : (
         <div className="photo-viewport dither">
-          <PhotoBackdrop
-            currentUrl={currentBackdropUrl}
-            nextUrl={nextBackdropUrl}
-            isTransitioning={isTransitioning}
-          />
+          <PhotoBackdrop currentUrl={current.backdropUrl} nextUrl={next.backdropUrl} isTransitioning={isTransitioning} />
           <PhotoForeground
-            currentUrl={currentFgUrl}
-            nextUrl={nextFgUrl}
+            currentUrl={current.fgUrl}
+            currentSecondaryUrl={current.companionFgUrl || undefined}
+            nextUrl={next.fgUrl}
+            nextSecondaryUrl={next.companionFgUrl || undefined}
             isTransitioning={isTransitioning}
           />
           <PhotoPreloadPool
             photos={photos}
             baseIndex={activeIndex}
+            companionIndex={active.companionIdx}
             widgetId={id}
             containerSize={containerSize}
           />
-          <PhotoMetadataOverlay photo={activePhoto} showAlbumName={showAlbumName} />
+          <PhotoMetadataOverlay photo={active.photo} secondaryPhoto={active.companionPhoto} showAlbumName={showAlbumName} />
           {photos.length > 1 && (
             <PhotoTransportControls
               visible={controlsVisible || isPaused}
