@@ -38,8 +38,11 @@ from tools.bridge_engine import (
     resolve_channel_label,
     register_active_presence,
 )
+from tools.process_probe import get_process_children
+from tools.task_settle import get_turn_pending_tasks
 
 PRINT_TIMEOUT = os.getenv("AGY_PRINT_TIMEOUT", "4h")
+IDLE_WORKER_TIMEOUT_SECONDS = float(os.getenv("AGY_IDLE_WORKER_TIMEOUT", "1200"))
 
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
 LOUNGE_CHANNEL_ID = 1534452820995080192
@@ -50,21 +53,19 @@ DEDICATED_CHANNEL_CONFIGS = {
         "name": "zero-chat",
         "mode": "home",
         "sess_key": "home",
+        "always_warm": True,
     },
     ZERO_OPS_CHANNEL_ID: {
         "name": "zero-ops",
         "mode": "home",
         "sess_key": str(ZERO_OPS_CHANNEL_ID),
-    },
-    BANANA_STAND_CHANNEL_ID: {
-        "name": "the-banana-stand",
-        "mode": "external",
-        "sess_key": str(BANANA_STAND_CHANNEL_ID),
+        "always_warm": False,
     },
     LOUNGE_CHANNEL_ID: {
         "name": "lounge",
         "mode": "external",
         "sess_key": str(LOUNGE_CHANNEL_ID),
+        "always_warm": False,
     },
 }
 
@@ -92,11 +93,21 @@ from tools.bridge_pipeline import (
 class PersistentChannelWorker:
     """A dedicated, 24/7 warm agy CLI instance bound to a specific Discord channel."""
 
-    def __init__(self, channel_id: int, name: str, mode: str, sess_key: str):
+    def __init__(
+        self,
+        channel_id: int,
+        name: str,
+        mode: str,
+        sess_key: str,
+        always_warm: bool | None = None,
+    ):
         self.channel_id = channel_id
         self.name = name
         self.mode = mode
         self.sess_key = sess_key
+        self.always_warm: bool = (
+            (channel_id == TARGET_CHANNEL_ID) if always_warm is None else bool(always_warm)
+        )
         self.proc: asyncio.subprocess.Process | None = None
         self.conv_id: str | None = None
         self.is_ready: bool = False
@@ -165,7 +176,8 @@ class PersistentChannelWorker:
                 return
 
             self.is_ready = False
-            self.conv_id = get_channel_session_id(self.channel_id, self.mode)
+            if not self.conv_id:
+                self.conv_id = get_channel_session_id(self.channel_id, self.mode)
             cmd = [
                 "agy",
                 "--add-dir=/workspace",
@@ -250,6 +262,53 @@ class PersistentChannelWorker:
                 pass
             self.proc = None
             print(f"[BridgeDaemon] Worker #{self.name} terminated.")
+
+    def is_idle_reapable(
+        self,
+        now: float | None = None,
+        idle_timeout: float | None = None,
+    ) -> bool:
+        """Check if this worker is eligible for idle reaping."""
+        if self.always_warm or self.channel_id == TARGET_CHANNEL_ID:
+            return False
+        if not self.is_ready or self.proc is None or self.proc.returncode is not None:
+            return False
+        if self.lock.locked() or self.start_lock.locked():
+            return False
+        if self.channel_id in channel_active_procs:
+            return False
+        now_ts = time.time() if now is None else now
+        timeout = IDLE_WORKER_TIMEOUT_SECONDS if idle_timeout is None else idle_timeout
+        last_activity = max(self.started_at, self.last_turn_at)
+        if (now_ts - last_activity) < timeout:
+            return False
+        if get_process_children(self.proc.pid):
+            return False
+        if self.conv_id and get_turn_pending_tasks(self.conv_id):
+            return False
+        return True
+
+    async def reap_if_idle(
+        self,
+        now: float | None = None,
+        idle_timeout: float | None = None,
+    ) -> bool:
+        """Shut down this worker if it has been idle past timeout and has no active children/tasks."""
+        if not self.is_idle_reapable(now=now, idle_timeout=idle_timeout):
+            return False
+        saved_conv_id = self.conv_id
+        await self.shutdown()
+        self.conv_id = saved_conv_id
+        try:
+            record_daemon_pids([
+                w.proc.pid
+                for w in daemon_manager.workers.values()
+                if w.proc and w.proc.pid and w.proc.returncode is None
+            ])
+        except Exception:
+            pass
+        print(f"[BridgeDaemon] 💤 Reaped idle worker #{self.name} (preserved conv={self.conv_id}).")
+        return True
 
     async def recycle(self, new_conv_id: str | None = None, keep_conv_id: bool = False):
         """Recycle worker process with an optional new conversation ID (e.g. post-compaction)."""
@@ -673,12 +732,14 @@ class PersistentDaemonManager:
 
     def __init__(self):
         self.workers: dict[int, PersistentChannelWorker] = {}
+        self.reaper_task: asyncio.Task | None = None
         for cid, cfg in DEDICATED_CHANNEL_CONFIGS.items():
             self.workers[cid] = PersistentChannelWorker(
                 channel_id=cid,
                 name=cfg["name"],
                 mode=cfg["mode"],
                 sess_key=cfg["sess_key"],
+                always_warm=cfg.get("always_warm", cid == TARGET_CHANNEL_ID),
             )
 
     def is_dedicated_channel(self, channel_id: int | str) -> bool:
@@ -693,12 +754,53 @@ class PersistentDaemonManager:
             return None
         return self.workers.get(cid)
 
+    async def reap_idle_workers(self, idle_timeout: float | None = None) -> list[str]:
+        """Reap any non-primary persistent workers that have been idle past timeout."""
+        reaped: list[str] = []
+        now_ts = time.time()
+        for w in self.workers.values():
+            try:
+                if await w.reap_if_idle(now=now_ts, idle_timeout=idle_timeout):
+                    reaped.append(w.name)
+            except Exception as err:
+                print(f"[BridgeDaemon] ⚠️ Error checking/reaping idle worker #{w.name}: {err}")
+        if reaped:
+            try:
+                record_daemon_pids([
+                    w.proc.pid
+                    for w in self.workers.values()
+                    if w.proc and w.proc.pid and w.proc.returncode is None
+                ])
+            except Exception:
+                pass
+        return reaped
+
+    async def _reaper_loop(self, interval: float = 60.0):
+        """Background periodic task that reaps idle secondary workers."""
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await self.reap_idle_workers()
+        except asyncio.CancelledError:
+            pass
+
     async def start_all(self, include_classifier: bool | None = None):
-        """Warm up all dedicated persistent daemons on bot ready."""
+        """Warm up primary always-warm persistent daemons on bot ready and start idle reaper."""
         if not is_persistent_daemons_enabled():
             print("[BridgeDaemon] Persistent worker daemons disabled in runtime rules.")
             return
-        tasks = [w.start() for w in self.workers.values()]
+        if self.reaper_task is None or self.reaper_task.done():
+            try:
+                self.reaper_task = asyncio.create_task(self._reaper_loop())
+            except RuntimeError:
+                pass
+        warm_workers = [
+            w
+            for w in self.workers.values()
+            if getattr(w, "always_warm", w.channel_id == TARGET_CHANNEL_ID)
+            or (w.proc is not None and getattr(w.proc, "returncode", None) is None)
+        ]
+        tasks = [w.start() for w in warm_workers]
         run_classifier = (
             include_classifier
             if include_classifier is not None
@@ -712,16 +814,23 @@ class PersistentDaemonManager:
             except Exception as e:
                 print(f"[BridgeDaemon] ⚠️ Failed to warm warm_classifier: {e}")
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for w, res in zip(self.workers.values(), results[: len(self.workers)]):
+        for w, res in zip(warm_workers, results[: len(warm_workers)]):
             if isinstance(res, Exception):
                 print(f"[BridgeDaemon] ⚠️ Failed to warm worker #{w.name}: {res}")
-        if run_classifier and len(results) > len(self.workers):
+        if run_classifier and len(results) > len(warm_workers):
             warm_res = results[-1]
             if isinstance(warm_res, Exception):
                 print(f"[BridgeDaemon] ⚠️ Failed to warm warm_classifier: {warm_res}")
 
     async def shutdown_all(self, include_classifier: bool | None = None):
         """Cleanly terminate all persistent workers before bridge reload."""
+        if self.reaper_task and not self.reaper_task.done():
+            self.reaper_task.cancel()
+            try:
+                await self.reaper_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.reaper_task = None
         tasks = [w.shutdown() for w in self.workers.values()]
         run_classifier = (
             include_classifier
@@ -745,7 +854,15 @@ class PersistentDaemonManager:
 
     async def recycle_all(self, include_classifier: bool | None = None):
         """Recycle all persistent workers (e.g. after model switch)."""
-        tasks = [w.recycle() for w in self.workers.values()]
+        tasks = [
+            w.recycle()
+            if (
+                getattr(w, "always_warm", w.channel_id == TARGET_CHANNEL_ID)
+                or (w.proc is not None and getattr(w.proc, "returncode", None) is None)
+            )
+            else w.shutdown()
+            for w in self.workers.values()
+        ]
         run_classifier = (
             include_classifier
             if include_classifier is not None
@@ -761,10 +878,10 @@ class PersistentDaemonManager:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def proactive_nightly_recycle(self, include_classifier: bool | None = None):
-        """Proactively recycle and re-warm all persistent workers overnight (e.g. during 2:00 AM PT rollover).
+        """Proactively recycle and re-warm persistent workers overnight (e.g. during 2:00 AM PT rollover).
 
-        Immediately terminates yesterday's workers, boots fresh warm sessions, and evicts
-        their session keys from pending reset_session_keys so the first morning turns incur 0ms reset penalty.
+        Immediately terminates yesterday's workers, boots fresh warm sessions for always_warm (or active) workers,
+        and evicts their session keys from pending reset_session_keys so the first morning turns incur 0ms reset penalty.
         """
         from tools.bridge_state import reset_session_meta, remove_reset_session_key
         import tools.bridge_runner as br
@@ -772,8 +889,14 @@ class PersistentDaemonManager:
         async def _recycle_one(w):
             try:
                 old_cid = w.conv_id
+                was_running = w.proc is not None and getattr(w.proc, "returncode", None) is None
+                is_always_warm = getattr(w, "always_warm", w.channel_id == TARGET_CHANNEL_ID)
                 reset_session_meta(w.sess_key)
-                await w.recycle(new_conv_id=None)
+                if is_always_warm or was_running:
+                    await w.recycle(new_conv_id=None)
+                else:
+                    await w.shutdown()
+                    w.conv_id = None
                 # Ensure reset_session_keys is cleared for this persistent worker
                 if hasattr(br, "reset_session_keys"):
                     br.reset_session_keys.discard(w.sess_key)

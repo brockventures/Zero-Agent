@@ -75,10 +75,16 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_01_dedicated_channel_detection(self):
-        """Verify only the Big Three channels are marked dedicated; others are dynamic."""
+        """Verify dedicated channels (#zero-chat, #zero-ops, #lounge) and BANANA_STAND_CHANNEL_ID exclusion."""
         self.assertTrue(bd.is_dedicated_channel(bs.TARGET_CHANNEL_ID))
-        self.assertTrue(bd.is_dedicated_channel(bd.BANANA_STAND_CHANNEL_ID))
+        self.assertTrue(bd.is_dedicated_channel(bd.ZERO_OPS_CHANNEL_ID))
         self.assertTrue(bd.is_dedicated_channel(bd.LOUNGE_CHANNEL_ID))
+        self.assertFalse(bd.is_dedicated_channel(bd.BANANA_STAND_CHANNEL_ID))
+        self.assertNotIn(bd.BANANA_STAND_CHANNEL_ID, bd.DEDICATED_CHANNEL_CONFIGS)
+        self.assertEqual(bd.BANANA_STAND_CHANNEL_ID, 1534436119888793750)
+        self.assertTrue(bd.DEDICATED_CHANNEL_CONFIGS[bs.TARGET_CHANNEL_ID]["always_warm"])
+        self.assertFalse(bd.DEDICATED_CHANNEL_CONFIGS[bd.ZERO_OPS_CHANNEL_ID]["always_warm"])
+        self.assertFalse(bd.DEDICATED_CHANNEL_CONFIGS[bd.LOUNGE_CHANNEL_ID]["always_warm"])
 
         # Secondary home channels and random threads should NOT be dedicated
         self.assertFalse(bd.is_dedicated_channel(1544955535722545253))  # homelab
@@ -91,11 +97,12 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
         mgr = bd.PersistentDaemonManager()
         with patch("tools.bridge_daemons.is_persistent_daemons_enabled", return_value=False):
             self.assertFalse(mgr.is_dedicated_channel(bs.TARGET_CHANNEL_ID))
-            self.assertFalse(mgr.is_dedicated_channel(bd.BANANA_STAND_CHANNEL_ID))
+            self.assertFalse(mgr.is_dedicated_channel(bd.LOUNGE_CHANNEL_ID))
 
         with patch("tools.bridge_daemons.is_persistent_daemons_enabled", return_value=True):
             self.assertTrue(mgr.is_dedicated_channel(bs.TARGET_CHANNEL_ID))
-            self.assertTrue(mgr.is_dedicated_channel(bd.BANANA_STAND_CHANNEL_ID))
+            self.assertTrue(mgr.is_dedicated_channel(bd.LOUNGE_CHANNEL_ID))
+            self.assertFalse(mgr.is_dedicated_channel(bd.BANANA_STAND_CHANNEL_ID))
 
     def test_03_prompt_formatting(self):
         """Verify prompt formatting injects PT timezone and boundaries."""
@@ -167,39 +174,40 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(worker.proc)
 
     async def test_05_parallel_external_channels(self):
-        """Verify #the-banana-stand and #lounge execute turns independently and concurrently."""
+        """Verify #zero-ops and #lounge execute turns independently and concurrently while #the-banana-stand has no warm daemon."""
         mgr = bd.PersistentDaemonManager()
-        worker_banana = mgr.get_worker(bd.BANANA_STAND_CHANNEL_ID)
+        self.assertIsNone(mgr.get_worker(bd.BANANA_STAND_CHANNEL_ID))
+        worker_ops = mgr.get_worker(bd.ZERO_OPS_CHANNEL_ID)
         worker_lounge = mgr.get_worker(bd.LOUNGE_CHANNEL_ID)
 
-        self.assertIsNotNone(worker_banana)
+        self.assertIsNotNone(worker_ops)
         self.assertIsNotNone(worker_lounge)
 
-        banana_started = asyncio.Event()
+        ops_started = asyncio.Event()
         lounge_started = asyncio.Event()
-        banana_can_finish = asyncio.Event()
+        ops_can_finish = asyncio.Event()
         lounge_can_finish = asyncio.Event()
 
-        async def mock_banana_turn(*args, **kwargs):
-            banana_started.set()
-            await banana_can_finish.wait()
+        async def mock_ops_turn(*args, **kwargs):
+            ops_started.set()
+            await ops_can_finish.wait()
 
         async def mock_lounge_turn(*args, **kwargs):
             lounge_started.set()
             await lounge_can_finish.wait()
 
-        with patch.object(worker_banana, "execute_turn", side_effect=mock_banana_turn), \
+        with patch.object(worker_ops, "execute_turn", side_effect=mock_ops_turn), \
              patch.object(worker_lounge, "execute_turn", side_effect=mock_lounge_turn):
 
-            t1 = asyncio.create_task(worker_banana.execute_turn("banana prompt", None, MagicMock(), []))
+            t1 = asyncio.create_task(worker_ops.execute_turn("ops prompt", None, MagicMock(), []))
             t2 = asyncio.create_task(worker_lounge.execute_turn("lounge prompt", None, MagicMock(), []))
 
             # Both should start concurrently without one blocking the other
-            await asyncio.wait_for(asyncio.gather(banana_started.wait(), lounge_started.wait()), timeout=2.0)
-            self.assertTrue(banana_started.is_set())
+            await asyncio.wait_for(asyncio.gather(ops_started.wait(), lounge_started.wait()), timeout=2.0)
+            self.assertTrue(ops_started.is_set())
             self.assertTrue(lounge_started.is_set())
 
-            banana_can_finish.set()
+            ops_can_finish.set()
             lounge_can_finish.set()
             await asyncio.gather(t1, t2)
 
@@ -267,42 +275,52 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(mock_status_msg.edit.await_count >= 1)
 
     async def test_07_proactive_nightly_recycle_and_pending_carryforward(self):
-        """Verify that proactive_nightly_recycle recycles all dedicated workers and clears reset keys,
+        """Verify that proactive_nightly_recycle recycles always_warm/running dedicated workers and clears reset keys,
         and execute_turn consumes pending carryforward context without turn recycling."""
         # 1. Dedicated channels verification
-        self.assertIn(bd.BANANA_STAND_CHANNEL_ID, bd.DEDICATED_CHANNEL_CONFIGS)
+        self.assertNotIn(bd.BANANA_STAND_CHANNEL_ID, bd.DEDICATED_CHANNEL_CONFIGS)
         self.assertIn(bd.TARGET_CHANNEL_ID, bd.DEDICATED_CHANNEL_CONFIGS)
+        self.assertIn(bd.LOUNGE_CHANNEL_ID, bd.DEDICATED_CHANNEL_CONFIGS)
 
         # 2. Proactive nightly recycle test
         mgr = bd.PersistentDaemonManager()
         mock_worker_home = AsyncMock()
+        mock_worker_home.channel_id = bd.TARGET_CHANNEL_ID
+        mock_worker_home.always_warm = True
+        mock_worker_home.proc = MagicMock(returncode=None)
         mock_worker_home.sess_key = "home"
         mock_worker_home.name = "zero-chat"
         mock_worker_home.conv_id = "old-home-conv"
         mock_worker_home.recycle = AsyncMock()
 
-        mock_worker_banana = AsyncMock()
-        mock_worker_banana.sess_key = str(bd.BANANA_STAND_CHANNEL_ID)
-        mock_worker_banana.name = "the-banana-stand"
-        mock_worker_banana.conv_id = "old-banana-conv"
-        mock_worker_banana.recycle = AsyncMock()
+        mock_worker_lounge = AsyncMock()
+        mock_worker_lounge.channel_id = bd.LOUNGE_CHANNEL_ID
+        mock_worker_lounge.always_warm = False
+        mock_worker_lounge.proc = None
+        mock_worker_lounge.mode = "external"
+        mock_worker_lounge.sess_key = str(bd.LOUNGE_CHANNEL_ID)
+        mock_worker_lounge.name = "lounge"
+        mock_worker_lounge.conv_id = "old-lounge-conv"
+        mock_worker_lounge.recycle = AsyncMock()
+        mock_worker_lounge.shutdown = AsyncMock()
 
         mgr.workers = {
             bd.TARGET_CHANNEL_ID: mock_worker_home,
-            bd.BANANA_STAND_CHANNEL_ID: mock_worker_banana,
+            bd.LOUNGE_CHANNEL_ID: mock_worker_lounge,
         }
 
         with patch("tools.bridge_state.reset_session_meta") as mock_reset_meta, \
              patch("tools.bridge_state.remove_reset_session_key") as mock_rm_key, \
-             patch("tools.bridge_runner.reset_session_keys", new={"home", str(bd.BANANA_STAND_CHANNEL_ID)}) as mock_keys:
+             patch("tools.bridge_runner.reset_session_keys", new={"home", str(bd.LOUNGE_CHANNEL_ID)}) as mock_keys:
             await mgr.proactive_nightly_recycle()
 
             mock_worker_home.recycle.assert_awaited_once_with(new_conv_id=None)
-            mock_worker_banana.recycle.assert_awaited_once_with(new_conv_id=None)
+            mock_worker_lounge.recycle.assert_not_awaited()
+            mock_worker_lounge.shutdown.assert_awaited_once()
             self.assertEqual(mock_reset_meta.call_count, 2)
             self.assertEqual(mock_rm_key.call_count, 2)
             self.assertNotIn("home", mock_keys)
-            self.assertNotIn(str(bd.BANANA_STAND_CHANNEL_ID), mock_keys)
+            self.assertNotIn(str(bd.LOUNGE_CHANNEL_ID), mock_keys)
 
         # 3. Pending carryforward context consumption without turn recycling
         test_worker = bd.PersistentChannelWorker(
@@ -676,6 +694,112 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
                  patch("tools.bridge_state.remove_reset_session_key"):
                 await mgr.proactive_nightly_recycle(include_classifier=True)
                 mock_w_recycle.assert_called_once()
+
+    async def test_17_idle_worker_reaper_and_safety_guards(self):
+        """Verify 20m child-safe idle worker reaper behavior across primary and secondary workers."""
+        mgr = bd.PersistentDaemonManager()
+        w_chat = mgr.get_worker(bs.TARGET_CHANNEL_ID)
+        w_ops = mgr.get_worker(bd.ZERO_OPS_CHANNEL_ID)
+        w_lounge = mgr.get_worker(bd.LOUNGE_CHANNEL_ID)
+
+        self.assertTrue(w_chat.always_warm)
+        self.assertFalse(w_ops.always_warm)
+        self.assertFalse(w_lounge.always_warm)
+
+        # Simulate all three workers running and idle for >1200s
+        for idx, w in enumerate((w_chat, w_ops, w_lounge), start=1):
+            mproc = MagicMock()
+            mproc.pid = 70000 + idx
+            mproc.returncode = None
+            mproc.wait = AsyncMock(return_value=0)
+            w.proc = mproc
+            w.is_ready = True
+            w.conv_id = f"conv-{w.name}-123"
+            w.started_at = 1000.0
+            w.last_turn_at = 1000.0
+
+        # (b) #zero-chat (TARGET_CHANNEL_ID) is never reaped when idle
+        with patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]):
+            self.assertFalse(w_chat.is_idle_reapable(now=5000.0, idle_timeout=1200.0))
+            self.assertFalse(await w_chat.reap_if_idle(now=5000.0, idle_timeout=1200.0))
+            self.assertIsNotNone(w_chat.proc)
+
+        # Before timeout (e.g. 1199s elapsed), secondary worker is NOT reapable
+        with patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]):
+            self.assertFalse(w_ops.is_idle_reapable(now=2199.0, idle_timeout=1200.0))
+
+        # (d) Safety guards block idle reaping even past 1200s:
+        # 1. Active child processes
+        with patch("tools.bridge_daemons.get_process_children", return_value=[88801]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]):
+            self.assertFalse(w_ops.is_idle_reapable(now=3000.0, idle_timeout=1200.0))
+
+        # 2. Pending background tasks
+        with patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=["task-bg-1"]):
+            self.assertFalse(w_ops.is_idle_reapable(now=3000.0, idle_timeout=1200.0))
+
+        # 3. Active turn in channel_active_procs
+        bd.channel_active_procs[bd.ZERO_OPS_CHANNEL_ID] = w_ops.proc
+        try:
+            with patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+                 patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]):
+                self.assertFalse(w_ops.is_idle_reapable(now=3000.0, idle_timeout=1200.0))
+        finally:
+            bd.channel_active_procs.pop(bd.ZERO_OPS_CHANNEL_ID, None)
+
+        # 4. Locked worker (turn lock or start_lock held)
+        async with w_ops.lock:
+            with patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+                 patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]):
+                self.assertFalse(w_ops.is_idle_reapable(now=3000.0, idle_timeout=1200.0))
+
+        # (c) Secondary workers (#zero-ops, #lounge) are reaped after 1200s of inactivity while preserving conv_id
+        with patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]), \
+             patch("tools.bridge_daemons.record_daemon_pids") as mock_rec_pids, \
+             patch("time.time", return_value=3000.0):
+            reaped = await mgr.reap_idle_workers(idle_timeout=1200.0)
+            self.assertCountEqual(reaped, ["zero-ops", "lounge"])
+            self.assertIsNotNone(w_chat.proc)
+            self.assertIsNone(w_ops.proc)
+            self.assertFalse(w_ops.is_ready)
+            self.assertEqual(w_ops.conv_id, "conv-zero-ops-123")
+            self.assertIsNone(w_lounge.proc)
+            self.assertFalse(w_lounge.is_ready)
+            self.assertEqual(w_lounge.conv_id, "conv-lounge-123")
+            mock_rec_pids.assert_called()
+
+        # Respawning cleanly on the next turn with preserved conv_id
+        respawn_proc = MagicMock()
+        respawn_proc.pid = 79999
+        respawn_proc.returncode = None
+        respawn_proc.stdin = MagicMock()
+        respawn_proc.stdin.write = MagicMock()
+        respawn_proc.stdin.drain = AsyncMock()
+        init_and_result = iter([
+            b'{"event":"init","conversation_id":"conv-zero-ops-123","init":{}}\n',
+            b'{"event":"result","result":{"conversation_id":"conv-zero-ops-123","status":"SUCCESS","response":"Respawned cleanly"}}\n',
+            b'',
+        ])
+        respawn_proc.stdout = AsyncMock()
+        respawn_proc.stdout.readline = AsyncMock(side_effect=lambda: next(init_and_result))
+        respawn_proc.stderr = AsyncMock()
+        respawn_proc.stderr.readline = AsyncMock(return_value=b"")
+
+        with patch("asyncio.create_subprocess_exec", return_value=respawn_proc) as mock_exec, \
+             patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
+             patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock) as mock_deliver:
+            await w_ops.execute_turn("Next turn after idle reap", AsyncMock(), AsyncMock(), [])
+            mock_exec.assert_called_once()
+            spawn_cmd = mock_exec.call_args[0]
+            self.assertIn("--conversation=conv-zero-ops-123", spawn_cmd)
+            self.assertTrue(w_ops.is_ready)
+            self.assertEqual(w_ops.conv_id, "conv-zero-ops-123")
+            mock_deliver.assert_awaited_once()
+            await w_ops.shutdown()
 
 
 if __name__ == "__main__":
