@@ -54,7 +54,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 # Re-exports for backward compatibility with existing tests and scripts
-from tools.bridge_state import (
+from tools.bridge_state import (  # noqa: F401
     DATA_DIR,
     ATTACHMENTS_DIR,
     CONFIG_FILE,
@@ -82,7 +82,7 @@ from tools.bridge_state import (
     clear_channel_session_id,
     PT_TZ,
 )
-from tools.bridge_formatting import (
+from tools.bridge_formatting import (  # noqa: F401
     format_command_preview,
     convert_markdown_tables,
     format_for_discord,
@@ -94,7 +94,7 @@ from tools.bridge_formatting import (
     generate_concise_thread_title,
     parse_interactive_choices,
 )
-from tools.bridge_runner import (
+from tools.bridge_runner import (  # noqa: F401
     find_new_artifacts,
     execute_agy_turn,
     channel_active_procs,
@@ -102,7 +102,7 @@ from tools.bridge_runner import (
     reset_session_keys,
     thread_active_tasks,
 )
-from tools.bridge_handlers import (
+from tools.bridge_handlers import (  # noqa: F401
     ChoiceButton,
     QuickChoiceView,
     apply_bot_presence,
@@ -118,8 +118,8 @@ from tools.bridge_handlers import (
     handle_message,
     handle_raw_reaction_event,
 )
-from tools.bridge_commands import ON_DEMAND_TRIGGERS
-from tools.bridge_scheduler import (
+from tools.bridge_commands import ON_DEMAND_TRIGGERS  # noqa: F401
+from tools.bridge_scheduler import (  # noqa: F401
     BridgeScheduler,
     dispatch_scheduled_prompt,
 )
@@ -870,17 +870,24 @@ async def on_button_interaction(interaction: discord.Interaction):
                         with tools.forge.get_db_connection(tools.forge.FORGE_DB_PATH) as conn:
                             row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
                         if row:
-                            row_dict = dict(row)
-                            row_dict["status"] = "executing"
-                            embed_dict = tools.forge.render_decision_card_embed(row_dict)
-                            embed = discord.Embed.from_dict(embed_dict) if embed_dict else None
-                            if getattr(interaction.message, "embeds", None):
-                                await interaction.message.edit(content="", embed=embed, view=view)
-                            elif getattr(interaction.message, "content", None):
-                                card_text = tools.forge.format_decision_card_text(row_dict)
-                                await interaction.message.edit(content=card_text, view=view)
+                            can_execute = (
+                                row["status"] == "pending"
+                                or (row["handler_type"] == "bridge_reload" and row["status"] in ("pending", "expired"))
+                            )
+                            if can_execute:
+                                row_dict = dict(row)
+                                row_dict["status"] = "executing"
+                                embed_dict = tools.forge.render_decision_card_embed(row_dict)
+                                embed = discord.Embed.from_dict(embed_dict) if embed_dict else None
+                                if getattr(interaction.message, "embeds", None):
+                                    await interaction.message.edit(content="", embed=embed, view=view)
+                                elif getattr(interaction.message, "content", None):
+                                    card_text = tools.forge.format_decision_card_text(row_dict)
+                                    await interaction.message.edit(content=card_text, view=view)
+                                else:
+                                    await interaction.message.edit(content="", embed=embed, view=view)
                             else:
-                                await interaction.message.edit(content="", embed=embed, view=view)
+                                await interaction.message.edit(view=view)
                         else:
                             await interaction.message.edit(view=view)
                     else:
@@ -903,11 +910,28 @@ async def on_button_interaction(interaction: discord.Interaction):
                     view = discord.ui.View.from_message(interaction.message)
                     for item in view.children:
                         item.disabled = True
-                    if res.get("formatted_embed"):
-                        embed = discord.Embed.from_dict(res["formatted_embed"])
+                    fmt_embed = res.get("formatted_embed")
+                    fmt_card = res.get("formatted_card")
+                    if not fmt_embed and not fmt_card:
+                        with tools.forge.get_db_connection(tools.forge.FORGE_DB_PATH) as conn:
+                            db_row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
+                        if db_row:
+                            fmt_embed = tools.forge.render_decision_card_embed(db_row)
+                            fmt_card = tools.forge.format_decision_card_text(db_row)
+                    if fmt_embed:
+                        embed = discord.Embed.from_dict(fmt_embed)
                         await interaction.message.edit(content="", embed=embed, view=view)
-                    elif res.get("formatted_card"):
-                        await interaction.message.edit(content=res["formatted_card"], view=view)
+                    elif fmt_card:
+                        await interaction.message.edit(content=fmt_card, view=view)
+                except Exception:
+                    pass
+
+            if not res.get("ok") and not is_already_executing:
+                try:
+                    await interaction.followup.send(
+                        f"⚠️ {res.get('error', 'Action could not be executed.')}",
+                        ephemeral=True,
+                    )
                 except Exception:
                     pass
 

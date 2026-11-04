@@ -5031,6 +5031,7 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
                 handler_type="bridge_reload",
                 payload={"build_id": build_id, "reason": f"FORGE build {build_id} ({build['title']})"},
                 channel_id=int(target_ch),
+                ttl_seconds=86400.0,
                 db_path=db_path,
                 post_to_discord=True,
             )
@@ -7577,21 +7578,42 @@ def execute_decision(
         row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
         if not row:
             return {"ok": False, "error": f"Decision {decision_id} not found."}
-        if row["status"] != "pending":
-            return {"ok": False, "error": f"Decision {decision_id} is already {row['status']}."}
-        if time.time() > float(row["expires_at"]):
-            conn.execute(
-                "UPDATE forge_decisions SET status = 'expired', resolved_at = ? WHERE id = ?",
-                (time.time(), decision_id),
+        is_reload_card = row["handler_type"] == "bridge_reload"
+        if is_reload_card and row["status"] in ("pending", "expired"):
+            cur = conn.execute(
+                "UPDATE forge_decisions SET status = 'executing' WHERE id = ? AND status IN ('pending', 'expired')",
+                (decision_id,),
             )
-            return {"ok": False, "error": f"Decision {decision_id} has expired."}
+            if cur.rowcount == 0:
+                return {"ok": False, "error": f"Decision {decision_id} is already executing."}
+        else:
+            if row["status"] != "pending":
+                fresh = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone() or row
+                return {
+                    "ok": False,
+                    "error": f"Decision {decision_id} is already {row['status']}.",
+                    "formatted_card": format_decision_card_text(fresh),
+                    "formatted_embed": render_decision_card_embed(fresh),
+                }
+            if time.time() > float(row["expires_at"]):
+                conn.execute(
+                    "UPDATE forge_decisions SET status = 'expired', resolved_at = ? WHERE id = ?",
+                    (time.time(), decision_id),
+                )
+                fresh = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone() or row
+                return {
+                    "ok": False,
+                    "error": f"Decision {decision_id} has expired.",
+                    "formatted_card": format_decision_card_text(fresh),
+                    "formatted_embed": render_decision_card_embed(fresh),
+                }
 
-        cur = conn.execute(
-            "UPDATE forge_decisions SET status = 'executing' WHERE id = ? AND status = 'pending'",
-            (decision_id,),
-        )
-        if cur.rowcount == 0:
-            return {"ok": False, "error": f"Decision {decision_id} is already executing."}
+            cur = conn.execute(
+                "UPDATE forge_decisions SET status = 'executing' WHERE id = ? AND status = 'pending'",
+                (decision_id,),
+            )
+            if cur.rowcount == 0:
+                return {"ok": False, "error": f"Decision {decision_id} is already executing."}
 
         payload = override_payload if override_payload is not None else json.loads(row["payload_json"] or "{}")
         if override_payload is not None:
@@ -7641,8 +7663,17 @@ def execute_decision(
             receipt = f"Merged PR #{pr_num} in `{Path(repo_dir).name}`"
 
         elif handler == "bridge_reload":
+            ts_str = str(time.time())
             reload_flag = DATA_DIR / "reload_bridge.flag"
-            reload_flag.write_text(str(time.time()), encoding="utf-8")
+            reload_flag.parent.mkdir(parents=True, exist_ok=True)
+            reload_flag.write_text(ts_str, encoding="utf-8")
+            ws_reload_flag = Path("/workspace/data/reload_bridge.flag")
+            if ws_reload_flag != reload_flag:
+                try:
+                    ws_reload_flag.parent.mkdir(parents=True, exist_ok=True)
+                    ws_reload_flag.write_text(ts_str, encoding="utf-8")
+                except Exception:
+                    pass
             ok = True
             receipt = "Triggered in-place bridge reload"
 
@@ -7759,6 +7790,7 @@ def expire_stale_decisions(db_path: Path | str = FORGE_DB_PATH) -> list[str]:
     """Expire pending Decision Cards whose TTL has passed."""
     now = time.time()
     expired_ids = []
+    expired_rows = []
     with get_db_connection(db_path) as conn:
         rows = conn.execute(
             "SELECT * FROM forge_decisions WHERE status = 'pending' AND expires_at < ?",
@@ -7770,6 +7802,42 @@ def expire_stale_decisions(db_path: Path | str = FORGE_DB_PATH) -> list[str]:
                 (now, r["id"]),
             )
             expired_ids.append(r["id"])
+            updated_r = dict(r)
+            updated_r["status"] = "expired"
+            updated_r["resolved_at"] = now
+            expired_rows.append(updated_r)
+
+    if expired_rows:
+        token = _get_discord_token()
+        if token:
+            headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+            for r in expired_rows:
+                msg_id = r.get("message_id")
+                ch_id = r.get("channel_id")
+                if msg_id and ch_id:
+                    decision_id = r["id"]
+                    embed_data = render_decision_card_embed(r)
+                    components = [
+                        {
+                            "type": 1,
+                            "components": [
+                                {"type": 2, "style": 3, "label": "Approve", "custom_id": f"forge_approve:{decision_id}", "disabled": True},
+                                {"type": 2, "style": 2, "label": "Edit", "custom_id": f"forge_edit:{decision_id}", "disabled": True},
+                                {"type": 2, "style": 4, "label": "Dismiss", "custom_id": f"forge_dismiss:{decision_id}", "disabled": True},
+                            ],
+                        }
+                    ]
+                    url = f"https://discord.com/api/v10/channels/{ch_id}/messages/{msg_id}"
+                    try:
+                        requests.patch(
+                            url,
+                            headers=headers,
+                            json={"content": "", "embeds": [embed_data], "components": components},
+                            timeout=5,
+                        )
+                    except Exception:
+                        pass
+
     return expired_ids
 
 

@@ -3948,5 +3948,128 @@ def test_goldfish_preflight_rejects_manual_commit_or_push_in_verification_cmd(tm
         assert any("manual git commit/push" in f.lower() or "git commit" in f.lower() or "git push" in f.lower() for f in findings)
 
 
+def test_bridge_reload_expired_execution_and_expired_decision_feedback(tmp_path, monkeypatch):
+    """Verify expired bridge_reload cards can still execute, non-reload expired cards return formatted_embed/card, and expire_stale_decisions patches Discord."""
+    import tools.forge as forge_mod
+
+    db_path = tmp_path / "forge_reload.db"
+    forge_mod.init_forge_db(db_path)
+
+    fake_data_dir = tmp_path / "forge_data"
+    fake_data_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", fake_data_dir)
+
+    # 1. Expired bridge_reload card (TTL passed, status still pending) executes cleanly
+    d_reload_ttl = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Bridge (fg-test-1)",
+        summary="Reload bridge after build.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-test-1"},
+        channel_id=forge_mod.ZERO_OPS_CHANNEL_ID,
+        ttl_seconds=-120.0,
+        db_path=db_path,
+    )
+    res_reload_ttl = forge_mod.execute_decision(
+        d_reload_ttl["decision_id"],
+        user_id=forge_mod.OWNER_USER_ID,
+        db_path=db_path,
+    )
+    assert res_reload_ttl["ok"] is True
+    assert res_reload_ttl["status"] == "approved"
+    assert res_reload_ttl["handler_type"] == "bridge_reload"
+    assert (fake_data_dir / "reload_bridge.flag").exists()
+
+    # 2. Already-marked 'expired' bridge_reload card also executes cleanly when clicked
+    d_reload_exp = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Bridge (fg-test-2)",
+        summary="Reload bridge after build 2.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-test-2"},
+        channel_id=forge_mod.ZERO_OPS_CHANNEL_ID,
+        ttl_seconds=-60.0,
+        db_path=db_path,
+    )
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE forge_decisions SET status = 'expired', message_id = 555666777 WHERE id = ?",
+            (d_reload_exp["decision_id"],),
+        )
+    res_reload_exp = forge_mod.execute_decision(
+        d_reload_exp["decision_id"],
+        user_id=forge_mod.OWNER_USER_ID,
+        db_path=db_path,
+    )
+    assert res_reload_exp["ok"] is True
+    assert res_reload_exp["status"] == "approved"
+    assert "Approved & Executed" in res_reload_exp["formatted_card"]
+    assert res_reload_exp["formatted_embed"]["title"].startswith("✅")
+
+    # 3. Non-reload expired card (both TTL-expired while pending and already 'expired') returns formatted_embed & formatted_card
+    d_shell_exp = forge_mod.stage_decision(
+        category="homelab",
+        title="Restart Service",
+        summary="Run service restart.",
+        handler_type="shell",
+        payload={"command": "true"},
+        channel_id=forge_mod.ZERO_OPS_CHANNEL_ID,
+        ttl_seconds=-30.0,
+        db_path=db_path,
+    )
+    res_shell_ttl = forge_mod.execute_decision(
+        d_shell_exp["decision_id"],
+        user_id=forge_mod.OWNER_USER_ID,
+        db_path=db_path,
+    )
+    assert res_shell_ttl["ok"] is False
+    assert "expired" in res_shell_ttl["error"]
+    assert "formatted_embed" in res_shell_ttl and res_shell_ttl["formatted_embed"]["title"].startswith("⏱️")
+    assert "formatted_card" in res_shell_ttl and "Expired without action" in res_shell_ttl["formatted_card"]
+
+    # Calling execute_decision again when status is already 'expired' also returns formatted_embed & formatted_card
+    res_shell_already = forge_mod.execute_decision(
+        d_shell_exp["decision_id"],
+        user_id=forge_mod.OWNER_USER_ID,
+        db_path=db_path,
+    )
+    assert res_shell_already["ok"] is False
+    assert "already expired" in res_shell_already["error"]
+    assert "formatted_embed" in res_shell_already and res_shell_already["formatted_embed"]["title"].startswith("⏱️")
+    assert "formatted_card" in res_shell_already and "Expired without action" in res_shell_already["formatted_card"]
+
+    # 4. expire_stale_decisions updates Discord message via REST PATCH when message_id & channel_id exist
+    d_stale = forge_mod.stage_decision(
+        category="homelab",
+        title="Stale Card With Message",
+        summary="Test REST PATCH on expire.",
+        handler_type="shell",
+        payload={"command": "true"},
+        channel_id=forge_mod.ZERO_OPS_CHANNEL_ID,
+        ttl_seconds=-10.0,
+        db_path=db_path,
+    )
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute("UPDATE forge_decisions SET message_id = 888999000 WHERE id = ?", (d_stale["decision_id"],))
+
+    patch_calls = []
+
+    def _fake_patch(url, headers=None, json=None, timeout=None):
+        patch_calls.append({"url": url, "json": json, "timeout": timeout})
+        m = MagicMock()
+        m.status_code = 200
+        return m
+
+    monkeypatch.setattr(forge_mod, "_get_discord_token", lambda: "mock-bot-token")
+    monkeypatch.setattr(forge_mod.requests, "patch", _fake_patch)
+
+    expired_list = forge_mod.expire_stale_decisions(db_path=db_path)
+    assert d_stale["decision_id"] in expired_list
+    assert len(patch_calls) == 1
+    assert "888999000" in patch_calls[0]["url"]
+    assert patch_calls[0]["json"]["embeds"][0]["title"].startswith("⏱️")
+    assert all(btn["disabled"] is True for btn in patch_calls[0]["json"]["components"][0]["components"])
+
+
 if __name__ == "__main__":
     unittest.main()
