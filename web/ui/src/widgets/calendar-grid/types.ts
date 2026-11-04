@@ -29,7 +29,7 @@ export interface FamilySpanEvent extends FamilyEvent {
   col_span: number;
 }
 
-interface FamilyDayEvent extends FamilyEvent {
+export interface FamilyDayEvent extends FamilyEvent {
   top_pct: number;
   height_pct: number;
   left_pct: number;
@@ -41,11 +41,21 @@ interface FamilyDayEvent extends FamilyEvent {
   is_linked?: boolean;
 }
 
-interface TimelineMarker {
+export interface TimelineMarker {
   label: string;
   top_pct: number;
   is_start?: boolean;
   is_end?: boolean;
+}
+
+export interface CollapsedHoursGap {
+  start_hour: number;
+  end_hour: number;
+  start_str?: string;
+  end_str?: string;
+  label: string;
+  top_pct: number;
+  height_pct: number;
 }
 
 export interface FamilyDay {
@@ -67,10 +77,12 @@ export interface FamilyViewModel {
   range_end: string;
   range_label: string;
   today: string;
+  time_format?: '12h' | '24h' | string;
   hours_start?: string;
   hours_end?: string;
   hour_markers?: string[];
   timeline_markers?: TimelineMarker[];
+  collapsed_gaps?: CollapsedHoursGap[];
   members?: FamilyMember[];
   days?: FamilyDay[];
   all_day_events?: FamilySpanEvent[];

@@ -2,8 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import { useIsCurrentPane } from '../../carousel/PaneContext';
 import { useDocumentVisible } from '../../lifecycle/visibility';
 import { useDisplayStore } from '../../store';
-import { computeNowIndicatorPct, stripMealiePrefix } from './dateUtils';
+import {
+  computeNowIndicatorPct,
+  formatEventTime,
+  parseTimeMinutes,
+  resolveCollapsedMiddayGaps,
+  stripMealiePrefix,
+} from './dateUtils';
 import type {
+  CollapsedHoursGap,
   FamilyDay,
   FamilyEvent,
   FamilyMember,
@@ -141,6 +148,29 @@ export function CalendarWeekView({
   const hasTimelineMarkers = Boolean(weekVM?.timeline_markers?.length || weekVM?.hour_markers?.length);
   const marginLeft = hasTimelineMarkers ? '44px' : undefined;
 
+  const inferredTimeFormat =
+    weekVM?.time_format ||
+    (weekVM?.timeline_markers?.some((m) => /[ap]m$/i.test(m.label)) ||
+    weekVM?.hour_markers?.some((m) => /[ap]m$/i.test(m))
+      ? '12h'
+      : undefined);
+
+  const startMin =
+    parseTimeMinutes(weekVM?.hours_start) ??
+    parseTimeMinutes(weekVM?.timeline_markers?.[0]?.label) ??
+    parseTimeMinutes(weekVM?.hour_markers?.[0]) ??
+    420;
+  const endMin =
+    parseTimeMinutes(weekVM?.hours_end) ??
+    parseTimeMinutes(weekVM?.timeline_markers?.[weekVM.timeline_markers.length - 1]?.label) ??
+    parseTimeMinutes(weekVM?.hour_markers?.[weekVM.hour_markers.length - 1]) ??
+    1260;
+
+  const collapsedGaps: CollapsedHoursGap[] =
+    weekVM?.collapsed_gaps && weekVM.collapsed_gaps.length > 0
+      ? weekVM.collapsed_gaps
+      : resolveCollapsedMiddayGaps(daysToRender, startMin, endMin, inferredTimeFormat);
+
   return (
     <div
       className="cf-view-panel cf-view-week"
@@ -258,26 +288,29 @@ export function CalendarWeekView({
             >
               {daysToRender.map((day) => (
                 <div key={day.date} className="cf-day-early-col" style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                  {day.early_events?.map((ev) => (
-                    <div key={ev.id} className="cf-edge-band cf-early-band" style={{ display: 'flex', flexDirection: 'column', gap: '2px', padding: '2px 4px', background: 'rgba(90, 60, 30, 0.05)', borderRadius: '6px', border: '1px dashed var(--mm-divider, rgba(90, 60, 30, 0.12))', flexShrink: 0 }}>
-                      <div
-                        className={`cf-edge-event cf-event-clickable${ev.pattern ? ` cf-pattern-${ev.pattern}` : ''}`}
-                        role="button" tabIndex={0} title={`Early event: ${ev.start} ${ev.title}${ev.location ? ` (${ev.location})` : ''}`}
-                        aria-label={`Early event: ${ev.title} at ${ev.start}`}
-                        data-event-id={ev.id} data-event-title={ev.title} data-event-start={ev.start}
-                        data-event-end={ev.end} data-event-location={ev.location} data-event-description={ev.description}
-                        onClick={() => onOpenModal(ev, day.date)}
-                        onKeyDown={(e) => handleEventKeyDown(e, () => onOpenModal(ev, day.date))}
-                        style={{
-                          fontSize: '0.60rem', fontWeight: 700, padding: '2px 4px', borderRadius: '4px',
-                          backgroundColor: ev.color, color: ev.text_color, overflow: 'hidden', textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap', cursor: 'pointer', touchAction: 'manipulation',
-                        }}
-                      >
-                        ▲ {ev.start} {ev.title}
+                  {day.early_events?.map((ev) => {
+                    const startDisplay = formatEventTime(ev.start, inferredTimeFormat) || ev.start;
+                    return (
+                      <div key={ev.id} className="cf-edge-band cf-early-band" style={{ display: 'flex', flexDirection: 'column', gap: '2px', padding: '2px 4px', background: 'rgba(90, 60, 30, 0.05)', borderRadius: '6px', border: '1px dashed var(--mm-divider, rgba(90, 60, 30, 0.12))', flexShrink: 0 }}>
+                        <div
+                          className={`cf-edge-event cf-event-clickable${ev.pattern ? ` cf-pattern-${ev.pattern}` : ''}`}
+                          role="button" tabIndex={0} title={`Early event: ${startDisplay} ${ev.title}${ev.location ? ` (${ev.location})` : ''}`}
+                          aria-label={`Early event: ${ev.title} at ${startDisplay}`}
+                          data-event-id={ev.id} data-event-title={ev.title} data-event-start={ev.start}
+                          data-event-end={ev.end} data-event-location={ev.location} data-event-description={ev.description}
+                          onClick={() => onOpenModal(ev, day.date)}
+                          onKeyDown={(e) => handleEventKeyDown(e, () => onOpenModal(ev, day.date))}
+                          style={{
+                            fontSize: '0.60rem', fontWeight: 700, padding: '2px 4px', borderRadius: '4px',
+                            backgroundColor: ev.color, color: ev.text_color, overflow: 'hidden', textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap', cursor: 'pointer', touchAction: 'manipulation',
+                          }}
+                        >
+                          ▲ {startDisplay} {ev.title}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               ))}
             </div>
@@ -360,6 +393,24 @@ export function CalendarWeekView({
                     </div>
 
                     <div className="cf-day-canvas" ref={(el) => registerDayCanvas(day.date, el)} style={{ flex: 1, position: 'relative', minHeight: 0, marginTop: '4px' }}>
+                      {collapsedGaps.map((gap, gapIdx) => (
+                        <div
+                          key={`${gap.start_hour}-${gap.end_hour}-${gapIdx}`}
+                          className="cf-collapsed-gap"
+                          aria-hidden="true"
+                          data-gap-start={gap.start_str || `${String(gap.start_hour).padStart(2, '0')}:00`}
+                          data-gap-end={gap.end_str || `${String(gap.end_hour).padStart(2, '0')}:00`}
+                          style={{
+                            position: 'absolute',
+                            left: 0,
+                            right: 0,
+                            top: `${gap.top_pct}%`,
+                            height: `${gap.height_pct}%`,
+                          }}
+                        >
+                          <span className="cf-collapsed-gap-label">{gap.label}</span>
+                        </div>
+                      ))}
                       {day.is_today && nowPct !== null && (
                         <div
                           className="cf-now-indicator"
@@ -390,41 +441,45 @@ export function CalendarWeekView({
                           />
                         </div>
                       )}
-                      {day.events?.map((ev) => (
-                        <div
-                          key={ev.id}
-                          className={`cf-day-event cf-event-clickable${ev.pattern ? ` cf-pattern-${ev.pattern}` : ''}`}
-                          role="button" tabIndex={0}
-                          title={`${ev.start}–${ev.end}: ${ev.title}${ev.location ? ` (${ev.location})` : ''}`}
-                          aria-label={`${ev.title}, ${ev.start} to ${ev.end}${ev.location ? `, ${ev.location}` : ''}`}
-                          data-event-id={ev.id} data-event-title={ev.title} data-event-start={ev.start}
-                          data-event-end={ev.end} data-event-location={ev.location} data-event-description={ev.description}
-                          onClick={() => onOpenModal(ev, day.date)}
-                          onKeyDown={(e) => handleEventKeyDown(e, () => onOpenModal(ev, day.date))}
-                          style={{
-                            position: 'absolute', top: `${ev.top_pct}%`, height: `${ev.height_pct}%`,
-                            left: `calc(${ev.left_pct}% + 1px)`, width: `calc(${ev.width_pct}% - 2px)`,
-                            minHeight: '20px', padding: '2px 4px', borderRadius: '6px',
-                            backgroundColor: ev.color, color: ev.text_color, overflow: 'hidden',
-                            display: 'flex', flexDirection: 'column', boxSizing: 'border-box',
-                            border: '1px solid rgba(0, 0, 0, 0.12)', boxShadow: '0 1px 3px rgba(0, 0, 0, 0.12)',
-                            cursor: 'pointer', touchAction: 'manipulation',
-                          }}
-                        >
-                          <div className="cf-event-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '2px', fontSize: '0.60rem', fontWeight: 800, lineHeight: 1.1, flexShrink: 0 }}>
-                            <span className="cf-event-time" style={{ fontFamily: 'var(--mm-font-mono, monospace)' }}>{ev.start}</span>
-                            {ev.initials && ev.initials.length > 0 && <span className="cf-event-initials" style={{ opacity: 0.85 }}>{ev.initials.join('')}</span>}
-                          </div>
-                          <div className="cf-event-title" style={{ fontSize: '0.65rem', fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: 1.2, flexShrink: 0 }}>
-                            {ev.title}
-                          </div>
-                          {ev.location && (
-                            <div className="cf-event-location" style={{ fontSize: '0.55rem', opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {ev.location}
+                      {day.events?.map((ev) => {
+                        const startDisplay = formatEventTime(ev.start, inferredTimeFormat) || ev.start;
+                        const endDisplay = formatEventTime(ev.end, inferredTimeFormat) || ev.end;
+                        return (
+                          <div
+                            key={ev.id}
+                            className={`cf-day-event cf-event-clickable${ev.pattern ? ` cf-pattern-${ev.pattern}` : ''}`}
+                            role="button" tabIndex={0}
+                            title={`${startDisplay}–${endDisplay}: ${ev.title}${ev.location ? ` (${ev.location})` : ''}`}
+                            aria-label={`${ev.title}, ${startDisplay} to ${endDisplay}${ev.location ? `, ${ev.location}` : ''}`}
+                            data-event-id={ev.id} data-event-title={ev.title} data-event-start={ev.start}
+                            data-event-end={ev.end} data-event-location={ev.location} data-event-description={ev.description}
+                            onClick={() => onOpenModal(ev, day.date)}
+                            onKeyDown={(e) => handleEventKeyDown(e, () => onOpenModal(ev, day.date))}
+                            style={{
+                              position: 'absolute', top: `${ev.top_pct}%`, height: `${ev.height_pct}%`,
+                              left: `calc(${ev.left_pct}% + 1px)`, width: `calc(${ev.width_pct}% - 2px)`,
+                              minHeight: '20px', padding: '2px 4px', borderRadius: '6px',
+                              backgroundColor: ev.color, color: ev.text_color, overflow: 'hidden',
+                              display: 'flex', flexDirection: 'column', boxSizing: 'border-box',
+                              border: '1px solid rgba(0, 0, 0, 0.12)', boxShadow: '0 1px 3px rgba(0, 0, 0, 0.12)',
+                              cursor: 'pointer', touchAction: 'manipulation',
+                            }}
+                          >
+                            <div className="cf-event-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '2px', fontSize: '0.60rem', fontWeight: 800, lineHeight: 1.1, flexShrink: 0 }}>
+                              <span className="cf-event-time" style={{ fontFamily: 'var(--mm-font-mono, monospace)' }}>{startDisplay}</span>
+                              {ev.initials && ev.initials.length > 0 && <span className="cf-event-initials" style={{ opacity: 0.85 }}>{ev.initials.join('')}</span>}
                             </div>
-                          )}
-                        </div>
-                      ))}
+                            <div className="cf-event-title" style={{ fontSize: '0.65rem', fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', lineHeight: 1.2, flexShrink: 0 }}>
+                              {ev.title}
+                            </div>
+                            {ev.location && (
+                              <div className="cf-event-location" style={{ fontSize: '0.55rem', opacity: 0.85, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {ev.location}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 );
@@ -443,26 +498,29 @@ export function CalendarWeekView({
             >
               {daysToRender.map((day) => (
                 <div key={day.date} className="cf-day-late-col" style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
-                  {day.late_events?.map((ev) => (
-                    <div key={ev.id} className="cf-edge-band cf-late-band" style={{ display: 'flex', flexDirection: 'column', gap: '2px', padding: '2px 4px', background: 'rgba(90, 60, 30, 0.05)', borderRadius: '6px', border: '1px dashed var(--mm-divider, rgba(90, 60, 30, 0.12))', flexShrink: 0 }}>
-                      <div
-                        className={`cf-edge-event cf-event-clickable${ev.pattern ? ` cf-pattern-${ev.pattern}` : ''}`}
-                        role="button" tabIndex={0} title={`Late event: ${ev.start} ${ev.title}${ev.location ? ` (${ev.location})` : ''}`}
-                        aria-label={`Late event: ${ev.title} at ${ev.start}`}
-                        data-event-id={ev.id} data-event-title={ev.title} data-event-start={ev.start}
-                        data-event-end={ev.end} data-event-location={ev.location} data-event-description={ev.description}
-                        onClick={() => onOpenModal(ev, day.date)}
-                        onKeyDown={(e) => handleEventKeyDown(e, () => onOpenModal(ev, day.date))}
-                        style={{
-                          fontSize: '0.60rem', fontWeight: 700, padding: '2px 4px', borderRadius: '4px',
-                          backgroundColor: ev.color, color: ev.text_color, overflow: 'hidden',
-                          textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer', touchAction: 'manipulation',
-                        }}
-                      >
-                        ▼ {ev.start} {ev.title}
+                  {day.late_events?.map((ev) => {
+                    const startDisplay = formatEventTime(ev.start, inferredTimeFormat) || ev.start;
+                    return (
+                      <div key={ev.id} className="cf-edge-band cf-late-band" style={{ display: 'flex', flexDirection: 'column', gap: '2px', padding: '2px 4px', background: 'rgba(90, 60, 30, 0.05)', borderRadius: '6px', border: '1px dashed var(--mm-divider, rgba(90, 60, 30, 0.12))', flexShrink: 0 }}>
+                        <div
+                          className={`cf-edge-event cf-event-clickable${ev.pattern ? ` cf-pattern-${ev.pattern}` : ''}`}
+                          role="button" tabIndex={0} title={`Late event: ${startDisplay} ${ev.title}${ev.location ? ` (${ev.location})` : ''}`}
+                          aria-label={`Late event: ${ev.title} at ${startDisplay}`}
+                          data-event-id={ev.id} data-event-title={ev.title} data-event-start={ev.start}
+                          data-event-end={ev.end} data-event-location={ev.location} data-event-description={ev.description}
+                          onClick={() => onOpenModal(ev, day.date)}
+                          onKeyDown={(e) => handleEventKeyDown(e, () => onOpenModal(ev, day.date))}
+                          style={{
+                            fontSize: '0.60rem', fontWeight: 700, padding: '2px 4px', borderRadius: '4px',
+                            backgroundColor: ev.color, color: ev.text_color, overflow: 'hidden',
+                            textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer', touchAction: 'manipulation',
+                          }}
+                        >
+                          ▼ {startDisplay} {ev.title}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               ))}
             </div>

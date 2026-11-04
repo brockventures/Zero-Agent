@@ -67,18 +67,20 @@ type FamilySpanEvent struct {
 // FamilyViewModel is the fully resolved server-side view model consumed by the calendar-family
 // week view template "View model".
 type FamilyViewModel struct {
-	RangeStart      string            `json:"range_start"`
-	RangeEnd        string            `json:"range_end"`
-	RangeLabel      string            `json:"range_label"`
-	Today           string            `json:"today"`
-	HoursStart      string            `json:"hours_start"`
-	HoursEnd        string            `json:"hours_end"`
-	HourMarkers     []string          `json:"hour_markers"`
-	TimelineMarkers []TimelineMarker  `json:"timeline_markers,omitempty"`
-	Members         []FamilyMember    `json:"members"`
-	Days            []FamilyDay       `json:"days"`
-	AllDayEvents    []FamilySpanEvent `json:"all_day_events"`
-	SharedColor     string            `json:"shared_color"`
+	RangeStart      string              `json:"range_start"`
+	RangeEnd        string              `json:"range_end"`
+	RangeLabel      string              `json:"range_label"`
+	Today           string              `json:"today"`
+	TimeFormat      string              `json:"time_format,omitempty"`
+	HoursStart      string              `json:"hours_start"`
+	HoursEnd        string              `json:"hours_end"`
+	HourMarkers     []string            `json:"hour_markers"`
+	TimelineMarkers []TimelineMarker    `json:"timeline_markers,omitempty"`
+	CollapsedGaps   []CollapsedHoursGap `json:"collapsed_gaps,omitempty"`
+	Members         []FamilyMember      `json:"members"`
+	Days            []FamilyDay         `json:"days"`
+	AllDayEvents    []FamilySpanEvent   `json:"all_day_events"`
+	SharedColor     string              `json:"shared_color"`
 }
 
 // FamilyDayEvent represents a resolved event positioned within a day view column or edge band.
@@ -104,21 +106,36 @@ type TimelineMarker struct {
 	IsEnd   bool    `json:"is_end,omitempty"`
 }
 
+// CollapsedHoursGap represents an empty interior hour span (3+ consecutive empty hours)
+// collapsed into a compact vertical band in the week/day timeline.
+type CollapsedHoursGap struct {
+	StartHour int     `json:"start_hour"`
+	EndHour   int     `json:"end_hour"`
+	StartStr  string  `json:"start_str"`
+	EndStr    string  `json:"end_str"`
+	Label     string  `json:"label"`
+	TopPct    float64 `json:"top_pct"`
+	HeightPct float64 `json:"height_pct"`
+}
+
 // HoursBand represents the parsed visible hours window for the day view.
 type HoursBand struct {
-	StartHour       int              `json:"start_hour"`
-	StartMinute     int              `json:"start_minute"`
-	EndHour         int              `json:"end_hour"`
-	EndMinute       int              `json:"end_minute"`
-	StartStr        string           `json:"start_str"`
-	EndStr          string           `json:"end_str"`
-	Markers         []string         `json:"markers"`
-	TimelineMarkers []TimelineMarker `json:"timeline_markers,omitempty"`
+	StartHour       int                 `json:"start_hour"`
+	StartMinute     int                 `json:"start_minute"`
+	EndHour         int                 `json:"end_hour"`
+	EndMinute       int                 `json:"end_minute"`
+	StartStr        string              `json:"start_str"`
+	EndStr          string              `json:"end_str"`
+	Markers         []string            `json:"markers"`
+	TimelineMarkers []TimelineMarker    `json:"timeline_markers,omitempty"`
+	CollapsedGaps   []CollapsedHoursGap `json:"collapsed_gaps,omitempty"`
 }
 
 const (
-	defaultSharedColor = "#3D405B"
-	maxFamilyMembers   = 8
+	defaultSharedColor         = "#3D405B"
+	maxFamilyMembers           = 8
+	collapsedGapHourEquivalent = 0.65
+	minCollapsedGapHours       = 3
 )
 
 // familyCalendarSource mirrors the subset of the calendar-family config_schema `calendars[]`
@@ -136,7 +153,11 @@ type mergedFamilyEvents struct {
 	rawEvents map[string]provider.CalendarEvent
 }
 
-func newFamilyEvent(ev provider.CalendarEvent, loc *time.Location) *FamilyEvent {
+func newFamilyEvent(ev provider.CalendarEvent, loc *time.Location, timeFormat ...string) *FamilyEvent {
+	tf := "24h"
+	if len(timeFormat) > 0 && timeFormat[0] != "" {
+		tf = timeFormat[0]
+	}
 	fe := &FamilyEvent{
 		ID:          ev.ID,
 		Title:       ev.Title,
@@ -146,10 +167,12 @@ func newFamilyEvent(ev provider.CalendarEvent, loc *time.Location) *FamilyEvent 
 	}
 	if !ev.AllDay {
 		if t, ok := parseFamilyTime(ev.Start); ok {
-			fe.Start = t.In(loc).Format("15:04")
+			tLocal := t.In(loc)
+			fe.Start = formatTimeLabel(tLocal.Hour(), tLocal.Minute(), tf)
 		}
 		if t, ok := parseFamilyTime(ev.End); ok {
-			fe.End = t.In(loc).Format("15:04")
+			tLocal := t.In(loc)
+			fe.End = formatTimeLabel(tLocal.Hour(), tLocal.Minute(), tf)
 		}
 	}
 	return fe
@@ -182,9 +205,14 @@ func mergeFamilyEvents(
 	sharedColor string,
 	loc *time.Location,
 	matchDates func(provider.CalendarEvent) []string,
+	timeFormat ...string,
 ) mergedFamilyEvents {
 	if loc == nil {
 		loc = time.UTC
+	}
+	tf := "24h"
+	if len(timeFormat) > 0 && timeFormat[0] != "" {
+		tf = timeFormat[0]
 	}
 	merged := make(map[string]*FamilyEvent)
 	var mergedOrder []string
@@ -200,7 +228,7 @@ func mergeFamilyEvents(
 
 		fe, exists := merged[ev.ID]
 		if !exists {
-			fe = newFamilyEvent(ev, loc)
+			fe = newFamilyEvent(ev, loc, tf)
 			merged[ev.ID] = fe
 			mergedOrder = append(mergedOrder, ev.ID)
 			mergedDates[ev.ID] = matchedDates
@@ -284,6 +312,7 @@ func BuildFamilyView(data any, cfg map[string]any, dims domain.Dimension, now ti
 	}
 
 	maxVisible := maxVisibleTimedRows(dims)
+	timeFormat := stringOr(cfg, "time_format", "24h")
 
 	hours := resolveFamilyHoursBand(cfg, snapshot.Events, dayIndex, now.Location())
 
@@ -294,6 +323,7 @@ func BuildFamilyView(data any, cfg map[string]any, dims domain.Dimension, now ti
 		sharedColor,
 		now.Location(),
 		matchWindowDates(dayIndex, now.Location()),
+		timeFormat,
 	)
 
 	for _, id := range mergedData.order {
@@ -316,15 +346,38 @@ func BuildFamilyView(data any, cfg map[string]any, dims domain.Dimension, now ti
 		RangeEnd:        rangeEnd.Format("2006-01-02"),
 		RangeLabel:      formatFamilyRangeLabel(rangeStart, rangeEnd),
 		Today:           today.Format("2006-01-02"),
+		TimeFormat:      timeFormat,
 		HoursStart:      hours.StartStr,
 		HoursEnd:        hours.EndStr,
 		HourMarkers:     hours.Markers,
 		TimelineMarkers: hours.TimelineMarkers,
+		CollapsedGaps:   hours.CollapsedGaps,
 		Members:         members,
 		Days:            days,
 		AllDayEvents:    allDayEvents,
 		SharedColor:     sharedColor,
 	}, nil
+}
+
+func eventMinutesForSort(label string) int {
+	label = strings.TrimSpace(strings.ToLower(label))
+	if strings.HasSuffix(label, "am") || strings.HasSuffix(label, "pm") {
+		isPM := strings.HasSuffix(label, "pm")
+		core := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(label, "am"), "pm"))
+		h, m, ok := parseClockTime(core)
+		if ok {
+			if isPM && h != 12 {
+				h += 12
+			} else if !isPM && h == 12 {
+				h = 0
+			}
+			return h*60 + m
+		}
+	}
+	if h, m, ok := parseClockTime(label); ok {
+		return h*60 + m
+	}
+	return 0
 }
 
 func buildFamilyAllDaySpans(mergedData mergedFamilyEvents, dayIndex map[string]int, numDays int) []FamilySpanEvent {
@@ -376,6 +429,11 @@ func buildFamilyAllDaySpans(mergedData mergedFamilyEvents, dayIndex map[string]i
 func populateFamilyDayColumns(days []FamilyDay, rangeStart time.Time, maxVisible int, hours HoursBand, mergedData mergedFamilyEvents) {
 	for i := range days {
 		sort.SliceStable(days[i].Timed, func(a, b int) bool {
+			ma := eventMinutesForSort(days[i].Timed[a].Start)
+			mb := eventMinutesForSort(days[i].Timed[b].Start)
+			if ma != mb {
+				return ma < mb
+			}
 			return days[i].Timed[a].Start < days[i].Timed[b].Start
 		})
 		if maxVisible > 0 && len(days[i].Timed) > maxVisible {
@@ -869,22 +927,76 @@ func defaultHoursBand(timeFormat ...string) HoursBand {
 // (floored to 30-minute intervals for clean timeline alignment), with a minimum 4-hour
 // window and a fallback to 07:00–21:00 when no events or only late events exist.
 func resolveFamilyHoursBand(cfg map[string]any, events []provider.CalendarEvent, dayIndex map[string]int, loc *time.Location) HoursBand {
-	if band, ok := parseExplicitHoursBand(cfg); ok {
-		return band
-	}
-
 	timeFormat := stringOr(cfg, "time_format", "24h")
-
 	if loc == nil {
 		loc = time.UTC
 	}
 
-	defaultBand := defaultHoursBand(timeFormat)
-	endH := defaultBand.EndHour
-	endM := defaultBand.EndMinute
-	endTotal := endH*60 + endM
+	var band HoursBand
+	if explicitBand, ok := parseExplicitHoursBand(cfg); ok {
+		band = explicitBand
+	} else {
+		defaultBand := defaultHoursBand(timeFormat)
+		endH := defaultBand.EndHour
+		endM := defaultBand.EndMinute
+		endTotal := endH*60 + endM
 
-	earliestMinutes := -1
+		earliestMinutes := -1
+		for _, ev := range events {
+			if ev.AllDay {
+				continue
+			}
+			tStart, ok := parseFamilyTime(ev.Start)
+			if !ok {
+				continue
+			}
+			startLocal := tStart.In(loc)
+			dateStr := startLocal.Format("2006-01-02")
+			if _, inWeek := dayIndex[dateStr]; !inWeek {
+				continue
+			}
+			mins := startLocal.Hour()*60 + startLocal.Minute()
+			if earliestMinutes == -1 || mins < earliestMinutes {
+				earliestMinutes = mins
+			}
+		}
+
+		// If no timed events start in the week, or if the window would be less than 4 hours (240 mins),
+		// fall back to default 07:00.
+		startH := defaultBand.StartHour
+		startM := defaultBand.StartMinute
+		if earliestMinutes >= 0 {
+			floorMins := (earliestMinutes / 30) * 30
+			if endTotal-floorMins >= 240 {
+				startH = floorMins / 60
+				startM = floorMins % 60
+			}
+		}
+
+		band = newHoursBand(startH, startM, endH, endM, timeFormat)
+	}
+
+	return applyCollapsedMiddayGaps(band, events, dayIndex, loc, timeFormat)
+}
+
+func applyCollapsedMiddayGaps(band HoursBand, events []provider.CalendarEvent, dayIndex map[string]int, loc *time.Location, timeFormat string) HoursBand {
+	if len(events) == 0 || len(dayIndex) == 0 {
+		return band
+	}
+	if loc == nil {
+		loc = time.UTC
+	}
+
+	firstActiveHour := band.StartHour
+	if band.StartMinute > 0 {
+		firstActiveHour++
+	}
+	lastActiveHour := band.EndHour
+	if lastActiveHour-firstActiveHour < minCollapsedGapHours+2 {
+		return band
+	}
+
+	occupied := make(map[int]bool, lastActiveHour-firstActiveHour)
 	for _, ev := range events {
 		if ev.AllDay {
 			continue
@@ -893,30 +1005,194 @@ func resolveFamilyHoursBand(cfg map[string]any, events []provider.CalendarEvent,
 		if !ok {
 			continue
 		}
-		startLocal := tStart.In(loc)
-		dateStr := startLocal.Format("2006-01-02")
-		if _, inWeek := dayIndex[dateStr]; !inWeek {
+		tEnd, ok2 := parseFamilyTime(ev.End)
+		if !ok2 || !tEnd.After(tStart) {
+			tEnd = tStart.Add(30 * time.Minute)
+		}
+		evDates := timedEventDateRange(ev, loc)
+		for _, dStr := range evDates {
+			if _, inWindow := dayIndex[dStr]; !inWindow {
+				continue
+			}
+			dayTime, err := time.ParseInLocation("2006-01-02", dStr, loc)
+			if err != nil {
+				continue
+			}
+			for h := firstActiveHour; h < lastActiveHour; h++ {
+				slotStart := time.Date(dayTime.Year(), dayTime.Month(), dayTime.Day(), h, 0, 0, 0, loc)
+				slotEnd := slotStart.Add(time.Hour)
+				if tStart.In(loc).Before(slotEnd) && tEnd.In(loc).After(slotStart) {
+					occupied[h] = true
+				}
+			}
+		}
+	}
+
+	minOccupied := -1
+	maxOccupied := -1
+	for h := firstActiveHour; h < lastActiveHour; h++ {
+		if occupied[h] {
+			if minOccupied == -1 || h < minOccupied {
+				minOccupied = h
+			}
+			if maxOccupied == -1 || h > maxOccupied {
+				maxOccupied = h
+			}
+		}
+	}
+
+	// Only collapse interior spans strictly between the first and last active event hours.
+	if minOccupied == -1 || maxOccupied <= minOccupied+minCollapsedGapHours {
+		return band
+	}
+
+	var gaps []CollapsedHoursGap
+	runStart := -1
+	for h := minOccupied + 1; h <= maxOccupied; h++ {
+		if !occupied[h] && h < maxOccupied {
+			if runStart == -1 {
+				runStart = h
+			}
+		} else if runStart != -1 {
+			if h-runStart >= minCollapsedGapHours {
+				startLbl := formatTimeLabel(runStart, 0, timeFormat)
+				endLbl := formatTimeLabel(h, 0, timeFormat)
+				gaps = append(gaps, CollapsedHoursGap{
+					StartHour: runStart,
+					EndHour:   h,
+					StartStr:  fmt.Sprintf("%02d:00", runStart),
+					EndStr:    fmt.Sprintf("%02d:00", h),
+					Label:     fmt.Sprintf("%s – %s", startLbl, endLbl),
+				})
+			}
+			runStart = -1
+		}
+	}
+
+	if len(gaps) == 0 {
+		return band
+	}
+
+	band.CollapsedGaps = gaps
+	for i := range band.CollapsedGaps {
+		g := &band.CollapsedGaps[i]
+		top := mapMinutesToCanvasPct(float64(g.StartHour*60), band)
+		bot := mapMinutesToCanvasPct(float64(g.EndHour*60), band)
+		g.TopPct = roundToTwoDecimals(top)
+		g.HeightPct = roundToTwoDecimals(bot - top)
+	}
+	band.TimelineMarkers = generateTimelineMarkersWithGaps(band, timeFormat)
+	return band
+}
+
+func mapMinutesToCanvasPct(mins float64, hours HoursBand) float64 {
+	startTotal := float64(hours.StartHour*60 + hours.StartMinute)
+	endTotal := float64(hours.EndHour*60 + hours.EndMinute)
+	if endTotal <= startTotal {
+		return 0.0
+	}
+	if mins <= startTotal {
+		return 0.0
+	}
+	if mins >= endTotal {
+		return 100.0
+	}
+	if len(hours.CollapsedGaps) == 0 {
+		return ((mins - startTotal) / (endTotal - startTotal)) * 100.0
+	}
+
+	compressedGapMins := collapsedGapHourEquivalent * 60.0
+	totalEff := 0.0
+	effAtMins := 0.0
+	cur := startTotal
+
+	for _, g := range hours.CollapsedGaps {
+		gStart := math.Max(float64(g.StartHour*60), cur)
+		gEnd := math.Min(float64(g.EndHour*60), endTotal)
+		if gEnd <= gStart {
 			continue
 		}
-		mins := startLocal.Hour()*60 + startLocal.Minute()
-		if earliestMinutes == -1 || mins < earliestMinutes {
-			earliestMinutes = mins
+		if gStart > cur {
+			seg := gStart - cur
+			if mins > cur {
+				effAtMins += math.Min(mins, gStart) - cur
+			}
+			totalEff += seg
 		}
+		gapActual := gEnd - gStart
+		if mins > gStart {
+			inGap := math.Min(mins, gEnd) - gStart
+			effAtMins += (inGap / gapActual) * compressedGapMins
+		}
+		totalEff += compressedGapMins
+		cur = gEnd
 	}
 
-	// If no timed events start in the week, or if the window would be less than 4 hours (240 mins),
-	// fall back to default 07:00.
-	startH := defaultBand.StartHour
-	startM := defaultBand.StartMinute
-	if earliestMinutes >= 0 {
-		floorMins := (earliestMinutes / 30) * 30
-		if endTotal-floorMins >= 240 {
-			startH = floorMins / 60
-			startM = floorMins % 60
+	if endTotal > cur {
+		seg := endTotal - cur
+		if mins > cur {
+			effAtMins += math.Min(mins, endTotal) - cur
 		}
+		totalEff += seg
 	}
 
-	return newHoursBand(startH, startM, endH, endM, timeFormat)
+	if totalEff <= 0 {
+		return 0.0
+	}
+	return (effAtMins / totalEff) * 100.0
+}
+
+func generateTimelineMarkersWithGaps(hours HoursBand, timeFormat string) []TimelineMarker {
+	hStart, mStart, hEnd, mEnd := hours.StartHour, hours.StartMinute, hours.EndHour, hours.EndMinute
+	startTotal := hStart*60 + mStart
+	endTotal := hEnd*60 + mEnd
+	if endTotal <= startTotal {
+		return nil
+	}
+
+	isInteriorGapHour := func(h int) bool {
+		for _, g := range hours.CollapsedGaps {
+			if h > g.StartHour && h < g.EndHour {
+				return true
+			}
+		}
+		return false
+	}
+
+	markers := make([]TimelineMarker, 0, (hEnd-hStart)+2)
+	markers = append(markers, TimelineMarker{
+		Label:   formatTimeLabel(hStart, mStart, timeFormat),
+		TopPct:  0.0,
+		IsStart: true,
+	})
+
+	firstHour := hStart + 1
+	for h := firstHour; h < hEnd; h++ {
+		if isInteriorGapHour(h) {
+			continue
+		}
+		pct := mapMinutesToCanvasPct(float64(h*60), hours)
+		markers = append(markers, TimelineMarker{
+			Label:  formatTimeLabel(h, 0, timeFormat),
+			TopPct: roundToTwoDecimals(pct),
+		})
+	}
+
+	if mEnd > 0 && hEnd*60 > startTotal && !isInteriorGapHour(hEnd) {
+		pct := mapMinutesToCanvasPct(float64(hEnd*60), hours)
+		markers = append(markers, TimelineMarker{
+			Label:  formatTimeLabel(hEnd, 0, timeFormat),
+			TopPct: roundToTwoDecimals(pct),
+		})
+	}
+
+	markers = append(markers, TimelineMarker{
+		Label:  formatTimeLabel(hEnd, mEnd, timeFormat),
+		TopPct: 100.0,
+		IsEnd:  true,
+	})
+
+	return markers
 }
 
 func generateTimelineMarkers(hStart, mStart, hEnd, mEnd int, timeFormat ...string) []TimelineMarker {
@@ -1017,10 +1293,20 @@ func parseClockTime(v string) (hour, minute int, ok bool) {
 	return h, 0, true
 }
 
-func calculateVisibleEventPosition(effStart, effEnd, wStart, wEnd, start, end time.Time, wDuration float64) (float64, float64) {
+func calculateVisibleEventPosition(effStart, effEnd, wStart, wEnd, start, end time.Time, wDuration float64, hours HoursBand) (float64, float64) {
 	if effEnd.After(effStart) && !start.After(wEnd) && !end.Before(wStart) {
-		topPct := (effStart.Sub(wStart).Seconds() / wDuration) * 100.0
-		heightPct := (effEnd.Sub(effStart).Seconds() / wDuration) * 100.0
+		var topPct, heightPct float64
+		if len(hours.CollapsedGaps) > 0 {
+			startTotal := float64(hours.StartHour*60 + hours.StartMinute)
+			effStartMins := startTotal + effStart.Sub(wStart).Minutes()
+			effEndMins := startTotal + effEnd.Sub(wStart).Minutes()
+			topPct = mapMinutesToCanvasPct(effStartMins, hours)
+			botPct := mapMinutesToCanvasPct(effEndMins, hours)
+			heightPct = botPct - topPct
+		} else {
+			topPct = (effStart.Sub(wStart).Seconds() / wDuration) * 100.0
+			heightPct = (effEnd.Sub(effStart).Seconds() / wDuration) * 100.0
+		}
 		// Ensure visible events have at least 2.0% height for legibility and tap targets
 		if heightPct < 2.0 {
 			heightPct = 2.0
@@ -1079,7 +1365,7 @@ func ComputeDayEventPosition(eventStart, eventEnd time.Time, day time.Time, hour
 		effEnd = wEnd
 	}
 
-	topPct, heightPct = calculateVisibleEventPosition(effStart, effEnd, wStart, wEnd, start, end, wDuration)
+	topPct, heightPct = calculateVisibleEventPosition(effStart, effEnd, wStart, wEnd, start, end, wDuration, hours)
 	topPct = roundToTwoDecimals(topPct)
 	heightPct = roundToTwoDecimals(heightPct)
 	return topPct, heightPct, isEarlyEdge, isLateEdge
@@ -1225,6 +1511,7 @@ func BuildFamilyMonthView(data any, cfg map[string]any, dims domain.Dimension, n
 	}
 
 	snapshot := extractCalendarSnapshot(data)
+	timeFormat := stringOr(cfg, "time_format", "24h")
 	mergedData := mergeFamilyEvents(
 		snapshot.Events,
 		members,
@@ -1232,6 +1519,7 @@ func BuildFamilyMonthView(data any, cfg map[string]any, dims domain.Dimension, n
 		sharedColor,
 		loc,
 		matchWindowDates(dayIndex, loc),
+		timeFormat,
 	)
 
 	populateFamilyMonthDays(days, mergedData, dayIndex, members, sharedColor, dims)
@@ -1355,6 +1643,11 @@ func populateFamilyMonthDays(
 		sort.SliceStable(evs, func(a, b int) bool {
 			if evs[a].AllDay != evs[b].AllDay {
 				return evs[a].AllDay && !evs[b].AllDay
+			}
+			ma := eventMinutesForSort(evs[a].Start)
+			mb := eventMinutesForSort(evs[b].Start)
+			if ma != mb {
+				return ma < mb
 			}
 			if evs[a].Start != evs[b].Start {
 				return evs[a].Start < evs[b].Start
