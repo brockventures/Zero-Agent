@@ -199,6 +199,7 @@ class GotchiBleRelayService : Service() {
 
         const val ACTION_RESCAN = "ventures.brock.gotchi.forwarder.ACTION_RESCAN"
         const val ACTION_DISCONNECT = "ventures.brock.gotchi.forwarder.ACTION_DISCONNECT"
+        const val ACTION_SYNC_CONFIG = "ventures.brock.gotchi.forwarder.ACTION_SYNC_CONFIG"
 
         @Volatile
         var connectionStatus: String = "IDLE"
@@ -307,13 +308,17 @@ class GotchiBleRelayService : Service() {
             disconnectAndDisableRelay()
             return START_NOT_STICKY
         }
+        val audioModeExtra = intent?.getStringExtra(KEY_AUDIO_OUT_MODE)
         intent?.let {
             val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
             it.getStringExtra(KEY_GATEWAY_URL)?.let { url -> prefs.putString(KEY_GATEWAY_URL, url) }
             it.getStringExtra(KEY_BEARER_TOKEN)?.let { tok -> prefs.putString(KEY_BEARER_TOKEN, tok) }
             it.getStringExtra(KEY_NODE_ID)?.let { node -> prefs.putString(KEY_NODE_ID, node) }
-            it.getStringExtra(KEY_AUDIO_OUT_MODE)?.let { mode -> prefs.putString(KEY_AUDIO_OUT_MODE, mode) }
+            audioModeExtra?.let { mode -> prefs.putString(KEY_AUDIO_OUT_MODE, mode) }
             prefs.apply()
+        }
+        if (intent?.action == ACTION_SYNC_CONFIG || (!audioModeExtra.isNullOrBlank() && isTxSubscribed)) {
+            pushAudioOutModeToGotchi(audioModeExtra)
         }
         if (intent?.action == ACTION_RESCAN) {
             relayDisabled = false
@@ -758,6 +763,10 @@ class GotchiBleRelayService : Service() {
                     Log.i(TAG, "CCCD (0x2902) notification subscription confirmed (GATT_SUCCESS); requesting MTU ${BleFramingCodec.DEFAULT_GATT_MTU}")
                     clearDeviceBusyFlag(gatt)
                     gatt.requestMtu(BleFramingCodec.DEFAULT_GATT_MTU)
+                    serviceScope.launch {
+                        delay(350)
+                        pushAudioOutModeToGotchi()
+                    }
                     startNotifyPollLoop()
                 } else {
                     Log.w(TAG, "CCCD (0x2902) write failed with status=$status; supervisor will retry")
@@ -1037,9 +1046,13 @@ class GotchiBleRelayService : Service() {
         val nodeId = commitMeta?.optString("node_id")?.takeIf { it.isNotBlank() }
             ?: prefs.getString(KEY_NODE_ID, DEFAULT_NODE_ID)
             ?: DEFAULT_NODE_ID
-        val audioOutMode = commitMeta?.optString("audio_out_mode")?.takeIf { it.isNotBlank() }
-            ?: prefs.getString(KEY_AUDIO_OUT_MODE, DEFAULT_AUDIO_OUT_MODE)
-            ?: DEFAULT_AUDIO_OUT_MODE
+        val prefAudioOutMode = prefs.getString(KEY_AUDIO_OUT_MODE, null)?.takeIf { it.isNotBlank() }
+        val commitAudioOutMode = commitMeta?.optString("audio_out_mode")?.takeIf { it.isNotBlank() }
+        val audioOutMode = if (prefAudioOutMode == "ble_phone") {
+            "ble_phone"
+        } else {
+            commitAudioOutMode ?: prefAudioOutMode ?: DEFAULT_AUDIO_OUT_MODE
+        }
         val mode = commitMeta?.optString("mode")?.takeIf { it.isNotBlank() } ?: "interact"
         val prompt = commitMeta?.optString("prompt")?.takeIf { it.isNotBlank() }
 
@@ -1296,6 +1309,27 @@ class GotchiBleRelayService : Service() {
             .build()
         track.write(pcmBytes, 0, pcmBytes.size)
         track.play()
+    }
+
+    internal fun pushAudioOutModeToGotchi(modeOverride: String? = null): Boolean {
+        val mode = modeOverride?.takeIf { it.isNotBlank() }
+            ?: runCatching {
+                getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .getString(KEY_AUDIO_OUT_MODE, DEFAULT_AUDIO_OUT_MODE)
+            }.getOrNull()?.takeIf { it.isNotBlank() }
+            ?: DEFAULT_AUDIO_OUT_MODE
+        val jsonStr = runCatching {
+            JSONObject()
+                .put("cmd", "set_config")
+                .put("audio_out_mode", mode)
+                .toString()
+        }.getOrNull() ?: """{"cmd":"set_config","audio_out_mode":"$mode"}"""
+        val jsonBytes = jsonStr.toByteArray(Charsets.UTF_8)
+        if (isTxSubscribed && activeGatt != null && rxCharacteristic != null) {
+            sendBleFrame(BleFramingCodec.FrameType.CONTROL, jsonBytes)
+            return true
+        }
+        return false
     }
 
     private fun sendBleFrame(

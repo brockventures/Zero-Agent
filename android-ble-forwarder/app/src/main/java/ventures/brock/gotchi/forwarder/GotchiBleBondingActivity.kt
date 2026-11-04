@@ -566,7 +566,25 @@ class GotchiBleBondingActivity : Activity() {
                 .setTitle("GOTCHI SETTINGS & BLE RELAY")
                 .setView(settingsLayout)
                 .setPositiveButton("SAVE & CLOSE") { dialog, _ ->
-                    savePreferences()
+                    val audioMode = savePreferences()
+                    val prefs = getSharedPreferences(GotchiBleRelayService.PREFS_NAME, Context.MODE_PRIVATE)
+                    if (prefs.getBoolean(GotchiBleRelayService.KEY_RELAY_ENABLED, true)) {
+                        val url = urlEditText.text.toString().trim().ifBlank { DEFAULT_FALLBACK_URL }
+                        val token = tokenEditText.text.toString().trim()
+                        val node = nodeEditText.text.toString().trim().ifBlank { GotchiBleRelayService.DEFAULT_NODE_ID }
+                        val syncIntent = Intent(this, GotchiBleRelayService::class.java).apply {
+                            action = GotchiBleRelayService.ACTION_SYNC_CONFIG
+                            putExtra(GotchiBleRelayService.KEY_GATEWAY_URL, url)
+                            putExtra(GotchiBleRelayService.KEY_BEARER_TOKEN, token)
+                            putExtra(GotchiBleRelayService.KEY_NODE_ID, node)
+                            putExtra(GotchiBleRelayService.KEY_AUDIO_OUT_MODE, audioMode)
+                        }
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(syncIntent)
+                        } else {
+                            startService(syncIntent)
+                        }
+                    }
                     dialog.dismiss()
                 }
                 .setNegativeButton("CANCEL", null)
