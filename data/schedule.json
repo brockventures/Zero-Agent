@@ -98,9 +98,9 @@
     "interval_seconds": 7200,
     "prompt": "Run the infrastructure heartbeat check using /workspace/tools/sidecars.py heartbeat. Post only if infrastructure is degraded (silent when healthy).",
     "catchup_if_missed": false,
-    "last_run_ts": 1793765653,
-    "last_run_at": "2026-11-03 08:14 PM PT",
-    "next_run_ts": 1793772853.0,
+    "last_run_ts": 1793772876,
+    "last_run_at": "2026-11-03 10:14 PM PT",
+    "next_run_ts": 1793780076.0,
     "channel_id": 1544955535722545253
   },
   {
@@ -141,9 +141,9 @@
     "prompt": "Run the nightly agenda & inbox triage briefing using /workspace/tools/sidecars.py triage. Present tomorrow's calendar agenda and priority unread emails.",
     "catchup_if_missed": true,
     "catchup_window_seconds": 7200,
-    "last_run_ts": 1793691025,
-    "last_run_at": "2026-11-02 11:30 PM PT",
-    "next_run_ts": 1793777400.0
+    "last_run_ts": 1793777425,
+    "last_run_at": "2026-11-03 11:30 PM PT",
+    "next_run_ts": 1793863800.0
   },
   {
     "id": "nas_logs",
@@ -471,9 +471,9 @@
     "interval_seconds": 300,
     "prompt": "Run the bridge liveness & gateway watchdog check using /workspace/tools/sidecars.py bridge_watchdog. Auto-heals and alerts only if degraded (silent when nominal).",
     "catchup_if_missed": false,
-    "last_run_ts": 1793772114,
-    "last_run_at": "2026-11-03 10:01 PM PT",
-    "next_run_ts": 1793772414.0,
+    "last_run_ts": 1793777516,
+    "last_run_at": "2026-11-03 11:31 PM PT",
+    "next_run_ts": 1793777816.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -485,9 +485,9 @@
     "channel_id": 1544953279664889888,
     "prompt": "Run the Host 2 and Host 1 PID & process headroom watchdog using /workspace/tools/sidecars.py pid_watchdog. Silent execution unless warning or critical threshold exceeded.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793771911,
-    "last_run_at": "2026-11-03 09:58 PM PT",
-    "next_run_ts": 1793772811.0
+    "last_run_ts": 1793777375,
+    "last_run_at": "2026-11-03 11:29 PM PT",
+    "next_run_ts": 1793778275.0
   },
   {
     "id": "agora_roguelike_pm",
@@ -685,9 +685,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the Arr queue & health watchdog using /workspace/tools/sidecars.py arr_queue.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793768935,
-    "last_run_at": "2026-11-03 09:08 PM PT",
-    "next_run_ts": 1793772535.0
+    "last_run_ts": 1793776159,
+    "last_run_at": "2026-11-03 11:09 PM PT",
+    "next_run_ts": 1793779759.0
   },
   {
     "id": "prowlarr_watchdog",
@@ -698,9 +698,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the Prowlarr indexer health watchdog using /workspace/tools/sidecars.py prowlarr.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793772004,
-    "last_run_at": "2026-11-03 10:00 PM PT",
-    "next_run_ts": 1793775604.0
+    "last_run_ts": 1793775749,
+    "last_run_at": "2026-11-03 11:02 PM PT",
+    "next_run_ts": 1793779349.0
   },
   {
     "id": "sabnzbd_watchdog",
@@ -711,9 +711,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the SABnzbd downloader & unpack watchdog using /workspace/tools/sidecars.py sabnzbd.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793772004,
-    "last_run_at": "2026-11-03 10:00 PM PT",
-    "next_run_ts": 1793775603.7706754
+    "last_run_ts": 1793775747,
+    "last_run_at": "2026-11-03 11:02 PM PT",
+    "next_run_ts": 1793779347.0
   },
   {
     "id": "nest_lock_watchdog",
@@ -724,9 +724,9 @@
     "channel_id": 1544953275877556334,
     "prompt": "Run the Nest lock & Homebridge self-healing watchdog using /workspace/tools/sidecars.py nest_lock.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793770385,
-    "last_run_at": "2026-11-03 09:33 PM PT",
-    "next_run_ts": 1793773985.0
+    "last_run_ts": 1793777594,
+    "last_run_at": "2026-11-03 11:33 PM PT",
+    "next_run_ts": 1793781194.0
   },
   {
     "id": "ha_reauth_watchdog",
@@ -737,9 +737,9 @@
     "channel_id": 1544953275877556334,
     "prompt": "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793768951,
-    "last_run_at": "2026-11-03 09:09 PM PT",
-    "next_run_ts": 1793772551.0
+    "last_run_ts": 1793776176,
+    "last_run_at": "2026-11-03 11:09 PM PT",
+    "next_run_ts": 1793779776.0
   },
   {
     "id": "google_tasks_sync",
@@ -749,9 +749,9 @@
     "interval_seconds": 1800,
     "prompt": "Run the Google Tasks two-way sync using /workspace/tools/sidecars.py tasks_sync. Silent sidecar execution (silent unless error).",
     "catchup_if_missed": false,
-    "last_run_ts": 1793771694,
-    "last_run_at": "2026-11-03 09:54 PM PT",
-    "next_run_ts": 1793773494.0
+    "last_run_ts": 1793777110,
+    "last_run_at": "2026-11-03 11:25 PM PT",
+    "next_run_ts": 1793778910.0
   },
   {
     "id": "quota_poller",
@@ -761,9 +761,9 @@
     "interval_seconds": 600,
     "prompt": "Run the 10-minute ground-truth quota usage poller using /workspace/tools/sidecars.py quota_poller. Captures live remaining fractions and cycle burn deltas.",
     "catchup_if_missed": false,
-    "last_run_ts": 1793771611,
-    "last_run_at": "2026-11-03 09:53 PM PT",
-    "next_run_ts": 1793772211.0
+    "last_run_ts": 1793777308,
+    "last_run_at": "2026-11-03 11:28 PM PT",
+    "next_run_ts": 1793777908.0
   },
   {
     "id": "personal_data_sync",
@@ -794,9 +794,9 @@
       23,
       7
     ],
-    "last_run_ts": 1793771914,
-    "last_run_at": "2026-11-03 09:58 PM PT",
-    "next_run_ts": 1793772214.0
+    "last_run_ts": 1793775679,
+    "last_run_at": "2026-11-03 11:01 PM PT",
+    "next_run_ts": 1793804400.0
   },
   {
     "id": "resident_agents_daily_tip",

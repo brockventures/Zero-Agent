@@ -2604,7 +2604,7 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
 def detect_repo_verification_script(worktree_dir: Path | str) -> Optional[str]:
     """Detect repo-level deterministic verification script if present in worktree.
 
-    Checks if `scripts/verify.sh` exists in the worktree and returns `sh scripts/verify.sh --lint-only`
+    Checks if `scripts/verify.sh` exists in the worktree and returns `sh scripts/verify.sh --staged`
     (or `sh scripts/verify.sh` when `FORGE_FULL_REPO_VERIFY=1` is set).
     """
     if not worktree_dir:
@@ -2615,7 +2615,7 @@ def detect_repo_verification_script(worktree_dir: Path | str) -> Optional[str]:
         if script_path.is_file():
             if os.environ.get("FORGE_FULL_REPO_VERIFY") == "1":
                 return "sh scripts/verify.sh"
-            return "sh scripts/verify.sh --lint-only"
+            return "sh scripts/verify.sh --staged"
     except Exception:
         pass
     return None
