@@ -31,6 +31,8 @@ import android.media.AudioTrack
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelUuid
@@ -38,12 +40,14 @@ import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -56,8 +60,105 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.NetworkInterface
+import java.net.URL
+import java.net.UnknownHostException
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+
+/**
+ * Tailscale/Cloudflare Fallback DNS Resolver for OkHttpClient.
+ *
+ * Ensures hostnames like 'gotchi.brock.ventures' resolve reliably even when
+ * Tailscale MagicDNS (100.100.100.100) or cellular DNS is unreachable or wedged.
+ * Resolution chain:
+ * 1. Standard Android system DNS (`Dns.SYSTEM`)
+ * 2. Cloudflare (1.1.1.1) and Google (8.8.8.8) DNS-over-HTTPS (DoH) via raw IP
+ * 3. Static bootstrap IP fallback (e.g. Cloudflare Anycast IPs for gotchi.brock.ventures)
+ */
+class FallbackDns(
+    private val staticFallbacks: Map<String, List<String>> = mapOf(
+        "gotchi.brock.ventures" to listOf("104.21.32.66", "172.67.184.64")
+    )
+) : Dns {
+    override fun lookup(hostname: String): List<InetAddress> {
+        // 1. Try system standard DNS first
+        try {
+            val addresses = Dns.SYSTEM.lookup(hostname)
+            if (addresses.isNotEmpty()) {
+                return addresses
+            }
+        } catch (ignored: Exception) {
+            // System DNS failed (e.g. Tailscale MagicDNS 100.100.100.100 unreachable on cellular)
+        }
+
+        // 2. Query Cloudflare (1.1.1.1) or Google (8.8.8.8) DoH over raw IP without recursive DNS
+        val dohAddresses = queryDoh(hostname)
+        if (dohAddresses.isNotEmpty()) {
+            return dohAddresses
+        }
+
+        // 3. Fall back to static bootstrap IPs
+        val fallbackIps = staticFallbacks[hostname.lowercase()]
+        if (!fallbackIps.isNullOrEmpty()) {
+            val parsed = fallbackIps.mapNotNull { ipStr ->
+                runCatching {
+                    val parts = ipStr.split('.').map { it.toInt().toByte() }.toByteArray()
+                    InetAddress.getByAddress(hostname, parts)
+                }.getOrNull()
+            }
+            if (parsed.isNotEmpty()) {
+                return parsed
+            }
+        }
+
+        throw UnknownHostException("Unable to resolve $hostname via system DNS, DoH, or static fallback")
+    }
+
+    private fun queryDoh(hostname: String): List<InetAddress> {
+        val dohUrls = listOf(
+            "https://1.1.1.1/dns-query?name=$hostname&type=A",
+            "https://8.8.8.8/resolve?name=$hostname&type=A"
+        )
+        for (urlStr in dohUrls) {
+            try {
+                val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 3000
+                    readTimeout = 3000
+                    setRequestProperty("Accept", "application/dns-json, application/json")
+                    instanceFollowRedirects = false
+                }
+                if (conn.responseCode == 200) {
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val json = JSONObject(body)
+                    val answers = json.optJSONArray("Answer")
+                    val list = mutableListOf<InetAddress>()
+                    if (answers != null) {
+                        for (i in 0 until answers.length()) {
+                            val item = answers.optJSONObject(i) ?: continue
+                            if (item.optInt("type") == 1) { // A record
+                                val ip = item.optString("data")
+                                if (ip.isNotBlank()) {
+                                    val parts = ip.split('.').map { it.toInt().toByte() }.toByteArray()
+                                    list.add(InetAddress.getByAddress(hostname, parts))
+                                }
+                            }
+                        }
+                    }
+                    if (list.isNotEmpty()) {
+                        return list
+                    }
+                }
+            } catch (ignored: Exception) {
+                // Try next DoH provider
+            }
+        }
+        return emptyList()
+    }
+}
 
 /**
  * Headless Android Foreground Service for GOTCHI V1 "Smart Pipe" BLE Companion Relay (F18 / T4.2).
@@ -66,7 +167,7 @@ import java.util.concurrent.TimeUnit
  * reverse proxy), plain LAN HTTP (`:8765`), or optional VPN — Tailscale is NOT required on the phone.
  *
  * Responsibilities:
- * 1. Scans and auto-bonds to the GOTCHI BLE GATT UART service (`6E400001-B5A3-F393-E0A9-E50E24DCCA9E`),
+ * 1. Scans and connects to the GOTCHI BLE GATT UART service (`6E400001-B5A3-F393-E0A9-E50E24DCCA9E`),
  *    requesting BLE 5.0 2M PHY and 512-byte ATT MTU.
  * 2. Reassembles binary-framed PTT uplink streams (`AUDIO_CHUNK`, `IMAGE_FRAME` 0..4, `TURN_COMMIT`)
  *    validated via CRC-16/CCITT header checks and IEEE 802.3 CRC-32 payload trailers.
@@ -108,6 +209,12 @@ class GotchiBleRelayService : Service() {
         @Volatile
         var isRelayTurnActive: Boolean = false
 
+        @Volatile
+        var isTxSubscribed: Boolean = false
+
+        const val HANDSHAKE_RETRY_INTERVAL_MS = 3000L
+        const val HANDSHAKE_MAX_ATTEMPTS = 6
+
         val SERVICE_UUID: UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
         val CHAR_TX_UUID: UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E") // GOTCHI -> Phone (Notify)
         val CHAR_RX_UUID: UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E") // Phone -> GOTCHI (Write)
@@ -126,6 +233,8 @@ class GotchiBleRelayService : Service() {
 
         const val OFFLINE_SPOOL_DIR = "offline_spool"
         const val MAX_OFFLINE_SPOOL_ITEMS = 64
+
+        const val ADB_TLS_SERVICE_TYPE = "_adb-tls-connect._tcp."
     }
 
     internal enum class PostOutcome {
@@ -137,6 +246,7 @@ class GotchiBleRelayService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val spoolMutex = Mutex()
     private val httpClient = OkHttpClient.Builder()
+        .dns(FallbackDns())
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(90, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -152,14 +262,23 @@ class GotchiBleRelayService : Service() {
     private var negotiatedMaxPayload: Int = BleFramingCodec.DEFAULT_MAX_PAYLOAD
     private var activeGatt: BluetoothGatt? = null
     private var rxCharacteristic: BluetoothGattCharacteristic? = null
+    private var handshakeSupervisorJob: Job? = null
     private var networkCallbackRegistered: Boolean = false
     private var notifyPollRunning: Boolean = false
     private var relayDisabled: Boolean = false
+
+    private var nsdManager: NsdManager? = null
+    private var adbDiscoveryListener: NsdManager.DiscoveryListener? = null
+    private var isAdbDiscoveryActive: Boolean = false
+    private var isResolvingAdb: Boolean = false
+    private var lastBeaconKey: String? = null
+    private var latestDiscoveredAdbPort: Int = 0
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             serviceScope.launch {
                 drainOfflineSpool()
+                checkAndReportAdbBeacon()
             }
         }
     }
@@ -176,6 +295,7 @@ class GotchiBleRelayService : Service() {
         startForegroundWithNotification("Scanning for GOTCHI over BLE...")
         registerConnectivityWatcher()
         startBleScan()
+        startAdbBeaconDiscovery()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -196,6 +316,7 @@ class GotchiBleRelayService : Service() {
             val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
             prefs.putBoolean(KEY_RELAY_ENABLED, true)
             prefs.apply()
+            startAdbBeaconDiscovery()
             triggerRescan()
         }
         serviceScope.launch {
@@ -207,10 +328,14 @@ class GotchiBleRelayService : Service() {
     private fun disconnectAndDisableRelay() {
         relayDisabled = true
         isRelayTurnActive = false
+        isTxSubscribed = false
+        handshakeSupervisorJob?.cancel()
+        handshakeSupervisorJob = null
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
         prefs.putBoolean(KEY_RELAY_ENABLED, false)
         prefs.apply()
 
+        stopAdbBeaconDiscovery()
         stopBleScan()
         activeGatt?.disconnect()
         activeGatt?.close()
@@ -226,6 +351,10 @@ class GotchiBleRelayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         isRelayTurnActive = false
+        isTxSubscribed = false
+        handshakeSupervisorJob?.cancel()
+        handshakeSupervisorJob = null
+        stopAdbBeaconDiscovery()
         unregisterConnectivityWatcher()
         stopBleScan()
         connectionStatus = "IDLE"
@@ -348,6 +477,9 @@ class GotchiBleRelayService : Service() {
     private fun triggerRescan() {
         if (relayDisabled) return
         isRelayTurnActive = false
+        isTxSubscribed = false
+        handshakeSupervisorJob?.cancel()
+        handshakeSupervisorJob = null
         stopBleScan()
         activeGatt?.disconnect()
         activeGatt?.close()
@@ -410,16 +542,87 @@ class GotchiBleRelayService : Service() {
                 ?: device.address
                 ?: "Gotchi"
             connectedDeviceName = devName
-
             connectionStatus = "CONNECTING"
             updateForegroundNotification("Connecting to $devName...")
             activeGatt = device.connectGatt(this@GotchiBleRelayService, true, gattCallback, BluetoothDevice.TRANSPORT_LE)
         }
     }
 
+    internal fun clearStaleBondIfNeeded(device: BluetoothDevice?): Boolean {
+        val dev = device ?: return false
+        if (dev.bondState != BluetoothDevice.BOND_BONDED) return false
+        return try {
+            val method = dev.javaClass.getMethod("removeBond")
+            val removed = method.invoke(dev) as? Boolean ?: false
+            Log.w(TAG, "Cleared stale OS bond via removeBond() on ${dev.address}: $removed")
+            removed
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to invoke removeBond() via reflection: ${e.message}")
+            false
+        }
+    }
+
+    internal fun writeCccdNotificationDescriptor(
+        gatt: BluetoothGatt,
+        txChar: BluetoothGattCharacteristic
+    ): Boolean {
+        gatt.setCharacteristicNotification(txChar, true)
+        val desc = txChar.getDescriptor(CCCD_UUID) ?: return false
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            @Suppress("DEPRECATION")
+            gatt.writeDescriptor(desc)
+        }
+    }
+
+    private fun launchHandshakeSupervisor(gatt: BluetoothGatt) {
+        handshakeSupervisorJob?.cancel()
+        handshakeSupervisorJob = serviceScope.launch {
+            gatt.requestMtu(BleFramingCodec.DEFAULT_GATT_MTU)
+            delay(600)
+            for (attempt in 1..HANDSHAKE_MAX_ATTEMPTS) {
+                if (isTxSubscribed || activeGatt !== gatt || relayDisabled) {
+                    return@launch
+                }
+                val service = gatt.getService(SERVICE_UUID)
+                val txChar = service?.getCharacteristic(CHAR_TX_UUID)
+                rxCharacteristic = service?.getCharacteristic(CHAR_RX_UUID) ?: rxCharacteristic
+                if (txChar != null) {
+                    Log.d(TAG, "Handshake supervisor attempt $attempt/$HANDSHAKE_MAX_ATTEMPTS: writing CCCD (0x2902)")
+                    writeCccdNotificationDescriptor(gatt, txChar)
+                } else {
+                    Log.d(TAG, "Handshake supervisor attempt $attempt/$HANDSHAKE_MAX_ATTEMPTS: calling discoverServices()")
+                    gatt.discoverServices()
+                }
+                delay(HANDSHAKE_RETRY_INTERVAL_MS)
+                if (isTxSubscribed || activeGatt !== gatt || relayDisabled) {
+                    return@launch
+                }
+            }
+            if (!isTxSubscribed && activeGatt === gatt && !relayDisabled) {
+                Log.w(TAG, "CCCD subscription failed after $HANDSHAKE_MAX_ATTEMPTS attempts (SMP encryption stall)")
+                val dev = runCatching { gatt.device }.getOrNull()
+                if (dev != null && dev.bondState == BluetoothDevice.BOND_BONDED) {
+                    clearStaleBondIfNeeded(dev)
+                }
+                runCatching { gatt.disconnect() }
+                runCatching { gatt.close() }
+                if (activeGatt === gatt) {
+                    activeGatt = null
+                    rxCharacteristic = null
+                }
+                scheduleReconnect()
+            }
+        }
+    }
+
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                isTxSubscribed = false
                 connectionStatus = "CONNECTED"
                 val devName = runCatching { gatt.device.name }.getOrNull()?.takeIf { it.isNotBlank() }
                     ?: gatt.device.address
@@ -433,9 +636,16 @@ class GotchiBleRelayService : Service() {
                         BluetoothDevice.PHY_OPTION_NO_PREFERRED
                     )
                 }
-                gatt.requestMtu(BleFramingCodec.DEFAULT_GATT_MTU)
+                launchHandshakeSupervisor(gatt)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isRelayTurnActive = false
+                isTxSubscribed = false
+                handshakeSupervisorJob?.cancel()
+                handshakeSupervisorJob = null
+                runCatching { gatt.close() }
+                if (activeGatt === gatt) {
+                    activeGatt = null
+                }
                 connectionStatus = if (relayDisabled) "DISABLED" else "DISCONNECTED"
                 connectedDeviceName = ""
                 if (!relayDisabled) {
@@ -457,7 +667,9 @@ class GotchiBleRelayService : Service() {
                     BleFramingCodec.DEFAULT_MAX_PAYLOAD
                 )
             }
-            gatt.discoverServices()
+            if (!isTxSubscribed) {
+                gatt.discoverServices()
+            }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -465,12 +677,36 @@ class GotchiBleRelayService : Service() {
             val service = gatt.getService(SERVICE_UUID) ?: return
             rxCharacteristic = service.getCharacteristic(CHAR_RX_UUID)
             val txChar = service.getCharacteristic(CHAR_TX_UUID) ?: return
-            gatt.setCharacteristicNotification(txChar, true)
-            txChar.getDescriptor(CCCD_UUID)?.let { desc ->
-                desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                gatt.writeDescriptor(desc)
-            }
+            writeCccdNotificationDescriptor(gatt, txChar)
             startNotifyPollLoop()
+        }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            if (descriptor.uuid == CCCD_UUID) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    isTxSubscribed = true
+                    handshakeSupervisorJob?.cancel()
+                    handshakeSupervisorJob = null
+                    Log.i(TAG, "CCCD (0x2902) notification subscription confirmed (GATT_SUCCESS)")
+                    startNotifyPollLoop()
+                } else {
+                    Log.w(TAG, "CCCD (0x2902) write failed with status=$status; supervisor will retry")
+                }
+            }
+        }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            if (characteristic.uuid == CHAR_TX_UUID) {
+                handleIncomingBlePacket(value)
+            }
         }
 
         @Deprecated("Deprecated in Java")
@@ -479,6 +715,7 @@ class GotchiBleRelayService : Service() {
             characteristic: BluetoothGattCharacteristic
         ) {
             if (characteristic.uuid == CHAR_TX_UUID) {
+                @Suppress("DEPRECATION")
                 handleIncomingBlePacket(characteristic.value ?: return)
             }
         }
@@ -529,15 +766,8 @@ class GotchiBleRelayService : Service() {
                     audioStreamBuffer.reset()
                     audioStreamIsAdpcm = false
                     imageFrames.clear()
-                    val wavBytes = transcodeUplinkAudioIfNeeded(rawAudioBytes, isAdpcm)
                     val locationMeta = readCoarseLocationMeta()
-                    serviceScope.launch {
-                        try {
-                            forwardTurnToGateway(wavBytes, capturedImages, commitMeta, locationMeta)
-                        } finally {
-                            isRelayTurnActive = false
-                        }
-                    }
+                    handleTurnCommit(rawAudioBytes, isAdpcm, capturedImages, commitMeta, locationMeta)
                 }
                 BleFramingCodec.FrameType.CANCEL -> {
                     isRelayTurnActive = false
@@ -565,6 +795,7 @@ class GotchiBleRelayService : Service() {
                 .put("detail", e.message ?: "framing_error")
                 .toString()
             sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, errJson.toByteArray(Charsets.UTF_8))
+            emitTerminalDoneToBle()
         }
     }
 
@@ -678,9 +909,36 @@ class GotchiBleRelayService : Service() {
         }
     }
 
+    internal fun handleTurnCommit(
+        rawAudioBytes: ByteArray,
+        isAdpcm: Boolean,
+        capturedImages: Map<Int, ByteArray>,
+        commitMeta: JSONObject?,
+        locationMeta: JSONObject?
+    ) {
+        val wavBytes = transcodeUplinkAudioIfNeeded(rawAudioBytes, isAdpcm)
+        serviceScope.launch {
+            try {
+                forwardTurnToGateway(wavBytes, capturedImages, commitMeta, locationMeta)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Turn forwarding failed: ${t.message}", t)
+                emitTerminalDoneToBle()
+            } finally {
+                isRelayTurnActive = false
+            }
+        }
+    }
+
+    internal fun emitTerminalDoneToBle() {
+        val donePayload = "{\"type\":\"done\"}"
+        val doneEvt = "event: done\ndata: $donePayload\n\n"
+        sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, doneEvt.toByteArray(Charsets.UTF_8))
+    }
+
     private fun emitOfflineQueuedToBle() {
         val statusEvt = "event: status\ndata: {\"status\":\"offline_queued\",\"spooled\":true}\n\n"
-        val doneEvt = "event: done\ndata: {\"offline_queued\":true,\"spooled\":true}\n\n"
+        val donePayload = "{\"type\":\"done\",\"offline_queued\":true,\"spooled\":true}"
+        val doneEvt = "event: done\ndata: $donePayload\n\n"
         sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, statusEvt.toByteArray(Charsets.UTF_8))
         sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, doneEvt.toByteArray(Charsets.UTF_8))
     }
@@ -694,12 +952,16 @@ class GotchiBleRelayService : Service() {
     ): PostOutcome {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val configuredUrl = prefs.getString(KEY_GATEWAY_URL, DEFAULT_GATEWAY_URL)?.trim()
-        val rawGatewayUrl = if (!configuredUrl.isNullOrBlank() && configuredUrl != DEFAULT_GATEWAY_URL) {
+        val rawGatewayUrl = if (!configuredUrl.isNullOrBlank()) {
             configuredUrl
         } else {
-            commitMeta?.optString("hub_url")?.takeIf { it.isNotBlank() }
-                ?: configuredUrl?.takeIf { it.isNotBlank() }
-                ?: DEFAULT_GATEWAY_URL
+            val fwUrl = commitMeta?.optString("hub_url")?.takeIf { it.isNotBlank() }
+                ?: commitMeta?.optString("gateway_url")?.takeIf { it.isNotBlank() }
+            if (!fwUrl.isNullOrBlank() && !fwUrl.contains(".local") && !fwUrl.startsWith("http://192.168.") && !fwUrl.startsWith("http://10.") && !fwUrl.startsWith("http://172.")) {
+                fwUrl
+            } else {
+                DEFAULT_GATEWAY_URL
+            }
         }
         val gatewayUrl = rawGatewayUrl.removeSuffix("/api/voice/interact").trimEnd('/')
         val bearerToken = prefs.getString(KEY_BEARER_TOKEN, "") ?: ""
@@ -792,6 +1054,7 @@ class GotchiBleRelayService : Service() {
                             .put("status", code)
                             .toString()
                         sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, errPayload.toByteArray(Charsets.UTF_8))
+                        emitTerminalDoneToBle()
                     }
                     return if (isRetryableStatus) PostOutcome.RETRYABLE_FAILURE else PostOutcome.PERMANENT_FAILURE
                 }
@@ -799,16 +1062,26 @@ class GotchiBleRelayService : Service() {
                 // HTTP 200 headers received: gateway has accepted and started executing the turn.
                 // Never spool after this point if the SSE read drops mid-stream, avoiding duplicate execution.
                 responseStarted = true
-                val body = response.body ?: return PostOutcome.DELIVERED
+                val body = response.body
+                if (body == null) {
+                    if (!isReplay) {
+                        emitTerminalDoneToBle()
+                    }
+                    return PostOutcome.DELIVERED
+                }
                 val reader = BufferedReader(InputStreamReader(body.byteStream(), Charsets.UTF_8))
                 var currentEvent = "message"
                 val dataLines = mutableListOf<String>()
+                var sawDoneEvent = false
 
                 while (true) {
                     val line = reader.readLine() ?: break
                     if (line.isEmpty()) {
                         if (dataLines.isNotEmpty()) {
                             val rawData = dataLines.joinToString("\n")
+                            if (currentEvent == "done") {
+                                sawDoneEvent = true
+                            }
                             if (!isReplay) {
                                 handleSseEvent(currentEvent, rawData, audioOutMode)
                             }
@@ -820,6 +1093,9 @@ class GotchiBleRelayService : Service() {
                     } else if (line.startsWith("data:")) {
                         dataLines.add(line.removePrefix("data:").trim())
                     }
+                }
+                if (!isReplay && !sawDoneEvent) {
+                    emitTerminalDoneToBle()
                 }
                 PostOutcome.DELIVERED
             }
@@ -834,6 +1110,7 @@ class GotchiBleRelayService : Service() {
                         .put("detail", "stream_interrupted")
                         .toString()
                     sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, errPayload.toByteArray(Charsets.UTF_8))
+                    emitTerminalDoneToBle()
                 }
                 PostOutcome.DELIVERED
             } else if (!isReplay) {
@@ -850,6 +1127,7 @@ class GotchiBleRelayService : Service() {
                     .put("detail", e.message ?: "gateway_unreachable")
                     .toString()
                 sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, errPayload.toByteArray(Charsets.UTF_8))
+                emitTerminalDoneToBle()
             }
             if (responseStarted) {
                 PostOutcome.DELIVERED
@@ -860,6 +1138,14 @@ class GotchiBleRelayService : Service() {
             }
         }
     }
+
+    internal suspend fun postVoiceInteract(
+        wavBytes: ByteArray,
+        images: Map<Int, ByteArray>,
+        commitMeta: JSONObject?,
+        locationMeta: JSONObject?,
+        isReplay: Boolean
+    ): PostOutcome = executeGatewayPost(wavBytes, images, commitMeta, locationMeta, isReplay)
 
     internal fun transcodeDownlinkAudioEventToAdpcm(eventType: String, rawData: String): String {
         if (eventType != "sentence" && eventType != "audio_chunk") return rawData
@@ -961,9 +1247,19 @@ class GotchiBleRelayService : Service() {
         )
         downlinkSeqNum = nextSeq
         for (pkt in packets) {
-            rxChar.value = pkt
-            rxChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            gatt.writeCharacteristic(rxChar)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(
+                    rxChar,
+                    pkt,
+                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                rxChar.value = pkt
+                rxChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                @Suppress("DEPRECATION")
+                gatt.writeCharacteristic(rxChar)
+            }
         }
     }
 
@@ -1030,6 +1326,219 @@ class GotchiBleRelayService : Service() {
         runCatching {
             httpClient.newCall(reqBuilder.build()).execute().close()
         }
+    }
+
+    // --- Wireless ADB Port Beacon ---
+
+    internal fun startAdbBeaconDiscovery() {
+        if (isAdbDiscoveryActive) return
+        val mgr = getSystemService(Context.NSD_SERVICE) as? NsdManager ?: return
+        nsdManager = mgr
+
+        val listener = object : NsdManager.DiscoveryListener {
+            override fun onDiscoveryStarted(regType: String) {
+                isAdbDiscoveryActive = true
+                Log.d(TAG, "ADB TLS discovery started: $regType")
+            }
+
+            override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                val serviceType = serviceInfo.serviceType ?: ""
+                if (!serviceType.contains("_adb-tls-connect")) return
+                Log.d(TAG, "ADB TLS service found: ${serviceInfo.serviceName}")
+                resolveAdbService(serviceInfo)
+            }
+
+            override fun onServiceLost(serviceInfo: NsdServiceInfo) {
+                Log.d(TAG, "ADB TLS service lost: ${serviceInfo.serviceName}")
+            }
+
+            override fun onDiscoveryStopped(serviceType: String) {
+                isAdbDiscoveryActive = false
+                Log.d(TAG, "ADB TLS discovery stopped: $serviceType")
+            }
+
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                isAdbDiscoveryActive = false
+                Log.w(TAG, "ADB TLS discovery start failed: $errorCode")
+                runCatching { nsdManager?.stopServiceDiscovery(this) }
+            }
+
+            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
+                Log.w(TAG, "ADB TLS discovery stop failed: $errorCode")
+            }
+        }
+
+        adbDiscoveryListener = listener
+        runCatching {
+            mgr.discoverServices(
+                ADB_TLS_SERVICE_TYPE,
+                NsdManager.PROTOCOL_DNS_SD,
+                listener
+            )
+        }.onFailure { e ->
+            Log.w(TAG, "Failed to start ADB discovery: ${e.message}")
+            isAdbDiscoveryActive = false
+        }
+    }
+
+    internal fun stopAdbBeaconDiscovery() {
+        val listener = adbDiscoveryListener ?: return
+        adbDiscoveryListener = null
+        isAdbDiscoveryActive = false
+        runCatching {
+            nsdManager?.stopServiceDiscovery(listener)
+        }
+    }
+
+    private fun resolveAdbService(serviceInfo: NsdServiceInfo) {
+        if (isResolvingAdb) return
+        val mgr = nsdManager ?: return
+        isResolvingAdb = true
+        try {
+            mgr.resolveService(serviceInfo, object : NsdManager.ResolveListener {
+                override fun onResolveFailed(info: NsdServiceInfo?, errorCode: Int) {
+                    isResolvingAdb = false
+                    Log.w(TAG, "ADB resolveService failed: $errorCode")
+                }
+
+                override fun onServiceResolved(resolvedInfo: NsdServiceInfo) {
+                    isResolvingAdb = false
+                    val port = resolvedInfo.port
+                    if (port <= 0) return
+
+                    val allLocalIps = getAllLocalIpAddresses()
+                    val hostAddr = resolvedInfo.host?.hostAddress
+                    if (hostAddr != null && !resolvedInfo.host.isLoopbackAddress && !allLocalIps.contains(hostAddr)) {
+                        Log.d(TAG, "Ignoring ADB beacon from external host: $hostAddr")
+                        return
+                    }
+
+                    latestDiscoveredAdbPort = port
+                    val ips = getDeviceIps()
+                    val key = "${ips.tailscaleIp ?: ""}:${ips.lanIp ?: ""}:$port"
+                    if (key == lastBeaconKey) {
+                        return
+                    }
+
+                    serviceScope.launch {
+                        postAdbBeacon(port, ips)
+                    }
+                }
+            })
+        } catch (e: Exception) {
+            isResolvingAdb = false
+            Log.w(TAG, "Failed to call resolveService: ${e.message}")
+        }
+    }
+
+    internal fun checkAndReportAdbBeacon() {
+        val port = latestDiscoveredAdbPort
+        if (port <= 0) return
+        val ips = getDeviceIps()
+        val key = "${ips.tailscaleIp ?: ""}:${ips.lanIp ?: ""}:$port"
+        if (key != lastBeaconKey) {
+            serviceScope.launch {
+                postAdbBeacon(port, ips)
+            }
+        }
+    }
+
+    internal suspend fun postAdbBeacon(port: Int, ips: DeviceIps) {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val configuredUrl = prefs.getString(KEY_GATEWAY_URL, DEFAULT_GATEWAY_URL)?.trim()
+        val rawGatewayUrl = if (!configuredUrl.isNullOrBlank()) {
+            configuredUrl
+        } else {
+            DEFAULT_GATEWAY_URL
+        }
+        val gatewayUrl = rawGatewayUrl.removeSuffix("/api/voice/interact").trimEnd('/')
+        val bearerToken = prefs.getString(KEY_BEARER_TOKEN, "") ?: ""
+
+        val payload = JSONObject().apply {
+            put("tailscale_ip", ips.tailscaleIp ?: JSONObject.NULL)
+            put("lan_ip", ips.lanIp ?: JSONObject.NULL)
+            put("adb_tls_port", port)
+            put("device", Build.MODEL ?: "Android")
+            put("device_model", Build.MODEL ?: "Android")
+            put("version_code", 10)
+            put("timestamp", System.currentTimeMillis() / 1000.0)
+        }
+
+        val body = payload.toString().toRequestBody("application/json".toMediaType())
+        val reqBuilder = Request.Builder()
+            .url("$gatewayUrl/api/device/adb-beacon")
+            .post(body)
+        if (bearerToken.isNotBlank()) {
+            reqBuilder.header("Authorization", "Bearer $bearerToken")
+        }
+
+        try {
+            httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    lastBeaconKey = "${ips.tailscaleIp ?: ""}:${ips.lanIp ?: ""}:$port"
+                    Log.i(TAG, "ADB beacon posted successfully: $lastBeaconKey")
+                } else {
+                    Log.w(TAG, "ADB beacon post returned code ${resp.code}")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to post ADB beacon: ${e.message}")
+        }
+    }
+
+    internal data class DeviceIps(val tailscaleIp: String?, val lanIp: String?)
+
+    internal fun getAllLocalIpAddresses(): Set<String> {
+        val result = mutableSetOf("127.0.0.1", "::1", "localhost")
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            if (interfaces != null) {
+                for (iface in interfaces.asSequence()) {
+                    for (addr in iface.inetAddresses.asSequence()) {
+                        addr.hostAddress?.let { result.add(it) }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to get local IPs: ${e.message}")
+        }
+        return result
+    }
+
+    internal fun getDeviceIps(): DeviceIps {
+        var tailscaleIp: String? = null
+        var lanIp: String? = null
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            if (interfaces != null) {
+                for (iface in interfaces.asSequence()) {
+                    if (!iface.isUp || iface.isLoopback) continue
+                    for (addr in iface.inetAddresses.asSequence()) {
+                        if (addr.isLoopbackAddress || addr !is Inet4Address) continue
+                        val host = addr.hostAddress ?: continue
+                        val parts = host.split('.').mapNotNull { it.toIntOrNull() }
+                        if (parts.size != 4) continue
+
+                        // Tailscale CGNAT range: 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+                        if (parts[0] == 100 && parts[1] in 64..127) {
+                            tailscaleIp = host
+                        } else if (
+                            // RFC 1918 Private LAN IPs
+                            (parts[0] == 192 && parts[1] == 168) ||
+                            (parts[0] == 10) ||
+                            (parts[0] == 172 && parts[1] in 16..31)
+                        ) {
+                            if (lanIp == null || iface.name.contains("wlan", ignoreCase = true)) {
+                                lanIp = host
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to enumerate network interfaces: ${e.message}")
+        }
+        return DeviceIps(tailscaleIp, lanIp)
     }
 
 }
