@@ -59,6 +59,30 @@ class TestBridgePromptAndFormatting(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<#1534436119888793750>", cleaned)
         self.assertNotIn("`<#1534436119888793750>`", cleaned)
 
+    def test_strip_trailing_streaming_cursor_glyphs(self):
+        """Verify trailing Unicode block-cursor glyphs (▋ U+258B, █ U+2588, etc.) are stripped while preserving code spans."""
+        # 1. Trailing cursor at the end of a message
+        self.assertEqual(
+            format_for_discord("Deployment completed cleanly. ▋"),
+            "Deployment completed cleanly.",
+        )
+        self.assertEqual(
+            format_for_discord("All checks passed!▋\n"),
+            "All checks passed!",
+        )
+        # 2. Trailing cursor immediately before [CHOICES: ...]
+        self.assertEqual(
+            format_for_discord("Ready to deploy. ▋\n\n[CHOICES: Deploy | Cancel]"),
+            "Ready to deploy.\n\n[CHOICES: Deploy | Cancel]",
+        )
+        # 3. Intentional block glyphs inside inline code and fenced code blocks are preserved
+        code_msg = "Progress bar: `[████████▋  ] 85%` and inline `▋`:\n```\n████▋\n```▋"
+        formatted_code = format_for_discord(code_msg)
+        self.assertIn("`[████████▋  ] 85%`", formatted_code)
+        self.assertIn("`▋`", formatted_code)
+        self.assertIn("```\n████▋\n```", formatted_code)
+        self.assertFalse(formatted_code.endswith("▋"))
+
     async def test_route_external_message_reply_to_other_ignored(self):
         """Verify inline replies to other users return True immediately without chiming in."""
         msg = MagicMock()

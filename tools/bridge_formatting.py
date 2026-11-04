@@ -9,16 +9,12 @@ Re-exports stream and safety symbols for complete backward compatibility.
 from __future__ import annotations
 
 import html
-import json
-import os
 import re
 import sys
 import urllib.request
-from pathlib import Path
-from typing import Any, Callable, Optional
 
 # Re-export pure security, leak detection, code-span shielding, and secret scrubbing symbols
-from tools.bridge_safety import (
+from tools.bridge_safety import (  # noqa: F401
     CLI_LEAK_LINE_PATTERNS,
     _CODE_SPAN_RE,
     _get_scrub_targets,
@@ -31,7 +27,7 @@ from tools.bridge_safety import (
 )
 
 # Re-export stream-json protocol parser, transcript harvesting, and error formatting
-from tools.bridge_stream import (
+from tools.bridge_stream import (  # noqa: F401
     AgyStreamParser,
     format_agy_error_message,
     format_command_preview,
@@ -327,8 +323,23 @@ def format_for_discord(text: str) -> str:
     except Exception:
         pass
 
+    # 6b. Strip trailing streaming block-cursor glyphs (e.g. U+258B ▋) while code spans are masked
+    text = re.sub(
+        r"[ \t]*[\u2588-\u258f\u25ae\u25af]+[ \t]*(?=(?:\s*\[(?:GIF|CHOICES|OPTIONS)\b|\s*$))",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
     # 7. Restore all shielded fenced code blocks and inline code spans
     text = restore_code_spans(text, code_spans, prefix="\x00DISCORD_SPAN_")
+    # Also strip trailing block-cursor glyphs attached immediately to a closing code fence (```▋)
+    text = re.sub(
+        r"(```[ \t]*?)[\u2588-\u258f\u25ae\u25af]+[ \t]*(?=(?:\s*\[(?:GIF|CHOICES|OPTIONS)\b|\s*$))",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
 
     # 8. Sanitize reaction GIFs (verify Tenor links are live HTTP 200 and position at end before [CHOICES: ...])
     text = sanitize_reaction_gifs(text)
@@ -536,15 +547,15 @@ def extract_agent_response(raw_text: str, conv_id: str | None = None) -> str:
 
     # Fallback filter for plain text outside JSON lines
     clean_lines = []
-    for l in text.splitlines():
-        l_str = l.strip()
+    for ln in text.splitlines():
+        l_str = ln.strip()
         if not l_str or (l_str.startswith("{") and l_str.endswith("}")) or (l_str.startswith("[") and l_str.endswith("]")):
             continue
         if l_str.startswith("===") and l_str.endswith("==="):
             continue
         if "\"event\":\"" in l_str or "\"step_update\":\"" in l_str or "\"conversation_id\":\"" in l_str:
             continue
-        clean_lines.append(l)
+        clean_lines.append(ln)
 
     if clean_lines:
         cand = format_for_discord("\n".join(clean_lines))
@@ -1015,7 +1026,7 @@ def synthesize_thread_title(prompt: str, response: str, max_words: int = 6) -> s
         "migrating deliverable", "online and ready", "lead with the result"
     )
 
-    lines = [l.strip() for l in response.split("\n") if l.strip()]
+    lines = [ln.strip() for ln in response.split("\n") if ln.strip()]
     candidate = None
 
     for line in lines[:8]:

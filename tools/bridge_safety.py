@@ -121,11 +121,11 @@ def dedup_repetitive_patterns(text: str, max_repeats: int = 3) -> str:
         new_lines = []
         pattern_collapsed = False
         while i < len(lines):
-            block = [l.strip() for l in lines[i : i + k]]
-            if any(len(l) > 3 for l in block) and i + k <= len(lines):
+            block = [ln.strip() for ln in lines[i : i + k]]
+            if any(len(ln) > 3 for ln in block) and i + k <= len(lines):
                 repeats = 1
                 while i + (repeats + 1) * k <= len(lines):
-                    next_block = [l.strip() for l in lines[i + repeats * k : i + (repeats + 1) * k]]
+                    next_block = [ln.strip() for ln in lines[i + repeats * k : i + (repeats + 1) * k]]
                     if next_block == block:
                         repeats += 1
                     else:
@@ -461,7 +461,21 @@ def strip_internal_cli_chatter(text: str) -> str:
             cleaned_lines.append(line)
 
     res = "\n".join(cleaned_lines)
+    # Strip trailing streaming block-cursor glyphs while code spans are masked
+    res = re.sub(
+        r"[ \t]*[\u2588-\u258f\u25ae\u25af]+[ \t]*(?=(?:\s*\[(?:GIF|CHOICES|OPTIONS)\b|\s*$))",
+        "",
+        res,
+        flags=re.IGNORECASE,
+    )
     res = restore_code_spans(res, code_spans, prefix="\x00SAFETY_SPAN_")
+    # Also strip trailing block-cursor glyphs attached immediately to a closing code fence (```▋)
+    res = re.sub(
+        r"(```[ \t]*?)[\u2588-\u258f\u25ae\u25af]+[ \t]*(?=(?:\s*\[(?:GIF|CHOICES|OPTIONS)\b|\s*$))",
+        r"\1",
+        res,
+        flags=re.IGNORECASE,
+    )
     return re.sub(r"\n{3,}", "\n\n", res).strip()
 
 
@@ -600,10 +614,10 @@ def is_internal_cli_leak(text: str) -> bool:
     # Option B chatter on cleaned text (suppress only if not substantive)
     is_substantive = len(cleaned.strip()) > 300 and ("\n\n" in cleaned or "###" in cleaned)
     if not is_substantive:
-        lines_non_empty = [l.strip() for l in cleaned.splitlines() if l.strip()]
+        lines_non_empty = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
         if lines_non_empty and all(
-            re.match(r"^(?:-\s*)?(?:a?waiting|wait)\s+", l, re.IGNORECASE)
-            for l in lines_non_empty
+            re.match(r"^(?:-\s*)?(?:a?waiting|wait)\s+", ln, re.IGNORECASE)
+            for ln in lines_non_empty
         ):
             return True
         if re.search(r"\ba?wait(?:ing)?\s+for\s+(?:at\s+least\s+one\s+of\s+the\s+)?(?:background\s+)?task", lower):
@@ -618,14 +632,14 @@ def is_internal_cli_leak(text: str) -> bool:
             return True
 
     # If remaining lines are exclusively internal daemon/system/test lines without user-facing content
-    remaining_lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
+    remaining_lines = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
     if remaining_lines and all(
         re.match(
             r"^(\[BridgeDaemon\]|\[BridgeState\]|Process\s+[^\n]+completed|Ran \d+ test|OK$|FAILED|\.\.\.|-{5,}|<end of|<RECEIVED_TASK_NOTIFICATION|</?WAITING_FOR_TASKS_OUTPUT|Wait for at least one)",
-            l,
+            ln,
             re.IGNORECASE,
         )
-        for l in remaining_lines
+        for ln in remaining_lines
     ):
         return True
 
