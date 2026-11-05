@@ -1730,7 +1730,7 @@ def run_weather_energy_card(dry_run: bool = False, test: bool = False, post_to_d
 
 
 def run_midweek_grocery_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
-    """Execute Wednesday Mid-Week Staple & Voice Grocery Replenishment Decision Card workflow."""
+    """Execute Thursday Mid-Week Staple & Voice Grocery Replenishment Decision Card workflow."""
     try:
         from tools.proactive_decision_cards import run_midweek_grocery_card as _run_midweek
         return _run_midweek(dry_run=dry_run, test=test, post_to_discord=post_to_discord)

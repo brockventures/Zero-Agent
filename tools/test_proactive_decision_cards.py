@@ -1484,6 +1484,38 @@ def test_midweek_grocery_dry_run(test_db: Path) -> None:
     assert "Bananas" in summary
 
 
+def test_midweek_grocery_untruncated_full_list_and_afx_link(test_db: Path) -> None:
+    """Renders all >6 staples and task items without truncation and includes 1-click Whole Foods AFX cart link."""
+    staples = [
+        {"id": f"staple-{i}", "name": f"Staple Item {i}", "days_elapsed": 10 + i, "cadence_days": 7, "default_amount": 2 if i == 3 else 1}
+        for i in range(1, 16)
+    ]
+    tasks = [{"summary": f"Voice Task Item {j}"} for j in range(1, 10)]
+    override = {"due_staples": staples, "task_items": tasks}
+
+    ok, summary, meta = run_midweek_grocery_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        items_override=override,
+    )
+    assert ok is True
+    assert meta["cards_staged"] == 1
+    assert meta["due_staples_count"] == 15
+    assert meta["task_items_count"] == 9
+    assert meta["total_items"] == 24
+    assert "more staples" not in summary
+    assert "more task items" not in summary
+    for i in range(1, 16):
+        assert f"Staple Item {i}" in summary
+    for j in range(1, 10):
+        assert f"Voice Task Item {j}" in summary
+    assert "2x `Staple Item 3`" in summary
+    assert "1-Click Whole Foods Cart" in summary
+    assert "https://www.amazon.com/afx/ingredients/landingencoded" in summary
+    assert meta.get("afx_url", "").startswith("https://www.amazon.com/afx/ingredients/landingencoded")
+
+
 # ==============================================================================
 # Workflow 7: Evening PM Hobby Build Card Tests
 # ==============================================================================

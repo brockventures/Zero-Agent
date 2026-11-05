@@ -67,12 +67,21 @@ except ImportError:
         gmail_search = None  # type: ignore
 
 try:
-    from tools.grocery_manager import get_due_staples
+    from tools.grocery_manager import compile_cart, get_due_staples
 except ImportError:
     try:
-        from grocery_manager import get_due_staples
+        from grocery_manager import compile_cart, get_due_staples
     except ImportError:
+        compile_cart = None  # type: ignore
         get_due_staples = None  # type: ignore
+
+try:
+    from tools.whole_foods_afx import generate_afx_url
+except ImportError:
+    try:
+        from whole_foods_afx import generate_afx_url
+    except ImportError:
+        generate_afx_url = None  # type: ignore
 
 try:
     from tools.ha_shopping_list import get_pending_groceries
@@ -1614,8 +1623,9 @@ def run_midweek_grocery_card(
     post_to_discord: bool = True,
     items_override: Optional[dict[str, Any] | list[dict[str, Any]]] = None,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Aggregate mid-week grocery task additions and due staples into a Decision Card in #shopping (1544955538033348618).
+    """Aggregate Thursday mid-week grocery task additions and due staples into a Decision Card in #shopping (1544955538033348618).
 
+    Renders the full, untruncated item list (with quantities and due cadence) and a 1-click Whole Foods AFX cart link.
     Strictly event-driven: returns (True, '', {'cards_staged': 0}) when 0 items due/pending.
     """
     due_staples: list[dict[str, Any]] = []
@@ -1649,6 +1659,50 @@ def run_midweek_grocery_card(
     if total_count == 0:
         return True, "", {"cards_staged": 0, "due_staples_count": 0, "task_items_count": 0}
 
+    # Build 1-click Whole Foods AFX cart URL across all Whole Foods staples & pending task additions
+    wf_staging_items: list[dict[str, Any]] = []
+    costco_staples: list[dict[str, Any]] = []
+    for s in due_staples:
+        store = str(s.get("store") or "whole_foods").lower()
+        if store == "costco":
+            costco_staples.append(s)
+        else:
+            q_name = s.get("search_query") or s.get("name") or "Staple"
+            amt = s.get("default_amount", s.get("amount", 1))
+            unit = s.get("unit", "COUNT")
+            wf_staging_items.append({
+                "name": str(q_name),
+                "search_query": s.get("search_query"),
+                "amount": amt,
+                "unit": unit,
+                "is_user_request": True,
+            })
+
+    for t in task_items:
+        t_name = (
+            (t.get("summary") or t.get("title") or t.get("name") or str(t))
+            if isinstance(t, dict)
+            else str(t)
+        )
+        t_clean = str(t_name).strip()
+        if t_clean:
+            wf_staging_items.append({
+                "name": t_clean,
+                "amount": (t.get("amount", 1) if isinstance(t, dict) else 1),
+                "unit": (t.get("unit", "COUNT") if isinstance(t, dict) else "COUNT"),
+                "is_user_request": True,
+            })
+
+    afx_url = ""
+    if wf_staging_items:
+        try:
+            if compile_cart is not None:
+                afx_url, _, _ = compile_cart(wf_staging_items, exclude_pantry=False)
+            elif generate_afx_url is not None:
+                afx_url = generate_afx_url(wf_staging_items)
+        except Exception:
+            afx_url = ""
+
     title = f"🛒 Mid-Week Grocery & Staples Radar ({total_count} item{'s' if total_count != 1 else ''})"
     summary_lines = [
         f"### 🛒 Mid-Week Grocery & Staples Radar ({total_count})",
@@ -1657,23 +1711,34 @@ def run_midweek_grocery_card(
     ]
     if due_staples:
         summary_lines.append(f"**Recurring Staples Due ({len(due_staples)}):**")
-        for s in due_staples[:6]:
+        for s in due_staples:
             s_name = s.get("name", "Staple")
             elapsed = s.get("days_elapsed")
             cadence = s.get("cadence_days", 7)
+            amt = s.get("default_amount", s.get("amount", 1))
+            try:
+                amt_num = float(amt)
+                qty_prefix = f"{int(amt_num) if amt_num.is_integer() else amt_num}x " if amt_num != 1 else ""
+            except Exception:
+                qty_prefix = ""
+            store_tag = " [Costco]" if str(s.get("store") or "").lower() == "costco" else ""
             detail_str = f"({elapsed}d since last buy, cadence: {cadence}d)" if elapsed is not None else f"(cadence: {cadence}d)"
-            summary_lines.append(f"• 🥛 `{s_name}` {detail_str}")
-        if len(due_staples) > 6:
-            summary_lines.append(f"• *... and {len(due_staples) - 6} more staples*")
+            summary_lines.append(f"• 🥛 {qty_prefix}`{s_name}`{store_tag} {detail_str}")
         summary_lines.append("")
 
     if task_items:
         summary_lines.append(f"**Voice & Task Additions ({len(task_items)}):**")
-        for t in task_items[:6]:
-            t_name = t.get("summary") or t.get("name") or str(t)
+        for t in task_items:
+            t_name = (
+                (t.get("summary") or t.get("title") or t.get("name") or str(t))
+                if isinstance(t, dict)
+                else str(t)
+            )
             summary_lines.append(f"• 📝 `{t_name}`")
-        if len(task_items) > 6:
-            summary_lines.append(f"• *... and {len(task_items) - 6} more task items*")
+        summary_lines.append("")
+
+    if afx_url:
+        summary_lines.append(f"🛒 [**1-Click Whole Foods Cart ({len(wf_staging_items)} item{'s' if len(wf_staging_items) != 1 else ''})**](<{afx_url}>)")
         summary_lines.append("")
 
     import shlex as _shlex
@@ -1688,6 +1753,7 @@ def run_midweek_grocery_card(
             "due_staples_count": len(due_staples),
             "task_items_count": len(task_items),
             "total_items": total_count,
+            "afx_url": afx_url,
         }
 
     cmd = f"python3 /workspace/tools/whole_foods_afx.py && python3 /workspace/tools/task_manager.py add {_shlex.quote(task_title)} --priority p2"
@@ -1697,6 +1763,7 @@ def run_midweek_grocery_card(
         "task_items_count": len(task_items),
         "total_items": total_count,
         "task_title": task_title,
+        "afx_url": afx_url,
     }
 
     should_post = post_to_discord and not test
@@ -1719,6 +1786,7 @@ def run_midweek_grocery_card(
         "due_staples_count": len(due_staples),
         "task_items_count": len(task_items),
         "total_items": total_count,
+        "afx_url": afx_url,
     }
 
 
