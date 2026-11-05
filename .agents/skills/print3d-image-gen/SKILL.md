@@ -78,20 +78,14 @@ Isolated [scale/style] of [subject], neutral standing [A-pose/grounded pose], he
 ### Step 1: Visual Prompt Formulation
 Analyze user intent, select appropriate subject archetype (figurine, functional part, relief), and inject the mandatory FDM invariants and bold physical relief constraints into the prompt.
 
-### Step 2: Generation Execution
-Execute generation using the dedicated image engine:
+### Step 2: Generation Execution (Subscription-First Default & Paid-API Guard)
+Execute generation using the Antigravity subscription at $0 API cost:
 
-#### Primary Path (`tools/gemini_image.py`):
-```bash
-python3 /workspace/tools/gemini_image.py \
-  --prompt "<structured prompt>" \
-  --aspect-ratio "1:1" \
-  --name "<snake_case_name>" \
-  --channel zero-chat \
-  --caption "FDM-optimized concept for [subject]. Ready for 3D mesh reconstruction."
-```
+> [!IMPORTANT]
+> **Ban on Unapproved Paid-API Batch Loops:**
+> NEVER execute multi-image batch generation loops against the paid `generativelanguage.googleapis.com` REST endpoint (`GEMINI_API_KEY`). Always use the Antigravity subscription path (`image-generator` subagent or `tools/gemini_image.py` default subscription mode). Passing `--allow-paid-api` (or `GEMINI_IMAGE_ALLOW_PAID=1`) is strictly prohibited unless explicitly authorized by the user, and is gated by a hard daily budget cap.
 
-#### Fallback Path (`generate_image` runtime tool):
+#### Primary Path A: Native Antigravity Subscription Subagent (`image-generator` / `generate_image` runtime tool):
 ```json
 {
   "AspectRatio": "1:1",
@@ -101,6 +95,18 @@ python3 /workspace/tools/gemini_image.py \
   "toolSummary": "Generate 3D concept"
 }
 ```
+
+#### Primary Path B: Subscription CLI Pipeline (`tools/gemini_image.py` — Default Subscription Mode):
+By default, `tools/gemini_image.py` invokes `agy --model=gemini-3.8-flash-low --agent=image-generator` using the Antigravity subscription ($0 API billing), validates the image on disk, and delivers to Discord:
+```bash
+python3 /workspace/tools/gemini_image.py \
+  --prompt "<structured prompt>" \
+  --aspect-ratio "1:1" \
+  --name "<snake_case_name>" \
+  --channel zero-chat \
+  --caption "FDM-optimized concept for [subject]. Ready for 3D mesh reconstruction."
+```
+*(Note: Paid Gemini REST API calls require explicit `--allow-paid-api` and must never be used in unapproved multi-concept batch loops.)*
 
 ### Step 3: Forensic Verification on Disk
 Confirm the image exists, has valid dimensions, and non-zero byte size before announcing to chat:

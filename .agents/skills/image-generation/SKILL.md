@@ -36,25 +36,16 @@ Translate high-level requests into rich, descriptive prompts that specify compos
 3. **Image Naming (`ImageName`):**
    * Keep it lowercase snake_case, max 3 words (e.g. `docker_lemons_meme`, `server_rack_fire`, `bot_avatar`).
 
-### Step 2: Generation Execution
+### Step 2: Generation Execution (Subscription-First Default & Paid-API Guard)
 
-Zero supports two generation paths:
+Zero enforces a strict **Subscription-First ($0 API Cost)** policy to prevent unexpected Google Cloud API billing from image generation:
 
-#### Option A: Direct Gemini API (`tools/gemini_image.py` — Primary & Recommended)
-Bypasses the Antigravity CLI's shared preview queue and 855-poll blocking loop. Executes direct HTTPS REST requests against `gemini-3.1-flash-image` with dedicated project quota:
-```bash
-python3 /workspace/tools/gemini_image.py \
-  --prompt "<detailed descriptive prompt>" \
-  --aspect-ratio "1:1" \
-  --name "docker_lemons_meme" \
-  --channel lounge
-```
-* Renders in ~5–9 seconds.
-* Automatically verifies the JPEG and delivers to Discord via `deliver_image.py` with zero prompt dump (omit `--caption` or pass `""` so only the clean image is uploaded; never echo the raw generation prompt into Discord).
-* Multi-model cascade fallback: `gemini-3.1-flash-image` -> `gemini-3.1-flash-image-preview` -> `gemini-2.5-flash-image`.
+> [!IMPORTANT]
+> **Ban on Unapproved Paid-API Batch Loops:**
+> NEVER execute multi-image batch generation loops against the paid `generativelanguage.googleapis.com` REST endpoint (`GEMINI_API_KEY`). All image generation MUST default to the Antigravity subscription (`image-generator` subagent or `gemini_image.py` default subscription mode). Passing `--allow-paid-api` (or `GEMINI_IMAGE_ALLOW_PAID=1`) is strictly prohibited unless explicitly authorized by the user for a single bounded call, and is enforced by a hard daily budget cap.
 
-#### Option B: Native Tool Execution (`generate_image` — Fallback)
-If running inside standard Antigravity CLI:
+#### Option A: Native Antigravity Subscription Subagent (`image-generator` / `generate_image` — Primary In-Turn Path)
+Invoke the built-in `image-generator` subagent or `generate_image` tool directly inside the active Antigravity session (runs on subscription OAuth at $0 API cost):
 ```json
 {
   "AspectRatio": "1:1",
@@ -65,7 +56,18 @@ If running inside standard Antigravity CLI:
 }
 ```
 * Saves to active brain session directory: `/root/.gemini/antigravity-cli/brain/<conv_id>/<ImageName>_<timestamp>.jpg`
-* Caution: Can hit `503 MODEL_CAPACITY_EXHAUSTED` or long polling loops during peak hours.
+
+#### Option B: CLI Subscription Pipeline (`tools/gemini_image.py` — Default Subscription Mode + Auto-Delivery)
+By default, `tools/gemini_image.py` routes through the Antigravity CLI subscription (`agy --model=gemini-3.8-flash-low --agent=image-generator`) at $0 API cost, verifies the image on disk, and optionally delivers it to Discord:
+```bash
+python3 /workspace/tools/gemini_image.py \
+  --prompt "<detailed descriptive prompt>" \
+  --aspect-ratio "1:1" \
+  --name "docker_lemons_meme" \
+  --channel lounge
+```
+* Automatically verifies the JPEG via `check_image()` and delivers to Discord via `deliver_image.py` with zero prompt dump (omit `--caption` or pass `""` so only the clean image is uploaded; never echo the raw generation prompt into Discord).
+* **Paid API Fallback Gate (`--allow-paid-api`):** Direct HTTPS REST requests to `generativelanguage.googleapis.com` (`gemini-3.1-flash-image` -> `gemini-3.1-flash-image-preview` -> `gemini-2.5-flash-image`) are blocked by default and require explicit `--allow-paid-api` (subject to the daily paid budget guard). Never run paid API calls in automated loops or multi-concept batches.
 
 ### Step 3: Forensic Verification on Disk (Never Skip)
 
