@@ -56,6 +56,7 @@ from tools.proactive_decision_cards import (
     _fetch_live_weather_data,
     _get_calendar_seen_path,
     _get_ha_credentials,
+    _is_dropoff_pickup_block,
     _load_seen_calendar_keys,
     _make_calendar_issue_key,
     _parse_event_datetime,
@@ -774,6 +775,60 @@ def test_calendar_radar_back_to_back_dropoff_and_same_location_suppressed(test_d
     assert ok_gt is True
     assert meta_gt["read_only_alerts"] == 1
     assert "Tight buffer" in meta_gt["issues"][0]["title"]
+
+
+def test_calendar_radar_self_overlap_deduplication_and_dropoff_typo_tolerance(test_db: Path) -> None:
+    """Duplicate events across multiple calendars do not self-overlap, and dropoff typos ('droppff') suppress tight buffers."""
+    now_pt = datetime.now(PT)
+
+    # 1. Verify _is_dropoff_pickup_block tolerates 'droppff' and 'dropff'
+    assert _is_dropoff_pickup_block({"summary": "Rosie dropoff"}) is True
+    assert _is_dropoff_pickup_block({"summary": "Isaac droppff"}) is True
+    assert _is_dropoff_pickup_block({"summary": "Isaac dropff"}) is True
+    assert _is_dropoff_pickup_block({"summary": "Team Sync"}) is False
+
+    # 2. Duplicate events with same ID or identical summary+start+end across personal & family calendars
+    shared_start = (now_pt + timedelta(hours=2)).isoformat()
+    shared_end = (now_pt + timedelta(hours=2, minutes=10)).isoformat()
+    events_multi_calendar = [
+        {
+            "id": "h81m07ba0d5kemgppka6emtqrn_20261105T160500Z",
+            "summary": "Rosie dropoff",
+            "start": shared_start,
+            "end": shared_end,
+        },
+        {
+            "id": "h81m07ba0d5kemgppka6emtqrn_20261105T160500Z",
+            "summary": "Rosie dropoff",
+            "start": shared_start,
+            "end": shared_end,
+        },
+        #Followed 5 minutes later by 'Isaac droppff' duplicated with different IDs but identical summary+start+end
+        {
+            "id": "cal-personal-isaac",
+            "summary": "Isaac droppff",
+            "start": (now_pt + timedelta(hours=2, minutes=15)).isoformat(),
+            "end": (now_pt + timedelta(hours=2, minutes=30)).isoformat(),
+        },
+        {
+            "id": "cal-family-isaac",
+            "summary": "  isaac droppff  ",
+            "start": (now_pt + timedelta(hours=2, minutes=15)).isoformat(),
+            "end": (now_pt + timedelta(hours=2, minutes=30)).isoformat(),
+        },
+    ]
+
+    ok, summary, meta = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=events_multi_calendar,
+    )
+    assert ok is True
+    assert summary == ""
+    assert meta["cards_staged"] == 0
+    assert meta["read_only_alerts"] == 0
+    assert meta["issues"] == []
 
 
 def test_calendar_radar_read_only_timing_alerts_dispatch(

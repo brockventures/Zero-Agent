@@ -340,7 +340,13 @@ def _extract_assigned_parent(ev: dict[str, Any]) -> str:
 def _is_dropoff_pickup_block(ev: dict[str, Any]) -> bool:
     """Check if event summary is a dropoff, pickup, or handoff block."""
     summary = str(ev.get("summary", ""))
-    return bool(re.search(r"\b(drop-?off|drop\s+off|pick-?up|pick\s+up|handoff)\b", summary, re.IGNORECASE))
+    return bool(
+        re.search(
+            r"\b(drop-?off|drop\s+off|droppff|dropff|pick-?up|pick\s+up|handoff)\b",
+            summary,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _classify_comms_item(item: dict[str, Any]) -> Optional[str]:
@@ -635,6 +641,8 @@ def run_family_calendar_radar_card(
 
     # 2. Parse & normalize events within window
     normalized_events: list[dict[str, Any]] = []
+    seen_event_ids: set[str] = set()
+    seen_event_tuples: set[tuple[str, datetime, datetime]] = set()
     for ev in raw_events:
         summary = str(ev.get("summary", "(Untitled)")).strip()
         start_val = ev.get("start")
@@ -649,8 +657,16 @@ def run_family_calendar_radar_card(
         if end_dt < now_pt or start_dt > window_end_pt:
             continue
 
+        ev_id = str(ev.get("id", "")).strip()
+        ev_tuple = (summary.strip().lower(), start_dt, end_dt)
+        if (ev_id and ev_id in seen_event_ids) or (ev_tuple in seen_event_tuples):
+            continue
+        if ev_id:
+            seen_event_ids.add(ev_id)
+        seen_event_tuples.add(ev_tuple)
+
         normalized_events.append({
-            "id": ev.get("id", ""),
+            "id": ev_id,
             "summary": summary,
             "description": ev.get("description", ""),
             "location": ev.get("location", ""),
@@ -676,6 +692,12 @@ def run_family_calendar_radar_card(
             ev2 = timed_events[j]
             if ev2["start_dt"] >= ev1["end_dt"]:
                 break
+            if (ev1["id"] and ev1["id"] == ev2["id"]) or (
+                ev1["summary"].strip().lower() == ev2["summary"].strip().lower()
+                and ev1["start_dt"] == ev2["start_dt"]
+                and ev1["end_dt"] == ev2["end_dt"]
+            ):
+                continue
             # ev2 starts before ev1 ends -> overlap
             if ev1["start_dt"] < ev2["end_dt"] and ev2["start_dt"] < ev1["end_dt"]:
                 p2 = _extract_assigned_parent(ev2)
