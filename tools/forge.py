@@ -7391,6 +7391,33 @@ def stage_decision(
     }
 
 
+def stage_decision_card(
+    category: str,
+    title: str,
+    summary: str,
+    handler_type: str,
+    payload: dict,
+    channel_id: int = ZERO_CHAT_CHANNEL_ID,
+    ttl_seconds: float = 7200.0,
+    is_private: Optional[bool] = None,
+    db_path: Path | str = FORGE_DB_PATH,
+    post_to_discord: bool = False,
+) -> dict:
+    """Alias for `stage_decision`: stages a deterministic Decision Card without clipping multi-item summaries."""
+    return stage_decision(
+        category=category,
+        title=title,
+        summary=summary,
+        handler_type=handler_type,
+        payload=payload,
+        channel_id=channel_id,
+        ttl_seconds=ttl_seconds,
+        is_private=is_private,
+        db_path=db_path,
+        post_to_discord=post_to_discord,
+    )
+
+
 def render_decision_card_embed(decision: sqlite3.Row | dict) -> dict:
     """Render a staged Decision Card as a native Discord Embed dictionary."""
     status = (decision.get("status") if isinstance(decision, dict) else decision["status"]) or "pending"

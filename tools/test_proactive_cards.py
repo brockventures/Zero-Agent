@@ -115,7 +115,7 @@ def test_midweek_grocery_dry_run(test_db: Path) -> None:
     assert "Bananas" in summary
 
 
-def test_proactive_cards_untruncated_15_staples_and_afx_url(test_db: Path) -> None:
+def test_proactive_cards_untruncated_15_staples_and_afx_url(test_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Verifies that 15 due staples and 8 voice tasks are rendered in full with 0 truncation and a 1-click AFX URL."""
     staples = [
         {
@@ -132,10 +132,18 @@ def test_proactive_cards_untruncated_15_staples_and_afx_url(test_db: Path) -> No
     ]
     tasks = [{"summary": f"Extra Grocery Item {j}"} for j in range(1, 9)]
 
+    posted_messages: list[tuple[int, str]] = []
+
+    def mock_post_direct(channel_id: int, content: str) -> int:
+        posted_messages.append((channel_id, content))
+        return 9876543210
+
+    monkeypatch.setattr("tools.proactive_decision_cards._post_channel_message_rest", mock_post_direct)
+
     ok, summary, meta = run_midweek_grocery_card(
-        test=True,
+        test=False,
         db_path=test_db,
-        post_to_discord=False,
+        post_to_discord=True,
         items_override={"due_staples": staples, "task_items": tasks},
     )
 
@@ -144,8 +152,20 @@ def test_proactive_cards_untruncated_15_staples_and_afx_url(test_db: Path) -> No
     assert meta["due_staples_count"] == 15
     assert meta["task_items_count"] == 8
     assert meta["total_items"] == 23
+    assert meta["discord_message_id"] == 9876543210
 
-    # Verify zero truncation
+    # Verify direct full-length message posted to #shopping without Decision Card truncation
+    assert len(posted_messages) == 1
+    posted_ch, posted_text = posted_messages[0]
+    assert posted_ch == CHANNEL_SHOPPING
+    assert "**Approve Action:**" not in posted_text
+    for i in range(1, 16):
+        assert f"Household Staple {i}" in posted_text
+    for j in range(1, 9):
+        assert f"Extra Grocery Item {j}" in posted_text
+    assert "1-Click Whole Foods Cart (23 items)" in posted_text
+
+    # Verify zero truncation in summary
     assert "more staples" not in summary
     assert "more task items" not in summary
     for i in range(1, 16):
@@ -168,10 +188,41 @@ def test_proactive_cards_untruncated_15_staples_and_afx_url(test_db: Path) -> No
     assert row is not None
     assert row["category"] == "shopping"
     assert row["channel_id"] == CHANNEL_SHOPPING
+    assert row["message_id"] == 9876543210
     payload = json.loads(row["payload_json"])
     valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
     assert valid_sh is True, f"Shell payload invalid: {val_err}"
     assert payload["afx_url"] == meta["afx_url"]
+
+
+def test_stage_decision_card_preserves_untruncated_shopping_summary(test_db: Path) -> None:
+    """Verifies tools.forge.stage_decision_card does not clip multi-item shopping summaries."""
+    from tools.forge import render_decision_card_embed, stage_decision_card
+
+    long_summary = "### 🛒 Mid-Week Grocery & Staples Radar (15)\n" + "\n".join(
+        f"• 🥛 `Staple Item {i}` (14d since last buy, cadence: 7d)" for i in range(1, 16)
+    )
+    res = stage_decision_card(
+        category="shopping",
+        title="🛒 Mid-Week Grocery & Staples Radar (15 items)",
+        summary=long_summary,
+        handler_type="shell",
+        payload={"command": "python3 /workspace/tools/whole_foods_afx.py"},
+        channel_id=CHANNEL_SHOPPING,
+        db_path=test_db,
+        post_to_discord=False,
+    )
+    assert res["ok"] is True
+    conn = sqlite3.connect(test_db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (res["decision_id"],)).fetchone()
+    conn.close()
+    assert row is not None
+    for i in range(1, 16):
+        assert f"Staple Item {i}" in row["summary"]
+    embed = render_decision_card_embed(row)
+    for i in range(1, 16):
+        assert f"Staple Item {i}" in embed["description"]
 
 
 def test_thursday_schedule_day_of_week() -> None:

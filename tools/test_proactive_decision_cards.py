@@ -1580,8 +1580,8 @@ def test_midweek_grocery_dry_run(test_db: Path) -> None:
     assert "Bananas" in summary
 
 
-def test_midweek_grocery_untruncated_full_list_and_afx_link(test_db: Path) -> None:
-    """Renders all >6 staples and task items without truncation and includes 1-click Whole Foods AFX cart link."""
+def test_midweek_grocery_untruncated_full_list_and_afx_link(test_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Renders all >6 staples and task items without truncation, includes 1-click Whole Foods AFX cart link, and posts directly to #shopping."""
     staples = [
         {"id": f"staple-{i}", "name": f"Staple Item {i}", "days_elapsed": 10 + i, "cadence_days": 7, "default_amount": 2 if i == 3 else 1}
         for i in range(1, 16)
@@ -1589,10 +1589,16 @@ def test_midweek_grocery_untruncated_full_list_and_afx_link(test_db: Path) -> No
     tasks = [{"summary": f"Voice Task Item {j}"} for j in range(1, 10)]
     override = {"due_staples": staples, "task_items": tasks}
 
+    posted: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        "tools.proactive_decision_cards._post_channel_message_rest",
+        lambda cid, txt: (posted.append((cid, txt)) or 1122334455),
+    )
+
     ok, summary, meta = run_midweek_grocery_card(
-        test=True,
+        test=False,
         db_path=test_db,
-        post_to_discord=False,
+        post_to_discord=True,
         items_override=override,
     )
     assert ok is True
@@ -1600,12 +1606,18 @@ def test_midweek_grocery_untruncated_full_list_and_afx_link(test_db: Path) -> No
     assert meta["due_staples_count"] == 15
     assert meta["task_items_count"] == 9
     assert meta["total_items"] == 24
+    assert meta["discord_message_id"] == 1122334455
+    assert len(posted) == 1
+    assert posted[0][0] == CHANNEL_SHOPPING
+    assert "more staples" not in posted[0][1]
     assert "more staples" not in summary
     assert "more task items" not in summary
     for i in range(1, 16):
         assert f"Staple Item {i}" in summary
+        assert f"Staple Item {i}" in posted[0][1]
     for j in range(1, 10):
         assert f"Voice Task Item {j}" in summary
+        assert f"Voice Task Item {j}" in posted[0][1]
     assert "2x `Staple Item 3`" in summary
     assert "1-Click Whole Foods Cart" in summary
     assert "https://www.amazon.com/afx/ingredients/landingencoded" in summary

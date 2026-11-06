@@ -1627,6 +1627,67 @@ def run_weather_energy_card(
 
 # ==============================================================================
 # Workflow 6: Mid-Week Staple & Voice Grocery Card
+def _post_channel_message_rest(channel_id: int, content: str) -> Optional[int]:
+    """Post a full-length markdown message directly to a Discord channel via REST API v10.
+
+    Automatically splits into multiple messages only if content exceeds Discord's 2,000-character limit.
+    Returns the first message ID posted, or None on error/missing token.
+    """
+    token = None
+    try:
+        from tools.forge import _get_discord_token
+        token = _get_discord_token()
+    except Exception:
+        pass
+    if not token:
+        secrets_path = os.environ.get("SECRETS_FILE_PATH", "/secrets/env.json")
+        sf = Path(secrets_path)
+        if sf.exists():
+            try:
+                sec = json.loads(sf.read_text(encoding="utf-8"))
+                token = sec.get("DISCORD_TOKEN") or sec.get("DISCORD_BOT_TOKEN")
+            except Exception:
+                pass
+    if not token:
+        return None
+
+    text = str(content or "").strip()
+    if not text:
+        return None
+
+    chunks: list[str] = []
+    while len(text) > 1950:
+        split_idx = text.rfind("\n", 0, 1950)
+        if split_idx <= 0:
+            split_idx = 1950
+        chunks.append(text[:split_idx].rstrip())
+        text = text[split_idx:].lstrip("\n")
+    if text:
+        chunks.append(text)
+
+    headers = {
+        "Authorization": f"Bot {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "DiscordBot (https://zero, 1.0)",
+    }
+    url = f"https://discord.com/api/v10/channels/{int(channel_id)}/messages"
+    first_msg_id: Optional[int] = None
+    for ch_text in chunks:
+        try:
+            data = json.dumps({"content": ch_text}).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if 200 <= resp.status < 300:
+                    resp_obj = json.loads(resp.read().decode("utf-8"))
+                    if first_msg_id is None and resp_obj.get("id"):
+                        first_msg_id = int(resp_obj["id"])
+        except Exception as e:
+            print(f"[ProactiveCards] Warning posting direct message to {channel_id}: {e}", file=sys.stderr)
+    return first_msg_id
+
+
+# ==============================================================================
+# Workflow 6: Mid-Week Staple & Voice Grocery Card
 # ==============================================================================
 def run_midweek_grocery_card(
     dry_run: bool = False,
@@ -1635,11 +1696,22 @@ def run_midweek_grocery_card(
     post_to_discord: bool = True,
     items_override: Optional[dict[str, Any] | list[dict[str, Any]]] = None,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Aggregate Thursday mid-week grocery task additions and due staples into a Decision Card in #shopping (1544955538033348618).
+    """Aggregate Thursday mid-week grocery task additions and due staples in #shopping (1544955538033348618).
 
-    Renders the full, untruncated item list (with quantities and due cadence) and a 1-click Whole Foods AFX cart link.
+    Renders the full, untruncated item list (with quantities and due cadence) and a 1-click Whole Foods AFX cart link,
+    posting the complete itemized message directly to #shopping when post_to_discord=True.
     Strictly event-driven: returns (True, '', {'cards_staged': 0}) when 0 items due/pending.
     """
+    if items_override is None and not test:
+        try:
+            import importlib as _importlib
+            if "tools.grocery_manager" in sys.modules:
+                _importlib.reload(sys.modules["tools.grocery_manager"])
+            if "tools.ha_shopping_list" in sys.modules:
+                _importlib.reload(sys.modules["tools.ha_shopping_list"])
+        except Exception:
+            pass
+
     due_staples: list[dict[str, Any]] = []
     task_items: list[dict[str, Any]] = []
 
@@ -1753,6 +1825,8 @@ def run_midweek_grocery_card(
         summary_lines.append(f"🛒 [**1-Click Whole Foods Cart ({len(wf_staging_items)} item{'s' if len(wf_staging_items) != 1 else ''})**](<{afx_url}>)")
         summary_lines.append("")
 
+    direct_message_text = "\n".join(summary_lines).strip()
+
     import shlex as _shlex
     task_title = f"Review Whole Foods AFX cart ({total_count} items)"
     summary_lines.append(f"**Approve Action:** Stage 1-click Whole Foods AFX cart and create task: '{task_title}'")
@@ -1766,6 +1840,7 @@ def run_midweek_grocery_card(
             "task_items_count": len(task_items),
             "total_items": total_count,
             "afx_url": afx_url,
+            "direct_message": direct_message_text,
         }
 
     cmd = f"python3 /workspace/tools/whole_foods_afx.py && python3 /workspace/tools/task_manager.py add {_shlex.quote(task_title)} --priority p2"
@@ -1778,6 +1853,8 @@ def run_midweek_grocery_card(
         "afx_url": afx_url,
     }
 
+    # Record in forge_decisions without posting a truncated/card embed to Discord;
+    # instead, when should_post is True, post the full untruncated message directly to #shopping.
     should_post = post_to_discord and not test
     stage_res = stage_decision(
         category="shopping",
@@ -1787,18 +1864,36 @@ def run_midweek_grocery_card(
         payload=payload,
         channel_id=CHANNEL_SHOPPING,
         db_path=db_path,
-        post_to_discord=should_post,
+        post_to_discord=False,
     )
 
     decision_id = stage_res.get("decision_id")
+    discord_msg_id: Optional[int] = None
+    if should_post:
+        discord_msg_id = _post_channel_message_rest(CHANNEL_SHOPPING, direct_message_text)
+        if decision_id:
+            try:
+                import sqlite3 as _sqlite3
+                import time as _time
+                with _sqlite3.connect(str(db_path), timeout=10.0) as _conn:
+                    _conn.execute(
+                        "UPDATE forge_decisions SET message_id = ?, status = 'approved', resolved_at = ?, receipt_text = ? WHERE id = ?",
+                        (discord_msg_id, _time.time(), "Posted full untruncated mid-week grocery check directly to #shopping", decision_id),
+                    )
+                    _conn.commit()
+            except Exception:
+                pass
+
     return True, summary_text, {
         "cards_staged": 1 if decision_id else 0,
         "decision_id": decision_id,
         "decision_ids": [decision_id] if decision_id else [],
+        "discord_message_id": discord_msg_id,
         "due_staples_count": len(due_staples),
         "task_items_count": len(task_items),
         "total_items": total_count,
         "afx_url": afx_url,
+        "direct_message": direct_message_text,
     }
 
 
