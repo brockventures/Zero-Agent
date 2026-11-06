@@ -435,7 +435,9 @@ def run_loop():
         while _running:
             try:
                 tok = get_access_token()
-                query = urllib.parse.quote(f"(to:{TARGET_EMAIL} OR (from:notifications@github.com after:{STARTUP_EPOCH})) is:unread")
+                query = urllib.parse.quote(
+                    f'((to:{TARGET_EMAIL} OR (from:notifications@github.com after:{STARTUP_EPOCH})) is:unread) OR (subject:"[WORK-CAL-SYNC]" after:{STARTUP_EPOCH})'
+                )
                 url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?q={query}&maxResults=5"
                 req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
                 
