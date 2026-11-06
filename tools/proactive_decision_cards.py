@@ -347,15 +347,21 @@ def _extract_assigned_parent(ev: dict[str, Any]) -> str:
 
 
 def _is_dropoff_pickup_block(ev: dict[str, Any]) -> bool:
-    """Check if event summary is a dropoff, pickup, or handoff block."""
+    """Check if event summary is a dropoff, pickup, or routine care/handoff reminder block."""
     summary = str(ev.get("summary", ""))
-    return bool(
-        re.search(
-            r"\b(drop-?off|drop\s+off|droppff|dropff|pick-?up|pick\s+up|handoff)\b",
-            summary,
-            re.IGNORECASE,
-        )
-    )
+    if re.search(
+        r"\b(drop-?off|drop\s+off|droppff|dropff|pick-?up|pick\s+up|handoff|isaac[-\s]+rafaela|rafaela)\b",
+        summary,
+        re.IGNORECASE,
+    ):
+        return True
+    start_dt = ev.get("start_dt")
+    end_dt = ev.get("end_dt")
+    if isinstance(start_dt, datetime) and isinstance(end_dt, datetime):
+        dur_seconds = (end_dt - start_dt).total_seconds()
+        if 0 < dur_seconds <= 10 * 60:
+            return True
+    return False
 
 
 def _classify_comms_item(item: dict[str, Any]) -> Optional[str]:
@@ -711,6 +717,12 @@ def run_family_calendar_radar_card(
             if ev1["start_dt"] < ev2["end_dt"] and ev2["start_dt"] < ev1["end_dt"]:
                 p2 = _extract_assigned_parent(ev2)
                 if {p1, p2} == {"ryan", "emily"}:
+                    continue
+                dur1 = (ev1["end_dt"] - ev1["start_dt"]).total_seconds()
+                dur2 = (ev2["end_dt"] - ev2["start_dt"]).total_seconds()
+                if (_is_dropoff_pickup_block(ev1) and 0 < dur1 <= 10 * 60) or (
+                    _is_dropoff_pickup_block(ev2) and 0 < dur2 <= 10 * 60
+                ):
                     continue
                 start_date_str = ev1["start_dt"].strftime("%Y-%m-%d")
                 ev_list = [ev1["summary"], ev2["summary"]]

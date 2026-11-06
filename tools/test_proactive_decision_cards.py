@@ -781,10 +781,16 @@ def test_calendar_radar_self_overlap_deduplication_and_dropoff_typo_tolerance(te
     """Duplicate events across multiple calendars do not self-overlap, and dropoff typos ('droppff') suppress tight buffers."""
     now_pt = datetime.now(PT)
 
-    # 1. Verify _is_dropoff_pickup_block tolerates 'droppff' and 'dropff'
+    # 1. Verify _is_dropoff_pickup_block tolerates 'droppff', 'dropff', 'Isaac-Rafaela', and <=10m duration blocks
     assert _is_dropoff_pickup_block({"summary": "Rosie dropoff"}) is True
     assert _is_dropoff_pickup_block({"summary": "Isaac droppff"}) is True
     assert _is_dropoff_pickup_block({"summary": "Isaac dropff"}) is True
+    assert _is_dropoff_pickup_block({"summary": "Isaac-Rafaela"}) is True
+    assert _is_dropoff_pickup_block({
+        "summary": "Morning Check-in",
+        "start_dt": now_pt,
+        "end_dt": now_pt + timedelta(minutes=5),
+    }) is True
     assert _is_dropoff_pickup_block({"summary": "Team Sync"}) is False
 
     # 2. Duplicate events with same ID or identical summary+start+end across personal & family calendars
@@ -829,6 +835,96 @@ def test_calendar_radar_self_overlap_deduplication_and_dropoff_typo_tolerance(te
     assert meta["cards_staged"] == 0
     assert meta["read_only_alerts"] == 0
     assert meta["issues"] == []
+
+
+def test_calendar_radar_nov_5_6_live_handoff_and_pickup_regression(test_db: Path) -> None:
+    """Regression test for Nov 5-6 live event payload:
+    1. 'Isaac pickup' duplicated across Ryan + Family calendars does not self-overlap.
+    2. 'Isaac-Rafaela' (08:00-08:05 AM, 5m morning handoff) followed by 'Rosie dropoff' (08:05-08:10 AM)
+       does not trigger a 0m Tight Buffer alert.
+    3. 'Isaac pickup' (5:00-5:05 PM, 5m pickup reminder) overlapping with 'Rosie's birthday party!' (5:00-7:00 PM)
+       does not trigger a false Overlap alert, while still staging the birthday party prep card.
+    """
+    now_pt = datetime.now(PT)
+    base_morning = (now_pt + timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
+    base_evening = base_morning + timedelta(hours=9)
+
+    live_events = [
+        # 1. Duplicate 'Isaac pickup' across Ryan + Family calendars
+        {
+            "id": "ryan-cal-isaac-pickup",
+            "summary": "Isaac pickup",
+            "start": base_evening.isoformat(),
+            "end": (base_evening + timedelta(minutes=5)).isoformat(),
+        },
+        {
+            "id": "family-cal-isaac-pickup",
+            "summary": "Isaac pickup",
+            "start": base_evening.isoformat(),
+            "end": (base_evening + timedelta(minutes=5)).isoformat(),
+        },
+        # 2. 'Isaac-Rafaela' (5m morning handoff) back-to-back with 'Rosie dropoff' (0m gap)
+        {
+            "id": "ev-isaac-rafaela",
+            "summary": "Isaac-Rafaela",
+            "start": base_morning.isoformat(),
+            "end": (base_morning + timedelta(minutes=5)).isoformat(),
+        },
+        {
+            "id": "ev-rosie-dropoff",
+            "summary": "Rosie dropoff",
+            "start": (base_morning + timedelta(minutes=5)).isoformat(),
+            "end": (base_morning + timedelta(minutes=10)).isoformat(),
+        },
+        # 3. 'Rosie's birthday party!' (2h event) overlapping with 5m 'Isaac pickup'
+        {
+            "id": "ev-rosie-bday-party",
+            "summary": "Rosie's birthday party!",
+            "start": base_evening.isoformat(),
+            "end": (base_evening + timedelta(hours=2)).isoformat(),
+        },
+    ]
+
+    ok, summary, meta = run_family_calendar_radar_card(
+        test=True,
+        db_path=test_db,
+        post_to_discord=False,
+        events_override=live_events,
+    )
+    assert ok is True
+    # Zero read-only overlap or tight buffer timing alerts
+    assert meta["read_only_alerts"] == 0
+    issue_types = [iss["type"] for iss in meta["issues"]]
+    assert "overlap" not in issue_types
+    assert "tight_buffer" not in issue_types
+    # Only the actionable prep card for 'Rosie's birthday party!' is staged
+    assert issue_types == ["prep"]
+    assert meta["cards_staged"] == 1
+
+
+def test_bridge_scheduler_reloads_proactive_decision_cards(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify bridge_scheduler._reload_proactive_decision_cards reloads proactive_decision_cards module."""
+    import importlib
+    import tools.bridge_scheduler as bs
+    import tools.proactive_decision_cards as pdc
+
+    reload_Targets: list[Any] = []
+    orig_reload = importlib.reload
+
+    def spy_reload(mod: Any) -> Any:
+        reload_Targets.append(getattr(mod, "__name__", str(mod)))
+        return orig_reload(mod)
+
+    monkeypatch.setattr(importlib, "reload", spy_reload)
+    monkeypatch.setattr(
+        "tools.sidecars.run_family_calendar_radar_card",
+        lambda **kw: (True, "", {"cards_staged": 0, "read_only_alerts": 0}),
+    )
+
+    ok, rep, details = bs.run_family_calendar_radar_card(dry_run=True, test=True, post_to_discord=False)
+    assert ok is True
+    assert any("proactive_decision_cards" in name for name in reload_Targets)
+    assert pdc is not None
 
 
 def test_calendar_radar_read_only_timing_alerts_dispatch(

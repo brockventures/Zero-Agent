@@ -122,50 +122,88 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
 }
 
 
+def _reload_proactive_decision_cards():
+    """Reload proactive_decision_cards (and sync /app copy if needed) so merged FORGE fixes take effect immediately."""
+    import importlib as _importlib
+    import shutil as _shutil
+    import sys as _sys
+
+    ws_pdc = Path("/workspace/tools/proactive_decision_cards.py")
+    app_pdc = Path("/app/tools/proactive_decision_cards.py")
+    if ws_pdc.exists() and app_pdc.parent.exists():
+        try:
+            if not app_pdc.exists() or ws_pdc.stat().st_mtime > app_pdc.stat().st_mtime:
+                _shutil.copy2(ws_pdc, app_pdc)
+        except Exception:
+            pass
+
+    for mod_name in ("proactive_decision_cards", "tools.proactive_decision_cards"):
+        if mod_name in _sys.modules:
+            try:
+                _importlib.reload(_sys.modules[mod_name])
+            except Exception:
+                pass
+    try:
+        import tools.proactive_decision_cards as _pdc
+        _importlib.reload(_pdc)
+        return _pdc
+    except Exception:
+        import tools.proactive_decision_cards as _pdc
+        return _pdc
+
+
 def run_morning_inbox_triage_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
     """Execute morning Inbox & RCS actionable triage Decision Card workflow."""
+    _reload_proactive_decision_cards()
     from tools.sidecars import run_morning_inbox_triage_card as _fn
     return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
 
 
 def run_commute_inbox_triage_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
     """Execute commute Inbox & RCS actionable triage Decision Card workflow."""
+    _reload_proactive_decision_cards()
     from tools.sidecars import run_commute_inbox_triage_card as _fn
     return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
 
 
 def run_family_calendar_radar_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
     """Execute 48-hour Family Calendar & Action Radar Decision Card workflow."""
+    _reload_proactive_decision_cards()
     from tools.sidecars import run_family_calendar_radar_card as _fn
     return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
 
 
 def run_dinner_pivot_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
     """Execute afternoon Dinner Defrost & Calendar Conflict Pivot Decision Card workflow."""
+    _reload_proactive_decision_cards()
     from tools.sidecars import run_dinner_pivot_card as _fn
     return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
 
 
 def run_actual_budget_anomaly_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
     """Execute Actual Budget Anomaly & Overspend Detection Decision Card workflow."""
+    _reload_proactive_decision_cards()
     from tools.sidecars import run_actual_budget_anomaly_card as _fn
     return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
 
 
 def run_weather_energy_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
     """Execute morning Weather, Air Quality & Pre-Adjustment Energy Decision Card workflow."""
+    _reload_proactive_decision_cards()
     from tools.sidecars import run_weather_energy_card as _fn
     return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
 
 
 def run_midweek_grocery_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
     """Execute Wednesday Mid-Week Staple & Voice Grocery Replenishment Decision Card workflow."""
+    _reload_proactive_decision_cards()
     from tools.sidecars import run_midweek_grocery_card as _fn
     return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
 
 
 def run_evening_pm_build_card(dry_run: bool = False, test: bool = False, post_to_discord: bool = True) -> tuple[bool, str, dict]:
     """Execute evening PM Hobby & Build Decision Card workflow."""
+    _reload_proactive_decision_cards()
     from tools.sidecars import run_evening_pm_build_card as _fn
     return _fn(dry_run=dry_run, test=test, post_to_discord=post_to_discord)
 
@@ -273,6 +311,7 @@ async def dispatch_scheduled_prompt(
     # Morning Inbox & RCS Triage Decision Card
     if job_id == "morning_inbox_triage_card" or "morning_inbox_triage_card" in prompt or job_name == "Morning Inbox & RCS Triage Card":
         try:
+            _reload_proactive_decision_cards()
             from tools.sidecars import run_morning_inbox_triage_card
             ok, rep, details = await _run_sidecar_job_async("morning_inbox_triage_card", "Morning Inbox & RCS Triage Card", run_morning_inbox_triage_card)
             staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
@@ -291,6 +330,7 @@ async def dispatch_scheduled_prompt(
     # Commute Inbox & RCS Triage Decision Card
     if job_id == "commute_inbox_triage_card" or "commute_inbox_triage_card" in prompt or job_name == "Commute Inbox & RCS Triage Card":
         try:
+            _reload_proactive_decision_cards()
             from tools.sidecars import run_commute_inbox_triage_card
             ok, rep, details = await _run_sidecar_job_async("commute_inbox_triage_card", "Commute Inbox & RCS Triage Card", run_commute_inbox_triage_card)
             staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
@@ -309,6 +349,7 @@ async def dispatch_scheduled_prompt(
     # 48h Family Calendar Radar Card
     if job_id == "family_calendar_radar_card" or "family_calendar_radar_card" in prompt or job_name == "48h Family Calendar Radar Card":
         try:
+            _reload_proactive_decision_cards()
             from tools.sidecars import run_family_calendar_radar_card
             ok, rep, details = await _run_sidecar_job_async("family_calendar_radar_card", "48h Family Calendar Radar Card", run_family_calendar_radar_card)
             staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
@@ -327,6 +368,7 @@ async def dispatch_scheduled_prompt(
     # Afternoon Dinner Pivot Card
     if job_id == "dinner_pivot_card" or "dinner_pivot_card" in prompt or job_name == "Afternoon Dinner Pivot Card":
         try:
+            _reload_proactive_decision_cards()
             from tools.sidecars import run_dinner_pivot_card
             ok, rep, details = await _run_sidecar_job_async("dinner_pivot_card", "Afternoon Dinner Pivot Card", run_dinner_pivot_card)
             staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
@@ -345,6 +387,7 @@ async def dispatch_scheduled_prompt(
     # Actual Budget Anomaly Card
     if job_id == "actual_budget_anomaly_card" or "actual_budget_anomaly_card" in prompt or job_name == "Actual Budget Anomaly Card":
         try:
+            _reload_proactive_decision_cards()
             from tools.sidecars import run_actual_budget_anomaly_card
             ok, rep, details = await _run_sidecar_job_async("actual_budget_anomaly_card", "Actual Budget Anomaly Card", run_actual_budget_anomaly_card)
             staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
@@ -363,6 +406,7 @@ async def dispatch_scheduled_prompt(
     # Weather & Energy Pre-Adjustment Card
     if job_id == "weather_energy_card" or "weather_energy_card" in prompt or job_name == "Weather & Energy Pre-Adjustment Card":
         try:
+            _reload_proactive_decision_cards()
             from tools.sidecars import run_weather_energy_card
             ok, rep, details = await _run_sidecar_job_async("weather_energy_card", "Weather & Energy Pre-Adjustment Card", run_weather_energy_card)
             staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
@@ -381,6 +425,7 @@ async def dispatch_scheduled_prompt(
     # Mid-Week Staple & Voice Grocery Card
     if job_id == "midweek_grocery_card" or "midweek_grocery_card" in prompt or job_name == "Mid-Week Staple & Voice Grocery Card":
         try:
+            _reload_proactive_decision_cards()
             from tools.sidecars import run_midweek_grocery_card
             ok, rep, details = await _run_sidecar_job_async("midweek_grocery_card", "Mid-Week Staple & Voice Grocery Card", run_midweek_grocery_card)
             staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
@@ -399,6 +444,7 @@ async def dispatch_scheduled_prompt(
     # Evening PM Hobby Build Card
     if job_id == "evening_pm_build_card" or "evening_pm_build_card" in prompt or job_name == "Evening PM Hobby Build Card":
         try:
+            _reload_proactive_decision_cards()
             from tools.sidecars import run_evening_pm_build_card
             ok, rep, details = await _run_sidecar_job_async("evening_pm_build_card", "Evening PM Hobby Build Card", run_evening_pm_build_card)
             staged = details.get("cards_staged", 0) if isinstance(details, dict) else 0
