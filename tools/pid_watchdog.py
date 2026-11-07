@@ -50,17 +50,32 @@ def check_host_pid_health(ip: str, host_name: str, threshold: float = DEFAULT_TH
             code, out, err = run_ssh(
                 ip,
                 cmd,
-                timeout=25,
-                connect_timeout=15,
+                timeout=40,
+                connect_timeout=20,
                 user=SSH_USER,
                 port=SSH_PORT,
                 key=SSH_KEY,
-                disable_mux=(attempt > 1),
+                disable_mux=(attempt == 2),
                 retry_without_mux_on_timeout=(attempt == 1),
             )
         except TypeError:
-            code, out, err = run_ssh(ip, cmd, timeout=25, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
+            code, out, err = run_ssh(ip, cmd, timeout=40, user=SSH_USER, port=SSH_PORT, key=SSH_KEY)
         if code == 0 and len([line.strip() for line in out.strip().split("\n") if line.strip()]) >= 4:
+            if attempt == 2:
+                try:
+                    run_ssh(
+                        ip,
+                        "true",
+                        timeout=20,
+                        connect_timeout=15,
+                        user=SSH_USER,
+                        port=SSH_PORT,
+                        key=SSH_KEY,
+                        disable_mux=False,
+                        retry_without_mux_on_timeout=False,
+                    )
+                except Exception:
+                    pass
             break
         if attempt < 3:
             evict_ssh_mux_socket(ip, user=SSH_USER, port=SSH_PORT)

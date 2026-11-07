@@ -95,7 +95,7 @@ def test_run_ssh_timeout_expired_fallback_propagates_custom_connect_timeout():
 
 
 def test_check_host_pid_health_retries_and_passes_connect_timeout():
-    """Verify check_host_pid_health passes timeout=25, connect_timeout=15 and retries cleanly."""
+    """Verify check_host_pid_health passes timeout=40, connect_timeout=20, retries cleanly, and warms mux."""
     sample_output = "62755\n4194304\n0.15 0.20 0.18 2/850 12345\n142\n"
 
     with (
@@ -105,6 +105,7 @@ def test_check_host_pid_health_retries_and_passes_connect_timeout():
             side_effect=[
                 (255, "", "Connection timed out during banner exchange"),
                 (0, sample_output, ""),
+                (0, "", ""),
             ],
         ) as mock_ssh,
         patch.object(pid_watchdog, "evict_ssh_mux_socket", return_value=True) as mock_evict,
@@ -118,19 +119,51 @@ def test_check_host_pid_health_retries_and_passes_connect_timeout():
     assert res["proc_count"] == 142
     assert res["last_pid"] == 12345
 
-    assert mock_ssh.call_count == 2
+    assert mock_ssh.call_count == 3
     first_kwargs = mock_ssh.call_args_list[0][1]
     second_kwargs = mock_ssh.call_args_list[1][1]
+    warm_kwargs = mock_ssh.call_args_list[2][1]
 
-    assert first_kwargs["timeout"] == 25
-    assert first_kwargs["connect_timeout"] == 15
+    assert first_kwargs["timeout"] == 40
+    assert first_kwargs["connect_timeout"] == 20
     assert first_kwargs["disable_mux"] is False
     assert first_kwargs["retry_without_mux_on_timeout"] is True
 
-    assert second_kwargs["timeout"] == 25
-    assert second_kwargs["connect_timeout"] == 15
+    assert second_kwargs["timeout"] == 40
+    assert second_kwargs["connect_timeout"] == 20
     assert second_kwargs["disable_mux"] is True
     assert second_kwargs["retry_without_mux_on_timeout"] is False
 
+    assert warm_kwargs["disable_mux"] is False
+
     mock_evict.assert_called_once()
     mock_sleep.assert_called_once_with(2.0)
+
+
+def test_check_host_pid_health_final_attempt_reenables_mux():
+    """Verify check_host_pid_health re-enables mux on final attempt 3 to keep multiplexer pinned."""
+    sample_output = "62755\n4194304\n0.15 0.20 0.18 2/850 12345\n142\n"
+
+    with (
+        patch.object(
+            pid_watchdog,
+            "run_ssh",
+            side_effect=[
+                (255, "", "Connection timed out"),
+                (255, "", "Connection timed out"),
+                (0, sample_output, ""),
+            ],
+        ) as mock_ssh,
+        patch.object(pid_watchdog, "evict_ssh_mux_socket", return_value=True) as mock_evict,
+        patch.object(pid_watchdog.time, "sleep") as mock_sleep,
+    ):
+        res = pid_watchdog.check_host_pid_health("198.51.100.10", "NasHost01")
+
+    assert res["status"] == "nominal"
+    assert mock_ssh.call_count == 3
+    third_kwargs = mock_ssh.call_args_list[2][1]
+    assert third_kwargs["timeout"] == 40
+    assert third_kwargs["connect_timeout"] == 20
+    assert third_kwargs["disable_mux"] is False
+    assert mock_evict.call_count == 2
+    assert mock_sleep.call_count == 2

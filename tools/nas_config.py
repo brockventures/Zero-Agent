@@ -153,6 +153,14 @@ def build_ssh_cmd(
     ]
     if disable_mux:
         cmd.extend(["-o", "ControlMaster=no", "-o", "ControlPath=none"])
+    elif os.name != "nt":
+        cmd.extend([
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath=/tmp/ssh_mux_{host}_{p}_{u}",
+            "-o", "ControlPersist=4h",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+        ])
     if batch_mode:
         cmd.extend(["-o", "BatchMode=yes"])
     cmd.extend([f"{u}@{host}", remote_cmd])
@@ -167,10 +175,11 @@ def evict_ssh_mux_socket(
     """Evict a stale or wedged OpenSSH ControlMaster socket for a target host."""
     u = user or SSH_USER
     p = port or SSH_PORT
+    mux_socket = f"/tmp/ssh_mux_{host}_{p}_{u}"
     evicted = False
     try:
         subprocess.run(
-            ["ssh", "-p", str(p), "-O", "exit", f"{u}@{host}"],
+            ["ssh", "-p", str(p), "-o", f"ControlPath={mux_socket}", "-O", "exit", f"{u}@{host}"],
             capture_output=True,
             text=True,
             timeout=3,
@@ -179,7 +188,7 @@ def evict_ssh_mux_socket(
     except Exception:
         pass
 
-    mux_path = Path(f"/tmp/ssh_mux_{host}_{p}_{u}")
+    mux_path = Path(mux_socket)
     try:
         if mux_path.exists() or mux_path.is_socket():
             mux_path.unlink(missing_ok=True)
