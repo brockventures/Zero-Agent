@@ -1077,20 +1077,38 @@ class HeartbeatTracker:
                     continue
 
         # Also inspect recently active subagent transcripts modified within the last 10 minutes
+        # Only scan brain_dir if the current conversation actually invoked a subagent (or has <= 30 entries)
         now = time.time()
-        if self.brain_dir.exists():
+        should_scan_subagents = False
+        transcript_file = conv_path / "logs" / "transcript.jsonl"
+        if transcript_file.exists():
             try:
-                for sub_entry in self.brain_dir.iterdir():
-                    if not sub_entry.is_dir() or sub_entry.name == str(cid):
-                        continue
-                    sub_log = sub_entry / ".system_generated" / "logs" / "transcript.jsonl"
-                    if sub_log.exists():
-                        st = sub_log.stat()
-                        if (now - st.st_mtime) <= 600.0:
-                            file_count += 1
-                            if st.st_mtime > max_mtime:
-                                max_mtime = st.st_mtime
-                            total_bytes += st.st_size
+                if "invoke_subagent" in transcript_file.read_text(encoding="utf-8", errors="ignore"):
+                    should_scan_subagents = True
+            except OSError:
+                pass
+        elif self.brain_dir.exists():
+            should_scan_subagents = True
+
+        if should_scan_subagents and self.brain_dir.exists():
+            try:
+                with os.scandir(self.brain_dir) as it:
+                    for sub_entry in it:
+                        if not sub_entry.is_dir(follow_symlinks=False) or sub_entry.name == str(cid):
+                            continue
+                        try:
+                            if (now - sub_entry.stat(follow_symlinks=False).st_mtime) > 86400.0:
+                                continue
+                        except OSError:
+                            continue
+                        sub_log = Path(sub_entry.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                        if sub_log.exists():
+                            st = sub_log.stat()
+                            if (now - st.st_mtime) <= 600.0:
+                                file_count += 1
+                                if st.st_mtime > max_mtime:
+                                    max_mtime = st.st_mtime
+                                total_bytes += st.st_size
             except OSError:
                 pass
 

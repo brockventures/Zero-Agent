@@ -772,7 +772,7 @@ class TurnCoordinator:
                     )
 
                     # Check for wedged interactive subprocess at >= 45s of silence
-                    if self.probe_process_wedge(proc_pid):
+                    if await asyncio.to_thread(self.probe_process_wedge, proc_pid):
                         if on_recycle:
                             await on_recycle()
                         return self.format_diagnostic_beacon(proc_pid=proc_pid)
@@ -781,14 +781,15 @@ class TurnCoordinator:
                     if proc_pid:
                         try:
                             from tools.process_probe import get_process_children
-                            has_children = len(get_process_children(proc_pid)) > 0
+                            has_children = len(await asyncio.to_thread(get_process_children, proc_pid)) > 0
                             if has_children:
                                 self.maybe_touch_beacon()
                         except Exception:
                             pass
 
                     # Watchdog timeout check
-                    is_timeout, reason = self.check_watchdog_timeout(
+                    is_timeout, reason = await asyncio.to_thread(
+                        self.check_watchdog_timeout,
                         step_idle_timeout=watchdog_timeout,
                         turn_timeout_seconds=watchdog_timeout,
                         max_turn_ceiling=max_turn_ceiling,

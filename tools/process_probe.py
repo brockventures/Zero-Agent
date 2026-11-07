@@ -72,8 +72,8 @@ def get_process_children(pid: int) -> List[int]:
     except (OSError, PermissionError):
         pass
 
-    # Fallback to scanning all /proc if /proc/<pid>/task/<tid>/children is empty
-    if not direct_children:
+    # Fallback to scanning all /proc only on kernels lacking /proc/<pid>/task/<tid>/children
+    if not direct_children and not (task_dir / str(pid) / "children").exists():
         try:
             for p in Path("/proc").iterdir():
                 if p.is_dir() and p.name.isdigit():
@@ -182,7 +182,7 @@ def inspect_single_process(pid: int) -> Dict[str, Any]:
 
 def scan_tail_for_prompts(text_buffer: str) -> Optional[str]:
     """Scan the tail of a process output buffer for interactive prompt patterns."""
-    lines = [l.strip() for l in text_buffer.splitlines() if l.strip()]
+    lines = [ln.strip() for ln in text_buffer.splitlines() if ln.strip()]
     if not lines:
         return None
 
