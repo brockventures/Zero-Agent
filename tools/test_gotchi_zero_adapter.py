@@ -1453,6 +1453,235 @@ def test_handoff_to_zero_runtime_and_defer_marker_wakes_zero_chat(monkeypatch):
     assert "[GOTCHI VOICE HANDOFF]: Run the full CAD render and slice the enclosure." in queued_turns[0]["prompt"]
 
 
+def test_contextual_tool_stage_events_and_multistep_progress_streaming(monkeypatch):
+    import sys
+    import types as py_types
+    from typing import Optional, Tuple
+    from tools.gotchi_zero_adapter import (
+        GotchiZeroBrainAdapter,
+        brain_call_stream,
+        build_contextual_tool_filler,
+        format_voice_turn_prefix,
+    )
+
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._append_voice_turn_to_history",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setenv("GOTCHI_CONTEXT_CACHE_ENABLED", "0")
+
+    executed_tools: List[Tuple[str, Dict[str, Any]]] = []
+
+    async def fake_execute_tool(name: str, args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+        executed_tools.append((name, dict(args)))
+        if name == "check_tasks_and_repos":
+            return {"result": "Open PR #142 in brockventures/gotchi"}
+        if name == "read_local_file":
+            return {"content": "Build status: green"}
+        if name == "get_weather_forecast":
+            return {"forecast": "68F and clear"}
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.execute_gotchi_tool_call",
+        fake_execute_tool,
+    )
+
+    # Set up a fake stage_events module to verify stage_events.emit_stage is invoked
+    emitted_lomin_stages: List[Dict[str, Any]] = []
+    fake_stage_events_mod = py_types.ModuleType("stage_events")
+
+    def fake_emit_stage(*args: Any, **kwargs: Any) -> None:
+        if kwargs:
+            emitted_lomin_stages.append(dict(kwargs))
+        elif len(args) >= 2:
+            emitted_lomin_stages.append({"stage": args[0], "detail": args[1]})
+        elif len(args) == 1 and isinstance(args[0], dict):
+            emitted_lomin_stages.append(dict(args[0]))
+
+    fake_stage_events_mod.emit_stage = fake_emit_stage  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "stage_events", fake_stage_events_mod)
+
+    class FakeFunctionCall:
+        def __init__(self, name: str, args: Dict[str, Any]):
+            self.name = name
+            self.args = args
+
+    class FakeChunk:
+        def __init__(
+            self,
+            text: str = "",
+            function_calls: Optional[List[Any]] = None,
+        ):
+            self.text = text
+            self.function_calls = function_calls
+            self.candidates = []
+
+    # Case 1: Multi-step tool turn where step 0 calls a tool without text, step 1 emits
+    # intermediate progress text ("I checked the open PRs, now reading the status log.")
+    # and calls a second tool, and step 2 emits the final answer.
+    class MultiStepModelsWithIntermediateText:
+        def __init__(self):
+            self.call_count = 0
+
+        async def generate_content_stream(self, model: str, contents: Any, config: Any):
+            step_idx = self.call_count
+            self.call_count += 1
+            if step_idx == 0:
+                yield FakeChunk(
+                    text="",
+                    function_calls=[
+                        FakeFunctionCall("check_tasks_and_repos", {"repo_or_filter": "gotchi"})
+                    ],
+                )
+            elif step_idx == 1:
+                yield FakeChunk(
+                    text="I found open PR 142, now checking the local build log.",
+                    function_calls=[
+                        FakeFunctionCall("read_local_file", {"file_path": "/workspace/data/tasks.json"})
+                    ],
+                )
+            else:
+                yield FakeChunk(
+                    text="PR 142 is open and the local build log is completely green.",
+                    function_calls=None,
+                )
+
+    class FakeAio:
+        def __init__(self, models_impl: Any):
+            self.models = models_impl
+
+    class FakeGenaiClient:
+        def __init__(self, models_impl: Any):
+            self.aio = FakeAio(models_impl)
+
+    adapter = GotchiZeroBrainAdapter(api_key="fake-key", dispatch_discord=False)
+    adapter._genai_client = FakeGenaiClient(MultiStepModelsWithIntermediateText())
+
+    streamed_sentences: List[str] = []
+    stage_cb_events: List[Dict[str, Any]] = []
+    tool_start_events: List[Tuple[str, str, str]] = []
+    stages_out: Dict[str, Any] = {}
+
+    def on_tool_cb(stage: str = "tool", tool: str = "", detail: str = "", **kw: Any) -> None:
+        tool_start_events.append((stage, tool, detail))
+
+    def on_stage_cb(ev: Dict[str, Any]) -> None:
+        stage_cb_events.append(dict(ev))
+
+    res = asyncio.run(
+        adapter.handle_turn(
+            {
+                "node_id": "gotchi-ryan-01",
+                "session_id": "sess-multistep-1",
+                "prompt": "Check the tasks and build log.",
+                "_on_sentence": streamed_sentences.append,
+                "_on_tool_start": on_tool_cb,
+                "on_stage": on_stage_cb,
+                "stages_out": stages_out,
+            }
+        )
+    )
+
+    # Both step 0 and step 1 tool calls must trigger stage callbacks and stages_out
+    assert len(executed_tools) == 2
+    assert [t[0] for t in executed_tools] == ["check_tasks_and_repos", "read_local_file"]
+
+    assert len(tool_start_events) == 2
+    assert tool_start_events[0][0] == "tool"
+    assert tool_start_events[0][1] == "check_tasks_and_repos"
+    assert tool_start_events[0][2] == build_contextual_tool_filler(
+        "check_tasks_and_repos", {"repo_or_filter": "gotchi"}, format_voice_turn_prefix(node_id="gotchi-ryan-01", speaker="ryan") + "\nCheck the tasks and build log."
+    )
+    assert tool_start_events[1][0] == "tool"
+    assert tool_start_events[1][1] == "read_local_file"
+
+    assert len(stage_cb_events) == 2
+    assert stage_cb_events[0]["stage"] == "tool"
+    assert stage_cb_events[0]["tool"] == "check_tasks_and_repos"
+    assert stage_cb_events[1]["stage"] == "tool"
+    assert stage_cb_events[1]["tool"] == "read_local_file"
+
+    assert "events" in stages_out
+    assert len(stages_out["events"]) == 2
+    assert stages_out["events"][0]["stage"] == "tool"
+    assert stages_out["events"][0]["tool"] == "check_tasks_and_repos"
+    assert stages_out["events"][1]["stage"] == "tool"
+    assert stages_out["events"][1]["tool"] == "read_local_file"
+
+    assert len(emitted_lomin_stages) == 2
+    assert emitted_lomin_stages[0]["stage"] == "tool"
+    assert emitted_lomin_stages[0]["tool"] == "check_tasks_and_repos"
+    assert emitted_lomin_stages[1]["tool"] == "read_local_file"
+
+    # Streamed sentences must include:
+    # 1) Step 0 pre-tool contextual filler
+    # 2) Step 1 intermediate progress text ("I found open PR 142, now checking the local build log.")
+    # 3) Step 2 final synthesis ("PR 142 is open and the local build log is completely green.")
+    assert len(streamed_sentences) == 3
+    assert any("found open pr 142" in s.lower() for s in streamed_sentences)
+    assert "pr 142 is open and the local build log is completely green." in streamed_sentences[-1].lower()
+    assert "pr 142 is open" in res["reply"].lower()
+
+    # Case 2: Multi-step tool turn where step 1 calls a subsequent tool WITHOUT intermediate text
+    # -> must emit contextual tool filler for the step 1 tool via _emit_streamed_sentence, and
+    #    test brain_call_stream(stages_out=...) forwarding.
+    class MultiStepModelsSilentStep1:
+        def __init__(self):
+            self.call_count = 0
+
+        async def generate_content_stream(self, model: str, contents: Any, config: Any):
+            step_idx = self.call_count
+            self.call_count += 1
+            if step_idx == 0:
+                yield FakeChunk(
+                    text="",
+                    function_calls=[
+                        FakeFunctionCall("check_tasks_and_repos", {"repo_or_filter": "gotchi"})
+                    ],
+                )
+            elif step_idx == 1:
+                yield FakeChunk(
+                    text="",
+                    function_calls=[
+                        FakeFunctionCall("get_weather_forecast", {"location": "Seattle"})
+                    ],
+                )
+            else:
+                yield FakeChunk(
+                    text="Tasks are clear and Seattle is 68 degrees.",
+                    function_calls=None,
+                )
+
+    monkeypatch.setattr(
+        GotchiZeroBrainAdapter,
+        "_get_genai_client",
+        lambda self: FakeGenaiClient(MultiStepModelsSilentStep1()),
+    )
+
+    partials: List[str] = []
+    stream_stages_out: Dict[str, Any] = {}
+    stream_reply = brain_call_stream(
+        "gotchi-ryan-01",
+        "Check tasks and weather.",
+        timeout=30,
+        on_partial=partials.append,
+        stages_out=stream_stages_out,
+    )
+    assert "seattle is 68 degrees" in stream_reply.lower()
+    assert len(stream_stages_out.get("events", [])) == 2
+    assert stream_stages_out["events"][0]["tool"] == "check_tasks_and_repos"
+    assert stream_stages_out["events"][1]["tool"] == "get_weather_forecast"
+    # Verify step 0 filler, step 1 weather filler, and step 2 final reply were all streamed via on_partial
+    assert len(partials) >= 3
+    assert any("weather" in p.lower() or "forecast" in p.lower() or "conditions" in p.lower() for p in partials)
+
+
+
 
 
 

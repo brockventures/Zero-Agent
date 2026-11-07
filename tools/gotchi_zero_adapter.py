@@ -39,6 +39,7 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -3479,6 +3480,124 @@ class GotchiZeroBrainAdapter:
             if asyncio.iscoroutine(res):
                 await res
 
+    async def _emit_stage_event(
+        self,
+        *,
+        fn_name: str,
+        fn_args: Dict[str, Any],
+        detail: str,
+        step: int,
+        t0: float,
+        on_tool_start: Optional[Callable[..., Any]] = None,
+        on_stage: Optional[Callable[..., Any]] = None,
+        stage_callback: Optional[Callable[..., Any]] = None,
+        stages_out: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        elapsed = round(max(0.0, time.monotonic() - t0), 3)
+        event_dict: Dict[str, Any] = {
+            "stage": "tool",
+            "tool": fn_name,
+            "detail": detail,
+            "args": fn_args,
+            "step": step,
+            "t": elapsed,
+        }
+        if isinstance(stages_out, dict):
+            stages_out.setdefault("call_start_ms", int(time.time() * 1000))
+            events_list = stages_out.setdefault("events", [])
+            if isinstance(events_list, list):
+                events_list.append(dict(event_dict))
+        else:
+            try:
+                gw_mod = sys.modules.get("gateway") or sys.modules.get("lomin.gateway")
+                if gw_mod is not None:
+                    sink = getattr(gw_mod, "_STAGE_SINK", None)
+                    sink_stages = getattr(sink, "stages", None) if sink is not None else None
+                    if isinstance(sink_stages, dict):
+                        sink_stages.setdefault("call_start_ms", int(time.time() * 1000))
+                        events_list = sink_stages.setdefault("events", [])
+                        if isinstance(events_list, list):
+                            events_list.append(dict(event_dict))
+            except Exception:
+                pass
+
+        for mod_name in ("stage_events", "lomin.stage_events"):
+            try:
+                se_mod = sys.modules.get(mod_name)
+                if se_mod is None:
+                    import importlib
+
+                    se_mod = importlib.import_module(mod_name)
+                emit_fn = getattr(se_mod, "emit_stage", None)
+                if callable(emit_fn):
+                    try:
+                        emit_fn(stage="tool", tool=fn_name, detail=detail)
+                    except TypeError:
+                        try:
+                            emit_fn("tool", detail)
+                        except TypeError:
+                            emit_fn(dict(event_dict))
+                    break
+            except Exception:
+                continue
+
+        async def _call_cb(cb: Any, is_tool_cb: bool = False) -> None:
+            if not callable(cb):
+                return
+            try:
+                sig = inspect.signature(cb)
+                params = list(sig.parameters.values())
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+                has_var_pos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+                param_names = {p.name for p in params}
+                pos_params = [
+                    p
+                    for p in params
+                    if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                ]
+                if has_var_kw or {"stage", "tool", "detail"}.issubset(param_names):
+                    kw: Dict[str, Any] = {"stage": "tool", "tool": fn_name, "detail": detail}
+                    if not has_var_kw:
+                        kw = {k: v for k, v in kw.items() if k in param_names}
+                    res = cb(**kw)
+                elif len(pos_params) >= 3 or has_var_pos:
+                    try:
+                        res = cb(stage="tool", tool=fn_name, detail=detail)
+                    except TypeError:
+                        res = cb(fn_name if is_tool_cb else dict(event_dict))
+                elif len(pos_params) == 2:
+                    if is_tool_cb:
+                        res = cb(fn_name, detail)
+                    else:
+                        res = cb("tool", detail)
+                elif len(pos_params) == 1:
+                    first_name = pos_params[0].name.lower()
+                    if is_tool_cb and first_name not in ("event", "ev", "payload", "raw", "data", "stage_event"):
+                        res = cb(fn_name)
+                    else:
+                        res = cb(dict(event_dict))
+                else:
+                    res = cb()
+            except TypeError:
+                try:
+                    res = cb(fn_name if is_tool_cb else dict(event_dict))
+                except TypeError:
+                    res = cb(dict(event_dict))
+            if inspect.isawaitable(res):
+                await res
+
+        seen_cbs: List[Any] = []
+        for cb, is_tool in (
+            (on_tool_start, True),
+            (on_stage, False),
+            (stage_callback, False),
+        ):
+            if cb is not None and cb not in seen_cbs:
+                seen_cbs.append(cb)
+                await _call_cb(cb, is_tool_cb=is_tool)
+
+        return event_dict
+
     async def _run_gemini_with_tools(
         self,
         prompt: str,
@@ -3486,10 +3605,15 @@ class GotchiZeroBrainAdapter:
         burst_images: List[bytes],
         on_sentence: Optional[Callable[[str], Any]] = None,
         audio_bytes: Optional[bytes] = None,
+        on_tool_start: Optional[Callable[..., Any]] = None,
+        on_stage: Optional[Callable[..., Any]] = None,
+        stage_callback: Optional[Callable[..., Any]] = None,
+        stages_out: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, bool, List[str]]:
         from backend.voice_gateway import SentenceStreamSplitter
         from google.genai import types
 
+        t0_run = time.monotonic()
         client = self._get_genai_client()
         if client is None:
             return "Zero is online, but GEMINI_API_KEY is not configured in the environment.", False, []
@@ -3648,7 +3772,16 @@ class GotchiZeroBrainAdapter:
                     return final_raw, explicitly_posted_to_zero_chat, emitted_sentences
             else:
                 if step_fcalls:
-                    step_text = ""
+                    if step_text:
+                        accumulated_raw_parts.append(step_text)
+                        for ready_s in splitter.feed(step_text):
+                            await self._emit_streamed_sentence(
+                                ready_s, emitted_sentences, on_sentence
+                            )
+                        for trailing_s in splitter.flush():
+                            await self._emit_streamed_sentence(
+                                trailing_s, emitted_sentences, on_sentence
+                            )
                 else:
                     if step_text:
                         accumulated_raw_parts.append(step_text)
@@ -3668,9 +3801,22 @@ class GotchiZeroBrainAdapter:
 
             fn_parts: List[types.Part] = []
             tool_had_error = False
+            step_emitted_progress = bool(step_text)
             for fc in step_fcalls:
                 fn_name = getattr(fc, "name", "")
                 fn_args = dict(getattr(fc, "args", {}) or {})
+                filler_detail = build_contextual_tool_filler(fn_name, fn_args, prompt)
+                await self._emit_stage_event(
+                    fn_name=fn_name,
+                    fn_args=fn_args,
+                    detail=filler_detail,
+                    step=_step,
+                    t0=t0_run,
+                    on_tool_start=on_tool_start,
+                    on_stage=on_stage,
+                    stage_callback=stage_callback,
+                    stages_out=stages_out,
+                )
                 if fn_name == "request_deep_thinking":
                     model_requested_deep_thinking = True
                     preamble = str(fn_args.get("spoken_preamble", "") or "").strip()
@@ -3680,6 +3826,7 @@ class GotchiZeroBrainAdapter:
                         await self._emit_streamed_sentence(
                             preamble, emitted_sentences, on_sentence
                         )
+                        step_emitted_progress = True
                 elif fn_name == "handoff_to_zero_runtime":
                     ack_text = str(
                         fn_args.get("spoken_ack")
@@ -3691,12 +3838,19 @@ class GotchiZeroBrainAdapter:
                         await self._emit_streamed_sentence(
                             ack_text, emitted_sentences, on_sentence
                         )
+                        step_emitted_progress = True
                 elif _step == 0 and not step_text and not emitted_sentences:
                     # Pre-tool contextual action narration when the model invokes a tool without leading text
-                    default_preamble = build_contextual_tool_filler(fn_name, fn_args, prompt)
                     await self._emit_streamed_sentence(
-                        default_preamble, emitted_sentences, on_sentence
+                        filler_detail, emitted_sentences, on_sentence
                     )
+                    step_emitted_progress = True
+                elif _step >= 1 and not step_emitted_progress:
+                    # Multi-step tool progress narration when the model invokes a subsequent tool without step_text
+                    await self._emit_streamed_sentence(
+                        filler_detail, emitted_sentences, on_sentence
+                    )
+                    step_emitted_progress = True
 
                 res_dict = await execute_gotchi_tool_call(fn_name, fn_args)
                 if fn_name in ("post_note_to_zero_chat", "handoff_to_zero_runtime") or (
@@ -3811,6 +3965,18 @@ class GotchiZeroBrainAdapter:
         speaker = resolve_speaker_for_node(node_id, parsed_turn.get("speaker"))
         session_id = str(parsed_turn.get("session_id") or f"sess-{int(time.time()*1000)}")
         on_sentence: Optional[Callable[[str], Any]] = parsed_turn.get("_on_sentence")
+        on_tool_start: Optional[Callable[..., Any]] = (
+            parsed_turn.get("_on_tool_start") or parsed_turn.get("on_tool_start")
+        )
+        on_stage: Optional[Callable[..., Any]] = (
+            parsed_turn.get("on_stage") or parsed_turn.get("_on_stage")
+        )
+        stage_callback: Optional[Callable[..., Any]] = parsed_turn.get("stage_callback")
+        stages_out: Optional[Dict[str, Any]] = (
+            parsed_turn.get("stages_out")
+            if isinstance(parsed_turn.get("stages_out"), dict)
+            else None
+        )
 
         image_bytes: Optional[bytes] = parsed_turn.get("image_bytes")
         if image_bytes is None and parsed_turn.get("image_b64"):
@@ -3953,6 +4119,24 @@ class GotchiZeroBrainAdapter:
         streamed_sentences: List[str] = []
         ha_matched, ha_speech, ha_meta = (False, "", {"reason": "disabled"})
 
+        def _build_gemini_stage_kwargs() -> Dict[str, Any]:
+            candidate_kw = {
+                "on_tool_start": on_tool_start,
+                "on_stage": on_stage,
+                "stage_callback": stage_callback,
+                "stages_out": stages_out,
+            }
+            non_null = {k: v for k, v in candidate_kw.items() if v is not None}
+            if not non_null:
+                return {}
+            try:
+                sig = inspect.signature(self._run_gemini_with_tools)
+                params = sig.parameters
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                return {k: v for k, v in non_null.items() if has_var_kw or k in params}
+            except (ValueError, TypeError):
+                return non_null
+
         if direct_audio_to_brain and bg_stt_task is not None:
             # Race Gemini audio stream against bg_stt_task:
             # Hold Gemini's sentence output until either the transcript arrives
@@ -3976,6 +4160,7 @@ class GotchiZeroBrainAdapter:
                     burst_images=burst_images,
                     on_sentence=_gated_on_sentence,
                     audio_bytes=audio_bytes,
+                    **_build_gemini_stage_kwargs(),
                 )
             )
             first_sentence_waiter = asyncio.create_task(first_sentence_ready.wait())
@@ -4110,6 +4295,10 @@ class GotchiZeroBrainAdapter:
                         "image_bytes": image_bytes,
                         "burst_images": burst_images,
                         "_on_sentence": on_sentence,
+                        "_on_tool_start": on_tool_start,
+                        "on_stage": on_stage,
+                        "stage_callback": stage_callback,
+                        "stages_out": stages_out,
                     }
                 )
                 if asyncio.iscoroutine(raw_res):
@@ -4131,12 +4320,26 @@ class GotchiZeroBrainAdapter:
                 async def _forward_sentence(s_txt: str) -> None:
                     await self._emit_streamed_sentence(s_txt, streamed_sentences, on_sentence)
 
+                async def _forward_tool_start(t_name: str) -> None:
+                    filler = build_contextual_tool_filler(t_name, {}, call_prompt)
+                    await self._emit_stage_event(
+                        fn_name=t_name,
+                        fn_args={},
+                        detail=filler,
+                        step=0,
+                        t0=t0,
+                        on_tool_start=on_tool_start,
+                        on_stage=on_stage,
+                        stage_callback=stage_callback,
+                        stages_out=stages_out,
+                    )
+
                 worker_res = await self.warm_worker.run_turn(
                     call_prompt,
                     node_id=node_id,
                     session_id=session_id,
                     on_sentence=_forward_sentence,
-                    on_tool_start=parsed_turn.get("_on_tool_start"),
+                    on_tool_start=_forward_tool_start,
                 )
                 raw_reply = str(worker_res.get("reply") or "")
             else:
@@ -4149,6 +4352,7 @@ class GotchiZeroBrainAdapter:
                     burst_images=burst_images,
                     on_sentence=on_sentence,
                     audio_bytes=audio_bytes if direct_audio_to_brain else None,
+                    **_build_gemini_stage_kwargs(),
                 )
 
         if bg_stt_task is not None:
@@ -4263,6 +4467,9 @@ def brain_call_stream(
     timeout: int = 45,
     on_partial: Optional[Callable[[str], None]] = None,
     stages_out: Optional[Dict[str, Any]] = None,
+    on_stage: Optional[Callable[..., Any]] = None,
+    on_tool_start: Optional[Callable[..., Any]] = None,
+    stage_callback: Optional[Callable[..., Any]] = None,
 ) -> str:
     """Lomin plugin streaming brain hook."""
     adapter = GotchiZeroBrainAdapter()
@@ -4273,16 +4480,39 @@ def brain_call_stream(
         if on_partial is not None:
             on_partial(" ".join(running_sentences))
 
-    res = asyncio.run(
-        adapter.handle_turn(
-            {
-                "prompt": prompt,
-                "node_id": target or "gotchi-ryan-01",
-                "_on_sentence": _on_s,
-            }
-        )
-    )
+    if stages_out is None:
+        try:
+            gw_mod = sys.modules.get("gateway") or sys.modules.get("lomin.gateway")
+            if gw_mod is not None:
+                sink = getattr(gw_mod, "_STAGE_SINK", None)
+                sink_stages = getattr(sink, "stages", None) if sink is not None else None
+                if isinstance(sink_stages, dict):
+                    stages_out = sink_stages
+        except Exception:
+            pass
+
+    if isinstance(stages_out, dict):
+        stages_out.setdefault("call_start_ms", int(time.time() * 1000))
+        stages_out.setdefault("events", [])
+
+    turn_payload: Dict[str, Any] = {
+        "prompt": prompt,
+        "node_id": target or "gotchi-ryan-01",
+        "_on_sentence": _on_s,
+    }
+    if stages_out is not None:
+        turn_payload["stages_out"] = stages_out
+    if on_stage is not None:
+        turn_payload["on_stage"] = on_stage
+    if on_tool_start is not None:
+        turn_payload["_on_tool_start"] = on_tool_start
+    if stage_callback is not None:
+        turn_payload["stage_callback"] = stage_callback
+
+    res = asyncio.run(adapter.handle_turn(turn_payload))
     reply = str(res.get("reply") or "")
+    if isinstance(stages_out, dict):
+        stages_out["final_seen_ms"] = int(time.time() * 1000)
     if on_partial is not None and not running_sentences and reply:
         on_partial(reply)
     return reply
