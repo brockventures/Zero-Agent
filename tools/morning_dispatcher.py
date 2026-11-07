@@ -39,8 +39,8 @@ DATA_DIR = Path("/workspace/data")
 HISTORY_FILE = DATA_DIR / "morning_rotation_history.json"
 TARGET_CHANNEL = "the-banana-stand"  # 1534436119888793750
 
-# Marvin (Dr. Coley moving house) and Aerial are temporarily benched from the rotation.
-SKIP_LIST = {"marvin", "aerial"}
+# Marvin (Dr. Coley moving house) is temporarily benched from the rotation.
+SKIP_LIST = {"marvin"}
 
 ROSTER = [
     {
@@ -68,8 +68,8 @@ ROSTER = [
         "agent": "aerial",
         "name": "Aerial",
         "tag": "<@1542035925603713086>",
-        "role": "Alex's agent (benched)",
-        "enabled": False,
+        "role": "Alex's agent",
+        "enabled": True,
     },
 ]
 
@@ -103,7 +103,7 @@ def get_rotation_target(dt: datetime | None = None) -> dict:
         "role": entry["role"]
     }
 
-TEAM_ROLE_TAG = "<@&1543462881624858624>"
+TEAM_ROLE_TAG = "<@&1543462881624858624> <@&1544591666671915070>"
 
 THEME_DESCRIPTION = (
     "Feel free to bring whatever is top of mind across:\n"
@@ -148,23 +148,24 @@ def generate_morning_payload(target: dict, note: str | None = None) -> str:
         envelope = {
             "v": 1.1,
             "kind": "handoff",
-            "reply": "required",
+            "reply": "optional",
+            "floor": "open",
             "subject": f"morning-topic-{date_str}",
-            "to": "Amos",
+            "to": "all",
             "round": 1,
-            "max_rounds": 3,
+            "max_rounds": 10,
             "evidence": [
                 {
                     "src": "bin/morning-dispatcher.py",
-                    "note": f"Pacific Day {day_num} roster rotation (3 rounds max)"
+                    "note": f"Pacific Day {day_num} roster rotation (Amos leads, floor open to all)"
                 }
             ]
         }
         env_str = json.dumps(envelope, indent=2)
         body = (
-            f"{target['tag']} {TEAM_ROLE_TAG} **Morning Engineering Standup (Round 1 of 3) — The floor is yours.**\n\n"
+            f"{target['tag']} {TEAM_ROLE_TAG} **Morning Engineering Standup (Round 1 of 10) — Amos leads, floor open to all.**\n\n"
             f"{THEME_DESCRIPTION}\n\n"
-            f"Floor is open for your topic (3 rounds of discussion)."
+            f"Floor is open for group discussion (10 rounds max)."
         )
         if note:
             body = f"{body}\n\n*{note}*"
@@ -177,23 +178,24 @@ def generate_morning_payload(target: dict, note: str | None = None) -> str:
         envelope = {
             "v": 1.1,
             "kind": "handoff",
-            "reply": "required",
+            "reply": "optional",
+            "floor": "open",
             "subject": f"morning-topic-{date_str}",
-            "to": "Marvin",
+            "to": "all",
             "round": 1,
-            "max_rounds": 3,
+            "max_rounds": 10,
             "evidence": [
                 {
                     "src": "bin/morning-dispatcher.py",
-                    "note": f"Pacific Day {day_num} roster rotation (3 rounds max)"
+                    "note": f"Pacific Day {day_num} roster rotation (Marvin leads, floor open to all)"
                 }
             ]
         }
         env_str = json.dumps(envelope, indent=2)
         body = (
-            f"{target['tag']} {TEAM_ROLE_TAG} **Morning Engineering Standup (Round 1 of 3) — Marvin, the floor is yours.**\n\n"
+            f"{target['tag']} {TEAM_ROLE_TAG} **Morning Engineering Standup (Round 1 of 10) — Marvin leads, floor open to all.**\n\n"
             f"{THEME_DESCRIPTION}\n\n"
-            f"Floor is open for your topic (3 rounds of discussion)."
+            f"Floor is open for group discussion (10 rounds max)."
         )
         if note:
             body = f"{body}\n\n*{note}*"
@@ -206,23 +208,24 @@ def generate_morning_payload(target: dict, note: str | None = None) -> str:
         envelope = {
             "v": 1.1,
             "kind": "handoff",
-            "reply": "required",
+            "reply": "optional",
+            "floor": "open",
             "subject": f"morning-topic-{date_str}",
-            "to": "Aerial",
+            "to": "all",
             "round": 1,
-            "max_rounds": 3,
+            "max_rounds": 10,
             "evidence": [
                 {
                     "src": "bin/morning-dispatcher.py",
-                    "note": f"Pacific Day {day_num} roster rotation (3 rounds max)"
+                    "note": f"Pacific Day {day_num} roster rotation (Aerial leads, floor open to all)"
                 }
             ]
         }
         env_str = json.dumps(envelope, indent=2)
         body = (
-            f"{target['tag']} {TEAM_ROLE_TAG} **Morning Engineering Standup (Round 1 of 3) — Aerial, the floor is yours.**\n\n"
+            f"{target['tag']} {TEAM_ROLE_TAG} **Morning Engineering Standup (Round 1 of 10) — Aerial leads, floor open to all.**\n\n"
             f"{THEME_DESCRIPTION}\n\n"
-            f"Floor is open for your topic (3 rounds of discussion)."
+            f"Floor is open for group discussion (10 rounds max)."
         )
         if note:
             body = f"{body}\n\n*{note}*"
@@ -241,20 +244,22 @@ def generate_morning_payload(target: dict, note: str | None = None) -> str:
             "v": 1.1,
             "kind": "finding",
             "reply": "optional",
+            "floor": "open",
             "subject": f"morning-topic-{date_str}",
+            "to": "all",
             "round": 1,
-            "max_rounds": 3,
+            "max_rounds": 10,
             "evidence": [
                 {
                     "src": "bin/morning-dispatcher.py",
-                    "note": f"Pacific Day {day_num} roster rotation (Zero seed: {seed['title']}, 3 rounds max)"
+                    "note": f"Pacific Day {day_num} roster rotation (Zero seed: {seed['title']}, floor open to all)"
                 }
             ]
         }
         env_str = json.dumps(envelope, indent=2)
         body = (
-            f"☀️ **Morning Engineering Standup (Day {day_num} — Zero — Round 1 of 3)**\n\n"
-            f"{TEAM_ROLE_TAG} Today's standup is open (3 rounds of discussion). I'll kick off with a seed topic, but the floor is open for peer feedback or bringing whatever is top of mind:\n\n"
+            f"☀️ **Morning Engineering Standup (Day {day_num} — Zero — Round 1 of 10)**\n\n"
+            f"{TEAM_ROLE_TAG} Today's standup is open (10 rounds of discussion). I'll kick off with a seed topic, but the floor is open for peer feedback or bringing whatever is top of mind:\n\n"
             f"**Seed Topic: {seed['title']}**\n"
             f"{seed['description']}\n\n"
             f"{THEME_DESCRIPTION}\n\n"

@@ -171,7 +171,7 @@ def log_execution(job_id: str, name: str, status: str, duration_sec: float, summ
     is_test_runner = (
         "PYTEST_CURRENT_TEST" in os.environ
         or "pytest" in sys.modules
-        or ("unittest" in sys.modules and any(k.startswith("test_") or ".test_" in k for k in sys.modules))
+        or ("unittest" in sys.modules and any(k.startswith("test_") or ".test_" in k for k in list(sys.modules)))
     )
     if is_test_runner and str(EXECUTION_STATUS_FILE).startswith("/workspace/data"):
         return entry

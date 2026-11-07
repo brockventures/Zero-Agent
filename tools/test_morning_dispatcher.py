@@ -23,30 +23,34 @@ def test_active_roster_excludes_benched_agents():
     active_agents = {entry["agent"] for entry in active}
 
     assert "marvin" not in active_agents
-    assert "aerial" not in active_agents
+    assert "aerial" in active_agents
     assert "zero" in active_agents
     assert "amos" in active_agents
-    assert len(active) == 2
+    assert len(active) == 3
 
 
-def test_rotation_target_alternates_zero_and_amos():
-    # Day 278 -> Zero (278 % 2 == 0)
-    # Day 279 -> Amos (279 % 2 == 1)
-    dt_day_278 = datetime(2026, 10, 5, 9, 30, tzinfo=PT)
+def test_rotation_target_cycles_active_roster():
+    # Day 279 -> Zero (279 % 3 == 0)
+    # Day 280 -> Amos (280 % 3 == 1)
+    # Day 281 -> Aerial (281 % 3 == 2)
     dt_day_279 = datetime(2026, 10, 6, 9, 30, tzinfo=PT)
+    dt_day_280 = datetime(2026, 10, 7, 9, 30, tzinfo=PT)
+    dt_day_281 = datetime(2026, 10, 8, 9, 30, tzinfo=PT)
 
-    target_278 = get_rotation_target(dt_day_278)
-    target_279 = get_rotation_target(dt_day_279)
-
-    assert target_278["agent"] == "zero"
-    assert target_279["agent"] == "amos"
+    assert get_rotation_target(dt_day_279)["agent"] == "zero"
+    assert get_rotation_target(dt_day_280)["agent"] == "amos"
+    assert get_rotation_target(dt_day_281)["agent"] == "aerial"
 
 
 def test_generate_morning_payload_v1_1_envelope():
-    dt_day_278 = datetime(2026, 10, 5, 9, 30, tzinfo=PT)
-    target = get_rotation_target(dt_day_278)
+    dt_day_279 = datetime(2026, 10, 6, 9, 30, tzinfo=PT)
+    target = get_rotation_target(dt_day_279)
     payload = generate_morning_payload(target)
 
-    assert '\"v\": 1.1' in payload
-    assert '\"kind\": \"finding\"' in payload
-    assert "morning-topic-2026-10-05" in payload
+    assert '"v": 1.1' in payload
+    assert '"kind": "finding"' in payload
+    assert '"to": "all"' in payload
+    assert '"floor": "open"' in payload
+    assert '"max_rounds": 10' in payload
+    assert "morning-topic-2026-10-06" in payload
+    assert "<@&1543462881624858624> <@&1544591666671915070>" in payload
