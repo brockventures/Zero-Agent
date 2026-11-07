@@ -691,6 +691,31 @@ def stage_fantasy_decision(
         return None
 
 
+def _compact_dilemma_text(text: str) -> str:
+    """Collapse excessive double-spaced blank lines inside Reddit comments (especially short list items)."""
+    raw_lines = [line.strip() for line in text.strip().splitlines()]
+    non_empty = [line for line in raw_lines if line]
+    if not non_empty:
+        return ""
+    out_lines: List[str] = []
+    for idx, line in enumerate(raw_lines):
+        if not line:
+            # Keep a blank line only after long prose paragraphs (>= 55 chars) when followed by another long paragraph
+            prev_line = out_lines[-1] if out_lines else ""
+            next_non_empty = next((nl for nl in raw_lines[idx + 1:] if nl), "")
+            if (
+                prev_line
+                and prev_line != ""
+                and len(prev_line) >= 55
+                and len(next_non_empty) >= 55
+                and not prev_line.endswith(":")
+            ):
+                out_lines.append("")
+            continue
+        out_lines.append(line)
+    return "\n".join(f"> {line}" if line else ">" for line in out_lines)
+
+
 def format_draft_card(candidate: Dict[str, Any], draft: str, decision_staged: bool = False) -> str:
     """Format candidate comment and draft proposal into an actionable Discord card."""
     author = candidate.get("author", "fellow manager")
@@ -699,8 +724,8 @@ def format_draft_card(candidate: Dict[str, Any], draft: str, decision_staged: bo
 
     text = candidate.get("text", "").strip()
 
-    # Ensure multiline text has '>' on every non-empty line for clean Discord blockquote
-    formatted_quote = "\n".join(f"> {line}" if line.strip() else ">" for line in text.splitlines())
+    # Compact excessive blank lines while preserving '>' prefix on every line for clean Discord blockquote
+    formatted_quote = _compact_dilemma_text(text)
 
     bb_block = ""
     bb_ctx = candidate.get("big_board_context")
@@ -713,22 +738,21 @@ def format_draft_card(candidate: Dict[str, Any], draft: str, decision_staged: bo
                 f"{v['player_name']} (`${round(v.get('league_specific_dollar', 0))}`)"
                 for v in vals[:8]
             ]
-            bb_block = f"- **Big Board ({fmt_label}):** {', '.join(top_chips)}\n\n"
+            bb_block = f"- **Big Board ({fmt_label}):** {', '.join(top_chips)}\n"
 
     action_block = (
         "- **Action:** Persistent Decision Card staged below. Approve to post via `u/prime416`, edit the draft, or skip."
         if decision_staged
-        else "- **Action:** Approve below to post via `u/prime416`, edit the draft, or skip.\n\n[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]"
+        else "[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]"
     )
 
     return (
-        f"⚾ **r/fantasybaseball Discovery & Draft Card**\n\n"
-        f"- **Thread:** [**{thread_title}**](<{thread_url}>)\n"
+        f"⚾ **r/fantasybaseball Discovery & Draft Card**\n"
+        f"- **Thread:** [{thread_title}](<{thread_url}>)\n"
         f"- **Dilemma from u/{author}:**\n"
-        f"{formatted_quote}\n\n"
+        f"{formatted_quote}\n"
         f"{bb_block}"
-        f"- **Proposed Draft (Ivy Brain · Gemini 4 Argon Low · 2-Sentence Cap):**\n"
-        f"\"{draft}\"\n\n"
+        f"- **Proposed Draft:** \"{draft}\"\n\n"
         f"{action_block}"
     )
 

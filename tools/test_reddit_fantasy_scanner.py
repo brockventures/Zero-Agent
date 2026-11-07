@@ -104,7 +104,7 @@ class TestRedditFantasyScanner(unittest.TestCase):
         self.assertIn("draft", extra)
 
     def test_format_draft_card_multiline_blockquote(self):
-        """Verify multiline dilemmas get proper '>' prefix on every line for Discord."""
+        """Verify multiline dilemmas get proper '>' prefix on every line and collapse excessive blank lines between short items."""
         cand = {
             "thread_title": "Daily Anything Goes Thread",
             "thread_url": "https://www.reddit.com/r/fantasybaseball/comments/456/",
@@ -115,7 +115,7 @@ class TestRedditFantasyScanner(unittest.TestCase):
         card = format_draft_card(cand, draft)
 
         self.assertIn("> First line of dilemma.", card)
-        self.assertIn(">\n> Second line after blank line.", card)
+        self.assertIn("> Second line after blank line.", card)
         self.assertIn("> Third line.", card)
         self.assertNotIn('> *"', card)
 
