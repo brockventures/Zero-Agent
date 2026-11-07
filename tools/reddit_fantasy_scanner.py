@@ -692,28 +692,11 @@ def stage_fantasy_decision(
 
 
 def _compact_dilemma_text(text: str) -> str:
-    """Collapse excessive double-spaced blank lines inside Reddit comments (especially short list items)."""
-    raw_lines = [line.strip() for line in text.strip().splitlines()]
-    non_empty = [line for line in raw_lines if line]
-    if not non_empty:
+    """Collapse all blank lines inside Reddit comments so Discord blockquotes render without empty '>' rows."""
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if not lines:
         return ""
-    out_lines: List[str] = []
-    for idx, line in enumerate(raw_lines):
-        if not line:
-            # Keep a blank line only after long prose paragraphs (>= 55 chars) when followed by another long paragraph
-            prev_line = out_lines[-1] if out_lines else ""
-            next_non_empty = next((nl for nl in raw_lines[idx + 1:] if nl), "")
-            if (
-                prev_line
-                and prev_line != ""
-                and len(prev_line) >= 55
-                and len(next_non_empty) >= 55
-                and not prev_line.endswith(":")
-            ):
-                out_lines.append("")
-            continue
-        out_lines.append(line)
-    return "\n".join(f"> {line}" if line else ">" for line in out_lines)
+    return "\n".join(f"> {line}" for line in lines)
 
 
 def format_draft_card(candidate: Dict[str, Any], draft: str, decision_staged: bool = False) -> str:

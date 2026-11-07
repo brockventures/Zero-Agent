@@ -104,19 +104,24 @@ class TestRedditFantasyScanner(unittest.TestCase):
         self.assertIn("draft", extra)
 
     def test_format_draft_card_multiline_blockquote(self):
-        """Verify multiline dilemmas get proper '>' prefix on every line and collapse excessive blank lines between short items."""
+        """Verify multiline dilemmas get proper '>' prefix on every line and collapse all blank '>' rows."""
         cand = {
             "thread_title": "Daily Anything Goes Thread",
             "thread_url": "https://www.reddit.com/r/fantasybaseball/comments/456/",
             "author": "DynastyOwner",
-            "text": "First line of dilemma.\n\nSecond line after blank line.\nThird line.",
+            "text": (
+                "Hey guys. I'm one of 6 expansion teams in a cbs format dynasty baseball league that is expanding from 10 to 16 teams.\n\n"
+                "I had the 1st pick in the expansion draft and chose Josue de paula.\n"
+                "Third line."
+            ),
         }
         draft = "Hold your young talent. Do not trade picks. Stay patient."
         card = format_draft_card(cand, draft)
 
-        self.assertIn("> First line of dilemma.", card)
-        self.assertIn("> Second line after blank line.", card)
+        self.assertIn("> Hey guys. I'm one of 6 expansion teams", card)
+        self.assertIn("> I had the 1st pick in the expansion draft", card)
         self.assertIn("> Third line.", card)
+        self.assertNotIn("\n>\n", card)
         self.assertNotIn('> *"', card)
 
     def test_score_candidate_unanswered_dynasty_ranks_high(self):
