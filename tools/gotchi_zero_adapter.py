@@ -47,9 +47,11 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1971,16 +1973,716 @@ def _run_general_web_search(query: str, limit: int = 5) -> str:
         return json.dumps({"error": str(exc)})
 
 
-def _queue_zero_runtime_turn(prompt_text: str, source: str = "gotchi-voice-handoff") -> Dict[str, Any]:
+def _queue_zero_runtime_turn(
+    prompt_text: str,
+    source: str = "gotchi-voice-handoff",
+    node_id: str = "gotchi-ryan-01",
+    task_prompt: str = "",
+) -> Dict[str, Any]:
     """
     Invokes `outbox.queue_agent_turn` into `#zero-chat` (`TARGET_CHANNEL_ID`), accepting either
-    `source=` or `job_name=` parameter conventions cleanly across real and monkeypatched outbox.
+    `source=` or `job_name=` parameter conventions cleanly across real and monkeypatched outbox,
+    and records the detached handoff job for `node_id`.
     """
     ch_str = str(TARGET_CHANNEL_ID) if TARGET_CHANNEL_ID else "1542081375287640084"
     try:
-        return outbox.queue_agent_turn(ch_str, prompt_text, source=source)  # type: ignore[call-arg]
+        res = outbox.queue_agent_turn(ch_str, prompt_text, source=source)  # type: ignore[call-arg]
     except TypeError:
-        return outbox.queue_agent_turn(ch_str, prompt_text, job_name=source)
+        res = outbox.queue_agent_turn(ch_str, prompt_text, job_name=source)
+    _record_detached_handoff_job(
+        node_id=node_id,
+        task_prompt=task_prompt or prompt_text,
+        prompt_text=prompt_text,
+        queued_record=res if isinstance(res, dict) else {"id": f"handoff-{int(time.time()*1000)}"},
+    )
+    return res
+
+
+# --- Active Turn & Detached Handoff Tracking, Cancellation & Status Check ---
+
+_ACTIVE_TURN_LOCK = threading.Lock()
+# Keyed by node_id -> Dict[str, Any] with task_id, target, started_at, cancel_event, asyncio_tasks, prompt
+_ACTIVE_TURNS_BY_NODE: Dict[str, Dict[str, Any]] = {}
+# Keyed by task_id -> Dict[str, Any] (same entry dict)
+_ACTIVE_TURNS_BY_TASK_ID: Dict[str, Dict[str, Any]] = {}
+# Keyed by node_id -> List[Dict[str, Any]] of detached background handoff jobs (most recent last)
+_DETACHED_HANDOFF_JOBS: Dict[str, List[Dict[str, Any]]] = {}
+
+_VOICE_CANCEL_PHRASES = frozenset({
+    "cancel that",
+    "stop that",
+    "never mind",
+    "nevermind",
+    "abort that",
+    "cancel task",
+    "cancel the task",
+    "stop the task",
+    "abort task",
+    "abort the task",
+    "cancel handoff",
+    "cancel the handoff",
+    "stop handoff",
+    "abort handoff",
+    "cancel background task",
+    "stop background task",
+    "cancel it",
+    "stop it",
+    "stop it now",
+    "abort it",
+})
+
+_VOICE_STATUS_PHRASES = frozenset({
+    "how is that task going",
+    "how's that task going",
+    "hows that task going",
+    "is that background task done yet",
+    "is the background task done yet",
+    "is that background task done",
+    "is that task done yet",
+    "is that task done",
+    "status on that handoff",
+    "status of that handoff",
+    "what is the status on that handoff",
+    "what's the status on that handoff",
+    "whats the status on that handoff",
+    "check handoff status",
+    "handoff status",
+    "background task status",
+    "status on that background task",
+    "status on that task",
+    "how is that handoff going",
+    "how's that handoff going",
+    "is that handoff done yet",
+    "is that handoff done",
+})
+
+
+def _extract_clean_utterance(text: str) -> str:
+    """Strips optional `[VOICE TURN ...]` or `[VOICE ...]` framing lines and normalizes punctuation."""
+    raw = (text or "").strip()
+    if raw.startswith("[VOICE") and "]" in raw:
+        raw = raw.split("]", 1)[1].strip()
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    kept = [
+        ln
+        for ln in lines
+        if not ln.startswith("This reply will be spoken aloud:")
+        and not ln.startswith("A spoken request, verified or not,")
+        and not ln.startswith("Current time:")
+    ]
+    joined = " ".join(kept) if kept else raw
+    norm = re.sub(r"[^\w\s']", " ", joined.lower())
+    return " ".join(norm.split())
+
+
+def is_voice_cancel_intent(text: str) -> bool:
+    """Returns True when the utterance matches a voice turn/handoff cancellation phrase."""
+    norm = _extract_clean_utterance(text)
+    if not norm:
+        return False
+    if norm in _VOICE_CANCEL_PHRASES:
+        return True
+    words = norm.split()
+    if len(words) <= 4 and words[0] in ("cancel", "stop", "abort") and (
+        len(words) == 1
+        or any(w in words[1:] for w in ("that", "it", "this", "task", "handoff", "turn", "job", "now"))
+    ):
+        return True
+    if norm.startswith(("cancel that ", "stop that ", "abort that ", "never mind ", "nevermind ")):
+        return True
+    return False
+
+
+def is_handoff_status_intent(text: str) -> bool:
+    """Returns True when the utterance asks for the status of a running or recent detached handoff."""
+    norm = _extract_clean_utterance(text)
+    if not norm or norm == "status check" or norm == "what is the status":
+        return False
+    if norm in _VOICE_STATUS_PHRASES:
+        return True
+    has_target_noun = any(
+        w in norm for w in ("handoff", "background task", "that task", "the task", "background job", "that job")
+    )
+    has_status_cue = any(
+        w in norm
+        for w in (
+            "how is",
+            "how's",
+            "hows",
+            "done yet",
+            "done",
+            "finished",
+            "status",
+            "progress",
+            "going",
+            "still running",
+            "complete",
+            "completed",
+        )
+    )
+    return bool(has_target_noun and has_status_cue)
+
+
+def _clean_handoff_task_summary(task_prompt: str) -> str:
+    clean = (task_prompt or "").strip()
+    if clean.startswith("[GOTCHI VOICE HANDOFF]:"):
+        clean = clean[len("[GOTCHI VOICE HANDOFF]:") :].strip()
+    if "[DUAL-DELIVERY COMPLETION REQUIREMENT]:" in clean:
+        clean = clean.split("[DUAL-DELIVERY COMPLETION REQUIREMENT]:", 1)[0].strip()
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:160]
+
+
+def _record_detached_handoff_job(
+    node_id: str,
+    task_prompt: str,
+    prompt_text: str,
+    queued_record: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    clean_node = (node_id or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
+    rec = queued_record if isinstance(queued_record, dict) else {}
+    job_id = str(rec.get("id") or f"handoff-{uuid.uuid4().hex[:10]}")
+    summary = _clean_handoff_task_summary(task_prompt or prompt_text)
+    entry: Dict[str, Any] = {
+        "job_id": job_id,
+        "outbox_id": str(rec.get("id") or job_id),
+        "node_id": clean_node,
+        "task_prompt": summary,
+        "raw_prompt": prompt_text,
+        "topic": extract_topic(summary) if summary else "background task",
+        "status": "queued",
+        "created_at": float(rec.get("created_at") or time.time()),
+        "updated_at": time.time(),
+        "completed_at": None,
+        "cancelled_at": None,
+        "answer": None,
+    }
+    with _ACTIVE_TURN_LOCK:
+        jobs = _DETACHED_HANDOFF_JOBS.setdefault(clean_node, [])
+        jobs.append(entry)
+        if len(jobs) > 20:
+            del jobs[:-20]
+    return entry
+
+
+def _mark_detached_handoff_completed(
+    node_id: str,
+    prompt: str = "",
+    answer: str = "",
+    topic: str = "",
+) -> Optional[Dict[str, Any]]:
+    clean_node = (node_id or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
+    clean_summary = _clean_handoff_task_summary(prompt)
+    with _ACTIVE_TURN_LOCK:
+        jobs = list(_DETACHED_HANDOFF_JOBS.get(clean_node) or [])
+        matched: Optional[Dict[str, Any]] = None
+        for job in reversed(jobs):
+            if job.get("status") == "cancelled":
+                continue
+            if clean_summary and job.get("task_prompt"):
+                j_prompt = str(job.get("task_prompt") or "").lower()
+                c_low = clean_summary.lower()
+                if c_low in j_prompt or j_prompt in c_low:
+                    matched = job
+                    break
+            if matched is None and job.get("status") in ("queued", "running"):
+                matched = job
+        if matched is None and jobs:
+            for job in reversed(jobs):
+                if job.get("status") != "cancelled":
+                    matched = job
+                    break
+        if matched is None:
+            matched = {
+                "job_id": f"handoff-{uuid.uuid4().hex[:10]}",
+                "outbox_id": "",
+                "node_id": clean_node,
+                "task_prompt": clean_summary or "Background handoff task",
+                "raw_prompt": prompt,
+                "topic": topic or (extract_topic(clean_summary) if clean_summary else "background task"),
+                "status": "completed",
+                "created_at": time.time(),
+                "updated_at": time.time(),
+                "completed_at": time.time(),
+                "cancelled_at": None,
+                "answer": answer,
+            }
+            _DETACHED_HANDOFF_JOBS.setdefault(clean_node, []).append(matched)
+        else:
+            matched["status"] = "completed"
+            matched["completed_at"] = time.time()
+            matched["updated_at"] = time.time()
+            if answer:
+                matched["answer"] = answer
+            if topic:
+                matched["topic"] = topic
+        return dict(matched)
+
+
+def _remove_queued_handoff_from_outbox(outbox_id: str = "", raw_prompt: str = "") -> bool:
+    """Removes a pending detached handoff record from `outbox.PENDING_FILE` if still queued on disk."""
+    removed = False
+    try:
+        pending_file = getattr(outbox, "PENDING_FILE", None)
+        if isinstance(pending_file, Path) and pending_file.is_file():
+            lines = pending_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            kept: List[str] = []
+            for ln in lines:
+                s = ln.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    kept.append(ln)
+                    continue
+                oid = str(obj.get("id") or "")
+                content = str(obj.get("content") or "")
+                if (outbox_id and oid == outbox_id) or (
+                    raw_prompt and content and (content == raw_prompt or raw_prompt in content)
+                ):
+                    removed = True
+                    continue
+                kept.append(ln)
+            if removed:
+                pending_file.write_text(
+                    ("\n".join(kept) + "\n") if kept else "",
+                    encoding="utf-8",
+                )
+    except Exception as exc:
+        log.debug(f"[GotchiZero] Could not prune outbox pending file on cancel: {exc}")
+    return removed
+
+
+def register_active_turn(
+    node_id: str,
+    *,
+    task_id: Optional[str] = None,
+    target: str = "",
+    prompt: str = "",
+) -> Dict[str, Any]:
+    """Registers an in-flight PTT or Talker-Thinker turn for `node_id` (and optional `task_id`)."""
+    clean_node = (node_id or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
+    tid = (task_id or "").strip() or f"turn-{uuid.uuid4().hex[:12]}"
+    entry: Dict[str, Any] = {
+        "node_id": clean_node,
+        "target": (target or clean_node).strip(),
+        "task_id": tid,
+        "prompt": prompt,
+        "started_at": time.time(),
+        "cancel_event": threading.Event(),
+        "asyncio_tasks": [],
+        "cancelled_reason": "",
+    }
+    with _ACTIVE_TURN_LOCK:
+        _ACTIVE_TURNS_BY_NODE[clean_node] = entry
+        _ACTIVE_TURNS_BY_TASK_ID[tid] = entry
+    return entry
+
+
+def unregister_active_turn(node_id: str, turn_entry: Optional[Dict[str, Any]] = None) -> None:
+    """Unregisters an in-flight turn when it completes or aborts."""
+    clean_node = (node_id or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
+    with _ACTIVE_TURN_LOCK:
+        cur = _ACTIVE_TURNS_BY_NODE.get(clean_node)
+        if turn_entry is None or cur is turn_entry:
+            _ACTIVE_TURNS_BY_NODE.pop(clean_node, None)
+        if turn_entry is not None:
+            tid = str(turn_entry.get("task_id") or "")
+            if tid and _ACTIVE_TURNS_BY_TASK_ID.get(tid) is turn_entry:
+                _ACTIVE_TURNS_BY_TASK_ID.pop(tid, None)
+        elif cur is not None:
+            tid = str(cur.get("task_id") or "")
+            if tid:
+                _ACTIVE_TURNS_BY_TASK_ID.pop(tid, None)
+
+
+def get_active_turns_snapshot() -> Dict[str, Dict[str, Any]]:
+    """Returns a shallow snapshot of active in-flight turns keyed by `node_id`."""
+    with _ACTIVE_TURN_LOCK:
+        return {
+            k: {
+                "node_id": v["node_id"],
+                "target": v["target"],
+                "task_id": v["task_id"],
+                "prompt": v["prompt"],
+                "started_at": v["started_at"],
+                "cancelled": v["cancel_event"].is_set(),
+            }
+            for k, v in _ACTIVE_TURNS_BY_NODE.items()
+        }
+
+
+def cancel_turn(
+    node_id: str = "gotchi-ryan-01",
+    reason: str = "",
+    *,
+    exclude_turn_entry: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Cancels any active in-flight PTT/Talker-Thinker turn and/or queued/running detached
+    background handoff job for `node_id`, returning a structured status dict with a concise
+    spoken confirmation (`reply` / `spoken_reply`).
+    """
+    clean_node = (node_id or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
+    clean_reason = (reason or "user_requested").strip() or "user_requested"
+
+    cancelled_turn = False
+    cancelled_task_id: Optional[str] = None
+    cancelled_handoff: Optional[Dict[str, Any]] = None
+    tasks_to_cancel: List[Any] = []
+
+    with _ACTIVE_TURN_LOCK:
+        active = _ACTIVE_TURNS_BY_NODE.get(clean_node)
+        if active is None and clean_node in _ACTIVE_TURNS_BY_TASK_ID:
+            active = _ACTIVE_TURNS_BY_TASK_ID.get(clean_node)
+            if active is not None:
+                clean_node = str(active.get("node_id") or clean_node)
+        if (
+            active is not None
+            and active is not exclude_turn_entry
+            and not active["cancel_event"].is_set()
+        ):
+            active["cancel_event"].set()
+            active["cancelled_reason"] = clean_reason
+            cancelled_turn = True
+            cancelled_task_id = str(active.get("task_id") or "")
+            tasks_to_cancel.extend(list(active.get("asyncio_tasks") or []))
+
+        node_jobs = _DETACHED_HANDOFF_JOBS.get(clean_node) or []
+        for job in reversed(node_jobs):
+            if job.get("status") in ("queued", "running", "pending"):
+                job["status"] = "cancelled"
+                job["cancelled_at"] = time.time()
+                job["updated_at"] = time.time()
+                job["cancel_reason"] = clean_reason
+                cancelled_handoff = dict(job)
+                break
+
+    for t_obj in tasks_to_cancel:
+        try:
+            cancel_fn = getattr(t_obj, "cancel", None)
+            if callable(cancel_fn):
+                cancel_fn()
+        except Exception:
+            pass
+
+    # Also notify Lomin gateway.cancel_active_turn if loaded and not already triggered from there
+    try:
+        gw_mod = sys.modules.get("gateway") or sys.modules.get("lomin.gateway")
+        if gw_mod is not None:
+            gw_active = getattr(gw_mod, "_ACTIVE_TASKS", None)
+            if isinstance(gw_active, dict) and clean_node in gw_active:
+                gw_task = gw_active.get(clean_node)
+                if isinstance(gw_task, dict):
+                    ev = gw_task.get("cancel_event")
+                    if ev is not None and not ev.is_set():
+                        ev.set()
+                        cancelled_turn = True
+                    wake = gw_task.get("wake")
+                    if wake is not None and hasattr(wake, "set"):
+                        wake.set()
+    except Exception:
+        pass
+
+    outbox_pruned = False
+    if cancelled_handoff is not None:
+        outbox_pruned = _remove_queued_handoff_from_outbox(
+            outbox_id=str(cancelled_handoff.get("outbox_id") or ""),
+            raw_prompt=str(cancelled_handoff.get("raw_prompt") or ""),
+        )
+
+    cancelled_any = bool(cancelled_turn or cancelled_handoff is not None)
+    if cancelled_turn and cancelled_handoff is not None:
+        spoken = "Cancelled. I stopped the active turn and aborted that background handoff."
+        status_code = "cancelled"
+    elif cancelled_handoff is not None:
+        topic_lbl = cancelled_handoff.get("topic") or "background"
+        spoken = f"Cancelled. I aborted that {topic_lbl} handoff task."
+        status_code = "cancelled"
+    elif cancelled_turn:
+        spoken = "Cancelled. I stopped that turn."
+        status_code = "cancelled"
+    else:
+        spoken = "Nothing is currently running to cancel."
+        status_code = "no_active_turn"
+
+    return {
+        "ok": True,
+        "node_id": clean_node,
+        "cancelled": cancelled_any,
+        "status": status_code,
+        "cancelled_turn": cancelled_turn,
+        "cancelled_task_id": cancelled_task_id,
+        "cancelled_handoff": cancelled_handoff,
+        "outbox_pruned": outbox_pruned,
+        "reason": clean_reason,
+        "reply": spoken,
+        "spoken_reply": spoken,
+    }
+
+
+def brain_cancel(target: str, task_id: str = "") -> bool:
+    """
+    Lomin plugin cancellation hook (`_plugin_brain_cancel(target, task_id)`).
+    Signals cancellation for the matching `task_id` or `target` node and returns True
+    if an active turn or detached handoff was cancelled.
+    """
+    clean_tid = (task_id or "").strip()
+    clean_target = (target or "").strip()
+
+    with _ACTIVE_TURN_LOCK:
+        entry = _ACTIVE_TURNS_BY_TASK_ID.get(clean_tid) if clean_tid else None
+        if entry is None and clean_target:
+            entry = _ACTIVE_TURNS_BY_NODE.get(clean_target)
+        if entry is None and clean_target:
+            for cand in _ACTIVE_TURNS_BY_NODE.values():
+                if cand.get("target") == clean_target:
+                    entry = cand
+                    break
+        target_node = str(entry.get("node_id")) if entry is not None else (clean_target or clean_tid or "gotchi-ryan-01")
+
+    res = cancel_turn(target_node, reason=f"brain_cancel:{clean_tid or clean_target}")
+    return bool(res.get("cancelled"))
+
+
+def check_detached_handoff_status(node_id: str = "gotchi-ryan-01") -> Dict[str, Any]:
+    """
+    Inspects live status of running, queued, or recently completed detached background
+    handoffs (and active turns) for `node_id` without spawning a duplicate handoff.
+    Checks:
+    1. `_DETACHED_HANDOFF_JOBS[node_id]` in-memory ledger.
+    2. `get_lomin_pending_store()` and `PendingVoiceAnswerStore` for completed answers waiting to be spoken.
+    3. `outbox.get_pending_messages()` and `outbox.HISTORY_FILE` for queued/dispatched handoff turns.
+    """
+    clean_node = (node_id or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
+    now = time.time()
+
+    # 1. Check if a completed answer is waiting in Lomin pending store or Gotchi PendingVoiceAnswerStore
+    pending_answer_item: Optional[Dict[str, Any]] = None
+    try:
+        from pending_and_auth import get_pending_store as _get_lomin_store  # type: ignore
+
+        pending_answer_item = _get_lomin_store().peek_for_node(clean_node)
+    except Exception:
+        pass
+
+    if pending_answer_item is None:
+        try:
+            from backend.voice_gateway import PendingVoiceAnswerStore
+
+            ans = PendingVoiceAnswerStore().get_latest_pending(node_id=clean_node)
+            if ans:
+                pending_answer_item = {
+                    "id": ans.get("answer_id", ""),
+                    "node_id": clean_node,
+                    "prompt": ans.get("prompt", ""),
+                    "answer": ans.get("spoken_text") or ans.get("full_text") or "",
+                    "topic": ans.get("topic", ""),
+                    "created_at": ans.get("created_at", now),
+                }
+        except Exception:
+            pass
+
+    if pending_answer_item is not None and pending_answer_item.get("answer"):
+        ans_text = clean_spoken_text_for_tts(str(pending_answer_item.get("answer") or ""))
+        prompt_text = str(pending_answer_item.get("prompt") or "")
+        topic_text = str(pending_answer_item.get("topic") or "")
+        _mark_detached_handoff_completed(clean_node, prompt=prompt_text, answer=ans_text, topic=topic_text)
+
+    with _ACTIVE_TURN_LOCK:
+        node_jobs = [dict(j) for j in (_DETACHED_HANDOFF_JOBS.get(clean_node) or [])]
+        active_turn = _ACTIVE_TURNS_BY_NODE.get(clean_node)
+        has_active_turn = bool(active_turn and not active_turn["cancel_event"].is_set())
+
+    latest_job: Optional[Dict[str, Any]] = node_jobs[-1] if node_jobs else None
+
+    # Reconcile queued/running status with outbox queue/history if available
+    if latest_job is not None and latest_job.get("status") in ("queued", "running"):
+        outbox_id = str(latest_job.get("outbox_id") or "")
+        raw_prompt = str(latest_job.get("raw_prompt") or "")
+        try:
+            pending_msgs = outbox.get_pending_messages()
+            still_in_outbox = any(
+                (outbox_id and str(m.get("id") or "") == outbox_id)
+                or (raw_prompt and raw_prompt in str(m.get("content") or ""))
+                for m in pending_msgs
+            )
+            if not still_in_outbox and latest_job.get("status") == "queued":
+                latest_job["status"] = "running"
+                with _ACTIVE_TURN_LOCK:
+                    for j in reversed(_DETACHED_HANDOFF_JOBS.get(clean_node) or []):
+                        if j.get("job_id") == latest_job.get("job_id"):
+                            j["status"] = "running"
+                            j["updated_at"] = now
+                            break
+        except Exception:
+            pass
+
+    if latest_job is not None:
+        st = str(latest_job.get("status") or "unknown")
+        summary = str(latest_job.get("task_prompt") or "your background task")
+        elapsed_s = max(1, int(now - float(latest_job.get("created_at") or now)))
+        ans_summary = str(latest_job.get("answer") or "").strip()
+
+        if st == "completed":
+            if ans_summary:
+                spoken = f"That background task is finished. {ans_summary}"
+            else:
+                spoken = f"That background handoff for {summary} is finished. Check Zero-Chat for the full details."
+        elif st == "cancelled":
+            spoken = f"That background handoff for {summary} was cancelled."
+        elif st == "running":
+            spoken = (
+                f"That background handoff is still running in Zero-Chat "
+                f"(started {elapsed_s} seconds ago): {summary}."
+            )
+        else:
+            spoken = (
+                f"That background handoff is queued and running in Zero-Chat "
+                f"(started {elapsed_s} seconds ago): {summary}."
+            )
+
+        return {
+            "ok": True,
+            "node_id": clean_node,
+            "has_handoff": True,
+            "has_active_turn": has_active_turn,
+            "status": st,
+            "job": latest_job,
+            "elapsed_s": elapsed_s,
+            "reply": spoken,
+            "spoken_reply": spoken,
+        }
+
+    if has_active_turn and active_turn is not None:
+        elapsed_s = max(1, int(now - float(active_turn.get("started_at") or now)))
+        spoken = f"I'm still working on your active request right now ({elapsed_s} seconds elapsed)."
+        return {
+            "ok": True,
+            "node_id": clean_node,
+            "has_handoff": False,
+            "has_active_turn": True,
+            "status": "running_turn",
+            "job": None,
+            "elapsed_s": elapsed_s,
+            "reply": spoken,
+            "spoken_reply": spoken,
+        }
+
+    spoken = "There are no active or recent background handoff tasks for this device right now."
+    return {
+        "ok": True,
+        "node_id": clean_node,
+        "has_handoff": False,
+        "has_active_turn": False,
+        "status": "idle",
+        "job": None,
+        "elapsed_s": 0,
+        "reply": spoken,
+        "spoken_reply": spoken,
+    }
+
+
+def check_task_status(node_id: str = "gotchi-ryan-01", task_id: str = "") -> Dict[str, Any]:
+    """Lomin plugin hook for checking running or recently completed task/handoff status."""
+    clean_node = (node_id or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
+    if task_id:
+        with _ACTIVE_TURN_LOCK:
+            by_tid = _ACTIVE_TURNS_BY_TASK_ID.get(task_id.strip())
+            if by_tid is not None and by_tid.get("node_id"):
+                clean_node = str(by_tid["node_id"])
+    return check_detached_handoff_status(clean_node)
+
+
+def live_tools() -> List[Dict[str, Any]]:
+    """
+    Lomin plugin hook exposing Talker-Thinker live session tool declarations
+    (`call_thinker`, `cancel_thinker`, `check_task_status`, `answer_prompt`, `set_progress_updates`).
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "call_thinker",
+                "description": (
+                    "Hand a request to Zero's deep Thinker brain when tools, memory lookup, homelab checks, "
+                    "or multi-step actions are needed. Returns immediately while the Thinker works."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"request": {"type": "string"}},
+                    "required": ["request"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "cancel_thinker",
+                "description": "Cancel the currently running Thinker turn or background handoff task.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "check_task_status",
+                "description": "Check the live status of a running or recently completed background handoff task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"node_id": {"type": "string"}},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "answer_prompt",
+                "description": "Answer a pending approval prompt.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt_id": {"type": "string"},
+                        "decision": {"type": "string"},
+                    },
+                    "required": ["prompt_id", "decision"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "set_progress_updates",
+                "description": "Turn spoken progress updates on or off during multi-step Thinker tasks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean"}},
+                    "required": ["enabled"],
+                },
+            },
+        },
+    ]
+
+
+def talker_instructions(target: str = "zero", node_id: str = "gotchi-ryan-01") -> str:
+    """
+    Lomin plugin hook (`talker_instructions(target, node_id)`) returning system instructions
+    for the fast conversational Talker in `/voice/live` Talker-Thinker hybrid sessions.
+    """
+    clean_node = (node_id or "gotchi-ryan-01").strip() or "gotchi-ryan-01"
+    speaker = resolve_speaker_for_node(clean_node)
+    return (
+        f"You are Zero, speaking with {speaker} on Gotchi ({clean_node}, target={target or 'zero'}) "
+        "in Talker-Thinker hybrid voice mode. "
+        "Keep spoken replies crisp, natural, and plain-spoken (1 to 2 short sentences, no markdown or URLs). "
+        "When a request requires checking tools, memory, weather, smart home state, or running tasks, "
+        "briefly state the concrete action you are taking and call `call_thinker`. "
+        "If the user says 'cancel that', 'stop that', 'never mind', or 'abort that', call `cancel_thinker` "
+        "immediately and confirm cancellation. "
+        "If the user asks how a background task or handoff is going, report the live status without "
+        "spawning a duplicate handoff."
+    )
 
 
 def _format_handoff_dual_delivery_prompt(task_prompt: str, node_id: str = "gotchi-ryan-01") -> str:
