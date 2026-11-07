@@ -222,13 +222,15 @@ class TestRedditFantasyScanner(unittest.TestCase):
         self.assertGreaterEqual(versus_score, 60)
 
     @patch("tools.reddit_fantasy_scanner.scan_reddit_via_pixel")
+    @patch("tools.outbox.dispatch_via_rest")
+    @patch("tools.outbox.flush_pending_messages")
     @patch("tools.outbox.queue_outbox_message")
     @patch("tools.reddit_fantasy_scanner.stage_fantasy_decision")
     @patch("tools.reddit_fantasy_scanner.save_state")
-    def test_production_run_stages_persistent_decision_card_by_default(
-        self, mock_save, mock_stage, mock_outbox, mock_scan
+    def test_production_run_posts_full_outbox_card_with_choices_by_default(
+        self, mock_save, mock_stage, mock_outbox, mock_flush, mock_dispatch, mock_scan
     ):
-        """Verify non-test runs stage a persistent SQLite Decision Card and persist last_candidate / last_draft."""
+        """Verify non-test runs post the full unclipped card via outbox with [CHOICES: ...] buttons by default."""
         mock_scan.return_value = [
             {
                 "thread_title": "Daily Anything Goes Thread",
@@ -241,17 +243,17 @@ class TestRedditFantasyScanner(unittest.TestCase):
                 "time_ago": "15m ago",
             }
         ]
-        mock_stage.return_value = {"ok": True, "decision_id": "dec-123-reddit"}
+        mock_flush.return_value = [{"id": "outbox-1", "channel": "zero-chat", "content": "card"}]
         ok, card, extra = run_reddit_fantasy_scanner(test=False, post_discord=True)
         self.assertTrue(ok)
-        self.assertTrue(extra.get("decision_staged"))
+        self.assertFalse(extra.get("decision_staged"))
         self.assertIn("⚾ **r/fantasybaseball Discovery & Draft Card**", card)
-        self.assertIn("Persistent Decision Card staged below", card)
-        self.assertNotIn("[CHOICES: Post Draft to Reddit", card)
-        mock_stage.assert_called_once()
-        _, kwargs = mock_stage.call_args
-        self.assertTrue(kwargs.get("post_to_discord"))
-        mock_outbox.assert_not_called()
+        self.assertIn("[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]", card)
+        self.assertNotIn("Persistent Decision Card staged below", card)
+        mock_stage.assert_not_called()
+        mock_outbox.assert_called_once()
+        mock_flush.assert_called_once()
+        mock_dispatch.assert_called_once()
         mock_save.assert_called_once()
         saved_state = mock_save.call_args[0][0]
         self.assertEqual(saved_state["last_candidate"]["author"], "Shiny_Rattata")
@@ -259,13 +261,18 @@ class TestRedditFantasyScanner(unittest.TestCase):
 
     @patch("tools.forge.stage_decision")
     def test_stage_fantasy_decision_includes_approve_action_and_cli_args(self, mock_forge_stage):
-        """Verify stage_fantasy_decision builds an explicit Approve Action and passes thread_url, thing_id, author, and draft."""
+        """Verify stage_fantasy_decision builds an explicit Approve Action without truncating text at 280 chars and passes thread_url, thing_id, author, and draft."""
         mock_forge_stage.return_value = {"ok": True, "decision_id": "dec-456-reddit"}
+        long_dilemma = (
+            "Should I keep Chourio or Merrill in a 12-team 5x5 roto league? "
+            + ("Here is extra league context that pushes the dilemma well beyond 280 characters. " * 4)
+            + "END_OF_UNCLIPPED_DILEMMA"
+        )
         cand = {
             "thread_title": "Nightly Anything Goes Thread",
             "thread_url": "https://www.reddit.com/r/fantasybaseball/comments/abc123/nightly/",
             "author": "KeeperKing",
-            "text": "Should I keep Chourio or Merrill in a 12-team 5x5 roto league?",
+            "text": long_dilemma,
             "raw_id": "t1_xyz789",
         }
         draft = "Merrill gives you the higher batting average floor, while Chourio has the 30/30 ceiling."
@@ -274,6 +281,7 @@ class TestRedditFantasyScanner(unittest.TestCase):
         mock_forge_stage.assert_called_once()
         kwargs = mock_forge_stage.call_args.kwargs
         self.assertEqual(kwargs["category"], "reddit_fantasy")
+        self.assertIn("END_OF_UNCLIPPED_DILEMMA", kwargs["summary"])
         self.assertIn("**Approve Action:** Post this reply to `r/fantasybaseball` via `u/prime416`", kwargs["summary"])
         cmd = kwargs["payload"]["command"]
         self.assertIn("--post-draft", cmd)

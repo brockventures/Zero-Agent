@@ -646,7 +646,7 @@ def stage_fantasy_decision(
         thread_url = candidate.get("thread_url", "https://www.reddit.com/r/fantasybaseball/")
         raw_id = str(candidate.get("raw_id") or "")
         thing_id = raw_id if (raw_id.startswith("t1_") or (raw_id and "::" not in raw_id and not raw_id.startswith("http"))) else str(candidate.get("thing_id") or "")
-        text_snip = candidate.get("text", "").strip()[:280]
+        text_snip = candidate.get("text", "").strip()
         cid = channel_id or ZERO_CHAT_CHANNEL_ID
 
         summary = (
@@ -792,7 +792,7 @@ def run_reddit_fantasy_scanner(
         save_state(state)
 
     dest_cid = channel_id or ZERO_CHAT_CHANNEL_ID
-    should_stage = stage if stage is not None else (not test)
+    should_stage = bool(stage) if stage is not None else False
     decision_staged = False
     if should_stage and selected.get("quality_score", 0) >= (0 if test else 40):
         dec = stage_fantasy_decision(selected, draft, channel_id=dest_cid, post_to_discord=post_discord)
@@ -801,11 +801,13 @@ def run_reddit_fantasy_scanner(
 
     card = format_draft_card(selected, draft, decision_staged=decision_staged)
 
-    # Only fall back to legacy outbox [CHOICES: ...] message if persistent Decision Card was not staged
+    # Dispatch full unclipped card with [CHOICES: ...] buttons via outbox unless a persistent Decision Card was explicitly staged
     if post_discord and not decision_staged:
         try:
-            from tools.outbox import queue_outbox_message
+            from tools.outbox import queue_outbox_message, flush_pending_messages, dispatch_via_rest
             queue_outbox_message(str(dest_cid), card, source_turn="reddit_fantasy_scanner")
+            for omsg in flush_pending_messages():
+                dispatch_via_rest(omsg)
             log.info("Dispatched draft card to Discord channel %s", dest_cid)
         except Exception as e:
             log.warning("Could not dispatch to Discord: %s", e)
