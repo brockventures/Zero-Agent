@@ -42,9 +42,9 @@ MAX_INLINE_RUN_COMMANDS_AFTER_90S = 15
 TURN_RESET_IDLE_SECONDS = 45.0
 TURN_STATE_EXPIRY_SECONDS = 900.0
 
-INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S = 3
-INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT = 5
-INTERACTIVE_DIAG_TIME_WINDOW_SECONDS = 30.0
+INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S = 6
+INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT = 8
+INTERACTIVE_DIAG_TIME_WINDOW_SECONDS = 75.0
 FORGE_CHANNEL_ID_STR = "1562899941595160657"
 ZERO_CHAT_CHANNEL_ID_STR = "1542081375287640084"
 CRAB_CAVERN_CHANNEL_IDS = {
@@ -462,6 +462,15 @@ def is_exempt_from_investigation_gate(name: str, args: dict, cwd: str = "/worksp
             "modal_harness.py",
             "outbox.py",
             "gif_tool.py",
+            "channel_history.py",
+            "transcript_index.py",
+            "mealie_tool.py",
+            "deliver_image.py",
+            "banana.py",
+            "send_mail.py",
+            "ha_shopping_list.py",
+            "whole_foods_afx.py",
+            "grocery_manager.py",
             "git ",
             "gh ",
             "pytest",
@@ -532,7 +541,7 @@ def check_interactive_investigation_gate(
         save_state(state, state_file)
         reason = (
             f"Interactive Investigation Gate Triggered: Detected {current_steps} diagnostic tool steps "
-            f"over {elapsed:.1f}s (ceiling: 3 steps after 30.0s, max 5 steps). "
+            f"over {elapsed:.1f}s (ceiling: {INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S} steps after {INTERACTIVE_DIAG_TIME_WINDOW_SECONDS:.1f}s, max {INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT} steps). "
             "Open-ended investigations in interactive Discord turns must wrap up initial verified findings immediately. "
             "**Code/Feature/Bugfix Builds:** MUST immediately write a ForgePlan JSON and call `python3 /workspace/tools/forge.py enqueue <plan.json>` — "
             "NEVER call `forge.py job start` for code/asset changes, as `job start` locks the turn without staging a FORGE build or Decision Card. "
@@ -718,7 +727,11 @@ def check_file_deletion_gate(cmd: str, cwd: str = "/workspace") -> tuple[bool, s
         return True, ""
 
     # 1. Block direct SQL/shell tampering with decision_cards / forge_decisions approval status
-    if ("decision_cards" in cmd or "forge_decisions" in cmd) and re.search(r"\b(?:UPDATE|INSERT|REPLACE)\b", cmd, re.IGNORECASE):
+    if re.search(
+        r"\b(?:UPDATE\s+(?:OR\s+\w+\s+)?(?:decision_cards|forge_decisions)\b|(?:INSERT|REPLACE)\s+(?:OR\s+\w+\s+)?INTO\s+(?:decision_cards|forge_decisions)\b)",
+        cmd,
+        re.IGNORECASE,
+    ):
         return False, (
             "Decision Card Tamper Blocked: Modifying 'decision_cards' or 'forge_decisions' approval status directly via SQL or shell is prohibited. "
             "Only Ryan can approve a Decision Card via the interactive Discord button."
