@@ -59,16 +59,27 @@ LOMIN_CORE_MODULES = (
     "desktop_embed.py",
     "desktop_tts.py",
     "gateway.py",
+    "gemini_live.py",
     "ha_fastpath.py",
+    "live_harness.py",
+    "live_ws.py",
     "multipart.py",
     "pending_and_auth.py",
     "sentence_segmenter.py",
     "side_channel.py",
     "streaming_brain.py",
     "t3_fast.py",
+    "talker_backend.py",
     "text_utils.py",
     "tts_backends.py",
     "vision_adpcm.py",
+)
+
+LOMIN_SUBDIR_MODULES = (
+    "examples/reference_plugin.py",
+    "tools/gemini_live_smoke.py",
+    "tools/latency_summary.py",
+    "tools/stream_underrun_harness.py",
 )
 
 ADAPTER_SHIM_CONTENT = '''#!/usr/bin/env python3
@@ -151,6 +162,26 @@ def sync_lomin_modules_to_gotchi(
                 ):
                     shutil.copy2(s_file, d_file)
                 synced.append(filename)
+            except Exception as exc:
+                log.warning(f"[LominRuntime] Failed to sync {s_file} -> {d_file}: {exc}")
+
+        for rel_sub in LOMIN_SUBDIR_MODULES:
+            s_file = src_path / rel_sub
+            if not s_file.is_file():
+                continue
+            d_file = dest_path / rel_sub
+            try:
+                d_file.parent.mkdir(parents=True, exist_ok=True)
+                sub_init = d_file.parent / "__init__.py"
+                if not sub_init.exists():
+                    sub_init.write_text("", encoding="utf-8")
+                if (
+                    not d_file.exists()
+                    or s_file.stat().st_size != d_file.stat().st_size
+                    or s_file.read_bytes() != d_file.read_bytes()
+                ):
+                    shutil.copy2(s_file, d_file)
+                synced.append(rel_sub)
             except Exception as exc:
                 log.warning(f"[LominRuntime] Failed to sync {s_file} -> {d_file}: {exc}")
 
@@ -275,6 +306,14 @@ def _invoke_callable_with_supported_kwargs(
                 payload["image_b64"] = clean_kwargs["image_b64"]
             if clean_kwargs.get("burst_images_b64"):
                 payload["burst_images_b64"] = clean_kwargs["burst_images_b64"]
+            if clean_kwargs.get("task_id"):
+                payload["task_id"] = clean_kwargs["task_id"]
+            if clean_kwargs.get("audio_clips"):
+                payload["audio_clips"] = clean_kwargs["audio_clips"]
+            if len(args) > 4 and isinstance(args[4], dict):
+                payload["stages_out"] = args[4]
+            elif isinstance(clean_kwargs.get("stages_out"), dict):
+                payload["stages_out"] = clean_kwargs["stages_out"]
             if clean_kwargs.get("audio_b64"):
                 raw_aud = clean_kwargs["audio_b64"]
                 payload["audio_b64"] = raw_aud
@@ -415,7 +454,9 @@ def apply_lomin_gateway_redteam_patches(gateway_mod: Any = None) -> Any:
         wrapped = gateway_mod._frame_for_call(prompt, node_id, speaker, speaker_score)
         target = gateway_mod._call_target(node_id)
         stage_sink = getattr(gateway_mod, "_STAGE_SINK", None)
-        stages = getattr(stage_sink, "stages", None) if stage_sink is not None else None
+        stages = mm_kwargs.pop("stages_out", None)
+        if stages is None and stage_sink is not None:
+            stages = getattr(stage_sink, "stages", None)
         return _invoke_callable_with_supported_kwargs(
             plugin_stream_fn,
             target,

@@ -97,24 +97,135 @@ def test_sync_lomin_modules_and_single_adapter_shim(tmp_path: Path) -> None:
     )
     assert "gateway.py" in synced
     assert "pending_and_auth.py" in synced
+    for hybrid_mod in ("gemini_live.py", "live_harness.py", "live_ws.py", "talker_backend.py"):
+        assert hybrid_mod in lomin_runtime.LOMIN_CORE_MODULES
+        assert hybrid_mod in synced
+        assert (dest_lomin / hybrid_mod).is_file()
+    assert "examples/reference_plugin.py" in synced
+    assert (dest_lomin / "examples" / "reference_plugin.py").is_file()
     assert (dest_lomin / "gateway.py").is_file()
 
     # Also verify syncing to canonical /workspace/gotchi/lomin and updating shim
-    lomin_runtime.sync_lomin_modules_to_gotchi()
+    canonical_synced = lomin_runtime.sync_lomin_modules_to_gotchi()
+    for hybrid_mod in ("gemini_live.py", "live_harness.py", "live_ws.py", "talker_backend.py"):
+        assert hybrid_mod in canonical_synced
+        assert (Path(lomin_runtime.DEFAULT_GOTCHI_LOMIN_DIR) / hybrid_mod).is_file()
+
     shim_path = lomin_runtime.ensure_single_adapter_shim()
     assert shim_path.is_file()
     shim_text = shim_path.read_text(encoding="utf-8")
     assert "from tools.gotchi_zero_adapter import *" in shim_text
     assert len(shim_text.splitlines()) < 60
 
-    # Verify importing backend.gotchi_zero_adapter resolves identical symbols as tools.gotchi_zero_adapter
-    import backend.gotchi_zero_adapter as backend_adapter
-    import importlib
+    # Verify loading the shim at /workspace/gotchi/backend/gotchi_zero_adapter.py resolves
+    # identical symbols as tools.gotchi_zero_adapter
+    import importlib.util
     import tools.gotchi_zero_adapter as canonical_adapter
 
-    importlib.reload(backend_adapter)
+    spec = importlib.util.spec_from_file_location("gotchi_backend_adapter_shim", shim_path)
+    assert spec is not None and spec.loader is not None
+    backend_adapter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(backend_adapter)
     assert backend_adapter.GotchiZeroBrainAdapter is canonical_adapter.GotchiZeroBrainAdapter
     assert backend_adapter.create_zero_gotchi_app is canonical_adapter.create_zero_gotchi_app
+
+
+def test_voice_hybrid_modules_and_plugin_hook_exposure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lomin_runtime.sync_lomin_modules_to_gotchi()
+    import gateway
+    import gemini_live
+    import live_harness
+    import live_ws
+    import talker_backend
+
+    lomin_runtime.apply_lomin_gateway_redteam_patches(gateway)
+
+    # 1. Verify Phase A/B/C modules and symbols are imported from synced runtime
+    assert hasattr(live_harness, "LiveSession")
+    assert hasattr(live_harness, "ProgressRelay")
+    assert hasattr(talker_backend, "TalkerBackend")
+    assert hasattr(talker_backend, "CascadedTextBackend")
+    assert hasattr(gemini_live, "GeminiLiveBackend")
+    assert hasattr(live_ws, "WSConn")
+    assert hasattr(live_ws, "run_live_session")
+
+    # 2. Verify gateway Phase A/B/C hooks: normalize_stage_event, ProgressNarrator,
+    #    context_opener_enabled, spoken_progress_enabled, spoken_cancel_enabled,
+    #    cancel_active_turn, and _resolve_talker_instructions
+    ev = gateway.normalize_stage_event({"stage": "tool_start", "detail": "checking logs", "t": 0.25})
+    assert ev == {"stage": "tool_start", "detail": "checking logs", "t": 0.25}
+    assert gateway.is_cancel_phrase("cancel that") is True
+    assert gateway.is_cancel_phrase("stop the build server") is False
+
+    # 3. Verify plugin hook exposure (`_plugin_brain_cancel`, `_plugin_talker_instructions`,
+    #    and `task_id` / `stages_out` forwarding through patched `plugin_brain_call_stream`)
+    cancel_calls: List[tuple[str, str]] = []
+    monkeypatch.setattr(
+        gateway,
+        "_plugin_brain_cancel",
+        lambda target, task_id: cancel_calls.append((target, task_id)) or True,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_plugin_talker_instructions",
+        lambda target, node_id: f"Talker instructions for {target} on {node_id}",
+    )
+
+    assert (
+        gateway._resolve_talker_instructions("zero", "gotchi-ryan-01")
+        == "Talker instructions for zero on gotchi-ryan-01"
+    )
+
+    task = gateway._register_task("gotchi-ryan-01", "zero", task_id="task-abc-123")
+    try:
+        outcome = gateway.cancel_active_turn("gotchi-ryan-01")
+        assert outcome == "cancelled"
+        assert cancel_calls == [("zero", "task-abc-123")]
+    finally:
+        gateway._unregister_task("gotchi-ryan-01", task)
+
+    seen_stream: Dict[str, Any] = {}
+
+    def _mock_stream(
+        target: str,
+        prompt: str,
+        timeout: int,
+        on_partial: Any = None,
+        stages_out: Any = None,
+        **kwargs: Any,
+    ) -> str:
+        seen_stream["target"] = target
+        seen_stream["stages_out"] = stages_out
+        seen_stream["kwargs"] = dict(kwargs)
+        if isinstance(stages_out, dict):
+            stages_out.setdefault("events", []).append(
+                {"stage": "tool_start", "detail": "inspecting state", "t": 0.1}
+            )
+        if callable(on_partial):
+            on_partial("Hybrid stream ok.")
+        return "Hybrid stream ok."
+
+    monkeypatch.setattr(gateway, "_plugin_brain_call_stream", _mock_stream)
+    monkeypatch.setattr(gateway, "STREAM_BRAIN_CALL", gateway.plugin_brain_call_stream)
+
+    explicit_stages: Dict[str, Any] = {}
+    out = gateway.STREAM_BRAIN_CALL(
+        "status check",
+        "sess-hybrid",
+        "gotchi-ryan-01",
+        "ryan",
+        0.99,
+        30,
+        lambda _p: None,
+        task_id="task-hybrid-1",
+        stages_out=explicit_stages,
+    )
+    assert out == "Hybrid stream ok."
+    assert seen_stream["kwargs"].get("task_id") == "task-hybrid-1"
+    assert seen_stream["stages_out"] is explicit_stages
+    assert explicit_stages["events"][0]["stage"] == "tool_start"
 
 
 def test_redteam_patches_direct_audio_whisper_bypass_and_kwargs_forwarding(
