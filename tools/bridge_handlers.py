@@ -21,6 +21,7 @@ from typing import Any
 import discord
 
 from tools.bridge_ambient import (
+    PROCESSED_BACKLOG_MSG_IDS,
     channel_last_bot_reply,
     route_external_message,
     warm_channel_history,
@@ -68,7 +69,6 @@ import tools.bridge_runner as br
 BOT_BOOT_TIME = time.time()
 BANANA_WATCHER_BOT_ID = 1545924520236290198
 PROCESSED_INTERACTIONS = set()
-PROCESSED_BACKLOG_MSG_IDS = set()
 active_turn_task = None
 active_status_msg = None
 has_notified_ready = False
@@ -920,7 +920,9 @@ async def handle_message(
     if hasattr(msg, "id"):
         PROCESSED_BACKLOG_MSG_IDS.add(msg.id)
         if len(PROCESSED_BACKLOG_MSG_IDS) > 1000:
-            PROCESSED_BACKLOG_MSG_IDS = set(list(PROCESSED_BACKLOG_MSG_IDS)[-500:])
+            to_keep = list(PROCESSED_BACKLOG_MSG_IDS)[-500:]
+            PROCESSED_BACKLOG_MSG_IDS.clear()
+            PROCESSED_BACKLOG_MSG_IDS.update(to_keep)
 
     content = msg.content.strip() if hasattr(msg, "content") else ""
     is_thread_channel = isinstance(msg.channel, discord.Thread)
