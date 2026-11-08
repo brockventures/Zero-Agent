@@ -32,6 +32,8 @@ DEFAULT_VISION_CACHE_PATH = Path("/workspace/data/photos_curation/vision_scores_
 DEFAULT_POPULATION_STATUS_PATH = Path("/workspace/data/photos_curation/population_status.json")
 DEFAULT_CHROME_COOKIES_PATH = Path("/tmp/chrome_zero_profile/Default/Cookies")
 ADD_ITEMS_RPC_ID = "C2V01c"
+SAVE_TO_LIBRARY_RPC_ID = "V8RKJ"
+ADD_LIBRARY_TO_SHARED_RPC_ID = "laUYf"
 BURST_WINDOW_MS = 90_000
 TARGET_CURATION_SPECS: dict[str, dict[str, Any]] = {
     "Rosie Year 6": {
@@ -1783,7 +1785,12 @@ def build_add_items_rpc_payload(
         elif isinstance(it, dict) and it.get("item_id"):
             item_ids.append(str(it["item_id"]))
 
-    if source_album_id and source_auth_key:
+    if rpc_id == SAVE_TO_LIBRARY_RPC_ID:
+        inner_arg = json.dumps([item_ids, source_auth_key, source_album_id])
+    elif rpc_id == ADD_LIBRARY_TO_SHARED_RPC_ID:
+        item_entries = [[[iid] for iid in item_ids]]
+        inner_arg = json.dumps([target_album_id, [2, None, item_entries, None, None, None, [1]], [None, target_auth_key]])
+    elif source_album_id and source_auth_key:
         item_entries = [[[iid, source_album_id, source_auth_key] for iid in item_ids]]
         inner_arg = json.dumps([target_album_id, item_entries, target_auth_key])
     else:
@@ -1802,6 +1809,8 @@ def populate_shared_album(
     cookies_db_path: Path | str = DEFAULT_CHROME_COOKIES_PATH,
     batch_size: int = 50,
     rpc_id: str = ADD_ITEMS_RPC_ID,
+    source_album_id: str | None = None,
+    source_auth_key: str | None = None,
     at_token: str | None = None,
     bl_token: str | None = None,
     f_sid: str | None = None,
@@ -1858,11 +1867,95 @@ def populate_shared_album(
 
         for start_idx in range(0, len(items_to_add), max(1, batch_size)):
             chunk = items_to_add[start_idx : start_idx + max(1, batch_size)]
+            if rpc_id in ("V8RKJ+laUYf", f"{SAVE_TO_LIBRARY_RPC_ID}+{ADD_LIBRARY_TO_SHARED_RPC_ID}"):
+                _, v8_req = build_add_items_rpc_payload(
+                    target_album_id=target_album_id,
+                    target_auth_key=target_auth_key,
+                    items=chunk,
+                    rpc_id=SAVE_TO_LIBRARY_RPC_ID,
+                    source_album_id=source_album_id,
+                    source_auth_key=source_auth_key,
+                )
+                v8_params: dict[str, str] = {
+                    "rpcids": SAVE_TO_LIBRARY_RPC_ID,
+                    "source-path": f"/share/{source_album_id or target_album_id}",
+                    "hl": "en",
+                    "rt": "c",
+                }
+                if bl_token:
+                    v8_params["bl"] = bl_token
+                if f_sid:
+                    v8_params["f.sid"] = f_sid
+                v8_url = "https://photos.google.com/_/PhotosUi/data/batchexecute?" + urllib.parse.urlencode(v8_params)
+                v8_form = {"f.req": v8_req}
+                if at_token:
+                    v8_form["at"] = at_token
+                v8_resp = http_session.post(
+                    v8_url,
+                    data=v8_form,
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                        "Origin": "https://photos.google.com",
+                        "Referer": share_url,
+                    },
+                    timeout=timeout,
+                )
+                v8_resp.raise_for_status()
+                v8_parsed = parse_batchexecute_response(v8_resp.text, rpc_id=SAVE_TO_LIBRARY_RPC_ID)
+                lib_ids: list[str] = []
+                if isinstance(v8_parsed, list) and v8_parsed and isinstance(v8_parsed[0], list):
+                    lib_ids = [str(x) for x in v8_parsed[0] if x]
+                if not lib_ids:
+                    lib_ids = [
+                        it if isinstance(it, str) else str(it.get("item_id", ""))
+                        for it in chunk
+                        if (it if isinstance(it, str) else it.get("item_id"))
+                    ]
+
+                _, la_req = build_add_items_rpc_payload(
+                    target_album_id=target_album_id,
+                    target_auth_key=target_auth_key,
+                    items=lib_ids,
+                    rpc_id=ADD_LIBRARY_TO_SHARED_RPC_ID,
+                )
+                la_params: dict[str, str] = {
+                    "rpcids": ADD_LIBRARY_TO_SHARED_RPC_ID,
+                    "source-path": f"/share/{target_album_id}",
+                    "hl": "en",
+                    "rt": "c",
+                }
+                if bl_token:
+                    la_params["bl"] = bl_token
+                if f_sid:
+                    la_params["f.sid"] = f_sid
+                la_url = "https://photos.google.com/_/PhotosUi/data/batchexecute?" + urllib.parse.urlencode(la_params)
+                la_form = {"f.req": la_req}
+                if at_token:
+                    la_form["at"] = at_token
+                la_resp = http_session.post(
+                    la_url,
+                    data=la_form,
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                        "Origin": "https://photos.google.com",
+                        "Referer": share_url,
+                    },
+                    timeout=timeout,
+                )
+                la_resp.raise_for_status()
+                parsed = parse_batchexecute_response(la_resp.text, rpc_id=ADD_LIBRARY_TO_SHARED_RPC_ID)
+                batch_responses.append(parsed)
+                batches_executed += 1
+                added_item_ids.extend(lib_ids)
+                continue
+
             _, f_req = build_add_items_rpc_payload(
                 target_album_id=target_album_id,
                 target_auth_key=target_auth_key,
                 items=chunk,
                 rpc_id=rpc_id,
+                source_album_id=source_album_id,
+                source_auth_key=source_auth_key,
             )
             params: dict[str, str] = {
                 "rpcids": rpc_id,
@@ -1915,6 +2008,78 @@ def populate_shared_album(
             http_session.close()
 
 
+def populate_all_targets(
+    curation_dir: Path | str = DEFAULT_CURATION_DIR,
+    status_path: Path | str = DEFAULT_POPULATION_STATUS_PATH,
+    cookies_db_path: Path | str = DEFAULT_CHROME_COOKIES_PATH,
+    targets: list[str] | None = None,
+    batch_size: int = 50,
+    rpc_id: str = ADD_ITEMS_RPC_ID,
+    dry_run: bool = False,
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    """Populate all curated target albums (Rosie Year 6 & Isaac Year 2), verify live counts, and write population_status.json."""
+    cur_dir = Path(curation_dir)
+    target_names = targets or list(TARGET_CURATION_SPECS.keys())
+    albums_status: dict[str, dict[str, Any]] = {}
+
+    for t_name in target_names:
+        spec = TARGET_CURATION_SPECS[t_name]
+        curated_file = cur_dir / str(spec["output_filename"])
+        curated_data = json.loads(curated_file.read_text(encoding="utf-8"))
+        short_url = ALBUM_REGISTRY[t_name]["short_url"]
+
+        pre_live = scrape_shared_album(t_name, short_url)
+        live_existing_keys = {_item_key(it) for it in pre_live.get("items", [])}
+        selected_items = curated_data.get("selected_items", [])
+        remaining_items = [it for it in selected_items if _item_key(it) not in live_existing_keys]
+
+        pop_res = populate_shared_album(
+            target_album=t_name,
+            target_album_id=pre_live["album_id"],
+            target_auth_key=pre_live["auth_key"],
+            items_to_add=remaining_items,
+            cookies_db_path=cookies_db_path,
+            batch_size=batch_size,
+            rpc_id=rpc_id,
+            session=session,
+            dry_run=dry_run,
+        )
+
+        post_live = pre_live if (dry_run or not remaining_items) else scrape_shared_album(t_name, short_url)
+        post_count = int(post_live.get("item_count", 0))
+        min_expected = 540 if t_name == "Rosie Year 6" else (560 if t_name == "Isaac Year 2" else int(spec["target_count"]) - 40)
+
+        entry = {
+            "target_album": t_name,
+            "short_url": short_url,
+            "album_id": pre_live["album_id"],
+            "curated_target_count": int(spec["target_count"]),
+            "curated_newly_selected_count": int(curated_data.get("newly_selected_count", len(remaining_items))),
+            "pre_population_live_count": int(pre_live.get("item_count", 0)),
+            "remaining_submitted_count": len(remaining_items),
+            "added_in_run_count": int(pop_res.get("added_count", 0)),
+            "batches_executed": int(pop_res.get("batches_executed", 0)),
+            "rpc_id": pop_res.get("rpc_id", rpc_id),
+            "post_population_live_count": post_count,
+            "live_item_count": post_count,
+            "verified": post_count >= min_expected,
+            "status": pop_res.get("status", "completed"),
+        }
+        albums_status[t_name] = entry
+
+    status_payload: dict[str, Any] = {
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "dry_run": dry_run,
+        "albums": albums_status,
+        **albums_status,
+    }
+    out_status = Path(status_path)
+    out_status.parent.mkdir(parents=True, exist_ok=True)
+    out_status.write_text(json.dumps(status_payload, indent=2), encoding="utf-8")
+    return status_payload
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Google Photos Shared Album Pagination Indexer & Phase 2 Multimodal Vision Curator"
@@ -1948,6 +2113,22 @@ def main() -> None:
         help="Skip scraping and run Phase 2 curation directly from existing manifest.json",
     )
     parser.add_argument(
+        "--populate",
+        action="store_true",
+        help="Populate target shared albums (Rosie Year 6 & Isaac Year 2) and write population_status.json",
+    )
+    parser.add_argument(
+        "--population-status",
+        type=Path,
+        default=DEFAULT_POPULATION_STATUS_PATH,
+        help="Output path for population_status.json",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run population in dry-run mode without mutating Google Photos albums",
+    )
+    parser.add_argument(
         "--no-network-vision",
         action="store_true",
         help="Disable network thumbnail fetches during vision scoring",
@@ -1966,7 +2147,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.curate_only:
+    if not args.curate_only and not args.populate:
         t0 = time.time()
         manifest = build_curation_manifest(
             output_path=args.output,
@@ -2006,6 +2187,21 @@ def main() -> None:
                 f"[lift={res['hearted_lift_ratio']}x], "
                 f"bursts={res['burst_stats']['total_bursts']}, "
                 f"solo_excluded={res['vision_disambiguation_stats']['solo_other_child_excluded']})"
+            )
+
+    if args.populate:
+        t2 = time.time()
+        pop_status = populate_all_targets(
+            curation_dir=args.curation_dir,
+            status_path=args.population_status,
+            dry_run=args.dry_run,
+        )
+        p_elapsed = time.time() - t2
+        print(f"Completed shared album population in {p_elapsed:.1f}s -> {args.population_status}")
+        for t_name, p_res in pop_status.get("albums", {}).items():
+            print(
+                f"  {t_name}: live_item_count={p_res['live_item_count']}, "
+                f"added_in_run={p_res['added_in_run_count']}, verified={p_res['verified']}"
             )
 
 

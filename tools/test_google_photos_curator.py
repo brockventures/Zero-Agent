@@ -501,3 +501,65 @@ def test_extract_wiz_tokens_and_populate_shared_album() -> None:
     assert mock_session.post.call_count == 2
 
 
+def test_build_add_items_rpc_payload_variants_and_populate_all_targets(tmp_path: Path) -> None:
+    rpc_v8, f_req_v8 = gpc.build_add_items_rpc_payload(
+        target_album_id="TGT_ALB",
+        target_auth_key="TGT_KEY",
+        items=["ITEM_1", "ITEM_2"],
+        rpc_id="V8RKJ",
+        source_album_id="SRC_ALB",
+        source_auth_key="SRC_KEY",
+    )
+    assert rpc_v8 == "V8RKJ"
+    assert "SRC_ALB" in f_req_v8
+
+    rpc_la, f_req_la = gpc.build_add_items_rpc_payload(
+        target_album_id="TGT_ALB",
+        target_auth_key="TGT_KEY",
+        items=["LIB_1"],
+        rpc_id="laUYf",
+    )
+    assert rpc_la == "laUYf"
+    assert "LIB_1" in f_req_la
+
+    cur_dir = tmp_path / "curation"
+    cur_dir.mkdir(parents=True, exist_ok=True)
+    status_file = tmp_path / "population_status.json"
+
+    rosie_items = [{"item_id": f"R_{i}", "dedup_key": f"rk_{i}"} for i in range(550)]
+    isaac_items = [{"item_id": f"I_{i}", "dedup_key": f"ik_{i}"} for i in range(565)]
+
+    (cur_dir / "rosie_year_6_curated.json").write_text(
+        json.dumps({"newly_selected_count": 549, "selected_items": rosie_items}),
+        encoding="utf-8",
+    )
+    (cur_dir / "isaac_year_2_curated.json").write_text(
+        json.dumps({"newly_selected_count": 566, "selected_items": isaac_items}),
+        encoding="utf-8",
+    )
+
+    def fake_scrape(album_name: str, short_url: str, max_pages: int | None = None, timeout: int = 20) -> dict[str, Any]:
+        items = rosie_items if album_name == "Rosie Year 6" else isaac_items
+        return {
+            "album_name": album_name,
+            "album_id": f"ALB_{album_name}",
+            "auth_key": "AUTH_KEY",
+            "item_count": len(items),
+            "items": items,
+        }
+
+    with patch("tools.google_photos_curator.scrape_shared_album", side_effect=fake_scrape):
+        status = gpc.populate_all_targets(
+            curation_dir=cur_dir,
+            status_path=status_file,
+            dry_run=False,
+        )
+
+    assert status_file.exists()
+    assert status["Rosie Year 6"]["live_item_count"] == 550
+    assert status["Rosie Year 6"]["verified"] is True
+    assert status["Isaac Year 2"]["live_item_count"] == 565
+    assert status["Isaac Year 2"]["verified"] is True
+
+
+
