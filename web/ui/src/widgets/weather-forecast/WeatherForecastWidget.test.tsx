@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as formatModule from '../format';
 import { useDisplayStore } from '../../store';
 import { WeatherForecastWidget } from './WeatherForecastWidget';
+import weatherForecastCss from './WeatherForecastWidget.css?raw';
 import { WeatherIcon, WeatherIconGlyph } from './WeatherIcon';
 import { WeatherHourlyGraph } from './WeatherHourlyGraph';
 import {
@@ -1527,5 +1528,32 @@ describe('WeatherHourlyGraph component', () => {
     rerender(<WeatherForecastWidget id="weather-school-shadow" type="weather-forecast" />);
     const stripInvalid = container.querySelector('.weather-school-day-strip') as HTMLElement | null;
     expect(stripInvalid?.style.getPropertyValue('--weather-scrim-opacity')).toBe('');
+  });
+
+  it('defines school-day full-bleed container, hidden legacy sections, slot styling, and slot hour labels in WeatherForecastWidget.css', () => {
+    expect(weatherForecastCss).toMatch(
+      /\.widget-card\[data-widget-type=["']weather-forecast["']\]:has\(\.weather-school-day-strip\)\s*\{[^}]*padding:\s*6px;/,
+    );
+    expect(weatherForecastCss).toMatch(
+      /\.widget-weather:has\(\.weather-school-day-strip\)\s*\{[^}]*display:\s*block;[^}]*padding:\s*0;[^}]*width:\s*100%;[^}]*height:\s*100%;/s,
+    );
+    expect(weatherForecastCss).toMatch(
+      /\.widget-weather:has\(\.weather-school-day-strip\)\s*>\s*\.weather-header[\s\S]*?\.widget-weather:has\(\.weather-school-day-strip\)\s*>\s*\.weather-container[\s\S]*?\.widget-weather:has\(\.weather-school-day-strip\)\s*>\s*\.weather-micro-stats\s*\{[^}]*display:\s*none;/,
+    );
+    expect(weatherForecastCss).toMatch(
+      /\.weather-school-day-strip\s*\{[^}]*gap:\s*8px;/s,
+    );
+    expect(weatherForecastCss).toMatch(
+      /\.weather-school-day-slot\s*\{[^}]*box-shadow:\s*none;[^}]*border:\s*2px solid rgba\(255,\s*255,\s*255,\s*0\.32\);/s,
+    );
+    expect(weatherForecastCss).toMatch(
+      /\.weather-school-day-slot-morning\s+\.weather-school-day-name::after\s*\{[^}]*content:\s*['"]\s*·\s*8 AM['"];/s,
+    );
+    expect(weatherForecastCss).toMatch(
+      /\.weather-school-day-slot-afternoon\s+\.weather-school-day-name::after\s*\{[^}]*content:\s*['"]\s*·\s*2 PM['"];/s,
+    );
+    expect(weatherForecastCss).toMatch(
+      /\.weather-school-day-slot-evening\s+\.weather-school-day-name::after\s*\{[^}]*content:\s*['"]\s*·\s*6 PM['"];/s,
+    );
   });
 });

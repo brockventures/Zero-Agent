@@ -1,3 +1,7 @@
+.widget-card[data-widget-type="weather-forecast"]:has(.weather-school-day-strip) {
+  padding: 6px;
+}
+
 .widget-weather {
   display: flex;
   flex-direction: column;
@@ -5,6 +9,19 @@
   min-height: 0;
   width: 100%;
   height: 100%;
+}
+
+.widget-weather:has(.weather-school-day-strip) {
+  display: block;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.widget-weather:has(.weather-school-day-strip) > .weather-header,
+.widget-weather:has(.weather-school-day-strip) > .weather-container,
+.widget-weather:has(.weather-school-day-strip) > .weather-micro-stats {
+  display: none;
 }
 
 .weather-hourly-graph text {
@@ -16,7 +33,7 @@
   --weather-scrim-opacity: 1;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
+  gap: 8px;
   width: 100%;
   height: 100%;
   align-items: stretch;
@@ -32,7 +49,21 @@
   border-radius: 20px;
   overflow: hidden;
   background: #0f172a;
+  box-shadow: none;
+  border: 2px solid rgba(255, 255, 255, 0.32);
   contain: layout paint;
+}
+
+.weather-school-day-slot-morning .weather-school-day-name::after {
+  content: ' · 8 AM';
+}
+
+.weather-school-day-slot-afternoon .weather-school-day-name::after {
+  content: ' · 2 PM';
+}
+
+.weather-school-day-slot-evening .weather-school-day-name::after {
+  content: ' · 6 PM';
 }
 
 .weather-school-day-slot::before {
