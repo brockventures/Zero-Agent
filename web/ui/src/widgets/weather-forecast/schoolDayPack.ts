@@ -298,10 +298,7 @@ export function resolveBirthdayOverride(
   if (Array.isArray(birthdaysConfig)) {
     for (const item of birthdaysConfig) {
       if (item && typeof item === 'object' && !Array.isArray(item)) {
-        const match = matchBirthdayEntryObject(
-          item as BirthdayConfigEntry & Record<string, unknown>,
-          targetMonthDay,
-        );
+        const match = matchBirthdayEntryObject(item as Record<string, unknown>, targetMonthDay);
         if (match) return match;
       }
     }
@@ -322,11 +319,7 @@ export function resolveBirthdayOverride(
           if (match) return match;
         }
       } else if (v && typeof v === 'object' && !Array.isArray(v)) {
-        const match = matchBirthdayEntryObject(
-          v as BirthdayConfigEntry & Record<string, unknown>,
-          targetMonthDay,
-          k,
-        );
+        const match = matchBirthdayEntryObject(v as Record<string, unknown>, targetMonthDay, k);
         if (match) return match;
       }
     }

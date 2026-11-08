@@ -1,0 +1,10 @@
+{
+  "session": "Kitchen assistant",
+  "updated_at": "2026-01-02T18:42:00Z",
+  "messages": [
+    {"role": "human", "author": "sam", "ts": "2026-01-02T18:39:10Z", "text": "What is on the calendar tomorrow?"},
+    {"role": "agent", "author": "assistant", "ts": "2026-01-02T18:39:18Z", "text": "Dentist at 9:00 and soccer practice at 4:30."},
+    {"role": "human", "author": "sam", "ts": "2026-01-02T18:41:02Z", "text": "Add milk and eggs to the shopping list."},
+    {"role": "agent", "author": "assistant", "ts": "2026-01-02T18:42:00Z", "text": "Done. Milk and eggs are on the shopping list."}
+  ]
+}

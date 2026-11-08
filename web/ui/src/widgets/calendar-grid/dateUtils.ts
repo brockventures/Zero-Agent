@@ -120,20 +120,14 @@ export function sliceWeekWindow(
   return days;
 }
 
-export const COLLAPSED_GAP_HOUR_EQUIVALENT = 0.65;
-export const MIN_COLLAPSED_GAP_HOURS = 3;
+const COLLAPSED_GAP_HOUR_EQUIVALENT = 0.65;
 
 export function computeDayLayout(
   allDayEvents: FamilySpanEvent[] | undefined,
   days: FamilyDay[] | undefined,
   activeView: ViewMode,
-  currentDateISO: string,
-  collapsedGaps?: CollapsedHoursGap[]
+  currentDateISO: string
 ): FamilySpanEvent[] {
-  if (days && collapsedGaps && collapsedGaps.length > 0) {
-    // Preserve collapsed gap metadata on the layout pass when supplied.
-    void collapsedGaps;
-  }
   if (!allDayEvents || allDayEvents.length === 0) return [];
   if (activeView !== 'day') return allDayEvents;
   const dayIdx = (days || []).findIndex((d) => d.date === currentDateISO);
@@ -177,7 +171,7 @@ export function formatEventTime(label?: string, timeFormat?: string): string {
   }
 
   // If already in 12h format (e.g. '6pm' or '6:30pm'), preserve it when timeFormat is omitted
-  if (/[ap]m$/i.test(trimmed)) {
+  if (!timeFormat && /[ap]m$/i.test(trimmed)) {
     return trimmed;
   }
 
@@ -242,88 +236,6 @@ export function mapTimeMinutesToPct(
 
   if (totalEff <= 0) return 0;
   return (effAtTarget / totalEff) * 100;
-}
-
-/**
- * Computes collapsed midday gaps (3+ consecutive empty interior hours between the first and last
- * active event hours across the given days) when not already provided by the backend.
- */
-export function resolveCollapsedMiddayGaps(
-  days: FamilyDay[] | undefined,
-  startMin: number,
-  endMin: number,
-  timeFormat?: string
-): CollapsedHoursGap[] {
-  if (!days || days.length === 0) return [];
-  const firstHour = Math.ceil(startMin / 60);
-  const lastHour = Math.floor(endMin / 60);
-  if (lastHour - firstHour < MIN_COLLAPSED_GAP_HOURS + 2) return [];
-
-  const occupied = new Set<number>();
-  for (const day of days) {
-    const evList = day.events && day.events.length > 0 ? day.events : day.timed || [];
-    for (const ev of evList) {
-      if (ev.all_day) continue;
-      const sMin = parseTimeMinutes(ev.start);
-      if (sMin === null) continue;
-      let eMin = parseTimeMinutes(ev.end);
-      if (eMin === null || eMin <= sMin) eMin = sMin + 30;
-      for (let h = firstHour; h < lastHour; h++) {
-        const slotStart = h * 60;
-        const slotEnd = (h + 1) * 60;
-        if (sMin < slotEnd && eMin > slotStart) {
-          occupied.add(h);
-        }
-      }
-    }
-  }
-
-  let minOcc = -1;
-  let maxOcc = -1;
-  for (let h = firstHour; h < lastHour; h++) {
-    if (occupied.has(h)) {
-      if (minOcc === -1 || h < minOcc) minOcc = h;
-      if (maxOcc === -1 || h > maxOcc) maxOcc = h;
-    }
-  }
-
-  if (minOcc === -1 || maxOcc <= minOcc + MIN_COLLAPSED_GAP_HOURS) return [];
-
-  const gaps: CollapsedHoursGap[] = [];
-  let runStart = -1;
-  for (let h = minOcc + 1; h <= maxOcc; h++) {
-    if (!occupied.has(h) && h < maxOcc) {
-      if (runStart === -1) runStart = h;
-    } else if (runStart !== -1) {
-      if (h - runStart >= MIN_COLLAPSED_GAP_HOURS) {
-        const startStr = `${String(runStart).padStart(2, '0')}:00`;
-        const endStr = `${String(h).padStart(2, '0')}:00`;
-        const startLbl = formatEventTime(startStr, timeFormat);
-        const endLbl = formatEventTime(endStr, timeFormat);
-        gaps.push({
-          start_hour: runStart,
-          end_hour: h,
-          start_str: startStr,
-          end_str: endStr,
-          label: `${startLbl} – ${endLbl}`,
-          top_pct: 0,
-          height_pct: 0,
-        });
-      }
-      runStart = -1;
-    }
-  }
-
-  if (gaps.length === 0) return [];
-
-  for (const g of gaps) {
-    const top = mapTimeMinutesToPct(g.start_hour * 60, startMin, endMin, gaps);
-    const bot = mapTimeMinutesToPct(g.end_hour * 60, startMin, endMin, gaps);
-    g.top_pct = Math.round(top * 100) / 100;
-    g.height_pct = Math.round((bot - top) * 100) / 100;
-  }
-
-  return gaps;
 }
 
 /**
@@ -424,3 +336,135 @@ export function computeNowIndicatorPct(
 
   return mapTimeMinutesToPct(nowMin, startMin, endMin, gaps);
 }
+
+interface CustomBirthdayEntry {
+  name?: string;
+  key?: string;
+  id?: string;
+  date?: string;
+  month_day?: string;
+  month?: number;
+  day?: number;
+  label?: string;
+  banner_label?: string;
+}
+
+function normalizeCustomMonthDay(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  const fullMatch = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(trimmed);
+  if (fullMatch) {
+    return `${fullMatch[2].padStart(2, '0')}-${fullMatch[3].padStart(2, '0')}`;
+  }
+  const mdMatch = /^(\d{1,2})[-/](\d{1,2})$/.exec(trimmed);
+  if (mdMatch) {
+    return `${mdMatch[1].padStart(2, '0')}-${mdMatch[2].padStart(2, '0')}`;
+  }
+  return undefined;
+}
+
+function formatCustomSpecialDayBadge(nameRaw?: string, labelRaw?: string): string | null {
+  if (typeof labelRaw === 'string' && labelRaw.trim()) {
+    const cleanLabel = labelRaw.trim().replace(/^🎂\s*/, '');
+    return `🎂 ${cleanLabel}`;
+  }
+  if (typeof nameRaw === 'string' && nameRaw.trim()) {
+    const cleanName = nameRaw.trim();
+    if (/bday|birthday/i.test(cleanName)) {
+      return `🎂 ${cleanName.replace(/^🎂\s*/, '')}`;
+    }
+    return `🎂 ${cleanName}'s Bday`;
+  }
+  return null;
+}
+
+function matchCustomEntryObject(
+  entry: CustomBirthdayEntry & Record<string, unknown>,
+  targetMonthDay: string,
+  fallbackKey?: string,
+): string | null {
+  let entryMonthDay = normalizeCustomMonthDay(entry.date ?? entry.month_day);
+  if (
+    !entryMonthDay &&
+    typeof entry.month === 'number' &&
+    typeof entry.day === 'number'
+  ) {
+    entryMonthDay = `${String(entry.month).padStart(2, '0')}-${String(entry.day).padStart(2, '0')}`;
+  }
+  if (!entryMonthDay && fallbackKey) {
+    entryMonthDay = normalizeCustomMonthDay(fallbackKey);
+  }
+  if (entryMonthDay !== targetMonthDay) return null;
+
+  const rawName =
+    typeof entry.name === 'string'
+      ? entry.name
+      : typeof entry.key === 'string'
+        ? entry.key
+        : typeof entry.id === 'string'
+          ? entry.id
+          : fallbackKey && !normalizeCustomMonthDay(fallbackKey)
+            ? fallbackKey
+            : '';
+  const rawLabel =
+    typeof entry.label === 'string'
+      ? entry.label
+      : typeof entry.banner_label === 'string'
+        ? entry.banner_label
+        : undefined;
+  return formatCustomSpecialDayBadge(rawName, rawLabel);
+}
+
+function resolveSingleSpecialSource(dateStr: string, source: unknown): string | null {
+  if (!source || typeof source === 'boolean') return null;
+  const targetMonthDay = normalizeCustomMonthDay(dateStr);
+  if (!targetMonthDay) return null;
+
+  if (Array.isArray(source)) {
+    for (const item of source) {
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        const match = matchCustomEntryObject(item as Record<string, unknown>, targetMonthDay);
+        if (match) return match;
+      }
+    }
+    return null;
+  }
+
+  if (typeof source === 'object') {
+    const map = source as Record<string, unknown>;
+    for (const [k, v] of Object.entries(map)) {
+      if (typeof v === 'string') {
+        const kAsDate = normalizeCustomMonthDay(k);
+        const vAsDate = normalizeCustomMonthDay(v);
+        if (vAsDate === targetMonthDay) {
+          const match = formatCustomSpecialDayBadge(k);
+          if (match) return match;
+        } else if (kAsDate === targetMonthDay) {
+          const match = formatCustomSpecialDayBadge(v);
+          if (match) return match;
+        }
+      } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const match = matchCustomEntryObject(v as Record<string, unknown>, targetMonthDay, k);
+        if (match) return match;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolves a custom birthday or special-day badge text ('🎂 Maya\'s Bday' or '🎂 Custom Label')
+ * for a given date ('YYYY-MM-DD' or 'MM-DD') from widget config (`birthdays` or `special_days`).
+ */
+export function resolveConfiguredSpecialDayLabel(
+  dateStr?: string,
+  birthdays?: unknown,
+  specialDays?: unknown,
+): string | null {
+  if (!dateStr) return null;
+  return (
+    resolveSingleSpecialSource(dateStr, birthdays) ||
+    resolveSingleSpecialSource(dateStr, specialDays)
+  );
+}
+

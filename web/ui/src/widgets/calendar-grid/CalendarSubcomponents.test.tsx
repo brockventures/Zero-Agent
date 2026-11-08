@@ -1,9 +1,11 @@
 import { act, cleanup, fireEvent, render, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useDisplayStore } from '../../store';
+import { CalendarGridWidget, type CalendarGridViewModel } from './CalendarGridWidget';
 import { CalendarEventModal } from './CalendarEventModal';
 import { CalendarHeader } from './CalendarHeader';
 import { CalendarMonthView } from './CalendarMonthView';
+import { CalendarAllDayBand, detectDaySpecialStatus, detectEventFlair, renderEventFlairWatermark, } from './CalendarWeekBands';
 import { batchFitDayColumnEvents, CalendarWeekView } from './CalendarWeekView';
 import { formatISODate as toISODate } from './dateUtils';
 import { useCalendarRangeData } from './useCalendarRangeData';
@@ -78,28 +80,38 @@ describe('CalendarEventModal', () => {
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 
-  it('renders Mealie hero image when location starts with /hearth-api/mealie/image/', () => {
-    const mealieEvent: FamilyEvent = {
-      id: 'mealie-1',
-      title: '🍽️ Pasta Carbonara',
-      location: '/hearth-api/mealie/image/carbonara.jpg',
-    };
-    const { container } = render(
+  it('renders Mealie hero image when location or image_url has a supported Mealie image source', () => {
+    const mealieEvent: FamilyEvent = { id: 'mealie-1', title: '🍽️ Pasta Carbonara', location: '/hearth-api/mealie/image/carbonara.jpg' };
+    const { container, rerender } = render(
       <CalendarEventModal event={mealieEvent} dateLabel="Oct 27" onClose={vi.fn()} />
     );
 
-    const img = container.querySelector('img');
+    let img = container.querySelector('img');
     expect(img).not.toBeNull();
     expect(img?.getAttribute('src')).toBe('/hearth-api/mealie/image/carbonara.jpg');
+    expect(container.querySelector('.cf-modal-location')).toBeNull();
+
+    // Also supports image_url with /api/media/recipes/... while suppressing non-image location when hero image renders
+    const mediaEvent: FamilyEvent = { id: 'mealie-2', title: 'Salmon Bowl', location: 'Kitchen', image_url: '/api/media/recipes/salmon/images/min-original.webp', description: 'B'.repeat(320) };
+    rerender(<CalendarEventModal event={mediaEvent} dateLabel="Oct 27" onClose={vi.fn()} />);
+    img = container.querySelector('img');
+    expect(img).not.toBeNull();
+    expect(img?.getAttribute('src')).toBe('/api/media/recipes/salmon/images/min-original.webp');
+    expect(container.querySelector('.cf-modal-location')).toBeNull();
+    // Description is treated as Mealie recipe (not truncated to 280 chars) even without plate emoji in title
+    const descEl = container.querySelector('.cf-modal-description');
+    expect(descEl?.textContent?.length).toBe(320);
+
+    // Also supports data:image/... in location without rendering location pin
+    const dataImgEvent: FamilyEvent = { id: 'mealie-3', title: 'Tacos', location: 'data:image/webp;base64,UklGRg==' };
+    rerender(<CalendarEventModal event={dataImgEvent} dateLabel="Oct 27" onClose={vi.fn()} />);
+    img = container.querySelector('img');
+    expect(img?.getAttribute('src')).toBe('data:image/webp;base64,UklGRg==');
     expect(container.querySelector('.cf-modal-location')).toBeNull();
   });
 
   it('renders standard location icon for normal locations', () => {
-    const event: FamilyEvent = {
-      id: 'loc-1',
-      title: 'Doctor Appointment',
-      location: 'Medical Center Suite 400',
-    };
+    const event: FamilyEvent = { id: 'loc-1', title: 'Doctor Appointment', location: 'Medical Center Suite 400' };
     const { container } = render(
       <CalendarEventModal event={event} dateLabel="Oct 27" onClose={vi.fn()} />
     );
@@ -111,14 +123,7 @@ describe('CalendarEventModal', () => {
   });
 
   it('renders owner chips with initials, colors, and pattern classes', () => {
-    const event: FamilyEvent = {
-      id: 'chip-1',
-      title: 'Family Dinner',
-      owners: ['Alex', 'Sam'],
-      initials: ['A', 'S'],
-      colors: ['#ff6f59', '#8b60ed'],
-      patterns: ['solid', 'striped'],
-    };
+    const event: FamilyEvent = { id: 'chip-1', title: 'Family Dinner', owners: ['Alex', 'Sam'], initials: ['A', 'S'], colors: ['#ff6f59', '#8b60ed'], patterns: ['solid', 'striped'] };
     const { container } = render(
       <CalendarEventModal event={event} dateLabel="Oct 27" onClose={vi.fn()} />
     );
@@ -135,12 +140,7 @@ describe('CalendarEventModal', () => {
 
   it('handles Mealie emoji description stripping and preserves long text without truncation', () => {
     const longDesc = '🍽️ '.repeat(5) + 'A'.repeat(300);
-    const mealieEvent: FamilyEvent = {
-      id: 'm-desc',
-      title: '🍽️ Stew',
-      location: '/hearth-api/mealie/image/stew.jpg',
-      description: longDesc,
-    };
+    const mealieEvent: FamilyEvent = { id: 'm-desc', title: '🍽️ Stew', location: '/hearth-api/mealie/image/stew.jpg', description: longDesc };
     const { container } = render(
       <CalendarEventModal event={mealieEvent} dateLabel="Oct 27" onClose={vi.fn()} />
     );
@@ -154,11 +154,7 @@ describe('CalendarEventModal', () => {
 
   it('truncates standard event description exceeding 280 chars to 277 chars + ellipsis', () => {
     const longDesc = 'B'.repeat(320);
-    const event: FamilyEvent = {
-      id: 'norm-desc',
-      title: 'Conference',
-      description: longDesc,
-    };
+    const event: FamilyEvent = { id: 'norm-desc', title: 'Conference', description: longDesc };
     const { container } = render(
       <CalendarEventModal event={event} dateLabel="Oct 27" onClose={vi.fn()} />
     );
@@ -212,22 +208,7 @@ describe('CalendarHeader', () => {
   it('renders member filter chips and handles clicks with active/dimmed styles', () => {
     const onSelectMember = vi.fn();
     const { container } = render(
-      <CalendarHeader
-        customTitle="Family Calendar"
-        activeView="week"
-        pageOffset={0}
-        rangeLabelWeek="Oct 25 – 31, 2026"
-        rangeLabelMonth="October 2026"
-        rangeLabelDay="Tuesday, Oct 27"
-        syncMessage={null}
-        members={members}
-        selectedMember="Alex"
-        onSelectMember={onSelectMember}
-        onPrev={vi.fn()}
-        onNext={vi.fn()}
-        onResetDate={vi.fn()}
-        onViewSwitch={vi.fn()}
-      />
+      <CalendarHeader customTitle="Family Calendar" activeView="week" pageOffset={0} rangeLabelWeek="Oct 25 – 31, 2026" rangeLabelMonth="October 2026" rangeLabelDay="Tuesday, Oct 27" syncMessage={null} members={members} selectedMember="Alex" onSelectMember={onSelectMember} onPrev={vi.fn()} onNext={vi.fn()} onResetDate={vi.fn()} onViewSwitch={vi.fn()}/>
     );
 
     const alexChip = container.querySelector('button[data-member="Alex"]')!;
@@ -242,20 +223,7 @@ describe('CalendarHeader', () => {
     // Default pattern fallback and missing onSelectMember handler
     const anonMember = { initial: 'X', color: '#123456' } as unknown as FamilyMember;
     const { container: anonContainer } = render(
-      <CalendarHeader
-        customTitle="Family Calendar"
-        activeView="day"
-        pageOffset={0}
-        rangeLabelWeek="Oct 25 – 31, 2026"
-        rangeLabelMonth="October 2026"
-        rangeLabelDay="Tuesday, Oct 27"
-        syncMessage={null}
-        members={[anonMember]}
-        onPrev={vi.fn()}
-        onNext={vi.fn()}
-        onResetDate={vi.fn()}
-        onViewSwitch={vi.fn()}
-      />
+      <CalendarHeader customTitle="Family Calendar" activeView="day" pageOffset={0} rangeLabelWeek="Oct 25 – 31, 2026" rangeLabelMonth="October 2026" rangeLabelDay="Tuesday, Oct 27" syncMessage={null} members={[anonMember]} onPrev={vi.fn()} onNext={vi.fn()} onResetDate={vi.fn()} onViewSwitch={vi.fn()}/>
     );
     const anonChip = anonContainer.querySelector('.cf-member-chip') as HTMLElement;
     expect(anonChip.classList.contains('cf-pattern-solid')).toBe(true);
@@ -272,40 +240,14 @@ describe('CalendarHeader', () => {
   it('toggles TODAY reset badge visibility according to pageOffset', () => {
     const onResetDate = vi.fn();
     const { container, rerender } = render(
-      <CalendarHeader
-        customTitle="Family Calendar"
-        activeView="week"
-        pageOffset={0}
-        rangeLabelWeek="Oct 25 – 31, 2026"
-        rangeLabelMonth="October 2026"
-        rangeLabelDay="Tuesday, Oct 27"
-        syncMessage={null}
-        members={members}
-        onPrev={vi.fn()}
-        onNext={vi.fn()}
-        onResetDate={onResetDate}
-        onViewSwitch={vi.fn()}
-      />
+      <CalendarHeader customTitle="Family Calendar" activeView="week" pageOffset={0} rangeLabelWeek="Oct 25 – 31, 2026" rangeLabelMonth="October 2026" rangeLabelDay="Tuesday, Oct 27" syncMessage={null} members={members} onPrev={vi.fn()} onNext={vi.fn()} onResetDate={onResetDate} onViewSwitch={vi.fn()}/>
     );
 
     const todayBtn = container.querySelector('.cf-today-badge') as HTMLElement;
     expect(todayBtn.style.display).toBe('none');
 
     rerender(
-      <CalendarHeader
-        customTitle="Family Calendar"
-        activeView="week"
-        pageOffset={1}
-        rangeLabelWeek="Nov 1 – 7, 2026"
-        rangeLabelMonth="November 2026"
-        rangeLabelDay="Tuesday, Nov 3"
-        syncMessage={null}
-        members={members}
-        onPrev={vi.fn()}
-        onNext={vi.fn()}
-        onResetDate={onResetDate}
-        onViewSwitch={vi.fn()}
-      />
+      <CalendarHeader customTitle="Family Calendar" activeView="week" pageOffset={1} rangeLabelWeek="Nov 1 – 7, 2026" rangeLabelMonth="November 2026" rangeLabelDay="Tuesday, Nov 3" syncMessage={null} members={members} onPrev={vi.fn()} onNext={vi.fn()} onResetDate={onResetDate} onViewSwitch={vi.fn()}/>
     );
 
     expect(todayBtn.style.display).toBe('');
@@ -315,39 +257,13 @@ describe('CalendarHeader', () => {
 
   it('displays syncMessage indicator when present with accessible role', () => {
     const { container, rerender } = render(
-      <CalendarHeader
-        customTitle="Family Calendar"
-        activeView="week"
-        pageOffset={0}
-        rangeLabelWeek="Oct 25 – 31, 2026"
-        rangeLabelMonth="October 2026"
-        rangeLabelDay="Tuesday, Oct 27"
-        syncMessage={null}
-        members={members}
-        onPrev={vi.fn()}
-        onNext={vi.fn()}
-        onResetDate={vi.fn()}
-        onViewSwitch={vi.fn()}
-      />
+      <CalendarHeader customTitle="Family Calendar" activeView="week" pageOffset={0} rangeLabelWeek="Oct 25 – 31, 2026" rangeLabelMonth="October 2026" rangeLabelDay="Tuesday, Oct 27" syncMessage={null} members={members} onPrev={vi.fn()} onNext={vi.fn()} onResetDate={vi.fn()} onViewSwitch={vi.fn()}/>
     );
 
     expect(container.querySelector('.cf-sync-indicator')).toBeNull();
 
     rerender(
-      <CalendarHeader
-        customTitle="Family Calendar"
-        activeView="week"
-        pageOffset={0}
-        rangeLabelWeek="Oct 25 – 31, 2026"
-        rangeLabelMonth="October 2026"
-        rangeLabelDay="Tuesday, Oct 27"
-        syncMessage="Sync failed"
-        members={members}
-        onPrev={vi.fn()}
-        onNext={vi.fn()}
-        onResetDate={vi.fn()}
-        onViewSwitch={vi.fn()}
-      />
+      <CalendarHeader customTitle="Family Calendar" activeView="week" pageOffset={0} rangeLabelWeek="Oct 25 – 31, 2026" rangeLabelMonth="October 2026" rangeLabelDay="Tuesday, Oct 27" syncMessage="Sync failed" members={members} onPrev={vi.fn()} onNext={vi.fn()} onResetDate={vi.fn()} onViewSwitch={vi.fn()}/>
     );
 
     const syncEl = container.querySelector('.cf-sync-indicator');
@@ -361,20 +277,7 @@ describe('CalendarHeader', () => {
     const onPrev = vi.fn();
     const onNext = vi.fn();
     const { container } = render(
-      <CalendarHeader
-        customTitle="Family Calendar"
-        activeView="week"
-        pageOffset={0}
-        rangeLabelWeek="Oct 25 – 31, 2026"
-        rangeLabelMonth="October 2026"
-        rangeLabelDay="Tuesday, Oct 27"
-        syncMessage={null}
-        members={members}
-        onPrev={onPrev}
-        onNext={onNext}
-        onResetDate={vi.fn()}
-        onViewSwitch={vi.fn()}
-      />
+      <CalendarHeader customTitle="Family Calendar" activeView="week" pageOffset={0} rangeLabelWeek="Oct 25 – 31, 2026" rangeLabelMonth="October 2026" rangeLabelDay="Tuesday, Oct 27" syncMessage={null} members={members} onPrev={onPrev} onNext={onNext} onResetDate={vi.fn()} onViewSwitch={vi.fn()}/>
     );
 
     fireEvent.click(container.querySelector('.cf-prev-btn')!);
@@ -385,67 +288,26 @@ describe('CalendarHeader', () => {
   });
 
   it('renders day view header with rangeLabelDay and handles empty members and undefined onSelectMember', () => {
-    const props = {
-      customTitle: 'Family Calendar',
-      activeView: 'day' as const,
-      pageOffset: 0,
-      rangeLabelWeek: 'Oct 25 – 31, 2026',
-      rangeLabelMonth: 'October 2026',
-      rangeLabelDay: 'Tuesday, Oct 27',
-      syncMessage: null,
-      members: [],
-      onPrev: vi.fn(),
-      onNext: vi.fn(),
-      onResetDate: vi.fn(),
-      onViewSwitch: vi.fn(),
-    };
+    const props = { customTitle: 'Family Calendar', activeView: 'day' as const, pageOffset: 0, rangeLabelWeek: 'Oct 25 – 31, 2026', rangeLabelMonth: 'October 2026', rangeLabelDay: 'Tuesday, Oct 27', syncMessage: null, members: [], onPrev: vi.fn(), onNext: vi.fn(), onResetDate: vi.fn(), onViewSwitch: vi.fn() };
     const { container, rerender } = render(<CalendarHeader {...props} />);
-
     const dayLabel = container.querySelector('.cf-label-day') as HTMLElement;
     expect(dayLabel.style.display).toBe('');
     expect(dayLabel.textContent).toBe('Tuesday, Oct 27');
-
-    const weekLabel = container.querySelector('.cf-label-week') as HTMLElement;
-    expect(weekLabel.style.display).toBe('none');
-
-    const monthLabel = container.querySelector('.cf-label-month') as HTMLElement;
-    expect(monthLabel.style.display).toBe('none');
-
+    expect((container.querySelector('.cf-label-week') as HTMLElement).style.display).toBe('none');
+    expect((container.querySelector('.cf-label-month') as HTMLElement).style.display).toBe('none');
     expect(container.querySelector('.cf-legend')).toBeNull();
-
-    // Exercise compiler memo hit
     rerender(<CalendarHeader {...props} />);
     expect(container.querySelector('.cf-label-day')?.textContent).toBe('Tuesday, Oct 27');
   });
 
   it('renders month view header with rangeLabelMonth visible', () => {
-    const props = {
-      customTitle: 'Family Calendar',
-      activeView: 'month' as const,
-      pageOffset: 0,
-      rangeLabelWeek: 'Oct 25 – 31, 2026',
-      rangeLabelMonth: 'October 2026',
-      rangeLabelDay: 'Tuesday, Oct 27',
-      syncMessage: null,
-      members: [],
-      onPrev: vi.fn(),
-      onNext: vi.fn(),
-      onResetDate: vi.fn(),
-      onViewSwitch: vi.fn(),
-    };
+    const props = { customTitle: 'Family Calendar', activeView: 'month' as const, pageOffset: 0, rangeLabelWeek: 'Oct 25 – 31, 2026', rangeLabelMonth: 'October 2026', rangeLabelDay: 'Tuesday, Oct 27', syncMessage: null, members: [], onPrev: vi.fn(), onNext: vi.fn(), onResetDate: vi.fn(), onViewSwitch: vi.fn() };
     const { container, rerender } = render(<CalendarHeader {...props} />);
-
     const monthLabel = container.querySelector('.cf-label-month') as HTMLElement;
     expect(monthLabel.style.display).toBe('');
     expect(monthLabel.textContent).toBe('October 2026');
-
-    const weekLabel = container.querySelector('.cf-label-week') as HTMLElement;
-    expect(weekLabel.style.display).toBe('none');
-
-    const dayLabel = container.querySelector('.cf-label-day') as HTMLElement;
-    expect(dayLabel.style.display).toBe('none');
-
-    // Exercise compiler memo hit
+    expect((container.querySelector('.cf-label-week') as HTMLElement).style.display).toBe('none');
+    expect((container.querySelector('.cf-label-day') as HTMLElement).style.display).toBe('none');
     rerender(<CalendarHeader {...props} />);
     expect(container.querySelector('.cf-label-month')?.textContent).toBe('October 2026');
   });
@@ -524,12 +386,7 @@ describe('CalendarMonthView & CalendarWeekView', () => {
   describe('CalendarMonthView', () => {
     it('renders empty state when no month data or members', () => {
       const { container } = render(
-        <CalendarMonthView
-          activeView="month"
-          monthVM={undefined}
-          members={[]}
-          onOpenModal={vi.fn()}
-        />
+        <CalendarMonthView activeView="month" monthVM={undefined} members={[]} onOpenModal={vi.fn()}/>
       );
       expect(container.textContent).toContain('No calendar data yet');
     });
@@ -609,25 +466,12 @@ describe('CalendarMonthView & CalendarWeekView', () => {
         today: '2026-10-27',
         weekday_headers: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
         days: [
-          {
-            date: '2026-10-27',
-            day_of_month: 27,
-            is_current_month: true,
-            is_today: true,
-            is_weekend: false,
-            events: [ev],
-            event_title: 'Dinner Meeting',
-          },
+          { date: '2026-10-27', day_of_month: 27, is_current_month: true, is_today: true, is_weekend: false, events: [ev], event_title: 'Dinner Meeting' },
         ],
       };
 
       const { container } = render(
-        <CalendarMonthView
-          activeView="month"
-          monthVM={monthVM}
-          members={members}
-          onOpenModal={onOpenModal}
-        />
+        <CalendarMonthView activeView="month" monthVM={monthVM} members={members} onOpenModal={onOpenModal}/>
       );
 
       const eventTitle = container.querySelector('.cf-month-event-title')!;
@@ -651,24 +495,12 @@ describe('CalendarMonthView & CalendarWeekView', () => {
         today: '2026-10-27',
         weekday_headers: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
         days: [
-          {
-            date: '2026-10-27',
-            day_of_month: 27,
-            is_current_month: true,
-            is_today: true,
-            is_weekend: false,
-            event_title: 'Only Title Event',
-          },
+          { date: '2026-10-27', day_of_month: 27, is_current_month: true, is_today: true, is_weekend: false, event_title: 'Only Title Event' },
         ],
       };
 
       const { container } = render(
-        <CalendarMonthView
-          activeView="month"
-          monthVM={monthVM}
-          members={members}
-          onOpenModal={onOpenModal}
-        />
+        <CalendarMonthView activeView="month" monthVM={monthVM} members={members} onOpenModal={onOpenModal}/>
       );
 
       const titleEl = container.querySelector('.cf-month-event-title')!;
@@ -709,12 +541,7 @@ describe('CalendarMonthView & CalendarWeekView', () => {
       };
 
       const { container } = render(
-        <CalendarMonthView
-          activeView="month"
-          monthVM={monthVM}
-          members={members}
-          onOpenModal={vi.fn()}
-        />
+        <CalendarMonthView activeView="month" monthVM={monthVM} members={members} onOpenModal={vi.fn()}/>
       );
 
       const dots = container.querySelectorAll('.cf-month-dot');
@@ -728,56 +555,25 @@ describe('CalendarMonthView & CalendarWeekView', () => {
   describe('CalendarWeekView', () => {
     it('renders empty state when daysToRender or members is empty', () => {
       const { container } = render(
-        <CalendarWeekView
-          activeView="week"
-          daysToRender={[]}
-          visibleAllDayEvents={[]}
-          members={[]}
-          currentDateISO="2026-10-27"
-          onOpenModal={vi.fn()}
-        />
+        <CalendarWeekView activeView="week" daysToRender={[]} visibleAllDayEvents={[]} members={[]} currentDateISO="2026-10-27" onOpenModal={vi.fn()}/>
       );
       expect(container.textContent).toContain('No calendar data yet');
     });
 
     it('renders Mealie all-day card with image and icon vs normal all-day span event', () => {
       const onOpenModal = vi.fn();
-      const allDayMealie: FamilySpanEvent = {
-        id: 'mealie-span-1',
-        title: '🍽️ Tacos Dinner',
-        start_col: 1,
-        col_span: 1,
-        location: '/hearth-api/mealie/image/tacos.jpg',
-        color: '#ff6f59',
-        text_color: '#ffffff',
-        pattern: 'stripes',
-      };
-      const allDayNormal: FamilySpanEvent = {
-        id: 'normal-span-1',
-        title: 'All Day Workshop',
-        start_col: 2,
-        col_span: 1,
-        color: '#8b60ed',
-        text_color: '#ffffff',
-        pattern: 'dots',
-      };
+      const allDayMealie: FamilySpanEvent = { id: 'mealie-span-1', title: '🍽️ Tacos Dinner', start_col: 1, col_span: 1, image_url: '/api/media/recipes/tacos/images/min-original.webp', color: '#ff6f59', text_color: '#ffffff', pattern: 'stripes' };
+      const allDayNormal: FamilySpanEvent = { id: 'normal-span-1', title: 'All Day Workshop', start_col: 2, col_span: 1, color: '#8b60ed', text_color: '#ffffff', pattern: 'dots' };
       const daysToRender: FamilyDay[] = [
         { date: '2026-10-27', day_of_month: 27, is_today: true, is_weekend: false, events: [] },
         { date: '2026-10-28', day_of_month: 28, is_today: false, is_weekend: false, events: [] },
       ];
 
       const { container } = render(
-        <CalendarWeekView
-          activeView="week"
-          daysToRender={daysToRender}
-          visibleAllDayEvents={[allDayMealie, allDayNormal]}
-          members={members}
-          currentDateISO="2026-10-27"
-          onOpenModal={onOpenModal}
-        />
+        <CalendarWeekView activeView="week" daysToRender={daysToRender} visibleAllDayEvents={[allDayMealie, allDayNormal]} members={members} currentDateISO="2026-10-27" onOpenModal={onOpenModal}/>
       );
 
-      const mealieImg = container.querySelector('img[src="/hearth-api/mealie/image/tacos.jpg"]');
+      const mealieImg = container.querySelector('img[src="/api/media/recipes/tacos/images/min-original.webp"]');
       expect(mealieImg).not.toBeNull();
       expect(container.querySelector('.cf-mealie-icon')).not.toBeNull();
       expect(container.querySelector('.cf-pattern-stripes')).not.toBeNull();
@@ -804,47 +600,13 @@ describe('CalendarMonthView & CalendarWeekView', () => {
           is_today: true,
           is_weekend: false,
           early_events: [
-            {
-              id: 'early-1',
-              title: 'Morning Yoga',
-              start: '06:00',
-              top_pct: 0,
-              height_pct: 0,
-              left_pct: 0,
-              width_pct: 100,
-              color: '#8b60ed',
-              text_color: '#ffffff',
-              pattern: 'dots',
-              location: 'Studio A',
-            },
+            { id: 'early-1', title: 'Morning Yoga', start: '06:00', top_pct: 0, height_pct: 0, left_pct: 0, width_pct: 100, color: '#8b60ed', text_color: '#ffffff', pattern: 'dots', location: 'Studio A' },
           ],
           late_events: [
-            {
-              id: 'late-1',
-              title: 'Night Run',
-              start: '22:30',
-              top_pct: 0,
-              height_pct: 0,
-              left_pct: 0,
-              width_pct: 100,
-              color: '#ff6f59',
-              text_color: '#ffffff',
-              pattern: 'dots',
-              location: 'Track',
-            },
+            { id: 'late-1', title: 'Night Run', start: '22:30', top_pct: 0, height_pct: 0, left_pct: 0, width_pct: 100, color: '#ff6f59', text_color: '#ffffff', pattern: 'dots', location: 'Track' },
           ],
           events: [
-            {
-              id: 'timed-1',
-              title: 'Midday Sync',
-              start: '12:00',
-              end: '13:00',
-              top_pct: 40,
-              height_pct: 15,
-              left_pct: 0,
-              width_pct: 100,
-              pattern: 'dots',
-            },
+            { id: 'timed-1', title: 'Midday Sync', start: '12:00', end: '13:00', top_pct: 40, height_pct: 15, left_pct: 0, width_pct: 100, pattern: 'dots' },
           ],
         },
       ];
@@ -905,39 +667,17 @@ describe('CalendarMonthView & CalendarWeekView', () => {
       };
 
       const { container, rerender } = render(
-        <CalendarWeekView
-          activeView="week"
-          weekVM={weekVMTimeline}
-          daysToRender={daysToRender}
-          visibleAllDayEvents={[]}
-          members={members}
-          currentDateISO="2026-10-27"
-          onOpenModal={vi.fn()}
-        />
+        <CalendarWeekView activeView="week" weekVM={weekVMTimeline} daysToRender={daysToRender} visibleAllDayEvents={[]} members={members} currentDateISO="2026-10-27" onOpenModal={vi.fn()}/>
       );
 
       let markers = container.querySelectorAll('.cf-hour-marker');
       expect(markers.length).toBe(2);
       expect(markers[0].textContent).toBe('09:00');
 
-      const weekVMHourMarkers: FamilyViewModel = {
-        range_start: '2026-10-25',
-        range_end: '2026-10-31',
-        range_label: 'Oct 25 – 31',
-        today: '2026-10-27',
-        hour_markers: ['08:00', '12:00', '16:00'],
-      };
+      const weekVMHourMarkers: FamilyViewModel = { range_start: '2026-10-25', range_end: '2026-10-31', range_label: 'Oct 25 – 31', today: '2026-10-27', hour_markers: ['08:00', '12:00', '16:00'] };
 
       rerender(
-        <CalendarWeekView
-          activeView="week"
-          weekVM={weekVMHourMarkers}
-          daysToRender={daysToRender}
-          visibleAllDayEvents={[]}
-          members={members}
-          currentDateISO="2026-10-27"
-          onOpenModal={vi.fn()}
-        />
+        <CalendarWeekView activeView="week" weekVM={weekVMHourMarkers} daysToRender={daysToRender} visibleAllDayEvents={[]} members={members} currentDateISO="2026-10-27" onOpenModal={vi.fn()}/>
       );
 
       markers = container.querySelectorAll('.cf-hour-marker');
@@ -952,15 +692,7 @@ describe('CalendarMonthView & CalendarWeekView', () => {
       ];
 
       const { container } = render(
-        <CalendarWeekView
-          activeView="week"
-          daysToRender={daysToRender}
-          visibleAllDayEvents={[]}
-          members={members}
-          currentDateISO="2026-10-27"
-          onOpenModal={vi.fn()}
-          onSelectDay={onSelectDay}
-        />
+        <CalendarWeekView activeView="week" daysToRender={daysToRender} visibleAllDayEvents={[]} members={members} currentDateISO="2026-10-27" onOpenModal={vi.fn()} onSelectDay={onSelectDay}/>
       );
 
       const header = container.querySelector('.cf-day-header')!;
@@ -983,32 +715,14 @@ describe('CalendarMonthView & CalendarWeekView', () => {
           is_today: true,
           is_weekend: false,
           all_day: [
-            {
-              id: 'col-allday-1',
-              title: '🍽️ Tacos Lunch',
-              location: '/hearth-api/mealie/image/tacos.jpg',
-              color: '#8b60ed',
-              text_color: '#ffffff',
-            },
-            {
-              id: 'col-allday-2',
-              title: 'Standard All Day',
-              color: '#ff6f59',
-              text_color: '#ffffff',
-            },
+            { id: 'col-allday-1', title: '🍽️ Tacos Lunch', location: '/hearth-api/mealie/image/tacos.jpg', color: '#8b60ed', text_color: '#ffffff' },
+            { id: 'col-allday-2', title: 'Standard All Day', color: '#ff6f59', text_color: '#ffffff' },
           ],
         },
       ];
 
       const { container } = render(
-        <CalendarWeekView
-          activeView="week"
-          daysToRender={daysToRender}
-          visibleAllDayEvents={[]}
-          members={members}
-          currentDateISO="2026-10-27"
-          onOpenModal={onOpenModal}
-        />
+        <CalendarWeekView activeView="week" daysToRender={daysToRender} visibleAllDayEvents={[]} members={members} currentDateISO="2026-10-27" onOpenModal={onOpenModal}/>
       );
 
       const items = container.querySelectorAll('.cf-day-allday-col .cf-event.cf-allday');
@@ -1020,6 +734,77 @@ describe('CalendarMonthView & CalendarWeekView', () => {
       );
       fireEvent.keyDown(items[0], { key: 'Enter' });
       fireEvent.keyDown(items[0], { key: ' ' });
+    });
+
+    it('renders .cf-week-meal-row, .cf-day-meal-bar, and 128px full-bleed .cf-mealie-bar photo card with Dinner pill, gradient scrim, click/keyboard modal triggers, and filters meals by member', () => {
+      const onOpenModal = vi.fn();
+      const daysToRender: FamilyDay[] = [
+        {
+          date: '2026-10-27', day_of_month: 27, is_today: true, is_weekend: false,
+          meals: [
+            { id: 'meal-1', title: '🍽️ Creamy Tuscan Chicken', location: 'Kitchen', image_url: '/hearth-api/mealie/image/tuscan.jpg', description: 'Recipe notes', color: '#10b981', text_color: '#ffffff', pattern: 'dots', owners: ['Alex'] } as FamilyEvent,
+            { id: 'meal-2', title: 'Tacos Night', color: '#8b60ed', text_color: '#ffffff', owners: ['Sam'] },
+          ],
+        },
+      ];
+      const { container } = render(
+        <CalendarWeekView activeView="week" daysToRender={daysToRender} visibleAllDayEvents={[]} members={members} currentDateISO="2026-10-27" onOpenModal={onOpenModal} />
+      );
+      const dayCol = container.querySelector('.cf-day')!;
+      expect(dayCol.querySelector('.cf-day-meal-bar')).toBeNull();
+
+      const mealRow = container.querySelector('.cf-week-meal-row')!;
+      expect(mealRow).not.toBeNull();
+      const mealBar = mealRow.querySelector('.cf-day-meal-bar')!;
+      expect(mealBar).not.toBeNull();
+      const mealPills = mealBar.querySelectorAll('.cf-event.cf-mealie-bar.cf-event-clickable');
+      expect(mealPills.length).toBe(2);
+
+      const firstPill = mealPills[0] as HTMLElement;
+      expect(firstPill.classList.contains('cf-pattern-dots')).toBe(true);
+      expect(firstPill.classList.contains('cf-mealie-card')).toBe(true);
+      expect(firstPill.style.minHeight).toBe('128px');
+      expect(firstPill.style.height).toBe('128px');
+      expect(firstPill.style.borderRadius).toBe('12px');
+      expect(firstPill.style.backgroundColor).toBe('rgb(217, 119, 87)');
+      expect(firstPill.getAttribute('data-event-id')).toBe('meal-1');
+      expect(firstPill.getAttribute('data-event-allday')).toBe('true');
+      expect(firstPill.getAttribute('data-event-location')).toBe('Kitchen');
+      expect(firstPill.getAttribute('data-event-image-url')).toBe('/hearth-api/mealie/image/tuscan.jpg');
+      expect(firstPill.getAttribute('data-event-description')).toBe('Recipe notes');
+      expect(firstPill.querySelector('.cf-mealie-pill')?.textContent).toBe('🍽️ Dinner');
+      expect(firstPill.querySelector('.cf-mealie-title')?.textContent).toBe('Creamy Tuscan Chicken');
+
+      const thumb = firstPill.querySelector('img.cf-mealie-photo') as HTMLImageElement;
+      expect(thumb.getAttribute('src')).toBe('/hearth-api/mealie/image/tuscan.jpg');
+      expect(thumb.style.position).toBe('absolute');
+      expect(thumb.style.objectFit).toBe('cover');
+      expect((mealPills[1] as HTMLElement).querySelector('img')).toBeNull();
+      expect((mealPills[1] as HTMLElement).style.backgroundColor).toBe('rgb(217, 119, 87)');
+      expect(mealPills[1].querySelector('.cf-mealie-title')?.textContent).toBe('Tacos Night');
+
+      fireEvent.click(firstPill);
+      expect(onOpenModal).toHaveBeenCalledWith(expect.objectContaining({ id: 'meal-1' }), '2026-10-27');
+      fireEvent.keyDown(firstPill, { key: 'Enter' });
+      expect(onOpenModal).toHaveBeenCalledTimes(2);
+      fireEvent.keyDown(firstPill, { key: ' ' });
+      expect(onOpenModal).toHaveBeenCalledTimes(3);
+
+      useDisplayStore.setState({
+        widgets: {
+          'cal-meal-filter': {
+            meta: { type: 'calendar-grid', origin: [0, 0], dimensions: [6, 2], config: {}, assets_base: '' },
+            state: 'healthy', data: {}, timestamp: '2026-10-27T10:00:00Z',
+            viewModel: { active_view: 'week', week: { range_start: '2026-10-27', range_end: '2026-10-27', range_label: 'Oct 27, 2026', today: '2026-10-27', members, days: daysToRender } } satisfies CalendarGridViewModel as unknown as Record<string, unknown>,
+          },
+        },
+      });
+      const { container: gridContainer } = render(<CalendarGridWidget id="cal-meal-filter" type="calendar-grid" />);
+      expect(gridContainer.querySelectorAll('.cf-mealie-bar').length).toBe(2);
+      fireEvent.click(gridContainer.querySelector('.cf-member-chip[data-member="Alex"]')!);
+      const filteredMeals = gridContainer.querySelectorAll('.cf-mealie-bar');
+      expect(filteredMeals.length).toBe(1);
+      expect(filteredMeals[0].getAttribute('data-event-id')).toBe('meal-1');
     });
 
     it('attaches ResizeObserver to day canvas elements and disconnects on unmount', () => {
@@ -1037,14 +822,7 @@ describe('CalendarMonthView & CalendarWeekView', () => {
           { date: '2026-10-27', day_of_month: 27, is_today: true, is_weekend: false },
         ];
         const { unmount } = render(
-          <CalendarWeekView
-            activeView="week"
-            daysToRender={daysToRender}
-            visibleAllDayEvents={[]}
-            members={members}
-            currentDateISO="2026-10-27"
-            onOpenModal={vi.fn()}
-          />
+          <CalendarWeekView activeView="week" daysToRender={daysToRender} visibleAllDayEvents={[]} members={members} currentDateISO="2026-10-27" onOpenModal={vi.fn()}/>
         );
 
         expect(observe).toHaveBeenCalled();
@@ -1088,9 +866,8 @@ describe('useCalendarRangeData & useInactivityReset', () => {
       vi.stubGlobal('fetch', fetchMock);
 
       // Set window.location.search
-      const origLocation = window.location;
-      delete (window as unknown as { location: unknown }).location;
-      (window as unknown as { location: unknown }).location = { ...origLocation, search: '?node=kiosk-1' };
+      const origHref = window.location.href;
+      window.history.replaceState({}, '', '?node=kiosk-1');
 
       let activeView: ViewMode = 'week';
       const setActiveView: React.Dispatch<React.SetStateAction<ViewMode>> = (action) => {
@@ -1130,7 +907,7 @@ describe('useCalendarRangeData & useInactivityReset', () => {
       });
       expect(fetchMock.mock.calls.length).toBe(callCountBefore);
 
-      (window as unknown as { location: unknown }).location = origLocation;
+      window.history.replaceState({}, '', origHref);
     });
 
     it('rolls back state and displays "Sync failed" on fetch error', async () => {
@@ -1516,22 +1293,12 @@ describe('useCalendarRangeData & useInactivityReset', () => {
       const baseDate = new Date(2026, 9, 27);
       const baseWeekStart = new Date(2026, 9, 25);
 
-      const entryVM: Record<string, unknown> = {
-        days: [],
-        range_start: '2026-09-01',
-        range_end: '2026-11-30',
-        cached_range_start: '2026-09-01',
-        cached_range_end: '2026-11-30',
-      };
+      const entryVM: Record<string, unknown> = { days: [], range_start: '2026-09-01', range_end: '2026-11-30', cached_range_start: '2026-09-01', cached_range_end: '2026-11-30' };
 
       const mockFetch = vi.fn().mockResolvedValue({
         ok: true,
         json: async () => ({
-          view_model: {
-            days: [],
-            range_start: '2026-09-01',
-            range_end: '2026-11-30',
-          },
+          view_model: { days: [], range_start: '2026-09-01', range_end: '2026-11-30' },
         }),
       });
       vi.stubGlobal('fetch', mockFetch);
@@ -1668,6 +1435,319 @@ describe('useCalendarRangeData & useInactivityReset', () => {
         vi.advanceTimersByTime(20000);
       });
       expect(onReset).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('Special Day Highlights & Event Flairs', () => {
+    describe('detectEventFlair', () => {
+      it('correctly classifies keyword-matched titles', () => {
+        expect(detectEventFlair("Maya's Birthday")).toBe('birthday');
+        expect(detectEventFlair('Sam Bday Bash')).toBe('birthday');
+        expect(detectEventFlair('Grandpa B-day')).toBe('birthday');
+        expect(detectEventFlair('Graduation Party')).toBe('party');
+        expect(detectEventFlair('Dentist Appointment')).toBe('dentist');
+        expect(detectEventFlair('Orthodontist Visit')).toBe('dentist');
+        expect(detectEventFlair('Movie Night')).toBe('movie');
+        expect(detectEventFlair('Film Screening')).toBe('movie');
+        expect(detectEventFlair('Flight to Chicago')).toBe('flight');
+        expect(detectEventFlair('Airline Booking')).toBe('flight');
+        expect(detectEventFlair('Soccer Practice')).toBe('sports');
+        expect(detectEventFlair('Baseball Game')).toBe('sports');
+        expect(detectEventFlair('Thanksgiving Dinner')).toBe('holiday');
+        expect(detectEventFlair('Halloween Trick or Treat')).toBe('holiday');
+        expect(detectEventFlair('Veterans Day')).toBe('holiday');
+        expect(detectEventFlair('Regular Meeting')).toBeNull();
+        expect(detectEventFlair('')).toBeNull();
+        expect(detectEventFlair(undefined)).toBeNull();
+      });
+    });
+
+    describe('detectDaySpecialStatus', () => {
+      it('detects family birthdays and excludes work birthdays', () => {
+        const familyMembers: FamilyMember[] = [
+          { name: 'Alex', initial: 'A', color: '#ff0000', text_color: '#fff', pattern: 'solid' },
+          { name: 'Maya', initial: 'M', color: '#00ff00', text_color: '#fff', pattern: 'solid' },
+        ];
+
+        // Family birthday by title prefix/possessive
+        expect(
+          detectDaySpecialStatus([{ id: '1', title: "Maya's Birthday" }], familyMembers)
+        ).toBe('birthday');
+
+        // Family birthday by owner
+        expect(
+          detectDaySpecialStatus(
+            [{ id: '2', title: 'Birthday Dinner', owners: ['Alex'] }],
+            familyMembers
+          )
+        ).toBe('birthday');
+
+        // Family birthday by member field
+        expect(
+          detectDaySpecialStatus(
+            [{ id: '3', title: 'Happy Birthday!', member: 'Maya' } as unknown as FamilyEvent],
+            familyMembers
+          )
+        ).toBe('birthday');
+
+        // Work birthday explicitly excluded
+        expect(
+          detectDaySpecialStatus([{ id: '4', title: 'Dave (Work) Birthday' }], familyMembers)
+        ).toBeNull();
+        expect(
+          detectDaySpecialStatus([{ id: '5', title: 'Coworker Birthday - Lunch' }], familyMembers)
+        ).toBeNull();
+        expect(
+          detectDaySpecialStatus(
+            [{ id: '6', title: 'Bob Birthday', owners: ['(Work)'] }],
+            familyMembers
+          )
+        ).toBeNull();
+
+        // Non-family birthday (not in members list)
+        expect(
+          detectDaySpecialStatus([{ id: '7', title: "Charlie's Birthday" }], familyMembers)
+        ).toBeNull();
+      });
+
+      it('detects holidays by keyword or calendar name', () => {
+        expect(
+          detectDaySpecialStatus([{ id: 'h1', title: 'Thanksgiving Day' }], [])
+        ).toBe('holiday');
+        expect(
+          detectDaySpecialStatus(
+            [{ id: 'h2', title: 'Day Off', calendar: 'US Holidays' } as unknown as FamilyEvent],
+            []
+          )
+        ).toBe('holiday');
+        expect(detectDaySpecialStatus([{ id: 'h3', title: 'Regular Team Sync' }], [])).toBeNull();
+        expect(detectDaySpecialStatus([], [])).toBeNull();
+      });
+    });
+
+    describe('renderEventFlairWatermark', () => {
+      it('renders SVG watermarks for all flair types', () => {
+        const flairs = ['birthday', 'party', 'dentist', 'movie', 'flight', 'sports', 'holiday'] as const;
+        for (const flair of flairs) {
+          const { container } = render(renderEventFlairWatermark(flair)!);
+          expect(container.querySelector('.cf-event-flair-watermark')).not.toBeNull();
+          expect(container.querySelector('svg')).not.toBeNull();
+        }
+      });
+    });
+
+    describe('CalendarEventModal flair banners', () => {
+      it('renders illustrated flair banner for matching themes, respecting eventFlair and Mealie hero', () => {
+        const bdayEv: FamilyEvent = { id: 'bday-1', title: "Alex's Birthday Party" };
+        const { container, rerender } = render(
+          <CalendarEventModal event={bdayEv} dateLabel="Oct 27" onClose={vi.fn()} eventFlair={true} />
+        );
+        expect(
+          container.querySelector('.cf-modal-flair-banner.cf-modal-flair-birthday')
+        ).not.toBeNull();
+
+        // Disabling via eventFlair={false} suppresses banner
+        rerender(
+          <CalendarEventModal event={bdayEv} dateLabel="Oct 27" onClose={vi.fn()} eventFlair={false} />
+        );
+        expect(container.querySelector('.cf-modal-flair-banner')).toBeNull();
+
+        // Mealie hero suppresses flair banner
+        const mealieEv: FamilyEvent = { id: 'mealie-flair', title: 'Birthday Cake', location: '/hearth-api/mealie/image/cake.jpg' };
+        rerender(
+          <CalendarEventModal event={mealieEv} dateLabel="Oct 27" onClose={vi.fn()} eventFlair={true} />
+        );
+        expect(container.querySelector('.cf-modal-flair-banner')).toBeNull();
+        expect(container.querySelector('img')).not.toBeNull();
+      });
+    });
+
+    describe('CalendarAllDayBand flair watermarks', () => {
+      it('renders flair watermark on CalendarAllDayBand all-day pill', () => {
+        const spanEv: FamilySpanEvent = { id: 'span-movie', title: 'Film Festival', start: '2026-10-27', end: '2026-10-27', all_day: true, start_col: 1, col_span: 1, color: '#6366f1', text_color: '#ffffff' };
+        const { container, rerender } = render(
+          <CalendarAllDayBand
+            activeView="week"
+            daysToRender={[
+              { date: '2026-10-27', weekday_abbr: 'Tue', day_of_month: 27, is_today: true, is_weekend: false },
+            ]}
+            visibleAllDayEvents={[spanEv]}
+            currentDateISO="2026-10-27"
+            onOpenModal={vi.fn()}
+            eventFlair={true}
+          />
+        );
+        expect(container.querySelector('.cf-allday.cf-flair-movie')).not.toBeNull();
+        expect(container.querySelector('.cf-event-flair-watermark')).not.toBeNull();
+
+        rerender(
+          <CalendarAllDayBand
+            activeView="week"
+            daysToRender={[
+              { date: '2026-10-27', weekday_abbr: 'Tue', day_of_month: 27, is_today: true, is_weekend: false },
+            ]}
+            visibleAllDayEvents={[spanEv]}
+            currentDateISO="2026-10-27"
+            onOpenModal={vi.fn()}
+            eventFlair={false}
+          />
+        );
+        expect(container.querySelector('.cf-flair-movie')).toBeNull();
+        expect(container.querySelector('.cf-event-flair-watermark')).toBeNull();
+      });
+    });
+
+    describe('CalendarMonthView special day highlights', () => {
+      it('renders special day highlights and pills in CalendarMonthView', () => {
+        const monthVM: FamilyMonthViewModel = {
+          month_label: 'October 2026',
+          month_name: 'October',
+          year: 2026,
+          month: 10,
+          range_start: '2026-10-01',
+          range_end: '2026-10-31',
+          today: '2026-10-27',
+          shared_color: '#3D405B',
+          weekday_headers: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
+          members,
+          days: [
+            {
+              date: '2026-10-25',
+              day_of_month: 25,
+              is_current_month: true,
+              is_today: false,
+              is_weekend: true,
+              events: [{ id: 'bday', title: "Alex's Birthday" }],
+            },
+            {
+              date: '2026-10-26',
+              day_of_month: 26,
+              is_current_month: true,
+              is_today: false,
+              is_weekend: false,
+              events: [{ id: 'holiday', title: 'Halloween' }],
+            },
+            {
+              date: '2026-10-27',
+              day_of_month: 27,
+              is_current_month: true,
+              is_today: true,
+              is_weekend: false,
+              events: [{ id: 'work', title: 'Dave (Work) Birthday' }],
+            },
+          ],
+        };
+
+        const { container, rerender } = render(
+          <CalendarMonthView activeView="month" monthVM={monthVM} members={members} onOpenModal={vi.fn()} celebrateSpecialDays={true}/>
+        );
+
+        const bdayCell = container.querySelector('.cf-month-day[data-date="2026-10-25"]');
+        expect(bdayCell?.classList.contains('cf-special-birthday')).toBe(true);
+        expect(bdayCell?.querySelector('.cf-pill-birthday')?.textContent).toContain('🎂 Family Bday');
+
+        const holidayCell = container.querySelector('.cf-month-day[data-date="2026-10-26"]');
+        expect(holidayCell?.classList.contains('cf-special-holiday')).toBe(true);
+        expect(holidayCell?.querySelector('.cf-pill-holiday')?.textContent).toContain('✨ Holiday');
+
+        const workCell = container.querySelector('.cf-month-day[data-date="2026-10-27"]');
+        expect(workCell?.classList.contains('cf-special-birthday')).toBe(false);
+        expect(workCell?.querySelector('.cf-pill-birthday')).toBeNull();
+
+        // Disabling celebrateSpecialDays={false}
+        rerender(
+          <CalendarMonthView activeView="month" monthVM={monthVM} members={members} onOpenModal={vi.fn()} celebrateSpecialDays={false}/>
+        );
+        expect(container.querySelector('.cf-special-birthday')).toBeNull();
+        expect(container.querySelector('.cf-special-holiday')).toBeNull();
+        expect(container.querySelector('.cf-special-pill')).toBeNull();
+      });
+
+      it('resolves custom birthday and special_days names and labels on configured dates in week and month views', () => {
+        const birthdaysCfg = [
+          { name: 'Maya', date: '10-25' },
+          { name: 'Sam', month: 10, day: 28, label: "Sam's Golden Bday" },
+        ];
+        const specialDaysCfg = {
+          Alex: '2026-10-29',
+          '10-30': 'Grandpa',
+          '10-31': { name: 'Family', label: 'Founders Day' },
+        };
+
+        const daysToRender: FamilyDay[] = [
+          { date: '2026-10-25', weekday_abbr: 'Sun', day_of_month: 25, is_today: false, is_weekend: true, events: [] },
+          { date: '2026-10-28', weekday_abbr: 'Wed', day_of_month: 28, is_today: false, is_weekend: false, events: [] },
+          { date: '2026-10-29', weekday_abbr: 'Thu', day_of_month: 29, is_today: false, is_weekend: false, events: [] },
+          { date: '2026-10-30', weekday_abbr: 'Fri', day_of_month: 30, is_today: false, is_weekend: false, events: [] },
+          { date: '2026-10-31', weekday_abbr: 'Sat', day_of_month: 31, is_today: false, is_weekend: true, events: [] },
+        ];
+
+        const { container: weekContainer } = render(
+          <CalendarWeekView
+            activeView="week"
+            daysToRender={daysToRender}
+            visibleAllDayEvents={[]}
+            members={members}
+            currentDateISO="2026-10-25"
+            onOpenModal={vi.fn()}
+            celebrateSpecialDays={true}
+            birthdays={birthdaysCfg}
+            specialDays={specialDaysCfg}
+          />
+        );
+
+        expect(
+          weekContainer.querySelector('.cf-day[data-date="2026-10-25"] .cf-pill-birthday')?.textContent
+        ).toBe("🎂 Maya's Bday");
+        expect(
+          weekContainer.querySelector('.cf-day[data-date="2026-10-28"] .cf-pill-birthday')?.textContent
+        ).toBe("🎂 Sam's Golden Bday");
+        expect(
+          weekContainer.querySelector('.cf-day[data-date="2026-10-29"] .cf-pill-birthday')?.textContent
+        ).toBe("🎂 Alex's Bday");
+        expect(
+          weekContainer.querySelector('.cf-day[data-date="2026-10-30"] .cf-pill-birthday')?.textContent
+        ).toBe("🎂 Grandpa's Bday");
+        expect(
+          weekContainer.querySelector('.cf-day[data-date="2026-10-31"] .cf-pill-birthday')?.textContent
+        ).toBe('🎂 Founders Day');
+
+        const monthVM: FamilyMonthViewModel = {
+          month_label: 'October 2026',
+          month_name: 'October',
+          year: 2026,
+          month: 10,
+          range_start: '2026-10-01',
+          range_end: '2026-10-31',
+          today: '2026-10-25',
+          shared_color: '#3D405B',
+          weekday_headers: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'],
+          members,
+          days: [
+            { date: '2026-10-25', day_of_month: 25, is_current_month: true, is_today: true, is_weekend: true },
+            { date: '2026-10-28', day_of_month: 28, is_current_month: true, is_today: false, is_weekend: false },
+          ],
+        };
+
+        const { container: monthContainer } = render(
+          <CalendarMonthView
+            activeView="month"
+            monthVM={monthVM}
+            members={members}
+            onOpenModal={vi.fn()}
+            celebrateSpecialDays={true}
+            birthdays={{ Maya: { date: '10-25' } }}
+            specialDays={{ Sam: { date: '10-28', label: "Sam's Day" } }}
+          />
+        );
+
+        expect(
+          monthContainer.querySelector('.cf-month-day[data-date="2026-10-25"] .cf-pill-birthday')?.textContent
+        ).toBe("🎂 Maya's Bday");
+        expect(
+          monthContainer.querySelector('.cf-month-day[data-date="2026-10-28"] .cf-pill-birthday')?.textContent
+        ).toBe("🎂 Sam's Day");
+      });
     });
   });
 });

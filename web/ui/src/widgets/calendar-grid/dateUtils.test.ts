@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { createElement } from 'react';
+import { render } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { CalendarWeekView } from './CalendarWeekView';
 import {
   addDays,
   addMonths,
@@ -6,11 +9,13 @@ import {
   computeDayLayout,
   computeNowIndicatorPct,
   formatDayLabel,
+  formatEventTime,
   formatISODate,
   formatModalDateRange,
   formatMonthLabel,
   formatRangeLabel,
   formatShortDate,
+  mapTimeMinutesToPct,
   matchesMemberFilter,
   parseISODate,
   parseTimeMinutes,
@@ -18,7 +23,13 @@ import {
   startOfWeek,
   stripMealiePrefix,
 } from './dateUtils';
-import type { FamilyDay, FamilyMonthDay, FamilySpanEvent, FamilyViewModel } from './types';
+import type {
+  CollapsedHoursGap,
+  FamilyDay,
+  FamilyMonthDay,
+  FamilySpanEvent,
+  FamilyViewModel,
+} from './types';
 
 describe('dateUtils', () => {
   it('parses and formats ISO dates', () => {
@@ -296,6 +307,177 @@ describe('dateUtils', () => {
     it('returns false when neither owners nor initials match', () => {
       const ev = { id: '5', title: 'Dentist' };
       expect(matchesMemberFilter(ev, 'Alex', members)).toBe(false);
+    });
+  });
+
+  describe('formatEventTime', () => {
+    it('returns empty string for empty, undefined, or whitespace input', () => {
+      expect(formatEventTime()).toBe('');
+      expect(formatEventTime('')).toBe('');
+      expect(formatEventTime('   ')).toBe('');
+    });
+
+    it('returns trimmed input when time cannot be parsed', () => {
+      expect(formatEventTime('  TBD  ')).toBe('TBD');
+      expect(formatEventTime('invalid', '12h')).toBe('invalid');
+    });
+
+    it('formats into 12-hour format when timeFormat is 12h', () => {
+      expect(formatEventTime('00:00', '12h')).toBe('12am');
+      expect(formatEventTime('00:30', '12h')).toBe('12:30am');
+      expect(formatEventTime('09:00', '12h')).toBe('9am');
+      expect(formatEventTime('09:15', '12H')).toBe('9:15am');
+      expect(formatEventTime('12:00', '12h')).toBe('12pm');
+      expect(formatEventTime('12:45', '12h')).toBe('12:45pm');
+      expect(formatEventTime('18:00', '12h')).toBe('6pm');
+      expect(formatEventTime('18:30', '12h')).toBe('6:30pm');
+      expect(formatEventTime('24:00', '12h')).toBe('12am');
+    });
+
+    it('formats into 24-hour format by default or when 24h is specified, preserving 12h input if timeFormat is omitted', () => {
+      expect(formatEventTime('9:05')).toBe('09:05');
+      expect(formatEventTime('18:30', '24h')).toBe('18:30');
+      expect(formatEventTime('6:30 PM', '24h')).toBe('18:30');
+      expect(formatEventTime('6pm')).toBe('6pm');
+      expect(formatEventTime('6:30pm')).toBe('6:30pm');
+    });
+  });
+
+  describe('mapTimeMinutesToPct', () => {
+    it('handles boundary conditions and linear mapping without gaps', () => {
+      expect(mapTimeMinutesToPct(500, 600, 600)).toBe(0);
+      expect(mapTimeMinutesToPct(500, 700, 600)).toBe(0);
+      expect(mapTimeMinutesToPct(400, 480, 1200)).toBe(0);
+      expect(mapTimeMinutesToPct(480, 480, 1200)).toBe(0);
+      expect(mapTimeMinutesToPct(1200, 480, 1200)).toBe(100);
+      expect(mapTimeMinutesToPct(1300, 480, 1200)).toBe(100);
+      expect(mapTimeMinutesToPct(840, 480, 1200)).toBeCloseTo(50, 2);
+      expect(mapTimeMinutesToPct(840, 480, 1200, [])).toBeCloseTo(50, 2);
+    });
+
+    it('compresses interior collapsed gaps using 0.65 hour-equivalent weighting', () => {
+      // Window 08:00 (480) to 16:00 (960): 8 hours total
+      // Gap 10:00 to 14:00 (4 hours) compressed to 0.65h (39 mins)
+      // Total effective minutes = (10-8)*60 + 39 + (16-14)*60 = 120 + 39 + 120 = 279 mins
+      const gaps: CollapsedHoursGap[] = [
+        {
+          start_hour: 10,
+          end_hour: 14,
+          label: '10:00 – 14:00',
+          top_pct: 0,
+          height_pct: 0,
+        },
+      ];
+
+      // Before gap: 09:00 (540) -> 60 / 279 * 100
+      expect(mapTimeMinutesToPct(540, 480, 960, gaps)).toBeCloseTo((60 / 279) * 100, 2);
+      // At gap start: 10:00 (600) -> 120 / 279 * 100
+      expect(mapTimeMinutesToPct(600, 480, 960, gaps)).toBeCloseTo((120 / 279) * 100, 2);
+      // Halfway inside gap: 12:00 (720) -> (120 + 19.5) / 279 * 100 = 50%
+      expect(mapTimeMinutesToPct(720, 480, 960, gaps)).toBeCloseTo(50, 2);
+      // At gap end: 14:00 (840) -> (120 + 39) / 279 * 100
+      expect(mapTimeMinutesToPct(840, 480, 960, gaps)).toBeCloseTo((159 / 279) * 100, 2);
+      // After gap: 15:00 (900) -> (159 + 60) / 279 * 100
+      expect(mapTimeMinutesToPct(900, 480, 960, gaps)).toBeCloseTo((219 / 279) * 100, 2);
+    });
+
+    it('sorts out-of-order gaps and ignores out-of-range gaps', () => {
+      const gaps: CollapsedHoursGap[] = [
+        { start_hour: 14, end_hour: 17, label: '14:00 – 17:00', top_pct: 0, height_pct: 0 },
+        { start_hour: 5, end_hour: 7, label: '05:00 – 07:00', top_pct: 0, height_pct: 0 },
+        { start_hour: 9, end_hour: 12, label: '09:00 – 12:00', top_pct: 0, height_pct: 0 },
+      ];
+      // Window 08:00 (480) to 18:00 (1080)
+      // Active hours: 8-9 (60), 12-14 (120), 17-18 (60) = 240
+      // Two 3h gaps -> 2 * 39 = 78
+      // Total eff = 318
+      // At 13:00 (780): 60 (8-9) + 39 (gap 9-12) + 60 (12-13) = 159 -> 159/318 = 50%
+      expect(mapTimeMinutesToPct(780, 480, 1080, gaps)).toBeCloseTo(50, 2);
+    });
+  });
+
+  describe('computeNowIndicatorPct with collapsed_gaps', () => {
+    it('maps now indicator onto compressed timeline when weekVM.collapsed_gaps is present', () => {
+      const vmWithGaps: FamilyViewModel = {
+        range_start: '2026-10-25',
+        range_end: '2026-10-31',
+        range_label: 'Oct 25 – 31, 2026',
+        today: '2026-10-27',
+        hours_start: '08:00',
+        hours_end: '16:00',
+        collapsed_gaps: [
+          {
+            start_hour: 10,
+            end_hour: 14,
+            label: '10:00 – 14:00',
+            top_pct: 43.01,
+            height_pct: 13.98,
+          },
+        ],
+      };
+      // 12:00 UTC is halfway through the symmetric 10:00–14:00 gap in an 08:00–16:00 window -> 50%
+      const now = new Date('2026-10-27T12:00:00Z');
+      expect(computeNowIndicatorPct(vmWithGaps, now, 'UTC')).toBeCloseTo(50, 1);
+    });
+
+    it('renders .cf-collapsed-gap bands in CalendarWeekView only when weekVM.collapsed_gaps is present', () => {
+      const days: FamilyDay[] = [
+        { date: '2026-10-27', weekday_abbr: 'Tue', day_of_month: 27, is_today: true, is_weekend: false, events: [] },
+      ];
+      const members = [
+        { name: 'Alex', initial: 'A', color: '#ff6f59', text_color: '#ffffff', pattern: 'solid' },
+      ];
+
+      const { container, rerender } = render(
+        createElement(CalendarWeekView, {
+          activeView: 'week',
+          weekVM: {
+            range_start: '2026-10-25',
+            range_end: '2026-10-31',
+            range_label: 'Oct 25 – 31, 2026',
+            today: '2026-10-27',
+            timeline_markers: [{ label: '9am', top_pct: 0, is_start: true }],
+          },
+          daysToRender: days,
+          visibleAllDayEvents: [],
+          members,
+          currentDateISO: '2026-10-27',
+          onOpenModal: vi.fn(),
+        })
+      );
+      expect(container.querySelectorAll('.cf-collapsed-gap').length).toBe(0);
+
+      rerender(
+        createElement(CalendarWeekView, {
+          activeView: 'week',
+          weekVM: {
+            range_start: '2026-10-25',
+            range_end: '2026-10-31',
+            range_label: 'Oct 25 – 31, 2026',
+            today: '2026-10-27',
+            time_format: '12h',
+            collapsed_gaps: [
+              {
+                start_hour: 10,
+                end_hour: 13,
+                label: '10am – 1pm',
+                top_pct: 25,
+                height_pct: 12,
+              },
+            ],
+          },
+          daysToRender: days,
+          visibleAllDayEvents: [],
+          members,
+          currentDateISO: '2026-10-27',
+          onOpenModal: vi.fn(),
+        })
+      );
+      const gaps = container.querySelectorAll('.cf-collapsed-gap');
+      expect(gaps.length).toBe(1);
+      expect(gaps[0].getAttribute('data-gap-start')).toBe('10:00');
+      expect(gaps[0].getAttribute('data-gap-end')).toBe('13:00');
+      expect(gaps[0].querySelector('.cf-collapsed-gap-label')?.textContent).toBe('10am – 1pm');
     });
   });
 });

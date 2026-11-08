@@ -11,6 +11,7 @@ export interface FamilyEvent {
   id: string;
   title: string;
   location?: string;
+  image_url?: string;
   description?: string;
   start?: string;
   end?: string;
@@ -64,7 +65,9 @@ export interface FamilyDay {
   day_of_month: number;
   is_today: boolean;
   is_weekend: boolean;
+  special_label?: string;
   all_day?: FamilyEvent[];
+  meals?: FamilyEvent[];
   timed?: FamilyEvent[];
   overflow?: number;
   events?: FamilyDayEvent[];
@@ -108,6 +111,7 @@ export interface FamilyMonthDay {
   is_current_month: boolean;
   is_today: boolean;
   is_weekend: boolean;
+  special_label?: string;
   dots?: FamilyMonthDot[];
   event_title?: string;
   events_count?: number;
