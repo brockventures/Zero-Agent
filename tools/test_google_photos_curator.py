@@ -453,3 +453,51 @@ def test_curate_target_album_preserves_existing_boosts_hearts_and_calibrates_vid
     assert curated["hearted_lift_ratio"] >= 2.0
     assert (out_dir / "isaac_year_2_curated.json").exists()
 
+
+def test_extract_wiz_tokens_and_populate_shared_album() -> None:
+    sample_html = (
+        '<html><script>window.WIZ_global_data = '
+        '{"SNlM0e":"AT_TOKEN_123:456","FdrFJe":"-987654321","cfb2h":"boq_photosuiserver_20261108"};'
+        '</script></html>'
+    )
+    wiz = gpc.extract_wiz_tokens(sample_html)
+    assert wiz["SNlM0e"] == "AT_TOKEN_123:456"
+    assert wiz["FdrFJe"] == "-987654321"
+    assert wiz["cfb2h"] == "boq_photosuiserver_20261108"
+
+    mock_session = MagicMock()
+    get_resp = MagicMock()
+    get_resp.text = sample_html
+    get_resp.raise_for_status.return_value = None
+    mock_session.get.return_value = get_resp
+
+    rpc_id = gpc.ADD_ITEMS_RPC_ID
+    inner_json = json.dumps([["AF1QipAdded1", "AF1QipAdded2"]])
+    outer_line = json.dumps([["wrb.fr", rpc_id, inner_json, None, None, None, "generic"]])
+    post_resp = MagicMock()
+    post_resp.text = f")}}]'\n\n120\n{outer_line}\n"
+    post_resp.raise_for_status.return_value = None
+    mock_session.post.return_value = post_resp
+
+    items_to_add = [
+        {"item_id": "AF1QipItem1", "dedup_key": "k1"},
+        {"item_id": "AF1QipItem2", "dedup_key": "k2"},
+        {"item_id": "AF1QipItem3", "dedup_key": "k3"},
+    ]
+    res = gpc.populate_shared_album(
+        target_album="Rosie Year 6",
+        target_album_id="ALB_TARGET_1",
+        target_auth_key="AUTH_KEY_1",
+        items_to_add=items_to_add,
+        cookies={"SID": "fake_sid"},
+        batch_size=2,
+        session=mock_session,
+    )
+    assert res["status"] == "completed"
+    assert res["requested_count"] == 3
+    assert res["added_count"] == 3
+    assert res["batches_executed"] == 2
+    assert res["added_item_ids"] == ["AF1QipItem1", "AF1QipItem2", "AF1QipItem3"]
+    assert mock_session.post.call_count == 2
+
+

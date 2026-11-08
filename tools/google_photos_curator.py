@@ -6,15 +6,19 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
+import hashlib
 import io
 import json
 from pathlib import Path
 import re
+import sqlite3
 import time
 from typing import Any
 import urllib.parse
 import urllib.request
 
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from PIL import Image
 import numpy as np
 import requests
@@ -25,6 +29,9 @@ BATCHEXECUTE_URL = "https://photos.google.com/_/PhotosUi/data/batchexecute?rpcid
 DEFAULT_MANIFEST_PATH = Path("/workspace/data/photos_curation/manifest.json")
 DEFAULT_CURATION_DIR = Path("/workspace/data/photos_curation")
 DEFAULT_VISION_CACHE_PATH = Path("/workspace/data/photos_curation/vision_scores_cache.json")
+DEFAULT_POPULATION_STATUS_PATH = Path("/workspace/data/photos_curation/population_status.json")
+DEFAULT_CHROME_COOKIES_PATH = Path("/tmp/chrome_zero_profile/Default/Cookies")
+ADD_ITEMS_RPC_ID = "C2V01c"
 BURST_WINDOW_MS = 90_000
 TARGET_CURATION_SPECS: dict[str, dict[str, Any]] = {
     "Rosie Year 6": {
@@ -1697,6 +1704,215 @@ def curate_all_targets(
             fetch_network=fetch_network,
         )
     return results
+
+
+def decrypt_chrome_cookies(
+    cookies_db_path: Path | str = DEFAULT_CHROME_COOKIES_PATH,
+    host_filter: str = "google",
+) -> list[dict[str, Any]]:
+    """Decrypt Chrome SQLite cookies using Linux PBKDF2 ('peanuts'/'saltysalt', 1 iter, AES-128-CBC, 32B prefix strip)."""
+    db_path = Path(cookies_db_path)
+    if not db_path.exists():
+        raise FileNotFoundError(f"Chrome cookies DB not found at {db_path}")
+
+    aes_key = hashlib.pbkdf2_hmac("sha1", b"peanuts", b"saltysalt", 1, 16)
+    iv = b" " * 16
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT host_key, name, value, encrypted_value, path, is_secure, is_httponly "
+            "FROM cookies WHERE host_key LIKE ?",
+            (f"%{host_filter}%",),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    cookies: list[dict[str, Any]] = []
+    for host_key, name, value, encrypted_value, path, is_secure, is_httponly in rows:
+        dec_val = str(value or "")
+        if not dec_val and encrypted_value:
+            enc_bytes = bytes(encrypted_value)
+            if enc_bytes[:3] in (b"v10", b"v11"):
+                cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+                decryptor = cipher.decryptor()
+                padded = decryptor.update(enc_bytes[3:]) + decryptor.finalize()
+                pad_len = padded[-1] if padded else 0
+                unpadded = padded[:-pad_len] if 0 < pad_len <= 16 else padded
+                raw_val = unpadded[32:] if len(unpadded) >= 32 else unpadded
+                dec_val = raw_val.decode("utf-8", errors="ignore")
+        if dec_val:
+            cookies.append(
+                {
+                    "name": str(name),
+                    "value": dec_val,
+                    "domain": str(host_key),
+                    "path": str(path or "/"),
+                    "secure": bool(is_secure),
+                    "httpOnly": bool(is_httponly),
+                }
+            )
+    return cookies
+
+
+def extract_wiz_tokens(html: str) -> dict[str, str]:
+    """Extract SNlM0e (at CSRF token), FdrFJe (f.sid), and cfb2h (bl build label) from Google Photos HTML."""
+    tokens: dict[str, str] = {}
+    for key in ("SNlM0e", "FdrFJe", "cfb2h", "qwAQke"):
+        match = re.search(rf'"{key}":"([^"]+)"', html)
+        if match:
+            tokens[key] = match.group(1)
+    return tokens
+
+
+def build_add_items_rpc_payload(
+    target_album_id: str,
+    target_auth_key: str,
+    items: list[dict[str, Any] | str],
+    rpc_id: str = ADD_ITEMS_RPC_ID,
+    source_album_id: str | None = None,
+    source_auth_key: str | None = None,
+) -> tuple[str, str]:
+    """Construct the batchexecute (rpc_id, f.req) payload to batch-add media items into a shared album."""
+    item_ids: list[str] = []
+    for it in items:
+        if isinstance(it, str):
+            item_ids.append(it)
+        elif isinstance(it, dict) and it.get("item_id"):
+            item_ids.append(str(it["item_id"]))
+
+    if source_album_id and source_auth_key:
+        item_entries = [[[iid, source_album_id, source_auth_key] for iid in item_ids]]
+        inner_arg = json.dumps([target_album_id, item_entries, target_auth_key])
+    else:
+        inner_arg = json.dumps([[target_album_id], [item_ids, None, None, 0], [None, target_auth_key]])
+
+    f_req = json.dumps([[[rpc_id, inner_arg, None, "generic"]]])
+    return rpc_id, f_req
+
+
+def populate_shared_album(
+    target_album: str,
+    target_album_id: str,
+    target_auth_key: str,
+    items_to_add: list[dict[str, Any]],
+    cookies: list[dict[str, Any]] | dict[str, str] | None = None,
+    cookies_db_path: Path | str = DEFAULT_CHROME_COOKIES_PATH,
+    batch_size: int = 50,
+    rpc_id: str = ADD_ITEMS_RPC_ID,
+    at_token: str | None = None,
+    bl_token: str | None = None,
+    f_sid: str | None = None,
+    session: requests.Session | None = None,
+    dry_run: bool = False,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    """Batch-populate curated items into a Google Photos shared album via authenticated batchexecute RPC."""
+    if not items_to_add or dry_run:
+        return {
+            "target_album": target_album,
+            "target_album_id": target_album_id,
+            "requested_count": len(items_to_add),
+            "added_count": 0 if dry_run else len(items_to_add),
+            "batches_executed": 0,
+            "rpc_id": rpc_id,
+            "dry_run": dry_run,
+            "status": "dry_run" if dry_run else "noop",
+            "added_item_ids": [],
+        }
+
+    own_session = session is None
+    http_session = session or requests.Session()
+    http_session.headers.update({"User-Agent": USER_AGENT})
+
+    if cookies is None and Path(cookies_db_path).exists():
+        cookies = decrypt_chrome_cookies(cookies_db_path)
+
+    if isinstance(cookies, list):
+        for c in cookies:
+            http_session.cookies.set(
+                c["name"],
+                c["value"],
+                domain=c.get("domain", ".google.com"),
+                path=c.get("path", "/"),
+            )
+    elif isinstance(cookies, dict):
+        for k, v in cookies.items():
+            http_session.cookies.set(k, v, domain=".google.com")
+
+    try:
+        share_url = f"https://photos.google.com/share/{target_album_id}?key={target_auth_key}"
+        if not at_token:
+            page_resp = http_session.get(share_url, timeout=timeout)
+            page_resp.raise_for_status()
+            wiz = extract_wiz_tokens(page_resp.text)
+            at_token = wiz.get("SNlM0e", "")
+            bl_token = bl_token or wiz.get("cfb2h", "")
+            f_sid = f_sid or wiz.get("FdrFJe", "")
+
+        batches_executed = 0
+        added_item_ids: list[str] = []
+        batch_responses: list[Any] = []
+
+        for start_idx in range(0, len(items_to_add), max(1, batch_size)):
+            chunk = items_to_add[start_idx : start_idx + max(1, batch_size)]
+            _, f_req = build_add_items_rpc_payload(
+                target_album_id=target_album_id,
+                target_auth_key=target_auth_key,
+                items=chunk,
+                rpc_id=rpc_id,
+            )
+            params: dict[str, str] = {
+                "rpcids": rpc_id,
+                "source-path": f"/share/{target_album_id}",
+                "hl": "en",
+                "rt": "c",
+            }
+            if bl_token:
+                params["bl"] = bl_token
+            if f_sid:
+                params["f.sid"] = f_sid
+
+            post_url = "https://photos.google.com/_/PhotosUi/data/batchexecute?" + urllib.parse.urlencode(params)
+            form_data: dict[str, str] = {"f.req": f_req}
+            if at_token:
+                form_data["at"] = at_token
+
+            resp = http_session.post(
+                post_url,
+                data=form_data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "Origin": "https://photos.google.com",
+                    "Referer": share_url,
+                },
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            parsed = parse_batchexecute_response(resp.text, rpc_id=rpc_id)
+            batch_responses.append(parsed)
+            batches_executed += 1
+            for it in chunk:
+                iid = it if isinstance(it, str) else str(it.get("item_id", ""))
+                if iid:
+                    added_item_ids.append(iid)
+
+        return {
+            "target_album": target_album,
+            "target_album_id": target_album_id,
+            "requested_count": len(items_to_add),
+            "added_count": len(added_item_ids),
+            "batches_executed": batches_executed,
+            "rpc_id": rpc_id,
+            "dry_run": False,
+            "status": "completed",
+            "added_item_ids": added_item_ids,
+        }
+    finally:
+        if own_session:
+            http_session.close()
 
 
 def main() -> None:
