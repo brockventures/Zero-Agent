@@ -1907,6 +1907,85 @@ def throttle_heavy_compiler_command(cmd: str) -> str:
     )
 
 
+_PROSE_CLI_FLAG_PREFIX_RE = re.compile(
+    r"(?:^|[\s;&|])(?:--(?:message|body|summary|details|title)|-m)(?:\s+|=)$"
+)
+
+
+def escape_double_quoted_cli_prose(cmd: str) -> str:
+    """Escape unescaped '$' variables ($0, $100, $var) and backticks (`...`) inside double-quoted
+    CLI prose arguments (--message, -m, --body, --summary, --details, --title) before bash executes
+    the command, preventing shell positional parameter/backtick corruption on outbox/mail sends.
+    """
+    if not cmd or ('"' not in cmd) or ("$" not in cmd and "`" not in cmd):
+        return cmd
+
+    out: list[str] = []
+    i = 0
+    n = len(cmd)
+    state = "normal"  # normal | single | double | prose_double
+
+    while i < n:
+        ch = cmd[i]
+        if state == "normal":
+            if ch == "\\" and i + 1 < n:
+                out.append(cmd[i : i + 2])
+                i += 2
+                continue
+            if ch == "'":
+                state = "single"
+                out.append(ch)
+                i += 1
+                continue
+            if ch == '"':
+                prefix = cmd[max(0, i - 32) : i]
+                if _PROSE_CLI_FLAG_PREFIX_RE.search(prefix):
+                    state = "prose_double"
+                else:
+                    state = "double"
+                out.append(ch)
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        elif state == "single":
+            if ch == "'":
+                state = "normal"
+            out.append(ch)
+            i += 1
+        elif state == "double":
+            if ch == "\\" and i + 1 < n:
+                out.append(cmd[i : i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                state = "normal"
+            out.append(ch)
+            i += 1
+        elif state == "prose_double":
+            if ch == "\\" and i + 1 < n:
+                out.append(cmd[i : i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                state = "normal"
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "`":
+                out.append("\\`")
+                i += 1
+                continue
+            if ch == "$" and i + 1 < n and re.match(r"[0-9a-zA-Z_{(@*#?$-]", cmd[i + 1]):
+                out.append("\\$")
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+
+    return "".join(out)
+
+
 def check_batching(cmd: str) -> tuple[bool, str]:
     return check_tool_use("run_command", {"CommandLine": cmd})
 
@@ -2044,7 +2123,8 @@ def main():
 
             try:
                 raw_cmd = args.get("CommandLine", "")
-                throttled_cmd = throttle_heavy_compiler_command(raw_cmd)
+                safe_cmd = escape_double_quoted_cli_prose(raw_cmd)
+                throttled_cmd = throttle_heavy_compiler_command(safe_cmd)
                 for tools_dir in ("/workspace/tools", "/opt/zero/workspace/tools"):
                     if os.path.isdir(tools_dir) and tools_dir not in sys.path:
                         sys.path.insert(0, tools_dir)
