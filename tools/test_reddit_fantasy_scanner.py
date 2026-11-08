@@ -354,6 +354,45 @@ class TestRedditFantasyScanner(unittest.TestCase):
             thing_id="t1_statecomment",
         )
 
+    @patch("tools.reddit_fantasy_scanner.scan_reddit_via_pixel")
+    @patch("tools.outbox.dispatch_via_rest")
+    @patch("tools.outbox.flush_pending_messages")
+    @patch("tools.outbox.queue_outbox_message")
+    @patch("tools.reddit_fantasy_scanner.save_state")
+    @patch("tools.reddit_fantasy_scanner.load_state")
+    def test_scheduled_run_does_not_double_post_via_outbox(
+        self, mock_load, mock_save, mock_outbox, mock_flush, mock_dispatch, mock_scan
+    ):
+        """Verify scheduled runs (post_discord=False) return the draft card for bridge_scheduler without also dispatching via outbox."""
+        mock_load.return_value = {"seen_comments": [], "last_run_at": None, "last_thread_url": None, "last_candidate": None, "last_draft": None}
+        mock_scan.return_value = [
+            {
+                "thread_title": "Daily Anything Goes Thread",
+                "thread_url": "https://www.reddit.com/r/fantasybaseball/comments/1xqxwkf/",
+                "author": "Least-Form5839",
+                "text": "Should I keep Sanchez for two guaranteed years or Burns with three years of control?",
+                "raw_id": "t1_test_scheduled_no_double_post",
+                "reply_count": 0,
+                "depth": 0,
+                "time_ago": "10m ago",
+            }
+        ]
+        ok, card, extra = run_reddit_fantasy_scanner(test=False, post_discord=False)
+        self.assertTrue(ok)
+        self.assertFalse(extra.get("decision_staged"))
+        self.assertIn("⚾ **r/fantasybaseball Discovery & Draft Card**", card)
+        self.assertIn("[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]", card)
+        mock_outbox.assert_not_called()
+        mock_flush.assert_not_called()
+        mock_dispatch.assert_not_called()
+        mock_save.assert_called_once()
+
+        scheduler_src = Path(__file__).resolve().parent.joinpath("bridge_scheduler.py").read_text(encoding="utf-8")
+        self.assertIn(
+            '"Reddit Fantasy Baseball Scanner",\n                run_reddit_fantasy_scanner,\n                post_discord=False,',
+            scheduler_src,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

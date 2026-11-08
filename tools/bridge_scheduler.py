@@ -699,7 +699,7 @@ async def dispatch_scheduled_prompt(
                 "reddit_fantasy_scanner",
                 "Reddit Fantasy Baseball Scanner",
                 run_reddit_fantasy_scanner,
-                post_discord=True,
+                post_discord=False,
             )
             decision_staged = isinstance(extra, dict) and extra.get("decision_staged") is True
             if ok and out and not out.startswith("No new") and not out.startswith("Scanned active") and bot:
