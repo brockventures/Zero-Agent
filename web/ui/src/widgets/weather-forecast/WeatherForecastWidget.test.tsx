@@ -29,44 +29,85 @@ describe('WeatherForecastWidget', () => {
     useDisplayStore.setState({
       widgets: {
         'weather-unnamed': {
-          meta: { type: 'weather-forecast', origin: [0, 0], dimensions: [3, 2], config: {}, assets_base: '' },
-          state: 'healthy', data: {}, timestamp: '2026-10-31T12:00:00Z',
+          meta: {
+            type: 'weather-forecast',
+            origin: [0, 0],
+            dimensions: [3, 2],
+            config: {},
+            assets_base: '',
+          },
+          state: 'healthy',
+          data: {},
+          timestamp: '2026-10-31T12:00:00Z',
         },
       },
     });
-    const { container } = render(<WeatherForecastWidget id="weather-unnamed" type="weather-forecast" />);
+
+    const { container } = render(
+      <WeatherForecastWidget id="weather-unnamed" type="weather-forecast" />,
+    );
     const root = container.querySelector('.widget-weather');
     expect(root).not.toBeNull();
     expect(root?.querySelector('.weather-header')).toBeNull();
-    expect(root?.querySelector('.weather-loading')?.textContent).toContain('Loading weather forecast...');
+    expect(root?.querySelector('.weather-loading')?.textContent).toContain(
+      'Loading weather forecast...',
+    );
   });
 
   it('renders named loading state with header when config.location_name is set but data is unhydrated', () => {
     useDisplayStore.setState({
       widgets: {
         'weather-named': {
-          meta: { type: 'weather-forecast', origin: [0, 0], dimensions: [3, 2], config: { location_name: 'San Francisco' }, assets_base: '' },
-          state: 'healthy', data: {}, timestamp: '2026-10-31T12:00:00Z',
+          meta: {
+            type: 'weather-forecast',
+            origin: [0, 0],
+            dimensions: [3, 2],
+            config: { location_name: 'San Francisco' },
+            assets_base: '',
+          },
+          state: 'healthy',
+          data: {},
+          timestamp: '2026-10-31T12:00:00Z',
         },
       },
     });
-    const { container } = render(<WeatherForecastWidget id="weather-named" type="weather-forecast" />);
+
+    const { container } = render(
+      <WeatherForecastWidget id="weather-named" type="weather-forecast" />,
+    );
     const root = container.querySelector('.widget-weather');
     expect(root?.querySelector('.weather-header')).not.toBeNull();
     expect(root?.querySelector('.weather-location-name')?.textContent).toBe('San Francisco');
-    expect(root?.querySelector('.weather-loading')?.textContent).toContain('Loading weather forecast...');
+    expect(root?.querySelector('.weather-loading')?.textContent).toContain(
+      'Loading weather forecast...',
+    );
   });
 
   it('renders header using config.name', () => {
     useDisplayStore.setState({
       widgets: {
         'weather-by-name': {
-          meta: { type: 'weather-forecast', origin: [0, 0], dimensions: [3, 2], config: { name: 'Home Base' }, assets_base: '' },
-          state: 'healthy', data: { current: { temperature: 72 } }, timestamp: '2026-10-31T12:00:00Z',
+          meta: {
+            type: 'weather-forecast',
+            origin: [0, 0],
+            dimensions: [3, 2],
+            config: { name: 'Home Base' },
+            assets_base: '',
+          },
+          state: 'healthy',
+          data: {
+            current: {
+              temperature: 72,
+            },
+          },
+          timestamp: '2026-10-31T12:00:00Z',
         },
       },
     });
-    const { container } = render(<WeatherForecastWidget id="weather-by-name" type="weather-forecast" />);
+
+    const { container } = render(
+      <WeatherForecastWidget id="weather-by-name" type="weather-forecast" />,
+    );
     expect(container.querySelector('.weather-location-name')?.textContent).toBe('Home Base');
   });
 
@@ -74,12 +115,27 @@ describe('WeatherForecastWidget', () => {
     useDisplayStore.setState({
       widgets: {
         'weather-no-loc': {
-          meta: { type: 'weather-forecast', origin: [0, 0], dimensions: [3, 2], config: {}, assets_base: '' },
-          state: 'healthy', data: { current: { temperature: 70 } }, timestamp: '2026-10-31T12:00:00Z',
+          meta: {
+            type: 'weather-forecast',
+            origin: [0, 0],
+            dimensions: [3, 2],
+            config: {},
+            assets_base: '',
+          },
+          state: 'healthy',
+          data: {
+            current: {
+              temperature: 70,
+            },
+          },
+          timestamp: '2026-10-31T12:00:00Z',
         },
       },
     });
-    const { container } = render(<WeatherForecastWidget id="weather-no-loc" type="weather-forecast" />);
+
+    const { container } = render(
+      <WeatherForecastWidget id="weather-no-loc" type="weather-forecast" />,
+    );
     expect(container.querySelector('.weather-header-title')?.textContent).toBe('Weather');
   });
 
@@ -87,14 +143,33 @@ describe('WeatherForecastWidget', () => {
     useDisplayStore.setState({
       widgets: {
         'weather-freezing': {
-          meta: { type: 'weather-forecast', origin: [0, 0], dimensions: [3, 2], config: {}, assets_base: '' },
+          meta: {
+            type: 'weather-forecast',
+            origin: [0, 0],
+            dimensions: [3, 2],
+            config: {},
+            assets_base: '',
+          },
           state: 'healthy',
-          data: { current: { temperature: -4.2 }, daily: [{ temp_max: 0, temp_min: -8 }] },
+          data: {
+            current: {
+              temperature: -4.2,
+            },
+            daily: [
+              {
+                temp_max: 0,
+                temp_min: -8,
+              },
+            ],
+          },
           timestamp: '2026-10-31T12:00:00Z',
         },
       },
     });
-    const { container } = render(<WeatherForecastWidget id="weather-freezing" type="weather-forecast" />);
+
+    const { container } = render(
+      <WeatherForecastWidget id="weather-freezing" type="weather-forecast" />,
+    );
     expect(container.querySelector('.weather-temp-main')?.textContent).toBe('-4°');
     expect(container.querySelector('.weather-temp-range')?.textContent).toBe('H: 0° • L: -8°');
   });
@@ -236,14 +311,30 @@ describe('WeatherForecastWidget', () => {
     useDisplayStore.setState({
       widgets: {
         'weather-no-hourly': {
-          meta: { type: 'weather-forecast', origin: [0, 0], dimensions: [3, 2], config: {}, assets_base: '' },
+          meta: {
+            type: 'weather-forecast',
+            origin: [0, 0],
+            dimensions: [3, 2],
+            config: {},
+            assets_base: '',
+          },
           state: 'healthy',
-          data: { current: { temperature: 70, condition_text: 'Clear', icon: 'weather-sunny' }, hourly: [] },
+          data: {
+            current: {
+              temperature: 70,
+              condition_text: 'Clear',
+              icon: 'weather-sunny',
+            },
+            hourly: [],
+          },
           timestamp: '2026-10-31T12:00:00Z',
         },
       },
     });
-    const { container } = render(<WeatherForecastWidget id="weather-no-hourly" type="weather-forecast" />);
+
+    const { container } = render(
+      <WeatherForecastWidget id="weather-no-hourly" type="weather-forecast" />,
+    );
     const empty = container.querySelector('.weather-empty');
     expect(empty).not.toBeNull();
     expect(empty?.textContent).toContain('No hourly forecast available');
@@ -251,9 +342,18 @@ describe('WeatherForecastWidget', () => {
 
   it('renders widget-error-banner when state is error', () => {
     useDisplayStore.setState({
-      widgets: { 'weather-err': { state: 'error', data: {}, timestamp: '' } },
+      widgets: {
+        'weather-err': {
+          state: 'error',
+          data: {},
+          timestamp: '',
+        },
+      },
     });
-    const { container } = render(<WeatherForecastWidget id="weather-err" type="weather-forecast" />);
+
+    const { container } = render(
+      <WeatherForecastWidget id="weather-err" type="weather-forecast" />,
+    );
     const banner = container.querySelector('.widget-error-banner');
     expect(banner).not.toBeNull();
     expect(banner?.textContent).toContain('Widget Error');
@@ -988,15 +1088,36 @@ describe('WeatherHourlyGraph component', () => {
   it('renders WeatherHourlyGraph when gridLinesPath, areaPath, curvePath are empty or present with precipitation', () => {
     // 1. All paths present with non-zero precipitation
     const spy1 = vi.spyOn(formatModule, 'computeHourlyGraphLayout').mockReturnValueOnce({
-      totalWidth: 500, svgHeight: 200, baseY: 180, isTall: false, gradientId: 'grad-full',
-      areaPath: 'M 0 180 L 100 100 L 200 180 Z', curvePath: 'M 0 100 L 100 100',
+      totalWidth: 500,
+      svgHeight: 200,
+      baseY: 180,
+      isTall: false,
+      gradientId: 'grad-full',
+      areaPath: 'M 0 180 L 100 100 L 200 180 Z',
+      curvePath: 'M 0 100 L 100 100',
       gridLinesPath: 'M 50 0 L 50 180',
-      points: [{
-        x: 50, y: 50, lineY1: 54, precipProb: 40, precipY: 12, icon: 'weather-rainy',
-        iconTranslateX: 40, iconY: 14, iconScale: 0.8, tempRound: 65, tempY: 44,
-        tempFontSize: 12, circleR: 3.5, timeLabel: 'Now', timeWeight: '800',
-        timeColor: '#000', timeY: 102, timeFontSize: 11,
-      }],
+      points: [
+        {
+          x: 50,
+          y: 50,
+          lineY1: 54,
+          precipProb: 40,
+          precipY: 12,
+          icon: 'weather-rainy',
+          iconTranslateX: 40,
+          iconY: 14,
+          iconScale: 0.8,
+          tempRound: 65,
+          tempY: 44,
+          tempFontSize: 12,
+          circleR: 3.5,
+          timeLabel: 'Now',
+          timeWeight: '800',
+          timeColor: '#000',
+          timeY: 102,
+          timeFontSize: 11,
+        },
+      ],
     });
     const { container: cFull } = render(<WeatherHourlyGraph hourly={[{ temp: 65 }]} />);
     expect(cFull.querySelector('svg.weather-hourly-graph')).not.toBeNull();
@@ -1006,14 +1127,36 @@ describe('WeatherHourlyGraph component', () => {
 
     // 2. All paths empty / falsy and precipProb = 0
     const spy2 = vi.spyOn(formatModule, 'computeHourlyGraphLayout').mockReturnValueOnce({
-      totalWidth: 500, svgHeight: 200, baseY: 180, isTall: false, gradientId: 'grad-empty',
-      areaPath: '', curvePath: '', gridLinesPath: '',
-      points: [{
-        x: 50, y: 50, lineY1: 54, precipProb: 0, precipY: 12, icon: 'weather-sunny',
-        iconTranslateX: 40, iconY: 14, iconScale: 0.8, tempRound: 65, tempY: 44,
-        tempFontSize: 12, circleR: 3.5, timeLabel: 'Now', timeWeight: '800',
-        timeColor: '#000', timeY: 102, timeFontSize: 11,
-      }],
+      totalWidth: 500,
+      svgHeight: 200,
+      baseY: 180,
+      isTall: false,
+      gradientId: 'grad-empty',
+      areaPath: '',
+      curvePath: '',
+      gridLinesPath: '',
+      points: [
+        {
+          x: 50,
+          y: 50,
+          lineY1: 54,
+          precipProb: 0,
+          precipY: 12,
+          icon: 'weather-sunny',
+          iconTranslateX: 40,
+          iconY: 14,
+          iconScale: 0.8,
+          tempRound: 65,
+          tempY: 44,
+          tempFontSize: 12,
+          circleR: 3.5,
+          timeLabel: 'Now',
+          timeWeight: '800',
+          timeColor: '#000',
+          timeY: 102,
+          timeFontSize: 11,
+        },
+      ],
     });
     const { container: cEmpty } = render(<WeatherHourlyGraph hourly={[{ temp: 65 }]} />);
     expect(cEmpty.querySelector('svg.weather-hourly-graph')).not.toBeNull();
@@ -1047,57 +1190,115 @@ describe('WeatherHourlyGraph component', () => {
 
     // All WeatherIconGlyph branches
     const glyphs = [
-      'weather-sunny', 'weather-clear-night', 'weather-partly-cloudy', 'weather-night-partly-cloudy',
-      'weather-cloudy', 'weather-fog', 'weather-rainy', 'weather-pouring',
-      'weather-snowy', 'weather-snowy-rainy', 'weather-lightning', 'weather-lightning-rainy',
+      'weather-sunny',
+      'weather-clear-night',
+      'weather-partly-cloudy',
+      'weather-night-partly-cloudy',
+      'weather-cloudy',
+      'weather-fog',
+      'weather-rainy',
+      'weather-pouring',
+      'weather-snowy',
+      'weather-snowy-rainy',
+      'weather-lightning',
+      'weather-lightning-rainy',
     ];
     for (const glyph of glyphs) {
       const { container } = render(<WeatherIcon name={glyph} />);
       expect(container.querySelector('svg')).not.toBeNull();
-      const { container: glyphContainer } = render(<svg><WeatherIconGlyph name={glyph} /></svg>);
+
+      const { container: glyphContainer } = render(
+        <svg>
+          <WeatherIconGlyph name={glyph} />
+        </svg>,
+      );
       expect(glyphContainer.querySelector('path')).not.toBeNull();
     }
 
     // Name normalization: empty, whitespace, null, undefined, special chars sanitization
     const { container: cEmpty } = render(<WeatherIcon name="" />);
     expect(cEmpty.querySelector('svg')?.classList.contains('mm-icon-weather-cloudy')).toBe(true);
+
     const { container: cSpaces } = render(<WeatherIcon name="   " />);
     expect(cSpaces.querySelector('svg')?.classList.contains('mm-icon-weather-cloudy')).toBe(true);
+
     const { container: cNull } = render(<WeatherIcon name={null} />);
     expect(cNull.querySelector('svg')?.classList.contains('mm-icon-weather-cloudy')).toBe(true);
+
     const { container: cSpecial } = render(<WeatherIcon name="weather$$sunny!!" />);
     expect(cSpecial.querySelector('svg')?.classList.contains('mm-icon-weathersunny')).toBe(true);
+
     const { container: cAllSpecial } = render(<WeatherIcon name="$$$###@@@" />);
     expect(cAllSpecial.querySelector('svg')?.classList.contains('mm-icon-weather-cloudy')).toBe(true);
 
     // WeatherIconGlyph standalone direct render inside SVG with special characters
-    const { container: cGlyphSpecial } = render(<svg><WeatherIconGlyph name="weather#fog" /></svg>);
+    const { container: cGlyphSpecial } = render(
+      <svg>
+        <WeatherIconGlyph name="weather#fog" />
+      </svg>,
+    );
     expect(cGlyphSpecial.querySelector('path')).not.toBeNull();
 
     // WeatherIconGlyph default branch for unrecognized tokens
-    const { container: cGlyphDefault } = render(<svg><WeatherIconGlyph name="weather-tornado" /></svg>);
+    const { container: cGlyphDefault } = render(
+      <svg>
+        <WeatherIconGlyph name="weather-tornado" />
+      </svg>,
+    );
     expect(cGlyphDefault.querySelector('path')).not.toBeNull();
 
     // WeatherIconGlyph with null / whitespace / non-matching characters
-    const { container: cGlyphNull } = render(<svg><WeatherIconGlyph name={null} /></svg>);
+    const { container: cGlyphNull } = render(
+      <svg>
+        <WeatherIconGlyph name={null} />
+      </svg>,
+    );
     expect(cGlyphNull.querySelector('path')).not.toBeNull();
-    const { container: cGlyphEmpty } = render(<svg><WeatherIconGlyph name="   " /></svg>);
+
+    const { container: cGlyphEmpty } = render(
+      <svg>
+        <WeatherIconGlyph name="   " />
+      </svg>,
+    );
     expect(cGlyphEmpty.querySelector('path')).not.toBeNull();
-    const { container: cGlyphSymbols } = render(<svg><WeatherIconGlyph name="$$$" /></svg>);
+
+    const { container: cGlyphSymbols } = render(
+      <svg>
+        <WeatherIconGlyph name="$$$" />
+      </svg>,
+    );
     expect(cGlyphSymbols.querySelector('path')).not.toBeNull();
   });
 
   it('exercises React compiler memoization on WeatherIcon and WeatherIconGlyph across all tokens', () => {
     const allTokens = [
-      'weather-sunny', 'weather-clear-night', 'weather-partly-cloudy', 'weather-night-partly-cloudy',
-      'weather-cloudy', 'weather-fog', 'weather-rainy', 'weather-pouring',
-      'weather-snowy', 'weather-snowy-rainy', 'weather-lightning', 'weather-lightning-rainy',
-      'unknown-token', '',
+      'weather-sunny',
+      'weather-clear-night',
+      'weather-partly-cloudy',
+      'weather-night-partly-cloudy',
+      'weather-cloudy',
+      'weather-fog',
+      'weather-rainy',
+      'weather-pouring',
+      'weather-snowy',
+      'weather-snowy-rainy',
+      'weather-lightning',
+      'weather-lightning-rainy',
+      'unknown-token',
+      '',
     ];
 
     for (const token of allTokens) {
-      const { rerender: rerenderGlyph, unmount: unmountGlyph } = render(<svg><WeatherIconGlyph name={token} /></svg>);
-      rerenderGlyph(<svg><WeatherIconGlyph name={token} /></svg>);
+      const { rerender: rerenderGlyph, unmount: unmountGlyph } = render(
+        <svg>
+          <WeatherIconGlyph name={token} />
+        </svg>,
+      );
+      rerenderGlyph(
+        <svg>
+          <WeatherIconGlyph name={token} />
+        </svg>,
+      );
       unmountGlyph();
 
       const { rerender: rerenderIcon, unmount: unmountIcon } = render(
@@ -1358,109 +1559,5 @@ describe('WeatherHourlyGraph component', () => {
       dateStr: '2026-10-31',
       isTomorrow: false,
     });
-  });
-
-  it('renders configurable birthday override badge, outfit prefix, and birthday sprite URLs when birthdays match', () => {
-    useDisplayStore.setState({
-      widgets: {
-        'weather-school-birthday': {
-          meta: {
-            type: 'weather-forecast',
-            origin: [0, 0],
-            dimensions: [2, 1],
-            config: {
-              mode: 'school-day',
-              character_pack: 'ghibli_school_day',
-              date: '2026-11-07',
-              birthdays: [{ name: 'ChildOne', date: '11-07' }],
-            },
-            assets_base: '',
-          },
-          state: 'healthy',
-          data: {
-            current: {
-              temperature: 65,
-              icon: 'weather-sunny',
-            },
-            slots: {
-              morning: { temp: 52, precip_prob: 0, icon: 'weather-sunny' },
-              afternoon: { temp: 72, precip_prob: 0, icon: 'weather-sunny' },
-              evening: { temp: 60, precip_prob: 0, icon: 'weather-clear-night' },
-            },
-          },
-          timestamp: '2026-11-07T09:00:00Z',
-        },
-      },
-    });
-
-    const { container, rerender } = render(
-      <WeatherForecastWidget id="weather-school-birthday" type="weather-forecast" />,
-    );
-
-    const morningSlot = container.querySelector('.weather-school-day-slot-morning');
-    expect(morningSlot?.getAttribute('data-birthday')).toBe('true');
-    expect(morningSlot?.querySelector('.weather-school-day-birthday-badge')?.textContent).toBe(
-      '🎂 Happy Birthday ChildOne!',
-    );
-    expect(morningSlot?.querySelector('.weather-school-day-outfit')?.textContent).toBe(
-      '🎂 Birthday Celebration! · Light Jacket & Pants',
-    );
-    expect(morningSlot?.querySelector('img.weather-school-day-sprite')?.getAttribute('src')).toBe(
-      '/static/ui/assets/weather-packs/ghibli_school_day/birthday_childone_morning.jpg',
-    );
-
-    const afternoonSlot = container.querySelector('.weather-school-day-slot-afternoon');
-    expect(afternoonSlot?.querySelector('img.weather-school-day-sprite')?.getAttribute('src')).toBe(
-      '/static/ui/assets/weather-packs/ghibli_school_day/birthday_childone_afternoon.jpg',
-    );
-
-    const eveningSlot = container.querySelector('.weather-school-day-slot-evening');
-    expect(eveningSlot?.querySelector('img.weather-school-day-sprite')?.getAttribute('src')).toBe(
-      '/static/ui/assets/weather-packs/ghibli_school_day/birthday_childone_evening.jpg',
-    );
-
-    // Non-matching date should not render birthday override
-    useDisplayStore.setState({
-      widgets: {
-        'weather-school-birthday': {
-          meta: {
-            type: 'weather-forecast',
-            origin: [0, 0],
-            dimensions: [2, 1],
-            config: {
-              mode: 'school-day',
-              character_pack: 'ghibli_school_day',
-              date: '2026-11-08',
-              birthdays: [{ name: 'ChildOne', date: '11-07' }],
-            },
-            assets_base: '',
-          },
-          state: 'healthy',
-          data: {
-            current: {
-              temperature: 65,
-              icon: 'weather-sunny',
-            },
-            slots: {
-              morning: { temp: 52, precip_prob: 0, icon: 'weather-sunny' },
-              afternoon: { temp: 72, precip_prob: 0, icon: 'weather-sunny' },
-              evening: { temp: 60, precip_prob: 0, icon: 'weather-clear-night' },
-            },
-          },
-          timestamp: '2026-11-08T09:00:00Z',
-        },
-      },
-    });
-
-    rerender(<WeatherForecastWidget id="weather-school-birthday" type="weather-forecast" />);
-    const nonBirthdayMorning = container.querySelector('.weather-school-day-slot-morning');
-    expect(nonBirthdayMorning?.getAttribute('data-birthday')).toBeNull();
-    expect(nonBirthdayMorning?.querySelector('.weather-school-day-birthday-badge')).toBeNull();
-    expect(nonBirthdayMorning?.querySelector('.weather-school-day-outfit')?.textContent).toBe(
-      'Light Jacket & Pants',
-    );
-    expect(
-      nonBirthdayMorning?.querySelector('img.weather-school-day-sprite')?.getAttribute('src'),
-    ).toMatch(/^\/static\/ui\/assets\/weather-packs\/ghibli_school_day\/morning_mild_v\d+\.jpg$/);
   });
 });

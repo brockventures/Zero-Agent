@@ -135,7 +135,6 @@ function filterDaysByMember(
       matchesMemberFilter(ev, selectedMember, membersList),
     ),
     all_day: day.all_day?.filter((ev) => matchesMemberFilter(ev, selectedMember, membersList)),
-    meals: day.meals?.filter((ev) => matchesMemberFilter(ev, selectedMember, membersList)),
     timed: day.timed?.filter((ev) => matchesMemberFilter(ev, selectedMember, membersList)),
   }));
 }
@@ -197,10 +196,6 @@ export function CalendarGridWidget({
   const entryVM = entry?.viewModel as Record<string, unknown> | undefined;
 
   const defaultView = resolveDefaultView(config, entryVM);
-  const celebrateSpecialDays = config?.celebrate_special_days !== false;
-  const eventFlair = config?.event_flair !== false;
-  const birthdaysConfig = config?.birthdays;
-  const specialDaysConfig = config?.special_days;
 
   const [activeView, setActiveView] = useState<ViewMode>(defaultView);
   const [selectedMember, setSelectedMember] = useState<string | null>(null);
@@ -321,8 +316,6 @@ export function CalendarGridWidget({
       data-active-view={activeView}
       data-current-date={currentDateISO}
       data-page-offset={String(pageOffset)}
-      data-celebrate-special-days={String(celebrateSpecialDays)}
-      data-event-flair={String(eventFlair)}
       style={memberCssVars}
       onPointerDown={handleUserActivity}
     >
@@ -359,10 +352,6 @@ export function CalendarGridWidget({
         currentDateISO={currentDateISO}
         onOpenModal={openModal}
         onSelectDay={selectDayView}
-        celebrateSpecialDays={celebrateSpecialDays}
-        eventFlair={eventFlair}
-        birthdays={birthdaysConfig}
-        specialDays={specialDaysConfig}
       />
 
       <CalendarMonthView
@@ -371,16 +360,12 @@ export function CalendarGridWidget({
         members={members}
         onOpenModal={(ev, date) => openModal(ev, date)}
         onSelectDay={selectDayView}
-        celebrateSpecialDays={celebrateSpecialDays}
-        birthdays={birthdaysConfig}
-        specialDays={specialDaysConfig}
       />
 
       <CalendarEventModal
         event={activeModalEvent}
         dateLabel={activeModalDateLabel}
         onClose={closeModal}
-        eventFlair={eventFlair}
       />
     </div>
   );
