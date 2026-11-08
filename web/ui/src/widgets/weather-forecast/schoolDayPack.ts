@@ -172,18 +172,247 @@ export function selectDailyVariantIndex(
 ): number {
   const count = Math.max(1, variantsCount);
   let hash = 0;
-  const seed = `${dateStr}:${slot}`;
-  for (let i = 0; i < seed.length; i++) {
-    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  for (let i = 0; i < dateStr.length; i++) {
+    hash = (hash * 31 + dateStr.charCodeAt(i)) >>> 0;
   }
-  return (hash % count) + 1;
+  const slotOffset = slot === 'morning' ? 0 : slot === 'afternoon' ? 1 : 2;
+  return ((hash + slotOffset) % count) + 1;
+}
+
+interface BirthdayConfigEntry {
+  key?: string;
+  id?: string;
+  name?: string;
+  date?: string;
+  month_day?: string;
+  month?: number;
+  day?: number;
+  label?: string;
+  banner_label?: string;
+  outfit_label?: string;
+}
+
+export interface BirthdayMatch {
+  key: string;
+  name: string;
+  bannerLabel: string;
+  outfitLabel: string;
+}
+
+function normalizeMonthDay(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  const fullMatch = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(trimmed);
+  if (fullMatch) {
+    return `${fullMatch[2].padStart(2, '0')}-${fullMatch[3].padStart(2, '0')}`;
+  }
+  const mdMatch = /^(\d{1,2})[-/](\d{1,2})$/.exec(trimmed);
+  if (mdMatch) {
+    return `${mdMatch[1].padStart(2, '0')}-${mdMatch[2].padStart(2, '0')}`;
+  }
+  return undefined;
+}
+
+function sanitizeBirthdayKey(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function formatBirthdayMatch(
+  keyRaw: string,
+  nameRaw: string,
+  bannerRaw?: string,
+  outfitRaw?: string,
+): BirthdayMatch | undefined {
+  const key = sanitizeBirthdayKey(keyRaw);
+  if (!key) return undefined;
+  const name = nameRaw.trim() || key.charAt(0).toUpperCase() + key.slice(1);
+  const bannerLabel =
+    typeof bannerRaw === 'string' && bannerRaw.trim()
+      ? bannerRaw.trim()
+      : `🎂 Happy Birthday ${name}!`;
+  const outfitLabel =
+    typeof outfitRaw === 'string' && outfitRaw.trim()
+      ? outfitRaw.trim()
+      : `🎂 Birthday Celebration!`;
+  return { key, name, bannerLabel, outfitLabel };
+}
+
+function matchBirthdayEntryObject(
+  entry: BirthdayConfigEntry & Record<string, unknown>,
+  targetMonthDay: string,
+  fallbackKey?: string,
+): BirthdayMatch | undefined {
+  let entryMonthDay = normalizeMonthDay(entry.date ?? entry.month_day);
+  if (
+    !entryMonthDay &&
+    typeof entry.month === 'number' &&
+    typeof entry.day === 'number'
+  ) {
+    entryMonthDay = `${String(entry.month).padStart(2, '0')}-${String(entry.day).padStart(2, '0')}`;
+  }
+  if (!entryMonthDay && fallbackKey) {
+    entryMonthDay = normalizeMonthDay(fallbackKey);
+  }
+  if (entryMonthDay !== targetMonthDay) return undefined;
+
+  const rawName =
+    typeof entry.name === 'string'
+      ? entry.name
+      : typeof entry.key === 'string'
+        ? entry.key
+        : typeof entry.id === 'string'
+          ? entry.id
+          : fallbackKey && !normalizeMonthDay(fallbackKey)
+            ? fallbackKey
+            : '';
+  const rawKey =
+    typeof entry.key === 'string'
+      ? entry.key
+      : typeof entry.id === 'string'
+        ? entry.id
+        : rawName;
+  const bannerRaw =
+    typeof entry.banner_label === 'string'
+      ? entry.banner_label
+      : typeof entry.label === 'string'
+        ? entry.label
+        : undefined;
+  const outfitRaw = typeof entry.outfit_label === 'string' ? entry.outfit_label : undefined;
+  return formatBirthdayMatch(rawKey, rawName, bannerRaw, outfitRaw);
+}
+
+export function resolveBirthdayOverride(
+  dateStr?: string,
+  birthdaysConfig?: unknown,
+): BirthdayMatch | undefined {
+  if (!dateStr || !birthdaysConfig || typeof birthdaysConfig === 'boolean') {
+    return undefined;
+  }
+  const targetMonthDay = normalizeMonthDay(dateStr);
+  if (!targetMonthDay) return undefined;
+
+  if (Array.isArray(birthdaysConfig)) {
+    for (const item of birthdaysConfig) {
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        const match = matchBirthdayEntryObject(
+          item as BirthdayConfigEntry & Record<string, unknown>,
+          targetMonthDay,
+        );
+        if (match) return match;
+      }
+    }
+    return undefined;
+  }
+
+  if (typeof birthdaysConfig === 'object') {
+    const map = birthdaysConfig as Record<string, unknown>;
+    for (const [k, v] of Object.entries(map)) {
+      if (typeof v === 'string') {
+        const kAsDate = normalizeMonthDay(k);
+        const vAsDate = normalizeMonthDay(v);
+        if (vAsDate === targetMonthDay) {
+          const match = formatBirthdayMatch(k, k);
+          if (match) return match;
+        } else if (kAsDate === targetMonthDay) {
+          const match = formatBirthdayMatch(v, v);
+          if (match) return match;
+        }
+      } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+        const match = matchBirthdayEntryObject(
+          v as BirthdayConfigEntry & Record<string, unknown>,
+          targetMonthDay,
+          k,
+        );
+        if (match) return match;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+export function resolveBirthdayPackSpriteUrl(
+  packName: string,
+  birthdayKey: string,
+  slot: DaypartSlot,
+  assetsBase = '/static/ui/assets/weather-packs',
+): string {
+  return `${assetsBase}/${packName}/birthday_${birthdayKey}_${slot}.jpg`;
+}
+
+const HOLIDAY_SUPPORTED_STATES: Record<string, ReadonlySet<ClothingConditionState>> = {
+  new_years: new Set(['cold_puffer', 'cool_evening', 'morning_mild', 'morning_rain', 'rainy_boots']),
+  valentines: new Set(['cold_puffer', 'cool_evening', 'morning_mild', 'morning_rain', 'rainy_boots', 'warm_pants']),
+  easter: new Set(['cold_puffer', 'cool_evening', 'hot_dress', 'morning_mild', 'morning_rain', 'rainy_boots', 'warm_pants']),
+  memorial_day: new Set(['cool_evening', 'hot_dress', 'morning_mild', 'rainy_boots', 'warm_pants']),
+  july_4th: new Set(['cool_evening', 'hot_dress', 'morning_mild', 'warm_pants']),
+  labor_day: new Set(['cool_evening', 'hot_dress', 'morning_mild', 'warm_pants']),
+  halloween: new Set(['cold_puffer', 'cool_evening', 'morning_mild', 'morning_rain', 'rainy_boots', 'warm_pants']),
+  thanksgiving: new Set(['cold_puffer', 'cool_evening', 'morning_mild', 'morning_rain', 'rainy_boots', 'warm_pants']),
+  christmas: new Set(['cold_puffer', 'cool_evening', 'morning_mild', 'morning_rain', 'rainy_boots']),
+};
+
+function computeEasterMonthDay(year: number): [number, number] {
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return [month, day];
+}
+
+function resolveUSHolidayKey(dateStr?: string): string | undefined {
+  if (!dateStr) return undefined;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
+  if (!match) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month === 1 && day === 1) return 'new_years';
+  if (month === 2 && day === 14) return 'valentines';
+  if (month === 7 && day === 4) return 'july_4th';
+  if (month === 10 && day === 31) return 'halloween';
+  if (month === 12 && (day === 24 || day === 25)) return 'christmas';
+  const [eMonth, eDay] = computeEasterMonthDay(year);
+  if (month === eMonth && day === eDay) return 'easter';
+  const dow = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+  if (month === 5 && dow === 1 && day >= 25) return 'memorial_day';
+  if (month === 9 && dow === 1 && day <= 7) return 'labor_day';
+  if (month === 11 && dow === 4 && day >= 22 && day <= 28) return 'thanksgiving';
+  return undefined;
 }
 
 export function resolveCharacterPackSpriteUrl(
   packName: string,
   state: ClothingConditionState,
   variantIndex: number,
+  dateStrOrAssetsBase?: string,
+  enableHolidays?: boolean,
   assetsBase = '/static/ui/assets/weather-packs',
 ): string {
-  return `${assetsBase}/${packName}/${state}_v${variantIndex}.jpg`;
+  const isLegacyBase =
+    typeof dateStrOrAssetsBase === 'string' &&
+    (dateStrOrAssetsBase.startsWith('/') || dateStrOrAssetsBase.startsWith('http'));
+  const base = isLegacyBase ? dateStrOrAssetsBase : assetsBase;
+  const dateStr = isLegacyBase ? undefined : dateStrOrAssetsBase;
+  if (enableHolidays) {
+    const holidayKey = resolveUSHolidayKey(dateStr);
+    if (holidayKey && HOLIDAY_SUPPORTED_STATES[holidayKey]?.has(state)) {
+      return `${base}/${packName}/holiday_${holidayKey}_${state}.jpg`;
+    }
+  }
+  return `${base}/${packName}/${state}_v${variantIndex}.jpg`;
 }

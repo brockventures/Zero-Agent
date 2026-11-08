@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SCHOOL_DAY_THRESHOLDS,
   type SchoolDayThresholds,
+  resolveBirthdayOverride,
+  resolveBirthdayPackSpriteUrl,
   resolveCharacterPackSpriteUrl,
   resolveClothingConditionState,
   selectDailyVariantIndex,
@@ -184,6 +186,148 @@ describe('schoolDayPack utilities', () => {
       const clampedNeg = selectDailyVariantIndex('2026-10-31', 'morning', -5);
       expect(clampedNeg).toBe(1);
     });
+
+    it('assigns distinct round-robin variant indices across morning, afternoon, and evening when variantsCount >= 3', () => {
+      const dates = ['2026-11-07', '2026-11-08', '2026-12-25', '2026-01-01'];
+      for (const dateStr of dates) {
+        const morning = selectDailyVariantIndex(dateStr, 'morning', 5);
+        const afternoon = selectDailyVariantIndex(dateStr, 'afternoon', 5);
+        const evening = selectDailyVariantIndex(dateStr, 'evening', 5);
+        expect(new Set([morning, afternoon, evening]).size).toBe(3);
+      }
+    });
+  });
+
+  describe('resolveBirthdayOverride and resolveBirthdayPackSpriteUrl', () => {
+    it('resolves birthday override from array and object configurations using generic fixtures', () => {
+      const arrayConfig = [
+        { name: 'ChildOne', date: '11-07' },
+        { key: 'child_two', name: 'ChildTwo', date: '05-14', banner_label: 'Party Time!' },
+      ];
+      const match1 = resolveBirthdayOverride('2026-11-07', arrayConfig);
+      expect(match1).toEqual({
+        key: 'childone',
+        name: 'ChildOne',
+        bannerLabel: '🎂 Happy Birthday ChildOne!',
+        outfitLabel: '🎂 Birthday Celebration!',
+      });
+
+      const match2 = resolveBirthdayOverride('2026-05-14', arrayConfig);
+      expect(match2).toEqual({
+        key: 'child_two',
+        name: 'ChildTwo',
+        bannerLabel: 'Party Time!',
+        outfitLabel: '🎂 Birthday Celebration!',
+      });
+
+      expect(resolveBirthdayOverride('2026-11-08', arrayConfig)).toBeUndefined();
+
+      const mapConfig = {
+        ChildOne: '11-07',
+      };
+      expect(resolveBirthdayOverride('2026-11-07', mapConfig)).toEqual({
+        key: 'childone',
+        name: 'ChildOne',
+        bannerLabel: '🎂 Happy Birthday ChildOne!',
+        outfitLabel: '🎂 Birthday Celebration!',
+      });
+    });
+
+    it('resolves numeric { month, day, name } entries and custom id / label / outfit_label overrides', () => {
+      const numericAndCustomConfig = [
+        { month: 11, day: 7, name: 'ChildOne' },
+        {
+          id: 'CustomId',
+          month_day: '2026-03-04',
+          label: 'Custom Label Banner',
+          outfit_label: 'Custom Outfit!',
+        },
+        {
+          key: '   ',
+          name: '   ',
+          date: '09/09',
+        },
+      ];
+
+      expect(resolveBirthdayOverride('2026-11-07', numericAndCustomConfig)).toEqual({
+        key: 'childone',
+        name: 'ChildOne',
+        bannerLabel: '🎂 Happy Birthday ChildOne!',
+        outfitLabel: '🎂 Birthday Celebration!',
+      });
+
+      expect(resolveBirthdayOverride('2026-03-04', numericAndCustomConfig)).toEqual({
+        key: 'customid',
+        name: 'CustomId',
+        bannerLabel: 'Custom Label Banner',
+        outfitLabel: 'Custom Outfit!',
+      });
+
+      // Empty/whitespace key sanitizes to '' and returns undefined
+      expect(resolveBirthdayOverride('2026-09-09', numericAndCustomConfig)).toBeUndefined();
+    });
+
+    it('resolves object-valued map entries and date-keyed string map entries', () => {
+      const objectByNameMap = {
+        ChildOne: { date: '11-07', outfit_label: 'Party Hat' },
+      };
+      expect(resolveBirthdayOverride('2026-11-07', objectByNameMap)).toEqual({
+        key: 'childone',
+        name: 'ChildOne',
+        bannerLabel: '🎂 Happy Birthday ChildOne!',
+        outfitLabel: 'Party Hat',
+      });
+
+      const objectByDateMap = {
+        '11-07': { name: 'ChildOne', label: 'Hooray ChildOne!' },
+      };
+      expect(resolveBirthdayOverride('2026-11-07', objectByDateMap)).toEqual({
+        key: 'childone',
+        name: 'ChildOne',
+        bannerLabel: 'Hooray ChildOne!',
+        outfitLabel: '🎂 Birthday Celebration!',
+      });
+
+      const dateKeyedStringMap = {
+        '11-07': 'ChildOne',
+      };
+      expect(resolveBirthdayOverride('2026-11-07', dateKeyedStringMap)).toEqual({
+        key: 'childone',
+        name: 'ChildOne',
+        bannerLabel: '🎂 Happy Birthday ChildOne!',
+        outfitLabel: '🎂 Birthday Celebration!',
+      });
+    });
+
+    it('returns undefined for invalid, boolean, or empty birthday configurations and entries', () => {
+      expect(resolveBirthdayOverride(undefined, { ChildOne: '11-07' })).toBeUndefined();
+      expect(resolveBirthdayOverride('invalid-date', { ChildOne: '11-07' })).toBeUndefined();
+      expect(resolveBirthdayOverride('2026-11-07', undefined)).toBeUndefined();
+      expect(resolveBirthdayOverride('2026-11-07', null)).toBeUndefined();
+      expect(resolveBirthdayOverride('2026-11-07', true)).toBeUndefined();
+      expect(resolveBirthdayOverride('2026-11-07', false)).toBeUndefined();
+      expect(resolveBirthdayOverride('2026-11-07', [])).toBeUndefined();
+      expect(resolveBirthdayOverride('2026-11-07', {})).toBeUndefined();
+      expect(
+        resolveBirthdayOverride('2026-11-07', [null, 'invalid', [], { date: 123 }]),
+      ).toBeUndefined();
+      expect(
+        resolveBirthdayOverride('2026-11-07', {
+          ChildOne: null,
+          ChildTwo: [],
+          '11-07': {},
+        }),
+      ).toBeUndefined();
+    });
+
+    it('formats birthday pack sprite URLs cleanly', () => {
+      expect(resolveBirthdayPackSpriteUrl('ghibli_school_day', 'childone', 'morning')).toBe(
+        '/static/ui/assets/weather-packs/ghibli_school_day/birthday_childone_morning.jpg',
+      );
+      expect(
+        resolveBirthdayPackSpriteUrl('custom_pack', 'childone', 'evening', '/custom/base'),
+      ).toBe('/custom/base/custom_pack/birthday_childone_evening.jpg');
+    });
   });
 
   describe('resolveCharacterPackSpriteUrl', () => {
@@ -202,5 +346,42 @@ describe('schoolDayPack utilities', () => {
       expect(url).toBe('/custom/assets/packs/custom_pack/morning_rain_v1.jpg');
     });
   });
-});
 
+  it('resolves holiday sprite when enableHolidays is true and state is supported', () => {
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'cold_puffer', 2, '2026-10-31', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/holiday_halloween_cold_puffer.jpg');
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'cold_puffer', 2, '2026-12-25', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/holiday_christmas_cold_puffer.jpg');
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'cold_puffer', 2, '2026-01-01', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/holiday_new_years_cold_puffer.jpg');
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'warm_pants', 2, '2026-02-14', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/holiday_valentines_warm_pants.jpg');
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'hot_dress', 2, '2026-07-04', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/holiday_july_4th_hot_dress.jpg');
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'warm_pants', 2, '2026-04-05', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/holiday_easter_warm_pants.jpg');
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'warm_pants', 2, '2026-05-25', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/holiday_memorial_day_warm_pants.jpg');
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'warm_pants', 2, '2026-09-07', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/holiday_labor_day_warm_pants.jpg');
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'cold_puffer', 2, '2026-11-26', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/holiday_thanksgiving_cold_puffer.jpg');
+    // Unsupported state on holiday falls back to regular daily variant
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'hot_dress', 3, '2026-12-25', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/hot_dress_v3.jpg');
+    // Non-holiday date falls back to regular daily variant
+    expect(
+      resolveCharacterPackSpriteUrl('ghibli', 'cold_puffer', 1, '2026-10-15', true),
+    ).toBe('/static/ui/assets/weather-packs/ghibli/cold_puffer_v1.jpg');
+  });
+});
