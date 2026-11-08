@@ -691,6 +691,27 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Dockhand image check execution error: {e}")
         return
 
+    # Hearth Upstream Mirrormere Weekly Sync: silent unless not ok or an update occurred
+    if job_id == "hearth_weekly_sync" or "hearth_sync" in prompt or "Hearth Upstream Mirrormere Weekly Sync" in job_name:
+        try:
+            from tools.hearth_sync import sync_hearth
+            ok, out, _ = await _run_sidecar_job_async(
+                "hearth_weekly_sync",
+                "Hearth Upstream Mirrormere Weekly Sync",
+                lambda: sync_hearth(force=False),
+            )
+            update_occurred = bool(out and ("updated" in out.lower() or "synced" in out.lower() or "deployed" in out.lower() or "rebuilt" in out.lower()))
+            if (not ok or update_occurred) and out and out.strip() and bot:
+                ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
+                if ch:
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    await _send_chunked_content(ch, clean_content, choice_view)
+            else:
+                print(f"[Scheduler] Hearth weekly sync nominal (silent): {out}")
+        except Exception as e:
+            print(f"[Scheduler] Hearth weekly sync execution error: {e}")
+        return
+
     # Reddit fantasy baseball scanner: surface high-signal dilemma draft card to #zero-chat
     if "reddit_fantasy" in prompt or "reddit_scan" in prompt or "Reddit Fantasy Baseball" in job_name:
         try:

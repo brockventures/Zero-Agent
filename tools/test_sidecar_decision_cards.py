@@ -647,3 +647,64 @@ class TestSchedulerDoublePostSuppression:
                 bot=mock_bot
             )
             mock_channel.send.assert_called_once()
+
+
+# ==============================================================================
+# 7. HEARTH UPSTREAM MIRRORMERE WEEKLY SYNC TESTS
+# ==============================================================================
+
+class TestHearthWeeklySyncSchedule:
+    """Verifies Hearth auto-sync is decoupled from heartbeat sweep and dispatches cleanly as a weekly sidecar."""
+
+    def test_run_heartbeat_sweep_does_not_call_sync_hearth(self):
+        import inspect
+        from tools.sidecars import run_heartbeat_sweep
+
+        src = inspect.getsource(run_heartbeat_sweep)
+        assert "sync_hearth" not in src
+        assert "hearth_sync" not in src
+
+    @patch("tools.hearth_sync.sync_hearth")
+    def test_sidecars_cli_hearth_sync_dispatches_cleanly(self, mock_sync_hearth, monkeypatch, capsys):
+        import runpy
+
+        mock_sync_hearth.return_value = (True, "hearth-core healthy (Up 2 days)")
+        monkeypatch.setattr(sys, "argv", ["sidecars.py", "hearth_sync", "--force"])
+
+        runpy.run_path(os.path.join(REPO_ROOT, "tools", "sidecars.py"), run_name="__main__")
+
+        mock_sync_hearth.assert_called_once_with(force=True)
+        captured = capsys.readouterr()
+        assert "hearth-core healthy (Up 2 days)" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_bridge_scheduler_hearth_weekly_sync_dispatch(self):
+        import tools.bridge_scheduler as bshed
+        from unittest.mock import AsyncMock
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        # Nominal healthy status (no update) -> silent, no Discord message posted
+        with patch("tools.hearth_sync.sync_hearth", return_value=(True, "hearth-core healthy (Up 2 days)")):
+            await bshed.dispatch_scheduled_prompt(
+                "Run the weekly Hearth upstream Mirrormere sync using /workspace/tools/sidecars.py hearth_sync.",
+                "Hearth Upstream Mirrormere Weekly Sync",
+                bot=mock_bot,
+                job_id="hearth_weekly_sync",
+            )
+            mock_channel.send.assert_not_called()
+
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        # Failure status -> posts alert to HOMELAB_CHANNEL_ID
+        with patch("tools.hearth_sync.sync_hearth", return_value=(False, "hearth-core container not Up")):
+            await bshed.dispatch_scheduled_prompt(
+                "Run the weekly Hearth upstream Mirrormere sync using /workspace/tools/sidecars.py hearth_sync.",
+                "Hearth Upstream Mirrormere Weekly Sync",
+                bot=mock_bot,
+                job_id="hearth_weekly_sync",
+            )
+            mock_channel.send.assert_called_once()
+
