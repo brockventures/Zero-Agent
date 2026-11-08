@@ -34,7 +34,7 @@ class TestGeminiImage(unittest.TestCase):
             "success": True,
             "path": "/tmp/sub_render.jpg",
             "filename": "sub_render.jpg",
-            "model": "subscription:gemini-3.8-flash-low",
+            "model": "subscription:gemini-4-argon-low",
             "billing_mode": "subscription",
             "prompt": "Test prompt, in square 1:1 format",
             "width": 1024,
@@ -88,14 +88,15 @@ class TestGeminiImage(unittest.TestCase):
 
             self.assertTrue(res["success"])
             self.assertEqual(res["billing_mode"], "subscription")
-            self.assertEqual(res["model"], "subscription:gemini-3.8-flash-low")
+            self.assertEqual(res["model"], "subscription:gemini-4-argon-low")
             self.assertIn("16:9", res["prompt"])
             self.assertTrue(Path(res["path"]).exists())
             mock_run.assert_called_once()
             called_cmd = mock_run.call_args[0][0]
             self.assertEqual(called_cmd[0], "agy")
-            self.assertIn("--model=gemini-3.8-flash-low", called_cmd)
-            self.assertIn("--agent=image-generator", called_cmd)
+            self.assertIn("--model=gemini-4-argon-low", called_cmd)
+            self.assertNotIn("--agent=image-generator", called_cmd)
+            self.assertTrue(any("image-generator" in arg for arg in called_cmd))
 
     @patch("requests.post")
     @patch("tools.gemini_image.check_and_record_paid_budget", return_value={"allowed": True, "used_24h": 1, "daily_limit": 5})

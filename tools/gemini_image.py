@@ -3,7 +3,7 @@
 gemini_image.py - Antigravity Subscription-First Image Generation & Paid-API Guard Pipeline
 
 Routes image generation by default through the Antigravity CLI subscription (`agy`
-built-in `image-generator` subagent / `--model=gemini-3.8-flash-low`) at $0 API cost.
+built-in `image-generator` subagent / `--model=gemini-4-argon-low`) at $0 API cost.
 Direct HTTPS REST calls to `generativelanguage.googleapis.com` with `GEMINI_API_KEY`
 are strictly gated behind explicit `--allow-paid-api` (or `GEMINI_IMAGE_ALLOW_PAID=1`)
 and enforced by a hard daily budget cap to prevent unexpected Google Cloud billing.
@@ -42,7 +42,7 @@ IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 BUDGET_STATE_FILE = DATA_DIR / "gemini_image_paid_budget.json"
 DEFAULT_DAILY_PAID_LIMIT = 5
-SUBSCRIPTION_MODEL = "gemini-3.8-flash-low"
+SUBSCRIPTION_MODEL = "gemini-4-argon-low"
 
 MODEL_CASCADE = [
     "gemini-3.1-flash-image",
@@ -213,7 +213,7 @@ def generate_image_subscription(
 ) -> Dict[str, Any]:
     """
     Generate an image using the Antigravity CLI subscription (`agy` built-in
-    `image-generator` subagent / `--model=gemini-3.8-flash-low`) at $0 API cost,
+    `image-generator` subagent / `--model=gemini-4-argon-low`) at $0 API cost,
     copy/move the resulting artifact to `out_file`, and validate with `check_image()`.
     """
     out_dir = resolve_output_dir(output_dir)
@@ -235,16 +235,16 @@ def generate_image_subscription(
             ref_clause = f" Reference image path for conditioning: {ref_path.resolve()}."
 
     agy_prompt = (
-        f"Generate an image using the image-generator subagent or generate_image tool "
+        f"Invoke the image-generator subagent to generate an image "
         f"with AspectRatio='{aspect_ratio.strip()}', ImageName='{clean_name}', "
         f"and Prompt: {full_prompt}.{ref_clause} "
-        f"Save or copy the generated image to {out_file} and reply with ONLY the absolute file path."
+        f"Wait for the image-generator subagent to finish, save or copy the resulting image to {out_file}, "
+        f"and reply with ONLY the absolute file path."
     )
 
     cmd = [
         "agy",
         f"--model={SUBSCRIPTION_MODEL}",
-        "--agent=image-generator",
         "--dangerously-skip-permissions",
         "--disable-slash-commands",
         f"-p={agy_prompt}",
