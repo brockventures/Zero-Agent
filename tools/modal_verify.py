@@ -86,7 +86,7 @@ _NON_GO_SAFE_EXTENSIONS = {
 
 _GO_SUBCOMMAND_REGEX = re.compile(
     r"(?:^|[\s/\"'(\|&;])("
-    r"deadcode\b"
+    r"(?<!npm run )(?<!yarn run )(?<!pnpm run )(?<!pnpm )(?<!bun run )deadcode\b"
     r"|golangci-lint\b"
     r"|oapi-codegen\b"
     r"|go\s+(?:vet|test|build|generate|run|tool)\b"
@@ -95,7 +95,7 @@ _GO_SUBCOMMAND_REGEX = re.compile(
 
 _HEAVY_GO_ANALYSIS_REGEX = re.compile(
     r"(?:^|[\s/\"'(\|&;])("
-    r"deadcode\b"
+    r"(?<!npm run )(?<!yarn run )(?<!pnpm run )(?<!pnpm )(?<!bun run )deadcode\b"
     r"|golangci-lint\b"
     r"|oapi-codegen\b"
     r"|go\s+test\s+[^\n;&|]*\./\.\.\."

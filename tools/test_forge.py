@@ -423,7 +423,7 @@ class TestForgeEngine(unittest.TestCase):
         verify_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
 
         # Default detection without FORGE_FULL_REPO_VERIFY
-        self.assertEqual(detect_repo_verification_script(wt_dir), "sh scripts/verify.sh --lint-only")
+        self.assertEqual(detect_repo_verification_script(wt_dir), "sh scripts/verify.sh --staged")
 
         # Detection with FORGE_FULL_REPO_VERIFY=1
         with patch.dict(os.environ, {"FORGE_FULL_REPO_VERIFY": "1"}):
@@ -431,12 +431,12 @@ class TestForgeEngine(unittest.TestCase):
 
         # 2. build_default_verification_cmd with verify.sh present
         cmd_no_py = build_default_verification_cmd(["main.go"], worktree_dir=wt_dir)
-        self.assertEqual(cmd_no_py, "sh scripts/verify.sh --lint-only")
+        self.assertEqual(cmd_no_py, "sh scripts/verify.sh --staged")
 
         cmd_with_py = build_default_verification_cmd(["tools/mod.py"], worktree_dir=wt_dir)
         self.assertEqual(
             cmd_with_py,
-            'python3 -m py_compile "tools/mod.py" && sh scripts/verify.sh --lint-only',
+            'python3 -m py_compile "tools/mod.py" && sh scripts/verify.sh --staged',
         )
 
         with patch.dict(os.environ, {"FORGE_FULL_REPO_VERIFY": "1"}):

@@ -2639,10 +2639,71 @@ def detect_repo_verification_script(worktree_dir: Path | str) -> Optional[str]:
     return None
 
 
+def _build_fast_staged_verify_cmd(worktree_dir: Path | str, changed_files: Optional[list[str]] = None) -> str:
+    """Build a subshell-safe pre-flight verification command for `scripts/verify.sh --staged`.
+
+    When `web/ui/` files are modified and `FORGE_FULL_REPO_VERIFY != 1`, runs fast frontend
+    pre-flight checks (`eslint --max-warnings=0` on staged/modified `web/ui/` files, `npm run deadcode` / knip,
+    and `npm run typecheck` / `tsc --noEmit`) directly from the worktree root before commit/push,
+    avoiding `npm run test:coverage` single-process hangs while keeping heavy Go static analyzers
+    (`golangci-lint`, `deadcode`) skipped on non-Go diffs.
+    Always resets working directory to `worktree_dir` first so preceding `cd subdir` segments
+    cannot break relative paths.
+    """
+    wt = Path(worktree_dir).resolve()
+    q_wt = f'"{wt}"'
+    if os.environ.get("FORGE_FULL_REPO_VERIFY") == "1":
+        return f"(cd {q_wt} && sh scripts/verify.sh)"
+
+    norm_files: list[str] = []
+    for f in (changed_files or []):
+        nf = str(f or "").strip().replace("\\", "/")
+        while nf.startswith("./"):
+            nf = nf[2:]
+        if nf and nf not in norm_files:
+            norm_files.append(nf)
+
+    ui_files = [f for f in norm_files if f.startswith("web/ui/")]
+    ui_pkg_json = wt / "web" / "ui" / "package.json"
+    if ui_files and ui_pkg_json.is_file():
+        non_ui_files = [f for f in norm_files if not f.startswith("web/ui/")]
+        ui_rel_lint = [
+            f[len("web/ui/") :]
+            for f in ui_files
+            if f.endswith((".ts", ".tsx", ".js", ".mjs", ".cjs"))
+            and (wt / f).is_file()
+        ]
+        full_ui_lint = any(
+            f in ("web/ui/eslint.config.js", "web/ui/package.json", "web/ui/package-lock.json", "scripts/verify.sh")
+            for f in norm_files
+        )
+        ui_subcmds: list[str] = []
+        if full_ui_lint:
+            ui_subcmds.append("npm run lint")
+        elif ui_rel_lint:
+            quoted_lint = " ".join(f'"{uf}"' for uf in ui_rel_lint)
+            ui_subcmds.append(f"npx --no-install eslint --max-warnings=0 {quoted_lint}")
+        ui_subcmds.append("npm run deadcode")
+        ui_subcmds.append("npm run typecheck")
+        fast_ui_cmd = f"(cd {q_wt}/web/ui && {' && '.join(ui_subcmds)})"
+        if not (wt / "web" / "ui" / "node_modules").exists() and (wt / "scripts" / "verify.sh").is_file():
+            return f"(cd {q_wt} && sh scripts/verify.sh --staged)"
+        if non_ui_files and (wt / "scripts" / "verify.sh").is_file():
+            return f"{fast_ui_cmd} && (cd {q_wt} && sh scripts/verify.sh --staged)"
+        return fast_ui_cmd
+
+    return f"(cd {q_wt} && sh scripts/verify.sh --staged)"
+
+
 def build_default_verification_cmd(target_files: list[str], worktree_dir: Optional[Path | str] = None) -> str:
     """Synthesize a deterministic baseline verification command when `verification_cmd` is omitted."""
     cmds: list[str] = []
     py_files = [str(f).strip() for f in target_files if str(f).strip().endswith(".py")]
+    ui_files = [
+        str(f).strip().replace("\\", "/").lstrip("./")
+        for f in target_files
+        if str(f).strip().replace("\\", "/").lstrip("./").startswith("web/ui/")
+    ]
 
     if py_files:
         quoted_py = " ".join(f'"{f}"' for f in py_files)
@@ -2667,6 +2728,38 @@ def build_default_verification_cmd(target_files: list[str], worktree_dir: Option
         if test_files:
             quoted_tests = " ".join(f'"{tf}"' for tf in test_files)
             cmds.append(f"pytest {quoted_tests}")
+
+    if ui_files and worktree_dir and (Path(worktree_dir) / "web" / "ui" / "package.json").is_file():
+        wt_p = Path(worktree_dir)
+        ui_lint_targets = [
+            uf[len("web/ui/") :]
+            for uf in ui_files
+            if uf.endswith((".ts", ".tsx", ".js", ".mjs", ".cjs"))
+        ]
+        ui_parts: list[str] = []
+        if ui_lint_targets:
+            q_lint = " ".join(f'"{u}"' for u in ui_lint_targets)
+            ui_parts.append(f"npx --no-install eslint --max-warnings=0 {q_lint}")
+        else:
+            ui_parts.append("npm run lint")
+        ui_parts.append("npm run deadcode")
+        ui_parts.append("npm run typecheck")
+        ui_test_targets: list[str] = []
+        for uf in ui_files:
+            rel_u = uf[len("web/ui/") :]
+            if ".test." in rel_u or ".spec." in rel_u:
+                if rel_u not in ui_test_targets:
+                    ui_test_targets.append(rel_u)
+            else:
+                stem, ext = os.path.splitext(rel_u)
+                for cand_ext in (f".test{ext}", ".test.tsx", ".test.ts"):
+                    cand_rel = f"{stem}{cand_ext}"
+                    if (wt_p / "web" / "ui" / cand_rel).is_file() and cand_rel not in ui_test_targets:
+                        ui_test_targets.append(cand_rel)
+        if ui_test_targets:
+            q_utests = " ".join(f'"{ut}"' for ut in ui_test_targets)
+            ui_parts.append(f"npx vitest run {q_utests}")
+        cmds.append(f"(cd web/ui && {' && '.join(ui_parts)})")
 
     if worktree_dir:
         repo_verify = detect_repo_verification_script(worktree_dir)
@@ -4564,6 +4657,11 @@ def verify_chunk_worktree(
             return False, "", f"Blind diff grading failed: {diff_err}"
 
     # 3. Execute verification_cmd (or synthesized baseline gate if omitted)
+    combined_changed_files: list[str] = []
+    for f in (list(target_files or []) + list(changed)):
+        if f and f not in combined_changed_files:
+            combined_changed_files.append(f)
+
     effective_cmd = (verification_cmd or "").strip()
     if not effective_cmd:
         files_to_check = list(target_files) if target_files else changed
@@ -4571,15 +4669,17 @@ def verify_chunk_worktree(
 
     repo_verify_cmd = detect_repo_verification_script(wt)
     if repo_verify_cmd and "scripts/verify.sh" not in effective_cmd:
+        fast_staged_cmd = _build_fast_staged_verify_cmd(wt, changed_files=combined_changed_files)
         if effective_cmd and effective_cmd != "true":
-            effective_cmd = f"{effective_cmd} && {repo_verify_cmd}"
+            effective_cmd = f"{effective_cmd} && {fast_staged_cmd}"
         else:
-            effective_cmd = repo_verify_cmd
-
-    combined_changed_files: list[str] = []
-    for f in (list(target_files or []) + list(changed)):
-        if f and f not in combined_changed_files:
-            combined_changed_files.append(f)
+            effective_cmd = fast_staged_cmd
+    elif "scripts/verify.sh --staged" in effective_cmd:
+        fast_staged_cmd = _build_fast_staged_verify_cmd(wt, changed_files=combined_changed_files)
+        if effective_cmd.strip() == "sh scripts/verify.sh --staged":
+            effective_cmd = fast_staged_cmd
+        else:
+            effective_cmd = effective_cmd.replace("sh scripts/verify.sh --staged", fast_staged_cmd)
 
     from tools.modal_verify import (
         filter_verify_cmd_for_changed_files,

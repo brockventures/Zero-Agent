@@ -223,6 +223,78 @@ class TestModalVerify(unittest.TestCase):
         self.assertTrue(has_heavy_go_static_analysis("golangci-lint run"))
         self.assertTrue(has_heavy_go_static_analysis("go test -race ./..."))
         self.assertFalse(has_heavy_go_static_analysis("pytest tools/test_modal_verify.py"))
+        self.assertFalse(has_heavy_go_static_analysis("npm run deadcode && npm run typecheck"))
+        self.assertIn(
+            "npm run deadcode",
+            filter_verify_cmd_for_changed_files(
+                "npm run deadcode && npm run typecheck && deadcode ./...",
+                ["web/ui/src/App.tsx"],
+            ),
+        )
+
+    def test_07_verify_chunk_worktree_web_ui_fast_frontend_checks(self) -> None:
+        from tools.forge import _build_fast_staged_verify_cmd, build_default_verification_cmd
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "repo"
+            wt.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(wt), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(wt), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Zero"], cwd=str(wt), check=True, capture_output=True)
+
+            (wt / "scripts").mkdir(parents=True, exist_ok=True)
+            verify_sh = wt / "scripts" / "verify.sh"
+            verify_sh.write_text("#!/bin/sh\necho 'staged-verify-ran'\n", encoding="utf-8")
+            verify_sh.chmod(0o755)
+
+            ui_dir = wt / "web" / "ui" / "src"
+            ui_dir.mkdir(parents=True, exist_ok=True)
+            (wt / "web" / "ui" / "package.json").write_text('{"name": "ui"}\n', encoding="utf-8")
+            app_tsx = ui_dir / "App.tsx"
+            app_tsx.write_text("export const x = 1;\n", encoding="utf-8")
+            app_test = ui_dir / "App.test.tsx"
+            app_test.write_text("export const t = 1;\n", encoding="utf-8")
+
+            subprocess.run(["git", "add", "-A"], cwd=str(wt), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(wt), check=True, capture_output=True)
+
+            # Modify web/ui/src/App.tsx
+            app_tsx.write_text("export const x: number = 2;\n", encoding="utf-8")
+
+            default_cmd = build_default_verification_cmd(["web/ui/src/App.tsx"], worktree_dir=wt)
+            self.assertIn("npx --no-install eslint --max-warnings=0 \"src/App.tsx\"", default_cmd)
+            self.assertIn("npm run deadcode", default_cmd)
+            self.assertIn("npm run typecheck", default_cmd)
+            self.assertIn("npx vitest run \"src/App.test.tsx\"", default_cmd)
+
+            # When node_modules exists, _build_fast_staged_verify_cmd synthesizes fast frontend checks
+            (wt / "web" / "ui" / "node_modules").mkdir(parents=True, exist_ok=True)
+            fast_cmd = _build_fast_staged_verify_cmd(wt, changed_files=["web/ui/src/App.tsx"])
+            self.assertIn("npx --no-install eslint --max-warnings=0 \"src/App.tsx\"", fast_cmd)
+            self.assertIn("npm run deadcode", fast_cmd)
+            self.assertIn("npm run typecheck", fast_cmd)
+
+            # Remove fake node_modules so verify.sh fallback runs cleanly in test subprocess
+            (wt / "web" / "ui" / "node_modules").rmdir()
+            passed, diff_stat, err = verify_chunk_worktree(
+                wt,
+                "deadcode ./... && echo 'ui-verified'",
+                target_files=["web/ui/src/App.tsx"],
+                require_changes=True,
+            )
+            self.assertTrue(passed, err)
+            self.assertIn("1 file changed", diff_stat)
+
+            # Verify failing verify.sh --staged catches frontend lint/type error in a single pass
+            verify_sh.write_text("#!/bin/sh\necho 'TS2322: Type error in App.tsx' >&2\nexit 1\n", encoding="utf-8")
+            passed_fail, _, err_fail = verify_chunk_worktree(
+                wt,
+                "echo 'unit-test-ok'",
+                target_files=["web/ui/src/App.tsx"],
+                require_changes=True,
+            )
+            self.assertFalse(passed_fail)
+            self.assertIn("TS2322: Type error in App.tsx", err_fail)
 
 
 if __name__ == "__main__":
