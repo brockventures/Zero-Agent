@@ -2124,6 +2124,21 @@ def main():
             try:
                 raw_cmd = args.get("CommandLine", "")
                 safe_cmd = escape_double_quoted_cli_prose(raw_cmd)
+                if safe_cmd != raw_cmd:
+                    print(
+                        json.dumps(
+                            {
+                                "decision": "deny",
+                                "reason": (
+                                    "Shell Double-Quote Corruption Guard: Detected unescaped '$' ($0, $1, $var) or backticks (`...`) "
+                                    "inside a double-quoted CLI prose argument (--message, -m, --body, --summary, --title). "
+                                    "Bash expands '$0' to 'bash', eats '$1..$9', and executes '`...`' as command substitution before Python runs. "
+                                    "Use single quotes (--message '...') or a single-quoted python3 -c script."
+                                ),
+                            }
+                        )
+                    )
+                    return
                 throttled_cmd = throttle_heavy_compiler_command(safe_cmd)
                 for tools_dir in ("/workspace/tools", "/opt/zero/workspace/tools"):
                     if os.path.isdir(tools_dir) and tools_dir not in sys.path:
