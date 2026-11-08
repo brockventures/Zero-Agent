@@ -437,6 +437,7 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
             channel=FORGE_CHANNEL_ID,
             content="Test notification",
             source_turn="gh_pr_watcher",
+            msg_type="text",
             is_agent_turn=False,
         )
 
@@ -452,12 +453,14 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
                 channel=FORGE_CHANNEL_ID,
                 content="Test notification",
                 source_turn="gh_pr_watcher",
+                msg_type="text",
                 is_agent_turn=False,
             ),
             call(
                 channel=ZERO_OPS_CHANNEL_ID,
                 content="Test notification",
                 source_turn="gh_pr_watcher",
+                msg_type="text",
                 is_agent_turn=False,
             ),
         ])
@@ -591,6 +594,7 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
             channel=FORGE_CHANNEL_ID,
             content=ANY,
             source_turn="gh_pr_watcher",
+            msg_type="text",
             is_agent_turn=False,
         )
         self.assertIn(
@@ -648,6 +652,7 @@ class TestGhPrWatcherReviewsAndOutbox(unittest.TestCase):
             channel=FORGE_CHANNEL_ID,
             content=ANY,
             source_turn="gh_pr_watcher",
+            msg_type="text",
             is_agent_turn=False,
         )
         self.assertIn("COM_100", state["seen_comment_ids"])
@@ -811,6 +816,7 @@ class TestGhPrWatcherEndToEnd(unittest.TestCase):
                 channel=FORGE_CHANNEL_ID,
                 content=ANY,
                 source_turn="gh_pr_watcher",
+                msg_type="agent_turn",
                 is_agent_turn=True,
             )
             self.assertTrue(tmp_state.exists())
@@ -1297,21 +1303,31 @@ class TestGhPrWatcherAutoMerge(unittest.TestCase):
         self.assertNotIn("mcarmody/lomin#5", state["auto_merged_prs"])
 
     def test_ensure_schedule_registered_idempotent(self) -> None:
-        """ensure_schedule_registered adds gh_pr_watcher with */3 * * * * and is idempotent."""
+        """ensure_schedule_registered adds gh_pr_watcher with */3 * * * * and is idempotent across list, tasks, and jobs formats."""
         tmp_sched = Path("/tmp/test_gh_pr_watcher_schedule.json")
-        tmp_sched.write_text(json.dumps([{"id": "existing_job"}]), encoding="utf-8")
         try:
-            added1 = ensure_schedule_registered(tmp_sched)
-            self.assertTrue(added1)
-            entries = json.loads(tmp_sched.read_text(encoding="utf-8"))
-            self.assertEqual(len(entries), 2)
-            watcher_entry = [e for e in entries if e.get("id") == "gh_pr_watcher"][0]
-            self.assertEqual(watcher_entry["cron_expression"], "*/3 * * * *")
-            self.assertEqual(watcher_entry["interval_seconds"], 180)
-            self.assertTrue(watcher_entry["enabled"])
+            for root_payload in (
+                [{"id": "existing_job"}],
+                {"tasks": [{"id": "existing_task"}]},
+                {"jobs": [{"id": "existing_job"}]},
+            ):
+                tmp_sched.write_text(json.dumps(root_payload), encoding="utf-8")
+                added1 = ensure_schedule_registered(tmp_sched)
+                self.assertTrue(added1)
+                parsed = json.loads(tmp_sched.read_text(encoding="utf-8"))
+                entries = (
+                    parsed
+                    if isinstance(parsed, list)
+                    else parsed.get("tasks") or parsed.get("jobs") or []
+                )
+                self.assertEqual(len(entries), 2)
+                watcher_entry = [e for e in entries if e.get("id") == "gh_pr_watcher"][0]
+                self.assertEqual(watcher_entry["cron_expression"], "*/3 * * * *")
+                self.assertEqual(watcher_entry["interval_seconds"], 180)
+                self.assertTrue(watcher_entry["enabled"])
 
-            added2 = ensure_schedule_registered(tmp_sched)
-            self.assertFalse(added2)
+                added2 = ensure_schedule_registered(tmp_sched)
+                self.assertFalse(added2)
         finally:
             tmp_sched.unlink(missing_ok=True)
 
@@ -2488,8 +2504,89 @@ class TestGhPrWatcherAgentTurnWakeup(unittest.TestCase):
             channel=FORGE_CHANNEL_ID,
             content="Actionable failure",
             source_turn="gh_pr_watcher",
+            msg_type="agent_turn",
             is_agent_turn=True,
         )
+
+    def test_queue_outbox_message_accepts_is_agent_turn(self) -> None:
+        from tools.outbox import queue_outbox_message
+        import tools.outbox as outbox_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_pending = Path(tmpdir) / "pending.jsonl"
+            with (
+                patch.object(outbox_mod, "OUTBOX_DIR", Path(tmpdir)),
+                patch.object(outbox_mod, "PENDING_FILE", tmp_pending),
+            ):
+                rec = queue_outbox_message(
+                    channel=str(FORGE_CHANNEL_ID),
+                    content="Actionable PR failure",
+                    source_turn="gh_pr_watcher",
+                    is_agent_turn=True,
+                    force=True,
+                )
+                self.assertEqual(rec["type"], "agent_turn")
+                self.assertTrue(rec["is_agent_turn"])
+
+    @patch("tools.gh_pr_watcher.dispatch_notification")
+    def test_check_pr_failed_dispatch_does_not_mark_events_seen(
+        self, mock_dispatch: MagicMock
+    ) -> None:
+        mock_dispatch.return_value = []
+        state: dict[str, Any] = {"version": 1}
+        pr_details = {
+            "repo": "brockventures/Zero-Agent",
+            "number": 52,
+            "title": "fix: review ping",
+            "url": "https://github.com/brockventures/Zero-Agent/pull/52",
+            "author": {"login": "zero-brock"},
+            "headRefOid": "sha123",
+            "reviewDecision": "CHANGES_REQUESTED",
+            "reviews": [
+                {
+                    "id": "REV_FAIL_1",
+                    "author": {"login": "ryanbrock"},
+                    "state": "CHANGES_REQUESTED",
+                    "submittedAt": "2026-11-03T01:00:00Z",
+                    "body": "Please fix this",
+                }
+            ],
+            "reviewRequests": [{"login": "zero-brock"}],
+            "comments": [
+                {
+                    "id": "COM_FAIL_1",
+                    "author": {"login": "aerial-bot"},
+                    "createdAt": "2026-11-03T01:02:00Z",
+                    "body": "Agent assessment: Fail",
+                }
+            ],
+            "statusCheckRollup": [
+                {
+                    "name": "pytest",
+                    "status": "COMPLETED",
+                    "conclusion": "FAILURE",
+                    "detailsUrl": "https://github.com/brockventures/Zero-Agent/actions/runs/1",
+                }
+            ],
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+        }
+
+        stats = check_pr(
+            pr_details=pr_details,
+            state=state,
+            current_user="zero-brock",
+        )
+        self.assertEqual(stats["reviews_notified"], 0)
+        self.assertEqual(stats["review_requests_notified"], 0)
+        self.assertEqual(stats["comments_notified"], 0)
+        self.assertEqual(stats["ci_failures_notified"], 0)
+        self.assertEqual(stats["conflicts_notified"], 0)
+        self.assertNotIn("REV_FAIL_1", state["seen_review_ids"])
+        self.assertNotIn("brockventures/Zero-Agent#52:req:zero-brock", state["seen_review_requests"])
+        self.assertNotIn("COM_FAIL_1", state["seen_comment_ids"])
+        self.assertNotIn("ci_fail:brockventures/Zero-Agent#52:sha123:pytest", state["seen_ci_failures"])
+        self.assertNotIn("conflict:brockventures/Zero-Agent#52:sha123", state["seen_merge_conflicts"])
 
     @patch("tools.gh_pr_watcher.dispatch_notification")
     def test_check_pr_triggers_agent_turn_on_actionable_failures(

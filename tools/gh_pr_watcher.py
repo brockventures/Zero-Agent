@@ -104,7 +104,11 @@ def ensure_schedule_registered(
         raw = schedule_file.read_text(encoding="utf-8")
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
-            if "jobs" in parsed:
+            if "tasks" in parsed:
+                if not isinstance(parsed["tasks"], list):
+                    return False
+                job_list = parsed["tasks"]
+            elif "jobs" in parsed:
                 if not isinstance(parsed["jobs"], list):
                     return False
                 job_list = parsed["jobs"]
@@ -1053,6 +1057,7 @@ def dispatch_notification(
                 channel=ch,
                 content=content,
                 source_turn="gh_pr_watcher",
+                msg_type="agent_turn" if is_agent_turn else "text",
                 is_agent_turn=is_agent_turn,
             )
             results.append(res)
@@ -1195,10 +1200,11 @@ def check_pr(
         if rev_id in seen_reviews:
             continue
 
-        seen_reviews.add(rev_id)
         rev_state = rev.get("state", "COMMENTED")
         if rev_state in ("CHANGES_REQUESTED", "APPROVED", "COMMENTED", "DISMISSED"):
-            if not seed_only:
+            if seed_only:
+                seen_reviews.add(rev_id)
+            else:
                 msg = format_review_message(
                     repo=repo,
                     pr_number=pr_number,
@@ -1213,17 +1219,21 @@ def check_pr(
                     dry_run=dry_run,
                     is_agent_turn=(rev_state == "CHANGES_REQUESTED"),
                 )
-                stats["reviews_notified"] += 1
-                if not dry_run:
-                    notif_list = active_notifications.setdefault(pr_key, [])
-                    for d_res in dispatch_res:
-                        notif_list.append({
-                            "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
-                            "message_id": d_res.get("message_id") or 0,
-                            "event_id": rev_id,
-                            "created_at": submitted_at or datetime.now(timezone.utc).isoformat(),
-                            "head_ref_oid": current_head,
-                        })
+                if dry_run or dispatch_res:
+                    seen_reviews.add(rev_id)
+                    stats["reviews_notified"] += 1
+                    if not dry_run:
+                        notif_list = active_notifications.setdefault(pr_key, [])
+                        for d_res in dispatch_res:
+                            notif_list.append({
+                                "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
+                                "message_id": d_res.get("message_id") or 0,
+                                "event_id": rev_id,
+                                "created_at": submitted_at or datetime.now(timezone.utc).isoformat(),
+                                "head_ref_oid": current_head,
+                            })
+        else:
+            seen_reviews.add(rev_id)
 
     # 2. Check review requests
     for req in pr_details.get("reviewRequests", []):
@@ -1234,8 +1244,9 @@ def check_pr(
         if req_key in seen_reqs:
             continue
 
-        seen_reqs.add(req_key)
-        if not seed_only:
+        if seed_only:
+            seen_reqs.add(req_key)
+        else:
             pr_author = (pr_details.get("author") or {}).get("login", "unknown")
             msg = format_review_request_message(
                 repo=repo,
@@ -1246,17 +1257,19 @@ def check_pr(
                 author=pr_author,
             )
             dispatch_res = dispatch_notification(msg, channels=channels, dry_run=dry_run)
-            stats["review_requests_notified"] += 1
-            if not dry_run:
-                notif_list = active_notifications.setdefault(pr_key, [])
-                for d_res in dispatch_res:
-                    notif_list.append({
-                        "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
-                        "message_id": d_res.get("message_id") or 0,
-                        "event_id": req_key,
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                        "head_ref_oid": current_head,
-                    })
+            if dry_run or dispatch_res:
+                seen_reqs.add(req_key)
+                stats["review_requests_notified"] += 1
+                if not dry_run:
+                    notif_list = active_notifications.setdefault(pr_key, [])
+                    for d_res in dispatch_res:
+                        notif_list.append({
+                            "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
+                            "message_id": d_res.get("message_id") or 0,
+                            "event_id": req_key,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "head_ref_oid": current_head,
+                        })
 
     # 3. Check comments
     for com in pr_details.get("comments", []):
@@ -1273,8 +1286,9 @@ def check_pr(
         if com_id in seen_comments:
             continue
 
-        seen_comments.add(com_id)
-        if not seed_only:
+        if seed_only:
+            seen_comments.add(com_id)
+        else:
             msg = format_comment_message(
                 repo=repo,
                 pr_number=pr_number,
@@ -1293,17 +1307,19 @@ def check_pr(
                 dry_run=dry_run,
                 is_agent_turn=is_roborev_fail,
             )
-            stats["comments_notified"] += 1
-            if not dry_run:
-                notif_list = active_notifications.setdefault(pr_key, [])
-                for d_res in dispatch_res:
-                    notif_list.append({
-                        "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
-                        "message_id": d_res.get("message_id") or 0,
-                        "event_id": com_id,
-                        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
-                        "head_ref_oid": current_head,
-                    })
+            if dry_run or dispatch_res:
+                seen_comments.add(com_id)
+                stats["comments_notified"] += 1
+                if not dry_run:
+                    notif_list = active_notifications.setdefault(pr_key, [])
+                    for d_res in dispatch_res:
+                        notif_list.append({
+                            "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
+                            "message_id": d_res.get("message_id") or 0,
+                            "event_id": com_id,
+                            "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+                            "head_ref_oid": current_head,
+                        })
 
     # 4. Check reviewDecision transition
     old_decision = review_decisions.get(pr_key)
@@ -1372,8 +1388,9 @@ def check_pr(
             check_name = chk.get("name") or "unnamed_check"
             fail_key = f"ci_fail:{repo}#{pr_number}:{current_head}:{check_name}"
             if fail_key not in seen_ci_failures:
-                seen_ci_failures.add(fail_key)
-                if not seed_only:
+                if seed_only:
+                    seen_ci_failures.add(fail_key)
+                else:
                     msg = format_ci_failure_message(
                         repo=repo,
                         pr_number=pr_number,
@@ -1388,17 +1405,19 @@ def check_pr(
                         dry_run=dry_run,
                         is_agent_turn=True,
                     )
-                    stats["ci_failures_notified"] += 1
-                    if not dry_run:
-                        notif_list = active_notifications.setdefault(pr_key, [])
-                        for d_res in dispatch_res:
-                            notif_list.append({
-                                "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
-                                "message_id": d_res.get("message_id") or 0,
-                                "event_id": fail_key,
-                                "created_at": datetime.now(timezone.utc).isoformat(),
-                                "head_ref_oid": current_head,
-                            })
+                    if dry_run or dispatch_res:
+                        seen_ci_failures.add(fail_key)
+                        stats["ci_failures_notified"] += 1
+                        if not dry_run:
+                            notif_list = active_notifications.setdefault(pr_key, [])
+                            for d_res in dispatch_res:
+                                notif_list.append({
+                                    "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
+                                    "message_id": d_res.get("message_id") or 0,
+                                    "event_id": fail_key,
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                    "head_ref_oid": current_head,
+                                })
 
         # B) Check merge conflicts
         mergeable = str(pr_details.get("mergeable") or "").upper()
@@ -1406,8 +1425,9 @@ def check_pr(
         if mergeable == "CONFLICTING" or merge_state == "DIRTY":
             conflict_key = f"conflict:{repo}#{pr_number}:{current_head}"
             if conflict_key not in seen_merge_conflicts:
-                seen_merge_conflicts.add(conflict_key)
-                if not seed_only:
+                if seed_only:
+                    seen_merge_conflicts.add(conflict_key)
+                else:
                     msg = format_merge_conflict_message(
                         repo=repo,
                         pr_number=pr_number,
@@ -1420,17 +1440,19 @@ def check_pr(
                         dry_run=dry_run,
                         is_agent_turn=True,
                     )
-                    stats["conflicts_notified"] += 1
-                    if not dry_run:
-                        notif_list = active_notifications.setdefault(pr_key, [])
-                        for d_res in dispatch_res:
-                            notif_list.append({
-                                "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
-                                "message_id": d_res.get("message_id") or 0,
-                                "event_id": conflict_key,
-                                "created_at": datetime.now(timezone.utc).isoformat(),
-                                "head_ref_oid": current_head,
-                            })
+                    if dry_run or dispatch_res:
+                        seen_merge_conflicts.add(conflict_key)
+                        stats["conflicts_notified"] += 1
+                        if not dry_run:
+                            notif_list = active_notifications.setdefault(pr_key, [])
+                            for d_res in dispatch_res:
+                                notif_list.append({
+                                    "channel_id": d_res.get("channel_id") or d_res.get("channel") or 0,
+                                    "message_id": d_res.get("message_id") or 0,
+                                    "event_id": conflict_key,
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                    "head_ref_oid": current_head,
+                                })
 
     # 6. Check and attempt auto-merge for whitelisted authors
     if not seed_only:

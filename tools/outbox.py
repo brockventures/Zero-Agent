@@ -213,12 +213,15 @@ def queue_outbox_message(
     dedupe_window: int = DEFAULT_DEDUPE_WINDOW_SECONDS,
     force: bool = False,
     msg_type: str = "text",
+    is_agent_turn: bool = False,
 ) -> dict:
     """
     Queue a message for asynchronous delivery to another Discord channel.
     Uses atomic append to durable pending.jsonl queue.
     Guarded by deduplication window (default 600s). Pass force=True to bypass.
     """
+    if is_agent_turn and msg_type == "text":
+        msg_type = "agent_turn"
     clean_name, ch_id = resolve_channel(channel)
     content = content.strip()
 
@@ -308,6 +311,7 @@ def queue_outbox_message(
         "content": content,
         "source": source_turn,
         "type": msg_type,
+        "is_agent_turn": bool(is_agent_turn or msg_type == "agent_turn"),
         "created_at": time.time(),
         "created_at_iso": datetime.now(timezone.utc).isoformat(),
         "status": "queued",
