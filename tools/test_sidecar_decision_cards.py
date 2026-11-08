@@ -708,3 +708,80 @@ class TestHearthWeeklySyncSchedule:
             )
             mock_channel.send.assert_called_once()
 
+
+# ==============================================================================
+# 8. DECISION CARD SHELL_CMD ALIAS & UNSUPPORTED HANDLER ROLLBACK TESTS
+# ==============================================================================
+
+class TestDecisionCardShellAliasesAndFailureRollback:
+    """Verifies shell_cmd/bash/cmd handler aliases execute cleanly and unsupported handlers transition to 'failed'."""
+
+    @pytest.mark.parametrize("alias", ["shell", "shell_cmd", "cmd", "bash"])
+    def test_execute_decision_card_shell_aliases_succeed(self, tmp_path, alias):
+        from tools.forge import init_forge_db, stage_decision, execute_decision_card, get_db_connection
+
+        db_path = tmp_path / "test_forge.db"
+        init_forge_db(db_path)
+
+        staged = stage_decision(
+            category="homelab_action",
+            title=f"Test {alias} alias",
+            summary="Verify shell alias execution",
+            handler_type=alias,
+            payload={"command": "echo hello_world_alias", "cwd": str(tmp_path)},
+            db_path=db_path,
+            post_to_discord=False,
+        )
+        assert staged["ok"] is True
+        dec_id = staged["decision_id"]
+
+        res = execute_decision_card(dec_id, db_path=db_path)
+        assert res["ok"] is True
+        assert res["status"] == "approved"
+        assert "hello_world_alias" in res["receipt"]
+        assert "✅" in res["formatted_card"]
+        assert res["formatted_embed"]["title"].startswith("✅")
+
+        with get_db_connection(db_path) as conn:
+            row = conn.execute(
+                "SELECT status, receipt_text FROM forge_decisions WHERE id = ? LIMIT 1",
+                (dec_id,),
+            ).fetchone()
+            assert row["status"] == "approved"
+            assert "hello_world_alias" in row["receipt_text"]
+
+    def test_execute_decision_card_unsupported_handler_marks_failed_not_stuck_executing(self, tmp_path):
+        from tools.forge import init_forge_db, stage_decision, execute_decision_card, get_db_connection
+
+        db_path = tmp_path / "test_forge.db"
+        init_forge_db(db_path)
+
+        staged = stage_decision(
+            category="homelab_action",
+            title="Unsupported Handler Test",
+            summary="Verify unsupported handler fails cleanly",
+            handler_type="unknown_magic_handler",
+            payload={"foo": "bar"},
+            db_path=db_path,
+            post_to_discord=False,
+        )
+        dec_id = staged["decision_id"]
+
+        res = execute_decision_card(dec_id, db_path=db_path)
+        assert res["ok"] is False
+        assert res["status"] == "failed"
+        assert "Unsupported handler_type: unknown_magic_handler" in res["receipt"]
+        assert "Unsupported handler_type: unknown_magic_handler" in res.get("error", "")
+        assert "❌" in res["formatted_card"]
+        assert res["formatted_embed"]["title"].startswith("❌")
+
+        with get_db_connection(db_path) as conn:
+            row = conn.execute(
+                "SELECT status, resolved_at, receipt_text FROM forge_decisions WHERE id = ? LIMIT 1",
+                (dec_id,),
+            ).fetchone()
+            assert row["status"] == "failed"
+            assert row["resolved_at"] is not None
+            assert "Unsupported handler_type: unknown_magic_handler" in row["receipt_text"]
+
+

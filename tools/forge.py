@@ -7297,7 +7297,7 @@ def list_jobs(limit: int = 15, db_path: Path | str = FORGE_DB_PATH) -> list[dict
 
 def _validate_decision_shell_payload(handler_type: str, payload: dict) -> tuple[bool, str]:
     """Pre-flight validate `shell` Decision Card payloads so malformed bash/python quoting fails at stage time rather than on Approve click."""
-    if handler_type != "shell":
+    if handler_type not in ("shell", "shell_cmd", "cmd", "bash"):
         return True, ""
     cmd = str(payload.get("command") or "").strip()
     if not cmd:
@@ -7362,7 +7362,7 @@ def _ensure_decision_action_clarity(
         service = p.get("service") or "service"
         act = p.get("action") or "up -d"
         action_text = f"Execute `docker compose {act} {service}`"
-    elif handler == "shell":
+    elif handler in ("shell", "shell_cmd", "cmd", "bash"):
         cmd = str(p.get("command") or "").strip()
         if p.get("action"):
             action_text = str(p["action"]).strip()
@@ -7772,7 +7772,7 @@ def execute_decision(
     receipt = ""
 
     try:
-        if handler == "shell":
+        if handler in ("shell", "shell_cmd", "cmd", "bash"):
             cmd = payload.get("command", "")
             cwd = payload.get("cwd", "/workspace")
             timeout_sec = int(payload.get("timeout", 180) or 180)
@@ -7857,27 +7857,30 @@ def execute_decision(
                     p_obj = WORKSPACE_DIR / p_obj
                 plan_data = json.loads(p_obj.read_text(encoding="utf-8"))
             if not isinstance(plan_data, dict):
-                return {"ok": False, "error": "forge_enqueue payload requires 'plan_file' or 'plan' dict."}
-            allow_overlap = bool(payload.get("allow_overlap", False))
-            enq_res = enqueue_build(
-                plan_data,
-                db_path=db_path,
-                post_widget=True,
-                allow_overlap=allow_overlap,
-                check_approval_gate=False,
-            )
-            ok = bool(enq_res.get("ok"))
-            if ok:
-                receipt = f"Enqueued FORGE build `{enq_res['build_id']}` ({enq_res.get('chunk_count', 1)} chunk(s)) in <#{FORGE_CHANNEL_ID}>"
+                ok = False
+                receipt = "forge_enqueue payload requires 'plan_file' or 'plan' dict."
             else:
-                receipt = f"FORGE enqueue failed: {enq_res.get('error', 'unknown error')}"
+                allow_overlap = bool(payload.get("allow_overlap", False))
+                enq_res = enqueue_build(
+                    plan_data,
+                    db_path=db_path,
+                    post_widget=True,
+                    allow_overlap=allow_overlap,
+                    check_approval_gate=False,
+                )
+                ok = bool(enq_res.get("ok"))
+                if ok:
+                    receipt = f"Enqueued FORGE build `{enq_res['build_id']}` ({enq_res.get('chunk_count', 1)} chunk(s)) in <#{FORGE_CHANNEL_ID}>"
+                else:
+                    receipt = f"FORGE enqueue failed: {enq_res.get('error', 'unknown error')}"
 
         elif handler in ("noop", "approval"):
             ok = True
             receipt = str(payload.get("receipt") or payload.get("note") or "Approved by Ryan")
 
         else:
-            return {"ok": False, "error": f"Unsupported handler_type: {handler}"}
+            ok = False
+            receipt = f"Unsupported handler_type: {handler}"
     except Exception as e:
         ok = False
         receipt = str(e)
@@ -7891,7 +7894,7 @@ def execute_decision(
         )
         updated_row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
 
-    return {
+    res_dict = {
         "ok": ok,
         "decision_id": decision_id,
         "handler_type": handler,
@@ -7901,6 +7904,12 @@ def execute_decision(
         "formatted_card": format_decision_card_text(updated_row) if updated_row else "",
         "formatted_embed": render_decision_card_embed(updated_row) if updated_row else {},
     }
+    if not ok:
+        res_dict["error"] = receipt
+    return res_dict
+
+
+execute_decision_card = execute_decision
 
 
 def dismiss_decision(
