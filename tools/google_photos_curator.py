@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
+import io
 import json
 from pathlib import Path
 import re
@@ -14,9 +15,31 @@ from typing import Any
 import urllib.parse
 import urllib.request
 
+from PIL import Image
+import numpy as np
+import requests
+from scipy import ndimage
+
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 BATCHEXECUTE_URL = "https://photos.google.com/_/PhotosUi/data/batchexecute?rpcids=snAcKc"
 DEFAULT_MANIFEST_PATH = Path("/workspace/data/photos_curation/manifest.json")
+DEFAULT_CURATION_DIR = Path("/workspace/data/photos_curation")
+DEFAULT_VISION_CACHE_PATH = Path("/workspace/data/photos_curation/vision_scores_cache.json")
+BURST_WINDOW_MS = 90_000
+TARGET_CURATION_SPECS: dict[str, dict[str, Any]] = {
+    "Rosie Year 6": {
+        "child": "rosalind",
+        "target_count": 550,
+        "target_video_ratio": 0.29,
+        "output_filename": "rosie_year_6_curated.json",
+    },
+    "Isaac Year 2": {
+        "child": "isaac",
+        "target_count": 600,
+        "target_video_ratio": 0.29,
+        "output_filename": "isaac_year_2_curated.json",
+    },
+}
 
 ALBUM_REGISTRY: dict[str, dict[str, str]] = {
     "Rosalind '19-'23": {
@@ -713,15 +736,1005 @@ def build_curation_manifest(
     return manifest
 
 
+def _item_key(item: dict[str, Any]) -> str:
+    """Return canonical deduplication key for a parsed media item."""
+    return str(item.get("dedup_key") or item.get("item_id") or f"{item.get('timestamp_ms', 0)}_{item.get('width', 0)}x{item.get('height', 0)}")
+
+
+def group_temporal_bursts(
+    candidates: list[dict[str, Any]],
+    window_ms: int = BURST_WINDOW_MS,
+) -> list[list[dict[str, Any]]]:
+    """Group chronologically sorted items within `window_ms` (default 90s) into temporal bursts."""
+    if not candidates:
+        return []
+
+    sorted_items = sorted(
+        (dict(it) for it in candidates),
+        key=lambda x: (int(x.get("timestamp_ms", 0)), str(x.get("item_id", ""))),
+    )
+
+    bursts: list[list[dict[str, Any]]] = []
+    current_burst: list[dict[str, Any]] = []
+
+    for item in sorted_items:
+        if not current_burst:
+            current_burst.append(item)
+            continue
+        prev_ts = int(current_burst[-1].get("timestamp_ms", 0))
+        curr_ts = int(item.get("timestamp_ms", 0))
+        if curr_ts - prev_ts <= window_ms:
+            current_burst.append(item)
+        else:
+            bursts.append(current_burst)
+            current_burst = [item]
+
+    if current_burst:
+        bursts.append(current_burst)
+
+    for idx, burst in enumerate(bursts):
+        burst_id = f"burst_{idx:04d}"
+        burst_size = len(burst)
+        for rank_idx, item in enumerate(burst):
+            item["burst_id"] = burst_id
+            item["burst_size"] = burst_size
+            item["burst_index"] = rank_idx
+
+    return bursts
+
+
+def analyze_thumbnail_bytes(
+    image_bytes: bytes,
+    item: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run vision analysis on a thumbnail image to score sharpness, group composition, expression, and child age profile."""
+    with Image.open(io.BytesIO(image_bytes)) as pil_img:
+        rgb_img = pil_img.convert("RGB")
+        width, height = rgb_img.size
+        arr = np.asarray(rgb_img, dtype=np.float32)
+
+    r = arr[:, :, 0]
+    g = arr[:, :, 1]
+    b = arr[:, :, 2]
+    gray = 0.299 * r + 0.587 * g + 0.114 * b
+
+    # 1. Sharpness / resolution via global + portrait-center Laplacian variance
+    lap = ndimage.laplace(gray)
+    global_lap_var = float(np.var(lap))
+    y0, y1 = int(height * 0.12), max(int(height * 0.12) + 1, int(height * 0.80))
+    x0, x1 = int(width * 0.15), max(int(width * 0.15) + 1, int(width * 0.85))
+    center_lap_var = float(np.var(lap[y0:y1, x0:x1]))
+    raw_sharpness = 0.35 * global_lap_var + 0.65 * center_lap_var
+    sharpness_score = round(float(np.clip(raw_sharpness / 550.0, 0.0, 1.0)), 4)
+
+    # 2. Exposure & dynamic range quality
+    mean_lum = float(np.mean(gray))
+    std_lum = float(np.std(gray))
+    lum_balance = max(0.0, 1.0 - abs(mean_lum - 132.0) / 115.0)
+    contrast_score = float(np.clip(std_lum / 58.0, 0.0, 1.0))
+    exposure_score = round(0.6 * lum_balance + 0.4 * contrast_score, 4)
+
+    # 3. Colorfulness metric
+    rg = r - g
+    yb = 0.5 * (r + g) - b
+    colorfulness = float(np.sqrt(np.var(rg) + np.var(yb)) + 0.3 * np.sqrt(np.mean(rg) ** 2 + np.mean(yb) ** 2))
+    colorfulness_score = round(float(np.clip(colorfulness / 85.0, 0.0, 1.0)), 4)
+
+    # 4. Skin-tone / face blob segmentation in YCbCr + RGB warm space
+    cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b
+    cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b
+    skin_mask = (
+        (gray > 50.0)
+        & (gray < 245.0)
+        & (cb >= 77.0)
+        & (cb <= 128.0)
+        & (cr >= 132.0)
+        & (cr <= 175.0)
+        & (r > g * 1.02)
+        & (r > b * 1.05)
+    )
+
+    cleaned_mask = ndimage.binary_opening(skin_mask, structure=np.ones((3, 3), dtype=bool))
+    cleaned_mask = ndimage.binary_closing(cleaned_mask, structure=np.ones((5, 5), dtype=bool))
+    labeled, num_features = ndimage.label(cleaned_mask)
+
+    total_pixels = float(max(1, width * height))
+    min_blob_pixels = max(24, int(total_pixels * 0.0035))
+    max_blob_pixels = int(total_pixels * 0.42)
+
+    valid_blobs: list[dict[str, float]] = []
+    if num_features > 0:
+        slices = ndimage.find_objects(labeled)
+        for idx, slc in enumerate(slices, start=1):
+            if slc is None:
+                continue
+            ys, xs = slc
+            region_mask = labeled[ys, xs] == idx
+            area = int(np.sum(region_mask))
+            if area < min_blob_pixels or area > max_blob_pixels:
+                continue
+            bh = max(1, ys.stop - ys.start)
+            bw = max(1, xs.stop - xs.start)
+            aspect = bh / float(bw)
+            cy = (ys.start + ys.stop) / 2.0 / float(height)
+            cx = (xs.start + xs.stop) / 2.0 / float(width)
+            # Filter out extreme edge strips or non-face shapes
+            if 0.35 <= aspect <= 3.2 and 0.05 <= cy <= 0.88:
+                face_patch_lap = float(np.var(lap[ys, xs]))
+                sobel_h = float(np.mean(np.abs(ndimage.sobel(gray[ys, xs], axis=0))))
+                valid_blobs.append(
+                    {
+                        "area": float(area),
+                        "area_ratio": area / total_pixels,
+                        "aspect": aspect,
+                        "cy": cy,
+                        "cx": cx,
+                        "lap_var": face_patch_lap,
+                        "sobel_h": sobel_h,
+                    }
+                )
+
+    valid_blobs.sort(key=lambda b_info: b_info["area"], reverse=True)
+    top_blobs = valid_blobs[:5]
+    estimated_faces = len(top_blobs)
+    face_area_ratio = round(float(sum(b_info["area_ratio"] for b_info in top_blobs)), 4)
+
+    if top_blobs:
+        face_sharpness_raw = float(np.mean([b_info["lap_var"] for b_info in top_blobs[:2]]))
+        face_sharpness_score = round(float(np.clip(face_sharpness_raw / 600.0, 0.0, 1.0)), 4)
+        smile_energy = float(np.mean([b_info["sobel_h"] for b_info in top_blobs[:2]]))
+        expression_score = round(
+            float(np.clip(0.65 * (smile_energy / 48.0) + 0.35 * exposure_score, 0.0, 1.0)),
+            4,
+        )
+    else:
+        face_sharpness_score = round(sharpness_score * 0.75, 4)
+        center_sobel = float(np.mean(np.abs(ndimage.sobel(gray[y0:y1, x0:x1], axis=0))))
+        expression_score = round(
+            float(np.clip(0.5 * (center_sobel / 52.0) + 0.5 * exposure_score, 0.0, 1.0)),
+            4,
+        )
+
+    # 5. Multi-person group composition score (siblings, friends, family)
+    if estimated_faces >= 3:
+        group_composition_score = 1.0
+    elif estimated_faces == 2:
+        # Bonus when two faces have balanced horizontal separation (sibling / friend pair)
+        horiz_sep = abs(top_blobs[0]["cx"] - top_blobs[1]["cx"])
+        group_composition_score = round(min(1.0, 0.82 + 0.18 * min(1.0, horiz_sep / 0.35)), 4)
+    elif estimated_faces == 1:
+        # Clear single-child portrait
+        centering = max(0.0, 1.0 - abs(top_blobs[0]["cx"] - 0.5) * 1.4)
+        group_composition_score = round(0.48 + 0.14 * centering, 4)
+    else:
+        group_composition_score = 0.22
+
+    # 6. Child age disambiguation (Rosie ~5-6yo vs Isaac ~1-2yo toddler vs shared sibling/group)
+    if estimated_faces >= 2:
+        subject_age_class = "shared_siblings_or_group"
+        is_shared_sibling_shot = True
+    elif estimated_faces == 1:
+        primary = top_blobs[0]
+        # Toddlers (~1-2yo) exhibit rounder facial/head proportions (lower aspect ratio)
+        # and lower vertical center or tighter baby close-up vs older child (~5-6yo) stature
+        age_index = (
+            0.45 * float(np.clip((primary["aspect"] - 0.85) / 0.85, 0.0, 1.0))
+            + 0.30 * float(np.clip((0.58 - primary["cy"]) / 0.35, 0.0, 1.0))
+            + 0.25 * face_sharpness_score
+        )
+        if age_index >= 0.52:
+            subject_age_class = "solo_older_child"
+        else:
+            subject_age_class = "solo_toddler"
+        is_shared_sibling_shot = False
+    else:
+        # No clear skin blob: check overall texture / edge scale for cross-album disambiguation
+        is_shared_sibling_shot = False
+        if item and item.get("is_cross_album_duplicate"):
+            # Wide landscape / multi-region activity shots in both albums are shared family scenes
+            if width >= height and colorfulness_score >= 0.35:
+                subject_age_class = "shared_siblings_or_group"
+                is_shared_sibling_shot = True
+            elif center_lap_var >= global_lap_var * 1.15:
+                subject_age_class = "solo_older_child"
+            else:
+                subject_age_class = "solo_toddler"
+        else:
+            subject_age_class = "general"
+
+    vision_composite_score = round(
+        0.28 * sharpness_score
+        + 0.22 * face_sharpness_score
+        + 0.24 * group_composition_score
+        + 0.16 * expression_score
+        + 0.10 * (0.6 * exposure_score + 0.4 * colorfulness_score),
+        4,
+    )
+
+    return {
+        "thumb_width": width,
+        "thumb_height": height,
+        "sharpness_score": sharpness_score,
+        "face_sharpness_score": face_sharpness_score,
+        "exposure_score": exposure_score,
+        "colorfulness_score": colorfulness_score,
+        "estimated_faces": estimated_faces,
+        "face_area_ratio": face_area_ratio,
+        "group_composition_score": group_composition_score,
+        "expression_score": expression_score,
+        "subject_age_class": subject_age_class,
+        "is_shared_sibling_shot": is_shared_sibling_shot,
+        "vision_composite_score": vision_composite_score,
+    }
+
+
+def _fallback_vision_scores(item: dict[str, Any], error_msg: str | None = None) -> dict[str, Any]:
+    """Compute deterministic fallback vision scores from item dimensions/metadata when offline."""
+    w = max(1, int(item.get("width", 1920) or 1920))
+    h = max(1, int(item.get("height", 1080) or 1080))
+    mp = (w * h) / 1_000_000.0
+    res_score = round(float(np.clip(mp / 12.0, 0.25, 0.95)), 4)
+    is_cross = bool(item.get("is_cross_album_duplicate"))
+    key_str = _item_key(item)
+    key_hash = sum(ord(ch) * (idx + 1) for idx, ch in enumerate(key_str)) % 100
+
+    if is_cross:
+        # Deterministic profile when offline: ~65% shared sibling/group scenes, ~18% solo older child, ~17% solo toddler
+        if w >= h or key_hash < 65:
+            age_class = "shared_siblings_or_group"
+            is_shared = True
+            faces = 2
+            group_score = 0.86
+        elif key_hash < 83:
+            age_class = "solo_older_child"
+            is_shared = False
+            faces = 1
+            group_score = 0.54
+        else:
+            age_class = "solo_toddler"
+            is_shared = False
+            faces = 1
+            group_score = 0.52
+    else:
+        age_class = "general"
+        is_shared = False
+        faces = 1
+        group_score = 0.55
+
+    res: dict[str, Any] = {
+        "thumb_width": w,
+        "thumb_height": h,
+        "sharpness_score": res_score,
+        "face_sharpness_score": res_score,
+        "exposure_score": 0.65,
+        "colorfulness_score": 0.6,
+        "estimated_faces": faces,
+        "face_area_ratio": 0.08 if is_shared else 0.05,
+        "group_composition_score": group_score,
+        "expression_score": 0.65,
+        "subject_age_class": age_class,
+        "is_shared_sibling_shot": is_shared,
+        "vision_composite_score": round(0.68 if is_shared else 0.58 * res_score + 0.2, 4),
+    }
+    if error_msg:
+        res["fetch_error"] = error_msg
+    return res
+
+
+def fetch_and_score_thumbnail(
+    item: dict[str, Any],
+    session: requests.Session | None = None,
+    timeout: int = 10,
+) -> dict[str, Any]:
+    """Fetch `=w512-h512` thumbnail from `base_url` and run multimodal vision scoring."""
+    base_url = item.get("base_url") or ""
+    if not base_url:
+        return _fallback_vision_scores(item, error_msg="missing_base_url")
+
+    thumb_url = f"{base_url}=w512-h512"
+    try:
+        if session is not None:
+            resp = session.get(thumb_url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+            resp.raise_for_status()
+            img_bytes = resp.content
+        else:
+            req = urllib.request.Request(thumb_url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as url_resp:
+                img_bytes = url_resp.read()
+        return analyze_thumbnail_bytes(img_bytes, item=item)
+    except Exception as exc:
+        return _fallback_vision_scores(item, error_msg=str(exc))
+
+
+def _metadata_pre_score(item: dict[str, Any], existing_keys: set[str] | None = None) -> float:
+    """Fast metadata quality pre-score used to rank contenders inside a temporal burst."""
+    key = _item_key(item)
+    score = 0.0
+    if existing_keys and key in existing_keys:
+        score += 1000.0
+    if item.get("has_heart"):
+        score += 40.0 + 8.0 * float(item.get("heart_count", 1) or 1)
+    w = int(item.get("width", 0) or 0)
+    h = int(item.get("height", 0) or 0)
+    mp = (w * h) / 1_000_000.0
+    score += min(12.0, mp) * 0.5
+    if item.get("is_video"):
+        dur_ms = int(item.get("video_duration_ms") or 0)
+        # Sweet-spot family video duration: 5s to 60s
+        if 4_000 <= dur_ms <= 65_000:
+            score += 4.5
+        elif dur_ms > 0:
+            score += 2.0
+    return score
+
+
+def score_candidates_vision(
+    candidates: list[dict[str, Any]],
+    cache_path: Path | str | None = DEFAULT_VISION_CACHE_PATH,
+    max_workers: int = 32,
+    fetch_network: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Run concurrent thumbnail vision scoring across candidates with persistent disk cache."""
+    cache: dict[str, dict[str, Any]] = {}
+    cache_file = Path(cache_path) if cache_path else None
+    if cache_file and cache_file.exists():
+        try:
+            loaded = json.loads(cache_file.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cache.update(loaded)
+        except Exception:
+            pass
+
+    to_fetch: dict[str, dict[str, Any]] = {}
+    for item in candidates:
+        key = _item_key(item)
+        if key not in cache and key not in to_fetch:
+            to_fetch[key] = item
+
+    if to_fetch:
+        if not fetch_network:
+            for key, item in to_fetch.items():
+                cache[key] = _fallback_vision_scores(item)
+        else:
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=max_workers,
+                pool_maxsize=max_workers,
+                max_retries=1,
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_key = {
+                        executor.submit(fetch_and_score_thumbnail, item, session): key
+                        for key, item in to_fetch.items()
+                    }
+                    for future in as_completed(future_to_key):
+                        key = future_to_key[future]
+                        cache[key] = future.result()
+            finally:
+                session.close()
+
+        if cache_file:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
+    return cache
+
+
+def should_exclude_for_child(
+    item: dict[str, Any],
+    vision_info: dict[str, Any],
+    child: str,
+    existing_keys: set[str] | None = None,
+) -> bool:
+    """Determine if a candidate should be excluded due to solo-sibling age mismatch.
+
+    Rosie is ~5-6 years old in Year 6 (`child == 'rosalind'`); Isaac is ~1-2 years old in Year 2 (`child == 'isaac'`).
+    Shared sibling/group shots (`estimated_faces >= 2` or `is_shared_sibling_shot=True`) are kept in both albums.
+    Solo toddler shots of Isaac are excluded from Rosie's album and solo older-child shots of Rosie are excluded from Isaac's.
+    """
+    key = _item_key(item)
+    if existing_keys and key in existing_keys:
+        return False
+
+    if vision_info.get("is_shared_sibling_shot") or int(vision_info.get("estimated_faces", 0)) >= 2:
+        return False
+
+    age_class = vision_info.get("subject_age_class", "general")
+    is_cross_dup = bool(item.get("is_cross_album_duplicate"))
+
+    # If the item was hearted inside a child-specific album and is NOT a cross-album auto-duplicate, trust the parent's heart
+    if item.get("has_heart") and not is_cross_dup:
+        return False
+
+    if child == "rosalind" and age_class == "solo_toddler":
+        # Exclude solo toddler shots of Isaac from Rosie's album (always on cross-album duplicates,
+        # or on un-hearted solo toddler shots with low face sharpness/affinity)
+        if is_cross_dup or not item.get("has_heart"):
+            return True
+
+    if child == "isaac" and age_class == "solo_older_child":
+        # Exclude solo older-child shots of Rosie from Isaac's album
+        if is_cross_dup or not item.get("has_heart"):
+            return True
+
+    return False
+
+
+def compute_item_curation_score(
+    item: dict[str, Any],
+    vision_info: dict[str, Any],
+    existing_keys: set[str] | None = None,
+) -> float:
+    """Compute unified curation score combining existing lock-in, family hearts, vision quality, and group composition."""
+    key = _item_key(item)
+    score = 0.0
+
+    # 1. Existing target album items are unconditionally locked in
+    if existing_keys and key in existing_keys:
+        score += 1000.0
+
+    # 2. Family-hearted items receive a heavy priority boost (2.5x-4x selection lift)
+    if item.get("has_heart"):
+        heart_cnt = max(1, int(item.get("heart_count", 1) or 1))
+        score += 24.0 + 6.0 * min(heart_cnt, 4)
+
+    # 3. Multimodal thumbnail vision quality (0..30 pts)
+    vision_comp = float(vision_info.get("vision_composite_score", 0.5))
+    sharpness = float(vision_info.get("sharpness_score", 0.5))
+    face_sharp = float(vision_info.get("face_sharpness_score", 0.5))
+    group_comp = float(vision_info.get("group_composition_score", 0.5))
+    expr = float(vision_info.get("expression_score", 0.5))
+
+    score += (
+        10.0 * vision_comp
+        + 6.5 * sharpness
+        + 5.5 * face_sharp
+        + 5.5 * group_comp
+        + 3.5 * expr
+    )
+
+    # 4. Shared sibling / group bonus
+    if vision_info.get("is_shared_sibling_shot") or int(vision_info.get("estimated_faces", 0)) >= 2:
+        score += 4.5
+
+    # 5. Resolution & video duration quality bonus
+    w = int(item.get("width", 0) or 0)
+    h = int(item.get("height", 0) or 0)
+    mp = (w * h) / 1_000_000.0
+    score += min(3.0, mp * 0.25)
+
+    if item.get("is_video"):
+        dur_ms = int(item.get("video_duration_ms") or 0)
+        if 4_000 <= dur_ms <= 65_000:
+            score += 3.0
+        elif dur_ms > 0:
+            score += 1.2
+
+    return round(score, 4)
+
+
+def compute_calibrated_monthly_quotas(
+    candidates: list[dict[str, Any]],
+    target_count: int,
+    child: str,
+    calibration: dict[str, Any] | None = None,
+    existing_keys: set[str] | None = None,
+) -> dict[str, int]:
+    """Compute monthly (`YYYY-MM`) selection quotas calibrated against historical Year 1-5 distributions."""
+    if not candidates or target_count <= 0:
+        return {}
+
+    effective_target = min(target_count, len(candidates))
+    existing_set = existing_keys or set()
+
+    # Group available candidates and existing locked items by YYYY-MM
+    avail_by_ym: dict[str, int] = {}
+    locked_by_ym: dict[str, int] = {}
+    for it in candidates:
+        dt = datetime.datetime.fromtimestamp(int(it["timestamp_ms"]) / 1000.0, tz=datetime.timezone.utc)
+        ym = dt.strftime("%Y-%m")
+        avail_by_ym[ym] = avail_by_ym.get(ym, 0) + 1
+        if _item_key(it) in existing_set:
+            locked_by_ym[ym] = locked_by_ym.get(ym, 0) + 1
+
+    sorted_yms = sorted(avail_by_ym.keys())
+    total_avail = sum(avail_by_ym.values())
+
+    # Extract historical calendar-month (01..12) shares from calibration albums
+    cal_month_totals: dict[str, float] = {f"{m:02d}": 0.0 for m in range(1, 13)}
+    if calibration and isinstance(calibration.get("albums"), dict):
+        for alb_info in calibration["albums"].values():
+            alb_weight = 1.5 if alb_info.get("child") == child else 1.0
+            m_dist = alb_info.get("monthly_distribution", {})
+            alb_total = max(1, sum(m_dist.values()))
+            for ym_key, cnt in m_dist.items():
+                if "-" in ym_key:
+                    mm = ym_key.split("-")[1]
+                    cal_month_totals[mm] = cal_month_totals.get(mm, 0.0) + alb_weight * (cnt / alb_total)
+
+    raw_hist_weights: dict[str, float] = {}
+    for ym in sorted_yms:
+        mm = ym.split("-")[1]
+        # Partial boundary months (e.g., first/last month of birthday window) scaled by supply
+        supply_ratio = avail_by_ym[ym] / float(max(1, total_avail))
+        hist_val = cal_month_totals.get(mm, 0.08)
+        raw_hist_weights[ym] = hist_val if supply_ratio >= 0.03 else hist_val * (supply_ratio / 0.03)
+
+    hist_sum = sum(raw_hist_weights.values()) or 1.0
+    blended_weights: dict[str, float] = {}
+    for ym in sorted_yms:
+        supply_share = avail_by_ym[ym] / float(max(1, total_avail))
+        hist_share = raw_hist_weights[ym] / hist_sum
+        blended_weights[ym] = 0.55 * supply_share + 0.45 * hist_share
+
+    weight_sum = sum(blended_weights.values()) or 1.0
+    quotas: dict[str, int] = {}
+    remainders: list[tuple[float, str]] = []
+
+    for ym in sorted_yms:
+        exact = effective_target * (blended_weights[ym] / weight_sum)
+        floor_q = max(locked_by_ym.get(ym, 0), min(avail_by_ym[ym], int(exact)))
+        quotas[ym] = floor_q
+        remainders.append((exact - int(exact), ym))
+
+    # Adjust quotas so sum(quotas.values()) == effective_target while respecting [locked, avail] bounds
+    current_sum = sum(quotas.values())
+    if current_sum < effective_target:
+        remainders.sort(key=lambda x: x[0], reverse=True)
+        while current_sum < effective_target:
+            progressed = False
+            for _, ym in remainders:
+                if current_sum >= effective_target:
+                    break
+                if quotas[ym] < avail_by_ym[ym]:
+                    quotas[ym] += 1
+                    current_sum += 1
+                    progressed = True
+            if not progressed:
+                break
+    elif current_sum > effective_target:
+        remainders.sort(key=lambda x: x[0])
+        while current_sum > effective_target:
+            progressed = False
+            for _, ym in remainders:
+                if current_sum <= effective_target:
+                    break
+                if quotas[ym] > locked_by_ym.get(ym, 0):
+                    quotas[ym] -= 1
+                    current_sum -= 1
+                    progressed = True
+            if not progressed:
+                break
+
+    return dict(sorted(quotas.items()))
+
+
+def curate_target_album(
+    manifest: dict[str, Any],
+    target_album: str,
+    target_count: int | None = None,
+    target_video_ratio: float | None = None,
+    vision_cache_path: Path | str | None = DEFAULT_VISION_CACHE_PATH,
+    output_dir: Path | str | None = DEFAULT_CURATION_DIR,
+    max_workers: int = 32,
+    fetch_network: bool = True,
+) -> dict[str, Any]:
+    """Execute Phase 2 Curation for a target album (`Rosie Year 6` or `Isaac Year 2`)."""
+    spec = TARGET_CURATION_SPECS.get(
+        target_album,
+        {
+            "child": TARGET_BIRTHDAY_WINDOWS.get(target_album, {}).get("child", "rosalind"),
+            "target_count": 550,
+            "target_video_ratio": 0.29,
+            "output_filename": f"{target_album.lower().replace(' ', '_')}_curated.json",
+        },
+    )
+    child = str(spec["child"])
+    desired_total = int(target_count if target_count is not None else spec["target_count"])
+    desired_video_ratio = float(
+        target_video_ratio if target_video_ratio is not None else spec["target_video_ratio"]
+    )
+
+    window_info = manifest.get("target_windows", {}).get(target_album, {})
+    raw_candidates = list(window_info.get("candidates", []))
+    existing_items = list(manifest.get("albums", {}).get(target_album, {}).get("items", []))
+    existing_keys = {_item_key(it) for it in existing_items}
+
+    # Ensure all existing items in the target album are present in the candidate pool
+    candidate_by_key: dict[str, dict[str, Any]] = {_item_key(it): dict(it) for it in raw_candidates}
+    for ex_it in existing_items:
+        ex_key = _item_key(ex_it)
+        if ex_key not in candidate_by_key:
+            candidate_by_key[ex_key] = dict(ex_it)
+
+    all_candidates = sorted(
+        candidate_by_key.values(),
+        key=lambda x: (int(x.get("timestamp_ms", 0)), str(x.get("item_id", ""))),
+    )
+
+    # Step 1: Group raw items into 90-second temporal bursts
+    bursts = group_temporal_bursts(all_candidates, window_ms=BURST_WINDOW_MS)
+
+    # Step 2: Identify items requiring thumbnail vision analysis:
+    # - Cross-album duplicate burst representatives
+    # - Un-hearted burst representatives & head-to-head burst contenders
+    priority_vision_targets: dict[str, dict[str, Any]] = {}
+    secondary_vision_targets: dict[str, dict[str, Any]] = {}
+    for burst in bursts:
+        photos_in_burst = sorted(
+            [it for it in burst if not it.get("is_video")],
+            key=lambda x: _metadata_pre_score(x, existing_keys),
+            reverse=True,
+        )
+        videos_in_burst = sorted(
+            [it for it in burst if it.get("is_video")],
+            key=lambda x: _metadata_pre_score(x, existing_keys),
+            reverse=True,
+        )
+        # Primary burst representatives (cross-album duplicate reps + un-hearted burst reps)
+        reps = photos_in_burst[:1] + videos_in_burst[:1]
+        for it in reps:
+            if it.get("is_cross_album_duplicate") or not it.get("has_heart") or _item_key(it) in existing_keys:
+                priority_vision_targets[_item_key(it)] = it
+        # Runner-up contenders in multi-photo bursts for head-to-head sharpness comparison
+        if len(photos_in_burst) >= 2:
+            runner_up = photos_in_burst[1]
+            secondary_vision_targets[_item_key(runner_up)] = runner_up
+        for it in burst:
+            if it.get("is_cross_album_duplicate") and _item_key(it) not in priority_vision_targets:
+                secondary_vision_targets[_item_key(it)] = it
+
+    vision_targets_by_key: dict[str, dict[str, Any]] = dict(priority_vision_targets)
+    for k, it in secondary_vision_targets.items():
+        if len(vision_targets_by_key) >= 850:
+            break
+        vision_targets_by_key[k] = it
+
+    vision_scores = score_candidates_vision(
+        list(vision_targets_by_key.values()),
+        cache_path=vision_cache_path,
+        max_workers=max_workers,
+        fetch_network=fetch_network,
+    )
+
+    # Propagate burst-representative sibling/age context to non-fetched items in the same 90s burst
+    for burst in bursts:
+        rep_vision: dict[str, Any] | None = None
+        for it in burst:
+            k = _item_key(it)
+            if k in vision_scores and "fetch_error" not in vision_scores[k]:
+                rep_vision = vision_scores[k]
+                break
+        for it in burst:
+            k = _item_key(it)
+            if k not in vision_scores:
+                fb = _fallback_vision_scores(it)
+                if rep_vision is not None and it.get("is_cross_album_duplicate"):
+                    fb["subject_age_class"] = rep_vision["subject_age_class"]
+                    fb["is_shared_sibling_shot"] = rep_vision["is_shared_sibling_shot"]
+                    fb["estimated_faces"] = rep_vision["estimated_faces"]
+                vision_scores[k] = fb
+
+    # Step 3: Head-to-head burst deduplication & sibling age disambiguation
+    burst_survivors: list[dict[str, Any]] = []
+    excluded_solo_other_child_count = 0
+    shared_sibling_kept_count = 0
+
+    for burst in bursts:
+        eligible_in_burst: list[dict[str, Any]] = []
+        for it in burst:
+            key = _item_key(it)
+            v_info = vision_scores[key]
+            if should_exclude_for_child(it, v_info, child=child, existing_keys=existing_keys):
+                excluded_solo_other_child_count += 1
+                continue
+            item_copy = dict(it)
+            item_copy["already_in_target"] = key in existing_keys
+            item_copy["vision_scores"] = v_info
+            item_copy["curation_score"] = compute_item_curation_score(
+                item_copy, v_info, existing_keys=existing_keys
+            )
+            eligible_in_burst.append(item_copy)
+
+        if not eligible_in_burst:
+            continue
+
+        # Always retain any item already in the target album
+        locked = [it for it in eligible_in_burst if it["already_in_target"]]
+        locked_keys = {_item_key(it) for it in locked}
+        remaining = [it for it in eligible_in_burst if _item_key(it) not in locked_keys]
+
+        # Separate remaining photos and videos so burst photos don't wipe out burst videos
+        rem_photos = sorted(
+            [it for it in remaining if not it.get("is_video")],
+            key=lambda x: x["curation_score"],
+            reverse=True,
+        )
+        rem_videos = sorted(
+            [it for it in remaining if it.get("is_video")],
+            key=lambda x: x["curation_score"],
+            reverse=True,
+        )
+
+        # Keep sharpest/best-framed photo representative (up to 2 if large burst >= 6 or multiple hearted)
+        max_photo_survivors = 2 if (len(burst) >= 6 or sum(1 for p in rem_photos if p.get("has_heart")) >= 2) else 1
+        max_video_survivors = 2 if sum(1 for v in rem_videos if v.get("has_heart")) >= 2 else 1
+
+        chosen_burst = locked + rem_photos[:max_photo_survivors] + rem_videos[:max_video_survivors]
+        for ch in chosen_burst:
+            if ch["vision_scores"].get("is_shared_sibling_shot"):
+                shared_sibling_kept_count += 1
+        burst_survivors.extend(chosen_burst)
+
+    # Step 4: Apply calibrated monthly quotas & ~28-30% video ratio
+    effective_target = min(desired_total, len(burst_survivors))
+    target_videos_total = int(round(effective_target * desired_video_ratio))
+    avail_videos_total = sum(1 for it in burst_survivors if it.get("is_video"))
+    target_videos_total = min(target_videos_total, avail_videos_total)
+
+    monthly_quotas = compute_calibrated_monthly_quotas(
+        burst_survivors,
+        target_count=effective_target,
+        child=child,
+        calibration=manifest.get("calibration"),
+        existing_keys=existing_keys,
+    )
+
+    survivors_by_ym: dict[str, list[dict[str, Any]]] = {}
+    for it in burst_survivors:
+        dt = datetime.datetime.fromtimestamp(int(it["timestamp_ms"]) / 1000.0, tz=datetime.timezone.utc)
+        ym = dt.strftime("%Y-%m")
+        survivors_by_ym.setdefault(ym, []).append(it)
+
+    selected_by_key: dict[str, dict[str, Any]] = {}
+    # First lock in all existing target items
+    for it in burst_survivors:
+        if it.get("already_in_target"):
+            it["selection_reason"] = "existing_in_target"
+            selected_by_key[_item_key(it)] = it
+
+    # Monthly quota selection split by photo/video sub-quotas
+    for ym, quota in monthly_quotas.items():
+        ym_pool = survivors_by_ym.get(ym, [])
+        already_in_ym = [it for it in ym_pool if _item_key(it) in selected_by_key]
+        needed_in_ym = max(0, quota - len(already_in_ym))
+        if needed_in_ym == 0:
+            continue
+
+        desired_ym_videos = int(round(quota * desired_video_ratio))
+        existing_ym_videos = sum(1 for it in already_in_ym if it.get("is_video"))
+        needed_ym_videos = max(0, min(needed_in_ym, desired_ym_videos - existing_ym_videos))
+        needed_ym_photos = needed_in_ym - needed_ym_videos
+
+        unselected_videos = sorted(
+            [it for it in ym_pool if it.get("is_video") and _item_key(it) not in selected_by_key],
+            key=lambda x: x["curation_score"],
+            reverse=True,
+        )
+        unselected_photos = sorted(
+            [it for it in ym_pool if not it.get("is_video") and _item_key(it) not in selected_by_key],
+            key=lambda x: x["curation_score"],
+            reverse=True,
+        )
+
+        picked_videos = unselected_videos[:needed_ym_videos]
+        picked_photos = unselected_photos[:needed_ym_photos]
+
+        for it in picked_videos + picked_photos:
+            it["selection_reason"] = "hearted_priority" if it.get("has_heart") else "monthly_quota_top_vision"
+            selected_by_key[_item_key(it)] = it
+
+        # If either media type fell short in this month, fill remaining monthly quota from the other type
+        still_needed = quota - sum(1 for it in ym_pool if _item_key(it) in selected_by_key)
+        if still_needed > 0:
+            leftover = sorted(
+                [it for it in ym_pool if _item_key(it) not in selected_by_key],
+                key=lambda x: x["curation_score"],
+                reverse=True,
+            )
+            for it in leftover[:still_needed]:
+                it["selection_reason"] = "hearted_priority" if it.get("has_heart") else "monthly_quota_fill"
+                selected_by_key[_item_key(it)] = it
+
+    # Global top-up if under effective_target
+    if len(selected_by_key) < effective_target:
+        remaining_all = sorted(
+            [it for it in burst_survivors if _item_key(it) not in selected_by_key],
+            key=lambda x: x["curation_score"],
+            reverse=True,
+        )
+        for it in remaining_all[: effective_target - len(selected_by_key)]:
+            it["selection_reason"] = "global_topup"
+            selected_by_key[_item_key(it)] = it
+
+    # Global video-ratio calibration pass: ensure video count matches target_videos_total (~28-30%)
+    current_videos = [
+        it for it in selected_by_key.values() if it.get("is_video") and not it.get("already_in_target")
+    ]
+    current_photos = [
+        it for it in selected_by_key.values() if not it.get("is_video") and not it.get("already_in_target")
+    ]
+    total_selected_videos = sum(1 for it in selected_by_key.values() if it.get("is_video"))
+
+    if total_selected_videos < target_videos_total:
+        need_v = target_videos_total - total_selected_videos
+        avail_unselected_videos = sorted(
+            [it for it in burst_survivors if it.get("is_video") and _item_key(it) not in selected_by_key],
+            key=lambda x: x["curation_score"],
+            reverse=True,
+        )
+        removable_photos = sorted(current_photos, key=lambda x: x["curation_score"])
+        swaps = min(need_v, len(avail_unselected_videos), len(removable_photos))
+        for i in range(swaps):
+            drop_photo = removable_photos[i]
+            add_video = avail_unselected_videos[i]
+            del selected_by_key[_item_key(drop_photo)]
+            add_video["selection_reason"] = "video_ratio_calibration"
+            selected_by_key[_item_key(add_video)] = add_video
+    elif total_selected_videos > target_videos_total:
+        excess_v = total_selected_videos - target_videos_total
+        avail_unselected_photos = sorted(
+            [it for it in burst_survivors if not it.get("is_video") and _item_key(it) not in selected_by_key],
+            key=lambda x: x["curation_score"],
+            reverse=True,
+        )
+        removable_videos = sorted(current_videos, key=lambda x: x["curation_score"])
+        swaps = min(excess_v, len(avail_unselected_photos), len(removable_videos))
+        for i in range(swaps):
+            drop_video = removable_videos[i]
+            add_photo = avail_unselected_photos[i]
+            del selected_by_key[_item_key(drop_video)]
+            add_photo["selection_reason"] = "video_ratio_calibration"
+            selected_by_key[_item_key(add_photo)] = add_photo
+
+    selected_items = sorted(
+        selected_by_key.values(),
+        key=lambda x: (int(x.get("timestamp_ms", 0)), str(x.get("item_id", ""))),
+    )
+    newly_added_items = [it for it in selected_items if not it.get("already_in_target")]
+
+    final_video_count = sum(1 for it in selected_items if it.get("is_video"))
+    final_photo_count = len(selected_items) - final_video_count
+    final_video_ratio = round(final_video_count / len(selected_items), 4) if selected_items else 0.0
+
+    hearted_candidates_total = sum(1 for it in all_candidates if it.get("has_heart"))
+    unhearted_candidates_total = len(all_candidates) - hearted_candidates_total
+    hearted_selected = sum(1 for it in selected_items if it.get("has_heart"))
+    unhearted_selected = len(selected_items) - hearted_selected
+
+    heart_sel_rate = (
+        round(hearted_selected / hearted_candidates_total, 4) if hearted_candidates_total > 0 else 0.0
+    )
+    unheart_sel_rate = (
+        round(unhearted_selected / unhearted_candidates_total, 4) if unhearted_candidates_total > 0 else 0.0
+    )
+    heart_lift = round(heart_sel_rate / unheart_sel_rate, 2) if unheart_sel_rate > 0 else 0.0
+
+    actual_monthly_dist: dict[str, int] = {}
+    actual_contributors: dict[str, int] = {}
+    for it in selected_items:
+        dt = datetime.datetime.fromtimestamp(int(it["timestamp_ms"]) / 1000.0, tz=datetime.timezone.utc)
+        ym = dt.strftime("%Y-%m")
+        actual_monthly_dist[ym] = actual_monthly_dist.get(ym, 0) + 1
+        cname = it.get("contributor_name") or it.get("contributor_id") or "unknown"
+        actual_contributors[cname] = actual_contributors.get(cname, 0) + 1
+
+    curated_manifest: dict[str, Any] = {
+        "target_album": target_album,
+        "child": child,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "window": {
+            "start_iso": window_info.get("start_iso"),
+            "end_iso": window_info.get("end_iso"),
+            "start_ms": window_info.get("start_ms"),
+            "end_ms": window_info.get("end_ms"),
+        },
+        "target_count": desired_total,
+        "selected_count": len(selected_items),
+        "existing_preserved_count": sum(1 for it in selected_items if it.get("already_in_target")),
+        "newly_selected_count": len(newly_added_items),
+        "photo_count": final_photo_count,
+        "video_count": final_video_count,
+        "video_ratio": final_video_ratio,
+        "hearted_candidate_count": hearted_candidates_total,
+        "hearted_selected_count": hearted_selected,
+        "hearted_selection_rate": heart_sel_rate,
+        "unhearted_selection_rate": unheart_sel_rate,
+        "hearted_lift_ratio": heart_lift,
+        "burst_stats": {
+            "raw_candidate_count": len(all_candidates),
+            "total_bursts": len(bursts),
+            "burst_window_ms": BURST_WINDOW_MS,
+            "burst_survivor_count": len(burst_survivors),
+            "burst_duplicates_pruned": len(all_candidates) - len(burst_survivors) - excluded_solo_other_child_count,
+        },
+        "vision_disambiguation_stats": {
+            "thumbnails_analyzed": len(vision_targets_by_key),
+            "cross_album_duplicates_evaluated": sum(
+                1 for it in all_candidates if it.get("is_cross_album_duplicate")
+            ),
+            "shared_sibling_group_shots_kept": shared_sibling_kept_count,
+            "solo_other_child_excluded": excluded_solo_other_child_count,
+        },
+        "monthly_quotas": monthly_quotas,
+        "monthly_distribution": dict(sorted(actual_monthly_dist.items())),
+        "contributor_breakdown": actual_contributors,
+        "selected_items": selected_items,
+        "newly_added_items": newly_added_items,
+    }
+
+    if output_dir is not None:
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_file = out_dir / str(spec["output_filename"])
+        out_file.write_text(json.dumps(curated_manifest, indent=2), encoding="utf-8")
+
+    return curated_manifest
+
+
+def curate_all_targets(
+    manifest_path: Path | str = DEFAULT_MANIFEST_PATH,
+    output_dir: Path | str = DEFAULT_CURATION_DIR,
+    vision_cache_path: Path | str | None = DEFAULT_VISION_CACHE_PATH,
+    targets: list[str] | None = None,
+    max_workers: int = 32,
+    fetch_network: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Load the indexed manifest and run Phase 2 Curation for Rosie Year 6 and Isaac Year 2."""
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    target_names = targets or list(TARGET_CURATION_SPECS.keys())
+    results: dict[str, dict[str, Any]] = {}
+    for t_name in target_names:
+        results[t_name] = curate_target_album(
+            manifest=manifest,
+            target_album=t_name,
+            vision_cache_path=vision_cache_path,
+            output_dir=output_dir,
+            max_workers=max_workers,
+            fetch_network=fetch_network,
+        )
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Google Photos Shared Album Pagination Indexer & Calibration Metadata Extractor"
+        description="Google Photos Shared Album Pagination Indexer & Phase 2 Multimodal Vision Curator"
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=DEFAULT_MANIFEST_PATH,
         help="Output path for the indexed manifest JSON",
+    )
+    parser.add_argument(
+        "--curation-dir",
+        type=Path,
+        default=DEFAULT_CURATION_DIR,
+        help="Output directory for curated target manifests",
+    )
+    parser.add_argument(
+        "--vision-cache",
+        type=Path,
+        default=DEFAULT_VISION_CACHE_PATH,
+        help="Path for cached thumbnail vision analysis scores",
+    )
+    parser.add_argument(
+        "--curate",
+        action="store_true",
+        help="Run Phase 2 multimodal curation for Rosie Year 6 and Isaac Year 2",
+    )
+    parser.add_argument(
+        "--curate-only",
+        action="store_true",
+        help="Skip scraping and run Phase 2 curation directly from existing manifest.json",
+    )
+    parser.add_argument(
+        "--no-network-vision",
+        action="store_true",
+        help="Disable network thumbnail fetches during vision scoring",
     )
     parser.add_argument(
         "--max-pages",
@@ -732,29 +1745,52 @@ def main() -> None:
     parser.add_argument(
         "--workers",
         type=int,
-        default=6,
-        help="Concurrent album scraper threads",
+        default=32,
+        help="Concurrent worker threads",
     )
     args = parser.parse_args()
 
-    t0 = time.time()
-    manifest = build_curation_manifest(
-        output_path=args.output,
-        max_workers=args.workers,
-        max_pages=args.max_pages,
-    )
-    elapsed = time.time() - t0
-    print(
-        f"Indexed {manifest['album_count']} albums ({manifest['total_indexed_items']} total items) "
-        f"in {elapsed:.1f}s -> {args.output}"
-    )
-    print(f"Cross-album duplicates (Rosalind vs Isaac): {manifest['cross_album_duplicates']['duplicate_count']}")
-    for t_name, t_info in manifest["target_windows"].items():
-        print(
-            f"  {t_name}: {t_info['candidate_count']} candidates "
-            f"(photos={t_info['photo_count']}, videos={t_info['video_count']}, "
-            f"hearted={t_info['hearted_count']}, cross_dups={t_info['cross_album_duplicate_count']})"
+    if not args.curate_only:
+        t0 = time.time()
+        manifest = build_curation_manifest(
+            output_path=args.output,
+            max_workers=min(args.workers, 8),
+            max_pages=args.max_pages,
         )
+        elapsed = time.time() - t0
+        print(
+            f"Indexed {manifest['album_count']} albums ({manifest['total_indexed_items']} total items) "
+            f"in {elapsed:.1f}s -> {args.output}"
+        )
+        print(f"Cross-album duplicates (Rosalind vs Isaac): {manifest['cross_album_duplicates']['duplicate_count']}")
+        for t_name, t_info in manifest["target_windows"].items():
+            print(
+                f"  {t_name}: {t_info['candidate_count']} candidates "
+                f"(photos={t_info['photo_count']}, videos={t_info['video_count']}, "
+                f"hearted={t_info['hearted_count']}, cross_dups={t_info['cross_album_duplicate_count']})"
+            )
+
+    if args.curate or args.curate_only:
+        t1 = time.time()
+        results = curate_all_targets(
+            manifest_path=args.output,
+            output_dir=args.curation_dir,
+            vision_cache_path=args.vision_cache,
+            max_workers=args.workers,
+            fetch_network=not args.no_network_vision,
+        )
+        c_elapsed = time.time() - t1
+        print(f"Completed Phase 2 curation in {c_elapsed:.1f}s:")
+        for t_name, res in results.items():
+            print(
+                f"  {t_name}: selected={res['selected_count']} "
+                f"(existing_preserved={res['existing_preserved_count']}, newly_added={res['newly_selected_count']}, "
+                f"photos={res['photo_count']}, videos={res['video_count']} [{res['video_ratio']*100:.1f}%], "
+                f"hearted_selected={res['hearted_selected_count']}/{res['hearted_candidate_count']} "
+                f"[lift={res['hearted_lift_ratio']}x], "
+                f"bursts={res['burst_stats']['total_bursts']}, "
+                f"solo_excluded={res['vision_disambiguation_stats']['solo_other_child_excluded']})"
+            )
 
 
 if __name__ == "__main__":

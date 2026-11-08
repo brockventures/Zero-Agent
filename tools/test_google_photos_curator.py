@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import datetime
+import io
 import json
 from pathlib import Path
 import sys
 from typing import Any
 from unittest.mock import MagicMock, patch
+
+from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools import google_photos_curator as gpc
@@ -273,3 +276,180 @@ def test_build_curation_manifest_writes_output(tmp_path: Path) -> None:
     assert loaded["target_windows"]["Rosie Year 6"]["candidate_count"] == 1
     assert loaded["target_windows"]["Isaac Year 2"]["candidate_count"] == 1
     assert manifest["total_indexed_items"] == 2
+
+
+def _make_synthetic_thumbnail_bytes(
+    num_faces: int = 1,
+    sharp: bool = True,
+    toddler_proportions: bool = False,
+) -> bytes:
+    """Create a synthetic RGB JPEG thumbnail with 1 or 2 skin-tone regions and controllable sharpness."""
+    img = Image.new("RGB", (256, 256), color=(65, 115, 165))
+    draw = ImageDraw.Draw(img)
+
+    # Skin-tone RGB (warm peach/tan within YCbCr skin bounds: R=215, G=162, B=132)
+    skin_rgb = (215, 162, 132)
+    detail_rgb = (60, 35, 30)
+
+    if num_faces >= 2:
+        # Two distinct sibling faces separated horizontally
+        draw.ellipse((35, 65, 105, 160), fill=skin_rgb)
+        draw.ellipse((150, 75, 220, 165), fill=skin_rgb)
+        if sharp:
+            for y in range(85, 145, 6):
+                draw.line((50, y, 90, y), fill=detail_rgb, width=2)
+                draw.line((165, y, 205, y), fill=detail_rgb, width=2)
+    elif num_faces == 1:
+        if toddler_proportions:
+            # Rounder baby/toddler face lower in the frame
+            draw.ellipse((88, 125, 168, 200), fill=skin_rgb)
+            if sharp:
+                draw.line((108, 155, 148, 155), fill=detail_rgb, width=1)
+        else:
+            # Taller older-child face/upper portrait higher in the frame with high-frequency detail
+            draw.rectangle((95, 35, 160, 155), fill=skin_rgb)
+            if sharp:
+                for y in range(45, 145, 4):
+                    draw.line((102, y, 152, y), fill=detail_rgb, width=2)
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92 if sharp else 30)
+    return buf.getvalue()
+
+
+def test_group_temporal_bursts_90s_window() -> None:
+    t0 = 1_740_000_000_000
+    items = [
+        {"item_id": "id_1", "dedup_key": "k1", "timestamp_ms": t0},
+        {"item_id": "id_2", "dedup_key": "k2", "timestamp_ms": t0 + 30_000},
+        {"item_id": "id_3", "dedup_key": "k3", "timestamp_ms": t0 + 115_000},  # 85s after id_2 -> same burst
+        {"item_id": "id_4", "dedup_key": "k4", "timestamp_ms": t0 + 210_000},  # 95s after id_3 -> new burst
+    ]
+    bursts = gpc.group_temporal_bursts(items, window_ms=90_000)
+    assert len(bursts) == 2
+    assert len(bursts[0]) == 3
+    assert len(bursts[1]) == 1
+    assert bursts[0][0]["burst_id"] == "burst_0000"
+    assert bursts[0][0]["burst_size"] == 3
+    assert bursts[1][0]["burst_id"] == "burst_0001"
+
+
+def test_analyze_thumbnail_and_child_age_disambiguation() -> None:
+    sibling_bytes = _make_synthetic_thumbnail_bytes(num_faces=2, sharp=True)
+    older_sharp_bytes = _make_synthetic_thumbnail_bytes(num_faces=1, sharp=True, toddler_proportions=False)
+    toddler_blur_bytes = _make_synthetic_thumbnail_bytes(num_faces=1, sharp=False, toddler_proportions=True)
+
+    sibling_scores = gpc.analyze_thumbnail_bytes(sibling_bytes)
+    older_scores = gpc.analyze_thumbnail_bytes(older_sharp_bytes)
+    toddler_scores = gpc.analyze_thumbnail_bytes(toddler_blur_bytes)
+
+    assert sibling_scores["estimated_faces"] >= 2
+    assert sibling_scores["is_shared_sibling_shot"] is True
+    assert sibling_scores["subject_age_class"] == "shared_siblings_or_group"
+    assert sibling_scores["group_composition_score"] > older_scores["group_composition_score"]
+
+    assert older_scores["sharpness_score"] > toddler_scores["sharpness_score"]
+    assert older_scores["subject_age_class"] == "solo_older_child"
+    assert toddler_scores["subject_age_class"] == "solo_toddler"
+
+    cross_dup_item = {"item_id": "dup1", "dedup_key": "dup1", "is_cross_album_duplicate": True, "has_heart": False}
+    # Shared sibling shot is kept in BOTH Rosie and Isaac albums
+    assert gpc.should_exclude_for_child(cross_dup_item, sibling_scores, child="rosalind") is False
+    assert gpc.should_exclude_for_child(cross_dup_item, sibling_scores, child="isaac") is False
+
+    # Solo toddler shot is excluded from Rosie's album but kept in Isaac's album
+    assert gpc.should_exclude_for_child(cross_dup_item, toddler_scores, child="rosalind") is True
+    assert gpc.should_exclude_for_child(cross_dup_item, toddler_scores, child="isaac") is False
+
+    # Solo older-child shot is excluded from Isaac's album but kept in Rosie's album
+    assert gpc.should_exclude_for_child(cross_dup_item, older_scores, child="isaac") is True
+    assert gpc.should_exclude_for_child(cross_dup_item, older_scores, child="rosalind") is False
+
+
+def test_curate_target_album_preserves_existing_boosts_hearts_and_calibrates_video_ratio(tmp_path: Path) -> None:
+    base_dt = datetime.datetime(2025, 1, 5, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    candidates: list[dict[str, Any]] = []
+    existing_items: list[dict[str, Any]] = []
+
+    # Generate 120 synthetic candidates across 6 months (photos + videos, bursts, hearted items, 5 existing)
+    for m_idx in range(6):
+        month_dt = base_dt + datetime.timedelta(days=30 * m_idx)
+        month_ms = int(month_dt.timestamp() * 1000)
+        for i in range(20):
+            # Pair items 0&1, 2&3 into 30-second bursts, space bursts by 5 minutes
+            burst_group = i // 2
+            within_burst = i % 2
+            ts = month_ms + burst_group * 300_000 + within_burst * 25_000
+            is_vid = within_burst == 1 and (burst_group % 2 == 0)
+            has_heart = burst_group in (0, 1) and within_burst == 0
+            key = f"cand_{m_idx}_{i}"
+            item = {
+                "item_id": f"ID_{key}",
+                "dedup_key": key,
+                "base_url": f"https://lh3.googleusercontent.com/pw/{key}",
+                "timestamp_ms": ts,
+                "timestamp_iso": datetime.datetime.fromtimestamp(ts / 1000.0, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "width": 4032 if within_burst == 0 else 1920,
+                "height": 3024 if within_burst == 0 else 1080,
+                "is_video": is_vid,
+                "media_type": "video" if is_vid else "photo",
+                "video_duration_ms": 18_000 if is_vid else None,
+                "contributor_id": "actor_1",
+                "contributor_name": "Parent One",
+                "has_heart": has_heart,
+                "heart_count": 2 if has_heart else 0,
+                "is_cross_album_duplicate": (i == 19),
+            }
+            candidates.append(item)
+            if m_idx == 0 and i < 5:
+                existing_items.append(dict(item))
+
+    manifest = {
+        "calibration": {
+            "albums": {
+                "Isaac Year 1": {
+                    "child": "isaac",
+                    "monthly_distribution": {f"2024-{m:02d}": 50 for m in range(1, 7)},
+                }
+            }
+        },
+        "target_windows": {
+            "Isaac Year 2": {
+                "child": "isaac",
+                "start_iso": "2024-12-26T00:00:00Z",
+                "end_iso": "2025-12-26T00:00:00Z",
+                "start_ms": int(base_dt.timestamp() * 1000),
+                "end_ms": int((base_dt + datetime.timedelta(days=365)).timestamp() * 1000),
+                "candidates": candidates,
+            }
+        },
+        "albums": {
+            "Isaac Year 2": {
+                "items": existing_items,
+            }
+        },
+    }
+
+    cache_file = tmp_path / "vision_cache.json"
+    out_dir = tmp_path / "curation_out"
+
+    curated = gpc.curate_target_album(
+        manifest=manifest,
+        target_album="Isaac Year 2",
+        target_count=40,
+        target_video_ratio=0.29,
+        vision_cache_path=cache_file,
+        output_dir=out_dir,
+        fetch_network=False,
+    )
+
+    assert curated["selected_count"] == 40
+    assert curated["existing_preserved_count"] == 5
+    assert curated["newly_selected_count"] == 35
+    # Video ratio should match ~28-30% target (12 / 40 = 0.30)
+    assert 0.25 <= curated["video_ratio"] <= 0.33
+    # Family-hearted items should have high selection rate
+    assert curated["hearted_selection_rate"] >= 0.8
+    assert curated["hearted_lift_ratio"] >= 2.0
+    assert (out_dir / "isaac_year_2_curated.json").exists()
+
