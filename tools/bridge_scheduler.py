@@ -1864,6 +1864,39 @@ class BridgeScheduler:
         except Exception as oe:
             print(f"[Bridge] Error flushing outbox queue: {oe}")
 
+    def _sync_housekeeping(self) -> None:
+        """Synchronously persist gateway heartbeat and reap stale agy processes in background thread."""
+        # Dynamic Discord Gateway Heartbeat Verification
+        try:
+            from tools.bridge_state import update_gateway_heartbeat
+            gw_status = "connected" if (self.bot and getattr(self.bot, "is_ready", lambda: False)()) else "disconnected"
+            update_gateway_heartbeat(self.bot, status=gw_status)
+        except Exception:
+            pass
+
+        # Autonomous Subprocess Watchdog & Reaper
+        try:
+            from tools.process_probe import reap_stale_agy_processes
+            from tools.bridge_state import get_all_active_pids
+            allowed_pids = set(get_all_active_pids())
+            if br.active_proc and getattr(br.active_proc, "pid", None):
+                allowed_pids.add(br.active_proc.pid)
+            if br.ext_active_proc and getattr(br.ext_active_proc, "pid", None):
+                allowed_pids.add(br.ext_active_proc.pid)
+            for p in list(getattr(br, "channel_active_procs", {}).values()):
+                if p and getattr(p, "pid", None):
+                    allowed_pids.add(p.pid)
+            try:
+                from tools.bridge_daemons import daemon_manager
+                for w in list(daemon_manager.workers.values()):
+                    if w.proc and getattr(w.proc, "pid", None):
+                        allowed_pids.add(w.proc.pid)
+            except Exception:
+                pass
+            reap_stale_agy_processes(allowed_active_pids=allowed_pids)
+        except Exception:
+            pass
+
     async def _loop(self):
         global _last_bot_status_mtime
         while self._running:
@@ -1871,34 +1904,13 @@ class BridgeScheduler:
                 now_ts = time.time()
                 await self._evaluate_and_dispatch_jobs(is_startup=False)
 
-                # Dynamic Discord Gateway Heartbeat Verification
+                # Dynamic Discord Gateway Heartbeat Verification & Stale Process Table Reaper
+                # Offloaded to a background thread to prevent slow disk I/O or /proc contention
+                # from blocking the main Discord gateway asyncio event loop.
                 try:
-                    from tools.bridge_state import update_gateway_heartbeat
-                    gw_status = "connected" if (self.bot and getattr(self.bot, "is_ready", lambda: False)()) else "disconnected"
-                    update_gateway_heartbeat(self.bot, status=gw_status)
-                except Exception:
-                    pass
-
-                # Autonomous Subprocess Watchdog & Reaper
-                try:
-                    from tools.process_probe import reap_stale_agy_processes
-                    from tools.bridge_state import get_all_active_pids
-                    allowed_pids = set(get_all_active_pids())
-                    if br.active_proc and getattr(br.active_proc, "pid", None):
-                        allowed_pids.add(br.active_proc.pid)
-                    if br.ext_active_proc and getattr(br.ext_active_proc, "pid", None):
-                        allowed_pids.add(br.ext_active_proc.pid)
-                    for p in list(getattr(br, "channel_active_procs", {}).values()):
-                        if p and getattr(p, "pid", None):
-                            allowed_pids.add(p.pid)
-                    try:
-                        from tools.bridge_daemons import daemon_manager
-                        for w in list(daemon_manager.workers.values()):
-                            if w.proc and getattr(w.proc, "pid", None):
-                                allowed_pids.add(w.proc.pid)
-                    except Exception:
-                        pass
-                    reap_stale_agy_processes(allowed_active_pids=allowed_pids)
+                    await asyncio.wait_for(asyncio.to_thread(self._sync_housekeeping), timeout=8.0)
+                except asyncio.TimeoutError:
+                    print("[BridgeScheduler] Warning: sync housekeeping timed out after 8s (offloaded thread)")
                 except Exception:
                     pass
 

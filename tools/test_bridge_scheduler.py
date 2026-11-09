@@ -55,7 +55,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     async def test_anti_storm_guard(self):
-        dispatch_mock = AsyncMock()
+        _ = AsyncMock()
         bshed.LAST_SCHEDULED_DISPATCH.clear()
 
         # First dispatch should succeed
@@ -72,7 +72,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         bshed.LAST_SCHEDULED_DISPATCH.clear()
         br.reset_session_keys.clear()
 
-        with patch("tools.session_summarizer.generate_summary") as mock_sum, \
+        with patch("tools.session_summarizer.generate_summary"), \
              patch("tools.bridge_daemons.daemon_manager.proactive_nightly_recycle", new_callable=AsyncMock) as mock_recycle:
             await bshed.dispatch_scheduled_prompt("[INTERNAL_SESSION_ROLLOVER]", "Daily Session Rollover")
             self.assertIn("home", br.reset_session_keys)
@@ -856,7 +856,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_bot = MagicMock()
         mock_turn_queue = AsyncMock()
 
-        with patch("tools.sidecars.run_agora_roguelike_pm", return_value=(True, "", {"nominal": True})) as mock_pm:
+        with patch("tools.sidecars.run_agora_roguelike_pm", return_value=(True, "", {"nominal": True})):
             await bshed.dispatch_scheduled_prompt(
                 "Run the Agora Roguelike PM board assessment and autonomous merge check using python3 /workspace/tools/sidecars.py agora_pm. Post updates to #agora when PRs or assignments change (silent when nominal).",
                 "Agora Roguelike PM & Board Coordinator",
@@ -871,7 +871,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_bot = MagicMock()
         mock_turn_queue = AsyncMock()
 
-        with patch("tools.sidecars.run_agora_roguelike_engineer", return_value=(True, "All pass", None)) as mock_eng:
+        with patch("tools.sidecars.run_agora_roguelike_engineer", return_value=(True, "All pass", None)):
             await bshed.dispatch_scheduled_prompt(
                 "Run the Agora Roguelike engineering execution check using python3 /workspace/tools/sidecars.py agora_engineer.",
                 "Agora Roguelike Engineering Execution",
@@ -1061,7 +1061,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             return orig_open(file, *args, **kwargs)
 
         with patch("builtins.open", side_effect=counting_open):
-            jobs = load_schedule()
+            _ = load_schedule()
             self.assertEqual(status_open_count, 1)
             # Subsequent get_last_execution_for_job with unchanged mtime uses cache without re-opening
             epoch, pt = get_last_execution_for_job("nightly_triage")
@@ -1105,6 +1105,44 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_reap.assert_called_once()
         allowed = mock_reap.call_args[1]["allowed_active_pids"]
         self.assertIn(42424, allowed)
+
+    async def test_loop_offloads_sync_housekeeping_to_thread(self):
+        """Verify _loop executes _sync_housekeeping in a thread with bounded timeout."""
+        scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock())
+        scheduler._running = True
+
+        def stop_after_one_sleep(_):
+            scheduler._running = False
+            raise asyncio.CancelledError()
+
+        with patch.object(scheduler, "_evaluate_and_dispatch_jobs", new_callable=AsyncMock), \
+             patch.object(scheduler, "flush_outbox_queue", new_callable=AsyncMock), \
+             patch.object(scheduler, "_sync_housekeeping") as mock_hk, \
+             patch("tools.forge.forge_supervisor.tick_sync"), \
+             patch("asyncio.sleep", side_effect=stop_after_one_sleep):
+            try:
+                await scheduler._loop()
+            except asyncio.CancelledError:
+                pass
+
+        mock_hk.assert_called_once()
+
+    def test_sync_housekeeping_reaps_and_updates_heartbeat(self):
+        """Verify _sync_housekeeping invokes update_gateway_heartbeat and reap_stale_agy_processes."""
+        scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock())
+        mock_bot = MagicMock()
+        mock_bot.is_ready.return_value = True
+        scheduler.bot = mock_bot
+
+        with patch("tools.bridge_state.update_gateway_heartbeat") as mock_gw, \
+             patch("tools.process_probe.reap_stale_agy_processes") as mock_reap, \
+             patch("tools.bridge_state.get_all_active_pids", return_value=[1234]):
+            scheduler._sync_housekeeping()
+
+        mock_gw.assert_called_once_with(mock_bot, status="connected")
+        mock_reap.assert_called_once()
+        self.assertIn(1234, mock_reap.call_args[1]["allowed_active_pids"])
+
 
 if __name__ == "__main__":
     unittest.main()

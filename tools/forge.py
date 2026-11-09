@@ -5284,6 +5284,7 @@ MAX_PARALLEL_BUILDS_PER_AGENT = 2
 MAX_PARALLEL_CHUNKS_PER_BUILD = 2
 ACTIVE_CHAT_MAX_PARALLEL_BUILDS = 1
 ACTIVE_CHAT_MAX_PARALLEL_CHUNKS = 1
+FORGE_LOAD_SHED_THRESHOLD = 12.0
 CHUNK_WORKER_TIMEOUT_SECONDS = 1200.0
 CHUNK_SILENT_STALL_TIMEOUT_SECONDS = 300.0
 VERIFY_CMD_TIMEOUT_SECONDS = 300.0
@@ -5329,6 +5330,14 @@ def _has_active_interactive_turns(max_age_s: float = 600.0) -> bool:
         except Exception:
             pass
     return False
+
+
+def _get_current_1m_load() -> float:
+    """Return the current 1-minute system load average, or 0.0 on error."""
+    try:
+        return float(os.getloadavg()[0])
+    except (AttributeError, OSError, IndexError, ValueError):
+        return 0.0
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -5696,13 +5705,19 @@ class ForgeSupervisor:
         return active_ids
 
     def _effective_max_builds(self) -> int:
-        if _is_prod_forge_env(self.db_path) and _has_active_interactive_turns():
-            return min(self.max_parallel_builds, ACTIVE_CHAT_MAX_PARALLEL_BUILDS)
+        if _is_prod_forge_env(self.db_path):
+            if _get_current_1m_load() >= FORGE_LOAD_SHED_THRESHOLD:
+                return min(self.max_parallel_builds, 1)
+            if _has_active_interactive_turns():
+                return min(self.max_parallel_builds, ACTIVE_CHAT_MAX_PARALLEL_BUILDS)
         return self.max_parallel_builds
 
     def _effective_max_chunks(self) -> int:
-        if _is_prod_forge_env(self.db_path) and _has_active_interactive_turns():
-            return min(self.max_parallel_chunks, ACTIVE_CHAT_MAX_PARALLEL_CHUNKS)
+        if _is_prod_forge_env(self.db_path):
+            if _get_current_1m_load() >= FORGE_LOAD_SHED_THRESHOLD:
+                return min(self.max_parallel_chunks, 1)
+            if _has_active_interactive_turns():
+                return min(self.max_parallel_chunks, ACTIVE_CHAT_MAX_PARALLEL_CHUNKS)
         return self.max_parallel_chunks
 
     def tick_sync(self) -> dict:
@@ -5742,6 +5757,10 @@ class ForgeSupervisor:
         active_ids = self._count_active_build_workers()
         if len(active_ids) >= self._effective_max_builds():
             return None
+
+        if _is_prod_forge_env(self.db_path) and _get_current_1m_load() >= FORGE_LOAD_SHED_THRESHOLD:
+            if len(active_ids) >= 1 or _has_active_interactive_turns():
+                return None
 
         in_ivy = is_ivy_container()
         with get_db_connection(self.db_path) as conn:
