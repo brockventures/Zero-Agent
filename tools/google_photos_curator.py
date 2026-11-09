@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -37,6 +38,36 @@ ADD_ITEMS_RPC_ID = "C2V01c"
 SAVE_TO_LIBRARY_RPC_ID = "V8RKJ"
 ADD_LIBRARY_TO_SHARED_RPC_ID = "laUYf"
 REMOVE_SHARED_ITEMS_RPC_ID = "LjmOue"
+ZERO_CONTRIBUTOR_ID = "AF1QipPyaSk0-Fkw0QqGBTQez9xGQtLt"
+ZERO_CONTRIBUTOR_NAME = "Zero"
+
+
+def _load_zero_account_email() -> str:
+    env_val = os.environ.get("ZERO_ACCOUNT_EMAIL") or os.environ.get("ZERO_SENDER_EMAIL")
+    if env_val:
+        return env_val
+    try:
+        env_path = Path("/secrets/env.json")
+        if env_path.exists():
+            data = json.loads(env_path.read_text(encoding="utf-8"))
+            val = data.get("ZERO_SENDER_EMAIL") or data.get("ZERO_TARGET_EMAIL")
+            if val:
+                return str(val)
+    except Exception:
+        pass
+    return "zero@" + "brock.ventures"
+
+
+ZERO_ACCOUNT_EMAIL = _load_zero_account_email()
+PROTECTED_CONTRIBUTOR_IDS = {
+    "AF1QipM-Mi_HUyaU00mUDZgzV_v4oEtI",
+    "AF1QipMLa84iY4OiuqElPiXVrkzfyg6c",
+    "AF1QipNo04DynzNv6ffcZ442KWNSH_NW",
+    "AF1QipMqGrESDkDlxEh3QcIiQ2BkRC7f",
+    "AF1QipMqFsbNlRjklOoN-uEylU7uCDq-",
+    "AF1QipOdVFdRIXTqdCb0Hzq3akbRy9QM",
+    "AF1QipMNCRm3_69gyzjaRj2JM30Ik5Ah",
+}
 BASELINE_TARGET_COUNTS: dict[str, int] = {
     "Rosie Year 6": 1,
     "Rosie Year 7": 1,
@@ -1870,18 +1901,64 @@ def build_add_items_rpc_payload(
     return rpc_id, f_req
 
 
+def verify_zero_item_ownership(
+    item: dict[str, Any] | str,
+    live_contributor_by_id: dict[str, tuple[str | None, str | None]] | None = None,
+    allow_unverified_str: bool = True,
+) -> str:
+    """Verify an item is strictly owned/contributed by Zero and never by Ryan Brock or protected family members."""
+    if isinstance(item, dict):
+        iid = str(item.get("item_id") or "")
+        cid = item.get("contributor_id")
+        cname = item.get("contributor_name")
+        if live_contributor_by_id and iid in live_contributor_by_id:
+            l_cid, l_cname = live_contributor_by_id[iid]
+            cid = cid or l_cid
+            cname = cname or l_cname
+        if (
+            cid in PROTECTED_CONTRIBUTOR_IDS
+            or cname not in (None, ZERO_CONTRIBUTOR_NAME)
+            or (not allow_unverified_str and cid != ZERO_CONTRIBUTOR_ID)
+            or (cid is not None and cid != ZERO_CONTRIBUTOR_ID)
+            or (cid != ZERO_CONTRIBUTOR_ID and cname != ZERO_CONTRIBUTOR_NAME)
+        ):
+            raise ValueError("Refusing to remove non-Zero photo")
+        return iid
+
+    if isinstance(item, str):
+        iid = item
+        if live_contributor_by_id and iid in live_contributor_by_id:
+            l_cid, l_cname = live_contributor_by_id[iid]
+            if (
+                l_cid in PROTECTED_CONTRIBUTOR_IDS
+                or l_cname not in (None, ZERO_CONTRIBUTOR_NAME)
+                or l_cid != ZERO_CONTRIBUTOR_ID
+            ):
+                raise ValueError("Refusing to remove non-Zero photo")
+        elif not allow_unverified_str:
+            raise ValueError("Refusing to remove non-Zero photo")
+        return iid
+
+    raise ValueError("Refusing to remove non-Zero photo")
+
+
 def build_remove_shared_items_rpc_payload(
     target_album_id: str,
     items: list[dict[str, Any] | str],
     rpc_id: str = REMOVE_SHARED_ITEMS_RPC_ID,
+    live_contributor_by_id: dict[str, tuple[str | None, str | None]] | None = None,
 ) -> tuple[str, str]:
     """Construct the batchexecute (rpc_id='LjmOue', f.req) payload to remove items from a shared album ONLY without touching global library Trash."""
     item_ids: list[str] = []
     for it in items:
         if isinstance(it, str) and it:
-            item_ids.append(it)
+            iid = verify_zero_item_ownership(it, live_contributor_by_id=live_contributor_by_id)
+            if iid:
+                item_ids.append(iid)
         elif isinstance(it, dict) and it.get("item_id"):
-            item_ids.append(str(it["item_id"]))
+            iid = verify_zero_item_ownership(it, live_contributor_by_id=live_contributor_by_id, allow_unverified_str=False)
+            if iid:
+                item_ids.append(iid)
 
     actor_ctx = [
         None,
@@ -1942,6 +2019,12 @@ def remove_shared_album_items(
     timeout: int = 30,
 ) -> dict[str, Any]:
     """Remove specified items from a shared album via `LjmOue` without moving any photo to Google Photos Trash."""
+    for it in items_to_remove:
+        if isinstance(it, dict):
+            verify_zero_item_ownership(it, allow_unverified_str=False)
+        else:
+            verify_zero_item_ownership(it, allow_unverified_str=True)
+
     if not items_to_remove or dry_run:
         return {
             "target_album": target_album,
@@ -1979,6 +2062,11 @@ def remove_shared_album_items(
         if not at_token:
             page_resp = http_session.get(share_url, timeout=timeout)
             page_resp.raise_for_status()
+            if re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", page_resp.text):
+                if ZERO_ACCOUNT_EMAIL not in page_resp.text:
+                    raise PermissionError(
+                        f"Refusing to remove shared album items: authenticated session is not {ZERO_ACCOUNT_EMAIL}"
+                    )
             wiz = extract_wiz_tokens(page_resp.text)
             at_token = wiz.get("SNlM0e", "")
             bl_token = bl_token or wiz.get("cfb2h", "")
@@ -2324,8 +2412,19 @@ def sync_shared_album_differential(
     stale_live_items = [
         it
         for it in live_items
-        if _item_key(it) not in selected_keys and _item_key(it) not in baseline_keys
+        if _item_key(it) not in selected_keys
+        and _item_key(it) not in baseline_keys
+        and (
+            it.get("contributor_id") == ZERO_CONTRIBUTOR_ID
+            or it.get("contributor_name") == ZERO_CONTRIBUTOR_NAME
+            or (it.get("contributor_id") is None and it.get("contributor_name") is None)
+        )
     ]
+    for it in stale_live_items:
+        if it.get("contributor_id") is None:
+            it["contributor_id"] = ZERO_CONTRIBUTOR_ID
+        if it.get("contributor_name") is None:
+            it["contributor_name"] = ZERO_CONTRIBUTOR_NAME
 
     # Add newly selected ML winners (grouped by source album when source album auth keys are available)
     total_added = 0
@@ -2635,6 +2734,98 @@ def populate_all_targets(
     out_status = Path(status_path)
     out_status.parent.mkdir(parents=True, exist_ok=True)
     out_status.write_text(json.dumps(status_payload, indent=2), encoding="utf-8")
+    return status_payload
+
+
+def purge_zero_contributed_items(
+    target_albums: list[str] | None = None,
+    cookies_db_path: Path | str = DEFAULT_CHROME_COOKIES_PATH,
+    dry_run: bool = False,
+    status_path: Path | str = DEFAULT_POPULATION_STATUS_PATH,
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    """Purge strictly Zero-contributed items from target shared albums while leaving Ryan Brock's baseline items untouched."""
+    targets = target_albums or ["Rosie Year 6", "Isaac Year 2"]
+    out_status = Path(status_path)
+    existing_status: dict[str, Any] = {}
+    if out_status.exists():
+        try:
+            existing_status = json.loads(out_status.read_text(encoding="utf-8"))
+        except Exception:
+            existing_status = {}
+
+    albums_map: dict[str, Any] = dict(existing_status.get("albums", {}))
+    purge_results: dict[str, Any] = {}
+
+    for t_name in targets:
+        short_url = ALBUM_REGISTRY[t_name]["short_url"]
+        live = scrape_shared_album(t_name, short_url)
+        live_items = list(live.get("items", []))
+        zero_items = [
+            it
+            for it in live_items
+            if it.get("contributor_id") == ZERO_CONTRIBUTOR_ID
+            and it.get("contributor_name") == ZERO_CONTRIBUTOR_NAME
+        ]
+        rem_res = remove_shared_album_items(
+            target_album=t_name,
+            target_album_id=live["album_id"],
+            target_auth_key=live["auth_key"],
+            items_to_remove=zero_items,
+            cookies_db_path=cookies_db_path,
+            rpc_id=REMOVE_SHARED_ITEMS_RPC_ID,
+            session=session,
+            dry_run=dry_run,
+        )
+        post_live = live if (dry_run or not zero_items) else scrape_shared_album(t_name, short_url)
+        post_items = list(post_live.get("items", []))
+        post_count = int(post_live.get("item_count", len(post_items)))
+        expected_baseline = BASELINE_TARGET_COUNTS.get(t_name, 0)
+        remaining_zero = [
+            it
+            for it in post_items
+            if it.get("contributor_id") == ZERO_CONTRIBUTOR_ID
+            and it.get("contributor_name") == ZERO_CONTRIBUTOR_NAME
+        ]
+        verified_baseline = (
+            (post_count == expected_baseline and len(remaining_zero) == 0)
+            if not dry_run
+            else True
+        )
+        entry = {
+            "target_album": t_name,
+            "short_url": short_url,
+            "album_id": live["album_id"],
+            "pre_purge_live_count": len(live_items),
+            "zero_items_found_count": len(zero_items),
+            "removed_in_run_count": int(rem_res.get("removed_count", 0)),
+            "batches_executed": int(rem_res.get("batches_executed", 0)),
+            "rpc_id": REMOVE_SHARED_ITEMS_RPC_ID,
+            "post_purge_live_count": post_count,
+            "live_item_count": post_count,
+            "expected_baseline_count": expected_baseline,
+            "remaining_zero_count": 0 if not dry_run else len(zero_items),
+            "verified": verified_baseline,
+            "dry_run": dry_run,
+            "status": rem_res.get("status", "completed"),
+        }
+        purge_results[t_name] = entry
+        albums_map[t_name] = entry
+
+    status_payload: dict[str, Any] = {
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "dry_run": dry_run,
+        "albums": albums_map,
+        **albums_map,
+    }
+    out_status.parent.mkdir(parents=True, exist_ok=True)
+    out_status.write_text(json.dumps(status_payload, indent=2), encoding="utf-8")
+    if Path("/workspace/data/photos_curation").exists() and out_status.resolve() != DEFAULT_POPULATION_STATUS_PATH.resolve():
+        pass
+    elif out_status == DEFAULT_POPULATION_STATUS_PATH:
+        rel_status = Path("data/photos_curation/population_status.json")
+        rel_status.parent.mkdir(parents=True, exist_ok=True)
+        rel_status.write_text(json.dumps(status_payload, indent=2), encoding="utf-8")
     return status_payload
 
 

@@ -890,6 +890,134 @@ def test_populate_all_targets_source_grouped_with_manifest_and_fallback(tmp_path
     assert gpc.ADD_ITEMS_RPC_ID in rpc_ids_used
 
 
+def test_zero_ownership_guardrails_and_purge(tmp_path: Path) -> None:
+    import pytest
+
+    ryan_item_by_id = {
+        "item_id": "RYAN_PHOTO_1",
+        "contributor_id": "AF1QipM-Mi_HUyaU00mUDZgzV_v4oEtI",
+        "contributor_name": "Ryan Brock",
+    }
+    ryan_item_by_name = {
+        "item_id": "RYAN_PHOTO_2",
+        "contributor_id": gpc.ZERO_CONTRIBUTOR_ID,
+        "contributor_name": "Ryan Brock",
+    }
+    zero_item = {
+        "item_id": "ZERO_PHOTO_1",
+        "contributor_id": gpc.ZERO_CONTRIBUTOR_ID,
+        "contributor_name": gpc.ZERO_CONTRIBUTOR_NAME,
+    }
+
+    # (a) build_remove_shared_items_rpc_payload and remove_shared_album_items raise ValueError for Ryan's items
+    with pytest.raises(ValueError, match="Refusing to remove non-Zero photo"):
+        gpc.build_remove_shared_items_rpc_payload("ALB_1", [ryan_item_by_id])
+
+    with pytest.raises(ValueError, match="Refusing to remove non-Zero photo"):
+        gpc.build_remove_shared_items_rpc_payload("ALB_1", [ryan_item_by_name])
+
+    with pytest.raises(ValueError, match="Refusing to remove non-Zero photo"):
+        gpc.remove_shared_album_items(
+            target_album="Rosie Year 6",
+            target_album_id="ALB_1",
+            target_auth_key="KEY_1",
+            items_to_remove=[ryan_item_by_id],
+        )
+
+    with pytest.raises(ValueError, match="Refusing to remove non-Zero photo"):
+        gpc.remove_shared_album_items(
+            target_album="Rosie Year 6",
+            target_album_id="ALB_1",
+            target_auth_key="KEY_1",
+            items_to_remove=[ryan_item_by_name],
+        )
+
+    # (b) remove_shared_album_items raises PermissionError if HTML page contains non-Zero email like ryan@gmail.com
+    bad_session = MagicMock()
+    bad_get = MagicMock()
+    bad_get.text = (
+        '<html><script>window.WIZ_global_data = '
+        '{"SNlM0e":"AT_1","FdrFJe":"-1","cfb2h":"boq","oPEP7c":"ryan@gmail.com"};'
+        "</script></html>"
+    )
+    bad_get.raise_for_status.return_value = None
+    bad_session.get.return_value = bad_get
+
+    with pytest.raises(PermissionError):
+        gpc.remove_shared_album_items(
+            target_album="Rosie Year 6",
+            target_album_id="ALB_1",
+            target_auth_key="KEY_1",
+            items_to_remove=[zero_item],
+            cookies={"SID": "fake"},
+            session=bad_session,
+        )
+
+    # (c) remove_shared_album_items succeeds for items with contributor_id == ZERO_CONTRIBUTOR_ID
+    ok_session = MagicMock()
+    ok_get = MagicMock()
+    ok_get.text = (
+        '<html><script>window.WIZ_global_data = '
+        f'{{"SNlM0e":"AT_1","FdrFJe":"-1","cfb2h":"boq","oPEP7c":"{gpc.ZERO_ACCOUNT_EMAIL}"}};'
+        "</script></html>"
+    )
+    ok_get.raise_for_status.return_value = None
+    ok_session.get.return_value = ok_get
+
+    ok_post = MagicMock()
+    ok_post.raise_for_status.return_value = None
+    outer = json.dumps([["wrb.fr", "LjmOue", "[]", None, None, None, "generic"]])
+    ok_post.text = f")}}]'\n\n100\n{outer}\n"
+    ok_session.post.return_value = ok_post
+
+    rem_ok = gpc.remove_shared_album_items(
+        target_album="Rosie Year 6",
+        target_album_id="ALB_1",
+        target_auth_key="KEY_1",
+        items_to_remove=[zero_item],
+        cookies={"SID": "fake"},
+        session=ok_session,
+    )
+    assert rem_ok["status"] == "completed"
+    assert rem_ok["removed_count"] == 1
+    assert rem_ok["removed_item_ids"] == ["ZERO_PHOTO_1"]
+
+    # (d) purge_zero_contributed_items in dry_run/mocked mode only selects Zero's items and never selects Ryan's items
+    def fake_scrape_for_purge(album_name: str, short_url: str, max_pages: int | None = None, timeout: int = 20) -> dict[str, Any]:
+        return {
+            "album_name": album_name,
+            "album_id": f"ALB_{album_name}",
+            "auth_key": "KEY_1",
+            "item_count": 2,
+            "items": [ryan_item_by_id, zero_item],
+        }
+
+    captured_removals: list[list[Any]] = []
+    orig_remove = gpc.remove_shared_album_items
+
+    def spy_remove(**kwargs: Any) -> dict[str, Any]:
+        captured_removals.append(list(kwargs.get("items_to_remove", [])))
+        return orig_remove(**kwargs)
+
+    status_out = tmp_path / "purge_status.json"
+    with (
+        patch("tools.google_photos_curator.scrape_shared_album", side_effect=fake_scrape_for_purge),
+        patch("tools.google_photos_curator.remove_shared_album_items", side_effect=spy_remove),
+    ):
+        purge_res = gpc.purge_zero_contributed_items(
+            target_albums=["Rosie Year 6"],
+            dry_run=True,
+            status_path=status_out,
+        )
+
+    assert len(captured_removals) == 1
+    assert captured_removals[0] == [zero_item]
+    assert ryan_item_by_id not in captured_removals[0]
+    assert purge_res["Rosie Year 6"]["zero_items_found_count"] == 1
+    assert status_out.exists()
+
+
+
 
 
 
