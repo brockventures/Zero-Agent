@@ -527,19 +527,35 @@ def test_build_add_items_rpc_payload_variants_and_populate_all_targets(tmp_path:
     status_file = tmp_path / "population_status.json"
 
     rosie_items = [{"item_id": f"R_{i}", "dedup_key": f"rk_{i}"} for i in range(550)]
+    rosie_7_items = [{"item_id": f"R7_{i}", "dedup_key": f"rk7_{i}"} for i in range(550)]
     isaac_items = [{"item_id": f"I_{i}", "dedup_key": f"ik_{i}"} for i in range(565)]
+    isaac_3_items = [{"item_id": f"I3_{i}", "dedup_key": f"ik3_{i}"} for i in range(580)]
 
     (cur_dir / "rosie_year_6_curated.json").write_text(
         json.dumps({"newly_selected_count": 549, "selected_items": rosie_items}),
+        encoding="utf-8",
+    )
+    (cur_dir / "rosie_year_7_curated.json").write_text(
+        json.dumps({"newly_selected_count": 550, "selected_items": rosie_7_items}),
         encoding="utf-8",
     )
     (cur_dir / "isaac_year_2_curated.json").write_text(
         json.dumps({"newly_selected_count": 566, "selected_items": isaac_items}),
         encoding="utf-8",
     )
+    (cur_dir / "isaac_year_3_curated.json").write_text(
+        json.dumps({"newly_selected_count": 580, "selected_items": isaac_3_items}),
+        encoding="utf-8",
+    )
 
     def fake_scrape(album_name: str, short_url: str, max_pages: int | None = None, timeout: int = 20) -> dict[str, Any]:
-        items = rosie_items if album_name == "Rosie Year 6" else isaac_items
+        item_map = {
+            "Rosie Year 6": rosie_items,
+            "Rosie Year 7": rosie_7_items,
+            "Isaac Year 2": isaac_items,
+            "Isaac Year 3": isaac_3_items,
+        }
+        items = item_map.get(album_name, [])
         return {
             "album_name": album_name,
             "album_id": f"ALB_{album_name}",
@@ -558,8 +574,12 @@ def test_build_add_items_rpc_payload_variants_and_populate_all_targets(tmp_path:
     assert status_file.exists()
     assert status["Rosie Year 6"]["live_item_count"] == 550
     assert status["Rosie Year 6"]["verified"] is True
+    assert status["Rosie Year 7"]["live_item_count"] == 550
+    assert status["Rosie Year 7"]["verified"] is True
     assert status["Isaac Year 2"]["live_item_count"] == 565
     assert status["Isaac Year 2"]["verified"] is True
+    assert status["Isaac Year 3"]["live_item_count"] == 580
+    assert status["Isaac Year 3"]["verified"] is True
 
 
 def test_heart_score_inversion_fixed_and_personalized_probe() -> None:
@@ -727,6 +747,148 @@ def test_remove_shared_items_and_differential_sync() -> None:
     assert pop_partial["status"] == "completed"
     assert pop_partial["added_count"] == 1
     assert pop_partial["added_item_ids"] == ["AF1QipLibOk1"]
+
+
+def test_target_curation_specs_and_baseline_counts() -> None:
+    assert set(gpc.TARGET_CURATION_SPECS.keys()) == {
+        "Rosie Year 6",
+        "Rosie Year 7",
+        "Isaac Year 2",
+        "Isaac Year 3",
+    }
+    assert gpc.TARGET_CURATION_SPECS["Rosie Year 6"] == {
+        "child": "rosalind",
+        "target_count": 550,
+        "target_video_ratio": 0.29,
+        "output_filename": "rosie_year_6_curated.json",
+    }
+    assert gpc.TARGET_CURATION_SPECS["Rosie Year 7"] == {
+        "child": "rosalind",
+        "target_count": 550,
+        "target_video_ratio": 0.29,
+        "output_filename": "rosie_year_7_curated.json",
+    }
+    assert gpc.TARGET_CURATION_SPECS["Isaac Year 2"] == {
+        "child": "isaac",
+        "target_count": 600,
+        "target_video_ratio": 0.29,
+        "output_filename": "isaac_year_2_curated.json",
+    }
+    assert gpc.TARGET_CURATION_SPECS["Isaac Year 3"] == {
+        "child": "isaac",
+        "target_count": 600,
+        "target_video_ratio": 0.29,
+        "output_filename": "isaac_year_3_curated.json",
+    }
+
+    assert gpc.BASELINE_TARGET_COUNTS["Rosie Year 6"] == 1
+    assert gpc.BASELINE_TARGET_COUNTS["Rosie Year 7"] == 1
+    assert gpc.BASELINE_TARGET_COUNTS["Isaac Year 2"] == 34
+    assert gpc.BASELINE_TARGET_COUNTS["Isaac Year 3"] == 1
+
+
+def test_get_hearth_best_of_albums() -> None:
+    best_of = gpc.get_hearth_best_of_albums()
+    expected_yearly = {
+        "Rosie Year 1",
+        "Rosie Year 2",
+        "Rosie Year 3",
+        "Rosie Year 4",
+        "Rosie Year 5",
+        "Rosie Year 6",
+        "Rosie Year 7",
+        "Isaac Year 1",
+        "Isaac Year 2",
+        "Isaac Year 3",
+    }
+    assert set(best_of.keys()) == expected_yearly
+    assert len(best_of) == 10
+    # Strictly exclude raw source dump albums
+    assert "Rosalind '19-'23" not in best_of
+    assert "Rosalind '23-" not in best_of
+    assert "Isaac '23-" not in best_of
+    for name, meta in best_of.items():
+        assert meta["role"] != "source"
+        assert meta["short_url"].startswith("https://photos.app.goo.gl/")
+
+
+def test_populate_all_targets_source_grouped_with_manifest_and_fallback(tmp_path: Path) -> None:
+    cur_dir = tmp_path / "curation"
+    cur_dir.mkdir(parents=True, exist_ok=True)
+    manifest_file = tmp_path / "manifest.json"
+    status_file = tmp_path / "population_status.json"
+
+    manifest_data = {
+        "albums": {
+            "Rosalind '23-": {
+                "album_id": "SRC_ALB_23",
+                "auth_key": "SRC_AUTH_23",
+            },
+            "Rosalind '19-'23": {
+                "album_id": "SRC_ALB_19",
+                "auth_key": "SRC_AUTH_19",
+            },
+        }
+    }
+    manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    items = [
+        {"item_id": "ITEM_SRC_23_1", "dedup_key": "k23_1", "album_name": "Rosalind '23-"},
+        {"item_id": "ITEM_SRC_19_1", "dedup_key": "k19_1", "album_name": "Rosalind '19-'23"},
+    ]
+    (cur_dir / "rosie_year_7_curated.json").write_text(
+        json.dumps({"newly_selected_count": 2, "selected_items": items}),
+        encoding="utf-8",
+    )
+
+    populate_calls: list[dict[str, Any]] = []
+
+    def fake_populate_shared_album(**kwargs: Any) -> dict[str, Any]:
+        populate_calls.append(kwargs)
+        # Simulate V8RKJ failure on first call to trigger C2V01c fallback
+        if kwargs.get("rpc_id") == "V8RKJ+laUYf" and kwargs.get("source_album_id") == "SRC_ALB_23":
+            return {"added_count": 0, "batches_executed": 1, "rpc_id": "V8RKJ+laUYf", "status": "completed"}
+        return {
+            "added_count": len(kwargs.get("items_to_add", [])),
+            "batches_executed": 1,
+            "rpc_id": kwargs.get("rpc_id"),
+            "status": "completed",
+            "added_item_ids": [it["item_id"] for it in kwargs.get("items_to_add", [])],
+        }
+
+    def fake_scrape(album_name: str, short_url: str, max_pages: int | None = None, timeout: int = 20) -> dict[str, Any]:
+        return {
+            "album_name": album_name,
+            "album_id": "TGT_ALB_R7",
+            "auth_key": "TGT_AUTH_R7",
+            "item_count": 550,
+            "items": [],
+        }
+
+    with (
+        patch("tools.google_photos_curator.scrape_shared_album", side_effect=fake_scrape),
+        patch("tools.google_photos_curator.populate_shared_album", side_effect=fake_populate_shared_album),
+    ):
+        res = gpc.populate_all_targets(
+            curation_dir=cur_dir,
+            status_path=status_file,
+            manifest_path=manifest_file,
+            targets=["Rosie Year 7"],
+            dry_run=False,
+        )
+
+    assert status_file.exists()
+    assert res["Rosie Year 7"]["verified"] is True
+    # Check that populate_shared_album was called with source_album_id and source_auth_key
+    src_album_ids = {call["source_album_id"] for call in populate_calls}
+    assert "SRC_ALB_23" in src_album_ids
+    assert "SRC_ALB_19" in src_album_ids
+    # Verify V8RKJ+laUYf was tried
+    rpc_ids_used = [call["rpc_id"] for call in populate_calls]
+    assert "V8RKJ+laUYf" in rpc_ids_used
+    # Verify C2V01c fallback occurred for the failing V8RKJ call
+    assert gpc.ADD_ITEMS_RPC_ID in rpc_ids_used
+
 
 
 
