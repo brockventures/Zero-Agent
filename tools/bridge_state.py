@@ -49,6 +49,7 @@ TARGET_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "1542081375287640084"))
 BROCK_GUILD_ID = int(os.getenv("DISCORD_BROCK_GUILD_ID", "1210466877294518272"))
 OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
 IVY_USER_ID = int(os.getenv("DISCORD_IVY_USER_ID", "1541205716948353074"))
+VULCAN_USER_ID = int(os.getenv("VULCAN_BOT_USER_ID", "1569253686788493384"))
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
 CRAB_CAVERN_GUILD_ID = int(os.getenv("DISCORD_CRAB_CAVERN_GUILD_ID", "1486135733214380105"))
 CRAB_CAVERN_CHANNEL_IDS = {
@@ -90,15 +91,49 @@ DEFAULT_HOME_CHANNELS = {
 RETITLED_THREADS_FILE = DATA_DIR / "retitled_threads.json"
 
 
+def is_vulcan_agent() -> bool:
+    """Return True if executing inside the dedicated discord-vulcan-agent container."""
+    return os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan"
+
+
+def is_vulcan_delegated() -> bool:
+    """Return True if #forge chat and FORGE build execution are delegated to Vulcan."""
+    if os.getenv("VULCAN_DELEGATED", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    try:
+        rules = get_runtime_rules()
+        if rules.get("vulcan_delegated", False):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def is_home_channel(channel) -> bool:
-    """Check if a Discord channel or thread belongs to Zero's home turf."""
+    """Check if a Discord channel or thread belongs to Zero's (or Vulcan's) home turf."""
     if not channel:
+        return False
+
+    if is_vulcan_agent():
+        if isinstance(channel, (int, str)):
+            try:
+                return int(channel) == FORGE_CHANNEL_ID
+            except (ValueError, TypeError):
+                return False
+        ch_id = getattr(channel, "id", None)
+        if ch_id == FORGE_CHANNEL_ID:
+            return True
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id == FORGE_CHANNEL_ID:
+            return True
         return False
 
     rules = get_runtime_rules()
     ops_cat_id = rules.get("operations_category_id", OPERATIONS_CATEGORY_ID)
     home_ch_ids = set(rules.get("home_channel_ids", DEFAULT_HOME_CHANNELS))
     excluded_ch_ids = set(rules.get("excluded_home_channel_ids", DEFAULT_EXCLUDED_HOME_CHANNELS))
+    if is_vulcan_delegated():
+        excluded_ch_ids.add(FORGE_CHANNEL_ID)
 
     if isinstance(channel, (int, str)):
         try:
@@ -138,8 +173,13 @@ def is_excluded_channel(channel) -> bool:
     if not channel:
         return False
 
+    if is_vulcan_agent():
+        return not is_home_channel(channel)
+
     rules = get_runtime_rules()
     excluded_ch_ids = set(rules.get("excluded_home_channel_ids", DEFAULT_EXCLUDED_HOME_CHANNELS))
+    if is_vulcan_delegated():
+        excluded_ch_ids.add(FORGE_CHANNEL_ID)
 
     if isinstance(channel, (int, str)):
         try:
