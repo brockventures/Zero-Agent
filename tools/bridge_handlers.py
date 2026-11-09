@@ -50,6 +50,7 @@ from tools.bridge_state import (
     is_home_channel,
     is_excluded_channel,
     is_reply_to_zero,
+    is_vulcan_agent,
     IVY_USER_ID,
 )
 from tools.bridge_formatting import (
@@ -260,9 +261,13 @@ async def apply_bot_presence(bot: discord.Client, custom_activity: str = None, s
             await bot.change_presence(activity=activity, status=st)
             return
 
+        from tools.bridge_state import is_vulcan_agent
         from tools.set_status import get_status
         data = get_status()
-        act_text = data.get("activity_text", "Zero is online and ready.")[:128]
+        default_act = "Vulcan is online and ready." if is_vulcan_agent() else "Zero is online and ready."
+        act_text = data.get("activity_text", default_act)[:128]
+        if is_vulcan_agent() and not data.get("is_custom") and act_text == "Zero is online and ready.":
+            act_text = "Vulcan is online and ready."
         act_type = str(data.get("activity_type", "custom")).lower()
         st_str = str(data.get("status", "online")).lower()
 
@@ -823,6 +828,11 @@ async def handle_on_ready(
             except Exception:
                 pass
 
+        is_vulc = is_vulcan_agent()
+        default_agent_name = "Vulcan" if is_vulc else "Zero"
+        agent_name = os.environ.get("AGENT_NAME", default_agent_name).strip() or default_agent_name
+        target_ch_name = "#forge" if is_vulc else "#zero-chat"
+
         host_name = os.environ.get("NAS_HOST_2_NAME", "Host2")
         reason_tag = (
             "(Planned Feature Deploy/Update)"
@@ -831,7 +841,7 @@ async def handle_on_ready(
         )
         startup_prompt = (
             "[SYSTEM REBOOT & STARTUP EVENT]\n"
-            f"You (Zero) just completed a reboot/reload on {host_name}.\n"
+            f"You ({agent_name}) just completed a reboot/reload on {host_name}.\n"
             f"• Restart Reason: {restart_reason} {reason_tag}\n"
         )
 
@@ -842,9 +852,9 @@ async def handle_on_ready(
                 startup_prompt += f"• Interrupted Task Prior to Reboot: \"{interrupted_prompt[:150]}\"\n"
 
         startup_prompt += (
-            "\nDeliver a brief, direct restart check-in to Ryan in #zero-chat (1–2 sentences max):\n"
+            f"\nDeliver a brief, direct restart check-in to Ryan in {target_ch_name} (1–2 sentences max):\n"
             "1. MUST start your message with the exact standard status header:\n"
-            "🟢 **Zero is online and ready.**\n\n"
+            f"🟢 **{agent_name} is online and ready.**\n\n"
             "2. State concisely why you restarted in plain language (do NOT mention git commit hashes, test counts, or internal sync details).\n"
             "3. Do NOT invent filler next-step menus or artificial [CHOICES: ...] buttons, and NEVER prompt Ryan to merge, commit, or run routine git housekeeping (land any autonomous git cleanup silently before replying). Only include [CHOICES: ...] if an interrupted user task or genuine architectural decision actively requires Ryan\x27s approval."
         )

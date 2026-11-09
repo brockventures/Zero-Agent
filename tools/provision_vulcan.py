@@ -56,6 +56,7 @@ services:
     cpu_shares: 256
     environment:
       - AGENT_ROLE=vulcan
+      - AGENT_NAME=Vulcan
       - DISCORD_CHANNEL_ID={FORGE_CHANNEL_ID}
       - VULCAN_BOT_USER_ID={VULCAN_USER_ID}
       - TZ=America/Los_Angeles
@@ -82,6 +83,7 @@ def build_remote_staging_Payload(
 
     env_lines = [
         "AGENT_ROLE=vulcan",
+        "AGENT_NAME=Vulcan",
         f"DISCORD_CHANNEL_ID={FORGE_CHANNEL_ID}",
         f"VULCAN_BOT_USER_ID={VULCAN_USER_ID}",
     ]

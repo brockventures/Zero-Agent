@@ -11,6 +11,7 @@
     "turn_watchdog_seconds": 300.0,
     "turn_max_ceiling_seconds": 0.0,
     "forge_channel_id": 1562899941595160657,
+    "vulcan_delegated": true,
     "live_status_ticker_enabled": false,
     "task_settle_enabled": true,
     "task_settle_timeout_seconds": 25.0,

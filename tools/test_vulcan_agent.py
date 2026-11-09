@@ -145,12 +145,16 @@ class TestVulcanAgentScoping(unittest.TestCase):
         self.assertIn("mem_limit: 2000m", compose)
         self.assertIn("cpu_shares: 256", compose)
         self.assertIn("AGENT_ROLE=vulcan", compose)
+        self.assertIn("AGENT_NAME=Vulcan", compose)
         self.assertIn(f"DISCORD_CHANNEL_ID={bs.FORGE_CHANNEL_ID}", compose)
         self.assertIn("/workspace:/workspace", compose)
         self.assertIn("/secrets:/secrets", compose)
         self.assertIn("/app/bridge.py:/app/bridge.py", compose)
         self.assertIn("/app/entrypoint.sh:/app/entrypoint.sh", compose)
         self.assertIn("agents.md:/root/.gemini/AGENTS.md:ro", compose)
+
+        staging = pv.build_remote_staging_Payload(docker_root="/opt/docker")
+        self.assertIn("AGENT_NAME=Vulcan", staging["/opt/docker/discord-vulcan-agent/.env.defaults"])
 
         res = pv.provision_vulcan_on_host2(dry_run=True, docker_root="/opt/docker")
         self.assertTrue(res["ok"])
@@ -183,6 +187,84 @@ class TestVulcanSchedulerLeanMode(unittest.IsolatedAsyncioTestCase):
         mock_reap.assert_not_called()
         mock_tick.assert_called_once()
         mock_flush.assert_awaited_once_with(channel_filter=bs.FORGE_CHANNEL_ID)
+
+
+class TestVulcanStartupAndPresence(unittest.IsolatedAsyncioTestCase):
+    async def test_apply_bot_presence_defaults_to_vulcan(self):
+        import tools.bridge_handlers as bh
+
+        bot = AsyncMock()
+        bot.is_ready = lambda: True
+
+        with patch.dict(os.environ, {"AGENT_ROLE": "vulcan"}, clear=False), \
+             patch("tools.bridge_engine.format_active_presence_text", return_value=None), \
+             patch("tools.set_status.get_status", return_value={"activity_text": "Zero is online and ready.", "is_custom": False}):
+            os.environ.pop("AGENT_NAME", None)
+            await bh.apply_bot_presence(bot)
+            bot.change_presence.assert_awaited_once()
+            _, kwargs = bot.change_presence.call_args
+            self.assertEqual(kwargs["activity"].name, "Vulcan is online and ready.")
+
+    async def test_handle_on_ready_queues_vulcan_startup_prompt_without_agent_name_env(self):
+        import contextlib
+        import tools.bridge_handlers as bh
+
+        bot = AsyncMock()
+        bot.user = AsyncMock()
+        bot.user.id = 123456789
+        fake_channel = DummyChannel(bs.FORGE_CHANNEL_ID)
+        bot.get_channel = lambda cid: fake_channel
+        turn_queue = asyncio.Queue()
+        ext_turn_queue = asyncio.Queue()
+
+        orig_has_notified = bh.has_notified_ready
+        bh.has_notified_ready = False
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, {"AGENT_ROLE": "vulcan"}, clear=False))
+                stack.enter_context(patch("tools.bridge_handlers.sync_credentials"))
+                stack.enter_context(patch("tools.bridge_handlers.update_beacon"))
+                stack.enter_context(patch("tools.mcp_daemon.ensure_mcp_daemon_running"))
+                stack.enter_context(patch("tools.mcp_daemon.get_status", return_value={}))
+                stack.enter_context(patch("tools.zero_mail_listener.ensure_mail_listener_running"))
+                stack.enter_context(patch("tools.zero_mail_listener.get_status", return_value={}))
+                stack.enter_context(patch("tools.amazon_order_listener.ensure_amazon_listener_running"))
+                stack.enter_context(patch("tools.amazon_order_listener.get_status", return_value={}))
+                stack.enter_context(patch("tools.zero_health_server.ensure_health_server_running"))
+                stack.enter_context(patch("tools.zero_health_server.get_status", return_value={}))
+                stack.enter_context(patch("tools.banana_watcher.ensure_banana_watcher_running"))
+                stack.enter_context(patch("tools.banana_watcher.get_daemon_status", return_value={}))
+                stack.enter_context(patch("tools.forge.reconcile_forge_on_boot", return_value={}))
+                stack.enter_context(patch("tools.bridge_daemons.warmup_persistent_daemons", new_callable=AsyncMock))
+                mock_inflight = stack.enter_context(patch("tools.bridge_handlers.IN_FLIGHT_FILE"))
+                mock_restart = stack.enter_context(patch("tools.bridge_handlers.RESTART_INTENT_FILE"))
+                mock_sessions = stack.enter_context(patch("tools.bridge_handlers.SESSIONS_FILE"))
+                stack.enter_context(patch("tools.bridge_handlers.get_runtime_rules", return_value={"home_channel_ids": []}))
+                stack.enter_context(patch("tools.bridge_handlers.warm_channel_history", new_callable=AsyncMock))
+                stack.enter_context(patch("tools.bridge_handlers.detect_recent_container_oom", return_value=None, create=True))
+
+                os.environ.pop("AGENT_NAME", None)
+                mock_inflight.exists.return_value = False
+                mock_restart.exists.return_value = False
+                mock_sessions.exists.return_value = False
+
+                await bh.handle_on_ready(
+                    bot=bot,
+                    turn_queue=turn_queue,
+                    ext_turn_queue=ext_turn_queue,
+                    start_workers_fn=None,
+                    start_scheduler_fn=None,
+                )
+
+                self.assertFalse(turn_queue.empty())
+                queued = await turn_queue.get()
+                prompt = queued["prompt"]
+                self.assertIn("You (Vulcan) just completed a reboot/reload", prompt)
+                self.assertIn("🟢 **Vulcan is online and ready.**", prompt)
+                self.assertIn("#forge", prompt)
+                self.assertNotIn("Zero is online and ready.", prompt)
+        finally:
+            bh.has_notified_ready = orig_has_notified
 
 
 if __name__ == "__main__":
