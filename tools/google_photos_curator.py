@@ -39,7 +39,9 @@ ADD_LIBRARY_TO_SHARED_RPC_ID = "laUYf"
 REMOVE_SHARED_ITEMS_RPC_ID = "LjmOue"
 BASELINE_TARGET_COUNTS: dict[str, int] = {
     "Rosie Year 6": 1,
+    "Rosie Year 7": 1,
     "Isaac Year 2": 34,
+    "Isaac Year 3": 1,
 }
 BURST_WINDOW_MS = 90_000
 TARGET_CURATION_SPECS: dict[str, dict[str, Any]] = {
@@ -49,11 +51,23 @@ TARGET_CURATION_SPECS: dict[str, dict[str, Any]] = {
         "target_video_ratio": 0.29,
         "output_filename": "rosie_year_6_curated.json",
     },
+    "Rosie Year 7": {
+        "child": "rosalind",
+        "target_count": 550,
+        "target_video_ratio": 0.29,
+        "output_filename": "rosie_year_7_curated.json",
+    },
     "Isaac Year 2": {
         "child": "isaac",
         "target_count": 600,
         "target_video_ratio": 0.29,
         "output_filename": "isaac_year_2_curated.json",
+    },
+    "Isaac Year 3": {
+        "child": "isaac",
+        "target_count": 600,
+        "target_video_ratio": 0.29,
+        "output_filename": "isaac_year_3_curated.json",
     },
 }
 
@@ -134,6 +148,12 @@ ALBUM_REGISTRY: dict[str, dict[str, str]] = {
         "year": "3",
     },
 }
+
+
+def get_hearth_best_of_albums() -> dict[str, dict[str, str]]:
+    """Return strictly the 10 yearly best-of albums from ALBUM_REGISTRY (Rosie Year 1-7 and Isaac Year 1-3), excluding raw dump source albums."""
+    return {name: dict(meta) for name, meta in ALBUM_REGISTRY.items() if meta.get("role") != "source"}
+
 
 # Birthday-year windows (inclusive start, exclusive end) in UTC milliseconds
 # Rosie birthday: Nov 10 (Nov 2024 - Nov 2025 for Year 6; Nov 2025 - Nov 2026 for Year 7)
@@ -2341,6 +2361,28 @@ def sync_shared_album_differential(
                     session=session,
                     dry_run=dry_run,
                 )
+                if (
+                    not dry_run
+                    and int(add_res.get("added_count", 0)) == 0
+                    and grp
+                    and effective_add_rpc_id != ADD_ITEMS_RPC_ID
+                ):
+                    fallback_res = populate_shared_album(
+                        target_album=target_album,
+                        target_album_id=pre_live["album_id"],
+                        target_auth_key=pre_live["auth_key"],
+                        items_to_add=grp,
+                        cookies=cookies,
+                        cookies_db_path=cookies_db_path,
+                        batch_size=batch_size,
+                        rpc_id=ADD_ITEMS_RPC_ID,
+                        source_album_id=src_meta.get("album_id"),
+                        source_auth_key=src_meta.get("auth_key"),
+                        session=session,
+                        dry_run=dry_run,
+                    )
+                    if int(fallback_res.get("added_count", 0)) > 0:
+                        add_res = fallback_res
                 total_added += int(add_res.get("added_count", 0))
                 total_add_batches += int(add_res.get("batches_executed", 0))
                 added_ids.extend(add_res.get("added_item_ids", []))
@@ -2388,7 +2430,11 @@ def sync_shared_album_differential(
     )
     post_count = int(post_live.get("item_count", 0))
     spec = TARGET_CURATION_SPECS.get(target_album, {"target_count": len(selected_items)})
-    min_expected = 540 if target_album == "Rosie Year 6" else (560 if target_album == "Isaac Year 2" else int(spec["target_count"]) - 40)
+    min_expected = (
+        540
+        if target_album in ("Rosie Year 6", "Rosie Year 7")
+        else (560 if target_album in ("Isaac Year 2", "Isaac Year 3") else int(spec["target_count"]) - 40)
+    )
 
     return {
         "target_album": target_album,
@@ -2425,7 +2471,7 @@ def populate_all_targets(
     dry_run: bool = False,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
-    """Populate or differentially sync all curated target albums (Rosie Year 6 & Isaac Year 2), verify live counts, and write population_status.json."""
+    """Populate or differentially sync all curated target albums (Rosie Year 6 & 7, Isaac Year 2 & 3), verify live counts, and write population_status.json."""
     cur_dir = Path(curation_dir)
     target_names = targets or list(TARGET_CURATION_SPECS.keys())
     albums_status: dict[str, dict[str, Any]] = {}
@@ -2461,21 +2507,106 @@ def populate_all_targets(
         selected_items = curated_data.get("selected_items", [])
         remaining_items = [it for it in selected_items if _item_key(it) not in live_existing_keys]
 
-        pop_res = populate_shared_album(
-            target_album=t_name,
-            target_album_id=pre_live["album_id"],
-            target_auth_key=pre_live["auth_key"],
-            items_to_add=remaining_items,
-            cookies_db_path=cookies_db_path,
-            batch_size=batch_size,
-            rpc_id=rpc_id,
-            session=session,
-            dry_run=dry_run,
-        )
+        total_added = 0
+        total_add_batches = 0
+        added_ids: list[str] = []
+        last_pop_res: dict[str, Any] = {}
+        effective_rpc_id = rpc_id
+
+        if remaining_items:
+            albums_meta = (manifest or {}).get("albums", {})
+            if albums_meta and effective_rpc_id == ADD_ITEMS_RPC_ID:
+                effective_rpc_id = f"{SAVE_TO_LIBRARY_RPC_ID}+{ADD_LIBRARY_TO_SHARED_RPC_ID}"
+
+            has_album_names = any(it.get("album_name") for it in remaining_items)
+            if albums_meta and (
+                effective_rpc_id in (
+                    "V8RKJ+laUYf",
+                    f"{SAVE_TO_LIBRARY_RPC_ID}+{ADD_LIBRARY_TO_SHARED_RPC_ID}",
+                )
+                or has_album_names
+            ):
+                by_src: dict[str, list[dict[str, Any]]] = {}
+                for it in remaining_items:
+                    s_name = str(it.get("album_name") or "")
+                    by_src.setdefault(s_name, []).append(it)
+                for s_name, grp in by_src.items():
+                    src_meta = albums_meta.get(s_name, {})
+                    src_album_id = src_meta.get("album_id")
+                    src_auth_key = src_meta.get("auth_key")
+                    pop_res = populate_shared_album(
+                        target_album=t_name,
+                        target_album_id=pre_live["album_id"],
+                        target_auth_key=pre_live["auth_key"],
+                        items_to_add=grp,
+                        cookies_db_path=cookies_db_path,
+                        batch_size=batch_size,
+                        rpc_id=effective_rpc_id,
+                        source_album_id=src_album_id,
+                        source_auth_key=src_auth_key,
+                        session=session,
+                        dry_run=dry_run,
+                    )
+                    # If V8RKJ failed (0 added in live run), fallback to source-grouped C2V01c
+                    if (
+                        not dry_run
+                        and int(pop_res.get("added_count", 0)) == 0
+                        and grp
+                        and effective_rpc_id != ADD_ITEMS_RPC_ID
+                    ):
+                        fallback_res = populate_shared_album(
+                            target_album=t_name,
+                            target_album_id=pre_live["album_id"],
+                            target_auth_key=pre_live["auth_key"],
+                            items_to_add=grp,
+                            cookies_db_path=cookies_db_path,
+                            batch_size=batch_size,
+                            rpc_id=ADD_ITEMS_RPC_ID,
+                            source_album_id=src_album_id,
+                            source_auth_key=src_auth_key,
+                            session=session,
+                            dry_run=dry_run,
+                        )
+                        if int(fallback_res.get("added_count", 0)) > 0:
+                            pop_res = fallback_res
+                    total_added += int(pop_res.get("added_count", 0))
+                    total_add_batches += int(pop_res.get("batches_executed", 0))
+                    added_ids.extend(pop_res.get("added_item_ids", []))
+                    last_pop_res = pop_res
+            else:
+                pop_res = populate_shared_album(
+                    target_album=t_name,
+                    target_album_id=pre_live["album_id"],
+                    target_auth_key=pre_live["auth_key"],
+                    items_to_add=remaining_items,
+                    cookies_db_path=cookies_db_path,
+                    batch_size=batch_size,
+                    rpc_id=effective_rpc_id,
+                    session=session,
+                    dry_run=dry_run,
+                )
+                total_added += int(pop_res.get("added_count", 0))
+                total_add_batches += int(pop_res.get("batches_executed", 0))
+                added_ids.extend(pop_res.get("added_item_ids", []))
+                last_pop_res = pop_res
+        else:
+            last_pop_res = {
+                "target_album": t_name,
+                "target_album_id": pre_live["album_id"],
+                "requested_count": 0,
+                "added_count": 0,
+                "batches_executed": 0,
+                "rpc_id": rpc_id,
+                "dry_run": dry_run,
+                "status": "dry_run" if dry_run else "noop",
+                "added_item_ids": [],
+            }
 
         post_live = pre_live if (dry_run or not remaining_items) else scrape_shared_album(t_name, short_url)
         post_count = int(post_live.get("item_count", 0))
-        min_expected = 540 if t_name == "Rosie Year 6" else (560 if t_name == "Isaac Year 2" else int(spec["target_count"]) - 40)
+        min_expected = 540 if t_name in ("Rosie Year 6", "Rosie Year 7") else (
+            560 if t_name in ("Isaac Year 2", "Isaac Year 3") else int(spec["target_count"]) - 40
+        )
 
         entry = {
             "target_album": t_name,
@@ -2485,13 +2616,13 @@ def populate_all_targets(
             "curated_newly_selected_count": int(curated_data.get("newly_selected_count", len(remaining_items))),
             "pre_population_live_count": int(pre_live.get("item_count", 0)),
             "remaining_submitted_count": len(remaining_items),
-            "added_in_run_count": int(pop_res.get("added_count", 0)),
-            "batches_executed": int(pop_res.get("batches_executed", 0)),
-            "rpc_id": pop_res.get("rpc_id", rpc_id),
+            "added_in_run_count": total_added,
+            "batches_executed": total_add_batches,
+            "rpc_id": last_pop_res.get("rpc_id", effective_rpc_id),
             "post_population_live_count": post_count,
             "live_item_count": post_count,
             "verified": post_count >= min_expected,
-            "status": pop_res.get("status", "completed"),
+            "status": last_pop_res.get("status", "completed"),
         }
         albums_status[t_name] = entry
 
