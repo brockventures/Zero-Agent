@@ -18,6 +18,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import urllib.parse
+import urllib.request
 from zoneinfo import ZoneInfo
 
 CURRENT_DIR = Path(__file__).resolve().parent.parent
@@ -332,6 +333,60 @@ def _evaluate_ivy(force: bool = False, strict: bool = False) -> tuple[int, dict]
     return status_code, payload
 
 
+def _discover_process_pid(
+    patterns: tuple[str, ...] | list[str] | str,
+    required_substrings: tuple[str, ...] = (),
+) -> int | None:
+    """Scan /proc/[0-9]*/cmdline for a live process matching any pattern."""
+    if isinstance(patterns, str):
+        patterns = (patterns,)
+    proc_dir = Path("/proc")
+    if not proc_dir.exists():
+        return None
+    my_pid = os.getpid()
+    try:
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == my_pid:
+                continue
+            try:
+                cmdline_path = entry / "cmdline"
+                if not cmdline_path.exists():
+                    continue
+                cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                if not any(pat in cmdline for pat in patterns):
+                    continue
+                if required_substrings and not all(req in cmdline for req in required_substrings):
+                    continue
+                status_path = entry / "status"
+                if status_path.exists():
+                    status_text = status_path.read_text(encoding="utf-8", errors="ignore")
+                    tgid_lines = [line.split()[1] for line in status_text.splitlines() if line.startswith("Tgid:")]
+                    if tgid_lines and int(tgid_lines[0]) != pid:
+                        continue
+                os.kill(pid, 0)
+                return pid
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _check_health_port_alive(port: int | None = None, timeout: float = 1.5) -> bool:
+    """Check if the local health server HTTP port is already responding 200 OK."""
+    target_port = port if port is not None else PORT
+    url = f"http://127.0.0.1:{target_port}/health"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Zero-Health-SelfCheck/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode() == 200
+    except Exception:
+        return False
+
+
 class ZeroHealthHandler(BaseHTTPRequestHandler):
     def _evaluate_health(self, strict: bool = False) -> tuple[int, dict]:
         now_ts = time.time()
@@ -374,7 +429,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-        # 3. Check MCP daemon liveness
+        # 3. Check MCP daemon liveness (with /proc discovery self-healing fallback)
         mcp_pid_file = DATA_DIR / "mcp_daemon.pid"
         mcp_status = "offline"
         if mcp_pid_file.exists():
@@ -384,8 +439,16 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 mcp_status = "running"
             except Exception:
                 mcp_status = "stale_pid"
+        if mcp_status != "running":
+            discovered_mcp_pid = _discover_process_pid("mcp_daemon.py")
+            if discovered_mcp_pid:
+                mcp_status = "running"
+                try:
+                    mcp_pid_file.write_text(str(discovered_mcp_pid))
+                except Exception:
+                    pass
 
-        # 4. Check Mail listener liveness
+        # 4. Check Mail listener liveness (with /proc discovery self-healing fallback)
         mail_pid_file = DATA_DIR / "zero_mail_listener.pid"
         mail_status = "offline"
         if mail_pid_file.exists():
@@ -395,6 +458,14 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 mail_status = "running"
             except Exception:
                 mail_status = "stale_pid"
+        if mail_status != "running":
+            discovered_mail_pid = _discover_process_pid(("zero_mail_listener", "mail_listener"))
+            if discovered_mail_pid:
+                mail_status = "running"
+                try:
+                    mail_pid_file.write_text(str(discovered_mail_pid))
+                except Exception:
+                    pass
 
         # 5. Check in-flight active turns
         active_in_flight_turns = []
@@ -1549,33 +1620,46 @@ def run_server():
 
 
 def is_running() -> int | None:
-    if not PID_FILE.exists():
-        return None
-    try:
-        pid = int(PID_FILE.read_text().strip())
-        os.kill(pid, 0)
-        cmdline_path = Path(f"/proc/{pid}/cmdline")
-        status_path = Path(f"/proc/{pid}/status")
-        if cmdline_path.exists() and status_path.exists():
-            cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
-            status_text = status_path.read_text(encoding="utf-8", errors="ignore")
-            tgid_lines = [line.split()[1] for line in status_text.splitlines() if line.startswith("Tgid:")]
-            if (tgid_lines and int(tgid_lines[0]) != pid) or "zero_health_server" not in cmdline:
-                PID_FILE.unlink(missing_ok=True)
-                return None
-        return pid
-    except (ValueError, OSError):
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, 0)
+            cmdline_path = Path(f"/proc/{pid}/cmdline")
+            status_path = Path(f"/proc/{pid}/status")
+            valid_proc = True
+            if cmdline_path.exists() and status_path.exists():
+                cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                status_text = status_path.read_text(encoding="utf-8", errors="ignore")
+                tgid_lines = [line.split()[1] for line in status_text.splitlines() if line.startswith("Tgid:")]
+                if (tgid_lines and int(tgid_lines[0]) != pid) or "zero_health_server" not in cmdline:
+                    valid_proc = False
+            if valid_proc:
+                return pid
+        except (ValueError, OSError):
+            pass
+
+    discovered = _discover_process_pid("zero_health_server.py", ("--foreground",)) or _discover_process_pid("zero_health_server.py")
+    if discovered:
+        try:
+            PID_FILE.write_text(str(discovered))
+        except Exception:
+            pass
+        return discovered
+
+    if PID_FILE.exists():
         try:
             PID_FILE.unlink()
         except Exception:
             pass
-        return None
+    return None
 
 
 def start_daemon():
     pid = is_running()
     if pid:
         return {"ok": True, "status": "already_running", "pid": pid, "port": PORT}
+    if _check_health_port_alive():
+        return {"ok": True, "status": "already_running", "pid": None, "port": PORT}
 
     with open(LOG_FILE, "a") as log_out:
         proc = subprocess.Popen(
@@ -1616,15 +1700,17 @@ def stop_daemon():
 
 
 def ensure_health_server_running():
-    if not is_running():
-        start_daemon()
+    if is_running() or _check_health_port_alive():
+        return
+    start_daemon()
 
 
 def get_status() -> dict:
     pid = is_running()
+    running = (pid is not None) or _check_health_port_alive()
     return {
         "ok": True,
-        "running": pid is not None,
+        "running": running,
         "pid": pid,
         "port": PORT,
         "url": f"http://127.0.0.1:{PORT}/"

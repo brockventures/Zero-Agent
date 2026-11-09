@@ -333,6 +333,83 @@ class TestZeroHealthServer(unittest.TestCase):
         self.assertEqual(sent_headers.get("Content-Disposition"), 'attachment; filename="gotchi-v2.apk"')
         self.assertEqual(h.wfile.getvalue(), b"PK\x03\x04dummy-apk-payload")
 
+    def test_health_components_proc_fallback_and_pid_self_healing(self):
+        now = time.time()
+        beacon_data = {
+            "gateway_heartbeat": now - 5,
+            "gateway_status": "connected",
+            "gateway_latency_ms": 20.0,
+            "state": "IDLE"
+        }
+        (self.temp_path / "liveness_beacon.json").write_text(json.dumps(beacon_data))
+        # Write stale PIDs that do not exist
+        (self.temp_path / "mcp_daemon.pid").write_text("9999991")
+        (self.temp_path / "zero_mail_listener.pid").write_text("9999992")
+
+        def fake_discover(patterns, required_substrings=()):
+            if patterns == "mcp_daemon.py":
+                return 42421
+            if "mail_listener" in patterns:
+                return 42422
+            return None
+
+        handler = zhealth.ZeroHealthHandler.__new__(zhealth.ZeroHealthHandler)
+        with patch("tools.zero_health_server._discover_process_pid", side_effect=fake_discover):
+            code, payload = handler._evaluate_health()
+
+        self.assertEqual(code, 200)
+        self.assertEqual(payload["components"]["mcp_daemon"], "running")
+        self.assertEqual(payload["components"]["mail_listener"], "running")
+        self.assertEqual((self.temp_path / "mcp_daemon.pid").read_text().strip(), "42421")
+        self.assertEqual((self.temp_path / "zero_mail_listener.pid").read_text().strip(), "42422")
+
+    def test_health_server_is_running_and_port_fallback(self):
+        orig_pid_file = zhealth.PID_FILE
+        try:
+            zhealth.PID_FILE = self.temp_path / "zero_health_server.pid"
+            zhealth.PID_FILE.write_text("9999993")
+
+            with patch("tools.zero_health_server._discover_process_pid", return_value=51510):
+                pid = zhealth.is_running()
+                self.assertEqual(pid, 51510)
+                self.assertEqual(zhealth.PID_FILE.read_text().strip(), "51510")
+
+            # When PID is not found but port 8769 is alive, ensure_health_server_running does not spawn duplicate
+            zhealth.PID_FILE.unlink(missing_ok=True)
+            with patch("tools.zero_health_server._discover_process_pid", return_value=None), \
+                 patch("tools.zero_health_server._check_health_port_alive", return_value=True), \
+                 patch("tools.zero_health_server.start_daemon") as mock_start:
+                zhealth.ensure_health_server_running()
+                mock_start.assert_not_called()
+                status = zhealth.get_status()
+                self.assertTrue(status["running"])
+        finally:
+            zhealth.PID_FILE = orig_pid_file
+
+    def test_mcp_daemon_pid_self_healing_and_healthy_port_fallback(self):
+        import tools.mcp_daemon as mcp_daemon
+
+        orig_pid_file = mcp_daemon.PID_FILE
+        try:
+            mcp_daemon.PID_FILE = self.temp_path / "mcp_daemon.pid"
+            mcp_daemon.PID_FILE.write_text("9999994")
+
+            # 1. Reconciles stale PID_FILE via /proc discovery
+            with patch("tools.mcp_daemon._discover_mcp_daemon_pid", return_value=61610):
+                pid = mcp_daemon.get_daemon_pid()
+                self.assertEqual(pid, 61610)
+                self.assertEqual(mcp_daemon.PID_FILE.read_text().strip(), "61610")
+
+            # 2. If PID_FILE is missing and /proc returns None, but all ports return 200 OK, get_status treats as healthy
+            mcp_daemon.PID_FILE.unlink(missing_ok=True)
+            with patch("tools.mcp_daemon._discover_mcp_daemon_pid", return_value=None), \
+                 patch("tools.mcp_daemon.check_port_health", return_value=(True, "HTTP 200 OK")):
+                st = mcp_daemon.get_status()
+                self.assertTrue(st["running"])
+                self.assertTrue(st["healthy"])
+        finally:
+            mcp_daemon.PID_FILE = orig_pid_file
+
 
 if __name__ == "__main__":
     unittest.main()

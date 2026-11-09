@@ -137,21 +137,57 @@ def is_mcp_daemon_process(pid: int) -> bool:
     return True
 
 
-def get_daemon_pid() -> int | None:
-    """Read the current daemon PID from PID_FILE if running."""
-    if not PID_FILE.exists():
+def _discover_mcp_daemon_pid() -> int | None:
+    """Scan /proc/[0-9]*/cmdline for a running mcp_daemon.py process."""
+    proc_dir = Path("/proc")
+    if not proc_dir.exists():
         return None
+    my_pid = os.getpid()
     try:
-        with open(PID_FILE, "r") as f:
-            pid = int(f.read().strip())
-        if is_mcp_daemon_process(pid):
-            return pid
-        else:
-            PID_FILE.unlink(missing_ok=True)
-            return None
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == my_pid:
+                continue
+            try:
+                cmdline_path = entry / "cmdline"
+                if not cmdline_path.exists():
+                    continue
+                cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace")
+                if "mcp_daemon.py" in cmdline and "run" in cmdline:
+                    if is_process_running(pid):
+                        return pid
+            except Exception:
+                continue
     except Exception:
+        pass
+    return None
+
+
+def get_daemon_pid() -> int | None:
+    """Read the current daemon PID from PID_FILE if running, or reconcile via /proc."""
+    if PID_FILE.exists():
+        try:
+            with open(PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            if is_mcp_daemon_process(pid):
+                return pid
+        except Exception:
+            pass
+
+    discovered = _discover_mcp_daemon_pid()
+    if discovered:
+        try:
+            with open(PID_FILE, "w") as f:
+                f.write(str(discovered))
+        except Exception:
+            pass
+        return discovered
+
+    if PID_FILE.exists():
         PID_FILE.unlink(missing_ok=True)
-        return None
+    return None
 
 async def run_servers_async():
     """Run all MCP servers concurrently inside one asyncio event loop."""
@@ -288,14 +324,13 @@ def stop_daemon() -> bool:
 def get_status() -> dict:
     """Check full status of MCP daemon and all endpoints."""
     pid = get_daemon_pid()
-    is_running = pid is not None
-    
+
     server_status = {}
-    all_healthy = is_running
+    ports_all_healthy = len(SERVERS_CONFIG) > 0
     for name, cfg in SERVERS_CONFIG.items():
         ok, msg = check_port_health(cfg["port"])
         if not ok:
-            all_healthy = False
+            ports_all_healthy = False
         server_status[name] = {
             "port": cfg["port"],
             "url": f"http://127.0.0.1:{cfg['port']}/sse",
@@ -303,6 +338,19 @@ def get_status() -> dict:
             "status": msg,
             "description": cfg["description"],
         }
+
+    if pid is None and ports_all_healthy:
+        discovered = _discover_mcp_daemon_pid()
+        if discovered:
+            pid = discovered
+            try:
+                with open(PID_FILE, "w") as f:
+                    f.write(str(pid))
+            except Exception:
+                pass
+
+    is_running = (pid is not None) or ports_all_healthy
+    all_healthy = is_running and ports_all_healthy
 
     return {
         "running": is_running,
