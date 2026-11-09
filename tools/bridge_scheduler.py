@@ -1749,8 +1749,14 @@ class BridgeScheduler:
 
     async def start(self):
         self._running = True
-        # Evaluate missed/due jobs on startup
-        await self._evaluate_and_dispatch_jobs(is_startup=True)
+        try:
+            from tools.bridge_state import is_vulcan_agent
+            is_vulc = is_vulcan_agent()
+        except Exception:
+            is_vulc = False
+        # Evaluate missed/due jobs on startup (Zero only; Vulcan runs lean #forge-only loop)
+        if not is_vulc:
+            await self._evaluate_and_dispatch_jobs(is_startup=True)
         self._task = asyncio.create_task(self._loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
@@ -1763,7 +1769,7 @@ class BridgeScheduler:
         for t in list(self._active_job_tasks):
             t.cancel()
 
-    async def flush_outbox_queue(self):
+    async def flush_outbox_queue(self, channel_filter: int | None = None):
         """Outbox Queue Flusher (Cross-Channel Asynchronous Dispatch)
         
         Safely drains pending outbox messages with:
@@ -1784,6 +1790,19 @@ class BridgeScheduler:
                 ch_name = omsg.get("channel", "unknown")
                 target_cid = omsg.get("channel_id")
                 if not target_cid or not self.bot:
+                    continue
+
+                if channel_filter is not None and int(target_cid) != int(channel_filter):
+                    try:
+                        from tools.outbox import queue_outbox_message
+                        queue_outbox_message(
+                            channel=str(target_cid),
+                            content=omsg.get("content", ""),
+                            source_turn=omsg.get("source", "requeued"),
+                            is_agent_turn=bool(omsg.get("type") == "agent_turn" or omsg.get("is_agent_turn")),
+                        )
+                    except Exception:
+                        pass
                     continue
 
                 try:
@@ -1902,6 +1921,35 @@ class BridgeScheduler:
         while self._running:
             try:
                 now_ts = time.time()
+                try:
+                    from tools.bridge_state import is_vulcan_agent, FORGE_CHANNEL_ID
+                    in_vulcan = is_vulcan_agent()
+                except Exception:
+                    in_vulcan = False
+
+                if in_vulcan:
+                    # Lean #forge-only loop for Vulcan: gateway heartbeat, ForgeSupervisor build/chunk ticks,
+                    # and #forge turn/wakeup dispatching (skipping Zero-only household cron jobs, email listeners,
+                    # and Crab Cavern background tasks).
+                    try:
+                        from tools.bridge_state import update_gateway_heartbeat
+                        gw_status = "connected" if (self.bot and getattr(self.bot, "is_ready", lambda: False)()) else "disconnected"
+                        update_gateway_heartbeat(self.bot, status=gw_status)
+                    except Exception:
+                        pass
+
+                    try:
+                        from tools.forge import forge_supervisor
+                        await asyncio.wait_for(asyncio.to_thread(forge_supervisor.tick_sync), timeout=12.0)
+                    except asyncio.TimeoutError:
+                        print("[BridgeScheduler] Warning: forge_supervisor.tick_sync() timed out after 12s (Vulcan lean loop)")
+                    except Exception:
+                        pass
+
+                    await self.flush_outbox_queue(channel_filter=FORGE_CHANNEL_ID)
+                    await asyncio.sleep(15)
+                    continue
+
                 await self._evaluate_and_dispatch_jobs(is_startup=False)
 
                 # Dynamic Discord Gateway Heartbeat Verification & Stale Process Table Reaper

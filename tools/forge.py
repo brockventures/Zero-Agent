@@ -372,14 +372,29 @@ def get_default_origin_channel() -> str:
     return "zero-chat"
 
 
-def _get_discord_token(for_forge_channel: bool = False) -> Optional[str]:
-    """Retrieve Discord bot token across Zero (/secrets) and Ivy (.env) environments.
+def _get_discord_token(
+    for_forge_channel: bool = False,
+    for_channel_id: Optional[int] = None,
+) -> Optional[str]:
+    """Retrieve Discord bot token across Zero (/secrets), Vulcan, and Ivy (.env) environments.
 
-    When `for_forge_channel=True`, prefers `VULCAN_BOT_TOKEN` / `FORGE_BOT_TOKEN` if
-    configured, or Zero's bot token from `/opt/zero/.env` inside `discord-ivy-agent`.
+    When `for_forge_channel=True` or `for_channel_id == FORGE_CHANNEL_ID`, prefers
+    `VULCAN_DISCORD_TOKEN` / `VULCAN_BOT_TOKEN` / `FORGE_BOT_TOKEN` if configured
+    (especially when `AGENT_ROLE=vulcan` or `VULCAN_DELEGATED=1`), while using Zero's
+    primary `DISCORD_BOT_TOKEN` for cross-channel notifications/cards outside `#forge`.
     """
-    if for_forge_channel:
-        for env_key in ("VULCAN_BOT_TOKEN", "FORGE_BOT_TOKEN"):
+    is_forge_target = bool(for_forge_channel or (for_channel_id is not None and int(for_channel_id) == FORGE_CHANNEL_ID))
+    vulcan_active = (
+        os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan"
+        or os.getenv("VULCAN_DELEGATED", "").strip().lower() in {"1", "true", "yes"}
+    )
+    if is_forge_target:
+        token_keys = (
+            ("VULCAN_DISCORD_TOKEN", "VULCAN_BOT_TOKEN", "FORGE_BOT_TOKEN")
+            if vulcan_active
+            else ("VULCAN_DISCORD_TOKEN", "VULCAN_BOT_TOKEN", "FORGE_BOT_TOKEN")
+        )
+        for env_key in token_keys:
             val = os.getenv(env_key, "").strip()
             if val:
                 return val
@@ -387,13 +402,13 @@ def _get_discord_token(for_forge_channel: bool = False) -> Optional[str]:
             if sec_p.exists():
                 try:
                     sec_data = json.loads(sec_p.read_text(encoding="utf-8"))
-                    for env_key in ("VULCAN_BOT_TOKEN", "FORGE_BOT_TOKEN"):
+                    for env_key in token_keys:
                         val = str(sec_data.get(env_key) or "").strip()
                         if val:
                             return val
                 except Exception:
                     pass
-    if for_forge_channel and is_ivy_container():
+    if is_forge_target and is_ivy_container():
         zero_env = Path("/opt/zero/.env")
         if zero_env.exists():
             try:
@@ -404,6 +419,17 @@ def _get_discord_token(for_forge_channel: bool = False) -> Optional[str]:
                             return val
             except Exception:
                 pass
+    # For cross-channel cards/notifications outside #forge when running inside Vulcan, prefer Zero's primary DISCORD_BOT_TOKEN from /secrets/env.json
+    if not is_forge_target and os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan":
+        for sec_p in (Path("/secrets/env.json"), Path("/opt/zero/secrets/env.json")):
+            if sec_p.exists():
+                try:
+                    sec_data = json.loads(sec_p.read_text(encoding="utf-8"))
+                    val = str(sec_data.get("DISCORD_BOT_TOKEN") or "").strip()
+                    if val:
+                        return val
+                except Exception:
+                    pass
     try:
         from tools.deliver_image import get_discord_token
         return get_discord_token()
@@ -5720,8 +5746,47 @@ class ForgeSupervisor:
                 return min(self.max_parallel_chunks, ACTIVE_CHAT_MAX_PARALLEL_CHUNKS)
         return self.max_parallel_chunks
 
+    def should_execute_builds(self) -> bool:
+        """Return True when this container should execute FORGE builds/chunks, or False when Zero delegates to Vulcan."""
+        try:
+            from tools.bridge_state import is_vulcan_agent, is_vulcan_delegated
+            if is_vulcan_agent():
+                return True
+            if is_vulcan_delegated() and not is_ivy_container():
+                return False
+        except Exception:
+            role = os.getenv("AGENT_ROLE", "").strip().lower()
+            if role == "vulcan":
+                return True
+            if os.getenv("VULCAN_DELEGATED", "").strip().lower() in {"1", "true", "yes"} and not is_ivy_container():
+                return False
+        return True
+
+    def _record_vulcan_heartbeat(self) -> None:
+        """Record a Vulcan supervisor heartbeat timestamp to /workspace/data/vulcan_heartbeat.json."""
+        try:
+            from tools.bridge_state import is_vulcan_agent
+            is_vulc = is_vulcan_agent()
+        except Exception:
+            is_vulc = os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan"
+        if not is_vulc:
+            return
+        hb_path = DATA_DIR / "vulcan_heartbeat.json"
+        try:
+            hb_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "timestamp": time.time(),
+                "agent_role": "vulcan",
+                "channel_id": FORGE_CHANNEL_ID,
+                "active_builds": sorted(self._count_active_build_workers()),
+            }
+            hb_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
     def tick_sync(self) -> dict:
         """Synchronous housekeeping tick: expire stale decisions, prune 1h completed #forge cards, sync header, dispatch SDK tasks, and advance queued builds."""
+        self._record_vulcan_heartbeat()
         try:
             from tools.bridge_state import reap_stale_in_flight_entries
             reap_stale_in_flight_entries()
@@ -5738,11 +5803,12 @@ class ForgeSupervisor:
             pass
 
         spawned_builds: list[str] = []
-        while len(self._count_active_build_workers()) < self._effective_max_builds():
-            b_id = self.maybe_spawn_next_build_worker()
-            if not b_id:
-                break
-            spawned_builds.append(b_id)
+        if self.should_execute_builds():
+            while len(self._count_active_build_workers()) < self._effective_max_builds():
+                b_id = self.maybe_spawn_next_build_worker()
+                if not b_id:
+                    break
+                spawned_builds.append(b_id)
 
         return {
             "expired_decisions": expired,
@@ -5754,6 +5820,8 @@ class ForgeSupervisor:
 
     def maybe_spawn_next_build_worker(self) -> Optional[str]:
         """If a build for this container is queued/running in SQLite and active build workers < max_parallel_builds, spawn a detached worker."""
+        if not self.should_execute_builds():
+            return None
         active_ids = self._count_active_build_workers()
         if len(active_ids) >= self._effective_max_builds():
             return None
