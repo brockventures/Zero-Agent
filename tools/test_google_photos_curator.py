@@ -562,4 +562,173 @@ def test_build_add_items_rpc_payload_variants_and_populate_all_targets(tmp_path:
     assert status["Isaac Year 2"]["verified"] is True
 
 
+def test_heart_score_inversion_fixed_and_personalized_probe() -> None:
+    sharp_bytes = _make_synthetic_thumbnail_bytes(num_faces=1, sharp=True, toddler_proportions=False)
+    blur_bytes = _make_synthetic_thumbnail_bytes(num_faces=1, sharp=False, toddler_proportions=False)
+
+    sharp_vision = gpc.analyze_thumbnail_bytes(sharp_bytes)
+    blur_vision = gpc.analyze_thumbnail_bytes(blur_bytes)
+    blur_vision["is_heavy_blur"] = True
+    blur_vision["sharpness_score"] = 0.05
+    blur_vision["face_sharpness_score"] = 0.05
+
+    unhearted_sharp_item = {
+        "item_id": "SHARP_1",
+        "dedup_key": "sharp_1",
+        "width": 4032,
+        "height": 3024,
+        "has_heart": False,
+        "heart_count": 0,
+    }
+    hearted_blur_item = {
+        "item_id": "BLUR_HEART_1",
+        "dedup_key": "blur_heart_1",
+        "width": 4032,
+        "height": 3024,
+        "has_heart": True,
+        "heart_count": 3,
+    }
+
+    sharp_score = gpc.compute_item_curation_score(unhearted_sharp_item, sharp_vision)
+    blur_heart_score = gpc.compute_item_curation_score(hearted_blur_item, blur_vision)
+
+    # Sharp unhearted portrait MUST beat a heavily blurred hearted frame (Heart Score Inversion fixed)
+    assert sharp_score > blur_heart_score
+
+
+def test_remove_shared_items_and_differential_sync() -> None:
+    rpc_rem, f_req_rem = gpc.build_remove_shared_items_rpc_payload(
+        target_album_id="ALB_TARGET_1",
+        items=["ITEM_REM_1", "ITEM_REM_2"],
+    )
+    assert rpc_rem == "LjmOue"
+    assert "ALB_TARGET_1" in f_req_rem
+    assert "ITEM_REM_1" in f_req_rem
+    assert "ITEM_REM_2" in f_req_rem
+
+    v8_nested = [
+        [["AF1QipNestedLibId1", ["111", None, "222"]]],
+        [[["AF1QipNestedLibId1", ["111", None, "222"]], None, "AF1QipOrig1"]],
+        2,
+    ]
+    assert gpc._extract_v8rkj_library_ids(v8_nested) == ["AF1QipNestedLibId1"]
+
+    live_before = [
+        {"item_id": "BASE_1", "dedup_key": "k_base_1"},
+        {"item_id": "KEEP_1", "dedup_key": "k_keep_1"},
+        {"item_id": "STALE_1", "dedup_key": "k_stale_1"},
+    ]
+    live_after = [
+        {"item_id": "BASE_1", "dedup_key": "k_base_1"},
+        {"item_id": "KEEP_1", "dedup_key": "k_keep_1"},
+        {"item_id": "NEW_1", "dedup_key": "k_new_1"},
+    ]
+    curated_data = {
+        "newly_selected_count": 1,
+        "selected_items": [
+            {"item_id": "BASE_1", "dedup_key": "k_base_1", "already_in_target": True},
+            {"item_id": "KEEP_1", "dedup_key": "k_keep_1", "already_in_target": False},
+            {"item_id": "NEW_1", "dedup_key": "k_new_1", "already_in_target": False},
+        ],
+    }
+
+    scrape_calls = 0
+
+    def fake_scrape(album_name: str, short_url: str, max_pages: int | None = None, timeout: int = 20) -> dict[str, Any]:
+        nonlocal scrape_calls
+        scrape_calls += 1
+        items = live_before if scrape_calls == 1 else live_after
+        return {
+            "album_name": album_name,
+            "album_id": "ALB_R6",
+            "auth_key": "KEY_R6",
+            "item_count": len(items),
+            "items": items,
+        }
+
+    sample_html = (
+        '<html><script>window.WIZ_global_data = '
+        '{"SNlM0e":"AT_TOKEN","FdrFJe":"-111","cfb2h":"boq_photos"};'
+        '</script></html>'
+    )
+    mock_session = MagicMock()
+    get_resp = MagicMock()
+    get_resp.text = sample_html
+    get_resp.raise_for_status.return_value = None
+    mock_session.get.return_value = get_resp
+
+    def fake_post(url: str, data: Any = None, headers: Any = None, timeout: int = 30) -> Any:
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        if "LjmOue" in url:
+            outer = json.dumps([["wrb.fr", "LjmOue", "[]", None, None, None, "generic"]])
+        else:
+            outer = json.dumps([["wrb.fr", "C2V01c", '[["NEW_1"]]', None, None, None, "generic"]])
+        resp.text = f")}}]'\n\n100\n{outer}\n"
+        return resp
+
+    mock_session.post.side_effect = fake_post
+
+    with patch("tools.google_photos_curator.scrape_shared_album", side_effect=fake_scrape):
+        res = gpc.sync_shared_album_differential(
+            target_album="Rosie Year 6",
+            curated_data=curated_data,
+            cookies={"SID": "fake"},
+            session=mock_session,
+        )
+
+    assert res["baseline_locked_count"] == 1
+    assert res["overlapping_kept_count"] == 2
+    assert res["added_in_run_count"] == 1
+    assert res["removed_in_run_count"] == 1
+    assert res["live_item_count"] == 3
+
+    # Verify graceful V8RKJ sub-batch fallback when one sub-batch fails with PhotosAddReceivedItemsToLibraryFailure
+    v8_calls = 0
+
+    def fake_v8_partial_post(url: str, data: Any = None, headers: Any = None, timeout: int = 30) -> Any:
+        nonlocal v8_calls
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        if "V8RKJ" in url:
+            v8_calls += 1
+            if v8_calls == 1:
+                # Simulate full batch failure
+                err_line = json.dumps([["wrb.fr", "V8RKJ", None, None, None, [8, None], "generic"]])
+                resp.text = f")}}]'\n\n100\n{err_line}\n"
+            elif v8_calls == 2:
+                # First sub-batch succeeds
+                ok_inner = json.dumps([[["AF1QipLibOk1", ["1", None, "2"]]], [], 2])
+                ok_line = json.dumps([["wrb.fr", "V8RKJ", ok_inner, None, None, None, "generic"]])
+                resp.text = f")}}]'\n\n100\n{ok_line}\n"
+            else:
+                # Remaining sub-batches fail
+                err_line = json.dumps([["wrb.fr", "V8RKJ", None, None, None, [8, None], "generic"]])
+                resp.text = f")}}]'\n\n100\n{err_line}\n"
+        else:
+            la_inner = json.dumps(["ig", None, 0, None, ["AF1QipShared1"]])
+            la_line = json.dumps([["wrb.fr", "laUYf", la_inner, None, None, None, "generic"]])
+            resp.text = f")}}]'\n\n100\n{la_line}\n"
+        return resp
+
+    mock_session.post.side_effect = fake_v8_partial_post
+    pop_partial = gpc.populate_shared_album(
+        target_album="Rosie Year 6",
+        target_album_id="ALB_R6",
+        target_auth_key="KEY_R6",
+        items_to_add=[{"item_id": f"SRC_{i}"} for i in range(5)],
+        rpc_id="V8RKJ+laUYf",
+        source_album_id="SRC_ALB",
+        source_auth_key="SRC_KEY",
+        cookies={"SID": "fake"},
+        batch_size=5,
+        session=mock_session,
+    )
+    assert pop_partial["status"] == "completed"
+    assert pop_partial["added_count"] == 1
+    assert pop_partial["added_item_ids"] == ["AF1QipLibOk1"]
+
+
+
+
 

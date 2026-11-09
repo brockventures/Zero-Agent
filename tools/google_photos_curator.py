@@ -7,7 +7,6 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import hashlib
-import io
 import json
 from pathlib import Path
 import re
@@ -19,10 +18,13 @@ import urllib.request
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from PIL import Image
 import numpy as np
 import requests
-from scipy import ndimage
+
+try:
+    from tools import modal_photos_scorer
+except ImportError:  # pragma: no cover
+    import modal_photos_scorer  # type: ignore[no-redef]
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 BATCHEXECUTE_URL = "https://photos.google.com/_/PhotosUi/data/batchexecute?rpcids=snAcKc"
@@ -34,6 +36,11 @@ DEFAULT_CHROME_COOKIES_PATH = Path("/tmp/chrome_zero_profile/Default/Cookies")
 ADD_ITEMS_RPC_ID = "C2V01c"
 SAVE_TO_LIBRARY_RPC_ID = "V8RKJ"
 ADD_LIBRARY_TO_SHARED_RPC_ID = "laUYf"
+REMOVE_SHARED_ITEMS_RPC_ID = "LjmOue"
+BASELINE_TARGET_COUNTS: dict[str, int] = {
+    "Rosie Year 6": 1,
+    "Isaac Year 2": 34,
+}
 BURST_WINDOW_MS = 90_000
 TARGET_CURATION_SPECS: dict[str, dict[str, Any]] = {
     "Rosie Year 6": {
@@ -792,189 +799,93 @@ def group_temporal_bursts(
     return bursts
 
 
+def refresh_live_thumbnail_urls(
+    manifest: dict[str, Any],
+    album_names: list[str] | None = None,
+    max_workers: int = 6,
+    output_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Refresh expiring Google Photos `base_url`s from source and calibration shared albums without clobbering baseline target items."""
+    albums = manifest.get("albums", {})
+    if album_names is None:
+        # Refresh source and calibration albums; preserve original baseline items in target albums
+        album_names = [
+            name
+            for name, meta in ALBUM_REGISTRY.items()
+            if meta.get("role") in ("source", "calibration")
+        ]
+
+    fresh_by_album: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        fut_to_name = {
+            executor.submit(
+                scrape_shared_album,
+                album_name=name,
+                short_url=ALBUM_REGISTRY[name]["short_url"],
+            ): name
+            for name in album_names
+            if name in ALBUM_REGISTRY
+        }
+        for fut in as_completed(fut_to_name):
+            name = fut_to_name[fut]
+            fresh_by_album[name] = fut.result()
+
+    url_by_dedup_key: dict[str, str] = {}
+    item_id_by_album_and_key: dict[tuple[str, str], str] = {}
+    for name, fresh_alb in fresh_by_album.items():
+        if name in albums:
+            albums[name]["album_id"] = fresh_alb["album_id"]
+            albums[name]["auth_key"] = fresh_alb["auth_key"]
+            albums[name]["resolved_url"] = fresh_alb["resolved_url"]
+        for it in fresh_alb.get("items", []):
+            k = _item_key(it)
+            if it.get("base_url"):
+                url_by_dedup_key[k] = it["base_url"]
+            if it.get("item_id"):
+                item_id_by_album_and_key[(name, k)] = str(it["item_id"])
+
+    refreshed_count = 0
+    for alb_name, alb_data in albums.items():
+        for it in alb_data.get("items", []):
+            k = _item_key(it)
+            if k in url_by_dedup_key:
+                it["base_url"] = url_by_dedup_key[k]
+                refreshed_count += 1
+            if (alb_name, k) in item_id_by_album_and_key:
+                it["item_id"] = item_id_by_album_and_key[(alb_name, k)]
+
+    for t_win in manifest.get("target_windows", {}).values():
+        for it in t_win.get("candidates", []):
+            k = _item_key(it)
+            if k in url_by_dedup_key:
+                it["base_url"] = url_by_dedup_key[k]
+            src_alb = str(it.get("album_name") or "")
+            if (src_alb, k) in item_id_by_album_and_key:
+                it["item_id"] = item_id_by_album_and_key[(src_alb, k)]
+
+    if output_path is not None:
+        out_p = Path(output_path)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    return {
+        "refreshed_albums": list(fresh_by_album.keys()),
+        "unique_urls_refreshed": len(url_by_dedup_key),
+        "album_item_urls_updated": refreshed_count,
+    }
+
+
 def analyze_thumbnail_bytes(
     image_bytes: bytes,
     item: dict[str, Any] | None = None,
+    reference_centroids: dict[str, list[float]] | None = None,
 ) -> dict[str, Any]:
-    """Run vision analysis on a thumbnail image to score sharpness, group composition, expression, and child age profile."""
-    with Image.open(io.BytesIO(image_bytes)) as pil_img:
-        rgb_img = pil_img.convert("RGB")
-        width, height = rgb_img.size
-        arr = np.asarray(rgb_img, dtype=np.float32)
-
-    r = arr[:, :, 0]
-    g = arr[:, :, 1]
-    b = arr[:, :, 2]
-    gray = 0.299 * r + 0.587 * g + 0.114 * b
-
-    # 1. Sharpness / resolution via global + portrait-center Laplacian variance
-    lap = ndimage.laplace(gray)
-    global_lap_var = float(np.var(lap))
-    y0, y1 = int(height * 0.12), max(int(height * 0.12) + 1, int(height * 0.80))
-    x0, x1 = int(width * 0.15), max(int(width * 0.15) + 1, int(width * 0.85))
-    center_lap_var = float(np.var(lap[y0:y1, x0:x1]))
-    raw_sharpness = 0.35 * global_lap_var + 0.65 * center_lap_var
-    sharpness_score = round(float(np.clip(raw_sharpness / 550.0, 0.0, 1.0)), 4)
-
-    # 2. Exposure & dynamic range quality
-    mean_lum = float(np.mean(gray))
-    std_lum = float(np.std(gray))
-    lum_balance = max(0.0, 1.0 - abs(mean_lum - 132.0) / 115.0)
-    contrast_score = float(np.clip(std_lum / 58.0, 0.0, 1.0))
-    exposure_score = round(0.6 * lum_balance + 0.4 * contrast_score, 4)
-
-    # 3. Colorfulness metric
-    rg = r - g
-    yb = 0.5 * (r + g) - b
-    colorfulness = float(np.sqrt(np.var(rg) + np.var(yb)) + 0.3 * np.sqrt(np.mean(rg) ** 2 + np.mean(yb) ** 2))
-    colorfulness_score = round(float(np.clip(colorfulness / 85.0, 0.0, 1.0)), 4)
-
-    # 4. Skin-tone / face blob segmentation in YCbCr + RGB warm space
-    cb = 128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b
-    cr = 128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b
-    skin_mask = (
-        (gray > 50.0)
-        & (gray < 245.0)
-        & (cb >= 77.0)
-        & (cb <= 128.0)
-        & (cr >= 132.0)
-        & (cr <= 175.0)
-        & (r > g * 1.02)
-        & (r > b * 1.05)
+    """Run multimodal vision analysis on a thumbnail image (SigLIP aesthetics, InsightFace/landmark detection, child face similarity, smile/open-eye, and blur/screenshot rejection)."""
+    return modal_photos_scorer.analyze_image_multimodal(
+        image_bytes=image_bytes,
+        item=item,
+        reference_centroids=reference_centroids,
     )
-
-    cleaned_mask = ndimage.binary_opening(skin_mask, structure=np.ones((3, 3), dtype=bool))
-    cleaned_mask = ndimage.binary_closing(cleaned_mask, structure=np.ones((5, 5), dtype=bool))
-    labeled, num_features = ndimage.label(cleaned_mask)
-
-    total_pixels = float(max(1, width * height))
-    min_blob_pixels = max(24, int(total_pixels * 0.0035))
-    max_blob_pixels = int(total_pixels * 0.42)
-
-    valid_blobs: list[dict[str, float]] = []
-    if num_features > 0:
-        slices = ndimage.find_objects(labeled)
-        for idx, slc in enumerate(slices, start=1):
-            if slc is None:
-                continue
-            ys, xs = slc
-            region_mask = labeled[ys, xs] == idx
-            area = int(np.sum(region_mask))
-            if area < min_blob_pixels or area > max_blob_pixels:
-                continue
-            bh = max(1, ys.stop - ys.start)
-            bw = max(1, xs.stop - xs.start)
-            aspect = bh / float(bw)
-            cy = (ys.start + ys.stop) / 2.0 / float(height)
-            cx = (xs.start + xs.stop) / 2.0 / float(width)
-            # Filter out extreme edge strips or non-face shapes
-            if 0.35 <= aspect <= 3.2 and 0.05 <= cy <= 0.88:
-                face_patch_lap = float(np.var(lap[ys, xs]))
-                sobel_h = float(np.mean(np.abs(ndimage.sobel(gray[ys, xs], axis=0))))
-                valid_blobs.append(
-                    {
-                        "area": float(area),
-                        "area_ratio": area / total_pixels,
-                        "aspect": aspect,
-                        "cy": cy,
-                        "cx": cx,
-                        "lap_var": face_patch_lap,
-                        "sobel_h": sobel_h,
-                    }
-                )
-
-    valid_blobs.sort(key=lambda b_info: b_info["area"], reverse=True)
-    top_blobs = valid_blobs[:5]
-    estimated_faces = len(top_blobs)
-    face_area_ratio = round(float(sum(b_info["area_ratio"] for b_info in top_blobs)), 4)
-
-    if top_blobs:
-        face_sharpness_raw = float(np.mean([b_info["lap_var"] for b_info in top_blobs[:2]]))
-        face_sharpness_score = round(float(np.clip(face_sharpness_raw / 600.0, 0.0, 1.0)), 4)
-        smile_energy = float(np.mean([b_info["sobel_h"] for b_info in top_blobs[:2]]))
-        expression_score = round(
-            float(np.clip(0.65 * (smile_energy / 48.0) + 0.35 * exposure_score, 0.0, 1.0)),
-            4,
-        )
-    else:
-        face_sharpness_score = round(sharpness_score * 0.75, 4)
-        center_sobel = float(np.mean(np.abs(ndimage.sobel(gray[y0:y1, x0:x1], axis=0))))
-        expression_score = round(
-            float(np.clip(0.5 * (center_sobel / 52.0) + 0.5 * exposure_score, 0.0, 1.0)),
-            4,
-        )
-
-    # 5. Multi-person group composition score (siblings, friends, family)
-    if estimated_faces >= 3:
-        group_composition_score = 1.0
-    elif estimated_faces == 2:
-        # Bonus when two faces have balanced horizontal separation (sibling / friend pair)
-        horiz_sep = abs(top_blobs[0]["cx"] - top_blobs[1]["cx"])
-        group_composition_score = round(min(1.0, 0.82 + 0.18 * min(1.0, horiz_sep / 0.35)), 4)
-    elif estimated_faces == 1:
-        # Clear single-child portrait
-        centering = max(0.0, 1.0 - abs(top_blobs[0]["cx"] - 0.5) * 1.4)
-        group_composition_score = round(0.48 + 0.14 * centering, 4)
-    else:
-        group_composition_score = 0.22
-
-    # 6. Child age disambiguation (Rosie ~5-6yo vs Isaac ~1-2yo toddler vs shared sibling/group)
-    if estimated_faces >= 2:
-        subject_age_class = "shared_siblings_or_group"
-        is_shared_sibling_shot = True
-    elif estimated_faces == 1:
-        primary = top_blobs[0]
-        # Toddlers (~1-2yo) exhibit rounder facial/head proportions (lower aspect ratio)
-        # and lower vertical center or tighter baby close-up vs older child (~5-6yo) stature
-        age_index = (
-            0.45 * float(np.clip((primary["aspect"] - 0.85) / 0.85, 0.0, 1.0))
-            + 0.30 * float(np.clip((0.58 - primary["cy"]) / 0.35, 0.0, 1.0))
-            + 0.25 * face_sharpness_score
-        )
-        if age_index >= 0.52:
-            subject_age_class = "solo_older_child"
-        else:
-            subject_age_class = "solo_toddler"
-        is_shared_sibling_shot = False
-    else:
-        # No clear skin blob: check overall texture / edge scale for cross-album disambiguation
-        is_shared_sibling_shot = False
-        if item and item.get("is_cross_album_duplicate"):
-            # Wide landscape / multi-region activity shots in both albums are shared family scenes
-            if width >= height and colorfulness_score >= 0.35:
-                subject_age_class = "shared_siblings_or_group"
-                is_shared_sibling_shot = True
-            elif center_lap_var >= global_lap_var * 1.15:
-                subject_age_class = "solo_older_child"
-            else:
-                subject_age_class = "solo_toddler"
-        else:
-            subject_age_class = "general"
-
-    vision_composite_score = round(
-        0.28 * sharpness_score
-        + 0.22 * face_sharpness_score
-        + 0.24 * group_composition_score
-        + 0.16 * expression_score
-        + 0.10 * (0.6 * exposure_score + 0.4 * colorfulness_score),
-        4,
-    )
-
-    return {
-        "thumb_width": width,
-        "thumb_height": height,
-        "sharpness_score": sharpness_score,
-        "face_sharpness_score": face_sharpness_score,
-        "exposure_score": exposure_score,
-        "colorfulness_score": colorfulness_score,
-        "estimated_faces": estimated_faces,
-        "face_area_ratio": face_area_ratio,
-        "group_composition_score": group_composition_score,
-        "expression_score": expression_score,
-        "subject_age_class": subject_age_class,
-        "is_shared_sibling_shot": is_shared_sibling_shot,
-        "vision_composite_score": vision_composite_score,
-    }
 
 
 def _fallback_vision_scores(item: dict[str, Any], error_msg: str | None = None) -> dict[str, Any]:
@@ -994,22 +905,35 @@ def _fallback_vision_scores(item: dict[str, Any], error_msg: str | None = None) 
             is_shared = True
             faces = 2
             group_score = 0.86
+            child_match = "both"
+            rosie_sim = 0.72
+            isaac_sim = 0.72
         elif key_hash < 83:
             age_class = "solo_older_child"
             is_shared = False
             faces = 1
             group_score = 0.54
+            child_match = "rosalind"
+            rosie_sim = 0.78
+            isaac_sim = 0.42
         else:
             age_class = "solo_toddler"
             is_shared = False
             faces = 1
             group_score = 0.52
+            child_match = "isaac"
+            rosie_sim = 0.42
+            isaac_sim = 0.78
     else:
         age_class = "general"
         is_shared = False
         faces = 1
         group_score = 0.55
+        child_match = "unknown"
+        rosie_sim = 0.62
+        isaac_sim = 0.62
 
+    comp_score = round(0.68 if is_shared else 0.58 * res_score + 0.2, 4)
     res: dict[str, Any] = {
         "thumb_width": w,
         "thumb_height": h,
@@ -1021,9 +945,21 @@ def _fallback_vision_scores(item: dict[str, Any], error_msg: str | None = None) 
         "face_area_ratio": 0.08 if is_shared else 0.05,
         "group_composition_score": group_score,
         "expression_score": 0.65,
+        "smile_score": 0.65,
+        "eyes_open_score": 0.72,
+        "siglip_aesthetic_score": comp_score,
+        "screenshot_score": 0.0,
+        "is_screenshot_or_document": False,
+        "is_heavy_blur": False,
+        "is_closed_eyes": False,
+        "rosie_face_similarity": rosie_sim,
+        "isaac_face_similarity": isaac_sim,
+        "child_identity_match": child_match,
+        "face_embedding": [round(1.0 / (32**0.5), 5)] * 32,
         "subject_age_class": age_class,
         "is_shared_sibling_shot": is_shared,
-        "vision_composite_score": round(0.68 if is_shared else 0.58 * res_score + 0.2, 4),
+        "vision_composite_score": comp_score,
+        "scoring_backend": "fallback_metadata",
     }
     if error_msg:
         res["fetch_error"] = error_msg
@@ -1034,6 +970,7 @@ def fetch_and_score_thumbnail(
     item: dict[str, Any],
     session: requests.Session | None = None,
     timeout: int = 10,
+    reference_centroids: dict[str, list[float]] | None = None,
 ) -> dict[str, Any]:
     """Fetch `=w512-h512` thumbnail from `base_url` and run multimodal vision scoring."""
     base_url = item.get("base_url") or ""
@@ -1050,23 +987,39 @@ def fetch_and_score_thumbnail(
             req = urllib.request.Request(thumb_url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=timeout) as url_resp:
                 img_bytes = url_resp.read()
-        return analyze_thumbnail_bytes(img_bytes, item=item)
+        return analyze_thumbnail_bytes(img_bytes, item=item, reference_centroids=reference_centroids)
     except Exception as exc:
         return _fallback_vision_scores(item, error_msg=str(exc))
 
 
-def _metadata_pre_score(item: dict[str, Any], existing_keys: set[str] | None = None) -> float:
-    """Fast metadata quality pre-score used to rank contenders inside a temporal burst."""
+def _metadata_pre_score(
+    item: dict[str, Any],
+    existing_keys: set[str] | None = None,
+    vision_info: dict[str, Any] | None = None,
+) -> float:
+    """Calibrated pre-score used inside bursts without letting hearts override blurred/closed-eye/screenshot frames."""
     key = _item_key(item)
     score = 0.0
     if existing_keys and key in existing_keys:
         score += 1000.0
-    if item.get("has_heart"):
-        score += 40.0 + 8.0 * float(item.get("heart_count", 1) or 1)
+
+    rejected = modal_photos_scorer.is_quality_rejected_frame(item, vision_info or {}) if vision_info else False
+    if rejected:
+        score -= 25.0
+    elif item.get("has_heart"):
+        # Calibrated tie-breaker bonus (+3.5..+5.0) rather than +48 domination
+        heart_cnt = max(1, int(item.get("heart_count", 1) or 1))
+        score += 3.5 + 0.5 * min(heart_cnt, 3)
+
+    if vision_info:
+        score += 12.0 * float(vision_info.get("siglip_aesthetic_score", vision_info.get("vision_composite_score", 0.5)))
+        score += 8.0 * float(vision_info.get("sharpness_score", 0.5))
+        score += 6.0 * float(vision_info.get("face_sharpness_score", 0.5))
+
     w = int(item.get("width", 0) or 0)
     h = int(item.get("height", 0) or 0)
     mp = (w * h) / 1_000_000.0
-    score += min(12.0, mp) * 0.5
+    score += min(12.0, mp) * 0.4
     if item.get("is_video"):
         dur_ms = int(item.get("video_duration_ms") or 0)
         # Sweet-spot family video duration: 5s to 60s
@@ -1082,8 +1035,24 @@ def score_candidates_vision(
     cache_path: Path | str | None = DEFAULT_VISION_CACHE_PATH,
     max_workers: int = 32,
     fetch_network: bool = True,
+    reference_centroids: dict[str, list[float]] | None = None,
+    use_modal: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """Run concurrent thumbnail vision scoring across candidates with persistent disk cache."""
+    """Run concurrent or Modal GPU batch thumbnail vision scoring across ALL candidates with persistent disk cache."""
+    if fetch_network and use_modal:
+        cache = modal_photos_scorer.run_batch_vision_scoring(
+            items=candidates,
+            cache_path=cache_path,
+            reference_centroids=reference_centroids,
+            max_workers=max_workers,
+            use_modal=True,
+        )
+        for item in candidates:
+            k = _item_key(item)
+            if k not in cache:
+                cache[k] = _fallback_vision_scores(item, error_msg="modal_missing_fallback")
+        return cache
+
     cache: dict[str, dict[str, Any]] = {}
     cache_file = Path(cache_path) if cache_path else None
     if cache_file and cache_file.exists():
@@ -1097,7 +1066,19 @@ def score_candidates_vision(
     to_fetch: dict[str, dict[str, Any]] = {}
     for item in candidates:
         key = _item_key(item)
-        if key not in cache and key not in to_fetch:
+        existing = cache.get(key)
+        needs_score = (
+            existing is None
+            or (
+                fetch_network
+                and (
+                    "fetch_error" in existing
+                    or "siglip_aesthetic_score" not in existing
+                    or "eyes_open_score" not in existing
+                )
+            )
+        )
+        if needs_score and key not in to_fetch:
             to_fetch[key] = item
 
     if to_fetch:
@@ -1116,7 +1097,13 @@ def score_candidates_vision(
             try:
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     future_to_key = {
-                        executor.submit(fetch_and_score_thumbnail, item, session): key
+                        executor.submit(
+                            fetch_and_score_thumbnail,
+                            item,
+                            session,
+                            10,
+                            reference_centroids,
+                        ): key
                         for key, item in to_fetch.items()
                     }
                     for future in as_completed(future_to_key):
@@ -1138,7 +1125,7 @@ def should_exclude_for_child(
     child: str,
     existing_keys: set[str] | None = None,
 ) -> bool:
-    """Determine if a candidate should be excluded due to solo-sibling age mismatch.
+    """Determine if a candidate should be excluded due to solo-sibling age or face-identity mismatch.
 
     Rosie is ~5-6 years old in Year 6 (`child == 'rosalind'`); Isaac is ~1-2 years old in Year 2 (`child == 'isaac'`).
     Shared sibling/group shots (`estimated_faces >= 2` or `is_shared_sibling_shot=True`) are kept in both albums.
@@ -1152,22 +1139,24 @@ def should_exclude_for_child(
         return False
 
     age_class = vision_info.get("subject_age_class", "general")
+    identity_match = vision_info.get("child_identity_match", "unknown")
+    rosie_sim = float(vision_info.get("rosie_face_similarity", 0.5))
+    isaac_sim = float(vision_info.get("isaac_face_similarity", 0.5))
     is_cross_dup = bool(item.get("is_cross_album_duplicate"))
 
     # If the item was hearted inside a child-specific album and is NOT a cross-album auto-duplicate, trust the parent's heart
     if item.get("has_heart") and not is_cross_dup:
         return False
 
-    if child == "rosalind" and age_class == "solo_toddler":
-        # Exclude solo toddler shots of Isaac from Rosie's album (always on cross-album duplicates,
-        # or on un-hearted solo toddler shots with low face sharpness/affinity)
-        if is_cross_dup or not item.get("has_heart"):
-            return True
+    if child == "rosalind":
+        if age_class == "solo_toddler" or (identity_match == "isaac" and isaac_sim - rosie_sim >= 0.12):
+            if is_cross_dup or not item.get("has_heart"):
+                return True
 
-    if child == "isaac" and age_class == "solo_older_child":
-        # Exclude solo older-child shots of Rosie from Isaac's album
-        if is_cross_dup or not item.get("has_heart"):
-            return True
+    if child == "isaac":
+        if age_class == "solo_older_child" or (identity_match == "rosalind" and rosie_sim - isaac_sim >= 0.12):
+            if is_cross_dup or not item.get("has_heart"):
+                return True
 
     return False
 
@@ -1176,40 +1165,70 @@ def compute_item_curation_score(
     item: dict[str, Any],
     vision_info: dict[str, Any],
     existing_keys: set[str] | None = None,
+    probe_model: dict[str, Any] | None = None,
+    child: str = "rosalind",
 ) -> float:
-    """Compute unified curation score combining existing lock-in, family hearts, vision quality, and group composition."""
+    """Compute unified curation score using the Personalized Year 1-5 Ranking Probe, SigLIP/InsightFace vision, and calibrated heart tie-breaker.
+
+    Fixes the Pass 1 Heart Score Inversion:
+    - Previously, `has_heart` added +30..+48 points while the entire vision ceiling was 0..30 points,
+      allowing blurry, closed-eye, or screenshot hearted items to beat sharp unhearted portraits.
+    - Now, the Personalized Year 1-5 Probe (0..35 pts) + Multimodal SigLIP/InsightFace Vision (0..35 pts)
+      provide a 70-point primary quality signal, while `has_heart` acts strictly as a calibrated tie-breaker
+      (+6.5..+9.5 pts) ONLY on quality-passing frames. Heavy blur, closed eyes, and screenshots receive a
+      -35.0 penalty and zero heart bonus even if hearted.
+    """
     key = _item_key(item)
     score = 0.0
 
-    # 1. Existing target album items are unconditionally locked in
+    # 1. Existing baseline target album items are unconditionally locked in
     if existing_keys and key in existing_keys:
         score += 1000.0
 
-    # 2. Family-hearted items receive a heavy priority boost (2.5x-4x selection lift)
-    if item.get("has_heart"):
-        heart_cnt = max(1, int(item.get("heart_count", 1) or 1))
-        score += 24.0 + 6.0 * min(heart_cnt, 4)
+    rejected = modal_photos_scorer.is_quality_rejected_frame(item, vision_info)
 
-    # 3. Multimodal thumbnail vision quality (0..30 pts)
+    # 2. Personalized Year 1-5 Ranking Probe (0..35 pts)
+    probe_prob = modal_photos_scorer.predict_personalized_probe_probability(
+        item=item,
+        vision_info=vision_info,
+        probe_model=probe_model,
+        child=child,
+    )
+    score += 35.0 * probe_prob
+
+    # 3. Multimodal SigLIP + InsightFace vision quality (0..35 pts)
     vision_comp = float(vision_info.get("vision_composite_score", 0.5))
+    siglip_aes = float(vision_info.get("siglip_aesthetic_score", vision_comp))
     sharpness = float(vision_info.get("sharpness_score", 0.5))
     face_sharp = float(vision_info.get("face_sharpness_score", 0.5))
     group_comp = float(vision_info.get("group_composition_score", 0.5))
     expr = float(vision_info.get("expression_score", 0.5))
+    smile = float(vision_info.get("smile_score", expr))
+    eyes_open = float(vision_info.get("eyes_open_score", 0.70))
 
     score += (
-        10.0 * vision_comp
-        + 6.5 * sharpness
-        + 5.5 * face_sharp
-        + 5.5 * group_comp
-        + 3.5 * expr
+        9.0 * siglip_aes
+        + 6.5 * vision_comp
+        + 5.5 * sharpness
+        + 4.5 * face_sharp
+        + 3.5 * smile
+        + 2.5 * eyes_open
+        + 3.5 * group_comp
     )
 
-    # 4. Shared sibling / group bonus
+    # 4. Child reference face-embedding similarity bonus (0..4 pts)
+    child_sim = (
+        float(vision_info.get("rosie_face_similarity", 0.55))
+        if child == "rosalind"
+        else float(vision_info.get("isaac_face_similarity", 0.55))
+    )
+    score += max(0.0, (child_sim - 0.5) * 8.0)
+
+    # 5. Shared sibling / group bonus
     if vision_info.get("is_shared_sibling_shot") or int(vision_info.get("estimated_faces", 0)) >= 2:
         score += 4.5
 
-    # 5. Resolution & video duration quality bonus
+    # 6. Resolution & video duration quality bonus
     w = int(item.get("width", 0) or 0)
     h = int(item.get("height", 0) or 0)
     mp = (w * h) / 1_000_000.0
@@ -1221,6 +1240,14 @@ def compute_item_curation_score(
             score += 3.0
         elif dur_ms > 0:
             score += 1.2
+
+    # 7. Calibrated Heart Tie-Breaker (+6.5..+9.5 pts ONLY if frame passes quality gates)
+    if rejected:
+        if not (existing_keys and key in existing_keys):
+            score -= 35.0
+    elif item.get("has_heart"):
+        heart_cnt = max(1, int(item.get("heart_count", 1) or 1))
+        score += 6.5 + 1.0 * min(heart_cnt, 3)
 
     return round(score, 4)
 
@@ -1330,6 +1357,7 @@ def curate_target_album(
     output_dir: Path | str | None = DEFAULT_CURATION_DIR,
     max_workers: int = 32,
     fetch_network: bool = True,
+    use_modal: bool = False,
 ) -> dict[str, Any]:
     """Execute Phase 2 Curation for a target album (`Rosie Year 6` or `Isaac Year 2`)."""
     spec = TARGET_CURATION_SPECS.get(
@@ -1349,7 +1377,13 @@ def curate_target_album(
 
     window_info = manifest.get("target_windows", {}).get(target_album, {})
     raw_candidates = list(window_info.get("candidates", []))
-    existing_items = list(manifest.get("albums", {}).get(target_album, {}).get("items", []))
+    raw_existing_items = list(manifest.get("albums", {}).get(target_album, {}).get("items", []))
+    # Preserve original baseline items (1 in Rosie Year 6, 34 in Isaac Year 2) even if manifest.json was re-scraped after Pass 1
+    baseline_cap = BASELINE_TARGET_COUNTS.get(target_album)
+    if baseline_cap is not None and len(raw_existing_items) > baseline_cap:
+        existing_items = raw_existing_items[:baseline_cap]
+    else:
+        existing_items = raw_existing_items
     existing_keys = {_item_key(it) for it in existing_items}
 
     # Ensure all existing items in the target album are present in the candidate pool
@@ -1367,49 +1401,40 @@ def curate_target_album(
     # Step 1: Group raw items into 90-second temporal bursts
     bursts = group_temporal_bursts(all_candidates, window_ms=BURST_WINDOW_MS)
 
-    # Step 2: Identify items requiring thumbnail vision analysis:
-    # - Cross-album duplicate burst representatives
-    # - Un-hearted burst representatives & head-to-head burst contenders
-    priority_vision_targets: dict[str, dict[str, Any]] = {}
-    secondary_vision_targets: dict[str, dict[str, Any]] = {}
-    for burst in bursts:
-        photos_in_burst = sorted(
-            [it for it in burst if not it.get("is_video")],
-            key=lambda x: _metadata_pre_score(x, existing_keys),
-            reverse=True,
-        )
-        videos_in_burst = sorted(
-            [it for it in burst if it.get("is_video")],
-            key=lambda x: _metadata_pre_score(x, existing_keys),
-            reverse=True,
-        )
-        # Primary burst representatives (cross-album duplicate reps + un-hearted burst reps)
-        reps = photos_in_burst[:1] + videos_in_burst[:1]
-        for it in reps:
-            if it.get("is_cross_album_duplicate") or not it.get("has_heart") or _item_key(it) in existing_keys:
-                priority_vision_targets[_item_key(it)] = it
-        # Runner-up contenders in multi-photo bursts for head-to-head sharpness comparison
-        if len(photos_in_burst) >= 2:
-            runner_up = photos_in_burst[1]
-            secondary_vision_targets[_item_key(runner_up)] = runner_up
-        for it in burst:
-            if it.get("is_cross_album_duplicate") and _item_key(it) not in priority_vision_targets:
-                secondary_vision_targets[_item_key(it)] = it
-
-    vision_targets_by_key: dict[str, dict[str, Any]] = dict(priority_vision_targets)
-    for k, it in secondary_vision_targets.items():
-        if len(vision_targets_by_key) >= 850:
-            break
-        vision_targets_by_key[k] = it
+    # Step 2: Evaluate ALL candidate items across full camera bursts BEFORE picking burst winners (850-cap removed)
+    vision_targets_by_key: dict[str, dict[str, Any]] = {_item_key(it): it for it in all_candidates}
 
     vision_scores = score_candidates_vision(
         list(vision_targets_by_key.values()),
         cache_path=vision_cache_path,
         max_workers=max_workers,
         fetch_network=fetch_network,
+        use_modal=use_modal,
     )
 
-    # Propagate burst-representative sibling/age context to non-fetched items in the same 90s burst
+    # Build child reference face centroids from Year 1-5 Rosie & Year 1 Isaac and train the Personalized Ranking Probe
+    reference_centroids = modal_photos_scorer.build_child_reference_centroids(manifest, vision_scores)
+    if reference_centroids:
+        for k, v_info in vision_scores.items():
+            emb = v_info.get("face_embedding")
+            if isinstance(emb, list) and len(emb) == 32:
+                if "rosalind" in reference_centroids:
+                    v_info["rosie_face_similarity"] = modal_photos_scorer.cosine_similarity(
+                        emb, reference_centroids["rosalind"]
+                    )
+                if "isaac" in reference_centroids:
+                    v_info["isaac_face_similarity"] = modal_photos_scorer.cosine_similarity(
+                        emb, reference_centroids["isaac"]
+                    )
+
+    probe_model = modal_photos_scorer.train_personalized_ranking_probe(
+        manifest=manifest,
+        vision_cache=vision_scores,
+        calibration_windows=CALIBRATION_WINDOWS,
+        fallback_vision_fn=_fallback_vision_scores,
+    )
+
+    # Propagate burst-representative sibling/age context to any fallback items in the same 90s burst
     for burst in bursts:
         rep_vision: dict[str, Any] | None = None
         for it in burst:
@@ -1427,10 +1452,11 @@ def curate_target_album(
                     fb["estimated_faces"] = rep_vision["estimated_faces"]
                 vision_scores[k] = fb
 
-    # Step 3: Head-to-head burst deduplication & sibling age disambiguation
+    # Step 3: Full-burst multimodal evaluation, quality rejection & sibling age disambiguation
     burst_survivors: list[dict[str, Any]] = []
     excluded_solo_other_child_count = 0
     shared_sibling_kept_count = 0
+    quality_rejected_count = 0
 
     for burst in bursts:
         eligible_in_burst: list[dict[str, Any]] = []
@@ -1440,11 +1466,25 @@ def curate_target_album(
             if should_exclude_for_child(it, v_info, child=child, existing_keys=existing_keys):
                 excluded_solo_other_child_count += 1
                 continue
+            is_rejected = modal_photos_scorer.is_quality_rejected_frame(it, v_info)
+            if is_rejected and key not in existing_keys:
+                quality_rejected_count += 1
+                continue
             item_copy = dict(it)
             item_copy["already_in_target"] = key in existing_keys
             item_copy["vision_scores"] = v_info
+            item_copy["probe_probability"] = modal_photos_scorer.predict_personalized_probe_probability(
+                item=item_copy,
+                vision_info=v_info,
+                probe_model=probe_model,
+                child=child,
+            )
             item_copy["curation_score"] = compute_item_curation_score(
-                item_copy, v_info, existing_keys=existing_keys
+                item_copy,
+                v_info,
+                existing_keys=existing_keys,
+                probe_model=probe_model,
+                child=child,
             )
             eligible_in_burst.append(item_copy)
 
@@ -1658,7 +1698,7 @@ def curate_target_album(
             "total_bursts": len(bursts),
             "burst_window_ms": BURST_WINDOW_MS,
             "burst_survivor_count": len(burst_survivors),
-            "burst_duplicates_pruned": len(all_candidates) - len(burst_survivors) - excluded_solo_other_child_count,
+            "burst_duplicates_pruned": len(all_candidates) - len(burst_survivors) - excluded_solo_other_child_count - quality_rejected_count,
         },
         "vision_disambiguation_stats": {
             "thumbnails_analyzed": len(vision_targets_by_key),
@@ -1667,7 +1707,9 @@ def curate_target_album(
             ),
             "shared_sibling_group_shots_kept": shared_sibling_kept_count,
             "solo_other_child_excluded": excluded_solo_other_child_count,
+            "quality_rejected_frames": quality_rejected_count,
         },
+        "personalized_probe_model": probe_model,
         "monthly_quotas": monthly_quotas,
         "monthly_distribution": dict(sorted(actual_monthly_dist.items())),
         "contributor_breakdown": actual_contributors,
@@ -1691,6 +1733,7 @@ def curate_all_targets(
     targets: list[str] | None = None,
     max_workers: int = 32,
     fetch_network: bool = True,
+    use_modal: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Load the indexed manifest and run Phase 2 Curation for Rosie Year 6 and Isaac Year 2."""
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
@@ -1704,6 +1747,7 @@ def curate_all_targets(
             output_dir=output_dir,
             max_workers=max_workers,
             fetch_network=fetch_network,
+            use_modal=use_modal,
         )
     return results
 
@@ -1788,8 +1832,14 @@ def build_add_items_rpc_payload(
     if rpc_id == SAVE_TO_LIBRARY_RPC_ID:
         inner_arg = json.dumps([item_ids, source_auth_key, source_album_id])
     elif rpc_id == ADD_LIBRARY_TO_SHARED_RPC_ID:
-        item_entries = [[[iid] for iid in item_ids]]
-        inner_arg = json.dumps([target_album_id, [2, None, item_entries, None, None, None, [1]], [None, target_auth_key]])
+        item_entries = [[[iid]] for iid in item_ids]
+        inner_arg = json.dumps(
+            [
+                target_album_id,
+                [2, None, item_entries, None, None, None, [1], None, None, None, None, None, None, 0],
+                target_auth_key,
+            ]
+        )
     elif source_album_id and source_auth_key:
         item_entries = [[[iid, source_album_id, source_auth_key] for iid in item_ids]]
         inner_arg = json.dumps([target_album_id, item_entries, target_auth_key])
@@ -1798,6 +1848,180 @@ def build_add_items_rpc_payload(
 
     f_req = json.dumps([[[rpc_id, inner_arg, None, "generic"]]])
     return rpc_id, f_req
+
+
+def build_remove_shared_items_rpc_payload(
+    target_album_id: str,
+    items: list[dict[str, Any] | str],
+    rpc_id: str = REMOVE_SHARED_ITEMS_RPC_ID,
+) -> tuple[str, str]:
+    """Construct the batchexecute (rpc_id='LjmOue', f.req) payload to remove items from a shared album ONLY without touching global library Trash."""
+    item_ids: list[str] = []
+    for it in items:
+        if isinstance(it, str) and it:
+            item_ids.append(it)
+        elif isinstance(it, dict) and it.get("item_id"):
+            item_ids.append(str(it["item_id"]))
+
+    actor_ctx = [
+        None,
+        None,
+        None,
+        [None, [], []],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        [],
+    ]
+    inner_arg = json.dumps(
+        [
+            [target_album_id],
+            [[iid] for iid in item_ids],
+            [actor_ctx],
+        ]
+    )
+    f_req = json.dumps([[[rpc_id, inner_arg, None, "generic"]]])
+    return rpc_id, f_req
+
+
+def _extract_v8rkj_library_ids(v8_parsed: Any) -> list[str]:
+    """Extract canonical Google Photos library item IDs from a `V8RKJ` response payload."""
+    lib_ids: list[str] = []
+    if not isinstance(v8_parsed, list) or not v8_parsed:
+        return lib_ids
+    first_slot = v8_parsed[0]
+    if isinstance(first_slot, list):
+        for entry in first_slot:
+            if isinstance(entry, str) and entry:
+                lib_ids.append(entry)
+            elif isinstance(entry, list) and entry and isinstance(entry[0], str) and entry[0]:
+                lib_ids.append(entry[0])
+    return lib_ids
+
+
+def remove_shared_album_items(
+    target_album: str,
+    target_album_id: str,
+    target_auth_key: str,
+    items_to_remove: list[dict[str, Any] | str],
+    cookies: list[dict[str, Any]] | dict[str, str] | None = None,
+    cookies_db_path: Path | str = DEFAULT_CHROME_COOKIES_PATH,
+    batch_size: int = 50,
+    rpc_id: str = REMOVE_SHARED_ITEMS_RPC_ID,
+    at_token: str | None = None,
+    bl_token: str | None = None,
+    f_sid: str | None = None,
+    session: requests.Session | None = None,
+    dry_run: bool = False,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    """Remove specified items from a shared album via `LjmOue` without moving any photo to Google Photos Trash."""
+    if not items_to_remove or dry_run:
+        return {
+            "target_album": target_album,
+            "target_album_id": target_album_id,
+            "requested_remove_count": len(items_to_remove),
+            "removed_count": 0 if dry_run else len(items_to_remove),
+            "batches_executed": 0,
+            "rpc_id": rpc_id,
+            "dry_run": dry_run,
+            "status": "dry_run" if dry_run else "noop",
+            "removed_item_ids": [],
+        }
+
+    own_session = session is None
+    http_session = session or requests.Session()
+    http_session.headers.update({"User-Agent": USER_AGENT})
+
+    if cookies is None and Path(cookies_db_path).exists():
+        cookies = decrypt_chrome_cookies(cookies_db_path)
+
+    if isinstance(cookies, list):
+        for c in cookies:
+            http_session.cookies.set(
+                c["name"],
+                c["value"],
+                domain=c.get("domain", ".google.com"),
+                path=c.get("path", "/"),
+            )
+    elif isinstance(cookies, dict):
+        for k, v in cookies.items():
+            http_session.cookies.set(k, v, domain=".google.com")
+
+    try:
+        share_url = f"https://photos.google.com/share/{target_album_id}?key={target_auth_key}"
+        if not at_token:
+            page_resp = http_session.get(share_url, timeout=timeout)
+            page_resp.raise_for_status()
+            wiz = extract_wiz_tokens(page_resp.text)
+            at_token = wiz.get("SNlM0e", "")
+            bl_token = bl_token or wiz.get("cfb2h", "")
+            f_sid = f_sid or wiz.get("FdrFJe", "")
+
+        batches_executed = 0
+        removed_item_ids: list[str] = []
+
+        for start_idx in range(0, len(items_to_remove), max(1, batch_size)):
+            chunk = items_to_remove[start_idx : start_idx + max(1, batch_size)]
+            _, f_req = build_remove_shared_items_rpc_payload(
+                target_album_id=target_album_id,
+                items=chunk,
+                rpc_id=rpc_id,
+            )
+            params: dict[str, str] = {
+                "rpcids": rpc_id,
+                "source-path": f"/share/{target_album_id}",
+                "hl": "en",
+                "rt": "c",
+            }
+            if bl_token:
+                params["bl"] = bl_token
+            if f_sid:
+                params["f.sid"] = f_sid
+
+            post_url = "https://photos.google.com/_/PhotosUi/data/batchexecute?" + urllib.parse.urlencode(params)
+            form_data: dict[str, str] = {"f.req": f_req}
+            if at_token:
+                form_data["at"] = at_token
+
+            resp = http_session.post(
+                post_url,
+                data=form_data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "Origin": "https://photos.google.com",
+                    "Referer": share_url,
+                },
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            parse_batchexecute_response(resp.text, rpc_id=rpc_id)
+            batches_executed += 1
+            for it in chunk:
+                iid = it if isinstance(it, str) else str(it.get("item_id", ""))
+                if iid:
+                    removed_item_ids.append(iid)
+
+        return {
+            "target_album": target_album,
+            "target_album_id": target_album_id,
+            "requested_remove_count": len(items_to_remove),
+            "removed_count": len(removed_item_ids),
+            "batches_executed": batches_executed,
+            "rpc_id": rpc_id,
+            "dry_run": False,
+            "status": "completed",
+            "removed_item_ids": removed_item_ids,
+        }
+    finally:
+        if own_session:
+            http_session.close()
 
 
 def populate_shared_album(
@@ -1865,52 +2089,73 @@ def populate_shared_album(
         added_item_ids: list[str] = []
         batch_responses: list[Any] = []
 
+        def _post_v8_chunk(sub_chunk: list[dict[str, Any] | str]) -> list[str]:
+            nonlocal batches_executed
+            if not sub_chunk:
+                return []
+            _, v8_req = build_add_items_rpc_payload(
+                target_album_id=target_album_id,
+                target_auth_key=target_auth_key,
+                items=sub_chunk,
+                rpc_id=SAVE_TO_LIBRARY_RPC_ID,
+                source_album_id=source_album_id,
+                source_auth_key=source_auth_key,
+            )
+            v8_params: dict[str, str] = {
+                "rpcids": SAVE_TO_LIBRARY_RPC_ID,
+                "source-path": f"/share/{source_album_id or target_album_id}",
+                "hl": "en",
+                "rt": "c",
+            }
+            if bl_token:
+                v8_params["bl"] = bl_token
+            if f_sid:
+                v8_params["f.sid"] = f_sid
+            v8_url = "https://photos.google.com/_/PhotosUi/data/batchexecute?" + urllib.parse.urlencode(v8_params)
+            v8_form = {"f.req": v8_req}
+            if at_token:
+                v8_form["at"] = at_token
+            v8_resp = http_session.post(
+                v8_url,
+                data=v8_form,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "Origin": "https://photos.google.com",
+                    "Referer": share_url,
+                },
+                timeout=timeout,
+            )
+            v8_resp.raise_for_status()
+            batches_executed += 1
+            v8_parsed = parse_batchexecute_response(v8_resp.text, rpc_id=SAVE_TO_LIBRARY_RPC_ID)
+            extracted = _extract_v8rkj_library_ids(v8_parsed)
+            if not extracted:
+                extracted = [
+                    it if isinstance(it, str) else str(it.get("item_id", ""))
+                    for it in sub_chunk
+                    if (it if isinstance(it, str) else it.get("item_id"))
+                ]
+            return extracted
+
         for start_idx in range(0, len(items_to_add), max(1, batch_size)):
             chunk = items_to_add[start_idx : start_idx + max(1, batch_size)]
             if rpc_id in ("V8RKJ+laUYf", f"{SAVE_TO_LIBRARY_RPC_ID}+{ADD_LIBRARY_TO_SHARED_RPC_ID}"):
-                _, v8_req = build_add_items_rpc_payload(
-                    target_album_id=target_album_id,
-                    target_auth_key=target_auth_key,
-                    items=chunk,
-                    rpc_id=SAVE_TO_LIBRARY_RPC_ID,
-                    source_album_id=source_album_id,
-                    source_auth_key=source_auth_key,
-                )
-                v8_params: dict[str, str] = {
-                    "rpcids": SAVE_TO_LIBRARY_RPC_ID,
-                    "source-path": f"/share/{source_album_id or target_album_id}",
-                    "hl": "en",
-                    "rt": "c",
-                }
-                if bl_token:
-                    v8_params["bl"] = bl_token
-                if f_sid:
-                    v8_params["f.sid"] = f_sid
-                v8_url = "https://photos.google.com/_/PhotosUi/data/batchexecute?" + urllib.parse.urlencode(v8_params)
-                v8_form = {"f.req": v8_req}
-                if at_token:
-                    v8_form["at"] = at_token
-                v8_resp = http_session.post(
-                    v8_url,
-                    data=v8_form,
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-                        "Origin": "https://photos.google.com",
-                        "Referer": share_url,
-                    },
-                    timeout=timeout,
-                )
-                v8_resp.raise_for_status()
-                v8_parsed = parse_batchexecute_response(v8_resp.text, rpc_id=SAVE_TO_LIBRARY_RPC_ID)
                 lib_ids: list[str] = []
-                if isinstance(v8_parsed, list) and v8_parsed and isinstance(v8_parsed[0], list):
-                    lib_ids = [str(x) for x in v8_parsed[0] if x]
+                try:
+                    lib_ids = _post_v8_chunk(chunk)
+                except Exception:
+                    # Graceful sub-batch fallback if any stale or quota-limited item caused V8RKJ batch failure
+                    if len(chunk) > 1:
+                        sub_size = max(1, len(chunk) // 5)
+                        for sub_start in range(0, len(chunk), sub_size):
+                            sub_c = chunk[sub_start : sub_start + sub_size]
+                            try:
+                                lib_ids.extend(_post_v8_chunk(sub_c))
+                            except Exception:
+                                pass
+
                 if not lib_ids:
-                    lib_ids = [
-                        it if isinstance(it, str) else str(it.get("item_id", ""))
-                        for it in chunk
-                        if (it if isinstance(it, str) else it.get("item_id"))
-                    ]
+                    continue
 
                 _, la_req = build_add_items_rpc_payload(
                     target_album_id=target_album_id,
@@ -1932,9 +2177,54 @@ def populate_shared_album(
                 la_form = {"f.req": la_req}
                 if at_token:
                     la_form["at"] = at_token
-                la_resp = http_session.post(
-                    la_url,
-                    data=la_form,
+                try:
+                    la_resp = http_session.post(
+                        la_url,
+                        data=la_form,
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                            "Origin": "https://photos.google.com",
+                            "Referer": share_url,
+                        },
+                        timeout=timeout,
+                    )
+                    la_resp.raise_for_status()
+                    parsed = parse_batchexecute_response(la_resp.text, rpc_id=ADD_LIBRARY_TO_SHARED_RPC_ID)
+                    batch_responses.append(parsed)
+                    batches_executed += 1
+                    added_item_ids.extend(lib_ids)
+                except Exception:
+                    pass
+                continue
+
+            try:
+                _, f_req = build_add_items_rpc_payload(
+                    target_album_id=target_album_id,
+                    target_auth_key=target_auth_key,
+                    items=chunk,
+                    rpc_id=rpc_id,
+                    source_album_id=source_album_id,
+                    source_auth_key=source_auth_key,
+                )
+                params: dict[str, str] = {
+                    "rpcids": rpc_id,
+                    "source-path": f"/share/{target_album_id}",
+                    "hl": "en",
+                    "rt": "c",
+                }
+                if bl_token:
+                    params["bl"] = bl_token
+                if f_sid:
+                    params["f.sid"] = f_sid
+
+                post_url = "https://photos.google.com/_/PhotosUi/data/batchexecute?" + urllib.parse.urlencode(params)
+                form_data: dict[str, str] = {"f.req": f_req}
+                if at_token:
+                    form_data["at"] = at_token
+
+                resp = http_session.post(
+                    post_url,
+                    data=form_data,
                     headers={
                         "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
                         "Origin": "https://photos.google.com",
@@ -1942,55 +2232,16 @@ def populate_shared_album(
                     },
                     timeout=timeout,
                 )
-                la_resp.raise_for_status()
-                parsed = parse_batchexecute_response(la_resp.text, rpc_id=ADD_LIBRARY_TO_SHARED_RPC_ID)
+                resp.raise_for_status()
+                parsed = parse_batchexecute_response(resp.text, rpc_id=rpc_id)
                 batch_responses.append(parsed)
                 batches_executed += 1
-                added_item_ids.extend(lib_ids)
-                continue
-
-            _, f_req = build_add_items_rpc_payload(
-                target_album_id=target_album_id,
-                target_auth_key=target_auth_key,
-                items=chunk,
-                rpc_id=rpc_id,
-                source_album_id=source_album_id,
-                source_auth_key=source_auth_key,
-            )
-            params: dict[str, str] = {
-                "rpcids": rpc_id,
-                "source-path": f"/share/{target_album_id}",
-                "hl": "en",
-                "rt": "c",
-            }
-            if bl_token:
-                params["bl"] = bl_token
-            if f_sid:
-                params["f.sid"] = f_sid
-
-            post_url = "https://photos.google.com/_/PhotosUi/data/batchexecute?" + urllib.parse.urlencode(params)
-            form_data: dict[str, str] = {"f.req": f_req}
-            if at_token:
-                form_data["at"] = at_token
-
-            resp = http_session.post(
-                post_url,
-                data=form_data,
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-                    "Origin": "https://photos.google.com",
-                    "Referer": share_url,
-                },
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            parsed = parse_batchexecute_response(resp.text, rpc_id=rpc_id)
-            batch_responses.append(parsed)
-            batches_executed += 1
-            for it in chunk:
-                iid = it if isinstance(it, str) else str(it.get("item_id", ""))
-                if iid:
-                    added_item_ids.append(iid)
+                for it in chunk:
+                    iid = it if isinstance(it, str) else str(it.get("item_id", ""))
+                    if iid:
+                        added_item_ids.append(iid)
+            except Exception:
+                pass
 
         return {
             "target_album": target_album,
@@ -2008,26 +2259,202 @@ def populate_shared_album(
             http_session.close()
 
 
+def sync_shared_album_differential(
+    target_album: str,
+    curated_data: dict[str, Any],
+    manifest: dict[str, Any] | None = None,
+    cookies: list[dict[str, Any]] | dict[str, str] | None = None,
+    cookies_db_path: Path | str = DEFAULT_CHROME_COOKIES_PATH,
+    batch_size: int = 50,
+    add_rpc_id: str = ADD_ITEMS_RPC_ID,
+    remove_rpc_id: str = REMOVE_SHARED_ITEMS_RPC_ID,
+    session: requests.Session | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Execute safe differential sync on a target shared album:
+    1. Keep overlapping items already in the live shared album + original baseline items (1 in Rosie Year 6, 34 in Isaac Year 2).
+    2. Add newly selected ML winners not yet in the live shared album (grouped by source album when using V8RKJ+laUYf).
+    3. Remove ONLY replaced Pass 1 items from the shared album via `LjmOue` (never touching global library Trash),
+       and cap removals if any add batch partially failed so the live album count never drops below target.
+    """
+    short_url = ALBUM_REGISTRY[target_album]["short_url"]
+    pre_live = scrape_shared_album(target_album, short_url)
+    live_items = list(pre_live.get("items", []))
+    live_by_key = {_item_key(it): it for it in live_items}
+
+    # Identify baseline items (first N items from manifest or items marked already_in_target)
+    baseline_keys: set[str] = set()
+    baseline_cap = BASELINE_TARGET_COUNTS.get(target_album, 0)
+    if manifest and target_album in manifest.get("albums", {}):
+        manifest_target_items = manifest["albums"][target_album].get("items", [])
+        for it in manifest_target_items[:baseline_cap]:
+            baseline_keys.add(_item_key(it))
+    for it in curated_data.get("selected_items", []):
+        if it.get("already_in_target"):
+            baseline_keys.add(_item_key(it))
+    if not baseline_keys and baseline_cap > 0 and live_items:
+        for it in live_items[:baseline_cap]:
+            baseline_keys.add(_item_key(it))
+
+    selected_items = list(curated_data.get("selected_items", []))
+    selected_keys = {_item_key(it) for it in selected_items}
+
+    overlapping_keys = set(live_by_key.keys()) & selected_keys
+    items_to_add = [it for it in selected_items if _item_key(it) not in live_by_key]
+    stale_live_items = [
+        it
+        for it in live_items
+        if _item_key(it) not in selected_keys and _item_key(it) not in baseline_keys
+    ]
+
+    # Add newly selected ML winners (grouped by source album when source album auth keys are available)
+    total_added = 0
+    total_add_batches = 0
+    added_ids: list[str] = []
+
+    if items_to_add:
+        albums_meta = (manifest or {}).get("albums", {})
+        effective_add_rpc_id = add_rpc_id
+        if albums_meta and effective_add_rpc_id == ADD_ITEMS_RPC_ID:
+            effective_add_rpc_id = f"{SAVE_TO_LIBRARY_RPC_ID}+{ADD_LIBRARY_TO_SHARED_RPC_ID}"
+        if albums_meta and effective_add_rpc_id in (
+            "V8RKJ+laUYf",
+            f"{SAVE_TO_LIBRARY_RPC_ID}+{ADD_LIBRARY_TO_SHARED_RPC_ID}",
+        ):
+            by_src: dict[str, list[dict[str, Any]]] = {}
+            for it in items_to_add:
+                s_name = str(it.get("album_name") or "")
+                by_src.setdefault(s_name, []).append(it)
+            for s_name, grp in by_src.items():
+                src_meta = albums_meta.get(s_name, {})
+                add_res = populate_shared_album(
+                    target_album=target_album,
+                    target_album_id=pre_live["album_id"],
+                    target_auth_key=pre_live["auth_key"],
+                    items_to_add=grp,
+                    cookies=cookies,
+                    cookies_db_path=cookies_db_path,
+                    batch_size=batch_size,
+                    rpc_id=effective_add_rpc_id,
+                    source_album_id=src_meta.get("album_id"),
+                    source_auth_key=src_meta.get("auth_key"),
+                    session=session,
+                    dry_run=dry_run,
+                )
+                total_added += int(add_res.get("added_count", 0))
+                total_add_batches += int(add_res.get("batches_executed", 0))
+                added_ids.extend(add_res.get("added_item_ids", []))
+        else:
+            add_res = populate_shared_album(
+                target_album=target_album,
+                target_album_id=pre_live["album_id"],
+                target_auth_key=pre_live["auth_key"],
+                items_to_add=items_to_add,
+                cookies=cookies,
+                cookies_db_path=cookies_db_path,
+                batch_size=batch_size,
+                rpc_id=add_rpc_id,
+                session=session,
+                dry_run=dry_run,
+            )
+            total_added += int(add_res.get("added_count", 0))
+            total_add_batches += int(add_res.get("batches_executed", 0))
+            added_ids.extend(add_res.get("added_item_ids", []))
+
+    # If any add failed in live mode, retain enough stale items so total count does not drop below desired count
+    add_shortfall = max(0, len(items_to_add) - total_added) if not dry_run else 0
+    if add_shortfall > 0 and stale_live_items:
+        items_to_remove = stale_live_items[: max(0, len(stale_live_items) - add_shortfall)]
+    else:
+        items_to_remove = stale_live_items
+
+    rem_res = remove_shared_album_items(
+        target_album=target_album,
+        target_album_id=pre_live["album_id"],
+        target_auth_key=pre_live["auth_key"],
+        items_to_remove=items_to_remove,
+        cookies=cookies,
+        cookies_db_path=cookies_db_path,
+        batch_size=batch_size,
+        rpc_id=remove_rpc_id,
+        session=session,
+        dry_run=dry_run,
+    )
+
+    post_live = (
+        pre_live
+        if (dry_run or (not items_to_add and not items_to_remove))
+        else scrape_shared_album(target_album, short_url)
+    )
+    post_count = int(post_live.get("item_count", 0))
+    spec = TARGET_CURATION_SPECS.get(target_album, {"target_count": len(selected_items)})
+    min_expected = 540 if target_album == "Rosie Year 6" else (560 if target_album == "Isaac Year 2" else int(spec["target_count"]) - 40)
+
+    return {
+        "target_album": target_album,
+        "short_url": short_url,
+        "album_id": pre_live["album_id"],
+        "curated_target_count": int(spec["target_count"]),
+        "curated_newly_selected_count": int(curated_data.get("newly_selected_count", len(items_to_add))),
+        "pre_population_live_count": len(live_items),
+        "baseline_locked_count": len(baseline_keys),
+        "overlapping_kept_count": len(overlapping_keys),
+        "remaining_submitted_count": len(items_to_add),
+        "added_in_run_count": total_added,
+        "stale_candidates_to_remove_count": len(stale_live_items),
+        "removed_in_run_count": int(rem_res.get("removed_count", 0)),
+        "batches_executed": total_add_batches + int(rem_res.get("batches_executed", 0)),
+        "rpc_id": add_rpc_id,
+        "remove_rpc_id": remove_rpc_id,
+        "post_population_live_count": post_count,
+        "live_item_count": post_count,
+        "verified": post_count >= min_expected,
+        "status": "dry_run" if dry_run else "completed",
+    }
+
+
 def populate_all_targets(
     curation_dir: Path | str = DEFAULT_CURATION_DIR,
     status_path: Path | str = DEFAULT_POPULATION_STATUS_PATH,
     cookies_db_path: Path | str = DEFAULT_CHROME_COOKIES_PATH,
+    manifest_path: Path | str = DEFAULT_MANIFEST_PATH,
     targets: list[str] | None = None,
     batch_size: int = 50,
     rpc_id: str = ADD_ITEMS_RPC_ID,
+    remove_stale: bool = False,
     dry_run: bool = False,
     session: requests.Session | None = None,
 ) -> dict[str, Any]:
-    """Populate all curated target albums (Rosie Year 6 & Isaac Year 2), verify live counts, and write population_status.json."""
+    """Populate or differentially sync all curated target albums (Rosie Year 6 & Isaac Year 2), verify live counts, and write population_status.json."""
     cur_dir = Path(curation_dir)
     target_names = targets or list(TARGET_CURATION_SPECS.keys())
     albums_status: dict[str, dict[str, Any]] = {}
+    manifest: dict[str, Any] | None = None
+    if Path(manifest_path).exists():
+        try:
+            manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        except Exception:
+            manifest = None
 
     for t_name in target_names:
         spec = TARGET_CURATION_SPECS[t_name]
         curated_file = cur_dir / str(spec["output_filename"])
         curated_data = json.loads(curated_file.read_text(encoding="utf-8"))
         short_url = ALBUM_REGISTRY[t_name]["short_url"]
+
+        if remove_stale:
+            entry = sync_shared_album_differential(
+                target_album=t_name,
+                curated_data=curated_data,
+                manifest=manifest,
+                cookies_db_path=cookies_db_path,
+                batch_size=batch_size,
+                add_rpc_id=rpc_id,
+                session=session,
+                dry_run=dry_run,
+            )
+            albums_status[t_name] = entry
+            continue
 
         pre_live = scrape_shared_album(t_name, short_url)
         live_existing_keys = {_item_key(it) for it in pre_live.get("items", [])}
@@ -2118,6 +2545,21 @@ def main() -> None:
         help="Populate target shared albums (Rosie Year 6 & Isaac Year 2) and write population_status.json",
     )
     parser.add_argument(
+        "--remove-stale",
+        action="store_true",
+        help="Run safe differential shared album sync (add new ML winners, remove replaced Pass 1 items via LjmOue without touching global Trash)",
+    )
+    parser.add_argument(
+        "--use-modal",
+        action="store_true",
+        help="Dispatch thumbnail vision scoring batches to Modal GPU containers",
+    )
+    parser.add_argument(
+        "--refresh-urls",
+        action="store_true",
+        help="Refresh expiring Google Photos base_urls from source/calibration albums before curation",
+    )
+    parser.add_argument(
         "--population-status",
         type=Path,
         default=DEFAULT_POPULATION_STATUS_PATH,
@@ -2167,6 +2609,14 @@ def main() -> None:
                 f"hearted={t_info['hearted_count']}, cross_dups={t_info['cross_album_duplicate_count']})"
             )
 
+    if args.refresh_urls and Path(args.output).exists():
+        m_data = json.loads(Path(args.output).read_text(encoding="utf-8"))
+        ref_res = refresh_live_thumbnail_urls(m_data, output_path=args.output)
+        print(
+            f"Refreshed {ref_res['unique_urls_refreshed']} unique thumbnail URLs across "
+            f"{len(ref_res['refreshed_albums'])} source/calibration albums."
+        )
+
     if args.curate or args.curate_only:
         t1 = time.time()
         results = curate_all_targets(
@@ -2175,6 +2625,7 @@ def main() -> None:
             vision_cache_path=args.vision_cache,
             max_workers=args.workers,
             fetch_network=not args.no_network_vision,
+            use_modal=args.use_modal,
         )
         c_elapsed = time.time() - t1
         print(f"Completed Phase 2 curation in {c_elapsed:.1f}s:")
@@ -2194,6 +2645,8 @@ def main() -> None:
         pop_status = populate_all_targets(
             curation_dir=args.curation_dir,
             status_path=args.population_status,
+            manifest_path=args.output,
+            remove_stale=args.remove_stale,
             dry_run=args.dry_run,
         )
         p_elapsed = time.time() - t2
