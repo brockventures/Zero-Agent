@@ -239,7 +239,14 @@ def run_ssh(
             and retry_without_mux_on_timeout
             and any(
                 k in (res.stderr or "").lower()
-                for k in ("timed out", "mux_client", "connection reset", "broken pipe", "control socket")
+                for k in (
+                    "timed out",
+                    "mux_client",
+                    "connection reset",
+                    "broken pipe",
+                    "control socket",
+                    "session_process_tty",
+                )
             )
         ):
             evict_ssh_mux_socket(host, user=user, port=port)
