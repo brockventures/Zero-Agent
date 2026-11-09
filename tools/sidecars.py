@@ -1024,9 +1024,405 @@ def run_ev9_monitor(force_digest: bool = False) -> tuple[bool, str, str | None]:
 # --------------------------------------------------------------------------
 MARKETING_STATE_FILE = "/workspace/data/marketing_sweep_last_run"
 MARKETING_SENDERS_FILE = "/workspace/data/marketing_senders.json"
+MARKETING_UNSUBSCRIBED_FILE = "/workspace/data/marketing_unsubscribed.json"
+LAST_SIDECAR_POST_FILE = "/workspace/data/last_sidecar_post.json"
 MARKETING_MIN_DAYS_BETWEEN_RUNS = 12
 MARKETING_QUERY = "category:promotions newer_than:15d"
 MARKETING_PROTECTED_SENDERS = ("roy cloud", "konstella", "famly", "powerschool", "homeroom")
+
+
+def _load_marketing_unsubscribed() -> dict:
+    """Load unsubscribed marketing senders state from MARKETING_UNSUBSCRIBED_FILE."""
+    if not os.path.exists(MARKETING_UNSUBSCRIBED_FILE):
+        return {"emails": [], "senders": [], "updated_at": ""}
+    try:
+        with open(MARKETING_UNSUBSCRIBED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            emails = [str(e).lower().strip() for e in data.get("emails", []) if e]
+            senders = data.get("senders", [])
+            if not isinstance(senders, list):
+                senders = []
+            for s in senders:
+                if isinstance(s, dict) and s.get("email"):
+                    addr = str(s["email"]).lower().strip()
+                    if addr and addr not in emails:
+                        emails.append(addr)
+            return {
+                "emails": emails,
+                "senders": senders,
+                "updated_at": data.get("updated_at", ""),
+            }
+        if isinstance(data, list):
+            emails = []
+            senders = []
+            for item in data:
+                if isinstance(item, str) and item.strip():
+                    addr = item.lower().strip()
+                    if addr not in emails:
+                        emails.append(addr)
+                    senders.append({"name": addr, "email": addr})
+                elif isinstance(item, dict) and item.get("email"):
+                    addr = str(item["email"]).lower().strip()
+                    if addr not in emails:
+                        emails.append(addr)
+                    senders.append(item)
+            return {"emails": emails, "senders": senders, "updated_at": ""}
+    except Exception:
+        pass
+    return {"emails": [], "senders": [], "updated_at": ""}
+
+
+def _save_marketing_unsubscribed(data: dict) -> None:
+    """Persist unsubscribed marketing senders state to MARKETING_UNSUBSCRIBED_FILE."""
+    try:
+        os.makedirs(os.path.dirname(MARKETING_UNSUBSCRIBED_FILE), exist_ok=True)
+        with open(MARKETING_UNSUBSCRIBED_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.warning("Failed to save marketing unsubscribed file: %s", e)
+
+
+def save_last_sidecar_post(
+    job_id: str,
+    title: str,
+    message: str,
+    senders: list[dict] | None = None,
+    should_post: bool = True,
+) -> dict:
+    """Persist the latest sidecar rendered post to LAST_SIDECAR_POST_FILE for turn context."""
+    now_pt = datetime.now(PT)
+    payload: dict = {
+        "job_id": job_id,
+        "title": title,
+        "message": message,
+        "text": message,
+        "should_post": should_post,
+        "timestamp_iso": now_pt.isoformat(),
+        "timestamp_epoch": int(now_pt.timestamp()),
+        "timestamp_pt": now_pt.strftime("%Y-%m-%d %I:%M %p PT"),
+    }
+    if senders is not None:
+        payload["senders"] = senders
+    try:
+        os.makedirs(os.path.dirname(LAST_SIDECAR_POST_FILE), exist_ok=True)
+        with open(LAST_SIDECAR_POST_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        log.warning("Failed to save last sidecar post: %s", e)
+    return payload
+
+
+def get_recent_marketing_report_context() -> str:
+    """Load recent marketing report and numbered sender list for active turn context."""
+    post_data: dict = {}
+    if os.path.exists(LAST_SIDECAR_POST_FILE):
+        try:
+            with open(LAST_SIDECAR_POST_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                post_data = loaded
+        except Exception:
+            post_data = {}
+
+    senders: list[dict] = []
+    if os.path.exists(MARKETING_SENDERS_FILE):
+        try:
+            with open(MARKETING_SENDERS_FILE, "r", encoding="utf-8") as f:
+                loaded_senders = json.load(f)
+            if isinstance(loaded_senders, list):
+                senders = [s for s in loaded_senders if isinstance(s, dict)]
+        except Exception:
+            senders = []
+
+    if not senders and isinstance(post_data.get("senders"), list):
+        senders = [s for s in post_data["senders"] if isinstance(s, dict)]
+
+    msg = str(post_data.get("message") or post_data.get("text") or "").strip()
+    if not msg and not senders:
+        return ""
+
+    parts: list[str] = []
+    if msg:
+        parts.append(msg)
+    if senders:
+        numbered_lines = [
+            f"{i}. {s.get('name') or s.get('email', '')} <{s.get('email', '')}> — {s.get('count', 1)} email{'s' if s.get('count', 1) != 1 else ''}"
+            for i, s in enumerate(senders, 1)
+        ]
+        parts.append("Numbered Marketing Senders:\n" + "\n".join(numbered_lines))
+    return "\n\n".join(parts)
+
+
+def _extract_unsubscribe_http_url(list_unsub_header: str) -> str:
+    """Extract the first HTTP(S) URL from a List-Unsubscribe header."""
+    if not list_unsub_header:
+        return ""
+    for match in re.findall(r"<([^>]+)>", list_unsub_header):
+        candidate = match.strip()
+        if candidate.lower().startswith(("http://", "https://")):
+            return candidate
+    for match in re.findall(r"https?://[^\s,>]+", list_unsub_header):
+        return match.strip()
+    return ""
+
+
+def _unsubscribe_and_trash_sender(addr: str, name: str = "") -> dict:
+    """Search Gmail for messages from addr, trigger List-Unsubscribe/filter, and trash messages."""
+    import urllib.parse
+    import urllib.request
+    from workspace_mcp import GMAIL_BASE, _auth_headers
+
+    addr_norm = addr.lower().strip()
+    result = {
+        "name": name or addr_norm,
+        "email": addr_norm,
+        "trashed_count": 0,
+        "message_ids": [],
+        "unsubscribe_url": "",
+        "unsubscribe_http_ok": False,
+        "filter_created": False,
+    }
+
+    try:
+        headers = _auth_headers()
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+    msg_ids: list[str] = []
+    try:
+        params = urllib.parse.urlencode({"q": f"from:{addr_norm}", "maxResults": 50})
+        req = urllib.request.Request(f"{GMAIL_BASE}/messages?{params}", headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        msg_ids = [m["id"] for m in (data.get("messages") or []) if isinstance(m, dict) and m.get("id")]
+    except Exception as e:
+        result["search_error"] = str(e)
+
+    # Inspect up to 3 messages for List-Unsubscribe headers
+    list_unsub = ""
+    list_unsub_post = ""
+    for mid in msg_ids[:3]:
+        try:
+            meta_url = (
+                f"{GMAIL_BASE}/messages/{mid}"
+                "?format=metadata&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Unsubscribe-Post"
+            )
+            mreq = urllib.request.Request(meta_url, headers=headers)
+            with urllib.request.urlopen(mreq, timeout=15) as mresp:
+                mdata = json.loads(mresp.read().decode())
+            hdrs = {
+                h.get("name", "").lower(): h.get("value", "")
+                for h in mdata.get("payload", {}).get("headers", [])
+            }
+            if hdrs.get("list-unsubscribe"):
+                list_unsub = hdrs["list-unsubscribe"]
+                list_unsub_post = hdrs.get("list-unsubscribe-post", "")
+                break
+        except Exception:
+            continue
+
+    unsub_url = _extract_unsubscribe_http_url(list_unsub)
+    if unsub_url:
+        result["unsubscribe_url"] = unsub_url
+        try:
+            req_headers = {"User-Agent": "Mozilla/5.0 (compatible; ZeroUnsubscribe/1.0)"}
+            if list_unsub_post:
+                body = b"List-Unsubscribe=One-Click"
+                req_headers["Content-Type"] = "application/x-www-form-urlencoded"
+                ureq = urllib.request.Request(unsub_url, data=body, headers=req_headers, method="POST")
+            else:
+                ureq = urllib.request.Request(unsub_url, headers=req_headers, method="GET")
+            with urllib.request.urlopen(ureq, timeout=10) as uresp:
+                result["unsubscribe_http_ok"] = 200 <= getattr(uresp, "status", 200) < 400
+        except Exception:
+            result["unsubscribe_http_ok"] = False
+
+    # Best-effort Gmail filter creation (if settings.basic scope is authorized)
+    try:
+        filter_payload = json.dumps({
+            "criteria": {"from": addr_norm},
+            "action": {"removeLabelIds": ["INBOX"], "addLabelIds": ["TRASH"]},
+        }).encode("utf-8")
+        freq = urllib.request.Request(
+            f"{GMAIL_BASE}/settings/filters",
+            data=filter_payload,
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(freq, timeout=10) as fresp:
+            result["filter_created"] = 200 <= getattr(fresp, "status", 200) < 300
+    except Exception:
+        result["filter_created"] = False
+
+    # Move matching promotional messages from this sender to Trash
+    trashed = 0
+    for mid in msg_ids:
+        try:
+            treq = urllib.request.Request(
+                f"{GMAIL_BASE}/messages/{mid}/trash",
+                data=b"{}",
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(treq, timeout=15):
+                trashed += 1
+        except Exception:
+            continue
+
+    result["trashed_count"] = trashed
+    result["message_ids"] = msg_ids
+    return result
+
+
+def unsubscribe_marketing_senders(targets: list[int | str] | str) -> dict:
+    """Unsubscribe and trash promotional emails for the given 1-based sender indices or email addresses."""
+    senders_list: list[dict] = []
+    if os.path.exists(MARKETING_SENDERS_FILE):
+        try:
+            with open(MARKETING_SENDERS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                senders_list = [s for s in loaded if isinstance(s, dict)]
+        except Exception:
+            senders_list = []
+
+    raw_items: list[int | str] = []
+    if isinstance(targets, str):
+        for tok in re.split(r"[,\s]+", targets.strip()):
+            if tok:
+                raw_items.append(tok)
+    elif isinstance(targets, (list, tuple, set)):
+        for item in targets:
+            if isinstance(item, str) and "," in item and "@" not in item:
+                for tok in re.split(r"[,\s]+", item.strip()):
+                    if tok:
+                        raw_items.append(tok)
+            else:
+                raw_items.append(item)
+
+    resolved: list[dict] = []
+    seen_emails: set[str] = set()
+
+    def _add_sender(entry: dict) -> None:
+        addr = str(entry.get("email", "")).lower().strip()
+        if not addr or addr in seen_emails:
+            return
+        if any(p in addr or p in str(entry.get("name", "")).lower() for p in MARKETING_PROTECTED_SENDERS):
+            return
+        seen_emails.add(addr)
+        resolved.append({
+            "name": str(entry.get("name") or addr).strip(),
+            "email": addr,
+        })
+
+    for item in raw_items:
+        if isinstance(item, int) or (isinstance(item, str) and item.strip().isdigit()):
+            idx = int(item)
+            if 1 <= idx <= len(senders_list):
+                chosen = senders_list[idx - 1]
+                _add_sender(chosen)
+                chosen_name = str(chosen.get("name", "")).strip().lower()
+                if chosen_name:
+                    for s in senders_list:
+                        if str(s.get("name", "")).strip().lower() == chosen_name:
+                            _add_sender(s)
+        elif isinstance(item, str):
+            cleaned = item.strip()
+            if not cleaned:
+                continue
+            parsed_name, parsed_addr = email.utils.parseaddr(cleaned)
+            if "@" in cleaned or "@" in parsed_addr:
+                addr = (parsed_addr or cleaned).lower().strip()
+                matched = next(
+                    (s for s in senders_list if str(s.get("email", "")).lower().strip() == addr),
+                    None,
+                )
+                if matched:
+                    _add_sender(matched)
+                else:
+                    _add_sender({"name": parsed_name.strip() or addr, "email": addr})
+            else:
+                low_name = cleaned.lower()
+                for s in senders_list:
+                    sname = str(s.get("name", "")).strip().lower()
+                    if sname == low_name or low_name in sname:
+                        _add_sender(s)
+
+    now_pt = datetime.now(PT)
+    state = _load_marketing_unsubscribed()
+    existing_emails: list[str] = list(state.get("emails", []))
+    existing_senders_by_email: dict[str, dict] = {
+        str(s.get("email", "")).lower().strip(): s
+        for s in state.get("senders", [])
+        if isinstance(s, dict) and s.get("email")
+    }
+
+    processed_results: list[dict] = []
+    for target in resolved:
+        addr = target["email"]
+        name = target["name"]
+        action_res = _unsubscribe_and_trash_sender(addr, name=name)
+        action_res["unsubscribed_at"] = now_pt.isoformat()
+        processed_results.append(action_res)
+        if addr not in existing_emails:
+            existing_emails.append(addr)
+        existing_senders_by_email[addr] = {
+            "name": name,
+            "email": addr,
+            "unsubscribed_at": action_res["unsubscribed_at"],
+            "trashed_count": action_res.get("trashed_count", 0),
+            "unsubscribe_url": action_res.get("unsubscribe_url", ""),
+            "unsubscribe_http_ok": action_res.get("unsubscribe_http_ok", False),
+            "filter_created": action_res.get("filter_created", False),
+        }
+
+    updated_state = {
+        "emails": existing_emails,
+        "senders": list(existing_senders_by_email.values()),
+        "updated_at": now_pt.isoformat(),
+    }
+    _save_marketing_unsubscribed(updated_state)
+
+    if senders_list and not os.path.exists(LAST_SIDECAR_POST_FILE):
+        date_str = now_pt.strftime("%b %d")
+        lines = [
+            f"{i}. {s.get('name', s.get('email', ''))} — {s.get('count', 1)} email{'s' if s.get('count', 1) != 1 else ''}"
+            for i, s in enumerate(senders_list, 1)
+        ]
+        rendered = (
+            f"📬 **Biweekly Marketing Report** — {date_str}\n\n"
+            f"**{len(senders_list)} promotional senders this period:**\n"
+            + "\n".join(lines)
+            + "\n\nReply with sender numbers or names to unsubscribe."
+        )
+        save_last_sidecar_post(
+            job_id="marketing",
+            title=f"Biweekly Marketing Report — {date_str}",
+            message=rendered,
+            senders=senders_list,
+            should_post=True,
+        )
+
+    summary_lines = [
+        f"• {r['name']} ({r['email']}) — trashed {r.get('trashed_count', 0)} email(s)"
+        for r in processed_results
+    ]
+    msg = (
+        f"✅ Unsubscribed {len(processed_results)} marketing sender(s):\n" + "\n".join(summary_lines)
+        if processed_results
+        else "No matching marketing senders found to unsubscribe."
+    )
+    return {
+        "ok": True,
+        "unsubscribed": processed_results,
+        "emails": [r["email"] for r in processed_results],
+        "all_unsubscribed_emails": existing_emails,
+        "trashed_total": sum(r.get("trashed_count", 0) for r in processed_results),
+        "message": msg,
+    }
+
 
 def _marketing_due() -> bool:
     if not os.path.exists(MARKETING_STATE_FILE):
@@ -1049,6 +1445,7 @@ def run_marketing_sweep(force: bool = False) -> tuple[bool, str]:
     if not res.get("ok"):
         return True, f"📬 **Biweekly Marketing Report** — {date_str}\n⚠️ Could not search promotions: {res.get('error')}"
 
+    unsubscribed_emails = set(_load_marketing_unsubscribed().get("emails", []))
     msgs = res.get("messages", []) or []
     counts = {}
     for m in msgs:
@@ -1058,6 +1455,8 @@ def run_marketing_sweep(force: bool = False) -> tuple[bool, str]:
             continue
         parsed_name, parsed_addr = email.utils.parseaddr(sender)
         addr = parsed_addr.lower().strip() if parsed_addr else sender.lower().strip()
+        if addr in unsubscribed_emails:
+            continue
         name = parsed_name.strip().strip('"').strip("'") or addr
         entry = counts.setdefault(addr, {"name": name, "email": addr, "count": 0})
         entry["count"] += 1
@@ -1083,6 +1482,13 @@ def run_marketing_sweep(force: bool = False) -> tuple[bool, str]:
             f.write(now_pt.strftime("%Y-%m-%d"))
         with open(MARKETING_SENDERS_FILE, "w") as f:
             json.dump(senders, f, indent=2)
+        save_last_sidecar_post(
+            job_id="marketing",
+            title=f"Biweekly Marketing Report — {date_str}",
+            message=msg,
+            senders=senders,
+            should_post=should_post,
+        )
     except Exception:
         pass
 
@@ -1834,6 +2240,9 @@ if __name__ == "__main__":
     elif action == "marketing":
         ok, rep, _ = run_sidecar_job("marketing", "Marketing Email Sweep", run_marketing_sweep, force=True)
         print(rep)
+    elif action in ("marketing_unsubscribe", "unsubscribe_marketing", "unsubscribe"):
+        res = unsubscribe_marketing_senders(sys.argv[2:])
+        print(res.get("message", ""))
     elif action == "doctor":
         from tools.memory_manager import run_memory_doctor
         ok, rep, _ = run_sidecar_job("doctor", "Memory Doctor Audit", lambda: run_memory_doctor(auto_remediate=True))
