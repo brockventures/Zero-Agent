@@ -28,6 +28,20 @@ import nas_config  # noqa: E402
 
 DEFAULT_STATE_PATH = Path("/workspace/data/mirrormere_deploy_state.json")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+REMOTE_GIT_PATH_EXPORT = 'export PATH="/usr/local/git/bin:/volume1/@appstore/Git/bin:$PATH"'
+
+
+def _unpack_ssh_result(res: Any) -> tuple[int, str, str]:
+    """Normalize run_ssh return values across tuple (rc, stdout, stderr) and SimpleNamespace mocks."""
+    if isinstance(res, tuple):
+        rc = int(res[0])
+        stdout = str(res[1] or "") if len(res) > 1 else ""
+        stderr = str(res[2] or "") if len(res) > 2 else ""
+        return rc, stdout, stderr
+    rc = int(getattr(res, "returncode", 1))
+    stdout = str(getattr(res, "stdout", "") or "")
+    stderr = str(getattr(res, "stderr", "") or "")
+    return rc, stdout, stderr
 
 
 def get_upstream_head_sha(
@@ -84,11 +98,16 @@ def save_deploy_state(state_path: Path, state: dict[str, Any]) -> None:
 def get_host2_current_sha() -> str | None:
     """Query the current deployed git HEAD SHA in the Host 2 hearth checkout."""
     hearth_dir = f"{nas_config.DOCKER_ROOT}/hearth"
-    remote_cmd = f"cd {hearth_dir} && git rev-parse HEAD"
+    remote_cmd = (
+        f"{REMOTE_GIT_PATH_EXPORT}; "
+        f"cd {hearth_dir} && "
+        f"(git rev-parse HEAD 2>/dev/null || cat .git/refs/heads/main 2>/dev/null || cat .git/HEAD 2>/dev/null)"
+    )
     res = nas_config.run_ssh(nas_config.HOST_2_IP, remote_cmd, timeout=30)
-    if res.returncode != 0:
+    rc, stdout, _ = _unpack_ssh_result(res)
+    if rc != 0:
         return None
-    candidate = (res.stdout or "").strip().splitlines()
+    candidate = stdout.strip().splitlines()
     if not candidate:
         return None
     sha = candidate[-1].strip().lower()
@@ -96,19 +115,28 @@ def get_host2_current_sha() -> str | None:
 
 
 def deploy_hearth_on_host2(target_sha: str, dry_run: bool = False) -> dict[str, Any]:
-    """Reset Host 2 hearth repo to target_sha, rebuild image, roll out compose, and verify healthz."""
+    """Sync Host 2 hearth repo to target_sha (preserving deploy/), pull image, roll out compose, and verify healthz."""
     if not SHA_RE.match(target_sha):
         raise ValueError(f"Invalid target_sha: {target_sha!r}")
 
     hearth_dir = f"{nas_config.DOCKER_ROOT}/hearth"
     deploy_dir = f"{hearth_dir}/deploy"
     compose_file = f"{deploy_dir}/compose.hearth.yaml"
+    tarball_url = f"https://github.com/azylman/mirrormere/archive/{target_sha}.tar.gz"
 
     remote_cmd = (
         f"set -e; "
-        f"cd {hearth_dir} && git fetch origin main && git reset --hard {target_sha} && "
-        f"sudo /usr/local/bin/docker build -t ghcr.io/azylman/mirrormere:latest {hearth_dir} && "
+        f"{REMOTE_GIT_PATH_EXPORT}; "
+        f"cd {hearth_dir} && "
+        f"if command -v git >/dev/null 2>&1; then "
+        f"  git fetch origin main && git checkout {target_sha} -- . ':!deploy'; "
+        f"else "
+        f"  chmod -R u+w {hearth_dir} 2>/dev/null || true; "
+        f"  curl -fsSL {tarball_url} | tar -xz --overwrite --strip-components=1 --exclude='deploy' -C {hearth_dir}; "
+        f"fi && "
+        f"if [ -d {hearth_dir}/.git/refs/heads ]; then echo {target_sha} > {hearth_dir}/.git/refs/heads/main; fi && "
         f"cd {deploy_dir} && "
+        f"sudo /usr/local/bin/docker compose -f compose.hearth.yaml pull hearth-core && "
         f"sudo /usr/local/bin/docker compose -f compose.hearth.yaml up -d hearth-ical-bridge hearth-core && "
         f"for i in $(seq 1 15); do "
         f"  if curl -fsS http://127.0.0.1:8099/healthz >/dev/null && "
@@ -131,11 +159,11 @@ def deploy_hearth_on_host2(target_sha: str, dry_run: bool = False) -> dict[str, 
         }
 
     res = nas_config.run_ssh(nas_config.HOST_2_IP, remote_cmd, timeout=300)
-    if res.returncode != 0:
-        stderr = (res.stderr or "").strip()
-        stdout = (res.stdout or "").strip()
+    rc, stdout, stderr = _unpack_ssh_result(res)
+    if rc != 0:
+        err_msg = stderr.strip() or stdout.strip()
         raise RuntimeError(
-            f"Hearth deploy on Host 2 failed (rc={res.returncode}): {stderr or stdout}"
+            f"Hearth deploy on Host 2 failed (rc={rc}): {err_msg}"
         )
 
     return {
@@ -144,7 +172,7 @@ def deploy_hearth_on_host2(target_sha: str, dry_run: bool = False) -> dict[str, 
         "host": nas_config.HOST_2_IP,
         "hearth_dir": hearth_dir,
         "compose_file": compose_file,
-        "stdout": (res.stdout or "").strip(),
+        "stdout": stdout.strip(),
     }
 
 

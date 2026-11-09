@@ -63,7 +63,7 @@ def test_load_and_save_deploy_state(tmp_path: Path) -> None:
 def test_sync_once_initial_seed_when_host2_matches_upstream(tmp_path: Path) -> None:
     state_file = tmp_path / "mirrormere_deploy_state.json"
     ls_remote_proc = SimpleNamespace(returncode=0, stdout=f"{SHA_NEW}\trefs/heads/main\n", stderr="")
-    ssh_rev_parse = SimpleNamespace(returncode=0, stdout=f"{SHA_NEW}\n", stderr="")
+    ssh_rev_parse = (0, f"{SHA_NEW}\n", "")
 
     with (
         patch.object(mad.nas_config, "HOST_2_IP", TEST_HOST2_IP),
@@ -98,7 +98,7 @@ def test_sync_once_triggers_deploy_when_upstream_advances(tmp_path: Path) -> Non
     state_file = tmp_path / "mirrormere_deploy_state.json"
     mad.save_deploy_state(state_file, {"last_deployed_sha": SHA_OLD, "updated_at": 1700000000})
     ls_remote_proc = SimpleNamespace(returncode=0, stdout=f"{SHA_NEW}\trefs/heads/main\n", stderr="")
-    ssh_deploy_proc = SimpleNamespace(returncode=0, stdout="HEALTH_OK\n", stderr="")
+    ssh_deploy_proc = (0, "HEALTH_OK\n", "")
 
     with (
         patch.object(mad.nas_config, "HOST_2_IP", TEST_HOST2_IP),
@@ -112,8 +112,10 @@ def test_sync_once_triggers_deploy_when_upstream_advances(tmp_path: Path) -> Non
     mock_ssh.assert_called_once()
     host_arg, cmd_arg = mock_ssh.call_args[0]
     assert host_arg == TEST_HOST2_IP
-    assert f"cd {TEST_DOCKER_ROOT}/hearth && git fetch origin main && git reset --hard {SHA_NEW}" in cmd_arg
-    assert f"sudo /usr/local/bin/docker build -t ghcr.io/azylman/mirrormere:latest {TEST_DOCKER_ROOT}/hearth" in cmd_arg
+    assert "/usr/local/git/bin:/volume1/@appstore/Git/bin" in cmd_arg
+    assert "--exclude='deploy'" in cmd_arg
+    assert f"https://github.com/azylman/mirrormere/archive/{SHA_NEW}.tar.gz" in cmd_arg
+    assert "sudo /usr/local/bin/docker compose -f compose.hearth.yaml pull hearth-core" in cmd_arg
     assert "sudo /usr/local/bin/docker compose -f compose.hearth.yaml up -d hearth-ical-bridge hearth-core" in cmd_arg
     assert "http://127.0.0.1:8099/healthz" in cmd_arg
     assert "http://127.0.0.1:8088/healthz" in cmd_arg
@@ -146,10 +148,10 @@ def test_sync_once_ssh_failure_does_not_advance_state(tmp_path: Path) -> None:
     state_file = tmp_path / "mirrormere_deploy_state.json"
     mad.save_deploy_state(state_file, {"last_deployed_sha": SHA_OLD, "updated_at": 1700000000})
     ls_remote_proc = SimpleNamespace(returncode=0, stdout=f"{SHA_NEW}\trefs/heads/main\n", stderr="")
-    ssh_fail_proc = SimpleNamespace(
-        returncode=1,
-        stdout="",
-        stderr="Health check failed for 127.0.0.1:8099/healthz or 127.0.0.1:8088/healthz",
+    ssh_fail_proc = (
+        1,
+        "",
+        "Health check failed for 127.0.0.1:8099/healthz or 127.0.0.1:8088/healthz",
     )
 
     with (
