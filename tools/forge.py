@@ -5460,6 +5460,14 @@ def _prepare_clean_repo_and_sync_base(
     """Ensure base repo has no wedged git operations, auto-stash dirty tracked files, and align local default_branch to latest_def_ref."""
     rp = Path(repo_dir).resolve()
 
+    # 0. Ensure git safe.directory is configured for bind-mounted repositories (e.g. /workspace in Vulcan container)
+    try:
+        chk_safe = subprocess.run(["git", "config", "--global", "--get-all", "safe.directory"], capture_output=True, text=True, timeout=5)
+        if "*" not in chk_safe.stdout.splitlines():
+            subprocess.run(["git", "config", "--global", "--add", "safe.directory", "*"], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
     # 1. Abort any wedged rebase, merge, or cherry-pick in repo_dir
     for abort_cmd in (
         ["git", "cherry-pick", "--abort"],
@@ -5965,11 +5973,18 @@ class ForgeSupervisor:
             lock_fh.close()
             return False
 
+        dispatched_any_chunk = False
         try:
             with get_db_connection(self.db_path) as conn:
                 build = conn.execute("SELECT * FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
                 if not build or build["status"] in ("cancelled", "failed", "completed"):
                     return False
+                # Reclaim any orphaned 'running' or 'verifying' chunks left behind by a previously
+                # interrupted worker process; we now hold the exclusive per-build flock.
+                conn.execute(
+                    "UPDATE forge_chunks SET status = 'pending', live_status = 'Reclaimed after worker interruption' WHERE build_id = ? AND status IN ('running', 'verifying')",
+                    (build_id,),
+                )
                 chunks = conn.execute(
                     "SELECT * FROM forge_chunks WHERE build_id = ? ORDER BY chunk_index ASC",
                     (build_id,),
@@ -6030,6 +6045,7 @@ class ForgeSupervisor:
                         if cand["status"] != "pending" or cand["id"] in in_flight_ids:
                             continue
                         if _chunks_are_eligible_in_parallel(cand, all_chunks, running_rows):
+                            dispatched_any_chunk = True
                             fut = pool.submit(self.execute_chunk_in_worktree, build_id, cand)
                             active_futures[fut] = cand
                             in_flight_ids.add(cand["id"])
@@ -6039,18 +6055,36 @@ class ForgeSupervisor:
                         # Fallback if remaining pending chunks exist but none matched parallel eligibility
                         fallback_cand = next((c for c in all_chunks if c["status"] == "pending"), None)
                         if fallback_cand:
+                            dispatched_any_chunk = True
                             fut = pool.submit(self.execute_chunk_in_worktree, build_id, fallback_cand)
                             active_futures[fut] = fallback_cand
                         else:
+                            if any(c["status"] in ("failed", "cancelled") for c in unmerged):
+                                with get_db_connection(self.db_path) as conn:
+                                    conn.execute(
+                                        "UPDATE forge_builds SET status = 'failed', updated_at = ? WHERE id = ? AND status NOT IN ('completed', 'cancelled')",
+                                        (time.time(), build_id),
+                                    )
+                                post_or_update_build_widget(build_id, db_path=self.db_path)
+                                failed_pipeline = True
                             break
 
                     done, _ = wait(list(active_futures.keys()), return_when=FIRST_COMPLETED)
                     for fut in done:
-                        active_futures.pop(fut, None)
+                        cand_Done = active_futures.pop(fut, None)
                         try:
                             ok = fut.result()
-                        except Exception:
+                        except Exception as fut_exc:
                             ok = False
+                            try:
+                                err_log_path = FORGE_LOGS_DIR / f"build-{build_id}.log"
+                                with open(err_log_path, "a", encoding="utf-8") as elf:
+                                    elf.write(
+                                        f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}] "
+                                        f"Unhandled exception in chunk worker {cand_Done['id'] if cand_Done else build_id}: {fut_exc!r}\n"
+                                    )
+                            except Exception:
+                                pass
                         if not ok:
                             failed_pipeline = True
 
@@ -6066,7 +6100,7 @@ class ForgeSupervisor:
             return not failed_pipeline
         finally:
             _release_file_lock(lock_fh)
-            if _is_prod_forge_env(self.db_path):
+            if dispatched_any_chunk and _is_prod_forge_env(self.db_path):
                 try:
                     self.maybe_spawn_next_build_worker()
                 except Exception:

@@ -346,3 +346,37 @@ class TestVulcanStartupAndPresence(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_run_build_pipeline_reclaims_orphaned_running_chunks(tmp_path, monkeypatch):
+    from tools import forge
+    db_path = tmp_path / "forge.db"
+    forge.init_forge_db(db_path)
+    with forge.get_db_connection(db_path) as conn:
+        conn.execute(
+            "INSERT INTO forge_builds (id, title, objective, repo, tier, origin_channel_id, status, created_at, updated_at) "
+            "VALUES ('fg-orphan-1', 'Orphan Test', 'Obj', ?, 2, 123, 'running', 1.0, 1.0)",
+            (str(tmp_path),),
+        )
+        conn.execute(
+            "INSERT INTO forge_chunks (id, build_id, chunk_index, title, repo, target_files_json, instructions, verification_cmd, status) "
+            "VALUES ('fg-orphan-1-c0', 'fg-orphan-1', 0, 'Chunk 0', ?, ?, 'do it', 'true', 'running')",
+            (str(tmp_path), '["a.py"]'),
+        )
+    sup = forge.ForgeSupervisor(db_path=db_path)
+    executed = []
+
+    def fake_exec(build_id, chunk_row):
+        executed.append(chunk_row["id"])
+        with forge.get_db_connection(db_path) as conn:
+            conn.execute("UPDATE forge_chunks SET status = 'merged' WHERE id = ?", (chunk_row["id"],))
+        return True
+
+    monkeypatch.setattr(sup, "execute_chunk_in_worktree", fake_exec)
+    monkeypatch.setattr(forge, "_prepare_clean_repo_and_sync_base", lambda *a, **kw: "HEAD")
+    monkeypatch.setattr(forge, "_propagate_build_branches", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge, "dispatch_build_completion_to_origin", lambda *a, **kw: None)
+
+    assert sup.run_build_pipeline("fg-orphan-1") is True
+    assert executed == ["fg-orphan-1-c0"]
