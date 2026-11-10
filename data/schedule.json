@@ -471,9 +471,9 @@
     "interval_seconds": 300,
     "prompt": "Run the bridge liveness & gateway watchdog check using /workspace/tools/sidecars.py bridge_watchdog. Auto-heals and alerts only if degraded (silent when nominal).",
     "catchup_if_missed": false,
-    "last_run_ts": 1794323652.1974263,
-    "last_run_at": "2026-11-10 07:14 AM PT",
-    "next_run_ts": 1794323952.1974263,
+    "last_run_ts": 1794325205,
+    "last_run_at": "2026-11-10 07:40 AM PT",
+    "next_run_ts": 1794325505.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -485,9 +485,9 @@
     "channel_id": 1544953279664889888,
     "prompt": "Run the Host 2 and Host 1 PID & process headroom watchdog using /workspace/tools/sidecars.py pid_watchdog. Silent execution unless warning or critical threshold exceeded.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794323289,
-    "last_run_at": "2026-11-10 07:08 AM PT",
-    "next_run_ts": 1794324189.0
+    "last_run_ts": 1794325095,
+    "last_run_at": "2026-11-10 07:38 AM PT",
+    "next_run_ts": 1794325995.0
   },
   {
     "id": "agora_roguelike_pm",
@@ -685,9 +685,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the Arr queue & health watchdog using /workspace/tools/sidecars.py arr_queue.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794321115,
-    "last_run_at": "2026-11-10 06:31 AM PT",
-    "next_run_ts": 1794324715.0
+    "last_run_ts": 1794324719,
+    "last_run_at": "2026-11-10 07:31 AM PT",
+    "next_run_ts": 1794328319.0
   },
   {
     "id": "prowlarr_watchdog",
@@ -698,9 +698,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the Prowlarr indexer health watchdog using /workspace/tools/sidecars.py prowlarr.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794320627,
-    "last_run_at": "2026-11-10 06:23 AM PT",
-    "next_run_ts": 1794324227.0
+    "last_run_ts": 1794324236,
+    "last_run_at": "2026-11-10 07:23 AM PT",
+    "next_run_ts": 1794327836.0
   },
   {
     "id": "sabnzbd_watchdog",
@@ -711,9 +711,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the SABnzbd downloader & unpack watchdog using /workspace/tools/sidecars.py sabnzbd.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794320627,
-    "last_run_at": "2026-11-10 06:23 AM PT",
-    "next_run_ts": 1794324227.0
+    "last_run_ts": 1794324236,
+    "last_run_at": "2026-11-10 07:23 AM PT",
+    "next_run_ts": 1794327836.0
   },
   {
     "id": "nest_lock_watchdog",
@@ -749,9 +749,9 @@
     "interval_seconds": 1800,
     "prompt": "Run the Google Tasks two-way sync using /workspace/tools/sidecars.py tasks_sync. Silent sidecar execution (silent unless error).",
     "catchup_if_missed": false,
-    "last_run_ts": 1794323132,
-    "last_run_at": "2026-11-10 07:05 AM PT",
-    "next_run_ts": 1794324932.0
+    "last_run_ts": 1794324940,
+    "last_run_at": "2026-11-10 07:35 AM PT",
+    "next_run_ts": 1794326740.0
   },
   {
     "id": "quota_poller",
@@ -761,9 +761,9 @@
     "interval_seconds": 600,
     "prompt": "Run the 10-minute ground-truth quota usage poller using /workspace/tools/sidecars.py quota_poller. Captures live remaining fractions and cycle burn deltas.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794323284,
-    "last_run_at": "2026-11-10 07:08 AM PT",
-    "next_run_ts": 1794323884.0
+    "last_run_ts": 1794325129,
+    "last_run_at": "2026-11-10 07:38 AM PT",
+    "next_run_ts": 1794325729.0
   },
   {
     "id": "personal_data_sync",
@@ -794,9 +794,9 @@
       23,
       7
     ],
-    "last_run_ts": 1794323765,
-    "last_run_at": "2026-11-10 07:16 AM PT",
-    "next_run_ts": 1794324065.0
+    "last_run_ts": 1794325316,
+    "last_run_at": "2026-11-10 07:41 AM PT",
+    "next_run_ts": 1794325616.0
   },
   {
     "id": "resident_agents_daily_tip",
@@ -908,10 +908,10 @@
     "minute_pt": 30,
     "prompt": "Run the morning Weather, Air Quality & Pre-Adjustment Energy Decision Card workflow using /workspace/tools/sidecars.py weather_energy_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794238206,
-    "next_run_ts": 1794324600.0,
+    "last_run_ts": 1794324610,
+    "next_run_ts": 1794411000.0,
     "channel_id": 1544953275877556334,
-    "last_run_at": "2026-11-09 07:30 AM PT"
+    "last_run_at": "2026-11-10 07:30 AM PT"
   },
   {
     "id": "midweek_grocery_card",
