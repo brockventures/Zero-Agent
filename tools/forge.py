@@ -148,13 +148,15 @@ def _apply_low_priority() -> None:
 
 
 def resolve_default_forge_db_path() -> Path:
-    """Resolve the shared cross-container FORGE SQLite path on Host 2 (/baseball/data/forge.db) when present."""
+    """Resolve the shared cross-container FORGE SQLite path on Host 2 when present, falling back cleanly if broken."""
     env_override = os.getenv("FORGE_DB_PATH", "").strip()
     if env_override:
         return Path(env_override)
     shared_baseball_data = Path("/baseball/data")
     if shared_baseball_data.exists() and shared_baseball_data.is_dir():
-        return shared_baseball_data / "forge.db"
+        cand = shared_baseball_data / "forge.db"
+        if not (cand.is_symlink() and not cand.exists()):
+            return cand
     return DATA_DIR / "forge.db"
 
 
@@ -817,10 +819,24 @@ def _get_repo_default_branch(repo_dir: Path | str) -> str:
 # ---------------------------------------------------------------------------
 
 def get_db_connection(db_path: Path | str = FORGE_DB_PATH) -> sqlite3.Connection:
-    """Open a WAL-mode SQLite connection with busy timeout and foreign keys enabled."""
+    """Open a WAL-mode SQLite connection with busy timeout and foreign keys enabled, healing broken symlinks."""
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(p), timeout=10.0)
+    if p.is_symlink() and not p.exists():
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    try:
+        conn = sqlite3.connect(str(p), timeout=10.0)
+    except sqlite3.OperationalError:
+        if p.is_symlink():
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        p.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(p), timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
@@ -949,8 +965,11 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
         _ensure_column(conn, "forge_chunks", "total_tokens", "INTEGER NOT NULL DEFAULT 0")
 
 
-# Initialize schema on import
-init_forge_db()
+# Initialize schema on import (tolerating broken symlinks or read-only mounts)
+try:
+    init_forge_db()
+except Exception as _init_db_err:
+    print(f"[FORGE] Warning initializing forge DB at {FORGE_DB_PATH}: {_init_db_err}", file=sys.stderr)
 
 
 def consolidate_legacy_forge_db(
@@ -1018,6 +1037,18 @@ def consolidate_legacy_forge_db(
         primary_conn.close()
 
     try:
+        # Only replace legacy (/workspace/data/forge.db) with a symlink if primary is NOT a container-local /baseball/data path
+        # unless /baseball is explicitly mounted across all containers, so peer containers (e.g. discord-vulcan-agent)
+        # that only mount /workspace never encounter a dangling symlink to /baseball/data/forge.db.
+        resolved_primary = primary.resolve()
+        if str(resolved_primary).startswith("/baseball/"):
+            return {
+                "migrated_rows": migrated_rows,
+                "symlinked": False,
+                "primary": str(resolved_primary),
+                "legacy": str(legacy),
+                "status": "migrated_kept_both",
+            }
         legacy.unlink()
     except FileNotFoundError:
         pass
@@ -5784,17 +5815,63 @@ class ForgeSupervisor:
         except Exception:
             pass
 
+    def _heal_db_and_backfill_widgets(self) -> list[str]:
+        """Ensure the FORGE SQLite database is healthy and backfill missing #forge cards for queued/running builds."""
+        backfilled: list[str] = []
+        try:
+            init_forge_db(self.db_path)
+        except Exception as e:
+            print(f"[FORGE] Warning healing DB in ForgeSupervisor: {e}", file=sys.stderr)
+            return backfilled
+
+        if not _is_prod_forge_env(self.db_path):
+            return backfilled
+
+        try:
+            with get_db_connection(self.db_path) as conn:
+                missing_rows = conn.execute(
+                    "SELECT id FROM forge_builds WHERE status IN ('queued', 'running') AND (forge_message_id IS NULL OR forge_message_id = 0) ORDER BY created_at ASC"
+                ).fetchall()
+            for r in missing_rows:
+                bid = r["id"]
+                msg_id = post_or_update_build_widget(bid, db_path=self.db_path)
+                if msg_id:
+                    backfilled.append(bid)
+        except Exception as e:
+            print(f"[FORGE] Warning backfilling missing build widgets: {e}", file=sys.stderr)
+        return backfilled
+
     def tick_sync(self) -> dict:
         """Synchronous housekeeping tick: expire stale decisions, prune 1h completed #forge cards, sync header, dispatch SDK tasks, and advance queued builds."""
-        self._record_vulcan_heartbeat()
+        try:
+            self._record_vulcan_heartbeat()
+        except Exception:
+            pass
         try:
             from tools.bridge_state import reap_stale_in_flight_entries
             reap_stale_in_flight_entries()
         except Exception:
             pass
-        expired = expire_stale_decisions(db_path=self.db_path)
-        pruned_widgets = prune_completed_build_widgets(db_path=self.db_path)
-        sync_forge_channel_header(db_path=self.db_path)
+
+        backfilled_widgets = self._heal_db_and_backfill_widgets()
+
+        expired: list[str] = []
+        try:
+            expired = expire_stale_decisions(db_path=self.db_path)
+        except Exception as e:
+            print(f"[FORGE] Warning in expire_stale_decisions: {e}", file=sys.stderr)
+
+        pruned_widgets = 0
+        try:
+            pruned_widgets = prune_completed_build_widgets(db_path=self.db_path)
+        except Exception as e:
+            print(f"[FORGE] Warning in prune_completed_build_widgets: {e}", file=sys.stderr)
+
+        try:
+            sync_forge_channel_header(db_path=self.db_path)
+        except Exception as e:
+            print(f"[FORGE] Warning in sync_forge_channel_header: {e}", file=sys.stderr)
+
         dispatched_sdk = []
         try:
             from tools.task_settle import check_and_dispatch_completed_tasks
@@ -5803,16 +5880,20 @@ class ForgeSupervisor:
             pass
 
         spawned_builds: list[str] = []
-        if self.should_execute_builds():
-            while len(self._count_active_build_workers()) < self._effective_max_builds():
-                b_id = self.maybe_spawn_next_build_worker()
-                if not b_id:
-                    break
-                spawned_builds.append(b_id)
+        try:
+            if self.should_execute_builds():
+                while len(self._count_active_build_workers()) < self._effective_max_builds():
+                    b_id = self.maybe_spawn_next_build_worker()
+                    if not b_id:
+                        break
+                    spawned_builds.append(b_id)
+        except Exception as e:
+            print(f"[FORGE] Warning spawning build worker in tick_sync: {e}", file=sys.stderr)
 
         return {
             "expired_decisions": expired,
             "pruned_widgets": pruned_widgets,
+            "backfilled_widgets": backfilled_widgets,
             "dispatched_sdk_tasks": len(dispatched_sdk),
             "spawned_build": spawned_builds[0] if spawned_builds else None,
             "spawned_builds": spawned_builds,

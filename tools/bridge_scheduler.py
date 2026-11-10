@@ -1754,11 +1754,69 @@ class BridgeScheduler:
             is_vulc = is_vulcan_agent()
         except Exception:
             is_vulc = False
+        if is_vulc:
+            try:
+                await asyncio.to_thread(self._ensure_vulcan_runtime_hygiene)
+            except Exception as e:
+                print(f"[BridgeScheduler] Warning running Vulcan startup hygiene: {e}")
         # Evaluate missed/due jobs on startup (Zero only; Vulcan runs lean #forge-only loop)
         if not is_vulc:
             await self._evaluate_and_dispatch_jobs(is_startup=True)
         self._task = asyncio.create_task(self._loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    def _ensure_vulcan_runtime_hygiene(
+        self,
+        workspace_tools_dir: Path | str = "/workspace/tools",
+        app_dir: Path | str = "/app",
+    ) -> dict:
+        """Sync /workspace/tools/bridge*.py into /app/ inside discord-vulcan-agent and terminate any duplicate Zero-only sidecars."""
+        import shutil as _shutil
+        import signal as _signal
+
+        synced_files: list[str] = []
+        killed_pids: list[int] = []
+
+        ws_tools = Path(workspace_tools_dir)
+        target_app = Path(app_dir)
+        if ws_tools.exists() and target_app.exists():
+            for src in sorted(ws_tools.glob("bridge*.py")):
+                dst = target_app / src.name
+                try:
+                    if dst.is_symlink():
+                        if not dst.exists():
+                            dst.unlink()
+                        else:
+                            continue
+                    if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime or src.stat().st_size != dst.stat().st_size:
+                        _shutil.copy2(src, dst)
+                        synced_files.append(src.name)
+                except Exception:
+                    pass
+
+        zero_only_markers = (
+            "zero_mail_listener.py",
+            "amazon_order_listener.py",
+            "banana_watcher.py",
+        )
+        proc_root = Path("/proc")
+        if proc_root.exists():
+            my_pid = os.getpid()
+            for entry in proc_root.iterdir():
+                if not entry.name.isdigit():
+                    continue
+                pid = int(entry.name)
+                if pid <= 1 or pid == my_pid:
+                    continue
+                try:
+                    raw_cmd = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                    if any(marker in raw_cmd for marker in zero_only_markers):
+                        os.kill(pid, _signal.SIGTERM)
+                        killed_pids.append(pid)
+                except Exception:
+                    pass
+
+        return {"synced_files": synced_files, "killed_pids": killed_pids}
 
     async def stop(self):
         self._running = False
@@ -1928,13 +1986,22 @@ class BridgeScheduler:
                     in_vulcan = False
 
                 if in_vulcan:
-                    # Lean #forge-only loop for Vulcan: gateway heartbeat, ForgeSupervisor build/chunk ticks,
-                    # and #forge turn/wakeup dispatching (skipping Zero-only household cron jobs, email listeners,
-                    # and Crab Cavern background tasks).
+                    # Lean #forge-only loop for Vulcan: gateway heartbeat, runtime hygiene (/app/bridge*.py sync
+                    # & Zero-only sidecar termination), ForgeSupervisor build/chunk ticks with automatic recovery,
+                    # and #forge turn/wakeup dispatching.
                     try:
                         from tools.bridge_state import update_gateway_heartbeat
                         gw_status = "connected" if (self.bot and getattr(self.bot, "is_ready", lambda: False)()) else "disconnected"
                         update_gateway_heartbeat(self.bot, status=gw_status)
+                    except Exception:
+                        pass
+
+                    hygiene_res = {"synced_files": [], "killed_pids": []}
+                    try:
+                        hygiene_res = await asyncio.wait_for(
+                            asyncio.to_thread(self._ensure_vulcan_runtime_hygiene),
+                            timeout=5.0,
+                        )
                     except Exception:
                         pass
 
@@ -1943,10 +2010,39 @@ class BridgeScheduler:
                         await asyncio.wait_for(asyncio.to_thread(forge_supervisor.tick_sync), timeout=12.0)
                     except asyncio.TimeoutError:
                         print("[BridgeScheduler] Warning: forge_supervisor.tick_sync() timed out after 12s (Vulcan lean loop)")
-                    except Exception:
-                        pass
+                    except Exception as tick_err:
+                        print(f"[BridgeScheduler] Warning: forge_supervisor.tick_sync() raised {tick_err}; attempting self-heal recovery...")
+                        try:
+                            import importlib as _importlib
+                            import tools.forge as _fg_mod
+                            _importlib.reload(_fg_mod)
+                            _fg_mod.init_forge_db(_fg_mod.FORGE_DB_PATH)
+                            await asyncio.wait_for(
+                                asyncio.to_thread(_fg_mod.forge_supervisor.maybe_spawn_next_build_worker),
+                                timeout=8.0,
+                            )
+                        except Exception as rec_err:
+                            print(f"[BridgeScheduler] Error during ForgeSupervisor self-heal recovery: {rec_err}")
 
                     await self.flush_outbox_queue(channel_filter=FORGE_CHANNEL_ID)
+
+                    vulcan_reload_flag = DATA_DIR / "reload_vulcan.flag"
+                    if vulcan_reload_flag.exists() or hygiene_res.get("synced_files"):
+                        busy = self.is_busy_fn() if self.is_busy_fn else []
+                        if not busy:
+                            try:
+                                if vulcan_reload_flag.exists():
+                                    vulcan_reload_flag.unlink()
+                            except Exception:
+                                pass
+                            if self.reload_fn:
+                                await self.reload_fn(
+                                    None,
+                                    initiator="scheduler",
+                                    force=True,
+                                    reason="Vulcan /app/bridge*.py sync or reload_vulcan.flag trigger",
+                                )
+
                     await asyncio.sleep(15)
                     continue
 

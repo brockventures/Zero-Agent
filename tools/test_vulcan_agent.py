@@ -188,6 +188,83 @@ class TestVulcanSchedulerLeanMode(unittest.IsolatedAsyncioTestCase):
         mock_tick.assert_called_once()
         mock_flush.assert_awaited_once_with(channel_filter=bs.FORGE_CHANNEL_ID)
 
+    async def test_vulcan_runtime_hygiene_syncs_bridge_and_kills_zero_sidecars(self):
+        scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            ws_tools = tmp_path / "tools"
+            app_dir = tmp_path / "app"
+            ws_tools.mkdir(parents=True)
+            app_dir.mkdir(parents=True)
+
+            (ws_tools / "bridge.py").write_text("# fresh bridge\n", encoding="utf-8")
+            (ws_tools / "bridge_scheduler.py").write_text("# fresh scheduler\n", encoding="utf-8")
+            (app_dir / "bridge.py").write_text("# stale\n", encoding="utf-8")
+
+            res = scheduler._ensure_vulcan_runtime_hygiene(workspace_tools_dir=ws_tools, app_dir=app_dir)
+            self.assertIn("bridge.py", res["synced_files"])
+            self.assertIn("bridge_scheduler.py", res["synced_files"])
+            self.assertEqual((app_dir / "bridge.py").read_text(encoding="utf-8"), "# fresh bridge\n")
+            self.assertEqual((app_dir / "bridge_scheduler.py").read_text(encoding="utf-8"), "# fresh scheduler\n")
+
+    async def test_vulcan_scheduler_loop_recovers_from_tick_sync_exception(self):
+        scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock())
+        scheduler._running = True
+
+        def stop_after_one_sleep(_):
+            scheduler._running = False
+            raise asyncio.CancelledError()
+
+        with patch.dict(os.environ, {"AGENT_ROLE": "vulcan"}, clear=False), \
+             patch.object(scheduler, "_ensure_vulcan_runtime_hygiene", return_value={"synced_files": [], "killed_pids": []}), \
+             patch.object(scheduler, "flush_outbox_queue", new_callable=AsyncMock) as mock_flush, \
+             patch("tools.forge.forge_supervisor.tick_sync", side_effect=RuntimeError("transient db error")), \
+             patch("importlib.reload"), \
+             patch("tools.forge.init_forge_db") as mock_init_db, \
+             patch("tools.forge.forge_supervisor.maybe_spawn_next_build_worker", return_value="fg-123") as mock_spawn, \
+             patch("asyncio.sleep", side_effect=stop_after_one_sleep):
+            try:
+                await scheduler._loop()
+            except asyncio.CancelledError:
+                pass
+
+        mock_init_db.assert_called_once()
+        mock_spawn.assert_called_once()
+        mock_flush.assert_awaited_once_with(channel_filter=bs.FORGE_CHANNEL_ID)
+
+
+class TestForgeSupervisorResilience(unittest.TestCase):
+    def test_get_db_connection_heals_broken_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            db_path = tmp_path / "forge.db"
+            db_path.symlink_to(tmp_path / "nonexistent_dir" / "missing.db")
+            self.assertTrue(db_path.is_symlink())
+            self.assertFalse(db_path.exists())
+
+            fg.init_forge_db(db_path)
+            self.assertFalse(db_path.is_symlink())
+            self.assertTrue(db_path.exists())
+
+    def test_tick_sync_isolates_substep_errors_and_still_spawns_builds(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            db_path = tmp_path / "forge.db"
+            sup = fg.ForgeSupervisor(db_path=db_path)
+
+            with patch.dict(os.environ, {"AGENT_ROLE": "vulcan"}, clear=False), \
+                 patch("tools.forge.DATA_DIR", tmp_path), \
+                 patch("tools.forge.expire_stale_decisions", side_effect=RuntimeError("decision error")), \
+                 patch("tools.forge.prune_completed_build_widgets", side_effect=RuntimeError("prune error")), \
+                 patch("tools.forge.sync_forge_channel_header", side_effect=RuntimeError("header error")), \
+                 patch.object(sup, "_effective_max_builds", return_value=1), \
+                 patch.object(sup, "_count_active_build_workers", side_effect=[set(), set(), {"fg-recovered"}]), \
+                 patch.object(sup, "maybe_spawn_next_build_worker", return_value="fg-recovered") as mock_spawn:
+                res = sup.tick_sync()
+                self.assertEqual(res["spawned_build"], "fg-recovered")
+                self.assertEqual(res["spawned_builds"], ["fg-recovered"])
+                mock_spawn.assert_called_once()
+
 
 class TestVulcanStartupAndPresence(unittest.IsolatedAsyncioTestCase):
     async def test_apply_bot_presence_defaults_to_vulcan(self):

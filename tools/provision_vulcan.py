@@ -59,6 +59,8 @@ services:
       - AGENT_NAME=Vulcan
       - DISCORD_CHANNEL_ID={FORGE_CHANNEL_ID}
       - VULCAN_BOT_USER_ID={VULCAN_USER_ID}
+      - FORGE_DB_PATH=/workspace/data/forge.db
+      - DISABLE_ZERO_SIDECARS=1
       - TZ=America/Los_Angeles
     env_file:
       - {vulcan_dir}/.env
@@ -86,6 +88,8 @@ def build_remote_staging_Payload(
         "AGENT_NAME=Vulcan",
         f"DISCORD_CHANNEL_ID={FORGE_CHANNEL_ID}",
         f"VULCAN_BOT_USER_ID={VULCAN_USER_ID}",
+        "FORGE_DB_PATH=/workspace/data/forge.db",
+        "DISABLE_ZERO_SIDECARS=1",
     ]
     if discord_bot_token:
         env_lines.append(f"DISCORD_BOT_TOKEN={discord_bot_token}")
@@ -144,7 +148,8 @@ def provision_vulcan_on_host2(
     payload_b64 = base64.b64encode(json.dumps(encoded_files).encode("utf-8")).decode("ascii")
 
     remote_py = (
-        "import base64, json, os, pathlib\n"
+        "import base64, json, os, pathlib, shutil\n"
+        f"zero_dir = pathlib.Path({d_root!r}) / 'discord-agy-agent'\n"
         f"vulcan_dir = pathlib.Path({vulcan_dir!r})\n"
         "vulcan_dir.mkdir(parents=True, exist_ok=True)\n"
         f"data = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
@@ -152,6 +157,18 @@ def provision_vulcan_on_host2(
         "    p = pathlib.Path(fpath)\n"
         "    p.parent.mkdir(parents=True, exist_ok=True)\n"
         "    p.write_text(base64.b64decode(b64_txt).decode('utf-8'), encoding='utf-8')\n"
+        "ws_tools = zero_dir / 'workspace' / 'tools'\n"
+        "app_dir = zero_dir / 'app'\n"
+        "if ws_tools.exists() and app_dir.exists():\n"
+        "    for src in sorted(ws_tools.glob('bridge*.py')):\n"
+        "        dst = app_dir / src.name\n"
+        "        try:\n"
+        "            if dst.is_symlink() and not dst.exists():\n"
+        "                dst.unlink()\n"
+        "            if not dst.is_symlink():\n"
+        "                shutil.copy2(src, dst)\n"
+        "        except Exception:\n"
+        "            pass\n"
         "env_p = vulcan_dir / '.env'\n"
         "def_p = vulcan_dir / '.env.defaults'\n"
         "if not env_p.exists() and def_p.exists():\n"
@@ -160,15 +177,25 @@ def provision_vulcan_on_host2(
     )
     remote_cmd = f"python3 -c {json.dumps(remote_py)}"
     if start_container:
-        remote_cmd += f" && cd {vulcan_dir} && sudo /usr/local/bin/docker-compose up -d"
+        remote_cmd += (
+            f" && cd {vulcan_dir} && sudo /usr/local/bin/docker-compose up -d"
+            f" && sudo /usr/local/bin/docker exec {CONTAINER_NAME} bash -c "
+            "\"cp -f /workspace/tools/bridge*.py /app/ && pkill -f zero_mail_listener || true; pkill -f amazon_order_listener || true; pkill -f banana_watcher || true\""
+        )
 
     res = nas_config.run_ssh(nas_config.HOST_2_IP, remote_cmd, timeout=30)
-    ok = res.returncode == 0 and "STAGED_OK" in (res.stdout or "")
+    if isinstance(res, tuple):
+        rc, out, err = res
+    else:
+        rc = getattr(res, "returncode", 1)
+        out = getattr(res, "stdout", "")
+        err = getattr(res, "stderr", "")
+    ok = rc == 0 and "STAGED_OK" in (out or "")
     return {
         "ok": ok,
-        "returncode": res.returncode,
-        "stdout": (res.stdout or "").strip(),
-        "stderr": (res.stderr or "").strip(),
+        "returncode": rc,
+        "stdout": (out or "").strip(),
+        "stderr": (err or "").strip(),
         "vulcan_dir": vulcan_dir,
     }
 
