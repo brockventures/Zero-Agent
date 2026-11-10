@@ -70,7 +70,28 @@ PT_TZ = ZoneInfo("America/Los_Angeles")
 
 FORGE_CHANNEL_ID = 1562899941595160657
 FORGE_HEADER_MESSAGE_ID = 1563755730161631280
+FORGE_HEADER_ID_CACHE_FILE = DATA_DIR / ".forge_header_msg_id.txt"
 ZERO_CHAT_CHANNEL_ID = 1542081375287640084
+
+
+def get_forge_header_message_id(default_id: int = FORGE_HEADER_MESSAGE_ID) -> int:
+    """Resolve active #forge pinned header message ID, reading FORGE_HEADER_ID_CACHE_FILE when using default_id."""
+    if int(default_id) != FORGE_HEADER_MESSAGE_ID:
+        return int(default_id)
+    for cand in (
+        FORGE_HEADER_ID_CACHE_FILE,
+        DATA_DIR / ".forge_header_msg_id.txt",
+        Path("/opt/zero/workspace/data/.forge_header_msg_id.txt"),
+        Path("/baseball/data/.forge_header_msg_id.txt"),
+    ):
+        try:
+            if cand.exists() and cand.is_file():
+                raw = cand.read_text(encoding="utf-8").strip()
+                if raw.isdigit():
+                    return int(raw)
+        except Exception:
+            pass
+    return int(default_id)
 ZERO_OPS_CHANNEL_ID = 1544953279664889888
 BASEBALL_CHANNEL_ID = 1548196929308065893
 OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
@@ -499,6 +520,62 @@ def _get_vulcan_webhook(
                 data = json.loads(cand.read_text(encoding="utf-8"))
                 if isinstance(data, dict) and data.get("id") and data.get("token"):
                     return {"id": str(data["id"]), "token": str(data["token"]), "name": str(data.get("name") or "Vulcan")}
+        except Exception:
+            pass
+
+    # If cache is missing, attempt to discover the webhook via Discord REST API using available tokens
+    candidate_tokens: list[str] = []
+    for tok in (
+        _get_discord_token(for_forge_channel=True),
+        _get_discord_token(for_forge_channel=False),
+        os.getenv("DISCORD_BOT_TOKEN", "").strip(),
+    ):
+        if tok and tok not in candidate_tokens:
+            candidate_tokens.append(tok)
+    for sec_p in (Path("/secrets/env.json"), Path("/opt/zero/secrets/env.json")):
+        if sec_p.exists():
+            try:
+                sec_data = json.loads(sec_p.read_text(encoding="utf-8"))
+                val = str(sec_data.get("DISCORD_BOT_TOKEN") or "").strip()
+                if val and val not in candidate_tokens:
+                    candidate_tokens.append(val)
+            except Exception:
+                pass
+    for env_cand in (Path("/app/.env"), Path("/opt/zero/.env"), Path("/workspace/.env")):
+        if env_cand.exists():
+            try:
+                for line in env_cand.read_text(encoding="utf-8").splitlines():
+                    if line.strip().startswith("DISCORD_BOT_TOKEN="):
+                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if val and val not in candidate_tokens:
+                            candidate_tokens.append(val)
+            except Exception:
+                pass
+
+    for tok in candidate_tokens:
+        try:
+            resp = requests.get(
+                f"https://discord.com/api/v10/channels/{forge_channel_id}/webhooks",
+                headers={"Authorization": f"Bot {tok}"},
+                timeout=10,
+            )
+            if resp.status_code == 200 and isinstance(resp.json(), list):
+                for wh_item in resp.json():
+                    if isinstance(wh_item, dict) and wh_item.get("id") and wh_item.get("token"):
+                        wh_name = str(wh_item.get("name") or "")
+                        if "vulcan" in wh_name.lower() or str(wh_item["id"]) == "1563745143365042236" or len(resp.json()) == 1:
+                            wh_obj = {
+                                "id": str(wh_item["id"]),
+                                "token": str(wh_item["token"]),
+                                "name": wh_name or "Vulcan",
+                            }
+                            try:
+                                (DATA_DIR / ".vulcan_webhook.json").write_text(
+                                    json.dumps(wh_obj), encoding="utf-8"
+                                )
+                            except Exception:
+                                pass
+                            return wh_obj
         except Exception:
             pass
     return None
@@ -8538,7 +8615,8 @@ def _merge_remote_active_embeds_into_header(
 
     for msg in messages:
         try:
-            if int(msg.get("id", 0)) == FORGE_HEADER_MESSAGE_ID:
+            active_hdr_id = get_forge_header_message_id()
+            if int(msg.get("id", 0)) in (FORGE_HEADER_MESSAGE_ID, active_hdr_id):
                 continue
             embeds = msg.get("embeds") or []
             if not embeds:
@@ -8565,7 +8643,7 @@ def _merge_remote_active_embeds_into_header(
                 st_label = first_line.split("**")[1] if "**" in first_line else "RUNNING"
                 remote_build_lines.append(f"- 🔨 **`{entity_id}` — {clean_title}** (`{st_label}` · {ch_ref})")
             elif entity_id.startswith("dt-") and desc.startswith("**RUNNING**"):
-                remote_job_lines.append(f"- ⚙️ **`{entity_id}` — {clean_title}** (`running` · {ch_ref})")
+                remote_job_lines.append(f"- ⚙️ **`{entity_id}` — {j_title if (j_title := clean_title) else clean_title}** (`running` · {ch_ref})")
         except Exception:
             continue
 
@@ -8631,11 +8709,13 @@ def sync_forge_channel_header(
     if not token and not wh:
         return False
 
+    active_header_id = get_forge_header_message_id(header_message_id)
     rendered_payload = f"{content}\n\n*Last synced: {_now_pt_str()}*"
+    msg_payload = {"content": rendered_payload[:1990], "embeds": []}
     try:
-        ok_patch, _ = _patch_forge_channel_message(
-            int(header_message_id),
-            payload={"content": rendered_payload[:1990], "embeds": []},
+        ok_patch, status_code = _patch_forge_channel_message(
+            int(active_header_id),
+            payload=msg_payload,
             forge_channel_id=forge_channel_id,
             token=token,
             db_path=db_path,
@@ -8643,6 +8723,46 @@ def sync_forge_channel_header(
         if ok_patch:
             cache_file.write_text(content, encoding="utf-8")
             return True
+
+        if (
+            status_code in (403, 404)
+            and _is_prod_forge_env(db_path)
+            and int(forge_channel_id) == FORGE_CHANNEL_ID
+        ):
+            new_id = _post_forge_channel_message(
+                payload=msg_payload,
+                forge_channel_id=forge_channel_id,
+                token=token,
+                db_path=db_path,
+            )
+            if new_id:
+                for id_file in (FORGE_HEADER_ID_CACHE_FILE, DATA_DIR / ".forge_header_msg_id.txt"):
+                    try:
+                        id_file.parent.mkdir(parents=True, exist_ok=True)
+                        id_file.write_text(str(new_id), encoding="utf-8")
+                    except Exception:
+                        pass
+                if token:
+                    pin_headers = {"Authorization": f"Bot {token}"}
+                    try:
+                        requests.put(
+                            f"https://discord.com/api/v10/channels/{forge_channel_id}/pins/{new_id}",
+                            headers=pin_headers,
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
+                    if int(active_header_id) != int(new_id):
+                        try:
+                            requests.delete(
+                                f"https://discord.com/api/v10/channels/{forge_channel_id}/pins/{active_header_id}",
+                                headers=pin_headers,
+                                timeout=10,
+                            )
+                        except Exception:
+                            pass
+                cache_file.write_text(content, encoding="utf-8")
+                return True
     except Exception:
         pass
     return False

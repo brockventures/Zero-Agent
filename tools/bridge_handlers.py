@@ -985,6 +985,10 @@ async def handle_message(
     if bot.user and msg.author.id == bot.user.id and not is_ivy_proxy_escalation:
         return
 
+    msg_type = getattr(msg, "type", None)
+    if msg_type is not None and msg_type not in (discord.MessageType.default, discord.MessageType.reply):
+        return
+
     # Dedicated Excluded Channel Quarantine (e.g. #baseball dedicated exclusively to Ivy):
     # Owned exclusively by Ivy. Zero responds ONLY if:
     # 1. Ryan Brock (Owner) explicitly tags Zero or replies directly to Zero.

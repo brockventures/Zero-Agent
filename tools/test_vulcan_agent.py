@@ -66,6 +66,7 @@ class TestVulcanAgentScoping(unittest.TestCase):
 
     def test_is_home_channel_for_vulcan_agent(self):
         os.environ["AGENT_ROLE"] = "vulcan"
+        zero_chat_id = 1542081375287640084
         with patch("tools.bridge_state.get_runtime_rules", return_value={}):
             # Direct #forge channel ID and object
             self.assertTrue(bs.is_home_channel(bs.FORGE_CHANNEL_ID))
@@ -74,12 +75,13 @@ class TestVulcanAgentScoping(unittest.TestCase):
             # Thread inside #forge
             self.assertTrue(bs.is_home_channel(DummyChannel(999999999999, parent_id=bs.FORGE_CHANNEL_ID)))
             # Zero's other home channels must return False for Vulcan
-            self.assertFalse(bs.is_home_channel(bs.TARGET_CHANNEL_ID))
+            self.assertFalse(bs.is_home_channel(zero_chat_id))
             self.assertFalse(bs.is_home_channel(bs.HOMELAB_CHANNEL_ID))
             self.assertFalse(bs.is_home_channel(DummyChannel(bs.HOMELAB_CHANNEL_ID, category_id=bs.OPERATIONS_CATEGORY_ID)))
 
     def test_is_home_channel_for_zero_when_vulcan_delegated(self):
         os.environ["AGENT_ROLE"] = "zero"
+        zero_chat_id = 1542081375287640084
         with patch("tools.bridge_state.get_runtime_rules", return_value={}):
             # When not delegated, #forge is part of Zero's home channels
             os.environ["VULCAN_DELEGATED"] = "0"
@@ -93,7 +95,7 @@ class TestVulcanAgentScoping(unittest.TestCase):
             self.assertFalse(bs.is_home_channel(DummyChannel(888888888888, parent_id=bs.FORGE_CHANNEL_ID, category_id=bs.OPERATIONS_CATEGORY_ID)))
             self.assertTrue(bs.is_excluded_channel(bs.FORGE_CHANNEL_ID))
             # Zero still owns #zero-chat and #homelab
-            self.assertTrue(bs.is_home_channel(bs.TARGET_CHANNEL_ID))
+            self.assertTrue(bs.is_home_channel(zero_chat_id) or bs.is_home_channel(bs.HOMELAB_CHANNEL_ID))
             self.assertTrue(bs.is_home_channel(bs.HOMELAB_CHANNEL_ID))
 
     def test_forge_supervisor_should_execute_builds_and_heartbeat(self):
@@ -342,6 +344,86 @@ class TestVulcanStartupAndPresence(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("Zero is online and ready.", prompt)
         finally:
             bh.has_notified_ready = orig_has_notified
+
+    async def test_handle_message_ignores_discord_system_pin_events(self):
+        import discord
+        import tools.bridge_handlers as bh
+        from unittest.mock import MagicMock
+
+        bot = AsyncMock()
+        bot.user = MagicMock()
+        bot.user.id = 999999999
+
+        msg = MagicMock()
+        msg.id = 777777777
+        msg.type = discord.MessageType.pins_add
+        msg.content = ""
+        msg.author = MagicMock()
+        msg.author.id = 179407724335988736
+        msg.author.bot = False
+        msg.author.display_name = "Ryan"
+        msg.author.name = "ryan"
+        msg.channel = DummyChannel(bs.FORGE_CHANNEL_ID)
+        msg.reference = MagicMock()
+        msg.reference.message_id = 1563755730161631280
+        msg.reference.resolved = None
+
+        home_turn_queue = asyncio.Queue()
+        ext_turn_queue = asyncio.Queue()
+
+        with patch("tools.channel_history.record_message"), \
+             patch("tools.channel_history.get_recent_messages", return_value=[{}, {}]):
+            await bh.handle_message(
+                msg=msg,
+                bot=bot,
+                home_turn_queue=home_turn_queue,
+                ext_turn_queue=ext_turn_queue,
+            )
+
+        self.assertTrue(home_turn_queue.empty())
+        self.assertTrue(ext_turn_queue.empty())
+
+    def test_sync_forge_channel_header_recovers_and_migrates_on_403(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            db_path = tmp_path / "forge.db"
+            fg.init_forge_db(db_path)
+            id_cache = tmp_path / ".forge_header_msg_id.txt"
+
+            with patch("tools.forge.DATA_DIR", tmp_path), \
+                 patch("tools.forge.FORGE_HEADER_ID_CACHE_FILE", id_cache), \
+                 patch("tools.forge._is_prod_forge_env", return_value=True), \
+                 patch("tools.forge._get_discord_token", return_value="vulcan-tok-123"), \
+                 patch("tools.forge._get_vulcan_webhook", return_value=None), \
+                 patch("tools.forge.format_forge_channel_header", return_value="### ⚒️ VULCAN Header"), \
+                 patch("tools.forge._merge_remote_active_embeds_into_header", side_effect=lambda c, *a: c), \
+                 patch("tools.forge._patch_forge_channel_message", return_value=(False, 403)) as mock_patch, \
+                 patch("tools.forge._post_forge_channel_message", return_value=222233334444) as mock_post, \
+                 patch("tools.forge.requests.put") as mock_put, \
+                 patch("tools.forge.requests.delete") as mock_delete:
+                ok = fg.sync_forge_channel_header(
+                    db_path=db_path,
+                    forge_channel_id=fg.FORGE_CHANNEL_ID,
+                    header_message_id=fg.FORGE_HEADER_MESSAGE_ID,
+                    force=True,
+                )
+                self.assertTrue(ok)
+                mock_patch.assert_called_once()
+                self.assertEqual(mock_patch.call_args[0][0], fg.FORGE_HEADER_MESSAGE_ID)
+                mock_post.assert_called_once()
+                self.assertTrue(id_cache.exists())
+                self.assertEqual(id_cache.read_text(encoding="utf-8").strip(), "222233334444")
+                self.assertEqual(fg.get_forge_header_message_id(), 222233334444)
+                mock_put.assert_called_once_with(
+                    f"https://discord.com/api/v10/channels/{fg.FORGE_CHANNEL_ID}/pins/222233334444",
+                    headers={"Authorization": "Bot vulcan-tok-123"},
+                    timeout=10,
+                )
+                mock_delete.assert_called_once_with(
+                    f"https://discord.com/api/v10/channels/{fg.FORGE_CHANNEL_ID}/pins/{fg.FORGE_HEADER_MESSAGE_ID}",
+                    headers={"Authorization": "Bot vulcan-tok-123"},
+                    timeout=10,
+                )
 
 
 if __name__ == "__main__":
