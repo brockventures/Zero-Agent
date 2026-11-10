@@ -256,6 +256,414 @@ class TestWorkCalSync(unittest.TestCase):
             thr_body = json.loads(thr_req.data.decode("utf-8"))
             self.assertEqual(thr_body, {"removeLabelIds": ["INBOX", "UNREAD", "IMPORTANT"]})
 
+    def test_reconcile_work_cal_insert_new_events(self):
+        state = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-17T23:59:59-08:00",
+            "events": [
+                {
+                    "uid_hash": "ev1",
+                    "summary": "Internal Architecture Review",
+                    "start": "2026-11-03T10:00:00-08:00",
+                    "end": "2026-11-03T11:00:00-08:00",
+                },
+                {
+                    "uid_hash": "ev2",
+                    "summary": "1:1 Sync",
+                    "start": "2026-11-04T14:00:00-08:00",
+                    "end": "2026-11-04T15:00:00-08:00",
+                },
+            ],
+        }
+
+        captured_requests = []
+
+        def fake_urlopen(req, timeout=15):
+            captured_requests.append(req)
+            resp = MagicMock()
+            resp.status = 200
+            if req.get_method() == "GET":
+                resp.read.return_value = json.dumps({"items": []}).encode("utf-8")
+            elif req.get_method() == "POST":
+                resp.read.return_value = json.dumps({"id": "created_ev"}).encode("utf-8")
+            else:
+                resp.read.return_value = b"{}"
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = False
+            return cm
+
+        with patch("tools.work_cal_sync.urllib.request.urlopen", side_effect=fake_urlopen):
+            res = wcs.reconcile_work_cal_to_google_calendar(state, tok="tok_123")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["inserted"], 2)
+            self.assertEqual(res["updated"], 0)
+            self.assertEqual(res["deleted"], 0)
+            self.assertEqual(res["unchanged"], 0)
+
+            post_reqs = [r for r in captured_requests if r.get_method() == "POST"]
+            self.assertEqual(len(post_reqs), 2)
+            for pr in post_reqs:
+                self.assertEqual(pr.get_header("Authorization"), "Bearer tok_123")
+                body = json.loads(pr.data.decode("utf-8"))
+                self.assertEqual(body["summary"], "Work Meeting")
+                self.assertEqual(body["description"], wcs.SYNC_DESC)
+                self.assertEqual(body["transparency"], "opaque")
+                self.assertEqual(body["reminders"], {"useDefault": False, "overrides": []})
+                ext = body["extendedProperties"]["private"]
+                self.assertEqual(ext[wcs.SYNC_SOURCE_KEY], wcs.SYNC_SOURCE_VAL)
+                self.assertIn(ext[wcs.SYNC_UID_KEY], ["ev1", "ev2"])
+
+    def test_reconcile_work_cal_patch_and_unchanged_skip(self):
+        state = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-17T23:59:59-08:00",
+            "events": [
+                {
+                    "uid_hash": "ev_moved",
+                    "summary": "Moved Sync",
+                    "start": "2026-11-03T11:00:00-08:00",
+                    "end": "2026-11-03T12:00:00-08:00",
+                },
+                {
+                    "uid_hash": "ev_unchanged",
+                    "summary": "Same Time Sync",
+                    "start": "2026-11-04T14:00:00-08:00",
+                    "end": "2026-11-04T15:00:00-08:00",
+                },
+            ],
+        }
+
+        existing_items = [
+            {
+                "id": "gcal_moved_id",
+                "summary": "Work Meeting",
+                "description": wcs.SYNC_DESC,
+                "transparency": "opaque",
+                "start": {"dateTime": "2026-11-03T09:00:00-08:00"},
+                "end": {"dateTime": "2026-11-03T10:00:00-08:00"},
+                "extendedProperties": {
+                    "private": {
+                        wcs.SYNC_SOURCE_KEY: wcs.SYNC_SOURCE_VAL,
+                        wcs.SYNC_UID_KEY: "ev_moved",
+                    }
+                },
+            },
+            {
+                "id": "gcal_same_id",
+                "summary": "Work Meeting",
+                "description": wcs.SYNC_DESC,
+                "transparency": "opaque",
+                "start": {"dateTime": "2026-11-04T14:00:00-08:00"},
+                "end": {"dateTime": "2026-11-04T15:00:00-08:00"},
+                "extendedProperties": {
+                    "private": {
+                        wcs.SYNC_SOURCE_KEY: wcs.SYNC_SOURCE_VAL,
+                        wcs.SYNC_UID_KEY: "ev_unchanged",
+                    }
+                },
+            },
+        ]
+
+        captured_requests = []
+
+        def fake_urlopen(req, timeout=15):
+            captured_requests.append(req)
+            resp = MagicMock()
+            resp.status = 200
+            if req.get_method() == "GET":
+                resp.read.return_value = json.dumps({"items": existing_items}).encode("utf-8")
+            else:
+                resp.read.return_value = b"{}"
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = False
+            return cm
+
+        with patch("tools.work_cal_sync.urllib.request.urlopen", side_effect=fake_urlopen):
+            res = wcs.reconcile_work_cal_to_google_calendar(state, tok="tok_123")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["inserted"], 0)
+            self.assertEqual(res["updated"], 1)
+            self.assertEqual(res["deleted"], 0)
+            self.assertEqual(res["unchanged"], 1)
+
+            patch_reqs = [r for r in captured_requests if r.get_method() == "PATCH"]
+            self.assertEqual(len(patch_reqs), 1)
+            self.assertIn("gcal_moved_id", patch_reqs[0].full_url)
+            body = json.loads(patch_reqs[0].data.decode("utf-8"))
+            self.assertEqual(body["start"]["dateTime"], "2026-11-03T11:00:00-08:00")
+            self.assertEqual(body["end"]["dateTime"], "2026-11-03T12:00:00-08:00")
+
+    def test_reconcile_work_cal_delete_canceled_events(self):
+        # Desired state has no events (all canceled / cleared)
+        state = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-17T23:59:59-08:00",
+            "events": [],
+        }
+
+        existing_items = [
+            {
+                "id": "gcal_canceled_1",
+                "summary": "Work Meeting",
+                "start": {"dateTime": "2026-11-05T10:00:00-08:00"},
+                "end": {"dateTime": "2026-11-05T11:00:00-08:00"},
+                "extendedProperties": {
+                    "private": {
+                        wcs.SYNC_SOURCE_KEY: wcs.SYNC_SOURCE_VAL,
+                        wcs.SYNC_UID_KEY: "canceled_uid_1",
+                    }
+                },
+            },
+            {
+                "id": "gcal_canceled_2",
+                "summary": "Work Meeting",
+                "start": {"dateTime": "2026-11-06T10:00:00-08:00"},
+                "end": {"dateTime": "2026-11-06T11:00:00-08:00"},
+                "extendedProperties": {
+                    "private": {
+                        wcs.SYNC_SOURCE_KEY: wcs.SYNC_SOURCE_VAL,
+                        wcs.SYNC_UID_KEY: "canceled_uid_2",
+                    }
+                },
+            },
+        ]
+
+        captured_requests = []
+
+        def fake_urlopen(req, timeout=15):
+            captured_requests.append(req)
+            resp = MagicMock()
+            resp.status = 200
+            if req.get_method() == "GET":
+                resp.read.return_value = json.dumps({"items": existing_items}).encode("utf-8")
+            else:
+                resp.read.return_value = b"{}"
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = False
+            return cm
+
+        with patch("tools.work_cal_sync.urllib.request.urlopen", side_effect=fake_urlopen):
+            res = wcs.reconcile_work_cal_to_google_calendar(state, tok="tok_123")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["inserted"], 0)
+            self.assertEqual(res["updated"], 0)
+            self.assertEqual(res["deleted"], 2)
+            self.assertEqual(res["unchanged"], 0)
+
+            delete_reqs = [r for r in captured_requests if r.get_method() == "DELETE"]
+            self.assertEqual(len(delete_reqs), 2)
+            del_urls = [r.full_url for r in delete_reqs]
+            self.assertTrue(any("gcal_canceled_1" in u for u in del_urls))
+            self.assertTrue(any("gcal_canceled_2" in u for u in del_urls))
+
+    def test_reconcile_strict_non_modification_of_personal_events(self):
+        state = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-17T23:59:59-08:00",
+            "events": [
+                {
+                    "uid_hash": "ev_active",
+                    "summary": "Engineering Standup",
+                    "start": "2026-11-04T09:00:00-08:00",
+                    "end": "2026-11-04T09:30:00-08:00",
+                }
+            ],
+        }
+
+        # Google Calendar returns personal events and one matching synced event
+        existing_items = [
+            {
+                "id": "personal_dentist_appts",
+                "summary": "Dentist Appointment",
+                "start": {"dateTime": "2026-11-04T08:00:00-08:00"},
+                "end": {"dateTime": "2026-11-04T09:00:00-08:00"},
+                # Missing zero_sync_source property entirely
+            },
+            {
+                "id": "personal_family_dinner",
+                "summary": "Family Dinner",
+                "start": {"dateTime": "2026-11-04T18:00:00-08:00"},
+                "end": {"dateTime": "2026-11-04T19:30:00-08:00"},
+                "extendedProperties": {
+                    "private": {
+                        "other_source": "family_cal",
+                    }
+                },
+            },
+            {
+                "id": "gcal_active_id",
+                "summary": "Work Meeting",
+                "description": wcs.SYNC_DESC,
+                "transparency": "opaque",
+                "start": {"dateTime": "2026-11-04T09:00:00-08:00"},
+                "end": {"dateTime": "2026-11-04T09:30:00-08:00"},
+                "extendedProperties": {
+                    "private": {
+                        wcs.SYNC_SOURCE_KEY: wcs.SYNC_SOURCE_VAL,
+                        wcs.SYNC_UID_KEY: "ev_active",
+                    }
+                },
+            },
+        ]
+
+        captured_requests = []
+
+        def fake_urlopen(req, timeout=15):
+            captured_requests.append(req)
+            resp = MagicMock()
+            resp.status = 200
+            if req.get_method() == "GET":
+                resp.read.return_value = json.dumps({"items": existing_items}).encode("utf-8")
+            else:
+                resp.read.return_value = b"{}"
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = False
+            return cm
+
+        with patch("tools.work_cal_sync.urllib.request.urlopen", side_effect=fake_urlopen):
+            res = wcs.reconcile_work_cal_to_google_calendar(state, tok="tok_123")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["inserted"], 0)
+            self.assertEqual(res["updated"], 0)
+            self.assertEqual(res["deleted"], 0)
+            self.assertEqual(res["unchanged"], 1)
+
+            # Assert ZERO mutative requests touched the personal events
+            for req in captured_requests:
+                method = req.get_method()
+                if method in ("PATCH", "DELETE", "PUT"):
+                    self.assertNotIn("personal_dentist_appts", req.full_url)
+                    self.assertNotIn("personal_family_dinner", req.full_url)
+
+    def test_reconcile_duplicate_synced_events_cleanup(self):
+        state = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-17T23:59:59-08:00",
+            "events": [
+                {
+                    "uid_hash": "dup_uid",
+                    "summary": "Meeting with duplicates",
+                    "start": "2026-11-03T10:00:00-08:00",
+                    "end": "2026-11-03T11:00:00-08:00",
+                }
+            ],
+        }
+
+        # Two events in Google Calendar with the same zero_work_cal_uid
+        existing_items = [
+            {
+                "id": "gcal_dup_1",
+                "summary": "Work Meeting",
+                "description": wcs.SYNC_DESC,
+                "transparency": "opaque",
+                "start": {"dateTime": "2026-11-03T10:00:00-08:00"},
+                "end": {"dateTime": "2026-11-03T11:00:00-08:00"},
+                "extendedProperties": {
+                    "private": {
+                        wcs.SYNC_SOURCE_KEY: wcs.SYNC_SOURCE_VAL,
+                        wcs.SYNC_UID_KEY: "dup_uid",
+                    }
+                },
+            },
+            {
+                "id": "gcal_dup_2",
+                "summary": "Work Meeting",
+                "description": wcs.SYNC_DESC,
+                "transparency": "opaque",
+                "start": {"dateTime": "2026-11-03T10:00:00-08:00"},
+                "end": {"dateTime": "2026-11-03T11:00:00-08:00"},
+                "extendedProperties": {
+                    "private": {
+                        wcs.SYNC_SOURCE_KEY: wcs.SYNC_SOURCE_VAL,
+                        wcs.SYNC_UID_KEY: "dup_uid",
+                    }
+                },
+            },
+        ]
+
+        captured_requests = []
+
+        def fake_urlopen(req, timeout=15):
+            captured_requests.append(req)
+            resp = MagicMock()
+            resp.status = 200
+            if req.get_method() == "GET":
+                resp.read.return_value = json.dumps({"items": existing_items}).encode("utf-8")
+            else:
+                resp.read.return_value = b"{}"
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = False
+            return cm
+
+        with patch("tools.work_cal_sync.urllib.request.urlopen", side_effect=fake_urlopen):
+            res = wcs.reconcile_work_cal_to_google_calendar(state, tok="tok_123")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["deleted"], 1)
+            self.assertEqual(res["unchanged"], 1)
+
+            delete_reqs = [r for r in captured_requests if r.get_method() == "DELETE"]
+            self.assertEqual(len(delete_reqs), 1)
+            self.assertIn("gcal_dup_2", delete_reqs[0].full_url)
+
+    def test_main_reconcile_and_sync_reconcile_cli(self):
+        payload = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-17T23:59:59-08:00",
+            "events": [
+                {
+                    "uid_hash": "cli_ev",
+                    "summary": "CLI Sync Event",
+                    "start": "2026-11-03T20:30:00-08:00",
+                    "end": "2026-11-03T21:30:00-08:00",
+                }
+            ],
+        }
+        wcs.ingest_work_cal_payload(payload, state_path=self.state_path)
+
+        # 1. Standalone --reconcile
+        mock_rec_return = {"ok": True, "inserted": 1, "updated": 0, "deleted": 0, "unchanged": 0}
+        with patch("tools.work_cal_sync.reconcile_work_cal_to_google_calendar", return_value=mock_rec_return) as mock_rec:
+            rc = wcs.main(["--reconcile", "--state-path", str(self.state_path), "--calendar-id", "primary"])
+            self.assertEqual(rc, 0)
+            mock_rec.assert_called_once_with(
+                state_path=self.state_path,
+                calendar_id="primary",
+            )
+
+        # 2. Combined --sync --reconcile
+        mock_sync_state = {"schema": "zero.work_cal_sync.v1", "events": [1], "generated_at": "2026-11-03"}
+        with patch("tools.work_cal_sync.sync_latest_from_gmail", return_value=mock_sync_state) as mock_sync:
+            rc2 = wcs.main(["--sync", "--reconcile", "--state-path", str(self.state_path), "--calendar-id", "primary"])
+            self.assertEqual(rc2, 0)
+            mock_sync.assert_called_once_with(
+                state_path=self.state_path,
+                reconcile_calendar=True,
+                calendar_id="primary",
+            )
+
     def test_sync_latest_from_gmail_ingests_newest_and_archives_all_matches(self):
         payload = {
             "schema": "zero.work_cal_sync.v1",

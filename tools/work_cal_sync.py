@@ -15,9 +15,10 @@ import os
 import re
 import sys
 import tempfile
+import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,6 +26,11 @@ WORK_CAL_SCHEMA = "zero.work_cal_sync.v1"
 WORK_CAL_STATE_PATH = Path(os.environ.get("DATA_DIR", "/workspace/data")) / "work_calendar_sync.json"
 DEFAULT_TZ = ZoneInfo("America/Los_Angeles")
 GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
+CALENDAR_BASE = "https://www.googleapis.com/calendar/v3"
+SYNC_SOURCE_KEY = "zero_sync_source"
+SYNC_SOURCE_VAL = "work_cal_sync_v1"
+SYNC_UID_KEY = "zero_work_cal_uid"
+SYNC_DESC = "Synced via [WORK-CAL-SYNC]"
 TIMEOUT = 15
 
 HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9:-]*(?:\s+[^<>]*)?>")
@@ -37,7 +43,7 @@ def _decode_b64url(data: str) -> str:
     padded = data + "=" * (-len(data) % 4)
     try:
         return base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -73,7 +79,7 @@ def _try_parse_work_cal_json(text: str) -> dict | None:
             obj = json.loads(candidate_str)
             if isinstance(obj, dict) and obj.get("schema") == WORK_CAL_SCHEMA:
                 return obj
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
         # Substring JSON object scan via JSONDecoder.raw_decode
@@ -87,7 +93,7 @@ def _try_parse_work_cal_json(text: str) -> dict | None:
                 obj, _ = decoder.raw_decode(candidate_str, brace_pos)
                 if isinstance(obj, dict) and obj.get("schema") == WORK_CAL_SCHEMA:
                     return obj
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             idx = brace_pos + 1
 
@@ -99,7 +105,7 @@ def _try_parse_work_cal_json(text: str) -> dict | None:
                 obj = json.loads(candidate_str[first_brace : last_brace + 1])
                 if isinstance(obj, dict) and obj.get("schema") == WORK_CAL_SCHEMA:
                     return obj
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
     return None
 
@@ -149,16 +155,35 @@ def extract_work_cal_json_from_message(m_data: dict) -> dict | None:
     return None
 
 
-def ingest_work_cal_payload(payload: dict, state_path: Path | None = None) -> dict:
+def _resolve_access_token(tok: str | None = None) -> str:
+    if tok is not None:
+        return tok
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    try:
+        from tools.zero_mail_listener import get_access_token
+    except ImportError:
+        from zero_mail_listener import get_access_token
+    return get_access_token()
+
+
+def ingest_work_cal_payload(
+    payload: dict,
+    state_path: Path | None = None,
+    reconcile_calendar: bool = False,
+    calendar_id: str = "primary",
+    tok: str | None = None,
+) -> dict:
     """Validate schema/events and atomically write normalized state to work_calendar_sync.json."""
     if not isinstance(payload, dict):
-        raise ValueError("Payload must be a dictionary.")
+        raise ValueError("Payload must be a dictionary.")  # noqa: TRY004
     if payload.get("schema") != WORK_CAL_SCHEMA:
         raise ValueError(f"Unsupported work calendar schema: {payload.get('schema')!r}")
 
     raw_events = payload.get("events")
     if not isinstance(raw_events, list):
-        raise ValueError("Payload 'events' must be a list.")
+        raise ValueError("Payload 'events' must be a list.")  # noqa: TRY004
 
     normalized_events: list[dict] = []
     seen_hashes: set[str] = set()
@@ -172,7 +197,7 @@ def ingest_work_cal_payload(payload: dict, state_path: Path | None = None) -> di
         summary = str(ev.get("summary") or "Work Meeting").strip() or "Work Meeting"
         uid_hash = str(ev.get("uid_hash") or "").strip()
         if not uid_hash:
-            uid_hash = hashlib.sha256(f"{summary}|{start}|{end}".encode("utf-8")).hexdigest()[:16]
+            uid_hash = hashlib.sha256(f"{summary}|{start}|{end}".encode()).hexdigest()[:16]
         if uid_hash in seen_hashes:
             continue
         seen_hashes.add(uid_hash)
@@ -191,7 +216,7 @@ def ingest_work_cal_payload(payload: dict, state_path: Path | None = None) -> di
     state = {
         "schema": WORK_CAL_SCHEMA,
         "generated_at": payload.get("generated_at", ""),
-        "ingested_at": datetime.now(timezone.utc).isoformat(),
+        "ingested_at": datetime.now(UTC).isoformat(),
         "timezone": payload.get("timezone", "America/Los_Angeles"),
         "window_start": payload.get("window_start", ""),
         "window_end": payload.get("window_end", ""),
@@ -218,18 +243,38 @@ def ingest_work_cal_payload(payload: dict, state_path: Path | None = None) -> di
             pass
         raise
 
+    if reconcile_calendar:
+        reconcile_work_cal_to_google_calendar(
+            state,
+            state_path=target_path,
+            calendar_id=calendar_id,
+            tok=tok,
+        )
+
     return state
 
 
-def ingest_work_cal_message(m_data: dict, state_path: Path | None = None) -> bool:
+def ingest_work_cal_message(
+    m_data: dict,
+    state_path: Path | None = None,
+    reconcile_calendar: bool = False,
+    calendar_id: str = "primary",
+    tok: str | None = None,
+) -> bool:
     """Extract and ingest a [WORK-CAL-SYNC] payload from a Gmail message dictionary."""
     payload = extract_work_cal_json_from_message(m_data)
     if not payload:
         return False
     try:
-        ingest_work_cal_payload(payload, state_path=state_path)
+        ingest_work_cal_payload(
+            payload,
+            state_path=state_path,
+            reconcile_calendar=reconcile_calendar,
+            calendar_id=calendar_id,
+            tok=tok,
+        )
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -247,7 +292,7 @@ def _parse_aware_datetime(iso_str: str, fallback_tz: ZoneInfo = DEFAULT_TZ) -> d
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=fallback_tz)
-    return dt.astimezone(timezone.utc)
+    return dt.astimezone(UTC)
 
 
 def get_cached_work_events(
@@ -264,7 +309,7 @@ def get_cached_work_events(
 
     try:
         data = json.loads(target_path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
 
     if not isinstance(data, dict) or data.get("schema") != WORK_CAL_SCHEMA:
@@ -273,7 +318,7 @@ def get_cached_work_events(
     tz_name = data.get("timezone") or "America/Los_Angeles"
     try:
         fallback_tz = ZoneInfo(tz_name)
-    except Exception:
+    except Exception:  # noqa: BLE001
         fallback_tz = DEFAULT_TZ
 
     t_min = _parse_aware_datetime(time_min_iso, fallback_tz=fallback_tz) if time_min_iso else None
@@ -323,19 +368,11 @@ def archive_work_cal_message(
     """Remove INBOX, UNREAD, and IMPORTANT labels from a [WORK-CAL-SYNC] message (and thread)."""
     if not mid:
         return False
-    if tok is None:
-        repo_root = Path(__file__).resolve().parent.parent
-        if str(repo_root) not in sys.path:
-            sys.path.insert(0, str(repo_root))
-        try:
-            from tools.zero_mail_listener import get_access_token
-        except ImportError:
-            from zero_mail_listener import get_access_token
-        tok = get_access_token()
+    resolved_tok = _resolve_access_token(tok)
 
-    body = json.dumps({"removeLabelIds": ["INBOX", "UNREAD", "IMPORTANT"]}).encode("utf-8")
+    body = json.dumps({"removeLabelIds": ["INBOX", "UNREAD", "IMPORTANT"]}).encode()
     headers = {
-        "Authorization": f"Bearer {tok}",
+        "Authorization": f"Bearer {resolved_tok}",
         "Content-Type": "application/json",
     }
     ok = False
@@ -344,7 +381,7 @@ def archive_work_cal_message(
         mod_req = urllib.request.Request(mod_url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(mod_req, timeout=TIMEOUT) as resp:
             ok = resp.status in (200, 204) or True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
     if thread_id:
@@ -353,25 +390,274 @@ def archive_work_cal_message(
             t_req = urllib.request.Request(t_url, data=body, headers=headers, method="POST")
             with urllib.request.urlopen(t_req, timeout=TIMEOUT):
                 pass
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     return ok
 
 
-def sync_latest_from_gmail(state_path: Path | None = None) -> dict | None:
+def reconcile_work_cal_to_google_calendar(
+    state: dict | None = None,
+    *,
+    state_path: Path | None = None,
+    calendar_id: str = "primary",
+    tok: str | None = None,
+) -> dict:
+    """Upsert new/moved 'Work Meeting' blocks and delete canceled/declined ones
+    on Google Calendar, strictly restricted to events with zero_sync_source == 'work_cal_sync_v1'.
+    """
+    if state is None:
+        target_path = Path(state_path) if state_path is not None else WORK_CAL_STATE_PATH
+        if not target_path.exists():
+            raise FileNotFoundError(f"Work calendar state file not found: {target_path}")
+        state = json.loads(target_path.read_text(encoding="utf-8"))
+
+    if not isinstance(state, dict):
+        raise ValueError("Payload must be a dictionary.")  # noqa: TRY004
+    if state.get("schema") != WORK_CAL_SCHEMA:
+        raise ValueError(f"Unsupported work calendar schema: {state.get('schema')!r}")
+
+    resolved_tok = _resolve_access_token(tok)
+
+    tz_name = state.get("timezone") or "America/Los_Angeles"
+    try:
+        fallback_tz = ZoneInfo(tz_name)
+    except Exception:  # noqa: BLE001
+        fallback_tz = DEFAULT_TZ
+
+    now_utc = datetime.now(UTC)
+    win_min_dt = _parse_aware_datetime(str(state.get("window_start") or ""), fallback_tz=fallback_tz)
+    win_max_dt = _parse_aware_datetime(str(state.get("window_end") or ""), fallback_tz=fallback_tz)
+    if win_min_dt is None:
+        win_min_dt = now_utc - timedelta(days=1)
+    if win_max_dt is None:
+        win_max_dt = now_utc + timedelta(days=15)
+
+    encoded_cal_id = urllib.parse.quote(calendar_id, safe="")
+    auth_headers = {
+        "Authorization": f"Bearer {resolved_tok}",
+        "Content-Type": "application/json",
+    }
+
+    # Fetch existing synced events from Google Calendar in the sync window
+    existing_items: list[dict] = []
+    page_token: str | None = None
+    while True:
+        query_params = {
+            "privateExtendedProperty": f"{SYNC_SOURCE_KEY}={SYNC_SOURCE_VAL}",
+            "singleEvents": "true",
+            "timeMin": win_min_dt.isoformat(),
+            "timeMax": win_max_dt.isoformat(),
+            "maxResults": "250",
+        }
+        if page_token:
+            query_params["pageToken"] = page_token
+        query_str = urllib.parse.urlencode(query_params)
+        list_url = f"{CALENDAR_BASE}/calendars/{encoded_cal_id}/events?{query_str}"
+        req = urllib.request.Request(list_url, headers=auth_headers)
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for item in data.get("items", []):
+            if isinstance(item, dict):
+                existing_items.append(item)
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    # Safety lock: Python-side double verification
+    # ONLY touch events where extendedProperties.private.zero_sync_source == 'work_cal_sync_v1' and status != 'cancelled'
+    existing_by_uid: dict[str, list[dict]] = {}
+    stale_or_invalid_events: list[dict] = []
+    for item in existing_items:
+        if item.get("status") == "cancelled":
+            continue
+        ext_priv = item.get("extendedProperties", {}).get("private", {})
+        if not isinstance(ext_priv, dict) or ext_priv.get(SYNC_SOURCE_KEY) != SYNC_SOURCE_VAL:
+            continue
+        uid = ext_priv.get(SYNC_UID_KEY)
+        if uid:
+            existing_by_uid.setdefault(uid, []).append(item)
+        else:
+            stale_or_invalid_events.append(item)
+
+    inserted = 0
+    updated = 0
+    deleted = 0
+    unchanged = 0
+
+    # Delete any duplicate existing synced events for the same uid
+    for uid, items in list(existing_by_uid.items()):
+        if len(items) > 1:
+            for dup in items[1:]:
+                dup_id = dup.get("id")
+                if dup_id:
+                    del_url = f"{CALENDAR_BASE}/calendars/{encoded_cal_id}/events/{urllib.parse.quote(dup_id, safe='')}"
+                    del_req = urllib.request.Request(
+                        del_url,
+                        headers={"Authorization": f"Bearer {resolved_tok}"},
+                        method="DELETE",
+                    )
+                    try:
+                        with urllib.request.urlopen(del_req, timeout=TIMEOUT):
+                            pass
+                    except urllib.error.HTTPError as exc:
+                        if exc.code not in (404, 410):
+                            raise
+                    deleted += 1
+            existing_by_uid[uid] = [items[0]]
+
+    # Delete any stale work_cal_sync_v1 events lacking a UID
+    for stale_item in stale_or_invalid_events:
+        stale_id = stale_item.get("id")
+        if stale_id:
+            del_url = f"{CALENDAR_BASE}/calendars/{encoded_cal_id}/events/{urllib.parse.quote(stale_id, safe='')}"
+            del_req = urllib.request.Request(
+                del_url,
+                headers={"Authorization": f"Bearer {resolved_tok}"},
+                method="DELETE",
+            )
+            try:
+                with urllib.request.urlopen(del_req, timeout=TIMEOUT):
+                    pass
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (404, 410):
+                    raise
+            deleted += 1
+
+    # Filter desired events overlapping [win_min_dt, win_max_dt]
+    raw_events = state.get("events", [])
+    desired_events: list[dict] = []
+    desired_uids: set[str] = set()
+
+    for ev in raw_events:
+        if not isinstance(ev, dict):
+            continue
+        start_str = str(ev.get("start") or "").strip()
+        end_str = str(ev.get("end") or "").strip()
+        uid_hash = str(ev.get("uid_hash") or "").strip()
+        if not start_str or not end_str or not uid_hash:
+            continue
+
+        ev_start = _parse_aware_datetime(start_str, fallback_tz=fallback_tz)
+        ev_end = _parse_aware_datetime(end_str, fallback_tz=fallback_tz)
+        if ev_start is None or ev_end is None:
+            continue
+
+        if ev_end <= win_min_dt or ev_start >= win_max_dt:
+            continue
+
+        desired_events.append(ev)
+        desired_uids.add(uid_hash)
+
+    # Reconcile each desired event: POST if missing, PATCH if changed, else unchanged
+    for ev in desired_events:
+        uid_hash = ev["uid_hash"]
+        start_str = ev["start"]
+        end_str = ev["end"]
+
+        body = {
+            "summary": "Work Meeting",
+            "description": SYNC_DESC,
+            "start": {"dateTime": start_str, "timeZone": tz_name},
+            "end": {"dateTime": end_str, "timeZone": tz_name},
+            "transparency": "opaque",
+            "reminders": {"useDefault": False, "overrides": []},
+            "extendedProperties": {
+                "private": {
+                    SYNC_SOURCE_KEY: SYNC_SOURCE_VAL,
+                    SYNC_UID_KEY: uid_hash,
+                }
+            },
+        }
+
+        existing_match = existing_by_uid.get(uid_hash, [None])[0]
+        if existing_match is None:
+            # POST new event
+            post_url = f"{CALENDAR_BASE}/calendars/{encoded_cal_id}/events"
+            post_data = json.dumps(body).encode()
+            post_req = urllib.request.Request(post_url, data=post_data, headers=auth_headers, method="POST")
+            with urllib.request.urlopen(post_req, timeout=TIMEOUT) as resp:
+                resp.read()
+            inserted += 1
+        else:
+            # Check if start/end instant or summary changed
+            ex_summary = existing_match.get("summary")
+            ex_start_str = (
+                existing_match.get("start", {}).get("dateTime")
+                or existing_match.get("start", {}).get("date")
+                or ""
+            )
+            ex_end_str = (
+                existing_match.get("end", {}).get("dateTime")
+                or existing_match.get("end", {}).get("date")
+                or ""
+            )
+            ex_start_dt = _parse_aware_datetime(ex_start_str, fallback_tz=fallback_tz)
+            ex_end_dt = _parse_aware_datetime(ex_end_str, fallback_tz=fallback_tz)
+            des_start_dt = _parse_aware_datetime(start_str, fallback_tz=fallback_tz)
+            des_end_dt = _parse_aware_datetime(end_str, fallback_tz=fallback_tz)
+
+            time_or_summary_changed = (
+                ex_summary != "Work Meeting"
+                or ex_start_dt != des_start_dt
+                or ex_end_dt != des_end_dt
+            )
+            ex_desc = existing_match.get("description", "")
+            ex_transparency = existing_match.get("transparency", "")
+            other_fields_changed = (
+                ex_desc != SYNC_DESC
+                or ex_transparency != "opaque"
+            )
+
+            if time_or_summary_changed or other_fields_changed:
+                ev_id = existing_match.get("id")
+                patch_url = f"{CALENDAR_BASE}/calendars/{encoded_cal_id}/events/{urllib.parse.quote(ev_id, safe='')}"
+                patch_data = json.dumps(body).encode()
+                patch_req = urllib.request.Request(patch_url, data=patch_data, headers=auth_headers, method="PATCH")
+                with urllib.request.urlopen(patch_req, timeout=TIMEOUT) as resp:
+                    resp.read()
+                updated += 1
+            else:
+                unchanged += 1
+
+    # Delete any existing work_cal_sync_v1 event whose uid_hash is no longer present in desired events
+    for uid, items in existing_by_uid.items():
+        if uid not in desired_uids:
+            for item in items:
+                ev_id = item.get("id")
+                if ev_id:
+                    del_url = f"{CALENDAR_BASE}/calendars/{encoded_cal_id}/events/{urllib.parse.quote(ev_id, safe='')}"
+                    del_req = urllib.request.Request(
+                        del_url,
+                        headers={"Authorization": f"Bearer {resolved_tok}"},
+                        method="DELETE",
+                    )
+                    try:
+                        with urllib.request.urlopen(del_req, timeout=TIMEOUT):
+                            pass
+                    except urllib.error.HTTPError as exc:
+                        if exc.code not in (404, 410):
+                            raise
+                    deleted += 1
+
+    return {
+        "ok": True,
+        "inserted": inserted,
+        "updated": updated,
+        "deleted": deleted,
+        "unchanged": unchanged,
+    }
+
+
+def sync_latest_from_gmail(
+    state_path: Path | None = None,
+    reconcile_calendar: bool = False,
+    calendar_id: str = "primary",
+) -> dict | None:
     """Fetch recent subject:\"[WORK-CAL-SYNC]\" messages from Gmail, ingest the newest valid payload,
     and archive/mark read all matching [WORK-CAL-SYNC] messages.
     """
-    repo_root = Path(__file__).resolve().parent.parent
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    try:
-        from tools.zero_mail_listener import get_access_token
-    except ImportError:
-        from zero_mail_listener import get_access_token
-
-    tok = get_access_token()
+    tok = _resolve_access_token()
     query = urllib.parse.quote('subject:"[WORK-CAL-SYNC]"')
     list_url = f"{GMAIL_BASE}/messages?q={query}&maxResults=20"
     req = urllib.request.Request(list_url, headers={"Authorization": f"Bearer {tok}"})
@@ -394,7 +680,13 @@ def sync_latest_from_gmail(state_path: Path | None = None) -> dict | None:
                 thread_id = m_data.get("threadId")
             payload = extract_work_cal_json_from_message(m_data)
             if payload:
-                ingested_state = ingest_work_cal_payload(payload, state_path=state_path)
+                ingested_state = ingest_work_cal_payload(
+                    payload,
+                    state_path=state_path,
+                    reconcile_calendar=reconcile_calendar,
+                    calendar_id=calendar_id,
+                    tok=tok,
+                )
         archive_work_cal_message(mid, tok=tok, thread_id=thread_id)
     return ingested_state
 
@@ -407,6 +699,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Fetch the latest [WORK-CAL-SYNC] email from Gmail and persist to work_calendar_sync.json",
     )
     parser.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="Reconcile work calendar events onto Google Calendar",
+    )
+    parser.add_argument(
+        "--calendar-id",
+        type=str,
+        default="primary",
+        help="Target Google Calendar ID (default: primary)",
+    )
+    parser.add_argument(
         "--state-path",
         type=Path,
         default=None,
@@ -415,14 +718,31 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.sync:
-        state = sync_latest_from_gmail(state_path=args.state_path)
+        state = sync_latest_from_gmail(
+            state_path=args.state_path,
+            reconcile_calendar=args.reconcile,
+            calendar_id=args.calendar_id,
+        )
         if state is None:
             print("[work_cal_sync] No valid [WORK-CAL-SYNC] message found in Gmail.", file=sys.stderr)
             return 1
         target = args.state_path or WORK_CAL_STATE_PATH
+        reconcile_note = " (and reconciled to Google Calendar)" if args.reconcile else ""
         print(
             f"[work_cal_sync] Synced {len(state.get('events', []))} work event(s) "
-            f"(generated_at={state.get('generated_at')}) -> {target}"
+            f"(generated_at={state.get('generated_at')}) -> {target}{reconcile_note}"
+        )
+        return 0
+
+    if args.reconcile:
+        res = reconcile_work_cal_to_google_calendar(
+            state_path=args.state_path,
+            calendar_id=args.calendar_id,
+        )
+        print(
+            f"[work_cal_sync] Reconciled to {args.calendar_id}: "
+            f"inserted={res.get('inserted', 0)} updated={res.get('updated', 0)} "
+            f"deleted={res.get('deleted', 0)} unchanged={res.get('unchanged', 0)}"
         )
         return 0
 
