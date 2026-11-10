@@ -98,9 +98,9 @@
     "interval_seconds": 7200,
     "prompt": "Run the infrastructure heartbeat check using /workspace/tools/sidecars.py heartbeat. Post only if infrastructure is degraded (silent when healthy).",
     "catchup_if_missed": false,
-    "last_run_ts": 1794263058,
-    "last_run_at": "2026-11-09 02:24 PM PT",
-    "next_run_ts": 1794270258.0,
+    "last_run_ts": 1794277471,
+    "last_run_at": "2026-11-09 06:24 PM PT",
+    "next_run_ts": 1794284671.0,
     "channel_id": 1544955535722545253
   },
   {
@@ -471,9 +471,9 @@
     "interval_seconds": 300,
     "prompt": "Run the bridge liveness & gateway watchdog check using /workspace/tools/sidecars.py bridge_watchdog. Auto-heals and alerts only if degraded (silent when nominal).",
     "catchup_if_missed": false,
-    "last_run_ts": 1794264206,
-    "last_run_at": "2026-11-09 02:43 PM PT",
-    "next_run_ts": 1794264506.0,
+    "last_run_ts": 1794280198,
+    "last_run_at": "2026-11-09 07:09 PM PT",
+    "next_run_ts": 1794280498.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -485,9 +485,9 @@
     "channel_id": 1544953279664889888,
     "prompt": "Run the Host 2 and Host 1 PID & process headroom watchdog using /workspace/tools/sidecars.py pid_watchdog. Silent execution unless warning or critical threshold exceeded.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794264238,
-    "last_run_at": "2026-11-09 02:43 PM PT",
-    "next_run_ts": 1794265138.0
+    "last_run_ts": 1794279692,
+    "last_run_at": "2026-11-09 07:01 PM PT",
+    "next_run_ts": 1794280592.0
   },
   {
     "id": "agora_roguelike_pm",
@@ -685,9 +685,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the Arr queue & health watchdog using /workspace/tools/sidecars.py arr_queue.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794263371,
-    "last_run_at": "2026-11-09 02:29 PM PT",
-    "next_run_ts": 1794266971.0
+    "last_run_ts": 1794277821,
+    "last_run_at": "2026-11-09 06:30 PM PT",
+    "next_run_ts": 1794281421.0
   },
   {
     "id": "prowlarr_watchdog",
@@ -698,9 +698,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the Prowlarr indexer health watchdog using /workspace/tools/sidecars.py prowlarr.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794262898,
-    "last_run_at": "2026-11-09 02:21 PM PT",
-    "next_run_ts": 1794266498.0
+    "last_run_ts": 1794277327,
+    "last_run_at": "2026-11-09 06:22 PM PT",
+    "next_run_ts": 1794280927.0
   },
   {
     "id": "sabnzbd_watchdog",
@@ -711,9 +711,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the SABnzbd downloader & unpack watchdog using /workspace/tools/sidecars.py sabnzbd.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794262898,
-    "last_run_at": "2026-11-09 02:21 PM PT",
-    "next_run_ts": 1794266498.0
+    "last_run_ts": 1794277326,
+    "last_run_at": "2026-11-09 06:22 PM PT",
+    "next_run_ts": 1794280926.0
   },
   {
     "id": "nest_lock_watchdog",
@@ -724,9 +724,9 @@
     "channel_id": 1544953275877556334,
     "prompt": "Run the Nest lock & Homebridge self-healing watchdog using /workspace/tools/sidecars.py nest_lock.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794261243,
-    "last_run_at": "2026-11-09 01:54 PM PT",
-    "next_run_ts": 1794264843.0
+    "last_run_ts": 1794279296,
+    "last_run_at": "2026-11-09 06:54 PM PT",
+    "next_run_ts": 1794282896.0
   },
   {
     "id": "ha_reauth_watchdog",
@@ -737,9 +737,9 @@
     "channel_id": 1544953275877556334,
     "prompt": "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794262127,
-    "last_run_at": "2026-11-09 02:08 PM PT",
-    "next_run_ts": 1794265727.0
+    "last_run_ts": 1794280183,
+    "last_run_at": "2026-11-09 07:09 PM PT",
+    "next_run_ts": 1794283783.0
   },
   {
     "id": "google_tasks_sync",
@@ -749,9 +749,9 @@
     "interval_seconds": 1800,
     "prompt": "Run the Google Tasks two-way sync using /workspace/tools/sidecars.py tasks_sync. Silent sidecar execution (silent unless error).",
     "catchup_if_missed": false,
-    "last_run_ts": 1794263466,
-    "last_run_at": "2026-11-09 02:31 PM PT",
-    "next_run_ts": 1794265266.0
+    "last_run_ts": 1794279771,
+    "last_run_at": "2026-11-09 07:02 PM PT",
+    "next_run_ts": 1794281571.0
   },
   {
     "id": "quota_poller",
@@ -761,9 +761,9 @@
     "interval_seconds": 600,
     "prompt": "Run the 10-minute ground-truth quota usage poller using /workspace/tools/sidecars.py quota_poller. Captures live remaining fractions and cycle burn deltas.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794264147,
-    "last_run_at": "2026-11-09 02:42 PM PT",
-    "next_run_ts": 1794264747.0
+    "last_run_ts": 1794280138,
+    "last_run_at": "2026-11-09 07:08 PM PT",
+    "next_run_ts": 1794280738.0
   },
   {
     "id": "personal_data_sync",
@@ -794,9 +794,9 @@
       23,
       7
     ],
-    "last_run_ts": 1794264084,
-    "last_run_at": "2026-11-09 02:41 PM PT",
-    "next_run_ts": 1794264384.0
+    "last_run_ts": 1794280170,
+    "last_run_at": "2026-11-09 07:09 PM PT",
+    "next_run_ts": 1794280470.0
   },
   {
     "id": "resident_agents_daily_tip",
@@ -866,10 +866,10 @@
     "minute_pt": 0,
     "prompt": "Run the 48h Family Calendar & Action Radar Decision Card workflow using /workspace/tools/sidecars.py family_calendar_radar_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794189603,
-    "next_run_ts": 1794276000.0,
+    "last_run_ts": 1794276003,
+    "next_run_ts": 1794362400.0,
     "channel_id": 1550577908811178095,
-    "last_run_at": "2026-11-08 06:00 PM PT"
+    "last_run_at": "2026-11-09 06:00 PM PT"
   },
   {
     "id": "dinner_pivot_card",
@@ -880,10 +880,10 @@
     "minute_pt": 15,
     "prompt": "Run the afternoon Dinner Defrost & Calendar Conflict Pivot Decision Card workflow using /workspace/tools/sidecars.py dinner_pivot_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794183313,
-    "next_run_ts": 1794269700.0,
+    "last_run_ts": 1794269715,
+    "next_run_ts": 1794356100.0,
     "channel_id": 1550577908811178095,
-    "last_run_at": "2026-11-08 04:15 PM PT"
+    "last_run_at": "2026-11-09 04:15 PM PT"
   },
   {
     "id": "actual_budget_anomaly_card",
