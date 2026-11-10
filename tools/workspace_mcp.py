@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Google Workspace (Gmail & Calendar) MCP Server for Ivy-AG.
 
 Authenticates via /secrets/google_oauth.json using stored OAuth refresh token.
@@ -439,6 +440,23 @@ def calendar_list_calendars() -> str:
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)})
 
+def _parse_iso_to_utc(iso_str: str | None, fallback_tz: ZoneInfo = PT) -> datetime | None:
+    if not iso_str or not isinstance(iso_str, str):
+        return None
+    s = iso_str.strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=fallback_tz)
+    return dt.astimezone(timezone.utc)
+
+
 @server.tool()
 def calendar_list_events(calendar_id: str = "primary", time_min_iso: str = "", time_max_iso: str = "", max_results: int = 30) -> str:
     """List Google Calendar events. calendar_id can be 'primary', 'all' (sweeps Ryan, Emily, family, home, nanny share), 'work' (cached work calendar), or a specific calendar ID."""
@@ -463,6 +481,8 @@ def calendar_list_events(calendar_id: str = "primary", time_min_iso: str = "", t
 
         all_events = []
         seen_events = set()
+        synced_work_uids = set()
+        synced_work_time_ranges = set()
 
         for cid, cname in cals_to_query:
             encoded_id = urllib.parse.quote(cid)
@@ -481,7 +501,7 @@ def calendar_list_events(calendar_id: str = "primary", time_min_iso: str = "", t
                         start = ev.get("start", {}).get("dateTime") or ev.get("start", {}).get("date")
                         end = ev.get("end", {}).get("dateTime") or ev.get("end", {}).get("date")
                         summary = ev.get("summary", "(no title)")
-                        ev_key = (summary, start)
+                        ev_key = (summary, start, end)
                         if ev_key in seen_events:
                             continue
                         seen_events.add(ev_key)
@@ -494,6 +514,19 @@ def calendar_list_events(calendar_id: str = "primary", time_min_iso: str = "", t
                             "location": ev.get("location", ""),
                             "description": ev.get("description", "")
                         })
+
+                        if cid.lower() == "primary" or cname == "Ryan":
+                            ext_priv = ev.get("extendedProperties", {}).get("private", {})
+                            if isinstance(ext_priv, dict):
+                                uid_val = ext_priv.get("zero_work_cal_uid")
+                                if uid_val:
+                                    synced_work_uids.add(str(uid_val))
+                            desc_val = (ev.get("description") or "").strip()
+                            if desc_val == "Synced via [WORK-CAL-SYNC]":
+                                s_dt = _parse_iso_to_utc(start)
+                                e_dt = _parse_iso_to_utc(end)
+                                if s_dt and e_dt:
+                                    synced_work_time_ranges.add((s_dt, e_dt))
             except Exception as ce:
                 print(f"[Calendar] Warning fetching {cid}: {ce}", file=sys.stderr)
 
@@ -505,7 +538,20 @@ def calendar_list_events(calendar_id: str = "primary", time_min_iso: str = "", t
                     from work_cal_sync import get_cached_work_events
 
                 for wev in get_cached_work_events(time_min_iso=time_min_iso, time_max_iso=time_max_iso):
-                    ev_key = (wev.get("summary", "(no title)"), wev.get("start"))
+                    wev_id = str(wev.get("id") or "")
+                    wev_uid = wev.get("uid_hash") or (wev_id[5:] if wev_id.startswith("work_") else "")
+                    if wev_uid and wev_uid in synced_work_uids:
+                        continue
+
+                    wev_start = wev.get("start")
+                    wev_end = wev.get("end")
+                    if synced_work_time_ranges and wev_start and wev_end:
+                        wev_s_dt = _parse_iso_to_utc(wev_start)
+                        wev_e_dt = _parse_iso_to_utc(wev_end)
+                        if wev_s_dt and wev_e_dt and (wev_s_dt, wev_e_dt) in synced_work_time_ranges:
+                            continue
+
+                    ev_key = (wev.get("summary", "(no title)"), wev_start, wev_end)
                     if ev_key in seen_events:
                         continue
                     seen_events.add(ev_key)

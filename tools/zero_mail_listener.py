@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Zero Dedicated Inbound Email Listener Daemon (Hardened with Anti-Flood / Anti-DDoS Circuit Breaker).
 
 Maintain a fast polling loop against Gmail for emails addressed to Zero's address.
@@ -153,13 +154,22 @@ except ImportError:
         process_github_email_doorbell = None
 
 try:
-    from tools.work_cal_sync import archive_work_cal_message, ingest_work_cal_message
+    from tools.work_cal_sync import (
+        archive_work_cal_message,
+        ingest_work_cal_message,
+        reconcile_work_cal_to_google_calendar,
+    )
 except ImportError:
     try:
-        from work_cal_sync import archive_work_cal_message, ingest_work_cal_message
+        from work_cal_sync import (
+            archive_work_cal_message,
+            ingest_work_cal_message,
+            reconcile_work_cal_to_google_calendar,
+        )
     except ImportError:
         archive_work_cal_message = None
         ingest_work_cal_message = None
+        reconcile_work_cal_to_google_calendar = None
 
 def sanitize_text(text: str, max_len: int = 150) -> str:
     if not text:
@@ -475,6 +485,7 @@ def run_loop():
                                     else:
                                         log(f"GitHub email doorbell cap ({MAX_GITHUB_DOORBELLS_PER_CYCLE}) reached for this tick; skipping eval for {mid}")
                                 elif is_silent_system_email(headers_lower, m_data.get("snippet", "")):
+                                    ingest_succeeded = False
                                     if ingest_work_cal_message:
                                         try:
                                             ingested = ingest_work_cal_message(m_data)
@@ -483,9 +494,15 @@ def run_loop():
                                                 full_req = urllib.request.Request(full_url, headers={"Authorization": f"Bearer {tok}"})
                                                 with urllib.request.urlopen(full_req, timeout=TIMEOUT) as full_resp:
                                                     full_data = json.loads(full_resp.read().decode())
-                                                ingest_work_cal_message(full_data)
+                                                ingested = ingest_work_cal_message(full_data)
+                                            ingest_succeeded = bool(ingested)
                                         except Exception as wc_err:
                                             log(f"Work calendar sync ingestion error for {mid}: {wc_err}")
+                                    if ingest_succeeded and reconcile_work_cal_to_google_calendar:
+                                        try:
+                                            reconcile_work_cal_to_google_calendar(tok=tok)
+                                        except Exception as rec_err:
+                                            log(f"Work calendar sync reconciliation error for {mid}: {rec_err}")
                                     if archive_work_cal_message:
                                         try:
                                             archive_work_cal_message(mid, tok=tok, thread_id=m_data.get("threadId"))

@@ -226,6 +226,177 @@ class TestWorkCalSync(unittest.TestCase):
                 self.assertEqual(res_all["events"][1]["id"], "work_aa01cfd50d77c851")
                 self.assertEqual(res_all["events"][1]["calendar"], "Work (Ryan)")
 
+    def test_workspace_mcp_deduplicates_synced_work_meetings_via_extended_properties(self):
+        payload = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-09T23:59:59-08:00",
+            "events": [
+                {
+                    "uid_hash": "uid111",
+                    "summary": "1:1 with Manager",
+                    "start": "2026-11-03T20:30:00-08:00",
+                    "end": "2026-11-03T21:30:00-08:00",
+                },
+                {
+                    "uid_hash": "uid222",
+                    "summary": "Unsynced Team Sync",
+                    "start": "2026-11-03T21:30:00-08:00",
+                    "end": "2026-11-03T22:00:00-08:00",
+                },
+            ],
+        }
+        wcs.ingest_work_cal_payload(payload, state_path=self.state_path)
+
+        primary_gcal_items = [
+            {
+                "id": "gcal_synced_1",
+                "summary": "Work Meeting",
+                "description": "Synced via [WORK-CAL-SYNC]",
+                "start": {"dateTime": "2026-11-03T20:30:00-08:00"},
+                "end": {"dateTime": "2026-11-03T21:30:00-08:00"},
+                "extendedProperties": {
+                    "private": {
+                        "zero_sync_source": "work_cal_sync_v1",
+                        "zero_work_cal_uid": "uid111",
+                    }
+                },
+            },
+            {
+                "id": "personal_dinner",
+                "summary": "Family Dinner",
+                "start": {"dateTime": "2026-11-03T18:00:00-08:00"},
+                "end": {"dateTime": "2026-11-03T19:00:00-08:00"},
+            },
+        ]
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({"items": primary_gcal_items}).encode("utf-8")
+        mock_cm = MagicMock()
+        mock_cm.__enter__.return_value = mock_resp
+        mock_cm.__exit__.return_value = False
+
+        with patch.object(wcs, "WORK_CAL_STATE_PATH", self.state_path), \
+             patch.dict(wmcp.FAMILY_CALENDARS, {"primary": "Ryan"}, clear=True), \
+             patch("tools.workspace_mcp.urllib.request.urlopen", return_value=mock_cm), \
+             patch("tools.workspace_mcp._auth_headers", return_value={"Authorization": "Bearer test"}):
+            raw = wmcp.calendar_list_events(
+                calendar_id="primary",
+                time_min_iso="2026-11-03T00:00:00-08:00",
+                time_max_iso="2026-11-05T00:00:00-08:00",
+            )
+            res = json.loads(raw)
+            self.assertTrue(res["ok"])
+            # Expect 3 events: Family Dinner, Work Meeting (gcal_synced_1), and Unsynced Team Sync (uid222).
+            # uid111 from cached work events must be deduplicated because primary already returned it!
+            self.assertEqual(res["count"], 3)
+            ids = [e["id"] for e in res["events"]]
+            self.assertIn("gcal_synced_1", ids)
+            self.assertIn("personal_dinner", ids)
+            self.assertIn("work_uid222", ids)
+            self.assertNotIn("work_uid111", ids)
+
+    def test_workspace_mcp_deduplicates_synced_work_meetings_via_utc_interval_fallback(self):
+        payload = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-09T23:59:59-08:00",
+            "events": [
+                {
+                    "uid_hash": "uid111",
+                    "summary": "1:1 with Manager",
+                    "start": "2026-11-03T20:30:00-08:00",
+                    "end": "2026-11-03T21:30:00-08:00",
+                },
+                {
+                    "uid_hash": "uid222",
+                    "summary": "Unsynced Team Sync",
+                    "start": "2026-11-03T21:30:00-08:00",
+                    "end": "2026-11-03T22:00:00-08:00",
+                },
+            ],
+        }
+        wcs.ingest_work_cal_payload(payload, state_path=self.state_path)
+
+        # extendedProperties missing, but description and aware UTC start/end match (04:30Z next day)
+        primary_gcal_items = [
+            {
+                "id": "gcal_synced_fallback",
+                "summary": "Work Meeting",
+                "description": "Synced via [WORK-CAL-SYNC]",
+                "start": {"dateTime": "2026-11-04T04:30:00Z"},
+                "end": {"dateTime": "2026-11-04T05:30:00Z"},
+            },
+        ]
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({"items": primary_gcal_items}).encode("utf-8")
+        mock_cm = MagicMock()
+        mock_cm.__enter__.return_value = mock_resp
+        mock_cm.__exit__.return_value = False
+
+        with patch.object(wcs, "WORK_CAL_STATE_PATH", self.state_path), \
+             patch.dict(wmcp.FAMILY_CALENDARS, {"primary": "Ryan"}, clear=True), \
+             patch("tools.workspace_mcp.urllib.request.urlopen", return_value=mock_cm), \
+             patch("tools.workspace_mcp._auth_headers", return_value={"Authorization": "Bearer test"}):
+            raw = wmcp.calendar_list_events(
+                calendar_id="primary",
+                time_min_iso="2026-11-03T00:00:00-08:00",
+                time_max_iso="2026-11-05T00:00:00-08:00",
+            )
+            res = json.loads(raw)
+            self.assertTrue(res["ok"])
+            # Expect 2 events: gcal_synced_fallback and Unsynced Team Sync (uid222).
+            # uid111 from cached work events must be deduplicated via UTC interval matching!
+            self.assertEqual(res["count"], 2)
+            ids = [e["id"] for e in res["events"]]
+            self.assertIn("gcal_synced_fallback", ids)
+            self.assertIn("work_uid222", ids)
+            self.assertNotIn("work_uid111", ids)
+
+    def test_workspace_mcp_preserves_same_start_different_end_overlapping_meetings(self):
+        payload = {
+            "schema": "zero.work_cal_sync.v1",
+            "generated_at": "2026-11-03T10:51:33-08:00",
+            "timezone": "America/Los_Angeles",
+            "window_start": "2026-11-03T00:00:00-08:00",
+            "window_end": "2026-11-09T23:59:59-08:00",
+            "events": [
+                {
+                    "uid_hash": "overlap_short",
+                    "summary": "Project Sync",
+                    "start": "2026-11-03T20:30:00-08:00",
+                    "end": "2026-11-03T21:00:00-08:00",
+                },
+                {
+                    "uid_hash": "overlap_long",
+                    "summary": "Project Sync",
+                    "start": "2026-11-03T20:30:00-08:00",
+                    "end": "2026-11-03T21:30:00-08:00",
+                },
+            ],
+        }
+        wcs.ingest_work_cal_payload(payload, state_path=self.state_path)
+
+        with patch.object(wcs, "WORK_CAL_STATE_PATH", self.state_path):
+            raw = wmcp.calendar_list_events(
+                calendar_id="work",
+                time_min_iso="2026-11-03T00:00:00-08:00",
+                time_max_iso="2026-11-05T00:00:00-08:00",
+            )
+            res = json.loads(raw)
+            self.assertTrue(res["ok"])
+            # Both meetings start at 20:30:00 but have different end times; neither should be dropped
+            self.assertEqual(res["count"], 2)
+            ends = sorted([e["end"] for e in res["events"]])
+            self.assertEqual(ends, ["2026-11-03T21:00:00-08:00", "2026-11-03T21:30:00-08:00"])
+            ids = sorted([e["id"] for e in res["events"]])
+            self.assertEqual(ids, ["work_overlap_long", "work_overlap_short"])
+
     def test_archive_work_cal_message_removes_inbox_unread_important(self):
         captured_requests = []
 

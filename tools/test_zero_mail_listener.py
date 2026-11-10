@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 REMO_ROOT = Path(__file__).resolve().parent.parent
 if str(REMO_ROOT) not in sys.path:
@@ -94,11 +94,11 @@ class TestZeroMailListener(unittest.TestCase):
         incomplete_file = self.temp_path / "incomplete.json"
         incomplete_file.write_text(json.dumps({"client_id": "only-id"}))
 
-        with patch.dict(os.environ, {"GOOGLE_OAUTH_PATH": str(incomplete_file)}):
-            with patch("tools.zero_mail_listener.os.path.exists", side_effect=lambda p: p == str(incomplete_file)):
-                creds, path = zmail.resolve_credentials()
-                self.assertIsNone(creds)
-                self.assertIsNone(path)
+        with patch.dict(os.environ, {"GOOGLE_OAUTH_PATH": str(incomplete_file)}), \
+             patch("tools.zero_mail_listener.os.path.exists", side_effect=lambda p: p == str(incomplete_file)):
+            creds, path = zmail.resolve_credentials()
+            self.assertIsNone(creds)
+            self.assertIsNone(path)
 
     def test_log_error_throttled_deduplication(self):
         logged = []
@@ -249,6 +249,161 @@ class TestZeroMailListener(unittest.TestCase):
         self.assertIsNotNone(extracted)
         self.assertEqual(len(extracted["events"]), 1)
         self.assertEqual(extracted["events"][0]["uid_hash"], "h1")
+
+    def test_polling_loop_triggers_reconcile_when_work_cal_ingest_succeeds(self):
+        msg_metadata = {
+            "id": "msg_sync_101",
+            "threadId": "thread_sync_101",
+            "snippet": "Sync snippet",
+            "payload": {
+                "headers": [
+                    {"name": "Subject", "value": "[WORK-CAL-SYNC] Latest schedule"},
+                    {"name": "From", "value": "calendar-bot@example.com"},
+                ]
+            },
+        }
+
+        list_response = {"messages": [{"id": "msg_sync_101"}]}
+
+        def mock_urlopen_impl(req, timeout=15):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            resp = MagicMock()
+            if "messages?q=" in url:
+                resp.read.return_value = json.dumps(list_response).encode("utf-8")
+            elif "messages/msg_sync_101" in url:
+                resp.read.return_value = json.dumps(msg_metadata).encode("utf-8")
+            else:
+                resp.read.return_value = b"{}"
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = False
+            return cm
+
+        mock_ingest = MagicMock(return_value=True)
+        mock_reconcile = MagicMock()
+
+        def mock_archive(mid, tok=None, thread_id=None):
+            zmail._running = False
+
+        mock_arch = MagicMock(side_effect=mock_archive)
+
+        zmail._running = True
+        with patch("tools.zero_mail_listener.get_access_token", return_value="tok-xyz"), \
+             patch("tools.zero_mail_listener.load_seen", return_value={"seed_id"}), \
+             patch("tools.zero_mail_listener.save_seen"), \
+             patch("tools.zero_mail_listener.load_env", return_value={"DISCORD_BOT_TOKEN": "bot-tok"}), \
+             patch("tools.zero_mail_listener.ingest_work_cal_message", mock_ingest), \
+             patch("tools.zero_mail_listener.reconcile_work_cal_to_google_calendar", mock_reconcile), \
+             patch("tools.zero_mail_listener.archive_work_cal_message", mock_arch), \
+             patch("tools.zero_mail_listener.urllib.request.urlopen", side_effect=mock_urlopen_impl):
+            zmail.run_loop()
+
+        mock_ingest.assert_called_once()
+        mock_reconcile.assert_called_once_with(tok="tok-xyz")
+        mock_arch.assert_called_once_with("msg_sync_101", tok="tok-xyz", thread_id="thread_sync_101")
+
+    def test_polling_loop_handles_reconcile_exception_gracefully(self):
+        msg_metadata = {
+            "id": "msg_sync_102",
+            "threadId": "thread_sync_102",
+            "snippet": "Sync snippet",
+            "payload": {
+                "headers": [
+                    {"name": "Subject", "value": "[WORK-CAL-SYNC] Latest schedule"},
+                    {"name": "From", "value": "calendar-bot@example.com"},
+                ]
+            },
+        }
+
+        list_response = {"messages": [{"id": "msg_sync_102"}]}
+
+        def mock_urlopen_impl(req, timeout=15):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            resp = MagicMock()
+            if "messages?q=" in url:
+                resp.read.return_value = json.dumps(list_response).encode("utf-8")
+            elif "messages/msg_sync_102" in url:
+                resp.read.return_value = json.dumps(msg_metadata).encode("utf-8")
+            else:
+                resp.read.return_value = b"{}"
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = False
+            return cm
+
+        mock_ingest = MagicMock(return_value=True)
+        mock_reconcile = MagicMock(side_effect=RuntimeError("Google Calendar API 503"))
+
+        def mock_archive(mid, tok=None, thread_id=None):
+            zmail._running = False
+
+        mock_arch = MagicMock(side_effect=mock_archive)
+
+        zmail._running = True
+        with patch("tools.zero_mail_listener.get_access_token", return_value="tok-xyz"), \
+             patch("tools.zero_mail_listener.load_seen", return_value={"seed_id"}), \
+             patch("tools.zero_mail_listener.save_seen"), \
+             patch("tools.zero_mail_listener.load_env", return_value={"DISCORD_BOT_TOKEN": "bot-tok"}), \
+             patch("tools.zero_mail_listener.ingest_work_cal_message", mock_ingest), \
+             patch("tools.zero_mail_listener.reconcile_work_cal_to_google_calendar", mock_reconcile), \
+             patch("tools.zero_mail_listener.archive_work_cal_message", mock_arch), \
+             patch("tools.zero_mail_listener.urllib.request.urlopen", side_effect=mock_urlopen_impl):
+            zmail.run_loop()
+
+        mock_reconcile.assert_called_once_with(tok="tok-xyz")
+        mock_arch.assert_called_once_with("msg_sync_102", tok="tok-xyz", thread_id="thread_sync_102")
+
+    def test_polling_loop_skips_reconcile_when_work_cal_ingest_fails(self):
+        msg_metadata = {
+            "id": "msg_sync_103",
+            "threadId": "thread_sync_103",
+            "snippet": "Sync snippet",
+            "payload": {
+                "headers": [
+                    {"name": "Subject", "value": "[WORK-CAL-SYNC] Bad payload"},
+                    {"name": "From", "value": "calendar-bot@example.com"},
+                ]
+            },
+        }
+
+        list_response = {"messages": [{"id": "msg_sync_103"}]}
+
+        def mock_urlopen_impl(req, timeout=15):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            resp = MagicMock()
+            if "messages?q=" in url:
+                resp.read.return_value = json.dumps(list_response).encode("utf-8")
+            elif "messages/msg_sync_103" in url:
+                resp.read.return_value = json.dumps(msg_metadata).encode("utf-8")
+            else:
+                resp.read.return_value = b"{}"
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = False
+            return cm
+
+        mock_ingest = MagicMock(return_value=False)
+        mock_reconcile = MagicMock()
+
+        def mock_archive(mid, tok=None, thread_id=None):
+            zmail._running = False
+
+        mock_arch = MagicMock(side_effect=mock_archive)
+
+        zmail._running = True
+        with patch("tools.zero_mail_listener.get_access_token", return_value="tok-xyz"), \
+             patch("tools.zero_mail_listener.load_seen", return_value={"seed_id"}), \
+             patch("tools.zero_mail_listener.save_seen"), \
+             patch("tools.zero_mail_listener.load_env", return_value={"DISCORD_BOT_TOKEN": "bot-tok"}), \
+             patch("tools.zero_mail_listener.ingest_work_cal_message", mock_ingest), \
+             patch("tools.zero_mail_listener.reconcile_work_cal_to_google_calendar", mock_reconcile), \
+             patch("tools.zero_mail_listener.archive_work_cal_message", mock_arch), \
+             patch("tools.zero_mail_listener.urllib.request.urlopen", side_effect=mock_urlopen_impl):
+            zmail.run_loop()
+
+        mock_ingest.assert_called()
+        mock_reconcile.assert_not_called()
+        mock_arch.assert_called_once_with("msg_sync_103", tok="tok-xyz", thread_id="thread_sync_103")
 
 
 if __name__ == "__main__":
