@@ -7816,6 +7816,9 @@ def _resolve_decision_channel(channel_id: int) -> tuple[int, Optional[int]]:
             def is_home_channel(ch):
                 return int(ch) == ZERO_CHAT_CHANNEL_ID
 
+    if cid == FORGE_CHANNEL_ID:
+        return cid, None
+
     if cid in CRAB_CAVERN_CHANNEL_IDS or not is_home_channel(cid):
         return ZERO_CHAT_CHANNEL_ID, cid
     return cid, None
@@ -7832,6 +7835,7 @@ def stage_decision(
     is_private: Optional[bool] = None,
     db_path: Path | str = FORGE_DB_PATH,
     post_to_discord: bool = False,
+    token: Optional[str] = None,
 ) -> dict:
     """Stage a deterministic Decision Card in SQLite (and optionally post directly to Discord)."""
     ok_val, val_err = _validate_decision_shell_payload(handler_type.strip(), payload)
@@ -7877,7 +7881,8 @@ def stage_decision(
 
     msg_id = None
     if post_to_discord:
-        msg_id = _post_decision_card_rest(decision_id, db_path=db_path)
+        resolved_token = token or _get_discord_token(for_forge_channel=(int(channel_id) == FORGE_CHANNEL_ID))
+        msg_id = _post_decision_card_rest(decision_id, db_path=db_path, token=resolved_token)
 
     redirected = orig_ch is not None
     return {
@@ -7909,6 +7914,9 @@ def stage_decision_card(
     post_to_discord: bool = False,
 ) -> dict:
     """Alias for `stage_decision`: stages a deterministic Decision Card without clipping multi-item summaries."""
+    token = None
+    if post_to_discord:
+        token = _get_discord_token(for_forge_channel=(int(channel_id) == FORGE_CHANNEL_ID))
     return stage_decision(
         category=category,
         title=title,
@@ -7920,6 +7928,7 @@ def stage_decision_card(
         is_private=is_private,
         db_path=db_path,
         post_to_discord=post_to_discord,
+        token=token,
     )
 
 
@@ -8055,14 +8064,18 @@ def format_decision_card_text(decision: sqlite3.Row | dict) -> str:
     return f"❌ **{title}** [Failed · {res_str}]\n{summary}{err_str}"
 
 
-def _post_decision_card_rest(decision_id: str, db_path: Path | str = FORGE_DB_PATH) -> Optional[int]:
+def _post_decision_card_rest(
+    decision_id: str,
+    db_path: Path | str = FORGE_DB_PATH,
+    token: Optional[str] = None,
+) -> Optional[int]:
     """Post a staged Decision Card with interactive buttons via Discord REST API v10."""
     with get_db_connection(db_path) as conn:
         row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
         if not row:
             return None
 
-    token = _get_discord_token()
+    token = token or _get_discord_token(for_forge_channel=(int(row["channel_id"]) == FORGE_CHANNEL_ID))
     if not token:
         return None
 

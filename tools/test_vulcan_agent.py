@@ -34,6 +34,7 @@ class TestVulcanAgentScoping(unittest.TestCase):
         self.env_patcher = patch.dict(os.environ, {}, clear=False)
         self.env_patcher.start()
         os.environ.pop("AGENT_ROLE", None)
+        os.environ.pop("DISCORD_CHANNEL_ID", None)
         os.environ.pop("VULCAN_DELEGATED", None)
         os.environ.pop("VULCAN_DISCORD_TOKEN", None)
         os.environ.pop("VULCAN_BOT_TOKEN", None)
@@ -50,6 +51,70 @@ class TestVulcanAgentScoping(unittest.TestCase):
         self.assertTrue(bs.is_vulcan_agent())
         os.environ["AGENT_ROLE"] = "zero"
         self.assertFalse(bs.is_vulcan_agent())
+        os.environ.pop("AGENT_ROLE", None)
+        os.environ["DISCORD_CHANNEL_ID"] = str(bs.FORGE_CHANNEL_ID)
+        self.assertTrue(bs.is_vulcan_agent())
+        os.environ["DISCORD_CHANNEL_ID"] = "1542081375287640084"
+        self.assertFalse(bs.is_vulcan_agent())
+
+    def test_session_key_isolation_between_zero_and_vulcan(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            sess_file = tmp_path / "sessions.json"
+            meta_file = tmp_path / "session_metadata.json"
+            zero_chat_id = 1542081375287640084
+            forge_id = bs.FORGE_CHANNEL_ID
+
+            with patch.object(bs, "SESSIONS_FILE", sess_file), \
+                 patch.object(bs, "SESSION_METADATA_FILE", meta_file):
+                # 1. Zero persists its home session
+                os.environ["AGENT_ROLE"] = "zero"
+                os.environ["DISCORD_CHANNEL_ID"] = str(zero_chat_id)
+                self.assertEqual(bs.get_home_session_key(), "home")
+                bs.set_channel_session_id(zero_chat_id, "home", "zero-conv-111", target_channel_id=zero_chat_id)
+                self.assertEqual(bs.get_channel_session_id(zero_chat_id, "home", target_channel_id=zero_chat_id), "zero-conv-111")
+
+                # 2. Vulcan persists its home session in #forge (with target_channel_id == FORGE_CHANNEL_ID)
+                os.environ["AGENT_ROLE"] = "vulcan"
+                os.environ["DISCORD_CHANNEL_ID"] = str(forge_id)
+                self.assertEqual(bs.get_home_session_key(), "vulcan-home")
+                bs.set_channel_session_id(forge_id, "home", "vulcan-conv-222", target_channel_id=forge_id)
+                self.assertEqual(bs.get_channel_session_id(forge_id, "home", target_channel_id=forge_id), "vulcan-conv-222")
+
+                # Verify Zero's 'home' key in sessions.json was NOT overwritten by Vulcan
+                raw_sessions = json.loads(sess_file.read_text(encoding="utf-8"))
+                self.assertEqual(raw_sessions.get("home"), "zero-conv-111")
+                self.assertEqual(raw_sessions.get(str(forge_id)), "vulcan-conv-222")
+
+                # 3. Clearing Vulcan's session leaves Zero's 'home' key intact
+                bs.clear_channel_session_id(forge_id, "home", target_channel_id=forge_id)
+                self.assertIsNone(bs.get_channel_session_id(forge_id, "home", target_channel_id=forge_id))
+                os.environ["AGENT_ROLE"] = "zero"
+                os.environ["DISCORD_CHANNEL_ID"] = str(zero_chat_id)
+                self.assertEqual(bs.get_channel_session_id(zero_chat_id, "home", target_channel_id=zero_chat_id), "zero-conv-111")
+
+    def test_stage_decision_card_uses_for_forge_channel_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "forge.db"
+            fg.init_forge_db(db_path)
+
+            with patch("tools.forge._get_discord_token", return_value="vulcan-bot-token") as mock_get_token, \
+                 patch("tools.forge._post_decision_card_rest", return_value=987654321) as mock_post_rest:
+                res = fg.stage_decision_card(
+                    category="ops",
+                    title="Reload Vulcan Bridge",
+                    summary="Reload Vulcan in #forge",
+                    handler_type="bridge_reload",
+                    payload={"action": "Trigger in-place bridge reload"},
+                    channel_id=fg.FORGE_CHANNEL_ID,
+                    db_path=db_path,
+                    post_to_discord=True,
+                )
+                self.assertTrue(res["ok"])
+                self.assertEqual(res["channel_id"], fg.FORGE_CHANNEL_ID)
+                self.assertFalse(res["redirected_to_zero_chat"])
+                mock_get_token.assert_called_with(for_forge_channel=True)
+                mock_post_rest.assert_called_once()
 
     def test_is_vulcan_delegated_env_and_runtime_rules(self):
         with patch("tools.bridge_state.get_runtime_rules", return_value={}):

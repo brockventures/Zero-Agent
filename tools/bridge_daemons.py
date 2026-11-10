@@ -15,6 +15,8 @@ import discord
 
 from tools.bridge_state import (
     TARGET_CHANNEL_ID,
+    FORGE_CHANNEL_ID,
+    is_vulcan_agent,
     get_runtime_rules,
     get_channel_session_id,
     set_channel_session_id,
@@ -50,9 +52,9 @@ ZERO_OPS_CHANNEL_ID = 1544953279664889888
 
 DEDICATED_CHANNEL_CONFIGS = {
     TARGET_CHANNEL_ID: {
-        "name": "zero-chat",
+        "name": "forge" if is_vulcan_agent() else "zero-chat",
         "mode": "home",
-        "sess_key": "home",
+        "sess_key": str(FORGE_CHANNEL_ID) if is_vulcan_agent() else "home",
         "always_warm": True,
     },
     ZERO_OPS_CHANNEL_ID: {

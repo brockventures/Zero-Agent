@@ -21,17 +21,22 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
 ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
+_IS_VULCAN_BOOT = (
+    os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan"
+    or int(os.getenv("DISCORD_CHANNEL_ID", "0") or 0) == 1562899941595160657
+)
+
 CONFIG_FILE = DATA_DIR / "runtime_config.json"
-IN_FLIGHT_FILE = DATA_DIR / "in_flight_turn.json"
-RESTART_INTENT_FILE = DATA_DIR / "restart_intent.json"
-QUEUE_FILE = DATA_DIR / "turn_queue.json"
-EXT_QUEUE_FILE = DATA_DIR / "external_turn_queue.json"
+IN_FLIGHT_FILE = DATA_DIR / ("vulcan_in_flight_turn.json" if _IS_VULCAN_BOOT else "in_flight_turn.json")
+RESTART_INTENT_FILE = DATA_DIR / ("vulcan_restart_intent.json" if _IS_VULCAN_BOOT else "restart_intent.json")
+QUEUE_FILE = DATA_DIR / ("vulcan_turn_queue.json" if _IS_VULCAN_BOOT else "turn_queue.json")
+EXT_QUEUE_FILE = DATA_DIR / ("vulcan_external_turn_queue.json" if _IS_VULCAN_BOOT else "external_turn_queue.json")
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 SESSION_METADATA_FILE = DATA_DIR / "session_metadata.json"
 RESET_SESSION_KEYS_FILE = DATA_DIR / "reset_session_keys.json"
-BEACON_FILE = DATA_DIR / "liveness_beacon.json"
+BEACON_FILE = DATA_DIR / ("vulcan_liveness_beacon.json" if _IS_VULCAN_BOOT else "liveness_beacon.json")
 BOT_STATUS_FILE = DATA_DIR / "bot_status.json"
-DAEMON_PIDS_FILE = DATA_DIR / "daemon_pids.json"
+DAEMON_PIDS_FILE = DATA_DIR / ("vulcan_daemon_pids.json" if _IS_VULCAN_BOOT else "daemon_pids.json")
 BOT_STATS_FILE = DATA_DIR / "bot_stats.json"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_RULES_FILE = (
@@ -93,7 +98,17 @@ RETITLED_THREADS_FILE = DATA_DIR / "retitled_threads.json"
 
 def is_vulcan_agent() -> bool:
     """Return True if executing inside the dedicated discord-vulcan-agent container."""
-    return os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan"
+    if os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan":
+        return True
+    try:
+        return int(os.getenv("DISCORD_CHANNEL_ID", "0") or 0) == FORGE_CHANNEL_ID
+    except (ValueError, TypeError):
+        return False
+
+
+def get_home_session_key() -> str:
+    """Return the home session key ('vulcan-home' for Vulcan, 'home' for Zero)."""
+    return "vulcan-home" if is_vulcan_agent() else "home"
 
 
 def is_vulcan_delegated() -> bool:
@@ -915,13 +930,25 @@ def check_compaction_needed(
     return False, ""
 
 
+def _resolve_session_key(channel_id: int | str, mode: str, target_channel_id: int = TARGET_CHANNEL_ID) -> str:
+    """Resolve the session storage key for a channel or thread, isolating Vulcan from Zero's 'home' key."""
+    cid = int(channel_id)
+    if cid == FORGE_CHANNEL_ID:
+        return str(FORGE_CHANNEL_ID)
+    if is_vulcan_agent():
+        return get_home_session_key() if (mode == "home" and cid == target_channel_id) else str(channel_id)
+    return get_home_session_key() if (mode == "home" and cid == target_channel_id) else str(channel_id)
+
+
 def get_channel_session_id(channel_id: int | str, mode: str, target_channel_id: int = TARGET_CHANNEL_ID) -> str | None:
     """Look up active conversation ID bound to a channel or thread."""
     if SESSIONS_FILE.exists():
         try:
             with open(SESSIONS_FILE) as f:
                 d = json.load(f)
-                key = "home" if (mode == "home" and int(channel_id) == target_channel_id) else str(channel_id)
+                key = _resolve_session_key(channel_id, mode, target_channel_id)
+                if int(channel_id) == FORGE_CHANNEL_ID and key not in d and is_vulcan_agent():
+                    return d.get(get_home_session_key())
                 return d.get(key)
         except Exception:
             return None
@@ -938,7 +965,7 @@ def set_channel_session_id(channel_id: int | str, mode: str, conv_id: str, targe
                     d = json.load(f)
             except Exception:
                 d = {}
-        key = "home" if (mode == "home" and int(channel_id) == target_channel_id) else str(channel_id)
+        key = _resolve_session_key(channel_id, mode, target_channel_id)
         old_conv_id = d.get(key)
         if old_conv_id != conv_id:
             d[key] = conv_id
@@ -963,7 +990,7 @@ def set_channel_session_id(channel_id: int | str, mode: str, conv_id: str, targe
 def clear_channel_session_id(channel_id: int | str, mode: str, target_channel_id: int = TARGET_CHANNEL_ID):
     """Clear conversation ID mapping and reset session metadata."""
     try:
-        key = "home" if (mode == "home" and int(channel_id) == target_channel_id) else str(channel_id)
+        key = _resolve_session_key(channel_id, mode, target_channel_id)
         old_conv_id = None
         if SESSIONS_FILE.exists():
             with open(SESSIONS_FILE) as f:
