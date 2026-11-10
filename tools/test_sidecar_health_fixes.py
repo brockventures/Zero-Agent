@@ -6,10 +6,13 @@
 - update_antigravity quiet Decision Card staging and stdout suppression
 """
 
+import json
 import os
 import subprocess
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 # Prioritize worktree directory over /workspace in sys.path
@@ -17,14 +20,18 @@ sys.path = [p for p in sys.path if p not in ("/workspace", "/workspace/tools")]
 sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
 sys.path.insert(0, REPO_ROOT)
 
-import tools.dockhand_update as dockhand_update
-import tools.ha_update_check as ha_update_check
-import tools.nas_storage_check as nas_storage_check
-import tools.update_antigravity as update_antigravity
+from tools import (
+    dockhand_update,
+    ha_update_check,
+    nas_storage_check,
+    sidecars,
+    update_antigravity,
+)
 
 # RFC 5737 documentation IPs for unit test isolation
 DOC_HOST_1 = "198.51.100.82"
 DOC_HOST_2 = "203.0.113.84"
+DOC_SLZB_IP = "198.51.100.25"
 
 
 # ==============================================================================
@@ -370,3 +377,180 @@ def test_update_antigravity_up_to_date(capsys):
 
         update_antigravity.check_updates(quiet=False)
         assert "Antigravity CLI is up to date" in capsys.readouterr().out
+
+
+# ==============================================================================
+# 5. SLZB-06P7 Stable Firmware Promotion Watcher & Flasher tests
+# ==============================================================================
+
+
+def test_slzb_semver_parser():
+    """Verify semver parser rejects dev/rc/beta while accepting clean release versions."""
+    assert sidecars._parse_semver_tuple("3.4.5") == (3, 4, 5)
+    assert sidecars._parse_semver_tuple("v3.4.5") == (3, 4, 5)
+    assert sidecars._parse_semver_tuple("v3.5.0") == (3, 5, 0)
+    assert sidecars._parse_semver_tuple("3.4.5") >= (3, 4, 5)
+    assert sidecars._parse_semver_tuple("v3.5.0") >= (3, 4, 5)
+    assert not (sidecars._parse_semver_tuple("3.4.4") >= (3, 4, 5))
+
+    for bad in (
+        "3.4.5.dev0",
+        "v3.4.5.dev0",
+        "3.4.5-rc1",
+        "3.4.5b2",
+        "v3.4.5-alpha",
+        "3.4.5-pre",
+        "3.4.5-nightly",
+        "",
+        "invalid",
+        "3.4.x",
+    ):
+        with pytest.raises(ValueError):
+            sidecars._parse_semver_tuple(bad)
+
+
+def test_slzb_6h_throttle_and_auto_retirement(tmp_path):
+    """Verify 6-hour throttle and auto-retirement when HA reports release channel."""
+    state_file = tmp_path / "slzb_watch.json"
+    with patch.object(sidecars, "SLZB_WATCH_STATE_PATH", state_file):
+        # 1. When already completed and not force, returns early
+        state_file.write_text(
+            json.dumps({
+                "completed": True,
+                "target_min_version": "3.4.5",
+                "last_checked_ts": 100.0,
+                "staged_version": "3.4.5",
+            })
+        )
+        res = sidecars.check_slzb_stable_release(force=False)
+        assert res.get("status") == "completed"
+
+        # 2. When HA reports release channel, auto-retire and save state
+        state_file.write_text(
+            json.dumps({
+                "completed": False,
+                "target_min_version": "3.4.5",
+                "last_checked_ts": 0.0,
+                "staged_version": None,
+            })
+        )
+        with patch.object(sidecars, "_get_ha_entity_state", return_value={"state": "release"}):
+            res2 = sidecars.check_slzb_stable_release(force=False)
+            assert res2.get("status") == "completed"
+            saved = json.loads(state_file.read_text())
+            assert saved.get("completed") is True
+
+        # 3. 6-hour throttle when checked recently
+        state_file.write_text(
+            json.dumps({
+                "completed": False,
+                "target_min_version": "3.4.5",
+                "last_checked_ts": 1000000.0,
+                "staged_version": None,
+            })
+        )
+        with (
+            patch("time.time", return_value=1003600.0),
+            patch.object(sidecars, "_get_ha_entity_state", return_value={"state": "dev"}),
+        ):
+            res3 = sidecars.check_slzb_stable_release(force=False)
+            assert res3.get("status") == "throttled"
+
+
+def test_slzb_decision_card_staging_and_deduplication(tmp_path):
+    """Verify Decision Card staging on v3.4.5+ stable and deduplication on repeat checks."""
+    state_file = tmp_path / "slzb_watch.json"
+    with patch.object(sidecars, "SLZB_WATCH_STATE_PATH", state_file):
+        state_file.write_text(
+            json.dumps({
+                "completed": False,
+                "target_min_version": "3.4.5",
+                "last_checked_ts": 0.0,
+                "staged_version": None,
+            })
+        )
+
+        mock_ssh_payload = {
+            "sw_version": "3.4.5.dev0",
+            "fw_channel": "dev",
+            "latest_release_ver": "3.4.5",
+            "prod": True,
+        }
+
+        mock_run_ssh = MagicMock(return_value=(0, json.dumps(mock_ssh_payload), ""))
+        mock_subproc_run = MagicMock()
+
+        with (
+            patch.object(sidecars, "_get_ha_entity_state", return_value={"state": "dev"}),
+            patch.object(sidecars.nas_config, "run_ssh", mock_run_ssh),
+            patch("subprocess.run", mock_subproc_run),
+        ):
+            res = sidecars.check_slzb_stable_release(force=True)
+            assert res.get("status") == "staged"
+            assert res.get("latest_release_ver") == "3.4.5"
+
+            # Check subprocess call arguments for forge stage-decision
+            assert mock_subproc_run.called
+            args = mock_subproc_run.call_args[0][0]
+            assert "forge.py" in " ".join(args)
+            assert "stage-decision" in args
+            assert "--category" in args and "homelab" in args
+            assert "--channel-id" in args and "1544953275877556334" in args
+            assert "Flash SLZB-06P7 Stable Firmware (3.4.5)" in " ".join(args)
+            assert "flash_slzb_stable" in " ".join(args)
+
+            # Saved state should have staged_version == '3.4.5'
+            saved = json.loads(state_file.read_text())
+            assert saved.get("staged_version") == "3.4.5"
+
+            # Repeat run with force=True should deduplicate and NOT stage again
+            mock_subproc_run.reset_mock()
+            res_repeat = sidecars.check_slzb_stable_release(force=True)
+            assert res_repeat.get("status") == "ok"
+            assert not mock_subproc_run.called
+
+
+def test_slzb_flash_stable_flow(tmp_path):
+    """Verify flash_slzb_stable executes firmware flash, reloads HA entry, marks completed, and dispatches outbox."""
+    state_file = tmp_path / "slzb_watch.json"
+    with patch.object(sidecars, "SLZB_WATCH_STATE_PATH", state_file):
+        state_file.write_text(
+            json.dumps({
+                "completed": False,
+                "target_min_version": "3.4.5",
+                "last_checked_ts": 0.0,
+                "staged_version": "3.4.5",
+            })
+        )
+
+        mock_flash_resp = {
+            "ok": True,
+            "sw_version": "3.4.5",
+            "fw_channel": "release",
+            "entry_id": "smlight_slzb06p7_entry_abc123",
+        }
+        mock_run_ssh = MagicMock(return_value=(0, json.dumps(mock_flash_resp), ""))
+        mock_subproc_run = MagicMock(return_value=MagicMock(returncode=0))
+        mock_urlopen = MagicMock()
+
+        with (
+            patch.object(sidecars.nas_config, "run_ssh", mock_run_ssh),
+            patch("urllib.request.urlopen", mock_urlopen),
+            patch("subprocess.run", mock_subproc_run),
+        ):
+            ok, msg = sidecars.flash_slzb_stable()
+            assert ok is True
+            assert "3.4.5" in msg
+
+            # State marked completed
+            saved = json.loads(state_file.read_text())
+            assert saved.get("completed") is True
+
+            # Outbox dispatch called
+            outbox_calls = [c for c in mock_subproc_run.call_args_list if "outbox.py" in " ".join(c[0][0])]
+            assert len(outbox_calls) >= 1
+            cmd = outbox_calls[0][0][0]
+            assert "1544953275877556334" in cmd
+            assert "--message" in cmd
+            assert "3.4.5" in " ".join(cmd)
+

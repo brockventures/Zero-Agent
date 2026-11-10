@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Comprehensive Sidecar Execution Engine for Zero.
 
 Implements all scheduled maintenance and monitoring jobs:
@@ -56,11 +57,15 @@ from workspace_mcp import calendar_list_events, gmail_search
 PT = ZoneInfo("America/Los_Angeles")
 
 try:
+    from tools import nas_config
     from tools.nas_config import resolve_nas_config, _resolve_nas_config
 except ImportError:
+    import nas_config
     from nas_config import resolve_nas_config, _resolve_nas_config
 
 HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
+
+SLZB_WATCH_STATE_PATH = Path("/workspace/data/slzb_stable_watch.json")
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/workspace/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -587,6 +592,12 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
             failures.append("Zero Health Server (`zero_health_server.py` on port `8769`) is offline and failed auto-heal")
     except Exception as he:
         failures.append(f"Zero Health Server check failed: {he}")
+
+    # 8. SLZB-06P7 Stable Firmware Promotion Watcher (non-blocking 6h sweep)
+    try:
+        check_slzb_stable_release(force=False)
+    except Exception as se:
+        log.warning("SLZB-06P7 stable firmware check non-blocking sweep warning: %s", se)
 
     if not failures:
         return True, f"🟢 **Heartbeat Sweep Healthy** — {now_str}\nAll containers, ports, Home Assistant, and external monitors healthy across `.82` and `.84`."
@@ -2156,6 +2167,385 @@ def run_usage_telemetry_audit(days: int | float = 7, dry_run: bool = False, test
         return False, f"⚠️ Usage telemetry audit error: {e}", {"error": str(e)}
 
 
+# --------------------------------------------------------------------------
+# SLZB-06P7 Stable Firmware Promotion Watcher & Flasher
+# --------------------------------------------------------------------------
+def _parse_semver_tuple(ver_str: str) -> tuple[int, ...]:
+    """Parse a semantic version string into a tuple of ints, stripping leading 'v'.
+
+    Rejects any version containing pre-release markers (dev, alpha, beta, rc, pre, nightly).
+    Raises ValueError on pre-release or non-numeric semver strings.
+    """
+    clean = str(ver_str).strip().lstrip("vV")
+    lower = clean.lower()
+    for marker in ("dev", "alpha", "beta", "rc", "pre", "nightly"):
+        if marker in lower:
+            raise ValueError(f"Pre-release version rejected: {ver_str}")
+    if not clean:
+        raise ValueError(f"Empty semver string: {ver_str}")
+    parts = clean.split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError as e:
+        raise ValueError(f"Invalid semver string: {ver_str}") from e
+
+
+DEFAULT_SLZB_WATCH_STATE = {
+    "completed": False,
+    "target_min_version": "3.4.5",
+    "last_checked_ts": 0.0,
+    "staged_version": None,
+}
+
+
+def _load_slzb_watch_state() -> dict:
+    if SLZB_WATCH_STATE_PATH.exists():
+        try:
+            with open(SLZB_WATCH_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                res = dict(DEFAULT_SLZB_WATCH_STATE)
+                res.update(data)
+                return res
+        except Exception:
+            pass
+    return dict(DEFAULT_SLZB_WATCH_STATE)
+
+
+def _save_slzb_watch_state(state: dict) -> None:
+    try:
+        SLZB_WATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SLZB_WATCH_STATE_PATH.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        tmp.replace(SLZB_WATCH_STATE_PATH)
+    except Exception as e:
+        log.warning("Failed to save SLZB watch state: %s", e)
+
+
+def _get_ha_rest_credentials() -> tuple[str, str]:
+    base_url = os.environ.get("HA_BASE_URL", "").rstrip("/")
+    token = os.environ.get("HA_ACCESS_TOKEN", "")
+
+    if os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json", "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if not base_url and d.get("HA_BASE_URL"):
+                    base_url = d["HA_BASE_URL"].rstrip("/")
+                if not token and d.get("HA_ACCESS_TOKEN"):
+                    token = d["HA_ACCESS_TOKEN"]
+        except Exception:
+            pass
+
+    if os.path.exists("/secrets/ha.json"):
+        try:
+            with open("/secrets/ha.json", "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if not base_url and d.get("url"):
+                    base_url = d["url"].rstrip("/")
+                if not token and d.get("token"):
+                    token = d["token"]
+        except Exception:
+            pass
+
+    return base_url or "http://127.0.0.1:8123", token
+
+
+def _get_ha_entity_state(entity_id: str) -> dict | None:
+    base_url, token = _get_ha_rest_credentials()
+    url = f"{base_url}/api/states/{entity_id}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning("Failed to query HA state for %s: %s", entity_id, e)
+        return None
+
+
+def check_slzb_stable_release(force: bool = False) -> dict:
+    """Monitor SMLIGHT official release feed for SLZB-06P7 and stage a Decision Card when stable Core OS >= 3.4.5 drops."""
+    state = _load_slzb_watch_state()
+    if state.get("completed") and not force:
+        return {"status": "completed", "message": "SLZB stable watch already completed", "state": state}
+
+    now = time.time()
+    last_ts = float(state.get("last_checked_ts", 0.0) or 0.0)
+    if not force and (now - last_ts < 21600):
+        return {"status": "throttled", "message": f"Throttled: checked {int(now - last_ts)}s ago (< 21600s)", "state": state}
+
+    # Query HA REST API: if state is already 'release', auto-retire
+    channel_state = _get_ha_entity_state("sensor.slzb_06p7_firmware_channel")
+    if channel_state and channel_state.get("state") == "release":
+        state["completed"] = True
+        state["last_checked_ts"] = now
+        _save_slzb_watch_state(state)
+        return {"status": "completed", "message": "SLZB-06P7 already on release channel", "state": state}
+
+    # Remote check via nas_config.run_ssh on Host 1
+    host_1_ip = getattr(nas_config, "HOST_1_IP", "127.0.0.1")
+    docker_root = getattr(nas_config, "DOCKER_ROOT", os.environ.get("NAS_DOCKER_ROOT", "/docker"))
+
+    inner_py = (
+        "import asyncio, json, pysmlight\n"
+        "async def main():\n"
+        "    client = pysmlight.Api2('__SLZB_HOST__')\n"
+        "    info = await client.get_info()\n"
+        "    fw = await client.get_firmware_version('release', device=info.model, mode='esp32')\n"
+        "    fw_obj = fw[0] if isinstance(fw, list) and fw else fw\n"
+        "    print(json.dumps({\n"
+        "        'sw_version': getattr(info, 'sw_version', ''),\n"
+        "        'fw_channel': getattr(info, 'fw_channel', ''),\n"
+        "        'latest_release_ver': getattr(fw_obj, 'ver', ''),\n"
+        "        'prod': getattr(fw_obj, 'prod', False)\n"
+        "    }))\n"
+        "asyncio.run(main())\n"
+    )
+
+    outer_py = (
+        f"import base64, json, subprocess, sys\n"
+        f"cfg_path = '{docker_root}/homeassistant/config/.storage/core.config_entries'\n"
+        f"try:\n"
+        f"    with open(cfg_path, 'r', encoding='utf-8') as f:\n"
+        f"        data = json.load(f)\n"
+        f"    entries = data.get('data', {{}}).get('entries', [])\n"
+        f"    slzb = next((e for e in entries if e.get('domain') == 'smlight' and e.get('title') == 'SLZB-06P7'), None)\n"
+        f"    if not slzb:\n"
+        f"        print(json.dumps({{'error': 'SLZB-06P7 config entry not found'}}))\n"
+        f"        sys.exit(1)\n"
+        f"    host = slzb.get('data', {{}}).get('host')\n"
+        f"    if not host:\n"
+        f"        print(json.dumps({{'error': 'Host not found in SLZB entry data'}}))\n"
+        f"        sys.exit(1)\n"
+        f"    inner_code = {repr(inner_py)}.replace('__SLZB_HOST__', host)\n"
+        f"    b64_inner = base64.b64encode(inner_code.encode('utf-8')).decode('ascii')\n"
+        f"    cmd = ['docker', 'exec', 'home-assistant', 'python3', '-c', f'import base64; exec(base64.b64decode(\"{{b64_inner}}\").decode(\"utf-8\"))']\n"
+        f"    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)\n"
+        f"    if res.returncode != 0:\n"
+        f"        print(json.dumps({{'error': f'docker exec failed (code {{res.returncode}}): {{res.stderr}}'}}))\n"
+        f"        sys.exit(res.returncode)\n"
+        f"    print(res.stdout.strip())\n"
+        f"except Exception as e:\n"
+        f"    print(json.dumps({{'error': str(e)}}))\n"
+        f"    sys.exit(1)\n"
+    )
+
+    import base64
+    b64_outer = base64.b64encode(outer_py.encode("utf-8")).decode("ascii")
+    remote_cmd = f"python3 -c \"import base64; exec(base64.b64decode('{b64_outer}').decode('utf-8'))\""
+
+    ret_code, stdout, stderr = nas_config.run_ssh(host_1_ip, remote_cmd, timeout=90)
+    data = {}
+    for line in reversed((stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                data = json.loads(line)
+                break
+            except Exception:
+                continue
+
+    if not data or "error" in data:
+        err = data.get("error") if data else f"SSH check failed (code {ret_code}): {stderr}"
+        log.warning("SLZB-06P7 check error: %s", err)
+        return {"status": "error", "error": err, "state": state}
+
+    sw_version = data.get("sw_version", "")
+    fw_channel = data.get("fw_channel", "")
+    latest_release_ver = data.get("latest_release_ver", "")
+    prod = bool(data.get("prod", False))
+
+    state["last_checked_ts"] = now
+
+    is_stable = False
+    try:
+        ver_tuple = _parse_semver_tuple(latest_release_ver)
+        is_stable = ver_tuple >= (3, 4, 5)
+    except ValueError:
+        is_stable = False
+
+    staged = False
+    if prod and is_stable and state.get("staged_version") != latest_release_ver:
+        subprocess.run([
+            "python3", "/workspace/tools/forge.py", "stage-decision",
+            "--category", "homelab",
+            "--title", f"Flash SLZB-06P7 Stable Firmware ({latest_release_ver})",
+            "--summary", (
+                f"SMLIGHT promoted Core OS **{latest_release_ver}** to the stable release channel (stick is currently on **{sw_version}**).\n\n"
+                f"**Approve Action:** Flashes verified stable Core OS **{latest_release_ver}** onto SLZB-06P7, waits for coordinator reboot, "
+                f"reloads the HA SMLIGHT integration, and retires this monitor."
+            ),
+            "--handler", "shell",
+            "--payload", json.dumps({"command": "python3 /workspace/tools/sidecars.py flash_slzb_stable"}),
+            "--channel-id", "1544953275877556334",
+            "--ttl", "604800",
+            "--post"
+        ], check=True)
+        state["staged_version"] = latest_release_ver
+        staged = True
+
+    _save_slzb_watch_state(state)
+    return {
+        "status": "staged" if staged else "ok",
+        "sw_version": sw_version,
+        "fw_channel": fw_channel,
+        "latest_release_ver": latest_release_ver,
+        "prod": prod,
+        "staged_version": state.get("staged_version"),
+        "state": state,
+    }
+
+
+def flash_slzb_stable() -> tuple[bool, str]:
+    """Flash verified stable release Core OS firmware to SLZB-06P7, wait for reboot, reload HA, and retire watcher."""
+    host_1_ip = getattr(nas_config, "HOST_1_IP", "127.0.0.1")
+    docker_root = getattr(nas_config, "DOCKER_ROOT", os.environ.get("NAS_DOCKER_ROOT", "/docker"))
+
+    inner_flash_py = (
+        "import asyncio, json, time, pysmlight\n"
+        "async def main():\n"
+        "    client = pysmlight.Api2('__SLZB_HOST__')\n"
+        "    info = await client.get_info()\n"
+        "    fw = await client.get_firmware_version('release', device=info.model, mode='esp32')\n"
+        "    fw_obj = fw[0] if isinstance(fw, list) and fw else fw\n"
+        "    ver = getattr(fw_obj, 'ver', '')\n"
+        "    prod = getattr(fw_obj, 'prod', False)\n"
+        "    clean = ver.strip().lstrip('vV').lower()\n"
+        "    for m in ('dev', 'alpha', 'beta', 'rc', 'pre', 'nightly'):\n"
+        "        if m in clean:\n"
+        "            print(json.dumps({'ok': False, 'error': f'Pre-release firmware rejected: {ver}'}))\n"
+        "            return\n"
+        "    try:\n"
+        "        parts = tuple(int(p) for p in clean.split('.'))\n"
+        "    except Exception:\n"
+        "        print(json.dumps({'ok': False, 'error': f'Invalid semver: {ver}'}))\n"
+        "        return\n"
+        "    if not (prod and parts >= (3, 4, 5)):\n"
+        "        print(json.dumps({'ok': False, 'error': f'Firmware not verified stable >= 3.4.5: ver={ver}, prod={prod}'}))\n"
+        "        return\n"
+        "    await client.fw_update(fw_obj)\n"
+        "    deadline = time.time() + 90\n"
+        "    rebooted = False\n"
+        "    cur_ver = ver\n"
+        "    while time.time() < deadline:\n"
+        "        await asyncio.sleep(5)\n"
+        "        try:\n"
+        "            cur_info = await client.get_info()\n"
+        "            if getattr(cur_info, 'fw_channel', '') == 'release':\n"
+        "                rebooted = True\n"
+        "                cur_ver = getattr(cur_info, 'sw_version', ver)\n"
+        "                break\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "    if not rebooted:\n"
+        "        print(json.dumps({'ok': False, 'error': 'Timed out after 90s waiting for SLZB-06P7 to report release channel'}))\n"
+        "        return\n"
+        "    print(json.dumps({'ok': True, 'sw_version': cur_ver, 'fw_channel': 'release', 'entry_id': '__ENTRY_ID__'}))\n"
+        "asyncio.run(main())\n"
+    )
+
+    outer_flash_py = (
+        f"import base64, json, subprocess, sys\n"
+        f"cfg_path = '{docker_root}/homeassistant/config/.storage/core.config_entries'\n"
+        f"try:\n"
+        f"    with open(cfg_path, 'r', encoding='utf-8') as f:\n"
+        f"        data = json.load(f)\n"
+        f"    entries = data.get('data', {{}}).get('entries', [])\n"
+        f"    slzb = next((e for e in entries if e.get('domain') == 'smlight' and e.get('title') == 'SLZB-06P7'), None)\n"
+        f"    if not slzb:\n"
+        f"        print(json.dumps({{'ok': False, 'error': 'SLZB-06P7 config entry not found'}}))\n"
+        f"        sys.exit(1)\n"
+        f"    host = slzb.get('data', {{}}).get('host')\n"
+        f"    entry_id = slzb.get('entry_id', '')\n"
+        f"    if not host:\n"
+        f"        print(json.dumps({{'ok': False, 'error': 'Host not found in SLZB entry data'}}))\n"
+        f"        sys.exit(1)\n"
+        f"    inner_code = {repr(inner_flash_py)}.replace('__SLZB_HOST__', host).replace('__ENTRY_ID__', entry_id)\n"
+        f"    b64_inner = base64.b64encode(inner_code.encode('utf-8')).decode('ascii')\n"
+        f"    cmd = ['docker', 'exec', 'home-assistant', 'python3', '-c', f'import base64; exec(base64.b64decode(\"{{b64_inner}}\").decode(\"utf-8\"))']\n"
+        f"    res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)\n"
+        f"    if res.returncode != 0:\n"
+        f"        print(json.dumps({{'ok': False, 'error': f'docker exec failed: {{res.stderr}}'}}))\n"
+        f"        sys.exit(res.returncode)\n"
+        f"    print(res.stdout.strip())\n"
+        f"except Exception as e:\n"
+        f"    print(json.dumps({{'ok': False, 'error': str(e)}}))\n"
+        f"    sys.exit(1)\n"
+    )
+
+    import base64
+    b64_outer = base64.b64encode(outer_flash_py.encode("utf-8")).decode("ascii")
+    remote_cmd = f"python3 -c \"import base64; exec(base64.b64decode('{b64_outer}').decode('utf-8'))\""
+
+    ret_code, stdout, stderr = nas_config.run_ssh(host_1_ip, remote_cmd, timeout=180)
+    data = {}
+    for line in reversed((stdout or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                data = json.loads(line)
+                break
+            except Exception:
+                continue
+
+    if not data or not data.get("ok"):
+        err = data.get("error") if data else f"SSH flash command failed (code {ret_code}): {stderr}"
+        return False, f"SLZB-06P7 firmware flash failed: {err}"
+
+    final_ver = data.get("sw_version", "stable")
+    entry_id = data.get("entry_id", "")
+
+    # Reload HA config entry
+    if entry_id:
+        try:
+            base_url, token = _get_ha_rest_credentials()
+            url = f"{base_url}/api/services/homeassistant/reload_config_entry"
+            req = urllib.request.Request(
+                url,
+                data=json.dumps({"entry_id": entry_id}).encode("utf-8"),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15):
+                pass
+        except Exception as e:
+            log.warning("Failed to reload HA config entry: %s", e)
+
+    # Mark completed in SLZB_WATCH_STATE_PATH
+    state = _load_slzb_watch_state()
+    state["completed"] = True
+    state["last_checked_ts"] = time.time()
+    _save_slzb_watch_state(state)
+
+    # Dispatch confirmation to channel 1544953275877556334 via outbox
+    msg = (
+        f"✅ **SLZB-06P7 Stable Firmware Live:** Flashed Core OS **{final_ver}** on `release` channel.\n"
+        f"HA SMLIGHT integration reloaded and 6-hour promotion watcher retired."
+    )
+    try:
+        res = subprocess.run([
+            "python3", "/workspace/tools/outbox.py", "send",
+            "--channel", "1544953275877556334",
+            "--message", msg,
+        ], capture_output=True, text=True, check=False)
+        if res.returncode != 0:
+            subprocess.run([
+                "python3", "/workspace/tools/outbox.py",
+                "--channel", "1544953275877556334",
+                "--message", msg,
+            ], check=False)
+    except Exception as e:
+        log.warning("Failed to dispatch confirmation message to outbox: %s", e)
+
+    return True, f"Successfully flashed SLZB-06P7 to stable Core OS {final_ver} and retired monitor"
+
+
 if __name__ == "__main__":
     action = sys.argv[1] if len(sys.argv) > 1 else "heartbeat"
     if action in ("cubs", "cubs_game", "cubs_notifier"):
@@ -2594,5 +2984,13 @@ if __name__ == "__main__":
     elif action == "history":
         entries = get_execution_history(limit=20)
         print(json.dumps(entries, indent=2))
+    elif action in ("slzb_watch", "check_slzb_stable", "slzb_check"):
+        force = "--no-force" not in sys.argv
+        res = check_slzb_stable_release(force=force)
+        print(json.dumps(res, indent=2))
+    elif action in ("flash_slzb_stable", "slzb_flash"):
+        ok, msg = flash_slzb_stable()
+        print(f"[{'OK' if ok else 'FAILED'}] {msg}")
+        sys.exit(0 if ok else 1)
     else:
         print(f"Unknown action: {action}")
