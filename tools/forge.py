@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """
 forge.py — FORGE Engine (Federated Orchestration, Runtime & Gated Execution)
 
@@ -2696,6 +2697,89 @@ def detect_repo_verification_script(worktree_dir: Path | str) -> Optional[str]:
     return None
 
 
+def _ensure_worktree_ui_node_modules(worktree_dir: Path | str, repo_dir: Optional[Path | str] = None) -> bool:
+    """Symlink `web/ui/node_modules` into an isolated git worktree from the parent repository when present."""
+    try:
+        wt = Path(worktree_dir).resolve()
+        wt_ui = wt / "web" / "ui"
+        if not wt_ui.is_dir():
+            return False
+        wt_nm = wt_ui / "node_modules"
+        if wt_nm.exists():
+            return True
+
+        candidates: list[Path] = []
+        if repo_dir:
+            candidates.append(Path(repo_dir).resolve() / "web" / "ui" / "node_modules")
+
+        git_marker = wt / ".git"
+        if git_marker.is_file():
+            try:
+                raw_git = git_marker.read_text(encoding="utf-8", errors="ignore").strip()
+                if raw_git.startswith("gitdir:"):
+                    gitdir_str = raw_git[len("gitdir:") :].strip()
+                    gitdir_path = Path(gitdir_str)
+                    if not gitdir_path.is_absolute():
+                        gitdir_path = (wt / gitdir_path).resolve()
+                    else:
+                        gitdir_path = gitdir_path.resolve()
+                    # Typical layout: <main_repo>/.git/worktrees/<wt_name>
+                    if gitdir_path.parent.name == "worktrees" and gitdir_path.parent.parent.name == ".git":
+                        main_repo = gitdir_path.parent.parent.parent
+                        candidates.append(main_repo / "web" / "ui" / "node_modules")
+                    commondir_file = gitdir_path / "commondir"
+                    if commondir_file.is_file():
+                        c_rel = commondir_file.read_text(encoding="utf-8", errors="ignore").strip()
+                        if c_rel:
+                            common_git = (gitdir_path / c_rel).resolve()
+                            if common_git.name == ".git":
+                                candidates.append(common_git.parent / "web" / "ui" / "node_modules")
+            except Exception:
+                pass
+
+        candidates.append(WORKSPACE_DIR / "repos" / "mirrormere" / "web" / "ui" / "node_modules")
+        candidates.append(Path("/workspace/repos/mirrormere/web/ui/node_modules"))
+
+        for cand in candidates:
+            try:
+                if cand.is_dir() and cand.resolve() != wt_nm.resolve():
+                    if wt_nm.is_symlink():
+                        wt_nm.unlink(missing_ok=True)
+                    wt_nm.symlink_to(cand.resolve(), target_is_directory=True)
+                    # Ensure git ignores symlinked node_modules even if .gitignore uses trailing-slash 'node_modules/'
+                    try:
+                        common_git_dir: Optional[Path] = None
+                        if git_marker.is_file():
+                            raw_g = git_marker.read_text(encoding="utf-8", errors="ignore").strip()
+                            if raw_g.startswith("gitdir:"):
+                                g_p = Path(raw_g[len("gitdir:") :].strip())
+                                g_p = (wt / g_p).resolve() if not g_p.is_absolute() else g_p.resolve()
+                                c_f = g_p / "commondir"
+                                if c_f.is_file():
+                                    c_r = c_f.read_text(encoding="utf-8", errors="ignore").strip()
+                                    if c_r:
+                                        common_git_dir = (g_p / c_r).resolve()
+                                elif g_p.parent.name == "worktrees" and g_p.parent.parent.name == ".git":
+                                    common_git_dir = g_p.parent.parent
+                        elif git_marker.is_dir():
+                            common_git_dir = git_marker
+                        if common_git_dir and common_git_dir.is_dir():
+                            excl_file = common_git_dir / "info" / "exclude"
+                            excl_file.parent.mkdir(parents=True, exist_ok=True)
+                            existing_excl = excl_file.read_text(encoding="utf-8", errors="ignore") if excl_file.is_file() else ""
+                            if "node_modules" not in [ln.strip() for ln in existing_excl.splitlines()]:
+                                prefix = "\n" if existing_excl and not existing_excl.endswith("\n") else ""
+                                excl_file.write_text(f"{existing_excl}{prefix}node_modules\n", encoding="utf-8")
+                    except Exception:
+                        pass
+                    return wt_nm.exists()
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def _build_fast_staged_verify_cmd(worktree_dir: Path | str, changed_files: Optional[list[str]] = None) -> str:
     """Build a subshell-safe pre-flight verification command for `scripts/verify.sh --staged`.
 
@@ -2743,10 +2827,31 @@ def _build_fast_staged_verify_cmd(worktree_dir: Path | str, changed_files: Optio
         ui_subcmds.append("npm run deadcode")
         ui_subcmds.append("npm run typecheck")
         fast_ui_cmd = f"(cd {q_wt}/web/ui && {' && '.join(ui_subcmds)})"
+        if not (wt / "web" / "ui" / "node_modules").exists():
+            _ensure_worktree_ui_node_modules(wt)
         if not (wt / "web" / "ui" / "node_modules").exists() and (wt / "scripts" / "verify.sh").is_file():
             return f"(cd {q_wt} && sh scripts/verify.sh --staged)"
         if non_ui_files and (wt / "scripts" / "verify.sh").is_file():
-            return f"{fast_ui_cmd} && (cd {q_wt} && sh scripts/verify.sh --staged)"
+            from tools.modal_verify import should_run_go_verification
+
+            non_ui_non_json = [f for f in non_ui_files if not f.lower().endswith(".json")]
+            run_go_verify = (
+                should_run_go_verification(non_ui_non_json, cwd=wt)
+                if non_ui_non_json
+                else should_run_go_verification(non_ui_files, cwd=wt)
+                and any(
+                    k in f.lower()
+                    for f in non_ui_files
+                    for k in ("openapi", "swagger", "oapi-codegen", ".golangci")
+                )
+            )
+            if run_go_verify:
+                return f"{fast_ui_cmd} && (cd {q_wt} && sh scripts/verify.sh --staged)"
+            py_non_ui = [f for f in non_ui_files if f.endswith(".py")]
+            if py_non_ui:
+                py_default_cmd = build_default_verification_cmd(py_non_ui, worktree_dir=None)
+                if py_default_cmd and py_default_cmd != "true":
+                    return f"{fast_ui_cmd} && (cd {q_wt} && {py_default_cmd})"
         return fast_ui_cmd
 
     return f"(cd {q_wt} && sh scripts/verify.sh --staged)"
@@ -6150,6 +6255,7 @@ class ForgeSupervisor:
 
         def _ensure_chunk_worktree(force_recreate: bool = False) -> None:
             if not force_recreate and wt_dir.exists() and (wt_dir / ".git").exists():
+                _ensure_worktree_ui_node_modules(wt_dir, repo_dir=repo_dir)
                 return
             git_lk = _acquire_repo_git_lock(repo_dir)
             try:
@@ -6221,6 +6327,8 @@ class ForgeSupervisor:
                     )
                     if rb_init.returncode != 0:
                         subprocess.run(["git", "rebase", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
+
+                _ensure_worktree_ui_node_modules(wt_dir, repo_dir=repo_dir)
             finally:
                 _release_file_lock(git_lk)
 

@@ -1,3 +1,4 @@
+# ruff: noqa
 """
 test_forge.py — Comprehensive Unit Tests for FORGE v1.1 Engine & Zero-Vault Encryption.
 
@@ -4133,6 +4134,81 @@ def test_forge_load_shed_threshold_and_build_capping(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor, "_count_active_build_workers", lambda: set())
     monkeypatch.setattr(forge_mod, "_has_active_interactive_turns", lambda: True)
     assert supervisor.maybe_spawn_next_build_worker() is None
+
+
+def test_fast_staged_verify_cmd_symlinks_worktree_node_modules(tmp_path):
+    """Verify _build_fast_staged_verify_cmd symlinks web/ui/node_modules from parent repo worktree and leaves git status clean."""
+    main_repo = _init_test_git_repo(tmp_path / "main_repo")
+    (main_repo / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    ui_dir = main_repo / "web" / "ui" / "src"
+    ui_dir.mkdir(parents=True, exist_ok=True)
+    (main_repo / "web" / "ui" / "package.json").write_text('{"name": "ui"}\n', encoding="utf-8")
+    (ui_dir / "App.tsx").write_text("export const App = () => null;\n", encoding="utf-8")
+    scripts_dir = main_repo / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    (scripts_dir / "verify.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    subprocess.run(["git", "add", "."], cwd=str(main_repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Add UI and verify.sh"], cwd=str(main_repo), check=True, capture_output=True)
+
+    # Create untracked node_modules in main_repo
+    main_nm = main_repo / "web" / "ui" / "node_modules" / ".bin"
+    main_nm.mkdir(parents=True, exist_ok=True)
+
+    # Add an isolated git worktree (which starts without untracked web/ui/node_modules)
+    wt_dir = tmp_path / "wt_isolated"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feat/ui-test", str(wt_dir), "HEAD"],
+        cwd=str(main_repo),
+        check=True,
+        capture_output=True,
+    )
+    assert not (wt_dir / "web" / "ui" / "node_modules").exists()
+
+    cmd = forge_mod._build_fast_staged_verify_cmd(wt_dir, changed_files=["web/ui/src/App.tsx"])
+    assert (wt_dir / "web" / "ui" / "node_modules").is_symlink()
+    assert (wt_dir / "web" / "ui" / "node_modules").resolve() == (main_repo / "web" / "ui" / "node_modules").resolve()
+    assert "npx --no-install eslint --max-warnings=0" in cmd
+    assert "npm run deadcode" in cmd
+    assert "npm run typecheck" in cmd
+    assert "sh scripts/verify.sh --staged" not in cmd
+
+    # Verify mixed UI + Python diff does NOT invoke scripts/verify.sh --staged (preventing full-repo vitest coverage fallback)
+    ical_dir = wt_dir / "deploy" / "ical-bridge"
+    ical_dir.mkdir(parents=True, exist_ok=True)
+    (ical_dir / "server.py").write_text("print('ok')\n", encoding="utf-8")
+    yt_dir = wt_dir / "web" / "ui" / "src" / "widgets" / "yt-music"
+    yt_dir.mkdir(parents=True, exist_ok=True)
+    (yt_dir / "YtMusicWidget.tsx").write_text("export const YtMusicWidget = () => null;\n", encoding="utf-8")
+
+    mixed_cmd = forge_mod._build_fast_staged_verify_cmd(
+        wt_dir,
+        changed_files=["deploy/ical-bridge/server.py", "web/ui/src/widgets/yt-music/YtMusicWidget.tsx"],
+    )
+    assert "scripts/verify.sh --staged" not in mixed_cmd
+    assert "npx --no-install eslint --max-warnings=0" in mixed_cmd
+    assert 'python3 -m py_compile "deploy/ical-bridge/server.py"' in mixed_cmd
+
+    # Verify mixed UI + Go diff DOES invoke scripts/verify.sh --staged
+    mixed_go_cmd = forge_mod._build_fast_staged_verify_cmd(
+        wt_dir,
+        changed_files=["internal/server/router.go", "web/ui/src/widgets/yt-music/YtMusicWidget.tsx"],
+    )
+    assert "scripts/verify.sh --staged" in mixed_go_cmd
+
+    # Remove untracked test files before checking git status --porcelain for symlink hygiene
+    (ical_dir / "server.py").unlink()
+    (yt_dir / "YtMusicWidget.tsx").unlink()
+
+    # Verify git status --porcelain remains 100% clean in the worktree
+    st = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(wt_dir),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert st.stdout.strip() == ""
 
 
 if __name__ == "__main__":
