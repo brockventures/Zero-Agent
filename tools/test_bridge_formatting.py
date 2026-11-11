@@ -1092,16 +1092,23 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertNotIn("`", preview)
 
     def test_forge_worker_model_default_and_fallback(self):
-        """Verify forge.py uses gemini-4-argon-low default and falls back when gemini-3.8-flash-high is rejected."""
+        """Verify forge.py uses Argon Low -> Argon Med -> Carbon High ladder and falls back when a model is rejected."""
         from tools.forge import (
             DEFAULT_WORKER_MODEL,
             ESCALATION_WORKER_MODEL,
+            FINAL_ESCALATION_WORKER_MODEL,
             is_unrecognized_model_error,
             resolve_worker_model_fallback,
+            resolve_worker_model_for_attempt,
         )
 
         self.assertEqual(DEFAULT_WORKER_MODEL, "gemini-4-argon-low")
         self.assertEqual(ESCALATION_WORKER_MODEL, "gemini-4-argon-medium")
+        self.assertEqual(FINAL_ESCALATION_WORKER_MODEL, "gemini-4-carbon-high")
+
+        self.assertEqual(resolve_worker_model_for_attempt(None, attempt=1, max_attempts=3), "gemini-4-argon-low")
+        self.assertEqual(resolve_worker_model_for_attempt(None, attempt=2, max_attempts=3), "gemini-4-argon-medium")
+        self.assertEqual(resolve_worker_model_for_attempt(None, attempt=3, max_attempts=3), "gemini-4-carbon-high")
 
         err_line = (
             'error: invalid model selection (--model "gemini-3.8-flash-high" --effort ""): '
@@ -1121,6 +1128,13 @@ class TestBridgeFormatting(unittest.TestCase):
             rejected_models={"gemini-3.8-flash-high", "gemini-4-argon-low"},
         )
         self.assertEqual(fb2, "gemini-4-argon-medium")
+
+        fb3 = resolve_worker_model_fallback(
+            "gemini-4-argon-medium",
+            attempt=3,
+            max_attempts=3,
+        )
+        self.assertEqual(fb3, "gemini-4-carbon-high")
 
 
 class TestBridgeTurnHoldRace(unittest.IsolatedAsyncioTestCase):

@@ -98,6 +98,7 @@ OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
 
 DEFAULT_WORKER_MODEL = "gemini-4-argon-low"
 ESCALATION_WORKER_MODEL = "gemini-4-argon-medium"
+FINAL_ESCALATION_WORKER_MODEL = "gemini-4-carbon-high"
 DEFAULT_LEASE_TTL_SECONDS = 300.0
 
 WORKER_MODEL_FALLBACK_MAP: dict[str, str] = {
@@ -106,7 +107,23 @@ WORKER_MODEL_FALLBACK_MAP: dict[str, str] = {
     "gemini-3.8-flash-low": "gemini-4-argon-low",
     "gemini-3.8-flash": "gemini-4-argon-low",
     "gemini-4-argon-low": "gemini-4-argon-medium",
+    "gemini-4-argon-medium": "gemini-4-carbon-high",
+    "gemini-4-carbon-high": "gemini-4-argon-medium",
 }
+
+
+def resolve_worker_model_for_attempt(
+    base_model: Optional[str] = None,
+    attempt: int = 1,
+    max_attempts: int = 3,
+) -> str:
+    """Resolve the tiered worker model ladder (Attempt 1: Argon Low -> Attempt 2: Argon Med -> Attempt 3: Carbon High)."""
+    clean_base = (base_model or "").strip() or DEFAULT_WORKER_MODEL
+    if attempt >= max_attempts:
+        return FINAL_ESCALATION_WORKER_MODEL
+    if attempt >= 2 and clean_base == DEFAULT_WORKER_MODEL:
+        return ESCALATION_WORKER_MODEL
+    return clean_base
 
 
 def is_unrecognized_model_error(output_text: str) -> bool:
@@ -130,12 +147,14 @@ def resolve_worker_model_fallback(
     rej = set(rejected_models or set())
     if failed_model:
         rej.add(failed_model)
-    if attempt >= max_attempts and ESCALATION_WORKER_MODEL not in rej:
+    if attempt >= max_attempts and FINAL_ESCALATION_WORKER_MODEL not in rej:
+        return FINAL_ESCALATION_WORKER_MODEL
+    if attempt == 2 and ESCALATION_WORKER_MODEL not in rej:
         return ESCALATION_WORKER_MODEL
     mapped = WORKER_MODEL_FALLBACK_MAP.get(failed_model, DEFAULT_WORKER_MODEL)
     if mapped not in rej:
         return mapped
-    for candidate in (DEFAULT_WORKER_MODEL, ESCALATION_WORKER_MODEL):
+    for candidate in (DEFAULT_WORKER_MODEL, ESCALATION_WORKER_MODEL, FINAL_ESCALATION_WORKER_MODEL):
         if candidate not in rej:
             return candidate
     return ESCALATION_WORKER_MODEL
@@ -6425,10 +6444,19 @@ class ForgeSupervisor:
             tail_lines: list[str] = []
             step_cnt = 0
             model = DEFAULT_WORKER_MODEL
+            fallback_override_model = None
 
             for _model_try in range(3):
-                base_model = fallback_override_model or chunk_row["worker_model"] or DEFAULT_WORKER_MODEL
-                model = ESCALATION_WORKER_MODEL if attempt == max_attempts else base_model
+                base_model = chunk_row["worker_model"] or DEFAULT_WORKER_MODEL
+                model = (
+                    fallback_override_model
+                    if fallback_override_model
+                    else resolve_worker_model_for_attempt(
+                        base_model,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                    )
+                )
                 if model in rejected_models:
                     model = resolve_worker_model_fallback(
                         model,
