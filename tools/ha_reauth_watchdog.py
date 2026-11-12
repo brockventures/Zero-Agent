@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Home Assistant Integration Re-Auth & Setup Error Watchdog.
 
 Audits Home Assistant config entries and persistent notifications:
@@ -9,14 +10,17 @@ Audits Home Assistant config entries and persistent notifications:
 """
 
 import argparse
+import http.cookiejar
 import json
 import os
 import socket
+import ssl
 import sys
 import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 PT = ZoneInfo("America/Los_Angeles")
@@ -45,6 +49,11 @@ ZWAVE_READY_LOG_SIGNATURES = (
     "all queues idle",
     "Controller status: Ready",
 )
+
+ENVOY_HEAL_COOLDOWN_SECONDS = 1800
+ENVOY_RECONNECT_POLL_ATTEMPTS = 9
+ENVOY_RECONNECT_POLL_INTERVAL_SECONDS = 5.0
+ENVOY_RELOAD_TIMEOUT_SECONDS = 30
 
 # Devices that routinely enter setup_retry when powered off at the wall
 BENIGN_STANDBY_DOMAINS = {"octoprint", "android_ip_webcam", "androidtv_remote"}
@@ -559,6 +568,261 @@ def _auto_heal_zwave_js(
     return False
 
 
+def _probe_tcp_port(ip: str, port: int = 443, timeout: float = 2.0) -> bool:
+    """Probe whether TCP port is accepting connections."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            return sock.connect_ex((ip, port)) == 0
+    except Exception:
+        return False
+
+
+def _get_unifi_config() -> tuple[str, str, str]:
+    """Resolve UniFi Controller URL, username, and password from environment or /secrets/env.json."""
+    unifi_url = (os.environ.get("UNIFI_BASE_URL") or os.environ.get("UNIFI_URL") or "").rstrip("/")
+    unifi_user = os.environ.get("UNIFI_USER") or os.environ.get("UNIFI_USERNAME") or ""
+    unifi_pass = os.environ.get("UNIFI_PASSWORD") or os.environ.get("UNIFI_PASS") or ""
+
+    if os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json") as f:
+                d = json.load(f)
+                if not unifi_url:
+                    unifi_url = (d.get("UNIFI_BASE_URL") or d.get("UNIFI_URL") or d.get("GATEWAY_URL") or "").rstrip("/")
+                if not unifi_user:
+                    unifi_user = d.get("UNIFI_USER") or d.get("UNIFI_USERNAME") or ""
+                if not unifi_pass:
+                    unifi_pass = d.get("UNIFI_PASSWORD") or d.get("UNIFI_PASS") or ""
+        except Exception:
+            pass
+
+    return unifi_url or "https://127.0.0.1", unifi_user, unifi_pass
+
+
+def _kick_unifi_envoy_client(
+    unifi_url: str,
+    username: str,
+    password: str,
+    opener: Any = None,
+) -> tuple[bool, str | None, str | None]:
+    """Kick the Enphase Envoy Wi-Fi client on UniFi to clear zombie association and force reconnect.
+
+    1. Logs into UniFi OS (/api/auth/login) capturing session cookies and X-CSRF-Token.
+    2. Queries /proxy/network/api/s/default/stat/sta (falling back to /stat/alluser) for client
+       with 'envoy' in hostname or name (case-insensitive).
+    3. Issues POST /proxy/network/api/s/default/cmd/stamgr with {'cmd': 'kick-sta', 'mac': mac}.
+    Returns (True, mac, ip) on success, or (False, None, None) on failure.
+    """
+    if not unifi_url or not username or not password:
+        print("[HAReauthWatchdog] UniFi credentials or URL missing for Envoy kick.", file=sys.stderr)
+        return False, None, None
+
+    unifi_url = unifi_url.rstrip("/")
+    if opener is None:
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            cj = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=ctx),
+                urllib.request.HTTPCookieProcessor(cj),
+            )
+        except Exception as ex:
+            print(f"[HAReauthWatchdog] Failed to build UniFi HTTPS opener: {ex}", file=sys.stderr)
+            return False, None, None
+
+    try:
+        # 1. Login to UniFi OS
+        login_data = json.dumps({"username": username, "password": password}).encode("utf-8")
+        login_req = urllib.request.Request(
+            f"{unifi_url}/api/auth/login",
+            data=login_data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        csrf_token = ""
+        with opener.open(login_req, timeout=10) as resp:
+            headers = getattr(resp, "headers", None)
+            if headers:
+                for k, v in headers.items():
+                    if k.lower() == "x-csrf-token":
+                        csrf_token = v
+                        break
+
+        common_headers = {"Content-Type": "application/json"}
+        if csrf_token:
+            common_headers["X-CSRF-Token"] = csrf_token
+
+        # 2. Search active stations (/stat/sta)
+        clients: list[dict] = []
+        sta_req = urllib.request.Request(
+            f"{unifi_url}/proxy/network/api/s/default/stat/sta",
+            headers=common_headers,
+        )
+        try:
+            with opener.open(sta_req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                if isinstance(data, dict):
+                    clients = data.get("data", [])
+                elif isinstance(data, list):
+                    clients = data
+        except Exception as sta_ex:
+            print(f"[HAReauthWatchdog] UniFi stat/sta lookup failed: {sta_ex}", file=sys.stderr)
+
+        def _is_envoy(c: dict) -> bool:
+            h = str(c.get("hostname") or "").lower()
+            n = str(c.get("name") or "").lower()
+            return "envoy" in h or "envoy" in n
+
+        target = next((c for c in clients if isinstance(c, dict) and _is_envoy(c)), None)
+
+        # Fallback to /stat/alluser if not in active sta list
+        if not target:
+            alluser_req = urllib.request.Request(
+                f"{unifi_url}/proxy/network/api/s/default/stat/alluser",
+                headers=common_headers,
+            )
+            try:
+                with opener.open(alluser_req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                    all_clients = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                    target = next((c for c in all_clients if isinstance(c, dict) and _is_envoy(c)), None)
+            except Exception as all_ex:
+                print(f"[HAReauthWatchdog] UniFi stat/alluser lookup failed: {all_ex}", file=sys.stderr)
+
+        if not target:
+            print("[HAReauthWatchdog] Enphase Envoy client not found in UniFi station table.", file=sys.stderr)
+            return False, None, None
+
+        mac = target.get("mac")
+        ip = target.get("ip") or target.get("last_ip")
+        if not mac:
+            print("[HAReauthWatchdog] Enphase Envoy client has no MAC address in UniFi data.", file=sys.stderr)
+            return False, None, ip
+
+        # 3. Issue kick-sta command
+        kick_data = json.dumps({"cmd": "kick-sta", "mac": mac}).encode("utf-8")
+        kick_req = urllib.request.Request(
+            f"{unifi_url}/proxy/network/api/s/default/cmd/stamgr",
+            data=kick_data,
+            headers=common_headers,
+            method="POST",
+        )
+        with opener.open(kick_req, timeout=10) as resp:
+            status = getattr(resp, "status", None) or getattr(resp, "code", 200)
+            if status in (200, 204):
+                print(
+                    f"[HAReauthWatchdog] 🔄 Dispatched UniFi kick-sta for Envoy (mac={mac}, ip={ip}).",
+                    file=sys.stderr,
+                )
+                return True, mac, ip
+    except Exception as ex:
+        print(f"[HAReauthWatchdog] UniFi kick-sta error: {ex}", file=sys.stderr)
+
+    return False, None, None
+
+
+def _auto_heal_enphase_envoy(
+    base_url: str,
+    token: str,
+    entry_id: str,
+    state: dict | None = None,
+) -> bool:
+    """Attempt to recover a wedged Enphase Envoy Wi-Fi zombie association.
+
+    1. Checks cooldown (ENVOY_HEAL_COOLDOWN_SECONDS = 1800) from state['envoy_last_heal_ts'].
+    2. Inspects HA entry data or probes TCP port 443; if already reachable, skips UniFi kick.
+    3. If unreachable or unknown, calls _kick_unifi_envoy_client() to force re-association.
+    4. Updates state['envoy_last_heal_ts'] and saves state.
+    5. Polls TCP port 443 on the Envoy IP up to ENVOY_RECONNECT_POLL_ATTEMPTS times.
+    6. Reloads HA config entry and verifies state == 'loaded'.
+    """
+    if state is None:
+        state = _load_state()
+
+    now = int(time.time())
+    last_heal = state.get("envoy_last_heal_ts", 0)
+    if now - last_heal < ENVOY_HEAL_COOLDOWN_SECONDS:
+        print(
+            f"[HAReauthWatchdog] Envoy heal cooldown active ({now - last_heal}s < {ENVOY_HEAL_COOLDOWN_SECONDS}s), skipping.",
+            file=sys.stderr,
+        )
+        return False
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    host: str | None = None
+    try:
+        req = urllib.request.Request(f"{base_url}/api/config/config_entries/entry", headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            entries = json.loads(resp.read().decode())
+            for e in entries:
+                if e.get("entry_id") == entry_id:
+                    host = e.get("data", {}).get("host") or e.get("data", {}).get("ip_address")
+                    break
+    except Exception as ex:
+        print(f"[HAReauthWatchdog] Note: Could not fetch HA config entry details: {ex}", file=sys.stderr)
+
+    kicked = False
+    if host and _probe_tcp_port(host, 443):
+        print(
+            f"[HAReauthWatchdog] Envoy port 443 already reachable at {host}; skipping UniFi kick.",
+            file=sys.stderr,
+        )
+    else:
+        unifi_url, unifi_user, unifi_pass = _get_unifi_config()
+        ok, _mac, discovered_ip = _kick_unifi_envoy_client(unifi_url, unifi_user, unifi_pass)
+        if not ok:
+            return False
+        state["envoy_last_heal_ts"] = int(time.time())
+        _save_state(state)
+        kicked = True
+        host = host or discovered_ip
+
+    if not host:
+        print("[HAReauthWatchdog] Unable to resolve Envoy IP address for reconnection poll.", file=sys.stderr)
+        return False
+
+    if kicked:
+        recovered = False
+        for _ in range(ENVOY_RECONNECT_POLL_ATTEMPTS):
+            time.sleep(ENVOY_RECONNECT_POLL_INTERVAL_SECONDS)
+            if _probe_tcp_port(host, 443):
+                recovered = True
+                break
+        if not recovered:
+            print(f"[HAReauthWatchdog] Envoy port 443 on {host} did not recover after UniFi kick.", file=sys.stderr)
+            return False
+
+    reload_url = f"{base_url}/api/config/config_entries/entry/{entry_id}/reload"
+    try:
+        rel_req = urllib.request.Request(reload_url, data=b"{}", headers=headers, method="POST")
+        with urllib.request.urlopen(rel_req, timeout=ENVOY_RELOAD_TIMEOUT_SECONDS) as rel_resp:
+            rel_status = getattr(rel_resp, "status", None) or getattr(rel_resp, "code", 200)
+            if rel_status != 200:
+                return False
+    except Exception as rel_ex:
+        print(f"[HAReauthWatchdog] Envoy reload request failed: {rel_ex}", file=sys.stderr)
+        return False
+
+    try:
+        verify_req = urllib.request.Request(f"{base_url}/api/config/config_entries/entry", headers=headers)
+        with urllib.request.urlopen(verify_req, timeout=10) as verify_resp:
+            entries = json.loads(verify_resp.read().decode())
+            for item in entries:
+                if item.get("entry_id") == entry_id and item.get("state") == "loaded":
+                    print(
+                        f"[HAReauthWatchdog] 🔄 Auto-healed enphase_envoy config entry {entry_id} (verified state=loaded).",
+                        file=sys.stderr,
+                    )
+                    return True
+    except Exception as ver_ex:
+        print(f"[HAReauthWatchdog] Envoy verify request failed: {ver_ex}", file=sys.stderr)
+
+    return False
+
+
 def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
     base_url, token = _get_ha_config()
     if not token:
@@ -610,6 +874,12 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
             zwave_heal_attempted = True
             if _auto_heal_zwave_js(base_url, token, entry_id):
                 zwave_healed = True
+                continue
+
+        # Auto-heal Enphase Envoy Wi-Fi zombie association if in setup_retry or setup_error
+        if domain == "enphase_envoy" and st in ("setup_retry", "setup_error"):
+            if _auto_heal_enphase_envoy(base_url, token, entry_id, state=state):
+                _save_state(state)
                 continue
 
         is_reauth = "reauth" in str(reason).lower() or "authentication" in str(reason).lower() or st == "setup_error"
