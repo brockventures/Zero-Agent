@@ -117,6 +117,17 @@ func (dc DisplayConfig) GetLayoutOverridePath() string {
 	return trimmedOr(dc.LayoutOverridePath, DefaultLayoutOverridePath)
 }
 
+// LiveViewWidgets returns all configured widgets of type "live-view" in declaration order.
+func (dc DisplayConfig) LiveViewWidgets() []WidgetConfig {
+	var out []WidgetConfig
+	for _, w := range dc.Widgets {
+		if w.IsLiveView() {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 // DisplayVoiceConfig configures voice visuals on the display.
 type DisplayVoiceConfig struct {
 	Waveform *VoiceWaveformConfig `yaml:"waveform,omitempty"`
@@ -282,6 +293,19 @@ type GridConfig struct {
 	Rows    int `yaml:"rows,omitempty"`
 }
 
+// IsPortrait reports whether the grid uses the 3x6 portrait layout geometry.
+func (g GridConfig) IsPortrait() bool {
+	return g.Columns == 3 && g.Rows == 6
+}
+
+// CellCount returns the total number of discrete grid cells (columns * rows).
+func (g GridConfig) CellCount() int {
+	if g.Columns <= 0 || g.Rows <= 0 {
+		return 0
+	}
+	return g.Columns * g.Rows
+}
+
 func validateGridAndWidgetDimensions(grid GridConfig, widgetID string, dims []int) error {
 	if (grid.Columns != 6 || grid.Rows != 2) && (grid.Columns != 3 || grid.Rows != 6) {
 		return fmt.Errorf("grid dimensions must be 6x2 or 3x6 (got %dx%d)", grid.Columns, grid.Rows)
@@ -312,6 +336,31 @@ type WidgetConfig struct {
 	Token                  string            `yaml:"-"` // Resolved secret populated from TokenEnv
 	Secrets                map[string]string `yaml:"-"` // Resolved secrets populated from *_env keys in Config
 	Config                 map[string]any    `yaml:"config,omitempty"`
+}
+
+// IsLiveView reports whether this widget is a live-view camera/video tile.
+func (w WidgetConfig) IsLiveView() bool {
+	return strings.TrimSpace(w.Type) == "live-view"
+}
+
+// StreamType returns the normalized live-view stream type ("webrtc", "mjpeg", or "hls"),
+// inferring "mjpeg" for Hearth camera proxy endpoints when stream_type is omitted.
+func (w WidgetConfig) StreamType() string {
+	if w.Config != nil {
+		if raw, ok := w.Config["stream_type"].(string); ok {
+			switch norm := strings.ToLower(strings.TrimSpace(raw)); norm {
+			case "mjpeg", "hls", "webrtc":
+				return norm
+			}
+		}
+		if rawURL, ok := w.Config["stream_url"].(string); ok {
+			u := strings.ToLower(strings.TrimSpace(rawURL))
+			if strings.Contains(u, "/hearth-api/camera/") || strings.Contains(u, "mjpeg") || strings.Contains(u, "camera_proxy") {
+				return "mjpeg"
+			}
+		}
+	}
+	return "webrtc"
 }
 
 // ChatLogConfig tunes the in-memory conversation store behind the chat-log

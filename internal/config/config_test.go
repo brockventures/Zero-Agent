@@ -48,6 +48,12 @@ const (
 func TestLoad_ExampleConfig(t *testing.T) {
 	t.Parallel()
 	examplePath := filepath.Join("..", "..", "deploy", "examples", "config.yaml")
+	if _, err := os.Stat(examplePath); err != nil {
+		altPath := "/workspace/mirrormere/deploy/examples/config.yaml"
+		if _, altErr := os.Stat(altPath); altErr == nil {
+			examplePath = altPath
+		}
+	}
 
 	_, err := config.LoadWithEnv(examplePath, mockGetenv(nil))
 	if err == nil || !strings.Contains(err.Error(), "FAMILY_CALENDAR_URL") {
@@ -520,4 +526,54 @@ func TestDisplayUI(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLiveViewAndPortraitGridHelpers(t *testing.T) {
+	t.Parallel()
+	yamlStr := `timezone: America/Los_Angeles
+display:
+  grid:
+    columns: 3
+    rows: 6
+  widgets:
+    - id: hearth-family-grid
+      type: calendar-grid
+      dimensions: [3, 3]
+    - id: cam-doorbell
+      type: live-view
+      dimensions: [3, 2]
+      config:
+        title: Doorbell
+        stream_url: /hearth-api/camera/stream/doorbell
+        stream_type: mjpeg
+        fit: cover
+    - id: cam-front-yard
+      type: live-view
+      dimensions: [1, 2]
+      config:
+        title: Front Yard
+        stream_url: /hearth-api/camera/stream/front_yard_camera
+    - id: cam-rosie
+      type: live-view
+      dimensions: [1, 2]
+      config:
+        title: Rosie Cam
+        stream_url: https://stream.example.com/webrtc
+        stream_type: webrtc
+`
+	cfg, err := config.ParseWithEnv([]byte(yamlStr), nil)
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	assertEq(t, "portrait grid", cfg.Display.Grid.IsPortrait(), true)
+	assertEq(t, "portrait cells", cfg.Display.Grid.CellCount(), 18)
+	assertEq(t, "zero cells", (config.GridConfig{}).CellCount(), 0)
+	assertEq(t, "landscape portrait", (config.GridConfig{Columns: 6, Rows: 2}).IsPortrait(), false)
+
+	lv := cfg.Display.LiveViewWidgets()
+	assertEq(t, "live-view count", len(lv), 3)
+	assertEq(t, "doorbell stream type", lv[0].StreamType(), "mjpeg")
+	assertEq(t, "inferred camera proxy stream type", lv[1].StreamType(), "mjpeg")
+	assertEq(t, "explicit webrtc stream type", lv[2].StreamType(), "webrtc")
+	assertEq(t, "non live-view default stream type", cfg.Display.Widgets[0].StreamType(), "webrtc")
 }
