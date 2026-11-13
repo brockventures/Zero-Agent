@@ -6,7 +6,7 @@
     "max_parallel_workers": 4,
     "persistent_daemons_enabled": true,
     "morning_discussion_max_rounds": 3,
-    "turn_step_idle_seconds": 150.0,
+    "turn_step_idle_seconds": 240.0,
     "agent_done_cutoff_seconds": 15.0,
     "turn_watchdog_seconds": 300.0,
     "turn_max_ceiling_seconds": 0.0,
