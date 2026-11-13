@@ -2992,5 +2992,24 @@ if __name__ == "__main__":
         ok, msg = flash_slzb_stable()
         print(f"[{'OK' if ok else 'FAILED'}] {msg}")
         sys.exit(0 if ok else 1)
+    elif action in ("dsm_update", "dsm_update_monitor", "dsm"):
+        def _invoke_dsm_update_monitor() -> str:
+            res = subprocess.run(
+                ["python3", "/workspace/tools/dsm_update_monitor.py", "--check", "--ensure-adb"],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode != 0:
+                err_txt = (res.stderr or res.stdout or "dsm_update_monitor failed").strip()
+                raise RuntimeError(err_txt)
+            return (res.stdout or "").strip()
+
+        ok, rep, _ = run_sidecar_job(
+            "dsm_update_monitor",
+            "Synology DSM Update Monitor & Host 2 ADB Check",
+            _invoke_dsm_update_monitor,
+        )
+        if rep:
+            print(rep)
     else:
         print(f"Unknown action: {action}")

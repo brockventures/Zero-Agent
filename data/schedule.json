@@ -967,5 +967,18 @@
     "catchup_window_seconds": 14400,
     "channel_id": 1542081375287640084,
     "prompt": "Remind Ryan in #zero-chat that he asked for a reminder when home to install the Gotchi BLE Forwarder APK over Wireless ADB (Settings -> System -> Developer options -> Wireless debugging -> Pair device with pairing code, then share the IP:port and 6-digit code)."
+  },
+  {
+    "id": "dsm_update_monitor",
+    "name": "Synology DSM Update & Host 2 ADB Monitor",
+    "enabled": true,
+    "schedule_type": "weekly",
+    "day_of_week": 2,
+    "hour_pt": 9,
+    "minute_pt": 0,
+    "channel_id": 1542081375287640084,
+    "prompt": "Run the weekly Synology DSM update & Host 2 Pixel ADB monitor using /workspace/tools/sidecars.py dsm_update. Remediates 1.task hotfix drift automatically and stages an Approve/Dismiss Decision Card in #zero-chat when a DSM update is available.",
+    "catchup_if_missed": true,
+    "catchup_window_seconds": 14400
   }
 ]
