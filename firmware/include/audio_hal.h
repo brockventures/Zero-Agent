@@ -110,6 +110,15 @@ bool playBase64AdpcmChunk(const char* b64_data, size_t b64_len, uint32_t sample_
 // Validate whether `kind` is an allowed UI chime name ("ready", "ptt_start", "ptt_stop", "snap", "thinking", "error", "")
 bool isValidChimeKind(const char* kind);
 
+// Default UI chime playback volume percentage (35% of 24,000 LSB ceiling)
+constexpr uint8_t DEFAULT_CHIME_VOLUME_PCT = 35;
+constexpr uint8_t MAX_CHIME_VOLUME_PCT     = 100;
+constexpr float   CHIME_PEAK_CEILING_LSB   = 24000.0f;
+
+// Set / get UI chime playback volume percentage (0..100%, defaults to 35% of 24,000 LSB ceiling)
+void setChimeVolumePct(uint8_t pct);
+uint8_t getChimeVolumePct();
+
 // Play 1C-2A-2 (Warm Studio Fade) tactile reed chime or 35mm SLR shutter ("ptt_start", "ptt_stop", "snap", "thinking", "ready", "error")
 void playChime(const char* kind);
 

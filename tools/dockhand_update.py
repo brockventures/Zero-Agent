@@ -17,13 +17,48 @@ except ImportError:
 
 HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
-SSH_82 = ["ssh", "-i", SSH_KEY, "-p", SSH_PORT, "-o", "BatchMode=yes", f"{SSH_USER}@{HOST_1_IP}"]
-SSH_84 = ["ssh", "-i", SSH_KEY, "-p", SSH_PORT, "-o", "BatchMode=yes", f"{SSH_USER}@{HOST_2_IP}"]
+DEFAULT_SSH_CMD_TIMEOUT = 30
+BACKUP_SSH_CMD_TIMEOUT = 60
+UPGRADE_SSH_CMD_TIMEOUT = 120
+
+SSH_82 = [
+    "ssh",
+    "-i",
+    SSH_KEY,
+    "-p",
+    SSH_PORT,
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    f"{SSH_USER}@{HOST_1_IP}",
+]
+SSH_84 = [
+    "ssh",
+    "-i",
+    SSH_KEY,
+    "-p",
+    SSH_PORT,
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    f"{SSH_USER}@{HOST_2_IP}",
+]
 
 
-def get_remote_out(ssh_base: list, cmd_str: str) -> str:
+def get_remote_out(ssh_base: list, cmd_str: str, timeout: int = DEFAULT_SSH_CMD_TIMEOUT) -> str:
+    effective_timeout = timeout if (timeout is not None and timeout > 0) else DEFAULT_SSH_CMD_TIMEOUT
     try:
-        return subprocess.check_output(ssh_base + [cmd_str], stderr=subprocess.DEVNULL).decode().strip()
+        return (
+            subprocess.check_output(
+                ssh_base + [cmd_str],
+                stderr=subprocess.DEVNULL,
+                timeout=effective_timeout,
+            )
+            .decode()
+            .strip()
+        )
     except Exception:
         return ""
 
@@ -119,6 +154,7 @@ def perform_upgrade():
     get_remote_out(
         SSH_82,
         f"mkdir -p '{backup_dir}/dockhand' && sqlite3 '{appdata_dir}/dockhand/db/dockhand.db' \".backup '{bak_82}'\"",
+        timeout=BACKUP_SSH_CMD_TIMEOUT,
     )
     bak_sz_82 = get_remote_out(SSH_82, f"ls -lh '{bak_82}' 2>/dev/null | awk '{{print $5}}'")
     if bak_sz_82:
@@ -127,11 +163,19 @@ def perform_upgrade():
         print("   ⚠️ Backup file verification failed, proceeding with caution...")
 
     print("   • Pulling new image & recreating container...")
-    get_remote_out(SSH_82, f"cd '{appdata_dir}' && docker compose pull dockhand && docker compose up -d dockhand")
+    get_remote_out(
+        SSH_82,
+        f"cd '{appdata_dir}' && docker compose pull dockhand && docker compose up -d dockhand",
+        timeout=UPGRADE_SSH_CMD_TIMEOUT,
+    )
     status_82 = ""
     for _ in range(10):
         time.sleep(2)
-        status_82 = get_remote_out(SSH_82, "curl -s -o /dev/null -w '%{http_code}' http://localhost:3866/ || true")
+        status_82 = get_remote_out(
+            SSH_82,
+            "curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://localhost:3866/ || true",
+            timeout=15,
+        )
         if status_82 in ("200", "302"):
             break
     print(f"   • Host1 Status: HTTP {status_82} OK")
@@ -144,6 +188,7 @@ def perform_upgrade():
     get_remote_out(
         SSH_84,
         f"mkdir -p '{support_dir}/backups' && sqlite3 '{support_dir}/db/dockhand.db' \".backup '{bak_84}'\"",
+        timeout=BACKUP_SSH_CMD_TIMEOUT,
     )
     bak_sz_84 = get_remote_out(SSH_84, f"ls -lh '{bak_84}' 2>/dev/null | awk '{{print $5}}'")
     if bak_sz_84:
@@ -153,12 +198,18 @@ def perform_upgrade():
 
     print("   • Pulling new image & recreating container...")
     get_remote_out(
-        SSH_84, f"cd '{support_compose_dir}' && docker compose pull dockhand && docker compose up -d dockhand"
+        SSH_84,
+        f"cd '{support_compose_dir}' && docker compose pull dockhand && docker compose up -d dockhand",
+        timeout=UPGRADE_SSH_CMD_TIMEOUT,
     )
     status_84 = ""
     for _ in range(10):
         time.sleep(2)
-        status_84 = get_remote_out(SSH_84, "curl -s -o /dev/null -w '%{http_code}' http://localhost:3866/ || true")
+        status_84 = get_remote_out(
+            SSH_84,
+            "curl -s --max-time 5 -o /dev/null -w '%{http_code}' http://localhost:3866/ || true",
+            timeout=15,
+        )
         if status_84 in ("200", "302"):
             break
     print(f"   • Host2 Status: HTTP {status_84} OK")

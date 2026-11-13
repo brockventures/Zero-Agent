@@ -274,6 +274,7 @@ class GotchiPhoneEngine(
     val config = Config()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val httpClient = OkHttpClient.Builder()
+        .dns(FallbackDns())
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(90, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -1379,19 +1380,17 @@ object GotchiChimeSynthesizer {
         when (kind) {
             "ptt_start" -> {
                 // 1C-2A-2 (Warm Studio Fade) PTT Start (~248ms):
-                // Latch click -> F5 (698.5 Hz) -> G5 (784.0 Hz) -> C6 (1046.5 Hz) -> latch click
+                // Single crisp tactile latch click -> F5 (698.5 Hz) -> G5 (784.0 Hz) -> C6 (1046.5 Hz)
                 addSwitchClick(mixBuf, MAX_CHIME_SAMPLES, 0.000f, 6.5f, 2200.0f, 850.0f, 0.92f, 0.45f)
                 addReedNoteSmooth(mixBuf, MAX_CHIME_SAMPLES, 0.008f, 698.5f, 78.0f, 0.65f, 6.0f, 2200.0f, 8.0f, 6.0f, 0.36f, 22.0f, 5.2f, 0.0045f)
                 addReedNoteSmooth(mixBuf, MAX_CHIME_SAMPLES, 0.076f, 784.0f, 80.0f, 0.68f, 6.0f, 2400.0f, 8.0f, 6.0f, 0.36f, 24.0f, 5.2f, 0.005f)
                 addReedNoteSmooth(mixBuf, MAX_CHIME_SAMPLES, 0.145f, 1046.5f, 96.0f, 0.68f, 6.5f, 2800.0f, 8.0f, 6.0f, 0.36f, 26.0f, 5.2f, 0.0055f)
-                addSwitchClick(mixBuf, MAX_CHIME_SAMPLES, 0.235f, 6.5f, 2600.0f, 950.0f, 0.85f, 0.45f)
                 totalSamples = (0.248f * CHIME_SR).toInt()
             }
             "ptt_stop" -> {
-                // 1C-2A-2 PTT Stop (~272ms): Descending C6 -> F5 -> release click
+                // 1C-2A-2 PTT Stop (~272ms): Descending C6 -> F5
                 addReedNoteSmooth(mixBuf, MAX_CHIME_SAMPLES, 0.000f, 1046.5f, 108.0f, 0.68f, 7.5f, 2600.0f, 10.0f, 6.0f, 0.36f, 26.0f, 5.2f, 0.005f)
                 addReedNoteSmooth(mixBuf, MAX_CHIME_SAMPLES, 0.092f, 698.5f, 165.0f, 0.68f, 6.5f, 1800.0f, 8.0f, 6.0f, 0.36f, 48.0f, 5.2f, 0.006f)
-                addSwitchClick(mixBuf, MAX_CHIME_SAMPLES, 0.258f, 6.0f, 1550.0f, 700.0f, 0.80f, 0.45f)
                 totalSamples = (0.272f * CHIME_SR).toInt()
             }
             "snap" -> {
@@ -1405,10 +1404,9 @@ object GotchiChimeSynthesizer {
                 totalSamples = (0.160f * CHIME_SR).toInt()
             }
             "thinking" -> {
-                // 1C-2A Thinking / Tool Pulse (~385ms): Two relay latches into warm G5 -> B5 interval
+                // 1C-2A Thinking / Tool Pulse (~385ms): Single relay latch into warm G5 -> B5 interval
                 addSwitchClick(mixBuf, MAX_CHIME_SAMPLES, 0.000f, 6.5f, 2200.0f, 820.0f, 0.88f, 0.45f)
                 addReedNoteSmooth(mixBuf, MAX_CHIME_SAMPLES, 0.035f, 784.0f, 140.0f, 0.54f, 5.0f, 2400.0f, 6.0f, 6.0f, 0.36f, 35.0f, 5.2f, 0.0048f)
-                addSwitchClick(mixBuf, MAX_CHIME_SAMPLES, 0.165f, 6.5f, 2600.0f, 920.0f, 0.88f, 0.45f)
                 addReedNoteSmooth(mixBuf, MAX_CHIME_SAMPLES, 0.200f, 987.8f, 180.0f, 0.56f, 5.0f, 2750.0f, 6.0f, 6.0f, 0.36f, 55.0f, 5.2f, 0.006f)
                 totalSamples = (0.390f * CHIME_SR).toInt()
             }

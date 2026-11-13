@@ -4221,5 +4221,90 @@ def test_fast_staged_verify_cmd_symlinks_worktree_node_modules(tmp_path):
     assert st.stdout.strip() == ""
 
 
+def test_detect_skill_and_rule_drift_ignores_unrelated_same_line_prose_examples(tmp_path):
+    """Verify unrelated prose examples on the same line as tools/forge.py do not trigger false drift alerts, while real removed symbols/flags do."""
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    (tools_dir / "forge.py").write_text(
+        'def validate_forge_plan(plan):\n    return "--staged --post"\n',
+        encoding="utf-8",
+    )
+    (tools_dir / "batch_guard.py").write_text(
+        "def check_interactive_investigation_gate():\n    return True\n",
+        encoding="utf-8",
+    )
+
+    rules_dir = tmp_path / ".agents" / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    (rules_dir / "discord_formatting.md").write_text(
+        "# Discord Formatting\n"
+        "- **NEVER** cite Python file names (`build_public_standings_page.py`, `team_roster_allocator.py`, `tools/forge.py`), "
+        "function/method names (`validate_forge_plan()`, `buildSplitStartingNine()`), or selectors (`#drawer-bench-body`).\n"
+        "- Reserve inline backticks for file paths (`/workspace/tools/forge.py`), shell commands (`pytest`), or CLI flags (`--unrelated-flag`).\n"
+        "- Avoid citing internal files like `tools/forge.py` or frontend helpers like `buildSplitStartingNine()` in chat.\n"
+        "- Merge via `gh pr merge --squash --delete-branch` or run `python3 /workspace/tools/forge.py`.\n"
+        "- Prevent `tools/forge.py` subprocesses from hanging on `proc.wait()`.\n",
+        encoding="utf-8",
+    )
+    (rules_dir / "crab_cavern_coordination.md").write_text(
+        "# Crab Cavern\n"
+        "```bash\n"
+        "python3 /workspace/tools/forge.py propose --post\n"
+        "```\n"
+        "- Reply confirming the card was staged for approval with a single tap (without leaking private paths).\n",
+        encoding="utf-8",
+    )
+    (rules_dir / "tool_roundtrip_minimization.md").write_text(
+        "# Tool Roundtrips (`batch_guard.py`)\n"
+        "- **Interactive Investigation Gate (`check_interactive_investigation_gate()`):** Hand off long probes via `python3 /workspace/tools/forge.py job start`.\n",
+        encoding="utf-8",
+    )
+
+    assert forge_mod.detect_skill_and_rule_drift(tmp_path, ["tools/forge.py"]) == []
+
+    skills_dir = tmp_path / ".agents" / "skills" / "forge-orchestrator"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    (skills_dir / "SKILL.md").write_text(
+        "# FORGE Orchestrator\n"
+        "- `forge.py` invokes `removed_helper_fn()` during preflight and passes `--stale-flag`.\n"
+        "- Explicit target `tools/forge.py:removed_explicit_sym`.\n",
+        encoding="utf-8",
+    )
+
+    warnings = forge_mod.detect_skill_and_rule_drift(tmp_path, ["tools/forge.py"])
+    assert any("--stale-flag" in w for w in warnings)
+    assert any("removed_helper_fn" in w for w in warnings)
+    assert any("removed_explicit_sym" in w for w in warnings)
+    assert not any("buildSplitStartingNine" in w for w in warnings)
+
+
+def test_live_workspace_forge_skill_and_rule_drift_zero_false_positives():
+    """Verify detect_skill_and_rule_drift reports zero warnings on tools/forge.py against live workspace skills and rules."""
+    repo_root = Path(__file__).resolve().parent.parent
+    warnings = forge_mod.detect_skill_and_rule_drift(repo_root, ["tools/forge.py"])
+    assert warnings == []
+
+
+def test_all_forge_subprocess_run_calls_specify_timeout():
+    """Verify every synchronous subprocess call in tools/forge.py includes an explicit timeout keyword argument."""
+    import ast
+
+    forge_path = Path(__file__).resolve().parent / "forge.py"
+    tree = ast.parse(forge_path.read_text(encoding="utf-8"), filename=str(forge_path))
+    missing = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess"
+                and node.func.attr in ("run", "call", "check_call", "check_output")
+            ):
+                kw_names = {kw.arg for kw in node.keywords if kw.arg}
+                if "timeout" not in kw_names:
+                    missing.append(f"L{node.lineno}: subprocess.{node.func.attr}")
+    assert missing == [], f"Unguarded subprocess calls without timeout=: {missing}"
+
+
 if __name__ == "__main__":
     unittest.main()

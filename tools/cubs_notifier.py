@@ -10,6 +10,7 @@ State is tracked in /workspace/data/cubs_notifier_state.json to prevent duplicat
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -20,6 +21,7 @@ from zoneinfo import ZoneInfo
 PT_TZ = ZoneInfo("America/Los_Angeles")
 CUBS_TEAM_ID = 112
 STATE_FILE = Path("/workspace/data/cubs_notifier_state.json")
+CAST_SUBPROCESS_TIMEOUT = 60
 
 
 def load_state() -> dict:
@@ -216,10 +218,13 @@ def main():
     args = parser.parse_args()
 
     if args.cast:
-        import subprocess
         cmd = [sys.executable, "/workspace/tools/mlb_stream_extractor.py", "--team", "cubs", "--cast"]
-        res = subprocess.run(cmd)
-        sys.exit(res.returncode)
+        try:
+            res = subprocess.run(cmd, timeout=CAST_SUBPROCESS_TIMEOUT)
+            sys.exit(res.returncode)
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f"Error: Cubs cast subprocess timed out after {CAST_SUBPROCESS_TIMEOUT}s.\n")
+            sys.exit(124)
 
     ok, rep, meta = check_cubs_game(force=args.force, test=args.test)
     if rep:

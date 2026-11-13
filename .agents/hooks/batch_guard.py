@@ -42,10 +42,22 @@ MAX_INLINE_RUN_COMMANDS_AFTER_90S = 15
 TURN_RESET_IDLE_SECONDS = 45.0
 TURN_STATE_EXPIRY_SECONDS = 900.0
 
-INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S = 3
-INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT = 5
-INTERACTIVE_DIAG_TIME_WINDOW_SECONDS = 30.0
+INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S = 6
+INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT = 8
+INTERACTIVE_DIAG_TIME_WINDOW_SECONDS = 75.0
 FORGE_CHANNEL_ID_STR = "1562899941595160657"
+ZERO_CHAT_CHANNEL_ID_STR = "1542081375287640084"
+CRAB_CAVERN_CHANNEL_IDS = {
+    1534436119888793750,  # #the-banana-stand
+    1534452820995080192,  # #lounge
+    1549555629222404096,  # #debug-huddle
+    1551465050072416286,  # #side-project
+    1552732003076669460,  # #mirrormere
+    1558202642663211169,  # #agora
+    1561509863018856468,  # #gotchi
+    1562246590943461429,  # #gotchi-chat
+    1562544598423965856,  # #r-residentagents
+}
 
 _VERSIONED_SCRATCH_SWEEP_RE = re.compile(
     r"(?:^|/)(?:scratch|brain/[^/]+/scratch|tmp)/(?:(?P<stem>[a-zA-Z0-9_-]*?(?:sim|sweep|grid|solve|tune|calib|opt)[a-zA-Z0-9_-]*?)_v\d+|v\d+)\.py$",
@@ -360,6 +372,87 @@ def _get_in_flight_channel_id(in_flight_file: str = IN_FLIGHT_TURN_FILE, agy_pid
     return None
 
 
+def _resolve_repo_root() -> str:
+    """Resolve repository root whether imported from `tools/` or `.agents/hooks/`."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(here)
+    if os.path.basename(here) == "hooks" and os.path.basename(parent) == ".agents":
+        return os.path.dirname(parent)
+    return parent
+
+
+def is_crab_cavern_channel(channel_id: int | str | None) -> bool:
+    """Return True if channel_id belongs to Crab Cavern or an external shared channel."""
+    if channel_id is None:
+        return False
+    try:
+        cid = int(str(channel_id).strip())
+    except (ValueError, TypeError):
+        return False
+    if cid in CRAB_CAVERN_CHANNEL_IDS:
+        return True
+    try:
+        _repo_root = _resolve_repo_root()
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
+        from tools.bridge_state import CRAB_CAVERN_CHANNEL_IDS as _BS_CC_IDS
+        return cid in _BS_CC_IDS
+    except Exception:
+        return False
+
+
+def check_crab_cavern_airgap_guard(
+    name: str,
+    args: dict,
+    cwd: str = "/workspace",
+    in_flight_file: str = IN_FLIGHT_TURN_FILE,
+    agy_pid: int | None = None,
+) -> tuple[bool, str]:
+    """Block private homelab NAS / SSH / secrets access during Crab Cavern turns and instruct staging a #zero-chat Decision Card."""
+    if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
+        return True, ""
+    norm_cwd = _norm_posix(cwd or "/workspace", "/")
+    if norm_cwd.startswith("/tmp/forge-wt-"):
+        return True, ""
+
+    channel_id = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
+    if not channel_id and in_flight_file and os.path.exists(in_flight_file):
+        in_flight_ch = _get_in_flight_channel_id(in_flight_file, agy_pid=agy_pid)
+        if in_flight_ch is not None:
+            channel_id = str(in_flight_ch).strip()
+
+    if not is_crab_cavern_channel(channel_id):
+        return True, ""
+
+    escalation_msg = (
+        "Crab Cavern Air-Gap Sandbox Guard Triggered: Direct homelab NAS, SSH, Home Assistant, or `/secrets/` access is blocked in shared Crab Cavern channels. "
+        "NEVER ask Ryan to re-prompt in `#zero-chat`. Instead, immediately stage a 1-click Decision Card to `#zero-chat` (`1542081375287640084`) on the spot via:\n"
+        "python3 /workspace/tools/forge.py propose --channel 1542081375287640084 --category \"homelab_action\" --title \"<Action Title>\" "
+        "--summary \"<Action Summary>\" --handler \"<handler_type>\" --payload '<json_payload>' --post"
+    )
+
+    if name in ("view_file", "read_file", "edit_file", "replace_file_content", "write_file", "write_to_file"):
+        target_p = _norm_posix(str(args.get("AbsolutePath") or args.get("TargetFile") or args.get("Path") or ""), cwd)
+        if target_p.startswith(("/secrets/", "/workspace/memory/private/", "/workspace/memory/vault/")):
+            return False, escalation_msg
+        return True, ""
+
+    if name == "run_command":
+        cmd = str(args.get("CommandLine") or "").strip()
+        if not cmd:
+            return True, ""
+        # Allow staging the Decision Card itself via forge.py propose / stage-decision
+        if re.search(r"\bforge\.py\s+(?:propose|stage-decision)\b", cmd):
+            return True, ""
+        if re.search(
+            r"\b(?:ssh|scp|sftp)\b|\brun_ssh\s*\(|\bnas_config\.run_ssh\b|/secrets/|/workspace/memory/private/|/workspace/memory/vault/|home-assistant_v2\.db\b",
+            cmd,
+        ):
+            return False, escalation_msg
+
+    return True, ""
+
+
 def is_exempt_from_investigation_gate(name: str, args: dict, cwd: str = "/workspace") -> bool:
     """Return True if tool invocation is exempt from interactive investigation step limits."""
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
@@ -378,6 +471,15 @@ def is_exempt_from_investigation_gate(name: str, args: dict, cwd: str = "/worksp
             "modal_harness.py",
             "outbox.py",
             "gif_tool.py",
+            "channel_history.py",
+            "transcript_index.py",
+            "mealie_tool.py",
+            "deliver_image.py",
+            "banana.py",
+            "send_mail.py",
+            "ha_shopping_list.py",
+            "whole_foods_afx.py",
+            "grocery_manager.py",
             "git ",
             "gh ",
             "pytest",
@@ -448,7 +550,7 @@ def check_interactive_investigation_gate(
         save_state(state, state_file)
         reason = (
             f"Interactive Investigation Gate Triggered: Detected {current_steps} diagnostic tool steps "
-            f"over {elapsed:.1f}s (ceiling: 3 steps after 30.0s, max 5 steps). "
+            f"over {elapsed:.1f}s (ceiling: {INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S} steps after {INTERACTIVE_DIAG_TIME_WINDOW_SECONDS:.1f}s, max {INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT} steps). "
             "Open-ended investigations in interactive Discord turns must wrap up initial verified findings immediately. "
             "**Code/Feature/Bugfix Builds:** MUST immediately write a ForgePlan JSON and call `python3 /workspace/tools/forge.py enqueue <plan.json>` — "
             "NEVER call `forge.py job start` for code/asset changes, as `job start` locks the turn without staging a FORGE build or Decision Card. "
@@ -634,7 +736,11 @@ def check_file_deletion_gate(cmd: str, cwd: str = "/workspace") -> tuple[bool, s
         return True, ""
 
     # 1. Block direct SQL/shell tampering with decision_cards / forge_decisions approval status
-    if ("decision_cards" in cmd or "forge_decisions" in cmd) and re.search(r"\b(?:UPDATE|INSERT|REPLACE)\b", cmd, re.IGNORECASE):
+    if re.search(
+        r"\b(?:UPDATE\s+(?:OR\s+\w+\s+)?(?:decision_cards|forge_decisions)\b|(?:INSERT|REPLACE)\s+(?:OR\s+\w+\s+)?INTO\s+(?:decision_cards|forge_decisions)\b)",
+        cmd,
+        re.IGNORECASE,
+    ):
         return False, (
             "Decision Card Tamper Blocked: Modifying 'decision_cards' or 'forge_decisions' approval status directly via SQL or shell is prohibited. "
             "Only Ryan can approve a Decision Card via the interactive Discord button."
@@ -1208,7 +1314,7 @@ def check_forge_post_offload_lock(
     if is_prior_job_start:
         if name == "run_command" and (
             re.search(r"\bforge\.py\s+enqueue\b", cmd)
-            or (re.search(r"\bforge\.py\s+stage-decision\b", cmd) and "forge_enqueue" in cmd)
+            or (re.search(r"\bforge\.py\s+(?:stage-decision|propose)\b", cmd) and "forge_enqueue" in cmd)
         ):
             return True, ""
         if name in ("write_file", "write_to_file", "edit_file", "replace_file_content"):
@@ -1235,6 +1341,246 @@ def is_heavy_inline_benchmark_or_migration(cmd: str, cwd: str = "/workspace") ->
     if "forge.py" in cmd or "detached_runner.py" in cmd or "modal_harness.py" in cmd:
         return False
     return bool(_HEAVY_CLI_BENCHMARK_OR_MIGRATE_RE.search(cmd))
+
+
+_FORGE_JOB_START_RE = re.compile(
+    r"\b(?:(?:forge\.py|tools\.forge)(?:\s+--[a-zA-Z0-9_-]+(?:=[^\s;|&]+|\s+[^\s;|&-]+)?)*\s+job\s+start|detached_runner\.py\s+start)\b"
+)
+_JOB_START_OTHER_VALUE_FLAGS = {"--name", "-n", "--channel", "--cwd", "--timeout", "-t"}
+_JOB_START_HELP_FLAGS = {"--help", "-h"}
+
+
+def _tokenize_job_start_args(tail: str) -> list[tuple[str, bool]]:
+    """Tokenize shell arguments following `forge.py job start` up to the first unquoted command separator."""
+    tokens: list[tuple[str, bool]] = []
+    cur: list[str] = []
+    in_token = False
+    was_quoted = False
+    quote: str | None = None
+    i = 0
+    n = len(tail)
+
+    while i < n:
+        ch = tail[i]
+        if quote is None:
+            if ch == "\\":
+                if i + 1 < n:
+                    nxt = tail[i + 1]
+                    if nxt == "\n":
+                        i += 2
+                        continue
+                    cur.append(nxt)
+                    in_token = True
+                    i += 2
+                    continue
+                cur.append(ch)
+                in_token = True
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                if cur == ["$"] and not was_quoted:
+                    cur.clear()
+                quote = ch
+                in_token = True
+                was_quoted = True
+                i += 1
+                continue
+            if ch in ("\n", ";"):
+                break
+            if ch == "|":
+                prev_ch = tail[i - 1] if i > 0 else ""
+                if prev_ch != ">":
+                    break
+            if ch == "&":
+                prev_ch = tail[i - 1] if i > 0 else ""
+                next_ch = tail[i + 1] if i + 1 < n else ""
+                if prev_ch != ">" and next_ch != ">":
+                    break
+            if ch.isspace():
+                if in_token:
+                    tokens.append(("".join(cur), was_quoted))
+                    cur = []
+                    in_token = False
+                    was_quoted = False
+                i += 1
+                continue
+            cur.append(ch)
+            in_token = True
+            i += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+            else:
+                cur.append(ch)
+            i += 1
+        elif quote == '"':
+            if ch == "\\" and i + 1 < n and tail[i + 1] in ('"', "\\", "$", "`", "\n"):
+                if tail[i + 1] != "\n":
+                    cur.append(tail[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            else:
+                cur.append(ch)
+            i += 1
+
+    if in_token:
+        tokens.append(("".join(cur), was_quoted))
+    return tokens
+
+
+def has_forge_job_start_command(cmd: str) -> bool:
+    """Return True only when a `forge.py job start` / `detached_runner.py start` invocation
+    includes a non-empty `--command` or `-c` argument (and is not `--help` / `-h`).
+    """
+    if not cmd:
+        return False
+    for m in _FORGE_JOB_START_RE.finditer(cmd):
+        tokens = _tokenize_job_start_args(cmd[m.end() :])
+        if not tokens:
+            continue
+        has_cmd = False
+        has_help = False
+        i = 0
+        while i < len(tokens):
+            tok, tok_quoted = tokens[i]
+            if not tok_quoted and tok in _JOB_START_HELP_FLAGS:
+                has_help = True
+                break
+            if not tok_quoted and tok in ("--command", "-c"):
+                if i + 1 < len(tokens):
+                    nxt_val, nxt_quoted = tokens[i + 1]
+                    if not (
+                        not nxt_quoted
+                        and (
+                            nxt_val in _JOB_START_OTHER_VALUE_FLAGS
+                            or nxt_val in _JOB_START_HELP_FLAGS
+                            or nxt_val.startswith("-")
+                        )
+                    ) and bool(nxt_val.strip()):
+                        has_cmd = True
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if tok.startswith("--command="):
+                if bool(tok[len("--command=") :].strip()):
+                    has_cmd = True
+                i += 1
+                continue
+            if tok.startswith("-c="):
+                if bool(tok[len("-c=") :].strip()):
+                    has_cmd = True
+                i += 1
+                continue
+            if not tok_quoted and tok in _JOB_START_OTHER_VALUE_FLAGS:
+                if i + 1 < len(tokens):
+                    nxt_val, nxt_quoted = tokens[i + 1]
+                    if not nxt_quoted and (
+                        nxt_val in ("--command", "-c")
+                        or nxt_val in _JOB_START_OTHER_VALUE_FLAGS
+                        or nxt_val in _JOB_START_HELP_FLAGS
+                    ):
+                        has_cmd = False
+                        break
+                    i += 2
+                    continue
+                i += 1
+                continue
+            i += 1
+        if has_cmd and not has_help:
+            return True
+    return False
+
+
+def _record_forge_offload_if_applicable(cmd: str, cwd: str, state: dict) -> None:
+    """Record post-offload turn lock state only for validated FORGE enqueue/decision/job-start commands."""
+    is_forge_enqueue = bool(re.search(r"\bforge\.py\s+enqueue\b", cmd))
+    is_forge_stage_decision = bool(
+        re.search(r"\bforge\.py\s+(?:stage-decision|propose)\b", cmd) and "forge_enqueue" in cmd
+    )
+    is_forge_job_start = has_forge_job_start_command(cmd)
+    is_no_synthesize_probe = bool(is_forge_job_start and "--no-synthesize" in cmd)
+
+    if is_forge_enqueue:
+        plan_ok = False
+        m_enq = re.search(r"\bforge\.py\s+enqueue\b", cmd)
+        cmd_before = cmd[: m_enq.start()] if m_enq else ""
+        has_preceding_shell_gen = bool(
+            re.search(
+                r"(?:<<|>>?|\b(?:cat|echo|printf|tee|python3?|cp|mv)\b)[^;&|\n]*[;&|\n]",
+                cmd_before,
+                re.DOTALL,
+            )
+        )
+        if not has_preceding_shell_gen:
+            m_plan = re.search(
+                r"\bforge\.py\s+enqueue\s+(?:--[a-zA-Z0-9_-]+(?:\s+[^\s;\"'|&>]+)?\s+)*(?:\"([^\"]+)\"|'([^']+)'|([^\s;\"'|&>]+))",
+                cmd,
+            )
+            if m_plan:
+                raw_pf = m_plan.group(1) or m_plan.group(2) or m_plan.group(3) or ""
+                if raw_pf and not raw_pf.startswith("-"):
+                    abs_pf = os.path.abspath(os.path.join(cwd or "/workspace", raw_pf))
+                    if os.path.isfile(abs_pf):
+                        try:
+                            with open(abs_pf, "r", encoding="utf-8") as pf:
+                                pdata = json.load(pf)
+                            if isinstance(pdata, dict):
+                                val_fn = None
+                                try:
+                                    _repo_root = _resolve_repo_root()
+                                    if _repo_root not in sys.path:
+                                        sys.path.insert(0, _repo_root)
+                                    elif sys.path[0] != _repo_root:
+                                        sys.path.remove(_repo_root)
+                                        sys.path.insert(0, _repo_root)
+                                    from tools.forge import _normalize_forge_plan_in_place, validate_forge_plan
+                                    _normalize_forge_plan_in_place(pdata, from_enqueue=True)
+                                    val_fn = validate_forge_plan
+                                except Exception:
+                                    try:
+                                        from tools.forge import _normalize_forge_plan_in_place, validate_forge_plan
+                                        _normalize_forge_plan_in_place(pdata, from_enqueue=True)
+                                        val_fn = validate_forge_plan
+                                    except Exception:
+                                        val_fn = None
+
+                                if callable(val_fn):
+                                    is_valid, _ = val_fn(pdata)
+                                    plan_ok = bool(is_valid)
+                                else:
+                                    if not pdata.get("title") or not pdata.get("chunks"):
+                                        plan_ok = False
+                                    elif not (
+                                        pdata.get("origin_channel_id")
+                                        or pdata.get("channel_id")
+                                    ):
+                                        plan_ok = False
+                                    elif not (
+                                        pdata.get("context_fact_sheet")
+                                        or pdata.get("shared_context")
+                                        or pdata.get("facts")
+                                        or pdata.get("objective")
+                                        or pdata.get("chunks")
+                                    ):
+                                        plan_ok = False
+                                    else:
+                                        plan_ok = True
+                        except Exception:
+                            plan_ok = False
+        if plan_ok:
+            state["inline_prod_files"] = []
+            state["offload_dispatched"] = True
+            state["offload_kind"] = "FORGE multi-chunk build (forge.py enqueue)"
+    elif is_forge_stage_decision:
+        state["inline_prod_files"] = []
+        state["offload_dispatched"] = True
+        state["offload_kind"] = "FORGE Two-Stage Decision Card (forge.py stage-decision --handler forge_enqueue)"
+    elif is_forge_job_start and not is_no_synthesize_probe:
+        state["offload_dispatched"] = True
+        state["offload_kind"] = "FORGE background job (forge.py job start)"
 
 
 def check_tool_use(
@@ -1309,6 +1655,18 @@ def check_tool_use(
             "Stop calling tools silently and let the background task completion notification wake you automatically."
         )
 
+    # 0a. Crab Cavern Air-Gap / SSH Sandbox Guard -> Auto-redirect to 1-click #zero-chat Decision Card
+    ok_cc, cc_reason = check_crab_cavern_airgap_guard(
+        name=name,
+        args=args,
+        cwd=cwd,
+        in_flight_file=in_flight_file,
+        agy_pid=agy_pid,
+    )
+    if not ok_cc:
+        save_state(state, state_file)
+        return False, cc_reason
+
     # 0b. Post-Offload Turn Lock: Once a FORGE build (`forge.py enqueue`) or detached background job (`forge.py job start`)
     # is dispatched in an interactive turn, block all subsequent mutating/execution tool calls so the agent cannot
     # loop or abuse `forge.py job start` as an inline `run_command` counter reset (while still permitting `forge.py enqueue`
@@ -1344,89 +1702,6 @@ def check_tool_use(
         if not ok_dk:
             save_state(state, state_file)
             return False, dk_reason
-
-        is_forge_enqueue = bool(re.search(r"\bforge\.py\s+enqueue\b", cmd))
-        is_forge_stage_decision = bool(re.search(r"\bforge\.py\s+stage-decision\b", cmd) and "forge_enqueue" in cmd)
-        is_forge_job_start = bool(
-            re.search(r"\bforge\.py\s+job\s+start\b", cmd) or re.search(r"\bdetached_runner\.py\s+start\b", cmd)
-        )
-        is_no_synthesize_probe = bool(is_forge_job_start and "--no-synthesize" in cmd)
-        if is_forge_enqueue:
-            plan_ok = False
-            m_enq = re.search(r"\bforge\.py\s+enqueue\b", cmd)
-            cmd_before = cmd[: m_enq.start()] if m_enq else ""
-            has_preceding_shell_gen = bool(
-                re.search(r"(?:<<|>>?|\b(?:cat|echo|printf|tee|python3?|cp|mv)\b)[^;&|\n]*[;&|\n]", cmd_before, re.DOTALL)
-            )
-            if not has_preceding_shell_gen:
-                m_plan = re.search(
-                    r"\bforge\.py\s+enqueue\s+(?:--[a-zA-Z0-9_-]+(?:\s+[^\s;\"'|&>]+)?\s+)*(?:\"([^\"]+)\"|'([^']+)'|([^\s;\"'|&>]+))",
-                    cmd,
-                )
-                if m_plan:
-                    raw_pf = m_plan.group(1) or m_plan.group(2) or m_plan.group(3) or ""
-                    if raw_pf and not raw_pf.startswith("-"):
-                        abs_pf = os.path.abspath(os.path.join(cwd or "/workspace", raw_pf))
-                        if os.path.isfile(abs_pf):
-                            try:
-                                with open(abs_pf, "r", encoding="utf-8") as pf:
-                                    pdata = json.load(pf)
-                                if isinstance(pdata, dict):
-                                    val_fn = None
-                                    try:
-                                        _repo_root = os.path.abspath(
-                                            os.path.join(os.path.dirname(__file__), "..", "..")
-                                        )
-                                        if _repo_root not in sys.path:
-                                            sys.path.insert(0, _repo_root)
-                                        elif sys.path[0] != _repo_root:
-                                            sys.path.remove(_repo_root)
-                                            sys.path.insert(0, _repo_root)
-                                        from tools.forge import _normalize_forge_plan_in_place, validate_forge_plan
-                                        _normalize_forge_plan_in_place(pdata, from_enqueue=True)
-                                        val_fn = validate_forge_plan
-                                    except Exception:
-                                        try:
-                                            from tools.forge import _normalize_forge_plan_in_place, validate_forge_plan
-                                            _normalize_forge_plan_in_place(pdata, from_enqueue=True)
-                                            val_fn = validate_forge_plan
-                                        except Exception:
-                                            val_fn = None
-
-                                    if callable(val_fn):
-                                        is_valid, _ = val_fn(pdata)
-                                        plan_ok = bool(is_valid)
-                                    else:
-                                        if not pdata.get("title") or not pdata.get("chunks"):
-                                            plan_ok = False
-                                        elif not (
-                                            pdata.get("origin_channel_id")
-                                            or pdata.get("channel_id")
-                                        ):
-                                            plan_ok = False
-                                        elif not (
-                                            pdata.get("context_fact_sheet")
-                                            or pdata.get("shared_context")
-                                            or pdata.get("facts")
-                                            or pdata.get("objective")
-                                            or pdata.get("chunks")
-                                        ):
-                                            plan_ok = False
-                                        else:
-                                            plan_ok = True
-                            except Exception:
-                                plan_ok = False
-            if plan_ok:
-                state["inline_prod_files"] = []
-                state["offload_dispatched"] = True
-                state["offload_kind"] = "FORGE multi-chunk build (forge.py enqueue)"
-        elif is_forge_stage_decision:
-            state["inline_prod_files"] = []
-            state["offload_dispatched"] = True
-            state["offload_kind"] = "FORGE Two-Stage Decision Card (forge.py stage-decision --handler forge_enqueue)"
-        elif is_forge_job_start and not is_no_synthesize_probe:
-            state["offload_dispatched"] = True
-            state["offload_kind"] = "FORGE background job (forge.py job start)"
 
         # A00-del. File Deletion & Decision Card Tamper Gate
         ok_del, del_reason = check_file_deletion_gate(cmd, cwd=cwd)
@@ -1613,52 +1888,44 @@ def check_tool_use(
             state["same_file_view_count"] = 0
             state["same_file_edit_count"] = 0
             state["consecutive_git_cmds"] = 0
-            save_state(state, state_file)
-            return True, ""
         else:
             state["consecutive_inline_python"] = 0
+            # C. Serial unbatched git lifecycle check
+            if is_single_git_lifecycle_cmd(cmd):
+                state["consecutive_git_cmds"] = state.get("consecutive_git_cmds", 0) + 1
+                if state["consecutive_git_cmds"] > MAX_CONSECUTIVE_GIT_CMDS:
+                    save_state(state, state_file)
+                    return False, (
+                        f"Batch Invariant Triggered: Detected {state['consecutive_git_cmds']} consecutive unbatched git lifecycle commands in serial. "
+                        "Please bundle git operations (e.g. 'git add <files> && git commit -m \"...\" && git push && gh pr create') into a single compound "
+                        "command or script to minimize tool roundtrips."
+                    )
+                state["cmd_inspections"] = 0
+                state["consecutive_file_views"] = 0
+                state["same_file_view_count"] = 0
+                state["same_file_edit_count"] = 0
+                state["agora_eval_calls"] = 0
+            else:
+                state["consecutive_git_cmds"] = 0
+                if is_batched_or_mutating_cmd(cmd):
+                    state["cmd_inspections"] = 0
+                    state["consecutive_file_views"] = 0
+                    state["same_file_view_count"] = 0
+                    state["same_file_edit_count"] = 0
+                    state["agora_eval_calls"] = 0
+                elif is_single_shell_inspection(cmd):
+                    state["cmd_inspections"] = state.get("cmd_inspections", 0) + 1
+                    if state["cmd_inspections"] > MAX_CONSECUTIVE_SHELL_INSPECTIONS:
+                        save_state(state, state_file)
+                        return False, (
+                            f"Batch Invariant Triggered: Detected {state['cmd_inspections']} consecutive single-line inspection commands in serial. "
+                            "Please bundle your diagnostic checks into a compound one-liner or a single Python scratch script in /workspace/scratch/ "
+                            "to minimize tool roundtrips."
+                        )
+                else:
+                    state["cmd_inspections"] = 0
 
-        # C. Serial unbatched git lifecycle check
-        if is_single_git_lifecycle_cmd(cmd):
-            state["consecutive_git_cmds"] = state.get("consecutive_git_cmds", 0) + 1
-            if state["consecutive_git_cmds"] > MAX_CONSECUTIVE_GIT_CMDS:
-                save_state(state, state_file)
-                return False, (
-                    f"Batch Invariant Triggered: Detected {state['consecutive_git_cmds']} consecutive unbatched git lifecycle commands in serial. "
-                    "Please bundle git operations (e.g. 'git add <files> && git commit -m \"...\" && git push && gh pr create') into a single compound "
-                    "command or script to minimize tool roundtrips."
-                )
-            state["cmd_inspections"] = 0
-            state["consecutive_file_views"] = 0
-            state["same_file_view_count"] = 0
-            state["same_file_edit_count"] = 0
-            state["agora_eval_calls"] = 0
-            save_state(state, state_file)
-            return True, ""
-        else:
-            state["consecutive_git_cmds"] = 0
-
-        if is_batched_or_mutating_cmd(cmd):
-            state["cmd_inspections"] = 0
-            state["consecutive_file_views"] = 0
-            state["same_file_view_count"] = 0
-            state["same_file_edit_count"] = 0
-            state["agora_eval_calls"] = 0
-            save_state(state, state_file)
-            return True, ""
-
-        if is_single_shell_inspection(cmd):
-            state["cmd_inspections"] = state.get("cmd_inspections", 0) + 1
-            if state["cmd_inspections"] > MAX_CONSECUTIVE_SHELL_INSPECTIONS:
-                save_state(state, state_file)
-                return False, (
-                    f"Batch Invariant Triggered: Detected {state['cmd_inspections']} consecutive single-line inspection commands in serial. "
-                    "Please bundle your diagnostic checks into a compound one-liner or a single Python scratch script in /workspace/scratch/ "
-                    "to minimize tool roundtrips."
-                )
-        else:
-            state["cmd_inspections"] = 0
-
+        _record_forge_offload_if_applicable(cmd, cwd, state)
         save_state(state, state_file)
         return True, ""
 
@@ -1798,6 +2065,85 @@ def throttle_heavy_compiler_command(cmd: str) -> str:
     )
 
 
+_PROSE_CLI_FLAG_PREFIX_RE = re.compile(
+    r"(?:^|[\s;&|])(?:--(?:message|body|summary|details|title)|-m)(?:\s+|=)$"
+)
+
+
+def escape_double_quoted_cli_prose(cmd: str) -> str:
+    """Escape unescaped '$' variables ($0, $100, $var) and backticks (`...`) inside double-quoted
+    CLI prose arguments (--message, -m, --body, --summary, --details, --title) before bash executes
+    the command, preventing shell positional parameter/backtick corruption on outbox/mail sends.
+    """
+    if not cmd or ('"' not in cmd) or ("$" not in cmd and "`" not in cmd):
+        return cmd
+
+    out: list[str] = []
+    i = 0
+    n = len(cmd)
+    state = "normal"  # normal | single | double | prose_double
+
+    while i < n:
+        ch = cmd[i]
+        if state == "normal":
+            if ch == "\\" and i + 1 < n:
+                out.append(cmd[i : i + 2])
+                i += 2
+                continue
+            if ch == "'":
+                state = "single"
+                out.append(ch)
+                i += 1
+                continue
+            if ch == '"':
+                prefix = cmd[max(0, i - 32) : i]
+                if _PROSE_CLI_FLAG_PREFIX_RE.search(prefix):
+                    state = "prose_double"
+                else:
+                    state = "double"
+                out.append(ch)
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        elif state == "single":
+            if ch == "'":
+                state = "normal"
+            out.append(ch)
+            i += 1
+        elif state == "double":
+            if ch == "\\" and i + 1 < n:
+                out.append(cmd[i : i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                state = "normal"
+            out.append(ch)
+            i += 1
+        elif state == "prose_double":
+            if ch == "\\" and i + 1 < n:
+                out.append(cmd[i : i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                state = "normal"
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "`":
+                out.append("\\`")
+                i += 1
+                continue
+            if ch == "$" and i + 1 < n and re.match(r"[0-9a-zA-Z_{(@*#?$-]", cmd[i + 1]):
+                out.append("\\$")
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+
+    return "".join(out)
+
+
 def check_batching(cmd: str) -> tuple[bool, str]:
     return check_tool_use("run_command", {"CommandLine": cmd})
 
@@ -1871,7 +2217,11 @@ def main():
         # 1. Unified Search Safety Gate (in-process, avoiding a second Python subprocess spawn)
         if name in ("grep_search", "find_by_name", "run_command"):
             try:
-                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                _here = os.path.dirname(os.path.abspath(__file__))
+                _hooks_dir = os.path.join(_resolve_repo_root(), ".agents", "hooks")
+                for _sg_dir in (_here, _hooks_dir):
+                    if os.path.isdir(_sg_dir) and _sg_dir not in sys.path:
+                        sys.path.insert(0, _sg_dir)
                 from search_guard import check_search_path, check_command_line, normalize_path
                 if name == "grep_search":
                     s_ok, s_reason = check_search_path(args.get("SearchPath", ""), cwd)
@@ -1891,6 +2241,28 @@ def main():
                     if not s_ok:
                         print(json.dumps({"decision": "deny", "reason": s_reason}))
                         return
+            except Exception:
+                pass
+
+        # 1b. Shell Double-Quote Corruption Guard (run before check_tool_use so denied commands never mutate state)
+        if name == "run_command" and not args.get("IsDaemon", False):
+            try:
+                raw_cmd_pre = args.get("CommandLine", "")
+                if escape_double_quoted_cli_prose(raw_cmd_pre) != raw_cmd_pre:
+                    print(
+                        json.dumps(
+                            {
+                                "decision": "deny",
+                                "reason": (
+                                    "Shell Double-Quote Corruption Guard: Detected unescaped '$' ($0, $1, $var) or backticks (`...`) "
+                                    "inside a double-quoted CLI prose argument (--message, -m, --body, --summary, --title). "
+                                    "Bash expands '$0' to 'bash', eats '$1..$9', and executes '`...`' as command substitution before Python runs. "
+                                    "Use single quotes (--message '...') or a single-quoted python3 -c script."
+                                ),
+                            }
+                        )
+                    )
+                    return
             except Exception:
                 pass
 
@@ -1935,7 +2307,23 @@ def main():
 
             try:
                 raw_cmd = args.get("CommandLine", "")
-                throttled_cmd = throttle_heavy_compiler_command(raw_cmd)
+                safe_cmd = escape_double_quoted_cli_prose(raw_cmd)
+                if safe_cmd != raw_cmd:
+                    print(
+                        json.dumps(
+                            {
+                                "decision": "deny",
+                                "reason": (
+                                    "Shell Double-Quote Corruption Guard: Detected unescaped '$' ($0, $1, $var) or backticks (`...`) "
+                                    "inside a double-quoted CLI prose argument (--message, -m, --body, --summary, --title). "
+                                    "Bash expands '$0' to 'bash', eats '$1..$9', and executes '`...`' as command substitution before Python runs. "
+                                    "Use single quotes (--message '...') or a single-quoted python3 -c script."
+                                ),
+                            }
+                        )
+                    )
+                    return
+                throttled_cmd = throttle_heavy_compiler_command(safe_cmd)
                 for tools_dir in ("/workspace/tools", "/opt/zero/workspace/tools"):
                     if os.path.isdir(tools_dir) and tools_dir not in sys.path:
                         sys.path.insert(0, tools_dir)

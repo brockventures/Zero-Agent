@@ -5056,6 +5056,28 @@ _DRIFT_PROSE_STOPWORDS = {
 }
 
 
+def _extract_prose_paren_spans(text: str) -> list[tuple[int, int, str]]:
+    """Return top-level `(start, end, substring)` parenthetical spans outside inline backticks."""
+    spans: list[tuple[int, int, str]] = []
+    in_bt = False
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "`":
+            in_bt = not in_bt
+        elif not in_bt:
+            if ch == "(":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    spans.append((start, i + 1, text[start : i + 1]))
+                    start = -1
+    return spans
+
+
 def detect_skill_and_rule_drift(repo_dir: Path | str, target_files: list[str]) -> list[str]:
     """Scan .agents/skills/*/SKILL.md and .agents/rules/*.md for references to modified non-test files
 
@@ -5136,18 +5158,127 @@ def detect_skill_and_rule_drift(repo_dir: Path | str, target_files: list[str]) -
             return True
         return False
 
+    anti_cite_re = re.compile(
+        r"\b(?:never|avoid|do\s+not|don't)\s+(?:cite|citing|mention|mentioning|expose|exposing|leak|leaking)\b"
+        r"|\b(?:file\s+(?:names?|paths?)|function(?:/method)?\s+names?|method\s+names?|code\s+identifiers?)\b",
+        re.I,
+    )
+    py_file_re = re.compile(r"(?:\b|/)(?:[a-zA-Z0-9_./-]+/)?([a-zA-Z0-9_-]+\.py)\b")
+    py_relpath_re = re.compile(r"(?:\b|/)((?:[a-zA-Z0-9_.-]+/)*[a-zA-Z0-9_-]+\.py)\b")
+    lower_camel_re = re.compile(r"^[a-z][a-z0-9]*[A-Z][a-zA-Z0-9]*$")
+
+    symbol_cache: dict[Path, set[str]] = {}
+
+    def _get_cached_symbols(file_path: Path, content: Optional[str] = None) -> set[str]:
+        resolved = file_path.resolve()
+        if resolved in symbol_cache:
+            return symbol_cache[resolved]
+        if content is None:
+            try:
+                content = resolved.read_text(encoding="utf-8")
+            except Exception:
+                symbol_cache[resolved] = set()
+                return set()
+        syms = _extract_file_symbols(resolved, content)
+        symbol_cache[resolved] = syms
+        return syms
+
+    def _resolve_doc_coref_symbols(doc_text: str, exclude_name: str) -> set[str]:
+        coref_syms: set[str] = set()
+        seen_paths: set[Path] = set()
+        for m in py_relpath_re.finditer(doc_text):
+            raw_ref = m.group(1).lstrip("/")
+            base_name = Path(raw_ref).name
+            if base_name == exclude_name:
+                continue
+            trimmed_ref = raw_ref[len("workspace/"):] if raw_ref.startswith("workspace/") else raw_ref
+            for cand in (
+                repo_path / trimmed_ref,
+                repo_path / "tools" / base_name,
+                repo_path / ".agents" / "hooks" / base_name,
+            ):
+                if cand.exists() and cand.is_file():
+                    rc = cand.resolve()
+                    if rc not in seen_paths:
+                        seen_paths.add(rc)
+                        coref_syms.update(_get_cached_symbols(rc))
+                    break
+        return coref_syms
+
     warnings: list[str] = []
     seen_warnings: set[str] = set()
 
     for rel_target, full_target in non_test_targets:
         target_name = full_target.name
+        target_stem = full_target.stem
+        allowed_dot_prefixes = {target_stem, f"{target_stem}_mod"}
         try:
             target_content = full_target.read_text(encoding="utf-8")
         except Exception:
             continue
 
-        defined_symbols = _extract_file_symbols(full_target, target_content)
+        defined_symbols = _get_cached_symbols(full_target, target_content)
+        has_lower_camel_defs = any(lower_camel_re.match(s) for s in defined_symbols)
         file_pattern = re.compile(r'(?:\b|/)' + re.escape(target_name) + r'\b')
+        bare_bt_file_re = re.compile(r"^`?(?:[a-zA-Z0-9_./-]+/)?" + re.escape(target_name) + r"`?$")
+        example_intro_re = re.compile(
+            r"\b(?:e\.g\.?|i\.e\.?|such\s+as|like|including|examples?\s+include)\s+`?(?:[a-zA-Z0-9_./-]+/)?"
+            + re.escape(target_name)
+            + r"\b",
+            re.I,
+        )
+        peer_bt_list_re = re.compile(
+            r"`(?:[a-zA-Z0-9_./-]+/)?"
+            + re.escape(target_name)
+            + r"`\s*(?:,|\bor\b|\band\b|\bvs\.?\b|\bfrom\b)\s*`[a-zA-Z_][a-zA-Z0-9_]*\s*\([^`]*\)`",
+            re.I,
+        )
+        bold_label_re = re.compile(r"\*\*[^*]*\([^)]*" + re.escape(target_name) + r"[^)]*\)[^*]*\*\*")
+        cli_subcmd_after_target_re = re.compile(
+            r"(?:\b|/)" + re.escape(target_name) + r"\s+\S+"
+        )
+
+        def _extract_direct_target_bt_flags(text_line: str) -> set[str]:
+            out: set[str] = set()
+            for bm in re.finditer(r"`([^`]+)`", text_line):
+                inner = bm.group(1)
+                if file_pattern.search(inner):
+                    for flag in re.findall(r"(--[a-zA-Z0-9][a-zA-Z0-9_-]*)", inner):
+                        out.add(flag)
+            return out
+
+        def _is_only_cli_subcommand_bt_mention(text_line: str) -> bool:
+            matched_cli_bt = False
+
+            def _strip_cli_bt(bm: re.Match) -> str:
+                nonlocal matched_cli_bt
+                inner = bm.group(1).strip()
+                if file_pattern.search(inner) and cli_subcmd_after_target_re.search(inner):
+                    matched_cli_bt = True
+                    return " "
+                return bm.group(0)
+
+            rem = re.sub(r"`([^`]+)`", _strip_cli_bt, text_line)
+            return matched_cli_bt and not file_pattern.search(rem)
+
+        def _strip_foreign_cli_backticks(text_line: str) -> str:
+            def _repl(bm: re.Match) -> str:
+                inner = bm.group(1).strip()
+                if file_pattern.search(inner):
+                    return bm.group(0)
+                if re.match(r"^(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?[a-zA-Z_][a-zA-Z0-9_]*\s*\(.*\)$", inner):
+                    return bm.group(0)
+                if " " in inner:
+                    return " "
+                return bm.group(0)
+
+            return re.sub(r"`([^`]+)`", _repl, text_line)
+
+        def _accept_dotted_or_bare_sym(text_str: str, match_start: int) -> bool:
+            if match_start > 0 and text_str[match_start - 1] == ".":
+                prev_m = re.search(r"([a-zA-Z_][a-zA-Z0-9_]*)\.$", text_str[:match_start])
+                return bool(prev_m and prev_m.group(1) in allowed_dot_prefixes)
+            return True
 
         for doc_label, doc_path in doc_files:
             try:
@@ -5161,11 +5292,27 @@ def detect_skill_and_rule_drift(repo_dir: Path | str, target_files: list[str]) -
             doc_lines = doc_text.splitlines()
             n_lines = len(doc_lines)
 
+            line_code_lang: list[Optional[str]] = [None] * n_lines
+            active_fence_lang: Optional[str] = None
+            for i_ln, raw_ln in enumerate(doc_lines):
+                s_ln = raw_ln.strip()
+                if s_ln.startswith("```"):
+                    if active_fence_lang is None:
+                        fence_info = s_ln[3:].strip()
+                        active_fence_lang = fence_info.split()[0].lower() if fence_info else "text"
+                    else:
+                        active_fence_lang = None
+                    line_code_lang[i_ln] = "__fence__"
+                else:
+                    line_code_lang[i_ln] = active_fence_lang
+
             flags_to_check: set[str] = set()
             symbols_to_check: set[str] = set()
+            explicit_symbols: set[str] = set()
 
             for idx, line in enumerate(doc_lines):
-                if not file_pattern.search(line):
+                idx_lang = line_code_lang[idx]
+                if idx_lang == "__fence__" or not file_pattern.search(line):
                     continue
 
                 # 1. Explicit target symbol citation: `tool.py:symbol_name`
@@ -5174,44 +5321,176 @@ def detect_skill_and_rule_drift(repo_dir: Path | str, target_files: list[str]) -
                     line,
                 ):
                     symbols_to_check.add(sym)
+                    explicit_symbols.add(sym)
 
-                # 2. Scope context lines for this mention
-                context_lines = [line]
-                is_bullet = line.strip().startswith(("*", "-", "+")) or bool(re.match(r'^\s*\d+\.', line))
+                context_entries: list[tuple[Optional[str], str]] = []
 
-                for j in range(idx + 1, min(idx + 15, n_lines)):
-                    nxt = doc_lines[j]
-                    s_nxt = nxt.strip()
-                    if s_nxt.startswith("#"):
-                        break
-                    if is_bullet and (s_nxt.startswith(("*", "-", "+")) or bool(re.match(r'^\d+\.', s_nxt))):
-                        break
-                    if re.search(r'(?:\b|/)[a-zA-Z0-9_-]+\.py\b', nxt) and not file_pattern.search(nxt):
-                        break
-                    context_lines.append(nxt)
-
-                # Extract flags and function citations from context_lines
-                in_code_block = False
-                for c_line in context_lines:
-                    s_cline = c_line.strip()
-                    if s_cline.startswith("```"):
-                        in_code_block = not in_code_block
+                if idx_lang is not None:
+                    # Mention occurs inside a fenced code block
+                    if idx_lang == "mermaid":
+                        other_m_pys = {m.group(1) for m in py_file_re.finditer(line)} - {target_name}
+                        if not other_m_pys:
+                            for flag in re.findall(r'(--[a-zA-Z0-9][a-zA-Z0-9_-]*)', line):
+                                flags_to_check.add(flag)
                         continue
 
+                    if idx_lang in ("python", "py"):
+                        unquoted = re.sub(r"""(['"])(?:\\.|(?!\1).)*\1""", " ", line)
+                        if not file_pattern.search(unquoted) and target_stem not in unquoted:
+                            continue
+                        context_entries.append((idx_lang, line))
+                        for j in range(idx + 1, min(idx + 15, n_lines)):
+                            j_lang = line_code_lang[j]
+                            if j_lang in (None, "__fence__"):
+                                break
+                            nxt = doc_lines[j]
+                            if re.search(r'(?:\b|/)[a-zA-Z0-9_-]+\.py\b', nxt) and not file_pattern.search(nxt):
+                                break
+                            context_entries.append((j_lang, nxt))
+                    else:
+                        # Shell / CLI fenced block: walk back to start of backslash-continued command
+                        cmd_start = idx
+                        while (
+                            cmd_start > 0
+                            and line_code_lang[cmd_start - 1] not in (None, "__fence__")
+                            and doc_lines[cmd_start - 1].rstrip().endswith("\\")
+                        ):
+                            cmd_start -= 1
+                        head_line = doc_lines[cmd_start]
+                        head_other_pys = {m.group(1) for m in py_file_re.finditer(head_line)} - {target_name}
+                        first_target_pos = file_pattern.search(line)
+                        first_other_on_line = any(
+                            m.group(1) != target_name and first_target_pos and m.start() < first_target_pos.start()
+                            for m in py_file_re.finditer(line)
+                        )
+                        if (head_other_pys and not file_pattern.search(head_line)) or first_other_on_line:
+                            for qm in re.finditer(r"""(['"])((?:\\.|(?!\1).)*)\1""", line):
+                                q_inner = qm.group(2).strip()
+                                if file_pattern.search(q_inner) and " " in q_inner:
+                                    for flag in re.findall(r'(--[a-zA-Z0-9][a-zA-Z0-9_-]*)', q_inner):
+                                        flags_to_check.add(flag)
+                            continue
+
+                        context_entries.append((idx_lang, line))
+                        for j in range(idx + 1, min(idx + 15, n_lines)):
+                            j_lang = line_code_lang[j]
+                            if j_lang in (None, "__fence__"):
+                                break
+                            if not doc_lines[j - 1].rstrip().endswith("\\"):
+                                break
+                            context_entries.append((j_lang, doc_lines[j]))
+                else:
+                    # Skip unrelated prose example / anti-citation lists on the same line
+                    if anti_cite_re.search(line) or example_intro_re.search(line) or peer_bt_list_re.search(line):
+                        flags_to_check.update(_extract_direct_target_bt_flags(line))
+                        continue
+
+                    if _is_only_cli_subcommand_bt_mention(line):
+                        flags_to_check.update(_extract_direct_target_bt_flags(line))
+                        continue
+
+                    # 2. Scope context lines for this prose mention
+                    paren_spans = _extract_prose_paren_spans(line)
+                    target_paren_spans = [sp for sp in paren_spans if file_pattern.search(sp[2])]
+                    line_without_parens = line
+                    for s_idx, e_idx, _ in reversed(paren_spans):
+                        line_without_parens = line_without_parens[:s_idx] + " " + line_without_parens[e_idx:]
+
+                    is_heading = line.lstrip().startswith("#")
+                    in_bold_label = bool(bold_label_re.search(line))
+                    if (
+                        target_paren_spans
+                        and not file_pattern.search(line_without_parens)
+                        and not is_heading
+                        and not in_bold_label
+                    ):
+                        for _, _, sp_text in target_paren_spans:
+                            inner_paren = sp_text[1:-1].strip()
+                            other_pys = {m.group(1) for m in py_file_re.finditer(inner_paren)} - {target_name}
+                            has_bare_file_bt = any(
+                                bare_bt_file_re.match(bm.group(0)) for bm in re.finditer(r"`[^`]+`", inner_paren)
+                            )
+                            is_example_paren = (
+                                bool(re.match(r"^(?:e\.g\.?|i\.e\.?|such\s+as|like|for\s+example)\b", inner_paren, re.I))
+                                or bool(other_pys)
+                                or (has_bare_file_bt and ("," in inner_paren or " or " in inner_paren or " and " in inner_paren))
+                            )
+                            if is_example_paren:
+                                flags_to_check.update(_extract_direct_target_bt_flags(inner_paren))
+                            else:
+                                context_entries.append((None, inner_paren))
+                        if not context_entries:
+                            continue
+                    else:
+                        other_main_pys = {m.group(1) for m in py_file_re.finditer(line_without_parens)} - {target_name}
+                        if other_main_pys:
+                            flags_to_check.update(_extract_direct_target_bt_flags(line))
+                            continue
+
+                        context_entries = [(None, line)]
+                        is_bullet = line.strip().startswith(("*", "-", "+")) or bool(re.match(r'^\s*\d+\.', line))
+                        saw_fence_open = False
+
+                        for j in range(idx + 1, min(idx + 15, n_lines)):
+                            j_lang = line_code_lang[j]
+                            if j_lang == "__fence__":
+                                if saw_fence_open:
+                                    break
+                                saw_fence_open = True
+                                continue
+                            nxt = doc_lines[j]
+                            s_nxt = nxt.strip()
+                            if j_lang is None:
+                                if s_nxt.startswith("#"):
+                                    break
+                                if is_bullet and (s_nxt.startswith(("*", "-", "+")) or bool(re.match(r'^\d+\.', s_nxt))):
+                                    break
+                                if re.search(r'(?:\b|/)[a-zA-Z0-9_-]+\.py\b', nxt) and not file_pattern.search(nxt):
+                                    break
+                                if anti_cite_re.search(nxt):
+                                    continue
+                                context_entries.append((None, nxt))
+                            else:
+                                if re.search(r'(?:\b|/)[a-zA-Z0-9_-]+\.py\b', nxt) and not file_pattern.search(nxt):
+                                    break
+                                context_entries.append((j_lang, nxt))
+
+                # Extract flags and function citations from context_entries
+                for c_lang, c_line in context_entries:
+                    in_code = c_lang is not None
+                    if in_code and c_lang not in ("python", "py"):
+                        def _strip_foreign_quoted_cmd(qm: re.Match) -> str:
+                            q_inner = qm.group(2)
+                            q_other = {m.group(1) for m in py_file_re.finditer(q_inner)} - {target_name}
+                            if q_other and not file_pattern.search(q_inner):
+                                return " "
+                            return qm.group(0)
+
+                        scan_line = re.sub(r"""(['"])((?:\\.|(?!\1).)*)\1""", _strip_foreign_quoted_cmd, c_line)
+                    elif in_code:
+                        scan_line = c_line
+                    else:
+                        scan_line = _strip_foreign_cli_backticks(c_line)
+
                     # CLI flags: --foo-bar
-                    for flag in re.findall(r'(--[a-zA-Z0-9][a-zA-Z0-9_-]*)', c_line):
+                    for flag in re.findall(r'(--[a-zA-Z0-9][a-zA-Z0-9_-]*)', scan_line):
                         flags_to_check.add(flag)
 
-                    # Form A: in backticks, e.g. `func()` or `func(...)`
-                    for m in re.finditer(r'`([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^`]*\)`', c_line):
-                        sym = m.group(1)
-                        low = sym.lower()
-                        if low not in _DRIFT_BUILTIN_NAMES and low not in _DRIFT_PROSE_STOPWORDS:
-                            symbols_to_check.add(sym)
+                    # Form A: in backticks, e.g. `func()` or `mod.func(...)`
+                    if not in_code:
+                        for m in re.finditer(r'`(?:([a-zA-Z_][a-zA-Z0-9_]*)\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^`]*\)`', scan_line):
+                            qual, sym = m.group(1), m.group(2)
+                            if qual and qual not in allowed_dot_prefixes:
+                                continue
+                            low = sym.lower()
+                            if low not in _DRIFT_BUILTIN_NAMES and low not in _DRIFT_PROSE_STOPWORDS:
+                                symbols_to_check.add(sym)
 
-                    # Form B: in code blocks or `def func_name(`
-                    if in_code_block or "def " in c_line:
-                        for m in re.finditer(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', c_line):
+                    # Form B: in Python code blocks or `def func_name(`
+                    if c_lang in ("python", "py") or "def " in scan_line:
+                        for m in re.finditer(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', scan_line):
+                            if not _accept_dotted_or_bare_sym(scan_line, m.start()):
+                                continue
                             sym = m.group(1)
                             low = sym.lower()
                             if low not in _DRIFT_BUILTIN_NAMES and low not in _DRIFT_PROSE_STOPWORDS:
@@ -5219,12 +5498,15 @@ def detect_skill_and_rule_drift(repo_dir: Path | str, target_files: list[str]) -
                                     symbols_to_check.add(sym)
 
                     # Form C: In prose, empty parentheses directly attached to identifier: `func_name()`
-                    for m in re.finditer(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\(\)', c_line):
-                        sym = m.group(1)
-                        low = sym.lower()
-                        if low not in _DRIFT_BUILTIN_NAMES and low not in _DRIFT_PROSE_STOPWORDS:
-                            if not (sym.isupper() and len(sym) > 1):
-                                symbols_to_check.add(sym)
+                    if not in_code:
+                        for m in re.finditer(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\(\)', scan_line):
+                            if not _accept_dotted_or_bare_sym(scan_line, m.start()):
+                                continue
+                            sym = m.group(1)
+                            low = sym.lower()
+                            if low not in _DRIFT_BUILTIN_NAMES and low not in _DRIFT_PROSE_STOPWORDS:
+                                if not (sym.isupper() and len(sym) > 1):
+                                    symbols_to_check.add(sym)
 
             # Check CLI flags
             for flag in sorted(flags_to_check):
@@ -5235,8 +5517,16 @@ def detect_skill_and_rule_drift(repo_dir: Path | str, target_files: list[str]) -
                         warnings.append(warn)
 
             # Check symbols
+            doc_coref_symbols: Optional[set[str]] = None
             for sym in sorted(symbols_to_check):
                 if sym in defined_symbols:
+                    continue
+                if (
+                    full_target.suffix == ".py"
+                    and sym not in explicit_symbols
+                    and not has_lower_camel_defs
+                    and lower_camel_re.match(sym)
+                ):
                     continue
                 if f"def {sym}(" in target_content or f"def {sym} (" in target_content:
                     continue
@@ -5244,6 +5534,11 @@ def detect_skill_and_rule_drift(repo_dir: Path | str, target_files: list[str]) -
                     continue
                 if re.search(r'\b' + re.escape(sym) + r'\s*=', target_content):
                     continue
+                if sym not in explicit_symbols:
+                    if doc_coref_symbols is None:
+                        doc_coref_symbols = _resolve_doc_coref_symbols(doc_text, target_name)
+                    if sym in doc_coref_symbols:
+                        continue
 
                 warn = f"{doc_label} references removed flag/symbol {sym} in {rel_target}"
                 if warn not in seen_warnings:
@@ -5660,32 +5955,39 @@ def _resolve_latest_branch_ref(repo_dir: Path | str, default_branch: str) -> str
         subprocess.run(["git", "fetch", "origin", default_branch], cwd=str(rp), capture_output=True, timeout=30)
     except Exception:
         pass
-    chk_origin = subprocess.run(
-        ["git", "rev-parse", "--verify", f"origin/{default_branch}"],
-        cwd=str(rp),
-        capture_output=True,
-    )
-    chk_local = subprocess.run(
-        ["git", "rev-parse", "--verify", default_branch],
-        cwd=str(rp),
-        capture_output=True,
-    )
-    has_origin = chk_origin.returncode == 0
-    has_local = chk_local.returncode == 0
-    if has_origin and has_local:
-        # If local default_branch contains origin/default_branch (i.e. local is equal or ahead), use local default_branch
-        anc = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", f"origin/{default_branch}", default_branch],
+    try:
+        chk_origin = subprocess.run(
+            ["git", "rev-parse", "--verify", f"origin/{default_branch}"],
             cwd=str(rp),
             capture_output=True,
+            timeout=10,
         )
-        if anc.returncode == 0:
+        chk_local = subprocess.run(
+            ["git", "rev-parse", "--verify", default_branch],
+            cwd=str(rp),
+            capture_output=True,
+            timeout=10,
+        )
+        has_origin = chk_origin.returncode == 0
+        has_local = chk_local.returncode == 0
+        if has_origin and has_local:
+            # If local default_branch contains origin/default_branch (i.e. local is equal or ahead), use local default_branch
+            anc = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", f"origin/{default_branch}", default_branch],
+                cwd=str(rp),
+                capture_output=True,
+                timeout=10,
+            )
+            if anc.returncode == 0:
+                return default_branch
+            return f"origin/{default_branch}"
+        if has_origin:
+            return f"origin/{default_branch}"
+        if has_local:
             return default_branch
-        return f"origin/{default_branch}"
-    if has_origin:
-        return f"origin/{default_branch}"
-    if has_local:
-        return default_branch
+    except subprocess.TimeoutExpired:
+        if default_branch:
+            return default_branch
     return "HEAD"
 
 
@@ -5720,9 +6022,9 @@ def _prepare_clean_repo_and_sync_base(
     is_workspace = (rp == Path(WORKSPACE_DIR).resolve())
     if not is_workspace or before_merge:
         try:
-            st_diff = subprocess.run(["git", "diff", "--quiet"], cwd=str(rp), capture_output=True)
-            st_cached = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(rp), capture_output=True)
-            st_status = subprocess.run(["git", "status", "--porcelain"], cwd=str(rp), capture_output=True, text=True)
+            st_diff = subprocess.run(["git", "diff", "--quiet"], cwd=str(rp), capture_output=True, timeout=15)
+            st_cached = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(rp), capture_output=True, timeout=15)
+            st_status = subprocess.run(["git", "status", "--porcelain"], cwd=str(rp), capture_output=True, text=True, timeout=15)
             if st_diff.returncode != 0 or st_cached.returncode != 0 or st_status.stdout.strip():
                 stash_msg = f"forge-autostash-{int(time.time())}"
                 subprocess.run(
@@ -5744,12 +6046,14 @@ def _prepare_clean_repo_and_sync_base(
             cwd=str(rp),
             capture_output=True,
             text=True,
+            timeout=10,
         ).stdout.strip()
         rev_latest = subprocess.run(
             ["git", "rev-parse", latest_def_ref],
             cwd=str(rp),
             capture_output=True,
             text=True,
+            timeout=10,
         ).stdout.strip()
 
         if rev_local and rev_latest and rev_local != rev_latest:
@@ -5757,6 +6061,7 @@ def _prepare_clean_repo_and_sync_base(
                 ["git", "merge-base", "--is-ancestor", latest_def_ref, default_branch],
                 cwd=str(rp),
                 capture_output=True,
+                timeout=10,
             )
             if anc.returncode != 0 or latest_def_ref != default_branch:
                 cur_branch = subprocess.run(
@@ -6398,7 +6703,7 @@ class ForgeSupervisor:
             git_lk = _acquire_repo_git_lock(repo_dir)
             try:
                 latest_def_ref = _prepare_clean_repo_and_sync_base(repo_dir, default_branch)
-                chk_stg = subprocess.run(["git", "rev-parse", "--verify", staging_ref], cwd=str(repo_dir), capture_output=True)
+                chk_stg = subprocess.run(["git", "rev-parse", "--verify", staging_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
                 if chk_stg.returncode != 0:
                     subprocess.run(["git", "branch", "-f", staging_ref, latest_def_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
                 else:
@@ -6418,6 +6723,7 @@ class ForgeSupervisor:
                     ["git", "rev-parse", "--verify", branch_name],
                     cwd=str(repo_dir),
                     capture_output=True,
+                    timeout=10,
                 ).returncode == 0
 
                 if ch_target_branch and br_exists:
@@ -7875,23 +8181,44 @@ def _resolve_decision_channel(channel_id: int) -> tuple[int, Optional[int]]:
     except (ValueError, TypeError):
         return ZERO_CHAT_CHANNEL_ID, None
 
+    home_turf_ids: set[int] = {
+        ZERO_CHAT_CHANNEL_ID,
+        ZERO_OPS_CHANNEL_ID,
+        FORGE_CHANNEL_ID,
+        BASEBALL_CHANNEL_ID,
+    }
     try:
-        from tools.bridge_state import CRAB_CAVERN_CHANNEL_IDS, is_home_channel
+        from tools.bridge_state import (
+            CRAB_CAVERN_CHANNEL_IDS,
+            DEFAULT_HOME_CHANNELS,
+            get_runtime_rules,
+            is_home_channel,
+        )
+        home_turf_ids.update(int(x) for x in DEFAULT_HOME_CHANNELS)
+        home_turf_ids.update(int(x) for x in get_runtime_rules().get("home_channel_ids", []))
     except ImportError:
         try:
-            from bridge_state import CRAB_CAVERN_CHANNEL_IDS, is_home_channel
+            from bridge_state import (
+                CRAB_CAVERN_CHANNEL_IDS,
+                DEFAULT_HOME_CHANNELS,
+                get_runtime_rules,
+                is_home_channel,
+            )
+            home_turf_ids.update(int(x) for x in DEFAULT_HOME_CHANNELS)
+            home_turf_ids.update(int(x) for x in get_runtime_rules().get("home_channel_ids", []))
         except ImportError:
             CRAB_CAVERN_CHANNEL_IDS = set()
 
             def is_home_channel(ch):
-                return int(ch) == ZERO_CHAT_CHANNEL_ID
+                return int(ch) in home_turf_ids
 
-    if cid == FORGE_CHANNEL_ID:
+    if cid in CRAB_CAVERN_CHANNEL_IDS:
+        return ZERO_CHAT_CHANNEL_ID, cid
+
+    if cid in home_turf_ids or is_home_channel(cid):
         return cid, None
 
-    if cid in CRAB_CAVERN_CHANNEL_IDS or not is_home_channel(cid):
-        return ZERO_CHAT_CHANNEL_ID, cid
-    return cid, None
+    return ZERO_CHAT_CHANNEL_ID, cid
 
 
 def stage_decision(
@@ -7951,8 +8278,10 @@ def stage_decision(
 
     msg_id = None
     if post_to_discord:
-        resolved_token = token or _get_discord_token(for_forge_channel=(int(channel_id) == FORGE_CHANNEL_ID))
-        msg_id = _post_decision_card_rest(decision_id, db_path=db_path, token=resolved_token)
+        if token is not None:
+            msg_id = _post_decision_card_rest(decision_id, db_path=db_path, token=token)
+        else:
+            msg_id = _post_decision_card_rest(decision_id, db_path=db_path)
 
     redirected = orig_ch is not None
     return {

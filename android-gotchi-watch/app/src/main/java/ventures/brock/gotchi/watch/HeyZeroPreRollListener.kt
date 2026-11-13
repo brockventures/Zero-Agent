@@ -33,8 +33,10 @@ import kotlin.math.sqrt
  *   "hey zero", "hay zero", "hi zero", "okay zero".
  * - Utilizes Android SpeechRecognizer with RecognizerIntent.EXTRA_PREFER_OFFLINE and EXTRA_PARTIAL_RESULTS
  *   paired with acoustic energy envelope tracking (RMS).
+ * - Clean AudioRecord handoff: synchronously stops and releases its AudioRecord (`pauseForActiveTurn` /
+ *   `releaseAudioRecordForHandoff`) before `GotchiWatchEngine` opens its own AudioRecord for PTT or Go Live.
  * - On wake-word match:
- *   1. Snapshots the 500 ms circular pre-roll PCM ring buffer.
+ *   1. Snapshots the 500 ms circular pre-roll PCM ring buffer and releases AudioRecord cleanly.
  *   2. Emits haptic confirmation via `VibrationEffect.createOneShot(75L, VibrationEffect.DEFAULT_AMPLITUDE)`.
  *   3. Dispatches `onWakeWordDetected(preRollPcm: ByteArray)` so the 500 ms pre-roll is prepended seamlessly
  *      into the active turn upload.
@@ -182,6 +184,9 @@ class HeyZeroPreRollListener(
 
     val ringBuffer = CircularPreRollBuffer(PRE_ROLL_BYTES)
     val isListening = AtomicBoolean(false)
+    val isPausedForTurn = AtomicBoolean(false)
+    private val isAudioCaptureActive = AtomicBoolean(false)
+    private val audioRecordLock = Any()
 
     var currentRms: Double = 0.0
         private set
@@ -197,6 +202,7 @@ class HeyZeroPreRollListener(
         ?: sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     private val wristTiltSensor = sensorManager?.getDefaultSensor(TYPE_WRIST_TILT_GESTURE)
     private var isSensorRegistered = false
+    @Volatile
     private var isSpeechRecognizerActive = false
 
     private fun registerSensors() {
@@ -217,7 +223,7 @@ class HeyZeroPreRollListener(
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
-        if (event == null) return
+        if (event == null || isPausedForTurn.get()) return
         when (event.sensor.type) {
             Sensor.TYPE_GRAVITY, Sensor.TYPE_ACCELEROMETER -> {
                 val gx = event.values[0]
@@ -231,36 +237,67 @@ class HeyZeroPreRollListener(
                 }
             }
         }
-        if (isListening.get() && !isSpeechRecognizerActive && currentRms >= WAKE_RMS_GATE_THRESHOLD && (!requireWristOrientation || isWristOriented)) {
+        if (isListening.get() && !isPausedForTurn.get() && !isSpeechRecognizerActive &&
+            currentRms >= WAKE_RMS_GATE_THRESHOLD && (!requireWristOrientation || isWristOriented)
+        ) {
             mainHandler.post { restartRecognizer() }
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
+    /**
+     * Synchronously stops and releases AudioRecord + SpeechRecognizer before GotchiWatchEngine
+     * opens its own AudioRecord for PTT, wake-word, or Go Live capture.
+     */
     fun pauseForActiveTurn() {
+        isPausedForTurn.set(true)
+        stopAudioRecordCapture()
         stopSpeechRecognizerLoop()
         unregisterSensors()
     }
 
+    /**
+     * Snapshots the 500 ms circular pre-roll ring buffer and synchronously stops/releases
+     * AudioRecord so GotchiWatchEngine can acquire the watch microphone cleanly without contention.
+     */
+    fun releaseAudioRecordForHandoff(): ByteArray {
+        val snapshot = ringBuffer.snapshot()
+        pauseForActiveTurn()
+        return snapshot
+    }
+
     fun resumeAfterTurn() {
+        isPausedForTurn.set(false)
         if (isListening.get()) {
             registerSensors()
+            startAudioRecordCapture()
             startSpeechRecognizerLoop()
         }
+    }
+
+    fun isAudioRecordReleased(): Boolean = synchronized(audioRecordLock) {
+        audioRecord == null && !isAudioCaptureActive.get()
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var speechRecognizer: SpeechRecognizer? = null
     private var recognizerIntent: Intent? = null
+    @Volatile
     private var audioRecordThread: Thread? = null
+    @Volatile
     private var audioRecord: AudioRecord? = null
 
     /**
      * Start the continuous 16 kHz pre-roll audio capture and wake phrase recognizer.
      */
     fun start() {
+        isPausedForTurn.set(false)
         if (isListening.compareAndSet(false, true)) {
+            registerSensors()
+            startAudioRecordCapture()
+            startSpeechRecognizerLoop()
+        } else if (isListening.get() && !isAudioCaptureActive.get()) {
             registerSensors()
             startAudioRecordCapture()
             startSpeechRecognizerLoop()
@@ -273,8 +310,12 @@ class HeyZeroPreRollListener(
      * Stop pre-roll audio capture and wake-word listening.
      */
     fun stop() {
+        isPausedForTurn.set(false)
         if (isListening.compareAndSet(true, false)) {
             unregisterSensors()
+            stopAudioRecordCapture()
+            stopSpeechRecognizerLoop()
+        } else {
             stopAudioRecordCapture()
             stopSpeechRecognizerLoop()
         }
@@ -297,20 +338,23 @@ class HeyZeroPreRollListener(
         ringBuffer.write(data, offset, length)
         currentRms = calculateRms(data, length)
         onRmsChangedListener?.invoke(currentRms.toFloat())
-        if (isListening.get() && !isSpeechRecognizerActive && currentRms >= WAKE_RMS_GATE_THRESHOLD && (!requireWristOrientation || isWristOriented)) {
+        if (isListening.get() && !isPausedForTurn.get() && !isSpeechRecognizerActive &&
+            currentRms >= WAKE_RMS_GATE_THRESHOLD && (!requireWristOrientation || isWristOriented)
+        ) {
             mainHandler.post { restartRecognizer() }
         }
     }
 
     /**
-     * Check candidates for wake phrase match and trigger notification + haptic.
+     * Check candidates for wake phrase match, cleanly release AudioRecord, and trigger notification + haptic.
      */
     fun processTranscriptCandidates(candidates: List<String>): Boolean {
+        if (!isListening.get() || isPausedForTurn.get()) return false
         for (raw in candidates) {
             if (isWakePhrase(raw)) {
                 Log.i(TAG, "Wake word matched: '$raw'")
                 triggerHapticConfirmation()
-                val preRoll = ringBuffer.snapshot()
+                val preRoll = releaseAudioRecordForHandoff()
                 mainHandler.post {
                     onWakeWordDetected?.invoke(preRoll)
                     wakeWordListener?.onWakeWordDetected(preRoll)
@@ -342,33 +386,64 @@ class HeyZeroPreRollListener(
 
     @SuppressLint("MissingPermission")
     private fun startAudioRecordCapture() {
+        if (!isListening.get() || isPausedForTurn.get()) return
+        if (!isAudioCaptureActive.compareAndSet(false, true)) return
+
         val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT)
         val bufSize = maxOf(minBuf, 2048)
 
         audioRecordThread = Thread({
-            runCatching {
-                val rec = AudioRecord(
+            var rec: AudioRecord? = null
+            try {
+                val created = AudioRecord(
                     MediaRecorder.AudioSource.MIC,
                     SAMPLE_RATE,
                     CHANNEL_CONFIG,
                     AUDIO_FORMAT,
                     bufSize
                 )
-                audioRecord = rec
-                rec.startRecording()
-
-                val temp = ByteArray(1024)
-                while (isListening.get()) {
-                    val read = rec.read(temp, 0, temp.size)
-                    if (read > 0) {
-                        feedPcm(temp, 0, read)
+                if (created.state != AudioRecord.STATE_INITIALIZED) {
+                    runCatching { created.release() }
+                    return@Thread
+                }
+                synchronized(audioRecordLock) {
+                    if (!isListening.get() || isPausedForTurn.get() || !isAudioCaptureActive.get()) {
+                        runCatching { created.release() }
+                        return@Thread
                     }
+                    rec = created
+                    audioRecord = created
+                    created.startRecording()
                 }
 
-                rec.stop()
-                rec.release()
-            }.onFailure { err ->
+                val temp = ByteArray(1024)
+                while (isListening.get() && !isPausedForTurn.get() && isAudioCaptureActive.get() &&
+                    !Thread.currentThread().isInterrupted
+                ) {
+                    val read = created.read(temp, 0, temp.size)
+                    if (read > 0) {
+                        feedPcm(temp, 0, read)
+                    } else if (read < 0) {
+                        break
+                    }
+                }
+            } catch (err: Throwable) {
                 Log.w(TAG, "AudioRecord pre-roll capture unavailable or permission missing: ${err.message}")
+            } finally {
+                synchronized(audioRecordLock) {
+                    rec?.let { activeRec ->
+                        runCatching {
+                            if (activeRec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                                activeRec.stop()
+                            }
+                        }
+                        runCatching { activeRec.release() }
+                        if (audioRecord === activeRec) {
+                            audioRecord = null
+                        }
+                    }
+                }
+                isAudioCaptureActive.set(false)
             }
         }, "HeyZeroPreRollAudioThread").apply {
             priority = Thread.NORM_PRIORITY + 1
@@ -376,19 +451,38 @@ class HeyZeroPreRollListener(
         }
     }
 
-    private fun stopAudioRecordCapture() {
-        runCatching {
-            audioRecord?.stop()
-            audioRecord?.release()
-        }
-        audioRecord = null
-        audioRecordThread?.interrupt()
+    fun stopAudioRecordCapture() {
+        isAudioCaptureActive.set(false)
+        val thread = audioRecordThread
         audioRecordThread = null
+
+        synchronized(audioRecordLock) {
+            audioRecord?.let { rec ->
+                runCatching {
+                    if (rec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        rec.stop()
+                    }
+                }
+            }
+        }
+
+        thread?.interrupt()
+        if (thread != null && thread !== Thread.currentThread()) {
+            runCatching { thread.join(300L) }
+        }
+
+        synchronized(audioRecordLock) {
+            audioRecord?.let { rec ->
+                runCatching { rec.stop() }
+                runCatching { rec.release() }
+            }
+            audioRecord = null
+        }
     }
 
     private fun startSpeechRecognizerLoop() {
         mainHandler.post {
-            if (!isListening.get()) return@post
+            if (!isListening.get() || isPausedForTurn.get()) return@post
             runCatching {
                 if (speechRecognizer == null) {
                     if (!SpeechRecognizer.isRecognitionAvailable(context)) {
@@ -446,13 +540,13 @@ class HeyZeroPreRollListener(
             }
             override fun onEndOfSpeech() {
                 isSpeechRecognizerActive = false
-                if (isListening.get()) {
+                if (isListening.get() && !isPausedForTurn.get()) {
                     mainHandler.postDelayed({ restartRecognizer() }, 80L)
                 }
             }
             override fun onError(error: Int) {
                 isSpeechRecognizerActive = false
-                if (isListening.get()) {
+                if (isListening.get() && !isPausedForTurn.get()) {
                     mainHandler.postDelayed({ restartRecognizer() }, 200L)
                 }
             }
@@ -460,7 +554,7 @@ class HeyZeroPreRollListener(
                 isSpeechRecognizerActive = false
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: emptyList<String>()
                 processTranscriptCandidates(matches)
-                if (isListening.get()) {
+                if (isListening.get() && !isPausedForTurn.get()) {
                     mainHandler.postDelayed({ restartRecognizer() }, 80L)
                 }
             }
@@ -473,7 +567,7 @@ class HeyZeroPreRollListener(
     }
 
     private fun restartRecognizer() {
-        if (!isListening.get()) return
+        if (!isListening.get() || isPausedForTurn.get()) return
         if (currentRms < WAKE_RMS_GATE_THRESHOLD || (requireWristOrientation && !isWristOriented)) {
             return
         }

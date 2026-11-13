@@ -157,6 +157,41 @@ void printFitted(Adafruit_GFX& d, int x, int baseline, char* text, int max_px,
     d.print(text);
 }
 
+// 9x7 px Wi-Fi signal icon: 2x2 dot at x+4, y+5, inner chevron/arc at y+3, outer chevron/arc at y+1.
+void drawWifiIcon(Adafruit_GFX& d, int x, int y, uint16_t fg) {
+    d.drawFastHLine(x + 1, y + 1, 7, fg);
+    d.drawPixel(x, y + 2, fg);
+    d.drawPixel(x + 8, y + 2, fg);
+
+    d.drawFastHLine(x + 3, y + 3, 3, fg);
+    d.drawPixel(x + 2, y + 4, fg);
+    d.drawPixel(x + 6, y + 4, fg);
+
+    d.fillRect(x + 4, y + 5, 2, 2, fg);
+}
+
+// 7x9 px Bluetooth rune: vertical spine at x+3, y..y+8, diagonal crosses, right rune segments.
+void drawBleIcon(Adafruit_GFX& d, int x, int y, uint16_t fg) {
+    d.drawFastVLine(x + 3, y, 9, fg);
+    d.drawLine(x + 1, y + 2, x + 5, y + 6, fg);
+    d.drawLine(x + 1, y + 6, x + 5, y + 2, fg);
+    d.drawLine(x + 3, y, x + 5, y + 2, fg);
+    d.drawLine(x + 3, y + 8, x + 5, y + 6, fg);
+}
+
+// Stair-stepped 'Z', 'z', 'z' sleep glyphs near upper temple ((x, y+10), (x+10, y+4), (x+18, y-2)).
+void drawSleepZzz(Adafruit_GFX& d, int x, int y, uint16_t fg, uint16_t bg) {
+    d.setFont(nullptr);
+    d.setTextSize(1);
+    d.setTextColor(fg, bg);
+    d.setCursor(x, y + 10);
+    d.print('Z');
+    d.setCursor(x + 10, y + 4);
+    d.print('z');
+    d.setCursor(x + 18, y - 2);
+    d.print('z');
+}
+
 }  // namespace
 
 void renderFrame(Adafruit_GFX& d, const GotchiUIState& ui, const char* refresh_mode) {
@@ -179,11 +214,11 @@ void renderFrame(Adafruit_GFX& d, const GotchiUIState& ui, const char* refresh_m
 
     const uint8_t frame = ui.anim_frame % 3;
     const bool is_zero = (ui.skin == "zero");
+    const bool eyes_closed = ui.blink || ui.sleeping;
 
     if (is_zero) {
-        if (ui.state == UiState::THINKING || ui.state == UiState::SYNTHESIZING) {
-            dx = 0;
-        }
+        dx = 0;
+        dy = 0;
         int paste_x = 2 + dx;
         if (paste_x < 2) paste_x = 2;
         if (paste_x > 4) paste_x = 4;
@@ -196,15 +231,15 @@ void renderFrame(Adafruit_GFX& d, const GotchiUIState& ui, const char* refresh_m
             d.drawBitmap(paste_x, paste_y, ZERO_BASE_PORTRAIT_196x134, ZERO_PORTRAIT_W, ZERO_PORTRAIT_H, GxEPD_WHITE);
             switch (ui.state) {
                 case UiState::LISTENING:
-                    if (!ui.blink) {
+                    if (!eyes_closed) {
                         arcStroke(d, 45 + dx, 71 + dy, 69 + dx, 82 + dy, 190, 350, 4, GxEPD_WHITE);
                         arcStroke(d, 87 + dx, 65 + dy, 117 + dx, 78 + dy, 190, 350, 4, GxEPD_WHITE);
                         d.fillRoundRect(50 + dx, 81 + dy, 17, 20, 5, GxEPD_WHITE);
                         d.fillRoundRect(92 + dx, 78 + dy, 20, 21, 6, GxEPD_WHITE);
                     }
-                    // Attentive rounded 'o' mouth
-                    fillBoxCircle(d, 71 + dx, 125 + dy, 86 + dx, 137 + dy, GxEPD_BLACK);
-                    fillBoxCircle(d, 75 + dx, 128 + dy, 82 + dx, 135 + dy, GxEPD_WHITE);
+                    // Clear mouth faceplate box and draw clean closed smile arc matching idle expression
+                    d.fillRect(58 + dx, 118 + dy, 42, 22, GxEPD_WHITE);
+                    arcStroke(d, 63 + dx, 118 + dy, 97 + dx, 136 + dy, 20.0f, 160.0f, 3, GxEPD_BLACK);
                     // Balanced concentric soundwave arcs (3 frames)
                     {
                         static const struct { int x0, y0, x1, y1; float s, e; } arcs_left[] = {
@@ -310,6 +345,7 @@ void renderFrame(Adafruit_GFX& d, const GotchiUIState& ui, const char* refresh_m
                         d.fillRoundRect(47 + dx, 80 + dy, 17, 18, 5, GxEPD_WHITE);
                         d.fillRoundRect(88 + dx, 77 + dy, 20, 20, 6, GxEPD_WHITE);
                     }
+                    d.fillRect(58 + dx, 118 + dy, 42, 20, GxEPD_WHITE);
                     thickLine(d, 65 + dx, 132 + dy, 91 + dx, 129 + dy, 3, GxEPD_BLACK);
                     // Two trail bubbles arcing up from Zero's forehead/temple into the thought cloud
                     ringBoxCircle(d, 28 + dx, 43 + dy, 35 + dx, 50 + dy, 2, GxEPD_BLACK);
@@ -368,15 +404,20 @@ void renderFrame(Adafruit_GFX& d, const GotchiUIState& ui, const char* refresh_m
             }
         }
 
-        // ui.blink: closed horizontal eyelid lines on Zero skin
-        if (ui.blink && (ui.state == UiState::IDLE ||
-                         ui.state == UiState::LISTENING ||
-                         ui.state == UiState::SPEAKING ||
-                         ui.state == UiState::TRANSCRIBING)) {
+        // ui.blink / ui.sleeping: closed horizontal eyelid lines on Zero skin
+        if (eyes_closed && (ui.state == UiState::IDLE ||
+                            ui.state == UiState::LISTENING ||
+                            ui.state == UiState::SPEAKING ||
+                            ui.state == UiState::TRANSCRIBING)) {
             d.fillRect(40 + dx, 64 + dy, 32, 41, GxEPD_BLACK);
             d.fillRect(82 + dx, 60 + dy, 38, 43, GxEPD_BLACK);
             thickLine(d, 45 + dx, 82 + dy, 68 + dx, 82 + dy, 3, GxEPD_WHITE);
             thickLine(d, 87 + dx, 78 + dy, 114 + dx, 78 + dy, 3, GxEPD_WHITE);
+        }
+
+        if (ui.sleeping) {
+            d.fillRoundRect(16, 26, 30, 24, 4, GxEPD_WHITE);
+            drawSleepZzz(d, 18, 30, GxEPD_BLACK, GxEPD_WHITE);
         }
 
         // Ensure side borders stay white (2px margin)
@@ -387,32 +428,65 @@ void renderFrame(Adafruit_GFX& d, const GotchiUIState& ui, const char* refresh_m
         d.fillRect(0, 179, 200, 21, GxEPD_WHITE);
         d.setFont(&FreeSansBold9pt7b);
         char header[40];
-        if (ui.state == UiState::IDLE) {
+        if (ui.sleeping) {
+            snprintf(header, sizeof(header), "ZERO //ZZZ");
+        } else if (ui.state == UiState::IDLE) {
             snprintf(header, sizeof(header), "ZERO");
         } else {
             snprintf(header, sizeof(header), "ZERO // %s", UI_STATE_UPPER[static_cast<uint8_t>(ui.state)]);
         }
         printFitted(d, 5, 194, header, HEADER_TEXT_MAX_PX, GxEPD_BLACK, GxEPD_WHITE);
 
-        // Top-right battery badge with white backing box
-        if (ui.wall_power || ui.battery_pct >= 0) {
-            char bat_badge[10];
-            if (ui.wall_power) {
-                if (ui.battery_pct >= 0) {
-                    snprintf(bat_badge, sizeof(bat_badge), "%d%%+", (int)ui.battery_pct);
+        // Top-right status & battery badge with white backing box
+        const bool has_bat = (ui.wall_power || ui.battery_pct >= 0);
+        if (has_bat || ui.wifi_active || ui.ble_active) {
+            char bat_badge[10] = "";
+            int badge_x = 196;
+            if (has_bat) {
+                if (ui.wall_power) {
+                    if (ui.battery_pct >= 0) {
+                        snprintf(bat_badge, sizeof(bat_badge), "%d%%+", (int)ui.battery_pct);
+                    } else {
+                        snprintf(bat_badge, sizeof(bat_badge), "CHG");
+                    }
                 } else {
-                    snprintf(bat_badge, sizeof(bat_badge), "CHG");
+                    snprintf(bat_badge, sizeof(bat_badge), "%d%%", (int)ui.battery_pct);
                 }
-            } else {
-                snprintf(bat_badge, sizeof(bat_badge), "%d%%", (int)ui.battery_pct);
+                badge_x = 195 - (int)strlen(bat_badge) * 6;
             }
-            int badge_x = 195 - (int)strlen(bat_badge) * 6;
-            d.fillRect(badge_x - 2, 4, 198 - (badge_x - 2), 11, GxEPD_WHITE);
-            d.setFont(nullptr);
-            d.setTextSize(1);
-            d.setTextColor(GxEPD_BLACK, GxEPD_WHITE);
-            d.setCursor(badge_x, 6);
-            d.print(bat_badge);
+
+            int cur_x = has_bat ? (badge_x - 3) : 195;
+            int ble_x = -1;
+            int wifi_x = -1;
+
+            if (ui.ble_active) {
+                cur_x -= 7;
+                ble_x = cur_x;
+                cur_x -= 3;
+            }
+            if (ui.wifi_active) {
+                cur_x -= 9;
+                wifi_x = cur_x;
+                cur_x -= 3;
+            }
+
+            int box_left = (wifi_x >= 0 ? wifi_x : (ble_x >= 0 ? ble_x : badge_x)) - 2;
+            if (box_left < 2) box_left = 2;
+            d.fillRect(box_left, 4, 198 - box_left, 11, GxEPD_WHITE);
+
+            if (wifi_x >= 0) {
+                drawWifiIcon(d, wifi_x, 6, GxEPD_BLACK);
+            }
+            if (ble_x >= 0) {
+                drawBleIcon(d, ble_x, 5, GxEPD_BLACK);
+            }
+            if (has_bat) {
+                d.setFont(nullptr);
+                d.setTextSize(1);
+                d.setTextColor(GxEPD_BLACK, GxEPD_WHITE);
+                d.setCursor(badge_x, 6);
+                d.print(bat_badge);
+            }
         }
         return;
     }
@@ -421,14 +495,16 @@ void renderFrame(Adafruit_GFX& d, const GotchiUIState& ui, const char* refresh_m
     d.fillRect(0, 0, 200, 21, GxEPD_BLACK);
     d.setFont(&FreeSansBold9pt7b);
     char header[40];
-    snprintf(header, sizeof(header), "GOTCHI // %s", UI_STATE_UPPER[static_cast<uint8_t>(ui.state)]);
-    printFitted(d, 5, 15, header, HEADER_TEXT_MAX_PX, GxEPD_WHITE, GxEPD_BLACK);
+    if (ui.sleeping) {
+        snprintf(header, sizeof(header), "GOTCHI // SLEEP");
+    } else {
+        snprintf(header, sizeof(header), "GOTCHI // %s", UI_STATE_UPPER[static_cast<uint8_t>(ui.state)]);
+    }
 
-    d.setFont(nullptr);
-    d.setTextSize(1);
-    d.setTextColor(GxEPD_WHITE, GxEPD_BLACK);
-    if (ui.wall_power || ui.battery_pct >= 0) {
-        char bat_badge[10];
+    const bool has_bat = (ui.wall_power || ui.battery_pct >= 0);
+    char bat_badge[10] = "";
+    int badge_x = 195;
+    if (has_bat) {
         if (ui.wall_power) {
             if (ui.battery_pct >= 0) {
                 snprintf(bat_badge, sizeof(bat_badge), "%d%%+", (int)ui.battery_pct);
@@ -438,12 +514,49 @@ void renderFrame(Adafruit_GFX& d, const GotchiUIState& ui, const char* refresh_m
         } else {
             snprintf(bat_badge, sizeof(bat_badge), "%d%%", (int)ui.battery_pct);
         }
-        int badge_x = 195 - (int)strlen(bat_badge) * 6;
+        badge_x = 195 - (int)strlen(bat_badge) * 6;
         if (badge_x < 152) badge_x = 152;
+    } else {
+        badge_x = 164;
+    }
+
+    int cur_x = badge_x - 3;
+    int ble_x = -1;
+    int wifi_x = -1;
+
+    if (ui.ble_active) {
+        cur_x -= 7;
+        ble_x = cur_x;
+        cur_x -= 3;
+    }
+    if (ui.wifi_active) {
+        cur_x -= 9;
+        wifi_x = cur_x;
+        cur_x -= 3;
+    }
+
+    int leftmost = (wifi_x >= 0 ? wifi_x : (ble_x >= 0 ? ble_x : badge_x));
+    int max_header_px = HEADER_TEXT_MAX_PX;
+    if (leftmost - 4 < max_header_px) {
+        max_header_px = leftmost - 4;
+    }
+    printFitted(d, 5, 15, header, max_header_px, GxEPD_WHITE, GxEPD_BLACK);
+
+    if (wifi_x >= 0) {
+        drawWifiIcon(d, wifi_x, 7, GxEPD_WHITE);
+    }
+    if (ble_x >= 0) {
+        drawBleIcon(d, ble_x, 6, GxEPD_WHITE);
+    }
+
+    d.setFont(nullptr);
+    d.setTextSize(1);
+    d.setTextColor(GxEPD_WHITE, GxEPD_BLACK);
+    if (has_bat) {
         d.setCursor(badge_x, 7);
         d.print(bat_badge);
     } else {
-        d.setCursor(164, 7);
+        d.setCursor(badge_x, 7);
         d.print(strcmp(refresh_mode, "full") == 0 ? "FULL" : "PART");
     }
 
@@ -457,7 +570,7 @@ void renderFrame(Adafruit_GFX& d, const GotchiUIState& ui, const char* refresh_m
     d.fillTriangle(124 + dx, 30 + dy, 134 + dx, 18 + dy, 144 + dx, 30 + dy, GxEPD_BLACK);
 
     // Face per state.
-    if (ui.blink) {
+    if (eyes_closed) {
         thickLine(d, 64 + dx, 70 + dy, 84 + dx, 70 + dy, 3, GxEPD_BLACK);
         thickLine(d, 116 + dx, 70 + dy, 136 + dx, 70 + dy, 3, GxEPD_BLACK);
     } else {
@@ -507,6 +620,10 @@ void renderFrame(Adafruit_GFX& d, const GotchiUIState& ui, const char* refresh_m
                 thickLine(d, 136 + dx, 60 + dy, 118 + dx, 78 + dy, 3, GxEPD_BLACK);
                 break;
         }
+    }
+
+    if (ui.sleeping) {
+        drawSleepZzz(d, 145, 35, GxEPD_BLACK, GxEPD_WHITE);
     }
 
     // Mouth and per-state animations

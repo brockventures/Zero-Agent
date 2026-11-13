@@ -372,6 +372,15 @@ def _get_in_flight_channel_id(in_flight_file: str = IN_FLIGHT_TURN_FILE, agy_pid
     return None
 
 
+def _resolve_repo_root() -> str:
+    """Resolve repository root whether imported from `tools/` or `.agents/hooks/`."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(here)
+    if os.path.basename(here) == "hooks" and os.path.basename(parent) == ".agents":
+        return os.path.dirname(parent)
+    return parent
+
+
 def is_crab_cavern_channel(channel_id: int | str | None) -> bool:
     """Return True if channel_id belongs to Crab Cavern or an external shared channel."""
     if channel_id is None:
@@ -383,7 +392,7 @@ def is_crab_cavern_channel(channel_id: int | str | None) -> bool:
     if cid in CRAB_CAVERN_CHANNEL_IDS:
         return True
     try:
-        _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        _repo_root = _resolve_repo_root()
         if _repo_root not in sys.path:
             sys.path.insert(0, _repo_root)
         from tools.bridge_state import CRAB_CAVERN_CHANNEL_IDS as _BS_CC_IDS
@@ -1334,6 +1343,246 @@ def is_heavy_inline_benchmark_or_migration(cmd: str, cwd: str = "/workspace") ->
     return bool(_HEAVY_CLI_BENCHMARK_OR_MIGRATE_RE.search(cmd))
 
 
+_FORGE_JOB_START_RE = re.compile(
+    r"\b(?:(?:forge\.py|tools\.forge)(?:\s+--[a-zA-Z0-9_-]+(?:=[^\s;|&]+|\s+[^\s;|&-]+)?)*\s+job\s+start|detached_runner\.py\s+start)\b"
+)
+_JOB_START_OTHER_VALUE_FLAGS = {"--name", "-n", "--channel", "--cwd", "--timeout", "-t"}
+_JOB_START_HELP_FLAGS = {"--help", "-h"}
+
+
+def _tokenize_job_start_args(tail: str) -> list[tuple[str, bool]]:
+    """Tokenize shell arguments following `forge.py job start` up to the first unquoted command separator."""
+    tokens: list[tuple[str, bool]] = []
+    cur: list[str] = []
+    in_token = False
+    was_quoted = False
+    quote: str | None = None
+    i = 0
+    n = len(tail)
+
+    while i < n:
+        ch = tail[i]
+        if quote is None:
+            if ch == "\\":
+                if i + 1 < n:
+                    nxt = tail[i + 1]
+                    if nxt == "\n":
+                        i += 2
+                        continue
+                    cur.append(nxt)
+                    in_token = True
+                    i += 2
+                    continue
+                cur.append(ch)
+                in_token = True
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                if cur == ["$"] and not was_quoted:
+                    cur.clear()
+                quote = ch
+                in_token = True
+                was_quoted = True
+                i += 1
+                continue
+            if ch in ("\n", ";"):
+                break
+            if ch == "|":
+                prev_ch = tail[i - 1] if i > 0 else ""
+                if prev_ch != ">":
+                    break
+            if ch == "&":
+                prev_ch = tail[i - 1] if i > 0 else ""
+                next_ch = tail[i + 1] if i + 1 < n else ""
+                if prev_ch != ">" and next_ch != ">":
+                    break
+            if ch.isspace():
+                if in_token:
+                    tokens.append(("".join(cur), was_quoted))
+                    cur = []
+                    in_token = False
+                    was_quoted = False
+                i += 1
+                continue
+            cur.append(ch)
+            in_token = True
+            i += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+            else:
+                cur.append(ch)
+            i += 1
+        elif quote == '"':
+            if ch == "\\" and i + 1 < n and tail[i + 1] in ('"', "\\", "$", "`", "\n"):
+                if tail[i + 1] != "\n":
+                    cur.append(tail[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            else:
+                cur.append(ch)
+            i += 1
+
+    if in_token:
+        tokens.append(("".join(cur), was_quoted))
+    return tokens
+
+
+def has_forge_job_start_command(cmd: str) -> bool:
+    """Return True only when a `forge.py job start` / `detached_runner.py start` invocation
+    includes a non-empty `--command` or `-c` argument (and is not `--help` / `-h`).
+    """
+    if not cmd:
+        return False
+    for m in _FORGE_JOB_START_RE.finditer(cmd):
+        tokens = _tokenize_job_start_args(cmd[m.end() :])
+        if not tokens:
+            continue
+        has_cmd = False
+        has_help = False
+        i = 0
+        while i < len(tokens):
+            tok, tok_quoted = tokens[i]
+            if not tok_quoted and tok in _JOB_START_HELP_FLAGS:
+                has_help = True
+                break
+            if not tok_quoted and tok in ("--command", "-c"):
+                if i + 1 < len(tokens):
+                    nxt_val, nxt_quoted = tokens[i + 1]
+                    if not (
+                        not nxt_quoted
+                        and (
+                            nxt_val in _JOB_START_OTHER_VALUE_FLAGS
+                            or nxt_val in _JOB_START_HELP_FLAGS
+                            or nxt_val.startswith("-")
+                        )
+                    ) and bool(nxt_val.strip()):
+                        has_cmd = True
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if tok.startswith("--command="):
+                if bool(tok[len("--command=") :].strip()):
+                    has_cmd = True
+                i += 1
+                continue
+            if tok.startswith("-c="):
+                if bool(tok[len("-c=") :].strip()):
+                    has_cmd = True
+                i += 1
+                continue
+            if not tok_quoted and tok in _JOB_START_OTHER_VALUE_FLAGS:
+                if i + 1 < len(tokens):
+                    nxt_val, nxt_quoted = tokens[i + 1]
+                    if not nxt_quoted and (
+                        nxt_val in ("--command", "-c")
+                        or nxt_val in _JOB_START_OTHER_VALUE_FLAGS
+                        or nxt_val in _JOB_START_HELP_FLAGS
+                    ):
+                        has_cmd = False
+                        break
+                    i += 2
+                    continue
+                i += 1
+                continue
+            i += 1
+        if has_cmd and not has_help:
+            return True
+    return False
+
+
+def _record_forge_offload_if_applicable(cmd: str, cwd: str, state: dict) -> None:
+    """Record post-offload turn lock state only for validated FORGE enqueue/decision/job-start commands."""
+    is_forge_enqueue = bool(re.search(r"\bforge\.py\s+enqueue\b", cmd))
+    is_forge_stage_decision = bool(
+        re.search(r"\bforge\.py\s+(?:stage-decision|propose)\b", cmd) and "forge_enqueue" in cmd
+    )
+    is_forge_job_start = has_forge_job_start_command(cmd)
+    is_no_synthesize_probe = bool(is_forge_job_start and "--no-synthesize" in cmd)
+
+    if is_forge_enqueue:
+        plan_ok = False
+        m_enq = re.search(r"\bforge\.py\s+enqueue\b", cmd)
+        cmd_before = cmd[: m_enq.start()] if m_enq else ""
+        has_preceding_shell_gen = bool(
+            re.search(
+                r"(?:<<|>>?|\b(?:cat|echo|printf|tee|python3?|cp|mv)\b)[^;&|\n]*[;&|\n]",
+                cmd_before,
+                re.DOTALL,
+            )
+        )
+        if not has_preceding_shell_gen:
+            m_plan = re.search(
+                r"\bforge\.py\s+enqueue\s+(?:--[a-zA-Z0-9_-]+(?:\s+[^\s;\"'|&>]+)?\s+)*(?:\"([^\"]+)\"|'([^']+)'|([^\s;\"'|&>]+))",
+                cmd,
+            )
+            if m_plan:
+                raw_pf = m_plan.group(1) or m_plan.group(2) or m_plan.group(3) or ""
+                if raw_pf and not raw_pf.startswith("-"):
+                    abs_pf = os.path.abspath(os.path.join(cwd or "/workspace", raw_pf))
+                    if os.path.isfile(abs_pf):
+                        try:
+                            with open(abs_pf, "r", encoding="utf-8") as pf:
+                                pdata = json.load(pf)
+                            if isinstance(pdata, dict):
+                                val_fn = None
+                                try:
+                                    _repo_root = _resolve_repo_root()
+                                    if _repo_root not in sys.path:
+                                        sys.path.insert(0, _repo_root)
+                                    elif sys.path[0] != _repo_root:
+                                        sys.path.remove(_repo_root)
+                                        sys.path.insert(0, _repo_root)
+                                    from tools.forge import _normalize_forge_plan_in_place, validate_forge_plan
+                                    _normalize_forge_plan_in_place(pdata, from_enqueue=True)
+                                    val_fn = validate_forge_plan
+                                except Exception:
+                                    try:
+                                        from tools.forge import _normalize_forge_plan_in_place, validate_forge_plan
+                                        _normalize_forge_plan_in_place(pdata, from_enqueue=True)
+                                        val_fn = validate_forge_plan
+                                    except Exception:
+                                        val_fn = None
+
+                                if callable(val_fn):
+                                    is_valid, _ = val_fn(pdata)
+                                    plan_ok = bool(is_valid)
+                                else:
+                                    if not pdata.get("title") or not pdata.get("chunks"):
+                                        plan_ok = False
+                                    elif not (
+                                        pdata.get("origin_channel_id")
+                                        or pdata.get("channel_id")
+                                    ):
+                                        plan_ok = False
+                                    elif not (
+                                        pdata.get("context_fact_sheet")
+                                        or pdata.get("shared_context")
+                                        or pdata.get("facts")
+                                        or pdata.get("objective")
+                                        or pdata.get("chunks")
+                                    ):
+                                        plan_ok = False
+                                    else:
+                                        plan_ok = True
+                        except Exception:
+                            plan_ok = False
+        if plan_ok:
+            state["inline_prod_files"] = []
+            state["offload_dispatched"] = True
+            state["offload_kind"] = "FORGE multi-chunk build (forge.py enqueue)"
+    elif is_forge_stage_decision:
+        state["inline_prod_files"] = []
+        state["offload_dispatched"] = True
+        state["offload_kind"] = "FORGE Two-Stage Decision Card (forge.py stage-decision --handler forge_enqueue)"
+    elif is_forge_job_start and not is_no_synthesize_probe:
+        state["offload_dispatched"] = True
+        state["offload_kind"] = "FORGE background job (forge.py job start)"
+
+
 def check_tool_use(
     name: str,
     args: dict,
@@ -1453,89 +1702,6 @@ def check_tool_use(
         if not ok_dk:
             save_state(state, state_file)
             return False, dk_reason
-
-        is_forge_enqueue = bool(re.search(r"\bforge\.py\s+enqueue\b", cmd))
-        is_forge_stage_decision = bool(re.search(r"\bforge\.py\s+(?:stage-decision|propose)\b", cmd) and "forge_enqueue" in cmd)
-        is_forge_job_start = bool(
-            re.search(r"\bforge\.py\s+job\s+start\b", cmd) or re.search(r"\bdetached_runner\.py\s+start\b", cmd)
-        )
-        is_no_synthesize_probe = bool(is_forge_job_start and "--no-synthesize" in cmd)
-        if is_forge_enqueue:
-            plan_ok = False
-            m_enq = re.search(r"\bforge\.py\s+enqueue\b", cmd)
-            cmd_before = cmd[: m_enq.start()] if m_enq else ""
-            has_preceding_shell_gen = bool(
-                re.search(r"(?:<<|>>?|\b(?:cat|echo|printf|tee|python3?|cp|mv)\b)[^;&|\n]*[;&|\n]", cmd_before, re.DOTALL)
-            )
-            if not has_preceding_shell_gen:
-                m_plan = re.search(
-                    r"\bforge\.py\s+enqueue\s+(?:--[a-zA-Z0-9_-]+(?:\s+[^\s;\"'|&>]+)?\s+)*(?:\"([^\"]+)\"|'([^']+)'|([^\s;\"'|&>]+))",
-                    cmd,
-                )
-                if m_plan:
-                    raw_pf = m_plan.group(1) or m_plan.group(2) or m_plan.group(3) or ""
-                    if raw_pf and not raw_pf.startswith("-"):
-                        abs_pf = os.path.abspath(os.path.join(cwd or "/workspace", raw_pf))
-                        if os.path.isfile(abs_pf):
-                            try:
-                                with open(abs_pf, "r", encoding="utf-8") as pf:
-                                    pdata = json.load(pf)
-                                if isinstance(pdata, dict):
-                                    val_fn = None
-                                    try:
-                                        _repo_root = os.path.abspath(
-                                            os.path.join(os.path.dirname(__file__), "..", "..")
-                                        )
-                                        if _repo_root not in sys.path:
-                                            sys.path.insert(0, _repo_root)
-                                        elif sys.path[0] != _repo_root:
-                                            sys.path.remove(_repo_root)
-                                            sys.path.insert(0, _repo_root)
-                                        from tools.forge import _normalize_forge_plan_in_place, validate_forge_plan
-                                        _normalize_forge_plan_in_place(pdata, from_enqueue=True)
-                                        val_fn = validate_forge_plan
-                                    except Exception:
-                                        try:
-                                            from tools.forge import _normalize_forge_plan_in_place, validate_forge_plan
-                                            _normalize_forge_plan_in_place(pdata, from_enqueue=True)
-                                            val_fn = validate_forge_plan
-                                        except Exception:
-                                            val_fn = None
-
-                                    if callable(val_fn):
-                                        is_valid, _ = val_fn(pdata)
-                                        plan_ok = bool(is_valid)
-                                    else:
-                                        if not pdata.get("title") or not pdata.get("chunks"):
-                                            plan_ok = False
-                                        elif not (
-                                            pdata.get("origin_channel_id")
-                                            or pdata.get("channel_id")
-                                        ):
-                                            plan_ok = False
-                                        elif not (
-                                            pdata.get("context_fact_sheet")
-                                            or pdata.get("shared_context")
-                                            or pdata.get("facts")
-                                            or pdata.get("objective")
-                                            or pdata.get("chunks")
-                                        ):
-                                            plan_ok = False
-                                        else:
-                                            plan_ok = True
-                            except Exception:
-                                plan_ok = False
-            if plan_ok:
-                state["inline_prod_files"] = []
-                state["offload_dispatched"] = True
-                state["offload_kind"] = "FORGE multi-chunk build (forge.py enqueue)"
-        elif is_forge_stage_decision:
-            state["inline_prod_files"] = []
-            state["offload_dispatched"] = True
-            state["offload_kind"] = "FORGE Two-Stage Decision Card (forge.py stage-decision --handler forge_enqueue)"
-        elif is_forge_job_start and not is_no_synthesize_probe:
-            state["offload_dispatched"] = True
-            state["offload_kind"] = "FORGE background job (forge.py job start)"
 
         # A00-del. File Deletion & Decision Card Tamper Gate
         ok_del, del_reason = check_file_deletion_gate(cmd, cwd=cwd)
@@ -1722,52 +1888,44 @@ def check_tool_use(
             state["same_file_view_count"] = 0
             state["same_file_edit_count"] = 0
             state["consecutive_git_cmds"] = 0
-            save_state(state, state_file)
-            return True, ""
         else:
             state["consecutive_inline_python"] = 0
+            # C. Serial unbatched git lifecycle check
+            if is_single_git_lifecycle_cmd(cmd):
+                state["consecutive_git_cmds"] = state.get("consecutive_git_cmds", 0) + 1
+                if state["consecutive_git_cmds"] > MAX_CONSECUTIVE_GIT_CMDS:
+                    save_state(state, state_file)
+                    return False, (
+                        f"Batch Invariant Triggered: Detected {state['consecutive_git_cmds']} consecutive unbatched git lifecycle commands in serial. "
+                        "Please bundle git operations (e.g. 'git add <files> && git commit -m \"...\" && git push && gh pr create') into a single compound "
+                        "command or script to minimize tool roundtrips."
+                    )
+                state["cmd_inspections"] = 0
+                state["consecutive_file_views"] = 0
+                state["same_file_view_count"] = 0
+                state["same_file_edit_count"] = 0
+                state["agora_eval_calls"] = 0
+            else:
+                state["consecutive_git_cmds"] = 0
+                if is_batched_or_mutating_cmd(cmd):
+                    state["cmd_inspections"] = 0
+                    state["consecutive_file_views"] = 0
+                    state["same_file_view_count"] = 0
+                    state["same_file_edit_count"] = 0
+                    state["agora_eval_calls"] = 0
+                elif is_single_shell_inspection(cmd):
+                    state["cmd_inspections"] = state.get("cmd_inspections", 0) + 1
+                    if state["cmd_inspections"] > MAX_CONSECUTIVE_SHELL_INSPECTIONS:
+                        save_state(state, state_file)
+                        return False, (
+                            f"Batch Invariant Triggered: Detected {state['cmd_inspections']} consecutive single-line inspection commands in serial. "
+                            "Please bundle your diagnostic checks into a compound one-liner or a single Python scratch script in /workspace/scratch/ "
+                            "to minimize tool roundtrips."
+                        )
+                else:
+                    state["cmd_inspections"] = 0
 
-        # C. Serial unbatched git lifecycle check
-        if is_single_git_lifecycle_cmd(cmd):
-            state["consecutive_git_cmds"] = state.get("consecutive_git_cmds", 0) + 1
-            if state["consecutive_git_cmds"] > MAX_CONSECUTIVE_GIT_CMDS:
-                save_state(state, state_file)
-                return False, (
-                    f"Batch Invariant Triggered: Detected {state['consecutive_git_cmds']} consecutive unbatched git lifecycle commands in serial. "
-                    "Please bundle git operations (e.g. 'git add <files> && git commit -m \"...\" && git push && gh pr create') into a single compound "
-                    "command or script to minimize tool roundtrips."
-                )
-            state["cmd_inspections"] = 0
-            state["consecutive_file_views"] = 0
-            state["same_file_view_count"] = 0
-            state["same_file_edit_count"] = 0
-            state["agora_eval_calls"] = 0
-            save_state(state, state_file)
-            return True, ""
-        else:
-            state["consecutive_git_cmds"] = 0
-
-        if is_batched_or_mutating_cmd(cmd):
-            state["cmd_inspections"] = 0
-            state["consecutive_file_views"] = 0
-            state["same_file_view_count"] = 0
-            state["same_file_edit_count"] = 0
-            state["agora_eval_calls"] = 0
-            save_state(state, state_file)
-            return True, ""
-
-        if is_single_shell_inspection(cmd):
-            state["cmd_inspections"] = state.get("cmd_inspections", 0) + 1
-            if state["cmd_inspections"] > MAX_CONSECUTIVE_SHELL_INSPECTIONS:
-                save_state(state, state_file)
-                return False, (
-                    f"Batch Invariant Triggered: Detected {state['cmd_inspections']} consecutive single-line inspection commands in serial. "
-                    "Please bundle your diagnostic checks into a compound one-liner or a single Python scratch script in /workspace/scratch/ "
-                    "to minimize tool roundtrips."
-                )
-        else:
-            state["cmd_inspections"] = 0
-
+        _record_forge_offload_if_applicable(cmd, cwd, state)
         save_state(state, state_file)
         return True, ""
 
@@ -2059,7 +2217,11 @@ def main():
         # 1. Unified Search Safety Gate (in-process, avoiding a second Python subprocess spawn)
         if name in ("grep_search", "find_by_name", "run_command"):
             try:
-                sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                _here = os.path.dirname(os.path.abspath(__file__))
+                _hooks_dir = os.path.join(_resolve_repo_root(), ".agents", "hooks")
+                for _sg_dir in (_here, _hooks_dir):
+                    if os.path.isdir(_sg_dir) and _sg_dir not in sys.path:
+                        sys.path.insert(0, _sg_dir)
                 from search_guard import check_search_path, check_command_line, normalize_path
                 if name == "grep_search":
                     s_ok, s_reason = check_search_path(args.get("SearchPath", ""), cwd)
@@ -2079,6 +2241,28 @@ def main():
                     if not s_ok:
                         print(json.dumps({"decision": "deny", "reason": s_reason}))
                         return
+            except Exception:
+                pass
+
+        # 1b. Shell Double-Quote Corruption Guard (run before check_tool_use so denied commands never mutate state)
+        if name == "run_command" and not args.get("IsDaemon", False):
+            try:
+                raw_cmd_pre = args.get("CommandLine", "")
+                if escape_double_quoted_cli_prose(raw_cmd_pre) != raw_cmd_pre:
+                    print(
+                        json.dumps(
+                            {
+                                "decision": "deny",
+                                "reason": (
+                                    "Shell Double-Quote Corruption Guard: Detected unescaped '$' ($0, $1, $var) or backticks (`...`) "
+                                    "inside a double-quoted CLI prose argument (--message, -m, --body, --summary, --title). "
+                                    "Bash expands '$0' to 'bash', eats '$1..$9', and executes '`...`' as command substitution before Python runs. "
+                                    "Use single quotes (--message '...') or a single-quoted python3 -c script."
+                                ),
+                            }
+                        )
+                    )
+                    return
             except Exception:
                 pass
 

@@ -68,6 +68,7 @@ class GotchiBleBondingActivity : Activity() {
         private const val BURST_HOLD_MS = 500L
         const val KEY_WAKE_WORD_ENABLED = "key_wake_word_enabled"
         const val DEFAULT_FALLBACK_URL = "https://gotchi.brock.ventures"
+        const val APP_VERSION_LABEL = "v12"
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -118,6 +119,7 @@ class GotchiBleBondingActivity : Activity() {
     override fun onResume() {
         super.onResume()
         enableFullScreenImmersiveMode()
+        ensureRelayServiceRunningIfPermitted()
         updateStatusUi()
         mainHandler.post(statusPollRunnable)
 
@@ -132,6 +134,31 @@ class GotchiBleBondingActivity : Activity() {
         if (wakeEnabled && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             if (engine.preRollListener == null) {
                 engine.initWakeWordListener(this).start()
+            }
+        }
+    }
+
+    private fun hasBleRelayPermissions(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
+                checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+    }
+
+    internal fun ensureRelayServiceRunningIfPermitted() {
+        val prefs = getSharedPreferences(GotchiBleRelayService.PREFS_NAME, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(GotchiBleRelayService.KEY_RELAY_ENABLED, true)) return
+        if (!hasBleRelayPermissions()) return
+        if (GotchiBleRelayService.connectionStatus == "IDLE") {
+            val serviceIntent = Intent(this, GotchiBleRelayService::class.java)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent)
+                } else {
+                    startService(serviceIntent)
+                }
             }
         }
     }
@@ -300,7 +327,7 @@ class GotchiBleBondingActivity : Activity() {
         rootLayout.addView(titleView)
 
         val subtitleView = TextView(this).apply {
-            text = "Smart Pipe Companion Forwarder & Desk Relay"
+            text = "Smart Pipe Companion Forwarder & Desk Relay ($APP_VERSION_LABEL)"
             textSize = 12f
             setTextColor(Color.parseColor("#9E9E9E"))
             setPadding(0, 0, 0, dp(16))
@@ -703,6 +730,7 @@ class GotchiBleBondingActivity : Activity() {
                     Toast.LENGTH_LONG
                 ).show()
             } else {
+                ensureRelayServiceRunningIfPermitted()
                 if (wakeWordCheckBox.isChecked && engine.preRollListener == null) {
                     engine.initWakeWordListener(this).start()
                 }

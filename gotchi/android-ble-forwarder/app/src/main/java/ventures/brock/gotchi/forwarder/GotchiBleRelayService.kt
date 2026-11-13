@@ -222,6 +222,9 @@ class GotchiBleRelayService : Service() {
         const val SMP_BONDING_MAX_WAIT_MS = 20000L
         const val SMP_POST_BOND_DISC_SETTLE_DELAY_MS = 1200L
         const val GATT_WRITE_WATCHDOG_TIMEOUT_MS = 150L
+        const val BLE_UPLINK_WATCHDOG_TIMEOUT_MS = 4000L
+        const val BLE_ERROR_DEBOUNCE_MS = 500L
+        const val FORWARDER_PROTOCOL_VERSION_CODE = 12
 
         val SERVICE_UUID: UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
         val CHAR_TX_UUID: UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E") // GOTCHI -> Phone (Notify)
@@ -275,6 +278,10 @@ class GotchiBleRelayService : Service() {
     internal val bleWriteQueue: ConcurrentLinkedQueue<ByteArray> = ConcurrentLinkedQueue()
     internal val isWriteInFlight: AtomicBoolean = AtomicBoolean(false)
     private var writeWatchdogJob: Job? = null
+    internal var uplinkTurnWatchdogJob: Job? = null
+    internal var uplinkReassemblyInProgress: Boolean = false
+    private var uplinkTurnCorrupted: Boolean = false
+    private var lastBleErrorSentMs: Long = 0L
     private var highPriorityActive: Boolean = false
     private var networkCallbackRegistered: Boolean = false
     private var notifyPollRunning: Boolean = false
@@ -349,6 +356,61 @@ class GotchiBleRelayService : Service() {
         isWriteInFlight.set(false)
     }
 
+    internal fun cancelUplinkTurnWatchdog() {
+        uplinkTurnWatchdogJob?.cancel()
+        uplinkTurnWatchdogJob = null
+    }
+
+    internal fun scheduleUplinkTurnWatchdog(timeoutMs: Long = BLE_UPLINK_WATCHDOG_TIMEOUT_MS) {
+        uplinkTurnWatchdogJob?.cancel()
+        uplinkTurnWatchdogJob = serviceScope.launch {
+            delay(timeoutMs)
+            abortIncompleteUplinkTurn("uplink_turn_timeout")
+        }
+    }
+
+    internal fun abortIncompleteUplinkTurn(reason: String = "uplink_turn_timeout") {
+        cancelUplinkTurnWatchdog()
+        val hadIncompleteTurn = isRelayTurnActive ||
+            uplinkReassemblyInProgress ||
+            audioStreamBuffer.size() > 0 ||
+            imageFrames.isNotEmpty()
+        uplinkReassemblyInProgress = false
+        uplinkTurnCorrupted = false
+        reassembler.resetSequenceTracking()
+        audioStreamBuffer.reset()
+        audioStreamIsAdpcm = false
+        imageFrames.clear()
+        updateTurnConnectionPriority(false)
+        if (!hadIncompleteTurn) {
+            return
+        }
+        Log.w(
+            TAG,
+            "BLE uplink watchdog expired after ${BLE_UPLINK_WATCHDOG_TIMEOUT_MS}ms ($reason); " +
+                "flushing incomplete turn and sending STATE:idle / error control frame to Gotchi"
+        )
+        val ctrlFrameJson = JSONObject()
+            .put("cmd", "turn_abort")
+            .put("control", "STATE:idle")
+            .put("state", "idle")
+            .put("error", reason)
+            .toString()
+        sendBleFrame(BleFramingCodec.FrameType.CONTROL, ctrlFrameJson.toByteArray(Charsets.UTF_8))
+
+        val errPayload = JSONObject()
+            .put("error", reason)
+            .put("message", "BLE TURN TIMEOUT")
+            .put("event", "error")
+            .put("detail", reason)
+            .toString()
+        val errEvt = "event: error\ndata: $errPayload\n\n"
+        val idleEvt = "event: state\ndata: {\"state\":\"idle\"}\n\n"
+        sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, errEvt.toByteArray(Charsets.UTF_8))
+        sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, idleEvt.toByteArray(Charsets.UTF_8))
+        emitTerminalDoneToBle()
+    }
+
     internal fun updateTurnConnectionPriority(active: Boolean) {
         if (active) {
             isRelayTurnActive = true
@@ -378,6 +440,9 @@ class GotchiBleRelayService : Service() {
 
     private fun disconnectAndDisableRelay() {
         relayDisabled = true
+        cancelUplinkTurnWatchdog()
+        uplinkReassemblyInProgress = false
+        uplinkTurnCorrupted = false
         updateTurnConnectionPriority(false)
         isTxSubscribed = false
         handshakeSupervisorJob?.cancel()
@@ -404,6 +469,9 @@ class GotchiBleRelayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        cancelUplinkTurnWatchdog()
+        uplinkReassemblyInProgress = false
+        uplinkTurnCorrupted = false
         updateTurnConnectionPriority(false)
         isTxSubscribed = false
         handshakeSupervisorJob?.cancel()
@@ -533,6 +601,9 @@ class GotchiBleRelayService : Service() {
 
     private fun triggerRescan() {
         if (relayDisabled) return
+        cancelUplinkTurnWatchdog()
+        uplinkReassemblyInProgress = false
+        uplinkTurnCorrupted = false
         updateTurnConnectionPriority(false)
         isTxSubscribed = false
         handshakeSupervisorJob?.cancel()
@@ -781,6 +852,9 @@ class GotchiBleRelayService : Service() {
                 // Note: Do NOT call setPreferredPhy(PHY_LE_2M_MASK) or requestMtu(512) here before SMP encryption/bonding settles
                 launchHandshakeSupervisor(gatt)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                cancelUplinkTurnWatchdog()
+                uplinkReassemblyInProgress = false
+                uplinkTurnCorrupted = false
                 updateTurnConnectionPriority(false)
                 isTxSubscribed = false
                 handshakeSupervisorJob?.cancel()
@@ -920,7 +994,29 @@ class GotchiBleRelayService : Service() {
 
     internal fun handleIncomingBlePacket(rawPacket: ByteArray) {
         try {
+            val rawFrameType = if (
+                rawPacket.size >= BleFramingCodec.OVERHEAD_BYTES &&
+                (rawPacket[0].toInt() and 0xFF) == (BleFramingCodec.MAGIC and 0xFF) &&
+                (rawPacket[1].toInt() and 0xFF) == ((BleFramingCodec.MAGIC shr 8) and 0xFF)
+            ) {
+                BleFramingCodec.FrameType.fromId(rawPacket[2].toInt() and 0xFF)
+            } else {
+                null
+            }
+            if (rawFrameType == BleFramingCodec.FrameType.AUDIO_CHUNK ||
+                rawFrameType == BleFramingCodec.FrameType.IMAGE_FRAME
+            ) {
+                val rawFlags = rawPacket[3].toInt() and 0xFF
+                val rawChunkIdx = ((rawPacket[8].toInt() and 0xFF) or ((rawPacket[9].toInt() and 0xFF) shl 8))
+                if ((rawFlags and BleFramingCodec.FLAG_FIRST_CHUNK) != 0 || rawChunkIdx == 0) {
+                    uplinkTurnCorrupted = false
+                }
+                uplinkReassemblyInProgress = true
+                updateTurnConnectionPriority(true)
+                scheduleUplinkTurnWatchdog()
+            }
             val completed = reassembler.pushPacket(rawPacket) ?: return
+            uplinkReassemblyInProgress = false
             if ((completed.flags and BleFramingCodec.FLAG_REQUIRES_ACK) != 0) {
                 val ackPayload = ByteArray(2) { idx ->
                     ((completed.seqNum shr (idx * 8)) and 0xFF).toByte()
@@ -929,7 +1025,9 @@ class GotchiBleRelayService : Service() {
             }
             when (completed.frameType) {
                 BleFramingCodec.FrameType.AUDIO_CHUNK -> {
+                    uplinkTurnCorrupted = false
                     updateTurnConnectionPriority(true)
+                    scheduleUplinkTurnWatchdog()
                     if ((completed.flags and BleFramingCodec.FLAG_FIRST_CHUNK) != 0 &&
                         audioStreamBuffer.size() == 0
                     ) {
@@ -942,9 +1040,22 @@ class GotchiBleRelayService : Service() {
                     audioStreamBuffer.write(completed.payload)
                 }
                 BleFramingCodec.FrameType.IMAGE_FRAME -> {
+                    uplinkTurnCorrupted = false
+                    updateTurnConnectionPriority(true)
+                    scheduleUplinkTurnWatchdog()
                     imageFrames[completed.frameIndex] = completed.payload
                 }
                 BleFramingCodec.FrameType.TURN_COMMIT -> {
+                    cancelUplinkTurnWatchdog()
+                    if (uplinkTurnCorrupted) {
+                        uplinkTurnCorrupted = false
+                        audioStreamBuffer.reset()
+                        audioStreamIsAdpcm = false
+                        imageFrames.clear()
+                        updateTurnConnectionPriority(false)
+                        Log.w(TAG, "Dropping trailing TURN_COMMIT after corrupted uplink burst")
+                        return
+                    }
                     updateTurnConnectionPriority(true)
                     val commitMeta = if (completed.payload.isNotEmpty()) {
                         runCatching { JSONObject(String(completed.payload, Charsets.UTF_8)) }.getOrNull()
@@ -959,6 +1070,9 @@ class GotchiBleRelayService : Service() {
                     handleTurnCommit(rawAudioBytes, isAdpcm, capturedImages, commitMeta, locationMeta)
                 }
                 BleFramingCodec.FrameType.CANCEL -> {
+                    cancelUplinkTurnWatchdog()
+                    uplinkReassemblyInProgress = false
+                    uplinkTurnCorrupted = false
                     updateTurnConnectionPriority(false)
                     reassembler.reset()
                     audioStreamBuffer.reset()
@@ -977,14 +1091,34 @@ class GotchiBleRelayService : Service() {
                 else -> Unit
             }
         } catch (e: Exception) {
+            cancelUplinkTurnWatchdog()
+            uplinkReassemblyInProgress = false
+            uplinkTurnCorrupted = true
+            reassembler.resetSequenceTracking()
+            audioStreamBuffer.reset()
+            audioStreamIsAdpcm = false
+            imageFrames.clear()
             updateTurnConnectionPriority(false)
             Log.w(TAG, "BLE packet error: ${e.message}")
-            val errJson = JSONObject()
-                .put("event", "error")
-                .put("detail", e.message ?: "framing_error")
-                .toString()
-            sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, errJson.toByteArray(Charsets.UTF_8))
-            emitTerminalDoneToBle()
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastBleErrorSentMs >= BLE_ERROR_DEBOUNCE_MS) {
+                lastBleErrorSentMs = nowMs
+                val ctrlFrameJson = JSONObject()
+                    .put("cmd", "turn_abort")
+                    .put("control", "STATE:idle")
+                    .put("state", "idle")
+                    .put("error", e.message ?: "framing_error")
+                    .toString()
+                sendBleFrame(BleFramingCodec.FrameType.CONTROL, ctrlFrameJson.toByteArray(Charsets.UTF_8))
+                val errJson = JSONObject()
+                    .put("event", "error")
+                    .put("detail", e.message ?: "framing_error")
+                    .toString()
+                sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, errJson.toByteArray(Charsets.UTF_8))
+                val idleEvt = "event: state\ndata: {\"state\":\"idle\"}\n\n"
+                sendBleFrame(BleFramingCodec.FrameType.SSE_EVENT, idleEvt.toByteArray(Charsets.UTF_8))
+                emitTerminalDoneToBle()
+            }
         }
     }
 
@@ -1720,13 +1854,15 @@ class GotchiBleRelayService : Service() {
         val gatewayUrl = rawGatewayUrl.removeSuffix("/api/voice/interact").trimEnd('/')
         val bearerToken = prefs.getString(KEY_BEARER_TOKEN, "") ?: ""
 
+        val installedVersion = GotchiForwarderUpdater.getInstalledVersionCode(this)
+            .takeIf { it > 0 } ?: FORWARDER_PROTOCOL_VERSION_CODE
         val payload = JSONObject().apply {
             put("tailscale_ip", ips.tailscaleIp ?: JSONObject.NULL)
             put("lan_ip", ips.lanIp ?: JSONObject.NULL)
             put("adb_tls_port", port)
             put("device", Build.MODEL ?: "Android")
             put("device_model", Build.MODEL ?: "Android")
-            put("version_code", 11)
+            put("version_code", installedVersion)
             put("timestamp", System.currentTimeMillis() / 1000.0)
         }
 

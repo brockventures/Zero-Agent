@@ -839,6 +839,17 @@ bool playBase64AdpcmChunk(const char* b64_data, size_t b64_len, uint32_t sample_
     return ok;
 }
 
+static uint8_t s_chime_volume_pct = 35;
+
+void setChimeVolumePct(uint8_t pct) {
+    if (pct > 100) pct = 100;
+    s_chime_volume_pct = pct;
+}
+
+uint8_t getChimeVolumePct() {
+    return s_chime_volume_pct;
+}
+
 bool isValidChimeKind(const char* kind) {
     if (!kind) return false;
     return strcmp(kind, "") == 0 ||
@@ -1086,6 +1097,7 @@ static void addSpringRingTail(
 void playChime(const char* kind) {
     if (!kind || kind[0] == '\0') return;
     if (!isValidChimeKind(kind)) return;
+    if (s_chime_volume_pct == 0) return;
 
     // Max chime duration is Build Ready (~800ms = 19,200 samples @ 24 kHz)
     constexpr size_t MAX_CHIME_SAMPLES = 20400;
@@ -1151,12 +1163,15 @@ void playChime(const char* kind) {
 
     if (total_samples > MAX_CHIME_SAMPLES) total_samples = MAX_CHIME_SAMPLES;
     // Two-pole 300 Hz high-pass filter at 24 kHz (alpha = 0.924) to strip sub-bass coil current spikes,
-    // paired with 24,000 LSB peak ceiling so chimes are crisp and clearly audible without rail sag.
+    // paired with configurable chime_volume_pct scaling of the 24,000 LSB peak ceiling (default 35%)
+    // so beeps and boops are gentle pocket ticks while leaving TTS speech playback volume untouched.
     const float alpha = 0.924f;
     float x1 = 0.0f, y1 = 0.0f;
     float x2 = 0.0f, y2 = 0.0f;
+    const float chime_scale = (static_cast<float>(s_chime_volume_pct) / 100.0f);
+    const float chime_peak_lsb = CHIME_PEAK_CEILING_LSB * chime_scale;
     for (size_t i = 0; i < total_samples; ++i) {
-        float x = tanhf(mix_buf[i] / 28000.0f) * 24000.0f;
+        float x = tanhf(mix_buf[i] / 28000.0f) * chime_peak_lsb;
         float s1 = alpha * (y1 + x - x1);
         x1 = x;
         y1 = s1;

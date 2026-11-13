@@ -11,8 +11,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import sys
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
+if _REPO_ROOT in sys.path:
+    sys.path.remove(_REPO_ROOT)
+sys.path.insert(0, _REPO_ROOT)
 from tools.bridge_git_sync import get_current_git_sha, sync_git_on_reload
 
 
@@ -86,6 +90,33 @@ class TestBridgeGitSync(unittest.TestCase):
             self.assertFalse(res["synced"])
             self.assertIsNotNone(res["error"])
             self.assertIn("Network timeout", res["message"])
+
+    def test_sync_git_on_reload_batches_untracked_and_enforces_timeouts(self):
+        import subprocess
+
+        recorded_calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            recorded_calls.append((cmd, kwargs.get("timeout"), kwargs.get("env", {})))
+            if "status" in cmd:
+                return MagicMock(
+                    returncode=0,
+                    stdout="?? tools/a.py\n?? tools/b.py\n?? scratch/ignore.tmp\n",
+                )
+            if "diff" in cmd:
+                return MagicMock(returncode=0, stdout="tools/a.py\ntools/b.py\n")
+            return MagicMock(returncode=0, stdout="abc9999\n")
+
+        fake_sync_file = self.temp_path / "last_sync.json"
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("tools.bridge_git_sync.LAST_SYNC_FILE", fake_sync_file):
+            res = sync_git_on_reload(repo_dir=self.temp_path, timeout=None)
+
+        self.assertTrue(res["synced"])
+        self.assertTrue(all(t is not None and t > 0 for _, t, _ in recorded_calls))
+        self.assertTrue(all(env.get("GIT_TERMINAL_PROMPT") == "0" for _, _, env in recorded_calls))
+        untracked_adds = [cmd for cmd, _, _ in recorded_calls if cmd[:3] == ["git", "add", "--"]]
+        self.assertEqual(untracked_adds, [["git", "add", "--", "tools/a.py", "tools/b.py"]])
 
 
 if __name__ == "__main__":

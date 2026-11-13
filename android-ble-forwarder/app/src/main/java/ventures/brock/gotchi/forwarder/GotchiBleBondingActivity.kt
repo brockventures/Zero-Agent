@@ -1,10 +1,14 @@
 package ventures.brock.gotchi.forwarder
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -64,6 +68,7 @@ class GotchiBleBondingActivity : Activity() {
         private const val BURST_HOLD_MS = 500L
         const val KEY_WAKE_WORD_ENABLED = "key_wake_word_enabled"
         const val DEFAULT_FALLBACK_URL = "https://gotchi.brock.ventures"
+        const val APP_VERSION_LABEL = "v12"
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -114,6 +119,7 @@ class GotchiBleBondingActivity : Activity() {
     override fun onResume() {
         super.onResume()
         enableFullScreenImmersiveMode()
+        ensureRelayServiceRunningIfPermitted()
         updateStatusUi()
         mainHandler.post(statusPollRunnable)
 
@@ -128,6 +134,31 @@ class GotchiBleBondingActivity : Activity() {
         if (wakeEnabled && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             if (engine.preRollListener == null) {
                 engine.initWakeWordListener(this).start()
+            }
+        }
+    }
+
+    private fun hasBleRelayPermissions(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
+                checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+    }
+
+    internal fun ensureRelayServiceRunningIfPermitted() {
+        val prefs = getSharedPreferences(GotchiBleRelayService.PREFS_NAME, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(GotchiBleRelayService.KEY_RELAY_ENABLED, true)) return
+        if (!hasBleRelayPermissions()) return
+        if (GotchiBleRelayService.connectionStatus == "IDLE") {
+            val serviceIntent = Intent(this, GotchiBleRelayService::class.java)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent)
+                } else {
+                    startService(serviceIntent)
+                }
             }
         }
     }
@@ -296,7 +327,7 @@ class GotchiBleBondingActivity : Activity() {
         rootLayout.addView(titleView)
 
         val subtitleView = TextView(this).apply {
-            text = "Smart Pipe Companion Forwarder & Desk Relay"
+            text = "Smart Pipe Companion Forwarder & Desk Relay ($APP_VERSION_LABEL)"
             textSize = 12f
             setTextColor(Color.parseColor("#9E9E9E"))
             setPadding(0, 0, 0, dp(16))
@@ -699,10 +730,78 @@ class GotchiBleBondingActivity : Activity() {
                     Toast.LENGTH_LONG
                 ).show()
             } else {
+                ensureRelayServiceRunningIfPermitted()
                 if (wakeWordCheckBox.isChecked && engine.preRollListener == null) {
                     engine.initWakeWordListener(this).start()
                 }
             }
+        }
+    }
+
+    private var pendingBondReceiver: BroadcastReceiver? = null
+
+    private fun unregisterPendingBondReceiver() {
+        val receiver = pendingBondReceiver ?: return
+        pendingBondReceiver = null
+        runCatching { unregisterReceiver(receiver) }
+    }
+
+    override fun onDestroy() {
+        unregisterPendingBondReceiver()
+        super.onDestroy()
+    }
+
+    @SuppressLint("MissingPermission")
+    internal fun bondAndConnectDevice(
+        device: BluetoothDevice,
+        onReadyToConnect: (BluetoothDevice) -> Unit
+    ) {
+        unregisterPendingBondReceiver()
+        when (device.bondState) {
+            BluetoothDevice.BOND_BONDED -> {
+                onReadyToConnect(device)
+            }
+            BluetoothDevice.BOND_BONDING -> {
+                GotchiBleRelayService.connectionStatus = "BONDING"
+                updateStatusUi()
+                waitForDeviceBondedThenConnect(device, onReadyToConnect)
+            }
+            else -> {
+                GotchiBleRelayService.connectionStatus = "BONDING"
+                updateStatusUi()
+                waitForDeviceBondedThenConnect(device, onReadyToConnect)
+                runCatching { device.createBond() }
+            }
+        }
+    }
+
+    private fun waitForDeviceBondedThenConnect(
+        targetDevice: BluetoothDevice,
+        onReadyToConnect: (BluetoothDevice) -> Unit
+    ) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) return
+                @Suppress("DEPRECATION")
+                val dev = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE) ?: return
+                if (dev.address != targetDevice.address) return
+                when (intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)) {
+                    BluetoothDevice.BOND_BONDED -> {
+                        unregisterPendingBondReceiver()
+                        onReadyToConnect(dev)
+                    }
+                    BluetoothDevice.BOND_NONE -> {
+                        unregisterPendingBondReceiver()
+                    }
+                }
+            }
+        }
+        pendingBondReceiver = receiver
+        val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(receiver, filter)
         }
     }
 
@@ -827,24 +926,43 @@ class GotchiBleBondingActivity : Activity() {
     }
 
     // Interactive Button Handlers
+    private var pendingPttRunnable: Runnable? = null
+
     private fun handleBtnTopTouch(action: Int) {
         when (action) {
             MotionEvent.ACTION_DOWN -> {
                 val now = SystemClock.uptimeMillis()
                 if (now - lastBtnTopDownMs <= DOUBLE_TAP_WINDOW_MS) {
-                    toggleLiveSession()
+                    pendingPttRunnable?.let { mainHandler.removeCallbacks(it) }
+                    pendingPttRunnable = null
                     lastBtnTopDownMs = 0L
+                    toggleLiveSession()
                     return
                 }
                 lastBtnTopDownMs = now
+                if (isLiveSession) {
+                    return
+                }
                 if (engine.isRecording()) {
                     stopPtt()
-                } else {
-                    btnTopHoldStartMs = now
-                    startPtt()
+                    return
                 }
+                btnTopHoldStartMs = now
+                // Avoid firing duplicate start chimes during rapid double-tap window
+                val pttRunnable = Runnable {
+                    pendingPttRunnable = null
+                    if (!isLiveSession && !engine.isRecording()) {
+                        startPtt()
+                    }
+                }
+                pendingPttRunnable = pttRunnable
+                mainHandler.postDelayed(pttRunnable, DOUBLE_TAP_WINDOW_MS)
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                pendingPttRunnable?.let {
+                    mainHandler.removeCallbacks(it)
+                    pendingPttRunnable = null
+                }
                 if (!isLiveSession && engine.isRecording() && SystemClock.uptimeMillis() - btnTopHoldStartMs >= 500L) {
                     stopPtt()
                 }
@@ -853,14 +971,12 @@ class GotchiBleBondingActivity : Activity() {
     }
 
     private fun startPtt() {
-        engine.playChime("ptt_start")
         viewportView.setPttActive(true)
         viewportView.updateState(newState = "listening", statusText = "LISTENING (RELEASE TO SEND)")
         engine.startPttCapture()
     }
 
     private fun stopPtt() {
-        engine.playChime("ptt_stop")
         viewportView.setPttActive(false)
         viewportView.updateState(newState = "transcribing", statusText = "TRANSCRIBING...")
         engine.stopPttAndCommit()

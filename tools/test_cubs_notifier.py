@@ -2,7 +2,13 @@ import unittest
 from unittest.mock import patch, MagicMock
 import json
 import sys
-sys.path.append("/workspace")
+from pathlib import Path
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT in sys.path:
+    sys.path.remove(_REPO_ROOT)
+sys.path.insert(0, _REPO_ROOT)
+if "/workspace" not in sys.path:
+    sys.path.append("/workspace")
 
 from tools.cubs_notifier import format_game_notification, check_cubs_game
 
@@ -64,6 +70,17 @@ class TestCubsNotifier(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(rep, "")
         self.assertEqual(meta.get("status"), "offseason_suspended")
+
+    def test_cast_cli_passes_timeout(self):
+        import subprocess
+        from tools import cubs_notifier
+
+        with patch.object(sys, "argv", ["cubs_notifier.py", "--cast"]), \
+             patch.object(cubs_notifier.subprocess, "run", return_value=MagicMock(returncode=0)) as mock_run:
+            with self.assertRaises(SystemExit) as ctx:
+                cubs_notifier.main()
+            self.assertEqual(ctx.exception.code, 0)
+            self.assertEqual(mock_run.call_args.kwargs.get("timeout"), cubs_notifier.CAST_SUBPROCESS_TIMEOUT)
 
 if __name__ == "__main__":
     unittest.main()

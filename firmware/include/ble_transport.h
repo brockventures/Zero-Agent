@@ -20,6 +20,17 @@ constexpr const char* GATT_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 constexpr const char* GATT_CHAR_RX_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr const char* GATT_CHAR_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
+// Inter-packet CHAR_TX notification pacing bounds (ms).
+// Paces ~40 ADPCM uplink chunks + TURN_COMMIT at 10-12ms intervals instead of an
+// unthrottled 2ms tight loop that overflows Android's BLE GATT queue and drops END_OF_TURN.
+constexpr uint32_t BLE_TX_MIN_PACING_MS     = 10;
+constexpr uint32_t BLE_TX_DEFAULT_PACING_MS = 12;
+constexpr uint32_t BLE_TX_MAX_PACING_MS     = 50;
+
+// Configures or queries the inter-packet CHAR_TX notification pacing interval (clamped to 10..50 ms).
+void setTxNotifyPacingMs(uint32_t pacing_ms);
+uint32_t getTxNotifyPacingMs();
+
 // Initializes the ESP32-S3 BLE GATT server and starts advertising.
 bool initBleTransport(const char* device_name = "GOTCHI-V1");
 

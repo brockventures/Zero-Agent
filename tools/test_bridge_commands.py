@@ -9,11 +9,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import sys
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
+if _REPO_ROOT in sys.path:
+    sys.path.remove(_REPO_ROOT)
+sys.path.insert(0, _REPO_ROOT)
 from tools.bridge_commands import (
     ON_DEMAND_TRIGGERS,
     QuickChoiceView,
@@ -283,6 +284,99 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res2.returncode, 0)
             self.assertEqual(mock_run2.call_count, 2)
             mock_evict2.assert_called_once()
+
+    def test_subprocess_calls_specify_explicit_timeout_guards(self):
+        """Verify every synchronous subprocess call in bridge_git_sync.py, dockhand_update.py, and cubs_notifier.py specifies timeout=."""
+        import ast
+
+        tools_dir = Path(__file__).resolve().parent
+        target_scripts = ("bridge_git_sync.py", "dockhand_update.py", "cubs_notifier.py")
+        missing = []
+        for script_name in target_scripts:
+            script_path = tools_dir / script_name
+            tree = ast.parse(script_path.read_text(encoding="utf-8"), filename=str(script_path))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "subprocess"
+                    and node.func.attr in ("run", "call", "check_call", "check_output")
+                ):
+                    kw_names = {kw.arg for kw in node.keywords if kw.arg}
+                    if "timeout" not in kw_names:
+                        missing.append(f"{script_name}:L{node.lineno}: subprocess.{node.func.attr}")
+        self.assertEqual(missing, [], f"Unguarded subprocess calls without timeout=: {missing}")
+
+    def test_dockhand_update_get_remote_out_enforces_timeout(self):
+        """Verify dockhand_update.get_remote_out passes explicit timeout= and returns empty string on TimeoutExpired."""
+        import subprocess
+        from tools import dockhand_update
+
+        ssh_stub = ["ssh", "user@198.51.100.10"]
+        with patch.object(dockhand_update.subprocess, "check_output", return_value=b"sha256:abc123\n") as mock_co:
+            out = dockhand_update.get_remote_out(ssh_stub, "docker inspect dockhand")
+            self.assertEqual(out, "sha256:abc123")
+            self.assertEqual(mock_co.call_args.kwargs.get("timeout"), dockhand_update.DEFAULT_SSH_CMD_TIMEOUT)
+
+        with patch.object(
+            dockhand_update.subprocess,
+            "check_output",
+            side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=30),
+        ):
+            self.assertEqual(dockhand_update.get_remote_out(ssh_stub, "docker inspect dockhand", timeout=30), "")
+
+    def test_cubs_notifier_cast_enforces_timeout(self):
+        """Verify cubs_notifier --cast passes timeout= to subprocess.run and exits 124 on TimeoutExpired."""
+        import subprocess
+        from tools import cubs_notifier
+
+        with patch.object(sys, "argv", ["cubs_notifier.py", "--cast"]), \
+             patch.object(
+                 cubs_notifier.subprocess,
+                 "run",
+                 side_effect=subprocess.TimeoutExpired(cmd="mlb_stream_extractor.py", timeout=60),
+             ) as mock_run:
+            with self.assertRaises(SystemExit) as ctx:
+                cubs_notifier.main()
+            self.assertEqual(ctx.exception.code, 124)
+            self.assertEqual(mock_run.call_args.kwargs.get("timeout"), cubs_notifier.CAST_SUBPROCESS_TIMEOUT)
+
+    def test_bridge_git_sync_enforces_non_none_timeout_and_aborts_timed_out_rebase(self):
+        """Verify sync_git_on_reload enforces positive timeouts even if timeout=None and aborts timed-out rebase without stalling on push."""
+        import shutil
+        import subprocess
+        import tempfile
+        from tools import bridge_git_sync
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            repo_path = Path(tmp_dir)
+            (repo_path / ".git").mkdir()
+            recorded_timeouts = []
+            executed_cmds = []
+
+            def fake_run(cmd, *args, **kwargs):
+                executed_cmds.append(cmd)
+                recorded_timeouts.append(kwargs.get("timeout"))
+                if "status" in cmd:
+                    return MagicMock(returncode=0, stdout=" M tools/bridge.py\n")
+                if "diff" in cmd:
+                    return MagicMock(returncode=0, stdout="tools/bridge.py\n")
+                if "pull" in cmd:
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 30))
+                return MagicMock(returncode=0, stdout="abc1234\n")
+
+            with patch.object(bridge_git_sync.subprocess, "run", side_effect=fake_run):
+                res = bridge_git_sync.sync_git_on_reload(repo_dir=repo_path, timeout=None)
+
+            self.assertFalse(res["synced"])
+            self.assertIsNotNone(res["error"])
+            self.assertTrue(all(t is not None and t > 0 for t in recorded_timeouts))
+            self.assertTrue(any(cmd[:3] == ["git", "rebase", "--abort"] for cmd in executed_cmds))
+            self.assertFalse(any(cmd[:2] == ["git", "push"] for cmd in executed_cmds))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

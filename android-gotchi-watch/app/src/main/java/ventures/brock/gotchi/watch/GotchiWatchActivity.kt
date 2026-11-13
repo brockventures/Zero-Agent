@@ -20,6 +20,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.Toast
 
 /**
@@ -34,9 +35,12 @@ import android.widget.Toast
  *   - Auto state-action mapping: START_PTT when idle, STOP_PTT_AND_COMMIT when recording, TRIGGER_BARGE_IN when speaking.
  * - Continuous 500 ms circular pre-roll listener via `HeyZeroPreRollListener`:
  *   - Spotting "Hey Zero" wake phrase offline.
- *   - Snapshots 500 ms 16 kHz PCM ring buffer and delegates to `engine.startWakeWordTurn(preRollPcm)`.
+ *   - Snapshots 500 ms 16 kHz PCM ring buffer, cleanly stops/releases AudioRecord, and delegates to
+ *     `engine.startWakeWordTurn(preRollPcm)`.
+ * - Remote Cloudflare Tunnel (`https://gotchi.brock.ventures`) + Bearer auth & `FallbackDns`, plus
+ *   port `8771` LAN migration from legacy `:8765` / `:8769` endpoints.
  * - Rotary Crown hardware scroll handling (`MotionEvent.AXIS_SCROLL`) to cycle skins and adjust modes.
- * - Long-press & double-tap gestures for quick skin switching and Go Live session activation.
+ * - Long-press & debounced double-tap gestures for quick wake-mode toggling and Go Live session activation.
  */
 class GotchiWatchActivity : Activity() {
 
@@ -113,12 +117,13 @@ class GotchiWatchActivity : Activity() {
             }
         }
 
-        // Initialize 'Hey Zero' Pre-Roll Listener
+        // Initialize 'Hey Zero' Pre-Roll Listener & link to engine for clean AudioRecord handoff
         preRollListener = HeyZeroPreRollListener(this) { preRollPcm ->
             runOnUiThread {
                 handleWakeWordDetected(preRollPcm)
             }
         }
+        engine.preRollListener = preRollListener
 
         loadPreferencesAndIntent(intent)
 
@@ -236,7 +241,11 @@ class GotchiWatchActivity : Activity() {
 
         incoming?.let {
             it.getStringExtra(KEY_GATEWAY_URL)?.let { v ->
-                val targetUrl = if (v.contains(":8765")) v.replace(":8765", ":8769") else v
+                val targetUrl = if (v.contains(":8765") || v.contains(":8769")) {
+                    v.replace(":8765", ":8771").replace(":8769", ":8771")
+                } else {
+                    GotchiWatchEngine.normalizeGatewayUrl(v)
+                }
                 edit.putString(KEY_GATEWAY_URL, targetUrl)
             }
             it.getStringExtra(KEY_BEARER_TOKEN)?.let { v -> edit.putString(KEY_BEARER_TOKEN, v) }
@@ -266,9 +275,11 @@ class GotchiWatchActivity : Activity() {
 
         var gwUrl = prefs.getString(KEY_GATEWAY_URL, GotchiWatchEngine.DEFAULT_GATEWAY_URL)
             ?: GotchiWatchEngine.DEFAULT_GATEWAY_URL
-        if (gwUrl.contains(":8765")) {
-            gwUrl = gwUrl.replace(":8765", ":8769")
+        if (gwUrl.contains(":8765") || gwUrl.contains(":8769")) {
+            gwUrl = gwUrl.replace(":8765", ":8771").replace(":8769", ":8771")
             prefs.edit().putString(KEY_GATEWAY_URL, gwUrl).apply()
+        } else if (gwUrl.isBlank()) {
+            gwUrl = GotchiWatchEngine.DEFAULT_GATEWAY_URL
         }
         engine.config.gatewayUrl = gwUrl
         engine.config.bearerToken = prefs.getString(KEY_BEARER_TOKEN, "") ?: ""
@@ -303,6 +314,10 @@ class GotchiWatchActivity : Activity() {
      * Dispatches action when a physical finger-pinch, double-pinch, or stem button event occurs.
      */
     internal fun handlePinchOrStemTrigger(source: String) {
+        if (engine.isRecording()) {
+            engine.stopPttAndCommit()
+            return
+        }
         if (engine.hasPendingAnswer && !engine.isRecording()) {
             engine.fetchAndPlayPendingAnswer()
             return
@@ -312,11 +327,12 @@ class GotchiWatchActivity : Activity() {
 
         when (action) {
             PinchGestureDetector.PinchAction.START_PTT -> {
-                // If Hey Zero listener was running, snapshot its buffer for pre-roll
+                // Snapshot pre-roll and cleanly stop/release HeyZero AudioRecord before PTT starts
                 if (preRollListener.isListening()) {
-                    val preRoll = preRollListener.getPreRollSnapshot()
+                    val preRoll = preRollListener.releaseAudioRecordForHandoff()
                     engine.startWakeWordTurn(preRoll)
                 } else {
+                    preRollListener.pauseForActiveTurn()
                     engine.startPttCapture(autoVadStop = true)
                 }
             }
@@ -329,6 +345,7 @@ class GotchiWatchActivity : Activity() {
             PinchGestureDetector.PinchAction.NONE -> {
                 // Toggle fallback if in transcribing or error
                 if (currentState in setOf("error", "offline")) {
+                    preRollListener.pauseForActiveTurn()
                     engine.startPttCapture(autoVadStop = true)
                 }
             }
@@ -363,6 +380,7 @@ class GotchiWatchActivity : Activity() {
      * Dispatches turn when 'Hey Zero' wake word is detected by the continuous pre-roll listener.
      */
     internal fun handleWakeWordDetected(preRollPcm: ByteArray) {
+        preRollListener.pauseForActiveTurn()
         engine.startWakeWordTurn(preRollPcm)
     }
 
@@ -399,10 +417,13 @@ class GotchiWatchActivity : Activity() {
     }
 
     private fun setupTouchInteractions(view: View) {
+        var pendingTapAction: Runnable? = null
+
         view.setOnTouchListener { _, event ->
             val now = SystemClock.elapsedRealtime()
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    pendingTapAction?.let { view.removeCallbacks(it) }
                     tapDownMs = now
                     isLongPressed = false
                     view.postDelayed({
@@ -432,19 +453,32 @@ class GotchiWatchActivity : Activity() {
                         if (tapCount >= 3) {
                             tapCount = 0
                             lastTapDownMs = 0L
+                            pendingTapAction?.let { view.removeCallbacks(it) }
+                            pendingTapAction = null
                             showWatchSettingsDialog()
-                        } else if (tapCount == 2) {
-                            toggleLiveSession()
                         } else {
-                            handlePinchOrStemTrigger("touch_tap")
+                            pendingTapAction = Runnable {
+                                val count = tapCount
+                                tapCount = 0
+                                lastTapDownMs = 0L
+                                if (count == 2) {
+                                    toggleLiveSession()
+                                } else if (count == 1) {
+                                    handlePinchOrStemTrigger("touch_tap")
+                                }
+                            }
+                            view.postDelayed(pendingTapAction!!, DOUBLE_TAP_WINDOW_MS)
                         }
                     }
                     true
                 }
                 MotionEvent.ACTION_CANCEL -> {
+                    pendingTapAction?.let { view.removeCallbacks(it) }
+                    pendingTapAction = null
                     tapDownMs = 0L
                     isLongPressed = false
                     tapCount = 0
+                    lastTapDownMs = 0L
                     true
                 }
                 else -> false
@@ -457,7 +491,7 @@ class GotchiWatchActivity : Activity() {
             .setTitle("Update Available")
             .setMessage("Version $remoteVersion is available. Install now?")
             .setPositiveButton("Install") { _, _ ->
-                GotchiWatchUpdater.downloadAndInstallApk(this, engine.config.gatewayUrl)
+                GotchiWatchUpdater.downloadAndInstallApk(this, engine.config.gatewayUrl, engine.config.bearerToken)
             }
             .setNegativeButton("Later", null)
             .show()
@@ -467,6 +501,7 @@ class GotchiWatchActivity : Activity() {
         if (engine.isLiveActive()) {
             engine.stopLiveSession()
         } else {
+            preRollListener.pauseForActiveTurn()
             engine.startLiveSession()
         }
     }
@@ -602,7 +637,11 @@ class GotchiWatchActivity : Activity() {
             text = "UPDATE APP (WI-FI)"
             setOnClickListener {
                 Toast.makeText(this@GotchiWatchActivity, "STARTING UPDATE...", Toast.LENGTH_SHORT).show()
-                GotchiWatchUpdater.downloadAndInstallApk(this@GotchiWatchActivity, engine.config.gatewayUrl) { status ->
+                GotchiWatchUpdater.downloadAndInstallApk(
+                    this@GotchiWatchActivity,
+                    engine.config.gatewayUrl,
+                    engine.config.bearerToken
+                ) { status ->
                     runOnUiThread {
                         Toast.makeText(this@GotchiWatchActivity, status, Toast.LENGTH_SHORT).show()
                     }
@@ -611,8 +650,15 @@ class GotchiWatchActivity : Activity() {
         }
 
         val gatewayInput = EditText(this).apply {
-            hint = "Gateway URL"
+            hint = "Gateway URL (https://gotchi.brock.ventures)"
             setText(engine.config.gatewayUrl)
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+        }
+
+        val bearerInput = EditText(this).apply {
+            hint = "Bearer Token (Tunnel Auth)"
+            setText(engine.config.bearerToken)
             setTextColor(Color.WHITE)
             setHintTextColor(Color.GRAY)
         }
@@ -633,16 +679,23 @@ class GotchiWatchActivity : Activity() {
         panel.addView(vadBtn)
         panel.addView(updateAppBtn)
         panel.addView(gatewayInput)
+        panel.addView(bearerInput)
         panel.addView(nodeInput)
+
+        val scrollView = ScrollView(this).apply {
+            addView(panel)
+        }
 
         AlertDialog.Builder(this)
             .setTitle("Gotchi Watch")
-            .setView(panel)
+            .setView(scrollView)
             .setPositiveButton("Save") { _, _ ->
-                engine.config.gatewayUrl = gatewayInput.text.toString().trim().ifEmpty { GotchiWatchEngine.DEFAULT_GATEWAY_URL }
+                engine.config.gatewayUrl = GotchiWatchEngine.normalizeGatewayUrl(gatewayInput.text.toString())
+                engine.config.bearerToken = bearerInput.text.toString().trim()
                 engine.config.nodeId = nodeInput.text.toString().trim().ifEmpty { GotchiWatchEngine.DEFAULT_NODE_ID }
                 getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
                     .putString(KEY_GATEWAY_URL, engine.config.gatewayUrl)
+                    .putString(KEY_BEARER_TOKEN, engine.config.bearerToken)
                     .putString(KEY_NODE_ID, engine.config.nodeId)
                     .putLong(KEY_PTT_SILENCE_MS, engine.config.pttSilenceMs)
                     .putString(KEY_SKIN, epaperView.uiState.skin)

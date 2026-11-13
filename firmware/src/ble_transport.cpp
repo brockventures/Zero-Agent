@@ -31,6 +31,9 @@ static bool s_initialized = false;
 static volatile bool s_peer_connected = false;
 static uint16_t s_max_payload = (uint16_t)BLE_MAX_PAYLOAD;
 static uint16_t s_tx_seq_num = 1;
+static uint32_t s_tx_pacing_ms = BLE_TX_DEFAULT_PACING_MS;
+static uint32_t s_last_tx_notify_ms = 0;
+static bool     s_has_tx_notify_ts = false;
 
 static PacketReassembler s_rx_reassembler(MAX_SSE_FRAME_BYTES);
 static QueuedFrame s_rx_queue[RX_QUEUE_DEPTH];
@@ -91,12 +94,16 @@ class GotchiServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) override {
         (void)pServer;
         s_peer_connected = true;
+        s_has_tx_notify_ts = false;
+        s_last_tx_notify_ms = 0;
         s_rx_reassembler.resetSequenceTracking();
         gotchi_log::RingLogger.info("ble", "BLE companion connected");
     }
 
     void onDisconnect(BLEServer* pServer) override {
         s_peer_connected = false;
+        s_has_tx_notify_ts = false;
+        s_last_tx_notify_ms = 0;
         s_rx_reassembler.resetSequenceTracking();
         gotchi_log::RingLogger.info("ble", "BLE companion disconnected; restarting advertising");
         if (pServer) {
@@ -104,6 +111,21 @@ class GotchiServerCallbacks : public BLEServerCallbacks {
         }
     }
 };
+
+static void paceBeforeBleNotify() {
+    if (!s_has_tx_notify_ts) {
+        return;
+    }
+    const uint32_t target_ms = s_tx_pacing_ms >= BLE_TX_MIN_PACING_MS
+        ? s_tx_pacing_ms
+        : BLE_TX_MIN_PACING_MS;
+    uint32_t elapsed = (uint32_t)(millis() - s_last_tx_notify_ms);
+    if (elapsed < target_ms) {
+        delay(target_ms - elapsed);
+    } else {
+        yield();
+    }
+}
 
 class GotchiRxCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pCharacteristic) override {
@@ -130,6 +152,16 @@ void setNegotiatedMtu(uint16_t att_mtu) {
 
 uint16_t getNegotiatedMaxPayload() {
     return s_max_payload;
+}
+
+void setTxNotifyPacingMs(uint32_t pacing_ms) {
+    if (pacing_ms < BLE_TX_MIN_PACING_MS) pacing_ms = BLE_TX_MIN_PACING_MS;
+    if (pacing_ms > BLE_TX_MAX_PACING_MS) pacing_ms = BLE_TX_MAX_PACING_MS;
+    s_tx_pacing_ms = pacing_ms;
+}
+
+uint32_t getTxNotifyPacingMs() {
+    return s_tx_pacing_ms;
 }
 
 bool isBlePeerConnected() {
@@ -289,9 +321,25 @@ bool sendFramedPayload(
         }
 
 #if defined(ARDUINO)
+        if (!s_peer_connected || !s_tx_char) {
+            return false;
+        }
+        paceBeforeBleNotify();
+        if (!s_peer_connected || !s_tx_char) {
+            return false;
+        }
         s_tx_char->setValue(pkt_buf, encoded_len);
         s_tx_char->notify();
-        delay(2);
+        s_last_tx_notify_ms = millis();
+        s_has_tx_notify_ts = true;
+        if (idx + 1 < total_chunks) {
+            const uint32_t pace_ms = s_tx_pacing_ms >= BLE_TX_MIN_PACING_MS
+                ? s_tx_pacing_ms
+                : BLE_TX_MIN_PACING_MS;
+            delay(pace_ms);
+        } else {
+            yield();
+        }
 #endif
     }
     return true;

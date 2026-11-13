@@ -3,21 +3,34 @@ import sys
 import unicodedata
 from pathlib import Path
 
-# Ensure gotchi backend packages resolve if running from repo root
+# Ensure gotchi backend & /workspace/tools packages resolve ahead of any lomin shadow package
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 if f"{_REPO_ROOT}/gotchi" not in sys.path:
     sys.path.insert(1, f"{_REPO_ROOT}/gotchi")
-if "/workspace" not in sys.path:
+if Path("/workspace/tools").is_dir():
+    if "/workspace" in sys.path:
+        sys.path.remove("/workspace")
+    sys.path.insert(1, "/workspace")
+elif "/workspace" not in sys.path:
     sys.path.append("/workspace")
 if "/workspace/gotchi" not in sys.path:
     sys.path.append("/workspace/gotchi")
+_tools_mod = sys.modules.get("tools")
+if _tools_mod is not None and hasattr(_tools_mod, "__path__") and Path("/workspace/tools").is_dir():
+    if "/workspace/tools" not in _tools_mod.__path__:
+        _tools_mod.__path__.insert(0, "/workspace/tools")
 
 import backend
-for _cand in [f"{_REPO_ROOT}/gotchi/backend", "/workspace/gotchi/backend"]:
-    if Path(_cand).is_dir() and hasattr(backend, "__path__") and _cand not in backend.__path__:
-        backend.__path__.append(_cand)
+_OWN_BACKEND_DIR = str(Path(__file__).resolve().parent)
+if hasattr(backend, "__path__"):
+    if _OWN_BACKEND_DIR in backend.__path__:
+        backend.__path__.remove(_OWN_BACKEND_DIR)
+    backend.__path__.insert(0, _OWN_BACKEND_DIR)
+    for _cand in [f"{_REPO_ROOT}/gotchi/backend", "/workspace/gotchi/backend"]:
+        if Path(_cand).is_dir() and _cand not in backend.__path__:
+            backend.__path__.append(_cand)
 
 """
 GOTCHI V1 — Reference Voice Gateway Server (`POST /api/voice/interact`)
@@ -53,9 +66,12 @@ import math
 import sqlite3
 import os
 import re
+import argparse
 import shlex
+import socket
 import struct
 import time
+import urllib.error
 import urllib.request
 from typing import Any, AsyncGenerator, Callable, Dict, List, Mapping, Optional, Tuple
 
@@ -79,7 +95,7 @@ from backend.llm_config import (
 logger = logging.getLogger("gotchi_gateway")
 
 DEFAULT_WATCH_APK_VERSION_CODE = int(os.environ.get("GOTCHI_WATCH_APK_VERSION", "5"))
-DEFAULT_FORWARDER_APK_VERSION_CODE = 4
+DEFAULT_FORWARDER_APK_VERSION_CODE = int(os.environ.get("GOTCHI_FORWARDER_APK_VERSION", "12"))
 
 NODE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -700,9 +716,20 @@ class GeminiTTSAdapter:
         self,
         llm_config: Optional[LLMConfig] = None,
         http_poster: Optional[Callable[[str, Dict[str, str], Dict[str, Any]], Dict[str, Any]]] = None,
+        max_retries: Optional[int] = None,
+        retry_base_delay_s: Optional[float] = None,
     ):
         self.llm_config = llm_config or LLMConfig.from_env_or_file()
+        self._custom_http_poster = http_poster is not None
         self.http_poster = http_poster or self._default_http_poster
+        if max_retries is None:
+            self.max_retries = 1 if self._custom_http_poster else 3
+        else:
+            self.max_retries = max(1, int(max_retries))
+        if retry_base_delay_s is None:
+            self.retry_base_delay_s = 0.01 if "PYTEST_CURRENT_TEST" in os.environ else 0.35
+        else:
+            self.retry_base_delay_s = max(0.0, float(retry_base_delay_s))
 
     @classmethod
     def _default_http_poster(cls, url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -783,15 +810,7 @@ class GeminiTTSAdapter:
         url = self.build_endpoint()
         headers = {"x-goog-api-key": api_key} if api_key else {}
         payload = self.build_payload(sentence_text)
-        try:
-            res = self.http_poster(url, headers, payload)
-        except Exception as exc:
-            if "404" in str(exc) and "gemini-2.5-flash-preview-tts" not in url:
-                fallback_url = f"{self.GEMINI_TTS_BASE}/models/gemini-2.5-flash-preview-tts:generateContent"
-                res = self.http_poster(fallback_url, headers, payload)
-                url = fallback_url
-            else:
-                raise
+        res, url = self._post_with_retry_and_fallback(url, headers, payload, sentence_text)
 
         for attempt in range(2):
             candidates = res.get("candidates") or []
@@ -811,6 +830,121 @@ class GeminiTTSAdapter:
                 "GeminiTTSAdapter returned no audio parts after retry; falling back to silent PCM stub"
             )
         return generate_synthetic_pcm(duration_s=0.25, sample_rate=sample_rate)
+
+    def _post_with_retry_and_fallback(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        sentence_text: str,
+    ) -> Tuple[Dict[str, Any], str]:
+        last_exc: Optional[BaseException] = None
+        attempts = max(1, self.max_retries)
+        for attempt in range(attempts):
+            try:
+                return self.http_poster(url, headers, payload), url
+            except Exception as exc:
+                last_exc = exc
+                if "404" in str(exc) and "gemini-2.5-flash-preview-tts" not in url:
+                    fallback_url = f"{self.GEMINI_TTS_BASE}/models/gemini-2.5-flash-preview-tts:generateContent"
+                    return self.http_poster(fallback_url, headers, payload), fallback_url
+                if "400" in str(exc):
+                    return (
+                        self.http_poster(
+                            url, headers, self.build_payload(f"Say aloud verbatim: {sentence_text}")
+                        ),
+                        url,
+                    )
+                if is_transient_gemini_error(exc) and attempt + 1 < attempts:
+                    delay = self.retry_base_delay_s * (2 ** attempt)
+                    logger.warning(
+                        "GeminiTTSAdapter transient error (attempt %d/%d): %s; retrying in %.2fs",
+                        attempt + 1,
+                        attempts,
+                        exc,
+                        delay,
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+                break
+
+        if (
+            last_exc is not None
+            and is_transient_gemini_error(last_exc)
+            and attempts > 1
+            and not self._custom_http_poster
+            and not self.llm_config.tts_url.strip()
+            and "gemini-2.5-flash-preview-tts" not in url
+        ):
+            fallback_url = f"{self.GEMINI_TTS_BASE}/models/gemini-2.5-flash-preview-tts:generateContent"
+            try:
+                logger.warning(
+                    "GeminiTTSAdapter primary model exhausted on 503; trying fallback TTS model %s",
+                    fallback_url,
+                )
+                return self.http_poster(fallback_url, headers, payload), fallback_url
+            except Exception as fb_exc:
+                last_exc = fb_exc
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("GeminiTTSAdapter request failed without response")
+
+
+def is_transient_gemini_error(exc: BaseException) -> bool:
+    """Return True for transient Gemini HTTP 429/500/502/503/504, ServerError, or network timeouts."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return int(getattr(exc, "code", 0) or 0) in (408, 429, 500, 502, 503, 504)
+    for attr in ("code", "status_code", "status"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, int):
+            return val in (408, 429, 500, 502, 503, 504)
+    if isinstance(exc, (TimeoutError, ConnectionError, urllib.error.URLError)):
+        return True
+    cls_name = exc.__class__.__name__.lower()
+    if cls_name in ("servererror", "serviceunavailable", "toomanyrequests", "deadlineexceeded"):
+        return True
+    msg = str(exc).lower()
+    if any(non_retry in msg for non_retry in ("http 400", "http 401", "http 403", "http 404")):
+        return False
+    transient_markers = (
+        "503",
+        "502",
+        "504",
+        "429",
+        "service unavailable",
+        "unavailable",
+        "servererror",
+        "high demand",
+        "overloaded",
+        "temporarily unavailable",
+        "timed out",
+        "connection reset",
+    )
+    return any(marker in msg for marker in transient_markers)
+
+
+def _resolve_gemini_api_key(explicit_key: str = "") -> str:
+    api_key = (explicit_key or "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        try:
+            sec_file = Path("/secrets/env.json")
+            if sec_file.is_file():
+                api_key = str(json.loads(sec_file.read_text()).get("GEMINI_API_KEY") or "").strip()
+        except Exception:
+            pass
+    if not api_key:
+        try:
+            env_file = Path("/workspace/.env")
+            if env_file.is_file():
+                for line in env_file.read_text().splitlines():
+                    if line.strip().startswith("GEMINI_API_KEY="):
+                        api_key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+        except Exception:
+            pass
+    return api_key
 
 
 def extract_pcm_from_wav_or_raw(raw_bytes: bytes) -> bytes:
@@ -1638,13 +1772,25 @@ class GeminiBrainAdapter:
         "and 'reply' (your spoken response as Zero)."
     )
 
+    FALLBACK_SPOKEN_REPLY = (
+        "Gemini is hitting a brief capacity spike right now. Give me a moment and try again."
+    )
+
     def __init__(
         self,
         llm_config: LLMConfig,
         http_poster: Optional[Callable[[str, Dict[str, str], Dict[str, Any]], Dict[str, Any]]] = None,
+        max_retries: int = 3,
+        retry_base_delay_s: Optional[float] = None,
     ):
         self.llm_config = llm_config
+        self._custom_http_poster = http_poster is not None
         self.http_poster = http_poster or GeminiTTSAdapter._default_http_poster
+        self.max_retries = max(1, int(max_retries))
+        if retry_base_delay_s is None:
+            self.retry_base_delay_s = 0.01 if "PYTEST_CURRENT_TEST" in os.environ else 0.4
+        else:
+            self.retry_base_delay_s = max(0.0, float(retry_base_delay_s))
 
     def resolve_model(self) -> str:
         m = (self.llm_config.model or "").strip()
@@ -1654,7 +1800,7 @@ class GeminiBrainAdapter:
 
     async def __call__(self, parsed_turn: Dict[str, Any]) -> Dict[str, Any]:
         t0 = time.monotonic()
-        api_key = self.llm_config.api_key.strip() or os.environ.get("GEMINI_API_KEY", "").strip()
+        api_key = _resolve_gemini_api_key(self.llm_config.api_key)
         if not api_key:
             return {
                 "transcript": parsed_turn.get("prompt") or "",
@@ -1716,8 +1862,63 @@ class GeminiBrainAdapter:
         }
         headers = {"x-goog-api-key": api_key}
         loop = asyncio.get_running_loop()
-        res = await loop.run_in_executor(None, self.http_poster, url, headers, payload)
+        res: Optional[Dict[str, Any]] = None
+        last_exc: Optional[BaseException] = None
+        attempts = max(1, self.max_retries)
+        for attempt in range(attempts):
+            try:
+                res = await loop.run_in_executor(None, self.http_poster, url, headers, payload)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if is_transient_gemini_error(exc) and attempt + 1 < attempts:
+                    delay = self.retry_base_delay_s * (2 ** attempt)
+                    logger.warning(
+                        "GeminiBrainAdapter transient error (attempt %d/%d, model=%s): %s; retrying in %.2fs",
+                        attempt + 1,
+                        attempts,
+                        model_name,
+                        exc,
+                        delay,
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    continue
+                break
+
+        if (
+            res is None
+            and last_exc is not None
+            and is_transient_gemini_error(last_exc)
+            and not self._custom_http_poster
+            and model_name not in ("gemini-2.5-flash-lite", "models/gemini-2.5-flash-lite")
+        ):
+            fallback_url = f"{self.GEMINI_API_BASE}/models/gemini-2.5-flash-lite:generateContent"
+            try:
+                logger.warning(
+                    "GeminiBrainAdapter primary model %s unavailable; falling back to gemini-2.5-flash-lite",
+                    model_name,
+                )
+                res = await loop.run_in_executor(None, self.http_poster, fallback_url, headers, payload)
+                last_exc = None
+            except Exception as fb_exc:
+                last_exc = fb_exc
+
         stt_ms = int((time.monotonic() - t0) * 1000)
+        if res is None:
+            logger.error(
+                "GeminiBrainAdapter exhausted %d attempts (%s); returning graceful spoken fallback",
+                attempts,
+                last_exc,
+            )
+            fallback_transcript = prompt_text if has_explicit else (prompt_text or "Voice turn")
+            return {
+                "transcript": fallback_transcript,
+                "reply": self.FALLBACK_SPOKEN_REPLY,
+                "stt_ms": stt_ms,
+                "degraded": True,
+            }
 
         raw_text = ""
         for cand in res.get("candidates") or []:
@@ -2315,11 +2516,9 @@ class TurnTranscriptSink:
         return self.llm_config.turn_log_webhook_url.strip()
 
     def format_discord_content(self, entry: Mapping[str, Any]) -> str:
-        node_id = entry.get("node_id", "gotchi-device")
         mode = entry.get("mode", "interact")
         transcript = entry.get("transcript", "")
         reply = entry.get("reply", "")
-        voice_name = entry.get("voice_name", DEFAULT_VOICE_NAME)
         stt_ms = entry.get("stt_ms", 0)
         first_audio_ms = entry.get("first_audio_ms", 0)
         total_ms = entry.get("total_ms", 0)
@@ -2329,29 +2528,29 @@ class TurnTranscriptSink:
         elif entry.get("has_image"):
             img_tag = " 📸 *(camera snapshot)*"
         if mode == "journal":
-            return f"📓 **[{node_id} · Journal]{img_tag}:** {transcript}"
+            return f"📓 **[Journal]{img_tag}:** {transcript}"
         if mode == "error":
             err_msg = entry.get("error", reply or "Background task failed")
             return (
-                f"⚠️ **[{node_id} · Async Handoff Failed]{img_tag}:** {transcript}\n"
+                f"⚠️ **[Async Handoff Failed]{img_tag}:** {transcript}\n"
                 f"**Error:** {err_msg}"
             )
         if mode == "async_handoff_long":
             return (
-                f"📋 **[{node_id} · Async Answer Breakdown]{img_tag}:**\n"
+                f"📋 **[Async Answer Breakdown]{img_tag}:**\n"
                 f"> **Prompt:** {transcript}\n\n"
                 f"{reply}\n"
                 f"-# stt: {stt_ms}ms · total: {total_ms}ms"
             )
         if mode == "async_handoff":
             return (
-                f"🎙️ **[{node_id} · Async Handoff]{img_tag}:** {transcript}\n"
-                f"🔊 **Zero ({voice_name}):** {reply}\n"
+                f"🎙️ **[Async Handoff]{img_tag}:** {transcript}\n"
+                f"🔊 **Zero:** {reply}\n"
                 f"-# stt: {stt_ms}ms · total: {total_ms}ms"
             )
         return (
-            f"🎙️ **[{node_id}]{img_tag}:** {transcript}\n"
-            f"🔊 **Zero ({voice_name}):** {reply}\n"
+            f"🎙️ **Ryan{img_tag}:** {transcript}\n"
+            f"🔊 **Zero:** {reply}\n"
             f"-# stt: {stt_ms}ms · first_audio: {first_audio_ms}ms · total: {total_ms}ms"
         )
 
@@ -3176,6 +3375,13 @@ class VoiceGatewayService:
             while not handler_task.done() or not live_sentence_queue.empty():
                 # Drain any sentences streamed early by the brain (pre-tool preamble or token stream)
                 while not live_sentence_queue.empty():
+                    if (
+                        live_streamed_count >= 1
+                        and not handler_task.done()
+                        and self.llm_config.async_handoff_ms > 0
+                        and (time.monotonic() - brain_start) >= handoff_s
+                    ):
+                        break
                     live_sent, tts_fut = live_sentence_queue.get_nowait()
                     live_streamed_sentences.append(live_sent)
                     filler_1_sent = True  # Suppress canned filler once real speech starts
@@ -4119,20 +4325,25 @@ def create_app(
             "node_id": node_id,
             "version_code": int(os.environ.get("GOTCHI_FORWARDER_APK_VERSION", DEFAULT_FORWARDER_APK_VERSION_CODE)),
             "apk_url": "/api/gotchi/forwarder/apk.apk",
+            "download_url": "/api/app/download",
         }
 
+    @app.get("/api/app/download")
+    @app.get("/api/app/download.apk")
     @app.get("/api/gotchi/forwarder/apk.apk")
     @app.get("/api/app/forwarder/apk")
     @app.get("/api/app/forwarder/apk.apk")
     def get_gotchi_forwarder_apk(request: Request):
         apk_candidates = [
+            Path(__file__).resolve().parent.parent / "android-ble-forwarder" / "releases" / "gotchi-ble-forwarder-debug.apk",
+            Path("/workspace/gotchi/android-ble-forwarder/releases/gotchi-ble-forwarder-debug.apk"),
+            Path("android-ble-forwarder/releases/gotchi-ble-forwarder-debug.apk"),
             Path("/workspace/scratch/gotchi-ble-forwarder-debug.apk"),
             Path(__file__).resolve().parent.parent / "scratch" / "gotchi-ble-forwarder-debug.apk",
-            Path(__file__).resolve().parent.parent / "android-ble-forwarder" / "releases" / "gotchi-ble-forwarder-debug.apk",
-            Path("android-ble-forwarder/releases/gotchi-ble-forwarder-debug.apk"),
             Path("/tmp/gotchi-ble-forwarder-debug.apk"),
         ]
-        apk_path = next((p for p in apk_candidates if p.is_file()), None)
+        existing_apks = [p for p in apk_candidates if p.is_file()]
+        apk_path = max(existing_apks, key=lambda p: p.stat().st_mtime) if existing_apks else None
         if not apk_path:
             return JSONResponse(status_code=404, content={"ok": False, "error": "apk_not_found"})
         from fastapi.responses import FileResponse
@@ -4143,6 +4354,174 @@ def create_app(
             filename="gotchi-ble-forwarder-debug.apk",
         )
 
+    @app.post("/api/device/adb-beacon")
+    async def post_device_adb_beacon(request: Request):
+        if srv.auth_required or (
+            srv.verifier.device_tokens
+            and ("authorization" in request.headers or "x-gotchi-token" in request.headers)
+        ):
+            headers = dict(request.headers)
+            client_ip = request.client.host if request.client else "0.0.0.0"
+            ok, code, err = srv.verifier.verify(headers, client_ip=client_ip)
+            if not ok:
+                admin_ok, _, _ = srv.verify_admin_auth(headers)
+                if not admin_ok:
+                    return JSONResponse(status_code=code, content=err)
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "invalid_json"})
+
+        if not isinstance(payload, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "payload_must_be_dict"})
+
+        beacon_data = dict(payload)
+        if "timestamp" not in beacon_data:
+            beacon_data["timestamp"] = time.time()
+
+        repo_root = Path(__file__).resolve().parent.parent
+        data_dir = Path(os.environ.get("GOTCHI_DATA_DIR", repo_root / "data"))
+        beacon_file = data_dir / "adb_beacon.json"
+        try:
+            beacon_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(beacon_file, "w", encoding="utf-8") as f:
+                json.dump(beacon_data, f, indent=2)
+        except Exception as e:
+            logger.warning("Failed to persist adb_beacon.json: %s", e)
+
+        app.state.latest_adb_beacon = beacon_data
+        return {"ok": True, "beacon": beacon_data, **beacon_data}
+
+    @app.get("/api/device/adb-beacon")
+    def get_device_adb_beacon(request: Request):
+        if srv.auth_required or (
+            srv.verifier.device_tokens
+            and ("authorization" in request.headers or "x-gotchi-token" in request.headers)
+        ):
+            headers = dict(request.headers)
+            client_ip = request.client.host if request.client else "0.0.0.0"
+            ok, code, err = srv.verifier.verify(headers, client_ip=client_ip)
+            if not ok:
+                admin_ok, _, _ = srv.verify_admin_auth(headers)
+                if not admin_ok:
+                    return JSONResponse(status_code=code, content=err)
+
+        beacon_data = getattr(app.state, "latest_adb_beacon", None)
+        if not beacon_data:
+            repo_root = Path(__file__).resolve().parent.parent
+            data_dir = Path(os.environ.get("GOTCHI_DATA_DIR", repo_root / "data"))
+            beacon_file = data_dir / "adb_beacon.json"
+            if beacon_file.is_file():
+                try:
+                    with open(beacon_file, "r", encoding="utf-8") as f:
+                        beacon_data = json.load(f)
+                    app.state.latest_adb_beacon = beacon_data
+                except Exception as e:
+                    logger.warning("Failed to read adb_beacon.json: %s", e)
+
+        if not beacon_data:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "no_beacon_registered"})
+
+        return {"ok": True, "beacon": beacon_data, **beacon_data}
+
     register_live_routes(app, live_srv)
     register_journal_routes(app, journal_srv)
     return app
+
+
+DEFAULT_PRIMARY_GATEWAY_PORT = int(
+    os.environ.get("GOTCHI_GATEWAY_PORT", os.environ.get("MVG_PORT", "8771"))
+)
+DEFAULT_SECONDARY_GATEWAY_PORT = int(os.environ.get("GOTCHI_SECONDARY_PORT", "8769"))
+
+
+def is_tcp_port_available(host: str, port: int) -> bool:
+    """Return True if (host, port) can be bound on TCP without EADDRINUSE."""
+    bind_host = "0.0.0.0" if host in ("", "0.0.0.0") else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((bind_host, int(port)))
+            return True
+        except OSError:
+            return False
+
+
+async def serve_dual_port_app(
+    app: Any,
+    host: str = "0.0.0.0",
+    port: int = DEFAULT_PRIMARY_GATEWAY_PORT,
+    secondary_port: Optional[int] = DEFAULT_SECONDARY_GATEWAY_PORT,
+) -> None:
+    """
+    Run `app` on primary `port` (default 8771) and concurrently on `secondary_port` (default 8769)
+    when `secondary_port` is available. If `secondary_port` is already bound (e.g. by Host 2's
+    `zero_health_server.py` reverse-proxy forwarding `/api/voice/*` -> `127.0.0.1:8771`), logs cleanly
+    and serves primary `port` without EADDRINUSE failure.
+    """
+    import uvicorn
+
+    primary_server = uvicorn.Server(uvicorn.Config(app, host=host, port=int(port), log_level="info"))
+    servers = [primary_server.serve()]
+
+    if secondary_port and int(secondary_port) > 0 and int(secondary_port) != int(port):
+        if is_tcp_port_available(host, int(secondary_port)):
+            logger.info(
+                "Binding secondary voice gateway listener on %s:%d alongside primary %s:%d",
+                host,
+                int(secondary_port),
+                host,
+                int(port),
+            )
+            secondary_server = uvicorn.Server(
+                uvicorn.Config(app, host=host, port=int(secondary_port), log_level="info")
+            )
+            servers.append(secondary_server.serve())
+        else:
+            logger.info(
+                "Secondary port %d already bound (reverse-proxy active); serving primary %s:%d",
+                int(secondary_port),
+                host,
+                int(port),
+            )
+
+    await asyncio.gather(*servers)
+
+
+def run_dual_port_gateway(
+    app: Any,
+    host: str = "0.0.0.0",
+    port: int = DEFAULT_PRIMARY_GATEWAY_PORT,
+    secondary_port: Optional[int] = DEFAULT_SECONDARY_GATEWAY_PORT,
+) -> None:
+    """Synchronous entrypoint wrapping `serve_dual_port_app`."""
+    asyncio.run(serve_dual_port_app(app, host=host, port=port, secondary_port=secondary_port))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="GOTCHI V1 Reference Voice Gateway Server")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PRIMARY_GATEWAY_PORT,
+        help=f"Primary bind port (default: {DEFAULT_PRIMARY_GATEWAY_PORT})",
+    )
+    parser.add_argument(
+        "--secondary-port",
+        type=int,
+        default=DEFAULT_SECONDARY_GATEWAY_PORT,
+        help=f"Secondary/fallback bind port (default: {DEFAULT_SECONDARY_GATEWAY_PORT}; 0 to disable)",
+    )
+    args = parser.parse_args()
+    app = create_app()
+    run_dual_port_gateway(
+        app,
+        host=args.host,
+        port=args.port,
+        secondary_port=args.secondary_port if args.secondary_port > 0 else None,
+    )
+
+
+if __name__ == "__main__":
+    main()

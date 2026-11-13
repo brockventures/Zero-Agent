@@ -193,10 +193,6 @@ bool EpdPanel::isPanelBusy() const {
 }
 
 bool EpdPanel::needsIdleScrub() const {
-    if (rtc_consecutive_partials >= MAX_CONSECUTIVE_PARTIALS) return true;
-    if (rtc_dirty_pixels >= MAX_DIRTY_PIXELS_BEFORE_SCRUB) return true;
-    uint32_t elapsed = rtc_ms_since_full + (millis() - last_full_ms);
-    if (elapsed >= FULL_REFRESH_INTERVAL_MS) return true;
     return false;
 }
 
@@ -205,9 +201,8 @@ uint32_t EpdPanel::cumulativeDirtyPixels() const {
 }
 
 const char* EpdPanel::selectMode(bool force_full, bool allow_periodic_full) {
+    (void)allow_periodic_full;
     if (force_full || rtc_first_frame_pending || !s_has_prev_frame) return "full";
-    if (rtc_consecutive_partials >= MAX_PARTIALS_HARD_CEILING) return "full";
-    if (allow_periodic_full && needsIdleScrub()) return "full";
     return "partial";
 }
 
@@ -273,10 +268,10 @@ bool EpdPanel::drawFrame(const GotchiUIState& ui, const char* mode) {
             rails_warm_ = true;
         }
 
-        // Keep mid-turn animation partial refreshes un-clamped to avoid ghosting.
         uint32_t flipped = 0;
         for (uint32_t i = 0; i < EPD_BUF_BYTES; ++i) {
             flipped += __builtin_popcount(static_cast<unsigned int>(s_prev_frame[i] ^ raw[i]));
+            s_prev_frame[i] |= static_cast<uint8_t>(~raw[i]);
         }
         rtc_dirty_pixels += flipped;
 
@@ -344,12 +339,8 @@ bool EpdPanel::drawFrame(const GotchiUIState& ui, const char* mode) {
         epdWriteCommand(0x3C);
         epdWriteData(0x00);
 
-        // Before clamping s_prev_frame in partial mode, compute flipped bits between
-        // previous raw frame and new raw buffer using __builtin_popcount(s_prev_frame[i] ^ raw[i])
-        // and accumulate into rtc_dirty_pixels.
-        // Re-drive solid black pixels jet-black on synchronous return-to-idle partial refresh:
-        // mark every black pixel (0) in raw as white (1) in s_prev_frame (0x26 old buffer),
-        // forcing SSD1681 partial LUT (0xFF) to actively re-drive all black pixels.
+        // Re-drive solid black pixels on return-to-idle partial refresh so ghosted/faded
+        // blacks are refreshed jet-black via SSD1681 partial LUT (white-to-black transition).
         uint32_t flipped = 0;
         for (uint32_t i = 0; i < EPD_BUF_BYTES; ++i) {
             flipped += __builtin_popcount(static_cast<unsigned int>(s_prev_frame[i] ^ raw[i]));
@@ -431,6 +422,12 @@ bool EpdPanel::drawFrame(const GotchiUIState& ui, const char* mode) {
         s_idle_start_ms = millis();
     } else {
         rtc_consecutive_partials++;
+    }
+
+    if (ui.sleeping) {
+        epdWriteCommand(0x10);
+        epdWriteData(0x01);
+        hibernating_ = true;
     }
 
     drawing_ = false;

@@ -28,6 +28,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #include <ArduinoJson.h>
 #include <driver/gpio.h>
 #include <driver/i2s.h>
+#include <esp_sleep.h>
 #include "esp_camera.h"
 #include "pins.h"
 #include "epd_panel.h"
@@ -75,10 +76,15 @@ struct GotchiConfig {
     bool     journal_mode = false;    // F24: Passive All-Day Journal mode off by default (configurable via set_config)
     bool     ble_disable_wifi = true; // F18/F24: Default true — turn off Wi-Fi radio whenever connected to phone over BLE
     uint32_t ble_wifi_idle_off_ms = 300000; // When bonded over BLE with Wi-Fi enabled, power down Wi-Fi after 5 min of idle
+    uint32_t battery_wifi_idle_off_ms = 120000; // 2 minutes default unplugged battery idle sleep
+    uint32_t screen_sleep_ms = 600000;     // 10 minutes default idle screen sleep (0 = disabled)
     uint32_t journal_seg_max_ms = 30000;   // F24: Max 30s per passive journal speech segment
     uint32_t journal_silence_ms = 2000;    // F24: 2.0s trailing silence closes a journal segment
     uint32_t journal_min_voiced_ms = 1000; // F24: Minimum 1.0s voiced duration to upload a journal segment
     String default_image_prompt = "Describe what you see in this snapshot briefly.";
+    uint8_t chime_volume_pct = 35;
+    uint8_t ble_tx_pacing_ms = gotchi_ble::BLE_TX_DEFAULT_PACING_MS; // 12ms CHAR_TX notification pacing (10..50ms)
+    uint32_t ble_thinking_timeout_ms = 25000;                        // 25s THINKING recovery guard in BLE relay / ble_phone mode
 } cfg;
 
 static bool constantTimeEquals(const String& a, const String& b) {
@@ -115,6 +121,15 @@ static String   s_pending_answer_id = "";
 static bool     s_auto_speak_pending = false;
 static bool     s_reopen_mic_pending = false; // set after a '?' reply finishes playing; loop() reopens the mic
 static bool     s_voice_busy = false;
+static constexpr uint32_t DEFERRED_WAIT_MAX_MS = 660000UL; // 11 minutes
+static bool     s_deferred_wait_active = false;
+static uint32_t s_deferred_wait_start_ts = 0;
+static uint32_t s_deferred_next_poll_ms = 30000;
+static uint32_t s_last_deferred_poll_ts = 0;
+
+struct GotchiUIStateWithAsync : public GotchiUIState {
+    bool async_handoff = false;
+};
 // millis() when the last voice/camera/live turn ended. The fuel gauge skips samples
 // for BATTERY_LOAD_SETTLE_MS after it, because VBAT sags under speaker and Wi-Fi TX load.
 static uint32_t s_last_load_end_ts = 0;
@@ -138,6 +153,13 @@ static UiState s_last_drawn_voice_state = UiState::IDLE;
 static uint32_t s_idle_entered_ts = 0;
 static int8_t   s_last_drawn_battery_pct = -1;
 static bool     s_last_drawn_wall_power = false;
+static bool     s_last_drawn_wifi_active = false;
+static bool     s_last_drawn_ble_active = false;
+static bool     s_screen_sleeping = false;
+static constexpr uint32_t BLE_THINKING_MIN_TIMEOUT_MS = 5000;
+static constexpr uint32_t BLE_THINKING_MAX_TIMEOUT_MS = 60000;
+static uint32_t s_thinking_entered_ts = 0;
+static bool     s_ble_thinking_timed_out = false;
 static void showIdle();
 static bool     s_enter_live_pending = false;
 static bool     s_wifi_disabled_for_ble_lp = false;
@@ -149,6 +171,14 @@ static TaskHandle_t s_rgb_task_handle = nullptr;
 static volatile bool s_led_test_override = false;
 static volatile bool s_rgb_force_refresh = false;
 
+static bool isBleRelayOrPhoneAudioMode() {
+    if (cfg.audio_out_mode == "ble_phone") {
+        return true;
+    }
+    return gotchi_ble::isBlePeerConnected() &&
+           (s_wifi_disabled_for_ble_lp || WiFi.status() != WL_CONNECTED);
+}
+
 static void notifyRgbTask() {
     if (s_rgb_task_handle) {
         xTaskNotifyGive(s_rgb_task_handle);
@@ -156,6 +186,18 @@ static void notifyRgbTask() {
 }
 
 static void setVoiceUiState(UiState state) {
+    if (state != UiState::IDLE) {
+        s_screen_sleeping = false;
+        s_last_activity_ts = millis();
+    }
+    if (state == UiState::THINKING || state == UiState::TRANSCRIBING || state == UiState::SYNTHESIZING) {
+        if (s_thinking_entered_ts == 0) {
+            s_thinking_entered_ts = millis();
+            if (s_thinking_entered_ts == 0) s_thinking_entered_ts = 1;
+        }
+    } else {
+        s_thinking_entered_ts = 0;
+    }
     s_last_drawn_voice_state = state;
     notifyRgbTask();
 }
@@ -292,15 +334,14 @@ static void rgbStatusTaskFn(void* param) {
     }
 }
 
-// Dynamically boosts CPU clock to 240 MHz (and switches Wi-Fi to WIFI_PS_MIN_MODEM) during active voice,
-// camera, live, or journal-upload bursts so JPEG DMA, base64 audio decoding, and NLMS AEC run
-// at full speed without Wi-Fi/BLE coexistence panics, then drops back to 80 MHz + WIFI_PS_MAX_MODEM whenever idle.
+// Dynamically switches Wi-Fi to WIFI_PS_MIN_MODEM during active voice,
+// camera, live, or journal-upload bursts, and drops back to WIFI_PS_MAX_MODEM whenever idle.
+// Dynamic CPU frequency switching (80/240 MHz) is removed to avoid ESP32-S3 OPI PSRAM + Wi-Fi/BLE panics.
 static int s_cpu_boost_depth = 0;
 
 struct ScopedCpuBoost {
     ScopedCpuBoost() {
         if (s_cpu_boost_depth++ == 0) {
-            setCpuFrequencyMhz(240);
             if (!s_wifi_disabled_for_ble_lp && WiFi.status() == WL_CONNECTED) {
                 WiFi.setSleep(WIFI_PS_MIN_MODEM);
             }
@@ -309,7 +350,6 @@ struct ScopedCpuBoost {
     ~ScopedCpuBoost() {
         if (--s_cpu_boost_depth <= 0) {
             s_cpu_boost_depth = 0;
-            setCpuFrequencyMhz(80);
             if (!s_wifi_disabled_for_ble_lp && WiFi.status() == WL_CONNECTED) {
                 WiFi.setSleep(WIFI_PS_MAX_MODEM);
             }
@@ -330,6 +370,7 @@ EpdPanel panel;
 // ADC read measures VBAT/2 on D4 (high-Z) and VBUS on D2 (against internal 45k INPUT_PULLDOWN).
 // ============================================================================
 static constexpr uint32_t POWER_TELEMETRY_INTERVAL_MS = 1000;
+static constexpr uint32_t POWER_TELEMETRY_IDLE_INTERVAL_MS = 60000; // 60s relaxed telemetry on battery idle
 static uint32_t s_last_power_sample_ts = 0;
 static uint16_t s_battery_mv = 0;
 static uint16_t s_last_d4_mv = 0;
@@ -364,9 +405,14 @@ static bool isUsbDataHostConnected() {
     return (bool)Serial;
 }
 
+static bool isExternalPowerConnected();
+
 static void samplePowerAndBatteryTelemetry(bool force = false) {
     uint32_t now = millis();
-    if (!force && s_last_power_sample_ts != 0 && (now - s_last_power_sample_ts < POWER_TELEMETRY_INTERVAL_MS)) {
+    bool idle_battery = !isExternalPowerConnected() && (s_last_drawn_voice_state == UiState::IDLE) &&
+                        (s_wifi_disabled_for_ble_lp || WiFi.getMode() == WIFI_MODE_NULL);
+    uint32_t interval = idle_battery ? POWER_TELEMETRY_IDLE_INTERVAL_MS : POWER_TELEMETRY_INTERVAL_MS;
+    if (!force && s_last_power_sample_ts != 0 && (now - s_last_power_sample_ts < interval)) {
         return;
     }
     // Only sample when neither tactile button is actively held LOW.
@@ -447,6 +493,8 @@ static void attachPowerToUi(GotchiUIState& ui) {
     ui.battery_pct = s_battery_pct;
     ui.battery_mv  = s_battery_mv;
     ui.wall_power  = isExternalPowerConnected();
+    ui.wifi_active = !s_wifi_disabled_for_ble_lp && (WiFi.status() == WL_CONNECTED);
+    ui.ble_active  = gotchi_ble::isBlePeerConnected();
 }
 
 static void applyPrerollPolicy() {
@@ -526,11 +574,36 @@ void loadConfig() {
     cfg.journal_mode         = prefs.getBool("journal_mode", cfg.journal_mode);
     cfg.ble_disable_wifi     = prefs.getBool("ble_no_wifi", cfg.ble_disable_wifi);
     cfg.ble_wifi_idle_off_ms = prefs.getUInt("ble_wifi_idl", cfg.ble_wifi_idle_off_ms);
+    cfg.battery_wifi_idle_off_ms = prefs.getUInt("bat_wifi_idl", cfg.battery_wifi_idle_off_ms);
+    cfg.screen_sleep_ms      = prefs.getUInt("scr_sleep_ms", cfg.screen_sleep_ms);
     cfg.journal_seg_max_ms   = prefs.getUInt("jrn_seg_ms", cfg.journal_seg_max_ms);
     cfg.journal_silence_ms   = prefs.getUInt("jrn_sil_ms", cfg.journal_silence_ms);
     cfg.journal_min_voiced_ms= prefs.getUInt("jrn_min_ms", cfg.journal_min_voiced_ms);
     cfg.default_image_prompt = prefs.getString("img_prompt", cfg.default_image_prompt);
+    cfg.chime_volume_pct     = (uint8_t)prefs.getUInt("chime_vol", cfg.chime_volume_pct);
+    cfg.ble_tx_pacing_ms     = (uint8_t)prefs.getUInt("ble_pace_ms", cfg.ble_tx_pacing_ms);
+    cfg.ble_thinking_timeout_ms = prefs.getUInt("ble_thk_ms", cfg.ble_thinking_timeout_ms);
+    if (!prefs.getBool("bat_idl_v1", false) && cfg.battery_wifi_idle_off_ms == 0) {
+        cfg.battery_wifi_idle_off_ms = 120000;
+        prefs.end();
+        prefs.begin("gotchi", false);
+        prefs.putUInt("bat_wifi_idl", 120000);
+        prefs.putBool("bat_idl_v1", true);
+    }
     prefs.end();
+    if (cfg.chime_volume_pct > 100) cfg.chime_volume_pct = 100;
+    gotchi_audio::setChimeVolumePct(cfg.chime_volume_pct);
+    if (cfg.ble_tx_pacing_ms < gotchi_ble::BLE_TX_MIN_PACING_MS) {
+        cfg.ble_tx_pacing_ms = (uint8_t)gotchi_ble::BLE_TX_MIN_PACING_MS;
+    } else if (cfg.ble_tx_pacing_ms > gotchi_ble::BLE_TX_MAX_PACING_MS) {
+        cfg.ble_tx_pacing_ms = (uint8_t)gotchi_ble::BLE_TX_MAX_PACING_MS;
+    }
+    gotchi_ble::setTxNotifyPacingMs(cfg.ble_tx_pacing_ms);
+    if (cfg.ble_thinking_timeout_ms < BLE_THINKING_MIN_TIMEOUT_MS) {
+        cfg.ble_thinking_timeout_ms = BLE_THINKING_MIN_TIMEOUT_MS;
+    } else if (cfg.ble_thinking_timeout_ms > BLE_THINKING_MAX_TIMEOUT_MS) {
+        cfg.ble_thinking_timeout_ms = BLE_THINKING_MAX_TIMEOUT_MS;
+    }
     if (cfg.ptt_max_ms > 120000) cfg.ptt_max_ms = 120000;
     if (cfg.ptt_max_ms < 1000)   cfg.ptt_max_ms = 1000;
 }
@@ -566,17 +639,39 @@ void saveConfig() {
     prefs.putBool("journal_mode", cfg.journal_mode);
     prefs.putBool("ble_no_wifi", cfg.ble_disable_wifi);
     prefs.putUInt("ble_wifi_idl", cfg.ble_wifi_idle_off_ms);
+    prefs.putUInt("bat_wifi_idl", cfg.battery_wifi_idle_off_ms);
+    prefs.putUInt("scr_sleep_ms", cfg.screen_sleep_ms);
+    prefs.putBool("bat_idl_v1", true);
     prefs.putUInt("jrn_seg_ms", cfg.journal_seg_max_ms);
     prefs.putUInt("jrn_sil_ms", cfg.journal_silence_ms);
     prefs.putUInt("jrn_min_ms", cfg.journal_min_voiced_ms);
     prefs.putString("img_prompt", cfg.default_image_prompt);
+    prefs.putUInt("chime_vol", cfg.chime_volume_pct);
+    prefs.putUInt("ble_pace_ms", cfg.ble_tx_pacing_ms);
+    prefs.putUInt("ble_thk_ms", cfg.ble_thinking_timeout_ms);
     prefs.end();
+    gotchi_audio::setChimeVolumePct(cfg.chime_volume_pct);
+    gotchi_ble::setTxNotifyPacingMs(cfg.ble_tx_pacing_ms);
     applyPrerollPolicy();
 }
 
 String handleJsonRpc(const String& jsonLine) {
     JsonDocument req;
     JsonDocument res;
+    String trimmed = jsonLine;
+    trimmed.trim();
+    if (trimmed.equalsIgnoreCase("STATE:idle")) {
+        gotchi_ble::clearIncomingQueue();
+        if (!s_voice_busy && s_last_drawn_voice_state != UiState::IDLE) {
+            showIdle();
+        }
+        res["cmd"] = "state";
+        res["ok"] = true;
+        res["state"] = "idle";
+        String out;
+        serializeJson(res, out);
+        return out;
+    }
     if (deserializeJson(req, jsonLine)) {
         res["ok"] = false;
         res["error"] = "invalid_json";
@@ -617,10 +712,15 @@ String handleJsonRpc(const String& jsonLine) {
         res["journal_mode"] = cfg.journal_mode;
         res["ble_disable_wifi"] = cfg.ble_disable_wifi;
         res["ble_wifi_idle_off_ms"] = cfg.ble_wifi_idle_off_ms;
+        res["battery_wifi_idle_off_ms"] = cfg.battery_wifi_idle_off_ms;
+        res["screen_sleep_ms"] = cfg.screen_sleep_ms;
         res["journal_seg_max_ms"] = cfg.journal_seg_max_ms;
         res["journal_silence_ms"] = cfg.journal_silence_ms;
         res["journal_min_voiced_ms"] = cfg.journal_min_voiced_ms;
         res["default_image_prompt"] = cfg.default_image_prompt;
+        res["chime_volume_pct"] = cfg.chime_volume_pct;
+        res["ble_tx_pacing_ms"] = cfg.ble_tx_pacing_ms;
+        res["ble_thinking_timeout_ms"] = cfg.ble_thinking_timeout_ms;
         samplePowerAndBatteryTelemetry(true);
         res["usb_host_connected"] = isUsbDataHostConnected();
         res["wall_power_connected"] = isWallBrickPowerConnected();
@@ -696,11 +796,33 @@ String handleJsonRpc(const String& jsonLine) {
         if (req["journal_mode"].is<bool>()) cfg.journal_mode = req["journal_mode"].as<bool>();
         if (req["ble_disable_wifi"].is<bool>()) cfg.ble_disable_wifi = req["ble_disable_wifi"].as<bool>();
         if (req["ble_wifi_idle_off_ms"].is<uint32_t>()) cfg.ble_wifi_idle_off_ms = req["ble_wifi_idle_off_ms"].as<uint32_t>();
+        if (req["battery_wifi_idle_off_ms"].is<uint32_t>()) cfg.battery_wifi_idle_off_ms = req["battery_wifi_idle_off_ms"].as<uint32_t>();
+        if (req["screen_sleep_ms"].is<uint32_t>()) cfg.screen_sleep_ms = req["screen_sleep_ms"].as<uint32_t>();
         if (req["journal_seg_max_ms"].is<uint32_t>()) cfg.journal_seg_max_ms = req["journal_seg_max_ms"].as<uint32_t>();
         if (req["journal_silence_ms"].is<uint32_t>()) cfg.journal_silence_ms = req["journal_silence_ms"].as<uint32_t>();
         if (req["journal_min_voiced_ms"].is<uint32_t>()) cfg.journal_min_voiced_ms = req["journal_min_voiced_ms"].as<uint32_t>();
         if (req["default_image_prompt"].is<const char*>()) {
             cfg.default_image_prompt = req["default_image_prompt"].as<String>();
+        }
+        if (req["chime_volume_pct"].is<int>() || req["chime_volume_pct"].is<uint32_t>()) {
+            int v = req["chime_volume_pct"].as<int>();
+            if (v < 0) v = 0;
+            if (v > 100) v = 100;
+            cfg.chime_volume_pct = (uint8_t)v;
+            gotchi_audio::setChimeVolumePct(cfg.chime_volume_pct);
+        }
+        if (req["ble_tx_pacing_ms"].is<int>() || req["ble_tx_pacing_ms"].is<uint32_t>()) {
+            int v = req["ble_tx_pacing_ms"].as<int>();
+            if (v < (int)gotchi_ble::BLE_TX_MIN_PACING_MS) v = (int)gotchi_ble::BLE_TX_MIN_PACING_MS;
+            if (v > (int)gotchi_ble::BLE_TX_MAX_PACING_MS) v = (int)gotchi_ble::BLE_TX_MAX_PACING_MS;
+            cfg.ble_tx_pacing_ms = (uint8_t)v;
+            gotchi_ble::setTxNotifyPacingMs(cfg.ble_tx_pacing_ms);
+        }
+        if (req["ble_thinking_timeout_ms"].is<uint32_t>() || req["ble_thinking_timeout_ms"].is<int>()) {
+            uint32_t v = req["ble_thinking_timeout_ms"].as<uint32_t>();
+            if (v < BLE_THINKING_MIN_TIMEOUT_MS) v = BLE_THINKING_MIN_TIMEOUT_MS;
+            if (v > BLE_THINKING_MAX_TIMEOUT_MS) v = BLE_THINKING_MAX_TIMEOUT_MS;
+            cfg.ble_thinking_timeout_ms = v;
         }
         saveConfig();
     } else if (cmd == "set_wifi") {
@@ -960,6 +1082,8 @@ String handleJsonRpc(const String& jsonLine) {
         if (msg.length() > 22) msg = msg.substring(0, 22);
         s_notify_status_text = msg;
         s_notify_expire_ts = millis() + NOTIFY_STATUS_TTL_MS;
+        s_screen_sleeping = false;
+        s_last_activity_ts = millis();
         if (req["notify_id"].is<const char*>()) {
             res["notify_id"] = req["notify_id"].as<String>();
         }
@@ -1030,6 +1154,15 @@ String handleJsonRpc(const String& jsonLine) {
         }
         res["d2_float_ms"] = d2_float_ms;
         notifyRgbTask();
+    } else if (cmd == "turn_abort") {
+        String reason = req["error"] | "turn_abort";
+        gotchi_log::RingLogger.warn("ble", (String("BLE relay turn_abort received: ") + reason).c_str());
+        gotchi_ble::clearIncomingQueue();
+        s_thinking_entered_ts = 0;
+        if (!s_voice_busy && s_last_drawn_voice_state != UiState::IDLE) {
+            showIdle();
+        }
+        res["state"] = "idle";
     } else if (cmd == "reboot") {
         ESP.restart();
     } else {
@@ -1073,12 +1206,15 @@ static void showIdle() {
     if (s_last_drawn_voice_state != UiState::IDLE || s_idle_entered_ts == 0) {
         s_idle_entered_ts = millis();
     }
+    s_screen_sleeping = false;
     setVoiceUiState(UiState::IDLE);
     samplePowerAndBatteryTelemetry();
     GotchiUIState idle_ui;
     attachPowerToUi(idle_ui);
     s_last_drawn_battery_pct = s_battery_pct;
     s_last_drawn_wall_power = isExternalPowerConnected();
+    s_last_drawn_wifi_active = idle_ui.wifi_active;
+    s_last_drawn_ble_active = idle_ui.ble_active;
     idle_ui.skin = cfg.skin;
     if (s_notify_status_text.length() > 0 && (int32_t)(millis() - s_notify_expire_ts) >= 0) {
         s_notify_status_text = "";
@@ -1091,6 +1227,18 @@ static void showIdle() {
         idle_ui.status_text = s_notify_status_text;
     }
     panel.draw(idle_ui, false);
+}
+
+static void enterScreenSleep() {
+    GotchiUIState sleep_ui;
+    sleep_ui.state = UiState::IDLE;
+    sleep_ui.sleeping = true;
+    sleep_ui.blink = true;
+    sleep_ui.skin = cfg.skin;
+    sleep_ui.status_text = "SLEEPING (PRESS PTT)";
+    attachPowerToUi(sleep_ui);
+    panel.draw(sleep_ui, false);
+    s_screen_sleeping = true;
 }
 
 static uint8_t s_voice_anim_frame = 0;
@@ -1137,6 +1285,17 @@ static gotchi_voice::InteractResult pollVoiceAbort() {
         s_btn_top_armed = false;
         return gotchi_voice::InteractResult::ABORT_CANCEL;
     }
+    if ((s_last_drawn_voice_state == UiState::THINKING ||
+         s_last_drawn_voice_state == UiState::TRANSCRIBING ||
+         s_last_drawn_voice_state == UiState::SYNTHESIZING) &&
+        s_thinking_entered_ts != 0 &&
+        isBleRelayOrPhoneAudioMode() &&
+        (uint32_t)(millis() - s_thinking_entered_ts) >= cfg.ble_thinking_timeout_ms) {
+        s_ble_thinking_timed_out = true;
+        s_thinking_entered_ts = 0;
+        gotchi_log::RingLogger.warn("ble", "THINKING timeout in BLE relay / ble_phone mode; recovering to IDLE");
+        return gotchi_voice::InteractResult::ABORT_CANCEL;
+    }
     return gotchi_voice::InteractResult::DONE;
 }
 
@@ -1177,6 +1336,7 @@ static size_t captureBurstFrames() {
 // Runs a Go Live continuous session (PRD F19 / F21 / Section 5b).
 // Stays open until `BTN_TOP` is pressed or `cfg.live_silence_ms` of silence elapses.
 static void runLiveSession() {
+    s_deferred_wait_active = false;
     ScopedVoiceBusy voice_busy_guard;
     GotchiUIState ui;
     ui.skin = cfg.skin;
@@ -1227,10 +1387,28 @@ static void runLiveSession() {
     showIdle();
 }
 
+static void wakeWiFiFromLowPower() {
+    if (s_wifi_disabled_for_ble_lp && cfg.wifi_ssid.length() > 0) {
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(cfg.wifi_ssid.c_str(), cfg.wifi_psk.c_str());
+        WiFi.setSleep(WIFI_PS_MAX_MODEM);
+        s_wifi_disabled_for_ble_lp = false;
+    }
+}
+
 static void dispatchVoiceOrSnap(const gotchi_audio::WavView& wav, bool include_staged_snap, bool is_standalone_snap) {
-    GotchiUIState ui;
+    GotchiUIStateWithAsync ui;
     attachPowerToUi(ui);
     ui.skin = cfg.skin;
+
+    wakeWiFiFromLowPower();
+
+    if (WiFi.status() != WL_CONNECTED && !gotchi_ble::isBlePeerConnected()) {
+        uint32_t t_assoc0 = millis();
+        while (WiFi.status() != WL_CONNECTED && (millis() - t_assoc0 < 6000)) {
+            delay(20);
+        }
+    }
 
     if (WiFi.status() != WL_CONNECTED && !gotchi_ble::isBlePeerConnected()) {
         ui.state = UiState::OFFLINE;
@@ -1269,11 +1447,25 @@ static void dispatchVoiceOrSnap(const gotchi_audio::WavView& wav, bool include_s
         clearStagedSnapshots();
     }
 
+    s_ble_thinking_timed_out = false;
     gotchi_voice::InteractResult result = gotchi_voice::InteractResult::DONE;
     bool ok = gotchi_voice::interact(
         wav, cfg.voice_url, cfg.node_id, ui, onVoiceState, cfg.bearer_token,
         img_ptr, pollVoiceAbort, &result, cfg.audio_out_mode
     );
+    if (s_ble_thinking_timed_out) {
+        s_ble_thinking_timed_out = false;
+        gotchi_ble::clearIncomingQueue();
+        gotchi_log::RingLogger.warn("ble", "Recovered from stuck BLE THINKING turn; returning to IDLE");
+        ui.state = UiState::ERROR;
+        ui.error_code = "ble_timeout";
+        ui.status_text = "BLE TIMEOUT";
+        setVoiceUiState(UiState::ERROR);
+        panel.draw(ui);
+        delay(1200);
+        showIdle();
+        return;
+    }
     if (ok) {
         gotchi_log::RingLogger.info("http", "Interact stream completed (done)");
     } else if (result == gotchi_voice::InteractResult::ABORT_CANCEL) {
@@ -1311,6 +1503,21 @@ static void dispatchVoiceOrSnap(const gotchi_audio::WavView& wav, bool include_s
         s_reopen_mic_pending = true;
     }
 
+    if (ui.status_text.indexOf("DEFER") >= 0 ||
+        ui.reply.indexOf("[[defer]]") >= 0 ||
+        ui.reply.indexOf("looking into that") >= 0 ||
+        ui.reply.indexOf("look into that") >= 0) {
+        ui.async_handoff = true;
+    }
+
+    if (ui.async_handoff) {
+        s_deferred_wait_active = true;
+        s_deferred_wait_start_ts = millis();
+        s_last_deferred_poll_ts = millis();
+        s_deferred_next_poll_ms = 30000;
+        gotchi_log::RingLogger.info("voice", "Async handoff: activated 11-min duty-cycled deferred wait window");
+    }
+
     if (!ok) {
         delay(2000);
     }
@@ -1331,6 +1538,7 @@ static void runPttTurn(bool auto_listen_for_snap = false, bool reply_followup = 
 static void playPendingAnswer();
 
 static void handleCameraButtonIdle() {
+    s_deferred_wait_active = false;
     ScopedVoiceBusy voice_busy_guard;
     GotchiUIState ui;
     ui.skin = cfg.skin;
@@ -1451,6 +1659,7 @@ static void playPendingAnswer() {
 //   - Pressing `BTN_BOT` during recording captures a photo on release and attaches it to the
 //     voice turn in progress (F14; bottom button no longer cancels recording).
 static void runPttTurn(bool auto_listen_for_snap, bool reply_followup) {
+    s_deferred_wait_active = false;
     if (!auto_listen_for_snap && !reply_followup && isPendingAnswerValid()) {
         uint32_t t0 = millis();
         bool released = false;
@@ -1744,36 +1953,89 @@ static void runPttTurn(bool auto_listen_for_snap, bool reply_followup) {
 //     speaker or e-paper screen. Any button press (`BTN_TOP` / `BTN_BOT`) immediately preempts
 //     passive journal capture with zero user latency.
 // ============================================================================
+static bool checkGatewayPendingOnBootAndIdle(bool force);
+
 static void manageBleLowPowerWiFi() {
-    // Turn off the Wi-Fi radio (`WIFI_OFF`) and keep idle CPU clock at 80 MHz when connected over BLE if either:
+    uint32_t now = millis();
+
+    // 1. Duty-Cycled Deferred Burst Polling
+    if (s_deferred_wait_active && !s_voice_busy && (s_cpu_boost_depth <= 0)) {
+        if ((uint32_t)(now - s_deferred_wait_start_ts) >= DEFERRED_WAIT_MAX_MS) {
+            s_deferred_wait_active = false;
+        } else {
+            uint32_t interval_ms = (s_deferred_next_poll_ms > 0)
+                ? s_deferred_next_poll_ms
+                : (((uint32_t)(now - s_deferred_wait_start_ts) < 120000UL) ? 30000UL : 120000UL);
+
+            if ((uint32_t)(now - s_last_deferred_poll_ts) >= interval_ms) {
+                s_last_deferred_poll_ts = now;
+                if (s_wifi_disabled_for_ble_lp) {
+                    if (cfg.wifi_ssid.length() > 0) {
+                        WiFi.mode(WIFI_STA);
+                        WiFi.begin(cfg.wifi_ssid.c_str(), cfg.wifi_psk.c_str());
+                        uint32_t t0 = millis();
+                        while (WiFi.status() != WL_CONNECTED && (millis() - t0 < 3500)) {
+                            delay(20);
+                        }
+                    }
+                    bool answered = false;
+                    if (WiFi.status() == WL_CONNECTED) {
+                        answered = checkGatewayPendingOnBootAndIdle(true);
+                    }
+                    if (!answered) {
+                        WiFi.disconnect(true);
+                        WiFi.mode(WIFI_OFF);
+                        s_wifi_disabled_for_ble_lp = true;
+                    } else {
+                        s_deferred_wait_active = false;
+                        s_last_activity_ts = millis();
+                        s_wifi_disabled_for_ble_lp = false;
+                        WiFi.setSleep(WIFI_PS_MAX_MODEM);
+                    }
+                } else if (WiFi.status() == WL_CONNECTED) {
+                    bool answered = checkGatewayPendingOnBootAndIdle(true);
+                    if (answered) {
+                        s_deferred_wait_active = false;
+                        s_last_activity_ts = millis();
+                    }
+                }
+            }
+        }
+    }
+
+    // Turn off the Wi-Fi radio (`WIFI_OFF`) when connected over BLE if either:
     //   1. `cfg.ble_disable_wifi` is true (immediate BLE-only mode), OR
     //   2. `cfg.ble_wifi_idle_off_ms > 0` and the badge has been idle with no button/turn/RPC activity
     //      for >= `cfg.ble_wifi_idle_off_ms` (default 5 minutes).
+    //   3. Running on battery (!isExternalPowerConnected()) and idle for >= cfg.battery_wifi_idle_off_ms (default 2 minutes).
     // Any button press or BLE disconnect automatically wakes Wi-Fi STA back up in WIFI_PS_MAX_MODEM mode.
     bool ble_idle_expired = (cfg.ble_wifi_idle_off_ms > 0) &&
                             !s_voice_busy &&
                             (s_cpu_boost_depth <= 0) &&
                             ((uint32_t)(millis() - s_last_activity_ts) >= cfg.ble_wifi_idle_off_ms);
     bool want_ble_lp = gotchi_ble::isBlePeerConnected() && (cfg.ble_disable_wifi || ble_idle_expired);
-    if (want_ble_lp && !s_wifi_disabled_for_ble_lp) {
+
+    bool bat_idle_expired = !isExternalPowerConnected() &&
+                            (cfg.battery_wifi_idle_off_ms > 0) &&
+                            !s_voice_busy &&
+                            (s_cpu_boost_depth <= 0) &&
+                            ((uint32_t)(millis() - s_last_activity_ts) >= cfg.battery_wifi_idle_off_ms);
+    bool want_wifi_off = want_ble_lp || bat_idle_expired;
+
+    if (want_wifi_off && !s_wifi_disabled_for_ble_lp) {
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
-        if (s_cpu_boost_depth <= 0) {
-            setCpuFrequencyMhz(80);
-        }
         s_wifi_disabled_for_ble_lp = true;
-        gotchi_log::RingLogger.info("power", "BLE connected: WiFi_OFF + 80 MHz low-power mode active");
-    } else if (!want_ble_lp && s_wifi_disabled_for_ble_lp) {
+        gotchi_log::RingLogger.info("power", want_ble_lp ? "BLE connected: WiFi_OFF low-power mode active"
+                                                        : "Battery idle: WiFi_OFF low-power mode active");
+    } else if (!want_wifi_off && s_wifi_disabled_for_ble_lp && !s_deferred_wait_active) {
         s_wifi_disabled_for_ble_lp = false;
         if (cfg.wifi_ssid.length() > 0) {
             WiFi.mode(WIFI_STA);
             WiFi.begin(cfg.wifi_ssid.c_str(), cfg.wifi_psk.c_str());
             WiFi.setSleep(s_cpu_boost_depth > 0 ? WIFI_PS_MIN_MODEM : WIFI_PS_MAX_MODEM);
         }
-        if (s_cpu_boost_depth <= 0) {
-            setCpuFrequencyMhz(80);
-        }
-        gotchi_log::RingLogger.info("power", "BLE disconnected or WiFi re-enabled: restored Wi-Fi STA (80 MHz idle)");
+        gotchi_log::RingLogger.info("power", "BLE disconnected or WiFi re-enabled: restored Wi-Fi STA");
     }
 }
 
@@ -1850,12 +2112,21 @@ static bool checkGatewayPendingOnBootAndIdle(bool force = false) {
         return false;
     }
 
+    if (req["poll_after_s"].is<uint32_t>()) {
+        uint32_t pas = req["poll_after_s"].as<uint32_t>();
+        if (pas < 10) pas = 10;
+        if (pas > 180) pas = 180;
+        s_deferred_next_poll_ms = pas * 1000UL;
+    }
+
     String chime = req["chime"] | "ready";
     String msg = req["status_text"] | (req["message"] | "BUILD READY");
     msg.trim();
     if (msg.length() > 22) msg = msg.substring(0, 22);
     s_notify_status_text = msg;
     s_notify_expire_ts = millis() + NOTIFY_STATUS_TTL_MS;
+    s_screen_sleeping = false;
+    s_last_activity_ts = millis();
 
     bool has_pending_audio = req["has_pending_audio"] | false;
     String answer_id = req["answer_id"].is<const char*>() ? req["answer_id"].as<String>() : String("");
@@ -1863,6 +2134,7 @@ static bool checkGatewayPendingOnBootAndIdle(bool force = false) {
         s_pending_answer_ready = true;
         s_pending_answer_expire_ts = millis() + PENDING_ANSWER_TTL_MS;
         s_pending_answer_id = answer_id;
+        s_deferred_wait_active = false;
         if (chime.length() == 0) {
             chime = "ready";
         }
@@ -1873,12 +2145,10 @@ static bool checkGatewayPendingOnBootAndIdle(bool force = false) {
         s_auto_speak_pending = true;
     }
 
-    if (s_wifi_disabled_for_ble_lp) setCpuFrequencyMhz(240);
     if (chime.length() > 0) {
         gotchi_audio::playChime(chime.c_str());
     }
     showIdle();
-    if (s_wifi_disabled_for_ble_lp) setCpuFrequencyMhz(80);
 
     return true;
 }
@@ -1966,6 +2236,11 @@ void setup() {
     panel.begin();
     GotchiUIState boot_ui;
     attachPowerToUi(boot_ui);
+    s_last_drawn_battery_pct = s_battery_pct;
+    s_last_drawn_wall_power = isExternalPowerConnected();
+    s_last_drawn_wifi_active = boot_ui.wifi_active;
+    s_last_drawn_ble_active = boot_ui.ble_active;
+    s_last_activity_ts = millis();
     boot_ui.skin = cfg.skin;
     if (wifi_configured && !wifi_up && !gotchi_ble::isBlePeerConnected()) {
         boot_ui.state = UiState::OFFLINE;
@@ -1993,7 +2268,6 @@ void setup() {
         if (ok) {
             ESP.restart();
         } else {
-            if (s_cpu_boost_depth <= 0) setCpuFrequencyMhz(80);
             if (!s_wifi_disabled_for_ble_lp && WiFi.status() == WL_CONNECTED) WiFi.setSleep(WIFI_PS_MAX_MODEM);
         }
     }, []() {
@@ -2004,7 +2278,6 @@ void setup() {
         }
         HTTPUpload& up = httpServer.upload();
         if (up.status == UPLOAD_FILE_START) {
-            setCpuFrequencyMhz(240);
             if (WiFi.status() == WL_CONNECTED) WiFi.setSleep(WIFI_PS_MIN_MODEM);
             Update.abort();
             Update.begin(UPDATE_SIZE_UNKNOWN);
@@ -2014,7 +2287,6 @@ void setup() {
             Update.end(true);
         } else if (up.status == UPLOAD_FILE_ABORTED) {
             Update.abort();
-            if (s_cpu_boost_depth <= 0) setCpuFrequencyMhz(80);
             if (!s_wifi_disabled_for_ble_lp && WiFi.status() == WL_CONNECTED) WiFi.setSleep(WIFI_PS_MAX_MODEM);
         }
     });
@@ -2044,7 +2316,6 @@ void setup() {
         checkGatewayPendingOnBootAndIdle(true);
         WiFi.setSleep(WIFI_PS_MAX_MODEM);
     }
-    setCpuFrequencyMhz(80);
 }
 
 static uint32_t s_last_idle_bat_log_ts = 0;
@@ -2065,6 +2336,9 @@ void loop() {
     // Launch Go Live session if triggered by double-tap or whole-utterance "Go Live" command (F19/F21)
     if (s_enter_live_pending) {
         s_enter_live_pending = false;
+        s_last_activity_ts = millis();
+        s_deferred_wait_active = false;
+        wakeWiFiFromLowPower();
         ScopedCpuBoost boost;
         runLiveSession();
         s_btn_top_armed = (digitalRead(PIN_BTN_TOP_PTT) == HIGH);
@@ -2100,8 +2374,21 @@ void loop() {
         checkGatewayPendingOnBootAndIdle(false);
     }
 
-    // Poll incoming BLE CONTROL (0x07) frames while IDLE so notifications work in BLE low-power mode
-    if (s_last_drawn_voice_state == UiState::IDLE && gotchi_ble::isBlePeerConnected()) {
+    // Guard against stuck THINKING state in loop() when no voice turn is active (BLE relay / ble_phone recovery)
+    if (!s_voice_busy &&
+        (s_last_drawn_voice_state == UiState::THINKING ||
+         s_last_drawn_voice_state == UiState::TRANSCRIBING ||
+         s_last_drawn_voice_state == UiState::SYNTHESIZING) &&
+        s_thinking_entered_ts != 0 &&
+        isBleRelayOrPhoneAudioMode() &&
+        (uint32_t)(millis() - s_thinking_entered_ts) >= cfg.ble_thinking_timeout_ms) {
+        gotchi_log::RingLogger.warn("ble", "Loop BLE THINKING guard triggered; resetting stuck state to IDLE");
+        gotchi_ble::clearIncomingQueue();
+        showIdle();
+    }
+
+    // Poll incoming BLE CONTROL (0x07) frames when not in an active turn so notifications & turn_abort recovery work
+    if (!s_voice_busy && gotchi_ble::isBlePeerConnected()) {
         uint8_t ctrl_buf[512];
         size_t ctrl_len = 0;
         gotchi_ble::FrameType ctrl_type = gotchi_ble::FrameType::CONTROL;
@@ -2126,24 +2413,13 @@ void loop() {
         showIdle();
     }
 
-    // Deferred periodic full refresh scrub after sitting unattended in IDLE for >= IDLE_SCRUB_DEFER_MS (75s)
-    if (s_last_drawn_voice_state == UiState::IDLE && panel.needsIdleScrub() &&
-        (millis() - s_idle_entered_ts >= IDLE_SCRUB_DEFER_MS)) {
-        GotchiUIState idle_ui;
-        attachPowerToUi(idle_ui);
-        idle_ui.skin = cfg.skin;
-        if (s_notify_status_text.length() > 0) {
-            idle_ui.status_text = s_notify_status_text;
-        }
-        panel.drawBlinkMaskedFull(idle_ui);
-        s_idle_entered_ts = millis();
-    }
-
     // Top button (speaking only, F13): start Hybrid / Tap-to-Talk / Hold-to-Talk / Double-Tap Live
     if (s_btn_top_armed && btnStable(PIN_BTN_TOP_PTT, true)) {
         s_btn_top_armed = false;
         s_last_activity_ts = millis();
         s_notify_status_text = "";
+        s_deferred_wait_active = false;
+        wakeWiFiFromLowPower();
         ScopedCpuBoost boost;
         runPttTurn();
         s_btn_top_armed = (digitalRead(PIN_BTN_TOP_PTT) == HIGH);
@@ -2154,6 +2430,8 @@ void loop() {
     if (s_btn_bot_armed && btnStable(PIN_BTN_BOT_MOD, true)) {
         s_btn_bot_armed = false;
         s_last_activity_ts = millis();
+        s_deferred_wait_active = false;
+        wakeWiFiFromLowPower();
         ScopedCpuBoost boost;
         handleCameraButtonIdle();
         s_btn_bot_armed = (digitalRead(PIN_BTN_BOT_MOD) == HIGH);
@@ -2163,6 +2441,9 @@ void loop() {
     // If staged camera snapshot(s) weren't paired with a voice prompt within `snap_window_ms` (3s),
     // dispatch standalone with `default_image_prompt` and no `audio` part.
     if (s_staged_jpeg_active && (millis() - s_staged_jpeg_ts >= cfg.snap_window_ms)) {
+        s_last_activity_ts = millis();
+        s_deferred_wait_active = false;
+        wakeWiFiFromLowPower();
         ScopedCpuBoost boost;
         gotchi_audio::WavView no_audio_wav{nullptr, 0};
         dispatchVoiceOrSnap(no_audio_wav, true, true);
@@ -2173,11 +2454,23 @@ void loop() {
     samplePowerAndBatteryTelemetry();
     bool unplug_settle_done = had_unplug_reseed && !s_battery_reseed;
 
+    manageBleLowPowerWiFi();
+
     if (s_last_drawn_voice_state == UiState::IDLE) {
-        if (isExternalPowerConnected() != s_last_drawn_wall_power) {
-            showIdle();
-        } else if (unplug_settle_done) {
-            showIdle();
+        if (cfg.screen_sleep_ms > 0 && !s_screen_sleeping &&
+            (uint32_t)(millis() - s_last_activity_ts) >= cfg.screen_sleep_ms) {
+            enterScreenSleep();
+        }
+        bool wifi_active = !s_wifi_disabled_for_ble_lp && (WiFi.status() == WL_CONNECTED);
+        bool ble_active = gotchi_ble::isBlePeerConnected();
+        if (!s_screen_sleeping) {
+            if (isExternalPowerConnected() != s_last_drawn_wall_power) {
+                showIdle();
+            } else if (unplug_settle_done) {
+                showIdle();
+            } else if (wifi_active != s_last_drawn_wifi_active || ble_active != s_last_drawn_ble_active) {
+                showIdle();
+            }
         }
     }
 
@@ -2185,15 +2478,17 @@ void loop() {
     if (s_last_drawn_voice_state == UiState::IDLE &&
         (s_last_idle_bat_log_ts == 0 || (now_idle_log - s_last_idle_bat_log_ts >= IDLE_BAT_LOG_INTERVAL_MS))) {
         s_last_idle_bat_log_ts = now_idle_log;
-        char pwr_msg[128];
+        char pwr_msg[144];
         snprintf(pwr_msg, sizeof(pwr_msg),
-                 "idle_power bat_mv=%u raw_mv=%u d4_mv=%u d2_mv=%u bat_pct=%d cpu_mhz=%u rssi=%d",
+                 "idle_power bat_mv=%u raw_mv=%u d4_mv=%u d2_mv=%u bat_pct=%d cpu_mhz=%u rssi=%d wifi=%s ble=%s",
                  (unsigned)s_battery_mv, (unsigned)(s_last_d4_mv * 2),
                  (unsigned)s_last_d4_mv, (unsigned)s_last_d2_mv,
                  (int)s_battery_pct, (unsigned)getCpuFrequencyMhz(),
-                 (WiFi.status() == WL_CONNECTED) ? (int)WiFi.RSSI() : 0);
+                 (WiFi.status() == WL_CONNECTED) ? (int)WiFi.RSSI() : 0,
+                 (s_wifi_disabled_for_ble_lp || WiFi.getMode() == WIFI_MODE_NULL) ? "off" : "on",
+                 gotchi_ble::isBlePeerConnected() ? "connected" : "adv");
         gotchi_log::RingLogger.info("power", pwr_msg);
-        if (s_battery_pct != s_last_drawn_battery_pct) {
+        if (!s_screen_sleeping && s_battery_pct != s_last_drawn_battery_pct) {
             showIdle();
         }
     }
@@ -2213,7 +2508,6 @@ void loop() {
     } else {
         s_switch_off_streak = 0;
     }
-    manageBleLowPowerWiFi();
     applyPrerollPolicy();
     if (cfg.journal_mode) {
         pollJournalMode();
@@ -2222,6 +2516,100 @@ void loop() {
         gotchi_audio::pumpPreroll();
         delay(2);
     } else {
-        delay(25);
+        bool can_light_sleep = !isExternalPowerConnected() &&
+                               !gotchi_ble::isBlePeerConnected() &&
+                               (s_last_drawn_voice_state == UiState::IDLE) &&
+                               !cfg.journal_mode &&
+                               !gotchi_audio::isPrerollEnabled() &&
+                               !s_staged_jpeg_active &&
+                               !panel.isDrawing() &&
+                               (s_wifi_disabled_for_ble_lp || WiFi.getMode() == WIFI_MODE_NULL) &&
+                               !s_voice_busy &&
+                               (s_cpu_boost_depth <= 0) &&
+                               !s_enter_live_pending &&
+                               !s_reopen_mic_pending &&
+                               !s_auto_speak_pending &&
+                               (s_battery_pct >= 0) &&
+                               (digitalRead(PIN_BTN_TOP_PTT) == HIGH) &&
+                               (digitalRead(PIN_BTN_BOT_MOD) == HIGH);
+
+        if (can_light_sleep) {
+            uint32_t now = millis();
+            uint32_t sleep_ms = 60000; // 60s relaxed battery telemetry & sleep interval
+
+            // Coalesced battery ADC telemetry deadline
+            if (now - s_last_power_sample_ts < POWER_TELEMETRY_IDLE_INTERVAL_MS) {
+                uint32_t rem_telemetry = POWER_TELEMETRY_IDLE_INTERVAL_MS - (now - s_last_power_sample_ts);
+                if (rem_telemetry < sleep_ms) sleep_ms = rem_telemetry;
+            }
+
+            // Idle power log deadline
+            if (now - s_last_idle_bat_log_ts < IDLE_BAT_LOG_INTERVAL_MS) {
+                uint32_t rem_log = IDLE_BAT_LOG_INTERVAL_MS - (now - s_last_idle_bat_log_ts);
+                if (rem_log < sleep_ms) sleep_ms = rem_log;
+            }
+
+            // Screen sleep deadline
+            if (!s_screen_sleeping && cfg.screen_sleep_ms > 0) {
+                uint32_t elapsed_active = now - s_last_activity_ts;
+                uint32_t rem_screen_sleep = (elapsed_active < cfg.screen_sleep_ms)
+                    ? (cfg.screen_sleep_ms - elapsed_active)
+                    : 10;
+                if (rem_screen_sleep < sleep_ms) sleep_ms = rem_screen_sleep;
+            }
+
+            // Deferred answer poll deadline
+            if (s_deferred_wait_active) {
+                uint32_t interval_ms = (s_deferred_next_poll_ms > 0)
+                    ? s_deferred_next_poll_ms
+                    : (((uint32_t)(now - s_deferred_wait_start_ts) < 120000UL) ? 30000UL : 120000UL);
+                uint32_t elapsed_poll = now - s_last_deferred_poll_ts;
+                uint32_t rem_poll = (elapsed_poll < interval_ms) ? (interval_ms - elapsed_poll) : 10;
+                if (rem_poll < sleep_ms) sleep_ms = rem_poll;
+            }
+
+            // Notification status LED blink edge / expiry deadline
+            if (s_notify_status_text.length() > 0) {
+                int32_t rem_expire = (int32_t)(s_notify_expire_ts - now);
+                if (rem_expire > 0) {
+                    uint32_t t = now % 4000;
+                    uint32_t next_edge_ms = 4000 - t;
+                    if (t < 120) {
+                        next_edge_ms = 120 - t;
+                    } else if (t < 260) {
+                        next_edge_ms = 260 - t;
+                    } else if (t < 380) {
+                        next_edge_ms = 380 - t;
+                    }
+                    if (next_edge_ms < (uint32_t)rem_expire && next_edge_ms < sleep_ms) {
+                        sleep_ms = next_edge_ms;
+                    } else if ((uint32_t)rem_expire < sleep_ms) {
+                        sleep_ms = (uint32_t)rem_expire;
+                    }
+                } else {
+                    sleep_ms = 10;
+                }
+            }
+
+            if (sleep_ms < 10) sleep_ms = 10;
+
+            gpio_wakeup_enable((gpio_num_t)PIN_BTN_TOP_PTT, GPIO_INTR_LOW_LEVEL);
+            gpio_wakeup_enable((gpio_num_t)PIN_BTN_BOT_MOD, GPIO_INTR_LOW_LEVEL);
+            esp_sleep_enable_gpio_wakeup();
+            esp_sleep_enable_timer_wakeup((uint64_t)sleep_ms * 1000ULL);
+
+            esp_light_sleep_start();
+
+            gpio_wakeup_disable((gpio_num_t)PIN_BTN_TOP_PTT);
+            gpio_wakeup_disable((gpio_num_t)PIN_BTN_BOT_MOD);
+            esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+            if (wake_cause == ESP_SLEEP_WAKEUP_GPIO) {
+                s_last_activity_ts = millis();
+            }
+            updateButtonArming();
+            samplePowerAndBatteryTelemetry();
+        } else {
+            delay(25);
+        }
     }
 }

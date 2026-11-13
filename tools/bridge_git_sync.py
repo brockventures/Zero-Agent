@@ -20,6 +20,9 @@ DATA_DIR = Path("/workspace/data")
 PT_TZ = ZoneInfo("America/Los_Angeles")
 LAST_SYNC_FILE = DATA_DIR / "last_reload_git_sync.json"
 
+DEFAULT_GIT_CMD_TIMEOUT = 10.0
+DEFAULT_GIT_SYNC_TIMEOUT = 30.0
+
 # Whitelisted directories for auto-staging untracked architectural assets
 SAFE_UNTRACKED_PREFIXES = (
     "tools/",
@@ -29,15 +32,39 @@ SAFE_UNTRACKED_PREFIXES = (
 )
 
 
-def get_current_git_sha(repo_dir: Path | str = "/workspace") -> str:
+def _normalize_timeout(value: float | None, default: float) -> float:
+    """Guarantee a strictly positive subprocess timeout even if None or <=0 is passed."""
+    if value is None:
+        return float(default)
+    try:
+        parsed = float(value)
+        return parsed if parsed > 0 else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _git_subprocess_env() -> dict[str, str]:
+    """Build non-interactive git environment so credential or SSH prompts never block reloads."""
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+    return env
+
+
+def get_current_git_sha(
+    repo_dir: Path | str = "/workspace",
+    timeout: float = DEFAULT_GIT_CMD_TIMEOUT,
+) -> str:
     """Retrieve current short HEAD commit SHA."""
+    cmd_timeout = _normalize_timeout(timeout, DEFAULT_GIT_CMD_TIMEOUT)
     try:
         res = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=str(repo_dir),
+            env=_git_subprocess_env(),
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=cmd_timeout,
         )
         if res.returncode == 0:
             return res.stdout.strip()
@@ -50,7 +77,7 @@ def sync_git_on_reload(
     repo_dir: Path | str = "/workspace",
     reason: str = "Manual in-place bridge reload",
     initiator: str = "user",
-    timeout: float = 20.0,
+    timeout: float = DEFAULT_GIT_SYNC_TIMEOUT,
 ) -> dict:
     """Safely stages, commits, and pushes modified architecture assets before reload.
     
@@ -64,6 +91,11 @@ def sync_git_on_reload(
         "error": str | None
     }
     """
+    sync_timeout = _normalize_timeout(timeout, DEFAULT_GIT_SYNC_TIMEOUT)
+    cmd_timeout = min(DEFAULT_GIT_CMD_TIMEOUT, sync_timeout)
+    commit_timeout = min(15.0, sync_timeout)
+    git_env = _git_subprocess_env()
+
     repo = Path(repo_dir)
     result = {
         "synced": False,
@@ -83,9 +115,10 @@ def sync_git_on_reload(
         st_proc = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=str(repo),
+            env=git_env,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=cmd_timeout,
             check=True,
         )
         status_lines = [l.strip() for l in st_proc.stdout.splitlines() if l.strip()]
@@ -99,33 +132,41 @@ def sync_git_on_reload(
         subprocess.run(
             ["git", "add", "-u"],
             cwd=str(repo),
+            env=git_env,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=cmd_timeout,
             check=True,
         )
 
-        # 3. Stage untracked files matching safe architecture prefixes
+        # 3. Stage untracked files matching safe architecture prefixes in one bounded call
+        untracked_to_stage: list[str] = []
         for line in status_lines:
             if line.startswith("??"):
                 rel_path = line[3:].strip().strip('"')
                 if any(rel_path.startswith(prefix) or rel_path.endswith(".md") for prefix in SAFE_UNTRACKED_PREFIXES):
                     # Don't add scratch or private files
                     if "scratch/" not in rel_path and "private" not in rel_path and not rel_path.endswith((".log", ".tmp", ".bak")):
-                        subprocess.run(
-                            ["git", "add", rel_path],
-                            cwd=str(repo),
-                            capture_output=True,
-                            timeout=5,
-                        )
+                        untracked_to_stage.append(rel_path)
+
+        if untracked_to_stage:
+            subprocess.run(
+                ["git", "add", "--", *untracked_to_stage],
+                cwd=str(repo),
+                env=git_env,
+                capture_output=True,
+                text=True,
+                timeout=cmd_timeout,
+            )
 
         # 4. Check if anything is actually staged
         diff_proc = subprocess.run(
             ["git", "diff", "--cached", "--name-only"],
             cwd=str(repo),
+            env=git_env,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=cmd_timeout,
             check=True,
         )
         staged_files = [f.strip() for f in diff_proc.stdout.splitlines() if f.strip()]
@@ -139,7 +180,7 @@ def sync_git_on_reload(
 
         # 5. Formulate commit message
         now_pt = datetime.now(timezone.utc).astimezone(PT_TZ)
-        title = f"feat(bridge): auto-sync architecture updates before reload"
+        title = "feat(bridge): auto-sync architecture updates before reload"
         body = (
             f"Automated pre-reload architecture sync.\n\n"
             f"• Reason: {reason}\n"
@@ -153,9 +194,10 @@ def sync_git_on_reload(
         subprocess.run(
             ["git", "commit", "-m", title, "-m", body],
             cwd=str(repo),
+            env=git_env,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=commit_timeout,
             check=True,
         )
 
@@ -167,19 +209,34 @@ def sync_git_on_reload(
             subprocess.run(
                 ["git", "pull", "--rebase", "origin", "main"],
                 cwd=str(repo),
+                env=git_env,
                 capture_output=True,
                 text=True,
-                timeout=timeout,
+                timeout=sync_timeout,
             )
+        except subprocess.TimeoutExpired:
+            try:
+                subprocess.run(
+                    ["git", "rebase", "--abort"],
+                    cwd=str(repo),
+                    env=git_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            raise
         except Exception:
             pass
 
-        push_proc = subprocess.run(
+        subprocess.run(
             ["git", "push", "origin", "main"],
             cwd=str(repo),
+            env=git_env,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=sync_timeout,
             check=True,
         )
 
@@ -211,7 +268,13 @@ def sync_git_on_reload(
         print(f"[BridgeGitSync] ⚠️ {result['message']}")
         # Clean up staging index so the repository is not left in a dirty staged state
         try:
-            subprocess.run(["git", "restore", "--staged", "."], cwd=str(repo), capture_output=True, timeout=5)
+            subprocess.run(
+                ["git", "restore", "--staged", "."],
+                cwd=str(repo),
+                env=git_env,
+                capture_output=True,
+                timeout=5,
+            )
         except Exception:
             pass
 

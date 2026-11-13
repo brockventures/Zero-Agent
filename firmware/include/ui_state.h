@@ -24,4 +24,7 @@ struct GotchiUIState {
     bool     wall_power = false;     // true when 5V VBUS wall brick or USB host power is detected
     uint8_t  anim_frame = 0;
     bool     blink = false;
+    bool     wifi_active = false;
+    bool     ble_active = false;
+    bool     sleeping = false;
 };

@@ -65,20 +65,53 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 if f"{_REPO_ROOT}/gotchi" not in sys.path:
     sys.path.insert(1, f"{_REPO_ROOT}/gotchi")
-if "/workspace" not in sys.path:
+if Path("/workspace/tools").is_dir():
+    if "/workspace" in sys.path:
+        sys.path.remove("/workspace")
+    sys.path.insert(1, "/workspace")
+elif "/workspace" not in sys.path:
     sys.path.append("/workspace")
 if "/workspace/gotchi" not in sys.path:
     sys.path.append("/workspace/gotchi")
+_tools_mod = sys.modules.get("tools")
+if _tools_mod is not None and hasattr(_tools_mod, "__path__") and Path("/workspace/tools").is_dir():
+    if "/workspace/tools" not in _tools_mod.__path__:
+        _tools_mod.__path__.insert(0, "/workspace/tools")
+
+import backend
+_OWN_BACKEND_DIR = str(Path(__file__).resolve().parent)
+if hasattr(backend, "__path__"):
+    if _OWN_BACKEND_DIR in backend.__path__:
+        backend.__path__.remove(_OWN_BACKEND_DIR)
+    backend.__path__.insert(0, _OWN_BACKEND_DIR)
+    for _cand in [f"{_REPO_ROOT}/gotchi/backend", "/workspace/gotchi/backend"]:
+        if Path(_cand).is_dir() and _cand not in backend.__path__:
+            backend.__path__.append(_cand)
 
 ZERO_CHAT_CHANNEL_ID = int(os.environ.get("GOTCHI_ZERO_CHAT_CHANNEL_ID", "0") or 0)
 TARGET_CHANNEL_ID = ZERO_CHAT_CHANNEL_ID
 log = logging.getLogger("gotchi_zero_adapter")
 
+import backend.voice_gateway as _vg
 from backend.voice_gateway import (
     condense_long_answer,
     extract_topic,
     is_long_answer,
 )
+
+DEFAULT_PRIMARY_GATEWAY_PORT = int(
+    getattr(_vg, "DEFAULT_PRIMARY_GATEWAY_PORT", int(os.environ.get("GOTCHI_GATEWAY_PORT", "8771")))
+)
+DEFAULT_SECONDARY_GATEWAY_PORT = int(
+    getattr(_vg, "DEFAULT_SECONDARY_GATEWAY_PORT", int(os.environ.get("GOTCHI_SECONDARY_PORT", "8769")))
+)
+_resolve_gemini_api_key = getattr(
+    _vg, "_resolve_gemini_api_key", lambda explicit="": (explicit or os.environ.get("GEMINI_API_KEY", "")).strip()
+)
+is_transient_gemini_error = getattr(
+    _vg, "is_transient_gemini_error", lambda exc: "503" in str(exc) or "unavailable" in str(exc).lower()
+)
+run_dual_port_gateway = getattr(_vg, "run_dual_port_gateway", None)
 
 if Path("/workspace/tools").is_dir() and os.environ.get("GOTCHI_STANDALONE") != "1":
     from tools.bridge_voice import (
@@ -903,6 +936,43 @@ def _build_gotchi_tools() -> list[Any]:
             ),
         )
     )
+    # Ensure web_and_reddit_search is present and documents reddit, web, and amazon modes + recency
+    f_decls = [d for d in f_decls if getattr(d, "name", None) != "web_and_reddit_search"]
+    f_decls.append(
+        types.FunctionDeclaration(
+            name="web_and_reddit_search",
+            description=(
+                "Search Reddit, Google Web, or Amazon for live community discussions, web articles, "
+                "active subreddits, or products."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "query": types.Schema(
+                        type="STRING",
+                        description="Search query string.",
+                    ),
+                    "subreddit": types.Schema(
+                        type="STRING",
+                        description="Optional specific subreddit name (without r/) to scope Reddit search.",
+                    ),
+                    "mode": types.Schema(
+                        type="STRING",
+                        description=(
+                            "Search mode: 'reddit' (default, community discussions), "
+                            "'web' (general Google web search for articles, documentation, or news), "
+                            "or 'amazon' (product prices and reviews)."
+                        ),
+                    ),
+                    "recency": types.Schema(
+                        type="STRING",
+                        description="Optional time filter: 'year', 'all', 'month', or 'week'. Defaults to 'year' for Reddit.",
+                    ),
+                },
+                required=["query"],
+            ),
+        )
+    )
     if not any(getattr(d, "name", None) == "request_deep_thinking" for d in f_decls):
         f_decls.append(
             types.FunctionDeclaration(
@@ -1401,6 +1471,35 @@ def normalize_discord_channel_input(raw: str) -> Tuple[bool, str]:
     return False, clean
 
 
+def _run_general_web_search(query: str, limit: int = 5) -> str:
+    """
+    Executes general Google web search via SerpApi and formats top organic results as JSON string.
+    """
+    clean_q = (query or "").strip()
+    if not clean_q:
+        return json.dumps({"error": "Empty query"})
+    try:
+        try:
+            import tools.reddit_extractor as _re
+        except ImportError:
+            from tools import reddit_extractor as _re  # type: ignore[no-redef]
+        raw_res = _re._query_serpapi({"q": clean_q, "num": limit, "hl": "en", "gl": "us"})
+        if isinstance(raw_res, dict) and raw_res.get("error"):
+            return json.dumps(raw_res)
+        raw_items = raw_res.get("organic_results", []) if isinstance(raw_res, dict) else []
+        formatted = []
+        for item in raw_items[:limit]:
+            if isinstance(item, dict):
+                formatted.append({
+                    "title": item.get("title", ""),
+                    "link": item.get("link", ""),
+                    "snippet": item.get("snippet", ""),
+                })
+        return json.dumps({"query": clean_q, "count": len(formatted), "organic_results": formatted})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
 async def execute_gotchi_tool_call(
     name: str,
     args: Dict[str, Any],
@@ -1550,16 +1649,28 @@ async def execute_gotchi_tool_call(
     if name == "web_and_reddit_search":
         query = str(args.get("query", "")).strip()
         sub = str(args.get("subreddit", "")).strip()
-        mode = str(args.get("mode", "reddit")).strip().lower()
+        mode = str(args.get("mode") or args.get("source") or "reddit").strip().lower()
+        recency = str(args.get("recency") or "").strip().lower()
         if not query:
             return {"error": "Empty query"}
         try:
             if mode == "amazon":
                 cmd = ["python3", "/workspace/tools/amazon_serpapi.py", query]
-            else:
-                cmd = ["python3", "/workspace/tools/reddit_extractor.py", "search", query, "-n", "5"]
-                if sub:
-                    cmd.extend(["--sub", sub])
+                res = await asyncio.to_thread(
+                    subprocess.run,
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=6,
+                )
+                return {"result": (res.stdout or res.stderr or "No results")[:3500]}
+            if mode in ("web", "google", "general", "broad"):
+                web_res = await asyncio.to_thread(_run_general_web_search, query)
+                return {"result": web_res[:3500]}
+
+            cmd = ["python3", "/workspace/tools/reddit_extractor.py", "search", query, "-n", "5"]
+            if sub:
+                cmd.extend(["--sub", sub])
             res = await asyncio.to_thread(
                 subprocess.run,
                 cmd,
@@ -1567,7 +1678,21 @@ async def execute_gotchi_tool_call(
                 text=True,
                 timeout=6,
             )
-            return {"result": (res.stdout or res.stderr or "No results")[:3500]}
+            stdout = res.stdout or ""
+            if '"count": 0' in stdout and recency != "all":
+                retry_cmd = list(cmd) + ["--recency", "all"]
+                res = await asyncio.to_thread(
+                    subprocess.run,
+                    retry_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=6,
+                )
+                stdout = res.stdout or ""
+            if '"count": 0' in stdout:
+                web_res = await asyncio.to_thread(_run_general_web_search, query)
+                return {"result": web_res[:3500]}
+            return {"result": (stdout or res.stderr or "No results")[:3500]}
         except Exception as e:
             return {"error": str(e)}
 
@@ -1744,14 +1869,14 @@ def record_gotchi_turn_to_channels(
     timing_footer = ""
     if total_ms is not None and total_ms > 0:
         fa_str = f" · first_audio: {first_audio_ms}ms" if first_audio_ms is not None else ""
-        timing_footer = f"\n-# session: {session_id} · stt: {stt_ms}ms{fa_str} · total: {total_ms}ms"
+        timing_footer = f"\n-# stt: {stt_ms}ms{fa_str} · total: {total_ms}ms"
 
     if mode == "journal":
-        discord_msg = f"📓 **[{node_id} · All-Day Journal]{img_badge}:**\n> {transcript}{timing_footer}"
+        discord_msg = f"📓 **[All-Day Journal]{img_badge}:**\n> {transcript}{timing_footer}"
     else:
         discord_msg = (
-            f"🎙️ **Ryan ({node_id}){img_badge}:** {transcript}\n"
-            f"🔊 **Zero ({voice_name}):** {reply}{timing_footer}"
+            f"🎙️ **Ryan{img_badge}:** {transcript}\n"
+            f"🔊 **Zero:** {reply}{timing_footer}"
         )
 
     dispatched = False
@@ -1880,12 +2005,14 @@ class GotchiZeroBrainAdapter:
         ha_http_poster: Optional[Callable[[str, Dict[str, str], Dict[str, Any], float], Dict[str, Any]]] = None,
         warm_worker: Optional[Any] = None,
         brain_mode: Optional[str] = None,
+        max_retries: int = 3,
+        retry_base_delay_s: Optional[float] = None,
     ):
         self.model = model
         self.api_key = (
             api_key
             if api_key is not None
-            else os.environ.get("GEMINI_API_KEY", "").strip()
+            else _resolve_gemini_api_key()
         )
         self.stt_adapter = stt_adapter
         self.llm_caller = llm_caller
@@ -1897,6 +2024,11 @@ class GotchiZeroBrainAdapter:
         self.ha_http_poster = ha_http_poster
         self.warm_worker = warm_worker
         self.brain_mode = (brain_mode or "").strip().lower()
+        self.max_retries = max(1, int(max_retries))
+        if retry_base_delay_s is None:
+            self.retry_base_delay_s = 0.01 if "PYTEST_CURRENT_TEST" in os.environ else 0.4
+        else:
+            self.retry_base_delay_s = max(0.0, float(retry_base_delay_s))
         self._genai_client: Optional[Any] = None
 
     def _is_subscription_mode(self) -> bool:
@@ -2020,61 +2152,132 @@ class GotchiZeroBrainAdapter:
             step_fcalls: List[Any] = []
             step_model_parts: List[types.Part] = []
 
-            stream_fn = getattr(client.aio.models, "generate_content_stream", None)
-            if callable(stream_fn):
-                stream_obj = stream_fn(
-                    model=live_model,
-                    contents=contents,
-                    config=config,
+            attempts = max(1, self.max_retries)
+            last_step_exc: Optional[BaseException] = None
+            for attempt in range(attempts):
+                attempt_model = live_model
+                if (
+                    attempt > 0
+                    and attempt + 1 == attempts
+                    and live_model == "gemini-2.5-flash"
+                    and client.__class__.__module__.startswith("google")
+                ):
+                    attempt_model = "gemini-2.5-flash-lite"
+                try:
+                    stream_fn = getattr(client.aio.models, "generate_content_stream", None)
+                    if callable(stream_fn):
+                        stream_obj = stream_fn(
+                            model=attempt_model,
+                            contents=contents,
+                            config=config,
+                        )
+                        if asyncio.iscoroutine(stream_obj):
+                            stream_obj = await stream_obj
+                        async for chunk in stream_obj:
+                            chunk_text = getattr(chunk, "text", None) or ""
+                            if chunk_text:
+                                step_text_chunks.append(chunk_text)
+                                if _step == 0:
+                                    for ready_s in splitter.feed(chunk_text):
+                                        await self._emit_streamed_sentence(
+                                            ready_s, emitted_sentences, on_sentence
+                                        )
+                            chunk_fcalls = getattr(chunk, "function_calls", None)
+                            if chunk_fcalls:
+                                step_fcalls.extend(list(chunk_fcalls))
+                            cands = getattr(chunk, "candidates", None)
+                            if cands and getattr(cands[0], "content", None):
+                                c_parts = getattr(cands[0].content, "parts", None) or []
+                                step_model_parts.extend(list(c_parts))
+                    else:
+                        resp = await client.aio.models.generate_content(
+                            model=attempt_model,
+                            contents=contents,
+                            config=config,
+                        )
+                        resp_text = getattr(resp, "text", None) or ""
+                        if resp_text:
+                            step_text_chunks.append(resp_text)
+                            if _step == 0:
+                                for ready_s in splitter.feed(resp_text):
+                                    await self._emit_streamed_sentence(
+                                        ready_s, emitted_sentences, on_sentence
+                                    )
+                        if getattr(resp, "function_calls", None):
+                            step_fcalls.extend(list(resp.function_calls))
+                        if getattr(resp, "candidates", None) and getattr(resp.candidates[0], "content", None):
+                            c_parts = getattr(resp.candidates[0].content, "parts", None) or []
+                            step_model_parts.extend(list(c_parts))
+                    last_step_exc = None
+                    break
+                except Exception as exc:
+                    last_step_exc = exc
+                    can_retry = (
+                        is_transient_gemini_error(exc)
+                        and attempt + 1 < attempts
+                        and not step_text_chunks
+                        and not step_fcalls
+                    )
+                    if can_retry:
+                        delay = self.retry_base_delay_s * (2 ** attempt)
+                        log.warning(
+                            "[GotchiZero] Transient Gemini error on step %d (attempt %d/%d, model=%s): %s; retrying in %.2fs",
+                            _step,
+                            attempt + 1,
+                            attempts,
+                            attempt_model,
+                            exc,
+                            delay,
+                        )
+                        splitter = SentenceStreamSplitter()
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        continue
+                    break
+
+            if last_step_exc is not None:
+                log.error(
+                    "[GotchiZero] Gemini call failed on step %d after retries: %s",
+                    _step,
+                    last_step_exc,
                 )
-                if asyncio.iscoroutine(stream_obj):
-                    stream_obj = await stream_obj
-                async for chunk in stream_obj:
-                    chunk_text = getattr(chunk, "text", None) or ""
-                    if chunk_text:
-                        step_text_chunks.append(chunk_text)
-                        for ready_s in splitter.feed(chunk_text):
+                partial = "".join(step_text_chunks).strip() or " ".join(accumulated_raw_parts).strip()
+                if partial:
+                    return partial, explicitly_posted_to_zero_chat, emitted_sentences
+                fallback_msg = "Gemini hit a brief capacity spike. Give me a second and try again."
+                await self._emit_streamed_sentence(fallback_msg, emitted_sentences, on_sentence)
+                return fallback_msg, explicitly_posted_to_zero_chat, emitted_sentences
+
+            if _step == 0:
+                for trailing_s in splitter.flush():
+                    await self._emit_streamed_sentence(
+                        trailing_s, emitted_sentences, on_sentence
+                    )
+
+            step_text = "".join(step_text_chunks).strip()
+
+            if _step == 0:
+                if step_text:
+                    accumulated_raw_parts.append(step_text)
+                if not step_fcalls:
+                    final_raw = " ".join(accumulated_raw_parts).strip()
+                    return final_raw, explicitly_posted_to_zero_chat, emitted_sentences
+            else:
+                if step_fcalls:
+                    step_text = ""
+                else:
+                    if step_text:
+                        accumulated_raw_parts.append(step_text)
+                        for ready_s in splitter.feed(step_text):
                             await self._emit_streamed_sentence(
                                 ready_s, emitted_sentences, on_sentence
                             )
-                    chunk_fcalls = getattr(chunk, "function_calls", None)
-                    if chunk_fcalls:
-                        step_fcalls.extend(list(chunk_fcalls))
-                    cands = getattr(chunk, "candidates", None)
-                    if cands and getattr(cands[0], "content", None):
-                        c_parts = getattr(cands[0].content, "parts", None) or []
-                        step_model_parts.extend(list(c_parts))
-            else:
-                resp = await client.aio.models.generate_content(
-                    model=live_model,
-                    contents=contents,
-                    config=config,
-                )
-                resp_text = getattr(resp, "text", None) or ""
-                if resp_text:
-                    step_text_chunks.append(resp_text)
-                    for ready_s in splitter.feed(resp_text):
-                        await self._emit_streamed_sentence(
-                            ready_s, emitted_sentences, on_sentence
-                        )
-                if getattr(resp, "function_calls", None):
-                    step_fcalls.extend(list(resp.function_calls))
-                if getattr(resp, "candidates", None) and getattr(resp.candidates[0], "content", None):
-                    c_parts = getattr(resp.candidates[0].content, "parts", None) or []
-                    step_model_parts.extend(list(c_parts))
-
-            for trailing_s in splitter.flush():
-                await self._emit_streamed_sentence(
-                    trailing_s, emitted_sentences, on_sentence
-                )
-
-            step_text = "".join(step_text_chunks).strip()
-            if step_text:
-                accumulated_raw_parts.append(step_text)
-
-            if not step_fcalls:
-                final_raw = " ".join(accumulated_raw_parts).strip()
-                return final_raw, explicitly_posted_to_zero_chat, emitted_sentences
+                        for trailing_s in splitter.flush():
+                            await self._emit_streamed_sentence(
+                                trailing_s, emitted_sentences, on_sentence
+                            )
+                    final_raw = step_text or " ".join(accumulated_raw_parts).strip()
+                    return final_raw, explicitly_posted_to_zero_chat, emitted_sentences
 
             if step_model_parts:
                 contents.append(types.Content(role="model", parts=step_model_parts))
@@ -2093,7 +2296,7 @@ class GotchiZeroBrainAdapter:
                         await self._emit_streamed_sentence(
                             preamble, emitted_sentences, on_sentence
                         )
-                elif not step_text and not emitted_sentences:
+                elif _step == 0 and not step_text and not emitted_sentences:
                     # Pre-tool contextual action narration when the model invokes a tool without leading text
                     default_preamble = build_contextual_tool_filler(fn_name, fn_args, prompt)
                     await self._emit_streamed_sentence(
@@ -2123,6 +2326,53 @@ class GotchiZeroBrainAdapter:
                 )
             contents.append(types.Content(role="user", parts=fn_parts))
 
+        if step_fcalls:
+            live_model = self._resolve_live_gemini_model()
+            synth_config = types.GenerateContentConfig(
+                system_instruction=sys_prompt,
+                tools=[],
+                temperature=0.4,
+                thinking_config=build_thinking_config(
+                    live_model,
+                    prompt,
+                    default_budget=self.thinking_budget,
+                    step=4,
+                    tool_had_error=tool_had_error,
+                    burst_count=len(burst_images),
+                    model_requested_deep_thinking=model_requested_deep_thinking,
+                ),
+            )
+            try:
+                synth_resp = None
+                for _s_attempt in range(max(1, self.max_retries)):
+                    try:
+                        synth_resp = await client.aio.models.generate_content(
+                            model=live_model,
+                            contents=contents,
+                            config=synth_config,
+                        )
+                        break
+                    except Exception as _s_exc:
+                        if is_transient_gemini_error(_s_exc) and _s_attempt + 1 < max(1, self.max_retries):
+                            await asyncio.sleep(self.retry_base_delay_s * (2 ** _s_attempt))
+                            continue
+                        raise
+                synth_text = getattr(synth_resp, "text", None) or ""
+                if synth_text:
+                    accumulated_raw_parts.append(synth_text)
+                    synth_splitter = SentenceStreamSplitter()
+                    for ready_s in synth_splitter.feed(synth_text):
+                        await self._emit_streamed_sentence(
+                            ready_s, emitted_sentences, on_sentence
+                        )
+                    for trailing_s in synth_splitter.flush():
+                        await self._emit_streamed_sentence(
+                            trailing_s, emitted_sentences, on_sentence
+                        )
+                    return synth_text.strip(), explicitly_posted_to_zero_chat, emitted_sentences
+            except Exception as e:
+                log.warning(f"[GotchiZero] Final synthesis generate_content failed: {e}")
+
         fallback_raw = " ".join(accumulated_raw_parts).strip() or "Handled. I sent that over to Zero-Chat."
         return fallback_raw, explicitly_posted_to_zero_chat, emitted_sentences
 
@@ -2138,28 +2388,37 @@ class GotchiZeroBrainAdapter:
             return ""
         live_model = self._resolve_live_gemini_model()
         try:
-            resp = await client.aio.models.generate_content(
-                model=live_model,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
-                            types.Part.from_text(
-                                text=(
-                                    "Transcribe the spoken English speech in this audio verbatim. "
-                                    "Return ONLY the spoken words (no quotes, no commentary). "
-                                    "If there is no intelligible speech, return an empty string."
-                                )
-                            ),
+            resp = None
+            for _t_attempt in range(max(1, self.max_retries)):
+                try:
+                    resp = await client.aio.models.generate_content(
+                        model=live_model,
+                        contents=[
+                            types.Content(
+                                role="user",
+                                parts=[
+                                    types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
+                                    types.Part.from_text(
+                                        text=(
+                                            "Transcribe the spoken English speech in this audio verbatim. "
+                                            "Return ONLY the spoken words (no quotes, no commentary). "
+                                            "If there is no intelligible speech, return an empty string."
+                                        )
+                                    ),
+                                ],
+                            )
                         ],
+                        config=types.GenerateContentConfig(
+                            temperature=0.0,
+                            thinking_config=build_thinking_config(live_model, "", default_budget=0, step=0),
+                        ),
                     )
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    thinking_config=build_thinking_config(live_model, "", default_budget=0, step=0),
-                ),
-            )
+                    break
+                except Exception as _t_exc:
+                    if is_transient_gemini_error(_t_exc) and _t_attempt + 1 < max(1, self.max_retries):
+                        await asyncio.sleep(self.retry_base_delay_s * (2 ** _t_attempt))
+                        continue
+                    raise
             return (getattr(resp, "text", None) or "").strip()
         except Exception as exc:
             log.warning(f"[GotchiZero] Multimodal audio transcription fallback failed: {exc}")
@@ -2710,7 +2969,18 @@ def main() -> None:
         help="Run the unified Gotchi + Zero FastAPI gateway server",
     )
     parser.add_argument("--host", default="0.0.0.0", help="Bind host for --serve (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8765, help="Bind port for --serve (default: 8765)")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PRIMARY_GATEWAY_PORT,
+        help=f"Primary bind port for --serve (default: {DEFAULT_PRIMARY_GATEWAY_PORT})",
+    )
+    parser.add_argument(
+        "--secondary-port",
+        type=int,
+        default=DEFAULT_SECONDARY_GATEWAY_PORT,
+        help=f"Secondary/fallback bind port for --serve (default: {DEFAULT_SECONDARY_GATEWAY_PORT}; 0 to disable)",
+    )
     args = parser.parse_args()
 
     if args.stdin:
@@ -2722,10 +2992,18 @@ def main() -> None:
         return
 
     if args.serve:
-        import uvicorn
-
         app = create_zero_gotchi_app()
-        uvicorn.run(app, host=args.host, port=args.port)
+        if callable(run_dual_port_gateway):
+            run_dual_port_gateway(
+                app,
+                host=args.host,
+                port=args.port,
+                secondary_port=args.secondary_port if args.secondary_port > 0 else None,
+            )
+        else:
+            import uvicorn
+
+            uvicorn.run(app, host=args.host, port=args.port)
         return
 
     parser.print_help()

@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include <pgmspace.h>
 
-// Auto-generated 1:1 uncropped Clean Line-Art Paper-White Zero portrait from /workspace/data/zero_avatar.png (192x192 -> 177x177 centered in 196x177, non-stippled 1-bit line art)
+// Auto-generated 1:1 uncropped Clean Line-Art Paper-White Zero portrait from /workspace/data/zero_avatar.png (192x192 -> 177x177 centered in 196x177)
 constexpr int ZERO_PORTRAIT_W = 196;
 constexpr int ZERO_PORTRAIT_H = 177;
 

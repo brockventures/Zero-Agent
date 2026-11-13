@@ -24,11 +24,12 @@ import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
 
 /**
- * Built-in Wi-Fi Self-Updater & Live Remote Config Synchronizer for GOTCHI Pixel Watch.
+ * Built-in Wi-Fi / Tunnel Self-Updater & Live Remote Config Synchronizer for GOTCHI Pixel Watch.
  *
  * Capabilities:
  * 1. `syncRemoteConfig`: Fetches live sensitivity and silence thresholds from Host 2 gateway
- *    (`GET /api/gotchi/watch/config?node_id=...`) and hot-reloads:
+ *    (`GET /api/gotchi/watch/config?node_id=...`) over `https://gotchi.brock.ventures` or LAN `:8771`
+ *    (with `FallbackDns` and optional Bearer token auth) and hot-reloads:
  *    - `pinchDetector.minLinearAccelThreshold`
  *    - `pinchDetector.maxGyroThreshold`
  *    - `pinchDetector.requireDoubleImpulse`
@@ -48,6 +49,7 @@ object GotchiWatchUpdater {
 
     private val httpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
+            .dns(FallbackDns())
             .connectTimeout(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(60L, TimeUnit.SECONDS)
             .writeTimeout(DEFAULT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
@@ -140,19 +142,35 @@ object GotchiWatchUpdater {
         gatewayUrl: String,
         onStatus: ((String) -> Unit)? = null
     ) {
+        val savedToken = runCatching {
+            context.getSharedPreferences(GotchiWatchActivity.PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(GotchiWatchActivity.KEY_BEARER_TOKEN, "") ?: ""
+        }.getOrDefault("")
+        downloadAndInstallApk(context, gatewayUrl, savedToken, onStatus)
+    }
+
+    fun downloadAndInstallApk(
+        context: Context,
+        gatewayUrl: String,
+        bearerToken: String,
+        onStatus: ((String) -> Unit)? = null
+    ) {
         val safeBaseUrl = normalizeGatewayUrl(gatewayUrl)
         val apkUrl = "${safeBaseUrl.trimEnd('/')}/api/gotchi/watch/apk.apk"
+        val token = bearerToken.trim()
 
         scope.launch(Dispatchers.IO) {
             try {
                 withContext(Dispatchers.Main) { onStatus?.invoke("CONNECTING...") }
 
-                val request = Request.Builder()
+                val reqBuilder = Request.Builder()
                     .url(apkUrl)
                     .get()
-                    .build()
+                if (token.isNotEmpty()) {
+                    reqBuilder.addHeader("Authorization", "Bearer $token")
+                }
 
-                val response = httpClient.newCall(request).execute()
+                val response = httpClient.newCall(reqBuilder.build()).execute()
                 if (!response.isSuccessful) {
                     val msg = "DOWNLOAD FAILED (${response.code})"
                     Log.e(TAG, msg)
@@ -208,15 +226,15 @@ object GotchiWatchUpdater {
         context.startActivity(installIntent)
     }
 
-    private fun normalizeGatewayUrl(url: String): String {
+    internal fun normalizeGatewayUrl(url: String): String {
         val trimmed = url.trim()
         if (trimmed.isEmpty()) {
             return GotchiWatchEngine.DEFAULT_GATEWAY_URL
         }
-        return if (trimmed.contains(":8765")) {
-            trimmed.replace(":8765", ":8769")
+        return if (trimmed.contains(":8765") || trimmed.contains(":8769")) {
+            trimmed.replace(":8765", ":8771").replace(":8769", ":8771")
         } else {
-            trimmed
+            GotchiWatchEngine.normalizeGatewayUrl(trimmed)
         }
     }
 }

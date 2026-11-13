@@ -19,6 +19,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -32,24 +33,119 @@ import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.URL
+import java.net.UnknownHostException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 
 /**
+ * Tailscale/Cloudflare Fallback DNS Resolver for Wear OS OkHttpClient (parity with GotchiPhoneEngine).
+ *
+ * Ensures hostnames like `gotchi.brock.ventures` resolve reliably even when Wear OS Bluetooth-tethered
+ * DNS, VPN DNS, or LTE resolver is unreachable or wedged.
+ * Resolution chain:
+ * 1. Standard Android system DNS (`Dns.SYSTEM`)
+ * 2. Cloudflare (1.1.1.1) and Google (8.8.8.8) DNS-over-HTTPS (DoH) via raw IP
+ * 3. Static bootstrap IP fallback (Cloudflare Anycast IPs for `gotchi.brock.ventures`)
+ */
+class FallbackDns(
+    private val staticFallbacks: Map<String, List<String>> = mapOf(
+        "gotchi.brock.ventures" to listOf("104.21.32.66", "172.67.184.64")
+    )
+) : Dns {
+    override fun lookup(hostname: String): List<InetAddress> {
+        // 1. Try system standard DNS first
+        try {
+            val addresses = Dns.SYSTEM.lookup(hostname)
+            if (addresses.isNotEmpty()) {
+                return addresses
+            }
+        } catch (ignored: Exception) {
+            // System DNS failed on watch Wi-Fi / Bluetooth proxy / LTE
+        }
+
+        // 2. Query Cloudflare (1.1.1.1) or Google (8.8.8.8) DoH over raw IP without recursive DNS
+        val dohAddresses = queryDoh(hostname)
+        if (dohAddresses.isNotEmpty()) {
+            return dohAddresses
+        }
+
+        // 3. Fall back to static bootstrap IPs
+        val fallbackIps = staticFallbacks[hostname.lowercase()]
+        if (!fallbackIps.isNullOrEmpty()) {
+            val parsed = fallbackIps.mapNotNull { ipStr ->
+                runCatching {
+                    val parts = ipStr.split('.').map { it.toInt().toByte() }.toByteArray()
+                    InetAddress.getByAddress(hostname, parts)
+                }.getOrNull()
+            }
+            if (parsed.isNotEmpty()) {
+                return parsed
+            }
+        }
+
+        throw UnknownHostException("Unable to resolve $hostname via system DNS, DoH, or static fallback")
+    }
+
+    private fun queryDoh(hostname: String): List<InetAddress> {
+        val dohUrls = listOf(
+            "https://1.1.1.1/dns-query?name=$hostname&type=A",
+            "https://8.8.8.8/resolve?name=$hostname&type=A"
+        )
+        for (urlStr in dohUrls) {
+            try {
+                val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 3000
+                    readTimeout = 3000
+                    setRequestProperty("Accept", "application/dns-json, application/json")
+                    instanceFollowRedirects = false
+                }
+                if (conn.responseCode == 200) {
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val json = JSONObject(body)
+                    val answers = json.optJSONArray("Answer")
+                    val list = mutableListOf<InetAddress>()
+                    if (answers != null) {
+                        for (i in 0 until answers.length()) {
+                            val item = answers.optJSONObject(i) ?: continue
+                            if (item.optInt("type") == 1) { // A record
+                                val ip = item.optString("data")
+                                if (ip.isNotBlank()) {
+                                    val parts = ip.split('.').map { it.toInt().toByte() }.toByteArray()
+                                    list.add(InetAddress.getByAddress(hostname, parts))
+                                }
+                            }
+                        }
+                    }
+                    if (list.isNotEmpty()) {
+                        return list
+                    }
+                }
+            } catch (ignored: Exception) {
+                // Try next DoH provider
+            }
+        }
+        return emptyList()
+    }
+}
+
+/**
  * Wear OS Standalone Gotchi Engine for Google Pixel Watch (`ventures.brock.gotchi.watch`).
  *
- * Implements full wire-protocol parity with `backend/voice_gateway.py` and `firmware/`:
+ * Implements full wire-protocol parity with `backend/voice_gateway.py`, `firmware/`, and `GotchiPhoneEngine`:
  * - `16 kHz` 16-bit mono PCM mic capture with `500 ms` circular pre-roll ring buffer (8,000 samples / 16,000 bytes).
  * - `POST /api/voice/interact` multipart WAV upload + streaming SSE response parser:
  *   `state`, `transcript`, `reply`, `sentence` / `audio_chunk` (`24 kHz` PCM16), `done`, `error`.
  * - `/api/live/ws` RFC 6455 full-duplex Go Live streaming with hardware `AcousticEchoCanceler`
  *   and 300 ms sustained VAD barge-in (`{"type":"barge_in"}`).
- * - Integration with `HeyZeroPreRollListener`: `startWakeWordTurn(preRollPcm)` seamlessly prepends
- *   the 500 ms circular pre-roll buffer into active turn capture.
- * - Integration with `PinchGestureDetector`: finger-pinch / double-pinch / stem key triggers
- *   toggle PTT capture or barge-in.
+ * - Remote Cloudflare Tunnel (`https://gotchi.brock.ventures`) + Bearer auth & `FallbackDns`, plus
+ *   port `8771` LAN support (`http://gotchi-gateway.local:8771`) with automatic `:8765`/`:8769` -> `:8771` migration.
+ * - Integration with `HeyZeroPreRollListener`: guarantees pre-roll `AudioRecord` is cleanly stopped/released
+ *   before starting PTT, wake-word, or Go Live capture.
  */
 class GotchiWatchEngine(
     private val onStateUpdate: (state: String?, transcript: String?, reply: String?, status: String?, audioBytes: Int, sampleRate: Int?) -> Unit
@@ -64,13 +160,29 @@ class GotchiWatchEngine(
         const val DEFAULT_LIVE_SILENCE_MS = 15000L
         const val LIVE_VAD_HANGOVER_MS = 600L
         const val BARGE_IN_SPEECH_MS = 300L
-        const val DEFAULT_RMS_THRESHOLD = 50.0
-        const val DEFAULT_GATEWAY_URL = "http://gotchi-gateway.local:8769"
+        const val DEFAULT_RMS_THRESHOLD = 180.0
+        const val DEFAULT_GATEWAY_PORT = 8771
+        const val DEFAULT_GATEWAY_URL = "https://gotchi.brock.ventures"
+        const val DEFAULT_LAN_GATEWAY_URL = "http://gotchi-gateway.local:8771"
         const val DEFAULT_NODE_ID = "gotchi-pixel-watch-01"
         const val DEFAULT_NOTIFY_POLL_INTERVAL_MS = 180000L // 3 minutes, matching desk unit
 
         const val ADPCM_MAGIC = "GAD1"
         const val ADPCM_HEADER_SIZE = 16
+
+        /**
+         * Normalizes gateway URLs, migrating legacy `:8765` and `:8769` ports to `:8771`
+         * and defaulting blank strings to `DEFAULT_GATEWAY_URL` (`https://gotchi.brock.ventures`).
+         */
+        fun normalizeGatewayUrl(url: String): String {
+            val trimmed = url.trim()
+            if (trimmed.isEmpty()) {
+                return DEFAULT_GATEWAY_URL
+            }
+            return trimmed
+                .replace(":8765", ":8771")
+                .replace(":8769", ":8771")
+        }
 
         val IMA_INDEX_TABLE = intArrayOf(
             -1, -1, -1, -1, 2, 4, 6, 8,
@@ -250,8 +362,11 @@ class GotchiWatchEngine(
     )
 
     val config = Config()
+    var preRollListener: HeyZeroPreRollListener? = null
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val httpClient = OkHttpClient.Builder()
+        .dns(FallbackDns())
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(90, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -271,9 +386,12 @@ class GotchiWatchEngine(
 
     private val pendingBurstImages = mutableMapOf<Int, ByteArray>()
     private var recordingJob: Job? = null
+    @Volatile
     private var isPttRecording = false
+    @Volatile
     private var isPttCancelled = false
     private var activeLiveWs: WebSocket? = null
+    @Volatile
     private var liveSessionActive = false
     private var activeAudioTrack: AudioTrack? = null
     private val audioPlaybackQueue = Channel<Pair<ByteArray, Int>>(Channel.UNLIMITED)
@@ -310,6 +428,42 @@ class GotchiWatchEngine(
     }
 
     /**
+     * Releases any active HeyZeroPreRollListener AudioRecord and acquires a fresh, initialized
+     * Wear OS AudioRecord instance with retry fallback across VOICE_COMMUNICATION / MIC sources.
+     */
+    @SuppressLint("MissingPermission")
+    private suspend fun acquireWatchAudioRecord(minBuf: Int): AudioRecord? {
+        preRollListener?.pauseForActiveTurn()
+        val sources = intArrayOf(
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.MIC
+        )
+        for (attempt in 0..1) {
+            for (source in sources) {
+                val rec = runCatching {
+                    AudioRecord(
+                        source,
+                        MIC_SAMPLE_RATE,
+                        AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT,
+                        minBuf
+                    )
+                }.getOrNull()
+                if (rec != null) {
+                    if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                        return rec
+                    }
+                    runCatching { rec.release() }
+                }
+            }
+            if (attempt == 0) {
+                delay(50L)
+            }
+        }
+        return null
+    }
+
+    /**
      * Start Push-to-Talk audio capture from watch microphone.
      */
     @SuppressLint("MissingPermission")
@@ -319,6 +473,12 @@ class GotchiWatchEngine(
             stopLiveSession()
             return
         }
+        val handoffPreRoll = if (preRollListener?.isListening() == true) {
+            preRollListener?.releaseAudioRecordForHandoff() ?: ByteArray(0)
+        } else {
+            preRollListener?.pauseForActiveTurn()
+            ByteArray(0)
+        }
         playChime("ptt_start")
         isPttRecording = true
         isPttCancelled = false
@@ -326,7 +486,7 @@ class GotchiWatchEngine(
 
         recordingJob = scope.launch {
             val pcmStream = ByteArrayOutputStream()
-            val preRoll = snapshotPreRollBytes()
+            val preRoll = if (handoffPreRoll.isNotEmpty()) handoffPreRoll else snapshotPreRollBytes()
             if (preRoll.isNotEmpty()) pcmStream.write(preRoll)
 
             val minBuf = AudioRecord.getMinBufferSize(
@@ -335,24 +495,22 @@ class GotchiWatchEngine(
                 AudioFormat.ENCODING_PCM_16BIT
             ).coerceAtLeast(3200)
 
-            val recorder = runCatching {
-                AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                    MIC_SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    minBuf
-                )
-            }.getOrNull()
+            val recorder = acquireWatchAudioRecord(minBuf)
+            if (recorder == null) {
+                isPttRecording = false
+                playChime("error")
+                onStateUpdate("error", null, null, "MIC UNAVAILABLE", 0, null)
+                return@launch
+            }
 
             val readBuf = ByteArray(1600) // 50ms @ 16kHz PCM16
             var lastVoiceMs = System.currentTimeMillis()
             var heardSpeech = false
 
             try {
-                recorder?.startRecording()
+                recorder.startRecording()
                 while (isActive && isPttRecording && !isPttCancelled) {
-                    val read = recorder?.read(readBuf, 0, readBuf.size) ?: -1
+                    val read = recorder.read(readBuf, 0, readBuf.size)
                     if (read > 0) {
                         pcmStream.write(readBuf, 0, read)
                         val rms = computePcm16Rms(readBuf, read)
@@ -365,12 +523,16 @@ class GotchiWatchEngine(
                             isPttRecording = false
                             break
                         }
+                    } else if (read < 0) {
+                        isPttRecording = false
+                        break
                     } else {
                         delay(25)
                     }
                 }
             } finally {
-                runCatching { recorder?.stop(); recorder?.release() }
+                isPttRecording = false
+                runCatching { recorder.stop(); recorder.release() }
             }
 
             if (isPttCancelled || !isActive) {
@@ -396,6 +558,7 @@ class GotchiWatchEngine(
         if (liveSessionActive) {
             stopLiveSession()
         }
+        preRollListener?.pauseForActiveTurn()
         playChime("ptt_start")
         isPttRecording = true
         isPttCancelled = false
@@ -414,24 +577,22 @@ class GotchiWatchEngine(
                 AudioFormat.ENCODING_PCM_16BIT
             ).coerceAtLeast(3200)
 
-            val recorder = runCatching {
-                AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                    MIC_SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    minBuf
-                )
-            }.getOrNull()
+            val recorder = acquireWatchAudioRecord(minBuf)
+            if (recorder == null) {
+                isPttRecording = false
+                playChime("error")
+                onStateUpdate("error", null, null, "MIC UNAVAILABLE", 0, null)
+                return@launch
+            }
 
             val readBuf = ByteArray(1600) // 50ms @ 16kHz PCM16
             var lastVoiceMs = System.currentTimeMillis()
             var heardSpeech = true // Wake phrase already spoken
 
             try {
-                recorder?.startRecording()
+                recorder.startRecording()
                 while (isActive && isPttRecording && !isPttCancelled) {
-                    val read = recorder?.read(readBuf, 0, readBuf.size) ?: -1
+                    val read = recorder.read(readBuf, 0, readBuf.size)
                     if (read > 0) {
                         pcmStream.write(readBuf, 0, read)
                         val rms = computePcm16Rms(readBuf, read)
@@ -443,12 +604,16 @@ class GotchiWatchEngine(
                             isPttRecording = false
                             break
                         }
+                    } else if (read < 0) {
+                        isPttRecording = false
+                        break
                     } else {
                         delay(25)
                     }
                 }
             } finally {
-                runCatching { recorder?.stop(); recorder?.release() }
+                isPttRecording = false
+                runCatching { recorder.stop(); recorder.release() }
             }
 
             if (isPttCancelled || !isActive) {
@@ -557,7 +722,7 @@ class GotchiWatchEngine(
             }
         }
 
-        val baseUrl = config.gatewayUrl.trimEnd('/')
+        val baseUrl = normalizeGatewayUrl(config.gatewayUrl).trimEnd('/')
         val reqBuilder = Request.Builder()
             .url("$baseUrl/api/voice/interact")
             .post(multipart.build())
@@ -659,11 +824,18 @@ class GotchiWatchEngine(
     @SuppressLint("MissingPermission")
     fun startLiveSession() {
         if (liveSessionActive) return
+        if (isPttRecording) {
+            cancelPttCapture()
+        }
+        preRollListener?.pauseForActiveTurn()
         liveSessionActive = true
         onStateUpdate("listening", "", "", "GO LIVE CONNECTING...", 0, null)
 
-        val baseUrl = config.gatewayUrl.trimEnd('/').replace("http://", "ws://").replace("https://", "wss://")
-        val wsUrl = "$baseUrl/api/live/ws?node_id=${config.nodeId}&session_id=${config.sessionId}"
+        val safeNodeId = if (validateNodeId(config.nodeId)) config.nodeId else DEFAULT_NODE_ID
+        val baseUrl = normalizeGatewayUrl(config.gatewayUrl).trimEnd('/')
+            .replace("http://", "ws://")
+            .replace("https://", "wss://")
+        val wsUrl = "$baseUrl/api/live/ws?node_id=$safeNodeId&session_id=${config.sessionId}"
         val reqBuilder = Request.Builder().url(wsUrl)
         if (config.bearerToken.isNotBlank()) {
             reqBuilder.header("Authorization", "Bearer ${config.bearerToken}")
@@ -718,18 +890,16 @@ class GotchiWatchEngine(
                 AudioFormat.ENCODING_PCM_16BIT
             ).coerceAtLeast(3200)
 
-            val recorder = runCatching {
-                AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                    MIC_SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    minBuf
-                )
-            }.getOrNull()
+            val recorder = acquireWatchAudioRecord(minBuf)
+            if (recorder == null) {
+                liveSessionActive = false
+                playChime("error")
+                onStateUpdate("error", null, null, "LIVE MIC UNAVAIL", 0, null)
+                return@launch
+            }
 
             // Attach hardware AcousticEchoCanceler if available on watch device
-            if (recorder != null && AcousticEchoCanceler.isAvailable()) {
+            if (AcousticEchoCanceler.isAvailable()) {
                 runCatching {
                     AcousticEchoCanceler.create(recorder.audioSessionId)?.apply {
                         enabled = true
@@ -742,9 +912,9 @@ class GotchiWatchEngine(
             var lastLiveVoiceMs = 0L
 
             try {
-                recorder?.startRecording()
+                recorder.startRecording()
                 while (isActive && liveSessionActive) {
-                    val read = recorder?.read(chunk, 0, chunk.size) ?: -1
+                    val read = recorder.read(chunk, 0, chunk.size)
                     if (read > 0) {
                         val rms = computePcm16Rms(chunk, read)
                         if (rms >= DEFAULT_RMS_THRESHOLD) {
@@ -774,12 +944,14 @@ class GotchiWatchEngine(
                         } else {
                             speechStartTime = 0L
                         }
+                    } else if (read < 0) {
+                        break
                     } else {
                         delay(25)
                     }
                 }
             } finally {
-                runCatching { recorder?.stop(); recorder?.release() }
+                runCatching { recorder.stop(); recorder.release() }
             }
         }
     }
@@ -881,7 +1053,7 @@ class GotchiWatchEngine(
 
     fun pollPendingNotificationsOnce(onPendingReady: ((statusText: String, autoSpeak: Boolean) -> Unit)? = null) {
         val safeNodeId = if (validateNodeId(config.nodeId)) config.nodeId else DEFAULT_NODE_ID
-        val baseUrl = config.gatewayUrl.trimEnd('/')
+        val baseUrl = normalizeGatewayUrl(config.gatewayUrl).trimEnd('/')
         val reqBuilder = Request.Builder()
             .url("$baseUrl/api/gotchi/notify?node_id=$safeNodeId")
             .get()
@@ -920,7 +1092,7 @@ class GotchiWatchEngine(
     }
 
     private fun ackNotification(nodeId: String, notifyId: String) {
-        val baseUrl = config.gatewayUrl.trimEnd('/')
+        val baseUrl = normalizeGatewayUrl(config.gatewayUrl).trimEnd('/')
         val payload = JSONObject()
             .put("node_id", nodeId)
             .put("notify_id", notifyId)
@@ -944,7 +1116,7 @@ class GotchiWatchEngine(
         scope.launch {
             val safeNodeId = if (validateNodeId(config.nodeId)) config.nodeId else DEFAULT_NODE_ID
             val ansId = pendingAnswerId
-            val baseUrl = config.gatewayUrl.trimEnd('/')
+            val baseUrl = normalizeGatewayUrl(config.gatewayUrl).trimEnd('/')
             val url = if (ansId.isNotBlank()) {
                 "$baseUrl/api/gotchi/pending_answer?node_id=$safeNodeId&answer_id=$ansId"
             } else {
@@ -1013,7 +1185,7 @@ class GotchiWatchEngine(
     }
 
     private fun ackPendingAnswer(nodeId: String, answerId: String) {
-        val baseUrl = config.gatewayUrl.trimEnd('/')
+        val baseUrl = normalizeGatewayUrl(config.gatewayUrl).trimEnd('/')
         val obj = JSONObject().put("node_id", nodeId)
         if (answerId.isNotBlank()) obj.put("answer_id", answerId)
         val body = obj.toString().toRequestBody("application/json".toMediaType())

@@ -19,6 +19,7 @@ from batch_guard import (
     check_forge_post_offload_lock,
     check_interactive_investigation_gate,
     check_tool_use,
+    has_forge_job_start_command,
     is_exempt_from_investigation_gate,
     load_state,
     FORGE_CHANNEL_ID_STR,
@@ -29,6 +30,8 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_forge_worker_env(monkeypatch):
     monkeypatch.delenv("FORGE_WORKER_ACTIVE", raising=False)
+    monkeypatch.delenv("DISCORD_CHANNEL_ID", raising=False)
+    monkeypatch.setattr("batch_guard.IN_FLIGHT_TURN_FILE", "/nonexistent_in_flight_turn.json")
 
 
 class TestBatchGuard(unittest.TestCase):
@@ -285,12 +288,13 @@ class TestBatchGuard(unittest.TestCase):
 
     def test_forge_tier2_tier3_gate_blocks_fourth_inline_production_file(self):
         # Up to 3 production files + unit test + markdown docs + scratch plan allowed in Tier 1
-        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/alpha.py"})[0])
-        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/beta.py"})[0])
-        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/gamma.py"})[0])
-        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/test_alpha.py"})[0])
-        self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/GEMINI.md"})[0])
-        self.assertTrue(check_tool_use("write_file", {"Path": "/workspace/scratch/forge_plan.json"})[0])
+        with unittest.mock.patch("os.access", return_value=True):
+            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/alpha.py"})[0])
+            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/beta.py"})[0])
+            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/gamma.py"})[0])
+            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/tools/test_alpha.py"})[0])
+            self.assertTrue(check_tool_use("edit_file", {"Path": "/workspace/GEMINI.md"})[0])
+            self.assertTrue(check_tool_use("write_file", {"Path": "/workspace/scratch/forge_plan.json"})[0])
 
         # 4th distinct production file in interactive turn is blocked by FORGE Tier 2/3 Gate
         allowed, reason = check_tool_use("edit_file", {"Path": "/workspace/tools/delta.py"})
@@ -1492,6 +1496,152 @@ def test_crab_cavern_airgap_guard_directs_propose_to_zero_chat(tmp_path):
             cwd="/workspace",
         )
         assert ok_prop is True, f"Expected forge.py propose to be allowed in Crab Cavern, got: {reason_prop}"
+
+
+def test_malformed_forge_job_start_without_command_does_not_lock_turn(tmp_path):
+    state_file = str(tmp_path / "bg_state_malformed_job.json")
+    malformed_invocations = [
+        "python3 /workspace/tools/forge.py job start",
+        "python3 /workspace/tools/forge.py job start --help",
+        "python3 /workspace/tools/forge.py job start -h",
+        'python3 /workspace/tools/forge.py job start --name "Missing Command"',
+        "python3 /workspace/tools/forge.py job start --channel zero-ops --cwd /workspace",
+        'python3 /workspace/tools/forge.py job start "python3 /workspace/scratch/probe.py"',
+        'python3 /workspace/tools/forge.py job start "python3 -c \'print(1)\'"',
+        'python3 /workspace/tools/forge.py job start --name "probe -c 1"',
+        'python3 /workspace/tools/forge.py job start --cmd "echo hi"',
+        "python3 /workspace/tools/forge.py job start --command",
+        "python3 /workspace/tools/forge.py job start -c",
+        'python3 /workspace/tools/forge.py job start --command ""',
+        'python3 /workspace/tools/forge.py job start --command=""',
+        'python3 /workspace/tools/forge.py job start -c=""',
+        'python3 /workspace/tools/forge.py job start --command --name "Foo"',
+        'python3 /workspace/tools/forge.py job start --name "Bad" && python3 -c "print(1)"',
+        'bash -c "python3 /workspace/tools/forge.py job start --name Foo"',
+        'python3 /workspace/tools/detached_runner.py start --name "NoCmd"',
+        'python3 /workspace/tools/forge.py job start --command "echo hi" --help',
+    ]
+
+    for bad_cmd in malformed_invocations:
+        assert has_forge_job_start_command(bad_cmd) is False, f"Expected False for: {bad_cmd}"
+        ok, reason = check_tool_use(
+            "run_command",
+            {"CommandLine": bad_cmd},
+            state_file=state_file,
+        )
+        assert ok is True, f"Expected malformed CLI call to pass through to argparse without locking: {bad_cmd} ({reason})"
+        st = load_state(state_file)
+        assert st.get("offload_dispatched") is False, f"Expected offload_dispatched=False after: {bad_cmd}"
+
+        # Subsequent edits or retries must NOT be locked
+        ok_edit, edit_reason = check_tool_use(
+            "edit_file",
+            {"Path": "/workspace/scratch/retry_probe.py", "Target": "a", "Replacement": "b"},
+            state_file=state_file,
+        )
+        assert ok_edit is True, f"Expected subsequent edit_file not to be locked after '{bad_cmd}', got: {edit_reason}"
+
+    # Verify all valid --command / -c forms ARE detected and DO activate Post-Offload Turn Lock
+    valid_invocations = [
+        'python3 /workspace/tools/forge.py job start --name "Good1" --command "python3 /workspace/scratch/p.py"',
+        'python3 /workspace/tools/forge.py job start --name "Good2" -c "python3 /workspace/scratch/p.py"',
+        'python3 /workspace/tools/forge.py job start --command="python3 /workspace/scratch/p.py"',
+        'python3 /workspace/tools/forge.py job start -c="python3 /workspace/scratch/p.py"',
+        "python3 /workspace/tools/forge.py job start -n 'Good3' -c 'echo ok && df -h'",
+        'python3 /workspace/tools/detached_runner.py start -c "echo ok"',
+        'python3 /workspace/tools/forge.py job start \\\n  --name "Multi" \\\n  --command "echo ok"',
+    ]
+    for idx, good_cmd in enumerate(valid_invocations):
+        assert has_forge_job_start_command(good_cmd) is True, f"Expected True for: {good_cmd}"
+        good_state_file = str(tmp_path / f"bg_state_good_job_{idx}.json")
+        ok_good, reason_good = check_tool_use(
+            "run_command",
+            {"CommandLine": good_cmd},
+            state_file=good_state_file,
+        )
+        assert ok_good is True, f"Expected valid job start to succeed: {good_cmd} ({reason_good})"
+        st_good = load_state(good_state_file)
+        assert st_good.get("offload_dispatched") is True
+        assert "job start" in st_good.get("offload_kind", "")
+
+        # Subsequent non-exempt command in same turn is locked
+        ok_after, reason_after = check_tool_use(
+            "run_command",
+            {"CommandLine": "python3 /workspace/scratch/extra.py"},
+            state_file=good_state_file,
+        )
+        assert ok_after is False
+        assert "FORGE Post-Offload Turn Lock Triggered" in reason_after
+
+
+def test_denied_forge_job_start_does_not_lock_turn(tmp_path):
+    import sqlite3
+
+    state_file = str(tmp_path / "bg_state_denied_job.json")
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE items (id INTEGER, name TEXT)")
+    conn.commit()
+    conn.close()
+
+    # Job start containing prohibited `SELECT *` is denied by SQLite Query Guard and must NOT lock turn
+    denied_cmd = f'python3 /workspace/tools/forge.py job start -c "sqlite3 {db_path} \'SELECT * FROM items LIMIT 5\'"'
+    ok_den, reason_den = check_tool_use(
+        "run_command",
+        {"CommandLine": denied_cmd},
+        state_file=state_file,
+    )
+    assert ok_den is False
+    assert "SQLite Query Guard Triggered" in reason_den
+    assert load_state(state_file).get("offload_dispatched") is False
+
+    # Agent can immediately retry with fixed query in the same turn
+    retry_cmd = f'python3 /workspace/tools/forge.py job start -c "sqlite3 {db_path} \'SELECT id FROM items LIMIT 5\'"'
+    ok_retry, reason_retry = check_tool_use(
+        "run_command",
+        {"CommandLine": retry_cmd},
+        state_file=state_file,
+    )
+    assert ok_retry is True, f"Expected retry after denied job start to succeed, got: {reason_retry}"
+    assert load_state(state_file).get("offload_dispatched") is True
+
+
+def test_tools_and_hooks_batch_guard_copies_are_identical(tmp_path):
+    import importlib.util
+    from pathlib import Path
+
+    tools_copy = Path(_REPO_ROOT) / "tools" / "batch_guard.py"
+    hooks_copy = Path(_REPO_ROOT) / ".agents" / "hooks" / "batch_guard.py"
+    assert tools_copy.is_file(), f"Missing {tools_copy}"
+    assert hooks_copy.is_file(), f"Missing {hooks_copy}"
+    assert tools_copy.read_text(encoding="utf-8") == hooks_copy.read_text(encoding="utf-8"), (
+        "tools/batch_guard.py and .agents/hooks/batch_guard.py must remain 100% identical"
+    )
+
+    spec = importlib.util.spec_from_file_location("hooks_batch_guard", str(hooks_copy))
+    hooks_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hooks_mod)
+
+    assert hooks_mod._resolve_repo_root() == os.path.abspath(_REPO_ROOT)
+    state_file = str(tmp_path / "hooks_mod_state.json")
+    ok_bad, _ = hooks_mod.check_tool_use(
+        "run_command",
+        {"CommandLine": 'python3 /workspace/tools/forge.py job start --name "MissingCmd"'},
+        state_file=state_file,
+        in_flight_file="/nonexistent_in_flight_turn.json",
+    )
+    assert ok_bad is True
+    assert hooks_mod.load_state(state_file).get("offload_dispatched") is False
+
+    ok_good, _ = hooks_mod.check_tool_use(
+        "run_command",
+        {"CommandLine": 'python3 /workspace/tools/forge.py job start --name "ValidCmd" -c "echo ok"'},
+        state_file=state_file,
+        in_flight_file="/nonexistent_in_flight_turn.json",
+    )
+    assert ok_good is True
+    assert hooks_mod.load_state(state_file).get("offload_dispatched") is True
+
 
 
 

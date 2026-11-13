@@ -22,6 +22,7 @@ constexpr size_t      SSE_BUF_BYTES            = 768 * 1024;
 constexpr uint32_t    CONNECT_TIMEOUT_MS       = 5000;
 constexpr uint32_t    WRITE_STALL_TIMEOUT_MS   = 5000;
 constexpr uint32_t    SSE_READ_IDLE_TIMEOUT_MS = 15000;
+constexpr uint32_t    BLE_SSE_IDLE_TIMEOUT_MS  = 20000;
 constexpr uint32_t    IDLE_TIMEOUT_MS          = 60000;
 constexpr size_t      UPLOAD_CHUNK             = 1460;
 constexpr uint32_t    DEFAULT_RATE_HZ          = 24000;
@@ -302,6 +303,10 @@ bool handleEvent(const char* event, const char* line, const JsonDocument& filter
         ui.last_sample_rate = rate;
         if (!mute_local_speaker) {
             gotchi_audio::appendBase64PcmToTurn(b64, b64_len, rate, is_adpcm);
+        } else if (ui.state != UiState::SPEAKING) {
+            ui.state = UiState::SPEAKING;
+            ui.status_text = "SPEAKING";
+            if (cb) cb(ui);
         }
         if (checkAbortFlag()) return true;
         return false;
@@ -552,10 +557,14 @@ bool interactOverBle(const gotchi_audio::WavView& wav, const String& url, const 
     uint32_t last_rx_ts = millis();
     bool done = false;
 
-    while (millis() - last_rx_ts <= IDLE_TIMEOUT_MS) {
+    while (millis() - last_rx_ts <= BLE_SSE_IDLE_TIMEOUT_MS) {
         if (checkAbortFlag()) {
             gotchi_ble::sendFramedPayload(gotchi_ble::FrameType::CANCEL, nullptr, 0);
             done = true;
+            break;
+        }
+        if (!gotchi_ble::isBlePeerConnected()) {
+            gotchi_log::RingLogger.warn("ble", "BLE peer disconnected during turn wait");
             break;
         }
         size_t rx_len = 0;
@@ -566,6 +575,18 @@ bool interactOverBle(const gotchi_audio::WavView& wav, const String& url, const 
         }
         last_rx_ts = millis();
         rx_buf[rx_len] = '\0';
+
+        if (rx_type == gotchi_ble::FrameType::CONTROL) {
+            const char* ctrl_str = (const char*)rx_buf;
+            if (strstr(ctrl_str, "turn_abort") != nullptr || strstr(ctrl_str, "STATE:idle") != nullptr) {
+                gotchi_log::RingLogger.warn("ble", "BLE relay aborted incomplete/timed-out turn via CONTROL frame");
+                gotchi_ble::clearIncomingQueue();
+                setFailure(ui, UiState::ERROR, "ble_timeout", "BLE TURN TIMEOUT", cb);
+                done = false;
+                break;
+            }
+            continue;
+        }
 
         if (rx_type != gotchi_ble::FrameType::SSE_EVENT) {
             continue;

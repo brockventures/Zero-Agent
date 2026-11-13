@@ -45,10 +45,21 @@
             </intent-filter>
         </activity>
 
+        <activity-alias
+            android:name=".MainActivity"
+            android:targetActivity=".GotchiBleBondingActivity"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:roundIcon="@mipmap/ic_launcher_round">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+            </intent-filter>
+        </activity-alias>
+
         <service
             android:name=".GotchiBleRelayService"
             android:enabled="true"
-            android:exported="true"
+            android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
         <receiver
