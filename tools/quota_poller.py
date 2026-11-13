@@ -33,6 +33,7 @@ DB_PATH = Path("/workspace/data/telemetry.db")
 # Antigravity subscription rate cards per 1M tokens
 RATE_CARDS: Dict[str, Dict[str, float]] = {
     "gemini-4-argon": {"input": 6.00, "output": 30.00, "cache_read": 0.30},
+    "gemini-4-hydrogen": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
     "gemini-3.8-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075},
 }
 DEFAULT_RATE_CARD_MODEL = "gemini-4-argon"
@@ -65,8 +66,12 @@ def compute_rate_card_cost(
     m = (model or "").lower()
     if m in RATE_CARDS:
         card = RATE_CARDS[m]
+    elif "hydrogen" in m:
+        card = RATE_CARDS["gemini-4-hydrogen"]
     elif "flash" in m:
         card = RATE_CARDS["gemini-3.8-flash"]
+    elif "argon" in m:
+        card = RATE_CARDS["gemini-4-argon"]
     else:
         card = RATE_CARDS[DEFAULT_RATE_CARD_MODEL]
 
@@ -140,8 +145,15 @@ def fetch_quota_buckets(timeout: int = 30) -> List[Dict[str, Any]]:
     groups = raw.get("command", {}).get("data", {}).get("groups", [])
     for group in groups:
         group_name = str(group.get("name", ""))
+        group_lower = group_name.lower()
+        is_gemini_group = any(k in group_lower for k in ("gemini", "hydrogen", "argon"))
         for b in group.get("buckets", []):
-            b_id = b.get("id") or ("gemini-weekly" if "gemini" in group_name.lower() and b.get("window") == "weekly" else None)
+            b_id = b.get("id")
+            if not b_id and is_gemini_group:
+                if b.get("window") == "weekly":
+                    b_id = "gemini-weekly"
+                elif b.get("window") in ("5h", "5-hour"):
+                    b_id = "gemini-5h"
             if not b_id:
                 continue
             buckets.append({
@@ -167,7 +179,7 @@ def fetch_quota_buckets(timeout: int = 30) -> List[Dict[str, Any]]:
                     frac = float(pct_str) / 100.0
                 except ValueError:
                     continue
-                if "gemini" in model_col:
+                if any(k in model_col for k in ("gemini", "hydrogen", "argon")):
                     b_id = "gemini-weekly" if "weekly" in win_col else "gemini-5h"
                 else:
                     b_id = "3p-weekly" if "weekly" in win_col else "3p-5h"

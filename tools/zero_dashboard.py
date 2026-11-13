@@ -35,6 +35,10 @@ MODEL_LIMITS = {
     "gemini-4-argon-high": {"limit": 1000000, "tripwire": 800000, "name": "Gemini 4 Argon (High)"},
     "gemini-4-argon-medium": {"limit": 1000000, "tripwire": 800000, "name": "Gemini 4 Argon (Medium)"},
     "gemini-4-argon-low": {"limit": 1000000, "tripwire": 800000, "name": "Gemini 4 Argon (Low)"},
+    "gemini-4-hydrogen-xhigh": {"limit": 1000000, "tripwire": 800000, "name": "Gemini 4 Hydrogen (XHigh)"},
+    "gemini-4-hydrogen-high": {"limit": 1000000, "tripwire": 800000, "name": "Gemini 4 Hydrogen (High)"},
+    "gemini-4-hydrogen-medium": {"limit": 1000000, "tripwire": 800000, "name": "Gemini 4 Hydrogen (Medium)"},
+    "gemini-4-hydrogen": {"limit": 1000000, "tripwire": 800000, "name": "Gemini 4 Hydrogen"},
     "gemini-3.8-flash-high": {"limit": 1000000, "tripwire": 800000, "name": "Gemini 3.8 Flash (High)"},
     "gemini-3.8-flash-medium": {"limit": 1000000, "tripwire": 800000, "name": "Gemini 3.8 Flash (Medium)"},
     "gemini-3.8-flash-low": {"limit": 1000000, "tripwire": 800000, "name": "Gemini 3.8 Flash (Low)"},
@@ -1012,8 +1016,8 @@ def get_vulcan_forge_payload(
                                 "status": c_dict.get("status", "pending"),
                                 "attempts": c_dict.get("attempt_count", 0),
                                 "attempt_count": c_dict.get("attempt_count", 0),
-                                "model": c_dict.get("worker_model", "gemini-3.8-flash-high"),
-                                "worker_model": c_dict.get("worker_model", "gemini-3.8-flash-high"),
+                                "model": c_dict.get("worker_model", "gemini-4-hydrogen-high"),
+                                "worker_model": c_dict.get("worker_model", "gemini-4-hydrogen-high"),
                                 "tokens": c_dict.get("total_tokens", 0),
                                 "total_tokens": c_dict.get("total_tokens", 0),
                                 "branch_name": c_dict.get("branch_name", ""),
@@ -1489,7 +1493,7 @@ def render_dashboard_html(agent: str = "zero") -> str:
     brand_tag_class = "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" if is_ivy else "bg-indigo-500/10 text-indigo-400 border-indigo-500/20"
     avatar_border_class = "border-emerald-500/40 shadow-emerald-500/10" if is_ivy else "border-indigo-500/40 shadow-indigo-500/10"
     header_meta = "DS1525+ (Host 2) · #baseball" if is_ivy else "DS1525+ (Host 2) · Port 8769"
-    model_name = "Gemini 3.8 Flash (High)" if is_ivy else "Gemini 3.8 Flash"
+    model_name = "Gemini 4 Hydrogen (High)" if is_ivy else "Gemini 4 Hydrogen"
     default_channel_name = "#baseball" if is_ivy else "#zero-ops"
     rollup_title = "7-Day Token Summary" if is_ivy else "Channel Token Distribution (7-Day)"
     rollup_subtitle = "Cumulative tokens and cache performance for #baseball." if is_ivy else "Cumulative tokens across channels."
@@ -2531,7 +2535,7 @@ def render_dashboard_html(agent: str = "zero") -> str:
 
       selectedChannel = ch.name;
 
-      document.getElementById('header-model').textContent = m.name || 'Gemini 3.8 Flash';
+      document.getElementById('header-model').textContent = m.name || 'Gemini 4 Hydrogen';
 
       // 0. Render Live Account Quota Cards
       const q = data.quota || {};

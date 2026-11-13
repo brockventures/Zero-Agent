@@ -197,7 +197,7 @@ class TestZeroDashboard(unittest.TestCase):
                 build_id TEXT NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 title TEXT NOT NULL,
-                worker_model TEXT NOT NULL DEFAULT 'gemini-3.8-flash-high',
+                worker_model TEXT NOT NULL DEFAULT 'gemini-4-hydrogen-high',
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 total_tokens INTEGER NOT NULL DEFAULT 0,
                 branch_name TEXT,
@@ -249,7 +249,7 @@ class TestZeroDashboard(unittest.TestCase):
             (now - 120, now - 60),
         )
         fconn.execute(
-            "INSERT INTO forge_chunks VALUES ('fg-1-c0', 'fg-1', 0, 'Chunk Zero', 'gemini-3.8-flash-high', 1, 5500, 'forge/fg-1', '1 file changed', '', 'running')"
+            "INSERT INTO forge_chunks VALUES ('fg-1-c0', 'fg-1', 0, 'Chunk Zero', 'gemini-4-hydrogen-high', 1, 5500, 'forge/fg-1', '1 file changed', '', 'running')"
         )
         fconn.execute(
             "INSERT INTO forge_jobs VALUES ('job-1', 'Detached Task', 'pytest', '/workspace', 'zero-ops', 'running', 100, 101, NULL, '/tmp/log', ?, NULL, NULL)",
@@ -285,7 +285,7 @@ class TestZeroDashboard(unittest.TestCase):
         self.assertEqual(len(b1["chunks"]), 1)
         self.assertEqual(b1["chunks"][0]["attempts"], 1)
         self.assertEqual(b1["chunks"][0]["tokens"], 5500)
-        self.assertEqual(b1["chunks"][0]["model"], "gemini-3.8-flash-high")
+        self.assertEqual(b1["chunks"][0]["model"], "gemini-4-hydrogen-high")
 
         self.assertEqual(len(payload["jobs"]), 1)
         self.assertEqual(payload["jobs"][0]["id"], "job-1")
@@ -416,7 +416,7 @@ class TestZeroHealthServerRouting(unittest.TestCase):
         html = zdash.render_dashboard_html(agent="ivy")
         self.assertIn("IVY", html)
         self.assertIn("SABERMETRIC GM", html)
-        self.assertIn("Gemini 3.8 Flash (High)", html)
+        self.assertIn("Gemini 4 Hydrogen (High)", html)
         self.assertIn("#baseball", html)
         self.assertIn("7-Day Token Summary", html)
         self.assertNotIn("Daemon & Background Compute", html)

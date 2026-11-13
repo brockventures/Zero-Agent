@@ -306,6 +306,7 @@ class TestQuotaPoller(unittest.TestCase):
         # Gemini 4 Argon: $6.00 input / $30.00 output+thinking / $0.30 cache_read per 1M
         self.assertEqual(DEFAULT_RATE_CARD_MODEL, "gemini-4-argon")
         self.assertIn("gemini-4-argon", RATE_CARDS)
+        self.assertIn("gemini-4-hydrogen", RATE_CARDS)
         self.assertIn("gemini-3.8-flash", RATE_CARDS)
 
         # 1M wire tokens individual tests (Argon)
@@ -324,6 +325,12 @@ class TestQuotaPoller(unittest.TestCase):
             model="gemini-4-argon",
         )
         self.assertAlmostEqual(cost_argon, 9.60)
+
+        # Gemini 4 Hydrogen: $0.75 input / $3.75 output+thinking / $0.075 cache_read per 1M
+        self.assertAlmostEqual(compute_rate_card_cost(input_tokens=1_000_000, model="gemini-4-hydrogen"), 0.75)
+        self.assertAlmostEqual(compute_rate_card_cost(output_tokens=1_000_000, model="gemini-4-hydrogen-high"), 3.75)
+        self.assertAlmostEqual(compute_rate_card_cost(thinking_tokens=1_000_000, model="gemini-4-hydrogen-medium"), 3.75)
+        self.assertAlmostEqual(compute_rate_card_cost(cache_read_tokens=1_000_000, model="gemini-4-hydrogen-xhigh"), 0.075)
 
         # Gemini 3.8 Flash: $0.75 input / $3.75 output+thinking / $0.075 cache_read per 1M
         self.assertAlmostEqual(compute_rate_card_cost(input_tokens=1_000_000, model="gemini-3.8-flash"), 0.75)

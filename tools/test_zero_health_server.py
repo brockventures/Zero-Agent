@@ -169,7 +169,7 @@ class TestZeroHealthServer(unittest.TestCase):
         mock_output = json.dumps({
             "container_status": "running",
             "session_meta": {"turns": 14},
-            "runtime_config": {"model": "gemini-3.8-flash-high"},
+            "runtime_config": {"model": "gemini-4-hydrogen-high"},
             "bot_stats": {"all_time_messages_sent": 820},
             "in_flight": {"ch_1": {"prompt": "Analyze Ohtani", "ts": time.time() - 10}},
             "active_detached_tasks": 1,
@@ -184,7 +184,8 @@ class TestZeroHealthServer(unittest.TestCase):
         self.assertEqual(payload["agent"], "Ivy")
         self.assertEqual(payload["turn_state"], "PROCESSING")
         self.assertEqual(payload["container_status"], "running")
-        self.assertEqual(payload["model_short"], "3.8 Flash")
+        self.assertEqual(payload["active_model"], "Gemini 4 Hydrogen (High)")
+        self.assertEqual(payload["model_short"], "4 Hydrogen")
         self.assertEqual(payload["session_turns"], 14)
         # Sum of 1 active turn + 1 detached task = 2
         self.assertEqual(payload["in_flight_turns"], 2)

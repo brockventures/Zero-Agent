@@ -237,7 +237,7 @@ def _evaluate_ivy(force: bool = False, strict: bool = False) -> tuple[int, dict]
     c_status = data.get("container_status", "unknown")
     is_running = (c_status == "running")
     daemon_running = bool(data.get("daemon_running", False))
-    raw_model = data.get("runtime_config", {}).get("model", "gemini-3.8-flash-high")
+    raw_model = data.get("runtime_config", {}).get("model", "gemini-4-hydrogen-high")
     session_turns = data.get("session_meta", {}).get("turns", 0)
 
     # Bot stats (All-time messages sent)
@@ -262,6 +262,10 @@ def _evaluate_ivy(force: bool = False, strict: bool = False) -> tuple[int, dict]
         "gemini-4-argon-high": "Gemini 4 Argon (High)",
         "gemini-4-argon-medium": "Gemini 4 Argon (Medium)",
         "gemini-4-argon-low": "Gemini 4 Argon (Low)",
+        "gemini-4-hydrogen-xhigh": "Gemini 4 Hydrogen (XHigh)",
+        "gemini-4-hydrogen-high": "Gemini 4 Hydrogen (High)",
+        "gemini-4-hydrogen-medium": "Gemini 4 Hydrogen (Medium)",
+        "gemini-4-hydrogen": "Gemini 4 Hydrogen",
         "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
         "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
         "gemini-3.8-flash-low": "Gemini 3.8 Flash (Low)",
@@ -277,6 +281,10 @@ def _evaluate_ivy(force: bool = False, strict: bool = False) -> tuple[int, dict]
         "gemini-4-argon-high": "4 Argon",
         "gemini-4-argon-medium": "4 Argon Med",
         "gemini-4-argon-low": "4 Argon Low",
+        "gemini-4-hydrogen-xhigh": "4 Hydrogen XHigh",
+        "gemini-4-hydrogen-high": "4 Hydrogen",
+        "gemini-4-hydrogen-medium": "4 Hydrogen Med",
+        "gemini-4-hydrogen": "4 Hydrogen",
         "gemini-3.8-flash-high": "3.8 Flash",
         "gemini-3.8-flash-medium": "3.8 Flash Med",
         "gemini-3.8-flash-low": "3.8 Flash Low",
@@ -552,7 +560,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 pass
 
         # 8. Active AI model
-        active_model_raw = os.environ.get("AGY_ACTIVE_MODEL", "gemini-3.8-flash-high")
+        active_model_raw = os.environ.get("AGY_ACTIVE_MODEL", "gemini-4-hydrogen-high")
         rules_file = Path("/workspace/config/runtime_rules.json")
         if rules_file.exists():
             try:
@@ -567,6 +575,10 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             "gemini-4-argon-high": "Gemini 4 Argon (High)",
             "gemini-4-argon-medium": "Gemini 4 Argon (Medium)",
             "gemini-4-argon-low": "Gemini 4 Argon (Low)",
+            "gemini-4-hydrogen-xhigh": "Gemini 4 Hydrogen (XHigh)",
+            "gemini-4-hydrogen-high": "Gemini 4 Hydrogen (High)",
+            "gemini-4-hydrogen-medium": "Gemini 4 Hydrogen (Medium)",
+            "gemini-4-hydrogen": "Gemini 4 Hydrogen",
             "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
             "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
             "gemini-3.8-flash-low": "Gemini 3.8 Flash (Low)",
@@ -582,6 +594,10 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             "gemini-4-argon-high": "4 Argon",
             "gemini-4-argon-medium": "4 Argon Med",
             "gemini-4-argon-low": "4 Argon Low",
+            "gemini-4-hydrogen-xhigh": "4 Hydrogen XHigh",
+            "gemini-4-hydrogen-high": "4 Hydrogen",
+            "gemini-4-hydrogen-medium": "4 Hydrogen Med",
+            "gemini-4-hydrogen": "4 Hydrogen",
             "gemini-3.8-flash-high": "3.8 Flash",
             "gemini-3.8-flash-medium": "3.8 Flash Med",
             "gemini-3.8-flash-low": "3.8 Flash Low",
