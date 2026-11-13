@@ -49,8 +49,13 @@ MODEL_ALIASES: dict[str, str] = {
     "argon-med": "gemini-4-argon-medium",
     "argon-medium": "gemini-4-argon-medium",
     "argon-low": "gemini-4-argon-low",
+    "hydrogen": "gemini-4-hydrogen-high",
+    "hydrogen-high": "gemini-4-hydrogen-high",
+    "hydrogen-med": "gemini-4-hydrogen-medium",
+    "hydrogen-medium": "gemini-4-hydrogen-medium",
+    "hydrogen-xhigh": "gemini-4-hydrogen-xhigh",
     "3.8": "gemini-3.8-flash-high",
-    "flash": "gemini-3.8-flash-high",
+    "flash": "gemini-4-hydrogen-high",
     "3.8-flash": "gemini-3.8-flash-high",
     "3.8-flash-high": "gemini-3.8-flash-high",
     "3.8-med": "gemini-3.8-flash-medium",
@@ -705,7 +710,7 @@ async def handle_operator_command(
                 help_lines.append("**Available Models (live from the CLI):**")
                 help_lines.extend(f"- `{mid}` ({label})" for mid, label in available.items())
                 help_lines.append("")
-                help_lines.append("*Shortcuts:* `argon`, `argon-med`, `argon-low`, `flash`, `3.8-low`, `sonnet`, `sonnet-medium`, `opus`, `gpt`")
+                help_lines.append("*Shortcuts:* `argon`, `argon-med`, `argon-low`, `hydrogen`, `hydrogen-med`, `hydrogen-xhigh`, `flash`, `3.8-low`, `sonnet`, `sonnet-medium`, `opus`, `gpt`")
             else:
                 help_lines.append("⚠️ Could not fetch the live model list from the CLI. Try again in a moment.")
             help_lines.append("*Switch with:* `/model <name>` | *Set fallback with:* `/model fallback <name>`")

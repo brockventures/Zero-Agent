@@ -8,13 +8,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, "/workspace")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import tools.bridge_models as bm
 
 LIVE = {
     "gemini-4-argon-high": "Gemini 4 Argon (High)",
     "gemini-4-argon-medium": "Gemini 4 Argon (Medium)",
     "gemini-4-argon-low": "Gemini 4 Argon (Low)",
+    "gemini-4-hydrogen-xhigh": "Gemini 4 Hydrogen (Extra High)",
+    "gemini-4-hydrogen-high": "Gemini 4 Hydrogen (High)",
+    "gemini-4-hydrogen-medium": "Gemini 4 Hydrogen (Medium)",
     "gemini-3.8-flash-high": "Gemini 3.8 Flash (High)",
     "gemini-3.8-flash-medium": "Gemini 3.8 Flash (Medium)",
     "gemini-3.8-flash-low": "Gemini 3.8 Flash (Low)",
@@ -50,14 +53,24 @@ class TestResolve(unittest.TestCase):
         self.assertEqual(bm.resolve_model("sonnet", LIVE), "claude-sonnet-5-5-high")
         self.assertEqual(bm.resolve_model("claude", LIVE), "claude-sonnet-5-5-high")
         self.assertEqual(bm.resolve_model("opus", LIVE), "claude-opus-5-5-high")
-        self.assertEqual(bm.resolve_model("flash", LIVE), "gemini-3.8-flash-high")
+        self.assertEqual(bm.resolve_model("flash", LIVE), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.resolve_model("hydrogen", LIVE), "gemini-4-hydrogen-high")
         self.assertEqual(bm.resolve_model("3.8", LIVE), "gemini-3.8-flash-high")
         self.assertEqual(bm.resolve_model("gpt", LIVE), "gpt-oss-120b-medium")
 
     def test_effort_suffix(self):
         self.assertEqual(bm.resolve_model("sonnet-medium", LIVE), "claude-sonnet-5-5-medium")
         self.assertEqual(bm.resolve_model("3.8-lite", LIVE), "gemini-3.8-flash-low")
+        self.assertEqual(bm.resolve_model("3.8-low", LIVE), "gemini-3.8-flash-low")
         self.assertEqual(bm.resolve_model("flash-med", LIVE), "gemini-3.8-flash-medium")
+
+    def test_hydrogen_shortcuts(self):
+        self.assertEqual(bm.resolve_model("hydrogen", LIVE), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.resolve_model("hydrogen-high", LIVE), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.resolve_model("hydrogen-med", LIVE), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.resolve_model("hydrogen-medium", LIVE), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.resolve_model("hydrogen-xhigh", LIVE), "gemini-4-hydrogen-xhigh")
+        self.assertEqual(bm.resolve_model("gemini-4-hydrogen-high", LIVE), "gemini-4-hydrogen-high")
 
     def test_argon_shortcuts(self):
         self.assertEqual(bm.resolve_model("argon", LIVE), "gemini-4-argon-high")
@@ -149,15 +162,23 @@ class TestFallback(unittest.TestCase):
         self.assertEqual(bm.get_channel_model_override(1548196930788524094, "projects"), "gemini-4-argon-medium")
         self.assertEqual(bm.get_channel_model_override(1558202642663211169, "agora"), "gemini-4-argon-medium")
         self.assertEqual(bm.get_channel_model_override(1551465050072416286, "side-project"), "gemini-4-argon-medium")
-        # Tier 3: Gemini 4 Argon (Low)
+        # Tier 3A: Gemini 4 Argon (Low) — Primary Conversational Flagships
         self.assertEqual(bm.get_channel_model_override(1542081375287640084, "zero-chat"), "gemini-4-argon-low")
-        self.assertEqual(bm.get_channel_model_override(1550577908811178095, "brock-house"), "gemini-4-argon-low")
-        self.assertEqual(bm.get_channel_model_override(1544955538033348618, "shopping"), "gemini-4-argon-low")
-        self.assertEqual(bm.get_channel_model_override(1544953277592899615, "steam-deck"), "gemini-4-argon-low")
+        self.assertEqual(bm.get_channel_model_override(None, "zero-chat"), "gemini-4-argon-low")
         self.assertEqual(bm.get_channel_model_override(1534452820995080192), "gemini-4-argon-low")
         self.assertEqual(bm.get_channel_model_override(None, "lounge"), "gemini-4-argon-low")
-        self.assertEqual(bm.get_channel_model_override(1534436119888793750), "gemini-4-argon-low")
-        self.assertEqual(bm.get_channel_model_override(None, "the-banana-stand"), "gemini-4-argon-low")
+        # Tier 3B: Gemini 4 Hydrogen (High) — Utility, Household & Coordination Channels
+        self.assertEqual(bm.get_channel_model_override(1562246590943461429, "gotchi-chat"), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(None, "gotchi-chat"), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(None, "gotchi-log"), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(1550577908811178095, "brock-house"), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(None, "brock-house"), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(1544955538033348618, "shopping"), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(None, "shopping"), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(1544953277592899615, "steam-deck"), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(None, "steam-deck"), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(1534436119888793750), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(None, "the-banana-stand"), "gemini-4-hydrogen-high")
         # Tier 4: Gemini 3.8 Flash (Low)
         self.assertEqual(bm.get_channel_model_override(1330447543477338202), "gemini-3.8-flash-low")
         self.assertEqual(bm.get_channel_model_override(1210466877835313155), "gemini-3.8-flash-low")

@@ -26,8 +26,15 @@ FORCED_REFRESH_MIN_AGE_SECONDS = 60
 
 MODEL_ERROR_RE = re.compile(r"invalid model selection|not recognized as a known model", re.IGNORECASE)
 
-_EFFORT_ALIASES = {"low": "low", "lite": "low", "med": "medium", "medium": "medium", "high": "high"}
-_EFFORT_PREFERENCE = ("high", "medium", "low")
+_EFFORT_ALIASES = {
+    "low": "low",
+    "lite": "low",
+    "med": "medium",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+}
+_EFFORT_PREFERENCE = ("high", "medium", "low", "xhigh")
 
 
 def _data_dir() -> Path:
@@ -128,7 +135,7 @@ def _norm_id(model_id: str) -> str:
 
 def _parse_id(model_id: str) -> tuple[list[str], str | None, tuple[int, ...]]:
     toks = _norm_id(model_id).split("-")
-    effort = toks[-1] if toks[-1] in ("low", "medium", "high") else None
+    effort = toks[-1] if toks[-1] in ("low", "medium", "high", "xhigh") else None
     base = toks[:-1] if effort else toks
     ver_tok = next((t for t in base if re.fullmatch(r"\d+(\.\d+)*", t)), "0")
     return base, effort, tuple(int(x) for x in ver_tok.split("."))
@@ -138,7 +145,7 @@ def resolve_model(requested: str | None, available: dict[str, str]) -> str | Non
     """Map a model ID or shortcut onto a real model ID, or None if nothing matches.
 
     Shortcuts are matched against the live list: `sonnet`, `claude` (= sonnet), `opus`, `gpt`,
-    `flash`, `3.8`, `3.8-low`, `flash-med`, `sonnet-medium`. Without an effort suffix the
+    `hydrogen`, `flash`, `3.8`, `3.8-low`, `flash-med`, `sonnet-medium`. Without an effort suffix the
     highest available effort is used; with one, only that effort matches.
     """
     if not requested or not available:
@@ -148,7 +155,19 @@ def resolve_model(requested: str | None, available: dict[str, str]) -> str | Non
         return req
 
     req_n = _norm_id(req)
-    m = re.search(r"-(low|lite|med|medium|high)$", req_n)
+    # Explicit fast-path shortcuts
+    if req_n == "flash" and "gemini-4-hydrogen-high" in available:
+        return "gemini-4-hydrogen-high"
+    if req_n in ("hydrogen", "hydrogen-high") and "gemini-4-hydrogen-high" in available:
+        return "gemini-4-hydrogen-high"
+    if req_n in ("hydrogen-med", "hydrogen-medium") and "gemini-4-hydrogen-medium" in available:
+        return "gemini-4-hydrogen-medium"
+    if req_n == "hydrogen-xhigh" and "gemini-4-hydrogen-xhigh" in available:
+        return "gemini-4-hydrogen-xhigh"
+    if req_n in ("argon", "4", "gemini-4") and "gemini-4-argon-high" in available:
+        return "gemini-4-argon-high"
+
+    m = re.search(r"-(low|lite|med|medium|high|xhigh)$", req_n)
     effort = _EFFORT_ALIASES[m.group(1)] if m else None
     base_s = req_n[: m.start()] if m else req_n
     want = [t for t in re.split(r"[-\s]+", base_s) if t]
@@ -266,14 +285,15 @@ CHANNEL_MODEL_OVERRIDES: dict[int, str] = {
     1558202642663211169: "gemini-4-argon-medium",   # #agora
     1551465050072416286: "gemini-4-argon-medium",   # #side-project
     1561509863018856468: "gemini-4-argon-medium",   # #gotchi
-    # Tier 3: Gemini 4 Argon (Low) — Fast Conversational Speed + Argon Quality
+    # Tier 3A: Gemini 4 Argon (Low) — Primary Conversational Flagships
     1542081375287640084: "gemini-4-argon-low",      # #zero-chat
-    1562246590943461429: "gemini-4-argon-low",      # #gotchi-chat
-    1550577908811178095: "gemini-4-argon-low",      # #brock-house
-    1544955538033348618: "gemini-4-argon-low",      # #shopping
-    1544953277592899615: "gemini-4-argon-low",      # #steam-deck
-    1534436119888793750: "gemini-4-argon-low",      # #the-banana-stand
     1534452820995080192: "gemini-4-argon-low",      # #lounge
+    # Tier 3B: Gemini 4 Hydrogen (High) — Utility, Household & Coordination Channels
+    1562246590943461429: "gemini-4-hydrogen-high",  # #gotchi-chat
+    1550577908811178095: "gemini-4-hydrogen-high",  # #brock-house
+    1544955538033348618: "gemini-4-hydrogen-high",  # #shopping
+    1544953277592899615: "gemini-4-hydrogen-high",  # #steam-deck
+    1534436119888793750: "gemini-4-hydrogen-high",  # #the-banana-stand
     # Tier 4: Gemini 3.8 Flash (Low) — Pure Notification & Webhook Channels
     1330447543477338202: "gemini-3.8-flash-low",    # #server-updates
     1210466877835313155: "gemini-3.8-flash-low",    # #seerr-notifications
@@ -311,8 +331,10 @@ def get_channel_model_override(
             "gotchi",
         ):
             return "gemini-4-argon-medium"
-        if cname in ("zero-chat", "gotchi-chat", "gotchi-log", "brock-house", "shopping", "steam-deck", "the-banana-stand", "lounge"):
+        if cname in ("zero-chat", "lounge"):
             return "gemini-4-argon-low"
+        if cname in ("gotchi-chat", "gotchi-log", "brock-house", "shopping", "steam-deck", "the-banana-stand"):
+            return "gemini-4-hydrogen-high"
         if cname == "server-updates" or cname.startswith("seer"):
             return "gemini-3.8-flash-low"
     return None
