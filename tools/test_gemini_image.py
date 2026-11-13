@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 """
-test_gemini_image.py - Unit tests for Antigravity subscription-first image generation and paid-API guard
+test_gemini_image.py - Unit tests for Antigravity subscription-first image generation,
+paid-API guard, and Studio Ghibli Hearth holiday & birthday pack generation.
 """
 
-import unittest
-from unittest.mock import patch, MagicMock
-from pathlib import Path
-import tempfile
 import base64
-
+import os
 import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.gemini_image import (
-    get_gemini_api_key,
+    HEARTH_HOLIDAY_LEGACY_STATES,
+    HEARTH_HOLIDAY_SCENES,
+    build_hearth_birthday_prompt,
+    build_hearth_holiday_prompt,
+    check_and_record_paid_budget,
+    generate_hearth_holiday_pack,
     generate_image_api,
     generate_image_subscription,
-    check_and_record_paid_budget,
+    get_gemini_api_key,
+    sync_legacy_holiday_states,
 )
 
 
@@ -61,8 +70,8 @@ class TestGeminiImage(unittest.TestCase):
     def test_generate_image_subscription_invokes_agy_and_copies_artifact(self, mock_check, mock_run):
         mock_check.return_value = {
             "valid": True,
-            "width": 1024,
-            "height": 1024,
+            "width": 1280,
+            "height": 720,
             "size_bytes": 54321,
             "size_kb": 53.05,
         }
@@ -97,6 +106,50 @@ class TestGeminiImage(unittest.TestCase):
             self.assertIn("--model=gemini-4-argon-low", called_cmd)
             self.assertNotIn("--agent=image-generator", called_cmd)
             self.assertTrue(any("image-generator" in arg for arg in called_cmd))
+
+    @patch("subprocess.run")
+    @patch("tools.gemini_image.check_image")
+    def test_generate_image_subscription_exact_filename_atomic_replace(self, mock_check, mock_run):
+        mock_check.return_value = {
+            "valid": True,
+            "width": 1280,
+            "height": 720,
+            "size_bytes": 98765,
+            "size_kb": 96.45,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "pack"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            existing = out_dir / "holiday_christmas_v1.jpg"
+            existing.write_bytes(b"stale_old_bytes")
+            old_ts = time.time() - 3600
+            os.utime(existing, (old_ts, old_ts))
+
+            src_img = Path(tmpdir) / "fresh_christmas.jpg"
+            src_img.write_bytes(b"fresh_new_ghibli_bytes")
+
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.stdout = f"{src_img}\n"
+            mock_proc.stderr = ""
+            mock_run.return_value = mock_proc
+
+            res = generate_image_subscription(
+                prompt="Ghibli winter scene",
+                aspect_ratio="16:9",
+                image_name="holiday_christmas_v1.jpg",
+                output_dir=str(out_dir),
+                timeout=30,
+                exact_filename=True,
+            )
+
+            self.assertTrue(res["success"])
+            self.assertEqual(res["filename"], "holiday_christmas_v1.jpg")
+            self.assertEqual(Path(res["path"]), existing)
+            self.assertEqual(existing.read_bytes(), b"fresh_new_ghibli_bytes")
+            # Ensure no leftover staging files remain
+            self.assertEqual(list(out_dir.glob("staging_*")), [])
 
     @patch("requests.post")
     @patch("tools.gemini_image.check_and_record_paid_budget", return_value={"allowed": True, "used_24h": 1, "daily_limit": 5})
@@ -162,7 +215,6 @@ class TestGeminiImage(unittest.TestCase):
             "size_kb": 120.5,
         }
 
-        # First model fails with 503, second model succeeds
         resp_503 = MagicMock()
         resp_503.status_code = 503
         resp_503.text = "Capacity exhausted"
@@ -235,6 +287,110 @@ class TestGeminiImage(unittest.TestCase):
         mock_gen.assert_called_once()
         self.assertFalse(mock_gen.call_args.kwargs.get("allow_paid_api"))
         mock_deliver.assert_called_once_with("/tmp/test.jpg", channel_input="lounge", caption=None)
+
+    def test_build_hearth_holiday_and_birthday_prompts(self):
+        cast = "older sister (age 7), younger brother (age 4), and infant baby sister held in arms"
+        for key in ("thanksgiving", "christmas", "winter_solstice", "new_years"):
+            self.assertIn(key, HEARTH_HOLIDAY_SCENES)
+            prompts = [build_hearth_holiday_prompt(key, v, cast) for v in (1, 2, 3)]
+            self.assertEqual(len(set(prompts)), 3)
+            for p in prompts:
+                self.assertIn("Studio Ghibli watercolor", p)
+                self.assertIn("right 42%", p)
+                self.assertIn(cast, p)
+
+        with self.assertRaises(ValueError):
+            build_hearth_holiday_prompt("unknown_holiday", 1, cast)
+
+        b_morning = build_hearth_birthday_prompt(
+            slot="morning",
+            celebrant_description="4-year-old boy",
+            cast_description=cast,
+            age=4,
+            season_hint="late-December winter",
+        )
+        self.assertIn("number '4'", b_morning)
+        self.assertIn("late-December winter", b_morning)
+        self.assertIn("right 42%", b_morning)
+
+        with self.assertRaises(ValueError):
+            build_hearth_birthday_prompt("midnight", "child", cast)
+
+    def test_generate_hearth_holiday_pack_and_legacy_sync(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pack_dir = Path(tmpdir) / "ghibli_test_pack"
+
+            def fake_generate(prompt, aspect_ratio, image_name, output_dir, timeout, reference_image, allow_paid_api, exact_filename):
+                self.assertEqual(aspect_ratio, "16:9")
+                self.assertTrue(exact_filename)
+                self.assertFalse(allow_paid_api)
+                out_path = Path(output_dir) / f"{image_name}.jpg"
+                out_path.write_bytes(f"jpeg_bytes_for_{image_name}".encode("utf-8"))
+                return {
+                    "success": True,
+                    "path": str(out_path),
+                    "filename": out_path.name,
+                    "model": "subscription:gemini-4-argon-low",
+                    "billing_mode": "subscription",
+                    "width": 1280,
+                    "height": 720,
+                    "size_bytes": out_path.stat().st_size,
+                    "size_kb": 0.1,
+                }
+
+            with patch("tools.gemini_image.generate_image_api", side_effect=fake_generate):
+                res = generate_hearth_holiday_pack(
+                    pack_dir=pack_dir,
+                    cast_description="three siblings in Ghibli watercolor style",
+                    holidays=("thanksgiving", "christmas", "new_years"),
+                    variants_per_holiday=3,
+                    birthday_specs=[
+                        {
+                            "key": "child_two",
+                            "celebrant_description": "younger brother turning 4",
+                            "age": 4,
+                            "season_hint": "late-December winter",
+                        }
+                    ],
+                    sync_legacy_states=True,
+                    max_workers=2,
+                )
+
+            self.assertTrue(res["success"])
+            # 3 holidays * 3 variants + 3 birthday slots = 12 generated files
+            self.assertEqual(res["generated_count"], 12)
+
+            for h in ("thanksgiving", "christmas", "new_years"):
+                for v in (1, 2, 3):
+                    self.assertTrue((pack_dir / f"holiday_{h}_v{v}.jpg").exists())
+                for st in HEARTH_HOLIDAY_LEGACY_STATES[h]:
+                    self.assertTrue((pack_dir / f"holiday_{h}_{st}.jpg").exists())
+
+            for slot in ("morning", "afternoon", "evening"):
+                self.assertTrue((pack_dir / f"birthday_child_two_{slot}.jpg").exists())
+
+            # Verify skip_existing skips valid existing assets
+            with patch("tools.gemini_image.check_image", return_value={"valid": True}), patch(
+                "tools.gemini_image.generate_image_api", side_effect=fake_generate
+            ) as mock_regen:
+                res2 = generate_hearth_holiday_pack(
+                    pack_dir=pack_dir,
+                    cast_description="three siblings in Ghibli watercolor style",
+                    holidays=("christmas",),
+                    variants_per_holiday=3,
+                    skip_existing=True,
+                    sync_legacy_states=False,
+                )
+                self.assertTrue(res2["success"])
+                self.assertEqual(res2["generated_count"], 0)
+                self.assertEqual(res2["skipped_count"], 3)
+                mock_regen.assert_not_called()
+
+    def test_sync_legacy_holiday_states_handles_empty_or_unknown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir)
+            self.assertEqual(sync_legacy_holiday_states(p, "unknown_key"), [])
+            self.assertEqual(sync_legacy_holiday_states(p, "christmas"), [])
 
 
 if __name__ == "__main__":
