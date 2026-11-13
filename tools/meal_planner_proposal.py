@@ -607,7 +607,7 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False, sta
     chef_note = ""
     try:
         from tools.llm_sidecar import call_sidecar_llm_json, get_sidecar_model
-        model_id = get_sidecar_model("weekly_meal_proposal", "gemini-4-argon-low")
+        model_id = get_sidecar_model("weekly_meal_proposal", "gemini-4-hydrogen-high")
         def _pool_brief(pool):
             return [{"slug": r.get("slug"), "name": r.get("name"), "tags": r.get("tags", [])[:4]} for r in pool[:10]]
         meal_prompt = (
@@ -717,7 +717,7 @@ def format_proposal_markdown(plan: dict) -> str:
         _fmt_meal(sun, r_sun),
     ]
     if chef_note:
-        lines.append(f"\n👨‍🍳 **Chef's Pairing Note (`gemini-3.8-flash-high`):** {chef_note}")
+        lines.append(f"\n👨‍🍳 **Chef's Pairing Note (`gemini-4-hydrogen-high`):** {chef_note}")
     lines.extend([
         "\n*Once locked in, these will push directly to the shared **Family** Google Calendar and stage ingredients into Monday's 5:00 PM PT Whole Foods delivery cart.*",
         "\n[CHOICES: Lock In Menu | Swap Tuesday | Swap Thursday | Swap Sunday]",

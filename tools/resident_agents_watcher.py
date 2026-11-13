@@ -557,7 +557,7 @@ def evaluate_seeding_candidates_llm(
 
     from tools.llm_sidecar import call_sidecar_llm_json, get_sidecar_model
 
-    model = get_sidecar_model("resident_agents_seeding", "gemini-3.8-flash-high")
+    model = get_sidecar_model("resident_agents_seeding", "gemini-4-hydrogen-high")
     prompt = (
         f"You are Ryan (u/prime416), an opinionated engineer and homelab builder browsing Reddit on mobile, using {model} to spot high-signal threads.\n"
         f"Decide if ANY thread in the batch is a natural fit for a sharp, engaging reply that casually uses the term 'resident agent', and if so, pick the single best thread and write the reply.\n\n"
