@@ -4073,12 +4073,15 @@ def test_bridge_reload_expired_execution_and_expired_decision_feedback(tmp_path,
 
 
 def test_forge_load_shed_threshold_and_build_capping(tmp_path, monkeypatch):
-    """Verify FORGE_LOAD_SHED_THRESHOLD limits build/chunk worker concurrency under high load."""
+    """Verify FORGE_LOAD_SHED_THRESHOLD and FORGE_MIN_AVAILABLE_RAM_MB limit build/chunk worker concurrency."""
     db_path = tmp_path / "forge.db"
     forge_mod.init_forge_db(db_path)
     supervisor = forge_mod.ForgeSupervisor(db_path=db_path, max_parallel_builds=3, max_parallel_chunks=3)
 
     assert forge_mod.FORGE_LOAD_SHED_THRESHOLD == 12.0
+    assert forge_mod.FORGE_MIN_AVAILABLE_RAM_MB == 1800.0
+    assert forge_mod.MAX_PARALLEL_BUILDS_PER_AGENT == 3
+    assert forge_mod.MAX_PARALLEL_CHUNKS_PER_BUILD == 1
 
     # 1. Test _get_current_1m_load
     monkeypatch.setattr(forge_mod.os, "getloadavg", lambda: (14.25, 9.5, 6.1))
@@ -4093,12 +4096,14 @@ def test_forge_load_shed_threshold_and_build_capping(tmp_path, monkeypatch):
     # 2. Test _effective_max_builds & _effective_max_chunks in non-prod environment
     monkeypatch.setattr(forge_mod, "_is_prod_forge_env", lambda p: False)
     monkeypatch.setattr(forge_mod, "_get_current_1m_load", lambda: 18.0)
+    monkeypatch.setattr(forge_mod, "_get_available_ram_mb", lambda: 900.0)
     monkeypatch.setattr(forge_mod, "_has_active_interactive_turns", lambda: False)
     assert supervisor._effective_max_builds() == 3
     assert supervisor._effective_max_chunks() == 3
 
     # 3. Test _effective_max_builds & _effective_max_chunks in prod environment
     monkeypatch.setattr(forge_mod, "_is_prod_forge_env", lambda p: True)
+    monkeypatch.setattr(forge_mod, "_get_available_ram_mb", lambda: 2500.0)
 
     # 3a. High load (>= 12.0) caps to 1 regardless of active turns
     monkeypatch.setattr(forge_mod, "_get_current_1m_load", lambda: 12.0)
@@ -4111,17 +4116,22 @@ def test_forge_load_shed_threshold_and_build_capping(tmp_path, monkeypatch):
     assert supervisor._effective_max_builds() == 1
     assert supervisor._effective_max_chunks() == 1
 
-    # 3b. Normal load (< 12.0) with active interactive turns caps to ACTIVE_CHAT_MAX_PARALLEL_* (1)
+    # 3b. Normal load (< 12.0) with active interactive turns caps to ACTIVE_CHAT_MAX_PARALLEL_*
     monkeypatch.setattr(forge_mod, "_get_current_1m_load", lambda: 4.0)
     monkeypatch.setattr(forge_mod, "_has_active_interactive_turns", lambda: True)
-    assert supervisor._effective_max_builds() == 1
+    assert supervisor._effective_max_builds() == forge_mod.ACTIVE_CHAT_MAX_PARALLEL_BUILDS
     assert supervisor._effective_max_chunks() == 1
 
-    # 3c. Normal load (< 12.0) without active interactive turns returns full max_parallel_*
+    # 3c. Normal load (< 12.0) without active interactive turns returns full max_parallel_* when RAM >= 1800 MB
     monkeypatch.setattr(forge_mod, "_get_current_1m_load", lambda: 4.0)
     monkeypatch.setattr(forge_mod, "_has_active_interactive_turns", lambda: False)
     assert supervisor._effective_max_builds() == 3
     assert supervisor._effective_max_chunks() == 3
+
+    # 3d. Low available RAM (< 1800 MB) holds 3rd build slot back (caps builds to 2 and chunks to 1)
+    monkeypatch.setattr(forge_mod, "_get_available_ram_mb", lambda: 1450.0)
+    assert supervisor._effective_max_builds() == 2
+    assert supervisor._effective_max_chunks() == 1
 
     # 4. Test maybe_spawn_next_build_worker load shedding in prod
     # When load >= 12.0 and active_ids >= 1 -> returns None

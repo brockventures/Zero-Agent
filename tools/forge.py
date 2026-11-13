@@ -5538,14 +5538,50 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
     return {"cleaned_worktrees": cleaned_wts, "reset_chunks": reset_chunks, "pruned_jobs": pruned_jobs}
 
 
-MAX_PARALLEL_BUILDS_PER_AGENT = 2
-MAX_PARALLEL_CHUNKS_PER_BUILD = 2
-ACTIVE_CHAT_MAX_PARALLEL_BUILDS = 1
+MAX_PARALLEL_BUILDS_PER_AGENT = 3
+MAX_PARALLEL_CHUNKS_PER_BUILD = 1
+ACTIVE_CHAT_MAX_PARALLEL_BUILDS = 2
 ACTIVE_CHAT_MAX_PARALLEL_CHUNKS = 1
 FORGE_LOAD_SHED_THRESHOLD = 12.0
+FORGE_MIN_AVAILABLE_RAM_MB = 1800.0
 CHUNK_WORKER_TIMEOUT_SECONDS = 1200.0
 CHUNK_SILENT_STALL_TIMEOUT_SECONDS = 300.0
 VERIFY_CMD_TIMEOUT_SECONDS = 300.0
+
+
+def _get_available_ram_mb() -> float:
+    """Return currently available system memory in MiB from /proc/meminfo, or 8192.0 as fallback."""
+    meminfo_path = Path("/proc/meminfo")
+    try:
+        if meminfo_path.exists():
+            avail_kb: Optional[int] = None
+            free_kb = 0
+            cached_kb = 0
+            buffers_kb = 0
+            for line in meminfo_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        avail_kb = int(parts[1])
+                        break
+                elif line.startswith("MemFree:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        free_kb = int(parts[1])
+                elif line.startswith("Cached:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        cached_kb = int(parts[1])
+                elif line.startswith("Buffers:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        buffers_kb = int(parts[1])
+            if avail_kb is None:
+                avail_kb = free_kb + cached_kb + buffers_kb
+            return round(avail_kb / 1024.0, 2)
+    except Exception:
+        pass
+    return 8192.0
 
 
 def _has_active_interactive_turns(max_age_s: float = 600.0) -> bool:
@@ -5974,13 +6010,19 @@ class ForgeSupervisor:
         if _is_prod_forge_env(self.db_path):
             if _get_current_1m_load() >= FORGE_LOAD_SHED_THRESHOLD:
                 return min(self.max_parallel_builds, 1)
+            cap = self.max_parallel_builds
+            if _get_available_ram_mb() < FORGE_MIN_AVAILABLE_RAM_MB:
+                cap = min(cap, 2)
             if _has_active_interactive_turns():
-                return min(self.max_parallel_builds, ACTIVE_CHAT_MAX_PARALLEL_BUILDS)
+                cap = min(cap, ACTIVE_CHAT_MAX_PARALLEL_BUILDS)
+            return cap
         return self.max_parallel_builds
 
     def _effective_max_chunks(self) -> int:
         if _is_prod_forge_env(self.db_path):
             if _get_current_1m_load() >= FORGE_LOAD_SHED_THRESHOLD:
+                return min(self.max_parallel_chunks, 1)
+            if _get_available_ram_mb() < FORGE_MIN_AVAILABLE_RAM_MB:
                 return min(self.max_parallel_chunks, 1)
             if _has_active_interactive_turns():
                 return min(self.max_parallel_chunks, ACTIVE_CHAT_MAX_PARALLEL_CHUNKS)
