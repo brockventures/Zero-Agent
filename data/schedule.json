@@ -255,9 +255,9 @@
     "prompt": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
     "catchup_if_missed": true,
     "catchup_window_seconds": 14400,
-    "last_run_ts": 1794582012,
-    "last_run_at": "2026-11-13 07:00 AM PT",
-    "next_run_ts": 1794668400.0
+    "last_run_ts": 1794683819,
+    "last_run_at": "2026-11-14 11:16 AM PT",
+    "next_run_ts": 1794754800.0
   },
   {
     "id": "daily_birthday_reminder",
@@ -761,9 +761,9 @@
     "interval_seconds": 600,
     "prompt": "Run the 10-minute ground-truth quota usage poller using /workspace/tools/sidecars.py quota_poller. Captures live remaining fractions and cycle burn deltas.",
     "catchup_if_missed": false,
-    "last_run_ts": 1794590798,
-    "last_run_at": "2026-11-13 09:26 AM PT",
-    "next_run_ts": 1794591398.0
+    "last_run_ts": 1794683811,
+    "last_run_at": "2026-11-14 11:16 AM PT",
+    "next_run_ts": 1794684411.0
   },
   {
     "id": "personal_data_sync",
