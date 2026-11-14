@@ -469,6 +469,8 @@ def is_exempt_from_investigation_gate(name: str, args: dict, cwd: str = "/worksp
             "tools.forge",
             "detached_runner.py",
             "modal_harness.py",
+            "modal_godot_verify.py",
+            "modal_verify.py",
             "outbox.py",
             "gif_tool.py",
             "channel_history.py",
@@ -1713,6 +1715,15 @@ def check_tool_use(
         if not ok_mut:
             return False, mut_reason
 
+        # A00-godot. Local Godot Binary Execution Guard (Require Modal Offload via modal_godot_verify.py)
+        if "Godot_v4.7.2" in cmd and "modal_godot_verify.py" not in cmd:
+            return False, (
+                "Modal Godot Offload Guard Triggered: Direct local execution of 'Godot_v4.7.2' on Host 2 is prohibited "
+                "(causes 5-minute --import hangs and heavy CPU/RAM spikes). "
+                "Route all headless Godot 4.7.2 test and simulation runs through Modal cloud compute via:\n"
+                "python3 /workspace/tools/modal_godot_verify.py [test_filter ...]"
+            )
+
         # A00. Heavy Inline Benchmark / Migration Gate (Require FORGE job start or enqueue)
         if is_heavy_inline_benchmark_or_migration(cmd, cwd=cwd):
             return False, (
@@ -1800,7 +1811,13 @@ def check_tool_use(
 
         # A00b. Repeated Same-Scratch-Script, Inline Heredoc & >90s Calibration / Command Loop Gate
         if os.environ.get("FORGE_WORKER_ACTIVE") != "1" and not os.path.abspath(cwd or "/workspace").replace("\\", "/").startswith("/tmp/forge-wt-"):
-            if "forge.py" not in cmd and "detached_runner.py" not in cmd and "modal_harness.py" not in cmd:
+            if (
+                "forge.py" not in cmd
+                and "detached_runner.py" not in cmd
+                and "modal_harness.py" not in cmd
+                and "modal_godot_verify.py" not in cmd
+                and "modal_verify.py" not in cmd
+            ):
                 turn_cmds = int(state.get("turn_run_commands", 0)) + 1
                 state["turn_run_commands"] = turn_cmds
                 turn_elapsed = now - float(state.get("turn_start_time", now) or now)

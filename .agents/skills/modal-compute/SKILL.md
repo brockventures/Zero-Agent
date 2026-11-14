@@ -1,7 +1,7 @@
 ---
 name: modal-compute
 description: >-
-  Use this skill whenever running or orchestrating heavy compilation (Android/Wear OS Gradle + Kotlin/DEX APK builds, Go static analysis, headless WebGL/3D renders, CAD mesh slicing), machine learning model training, multi-fold cross-validation sweeps, hyperparameter optimization, or compute-intensive workloads. Offloads heavy CPU/RAM tasks from Host 2 NAS to Modal serverless cloud compute (8–16 vCPUs, 32–64 GB RAM), protecting the NAS hardware from memory exhaustion and watchdog panics.
+  Use this skill whenever running or orchestrating heavy compilation (Android/Wear OS Gradle + Kotlin/DEX APK builds, Go static analysis, headless Godot 4.7.2 test and bot simulation suites, headless WebGL/3D renders, CAD mesh slicing), machine learning model training, multi-fold cross-validation sweeps, hyperparameter optimization, or compute-intensive workloads. Offloads heavy CPU/RAM tasks from Host 2 NAS to Modal serverless cloud compute (8–16 vCPUs, 16–64 GB RAM), protecting the NAS hardware from memory exhaustion and watchdog panics.
 ---
 
 # ☁️ Modal Serverless Cloud Compute Skill
@@ -13,7 +13,7 @@ The **Modal-Compute** skill governs offloading heavy computation from Host 2 (`<
 ## 🎯 When to Activate This Skill
 
 Activate this skill whenever:
-- **Heavy Software & Binary Compilation:** Compiling Android or Wear OS APKs via Gradle/Kotlin/D8 DEX (`gradlew assemble*`), running whole-program Go SSA static analyzers (`golangci-lint`, `deadcode`, `oapi-codegen` via `tools/modal_verify.py`), rendering headless Chromium WebGL/Three.js scenes, or slicing complex 3D CAD meshes.
+- **Heavy Software, Game Engine & Binary Compilation:** Compiling Android or Wear OS APKs via Gradle/Kotlin/D8 DEX (`gradlew assemble*`), running whole-program Go SSA static analyzers (`golangci-lint`, `deadcode`, `oapi-codegen` via `tools/modal_verify.py`), executing headless Godot 4.7.2 GDScript test and 120-round bot simulation suites (`tools/modal_godot_verify.py`), rendering headless Chromium WebGL/Three.js scenes, or slicing complex 3D CAD meshes.
 - Training, tuning, or fitting machine learning models in `big-projections` (`HistGradientBoosting`, `RandomForest`, `Ridge`, `CatBoost`, `LightGBM`).
 - Running multi-fold cross-validation suites (`KFold(n_splits=5)`) across multiple statistical targets (`PA`, `HR`, `ISO`, `BABIP`, `K%`, `BB%`, `SB`, `ERA`, `WHIP`).
 - Executing parameter optimization sweeps (>15 parameter combinations, Nelder-Mead, Powell, or grid search) across historical player cohorts (2021–2026).
@@ -56,6 +56,12 @@ modal run /baseball/big-projections/modal_harness.py \
 python3 /baseball/big-projections/modal_harness.py --mode benchmark
 ```
 - Runs the 19-category out-of-sample freshman scorecard (`7/7` Hitters + `12/12` Pitchers) locally in `~0.4s` and prints the JSON summary.
+
+### 5. Headless Godot 4.7.2 Test & Simulation Suites (`tools/modal_godot_verify.py`)
+```bash
+python3 /workspace/tools/modal_godot_verify.py [test_filter ...]
+```
+- Deterministically builds `game/.godot/global_script_class_cache.cfg` in `<0.02s` (preventing 5-minute `--import` hangs in fresh worktrees) and offloads headless Godot 4.7.2 test and 120-round bot simulation suites to Modal cloud compute (`8 vCPUs, 16 GB RAM`) backed by the persistent `zero-godot-cache` Modal Volume. Direct local invocation of `Godot_v4.7.2` on Host 2 is blocked by `batch_guard.py`.
 
 ---
 

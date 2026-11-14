@@ -54,7 +54,7 @@ def heal_and_check_active_forge_build() -> str | None:
                 active_label = f"{bid} ({title} — {status})"
         conn.close()
         return active_label
-    except Exception as exc:
+    except (sqlite3.Error, OSError, ValueError) as exc:
         print(f"DB check error: {exc}", file=sys.stderr)
         return None
 
@@ -67,6 +67,7 @@ def sync_merged_commits_and_issues(data: dict) -> bool:
         capture_output=True,
         text=True,
         timeout=15,
+        check=False,
     )
     log_text = log_res.stdout if log_res.returncode == 0 else ""
 
@@ -76,6 +77,7 @@ def sync_merged_commits_and_issues(data: dict) -> bool:
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
 
     res = subprocess.run(
@@ -83,6 +85,7 @@ def sync_merged_commits_and_issues(data: dict) -> bool:
         capture_output=True,
         text=True,
         timeout=30,
+        check=False,
     )
     state_map = {}
     if res.returncode == 0 and res.stdout.strip():
@@ -98,6 +101,7 @@ def sync_merged_commits_and_issues(data: dict) -> bool:
                     capture_output=True,
                     text=True,
                     timeout=20,
+                    check=False,
                 )
                 state_map[inum] = "CLOSED"
             if t.get("status") != "completed":
@@ -158,9 +162,9 @@ def enqueue_task_to_forge(task: dict) -> tuple[bool, str]:
                         f"Implement {slug} (GitHub Issue #{issue_num}): {task['title']}.\n\n"
                         f"{task['summary']}\n\n"
                         f"Target files to update: {', '.join(existing_targets[:6])}.\n"
-                        "Keep changes concise and verify with the headless Godot test runner before committing."
+                        "Keep changes concise and verify with the Modal headless Godot test runner (python3 /workspace/tools/modal_godot_verify.py) before committing."
                     ),
-                    "verification_cmd": task["test_cmd"],
+                    "verification_cmd": task.get("test_cmd", "python3 /workspace/tools/modal_godot_verify.py"),
                 }
             ],
         }
@@ -171,6 +175,7 @@ def enqueue_task_to_forge(task: dict) -> tuple[bool, str]:
         capture_output=True,
         text=True,
         timeout=300,
+        check=False,
     )
     out = (res.stdout + "\n" + res.stderr).strip()
     return (res.returncode == 0), out

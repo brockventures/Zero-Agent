@@ -1643,6 +1643,50 @@ def test_tools_and_hooks_batch_guard_copies_are_identical(tmp_path):
     assert hooks_mod.load_state(state_file).get("offload_dispatched") is True
 
 
+def test_modal_godot_verify_exempt_and_direct_local_godot_binary_blocked(tmp_path):
+    state_file = str(tmp_path / "bg_state_godot.json")
+
+    # 1. modal_godot_verify.py and modal_verify.py are exempt from investigation gate
+    assert is_exempt_from_investigation_gate(
+        "run_command",
+        {"CommandLine": "python3 /workspace/tools/modal_godot_verify.py test_upgrades"},
+        cwd="/workspace",
+    ) is True
+    assert is_exempt_from_investigation_gate(
+        "run_command",
+        {"CommandLine": "python3 /workspace/tools/modal_verify.py"},
+        cwd="/workspace",
+    ) is True
+
+    # 2. Direct local Godot_v4.7.2 binary execution is blocked unless routed via modal_godot_verify.py
+    for blocked_cmd in (
+        "/workspace/agora-roguelike/.godot-bin/Godot_v4.7.2-stable_linux.x86_64 --headless --path game -s res://tests/run_tests.gd",
+        "./game/tests/run.sh /workspace/agora-roguelike/.godot-bin/Godot_v4.7.2-stable_linux.x86_64",
+    ):
+        ok_direct, reason_direct = check_tool_use(
+            "run_command",
+            {"CommandLine": blocked_cmd},
+            state_file=state_file,
+        )
+        assert ok_direct is False, f"Expected direct Godot_v4.7.2 invocation to be blocked: {blocked_cmd}"
+        assert "Modal Godot Offload Guard Triggered" in reason_direct
+        assert "modal_godot_verify.py" in reason_direct
+
+    # 3. Invoking via modal_godot_verify.py (even with optional leading Godot_v4.7.2 argument) is allowed
+    for allowed_cmd in (
+        "python3 /workspace/tools/modal_godot_verify.py",
+        "python3 /workspace/tools/modal_godot_verify.py test_rescue_goldens test_sovereign_boss",
+        "python3 /workspace/tools/modal_godot_verify.py /workspace/agora-roguelike/.godot-bin/Godot_v4.7.2-stable_linux.x86_64 test_upgrades",
+    ):
+        ok_modal, reason_modal = check_tool_use(
+            "run_command",
+            {"CommandLine": allowed_cmd},
+            state_file=state_file,
+        )
+        assert ok_modal is True, f"Expected modal_godot_verify.py invocation to be allowed: {allowed_cmd} ({reason_modal})"
+
+
+
 
 
 
