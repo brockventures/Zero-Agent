@@ -279,13 +279,13 @@ def set_fallback_model(model_id: str) -> None:
 CHANNEL_MODEL_OVERRIDES: dict[int, str] = {
     # Tier 1: Gemini 4 Argon (High) — Spatial CAD & 3D Geometry
     1555973316752449576: "gemini-4-argon-high",     # #3d-print
-    # Tier 2: Gemini 4 Argon (Medium) / Carbon (Medium) — Infrastructure, Ops, Quant, Finance & Engineering
+    # Tier 2: Gemini 4 Argon (Medium) — Infrastructure, Ops, Quant, Finance & Engineering
     1548196929308065893: "gemini-4-argon-medium",   # #baseball
     1544955532765560924: "gemini-4-argon-medium",   # #finances
     1550577910757458015: "gemini-4-argon-medium",   # #vault
     1544953279664889888: "gemini-4-argon-medium",   # #zero-ops
     1562899941595160657: "gemini-4-argon-medium",   # #forge
-    1544953275877556334: "gemini-4-carbon-medium",  # #home-assistant
+    1544953275877556334: "gemini-4-argon-medium",   # #home-assistant
     1544955535722545253: "gemini-4-argon-medium",   # #homelab
     1548196930788524094: "gemini-4-argon-medium",   # #projects
     1558202642663211169: "gemini-4-argon-medium",   # #agora
@@ -322,8 +322,6 @@ def get_channel_model_override(
         cname = str(channel_name).strip().lstrip("#").lower()
         if cname == "3d-print":
             return "gemini-4-argon-high"
-        if cname == "home-assistant":
-            return "gemini-4-carbon-medium"
         if cname in (
             "baseball",
             "finances",
@@ -331,6 +329,7 @@ def get_channel_model_override(
             "zero-ops",
             "forge",
             "harness-management",
+            "home-assistant",
             "homelab",
             "projects",
             "agora",
