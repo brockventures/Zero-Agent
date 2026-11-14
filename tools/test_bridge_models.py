@@ -168,9 +168,9 @@ class TestFallback(unittest.TestCase):
         self.assertEqual(bm.get_channel_model_override(None, "zero-chat"), "gemini-4-argon-low")
         self.assertEqual(bm.get_channel_model_override(1534452820995080192), "gemini-4-argon-low")
         self.assertEqual(bm.get_channel_model_override(None, "lounge"), "gemini-4-argon-low")
-        self.assertEqual(bm.get_channel_model_override(1562544598423965856, "r-residentagents"), "gemini-4-argon-low")
-        self.assertEqual(bm.get_channel_model_override(None, "r-residentagents"), "gemini-4-argon-low")
         # Tier 3B: Gemini 4 Hydrogen (High) — Structured Ops, Utility, Household & Coordination Channels
+        self.assertEqual(bm.get_channel_model_override(1562544598423965856, "r-residentagents"), "gemini-4-hydrogen-high")
+        self.assertEqual(bm.get_channel_model_override(None, "r-residentagents"), "gemini-4-hydrogen-high")
         self.assertEqual(bm.get_channel_model_override(1544955532765560924, "finances"), "gemini-4-hydrogen-high")
         self.assertEqual(bm.get_channel_model_override(None, "finances"), "gemini-4-hydrogen-high")
         self.assertEqual(bm.get_channel_model_override(1550577910757458015, "vault"), "gemini-4-hydrogen-high")

@@ -288,8 +288,8 @@ CHANNEL_MODEL_OVERRIDES: dict[int, str] = {
     # Tier 3A: Gemini 4 Argon (Low) — Primary Conversational Flagships
     1542081375287640084: "gemini-4-argon-low",      # #zero-chat
     1534452820995080192: "gemini-4-argon-low",      # #lounge
-    1562544598423965856: "gemini-4-argon-low",      # #r-residentagents
     # Tier 3B: Gemini 4 Hydrogen (High) — Structured Ops, Utility, Household & Coordination Channels
+    1562544598423965856: "gemini-4-hydrogen-high",  # #r-residentagents
     1544955532765560924: "gemini-4-hydrogen-high",  # #finances
     1550577910757458015: "gemini-4-hydrogen-high",  # #vault
     1562899941595160657: "gemini-4-hydrogen-high",  # #forge
@@ -334,9 +334,10 @@ def get_channel_model_override(
             "gotchi",
         ):
             return "gemini-4-argon-medium"
-        if cname in ("zero-chat", "lounge", "r-residentagents"):
+        if cname in ("zero-chat", "lounge"):
             return "gemini-4-argon-low"
         if cname in (
+            "r-residentagents",
             "finances",
             "vault",
             "forge",

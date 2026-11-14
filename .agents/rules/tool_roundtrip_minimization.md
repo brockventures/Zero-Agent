@@ -26,7 +26,7 @@ description: Enforces tool roundtrip minimization, broad-slice file reads, and d
 5. **Targeted Pytest & Path-Gated Verification (Ban Unscoped Full-Suite Runs & Backend Linting on Frontend Diffs):**
    - In Tier 1 inline turns (`<90s`) and `#forge` worker turns, **NEVER** run unconstrained full repository test suites (bare `pytest` or `pytest tests/`) or whole-repo static analyzers (`./scripts/verify.sh --lint-only`, `golangci-lint`, `deadcode`) locally.
    - **Path-Gated Stack Verification:** When a change only touches frontend files (`web/`, `.ts`, `.tsx`, `.css`), run ONLY scoped frontend checks (`npm test`, `eslint`, `tsc`) and **NEVER** invoke Go/backend linters or `verify.sh` without `--staged` (and only run `--staged` after `git add`).
-   - **Modal Offload for Heavy Go Static Analysis:** Whenever `.go`, `go.mod`, or OpenAPI files are modified, offload `golangci-lint`, `deadcode`, and full `verify.sh` runs to Modal cloud compute (`tools/modal_verify.py`) so local CPU/RAM is never exhausted.
+   - **Modal Offload for Heavy Compiles & Static Analysis (Go, Android Gradle/DEX, WebGL/3D & Multi-Target Builds):** Whenever running heavy compilation or whole-program analysis—including Go static analysis (`golangci-lint`, `deadcode`, full `verify.sh` via `tools/modal_verify.py`), Android/Wear OS Gradle + Kotlin/D8 DEX APK compiles (`gradlew assemble*`), headless Chromium WebGL/3D renders, or any build consuming `>1 GB` RAM or `>60s` CPU—ALWAYS offload execution to Modal cloud compute (`8 vCPUs, 32 GB RAM`) with persistent Modal Volume caches so Host 2 NAS CPU, RAM, and disk I/O are never exhausted.
    - **ALWAYS** scope test execution strictly to the relevant test file or function under test (`pytest tests/test_feature.py`). Rely on CI for full matrix regressions.
 
 6. **Unified FORGE Routing (Execution Loop & Verification Cost) & One-Shot Git Batching:**
@@ -57,5 +57,8 @@ description: Enforces tool roundtrip minimization, broad-slice file reads, and d
    - **Read-Only + Busy Timeout + Indexed Bounds:** When direct SQLite querying of `home-assistant_v2.db` is required, **ALWAYS**:
      1. Open in immutable/read-only mode (`file:$NAS_DOCKER_ROOT/homeassistant/config/home-assistant_v2.db?mode=ro` or `sqlite3 -readonly -cmd ".timeout 3000"`) so Home Assistant's recorder write transactions never block the query for minutes.
      2. Filter on indexed columns (`s.metadata_id = (SELECT metadata_id FROM states_meta WHERE entity_id = '...')` and `s.last_updated_ts > <epoch>`) and **NEVER** apply unindexed `CAST(s.state AS REAL)` filters without a tight `last_updated_ts` lower bound.
+
+13. **Conversational Flagship Subagent Escalation (`#zero-chat` & `#lounge` — Argon Low → Medium/Pro):**
+   - Because `#zero-chat` (`1542081375287640084`) and `#lounge` (`1534452820995080192`) run on **Gemini 4 Argon (Low)** (`gemini-4-argon-low`) for fast first-token latency on everyday chat, whenever a prompt in either channel requires deep multi-step reasoning, architectural tradeoffs, complex log/state synthesis, or non-trivial debugging that doesn't warrant a full `#forge` build, delegate the heavy reasoning step via `invoke_subagent(TypeName="research", Model="pro", ...)` (or `TypeName="self", Model="pro"`) and synthesize the result concisely for the user.
 
 *Note: Enforced deterministically by `batch_guard.py`.*
