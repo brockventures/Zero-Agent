@@ -4547,28 +4547,32 @@ def test_execute_approval_card_passes_forge_approved_card_execution_env(tmp_path
 
 
 def test_worker_model_attempt_escalation_and_fallback_ladder():
-    """Verify FORGE worker ladder escalates Hydrogen XHigh -> Argon High -> Carbon High and updates fallback map."""
+    """Verify FORGE worker ladder escalates Hydrogen High -> Argon High -> Carbon High and updates fallback map."""
     import tools.forge as forge_mod
 
-    assert forge_mod.DEFAULT_WORKER_MODEL == "gemini-4-hydrogen-xhigh"
+    assert forge_mod.DEFAULT_WORKER_MODEL == "gemini-4-hydrogen-high"
     assert forge_mod.ESCALATION_WORKER_MODEL == "gemini-4-argon-high"
     assert forge_mod.FINAL_ESCALATION_WORKER_MODEL == "gemini-4-carbon-high"
 
+    assert forge_mod.WORKER_MODEL_FALLBACK_MAP["gemini-4-hydrogen-high"] == "gemini-4-argon-high"
     assert forge_mod.WORKER_MODEL_FALLBACK_MAP["gemini-4-hydrogen-xhigh"] == "gemini-4-argon-high"
-    assert forge_mod.WORKER_MODEL_FALLBACK_MAP["gemini-4-hydrogen-high"] == "gemini-4-hydrogen-xhigh"
     assert forge_mod.WORKER_MODEL_FALLBACK_MAP["gemini-4-argon-low"] == "gemini-4-argon-medium"
     assert forge_mod.WORKER_MODEL_FALLBACK_MAP["gemini-4-argon-medium"] == "gemini-4-argon-high"
     assert forge_mod.WORKER_MODEL_FALLBACK_MAP["gemini-4-argon-high"] == "gemini-4-carbon-high"
     assert forge_mod.WORKER_MODEL_FALLBACK_MAP["gemini-4-carbon-high"] == "gemini-4-argon-high"
 
-    assert forge_mod.resolve_worker_model_for_attempt(None, attempt=1, max_attempts=3) == "gemini-4-hydrogen-xhigh"
+    assert forge_mod.resolve_worker_model_for_attempt(None, attempt=1, max_attempts=3) == "gemini-4-hydrogen-high"
     assert forge_mod.resolve_worker_model_for_attempt(None, attempt=2, max_attempts=3) == "gemini-4-argon-high"
     assert forge_mod.resolve_worker_model_for_attempt(None, attempt=3, max_attempts=3) == "gemini-4-carbon-high"
-    assert forge_mod.resolve_worker_model_for_attempt("gemini-4-hydrogen-high", attempt=2, max_attempts=3) == "gemini-4-argon-high"
+    assert forge_mod.resolve_worker_model_for_attempt("gemini-4-hydrogen-xhigh", attempt=2, max_attempts=3) == "gemini-4-argon-high"
     assert forge_mod.resolve_worker_model_for_attempt("gemini-4-argon-low", attempt=2, max_attempts=3) == "gemini-4-argon-high"
     assert forge_mod.resolve_worker_model_for_attempt("gemini-4-argon-medium", attempt=2, max_attempts=3) == "gemini-4-argon-high"
     assert forge_mod.resolve_worker_model_for_attempt("gemini-4-carbon-high", attempt=2, max_attempts=3) == "gemini-4-carbon-high"
 
+    assert (
+        forge_mod.resolve_worker_model_fallback("gemini-4-hydrogen-high", attempt=1, max_attempts=3)
+        == "gemini-4-argon-high"
+    )
     assert (
         forge_mod.resolve_worker_model_fallback("gemini-4-hydrogen-xhigh", attempt=1, max_attempts=3)
         == "gemini-4-argon-high"
@@ -4578,7 +4582,7 @@ def test_worker_model_attempt_escalation_and_fallback_ladder():
         == "gemini-4-carbon-high"
     )
     assert (
-        forge_mod.resolve_worker_model_fallback("gemini-4-hydrogen-xhigh", attempt=2, max_attempts=3)
+        forge_mod.resolve_worker_model_fallback("gemini-4-hydrogen-high", attempt=2, max_attempts=3)
         == "gemini-4-argon-high"
     )
     assert (
@@ -4586,7 +4590,7 @@ def test_worker_model_attempt_escalation_and_fallback_ladder():
             "gemini-4-argon-high",
             attempt=2,
             max_attempts=3,
-            rejected_models={"gemini-4-hydrogen-xhigh", "gemini-4-argon-high"},
+            rejected_models={"gemini-4-hydrogen-high", "gemini-4-argon-high"},
         )
         == "gemini-4-carbon-high"
     )
@@ -4599,7 +4603,7 @@ def test_worker_model_attempt_escalation_and_fallback_ladder():
             "gemini-4-carbon-high",
             attempt=3,
             max_attempts=3,
-            rejected_models={"gemini-4-hydrogen-xhigh", "gemini-4-argon-high", "gemini-4-carbon-high"},
+            rejected_models={"gemini-4-hydrogen-high", "gemini-4-argon-high", "gemini-4-carbon-high"},
         )
         == "gemini-4-argon-high"
     )
