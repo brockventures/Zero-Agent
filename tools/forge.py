@@ -8524,13 +8524,13 @@ def _post_decision_card_rest(
     return None
 
 
-def execute_decision(
+def execute_approval_card(
     decision_id: str,
     user_id: int = OWNER_USER_ID,
     override_payload: Optional[dict] = None,
     db_path: Path | str = FORGE_DB_PATH,
 ) -> dict:
-    """Deterministically execute a staged Decision Card payload in <1s with zero LLM tokens."""
+    """Deterministically execute a human-approved Decision Card payload with FORGE_APPROVED_CARD_EXECUTION=1."""
     if int(user_id) != OWNER_USER_ID:
         return {"ok": False, "error": "Unauthorized user ID."}
 
@@ -8585,13 +8585,15 @@ def execute_decision(
     handler = row["handler_type"]
     ok = False
     receipt = ""
+    env = os.environ.copy()
+    env["FORGE_APPROVED_CARD_EXECUTION"] = "1"
 
     try:
         if handler in ("shell", "shell_cmd", "cmd", "bash"):
             cmd = payload.get("command", "")
             cwd = payload.get("cwd", "/workspace")
             timeout_sec = int(payload.get("timeout", 180) or 180)
-            proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout_sec)
+            proc = subprocess.run(cmd, shell=True, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout_sec)
             ok = proc.returncode == 0
             out = (proc.stdout or proc.stderr or "").strip()
             receipt = f"Exit 0 (`{out[:120]}`)" if ok and out else ("Exit 0" if ok else f"Exit {proc.returncode}: {out[:160]}")
@@ -8601,7 +8603,7 @@ def execute_decision(
             subj = payload["subject"]
             body = payload["body"]
             cmd = [sys.executable, str(WORKSPACE_DIR / "tools" / "send_mail.py"), "--to", to_addr, "--subject", subj, "--body", body]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
             ok = proc.returncode == 0
             receipt = f"Email dispatched to `{to_addr}`" if ok else f"send_mail failed: {proc.stderr[:160]}"
 
@@ -8609,8 +8611,8 @@ def execute_decision(
             service = payload["service"]
             action = payload.get("action", "up -d")
             compose_dir = payload.get("compose_dir", "/docker")
-            cmd = f"docker compose {action} {service}"
-            proc = subprocess.run(cmd, shell=True, cwd=compose_dir, capture_output=True, text=True, timeout=60)
+            cmd = f"docker compose {action} {service}".strip()
+            proc = subprocess.run(cmd, shell=True, cwd=compose_dir, env=env, capture_output=True, text=True, timeout=60)
             ok = proc.returncode == 0
             receipt = f"`{cmd}` succeeded" if ok else f"`{cmd}` failed: {proc.stderr[:160]}"
 
@@ -8642,7 +8644,7 @@ def execute_decision(
             paths = payload.get("paths") or payload.get("files") or ([] if not payload.get("path") else [payload["path"]])
             if cmd:
                 cwd = payload.get("cwd", "/workspace")
-                proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60)
+                proc = subprocess.run(cmd, shell=True, cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
                 ok = proc.returncode == 0
                 out = (proc.stdout or proc.stderr or "").strip()
                 receipt = f"Deleted via `{cmd[:80]}`" if ok else f"Exit {proc.returncode}: {out[:160]}"
@@ -8722,6 +8724,21 @@ def execute_decision(
     if not ok:
         res_dict["error"] = receipt
     return res_dict
+
+
+def execute_decision(
+    decision_id: str,
+    user_id: int = OWNER_USER_ID,
+    override_payload: Optional[dict] = None,
+    db_path: Path | str = FORGE_DB_PATH,
+) -> dict:
+    """Deterministically execute a staged Decision Card payload in <1s with zero LLM tokens."""
+    return execute_approval_card(
+        decision_id=decision_id,
+        user_id=user_id,
+        override_payload=override_payload,
+        db_path=db_path,
+    )
 
 
 execute_decision_card = execute_decision

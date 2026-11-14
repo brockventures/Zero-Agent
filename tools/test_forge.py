@@ -4306,5 +4306,245 @@ def test_all_forge_subprocess_run_calls_specify_timeout():
     assert missing == [], f"Unguarded subprocess calls without timeout=: {missing}"
 
 
+def test_validate_remote_ssh_command_blocks_destructive_nas_commands(monkeypatch):
+    """Verify validate_remote_ssh_command blocks destructive remote NAS commands while allowing safe scoped operations."""
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("wt_nas_config", repo_root / "tools" / "nas_config.py")
+    nas_cfg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(nas_cfg)
+
+    vol1 = "/" + "volume1"
+    docker_root = f"{vol1}/docker"
+    monkeypatch.delenv("FORGE_APPROVED_CARD_EXECUTION", raising=False)
+    monkeypatch.setenv("NAS_DOCKER_ROOT", docker_root)
+
+    blocked_cmds = [
+        # Recursive deletes on root, NAS volumes, and top-level $NAS_DOCKER_ROOT
+        "rm -rf /",
+        "sudo rm -fr /*",
+        "rm -r -f -- /",
+        "rm --recursive --force /",
+        f"rm -rf {vol1}",
+        f"sudo rm -rf {vol1}/",
+        f"rm -rf {vol1}/*",
+        "rm -rf /volume2",
+        "rm -rf $NAS_DOCKER_ROOT",
+        "rm -rf ${NAS_DOCKER_ROOT}/",
+        'rm -rf "$NAS_DOCKER_ROOT/*"',
+        f"rm -rf {docker_root}",
+        f"rm -rf {docker_root}/",
+        f"rm -rf {docker_root}/*",
+        f"rm -rf {docker_root}/mealie/..",
+        "rm -rf /docker",
+        "rm -rf /docker/*",
+        f"cd {vol1} && rm -rf *",
+        "cd $NAS_DOCKER_ROOT && rm -rf .",
+        # Docker volume rm/prune and docker system prune
+        "docker volume rm mealie_data",
+        "docker volume remove mealie_data",
+        "docker volume prune -f",
+        "sudo /usr/local/bin/docker volume prune",
+        "docker system prune",
+        "sudo /usr/local/bin/docker system prune -af --volumes",
+        # Unscoped or volume-destroying docker compose down
+        "docker compose down",
+        "docker-compose down",
+        "sudo /usr/local/bin/docker compose down",
+        f"docker compose -f {docker_root}/mealie/docker-compose.yml down -v",
+        # Stopping or restarting ContainerManager or dockerd
+        "sudo systemctl stop ContainerManager",
+        "sudo systemctl restart pkgctl-ContainerManager",
+        "systemctl stop docker",
+        "systemctl restart docker.service",
+        "systemctl restart dockerd",
+        "sudo synoservice --stop pkgctl-ContainerManager",
+        "sudo synoservice --restart ContainerManager",
+        "synoservice restart docker",
+        "synopkg stop ContainerManager",
+        "synopkg restart ContainerManager",
+        "service docker restart",
+        "pkill -f dockerd",
+        # Host reboot / shutdown / poweroff and synopkg uninstall
+        "reboot",
+        "sudo reboot",
+        "sudo /sbin/shutdown -h now",
+        "/sbin/poweroff",
+        "systemctl reboot",
+        "sudo synopkg uninstall HyperBackup",
+        "bash -c 'sudo reboot'",
+    ]
+    for cmd in blocked_cmds:
+        allowed, reason = nas_cfg.validate_remote_ssh_command(cmd)
+        assert allowed is False, f"Expected destructive SSH command to be blocked: {cmd}"
+        assert "NAS SSH Command Filter Blocked" in reason
+
+    allowed_cmds = [
+        "docker ps && uptime",
+        f"rm -rf {docker_root}/mealie/cache",
+        "rm -rf $NAS_DOCKER_ROOT/mealie/tmp",
+        "rm -rf ${NAS_DOCKER_ROOT}/plex_transcode/*",
+        "rm -rf /tmp/forge_test_cache",
+        f"docker compose -f {docker_root}/mealie/docker-compose.yml down",
+        f"docker-compose -f {docker_root}/mealie/docker-compose.yml down",
+        "docker compose -p mealie down",
+        f"docker compose --project-directory {docker_root}/mealie down",
+        "docker compose down mealie",
+        "docker restart mealie",
+        "docker stop mealie",
+        "docker volume ls",
+        "docker system df",
+        "systemctl status docker",
+        "synopkg status ContainerManager",
+        "last reboot | head -n 5",
+    ]
+    for cmd in allowed_cmds:
+        allowed, reason = nas_cfg.validate_remote_ssh_command(cmd)
+        assert allowed is True, f"Expected safe/scoped SSH command to pass: {cmd} (got: {reason})"
+
+
+def test_run_ssh_blocks_destructive_commands_and_honors_approved_card_bypass(monkeypatch):
+    """Verify run_ssh returns returncode=126 without spawning ssh unless FORGE_APPROVED_CARD_EXECUTION=1."""
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("wt_nas_config_run", repo_root / "tools" / "nas_config.py")
+    nas_cfg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(nas_cfg)
+
+    spawn_calls = []
+
+    def _fake_run(cmd, **kwargs):
+        spawn_calls.append(cmd)
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "approved-ok\n"
+        m.stderr = ""
+        return m
+
+    monkeypatch.setattr(nas_cfg.subprocess, "run", _fake_run)
+    monkeypatch.delenv("FORGE_APPROVED_CARD_EXECUTION", raising=False)
+
+    # 1. Blocked before spawning ssh when FORGE_APPROVED_CARD_EXECUTION is not '1'
+    rc, out, err = nas_cfg.run_ssh("203.0.113.10", "docker system prune -af", user="admin", port="22")
+    assert rc == 126
+    assert out == ""
+    assert "NAS SSH Command Filter Blocked" in err
+    assert spawn_calls == []
+
+    # 2. Safe remote command spawns ssh normally
+    rc_safe, out_safe, err_safe = nas_cfg.run_ssh("203.0.113.10", "docker ps", user="admin", port="22")
+    assert rc_safe == 0
+    assert out_safe == "approved-ok\n"
+    assert err_safe == ""
+    assert len(spawn_calls) == 1
+
+    # 3. FORGE_APPROVED_CARD_EXECUTION='1' cleanly bypasses the filter for approved destructive commands
+    monkeypatch.setenv("FORGE_APPROVED_CARD_EXECUTION", "1")
+    ok_val, reason_val = nas_cfg.validate_remote_ssh_command("docker system prune -af")
+    assert ok_val is True and reason_val == ""
+
+    rc_app, out_app, err_app = nas_cfg.run_ssh("203.0.113.10", "docker system prune -af", user="admin", port="22")
+    assert rc_app == 0
+    assert out_app == "approved-ok\n"
+    assert err_app == ""
+    assert len(spawn_calls) == 2
+
+
+def test_execute_approval_card_passes_forge_approved_card_execution_env(tmp_path, monkeypatch):
+    """Verify execute_approval_card sets FORGE_APPROVED_CARD_EXECUTION=1 so approved Decision Cards pass both gates."""
+    import tools.forge as forge_mod
+
+    monkeypatch.delenv("FORGE_APPROVED_CARD_EXECUTION", raising=False)
+    repo_root = Path(__file__).resolve().parent.parent
+    monkeypatch.setenv("PYTHONPATH", str(repo_root))
+
+    db_path = tmp_path / "forge_approval_env.db"
+    forge_mod.init_forge_db(db_path)
+
+    probe_py = (
+        f"{sys.executable} -c \""
+        "import os, sys; "
+        f"sys.path.insert(0, {str(repo_root)!r}); "
+        "import tools.batch_guard as bg, tools.nas_config as nc; "
+        "flag = os.environ.get('FORGE_APPROVED_CARD_EXECUTION'); "
+        "bg_ok, _ = bg.check_destructive_system_and_exposure_gate('docker system prune -af'); "
+        "nc_ok, _ = nc.validate_remote_ssh_command('docker system prune -af'); "
+        "assert flag == '1' and bg_ok is True and nc_ok is True, (flag, bg_ok, nc_ok); "
+        "print('BOTH_GATES_PASSED')"
+        "\""
+    )
+
+    staged = forge_mod.stage_decision(
+        category="maintenance",
+        title="Approved NAS Prune",
+        summary="Prune unused Docker containers with human approval.",
+        handler_type="shell_cmd",
+        payload={"command": probe_py, "cwd": str(tmp_path)},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    assert staged["ok"] is True
+
+    res = forge_mod.execute_approval_card(
+        staged["decision_id"],
+        user_id=forge_mod.OWNER_USER_ID,
+        db_path=db_path,
+    )
+    assert res["ok"] is True, f"Expected approved Decision Card execution to succeed, got: {res}"
+    assert res["status"] == "approved"
+    assert "BOTH_GATES_PASSED" in res["receipt"]
+    # Ensure approval env var did not leak into the parent process environment
+    assert os.environ.get("FORGE_APPROVED_CARD_EXECUTION") is None
+
+    # Verify docker_compose and file_delete subprocess handlers also receive FORGE_APPROVED_CARD_EXECUTION=1
+    captured_envs = []
+
+    def _capture_subproc_run(cmd, **kwargs):
+        captured_envs.append((cmd, kwargs.get("env") or {}))
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "ok"
+        m.stderr = ""
+        return m
+
+    monkeypatch.setattr(forge_mod.subprocess, "run", _capture_subproc_run)
+
+    d_compose = forge_mod.stage_decision(
+        category="homelab",
+        title="Compose Restart",
+        summary="Bring stack down.",
+        handler_type="docker_compose",
+        payload={"service": "mealie", "action": "down", "compose_dir": str(tmp_path)},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    res_compose = forge_mod.execute_decision(
+        d_compose["decision_id"],
+        user_id=forge_mod.OWNER_USER_ID,
+        db_path=db_path,
+    )
+    assert res_compose["ok"] is True
+    assert captured_envs[-1][1].get("FORGE_APPROVED_CARD_EXECUTION") == "1"
+
+    d_del = forge_mod.stage_decision(
+        category="file_delete",
+        title="Approved Delete",
+        summary="Remove old archive.",
+        handler_type="file_delete",
+        payload={"command": "rm -f /tmp/old_archive.tar", "cwd": str(tmp_path)},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    res_del = forge_mod.execute_approval_card(
+        d_del["decision_id"],
+        user_id=forge_mod.OWNER_USER_ID,
+        db_path=db_path,
+    )
+    assert res_del["ok"] is True
+    assert captured_envs[-1][1].get("FORGE_APPROVED_CARD_EXECUTION") == "1"
+
+
 if __name__ == "__main__":
     unittest.main()
