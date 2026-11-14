@@ -2810,84 +2810,184 @@ def detect_repo_verification_script(worktree_dir: Path | str) -> Optional[str]:
     return None
 
 
+def _resolve_worktree_gitdir(wt: Path) -> Optional[Path]:
+    """Resolve the gitdir Path for a worktree or repository (handles both `.git` dir and `gitdir:` file)."""
+    try:
+        wt_path = Path(wt)
+        git_marker = wt_path / ".git"
+        if git_marker.is_dir():
+            return git_marker.resolve()
+        if git_marker.is_file():
+            raw_git = git_marker.read_text(encoding="utf-8", errors="ignore").strip()
+            if raw_git.startswith("gitdir:"):
+                gitdir_str = raw_git[len("gitdir:") :].strip()
+                gitdir_path = Path(gitdir_str)
+                gitdir_path = (
+                    (wt_path / gitdir_path).resolve()
+                    if not gitdir_path.is_absolute()
+                    else gitdir_path.resolve()
+                )
+                if gitdir_path.is_dir():
+                    return gitdir_path
+    except Exception:
+        pass
+    return None
+
+
+def _record_worktree_base_head(worktree_dir: Path | str) -> Optional[str]:
+    """Record the fresh worktree HEAD SHA into `<gitdir>/forge_base_head` without dirtying git status."""
+    try:
+        wt = Path(worktree_dir)
+        gitdir = _resolve_worktree_gitdir(wt)
+        if not gitdir:
+            return None
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            sha = proc.stdout.strip()
+            (gitdir / "forge_base_head").write_text(f"{sha}\n", encoding="utf-8")
+            return sha
+    except Exception:
+        pass
+    return None
+
+
+def _recover_premature_worktree_commit(worktree_dir: Path | str) -> bool:
+    """If the worker prematurely committed inside `worktree_dir`, soft-reset back to `forge_base_head`."""
+    try:
+        wt = Path(worktree_dir)
+        gitdir = _resolve_worktree_gitdir(wt)
+        if not gitdir:
+            return False
+        base_file = gitdir / "forge_base_head"
+        if not base_file.is_file():
+            return False
+        base_head = base_file.read_text(encoding="utf-8", errors="ignore").strip()
+        if not base_head:
+            return False
+        head_proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if head_proc.returncode != 0:
+            return False
+        cur_head = head_proc.stdout.strip()
+        if not cur_head or cur_head == base_head:
+            return False
+        anc_proc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base_head, "HEAD"],
+            cwd=str(wt),
+            capture_output=True,
+            timeout=10,
+        )
+        if anc_proc.returncode != 0:
+            return False
+        rst_proc = subprocess.run(
+            ["git", "reset", "--soft", base_head],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return rst_proc.returncode == 0
+    except Exception:
+        pass
+    return False
+
+
 def _ensure_worktree_ui_node_modules(worktree_dir: Path | str, repo_dir: Optional[Path | str] = None) -> bool:
-    """Symlink `web/ui/node_modules` into an isolated git worktree from the parent repository when present."""
+    """Symlink `node_modules` into an isolated git worktree from the parent repository when present."""
     try:
         wt = Path(worktree_dir).resolve()
-        wt_ui = wt / "web" / "ui"
-        if not wt_ui.is_dir():
+        if not wt.is_dir():
             return False
-        wt_nm = wt_ui / "node_modules"
-        if wt_nm.exists():
-            return True
 
-        candidates: list[Path] = []
+        cand_repos: list[Path] = []
         if repo_dir:
-            candidates.append(Path(repo_dir).resolve() / "web" / "ui" / "node_modules")
+            cand_repos.append(Path(repo_dir).resolve())
 
         git_marker = wt / ".git"
-        if git_marker.is_file():
+        common_git_dir: Optional[Path] = None
+        gitdir_path = _resolve_worktree_gitdir(wt)
+        if git_marker.is_file() and gitdir_path is not None:
             try:
-                raw_git = git_marker.read_text(encoding="utf-8", errors="ignore").strip()
-                if raw_git.startswith("gitdir:"):
-                    gitdir_str = raw_git[len("gitdir:") :].strip()
-                    gitdir_path = Path(gitdir_str)
-                    if not gitdir_path.is_absolute():
-                        gitdir_path = (wt / gitdir_path).resolve()
-                    else:
-                        gitdir_path = gitdir_path.resolve()
-                    # Typical layout: <main_repo>/.git/worktrees/<wt_name>
-                    if gitdir_path.parent.name == "worktrees" and gitdir_path.parent.parent.name == ".git":
-                        main_repo = gitdir_path.parent.parent.parent
-                        candidates.append(main_repo / "web" / "ui" / "node_modules")
-                    commondir_file = gitdir_path / "commondir"
-                    if commondir_file.is_file():
-                        c_rel = commondir_file.read_text(encoding="utf-8", errors="ignore").strip()
-                        if c_rel:
-                            common_git = (gitdir_path / c_rel).resolve()
-                            if common_git.name == ".git":
-                                candidates.append(common_git.parent / "web" / "ui" / "node_modules")
+                # Typical layout: <main_repo>/.git/worktrees/<wt_name>
+                if gitdir_path.parent.name == "worktrees" and gitdir_path.parent.parent.name == ".git":
+                    main_repo = gitdir_path.parent.parent.parent
+                    cand_repos.append(main_repo)
+                    common_git_dir = gitdir_path.parent.parent
+                commondir_file = gitdir_path / "commondir"
+                if commondir_file.is_file():
+                    c_rel = commondir_file.read_text(encoding="utf-8", errors="ignore").strip()
+                    if c_rel:
+                        common_git = (gitdir_path / c_rel).resolve()
+                        if common_git.name == ".git":
+                            cand_repos.append(common_git.parent)
+                        common_git_dir = common_git
             except Exception:
                 pass
+        elif git_marker.is_dir():
+            common_git_dir = git_marker
 
-        candidates.append(WORKSPACE_DIR / "repos" / "mirrormere" / "web" / "ui" / "node_modules")
-        candidates.append(Path("/workspace/repos/mirrormere/web/ui/node_modules"))
-
-        for cand in candidates:
+        unique_repos: list[Path] = []
+        seen_repos: set[Path] = set()
+        for cr in cand_repos:
             try:
-                if cand.is_dir() and cand.resolve() != wt_nm.resolve():
-                    if wt_nm.is_symlink():
-                        wt_nm.unlink(missing_ok=True)
-                    wt_nm.symlink_to(cand.resolve(), target_is_directory=True)
-                    # Ensure git ignores symlinked node_modules even if .gitignore uses trailing-slash 'node_modules/'
-                    try:
-                        common_git_dir: Optional[Path] = None
-                        if git_marker.is_file():
-                            raw_g = git_marker.read_text(encoding="utf-8", errors="ignore").strip()
-                            if raw_g.startswith("gitdir:"):
-                                g_p = Path(raw_g[len("gitdir:") :].strip())
-                                g_p = (wt / g_p).resolve() if not g_p.is_absolute() else g_p.resolve()
-                                c_f = g_p / "commondir"
-                                if c_f.is_file():
-                                    c_r = c_f.read_text(encoding="utf-8", errors="ignore").strip()
-                                    if c_r:
-                                        common_git_dir = (g_p / c_r).resolve()
-                                elif g_p.parent.name == "worktrees" and g_p.parent.parent.name == ".git":
-                                    common_git_dir = g_p.parent.parent
-                        elif git_marker.is_dir():
-                            common_git_dir = git_marker
-                        if common_git_dir and common_git_dir.is_dir():
-                            excl_file = common_git_dir / "info" / "exclude"
-                            excl_file.parent.mkdir(parents=True, exist_ok=True)
-                            existing_excl = excl_file.read_text(encoding="utf-8", errors="ignore") if excl_file.is_file() else ""
-                            if "node_modules" not in [ln.strip() for ln in existing_excl.splitlines()]:
-                                prefix = "\n" if existing_excl and not existing_excl.endswith("\n") else ""
-                                excl_file.write_text(f"{existing_excl}{prefix}node_modules\n", encoding="utf-8")
-                    except Exception:
-                        pass
-                    return wt_nm.exists()
+                resolved_cr = cr.resolve()
             except Exception:
+                resolved_cr = cr
+            if resolved_cr not in seen_repos:
+                seen_repos.add(resolved_cr)
+                unique_repos.append(resolved_cr)
+
+        any_ready = False
+        exclude_updated = False
+        for rel in (".", "web/ui", "web", "frontend", "ui"):
+            wt_sub = wt if rel == "." else (wt / rel)
+            if not wt_sub.is_dir():
                 continue
+            wt_nm = wt_sub / "node_modules"
+            if wt_nm.exists():
+                any_ready = True
+                continue
+
+            sub_cands = [cr / "node_modules" if rel == "." else (cr / rel / "node_modules") for cr in unique_repos]
+            if rel == "web/ui":
+                sub_cands.append(WORKSPACE_DIR / "repos" / "mirrormere" / "web" / "ui" / "node_modules")
+                sub_cands.append(Path("/workspace/repos/mirrormere/web/ui/node_modules"))
+
+            for cand in sub_cands:
+                try:
+                    if cand.is_dir() and cand.resolve() != wt_nm.resolve():
+                        if wt_nm.is_symlink():
+                            wt_nm.unlink(missing_ok=True)
+                        wt_nm.symlink_to(cand.resolve(), target_is_directory=True)
+                        # Ensure git ignores symlinked node_modules even if .gitignore uses trailing-slash 'node_modules/'
+                        if not exclude_updated and common_git_dir and common_git_dir.is_dir():
+                            try:
+                                excl_file = common_git_dir / "info" / "exclude"
+                                excl_file.parent.mkdir(parents=True, exist_ok=True)
+                                existing_excl = excl_file.read_text(encoding="utf-8", errors="ignore") if excl_file.is_file() else ""
+                                if "node_modules" not in [ln.strip() for ln in existing_excl.splitlines()]:
+                                    prefix = "\n" if existing_excl and not existing_excl.endswith("\n") else ""
+                                    excl_file.write_text(f"{existing_excl}{prefix}node_modules\n", encoding="utf-8")
+                                exclude_updated = True
+                            except Exception:
+                                pass
+                        if wt_nm.exists():
+                            any_ready = True
+                            break
+                except Exception:
+                    continue
+        return any_ready
     except Exception:
         pass
     return False
@@ -5226,6 +5326,173 @@ def grade_chunk_diff_blind(
     return True, "Diff grading passed clean."
 
 
+def preflight_check_verification_cmd(
+    verification_cmd: Optional[str],
+    worktree_dir: Path | str,
+    target_files: Optional[list[str]] = None,
+) -> tuple[bool, str]:
+    """Scan `verification_cmd` for explicit python/sh/bash `.py`/`.sh` script args and fail fast if missing."""
+    cmd = (verification_cmd or "").strip()
+    if not cmd:
+        return True, ""
+
+    wt = Path(worktree_dir).resolve()
+    target_norm: set[str] = set()
+    target_resolved: set[Path] = set()
+    for tf in (target_files or []):
+        nf = str(tf or "").strip().replace("\\", "/")
+        while nf.startswith("./"):
+            nf = nf[2:]
+        if nf:
+            target_norm.add(nf)
+            try:
+                target_resolved.add((wt / nf).resolve())
+            except Exception:
+                pass
+
+    import shlex
+
+    try:
+        lexer = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except Exception:
+        tokens = cmd.split()
+
+    separators = {";", "&&", "||", "&", "|", "\n", "(", ")"}
+    cwd_stack: list[Path] = [wt]
+    idx = 0
+    n = len(tokens)
+
+    while idx < n:
+        tok = tokens[idx]
+        if tok == "(":
+            cwd_stack.append(cwd_stack[-1])
+            idx += 1
+            continue
+        if tok == ")":
+            if len(cwd_stack) > 1:
+                cwd_stack.pop()
+            idx += 1
+            continue
+        if tok in separators:
+            idx += 1
+            continue
+
+        seg: list[str] = []
+        while idx < n and tokens[idx] not in separators:
+            seg.append(tokens[idx])
+            idx += 1
+
+        if not seg:
+            continue
+
+        pos = 0
+        while pos < len(seg):
+            t = seg[pos]
+            if Path(t).name == "env":
+                pos += 1
+                continue
+            if "=" in t and not t.startswith("-") and not t.startswith("/"):
+                pos += 1
+                continue
+            break
+        if pos >= len(seg):
+            continue
+
+        cmd_tok = seg[pos]
+        cmd_base = Path(cmd_tok).name.lower()
+
+        if cmd_base == "cd" and pos + 1 < len(seg):
+            dest = seg[pos + 1]
+            if not any(ch in dest for ch in ("$", "*", "?", "{", "~", "`")):
+                try:
+                    new_cwd = (cwd_stack[-1] / dest).resolve() if not Path(dest).is_absolute() else Path(dest).resolve()
+                    if new_cwd.is_dir():
+                        cwd_stack[-1] = new_cwd
+                except Exception:
+                    pass
+            continue
+
+        is_py = cmd_base in ("python", "python3") or cmd_base.startswith("python3.")
+        is_sh = cmd_base in ("sh", "bash")
+        if not (is_py or is_sh):
+            continue
+
+        skip_next = False
+        for arg in seg[pos + 1 :]:
+            if not arg:
+                continue
+            if skip_next:
+                skip_next = False
+                continue
+            if arg.startswith("-") or (is_sh and arg == "+o"):
+                if arg == "--":
+                    continue
+                if arg in ("-c", "-m", "--command") or arg.startswith(("-c", "-m")):
+                    break
+                if not arg.startswith("--") and not arg.startswith("+"):
+                    flags = arg[1:]
+                    if "c" in flags or (is_py and "m" in flags):
+                        break
+                if (is_py and arg in ("-W", "-X", "--check-hash-based-pycs")) or (is_sh and arg in ("-o", "+o")):
+                    skip_next = True
+                continue
+
+            if arg.lower().endswith((".py", ".sh")):
+                if any(ch in arg for ch in ("$", "*", "?", "{", "~", "`")):
+                    break
+                arg_norm = arg.replace("\\", "/")
+                while arg_norm.startswith("./"):
+                    arg_norm = arg_norm[2:]
+
+                cur_cwd = cwd_stack[-1]
+                exists_on_disk = False
+                for cp in (Path(arg), wt / arg, cur_cwd / arg):
+                    try:
+                        if cp.exists():
+                            exists_on_disk = True
+                            break
+                    except Exception:
+                        pass
+
+                in_targets = arg_norm in target_norm
+                if not in_targets:
+                    try:
+                        resolved_arg = (cur_cwd / arg).resolve() if not Path(arg).is_absolute() else Path(arg).resolve()
+                        if resolved_arg in target_resolved:
+                            in_targets = True
+                        else:
+                            rel_from_wt = resolved_arg.relative_to(wt).as_posix()
+                            if rel_from_wt in target_norm:
+                                in_targets = True
+                    except Exception:
+                        pass
+
+                if not exists_on_disk and not in_targets:
+                    return False, f"[NON_RETRYABLE_SPEC_ERROR] Verification script not found: {arg}"
+            break
+
+    return True, ""
+
+
+def is_non_retryable_chunk_failure(
+    err_out: str,
+    worker_exc: Optional[Exception] = None,
+) -> tuple[bool, str]:
+    """Return (True, reason) when a chunk failure is deterministic and should trip the retry circuit breaker."""
+    msg = err_out or ""
+    if "[NON_RETRYABLE_SPEC_ERROR]" in msg:
+        return True, "non-retryable spec error in verification command"
+    if "Verification command timed out after" in msg:
+        return True, "verification command timed out"
+    if "Worktree directory does not exist:" in msg:
+        return True, "worktree directory missing"
+    if "Verification command failed (exit 127):" in msg:
+        return True, "verification command binary or script not found (exit 127)"
+    return False, ""
+
+
 def verify_chunk_worktree(
     worktree_dir: Path | str,
     verification_cmd: Optional[str] = None,
@@ -5243,6 +5510,10 @@ def verify_chunk_worktree(
     if not wt.exists():
         return False, "", f"Worktree directory does not exist: {wt}"
 
+    pf_ok, pf_err = preflight_check_verification_cmd(verification_cmd, wt, target_files=target_files)
+    if not pf_ok:
+        return False, "", pf_err
+
     st_proc = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=str(wt),
@@ -5251,6 +5522,16 @@ def verify_chunk_worktree(
         timeout=15,
     )
     changed = [line[3:].strip().strip('"') for line in st_proc.stdout.splitlines() if len(line) > 3]
+
+    if not changed and _recover_premature_worktree_commit(wt):
+        st_proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        changed = [line[3:].strip().strip('"') for line in st_proc.stdout.splitlines() if len(line) > 3]
 
     if require_changes and not changed:
         return False, "", "Worker produced zero file changes in worktree (git status --porcelain is empty)."
@@ -7276,6 +7557,7 @@ class ForgeSupervisor:
                     if rb_init.returncode != 0:
                         subprocess.run(["git", "rebase", "--abort"], cwd=str(wt_dir), capture_output=True, timeout=10)
 
+                _record_worktree_base_head(wt_dir)
                 _ensure_worktree_ui_node_modules(wt_dir, repo_dir=repo_dir)
             finally:
                 _release_file_lock(git_lk)
@@ -7807,6 +8089,31 @@ class ForgeSupervisor:
             else:
                 with self._state_lock, get_db_connection(self.db_path) as conn:
                     conn.execute("UPDATE forge_chunks SET last_error = ? WHERE id = ?", (err_out, chunk_id))
+                non_retryable, nr_reason = is_non_retryable_chunk_failure(err_out, worker_exc=worker_exc)
+                if (
+                    not non_retryable
+                    and worker_exc is None
+                    and "Worker produced zero file changes in worktree" in (err_out or "")
+                ):
+                    try:
+                        baseline_ok, _, _ = verify_chunk_worktree(
+                            wt_dir,
+                            chunk_row["verification_cmd"],
+                            prohibited_files=prohibited,
+                            target_files=target_files,
+                            require_changes=False,
+                        )
+                        if baseline_ok:
+                            non_retryable = True
+                            nr_reason = "worker exited cleanly with zero worktree changes while baseline verification already passes"
+                    except Exception:
+                        pass
+                if non_retryable and attempt < max_attempts:
+                    _log_build(
+                        f"[Attempt {attempt}/{max_attempts}] Non-retryable circuit breaker tripped for chunk {chunk_id}: "
+                        f"{nr_reason}. Stopping retries."
+                    )
+                    break
 
         # Exhausted all attempts
         _log_build(f"Chunk {chunk_id} failed after exhausting all {max_attempts} attempts.")

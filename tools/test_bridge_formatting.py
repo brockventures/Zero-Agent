@@ -1136,6 +1136,134 @@ class TestBridgeFormatting(unittest.TestCase):
         )
         self.assertEqual(fb3, "gemini-4-carbon-high")
 
+    def test_forge_circuit_breakers(self):
+        """Verify preflight_check_verification_cmd, is_non_retryable_chunk_failure, worktree recovery, and node_modules symlinking."""
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        from tools.forge import (
+            _ensure_worktree_ui_node_modules,
+            _record_worktree_base_head,
+            _recover_premature_worktree_commit,
+            _resolve_worktree_gitdir,
+            is_non_retryable_chunk_failure,
+            preflight_check_verification_cmd,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            wt = tmp_path / "wt"
+            wt.mkdir()
+            (wt / "existing.py").write_text("print('ok')\n", encoding="utf-8")
+
+            # 1. preflight_check_verification_cmd
+            ok, err = preflight_check_verification_cmd("python3 tools/missing_script.py", wt)
+            self.assertFalse(ok)
+            self.assertIn("[NON_RETRYABLE_SPEC_ERROR]", err)
+            self.assertIn("tools/missing_script.py", err)
+
+            ok_sh, err_sh = preflight_check_verification_cmd("bash scripts/nope.sh --flag", wt)
+            self.assertFalse(ok_sh)
+            self.assertIn("[NON_RETRYABLE_SPEC_ERROR]", err_sh)
+
+            ok_target, _ = preflight_check_verification_cmd(
+                "python3 tools/missing_script.py",
+                wt,
+                target_files=["tools/missing_script.py"],
+            )
+            self.assertTrue(ok_target)
+
+            ok_exists, _ = preflight_check_verification_cmd("python3 existing.py", wt)
+            self.assertTrue(ok_exists)
+
+            ok_inline, _ = preflight_check_verification_cmd(
+                "python3 -c \"print('missing.py')\" && python3 -m py_compile existing.py && sh -ec 'echo hi.sh'",
+                wt,
+            )
+            self.assertTrue(ok_inline)
+
+            # 2. is_non_retryable_chunk_failure
+            for msg in (
+                "Verification command timed out after 300s:\n...",
+                "[NON_RETRYABLE_SPEC_ERROR] Verification script not found: foo.py",
+                "Worktree directory does not exist: /tmp/forge-wt-missing",
+                "Verification command failed (exit 127):\n/bin/sh: 1: missing: not found",
+            ):
+                tripped, reason = is_non_retryable_chunk_failure(msg)
+                self.assertTrue(tripped, f"Expected circuit breaker to trip for: {msg}")
+                self.assertTrue(bool(reason))
+
+            tripped_norm, reason_norm = is_non_retryable_chunk_failure(
+                "Verification command failed (exit 1):\nAssertionError: 1 != 2"
+            )
+            self.assertFalse(tripped_norm)
+            self.assertEqual(reason_norm, "")
+
+            # 3. _record_worktree_base_head & _recover_premature_worktree_commit + node_modules symlinking
+            main_repo = tmp_path / "repo"
+            main_repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(main_repo), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(main_repo), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(main_repo), check=True, capture_output=True)
+            (main_repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+            (main_repo / "node_modules" / "pkg").mkdir(parents=True)
+            (main_repo / "frontend" / "node_modules" / "ui-pkg").mkdir(parents=True)
+            (main_repo / "frontend" / "index.ts").write_text("export const a = 1;\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py", "frontend/index.ts"], cwd=str(main_repo), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(main_repo), check=True, capture_output=True)
+
+            wt_git = tmp_path / "wt_git"
+            subprocess.run(
+                ["git", "worktree", "add", "-b", "forge-test-wt", str(wt_git), "HEAD"],
+                cwd=str(main_repo),
+                check=True,
+                capture_output=True,
+            )
+
+            self.assertIsNotNone(_resolve_worktree_gitdir(wt_git))
+            self.assertTrue(_ensure_worktree_ui_node_modules(wt_git))
+            self.assertTrue((wt_git / "node_modules").is_symlink())
+            self.assertTrue((wt_git / "frontend" / "node_modules").is_symlink())
+
+            base_sha = _record_worktree_base_head(wt_git)
+            self.assertTrue(bool(base_sha))
+            st_clean = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(wt_git),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(st_clean.stdout.strip(), "")
+
+            # No premature commit yet -> returns False
+            self.assertFalse(_recover_premature_worktree_commit(wt_git))
+
+            # Simulate worker prematurely committing inside worktree
+            (wt_git / "app.py").write_text("x = 2\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=str(wt_git), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "premature worker commit"], cwd=str(wt_git), check=True, capture_output=True)
+
+            self.assertTrue(_recover_premature_worktree_commit(wt_git))
+            head_after = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(wt_git),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(head_after, base_sha)
+
+            st_recovered = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(wt_git),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("app.py", st_recovered.stdout)
+            self.assertFalse(_recover_premature_worktree_commit(wt_git))
+
 
 class TestBridgeTurnHoldRace(unittest.IsolatedAsyncioTestCase):
     async def test_result_event_does_not_hold_stream_on_unflushed_tool_output_pending(self):
