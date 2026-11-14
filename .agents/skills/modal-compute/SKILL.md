@@ -1,7 +1,7 @@
 ---
 name: modal-compute
 description: >-
-  Use this skill whenever running or orchestrating heavy machine learning model training, multi-fold cross-validation sweeps, hyperparameter optimization (Nelder-Mead, Powell, Optuna), large cohort backtests, or compute-intensive workloads. Offloads heavy CPU/RAM tasks from Host 2 NAS to Modal serverless cloud compute (8–16 vCPUs, 32–64 GB RAM), protecting the NAS hardware from memory exhaustion and watchdog panics.
+  Use this skill whenever running or orchestrating heavy compilation (Android/Wear OS Gradle + Kotlin/DEX APK builds, Go static analysis, headless WebGL/3D renders, CAD mesh slicing), machine learning model training, multi-fold cross-validation sweeps, hyperparameter optimization, or compute-intensive workloads. Offloads heavy CPU/RAM tasks from Host 2 NAS to Modal serverless cloud compute (8–16 vCPUs, 32–64 GB RAM), protecting the NAS hardware from memory exhaustion and watchdog panics.
 ---
 
 # ☁️ Modal Serverless Cloud Compute Skill
@@ -13,11 +13,12 @@ The **Modal-Compute** skill governs offloading heavy computation from Host 2 (`<
 ## 🎯 When to Activate This Skill
 
 Activate this skill whenever:
+- **Heavy Software & Binary Compilation:** Compiling Android or Wear OS APKs via Gradle/Kotlin/D8 DEX (`gradlew assemble*`), running whole-program Go SSA static analyzers (`golangci-lint`, `deadcode`, `oapi-codegen` via `tools/modal_verify.py`), rendering headless Chromium WebGL/Three.js scenes, or slicing complex 3D CAD meshes.
 - Training, tuning, or fitting machine learning models in `big-projections` (`HistGradientBoosting`, `RandomForest`, `Ridge`, `CatBoost`, `LightGBM`).
 - Running multi-fold cross-validation suites (`KFold(n_splits=5)`) across multiple statistical targets (`PA`, `HR`, `ISO`, `BABIP`, `K%`, `BB%`, `SB`, `ERA`, `WHIP`).
 - Executing parameter optimization sweeps (>15 parameter combinations, Nelder-Mead, Powell, or grid search) across historical player cohorts (2021–2026).
 - Generating large transition datasets or multi-year feature matrices that would consume $>1\text{ GB}$ of RAM.
-- Any computational batch expected to take $>2\text{ minutes}$ or saturate $>2$ CPU cores.
+- Any compile, render, or computational batch expected to take $>60\text{ seconds}$, spawn JVM/compiler daemons, or saturate $>2$ CPU cores.
 
 ---
 
