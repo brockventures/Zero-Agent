@@ -5777,6 +5777,12 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
         Path("/baseball/big-projections"),
     ):
         if (repo_cand / ".git").exists():
+            wt_meta_root = repo_cand / ".git" / "worktrees"
+            if wt_meta_root.is_dir():
+                for lock_file in wt_meta_root.glob("*/locked"):
+                    wt_meta_name = lock_file.parent.name
+                    if not any(wt_meta_name.startswith(f"forge-wt-{bid}-") for bid in active_build_ids):
+                        lock_file.unlink(missing_ok=True)
             subprocess.run(["git", "worktree", "prune"], cwd=str(repo_cand), capture_output=True, timeout=10)
 
     reset_chunks = 0
@@ -6717,6 +6723,10 @@ class ForgeSupervisor:
                         subprocess.run(["git", "branch", "-f", staging_ref, latest_def_ref], cwd=str(repo_dir), capture_output=True, timeout=10)
 
                 shutil.rmtree(wt_dir, ignore_errors=True)
+                wt_lock_marker = repo_dir / ".git" / "worktrees" / wt_dir.name / "locked"
+                if wt_lock_marker.exists():
+                    wt_lock_marker.unlink(missing_ok=True)
+                subprocess.run(["git", "worktree", "unlock", str(wt_dir)], cwd=str(repo_dir), capture_output=True, timeout=10)
                 subprocess.run(["git", "worktree", "prune"], cwd=str(repo_dir), capture_output=True, timeout=10)
 
                 br_exists = subprocess.run(
@@ -6728,7 +6738,7 @@ class ForgeSupervisor:
 
                 if ch_target_branch and br_exists:
                     wt_res = subprocess.run(
-                        ["git", "worktree", "add", "--force", str(wt_dir), branch_name],
+                        ["git", "worktree", "add", "--force", "--force", str(wt_dir), branch_name],
                         cwd=str(repo_dir),
                         capture_output=True,
                         text=True,
@@ -6736,19 +6746,23 @@ class ForgeSupervisor:
                     )
                 else:
                     wt_res = subprocess.run(
-                        ["git", "worktree", "add", "--force", "-B", branch_name, str(wt_dir), base_ref],
+                        ["git", "worktree", "add", "--force", "--force", "-B", branch_name, str(wt_dir), base_ref],
                         cwd=str(repo_dir),
                         capture_output=True,
                         text=True,
                         timeout=30,
                     )
                 if wt_res.returncode != 0:
-                    subprocess.run(
-                        ["git", "worktree", "add", "--force", "-B", branch_name, str(wt_dir), "HEAD"],
+                    wt_res = subprocess.run(
+                        ["git", "worktree", "add", "--force", "--force", "-B", branch_name, str(wt_dir), "HEAD"],
                         cwd=str(repo_dir),
                         capture_output=True,
                         text=True,
                         timeout=30,
+                    )
+                if not wt_dir.exists():
+                    raise RuntimeError(
+                        f"git worktree add failed for {wt_dir} (rc={wt_res.returncode}): {(wt_res.stderr or '').strip()}"
                     )
 
                 # Clean untracked files in worktree immediately so no uncommitted test files bleed
