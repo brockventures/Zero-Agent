@@ -1981,6 +1981,117 @@ def test_approved_card_execution_passthrough_and_forge_worker_non_bypass(tmp_pat
         assert ok_sec_write is True, f"Expected approved write_file on /secrets/env.json to pass: {reason_sec_write}"
 
 
+def test_vulcan_in_flight_turn_file_selection_and_turn_anchor_offload_reset(tmp_path, monkeypatch):
+    import importlib
+    import batch_guard
+
+    try:
+        # 1. AGENT_ROLE=vulcan selects vulcan_in_flight_turn.json
+        with monkeypatch.context() as mp:
+            mp.setenv("AGENT_ROLE", "vulcan")
+            mp.delenv("DISCORD_CHANNEL_ID", raising=False)
+            importlib.reload(batch_guard)
+            assert batch_guard._IS_VULCAN_ENV is True
+            assert batch_guard.IN_FLIGHT_TURN_FILE == "/workspace/data/vulcan_in_flight_turn.json"
+
+        # 2. DISCORD_CHANNEL_ID=1562899941595160657 (#forge) selects vulcan_in_flight_turn.json
+        with monkeypatch.context() as mp:
+            mp.delenv("AGENT_ROLE", raising=False)
+            mp.setenv("DISCORD_CHANNEL_ID", FORGE_CHANNEL_ID_STR)
+            importlib.reload(batch_guard)
+            assert batch_guard._IS_VULCAN_ENV is True
+            assert batch_guard.IN_FLIGHT_TURN_FILE == "/workspace/data/vulcan_in_flight_turn.json"
+
+        # 3. Non-Vulcan environment selects standard in_flight_turn.json
+        with monkeypatch.context() as mp:
+            mp.delenv("AGENT_ROLE", raising=False)
+            mp.setenv("DISCORD_CHANNEL_ID", "1542081375287640084")
+            importlib.reload(batch_guard)
+            assert batch_guard._IS_VULCAN_ENV is False
+            assert batch_guard.IN_FLIGHT_TURN_FILE == "/workspace/data/in_flight_turn.json"
+
+        # 4. Turn-boundary change in vulcan_in_flight_turn.json resets offload_dispatched
+        vulcan_in_flight = tmp_path / "vulcan_in_flight_turn.json"
+        state_file = str(tmp_path / "bg_state_vulcan.json")
+        base_now = 1_800_400_000.0
+
+        with monkeypatch.context() as mp:
+            mp.setenv("AGENT_ROLE", "vulcan")
+            mp.setenv("DISCORD_CHANNEL_ID", FORGE_CHANNEL_ID_STR)
+            mp.setattr(batch_guard, "IN_FLIGHT_TURN_FILE", str(vulcan_in_flight))
+
+            vulcan_in_flight.write_text(
+                json.dumps(
+                    {
+                        FORGE_CHANNEL_ID_STR: {
+                            "channel_id": int(FORGE_CHANNEL_ID_STR),
+                            "conv_id": "conv-vulcan-1",
+                            "status_msg_id": 2001,
+                            "attempts": 1,
+                            "prompt": "First Vulcan Discord message",
+                            "ts": base_now,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            anchor_t1 = batch_guard._get_current_turn_Step_anchor(agy_pid=99999)
+            ok_job, reason_job = batch_guard.check_tool_use(
+                "run_command",
+                {"CommandLine": 'python3 /workspace/tools/forge.py job start --name "Vulcan Job" --command "echo ok"'},
+                state_file=state_file,
+                now=base_now,
+                agy_pid=99999,
+            )
+            assert ok_job is True, f"Expected job start to succeed, got: {reason_job}"
+
+            ok_locked, reason_locked = batch_guard.check_tool_use(
+                "edit_file",
+                {"Path": "/workspace/tools/alpha.py"},
+                state_file=state_file,
+                now=base_now + 2.0,
+                agy_pid=99999,
+            )
+            assert ok_locked is False
+            assert "FORGE Post-Offload Turn Lock Triggered" in reason_locked
+
+            # New Discord message updates vulcan_in_flight_turn.json -> turn_anchor changes & offload_dispatched resets
+            vulcan_in_flight.write_text(
+                json.dumps(
+                    {
+                        FORGE_CHANNEL_ID_STR: {
+                            "channel_id": int(FORGE_CHANNEL_ID_STR),
+                            "conv_id": "conv-vulcan-1",
+                            "status_msg_id": 2002,
+                            "attempts": 1,
+                            "prompt": "Second Vulcan Discord message",
+                            "ts": base_now + 5.0,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            anchor_t2 = batch_guard._get_current_turn_Step_anchor(agy_pid=99999)
+            assert anchor_t2 != anchor_t1
+
+            ok_t2, reason_t2 = batch_guard.check_tool_use(
+                "edit_file",
+                {"Path": "/workspace/tools/alpha.py"},
+                state_file=state_file,
+                now=base_now + 5.0,
+                agy_pid=99999,
+            )
+            assert ok_t2 is True, f"Expected new Vulcan turn to reset offload_dispatched, got: {reason_t2}"
+            sess_id = ":".join(str(anchor_t2).split(":")[:2])
+            st_t2 = batch_guard.load_state(state_file, session_id=sess_id)
+            assert st_t2.get("offload_dispatched") is False
+    finally:
+        importlib.reload(batch_guard)
+
+
+
 
 
 

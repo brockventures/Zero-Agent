@@ -24,7 +24,17 @@ import tempfile
 import time
 
 STATE_FILE = "/tmp/batch_guard_state.json" if os.name != "nt" else os.path.join(tempfile.gettempdir(), "batch_guard_state.json")
-IN_FLIGHT_TURN_FILE = "/workspace/data/in_flight_turn.json"
+FORGE_CHANNEL_ID_STR = "1562899941595160657"
+ZERO_CHAT_CHANNEL_ID_STR = "1542081375287640084"
+_IS_VULCAN_ENV = (
+    os.environ.get("AGENT_ROLE", "").strip().lower() == "vulcan"
+    or os.environ.get("DISCORD_CHANNEL_ID", "").strip() == FORGE_CHANNEL_ID_STR
+)
+IN_FLIGHT_TURN_FILE = (
+    "/workspace/data/vulcan_in_flight_turn.json"
+    if _IS_VULCAN_ENV
+    else "/workspace/data/in_flight_turn.json"
+)
 MAX_CONSECUTIVE_SHELL_INSPECTIONS = 3
 MAX_CONSECUTIVE_INLINE_PYTHON = 2
 MAX_CONSECUTIVE_SAME_FILE_VIEWS = 2
@@ -46,8 +56,6 @@ TURN_STATE_EXPIRY_SECONDS = 900.0
 INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S = 6
 INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT = 8
 INTERACTIVE_DIAG_TIME_WINDOW_SECONDS = 75.0
-FORGE_CHANNEL_ID_STR = "1562899941595160657"
-ZERO_CHAT_CHANNEL_ID_STR = "1542081375287640084"
 CRAB_CAVERN_CHANNEL_IDS = {
     1534436119888793750,  # #the-banana-stand
     1534452820995080192,  # #lounge
@@ -185,9 +193,11 @@ def _get_agy_ancestor_pid() -> int:
 
 def _get_current_turn_Step_anchor(
     agy_pid: int | None = None,
-    in_flight_file: str = IN_FLIGHT_TURN_FILE,
+    in_flight_file: str | None = None,
 ) -> str:
     """Return a deterministic per-turn anchor combining agy_pid, in_flight_turn metadata, and transcript USER_INPUT step."""
+    if in_flight_file is None:
+        in_flight_file = IN_FLIGHT_TURN_FILE
     if agy_pid is None:
         agy_pid = _get_agy_ancestor_pid()
     cid = ""
@@ -312,8 +322,10 @@ def _has_conv_id(turn_anchor: str, in_flight_file: str | None = None, agy_pid: i
     return False
 
 
-def _get_in_flight_channel_id(in_flight_file: str = IN_FLIGHT_TURN_FILE, agy_pid: int | None = None) -> int | str | None:
+def _get_in_flight_channel_id(in_flight_file: str | None = None, agy_pid: int | None = None) -> int | str | None:
     """Extract active channel ID from in_flight_turn.json if present."""
+    if in_flight_file is None:
+        in_flight_file = IN_FLIGHT_TURN_FILE
     if not in_flight_file or not os.path.exists(in_flight_file):
         return None
     try:
@@ -406,10 +418,12 @@ def check_crab_cavern_airgap_guard(
     name: str,
     args: dict,
     cwd: str = "/workspace",
-    in_flight_file: str = IN_FLIGHT_TURN_FILE,
+    in_flight_file: str | None = None,
     agy_pid: int | None = None,
 ) -> tuple[bool, str]:
     """Block private homelab NAS / SSH / secrets access during Crab Cavern turns and instruct staging a #zero-chat Decision Card."""
+    if in_flight_file is None:
+        in_flight_file = IN_FLIGHT_TURN_FILE
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True, ""
     norm_cwd = _norm_posix(cwd or "/workspace", "/")
@@ -508,7 +522,7 @@ def check_interactive_investigation_gate(
     state_file: str = STATE_FILE,
     cwd: str = "/workspace",
     now: float = 0.0,
-    in_flight_file: str = IN_FLIGHT_TURN_FILE,
+    in_flight_file: str | None = None,
     agy_pid: int | None = None,
 ) -> tuple[bool, str]:
     """Check deterministic tool-step/elapsed-time gate for interactive Discord bridge turns.
@@ -517,6 +531,8 @@ def check_interactive_investigation_gate(
     must wrap up initial verified findings, hand heavy probes to forge.py job start, and
     perform an explicit contradiction check against the first reply when woken on completion.
     """
+    if in_flight_file is None:
+        in_flight_file = IN_FLIGHT_TURN_FILE
     if now <= 0.0:
         now = time.time()
 
@@ -3003,8 +3019,8 @@ def main():
         # 2. Tool Batching Guard (reset turn state automatically when a new agy process/turn starts)
         try:
             agy_pid = _get_agy_ancestor_pid()
-            turn_anchor = _get_current_turn_Step_anchor(agy_pid)
-            has_conv = _has_conv_id(turn_anchor, agy_pid=agy_pid)
+            turn_anchor = _get_current_turn_Step_anchor(agy_pid, in_flight_file=IN_FLIGHT_TURN_FILE)
+            has_conv = _has_conv_id(turn_anchor, in_flight_file=IN_FLIGHT_TURN_FILE, agy_pid=agy_pid)
             sess_id = ":".join(str(turn_anchor).split(":")[:2]) if has_conv else str(turn_anchor)
             st = load_state(STATE_FILE, session_id=sess_id)
             # Reset turn state when a new user turn / prompt arrives (turn_anchor changes)
@@ -3026,7 +3042,10 @@ def main():
             return
         try:
             st_after = load_state(STATE_FILE, session_id=sess_id)
-            st_after["agy_ppid"] = _get_current_turn_Step_anchor(_get_agy_ancestor_pid())
+            st_after["agy_ppid"] = _get_current_turn_Step_anchor(
+                _get_agy_ancestor_pid(),
+                in_flight_file=IN_FLIGHT_TURN_FILE,
+            )
             st_after["_session_id"] = sess_id
             save_state(st_after, STATE_FILE, session_id=sess_id)
         except Exception:
