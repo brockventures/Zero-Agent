@@ -97,7 +97,7 @@ BASEBALL_CHANNEL_ID = 1548196929308065893
 OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
 
 DEFAULT_WORKER_MODEL = "gemini-4-hydrogen-high"
-ESCALATION_WORKER_MODEL = "gemini-4-argon-medium"
+ESCALATION_WORKER_MODEL = "gemini-4-hydrogen-xhigh"
 FINAL_ESCALATION_WORKER_MODEL = "gemini-4-carbon-high"
 DEFAULT_LEASE_TTL_SECONDS = 300.0
 
@@ -106,8 +106,8 @@ WORKER_MODEL_FALLBACK_MAP: dict[str, str] = {
     "gemini-3.8-flash-medium": "gemini-4-hydrogen-high",
     "gemini-3.8-flash-low": "gemini-4-hydrogen-high",
     "gemini-3.8-flash": "gemini-4-hydrogen-high",
-    "gemini-4-hydrogen-high": "gemini-4-argon-low",
-    "gemini-4-hydrogen-xhigh": "gemini-4-argon-low",
+    "gemini-4-hydrogen-high": "gemini-4-hydrogen-xhigh",
+    "gemini-4-hydrogen-xhigh": "gemini-4-argon-medium",
     "gemini-4-argon-low": "gemini-4-argon-medium",
     "gemini-4-argon-medium": "gemini-4-carbon-high",
     "gemini-4-carbon-high": "gemini-4-argon-medium",
@@ -119,7 +119,7 @@ def resolve_worker_model_for_attempt(
     attempt: int = 1,
     max_attempts: int = 3,
 ) -> str:
-    """Resolve the tiered worker model ladder (Attempt 1: Hydrogen High -> Attempt 2: Argon Med -> Attempt 3: Carbon High)."""
+    """Resolve the tiered worker model ladder (Attempt 1: Hydrogen High -> Attempt 2: Hydrogen XHigh -> Attempt 3: Carbon High)."""
     clean_base = (base_model or "").strip() or DEFAULT_WORKER_MODEL
     if attempt >= max_attempts:
         return FINAL_ESCALATION_WORKER_MODEL
