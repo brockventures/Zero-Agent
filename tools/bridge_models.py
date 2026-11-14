@@ -281,20 +281,23 @@ CHANNEL_MODEL_OVERRIDES: dict[int, str] = {
     1555973316752449576: "gemini-4-argon-high",     # #3d-print
     # Tier 2: Gemini 4 Argon (Medium) — Infrastructure, Ops, Quant, Finance & Engineering
     1548196929308065893: "gemini-4-argon-medium",   # #baseball
-    1544955532765560924: "gemini-4-argon-medium",   # #finances
-    1550577910757458015: "gemini-4-argon-medium",   # #vault
     1544953279664889888: "gemini-4-argon-medium",   # #zero-ops
-    1562899941595160657: "gemini-4-argon-medium",   # #forge
-    1544953275877556334: "gemini-4-argon-medium",   # #home-assistant
-    1544955535722545253: "gemini-4-argon-medium",   # #homelab
     1548196930788524094: "gemini-4-argon-medium",   # #projects
-    1558202642663211169: "gemini-4-argon-medium",   # #agora
     1551465050072416286: "gemini-4-argon-medium",   # #side-project
     1561509863018856468: "gemini-4-argon-medium",   # #gotchi
     # Tier 3A: Gemini 4 Argon (Low) — Primary Conversational Flagships
     1542081375287640084: "gemini-4-argon-low",      # #zero-chat
     1534452820995080192: "gemini-4-argon-low",      # #lounge
-    # Tier 3B: Gemini 4 Hydrogen (High) — Utility, Household & Coordination Channels
+    1562544598423965856: "gemini-4-argon-low",      # #r-residentagents
+    # Tier 3B: Gemini 4 Hydrogen (High) — Structured Ops, Utility, Household & Coordination Channels
+    1544955532765560924: "gemini-4-hydrogen-high",  # #finances
+    1550577910757458015: "gemini-4-hydrogen-high",  # #vault
+    1562899941595160657: "gemini-4-hydrogen-high",  # #forge
+    1544953275877556334: "gemini-4-hydrogen-high",  # #home-assistant
+    1544955535722545253: "gemini-4-hydrogen-high",  # #homelab
+    1558202642663211169: "gemini-4-hydrogen-high",  # #agora
+    1552732003076669460: "gemini-4-hydrogen-high",  # #mirrormere
+    1549555629222404096: "gemini-4-hydrogen-high",  # #debug-huddle
     1562246590943461429: "gemini-4-hydrogen-high",  # #gotchi-chat
     1550577908811178095: "gemini-4-hydrogen-high",  # #brock-house
     1544955538033348618: "gemini-4-hydrogen-high",  # #shopping
@@ -324,22 +327,31 @@ def get_channel_model_override(
             return "gemini-4-argon-high"
         if cname in (
             "baseball",
-            "finances",
-            "vault",
             "zero-ops",
-            "forge",
             "harness-management",
-            "home-assistant",
-            "homelab",
             "projects",
-            "agora",
             "side-project",
             "gotchi",
         ):
             return "gemini-4-argon-medium"
-        if cname in ("zero-chat", "lounge"):
+        if cname in ("zero-chat", "lounge", "r-residentagents"):
             return "gemini-4-argon-low"
-        if cname in ("gotchi-chat", "gotchi-log", "brock-house", "shopping", "steam-deck", "the-banana-stand"):
+        if cname in (
+            "finances",
+            "vault",
+            "forge",
+            "home-assistant",
+            "homelab",
+            "agora",
+            "mirrormere",
+            "debug-huddle",
+            "gotchi-chat",
+            "gotchi-log",
+            "brock-house",
+            "shopping",
+            "steam-deck",
+            "the-banana-stand",
+        ):
             return "gemini-4-hydrogen-high"
         if cname == "server-updates" or cname.startswith("seer"):
             return "gemini-3.8-flash-low"
