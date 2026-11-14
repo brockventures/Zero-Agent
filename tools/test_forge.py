@@ -4605,5 +4605,188 @@ def test_worker_model_attempt_escalation_and_fallback_ladder():
     )
 
 
+def test_should_run_carbon_preflight_gate():
+    """Verify Carbon (High) pre-flight eligibility rules and explicit review_spec overrides."""
+    non_core_chunk = [{"target_files_json": json.dumps(["docs/README.md"])}]
+    non_core_build = {"touches_core_bridge": 0, "plan_json": json.dumps({})}
+
+    # 1-chunk non-core build returns False
+    assert forge_mod.should_run_carbon_preflight(non_core_build, non_core_chunk) is False
+    assert (
+        forge_mod.should_run_carbon_preflight(
+            {"touches_core_bridge": 0, "plan_json": None},
+            [{"target_files": ["scripts/helper.py"]}],
+        )
+        is False
+    )
+
+    # 2-chunk build returns True
+    two_chunks = [
+        {"target_files_json": json.dumps(["docs/a.md"])},
+        {"target_files_json": json.dumps(["docs/b.md"])},
+    ]
+    assert forge_mod.should_run_carbon_preflight(non_core_build, two_chunks) is True
+
+    # 1-chunk build with touches_core_bridge=1 or core target_files returns True
+    assert (
+        forge_mod.should_run_carbon_preflight(
+            {"touches_core_bridge": 1, "plan_json": "{}"},
+            non_core_chunk,
+        )
+        is True
+    )
+    assert (
+        forge_mod.should_run_carbon_preflight(
+            non_core_build,
+            [{"target_files_json": json.dumps(["tools/forge.py"])}],
+        )
+        is True
+    )
+    assert (
+        forge_mod.should_run_carbon_preflight(
+            non_core_build,
+            [{"target_files": ["/workspace/tools/forge.py"]}],
+        )
+        is True
+    )
+    assert (
+        forge_mod.should_run_carbon_preflight(
+            non_core_build,
+            [{"target_files_json": json.dumps(["tools/bridge_models.py"])}],
+        )
+        is True
+    )
+
+    # Explicit plan_json review_spec overrides eligibility in both directions
+    override_false_build = {"touches_core_bridge": 1, "plan_json": json.dumps({"review_spec": False})}
+    assert forge_mod.should_run_carbon_preflight(override_false_build, two_chunks) is False
+    assert (
+        forge_mod.should_run_carbon_preflight(
+            override_false_build,
+            [{"target_files_json": json.dumps(["tools/forge.py"])}],
+        )
+        is False
+    )
+
+    override_true_build = {"touches_core_bridge": 0, "plan_json": json.dumps({"review_spec": True})}
+    assert forge_mod.should_run_carbon_preflight(override_true_build, non_core_chunk) is True
+
+
+def test_apply_carbon_preflight_refinements(tmp_path):
+    """Verify Carbon (High) pre-flight notes append idempotently and target_symbols_json merges cleanly."""
+    repo = _init_test_git_repo(tmp_path / "repo")
+    (repo / "sample.py").write_text(
+        "def initial_fn():\n    return 1\n\n\ndef refined_fn():\n    return 2\n\n\ndef extra_fn():\n    return 3\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "sample.py"], cwd=str(repo), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "Add sample.py"], cwd=str(repo), capture_output=True, check=True)
+
+    db_path = tmp_path / "forge.db"
+    forge_mod.init_forge_db(db_path)
+
+    build_id = "fg-test-carbon-preflight"
+    plan = {
+        "id": build_id,
+        "title": "Carbon Pre-Flight Refinement Test",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Preserve existing function contracts."],
+        "chunks": [
+            {
+                "title": "Update sample module",
+                "target_files": ["sample.py"],
+                "target_symbols": ["sample.py:initial_fn"],
+                "instructions": "Modify initial_fn in sample.py with deterministic validation.",
+                "verification_cmd": "python3 -m py_compile sample.py",
+            },
+            {
+                "title": "Update documentation",
+                "target_files": ["README.md"],
+                "instructions": "Document the updated validation rules in README.md.",
+                "verification_cmd": "true",
+            },
+        ],
+    }
+    enq = forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+    assert enq["ok"] is True
+
+    c0_id = f"{build_id}-c0"
+    c1_id = f"{build_id}-c1"
+    review_payload = {
+        "summary": "Clarify input validation and hydrate refined_fn.",
+        "chunk_refinements": {
+            c0_id: {
+                "review_notes": "- Guard against empty inputs.\n- Keep return type deterministic.",
+                "target_symbols": {
+                    "sample.py": ["initial_fn", "refined_fn"],
+                },
+            },
+        },
+    }
+
+    refined_count = forge_mod.apply_carbon_preflight_refinements(build_id, review_payload, db_path=db_path)
+    assert refined_count == 1
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0_row = conn.execute(
+            "SELECT instructions, target_symbols_json FROM forge_chunks WHERE id = ?",
+            (c0_id,),
+        ).fetchone()
+        c1_row = conn.execute(
+            "SELECT instructions, target_symbols_json FROM forge_chunks WHERE id = ?",
+            (c1_id,),
+        ).fetchone()
+
+    expected_notes_block = (
+        "Modify initial_fn in sample.py with deterministic validation.\n\n"
+        "### Carbon (High) Pre-Flight Review Notes:\n"
+        "- Guard against empty inputs.\n"
+        "- Keep return type deterministic."
+    )
+    assert c0_row["instructions"] == expected_notes_block
+    assert json.loads(c0_row["target_symbols_json"]) == ["sample.py:initial_fn", "sample.py:refined_fn"]
+    assert c1_row["instructions"] == "Document the updated validation rules in README.md."
+    assert json.loads(c1_row["target_symbols_json"]) == []
+
+    # Idempotency: re-applying identical payload performs zero updates and never duplicates notes header
+    refined_repeat = forge_mod.apply_carbon_preflight_refinements(build_id, review_payload, db_path=db_path)
+    assert refined_repeat == 0
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0_after_repeat = conn.execute(
+            "SELECT instructions, target_symbols_json FROM forge_chunks WHERE id = ?",
+            (c0_id,),
+        ).fetchone()
+    assert c0_after_repeat["instructions"] == expected_notes_block
+    assert c0_after_repeat["instructions"].count("### Carbon (High) Pre-Flight Review Notes:") == 1
+    assert json.loads(c0_after_repeat["target_symbols_json"]) == ["sample.py:initial_fn", "sample.py:refined_fn"]
+
+    # Subsequent refinement with a new symbol still merges symbols without duplicating review notes header
+    second_payload = {
+        "chunk_refinements": {
+            c0_id: {
+                "review_notes": "- Should not duplicate header.",
+                "target_symbols": ["sample.py:extra_fn"],
+            },
+        },
+    }
+    refined_sym_only = forge_mod.apply_carbon_preflight_refinements(build_id, second_payload, db_path=db_path)
+    assert refined_sym_only == 1
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0_after_second = conn.execute(
+            "SELECT instructions, target_symbols_json FROM forge_chunks WHERE id = ?",
+            (c0_id,),
+        ).fetchone()
+    assert c0_after_second["instructions"] == expected_notes_block
+    assert c0_after_second["instructions"].count("### Carbon (High) Pre-Flight Review Notes:") == 1
+    assert json.loads(c0_after_second["target_symbols_json"]) == [
+        "sample.py:initial_fn",
+        "sample.py:refined_fn",
+        "sample.py:extra_fn",
+    ]
+
+
 if __name__ == "__main__":
     unittest.main()
