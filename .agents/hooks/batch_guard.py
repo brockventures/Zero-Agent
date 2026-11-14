@@ -15,6 +15,7 @@ import ast
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import sqlite3
@@ -727,9 +728,708 @@ def _is_safe_ephemeral_delete_target(token: str, cwd: str = "/workspace") -> boo
     return False
 
 
+_DECISION_CARD_APPROVAL_HINT = (
+    "Stage a FORGE Decision Card via 'python3 /workspace/tools/forge.py propose ... --post' "
+    "and wait for Ryan's explicit approval (executes with FORGE_APPROVED_CARD_EXECUTION=1)."
+)
+
+_DESTRUCTIVE_SQL_DROP_RE = re.compile(
+    r"\b(?:DROP\s+(?:TEMP(?:ORARY)?\s+)?(?:TABLE|DATABASE)|TRUNCATE\s+TABLE)\b",
+    re.IGNORECASE,
+)
+_REMOTE_OR_SERVER_DB_RE = re.compile(
+    r"\b(?:psql|mysql|mariadb|dropdb|ssh|psycopg2?|asyncpg|pymysql|sqlalchemy)\b|\brun_ssh\b",
+    re.IGNORECASE,
+)
+_SQLITE_CLI_VALUE_FLAGS = {"-cmd", "-init", "-nullvalue", "-separator", "-newline"}
+_GIT_PUSH_VALUE_FLAGS = {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
+_SSH_VALUE_FLAGS = {
+    "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l",
+    "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w",
+}
+_COMPOSE_PRE_VALUE_FLAGS = {
+    "-f", "--file", "-p", "--project-name", "--project-directory",
+    "--env-file", "--profile", "-H", "--host", "--context", "-c",
+    "--ansi", "--progress", "--parallel",
+}
+_COMPOSE_SCOPE_FLAGS = {"-f", "--file", "-p", "--project-name", "--project-directory"}
+
+_CF_API_MUTATION_METHOD_RE = re.compile(
+    r"(?:"
+    r"(?:-X|--request|--method)\s*=?\s*['\"]?(?:POST|PUT|PATCH)['\"]?\b|"
+    r"\b(?:POST|PUT|PATCH)\s+https?://api\.cloudflare\.com\b|"
+    r"\.(?:post|put|patch)\s*\(|"
+    r"\bmethod\s*[:=]\s*['\"](?:POST|PUT|PATCH)['\"]"
+    r")",
+    re.IGNORECASE,
+)
+_CF_CURL_DATA_FLAG_RE = re.compile(
+    r"(?:^|\s)(?:-d|--data|--data-raw|--data-binary|--data-urlencode|--json)(?:\s|=)"
+)
+
+
+def _strip_outer_quotes(tok: str) -> str:
+    s = tok.strip()
+    if len(s) >= 2 and s[0] == s[-1]:
+        if s[0] == "'":
+            return s[1:-1]
+        if s[0] == '"':
+            return s[1:-1].replace('\\"', '"')
+    return s
+
+
+def _resolves_to_secrets_path(path_str: str, cwd: str = "/workspace") -> bool:
+    """Return True if path_str resolves into /secrets or /secrets/*."""
+    if not path_str:
+        return False
+    clean = _strip_outer_quotes(path_str)
+    if not clean:
+        return False
+    norm_p = posixpath.normpath(_norm_posix(clean, cwd or "/workspace"))
+    if norm_p == "/secrets" or norm_p.startswith("/secrets/"):
+        return True
+    try:
+        abs_p = os.path.abspath(os.path.join(cwd or "/workspace", clean))
+        real_p = os.path.realpath(abs_p).replace("\\", "/")
+        if real_p == "/secrets" or real_p.startswith("/secrets/"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def check_secrets_mutation_gate(target_file: str, cwd: str = "/workspace") -> tuple[bool, str]:
+    """Block direct file writes or edits targeting /secrets/* unless FORGE_APPROVED_CARD_EXECUTION=1."""
+    if not target_file:
+        return True, ""
+    if os.environ.get("FORGE_APPROVED_CARD_EXECUTION") == "1":
+        return True, ""
+    if _resolves_to_secrets_path(target_file, cwd=cwd):
+        return False, (
+            f"Hard Destructive & Secrets Gate Triggered: Direct file write/edit to '{target_file}' ('/secrets/*') "
+            f"is prohibited without explicit human approval. {_DECISION_CARD_APPROVAL_HINT}"
+        )
+    return True, ""
+
+
+def _split_unquoted_shell_segments(cmd: str) -> list[str]:
+    """Split shell command on unquoted ';', newline, '|', '&&', '||', '&' while preserving quoted strings."""
+    joined = re.sub(r"\\\r?\n", " ", cmd)
+    segments: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(joined)
+    while i < n:
+        ch = joined[i]
+        if quote is None:
+            if ch == "\\" and i + 1 < n:
+                cur.append(joined[i : i + 2])
+                i += 2
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                cur.append(ch)
+                i += 1
+                continue
+            if ch in (";", "\n"):
+                seg = "".join(cur).strip()
+                if seg:
+                    segments.append(seg)
+                cur = []
+                i += 1
+                continue
+            if ch == "|" and i + 1 < n and joined[i + 1] == "|":
+                seg = "".join(cur).strip()
+                if seg:
+                    segments.append(seg)
+                cur = []
+                i += 2
+                continue
+            if ch == "&" and i + 1 < n and joined[i + 1] == "&":
+                seg = "".join(cur).strip()
+                if seg:
+                    segments.append(seg)
+                cur = []
+                i += 2
+                continue
+            if ch == "|":
+                prev_ch = joined[i - 1] if i > 0 else ""
+                if prev_ch != ">":
+                    seg = "".join(cur).strip()
+                    if seg:
+                        segments.append(seg)
+                    cur = []
+                    i += 1
+                    continue
+            if ch == "&":
+                prev_ch = joined[i - 1] if i > 0 else ""
+                next_ch = joined[i + 1] if i + 1 < n else ""
+                if prev_ch not in (">", "<") and next_ch != ">":
+                    seg = "".join(cur).strip()
+                    if seg:
+                        segments.append(seg)
+                    cur = []
+                    i += 1
+                    continue
+            cur.append(ch)
+            i += 1
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+            cur.append(ch)
+            i += 1
+        elif quote == '"':
+            if ch == "\\" and i + 1 < n:
+                cur.append(joined[i : i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+            cur.append(ch)
+            i += 1
+    tail = "".join(cur).strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def _extract_wrapped_shell_commands(cmd: str) -> list[str]:
+    """Extract inner command payloads from ssh, bash/sh -c, and forge.py/detached_runner --command/-c wrappers."""
+    inner: list[str] = []
+    for m in re.finditer(
+        r"(?:--command|\b(?:bash|sh|zsh|dash)\s+(?:-[a-zA-Z]+\s+)*-c)(?:=|\s+)(['\"])([\s\S]*?)\1",
+        cmd,
+    ):
+        val = m.group(2).replace('\\"', '"').strip() if m.group(1) == '"' else m.group(2).strip()
+        if val:
+            inner.append(val)
+    for m in re.finditer(
+        r"\b(?:forge\.py|tools\.forge|detached_runner\.py)\b[^\n;|&]*?\s-c(?:=|\s+)(['\"])([\s\S]*?)\1",
+        cmd,
+    ):
+        val = m.group(2).replace('\\"', '"').strip() if m.group(1) == '"' else m.group(2).strip()
+        if val:
+            inner.append(val)
+    for seg in _split_unquoted_shell_segments(cmd):
+        m_ssh = re.match(r"^(?:sudo\s+|env\s+\S+\s+)*ssh\b(?P<rest>.*)$", seg.strip())
+        if not m_ssh:
+            continue
+        tokens = re.findall(r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S+)", m_ssh.group("rest").strip())
+        idx = 0
+        host_seen = False
+        while idx < len(tokens):
+            raw_tok = tokens[idx]
+            tok = _strip_outer_quotes(raw_tok)
+            if not host_seen:
+                if tok in _SSH_VALUE_FLAGS:
+                    idx += 2
+                    continue
+                if tok.startswith("-") and len(tok) > 2 and tok[:2] in _SSH_VALUE_FLAGS:
+                    idx += 1
+                    continue
+                if tok.startswith("-"):
+                    idx += 1
+                    continue
+                host_seen = True
+                idx += 1
+                continue
+            rem = tokens[idx:]
+            if len(rem) == 1:
+                unq = _strip_outer_quotes(rem[0]).strip()
+                if unq:
+                    inner.append(unq)
+            elif rem:
+                joined_rem = " ".join(_strip_outer_quotes(t) for t in rem).strip()
+                if joined_rem:
+                    inner.append(joined_rem)
+            break
+    return inner
+
+
+def _is_pure_decision_card_staging_cmd(cmd: str) -> bool:
+    """Allow staging a FORGE Decision Card via a single unchained `forge.py propose` / `stage-decision` call."""
+    stripped = cmd.strip()
+    if not re.match(
+        r"^(?:python[0-9.]*\s+)?(?:['\"]?[^\s'\"]*?/)?forge\.py\s+(?:propose|stage-decision)\b",
+        stripped,
+    ):
+        return False
+    unquoted = re.sub(r"'(?:[^']*)'|\"(?:\\.|[^\"\\])*\"", "''", stripped)
+    if any(sep in unquoted for sep in ("&&", "||", ";", "|", "\n", "`", "$(", ">")):
+        return False
+    return True
+
+
+def _extract_sqlite_targets_from_segment(seg: str) -> list[str]:
+    """Extract SQLite database path targets referenced in a shell/python command segment."""
+    targets: list[str] = []
+    m_cli = re.match(r"^(?:sudo\s+|env\s+\S+\s+)*(?:\S+/)?sqlite3(?=\s)(?P<rest>.*)$", seg.strip())
+    if m_cli:
+        tokens = re.findall(r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S+)", m_cli.group("rest").strip())
+        idx = 0
+        while idx < len(tokens):
+            tok = _strip_outer_quotes(tokens[idx])
+            if tok in _SQLITE_CLI_VALUE_FLAGS:
+                idx += 2
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            if tok:
+                targets.append(tok)
+            break
+    for m_conn in re.finditer(r"\bsqlite3\.connect\s*\(\s*(?:[fFrRuU]*)(['\"])(.*?)\1", seg):
+        if m_conn.group(2).strip():
+            targets.append(m_conn.group(2).strip())
+    for m_db in re.finditer(r"(?P<db>[^\s'\"();,]+?\.(?:db|sqlite|sqlite3))\b", seg):
+        cand = m_db.group("db").strip()
+        if cand and cand not in targets:
+            targets.append(cand)
+    return targets
+
+
+def _is_safe_tmp_sql_target(raw_target: str, cwd: str = "/workspace") -> bool:
+    """Return True only if raw_target is an ephemeral :memory: or /tmp/* SQLite test fixture (excluding /tmp/forge-wt-*)."""
+    clean = _strip_outer_quotes(raw_target)
+    if not clean:
+        return False
+    if clean == ":memory:" or "mode=memory" in clean:
+        return True
+    if clean.startswith("file:"):
+        clean = clean[5:].split("?")[0]
+    if not clean:
+        return False
+    tmp_root = tempfile.gettempdir().replace("\\", "/").rstrip("/")
+    if "{" in clean or "$" in clean:
+        return (
+            clean.startswith("/tmp/")
+            and not clean.startswith("/tmp/forge-wt-")
+            and ".." not in clean
+        )
+    norm_t = posixpath.normpath(_norm_posix(clean, cwd or "/workspace"))
+    in_tmp = (
+        norm_t.startswith("/tmp/")
+        or (bool(tmp_root) and norm_t.startswith(tmp_root + "/"))
+    ) and not norm_t.startswith("/tmp/forge-wt-")
+    if not in_tmp:
+        return False
+    try:
+        if os.path.exists(norm_t):
+            real_t = os.path.realpath(norm_t).replace("\\", "/")
+            if not (
+                real_t.startswith("/tmp/")
+                or (bool(tmp_root) and real_t.startswith(tmp_root + "/"))
+            ) or real_t.startswith("/tmp/forge-wt-"):
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _strip_heads_prefix(ref_name: str) -> str:
+    clean = ref_name.strip()
+    if clean.startswith("refs/heads/"):
+        return clean[len("refs/heads/") :]
+    return clean
+
+
+def _is_git_force_push_to_main_or_master(seg: str) -> bool:
+    """Return True if segment executes a git force-push targeting main or master."""
+    m = re.search(
+        r"\bgit\b(?:\s+(?:-[Cc]\s+\S+|--(?:git-dir|work-tree)(?:=\S+|\s+\S+)|--no-pager|--bare))*\s+push\b(?P<rest>.*)$",
+        seg.strip(),
+    )
+    if not m:
+        return False
+    tokens = re.findall(r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S+)", m.group("rest").strip())
+    has_force_flag = False
+    positional: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        raw_tok = tokens[idx]
+        if raw_tok.startswith((">", "2>", "&>", "1>")):
+            break
+        tok = _strip_outer_quotes(raw_tok)
+        if tok in _GIT_PUSH_VALUE_FLAGS:
+            idx += 2
+            continue
+        if tok in ("--force", "--force-if-includes") or tok.startswith("--force="):
+            has_force_flag = True
+            idx += 1
+            continue
+        if tok == "--force-with-lease" or tok.startswith("--force-with-lease="):
+            has_force_flag = True
+            if tok.startswith("--force-with-lease="):
+                lease_ref = tok.split("=", 1)[1].split(":", 1)[0]
+                if _strip_heads_prefix(lease_ref) in ("main", "master"):
+                    return True
+            idx += 1
+            continue
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1 and tok[1:].isalpha() and "f" in tok[1:]:
+            has_force_flag = True
+            idx += 1
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        positional.append(tok)
+        idx += 1
+
+    for p_idx, ref_tok in enumerate(positional):
+        is_plus_ref = ref_tok.startswith("+")
+        if p_idx == 0 and not is_plus_ref and not (len(positional) == 1 and has_force_flag):
+            continue
+        body = ref_tok.lstrip("+")
+        dst = body.split(":", 1)[1] if ":" in body else body
+        if _strip_heads_prefix(dst) in ("main", "master") and (is_plus_ref or has_force_flag):
+            return True
+    return False
+
+
+def _is_github_repo_admin_or_visibility_mutation(seg: str) -> tuple[bool, str]:
+    """Detect GitHub repository deletion, archival, or visibility mutations via gh CLI or REST API."""
+    if re.search(r"\bgh\s+repo\s+(?:delete|archive)\b", seg, re.IGNORECASE):
+        return True, "GitHub repository deletion/archival ('gh repo delete/archive')"
+    if re.search(r"\bgh\s+repo\s+edit\b", seg, re.IGNORECASE) and re.search(
+        r"--(?:visibility|accept-visibility-change-consequences)\b",
+        seg,
+        re.IGNORECASE,
+    ):
+        return True, "GitHub repository visibility change ('gh repo edit --visibility')"
+    if re.search(r"\bDELETE\s+(?:https?://api\.github\.com)?/?repos/", seg, re.IGNORECASE):
+        return True, "GitHub API repository deletion ('DELETE /repos/...')"
+    has_delete_method = bool(
+        re.search(
+            r"(?:-X|--method|--request)\s*=?\s*['\"]?DELETE['\"]?\b|\.delete\s*\(",
+            seg,
+            re.IGNORECASE,
+        )
+    )
+    has_repos_endpoint = bool(
+        re.search(
+            r"(?:api\.github\.com/repos/|(?:^|[\s'\"=])/?repos/)[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?",
+            seg,
+            re.IGNORECASE,
+        )
+    )
+    if has_delete_method and has_repos_endpoint:
+        return True, "GitHub API repository deletion ('DELETE /repos/...')"
+    if re.search(
+        r"""(?:\bvisibility['"]?\s*[:=]\s*['"]?public\b|\bprivate['"]?\s*[:=]\s*['"]?false\b)""",
+        seg,
+        re.IGNORECASE,
+    ):
+        return True, "GitHub repository public visibility mutation ('visibility=public' / 'private=false')"
+    if has_repos_endpoint and re.search(r"""\barchived['"]?\s*[:=]\s*['"]?true\b""", seg, re.IGNORECASE):
+        return True, "GitHub API repository archival ('archived=true')"
+    return False, ""
+
+
+def _is_cloudflare_exposure_mutation(seg: str) -> tuple[bool, str]:
+    """Detect public Cloudflare Tunnel or DNS record mutations."""
+    if re.search(r"\bcloudflared\b[^\n;|&]*?\btunnel\b[^\n;|&]*?\broute\b", seg, re.IGNORECASE):
+        return True, "Public Cloudflare Tunnel route mutation ('cloudflared tunnel route')"
+    if "api.cloudflare.com" in seg.lower() and re.search(r"\b(?:cfd_tunnel|dns_records)\b", seg, re.IGNORECASE):
+        if _CF_API_MUTATION_METHOD_RE.search(seg):
+            return True, "Public Cloudflare API mutation ('api.cloudflare.com' cfd_tunnel/dns_records POST/PUT/PATCH)"
+        if _CF_CURL_DATA_FLAG_RE.search(seg) and not re.search(
+            r"(?:-X|--request)\s*=?\s*['\"]?GET['\"]?\b|\s-G\b",
+            seg,
+            re.IGNORECASE,
+        ):
+            return True, "Public Cloudflare API mutation ('api.cloudflare.com' cfd_tunnel/dns_records data POST)"
+    if re.search(r"\bconfirm_public_exposure\s*=\s*True\b", seg) or re.search(
+        r"\bcloudflare\.py\s+(?:create_record|update_record)\b",
+        seg,
+    ):
+        return True, "Public Cloudflare DNS exposure mutation ('cloudflare.py')"
+    return False, ""
+
+
+def _is_secrets_shell_overwrite(seg: str, cwd: str = "/workspace") -> bool:
+    """Detect shell redirects, file copy/move/in-place tools, or inline scripts writing to /secrets/*."""
+    for m_redir in re.finditer(r"(?:[0-9&]*>>?\|?)\s*('[^']*'|\"[^\"]*\"|[^\s;|&><]+)", seg):
+        if _resolves_to_secrets_path(m_redir.group(1), cwd=cwd):
+            return True
+
+    m_tee = re.search(r"\btee\b(?P<rest>.*)$", seg)
+    if m_tee:
+        for raw_tok in re.findall(r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S+)", m_tee.group("rest")):
+            tok = _strip_outer_quotes(raw_tok)
+            if tok.startswith("-"):
+                continue
+            if _resolves_to_secrets_path(tok, cwd=cwd):
+                return True
+
+    m_cp_mv = re.match(r"^(?:sudo\s+)?(?:cp|mv|install|rsync|ln)\b(?P<rest>.*)$", seg.strip())
+    if m_cp_mv:
+        tokens = re.findall(r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S+)", m_cp_mv.group("rest").strip())
+        pos_paths: list[str] = []
+        idx = 0
+        while idx < len(tokens):
+            raw_tok = tokens[idx]
+            if raw_tok.startswith((">", "2>", "&>")):
+                break
+            tok = _strip_outer_quotes(raw_tok)
+            if tok in ("-t", "--target-directory") and idx + 1 < len(tokens):
+                if _resolves_to_secrets_path(tokens[idx + 1], cwd=cwd):
+                    return True
+                idx += 2
+                continue
+            if tok.startswith("--target-directory="):
+                if _resolves_to_secrets_path(tok.split("=", 1)[1], cwd=cwd):
+                    return True
+                idx += 1
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            pos_paths.append(tok)
+            idx += 1
+        if pos_paths and _resolves_to_secrets_path(pos_paths[-1], cwd=cwd):
+            return True
+
+    m_mut_tool = re.match(
+        r"^(?:sudo\s+)?(?P<tool>sed|perl|truncate|touch|chmod|chown|rm|unlink|shred)\b(?P<rest>.*)$",
+        seg.strip(),
+    )
+    if m_mut_tool:
+        tool_name = m_mut_tool.group("tool")
+        rest_str = m_mut_tool.group("rest")
+        is_inplace = True
+        if tool_name == "sed":
+            is_inplace = bool(re.search(r"\s-[a-zA-Z]*i|--in-place\b", " " + rest_str))
+        elif tool_name == "perl":
+            is_inplace = bool(re.search(r"\s-[a-zA-Z]*i", " " + rest_str))
+        if is_inplace:
+            for raw_tok in re.findall(r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S+)", rest_str):
+                tok = _strip_outer_quotes(raw_tok)
+                if not tok.startswith("-") and _resolves_to_secrets_path(tok, cwd=cwd):
+                    return True
+
+    for m_dd in re.finditer(r"\bdd\b[^\n;|&]*?\bof=('[^']*'|\"[^\"]*\"|\S+)", seg):
+        if _resolves_to_secrets_path(m_dd.group(1), cwd=cwd):
+            return True
+
+    for m_open in re.finditer(
+        r"\bopen\s*\(\s*(?:[fFrRuU]*)(['\"])([^'\"]+)\1\s*(?:,\s*(['\"])([^'\"]+)\3|[^)]*?\bmode\s*=\s*(['\"])([^'\"]+)\5)",
+        seg,
+    ):
+        p_val = m_open.group(2)
+        mode_val = m_open.group(4) or m_open.group(6) or ""
+        if any(flag in mode_val for flag in ("w", "a", "x", "+")) and _resolves_to_secrets_path(p_val, cwd=cwd):
+            return True
+
+    for m_pathlib in re.finditer(
+        r"\bPath\s*\(\s*(['\"])([^'\"]+)\1\s*\)\s*\.\s*(?:write_text|write_bytes|unlink|touch|replace|rename)\s*\(",
+        seg,
+    ):
+        if _resolves_to_secrets_path(m_pathlib.group(2), cwd=cwd):
+            return True
+
+    for m_py_fs in re.finditer(
+        r"\b(?:shutil\.(?:copy\w*|move|rmtree)|os\.(?:replace|rename|remove|unlink|truncate))\s*\(([^)]*)\)",
+        seg,
+    ):
+        str_args = [m_s.group(2) for m_s in re.finditer(r"(['\"])([^'\"]+)\1", m_py_fs.group(1))]
+        if str_args and _resolves_to_secrets_path(str_args[-1], cwd=cwd):
+            return True
+
+    return False
+
+
+def _is_unscoped_or_destructive_compose_down(seg: str) -> bool:
+    """Return True if segment runs an unscoped `docker compose down` / `docker-compose down` or destroys volumes (`-v`/`--volumes`/`--rmi`)."""
+    m = re.search(
+        r"\bdocker(?:-compose|(?:\s+(?:-[Hc]\s+\S+|--(?:host|context)(?:=\S+|\s+\S+)))*\s+compose)\b(?P<rest>.*)$",
+        seg.strip(),
+    )
+    if not m:
+        return False
+    tokens = re.findall(r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S+)", m.group("rest").strip())
+    has_project_scope = False
+    down_idx: int | None = None
+    idx = 0
+    while idx < len(tokens):
+        raw_tok = tokens[idx]
+        if raw_tok.startswith((">", "2>", "&>")):
+            break
+        tok = _strip_outer_quotes(raw_tok)
+        if tok == "down":
+            down_idx = idx
+            break
+        if tok in _COMPOSE_PRE_VALUE_FLAGS:
+            if tok in _COMPOSE_SCOPE_FLAGS and idx + 1 < len(tokens):
+                nxt_tok = _strip_outer_quotes(tokens[idx + 1])
+                if nxt_tok and not nxt_tok.startswith("-"):
+                    has_project_scope = True
+            idx += 2
+            continue
+        if any(tok.startswith(prefix) for prefix in ("--file=", "--project-name=", "--project-directory=")):
+            val = tok.split("=", 1)[1].strip()
+            if val:
+                has_project_scope = True
+            idx += 1
+            continue
+        if (tok.startswith("-f") or tok.startswith("-p")) and len(tok) > 2 and not tok.startswith("--"):
+            has_project_scope = True
+            idx += 1
+            continue
+        idx += 1
+
+    if down_idx is None:
+        return False
+
+    has_service_scope = False
+    j = down_idx + 1
+    while j < len(tokens):
+        raw_tok = tokens[j]
+        if raw_tok.startswith((">", "2>", "&>")):
+            break
+        tok = _strip_outer_quotes(raw_tok)
+        if tok in ("-v", "--volumes", "--rmi") or tok.startswith("--rmi="):
+            return True
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1 and tok[1:].isalpha() and "v" in tok[1:]:
+            return True
+        if tok in ("-t", "--timeout"):
+            j += 2
+            continue
+        if tok.startswith("-"):
+            j += 1
+            continue
+        if tok:
+            has_service_scope = True
+        j += 1
+
+    return not (has_project_scope or has_service_scope)
+
+
+def _is_destructive_container_or_host_segment(seg: str, full_cmd: str) -> tuple[bool, str]:
+    """Detect destructive Docker prune/volume/compose-down, stopping ContainerManager, and destructive NAS/host SSH commands."""
+    if re.search(
+        r"\bdocker\b(?:\s+(?:-[Hc]\s+\S+|--(?:host|context)(?:=\S+|\s+\S+)))*\s+system\s+prune\b",
+        seg,
+        re.IGNORECASE,
+    ):
+        return True, "Destructive container prune ('docker system prune')"
+    if re.search(
+        r"\bdocker\b(?:\s+(?:-[Hc]\s+\S+|--(?:host|context)(?:=\S+|\s+\S+)))*\s+volume\s+(?:rm|remove|prune)\b",
+        seg,
+        re.IGNORECASE,
+    ):
+        return True, "Destructive Docker volume deletion ('docker volume rm/prune')"
+    if _is_unscoped_or_destructive_compose_down(seg):
+        return True, "Unscoped or volume-destroying 'docker compose down'"
+    if re.search(
+        r"\b(?:stop|pause|disable|mask|kill|pkill|killall|uninstall)\b[^\n;|&]*\b(?:pkgctl-)?ContainerManager\b"
+        r"|\b(?:pkgctl-)?ContainerManager\b[^\n;|&]*\b(?:stop|pause|disable|mask|kill|uninstall)\b"
+        r"|--stop\s+(?:pkgctl-)?ContainerManager\b",
+        seg,
+        re.IGNORECASE,
+    ):
+        return True, "Stopping Synology 'ContainerManager'"
+    if re.search(r"\brm\b[^\n;|&]*?\x2fvolume1(?:\x2f|\b|['\"\s;|$])", seg):
+        return True, "Destructive NAS volume deletion ('rm' targeting primary NAS volume)"
+    if re.search(r"\bsynopkg\s+uninstall\b", seg, re.IGNORECASE):
+        return True, "Destructive Synology package removal ('synopkg uninstall')"
+    if re.search(
+        r"^(?:sudo\s+|nohup\s+|env\s+\S+\s+)*(?:/usr/sbin/|/sbin/)?(?:reboot|shutdown|poweroff)\b",
+        seg.strip(),
+        re.IGNORECASE,
+    ):
+        return True, "Destructive host power command ('reboot' / 'shutdown' / 'poweroff')"
+    if re.search(r"\b(?:ssh|run_ssh)\b", full_cmd) and re.search(
+        r"(?<!\.)\b(?:reboot|shutdown|poweroff)\b",
+        seg,
+        re.IGNORECASE,
+    ):
+        return True, "Destructive remote SSH power command ('reboot' / 'shutdown' / 'poweroff')"
+    return False, ""
+
+
+def check_destructive_system_and_exposure_gate(cmd: str, cwd: str = "/workspace") -> tuple[bool, str]:
+    """Deterministically block destructive SQL/git/GitHub/Cloudflare/secrets/container/NAS-SSH operations
+    unless os.environ.get('FORGE_APPROVED_CARD_EXECUTION') == '1'.
+    """
+    if not cmd or not cmd.strip():
+        return True, ""
+    if os.environ.get("FORGE_APPROVED_CARD_EXECUTION") == "1":
+        return True, ""
+    if _is_pure_decision_card_staging_cmd(cmd):
+        return True, ""
+
+    candidate_commands: list[str] = [cmd]
+    lvl1 = _extract_wrapped_shell_commands(cmd)
+    candidate_commands.extend(lvl1)
+    for sub in lvl1:
+        candidate_commands.extend(_extract_wrapped_shell_commands(sub))
+
+    all_segments: list[str] = []
+    for cand in candidate_commands:
+        segs = _split_unquoted_shell_segments(cand)
+        all_segments.extend(segs)
+        if "<<" in cand and cand.strip() not in all_segments:
+            all_segments.append(cand.strip())
+
+    # 1. SQL table/database drops (DROP TABLE, DROP DATABASE, TRUNCATE TABLE) outside /tmp/ test fixtures
+    for seg in all_segments:
+        if _DESTRUCTIVE_SQL_DROP_RE.search(seg):
+            if _REMOTE_OR_SERVER_DB_RE.search(cmd) or _REMOTE_OR_SERVER_DB_RE.search(seg):
+                return False, (
+                    "Hard Destructive Gate Triggered: SQL 'DROP TABLE' / 'DROP DATABASE' / 'TRUNCATE TABLE' "
+                    f"against non-/tmp databases is prohibited without explicit approval. {_DECISION_CARD_APPROVAL_HINT}"
+                )
+            sql_targets = _extract_sqlite_targets_from_segment(seg)
+            if not sql_targets or not all(_is_safe_tmp_sql_target(t, cwd=cwd) for t in sql_targets):
+                return False, (
+                    "Hard Destructive Gate Triggered: SQL 'DROP TABLE' / 'DROP DATABASE' / 'TRUNCATE TABLE' "
+                    f"outside '/tmp/' test fixtures is prohibited without explicit approval. {_DECISION_CARD_APPROVAL_HINT}"
+                )
+
+    # 2..6. Inspect all command segments (including unwrapped ssh / -c / --command payloads)
+    for seg in all_segments:
+        if _is_git_force_push_to_main_or_master(seg):
+            return False, (
+                "Hard Destructive Gate Triggered: Git force-push ('--force', '-f', '--force-with-lease', or '+ref') "
+                f"targeting 'main' or 'master' is prohibited without explicit approval. {_DECISION_CARD_APPROVAL_HINT}"
+            )
+
+        is_gh_bad, gh_desc = _is_github_repo_admin_or_visibility_mutation(seg)
+        if is_gh_bad:
+            return False, (
+                f"Hard Destructive & Exposure Gate Triggered: {gh_desc} is prohibited without explicit approval. "
+                f"{_DECISION_CARD_APPROVAL_HINT}"
+            )
+
+        is_cf_bad, cf_desc = _is_cloudflare_exposure_mutation(seg)
+        if is_cf_bad:
+            return False, (
+                f"Public Exposure Gate Triggered: {cf_desc} violates the 2-Layer Private LAN Default and is prohibited "
+                f"without explicit human approval. {_DECISION_CARD_APPROVAL_HINT}"
+            )
+
+        if _is_secrets_shell_overwrite(seg, cwd=cwd):
+            return False, (
+                "Hard Destructive & Secrets Gate Triggered: Overwriting or mutating '/secrets/*' via shell redirect "
+                f"or command is prohibited without explicit human approval. {_DECISION_CARD_APPROVAL_HINT}"
+            )
+
+        is_host_bad, host_desc = _is_destructive_container_or_host_segment(seg, cmd)
+        if is_host_bad:
+            return False, (
+                f"Hard Destructive Host/Container Gate Triggered: {host_desc} is prohibited without explicit human approval. "
+                f"{_DECISION_CARD_APPROVAL_HINT}"
+            )
+
+    return True, ""
+
+
 def check_file_deletion_gate(cmd: str, cwd: str = "/workspace") -> tuple[bool, str]:
     """Enforce human approval via FORGE Decision Card before deleting tracked/persistent files."""
     if not cmd:
+        return True, ""
+    if os.environ.get("FORGE_APPROVED_CARD_EXECUTION") == "1":
         return True, ""
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True, ""
@@ -1129,6 +1829,8 @@ def check_readonly_shared_mount(target_file: str, cwd: str = "/workspace") -> tu
             "Escalate the issue to Zero in #zero-ops (1544953279664889888) by running:\n"
             "python3 /workspace/tools/outbox.py --channel zero-ops --message \"<@1542285964213358633> [Upstream Fix Request] <file & root cause>\" --force && python3 /workspace/tools/outbox.py --flush"
         )
+    if os.environ.get("FORGE_APPROVED_CARD_EXECUTION") == "1":
+        return True, ""
     if os.path.exists(real_path) and not os.access(real_path, os.W_OK):
         return False, (
             f"Read-Only File Guard: '{target_file}' ('{real_path}') is read-only inside this container. "
@@ -1195,6 +1897,8 @@ def _check_inline_production_edit_gate(
     now: float = 0.0,
 ) -> tuple[bool, str]:
     """Enforce FORGE Tier 2/3 Gate: block interactive turns outside /tmp/forge-wt-* from mutating >2 production files inline or mutating after >90s calibration."""
+    if os.environ.get("FORGE_APPROVED_CARD_EXECUTION") == "1":
+        return True, ""
     if is_forge_worktree_or_exempt_path(target_file, cwd=cwd):
         return True, ""
     norm_cwd = os.path.abspath(cwd or "/workspace").replace("\\", "/")
@@ -1699,6 +2403,11 @@ def check_tool_use(
     if name == "run_command":
         cmd = args.get("CommandLine", "")
 
+        # A00-dest. Hard Destructive-Action, Cloudflare Exposure & Repo Admin Gate
+        ok_dest, dest_reason = check_destructive_system_and_exposure_gate(cmd, cwd=cwd)
+        if not ok_dest:
+            return False, dest_reason
+
         # A00-docker. Missing Container Docker CLI Guard
         ok_dk, dk_reason = check_missing_docker_cli_guard(cmd)
         if not ok_dk:
@@ -1984,8 +2693,12 @@ def check_tool_use(
         return True, ""
 
     # 3. replace_file_content / edit_file check
-    if name in ("replace_file_content", "edit_file"):
-        target_file = args.get("TargetFile") or args.get("Path") or ""
+    if name in ("replace_file_content", "edit_file", "multi_replace_file_content"):
+        target_file = args.get("TargetFile") or args.get("AbsolutePath") or args.get("Path") or ""
+        ok_sec, sec_reason = check_secrets_mutation_gate(target_file, cwd=cwd)
+        if not ok_sec:
+            return False, sec_reason
+
         state["cmd_inspections"] = 0
         state["consecutive_inline_python"] = 0
         state["consecutive_file_views"] = 0
@@ -2011,7 +2724,11 @@ def check_tool_use(
 
     # 4. write_to_file / write_file resets consecutive counters and blocks LLM-in-the-loop versioned scratch sweep loops (sim_v1..v14.py)
     if name in ("write_to_file", "write_file"):
-        target_file = args.get("TargetFile") or args.get("Path") or ""
+        target_file = args.get("TargetFile") or args.get("AbsolutePath") or args.get("Path") or ""
+        ok_sec, sec_reason = check_secrets_mutation_gate(target_file, cwd=cwd)
+        if not ok_sec:
+            return False, sec_reason
+
         state["cmd_inspections"] = 0
         state["consecutive_inline_python"] = 0
         state["consecutive_file_views"] = 0

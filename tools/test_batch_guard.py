@@ -16,8 +16,10 @@ sys.path.insert(0, _REPO_ROOT)
 from batch_guard import (
     STATE_FILE,
     check_batching,
+    check_destructive_system_and_exposure_gate,
     check_forge_post_offload_lock,
     check_interactive_investigation_gate,
+    check_secrets_mutation_gate,
     check_tool_use,
     has_forge_job_start_command,
     is_exempt_from_investigation_gate,
@@ -30,6 +32,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_forge_worker_env(monkeypatch):
     monkeypatch.delenv("FORGE_WORKER_ACTIVE", raising=False)
+    monkeypatch.delenv("FORGE_APPROVED_CARD_EXECUTION", raising=False)
     monkeypatch.delenv("DISCORD_CHANNEL_ID", raising=False)
     monkeypatch.setattr("batch_guard.IN_FLIGHT_TURN_FILE", "/nonexistent_in_flight_turn.json")
 
@@ -1684,6 +1687,299 @@ def test_modal_godot_verify_exempt_and_direct_local_godot_binary_blocked(tmp_pat
             state_file=state_file,
         )
         assert ok_modal is True, f"Expected modal_godot_verify.py invocation to be allowed: {allowed_cmd} ({reason_modal})"
+
+
+def test_sql_drop_and_truncate_gate_outside_tmp_fixtures(tmp_path):
+    state_file = str(tmp_path / "bg_state_sql_drop.json")
+
+    blocked_sql_cmds = [
+        'sqlite3 /workspace/data/forge.db "DROP TABLE builds"',
+        'sqlite3 data/forge.db "DROP TABLE IF EXISTS builds"',
+        'psql -U postgres -c "DROP TABLE projections;"',
+        'psql -c "DROP DATABASE big_board;"',
+        'mysql -e "TRUNCATE TABLE events;"',
+        'python3 -c "import sqlite3; sqlite3.connect(\'/workspace/data/app.db\').execute(\'DROP TABLE users\')"',
+        'python3 -c "import sqlite3; sqlite3.connect(\'/workspace/data/app.db\').execute(\'TRUNCATE TABLE logs\')"',
+        'sqlite3 /tmp/safe_fixture.db "DROP TABLE a" && sqlite3 /workspace/data/prod.db "DROP TABLE b"',
+    ]
+    for cmd in blocked_sql_cmds:
+        ok, reason = check_destructive_system_and_exposure_gate(cmd, cwd="/workspace")
+        assert ok is False, f"Expected destructive SQL to be blocked: {cmd}"
+        assert "DROP TABLE" in reason or "TRUNCATE TABLE" in reason
+        ok_tu, _ = check_tool_use("run_command", {"CommandLine": cmd}, state_file=state_file, cwd="/workspace")
+        assert ok_tu is False
+
+    # Relative DB path inside /tmp/forge-wt-* worktree must NOT be treated as a /tmp/ test fixture
+    ok_wt, _ = check_destructive_system_and_exposure_gate(
+        'sqlite3 data/forge.db "DROP TABLE builds"',
+        cwd="/tmp/forge-wt-fg-123-c0",
+    )
+    assert ok_wt is False
+
+    # Legitimate /tmp/ and :memory: SQLite test fixtures are allowed
+    tmp_db_file = str(tmp_path / "fixture_unit.db")
+    allowed_sql_cmds = [
+        'sqlite3 /tmp/unit_fixture.db "DROP TABLE IF EXISTS items;"',
+        f'sqlite3 {tmp_db_file} "TRUNCATE TABLE items;"',
+        'sqlite3 :memory: "CREATE TABLE t(id INT); DROP TABLE t;"',
+        'python3 -c "import sqlite3; sqlite3.connect(\'/tmp/unit_fixture.sqlite\').execute(\'DROP TABLE items\')"',
+    ]
+    for cmd in allowed_sql_cmds:
+        ok, reason = check_destructive_system_and_exposure_gate(cmd, cwd="/workspace")
+        assert ok is True, f"Expected /tmp/ SQLite fixture command to be allowed: {cmd} ({reason})"
+
+    ok_rel_tmp, reason_rel_tmp = check_destructive_system_and_exposure_gate(
+        'sqlite3 local_fixture.db "DROP TABLE items;"',
+        cwd="/tmp/isolated_unit_fixture_dir",
+    )
+    assert ok_rel_tmp is True, f"Expected relative DB under /tmp/ fixture dir to be allowed: {reason_rel_tmp}"
+
+
+def test_git_force_push_to_main_or_master_blocked(tmp_path):
+    state_file = str(tmp_path / "bg_state_git_force.json")
+
+    blocked_pushes = [
+        "git push --force origin main",
+        "git push -f origin master",
+        "git push -uf origin main",
+        "git push --force-with-lease origin main",
+        "git push --force-with-lease=main:abc1234 origin",
+        "git push origin main --force",
+        "git push origin +main",
+        "git push origin +master",
+        "git push origin +HEAD:main",
+        "git push origin +HEAD:refs/heads/master",
+        "git -C /workspace push --force origin refs/heads/main",
+        'bash -c "git push -f origin main"',
+        'python3 /workspace/tools/forge.py job start --name "ForcePush" --command "git push --force origin main"',
+    ]
+    for cmd in blocked_pushes:
+        ok, reason = check_tool_use("run_command", {"CommandLine": cmd}, state_file=state_file, cwd="/workspace")
+        assert ok is False, f"Expected force-push to main/master to be blocked: {cmd}"
+        assert "force-push" in reason.lower()
+        assert load_state(state_file).get("offload_dispatched") is False
+
+    allowed_pushes = [
+        "git push origin main",
+        "git push -u origin master",
+        "git push --force-with-lease origin feat/hard-gate",
+        "git push -f origin feat/main-refactor",
+        "git push origin +HEAD:feat/test-branch",
+    ]
+    for idx, cmd in enumerate(allowed_pushes):
+        s_file = str(tmp_path / f"bg_state_git_ok_{idx}.json")
+        ok, reason = check_tool_use("run_command", {"CommandLine": cmd}, state_file=s_file, cwd="/workspace")
+        assert ok is True, f"Expected safe/feature branch push to be allowed: {cmd} ({reason})"
+
+
+def test_github_repo_admin_and_visibility_mutations_blocked(tmp_path):
+    state_file = str(tmp_path / "bg_state_gh_admin.json")
+
+    blocked_gh_cmds = [
+        "gh repo delete owner/repo --yes",
+        "gh repo archive owner/repo --yes",
+        "gh repo edit owner/repo --visibility public",
+        "gh repo edit --visibility=private owner/repo",
+        "gh api -X DELETE /repos/owner/repo",
+        "gh api repos/owner/repo --method DELETE",
+        "curl -X DELETE https://api.github.com/repos/owner/repo",
+        "gh api -X PATCH /repos/owner/repo -f visibility=public",
+        "gh api -X PATCH /repos/owner/repo -F private=false",
+        'curl -X PATCH https://api.github.com/repos/owner/repo -d \'{"visibility": "public"}\'',
+        'curl -X PATCH https://api.github.com/repos/owner/repo -d \'{"private": false}\'',
+    ]
+    for cmd in blocked_gh_cmds:
+        ok, reason = check_tool_use("run_command", {"CommandLine": cmd}, state_file=state_file, cwd="/workspace")
+        assert ok is False, f"Expected GitHub repo admin/visibility command to be blocked: {cmd}"
+        assert "GitHub" in reason
+
+    allowed_gh_cmds = [
+        "gh repo view owner/repo",
+        "gh api /repos/owner/repo",
+        'gh pr create --title "feat: add gate" --body "verified"',
+    ]
+    for cmd in allowed_gh_cmds:
+        ok, reason = check_destructive_system_and_exposure_gate(cmd, cwd="/workspace")
+        assert ok is True, f"Expected non-destructive gh command to be allowed: {cmd} ({reason})"
+
+
+def test_cloudflare_public_exposure_mutations_blocked(tmp_path):
+    state_file = str(tmp_path / "bg_state_cf.json")
+
+    blocked_cf_cmds = [
+        "cloudflared tunnel route dns homelab-tunnel app.example.com",
+        "cloudflared tunnel --config /etc/cloudflared/config.yml route ip add 203.0.113.0/24 tun-id",
+        'curl -X POST https://api.cloudflare.com/client/v4/zones/zone123/dns_records -d \'{"type":"CNAME","name":"app"}\'',
+        'curl -X PUT https://api.cloudflare.com/client/v4/accounts/acc123/cfd_tunnel/tun456/configurations --data \'{}\'',
+        'curl --request PATCH https://api.cloudflare.com/client/v4/zones/zone123/dns_records/rec789 -d \'{"proxied":true}\'',
+        "python3 -c \"import requests; requests.post('https://api.cloudflare.com/client/v4/zones/z1/dns_records', json={})\"",
+    ]
+    for cmd in blocked_cf_cmds:
+        ok, reason = check_tool_use("run_command", {"CommandLine": cmd}, state_file=state_file, cwd="/workspace")
+        assert ok is False, f"Expected Cloudflare public exposure mutation to be blocked: {cmd}"
+        assert "Cloudflare" in reason
+
+    allowed_cf_cmds = [
+        'curl -s -H "Authorization: Bearer tok" https://api.cloudflare.com/client/v4/zones/zone123/dns_records',
+        "curl -s https://api.cloudflare.com/client/v4/accounts/acc123/cfd_tunnel",
+        "cloudflared tunnel list",
+    ]
+    for cmd in allowed_cf_cmds:
+        ok, reason = check_destructive_system_and_exposure_gate(cmd, cwd="/workspace")
+        assert ok is True, f"Expected read-only Cloudflare inspection to be allowed: {cmd} ({reason})"
+
+
+def test_secrets_file_mutation_and_shell_redirect_gate(tmp_path):
+    state_file = str(tmp_path / "bg_state_secrets.json")
+
+    # 1. Direct file write/edit tools targeting /secrets/* (including .. traversal)
+    for tool_name, args in (
+        ("write_file", {"Path": "/secrets/env.json", "Content": "{}"}),
+        ("write_to_file", {"TargetFile": "/secrets/pii_rules.json", "CodeContent": "{}"}),
+        ("edit_file", {"Path": "/secrets/env.json", "Target": "a", "Replacement": "b"}),
+        ("replace_file_content", {"TargetFile": "../secrets/env.json", "TargetContent": "a", "ReplacementContent": "b"}),
+    ):
+        ok, reason = check_tool_use(tool_name, args, state_file=state_file, cwd="/workspace")
+        assert ok is False, f"Expected {tool_name} on {args} to be blocked"
+        assert "/secrets/*" in reason
+
+    # 2. Shell redirects, file copy/move/sed/dd, and inline Python overwrites targeting /secrets/*
+    blocked_secret_cmds = [
+        "echo '{}' > /secrets/env.json",
+        "cat /tmp/override.json >> /secrets/pii_rules.json",
+        "echo '{}' | tee /secrets/token.json",
+        "cp /tmp/fake.json /secrets/env.json",
+        "mv /tmp/fake.json /secrets/env.json",
+        "sed -i 's/old/new/g' /secrets/env.json",
+        "dd if=/tmp/in.bin of=/secrets/env.json",
+        "python3 -c \"open('/secrets/env.json', 'w').write('{}')\"",
+        "python3 -c \"from pathlib import Path; Path('/secrets/env.json').write_text('{}')\"",
+    ]
+    for cmd in blocked_secret_cmds:
+        ok, reason = check_tool_use("run_command", {"CommandLine": cmd}, state_file=state_file, cwd="/workspace")
+        assert ok is False, f"Expected shell overwrite of /secrets/* to be blocked: {cmd}"
+        assert "/secrets/*" in reason
+
+    # 3. Read-only access in non-Crab-Cavern turns remains allowed
+    ok_ro_file, _ = check_tool_use("read_file", {"Path": "/secrets/env.json"}, state_file=state_file, cwd="/workspace")
+    assert ok_ro_file is True
+    ok_ro_py, _ = check_destructive_system_and_exposure_gate(
+        "python3 -c \"import json; d = json.load(open('/secrets/env.json'))\"",
+        cwd="/workspace",
+    )
+    assert ok_ro_py is True
+
+
+def test_destructive_container_and_nas_ssh_commands_blocked(tmp_path):
+    from unittest.mock import patch
+
+    state_file = str(tmp_path / "bg_state_host.json")
+    vol1 = "/" + "volume1"
+
+    blocked_host_cmds = [
+        "docker system prune",
+        "docker system prune -af --volumes",
+        "docker volume rm postgres_data",
+        "docker volume prune -f",
+        "docker compose down",
+        "docker-compose down --remove-orphans",
+        "docker compose -f /docker/mealie/docker-compose.yml down -v",
+        "synopkg stop ContainerManager",
+        "sudo systemctl stop pkgctl-ContainerManager",
+        "ssh admin@203.0.113.10 'sudo synopkg stop ContainerManager'",
+        f"ssh admin@203.0.113.10 'rm -rf {vol1}'",
+        f"ssh -p 22 admin@203.0.113.10 'sudo rm -rf {vol1}/docker/plex'",
+        "ssh admin@203.0.113.10 'sudo reboot'",
+        "ssh admin@203.0.113.10 reboot",
+        "ssh admin@203.0.113.10 'sudo shutdown -h now'",
+        "ssh admin@203.0.113.10 '/sbin/poweroff'",
+        "ssh admin@203.0.113.10 'sudo synopkg uninstall HyperBackup'",
+    ]
+    with patch("shutil.which", return_value="/usr/bin/docker"):
+        for cmd in blocked_host_cmds:
+            ok, reason = check_tool_use("run_command", {"CommandLine": cmd}, state_file=state_file, cwd="/workspace")
+            assert ok is False, f"Expected destructive container/host command to be blocked: {cmd}"
+            assert "Hard Destructive" in reason
+
+    allowed_host_cmds = [
+        "docker compose -f /docker/mealie/docker-compose.yml down",
+        "docker compose -p mealie down",
+        "docker compose --project-directory /docker/mealie down",
+        "docker compose down mealie",
+        "synopkg status ContainerManager",
+        "ssh admin@203.0.113.10 'docker ps && uptime'",
+        'python3 -c "from concurrent.futures import ThreadPoolExecutor; e = ThreadPoolExecutor(); e.shutdown(wait=True)"',
+    ]
+    with patch("shutil.which", return_value="/usr/bin/docker"):
+        for idx, cmd in enumerate(allowed_host_cmds):
+            s_file = str(tmp_path / f"bg_state_host_ok_{idx}.json")
+            ok, reason = check_tool_use("run_command", {"CommandLine": cmd}, state_file=s_file, cwd="/workspace")
+            assert ok is True, f"Expected scoped/non-destructive command to be allowed: {cmd} ({reason})"
+
+
+def test_approved_card_execution_passthrough_and_forge_worker_non_bypass(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    vol1 = "/" + "volume1"
+    sample_cmds = [
+        'sqlite3 /workspace/data/forge.db "DROP TABLE builds"',
+        "git push --force origin main",
+        "gh repo delete owner/repo --yes",
+        "cloudflared tunnel route dns tun app.example.com",
+        "echo '{}' > /secrets/env.json",
+        "docker system prune -af",
+        "docker compose down",
+        f"ssh admin@203.0.113.10 'rm -rf {vol1}/old_stack'",
+        "ssh admin@203.0.113.10 'sudo reboot'",
+    ]
+
+    # 1. FORGE_WORKER_ACTIVE=1 and /tmp/forge-wt-* MUST NOT bypass the hard destructive gate
+    monkeypatch.setenv("FORGE_WORKER_ACTIVE", "1")
+    for cmd in sample_cmds:
+        ok_wt, _ = check_destructive_system_and_exposure_gate(cmd, cwd="/tmp/forge-wt-fg-999-c0")
+        assert ok_wt is False, f"FORGE worker must not bypass destructive gate for: {cmd}"
+    ok_sec_wt, _ = check_secrets_mutation_gate("/secrets/env.json", cwd="/tmp/forge-wt-fg-999-c0")
+    assert ok_sec_wt is False
+
+    # 2. Pure unchained Decision Card staging (`forge.py propose`) is permitted, while chained execution is blocked
+    propose_cmd = (
+        'python3 /workspace/tools/forge.py propose --channel 1542081375287640084 '
+        '--category "maintenance" --title "Prune Docker" --summary "Prune unused images" '
+        '--handler "shell_cmd" --payload \'{"command": "docker system prune -af"}\' --post'
+    )
+    assert check_destructive_system_and_exposure_gate(propose_cmd, cwd="/workspace")[0] is True
+    assert check_destructive_system_and_exposure_gate(propose_cmd + " && docker system prune -af", cwd="/workspace")[0] is False
+
+    # 3. FORGE_APPROVED_CARD_EXECUTION=1 allows full pass-through across all gates
+    monkeypatch.setenv("FORGE_WORKER_ACTIVE", "")
+    monkeypatch.setenv("FORGE_APPROVED_CARD_EXECUTION", "1")
+    with patch("shutil.which", return_value="/usr/bin/docker"):
+        for idx, cmd in enumerate(sample_cmds):
+            s_file = str(tmp_path / f"bg_state_approved_{idx}.json")
+            ok_cmd, reason_cmd = check_tool_use(
+                "run_command",
+                {"CommandLine": cmd},
+                state_file=s_file,
+                cwd="/workspace",
+            )
+            assert ok_cmd is True, f"Expected FORGE_APPROVED_CARD_EXECUTION=1 to allow '{cmd}', got: {reason_cmd}"
+
+        ok_sec_edit, reason_sec_edit = check_tool_use(
+            "edit_file",
+            {"Path": "/secrets/env.json", "Target": "a", "Replacement": "b"},
+            state_file=str(tmp_path / "bg_state_approved_edit.json"),
+            cwd="/workspace",
+        )
+        assert ok_sec_edit is True, f"Expected approved edit_file on /secrets/env.json to pass: {reason_sec_edit}"
+
+        ok_sec_write, reason_sec_write = check_tool_use(
+            "write_file",
+            {"Path": "/secrets/env.json", "Content": "{}"},
+            state_file=str(tmp_path / "bg_state_approved_write.json"),
+            cwd="/workspace",
+        )
+        assert ok_sec_write is True, f"Expected approved write_file on /secrets/env.json to pass: {reason_sec_write}"
+
 
 
 
