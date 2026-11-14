@@ -99,6 +99,13 @@ OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
 DEFAULT_WORKER_MODEL = "gemini-4-hydrogen-xhigh"
 ESCALATION_WORKER_MODEL = "gemini-4-argon-high"
 FINAL_ESCALATION_WORKER_MODEL = "gemini-4-carbon-high"
+PREFLIGHT_ARCHITECT_MODEL = "gemini-4-carbon-high"
+CORE_INFRA_PREFLIGHT_PATHS = (
+    "tools/bridge",
+    "tools/forge.py",
+    "tools/batch_guard.py",
+    "tools/nas_config.py",
+)
 DEFAULT_LEASE_TTL_SECONDS = 300.0
 
 WORKER_MODEL_FALLBACK_MAP: dict[str, str] = {
@@ -975,6 +982,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
                 fact_sheet_json TEXT NOT NULL DEFAULT '[]',
                 shared_context_json TEXT NOT NULL DEFAULT '[]',
                 propagate_branches_json TEXT NOT NULL DEFAULT '[]',
+                plan_json TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL DEFAULT 'queued',
                 tokens_json TEXT NOT NULL DEFAULT '{}',
                 total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1058,6 +1066,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
         _ensure_column(conn, "forge_builds", "objective", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "forge_builds", "shared_context_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "forge_builds", "propagate_branches_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "forge_builds", "plan_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "forge_builds", "tokens_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "forge_builds", "total_tokens", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "forge_chunks", "repo", "TEXT NOT NULL DEFAULT ''")
@@ -3049,6 +3058,341 @@ def _detect_touches_core_bridge(plan: dict) -> bool:
                 return True
     return False
 
+_CARBON_PREFLIGHT_NOTES_HEADER = "### Carbon (High) Pre-Flight Review Notes:"
+
+
+def _row_get(row: sqlite3.Row | dict | Any, key: str, default: Any = None) -> Any:
+    """Safely read a field from either a dict or a sqlite3.Row."""
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key] if key in row.keys() else default
+    except Exception:
+        return default
+
+
+def _parse_json_value(raw: Any, default: Any) -> Any:
+    """Decode a JSON string or return an already-parsed value, falling back to `default`."""
+    if raw is None:
+        return default
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return default
+        try:
+            return json.loads(stripped)
+        except Exception:
+            return default
+    return raw
+
+
+def should_run_carbon_preflight(build: sqlite3.Row | dict, chunks: list[sqlite3.Row | dict]) -> bool:
+    """Return True if the build qualifies for a Gemini 4 Carbon (High) pre-flight architectural review."""
+    raw_plan = _row_get(build, "plan_json")
+    plan_obj = _parse_json_value(raw_plan, {})
+    if isinstance(plan_obj, dict):
+        if plan_obj.get("review_spec") is False:
+            return False
+        if plan_obj.get("review_spec") is True:
+            return True
+
+    if len(chunks) >= 2 or bool(_row_get(build, "touches_core_bridge", 0)):
+        return True
+
+    ws_prefix = f"{str(WORKSPACE_DIR).rstrip('/')}/"
+    for chunk in chunks:
+        raw_tf = _row_get(chunk, "target_files_json")
+        if raw_tf is None:
+            raw_tf = _row_get(chunk, "target_files")
+        tf_val = _parse_json_value(raw_tf, [])
+        for tf in _normalize_file_list(tf_val):
+            norm = tf.replace("\\", "/")
+            if norm.startswith(ws_prefix):
+                norm = norm[len(ws_prefix):]
+            if any(norm == core_path or norm.startswith(core_path) for core_path in CORE_INFRA_PREFLIGHT_PATHS):
+                return True
+
+    return False
+
+
+def apply_carbon_preflight_refinements(
+    build_id: str,
+    review_payload: dict,
+    db_path: Path | str = FORGE_DB_PATH,
+) -> int:
+    """Apply Carbon (High) pre-flight review notes and target_symbols to pending chunks for `build_id`."""
+    if not isinstance(review_payload, dict):
+        return 0
+    refinements = review_payload.get("chunk_refinements")
+    if not isinstance(refinements, dict) or not refinements:
+        return 0
+
+    refined_count = 0
+    with get_db_connection(db_path) as conn:
+        pending_rows = conn.execute(
+            "SELECT id, instructions, target_symbols_json FROM forge_chunks WHERE build_id = ? AND status = 'pending'",
+            (build_id,),
+        ).fetchall()
+        pending_by_id = {row["id"]: row for row in pending_rows}
+
+        for chunk_id, ref in refinements.items():
+            row = pending_by_id.get(str(chunk_id))
+            if row is None or not isinstance(ref, dict):
+                continue
+
+            raw_notes = ref.get("review_notes")
+            if not raw_notes:
+                raw_notes = ref.get("append_instructions")
+            if isinstance(raw_notes, list):
+                notes_text = "\n".join(str(item).strip() for item in raw_notes if str(item).strip()).strip()
+            elif isinstance(raw_notes, str):
+                notes_text = raw_notes.strip()
+            else:
+                notes_text = ""
+
+            curr_instructions = row["instructions"] or ""
+            new_instructions = curr_instructions
+            changed = False
+            if notes_text and _CARBON_PREFLIGHT_NOTES_HEADER not in curr_instructions:
+                new_instructions = f"{curr_instructions}\n\n{_CARBON_PREFLIGHT_NOTES_HEADER}\n{notes_text}"
+                changed = True
+
+            raw_curr_syms = _parse_json_value(row["target_symbols_json"], [])
+            curr_syms = _normalize_target_symbols(raw_curr_syms)
+            extra_syms_raw = ref.get("target_symbols")
+            extra_syms = _normalize_target_symbols(extra_syms_raw) if extra_syms_raw else []
+            merged_syms = list(curr_syms)
+            syms_changed = False
+            for sym in extra_syms:
+                if sym not in merged_syms:
+                    merged_syms.append(sym)
+                    syms_changed = True
+            if syms_changed:
+                changed = True
+
+            if changed:
+                conn.execute(
+                    "UPDATE forge_chunks SET instructions = ?, target_symbols_json = ? WHERE id = ? AND build_id = ? AND status = 'pending'",
+                    (
+                        new_instructions,
+                        json.dumps(merged_syms) if syms_changed else (row["target_symbols_json"] or "[]"),
+                        row["id"],
+                        build_id,
+                    ),
+                )
+                refined_count += 1
+
+    return refined_count
+
+
+def _build_carbon_preflight_prompt(
+    build_id: str,
+    build: sqlite3.Row | dict,
+    chunks: list[sqlite3.Row | dict],
+) -> str:
+    """Build a concise architectural review prompt for Gemini 4 Carbon (High)."""
+    build_title = str(_row_get(build, "title") or "").strip()
+    objective = str(_row_get(build, "objective") or build_title).strip()
+    repo = str(_row_get(build, "repo") or "/workspace").strip()
+
+    lines = [
+        "You are performing a fast read-only pre-flight architectural spec review for a FORGE build.",
+        "Do NOT modify any files or run destructive commands.",
+        "Audit all chunks for cross-chunk contract mismatches, missing edge cases, or verification gaps.",
+        "",
+        f"Build ID: {build_id}",
+        f"Build Title: {build_title}",
+        f"Objective: {objective}",
+        f"Repository: {repo}",
+        "",
+        "Chunks:",
+    ]
+
+    for idx, ch in enumerate(chunks):
+        c_id = str(_row_get(ch, "id") or f"{build_id}-c{idx}")
+        c_title = str(_row_get(ch, "title") or "").strip()
+        c_status = str(_row_get(ch, "status") or "pending").strip()
+        raw_tf = _row_get(ch, "target_files_json")
+        if raw_tf is None:
+            raw_tf = _row_get(ch, "target_files")
+        t_files = _normalize_file_list(_parse_json_value(raw_tf, []))
+        raw_ts = _row_get(ch, "target_symbols_json")
+        if raw_ts is None:
+            raw_ts = _row_get(ch, "target_symbols")
+        t_syms = _normalize_target_symbols(_parse_json_value(raw_ts, []))
+        v_cmd = str(_row_get(ch, "verification_cmd") or "").strip()
+        c_instr = str(_row_get(ch, "instructions") or "").strip()
+        if len(c_instr) > 6000:
+            c_instr = c_instr[:6000] + "\n... (truncated)"
+        lines.extend([
+            "---",
+            f"Chunk ID: {c_id} (index {idx}, status={c_status})",
+            f"Title: {c_title}",
+            f"Target Files: {json.dumps(t_files)}",
+            f"Target Symbols: {json.dumps(t_syms)}",
+            f"Verification Command: {v_cmd or '(auto-baseline)'}",
+            "Instructions:",
+            c_instr,
+        ])
+
+    lines.extend([
+        "---",
+        "",
+        "Output ONLY a JSON object (no markdown prose outside the JSON):",
+        "{",
+        '  "summary": "...",',
+        '  "chunk_refinements": {',
+        '    "<chunk_id>": {',
+        '      "review_notes": "bulleted edge cases/constraints to enforce",',
+        '      "target_symbols": {"path/to/file.py": ["OptionalExtraSymbol"]}',
+        "    }",
+        "  }",
+        "}",
+        'Return "chunk_refinements": {} if no refinements are needed.',
+    ])
+    return "\n".join(lines)
+
+
+def _parse_json_object_from_text(text: str) -> Optional[dict[str, Any]]:
+    """Extract a JSON object from plain JSON, fenced code blocks, or mixed assistant text."""
+    if not text or not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    try:
+        direct = json.loads(stripped)
+        if isinstance(direct, dict):
+            return direct
+    except Exception:
+        pass
+
+    for match in re.finditer(r"```(?:json)?\s*\n?(.*?)```", stripped, flags=re.DOTALL | re.IGNORECASE):
+        candidate = match.group(1).strip()
+        if not candidate:
+            continue
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    decoder = json.JSONDecoder()
+    fallback_dict: Optional[dict[str, Any]] = None
+    idx = 0
+    while idx < len(stripped):
+        pos = stripped.find("{", idx)
+        if pos == -1:
+            break
+        try:
+            obj, end_pos = decoder.raw_decode(stripped, pos)
+            if isinstance(obj, dict):
+                if "chunk_refinements" in obj or "summary" in obj:
+                    return obj
+                if fallback_dict is None:
+                    fallback_dict = obj
+            idx = max(pos + 1, end_pos)
+        except Exception:
+            idx = pos + 1
+    return fallback_dict
+
+
+def _extract_stream_json_assistant_text(raw_output: str) -> tuple[str, Optional[str]]:
+    """Extract assistant text and conversation_id from `agy --output-format=stream-json` output."""
+    if not raw_output:
+        return "", None
+
+    conv_id: Optional[str] = None
+    agent_chunks: list[str] = []
+    result_text = ""
+    saw_stream_event = False
+
+    for line in raw_output.splitlines():
+        line_s = line.strip()
+        if not line_s.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line_s)
+        except Exception:
+            continue
+        if not isinstance(ev, dict):
+            continue
+
+        cid = ev.get("conversation_id")
+        if not cid and isinstance(ev.get("result"), dict):
+            cid = ev["result"].get("conversation_id")
+        if cid and not conv_id:
+            conv_id = str(cid)
+
+        ev_type = ev.get("event") or ev.get("type")
+        if (
+            ev_type
+            in (
+                "init",
+                "result",
+                "step_update",
+                "tool",
+                "tool_call",
+                "tool_use",
+                "content",
+                "message",
+                "text",
+                "delta",
+                "assistant",
+            )
+            or "step_update" in ev
+            or "result" in ev
+        ):
+            saw_stream_event = True
+
+        if ev_type == "result" or "result" in ev:
+            res = ev.get("result")
+            if isinstance(res, dict) and isinstance(res.get("response"), str) and res["response"].strip():
+                result_text = res["response"].strip()
+            elif isinstance(ev.get("response"), str) and ev["response"].strip():
+                result_text = ev["response"].strip()
+
+        if ev_type == "step_update" or "step_update" in ev:
+            step = ev.get("step_update")
+            if isinstance(step, dict):
+                stype = step.get("step_type")
+                tname = step.get("tool_name") or (step.get("tool_info") or {}).get("name")
+                if stype == "tool" or tname:
+                    agent_chunks.clear()
+                elif stype == "agent_response":
+                    delta = step.get("text_delta") or step.get("text") or step.get("content")
+                    if isinstance(delta, str) and delta:
+                        agent_chunks.append(delta)
+        elif ev_type in ("tool", "tool_call", "tool_use"):
+            agent_chunks.clear()
+        elif ev_type in ("content", "message", "text", "delta"):
+            delta = ev.get("content") or ev.get("text") or ev.get("delta")
+            if isinstance(delta, str) and delta:
+                agent_chunks.append(delta)
+        elif ev_type == "assistant" and isinstance(ev.get("message"), dict):
+            msg_content = ev["message"].get("content")
+            if isinstance(msg_content, str) and msg_content:
+                agent_chunks.append(msg_content)
+            elif isinstance(msg_content, list):
+                for block in msg_content:
+                    if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                        agent_chunks.append(block["text"])
+
+    streamed_text = "".join(agent_chunks).strip()
+    if result_text and (_parse_json_object_from_text(result_text) is not None or not streamed_text):
+        return result_text, conv_id
+    if streamed_text:
+        return streamed_text, conv_id
+    if result_text:
+        return result_text, conv_id
+    if not saw_stream_event:
+        return raw_output.strip(), conv_id
+    return "", conv_id
+
 
 COMPLETED_WIDGET_TTL_SECONDS = 3600.0
 
@@ -4439,8 +4783,8 @@ def _enqueue_build_impl(
             INSERT INTO forge_builds (
                 id, title, objective, repo, tier, touches_core_bridge,
                 origin_channel_id, origin_thread_id, origin_conv_id,
-                fact_sheet_json, shared_context_json, propagate_branches_json, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                fact_sheet_json, shared_context_json, propagate_branches_json, plan_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
             """,
             (
                 build_id,
@@ -4455,6 +4799,7 @@ def _enqueue_build_impl(
                 json.dumps(norm_fact_sheet),
                 json.dumps(build_shared_ctx),
                 json.dumps(norm_pb),
+                json.dumps(plan, default=str),
                 now,
                 now,
             ),
@@ -6525,6 +6870,137 @@ class ForgeSupervisor:
         self._active_build_procs[target_build_id] = proc
         return target_build_id
 
+    def run_carbon_preflight_review(
+        self,
+        build_id: str,
+        build: sqlite3.Row | dict,
+        chunks: list[sqlite3.Row | dict],
+    ) -> bool:
+        """Run an automated Gemini 4 Carbon (High) pre-flight spec review and refinement step (fail-open)."""
+        FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        marker_path = FORGE_LOGS_DIR / f"preflight-{build_id}.done"
+        if marker_path.exists():
+            return False
+
+        pending_chunks = [
+            c for c in chunks if str(_row_get(c, "status") or "pending").strip().lower() == "pending"
+        ]
+        if not pending_chunks:
+            return False
+
+        build_log_path = FORGE_LOGS_DIR / f"build-{build_id}.log"
+
+        def _log_preflight(msg: str) -> None:
+            try:
+                FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+                with open(build_log_path, "a", encoding="utf-8") as lf:
+                    lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}] [Carbon Pre-Flight] {msg}\n")
+                    lf.flush()
+            except Exception:
+                pass
+
+        first_pending_id = str(_row_get(pending_chunks[0], "id") or "")
+        if first_pending_id:
+            try:
+                with self._state_lock, get_db_connection(self.db_path) as conn:
+                    conn.execute(
+                        "UPDATE forge_chunks SET live_status = ? WHERE id = ?",
+                        ("Carbon (High) pre-flight spec review...", first_pending_id),
+                    )
+                    conn.execute(
+                        "UPDATE forge_builds SET updated_at = ? WHERE id = ?",
+                        (time.time(), build_id),
+                    )
+            except Exception:
+                pass
+        try:
+            post_or_update_build_widget(build_id, db_path=self.db_path)
+        except Exception:
+            pass
+
+        preflight_ok = False
+        start_ts = time.time()
+        try:
+            prompt = _build_carbon_preflight_prompt(build_id, build, chunks)
+            repo_str = str(_row_get(build, "repo") or WORKSPACE_DIR).strip() or str(WORKSPACE_DIR)
+            repo_dir = Path(repo_str).resolve()
+            if not repo_dir.exists():
+                repo_dir = WORKSPACE_DIR
+
+            agy_cmd = [
+                "/usr/local/bin/agy",
+                f"--add-dir={repo_dir}",
+                f"-p={prompt}",
+                "--output-format=stream-json",
+                "--dangerously-skip-permissions",
+                f"--model={PREFLIGHT_ARCHITECT_MODEL}",
+            ]
+            preflight_env = os.environ.copy()
+            preflight_env["FORGE_WORKER_ACTIVE"] = "1"
+
+            proc_res = subprocess.run(
+                agy_cmd,
+                cwd=str(repo_dir),
+                env=preflight_env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+            elapsed_s = max(0.0, time.time() - start_ts)
+
+            stream_raw = (proc_res.stdout or "").strip() or (proc_res.stderr or "").strip()
+            assistant_text, preflight_conv_id = _extract_stream_json_assistant_text(stream_raw)
+
+            if proc_res.returncode != 0:
+                err_tail = ((proc_res.stdout or "") + "\n" + (proc_res.stderr or "")).strip()[-400:]
+                _log_preflight(
+                    f"Fail-open: agy exited with code {proc_res.returncode} in {elapsed_s:.1f}s: {err_tail}"
+                )
+                return False
+
+            try:
+                preflight_tok = record_forge_telemetry(
+                    build_id=build_id,
+                    chunk_id="preflight",
+                    conv_id=preflight_conv_id,
+                    model=PREFLIGHT_ARCHITECT_MODEL,
+                    role="preflight_architect",
+                    elapsed_s=elapsed_s,
+                )
+                update_chunk_and_build_tokens(build_id, "preflight", preflight_tok, db_path=self.db_path)
+            except Exception as pte:
+                _log_preflight(f"Warning: recording preflight telemetry failed: {pte}")
+
+            review_payload = _parse_json_object_from_text(assistant_text)
+            if not isinstance(review_payload, dict):
+                _log_preflight(
+                    f"Fail-open: unable to parse JSON payload from response ({len(assistant_text)} chars)."
+                )
+                return False
+
+            refined_count = apply_carbon_preflight_refinements(build_id, review_payload, db_path=self.db_path)
+            summary = str(review_payload.get("summary") or "").strip() or "(no summary provided)"
+            _log_preflight(
+                f"Completed in {elapsed_s:.1f}s (model={PREFLIGHT_ARCHITECT_MODEL}, refined_chunks={refined_count}): {summary}"
+            )
+            preflight_ok = True
+            return True
+        except subprocess.TimeoutExpired:
+            _log_preflight(f"Fail-open: pre-flight review timed out after {time.time() - start_ts:.1f}s (limit=90s).")
+            return False
+        except Exception as exc:
+            _log_preflight(f"Fail-open: pre-flight review raised exception: {exc}")
+            return False
+        finally:
+            try:
+                marker_path.write_text(
+                    json.dumps({"build_id": build_id, "ok": preflight_ok, "timestamp": time.time()}) + "\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
     def run_build_pipeline(self, build_id: str) -> bool:
         """Execute pending chunks for `build_id` with up to `max_parallel_chunks` concurrent Vulcan worktree workers."""
         lock_path = self._build_lock_path(build_id)
@@ -6568,6 +7044,12 @@ class ForgeSupervisor:
                         subprocess.run(["git", "branch", "-f", staging_ref, start_ref], cwd=str(r_dir), capture_output=True, timeout=10)
                     finally:
                         _release_file_lock(git_lk)
+
+                if _is_prod_forge_env(self.db_path) and should_run_carbon_preflight(build, chunks):
+                    try:
+                        self.run_carbon_preflight_review(build_id, build, chunks)
+                    except Exception as pf_exc:
+                        print(f"[FORGE] Warning in Carbon pre-flight review for {build_id}: {pf_exc}", file=sys.stderr)
 
             active_futures: dict[Any, sqlite3.Row] = {}
             failed_pipeline = False
