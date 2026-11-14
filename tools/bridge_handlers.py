@@ -674,6 +674,18 @@ async def handle_on_ready(
         await presence_fn()
     print(f"[Antigravity] Logged in as {bot.user} (ID: {bot.user.id})")
 
+    if start_workers_fn:
+        try:
+            start_workers_fn()
+        except Exception as swe:
+            print(f"[Bridge] Warning starting workers in handle_on_ready: {swe}")
+
+    if start_scheduler_fn:
+        try:
+            await start_scheduler_fn()
+        except Exception as sse:
+            print(f"[Bridge] Warning starting scheduler in handle_on_ready: {sse}")
+
     # Ensure Persistent MCP Daemon is active
     try:
         from tools.mcp_daemon import ensure_mcp_daemon_running, get_status
@@ -780,9 +792,6 @@ async def handle_on_ready(
     except Exception as pae:
         print(f"[Bridge] Warning scanning pending auth files: {pae}")
 
-    if start_workers_fn:
-        start_workers_fn()
-
     # On initial boot, load persisted turns; on gateway reconnect, preserve active in-memory queue
     if not has_notified_ready:
         if hasattr(turn_queue, "load_persisted"):
@@ -798,9 +807,6 @@ async def handle_on_ready(
                                 asyncio.create_task(turn_queue.put(item))
             except Exception as pe:
                 print(f"[Bridge] Error loading persisted turn queue: {pe}")
-
-    if start_scheduler_fn:
-        await start_scheduler_fn()
 
     if not has_notified_ready:
         has_notified_ready = True

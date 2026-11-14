@@ -1892,7 +1892,10 @@ class BridgeScheduler:
                 print(f"[BridgeScheduler] Warning running Vulcan startup hygiene: {e}")
         # Evaluate missed/due jobs on startup (Zero only; Vulcan runs lean #forge-only loop)
         if not is_vulc:
-            await self._evaluate_and_dispatch_jobs(is_startup=True)
+            try:
+                await self._evaluate_and_dispatch_jobs(is_startup=True)
+            except Exception as e:
+                print(f"[BridgeScheduler] Warning during startup job evaluation: {e}")
         self._task = asyncio.create_task(self._loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
@@ -1941,6 +1944,8 @@ class BridgeScheduler:
                     continue
                 try:
                     raw_cmd = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                    if "--output-format=" in raw_cmd or "forge.py" in raw_cmd or "/usr/local/bin/agy" in raw_cmd:
+                        continue
                     if any(marker in raw_cmd for marker in zero_only_markers):
                         os.kill(pid, _signal.SIGTERM)
                         killed_pids.append(pid)
