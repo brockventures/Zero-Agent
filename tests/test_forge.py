@@ -673,3 +673,84 @@ def test_preflight_check_verification_cmd_rejects_slow_benchmark_scripts(tmp_pat
     assert ok_fast is True
     assert err_fast == ""
 
+
+# ==============================================================================
+# 5. Read-Only Skill Audit (__pycache__ Temporary cfile) Tests
+# ==============================================================================
+
+
+def test_audit_and_prune_skills_uses_temp_cfile(tmp_path: Path, monkeypatch) -> None:
+    """audit_and_prune_skills.py compiles scripts via temp cfile without writing __pycache__."""
+    import importlib.util
+    import py_compile
+
+    script_path = Path(_REPO_ROOT) / ".agents" / "skills" / "scar-to-skill" / "scripts" / "audit_and_prune_skills.py"
+    spec = importlib.util.spec_from_file_location("audit_and_prune_skills", script_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    orig_dont_write_bytecode = sys.dont_write_bytecode
+    try:
+        spec.loader.exec_module(mod)
+        assert sys.dont_write_bytecode is True
+    finally:
+        monkeypatch.setattr(sys, "dont_write_bytecode", orig_dont_write_bytecode)
+
+    skills_root = tmp_path / "skills"
+    skill_dir = skills_root / "sample-ro-skill"
+    scripts_dir = skill_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: sample-ro-skill\n"
+        "description: Sample skill for testing read-only py_compile behavior.\n"
+        "---\n\n"
+        + ("Detailed methodology instructions for testing read-only skill audits. " * 2)
+        + "\n",
+        encoding="utf-8",
+    )
+    py_script = scripts_dir / "run_check.py"
+    py_script.write_text("def check():\n    return 'ok'\n", encoding="utf-8")
+
+    compile_calls: list[tuple[str, str | None, bool]] = []
+    real_compile = py_compile.compile
+
+    def spy_compile(file, cfile=None, dfile=None, doraise=False, optimize=-1, invalidation_mode=None, quiet=0):
+        compile_calls.append((str(file), cfile, doraise))
+        return real_compile(
+            file,
+            cfile=cfile,
+            dfile=dfile,
+            doraise=doraise,
+            optimize=optimize,
+            invalidation_mode=invalidation_mode,
+            quiet=quiet,
+        )
+
+    monkeypatch.setattr(mod.py_compile, "compile", spy_compile)
+    monkeypatch.setenv("SKILLS_DIR", str(skills_root))
+
+    rc = mod.audit()
+    assert rc == 0
+    assert len(compile_calls) == 1
+    compiled_src, compiled_cfile, doraise_flag = compile_calls[0]
+    assert Path(compiled_src) == py_script
+    assert doraise_flag is True
+    assert compiled_cfile is not None
+    assert compiled_cfile.endswith("run_check.pyc")
+    assert Path(compiled_cfile).parent != scripts_dir
+    assert "__pycache__" not in compiled_cfile
+    assert not (scripts_dir / "__pycache__").exists()
+
+    # Also verify --skills-dir CLI override works without writing __pycache__
+    compile_calls.clear()
+    monkeypatch.delenv("SKILLS_DIR", raising=False)
+    cli_proc = subprocess.run(
+        [sys.executable, str(script_path), "--skills-dir", str(skills_root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert cli_proc.returncode == 0, cli_proc.stdout + cli_proc.stderr
+    assert not (scripts_dir / "__pycache__").exists()
+
+

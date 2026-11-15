@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Audit installed skills and validate against Antigravity schema."""
 
+from __future__ import annotations
+
 import argparse
 import os
 import py_compile
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-SKILLS_DIR = Path("/workspace/.agents/skills")
+sys.dont_write_bytecode = True
+
+SKILLS_DIR = Path(os.environ.get("SKILLS_DIR", "/workspace/.agents/skills"))
 
 def parse_frontmatter(content: str):
     """Parse YAML frontmatter without external dependencies."""
@@ -55,17 +60,24 @@ def parse_frontmatter(content: str):
         
     return metadata, body
 
-def audit(verbose: bool = False):
+def audit(verbose: bool = False, skills_dir: Path | str | None = None):
     print("=" * 68)
     print("🧹 SKILL DIRECTORY AUDIT & PRUNING JANITOR (Antigravity Schema)")
     print("=" * 68)
-    
-    if not SKILLS_DIR.exists():
-        print(f"❌ Skills directory not found at {SKILLS_DIR}")
+
+    if skills_dir is not None:
+        target_skills_dir = Path(skills_dir)
+    elif os.environ.get("SKILLS_DIR"):
+        target_skills_dir = Path(os.environ["SKILLS_DIR"])
+    else:
+        target_skills_dir = SKILLS_DIR
+
+    if not target_skills_dir.exists():
+        print(f"❌ Skills directory not found at {target_skills_dir}")
         return 1
-        
-    skill_dirs = sorted([d for d in SKILLS_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")])
-    print(f"Auditing {len(skill_dirs)} installed skills in {SKILLS_DIR}...\n")
+
+    skill_dirs = sorted([d for d in target_skills_dir.iterdir() if d.is_dir() and not d.name.startswith(".")])
+    print(f"Auditing {len(skill_dirs)} installed skills in {target_skills_dir}...\n")
     
     executable_skills = []
     instruction_skills = []
@@ -118,13 +130,16 @@ def audit(verbose: bool = False):
         all_scripts = py_scripts + sh_scripts
         
         script_errors = []
-        for py_file in py_scripts:
-            try:
-                py_compile.compile(str(py_file), doraise=True)
-            except py_compile.PyCompileError as err:
-                script_errors.append(f"{py_file.name}: Syntax error ({err.msg})")
-            except Exception as err:
-                script_errors.append(f"{py_file.name}: {err}")
+        if py_scripts:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                for py_file in py_scripts:
+                    try:
+                        cfile = os.path.join(tmp_dir, f"{py_file.stem}.pyc")
+                        py_compile.compile(str(py_file), cfile=cfile, doraise=True)
+                    except py_compile.PyCompileError as err:
+                        script_errors.append(f"{py_file.name}: Syntax error ({err.msg})")
+                    except Exception as err:
+                        script_errors.append(f"{py_file.name}: {err}")
                 
         if script_errors:
             broken_skills.append((s.name, f"Script compilation errors: {', '.join(script_errors)}", "Fix syntax"))
@@ -174,5 +189,10 @@ def audit(verbose: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Audit and validate installed Antigravity skills.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--skills-dir",
+        default=None,
+        help="Override skills directory path (defaults to SKILLS_DIR env var or /workspace/.agents/skills)",
+    )
     args = parser.parse_args()
-    sys.exit(audit(verbose=args.verbose))
+    sys.exit(audit(verbose=args.verbose, skills_dir=args.skills_dir))
