@@ -25,6 +25,8 @@ from tools.forge import (
     format_origin_failure_envelope,
     get_db_connection,
     init_forge_db,
+    is_slow_benchmark_or_backtest_verification_cmd,
+    preflight_check_verification_cmd,
     render_decision_card_embed,
     run_goldfish_plan_preflight,
     stage_decision,
@@ -539,3 +541,135 @@ def test_execute_decision_custom_shell_timeout(tmp_path: Path) -> None:
     assert res_fast["status"] == "approved"
     assert "Exit 0" in res_fast["receipt"]
     assert "fast success" in res_fast["receipt"]
+
+
+# ==============================================================================
+# 4. Slow Benchmark / Backtest / Feedback-Study Verification Guard Tests
+# ==============================================================================
+
+
+def test_slow_benchmark_helper_detects_slow_scripts_and_targets() -> None:
+    """is_slow_benchmark_or_backtest_verification_cmd flags feedback-study, benchmark, backtest, and walk-forward runs."""
+    slow_cmds = [
+        "pytest tests/test_epic44_feedback_study.py",
+        "pytest -q tests/test_epic44_feedback_study.py::test_walk_forward",
+        "python3 -m pytest tests/test_epic44_feedback_study.py",
+        "python3 tools/benchmark_walk_forward.py --seasons 2020-2024",
+        "python3 scripts/backtest_suite.py",
+        "./walk_forward_eval.py",
+        "python3 tools/run_unified_benchmark_gate.py",
+        "python3 eval_benchmark.py",
+        "python3 strategy_backtest.py",
+        "python3 model_walk_forward_cv.py",
+    ]
+    for cmd in slow_cmds:
+        is_slow, reason = is_slow_benchmark_or_backtest_verification_cmd(cmd)
+        assert is_slow is True, f"Expected slow detection for: {cmd}"
+        assert reason
+
+
+def test_slow_benchmark_helper_allows_fast_tests_modal_and_overrides(monkeypatch) -> None:
+    """Fast unit tests, Modal wrappers, allow_slow_verification=True, and FORGE_ALLOW_SLOW_VERIFICATION=1 pass."""
+    fast_cmds = [
+        "pytest tests/test_forge.py -k slow_benchmark",
+        "pytest tools/test_kalshi_backtester.py",
+        "python3 -m py_compile tools/forge.py && ruff check tools/forge.py",
+        "python3 tools/modal_harness.py --script tools/benchmark_walk_forward.py",
+        "python3 tools/modal_verify.py tests/test_epic44_feedback_study.py",
+        "FORGE_ALLOW_SLOW_VERIFICATION=1 pytest tests/test_epic44_feedback_study.py",
+    ]
+    for cmd in fast_cmds:
+        is_slow, reason = is_slow_benchmark_or_backtest_verification_cmd(cmd)
+        assert is_slow is False, f"Unexpected slow detection for '{cmd}': {reason}"
+        assert reason == ""
+
+    # Explicit parameter override
+    is_slow, reason = is_slow_benchmark_or_backtest_verification_cmd(
+        "python3 benchmark_walk_forward.py",
+        allow_slow_verification=True,
+    )
+    assert is_slow is False
+    assert reason == ""
+
+    # Environment variable override
+    monkeypatch.setenv("FORGE_ALLOW_SLOW_VERIFICATION", "1")
+    is_slow_env, _ = is_slow_benchmark_or_backtest_verification_cmd("python3 backtest_suite.py")
+    assert is_slow_env is False
+
+
+def test_goldfish_preflight_rejects_and_whitelists_slow_benchmark_cmd(tmp_path: Path) -> None:
+    """run_goldfish_plan_preflight rejects slow verification_cmd unless allow_slow_verification=True."""
+    _init_dummy_git_repo(tmp_path)
+    target_py = tmp_path / "model.py"
+    target_py.write_text("def run():\n    return 1\n", encoding="utf-8")
+    slow_test = tmp_path / "test_epic44_feedback_study.py"
+    slow_test.write_text("def test_study():\n    assert True\n", encoding="utf-8")
+    fast_test = tmp_path / "test_model.py"
+    fast_test.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+
+    base_plan = {
+        "title": "Model Update",
+        "objective": "Update model helper",
+        "origin_channel_id": "123456789",
+        "repo": str(tmp_path),
+        "context_fact_sheet": ["Model helper update"],
+        "chunks": [
+            {
+                "title": "Chunk 0: Update model",
+                "target_files": ["model.py"],
+                "instructions": "Update model.run cleanly.",
+                "verification_cmd": "pytest test_epic44_feedback_study.py",
+            }
+        ],
+    }
+
+    passed, findings = run_goldfish_plan_preflight(dict(base_plan))
+    assert passed is False
+    assert any("slow benchmark/backtest/feedback-study" in f.lower() for f in findings)
+    assert any("modal_harness.py" in f for f in findings)
+
+    # Chunk-level whitelist override
+    chunk_override_plan = json.loads(json.dumps(base_plan))
+    chunk_override_plan["chunks"][0]["allow_slow_verification"] = True
+    passed_chunk, findings_chunk = run_goldfish_plan_preflight(chunk_override_plan)
+    assert passed_chunk is True
+    assert findings_chunk == []
+
+    # Plan-level whitelist override
+    plan_override_plan = json.loads(json.dumps(base_plan))
+    plan_override_plan["allow_slow_verification"] = True
+    passed_plan, findings_plan = run_goldfish_plan_preflight(plan_override_plan)
+    assert passed_plan is True
+    assert findings_plan == []
+
+    # Normal fast unit test command passes
+    fast_plan = json.loads(json.dumps(base_plan))
+    fast_plan["chunks"][0]["verification_cmd"] = "pytest test_model.py"
+    passed_fast, findings_fast = run_goldfish_plan_preflight(fast_plan)
+    assert passed_fast is True
+    assert findings_fast == []
+
+
+def test_preflight_check_verification_cmd_rejects_slow_benchmark_scripts(tmp_path: Path) -> None:
+    """preflight_check_verification_cmd fails fast with NON_RETRYABLE_SPEC_ERROR on slow benchmark/backtest scripts."""
+    (tmp_path / "benchmark_walk_forward.py").write_text("print('slow')\n", encoding="utf-8")
+    (tmp_path / "backtest_suite.py").write_text("print('slow')\n", encoding="utf-8")
+    (tmp_path / "test_epic44_feedback_study.py").write_text("def test_x(): pass\n", encoding="utf-8")
+    (tmp_path / "test_fast_unit.py").write_text("def test_y(): pass\n", encoding="utf-8")
+
+    for bad_cmd in (
+        "python3 benchmark_walk_forward.py",
+        "python3 backtest_suite.py",
+        "pytest test_epic44_feedback_study.py",
+    ):
+        ok, err = preflight_check_verification_cmd(bad_cmd, tmp_path)
+        assert ok is False
+        assert "[NON_RETRYABLE_SPEC_ERROR]" in err
+        assert "Slow benchmark/backtest/feedback-study script in verification_cmd" in err
+
+    ok_fast, err_fast = preflight_check_verification_cmd("pytest test_fast_unit.py", tmp_path)
+    assert ok_fast is True
+    assert err_fast == ""
+

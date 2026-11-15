@@ -26,10 +26,12 @@ import ast
 import asyncio
 import difflib
 import fcntl
+import fnmatch
 import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -2442,6 +2444,274 @@ def is_unscoped_pytest(cmd: str) -> bool:
     return False
 
 
+_SLOW_VERIFICATION_SCRIPT_PATTERNS = (
+    "test_*feedback_study*.py",
+    "*feedback_study*.py",
+    "benchmark_*.py",
+    "*_benchmark.py",
+    "backtest_*.py",
+    "*_backtest.py",
+    "walk_forward_*.py",
+    "*_walk_forward*.py",
+    "run_unified_benchmark_gate.py",
+)
+
+
+def _matches_slow_verification_basename(path_or_name: str) -> Optional[str]:
+    """Return the matched slow-verification basename if `path_or_name` matches a slow pattern."""
+    clean = str(path_or_name or "").strip().split("::", 1)[0]
+    if not clean:
+        return None
+    base = Path(clean.replace("\\", "/")).name.lower()
+    if not base:
+        return None
+    for pat in _SLOW_VERIFICATION_SCRIPT_PATTERNS:
+        if fnmatch.fnmatch(base, pat):
+            return Path(clean.replace("\\", "/")).name
+    return None
+
+
+def _is_truthy_env_flag(val: str) -> bool:
+    return str(val or "").strip().lower() in ("1", "true", "yes")
+
+
+def is_slow_benchmark_or_backtest_verification_cmd(
+    cmd: str,
+    allow_slow_verification: bool = False,
+) -> tuple[bool, str]:
+    """Detect slow multi-year walk-forward, feedback-study, benchmark, or backtest scripts in verification_cmd."""
+    cmd_clean = (cmd or "").strip()
+    if not cmd_clean:
+        return False, ""
+    if allow_slow_verification or _is_truthy_env_flag(os.environ.get("FORGE_ALLOW_SLOW_VERIFICATION", "")):
+        return False, ""
+
+    try:
+        lexer = shlex.shlex(cmd_clean, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except Exception:
+        tokens = cmd_clean.split()
+
+    separators = {";", "&&", "||", "&", "|", "\n", "(", ")"}
+    non_exec_cmds = {
+        "ruff", "flake8", "black", "isort", "mypy", "pyright",
+        "git", "echo", "printf", "ls", "cat", "head", "tail",
+        "wc", "stat", "cd", "true", "false", "mkdir", "cp", "mv", "rm",
+    }
+    non_exec_py_modules = {
+        "py_compile", "compileall", "ruff", "flake8", "black",
+        "isort", "mypy", "pip", "venv", "http.server",
+    }
+    pytest_value_opts = {
+        "-k", "-m", "-o", "-c", "--rootdir", "--confcutdir", "--basetemp",
+        "--junitxml", "--maxfail", "-W", "-n", "--dist", "--tb", "--capture",
+        "-l", "--log-level", "--reruns",
+    }
+    modal_script_names = {"modal_harness.py", "modal_verify.py"}
+    modal_module_names = {"modal_harness", "modal_verify", "tools.modal_harness", "tools.modal_verify"}
+
+    exported_allow = False
+    idx = 0
+    n = len(tokens)
+    while idx < n:
+        if tokens[idx] in separators:
+            idx += 1
+            continue
+        seg: list[str] = []
+        while idx < n and tokens[idx] not in separators:
+            seg.append(tokens[idx])
+            idx += 1
+        if not seg:
+            continue
+
+        pos = 0
+        seg_allow = False
+        if seg[0] == "export":
+            for t in seg[1:]:
+                if "=" in t:
+                    k, v = t.split("=", 1)
+                    if k == "FORGE_ALLOW_SLOW_VERIFICATION" and _is_truthy_env_flag(v):
+                        exported_allow = True
+            continue
+
+        while pos < len(seg):
+            t = seg[pos]
+            t_name = Path(t).name.lower()
+            if t_name in ("env", "nohup", "time"):
+                pos += 1
+                continue
+            if t_name == "nice":
+                pos += 1
+                if pos < len(seg) and seg[pos] in ("-n", "--adjustment") and pos + 1 < len(seg):
+                    pos += 2
+                elif pos < len(seg) and seg[pos].startswith("-n") and len(seg[pos]) > 2:
+                    pos += 1
+                continue
+            if t_name == "timeout":
+                pos += 1
+                while pos < len(seg) and seg[pos].startswith("-"):
+                    if seg[pos] in ("-s", "--signal", "-k", "--kill-after") and pos + 1 < len(seg):
+                        pos += 2
+                    else:
+                        pos += 1
+                if pos < len(seg):
+                    pos += 1  # duration
+                continue
+            if t_name in ("uv", "poetry", "pipenv") and pos + 1 < len(seg) and seg[pos + 1] == "run":
+                pos += 2
+                continue
+            if "=" in t and not t.startswith("-") and not t.startswith("/"):
+                k, v = t.split("=", 1)
+                if k == "FORGE_ALLOW_SLOW_VERIFICATION" and _is_truthy_env_flag(v):
+                    seg_allow = True
+                pos += 1
+                continue
+            break
+
+        if pos >= len(seg) or exported_allow or seg_allow:
+            continue
+
+        cmd_tok = seg[pos]
+        cmd_base = Path(cmd_tok).name.lower()
+        if cmd_base in non_exec_cmds or cmd_base in modal_script_names:
+            continue
+
+        # Direct script invocation (e.g. ./benchmark_walk_forward.py)
+        direct_match = _matches_slow_verification_basename(cmd_tok)
+        if direct_match:
+            return True, f"slow script '{direct_match}'"
+
+        is_py = cmd_base in ("python", "python3") or cmd_base.startswith("python3.")
+        is_sh = cmd_base in ("sh", "bash")
+        is_pytest = cmd_base in ("pytest", "py.test")
+
+        if is_py:
+            args = seg[pos + 1 :]
+            arg_idx = 0
+            skip_next = False
+            py_mode = "script"  # or "pytest", "ignore", "modal"
+            pytest_args_start = 0
+            while arg_idx < len(args):
+                arg = args[arg_idx]
+                if skip_next:
+                    skip_next = False
+                    arg_idx += 1
+                    continue
+                if arg in ("-W", "-X", "--check-hash-based-pycs"):
+                    skip_next = True
+                    arg_idx += 1
+                    continue
+                if arg in ("-c", "--command") or (arg.startswith("-c") and not arg.startswith("--")):
+                    py_mode = "ignore"
+                    break
+                if arg == "-m":
+                    if arg_idx + 1 < len(args):
+                        mod = args[arg_idx + 1].strip().lower()
+                        if mod in modal_module_names:
+                            py_mode = "modal"
+                        elif mod in ("pytest", "py.test"):
+                            py_mode = "pytest"
+                            pytest_args_start = arg_idx + 2
+                        elif mod in non_exec_py_modules:
+                            py_mode = "ignore"
+                        else:
+                            mod_last = mod.split(".")[-1] + ".py"
+                            mod_match = _matches_slow_verification_basename(mod_last)
+                            if mod_match:
+                                return True, f"slow module '{args[arg_idx + 1]}'"
+                            py_mode = "ignore"
+                    break
+                if arg.startswith("-m") and len(arg) > 2:
+                    mod = arg[2:].strip().lower()
+                    if mod in modal_module_names:
+                        py_mode = "modal"
+                    elif mod in ("pytest", "py.test"):
+                        py_mode = "pytest"
+                        pytest_args_start = arg_idx + 1
+                    elif mod in non_exec_py_modules:
+                        py_mode = "ignore"
+                    else:
+                        mod_last = mod.split(".")[-1] + ".py"
+                        mod_match = _matches_slow_verification_basename(mod_last)
+                        if mod_match:
+                            return True, f"slow module '{arg[2:]}'"
+                        py_mode = "ignore"
+                    break
+                if arg.startswith("-"):
+                    arg_idx += 1
+                    continue
+                # First positional script argument
+                if Path(arg.replace("\\", "/")).name.lower() in modal_script_names:
+                    py_mode = "modal"
+                else:
+                    matched = _matches_slow_verification_basename(arg)
+                    if matched:
+                        return True, f"slow script '{matched}'"
+                break
+
+            if py_mode in ("ignore", "modal"):
+                continue
+            if py_mode == "pytest":
+                is_pytest = True
+                pytest_args = args[pytest_args_start:]
+            else:
+                pytest_args = []
+        elif is_pytest:
+            pytest_args = seg[pos + 1 :]
+        elif is_sh:
+            args = seg[pos + 1 :]
+            arg_idx = 0
+            skip_next = False
+            while arg_idx < len(args):
+                arg = args[arg_idx]
+                if skip_next:
+                    skip_next = False
+                    arg_idx += 1
+                    continue
+                if arg in ("-o", "+o"):
+                    skip_next = True
+                    arg_idx += 1
+                    continue
+                if arg == "-c" and arg_idx + 1 < len(args):
+                    inner_slow, inner_reason = is_slow_benchmark_or_backtest_verification_cmd(
+                        args[arg_idx + 1],
+                        allow_slow_verification=False,
+                    )
+                    if inner_slow:
+                        return True, inner_reason
+                    break
+                if arg.startswith("-") or arg == "+o":
+                    arg_idx += 1
+                    continue
+                matched = _matches_slow_verification_basename(arg)
+                if matched:
+                    return True, f"slow script '{matched}'"
+                break
+            continue
+        else:
+            pytest_args = []
+
+        if is_pytest:
+            skip_next = False
+            for arg in pytest_args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg in pytest_value_opts:
+                    skip_next = True
+                    continue
+                if arg.startswith("-"):
+                    continue
+                if Path(arg.split("::", 1)[0].replace("\\", "/")).name.lower() in modal_script_names:
+                    continue
+                matched = _matches_slow_verification_basename(arg)
+                if matched:
+                    return True, f"slow pytest target '{matched}'"
+
+    return False, ""
+
+
 def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
     """Validate a ForgePlan with zero chat context against existing repository symbols and chunk dependencies."""
     if not isinstance(plan, dict):
@@ -2535,6 +2805,18 @@ def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
                 f"Chunk {idx} verification command contains unscoped full-suite pytest ('{verification_cmd}'). "
                 "Scope test execution strictly to the relevant test file or function under test (e.g. 'pytest tests/test_feature.py')."
             )
+        if verification_cmd:
+            allow_slow = bool(ch.get("allow_slow_verification") or plan.get("allow_slow_verification"))
+            is_slow_cmd, slow_reason = is_slow_benchmark_or_backtest_verification_cmd(
+                verification_cmd,
+                allow_slow_verification=allow_slow,
+            )
+            if is_slow_cmd:
+                findings.append(
+                    f"Chunk {idx} verification command invokes slow benchmark/backtest/feedback-study script "
+                    f"({slow_reason} in '{verification_cmd}'). Use fast scoped unit tests for chunk verification "
+                    "and route multi-year sweeps to Modal (`modal_harness.py`) or detached jobs."
+                )
         if ch_repo.exists() and verification_cmd:
             test_matches = re.findall(
                 r"(?:(?:\./)?(?:tests|tools)/(?:[\w\-]+/)*test_[\w\-]+\.py)",
@@ -5335,6 +5617,14 @@ def preflight_check_verification_cmd(
     cmd = (verification_cmd or "").strip()
     if not cmd:
         return True, ""
+
+    is_slow_cmd, reason = is_slow_benchmark_or_backtest_verification_cmd(cmd)
+    if is_slow_cmd:
+        return (
+            False,
+            f"[NON_RETRYABLE_SPEC_ERROR] Slow benchmark/backtest/feedback-study script in verification_cmd ({reason}); "
+            "use fast unit tests for chunk verification and offload multi-year sweeps to Modal or detached jobs.",
+        )
 
     wt = Path(worktree_dir).resolve()
     target_norm: set[str] = set()
