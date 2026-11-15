@@ -55,7 +55,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794578670,
     "last_run_at": "2026-11-13 06:04 AM PT",
-    "next_run_ts": 1794664800.0,
+    "next_run_ts": 1794837600.0,
     "channel_id": 1544955532765560924
   },
   {
@@ -100,7 +100,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794587452,
     "last_run_at": "2026-11-13 08:30 AM PT",
-    "next_run_ts": 1794594652.0,
+    "next_run_ts": 1794775851.232292,
     "channel_id": 1544955535722545253
   },
   {
@@ -114,7 +114,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794586514,
     "last_run_at": "2026-11-13 08:15 AM PT",
-    "next_run_ts": 1794672900.0,
+    "next_run_ts": 1794845700.0,
     "channel_id": 1544955538033348618
   },
   {
@@ -129,7 +129,7 @@
     "catchup_window_seconds": 14400,
     "last_run_ts": 1794589260,
     "last_run_at": "2026-11-13 09:01 AM PT",
-    "next_run_ts": 1794675600.0
+    "next_run_ts": 1794848400.0
   },
   {
     "id": "nightly_triage",
@@ -143,7 +143,7 @@
     "catchup_window_seconds": 7200,
     "last_run_ts": 1794555032,
     "last_run_at": "2026-11-12 11:30 PM PT",
-    "next_run_ts": 1794641400.0
+    "next_run_ts": 1794814200.0
   },
   {
     "id": "nas_logs",
@@ -158,7 +158,7 @@
     "catchup_window_seconds": 7200,
     "last_run_ts": 1794549623,
     "last_run_at": "2026-11-12 10:00 PM PT",
-    "next_run_ts": 1794636000.0
+    "next_run_ts": 1794808800.0
   },
   {
     "id": "dreaming",
@@ -171,7 +171,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794563386,
     "last_run_at": "2026-11-13 01:49 AM PT",
-    "next_run_ts": 1794649500.0,
+    "next_run_ts": 1794822300.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -185,7 +185,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794564098,
     "last_run_at": "2026-11-13 02:01 AM PT",
-    "next_run_ts": 1794650400.0,
+    "next_run_ts": 1794823200.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -199,7 +199,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794567610,
     "last_run_at": "2026-11-13 03:00 AM PT",
-    "next_run_ts": 1794654000.0,
+    "next_run_ts": 1794826800.0,
     "channel_id": 1544955535722545253
   },
   {
@@ -214,7 +214,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794135619,
     "last_run_at": "2026-11-08 03:00 AM PT",
-    "next_run_ts": 1794740400.0,
+    "next_run_ts": 1795345200.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -243,7 +243,7 @@
     "catchup_window_seconds": 14400,
     "last_run_ts": 1794580228,
     "last_run_at": "2026-11-13 06:30 AM PT",
-    "next_run_ts": 1794666600.0
+    "next_run_ts": 1794839400.0
   },
   {
     "id": "daily_quota_card",
@@ -255,9 +255,9 @@
     "prompt": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
     "catchup_if_missed": true,
     "catchup_window_seconds": 14400,
-    "last_run_ts": 1794683819,
-    "last_run_at": "2026-11-14 11:16 AM PT",
-    "next_run_ts": 1794754800.0
+    "last_run_ts": 1794767681,
+    "last_run_at": "2026-11-15 10:34 AM PT",
+    "next_run_ts": 1794841200.0
   },
   {
     "id": "daily_birthday_reminder",
@@ -271,7 +271,7 @@
     "catchup_window_seconds": 14400,
     "last_run_ts": 1794582910,
     "last_run_at": "2026-11-13 07:15 AM PT",
-    "next_run_ts": 1794669300.0
+    "next_run_ts": 1794842100.0
   },
   {
     "id": "weekly_social_last_seen_review",
@@ -313,7 +313,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794591013,
     "last_run_at": "2026-11-13 09:30 AM PT",
-    "next_run_ts": 1794677400.0
+    "next_run_ts": 1794850200.0
   },
   {
     "id": "antigravity_check",
@@ -326,7 +326,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794506412,
     "last_run_at": "2026-11-12 10:00 AM PT",
-    "next_run_ts": 1794592800.0,
+    "next_run_ts": 1794852000.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -372,7 +372,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1793989804,
     "last_run_at": "2026-11-06 10:30 AM PT",
-    "next_run_ts": 1794594600.0
+    "next_run_ts": 1795199400.0
   },
   {
     "id": "dockhand_update",
@@ -415,7 +415,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794009608,
     "last_run_at": "2026-11-06 04:00 PM PT",
-    "next_run_ts": 1794614400.0
+    "next_run_ts": 1795219200.0
   },
   {
     "id": "monthly_hardcode_regex_audit",
@@ -445,7 +445,7 @@
     "catchup_window_seconds": 14400,
     "last_run_ts": 1794569475,
     "last_run_at": "2026-11-13 03:31 AM PT",
-    "next_run_ts": 1794655800.0,
+    "next_run_ts": 1794828600.0,
     "channel_id": 1544955535722545253
   },
   {
@@ -460,7 +460,7 @@
     "catchup_window_seconds": 14400,
     "last_run_ts": 1794570409,
     "last_run_at": "2026-11-13 03:46 AM PT",
-    "next_run_ts": 1794656700.0,
+    "next_run_ts": 1794829500.0,
     "channel_id": 1544955535722545253
   },
   {
@@ -471,9 +471,9 @@
     "interval_seconds": 300,
     "prompt": "Run the bridge liveness & gateway watchdog check using /workspace/tools/sidecars.py bridge_watchdog. Auto-heals and alerts only if degraded (silent when nominal).",
     "catchup_if_missed": false,
-    "last_run_ts": 1794590926,
-    "last_run_at": "2026-11-13 09:28 AM PT",
-    "next_run_ts": 1794591226.0,
+    "last_run_ts": 1794768965,
+    "last_run_at": "2026-11-15 10:56 AM PT",
+    "next_run_ts": 1794769265.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -487,7 +487,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794590907,
     "last_run_at": "2026-11-13 09:28 AM PT",
-    "next_run_ts": 1794591807.0
+    "next_run_ts": 1794769551.232292
   },
   {
     "id": "agora_roguelike_pm",
@@ -614,7 +614,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794555909,
     "last_run_at": "2026-11-12 11:45 PM PT",
-    "next_run_ts": 1794642300.0
+    "next_run_ts": 1794815100.0
   },
   {
     "id": "reddit_fantasy_morning",
@@ -628,7 +628,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794585933,
     "last_run_at": "2026-11-13 08:05 AM PT",
-    "next_run_ts": 1794672300.0
+    "next_run_ts": 1794845100.0
   },
   {
     "id": "reddit_fantasy_afternoon",
@@ -642,7 +642,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794585933,
     "last_run_at": "2026-11-13 08:05 AM PT",
-    "next_run_ts": 1794607200.0
+    "next_run_ts": 1794780000.0
   },
   {
     "id": "kalshi_night_audit",
@@ -674,7 +674,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794564904,
     "last_run_at": "2026-11-13 02:15 AM PT",
-    "next_run_ts": 1794651300.0
+    "next_run_ts": 1794824100.0
   },
   {
     "id": "arr_queue_watchdog",
@@ -687,7 +687,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794588094,
     "last_run_at": "2026-11-13 08:41 AM PT",
-    "next_run_ts": 1794591694.0
+    "next_run_ts": 1794772251.232292
   },
   {
     "id": "prowlarr_watchdog",
@@ -700,7 +700,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794587631,
     "last_run_at": "2026-11-13 08:33 AM PT",
-    "next_run_ts": 1794591231.0
+    "next_run_ts": 1794772251.232292
   },
   {
     "id": "sabnzbd_watchdog",
@@ -713,7 +713,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794587593,
     "last_run_at": "2026-11-13 08:33 AM PT",
-    "next_run_ts": 1794591193.0
+    "next_run_ts": 1794772251.232292
   },
   {
     "id": "nest_lock_watchdog",
@@ -726,7 +726,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794578794,
     "last_run_at": "2026-11-13 06:06 AM PT",
-    "next_run_ts": 1794592661.7519183
+    "next_run_ts": 1794772251.232292
   },
   {
     "id": "ha_reauth_watchdog",
@@ -739,7 +739,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794590418,
     "last_run_at": "2026-11-13 09:20 AM PT",
-    "next_run_ts": 1794594018.0
+    "next_run_ts": 1794772251.232292
   },
   {
     "id": "google_tasks_sync",
@@ -751,7 +751,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794590871,
     "last_run_at": "2026-11-13 09:27 AM PT",
-    "next_run_ts": 1794592671.0
+    "next_run_ts": 1794770451.232292
   },
   {
     "id": "quota_poller",
@@ -763,7 +763,7 @@
     "catchup_if_missed": false,
     "last_run_ts": 1794683811,
     "last_run_at": "2026-11-14 11:16 AM PT",
-    "next_run_ts": 1794684411.0
+    "next_run_ts": 1794769251.232292
   },
   {
     "id": "personal_data_sync",
@@ -779,7 +779,7 @@
     "catchup_window_seconds": 14400,
     "last_run_ts": 1794139267,
     "last_run_at": "2026-11-08 04:01 AM PT",
-    "next_run_ts": 1794744000.0
+    "next_run_ts": 1795348800.0
   },
   {
     "id": "resident_agents_watcher",
@@ -794,9 +794,9 @@
       23,
       7
     ],
-    "last_run_ts": 1794590996,
-    "last_run_at": "2026-11-13 09:29 AM PT",
-    "next_run_ts": 1794591296.0
+    "last_run_ts": 1794768970,
+    "last_run_at": "2026-11-15 10:56 AM PT",
+    "next_run_ts": 1794769270.0
   },
   {
     "id": "resident_agents_daily_tip",
@@ -811,7 +811,7 @@
     "catchup_window_seconds": 14400,
     "last_run_ts": 1794511809,
     "last_run_at": "2026-11-12 11:30 AM PT",
-    "next_run_ts": 1794598200.0
+    "next_run_ts": 1794771000.0
   },
   {
     "id": "plex_audiobook_enricher",
@@ -825,7 +825,7 @@
     "prompt": "Run the weekly Plex Audiobook metadata enricher and cover badge pass using /workspace/tools/sidecars.py plex_audiobook_enricher --quiet. Silent background execution when 0 new books were added; post a concise update to #homelab only when new audiobooks are enriched and badged.",
     "catchup_if_missed": true,
     "catchup_window_seconds": 14400,
-    "next_run_ts": 1794742200.0,
+    "next_run_ts": 1795347000.0,
     "last_run_ts": 1794137418,
     "last_run_at": "2026-11-08 03:30 AM PT"
   },
@@ -867,7 +867,7 @@
     "prompt": "Run the 48h Family Calendar & Action Radar Decision Card workflow using /workspace/tools/sidecars.py family_calendar_radar_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": 1794535206,
-    "next_run_ts": 1794621600.0,
+    "next_run_ts": 1794794400.0,
     "channel_id": 1550577908811178095,
     "last_run_at": "2026-11-12 06:00 PM PT"
   },
@@ -881,7 +881,7 @@
     "prompt": "Run the afternoon Dinner Defrost & Calendar Conflict Pivot Decision Card workflow using /workspace/tools/sidecars.py dinner_pivot_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": 1794528913,
-    "next_run_ts": 1794615300.0,
+    "next_run_ts": 1794788100.0,
     "channel_id": 1550577908811178095,
     "last_run_at": "2026-11-12 04:15 PM PT"
   },
@@ -895,7 +895,7 @@
     "prompt": "Run the Actual Budget Anomaly & Overspend Detection Decision Card workflow using /workspace/tools/sidecars.py actual_budget_anomaly_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": 1794585628,
-    "next_run_ts": 1794672000.0,
+    "next_run_ts": 1794844800.0,
     "last_run_at": "2026-11-13 08:00 AM PT",
     "channel_id": 1544955532765560924
   },
@@ -909,7 +909,7 @@
     "prompt": "Run the morning Weather, Air Quality & Pre-Adjustment Energy Decision Card workflow using /workspace/tools/sidecars.py weather_energy_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": 1794583810,
-    "next_run_ts": 1794670200.0,
+    "next_run_ts": 1794843000.0,
     "channel_id": 1544953275877556334,
     "last_run_at": "2026-11-13 07:30 AM PT"
   },
@@ -938,7 +938,7 @@
     "prompt": "Run the evening PM Hobby & Build Decision Card workflow using /workspace/tools/sidecars.py evening_pm_build_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
     "last_run_ts": 1794543313,
-    "next_run_ts": 1794629700.0,
+    "next_run_ts": 1794802500.0,
     "channel_id": 1548196930788524094,
     "last_run_at": "2026-11-12 08:15 PM PT"
   },
@@ -985,18 +985,18 @@
   {
     "id": "agora_forge_piecewise_ticker",
     "name": "Agora Steam Game Piecewise FORGE Ticker (#agora)",
-    "enabled": true,
+    "enabled": false,
     "schedule_type": "interval",
     "interval_seconds": 1800,
     "channel_id": 1558202642663211169,
     "prompt": "Run the Agora Steam Game piecewise FORGE ticker: `python3 /workspace/tools/agora_forge_ticker.py`. If an open PR needs review/fixes or the next structured task in `/workspace/data/agora_forge_queue.json` was just enqueued to `#forge`, post a brief status update in `#agora`; if a build is already running, stay silent (`[NO_REPLY]`).",
     "catchup_if_missed": false,
-    "quiet_hours": {
-      "start_hour_pt": 0,
-      "end_hour_pt": 7
-    },
+    "quiet_hours": [
+      0,
+      7
+    ],
     "last_run_ts": 1794589231,
     "last_run_at": "2026-11-13 05:00 PM PT",
-    "next_run_ts": 1794591031.8928225
+    "next_run_ts": 1794770451.232292
   }
 ]
