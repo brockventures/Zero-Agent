@@ -90,7 +90,7 @@ def is_calibration_scratch_script(script_path: str) -> bool:
     return bool(_CALIBRATION_SCRATCH_SCRIPT_RE.search(script_path.replace("\\", "/")))
 
 _HEAVY_CLI_BENCHMARK_OR_MIGRATE_RE = re.compile(
-    r"(?:run_unified_benchmark_gate\.py|build_locked_evaluation_datasets|--migrate-db\b|fast_migrate_[a-zA-Z0-9_-]*\.py\b|backfill_[a-zA-Z0-9_-]*?splits[a-zA-Z0-9_-]*\.py\b)"
+    r"(?:run_unified_benchmark_gate\.py|build_locked_evaluation_datasets|--migrate-db\b|--migrate-all-pt-modes\b|fast_migrate_[a-zA-Z0-9_-]*\.py\b|backfill_[a-zA-Z0-9_-]*?splits[a-zA-Z0-9_-]*\.py\b)"
 )
 
 _DOCKER_ROOT_PREFIX = re.escape(os.environ.get("NAS_DOCKER_ROOT", "/" + "volume1/docker").rstrip("/"))
@@ -2062,6 +2062,8 @@ def is_heavy_inline_benchmark_or_migration(cmd: str, cwd: str = "/workspace") ->
         return False
     if "forge.py" in cmd or "detached_runner.py" in cmd or "modal_harness.py" in cmd:
         return False
+    if "refresh_preseason.py" in cmd and "predict_big.py" not in cmd:
+        return False
     return bool(_HEAVY_CLI_BENCHMARK_OR_MIGRATE_RE.search(cmd))
 
 
@@ -2214,6 +2216,147 @@ def has_forge_job_start_command(cmd: str) -> bool:
         if has_cmd and not has_help:
             return True
     return False
+
+
+_SAFE_NON_SWEEP_CMD_RE = re.compile(
+    r"^\s*(?:pytest|python[0-9.]*\s+-m\s+(?:pytest|unittest|py_compile)|ruff|git|grep|rg|ag|find|cat|head|tail|ls|wc|which)\b"
+)
+_BIG_MODEL_SUITE_OOS_MULTI_YEAR_RE = re.compile(r"\b20(?:1\d|2\d)\b")
+_BIG_MODEL_SUITE_OOS_HINT_RE = re.compile(
+    r"(?:"
+    r"\brange\s*\(\s*20"
+    r"|\bfor\s+(?:yr|year|season|seasons|holdout[_a-z0-9]*|test_year|eval_year)\s+in\b"
+    r"|\b(?:holdout|hold_out|walk_forward|walk-forward|out_of_sample|out-of-sample|multi_season|multi-season|oos)\b"
+    r")",
+    re.IGNORECASE,
+)
+_PY_SCRIPT_INVOCATION_RE = re.compile(
+    r"\bpython[0-9.]*\s+(?:-[a-zA-Z0-9]+\s+)*(?P<script>[^\s;\"'|&>]+\.py)\b"
+)
+_SHELL_LOOP_OR_MULTI_EXEC_RE = re.compile(
+    r"(?:\b(?:for|while)\b[^;\n]*[;\n]\s*do\b|\bxargs\b|\bparallel\b)"
+)
+_EXEMPT_PY_SCRIPT_BASENAMES = frozenset({
+    "modal_harness.py",
+    "forge.py",
+    "detached_runner.py",
+    "batch_guard.py",
+    "refresh_preseason.py",
+})
+
+
+def _extract_job_start_inner_commands(cmd: str) -> list[str]:
+    """Extract inner `--command` / `-c` payloads from `forge.py job start` or `detached_runner.py start`."""
+    inner: list[str] = []
+    for m in _FORGE_JOB_START_RE.finditer(cmd):
+        tokens = _tokenize_job_start_args(cmd[m.end() :])
+        i = 0
+        while i < len(tokens):
+            tok, tok_quoted = tokens[i]
+            if not tok_quoted and tok in ("--command", "-c") and i + 1 < len(tokens):
+                inner.append(tokens[i + 1][0])
+                i += 2
+                continue
+            if tok.startswith("--command="):
+                inner.append(tok[len("--command=") :])
+            elif tok.startswith("-c="):
+                inner.append(tok[len("-c=") :])
+            i += 1
+    return inner
+
+
+def _has_big_model_suite_oos_sweep(text: str) -> bool:
+    """Return True if Python/shell text runs BIGModelSuite across multi-season or OOS holdout loops."""
+    if not text or "BIGModelSuite" not in text:
+        return False
+    if _BIG_MODEL_SUITE_OOS_HINT_RE.search(text):
+        return True
+    if len(set(_BIG_MODEL_SUITE_OOS_MULTI_YEAR_RE.findall(text))) >= 2:
+        return True
+    if re.search(r"\bfor\b", text) and re.search(r"(?:\bfit_and_predict\b|\.fit\s*\()", text):
+        return True
+    return False
+
+
+def _is_chained_predict_big_migrate_all_pt_modes(cmd_text: str) -> bool:
+    """Detect ad-hoc predict_big.py --migrate-all-pt-modes shell chains or duplicated migration calls."""
+    if not cmd_text or "predict_big.py" not in cmd_text or "--migrate-all-pt-modes" not in cmd_text:
+        return False
+    if len(re.findall(r"\bpredict_big\.py\b", cmd_text)) >= 2:
+        return True
+    if len(re.findall(r"--migrate-(?:all-pt-modes|db)\b", cmd_text)) >= 2:
+        return True
+    if _SHELL_LOOP_OR_MULTI_EXEC_RE.search(cmd_text):
+        return True
+    raw_segments = [s.strip() for s in re.split(r"\s*(?:&&|\|\||;|\n)\s*", cmd_text) if s.strip()]
+    non_setup_segments = [
+        s for s in raw_segments if not re.match(r"^(?:cd|export|source|\.)\b", s)
+    ]
+    return len(non_setup_segments) >= 2
+
+
+def check_baseball_heavy_sweep_and_migration_guard(cmd: str, cwd: str = "/workspace") -> tuple[bool, str]:
+    """Block local multi-season BIGModelSuite OOS holdout sweeps and ad-hoc chained predict_big.py migrations."""
+    if not cmd:
+        return True, ""
+    if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
+        return True, ""
+    norm_cwd = _norm_posix(cwd or "/workspace", "/")
+    if norm_cwd.startswith("/tmp/forge-wt-"):
+        return True, ""
+
+    outer_segments = [s.strip() for s in re.split(r"\s*(?:&&|\|\||;|\n)\s*", cmd) if s.strip()]
+    if outer_segments and all(_SAFE_NON_SWEEP_CMD_RE.match(seg) for seg in outer_segments):
+        return True, ""
+
+    # Guard A: Local Multi-Season BIGModelSuite OOS Holdout Sweeps -> Offload to Modal
+    if "modal_harness.py" not in cmd:
+        is_local_oos_sweep = _has_big_model_suite_oos_sweep(cmd)
+        if not is_local_oos_sweep:
+            for m in _PY_SCRIPT_INVOCATION_RE.finditer(cmd):
+                script_path = m.group("script")
+                base = os.path.basename(script_path)
+                if base.startswith("test_") or base.endswith("_test.py") or base in _EXEMPT_PY_SCRIPT_BASENAMES:
+                    continue
+                abs_script = os.path.abspath(os.path.join(cwd or "/workspace", script_path))
+                if os.path.isfile(abs_script):
+                    try:
+                        with open(abs_script, "r", encoding="utf-8", errors="ignore") as sf:
+                            script_text = sf.read(262144)
+                        if _has_big_model_suite_oos_sweep(script_text):
+                            is_local_oos_sweep = True
+                            break
+                    except OSError:
+                        pass
+        if is_local_oos_sweep:
+            return False, (
+                "Modal Offload Guard Triggered (BIGModelSuite OOS Sweep): Running multi-season or out-of-sample holdout "
+                "`BIGModelSuite` sweeps locally on Host 2 NAS CPU is prohibited (hits 60-minute turn/CPU ceilings). "
+                "Offload multi-season `BIGModelSuite` OOS holdout sweeps to Modal cloud compute via:\n"
+                "python3 /baseball/big-projections/modal_harness.py [args]"
+            )
+
+    # Guard B: Ad-Hoc Chained predict_big.py --migrate-all-pt-modes One-Liners -> Use refresh_preseason.py
+    if "predict_big.py" in cmd and "--migrate-all-pt-modes" in cmd:
+        inner_cmds = _extract_job_start_inner_commands(cmd)
+        duplicated_outer = (
+            len(re.findall(r"\bpredict_big\.py\b", cmd)) >= 2
+            or len(re.findall(r"--migrate-(?:all-pt-modes|db)\b", cmd)) >= 2
+        )
+        is_chained_migration = duplicated_outer or (
+            any(_is_chained_predict_big_migrate_all_pt_modes(ic) for ic in inner_cmds)
+            if inner_cmds
+            else _is_chained_predict_big_migrate_all_pt_modes(cmd)
+        )
+        if is_chained_migration:
+            return False, (
+                "Canonical Preseason Refresh Guard Triggered: Ad-hoc chained `predict_big.py --migrate-all-pt-modes` "
+                "shell invocations outside `/baseball/big-projections/refresh_preseason.py` are prohibited (duplicates DB migrations). "
+                "Run a single canonical job via `/baseball/big-projections/refresh_preseason.py`:\n"
+                "python3 /workspace/tools/forge.py job start --name \"Refresh Preseason\" --command \"python3 /baseball/big-projections/refresh_preseason.py\""
+            )
+
+    return True, ""
 
 
 def _record_forge_offload_if_applicable(cmd: str, cwd: str, state: dict) -> None:
@@ -2448,6 +2591,11 @@ def check_tool_use(
                 "Route all headless Godot 4.7.2 test and simulation runs through Modal cloud compute via:\n"
                 "python3 /workspace/tools/modal_godot_verify.py [test_filter ...]"
             )
+
+        # A00-baseball. Local BIGModelSuite OOS Sweeps & Chained predict_big.py --migrate-all-pt-modes Guard
+        ok_bb, bb_reason = check_baseball_heavy_sweep_and_migration_guard(cmd, cwd=cwd)
+        if not ok_bb:
+            return False, bb_reason
 
         # A00. Heavy Inline Benchmark / Migration Gate (Require FORGE job start or enqueue)
         if is_heavy_inline_benchmark_or_migration(cmd, cwd=cwd):
