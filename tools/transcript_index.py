@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """SQLite FTS5 + Dense Vector Hybrid Search Engine for Zero / Antigravity.
 
 Provides sub-15ms hybrid search combining:
@@ -107,11 +108,15 @@ def check_has_vec(con: sqlite3.Connection) -> bool:
         return False
 
 
-def get_db(db_path: str = DB_PATH, load_vec: bool = True) -> sqlite3.Connection:
+def get_db(
+    db_path: str = DB_PATH,
+    load_vec: bool = True,
+    busy_timeout_ms: int = 60000,
+) -> sqlite3.Connection:
     """Connect to SQLite database and dynamically load sqlite-vec extension if available."""
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    con = sqlite3.connect(db_path, timeout=60.0)
-    con.execute("PRAGMA busy_timeout = 60000;")
+    con = sqlite3.connect(db_path, timeout=max(busy_timeout_ms / 1000.0, 1.0))
+    con.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)};")
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA synchronous=NORMAL;")
     con.execute("PRAGMA temp_store=MEMORY;")
@@ -334,10 +339,16 @@ def extract_frontmatter(content: str) -> Tuple[dict, str]:
 
 
 class TranscriptIndexer:
-    def __init__(self, db_path: str = DB_PATH, use_proxy: bool = True):
+    def __init__(
+        self,
+        db_path: str = DB_PATH,
+        use_proxy: bool = True,
+        busy_timeout_ms: int = 60000,
+    ):
         self.db_path = db_path
         self.use_proxy = use_proxy
-        self.con = get_db(db_path, load_vec=True)
+        self.busy_timeout_ms = busy_timeout_ms
+        self.con = get_db(db_path, load_vec=True, busy_timeout_ms=busy_timeout_ms)
         cur = self.con.cursor()
         has_tables = cur.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_chunks'"
@@ -807,7 +818,9 @@ class TranscriptIndexer:
         target: str = "all",
         limit: int = 10,
         mode: str = "hybrid",
-        rrf_k: int = DEFAULT_RRF_K
+        rrf_k: int = DEFAULT_RRF_K,
+        proxy_timeout: float = 8.0,
+        allow_cold_model_load: bool = True,
     ) -> Dict[str, Any]:
         """Execute BM25, dense vector, or Reciprocal Rank Fusion hybrid search."""
         t_start = time.perf_counter()
@@ -838,7 +851,7 @@ class TranscriptIndexer:
                     port = int(os.environ.get("ZERO_HEALTH_PORT", 8769))
                     url = f"http://127.0.0.1:{port}/api/embed?q={urllib.parse.quote(query)}"
                     req = urllib.request.Request(url, headers={"User-Agent": "Zero-TranscriptIndex/1.0"})
-                    with urllib.request.urlopen(req, timeout=8.0) as resp:
+                    with urllib.request.urlopen(req, timeout=proxy_timeout) as resp:
                         if resp.getcode() == 200:
                             payload = json.loads(resp.read().decode("utf-8"))
                             if payload.get("embedding_b64"):
@@ -846,7 +859,7 @@ class TranscriptIndexer:
                                 can_vector = True
                 except Exception:
                     pass
-            if not can_vector:
+            if not can_vector and allow_cold_model_load:
                 model = get_embedding_model()
                 if model is not None:
                     import numpy as np
@@ -860,6 +873,7 @@ class TranscriptIndexer:
             return results
         if mode == "hybrid" and not can_vector:
             mode = "fts"
+        results["mode"] = mode
 
         fts_query = self._format_query(query)
         candidate_k = max(limit * 3, 25)

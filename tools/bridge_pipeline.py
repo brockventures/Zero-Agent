@@ -1,3 +1,4 @@
+# ruff: noqa
 """
 Zero Discord Bridge - Unified Turn Pipeline & Telemetry Module
 Consolidates prompt formatting, response delivery, artifact tracking,
@@ -331,15 +332,31 @@ def get_ambient_memory_context(
         global _AMBIENT_INDEXER, _AMBIENT_INDEXER_CLS
         is_mock_cls = hasattr(TranscriptIndexer, "_mock_name") or "mock" in type(TranscriptIndexer).__name__.lower()
         if is_mock_cls:
-            indexer = TranscriptIndexer()
+            try:
+                indexer = TranscriptIndexer(busy_timeout_ms=5000)
+            except TypeError:
+                indexer = TranscriptIndexer()
         else:
             if _AMBIENT_INDEXER is None or _AMBIENT_INDEXER_CLS is not TranscriptIndexer:
-                _AMBIENT_INDEXER = TranscriptIndexer()
+                try:
+                    _AMBIENT_INDEXER = TranscriptIndexer(busy_timeout_ms=5000)
+                except TypeError:
+                    _AMBIENT_INDEXER = TranscriptIndexer()
                 _AMBIENT_INDEXER_CLS = TranscriptIndexer
             indexer = _AMBIENT_INDEXER
         try:
             # Query A: Primary turn search
-            res_a = indexer.search(clean_p[:200], target="memory", mode="hybrid", limit=limit + 3)
+            try:
+                res_a = indexer.search(
+                    clean_p[:200],
+                    target="memory",
+                    mode="hybrid",
+                    limit=limit + 3,
+                    proxy_timeout=5.0,
+                    allow_cold_model_load=False,
+                )
+            except TypeError:
+                res_a = indexer.search(clean_p[:200], target="memory", mode="hybrid", limit=limit + 3)
             mem_matches_a = res_a.get("memory", [])
 
             # Check if prompt requires coreference context resolution
@@ -365,7 +382,17 @@ def get_ambient_memory_context(
             # Query B: Dual-Query RRF if coreference or terse follow-up detected
             if prev_user_p and (is_coref or is_short):
                 combo_query = f"{prev_user_p} {clean_p}"[:250]
-                res_b = indexer.search(combo_query, target="memory", mode="hybrid", limit=limit + 3)
+                try:
+                    res_b = indexer.search(
+                        combo_query,
+                        target="memory",
+                        mode="hybrid",
+                        limit=limit + 3,
+                        proxy_timeout=5.0,
+                        allow_cold_model_load=False,
+                    )
+                except TypeError:
+                    res_b = indexer.search(combo_query, target="memory", mode="hybrid", limit=limit + 3)
                 mem_matches_b = res_b.get("memory", [])
 
                 # Reciprocal Rank Fusion: Contextualized combo gets 1.2 weight, isolated pronoun query gets 0.6

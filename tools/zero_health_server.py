@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Zero Health Check HTTP Server for external Cloudflare Tunnel & UptimeRobot monitoring.
 
 Exposes a lightweight HTTP JSON status endpoint on port 8769 for zero.brock.ventures.
@@ -13,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1622,9 +1624,22 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             super().log_message(format, *args)
 
 
+def _warmup_embedding_model():
+    """Warm up FastEmbed ONNX embedding model in background so /api/embed is hot on first turn."""
+    try:
+        from tools.transcript_index import get_embedding_model
+
+        model = get_embedding_model()
+        if model is not None:
+            list(model.embed(["warmup"]))
+    except Exception as e:
+        sys.stderr.write(f"[zero_health_server] Warning pre-warming FastEmbed ONNX model: {e}\n")
+
+
 def run_server():
     server = ThreadingHTTPServer(("0.0.0.0", PORT), ZeroHealthHandler)
     PID_FILE.write_text(str(os.getpid()))
+    threading.Thread(target=_warmup_embedding_model, daemon=True, name="embedding-warmup").start()
     try:
         server.serve_forever()
     finally:

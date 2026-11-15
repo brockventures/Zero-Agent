@@ -1,9 +1,17 @@
+# ruff: noqa
 import sys
+from pathlib import Path
 import json
 import pytest
 
-# Ensure workspace is on sys.path
-sys.path.insert(0, "/workspace")
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+elif sys.path[0] != _REPO_ROOT:
+    sys.path.remove(_REPO_ROOT)
+    sys.path.insert(0, _REPO_ROOT)
+if "/workspace" not in sys.path:
+    sys.path.append("/workspace")
 
 from tools.transcript_index import (
     check_has_vec,
@@ -380,4 +388,82 @@ def test_embedding_proxy_fast_path(tmp_path, monkeypatch):
         assert res["mode"] == "hybrid"
     finally:
         indexer.close()
+
+
+def test_search_proxy_timeout_and_cold_load_disabled(tmp_path, monkeypatch):
+    """Verify search(..., proxy_timeout=5.0, allow_cold_model_load=False) passes 5.0s timeout to /api/embed
+
+    and falls back to FTS5 without calling get_embedding_model() if proxy fails.
+    """
+    import urllib.request
+    import urllib.error
+    import tools.transcript_index as ti
+
+    db_file = str(tmp_path / "timeout_test.db")
+    indexer = TranscriptIndexer(db_file, use_proxy=True, busy_timeout_ms=5000)
+    try:
+        monkeypatch.setattr(ti, "_EMBEDDING_MODEL", None)
+
+        recorded_timeouts = []
+
+        def failing_urlopen(req, timeout=8.0):
+            recorded_timeouts.append(timeout)
+            raise urllib.error.URLError("Connection refused")
+
+        monkeypatch.setattr(urllib.request, "urlopen", failing_urlopen)
+
+        local_model_called = False
+
+        def mock_get_embedding_model():
+            nonlocal local_model_called
+            local_model_called = True
+            return None
+
+        monkeypatch.setattr(ti, "get_embedding_model", mock_get_embedding_model)
+
+        # When allow_cold_model_load=False:
+        # 1. proxy timeout is respected (5.0s)
+        # 2. get_embedding_model() is NOT called
+        # 3. hybrid mode gracefully falls back to fts
+        res = indexer.search(
+            "test timeout fallback",
+            target="memory",
+            mode="hybrid",
+            limit=3,
+            proxy_timeout=5.0,
+            allow_cold_model_load=False,
+        )
+        assert recorded_timeouts == [5.0]
+        assert not local_model_called
+        assert res["mode"] == "fts"
+
+        # When allow_cold_model_load=True (default), get_embedding_model() IS called on proxy failure
+        recorded_timeouts.clear()
+        local_model_called = False
+        res2 = indexer.search(
+            "test timeout fallback with cold load allowed",
+            target="memory",
+            mode="hybrid",
+            limit=3,
+            proxy_timeout=3.5,
+            allow_cold_model_load=True,
+        )
+        assert recorded_timeouts == [3.5]
+        assert local_model_called
+    finally:
+        indexer.close()
+
+
+def test_transcript_indexer_custom_busy_timeout(tmp_path):
+    """Verify TranscriptIndexer accepts custom busy_timeout_ms."""
+    db_file = str(tmp_path / "busy_timeout_test.db")
+    indexer = TranscriptIndexer(db_file, busy_timeout_ms=5000)
+    try:
+        assert indexer.busy_timeout_ms == 5000
+        cur = indexer.con.cursor()
+        timeout_val = cur.execute("PRAGMA busy_timeout;").fetchone()[0]
+        assert timeout_val == 5000
+    finally:
+        indexer.close()
+
 

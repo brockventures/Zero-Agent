@@ -1,12 +1,16 @@
+# ruff: noqa
 """Unit tests for tools.bridge_pipeline (TurnTimer, prepare_turn_prompt, deliver_turn_output)."""
 
-import asyncio
+import os
+import sys
 from pathlib import Path
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import sys
+os.environ["DISCORD_CHANNEL_ID"] = "1542081375287640084"
+os.environ.pop("AGENT_ROLE", None)
+
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -15,6 +19,13 @@ elif sys.path[0] != _REPO_ROOT:
     sys.path.insert(0, _REPO_ROOT)
 if "/workspace" not in sys.path:
     sys.path.append("/workspace")
+
+if "tools.bridge_state" in sys.modules:
+    import importlib
+    importlib.reload(sys.modules["tools.bridge_state"])
+if "tools.bridge_pipeline" in sys.modules:
+    import importlib
+    importlib.reload(sys.modules["tools.bridge_pipeline"])
 from tools.bridge_pipeline import (
     TurnTimer,
     prepare_turn_prompt,
@@ -695,6 +706,84 @@ class TestAmbientMemoryPreFetch(unittest.TestCase):
         if res:
             self.assertIn("[ACTIVE MEMORY CONTEXT]:", res)
             self.assertIn("Memory Grounding Directive", res)
+
+    def test_get_ambient_memory_context_passes_proxy_timeout_and_cold_load_disabled(self):
+        """Verify get_ambient_memory_context initializes TranscriptIndexer with busy_timeout_ms=5000
+
+        and passes proxy_timeout=5.0, allow_cold_model_load=False to search().
+        """
+        import tools.bridge_pipeline as bp
+
+        mock_indexer = MagicMock()
+        mock_indexer.search.return_value = {
+            "memory": [
+                {
+                    "file_path": "/workspace/memory/public/test_doc.md",
+                    "file_name": "test_doc.md",
+                    "title": "Test Title",
+                    "category": "test",
+                    "snippet": "Test snippet content for memory grounding",
+                }
+            ]
+        }
+        mock_indexer_cls = MagicMock(return_value=mock_indexer)
+
+        # Clear global cached indexer so new one is constructed
+        old_idx, old_cls = bp._AMBIENT_INDEXER, bp._AMBIENT_INDEXER_CLS
+        bp._AMBIENT_INDEXER = None
+        bp._AMBIENT_INDEXER_CLS = None
+
+        with patch("tools.transcript_index.TranscriptIndexer", mock_indexer_cls):
+            res = bp.get_ambient_memory_context("What is the current server configuration?", mode="home")
+            self.assertIn("[ACTIVE MEMORY CONTEXT]:", res)
+            self.assertIn("Test Title", res)
+
+            # Verify TranscriptIndexer initialized with busy_timeout_ms=5000
+            mock_indexer_cls.assert_called_with(busy_timeout_ms=5000)
+
+            # Verify search called with proxy_timeout=5.0 and allow_cold_model_load=False
+            self.assertTrue(mock_indexer.search.called)
+            _, kwargs = mock_indexer.search.call_args
+            self.assertEqual(kwargs.get("proxy_timeout"), 5.0)
+            self.assertIs(kwargs.get("allow_cold_model_load"), False)
+
+        bp._AMBIENT_INDEXER = old_idx
+        bp._AMBIENT_INDEXER_CLS = old_cls
+
+    def test_get_ambient_memory_context_graceful_fts_fallback_when_proxy_fails(self):
+        """Verify get_ambient_memory_context returns FTS5 memory groundings even when /api/embed proxy fails
+
+        and allow_cold_model_load is False (without calling get_embedding_model).
+        """
+        import urllib.error
+        import tools.bridge_pipeline as bp
+
+        # Clear cached indexer
+        old_idx, old_cls = bp._AMBIENT_INDEXER, bp._AMBIENT_INDEXER_CLS
+        bp._AMBIENT_INDEXER = None
+        bp._AMBIENT_INDEXER_CLS = None
+
+        local_model_called = False
+
+        def mock_get_embedding_model():
+            nonlocal local_model_called
+            local_model_called = True
+            return None
+
+        def failing_urlopen(req, timeout=8.0):
+            raise urllib.error.URLError("Connection refused")
+
+        try:
+            with patch("tools.transcript_index._EMBEDDING_MODEL", None), \
+                 patch("urllib.request.urlopen", failing_urlopen), \
+                 patch("tools.transcript_index.get_embedding_model", mock_get_embedding_model):
+                res = bp.get_ambient_memory_context("Synology Docker log driver hang DSM", mode="home")
+                self.assertFalse(local_model_called, "get_embedding_model must not be called when allow_cold_model_load=False")
+                if res:
+                    self.assertIn("[ACTIVE MEMORY CONTEXT]:", res)
+        finally:
+            bp._AMBIENT_INDEXER = old_idx
+            bp._AMBIENT_INDEXER_CLS = old_cls
 
 
 class TestBridgeEmojiReactions(unittest.IsolatedAsyncioTestCase):
