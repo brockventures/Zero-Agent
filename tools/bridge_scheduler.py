@@ -1681,6 +1681,24 @@ async def dispatch_scheduled_prompt(
         })
 
 
+def _coerce_quiet_hours(quiet) -> tuple[int, int] | None:
+    """Coerce list/tuple [start_h, end_h] or dict {'start_hour_pt': s, 'end_hour_pt': e} into (int, int)."""
+    if not quiet:
+        return None
+    try:
+        if isinstance(quiet, dict):
+            s = quiet.get("start_hour_pt", quiet.get("start_hour", quiet.get("start")))
+            e = quiet.get("end_hour_pt", quiet.get("end_hour", quiet.get("end")))
+            if s is not None and e is not None:
+                return int(s), int(e)
+            return None
+        if isinstance(quiet, (list, tuple)) and len(quiet) == 2:
+            return int(quiet[0]), int(quiet[1])
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
 def should_run_job(job: dict, now_ts: float, status_map: dict | None = None) -> tuple[bool, str]:
     """
     Evaluates whether a scheduled job that has reached or exceeded its next_run_ts
@@ -1692,10 +1710,10 @@ def should_run_job(job: dict, now_ts: float, status_map: dict | None = None) -> 
     if not job.get("enabled", True):
         return False, "disabled"
 
-    quiet = job.get("quiet_hours")
+    quiet_pair = _coerce_quiet_hours(job.get("quiet_hours"))
 
-    if quiet and len(quiet) == 2:
-        start_h, end_h = quiet
+    if quiet_pair is not None:
+        start_h, end_h = quiet_pair
         now_pt = datetime.fromtimestamp(now_ts, tz=PT_TZ)
         in_quiet = (start_h <= now_pt.hour < end_h) if start_h < end_h else (now_pt.hour >= start_h or now_pt.hour < end_h)
         if in_quiet:
@@ -1805,38 +1823,48 @@ class BridgeScheduler:
                 updated = False
 
                 for j in list(jobs):
-                    if not j.get("enabled", True):
-                        continue
+                    try:
+                        if not isinstance(j, dict) or not j.get("enabled", True):
+                            continue
 
-                    next_ts = j.get("next_run_ts")
-                    if not next_ts:
-                        j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
-                        updated = True
-                        continue
+                        if isinstance(j.get("quiet_hours"), dict):
+                            coerced_q = _coerce_quiet_hours(j.get("quiet_hours"))
+                            j["quiet_hours"] = list(coerced_q) if coerced_q is not None else None
+                            updated = True
 
-                    if now_ts >= next_ts:
-                        try:
-                            should_run, reason = should_run_job(j, now_ts, status_map=status_map)
-                        except TypeError:
-                            should_run, reason = should_run_job(j, now_ts)
-
-                        # Advance next_run_ts to future occurrence regardless of run or skip
-                        if j.get("schedule_type") == "one_shot":
-                            j["enabled"] = False
-                            j["next_run_ts"] = None
-                        else:
+                        next_ts = j.get("next_run_ts")
+                        if not next_ts:
                             j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
+                            updated = True
+                            continue
 
-                        prefix = "[BridgeScheduler Startup]" if is_startup else "[BridgeScheduler]"
-                        if should_run:
-                            j["last_run_ts"] = now_ts
-                            j["last_run_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
-                            print(f"{prefix} Triggering {j['name']} ({reason}, next: {j['next_run_ts']})")
-                            jobs_to_dispatch.append((j["prompt"], j["name"], j.get("channel_id"), j.get("id")))
-                        else:
-                            print(f"{prefix} Skipping {j['name']} ({reason}, advanced next to: {j['next_run_ts']})")
+                        if now_ts >= next_ts:
+                            try:
+                                should_run, reason = should_run_job(j, now_ts, status_map=status_map)
+                            except TypeError:
+                                should_run, reason = should_run_job(j, now_ts)
 
-                        updated = True
+                            # Advance next_run_ts to future occurrence regardless of run or skip
+                            if j.get("schedule_type") == "one_shot":
+                                j["enabled"] = False
+                                j["next_run_ts"] = None
+                            else:
+                                j["next_run_ts"] = calculate_next_run(j, from_ts=now_ts)
+
+                            prefix = "[BridgeScheduler Startup]" if is_startup else "[BridgeScheduler]"
+                            if should_run:
+                                j["last_run_ts"] = now_ts
+                                j["last_run_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
+                                print(f"{prefix} Triggering {j['name']} ({reason}, next: {j['next_run_ts']})")
+                                jobs_to_dispatch.append((j["prompt"], j["name"], j.get("channel_id"), j.get("id")))
+                            else:
+                                print(f"{prefix} Skipping {j['name']} ({reason}, advanced next to: {j['next_run_ts']})")
+
+                            updated = True
+                    except Exception as je:
+                        j_label = j.get("id") or j.get("name") if isinstance(j, dict) else repr(j)
+                        print(f"[BridgeScheduler] Error evaluating job {j_label}: {je}")
+                        continue
 
                 # CRITICAL: Persist schedule to disk BEFORE dispatching
                 if updated:

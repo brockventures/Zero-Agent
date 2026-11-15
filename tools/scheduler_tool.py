@@ -658,6 +658,24 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
 }
 
 
+def _coerce_quiet_hours(quiet) -> tuple[int, int] | None:
+    """Coerce list/tuple [start_h, end_h] or dict {'start_hour_pt': s, 'end_hour_pt': e} into (int, int)."""
+    if not quiet:
+        return None
+    try:
+        if isinstance(quiet, dict):
+            s = quiet.get("start_hour_pt", quiet.get("start_hour", quiet.get("start")))
+            e = quiet.get("end_hour_pt", quiet.get("end_hour", quiet.get("end")))
+            if s is not None and e is not None:
+                return int(s), int(e)
+            return None
+        if isinstance(quiet, (list, tuple)) and len(quiet) == 2:
+            return int(quiet[0]), int(quiet[1])
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
 def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
     """Compute the next Unix timestamp for a job."""
     now_ts = from_ts or time.time()
@@ -672,10 +690,10 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
         else:
             nxt = float(now_ts + interval)
 
-        quiet = job.get("quiet_hours")
+        quiet_pair = _coerce_quiet_hours(job.get("quiet_hours"))
 
-        if quiet and len(quiet) == 2:
-            start_h, end_h = quiet
+        if quiet_pair is not None:
+            start_h, end_h = quiet_pair
             nxt_pt = datetime.fromtimestamp(nxt, tz=PT)
             in_quiet = (start_h <= nxt_pt.hour < end_h) if start_h < end_h else (nxt_pt.hour >= start_h or nxt_pt.hour < end_h)
             if in_quiet:
@@ -878,8 +896,12 @@ def load_schedule() -> list[dict]:
                 jobs.append(job_entry)
                 updated = True
 
-        # Reconcile historical executions from sidecar_status.json
+        # Reconcile historical executions from sidecar_status.json and normalize dict quiet_hours
         for j in jobs:
+            if isinstance(j.get("quiet_hours"), dict):
+                coerced_q = _coerce_quiet_hours(j.get("quiet_hours"))
+                j["quiet_hours"] = list(coerced_q) if coerced_q is not None else None
+                updated = True
             last_epoch, last_pt = get_last_execution_for_job(j, status_map=status_map)
             if last_epoch and (not j.get("last_run_ts") or last_epoch > j.get("last_run_ts", 0)):
                 j["last_run_ts"] = last_epoch

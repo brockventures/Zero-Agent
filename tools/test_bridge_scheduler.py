@@ -1143,6 +1143,96 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         mock_reap.assert_called_once()
         self.assertIn(1234, mock_reap.call_args[1]["allowed_active_pids"])
 
+    def test_should_run_job_coerces_dict_quiet_hours(self):
+        """Verify dict quiet_hours={'start_hour_pt': 0, 'end_hour_pt': 7} is coerced cleanly without TypeError."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from tools.bridge_scheduler import should_run_job
+        from tools.scheduler_tool import calculate_next_run
+
+        pt = ZoneInfo("America/Los_Angeles")
+        job = {
+            "id": "agora_forge_piecewise_ticker",
+            "name": "Agora Piecewise Ticker",
+            "enabled": True,
+            "schedule_type": "interval",
+            "interval_seconds": 300,
+            "quiet_hours": {"start_hour_pt": 0, "end_hour_pt": 7},
+            "next_run_ts": 1000.0,
+            "catchup_if_missed": True,
+            "catchup_window_seconds": 7200,
+        }
+
+        # 03:00 AM PT -> paused by quiet hours
+        ts_0300 = datetime(2026, 11, 15, 3, 0, tzinfo=pt).timestamp()
+        job["next_run_ts"] = ts_0300 - 10
+        ok, reason = should_run_job(job, ts_0300)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "quiet_hours_0_to_7_pt")
+
+        # 10:30 AM PT -> outside quiet hours, runs cleanly
+        ts_1030 = datetime(2026, 11, 15, 10, 30, tzinfo=pt).timestamp()
+        job["next_run_ts"] = ts_1030 - 10
+        ok2, reason2 = should_run_job(job, ts_1030)
+        self.assertTrue(ok2)
+        self.assertEqual(reason2, "on_time")
+
+        # calculate_next_run also handles dict quiet_hours without TypeError
+        nxt = calculate_next_run(job, from_ts=ts_0300 - 300)
+        nxt_pt = datetime.fromtimestamp(nxt, tz=pt)
+        self.assertEqual(nxt_pt.hour, 7)
+
+    async def test_evaluate_and_dispatch_isolates_malformed_job_and_persists_schedule(self):
+        """Verify a dict quiet_hours or malformed job never aborts save_schedule(jobs) or blocks subsequent due jobs."""
+        dispatch_mock = AsyncMock()
+        scheduler = bshed.BridgeScheduler(dispatch_fn=dispatch_mock)
+        now = time.time()
+
+        jobs = [
+            {
+                "id": "agora_forge_piecewise_ticker",
+                "name": "Agora Piecewise Ticker",
+                "enabled": True,
+                "schedule_type": "interval",
+                "interval_seconds": 300,
+                "quiet_hours": {"start_hour_pt": 0, "end_hour_pt": 7},
+                "next_run_ts": now - 10,
+                "prompt": "Run ticker",
+            },
+            {
+                "id": "broken_job",
+                "name": "Broken Job",
+                "enabled": True,
+                "schedule_type": "interval",
+                "interval_seconds": "invalid_str_interval",
+                "next_run_ts": now - 10,
+                "prompt": "Broken",
+            },
+            {
+                "id": "daily_quota_card",
+                "name": "Daily Gemini Quota Card",
+                "enabled": True,
+                "schedule_type": "daily",
+                "hour_pt": 7,
+                "minute_pt": 0,
+                "next_run_ts": now - 5,
+                "catchup_if_missed": True,
+                "catchup_window_seconds": 14400,
+                "prompt": "Run quota card",
+            },
+        ]
+
+        with patch("tools.scheduler_tool.load_schedule", return_value=jobs), \
+             patch("tools.scheduler_tool.save_schedule") as mock_save:
+            await scheduler._evaluate_and_dispatch_jobs()
+            if scheduler._active_job_tasks:
+                await asyncio.gather(*list(scheduler._active_job_tasks))
+
+        mock_save.assert_called_once()
+        self.assertEqual(jobs[0]["quiet_hours"], [0, 7])
+        dispatched_ids = [c.kwargs.get("job_id") for c in dispatch_mock.await_args_list]
+        self.assertIn("daily_quota_card", dispatched_ids)
+
 
 if __name__ == "__main__":
     unittest.main()
