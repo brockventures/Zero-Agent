@@ -405,6 +405,31 @@ class TestZeroMailListener(unittest.TestCase):
         mock_reconcile.assert_not_called()
         mock_arch.assert_called_once_with("msg_sync_103", tok="tok-xyz", thread_id="thread_sync_103")
 
+    def test_daemon_singleton_integration(self):
+        with patch("tools.zero_mail_listener.reconcile_live_daemon_pid", return_value=8888):
+            pid = zmail.get_listener_pid()
+            self.assertEqual(pid, 8888)
+            st = zmail.get_status()
+            self.assertTrue(st["running"])
+            self.assertEqual(st["pid"], 8888)
+
+        with patch("tools.zero_mail_listener.reconcile_live_daemon_pid", return_value=None):
+            pid = zmail.get_listener_pid()
+            self.assertIsNone(pid)
+            st = zmail.get_status()
+            self.assertFalse(st["running"])
+
+        with patch("tools.zero_mail_listener.get_listener_pid", return_value=8888):
+            with patch("tools.zero_mail_listener.terminate_duplicate_daemons") as mock_term:
+                started = zmail.start_daemon_background()
+                self.assertTrue(started)
+                mock_term.assert_called_once_with("zero_mail_listener.py", ("run",), keep_pid=8888)
+
+        with patch("tools.zero_mail_listener.acquire_singleton_lock", return_value=None):
+            with patch("tools.zero_mail_listener.load_env") as mock_env:
+                zmail.run_loop()
+                mock_env.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

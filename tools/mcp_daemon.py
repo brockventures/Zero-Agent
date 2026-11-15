@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """MCP Persistent Daemon Manager for Zero.
 
 Runs Google Workspace, Home Assistant, and NAS Docker MCP servers as persistent
@@ -32,8 +33,28 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 PID_FILE = DATA_DIR / "mcp_daemon.pid"
+LOCK_FILE = DATA_DIR / "mcp_daemon.lock"
 LOG_FILE = DATA_DIR / "mcp_daemon.log"
 CONFIG_FILE = Path("/root/.gemini/config/mcp_config.json")
+
+try:
+    from tools.daemon_singleton import (
+        acquire_singleton_lock,
+        find_live_daemon_pids,
+        is_lock_held,
+        reconcile_live_daemon_pid,
+        release_singleton_lock,
+        terminate_duplicate_daemons,
+    )
+except ImportError:
+    from daemon_singleton import (
+        acquire_singleton_lock,
+        find_live_daemon_pids,
+        is_lock_held,
+        reconcile_live_daemon_pid,
+        release_singleton_lock,
+        terminate_duplicate_daemons,
+    )
 
 SERVERS_CONFIG = {
     "google-workspace": {
@@ -124,70 +145,25 @@ def is_process_running(pid: int) -> bool:
         return False
 
 def is_mcp_daemon_process(pid: int) -> bool:
-    """Verify the process exists and its cmdline is actually mcp_daemon.py (prevents PID-reuse collisions on container boot)."""
-    if not is_process_running(pid):
-        return False
-    try:
-        cmdline_path = Path(f"/proc/{pid}/cmdline")
-        if cmdline_path.exists():
-            cmdline = cmdline_path.read_bytes().decode("utf-8", errors="replace")
-            return "mcp_daemon.py" in cmdline
-    except Exception:
-        pass
-    return True
+    """Verify the process exists and its cmdline is actually mcp_daemon.py."""
+    live_pids = find_live_daemon_pids("mcp_daemon.py", ("run",))
+    return pid in live_pids
 
 
 def _discover_mcp_daemon_pid() -> int | None:
-    """Scan /proc/[0-9]*/cmdline for a running mcp_daemon.py process."""
-    proc_dir = Path("/proc")
-    if not proc_dir.exists():
-        return None
-    my_pid = os.getpid()
-    try:
-        for entry in proc_dir.iterdir():
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            if pid == my_pid:
-                continue
-            try:
-                cmdline_path = entry / "cmdline"
-                if not cmdline_path.exists():
-                    continue
-                cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="replace")
-                if "mcp_daemon.py" in cmdline and "run" in cmdline:
-                    if is_process_running(pid):
-                        return pid
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return None
+    """Scan /proc for a running mcp_daemon.py process."""
+    live = find_live_daemon_pids("mcp_daemon.py", ("run",), exclude_pid=os.getpid())
+    return live[0] if live else None
 
 
 def get_daemon_pid() -> int | None:
     """Read the current daemon PID from PID_FILE if running, or reconcile via /proc."""
-    if PID_FILE.exists():
-        try:
-            with open(PID_FILE, "r") as f:
-                pid = int(f.read().strip())
-            if is_mcp_daemon_process(pid):
-                return pid
-        except Exception:
-            pass
-
-    discovered = _discover_mcp_daemon_pid()
-    if discovered:
-        try:
-            with open(PID_FILE, "w") as f:
-                f.write(str(discovered))
-        except Exception:
-            pass
-        return discovered
-
-    if PID_FILE.exists():
-        PID_FILE.unlink(missing_ok=True)
-    return None
+    return reconcile_live_daemon_pid(
+        pid_file=PID_FILE,
+        lock_path=LOCK_FILE,
+        script_name="mcp_daemon.py",
+        subcommands=("run",),
+    )
 
 async def run_servers_async():
     """Run all MCP servers concurrently inside one asyncio event loop."""
@@ -249,6 +225,10 @@ async def run_servers_async():
 
 def run_daemon_foreground():
     """Run the daemon in the foreground."""
+    lock_handle = acquire_singleton_lock(LOCK_FILE)
+    if lock_handle is None:
+        print("[MCP Daemon] Another instance is already running (lock held). Exiting.")
+        return
     sync_mcp_config_json()
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
@@ -256,15 +236,18 @@ def run_daemon_foreground():
         asyncio.run(run_servers_async())
     finally:
         PID_FILE.unlink(missing_ok=True)
+        release_singleton_lock(lock_handle)
 
 def start_daemon_background() -> bool:
     """Start the daemon in background if not already running."""
     pid = get_daemon_pid()
-    if pid:
+    if pid or is_lock_held(LOCK_FILE):
+        terminate_duplicate_daemons("mcp_daemon.py", ("run",), keep_pid=pid)
         print(f"[MCP Daemon] Daemon already running (PID {pid}).")
         sync_mcp_config_json()
         return True
 
+    terminate_duplicate_daemons("mcp_daemon.py", ("run",))
     sync_mcp_config_json()
     log_fp = open(LOG_FILE, "a")
     proc = subprocess.Popen(
@@ -300,6 +283,7 @@ def stop_daemon() -> bool:
     """Stop the running daemon process."""
     pid = get_daemon_pid()
     if not pid:
+        terminate_duplicate_daemons("mcp_daemon.py", ("run",))
         print("[MCP Daemon] Daemon is not running.")
         return True
 
@@ -317,6 +301,7 @@ def stop_daemon() -> bool:
     except Exception as e:
         print(f"[MCP Daemon] Error while stopping PID {pid}: {e}")
 
+    terminate_duplicate_daemons("mcp_daemon.py", ("run",), keep_pid=None)
     PID_FILE.unlink(missing_ok=True)
     print("[MCP Daemon] Stopped.")
     return True

@@ -349,6 +349,26 @@ def process_message_payload(
     return "ready_for_dispatch"
 
 PID_FILE = os.path.join(STATE_DIR, "zero_mail_listener.pid")
+LOCK_FILE = os.path.join(STATE_DIR, "zero_mail_listener.lock")
+
+try:
+    from tools.daemon_singleton import (
+        acquire_singleton_lock,
+        find_live_daemon_pids,
+        is_lock_held,
+        reconcile_live_daemon_pid,
+        release_singleton_lock,
+        terminate_duplicate_daemons,
+    )
+except ImportError:
+    from daemon_singleton import (
+        acquire_singleton_lock,
+        find_live_daemon_pids,
+        is_lock_held,
+        reconcile_live_daemon_pid,
+        release_singleton_lock,
+        terminate_duplicate_daemons,
+    )
 
 _running = True
 
@@ -376,21 +396,12 @@ def is_process_running(pid: int) -> bool:
         return False
 
 def get_listener_pid() -> int | None:
-    if not os.path.exists(PID_FILE):
-        return None
-    try:
-        with open(PID_FILE, "r") as f:
-            pid = int(f.read().strip())
-        if is_process_running(pid):
-            return pid
-        else:
-            try:
-                os.unlink(PID_FILE)
-            except OSError:
-                pass
-            return None
-    except Exception:
-        return None
+    return reconcile_live_daemon_pid(
+        pid_file=PID_FILE,
+        lock_path=LOCK_FILE,
+        script_name="zero_mail_listener.py",
+        subcommands=("run",),
+    )
 
 def get_status() -> dict:
     pid = get_listener_pid()
@@ -405,6 +416,11 @@ def get_status() -> dict:
 
 def run_loop():
     global _running
+    lock_handle = acquire_singleton_lock(LOCK_FILE)
+    if lock_handle is None:
+        log("Email listener already running (lock held). Exiting.")
+        return
+
     signal.signal(signal.SIGTERM, _handle_exit_signal)
     signal.signal(signal.SIGINT, _handle_exit_signal)
 
@@ -558,15 +574,18 @@ def run_loop():
                 os.unlink(PID_FILE)
         except OSError:
             pass
+        release_singleton_lock(lock_handle)
         log("Zero Inbound Email Listener stopped cleanly.")
 
 def start_daemon_background() -> bool:
     """Start listener in detached background process."""
     pid = get_listener_pid()
-    if pid:
+    if pid or is_lock_held(LOCK_FILE):
+        terminate_duplicate_daemons("zero_mail_listener.py", ("run",), keep_pid=pid)
         log(f"Email listener already running (PID {pid}).")
         return True
 
+    terminate_duplicate_daemons("zero_mail_listener.py", ("run",))
     os.makedirs(STATE_DIR, exist_ok=True)
     log_fp = open(LOG_FILE, "a")
     proc = subprocess.Popen(
@@ -597,6 +616,7 @@ def stop_daemon() -> bool:
     """Stop the running email listener process."""
     pid = get_listener_pid()
     if not pid:
+        terminate_duplicate_daemons("zero_mail_listener.py", ("run",))
         print("[Email Listener] Listener is not running.")
         return True
 
@@ -614,6 +634,7 @@ def stop_daemon() -> bool:
     except Exception as e:
         print(f"[Email Listener] Error while stopping PID {pid}: {e}")
 
+    terminate_duplicate_daemons("zero_mail_listener.py", ("run",), keep_pid=None)
     try:
         if os.path.exists(PID_FILE):
             os.unlink(PID_FILE)

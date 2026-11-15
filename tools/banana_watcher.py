@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """
 banana_watcher.py - Lightweight Channel Watchdog & Conversation Referee
 Operates as @BananaWatcher in #the-banana-stand (1534436119888793750).
@@ -23,7 +24,27 @@ PT = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path("/workspace/data")
 STATE_FILE = DATA_DIR / "banana_watcher_state.json"
 PID_FILE = DATA_DIR / "banana_watcher.pid"
+LOCK_FILE = DATA_DIR / "banana_watcher.lock"
 LOG_FILE = DATA_DIR / "banana_watcher.log"
+
+try:
+    from tools.daemon_singleton import (
+        acquire_singleton_lock,
+        find_live_daemon_pids,
+        is_lock_held,
+        reconcile_live_daemon_pid,
+        release_singleton_lock,
+        terminate_duplicate_daemons,
+    )
+except ImportError:
+    from daemon_singleton import (
+        acquire_singleton_lock,
+        find_live_daemon_pids,
+        is_lock_held,
+        reconcile_live_daemon_pid,
+        release_singleton_lock,
+        terminate_duplicate_daemons,
+    )
 
 AGORA_CHANNEL_ID = 1558202642663211169
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
@@ -750,116 +771,118 @@ INTRO_MESSAGE = (
 def run_gateway_daemon(dry_run: bool = False, interval: int = 30, send_intro: bool = False):
     log(f"Starting BananaWatcher Gateway daemon (interval={interval}s, dry_run={dry_run}, intro={send_intro})...")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(PID_FILE, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
 
-    token = get_discord_token()
-    if not token:
-        log("Error: No BANANA_WATCHER_TOKEN available.")
+    lock_handle = acquire_singleton_lock(LOCK_FILE)
+    if lock_handle is None:
+        log("BananaWatcher Gateway daemon already running (lock held). Exiting.")
         return
 
-    import discord
-    import asyncio
+    try:
+        with open(PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
 
-    intents = discord.Intents.default()
-    intents.message_content = False
-
-    client = discord.Client(intents=intents)
-
-    async def watchdog_task():
-        await client.wait_until_ready()
-        ch = client.get_channel(BANANA_STAND_CHANNEL_ID)
-        if not ch:
-            log(f"Warning: Channel #{BANANA_STAND_CHANNEL_ID} not accessible by Banana Watcher.")
+        token = get_discord_token()
+        if not token:
+            log("Error: No BANANA_WATCHER_TOKEN available.")
             return
 
-        if send_intro:
-            try:
-                await ch.send(INTRO_MESSAGE)
-                log("Successfully posted intro beacon to #the-banana-stand.")
-            except Exception as e:
-                log(f"Error posting intro beacon: {e}")
+        import discord
+        import asyncio
 
-        last_heartbeat_log = time.time()
-        while not client.is_closed():
-            now_loop = time.time()
-            if now_loop - last_heartbeat_log >= 3600:
-                log("Banana Watcher heartbeat: gateway connected and monitoring #the-banana-stand.")
-                last_heartbeat_log = now_loop
-            for ch_id in WATCH_CHANNEL_IDS:
+        intents = discord.Intents.default()
+        intents.message_content = False
+
+        client = discord.Client(intents=intents)
+
+        async def watchdog_task():
+            await client.wait_until_ready()
+            ch = client.get_channel(BANANA_STAND_CHANNEL_ID)
+            if not ch:
+                log(f"Warning: Channel #{BANANA_STAND_CHANNEL_ID} not accessible by Banana Watcher.")
+                return
+
+            if send_intro:
                 try:
-                    actions = check_channel_and_evaluate(channel_id=ch_id, dry_run=dry_run)
-                    if actions:
-                        log(f"Evaluation actions for #{ch_id}: {actions}")
+                    await ch.send(INTRO_MESSAGE)
+                    log("Successfully posted intro beacon to #the-banana-stand.")
                 except Exception as e:
-                    log(f"Error in evaluation cycle for #{ch_id}: {e}")
-            await asyncio.sleep(interval)
+                    log(f"Error posting intro beacon: {e}")
 
-    @client.event
-    async def on_ready():
-        log(f"Banana Watcher connected and 🟢 ONLINE as {client.user} (ID: {client.user.id})")
+            last_heartbeat_log = time.time()
+            while not client.is_closed():
+                now_loop = time.time()
+                if now_loop - last_heartbeat_log >= 3600:
+                    log("Banana Watcher heartbeat: gateway connected and monitoring #the-banana-stand.")
+                    last_heartbeat_log = now_loop
+                for ch_id in WATCH_CHANNEL_IDS:
+                    try:
+                        actions = check_channel_and_evaluate(channel_id=ch_id, dry_run=dry_run)
+                        if actions:
+                            log(f"Evaluation actions for #{ch_id}: {actions}")
+                    except Exception as e:
+                        log(f"Error in evaluation cycle for #{ch_id}: {e}")
+                await asyncio.sleep(interval)
+
+        @client.event
+        async def on_ready():
+            log(f"Banana Watcher connected and 🟢 ONLINE as {client.user} (ID: {client.user.id})")
+            try:
+                await client.change_presence(
+                    activity=discord.Activity(type=discord.ActivityType.watching, name="#agora & #the-banana-stand 🍌"),
+                    status=discord.Status.online
+                )
+            except Exception as pe:
+                log(f"Warning setting presence: {pe}")
+            asyncio.create_task(watchdog_task())
+
+        def _handle_exit(signum, frame):
+            log(f"Received signal {signum}, stopping Gateway client cleanly...")
+            try:
+                asyncio.create_task(client.close())
+            except Exception:
+                sys.exit(0)
+
+        signal.signal(signal.SIGTERM, _handle_exit)
+        signal.signal(signal.SIGINT, _handle_exit)
+
         try:
-            await client.change_presence(
-                activity=discord.Activity(type=discord.ActivityType.watching, name="#agora & #the-banana-stand 🍌"),
-                status=discord.Status.online
-            )
-        except Exception as pe:
-            log(f"Warning setting presence: {pe}")
-        asyncio.create_task(watchdog_task())
-
-    def _handle_exit(signum, frame):
-        log(f"Received signal {signum}, stopping Gateway client cleanly...")
-        try:
-            asyncio.create_task(client.close())
-        except Exception:
-            sys.exit(0)
-
-    signal.signal(signal.SIGTERM, _handle_exit)
-    signal.signal(signal.SIGINT, _handle_exit)
-
-    try:
-        client.run(token, log_handler=None)
-    except Exception as e:
-        log(f"Gateway client exited: {e}")
+            client.run(token, log_handler=None)
+        except Exception as e:
+            log(f"Gateway client exited: {e}")
     finally:
         if PID_FILE.exists():
             try:
                 PID_FILE.unlink()
             except Exception:
                 pass
+        release_singleton_lock(lock_handle)
         log("BananaWatcher stopped.")
 
 def get_daemon_status() -> dict:
-    if PID_FILE.exists():
-        try:
-            pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)
-            cmdline_path = Path(f"/proc/{pid}/cmdline")
-            status_path = Path(f"/proc/{pid}/status")
-            if cmdline_path.exists() and status_path.exists():
-                cmdline = cmdline_path.read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
-                status_text = status_path.read_text(encoding="utf-8", errors="ignore")
-                tgid_lines = [line.split()[1] for line in status_text.splitlines() if line.startswith("Tgid:")]
-                if (tgid_lines and int(tgid_lines[0]) != pid) or "banana_watcher" not in cmdline:
-                    PID_FILE.unlink(missing_ok=True)
-                    return {"running": False, "pid": None}
-            return {"running": True, "pid": pid}
-        except (ValueError, ProcessLookupError, PermissionError, OSError):
-            pass
+    pid = reconcile_live_daemon_pid(
+        pid_file=PID_FILE,
+        lock_path=LOCK_FILE,
+        script_name="banana_watcher.py",
+        subcommands=("_daemon",),
+    )
+    if pid is not None:
+        return {"running": True, "pid": pid}
     return {"running": False, "pid": None}
 
 def start_daemon(interval: int = 30, intro: bool = False) -> dict:
     st = get_daemon_status()
-    if st["running"]:
+    if st["running"] or is_lock_held(LOCK_FILE):
+        terminate_duplicate_daemons("banana_watcher.py", ("_daemon",), keep_pid=st["pid"])
         return {"ok": True, "status": "already_running", "pid": st["pid"]}
 
+    terminate_duplicate_daemons("banana_watcher.py", ("_daemon",))
     import subprocess
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     log_f = open(LOG_FILE, "a")
     cmd = [sys.executable, str(Path(__file__).resolve()), "_daemon", f"--interval={interval}"]
     if intro:
         cmd.append("--intro")
     proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, start_new_session=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(proc.pid))
     time.sleep(0.5)
     st = get_daemon_status()
@@ -868,26 +891,29 @@ def start_daemon(interval: int = 30, intro: bool = False) -> dict:
 def stop_daemon() -> dict:
     st = get_daemon_status()
     if not st["running"]:
+        terminate_duplicate_daemons("banana_watcher.py", ("_daemon",))
         return {"ok": True, "status": "not_running"}
+    pid = st["pid"]
     try:
-        os.kill(st["pid"], signal.SIGTERM)
+        os.kill(pid, signal.SIGTERM)
         for _ in range(15):
             time.sleep(0.2)
             try:
-                os.kill(st["pid"], 0)
+                os.kill(pid, 0)
             except OSError:
                 break
         else:
-            os.kill(st["pid"], signal.SIGKILL)
+            os.kill(pid, signal.SIGKILL)
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+    terminate_duplicate_daemons("banana_watcher.py", ("_daemon",), keep_pid=None)
     if PID_FILE.exists():
         try:
             PID_FILE.unlink()
         except Exception:
             pass
-    return {"ok": True, "status": "stopped", "pid": st["pid"]}
+    return {"ok": True, "status": "stopped", "pid": pid}
 
 def ensure_banana_watcher_running():
     st = get_daemon_status()

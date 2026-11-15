@@ -8,9 +8,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 WORKSPACE = Path("/workspace")
 if str(WORKSPACE) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE))
+    sys.path.append(str(WORKSPACE))
 
 import tools.amazon_order_listener as aol
 
@@ -100,6 +103,33 @@ class TestAmazonOrderListener(unittest.TestCase):
         loaded_orders = aol.load_orders()
         self.assertEqual(len(loaded_orders), 1)
         self.assertEqual(loaded_orders[0]["order_id"], "123")
+
+    def test_daemon_singleton_integration(self):
+        from unittest.mock import patch
+        with patch("tools.amazon_order_listener.reconcile_live_daemon_pid", return_value=6789):
+            pid = aol.get_listener_pid()
+            self.assertEqual(pid, 6789)
+            st = aol.get_status()
+            self.assertTrue(st["running"])
+            self.assertEqual(st["pid"], 6789)
+
+        with patch("tools.amazon_order_listener.reconcile_live_daemon_pid", return_value=None):
+            pid = aol.get_listener_pid()
+            self.assertIsNone(pid)
+            st = aol.get_status()
+            self.assertFalse(st["running"])
+
+        with patch("tools.amazon_order_listener.get_listener_pid", return_value=6789):
+            with patch("tools.amazon_order_listener.terminate_duplicate_daemons") as mock_term:
+                started = aol.start_daemon_background()
+                self.assertTrue(started)
+                mock_term.assert_called_once_with("amazon_order_listener.py", ("run",), keep_pid=6789)
+
+        with patch("tools.amazon_order_listener.acquire_singleton_lock", return_value=None):
+            with patch("tools.amazon_order_listener.load_env") as mock_env:
+                aol.run_loop()
+                mock_env.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

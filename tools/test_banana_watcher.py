@@ -4,8 +4,12 @@ import json
 import time
 
 import sys
+from pathlib import Path
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
 from tools.banana_watcher import check_channel_and_evaluate, STALL_THRESHOLD_SECONDS
 
 class TestBananaWatcher(unittest.TestCase):
@@ -448,6 +452,38 @@ class TestBananaWatcher(unittest.TestCase):
             actions = check_channel_and_evaluate(channel_id=123, dry_run=True)
             self.assertFalse(any("Auto-parked" in a for a in actions))
             self.assertFalse(any("Stalled topic nudge" in a for a in actions))
+
+
+class TestBananaWatcherDaemonIntegration(unittest.TestCase):
+    def test_daemon_status_and_lock_guard(self):
+        import tools.banana_watcher as bw
+        with patch("tools.banana_watcher.reconcile_live_daemon_pid", return_value=4321):
+            st = bw.get_daemon_status()
+            self.assertTrue(st["running"])
+            self.assertEqual(st["pid"], 4321)
+
+        with patch("tools.banana_watcher.reconcile_live_daemon_pid", return_value=None):
+            st = bw.get_daemon_status()
+            self.assertFalse(st["running"])
+            self.assertIsNone(st["pid"])
+
+    def test_start_daemon_already_running(self):
+        import tools.banana_watcher as bw
+        with patch("tools.banana_watcher.get_daemon_status", return_value={"running": True, "pid": 5555}):
+            with patch("tools.banana_watcher.terminate_duplicate_daemons") as mock_term:
+                res = bw.start_daemon()
+                self.assertTrue(res["ok"])
+                self.assertEqual(res["status"], "already_running")
+                self.assertEqual(res["pid"], 5555)
+                mock_term.assert_called_once_with("banana_watcher.py", ("_daemon",), keep_pid=5555)
+
+    def test_run_gateway_daemon_lock_held_exits_early(self):
+        import tools.banana_watcher as bw
+        with patch("tools.banana_watcher.acquire_singleton_lock", return_value=None):
+            with patch("tools.banana_watcher.get_discord_token") as mock_token:
+                bw.run_gateway_daemon(dry_run=True)
+                mock_token.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

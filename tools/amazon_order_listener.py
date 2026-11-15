@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Zero Amazon Order Listener Daemon.
 
 Maintains a fast, lightweight polling loop against Gmail for Amazon order
@@ -34,6 +35,26 @@ SEEN_FILE = os.path.join(STATE_DIR, "seen_amazon_orders.json")
 ORDERS_FILE = os.path.join(STATE_DIR, "amazon_orders.json")
 LOG_FILE = os.environ.get("AMAZON_ORDER_LOG", os.path.join(STATE_DIR, "amazon_order_listener.log"))
 PID_FILE = os.path.join(STATE_DIR, "amazon_order_listener.pid")
+LOCK_FILE = os.path.join(STATE_DIR, "amazon_order_listener.lock")
+
+try:
+    from tools.daemon_singleton import (
+        acquire_singleton_lock,
+        find_live_daemon_pids,
+        is_lock_held,
+        reconcile_live_daemon_pid,
+        release_singleton_lock,
+        terminate_duplicate_daemons,
+    )
+except ImportError:
+    from daemon_singleton import (
+        acquire_singleton_lock,
+        find_live_daemon_pids,
+        is_lock_held,
+        reconcile_live_daemon_pid,
+        release_singleton_lock,
+        terminate_duplicate_daemons,
+    )
 
 POLL_INTERVAL = int(os.environ.get("AMAZON_POLL_INTERVAL", "60"))
 NOTIFY_DISCORD = os.environ.get("AMAZON_NOTIFY_DISCORD", "false").lower() in ("true", "1", "yes")
@@ -100,7 +121,7 @@ def extract_mime_parts(payload: dict) -> dict[str, str]:
         raw = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="ignore")
         if mime == "text/plain":
             out["plain"] += raw + "\n"
-        elif mime == "text/html":
+        elif mime == "text/html" or (not mime and ("<html" in raw.lower() or "<body" in raw.lower() or "<img" in raw.lower())):
             out["html"] += raw + "\n"
         else:
             out["plain"] += raw + "\n"
@@ -156,14 +177,19 @@ def parse_amazon_order(mdata: dict) -> dict:
         raw_alts = re.findall(r'alt="([^"]+)"', html_raw)
         exact_banned = {
             "amazon.com", "amazon", "completed", "pending", "shipped", "delivered",
-            "prime", "your orders", "your account", "buy again",
+            "prime", "your orders", "your account", "buy again", "amazon.com logo",
+            "amazon logo",
         }
         for alt in raw_alts:
             alt_clean = re.sub(r"\s+", " ", unescape(alt)).strip()
             if len(alt_clean) < 6:
                 continue
             alt_lower = alt_clean.lower()
-            if alt_lower in exact_banned or alt_lower.startswith("transactional-"):
+            if (
+                alt_lower in exact_banned
+                or alt_lower.startswith(("transactional-", "star rating", "amazon"))
+                or "logo" in alt_lower
+            ):
                 continue
             if alt_clean not in seen_items:
                 seen_items.add(alt_clean)
@@ -302,17 +328,12 @@ def is_process_running(pid: int) -> bool:
         return False
 
 def get_listener_pid() -> int | None:
-    if not os.path.exists(PID_FILE):
-        return None
-    try:
-        with open(PID_FILE, "r") as f:
-            pid = int(f.read().strip())
-        if is_process_running(pid):
-            return pid
-        os.unlink(PID_FILE)
-    except Exception:
-        pass
-    return None
+    return reconcile_live_daemon_pid(
+        pid_file=PID_FILE,
+        lock_path=LOCK_FILE,
+        script_name="amazon_order_listener.py",
+        subcommands=("run",),
+    )
 
 def get_status() -> dict:
     pid = get_listener_pid()
@@ -326,6 +347,11 @@ def get_status() -> dict:
 
 def run_loop():
     global _running
+    lock_handle = acquire_singleton_lock(LOCK_FILE)
+    if lock_handle is None:
+        log("Amazon order listener already running (lock held). Exiting.")
+        return
+
     signal.signal(signal.SIGINT, _handle_exit_signal)
     signal.signal(signal.SIGTERM, _handle_exit_signal)
 
@@ -334,6 +360,7 @@ def run_loop():
             f.write(str(os.getpid()))
     except Exception as e:
         log(f"Failed writing PID file {PID_FILE}: {e}")
+        release_singleton_lock(lock_handle)
         return
 
     log(f"Starting Amazon order listener daemon (PID: {os.getpid()})...")
@@ -411,14 +438,17 @@ def run_loop():
                 os.unlink(PID_FILE)
         except OSError:
             pass
+        release_singleton_lock(lock_handle)
         log("Zero Amazon Order Listener stopped cleanly.")
 
 def start_daemon_background() -> bool:
     pid = get_listener_pid()
-    if pid:
+    if pid or is_lock_held(LOCK_FILE):
+        terminate_duplicate_daemons("amazon_order_listener.py", ("run",), keep_pid=pid)
         log(f"Amazon order listener already running (PID {pid}).")
         return True
 
+    terminate_duplicate_daemons("amazon_order_listener.py", ("run",))
     os.makedirs(STATE_DIR, exist_ok=True)
     log_fp = open(LOG_FILE, "a")
     proc = subprocess.Popen(
@@ -444,6 +474,7 @@ def start_daemon_background() -> bool:
 def stop_daemon() -> bool:
     pid = get_listener_pid()
     if not pid:
+        terminate_duplicate_daemons("amazon_order_listener.py", ("run",))
         print("[Amazon Order Listener] Listener is not running.")
         return True
 
@@ -461,6 +492,7 @@ def stop_daemon() -> bool:
     except Exception as e:
         print(f"[Amazon Order Listener] Error while stopping PID {pid}: {e}")
 
+    terminate_duplicate_daemons("amazon_order_listener.py", ("run",), keep_pid=None)
     try:
         if os.path.exists(PID_FILE):
             os.unlink(PID_FILE)
