@@ -12,11 +12,13 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from tools.ha_reauth_watchdog import (
+    COORDINATOR_POE_CYCLE_COOLDOWN_SECONDS,
     ENVOY_HEAL_COOLDOWN_SECONDS,
     ENVOY_RECONNECT_POLL_ATTEMPTS,
     ENVOY_RECONNECT_POLL_INTERVAL_SECONDS,
     ENVOY_RELOAD_TIMEOUT_SECONDS,
     PT,
+    WAKEUP2_COVER_ENTITIES,
     ZHA_RELOAD_TIMEOUT_SECONDS,
     ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS,
     ZWAVE_JS_DEFAULT_ENTRY_ID,
@@ -25,13 +27,19 @@ from tools.ha_reauth_watchdog import (
     ZWAVE_RELOAD_TIMEOUT_SECONDS,
     _auto_heal_enphase_envoy,
     _auto_heal_matter_thread_nodes,
+    _auto_heal_thread_coordinator,
     _auto_heal_zha_entry,
     _auto_heal_zwave_js,
     _find_stale_matter_thread_services,
     _get_unifi_config,
     _kick_unifi_envoy_client,
     _parse_active_srp_matter_services,
+    _power_cycle_coordinator_poe_port,
     _probe_tcp_port,
+    _reconcile_living_room_blinds,
+    _reconcile_post_outage_covers,
+    _refresh_poe_port_cache,
+    _unifi_login_session,
     _zwave_logs_indicate_wedged_driver,
     check_ha_integrations,
 )
@@ -832,6 +840,393 @@ def test_check_ha_integrations_enphase_envoy_unhealed_alerts():
         assert len(items) == 1
         assert items[0]["domain"] == "enphase_envoy"
         assert "Envoy Gateway" in summary
+
+
+def test_unifi_login_session_success():
+    opener = MagicMock()
+    resp = MagicMock()
+    resp.headers = {"X-CSRF-Token": "csrf_token_abc"}
+    resp.__enter__.return_value = resp
+    opener.open.return_value = resp
+
+    res_opener, headers = _unifi_login_session("https://198.51.100.1:8443", "test_user", "test_pass", opener=opener)
+    assert res_opener is opener
+    assert headers.get("X-CSRF-Token") == "csrf_token_abc"
+    assert headers.get("Content-Type") == "application/json"
+
+
+def test_unifi_login_session_missing_credentials_or_error():
+    res_opener, headers = _unifi_login_session("", "user", "pass")
+    assert res_opener is None
+    assert headers == {}
+
+    opener = MagicMock()
+    opener.open.side_effect = Exception("network connection failed")
+    res_opener, headers = _unifi_login_session("https://198.51.100.1:8443", "user", "pass", opener=opener)
+    assert res_opener is None
+    assert headers == {}
+
+
+def test_refresh_poe_port_cache_learning():
+    opener = MagicMock()
+
+    def fake_open(req, timeout=10):
+        url = req.full_url
+        if url.endswith("/api/auth/login"):
+            resp = MagicMock()
+            resp.headers = {"X-CSRF-Token": "test_tok"}
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith("/proxy/network/api/s/default/stat/device"):
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({
+                "data": [
+                    {"mac": "00:00:5e:00:53:01", "name": "USW-24-PoE"}
+                ]
+            }).encode()
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith("/proxy/network/api/s/default/stat/sta"):
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({
+                "data": [
+                    {"name": "SLZB-06p7 Zigbee", "sw_mac": "00:00:5e:00:53:01", "sw_port": 2},
+                    {"name": "SLZB-06p7-Thread", "sw_mac": "00:00:5e:00:53:01", "sw_port": 4},
+                    {"hostname": "tubeszb-cc2652p2", "sw_mac": "00:00:5e:00:53:01", "sw_port": 6},
+                ]
+            }).encode()
+            resp.__enter__.return_value = resp
+            return resp
+        raise AssertionError(f"Unexpected url: {url}")
+
+    opener.open.side_effect = fake_open
+    state = {}
+    cache = _refresh_poe_port_cache("https://198.51.100.1:8443", "admin", "secret", state, opener=opener)
+
+    assert cache["zha_slzb06p7"] == {"switch_mac": "00:00:5e:00:53:01", "port_idx": 2, "switch_name": "USW-24-PoE"}
+    assert cache["thread_slzb06p7"] == {"switch_mac": "00:00:5e:00:53:01", "port_idx": 4, "switch_name": "USW-24-PoE"}
+    assert cache["zwave_tubeszb"] == {"switch_mac": "00:00:5e:00:53:01", "port_idx": 6, "switch_name": "USW-24-PoE"}
+
+
+def test_refresh_poe_port_cache_env_override():
+    override_json = json.dumps({
+        "zha_slzb06p7": {"switch_mac": "00:00:5e:00:53:99", "port_idx": 15, "switch_name": "OverrideSwitch"}
+    })
+    with patch.dict("os.environ", {"UNIFI_POE_COORDINATOR_MAP": override_json}):
+        state = {}
+        cache = _refresh_poe_port_cache("", "", "", state)
+        assert cache["zha_slzb06p7"]["port_idx"] == 15
+        assert cache["zha_slzb06p7"]["switch_mac"] == "00:00:5e:00:53:99"
+
+
+def test_refresh_poe_port_cache_offline_fallback():
+    state = {
+        "poe_port_cache": {
+            "zha_slzb06p7": {"switch_mac": "00:00:5e:00:53:01", "port_idx": 2, "switch_name": "CachedSwitch"}
+        }
+    }
+    with patch("tools.ha_reauth_watchdog._unifi_login_session", return_value=(None, {})):
+        cache = _refresh_poe_port_cache("https://198.51.100.1:8443", "u", "p", state)
+        assert cache["zha_slzb06p7"]["port_idx"] == 2
+        assert cache["zha_slzb06p7"]["switch_name"] == "CachedSwitch"
+
+
+def test_power_cycle_coordinator_poe_port_success():
+    state = {
+        "poe_port_cache": {
+            "zha_slzb06p7": {"switch_mac": "00:00:5e:00:53:01", "port_idx": 2, "switch_name": "USW-24-PoE"}
+        }
+    }
+    dispatched_payload = None
+
+    def fake_open(req, timeout=10):
+        nonlocal dispatched_payload
+        url = req.full_url
+        if url.endswith("/proxy/network/api/s/default/cmd/devmgr"):
+            dispatched_payload = json.loads(req.data.decode())
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        raise AssertionError(f"Unexpected url: {url}")
+
+    mock_opener = MagicMock()
+    mock_opener.open.side_effect = fake_open
+
+    with (
+        patch("tools.ha_reauth_watchdog._get_unifi_config", return_value=("https://198.51.100.1:8443", "u", "p")),
+        patch("tools.ha_reauth_watchdog._unifi_login_session", return_value=(mock_opener, {"X-CSRF-Token": "tok"})),
+        patch("tools.ha_reauth_watchdog._save_state") as mock_save,
+    ):
+        ok = _power_cycle_coordinator_poe_port("zha_slzb06p7", state=state, opener=mock_opener)
+        assert ok is True
+        assert dispatched_payload == {"cmd": "power-cycle", "mac": "00:00:5e:00:53:01", "port_idx": 2}
+        assert "zha_slzb06p7" in state.get("poe_last_cycle_ts", {})
+        assert mock_save.call_count >= 1
+
+
+def test_power_cycle_coordinator_poe_port_cooldown_suppression():
+    state = {"poe_last_cycle_ts": {"zha_slzb06p7": int(time.time()) - 200}}
+    with patch("tools.ha_reauth_watchdog._unifi_login_session") as mock_login:
+        ok = _power_cycle_coordinator_poe_port("zha_slzb06p7", state=state)
+        assert ok is False
+        assert mock_login.call_count == 0
+
+
+def test_power_cycle_coordinator_poe_port_unresolved():
+    state = {"poe_port_cache": {}}
+    with (
+        patch("tools.ha_reauth_watchdog._get_unifi_config", return_value=("https://198.51.100.1:8443", "u", "p")),
+        patch("tools.ha_reauth_watchdog._refresh_poe_port_cache", return_value={}),
+    ):
+        ok = _power_cycle_coordinator_poe_port("unknown_coordinator", state=state)
+        assert ok is False
+
+
+def test_auto_heal_zha_entry_poe_recovery():
+    probe_count = 0
+
+    def fake_probe(ip, port, timeout=2.0):
+        nonlocal probe_count
+        probe_count += 1
+        return probe_count >= 2
+
+    def fake_urlopen(req, timeout=10):
+        url = req.full_url
+        if url.endswith("/api/services/button/press"):
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith("/reload"):
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith("/api/config/config_entries/entry"):
+            resp = MagicMock()
+            resp.status = 200
+            resp.read.return_value = b'[{"entry_id": "zha_entry_1", "state": "loaded"}]'
+            resp.__enter__.return_value = resp
+            return resp
+        raise AssertionError(f"Unexpected url: {url}")
+
+    class FakeInitialSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def connect_ex(self, addr):
+            return 111  # Initial probe fails
+
+    state = {}
+    with (
+        patch("tools.ha_reauth_watchdog._get_zha_coordinator_ip", return_value="198.51.100.25"),
+        patch("tools.ha_reauth_watchdog.socket.socket", return_value=FakeInitialSocket()),
+        patch("tools.ha_reauth_watchdog._power_cycle_coordinator_poe_port", return_value=True) as mock_poe,
+        patch("tools.ha_reauth_watchdog._probe_tcp_port", side_effect=fake_probe),
+        patch("tools.ha_reauth_watchdog.urllib.request.urlopen", side_effect=fake_urlopen),
+        patch("tools.ha_reauth_watchdog.time.sleep"),
+    ):
+        ok = _auto_heal_zha_entry("http://198.51.100.10:8123", "tok", "zha_entry_1", state=state)
+        assert ok is True
+        assert mock_poe.call_count == 1
+        assert mock_poe.call_args[0][0] == "zha_slzb06p7"
+
+
+def test_auto_heal_zwave_js_poe_recovery_when_button_fails():
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def connect_ex(self, addr):
+            return 111
+
+    def fake_urlopen(req, timeout=10):
+        url = req.full_url
+        if url.endswith("/api/services/button/press"):
+            resp = MagicMock()
+            resp.status = 500  # Button press fails
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith(f"/api/config/config_entries/entry/{ZWAVE_JS_DEFAULT_ENTRY_ID}/reload"):
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith("/api/config/config_entries/entry"):
+            resp = MagicMock()
+            resp.status = 200
+            resp.read.return_value = f'[{{"entry_id": "{ZWAVE_JS_DEFAULT_ENTRY_ID}", "state": "loaded"}}]'.encode()
+            resp.__enter__.return_value = resp
+            return resp
+        if url.endswith("/api/services/cover/close_cover") or url.endswith("/api/services/cover/open_cover"):
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        raise AssertionError(f"Unexpected url: {url}")
+
+    sample_states = [
+        {"entity_id": "sensor.tubeszb_2026_zw_esp_ip_address", "state": "198.51.100.50"},
+        {"entity_id": "cover.living_room_blinds_1", "state": "open"},
+    ]
+    state = {}
+    with (
+        patch("tools.nas_config.run_ssh", return_value=(0, "Restarted", "")) as mock_ssh,
+        patch("tools.ha_reauth_watchdog.socket.socket", return_value=FakeSocket()),
+        patch("tools.ha_reauth_watchdog._power_cycle_coordinator_poe_port", return_value=True) as mock_poe,
+        patch("tools.ha_reauth_watchdog._probe_tcp_port", return_value=True),
+        patch("tools.ha_reauth_watchdog.urllib.request.urlopen", side_effect=fake_urlopen),
+        patch("tools.ha_reauth_watchdog.time.sleep"),
+    ):
+        ok = _auto_heal_zwave_js("http://198.51.100.10:8123", "tok", ZWAVE_JS_DEFAULT_ENTRY_ID, states=sample_states, state=state)
+        assert ok is True
+        assert mock_poe.call_count == 1
+        assert mock_poe.call_args[0][0] == "zwave_tubeszb"
+        assert mock_ssh.call_count == 1
+
+
+def test_auto_heal_thread_coordinator_via_poe_and_otbr_restart():
+    sample_states = [{"entity_id": "binary_sensor.slzb_06p7_thread_ethernet", "state": "off"}]
+    sample_entries = [
+        {"entry_id": "otbr_1", "domain": "otbr", "state": "setup_retry"},
+        {"entry_id": "matter_1", "domain": "matter", "state": "loaded"},
+    ]
+    reloaded_entries: list[str] = []
+
+    def fake_urlopen(req, timeout=10):
+        url = req.full_url
+        if "/reload" in url:
+            reloaded_entries.append(url)
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        raise AssertionError(f"Unexpected url: {url}")
+
+    state = {}
+    with (
+        patch("tools.ha_reauth_watchdog._power_cycle_coordinator_poe_port", return_value=True) as mock_poe,
+        patch("tools.nas_config.run_ssh", return_value=(0, "restarted", "")) as mock_ssh,
+        patch("tools.ha_reauth_watchdog.urllib.request.urlopen", side_effect=fake_urlopen),
+        patch("tools.ha_reauth_watchdog._auto_heal_matter_thread_nodes", return_value=[]) as mock_nodes,
+        patch("tools.ha_reauth_watchdog.time.sleep"),
+    ):
+        ok = _auto_heal_thread_coordinator(
+            "http://198.51.100.10:8123",
+            "tok",
+            states=sample_states,
+            state=state,
+            entries=sample_entries,
+        )
+        assert ok is True
+        assert mock_poe.call_count == 1
+        assert mock_poe.call_args[0][0] == "thread_slzb06p7"
+        assert mock_ssh.call_count == 1
+        assert "docker restart otbr" in mock_ssh.call_args[0][1]
+        assert any("otbr_1/reload" in u for u in reloaded_entries)
+        assert any("matter_1/reload" in u for u in reloaded_entries)
+        assert mock_nodes.call_count == 1
+
+
+def test_auto_heal_thread_coordinator_skips_when_nominal():
+    sample_states = [
+        {"entity_id": "binary_sensor.slzb_06p7_thread_ethernet", "state": "on"},
+        {"entity_id": "binary_sensor.slzb_06p7_thread_internet", "state": "on"},
+    ]
+    sample_entries = [{"entry_id": "otbr_1", "domain": "otbr", "state": "loaded"}]
+    with patch("tools.ha_reauth_watchdog._power_cycle_coordinator_poe_port") as mock_poe:
+        ok = _auto_heal_thread_coordinator("http://198.51.100.10:8123", "tok", states=sample_states, entries=sample_entries)
+        assert ok is False
+        assert mock_poe.call_count == 0
+
+
+def test_reconcile_post_outage_covers_tracks_and_reconciles_missed_opens():
+    state = {}
+    outage_states = [
+        {"entity_id": "cover.living_room_blinds_1", "state": "unavailable"},
+        {"entity_id": "cover.curtain_3_64", "state": "unknown"},
+    ]
+    _reconcile_post_outage_covers("http://198.51.100.10:8123", "tok", states=outage_states, state=state)
+    assert "cover.living_room_blinds_1" in state["unavailable_covers"]
+    assert "cover.curtain_3_64" in state["unavailable_covers"]
+
+    # Now recovered back online during daytime open window:
+    recovery_states = [
+        {"entity_id": "cover.living_room_blinds_1", "state": "closed"},
+        {"entity_id": "cover.curtain_3_64", "state": "closed"},
+    ]
+    daytime = datetime(2026, 11, 15, 10, 0, tzinfo=PT)
+    opened_covers: list[str] = []
+
+    def fake_urlopen(req, timeout=10):
+        if req.full_url.endswith("/api/services/cover/open_cover"):
+            payload = json.loads(req.data.decode())
+            opened_covers.append(payload["entity_id"])
+            resp = MagicMock()
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+        raise AssertionError(f"Unexpected url: {req.full_url}")
+
+    with patch("tools.ha_reauth_watchdog.urllib.request.urlopen", side_effect=fake_urlopen):
+        reconciled = _reconcile_post_outage_covers(
+            "http://198.51.100.10:8123",
+            "tok",
+            states=recovery_states,
+            state=state,
+            now_pt=daytime,
+        )
+        assert reconciled == ["cover.living_room_blinds_1", "cover.curtain_3_64"]
+        assert opened_covers == ["cover.living_room_blinds_1", "cover.curtain_3_64"]
+        assert state["unavailable_covers"] == []
+
+
+def test_reconcile_post_outage_covers_manual_close_preserved():
+    # Cover was NOT in state["unavailable_covers"] (it was never unavailable)
+    state = {"unavailable_covers": []}
+    states = [{"entity_id": "cover.living_room_blinds_1", "state": "closed"}]
+    daytime = datetime(2026, 11, 15, 10, 0, tzinfo=PT)
+    with patch("tools.ha_reauth_watchdog.urllib.request.urlopen") as mock_url:
+        reconciled = _reconcile_post_outage_covers(
+            "http://198.51.100.10:8123",
+            "tok",
+            states=states,
+            state=state,
+            now_pt=daytime,
+        )
+        assert reconciled == []
+        assert mock_url.call_count == 0
+
+
+def test_reconcile_post_outage_covers_outside_daytime_window():
+    state = {"unavailable_covers": ["cover.living_room_blinds_1"]}
+    recovery_states = [{"entity_id": "cover.living_room_blinds_1", "state": "closed"}]
+    nighttime = datetime(2026, 11, 15, 23, 0, tzinfo=PT)
+    with patch("tools.ha_reauth_watchdog.urllib.request.urlopen") as mock_url:
+        reconciled = _reconcile_post_outage_covers(
+            "http://198.51.100.10:8123",
+            "tok",
+            states=recovery_states,
+            state=state,
+            now_pt=nighttime,
+        )
+        assert reconciled == []
+        assert mock_url.call_count == 0
+        assert state["unavailable_covers"] == []
+
 
 
 

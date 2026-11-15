@@ -7,6 +7,7 @@ Audits Home Assistant config entries and persistent notifications:
 2. Filters known benign/powered-off devices (OctoPrint, Projector, IP Webcam).
 3. Dispatches immediate actionable alerts to #home-assistant (1544953275877556334).
 4. Deduplicates alerts using /workspace/data/ha_reauth_state.json.
+5. Auto-heals wedged ZHA, Z-Wave JS, Enphase Envoy, and Matter-over-Thread coordinators.
 """
 
 import argparse
@@ -54,6 +55,14 @@ ENVOY_HEAL_COOLDOWN_SECONDS = 1800
 ENVOY_RECONNECT_POLL_ATTEMPTS = 9
 ENVOY_RECONNECT_POLL_INTERVAL_SECONDS = 5.0
 ENVOY_RELOAD_TIMEOUT_SECONDS = 30
+
+COORDINATOR_POE_CYCLE_COOLDOWN_SECONDS = 1800
+WAKEUP2_COVER_ENTITIES = (
+    "cover.living_room_blinds_1",
+    "cover.living_room_blinds_2",
+    "cover.curtain_3_64",
+    "cover.curtain_3_31",
+)
 
 # Devices that routinely enter setup_retry when powered off at the wall
 BENIGN_STANDBY_DOMAINS = {"octoprint", "android_ip_webcam", "androidtv_remote"}
@@ -232,7 +241,7 @@ def _load_state() -> dict:
                 return json.load(f)
         except Exception:
             pass
-    return {"seen_issues": {}, "last_check_at": None}
+    return {"seen_issues": {}, "last_check_at": None, "poe_port_cache": {}, "poe_last_cycle_ts": {}, "unavailable_covers": []}
 
 
 def _save_state(state: dict):
@@ -255,25 +264,55 @@ def _get_zha_coordinator_ip() -> str:
     return zha_ip or "127.0.0.1"
 
 
-def _auto_heal_zha_entry(base_url: str, token: str, entry_id: str) -> bool:
+def _auto_heal_zha_entry(
+    base_url: str,
+    token: str,
+    entry_id: str,
+    state: dict | None = None,
+) -> bool:
     """Attempt to recover a wedged ZHA config entry safely.
 
-    1. Probes coordinator TCP port 6638 and closes the socket immediately so the
-       single-client serial-over-TCP bridge is never held open during reload.
-    2. Pulses `button.slzb_06p7_zigbee_restart` via SMLIGHT integration to hardware-reset
+    1. Probes coordinator TCP port 6638. If unreachable, triggers UniFi PoE power-cycle
+       for zha_slzb06p7 and polls port 6638 until back online.
+    2. Closes the socket immediately so the single-client serial-over-TCP bridge is
+       never held open during reload.
+    3. Pulses `button.slzb_06p7_zigbee_restart` via SMLIGHT integration to hardware-reset
        a wedged CC2652P7 UART chip before ZHA runs `_skip_bootloader()`.
-    3. Calls `/reload` with a 35s timeout (preventing premature HTTP client disconnect
+    4. Calls `/reload` with a 35s timeout (preventing premature HTTP client disconnect
        that cancels `async_setup_entry` into permanent `setup_error`).
-    4. Verifies the config entry reached `state == "loaded"` before reporting success.
+    5. Verifies the config entry reached `state == "loaded"` before reporting success.
     """
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     zha_ip = _get_zha_coordinator_ip()
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(2.0)
-            if sock.connect_ex((zha_ip, 6638)) != 0:
+        reachable = False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(2.0)
+                if sock.connect_ex((zha_ip, 6638)) == 0:
+                    reachable = True
+            time.sleep(ZHA_SOCKET_RELEASE_SETTLE_SECONDS)
+        except Exception:
+            reachable = False
+
+        if not reachable:
+            print(
+                f"[HAReauthWatchdog] ZHA port 6638 unreachable on {zha_ip}; attempting UniFi PoE cycle...",
+                file=sys.stderr,
+            )
+            cycled = _power_cycle_coordinator_poe_port("zha_slzb06p7", state=state)
+            if not cycled:
                 return False
-        time.sleep(ZHA_SOCKET_RELEASE_SETTLE_SECONDS)
+            recovered = False
+            for _ in range(12):
+                time.sleep(3.0)
+                if _probe_tcp_port(zha_ip, 6638):
+                    recovered = True
+                    break
+            if not recovered:
+                print(f"[HAReauthWatchdog] ZHA port 6638 did not recover after PoE power-cycle.", file=sys.stderr)
+                return False
+            time.sleep(ZHA_SOCKET_RELEASE_SETTLE_SECONDS)
 
         try:
             btn_req = urllib.request.Request(
@@ -380,6 +419,7 @@ def _reconcile_living_room_blinds(
     token: str,
     states: list[dict] | None = None,
     now_pt: datetime | None = None,
+    state: dict | None = None,
 ) -> list[str]:
     """Re-apply missed open/close schedules for living room blinds after Z-Wave JS recovery."""
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -444,10 +484,68 @@ def _reconcile_living_room_blinds(
                     f"[HAReauthWatchdog] 🔄 Reconciled living room blinds via cover/{service}: {targets}",
                     file=sys.stderr,
                 )
+                if state is not None and "unavailable_covers" in state:
+                    for t in targets:
+                        if t in state["unavailable_covers"]:
+                            state["unavailable_covers"].remove(t)
                 return targets
     except Exception as cov_ex:
         print(f"[HAReauthWatchdog] Note: Blind reconciliation skipped: {cov_ex}", file=sys.stderr)
     return []
+
+
+def _reconcile_post_outage_covers(
+    base_url: str,
+    token: str,
+    states: list[dict] | None = None,
+    state: dict | None = None,
+    now_pt: datetime | None = None,
+) -> list[str]:
+    """Track previously unavailable Wakeup-2 covers and open any that missed schedule upon recovery."""
+    if not states or state is None:
+        return []
+
+    unavail_list = state.setdefault("unavailable_covers", [])
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    current_pt = now_pt or datetime.now(PT)
+    minutes = current_pt.hour * 60 + current_pt.minute
+    open_start = (7 * 60 + 5) if current_pt.weekday() < 5 else (8 * 60 + 5)
+    is_open_window = open_start <= minutes <= (16 * 60)
+
+    reconciled: list[str] = []
+    current_state_map = {
+        s.get("entity_id"): s.get("state")
+        for s in states
+        if isinstance(s, dict) and s.get("entity_id") in WAKEUP2_COVER_ENTITIES
+    }
+
+    for eid in WAKEUP2_COVER_ENTITIES:
+        cur_st = current_state_map.get(eid)
+        if cur_st in ("unavailable", "unknown"):
+            if eid not in unavail_list:
+                unavail_list.append(eid)
+        elif eid in unavail_list:
+            unavail_list.remove(eid)
+            if is_open_window and cur_st == "closed":
+                try:
+                    cov_req = urllib.request.Request(
+                        f"{base_url}/api/services/cover/open_cover",
+                        data=json.dumps({"entity_id": eid}).encode(),
+                        headers=headers,
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(cov_req, timeout=10) as resp:
+                        if resp.status == 200:
+                            print(
+                                f"[HAReauthWatchdog] 🔄 Reconciled recovered cover {eid} (opened post-outage).",
+                                file=sys.stderr,
+                            )
+                            reconciled.append(eid)
+                except Exception as ex:
+                    print(f"[HAReauthWatchdog] Note: Failed to open recovered cover {eid}: {ex}", file=sys.stderr)
+
+    return reconciled
 
 
 def _auto_heal_zwave_js(
@@ -455,16 +553,19 @@ def _auto_heal_zwave_js(
     token: str,
     entry_id: str,
     states: list[dict] | None = None,
+    state: dict | None = None,
 ) -> bool:
     """Attempt to recover a wedged Z-Wave JS / TubesZB setup and reconcile living room blinds.
 
     1. Resolves the TubesZB Z-Wave coordinator IP from `states`, `TUBESZB_ZW_IP`, or `127.0.0.1`
        and probes TCP port 6053. If unreachable, pulses `button.tubeszb_2026_zw_restart_the_device`
        and waits `ZWAVE_RADIO_RESET_SETTLE_SECONDS` (8.0s).
-    2. Restarts `zwave-js-ui` on Host 1 via Docker Compose, waits
+    2. If the button press fails or port 6053 remains unreachable, triggers UniFi PoE power-cycle
+       for zwave_tubeszb and polls port 6053 until back online.
+    3. Restarts `zwave-js-ui` on Host 1 via Docker Compose, waits
        `ZWAVE_CONTAINER_STARTUP_SETTLE_SECONDS` (38.0s for its 30s entrypoint sleep),
        reloads the HA `zwave_js` config entry, and verifies `state == 'loaded'`.
-    3. Reconciles `cover.living_room_blinds_1` and `cover.living_room_blinds_2` if they missed
+    4. Reconciles `cover.living_room_blinds_1` and `cover.living_room_blinds_2` if they missed
        their scheduled close/open window while the bridge was wedged.
     """
     try:
@@ -499,6 +600,7 @@ def _auto_heal_zwave_js(
             reachable = False
 
         if not reachable:
+            btn_ok = False
             try:
                 btn_req = urllib.request.Request(
                     f"{base_url}/api/services/button/press",
@@ -508,6 +610,7 @@ def _auto_heal_zwave_js(
                 )
                 with urllib.request.urlopen(btn_req, timeout=10) as btn_resp:
                     if btn_resp.status == 200:
+                        btn_ok = True
                         print(
                             "[HAReauthWatchdog] 🔄 Pulsed button.tubeszb_2026_zw_restart_the_device (port 6053 unreachable).",
                             file=sys.stderr,
@@ -515,6 +618,23 @@ def _auto_heal_zwave_js(
                         time.sleep(ZWAVE_RADIO_RESET_SETTLE_SECONDS)
             except Exception as btn_ex:
                 print(f"[HAReauthWatchdog] Note: TubesZB restart button press skipped: {btn_ex}", file=sys.stderr)
+
+            need_poe = not btn_ok
+            if btn_ok and state and state.get("check_port_after_button"):
+                if not _probe_tcp_port(zw_ip, 6053):
+                    need_poe = True
+
+            if need_poe:
+                print(
+                    "[HAReauthWatchdog] ⚡ TubesZB coordinator unreachable; attempting UniFi PoE cycle...",
+                    file=sys.stderr,
+                )
+                cycled = _power_cycle_coordinator_poe_port("zwave_tubeszb", state=state)
+                if cycled:
+                    for _ in range(12):
+                        time.sleep(3.0)
+                        if _probe_tcp_port(zw_ip, 6053):
+                            break
 
         restart_cmd = (
             f"cd {nas_config.DOCKER_ROOT}/homeassistant && "
@@ -561,7 +681,7 @@ def _auto_heal_zwave_js(
                             f"[HAReauthWatchdog] 🔄 Auto-healed Z-Wave JS config entry {entry_id} (verified state=loaded).",
                             file=sys.stderr,
                         )
-                        _reconcile_living_room_blinds(base_url, token, states=states)
+                        _reconcile_living_room_blinds(base_url, token, states=states, state=state)
                         return True
     except Exception as ex:
         print(f"[HAReauthWatchdog] Z-Wave JS auto-heal error: {ex}", file=sys.stderr)
@@ -600,23 +720,18 @@ def _get_unifi_config() -> tuple[str, str, str]:
     return unifi_url or "https://127.0.0.1", unifi_user, unifi_pass
 
 
-def _kick_unifi_envoy_client(
+def _unifi_login_session(
     unifi_url: str,
     username: str,
     password: str,
     opener: Any = None,
-) -> tuple[bool, str | None, str | None]:
-    """Kick the Enphase Envoy Wi-Fi client on UniFi to clear zombie association and force reconnect.
+) -> tuple[Any, dict[str, str]]:
+    """Log into UniFi OS (/api/auth/login) capturing session cookies and X-CSRF-Token.
 
-    1. Logs into UniFi OS (/api/auth/login) capturing session cookies and X-CSRF-Token.
-    2. Queries /proxy/network/api/s/default/stat/sta (falling back to /stat/alluser) for client
-       with 'envoy' in hostname or name (case-insensitive).
-    3. Issues POST /proxy/network/api/s/default/cmd/stamgr with {'cmd': 'kick-sta', 'mac': mac}.
-    Returns (True, mac, ip) on success, or (False, None, None) on failure.
+    Returns (opener, common_headers) on success, or (None, {}) on failure.
     """
     if not unifi_url or not username or not password:
-        print("[HAReauthWatchdog] UniFi credentials or URL missing for Envoy kick.", file=sys.stderr)
-        return False, None, None
+        return None, {}
 
     unifi_url = unifi_url.rstrip("/")
     if opener is None:
@@ -631,10 +746,9 @@ def _kick_unifi_envoy_client(
             )
         except Exception as ex:
             print(f"[HAReauthWatchdog] Failed to build UniFi HTTPS opener: {ex}", file=sys.stderr)
-            return False, None, None
+            return None, {}
 
     try:
-        # 1. Login to UniFi OS
         login_data = json.dumps({"username": username, "password": password}).encode("utf-8")
         login_req = urllib.request.Request(
             f"{unifi_url}/api/auth/login",
@@ -654,7 +768,377 @@ def _kick_unifi_envoy_client(
         common_headers = {"Content-Type": "application/json"}
         if csrf_token:
             common_headers["X-CSRF-Token"] = csrf_token
+        return opener, common_headers
+    except Exception as ex:
+        print(f"[HAReauthWatchdog] UniFi login failed: {ex}", file=sys.stderr)
+        return None, {}
 
+
+def _match_coordinator_key(name_str: str) -> str | None:
+    """Classify client or port name into coordinator key."""
+    low = name_str.lower()
+    if "slzb-06p7-thread" in low or "slzb_06p7_thread" in low:
+        return "thread_slzb06p7"
+    if ("slzb-06p7" in low or "slzb_06p7" in low) and "thread" not in low:
+        return "zha_slzb06p7"
+    if "tubeszb" in low:
+        return "zwave_tubeszb"
+    return None
+
+
+def _refresh_poe_port_cache(
+    unifi_url: str,
+    username: str,
+    password: str,
+    state: dict,
+    opener: Any = None,
+) -> dict[str, dict]:
+    """Query UniFi /stat/device and /stat/sta to learn PoE switch MAC and port for coordinators.
+
+    Persists learned mappings in state['poe_port_cache'].
+    Also applies optional UNIFI_POE_COORDINATOR_MAP override from environment or /secrets/env.json.
+    """
+    cache = state.setdefault("poe_port_cache", {})
+
+    poe_map_raw = os.environ.get("UNIFI_POE_COORDINATOR_MAP")
+    if not poe_map_raw and os.path.exists("/secrets/env.json"):
+        try:
+            with open("/secrets/env.json") as f:
+                poe_map_raw = json.load(f).get("UNIFI_POE_COORDINATOR_MAP")
+        except Exception:
+            pass
+    if poe_map_raw:
+        poe_map = {}
+        if isinstance(poe_map_raw, str):
+            try:
+                poe_map = json.loads(poe_map_raw)
+            except Exception:
+                pass
+        elif isinstance(poe_map_raw, dict):
+            poe_map = poe_map_raw
+        for k, v in poe_map.items():
+            if isinstance(v, dict) and "switch_mac" in v and "port_idx" in v:
+                cache[k] = {
+                    "switch_mac": v["switch_mac"],
+                    "port_idx": int(v["port_idx"]),
+                    "switch_name": v.get("switch_name", ""),
+                }
+
+    if not unifi_url or not username or not password:
+        return cache
+
+    unifi_url = unifi_url.rstrip("/")
+    opener, common_headers = _unifi_login_session(unifi_url, username, password, opener=opener)
+    if not opener:
+        return cache
+
+    switch_name_map: dict[str, str] = {}
+    try:
+        # 1. Query /stat/device for switch names and port_table
+        dev_req = urllib.request.Request(
+            f"{unifi_url}/proxy/network/api/s/default/stat/device",
+            headers=common_headers,
+        )
+        try:
+            with opener.open(dev_req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                devices = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for d in devices:
+                    if isinstance(d, dict) and "mac" in d:
+                        d_mac = d["mac"]
+                        d_name = d.get("name") or d.get("model") or ""
+                        switch_name_map[d_mac] = d_name
+                        for p in d.get("port_table", []):
+                            p_idx = p.get("port_idx")
+                            if p_idx is not None:
+                                p_str = f"{p.get('name') or ''} {p.get('last_network_client') or ''}"
+                                matched = _match_coordinator_key(p_str)
+                                if matched and matched not in cache:
+                                    cache[matched] = {
+                                        "switch_mac": d_mac,
+                                        "port_idx": int(p_idx),
+                                        "switch_name": d_name,
+                                    }
+        except Exception as dev_ex:
+            print(f"[HAReauthWatchdog] UniFi stat/device query failed: {dev_ex}", file=sys.stderr)
+
+        # 2. Query /stat/sta for connected client switch ports
+        sta_req = urllib.request.Request(
+            f"{unifi_url}/proxy/network/api/s/default/stat/sta",
+            headers=common_headers,
+        )
+        try:
+            with opener.open(sta_req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                clients = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for c in clients:
+                    if not isinstance(c, dict):
+                        continue
+                    name_str = f"{c.get('name') or ''} {c.get('hostname') or ''}"
+                    matched = _match_coordinator_key(name_str)
+                    if matched:
+                        sw_mac = c.get("sw_mac") or c.get("switch_mac") or c.get("uplink_mac")
+                        sw_port = c.get("sw_port") or c.get("switch_port") or c.get("uplink_device_port")
+                        if sw_mac and sw_port is not None:
+                            cache[matched] = {
+                                "switch_mac": sw_mac,
+                                "port_idx": int(sw_port),
+                                "switch_name": switch_name_map.get(sw_mac, ""),
+                            }
+        except Exception as sta_ex:
+            print(f"[HAReauthWatchdog] UniFi stat/sta query failed: {sta_ex}", file=sys.stderr)
+
+        # 3. Fallback to /stat/alluser if any coordinator still unmapped
+        missing_keys = [k for k in ("zha_slzb06p7", "thread_slzb06p7", "zwave_tubeszb") if k not in cache]
+        if missing_keys:
+            alluser_req = urllib.request.Request(
+                f"{unifi_url}/proxy/network/api/s/default/stat/alluser",
+                headers=common_headers,
+            )
+            try:
+                with opener.open(alluser_req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                    all_clients = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                    for c in all_clients:
+                        if not isinstance(c, dict):
+                            continue
+                        name_str = f"{c.get('name') or ''} {c.get('hostname') or ''}"
+                        matched = _match_coordinator_key(name_str)
+                        if matched and matched in missing_keys and matched not in cache:
+                            sw_mac = c.get("sw_mac") or c.get("switch_mac") or c.get("uplink_mac")
+                            sw_port = c.get("sw_port") or c.get("switch_port") or c.get("uplink_device_port")
+                            if sw_mac and sw_port is not None:
+                                cache[matched] = {
+                                    "switch_mac": sw_mac,
+                                    "port_idx": int(sw_port),
+                                    "switch_name": switch_name_map.get(sw_mac, ""),
+                                }
+            except Exception as all_ex:
+                print(f"[HAReauthWatchdog] UniFi stat/alluser query failed: {all_ex}", file=sys.stderr)
+
+    except Exception as ex:
+        print(f"[HAReauthWatchdog] Error refreshing PoE port cache: {ex}", file=sys.stderr)
+
+    return cache
+
+
+def _power_cycle_coordinator_poe_port(
+    coordinator_key: str,
+    state: dict | None = None,
+    opener: Any = None,
+) -> bool:
+    """Power-cycle the PoE port powering a coordinator via UniFi devmgr command.
+
+    1. Checks per-coordinator cooldown (COORDINATOR_POE_CYCLE_COOLDOWN_SECONDS = 1800).
+    2. Resolves switch MAC and port index from live UniFi or state['poe_port_cache'].
+    3. Posts cmd: power-cycle to /proxy/network/api/s/default/cmd/devmgr.
+    4. Updates state['poe_last_cycle_ts'] and persists state.
+    """
+    if state is None:
+        state = _load_state()
+
+    now = int(time.time())
+    last_cycle_map = state.setdefault("poe_last_cycle_ts", {})
+    last_cycle = last_cycle_map.get(coordinator_key, 0)
+    if now - last_cycle < COORDINATOR_POE_CYCLE_COOLDOWN_SECONDS:
+        print(
+            f"[HAReauthWatchdog] PoE cycle cooldown active for {coordinator_key} "
+            f"({now - last_cycle}s < {COORDINATOR_POE_CYCLE_COOLDOWN_SECONDS}s), skipping.",
+            file=sys.stderr,
+        )
+        return False
+
+    cache = state.setdefault("poe_port_cache", {})
+    unifi_url, unifi_user, unifi_pass = _get_unifi_config()
+
+    if coordinator_key not in cache:
+        _refresh_poe_port_cache(unifi_url, unifi_user, unifi_pass, state, opener=opener)
+
+    port_info = cache.get(coordinator_key)
+    if not port_info or not port_info.get("switch_mac") or port_info.get("port_idx") is None:
+        print(f"[HAReauthWatchdog] Unable to resolve PoE switch/port for {coordinator_key}.", file=sys.stderr)
+        return False
+
+    switch_mac = port_info["switch_mac"]
+    port_idx = port_info["port_idx"]
+
+    opener, common_headers = _unifi_login_session(unifi_url, unifi_user, unifi_pass, opener=opener)
+    if not opener:
+        print(f"[HAReauthWatchdog] UniFi login failed for PoE power-cycle of {coordinator_key}.", file=sys.stderr)
+        return False
+
+    unifi_url = unifi_url.rstrip("/")
+    try:
+        payload = json.dumps({
+            "cmd": "power-cycle",
+            "mac": switch_mac,
+            "port_idx": int(port_idx),
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{unifi_url}/proxy/network/api/s/default/cmd/devmgr",
+            data=payload,
+            headers=common_headers,
+            method="POST",
+        )
+        with opener.open(req, timeout=10) as resp:
+            status = getattr(resp, "status", None) or getattr(resp, "code", 200)
+            if status in (200, 204):
+                last_cycle_map[coordinator_key] = now
+                _save_state(state)
+                sw_name = port_info.get("switch_name", "")
+                print(
+                    f"[HAReauthWatchdog] ⚡ Dispatched UniFi PoE power-cycle for {coordinator_key} "
+                    f"on switch {switch_mac} ({sw_name}) port {port_idx}.",
+                    file=sys.stderr,
+                )
+                return True
+    except Exception as ex:
+        print(f"[HAReauthWatchdog] UniFi devmgr power-cycle failed for {coordinator_key}: {ex}", file=sys.stderr)
+
+    return False
+
+
+def _auto_heal_thread_coordinator(
+    base_url: str,
+    token: str,
+    states: list[dict] | None = None,
+    state: dict | None = None,
+    entries: list[dict] | None = None,
+) -> bool:
+    """Attempt to recover wedged Thread coordinator (SLZB-06p7 Thread).
+
+    Detects if binary_sensor.slzb_06p7_thread_ethernet or binary_sensor.slzb_06p7_thread_internet
+    is off/unavailable/unknown, or if the otbr config entry is in setup_retry/setup_error.
+    Power-cycles thread_slzb06p7 via UniFi PoE (respecting 30m cooldown), restarts otbr container,
+    reloads otbr and matter config entries, and invokes _auto_heal_matter_thread_nodes.
+    """
+    if state is None:
+        state = _load_state()
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    needs_heal = False
+
+    # 1. Check entries for otbr error
+    otbr_entry_id = None
+    matter_entry_id = None
+    if entries:
+        for e in entries:
+            dom = e.get("domain")
+            st = e.get("state")
+            if dom == "otbr":
+                otbr_entry_id = e.get("entry_id")
+                if st in ("setup_retry", "setup_error"):
+                    needs_heal = True
+            elif dom == "matter":
+                matter_entry_id = e.get("entry_id")
+
+    # 2. Check states for thread coordinator ethernet / internet sensors
+    if states:
+        thread_sensor_ids = (
+            "binary_sensor.slzb_06p7_thread_ethernet",
+            "binary_sensor.slzb_06p7_thread_internet",
+        )
+        for s in states:
+            if isinstance(s, dict) and s.get("entity_id") in thread_sensor_ids:
+                val = str(s.get("state") or "").lower()
+                if val in ("off", "unavailable", "unknown"):
+                    needs_heal = True
+                    break
+
+    if not needs_heal:
+        return False
+
+    print("[HAReauthWatchdog] 🔄 Thread coordinator issue detected; initiating recovery...", file=sys.stderr)
+
+    # 3. Power-cycle thread_slzb06p7 via UniFi PoE
+    cycled = _power_cycle_coordinator_poe_port("thread_slzb06p7", state=state)
+    if cycled:
+        time.sleep(5.0)
+
+    # 4. Restart otbr container on Host 1
+    try:
+        from tools import nas_config
+    except ImportError:
+        try:
+            import nas_config  # type: ignore
+        except ImportError:
+            nas_config = None
+
+    if nas_config:
+        rc, _, err = nas_config.run_ssh(
+            nas_config.HOST_1_IP,
+            "sudo /usr/local/bin/docker restart otbr",
+            timeout=30,
+        )
+        if rc == 0:
+            print("[HAReauthWatchdog] 🔄 Restarted otbr container on Host 1.", file=sys.stderr)
+            time.sleep(5.0)
+        else:
+            print(f"[HAReauthWatchdog] Note: otbr container restart returned rc={rc}: {err}", file=sys.stderr)
+
+    # 5. Reload otbr config entry if known
+    if otbr_entry_id:
+        try:
+            rel_req = urllib.request.Request(
+                f"{base_url}/api/config/config_entries/entry/{otbr_entry_id}/reload",
+                data=b"{}",
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(rel_req, timeout=30) as rel_resp:
+                if rel_resp.status == 200:
+                    print(f"[HAReauthWatchdog] 🔄 Reloaded otbr config entry {otbr_entry_id}.", file=sys.stderr)
+        except Exception as ex:
+            print(f"[HAReauthWatchdog] Note: otbr reload skipped: {ex}", file=sys.stderr)
+
+    # 6. Reload matter config entry if known
+    if matter_entry_id:
+        try:
+            rel_req = urllib.request.Request(
+                f"{base_url}/api/config/config_entries/entry/{matter_entry_id}/reload",
+                data=b"{}",
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(rel_req, timeout=30) as rel_resp:
+                if rel_resp.status == 200:
+                    print(f"[HAReauthWatchdog] 🔄 Reloaded matter config entry {matter_entry_id}.", file=sys.stderr)
+        except Exception as ex:
+            print(f"[HAReauthWatchdog] Note: matter reload skipped: {ex}", file=sys.stderr)
+
+    # 7. Settle & invoke _auto_heal_matter_thread_nodes
+    try:
+        _auto_heal_matter_thread_nodes(states=states)
+    except Exception as ex:
+        print(f"[HAReauthWatchdog] Note: _auto_heal_matter_thread_nodes in thread recovery: {ex}", file=sys.stderr)
+
+    return True
+
+
+def _kick_unifi_envoy_client(
+    unifi_url: str,
+    username: str,
+    password: str,
+    opener: Any = None,
+) -> tuple[bool, str | None, str | None]:
+    """Kick the Enphase Envoy Wi-Fi client on UniFi to clear zombie association and force reconnect.
+
+    1. Logs into UniFi OS (/api/auth/login) capturing session cookies and X-CSRF-Token.
+    2. Queries /proxy/network/api/s/default/stat/sta (falling back to /stat/alluser) for client
+       with 'envoy' in hostname or name (case-insensitive).
+    3. Issues POST /proxy/network/api/s/default/cmd/stamgr with {'cmd': 'kick-sta', 'mac': mac}.
+    Returns (True, mac, ip) on success, or (False, None, None) on failure.
+    """
+    if not unifi_url or not username or not password:
+        print("[HAReauthWatchdog] UniFi credentials or URL missing for Envoy kick.", file=sys.stderr)
+        return False, None, None
+
+    unifi_url = unifi_url.rstrip("/")
+    opener, common_headers = _unifi_login_session(unifi_url, username, password, opener=opener)
+    if not opener:
+        return False, None, None
+
+    try:
         # 2. Search active stations (/stat/sta)
         clients: list[dict] = []
         sta_req = urllib.request.Request(
@@ -866,13 +1350,13 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
 
         # Auto-heal ZHA if coordinator is back online
         if domain == "zha" and st in ("setup_retry", "setup_error"):
-            if _auto_heal_zha_entry(base_url, token, entry_id):
+            if _auto_heal_zha_entry(base_url, token, entry_id, state=state):
                 continue
 
         # Auto-heal Z-Wave JS if config entry is in setup_retry or setup_error
         if domain == "zwave_js" and st in ("setup_retry", "setup_error"):
             zwave_heal_attempted = True
-            if _auto_heal_zwave_js(base_url, token, entry_id):
+            if _auto_heal_zwave_js(base_url, token, entry_id, state=state):
                 zwave_healed = True
                 continue
 
@@ -880,6 +1364,11 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
         if domain == "enphase_envoy" and st in ("setup_retry", "setup_error"):
             if _auto_heal_enphase_envoy(base_url, token, entry_id, state=state):
                 _save_state(state)
+                continue
+
+        # Auto-heal Thread / OTBR if in setup_retry or setup_error
+        if domain == "otbr" and st in ("setup_retry", "setup_error"):
+            if _auto_heal_thread_coordinator(base_url, token, state=state, entries=entries):
                 continue
 
         is_reauth = "reauth" in str(reason).lower() or "authentication" in str(reason).lower() or st == "setup_error"
@@ -892,16 +1381,22 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
             "title": title,
             "state": st,
             "reason": reason or f"Integration state: {st}",
-            "key": unique_key
+            "key": unique_key,
         })
 
-    # 2. Check Persistent Notifications, Matter-over-Thread & Z-Wave JS Blinds
+    # 2. Check Persistent Notifications, Matter-over-Thread, Thread Coordinator & Blinds
     try:
         url = f"{base_url}/api/states"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             states = json.loads(resp.read().decode())
+
+        # Check Thread coordinator sensors
+        _auto_heal_thread_coordinator(base_url, token, states=states, state=state, entries=entries)
+
         _auto_heal_matter_thread_nodes(states)
+        _reconcile_post_outage_covers(base_url, token, states=states, state=state)
+
         if not zwave_healed and not zwave_heal_attempted:
             blinds_unavailable = any(
                 isinstance(s, dict)
@@ -914,7 +1409,7 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
                 for s in states
             )
             if blinds_unavailable or (has_blinds and _check_zwave_js_logs_wedged()):
-                if _auto_heal_zwave_js(base_url, token, zwave_entry_id, states=states):
+                if _auto_heal_zwave_js(base_url, token, zwave_entry_id, states=states, state=state):
                     zwave_key = f"entry:{zwave_entry_id}"
                     active_keys.discard(zwave_key)
                     issues = [i for i in issues if i.get("key") != zwave_key]
@@ -934,7 +1429,7 @@ def check_ha_integrations(force: bool = False) -> tuple[bool, str, list[dict]]:
                         "title": title,
                         "state": "active",
                         "reason": msg[:180],
-                        "key": unique_key
+                        "key": unique_key,
                     })
     except Exception as e:
         print(f"[HAReauthWatchdog] Warning checking notifications: {e}", file=sys.stderr)
