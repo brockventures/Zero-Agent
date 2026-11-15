@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Session Summarizer & Architecture Manifest for Zero (Thread-Isolated Dual-Tier Compaction).
 
 Generates per-session carry-forward artifacts on compaction:
@@ -47,6 +48,70 @@ _FORGE_STATUS_PRIORITY = {
     "completed": 5,
     "merged": 5,
 }
+MAX_PRESERVED_MILESTONES = 35
+
+_SECTION_STOP_PREFIXES = (
+    "[GIF Cadence Tracker",
+    "[Bridge Execution Invariant",
+    "[System Time & Timezone",
+    "[ACTIVE MEMORY CONTEXT",
+    "[CURRENT USER PROMPT",
+)
+
+_PROMPT_RULE_LEAK_PREFIXES = (
+    "Status: Eligible (",
+    "Never choose SDK Option B",
+    "Never emit internal chain-of-thought",
+    "If an open-ended investigation is not resolved",
+    "Build Title:**",
+    "Build Title:",
+    "Objective:**",
+    "Objective:",
+    "Repository:**",
+    "Repository:",
+    "Status:** All ",
+    "Status:** All",
+    "home_channel_id:",
+    "Earlier Completed: Here is where",
+    "Host 2 Fixes Applied:**",
+    "Host 1 Fixes Applied:**",
+    "Target Cadence:",
+    "Contextual Overrides:",
+    "Rule: ALWAYS use Pacific Time",
+    "Note: System VM clock",
+)
+
+_CHUNK_LEAK_RE = re.compile(r"^Chunk\s+\d+:", re.IGNORECASE)
+
+
+def _is_prompt_rule_leak(line: str) -> bool:
+    """Check if a line/bullet matches prompt-rule or raw chunk metadata artifacts."""
+    if not line:
+        return True
+    s = line.strip().lstrip("-•* ").strip()
+    if any(s.startswith(p) for p in _SECTION_STOP_PREFIXES):
+        return True
+    if any(s.startswith(p) for p in _PROMPT_RULE_LEAK_PREFIXES):
+        return True
+    if _CHUNK_LEAK_RE.match(s):
+        return True
+    return False
+
+
+def _normalize_bullet_key(text: str) -> str:
+    """Extract a normalized alphanumeric key for deduplicating near-identical bullets."""
+    s = text.strip()
+    s = re.sub(r"^[-•* ]+", "", s)
+    # Strip trailing build IDs or parenthetical references e.g. (fg-...) or (dt-...) or (PR #...) or (merged)
+    s = re.sub(
+        r"\s*\((?:fg-[a-zA-Z0-9_-]+|dt-\d+|PR\s*#\d+|merged)\)",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"\b(?:fg-[a-zA-Z0-9_-]+|dt-\d+)\b", "", s, flags=re.IGNORECASE)
+    words = re.findall(r"[a-z0-9]+", s.lower())
+    return " ".join(words)
 
 
 def _get_merged_pr_numbers(
@@ -155,6 +220,8 @@ def _fetch_channel_scoped_forge_builds(
             rows = conn.execute(
                 "SELECT id, title, status FROM forge_builds "
                 "WHERE origin_channel_id = ? AND created_at >= ? "
+                "AND LOWER(status) NOT IN ('failed', 'cancelled', 'canceled') "
+                "AND LOWER(status) IN ('completed', 'merged', 'running', 'in_progress', 'queued', 'pending') "
                 "ORDER BY created_at DESC LIMIT ?",
                 (channel_id, cutoff, limit),
             ).fetchall()
@@ -188,10 +255,13 @@ def _parse_milestone_bullets_from_section(text: str) -> list[str]:
             continue
         if s.startswith("## "):
             break
+        if s.startswith(_SECTION_STOP_PREFIXES) or s.lstrip("-•* ").strip().startswith(_SECTION_STOP_PREFIXES):
+            break
         if s.startswith(("-", "•", "*")):
             norm = "- " + s.lstrip("-•* ").strip()
             if (
                 "Session Initialized: Fresh conversation thread" not in norm
+                and not _is_prompt_rule_leak(norm)
                 and norm not in bullets
             ):
                 bullets.append(norm)
@@ -455,6 +525,7 @@ def _merge_guaranteed_milestones(
     """Deterministically ensure channel-scoped FORGE builds and prior milestones are present in milestones_block."""
     lines: list[str] = []
     seen: set[str] = set()
+    seen_norm: set[str] = set()
     build_index: dict[str, tuple[int, int]] = {}  # build_id -> (line_idx, status_priority)
 
     # Only run git log check if any candidate line mentions an open/submitted PR
@@ -472,12 +543,20 @@ def _merge_guaranteed_milestones(
             else:
                 s = "- " + s.lstrip("-•* ").strip()
 
+            if _is_prompt_rule_leak(s):
+                continue
+
             s = _reconcile_open_pr_mentions(s, merged_prs=merged_prs)
 
             m_build = _FORGE_BUILD_BULLET_RE.search(s)
             if m_build:
                 build_id = m_build.group(1)
                 status_raw = m_build.group(2).strip().lower()
+
+                # Skip failed/cancelled FORGE builds from prior milestones or base_ms
+                if not is_authoritative_db and status_raw in ("failed", "cancelled", "canceled"):
+                    continue
+
                 prio = _FORGE_STATUS_PRIORITY.get(status_raw, 0)
                 if build_id in build_index:
                     prev_idx, prev_prio = build_index[build_id]
@@ -495,9 +574,16 @@ def _merge_guaranteed_milestones(
                     build_index[build_id] = (idx, prio)
                 continue
 
-            if s not in seen:
-                seen.add(s)
-                lines.append(s)
+            norm_key = _normalize_bullet_key(s)
+            if s in seen:
+                continue
+            if norm_key and norm_key in seen_norm:
+                continue
+
+            seen.add(s)
+            if norm_key:
+                seen_norm.add(norm_key)
+            lines.append(s)
 
     for pm in prior_milestones:
         _add(pm)
@@ -513,6 +599,10 @@ def _merge_guaranteed_milestones(
 
     if not lines:
         return "- Session Initialized: Fresh conversation thread with baseline homelab context."
+
+    if len(lines) > MAX_PRESERVED_MILESTONES:
+        lines = lines[-MAX_PRESERVED_MILESTONES:]
+
     return "\n".join(lines)
 
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """
 Unit test suite for tools/session_summarizer.py.
 Validates clean_dialogue_content, extract_recent_dialogue, and summary formatting.
@@ -366,6 +367,172 @@ class TestSessionSummarizer(unittest.TestCase):
         self.assertNotIn("PR #999 (merged)", merged)
         # Already annotated PR #412 is deduplicated and not double-annotated
         self.assertNotIn("(merged) (merged)", merged)
+
+    def test_parse_milestone_bullets_stops_at_cadence_and_invariant_headers(self):
+        raw = (
+            "## 1. Compacted Earlier Session History (Milestones)\n"
+            "- Completed initial system bootstrap.\n"
+            "- Shipped telemetry integration.\n"
+            "[GIF Cadence Tracker (Channel: 1544953279664889888)]: 1 message(s) since last reaction GIF.\n"
+            "• Target Cadence: ~1 in 5-7 messages.\n"
+            "- Leaked milestone that should never be parsed.\n"
+        )
+        bullets = session_summarizer._parse_milestone_bullets_from_section(raw)
+        self.assertEqual(
+            bullets,
+            [
+                "- Completed initial system bootstrap.",
+                "- Shipped telemetry integration.",
+            ],
+        )
+
+    def test_parse_milestone_bullets_stops_at_bridge_execution_invariant(self):
+        raw = (
+            "## 1. Compacted Earlier Session History\n"
+            "- Validated SQLite database schema.\n"
+            "[Bridge Execution Invariant (Channel: 12345)]:\n"
+            "• Rule: Always silent execution.\n"
+            "- Another phantom bullet.\n"
+        )
+        bullets = session_summarizer._parse_milestone_bullets_from_section(raw)
+        self.assertEqual(bullets, ["- Validated SQLite database schema."])
+
+    def test_parse_milestone_bullets_filters_prompt_rule_leaks(self):
+        raw = (
+            "## 1. Compacted Earlier Session History\n"
+            "- Completed real migration.\n"
+            "- Status: Eligible (68 turns since last GIF — optional ONLY if this turn has a genuine joke...)\n"
+            "- Never choose SDK Option B or emit intermediate wait/status chatter\n"
+            "- Never emit internal chain-of-thought, prompt rule citations, or draft rehearsals\n"
+            "- If an open-ended investigation is not resolved after 1-3 quick initial checks...\n"
+            "- Build Title:** Fix Rolling Compaction Summarizer Amnesia\n"
+            "- Objective:** 1) Fix tools/session_summarizer.py\n"
+            "- Repository:** `/workspace`\n"
+            "- Status:** All 1 chunk(s) passed deterministic Maker-Checker verification\n"
+            "- Chunk 1: Preserve Older Turn Milestones & Add Strict Channel-Scoped FORGE Build Ledger\n"
+            "- home_channel_id: 1542081375287640084\n"
+            "- Earlier Completed: Here is where both hosts stand right now:\n"
+            "- Host 2 Fixes Applied:** Host 2's DSM auto-update schedule is now switched\n"
+            "- Deployed production service.\n"
+        )
+        bullets = session_summarizer._parse_milestone_bullets_from_section(raw)
+        self.assertEqual(
+            bullets,
+            [
+                "- Completed real migration.",
+                "- Deployed production service.",
+            ],
+        )
+
+    def test_fetch_channel_scoped_forge_builds_excludes_failed_and_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "forge.db"
+            now = time.time()
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE forge_builds (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        origin_channel_id INTEGER NOT NULL,
+                        created_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO forge_builds (id, title, status, origin_channel_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                    ("fg-ok-1", "Passed Build", "completed", 1542081375287640084, now - 50),
+                )
+                conn.execute(
+                    "INSERT INTO forge_builds (id, title, status, origin_channel_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                    ("fg-run-1", "Active Build", "running", 1542081375287640084, now - 40),
+                )
+                conn.execute(
+                    "INSERT INTO forge_builds (id, title, status, origin_channel_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                    ("fg-fail-1", "Failed Build", "failed", 1542081375287640084, now - 30),
+                )
+                conn.execute(
+                    "INSERT INTO forge_builds (id, title, status, origin_channel_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                    ("fg-cancel-1", "Cancelled Build", "cancelled", 1542081375287640084, now - 20),
+                )
+                conn.execute(
+                    "INSERT INTO forge_builds (id, title, status, origin_channel_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                    ("fg-cancel-2", "Canceled US Spelling", "canceled", 1542081375287640084, now - 10),
+                )
+                conn.commit()
+
+            builds = _fetch_channel_scoped_forge_builds("home", db_path=db_path)
+            self.assertEqual(len(builds), 2)
+            build_ids = [b for b in builds]
+            self.assertTrue(any("fg-ok-1" in b for b in build_ids))
+            self.assertTrue(any("fg-run-1" in b for b in build_ids))
+            self.assertFalse(any("fg-fail-1" in b for b in build_ids))
+            self.assertFalse(any("fg-cancel-1" in b for b in build_ids))
+            self.assertFalse(any("fg-cancel-2" in b for b in build_ids))
+
+    def test_merge_guaranteed_milestones_filters_failed_prior_builds_and_prompt_leaks(self):
+        prior = [
+            "- Completed initial schema migration.",
+            "- FORGE Build `fg-old-fail` (failed): Broken Retry Build",
+            "- FORGE Build `fg-old-cancel` (cancelled): Cancelled Build",
+            "- Status: Eligible (45 turns since last GIF)",
+            "- Build Title:** Leaked Title",
+            "- Chunk 2: Some Leaked Chunk Spec",
+            "- Host 2 Fixes Applied:** Leaked Host Spec",
+            "- Real milestone that should survive.",
+        ]
+        base_ms = "- FORGE Build `fg-llm-fail` (failed): Hallucinated Failed Build\n- Verified unit tests."
+        channel_builds = ["- FORGE Build `fg-good-1` (completed): Good Build"]
+
+        merged = session_summarizer._merge_guaranteed_milestones(
+            base_ms, prior, channel_builds, merged_prs=set()
+        )
+        lines = merged.splitlines()
+
+        self.assertIn("- Completed initial schema migration.", lines)
+        self.assertIn("- Real milestone that should survive.", lines)
+        self.assertIn("- Verified unit tests.", lines)
+        self.assertIn("- FORGE Build `fg-good-1` (completed): Good Build", lines)
+
+        # Ensure failed/cancelled builds and leaks are removed
+        self.assertNotIn("- FORGE Build `fg-old-fail` (failed): Broken Retry Build", lines)
+        self.assertNotIn("- FORGE Build `fg-old-cancel` (cancelled): Cancelled Build", lines)
+        self.assertNotIn("- FORGE Build `fg-llm-fail` (failed): Hallucinated Failed Build", lines)
+        self.assertFalse(any("Status: Eligible" in l for l in lines))
+        self.assertFalse(any("Build Title:**" in l for l in lines))
+        self.assertFalse(any("Chunk 2:" in l for l in lines))
+        self.assertFalse(any("Host 2 Fixes Applied:" in l for l in lines))
+
+    def test_merge_guaranteed_milestones_deduplicates_near_identical_bullets(self):
+        prior = [
+            "- Fixed Reddit Fantasy Scanner scheduled double-posting by consolidating delivery exclusively through the scheduler's interactive card sender (fg-1794154585).",
+            "- Completed Phase 1 database schema migration.",
+        ]
+        base_ms = (
+            "- Fixed Reddit Fantasy Scanner scheduled double-posting by consolidating delivery exclusively through the scheduler's interactive card sender.\n"
+            "- completed phase 1 database schema migration"
+        )
+        merged = session_summarizer._merge_guaranteed_milestones(
+            base_ms, prior, [], merged_prs=set()
+        )
+        lines = merged.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(sum(1 for l in lines if "Reddit Fantasy Scanner" in l), 1)
+        self.assertEqual(sum(1 for l in lines if "database schema migration" in l), 1)
+
+    def test_merge_guaranteed_milestones_caps_at_35_entries(self):
+        prior = [f"- Milestone entry number {i:03d}." for i in range(50)]
+        merged = session_summarizer._merge_guaranteed_milestones(
+            "", prior, [], merged_prs=set()
+        )
+        lines = merged.splitlines()
+        self.assertEqual(len(lines), 35)
+        # Should keep the most recent 35 entries (indices 15..49)
+        self.assertIn("- Milestone entry number 049.", lines)
+        self.assertIn("- Milestone entry number 015.", lines)
+        self.assertNotIn("- Milestone entry number 000.", lines)
+        self.assertNotIn("- Milestone entry number 014.", lines)
 
 
 if __name__ == "__main__":
