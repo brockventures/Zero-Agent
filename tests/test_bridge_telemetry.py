@@ -1,6 +1,6 @@
 import asyncio
-from pathlib import Path
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -9,11 +9,11 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import discord
+
 import tools.bridge
 import tools.forge
 from tools.bridge_telemetry import (
     record_token_usage,
-    get_token_summary,
     resolve_channel_info,
 )
 
@@ -42,7 +42,7 @@ def test_resolve_channel_info_thread():
     assert info["parent_channel_name"] == "zero-chat"
 
 
-def test_record_and_summary(tmp_path, monkeypatch):
+def test_record_token_usage(tmp_path, monkeypatch):
     test_db = tmp_path / "test_telemetry.db"
     monkeypatch.setattr("tools.bridge_telemetry.DB_PATH", test_db)
 
@@ -55,11 +55,6 @@ def test_record_and_summary(tmp_path, monkeypatch):
     }
 
     assert record_token_usage(1542081375287640084, usage, conv_id="test-conv")
-    summary = get_token_summary(hours=1.0)
-    assert len(summary) == 1
-    assert summary[0]["parent_channel_name"] == "zero-chat"
-    assert summary[0]["total_input"] == 100
-    assert summary[0]["grand_total"] == 180
 
 
 def test_on_button_interaction_immediate_executing_state(tmp_path, monkeypatch):

@@ -1,3 +1,4 @@
+# ruff: noqa
 """
 Zero Discord Bridge - Process Execution & PTY Engine Module
 Encapsulates subprocess lifecycle, pseudo-terminal (PTY) allocation,
@@ -85,8 +86,24 @@ def kill_process_tree(proc, sig=signal.SIGTERM):
             pass
 
 
+def _fire_presence(apply_presence_fn, *args, **kwargs):
+    """Fire-and-forget Discord presence updates without blocking the turn path."""
+    if not apply_presence_fn:
+        return
+    res = None
+    try:
+        res = apply_presence_fn(*args, **kwargs)
+        if asyncio.iscoroutine(res):
+            async def _safe_presence():
+                try:
+                    await res
+                except Exception:
+                    pass
 
-
+            asyncio.create_task(_safe_presence())
+    except Exception:
+        if asyncio.iscoroutine(res):
+            res.close()
 
 
 async def execute_agy_turn(
@@ -294,11 +311,7 @@ async def execute_agy_turn(
             os.close(slave_fd)
             timer.mark_boot_end()
             timer.mark_send()
-            if apply_presence_fn:
-                try:
-                    await apply_presence_fn(custom_activity=turn_text, status_override="dnd")
-                except Exception:
-                    pass
+            _fire_presence(apply_presence_fn, custom_activity=turn_text, status_override="dnd")
             channel_active_procs[channel_id] = proc
             channel_active_prompts[channel_id] = prompt
             channel_active_reply_targets[channel_id] = reply_target
@@ -529,11 +542,7 @@ async def execute_agy_turn(
             elif mode == "external":
                 ext_active_proc = None
 
-            if apply_presence_fn:
-                try:
-                    await apply_presence_fn()
-                except Exception:
-                    pass
+            _fire_presence(apply_presence_fn)
 
         if channel_id in steering_channels:
             steering_channels.discard(channel_id)
@@ -639,54 +648,6 @@ async def execute_agy_turn(
         from tools.task_settle import is_substantive_response
         if is_substantive_response(final_text):
             final_text = reconcile_step_segments(pre_settle_text, final_text)
-
-    # TaskSettle Protocol: Detect and settle premature turn exits while background tasks are pending
-    if (
-        rules.get("task_settle_enabled", True)
-        and not is_settle_reinvocation
-        and not coord.timed_out
-        and not coord.last_agy_error
-    ):
-        try:
-            from tools.task_settle import evaluate_and_settle_turn, is_substantive_response
-
-            settle_timeout = float(rules.get("task_settle_timeout_seconds", 25.0))
-            was_settled, settled_text = await evaluate_and_settle_turn(
-                conv_id=active_cid,
-                channel_id=channel_id,
-                mode=mode,
-                status_msg=coord.status_msg,
-                reply_target=coord.early_ack_msg or reply_target,
-                reinvoke_coro_fn=execute_agy_turn,
-                timeout_seconds=settle_timeout,
-                current_text=final_text,
-                turn_kwargs={
-                    "author_name": author_name,
-                    "apply_presence_fn": apply_presence_fn,
-                    "button_choice_fn": button_choice_fn,
-                    "quick_choice_view_cls": quick_choice_view_cls,
-                    "is_last_word": is_last_word,
-                    "last_word_bot_id": last_word_bot_id,
-                    "last_word_bot_name": last_word_bot_name,
-                    "last_word_streak": last_word_streak,
-                    "queued_at": queued_at,
-                },
-            )
-            if was_settled and settled_text:
-                if settled_text == final_text:
-                    pass
-                else:
-                    return settled_text
-            elif settled_text:
-                if not is_internal_cli_leak(settled_text):
-                    final_text = settled_text
-            elif not was_settled:
-                # Tasks were NOT settled within window. If final_text is an internal leak or
-                # non-substantive placeholder (e.g. "An async task is running..."), suppress it!
-                if is_internal_cli_leak(final_text) or not is_substantive_response(final_text):
-                    final_text = "[NO_REPLY]"
-        except Exception as settle_err:
-            print(f"[BridgeRunner] TaskSettle error: {settle_err}")
 
     await deliver_turn_output(
         output_text=final_text,

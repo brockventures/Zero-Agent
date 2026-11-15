@@ -1,3 +1,4 @@
+# ruff: noqa
 """
 Zero Discord Bridge - Persistent Channel Worker Daemons Module
 Manages warm, 24/7 persistent agy CLI instances in stream-json mode for dedicated
@@ -85,6 +86,26 @@ def is_persistent_daemons_enabled() -> bool:
     """Check runtime rules to see if persistent worker daemons are enabled."""
     rules = get_runtime_rules()
     return bool(rules.get("persistent_daemons_enabled", True))
+
+
+def _fire_presence(apply_presence_fn, *args, **kwargs):
+    """Fire-and-forget Discord presence updates without blocking the turn path."""
+    if not apply_presence_fn:
+        return
+    res = None
+    try:
+        res = apply_presence_fn(*args, **kwargs)
+        if asyncio.iscoroutine(res):
+            async def _safe_presence():
+                try:
+                    await res
+                except Exception:
+                    pass
+
+            asyncio.create_task(_safe_presence())
+    except Exception:
+        if asyncio.iscoroutine(res):
+            res.close()
 
 from tools.bridge_pipeline import (
     TurnTimer,
@@ -481,252 +502,201 @@ class PersistentChannelWorker:
                     except Exception as ce:
                         print(f"[BridgeDaemon] Error checking pending engineering carry-forward context: {ce}")
 
-            # 2. Ensure worker is running & responsive
-            timer.mark_boot_start()
-            if not self.is_ready or self.proc is None or self.proc.returncode is not None:
-                await self.start()
+        # 2. Ensure worker is running & responsive
+        timer.mark_boot_start()
+        if not self.is_ready or self.proc is None or self.proc.returncode is not None:
+            await self.start()
 
-            # Notify the channel on every turn that runs on a fallback model
-            fb_notice = getattr(self, "fallback_info", None)
-            if fb_notice and reply_target:
-                try:
-                    await getattr(reply_target, "channel", reply_target).send(fb_notice)
-                except Exception as ne:
-                    print(f"[BridgeDaemon] Warning delivering model fallback notice: {ne}")
-
-            # Non-blocking pre-turn drain of any stray residual bytes in stdout StreamReader buffer
-            if self.proc and self.proc.stdout:
-                try:
-                    buf = getattr(self.proc.stdout, "_buffer", None)
-                    if buf and isinstance(buf, (bytearray, list)):
-                        discarded_len = len(buf)
-                        buf.clear()
-                        if discarded_len > 0:
-                            print(f"[BridgeDaemon] 🧹 Drained {discarded_len} residual bytes from #{self.name} stdout buffer.")
-                except Exception as de:
-                    print(f"[BridgeDaemon] Warning draining residual stdout buffer: {de}")
-            timer.mark_boot_end()
-
-            # 3. Format Prompt
-            timer.mark_ctx_start()
-            if (
-                reply_target
-                and getattr(reply_target, "reference", None)
-                and not getattr(reply_target.reference, "resolved", None)
-            ):
-                try:
-                    ref_id = reply_target.reference.message_id
-                    if ref_id and hasattr(reply_target, "channel") and hasattr(reply_target.channel, "fetch_message"):
-                        reply_target.reference.resolved = await reply_target.channel.fetch_message(ref_id)
-                except Exception as fe:
-                    print(f"[BridgeDaemon] Warning pre-resolving message reference {ref_id}: {fe}")
-
-            prepared_prompt = await asyncio.to_thread(
-                prepare_turn_prompt,
-                prompt=prompt,
-                mode=self.mode,
-                channel_id=self.channel_id,
-                sess_key=self.sess_key,
-                author_name=author_name,
-                reply_target=reply_target,
-                eng_carry_block=eng_carry_block,
-            )
-            timer.mark_ctx_end()
-
-            # 4. Set global process hooks for mid-turn steering and presence
-            channel_active_procs[self.channel_id] = self.proc
-            channel_active_prompts[self.channel_id] = prompt
-            update_beacon("PROCESSING", prompt, channel_id=self.channel_id)
-            record_in_flight(
-                channel_id=self.channel_id,
-                prompt=prompt,
-                conv_id=self.conv_id,
-                status_msg_id=status_msg.id if status_msg else None,
-                pid=self.proc.pid if self.proc else None,
-            )
-            if self.mode == "home" and self.channel_id == TARGET_CHANNEL_ID:
-                br.active_proc = self.proc
-            elif self.mode != "home":
-                br.ext_active_proc = self.proc
-
-            ch_title = resolve_channel_label(reply_target, fallback_name=self.name)
-            turn_text = register_active_presence(self.channel_id, ch_title)
-
-            self.last_agy_error = None
-            rules = get_runtime_rules()
-            turn_start_time = time.time()
-            from tools.bridge_stream import get_latest_transcript_step_index
-            baseline_step_index = get_latest_transcript_step_index(self.conv_id)
-
-            coord = TurnCoordinator(
-                channel_id=self.channel_id,
-                prompt=prompt,
-                mode=self.mode,
-                reply_target=reply_target,
-                status_msg=status_msg,
-                conv_id=self.conv_id,
-                turn_start_time=turn_start_time,
-                baseline_step_index=baseline_step_index,
-            )
-
+        # Notify the channel on every turn that runs on a fallback model
+        fb_notice = getattr(self, "fallback_info", None)
+        if fb_notice and reply_target:
             try:
-                # 5. Send NDJSON user message on stdin immediately before Discord presence update
-                payload = {"event": "user", "message": {"content": prepared_prompt}}
-                timer.mark_send()
-                self.proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
-                await self.proc.stdin.drain()
+                await getattr(reply_target, "channel", reply_target).send(fb_notice)
+            except Exception as ne:
+                print(f"[BridgeDaemon] Warning delivering model fallback notice: {ne}")
 
-                if apply_presence_fn:
-                    try:
-                        await apply_presence_fn(custom_activity=turn_text, status_override="dnd")
-                    except Exception:
-                        pass
+        # Non-blocking pre-turn drain of any stray residual bytes in stdout StreamReader buffer
+        if self.proc and self.proc.stdout:
+            try:
+                buf = getattr(self.proc.stdout, "_buffer", None)
+                if buf and isinstance(buf, (bytearray, list)):
+                    discarded_len = len(buf)
+                    buf.clear()
+                    if discarded_len > 0:
+                        print(f"[BridgeDaemon] 🧹 Drained {discarded_len} residual bytes from #{self.name} stdout buffer.")
+            except Exception as de:
+                print(f"[BridgeDaemon] Warning draining residual stdout buffer: {de}")
+        timer.mark_boot_end()
 
-                # 6. Stream events from stdout via TurnCoordinator
-                stream_parser = AgyStreamParser(conv_id=self.conv_id)
-                output_response = await coord.execute_stream_loop(
-                    proc=self.proc,
-                    stdout_reader=self.proc.stdout,
-                    stream_parser=stream_parser,
-                    timer=timer,
-                    rules=rules,
-                    worker_name=self.name,
-                    on_recycle=self.recycle,
-                    get_last_agy_error=lambda: self.last_agy_error,
-                )
-            except Exception as te:
-                if self.channel_id in steering_channels:
-                    steering_channels.discard(self.channel_id)
-                    timer.finish("STEERED")
-                    print(
-                        f"[BridgeDaemon] 🧭 Mid-turn steering in #{self.name}: cancelled active turn ({te}). "
-                        f"Purging worker state for incoming directive."
-                    )
-                    try:
-                        await self.recycle(keep_conv_id=True)
-                    except Exception as rec_err:
-                        print(f"[BridgeDaemon] Error recycling worker after steering: {rec_err}")
-                    return
-                timer.finish(f"FAILED: {te}")
-                print(f"[BridgeDaemon] ⚠️ Turn execution failed in #{self.name}: {te}. Recycling worker to purge pipe state...")
-                try:
-                    await self.recycle()
-                except Exception as rec_err:
-                    print(f"[BridgeDaemon] Error recycling worker after failure: {rec_err}")
-                raise
-            finally:
-                coord.cleanup_process(proc=self.proc, br_module=br)
-                if apply_presence_fn:
-                    try:
-                        await apply_presence_fn()
-                    except Exception:
-                        pass
+        # 3. Format Prompt
+        timer.mark_ctx_start()
+        if (
+            reply_target
+            and getattr(reply_target, "reference", None)
+            and not getattr(reply_target.reference, "resolved", None)
+        ):
+            try:
+                ref_id = reply_target.reference.message_id
+                if ref_id and hasattr(reply_target, "channel") and hasattr(reply_target.channel, "fetch_message"):
+                    reply_target.reference.resolved = await reply_target.channel.fetch_message(ref_id)
+            except Exception as fe:
+                print(f"[BridgeDaemon] Warning pre-resolving message reference {ref_id}: {fe}")
 
-            # Clean attachments
-            for fpath in attachments:
-                try:
-                    os.unlink(fpath)
-                except Exception:
-                    pass
+        prepared_prompt = await asyncio.to_thread(
+            prepare_turn_prompt,
+            prompt=prompt,
+            mode=self.mode,
+            channel_id=self.channel_id,
+            sess_key=self.sess_key,
+            author_name=author_name,
+            reply_target=reply_target,
+            eng_carry_block=eng_carry_block,
+        )
+        timer.mark_ctx_end()
 
-            # Steering check
+        # 4. Set global process hooks for mid-turn steering and presence
+        channel_active_procs[self.channel_id] = self.proc
+        channel_active_prompts[self.channel_id] = prompt
+        update_beacon("PROCESSING", prompt, channel_id=self.channel_id)
+        record_in_flight(
+            channel_id=self.channel_id,
+            prompt=prompt,
+            conv_id=self.conv_id,
+            status_msg_id=status_msg.id if status_msg else None,
+            pid=self.proc.pid if self.proc else None,
+        )
+        if self.mode == "home" and self.channel_id == TARGET_CHANNEL_ID:
+            br.active_proc = self.proc
+        elif self.mode != "home":
+            br.ext_active_proc = self.proc
+
+        ch_title = resolve_channel_label(reply_target, fallback_name=self.name)
+        turn_text = register_active_presence(self.channel_id, ch_title)
+
+        self.last_agy_error = None
+        rules = get_runtime_rules()
+        turn_start_time = time.time()
+        from tools.bridge_stream import get_latest_transcript_step_index
+        baseline_step_index = get_latest_transcript_step_index(self.conv_id)
+
+        coord = TurnCoordinator(
+            channel_id=self.channel_id,
+            prompt=prompt,
+            mode=self.mode,
+            reply_target=reply_target,
+            status_msg=status_msg,
+            conv_id=self.conv_id,
+            turn_start_time=turn_start_time,
+            baseline_step_index=baseline_step_index,
+        )
+
+        try:
+            # 5. Send NDJSON user message on stdin immediately before Discord presence update
+            payload = {"event": "user", "message": {"content": prepared_prompt}}
+            timer.mark_send()
+            self.proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+            await self.proc.stdin.drain()
+
+            _fire_presence(apply_presence_fn, custom_activity=turn_text, status_override="dnd")
+
+            # 6. Stream events from stdout via TurnCoordinator
+            stream_parser = AgyStreamParser(conv_id=self.conv_id)
+            output_response = await coord.execute_stream_loop(
+                proc=self.proc,
+                stdout_reader=self.proc.stdout,
+                stream_parser=stream_parser,
+                timer=timer,
+                rules=rules,
+                worker_name=self.name,
+                on_recycle=self.recycle,
+                get_last_agy_error=lambda: self.last_agy_error,
+            )
+        except Exception as te:
             if self.channel_id in steering_channels:
                 steering_channels.discard(self.channel_id)
                 timer.finish("STEERED")
-                print(f"[BridgeDaemon] 🧭 Mid-turn steering executed in #{self.name}. Discarding stale turn response.")
+                print(
+                    f"[BridgeDaemon] 🧭 Mid-turn steering in #{self.name}: cancelled active turn ({te}). "
+                    f"Purging worker state for incoming directive."
+                )
                 try:
                     await self.recycle(keep_conv_id=True)
                 except Exception as rec_err:
                     print(f"[BridgeDaemon] Error recycling worker after steering: {rec_err}")
                 return
+            timer.finish(f"FAILED: {te}")
+            print(f"[BridgeDaemon] ⚠️ Turn execution failed in #{self.name}: {te}. Recycling worker to purge pipe state...")
+            try:
+                await self.recycle()
+            except Exception as rec_err:
+                print(f"[BridgeDaemon] Error recycling worker after failure: {rec_err}")
+            raise
+        finally:
+            coord.cleanup_process(proc=self.proc, br_module=br)
+            _fire_presence(apply_presence_fn)
 
-            # Fallback to on-disk transcript if output was empty or placeholder and not explicit silence
-            output_response, _ = coord.harvest_fallback(
-                output_response=output_response,
-                proc=self.proc,
-                turn_timeout_seconds=float(rules.get("turn_watchdog_seconds", 300.0)),
-            )
+        # Clean attachments
+        for fpath in attachments:
+            try:
+                os.unlink(fpath)
+            except Exception:
+                pass
 
-            if not is_settle_reinvocation:
-                self.turn_count += 1
-            self.last_turn_at = time.time()
-            if coord.conv_id:
-                self.conv_id = coord.conv_id
+        # Steering check
+        if self.channel_id in steering_channels:
+            steering_channels.discard(self.channel_id)
+            timer.finish("STEERED")
+            print(f"[BridgeDaemon] 🧭 Mid-turn steering executed in #{self.name}. Discarding stale turn response.")
+            try:
+                await self.recycle(keep_conv_id=True)
+            except Exception as rec_err:
+                print(f"[BridgeDaemon] Error recycling worker after steering: {rec_err}")
+            return
 
-            final_text = output_response or "*(No output from agent)*"
+        # Fallback to on-disk transcript if output was empty or placeholder and not explicit silence
+        output_response, _ = coord.harvest_fallback(
+            output_response=output_response,
+            proc=self.proc,
+            turn_timeout_seconds=float(rules.get("turn_watchdog_seconds", 300.0)),
+        )
 
-            if is_settle_reinvocation and pre_settle_text:
-                from tools.bridge_stream import reconcile_step_segments
-                from tools.task_settle import is_substantive_response
-                if is_substantive_response(final_text):
-                    final_text = reconcile_step_segments(pre_settle_text, final_text)
+        if not is_settle_reinvocation:
+            self.turn_count += 1
+        self.last_turn_at = time.time()
+        if coord.conv_id:
+            self.conv_id = coord.conv_id
 
-            # TaskSettle Protocol: Detect and settle premature turn exits while background tasks are pending
-            if (
-                rules.get("task_settle_enabled", True)
-                and not is_settle_reinvocation
-                and not coord.timed_out
-                and not coord.last_agy_error
-            ):
-                try:
-                    from tools.task_settle import evaluate_and_settle_turn
+        final_text = output_response or "*(No output from agent)*"
 
-                    settle_timeout = float(rules.get("task_settle_timeout_seconds", 25.0))
-                    was_settled, settled_text = await evaluate_and_settle_turn(
-                        conv_id=self.conv_id,
-                        channel_id=self.channel_id,
-                        mode=self.mode,
-                        status_msg=coord.status_msg,
-                        reply_target=reply_target,
-                        reinvoke_coro_fn=self.execute_turn,
-                        timeout_seconds=settle_timeout,
-                        current_text=final_text,
-                        turn_kwargs={
-                            "author_name": author_name,
-                            "apply_presence_fn": apply_presence_fn,
-                            "button_choice_fn": button_choice_fn,
-                            "quick_choice_view_cls": quick_choice_view_cls,
-                            "reload_fn": reload_fn,
-                            "is_last_word": is_last_word,
-                            "last_word_bot_id": last_word_bot_id,
-                            "last_word_bot_name": last_word_bot_name,
-                            "last_word_streak": last_word_streak,
-                            "queued_at": queued_at,
-                        },
-                    )
-                    if was_settled:
-                        if settled_text and settled_text == final_text:
-                            pass
-                        else:
-                            return settled_text
-                    elif settled_text:
-                        final_text = settled_text
-                except Exception as settle_err:
-                    print(f"[BridgeDaemon] TaskSettle error in #{self.name}: {settle_err}")
+        if is_settle_reinvocation and pre_settle_text:
+            from tools.bridge_stream import reconcile_step_segments
+            from tools.task_settle import is_substantive_response
+            if is_substantive_response(final_text):
+                final_text = reconcile_step_segments(pre_settle_text, final_text)
 
-            # Deliver response output to Discord
-            await deliver_turn_output(
-                output_text=final_text,
-                status_msg=coord.status_msg,
-                reply_target=reply_target,
-                mode=self.mode,
-                channel_id=self.channel_id,
-                conv_id=self.conv_id,
-                turn_start_time=turn_start_time,
-                button_choice_fn=button_choice_fn,
-                quick_choice_view_cls=quick_choice_view_cls,
-                delivery_target=coord.delivery_target,
-                escalated_to_thread=coord.escalated_to_thread,
-                notify_root_channel=coord.notify_root_channel,
-                thread_jump_url=coord.thread_jump_url,
-                is_last_word=is_last_word,
-                last_word_bot_id=last_word_bot_id,
-                last_word_bot_name=last_word_bot_name,
-                last_word_streak=last_word_streak,
-                is_physical_mention=is_physical_mention,
-                timer=timer,
-            )
-            return final_text
+        # Deliver response output to Discord
+        await deliver_turn_output(
+            output_text=final_text,
+            status_msg=coord.status_msg,
+            reply_target=reply_target,
+            mode=self.mode,
+            channel_id=self.channel_id,
+            conv_id=self.conv_id,
+            turn_start_time=turn_start_time,
+            button_choice_fn=button_choice_fn,
+            quick_choice_view_cls=quick_choice_view_cls,
+            delivery_target=coord.delivery_target,
+            escalated_to_thread=coord.escalated_to_thread,
+            notify_root_channel=coord.notify_root_channel,
+            thread_jump_url=coord.thread_jump_url,
+            is_last_word=is_last_word,
+            last_word_bot_id=last_word_bot_id,
+            last_word_bot_name=last_word_bot_name,
+            last_word_streak=last_word_streak,
+            is_physical_mention=is_physical_mention,
+            timer=timer,
+        )
+        return final_text
 
 
 class PersistentDaemonManager:

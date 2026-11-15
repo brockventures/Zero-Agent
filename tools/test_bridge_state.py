@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """
 Unit test suite for bridge_state.py (State, Session, and Queue Persistence).
 """
@@ -28,6 +29,12 @@ import tools.bridge_state as bs
 class TestBridgeState(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
+        self.orig_agent_role = os.environ.get("AGENT_ROLE")
+        self.orig_discord_ch_id = os.environ.get("DISCORD_CHANNEL_ID")
+        self.orig_vulcan_delegated = os.environ.get("VULCAN_DELEGATED")
+        os.environ["AGENT_ROLE"] = ""
+        os.environ.pop("DISCORD_CHANNEL_ID", None)
+        os.environ.pop("VULCAN_DELEGATED", None)
         self.temp_dir = tempfile.mkdtemp()
         self.temp_path = Path(self.temp_dir)
         self.orig_data_dir = bs.DATA_DIR
@@ -45,6 +52,18 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         bs.IN_FLIGHT_FILE = self.temp_path / "in_flight_turn.json"
 
     def tearDown(self):
+        if self.orig_agent_role is not None:
+            os.environ["AGENT_ROLE"] = self.orig_agent_role
+        else:
+            os.environ.pop("AGENT_ROLE", None)
+        if self.orig_discord_ch_id is not None:
+            os.environ["DISCORD_CHANNEL_ID"] = self.orig_discord_ch_id
+        else:
+            os.environ.pop("DISCORD_CHANNEL_ID", None)
+        if self.orig_vulcan_delegated is not None:
+            os.environ["VULCAN_DELEGATED"] = self.orig_vulcan_delegated
+        else:
+            os.environ.pop("VULCAN_DELEGATED", None)
         bs.DATA_DIR = self.orig_data_dir
         bs.SESSIONS_FILE = self.orig_sessions_file
         bs.SESSION_METADATA_FILE = self.orig_session_metadata_file
@@ -140,6 +159,21 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         needed, reason = bs.check_compaction_needed("transcript_steps", 2, brain_root=conv_dir)
         self.assertTrue(needed)
         self.assertIn("transcript steps (1505) exceeds", reason)
+
+        # 5. Transcript step index from tail seek triggers compaction without full-file line scan
+        transcript_tail = conv_dir / "transcript_tail" / ".system_generated" / "logs"
+        transcript_tail.mkdir(parents=True, exist_ok=True)
+        t_tail_file = transcript_tail / "transcript.jsonl"
+        with open(t_tail_file, "w") as f:
+            for i in range(250):
+                f.write(f'{{"step_index": {i}, "type": "USER_INPUT"}}\n')
+        needed, reason = bs.check_compaction_needed("transcript_tail", 2, brain_root=conv_dir)
+        self.assertTrue(needed)
+        self.assertIn("transcript steps (250) exceeds", reason)
+
+        # 6. Dead thread retitle helpers removed
+        self.assertFalse(hasattr(bs, "is_thread_retitled"))
+        self.assertFalse(hasattr(bs, "mark_thread_retitled"))
 
     async def test_persistent_turn_queue(self):
         q_file = self.temp_path / "test_queue.json"

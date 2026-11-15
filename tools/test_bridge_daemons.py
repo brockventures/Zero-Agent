@@ -14,12 +14,12 @@ import asyncio
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import sys
 repo_root = str(Path(__file__).resolve().parent.parent)
 while "/workspace" in sys.path:
     sys.path.remove("/workspace")
@@ -63,8 +63,11 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
         bs.DATA_DIR = self.temp_path
         bs.SESSIONS_FILE = self.temp_path / "sessions.json"
         bs.SESSION_METADATA_FILE = self.temp_path / "session_metadata.json"
+        self._ambient_patcher = patch("tools.bridge_pipeline.get_ambient_memory_context", return_value="")
+        self._ambient_patcher.start()
 
     def tearDown(self):
+        self._ambient_patcher.stop()
         bs.DATA_DIR = self.orig_data_dir
         bs.SESSIONS_FILE = self.orig_sessions_file
         bs.SESSION_METADATA_FILE = self.orig_session_meta_file
@@ -423,7 +426,7 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Retryable:** No", output_text)
 
     async def test_09_persistent_worker_task_settle_integration(self):
-        """Verify PersistentChannelWorker triggers evaluate_and_settle_turn and handles settle reinvocation without deadlock."""
+        """Verify post-turn evaluate_and_settle_turn is retired while preserving is_settle_reinvocation compatibility."""
         worker = bd.PersistentChannelWorker(
             channel_id=bs.TARGET_CHANNEL_ID,
             name="zero-chat",
@@ -431,11 +434,14 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             sess_key="home",
         )
         worker.conv_id = "test-conv-persistent-settle"
-        worker.proc = AsyncMock()
-        worker.proc.stdin = AsyncMock()
+        worker.proc = MagicMock()
+        worker.proc.pid = 77777
+        worker.proc.stdin = MagicMock()
+        worker.proc.stdin.write = MagicMock()
+        worker.proc.stdin.drain = AsyncMock()
         worker.proc.stdout = AsyncMock()
         worker.proc.stdout.readline = AsyncMock(return_value=b"")
-        worker.proc.returncode = 0
+        worker.proc.returncode = None
         worker.is_ready = True
 
         mock_status = AsyncMock()
@@ -444,8 +450,7 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
         mock_target.channel = MagicMock()
         mock_target.channel.id = bs.TARGET_CHANNEL_ID
 
-        # Mock evaluate_and_settle_turn returning was_settled=True
-        mock_settle = AsyncMock(return_value=(True, "Final settled substantive answer from reinvocation!"))
+        mock_settle = AsyncMock(return_value=(True, "Should never be called"))
 
         with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
              patch("tools.bridge_daemons.TurnCoordinator.execute_stream_loop", new_callable=AsyncMock, return_value="Initial turn response"), \
@@ -460,18 +465,25 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
                 attachments=[],
             )
 
-            # Settle protocol was invoked with correct channel & conv_id
-            mock_settle.assert_awaited_once()
-            call_kwargs = mock_settle.call_args.kwargs
-            self.assertEqual(call_kwargs["conv_id"], worker.conv_id)
-            self.assertEqual(call_kwargs["channel_id"], bs.TARGET_CHANNEL_ID)
-            self.assertEqual(call_kwargs["mode"], "home")
-            self.assertEqual(call_kwargs["reinvoke_coro_fn"], worker.execute_turn)
+            # Post-turn evaluate_and_settle_turn loop is retired
+            mock_settle.assert_not_awaited()
+            self.assertEqual(result, "Initial turn response")
+            mock_deliver.assert_awaited_once()
+            self.assertEqual(mock_deliver.call_args.kwargs["output_text"], "Initial turn response")
 
-            # Result is settled_text directly
-            self.assertEqual(result, "Final settled substantive answer from reinvocation!")
-            # deliver_turn_output should not be called again in outer turn because reinvocation handled it
-            mock_deliver.assert_not_called()
+            # Backwards compatibility: is_settle_reinvocation=True bypasses worker.lock and reconciles pre_settle_text
+            mock_deliver.reset_mock()
+            async with worker.lock:
+                reinv_res = await worker.execute_turn(
+                    prompt="Follow-up settle check",
+                    status_msg=mock_status,
+                    reply_target=mock_target,
+                    attachments=[],
+                    is_settle_reinvocation=True,
+                    pre_settle_text="Initial turn response",
+                )
+            self.assertEqual(reinv_res, "Initial turn response")
+            mock_deliver.assert_awaited_once()
 
 
     async def test_10_recycle_keep_conv_id(self):
@@ -500,7 +512,9 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
         worker.is_ready = True
         worker.proc = MagicMock()
         worker.proc.returncode = None
-        worker.proc.stdin = AsyncMock()
+        worker.proc.stdin = MagicMock()
+        worker.proc.stdin.write = MagicMock()
+        worker.proc.stdin.drain = AsyncMock()
         worker.proc.stdout = AsyncMock()
 
         mock_status = AsyncMock()
@@ -800,6 +814,74 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(w_ops.conv_id, "conv-zero-ops-123")
             mock_deliver.assert_awaited_once()
             await w_ops.shutdown()
+
+    async def test_18_fire_presence_non_blocking_and_error_safe(self):
+        """Verify apply_presence_fn is scheduled fire-and-forget without blocking turn execution or propagating errors."""
+        import tools.bridge_runner as br
+
+        worker = bd.PersistentChannelWorker(
+            channel_id=bs.TARGET_CHANNEL_ID,
+            name="zero-chat",
+            mode="home",
+            sess_key="home",
+        )
+        worker.conv_id = "conv-presence-fast"
+        worker.is_ready = True
+        worker.proc = MagicMock()
+        worker.proc.pid = 65432
+        worker.proc.returncode = None
+        worker.proc.stdin = MagicMock()
+        worker.proc.stdin.write = MagicMock()
+        worker.proc.stdin.drain = AsyncMock()
+        worker.proc.stdout = AsyncMock()
+
+        presence_gate = asyncio.Event()
+        presence_calls = []
+
+        async def slow_presence(*args, **kwargs):
+            presence_calls.append((args, kwargs))
+            await presence_gate.wait()
+
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.id = bs.TARGET_CHANNEL_ID
+
+        with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
+             patch("tools.bridge_daemons.TurnCoordinator.execute_stream_loop", new_callable=AsyncMock, return_value="Fast reply"), \
+             patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock) as mock_deliver:
+            # Turn must finish immediately even while slow_presence is still blocked on presence_gate
+            res = await asyncio.wait_for(
+                worker.execute_turn(
+                    prompt="Quick status check",
+                    status_msg=None,
+                    reply_target=mock_target,
+                    attachments=[],
+                    apply_presence_fn=slow_presence,
+                ),
+                timeout=2.0,
+            )
+            self.assertEqual(res, "Fast reply")
+            mock_deliver.assert_awaited_once()
+            await asyncio.sleep(0)
+            self.assertEqual(len(presence_calls), 2)
+            self.assertEqual(presence_calls[0][1].get("status_override"), "dnd")
+            self.assertEqual(presence_calls[1], ((), {}))
+
+        presence_gate.set()
+        await asyncio.sleep(0.01)
+
+        # Verify both sync and async exceptions inside apply_presence_fn are swallowed quietly
+        async def failing_async_presence(*args, **kwargs):
+            raise RuntimeError("Discord gateway websocket closed")
+
+        def failing_sync_presence(*args, **kwargs):
+            raise RuntimeError("Sync presence error")
+
+        bd._fire_presence(failing_async_presence, status_override="dnd")
+        bd._fire_presence(failing_sync_presence)
+        br._fire_presence(failing_async_presence, status_override="dnd")
+        br._fire_presence(failing_sync_presence)
+        await asyncio.sleep(0.01)
 
 
 if __name__ == "__main__":

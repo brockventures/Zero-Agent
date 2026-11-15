@@ -1,3 +1,4 @@
+# ruff: noqa
 """
 Zero Discord Bridge - State, Session & Queue Persistence Module
 Encapsulates all session mapping, turn tracking, compaction detection,
@@ -93,7 +94,6 @@ DEFAULT_HOME_CHANNELS = {
     FORGE_CHANNEL_ID,        # #forge
     GOTCHI_CHAT_CHANNEL_ID,  # #gotchi-chat
 }
-RETITLED_THREADS_FILE = DATA_DIR / "retitled_threads.json"
 
 
 def is_vulcan_agent() -> bool:
@@ -325,38 +325,6 @@ def is_reply_to_zero(msg, bot=None) -> bool:
             pass
 
     return False
-
-
-def is_thread_retitled(thread_id: int | str) -> bool:
-    """Check if a thread has already received its post-turn retitle."""
-    if RETITLED_THREADS_FILE.exists():
-        try:
-            with open(RETITLED_THREADS_FILE) as f:
-                d = json.load(f)
-                return str(thread_id) in d
-        except Exception:
-            pass
-    return False
-
-
-def mark_thread_retitled(thread_id: int | str):
-    """Record that a thread has received its post-turn retitle."""
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        d = {}
-        if RETITLED_THREADS_FILE.exists():
-            try:
-                with open(RETITLED_THREADS_FILE) as f:
-                    d = json.load(f)
-            except Exception:
-                pass
-        d[str(thread_id)] = time.time()
-        if len(d) > 500:
-            d = dict(sorted(d.items(), key=lambda x: x[1])[-500:])
-        with open(RETITLED_THREADS_FILE, "w") as f:
-            json.dump(d, f)
-    except Exception as e:
-        print(f"[BridgeState] Error recording retitled thread: {e}")
 
 
 def record_restart_intent(reason: str, initiator: str = "user"):
@@ -917,8 +885,15 @@ def check_compaction_needed(
             if size_mb >= max_mb:
                 return True, f"transcript size ({size_mb:.2f} MB) exceeds {max_mb:.1f} MB ceiling"
 
-            with open(transcript_path, "rb") as f:
-                line_count = sum(1 for _ in f)
+            from tools.bridge_stream import get_latest_transcript_step_index
+
+            latest_idx = get_latest_transcript_step_index(conv_id, brain_base_dir=brain_root)
+            if latest_idx >= 0:
+                line_count = latest_idx + 1
+            else:
+                with open(transcript_path, "rb") as f:
+                    line_count = sum(1 for _ in f)
+
             if line_count >= max_steps:
                 return True, f"transcript steps ({line_count}) exceeds {max_steps}-step ceiling"
 

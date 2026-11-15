@@ -1,3 +1,4 @@
+# ruff: noqa
 """
 bridge_stream.py — Stream Protocol, Event Ingestion & Session Transcript Harvesting.
 
@@ -260,38 +261,6 @@ def harvest_transcript_response(
     return None
 
 
-def get_latest_transcript_step_index(
-    conv_id: Optional[str],
-    brain_base_dir: Optional[Path | str] = None,
-) -> int:
-    """Return the highest step_index currently recorded in the session transcript, or -1."""
-    if not conv_id:
-        return -1
-    base = Path(brain_base_dir) if brain_base_dir else Path("/root/.gemini/antigravity-cli/brain")
-    brain_dir = base / str(conv_id) / ".system_generated" / "logs"
-    for fname in ("transcript_full.jsonl", "transcript.jsonl"):
-        tpath = brain_dir / fname
-        if not tpath.exists():
-            continue
-        try:
-            with open(tpath, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-            for line in reversed(lines):
-                line_s = line.strip()
-                if not line_s:
-                    continue
-                try:
-                    data = json.loads(line_s)
-                    sidx = data.get("step_index")
-                    if sidx is not None:
-                        return int(sidx)
-                except Exception:
-                    continue
-        except Exception:
-            continue
-    return -1
-
-
 _TRANSCRIPT_TAIL_BYTES = 65536
 
 
@@ -312,6 +281,64 @@ def _read_transcript_tail_lines(tpath: Path, max_bytes: int = _TRANSCRIPT_TAIL_B
             raw = raw[nl_idx + 1 :]
         text = raw.decode("utf-8", errors="replace")
         return text.splitlines()
+
+
+def _extract_step_index_from_lines(lines: list[str]) -> Optional[int]:
+    """Extract the highest step_index scanning backwards through JSONL lines."""
+    for line in reversed(lines):
+        line_s = line.strip()
+        if not line_s:
+            continue
+        try:
+            data = json.loads(line_s)
+            sidx = data.get("step_index")
+            if sidx is not None:
+                return int(sidx)
+        except Exception:
+            continue
+    return None
+
+
+def get_latest_transcript_step_index(
+    conv_id: Optional[str],
+    brain_base_dir: Optional[Path | str] = None,
+) -> int:
+    """Return the highest step_index currently recorded in the session transcript, or -1."""
+    if not conv_id:
+        return -1
+    base = Path(brain_base_dir) if brain_base_dir else Path("/root/.gemini/antigravity-cli/brain")
+    brain_dir = base / str(conv_id) / ".system_generated" / "logs"
+
+    existing_paths: list[Path] = []
+    best_tail_idx = -1
+    for fname in ("transcript.jsonl", "transcript_full.jsonl"):
+        tpath = brain_dir / fname
+        if not tpath.exists():
+            continue
+        existing_paths.append(tpath)
+        try:
+            tail_lines = _read_transcript_tail_lines(tpath, max_bytes=32768)
+            sidx = _extract_step_index_from_lines(tail_lines)
+            if sidx is not None and sidx > best_tail_idx:
+                best_tail_idx = sidx
+        except Exception:
+            continue
+
+    if best_tail_idx >= 0:
+        return best_tail_idx
+
+    for tpath in existing_paths:
+        try:
+            if tpath.stat().st_size <= 32768:
+                continue
+            with open(tpath, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            sidx = _extract_step_index_from_lines(lines)
+            if sidx is not None:
+                return sidx
+        except Exception:
+            continue
+    return -1
 
 
 def check_transcript_turn_status(

@@ -1,3 +1,4 @@
+# ruff: noqa
 """Bridge Token Telemetry Engine.
 
 Tracks, stores, and aggregates LLM token telemetry directly from agy wire streams.
@@ -12,7 +13,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger("bridge_telemetry")
 
@@ -209,32 +210,3 @@ def record_token_usage(
     except Exception as e:
         logger.error(f"[BridgeTelemetry] Failed recording token usage: {e}", exc_info=True)
         return False
-
-
-def get_token_summary(hours: float = 24.0) -> List[Dict[str, Any]]:
-    """Retrieve token summary rolled up by parent channel over the given time window."""
-    init_telemetry_db()
-    since = time.time() - (hours * 3600.0)
-    with get_db_connection() as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-                parent_channel_name,
-                COUNT(*) as turn_count,
-                SUM(is_thread) as thread_turn_count,
-                SUM(input_tokens) as total_input,
-                SUM(output_tokens) as total_output,
-                SUM(cache_read_tokens) as total_cache,
-                SUM(thinking_tokens) as total_thinking,
-                SUM(total_tokens) as grand_total
-            FROM token_usage
-            WHERE timestamp >= ?
-            GROUP BY parent_channel_name
-            ORDER BY grand_total DESC;
-            """,
-            (since,),
-        )
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]

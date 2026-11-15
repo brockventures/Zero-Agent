@@ -19,6 +19,7 @@ from tools.bridge_stream import (
     check_transcript_turn_status,
     format_agy_error_message,
     format_command_preview,
+    get_latest_transcript_step_index,
     harvest_transcript_response,
     is_aborted_stream_stub,
     parse_agy_error,
@@ -165,8 +166,7 @@ class TestBridgeStream(unittest.TestCase):
             {"type": "PLANNER_RESPONSE", "content": "Pong from transcript."},
         ]
         with open(transcript_file, "w") as f:
-            for s in steps:
-                f.write(json.dumps(s) + "\n")
+            f.writelines(json.dumps(s) + "\n" for s in steps)
 
         with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
             harvested = harvest_transcript_response(conv_id)
@@ -189,8 +189,7 @@ class TestBridgeStream(unittest.TestCase):
             {"type": "GENERIC", "content": "Running tests..."},
         ]
         with open(transcript_file, "w") as f:
-            for s in steps:
-                f.write(json.dumps(s) + "\n")
+            f.writelines(json.dumps(s) + "\n" for s in steps)
 
         with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
             harvested = harvest_transcript_response(conv_id)
@@ -216,8 +215,7 @@ class TestBridgeStream(unittest.TestCase):
             {"type": "PLANNER_RESPONSE", "content": "Benchmark complete: R2 is 0.9715."},
         ]
         with open(transcript_file, "w") as f:
-            for s in steps:
-                f.write(json.dumps(s) + "\n")
+            f.writelines(json.dumps(s) + "\n" for s in steps)
 
         with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
             harvested = harvest_transcript_response(conv_id)
@@ -226,8 +224,7 @@ class TestBridgeStream(unittest.TestCase):
         # Now test when turn ended without a final text step (only tool steps followed)
         steps_no_final = steps[:-1]
         with open(transcript_file, "w") as f:
-            for s in steps_no_final:
-                f.write(json.dumps(s) + "\n")
+            f.writelines(json.dumps(s) + "\n" for s in steps_no_final)
 
         with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
             harvested = harvest_transcript_response(conv_id)
@@ -500,8 +497,7 @@ class TestBridgeStream(unittest.TestCase):
             {"step_index": 2, "type": "ERROR_MESSAGE", "content": "Error: The stream was interrupted. Please continue."},
         ]
         with open(transcript_file, "w") as f:
-            for s in steps_unrecovered:
-                f.write(json.dumps(s) + "\n")
+            f.writelines(json.dumps(s) + "\n" for s in steps_unrecovered)
 
         with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
             harvested = harvest_transcript_response(conv_id)
@@ -512,8 +508,7 @@ class TestBridgeStream(unittest.TestCase):
             {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "All checks passed successfully."},
         ]
         with open(transcript_file, "w") as f:
-            for s in steps_recovered:
-                f.write(json.dumps(s) + "\n")
+            f.writelines(json.dumps(s) + "\n" for s in steps_recovered)
 
         with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
             harvested = harvest_transcript_response(conv_id)
@@ -533,8 +528,7 @@ class TestBridgeStream(unittest.TestCase):
             {"step_index": 2, "type": "ERROR_MESSAGE", "content": "Error: The stream was interrupted. Please continue."},
         ]
         with open(transcript_file, "w") as f:
-            for s in steps_unrecovered:
-                f.write(json.dumps(s) + "\n")
+            f.writelines(json.dumps(s) + "\n" for s in steps_unrecovered)
 
         with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
             status = check_transcript_turn_status(conv_id)
@@ -547,8 +541,7 @@ class TestBridgeStream(unittest.TestCase):
             {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "", "thinking": "Internal reasoning only..."},
         ]
         with open(transcript_file, "w") as f:
-            for s in steps_thinking_only:
-                f.write(json.dumps(s) + "\n")
+            f.writelines(json.dumps(s) + "\n" for s in steps_thinking_only)
 
         with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
             status = check_transcript_turn_status(conv_id)
@@ -561,8 +554,7 @@ class TestBridgeStream(unittest.TestCase):
             {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Stack deployment completed."},
         ]
         with open(transcript_file, "w") as f:
-            for s in steps_completed:
-                f.write(json.dumps(s) + "\n")
+            f.writelines(json.dumps(s) + "\n" for s in steps_completed)
 
         with patch("tools.bridge_stream.Path", side_effect=lambda p: Path(p) if "/root/.gemini/antigravity-cli/brain" not in str(p) else self.temp_path):
             status = check_transcript_turn_status(conv_id)
@@ -610,6 +602,46 @@ class TestBridgeStream(unittest.TestCase):
         self.assertEqual(status["reason"], "complete")
         self.assertEqual(status["content"], "Tail answer verified cleanly.")
         self.assertEqual(status["step_index"], 501)
+
+    def test_get_latest_transcript_step_index_tail_seek_and_fallback(self):
+        """Verify get_latest_transcript_step_index uses O(1) tail seek and falls back only when needed."""
+        self.assertEqual(get_latest_transcript_step_index(None, brain_base_dir=self.temp_path), -1)
+        self.assertEqual(get_latest_transcript_step_index("missing-conv", brain_base_dir=self.temp_path), -1)
+
+        # Case 1: Large >100KB transcript resolves step_index via tail seek without full-file readlines()
+        conv_id = "test-conv-step-idx-tail"
+        log_dir = self.temp_path / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        compact_path = log_dir / "transcript.jsonl"
+        full_path = log_dir / "transcript_full.jsonl"
+
+        with open(compact_path, "w", encoding="utf-8") as f:
+            f.writelines(
+                json.dumps({"step_index": i, "type": "USER_INPUT", "content": "x" * 400}) + "\n"
+                for i in range(300)
+            )
+        # Also write transcript_full.jsonl with a >40KB trailing line (>32KB tail window)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.writelines(
+                json.dumps({"step_index": i, "type": "USER_INPUT", "content": "y" * 400}) + "\n"
+                for i in range(299)
+            )
+            f.write(json.dumps({"step_index": 299, "type": "PLANNER_RESPONSE", "content": "z" * 45000}) + "\n")
+
+        self.assertGreater(compact_path.stat().st_size, 100_000)
+        self.assertEqual(get_latest_transcript_step_index(conv_id, brain_base_dir=self.temp_path), 299)
+
+        # Case 2: Single file whose trailing line exceeds 32KB falls back to full read accurately
+        conv_huge_tail = "test-conv-step-idx-fallback"
+        huge_dir = self.temp_path / conv_huge_tail / ".system_generated" / "logs"
+        huge_dir.mkdir(parents=True, exist_ok=True)
+        only_full = huge_dir / "transcript_full.jsonl"
+        with open(only_full, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"step_index": 41, "type": "USER_INPUT", "content": "ok"}) + "\n")
+            f.write(json.dumps({"step_index": 42, "type": "PLANNER_RESPONSE", "content": "big" * 15000}) + "\n")
+
+        self.assertGreater(only_full.stat().st_size, 32768)
+        self.assertEqual(get_latest_transcript_step_index(conv_huge_tail, brain_base_dir=self.temp_path), 42)
 
 
 class TestBridgeStreamEngineIntegration(unittest.IsolatedAsyncioTestCase):
