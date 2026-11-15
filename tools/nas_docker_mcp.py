@@ -188,6 +188,8 @@ def nas_docker(action: str, host: str = None, compose_dir: str = "", service: st
             "error": f"Unsupported action '{action}'. Allowed: ps, ps_all, logs, compose_ps, compose_up, compose_down, compose_restart, compose_pull, compose_build"
         })
 
+    remote_cmd = f'export PATH="/usr/local/bin:$PATH"; {remote_cmd}'
+
     is_mutate = action.startswith("compose_") and action not in ("compose_ps",)
 
     if is_mutate:
