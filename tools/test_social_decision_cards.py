@@ -686,7 +686,7 @@ def test_core_friends_fallback_on_stage_failure(tmp_path: Path):
 
 
 def test_birthday_reminder_structured_partner_resolution(tmp_path: Path):
-    """Verify check_birthdays resolves partner from Partner column and includes in alert."""
+    """Verify check_birthdays resolves partner from Partner column and emits plain reminder without Decision Card."""
     csv_file = tmp_path / "friends_master.csv"
     fieldnames = [
         "Name",
@@ -721,7 +721,7 @@ def test_birthday_reminder_structured_partner_resolution(tmp_path: Path):
 
     with (
         patch.object(birthday_reminder, "CSV_PATH", csv_file),
-        patch("tools.forge.stage_decision", return_value={"ok": True, "id": "dec-bday-1"}) as mock_stage,
+        patch("tools.forge.stage_decision") as mock_stage,
     ):
         has_bday, msg, matched = birthday_reminder.check_birthdays(target_date="10-30", stage=True)
 
@@ -730,24 +730,10 @@ def test_birthday_reminder_structured_partner_resolution(tmp_path: Path):
         assert matched[0]["Partner"] == "Jordan Chen"
         assert "Avery Chen" in msg
         assert "Jordan Chen" in msg
-        assert "[CHOICES:" not in msg  # Upgraded to Decision Card
-        assert birthday_reminder.LAST_DECISION_STAGED is True
-        assert matched[0].get("_decision_staged") is True
-
-        assert mock_stage.called
-        kwargs = mock_stage.call_args[1]
-        assert kwargs["category"] == "birthday"
-        assert "Avery Chen" in kwargs["title"]
-        assert kwargs["channel_id"] == 1542081375287640084
-        assert kwargs["post_to_discord"] is True
-        assert kwargs["handler_type"] == "shell"
-
-        payload = kwargs["payload"]
-        assert "python3 /workspace/tools/birthday_reminder.py --date 10-30" in payload["command"]
-        assert payload["cwd"] == "/workspace"
-
-        ok_cmd, err_cmd = _validate_decision_shell_payload("shell", payload)
-        assert ok_cmd is True, err_cmd
+        assert "[CHOICES:" not in msg
+        assert birthday_reminder.LAST_DECISION_STAGED is False
+        assert matched[0].get("_decision_staged") is False
+        assert not mock_stage.called
 
 
 def test_birthday_reminder_no_birthdays_no_card(tmp_path: Path):
@@ -797,8 +783,8 @@ def test_birthday_reminder_no_birthdays_no_card(tmp_path: Path):
         assert birthday_reminder.LAST_DECISION_STAGED is False
 
 
-def test_birthday_reminder_fallback_on_stage_failure(tmp_path: Path):
-    """Verify check_birthdays falls back to [CHOICES] if stage_decision raises."""
+def test_birthday_reminder_plain_reminder_without_choices(tmp_path: Path):
+    """Verify check_birthdays emits a clean plain reminder without [CHOICES] or Decision Card."""
     csv_file = tmp_path / "friends_master.csv"
     fieldnames = [
         "Name",
@@ -833,15 +819,16 @@ def test_birthday_reminder_fallback_on_stage_failure(tmp_path: Path):
 
     with (
         patch.object(birthday_reminder, "CSV_PATH", csv_file),
-        patch("tools.forge.stage_decision", side_effect=RuntimeError("Database lock")),
+        patch("tools.forge.stage_decision") as mock_stage,
     ):
         has_bday, msg, matched = birthday_reminder.check_birthdays(target_date="10-30", stage=True)
 
         assert has_bday is True
         assert len(matched) == 1
-        assert '[CHOICES: Text Fallback "Happy birthday!" | Remind Me Later]' in msg
+        assert "[CHOICES:" not in msg
         assert birthday_reminder.LAST_DECISION_STAGED is False
         assert matched[0].get("_decision_staged") is False
+        assert not mock_stage.called
 
 
 # ==============================================================================
@@ -956,7 +943,7 @@ def test_birthday_reminder_pytest_default_suppresses_staging(tmp_path: Path):
         assert not mock_stage.called
         assert birthday_reminder.LAST_DECISION_STAGED is False
         assert matched[0].get("_decision_staged") is False
-        assert "[CHOICES:" in msg
+        assert "[CHOICES:" not in msg
 
 
 def test_explicit_stage_false_suppresses_staging(tmp_path: Path):
@@ -999,8 +986,11 @@ def test_explicit_stage_false_suppresses_staging(tmp_path: Path):
 
 def test_should_stage_helper_matrix():
     """Verify _should_stage across all three modules."""
-    for mod in (birthday_reminder, social_last_seen_review, core_friends_reminder):
+    for mod in (social_last_seen_review, core_friends_reminder):
         assert mod._should_stage(True) is True
         assert mod._should_stage(False) is False
         # Running under pytest, so stage=None must return False
         assert mod._should_stage(None) is False
+    assert birthday_reminder._should_stage(True) is False
+    assert birthday_reminder._should_stage(False) is False
+    assert birthday_reminder._should_stage(None) is False
