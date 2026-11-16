@@ -730,7 +730,7 @@ def test_birthday_reminder_structured_partner_resolution(tmp_path: Path):
         assert matched[0]["Partner"] == "Jordan Chen"
         assert "Avery Chen" in msg
         assert "Jordan Chen" in msg
-        assert "[CHOICES:" not in msg
+        assert '[CHOICES: Text Avery "Happy birthday!" | Remind Me Later]' in msg
         assert birthday_reminder.LAST_DECISION_STAGED is False
         assert matched[0].get("_decision_staged") is False
         assert not mock_stage.called
@@ -783,8 +783,8 @@ def test_birthday_reminder_no_birthdays_no_card(tmp_path: Path):
         assert birthday_reminder.LAST_DECISION_STAGED is False
 
 
-def test_birthday_reminder_plain_reminder_without_choices(tmp_path: Path):
-    """Verify check_birthdays emits a clean plain reminder without [CHOICES] or Decision Card."""
+def test_birthday_reminder_plain_reminder_with_text_button(tmp_path: Path):
+    """Verify check_birthdays emits a plain reminder with [CHOICES: Text <Name> ...] and no Decision Card."""
     csv_file = tmp_path / "friends_master.csv"
     fieldnames = [
         "Name",
@@ -825,7 +825,7 @@ def test_birthday_reminder_plain_reminder_without_choices(tmp_path: Path):
 
         assert has_bday is True
         assert len(matched) == 1
-        assert "[CHOICES:" not in msg
+        assert '[CHOICES: Text Fallback "Happy birthday!" | Remind Me Later]' in msg
         assert birthday_reminder.LAST_DECISION_STAGED is False
         assert matched[0].get("_decision_staged") is False
         assert not mock_stage.called
@@ -943,7 +943,7 @@ def test_birthday_reminder_pytest_default_suppresses_staging(tmp_path: Path):
         assert not mock_stage.called
         assert birthday_reminder.LAST_DECISION_STAGED is False
         assert matched[0].get("_decision_staged") is False
-        assert "[CHOICES:" not in msg
+        assert '[CHOICES: Text Avery "Happy birthday!" | Remind Me Later]' in msg
 
 
 def test_explicit_stage_false_suppresses_staging(tmp_path: Path):

@@ -149,7 +149,7 @@ def check_birthdays(
     for person in matched:
         person["_decision_staged"] = False
 
-    message = "\n".join(lines).strip()
+    message = "\n".join(lines).strip() + "\n\n[CHOICES: " + " | ".join(buttons) + "]"
     return True, message, matched
 
 def main():
