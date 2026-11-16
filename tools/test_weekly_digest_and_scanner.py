@@ -99,8 +99,8 @@ class TestWeeklyDigestReminders:
 class TestWeeklyDigestPersonalSync:
     """Tests Personal Data & Gaming Profile Sync receipt inclusion in Weekly Household Radar."""
 
-    def test_weekly_digest_includes_personal_sync_receipt(self, tmp_path: Path):
-        """Verify generate_weekly_digest appends compact 1-line Personal Sync receipt when present."""
+    def test_weekly_digest_omits_personal_sync_receipt(self, tmp_path: Path):
+        """Verify generate_weekly_digest hides background Personal Sync & memory indexing receipts."""
         fake_status = {
             "personal_data_sync": {
                 "job_id": "personal_data_sync",
@@ -118,19 +118,11 @@ class TestWeeklyDigestPersonalSync:
         now = datetime(2026, 11, 1, 20, 0, tzinfo=PT)
         with patch("tools.weekly_digest.get_week_ahead_events", return_value=["• **Mon Nov 02** — Team Planning"]):
             with patch("tools.weekly_digest.get_upcoming_reminders_and_renewals", return_value=["• **Nov 06** — Renewals"]):
-                with patch("tools.weekly_digest.Path") as mock_path:
-                    def path_side_effect(p):
-                        if "sidecar_status.json" in str(p):
-                            return status_file
-                        return Path(p)
-
-                    mock_path.side_effect = path_side_effect
-
-                    digest = generate_weekly_digest(now)
+                digest = generate_weekly_digest(now)
 
         assert "📊 **Weekly Household Radar**" in digest
-        assert "🎮 **Weekly Profile Sync:**" in digest
-        assert "**Steam:** 726 games synced | **Xbox:** 153 titles, 40540 G synced" in digest
+        assert "🎮 **Weekly Profile Sync:**" not in digest
+        assert "transcript_index.db" not in digest
 
     def test_weekly_digest_handles_missing_personal_sync(self, tmp_path: Path):
         """Verify generate_weekly_digest completes cleanly when personal_data_sync is absent."""

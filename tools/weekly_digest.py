@@ -381,25 +381,6 @@ def generate_weekly_digest(now_pt: datetime | None = None) -> str:
     renewals_lines = get_upcoming_reminders_and_renewals(now_pt, days=30)
     renewals_block = "\n".join(renewals_lines) if renewals_lines else "• *No upcoming deadlines or renewals.*"
 
-    # 3. Personal Data & Gaming Profile Sync Receipt
-    sync_block = ""
-    status_file = Path("/workspace/data/sidecar_status.json")
-    if not status_file.exists():
-        status_file = Path(__file__).resolve().parent.parent / "data" / "sidecar_status.json"
-    if status_file.exists():
-        try:
-            with open(status_file, "r", encoding="utf-8") as f:
-                statuses = json.load(f)
-            p_sync = statuses.get("personal_data_sync", {})
-            p_summary = p_sync.get("extra", {}).get("summary") or p_sync.get("summary")
-            if p_summary:
-                compact_summary = p_summary.strip().split("\n")[0]
-                if compact_summary.endswith("& 6 perso"):
-                    compact_summary = compact_summary[:-len("& 6 perso")] + "& 6 personal movies synced"
-                sync_block = f"\n\n🎮 **Weekly Profile Sync:** {compact_summary}"
-        except Exception as e:
-            print(f"[WeeklyDigest] Error reading sidecar_status.json: {e}", file=sys.stderr)
-
     report = f"""📊 **Weekly Household Radar**
 _{date_header}_
 
@@ -407,7 +388,7 @@ _{date_header}_
 {week_block}
 
 📅 **30-Day Lookahead & Deadlines:**
-{renewals_block}{sync_block}"""
+{renewals_block}"""
     return report
 
 
