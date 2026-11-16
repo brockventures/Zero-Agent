@@ -24,6 +24,7 @@ from tools.weekly_digest import (
     generate_weekly_digest,
     get_recent_cashflow_rows,
     get_upcoming_reminders_and_renewals,
+    get_week_ahead_events,
 )
 
 PT = ZoneInfo("America/Los_Angeles")
@@ -144,6 +145,24 @@ class TestWeeklyDigestPersonalSync:
 
         assert "📊 **Weekly Household Radar**" in digest
         assert "🎮 **Weekly Profile Sync:**" not in digest
+
+    def test_week_ahead_excludes_kids_pickup_and_dropoff_variants(self):
+        """Verify get_week_ahead_events filters both 'Rosie dropoff' and 'Pickup Rosie, Isaac' formats."""
+        fake_cal = {
+            "events": [
+                {"summary": "Rosie dropoff", "start": "2026-11-16T08:15:00-08:00"},
+                {"summary": "Pickup Rosie, Isaac - Ryan", "start": "2026-11-17T17:30:00-08:00"},
+                {"summary": "Drop-off Isaac & Rosie", "start": "2026-11-18T08:15:00-08:00"},
+                {"summary": "Rosie, Isaac pick up", "start": "2026-11-19T17:30:00-08:00"},
+                {"summary": "Rosie gymnastics - Ryan", "start": "2026-11-16T17:00:00-08:00"},
+            ]
+        }
+        now = datetime(2026, 11, 15, 20, 0, tzinfo=PT)
+        with patch("tools.weekly_digest.calendar_list_events", return_value=json.dumps(fake_cal)):
+            lines = get_week_ahead_events(now)
+
+        assert len(lines) == 1
+        assert "Rosie gymnastics - Ryan" in lines[0]
 
 
 # ==============================================================================
