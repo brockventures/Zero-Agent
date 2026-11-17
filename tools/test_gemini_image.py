@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.gemini_image import (
     HEARTH_HOLIDAY_LEGACY_STATES,
     HEARTH_HOLIDAY_SCENES,
+    MODEL_CASCADE,
     build_hearth_birthday_prompt,
     build_hearth_holiday_prompt,
     check_and_record_paid_budget,
@@ -253,6 +254,10 @@ class TestGeminiImage(unittest.TestCase):
         self.assertTrue(res["success"])
         self.assertEqual(res["model"], "gemini-3.1-flash-image-preview")
         self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(
+            MODEL_CASCADE,
+            ["gemini-3.1-flash-image", "gemini-3.1-flash-image-preview"],
+        )
 
     @patch("requests.post")
     def test_paid_api_daily_budget_guard_blocks_excess_calls(self, mock_post):

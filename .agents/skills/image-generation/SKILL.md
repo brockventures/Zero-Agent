@@ -67,7 +67,7 @@ python3 /workspace/tools/gemini_image.py \
   --channel lounge
 ```
 * Automatically verifies the JPEG via `check_image()` and delivers to Discord via `deliver_image.py` with zero prompt dump (omit `--caption` or pass `""` so only the clean image is uploaded; never echo the raw generation prompt into Discord).
-* **Paid API Fallback Gate (`--allow-paid-api`):** Direct HTTPS REST requests to `generativelanguage.googleapis.com` (`gemini-3.1-flash-image` -> `gemini-3.1-flash-image-preview` -> `gemini-2.5-flash-image`) are blocked by default and require explicit `--allow-paid-api` (subject to the daily paid budget guard). Never run paid API calls in automated loops or multi-concept batches.
+* **Paid API Fallback Gate (`--allow-paid-api`):** Direct HTTPS REST requests to `generativelanguage.googleapis.com` (`gemini-3.1-flash-image` -> `gemini-3.1-flash-image-preview`) are blocked by default and require explicit `--allow-paid-api` (subject to the daily paid budget guard). Never run paid API calls in automated loops or multi-concept batches.
 
 ### Step 3: Forensic Verification on Disk (Never Skip)
 

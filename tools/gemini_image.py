@@ -11,7 +11,7 @@ and enforced by a hard daily budget cap to prevent unexpected Google Cloud billi
 Features:
 1. Subscription-First Execution: Uses Antigravity CLI subscription OAuth by default ($0 API billing).
 2. Paid-API Gate & Budget Guard: Requires `--allow-paid-api` and enforces a daily call cap before touching paid endpoints.
-3. Multi-Model Fallback (Paid API): gemini-3.1-flash-image -> gemini-3.1-flash-image-preview -> gemini-2.5-flash-image.
+3. Multi-Model Fallback (Paid API): gemini-3.1-flash-image -> gemini-3.1-flash-image-preview.
 4. Hard Client Timeout: Configurable timeout prevents process hangs.
 5. Integrated Verification: Auto-verifies image dimensions, format, and byte size via check_image().
 6. One-Click Discord Delivery: Optional --channel and --caption arguments deliver via deliver_image.py.
@@ -57,7 +57,6 @@ SUBSCRIPTION_MODEL = "gemini-4-argon-low"
 MODEL_CASCADE = [
     "gemini-3.1-flash-image",
     "gemini-3.1-flash-image-preview",
-    "gemini-2.5-flash-image",
 ]
 
 ASPECT_RATIO_PROMPTS = {

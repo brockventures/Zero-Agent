@@ -4,7 +4,7 @@ Zero Discord Voice Live Engine (Gemini Multimodal Live API + Discord DAVE E2EE V
 
 Provides real-time, low-latency bidirectional voice conversation with Zero inside
 Discord voice channels (specifically `#zero-voice`, ID: 1560924105279275042) powered by
-Google's Gemini Live API (`gemini-3.8-live` / `gemini-2.5-flash-native-audio-latest`).
+Google's Gemini Live API (`gemini-3.8-live` / `gemini-3.1-flash-live-preview`).
 
 Features:
 - Full Discord DAVE E2EE (MLS) decryption & encryption compatibility (`davey` + `PyNaCl`).
@@ -60,7 +60,7 @@ PT_TZ = ZoneInfo("America/Los_Angeles")
 ZERO_VOICE_CHANNEL_ID = 1560924105279275042
 GOTCHI_CHAT_CHANNEL_ID = 1562246590943461429
 DEFAULT_LIVE_MODEL = "gemini-3.8-live"
-FALLBACK_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
+FALLBACK_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 DEFAULT_VOICE_NAME = "Schedar"  # Even, steady, composed lower-middle male voice in Gemini Live
 VOICE_TRANSCRIPT_FILE = Path("/workspace/data/voice_transcripts.json")
 CHANNEL_HISTORY_FILE = Path("/workspace/data/channel_history.json")

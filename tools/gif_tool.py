@@ -896,7 +896,7 @@ def _call_gemini_api_direct(prompt: str, timeout: float = 3.0) -> str | None:
     api_key = _get_gemini_api_key()
     if not api_key:
         return None
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
