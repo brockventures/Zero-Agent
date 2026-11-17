@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Comprehensive test suite for Autonomous Arr & Prowlarr Health Triage Watchdogs."""
 
 import json
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
-if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if sys.path[0] != REPO_ROOT:
+    sys.path.insert(0, REPO_ROOT)
 
 import pytest
 import tools.arr_queue_watchdog as aqw
@@ -559,4 +562,166 @@ def test_arr_id_mismatch_poison_grab_auto_remediated(temp_env, monkeypatch):
         log_content = f.read()
         assert "queue_id_mismatch" in log_content
         assert "auto_purged_blocklisted_and_researched" in log_content
+
+
+def test_extract_release_show_prefix():
+    """Verify show prefix extraction for SxxExx episodic releases and Sxx season packs."""
+    # Episodic SxxExx
+    assert (
+        aqw._extract_release_show_prefix("JPod.2008.S01E07.1080p.AMZN.WEB-DL.H.264.SDR.DDP2.0.English-HONE")
+        == "jpod2008"
+    )
+    assert aqw._extract_release_show_prefix("Breaking.Bad.s05e16.720p.HDTV") == "breakingbad"
+    assert aqw._extract_release_show_prefix("Show_Name-S02E01-Title") == "showname"
+
+    # Season-pack Sxx
+    assert (
+        aqw._extract_release_show_prefix("The.Body.S01.1080p.NF.WEB-DL.DDP5.1.Atmos.H.264.DUAL-BiOMA")
+        == "thebody"
+    )
+    assert aqw._extract_release_show_prefix("Severance.S01.2160p.ATVP.WEB-DL") == "severance"
+    assert aqw._extract_release_show_prefix("Some.Show.s2.720p") == "someshow"
+
+    # Non-matching releases (movies or releases without Sxx)
+    assert aqw._extract_release_show_prefix("Inception.2010.1080p.BluRay") == ""
+    assert aqw._extract_release_show_prefix("") == ""
+
+
+def test_arr_id_mismatch_season_pack_deduplicates_download_id(temp_env, monkeypatch):
+    """Season pack with ID mismatch: deduplicates downloadId, removes item once, and re-searches all episodes."""
+    _, audit_file = temp_env
+
+    monkeypatch.setattr(aqw, "_get_api_keys", lambda: ("sonarr_mock_key", "radarr_mock_key"))
+    monkeypatch.setattr(aqw, "fetch_health", lambda app, port, key: [])
+    monkeypatch.setattr(aqw, "_auto_remediate_media_management", lambda app, port, key: (False, ""))
+
+    title = "The.Body.S01.1080p.NF.WEB-DL.DDP5.1.Atmos.H.264.DUAL-BiOMA"
+    mismatch_msg = [
+        "Found matching series via grab history, but release was matched to series by ID. Automatic import is not possible. See the FAQ for details."
+    ]
+    queue_mock = [
+        {
+            "id": 801,
+            "downloadId": "mock-the-body-s01",
+            "seriesId": 500,
+            "episodeId": 9001,
+            "title": title,
+            "status": "completed",
+            "trackedDownloadStatus": "warning",
+            "statusMessages": [{"title": title, "messages": mismatch_msg}],
+            "series": {"path": "/data/media/tv/The Body (2020)"},
+        },
+        {
+            "id": 802,
+            "downloadId": "mock-the-body-s01",
+            "seriesId": 500,
+            "episodeId": 9002,
+            "title": title,
+            "status": "completed",
+            "trackedDownloadStatus": "warning",
+            "statusMessages": [{"title": title, "messages": mismatch_msg}],
+            "series": {"path": "/data/media/tv/The Body (2020)"},
+        },
+        {
+            "id": 803,
+            "downloadId": "mock-the-body-s01",
+            "seriesId": 500,
+            "episodeId": 9003,
+            "title": title,
+            "status": "completed",
+            "trackedDownloadStatus": "warning",
+            "statusMessages": [{"title": title, "messages": mismatch_msg}],
+            "series": {"path": "/data/media/tv/The Body (2020)"},
+        },
+    ]
+    monkeypatch.setattr(aqw, "fetch_queue", lambda app, port, key: queue_mock if app == "Sonarr" else [])
+
+    remove_mock = MagicMock(return_value=True)
+    search_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(aqw, "remove_queue_item", remove_mock)
+    monkeypatch.setattr(aqw, "trigger_replacement_search", search_mock)
+
+    has_activity, summary, items = aqw.run_watchdog(auto_fix=True, force_dispatch=True)
+
+    assert remove_mock.call_count == 1
+    remove_mock.assert_called_once_with(
+        aqw.SONARR_PORT, "sonarr_mock_key", 801, remove_from_client=True, blocklist=True
+    )
+    assert search_mock.call_count == 1
+    assert search_mock.call_args[1]["episode_ids"] == [9001, 9002, 9003]
+    assert not has_activity
+    assert summary == ""
+
+    assert audit_file.exists()
+    with open(audit_file) as f:
+        log_content = f.read()
+        assert "queue_id_mismatch" in log_content
+        assert "auto_purged_blocklisted_and_researched" in log_content
+
+
+def test_arr_non_upgrade_season_pack_deduplicates_download_id(temp_env, monkeypatch):
+    """Season pack with non-upgrade rejection: deduplicates downloadId and purges once without spurious alerts."""
+    _, audit_file = temp_env
+
+    monkeypatch.setattr(aqw, "_get_api_keys", lambda: ("sonarr_mock_key", "radarr_mock_key"))
+    monkeypatch.setattr(aqw, "fetch_health", lambda app, port, key: [])
+    monkeypatch.setattr(aqw, "_auto_remediate_media_management", lambda app, port, key: (False, ""))
+
+    title = "Severance.S01.1080p.WEB-DL.DDP5.1.H.264"
+    non_upg_msg = ["Not an upgrade for existing file"]
+    queue_mock = [
+        {
+            "id": 901,
+            "downloadId": "mock-severance-s01",
+            "seriesId": 600,
+            "episodeId": 9101,
+            "title": title,
+            "status": "completed",
+            "trackedDownloadStatus": "warning",
+            "statusMessages": [{"title": title, "messages": non_upg_msg}],
+            "series": {"path": "/data/media/tv/Severance (2022)"},
+        },
+        {
+            "id": 902,
+            "downloadId": "mock-severance-s01",
+            "seriesId": 600,
+            "episodeId": 9102,
+            "title": title,
+            "status": "completed",
+            "trackedDownloadStatus": "warning",
+            "statusMessages": [{"title": title, "messages": non_upg_msg}],
+            "series": {"path": "/data/media/tv/Severance (2022)"},
+        },
+        {
+            "id": 903,
+            "downloadId": "mock-severance-s01",
+            "seriesId": 600,
+            "episodeId": 9103,
+            "title": title,
+            "status": "completed",
+            "trackedDownloadStatus": "warning",
+            "statusMessages": [{"title": title, "messages": non_upg_msg}],
+            "series": {"path": "/data/media/tv/Severance (2022)"},
+        },
+    ]
+    monkeypatch.setattr(aqw, "fetch_queue", lambda app, port, key: queue_mock if app == "Sonarr" else [])
+
+    remove_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(aqw, "remove_queue_item", remove_mock)
+
+    has_activity, summary, items = aqw.run_watchdog(auto_fix=True, force_dispatch=True)
+
+    assert remove_mock.call_count == 1
+    remove_mock.assert_called_once_with(
+        aqw.SONARR_PORT, "sonarr_mock_key", 901, remove_from_client=True, blocklist=True
+    )
+    assert not has_activity
+    assert summary == ""
+
+    assert audit_file.exists()
+    with open(audit_file) as f:
+        log_content = f.read()
+        assert "queue_non_upgrade" in log_content
+        assert "auto_purged_and_blocklisted" in log_content
+
 

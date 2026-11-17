@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Autonomous Queue & Health Triage Watchdog for Radarr and Sonarr.
 
 Monitors download, import queues, and system health across Host 1 (:7878 / :8989):
@@ -281,15 +282,39 @@ NON_UPGRADE_RE = re.compile("|".join(NON_UPGRADE_PATTERNS), re.IGNORECASE)
 ID_MISMATCH_PATTERNS = [
     r"matched to (?:series|movie) by id.*automatic import is not possible",
 ]
-ID_MISMATCH_RE = re.compile("|".join(ID_MISMATCH_PATTERNS), re.IGNORECASE)
+ID_MISMATCH_RE = re.compile("|".join(ID_MISMATCH_PATTERNS), re.IGNORECASE | re.DOTALL)
 
 
 def _extract_release_show_prefix(title: str) -> str:
-    """Extract normalized show prefix prior to SxxExx token for sibling poison detection."""
-    parts = re.split(r"[.\s_-]+S\d{1,2}E\d{1,2}\b", title or "", maxsplit=1, flags=re.IGNORECASE)
+    """Extract normalized show prefix prior to Sxx / SxxExx token for sibling poison detection."""
+    parts = re.split(r"[.\s_-]+S\d{1,2}(?:E\d{1,2})?\b", title or "", maxsplit=1, flags=re.IGNORECASE)
     if len(parts) > 1 and parts[0].strip():
         return re.sub(r"[^a-z0-9]+", "", parts[0].lower())
     return ""
+
+
+def _collect_same_download_siblings(
+    queue: list[dict],
+    raw_download_id: str,
+    purged_queue_ids: set[int],
+) -> tuple[list[int], list[int]]:
+    """Mark all queue rows sharing downloadId as purged and collect their episode/movie IDs."""
+    if not raw_download_id:
+        return [], []
+    collected_ep_ids: list[int] = []
+    collected_movie_ids: list[int] = []
+    for row in queue:
+        if row.get("downloadId") == raw_download_id:
+            row_id = row.get("id")
+            if row_id is not None:
+                purged_queue_ids.add(row_id)
+            ep_id = row.get("episodeId")
+            if ep_id is not None and ep_id not in collected_ep_ids:
+                collected_ep_ids.append(ep_id)
+            mv_id = row.get("movieId")
+            if mv_id is not None and mv_id not in collected_movie_ids:
+                collected_movie_ids.append(mv_id)
+    return collected_ep_ids, collected_movie_ids
 
 
 def trigger_replacement_search(
@@ -408,8 +433,11 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
         # 1. Inspect queue & download imports
         queue = fetch_queue(app_name, port, key)
         purged_queue_ids: set[int] = set()
+        purged_download_ids: set[str] = set()
         for item in queue:
-            if item.get("id") in purged_queue_ids:
+            if item.get("id") in purged_queue_ids or (
+                item.get("downloadId") and item.get("downloadId") in purged_download_ids
+            ):
                 continue
             tracked_status = item.get("trackedDownloadStatus", "").lower()
             status = item.get("status", "").lower()
@@ -487,6 +515,10 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                 if queue_item_id and remove_queue_item(port, key, queue_item_id, remove_from_client=True, blocklist=True):
                     remediation_done = True
                     purged_queue_ids.add(queue_item_id)
+                    raw_download_id = item.get("downloadId")
+                    if raw_download_id:
+                        purged_download_ids.add(raw_download_id)
+                        _collect_same_download_siblings(queue, raw_download_id, purged_queue_ids)
                     matching_msg = next((m for m in msg_texts if NON_UPGRADE_RE.search(m)), "Rejected non-upgrade")
                     remediated_entry = {
                         "app": app_name,
@@ -510,8 +542,18 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                 if queue_item_id and remove_queue_item(port, key, queue_item_id, remove_from_client=True, blocklist=True):
                     remediation_done = True
                     purged_queue_ids.add(queue_item_id)
-                    affected_ep_ids = [item["episodeId"]] if item.get("episodeId") else []
-                    affected_movie_ids = [item["movieId"]] if item.get("movieId") else []
+                    raw_download_id = item.get("downloadId")
+                    if raw_download_id:
+                        purged_download_ids.add(raw_download_id)
+                    same_dl_eps, same_dl_movies = _collect_same_download_siblings(
+                        queue, raw_download_id or "", purged_queue_ids
+                    )
+                    affected_ep_ids = list(same_dl_eps)
+                    if item.get("episodeId") and item["episodeId"] not in affected_ep_ids:
+                        affected_ep_ids.append(item["episodeId"])
+                    affected_movie_ids = list(same_dl_movies)
+                    if item.get("movieId") and item["movieId"] not in affected_movie_ids:
+                        affected_movie_ids.append(item["movieId"])
                     sibling_count = 0
 
                     # Also purge any queued sibling episodes for the same series sharing the mismatched show prefix
@@ -525,8 +567,20 @@ def run_watchdog(auto_fix: bool = True, force_dispatch: bool = False) -> tuple[b
                             if sib.get("seriesId") == target_series_id and _extract_release_show_prefix(sib.get("title", "")) == bad_prefix:
                                 if remove_queue_item(port, key, sib_id, remove_from_client=True, blocklist=True):
                                     purged_queue_ids.add(sib_id)
+                                    sib_dl_id = sib.get("downloadId")
+                                    if sib_dl_id:
+                                        purged_download_ids.add(sib_dl_id)
+                                        sib_eps, sib_movies = _collect_same_download_siblings(
+                                            queue, sib_dl_id, purged_queue_ids
+                                        )
+                                        for ep in sib_eps:
+                                            if ep not in affected_ep_ids:
+                                                affected_ep_ids.append(ep)
+                                        for mv in sib_movies:
+                                            if mv not in affected_movie_ids:
+                                                affected_movie_ids.append(mv)
                                     sibling_count += 1
-                                    if sib.get("episodeId"):
+                                    if sib.get("episodeId") and sib["episodeId"] not in affected_ep_ids:
                                         affected_ep_ids.append(sib["episodeId"])
 
                     re_searched = trigger_replacement_search(
