@@ -1,0 +1,832 @@
+"""Unit tests for Hearth Daily Weather Art Pipeline.
+
+Covers:
+1. Character consistency clause & slot prompt invariants (golden-blonde hair, light blue-green eyes,
+   7yo Rosie / 3yo Isaac / 3mo baby Eve, right 42% / left 58% composition, zero UI).
+2. Clothing state mapping across rain, cold, mild, warm, and hot weather brackets.
+3. Family context collection with mocked Switch, Tautulli, Steam, and memory fixtures
+   (RFC 5737 198.51.100.x documentation IPs only) including exact Ocarina of Time fidelity.
+4. Art style vault selection with 12-day cooldown and 60/40 context vs vault weighting.
+5. Forecast retrieval and seasonal fallback.
+6. Daily manifest schema validation, dry-run mode, and mocked image generation / forensic check / scp deploy.
+7. Schedule registration and idempotency.
+8. CLI entry point options.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from tools import hearth_daily_weather_art as hdwa
+except ImportError:
+    import hearth_daily_weather_art as hdwa
+
+import pytest
+
+
+# ===========================================================================
+# 1. Character Consistency & Prompt Invariant Tests
+# ===========================================================================
+class TestCharacterConsistencyAndPrompts:
+    """Verifies strict character consistency, composition, and negative guardrails."""
+
+    def test_base_character_consistency_clause_content(self) -> None:
+        """Verify the base clause contains all mandatory character invariants."""
+        clause = hdwa.BASE_CHARACTER_CONSISTENCY_CLAUSE
+
+        # Rosie checks
+        assert "Rosie" in clause
+        assert "7-year-old girl" in clause
+        assert "golden-blonde hair" in clause
+        assert "light blue-green eyes" in clause
+
+        # Isaac checks
+        assert "Isaac" in clause
+        assert "3-year-old toddler boy" in clause
+        assert "noticeably shorter than Rosie" in clause
+        assert "golden-blonde hair" in clause
+        assert "light blue-green eyes" in clause
+
+        # Genevieve (Eve) checks
+        assert "Genevieve (Eve)" in clause
+        assert "3-month-old infant baby girl" in clause
+        assert "tiny newborn-sized baby" in clause
+        assert "golden-blonde" in clause
+        assert "light blue-green eyes" in clause
+        assert "cradled" in clause
+
+        # Composition invariants (right 42% / left 58%)
+        assert "RIGHT 42%" in clause
+        assert "LEFT 58%" in clause
+        assert "16:9" in clause
+
+        # Negative guardrails
+        assert "no dark hair" in clause.lower()
+        assert "no brown hair" in clause.lower()
+        assert "no black hair" in clause.lower()
+        assert "zero-ui invariant" in clause.lower()
+        assert "no text" in clause.lower()
+        assert "no watermarks" in clause.lower()
+
+    def test_build_slot_prompt_structure_and_lighting(self) -> None:
+        """Verify build_slot_prompt generates cohesive prompts with correct slot lighting."""
+        theme = hdwa.ART_STYLE_VAULT["studio_ghibli_gouache"]
+        weather = {"clothing_state": "morning_mild", "temp_f": 58.0}
+
+        for slot, expected_lighting in [
+            ("morning", "8:00 AM dawn ambiance"),
+            ("afternoon", "2:00 PM sun"),
+            ("evening", "6:00 PM dusk"),
+        ]:
+            prompt = hdwa.build_slot_prompt(slot=slot, theme=theme, weather_info=weather)
+            assert expected_lighting in prompt
+            assert "Studio Ghibli watercolor and gouache" in prompt
+            assert hdwa.BASE_CHARACTER_CONSISTENCY_CLAUSE in prompt
+            assert "golden-blonde hair" in prompt
+            assert "light blue-green eyes" in prompt
+            assert "RIGHT 42%" in prompt
+            assert "LEFT 58%" in prompt
+            assert "16:9 widescreen" in prompt
+
+    def test_build_slot_prompt_ocarina_of_time_fidelity(self) -> None:
+        """Verify exact Switch title fidelity for Ocarina of Time in prompt flavor."""
+        oot_theme = hdwa.ART_STYLE_VAULT["zelda_oot_kokiri_storybook"]
+        weather = {"clothing_state": "morning_mild", "temp_f": 62.0}
+
+        prompt = hdwa.build_slot_prompt(slot="morning", theme=oot_theme, weather_info=weather)
+
+        assert "Kokiri Forest" in prompt
+        assert "Great Deku Tree" in prompt
+        assert "glowing friendly winged fairy (Navi)" in prompt
+        assert "wooden boardwalk footbridges" in prompt
+
+        # Non-OOT theme should NOT have the OOT special flavor clause
+        botw_theme = hdwa.ART_STYLE_VAULT["zelda_botw_watercolor"]
+        botw_prompt = hdwa.build_slot_prompt(slot="morning", theme=botw_theme, weather_info=weather)
+        assert "glowing friendly winged fairy (Navi)" not in botw_prompt
+
+    def test_all_vault_styles_have_scenes_and_mediums(self) -> None:
+        """Ensure all 19+ vault styles have required metadata and scene flavors."""
+        assert len(hdwa.ART_STYLE_VAULT) >= 19
+        for key, style in hdwa.ART_STYLE_VAULT.items():
+            assert "visual_medium" in style, f"Missing visual_medium in {key}"
+            assert "name" in style, f"Missing name in {key}"
+            assert "prompt_style" in style, f"Missing prompt_style in {key}"
+            assert "scene_flavor" in style, f"Missing scene_flavor in {key}"
+            assert "context_tags" in style, f"Missing context_tags in {key}"
+            for slot in ("morning", "afternoon", "evening"):
+                assert slot in style["scene_flavor"], f"Missing {slot} in scene_flavor for {key}"
+
+
+# ===========================================================================
+# 2. Clothing State Mapping Tests
+# ===========================================================================
+class TestClothingStateMapping:
+    """Verifies mapping of temperature, condition, and precipitation to clothing states."""
+
+    def test_rain_conditions_mapping(self) -> None:
+        """Verify rainy conditions map to morning_rain (morning) or rainy_boots (other)."""
+        # Explicit condition keyword
+        assert hdwa.map_weather_to_clothing_state("morning", 60.0, "Light rain") == "morning_rain"
+        assert hdwa.map_weather_to_clothing_state("afternoon", 60.0, "Rain shower") == "rainy_boots"
+        assert hdwa.map_weather_to_clothing_state("evening", 55.0, "Thunderstorm") == "rainy_boots"
+
+        # Precipitation amount threshold (> 0.04)
+        assert hdwa.map_weather_to_clothing_state("morning", 65.0, "cloudy", precip=0.08) == "morning_rain"
+        assert hdwa.map_weather_to_clothing_state("afternoon", 65.0, "cloudy", precip=0.05) == "rainy_boots"
+
+        # Precipitation probability threshold (>= 40.0)
+        assert hdwa.map_weather_to_clothing_state("morning", 68.0, "partlycloudy", precip_prob=45.0) == "morning_rain"
+        assert hdwa.map_weather_to_clothing_state("afternoon", 68.0, "partlycloudy", precip_prob=50.0) == "rainy_boots"
+
+    def test_cold_bracket_mapping(self) -> None:
+        """Verify cold temperatures (<= 48F) map to cold_puffer for all slots."""
+        for slot in ("morning", "afternoon", "evening"):
+            assert hdwa.map_weather_to_clothing_state(slot, 42.0, "clear") == "cold_puffer"
+            assert hdwa.map_weather_to_clothing_state(slot, 48.0, "sunny") == "cold_puffer"
+
+    def test_hot_bracket_mapping(self) -> None:
+        """Verify hot temperatures (>= 75F) map to hot_dress for all slots."""
+        for slot in ("morning", "afternoon", "evening"):
+            assert hdwa.map_weather_to_clothing_state(slot, 75.0, "sunny") == "hot_dress"
+            assert hdwa.map_weather_to_clothing_state(slot, 88.0, "partlycloudy") == "hot_dress"
+
+    def test_temperate_bracket_mapping(self) -> None:
+        """Verify mild / temperate temperatures (49F - 74F) respect slot nuances."""
+        # Morning: < 52F is cold_puffer, >= 52F is morning_mild
+        assert hdwa.map_weather_to_clothing_state("morning", 50.0, "sunny") == "cold_puffer"
+        assert hdwa.map_weather_to_clothing_state("morning", 54.0, "sunny") == "morning_mild"
+
+        # Afternoon: defaults to warm_pants
+        assert hdwa.map_weather_to_clothing_state("afternoon", 65.0, "sunny") == "warm_pants"
+
+        # Evening: <= 62F is cool_evening, > 62F is warm_pants
+        assert hdwa.map_weather_to_clothing_state("evening", 58.0, "clear") == "cool_evening"
+        assert hdwa.map_weather_to_clothing_state("evening", 62.0, "clear") == "cool_evening"
+        assert hdwa.map_weather_to_clothing_state("evening", 68.0, "clear") == "warm_pants"
+
+    def test_all_seven_clothing_state_prompts_configured(self) -> None:
+        """Ensure all 7 clothing states exist and describe all three siblings."""
+        expected_states = {
+            "morning_rain",
+            "rainy_boots",
+            "cold_puffer",
+            "morning_mild",
+            "cool_evening",
+            "warm_pants",
+            "hot_dress",
+        }
+        assert set(hdwa.CLOTHING_STATE_PROMPTS.keys()) == expected_states
+        for state, desc in hdwa.CLOTHING_STATE_PROMPTS.items():
+            assert "Rosie" in desc, f"{state} prompt missing Rosie"
+            assert "Isaac" in desc, f"{state} prompt missing Isaac"
+            assert "Genevieve" in desc, f"{state} prompt missing Genevieve"
+
+
+# ===========================================================================
+# 3. Family Context Collector Tests (RFC 5737 Compliant)
+# ===========================================================================
+class TestFamilyContextCollector:
+    """Verifies context collection from Switch, Tautulli, Steam, and memory profiles."""
+
+    def test_collect_family_context_empty_fallback(self) -> None:
+        """Verify collect_family_context gracefully handles non-existent files."""
+        with patch.object(hdwa, "DATA_DIR", Path("/tmp/non_existent_data_dir")):
+            ctx = hdwa.collect_family_context()
+            assert isinstance(ctx, dict)
+            assert "switch" in ctx
+            assert "matched_themes" in ctx
+            assert "special_notes" in ctx
+            assert isinstance(ctx["matched_themes"], list)
+
+    def test_collect_switch_json_ocarina_of_time(self) -> None:
+        """Verify exact Switch title match for Ocarina of Time triggers special theme and notes."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            switch_json = tmp_path / "switch_data.json"
+            switch_payload = {
+                "devices": [
+                    {
+                        "dailySummaries": [
+                            {
+                                "playedApps": [
+                                    {"application": {"title": "The Legend of Zelda: Ocarina of Time"}},
+                                    {"application": {"title": "Super Mario Odyssey"}},
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+            switch_json.write_text(json.dumps(switch_payload), encoding="utf-8")
+
+            with patch.object(hdwa, "DATA_DIR", tmp_path):
+                ctx = hdwa.collect_family_context()
+
+            assert "The Legend of Zelda: Ocarina of Time" in ctx["switch"]
+            assert "Super Mario Odyssey" in ctx["switch"]
+            assert "zelda_oot_kokiri_storybook" in ctx["matched_themes"]
+            assert "pixar_storybook_light" in ctx["matched_themes"]
+            assert any("Ocarina of Time" in note for note in ctx["special_notes"])
+            assert any("Kokiri Forest" in note for note in ctx["special_notes"])
+
+    def test_collect_switch_markdown_profiles(self) -> None:
+        """Verify markdown profile parser extracts titles and matches themes."""
+        raw_markdown = (
+            "## Currently Played Switch Titles\n"
+            "- **The Legend of Zelda: Tears of the Kingdom**: Exploring Hyrule depths\n"
+            "- **The Legend of Zelda: Link's Awakening**: Charming Koholint adventure\n"
+            "## Completed Titles\n"
+        )
+
+        with (
+            patch("pathlib.Path.exists", autospec=True) as mock_exists,
+            patch("pathlib.Path.read_text", autospec=True) as mock_read_text,
+        ):
+            def fake_exists(p: Path) -> bool:
+                return str(p).endswith("media_gaming_switch_profile.md")
+
+            def fake_read_text(p: Path, encoding: str = "utf-8") -> str:
+                if str(p).endswith("media_gaming_switch_profile.md"):
+                    return raw_markdown
+                return ""
+
+            mock_exists.side_effect = fake_exists
+            mock_read_text.side_effect = fake_read_text
+
+            ctx = hdwa.collect_family_context()
+
+        assert "zelda_botw_watercolor" in ctx["matched_themes"]
+        assert "links_awakening_diorama" in ctx["matched_themes"]
+
+    def test_collect_steam_plex_and_book_profiles(self) -> None:
+        """Verify Steam, Plex, and book profiles extract expected matched themes."""
+        sample_profiles = {
+            "media_gaming_steam_profile.md": "Playing Chrono Trigger and retro SNES pixel classics.",
+            "media_plex_taste_profile.md": "Family movie night: watched My Neighbor Totoro and Studio Ghibli favorites.",
+            "media_and_podcasts.md": "Reading Calvin and Hobbes treasury and Nordic folk tales.",
+        }
+
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            with (
+                patch.object(hdwa, "DATA_DIR", tmp_path),
+                patch("pathlib.Path.exists", autospec=True) as mock_exists,
+                patch("pathlib.Path.read_text", autospec=True) as mock_read_text,
+            ):
+                def fake_exists(p: Path) -> bool:
+                    filename = p.name
+                    return filename in sample_profiles
+
+                def fake_read_text(p: Path, encoding: str = "utf-8") -> str:
+                    filename = p.name
+                    return sample_profiles.get(filename, "")
+
+                mock_exists.side_effect = fake_exists
+                mock_read_text.side_effect = fake_read_text
+
+                ctx = hdwa.collect_family_context()
+
+            assert "snes_pixel_storybook" in ctx["matched_themes"]
+            assert "studio_ghibli_gouache" in ctx["matched_themes"]
+            assert "calvin_hobbes_ink_wash" in ctx["matched_themes"]
+            assert "nordic_folk_storybook" in ctx["matched_themes"]
+
+            # Deduplication check
+            assert len(ctx["matched_themes"]) == len(set(ctx["matched_themes"]))
+
+
+# ===========================================================================
+# 4. Art Style Selection & 12-Day Cooldown Tests
+# ===========================================================================
+class TestThemeSelectionAndCooldown:
+    """Verifies 12-day cooldown enforcement, forced CLI theme, and 60/40 weighting."""
+
+    def test_forced_theme_selection(self) -> None:
+        """Verify forced theme parameter bypasses cooldown and returns immediately."""
+        theme, reason = hdwa.select_daily_theme(
+            family_context={"matched_themes": []},
+            target_date="2026-11-20",
+            forced_theme="studio_ghibli_gouache",
+        )
+        assert theme["visual_medium"] == "studio_ghibli_gouache"
+        assert "forced_cli" in reason
+
+    def test_forced_theme_invalid_raises_value_error(self) -> None:
+        """Verify invalid forced theme raises ValueError."""
+        with pytest.raises(ValueError, match="Unknown theme 'non_existent_medium'"):
+            hdwa.select_daily_theme(
+                family_context={"matched_themes": []},
+                target_date="2026-11-20",
+                forced_theme="non_existent_medium",
+            )
+
+    def test_12_day_cooldown_excludes_recent_themes(self) -> None:
+        """Verify themes selected within the last 12 days are excluded from selection."""
+        with TemporaryDirectory() as tmp_dir:
+            history_file = Path(tmp_dir) / "theme_history.json"
+            target_date = "2026-11-20"
+            target_dt = datetime.strptime(target_date, "%Y-%m-%d").date()
+
+            # Create history entries:
+            # - Entry 5 days ago: studio_ghibli_gouache (should be cooled down)
+            # - Entry 10 days ago: zelda_botw_watercolor (should be cooled down)
+            # - Entry 15 days ago: snes_pixel_storybook (eligible)
+            history = [
+                {
+                    "date": (target_dt - timedelta(days=5)).isoformat(),
+                    "theme_key": "studio_ghibli_gouache",
+                    "visual_medium": "studio_ghibli_gouache",
+                },
+                {
+                    "date": (target_dt - timedelta(days=10)).isoformat(),
+                    "theme_key": "zelda_botw_watercolor",
+                    "visual_medium": "zelda_botw_watercolor",
+                },
+                {
+                    "date": (target_dt - timedelta(days=15)).isoformat(),
+                    "theme_key": "snes_pixel_storybook",
+                    "visual_medium": "snes_pixel_storybook",
+                },
+            ]
+            history_file.write_text(json.dumps(history), encoding="utf-8")
+
+            # Run 50 selections with context matching the cooled-down ghibli theme
+            # Ghibli must never be chosen because it is on 12-day cooldown
+            for seed in range(50):
+                theme, _ = hdwa.select_daily_theme(
+                    family_context={"matched_themes": ["studio_ghibli_gouache"]},
+                    target_date=target_date,
+                    seed=seed,
+                    history_file=history_file,
+                )
+                assert theme["visual_medium"] != "studio_ghibli_gouache"
+                assert theme["visual_medium"] != "zelda_botw_watercolor"
+
+    def test_60_40_context_selection_weighting(self) -> None:
+        """Verify context candidates are preferred when roll < 0.60 and available."""
+        with TemporaryDirectory() as tmp_dir:
+            history_file = Path(tmp_dir) / "theme_history.json"
+            history_file.write_text(json.dumps([]), encoding="utf-8")
+
+            # Mock random.Random to return roll < 0.60
+            with patch("random.Random") as mock_rng_cls:
+                mock_rng = MagicMock()
+                mock_rng.random.return_value = 0.45  # < 0.60
+                mock_rng.choice.side_effect = lambda seq: seq[0]
+                mock_rng_cls.return_value = mock_rng
+
+                theme, reason = hdwa.select_daily_theme(
+                    family_context={"matched_themes": ["calvin_hobbes_ink_wash"]},
+                    target_date="2026-11-20",
+                    history_file=history_file,
+                )
+                assert theme["visual_medium"] == "calvin_hobbes_ink_wash"
+                assert "family_context" in reason
+
+            # Mock random.Random to return roll >= 0.60
+            with patch("random.Random") as mock_rng_cls:
+                mock_rng = MagicMock()
+                mock_rng.random.return_value = 0.75  # >= 0.60
+                mock_rng.choice.side_effect = lambda seq: seq[0]
+                mock_rng_cls.return_value = mock_rng
+
+                theme, reason = hdwa.select_daily_theme(
+                    family_context={"matched_themes": ["calvin_hobbes_ink_wash"]},
+                    target_date="2026-11-20",
+                    history_file=history_file,
+                )
+                assert "vault_rotation" in reason
+
+    def test_all_themes_on_cooldown_fallback(self) -> None:
+        """Verify that if all vault themes are on cooldown, the pool resets safely."""
+        with TemporaryDirectory() as tmp_dir:
+            history_file = Path(tmp_dir) / "theme_history.json"
+            target_date = "2026-11-20"
+            target_dt = datetime.strptime(target_date, "%Y-%m-%d").date()
+
+            # Put every single vault theme in history within the last 5 days
+            history = []
+            for i, (key, style) in enumerate(hdwa.ART_STYLE_VAULT.items()):
+                history.append({
+                    "date": (target_dt - timedelta(days=(i % 10) + 1)).isoformat(),
+                    "theme_key": key,
+                    "visual_medium": style["visual_medium"],
+                })
+            history_file.write_text(json.dumps(history), encoding="utf-8")
+
+            theme, reason = hdwa.select_daily_theme(
+                family_context={"matched_themes": []},
+                target_date=target_date,
+                seed=42,
+                history_file=history_file,
+            )
+            assert theme["visual_medium"] in hdwa.ART_STYLE_VAULT
+            assert "vault_rotation" in reason
+
+    def test_record_theme_history_atomic(self) -> None:
+        """Verify record_theme_history writes and updates entries cleanly."""
+        with TemporaryDirectory() as tmp_dir:
+            hist_file = Path(tmp_dir) / "history.json"
+            hdwa.record_theme_history(
+                target_date="2026-11-20",
+                theme_key="studio_ghibli_gouache",
+                visual_medium="studio_ghibli_gouache",
+                context_source="unit_test",
+                history_file=hist_file,
+            )
+
+            records = hdwa.load_theme_history(hist_file)
+            assert len(records) == 1
+            assert records[0]["date"] == "2026-11-20"
+            assert records[0]["theme_key"] == "studio_ghibli_gouache"
+
+            # Update entry for the same date
+            hdwa.record_theme_history(
+                target_date="2026-11-20",
+                theme_key="snes_pixel_storybook",
+                visual_medium="snes_pixel_storybook",
+                context_source="unit_test_update",
+                history_file=hist_file,
+            )
+            records2 = hdwa.load_theme_history(hist_file)
+            assert len(records2) == 1
+            assert records2[0]["theme_key"] == "snes_pixel_storybook"
+
+
+# ===========================================================================
+# 5. Forecast Retrieval & Seasonal Fallback Tests
+# ===========================================================================
+class TestForecastRetrieval:
+    """Verifies Home Assistant forecast retrieval and seasonal fallback."""
+
+    def test_fetch_tomorrow_slots_forecast_seasonal_fallback(self) -> None:
+        """Verify seasonal fallback populates morning, afternoon, and evening slots."""
+        with patch.object(hdwa, "_get_ha_credentials", return_value=("", "")):
+            data = hdwa.fetch_tomorrow_slots_forecast(target_date="2026-11-20")
+
+            assert data["target_date"] == "2026-11-20"
+            assert data["source"] == "seasonal_estimate"
+            slots = data["slots"]
+            assert set(slots.keys()) == {"morning", "afternoon", "evening"}
+
+            # November is winter fallback in Northern California:
+            # morning: 46F -> cold_puffer
+            # afternoon: 58F -> warm_pants
+            # evening: 50F -> cool_evening
+            assert slots["morning"]["temp_f"] == 46.0
+            assert slots["morning"]["clothing_state"] == "cold_puffer"
+
+            assert slots["afternoon"]["temp_f"] == 58.0
+            assert slots["afternoon"]["clothing_state"] == "warm_pants"
+
+            assert slots["evening"]["temp_f"] == 50.0
+            assert slots["evening"]["clothing_state"] == "cool_evening"
+
+    def test_fetch_tomorrow_slots_forecast_ha_mocked(self) -> None:
+        """Verify hourly forecast parser extracts correct slot temperatures from Home Assistant."""
+        target_date = "2026-11-20"
+        mock_ha_payload = {
+            "weather.forecast_home": {
+                "forecast": [
+                    {
+                        "datetime": f"{target_date}T08:00:00-08:00",
+                        "temperature": 55.0,
+                        "condition": "sunny",
+                        "precipitation": 0.0,
+                        "precipitation_probability": 0.0,
+                    },
+                    {
+                        "datetime": f"{target_date}T14:00:00-08:00",
+                        "temperature": 78.0,
+                        "condition": "sunny",
+                        "precipitation": 0.0,
+                        "precipitation_probability": 0.0,
+                    },
+                    {
+                        "datetime": f"{target_date}T18:00:00-08:00",
+                        "temperature": 59.0,
+                        "condition": "rainy",
+                        "precipitation": 0.12,
+                        "precipitation_probability": 85.0,
+                    },
+                ]
+            }
+        }
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps(mock_ha_payload).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        # Use RFC 5737 documentation IP for mocked HA endpoint
+        with (
+            patch.object(hdwa, "_get_ha_credentials", return_value=("http://198.51.100.10:8123", "mock_token")),
+            patch("urllib.request.urlopen", return_value=mock_resp),
+        ):
+            fc = hdwa.fetch_tomorrow_slots_forecast(target_date=target_date)
+
+        assert fc["source"] == "ha_forecast"
+        slots = fc["slots"]
+        assert slots["morning"]["temp_f"] == 55.0
+        assert slots["morning"]["clothing_state"] == "morning_mild"
+
+        assert slots["afternoon"]["temp_f"] == 78.0
+        assert slots["afternoon"]["clothing_state"] == "hot_dress"
+
+        assert slots["evening"]["temp_f"] == 59.0
+        assert slots["evening"]["clothing_state"] == "rainy_boots"
+
+
+# ===========================================================================
+# 6. Schedule Registration Tests
+# ===========================================================================
+class TestScheduleInstallation:
+    """Verifies daily 6:30 PM PT schedule registration and idempotency."""
+
+    def test_install_schedule_creates_new_file(self) -> None:
+        """Verify schedule installation creates schedule.json if absent."""
+        with TemporaryDirectory() as tmp_dir:
+            sched_file = Path(tmp_dir) / "schedule.json"
+            ok, msg = hdwa.install_schedule_entry(sched_file)
+
+            assert ok is True
+            assert "Successfully registered" in msg
+            assert sched_file.exists()
+
+            data = json.loads(sched_file.read_text(encoding="utf-8"))
+            assert len(data) == 1
+            entry = data[0]
+            assert entry["id"] == "hearth_daily_weather_art"
+            assert entry["hour_pt"] == 18
+            assert entry["minute_pt"] == 30
+            assert entry["enabled"] is True
+
+    def test_install_schedule_idempotent_and_preserves_other_jobs(self) -> None:
+        """Verify running install_schedule multiple times updates in-place and preserves jobs."""
+        with TemporaryDirectory() as tmp_dir:
+            sched_file = Path(tmp_dir) / "schedule.json"
+            existing_jobs = [
+                {"id": "existing_cron_job", "name": "Existing Cron", "enabled": True},
+            ]
+            sched_file.write_text(json.dumps(existing_jobs), encoding="utf-8")
+
+            # First run
+            ok1, _ = hdwa.install_schedule_entry(sched_file)
+            assert ok1 is True
+            data1 = json.loads(sched_file.read_text(encoding="utf-8"))
+            assert len(data1) == 2
+            assert any(j["id"] == "existing_cron_job" for j in data1)
+            assert any(j["id"] == "hearth_daily_weather_art" for j in data1)
+
+            # Second run (idempotency check)
+            ok2, _ = hdwa.install_schedule_entry(sched_file)
+            assert ok2 is True
+            data2 = json.loads(sched_file.read_text(encoding="utf-8"))
+            assert len(data2) == 2
+
+
+# ===========================================================================
+# 7. Host 2 Deployment Tests
+# ===========================================================================
+class TestDeploymentToHost2:
+    """Verifies deploy_to_host2 scp parameters, validation, and remote pruning."""
+
+    def test_deploy_to_host2_missing_file_fails(self) -> None:
+        """Verify deployment fails immediately if a local file is missing."""
+        missing = Path("/tmp/non_existent_file_12345.jpg")
+        ok, msg = hdwa.deploy_to_host2([missing])
+        assert ok is False
+        assert "File does not exist" in msg
+
+    def test_deploy_to_host2_success(self) -> None:
+        """Verify scp -O and remote prune execution with mocked subprocess and ssh."""
+        with TemporaryDirectory() as tmp_dir:
+            test_file = Path(tmp_dir) / "daily_test.jpg"
+            test_file.write_text("dummy_image_data", encoding="utf-8")
+
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.stdout = ""
+            mock_proc.stderr = ""
+
+            with (
+                patch("subprocess.run", return_value=mock_proc) as mock_subproc,
+                patch.object(hdwa.nas_config, "run_ssh", return_value=(0, "deleted 2 files", "")) as mock_ssh,
+            ):
+                ok, msg = hdwa.deploy_to_host2([test_file])
+
+            assert ok is True
+            assert "Successfully uploaded" in msg
+
+            # Verify scp command structure
+            mock_subproc.assert_called_once()
+            cmd_args = mock_subproc.call_args[0][0]
+            assert cmd_args[0] == "scp"
+            assert "-O" in cmd_args
+            assert str(test_file.resolve()) in cmd_args
+
+            # Verify remote prune called via SSH
+            mock_ssh.assert_called_once()
+            prune_cmd = mock_ssh.call_args[0][1]
+            assert "daily_*.jpg" in prune_cmd
+            assert "-mtime +3 -delete" in prune_cmd
+
+
+# ===========================================================================
+# 8. End-to-End Pipeline Execution Tests
+# ===========================================================================
+class TestRunNightlyPipeline:
+    """Verifies run_nightly_pipeline in dry-run, success, and error paths."""
+
+    def test_run_nightly_pipeline_dry_run_manifest_schema(self) -> None:
+        """Verify --dry-run mode creates valid daily_manifest.json with all schema fields."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            hist_file = tmp_path / "history.json"
+
+            result = hdwa.run_nightly_pipeline(
+                target_date="2026-11-20",
+                theme="studio_ghibli_gouache",
+                output_dir=str(out_dir),
+                dry_run=True,
+                history_file=hist_file,
+            )
+
+            assert result["success"] is True
+            assert result["target_date"] == "2026-11-20"
+            manifest_path = Path(result["manifest_path"])
+            assert manifest_path.exists()
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            # Verify top-level manifest schema
+            assert manifest["date"] == "2026-11-20"
+            assert "generated_at" in manifest
+            assert manifest["theme_key"] == "studio_ghibli_gouache"
+            assert manifest["visual_medium"] == "studio_ghibli_gouache"
+            assert manifest["dry_run"] is True
+            assert "context_used" in manifest
+            assert "slots" in manifest
+
+            # Verify slot structures
+            slots = manifest["slots"]
+            assert set(slots.keys()) == {"morning", "afternoon", "evening"}
+            for slot_name in ("morning", "afternoon", "evening"):
+                slot_info = slots[slot_name]
+                assert "hour" in slot_info
+                assert "clothing_state" in slot_info
+                assert "temp_f" in slot_info
+                assert "condition" in slot_info
+                assert "filename" in slot_info
+                assert slot_info["filename"] == f"daily_2026-11-20_{slot_name}.jpg"
+                assert "relative_url" in slot_info
+                assert "prompt" in slot_info
+                assert slot_info["valid"] is True
+                assert slot_info["dry_run"] is True
+
+                # Check character consistency invariants in prompt
+                prompt = slot_info["prompt"]
+                assert "golden-blonde hair" in prompt
+                assert "light blue-green eyes" in prompt
+                assert "Rosie: 7-year-old girl" in prompt
+                assert "Isaac: 3-year-old toddler boy" in prompt
+                assert "Genevieve (Eve): 3-month-old infant baby girl" in prompt
+                assert "RIGHT 42%" in prompt
+                assert "LEFT 58%" in prompt
+
+    def test_run_nightly_pipeline_mocked_generation_and_deploy(self) -> None:
+        """Verify full pipeline execution with mocked Gemini subscription and verification."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            hist_file = tmp_path / "history.json"
+
+            def fake_generate_image(prompt: str, **kwargs: Any) -> dict[str, Any]:
+                image_name = kwargs.get("image_name", "test")
+                target_p = out_dir / f"{image_name}.jpg"
+                target_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)  # Dummy JPEG header
+                return {"success": True, "path": str(target_p)}
+
+            fake_check_image = MagicMock(return_value={
+                "valid": True,
+                "width": 1920,
+                "height": 1080,
+                "format": "JPEG",
+                "size_kb": 256.0,
+            })
+
+            with (
+                patch.object(hdwa, "generate_image_subscription", side_effect=fake_generate_image) as mock_gen,
+                patch.object(hdwa, "check_image", fake_check_image),
+                patch.object(hdwa, "deploy_to_host2", return_value=(True, "Synced 4 files")) as mock_deploy,
+            ):
+                result = hdwa.run_nightly_pipeline(
+                    target_date="2026-11-20",
+                    theme="zelda_oot_kokiri_storybook",
+                    output_dir=str(out_dir),
+                    dry_run=False,
+                    no_deploy=False,
+                    history_file=hist_file,
+                )
+
+            assert result["success"] is True
+            assert mock_gen.call_count == 3
+            assert fake_check_image.call_count == 3
+            mock_deploy.assert_called_once()
+
+            manifest = result["manifest"]
+            assert manifest["slots"]["morning"]["valid"] is True
+            assert manifest["slots"]["morning"]["width"] == 1920
+            assert manifest["slots"]["morning"]["height"] == 1080
+            assert manifest["slots"]["morning"]["format"] == "JPEG"
+
+            # History must be recorded after successful run
+            history = hdwa.load_theme_history(hist_file)
+            assert len(history) == 1
+            assert history[0]["visual_medium"] == "zelda_oot_kokiri_storybook"
+
+    def test_run_nightly_pipeline_generation_failure_handling(self) -> None:
+        """Verify pipeline handles image generation failure gracefully."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            hist_file = tmp_path / "history.json"
+
+            with (
+                patch.object(hdwa, "generate_image_subscription", return_value={"success": False, "error": "API quota exceeded"}),
+                patch.object(hdwa, "deploy_to_host2") as mock_deploy,
+            ):
+                result = hdwa.run_nightly_pipeline(
+                    target_date="2026-11-20",
+                    theme="studio_ghibli_gouache",
+                    output_dir=str(out_dir),
+                    dry_run=False,
+                    history_file=hist_file,
+                )
+
+            assert result["success"] is False
+            manifest = result["manifest"]
+            assert manifest["slots"]["morning"]["valid"] is False
+            assert "API quota exceeded" in manifest["slots"]["morning"]["error"]
+
+            # Deployment must NOT be attempted if generation failed
+            mock_deploy.assert_not_called()
+
+            # Failed run should NOT record history
+            assert len(hdwa.load_theme_history(hist_file)) == 0
+
+
+# ===========================================================================
+# 9. Main CLI Entry Point Tests
+# ===========================================================================
+class TestMainCLI:
+    """Verifies argument parsing and execution via main()."""
+
+    def test_main_dry_run_flag(self) -> None:
+        """Verify main() runs with --dry-run and exits 0."""
+        with TemporaryDirectory() as tmp_dir:
+            out_dir = Path(tmp_dir) / "cli_out"
+            test_argv = [
+                "hearth_daily_weather_art.py",
+                "--dry-run",
+                "--target-date", "2026-11-20",
+                "--output-dir", str(out_dir),
+            ]
+            with (
+                patch("sys.argv", test_argv),
+                patch.object(hdwa, "DEFAULT_HISTORY_FILE", Path(tmp_dir) / "hist.json"),
+            ):
+                ret = hdwa.main()
+            assert ret == 0
+            assert (out_dir / "daily_manifest.json").exists()
+
+    def test_main_install_schedule_flag(self) -> None:
+        """Verify main() runs with --install-schedule and exits 0."""
+        with TemporaryDirectory() as tmp_dir:
+            sched_file = Path(tmp_dir) / "schedule.json"
+            test_argv = [
+                "hearth_daily_weather_art.py",
+                "--install-schedule",
+            ]
+            real_install = hdwa.install_schedule_entry
+            with (
+                patch("sys.argv", test_argv),
+                patch.object(hdwa, "install_schedule_entry", side_effect=lambda *a, **kw: real_install(sched_file)),
+            ):
+                ret = hdwa.main()
+            assert ret == 0
+            assert sched_file.exists()
