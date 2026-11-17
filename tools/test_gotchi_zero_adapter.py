@@ -1053,6 +1053,7 @@ def test_resolve_lomin_client_lockout_key_and_redteam_routes(monkeypatch):
     # and empty body fallback
     monkeypatch.setenv("MVG_ENABLE_DEFER", "1")
     monkeypatch.setenv("MVG_ENABLE_MIC_REOPEN", "1")
+    monkeypatch.setenv("GOTCHI_TTS_ENGINE", "mock")
 
     def fake_llm(turn: Dict[str, Any]) -> Dict[str, Any]:
         return {"reply": "All systems nominal. Would you like details?"}
@@ -1078,14 +1079,25 @@ def test_resolve_lomin_client_lockout_key_and_redteam_routes(monkeypatch):
     assert ask_resp.status_code == 200
     assert "expects_reply" in ask_resp.text
 
-    # Store pending item via Lomin pending store and retrieve via /voice/pending/{node_id}
-    from pending_and_auth import get_pending_store  # type: ignore
+    # Store pending item via Lomin pending store (or /voice/pending route fallback) and retrieve via /voice/pending/{node_id}
+    try:
+        from pending_and_auth import get_pending_store  # type: ignore
 
-    get_pending_store().store(
-        node_id="gotchi-lomin-01",
-        prompt="Please defer this check",
-        answer="Checking the build queue now.",
-    )
+        get_pending_store().store(
+            node_id="gotchi-lomin-01",
+            prompt="Please defer this check",
+            answer="Checking the build queue now.",
+        )
+    except ImportError:
+        pend_post = client.post(
+            "/voice/pending",
+            json={
+                "node_id": "gotchi-lomin-01",
+                "prompt": "Please defer this check",
+                "answer": "Checking the build queue now.",
+            },
+        )
+        assert pend_post.status_code == 200
     pend_get = client.get("/voice/pending/gotchi-lomin-01")
     assert pend_get.status_code == 200
     pend_data = pend_get.json()
@@ -1679,6 +1691,83 @@ def test_contextual_tool_stage_events_and_multistep_progress_streaming(monkeypat
     # Verify step 0 filler, step 1 weather filler, and step 2 final reply were all streamed via on_partial
     assert len(partials) >= 3
     assert any("weather" in p.lower() or "forecast" in p.lower() or "conditions" in p.lower() for p in partials)
+
+
+def test_stream_failover_and_tts_use_non_deprecated_models(monkeypatch):
+    import asyncio
+    from tools.gotchi_zero_adapter import (
+        GotchiZeroBrainAdapter,
+        create_zero_gotchi_app,
+        shutdown_lomin_background_workers,
+    )
+
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._append_voice_turn_to_history",
+        lambda *a, **kw: None,
+    )
+
+    attempted_models: List[str] = []
+
+    class FakeChunk:
+        def __init__(self, text: str = ""):
+            self.text = text
+            self.function_calls = None
+            self.candidates = []
+
+    class FailoverModels:
+        async def generate_content_stream(self, model: str, contents: Any, config: Any):
+            attempted_models.append(model)
+            if model == "gemini-3.8-flash":
+                raise RuntimeError("503 UNAVAILABLE")
+            yield FakeChunk(text="Fallback model answered cleanly.")
+
+    class FakeAio:
+        def __init__(self):
+            self.models = FailoverModels()
+
+    class FakeClient:
+        def __init__(self):
+            self.aio = FakeAio()
+            self.caches = None
+
+    adapter = GotchiZeroBrainAdapter(api_key="fake-key", dispatch_discord=False)
+    monkeypatch.setattr(adapter, "_get_genai_client", lambda: FakeClient())
+    monkeypatch.setattr(adapter, "_get_or_create_context_cache", lambda *a, **kw: None)
+
+    reply, _, _ = asyncio.run(
+        adapter._run_gemini_with_tools("Quick status check.", None, [])
+    )
+    assert "Fallback model answered cleanly." in reply
+    assert attempted_models == ["gemini-3.8-flash", "gemini-3.1-flash-lite-preview"]
+    assert all("2.5-flash" not in m and "2.0-flash" not in m for m in attempted_models)
+
+    # Verify create_zero_gotchi_app defaults cfg.tts_model to gemini-3.1-flash-tts-preview
+    monkeypatch.delenv("GOTCHI_TTS_ENGINE", raising=False)
+    monkeypatch.delenv("GOTCHI_TTS_MODEL", raising=False)
+    monkeypatch.delenv("MVG_TTS", raising=False)
+
+    from backend import llm_config as llm_cfg_mod
+
+    orig_from_env = llm_cfg_mod.LLMConfig.from_env_or_file
+    captured_cfgs: List[Any] = []
+
+    def _wrapped_from_env(*args, **kwargs):
+        cfg = orig_from_env(*args, **kwargs)
+        cfg.tts_url = ""
+        captured_cfgs.append(cfg)
+        return cfg
+
+    monkeypatch.setattr(llm_cfg_mod.LLMConfig, "from_env_or_file", _wrapped_from_env)
+    create_zero_gotchi_app(adapter=adapter, live_mode_enabled=False)
+    assert len(captured_cfgs) == 1
+    assert captured_cfgs[0].tts_model == "gemini-3.1-flash-tts-preview"
+    assert "2.5-flash" not in captured_cfgs[0].tts_model
+    shutdown_lomin_background_workers(timeout_s=0.5)
+
 
 
 

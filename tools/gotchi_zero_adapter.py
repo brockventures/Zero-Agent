@@ -25,7 +25,7 @@ Unifies the GOTCHI hardware companion (`brockventures/gotchi`) and `#zero-voice`
      ensures Gotchi verbally tells Ryan to check `#zero-chat`.
 
 3. Speed & Latency Optimizations:
-   - `ThinkingConfig(thinking_budget=128)` by default on `gemini-2.5-flash` (ensures fact
+   - `ThinkingConfig(thinking_level="LOW")` / `thinking_budget=128` by default (ensures fact
      connection and tool reliability with ~50ms latency; auto-elevates to `256` on tool synthesis,
      `512` on errors/bursts/step 2+, and `1024` on deep queries).
    - Persistent `genai.Client` singleton keeps HTTP/2 TLS connections warm across turns.
@@ -561,7 +561,7 @@ def select_thinking_budget(
     model_requested_deep_thinking: bool = False,
 ) -> int:
     """
-    3-Tier Thinking Budget equivalent for `gemini-2.5-flash`:
+    3-Tier Thinking Budget equivalent for token-budget Flash models (e.g. `gemini-3.1-flash-lite-preview`):
     - Tier 1 (`LOW`): `128` tokens on Step 0, `256` tokens on Step 1 (tool synthesis).
     - Tier 2 (`MEDIUM`): `512` tokens on tool error, Step 2+, or 5-frame camera burst.
     - Tier 3 (`HIGH`): `1024` tokens when `request_deep_thinking` is invoked.
@@ -586,7 +586,7 @@ def build_thinking_config(
     burst_count: int = 0,
     model_requested_deep_thinking: bool = False,
 ) -> Any:
-    """Builds the 3-tier `types.ThinkingConfig` for either Gemini 3.8 or 2.5 Flash."""
+    """Builds the 3-tier `types.ThinkingConfig` using thinking_level (Gemini 3.6-3.8) or thinking_budget."""
     from google.genai import types
 
     m_lower = (model or "").lower()
@@ -2745,11 +2745,12 @@ def push_gotchi_pending_notification(
 
         gotchi_store = PendingVoiceAnswerStore()
         ans_rec = gotchi_store.save_answer(
+            answer_id=f"ans-{int(time.time() * 1000)}",
             node_id=clean_node,
             session_id=f"pending-{int(time.time() * 1000)}",
             prompt=clean_prompt,
             spoken_text=clean_answer,
-            full_text=answer or clean_answer,
+            full_answer=answer or clean_answer,
             topic=clean_topic,
         )
         gotchi_store.save_notification(
@@ -4397,7 +4398,7 @@ class GotchiZeroBrainAdapter:
             if callable(stream_fn):
                 async def _iter_stream_with_fallback():
                     models_to_try = [live_model]
-                    for fb in ("gemini-2.5-flash", "gemini-2.0-flash"):
+                    for fb in ("gemini-3.8-flash", "gemini-3.1-flash-lite-preview"):
                         if fb not in models_to_try:
                             models_to_try.append(fb)
                     last_err = None
@@ -5305,7 +5306,7 @@ def create_zero_gotchi_app(
     ):
         cfg.tts_engine = os.environ.get("MVG_TTS", "gemini") or "gemini"
         if "GOTCHI_TTS_MODEL" not in os.environ:
-            cfg.tts_model = "gemini-2.5-flash-preview-tts"
+            cfg.tts_model = "gemini-3.1-flash-tts-preview"
     if "GOTCHI_FILLER_DELAY_MS" not in os.environ:
         cfg.filler_delay_ms = 0
     if "GOTCHI_SECOND_FILLER_DELAY_MS" not in os.environ:
@@ -5510,11 +5511,12 @@ def create_zero_gotchi_app(
                 clean_ans = lomin_strip_defer_marker(spoken_reply) if lomin_strip_defer_marker else spoken_reply
                 get_lomin_pending_store().store(node_id=node_id, prompt=prompt, answer=clean_ans)
                 voice_srv.pending_answer_store.save_answer(
+                    answer_id=f"ans-{int(time.time() * 1000)}",
                     node_id=node_id,
                     session_id=session_id,
                     prompt=prompt,
                     spoken_text=clean_ans,
-                    full_text=raw_reply,
+                    full_answer=raw_reply,
                 )
 
         if lomin_strip_defer_marker is not None:
@@ -5715,14 +5717,24 @@ def create_zero_gotchi_app(
         item: Dict[str, Any] = {}
         if get_lomin_pending_store is not None:
             item = get_lomin_pending_store().store(node_id=node_id, prompt=prompt, answer=answer, topic=topic)
-        voice_srv.pending_answer_store.save_answer(
+        ans_rec = voice_srv.pending_answer_store.save_answer(
+            answer_id=f"ans-{int(time.time() * 1000)}",
             node_id=node_id,
             session_id=f"pending-{int(time.time() * 1000)}",
             prompt=prompt,
             spoken_text=answer,
-            full_text=answer,
+            full_answer=answer,
             topic=topic,
         )
+        if not item:
+            item = {
+                "id": ans_rec.get("answer_id", ""),
+                "node_id": node_id,
+                "prompt": prompt,
+                "answer": answer,
+                "topic": topic,
+                "created_at": ans_rec.get("created_at", time.time()),
+            }
         return JSONResponse(
             status_code=200,
             content={"status": "ok", "stored": True, "pending": item, "item": item, "node": node_id},
