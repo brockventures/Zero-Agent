@@ -44,6 +44,8 @@ class TestCashSweepMonitor(unittest.TestCase):
         ok, report, meta = evaluate_cash_sweep(test=True, post=False, quiet=True)
 
         self.assertTrue(ok)
+        self.assertFalse(meta["decision_staged"])
+        self.assertIn("[CHOICES:", report)
         self.assertEqual(meta["checking_balance"], 30000.0)
         self.assertEqual(meta["wf_cash_balance"], 100000.0)
         self.assertEqual(meta["gross_cash"], 130000.0)
@@ -51,6 +53,13 @@ class TestCashSweepMonitor(unittest.TestCase):
         self.assertEqual(meta["net_liquidity"], 120000.0)
         self.assertEqual(meta["excess_net"], 20000.0)
         self.assertIn("Deploy **`$20,000.00`** into **`Wealthfront Joint Investment (MZT3)`**", report)
+
+        with patch("tools.forge.stage_decision") as mock_stage:
+            ok2, report2, meta2 = evaluate_cash_sweep(test=False, post=False, quiet=True)
+            self.assertTrue(ok2)
+            self.assertFalse(meta2["decision_staged"])
+            self.assertIn("[CHOICES:", report2)
+            mock_stage.assert_not_called()
 
     @patch("tools.cash_sweep_monitor.Actual")
     @patch("tools.cash_sweep_monitor.get_accounts")

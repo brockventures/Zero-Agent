@@ -296,9 +296,17 @@ class TestRedditFantasyScanner(unittest.TestCase):
         self.assertIn("--draft", cmd)
 
     @patch("tools.pixel_browser.pixel_session")
-    @patch("playwright.sync_api.sync_playwright")
-    def test_post_draft_reply_via_pixel_upvotes_and_posts_comment(self, mock_pw, mock_pixel_session):
+    def test_post_draft_reply_via_pixel_upvotes_and_posts_comment(self, mock_pixel_session):
         """Verify post_draft_reply_via_pixel evaluates Old Reddit API upvote + comment and returns permalink."""
+        import types
+        from unittest.mock import MagicMock
+
+        mock_pw_mod = types.ModuleType("playwright")
+        mock_sync_api = types.ModuleType("playwright.sync_api")
+        mock_pw = MagicMock()
+        mock_sync_api.sync_playwright = mock_pw
+        mock_pw_mod.sync_api = mock_sync_api
+
         mock_pixel_session.return_value.__enter__.return_value = "http://127.0.0.1:9223"
         mock_page = mock_pw.return_value.__enter__.return_value.chromium.connect_over_cdp.return_value.contexts[0].pages[0]
         mock_page.url = "https://old.reddit.com/r/fantasybaseball/"
@@ -308,12 +316,13 @@ class TestRedditFantasyScanner(unittest.TestCase):
             "thing_id": "t1_xyz789",
         }
 
-        ok, permalink = post_draft_reply_via_pixel(
-            thread_url="https://www.reddit.com/r/fantasybaseball/comments/abc123/nightly/",
-            author="KeeperKing",
-            draft_text="Hold Merrill for the elite contact floor.",
-            thing_id="t1_xyz789",
-        )
+        with patch.dict(sys.modules, {"playwright": mock_pw_mod, "playwright.sync_api": mock_sync_api}):
+            ok, permalink = post_draft_reply_via_pixel(
+                thread_url="https://www.reddit.com/r/fantasybaseball/comments/abc123/nightly/",
+                author="KeeperKing",
+                draft_text="Hold Merrill for the elite contact floor.",
+                thing_id="t1_xyz789",
+            )
         self.assertTrue(ok)
         self.assertIn("/comments/abc123/nightly/new_reply_1/", permalink)
         mock_page.evaluate.assert_called_once()

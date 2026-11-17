@@ -38,7 +38,7 @@ FINANCES_CHANNEL_ID = 1544955532765560924
 # Model policy constants
 RESERVE_TARGET = 100000.00  # $100,000 liquid cash floor per Personal Financial Model
 
-def evaluate_cash_sweep(test: bool = False, post: bool = False, quiet: bool = False, stage: bool | None = None) -> tuple[bool, str, dict]:
+def evaluate_cash_sweep(test: bool = False, post: bool = False, quiet: bool = False, stage: bool = False) -> tuple[bool, str, dict]:
     """
     Evaluates current cash positions against the $100k liquid reserve floor.
     Returns (success: bool, report_markdown: str, metadata: dict)
@@ -121,7 +121,7 @@ def evaluate_cash_sweep(test: bool = False, post: bool = False, quiet: bool = Fa
                 choices_block = "[CHOICES: Re-evaluate Next Month | View Asset Ledger]"
 
             decision_staged = False
-            if excess_net >= 1000.0 and (not test or stage is True):
+            if excess_net >= 1000.0 and stage is True:
                 try:
                     from tools.forge import stage_decision
 

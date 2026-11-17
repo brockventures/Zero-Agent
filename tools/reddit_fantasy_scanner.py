@@ -745,7 +745,7 @@ def run_reddit_fantasy_scanner(
     quiet: bool = False,
     post_discord: bool = False,
     channel_id: Optional[int] = None,
-    stage: Optional[bool] = None,
+    stage: bool = False,
     *args, **kwargs
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """Execution entry point conforming to the 5-layer sidecar contract."""
@@ -799,7 +799,7 @@ def run_reddit_fantasy_scanner(
         save_state(state)
 
     dest_cid = channel_id or ZERO_CHAT_CHANNEL_ID
-    should_stage = bool(stage) if stage is not None else False
+    should_stage = stage is True
     decision_staged = False
     if should_stage and selected.get("quality_score", 0) >= (0 if test else 40):
         dec = stage_fantasy_decision(selected, draft, channel_id=dest_cid, post_to_discord=post_discord)
@@ -828,7 +828,7 @@ def main():
     parser.add_argument("--quiet", action="store_true", help="Suppress logging")
     parser.add_argument("--post-discord", action="store_true", help="Post candidate draft card to Discord")
     parser.add_argument("--channel-id", type=int, default=ZERO_CHAT_CHANNEL_ID, help="Destination Discord channel ID")
-    parser.add_argument("--stage", action="store_true", default=None, help="Force staging decision card even in test mode")
+    parser.add_argument("--stage", action="store_true", default=False, help="Force staging decision card even in test mode")
     parser.add_argument("--no-stage", dest="stage", action="store_false", help="Disable staging persistent decision card")
     parser.add_argument("--post-draft", action="store_true", help="Post approved draft reply to Reddit via u/prime416")
     parser.add_argument("--author", type=str, default="", help="Target author for draft reply")

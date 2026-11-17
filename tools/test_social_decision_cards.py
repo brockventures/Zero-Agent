@@ -305,7 +305,7 @@ def test_social_last_seen_review_fallback_on_stage_failure(tmp_path: Path):
         has_events, msg = social_last_seen_review.format_review_message(updates, stage=True)
         assert has_events is True
         assert "Morgan Stone" in msg
-        assert "[CHOICES: Confirm & Apply Last Seen Updates | Ignore Last Seen Updates]" in msg
+        assert "[CHOICES: Confirm All Last Seen Updates | Dismiss]" in msg
         assert social_last_seen_review.LAST_DECISION_STAGED is False
         assert all(u.get("_decision_staged") is False for u in updates)
 
@@ -984,13 +984,20 @@ def test_explicit_stage_false_suppresses_staging(tmp_path: Path):
         assert matched[0].get("_decision_staged") is False
 
 
-def test_should_stage_helper_matrix():
+def test_should_stage_helper_matrix(monkeypatch):
     """Verify _should_stage across all three modules."""
+    monkeypatch.delenv("STAGE_DECISION_CARDS", raising=False)
     for mod in (social_last_seen_review, core_friends_reminder):
         assert mod._should_stage(True) is True
         assert mod._should_stage(False) is False
-        # Running under pytest, so stage=None must return False
+        # Default stage=None returns False unless STAGE_DECISION_CARDS=1 is set
         assert mod._should_stage(None) is False
+
+    monkeypatch.setenv("STAGE_DECISION_CARDS", "1")
+    for mod in (social_last_seen_review, core_friends_reminder):
+        assert mod._should_stage(None) is True
+        assert mod._should_stage(False) is False
+
     assert birthday_reminder._should_stage(True) is False
     assert birthday_reminder._should_stage(False) is False
     assert birthday_reminder._should_stage(None) is False

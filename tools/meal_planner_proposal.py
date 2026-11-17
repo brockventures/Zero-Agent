@@ -547,7 +547,7 @@ def generate_proposal(ref_date: datetime | None = None, force: bool = False, sta
     now = ref_date or datetime.now(PT)
     dates = get_target_cooking_dates(now)
 
-    should_stage = bool(stage)
+    should_stage = stage is True
 
     if not force:
         active = load_active_plan()

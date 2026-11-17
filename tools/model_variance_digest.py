@@ -58,7 +58,7 @@ MODEL_MONTHLY_TARGETS = {
     "Digital Subscriptions & Cloud": 80.00,
 }
 
-def generate_variance_digest(target_month: str = "", test: bool = False, post: bool = False, quiet: bool = False, stage: bool | None = None) -> tuple[bool, str, dict]:
+def generate_variance_digest(target_month: str = "", test: bool = False, post: bool = False, quiet: bool = False, stage: bool = False) -> tuple[bool, str, dict]:
     """
     Evaluates monthly actual spending against model baselines.
     target_month: 'YYYY-MM' or 'YYYYMM'. Defaults to preceding completed month.
@@ -195,7 +195,7 @@ def generate_variance_digest(target_month: str = "", test: bool = False, post: b
             lines.append("[CHOICES: Run Trailing 3-Month Audit | View Category Breakdown | Done]")
 
             decision_staged = False
-            if actionable_overages and (not test or stage is True):
+            if actionable_overages and stage is True:
                 try:
                     from tools.forge import stage_decision
 

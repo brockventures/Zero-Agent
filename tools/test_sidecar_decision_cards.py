@@ -83,11 +83,16 @@ class TestCashSweepDecisionCards:
 
         assert ok is True
         assert meta["excess_net"] == 30000.0
-        assert meta["decision_staged"] is True
+        assert meta["decision_staged"] is False
         assert "Deterministic CFO Policy" in report
+        assert "[CHOICES:" in report
         assert "Preserves the core **$100,000.00** liquid emergency floor" in meta["cfo_rationale"]
+        mock_stage.assert_not_called()
 
-        # Verify Decision Card staged with correct payload and target channel
+        # Explicit stage=True still stages the Decision Card with correct payload and target channel
+        ok_s, report_s, meta_s = evaluate_cash_sweep(test=False, post=False, quiet=True, stage=True)
+        assert ok_s is True
+        assert meta_s["decision_staged"] is True
         mock_stage.assert_called_once()
         kws = mock_stage.call_args.kwargs
         assert kws["category"] == "cash_sweep"
@@ -233,11 +238,18 @@ class TestModelVarianceDigestDecisionCards:
 
             assert ok is True
             assert meta["actionable_overages_count"] >= 1
-            assert meta["decision_staged"] is True
+            assert meta["decision_staged"] is False
             assert meta["llm_called"] is True
+            assert "[CHOICES: Run Trailing 3-Month Audit | View Category Breakdown | Done]" in report
             mock_llm.assert_called_once()
+            mock_stage.assert_not_called()
 
-            # Verify Decision Card was staged with appropriate metadata
+            # Explicit stage=True still stages the Decision Card with appropriate metadata
+            ok_s, report_s, meta_s = generate_variance_digest(
+                target_month="2026-09", test=False, post=False, quiet=True, stage=True
+            )
+            assert ok_s is True
+            assert meta_s["decision_staged"] is True
             mock_stage.assert_called_once()
             kws = mock_stage.call_args.kwargs
             assert kws["category"] == "budget_variance"
@@ -452,201 +464,221 @@ class TestSidecarDecisionStagedMetadata:
 class TestSchedulerDoublePostSuppression:
     """Verifies that bridge_scheduler suppresses duplicate plain-text messages when decision_staged=True."""
 
-    @pytest.mark.asyncio
-    async def test_birthday_reminder_double_post_suppressed(self):
+    def test_birthday_reminder_double_post_suppressed(self):
+        import asyncio
         import tools.bridge_scheduler as bshed
         from unittest.mock import AsyncMock
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        mock_bot = MagicMock()
-        mock_channel = AsyncMock()
-        mock_bot.get_channel.return_value = mock_channel
+        async def _run():
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            mock_bot = MagicMock()
+            mock_channel = AsyncMock()
+            mock_bot.get_channel.return_value = mock_channel
 
-        # Staged is True -> send should NOT be called
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🎂 Birthday Alert", {"has_items": True, "decision_staged": True})):
-            await bshed.dispatch_scheduled_prompt(
-                "Check for friend & family birthdays today",
-                "Daily Birthday Reminder",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_not_called()
+            # Staged is True -> send should NOT be called
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🎂 Birthday Alert", {"has_items": True, "decision_staged": True})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Check for friend & family birthdays today",
+                    "Daily Birthday Reminder",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_not_called()
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        # Staged is False -> send SHOULD be called
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🎂 Birthday Alert", {"has_items": True, "decision_staged": False})):
-            await bshed.dispatch_scheduled_prompt(
-                "Check for friend & family birthdays today",
-                "Daily Birthday Reminder",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_called_once()
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            # Staged is False -> send SHOULD be called
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🎂 Birthday Alert", {"has_items": True, "decision_staged": False})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Check for friend & family birthdays today",
+                    "Daily Birthday Reminder",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_social_last_seen_review_double_post_suppressed(self):
+        asyncio.run(_run())
+
+    def test_social_last_seen_review_double_post_suppressed(self):
+        import asyncio
         import tools.bridge_scheduler as bshed
         from unittest.mock import AsyncMock
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        mock_bot = MagicMock()
-        mock_channel = AsyncMock()
-        mock_bot.get_channel.return_value = mock_channel
+        async def _run():
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            mock_bot = MagicMock()
+            mock_channel = AsyncMock()
+            mock_bot.get_channel.return_value = mock_channel
 
-        # Staged is True -> send should NOT be called
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🗓️ Social Review", {"has_items": True, "decision_staged": True})):
-            await bshed.dispatch_scheduled_prompt(
-                "Review past week for social gatherings using /workspace/tools/social_last_seen_review.py",
-                "Weekly Social & Last Seen Review",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_not_called()
+            # Staged is True -> send should NOT be called
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🗓️ Social Review", {"has_items": True, "decision_staged": True})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Review past week for social gatherings using /workspace/tools/social_last_seen_review.py",
+                    "Weekly Social & Last Seen Review",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_not_called()
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        # Staged is False -> send SHOULD be called
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🗓️ Social Review", {"has_items": True, "decision_staged": False})):
-            await bshed.dispatch_scheduled_prompt(
-                "Review past week for social gatherings using /workspace/tools/social_last_seen_review.py",
-                "Weekly Social & Last Seen Review",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_called_once()
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            # Staged is False -> send SHOULD be called
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🗓️ Social Review", {"has_items": True, "decision_staged": False})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Review past week for social gatherings using /workspace/tools/social_last_seen_review.py",
+                    "Weekly Social & Last Seen Review",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_core_friends_reminder_double_post_suppressed(self):
+        asyncio.run(_run())
+
+    def test_core_friends_reminder_double_post_suppressed(self):
+        import asyncio
         import tools.bridge_scheduler as bshed
         from unittest.mock import AsyncMock
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        mock_bot = MagicMock()
-        mock_channel = AsyncMock()
-        mock_bot.get_channel.return_value = mock_channel
+        async def _run():
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            mock_bot = MagicMock()
+            mock_channel = AsyncMock()
+            mock_bot.get_channel.return_value = mock_channel
 
-        # Staged is True -> send should NOT be called
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "👥 Core Friends Alert", {"has_items": True, "decision_staged": True})):
-            await bshed.dispatch_scheduled_prompt(
-                "Monthly check for local Core friends not seen using /workspace/tools/core_friends_reminder.py",
-                "Monthly Core Friends Social Planning Reminder",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_not_called()
+            # Staged is True -> send should NOT be called
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "👥 Core Friends Alert", {"has_items": True, "decision_staged": True})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Monthly check for local Core friends not seen using /workspace/tools/core_friends_reminder.py",
+                    "Monthly Core Friends Social Planning Reminder",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_not_called()
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        # Staged is False -> send SHOULD be called
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "👥 Core Friends Alert", {"has_items": True, "decision_staged": False})):
-            await bshed.dispatch_scheduled_prompt(
-                "Monthly check for local Core friends not seen using /workspace/tools/core_friends_reminder.py",
-                "Monthly Core Friends Social Planning Reminder",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_called_once()
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            # Staged is False -> send SHOULD be called
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "👥 Core Friends Alert", {"has_items": True, "decision_staged": False})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Monthly check for local Core friends not seen using /workspace/tools/core_friends_reminder.py",
+                    "Monthly Core Friends Social Planning Reminder",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_weekly_meal_proposal_double_post_suppressed(self):
+        asyncio.run(_run())
+
+    def test_weekly_meal_proposal_double_post_suppressed(self):
+        import asyncio
         import tools.bridge_scheduler as bshed
         from unittest.mock import AsyncMock
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        mock_bot = MagicMock()
-        mock_channel = AsyncMock()
-        mock_bot.get_channel.return_value = mock_channel
+        async def _run():
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            mock_bot = MagicMock()
+            mock_channel = AsyncMock()
+            mock_bot.get_channel.return_value = mock_channel
 
-        # Staged is True -> send should NOT be called
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🍽️ Menu Proposal", {"has_items": True, "decision_staged": True})):
-            await bshed.dispatch_scheduled_prompt(
-                "Generate the weekly meal proposal using /workspace/tools/meal_planner_proposal.py",
-                "Weekly 3-Dinner Meal Proposal",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_not_called()
+            # Staged is True -> send should NOT be called
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🍽️ Menu Proposal", {"has_items": True, "decision_staged": True})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Generate the weekly meal proposal using /workspace/tools/meal_planner_proposal.py",
+                    "Weekly 3-Dinner Meal Proposal",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_not_called()
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        # Staged is False -> send SHOULD be called
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🍽️ Menu Proposal", {"has_items": True, "decision_staged": False})):
-            await bshed.dispatch_scheduled_prompt(
-                "Generate the weekly meal proposal using /workspace/tools/meal_planner_proposal.py",
-                "Weekly 3-Dinner Meal Proposal",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_called_once()
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            # Staged is False -> send SHOULD be called
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🍽️ Menu Proposal", {"has_items": True, "decision_staged": False})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Generate the weekly meal proposal using /workspace/tools/meal_planner_proposal.py",
+                    "Weekly 3-Dinner Meal Proposal",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_weekly_meal_proposal_with_image_attachment(self, tmp_path):
+        asyncio.run(_run())
+
+    def test_weekly_meal_proposal_with_image_attachment(self, tmp_path):
+        import asyncio
         import tools.bridge_scheduler as bshed
         from unittest.mock import AsyncMock
         import discord
 
-        test_img = tmp_path / "weekly_menu_triptych.jpg"
-        test_img.write_text("mock image bytes")
+        async def _run():
+            test_img = tmp_path / "weekly_menu_triptych.jpg"
+            test_img.write_text("mock image bytes")
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        mock_bot = MagicMock()
-        mock_channel = AsyncMock()
-        mock_bot.get_channel.return_value = mock_channel
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            mock_bot = MagicMock()
+            mock_channel = AsyncMock()
+            mock_bot.get_channel.return_value = mock_channel
 
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🍽️ Menu Proposal", {"has_items": True, "decision_staged": False, "image_path": str(test_img)})):
-            await bshed.dispatch_scheduled_prompt(
-                "Generate the weekly meal proposal using /workspace/tools/meal_planner_proposal.py",
-                "Weekly 3-Dinner Meal Proposal",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_called_once()
-            _, kwargs = mock_channel.send.call_args
-            assert "file" in kwargs
-            assert isinstance(kwargs["file"], discord.File)
-            assert kwargs["file"].filename == "weekly_menu_triptych.jpg"
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "🍽️ Menu Proposal", {"has_items": True, "decision_staged": False, "image_path": str(test_img)})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Generate the weekly meal proposal using /workspace/tools/meal_planner_proposal.py",
+                    "Weekly 3-Dinner Meal Proposal",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_called_once()
+                _, kwargs = mock_channel.send.call_args
+                assert "file" in kwargs
+                assert isinstance(kwargs["file"], discord.File)
+                assert kwargs["file"].filename == "weekly_menu_triptych.jpg"
 
-    @pytest.mark.asyncio
-    async def test_swap_button_choice_with_image_attachment(self, tmp_path):
+        asyncio.run(_run())
+
+    def test_swap_button_choice_with_image_attachment(self, tmp_path):
         import asyncio
         import tools.bridge_commands as bcmd
         from unittest.mock import AsyncMock
 
-        test_img = tmp_path / "weekly_menu_triptych.jpg"
-        test_img.write_text("mock image bytes")
+        async def _run():
+            test_img = tmp_path / "weekly_menu_triptych.jpg"
+            test_img.write_text("mock image bytes")
 
-        mock_interaction = MagicMock()
-        mock_channel = AsyncMock()
-        mock_interaction.channel = mock_channel
+            mock_interaction = MagicMock()
+            mock_channel = AsyncMock()
+            mock_interaction.channel = mock_channel
 
-        mock_plan = {"image_path": str(test_img)}
-        turn_queue = asyncio.Queue()
-        with patch("tools.meal_planner_proposal.swap_slot", return_value=(True, "Swapped menu proposal [CHOICES: Lock In Menu]")), \
-             patch("tools.meal_planner_proposal.load_active_plan", return_value=mock_plan):
-            await bcmd.handle_button_choice("Swap Tuesday", mock_interaction, turn_queue)
-            # Expect 2 channel sends: the '🔘 Selected:' message and the proposal message with attachment
-            assert mock_channel.send.call_count == 2
-            second_call = mock_channel.send.call_args_list[1]
-            kwargs = second_call.kwargs
-            assert "file" in kwargs
-            assert kwargs["file"].filename == "weekly_menu_triptych.jpg"
+            mock_plan = {"image_path": str(test_img)}
+            turn_queue = asyncio.Queue()
+            with patch("tools.meal_planner_proposal.swap_slot", return_value=(True, "Swapped menu proposal [CHOICES: Lock In Menu]")), \
+                 patch("tools.meal_planner_proposal.load_active_plan", return_value=mock_plan):
+                await bcmd.handle_button_choice("Swap Tuesday", mock_interaction, turn_queue)
+                # Expect 2 channel sends: the '🔘 Selected:' message and the proposal message with attachment
+                assert mock_channel.send.call_count == 2
+                second_call = mock_channel.send.call_args_list[1]
+                kwargs = second_call.kwargs
+                assert "file" in kwargs
+                assert kwargs["file"].filename == "weekly_menu_triptych.jpg"
 
-    @pytest.mark.asyncio
-    async def test_reddit_fantasy_scanner_double_post_suppressed(self):
+        asyncio.run(_run())
+
+    def test_reddit_fantasy_scanner_double_post_suppressed(self):
+        import asyncio
         import tools.bridge_scheduler as bshed
         from unittest.mock import AsyncMock
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        mock_bot = MagicMock()
-        mock_channel = AsyncMock()
-        mock_bot.get_channel.return_value = mock_channel
+        async def _run():
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            mock_bot = MagicMock()
+            mock_channel = AsyncMock()
+            mock_bot.get_channel.return_value = mock_channel
 
-        # Staged is True -> send should NOT be called
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "⚾ Draft Dilemma Card", {"selected": {}, "decision_staged": True})):
-            await bshed.dispatch_scheduled_prompt(
-                "Scan r/fantasybaseball comments using /workspace/tools/reddit_fantasy_scanner.py",
-                "Reddit Fantasy Baseball Scanner",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_not_called()
+            # Staged is True -> send should NOT be called
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "⚾ Draft Dilemma Card", {"selected": {}, "decision_staged": True})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Scan r/fantasybaseball comments using /workspace/tools/reddit_fantasy_scanner.py",
+                    "Reddit Fantasy Baseball Scanner",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_not_called()
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        # Staged is False -> send SHOULD be called
-        with patch("tools.sidecars.run_sidecar_job", return_value=(True, "⚾ Draft Dilemma Card", {"selected": {}, "decision_staged": False})):
-            await bshed.dispatch_scheduled_prompt(
-                "Scan r/fantasybaseball comments using /workspace/tools/reddit_fantasy_scanner.py",
-                "Reddit Fantasy Baseball Scanner",
-                bot=mock_bot
-            )
-            mock_channel.send.assert_called_once()
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            # Staged is False -> send SHOULD be called
+            with patch("tools.sidecars.run_sidecar_job", return_value=(True, "⚾ Draft Dilemma Card", {"selected": {}, "decision_staged": False})):
+                await bshed.dispatch_scheduled_prompt(
+                    "Scan r/fantasybaseball comments using /workspace/tools/reddit_fantasy_scanner.py",
+                    "Reddit Fantasy Baseball Scanner",
+                    bot=mock_bot
+                )
+                mock_channel.send.assert_called_once()
+
+        asyncio.run(_run())
 
 
 # ==============================================================================
@@ -677,36 +709,39 @@ class TestHearthWeeklySyncSchedule:
         captured = capsys.readouterr()
         assert "hearth-core healthy (Up 2 days)" in captured.out
 
-    @pytest.mark.asyncio
-    async def test_bridge_scheduler_hearth_weekly_sync_dispatch(self):
+    def test_bridge_scheduler_hearth_weekly_sync_dispatch(self):
+        import asyncio
         import tools.bridge_scheduler as bshed
         from unittest.mock import AsyncMock
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        mock_bot = MagicMock()
-        mock_channel = AsyncMock()
-        mock_bot.get_channel.return_value = mock_channel
+        async def _run():
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            mock_bot = MagicMock()
+            mock_channel = AsyncMock()
+            mock_bot.get_channel.return_value = mock_channel
 
-        # Nominal healthy status (no update) -> silent, no Discord message posted
-        with patch("tools.hearth_sync.sync_hearth", return_value=(True, "hearth-core healthy (Up 2 days)")):
-            await bshed.dispatch_scheduled_prompt(
-                "Run the weekly Hearth upstream Mirrormere sync using /workspace/tools/sidecars.py hearth_sync.",
-                "Hearth Upstream Mirrormere Weekly Sync",
-                bot=mock_bot,
-                job_id="hearth_weekly_sync",
-            )
-            mock_channel.send.assert_not_called()
+            # Nominal healthy status (no update) -> silent, no Discord message posted
+            with patch("tools.hearth_sync.sync_hearth", return_value=(True, "hearth-core healthy (Up 2 days)")):
+                await bshed.dispatch_scheduled_prompt(
+                    "Run the weekly Hearth upstream Mirrormere sync using /workspace/tools/sidecars.py hearth_sync.",
+                    "Hearth Upstream Mirrormere Weekly Sync",
+                    bot=mock_bot,
+                    job_id="hearth_weekly_sync",
+                )
+                mock_channel.send.assert_not_called()
 
-        bshed.LAST_SCHEDULED_DISPATCH.clear()
-        # Failure status -> posts alert to HOMELAB_CHANNEL_ID
-        with patch("tools.hearth_sync.sync_hearth", return_value=(False, "hearth-core container not Up")):
-            await bshed.dispatch_scheduled_prompt(
-                "Run the weekly Hearth upstream Mirrormere sync using /workspace/tools/sidecars.py hearth_sync.",
-                "Hearth Upstream Mirrormere Weekly Sync",
-                bot=mock_bot,
-                job_id="hearth_weekly_sync",
-            )
-            mock_channel.send.assert_called_once()
+            bshed.LAST_SCHEDULED_DISPATCH.clear()
+            # Failure status -> posts alert to HOMELAB_CHANNEL_ID
+            with patch("tools.hearth_sync.sync_hearth", return_value=(False, "hearth-core container not Up")):
+                await bshed.dispatch_scheduled_prompt(
+                    "Run the weekly Hearth upstream Mirrormere sync using /workspace/tools/sidecars.py hearth_sync.",
+                    "Hearth Upstream Mirrormere Weekly Sync",
+                    bot=mock_bot,
+                    job_id="hearth_weekly_sync",
+                )
+                mock_channel.send.assert_called_once()
+
+        asyncio.run(_run())
 
 
 # ==============================================================================

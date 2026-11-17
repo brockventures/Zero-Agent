@@ -34,12 +34,15 @@ LAST_DECISION_STAGED: bool = False
 
 
 def _should_stage(stage: bool | None) -> bool:
-    """Determine whether a Decision Card should be staged."""
+    """Determine whether a Decision Card should be staged.
+
+    Defaults to False when stage is None unless STAGE_DECISION_CARDS=1 is set.
+    """
     if stage is True:
         return True
     if stage is False:
         return False
-    return "pytest" not in sys.modules and not os.environ.get("PYTEST_CURRENT_TEST")
+    return os.environ.get("STAGE_DECISION_CARDS") == "1"
 
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
@@ -535,7 +538,7 @@ def format_review_message(updates: list[dict], stage: bool | None = None) -> tup
             u["_decision_staged"] = False
 
     if not decision_staged:
-        lines.append("\n[CHOICES: Confirm & Apply Last Seen Updates | Ignore Last Seen Updates]")
+        lines.append("\n[CHOICES: Confirm All Last Seen Updates | Dismiss]")
 
     return True, "\n".join(lines)
 
