@@ -650,7 +650,10 @@ def format_audit_summary(
     ]
 
     if recommendations:
-        lines.append(f"- **Tuning Actions ({staged_count} staged in #zero-ops):**")
+        if staged_count > 0:
+            lines.append(f"- **Tuning Actions ({staged_count} staged in #zero-ops):**")
+        else:
+            lines.append("- **Tuning Observations (report-only):**")
         for r in recommendations[:4]:
             lines.append(f"  • {r['title']} ({r['reason']})")
     else:
@@ -672,15 +675,16 @@ def run_usage_telemetry_audit(
     days: int | float = 7,
     dry_run: bool = False,
     test: bool = False,
-    post_cards: bool = True,
+    post_cards: bool = False,
     db_path: Path | str = FORGE_DB_PATH,
     channel_history_path: Path | str | None = None,
     sidecar_history_path: Path | str | None = None,
     schedule_path: Path | str | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     """
-    Execute full telemetry audit over lookback window, stage tuning Decision Cards
-    in #zero-ops (1544953279664889888), and return (ok, concise_summary, audit_data).
+    Execute full telemetry audit over lookback window and return (ok, concise_summary, audit_data).
+    By default (post_cards=False), reports funnel and engagement metrics cleanly without staging
+    Decision Cards in #zero-ops unless explicitly requested via post_cards=True.
     """
     funnel = analyze_decision_card_funnel(days=days, db_path=db_path)
     engagement = analyze_channel_and_sidecar_engagement(
@@ -692,9 +696,10 @@ def run_usage_telemetry_audit(
     recommendations = synthesize_tuning_recommendations(funnel, engagement, schedule_path=schedule_path)
 
     staged_decision_ids: list[str] = []
-    should_post = post_cards and not test and not dry_run
+    should_stage = bool(post_cards) and not dry_run
+    should_post = should_stage and not test
 
-    if not dry_run:
+    if should_stage:
         for rec in recommendations:
             try:
                 res = stage_decision(
@@ -860,7 +865,8 @@ def main() -> int:
     parser.add_argument("--days", type=float, default=7.0, help="Audit lookback window in days")
     parser.add_argument("--dry-run", action="store_true", help="Inspect without modifying or staging")
     parser.add_argument("--test", action="store_true", help="Test mode (suppresses Discord API delivery)")
-    parser.add_argument("--no-post-cards", action="store_true", help="Do not post cards to Discord REST")
+    parser.add_argument("--post-cards", action="store_true", help="Explicitly stage and post tuning Decision Cards to #zero-ops")
+    parser.add_argument("--no-post-cards", action="store_true", help="Do not post cards to Discord REST (default)")
     parser.add_argument("--db-path", type=str, default=str(FORGE_DB_PATH), help="Path to SQLite database")
     parser.add_argument("--schedule-path", type=str, default=None, help="Path to schedule.json")
     parser.add_argument("--channel-history-path", type=str, default=None, help="Path to channel_history.json")
@@ -899,7 +905,7 @@ def main() -> int:
         days=args.days,
         dry_run=args.dry_run,
         test=args.test,
-        post_cards=not args.no_post_cards,
+        post_cards=args.post_cards and not args.no_post_cards,
         db_path=args.db_path,
         channel_history_path=args.channel_history_path,
         sidecar_history_path=args.sidecar_history_path,

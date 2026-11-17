@@ -19,7 +19,7 @@ for _p in [str(_CURRENT_DIR), str(_WORKSPACE_DIR)]:
 if "tools" in sys.modules:
     sys.modules["tools"].__path__ = [str(_CURRENT_DIR)]
 
-from tools.forge import _validate_decision_shell_payload, init_forge_db
+from tools.forge import init_forge_db
 
 # Re-ensure worktree is at head of sys.path after forge import
 for _p in [str(_CURRENT_DIR), str(_WORKSPACE_DIR)]:
@@ -57,7 +57,7 @@ def test_midweek_grocery_silent_when_zero_items(test_db: Path) -> None:
 
 
 def test_midweek_grocery_stages_card_with_staples_and_tasks(test_db: Path) -> None:
-    """Aggregates due staples and pending tasks into a single shopping Decision Card."""
+    """Aggregates due staples and pending tasks into a clean direct shopping alert without staging a card."""
     override = {
         "due_staples": [
             {"id": "milk", "name": "Organic Whole Milk", "days_elapsed": 7, "cadence_days": 7},
@@ -76,29 +76,19 @@ def test_midweek_grocery_stages_card_with_staples_and_tasks(test_db: Path) -> No
         items_override=override,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
     assert meta["due_staples_count"] == 2
     assert meta["task_items_count"] == 2
     assert meta["total_items"] == 4
     assert "Organic Whole Milk" in summary
     assert "Avocado oil spray" in summary
+    assert "**Approve Action:**" not in summary
 
     conn = sqlite3.connect(test_db)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (meta["decision_id"],)).fetchone()
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
     conn.close()
-
-    assert row is not None
-    assert row["category"] == "shopping"
-    assert row["channel_id"] == CHANNEL_SHOPPING
-    assert row["handler_type"] == "shell"
-    assert "**Approve Action:**" in row["summary"]
-
-    payload = json.loads(row["payload_json"])
-    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-    assert valid_sh is True, f"Shell payload invalid: {val_err}"
-    assert "whole_foods_afx.py" in payload["command"]
-    assert "task_manager.py add" in payload["command"]
+    assert count == 0
 
 
 def test_midweek_grocery_dry_run(test_db: Path) -> None:
@@ -138,7 +128,11 @@ def test_proactive_cards_untruncated_15_staples_and_afx_url(test_db: Path, monke
         posted_messages.append((channel_id, content))
         return 9876543210
 
-    monkeypatch.setattr("tools.proactive_decision_cards._post_channel_message_rest", mock_post_direct)
+    monkeypatch.setattr(
+        sys.modules[run_midweek_grocery_card.__module__],
+        "_post_channel_message_rest",
+        mock_post_direct,
+    )
 
     ok, summary, meta = run_midweek_grocery_card(
         test=False,
@@ -148,7 +142,8 @@ def test_proactive_cards_untruncated_15_staples_and_afx_url(test_db: Path, monke
     )
 
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
     assert meta["due_staples_count"] == 15
     assert meta["task_items_count"] == 8
     assert meta["total_items"] == 23
@@ -179,20 +174,11 @@ def test_proactive_cards_untruncated_15_staples_and_afx_url(test_db: Path, monke
     assert "https://www.amazon.com/afx/ingredients/landingencoded" in summary
     assert meta["afx_url"].startswith("https://www.amazon.com/afx/ingredients/landingencoded")
 
-    # Verify SQLite row and shell payload
+    # Verify zero forge_decisions rows created in direct-message mode
     conn = sqlite3.connect(test_db)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (meta["decision_id"],)).fetchone()
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
     conn.close()
-
-    assert row is not None
-    assert row["category"] == "shopping"
-    assert row["channel_id"] == CHANNEL_SHOPPING
-    assert row["message_id"] == 9876543210
-    payload = json.loads(row["payload_json"])
-    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-    assert valid_sh is True, f"Shell payload invalid: {val_err}"
-    assert payload["afx_url"] == meta["afx_url"]
+    assert count == 0
 
 
 def test_stage_decision_card_preserves_untruncated_shopping_summary(test_db: Path) -> None:

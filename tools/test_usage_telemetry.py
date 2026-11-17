@@ -8,7 +8,7 @@ import json
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -179,10 +179,9 @@ def test_funnel_empty_database(tmp_path: Path) -> None:
 def test_funnel_metrics_calculation(temp_db: Path) -> None:
     """Accurately calculates total, rates, median latency, and PT approval hours."""
     now = time.time()
-    # 2026-10-30 18:00:00 UTC = 11:00:00 PT
-    dt_11_pt = datetime(2026, 10, 30, 18, 0, 0, tzinfo=timezone.utc).timestamp()
-    # 2026-10-30 20:00:00 UTC = 13:00:00 PT
-    dt_13_pt = datetime(2026, 10, 30, 20, 0, 0, tzinfo=timezone.utc).timestamp()
+    recent_date = (datetime.now(PT_TZ) - timedelta(days=2)).date()
+    dt_11_pt = datetime.combine(recent_date, dt_time(11, 0), tzinfo=PT_TZ).timestamp()
+    dt_13_pt = datetime.combine(recent_date, dt_time(13, 0), tzinfo=PT_TZ).timestamp()
 
     # Category: mealie (total: 4 -> 1 approved, 2 edited_approved, 1 dismissed)
     _insert_decision(temp_db, "dec-1", "mealie", "approved", dt_11_pt, resolved_at=dt_11_pt + 120)  # latency: 120s
@@ -250,15 +249,22 @@ def test_engagement_human_hours_and_unengaged_channels(tmp_path: Path) -> None:
     history_file = tmp_path / "channel_history.json"
     sidecar_file = tmp_path / "sidecar_log.json"
 
-    # 1. Prepare channel history
+    # 1. Prepare channel history with dynamic recent dates inside 7-day lookback window
+    base_pt = (datetime.now(PT_TZ) - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    ts_8_pt = base_pt.replace(hour=8).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts_10_pt = base_pt.replace(hour=10, minute=15).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts_11_pt = base_pt.replace(hour=11, minute=5).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts_day_m2 = (base_pt - timedelta(days=1)).replace(hour=10).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts_day_m3 = (base_pt - timedelta(days=2)).replace(hour=10).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
     history_data = {
-        # Channel 1: Human active in evening (17:00 and 18:00 PT)
+        # Channel 1: Human active at 10:15 and 11:05 PT
         "1542081375287640084": [
             {
                 "author": "Zero",
                 "is_bot": True,
                 "content": "Morning triage",
-                "timestamp": "2026-10-30 08:00:00 UTC",
+                "timestamp": ts_8_pt,
                 "reactions": {},
                 "channel_name": "zero-chat",
             },
@@ -266,7 +272,7 @@ def test_engagement_human_hours_and_unengaged_channels(tmp_path: Path) -> None:
                 "author": "Ryan",
                 "is_bot": False,
                 "content": "Thanks Zero, good to go.",
-                "timestamp": "2026-10-30 17:15:00 UTC",  # 10:15 PT
+                "timestamp": ts_10_pt,  # 10:15 PT
                 "reactions": {},
                 "channel_name": "zero-chat",
             },
@@ -274,7 +280,7 @@ def test_engagement_human_hours_and_unengaged_channels(tmp_path: Path) -> None:
                 "author": "Zero",
                 "is_bot": True,
                 "content": "Acknowledged.",
-                "timestamp": "2026-10-30 18:05:00 UTC",  # 11:05 PT
+                "timestamp": ts_11_pt,  # 11:05 PT
                 "reactions": {"👍": ["Ryan"]},  # Human reaction
                 "channel_name": "zero-chat",
             },
@@ -285,7 +291,7 @@ def test_engagement_human_hours_and_unengaged_channels(tmp_path: Path) -> None:
                 "author": "Zero",
                 "is_bot": True,
                 "content": "Budget alert 1",
-                "timestamp": "2026-10-29 10:00:00 UTC",
+                "timestamp": ts_day_m2,
                 "reactions": {},
                 "channel_name": "finances",
             },
@@ -293,7 +299,7 @@ def test_engagement_human_hours_and_unengaged_channels(tmp_path: Path) -> None:
                 "author": "Zero",
                 "is_bot": True,
                 "content": "Budget alert 2",
-                "timestamp": "2026-10-29 14:00:00 UTC",
+                "timestamp": ts_day_m2,
                 "reactions": {},
                 "channel_name": "finances",
             },
@@ -301,22 +307,22 @@ def test_engagement_human_hours_and_unengaged_channels(tmp_path: Path) -> None:
                 "author": "Zero",
                 "is_bot": True,
                 "content": "Budget alert 3",
-                "timestamp": "2026-10-30 10:00:00 UTC",
+                "timestamp": ts_8_pt,
                 "reactions": {},
                 "channel_name": "finances",
             },
         ],
         # Channel 3: 4 consecutive bot messages -> unengaged (eligible for disable)
         "1544955538033348618": [
-            {"author": "Zero", "is_bot": True, "content": "Grocery 1", "timestamp": "2026-10-28 10:00:00 UTC", "reactions": {}, "channel_name": "shopping"},
-            {"author": "Zero", "is_bot": True, "content": "Grocery 2", "timestamp": "2026-10-29 10:00:00 UTC", "reactions": {}, "channel_name": "shopping"},
-            {"author": "Zero", "is_bot": True, "content": "Grocery 3", "timestamp": "2026-10-30 08:00:00 UTC", "reactions": {}, "channel_name": "shopping"},
-            {"author": "Zero", "is_bot": True, "content": "Grocery 4", "timestamp": "2026-10-30 12:00:00 UTC", "reactions": {}, "channel_name": "shopping"},
+            {"author": "Zero", "is_bot": True, "content": "Grocery 1", "timestamp": ts_day_m3, "reactions": {}, "channel_name": "shopping"},
+            {"author": "Zero", "is_bot": True, "content": "Grocery 2", "timestamp": ts_day_m2, "reactions": {}, "channel_name": "shopping"},
+            {"author": "Zero", "is_bot": True, "content": "Grocery 3", "timestamp": ts_8_pt, "reactions": {}, "channel_name": "shopping"},
+            {"author": "Zero", "is_bot": True, "content": "Grocery 4", "timestamp": ts_10_pt, "reactions": {}, "channel_name": "shopping"},
         ],
         # Channel 4: 2 bot messages (streak < 3) -> engaged/nominal
         "1550577908811178095": [
-            {"author": "Zero", "is_bot": True, "content": "Dinner card 1", "timestamp": "2026-10-30 15:00:00 UTC", "reactions": {}, "channel_name": "brock-house"},
-            {"author": "Zero", "is_bot": True, "content": "Dinner card 2", "timestamp": "2026-10-30 17:00:00 UTC", "reactions": {}, "channel_name": "brock-house"},
+            {"author": "Zero", "is_bot": True, "content": "Dinner card 1", "timestamp": ts_8_pt, "reactions": {}, "channel_name": "brock-house"},
+            {"author": "Zero", "is_bot": True, "content": "Dinner card 2", "timestamp": ts_10_pt, "reactions": {}, "channel_name": "brock-house"},
         ],
     }
     history_file.write_text(json.dumps(history_data), encoding="utf-8")
@@ -476,7 +482,7 @@ def test_synthesize_recommendations_clean_nominal(temp_schedule: Path) -> None:
 
 
 def test_run_usage_telemetry_audit_end_to_end(temp_db: Path, temp_schedule: Path, tmp_path: Path) -> None:
-    """Full audit run stages tuning Decision Cards in #zero-ops and produces concise summary."""
+    """Default audit reports funnel/engagement metrics cleanly without staging Decision Cards; post_cards=True opts in."""
     now = time.time()
     # Insert high expiration cards for calendar (3 of 3 expired)
     _insert_decision(temp_db, "dec-c1", "calendar", "expired", now - 3600, resolved_at=now - 100)
@@ -484,17 +490,40 @@ def test_run_usage_telemetry_audit_end_to_end(temp_db: Path, temp_schedule: Path
     _insert_decision(temp_db, "dec-c3", "calendar", "expired", now - 10800, resolved_at=now - 100)
 
     # Channel history with 4 unengaged messages in #shopping
+    recent_ts = (datetime.now(timezone.utc) - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S UTC")
     hist_file = tmp_path / "hist.json"
     hist_file.write_text(
         json.dumps({
             "1544955538033348618": [
-                {"author": "Zero", "is_bot": True, "content": f"Bot {i}", "timestamp": "2026-10-30 10:00:00 UTC", "reactions": {}, "channel_name": "shopping"}
+                {"author": "Zero", "is_bot": True, "content": f"Bot {i}", "timestamp": recent_ts, "reactions": {}, "channel_name": "shopping"}
                 for i in range(4)
             ]
         }),
         encoding="utf-8",
     )
 
+    # 1. Default run (post_cards=False by default): zero Decision Cards staged
+    ok_default, summary_default, data_default = run_usage_telemetry_audit(
+        days=7,
+        dry_run=False,
+        test=True,
+        db_path=temp_db,
+        channel_history_path=hist_file,
+        schedule_path=temp_schedule,
+    )
+    assert ok_default is True
+    assert data_default["cards_staged"] == 0
+    assert data_default["decision_ids"] == []
+    assert len(data_default["recommendations"]) >= 1
+    assert "|" not in summary_default
+    assert len(summary_default.split()) <= 180
+    assert "Usage & Signal-to-Noise Telemetry Engine" in summary_default
+
+    with sqlite3.connect(temp_db) as conn:
+        cnt = conn.execute("SELECT COUNT(*) FROM forge_decisions WHERE category = 'telemetry'").fetchone()[0]
+        assert cnt == 0
+
+    # 2. Explicit opt-in (post_cards=True): stages tuning Decision Cards in #zero-ops
     ok, summary, data = run_usage_telemetry_audit(
         days=7,
         dry_run=False,
@@ -675,14 +704,18 @@ def test_cli_execution_disable(temp_schedule: Path, monkeypatch: pytest.MonkeyPa
 
 
 def test_cli_execution_audit(temp_db: Path, temp_schedule: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """CLI default audit execution dispatches cleanly."""
+    """CLI default audit execution reports without staging cards unless --post-cards is passed."""
+    now = time.time()
+    _insert_decision(temp_db, "dec-c1", "calendar", "expired", now - 3600, resolved_at=now - 100)
+    _insert_decision(temp_db, "dec-c2", "calendar", "expired", now - 7200, resolved_at=now - 100)
+    _insert_decision(temp_db, "dec-c3", "calendar", "expired", now - 10800, resolved_at=now - 100)
+
     monkeypatch.setattr(
         sys,
         "argv",
         [
             "usage_telemetry.py",
             "--test",
-            "--dry-run",
             "--db-path",
             str(temp_db),
             "--schedule-path",
@@ -691,3 +724,28 @@ def test_cli_execution_audit(temp_db: Path, temp_schedule: Path, monkeypatch: py
     )
     code = usage_telemetry.main()
     assert code == 0
+
+    with sqlite3.connect(temp_db) as conn:
+        cnt = conn.execute("SELECT COUNT(*) FROM forge_decisions WHERE category = 'telemetry'").fetchone()[0]
+        assert cnt == 0
+
+    # With --post-cards, CLI stages telemetry cards
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "usage_telemetry.py",
+            "--test",
+            "--post-cards",
+            "--db-path",
+            str(temp_db),
+            "--schedule-path",
+            str(temp_schedule),
+        ],
+    )
+    code2 = usage_telemetry.main()
+    assert code2 == 0
+
+    with sqlite3.connect(temp_db) as conn:
+        cnt2 = conn.execute("SELECT COUNT(*) FROM forge_decisions WHERE category = 'telemetry'").fetchone()[0]
+        assert cnt2 >= 1

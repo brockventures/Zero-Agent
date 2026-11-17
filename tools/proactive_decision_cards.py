@@ -194,15 +194,12 @@ CATEGORY_DISPLAY_NAMES = {
 }
 
 CALENDAR_PREP_KEYWORDS = [
-    "birthday",
-    "party",
     "trip",
     "doctor",
     "camp",
     "flight",
     "dentist",
     "pediatrician",
-    "celebration",
 ]
 
 
@@ -477,12 +474,14 @@ def run_inbox_rcs_action_triage_card(
     db_path: Path | str = FORGE_DB_PATH,
     post_to_discord: bool = True,
     items_override: Optional[list[dict[str, Any]]] = None,
+    stage: bool = False,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Scan unread actionable Gmail/RCS items and stage a Decision Card in #zero-chat.
+    """Scan unread actionable Gmail/RCS items and post a clean alert to #zero-chat.
 
     Actionable categories: school/daycare, medical, contractor texts, package exceptions, RSVPs.
     Deduplicates via /workspace/data/triage_card_seen.json.
-    Strictly event-driven: returns (True, '', {'cards_staged': 0}) when 0 items detected.
+    Strictly event-driven: returns (True, '', {'cards_staged': 0, 'decision_staged': False}) when 0 items detected.
+    By default (stage=False), posts a direct markdown message without staging a Decision Card.
     """
     seen_ids = _load_seen_triage_ids()
 
@@ -534,9 +533,9 @@ def run_inbox_rcs_action_triage_card(
 
     # 3. Silent early exit if 0 actionable items
     if not actionable_items:
-        return True, "", {"cards_staged": 0, "detected_items": 0, "slot": slot}
+        return True, "", {"cards_staged": 0, "decision_staged": False, "detected_items": 0, "slot": slot}
 
-    # 4. Format Decision Card
+    # 4. Format alert summary
     count = len(actionable_items)
     slot_title = slot.capitalize()
 
@@ -550,7 +549,8 @@ def run_inbox_rcs_action_triage_card(
         sender = it.get("sender") or it.get("from") or "Unknown"
         subj = it.get("subject") or it.get("snippet") or it.get("text") or "(no subject)"
         summary_lines.append(f"• **[{cat_disp}]** `{sender}`: {subj[:80]}")
-        summary_lines.append(f"  **Approve Action:** Create task to follow up with {sender}")
+        if stage:
+            summary_lines.append(f"  **Approve Action:** Create task to follow up with {sender}")
     if count > 10:
         summary_lines.append(f"• *... and {count - 10} additional items*")
 
@@ -560,16 +560,34 @@ def run_inbox_rcs_action_triage_card(
     if dry_run:
         return True, summary_text, {
             "cards_staged": 0,
+            "decision_staged": False,
             "dry_run": True,
             "detected_items": count,
             "slot": slot,
         }
 
-    # 6. Stage Decision Cards in #zero-chat (One atomic card per actionable item)
+    should_post = post_to_discord and not test
+
+    # 6. Direct message mode (default)
+    if not stage:
+        discord_msg_id: Optional[int] = None
+        if should_post:
+            discord_msg_id = _post_channel_message_rest(CHANNEL_ZERO_CHAT, summary_text)
+        _save_seen_triage_ids(new_seen_ids)
+        return True, summary_text, {
+            "cards_staged": 0,
+            "decision_staged": False,
+            "decision_id": None,
+            "decision_ids": [],
+            "discord_message_id": discord_msg_id,
+            "detected_items": count,
+            "slot": slot,
+        }
+
+    # 7. Optional legacy Decision Card staging in #zero-chat (only when stage=True)
     import shlex as _shlex
 
     decision_ids: list[str] = []
-    should_post = post_to_discord and not test
 
     for it in actionable_items:
         cat_disp = it.get("category_display", "Action")
@@ -609,6 +627,7 @@ def run_inbox_rcs_action_triage_card(
 
     return True, summary_text, {
         "cards_staged": len(decision_ids),
+        "decision_staged": bool(decision_ids),
         "decision_id": decision_ids[0] if decision_ids else None,
         "decision_ids": decision_ids,
         "detected_items": count,
@@ -626,12 +645,14 @@ def run_family_calendar_radar_card(
     post_to_discord: bool = True,
     events_override: Optional[list[dict[str, Any]]] = None,
     window_hours: int = 24,
+    stage: bool = False,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Scan next 24h of family calendar events for overlaps, tight buffers (<15m), and prep items.
+    """Scan next 24h of family calendar events for overlaps, tight buffers (<15m), and non-party prep items.
 
-    Stages a Decision Card in #brock-house (1550577908811178095) for concrete prep actions.
-    Dispatches read-only timing alerts to #brock-house via queue_outbox_message.
-    Strictly event-driven: returns (True, '', {'cards_staged': 0, 'read_only_alerts': 0}) when 0 conflicts/prep alerts.
+    Focuses on real schedule overlaps, tight transitions, and unassigned dropoff/pickup coverage;
+    does not flag 'birthday' or 'party' events as shopping-list prep items.
+    By default (stage=False), posts a clean markdown alert directly to #brock-house (1550577908811178095).
+    Strictly event-driven: returns (True, '', {'cards_staged': 0, 'decision_staged': False, 'read_only_alerts': 0}) when 0 alerts.
     """
     now_pt = datetime.now(PT)
     window_end_pt = now_pt + timedelta(hours=window_hours)
@@ -780,7 +801,7 @@ def run_family_calendar_radar_card(
                     "assigned_parents": [p1, p2],
                 })
 
-    # C. Events needing prep (birthday, party, trip, doctor, camp, etc.)
+    # C. Events needing prep (trip, doctor, camp, flight, dentist, pediatrician; excludes birthday/party)
     for ev in normalized_events:
         haystack = f"{ev['summary']} {ev['description']}".lower()
         matched_prep = [kw for kw in CALENDAR_PREP_KEYWORDS if kw in haystack]
@@ -822,11 +843,12 @@ def run_family_calendar_radar_card(
     if not issues:
         return True, "", {
             "cards_staged": 0,
+            "decision_staged": False,
             "read_only_alerts": 0,
             "issues": [],
         }
 
-    # 5. Format Decision Card summary text
+    # 5. Format alert summary text
     count = len(issues)
 
     summary_lines = [
@@ -851,63 +873,62 @@ def run_family_calendar_radar_card(
     if dry_run:
         return True, summary_text, {
             "cards_staged": 0,
+            "decision_staged": False,
             "read_only_alerts": len(read_only_issues),
             "dry_run": True,
             "issues": issues,
         }
 
-    # 7. Stage Decision Cards ONLY for actionable issues (type == 'prep')
-    # and dispatch read-only timing alerts to #brock-house via queue_outbox_message
+    should_post = post_to_discord and not test
+
+    # 7. Direct message mode (default): post clean markdown summary once to #brock-house
+    if not stage:
+        discord_msg_id: Optional[int] = None
+        if should_post:
+            discord_msg_id = _post_channel_message_rest(CHANNEL_BROCK_HOUSE, summary_text)
+
+        if should_dedup:
+            updated_seen = set(seen_keys)
+            for iss in issues:
+                k = iss.get("key")
+                if k:
+                    updated_seen.add(k)
+            _save_seen_calendar_keys(updated_seen)
+
+        return True, summary_text, {
+            "cards_staged": 0,
+            "decision_staged": False,
+            "read_only_alerts": len(read_only_issues),
+            "decision_id": None,
+            "decision_ids": [],
+            "discord_message_id": discord_msg_id,
+            "issues": issues,
+        }
+
+    # 8. Optional legacy Decision Card staging (only when stage=True)
     import shlex as _shlex
 
     decision_ids: list[str] = []
-    should_post = post_to_discord and not test
 
     for issue in actionable_issues:
         itype = issue["type"]
         evs = issue.get("events") or []
         ev_summary = evs[0] if evs else str(issue.get("summary") or issue.get("title") or "Event")
-        kw = issue.get("prep_keyword", "")
-        haystack = f"{issue.get('summary', '')} {issue.get('description', '')}".lower()
-        supply_keywords = ("ice cream", "cake", "gift", "present", "snacks", "supplies")
-        has_supply_kw = any(re.search(rf"\b{re.escape(skw)}\b", haystack) for skw in supply_keywords)
-        is_party_celebration = kw in ("birthday", "party", "celebration")
-
-        if is_party_celebration or has_supply_kw:
-            if "supplies" in ev_summary.lower():
-                item_name = ev_summary
-            else:
-                item_name = f"{ev_summary} supplies"
-            cmd = f"python3 /workspace/tools/ha_shopping_list.py --add {_shlex.quote(item_name)}"
-            card_title = f"🗓️ Add to Shopping List: {item_name}"
-            card_summary = (
-                f"### 🗓️ Calendar Radar Prep\n"
-                f"{issue['details']}\n\n"
-                f"**Approve Action:** Add '{item_name}' to the household shopping list"
-            )
-            payload = {
-                "command": cmd,
-                "issue_type": itype,
-                "events": evs,
-                "key": issue.get("key"),
-                "item": item_name,
-            }
-        else:
-            t_title = f"Prep for {ev_summary} ({issue.get('details', '').split(' requires')[0]})"
-            card_title = f"🗓️ {issue['title']}"
-            card_summary = (
-                f"### 🗓️ Calendar Radar Alert\n"
-                f"{issue['details']}\n\n"
-                f"**Approve Action:** Create task in task manager: '{t_title}'"
-            )
-            cmd = f"python3 /workspace/tools/task_manager.py add {_shlex.quote(t_title)} --priority p1"
-            payload = {
-                "command": cmd,
-                "issue_type": itype,
-                "events": evs,
-                "key": issue.get("key"),
-                "task_title": t_title,
-            }
+        t_title = f"Prep for {ev_summary} ({issue.get('details', '').split(' requires')[0]})"
+        card_title = f"🗓️ {issue['title']}"
+        card_summary = (
+            f"### 🗓️ Calendar Radar Alert\n"
+            f"{issue['details']}\n\n"
+            f"**Approve Action:** Create task in task manager: '{t_title}'"
+        )
+        cmd = f"python3 /workspace/tools/task_manager.py add {_shlex.quote(t_title)} --priority p1"
+        payload = {
+            "command": cmd,
+            "issue_type": itype,
+            "events": evs,
+            "key": issue.get("key"),
+            "task_title": t_title,
+        }
 
         stage_res = stage_decision(
             category="calendar",
@@ -959,6 +980,7 @@ def run_family_calendar_radar_card(
 
     return True, summary_text, {
         "cards_staged": len(decision_ids),
+        "decision_staged": bool(decision_ids),
         "read_only_alerts": len(read_only_issues),
         "decision_id": decision_ids[0] if decision_ids else None,
         "decision_ids": decision_ids,
@@ -976,13 +998,15 @@ def run_dinner_pivot_card(
     post_to_discord: bool = True,
     plan_override: Optional[dict[str, Any]] = None,
     events_override: Optional[list[dict[str, Any]]] = None,
+    stage: bool = False,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Check tonight's Mealie dinner against evening calendar density (16:30-20:00 PT).
 
-    Stages a swap/push Decision Card in #brock-house (1550577908811178095) ONLY if:
+    Posts a swap/push alert to #brock-house (1550577908811178095) ONLY if:
       - Tonight's dinner is scheduled in Mealie AND >=2 evening events collide with a >30m recipe.
 
-    Strictly event-driven: returns (True, '', {'cards_staged': 0}) when nominal or when no dinner is scheduled.
+    Strictly event-driven: returns (True, '', {'cards_staged': 0, 'decision_staged': False}) when nominal or when no dinner is scheduled.
+    By default (stage=False), posts a clean markdown message directly without staging a Decision Card.
     """
     now_pt = datetime.now(PT)
     today = now_pt.date()
@@ -1096,23 +1120,27 @@ def run_dinner_pivot_card(
     if not trigger:
         return True, "", {
             "cards_staged": 0,
+            "decision_staged": False,
             "scheduled": is_scheduled,
             "recipe_minutes": recipe_minutes,
             "evening_events": len(evening_events),
         }
 
-    # 5. Format Decision Card
+    # 5. Format alert summary
     title = f"🍽️ Dinner Pivot: High evening density ({len(evening_events)} events) vs '{recipe_name}' ({recipe_minutes}m)"
     summary_lines = [
-        "### 🍽️ Dinner Pivot Card",
+        "### 🍽️ Dinner Pivot Alert",
         f"**Collision Detected:** {trigger_reason}",
         "",
         "• **Planned Recipe:** " + f"{recipe_name} ({recipe_minutes} minutes)",
         "• **Colliding Events:** " + ", ".join(f"'{e['summary']}'" for e in evening_events),
         "• **Recommendation:** Swap tonight's recipe with a 15-minute quick meal or push to tomorrow.",
-        "",
-        f"**Approve Action:** Create task in task manager: 'Dinner pivot: Quick alternative or takeout (replace {recipe_name})'",
     ]
+    if stage:
+        summary_lines.extend([
+            "",
+            f"**Approve Action:** Create task in task manager: 'Dinner pivot: Quick alternative or takeout (replace {recipe_name})'",
+        ])
 
     summary_text = "\n".join(summary_lines)
 
@@ -1120,12 +1148,31 @@ def run_dinner_pivot_card(
     if dry_run:
         return True, summary_text, {
             "cards_staged": 0,
+            "decision_staged": False,
             "dry_run": True,
             "trigger_reason": trigger_reason,
             "evening_events": len(evening_events),
         }
 
-    # 7. Stage Decision Card in #brock-house
+    should_post = post_to_discord and not test
+
+    # 7. Direct message mode (default)
+    if not stage:
+        discord_msg_id: Optional[int] = None
+        if should_post:
+            discord_msg_id = _post_channel_message_rest(CHANNEL_BROCK_HOUSE, summary_text)
+        return True, summary_text, {
+            "cards_staged": 0,
+            "decision_staged": False,
+            "decision_id": None,
+            "decision_ids": [],
+            "discord_message_id": discord_msg_id,
+            "trigger_reason": trigger_reason,
+            "recipe_name": recipe_name,
+            "evening_events": len(evening_events),
+        }
+
+    # 8. Optional legacy Decision Card staging in #brock-house (only when stage=True)
     import shlex as _shlex
     task_title = f"Dinner pivot: Quick alternative or takeout (replace {recipe_name})"
     cmd = f"python3 /workspace/tools/task_manager.py add {_shlex.quote(task_title)} --priority p1"
@@ -1137,7 +1184,6 @@ def run_dinner_pivot_card(
         "task_title": task_title,
     }
 
-    should_post = post_to_discord and not test
     stage_res = stage_decision(
         category="mealie",
         title=title,
@@ -1152,6 +1198,7 @@ def run_dinner_pivot_card(
     decision_id = stage_res.get("decision_id")
     return True, summary_text, {
         "cards_staged": 1 if decision_id else 0,
+        "decision_staged": bool(decision_id),
         "decision_id": decision_id,
         "decision_ids": [decision_id] if decision_id else [],
         "trigger_reason": trigger_reason,
@@ -1203,11 +1250,13 @@ def run_actual_budget_anomaly_card(
     db_path: Path | str = FORGE_DB_PATH,
     post_to_discord: bool = True,
     anomalies_override: Optional[list[dict[str, Any]]] = None,
+    stage: bool = False,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Scan Actual Budget ledger for uncategorized merchants, utility spikes (>25%), or cash reserve drift.
 
-    Stages a Decision Card in #finances (1544955532765560924).
-    Strictly event-driven: returns (True, '', {'cards_staged': 0}) when 0 anomalies detected.
+    Posts a clean markdown alert to #finances (1544955532765560924).
+    Strictly event-driven: returns (True, '', {'cards_staged': 0, 'decision_staged': False}) when 0 anomalies detected.
+    By default (stage=False), posts directly without staging a Decision Card.
     """
     candidates: list[dict[str, Any]] = []
     if anomalies_override is not None:
@@ -1282,7 +1331,7 @@ def run_actual_budget_anomaly_card(
 
     # Silent early exit if 0 anomalies
     if not detected_anomalies:
-        return True, "", {"cards_staged": 0, "anomalies": []}
+        return True, "", {"cards_staged": 0, "decision_staged": False, "anomalies": []}
 
     count = len(detected_anomalies)
     summary_lines = [
@@ -1306,15 +1355,30 @@ def run_actual_budget_anomaly_card(
     if dry_run:
         return True, summary_text, {
             "cards_staged": 0,
+            "decision_staged": False,
             "dry_run": True,
             "anomalies": detected_anomalies,
         }
 
-    # Stage one atomic card per anomaly
+    should_post = post_to_discord and not test
+
+    if not stage:
+        discord_msg_id: Optional[int] = None
+        if should_post:
+            discord_msg_id = _post_channel_message_rest(CHANNEL_FINANCES, summary_text)
+        return True, summary_text, {
+            "cards_staged": 0,
+            "decision_staged": False,
+            "decision_id": None,
+            "decision_ids": [],
+            "discord_message_id": discord_msg_id,
+            "anomalies": detected_anomalies,
+        }
+
+    # Optional legacy atomic card staging (only when stage=True)
     import shlex as _shlex
 
     decision_ids: list[str] = []
-    should_post = post_to_discord and not test
 
     for anomaly in detected_anomalies:
         atype = anomaly.get("type", "unknown")
@@ -1372,6 +1436,7 @@ def run_actual_budget_anomaly_card(
 
     return True, summary_text, {
         "cards_staged": len(decision_ids),
+        "decision_staged": bool(decision_ids),
         "decision_id": decision_ids[0] if decision_ids else None,
         "decision_ids": decision_ids,
         "anomalies": detected_anomalies,
@@ -1460,15 +1525,17 @@ def run_weather_energy_card(
     db_path: Path | str = FORGE_DB_PATH,
     post_to_discord: bool = True,
     weather_override: Optional[dict[str, Any]] = None,
+    stage: bool = False,
 ) -> tuple[bool, str, dict[str, Any]]:
-    """Evaluate weather conditions and stage pre-adjustment Decision Card in #home-assistant (1544953275877556334).
+    """Evaluate weather conditions and post a clean pre-adjustment alert to #home-assistant (1544953275877556334).
 
     Triggers on:
       - Rain >= 0.25 in (lawn irrigation suspension / sump pump check)
       - Heat >= 90°F (pre-cooling house prior to peak grid TOU hours & solar shades)
       - Cold <= 38°F (pre-heating living zones, outdoor faucet freeze protection)
 
-    Strictly event-driven: returns (True, '', {'cards_staged': 0}) when nominal.
+    Strictly event-driven: returns (True, '', {'cards_staged': 0, 'decision_staged': False}) when nominal.
+    By default (stage=False), posts directly without staging a Decision Card.
     """
     weather_data: dict[str, Any] = {}
     if weather_override is not None:
@@ -1541,7 +1608,7 @@ def run_weather_energy_card(
         })
 
     if not triggers:
-        return True, "", {"cards_staged": 0, "triggers": []}
+        return True, "", {"cards_staged": 0, "decision_staged": False, "triggers": []}
 
     summary_lines = [
         f"### ⚡ Weather & Energy Pre-Adjustment Radar ({len(triggers)})",
@@ -1562,15 +1629,30 @@ def run_weather_energy_card(
     if dry_run:
         return True, summary_text, {
             "cards_staged": 0,
+            "decision_staged": False,
             "dry_run": True,
             "triggers": triggers,
         }
 
-    # Stage one atomic card per weather trigger
+    should_post = post_to_discord and not test
+
+    if not stage:
+        discord_msg_id: Optional[int] = None
+        if should_post:
+            discord_msg_id = _post_channel_message_rest(CHANNEL_HOME_ASSISTANT, summary_text)
+        return True, summary_text, {
+            "cards_staged": 0,
+            "decision_staged": False,
+            "decision_id": None,
+            "decision_ids": [],
+            "discord_message_id": discord_msg_id,
+            "triggers": triggers,
+        }
+
+    # Optional legacy atomic card staging (only when stage=True)
     import shlex as _shlex
 
     decision_ids: list[str] = []
-    should_post = post_to_discord and not test
 
     for t in triggers:
         ttype = t.get("type")
@@ -1619,6 +1701,7 @@ def run_weather_energy_card(
 
     return True, summary_text, {
         "cards_staged": len(decision_ids),
+        "decision_staged": bool(decision_ids),
         "decision_id": decision_ids[0] if decision_ids else None,
         "decision_ids": decision_ids,
         "triggers": triggers,
@@ -1695,12 +1778,14 @@ def run_midweek_grocery_card(
     db_path: Path | str = FORGE_DB_PATH,
     post_to_discord: bool = True,
     items_override: Optional[dict[str, Any] | list[dict[str, Any]]] = None,
+    stage: bool = False,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Aggregate Thursday mid-week grocery task additions and due staples in #shopping (1544955538033348618).
 
     Renders the full, untruncated item list (with quantities and due cadence) and a 1-click Whole Foods AFX cart link,
     posting the complete itemized message directly to #shopping when post_to_discord=True.
-    Strictly event-driven: returns (True, '', {'cards_staged': 0}) when 0 items due/pending.
+    Strictly event-driven: returns (True, '', {'cards_staged': 0, 'decision_staged': False}) when 0 items due/pending.
+    By default (stage=False), posts directly without staging a Decision Card.
     """
     if items_override is None and not test:
         try:
@@ -1741,7 +1826,7 @@ def run_midweek_grocery_card(
 
     total_count = len(due_staples) + len(task_items)
     if total_count == 0:
-        return True, "", {"cards_staged": 0, "due_staples_count": 0, "task_items_count": 0}
+        return True, "", {"cards_staged": 0, "decision_staged": False, "due_staples_count": 0, "task_items_count": 0}
 
     # Build 1-click Whole Foods AFX cart URL across all Whole Foods staples & pending task additions
     wf_staging_items: list[dict[str, Any]] = []
@@ -1829,13 +1914,36 @@ def run_midweek_grocery_card(
 
     import shlex as _shlex
     task_title = f"Review Whole Foods AFX cart ({total_count} items)"
-    summary_lines.append(f"**Approve Action:** Stage 1-click Whole Foods AFX cart and create task: '{task_title}'")
-    summary_text = "\n".join(summary_lines).strip()
+    if stage:
+        summary_lines.append(f"**Approve Action:** Stage 1-click Whole Foods AFX cart and create task: '{task_title}'")
+        summary_text = "\n".join(summary_lines).strip()
+    else:
+        summary_text = direct_message_text
 
     if dry_run:
         return True, summary_text, {
             "cards_staged": 0,
+            "decision_staged": False,
             "dry_run": True,
+            "due_staples_count": len(due_staples),
+            "task_items_count": len(task_items),
+            "total_items": total_count,
+            "afx_url": afx_url,
+            "direct_message": direct_message_text,
+        }
+
+    should_post = post_to_discord and not test
+
+    if not stage:
+        discord_msg_id: Optional[int] = None
+        if should_post:
+            discord_msg_id = _post_channel_message_rest(CHANNEL_SHOPPING, direct_message_text)
+        return True, summary_text, {
+            "cards_staged": 0,
+            "decision_staged": False,
+            "decision_id": None,
+            "decision_ids": [],
+            "discord_message_id": discord_msg_id,
             "due_staples_count": len(due_staples),
             "task_items_count": len(task_items),
             "total_items": total_count,
@@ -1853,9 +1961,7 @@ def run_midweek_grocery_card(
         "afx_url": afx_url,
     }
 
-    # Record in forge_decisions without posting a truncated/card embed to Discord;
-    # instead, when should_post is True, post the full untruncated message directly to #shopping.
-    should_post = post_to_discord and not test
+    # Optional legacy Decision Card recording (only when stage=True)
     stage_res = stage_decision(
         category="shopping",
         title=title,
@@ -1868,7 +1974,7 @@ def run_midweek_grocery_card(
     )
 
     decision_id = stage_res.get("decision_id")
-    discord_msg_id: Optional[int] = None
+    discord_msg_id = None
     if should_post:
         discord_msg_id = _post_channel_message_rest(CHANNEL_SHOPPING, direct_message_text)
         if decision_id:
@@ -1886,6 +1992,7 @@ def run_midweek_grocery_card(
 
     return True, summary_text, {
         "cards_staged": 1 if decision_id else 0,
+        "decision_staged": bool(decision_id),
         "decision_id": decision_id,
         "decision_ids": [decision_id] if decision_id else [],
         "discord_message_id": discord_msg_id,

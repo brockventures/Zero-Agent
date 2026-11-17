@@ -34,7 +34,7 @@ for _p in [str(_CURRENT_DIR), str(_WORKSPACE_DIR)]:
         sys.path.remove(_p)
     sys.path.insert(0, _p)
 
-from tools.forge import _validate_decision_shell_payload, init_forge_db
+from tools.forge import init_forge_db
 
 # Re-ensure worktree is at the head of sys.path after forge import
 for _p in [str(_CURRENT_DIR), str(_WORKSPACE_DIR)]:
@@ -71,6 +71,8 @@ from tools.proactive_decision_cards import (
     run_midweek_grocery_card,
     run_weather_energy_card,
 )
+
+_pdc_module = sys.modules[run_midweek_grocery_card.__module__]
 
 PT = ZoneInfo("America/Los_Angeles")
 
@@ -208,8 +210,10 @@ def test_inbox_rcs_triage_filters_non_actionable(test_db: Path, isolate_triage_s
     assert meta["cards_staged"] == 0
 
 
-def test_inbox_rcs_triage_stages_card_and_deduplicates(test_db: Path, isolate_triage_seen: Path) -> None:
-    """Stages card for actionable items, saves seen IDs, and avoids duplicate cards on next run."""
+def test_inbox_rcs_triage_stages_card_and_deduplicates(
+    test_db: Path, isolate_triage_seen: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Posts clean direct alert for actionable items, saves seen IDs, and avoids duplicates without staging a card."""
     items = [
         {
             "id": "school-101",
@@ -225,37 +229,40 @@ def test_inbox_rcs_triage_stages_card_and_deduplicates(test_db: Path, isolate_tr
         },
     ]
 
-    # First run: stages card
+    posted: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        _pdc_module,
+        "_post_channel_message_rest",
+        lambda cid, txt: (posted.append((cid, txt)) or 445566),
+    )
+
+    # First run: posts direct alert without staging a Decision Card
     ok, summary, meta = run_inbox_rcs_action_triage_card(
         slot="morning",
-        test=True,
+        test=False,
         db_path=test_db,
-        post_to_discord=False,
+        post_to_discord=True,
         items_override=items,
     )
     assert ok is True
-    assert meta["cards_staged"] == 2
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
     assert meta["detected_items"] == 2
+    assert meta["discord_message_id"] == 445566
     assert "Preschool" in summary
     assert "Pediatrician" in summary
+    assert "**Approve Action:**" not in summary
 
-    # Verify staged in SQLite
+    assert len(posted) == 1
+    assert posted[0][0] == CHANNEL_ZERO_CHAT
+    assert "Preschool" in posted[0][1]
+    assert "**Approve Action:**" not in posted[0][1]
+
+    # Verify zero rows staged in SQLite
     conn = sqlite3.connect(test_db)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM forge_decisions ORDER BY id ASC").fetchall()
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
     conn.close()
-
-    assert len(rows) == 2
-    for row in rows:
-        assert row["category"] == "comms"
-        assert row["channel_id"] == CHANNEL_ZERO_CHAT
-        assert row["handler_type"] == "shell"
-        assert "**Approve Action:**" in row["summary"]
-
-        payload = json.loads(row["payload_json"])
-        valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-        assert valid_sh is True, f"Shell payload invalid: {val_err}"
-        assert "task_manager.py add" in payload["command"]
+    assert count == 0
 
     # Verify seen file was written
     assert isolate_triage_seen.exists()
@@ -274,6 +281,7 @@ def test_inbox_rcs_triage_stages_card_and_deduplicates(test_db: Path, isolate_tr
     assert ok2 is True
     assert summary2 == ""
     assert meta2["cards_staged"] == 0
+    assert meta2["decision_staged"] is False
 
 
 def test_inbox_rcs_triage_dry_run(test_db: Path, isolate_triage_seen: Path) -> None:
@@ -337,9 +345,9 @@ def test_calendar_radar_silent_when_no_conflicts(test_db: Path) -> None:
 
 
 def test_calendar_radar_detects_overlap_tight_buffer_and_prep(test_db: Path) -> None:
-    """Detects overlap conflict, tight buffer (<15m), and prep keyword.
+    """Detects overlap conflict, tight buffer (<15m), and non-party prep keyword without staging cards.
 
-    Only actionable prep items stage Decision Cards; overlaps and tight buffers emit read-only timing alerts.
+    Birthday/party events are NOT flagged as shopping-list prep items.
     """
     now_pt = datetime.now(PT)
     events: list[dict[str, Any]] = [
@@ -363,10 +371,17 @@ def test_calendar_radar_detects_overlap_tight_buffer_and_prep(test_db: Path) -> 
             "start": (now_pt + timedelta(hours=3, minutes=35)).isoformat(),
             "end": (now_pt + timedelta(hours=4, minutes=15)).isoformat(),
         },
-        # Event 4 requires prep (birthday party)
+        # Event 4: birthday party should NOT be flagged as shopping-list prep
+        {
+            "id": "ev-party-ignored",
+            "summary": "Rosie 4th Birthday Party",
+            "start": (now_pt + timedelta(hours=18)).isoformat(),
+            "end": (now_pt + timedelta(hours=19)).isoformat(),
+        },
+        # Event 5: non-party prep item (camp)
         {
             "id": "ev-prep",
-            "summary": "Rosie 4th Birthday Party",
+            "summary": "Summer Camp Check-in",
             "start": (now_pt + timedelta(hours=20)).isoformat(),
             "end": (now_pt + timedelta(hours=22)).isoformat(),
         },
@@ -379,31 +394,21 @@ def test_calendar_radar_detects_overlap_tight_buffer_and_prep(test_db: Path) -> 
         events_override=events,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
     assert meta["read_only_alerts"] == 2
     issues = meta["issues"]
     issue_types = {iss["type"] for iss in issues}
     assert "overlap" in issue_types
     assert "tight_buffer" in issue_types
     assert "prep" in issue_types
+    assert "Rosie 4th Birthday Party" not in summary
+    assert "Summer Camp Check-in" in summary
 
     conn = sqlite3.connect(test_db)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM forge_decisions ORDER BY id ASC").fetchall()
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
     conn.close()
-
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["category"] == "calendar"
-    assert row["channel_id"] == CHANNEL_BROCK_HOUSE
-    assert row["handler_type"] == "shell"
-    assert "**Approve Action:**" in row["summary"]
-    assert "Add 'Rosie 4th Birthday Party supplies' to the household shopping list" in row["summary"]
-
-    payload = json.loads(row["payload_json"])
-    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-    assert valid_sh is True, f"Shell payload invalid: {val_err}"
-    assert "ha_shopping_list.py --add" in payload["command"]
+    assert count == 0
 
 
 def test_calendar_radar_dry_run(test_db: Path) -> None:
@@ -464,7 +469,7 @@ def test_calendar_radar_deduplicates_across_consecutive_runs(
     }
     events = [event_prep, event_overlap_1, event_overlap_2]
 
-    # Run 1: Should detect prep + overlap, stage Decision Cards for prep, write seen file
+    # Run 1: Should detect doctor prep + overlap without staging Decision Cards, write seen file
     ok1, summary1, meta1 = run_family_calendar_radar_card(
         test=True,
         db_path=test_db,
@@ -472,9 +477,11 @@ def test_calendar_radar_deduplicates_across_consecutive_runs(
         events_override=events,
     )
     assert ok1 is True
-    assert meta1["cards_staged"] == 2
+    assert meta1["cards_staged"] == 0
+    assert meta1["decision_staged"] is False
     assert meta1["read_only_alerts"] == 1
-    assert len(meta1["issues"]) == 3
+    assert len(meta1["issues"]) == 2
+    assert "Rosie 4th Birthday Party" not in summary1
     assert isolate_calendar_seen.exists()
 
     seen_data = json.loads(isolate_calendar_seen.read_text(encoding="utf-8"))
@@ -510,8 +517,9 @@ def test_calendar_radar_deduplicates_across_consecutive_runs(
         events_override=events_with_new,
     )
     assert ok3 is True
-    assert meta3["cards_staged"] == 1
-    # Only the new soccer camp issue should be staged
+    assert meta3["cards_staged"] == 0
+    assert meta3["decision_staged"] is False
+    # Only the new soccer camp issue should be reported
     assert len(meta3["issues"]) == 1
     assert "Soccer Camp" in meta3["issues"][0]["title"]
 
@@ -524,7 +532,7 @@ def test_calendar_radar_dedup_bypassed_without_seen_env(
     now_pt = datetime.now(PT)
     events = [{
         "id": "ev-prep",
-        "summary": "Rosie Birthday Party",
+        "summary": "Summer Camp Check-in",
         "start": (now_pt + timedelta(hours=12)).isoformat(),
         "end": (now_pt + timedelta(hours=14)).isoformat(),
     }]
@@ -535,8 +543,11 @@ def test_calendar_radar_dedup_bypassed_without_seen_env(
     ok2, _, meta2 = run_family_calendar_radar_card(
         test=True, db_path=test_db, post_to_discord=False, events_override=events
     )
-    assert meta1["cards_staged"] == 1
-    assert meta2["cards_staged"] == 1
+    assert ok1 is True and ok2 is True
+    assert meta1["cards_staged"] == 0
+    assert meta2["cards_staged"] == 0
+    assert len(meta1["issues"]) == 1
+    assert len(meta2["issues"]) == 1
 
 
 def test_calendar_radar_ignores_events_beyond_24h(test_db: Path) -> None:
@@ -556,8 +567,8 @@ def test_calendar_radar_ignores_events_beyond_24h(test_db: Path) -> None:
             "end": (now_pt + timedelta(hours=31)).isoformat(),
         },
         {
-            "id": "ev-outside-party",
-            "summary": "Rosie Birthday Party",
+            "id": "ev-outside-camp",
+            "summary": "Summer Camp Check-in",
             "start": (now_pt + timedelta(hours=35)).isoformat(),
             "end": (now_pt + timedelta(hours=37)).isoformat(),
         },
@@ -576,7 +587,7 @@ def test_calendar_radar_ignores_events_beyond_24h(test_db: Path) -> None:
     assert meta["read_only_alerts"] == 0
     assert meta["issues"] == []
 
-    # Expanding window to 48h picks up both outside events
+    # Expanding window to 48h picks up both outside events without staging cards
     ok_48, summary_48, meta_48 = run_family_calendar_radar_card(
         test=True,
         db_path=test_db,
@@ -585,7 +596,8 @@ def test_calendar_radar_ignores_events_beyond_24h(test_db: Path) -> None:
         window_hours=48,
     )
     assert ok_48 is True
-    assert meta_48["cards_staged"] == 2
+    assert meta_48["cards_staged"] == 0
+    assert len(meta_48["issues"]) == 2
 
 
 def test_calendar_radar_parent_aware_overlap_suppressed(test_db: Path) -> None:
@@ -892,14 +904,12 @@ def test_calendar_radar_nov_5_6_live_handoff_and_pickup_regression(test_db: Path
         events_override=live_events,
     )
     assert ok is True
-    # Zero read-only overlap or tight buffer timing alerts
+    # Zero read-only overlap or tight buffer timing alerts, and birthday party is NOT flagged as shopping-list prep
     assert meta["read_only_alerts"] == 0
-    issue_types = [iss["type"] for iss in meta["issues"]]
-    assert "overlap" not in issue_types
-    assert "tight_buffer" not in issue_types
-    # Only the actionable prep card for 'Rosie's birthday party!' is staged
-    assert issue_types == ["prep"]
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
+    assert meta["issues"] == []
+    assert summary == ""
 
 
 def test_bridge_scheduler_reloads_proactive_decision_cards(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -930,21 +940,14 @@ def test_bridge_scheduler_reloads_proactive_decision_cards(monkeypatch: pytest.M
 def test_calendar_radar_read_only_timing_alerts_dispatch(
     test_db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Genuine tight buffers and overlaps emit read-only alerts without creating forge_decisions rows,
+    """Genuine tight buffers and overlaps post clean direct alerts to #brock-house without creating forge_decisions rows."""
+    posted: list[tuple[int, str]] = []
 
-    and dispatch read-only timing alerts via queue_outbox_message when post_to_discord is active.
-    """
-    outbox_calls: list[dict[str, Any]] = []
+    def mock_post_direct(channel_id: int, content: str) -> int:
+        posted.append((channel_id, content))
+        return 778899
 
-    def mock_queue_outbox(channel: str, content: str, source_turn: str = "zero", **kwargs: Any) -> dict[str, Any]:
-        call_info = {"channel": channel, "content": content, "source_turn": source_turn}
-        outbox_calls.append(call_info)
-        return {"status": "queued", "id": "msg-123"}
-
-    monkeypatch.setattr(
-        "tools.proactive_decision_cards.queue_outbox_message",
-        mock_queue_outbox,
-    )
+    monkeypatch.setattr(_pdc_module, "_post_channel_message_rest", mock_post_direct)
 
     now_pt = datetime.now(PT)
     events = [
@@ -979,7 +982,9 @@ def test_calendar_radar_read_only_timing_alerts_dispatch(
 
     assert ok is True
     assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
     assert meta["read_only_alerts"] == 2
+    assert meta["discord_message_id"] == 778899
     assert len(meta["issues"]) == 2
 
     # Zero rows staged in database
@@ -988,14 +993,12 @@ def test_calendar_radar_read_only_timing_alerts_dispatch(
     conn.close()
     assert count == 0
 
-    # Read-only timing alert dispatched to outbox
-    assert len(outbox_calls) == 1
-    call = outbox_calls[0]
-    assert call["channel"] == "brock-house"
-    assert call["source_turn"] == "family_calendar_radar"
-    assert "24h Calendar Timing Alerts" in call["content"]
-    assert "Quarterly Review" in call["content"]
-    assert "Strategy Sync" in call["content"]
+    # Clean direct markdown alert posted once to #brock-house
+    assert len(posted) == 1
+    assert posted[0][0] == CHANNEL_BROCK_HOUSE
+    assert "24h Family Calendar Radar" in posted[0][1]
+    assert "Quarterly Review" in posted[0][1]
+    assert "Strategy Sync" in posted[0][1]
 
 
 
@@ -1072,8 +1075,10 @@ def test_dinner_pivot_silent_when_unscheduled(test_db: Path) -> None:
     assert meta["scheduled"] is False
 
 
-def test_dinner_pivot_stages_card_on_density_collision(test_db: Path) -> None:
-    """Dinner pivot triggers when >=2 evening events collide with a >30m recipe."""
+def test_dinner_pivot_stages_card_on_density_collision(
+    test_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dinner pivot posts clean direct alert to #brock-house when >=2 evening events collide with >30m recipe."""
     now_pt = datetime.now(PT)
     today = now_pt.date()
     events = [
@@ -1090,33 +1095,37 @@ def test_dinner_pivot_stages_card_on_density_collision(test_db: Path) -> None:
     ]
     plan = {"name": "Homemade Lasagna", "total_time": 60}
 
+    posted: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        _pdc_module,
+        "_post_channel_message_rest",
+        lambda cid, txt: (posted.append((cid, txt)) or 223344),
+    )
+
     ok, summary, meta = run_dinner_pivot_card(
-        test=True,
+        test=False,
         db_path=test_db,
-        post_to_discord=False,
+        post_to_discord=True,
         plan_override=plan,
         events_override=events,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
+    assert meta["discord_message_id"] == 223344
     assert "Homemade Lasagna" in summary
     assert "Soccer Practice" in summary
+    assert "**Approve Action:**" not in summary
+
+    assert len(posted) == 1
+    assert posted[0][0] == CHANNEL_BROCK_HOUSE
+    assert "Homemade Lasagna" in posted[0][1]
+    assert "**Approve Action:**" not in posted[0][1]
 
     conn = sqlite3.connect(test_db)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (meta["decision_id"],)).fetchone()
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
     conn.close()
-
-    assert row is not None
-    assert row["category"] == "mealie"
-    assert row["channel_id"] == CHANNEL_BROCK_HOUSE
-    assert row["handler_type"] == "shell"
-    assert "**Approve Action:**" in row["summary"]
-
-    payload = json.loads(row["payload_json"])
-    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-    assert valid_sh is True, f"Shell payload invalid: {val_err}"
-    assert "task_manager.py add" in payload["command"]
+    assert count == 0
 
 
 def test_dinner_pivot_dry_run(test_db: Path) -> None:
@@ -1165,8 +1174,10 @@ def test_actual_budget_anomaly_silent_when_zero_anomalies(test_db: Path) -> None
     assert meta["anomalies"] == []
 
 
-def test_actual_budget_anomaly_stages_card_for_uncategorized_and_spike(test_db: Path) -> None:
-    """Detects uncategorized merchants, utility spikes (>25%), and cash reserve drift."""
+def test_actual_budget_anomaly_stages_card_for_uncategorized_and_spike(
+    test_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Detects uncategorized merchants, utility spikes (>25%), and cash reserve drift and posts directly to #finances."""
     anomalies = [
         {
             "type": "uncategorized_merchant",
@@ -1190,36 +1201,37 @@ def test_actual_budget_anomaly_stages_card_for_uncategorized_and_spike(test_db: 
         },
     ]
 
+    posted: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        _pdc_module,
+        "_post_channel_message_rest",
+        lambda cid, txt: (posted.append((cid, txt)) or 334455),
+    )
+
     ok, summary, meta = run_actual_budget_anomaly_card(
-        test=True,
+        test=False,
         db_path=test_db,
-        post_to_discord=False,
+        post_to_discord=True,
         anomalies_override=anomalies,
     )
     assert ok is True
-    assert meta["cards_staged"] == 3
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
+    assert meta["discord_message_id"] == 334455
     assert len(meta["anomalies"]) == 3
     assert "Pacific Hardware" in summary
     assert "CleanPower Electric" in summary
     assert "Primary Operating Reserve" in summary
 
-    # Verify staged in SQLite
+    assert len(posted) == 1
+    assert posted[0][0] == CHANNEL_FINANCES
+    assert "Pacific Hardware" in posted[0][1]
+
+    # Verify zero rows staged in SQLite
     conn = sqlite3.connect(test_db)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM forge_decisions ORDER BY id ASC").fetchall()
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
     conn.close()
-
-    assert len(rows) == 3
-    for row in rows:
-        assert row["category"] == "finances"
-        assert row["channel_id"] == CHANNEL_FINANCES
-        assert row["handler_type"] == "shell"
-        assert "**Approve Action:**" in row["summary"]
-
-        payload = json.loads(row["payload_json"])
-        valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-        assert valid_sh is True, f"Shell payload invalid: {val_err}"
-        assert "task_manager.py add" in payload["command"]
+    assert count == 0
 
 
 def test_actual_budget_anomaly_ignores_nominal_utility_increase(test_db: Path) -> None:
@@ -1305,7 +1317,9 @@ def test_actual_budget_anomaly_live_fetcher_fallback_and_read(
 
     ok2, summary2, meta2 = run_actual_budget_anomaly_card(test=False, db_path=test_db, post_to_discord=False)
     assert ok2 is True
-    assert meta2["cards_staged"] == 1
+    assert meta2["cards_staged"] == 0
+    assert meta2["decision_staged"] is False
+    assert len(meta2["anomalies"]) == 1
     assert "Electrician Express" in summary2
 
 
@@ -1332,7 +1346,7 @@ def test_weather_energy_silent_when_nominal(test_db: Path) -> None:
 
 
 def test_weather_energy_triggers_on_rain(test_db: Path) -> None:
-    """Rain >= 0.25 in stages weather pre-adjustment card."""
+    """Rain >= 0.25 in triggers weather pre-adjustment alert without staging a Decision Card."""
     weather = {"rain_inches": 0.45}
     ok, summary, meta = run_weather_energy_card(
         test=True,
@@ -1341,29 +1355,20 @@ def test_weather_energy_triggers_on_rain(test_db: Path) -> None:
         weather_override=weather,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
+    assert len(meta["triggers"]) == 1
     assert "Heavy Rain" in summary
     assert "0.45 in" in summary
 
     conn = sqlite3.connect(test_db)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (meta["decision_id"],)).fetchone()
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
     conn.close()
-
-    assert row is not None
-    assert row["category"] == "home_assistant"
-    assert row["channel_id"] == CHANNEL_HOME_ASSISTANT
-    assert row["handler_type"] == "shell"
-    assert "**Approve Action:**" in row["summary"]
-
-    payload = json.loads(row["payload_json"])
-    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-    assert valid_sh is True, f"Shell payload invalid: {val_err}"
-    assert "task_manager.py add" in payload["command"]
+    assert count == 0
 
 
 def test_weather_energy_triggers_on_heat(test_db: Path) -> None:
-    """Heat >= 90F stages pre-cooling energy adjustment card."""
+    """Heat >= 90F triggers pre-cooling energy alert without staging a Decision Card."""
     weather = {"temp_high": 95.0}
     ok, summary, meta = run_weather_energy_card(
         test=True,
@@ -1372,13 +1377,15 @@ def test_weather_energy_triggers_on_heat(test_db: Path) -> None:
         weather_override=weather,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
+    assert len(meta["triggers"]) == 1
     assert "Extreme Heat" in summary
     assert "95.0°F" in summary
 
 
 def test_weather_energy_triggers_on_cold(test_db: Path) -> None:
-    """Cold <= 38F stages freeze protection and pre-heating card."""
+    """Cold <= 38F triggers freeze protection alert without staging a Decision Card."""
     weather = {"temp_low": 34.0}
     ok, summary, meta = run_weather_energy_card(
         test=True,
@@ -1387,39 +1394,45 @@ def test_weather_energy_triggers_on_cold(test_db: Path) -> None:
         weather_override=weather,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
+    assert len(meta["triggers"]) == 1
     assert "Near-Freezing Cold" in summary
     assert "34.0°F" in summary
 
 
-def test_weather_energy_stages_atomic_cards_for_multiple_triggers(test_db: Path) -> None:
-    """Verifies that multiple weather triggers (rain + extreme heat) stage separate atomic Decision Cards."""
+def test_weather_energy_stages_atomic_cards_for_multiple_triggers(
+    test_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Multiple weather triggers (rain + extreme heat) emit a single clean direct alert to #home-assistant."""
     weather = {"rain_inches": 0.45, "temp_high": 95.0}
+    posted: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        _pdc_module,
+        "_post_channel_message_rest",
+        lambda cid, txt: (posted.append((cid, txt)) or 556677),
+    )
+
     ok, summary, meta = run_weather_energy_card(
-        test=True,
+        test=False,
         db_path=test_db,
-        post_to_discord=False,
+        post_to_discord=True,
         weather_override=weather,
     )
     assert ok is True
-    assert meta["cards_staged"] == 2
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
+    assert meta["discord_message_id"] == 556677
     assert len(meta["triggers"]) == 2
+    assert len(posted) == 1
+    assert posted[0][0] == CHANNEL_HOME_ASSISTANT
+    assert "Heavy Rain" in posted[0][1]
+    assert "Extreme Heat" in posted[0][1]
 
     conn = sqlite3.connect(test_db)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM forge_decisions ORDER BY id ASC").fetchall()
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
     conn.close()
-
-    assert len(rows) == 2
-    for row in rows:
-        assert row["category"] == "home_assistant"
-        assert row["channel_id"] == CHANNEL_HOME_ASSISTANT
-        assert row["handler_type"] == "shell"
-        assert "**Approve Action:**" in row["summary"]
-        payload = json.loads(row["payload_json"])
-        valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-        assert valid_sh is True, f"Shell payload invalid: {val_err}"
-        assert "task_manager.py add" in payload["command"]
+    assert count == 0
 
 
 def test_weather_energy_dry_run(test_db: Path) -> None:
@@ -1496,7 +1509,9 @@ def test_weather_energy_live_fetcher_fallback_and_read(
 
         ok2, summary2, meta2 = run_weather_energy_card(test=False, db_path=test_db, post_to_discord=False)
         assert ok2 is True
-        assert meta2["cards_staged"] == 1
+        assert meta2["cards_staged"] == 0
+        assert meta2["decision_staged"] is False
+        assert len(meta2["triggers"]) == 1
         assert "Extreme Heat" in summary2
         assert "96.5°F" in summary2
 
@@ -1522,7 +1537,7 @@ def test_midweek_grocery_silent_when_zero_items(test_db: Path) -> None:
 
 
 def test_midweek_grocery_stages_card_with_staples_and_tasks(test_db: Path) -> None:
-    """Aggregates due staples and pending tasks into a single shopping Decision Card."""
+    """Aggregates due staples and pending tasks into a clean direct shopping alert without staging a card."""
     override = {
         "due_staples": [
             {"id": "milk", "name": "Organic Whole Milk", "days_elapsed": 7, "cadence_days": 7},
@@ -1541,29 +1556,19 @@ def test_midweek_grocery_stages_card_with_staples_and_tasks(test_db: Path) -> No
         items_override=override,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
     assert meta["due_staples_count"] == 2
     assert meta["task_items_count"] == 2
     assert meta["total_items"] == 4
     assert "Organic Whole Milk" in summary
     assert "Avocado oil spray" in summary
+    assert "**Approve Action:**" not in summary
 
     conn = sqlite3.connect(test_db)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (meta["decision_id"],)).fetchone()
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
     conn.close()
-
-    assert row is not None
-    assert row["category"] == "shopping"
-    assert row["channel_id"] == CHANNEL_SHOPPING
-    assert row["handler_type"] == "shell"
-    assert "**Approve Action:**" in row["summary"]
-
-    payload = json.loads(row["payload_json"])
-    valid_sh, val_err = _validate_decision_shell_payload("shell", payload)
-    assert valid_sh is True, f"Shell payload invalid: {val_err}"
-    assert "whole_foods_afx.py" in payload["command"]
-    assert "task_manager.py add" in payload["command"]
+    assert count == 0
 
 
 def test_midweek_grocery_dry_run(test_db: Path) -> None:
@@ -1591,7 +1596,8 @@ def test_midweek_grocery_untruncated_full_list_and_afx_link(test_db: Path, monke
 
     posted: list[tuple[int, str]] = []
     monkeypatch.setattr(
-        "tools.proactive_decision_cards._post_channel_message_rest",
+        _pdc_module,
+        "_post_channel_message_rest",
         lambda cid, txt: (posted.append((cid, txt)) or 1122334455),
     )
 
@@ -1602,7 +1608,8 @@ def test_midweek_grocery_untruncated_full_list_and_afx_link(test_db: Path, monke
         items_override=override,
     )
     assert ok is True
-    assert meta["cards_staged"] == 1
+    assert meta["cards_staged"] == 0
+    assert meta["decision_staged"] is False
     assert meta["due_staples_count"] == 15
     assert meta["task_items_count"] == 9
     assert meta["total_items"] == 24
@@ -1610,6 +1617,7 @@ def test_midweek_grocery_untruncated_full_list_and_afx_link(test_db: Path, monke
     assert len(posted) == 1
     assert posted[0][0] == CHANNEL_SHOPPING
     assert "more staples" not in posted[0][1]
+    assert "**Approve Action:**" not in posted[0][1]
     assert "more staples" not in summary
     assert "more task items" not in summary
     for i in range(1, 16):
@@ -1622,6 +1630,11 @@ def test_midweek_grocery_untruncated_full_list_and_afx_link(test_db: Path, monke
     assert "1-Click Whole Foods Cart" in summary
     assert "https://www.amazon.com/afx/ingredients/landingencoded" in summary
     assert meta.get("afx_url", "").startswith("https://www.amazon.com/afx/ingredients/landingencoded")
+
+    conn = sqlite3.connect(test_db)
+    count = conn.execute("SELECT COUNT(*) FROM forge_decisions").fetchone()[0]
+    conn.close()
+    assert count == 0
 
 
 # ==============================================================================
