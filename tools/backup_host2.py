@@ -52,7 +52,7 @@ def prune_old_backups(dir_path: str, days: int = RETENTION_DAYS) -> int:
 
 def backup_baseball(ts: str) -> tuple[bool, str]:
     dest = f"/volumeUSB1/usbshare/backups/baseball/baseball_data_{ts}.sql.gz"
-    cmd = f"bash -o pipefail -c \"sudo docker exec baseball_db pg_dump -U myuser -d baseball_data | gzip > '{dest}'\""
+    cmd = f"bash -o pipefail -c \"sudo env PATH=/usr/local/bin:/usr/bin:/bin docker exec baseball_db pg_dump -U myuser -d baseball_data | gzip > '{dest}'\""
     code, _, stderr = run_ssh(cmd, timeout=120)
     if code != 0 or _is_sudo_auth_error(stderr):
         run_ssh(f"rm -f '{dest}'")
