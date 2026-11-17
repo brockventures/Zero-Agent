@@ -7,20 +7,22 @@ and 1-click Whole Foods AFX cart generation.
 
 import argparse
 import json
-import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 WORKSPACE = Path("/workspace")
-STAPLES_FILE = WORKSPACE / "data" / "grocery_staples.json"
-PANTRY_FILE = WORKSPACE / "data" / "pantry_staples.json"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+STAPLES_FILE = (REPO_ROOT / "data" / "grocery_staples.json") if (REPO_ROOT / "data" / "grocery_staples.json").exists() else (WORKSPACE / "data" / "grocery_staples.json")
+PANTRY_FILE = (REPO_ROOT / "data" / "pantry_staples.json") if (REPO_ROOT / "data" / "pantry_staples.json").exists() else (WORKSPACE / "data" / "pantry_staples.json")
 PT = ZoneInfo("America/Los_Angeles")
 
 # Import the core AFX compiler
-sys.path.insert(0, str(WORKSPACE))
-from tools.whole_foods_afx import generate_afx_url, normalize_ingredient_name, AFX_UNITS
+for _p in [str(REPO_ROOT), str(WORKSPACE)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+from tools.whole_foods_afx import generate_afx_url, normalize_ingredient_name
 
 
 def load_pantry_exclusions() -> set[str]:
@@ -29,8 +31,8 @@ def load_pantry_exclusions() -> set[str]:
     try:
         with open(PANTRY_FILE, "r") as f:
             data = json.load(f)
-            return set(item.strip().lower() for item in data.get("excluded_items", []))
-    except Exception:
+            return {item.strip().lower() for item in data.get("excluded_items", [])}
+    except Exception:  # noqa: BLE001
         return set()
 
 
@@ -41,7 +43,7 @@ def load_staples() -> list[dict]:
         with open(STAPLES_FILE, "r") as f:
             data = json.load(f)
             return data.get("staples", [])
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
 
 
@@ -69,7 +71,7 @@ def get_due_staples() -> list[dict]:
                 item_copy = dict(item)
                 item_copy["days_elapsed"] = days_elapsed
                 due.append(item_copy)
-        except Exception:
+        except Exception:  # noqa: BLE001
             due.append(item)
 
     return due
@@ -189,7 +191,7 @@ def parse_single_item(text_clean: str, is_pantry: bool = False, pantry_display: 
                 qty = float(n) / float(d)
             elif len(parts) == 1:
                 qty = float(parts[0].replace("-", "."))
-        except Exception:
+        except Exception:  # noqa: BLE001
             qty = 1.0
 
     unit = "COUNT"
@@ -297,7 +299,7 @@ def extract_active_meal_plan_items() -> tuple[list[dict], list[str], list[dict],
     try:
         with open(plan_file, "r") as f:
             plan = json.load(f)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return [], [], [], []
 
     meals = plan.get("meals", {})
@@ -423,34 +425,36 @@ def generate_quantity_warnings(staged_items: list[dict], manifest: list[dict]) -
 
 
 def sync_costco_tasks(items_to_ensure: list[str]) -> list[str]:
-    """Ensures all Costco items are present on the '🛒 Costco' Google Tasks list without duplicating."""
+    """Ensures all Costco items are present on the 'Costco' Todoist list without duplicating."""
     if not items_to_ensure:
         return []
     try:
-        from tools.google_tasks_grocery import get_pending_groceries, add_grocery_item
-        existing = get_pending_groceries(title="🛒 Costco")
+        from tools.todoist_grocery import add_grocery_item, get_pending_groceries
+        existing = get_pending_groceries(title="Costco")
         existing_titles = {t.get("title", "").strip().lower() for t in existing if t.get("title")}
         added = []
         for item in items_to_ensure:
             clean = item.strip()
             if clean and clean.lower() not in existing_titles:
-                add_grocery_item(clean, list_title="🛒 Costco")
+                add_grocery_item(clean, list_title="Costco")
                 existing_titles.add(clean.lower())
                 added.append(clean)
         return added
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[GroceryManager] Note: Could not sync Costco tasks: {e}", file=sys.stderr)
         return []
 
 
 def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan: bool = True, complete_tasks: bool = False, sync_costco_list: bool = True) -> dict:
     """Ingests pending items from Home Assistant todo.shopping_list + active meal plan recipes + due staples,
-    filters pantry exclusions, routes Costco recipes to '🛒 Costco' Google Tasks list, and compiles a 1-click AFX URL."""
+    filters pantry exclusions, routes Costco recipes to 'Costco' Todoist list, and compiles a 1-click AFX URL."""
     try:
-        from tools.google_tasks_grocery import get_pending_groceries, complete_task
+        from tools.todoist_grocery import complete_task, get_pending_groceries
     except ImportError:
-        sys.path.insert(0, str(WORKSPACE))
-        from tools.google_tasks_grocery import get_pending_groceries, complete_task
+        for _p in [str(REPO_ROOT), str(WORKSPACE)]:
+            if _p not in sys.path:
+                sys.path.insert(0, _p)
+        from tools.todoist_grocery import complete_task, get_pending_groceries
 
     staged_items = []
     task_records = []
@@ -475,27 +479,25 @@ def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan:
             if title:
                 staged_items.append({"name": title, "amount": 1, "unit": "COUNT", "is_user_request": True})
                 task_records.append({"id": it["id"], "source": "ha", "title": title})
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[GroceryManager] Note: Could not fetch Home Assistant items: {e}", file=sys.stderr)
 
-    # 2. Fetch pending items from Google Tasks '🛒 Whole Foods' (if any)
+    # 2. Fetch pending items from Todoist 'Whole Foods' (if any)
     try:
-        from tools.google_tasks_grocery import get_pending_groceries as get_gtasks_groceries
-        pending_tasks = get_gtasks_groceries()
+        from tools.todoist_grocery import get_pending_groceries as get_todoist_groceries
+        pending_tasks = get_todoist_groceries(title="Whole Foods")
         for t in pending_tasks:
             title = t.get("title", "").strip()
             # Avoid duplicate if already pulled from HA
             if title and title.lower() not in [x["name"].lower() for x in staged_items]:
                 staged_items.append({"name": title, "amount": 1, "unit": "COUNT", "is_user_request": True})
-                task_records.append({"id": t["id"], "source": "gtasks", "title": title})
-    except Exception as e:
-        print(f"[GroceryManager] Note: Could not fetch Google Tasks: {e}", file=sys.stderr)
+                task_records.append({"id": t["id"], "source": "todoist", "title": title})
+    except Exception as e:  # noqa: BLE001
+        print(f"[GroceryManager] Note: Could not fetch Todoist tasks: {e}", file=sys.stderr)
 
     # 2. Add due staples & collect Costco items
     due = []
-    costco_items = []
-    for cr_item in costco_recipe_items:
-        costco_items.append(cr_item)
+    costco_items = list(costco_recipe_items)
 
     if sync_costco_list and costco_recipe_items:
         sync_costco_tasks(costco_recipe_items)
@@ -517,14 +519,14 @@ def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan:
                 if not any(s["name"].lower() in c.lower() for c in costco_items):
                     costco_items.append(f"{s['name']} ({cadence_info})")
 
-    # Also check Google Tasks '🛒 Costco' list
+    # Also check Todoist 'Costco' list
     try:
-        costco_tasks = get_pending_groceries(title="🛒 Costco")
+        costco_tasks = get_pending_groceries(title="Costco")
         for ct in costco_tasks:
             t_title = ct.get("title", "").strip()
             if t_title and not any(t_title.lower() in c.lower() or c.lower() in t_title.lower() for c in costco_items):
                 costco_items.append(f"{t_title} (from Costco Task List)")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     # 3. Compile cart
@@ -540,9 +542,9 @@ def compile_weekly_manifest(include_due_staples: bool = True, include_meal_plan:
                 if t.get("source") == "ha":
                     from tools.ha_shopping_list import complete_grocery_item
                     complete_grocery_item(t["id"])
-                elif t.get("source") == "gtasks":
+                elif t.get("source") in ("todoist", "gtasks"):
                     complete_task(t["id"])
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
 
     return {
@@ -563,8 +565,8 @@ def main():
     parser = argparse.ArgumentParser(description="Zero Grocery Manager")
     parser.add_argument("--due-staples", action="store_true", help="List staples due for replenishment")
     parser.add_argument("--stage-due", action="store_true", help="Compile cart containing all due staples")
-    parser.add_argument("--weekly-staging", action="store_true", help="Ingest Google Tasks + due staples and compile weekly Whole Foods cart")
-    parser.add_argument("--complete-tasks", action="store_true", help="Mark ingested Google Tasks complete (use post-checkout)")
+    parser.add_argument("--weekly-staging", action="store_true", help="Ingest Todoist tasks + due staples and compile weekly Whole Foods cart")
+    parser.add_argument("--complete-tasks", action="store_true", help="Mark ingested Todoist tasks complete (use post-checkout)")
     parser.add_argument("--mark-purchased", nargs="+", help="Mark staple IDs or names as purchased today")
     parser.add_argument("--json-out", action="store_true", help="Output JSON format")
     args = parser.parse_args()
@@ -613,13 +615,13 @@ def main():
             assumed = res["assumed_in_stock"]
             url = res["url"]
             print(f"🛒 **Weekly Whole Foods Manifest ({len(manifest)} Items)**")
-            print(f"• Ingested: {res['tasks_ingested']} task(s) from Google Tasks, {res['staples_ingested']} due recurring staple(s)\n")
+            print(f"• Ingested: {res['tasks_ingested']} task(s) from Todoist, {res['staples_ingested']} due recurring staple(s)\n")
             print("### Staged Cart Items:")
             for m in manifest:
                 qty = int(m['amount']) if isinstance(m['amount'], float) and m['amount'].is_integer() else m['amount']
                 print(f"- {qty}x {m['name']} ({m['unit']})")
             if assumed:
-                print(f"\n### 🧂 Assumed in Stock (Pantry Excluded):")
+                print("\n### 🧂 Assumed in Stock (Pantry Excluded):")
                 print(", ".join(assumed))
             print(f"\n🛒 [**1-Click Whole Foods Cart**](<{url}>)")
     else:
