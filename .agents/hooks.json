@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 hooks/search_guard.py",
+            "command": "python3 hooks/search_guard.py || py hooks/search_guard.py",
             "timeout": 30
           }
         ]
@@ -22,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 hooks/batch_guard.py",
+            "command": "python3 hooks/batch_guard.py || py hooks/batch_guard.py",
             "timeout": 30
           }
         ]
@@ -34,7 +34,7 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "python3 hooks/time_context.py",
+        "command": "python3 hooks/time_context.py || py hooks/time_context.py",
         "timeout": 30
       }
     ]
