@@ -511,7 +511,9 @@ def fetch_tomorrow_slots_forecast(target_date: str | None = None) -> dict[str, A
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     if resp.status == 200:
                         data = json.loads(resp.read().decode("utf-8"))
-                        fc = data.get(entity, {}).get("forecast", [])
+                        payload_root = data.get("service_response", data) if isinstance(data, dict) else {}
+                        entity_block = payload_root.get(entity, {}) if isinstance(payload_root, dict) else {}
+                        fc = entity_block.get("forecast", []) if isinstance(entity_block, dict) else []
                         if fc:
                             raw_hourly_forecasts = fc
                             log.info("Fetched %d hourly forecast entries from %s", len(fc), entity)
@@ -531,11 +533,15 @@ def fetch_tomorrow_slots_forecast(target_date: str | None = None) -> dict[str, A
 
         for item in raw_hourly_forecasts:
             dt_str = item.get("datetime")
-            if not dt_str or not dt_str.startswith(target_date_str):
+            if not dt_str or not isinstance(dt_str, str):
                 continue
             try:
-                # Parse ISO timestamp
+                # Parse ISO timestamp and convert timezone-aware datetimes to PT_TZ before matching
                 item_dt = datetime.fromisoformat(dt_str)
+                if item_dt.tzinfo is not None:
+                    item_dt = item_dt.astimezone(PT_TZ)
+                if item_dt.strftime("%Y-%m-%d") != target_date_str:
+                    continue
                 diff = abs(item_dt.hour - target_h)
                 if diff < min_diff:
                     min_diff = diff
@@ -851,12 +857,71 @@ def build_slot_prompt(
 ) -> str:
     """Build a complete, surgical 16:9 prompt for a specific weather card slot.
 
-    Includes style medium, slot lighting, scene flavor, character consistency clause,
-    clothing mapping, right-weighted 42% composition invariant, and negative guardrails.
+    Includes style medium, slot lighting, explicit forecast weather atmosphere,
+    weather-matched attire override mandate, scene flavor, character consistency clause,
+    right-weighted 42% composition invariant, and negative guardrails.
     """
-    clothing_state = weather_info.get("clothing_state", "morning_mild")
+    temp_f = float(weather_info.get("temp_f", 60.0))
+    condition = str(weather_info.get("condition", "partlycloudy") or "partlycloudy").strip()
+    precip = float(weather_info.get("precipitation", 0.0) or 0.0)
+    precip_prob = float(weather_info.get("precipitation_probability", 0.0) or 0.0)
+
+    clothing_state = weather_info.get("clothing_state") or map_weather_to_clothing_state(
+        slot=slot,
+        temp_f=temp_f,
+        condition=condition,
+        precip=precip,
+        precip_prob=precip_prob,
+    )
     clothing_desc = CLOTHING_STATE_PROMPTS.get(clothing_state, CLOTHING_STATE_PROMPTS["morning_mild"])
     lighting_desc = SLOT_LIGHTING.get(slot, SLOT_LIGHTING["morning"])
+
+    cond_norm = condition.lower()
+    is_rain = (
+        any(k in cond_norm for k in ("rain", "pour", "drizzle", "shower", "thunder", "storm", "wet"))
+        or precip > 0.04
+        or precip_prob >= 40.0
+    )
+    if is_rain:
+        sky_desc = "overcast rain showers, wet glistening surfaces, and raindrop ripples in puddles"
+    elif any(k in cond_norm for k in ("cloud", "overcast", "fog", "mist", "haz")):
+        if "partly" in cond_norm:
+            sky_desc = "partly cloudy skies with drifting clouds and soft sunbreaks"
+        else:
+            sky_desc = "overcast cloudy skies with soft diffused light and misty air"
+    elif any(k in cond_norm for k in ("clear", "sun")):
+        sky_desc = "warm sunshine and clear skies" if slot != "evening" else "clear twilight skies"
+    else:
+        sky_desc = f"visible {condition} weather conditions"
+
+    if temp_f <= 48.0:
+        temp_feel = "chilly brisk air"
+    elif temp_f <= 60.0:
+        temp_feel = "cool crisp air"
+    elif temp_f < 75.0:
+        temp_feel = "pleasant mild air"
+    else:
+        temp_feel = "warm summery air"
+
+    precip_parts: list[str] = []
+    if precip > 0.0:
+        precip_parts.append(f"precipitation {precip:.2f} in")
+    if precip_prob > 0.0:
+        precip_parts.append(f"precipitation probability {precip_prob:.0f}%")
+    precip_summary = f", {', '.join(precip_parts)}" if precip_parts else ""
+
+    weather_atmosphere_clause = (
+        f"Forecast Weather ({condition}, {temp_f:.0f}°F{precip_summary}): "
+        f"Depict visible {sky_desc} with {temp_feel} matching the {condition} ({temp_f:.0f}°F) forecast "
+        f"purely through environmental visuals and atmosphere without rendering any text or numbers."
+    )
+
+    attire_mandate_clause = (
+        f"MANDATORY WEATHER-MATCHED ATTIRE ({clothing_state}): {clothing_desc} "
+        f"Rosie, Isaac, and baby Genevieve's outfits MUST strictly match the forecast weather "
+        f"(raincoats/umbrella/boots on wet forecasts, puffer coats/beanies in cold, sweaters/jackets in cool weather, "
+        f"or light breezy clothes in hot weather) rather than copying clothing from the reference image or wearing generic fantasy costumes."
+    )
 
     scene_flavor = theme.get("scene_flavor", {}).get(slot, "scenic picturesque outdoor landscape")
     prompt_style = theme.get("prompt_style", "")
@@ -871,7 +936,8 @@ def build_slot_prompt(
 
     full_prompt = (
         f"{prompt_style}. "
-        f"Atmosphere: {lighting_desc}. "
+        f"{attire_mandate_clause} "
+        f"Atmosphere: {lighting_desc}. {weather_atmosphere_clause} "
         f"Setting: {scene_flavor}.{special_flavor} "
         f"Characters & Attire: {BASE_CHARACTER_CONSISTENCY_CLAUSE} "
         f"Current weather attire ({clothing_state}): {clothing_desc} "

@@ -133,6 +133,41 @@ class TestCharacterConsistencyAndPrompts:
         botw_prompt = hdwa.build_slot_prompt(slot="morning", theme=botw_theme, weather_info=weather)
         assert "glowing friendly winged fairy (Navi)" not in botw_prompt
 
+    def test_build_slot_prompt_weather_atmosphere_and_attire_override(self) -> None:
+        """Verify build_slot_prompt embeds actual forecast condition/temp and attire override mandate."""
+        oot_theme = hdwa.ART_STYLE_VAULT["zelda_oot_kokiri_storybook"]
+        rainy_weather = {
+            "temp_f": 53.0,
+            "condition": "rainy",
+            "precipitation": 0.18,
+            "precipitation_probability": 85.0,
+            "clothing_state": "morning_rain",
+        }
+        rain_prompt = hdwa.build_slot_prompt(slot="morning", theme=oot_theme, weather_info=rainy_weather)
+
+        assert "MANDATORY WEATHER-MATCHED ATTIRE (morning_rain)" in rain_prompt
+        assert rain_prompt.index("MANDATORY WEATHER-MATCHED ATTIRE") < rain_prompt.index("Setting:")
+        assert "Forecast Weather (rainy, 53°F, precipitation 0.18 in, precipitation probability 85%)" in rain_prompt
+        assert "overcast rain showers" in rain_prompt
+        assert "cool crisp air" in rain_prompt
+        assert "raincoats/umbrella/boots on wet forecasts" in rain_prompt
+        assert "rather than copying clothing from the reference image or wearing generic fantasy costumes" in rain_prompt
+        assert "hooded rain slickers" in rain_prompt
+
+        botw_theme = hdwa.ART_STYLE_VAULT["zelda_botw_watercolor"]
+        cold_weather = {
+            "temp_f": 42.0,
+            "condition": "clear",
+            "precipitation": 0.0,
+            "precipitation_probability": 0.0,
+        }
+        cold_prompt = hdwa.build_slot_prompt(slot="evening", theme=botw_theme, weather_info=cold_weather)
+        assert "MANDATORY WEATHER-MATCHED ATTIRE (cold_puffer)" in cold_prompt
+        assert "Forecast Weather (clear, 42°F)" in cold_prompt
+        assert "chilly brisk air" in cold_prompt
+        assert "clear twilight skies" in cold_prompt
+        assert "quilted down puffer coats" in cold_prompt
+
     def test_all_vault_styles_have_scenes_and_mediums(self) -> None:
         """Ensure all 19+ vault styles have required metadata and scene flavors."""
         assert len(hdwa.ART_STYLE_VAULT) >= 19
@@ -564,6 +599,69 @@ class TestForecastRetrieval:
         assert slots["afternoon"]["clothing_state"] == "hot_dress"
 
         assert slots["evening"]["temp_f"] == 59.0
+        assert slots["evening"]["clothing_state"] == "rainy_boots"
+
+    def test_fetch_tomorrow_slots_forecast_service_response_and_utc_conversion(self) -> None:
+        """Verify HA service_response unwrapping and UTC-to-PT datetime conversion (including UTC date rollover)."""
+        target_date = "2026-11-20"
+        mock_ha_service_payload = {
+            "service_response": {
+                "weather.forecast_home": {
+                    "forecast": [
+                        {
+                            # 2026-11-20 16:00 UTC -> 2026-11-20 08:00 PST (morning)
+                            "datetime": "2026-11-20T16:00:00+00:00",
+                            "temperature": 45.0,
+                            "condition": "cloudy",
+                            "precipitation": 0.0,
+                            "precipitation_probability": 15.0,
+                        },
+                        {
+                            # 2026-11-20 22:00 UTC -> 2026-11-20 14:00 PST (afternoon)
+                            "datetime": "2026-11-20T22:00:00Z",
+                            "temperature": 61.0,
+                            "condition": "partlycloudy",
+                            "precipitation": 0.0,
+                            "precipitation_probability": 10.0,
+                        },
+                        {
+                            # 2026-11-21 02:00 UTC -> 2026-11-20 18:00 PST (evening)
+                            "datetime": "2026-11-21T02:00:00+00:00",
+                            "temperature": 51.0,
+                            "condition": "pouring",
+                            "precipitation": 0.25,
+                            "precipitation_probability": 95.0,
+                        },
+                    ]
+                }
+            }
+        }
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps(mock_ha_service_payload).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        with (
+            patch.object(hdwa, "_get_ha_credentials", return_value=("http://198.51.100.10:8123", "mock_token")),
+            patch("urllib.request.urlopen", return_value=mock_resp),
+        ):
+            fc = hdwa.fetch_tomorrow_slots_forecast(target_date=target_date)
+
+        assert fc["source"] == "ha_forecast"
+        slots = fc["slots"]
+        assert slots["morning"]["temp_f"] == 45.0
+        assert slots["morning"]["condition"] == "cloudy"
+        assert slots["morning"]["clothing_state"] == "cold_puffer"
+
+        assert slots["afternoon"]["temp_f"] == 61.0
+        assert slots["afternoon"]["condition"] == "partlycloudy"
+        assert slots["afternoon"]["clothing_state"] == "warm_pants"
+
+        assert slots["evening"]["temp_f"] == 51.0
+        assert slots["evening"]["condition"] == "pouring"
+        assert slots["evening"]["precipitation"] == 0.25
+        assert slots["evening"]["precipitation_probability"] == 95.0
         assert slots["evening"]["clothing_state"] == "rainy_boots"
 
 
