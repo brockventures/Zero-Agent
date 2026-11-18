@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ruff: noqa: BLE001, S110, S112, PLW1510, RUF059
+# ruff: noqa: BLE001, S110, S112, PLW1510, RUF059, EXE001
 """Nightly Dynamic Hearth Weather Art Pipeline with Context Collector & Character Consistency.
 
 Executes daily at 6:30 PM PT to:
@@ -28,7 +28,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from zoneinfo import ZoneInfo
 
 # Add workspace roots to sys.path
@@ -907,9 +907,20 @@ def deploy_to_host2(
     for lf in local_files:
         if not lf.exists():
             return False, f"File does not exist on disk: {lf}"
+        # Ensure local files have writable/readable 0644 permissions before upload
+        try:
+            os.chmod(lf, 0o644)
+        except Exception as e:
+            log.warning("Could not set 0644 permissions on %s: %s", lf, e)
         scp_cmd.append(str(lf.resolve()))
 
     scp_cmd.append(f"{nas_config.SSH_USER}@{nas_config.HOST_2_IP}:{remote_target_dir}/")
+
+    # Ensure remote files have user write permissions so scp overwrites never fail with Permission denied
+    pre_chmod_cmd = f"chmod -R u+w {remote_target_dir} 2>/dev/null || true"
+    rc, stdout, stderr = nas_config.run_ssh(nas_config.HOST_2_IP, pre_chmod_cmd, timeout=30)
+    if rc != 0:
+        log.warning("Pre-upload chmod on Host 2 returned rc=%d: %s", rc, stderr.strip())
 
     log.info("Deploying %d files to Host 2 (%s:%s/)", len(local_files), nas_config.HOST_2_IP, remote_target_dir)
     try:
@@ -990,6 +1001,18 @@ def install_schedule_entry(schedule_file: Path = DEFAULT_SCHEDULE_FILE) -> tuple
 # ---------------------------------------------------------------------------
 # 9. Main Pipeline Execution
 # ---------------------------------------------------------------------------
+class SlotUrl(str):
+    """String URL subclass providing backward-compatible .get() for in-memory consumers."""
+
+    def __new__(cls, content: str, details: dict[str, Any] | None = None) -> Self:
+        obj = super().__new__(cls, content)
+        obj._details = details or {}
+        return obj
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._details.get(key, default)
+
+
 def run_nightly_pipeline(
     target_date: str | None = None,
     theme: str | None = None,
@@ -1035,11 +1058,16 @@ def run_nightly_pipeline(
     # 3. Theme Selection (with same-date theme locking on resume)
     selected_theme: dict[str, Any]
     selection_reason: str
+    existing_date = (
+        existing_manifest.get("target_date") or existing_manifest.get("date")
+        if existing_manifest
+        else None
+    )
     if (
         not force
         and not theme
         and existing_manifest
-        and existing_manifest.get("date") == resolved_date
+        and existing_date == resolved_date
         and existing_manifest.get("theme_key") in ART_STYLE_VAULT
     ):
         locked_theme_key = existing_manifest["theme_key"]
@@ -1076,7 +1104,7 @@ def run_nightly_pipeline(
         not dry_run
         and not force
         and existing_manifest is not None
-        and existing_manifest.get("date") == resolved_date
+        and existing_date == resolved_date
         and existing_manifest.get("theme_key") == theme_key
     )
 
@@ -1113,10 +1141,14 @@ def run_nightly_pipeline(
 
         # Check for valid slot reuse on resume
         reused = False
-        if manifest_matches_context:
-            existing_slots = existing_manifest.get("slots", {})
-            existing_slot = existing_slots.get(slot_name, {})
-            if existing_slot.get("valid") is True and target_card_path.exists():
+        if manifest_matches_context and existing_manifest:
+            existing_slots_meta = existing_manifest.get("slot_details")
+            if not isinstance(existing_slots_meta, dict):
+                raw_slots = existing_manifest.get("slots")
+                existing_slots_meta = raw_slots if isinstance(raw_slots, dict) else {}
+
+            existing_slot = existing_slots_meta.get(slot_name, {})
+            if isinstance(existing_slot, dict) and existing_slot.get("valid") is True and target_card_path.exists():
                 chk = check_image(target_card_path)
                 if chk.get("valid"):
                     log.info(
@@ -1213,9 +1245,12 @@ def run_nightly_pipeline(
 
         manifest_slots[slot_name] = slot_manifest_entry
 
-    # 5. Compile and Write daily_manifest.json
+    # 5. Compile and Write daily_manifest.json (Hearth frontend contract)
     manifest = {
+        "target_date": resolved_date,
         "date": resolved_date,
+        "style_label": selected_theme["name"],
+        "theme_title": selected_theme["name"],
         "generated_at": datetime.now(PT_TZ).isoformat(),
         "theme_key": theme_key,
         "visual_medium": selected_theme["visual_medium"],
@@ -1228,7 +1263,11 @@ def run_nightly_pipeline(
             "matched_themes": family_context["matched_themes"],
             "special_notes": family_context["special_notes"],
         },
-        "slots": manifest_slots,
+        "slots": {
+            slot: SlotUrl(entry.get("relative_url", ""), entry)
+            for slot, entry in manifest_slots.items()
+        },
+        "slot_details": manifest_slots,
     }
 
     manifest_path = out_dir / "daily_manifest.json"

@@ -16,6 +16,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import stat
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -631,10 +632,11 @@ class TestDeploymentToHost2:
         assert "File does not exist" in msg
 
     def test_deploy_to_host2_success(self) -> None:
-        """Verify scp -O and remote prune execution with mocked subprocess and ssh."""
+        """Verify scp -O, pre-upload chmod, and remote prune execution with mocked subprocess and ssh."""
         with TemporaryDirectory() as tmp_dir:
             test_file = Path(tmp_dir) / "daily_test.jpg"
             test_file.write_text("dummy_image_data", encoding="utf-8")
+            test_file.chmod(0o444)  # Start with read-only permissions
 
             mock_proc = MagicMock()
             mock_proc.returncode = 0
@@ -643,12 +645,16 @@ class TestDeploymentToHost2:
 
             with (
                 patch("subprocess.run", return_value=mock_proc) as mock_subproc,
-                patch.object(hdwa.nas_config, "run_ssh", return_value=(0, "deleted 2 files", "")) as mock_ssh,
+                patch.object(hdwa.nas_config, "run_ssh", return_value=(0, "ok", "")) as mock_ssh,
             ):
                 ok, msg = hdwa.deploy_to_host2([test_file])
 
             assert ok is True
             assert "Successfully uploaded" in msg
+
+            # Verify local file permissions updated to 0644
+            mode = stat.S_IMODE(test_file.stat().st_mode)
+            assert mode == 0o644
 
             # Verify scp command structure
             mock_subproc.assert_called_once()
@@ -657,11 +663,59 @@ class TestDeploymentToHost2:
             assert "-O" in cmd_args
             assert str(test_file.resolve()) in cmd_args
 
-            # Verify remote prune called via SSH
-            mock_ssh.assert_called_once()
-            prune_cmd = mock_ssh.call_args[0][1]
+            # Verify pre-upload chmod and remote prune called via SSH
+            assert mock_ssh.call_count == 2
+            pre_cmd = mock_ssh.call_args_list[0][0][1]
+            assert "chmod -R u+w" in pre_cmd
+            prune_cmd = mock_ssh.call_args_list[1][0][1]
             assert "daily_*.jpg" in prune_cmd
             assert "-mtime +3 -delete" in prune_cmd
+
+    def test_deploy_to_host2_chmod_read_only_local_files(self) -> None:
+        """Verify deploy_to_host2 sets 0644 writable permissions on all input files."""
+        with TemporaryDirectory() as tmp_dir:
+            f1 = Path(tmp_dir) / "manifest.json"
+            f2 = Path(tmp_dir) / "daily_morning.jpg"
+            f1.write_text("{}", encoding="utf-8")
+            f2.write_text("fake_jpg", encoding="utf-8")
+            f1.chmod(0o400)
+            f2.chmod(0o555)
+
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+
+            with (
+                patch("subprocess.run", return_value=mock_proc),
+                patch.object(hdwa.nas_config, "run_ssh", return_value=(0, "", "")),
+            ):
+                ok, _ = hdwa.deploy_to_host2([f1, f2])
+
+            assert ok is True
+            assert stat.S_IMODE(f1.stat().st_mode) == 0o644
+            assert stat.S_IMODE(f2.stat().st_mode) == 0o644
+
+    def test_deploy_to_host2_pre_upload_chmod_failure_resilient(self) -> None:
+        """Verify deploy_to_host2 continues upload even if pre-upload remote chmod logs a non-zero exit."""
+        with TemporaryDirectory() as tmp_dir:
+            f = Path(tmp_dir) / "test.jpg"
+            f.write_text("data", encoding="utf-8")
+
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+
+            # First run_ssh (pre_chmod) returns rc=1, second (prune) returns rc=0
+            ssh_returns = [(1, "", "chmod: directory does not exist"), (0, "", "")]
+
+            with (
+                patch("subprocess.run", return_value=mock_proc) as mock_subproc,
+                patch.object(hdwa.nas_config, "run_ssh", side_effect=ssh_returns) as mock_ssh,
+            ):
+                ok, msg = hdwa.deploy_to_host2([f])
+
+            assert ok is True
+            assert "Successfully uploaded" in msg
+            assert mock_subproc.call_count == 1
+            assert mock_ssh.call_count == 2
 
 
 # ===========================================================================
@@ -693,19 +747,32 @@ class TestRunNightlyPipeline:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
             # Verify top-level manifest schema
+            assert manifest["target_date"] == "2026-11-20"
             assert manifest["date"] == "2026-11-20"
+            assert manifest["style_label"] == hdwa.ART_STYLE_VAULT["studio_ghibli_gouache"]["name"]
+            assert manifest["theme_title"] == hdwa.ART_STYLE_VAULT["studio_ghibli_gouache"]["name"]
             assert "generated_at" in manifest
             assert manifest["theme_key"] == "studio_ghibli_gouache"
             assert manifest["visual_medium"] == "studio_ghibli_gouache"
             assert manifest["dry_run"] is True
             assert "context_used" in manifest
             assert "slots" in manifest
+            assert "slot_details" in manifest
 
-            # Verify slot structures
+            # Verify slot structures (Hearth web UI contract: string URLs in slots)
             slots = manifest["slots"]
             assert set(slots.keys()) == {"morning", "afternoon", "evening"}
             for slot_name in ("morning", "afternoon", "evening"):
-                slot_info = slots[slot_name]
+                slot_url = slots[slot_name]
+                assert isinstance(slot_url, str)
+                assert f"daily_2026-11-20_{slot_name}.jpg" in slot_url
+                assert slot_url.startswith("/static/ui/assets/weather-packs/")
+
+            # Verify slot_details contains full metadata
+            slot_details = manifest["slot_details"]
+            assert set(slot_details.keys()) == {"morning", "afternoon", "evening"}
+            for slot_name in ("morning", "afternoon", "evening"):
+                slot_info = slot_details[slot_name]
                 assert "hour" in slot_info
                 assert "clothing_state" in slot_info
                 assert "temp_f" in slot_info
@@ -768,10 +835,12 @@ class TestRunNightlyPipeline:
             mock_deploy.assert_called_once()
 
             manifest = result["manifest"]
-            assert manifest["slots"]["morning"]["valid"] is True
-            assert manifest["slots"]["morning"]["width"] == 1920
-            assert manifest["slots"]["morning"]["height"] == 1080
-            assert manifest["slots"]["morning"]["format"] == "JPEG"
+            assert manifest["target_date"] == "2026-11-20"
+            assert isinstance(manifest["slots"]["morning"], str)
+            assert manifest["slot_details"]["morning"]["valid"] is True
+            assert manifest["slot_details"]["morning"]["width"] == 1920
+            assert manifest["slot_details"]["morning"]["height"] == 1080
+            assert manifest["slot_details"]["morning"]["format"] == "JPEG"
 
             # History must be recorded after successful run
             history = hdwa.load_theme_history(hist_file)
@@ -799,8 +868,8 @@ class TestRunNightlyPipeline:
 
             assert result["success"] is False
             manifest = result["manifest"]
-            assert manifest["slots"]["morning"]["valid"] is False
-            assert "API quota exceeded" in manifest["slots"]["morning"]["error"]
+            assert manifest["slot_details"]["morning"]["valid"] is False
+            assert "API quota exceeded" in manifest["slot_details"]["morning"]["error"]
 
             # Deployment must NOT be attempted if generation failed
             mock_deploy.assert_not_called()
@@ -862,10 +931,10 @@ class TestRunNightlyPipeline:
             assert attempts["evening"] == 1
 
             manifest = result["manifest"]
-            assert manifest["slots"]["morning"]["valid"] is True
-            assert manifest["slots"]["morning"]["retries"] == 1
-            assert manifest["slots"]["afternoon"]["valid"] is True
-            assert "retries" not in manifest["slots"]["afternoon"]
+            assert manifest["slot_details"]["morning"]["valid"] is True
+            assert manifest["slot_details"]["morning"]["retries"] == 1
+            assert manifest["slot_details"]["afternoon"]["valid"] is True
+            assert "retries" not in manifest["slot_details"]["afternoon"]
 
             mock_deploy.assert_called_once()
             assert len(hdwa.load_theme_history(hist_file)) == 1
@@ -893,8 +962,8 @@ class TestRunNightlyPipeline:
             assert result["success"] is False
             assert mock_gen.call_count == 9
             manifest = result["manifest"]
-            assert manifest["slots"]["morning"]["valid"] is False
-            assert "Persistent timeout" in manifest["slots"]["morning"]["error"]
+            assert manifest["slot_details"]["morning"]["valid"] is False
+            assert "Persistent timeout" in manifest["slot_details"]["morning"]["error"]
             mock_deploy.assert_not_called()
             assert len(hdwa.load_theme_history(hist_file)) == 0
 
@@ -985,10 +1054,11 @@ class TestRunNightlyPipeline:
             assert result["success"] is True
             assert mock_gen.call_count == 2
             manifest = result["manifest"]
-            assert manifest["slots"]["morning"]["valid"] is True
-            assert manifest["slots"]["morning"]["reused"] is True
-            assert manifest["slots"]["afternoon"]["valid"] is True
-            assert manifest["slots"]["evening"]["valid"] is True
+            assert manifest["slot_details"]["morning"]["valid"] is True
+            assert manifest["slot_details"]["morning"]["reused"] is True
+            assert manifest["slot_details"]["afternoon"]["valid"] is True
+            assert manifest["slot_details"]["evening"]["valid"] is True
+            assert isinstance(manifest["slots"]["morning"], str)
             mock_deploy.assert_called_once()
             deployed_files = mock_deploy.call_args[0][0]
             assert len(deployed_files) == 4
@@ -1043,7 +1113,7 @@ class TestRunNightlyPipeline:
             assert result["success"] is True
             assert result["manifest"]["theme_key"] == "studio_ghibli_gouache"
             assert mock_gen.call_count == 3
-            assert result["manifest"]["slots"]["morning"].get("reused") is not True
+            assert result["manifest"]["slot_details"]["morning"].get("reused") is not True
 
     def test_run_nightly_pipeline_invalidation_on_force(self) -> None:
         """Verify force=True regenerates all slots and ignores existing valid cards."""
@@ -1095,7 +1165,287 @@ class TestRunNightlyPipeline:
 
             assert result["success"] is True
             assert mock_gen.call_count == 3
-            assert result["manifest"]["slots"]["morning"].get("reused") is not True
+            assert result["manifest"]["slot_details"]["morning"].get("reused") is not True
+
+    def test_hearth_manifest_frontend_contract(self) -> None:
+        """Verify daily_manifest.json strictly matches the Hearth frontend app.js contract."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            hist_file = tmp_path / "history.json"
+
+            result = hdwa.run_nightly_pipeline(
+                target_date="2026-11-20",
+                theme="studio_ghibli_gouache",
+                output_dir=str(out_dir),
+                dry_run=True,
+                history_file=hist_file,
+            )
+
+            assert result["success"] is True
+            manifest = result["manifest"]
+
+            # 1. Hearth contract: target_date is a string and matches date
+            assert isinstance(manifest["target_date"], str)
+            assert manifest["target_date"] == "2026-11-20"
+            assert isinstance(manifest["date"], str)
+            assert manifest["date"] == manifest["target_date"]
+
+            # 2. Hearth contract: style_label and theme_title are strings matching theme name
+            theme_name = hdwa.ART_STYLE_VAULT["studio_ghibli_gouache"]["name"]
+            assert isinstance(manifest["style_label"], str)
+            assert manifest["style_label"] == theme_name
+            assert isinstance(manifest["theme_title"], str)
+            assert manifest["theme_title"] == theme_name
+
+            # 3. Hearth contract: slots[slot] MUST be a string URL/path
+            assert isinstance(manifest["slots"], dict)
+            for slot_name in ("morning", "afternoon", "evening"):
+                slot_url = manifest["slots"][slot_name]
+                assert isinstance(slot_url, str)
+                assert slot_url.startswith("/static/ui/assets/weather-packs/")
+                assert f"daily_2026-11-20_{slot_name}.jpg" in slot_url
+
+            # 4. Hearth contract: slot_details holds rich metadata for resume & forensics
+            assert isinstance(manifest["slot_details"], dict)
+            for slot_name in ("morning", "afternoon", "evening"):
+                details = manifest["slot_details"][slot_name]
+                assert isinstance(details, dict)
+                assert details["valid"] is True
+                assert details["clothing_state"] in hdwa.CLOTHING_STATE_PROMPTS
+                assert isinstance(details["temp_f"], float)
+                assert isinstance(details["filename"], str)
+                assert isinstance(details["relative_url"], str)
+
+            # 5. Forensic disk check: verify serialized JSON format conforms to JS app.js expectations
+            manifest_path = Path(result["manifest_path"])
+            on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
+            assert isinstance(on_disk["target_date"], str)
+            assert on_disk["style_label"] or on_disk["theme_title"]
+            assert isinstance(on_disk["slots"]["morning"], str)
+            assert isinstance(on_disk["slots"]["afternoon"], str)
+            assert isinstance(on_disk["slots"]["evening"], str)
+
+    def test_run_nightly_pipeline_resume_with_new_manifest_contract(self) -> None:
+        """Verify resume on same date with new contract reuses valid cards via slot_details."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            hist_file = tmp_path / "history.json"
+
+            morning_card = out_dir / "daily_2026-11-20_morning.jpg"
+            morning_card.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+
+            # Existing manifest using the new Hearth contract (target_date, string slots, slot_details)
+            existing_manifest = {
+                "target_date": "2026-11-20",
+                "date": "2026-11-20",
+                "theme_key": "snes_pixel_storybook",
+                "style_label": "Super Nintendo 16-Bit Pixel Storybook",
+                "theme_title": "Super Nintendo 16-Bit Pixel Storybook",
+                "slots": {
+                    "morning": "/static/ui/assets/weather-packs/ghibli_rosie_isaac_eve/daily_2026-11-20_morning.jpg",
+                    "afternoon": "/static/ui/assets/weather-packs/ghibli_rosie_isaac_eve/daily_2026-11-20_afternoon.jpg",
+                    "evening": "/static/ui/assets/weather-packs/ghibli_rosie_isaac_eve/daily_2026-11-20_evening.jpg",
+                },
+                "slot_details": {
+                    "morning": {
+                        "valid": True,
+                        "filename": "daily_2026-11-20_morning.jpg",
+                        "relative_url": "/static/ui/assets/weather-packs/ghibli_rosie_isaac_eve/daily_2026-11-20_morning.jpg",
+                    },
+                    "afternoon": {
+                        "valid": False,
+                        "error": "Previous failure",
+                    },
+                    "evening": {
+                        "valid": False,
+                        "error": "Previous failure",
+                    },
+                },
+            }
+            (out_dir / "daily_manifest.json").write_text(json.dumps(existing_manifest), encoding="utf-8")
+
+            def fake_generate_image(prompt: str, **kwargs: Any) -> dict[str, Any]:
+                image_name = kwargs.get("image_name", "")
+                target_p = out_dir / f"{image_name}.jpg"
+                target_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+                return {"success": True, "path": str(target_p)}
+
+            fake_check_image = MagicMock(return_value={
+                "valid": True,
+                "width": 1920,
+                "height": 1080,
+                "format": "JPEG",
+                "size_kb": 256.0,
+            })
+
+            with (
+                patch.object(hdwa, "generate_image_subscription", side_effect=fake_generate_image) as mock_gen,
+                patch.object(hdwa, "check_image", fake_check_image),
+                patch.object(hdwa, "deploy_to_host2", return_value=(True, "Synced")),
+            ):
+                result = hdwa.run_nightly_pipeline(
+                    target_date="2026-11-20",
+                    output_dir=str(out_dir),
+                    dry_run=False,
+                    history_file=hist_file,
+                )
+
+            assert result["success"] is True
+            # Morning was reused, afternoon & evening generated
+            assert mock_gen.call_count == 2
+            manifest = result["manifest"]
+            assert manifest["slot_details"]["morning"]["valid"] is True
+            assert manifest["slot_details"]["morning"]["reused"] is True
+            assert manifest["slot_details"]["afternoon"]["valid"] is True
+            assert manifest["slot_details"]["evening"]["valid"] is True
+            assert isinstance(manifest["slots"]["morning"], str)
+
+    def test_run_nightly_pipeline_resume_with_legacy_manifest_contract(self) -> None:
+        """Verify resume with legacy manifest (date only, dict slots, no slot_details) falls back seamlessly."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            hist_file = tmp_path / "history.json"
+
+            morning_card = out_dir / "daily_2026-11-20_morning.jpg"
+            morning_card.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+
+            # Legacy manifest format: date only, nested dict slots, no slot_details
+            legacy_manifest = {
+                "date": "2026-11-20",
+                "theme_key": "snes_pixel_storybook",
+                "slots": {
+                    "morning": {
+                        "valid": True,
+                        "filename": "daily_2026-11-20_morning.jpg",
+                    },
+                    "afternoon": {
+                        "valid": False,
+                    },
+                    "evening": {
+                        "valid": False,
+                    },
+                },
+            }
+            (out_dir / "daily_manifest.json").write_text(json.dumps(legacy_manifest), encoding="utf-8")
+
+            def fake_generate_image(prompt: str, **kwargs: Any) -> dict[str, Any]:
+                image_name = kwargs.get("image_name", "")
+                target_p = out_dir / f"{image_name}.jpg"
+                target_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+                return {"success": True, "path": str(target_p)}
+
+            fake_check_image = MagicMock(return_value={
+                "valid": True,
+                "width": 1920,
+                "height": 1080,
+                "format": "JPEG",
+                "size_kb": 256.0,
+            })
+
+            with (
+                patch.object(hdwa, "generate_image_subscription", side_effect=fake_generate_image) as mock_gen,
+                patch.object(hdwa, "check_image", fake_check_image),
+                patch.object(hdwa, "deploy_to_host2", return_value=(True, "Synced")),
+            ):
+                result = hdwa.run_nightly_pipeline(
+                    target_date="2026-11-20",
+                    output_dir=str(out_dir),
+                    dry_run=False,
+                    history_file=hist_file,
+                )
+
+            assert result["success"] is True
+            assert mock_gen.call_count == 2
+            manifest = result["manifest"]
+            assert manifest["target_date"] == "2026-11-20"
+            assert manifest["slot_details"]["morning"]["valid"] is True
+            assert manifest["slot_details"]["morning"]["reused"] is True
+            assert isinstance(manifest["slots"]["morning"], str)
+
+    def test_run_nightly_pipeline_resume_string_slots_missing_details(self) -> None:
+        """Verify pipeline handles existing manifest with string slots but no slot_details without crashing."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            hist_file = tmp_path / "history.json"
+
+            # Manifest with string slots and no slot_details
+            sparse_manifest = {
+                "target_date": "2026-11-20",
+                "theme_key": "studio_ghibli_gouache",
+                "slots": {
+                    "morning": "/static/ui/assets/weather-packs/ghibli_rosie_isaac_eve/daily_2026-11-20_morning.jpg",
+                    "afternoon": "/static/ui/assets/weather-packs/ghibli_rosie_isaac_eve/daily_2026-11-20_afternoon.jpg",
+                    "evening": "/static/ui/assets/weather-packs/ghibli_rosie_isaac_eve/daily_2026-11-20_evening.jpg",
+                },
+            }
+            (out_dir / "daily_manifest.json").write_text(json.dumps(sparse_manifest), encoding="utf-8")
+
+            def fake_generate_image(prompt: str, **kwargs: Any) -> dict[str, Any]:
+                image_name = kwargs.get("image_name", "")
+                target_p = out_dir / f"{image_name}.jpg"
+                target_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+                return {"success": True, "path": str(target_p)}
+
+            fake_check_image = MagicMock(return_value={
+                "valid": True,
+                "width": 1920,
+                "height": 1080,
+                "format": "JPEG",
+                "size_kb": 256.0,
+            })
+
+            with (
+                patch.object(hdwa, "generate_image_subscription", side_effect=fake_generate_image) as mock_gen,
+                patch.object(hdwa, "check_image", fake_check_image),
+                patch.object(hdwa, "deploy_to_host2", return_value=(True, "Synced")),
+            ):
+                result = hdwa.run_nightly_pipeline(
+                    target_date="2026-11-20",
+                    output_dir=str(out_dir),
+                    dry_run=False,
+                    history_file=hist_file,
+                )
+
+            assert result["success"] is True
+            # All 3 generated fresh since string slots couldn't provide valid=True
+            assert mock_gen.call_count == 3
+            manifest = result["manifest"]
+            assert manifest["slot_details"]["morning"]["valid"] is True
+            assert isinstance(manifest["slots"]["morning"], str)
+
+    def test_run_nightly_pipeline_resume_target_date_only_theme_locking(self) -> None:
+        """Verify resume with manifest containing only target_date (no date) correctly locks theme."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            hist_file = tmp_path / "history.json"
+
+            existing_manifest = {
+                "target_date": "2026-11-20",
+                "theme_key": "snes_pixel_storybook",
+                "slots": {},
+            }
+            (out_dir / "daily_manifest.json").write_text(json.dumps(existing_manifest), encoding="utf-8")
+
+            result = hdwa.run_nightly_pipeline(
+                target_date="2026-11-20",
+                output_dir=str(out_dir),
+                dry_run=True,
+                history_file=hist_file,
+            )
+
+            assert result["success"] is True
+            assert result["theme"] == hdwa.ART_STYLE_VAULT["snes_pixel_storybook"]["name"]
+            assert result["manifest"]["theme_key"] == "snes_pixel_storybook"
+            assert "theme_locked_resume" in result["manifest"]["selection_reason"]
 
 
 # ===========================================================================
