@@ -10,6 +10,10 @@ INVISIBLE_CHARS_RE = re.compile(
 # HTML stripping regex patterns
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", flags=re.DOTALL)
 SCRIPT_STYLE_RE = re.compile(r"<(script|style|iframe|object|embed)[^>]*>.*?</\1>", flags=re.DOTALL | re.IGNORECASE)
+HIDDEN_TAG_RE = re.compile(
+    r"<([a-zA-Z][a-zA-Z0-9:-]*)\b[^>]*style\s*=\s*(?:[\'\"][^\'\"]*(?:display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px|pt|em|rem)?|opacity\s*:\s*0)[^\'\"]*[\'\"]|(?:display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px|pt|em|rem)?|opacity\s*:\s*0))[^\s>]*[^>]*>.*?</\1>",
+    flags=re.DOTALL | re.IGNORECASE
+)
 HIDDEN_STYLE_RE = re.compile(r'style=[\'"][^\'"]*(display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0|opacity\s*:\s*0)[^\'"]*[\'"]', flags=re.IGNORECASE)
 HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9:-]*(?:\s+[^>]*)?/?>")
 
@@ -35,6 +39,10 @@ def strip_html_safely(raw_html: str) -> str:
         # Fallback: strip tags BEFORE unescaping entities so &lt; / &gt; in technical text are not eaten
         text = HTML_COMMENT_RE.sub("", raw_html)
         text = SCRIPT_STYLE_RE.sub("", text)
+        prev_text = None
+        while prev_text != text:
+            prev_text = text
+            text = HIDDEN_TAG_RE.sub("", text)
         text = HIDDEN_STYLE_RE.sub("", text)
         text = HTML_TAG_RE.sub(" ", text)
         return html.unescape(text)
@@ -71,3 +79,30 @@ def sanitize_discord_display(text: str, max_len: int = 120) -> str:
     # Neutralize markdown quote and subtext spoofing at line starts
     clean = re.sub(r"^([>#\-\*]+)", r" \1", clean, flags=re.MULTILINE)
     return clean.strip()
+
+def sanitize_web_text(raw_text: str, max_length: int = 8000) -> str:
+    """Sanitize inbound untrusted web text against hidden injections, invisible chars, and scripts."""
+    if not raw_text:
+        return ""
+
+    # 1. Normalize Unicode and remove invisible/directional characters
+    text = unicodedata.normalize("NFKC", raw_text)
+    text = INVISIBLE_CHARS_RE.sub("", text)
+
+    # 2. Safely parse and strip HTML, scripts, iframes, and hidden CSS blocks
+    text = strip_html_safely(text)
+
+    # 3. Collapse whitespace
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    # 4. Length ceiling truncation
+    if len(text) > max_length:
+        text = text[: max_length - 3] + "..."
+
+    return text
+
+def wrap_untrusted_web_payload(text: str, source: str = "web") -> str:
+    """Sanitize untrusted web text and wrap it within explicit XML-style security boundaries."""
+    sanitized = sanitize_web_text(text)
+    return f'<untrusted_web_payload source="{source}">\n{sanitized}\n</untrusted_web_payload>'

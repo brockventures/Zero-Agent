@@ -33,6 +33,11 @@ try:
 except ImportError:
     from tools.serpapi_guard import acquire_quota
 
+try:
+    from email_sanitizer import sanitize_web_text
+except ImportError:
+    from tools.email_sanitizer import sanitize_web_text
+
 
 def get_api_key() -> str:
     """Retrieve SerpApi API key from environment or secrets file."""
@@ -165,10 +170,12 @@ def search_reddit(
         if "reddit.com" not in link:
             continue
 
+        raw_title = item.get("title", "").replace(" : r/", " - r/")
+        raw_snippet = item.get("snippet", "")
         threads.append({
-            "title": item.get("title", "").replace(" : r/", " - r/"),
+            "title": sanitize_web_text(raw_title),
             "link": link,
-            "snippet": item.get("snippet", ""),
+            "snippet": sanitize_web_text(raw_snippet),
             "displayed_link": item.get("displayed_link", ""),
             "date": item.get("date", ""),
             "position": item.get("position")
@@ -179,6 +186,7 @@ def search_reddit(
         "query": params["q"],
         "recency": recency,
         "count": len(threads),
+        "untrusted_boundary": '<untrusted_web_payload source="reddit">',
         "threads": threads[:limit]
     }
 
