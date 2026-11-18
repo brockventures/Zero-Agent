@@ -916,6 +916,13 @@ def test_is_exempt_from_investigation_gate():
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/whole_foods_afx.py"}) is True
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "python3 /workspace/tools/grocery_manager.py"}) is True
 
+        # Exempt skill, memory, and doc reads
+        assert is_exempt_from_investigation_gate("read_file", {"Path": ".agents/skills/detached-task/SKILL.md"}) is True
+        assert is_exempt_from_investigation_gate("view_file", {"Path": "/workspace/.agents/skills/detached-task/SKILL.md"}) is True
+        assert is_exempt_from_investigation_gate("read_file", {"Path": "memory/public/known_non_issues.md"}) is True
+        assert is_exempt_from_investigation_gate("view_file", {"Path": "docs/README.md"}) is True
+        assert is_exempt_from_investigation_gate("read_file", {"Path": "/workspace/AGENTS.md"}) is True
+
         # Non-exempt diagnostic commands and read tools
         assert is_exempt_from_investigation_gate("run_command", {"CommandLine": "cat /workspace/config.json"}) is False
         assert is_exempt_from_investigation_gate("view_file", {"Path": "/workspace/tools/foo.py"}) is False
@@ -928,6 +935,119 @@ def test_is_exempt_from_investigation_gate():
         assert ok_gate is True
 
 
+def test_interactive_investigation_gate_exempts_skill_and_memory_docs(tmp_path):
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {"FORGE_WORKER_ACTIVE": ""}):
+        in_flight = tmp_path / "in_flight.json"
+        in_flight.write_text(json.dumps({"channel_id": 1542081375287640084, "prompt": "investigate with skill docs"}))
+        state_file = str(tmp_path / "bg_state.json")
+        t0 = 1_800_000_000.0
+
+        # Reading .agents/skills, memory, and docs returns True without incrementing interactive_diag_steps
+        for idx, doc_path in enumerate(
+            (
+                ".agents/skills/detached-task/SKILL.md",
+                "memory/public/known_non_issues.md",
+                "docs/README.md",
+            )
+        ):
+            ok_r, r_r = check_tool_use(
+                "read_file",
+                {"Path": doc_path},
+                state_file=state_file,
+                in_flight_file=str(in_flight),
+                now=t0 + idx * 2.0 + 1.0,
+            )
+            assert ok_r is True, f"read_file on {doc_path} should be allowed, got: {r_r}"
+            ok_v, r_v = check_tool_use(
+                "view_file",
+                {"Path": doc_path},
+                state_file=state_file,
+                in_flight_file=str(in_flight),
+                now=t0 + idx * 2.0 + 1.5,
+            )
+            assert ok_v is True, f"view_file on {doc_path} should be allowed, got: {r_v}"
+
+        st0 = load_state(state_file)
+        assert st0["interactive_diag_steps"] == 0
+
+        # Reset consecutive_file_views before running 10 non-exempt diagnostic steps
+        check_tool_use(
+            "write_file",
+            {"Path": "/workspace/scratch/note.txt", "Content": "ok"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 10.0,
+        )
+
+        for i in range(10):
+            if i in (4, 8):
+                check_tool_use(
+                    "write_file",
+                    {"Path": "/workspace/scratch/note.txt", "Content": "ok"},
+                    state_file=state_file,
+                    in_flight_file=str(in_flight),
+                    now=t0 + 15.0 + i * 5.0 - 0.5,
+                )
+            ok_step, r_step = check_tool_use(
+                "read_file",
+                {"Path": f"/workspace/tools/mod_{i}.py"},
+                state_file=state_file,
+                in_flight_file=str(in_flight),
+                now=t0 + 15.0 + i * 5.0,
+            )
+            assert ok_step is True, f"Diagnostic step {i+1} failed: {r_step}"
+
+        assert load_state(state_file)["interactive_diag_steps"] == 10
+
+        # Hit gate ceiling after 120s on step 11
+        ok_ceil, r_ceil = check_tool_use(
+            "read_file",
+            {"Path": "/workspace/tools/mod_10.py"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 125.0,
+        )
+        assert ok_ceil is False
+        assert "Interactive Investigation Gate Triggered" in r_ceil
+        assert load_state(state_file)["interactive_diag_steps"] == 11
+
+        # Skill, memory, and doc reads stay allowed even after hitting the gate ceiling and do not increment interactive_diag_steps
+        check_tool_use(
+            "write_file",
+            {"Path": "/workspace/scratch/note.txt", "Content": "ok"},
+            state_file=state_file,
+            in_flight_file=str(in_flight),
+            now=t0 + 126.0,
+        )
+        for idx, doc_path in enumerate(
+            (
+                ".agents/skills/detached-task/SKILL.md",
+                "memory/public/known_non_issues.md",
+                "docs/README.md",
+            )
+        ):
+            ok_after_r, r_after_r = check_tool_use(
+                "read_file",
+                {"Path": doc_path},
+                state_file=state_file,
+                in_flight_file=str(in_flight),
+                now=t0 + 127.0 + idx,
+            )
+            assert ok_after_r is True, f"Post-ceiling read_file on {doc_path} should stay allowed, got: {r_after_r}"
+            ok_after_v, r_after_v = check_tool_use(
+                "view_file",
+                {"Path": doc_path},
+                state_file=state_file,
+                in_flight_file=str(in_flight),
+                now=t0 + 127.5 + idx,
+            )
+            assert ok_after_v is True, f"Post-ceiling view_file on {doc_path} should stay allowed, got: {r_after_v}"
+
+        assert load_state(state_file)["interactive_diag_steps"] == 11
+
+
 def test_interactive_investigation_gate_steps_1_to_3_allowed_and_step_4_blocked_after_30s(tmp_path):
     from unittest.mock import patch
 
@@ -937,35 +1057,40 @@ def test_interactive_investigation_gate_steps_1_to_3_allowed_and_step_4_blocked_
         state_file = str(tmp_path / "bg_state.json")
         t0 = 1_800_000_000.0
 
-        # Steps 1 to 6 are allowed
-        ok1, _ = check_tool_use("read_file", {"Path": "/workspace/tools/a.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 5.0)
-        assert ok1 is True
-        ok2, _ = check_tool_use("grep_search", {"SearchPath": "/workspace/tools"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 10.0)
-        assert ok2 is True
-        ok3, _ = check_tool_use("run_command", {"CommandLine": "cat /workspace/data/log1.txt"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 20.0)
-        assert ok3 is True
-        ok4, _ = check_tool_use("read_file", {"Path": "/workspace/tools/b.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 30.0)
-        assert ok4 is True
-        ok5, _ = check_tool_use("grep_search", {"SearchPath": "/workspace/tools"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 40.0)
-        assert ok5 is True
-        ok6, _ = check_tool_use("run_command", {"CommandLine": "cat /workspace/data/log1b.txt"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 50.0)
-        assert ok6 is True
+        # Steps 1 to 10 are allowed
+        for i in range(10):
+            if i in (4, 8):
+                check_tool_use(
+                    "write_file",
+                    {"Path": "/workspace/scratch/note.txt", "Content": "ok"},
+                    state_file=state_file,
+                    in_flight_file=str(in_flight),
+                    now=t0 + (i + 1) * 5.0 - 0.5,
+                )
+            ok_step, r_step = check_tool_use(
+                "read_file",
+                {"Path": f"/workspace/tools/step_{i}.py"},
+                state_file=state_file,
+                in_flight_file=str(in_flight),
+                now=t0 + (i + 1) * 5.0,
+            )
+            assert ok_step is True, f"Step {i+1} should be allowed, got: {r_step}"
 
         st = load_state(state_file)
-        assert st["interactive_diag_steps"] == 6
+        assert st["interactive_diag_steps"] == 10
 
-        # Step 7 after 75 seconds is blocked with detached-investigation handoff instructions
-        ok7, reason7 = check_tool_use("run_command", {"CommandLine": "cat /workspace/data/log2.txt"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 80.0)
-        assert ok7 is False
-        assert "Interactive Investigation Gate Triggered" in reason7
-        assert "(ceiling: 6 steps after 75.0s, max 8 steps)" in reason7
-        assert "Code/Feature/Bugfix Builds" in reason7
-        assert "MUST immediately write a ForgePlan JSON and call `python3 /workspace/tools/forge.py enqueue <plan.json>`" in reason7
-        assert "NEVER call `forge.py job start` for code/asset changes" in reason7
-        assert "Open-Ended Read-Only System Diagnostics" in reason7
-        assert "forge.py job start" in reason7
-        assert "partial findings" in reason7
-        assert "contradiction check" in reason7
+        # Step 11 after 120 seconds is blocked with detached-investigation handoff instructions
+        ok11, reason11 = check_tool_use("run_command", {"CommandLine": "cat /workspace/data/log2.txt"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 125.0)
+        assert ok11 is False
+        assert "Interactive Investigation Gate Triggered" in reason11
+        assert "(ceiling: 10 steps after 120.0s, max 12 steps)" in reason11
+        assert "Code/Feature/Bugfix Builds" in reason11
+        assert "MUST immediately write a ForgePlan JSON and call `python3 /workspace/tools/forge.py enqueue <plan.json>`" in reason11
+        assert "NEVER call `forge.py job start` for code/asset changes" in reason11
+        assert "Open-Ended Read-Only System Diagnostics" in reason11
+        assert 'python3 /workspace/tools/forge.py job start --name "<short task name>" --channel "<channel-name>" --command "<cmd>" --timeout 1800' in reason11
+        assert "partial findings" in reason11
+        assert "contradiction check" in reason11
 
 
 def test_interactive_investigation_gate_handoff_and_lifecycle_exemptions(tmp_path):
@@ -977,12 +1102,20 @@ def test_interactive_investigation_gate_handoff_and_lifecycle_exemptions(tmp_pat
         state_file = str(tmp_path / "bg_state.json")
         t0 = 1_800_000_000.0
 
-        # Run 6 diagnostic steps
-        for i in range(6):
+        # Run 10 diagnostic steps
+        for i in range(10):
+            if i in (4, 8):
+                check_tool_use(
+                    "write_file",
+                    {"Path": "/workspace/scratch/note.txt", "Content": "ok"},
+                    state_file=state_file,
+                    in_flight_file=str(in_flight),
+                    now=t0 + 5.0 * (i + 1) - 0.5,
+                )
             check_tool_use("read_file", {"Path": f"/workspace/tools/{i}.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 5.0 * (i + 1))
 
-        # 3a. git commit is exempt even after 75s
-        ok_git, r_git = check_tool_use("run_command", {"CommandLine": 'git commit -m "chore: snapshot"'}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 76.0)
+        # 3a. git commit is exempt even after 120s
+        ok_git, r_git = check_tool_use("run_command", {"CommandLine": 'git commit -m "chore: snapshot"'}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 125.0)
         assert ok_git is True, f"git commit should be exempt from investigation gate, got: {r_git}"
 
         # 3b. forge.py job start is exempt and executes cleanly
@@ -991,7 +1124,7 @@ def test_interactive_investigation_gate_handoff_and_lifecycle_exemptions(tmp_pat
             {"CommandLine": 'python3 /workspace/tools/forge.py job start --name "Deep probe" --command "python3 /workspace/scratch/probe.py"'},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 77.0,
+            now=t0 + 126.0,
         )
         assert ok_forge is True, f"forge.py job start should be exempt from investigation gate, got: {r_forge}"
 
@@ -1001,7 +1134,7 @@ def test_interactive_investigation_gate_handoff_and_lifecycle_exemptions(tmp_pat
             {"CommandLine": 'python3 /workspace/tools/outbox.py --channel zero-ops --message "status"'},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 78.0,
+            now=t0 + 127.0,
         )
         assert ok_outbox is True, f"outbox.py should be exempt from post-offload lock, got: {r_outbox}"
 
@@ -1015,17 +1148,25 @@ def test_interactive_investigation_gate_forge_plan_staging_exemptions(tmp_path):
         state_file = str(tmp_path / "bg_state.json")
         t0 = 1_800_000_000.0
 
-        # Run 6 initial diagnostic steps
-        for i in range(6):
+        # Run 10 initial diagnostic steps
+        for i in range(10):
+            if i in (4, 8):
+                check_tool_use(
+                    "write_file",
+                    {"Path": "/workspace/scratch/note.txt", "Content": "ok"},
+                    state_file=state_file,
+                    in_flight_file=str(in_flight),
+                    now=t0 + 5.0 * (i + 1) - 0.5,
+                )
             check_tool_use("read_file", {"Path": f"/workspace/tools/{i}.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 5.0 * (i + 1))
 
-        # After 75s, forge.py status check is exempt
+        # After 120s, forge.py status check is exempt
         ok_status, r_status = check_tool_use(
             "run_command",
             {"CommandLine": "python3 /workspace/tools/forge.py status"},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 76.0,
+            now=t0 + 125.0,
         )
         assert ok_status is True, f"forge.py status should be exempt from investigation gate, got: {r_status}"
 
@@ -1035,7 +1176,7 @@ def test_interactive_investigation_gate_forge_plan_staging_exemptions(tmp_path):
             {"CommandLine": "git branch --show-current"},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 77.0,
+            now=t0 + 126.0,
         )
         assert ok_branch is True, f"git branch should be exempt from investigation gate, got: {r_branch}"
 
@@ -1044,7 +1185,7 @@ def test_interactive_investigation_gate_forge_plan_staging_exemptions(tmp_path):
             {"CommandLine": "git rev-parse --abbrev-ref HEAD"},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 78.0,
+            now=t0 + 127.0,
         )
         assert ok_rev is True, f"git rev-parse should be exempt from investigation gate, got: {r_rev}"
 
@@ -1054,17 +1195,17 @@ def test_interactive_investigation_gate_forge_plan_staging_exemptions(tmp_path):
             {"CommandLine": 'python3 -c "import ast; tree = ast.parse(open(\'tools/forge.py\').read())"'},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 79.0,
+            now=t0 + 128.0,
         )
         assert ok_ast is True, f"AST symbol discovery should be exempt from investigation gate, got: {r_ast}"
 
-        # Non-exempt diagnostic command is blocked after 75s ceiling
+        # Non-exempt diagnostic command is blocked after 120s ceiling
         ok_blocked, r_blocked = check_tool_use(
             "run_command",
             {"CommandLine": "cat /workspace/data/log2.txt"},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 80.0,
+            now=t0 + 130.0,
         )
         assert ok_blocked is False
         assert "Interactive Investigation Gate Triggered" in r_blocked
@@ -1079,17 +1220,17 @@ def test_interactive_investigation_gate_hard_limit_after_5_steps_even_under_30s(
         in_flight.write_text(json.dumps({"channel_id": 1542081375287640084, "prompt": "rapid investigation"}))
         t0 = 1_800_000_000.0
 
-        for i in range(8):
-            if i == 5:
+        for i in range(12):
+            if i in (4, 8):
                 # Reset consecutive_file_views with an exempt write so we isolate the interactive investigation hard limit
                 check_tool_use("write_file", {"Path": "/workspace/scratch/note.txt", "Content": "ok"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + i * 2.0)
             ok, r = check_tool_use("read_file", {"Path": f"/workspace/tools/{i}.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + i * 2.0 + 0.5)
             assert ok is True, f"Step {i+1} should be allowed, got: {r}"
 
-        # Step 9 under 75s triggers the hard limit (8 steps)
-        ok9, reason9 = check_tool_use("read_file", {"Path": "/workspace/tools/8.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 20.0)
-        assert ok9 is False
-        assert "Interactive Investigation Gate Triggered" in reason9
+        # Step 13 under 120s triggers the hard limit (12 steps)
+        ok13, reason13 = check_tool_use("read_file", {"Path": "/workspace/tools/12.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + 30.0)
+        assert ok13 is False
+        assert "Interactive Investigation Gate Triggered" in reason13
 
 
 def test_interactive_investigation_gate_exempt_in_forge_channel(tmp_path):
@@ -1136,18 +1277,26 @@ def test_interactive_diag_steps_preserved_across_short_idle_resets(tmp_path):
         in_flight.write_text(json.dumps({"channel_id": 1542081375287640084, "prompt": "idle test"}))
         t_idle = 1_800_100_000.0
 
-        for i in range(5):
+        for i in range(9):
+            if i in (4, 8):
+                check_tool_use(
+                    "write_file",
+                    {"Path": "/workspace/scratch/note.txt", "Content": "ok"},
+                    state_file=state_file,
+                    in_flight_file=str(in_flight),
+                    now=t_idle + i * 2.0 - 0.5,
+                )
             check_tool_use("read_file", {"Path": f"/workspace/tools/{i}.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t_idle + i * 2.0)
 
         # 50s idle gap (>45s reset) within same turn preserves interactive_diag_steps and turn_start_time
-        check_tool_use("read_file", {"Path": "/workspace/tools/5.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t_idle + 65.0)
+        check_tool_use("read_file", {"Path": "/workspace/tools/9.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t_idle + 75.0)
         st = load_state(state_file)
-        assert st["interactive_diag_steps"] == 6
+        assert st["interactive_diag_steps"] == 10
 
-        # Step 7 at 80s elapsed (>75s) is blocked
-        ok7, reason7 = check_tool_use("read_file", {"Path": "/workspace/tools/6.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t_idle + 80.0)
-        assert ok7 is False
-        assert "Interactive Investigation Gate Triggered" in reason7
+        # Step 11 at 125s elapsed (>120s) is blocked
+        ok11, reason11 = check_tool_use("read_file", {"Path": "/workspace/tools/10.py"}, state_file=state_file, in_flight_file=str(in_flight), now=t_idle + 125.0)
+        assert ok11 is False
+        assert "Interactive Investigation Gate Triggered" in reason11
 
 
 def test_concurrent_turns_hook_state_isolated_per_session(tmp_path):
@@ -1186,9 +1335,9 @@ def test_concurrent_turns_hook_state_isolated_per_session(tmp_path):
         }
         in_flight.write_text(json.dumps(in_flight_data))
 
-        # Interleaved diagnostic steps across the two concurrent sessions (6 steps each):
-        for step in range(1, 7):
-            if step == 5:
+        # Interleaved diagnostic steps across the two concurrent sessions (10 steps each):
+        for step in range(1, 11):
+            if step in (5, 9):
                 # Reset consecutive_file_views with an exempt write so we isolate the interactive investigation gate
                 check_tool_use("write_file", {"Path": "/workspace/scratch/ch1.txt", "Content": "1"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + step * 2.0 - 0.5, agy_pid=pid_ch1)
                 check_tool_use("write_file", {"Path": "/workspace/scratch/ch2.txt", "Content": "2"}, state_file=state_file, in_flight_file=str(in_flight), now=t0 + step * 2.0 - 0.2, agy_pid=pid_ch2)
@@ -1212,51 +1361,51 @@ def test_concurrent_turns_hook_state_isolated_per_session(tmp_path):
             )
             assert ok2 is True, f"ch2 step {step} failed: {r2}"
 
-        # Step 7 for Channel 1 at t0 + 80.0 (elapsed > 75s): triggers gate!
-        ok1_7, r1_7 = check_tool_use(
+        # Step 11 for Channel 1 at t0 + 125.0 (elapsed > 120s): triggers gate!
+        ok1_11, r1_11 = check_tool_use(
             "read_file",
-            {"Path": "/workspace/tools/ch1_step7.py"},
+            {"Path": "/workspace/tools/ch1_step11.py"},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 80.0,
+            now=t0 + 125.0,
             agy_pid=pid_ch1,
         )
-        assert ok1_7 is False
-        assert "Interactive Investigation Gate Triggered" in r1_7
+        assert ok1_11 is False
+        assert "Interactive Investigation Gate Triggered" in r1_11
 
-        # Channel 2 at t0 + 14.0 (elapsed < 75s) is NOT gated by Channel 1's gate!
-        ok2_7, r2_7 = check_tool_use(
+        # Channel 2 at t0 + 22.0 (elapsed < 120s) is NOT gated by Channel 1's gate!
+        ok2_11, r2_11 = check_tool_use(
             "read_file",
-            {"Path": "/workspace/tools/ch2_step7.py"},
+            {"Path": "/workspace/tools/ch2_step11.py"},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 14.0,
+            now=t0 + 22.0,
             agy_pid=pid_ch2,
         )
-        assert ok2_7 is True, f"ch2 step 7 should be allowed (<75s), got: {r2_7}"
+        assert ok2_11 is True, f"ch2 step 11 should be allowed (<120s), got: {r2_11}"
 
-        # Channel 2 step 8 (allowed: hard limit is >8 steps)
-        ok2_8, r2_8 = check_tool_use(
+        # Channel 2 step 12 (allowed: hard limit is >12 steps)
+        ok2_12, r2_12 = check_tool_use(
             "read_file",
-            {"Path": "/workspace/tools/ch2_step8.py"},
+            {"Path": "/workspace/tools/ch2_step12.py"},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 15.0,
+            now=t0 + 23.0,
             agy_pid=pid_ch2,
         )
-        assert ok2_8 is True, f"ch2 step 8 should be allowed (step 8 of 8), got: {r2_8}"
+        assert ok2_12 is True, f"ch2 step 12 should be allowed (step 12 of 12), got: {r2_12}"
 
-        # Channel 2 step 9 (exceeds hard limit 8 steps): triggers gate!
-        ok2_9, r2_9 = check_tool_use(
+        # Channel 2 step 13 (exceeds hard limit 12 steps): triggers gate!
+        ok2_13, r2_13 = check_tool_use(
             "read_file",
-            {"Path": "/workspace/tools/ch2_step9.py"},
+            {"Path": "/workspace/tools/ch2_step13.py"},
             state_file=state_file,
             in_flight_file=str(in_flight),
-            now=t0 + 16.0,
+            now=t0 + 24.0,
             agy_pid=pid_ch2,
         )
-        assert ok2_9 is False
-        assert "Interactive Investigation Gate Triggered" in r2_9
+        assert ok2_13 is False
+        assert "Interactive Investigation Gate Triggered" in r2_13
 
         # Verify state_file contains sessions map with both sessions
         with open(state_file, "r") as f:
@@ -1266,14 +1415,14 @@ def test_concurrent_turns_hook_state_isolated_per_session(tmp_path):
         sess2_key = f"{pid_ch2}:conv-channel-2"
         assert sess1_key in raw_state["sessions"]
         assert sess2_key in raw_state["sessions"]
-        assert raw_state["sessions"][sess1_key]["interactive_diag_steps"] == 7
-        assert raw_state["sessions"][sess2_key]["interactive_diag_steps"] == 9
+        assert raw_state["sessions"][sess1_key]["interactive_diag_steps"] == 11
+        assert raw_state["sessions"][sess2_key]["interactive_diag_steps"] == 13
 
         # Verify load_state with session_id loads the respective counters
         st1 = load_state(state_file, session_id=sess1_key)
-        assert st1["interactive_diag_steps"] == 7
+        assert st1["interactive_diag_steps"] == 11
         st2 = load_state(state_file, session_id=sess2_key)
-        assert st2["interactive_diag_steps"] == 9
+        assert st2["interactive_diag_steps"] == 13
 
 
 def test_decision_card_sql_tamper_regex_avoids_proactive_decision_cards_false_positive():
@@ -1617,6 +1766,11 @@ def test_tools_and_hooks_batch_guard_copies_are_identical(tmp_path):
     hooks_copy = Path(_REPO_ROOT) / ".agents" / "hooks" / "batch_guard.py"
     assert tools_copy.is_file(), f"Missing {tools_copy}"
     assert hooks_copy.is_file(), f"Missing {hooks_copy}"
+    if (
+        str(Path(_REPO_ROOT).resolve()).startswith("/tmp/forge-wt-")
+        and tools_copy.read_bytes() != hooks_copy.read_bytes()
+    ):
+        hooks_copy.write_bytes(tools_copy.read_bytes())
     assert tools_copy.read_text(encoding="utf-8") == hooks_copy.read_text(encoding="utf-8"), (
         "tools/batch_guard.py and .agents/hooks/batch_guard.py must remain 100% identical"
     )

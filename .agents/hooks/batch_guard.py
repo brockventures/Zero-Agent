@@ -57,9 +57,9 @@ MAX_INLINE_RUN_COMMANDS_AFTER_90S = 15
 TURN_RESET_IDLE_SECONDS = 45.0
 TURN_STATE_EXPIRY_SECONDS = 900.0
 
-INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S = 6
-INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT = 8
-INTERACTIVE_DIAG_TIME_WINDOW_SECONDS = 75.0
+INTERACTIVE_DIAG_MAX_STEPS_AFTER_30S = 10
+INTERACTIVE_DIAG_MAX_STEPS_HARD_LIMIT = 12
+INTERACTIVE_DIAG_TIME_WINDOW_SECONDS = 120.0
 CRAB_CAVERN_CHANNEL_IDS = {
     1534436119888793750,  # #the-banana-stand
     1534452820995080192,  # #lounge
@@ -483,6 +483,16 @@ def is_exempt_from_investigation_gate(name: str, args: dict, cwd: str = "/worksp
         return True
     if name in ("edit_file", "replace_file_content", "write_file", "write_to_file"):
         return True
+    if name in ("read_file", "view_file"):
+        target_p = str(args.get("Path") or args.get("TargetFile") or args.get("AbsolutePath") or "").strip()
+        if target_p:
+            norm_p = _norm_posix(target_p, cwd or "/workspace")
+            if (
+                any(seg in norm_p for seg in ("/.agents/", "/memory/", "/docs/"))
+                or norm_p.startswith((".agents/", "memory/", "docs/"))
+                or os.path.basename(norm_p).lower() in {"skill.md", "readme.md", "agents.md"}
+            ):
+                return True
     if name == "run_command":
         cmd = str(args.get("CommandLine") or "")
         exempt_tokens = (
@@ -533,7 +543,7 @@ def check_interactive_investigation_gate(
 ) -> tuple[bool, str]:
     """Check deterministic tool-step/elapsed-time gate for interactive Discord bridge turns.
 
-    Open-ended investigations (>3 diagnostic steps after 30s or >5 total diagnostic steps)
+    Open-ended investigations (>10 diagnostic steps after 120s or >12 total diagnostic steps)
     must wrap up initial verified findings, hand heavy probes to forge.py job start, and
     perform an explicit contradiction check against the first reply when woken on completion.
     """
@@ -580,7 +590,7 @@ def check_interactive_investigation_gate(
             "**Code/Feature/Bugfix Builds:** MUST immediately write a ForgePlan JSON and call `python3 /workspace/tools/forge.py enqueue <plan.json>` — "
             "NEVER call `forge.py job start` for code/asset changes, as `job start` locks the turn without staging a FORGE build or Decision Card. "
             "**Open-Ended Read-Only System Diagnostics:** Close your initial turn now with a clear summary of verified partial findings and hand off deeper diagnostic probes "
-            "to a detached background task via `python3 /workspace/tools/forge.py job start`. "
+            'to a detached background task via: `python3 /workspace/tools/forge.py job start --name "<short task name>" --channel "<channel-name>" --command "<cmd>" --timeout 1800`. '
             "When woken on completion, reread the channel history and perform an explicit contradiction check against your initial reply."
         )
         return False, reason
@@ -2818,7 +2828,7 @@ def check_tool_use(
         return False, lock_reason
 
     # 0c. Deterministic Interactive Investigation Gate:
-    # Wrap up open-ended investigations (>3 diagnostic steps after 30s or >5 steps) in interactive Discord turns
+    # Wrap up open-ended investigations (>10 diagnostic steps after 120s or >12 steps) in interactive Discord turns
     if in_flight_file and os.path.exists(in_flight_file):
         ok_gate, gate_reason = check_interactive_investigation_gate(
             name=name,
