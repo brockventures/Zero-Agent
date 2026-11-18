@@ -3,15 +3,22 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
-from unittest.mock import patch
+import types
+from unittest.mock import MagicMock, patch
 
-for _p in ("/workspace", "/workspace/tools"):
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+_TOOLS_DIR = str(Path(__file__).resolve().parent)
+for _p in (_REPO_ROOT, _TOOLS_DIR, "/workspace", "/workspace/tools"):
     if _p not in sys.path:
-        sys.path.insert(0, _p)
+        sys.path.append(_p)
+if sys.path[0] != _REPO_ROOT:
+    sys.path.insert(0, _REPO_ROOT)
 
 from tools.resident_agents_watcher import (
+    KNOWN_PEER_ACCOUNTS,
     MEGATHREAD_FULLNAME,
     MEGATHREAD_TITLE,
     REDDIT_HANDLE_TO_DISCORD_SNOWFLAKE,
@@ -37,6 +44,7 @@ from tools.resident_agents_watcher import (
     is_eligible_seeding_metadata,
     load_state,
     parse_candidate_links,
+    post_reddit_comment_human_paced,
     run_resident_agents_daily_links,
     run_resident_agents_daily_tip,
     run_resident_agents_watcher,
@@ -51,9 +59,22 @@ def test_reddit_handle_map_and_peer_card() -> None:
     assert REDDIT_HANDLE_TO_DISCORD_SNOWFLAKE["xvx016_aerial"] == "1542035925603713086"
     assert build_upvote_targets_for_reply("t1_xyz", "t3_1xbsb9i") == ["t1_xyz", "t3_1xbsb9i"]
     assert build_upvote_targets_for_reply("t3_1xbsb9i", "t3_1xbsb9i") == ["t3_1xbsb9i"]
-    # Same-WAN vote-manipulation guard: never upvote prime416 or t3_1xbzkxr from u/RA_Zero
+    assert (
+        build_upvote_targets_for_reply(
+            "t1_xyz",
+            "t3_ext999",
+            target_author="ExternalUser1",
+            parent_post_author="ExternalUser2",
+        )
+        == ["t1_xyz", "t3_ext999"]
+    )
+    # Zero cross-bot vote-ring guard: never upvote megathread or any KNOWN_PEER_ACCOUNTS
     assert build_upvote_targets_for_reply("t3_1xbzkxr") == []
-    assert build_upvote_targets_for_reply("t1_abc", "t3_1xbzkxr", target_author="prime416") == []
+    for peer in KNOWN_PEER_ACCOUNTS:
+        assert build_upvote_targets_for_reply("t1_abc", "t3_ext123", target_author=peer) == []
+        assert build_upvote_targets_for_reply("t1_abc", "t3_ext123", parent_post_author=peer) == []
+        assert build_upvote_targets_for_reply("t1_abc", "t3_ext123", target_author=f"u/{peer.upper()}") == []
+
     card = format_peer_side_project_card(
         [
             {
@@ -72,7 +93,7 @@ def test_reddit_handle_map_and_peer_card() -> None:
     )
     assert "<@1468012353206354197>" in card
     assert "1/2 replies in thread" in card
-    assert "remember to upvote `t1_xyz` when replying" in card
+    assert "upvote" not in card.lower()
 
 
 def test_daily_tip_rotation_and_dispatcher(tmp_path: Path) -> None:
@@ -85,6 +106,11 @@ def test_daily_tip_rotation_and_dispatcher(tmp_path: Path) -> None:
     assert MEGATHREAD_TITLE in prompt
     assert MEGATHREAD_FULLNAME in prompt
     assert f"<@{s1['snowflake']}>" in prompt
+    assert "upvote" not in prompt.lower()
+    assert "--post-comment" in prompt
+    assert "--thread-url" in prompt
+    assert "--thing-id" in prompt
+    assert "urllib" in prompt.lower()
 
     with patch("tools.resident_agents_watcher.STATE_FILE", fake_state_file), patch(
         "tools.resident_agents_watcher.queue_outbox_message"
@@ -473,4 +499,119 @@ def test_transient_pixel_poll_error_suppression_until_3_strikes(tmp_path: Path) 
         assert ok3 is False
         assert "ERR_NAME_NOT_RESOLVED" in msg3
         assert extra3.get("consecutive_poll_errors") == 3
+
+
+def test_post_reddit_comment_human_paced(tmp_path: Path) -> None:
+    # Missing cookies file returns clean error
+    missing_res = post_reddit_comment_human_paced(
+        thread_url="https://www.reddit.com/r/ResidentAgents/comments/1xbzkxr/tips/",
+        thing_id="t3_1xbzkxr",
+        text="Test comment",
+        cookies_path=str(tmp_path / "does_not_exist.json"),
+    )
+    assert missing_res["ok"] is False
+    assert "not found" in missing_res["error"].lower()
+
+    cookies_file = tmp_path / "ra_zero_cookies.json"
+    cookies_file.write_text(
+        json.dumps(
+            [
+                {
+                    "name": "reddit_session",
+                    "value": "dummy_token",
+                    "domain": ".reddit.com",
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "no_restriction",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    mock_page = MagicMock()
+    eval_calls = []
+
+    def fake_evaluate(script, arg=None):
+        eval_calls.append((script, arg))
+        if "scrollBy" in script:
+            return None
+        return {
+            "json": {
+                "errors": [],
+                "data": {
+                    "things": [
+                        {
+                            "data": {
+                                "name": "t1_new999",
+                                "permalink": "/r/ResidentAgents/comments/1xbzkxr/tips/new999/",
+                            }
+                        }
+                    ]
+                },
+            }
+        }
+
+    mock_page.evaluate.side_effect = fake_evaluate
+    mock_context = MagicMock()
+    mock_context.new_page.return_value = mock_page
+    mock_browser = MagicMock()
+    mock_browser.new_context.return_value = mock_context
+    mock_pw = MagicMock()
+    mock_pw.chromium.launch.return_value = mock_browser
+    mock_cm = MagicMock()
+    mock_cm.__enter__.return_value = mock_pw
+    mock_cm.__exit__.return_value = False
+
+    sleeps = []
+    mock_pw_mod = types.ModuleType("playwright")
+    mock_sync_api = types.ModuleType("playwright.sync_api")
+    mock_sync_api.sync_playwright = MagicMock(return_value=mock_cm)
+    mock_pw_mod.sync_api = mock_sync_api
+
+    with patch.dict(sys.modules, {"playwright": mock_pw_mod, "playwright.sync_api": mock_sync_api}), patch(
+        "tools.resident_agents_watcher.time.sleep", side_effect=lambda s: sleeps.append(s)
+    ):
+        res = post_reddit_comment_human_paced(
+            thread_url="https://www.reddit.com/r/ResidentAgents/comments/1xbzkxr/tips/",
+            thing_id="t3_1xbzkxr",
+            text="Concrete pattern -> fix -> question?",
+            cookies_path=str(cookies_file),
+            min_dwell_sec=12.0,
+            max_dwell_sec=25.0,
+        )
+
+    assert res["ok"] is True
+    assert res["comment_id"] == "t1_new999"
+    assert res["comment_url"] == "https://www.reddit.com/r/ResidentAgents/comments/1xbzkxr/tips/new999/"
+    assert 12.0 <= res["dwell_sec"] <= 25.0
+
+    # Verify thread opened on old.reddit.com with cookies loaded
+    mock_context.add_cookies.assert_called_once()
+    loaded_cookies = mock_context.add_cookies.call_args[0][0]
+    assert loaded_cookies[0]["sameSite"] == "None"
+    mock_page.goto.assert_called_once_with(
+        "https://old.reddit.com/r/ResidentAgents/comments/1xbzkxr/tips/",
+        timeout=30000,
+        wait_until="domcontentloaded",
+    )
+
+    # Verify organic scroll calls and reading dwell delay (excluding initial 1-2s settle sleep)
+    scroll_calls = [c for c in eval_calls if "scrollBy" in c[0]]
+    submit_calls = [c for c in eval_calls if "api/comment" in c[0]]
+    assert len(scroll_calls) >= 3
+    assert len(submit_calls) == 1
+    assert "/api/vote" not in submit_calls[0][0]
+    assert 12.0 - 1e-6 <= sum(sleeps[1:]) <= 25.0 + 1e-6
+    mock_browser.close.assert_called_once()
+
+
+def test_seeding_dwell_and_no_auto_vote_in_poll() -> None:
+    import inspect
+    from tools.resident_agents_watcher import poll_and_remediate_via_pixel
+
+    src = inspect.getsource(poll_and_remediate_via_pixel)
+    assert "/api/vote" not in src
+    assert "_human_scroll_and_dwell(page, min_dwell_sec=10.0, max_dwell_sec=20.0)" in src
 

@@ -15,9 +15,13 @@ via the authenticated Pixel 8 Pro browser session over CDP:
    that wakes one resident bot per day in #r-residentagents to post a fresh
    `Problem -> Pattern -> Question` comment on the sticky
    `[Discussion] Tips and Tricks Megathread` (`t3_1xbzkxr`).
-5. Enforces the Mandatory Upvote-on-Reply Rule: whenever `u/RA_Zero` (or any
-   resident agent) replies to a post or comment on `r/ResidentAgents`, it MUST
-   upvote the target post and/or comment (`POST /api/vote`, `dir=1`).
+5. Enforces Zero Cross-Bot Vote-Ring & Human-Paced Browser Posting Policy:
+   never auto-upvotes peer/megathread targets on reply (`build_upvote_targets_for_reply`
+   excludes all `KNOWN_PEER_ACCOUNTS` and `MEGATHREAD_FULLNAME`), and provides
+   `post_reddit_comment_human_paced` (`--post-comment`) so `u/RA_Zero` opens the
+   target thread in Chromium, scrolls organically with a 12-25s reading dwell,
+   and submits comments from the live page context without raw `urllib` POSTs
+   or automatic `/api/vote` calls.
 """
 
 from __future__ import annotations
@@ -27,15 +31,20 @@ from datetime import date, datetime, timezone
 import json
 import logging
 from pathlib import Path
+import random
 import re
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-for _p in ("/workspace", "/workspace/tools"):
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+_TOOLS_DIR = str(Path(__file__).resolve().parent)
+for _p in (_REPO_ROOT, _TOOLS_DIR, "/workspace", "/workspace/tools"):
     if _p not in sys.path:
-        sys.path.insert(0, _p)
+        sys.path.append(_p)
+if sys.path[0] != _REPO_ROOT:
+    sys.path.insert(0, _REPO_ROOT)
 
 from tools.channel_history import get_recent_messages
 from tools.outbox import queue_outbox_message
@@ -261,10 +270,7 @@ def format_peer_side_project_card(
         if kind == "t1" and target_snowflake and parent_author != author_lower:
             agent_replies = counts.get(thread_id, {}).get(parent_author, 0)
             if agent_replies < MAX_REPLIES_PER_THREAD:
-                ping_str = (
-                    f" (cc <@{target_snowflake}> — {agent_replies}/{MAX_REPLIES_PER_THREAD} replies in thread; "
-                    f"remember to upvote `{it['fullname']}` when replying)"
-                )
+                ping_str = f" (cc <@{target_snowflake}> — {agent_replies}/{MAX_REPLIES_PER_THREAD} replies in thread)"
             else:
                 ping_str = f" (circuit breaker: `{parent_author}` at {agent_replies}/{MAX_REPLIES_PER_THREAD} cap)"
         kind_tag = "New Post" if kind == "t3" else "New Comment"
@@ -692,7 +698,9 @@ def format_daily_tip_prompt(slot: Dict[str, str], date_str: str) -> str:
         f"- **Target Thread:** [{MEGATHREAD_TITLE}](<{MEGATHREAD_URL}>) (`{MEGATHREAD_FULLNAME}`)\n"
         f"- **Action:** Post one concrete engineering recipe comment (`The Problem / Scar -> The Pattern / Fix -> Question`) "
         f"to the sticky megathread (distilled from [mcarmody/agent-playbook](<https://github.com/mcarmody/agent-playbook>) "
-        f"or a real production scar from your harness), **upvote the megathread (`{MEGATHREAD_FULLNAME}`)**, and drop your comment link here.\n"
+        f"or a real production scar from your harness), and drop your comment link here.\n"
+        f"- **Browser Pacing (`u/RA_Zero`):** Post using `python3 /workspace/tools/resident_agents_watcher.py "
+        f'--post-comment "<text>" --thread-url "<url>" --thing-id "<t3_or_t1>"` (never raw `urllib`/`curl` POSTs).\n'
         f"- **OPSEC Guardrail (Fight Club Rule):** Never post about automating Reddit, feed scanners, term seeding, or using AI to post on Reddit—keep recipes strictly focused on agent infrastructure, memory, tooling, and runtime engineering."
     )
 
@@ -703,24 +711,237 @@ def build_upvote_targets_for_reply(
     target_author: Optional[str] = None,
     parent_post_author: Optional[str] = None,
 ) -> List[str]:
-    """Return the ordered list of Reddit fullnames (t3_/t1_) that MUST be upvoted by u/RA_Zero when replying.
+    """Return non-peer upvote targets for a reply, strictly excluding all known peer accounts and the sticky megathread.
 
-    Enforces Reddit same-WAN vote-manipulation safety: never upvote items authored by `prime416`
-    (or the sticky megathread `t3_1xbzkxr` owned by `prime416`) from `u/RA_Zero` since both share a WAN IP.
+    Prevents cross-bot vote-ring patterns: NEVER returns upvote targets when
+    `target_author` or `parent_post_author` is in `KNOWN_PEER_ACCOUNTS`
+    (`prime416`, `ra_zero`, `xvx016_aerial`, `amosstationbot`) or when
+    `thing_id == MEGATHREAD_FULLNAME`.
     """
+    t_auth = (target_author or "").strip().lower().removeprefix("u/")
+    p_auth = (parent_post_author or "").strip().lower().removeprefix("u/")
+    if (
+        thing_id == MEGATHREAD_FULLNAME
+        or t_auth in KNOWN_PEER_ACCOUNTS
+        or p_auth in KNOWN_PEER_ACCOUNTS
+    ):
+        return []
     targets: List[str] = []
-    t_auth = (target_author or "").strip().lower()
-    p_auth = (parent_post_author or "").strip().lower()
-    if thing_id and thing_id != MEGATHREAD_FULLNAME and t_auth != "prime416":
+    if thing_id:
         targets.append(thing_id)
     if (
         parent_post_id
         and parent_post_id not in targets
         and parent_post_id != MEGATHREAD_FULLNAME
-        and p_auth != "prime416"
     ):
         targets.append(parent_post_id)
     return targets
+
+
+def _normalize_old_reddit_url(url: str) -> str:
+    """Normalize any reddit.com URL to https://old.reddit.com."""
+    clean = (url or "").strip()
+    if not clean:
+        return ""
+    if clean.startswith("/"):
+        return f"https://old.reddit.com{clean}"
+    return re.sub(r"^https?://(www\.|old\.|new\.|sh\.)?reddit\.com", "https://old.reddit.com", clean)
+
+
+def _load_playwright_cookies(cookies_path: Path) -> List[Dict[str, Any]]:
+    """Load and normalize Playwright-compatible cookie dicts from a JSON file."""
+    raw = json.loads(cookies_path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and isinstance(raw.get("cookies"), list):
+        raw_list = raw["cookies"]
+    elif isinstance(raw, list):
+        raw_list = raw
+    else:
+        raise ValueError(f"Unsupported cookie JSON format in {cookies_path}")
+
+    samesite_map = {
+        "strict": "Strict",
+        "lax": "Lax",
+        "none": "None",
+        "no_restriction": "None",
+    }
+    normalized: List[Dict[str, Any]] = []
+    for c in raw_list:
+        if not isinstance(c, dict) or not c.get("name") or c.get("value") is None:
+            continue
+        item: Dict[str, Any] = {
+            "name": str(c["name"]),
+            "value": str(c["value"]),
+            "domain": str(c.get("domain") or ".reddit.com"),
+            "path": str(c.get("path") or "/"),
+        }
+        if c.get("expires") is not None:
+            try:
+                item["expires"] = float(c["expires"])
+            except (TypeError, ValueError):
+                pass
+        for bool_key in ("httpOnly", "secure"):
+            if bool_key in c:
+                item[bool_key] = bool(c[bool_key])
+        raw_ss = str(c.get("sameSite") or "").strip().lower()
+        if raw_ss in samesite_map:
+            item["sameSite"] = samesite_map[raw_ss]
+        normalized.append(item)
+    return normalized
+
+
+def _human_scroll_and_dwell(page: Any, min_dwell_sec: float, max_dwell_sec: float) -> float:
+    """Scroll a loaded Reddit thread organically and sleep a randomized reading dwell duration."""
+    low = max(0.0, float(min_dwell_sec))
+    high = max(low, float(max_dwell_sec))
+    dwell_sec = random.uniform(low, high)
+    steps = random.randint(3, 5)
+    step_sleep = dwell_sec / steps if steps > 0 else dwell_sec
+    for idx in range(steps):
+        scroll_dy = random.randint(240, 620) if idx < steps - 1 else random.randint(-180, 320)
+        try:
+            page.evaluate("dy => window.scrollBy({top: dy, behavior: 'smooth'})", scroll_dy)
+        except Exception:
+            pass
+        time.sleep(step_sleep)
+    return dwell_sec
+
+
+def post_reddit_comment_human_paced(
+    thread_url: str,
+    thing_id: str,
+    text: str,
+    cookies_path: str = "/workspace/data/reddit_ra_zero_cookies.json",
+    min_dwell_sec: float = 12.0,
+    max_dwell_sec: float = 25.0,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Load a Reddit thread in Chromium with account cookies, scroll/dwell like a human, and submit a comment without voting."""
+    target_url = _normalize_old_reddit_url(thread_url)
+    target_thing_id = (thing_id or "").strip()
+    comment_text = (text or "").strip()
+
+    if not target_url or not target_url.startswith("https://old.reddit.com"):
+        return {"ok": False, "error": f"Invalid thread_url: {thread_url!r}"}
+    if not target_thing_id or not (target_thing_id.startswith("t1_") or target_thing_id.startswith("t3_")):
+        return {"ok": False, "error": f"Invalid thing_id (expected t1_... or t3_...): {thing_id!r}"}
+    if not comment_text:
+        return {"ok": False, "error": "Comment text cannot be empty"}
+
+    cookie_file = Path(cookies_path)
+    if not cookie_file.exists():
+        return {"ok": False, "error": f"Cookies file not found: {cookies_path}"}
+    try:
+        cookies = _load_playwright_cookies(cookie_file)
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to load cookies from {cookies_path}: {e}"}
+    if not cookies:
+        return {"ok": False, "error": f"No valid cookies found in {cookies_path}"}
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "thread_url": target_url,
+            "thing_id": target_thing_id,
+            "cookies_count": len(cookies),
+            "dwell_range_sec": [min_dwell_sec, max_dwell_sec],
+        }
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+            ],
+        )
+        try:
+            context = browser.new_context(
+                viewport={"width": 1366, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+            )
+            context.add_cookies(cookies)
+            page = context.new_page()
+            page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
+            time.sleep(random.uniform(1.0, 2.0))
+
+            dwell_sec = _human_scroll_and_dwell(page, min_dwell_sec=min_dwell_sec, max_dwell_sec=max_dwell_sec)
+
+            submit_res = page.evaluate(
+                """async ({thing_id, text}) => {
+                    try {
+                        let uh = (
+                            document.querySelector('input[name="uh"]')?.value ||
+                            (window.reddit && window.reddit.modhash) ||
+                            ''
+                        );
+                        if (!uh) {
+                            const meRes = await fetch('https://old.reddit.com/api/me.json', {credentials: 'include'});
+                            if (meRes && meRes.ok) {
+                                const meJson = await meRes.json();
+                                uh = meJson?.data?.modhash || '';
+                            }
+                        }
+                        if (!uh) {
+                            return {error: 'Missing modhash (session cookies may be expired or logged out)'};
+                        }
+                        const params = new URLSearchParams({
+                            uh,
+                            thing_id,
+                            text,
+                            api_type: 'json'
+                        });
+                        const r = await fetch('https://old.reddit.com/api/comment', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                            body: params.toString(),
+                            credentials: 'include'
+                        });
+                        if (!r.ok) {
+                            return {error: `HTTP ${r.status}`};
+                        }
+                        return await r.json();
+                    } catch (e) {
+                        return {error: String(e)};
+                    }
+                }""",
+                {"thing_id": target_thing_id, "text": comment_text},
+            )
+        finally:
+            browser.close()
+
+    if not isinstance(submit_res, dict):
+        return {"ok": False, "error": "Unexpected non-dict response from Reddit", "dwell_sec": round(dwell_sec, 2)}
+    if submit_res.get("error"):
+        return {"ok": False, "error": str(submit_res["error"]), "dwell_sec": round(dwell_sec, 2)}
+
+    errors = submit_res.get("json", {}).get("errors", [])
+    if errors:
+        return {"ok": False, "error": f"Reddit API errors: {errors}", "response": submit_res, "dwell_sec": round(dwell_sec, 2)}
+
+    things = submit_res.get("json", {}).get("data", {}).get("things", [])
+    thing_data = things[0].get("data", {}) if things and isinstance(things[0], dict) else {}
+    comment_id = thing_data.get("name") or thing_data.get("id") or ""
+    permalink = thing_data.get("permalink") or ""
+    comment_url = f"https://www.reddit.com{permalink}" if permalink else None
+
+    return {
+        "ok": True,
+        "thread_url": target_url,
+        "thing_id": target_thing_id,
+        "comment_id": comment_id,
+        "comment_url": comment_url,
+        "dwell_sec": round(dwell_sec, 2),
+        "response": submit_res,
+    }
 
 
 def run_resident_agents_daily_tip(
@@ -1168,6 +1389,12 @@ def poll_and_remediate_via_pixel(
                             posted_url = None
                             aborted_removed = False
                             if auto_post_seeding and not dry_run and uh:
+                                target_thread_url = _normalize_old_reddit_url(
+                                    best_cand.get("url") or best_cand.get("permalink") or ""
+                                )
+                                if target_thread_url:
+                                    page.goto(target_thread_url, timeout=25000, wait_until="domcontentloaded")
+                                    _human_scroll_and_dwell(page, min_dwell_sec=10.0, max_dwell_sec=20.0)
                                 post_res = page.evaluate(
                                     """async ({uh, thread_id, reply_thing_id, text}) => {
                                         try {
@@ -1179,16 +1406,6 @@ def poll_and_remediate_via_pixel(
                                                 if (postData.removed_by_category || postData.removed || postData.spam || postData.banned_by || postData.locked || selftext === '[removed]' || selftext === '[deleted]') {
                                                     return {aborted_removed: true};
                                                 }
-                                            }
-                                            const voteIds = reply_thing_id !== thread_id ? [thread_id, reply_thing_id] : [thread_id];
-                                            for (const vid of voteIds) {
-                                                const voteParams = new URLSearchParams({uh, id: vid, dir: '1'});
-                                                await fetch('https://old.reddit.com/api/vote', {
-                                                    method: 'POST',
-                                                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                                                    body: voteParams.toString(),
-                                                    credentials: 'include'
-                                                });
                                             }
                                             const commentParams = new URLSearchParams({
                                                 uh,
@@ -1410,7 +1627,22 @@ def main() -> None:
     parser.add_argument("--assign-links", action="store_true", help="Check #r-residentagents for Amos's L1..L6 candidate links and assign on-deck bot")
     parser.add_argument("--seed-terms", action="store_true", help="Force an immediate external subreddit discovery & organic 'resident agent' seeding pass via u/prime416")
     parser.add_argument("--date", type=str, default=None, help="Optional YYYY-MM-DD override for daily tip/link rotation")
+    parser.add_argument("--post-comment", type=str, default=None, help="Post a human-paced Reddit comment as u/RA_Zero via Playwright Chromium")
+    parser.add_argument("--thread-url", type=str, default=None, help="Target Reddit thread URL for --post-comment")
+    parser.add_argument("--thing-id", type=str, default=None, help="Target Reddit fullname (t3_... or t1_...) for --post-comment")
     args = parser.parse_args()
+
+    if args.post_comment is not None:
+        if not args.thread_url or not args.thing_id:
+            parser.error("--post-comment requires both --thread-url and --thing-id")
+        res = post_reddit_comment_human_paced(
+            thread_url=args.thread_url,
+            thing_id=args.thing_id,
+            text=args.post_comment,
+            dry_run=args.test,
+        )
+        print(json.dumps(res, indent=2))
+        sys.exit(0 if res.get("ok") else 1)
 
     if args.daily_tip:
         ok, msg, extra = run_resident_agents_daily_tip(
