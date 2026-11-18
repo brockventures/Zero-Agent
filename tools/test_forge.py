@@ -995,6 +995,46 @@ class TestForgeEngine(unittest.TestCase):
         st_bb = subprocess.run(["git", "status", "--porcelain"], cwd=str(wt_bb), capture_output=True, text=True)
         self.assertEqual(st_bb.stdout.strip(), "")
 
+        # 3. Test external repo with repo-native AGENTS.md and custom .agents/rules/
+        wt_ext = Path(self.tmp_dir.name) / "wt_ext"
+        (wt_ext / ".agents" / "rules").mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-b", "main"], cwd=str(wt_ext), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(wt_ext), check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Mirrormere"], cwd=str(wt_ext), check=True, capture_output=True)
+
+        ext_agents = "# Mirrormere Agent Guidelines\nRun ./scripts/verify.sh --staged\n"
+        (wt_ext / "AGENTS.md").write_text(ext_agents, encoding="utf-8")
+        (wt_ext / ".agents" / "rules" / "custom_repo_rule.md").write_text("# Custom Repo Rule\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=str(wt_ext), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init ext"], cwd=str(wt_ext), check=True, capture_output=True)
+
+        snap_ext = forge_mod.stage_vulcan_worktree_profile(
+            wt_ext,
+            repo_dir=wt_ext,
+            target_files=["internal/app.go"],
+        )
+        self.assertFalse(snap_ext["is_baseball"])
+        staged_gemini = (wt_ext / "GEMINI.md").read_text(encoding="utf-8")
+        staged_agents = (wt_ext / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("Vulcan", staged_gemini)
+        self.assertIn("Run ./scripts/verify.sh --staged", staged_gemini)
+        self.assertIn("# Repository-Specific Instructions (Preserved from Repo AGENTS.md)", staged_gemini)
+        self.assertIn("Vulcan", staged_agents)
+        self.assertIn("Run ./scripts/verify.sh --staged", staged_agents)
+        self.assertTrue((wt_ext / ".agents" / "rules" / "custom_repo_rule.md").exists())
+        for core_rule in forge_mod.VULCAN_CORE_RULES:
+            self.assertTrue((wt_ext / ".agents" / "rules" / core_rule).exists())
+
+        forge_mod.restore_vulcan_worktree_profile(wt_ext, snap_ext)
+        self.assertEqual((wt_ext / "AGENTS.md").read_text(encoding="utf-8"), ext_agents)
+        self.assertFalse((wt_ext / "GEMINI.md").exists())
+        self.assertFalse((wt_ext / "agents.md").exists())
+        self.assertTrue((wt_ext / ".agents" / "rules" / "custom_repo_rule.md").exists())
+        for core_rule in forge_mod.VULCAN_CORE_RULES:
+            self.assertFalse((wt_ext / ".agents" / "rules" / core_rule).exists())
+        st_ext = subprocess.run(["git", "status", "--porcelain"], cwd=str(wt_ext), capture_output=True, text=True)
+        self.assertEqual(st_ext.stdout.strip(), "")
+
     def test_11_parallel_builds_and_intra_build_parallel_chunks(self):
         # 1. Verify _chunks_are_eligible_in_parallel respects disjoint target_files, shared files, and explicit depends_on
         plan_parallel = {

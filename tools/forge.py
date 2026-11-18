@@ -757,6 +757,40 @@ def stage_vulcan_worktree_profile(
                     break
                 except Exception:
                     pass
+
+        # Preserve repository-native instruction docs (e.g. external repos' AGENTS.md)
+        preserved_blocks: list[str] = []
+        seen_preserved: set[str] = set()
+        zero_ivy_vulcan_markers = (
+            "# Zero (",
+            "You are **Zero**",
+            "# Ivy (",
+            "You are **Ivy**",
+            "# Vulcan (",
+        )
+        for rdoc in ("AGENTS.md", "GEMINI.md", "agents.md"):
+            p = wt / rdoc
+            raw_text = ""
+            try:
+                if p.exists() and p.is_file():
+                    raw_text = p.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:
+                raw_text = ""
+            if not raw_text:
+                continue
+            if any(marker in raw_text for marker in zero_ivy_vulcan_markers):
+                continue
+            if raw_text not in seen_preserved:
+                seen_preserved.add(raw_text)
+                preserved_blocks.append(raw_text)
+        if preserved_blocks:
+            vulcan_md = (
+                vulcan_md.rstrip()
+                + "\n\n---\n\n# Repository-Specific Instructions (Preserved from Repo AGENTS.md)\n\n"
+                + "\n\n".join(preserved_blocks)
+                + "\n"
+            )
+
         for rdoc in ("GEMINI.md", "AGENTS.md", "agents.md"):
             p = wt / rdoc
             try:
@@ -805,22 +839,42 @@ def stage_vulcan_worktree_profile(
                     pass
                 break
 
-    # 3. Scope .agents/rules/ to Vulcan engineering rules (+ baseball invariants when applicable)
+    # 3. Scope .agents/rules/ to Vulcan engineering rules (+ baseball invariants when applicable),
+    # while preserving custom repository-native rules in external repos.
+    rule_search_dirs = (
+        WORKSPACE_DIR / ".agents" / "rules",
+        Path("/opt/zero/workspace/.agents/rules"),
+        Path("/baseball/data/vulcan_baseball_rules"),
+    )
+    known_zero_ivy_rules: set[str] = set(VULCAN_CORE_RULES) | set(VULCAN_BASEBALL_RULES)
+    for sdir in rule_search_dirs:
+        if sdir.exists() and sdir.is_dir():
+            try:
+                for r_entry in sdir.iterdir():
+                    if r_entry.is_file() or r_entry.is_symlink():
+                        known_zero_ivy_rules.add(r_entry.name)
+            except Exception:
+                pass
+
     rules_dir.mkdir(parents=True, exist_ok=True)
     for entry in list(rules_dir.iterdir()):
         rel_e = f".agents/rules/{entry.name}"
-        if entry.name not in allowed_rules and rel_e not in norm_targets:
+        if entry.name in allowed_rules or rel_e in norm_targets:
+            continue
+        is_zero_ivy_symlink = False
+        if entry.is_symlink():
+            try:
+                link_target = str(os.readlink(entry))
+                is_zero_ivy_symlink = link_target.startswith(("/workspace/", "/opt/zero/")) or link_target in ("/workspace", "/opt/zero")
+            except Exception:
+                pass
+        if entry.name in known_zero_ivy_rules or is_zero_ivy_symlink:
             try:
                 if entry.is_symlink() or entry.is_file():
                     entry.unlink()
             except Exception:
                 pass
 
-    rule_search_dirs = (
-        WORKSPACE_DIR / ".agents" / "rules",
-        Path("/opt/zero/workspace/.agents/rules"),
-        Path("/baseball/data/vulcan_baseball_rules"),
-    )
     staged_rules: list[str] = []
     for rname in sorted(allowed_rules):
         rel_r = f".agents/rules/{rname}"
