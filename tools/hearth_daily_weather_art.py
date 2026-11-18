@@ -55,6 +55,9 @@ DEFAULT_REF_IMAGE = DATA_DIR / "hearth_weather_ref" / "family_ref.jpg"
 DEFAULT_OUTPUT_DIR = DATA_DIR / "hearth_daily_weather"
 DEFAULT_SCHEDULE_FILE = DATA_DIR / "schedule.json"
 
+DEFAULT_IMAGE_TIMEOUT = 240
+DEFAULT_MAX_RETRIES = 2
+
 HEARTH_REMOTE_REL_PATH = "hearth/web/static/ui/assets/weather-packs/ghibli_rosie_isaac_eve"
 
 # ---------------------------------------------------------------------------
@@ -957,10 +960,11 @@ def install_schedule_entry(schedule_file: Path = DEFAULT_SCHEDULE_FILE) -> tuple
         "hour_pt": 18,
         "minute_pt": 30,
         "prompt": (
-            "Run nightly Hearth dynamic weather art pipeline: "
-            "python3 /workspace/tools/hearth_daily_weather_art.py. "
+            "Run nightly Hearth dynamic weather art pipeline via silent sidecar: "
+            "python3 /workspace/tools/sidecars.py hearth_weather_art. "
             "Generates 3 cohesive weather cards (morning, afternoon, evening) with family context "
-            "and character consistency, and syncs daily_manifest.json to Host 2."
+            "and character consistency, and syncs daily_manifest.json to Host 2. "
+            "Silent background sidecar (silent on success, alert only on failure)."
         ),
         "catchup_if_missed": False,
         "channel_id": 1544953275877556334,
@@ -995,6 +999,9 @@ def run_nightly_pipeline(
     dry_run: bool = False,
     no_deploy: bool = False,
     history_file: Path = DEFAULT_HISTORY_FILE,
+    timeout: int = DEFAULT_IMAGE_TIMEOUT,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Execute the nightly weather art pipeline end-to-end."""
     out_dir = Path(output_dir) if output_dir else DEFAULT_OUTPUT_DIR
@@ -1014,14 +1021,39 @@ def run_nightly_pipeline(
         len(family_context["matched_themes"]),
     )
 
-    # 3. Theme Selection
-    selected_theme, selection_reason = select_daily_theme(
-        family_context=family_context,
-        target_date=resolved_date,
-        forced_theme=theme,
-        seed=seed,
-        history_file=history_file,
-    )
+    # Inspect existing manifest for same-date theme-locked resume
+    manifest_path = out_dir / "daily_manifest.json"
+    existing_manifest: dict[str, Any] | None = None
+    if manifest_path.exists():
+        try:
+            parsed = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                existing_manifest = parsed
+        except Exception as e:
+            log.warning("Could not read existing manifest from %s: %s", manifest_path, e)
+
+    # 3. Theme Selection (with same-date theme locking on resume)
+    selected_theme: dict[str, Any]
+    selection_reason: str
+    if (
+        not force
+        and not theme
+        and existing_manifest
+        and existing_manifest.get("date") == resolved_date
+        and existing_manifest.get("theme_key") in ART_STYLE_VAULT
+    ):
+        locked_theme_key = existing_manifest["theme_key"]
+        selected_theme = ART_STYLE_VAULT[locked_theme_key]
+        selection_reason = f"theme_locked_resume ({locked_theme_key})"
+        log.info("Locked daily theme from existing manifest: %s (%s)", selected_theme["name"], selection_reason)
+    else:
+        selected_theme, selection_reason = select_daily_theme(
+            family_context=family_context,
+            target_date=resolved_date,
+            forced_theme=theme,
+            seed=seed,
+            history_file=history_file,
+        )
     theme_key = selected_theme["visual_medium"]
     log.info("Selected theme: %s (%s)", selected_theme["name"], selection_reason)
 
@@ -1038,6 +1070,15 @@ def run_nightly_pipeline(
     manifest_slots: dict[str, Any] = {}
     generated_image_paths: list[Path] = []
     pipeline_success = True
+
+    # Check whether existing manifest matches target date and selected theme for slot reuse
+    manifest_matches_context = (
+        not dry_run
+        and not force
+        and existing_manifest is not None
+        and existing_manifest.get("date") == resolved_date
+        and existing_manifest.get("theme_key") == theme_key
+    )
 
     for slot_name in ("morning", "afternoon", "evening"):
         slot_weather = slots_info[slot_name]
@@ -1070,39 +1111,105 @@ def run_nightly_pipeline(
             manifest_slots[slot_name] = slot_manifest_entry
             continue
 
-        log.info("Generating card for %s slot: %s", slot_name, card_filename)
-        gen_res = generate_image_subscription(
-            prompt=prompt,
-            aspect_ratio="16:9",
-            image_name=target_card_path.stem,
-            output_dir=str(out_dir),
-            reference_image=ref_img_path,
-            exact_filename=True,
-            timeout=120,
-        )
+        # Check for valid slot reuse on resume
+        reused = False
+        if manifest_matches_context:
+            existing_slots = existing_manifest.get("slots", {})
+            existing_slot = existing_slots.get(slot_name, {})
+            if existing_slot.get("valid") is True and target_card_path.exists():
+                chk = check_image(target_card_path)
+                if chk.get("valid"):
+                    log.info(
+                        "Reusing verified existing card for %s slot: %s (%dx%d, %s KB)",
+                        slot_name,
+                        card_filename,
+                        chk["width"],
+                        chk["height"],
+                        chk["size_kb"],
+                    )
+                    slot_manifest_entry.update({
+                        "valid": True,
+                        "width": chk["width"],
+                        "height": chk["height"],
+                        "format": chk["format"],
+                        "size_kb": chk["size_kb"],
+                        "reused": True,
+                    })
+                    generated_image_paths.append(target_card_path)
+                    manifest_slots[slot_name] = slot_manifest_entry
+                    reused = True
+                else:
+                    log.warning(
+                        "Existing card for %s slot failed forensic verification: %s",
+                        slot_name,
+                        chk.get("error"),
+                    )
 
-        if not gen_res.get("success"):
-            log.error("Generation failed for %s: %s", slot_name, gen_res.get("error"))
-            slot_manifest_entry["error"] = gen_res.get("error")
-            pipeline_success = False
-        else:
+        if reused:
+            continue
+
+        # Generate image with per-slot retries
+        success = False
+        last_error = ""
+        total_attempts = 1 + max(0, max_retries)
+
+        for attempt in range(1, total_attempts + 1):
+            log.info(
+                "Generating card for %s slot (attempt %d/%d, timeout=%ds): %s",
+                slot_name,
+                attempt,
+                total_attempts,
+                timeout,
+                card_filename,
+            )
+            gen_res = generate_image_subscription(
+                prompt=prompt,
+                aspect_ratio="16:9",
+                image_name=target_card_path.stem,
+                output_dir=str(out_dir),
+                reference_image=ref_img_path,
+                exact_filename=True,
+                timeout=timeout,
+            )
+
+            if not gen_res.get("success"):
+                last_error = gen_res.get("error") or "Unknown generation error"
+                log.warning("Attempt %d/%d failed for %s slot: %s", attempt, total_attempts, slot_name, last_error)
+                continue
+
             produced_path = Path(gen_res["path"])
             # Forensically verify image on disk
             chk = check_image(produced_path)
             if not chk.get("valid"):
-                log.error("Image validation failed for %s: %s", produced_path, chk.get("error"))
-                slot_manifest_entry["error"] = chk.get("error")
-                pipeline_success = False
-            else:
-                log.info("Verified %s: %dx%d, %s KB", card_filename, chk["width"], chk["height"], chk["size_kb"])
-                slot_manifest_entry.update({
-                    "valid": True,
-                    "width": chk["width"],
-                    "height": chk["height"],
-                    "format": chk["format"],
-                    "size_kb": chk["size_kb"],
-                })
-                generated_image_paths.append(produced_path)
+                last_error = chk.get("error") or "Image validation failed"
+                log.warning(
+                    "Validation for attempt %d/%d failed for %s (%s): %s",
+                    attempt,
+                    total_attempts,
+                    slot_name,
+                    produced_path,
+                    last_error,
+                )
+                continue
+
+            log.info("Verified %s: %dx%d, %s KB (attempt %d)", card_filename, chk["width"], chk["height"], chk["size_kb"], attempt)
+            slot_manifest_entry.update({
+                "valid": True,
+                "width": chk["width"],
+                "height": chk["height"],
+                "format": chk["format"],
+                "size_kb": chk["size_kb"],
+            })
+            if attempt > 1:
+                slot_manifest_entry["retries"] = attempt - 1
+            generated_image_paths.append(produced_path)
+            success = True
+            break
+
+        if not success:
+            log.error("All %d attempts failed for %s slot: %s", total_attempts, slot_name, last_error)
+            slot_manifest_entry["error"] = last_error
+            pipeline_success = False
 
         manifest_slots[slot_name] = slot_manifest_entry
 
@@ -1171,6 +1278,9 @@ def main() -> int:
     parser.add_argument("--output-dir", type=str, default=None, help="Local directory to output images and manifest")
     parser.add_argument("--dry-run", action="store_true", help="Build prompts and manifest without generating images or deploying")
     parser.add_argument("--no-deploy", action="store_true", help="Generate images locally without deploying to Host 2")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_IMAGE_TIMEOUT, help="Per-slot image generation timeout in seconds (default 240)")
+    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES, help="Maximum retry attempts per failed slot (default 2)")
+    parser.add_argument("--force", action="store_true", help="Force regeneration of slots even if valid existing cards exist")
     parser.add_argument("--install-schedule", action="store_true", help="Register daily 6:30 PM PT job in schedule.json")
 
     args = parser.parse_args()
@@ -1189,6 +1299,9 @@ def main() -> int:
         output_dir=args.output_dir,
         dry_run=args.dry_run,
         no_deploy=args.no_deploy,
+        timeout=args.timeout,
+        max_retries=args.max_retries,
+        force=args.force,
     )
 
     print(json.dumps(res, indent=2))

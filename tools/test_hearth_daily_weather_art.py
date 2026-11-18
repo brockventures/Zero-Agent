@@ -573,6 +573,9 @@ class TestScheduleInstallation:
             assert entry["hour_pt"] == 18
             assert entry["minute_pt"] == 30
             assert entry["enabled"] is True
+            assert "/workspace/tools/sidecars.py hearth_weather_art" in entry["prompt"]
+            assert "silent" in entry["prompt"].lower()
+            assert entry.get("channel_id") == 1544953275877556334
 
     def test_install_schedule_idempotent_and_preserves_other_jobs(self) -> None:
         """Verify running install_schedule multiple times updates in-place and preserves jobs."""
@@ -789,6 +792,295 @@ class TestRunNightlyPipeline:
             # Failed run should NOT record history
             assert len(hdwa.load_theme_history(hist_file)) == 0
 
+    def test_run_nightly_pipeline_default_timeout_and_retries_constants(self) -> None:
+        """Verify default timeout and retry constants."""
+        assert hdwa.DEFAULT_IMAGE_TIMEOUT == 240
+        assert hdwa.DEFAULT_MAX_RETRIES == 2
+
+    def test_run_nightly_pipeline_retry_after_timeout_recovery(self) -> None:
+        """Verify recovery after initial timeout via per-slot retry."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            hist_file = tmp_path / "history.json"
+
+            attempts: dict[str, int] = {"morning": 0, "afternoon": 0, "evening": 0}
+
+            def fake_generate_image(prompt: str, **kwargs: Any) -> dict[str, Any]:
+                image_name = kwargs.get("image_name", "")
+                slot = "morning" if "morning" in image_name else ("afternoon" if "afternoon" in image_name else "evening")
+                attempts[slot] += 1
+                if slot == "morning" and attempts["morning"] == 1:
+                    return {"success": False, "error": "Command timed out after 240s"}
+                target_p = out_dir / f"{image_name}.jpg"
+                target_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+                return {"success": True, "path": str(target_p)}
+
+            fake_check_image = MagicMock(return_value={
+                "valid": True,
+                "width": 1920,
+                "height": 1080,
+                "format": "JPEG",
+                "size_kb": 256.0,
+            })
+
+            with (
+                patch.object(hdwa, "generate_image_subscription", side_effect=fake_generate_image) as mock_gen,
+                patch.object(hdwa, "check_image", fake_check_image),
+                patch.object(hdwa, "deploy_to_host2", return_value=(True, "Synced")) as mock_deploy,
+            ):
+                result = hdwa.run_nightly_pipeline(
+                    target_date="2026-11-20",
+                    theme="studio_ghibli_gouache",
+                    output_dir=str(out_dir),
+                    dry_run=False,
+                    history_file=hist_file,
+                    timeout=240,
+                    max_retries=2,
+                )
+
+            assert result["success"] is True
+            assert mock_gen.call_count == 4
+            assert attempts["morning"] == 2
+            assert attempts["afternoon"] == 1
+            assert attempts["evening"] == 1
+
+            manifest = result["manifest"]
+            assert manifest["slots"]["morning"]["valid"] is True
+            assert manifest["slots"]["morning"]["retries"] == 1
+            assert manifest["slots"]["afternoon"]["valid"] is True
+            assert "retries" not in manifest["slots"]["afternoon"]
+
+            mock_deploy.assert_called_once()
+            assert len(hdwa.load_theme_history(hist_file)) == 1
+
+    def test_run_nightly_pipeline_retry_exhaustion(self) -> None:
+        """Verify pipeline failure when max_retries are exhausted."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            hist_file = tmp_path / "history.json"
+
+            with (
+                patch.object(hdwa, "generate_image_subscription", return_value={"success": False, "error": "Persistent timeout"}) as mock_gen,
+                patch.object(hdwa, "deploy_to_host2") as mock_deploy,
+            ):
+                result = hdwa.run_nightly_pipeline(
+                    target_date="2026-11-20",
+                    theme="studio_ghibli_gouache",
+                    output_dir=str(out_dir),
+                    dry_run=False,
+                    history_file=hist_file,
+                    max_retries=2,
+                )
+
+            assert result["success"] is False
+            assert mock_gen.call_count == 9
+            manifest = result["manifest"]
+            assert manifest["slots"]["morning"]["valid"] is False
+            assert "Persistent timeout" in manifest["slots"]["morning"]["error"]
+            mock_deploy.assert_not_called()
+            assert len(hdwa.load_theme_history(hist_file)) == 0
+
+    def test_run_nightly_pipeline_same_date_theme_locking(self) -> None:
+        """Verify resume on same date locks selected theme from existing manifest."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            hist_file = tmp_path / "history.json"
+
+            existing_manifest = {
+                "date": "2026-11-20",
+                "theme_key": "snes_pixel_storybook",
+                "slots": {},
+            }
+            (out_dir / "daily_manifest.json").write_text(json.dumps(existing_manifest), encoding="utf-8")
+
+            result = hdwa.run_nightly_pipeline(
+                target_date="2026-11-20",
+                output_dir=str(out_dir),
+                dry_run=True,
+                history_file=hist_file,
+            )
+
+            assert result["success"] is True
+            assert result["theme"] == hdwa.ART_STYLE_VAULT["snes_pixel_storybook"]["name"]
+            assert result["manifest"]["theme_key"] == "snes_pixel_storybook"
+            assert "theme_locked_resume" in result["manifest"]["selection_reason"]
+
+    def test_run_nightly_pipeline_slot_reuse_on_resume(self) -> None:
+        """Verify already-valid slots on disk are reused without re-invoking generation."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            hist_file = tmp_path / "history.json"
+
+            morning_card = out_dir / "daily_2026-11-20_morning.jpg"
+            morning_card.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+
+            existing_manifest = {
+                "date": "2026-11-20",
+                "theme_key": "snes_pixel_storybook",
+                "slots": {
+                    "morning": {
+                        "valid": True,
+                        "filename": "daily_2026-11-20_morning.jpg",
+                    },
+                    "afternoon": {
+                        "valid": False,
+                        "error": "Prior failure",
+                    },
+                    "evening": {
+                        "valid": False,
+                        "error": "Prior failure",
+                    },
+                },
+            }
+            (out_dir / "daily_manifest.json").write_text(json.dumps(existing_manifest), encoding="utf-8")
+
+            def fake_generate_image(prompt: str, **kwargs: Any) -> dict[str, Any]:
+                image_name = kwargs.get("image_name", "")
+                target_p = out_dir / f"{image_name}.jpg"
+                target_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+                return {"success": True, "path": str(target_p)}
+
+            fake_check_image = MagicMock(return_value={
+                "valid": True,
+                "width": 1920,
+                "height": 1080,
+                "format": "JPEG",
+                "size_kb": 256.0,
+            })
+
+            with (
+                patch.object(hdwa, "generate_image_subscription", side_effect=fake_generate_image) as mock_gen,
+                patch.object(hdwa, "check_image", fake_check_image),
+                patch.object(hdwa, "deploy_to_host2", return_value=(True, "Synced")) as mock_deploy,
+            ):
+                result = hdwa.run_nightly_pipeline(
+                    target_date="2026-11-20",
+                    output_dir=str(out_dir),
+                    dry_run=False,
+                    history_file=hist_file,
+                )
+
+            assert result["success"] is True
+            assert mock_gen.call_count == 2
+            manifest = result["manifest"]
+            assert manifest["slots"]["morning"]["valid"] is True
+            assert manifest["slots"]["morning"]["reused"] is True
+            assert manifest["slots"]["afternoon"]["valid"] is True
+            assert manifest["slots"]["evening"]["valid"] is True
+            mock_deploy.assert_called_once()
+            deployed_files = mock_deploy.call_args[0][0]
+            assert len(deployed_files) == 4
+
+    def test_run_nightly_pipeline_invalidation_on_theme_mismatch(self) -> None:
+        """Verify existing cards are NOT reused when theme changes/mismatches."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            hist_file = tmp_path / "history.json"
+
+            morning_card = out_dir / "daily_2026-11-20_morning.jpg"
+            morning_card.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+
+            existing_manifest = {
+                "date": "2026-11-20",
+                "theme_key": "snes_pixel_storybook",
+                "slots": {
+                    "morning": {"valid": True, "filename": "daily_2026-11-20_morning.jpg"},
+                },
+            }
+            (out_dir / "daily_manifest.json").write_text(json.dumps(existing_manifest), encoding="utf-8")
+
+            def fake_generate_image(prompt: str, **kwargs: Any) -> dict[str, Any]:
+                image_name = kwargs.get("image_name", "")
+                target_p = out_dir / f"{image_name}.jpg"
+                target_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+                return {"success": True, "path": str(target_p)}
+
+            fake_check_image = MagicMock(return_value={
+                "valid": True,
+                "width": 1920,
+                "height": 1080,
+                "format": "JPEG",
+                "size_kb": 256.0,
+            })
+
+            with (
+                patch.object(hdwa, "generate_image_subscription", side_effect=fake_generate_image) as mock_gen,
+                patch.object(hdwa, "check_image", fake_check_image),
+                patch.object(hdwa, "deploy_to_host2", return_value=(True, "Synced")),
+            ):
+                result = hdwa.run_nightly_pipeline(
+                    target_date="2026-11-20",
+                    theme="studio_ghibli_gouache",
+                    output_dir=str(out_dir),
+                    dry_run=False,
+                    history_file=hist_file,
+                )
+
+            assert result["success"] is True
+            assert result["manifest"]["theme_key"] == "studio_ghibli_gouache"
+            assert mock_gen.call_count == 3
+            assert result["manifest"]["slots"]["morning"].get("reused") is not True
+
+    def test_run_nightly_pipeline_invalidation_on_force(self) -> None:
+        """Verify force=True regenerates all slots and ignores existing valid cards."""
+        with TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            out_dir = tmp_path / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            hist_file = tmp_path / "history.json"
+
+            morning_card = out_dir / "daily_2026-11-20_morning.jpg"
+            morning_card.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+
+            existing_manifest = {
+                "date": "2026-11-20",
+                "theme_key": "studio_ghibli_gouache",
+                "slots": {
+                    "morning": {"valid": True, "filename": "daily_2026-11-20_morning.jpg"},
+                },
+            }
+            (out_dir / "daily_manifest.json").write_text(json.dumps(existing_manifest), encoding="utf-8")
+
+            def fake_generate_image(prompt: str, **kwargs: Any) -> dict[str, Any]:
+                image_name = kwargs.get("image_name", "")
+                target_p = out_dir / f"{image_name}.jpg"
+                target_p.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+                return {"success": True, "path": str(target_p)}
+
+            fake_check_image = MagicMock(return_value={
+                "valid": True,
+                "width": 1920,
+                "height": 1080,
+                "format": "JPEG",
+                "size_kb": 256.0,
+            })
+
+            with (
+                patch.object(hdwa, "generate_image_subscription", side_effect=fake_generate_image) as mock_gen,
+                patch.object(hdwa, "check_image", fake_check_image),
+                patch.object(hdwa, "deploy_to_host2", return_value=(True, "Synced")),
+            ):
+                result = hdwa.run_nightly_pipeline(
+                    target_date="2026-11-20",
+                    theme="studio_ghibli_gouache",
+                    output_dir=str(out_dir),
+                    dry_run=False,
+                    force=True,
+                    history_file=hist_file,
+                )
+
+            assert result["success"] is True
+            assert mock_gen.call_count == 3
+            assert result["manifest"]["slots"]["morning"].get("reused") is not True
+
 
 # ===========================================================================
 # 9. Main CLI Entry Point Tests
@@ -830,3 +1122,26 @@ class TestMainCLI:
                 ret = hdwa.main()
             assert ret == 0
             assert sched_file.exists()
+
+    def test_main_timeout_retries_and_force_flags(self) -> None:
+        """Verify main() parses and passes --timeout, --max-retries, and --force flags."""
+        test_argv = [
+            "hearth_daily_weather_art.py",
+            "--dry-run",
+            "--target-date", "2026-11-20",
+            "--timeout", "300",
+            "--max-retries", "4",
+            "--force",
+        ]
+        with (
+            patch("sys.argv", test_argv),
+            patch.object(hdwa, "run_nightly_pipeline", return_value={"success": True}) as mock_pipeline,
+        ):
+            ret = hdwa.main()
+
+        assert ret == 0
+        mock_pipeline.assert_called_once()
+        _, kwargs = mock_pipeline.call_args
+        assert kwargs["timeout"] == 300
+        assert kwargs["max_retries"] == 4
+        assert kwargs["force"] is True
