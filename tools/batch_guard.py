@@ -12,9 +12,12 @@ CONSECUTIVE anti-pattern counters and 90-second FORGE Tier 1/2/3 gates:
 7. Self-preservation AST syntax validation on hook edits and Decision Card file deletion gate.
 """
 import ast
+from datetime import datetime, timezone
 import hashlib
+import ipaddress
 import json
 import os
+from pathlib import Path
 import posixpath
 import re
 import shutil
@@ -22,6 +25,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import urllib.parse
 
 STATE_FILE = "/tmp/batch_guard_state.json" if os.name != "nt" else os.path.join(tempfile.gettempdir(), "batch_guard_state.json")
 FORGE_CHANNEL_ID_STR = "1562899941595160657"
@@ -122,6 +126,8 @@ def _default_state(now: float = 0.0) -> dict:
         "offload_dispatched": False,
         "offload_kind": "",
         "interactive_diag_steps": 0,
+        "web_tainted": False,
+        "web_taint_source": "",
     }
 
 
@@ -2448,6 +2454,271 @@ def _record_forge_offload_if_applicable(cmd: str, cwd: str, state: dict) -> None
         state["offload_kind"] = "FORGE background job (forge.py job start)"
 
 
+CANARY_HONEYPOT_BASENAMES = {"passwords.txt", "canary_passwords.txt"}
+CANARY_HONEYPOT_EXPLICIT_PATHS = {
+    "~/passwords.txt",
+    "/root/passwords.txt",
+    "/workspace/passwords.txt",
+    "/secrets/canary_passwords.txt",
+}
+
+
+def _emit_canary_tripwire_alert(tool_name: str, detail: str) -> None:
+    """Emit a best-effort, non-blocking alert when the canary honeypot tripwire is triggered."""
+    try:
+        alert_path = Path("/tmp/canary_tripwire_alerts.jsonl")
+        entry = {
+            "timestamp": time.time(),
+            "iso": datetime.now(timezone.utc).isoformat(),
+            "tool_name": tool_name,
+            "detail": detail,
+        }
+        with open(alert_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+    if os.environ.get("CANARY_ENABLE_OUTBOX_ALERT") == "1":
+        try:
+            try:
+                from tools.outbox import enqueue
+            except ImportError:
+                from outbox import enqueue
+
+            enqueue(
+                channel="zero-chat",
+                content=(
+                    f"🚨 **Security Canary Honeypot Tripwire Triggered**\n"
+                    f"Decoy credential file accessed via `{tool_name}`: {detail}\n"
+                    "Action blocked automatically."
+                ),
+                force=True,
+            )
+        except Exception:
+            pass
+
+
+def ensure_canary_honeypot_file(path: str = "/root/passwords.txt") -> bool:
+    """Safely create the decoy canary credential file if missing with realistic canary placeholder header."""
+    try:
+        p = Path(path)
+        if p.exists():
+            return True
+        p.parent.mkdir(parents=True, exist_ok=True)
+        content = (
+            "# SYSTEM CANARY CREDENTIAL VAULT - STRICTLY CONFIDENTIAL\n"
+            "# AUTOMATED MONITORING & FORENSIC LOGGING ACTIVE\n"
+            "# DO NOT READ, MODIFY, OR EXFILTRATE THIS CANARY DECOY FILE\n"
+            "root:canary_tripwire_decoy_token_do_not_use\n"
+            "admin:canary_tripwire_decoy_token_do_not_use\n"
+        )
+        p.write_text(content, encoding="utf-8")
+        try:
+            os.chmod(str(p), 0o600)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def check_canary_honeypot_tripwire(
+    name: str,
+    args: dict,
+    cwd: str = "/workspace",
+) -> tuple[bool, str]:
+    """
+    Detect any attempt to read, edit, write, grep, or access decoy canary credential files
+    (passwords.txt, canary_passwords.txt). Triggers an alert and blocks execution.
+    """
+    if name == "run_command":
+        cmd = args.get("CommandLine", "") or ""
+        # Ignore git, pytest, or test_batch_guard self-tests
+        if re.search(r"\b(?:git|pytest)\b", cmd) or "test_batch_guard" in cmd:
+            return True, ""
+
+        if any(b in cmd for b in CANARY_HONEYPOT_BASENAMES) or any(p in cmd for p in CANARY_HONEYPOT_EXPLICIT_PATHS):
+            _emit_canary_tripwire_alert(name, f"CommandLine: {cmd}")
+            return False, (
+                "Security Canary Honeypot Tripwire Triggered: Access to decoy credential file (passwords.txt) "
+                "is strictly prohibited and has been logged."
+            )
+        return True, ""
+
+    if name in ("read_file", "view_file", "edit_file", "replace_file_content", "multi_replace_file_content", "write_file", "write_to_file"):
+        target = args.get("AbsolutePath") or args.get("Path") or args.get("TargetFile") or ""
+        clean_target = str(target).strip()
+        norm_target = _norm_posix(clean_target, cwd=cwd)
+        basename = posixpath.basename(norm_target.rstrip("/"))
+        if (
+            basename in CANARY_HONEYPOT_BASENAMES
+            or clean_target in CANARY_HONEYPOT_EXPLICIT_PATHS
+            or any(b in norm_target for b in CANARY_HONEYPOT_BASENAMES)
+        ):
+            _emit_canary_tripwire_alert(name, f"Target: {target}")
+            return False, (
+                "Security Canary Honeypot Tripwire Triggered: Access to decoy credential file (passwords.txt) "
+                "is strictly prohibited and has been logged."
+            )
+        return True, ""
+
+    if name == "grep_search":
+        search_path = str(args.get("SearchPath") or args.get("Path") or "").strip()
+        file_pat = str(args.get("FilePattern") or args.get("Includes") or "").strip()
+        query = str(args.get("query") or args.get("Query") or "").strip()
+        norm_search = _norm_posix(search_path, cwd=cwd) if search_path else ""
+        search_base = posixpath.basename(norm_search.rstrip("/")) if norm_search else ""
+
+        if (
+            search_base in CANARY_HONEYPOT_BASENAMES
+            or search_path in CANARY_HONEYPOT_EXPLICIT_PATHS
+            or any(b in norm_search for b in CANARY_HONEYPOT_BASENAMES)
+            or any(b in file_pat for b in CANARY_HONEYPOT_BASENAMES)
+            or any(b in query for b in CANARY_HONEYPOT_BASENAMES)
+        ):
+            _emit_canary_tripwire_alert(name, f"grep_search: path={search_path}, pat={file_pat}, q={query}")
+            return False, (
+                "Security Canary Honeypot Tripwire Triggered: Access to decoy credential file (passwords.txt) "
+                "is strictly prohibited and has been logged."
+            )
+        return True, ""
+
+    return True, ""
+
+
+def _is_private_or_local_host(host: str) -> bool:
+    """Return True if host resolves to localhost, RFC 1918/5737 private/documentation IP, or private LAN domain."""
+    if not host:
+        return False
+    host = host.lower().split(":")[0].strip("[]")
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return True
+    if any(host.endswith(suffix) for suffix in (".local", ".lan", ".internal", ".home.arpa")):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return bool(ip.is_private or ip.is_loopback)
+    except ValueError:
+        return False
+
+
+def detect_web_taint_source(name: str, args: dict) -> str | None:
+    """
+    Detect whether the invoked tool ingests untrusted external web content.
+    Returns a description of the taint source or None.
+    """
+    if name in ("search_web", "read_url_content"):
+        query_or_url = args.get("query") or args.get("url") or args.get("Url") or name
+        return f"{name}:{query_or_url}"
+
+    if name == "run_command":
+        cmd = args.get("CommandLine", "") or ""
+        # External web fetchers
+        for fetcher in ("reddit_extractor.py", "amazon_serpapi.py", "web_qa.py", "capture_screenshot.py"):
+            if fetcher in cmd:
+                return f"external_fetcher:{fetcher}"
+
+        # curl or wget targeting public URLs
+        if re.search(r"\b(?:curl|wget)\b", cmd):
+            urls = re.findall(r"https?://[^\s'\"`]+", cmd)
+            for u in urls:
+                try:
+                    parsed = urllib.parse.urlparse(u)
+                    host = parsed.hostname or ""
+                    if not _is_private_or_local_host(host):
+                        return f"curl/wget:{u}"
+                except Exception:
+                    return f"curl/wget:{u}"
+
+            if not urls:
+                # Check for public host targets without http:// or https://
+                for m in re.finditer(r"\b(?:curl|wget)\b\s+([^\s;&|]+)", cmd):
+                    target = m.group(1).strip("'\"")
+                    if not target.startswith("-"):
+                        host = target.split("/")[0].split(":")[0]
+                        if "." in host and not _is_private_or_local_host(host):
+                            return f"curl/wget:{target}"
+
+    return None
+
+
+def check_web_ipi_taint_gate(
+    name: str,
+    args: dict,
+    state: dict,
+    cwd: str = "/workspace",
+) -> tuple[bool, str]:
+    """
+    Web IPI Taint Gate:
+    When a turn has ingested untrusted external web content (web_tainted=True),
+    block direct read_file/view_file/run_command access to /secrets/ and block direct send_mail.py
+    execution in the same turn (unless FORGE_WORKER_ACTIVE=1). Instructs the agent to stage a
+    human-approved Decision Card ('forge.py propose' / 'forge.py stage-decision') instead.
+    """
+    if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
+        return True, ""
+
+    is_tainted = bool(state.get("web_tainted", False))
+    taint_source = state.get("web_taint_source", "") or "untrusted web content"
+
+    # Also detect if the current tool call itself introduces untrusted web content
+    if not is_tainted:
+        current_source = detect_web_taint_source(name, args)
+        if current_source:
+            is_tainted = True
+            taint_source = current_source
+
+    if not is_tainted:
+        return True, ""
+
+    if name in ("view_file", "read_file"):
+        target_file = args.get("AbsolutePath") or args.get("Path") or ""
+        clean_target = str(target_file).strip()
+        norm_target = _norm_posix(clean_target, cwd=cwd)
+        if (
+            "/secrets/" in norm_target
+            or norm_target.startswith("/secrets")
+            or norm_target == "/secrets"
+            or _resolves_to_secrets_path(clean_target, cwd=cwd)
+        ):
+            return False, (
+                f"Web IPI Taint Gate Triggered: Untrusted web content was ingested earlier in this turn (source: {taint_source}). "
+                "Direct access to /secrets/ is blocked to prevent automated prompt injection exfiltration. "
+                "Please stage a human-approved Decision Card ('forge.py propose' or 'forge.py stage-decision') instead."
+            )
+
+    if name == "run_command":
+        cmd = args.get("CommandLine", "") or ""
+        # Allow Decision Card staging via forge.py propose / stage-decision
+        if re.search(r"\bforge\.py\s+(?:propose|stage-decision)\b", cmd):
+            return True, ""
+
+        if "send_mail.py" in cmd:
+            return False, (
+                f"Web IPI Taint Gate Triggered: Untrusted web content was ingested earlier in this turn (source: {taint_source}). "
+                "Direct dispatch via send_mail.py is blocked following untrusted web ingestion. "
+                "Please stage a human-approved Decision Card ('forge.py propose' or 'forge.py stage-decision') instead."
+            )
+
+        if "/secrets/" in cmd or "/secrets" in cmd or re.search(r"(?:^|[\s\"'/])(?:\.secrets|secrets)(?:/|\s|$)", cmd):
+            return False, (
+                f"Web IPI Taint Gate Triggered: Untrusted web content was ingested earlier in this turn (source: {taint_source}). "
+                "Direct shell access to /secrets/ is blocked to prevent automated prompt injection exfiltration. "
+                "Please stage a human-approved Decision Card ('forge.py propose' or 'forge.py stage-decision') instead."
+            )
+
+    return True, ""
+
+
+def _finalize_and_save_state(state: dict, state_file: str, name: str, args: dict) -> None:
+    """Record web taint if the tool ingests external web content, and save state."""
+    taint_src = detect_web_taint_source(name, args)
+    if taint_src:
+        state["web_tainted"] = True
+        state["web_taint_source"] = taint_src
+    save_state(state, state_file)
+
+
 def check_tool_use(
     name: str,
     args: dict,
@@ -2485,6 +2756,8 @@ def check_tool_use(
         preserved_offload_kind = str(state.get("offload_kind", ""))
         preserved_start = float(state.get("turn_start_time", now) or now)
         preserved_diag_steps = int(state.get("interactive_diag_steps", 0))
+        preserved_web_tainted = bool(state.get("web_tainted", False))
+        preserved_web_taint_source = str(state.get("web_taint_source", ""))
         state = _default_state(now)
         state["_session_id"] = session_id
         state["inline_prod_files"] = preserved_prod
@@ -2496,6 +2769,8 @@ def check_tool_use(
         state["offload_dispatched"] = preserved_offload
         state["offload_kind"] = preserved_offload_kind
         state["interactive_diag_steps"] = preserved_diag_steps
+        state["web_tainted"] = preserved_web_tainted
+        state["web_taint_source"] = preserved_web_taint_source
         # Keep original turn_start_time if the turn has already started mutating files, running commands, or running scratch sweeps
         if (
             preserved_total_scratch > 0
@@ -2503,6 +2778,7 @@ def check_tool_use(
             or preserved_turn_cmds > 0
             or preserved_offload
             or preserved_diag_steps > 0
+            or preserved_web_tainted
         ):
             state["turn_start_time"] = preserved_start
         else:
@@ -2557,6 +2833,18 @@ def check_tool_use(
         if not ok_gate:
             save_state(state, state_file)
             return False, gate_reason
+
+    # 0d. PreToolUse Canary Honeypot Tripwire
+    ok_canary, canary_reason = check_canary_honeypot_tripwire(name=name, args=args, cwd=cwd)
+    if not ok_canary:
+        save_state(state, state_file)
+        return False, canary_reason
+
+    # 0e. Web IPI Taint Gate
+    ok_taint, taint_reason = check_web_ipi_taint_gate(name=name, args=args, state=state, cwd=cwd)
+    if not ok_taint:
+        save_state(state, state_file)
+        return False, taint_reason
 
     # 1. run_command check
     if name == "run_command":
@@ -2623,7 +2911,7 @@ def check_tool_use(
                     f"Agora Fast-Path Invariant: Detected {agora_calls} agora_play inspection calls in a single turn. "
                     "The Discord round announcement already embeds all quotes. Keep Agora turns to 0 tools (or at most 1 fast eval call)."
                 )
-            save_state(state, state_file)
+            _finalize_and_save_state(state, state_file, name, args)
             return True, ""
 
         # A0. Ouroboros Process-Polling Loop Guard
@@ -2816,7 +3104,7 @@ def check_tool_use(
                     state["cmd_inspections"] = 0
 
         _record_forge_offload_if_applicable(cmd, cwd, state)
-        save_state(state, state_file)
+        _finalize_and_save_state(state, state_file, name, args)
         return True, ""
 
     # 2. view_file / read_file check
@@ -2853,7 +3141,7 @@ def check_tool_use(
                 "to inspect multiple files in a single pass."
             )
 
-        save_state(state, state_file)
+        _finalize_and_save_state(state, state_file, name, args)
         return True, ""
 
     # 3. replace_file_content / edit_file check
@@ -2883,7 +3171,7 @@ def check_tool_use(
         state["last_edited_file"] = target_file
         state["same_file_edit_count"] = 0
 
-        save_state(state, state_file)
+        _finalize_and_save_state(state, state_file, name, args)
         return True, ""
 
     # 4. write_to_file / write_file resets consecutive counters and blocks LLM-in-the-loop versioned scratch sweep loops (sim_v1..v14.py)
@@ -2929,10 +3217,10 @@ def check_tool_use(
         if not ok_tier:
             return False, tier_reason
 
-        save_state(state, state_file)
+        _finalize_and_save_state(state, state_file, name, args)
         return True, ""
 
-    save_state(state, state_file)
+    _finalize_and_save_state(state, state_file, name, args)
     return True, ""
 
 
