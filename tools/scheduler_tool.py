@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001, BLE001, S110
 """Persistent Sidecar Scheduler.
 
 Maintains /workspace/data/schedule.json:
@@ -742,6 +743,7 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
     return now_pt.timestamp() + 3600
 
 SIDECAR_ALIASES = {
+    "hearth_daily_weather_art": ["hearth_daily_weather_art", "hearth_weather_art"],
     "quant_daily_sweep": ["quant_daily_sweep", "quant_expansion_sweep", "quant"],
     "kalshi_midday_heating": ["kalshi_midday_heating"],
     "quant_pregame_sweep": ["quant_pregame_sweep"],

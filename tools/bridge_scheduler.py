@@ -839,6 +839,26 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Hearth weekly sync execution error: {e}")
         return
 
+    # Nightly Hearth Weather Art Generator: silent on success, alert on failure
+    if job_id == "hearth_daily_weather_art" or "hearth_weather_art" in prompt or job_name == "Nightly Hearth Weather Art Generator":
+        try:
+            from tools.sidecars import run_hearth_weather_art
+            ok, out, _ = await _run_sidecar_job_async(
+                "hearth_daily_weather_art",
+                "Nightly Hearth Weather Art Generator",
+                run_hearth_weather_art,
+            )
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel(channel_id or HOME_ASSISTANT_CHANNEL_ID)
+                if ch:
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    await _send_chunked_content(ch, clean_content, choice_view)
+            else:
+                print(f"[Scheduler] Hearth daily weather art nominal (silent): {out}")
+        except Exception as e:
+            print(f"[Scheduler] Hearth daily weather art execution error: {e}")
+        return
+
     # Reddit fantasy baseball scanner: surface high-signal dilemma draft card to #zero-chat
     if "reddit_fantasy" in prompt or "reddit_scan" in prompt or "Reddit Fantasy Baseball" in job_name:
         try:

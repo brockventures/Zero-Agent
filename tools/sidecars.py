@@ -307,7 +307,7 @@ def run_sidecar_job(job_id: str, name: str, func: callable, *args, **kwargs) -> 
             status = "ok" if ok else "warning"
         elif job_id == "plex":
             status = "ok" if ok else "warning"
-        elif job_id in ("host1_backup", "host2_backup"):
+        elif job_id in ("host1_backup", "host2_backup", "hearth_daily_weather_art"):
             status = "ok" if ok else "error"
         else:
             status = "ok" if ok else "warning"
@@ -2167,6 +2167,65 @@ def run_usage_telemetry_audit(days: int | float = 7, dry_run: bool = False, test
         return False, f"⚠️ Usage telemetry audit error: {e}", {"error": str(e)}
 
 
+def run_hearth_weather_art(
+    target_date: str | None = None,
+    theme: str | None = None,
+    force: bool = False,
+) -> tuple[bool, str, dict]:
+    """Execute nightly Hearth dynamic weather art pipeline as a silent sidecar."""
+    try:
+        from tools.hearth_daily_weather_art import run_nightly_pipeline
+
+        res = run_nightly_pipeline(
+            target_date=target_date,
+            theme=theme,
+            force=force,
+        )
+        is_success = bool(res.get("success", False))
+        deploy_info = res.get("deploy", {}) if isinstance(res.get("deploy"), dict) else {}
+        is_deployed = bool(deploy_info.get("deployed", False))
+        resolved_date = res.get("target_date", target_date or "unknown")
+        theme_name = res.get("theme", theme or "unknown")
+
+        if is_success and is_deployed:
+            manifest = res.get("manifest", {})
+            slots = manifest.get("slots", {}) if isinstance(manifest, dict) else {}
+            slots_summary = []
+            for slot_name in ("morning", "afternoon", "evening"):
+                slot_data = slots.get(slot_name, {})
+                reused_str = " (cached)" if slot_data.get("reused") else ""
+                slots_summary.append(f"{slot_name}{reused_str}")
+            slots_str = ", ".join(slots_summary) if slots_summary else "morning, afternoon, evening"
+            summary = (
+                f"Generated and deployed Hearth weather art for {resolved_date} "
+                f"({theme_name}; slots: {slots_str})"
+            )
+            return True, summary, res
+
+        err_msg = ""
+        if not is_success:
+            manifest = res.get("manifest", {})
+            slots = manifest.get("slots", {}) if isinstance(manifest, dict) else {}
+            failed_slots = [
+                s for s, d in slots.items() if isinstance(d, dict) and not d.get("valid", False)
+            ]
+            err_msg = (
+                f"Generation failed for slots: {', '.join(failed_slots)}"
+                if failed_slots
+                else "Image generation failed"
+            )
+        elif not is_deployed:
+            deploy_msg = deploy_info.get("message", "unknown deployment error")
+            err_msg = f"Deployment to Host 2 failed: {deploy_msg}"
+
+        alert = f"⚠️ **Hearth Daily Weather Art Failure** ({resolved_date}): {err_msg}"
+        return False, alert, res
+    except Exception as e:
+        log.error(f"Hearth weather art pipeline failed: {e}", exc_info=True)
+        alert = f"🚨 **Hearth Daily Weather Art Exception**: {e}"
+        return False, alert, {"error": str(e), "success": False}
+
+
 # --------------------------------------------------------------------------
 # SLZB-06P7 Stable Firmware Promotion Watcher & Flasher
 # --------------------------------------------------------------------------
@@ -2976,6 +3035,25 @@ if __name__ == "__main__":
             "hearth_weekly_sync",
             "Hearth Upstream Mirrormere Weekly Sync",
             lambda: sync_hearth(force=force),
+        )
+        if rep:
+            print(rep)
+    elif action in ("hearth_weather_art", "hearth_daily_weather_art"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        target_date = None
+        theme = None
+        for i, arg in enumerate(sys.argv):
+            if arg in ("--date", "--target-date") and i + 1 < len(sys.argv):
+                target_date = sys.argv[i + 1]
+            elif arg in ("--theme", "-m") and i + 1 < len(sys.argv):
+                theme = sys.argv[i + 1]
+        ok, rep, _ = run_sidecar_job(
+            "hearth_daily_weather_art",
+            "Nightly Hearth Weather Art Generator",
+            run_hearth_weather_art,
+            target_date=target_date,
+            theme=theme,
+            force=force,
         )
         if rep:
             print(rep)

@@ -24,8 +24,24 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+sys.path[:] = [p for p in sys.path if p not in ("/workspace", "/workspace/tools")]
+if str(REPO_ROOT) in sys.path:
+    sys.path.remove(str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT))
+
+# Evict any modules previously loaded from /workspace
+for mod_name in list(sys.modules.keys()):
+    if mod_name in ("tools", "sidecars", "scheduler_tool") or mod_name.startswith("tools."):
+        mod = sys.modules[mod_name]
+        mod_file = str(getattr(mod, "__file__", "") or "")
+        if "/workspace/" in mod_file:
+            del sys.modules[mod_name]
+
+import tools  # noqa: I001
+tools.__path__ = [str(REPO_ROOT / "tools")]
+if str(REPO_ROOT / "tools") in sys.path:
+    sys.path.remove(str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 try:
     from tools import hearth_daily_weather_art as hdwa
@@ -1145,3 +1161,146 @@ class TestMainCLI:
         assert kwargs["timeout"] == 300
         assert kwargs["max_retries"] == 4
         assert kwargs["force"] is True
+
+
+# ===========================================================================
+# 10. Sidecar Wrapper & Scheduler Integration Tests
+# ===========================================================================
+class TestSidecarWrapperAndScheduler:
+    """Verifies run_hearth_weather_art sidecar semantics, failure alerting, and alias mapping."""
+
+    def test_sidecar_aliases_mapping(self) -> None:
+        """Verify scheduler_tool.SIDECAR_ALIASES maps hearth_daily_weather_art."""
+        from tools.scheduler_tool import SIDECAR_ALIASES
+
+        assert "hearth_daily_weather_art" in SIDECAR_ALIASES
+        aliases = SIDECAR_ALIASES["hearth_daily_weather_art"]
+        assert "hearth_daily_weather_art" in aliases
+        assert "hearth_weather_art" in aliases
+
+    def test_run_hearth_weather_art_success_and_deploy(self) -> None:
+        """Verify run_hearth_weather_art returns (True, summary, res) on success+deploy."""
+        from tools import sidecars
+
+        fake_res = {
+            "success": True,
+            "target_date": "2026-11-20",
+            "theme": "Studio Ghibli Gouache",
+            "manifest": {
+                "theme_key": "studio_ghibli_gouache",
+                "slots": {
+                    "morning": {"valid": True, "reused": True},
+                    "afternoon": {"valid": True, "reused": False},
+                    "evening": {"valid": True, "reused": False},
+                },
+            },
+            "deploy": {"deployed": True, "message": "Synced 4 files to Host 2"},
+        }
+
+        with patch("tools.hearth_daily_weather_art.run_nightly_pipeline", return_value=fake_res) as mock_pipeline:
+            ok, summary, res = sidecars.run_hearth_weather_art(
+                target_date="2026-11-20",
+                theme="studio_ghibli_gouache",
+                force=True,
+            )
+
+        assert ok is True
+        assert "2026-11-20" in summary
+        assert "Studio Ghibli Gouache" in summary
+        assert "morning (cached)" in summary
+        assert res == fake_res
+        mock_pipeline.assert_called_once_with(
+            target_date="2026-11-20",
+            theme="studio_ghibli_gouache",
+            force=True,
+        )
+
+    def test_run_hearth_weather_art_pipeline_failure(self) -> None:
+        """Verify run_hearth_weather_art returns (False, alert, res) on slot failure."""
+        from tools import sidecars
+
+        fake_res = {
+            "success": False,
+            "target_date": "2026-11-20",
+            "theme": "Studio Ghibli Gouache",
+            "manifest": {
+                "theme_key": "studio_ghibli_gouache",
+                "slots": {
+                    "morning": {"valid": True},
+                    "afternoon": {"valid": False},
+                    "evening": {"valid": False},
+                },
+            },
+            "deploy": {"deployed": False, "message": "Pipeline incomplete"},
+        }
+
+        with patch("tools.hearth_daily_weather_art.run_nightly_pipeline", return_value=fake_res):
+            ok, alert, res = sidecars.run_hearth_weather_art(target_date="2026-11-20")
+
+        assert ok is False
+        assert "⚠️" in alert
+        assert "afternoon" in alert or "evening" in alert
+        assert res == fake_res
+
+    def test_run_hearth_weather_art_deploy_failure(self) -> None:
+        """Verify run_hearth_weather_art returns (False, alert, res) when deployment fails."""
+        from tools import sidecars
+
+        fake_res = {
+            "success": True,
+            "target_date": "2026-11-20",
+            "theme": "Studio Ghibli Gouache",
+            "manifest": {
+                "slots": {
+                    "morning": {"valid": True},
+                    "afternoon": {"valid": True},
+                    "evening": {"valid": True},
+                },
+            },
+            "deploy": {"deployed": False, "message": "Connection timed out to Host 2"},
+        }
+
+        with patch("tools.hearth_daily_weather_art.run_nightly_pipeline", return_value=fake_res):
+            ok, alert, res = sidecars.run_hearth_weather_art(target_date="2026-11-20")
+
+        assert ok is False
+        assert "⚠️" in alert
+        assert "Deployment to Host 2 failed" in alert
+        assert "Connection timed out" in alert
+        assert res == fake_res
+
+    def test_run_hearth_weather_art_exception_handling(self) -> None:
+        """Verify run_hearth_weather_art catches unhandled exceptions gracefully."""
+        from tools import sidecars
+
+        with patch("tools.hearth_daily_weather_art.run_nightly_pipeline", side_effect=RuntimeError("Disk full")):
+            ok, alert, res = sidecars.run_hearth_weather_art(target_date="2026-11-20")
+
+        assert ok is False
+        assert "🚨" in alert
+        assert "Disk full" in alert
+        assert res["success"] is False
+
+    def test_run_sidecar_job_hearth_weather_art_status_classification(self) -> None:
+        """Verify run_sidecar_job sets status='ok' on success and 'error' on failure."""
+        from tools import sidecars
+
+        # Success case
+        with patch.object(sidecars, "log_execution") as mock_log:
+            ok, _, _ = sidecars.run_sidecar_job(
+                "hearth_daily_weather_art",
+                "Nightly Hearth Weather Art Generator",
+                lambda: (True, "All good", {"summary": "clean"}),
+            )
+            assert ok is True
+            assert mock_log.call_args.kwargs["status"] == "ok"
+
+        # Failure case
+        with patch.object(sidecars, "log_execution") as mock_log:
+            ok, _, _ = sidecars.run_sidecar_job(
+                "hearth_daily_weather_art",
+                "Nightly Hearth Weather Art Generator",
+                lambda: (False, "Generation failed", {"summary": "failed"}),
+            )
+            assert ok is False
+            assert mock_log.call_args.kwargs["status"] == "error"

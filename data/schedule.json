@@ -998,5 +998,16 @@
     "last_run_ts": 1794589231,
     "last_run_at": "2026-11-13 05:00 PM PT",
     "next_run_ts": 1794770451.232292
+  },
+  {
+    "id": "hearth_daily_weather_art",
+    "name": "Nightly Hearth Weather Art Generator",
+    "enabled": true,
+    "schedule_type": "daily",
+    "hour_pt": 18,
+    "minute_pt": 30,
+    "prompt": "Run nightly Hearth dynamic weather art pipeline via silent sidecar: python3 /workspace/tools/sidecars.py hearth_weather_art. Generates 3 cohesive weather cards (morning, afternoon, evening) with family context and character consistency, and syncs daily_manifest.json to Host 2. Silent background sidecar (silent on success, alert only on failure).",
+    "catchup_if_missed": false,
+    "channel_id": 1544953275877556334
   }
 ]
