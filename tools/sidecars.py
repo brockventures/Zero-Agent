@@ -1661,6 +1661,21 @@ def run_arr_queue_watchdog(auto_fix: bool = True, force: bool = False) -> tuple[
     except Exception as e:
         return False, f"⚠️ Arr queue watchdog failed: {e}"
 
+def run_seerr_card_sync(limit: int = 100) -> tuple[bool, str]:
+    """Sync Seerr webhook cards in #media-requests with live Seerr request statuses."""
+    try:
+        from tools.seerr_card_sync import sync_seerr_cards
+        res = sync_seerr_cards(dry_run=False, limit=limit)
+        if not res["errors"]:
+            return True, f"(nominal - {res['updated']} Seerr card(s) updated)"
+        return (
+            False,
+            f"⚠️ Seerr card sync encountered {res['errors']} error(s) "
+            f"(updated={res.get('updated', 0)}, scanned={res.get('scanned', 0)})",
+        )
+    except Exception as e:
+        return False, f"⚠️ Seerr card sync failed: {e}"
+
 def run_ha_reauth_watchdog(force: bool = False) -> tuple[bool, str]:
     """Audit Home Assistant integrations for re-auth and setup failures."""
     try:
@@ -2617,6 +2632,14 @@ if __name__ == "__main__":
         force = "--force" in sys.argv or "-f" in sys.argv
         ok, rep, _ = run_sidecar_job("arr_queue_watchdog", "Arr Queue Watchdog", run_arr_queue_watchdog, force=force)
         if rep and rep != "(nominal - 0 import failures)":
+            print(rep)
+    elif action in ("seerr_card_sync", "seerr_sync"):
+        limit = 100
+        for i, arg in enumerate(sys.argv):
+            if arg == "--limit" and i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit():
+                limit = int(sys.argv[i + 1])
+        ok, rep, _ = run_sidecar_job("seerr_card_sync", "Seerr Media Request Card Sync", run_seerr_card_sync, limit=limit)
+        if rep:
             print(rep)
     elif action in ("ha_reauth", "reauth"):
         force = "--force" in sys.argv or "-f" in sys.argv

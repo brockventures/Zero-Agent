@@ -227,6 +227,8 @@ INTERNAL_SYSTEM_MAINTENANCE_NAMES = {
     "Weekly Plex Audiobook Enricher & Cover Badges",
     "Plex Audiobook Enricher & Cover Badges",
     "plex_audiobook_enricher",
+    "Seerr Media Request Card Sync",
+    "seerr_card_sync",
 }
 
 INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
@@ -246,6 +248,7 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "resident_agents_watcher",
     "resident_agents_daily_tip",
     "plex_audiobook_enricher",
+    "seerr_card_sync",
 }
 
 
@@ -978,6 +981,21 @@ async def dispatch_scheduled_prompt(
                 print("[Scheduler] Arr queue checked: nominal (silent).")
         except Exception as e:
             print(f"[Scheduler] Arr queue watchdog execution error: {e}")
+        return
+
+    # Seerr media-requests card auto-sync: silent unless errors occur
+    if "seerr_card_sync" in prompt or job_name in ("Seerr Media Request Card Sync", "Seerr Card Sync"):
+        try:
+            from tools.sidecars import run_seerr_card_sync
+            ok, out, _ = await _run_sidecar_job_async("seerr_card_sync", "Seerr Media Request Card Sync", run_seerr_card_sync)
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print(f"[Scheduler] Seerr card sync checked: {out or 'nominal'} (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Seerr card sync execution error: {e}")
         return
 
     # Home Assistant integration & re-auth check: silent unless integrations fail

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """
 Unit test suite for bridge_scheduler.py (Bridge Background Scheduler & Sidecar Dispatcher).
 """
@@ -1232,6 +1233,66 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(jobs[0]["quiet_hours"], [0, 7])
         dispatched_ids = [c.kwargs.get("job_id") for c in dispatch_mock.await_args_list]
         self.assertIn("daily_quota_card", dispatched_ids)
+
+    async def test_seerr_card_sync_silent_on_success(self):
+        """Verify seerr_card_sync runs run_seerr_card_sync silently without LLM turns or channel noise when ok is True."""
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_bot.fetch_channel = AsyncMock(return_value=mock_channel)
+        mock_turn_queue = AsyncMock()
+
+        with patch("tools.sidecars.run_seerr_card_sync", return_value=(True, "(nominal - 2 Seerr card(s) updated)")) as mock_sync, \
+             patch("tools.sidecars.log_execution"):
+            await bshed.dispatch_scheduled_prompt(
+                "Run Seerr webhook card sync using /workspace/tools/sidecars.py seerr_card_sync",
+                job_name="Seerr Media Request Card Sync",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue,
+                job_id="seerr_card_sync",
+            )
+            mock_sync.assert_called_once_with()
+            mock_channel.send.assert_not_called()
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_seerr_card_sync_alerts_on_failure(self):
+        """Verify seerr_card_sync posts an alert without invoking an LLM turn when ok is False."""
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_bot.fetch_channel = AsyncMock(return_value=mock_channel)
+        mock_turn_queue = AsyncMock()
+
+        err_msg = "⚠️ Seerr card sync encountered 1 error(s) (updated=0, scanned=10)"
+        with patch("tools.sidecars.run_seerr_card_sync", return_value=(False, err_msg)) as mock_sync, \
+             patch("tools.sidecars.log_execution"):
+            await bshed.dispatch_scheduled_prompt(
+                "Run Seerr webhook card sync using /workspace/tools/sidecars.py seerr_card_sync",
+                job_name="Seerr Card Sync",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue,
+                channel_id=12345,
+            )
+            mock_sync.assert_called_once_with()
+            mock_channel.send.assert_awaited_once_with(err_msg)
+            mock_turn_queue.put.assert_not_called()
+
+    def test_run_seerr_card_sync_sidecar_wrapper(self):
+        """Verify tools.sidecars.run_seerr_card_sync formats nominal and error returns cleanly."""
+        from tools.sidecars import run_seerr_card_sync
+
+        with patch("tools.seerr_card_sync.sync_seerr_cards", return_value={"updated": 3, "errors": 0, "scanned": 12}) as mock_fn:
+            ok, msg = run_seerr_card_sync(limit=50)
+            self.assertTrue(ok)
+            self.assertEqual(msg, "(nominal - 3 Seerr card(s) updated)")
+            mock_fn.assert_called_once_with(dry_run=False, limit=50)
+
+        with patch("tools.seerr_card_sync.sync_seerr_cards", return_value={"updated": 1, "errors": 2, "scanned": 12}):
+            ok_err, msg_err = run_seerr_card_sync()
+            self.assertFalse(ok_err)
+            self.assertIn("2 error(s)", msg_err)
 
 
 if __name__ == "__main__":
