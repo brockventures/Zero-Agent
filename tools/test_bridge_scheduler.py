@@ -1095,6 +1095,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(scheduler, "_evaluate_and_dispatch_jobs", new_callable=AsyncMock), \
              patch.object(scheduler, "flush_outbox_queue", new_callable=AsyncMock), \
+             patch("tools.bridge_state.is_vulcan_agent", return_value=False), \
              patch("tools.process_probe.reap_stale_agy_processes") as mock_reap, \
              patch("tools.forge.forge_supervisor.tick_sync"), \
              patch("asyncio.sleep", side_effect=stop_after_one_sleep):
@@ -1118,6 +1119,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(scheduler, "_evaluate_and_dispatch_jobs", new_callable=AsyncMock), \
              patch.object(scheduler, "flush_outbox_queue", new_callable=AsyncMock), \
+             patch("tools.bridge_state.is_vulcan_agent", return_value=False), \
              patch.object(scheduler, "_sync_housekeeping") as mock_hk, \
              patch("tools.forge.forge_supervisor.tick_sync"), \
              patch("asyncio.sleep", side_effect=stop_after_one_sleep):
@@ -1293,6 +1295,162 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             ok_err, msg_err = run_seerr_card_sync()
             self.assertFalse(ok_err)
             self.assertIn("2 error(s)", msg_err)
+
+
+    def test_calculate_next_run_interval_jitter_bounds(self):
+        """Verify calculate_next_run applies jitter within [-jitter, jitter] for interval jobs."""
+        from tools.scheduler_tool import calculate_next_run
+        job = {
+            "id": "resident_agents_watcher",
+            "schedule_type": "interval",
+            "interval_seconds": 300,
+            "jitter_seconds": 90,
+        }
+        from_ts = 1780000000.0
+
+        with patch("random.uniform", return_value=-90.0):
+            nxt = calculate_next_run(job, from_ts=from_ts)
+            self.assertEqual(nxt, from_ts + 210.0)
+
+        with patch("random.uniform", return_value=90.0):
+            nxt = calculate_next_run(job, from_ts=from_ts)
+            self.assertEqual(nxt, from_ts + 390.0)
+
+        with patch("random.uniform", return_value=0.0):
+            nxt = calculate_next_run(job, from_ts=from_ts)
+            self.assertEqual(nxt, from_ts + 300.0)
+
+        for _ in range(30):
+            nxt = calculate_next_run(job, from_ts=from_ts)
+            self.assertGreaterEqual(nxt, from_ts + 210.0)
+            self.assertLessEqual(nxt, from_ts + 390.0)
+
+    def test_calculate_next_run_interval_clamps_above_from_ts(self):
+        """Verify interval jobs clamp nxt >= from_ts + 30 when negative jitter pushes below threshold."""
+        from tools.scheduler_tool import calculate_next_run
+        job = {
+            "id": "short_interval_job",
+            "schedule_type": "interval",
+            "interval_seconds": 60,
+            "jitter_seconds": 50,
+        }
+        from_ts = 1780000000.0
+
+        with patch("random.uniform", return_value=-50.0):
+            nxt = calculate_next_run(job, from_ts=from_ts)
+            self.assertEqual(nxt, from_ts + 30.0)
+
+        with patch("random.uniform", return_value=-200.0):
+            nxt = calculate_next_run(job, from_ts=from_ts)
+            self.assertEqual(nxt, from_ts + 30.0)
+
+    def test_calculate_next_run_interval_honors_quiet_hours_after_jitter(self):
+        """Verify quiet hours are evaluated after jitter so jittered interval runs never land in quiet hours."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from tools.scheduler_tool import calculate_next_run
+
+        pt = ZoneInfo("America/Los_Angeles")
+        ts_2258 = datetime(2026, 11, 15, 22, 58, 0, tzinfo=pt).timestamp()
+        job = {
+            "id": "resident_agents_watcher",
+            "schedule_type": "interval",
+            "interval_seconds": 300,
+            "jitter_seconds": 90,
+            "quiet_hours": [23, 7],
+        }
+
+        # Base + 300s is 23:03 PT. Jitter -30s -> 23:02:30 PT (inside quiet hours)
+        with patch("random.uniform", return_value=-30.0):
+            nxt = calculate_next_run(job, from_ts=ts_2258)
+            nxt_pt = datetime.fromtimestamp(nxt, tz=pt)
+            self.assertEqual(nxt_pt.hour, 7)
+            self.assertEqual(nxt_pt.minute, 0)
+            self.assertEqual(nxt_pt.second, 0)
+            self.assertEqual(nxt_pt.day, 16)
+
+        # Base + 300s from 22:54 PT is 22:59 PT (outside quiet hours), but jitter +90s lands in 23:00:30 PT
+        ts_2254 = datetime(2026, 11, 15, 22, 54, 0, tzinfo=pt).timestamp()
+        with patch("random.uniform", return_value=90.0):
+            nxt2 = calculate_next_run(job, from_ts=ts_2254)
+            nxt2_pt = datetime.fromtimestamp(nxt2, tz=pt)
+            self.assertEqual(nxt2_pt.hour, 7)
+            self.assertEqual(nxt2_pt.minute, 0)
+            self.assertEqual(nxt2_pt.second, 0)
+            self.assertEqual(nxt2_pt.day, 16)
+
+    def test_calculate_next_run_daily_jitter_bounds(self):
+        """Verify calculate_next_run applies jitter within [-jitter, jitter] for daily jobs."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from tools.scheduler_tool import calculate_next_run
+
+        pt = ZoneInfo("America/Los_Angeles")
+        ts_0800 = datetime(2026, 11, 15, 8, 0, 0, tzinfo=pt).timestamp()
+        target_ts = datetime(2026, 11, 15, 11, 30, 0, tzinfo=pt).timestamp()
+
+        job = {
+            "id": "resident_agents_daily_tip",
+            "schedule_type": "daily",
+            "hour_pt": 11,
+            "minute_pt": 30,
+            "jitter_seconds": 1800,
+        }
+
+        with patch("random.uniform", return_value=-1800.0):
+            nxt = calculate_next_run(job, from_ts=ts_0800)
+            self.assertEqual(nxt, target_ts - 1800.0)
+
+        with patch("random.uniform", return_value=1800.0):
+            nxt = calculate_next_run(job, from_ts=ts_0800)
+            self.assertEqual(nxt, target_ts + 1800.0)
+
+        for _ in range(30):
+            nxt = calculate_next_run(job, from_ts=ts_0800)
+            self.assertGreaterEqual(nxt, target_ts - 1800.0)
+            self.assertLessEqual(nxt, target_ts + 1800.0)
+
+    def test_calculate_next_run_daily_clamps_above_from_ts(self):
+        """Verify daily jobs clamp nxt >= from_ts + 60 when negative jitter pushes below threshold."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from tools.scheduler_tool import calculate_next_run
+
+        pt = ZoneInfo("America/Los_Angeles")
+        ts_112945 = datetime(2026, 11, 15, 11, 29, 45, tzinfo=pt).timestamp()
+        job = {
+            "id": "resident_agents_daily_tip",
+            "schedule_type": "daily",
+            "hour_pt": 11,
+            "minute_pt": 30,
+            "jitter_seconds": 1800,
+        }
+
+        with patch("random.uniform", return_value=-1800.0):
+            nxt = calculate_next_run(job, from_ts=ts_112945)
+            self.assertEqual(nxt, ts_112945 + 60.0)
+            self.assertGreaterEqual(nxt, ts_112945 + 60.0)
+
+    def test_calculate_next_run_handles_invalid_or_missing_jitter(self):
+        """Verify calculate_next_run ignores invalid, zero, or negative jitter values safely."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from tools.scheduler_tool import calculate_next_run
+
+        pt = ZoneInfo("America/Los_Angeles")
+        ts_0800 = datetime(2026, 11, 15, 8, 0, 0, tzinfo=pt).timestamp()
+        expected = datetime(2026, 11, 15, 11, 30, 0, tzinfo=pt).timestamp()
+
+        for invalid in (None, 0, -100, "invalid", [10]):
+            job = {
+                "id": "test_job",
+                "schedule_type": "daily",
+                "hour_pt": 11,
+                "minute_pt": 30,
+                "jitter_seconds": invalid,
+            }
+            nxt = calculate_next_run(job, from_ts=ts_0800)
+            self.assertEqual(nxt, expected)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ Maintains /workspace/data/schedule.json:
 import json
 import logging
 import os
+import random
 import sys
 import threading
 import time
@@ -623,7 +624,8 @@ DEFAULT_JOBS = [
         "channel_id": 1542081375287640084,
         "prompt": "Run the r/ResidentAgents subreddit watcher and auto-approver using /workspace/tools/sidecars.py resident_agents_watcher --quiet. Silent background execution: if 0 new items and 0 approvals occurred (no output), emit ONLY [NO_REPLY].",
         "catchup_if_missed": False,
-        "quiet_hours": [23, 7]
+        "quiet_hours": [23, 7],
+        "jitter_seconds": 90,
     },
     {
         "id": "resident_agents_daily_tip",
@@ -635,7 +637,8 @@ DEFAULT_JOBS = [
         "channel_id": 1562544598423965856,
         "prompt": "Run the daily r/ResidentAgents Tips and Tricks Megathread rotation prompt using /workspace/tools/sidecars.py resident_agents_daily_tip --quiet. Wakes the on-deck resident bot in #r-residentagents to post a daily engineering recipe comment on t3_1xbzkxr.",
         "catchup_if_missed": True,
-        "catchup_window_seconds": 14400
+        "catchup_window_seconds": 14400,
+        "jitter_seconds": 1800,
     }
 ]
 
@@ -683,6 +686,16 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
     now_pt = datetime.fromtimestamp(now_ts, tz=PT)
     stype = job.get("schedule_type", "daily")
 
+    raw_jitter = job.get("jitter_seconds")
+    jitter = 0.0
+    if raw_jitter is not None:
+        try:
+            val = float(raw_jitter)
+            if val > 0:
+                jitter = val
+        except (ValueError, TypeError):
+            jitter = 0.0
+
     if stype == "interval":
         interval = job.get("interval_seconds", 7200)
         last = job.get("last_run_ts")
@@ -690,6 +703,11 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
             nxt = float(last + interval)
         else:
             nxt = float(now_ts + interval)
+
+        if jitter > 0:
+            nxt += random.uniform(-jitter, jitter)
+
+        nxt = max(nxt, now_ts + 30)
 
         quiet_pair = _coerce_quiet_hours(job.get("quiet_hours"))
 
@@ -702,7 +720,7 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
                 if resume_pt <= nxt_pt:
                     resume_pt += timedelta(days=1)
                 nxt = resume_pt.timestamp()
-        return nxt
+        return float(nxt)
 
     elif stype == "daily":
         h = job.get("hour_pt", 0)
@@ -710,7 +728,12 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
         target = now_pt.replace(hour=h, minute=m, second=0, microsecond=0)
         if target <= now_pt:
             target += timedelta(days=1)
-        return target.timestamp()
+        nxt = target.timestamp()
+        if jitter > 0:
+            nxt += random.uniform(-jitter, jitter)
+            if nxt <= now_ts + 60:
+                nxt = max(nxt, now_ts + 60)
+        return float(nxt)
 
     elif stype == "weekly":
         dow = job.get("day_of_week", 6)
@@ -720,7 +743,12 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
         target = now_pt.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=days_ahead)
         if target <= now_pt:
             target += timedelta(days=7)
-        return target.timestamp()
+        nxt = target.timestamp()
+        if jitter > 0:
+            nxt += random.uniform(-jitter, jitter)
+            if nxt <= now_ts + 60:
+                nxt = max(nxt, now_ts + 60)
+        return float(nxt)
 
     elif stype == "monthly":
         dom = job.get("day_of_month", 1)
@@ -735,12 +763,17 @@ def calculate_next_run(job: dict, from_ts: float | None = None) -> float:
             new_year = now_pt.year + (1 if now_pt.month == 12 else 0)
             new_month = 1 if now_pt.month == 12 else now_pt.month + 1
             target = target.replace(year=new_year, month=new_month, day=dom)
-        return target.timestamp()
+        nxt = target.timestamp()
+        if jitter > 0:
+            nxt += random.uniform(-jitter, jitter)
+            if nxt <= now_ts + 60:
+                nxt = max(nxt, now_ts + 60)
+        return float(nxt)
 
     elif stype == "one_shot":
-        return job.get("target_ts", now_pt.timestamp())
+        return float(job.get("target_ts", now_pt.timestamp()))
 
-    return now_pt.timestamp() + 3600
+    return float(now_pt.timestamp() + 3600)
 
 SIDECAR_ALIASES = {
     "hearth_daily_weather_art": ["hearth_daily_weather_art", "hearth_weather_art"],
