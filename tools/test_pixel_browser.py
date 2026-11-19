@@ -1,14 +1,21 @@
 """Unit tests for Pixel 8 Pro Mobile Browser Automation (tools/pixel_browser.py)."""
 
+from pathlib import Path
 import subprocess
+import sys
 import unittest
 from unittest.mock import MagicMock, call, patch
 import urllib.error
 
-import sys
-if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+for _p in (_REPO_ROOT, "/workspace"):
+    if _p not in sys.path:
+        sys.path.append(_p)
+if sys.path[0] != _REPO_ROOT:
+    sys.path.insert(0, _REPO_ROOT)
+
 from tools.pixel_browser import (
+    ADB_KEYEVENT_TIMEOUT_SEC,
     check_printer_conflict,
     get_adb_command_prefix,
     get_device_status,
@@ -66,20 +73,70 @@ class TestPixelBrowser(unittest.TestCase):
         self.assertTrue(st["screen_awake"])
         self.assertFalse(st["conflict"])
 
+    @patch("tools.pixel_browser.time.sleep")
+    @patch("tools.pixel_browser.get_adb_command_prefix", return_value=(["adb", "-s", "husky"], "usb"))
     @patch("tools.pixel_browser.subprocess.run")
-    def test_wake_and_unlock(self, mock_run):
-        wake_and_unlock()
-        # Verify both wakeup (224) and menu/unlock (82) keyevents are sent
+    def test_wake_and_unlock(self, mock_run, mock_prefix, mock_sleep):
+        ok = wake_and_unlock()
+        self.assertTrue(ok)
+        # Verify both wakeup (224) and menu/unlock (82) keyevents are sent with 8s timeout
         calls = [c[0][0] for c in mock_run.call_args_list]
+        timeouts = [c.kwargs.get("timeout") for c in mock_run.call_args_list]
+        self.assertEqual(ADB_KEYEVENT_TIMEOUT_SEC, 8)
         self.assertTrue(any("224" in arg_list for arg_list in calls))
         self.assertTrue(any("82" in arg_list for arg_list in calls))
+        self.assertTrue(all(t == 8 for t in timeouts))
 
+    @patch("tools.pixel_browser.get_adb_command_prefix", return_value=(["adb", "-s", "husky"], "usb"))
     @patch("tools.pixel_browser.subprocess.run")
-    def test_sleep_screen(self, mock_run):
-        sleep_screen()
-        # Verify power keyevent (26) is sent
+    def test_sleep_screen(self, mock_run, mock_prefix):
+        ok = sleep_screen()
+        self.assertTrue(ok)
+        # Verify unconditional KEYCODE_SLEEP (223) is sent with 8s timeout
         calls = [c[0][0] for c in mock_run.call_args_list]
-        self.assertTrue(any("26" in arg_list for arg_list in calls))
+        timeouts = [c.kwargs.get("timeout") for c in mock_run.call_args_list]
+        self.assertTrue(any("223" in arg_list for arg_list in calls))
+        self.assertEqual(timeouts, [8])
+
+    @patch("tools.pixel_browser.time.sleep")
+    @patch("tools.pixel_browser.get_adb_command_prefix", return_value=(["adb", "-s", "husky"], "usb"))
+    @patch("tools.pixel_browser.subprocess.run")
+    def test_wake_and_unlock_retries_transient_timeout(self, mock_run, mock_prefix, mock_sleep):
+        mock_run.side_effect = [
+            subprocess.TimeoutExpired(cmd="adb", timeout=8),
+            MagicMock(returncode=0),
+            MagicMock(returncode=0),
+        ]
+        ok = wake_and_unlock()
+        self.assertTrue(ok)
+        keyevents = [c[0][0][-1] for c in mock_run.call_args_list]
+        self.assertEqual(keyevents, ["224", "224", "82"])
+
+    @patch("tools.pixel_browser.time.sleep")
+    @patch("tools.pixel_browser.get_adb_command_prefix", return_value=(["adb", "-s", "husky"], "usb"))
+    @patch("tools.pixel_browser.subprocess.run")
+    def test_sleep_screen_survives_persistent_timeout(self, mock_run, mock_prefix, mock_sleep):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="adb", timeout=8)
+        ok = sleep_screen()
+        self.assertFalse(ok)
+        self.assertEqual(mock_run.call_count, 2)
+
+    @patch("tools.pixel_browser.time.sleep")
+    @patch("tools.pixel_browser.launch_chrome")
+    @patch("tools.pixel_browser.setup_cdp_forwarding", return_value=True)
+    @patch("tools.pixel_browser.get_adb_command_prefix", return_value=(["adb", "-s", "husky"], "local"))
+    @patch("tools.pixel_browser.check_printer_conflict", return_value=(False, "Clear"))
+    @patch("tools.pixel_browser.subprocess.run")
+    def test_pixel_session_proceeds_when_wake_and_sleep_timeout(
+        self, mock_run, mock_conflict, mock_prefix, mock_cdp, mock_chrome, mock_sleep
+    ):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="adb", timeout=8)
+        with pixel_session() as cdp_url:
+            self.assertEqual(cdp_url, "http://127.0.0.1:9223")
+            mock_cdp.assert_called_once()
+            mock_chrome.assert_called_once()
+        # 2 retries * 2 keyevents in wake_and_unlock + 2 retries * 1 keyevent in sleep_screen = 6
+        self.assertEqual(mock_run.call_count, 6)
 
     @patch("tools.pixel_browser.check_printer_conflict")
     def test_pixel_session_conflict_guard(self, mock_conflict):

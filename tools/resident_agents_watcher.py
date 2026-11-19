@@ -33,6 +33,7 @@ import logging
 from pathlib import Path
 import random
 import re
+import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -154,6 +155,8 @@ def load_state() -> Dict[str, Any]:
                     data.setdefault("last_seeding_post_ts", 0)
                     data.setdefault("seeding_posts_by_date", {})
                     data.setdefault("consecutive_poll_errors", 0)
+                    data.setdefault("first_poll_error_ts", None)
+                    data.setdefault("last_transient_alert_ts", 0)
                     data.setdefault("last_run_at", None)
                     return data
         except Exception as e:
@@ -172,6 +175,8 @@ def load_state() -> Dict[str, Any]:
         "last_seeding_post_ts": 0,
         "seeding_posts_by_date": {},
         "consecutive_poll_errors": 0,
+        "first_poll_error_ts": None,
+        "last_transient_alert_ts": 0,
         "last_run_at": None,
     }
 
@@ -1468,6 +1473,8 @@ def poll_and_remediate_via_pixel(
     state["thread_reply_counts"] = thread_reply_counts
     state["seen_seeding_ids"] = list(seen_seeding_set)[-300:]
     state["consecutive_poll_errors"] = 0
+    state["first_poll_error_ts"] = None
+    state["last_transient_alert_ts"] = 0
     state["last_run_at"] = datetime.now(PT).strftime("%Y-%m-%d %I:%M:%S %p PT")
     if not dry_run:
         save_state(state)
@@ -1481,8 +1488,15 @@ def poll_and_remediate_via_pixel(
     }
 
 
+TRANSIENT_POLL_ALERT_MIN_STRIKES = 24     # 24 * 5m = 2 hours of consecutive transient failures
+TRANSIENT_POLL_ALERT_MIN_SECONDS = 7200   # >= 2 hours elapsed since first consecutive poll error
+TRANSIENT_POLL_ALERT_COOLDOWN_SECONDS = 7200  # Re-alert at most every 2 hours during prolonged outages
+
+
 def _is_transient_pixel_poll_error(err: Exception | str) -> bool:
     """Return True if an exception is a transient Pixel wake/DNS/navigation/CDP timeout."""
+    if isinstance(err, (TimeoutError, subprocess.TimeoutExpired)):
+        return True
     msg = str(err).lower()
     transient_markers = (
         "err_name_not_resolved",
@@ -1491,6 +1505,7 @@ def _is_transient_pixel_poll_error(err: Exception | str) -> bool:
         "err_connection_timed_out",
         "err_connection_reset",
         "err_timed_out",
+        "timed out",
         "timeout",
         "connect_over_cdp",
         "target closed",
@@ -1525,24 +1540,63 @@ def run_resident_agents_watcher(
             auto_post_seeding=True,
         )
     except Exception as e:
+        now_ts = time.time()
         consec = int(state.get("consecutive_poll_errors") or 0) + 1
+        first_err_ts = state.get("first_poll_error_ts")
+        if not first_err_ts:
+            first_err_ts = now_ts
+        outage_sec = max(0.0, now_ts - float(first_err_ts))
+        last_alert_ts = float(state.get("last_transient_alert_ts") or 0)
+
         state["consecutive_poll_errors"] = consec
-        if not test:
-            save_state(state)
-        err_msg = f"⚠️ r/ResidentAgents watcher error: {e}"
-        log.warning("%s (consecutive_poll_errors=%d)", err_msg, consec)
-        if _is_transient_pixel_poll_error(e) and consec < 3:
-            # Suppress single-cycle Pixel wake/DNS/timeout hiccups from spamming #zero-chat
+        state["first_poll_error_ts"] = first_err_ts
+
+        is_transient = _is_transient_pixel_poll_error(e)
+        should_alert_transient = (
+            is_transient
+            and consec >= TRANSIENT_POLL_ALERT_MIN_STRIKES
+            and outage_sec >= TRANSIENT_POLL_ALERT_MIN_SECONDS
+            and (last_alert_ts <= 0 or (now_ts - last_alert_ts) >= TRANSIENT_POLL_ALERT_COOLDOWN_SECONDS)
+        )
+
+        if is_transient and not should_alert_transient:
+            if not test:
+                save_state(state)
+            outage_min = int(round(outage_sec / 60.0))
+            summary = f"Suppressed transient Pixel poll error ({consec} consecutive, {outage_min}m): {str(e)[:220]}"
+            log.warning("r/ResidentAgents watcher transient error suppressed: %s", summary)
+            # Suppress transient ADB/CDP/wake timeout hiccups from spamming #zero-chat;
+            # sidecars.run_sidecar_job records extra["summary"] to sidecar telemetry.
             return True, "", {
                 "ok": True,
+                "summary": summary,
                 "transient_error_suppressed": True,
+                "is_transient": True,
                 "consecutive_poll_errors": consec,
+                "outage_seconds": round(outage_sec, 1),
                 "error": str(e),
                 "link_assignment": link_assignment,
             }
+
+        if is_transient and should_alert_transient:
+            state["last_transient_alert_ts"] = now_ts
+            outage_hours = outage_sec / 3600.0
+            err_msg = (
+                f"⚠️ r/ResidentAgents watcher extended outage "
+                f"({consec} consecutive transient errors over {outage_hours:.1f}h): {e}"
+            )
+        else:
+            err_msg = f"⚠️ r/ResidentAgents watcher error: {e}"
+
+        if not test:
+            save_state(state)
+        log.warning("%s (consecutive_poll_errors=%d, outage_sec=%.1f)", err_msg, consec, outage_sec)
         return False, err_msg, {
-            "error": str(e),
+            "summary": err_msg[:400],
+            "is_transient": is_transient,
             "consecutive_poll_errors": consec,
+            "outage_seconds": round(outage_sec, 1),
+            "error": str(e),
             "link_assignment": link_assignment,
         }
 

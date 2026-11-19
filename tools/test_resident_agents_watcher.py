@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
 import types
 from unittest.mock import MagicMock, patch
@@ -27,6 +28,10 @@ from tools.resident_agents_watcher import (
     SEEDING_MIN_POST_INTERVAL_SEC,
     SEEDING_MIN_SCORE,
     SEEDING_SCAN_INTERVAL_SEC,
+    TRANSIENT_POLL_ALERT_COOLDOWN_SECONDS,
+    TRANSIENT_POLL_ALERT_MIN_SECONDS,
+    TRANSIENT_POLL_ALERT_MIN_STRIKES,
+    _is_transient_pixel_poll_error,
     build_upvote_targets_for_reply,
     classify_item_needs_approval,
     compute_seeding_velocity_priority,
@@ -474,31 +479,82 @@ def test_state_persistence_and_runner(tmp_path: Path) -> None:
             assert channels == [str(RESIDENT_AGENTS_CHANNEL_ID)]
 
 
-def test_transient_pixel_poll_error_suppression_until_3_strikes(tmp_path: Path) -> None:
+def test_is_transient_pixel_poll_error_markers() -> None:
+    assert _is_transient_pixel_poll_error(subprocess.TimeoutExpired(cmd="adb", timeout=8)) is True
+    assert _is_transient_pixel_poll_error(RuntimeError("Command 'adb shell input keyevent 224' timed out after 3 seconds")) is True
+    assert _is_transient_pixel_poll_error(RuntimeError("Timeout 25000ms exceeded")) is True
+    assert _is_transient_pixel_poll_error(RuntimeError("Page.goto: net::ERR_NAME_NOT_RESOLVED")) is True
+    assert _is_transient_pixel_poll_error(RuntimeError("BrowserType.connect_over_cdp: ECONNREFUSED")) is True
+    assert _is_transient_pixel_poll_error(RuntimeError("Reddit session cookies expired")) is False
+    assert _is_transient_pixel_poll_error(ValueError("Missing modhash")) is False
+
+
+def test_transient_pixel_poll_error_suppression_and_outage_alert(tmp_path: Path) -> None:
     fake_state_file = tmp_path / "state_err.json"
+    fake_now = [1795000000.0]
+
+    with patch("tools.resident_agents_watcher.STATE_FILE", fake_state_file), patch(
+        "tools.resident_agents_watcher.time.time", side_effect=lambda: fake_now[0]
+    ), patch(
+        "tools.resident_agents_watcher.check_and_assign_daily_links", return_value=None
+    ), patch(
+        "tools.resident_agents_watcher.poll_and_remediate_via_pixel",
+        side_effect=subprocess.TimeoutExpired(cmd="adb shell input keyevent 224", timeout=8),
+    ):
+        # Strikes 1..5 (including past old 3-strike cutoff): suppressed silently, logged to sidecar telemetry summary
+        for expected_strike in range(1, 6):
+            ok, msg, extra = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
+            assert ok is True
+            assert msg == ""
+            assert extra.get("transient_error_suppressed") is True
+            assert extra.get("is_transient") is True
+            assert extra.get("consecutive_poll_errors") == expected_strike
+            assert "Suppressed transient Pixel poll error" in extra.get("summary", "")
+            fake_now[0] += 300.0
+
+        # Even if >= 2 hours pass with fewer than TRANSIENT_POLL_ALERT_MIN_STRIKES (e.g. quiet hours), keep suppressing
+        fake_now[0] += TRANSIENT_POLL_ALERT_MIN_SECONDS + 60.0
+        ok_q, msg_q, extra_q = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
+        assert ok_q is True
+        assert msg_q == ""
+        assert extra_q.get("transient_error_suppressed") is True
+
+        # Advance to extended multi-hour outage threshold (TRANSIENT_POLL_ALERT_MIN_STRIKES and >= 2h)
+        st = json.loads(fake_state_file.read_text(encoding="utf-8"))
+        st["consecutive_poll_errors"] = TRANSIENT_POLL_ALERT_MIN_STRIKES - 1
+        st["first_poll_error_ts"] = fake_now[0] - TRANSIENT_POLL_ALERT_MIN_SECONDS - 10.0
+        fake_state_file.write_text(json.dumps(st), encoding="utf-8")
+
+        ok_alert, msg_alert, extra_alert = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
+        assert ok_alert is False
+        assert "extended outage" in msg_alert.lower()
+        assert "timed out" in msg_alert.lower()
+        assert extra_alert.get("consecutive_poll_errors") == TRANSIENT_POLL_ALERT_MIN_STRIKES
+
+        # Next 5-minute cycle during cooldown is suppressed again instead of spamming #zero-chat
+        fake_now[0] += 300.0
+        ok_cool, msg_cool, extra_cool = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
+        assert ok_cool is True
+        assert msg_cool == ""
+        assert extra_cool.get("transient_error_suppressed") is True
+
+        # After cooldown elapses, persistent multi-hour outage can alert again
+        fake_now[0] += TRANSIENT_POLL_ALERT_COOLDOWN_SECONDS + 5.0
+        ok_realert, msg_realert, _ = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
+        assert ok_realert is False
+        assert "extended outage" in msg_realert.lower()
+
+    # Genuine non-transient failure alerts immediately without suppression
     with patch("tools.resident_agents_watcher.STATE_FILE", fake_state_file), patch(
         "tools.resident_agents_watcher.check_and_assign_daily_links", return_value=None
     ), patch(
         "tools.resident_agents_watcher.poll_and_remediate_via_pixel",
-        side_effect=RuntimeError("Page.goto: net::ERR_NAME_NOT_RESOLVED at https://old.reddit.com/r/ResidentAgents/"),
+        side_effect=RuntimeError("Reddit session cookies expired"),
     ):
-        # Strike 1 & 2: suppressed silently
-        ok1, msg1, extra1 = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
-        assert ok1 is True
-        assert msg1 == ""
-        assert extra1.get("transient_error_suppressed") is True
-        assert extra1.get("consecutive_poll_errors") == 1
-
-        ok2, msg2, extra2 = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
-        assert ok2 is True
-        assert msg2 == ""
-        assert extra2.get("consecutive_poll_errors") == 2
-
-        # Strike 3: surfaces alert
-        ok3, msg3, extra3 = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
-        assert ok3 is False
-        assert "ERR_NAME_NOT_RESOLVED" in msg3
-        assert extra3.get("consecutive_poll_errors") == 3
+        ok_nt, msg_nt, extra_nt = run_resident_agents_watcher(test=False, quiet=True, post_discord=True)
+        assert ok_nt is False
+        assert "Reddit session cookies expired" in msg_nt
+        assert extra_nt.get("is_transient") is False
 
 
 def test_post_reddit_comment_human_paced(tmp_path: Path) -> None:

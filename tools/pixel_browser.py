@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -26,6 +27,8 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.request
+
+log = logging.getLogger("pixel_browser")
 
 for _p in ("/workspace", "/workspace/tools"):
     if _p not in sys.path:
@@ -160,19 +163,49 @@ def get_device_status() -> Dict[str, Any]:
     return status_data
 
 
-def wake_and_unlock():
-    """Wake screen and unlock keyguard."""
+ADB_KEYEVENT_TIMEOUT_SEC = 8
+
+
+def _run_adb_keyevent(
+    prefix: List[str],
+    keycode: str,
+    timeout: int = ADB_KEYEVENT_TIMEOUT_SEC,
+    retries: int = 1,
+) -> bool:
+    """Send an Android ADB keyevent, retrying on transient TimeoutExpired without crashing the session."""
+    cmd = prefix + ["shell", "input", "keyevent", str(keycode)]
+    attempts = 1 + max(0, retries)
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            log.warning(
+                "ADB keyevent %s timed out after %ss (attempt %d/%d)",
+                keycode,
+                timeout,
+                attempt,
+                attempts,
+            )
+            if attempt < attempts:
+                time.sleep(0.25)
+    return False
+
+
+def wake_and_unlock() -> bool:
+    """Wake screen and unlock keyguard without failing the session on transient ADB wake timeouts."""
     prefix, _ = get_adb_command_prefix()
     # 224 = KEYCODE_WAKEUP, 82 = KEYCODE_MENU (unlocks standard swipe lock)
-    subprocess.run(prefix + ["shell", "input", "keyevent", "224"], capture_output=True, timeout=3)
-    subprocess.run(prefix + ["shell", "input", "keyevent", "82"], capture_output=True, timeout=3)
+    woke = _run_adb_keyevent(prefix, "224")
+    unlocked = _run_adb_keyevent(prefix, "82")
     time.sleep(0.5)
+    return woke and unlocked
 
 
-def sleep_screen():
-    """Put display to sleep unconditionally (KEYCODE_SLEEP = 223) to preserve OLED panel and battery."""
+def sleep_screen() -> bool:
+    """Put display to sleep unconditionally (KEYCODE_SLEEP = 223) without crashing on transient ADB timeout."""
     prefix, _ = get_adb_command_prefix()
-    subprocess.run(prefix + ["shell", "input", "keyevent", "223"], capture_output=True, timeout=3)
+    return _run_adb_keyevent(prefix, "223")
 
 
 def setup_cdp_forwarding() -> bool:
