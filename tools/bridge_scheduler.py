@@ -2055,6 +2055,11 @@ class BridgeScheduler:
 
                     # Check if this outbox item requests an autonomous agent synthesis turn
                     if omsg.get("type") == "agent_turn" or omsg.get("is_agent_turn"):
+                        try:
+                            from tools.forge import post_pending_decision_cards
+                            post_pending_decision_cards(channel_id=int(target_cid))
+                        except Exception as pe:
+                            print(f"[Outbox] Warning posting pending decision cards for {target_cid}: {pe}")
                         if hasattr(self, "dispatch_fn") and self.dispatch_fn:
                             try:
                                 await self.dispatch_fn(

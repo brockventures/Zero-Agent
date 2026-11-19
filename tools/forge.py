@@ -8,7 +8,7 @@ Unifies four core runtime pillars in a single WAL-mode SQLite state machine (/wo
    ground-truth progress leases (stdout deltas, child PIDs, SDK task logs, subagent transcripts)
    plus a 3-strike runaway tool-loop circuit breaker.
 2. Multi-Chunk Spec-Driven Build Queue (#forge): Executes Tier 2/3 engineering plans in isolated
-   git worktrees using gemini-4-argon-low (with escalation to gemini-4-argon-medium), enforcing
+   git worktrees using gemini-4-hydrogen-high (with escalation to gemini-4-neon-medium and gemini-4-neon-high), enforcing
    pre-enqueue target-file overlap guards, Turn-0 AST/symbol snippet hydration (target_symbols +
    shared_context), per-chunk multi-repo routing, optional verification_cmd with auto-baseline
    lint/test fallback, live #forge widget updates, and originating-channel completion wakeups.
@@ -99,9 +99,9 @@ BASEBALL_CHANNEL_ID = 1548196929308065893
 OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
 
 DEFAULT_WORKER_MODEL = "gemini-4-hydrogen-high"
-ESCALATION_WORKER_MODEL = "gemini-4-argon-high"
-FINAL_ESCALATION_WORKER_MODEL = "gemini-4-carbon-high"
-PREFLIGHT_ARCHITECT_MODEL = "gemini-4-carbon-high"
+ESCALATION_WORKER_MODEL = "gemini-4-neon-medium"
+FINAL_ESCALATION_WORKER_MODEL = "gemini-4-neon-high"
+PREFLIGHT_ARCHITECT_MODEL = "gemini-4-neon-high"
 CORE_INFRA_PREFLIGHT_PATHS = (
     "tools/bridge",
     "tools/forge.py",
@@ -115,12 +115,17 @@ WORKER_MODEL_FALLBACK_MAP: dict[str, str] = {
     "gemini-3.8-flash-medium": "gemini-4-hydrogen-high",
     "gemini-3.8-flash-low": "gemini-4-hydrogen-high",
     "gemini-3.8-flash": "gemini-4-hydrogen-high",
-    "gemini-4-hydrogen-xhigh": "gemini-4-argon-high",
-    "gemini-4-hydrogen-high": "gemini-4-argon-high",
-    "gemini-4-argon-low": "gemini-4-argon-medium",
-    "gemini-4-argon-medium": "gemini-4-argon-high",
-    "gemini-4-argon-high": "gemini-4-carbon-high",
-    "gemini-4-carbon-high": "gemini-4-argon-high",
+    "gemini-4-hydrogen-medium": "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-high": "gemini-4-neon-medium",
+    "gemini-4-hydrogen-xhigh": "gemini-4-neon-medium",
+    "gemini-4-neon-low": "gemini-4-neon-medium",
+    "gemini-4-neon-medium": "gemini-4-neon-high",
+    "gemini-4-neon-high": "gemini-4-argon-high",
+    "gemini-4-neon-xhigh": "gemini-4-neon-high",
+    "gemini-4-argon-low": "gemini-4-neon-medium",
+    "gemini-4-argon-medium": "gemini-4-neon-medium",
+    "gemini-4-argon-high": "gemini-4-neon-high",
+    "gemini-4-carbon-high": "gemini-4-neon-high",
 }
 
 
@@ -129,13 +134,15 @@ def resolve_worker_model_for_attempt(
     attempt: int = 1,
     max_attempts: int = 3,
 ) -> str:
-    """Resolve the tiered worker model ladder (Attempt 1: Hydrogen High -> Attempt 2: Argon High -> Attempt 3: Carbon High)."""
+    """Resolve the tiered worker model ladder (Attempt 1: Hydrogen High -> Attempt 2: Neon Medium -> Attempt 3: Neon High)."""
     clean_base = (base_model or "").strip() or DEFAULT_WORKER_MODEL
     if attempt >= max_attempts:
         return FINAL_ESCALATION_WORKER_MODEL
     if attempt >= 2 and clean_base in (
         DEFAULT_WORKER_MODEL,
+        "gemini-4-hydrogen-medium",
         "gemini-4-hydrogen-xhigh",
+        "gemini-4-neon-low",
         "gemini-4-argon-low",
         "gemini-4-argon-medium",
     ):
@@ -171,7 +178,12 @@ def resolve_worker_model_fallback(
     mapped = WORKER_MODEL_FALLBACK_MAP.get(failed_model, DEFAULT_WORKER_MODEL)
     if mapped not in rej:
         return mapped
-    for candidate in (DEFAULT_WORKER_MODEL, ESCALATION_WORKER_MODEL, FINAL_ESCALATION_WORKER_MODEL):
+    for candidate in (
+        DEFAULT_WORKER_MODEL,
+        ESCALATION_WORKER_MODEL,
+        FINAL_ESCALATION_WORKER_MODEL,
+        "gemini-4-argon-high",
+    ):
         if candidate not in rej:
             return candidate
     return ESCALATION_WORKER_MODEL
@@ -479,15 +491,32 @@ def _get_discord_token(
                             return val
             except Exception:
                 pass
-    # For cross-channel cards/notifications outside #forge when running inside Vulcan, prefer Zero's primary DISCORD_BOT_TOKEN from /secrets/env.json
-    if not is_forge_target and os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan":
-        for sec_p in (Path("/secrets/env.json"), Path("/opt/zero/secrets/env.json")):
+    # For cross-channel cards/notifications outside #forge when running inside Vulcan, prefer Zero's primary DISCORD_BOT_TOKEN
+    if not is_forge_target:
+        for sec_p in (
+            Path("/secrets/env.json"),
+            Path("/opt/zero/secrets/env.json"),
+            Path("/docker/discord-agy-agent/secrets/env.json"),
+        ):
             if sec_p.exists():
                 try:
                     sec_data = json.loads(sec_p.read_text(encoding="utf-8"))
                     val = str(sec_data.get("DISCORD_BOT_TOKEN") or "").strip()
                     if val:
                         return val
+                except Exception:
+                    pass
+        for zero_env in (
+            Path("/opt/zero/.env"),
+            Path("/docker/discord-agy-agent/.env"),
+        ):
+            if zero_env.exists():
+                try:
+                    for line in zero_env.read_text(encoding="utf-8").splitlines():
+                        if line.strip().startswith("DISCORD_BOT_TOKEN="):
+                            val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            if val:
+                                return val
                 except Exception:
                     pass
     try:
@@ -505,6 +534,10 @@ def _get_discord_token(
                             return val
             except Exception:
                 pass
+    for env_key in ("DISCORD_BOT_TOKEN", "VULCAN_DISCORD_TOKEN", "VULCAN_BOT_TOKEN", "FORGE_BOT_TOKEN"):
+        val = os.getenv(env_key, "").strip()
+        if val:
+            return val
     return None
 
 
@@ -1052,7 +1085,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
                 chunk_index INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 repo TEXT NOT NULL DEFAULT '',
-                worker_model TEXT NOT NULL DEFAULT 'gemini-4-argon-low',
+                worker_model TEXT NOT NULL DEFAULT 'gemini-4-hydrogen-high',
                 target_files_json TEXT NOT NULL DEFAULT '[]',
                 target_symbols_json TEXT NOT NULL DEFAULT '[]',
                 shared_context_json TEXT NOT NULL DEFAULT '[]',
@@ -6617,7 +6650,7 @@ def format_origin_failure_envelope(build_id: str, db_path: Path | str = FORGE_DB
         f"[FORGE BUILD FAILURE ENVELOPE — `{build['id']}`]",
         f"**Build Title:** {build['title']}",
         f"**Repository:** `{build['repo']}`",
-        "**Status:** ❌ Build halted after exhausting 3 Maker-Checker attempts (including Argon Medium escalation).",
+        "**Status:** ❌ Build halted after exhausting 3 Maker-Checker attempts (including Neon Medium / Neon High escalation).",
     ]
     if failed_chunk:
         lines.extend([
@@ -6662,6 +6695,46 @@ def dispatch_build_failure_to_origin(build_id: str, db_path: Path | str = FORGE_
         return False
 
 
+def post_pending_decision_cards(
+    channel_id: Optional[int] = None,
+    db_path: Path | str = FORGE_DB_PATH,
+    token: Optional[str] = None,
+    max_age_seconds: float = 86400.0,
+) -> list[str]:
+    """Post any pending Decision Cards whose Discord REST delivery hasn't completed yet (`message_id IS NULL`)."""
+    now = time.time()
+    cutoff = now - float(max_age_seconds)
+    with get_db_connection(db_path) as conn:
+        if channel_id is not None:
+            rows = conn.execute(
+                """
+                SELECT id FROM forge_decisions
+                WHERE status = 'pending' AND message_id IS NULL
+                  AND channel_id = ? AND expires_at > ? AND created_at >= ?
+                ORDER BY created_at ASC
+                """,
+                (int(channel_id), now, cutoff),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id FROM forge_decisions
+                WHERE status = 'pending' AND message_id IS NULL
+                  AND expires_at > ? AND created_at >= ?
+                ORDER BY created_at ASC
+                """,
+                (now, cutoff),
+            ).fetchall()
+
+    posted: list[str] = []
+    for r in rows:
+        did = str(r["id"])
+        msg_id = _post_decision_card_rest(did, db_path=db_path, token=token)
+        if msg_id is not None:
+            posted.append(did)
+    return posted
+
+
 def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FORGE_DB_PATH) -> bool:
     """Wake the Argon Orchestrator in the originating channel/thread when all chunks complete."""
     with get_db_connection(db_path) as conn:
@@ -6684,6 +6757,7 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
                 db_path=db_path,
                 post_to_discord=True,
             )
+            post_pending_decision_cards(channel_id=int(target_ch), db_path=db_path)
         except Exception as de:
             print(f"[FORGE] Warning staging bridge_reload decision card for {build_id}: {de}")
     try:
