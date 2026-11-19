@@ -17,6 +17,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import sys
@@ -278,6 +279,22 @@ def check_all_hosts(
     return {"host1": h1, "host2": h2}
 
 
+def build_dsm_upgrade_script() -> str:
+    """Build the inner shell script executed inside chroot /host to download and start DSM updates."""
+    return (
+        "(/usr/syno/sbin/synoupgrade --download && /usr/syno/sbin/synoupgrade --start) || ("
+        "/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server method=check version=1 && "
+        "/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server.Download method=start version=1 && "
+        "for i in $(seq 1 90); do "
+        "sleep 2; "
+        "p=$(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server.Download method=progress version=1 2>/dev/null); "
+        "case \"$p\" in *'\"downloading\" : false'*|*'\"downloading\":false'*|*'\"progress\" : 100'*|*'\"progress\":100'*) break ;; esac; "
+        "done && "
+        "(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade method=start version=1 || /usr/syno/sbin/synoupgrade --autoupdate=1)"
+        ")"
+    )
+
+
 def apply_dsm_update(host_num: int) -> dict[str, Any]:
     """
     Download and start the DSM update in the background on the target host (1 or 2) via chroot.
@@ -291,23 +308,13 @@ def apply_dsm_update(host_num: int) -> dict[str, Any]:
     else:
         raise ValueError(f"Invalid host number: {host_num} (expected 1 or 2)")
 
-    inner_upgrade_script = (
-        "(/usr/syno/sbin/synoupgrade --download && /usr/syno/sbin/synoupgrade --start) || ("
-        "/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server method=check version=1 && "
-        "/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server.Download method=start version=1 && "
-        "for i in $(seq 1 90); do "
-        "sleep 2; "
-        "p=$(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server.Download method=progress version=1 2>/dev/null); "
-        "case \"$p\" in *'\"downloading\" : false'*|*'\"downloading\":false'*|*'\"progress\" : 100'*|*'\"progress\":100'*) break ;; esac; "
-        "done && "
-        "(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade method=start version=1 || /usr/syno/sbin/synoupgrade --autoupdate=1)"
-        ")"
-    )
+    inner_upgrade_script = build_dsm_upgrade_script()
+    b64_script = base64.b64encode(inner_upgrade_script.encode("utf-8")).decode("ascii")
 
     remote_cmd = (
         "PATH=/usr/local/bin:/usr/bin:/bin:$PATH "
         "nohup docker run --rm --privileged -v /:/host alpine "
-        f"chroot /host sh -c '{inner_upgrade_script}' "
+        f"chroot /host sh -c \"echo '{b64_script}' | base64 -d | sh\" "
         ">/tmp/dsm_upgrade_apply.log 2>&1 </dev/null &"
     )
     rc, stdout, stderr = nas_config.run_ssh(host_ip, remote_cmd)
@@ -319,6 +326,7 @@ def apply_dsm_update(host_num: int) -> dict[str, Any]:
         "stdout": (stdout or "").strip(),
         "stderr": (stderr or "").strip(),
         "command": remote_cmd,
+        "script": inner_upgrade_script,
     }
 
 
@@ -360,8 +368,6 @@ def ensure_host2_adb(host_ip: Optional[str] = None) -> dict[str, Any]:
     adb_bin = f"{docker_root}/discord-agy-agent/workspace/tools/bin/adb"
 
     rc_script = build_pixel_adb_rc_script(docker_root=docker_root)
-    import base64
-
     b64_rc = base64.b64encode(rc_script.encode("utf-8")).decode("ascii")
 
     remote_cmd = (

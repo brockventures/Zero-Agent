@@ -13,7 +13,11 @@ Verifies:
 
 from __future__ import annotations
 
+import base64
 import json
+import re
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -196,15 +200,71 @@ def test_apply_cli_runs_download_and_start():
         assert rc1 == 0
         assert len(ssh_calls) == 1
         assert ssh_calls[0][0] == MOCK_HOST_1_IP
-        assert "chroot /host" in ssh_calls[0][1]
-        assert "synoupgrade --download" in ssh_calls[0][1]
-        assert "synoupgrade --start" in ssh_calls[0][1]
+
+        cmd1 = ssh_calls[0][1]
+        assert "chroot /host sh -c \"echo '" in cmd1
+        assert "' | base64 -d | sh\"" in cmd1
+
+        match = re.search(r"chroot /host sh -c \"echo '([A-Za-z0-9+/=]+)' \| base64 -d \| sh\"", cmd1)
+        assert match is not None
+        decoded_script = base64.b64decode(match.group(1)).decode("utf-8")
+        assert decoded_script == dsm_update_monitor.build_dsm_upgrade_script()
+        assert "synoupgrade --download" in decoded_script
+        assert "synoupgrade --start" in decoded_script
+        assert "'\"downloading\" : false'" in decoded_script
 
         ssh_calls.clear()
         rc2 = dsm_update_monitor.main(["--apply", "--host", "2"])
         assert rc2 == 0
         assert len(ssh_calls) == 1
         assert ssh_calls[0][0] == MOCK_HOST_2_IP
+
+        ssh_calls.clear()
+        res = dsm_update_monitor.apply_dsm_update(1)
+        assert res["ok"] is True
+        assert "synoupgrade --download" in res["script"]
+        assert "synoupgrade --start" in res["script"]
+
+
+def test_apply_dsm_update_balanced_quotes_and_valid_sh_syntax():
+    ssh_calls: list[tuple[str, str]] = []
+
+    def fake_run_ssh(host: str, cmd: str, **kwargs):
+        ssh_calls.append((host, cmd))
+        return 0, "started", ""
+
+    with (
+        patch.object(dsm_update_monitor.nas_config, "HOST_1_IP", MOCK_HOST_1_IP),
+        patch.object(dsm_update_monitor.nas_config, "run_ssh", side_effect=fake_run_ssh),
+    ):
+        res = dsm_update_monitor.apply_dsm_update(1)
+
+    cmd = res["command"]
+    assert len(ssh_calls) == 1
+    assert cmd == ssh_calls[0][1]
+
+    # Balanced quotes and valid shell tokenization (no nested single-quote break)
+    assert cmd.count('"') % 2 == 0
+    assert cmd.count("'") % 2 == 0
+    tokens = shlex.split(cmd)
+    sh_c_idx = tokens.index("-c")
+    inner_pipeline = tokens[sh_c_idx + 1]
+    assert re.fullmatch(r"echo '[A-Za-z0-9+/=]+' \| base64 -d \| sh", inner_pipeline)
+
+    # Verify POSIX sh -n syntax validation passes for outer command, inner pipeline, and decoded script
+    for label, shell_snippet in (
+        ("outer_cmd", cmd),
+        ("inner_pipeline", inner_pipeline),
+        ("decoded_script", res["script"]),
+    ):
+        syntax_check = subprocess.run(
+            ["sh", "-n"],
+            input=shell_snippet,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert syntax_check.returncode == 0, f"{label} failed sh -n: {syntax_check.stderr}"
 
 
 def test_ensure_adb_updates_usb_and_rc_script():
