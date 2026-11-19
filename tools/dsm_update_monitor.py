@@ -280,26 +280,69 @@ def check_all_hosts(
 
 
 def build_dsm_upgrade_script() -> str:
-    """Build the inner shell script executed inside chroot /host to download and start DSM updates."""
+    """Build the inner shell script executed inside chroot /host to mirror DSM Control Panel's WebAPI upgrade flow."""
     return (
-        "(/usr/syno/sbin/synoupgrade --download && /usr/syno/sbin/synoupgrade --start) || ("
-        "/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server method=check version=1 && "
-        "/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server.Download method=start version=1 && "
-        "for i in $(seq 1 90); do "
-        "sleep 2; "
-        "p=$(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server.Download method=progress version=1 2>/dev/null); "
-        "case \"$p\" in *'\"downloading\" : false'*|*'\"downloading\":false'*|*'\"progress\" : 100'*|*'\"progress\":100'*) break ;; esac; "
-        "done && "
-        "(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade method=start version=1 || /usr/syno/sbin/synoupgrade --autoupdate=1)"
-        ")"
+        "chk=$(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server method=check version=3 "
+        "user_reading=true need_auto_smallupdate=true 2>&1)\n"
+        'printf \'%s\\n\' "$chk"\n'
+        'case "$chk" in\n'
+        "    *'\"success\" : true'*|*'\"success\": true'*|*'\"success\":true'*) ;;\n"
+        "    *) chk=$(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server method=check version=1 2>&1); "
+        'printf \'%s\\n\' "$chk" ;;\n'
+        "esac\n"
+        'case "$chk" in\n'
+        "    *ready_upgrade*) ;;\n"
+        "    *)\n"
+        "        dl=$(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server.Download method=start version=2 "
+        "target='\"update\"' need_auto_smallupdate=true 2>&1)\n"
+        '        printf \'%s\\n\' "$dl"\n'
+        '        case "$dl" in\n'
+        "            *'\"success\" : true'*|*'\"success\": true'*|*'\"success\":true'*) ;;\n"
+        "            *) /usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server.Download method=start version=1 2>&1 ;;\n"
+        "        esac\n"
+        "        for i in $(seq 1 90); do\n"
+        "            sleep 2\n"
+        "            p=$(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server.Download method=progress version=2 "
+        "need_download_target=true 2>/dev/null)\n"
+        '            case "$p" in\n'
+        "                *'\"success\" : true'*|*'\"success\": true'*|*'\"success\":true'*) ;;\n"
+        "                *) p=$(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade.Server.Download method=progress version=1 2>/dev/null) ;;\n"
+        "            esac\n"
+        '            case "$p" in\n'
+        "                *'\"status\"'*'\"finished\"'*|*'\"percent\"'*'\"100\"'*|*'\"percent\" : 100'*|*'\"percent\": 100'*|*'\"percent\":100'*|*'\"downloading\"'*false*|*'\"progress\"'*100*) break ;;\n"
+        "            esac\n"
+        "        done\n"
+        "        ;;\n"
+        "esac\n"
+        "/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade method=status version=1 feasibility_check=true\n"
+        "upg=$(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade method=start version=1 force=true type='\"server\"' 2>&1)\n"
+        'printf \'%s\\n\' "$upg"\n'
+        'case "$upg" in\n'
+        "    *'\"success\" : true'*|*'\"success\": true'*|*'\"success\":true'*) ;;\n"
+        "    *) /usr/syno/sbin/synoupgrade --autoupdate ;;\n"
+        "esac\n"
+        "for i in $(seq 1 300); do\n"
+        "    sleep 3\n"
+        "    prog=$(/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade method=progress version=1 2>/dev/null)\n"
+        '    case "$prog" in\n'
+        "        *'\"step\" : \"reboot\"'*|*'\"step\": \"reboot\"'*|*'\"step\":\"reboot\"'*)\n"
+        "            /usr/syno/bin/synowebapi --exec api=SYNO.Core.System method=reboot version=1 force=true local=false\n"
+        "            break\n"
+        "            ;;\n"
+        "        *'\"step\" : \"finish\"'*|*'\"step\": \"finish\"'*|*'\"step\":\"finish\"'*|*'\"step\" : \"failed\"'*|*'\"step\": \"failed\"'*|*'\"step\":\"failed\"'*)\n"
+        "            break\n"
+        "            ;;\n"
+        "    esac\n"
+        "done\n"
     )
 
 
 def apply_dsm_update(host_num: int) -> dict[str, Any]:
     """
     Download and start the DSM update in the background on the target host (1 or 2) via chroot.
-    Runs synoupgrade --download then synoupgrade --start in background via chroot, with automatic
-    fallback to synowebapi SYNO.Core.Upgrade.Server.Download + SYNO.Core.Upgrade start on DSM 7.3+.
+    Mirrors DSM Control Panel's WebAPI flow: SYNO.Core.Upgrade.Server check -> Server.Download start/progress ->
+    SYNO.Core.Upgrade feasibility_check & start (type="server", fallback to synoupgrade --autoupdate) ->
+    SYNO.Core.Upgrade progress polling -> SYNO.Core.System reboot.
     """
     if int(host_num) == 1:
         host_ip = getattr(nas_config, "HOST_1_IP", "127.0.0.1")

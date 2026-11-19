@@ -6,7 +6,7 @@ Verifies:
 - --check (/etc.defaults/VERSION + chroot /host /usr/syno/sbin/synoupgrade --check)
 - 1.task hotfix drift remediation (action=#schedule:dsm_autoupdate_hotfix# -> action=#schedule:dsm_autoupdate_notify#)
 - Atomic SQLite Decision Card staging in #zero-chat (1542081375287640084)
-- --apply --host <1|2> (synoupgrade --download then synoupgrade --start in background via chroot)
+- --apply --host <1|2> (Control Panel SYNO.Core.Upgrade WebAPI flow + reboot in background via chroot)
 - --ensure-adb (chmod -R 666 /dev/bus/usb/*, pixel_adb.sh update, :5037 server, tcp:9223 forward)
 - Weekly schedule entry in data/schedule.json
 """
@@ -209,9 +209,17 @@ def test_apply_cli_runs_download_and_start():
         assert match is not None
         decoded_script = base64.b64decode(match.group(1)).decode("utf-8")
         assert decoded_script == dsm_update_monitor.build_dsm_upgrade_script()
-        assert "synoupgrade --download" in decoded_script
-        assert "synoupgrade --start" in decoded_script
-        assert "'\"downloading\" : false'" in decoded_script
+        assert "api=SYNO.Core.Upgrade.Server method=check version=3 user_reading=true need_auto_smallupdate=true" in decoded_script
+        assert "api=SYNO.Core.Upgrade.Server method=check version=1" in decoded_script
+        assert "ready_upgrade" in decoded_script
+        assert "api=SYNO.Core.Upgrade.Server.Download method=start version=2 target='\"update\"' need_auto_smallupdate=true" in decoded_script
+        assert "api=SYNO.Core.Upgrade.Server.Download method=start version=1" in decoded_script
+        assert "api=SYNO.Core.Upgrade.Server.Download method=progress version=2 need_download_target=true" in decoded_script
+        assert "api=SYNO.Core.Upgrade method=status version=1 feasibility_check=true" in decoded_script
+        assert "/usr/syno/bin/synowebapi --exec api=SYNO.Core.Upgrade method=start version=1 force=true type='\"server\"'" in decoded_script
+        assert "/usr/syno/sbin/synoupgrade --autoupdate" in decoded_script
+        assert "api=SYNO.Core.Upgrade method=progress version=1" in decoded_script
+        assert "api=SYNO.Core.System method=reboot version=1 force=true local=false" in decoded_script
 
         ssh_calls.clear()
         rc2 = dsm_update_monitor.main(["--apply", "--host", "2"])
@@ -222,8 +230,140 @@ def test_apply_cli_runs_download_and_start():
         ssh_calls.clear()
         res = dsm_update_monitor.apply_dsm_update(1)
         assert res["ok"] is True
-        assert "synoupgrade --download" in res["script"]
-        assert "synoupgrade --start" in res["script"]
+        assert "type='\"server\"'" in res["script"]
+        assert "SYNO.Core.System method=reboot version=1 force=true local=false" in res["script"]
+
+
+def _run_upgrade_script_with_mocks(tmp_path: Path, scenario: str) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """Execute build_dsm_upgrade_script() under POSIX sh with mocked synowebapi/synoupgrade/sleep."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    log_file = tmp_path / "calls.log"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    sleep_sh = bin_dir / "sleep"
+    sleep_sh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    sleep_sh.chmod(0o755)
+
+    synowebapi_py = bin_dir / "synowebapi"
+    synowebapi_py.write_text(
+        f"""#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+args = " ".join(sys.argv[1:])
+with open({str(log_file)!r}, "a", encoding="utf-8") as f:
+    f.write("synowebapi: " + args + "\\n")
+
+state_dir = Path({str(state_dir)!r})
+scenario = {scenario!r}
+
+if "api=SYNO.Core.Upgrade.Server method=check version=3" in args:
+    if scenario == "fallback":
+        print('{{"success":false,"error":{{"code":103}}}}')
+    elif scenario == "ready_upgrade":
+        print('{{"data":{{"status":"ready_upgrade"}},"success":true}}')
+    else:
+        print('{{"data":{{"status":"available"}},"success":true}}')
+elif "api=SYNO.Core.Upgrade.Server method=check version=1" in args:
+    print('{{"data":{{"status":"available"}},"success":true}}')
+elif "api=SYNO.Core.Upgrade.Server.Download method=start version=2" in args:
+    if scenario == "fallback":
+        print('{{"success":false}}')
+    else:
+        print('{{"success":true}}')
+elif "api=SYNO.Core.Upgrade.Server.Download method=start version=1" in args:
+    print('{{"success":true}}')
+elif "api=SYNO.Core.Upgrade.Server.Download method=progress" in args:
+    cnt_file = state_dir / "dl_cnt"
+    cnt = int(cnt_file.read_text()) + 1 if cnt_file.exists() else 1
+    cnt_file.write_text(str(cnt))
+    if cnt == 1:
+        print('{{"data":{{"status":"downloading","percent":"42","downloading":true,"progress":42}},"success":true}}')
+    else:
+        print('{{"data":{{"status":"finished","percent":"100","downloading":false,"progress":100}},"success":true}}')
+elif "api=SYNO.Core.Upgrade method=status version=1 feasibility_check=true" in args:
+    print('{{"data":{{"feasibility":true}},"success":true}}')
+elif "api=SYNO.Core.Upgrade method=start version=1" in args:
+    if scenario == "fallback":
+        print('{{"success":false,"error":{{"code":400}}}}')
+    else:
+        print('{{"success" : true}}')
+elif "api=SYNO.Core.Upgrade method=progress version=1" in args:
+    cnt_file = state_dir / "upg_cnt"
+    cnt = int(cnt_file.read_text()) + 1 if cnt_file.exists() else 1
+    cnt_file.write_text(str(cnt))
+    if cnt == 1:
+        print('{{"data":{{"step":"install","percent":50}},"success":true}}')
+    elif scenario == "ready_upgrade":
+        print('{{"data":{{"step":"finish","percent":100}},"success":true}}')
+    else:
+        print('{{"data":{{"step" : "reboot","percent":100}},"success":true}}')
+elif "api=SYNO.Core.System method=reboot" in args:
+    print('{{"success":true}}')
+""",
+        encoding="utf-8",
+    )
+    synowebapi_py.chmod(0o755)
+
+    synoupgrade_sh = bin_dir / "synoupgrade"
+    synoupgrade_sh.write_text(
+        f'#!/bin/sh\necho "synoupgrade: $*" >> {str(log_file)!r}\nexit 0\n',
+        encoding="utf-8",
+    )
+    synoupgrade_sh.chmod(0o755)
+
+    script = dsm_update_monitor.build_dsm_upgrade_script()
+    script = script.replace("/usr/syno/bin/synowebapi", str(synowebapi_py))
+    script = script.replace("/usr/syno/sbin/synoupgrade", str(synoupgrade_sh))
+
+    proc = subprocess.run(
+        ["sh"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        check=False,
+    )
+    calls = log_file.read_text(encoding="utf-8").splitlines() if log_file.exists() else []
+    return proc, calls
+
+
+def test_dsm_upgrade_script_download_start_server_and_reboot_flow(tmp_path: Path):
+    proc, calls = _run_upgrade_script_with_mocks(tmp_path, "full_reboot")
+    assert proc.returncode == 0, proc.stderr
+    assert calls == [
+        "synowebapi: --exec api=SYNO.Core.Upgrade.Server method=check version=3 user_reading=true need_auto_smallupdate=true",
+        'synowebapi: --exec api=SYNO.Core.Upgrade.Server.Download method=start version=2 target="update" need_auto_smallupdate=true',
+        "synowebapi: --exec api=SYNO.Core.Upgrade.Server.Download method=progress version=2 need_download_target=true",
+        "synowebapi: --exec api=SYNO.Core.Upgrade.Server.Download method=progress version=2 need_download_target=true",
+        "synowebapi: --exec api=SYNO.Core.Upgrade method=status version=1 feasibility_check=true",
+        'synowebapi: --exec api=SYNO.Core.Upgrade method=start version=1 force=true type="server"',
+        "synowebapi: --exec api=SYNO.Core.Upgrade method=progress version=1",
+        "synowebapi: --exec api=SYNO.Core.Upgrade method=progress version=1",
+        "synowebapi: --exec api=SYNO.Core.System method=reboot version=1 force=true local=false",
+    ]
+
+
+def test_dsm_upgrade_script_skips_download_when_ready_upgrade(tmp_path: Path):
+    proc, calls = _run_upgrade_script_with_mocks(tmp_path, "ready_upgrade")
+    assert proc.returncode == 0, proc.stderr
+    assert calls == [
+        "synowebapi: --exec api=SYNO.Core.Upgrade.Server method=check version=3 user_reading=true need_auto_smallupdate=true",
+        "synowebapi: --exec api=SYNO.Core.Upgrade method=status version=1 feasibility_check=true",
+        'synowebapi: --exec api=SYNO.Core.Upgrade method=start version=1 force=true type="server"',
+        "synowebapi: --exec api=SYNO.Core.Upgrade method=progress version=1",
+        "synowebapi: --exec api=SYNO.Core.Upgrade method=progress version=1",
+    ]
+
+
+def test_dsm_upgrade_script_fallbacks_to_v1_and_synoupgrade_autoupdate(tmp_path: Path):
+    proc, calls = _run_upgrade_script_with_mocks(tmp_path, "fallback")
+    assert proc.returncode == 0, proc.stderr
+    assert "synowebapi: --exec api=SYNO.Core.Upgrade.Server method=check version=1" in calls
+    assert "synowebapi: --exec api=SYNO.Core.Upgrade.Server.Download method=start version=1" in calls
+    assert "synoupgrade: --autoupdate" in calls
 
 
 def test_apply_dsm_update_balanced_quotes_and_valid_sh_syntax():
