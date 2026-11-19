@@ -1092,23 +1092,25 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertNotIn("`", preview)
 
     def test_forge_worker_model_default_and_fallback(self):
-        """Verify forge.py uses Hydrogen High -> Argon High -> Carbon High ladder and falls back when a model is rejected."""
+        """Verify forge.py uses Hydrogen High -> Neon Medium -> Neon High ladder and falls back when a model is rejected."""
         from tools.forge import (
             DEFAULT_WORKER_MODEL,
             ESCALATION_WORKER_MODEL,
             FINAL_ESCALATION_WORKER_MODEL,
+            PREFLIGHT_ARCHITECT_MODEL,
             is_unrecognized_model_error,
             resolve_worker_model_fallback,
             resolve_worker_model_for_attempt,
         )
 
         self.assertEqual(DEFAULT_WORKER_MODEL, "gemini-4-hydrogen-high")
-        self.assertEqual(ESCALATION_WORKER_MODEL, "gemini-4-argon-high")
-        self.assertEqual(FINAL_ESCALATION_WORKER_MODEL, "gemini-4-carbon-high")
+        self.assertEqual(ESCALATION_WORKER_MODEL, "gemini-4-neon-medium")
+        self.assertEqual(FINAL_ESCALATION_WORKER_MODEL, "gemini-4-neon-high")
+        self.assertEqual(PREFLIGHT_ARCHITECT_MODEL, "gemini-4-neon-high")
 
         self.assertEqual(resolve_worker_model_for_attempt(None, attempt=1, max_attempts=3), "gemini-4-hydrogen-high")
-        self.assertEqual(resolve_worker_model_for_attempt(None, attempt=2, max_attempts=3), "gemini-4-argon-high")
-        self.assertEqual(resolve_worker_model_for_attempt(None, attempt=3, max_attempts=3), "gemini-4-carbon-high")
+        self.assertEqual(resolve_worker_model_for_attempt(None, attempt=2, max_attempts=3), "gemini-4-neon-medium")
+        self.assertEqual(resolve_worker_model_for_attempt(None, attempt=3, max_attempts=3), "gemini-4-neon-high")
 
         err_line = (
             'error: invalid model selection (--model "gemini-3.8-flash-high" --effort ""): '
@@ -1118,7 +1120,7 @@ class TestBridgeFormatting(unittest.TestCase):
         self.assertFalse(is_unrecognized_model_error("Normal build output"))
 
         fb1 = resolve_worker_model_fallback("gemini-3.8-flash-high", attempt=1, max_attempts=3)
-        self.assertIn(fb1, ("gemini-4-hydrogen-high", "gemini-4-argon-high", "gemini-4-argon-medium"))
+        self.assertIn(fb1, ("gemini-4-hydrogen-high", "gemini-4-neon-medium", "gemini-4-neon-high"))
         self.assertEqual(fb1, "gemini-4-hydrogen-high")
 
         fb2 = resolve_worker_model_fallback(
@@ -1127,14 +1129,22 @@ class TestBridgeFormatting(unittest.TestCase):
             max_attempts=3,
             rejected_models={"gemini-3.8-flash-high", "gemini-4-hydrogen-high"},
         )
-        self.assertEqual(fb2, "gemini-4-argon-high")
+        self.assertEqual(fb2, "gemini-4-neon-medium")
 
         fb3 = resolve_worker_model_fallback(
-            "gemini-4-argon-high",
+            "gemini-4-neon-medium",
             attempt=3,
             max_attempts=3,
         )
-        self.assertEqual(fb3, "gemini-4-carbon-high")
+        self.assertEqual(fb3, "gemini-4-neon-high")
+
+        fb4 = resolve_worker_model_fallback(
+            "gemini-4-neon-high",
+            attempt=3,
+            max_attempts=3,
+            rejected_models={"gemini-4-hydrogen-high", "gemini-4-neon-medium", "gemini-4-neon-high"},
+        )
+        self.assertEqual(fb4, "gemini-4-argon-high")
 
     def test_forge_circuit_breakers(self):
         """Verify preflight_check_verification_cmd, is_non_retryable_chunk_failure, worktree recovery, and node_modules symlinking."""

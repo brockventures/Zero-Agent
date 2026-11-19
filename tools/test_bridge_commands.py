@@ -16,6 +16,7 @@ if _REPO_ROOT in sys.path:
     sys.path.remove(_REPO_ROOT)
 sys.path.insert(0, _REPO_ROOT)
 from tools.bridge_commands import (
+    MODEL_ALIASES,
     ON_DEMAND_TRIGGERS,
     QuickChoiceView,
     handle_button_choice,
@@ -92,6 +93,38 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(handled)
         mock_setter.assert_called_once_with("gemini-3.8-flash-high")
+        msg.reply.assert_awaited_once()
+
+    def test_model_aliases_neon(self):
+        self.assertEqual(MODEL_ALIASES["neon"], "gemini-4-neon-high")
+        self.assertEqual(MODEL_ALIASES["neon-high"], "gemini-4-neon-high")
+        self.assertEqual(MODEL_ALIASES["neon-med"], "gemini-4-neon-medium")
+        self.assertEqual(MODEL_ALIASES["neon-medium"], "gemini-4-neon-medium")
+        self.assertEqual(MODEL_ALIASES["neon-low"], "gemini-4-neon-low")
+        self.assertEqual(MODEL_ALIASES["neon-xhigh"], "gemini-4-neon-xhigh")
+
+    async def test_handle_operator_command_model_switch_neon(self):
+        msg = MagicMock()
+        msg.content = "/model neon-med"
+        msg.channel.id = 123
+        msg.reply = AsyncMock()
+
+        bot = MagicMock()
+        queue = asyncio.Queue()
+        mock_setter = MagicMock()
+        live = {
+            "gemini-4-neon-high": "Gemini 4 Neon (High)",
+            "gemini-4-neon-medium": "Gemini 4 Neon (Medium)",
+            "gemini-4-neon-low": "Gemini 4 Neon (Low)",
+            "gemini-4-neon-xhigh": "Gemini 4 Neon (Extra High)",
+        }
+
+        with patch("tools.bridge_models.list_available_models", return_value=live):
+            handled = await handle_operator_command(
+                msg, bot, "/model neon-med", "Ryan", queue, active_model_setter=mock_setter
+            )
+        self.assertTrue(handled)
+        mock_setter.assert_called_once_with("gemini-4-neon-medium")
         msg.reply.assert_awaited_once()
 
     async def test_handle_operator_command_model_switch_argon(self):

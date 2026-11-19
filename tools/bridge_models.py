@@ -145,8 +145,8 @@ def resolve_model(requested: str | None, available: dict[str, str]) -> str | Non
     """Map a model ID or shortcut onto a real model ID, or None if nothing matches.
 
     Shortcuts are matched against the live list: `sonnet`, `claude` (= sonnet), `opus`, `gpt`,
-    `hydrogen`, `flash`, `3.8`, `3.8-low`, `flash-med`, `sonnet-medium`. Without an effort suffix the
-    highest available effort is used; with one, only that effort matches.
+    `neon`, `hydrogen`, `flash`, `3.8`, `3.8-low`, `flash-med`, `sonnet-medium`. Without an effort
+    suffix the highest available effort is used; with one, only that effort matches.
     """
     if not requested or not available:
         return None
@@ -158,6 +158,14 @@ def resolve_model(requested: str | None, available: dict[str, str]) -> str | Non
     # Explicit fast-path shortcuts
     if req_n == "flash" and "gemini-4-hydrogen-high" in available:
         return "gemini-4-hydrogen-high"
+    if req_n in ("neon", "neon-high") and "gemini-4-neon-high" in available:
+        return "gemini-4-neon-high"
+    if req_n in ("neon-med", "neon-medium") and "gemini-4-neon-medium" in available:
+        return "gemini-4-neon-medium"
+    if req_n == "neon-low" and "gemini-4-neon-low" in available:
+        return "gemini-4-neon-low"
+    if req_n == "neon-xhigh" and "gemini-4-neon-xhigh" in available:
+        return "gemini-4-neon-xhigh"
     if req_n in ("hydrogen", "hydrogen-high") and "gemini-4-hydrogen-high" in available:
         return "gemini-4-hydrogen-high"
     if req_n in ("hydrogen-med", "hydrogen-medium") and "gemini-4-hydrogen-medium" in available:
@@ -277,83 +285,79 @@ def set_fallback_model(model_id: str) -> None:
         json.dump(cfg, f, indent=2)
 
 CHANNEL_MODEL_OVERRIDES: dict[int, str] = {
-    # Tier 1: Gemini 4 Argon (High) — Spatial CAD & 3D Geometry
-    1555973316752449576: "gemini-4-argon-high",     # #3d-print
-    # Tier 2: Gemini 4 Argon (Medium) — Infrastructure, Ops, Quant, Finance & Engineering
-    1548196929308065893: "gemini-4-argon-medium",   # #baseball
-    1544953279664889888: "gemini-4-argon-medium",   # #zero-ops
-    1548196930788524094: "gemini-4-argon-medium",   # #projects
-    1551465050072416286: "gemini-4-argon-medium",   # #side-project
-    1561509863018856468: "gemini-4-argon-medium",   # #gotchi
-    # Tier 3A: Gemini 4 Argon (Low) — Primary Conversational Flagships
-    1542081375287640084: "gemini-4-argon-low",      # #zero-chat
-    1534452820995080192: "gemini-4-argon-low",      # #lounge
-    # Tier 3B: Gemini 4 Hydrogen (High) — Structured Ops, Utility, Household & Coordination Channels
-    1562544598423965856: "gemini-4-hydrogen-high",  # #r-residentagents
-    1544955532765560924: "gemini-4-hydrogen-high",  # #finances
-    1550577910757458015: "gemini-4-hydrogen-high",  # #vault
-    1562899941595160657: "gemini-4-hydrogen-high",  # #forge
-    1544953275877556334: "gemini-4-hydrogen-high",  # #home-assistant
-    1544955535722545253: "gemini-4-hydrogen-high",  # #homelab
-    1558202642663211169: "gemini-4-hydrogen-high",  # #agora
-    1552732003076669460: "gemini-4-hydrogen-high",  # #mirrormere
-    1549555629222404096: "gemini-4-hydrogen-high",  # #debug-huddle
-    1562246590943461429: "gemini-4-hydrogen-high",  # #gotchi-chat
-    1550577908811178095: "gemini-4-hydrogen-high",  # #brock-house
-    1544955538033348618: "gemini-4-hydrogen-high",  # #shopping
-    1544953277592899615: "gemini-4-hydrogen-high",  # #steam-deck
-    1534436119888793750: "gemini-4-hydrogen-high",  # #the-banana-stand
-    # Tier 4: Gemini 3.8 Flash (Low) — Pure Notification & Webhook Channels
-    1330447543477338202: "gemini-3.8-flash-low",    # #server-updates
-    1210466877835313155: "gemini-3.8-flash-low",    # #seerr-notifications
-    1453427860793463000: "gemini-3.8-flash-low",    # #seerr-requests-and-chat
+    # Tier 1: Gemini 4 Neon (High) — Heavy Engineering, Hardware/CAD & Escalations
+    1555973316752449576: "gemini-4-neon-high",      # #3d-print
+    1544953279664889888: "gemini-4-neon-high",      # #zero-ops / #harness-management
+    1548196930788524094: "gemini-4-neon-high",      # #projects
+    1551465050072416286: "gemini-4-neon-high",      # #side-project
+    1561509863018856468: "gemini-4-neon-high",      # #gotchi
+    1552732003076669460: "gemini-4-neon-high",      # #mirrormere
+    1562899941595160657: "gemini-4-neon-high",      # #forge
+    # Tier 2: Gemini 4 Neon (Medium) — Domain & Household Ops
+    1548196929308065893: "gemini-4-neon-medium",    # #baseball
+    1544955532765560924: "gemini-4-neon-medium",    # #finances
+    1550577910757458015: "gemini-4-neon-medium",    # #vault
+    1544953275877556334: "gemini-4-neon-medium",    # #home-assistant
+    1544955535722545253: "gemini-4-neon-medium",    # #homelab
+    1558202642663211169: "gemini-4-neon-medium",    # #agora
+    1562246590943461429: "gemini-4-neon-medium",    # #gotchi-chat / #gotchi-log
+    1550577908811178095: "gemini-4-neon-medium",    # #brock-house
+    1544955538033348618: "gemini-4-neon-medium",    # #shopping
+    1544953277592899615: "gemini-4-neon-medium",    # #steam-deck
+    # Tier 3: Gemini 4 Hydrogen (Medium) — Fast Live Chat, Social & Notification Channels
+    1542081375287640084: "gemini-4-hydrogen-medium",  # #zero-chat
+    1534452820995080192: "gemini-4-hydrogen-medium",  # #lounge
+    1534436119888793750: "gemini-4-hydrogen-medium",  # #the-banana-stand
+    1562544598423965856: "gemini-4-hydrogen-medium",  # #r-residentagents
+    1330447543477338202: "gemini-4-hydrogen-medium",  # #server-updates
+    1210466877835313155: "gemini-4-hydrogen-medium",  # #seerr-notifications
+    1453427860793463000: "gemini-4-hydrogen-medium",  # #seerr-requests-and-chat
 }
 
-SYNTHESIS_TURN_MODEL = "gemini-3.8-flash-low"
+SYNTHESIS_TURN_MODEL = "gemini-4-hydrogen-medium"
 
 
 def get_channel_model_override(
     channel_id: int | str | None = None,
     channel_name: str | None = None,
 ) -> str | None:
-    """Return a pinned model ID for specific channels across the 4-tier architecture, or None."""
+    """Return a pinned model ID for specific channels across the 3-tier Neon + Hydrogen architecture, or None."""
     if channel_id is not None and str(channel_id).isdigit():
         cid = int(channel_id)
         if cid in CHANNEL_MODEL_OVERRIDES:
             return CHANNEL_MODEL_OVERRIDES[cid]
     if channel_name:
         cname = str(channel_name).strip().lstrip("#").lower()
-        if cname == "3d-print":
-            return "gemini-4-argon-high"
         if cname in (
-            "baseball",
+            "3d-print",
             "zero-ops",
             "harness-management",
             "projects",
             "side-project",
             "gotchi",
+            "mirrormere",
+            "forge",
         ):
-            return "gemini-4-argon-medium"
-        if cname in ("zero-chat", "lounge"):
-            return "gemini-4-argon-low"
+            return "gemini-4-neon-high"
         if cname in (
-            "r-residentagents",
+            "baseball",
             "finances",
             "vault",
-            "forge",
             "home-assistant",
             "homelab",
             "agora",
-            "mirrormere",
-            "debug-huddle",
             "gotchi-chat",
             "gotchi-log",
             "brock-house",
             "shopping",
             "steam-deck",
-            "the-banana-stand",
         ):
-            return "gemini-4-hydrogen-high"
-        if cname == "server-updates" or cname.startswith("seer"):
-            return "gemini-3.8-flash-low"
+            return "gemini-4-neon-medium"
+        if cname in (
+            "zero-chat",
+            "lounge",
+            "the-banana-stand",
+            "r-residentagents",
+        ) or cname == "server-updates" or cname.startswith("seer"):
+            return "gemini-4-hydrogen-medium"
     return None

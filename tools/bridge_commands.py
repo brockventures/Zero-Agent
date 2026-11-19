@@ -44,6 +44,12 @@ from tools.bridge_state import (
 PROCESSED_INTERACTIONS: set[int] = set()
 
 MODEL_ALIASES: dict[str, str] = {
+    "neon": "gemini-4-neon-high",
+    "neon-high": "gemini-4-neon-high",
+    "neon-med": "gemini-4-neon-medium",
+    "neon-medium": "gemini-4-neon-medium",
+    "neon-low": "gemini-4-neon-low",
+    "neon-xhigh": "gemini-4-neon-xhigh",
     "argon": "gemini-4-argon-high",
     "argon-high": "gemini-4-argon-high",
     "argon-med": "gemini-4-argon-medium",
@@ -710,7 +716,7 @@ async def handle_operator_command(
                 help_lines.append("**Available Models (live from the CLI):**")
                 help_lines.extend(f"- `{mid}` ({label})" for mid, label in available.items())
                 help_lines.append("")
-                help_lines.append("*Shortcuts:* `argon`, `argon-med`, `argon-low`, `hydrogen`, `hydrogen-med`, `hydrogen-xhigh`, `flash`, `3.8-low`, `sonnet`, `sonnet-medium`, `opus`, `gpt`")
+                help_lines.append("*Shortcuts:* `neon`, `neon-med`, `neon-low`, `neon-xhigh`, `argon`, `argon-med`, `argon-low`, `hydrogen`, `hydrogen-med`, `hydrogen-xhigh`, `flash`, `3.8-low`, `sonnet`, `sonnet-medium`, `opus`, `gpt`")
             else:
                 help_lines.append("⚠️ Could not fetch the live model list from the CLI. Try again in a moment.")
             help_lines.append("*Switch with:* `/model <name>` | *Set fallback with:* `/model fallback <name>`")

@@ -61,7 +61,6 @@ CRAB_CAVERN_GUILD_ID = int(os.getenv("DISCORD_CRAB_CAVERN_GUILD_ID", "1486135733
 CRAB_CAVERN_CHANNEL_IDS = {
     1534436119888793750,  # #the-banana-stand
     1534452820995080192,  # #lounge
-    1549555629222404096,  # #debug-huddle
     1551465050072416286,  # #side-project
     1552732003076669460,  # #mirrormere
     1558202642663211169,  # #agora
@@ -1000,7 +999,7 @@ def get_session_parent_id(sess_key: str) -> str | None:
 
 
 # Active model selection persistence
-ACTIVE_MODEL = os.getenv("AGY_MODEL", "gemini-4-argon-low")
+ACTIVE_MODEL = os.getenv("AGY_MODEL", "gemini-4-hydrogen-medium")
 if CONFIG_FILE.exists():
     try:
         with open(CONFIG_FILE) as f:

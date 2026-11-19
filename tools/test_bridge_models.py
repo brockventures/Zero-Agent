@@ -12,6 +12,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import tools.bridge_models as bm
 
 LIVE = {
+    "gemini-4-neon-xhigh": "Gemini 4 Neon (Extra High)",
+    "gemini-4-neon-high": "Gemini 4 Neon (High)",
+    "gemini-4-neon-medium": "Gemini 4 Neon (Medium)",
+    "gemini-4-neon-low": "Gemini 4 Neon (Low)",
     "gemini-4-argon-high": "Gemini 4 Argon (High)",
     "gemini-4-argon-medium": "Gemini 4 Argon (Medium)",
     "gemini-4-argon-low": "Gemini 4 Argon (Low)",
@@ -63,6 +67,15 @@ class TestResolve(unittest.TestCase):
         self.assertEqual(bm.resolve_model("3.8-lite", LIVE), "gemini-3.8-flash-low")
         self.assertEqual(bm.resolve_model("3.8-low", LIVE), "gemini-3.8-flash-low")
         self.assertEqual(bm.resolve_model("flash-med", LIVE), "gemini-3.8-flash-medium")
+
+    def test_neon_shortcuts(self):
+        self.assertEqual(bm.resolve_model("neon", LIVE), "gemini-4-neon-high")
+        self.assertEqual(bm.resolve_model("neon-high", LIVE), "gemini-4-neon-high")
+        self.assertEqual(bm.resolve_model("neon-med", LIVE), "gemini-4-neon-medium")
+        self.assertEqual(bm.resolve_model("neon-medium", LIVE), "gemini-4-neon-medium")
+        self.assertEqual(bm.resolve_model("neon-low", LIVE), "gemini-4-neon-low")
+        self.assertEqual(bm.resolve_model("neon-xhigh", LIVE), "gemini-4-neon-xhigh")
+        self.assertEqual(bm.resolve_model("gemini-4-neon-high", LIVE), "gemini-4-neon-high")
 
     def test_hydrogen_shortcuts(self):
         self.assertEqual(bm.resolve_model("hydrogen", LIVE), "gemini-4-hydrogen-high")
@@ -148,63 +161,70 @@ class TestFallback(unittest.TestCase):
 
 
     def test_channel_model_overrides(self):
-        # Tier 1: Gemini 4 Argon (High)
-        self.assertEqual(bm.get_channel_model_override(1555973316752449576, "3d-print"), "gemini-4-argon-high")
-        self.assertEqual(bm.get_channel_model_override(None, "3d-print"), "gemini-4-argon-high")
-        # Tier 2: Gemini 4 Argon (Medium)
-        self.assertEqual(bm.get_channel_model_override(1548196929308065893, "baseball"), "gemini-4-argon-medium")
-        self.assertEqual(bm.get_channel_model_override(None, "baseball"), "gemini-4-argon-medium")
-        self.assertEqual(bm.get_channel_model_override(1544953279664889888, "zero-ops"), "gemini-4-argon-medium")
-        self.assertEqual(bm.get_channel_model_override(None, "zero-ops"), "gemini-4-argon-medium")
-        self.assertEqual(bm.get_channel_model_override(None, "harness-management"), "gemini-4-argon-medium")
-        self.assertEqual(bm.get_channel_model_override(1548196930788524094, "projects"), "gemini-4-argon-medium")
-        self.assertEqual(bm.get_channel_model_override(None, "projects"), "gemini-4-argon-medium")
-        self.assertEqual(bm.get_channel_model_override(1551465050072416286, "side-project"), "gemini-4-argon-medium")
-        self.assertEqual(bm.get_channel_model_override(None, "side-project"), "gemini-4-argon-medium")
-        self.assertEqual(bm.get_channel_model_override(1561509863018856468, "gotchi"), "gemini-4-argon-medium")
-        self.assertEqual(bm.get_channel_model_override(None, "gotchi"), "gemini-4-argon-medium")
-        # Tier 3A: Gemini 4 Argon (Low) — Primary Conversational Flagships
-        self.assertEqual(bm.get_channel_model_override(1542081375287640084, "zero-chat"), "gemini-4-argon-low")
-        self.assertEqual(bm.get_channel_model_override(None, "zero-chat"), "gemini-4-argon-low")
-        self.assertEqual(bm.get_channel_model_override(1534452820995080192), "gemini-4-argon-low")
-        self.assertEqual(bm.get_channel_model_override(None, "lounge"), "gemini-4-argon-low")
-        # Tier 3B: Gemini 4 Hydrogen (High) — Structured Ops, Utility, Household & Coordination Channels
-        self.assertEqual(bm.get_channel_model_override(1562544598423965856, "r-residentagents"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "r-residentagents"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1544955532765560924, "finances"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "finances"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1550577910757458015, "vault"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "vault"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1562899941595160657, "forge"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "forge"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1544953275877556334, "home-assistant"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "home-assistant"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1544955535722545253, "homelab"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "homelab"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1558202642663211169, "agora"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "agora"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1552732003076669460, "mirrormere"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "mirrormere"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1549555629222404096, "debug-huddle"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "debug-huddle"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1562246590943461429, "gotchi-chat"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "gotchi-chat"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "gotchi-log"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1550577908811178095, "brock-house"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "brock-house"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1544955538033348618, "shopping"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "shopping"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1544953277592899615, "steam-deck"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "steam-deck"), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(1534436119888793750), "gemini-4-hydrogen-high")
-        self.assertEqual(bm.get_channel_model_override(None, "the-banana-stand"), "gemini-4-hydrogen-high")
-        # Tier 4: Gemini 3.8 Flash (Low)
-        self.assertEqual(bm.get_channel_model_override(1330447543477338202), "gemini-3.8-flash-low")
-        self.assertEqual(bm.get_channel_model_override(None, "server-updates"), "gemini-3.8-flash-low")
-        self.assertEqual(bm.get_channel_model_override(1210466877835313155), "gemini-3.8-flash-low")
-        self.assertEqual(bm.get_channel_model_override(1453427860793463000), "gemini-3.8-flash-low")
-        self.assertEqual(bm.get_channel_model_override(None, "seerr-requests-and-chat"), "gemini-3.8-flash-low")
-        self.assertEqual(bm.get_channel_model_override(None, "seer-alerts"), "gemini-3.8-flash-low")
+        import tools.bridge_state as bs
+
+        # Tier 1: Gemini 4 Neon (High) — Heavy Engineering, Hardware/CAD & Escalations
+        self.assertEqual(bm.get_channel_model_override(1555973316752449576, "3d-print"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(None, "3d-print"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(1544953279664889888, "zero-ops"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(None, "zero-ops"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(None, "harness-management"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(1548196930788524094, "projects"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(None, "projects"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(1551465050072416286, "side-project"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(None, "side-project"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(1561509863018856468, "gotchi"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(None, "gotchi"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(1552732003076669460, "mirrormere"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(None, "mirrormere"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(1562899941595160657, "forge"), "gemini-4-neon-high")
+        self.assertEqual(bm.get_channel_model_override(None, "forge"), "gemini-4-neon-high")
+
+        # Tier 2: Gemini 4 Neon (Medium) — Domain & Household Ops
+        self.assertEqual(bm.get_channel_model_override(1548196929308065893, "baseball"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "baseball"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(1544955532765560924, "finances"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "finances"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(1550577910757458015, "vault"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "vault"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(1544953275877556334, "home-assistant"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "home-assistant"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(1544955535722545253, "homelab"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "homelab"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(1558202642663211169, "agora"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "agora"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(1562246590943461429, "gotchi-chat"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "gotchi-chat"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "gotchi-log"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(1550577908811178095, "brock-house"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "brock-house"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(1544955538033348618, "shopping"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "shopping"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(1544953277592899615, "steam-deck"), "gemini-4-neon-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "steam-deck"), "gemini-4-neon-medium")
+
+        # Tier 3: Gemini 4 Hydrogen (Medium) — Fast Live Chat, Social & Notification Channels
+        self.assertEqual(bm.get_channel_model_override(1542081375287640084, "zero-chat"), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "zero-chat"), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(1534452820995080192), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "lounge"), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(1534436119888793750), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "the-banana-stand"), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(1562544598423965856, "r-residentagents"), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "r-residentagents"), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(1330447543477338202), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "server-updates"), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(1210466877835313155), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(1453427860793463000), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "seerr-requests-and-chat"), "gemini-4-hydrogen-medium")
+        self.assertEqual(bm.get_channel_model_override(None, "seer-alerts"), "gemini-4-hydrogen-medium")
+
+        # Synthesis & deprecated debug-huddle / hydrogen-low invariants
+        self.assertEqual(bm.SYNTHESIS_TURN_MODEL, "gemini-4-hydrogen-medium")
+        self.assertNotIn("gemini-4-hydrogen-low", bm.CHANNEL_MODEL_OVERRIDES.values())
+        self.assertIsNone(bm.get_channel_model_override(1549555629222404096, "debug-huddle"))
+        self.assertIsNone(bm.get_channel_model_override(None, "debug-huddle"))
+        self.assertNotIn(1549555629222404096, bs.CRAB_CAVERN_CHANNEL_IDS)
         # Unpinned channel falls back to global default (None override)
         self.assertIsNone(bm.get_channel_model_override(999999999999999999, "random-unpinned"))
 
