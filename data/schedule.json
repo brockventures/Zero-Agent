@@ -98,9 +98,9 @@
     "interval_seconds": 7200,
     "prompt": "Run the infrastructure heartbeat check using /workspace/tools/sidecars.py heartbeat. Post only if infrastructure is degraded (silent when healthy).",
     "catchup_if_missed": false,
-    "last_run_ts": 1795093339,
-    "last_run_at": "2026-11-19 05:02 AM PT",
-    "next_run_ts": 1795100539.0,
+    "last_run_ts": 1795107757,
+    "last_run_at": "2026-11-19 09:02 AM PT",
+    "next_run_ts": 1795114957.0,
     "channel_id": 1544955535722545253
   },
   {
@@ -112,9 +112,9 @@
     "minute_pt": 15,
     "prompt": "Run the Kia EV9 listing monitor capture using /workspace/tools/sidecars.py ev9. Post the weekly digest if Sunday.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795018515,
-    "last_run_at": "2026-11-18 08:15 AM PT",
-    "next_run_ts": 1795104900.0,
+    "last_run_ts": 1795104912,
+    "last_run_at": "2026-11-19 08:15 AM PT",
+    "next_run_ts": 1795191300.0,
     "channel_id": 1544955538033348618
   },
   {
@@ -127,9 +127,9 @@
     "prompt": "Check dated one-shot reminders using /workspace/tools/sidecars.py reminders. Post only if a reminder has come due.",
     "catchup_if_missed": true,
     "catchup_window_seconds": 14400,
-    "last_run_ts": 1795021205,
-    "last_run_at": "2026-11-18 09:00 AM PT",
-    "next_run_ts": 1795107600.0
+    "last_run_ts": 1795107600,
+    "last_run_at": "2026-11-19 09:00 AM PT",
+    "next_run_ts": 1795194000.0
   },
   {
     "id": "nightly_triage",
@@ -255,9 +255,9 @@
     "prompt": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
     "catchup_if_missed": true,
     "catchup_window_seconds": 14400,
-    "last_run_ts": 1795014047,
-    "last_run_at": "2026-11-18 07:00 AM PT",
-    "next_run_ts": 1795100400.0
+    "last_run_ts": 1795100407,
+    "last_run_at": "2026-11-19 07:00 AM PT",
+    "next_run_ts": 1795186800.0
   },
   {
     "id": "daily_birthday_reminder",
@@ -269,9 +269,9 @@
     "prompt": "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py --quiet. If someone has a birthday today, post the reminder with the interactive text button.",
     "catchup_if_missed": true,
     "catchup_window_seconds": 14400,
-    "last_run_ts": 1795014902,
-    "last_run_at": "2026-11-18 07:15 AM PT",
-    "next_run_ts": 1795101300.0
+    "last_run_ts": 1795101302,
+    "last_run_at": "2026-11-19 07:15 AM PT",
+    "next_run_ts": 1795187700.0
   },
   {
     "id": "weekly_social_last_seen_review",
@@ -311,9 +311,9 @@
     "minute_pt": 30,
     "prompt": "Run the Crab Cavern morning rotation dispatcher using /workspace/tools/morning_dispatcher.py --dispatch.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795023012,
-    "last_run_at": "2026-11-18 09:30 AM PT",
-    "next_run_ts": 1795109400.0
+    "last_run_ts": 1795109411,
+    "last_run_at": "2026-11-19 09:30 AM PT",
+    "next_run_ts": 1795195800.0
   },
   {
     "id": "antigravity_check",
@@ -324,9 +324,9 @@
     "minute_pt": 0,
     "prompt": "Check for Antigravity CLI updates using /workspace/tools/update_antigravity.py.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795024823,
-    "last_run_at": "2026-11-18 10:00 AM PT",
-    "next_run_ts": 1795111200.0,
+    "last_run_ts": 1795111205,
+    "last_run_at": "2026-11-19 10:00 AM PT",
+    "next_run_ts": 1795197600.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -471,9 +471,9 @@
     "interval_seconds": 300,
     "prompt": "Run the bridge liveness & gateway watchdog check using /workspace/tools/sidecars.py bridge_watchdog. Auto-heals and alerts only if degraded (silent when nominal).",
     "catchup_if_missed": false,
-    "last_run_ts": 1795099590,
-    "last_run_at": "2026-11-19 06:46 AM PT",
-    "next_run_ts": 1795099890.0,
+    "last_run_ts": 1795112910,
+    "last_run_at": "2026-11-19 10:28 AM PT",
+    "next_run_ts": 1795113210.0,
     "channel_id": 1544953279664889888
   },
   {
@@ -485,9 +485,9 @@
     "channel_id": 1544953279664889888,
     "prompt": "Run the Host 2 and Host 1 PID & process headroom watchdog using /workspace/tools/sidecars.py pid_watchdog. Silent execution unless warning or critical threshold exceeded.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795099638,
-    "last_run_at": "2026-11-19 06:47 AM PT",
-    "next_run_ts": 1795100538.0
+    "last_run_ts": 1795112344,
+    "last_run_at": "2026-11-19 10:19 AM PT",
+    "next_run_ts": 1795113244.0
   },
   {
     "id": "agora_roguelike_pm",
@@ -626,9 +626,9 @@
     "channel_id": 1542081375287640084,
     "prompt": "Run the Reddit fantasy baseball morning discovery scan using /workspace/tools/sidecars.py reddit_fantasy. Scan r/fantasybaseball for active dilemma comments, generate draft replies, and post candidate cards to #zero-chat.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795017936,
-    "last_run_at": "2026-11-18 08:05 AM PT",
-    "next_run_ts": 1795104300.0
+    "last_run_ts": 1795104376,
+    "last_run_at": "2026-11-19 08:06 AM PT",
+    "next_run_ts": 1795190700.0
   },
   {
     "id": "reddit_fantasy_afternoon",
@@ -640,8 +640,8 @@
     "channel_id": 1542081375287640084,
     "prompt": "Run the Reddit fantasy baseball afternoon discovery scan using /workspace/tools/sidecars.py reddit_fantasy. Scan r/fantasybaseball for active dilemma comments, generate draft replies, and post candidate cards to #zero-chat.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795017936,
-    "last_run_at": "2026-11-18 08:05 AM PT",
+    "last_run_ts": 1795104376,
+    "last_run_at": "2026-11-19 08:06 AM PT",
     "next_run_ts": 1795125600.0
   },
   {
@@ -685,9 +685,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the Arr queue & health watchdog using /workspace/tools/sidecars.py arr_queue.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795097098,
-    "last_run_at": "2026-11-19 06:04 AM PT",
-    "next_run_ts": 1795100698.0
+    "last_run_ts": 1795111517,
+    "last_run_at": "2026-11-19 10:05 AM PT",
+    "next_run_ts": 1795115117.0
   },
   {
     "id": "prowlarr_watchdog",
@@ -698,9 +698,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the Prowlarr indexer health watchdog using /workspace/tools/sidecars.py prowlarr.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795097283,
-    "last_run_at": "2026-11-19 06:08 AM PT",
-    "next_run_ts": 1795100883.0
+    "last_run_ts": 1795111703,
+    "last_run_at": "2026-11-19 10:08 AM PT",
+    "next_run_ts": 1795115303.0
   },
   {
     "id": "sabnzbd_watchdog",
@@ -711,9 +711,9 @@
     "channel_id": 1544955535722545253,
     "prompt": "Run the SABnzbd downloader & unpack watchdog using /workspace/tools/sidecars.py sabnzbd.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795096998,
-    "last_run_at": "2026-11-19 06:03 AM PT",
-    "next_run_ts": 1795100598.0
+    "last_run_ts": 1795111408,
+    "last_run_at": "2026-11-19 10:03 AM PT",
+    "next_run_ts": 1795115008.0
   },
   {
     "id": "nest_lock_watchdog",
@@ -724,9 +724,9 @@
     "channel_id": 1544953275877556334,
     "prompt": "Run the Nest lock & Homebridge self-healing watchdog using /workspace/tools/sidecars.py nest_lock.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795097230,
-    "last_run_at": "2026-11-19 06:07 AM PT",
-    "next_run_ts": 1795100830.0
+    "last_run_ts": 1795111657,
+    "last_run_at": "2026-11-19 10:07 AM PT",
+    "next_run_ts": 1795115257.0
   },
   {
     "id": "ha_reauth_watchdog",
@@ -737,9 +737,9 @@
     "channel_id": 1544953275877556334,
     "prompt": "Run the Home Assistant integration & re-auth watchdog using /workspace/tools/sidecars.py ha_reauth.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795097286,
-    "last_run_at": "2026-11-19 06:08 AM PT",
-    "next_run_ts": 1795100886.0
+    "last_run_ts": 1795111704,
+    "last_run_at": "2026-11-19 10:08 AM PT",
+    "next_run_ts": 1795115304.0
   },
   {
     "id": "google_tasks_sync",
@@ -749,9 +749,9 @@
     "interval_seconds": 1800,
     "prompt": "Run the Google Tasks two-way sync using /workspace/tools/sidecars.py tasks_sync. Silent sidecar execution (silent unless error).",
     "catchup_if_missed": false,
-    "last_run_ts": 1795098162,
-    "last_run_at": "2026-11-19 06:22 AM PT",
-    "next_run_ts": 1795099962.0
+    "last_run_ts": 1795112660,
+    "last_run_at": "2026-11-19 10:24 AM PT",
+    "next_run_ts": 1795114460.0
   },
   {
     "id": "quota_poller",
@@ -761,9 +761,9 @@
     "interval_seconds": 600,
     "prompt": "Run the 10-minute ground-truth quota usage poller using /workspace/tools/sidecars.py quota_poller. Captures live remaining fractions and cycle burn deltas.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795099710,
-    "last_run_at": "2026-11-19 06:48 AM PT",
-    "next_run_ts": 1795100310.0
+    "last_run_ts": 1795112732,
+    "last_run_at": "2026-11-19 10:25 AM PT",
+    "next_run_ts": 1795113332.0
   },
   {
     "id": "personal_data_sync",
@@ -794,9 +794,9 @@
       23,
       7
     ],
-    "last_run_ts": 1795071428,
-    "last_run_at": "2026-11-18 10:57 PM PT",
-    "next_run_ts": 1795100400.0
+    "last_run_ts": 1795112901,
+    "last_run_at": "2026-11-19 10:28 AM PT",
+    "next_run_ts": 1795113201.0
   },
   {
     "id": "resident_agents_daily_tip",
@@ -894,9 +894,9 @@
     "minute_pt": 0,
     "prompt": "Run the Actual Budget Anomaly & Overspend Detection Decision Card workflow using /workspace/tools/sidecars.py actual_budget_anomaly_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795017603,
-    "next_run_ts": 1795104000.0,
-    "last_run_at": "2026-11-18 08:00 AM PT",
+    "last_run_ts": 1795104010,
+    "next_run_ts": 1795190400.0,
+    "last_run_at": "2026-11-19 08:00 AM PT",
     "channel_id": 1544955532765560924
   },
   {
@@ -908,10 +908,10 @@
     "minute_pt": 30,
     "prompt": "Run the morning Weather, Air Quality & Pre-Adjustment Energy Decision Card workflow using /workspace/tools/sidecars.py weather_energy_card. Silent background sidecar: if 0 cards are staged or output is empty, emit [NO_REPLY] with zero text.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795015805,
-    "next_run_ts": 1795102200.0,
+    "last_run_ts": 1795102206,
+    "next_run_ts": 1795188600.0,
     "channel_id": 1544953275877556334,
-    "last_run_at": "2026-11-18 07:30 AM PT"
+    "last_run_at": "2026-11-19 07:30 AM PT"
   },
   {
     "id": "midweek_grocery_card",
@@ -1024,8 +1024,8 @@
     "channel_id": 1544953279664889888,
     "prompt": "Run the Seerr media-requests card auto-sync using /workspace/tools/sidecars.py seerr_card_sync.",
     "catchup_if_missed": false,
-    "next_run_ts": 1795099976.0,
-    "last_run_ts": 1795099376,
-    "last_run_at": "2026-11-19 06:42 AM PT"
+    "next_run_ts": 1795113189.0,
+    "last_run_ts": 1795112589,
+    "last_run_at": "2026-11-19 10:23 AM PT"
   }
 ]
