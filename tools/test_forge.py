@@ -4119,7 +4119,7 @@ def test_bridge_reload_expired_execution_and_expired_decision_feedback(tmp_path,
         m.status_code = 200
         return m
 
-    monkeypatch.setattr(forge_mod, "_get_discord_token", lambda: "mock-bot-token")
+    monkeypatch.setattr(forge_mod, "_get_discord_token", lambda *args, **kwargs: "mock-bot-token")
     monkeypatch.setattr(forge_mod.requests, "patch", _fake_patch)
 
     expired_list = forge_mod.expire_stale_decisions(db_path=db_path)
@@ -4856,6 +4856,211 @@ def test_apply_carbon_preflight_refinements(tmp_path):
         "sample.py:refined_fn",
         "sample.py:extra_fn",
     ]
+
+
+def _make_fake_path_mapper(path_map: dict[str, Path]):
+    """Return a Path wrapper mapping specific absolute container paths to tmp_path files."""
+    real_path_cls = Path
+
+    def _mapped_path(raw, *args, **kwargs):
+        p = real_path_cls(raw, *args, **kwargs)
+        key = str(p)
+        if key in path_map:
+            return path_map[key]
+        if key.startswith(("/secrets/", "/opt/zero/", "/docker/", "/app/", "/workspace/.env")):
+            return path_map.get("__missing__", real_path_cls("/nonexistent-forge-test-path") / p.name)
+        return p
+
+    return _mapped_path
+
+
+def test_baseball_token_never_falls_back_to_zero_outside_ivy(tmp_path, monkeypatch):
+    """Ensure _get_discord_token(for_channel_id=BASEBALL_CHANNEL_ID) never returns Zero's token outside Ivy."""
+    zero_secrets = tmp_path / "zero_secrets.json"
+    zero_secrets.write_text(json.dumps({"DISCORD_BOT_TOKEN": "zero-secret-tok"}), encoding="utf-8")
+    zero_env = tmp_path / "zero.env"
+    zero_env.write_text("DISCORD_BOT_TOKEN=zero-dotenv-tok\n", encoding="utf-8")
+
+    monkeypatch.setattr(forge_mod, "is_ivy_container", lambda: False)
+    monkeypatch.setenv("AGENT_ROLE", "vulcan")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "zero-env-tok")
+    monkeypatch.delenv("IVY_DISCORD_TOKEN", raising=False)
+    monkeypatch.delenv("IVY_BOT_TOKEN", raising=False)
+
+    path_map = {
+        "/secrets/env.json": zero_secrets,
+        "/opt/zero/secrets/env.json": zero_secrets,
+        "/opt/zero/.env": zero_env,
+        "__missing__": tmp_path / "missing_file",
+    }
+    monkeypatch.setattr(forge_mod, "Path", _make_fake_path_mapper(path_map))
+    monkeypatch.setattr("tools.deliver_image.get_discord_token", lambda: "zero-deliver-tok")
+
+    # No Ivy token configured -> must return None (never Zero's token)
+    assert forge_mod._get_discord_token(for_channel_id=forge_mod.BASEBALL_CHANNEL_ID) is None
+    # Non-baseball cross-channel call still resolves Zero's token normally
+    assert forge_mod._get_discord_token(for_channel_id=forge_mod.ZERO_OPS_CHANNEL_ID) == "zero-secret-tok"
+
+    # Dedicated Ivy env / secrets / .env are honored when present
+    ivy_env = tmp_path / "ivy.env"
+    ivy_env.write_text("DISCORD_BOT_TOKEN=ivy-dotenv-tok\n", encoding="utf-8")
+    path_map["/docker/discord-ivy-agent/.env"] = ivy_env
+    assert forge_mod._get_discord_token(for_channel_id=forge_mod.BASEBALL_CHANNEL_ID) == "ivy-dotenv-tok"
+
+    monkeypatch.setenv("IVY_DISCORD_TOKEN", "ivy-explicit-env-tok")
+    assert forge_mod._get_discord_token(for_channel_id=forge_mod.BASEBALL_CHANNEL_ID) == "ivy-explicit-env-tok"
+
+
+def test_baseball_token_prefers_ivy_env_inside_ivy_container(tmp_path, monkeypatch):
+    """Ensure _get_discord_token inside Ivy prefers Ivy's own token and ignores /opt/zero/.env."""
+    zero_secrets = tmp_path / "zero_secrets.json"
+    zero_secrets.write_text(json.dumps({"DISCORD_BOT_TOKEN": "zero-secret-tok"}), encoding="utf-8")
+    zero_env = tmp_path / "zero.env"
+    zero_env.write_text("DISCORD_BOT_TOKEN=zero-dotenv-tok\n", encoding="utf-8")
+    app_env = tmp_path / "app.env"
+    app_env.write_text("DISCORD_BOT_TOKEN=ivy-app-dotenv-tok\n", encoding="utf-8")
+
+    monkeypatch.setattr(forge_mod, "is_ivy_container", lambda: True)
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("IVY_DISCORD_TOKEN", raising=False)
+    monkeypatch.delenv("IVY_BOT_TOKEN", raising=False)
+
+    path_map = {
+        "/secrets/env.json": zero_secrets,
+        "/opt/zero/secrets/env.json": zero_secrets,
+        "/opt/zero/.env": zero_env,
+        "/app/.env": app_env,
+        "__missing__": tmp_path / "missing_file",
+    }
+    monkeypatch.setattr(forge_mod, "Path", _make_fake_path_mapper(path_map))
+    monkeypatch.setattr("tools.deliver_image.get_discord_token", lambda: "zero-deliver-tok")
+
+    # Picks up Ivy's /app/.env even though /opt/zero/.env and /secrets/env.json have Zero's token
+    assert forge_mod._get_discord_token(for_channel_id=forge_mod.BASEBALL_CHANNEL_ID) == "ivy-app-dotenv-tok"
+    # Even with for_channel_id=None inside Ivy, resolves to Ivy's token (never Zero's)
+    assert forge_mod._get_discord_token() == "ivy-app-dotenv-tok"
+
+    # os.getenv("DISCORD_BOT_TOKEN") takes precedence inside Ivy
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "ivy-runtime-env-tok")
+    assert forge_mod._get_discord_token(for_channel_id=forge_mod.BASEBALL_CHANNEL_ID) == "ivy-runtime-env-tok"
+
+    # Without any Ivy token at all, returns None rather than falling back to Zero
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    path_map.pop("/app/.env")
+    assert forge_mod._get_discord_token(for_channel_id=forge_mod.BASEBALL_CHANNEL_ID) is None
+
+
+def test_baseball_decision_card_rest_skips_when_no_ivy_token(tmp_path, monkeypatch):
+    """Ensure _post_decision_card_rest passes for_channel_id=BASEBALL_CHANNEL_ID and skips posting without Ivy token."""
+    db_path = tmp_path / "forge_baseball_rest.db"
+    forge_mod.init_forge_db(db_path)
+
+    dec = forge_mod.stage_decision(
+        category="bridge_reload",
+        title="Reload Bridge (fg-bb-rest)",
+        summary="Reload bridge in-place.",
+        handler_type="bridge_reload",
+        payload={"build_id": "fg-bb-rest"},
+        channel_id=forge_mod.BASEBALL_CHANNEL_ID,
+        db_path=db_path,
+        post_to_discord=False,
+    )
+    did = dec["decision_id"]
+
+    seen_calls = []
+    post_calls = []
+
+    def _fake_get_token(for_forge_channel=False, for_channel_id=None):
+        seen_calls.append({"for_forge_channel": for_forge_channel, "for_channel_id": for_channel_id})
+        return None
+
+    def _fake_post(*args, **kwargs):
+        post_calls.append((args, kwargs))
+        m = MagicMock()
+        m.status_code = 200
+        m.json.return_value = {"id": "12345"}
+        return m
+
+    monkeypatch.setattr(forge_mod, "_get_discord_token", _fake_get_token)
+    monkeypatch.setattr(forge_mod.requests, "post", _fake_post)
+
+    res_msg_id = forge_mod._post_decision_card_rest(did, db_path=db_path)
+    assert res_msg_id is None
+    assert seen_calls == [{"for_forge_channel": False, "for_channel_id": forge_mod.BASEBALL_CHANNEL_ID}]
+    assert post_calls == []
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT message_id FROM forge_decisions WHERE id = ?", (did,)).fetchone()
+    assert row["message_id"] is None
+
+    # expire_stale_decisions also passes for_channel_id=BASEBALL_CHANNEL_ID and skips PATCH without Ivy token
+    patch_calls = []
+    monkeypatch.setattr(forge_mod.requests, "patch", lambda *a, **kw: patch_calls.append((a, kw)))
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE forge_decisions SET message_id = 777888, expires_at = ? WHERE id = ?",
+            (time.time() - 60.0, did),
+        )
+    seen_calls.clear()
+    expired = forge_mod.expire_stale_decisions(db_path=db_path)
+    assert did in expired
+    assert seen_calls == [{"for_forge_channel": False, "for_channel_id": forge_mod.BASEBALL_CHANNEL_ID}]
+    assert patch_calls == []
+
+
+def test_baseball_decision_card_bridge_reload_deferred_to_ivy_outbox(tmp_path, monkeypatch):
+    """Ensure #baseball bridge_reload decisions defer REST posting to Ivy's outbox poller when Vulcan lacks Ivy's token."""
+    db_path = tmp_path / "forge_baseball_defer.db"
+    forge_mod.init_forge_db(db_path)
+
+    build_id = "fg-bb-defer-1"
+    now = time.time()
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_builds (
+                id, title, repo, origin_channel_id, origin_thread_id,
+                touches_core_bridge, status, plan_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, 1, 'completed', '{}', ?, ?)
+            """,
+            (build_id, "Baseball Bridge Update", str(tmp_path), forge_mod.BASEBALL_CHANNEL_ID, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_chunks (
+                id, build_id, chunk_index, title, target_files_json, target_symbols_json,
+                prohibited_files_json, instructions, verification_cmd, status
+            ) VALUES (?, ?, 0, 'Chunk 0', '[]', '[]', '[]', 'Do work', 'true', 'completed')
+            """,
+            (f"{build_id}-c0", build_id),
+        )
+
+    monkeypatch.setattr(forge_mod, "_get_discord_token", lambda for_forge_channel=False, for_channel_id=None: None)
+
+    rest_post_calls = []
+    pending_calls = []
+    outbox_calls = []
+
+    monkeypatch.setattr(forge_mod, "_post_decision_card_rest", lambda *a, **kw: rest_post_calls.append((a, kw)))
+    monkeypatch.setattr(forge_mod, "post_pending_decision_cards", lambda *a, **kw: pending_calls.append((a, kw)) or [])
+    monkeypatch.setattr("tools.outbox.queue_outbox_message", lambda **kw: outbox_calls.append(kw) or {"ok": True})
+
+    ok = forge_mod.dispatch_build_completion_to_origin(build_id, db_path=db_path)
+    assert ok is True
+    assert rest_post_calls == []
+    assert pending_calls == []
+    assert len(outbox_calls) == 1
+    assert outbox_calls[0]["channel"] == forge_mod.BASEBALL_CHANNEL_ID
+    assert outbox_calls[0]["msg_type"] == "agent_turn"
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        dec_row = conn.execute(
+            "SELECT * FROM forge_decisions WHERE category = 'bridge_reload' AND channel_id = ?",
+            (forge_mod.BASEBALL_CHANNEL_ID,),
+        ).fetchone()
+    assert dec_row is not None
+    assert dec_row["status"] == "pending"
+    assert dec_row["message_id"] is None
 
 
 if __name__ == "__main__":

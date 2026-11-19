@@ -444,6 +444,23 @@ def get_default_origin_channel() -> str:
     return "zero-chat"
 
 
+def _parse_env_file_token(env_path: Path, key: str = "DISCORD_BOT_TOKEN") -> Optional[str]:
+    """Read a token value for `key=` from a dotenv file if it exists and is non-empty."""
+    if not env_path.exists():
+        return None
+    try:
+        prefix = f"{key}="
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith(prefix):
+                val = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                if val:
+                    return val
+    except Exception:
+        pass
+    return None
+
+
 def _get_discord_token(
     for_forge_channel: bool = False,
     for_channel_id: Optional[int] = None,
@@ -452,10 +469,17 @@ def _get_discord_token(
 
     When `for_forge_channel=True` or `for_channel_id == FORGE_CHANNEL_ID`, prefers
     `VULCAN_DISCORD_TOKEN` / `VULCAN_BOT_TOKEN` / `FORGE_BOT_TOKEN` if configured
-    (especially when `AGENT_ROLE=vulcan` or `VULCAN_DELEGATED=1`), while using Zero's
-    primary `DISCORD_BOT_TOKEN` for cross-channel notifications/cards outside `#forge`.
+    (especially when `AGENT_ROLE=vulcan` or `VULCAN_DELEGATED=1`).
+    When `for_channel_id == BASEBALL_CHANNEL_ID` (or running inside Ivy without a specific
+    non-baseball target), resolves strictly to Ivy's bot token and never falls back to
+    Zero's primary `DISCORD_BOT_TOKEN`.
     """
     is_forge_target = bool(for_forge_channel or (for_channel_id is not None and int(for_channel_id) == FORGE_CHANNEL_ID))
+    in_ivy = is_ivy_container()
+    is_baseball_target = bool(
+        (for_channel_id is not None and int(for_channel_id) == BASEBALL_CHANNEL_ID)
+        or (not is_forge_target and for_channel_id is None and in_ivy)
+    )
     vulcan_active = (
         os.getenv("AGENT_ROLE", "").strip().lower() == "vulcan"
         or os.getenv("VULCAN_DELEGATED", "").strip().lower() in {"1", "true", "yes"}
@@ -480,18 +504,43 @@ def _get_discord_token(
                             return val
                 except Exception:
                     pass
-    if is_forge_target and is_ivy_container():
-        zero_env = Path("/opt/zero/.env")
-        if zero_env.exists():
-            try:
-                for line in zero_env.read_text(encoding="utf-8").splitlines():
-                    if line.strip().startswith("DISCORD_BOT_TOKEN="):
-                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+    if is_forge_target and in_ivy:
+        val = _parse_env_file_token(Path("/opt/zero/.env"), "DISCORD_BOT_TOKEN")
+        if val:
+            return val
+    if is_baseball_target and not is_forge_target:
+        if in_ivy:
+            val = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+            if val:
+                return val
+            for env_cand in (Path("/app/.env"), Path("/workspace/.env"), Path(".env")):
+                val = _parse_env_file_token(env_cand, "DISCORD_BOT_TOKEN")
+                if val:
+                    return val
+        ivy_keys = ("IVY_DISCORD_TOKEN", "IVY_BOT_TOKEN")
+        for env_key in ivy_keys:
+            val = os.getenv(env_key, "").strip()
+            if val:
+                return val
+        for sec_p in (
+            Path("/secrets/env.json"),
+            Path("/opt/zero/secrets/env.json"),
+            Path("/docker/discord-agy-agent/secrets/env.json"),
+        ):
+            if sec_p.exists():
+                try:
+                    sec_data = json.loads(sec_p.read_text(encoding="utf-8"))
+                    for env_key in ivy_keys:
+                        val = str(sec_data.get(env_key) or "").strip()
                         if val:
                             return val
-            except Exception:
-                pass
-    # For cross-channel cards/notifications outside #forge when running inside Vulcan, prefer Zero's primary DISCORD_BOT_TOKEN
+                except Exception:
+                    pass
+        val = _parse_env_file_token(Path("/docker/discord-ivy-agent/.env"), "DISCORD_BOT_TOKEN")
+        if val:
+            return val
+        return None
+    # For cross-channel cards/notifications outside #forge and #baseball when running inside Vulcan, prefer Zero's primary DISCORD_BOT_TOKEN
     if not is_forge_target:
         for sec_p in (
             Path("/secrets/env.json"),
@@ -510,30 +559,18 @@ def _get_discord_token(
             Path("/opt/zero/.env"),
             Path("/docker/discord-agy-agent/.env"),
         ):
-            if zero_env.exists():
-                try:
-                    for line in zero_env.read_text(encoding="utf-8").splitlines():
-                        if line.strip().startswith("DISCORD_BOT_TOKEN="):
-                            val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                            if val:
-                                return val
-                except Exception:
-                    pass
+            val = _parse_env_file_token(zero_env, "DISCORD_BOT_TOKEN")
+            if val:
+                return val
     try:
         from tools.deliver_image import get_discord_token
         return get_discord_token()
     except Exception:
         pass
     for env_cand in (Path("/app/.env"), Path("/workspace/.env"), Path(".env")):
-        if env_cand.exists():
-            try:
-                for line in env_cand.read_text(encoding="utf-8").splitlines():
-                    if line.strip().startswith("DISCORD_BOT_TOKEN="):
-                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        if val:
-                            return val
-            except Exception:
-                pass
+        val = _parse_env_file_token(env_cand, "DISCORD_BOT_TOKEN")
+        if val:
+            return val
     for env_key in ("DISCORD_BOT_TOKEN", "VULCAN_DISCORD_TOKEN", "VULCAN_BOT_TOKEN", "FORGE_BOT_TOKEN"):
         val = os.getenv(env_key, "").strip()
         if val:
@@ -6746,18 +6783,28 @@ def dispatch_build_completion_to_origin(build_id: str, db_path: Path | str = FOR
     target_ch = build["origin_thread_id"] or build["origin_channel_id"]
     if build["touches_core_bridge"]:
         try:
+            target_cid = int(target_ch)
+            defer_baseball_post = (
+                target_cid == BASEBALL_CHANNEL_ID
+                and _get_discord_token(
+                    for_forge_channel=False,
+                    for_channel_id=BASEBALL_CHANNEL_ID,
+                )
+                is None
+            )
             stage_decision(
                 category="bridge_reload",
                 title=f"Reload Bridge ({build_id})",
                 summary=f"Build `{build_id}` ({build['title']}) modified bridge infrastructure. Reload bridge in-place.",
                 handler_type="bridge_reload",
                 payload={"build_id": build_id, "reason": f"FORGE build {build_id} ({build['title']})"},
-                channel_id=int(target_ch),
+                channel_id=target_cid,
                 ttl_seconds=86400.0,
                 db_path=db_path,
-                post_to_discord=True,
+                post_to_discord=not defer_baseball_post,
             )
-            post_pending_decision_cards(channel_id=int(target_ch), db_path=db_path)
+            if not defer_baseball_post:
+                post_pending_decision_cards(channel_id=target_cid, db_path=db_path)
         except Exception as de:
             print(f"[FORGE] Warning staging bridge_reload decision card for {build_id}: {de}")
     try:
@@ -9544,7 +9591,10 @@ def stage_decision_card(
     """Alias for `stage_decision`: stages a deterministic Decision Card without clipping multi-item summaries."""
     token = None
     if post_to_discord:
-        token = _get_discord_token(for_forge_channel=(int(channel_id) == FORGE_CHANNEL_ID))
+        token = _get_discord_token(
+            for_forge_channel=(int(channel_id) == FORGE_CHANNEL_ID),
+            for_channel_id=int(channel_id),
+        )
     return stage_decision(
         category=category,
         title=title,
@@ -9703,7 +9753,10 @@ def _post_decision_card_rest(
         if not row:
             return None
 
-    token = token or _get_discord_token(for_forge_channel=(int(row["channel_id"]) == FORGE_CHANNEL_ID))
+    token = token or _get_discord_token(
+        for_forge_channel=(int(row["channel_id"]) == FORGE_CHANNEL_ID),
+        for_channel_id=int(row["channel_id"]),
+    )
     if not token:
         return None
 
@@ -10007,35 +10060,39 @@ def expire_stale_decisions(db_path: Path | str = FORGE_DB_PATH) -> list[str]:
             expired_rows.append(updated_r)
 
     if expired_rows:
-        token = _get_discord_token()
-        if token:
-            headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
-            for r in expired_rows:
-                msg_id = r.get("message_id")
-                ch_id = r.get("channel_id")
-                if msg_id and ch_id:
-                    decision_id = r["id"]
-                    embed_data = render_decision_card_embed(r)
-                    components = [
-                        {
-                            "type": 1,
-                            "components": [
-                                {"type": 2, "style": 3, "label": "Approve", "custom_id": f"forge_approve:{decision_id}", "disabled": True},
-                                {"type": 2, "style": 2, "label": "Edit", "custom_id": f"forge_edit:{decision_id}", "disabled": True},
-                                {"type": 2, "style": 4, "label": "Dismiss", "custom_id": f"forge_dismiss:{decision_id}", "disabled": True},
-                            ],
-                        }
-                    ]
-                    url = f"https://discord.com/api/v10/channels/{ch_id}/messages/{msg_id}"
-                    try:
-                        requests.patch(
-                            url,
-                            headers=headers,
-                            json={"content": "", "embeds": [embed_data], "components": components},
-                            timeout=5,
-                        )
-                    except Exception:
-                        pass
+        for r in expired_rows:
+            msg_id = r.get("message_id")
+            ch_id = r.get("channel_id")
+            if msg_id and ch_id:
+                token = _get_discord_token(
+                    for_forge_channel=(int(ch_id) == FORGE_CHANNEL_ID),
+                    for_channel_id=int(ch_id),
+                )
+                if not token:
+                    continue
+                headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+                decision_id = r["id"]
+                embed_data = render_decision_card_embed(r)
+                components = [
+                    {
+                        "type": 1,
+                        "components": [
+                            {"type": 2, "style": 3, "label": "Approve", "custom_id": f"forge_approve:{decision_id}", "disabled": True},
+                            {"type": 2, "style": 2, "label": "Edit", "custom_id": f"forge_edit:{decision_id}", "disabled": True},
+                            {"type": 2, "style": 4, "label": "Dismiss", "custom_id": f"forge_dismiss:{decision_id}", "disabled": True},
+                        ],
+                    }
+                ]
+                url = f"https://discord.com/api/v10/channels/{ch_id}/messages/{msg_id}"
+                try:
+                    requests.patch(
+                        url,
+                        headers=headers,
+                        json={"content": "", "embeds": [embed_data], "components": components},
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
 
     return expired_ids
 
