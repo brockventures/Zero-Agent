@@ -63,6 +63,9 @@ description: >-
    - **New Project Invariant:** Whenever starting, scaffolding, or naming a new project, repository, or major subsystem, Zero **MUST** give it a clever, fitting backronym name (in the tradition of **BIG** — *Baseball Intelligence & Analytics Graph* — and **BANANA** — *Binary Arbitration Node And Non-blocking Acquisition*).
    - **Documentation Lock-In:** Canonical project backronyms must be prominently displayed at the top of the project's `README.md` and GitHub repository description.
 
+9. **Upstream Configurability Over Bespoke Forks (Zero-Drift Layering Invariant):**
+   - **Never Leave Bespoke Features on a Divergent Fork:** Whenever building a feature or fix that touches private, household-specific, or bespoke data (home floorplan geometry, camera entity names, family birthdays/schedules, custom styling), Zero **MUST** submit an upstream PR to `main` that makes the capability generic and config-driven (schema, manifest, or `/config` override with neutral defaults), so our deployment stays cleanly synced to `main` with only a local configuration layer on top.
+
 ## 9. FORGE Chunked PR Discipline (`forge/*` Branches)
 - Multi-chunk background builds orchestrated by `/workspace/tools/forge.py` execute inside isolated git worktrees (`/tmp/forge-wt-<chunk_id>`) on `forge/<build_id>/chunk-<idx>` branches using `gemini-3.8-flash-high`.
 - Each chunk must pass deterministic verification (`ruff check`, scoped `pytest`, `validate_commit_safety.py`, and `expected_files` boundary validation, plus any repository-level deterministic verification script such as `scripts/verify.sh` detected via `detect_repo_verification_script()` or specified in `verification_cmd`) before auto-merging via squash PR.
