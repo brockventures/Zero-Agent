@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001, I001, F401
 """
 test_task_settle.py — Unit Tests for TaskSettle Supervisor Protocol.
 """
@@ -542,6 +543,56 @@ class TestTaskSettle(unittest.IsolatedAsyncioTestCase):
             msg = mock_outbox.call_args.kwargs["content"]
             self.assertIn("**Output (Tail Excerpt):**", msg)
             self.assertIn("Row 0199:", msg)
+
+    def test_get_turn_pending_tasks_large_multiturn_tail_and_single_turn_fallback(self):
+        """Verify tail read skips old turns on >300KB multi-turn transcripts and falls back for >300KB single turns."""
+        from tools.task_settle import _read_transcript_tail_for_active_turn
+
+        tpath = self.logs_dir / "transcript.jsonl"
+        filler = json.dumps({"type": "PLANNER_RESPONSE", "content": "p" * 4096}) + "\n"
+
+        # 1. Multi-turn >300KB: turn 1 has an old uncompleted task + >300KB padding; turn 2 is at the tail
+        turn1_header = "\n".join([
+            json.dumps({"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "turn 1"}),
+            json.dumps({
+                "type": "GENERIC",
+                "source": "MODEL",
+                "content": f"Tool is running as a background task with task id: {self.conv_id}/task-old-1",
+            }),
+        ]) + "\n"
+        turn2_tail = "\n".join([
+            json.dumps({"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "turn 2"}),
+            json.dumps({
+                "type": "GENERIC",
+                "source": "MODEL",
+                "content": f"Tool is running as a background task with task id: {self.conv_id}/task-new-2",
+            }),
+        ]) + "\n"
+        tpath.write_text(turn1_header + (filler * 85) + turn2_tail, encoding="utf-8")
+        self.assertGreater(tpath.stat().st_size, 300_000)
+
+        # Ensure tail helper finds turn 2 without calling full-file readlines()
+        tail_lines = _read_transcript_tail_for_active_turn(tpath, chunk_bytes=262144)
+        self.assertLess(len(tail_lines), 10)
+        pending_multi = get_turn_pending_tasks(self.conv_id, brain_dir=self.test_dir)
+        self.assertEqual(pending_multi, ["task-new-2"])
+
+        # 2. Single-turn >300KB: turn boundary + task launch at byte 0 followed by >300KB with no later boundary
+        single_turn_header = "\n".join([
+            json.dumps({"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "big single turn"}),
+            json.dumps({
+                "type": "GENERIC",
+                "source": "MODEL",
+                "content": f"Tool is running as a background task with task id: {self.conv_id}/task-early-single",
+            }),
+        ]) + "\n"
+        tpath.write_text(single_turn_header + (filler * 85), encoding="utf-8")
+        self.assertGreater(tpath.stat().st_size, 300_000)
+
+        # Must fall back to full read because no USER_INPUT/CHECKPOINT exists in the last 262144 bytes
+        pending_single = get_turn_pending_tasks(self.conv_id, brain_dir=self.test_dir)
+        self.assertEqual(pending_single, ["task-early-single"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1347,6 +1347,53 @@ class HeartbeatTracker:
         self.brain_dir = Path(brain_dir)
         self.last_disk_signature: tuple[int, float, int] = (0, 0.0, 0)
         self.last_progress_time: float = time.time()
+        self._has_subagents: bool = False
+        self._last_transcript_offset: int = 0
+        self._last_transcript_cid: Optional[str] = conv_id
+        self._subagent_scan_interval: float = 30.0
+        self._last_subagent_scan_ts: float = 0.0
+        self._cached_subagent_sig: tuple[int, float, int] = (0, 0.0, 0)
+
+    def _check_transcript_has_subagents(self, conv_path: Path, cid: str) -> bool:
+        """Incrementally scan only newly appended transcript bytes for invoke_subagent."""
+        if getattr(self, "_last_transcript_cid", cid) != cid:
+            self._has_subagents = False
+            self._last_transcript_offset = 0
+            self._last_transcript_cid = cid
+            self._last_subagent_scan_ts = 0.0
+            self._cached_subagent_sig = (0, 0.0, 0)
+
+        if getattr(self, "_has_subagents", False):
+            return True
+
+        transcript_file = conv_path / "logs" / "transcript.jsonl"
+        if not transcript_file.exists():
+            return self.brain_dir.exists()
+
+        try:
+            st_size = transcript_file.stat().st_size
+            offset = getattr(self, "_last_transcript_offset", 0)
+            if st_size < offset:
+                offset = 0
+            if st_size > offset:
+                max_read_bytes = 1048576
+                with open(transcript_file, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read(max_read_bytes)
+                if b"invoke_subagent" in chunk:
+                    self._has_subagents = True
+                    self._last_transcript_offset = offset + len(chunk)
+                    return True
+                # Keep a 16-byte overlap when capped so marker cannot split across reads
+                if len(chunk) == max_read_bytes and (offset + len(chunk)) < st_size:
+                    self._last_transcript_offset = offset + len(chunk) - 16
+                else:
+                    self._last_transcript_offset = offset + len(chunk)
+            else:
+                self._last_transcript_offset = offset
+        except OSError:
+            pass
+        return getattr(self, "_has_subagents", False)
 
     def compute_disk_signature(self, conv_id: Optional[str] = None) -> tuple[int, float, int]:
         """Compute (file_count, max_mtime, total_bytes) across SDK task logs, messages, and subagent transcripts."""
@@ -1374,40 +1421,46 @@ class HeartbeatTracker:
                     continue
 
         # Also inspect recently active subagent transcripts modified within the last 10 minutes
-        # Only scan brain_dir if the current conversation actually invoked a subagent (or has <= 30 entries)
+        # Only scan brain_dir if the current conversation actually invoked a subagent (throttled every 30s)
         now = time.time()
-        should_scan_subagents = False
-        transcript_file = conv_path / "logs" / "transcript.jsonl"
-        if transcript_file.exists():
-            try:
-                if "invoke_subagent" in transcript_file.read_text(encoding="utf-8", errors="ignore"):
-                    should_scan_subagents = True
-            except OSError:
-                pass
-        elif self.brain_dir.exists():
-            should_scan_subagents = True
+        should_scan_subagents = self._check_transcript_has_subagents(conv_path, str(cid))
 
         if should_scan_subagents and self.brain_dir.exists():
-            try:
-                with os.scandir(self.brain_dir) as it:
-                    for sub_entry in it:
-                        if not sub_entry.is_dir(follow_symlinks=False) or sub_entry.name == str(cid):
-                            continue
-                        try:
-                            if (now - sub_entry.stat(follow_symlinks=False).st_mtime) > 86400.0:
+            scan_interval = getattr(self, "_subagent_scan_interval", 30.0)
+            last_scan_ts = getattr(self, "_last_subagent_scan_ts", 0.0)
+            if last_scan_ts <= 0.0 or (now - last_scan_ts) >= scan_interval:
+                sub_count = 0
+                sub_max_mtime = 0.0
+                sub_bytes = 0
+                try:
+                    with os.scandir(self.brain_dir) as it:
+                        for sub_entry in it:
+                            if not sub_entry.is_dir(follow_symlinks=False) or sub_entry.name == str(cid):
                                 continue
-                        except OSError:
-                            continue
-                        sub_log = Path(sub_entry.path) / ".system_generated" / "logs" / "transcript.jsonl"
-                        if sub_log.exists():
-                            st = sub_log.stat()
-                            if (now - st.st_mtime) <= 600.0:
-                                file_count += 1
-                                if st.st_mtime > max_mtime:
-                                    max_mtime = st.st_mtime
-                                total_bytes += st.st_size
-            except OSError:
-                pass
+                            try:
+                                if (now - sub_entry.stat(follow_symlinks=False).st_mtime) > 86400.0:
+                                    continue
+                            except OSError:
+                                continue
+                            sub_log = Path(sub_entry.path) / ".system_generated" / "logs" / "transcript.jsonl"
+                            if sub_log.exists():
+                                st = sub_log.stat()
+                                if (now - st.st_mtime) <= 600.0:
+                                    sub_count += 1
+                                    if st.st_mtime > sub_max_mtime:
+                                        sub_max_mtime = st.st_mtime
+                                    sub_bytes += st.st_size
+                except OSError:
+                    pass
+                self._cached_subagent_sig = (sub_count, sub_max_mtime, sub_bytes)
+                self._last_subagent_scan_ts = now
+            else:
+                sub_count, sub_max_mtime, sub_bytes = getattr(self, "_cached_subagent_sig", (0, 0.0, 0))
+
+            file_count += sub_count
+            if sub_max_mtime > max_mtime:
+                max_mtime = sub_max_mtime
+            total_bytes += sub_bytes
 
         return (file_count, max_mtime, total_bytes)
 
@@ -1438,8 +1491,20 @@ def check_runaway_tool_loop(
         return False, ""
 
     try:
-        with open(tpath, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()[-40:]
+        tail_bytes = 131072
+        with open(tpath, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            seek_pos = max(0, size - tail_bytes)
+            f.seek(seek_pos)
+            raw = f.read()
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines = lines[:-1]
+        if seek_pos > 0 and lines:
+            lines = lines[1:]
+        lines = lines[-40:]
     except Exception:
         return False, ""
 

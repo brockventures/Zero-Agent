@@ -5063,5 +5063,145 @@ def test_baseball_decision_card_bridge_reload_deferred_to_ivy_outbox(tmp_path, m
     assert dec_row["message_id"] is None
 
 
+def test_heartbeat_tracker_incremental_transcript_and_scandir_throttle(tmp_path, monkeypatch):
+    """Verify HeartbeatTracker scans transcript incrementally and throttles brain_dir os.scandir to 30s."""
+    brain_root = tmp_path / "brain"
+    conv_id = "conv-main"
+    logs_dir = brain_root / conv_id / ".system_generated" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    tfile = logs_dir / "transcript.jsonl"
+    tfile.write_text(
+        json.dumps({"type": "USER_INPUT", "content": "hello"}) + "\n",
+        encoding="utf-8",
+    )
+
+    sub1_logs = brain_root / "conv-sub-1" / ".system_generated" / "logs"
+    sub1_logs.mkdir(parents=True, exist_ok=True)
+    sub1_tfile = sub1_logs / "transcript.jsonl"
+    sub1_tfile.write_text('{"type": "PLANNER_RESPONSE", "content": "sub1"}\n', encoding="utf-8")
+
+    fake_now = [1000.0]
+    monkeypatch.setattr(forge_mod.time, "time", lambda: fake_now[0])
+
+    scandir_calls = []
+    real_scandir = os.scandir
+
+    def _spy_scandir(path):
+        if Path(path) == brain_root:
+            scandir_calls.append(str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(forge_mod.os, "scandir", _spy_scandir)
+
+    tracker = HeartbeatTracker(conv_id=conv_id, brain_dir=brain_root)
+    sig1 = tracker.compute_disk_signature()
+    assert tracker._has_subagents is False
+    assert tracker._last_transcript_offset == tfile.stat().st_size
+    assert len(scandir_calls) == 0
+    assert sig1[0] == 1  # only main transcript
+
+    # Append non-subagent bytes; verify incremental seek skips already-scanned prefix
+    prev_offset = tracker._last_transcript_offset
+    seek_positions = []
+    real_open = open
+
+    def _spy_open(file, mode="r", *args, **kwargs):
+        fh = real_open(file, mode, *args, **kwargs)
+        if str(file) == str(tfile) and "b" in mode:
+            orig_seek = fh.seek
+
+            def _tracked_seek(pos, whence=0):
+                seek_positions.append(pos)
+                return orig_seek(pos, whence)
+
+            fh.seek = _tracked_seek
+        return fh
+
+    with tfile.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "PLANNER_RESPONSE", "content": "working"}) + "\n")
+
+    with patch("builtins.open", side_effect=_spy_open):
+        sig2 = tracker.compute_disk_signature()
+
+    assert seek_positions == [prev_offset]
+    assert tracker._has_subagents is False
+    assert tracker._last_transcript_offset == tfile.stat().st_size
+    assert len(scandir_calls) == 0
+    assert sig2[0] == 1
+
+    # Append invoke_subagent; triggers first os.scandir at t=1005.0
+    fake_now[0] = 1005.0
+    with tfile.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "invoke_subagent"}]}) + "\n")
+
+    sig3 = tracker.compute_disk_signature()
+    assert tracker._has_subagents is True
+    assert len(scandir_calls) == 1
+    assert sig3[0] == 2  # main transcript + sub1 transcript
+
+    # Within 30s (t=1020.0): os.scandir is throttled and cached subagent sig is reused
+    fake_now[0] = 1020.0
+    sub2_logs = brain_root / "conv-sub-2" / ".system_generated" / "logs"
+    sub2_logs.mkdir(parents=True, exist_ok=True)
+    (sub2_logs / "transcript.jsonl").write_text('{"type": "PLANNER_RESPONSE", "content": "sub2"}\n', encoding="utf-8")
+
+    sig4 = tracker.compute_disk_signature()
+    assert len(scandir_calls) == 1
+    assert sig4[0] == 2  # still cached
+
+    # Past 30s (t=1036.0): os.scandir runs again and picks up sub2
+    fake_now[0] = 1036.0
+    sig5 = tracker.compute_disk_signature()
+    assert len(scandir_calls) == 2
+    assert sig5[0] == 3
+
+    # File shrink resets _last_transcript_offset cleanly
+    tracker._has_subagents = False
+    tfile.write_text('{"type": "USER_INPUT", "content": "reset"}\n', encoding="utf-8")
+    tracker.compute_disk_signature()
+    assert tracker._last_transcript_offset == tfile.stat().st_size
+
+
+def test_check_runaway_tool_loop_tail_read_large_transcript(tmp_path):
+    """Verify check_runaway_tool_loop detects loops via bounded tail read on >200KB transcripts."""
+    brain_root = tmp_path / "brain"
+    conv_id = "conv-large-tail"
+    logs_dir = brain_root / conv_id / ".system_generated" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    tfile = logs_dir / "transcript.jsonl"
+
+    # Write >220KB of historical padding lines
+    filler_line = json.dumps({"type": "PLANNER_RESPONSE", "content": "x" * 2048}) + "\n"
+    padding = filler_line * 115  # ~235KB
+    assert len(padding.encode("utf-8")) > 200_000
+
+    tail_entries = [
+        {"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "run tests"},
+    ]
+    for _ in range(3):
+        tail_entries.append({
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pytest fail.py"}}],
+        })
+        tail_entries.append({
+            "type": "GENERIC",
+            "content": "Command exited with code 1.\nError: assertion failed",
+        })
+    tail_text = "\n".join(json.dumps(e) for e in tail_entries) + "\n"
+    tfile.write_text(padding + tail_text, encoding="utf-8")
+
+    is_loop, reason = check_runaway_tool_loop(conv_id, brain_dir=brain_root, threshold=3)
+    assert is_loop is True
+    assert "Runaway tool loop" in reason
+
+    # Appending a fresh USER_INPUT + clean response clears the active turn loop
+    with tfile.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "try again"}) + "\n")
+        f.write(json.dumps({"type": "PLANNER_RESPONSE", "content": "Fixed cleanly."}) + "\n")
+
+    is_loop_after, _ = check_runaway_tool_loop(conv_id, brain_dir=brain_root, threshold=3)
+    assert is_loop_after is False
+
+
 if __name__ == "__main__":
     unittest.main()

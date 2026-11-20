@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001, I001, UP035, F401, S112, BLE001, UP045, SIM102, S110, SIM103, UP006, F841
 """
 task_settle.py — TaskSettle Protocol: Background Task State Supervisor.
 
@@ -51,9 +52,8 @@ def _is_task_finished_content(clean_tid: str, content: str) -> bool:
     return bool(re.search(pattern, content, re.IGNORECASE))
 
 
-def extract_turn_lines(lines: list[str]) -> list[str]:
-    """Scan transcript lines in reverse to extract strictly the active turn."""
-    last_user_idx = -1
+def _find_last_turn_boundary_idx(lines: list[str]) -> int:
+    """Return index of the most recent user/checkpoint turn boundary, or -1 if none found."""
     for i in range(len(lines) - 1, -1, -1):
         line = lines[i].strip()
         if not line:
@@ -68,14 +68,45 @@ def extract_turn_lines(lines: list[str]) -> list[str]:
                 or source in ("USER_EXPLICIT", "USER")
                 or role in ("user", "USER")
             ):
-                last_user_idx = i
-                break
+                return i
         except Exception:
             continue
+    return -1
 
+
+def extract_turn_lines(lines: list[str]) -> list[str]:
+    """Scan transcript lines in reverse to extract strictly the active turn."""
+    last_user_idx = _find_last_turn_boundary_idx(lines)
     if last_user_idx == -1:
         return lines
     return lines[last_user_idx:]
+
+
+def _read_transcript_tail_for_active_turn(tpath: Path, chunk_bytes: int = 262144) -> list[str]:
+    """Read only the tail of a large transcript if a turn boundary lies within chunk_bytes; fallback to full read."""
+    size = tpath.stat().st_size
+    if size <= chunk_bytes:
+        with open(tpath, "r", encoding="utf-8", errors="replace") as f:
+            return f.readlines()
+
+    seek_pos = size - chunk_bytes
+    with open(tpath, "rb") as f:
+        f.seek(seek_pos)
+        raw = f.read()
+
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    if seek_pos > 0 and lines:
+        lines = lines[1:]
+
+    boundary_idx = _find_last_turn_boundary_idx(lines)
+    if boundary_idx != -1:
+        return lines[boundary_idx:]
+
+    with open(tpath, "r", encoding="utf-8", errors="replace") as f:
+        return f.readlines()
 
 
 def get_turn_pending_tasks(
@@ -92,8 +123,7 @@ def get_turn_pending_tasks(
         if not tpath.exists():
             return []
         try:
-            with open(tpath, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            lines = _read_transcript_tail_for_active_turn(tpath)
         except Exception as e:
             print(f"[TaskSettle] Warning reading transcript for {conv_id}: {e}")
             return []
