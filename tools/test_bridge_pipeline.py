@@ -102,6 +102,32 @@ class TestTurnTimer(unittest.TestCase):
 
 
 class TestBridgePipelinePrompt(unittest.TestCase):
+    def setUp(self):
+        import shutil
+        import tempfile
+        import tools.channel_history as ch
+
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_path = Path(self.temp_dir)
+        self.orig_wm_file = ch.CHANNEL_WATERMARKS_FILE
+        self.orig_watermarks = dict(ch._seen_watermarks)
+        self.orig_history = {k: list(q) for k, q in ch._history_store.items()}
+        ch.CHANNEL_WATERMARKS_FILE = self.temp_path / "channel_seen_watermarks.json"
+        ch._seen_watermarks.clear()
+
+    def tearDown(self):
+        import shutil
+        from collections import deque
+        import tools.channel_history as ch
+
+        ch.CHANNEL_WATERMARKS_FILE = self.orig_wm_file
+        ch._seen_watermarks.clear()
+        ch._seen_watermarks.update(self.orig_watermarks)
+        ch._history_store.clear()
+        for k, msgs in self.orig_history.items():
+            ch._history_store[k] = deque(msgs, maxlen=ch.MAX_HISTORY_PER_CHANNEL)
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
     def test_prepare_turn_prompt_home(self):
         prompt = prepare_turn_prompt(
             prompt="Hello Zero",
@@ -213,21 +239,35 @@ class TestBridgePipelineDelivery(unittest.IsolatedAsyncioTestCase):
         import shutil
         import tempfile
         import tools.bridge_state as bs
+        import tools.channel_history as ch
 
         self.temp_dir = tempfile.mkdtemp()
         self.temp_path = Path(self.temp_dir)
         self.orig_data_dir = bs.DATA_DIR
         self.orig_session_meta = bs.SESSION_METADATA_FILE
+        self.orig_wm_file = ch.CHANNEL_WATERMARKS_FILE
+        self.orig_watermarks = dict(ch._seen_watermarks)
+        self.orig_history = {k: list(q) for k, q in ch._history_store.items()}
 
         bs.DATA_DIR = self.temp_path
         bs.SESSION_METADATA_FILE = self.temp_path / "session_metadata.json"
+        ch.CHANNEL_WATERMARKS_FILE = self.temp_path / "channel_seen_watermarks.json"
+        ch._seen_watermarks.clear()
 
     def tearDown(self):
         import shutil
+        from collections import deque
         import tools.bridge_state as bs
+        import tools.channel_history as ch
 
         bs.DATA_DIR = self.orig_data_dir
         bs.SESSION_METADATA_FILE = self.orig_session_meta
+        ch.CHANNEL_WATERMARKS_FILE = self.orig_wm_file
+        ch._seen_watermarks.clear()
+        ch._seen_watermarks.update(self.orig_watermarks)
+        ch._history_store.clear()
+        for k, msgs in self.orig_history.items():
+            ch._history_store[k] = deque(msgs, maxlen=ch.MAX_HISTORY_PER_CHANNEL)
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     async def test_deliver_external_no_reply(self):
@@ -1009,6 +1049,211 @@ class TestBridgeEmojiReactions(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[CHOICES:", send_args[0])
         self.assertEqual(send_kwargs["view"], "MOCK_PROJECTS_HOME_VIEW")
         zero_chat_mock.send.assert_not_called()
+
+
+class TestHomeUnseenDeltaIntegration(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import shutil
+        import tempfile
+        import tools.bridge_state as bs
+        import tools.channel_history as ch
+
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_path = Path(self.temp_dir)
+        self.orig_data_dir = bs.DATA_DIR
+        self.orig_session_meta = bs.SESSION_METADATA_FILE
+        self.orig_wm_file = ch.CHANNEL_WATERMARKS_FILE
+        self.orig_watermarks = dict(ch._seen_watermarks)
+        self.orig_history = {k: list(q) for k, q in ch._history_store.items()}
+        self.save_patcher = patch.object(ch, "save_history")
+        self.save_patcher.start()
+
+        bs.DATA_DIR = self.temp_path
+        bs.SESSION_METADATA_FILE = self.temp_path / "session_metadata.json"
+        ch.CHANNEL_WATERMARKS_FILE = self.temp_path / "channel_seen_watermarks.json"
+        ch._history_store.clear()
+        ch._seen_watermarks.clear()
+
+    def tearDown(self):
+        import shutil
+        from collections import deque
+        import tools.bridge_state as bs
+        import tools.channel_history as ch
+
+        self.save_patcher.stop()
+        bs.DATA_DIR = self.orig_data_dir
+        bs.SESSION_METADATA_FILE = self.orig_session_meta
+        ch.CHANNEL_WATERMARKS_FILE = self.orig_wm_file
+        ch._seen_watermarks.clear()
+        ch._seen_watermarks.update(self.orig_watermarks)
+        ch._history_store.clear()
+        for k, msgs in self.orig_history.items():
+            ch._history_store[k] = deque(msgs, maxlen=ch.MAX_HISTORY_PER_CHANNEL)
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_prepare_turn_prompt_home_normal_back_and_forth_has_no_delta(self):
+        import tools.channel_history as ch
+
+        home_cid = 1542081375287640084
+        ch.record_message(home_cid, "zero-chat", "Ryan", False, "Earlier ask", msg_id=1000, timestamp="2026-11-20 18:00:00 UTC")
+        ch.record_message(home_cid, "zero-chat", "Zero", True, "Earlier reply", msg_id=1001, timestamp="2026-11-20 18:00:10 UTC")
+        ch.mark_channel_seen(home_cid, msg_id=1001)
+
+        user_msg = MagicMock()
+        user_msg.id = 1002
+        user_msg.reference = None
+        ch.record_message(home_cid, "zero-chat", "Ryan", False, "Follow up question", msg_id=1002, timestamp="2026-11-20 18:01:00 UTC")
+
+        formatted = prepare_turn_prompt(
+            prompt="Follow up question",
+            mode="home",
+            channel_id=home_cid,
+            sess_key="home",
+            reply_target=user_msg,
+        )
+        self.assertNotIn("UNSEEN CHANNEL MESSAGES", formatted)
+        self.assertIn("Follow up question", formatted)
+
+    def test_prepare_turn_prompt_home_injects_sidecar_delta_before_reply_and_prompt(self):
+        import tools.channel_history as ch
+
+        home_cid = 1542081375287640084
+        ch.record_message(home_cid, "zero-chat", "Zero", True, "Last turn reply", msg_id=1000, timestamp="2026-09-03 04:00:00 UTC")
+        ch.mark_channel_seen(home_cid, msg_id=1000)
+        ch.record_message(home_cid, "zero-chat", "Zero", True, "🪪 Decision Card: Deploy hotfix?", msg_id=1001, timestamp="2026-09-03 04:12:11 UTC")
+
+        user_msg = MagicMock()
+        user_msg.id = 1002
+        ref = MagicMock()
+        ref.message_id = 999
+        resolved = MagicMock()
+        resolved.author.display_name = "Ryan"
+        resolved.author.bot = False
+        resolved.clean_content = "Anchor message"
+        resolved.created_at = None
+        ref.resolved = resolved
+        user_msg.reference = ref
+        ch.record_message(home_cid, "zero-chat", "Ryan", False, "Go ahead", msg_id=1002, timestamp="2026-09-03 04:13:00 UTC")
+
+        formatted = prepare_turn_prompt(
+            prompt="Go ahead",
+            mode="home",
+            channel_id=home_cid,
+            sess_key="home",
+            reply_target=user_msg,
+        )
+        self.assertIn("--- UNSEEN CHANNEL MESSAGES SINCE LAST TURN (#zero-chat, 1 messages, PT timezone) ---", formatted)
+        self.assertIn("[09:12:11 PM PT] Zero (bot): 🪪 Decision Card: Deploy hotfix?", formatted)
+        self.assertNotIn("Go ahead\n[Reacts", formatted)
+
+        unseen_pos = formatted.index("UNSEEN CHANNEL MESSAGES")
+        reply_pos = formatted.index("[DISCORD MESSAGE REPLY CONTEXT]:")
+        prompt_pos = formatted.rindex("Go ahead")
+        self.assertLess(unseen_pos, reply_pos)
+        self.assertLess(reply_pos, prompt_pos)
+
+    def test_prepare_turn_prompt_home_skips_delta_when_lazy_typer_context_present(self):
+        import tools.channel_history as ch
+
+        home_cid = 1542081375287640084
+        ch.record_message(home_cid, "zero-chat", "Zero", True, "Last turn reply", msg_id=1000, timestamp="2026-11-20 18:00:00 UTC")
+        ch.mark_channel_seen(home_cid, msg_id=1000)
+        ch.record_message(home_cid, "zero-chat", "Zero", True, "Sidecar alert", msg_id=1001, timestamp="2026-11-20 18:01:00 UTC")
+
+        lazy_prompt = (
+            "[OPERATIONAL DIRECTIVE - LAZY TYPER ADDRESSING]:\n"
+            "[RECENT DISCORD CHANNEL CONTEXT (Preceding messages in this channel)]:\n"
+            "Sidecar alert\n\n?"
+        )
+        formatted = prepare_turn_prompt(
+            prompt=lazy_prompt,
+            mode="home",
+            channel_id=home_cid,
+            sess_key="home",
+        )
+        self.assertNotIn("UNSEEN CHANNEL MESSAGES", formatted)
+
+    async def test_deliver_turn_output_home_advances_watermark_past_prompt_and_reply(self):
+        import tools.channel_history as ch
+
+        home_cid = 1542081375287640084
+        ch.mark_channel_seen(home_cid, msg_id=1000)
+
+        user_msg = MagicMock()
+        user_msg.id = 1002
+        sent_msg = MagicMock()
+        sent_msg.id = 1003
+        user_msg.reply = AsyncMock(return_value=sent_msg)
+
+        ch.record_message(home_cid, "zero-chat", "Ryan", False, "Check status", msg_id=1002, timestamp="2026-11-20 18:05:00 UTC")
+
+        await deliver_turn_output(
+            output_text="All systems green.",
+            status_msg=None,
+            reply_target=user_msg,
+            mode="home",
+            channel_id=home_cid,
+            conv_id="conv-wm-1",
+            turn_start_time=time.time(),
+        )
+
+        self.assertEqual(ch.get_channel_watermark(home_cid), 1003)
+
+        # Simulate Discord echoing Zero's own reply and then a subsequent outbox post
+        ch.record_message(home_cid, "zero-chat", "Zero", True, "All systems green.", msg_id=1003, timestamp="2026-11-20 18:05:05 UTC")
+        ch.record_message(home_cid, "zero-chat", "Zero", True, "📦 [Outbox] Backup finished.", msg_id=1004, timestamp="2026-11-20 18:06:00 UTC")
+        ch.record_message(home_cid, "zero-chat", "Ryan", False, "Next question", msg_id=1005, timestamp="2026-11-20 18:07:00 UTC")
+
+        delta = ch.format_unseen_delta_context(home_cid, exclude_msg_id=1005)
+        self.assertIn("Backup finished.", delta)
+        self.assertNotIn("All systems green.", delta)
+        self.assertNotIn("Check status", delta)
+        self.assertNotIn("Next question", delta)
+
+    async def test_deliver_turn_output_home_reaction_only_advances_watermark(self):
+        import tools.channel_history as ch
+
+        home_cid = 1542081375287640084
+        ch.mark_channel_seen(home_cid, msg_id=2000)
+
+        user_msg = AsyncMock()
+        user_msg.id = 2001
+        user_msg.add_reaction = AsyncMock()
+
+        await deliver_turn_output(
+            output_text="[REACT: 👍]",
+            status_msg=None,
+            reply_target=user_msg,
+            mode="home",
+            channel_id=home_cid,
+            conv_id="conv-wm-2",
+            turn_start_time=time.time(),
+        )
+
+        self.assertEqual(ch.get_channel_watermark(home_cid), 2001)
+
+    async def test_deliver_turn_output_home_autonomous_channel_target_uses_history_id(self):
+        import tools.channel_history as ch
+
+        home_cid = 1542081375287640084
+        ch.record_message(home_cid, "zero-chat", "Zero", True, "Earlier message", msg_id=3001, timestamp="2026-11-20 18:00:00 UTC")
+
+        channel_target = MagicMock(spec=["send", "id"])
+        channel_target.id = home_cid
+        channel_target.send = AsyncMock(return_value=MagicMock(spec=["id"], id=3002))
+
+        await deliver_turn_output(
+            output_text="Autonomous alert processed.",
+            status_msg=None,
+            reply_target=channel_target,
+            mode="home",
+            channel_id=home_cid,
+            conv_id="conv-wm-3",
+            turn_start_time=time.time(),
+        )
+
+        # Must advance to sent message ID (3002), never treat channel_target.id (home_cid) as a msg_id
+        self.assertEqual(ch.get_channel_watermark(home_cid), 3002)
 
 
 if __name__ == "__main__":

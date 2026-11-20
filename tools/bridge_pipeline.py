@@ -468,6 +468,51 @@ def get_ambient_memory_context(
         return ""
 
 
+def _extract_message_id(target: Any, channel_id: int | str | None = None) -> int | None:
+    """Return integer message ID if target represents a Discord message (not a channel/thread)."""
+    if target is None:
+        return None
+    if isinstance(target, (discord.TextChannel, discord.Thread)):
+        return None
+    if not hasattr(target, "reply") and not hasattr(target, "author") and not hasattr(target, "channel"):
+        return None
+    mid = getattr(target, "id", None)
+    if isinstance(mid, int) and not isinstance(mid, bool):
+        if channel_id is not None and str(mid) == str(channel_id) and not hasattr(target, "author"):
+            return None
+        return mid
+    if isinstance(mid, str) and mid.isdigit():
+        if channel_id is not None and mid == str(channel_id) and not hasattr(target, "author"):
+            return None
+        return int(mid)
+    return None
+
+
+def _advance_home_seen_watermark(
+    channel_id: int | str,
+    reply_target: Any = None,
+    sent_messages: list[Any] | None = None,
+) -> None:
+    """Advance the per-channel seen watermark past the user prompt and Zero's delivered reply."""
+    try:
+        from tools.channel_history import mark_channel_seen
+
+        candidate_ids: list[int] = []
+        reply_mid = _extract_message_id(reply_target, channel_id=channel_id)
+        if reply_mid is not None:
+            candidate_ids.append(reply_mid)
+        for sm in sent_messages or []:
+            sm_id = getattr(sm, "id", None)
+            if isinstance(sm_id, int) and not isinstance(sm_id, bool):
+                candidate_ids.append(sm_id)
+            elif isinstance(sm_id, str) and sm_id.isdigit():
+                candidate_ids.append(int(sm_id))
+        seen_id = max(candidate_ids) if candidate_ids else None
+        mark_channel_seen(channel_id, msg_id=seen_id)
+    except Exception as wm_err:
+        print(f"[BridgePipeline] Warning advancing channel seen watermark: {wm_err}")
+
+
 def prepare_turn_prompt(
     prompt: str,
     mode: str,
@@ -536,6 +581,16 @@ def prepare_turn_prompt(
         mem_ctx = get_ambient_memory_context(prompt, mode=mode, channel_id=channel_id)
         if mem_ctx:
             blocks.append(mem_ctx)
+        if "[RECENT DISCORD CHANNEL CONTEXT" not in prompt:
+            try:
+                from tools.channel_history import format_unseen_delta_context
+
+                target_msg_id = _extract_message_id(reply_target, channel_id=channel_id)
+                unseen_ctx = format_unseen_delta_context(channel_id, exclude_msg_id=target_msg_id)
+                if unseen_ctx:
+                    blocks.append(unseen_ctx)
+            except Exception as ce:
+                print(f"[BridgePipeline] Warning formatting unseen delta context: {ce}")
         if reply_block:
             blocks.append(reply_block)
         blocks.append(prompt)
@@ -773,6 +828,8 @@ async def deliver_turn_output(
                 await status_msg.delete()
             except Exception:
                 pass
+        if mode == "home" or is_home_channel(channel_id):
+            _advance_home_seen_watermark(channel_id, reply_target=reply_target, sent_messages=sent_messages)
         if timer:
             timer.mark_delivery_end()
             timer.finish("SUCCESS")
@@ -1239,6 +1296,8 @@ async def deliver_turn_output(
             except Exception as lwe:
                 print(f"[BridgePipeline] Error setting Last Word pause on silence: {lwe}")
         print("[BridgePipeline] Suppressed [NO_REPLY] in non-home or autonomous system turn")
+        if mode == "home" or is_home:
+            _advance_home_seen_watermark(channel_id, reply_target=reply_target, sent_messages=sent_messages)
         if timer:
             timer.mark_delivery_end()
             timer.finish("NO_REPLY")
@@ -1482,6 +1541,9 @@ async def deliver_turn_output(
             channel_last_bot_reply[channel_id] = time.time()
         except Exception:
             pass
+
+        if mode == "home" or is_home:
+            _advance_home_seen_watermark(channel_id, reply_target=reply_target, sent_messages=sent_messages)
 
         # Post-turn zero-token quota sampling (throttled to max 1 sample per 60s)
         try:

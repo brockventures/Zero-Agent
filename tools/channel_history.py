@@ -19,6 +19,7 @@ PT_TZ = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path("/workspace/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CHANNEL_HISTORY_FILE = DATA_DIR / "channel_history.json"
+CHANNEL_WATERMARKS_FILE = DATA_DIR / "channel_seen_watermarks.json"
 MAX_HISTORY_PER_CHANNEL = 40
 
 # Linked channel groups for cross-room awareness (e.g., Crab Cavern)
@@ -31,6 +32,7 @@ LINKED_CHANNEL_GROUPS = [
 
 # In-memory deque store: channel_id (str) -> deque of message dicts
 _history_store: dict[str, deque] = {}
+_seen_watermarks: dict[str, int] = {}
 _last_save_time = 0.0
 
 def load_history() -> dict[str, deque]:
@@ -374,5 +376,154 @@ def is_handoff_addressed_to_zero(content: str) -> bool:
         pass
     return False
 
+def load_watermarks() -> dict[str, int]:
+    """Load persistent per-channel seen message ID watermarks from disk."""
+    global _seen_watermarks
+    if CHANNEL_WATERMARKS_FILE.exists():
+        try:
+            with open(CHANNEL_WATERMARKS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                if isinstance(raw, dict):
+                    loaded: dict[str, int] = {}
+                    for ch_id, msg_id in raw.items():
+                        if msg_id is not None and not isinstance(msg_id, bool):
+                            try:
+                                loaded[str(ch_id)] = int(msg_id)
+                            except (TypeError, ValueError):
+                                pass
+                    _seen_watermarks = loaded
+        except Exception as e:
+            print(f"[ChannelHistory] Warning: Could not load watermarks from {CHANNEL_WATERMARKS_FILE}: {e}")
+    return _seen_watermarks
+
+
+def save_watermarks() -> None:
+    """Persist per-channel seen watermarks atomically to disk."""
+    try:
+        CHANNEL_WATERMARKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CHANNEL_WATERMARKS_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_seen_watermarks, f, indent=2)
+        tmp.replace(CHANNEL_WATERMARKS_FILE)
+    except Exception as e:
+        print(f"[ChannelHistory] Warning: Could not save watermarks to {CHANNEL_WATERMARKS_FILE}: {e}")
+
+
+def get_channel_watermark(channel_id: int | str) -> int | None:
+    """Return the persisted last seen message ID watermark for a channel, if any."""
+    return _seen_watermarks.get(str(channel_id))
+
+
+def _coerce_int_id(val) -> int | None:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str) and val.isdigit():
+        return int(val)
+    return None
+
+
+def mark_channel_seen(channel_id: int | str, msg_id: int | None = None) -> int | None:
+    """Advance the per-channel seen watermark to msg_id (or the latest recorded message ID)."""
+    ch_key = str(channel_id)
+    target_id = _coerce_int_id(msg_id)
+    if target_id is None:
+        if ch_key not in _history_store and not _history_store:
+            load_history()
+        msgs = list(_history_store.get(ch_key, []))
+        candidate_ids = [cid for m in msgs if (cid := _coerce_int_id(m.get("id"))) is not None]
+        if not candidate_ids:
+            return _seen_watermarks.get(ch_key)
+        target_id = max(candidate_ids)
+
+    prev = _seen_watermarks.get(ch_key)
+    if prev is None or target_id > prev:
+        _seen_watermarks[ch_key] = target_id
+        save_watermarks()
+    return _seen_watermarks.get(ch_key)
+
+
+def format_unseen_delta_context(
+    channel_id: int | str,
+    exclude_msg_id: int | None = None,
+    max_chars: int = 4000,
+) -> str:
+    """Format only messages posted in channel_id AFTER the last seen watermark.
+
+    On first boot (no watermark recorded yet for channel_id), safely initializes the
+    watermark without dumping pre-existing history and returns "".
+    """
+    ch_key = str(channel_id)
+    if ch_key not in _history_store and not _history_store:
+        load_history()
+
+    msgs = list(_history_store.get(ch_key, []))
+    excl_id = _coerce_int_id(exclude_msg_id)
+    wm = _seen_watermarks.get(ch_key)
+
+    if wm is None:
+        # First boot / uninitialized channel: anchor watermark to current history without dumping old backlog
+        candidate_ids = [
+            cid
+            for m in msgs
+            if (cid := _coerce_int_id(m.get("id"))) is not None and (excl_id is None or cid != excl_id)
+        ]
+        init_id = max(candidate_ids) if candidate_ids else excl_id
+        if init_id is not None:
+            mark_channel_seen(ch_key, msg_id=init_id)
+        return ""
+
+    # Locate watermark position in deque to support None or non-monotonic IDs after watermark
+    wm_idx = None
+    for idx, m in enumerate(msgs):
+        if _coerce_int_id(m.get("id")) == wm:
+            wm_idx = idx
+
+    if wm_idx is not None:
+        after_wm = msgs[wm_idx + 1:]
+    else:
+        after_wm = [
+            m for m in msgs
+            if (cid := _coerce_int_id(m.get("id"))) is not None and cid > wm
+        ]
+
+    if excl_id is not None:
+        unseen = [m for m in after_wm if _coerce_int_id(m.get("id")) != excl_id]
+    else:
+        unseen = after_wm
+
+    if not unseen:
+        return ""
+
+    ch_name = unseen[-1].get("channel_name") or (msgs[-1].get("channel_name", "") if msgs else "")
+    ch_label = ch_name or ch_key
+    footer = "--- END UNSEEN CHANNEL MESSAGES ---"
+    sample_header = f"--- UNSEEN CHANNEL MESSAGES SINCE LAST TURN (#{ch_label}, {len(unseen)} messages, PT timezone) ---"
+    wrapper_overhead = len(sample_header) + len(footer) + 2
+    line_budget = max_chars - wrapper_overhead if max_chars > wrapper_overhead + 40 else max_chars
+
+    lines = []
+    total_len = 0
+    # Walk newest to oldest to enforce max_chars budget, then reverse
+    for m in reversed(unseen):
+        line = _format_message_line(m, context_msgs=msgs)
+        sep_len = 1 if lines else 0
+        if total_len + sep_len + len(line) > line_budget:
+            if not lines and line_budget > 20:
+                lines.append(line[: line_budget - 15] + "... [truncated]")
+            break
+        lines.append(line)
+        total_len += sep_len + len(line)
+
+    if not lines:
+        return ""
+
+    lines.reverse()
+    header = f"--- UNSEEN CHANNEL MESSAGES SINCE LAST TURN (#{ch_label}, {len(lines)} messages, PT timezone) ---"
+    return f"{header}\n" + "\n".join(lines) + f"\n{footer}"
+
+
 # Initialize on module import
 load_history()
+load_watermarks()
