@@ -1,3 +1,4 @@
+# ruff: noqa: ASYNC230, B023, BLE001, I001, PIE810, PLW0602, RUF013, S110, SIM102, SIM117, UP041
 """
 Zero Discord Bridge - Discord Event Handlers, Routing & Dispatcher Module
 Encapsulates all Discord bot event listeners (on_ready, on_message, on_interaction),
@@ -689,8 +690,8 @@ async def handle_on_ready(
     # Ensure Persistent MCP Daemon is active
     try:
         from tools.mcp_daemon import ensure_mcp_daemon_running, get_status
-        ensure_mcp_daemon_running()
-        mcp_status = get_status()
+        await asyncio.to_thread(ensure_mcp_daemon_running)
+        mcp_status = await asyncio.to_thread(get_status)
         print(f"[Antigravity] Persistent MCP Daemon active (PID: {mcp_status.get('pid')}, healthy: {mcp_status.get('healthy')}).")
     except Exception as me:
         print(f"[Bridge] Warning initializing MCP daemon: {me}")
@@ -698,8 +699,8 @@ async def handle_on_ready(
     # Ensure Inbound Email Listener Daemon is active
     try:
         from tools.zero_mail_listener import ensure_mail_listener_running, get_status as get_mail_status
-        ensure_mail_listener_running()
-        mail_status = get_mail_status()
+        await asyncio.to_thread(ensure_mail_listener_running)
+        mail_status = await asyncio.to_thread(get_mail_status)
         print(f"[Antigravity] Inbound Email Listener active (PID: {mail_status.get('pid')}, target: {mail_status.get('target')}).")
     except Exception as mle:
         print(f"[Bridge] Warning initializing email listener: {mle}")
@@ -707,8 +708,8 @@ async def handle_on_ready(
     # Ensure Amazon Order Listener Daemon is active
     try:
         from tools.amazon_order_listener import ensure_amazon_listener_running, get_status as get_amazon_status
-        ensure_amazon_listener_running()
-        amazon_status = get_amazon_status()
+        await asyncio.to_thread(ensure_amazon_listener_running)
+        amazon_status = await asyncio.to_thread(get_amazon_status)
         print(f"[Antigravity] Amazon Order Listener active (PID: {amazon_status.get('pid')}).")
     except Exception as aoe:
         print(f"[Bridge] Warning initializing Amazon order listener: {aoe}")
@@ -716,8 +717,8 @@ async def handle_on_ready(
     # Ensure Zero Health Check HTTP Server is active (for zero.brock.ventures)
     try:
         from tools.zero_health_server import ensure_health_server_running, get_status as get_health_status
-        ensure_health_server_running()
-        health_status = get_health_status()
+        await asyncio.to_thread(ensure_health_server_running)
+        health_status = await asyncio.to_thread(get_health_status)
         print(f"[Antigravity] Zero Health Server active (PID: {health_status.get('pid')}, port: {health_status.get('port')}).")
     except Exception as hse:
         print(f"[Bridge] Warning initializing health server: {hse}")
@@ -725,8 +726,8 @@ async def handle_on_ready(
     # Ensure Banana Watcher Daemon is running in #the-banana-stand
     try:
         from tools.banana_watcher import ensure_banana_watcher_running, get_daemon_status as get_bw_status
-        ensure_banana_watcher_running()
-        bw_status = get_bw_status()
+        await asyncio.to_thread(ensure_banana_watcher_running)
+        bw_status = await asyncio.to_thread(get_bw_status)
         print(f"[Antigravity] Banana Watcher active (PID: {bw_status.get('pid')}).")
     except Exception as bwe:
         print(f"[Bridge] Warning initializing Banana Watcher: {bwe}")
@@ -734,7 +735,7 @@ async def handle_on_ready(
     # Reconcile FORGE worktrees and interrupted chunks on boot
     try:
         from tools.forge import reconcile_forge_on_boot
-        forge_rec = reconcile_forge_on_boot()
+        forge_rec = await asyncio.to_thread(reconcile_forge_on_boot)
         print(f"[Antigravity] FORGE boot reconciliation complete: {forge_rec}")
     except Exception as fre:
         print(f"[Bridge] Warning during FORGE boot reconciliation: {fre}")
@@ -992,7 +993,7 @@ async def handle_message(
         return
 
     msg_type = getattr(msg, "type", None)
-    if msg_type is not None and msg_type not in (discord.MessageType.default, discord.MessageType.reply):
+    if isinstance(msg_type, discord.MessageType) and msg_type not in (discord.MessageType.default, discord.MessageType.reply):
         return
 
     # Dedicated Excluded Channel Quarantine (e.g. #baseball dedicated exclusively to Ivy):

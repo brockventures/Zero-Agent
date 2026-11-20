@@ -1,3 +1,4 @@
+# ruff: noqa: BLE001, I001, RUF051, S110, SIM102, SIM114, UP035, UP041, UP045
 """
 bridge_engine.py — Shared Execution Engine & Turn Coordination Core for Zero Discord Bridge.
 
@@ -287,6 +288,7 @@ class TurnCoordinator:
             channel_active_reply_targets[self.channel_id] = self.reply_target
         self._heartbeat_tracker: Any = None
         self._last_heartbeat_poll: float = 0.0
+        self._last_loop_check_ts: float = 0.0
 
     def refresh_activity_lease(self, proc_pid: Optional[int] = None) -> bool:
         """Poll 4-signal ground-truth heartbeats (child PIDs, SDK task logs, subagent transcripts).
@@ -497,8 +499,10 @@ class TurnCoordinator:
         is_step_idle = idle_elapsed >= step_idle_timeout and not has_active_children
         is_turn_timeout = idle_elapsed >= turn_timeout_seconds and not has_active_children
 
-        # Runaway tool loop check (3 identical failing tool calls in a row)
-        if self.conv_id and (now - self.turn_start_time) >= 15.0:
+        # Runaway tool loop check (3 identical failing tool calls in a row), throttled to once per 5s
+        last_loop_check = getattr(self, "_last_loop_check_ts", 0.0)
+        if self.conv_id and (now - self.turn_start_time) >= 15.0 and (now - last_loop_check) >= 5.0:
+            self._last_loop_check_ts = now
             try:
                 from tools.forge import check_runaway_tool_loop
                 is_loop, loop_reason = check_runaway_tool_loop(self.conv_id)
@@ -540,6 +544,9 @@ class TurnCoordinator:
 
         Returns: (is_cutoff_reached, trigger_label)
         """
+        if self.result_received_at is None and self.agent_response_done_at is None:
+            return False, ""
+
         now = time.time()
 
         # If there are active background tasks pending in this turn, or transcript turn is not yet complete, hold execution open

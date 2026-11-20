@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001, FURB122, SIM117
 """
 Unit test suite for bridge_runner.py (Process Execution & PTY Engine).
 """
@@ -363,6 +364,85 @@ class TestBridgeRunner(unittest.TestCase):
         )
 
         self.assertNotIn(target_ch_id, br.channel_active_reply_targets)
+
+    def test_execute_agy_turn_offloads_select_and_watchdogs_to_thread(self):
+        """Verify select.select, evaluate_completion_cutoffs, probe_process_wedge, and check_watchdog_timeout use asyncio.to_thread."""
+        import contextlib
+
+        orig_to_thread = asyncio.to_thread
+        offloaded_funcs = []
+
+        async def spy_to_thread(func, *args, **kwargs):
+            offloaded_funcs.append(func)
+            return await orig_to_thread(func, *args, **kwargs)
+
+        mock_proc = MagicMock()
+        mock_proc.pid = 42424
+        mock_proc.returncode = None
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        mock_reply = MagicMock()
+        mock_reply.reference = None
+        mock_reply.channel = MagicMock()
+        mock_reply.channel.name = "zero-ops"
+
+        read_payloads = iter([
+            b'{"event":"result","result":{"conversation_id":"conv-offload-1","status":"SUCCESS","response":"All offloaded"}}\n',
+            b"",
+        ])
+
+        def fake_select(rlist, wlist, xlist, timeout=None):
+            return (rlist, [], [])
+
+        def fake_read(fd, n):
+            return next(read_payloads, b"")
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("tools.bridge_daemons.daemon_manager.is_dedicated_channel", return_value=False))
+            stack.enter_context(patch("tools.bridge_runner.sync_credentials"))
+            stack.enter_context(patch("tools.bridge_runner.get_runtime_rules", return_value={"live_status_ticker_enabled": False}))
+            stack.enter_context(patch("tools.bridge_runner.get_channel_session_id", return_value="conv-offload-1"))
+            stack.enter_context(patch("tools.bridge_runner.set_channel_session_id"))
+            stack.enter_context(patch("tools.bridge_runner.increment_session_turn", return_value=1))
+            stack.enter_context(patch("tools.bridge_runner.check_compaction_needed", return_value=(False, None)))
+            stack.enter_context(patch("tools.bridge_runner.prepare_turn_prompt", return_value="hello"))
+            stack.enter_context(patch("tools.bridge_runner.get_active_model", return_value=None))
+            stack.enter_context(patch("tools.bridge_runner.update_beacon"))
+            stack.enter_context(patch("tools.bridge_runner.register_active_presence", return_value="Working..."))
+            stack.enter_context(patch("tools.bridge_runner.record_in_flight"))
+            stack.enter_context(patch("tools.bridge_runner.pty.openpty", return_value=(101, 102)))
+            stack.enter_context(patch("tools.bridge_runner.os.close"))
+            stack.enter_context(patch("tools.bridge_runner.os.read", side_effect=fake_read))
+            mock_select = stack.enter_context(patch("tools.bridge_runner.select.select", side_effect=fake_select))
+            stack.enter_context(patch("tools.bridge_runner.asyncio.create_subprocess_exec", new=AsyncMock(return_value=mock_proc)))
+            stack.enter_context(patch("tools.bridge_runner.kill_process_tree"))
+            mock_deliver = stack.enter_context(patch("tools.bridge_runner.deliver_turn_output", new=AsyncMock()))
+            mock_cutoffs = stack.enter_context(patch("tools.bridge_runner.TurnCoordinator.evaluate_completion_cutoffs", return_value=(False, "")))
+            mock_wedge = stack.enter_context(patch("tools.bridge_runner.TurnCoordinator.probe_process_wedge", return_value=False))
+            mock_watchdog = stack.enter_context(patch("tools.bridge_runner.TurnCoordinator.check_watchdog_timeout", return_value=(False, "")))
+            stack.enter_context(patch("tools.bridge_runner.TurnCoordinator.teardown"))
+            stack.enter_context(patch("tools.bridge_runner.asyncio.to_thread", side_effect=spy_to_thread))
+
+            asyncio.run(
+                br.execute_agy_turn(
+                    prompt="Hello",
+                    status_msg=None,
+                    reply_target=mock_reply,
+                    attachments=[],
+                    mode="home",
+                    channel_id=1544953279664889888,
+                )
+            )
+
+        mock_deliver.assert_awaited_once()
+        mock_cutoffs.assert_called()
+        mock_wedge.assert_called()
+        mock_watchdog.assert_called()
+        self.assertIn(mock_select, offloaded_funcs)
+        self.assertGreaterEqual(offloaded_funcs.count(mock_select), 2)
+        self.assertIn(mock_cutoffs, offloaded_funcs)
+        self.assertIn(mock_wedge, offloaded_funcs)
+        self.assertIn(mock_watchdog, offloaded_funcs)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: ASYNC230, EXE001, F401, F811, F841, FURB167, I001, UP017
 """
 Unit test suite for bridge_handlers.py (Discord Bot Event Handlers, Routing & Dispatch).
 """
@@ -15,8 +16,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-WORKSPACE = Path("/workspace")
+WORKSPACE = Path(__file__).resolve().parent.parent
 if str(WORKSPACE) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE))
+elif sys.path[0] != str(WORKSPACE):
+    sys.path.remove(str(WORKSPACE))
     sys.path.insert(0, str(WORKSPACE))
 
 import signal
@@ -29,6 +33,21 @@ import tools.bridge_runner as br
 class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
+        p_vulcan_bs = patch("tools.bridge_state.is_vulcan_agent", return_value=False)
+        p_vulcan_bs.start()
+        self.addCleanup(p_vulcan_bs.stop)
+        p_vulcan_bh = patch("tools.bridge_handlers.is_vulcan_agent", return_value=False)
+        p_vulcan_bh.start()
+        self.addCleanup(p_vulcan_bh.stop)
+        p_forge_busy = patch("tools.forge.has_active_forge_builds", return_value=[])
+        p_forge_busy.start()
+        self.addCleanup(p_forge_busy.stop)
+        br.active_proc = None
+        br.ext_active_proc = None
+        bh.channel_active_tasks.clear()
+        bh.channel_queues.clear()
+        if hasattr(br, "channel_active_procs"):
+            br.channel_active_procs.clear()
         self.temp_dir = tempfile.mkdtemp()
         self.temp_path = Path(self.temp_dir)
         self.orig_data_dir = bs.DATA_DIR
@@ -141,11 +160,11 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
 
     async def test_robot_tag_addressing(self):
         # Verify classifier recognizes @robot and role tag
-        from tools.classifier import ZERO_TAGS
+        from tools.classifier import ZERO_TAGS, contains_robot_mention
         import re
-        self.assertTrue(any(re.search(p, "hey @robot can you check this?", re.I) for p in ZERO_TAGS))
+        self.assertTrue(contains_robot_mention("hey @robot can you check this?"))
         self.assertTrue(any(re.search(p, "hey <@&1542294519914037341> what is up?", re.I) for p in ZERO_TAGS))
-        self.assertTrue(any(re.search(p, "@robot status report", re.I) for p in ZERO_TAGS))
+        self.assertTrue(contains_robot_mention("@robot status report"))
 
         # Verify message routing treats @robot and role tag as addressed
         mock_bot = MagicMock()
@@ -195,10 +214,10 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
 
     async def test_zero_tag_no_false_positives(self):
         """Verify that common English usages like 'zero wrapping' do not trigger Zero mentions."""
-        from tools.classifier import ZERO_TAGS
+        from tools.classifier import ZERO_TAGS, contains_zero_mention
         import re
 
-        # Common English phrases that should NOT match ZERO_TAGS
+        # Common English phrases that should NOT match ZERO_TAGS or contains_zero_mention
         false_positive_phrases = [
             "single line with zero wrapping or vertical clipping",
             "zero layout shift (CLS = 0)",
@@ -208,8 +227,8 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         ]
         for phrase in false_positive_phrases:
             self.assertFalse(
-                any(re.search(p, phrase, re.I) for p in ZERO_TAGS),
-                f"Phrase '{phrase}' incorrectly matched ZERO_TAGS"
+                contains_zero_mention(phrase) or any(re.search(p, phrase, re.I) for p in ZERO_TAGS),
+                f"Phrase '{phrase}' incorrectly matched Zero mention"
             )
 
         # Legitimate mentions that SHOULD match
@@ -223,8 +242,8 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         ]
         for phrase in legit_mentions:
             self.assertTrue(
-                any(re.search(p, phrase, re.I) for p in ZERO_TAGS),
-                f"Legit mention '{phrase}' failed to match ZERO_TAGS"
+                contains_zero_mention(phrase) or any(re.search(p, phrase, re.I) for p in ZERO_TAGS),
+                f"Legit mention '{phrase}' failed to match Zero mention"
             )
 
     async def test_lazy_typer_minimal_role_mention(self):
@@ -1760,7 +1779,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
 
     async def test_detect_recent_container_oom_and_on_ready_prompt(self):
         """Verify that handle_on_ready detects recent container OOM events and labels startup reason accurately."""
-        now_iso = time.strftime("%Y-%m-%dT%H:%M:%S-07:00", time.localtime())
+        now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
         sample_log = (
             f"{now_iso} AppHost02 kernel: [1465143.304953] oom-kill:constraint=CONSTRAINT_MEMCG,"
             "cpuset=cef027e8ab10b9e28d9a5ad150dc83273b000a1d1ea556e4c9980450e7ce9630,task=python3,pid=63486,uid=0\n"
@@ -1801,6 +1820,60 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         queued_prompt = turn_queue.put.call_args[0][0]["prompt"]
         self.assertIn("(Unplanned Container OOM Restart)", queued_prompt)
         self.assertIn("OOM killer terminated `python3`", queued_prompt)
+
+    async def test_handle_on_ready_offloads_daemons_and_reconcile_to_thread(self):
+        """Verify handle_on_ready offloads synchronous daemon ensure/status checks and reconcile_forge_on_boot via asyncio.to_thread."""
+        bh.has_notified_ready = False
+        if bs.RESTART_INTENT_FILE.exists():
+            bs.RESTART_INTENT_FILE.unlink()
+
+        orig_to_thread = asyncio.to_thread
+        offloaded_funcs = []
+
+        async def spy_to_thread(func, *args, **kwargs):
+            offloaded_funcs.append(func)
+            return await orig_to_thread(func, *args, **kwargs)
+
+        mock_channel = MagicMock()
+        mock_bot = MagicMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        with patch("tools.mcp_daemon.ensure_mcp_daemon_running") as m_mcp_ens, \
+             patch("tools.mcp_daemon.get_status", return_value={"pid": 1, "healthy": True}) as m_mcp_st, \
+             patch("tools.zero_mail_listener.ensure_mail_listener_running") as m_mail_ens, \
+             patch("tools.zero_mail_listener.get_status", return_value={"pid": 2, "target": "test"}) as m_mail_st, \
+             patch("tools.amazon_order_listener.ensure_amazon_listener_running") as m_amz_ens, \
+             patch("tools.amazon_order_listener.get_status", return_value={"pid": 3}) as m_amz_st, \
+             patch("tools.zero_health_server.ensure_health_server_running") as m_hlth_ens, \
+             patch("tools.zero_health_server.get_status", return_value={"pid": 4, "port": 8080}) as m_hlth_st, \
+             patch("tools.banana_watcher.ensure_banana_watcher_running") as m_bw_ens, \
+             patch("tools.banana_watcher.get_daemon_status", return_value={"pid": 5}) as m_bw_st, \
+             patch("tools.forge.reconcile_forge_on_boot", return_value={}) as m_forge_rec, \
+             patch("tools.bridge_daemons.warmup_persistent_daemons", new_callable=AsyncMock), \
+             patch("tools.bridge_handlers.detect_recent_container_oom", return_value=None), \
+             patch("tools.bridge_handlers.asyncio.to_thread", side_effect=spy_to_thread):
+            await bh.handle_on_ready(
+                mock_bot,
+                turn_queue=AsyncMock(),
+                ext_turn_queue=AsyncMock(),
+                start_workers_fn=MagicMock(),
+                start_scheduler_fn=AsyncMock(),
+            )
+
+        for expected_fn in (
+            m_mcp_ens,
+            m_mcp_st,
+            m_mail_ens,
+            m_mail_st,
+            m_amz_ens,
+            m_amz_st,
+            m_hlth_ens,
+            m_hlth_st,
+            m_bw_ens,
+            m_bw_st,
+            m_forge_rec,
+        ):
+            self.assertIn(expected_fn, offloaded_funcs)
 
 
 if __name__ == "__main__":

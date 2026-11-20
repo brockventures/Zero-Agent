@@ -355,10 +355,16 @@ async def execute_agy_turn(
             line_buffer = ""
 
             while True:
-                r, _, _ = select.select([master_fd], [], [], 0.1)
+                r, _, _ = await asyncio.to_thread(select.select, [master_fd], [], [], 0.1)
 
                 # Post-result & completion drain cutoff
-                is_cutoff, trigger_label = coord.evaluate_completion_cutoffs(agent_done_window=agent_done_window)
+                if coord.result_received_at is not None or coord.agent_response_done_at is not None:
+                    is_cutoff, trigger_label = await asyncio.to_thread(
+                        coord.evaluate_completion_cutoffs,
+                        agent_done_window=agent_done_window,
+                    )
+                else:
+                    is_cutoff, trigger_label = False, ""
                 if is_cutoff:
                     print(f"[BridgeRunner] ⏱️ {trigger_label} cutoff reached, but PTY held open (PID {proc.pid}). Terminating to drain output...")
                     kill_process_tree(proc, signal.SIGTERM)
@@ -373,7 +379,11 @@ async def execute_agy_turn(
                     break
 
                 # Early wedge detection: If process tree has been completely silent for >= 45s, probe kernel wait states
-                if coord.probe_process_wedge(proc.pid, output_snippet="".join(output_chunks[-5:])):
+                if await asyncio.to_thread(
+                    coord.probe_process_wedge,
+                    proc.pid,
+                    output_snippet="".join(output_chunks[-5:]),
+                ):
                     timed_out = True
                     kill_process_tree(proc, signal.SIGTERM)
                     try:
@@ -387,7 +397,8 @@ async def execute_agy_turn(
                     break
 
                 # Bridge-level turn watchdog: enforces activity-renewed progress lease
-                is_timeout, reason = coord.check_watchdog_timeout(
+                is_timeout, reason = await asyncio.to_thread(
+                    coord.check_watchdog_timeout,
                     step_idle_timeout=step_idle_timeout,
                     turn_timeout_seconds=turn_timeout_seconds,
                     max_turn_ceiling=max_turn_ceiling,

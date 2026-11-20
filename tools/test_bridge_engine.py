@@ -1,3 +1,4 @@
+# ruff: noqa: I001
 """
 test_bridge_engine.py — Unit tests for TurnCoordinator & unified bridge execution engine.
 """
@@ -19,6 +20,9 @@ from tools.bridge_engine import TurnCoordinator
 
 class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        p_vulcan = patch("tools.bridge_state.is_vulcan_agent", return_value=False)
+        p_vulcan.start()
+        self.addCleanup(p_vulcan.stop)
         self.reply_target = MagicMock()
         self.coordinator = TurnCoordinator(
             channel_id=1542081375287640084,
@@ -116,6 +120,63 @@ class TestBridgeEngine(unittest.IsolatedAsyncioTestCase):
             cutoff, label = self.coordinator.evaluate_completion_cutoffs(agent_done_window=15.0)
             self.assertFalse(cutoff)
             self.assertEqual(label, "")
+
+    def test_evaluate_completion_cutoffs_skips_disk_when_no_completion_timestamps(self):
+        """Mid-turn ticks without result_received_at or agent_response_done_at must perform zero disk I/O."""
+        self.coordinator.result_received_at = None
+        self.coordinator.agent_response_done_at = None
+        self.coordinator.conv_id = "conv-mid-turn"
+
+        with patch("tools.task_settle.get_turn_pending_tasks") as mock_pending, \
+             patch("tools.bridge_engine.check_transcript_turn_status") as mock_status:
+            cutoff, label = self.coordinator.evaluate_completion_cutoffs(agent_done_window=15.0)
+
+        self.assertFalse(cutoff)
+        self.assertEqual(label, "")
+        mock_pending.assert_not_called()
+        mock_status.assert_not_called()
+
+    def test_check_watchdog_timeout_throttles_runaway_tool_loop(self):
+        """Runaway tool loop transcript check must be throttled to at most once every 5 seconds."""
+        self.coordinator.conv_id = "conv-loop-throttle"
+        self.coordinator.turn_start_time = 100.0
+        self.coordinator.last_activity_time = 119.0
+        self.coordinator._last_loop_check_ts = 0.0
+
+        fake_now = [120.0]
+        with patch("tools.bridge_engine.time.time", side_effect=lambda: fake_now[0]), \
+             patch.object(self.coordinator, "refresh_activity_lease", return_value=False), \
+             patch("tools.forge.check_runaway_tool_loop", return_value=(False, "")) as mock_loop:
+            # First check at +20s into turn -> runs check_runaway_tool_loop
+            timed_out, _ = self.coordinator.check_watchdog_timeout(
+                step_idle_timeout=90.0, turn_timeout_seconds=300.0, max_turn_ceiling=0.0
+            )
+            self.assertFalse(timed_out)
+            self.assertEqual(mock_loop.call_count, 1)
+
+            # 0.5s later (< 5.0s) -> throttled
+            fake_now[0] = 120.5
+            self.coordinator.last_activity_time = 120.0
+            self.coordinator.check_watchdog_timeout(
+                step_idle_timeout=90.0, turn_timeout_seconds=300.0, max_turn_ceiling=0.0
+            )
+            self.assertEqual(mock_loop.call_count, 1)
+
+            # 4.9s after first check (< 5.0s) -> still throttled
+            fake_now[0] = 124.9
+            self.coordinator.last_activity_time = 124.0
+            self.coordinator.check_watchdog_timeout(
+                step_idle_timeout=90.0, turn_timeout_seconds=300.0, max_turn_ceiling=0.0
+            )
+            self.assertEqual(mock_loop.call_count, 1)
+
+            # 5.1s after first check (>= 5.0s) -> runs again
+            fake_now[0] = 125.1
+            self.coordinator.last_activity_time = 125.0
+            self.coordinator.check_watchdog_timeout(
+                step_idle_timeout=90.0, turn_timeout_seconds=300.0, max_turn_ceiling=0.0
+            )
+            self.assertEqual(mock_loop.call_count, 2)
 
     def test_process_stream_events(self):
         # 1. init event
