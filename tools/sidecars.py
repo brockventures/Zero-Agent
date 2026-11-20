@@ -2038,6 +2038,15 @@ def run_pid_watchdog(force: bool = False, test: bool = False) -> tuple[bool, str
     except Exception as e:
         return False, f"⚠️ PID watchdog execution failed: {e}", {"error": str(e)}
 
+
+def run_orcaslicer_idle_reaper(force: bool = False, test: bool = False) -> tuple[bool, str, dict]:
+    """Evaluate OrcaSlicer idle state on Host 2 and stop cleanly after 30m inactivity."""
+    try:
+        from tools.orcaslicer_idle_reaper import evaluate_and_reap
+        return evaluate_and_reap(dry_run=test)
+    except Exception as e:
+        return False, f"⚠️ OrcaSlicer idle reaper execution failed: {e}", {"error": str(e)}
+
 # --------------------------------------------------------------------------
 # CLI Dispatcher
 # --------------------------------------------------------------------------
@@ -2916,6 +2925,18 @@ if __name__ == "__main__":
         force = "--force" in sys.argv or "-f" in sys.argv
         test = "--test" in sys.argv or "-t" in sys.argv
         ok, rep, _ = run_sidecar_job("pid_watchdog", "PID & Process Headroom Watchdog", run_pid_watchdog, force=force, test=test)
+        if rep:
+            print(rep)
+    elif action in ("orcaslicer_idle", "orcaslicer_reaper"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv or "--dry-run" in sys.argv
+        ok, rep, _ = run_sidecar_job(
+            "orcaslicer_idle_reaper",
+            "OrcaSlicer 30-Minute Idle Auto-Stop",
+            run_orcaslicer_idle_reaper,
+            force=force,
+            test=test,
+        )
         if rep:
             print(rep)
     elif action in ("plex_weekly_digest", "plex_digest"):
