@@ -229,6 +229,8 @@ INTERNAL_SYSTEM_MAINTENANCE_NAMES = {
     "plex_audiobook_enricher",
     "Seerr Media Request Card Sync",
     "seerr_card_sync",
+    "OrcaSlicer 30-Minute Idle Auto-Stop",
+    "orcaslicer_idle_reaper",
 }
 
 INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
@@ -249,6 +251,7 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "resident_agents_daily_tip",
     "plex_audiobook_enricher",
     "seerr_card_sync",
+    "orcaslicer_idle_reaper",
 }
 
 
@@ -1132,6 +1135,26 @@ async def dispatch_scheduled_prompt(
                 print("[Scheduler] Bridge watchdog checked: nominal (silent).")
         except Exception as e:
             print(f"[Scheduler] Bridge watchdog execution error: {e}")
+        return
+
+    # OrcaSlicer 30-Minute Idle Auto-Stop: silent unless container stopped or error
+    if job_id == "orcaslicer_idle_reaper" or "orcaslicer_idle" in prompt or job_name in ("OrcaSlicer 30-Minute Idle Auto-Stop", "orcaslicer_idle_reaper"):
+        try:
+            from tools.sidecars import run_orcaslicer_idle_reaper
+            ok, out, meta = await _run_sidecar_job_async(
+                "orcaslicer_idle_reaper",
+                "OrcaSlicer 30-Minute Idle Auto-Stop",
+                run_orcaslicer_idle_reaper,
+            )
+            stopped = isinstance(meta, dict) and bool(meta.get("stopped") or meta.get("action") == "stopped")
+            if (not ok or stopped) and out and out.strip() and bot:
+                ch = await get_dest_channel(channel_id or HOMELAB_CHANNEL_ID)
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] OrcaSlicer idle reaper checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] OrcaSlicer idle reaper execution error: {e}")
         return
 
     # Plex Weekly New Media Digest

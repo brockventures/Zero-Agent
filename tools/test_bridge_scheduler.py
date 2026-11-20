@@ -1452,6 +1452,79 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             nxt = calculate_next_run(job, from_ts=ts_0800)
             self.assertEqual(nxt, expected)
 
+    def test_orcaslicer_idle_reaper_registered_in_maintenance_sets(self):
+        """Verify orcaslicer_idle_reaper is registered in maintenance job/name sets."""
+        self.assertIn("orcaslicer_idle_reaper", bshed.INTERNAL_SYSTEM_MAINTENANCE_JOBS)
+        self.assertIn("orcaslicer_idle_reaper", bshed.INTERNAL_SYSTEM_MAINTENANCE_NAMES)
+        self.assertIn("OrcaSlicer 30-Minute Idle Auto-Stop", bshed.INTERNAL_SYSTEM_MAINTENANCE_NAMES)
+
+    async def test_orcaslicer_idle_reaper_silent_when_nominal(self):
+        """Verify orcaslicer_idle_reaper stays silent with zero LLM turn when nominal."""
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_channel = AsyncMock()
+        mock_bot.get_channel.return_value = mock_channel
+        mock_bot.fetch_channel = AsyncMock(return_value=mock_channel)
+        mock_turn_queue = AsyncMock()
+
+        with patch("tools.sidecars.run_orcaslicer_idle_reaper", return_value=(True, "", {"action": "idle_waiting"})) as mock_reaper, \
+             patch("tools.sidecars.log_execution"):
+            await bshed.dispatch_scheduled_prompt(
+                "Run OrcaSlicer idle reaper via /workspace/tools/sidecars.py orcaslicer_idle",
+                job_name="OrcaSlicer 30-Minute Idle Auto-Stop",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue,
+                job_id="orcaslicer_idle_reaper",
+            )
+            mock_reaper.assert_called_once_with()
+            mock_channel.send.assert_not_called()
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_orcaslicer_idle_reaper_alerts_homelab_when_stopped(self):
+        """Verify orcaslicer_idle_reaper posts to #homelab when container is stopped."""
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_homelab = AsyncMock()
+        mock_bot.get_channel.side_effect = lambda cid: mock_homelab if cid == bs.HOMELAB_CHANNEL_ID else None
+        mock_turn_queue = AsyncMock()
+
+        msg = "Stopped idle OrcaSlicer container after 30m inactivity."
+        with patch("tools.sidecars.run_orcaslicer_idle_reaper", return_value=(True, msg, {"action": "stopped"})) as mock_reaper, \
+             patch("tools.sidecars.log_execution"):
+            await bshed.dispatch_scheduled_prompt(
+                "Run OrcaSlicer idle reaper via /workspace/tools/sidecars.py orcaslicer_idle",
+                job_name="OrcaSlicer 30-Minute Idle Auto-Stop",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue,
+                job_id="orcaslicer_idle_reaper",
+            )
+            mock_reaper.assert_called_once_with()
+            mock_bot.get_channel.assert_called_with(bs.HOMELAB_CHANNEL_ID)
+            mock_homelab.send.assert_awaited_once_with(msg)
+            mock_turn_queue.put.assert_not_called()
+
+    async def test_orcaslicer_idle_reaper_alerts_homelab_on_error(self):
+        """Verify orcaslicer_idle_reaper posts to #homelab without an LLM turn on error."""
+        bshed.LAST_SCHEDULED_DISPATCH.clear()
+        mock_bot = MagicMock()
+        mock_homelab = AsyncMock()
+        mock_bot.get_channel.side_effect = lambda cid: mock_homelab if cid == bs.HOMELAB_CHANNEL_ID else None
+        mock_turn_queue = AsyncMock()
+
+        err_msg = "⚠️ Failed to stop idle OrcaSlicer container: permission denied"
+        with patch("tools.sidecars.run_orcaslicer_idle_reaper", return_value=(False, err_msg, {"action": "stop_failed"})) as mock_reaper, \
+             patch("tools.sidecars.log_execution"):
+            await bshed.dispatch_scheduled_prompt(
+                "Check orcaslicer_idle status",
+                job_name="OrcaSlicer 30-Minute Idle Auto-Stop",
+                bot=mock_bot,
+                turn_queue=mock_turn_queue,
+            )
+            mock_reaper.assert_called_once_with()
+            mock_bot.get_channel.assert_called_with(bs.HOMELAB_CHANNEL_ID)
+            mock_homelab.send.assert_awaited_once_with(err_msg)
+            mock_turn_queue.put.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
