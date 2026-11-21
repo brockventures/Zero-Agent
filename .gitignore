@@ -120,7 +120,15 @@ agora-roguelike/
 sharkfin/
 tools/bin/
 android-gotchi-watch/
+android-ble-forwarder/
+backend/
+core/
+firmware/
+poc/
+internal/
+web/
 ember/
 gotchi/
 mirrormere/
+repos/
 assets/
