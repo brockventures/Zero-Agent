@@ -2446,27 +2446,50 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
     assert req is True
     assert any("Multi-chunk" in r for r in reasons)
 
-    # With approved=True
+    # With approved=True WITHOUT FORGE_APPROVED_CARD_EXECUTION=1 -> MUST NOT bypass
     plan_appr = dict(multi_chunk_plan, approved=True)
-    req_a, reasons_a = evaluate_plan_approval_gate(
-        plan_appr,
-        batch_state_path="/tmp/nonexistent.json",
-        in_flight_path=nonexistent_ifp,
-        db_path=db_p,
-    )
-    assert req_a is False
-    assert reasons_a == []
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FORGE_APPROVED_CARD_EXECUTION", None)
+        req_a_unpriv, reasons_a_unpriv = evaluate_plan_approval_gate(
+            plan_appr,
+            batch_state_path="/tmp/nonexistent.json",
+            in_flight_path=nonexistent_ifp,
+            db_path=db_p,
+        )
+        assert req_a_unpriv is True
+        assert any("Multi-chunk" in r for r in reasons_a_unpriv)
 
-    # With skip_approval=True
-    plan_skip = dict(multi_chunk_plan, skip_approval=True)
-    req_s, reasons_s = evaluate_plan_approval_gate(
-        plan_skip,
-        batch_state_path="/tmp/nonexistent.json",
-        in_flight_path=nonexistent_ifp,
-        db_path=db_p,
-    )
-    assert req_s is False
-    assert reasons_s == []
+        # With skip_approval=True WITHOUT FORGE_APPROVED_CARD_EXECUTION=1 -> MUST NOT bypass
+        plan_skip = dict(multi_chunk_plan, skip_approval=True)
+        req_s_unpriv, reasons_s_unpriv = evaluate_plan_approval_gate(
+            plan_skip,
+            batch_state_path="/tmp/nonexistent.json",
+            in_flight_path=nonexistent_ifp,
+            db_path=db_p,
+        )
+        assert req_s_unpriv is True
+        assert any("Multi-chunk" in r for r in reasons_s_unpriv)
+
+    # With FORGE_APPROVED_CARD_EXECUTION=1 -> approved=True and skip_approval=True bypass cleanly
+    with patch.dict(os.environ, {"FORGE_APPROVED_CARD_EXECUTION": "1"}):
+        req_a, reasons_a = evaluate_plan_approval_gate(
+            plan_appr,
+            batch_state_path="/tmp/nonexistent.json",
+            in_flight_path=nonexistent_ifp,
+            db_path=db_p,
+        )
+        assert req_a is False
+        assert reasons_a == []
+
+        plan_skip = dict(multi_chunk_plan, skip_approval=True)
+        req_s, reasons_s = evaluate_plan_approval_gate(
+            plan_skip,
+            batch_state_path="/tmp/nonexistent.json",
+            in_flight_path=nonexistent_ifp,
+            db_path=db_p,
+        )
+        assert req_s is False
+        assert reasons_s == []
 
     # 6. Explicit Approval Directives in in_flight_turn.json
     in_flight_file = tmp_path / "in_flight_turn.json"
@@ -2515,41 +2538,19 @@ def test_decision_card_native_embeds_and_explicit_approval_bypass(tmp_path):
     )
     assert req_non is True
 
-    # 7. CLI flag parsing and execution for forge.py enqueue (--approved and --skip-approval)
+    # 7. CLI flag parsing rejects removed self-approval flags (--approved and --skip-approval)
+    import pytest
+
     plan_file = tmp_path / "test_plan.json"
     plan_file.write_text(json.dumps(multi_chunk_plan), encoding="utf-8")
 
-    import argparse
-    parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    p_enq = sub.add_parser("enqueue")
-    p_enq.add_argument("plan_file")
-    p_enq.add_argument("--no-widget", action="store_true")
-    p_enq.add_argument("--allow-overlap", action="store_true")
-    p_enq.add_argument("--approved", action="store_true")
-    p_enq.add_argument("--skip-approval", action="store_true")
-
-    args_appr = parser.parse_args(["enqueue", str(plan_file), "--approved"])
-    assert args_appr.approved is True
-    args_skip = parser.parse_args(["enqueue", str(plan_file), "--skip-approval"])
-    assert args_skip.skip_approval is True
-
-    # Test CLI invocation through forge_mod.main()
-    with patch("sys.argv", ["forge.py", "enqueue", str(plan_file), "--approved"]), \
-         patch.object(forge_mod, "enqueue_build") as mock_enq:
-        mock_enq.return_value = {"ok": True, "build_id": "test-build-appr"}
-        forge_mod.main()
-        mock_enq.assert_called_once()
-        passed_plan = mock_enq.call_args[0][0]
-        assert passed_plan.get("approved") is True
-
-    with patch("sys.argv", ["forge.py", "enqueue", str(plan_file), "--skip-approval"]), \
-         patch.object(forge_mod, "enqueue_build") as mock_enq2:
-        mock_enq2.return_value = {"ok": True, "build_id": "test-build-skip"}
-        forge_mod.main()
-        mock_enq2.assert_called_once()
-        passed_plan2 = mock_enq2.call_args[0][0]
-        assert passed_plan2.get("approved") is True
+    for forbidden_flag in ("--approved", "--skip-approval"):
+        with patch("sys.argv", ["forge.py", "enqueue", str(plan_file), forbidden_flag]), \
+             patch.object(forge_mod, "enqueue_build") as mock_enq_bad:
+            with pytest.raises(SystemExit) as exc_info:
+                forge_mod.main()
+            assert exc_info.value.code == 2
+            mock_enq_bad.assert_not_called()
 
     # 8. Edited approved status formatting
     row_edited = {
@@ -4572,9 +4573,9 @@ def test_execute_approval_card_passes_forge_approved_card_execution_env(tmp_path
     d_compose = forge_mod.stage_decision(
         category="homelab",
         title="Compose Restart",
-        summary="Bring stack down.",
+        summary="Restart Mealie stack.",
         handler_type="docker_compose",
-        payload={"service": "mealie", "action": "down", "compose_dir": str(tmp_path)},
+        payload={"service": "mealie", "action": "restart", "compose_dir": str(tmp_path)},
         channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
         db_path=db_path,
     )
@@ -5201,6 +5202,222 @@ def test_check_runaway_tool_loop_tail_read_large_transcript(tmp_path):
 
     is_loop_after, _ = check_runaway_tool_loop(conv_id, brain_dir=brain_root, threshold=3)
     assert is_loop_after is False
+
+
+def test_stage_decision_uses_cryptographic_hex_ids_and_preserves_retry_bypass(tmp_path, monkeypatch):
+    import re
+    import tools.forge as forge_mod
+
+    db_path = tmp_path / "forge_sec_ids.db"
+    forge_mod.init_forge_db(db_path)
+
+    ids = set()
+    for i in range(10):
+        res = forge_mod.stage_decision(
+            category="homelab",
+            title=f"Action {i}",
+            summary="Verify random token_hex decision ID.",
+            handler_type="noop",
+            payload={"note": f"n{i}"},
+            channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+            db_path=db_path,
+        )
+        assert res["ok"] is True
+        did = res["decision_id"]
+        assert re.fullmatch(r"dec-[0-9a-f]{12}-homelab", did), f"Unexpected decision_id format: {did}"
+        ids.add(did)
+    assert len(ids) == 10
+
+    # Verify is_retry auto-start bypass is still preserved without FORGE_APPROVED_CARD_EXECUTION=1
+    monkeypatch.delenv("FORGE_APPROVED_CARD_EXECUTION", raising=False)
+    retry_plan = {
+        "title": "Retry Multi-Chunk Build",
+        "repo": "/workspace",
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "is_retry": True,
+        "chunks": [
+            {"title": "C1", "target_files": ["tools/a.py"], "instructions": "c1"},
+            {"title": "C2", "target_files": ["tools/b.py"], "instructions": "c2"},
+        ],
+    }
+    req_retry, reasons_retry = forge_mod.evaluate_plan_approval_gate(
+        retry_plan,
+        batch_state_path="/tmp/nonexistent.json",
+        in_flight_path=tmp_path / "missing.json",
+        db_path=db_path,
+    )
+    assert req_retry is False
+    assert reasons_retry == []
+
+
+def test_docker_compose_handler_rejects_shell_injection_and_uses_shell_false(tmp_path, monkeypatch):
+    import tools.forge as forge_mod
+
+    db_path = tmp_path / "forge_dc_sec.db"
+    forge_mod.init_forge_db(db_path)
+
+    calls = []
+
+    def _fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "ok"
+        m.stderr = ""
+        return m
+
+    monkeypatch.setattr(forge_mod.subprocess, "run", _fake_run)
+
+    # 1. Legitimate allowlisted actions execute via shell=False with explicit argv list
+    for action, expected_tokens in (
+        ("up", ["up"]),
+        ("up -d", ["up", "-d"]),
+        ("start", ["start"]),
+        ("stop", ["stop"]),
+        ("pull", ["pull"]),
+        ("restart", ["restart"]),
+    ):
+        d = forge_mod.stage_decision(
+            category="homelab",
+            title=f"Compose {action}",
+            summary="Safe compose action.",
+            handler_type="docker_compose",
+            payload={"service": "mealie_app-1.0", "action": action, "compose_dir": str(tmp_path)},
+            channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+            db_path=db_path,
+        )
+        res = forge_mod.execute_decision(d["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_path)
+        assert res["ok"] is True, f"Expected action '{action}' to succeed, got: {res}"
+        last_cmd, last_kwargs = calls[-1]
+        assert last_cmd == ["docker", "compose", *expected_tokens, "mealie_app-1.0"]
+        assert last_kwargs.get("shell") is False
+
+    # 2. Shell injection and disallowed actions / invalid service names are rejected without invoking subprocess
+    calls_before = len(calls)
+    malicious_payloads = [
+        {"service": "mealie; rm -rf /", "action": "restart", "compose_dir": str(tmp_path)},
+        {"service": "$(whoami)", "action": "up -d", "compose_dir": str(tmp_path)},
+        {"service": "mealie && cat /secrets/env.json", "action": "start", "compose_dir": str(tmp_path)},
+        {"service": "-f", "action": "restart", "compose_dir": str(tmp_path)},
+        {"service": "mealie", "action": "down", "compose_dir": str(tmp_path)},
+        {"service": "mealie", "action": "up -d; id", "compose_dir": str(tmp_path)},
+        {"service": "mealie", "action": "exec", "compose_dir": str(tmp_path)},
+    ]
+    for bad_payload in malicious_payloads:
+        d_bad = forge_mod.stage_decision(
+            category="homelab",
+            title="Malicious Compose",
+            summary="Must be rejected.",
+            handler_type="docker_compose",
+            payload=bad_payload,
+            channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+            db_path=db_path,
+        )
+        res_bad = forge_mod.execute_decision(d_bad["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_path)
+        assert res_bad["ok"] is False, f"Expected payload {bad_payload} to be rejected"
+        assert res_bad["status"] == "failed"
+    assert len(calls) == calls_before, "subprocess.run must never be invoked for rejected docker_compose payloads"
+
+
+def test_dismiss_decision_cas_guard_and_stale_executing_recovery(tmp_path):
+    import tools.forge as forge_mod
+
+    db_path = tmp_path / "forge_cas_sec.db"
+    forge_mod.init_forge_db(db_path)
+
+    # 1. Pending card can be dismissed once; second dismiss fails cleanly
+    d_pend = forge_mod.stage_decision(
+        category="ops",
+        title="Pending Card",
+        summary="Dismiss me.",
+        handler_type="noop",
+        payload={},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    r_dis1 = forge_mod.dismiss_decision(d_pend["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_path)
+    assert r_dis1["ok"] is True
+    assert r_dis1["status"] == "dismissed"
+
+    r_dis2 = forge_mod.dismiss_decision(d_pend["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_path)
+    assert r_dis2["ok"] is False
+    assert r_dis2["status"] == "dismissed"
+
+    # 2. Approved card CANNOT be overwritten by dismiss_decision
+    d_app = forge_mod.stage_decision(
+        category="ops",
+        title="Approved Card",
+        summary="Already approved.",
+        handler_type="noop",
+        payload={"note": "done"},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    r_exec = forge_mod.execute_decision(d_app["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_path)
+    assert r_exec["ok"] is True
+    assert r_exec["status"] == "approved"
+
+    r_dis_app = forge_mod.dismiss_decision(d_app["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_path)
+    assert r_dis_app["ok"] is False
+    assert r_dis_app["status"] == "approved"
+    with forge_mod.get_db_connection(db_path) as conn:
+        assert conn.execute("SELECT status FROM forge_decisions WHERE id = ?", (d_app["decision_id"],)).fetchone()["status"] == "approved"
+
+    # 3. Executing card CANNOT be overwritten by dismiss_decision
+    d_exec = forge_mod.stage_decision(
+        category="ops",
+        title="Executing Card",
+        summary="Currently executing.",
+        handler_type="noop",
+        payload={},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    now = time.time()
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE forge_decisions SET status = 'executing', executing_started_at = ? WHERE id = ?",
+            (now, d_exec["decision_id"]),
+        )
+    r_dis_exec = forge_mod.dismiss_decision(d_exec["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_path)
+    assert r_dis_exec["ok"] is False
+    assert r_dis_exec["status"] == "executing"
+
+    # 4. Fresh executing card (< 15 min) is NOT reaped, while stale executing card (> 15 min) IS recovered
+    d_stale = forge_mod.stage_decision(
+        category="ops",
+        title="Stale Executing Card",
+        summary="Stuck in executing.",
+        handler_type="noop",
+        payload={},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE forge_decisions SET status = 'executing', executing_started_at = ? WHERE id = ?",
+            (now - 1000.0, d_stale["decision_id"]),
+        )
+
+    expired_or_recovered = forge_mod.expire_stale_decisions(db_path=db_path)
+    assert d_stale["decision_id"] in expired_or_recovered
+    assert d_exec["decision_id"] not in expired_or_recovered
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        stale_row = conn.execute("SELECT status, receipt_text FROM forge_decisions WHERE id = ?", (d_stale["decision_id"],)).fetchone()
+        fresh_row = conn.execute("SELECT status FROM forge_decisions WHERE id = ?", (d_exec["decision_id"],)).fetchone()
+    assert stale_row["status"] == "failed"
+    assert "stale executing" in stale_row["receipt_text"].lower()
+    assert fresh_row["status"] == "executing"
+
+    # 5. Boot reconciliation also recovers stale executing decisions
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute(
+            "UPDATE forge_decisions SET status = 'executing', executing_started_at = ? WHERE id = ?",
+            (now - 1200.0, d_exec["decision_id"]),
+        )
+    reconcile_res = forge_mod.reconcile_forge_on_boot(db_path=db_path)
+    assert d_exec["decision_id"] in reconcile_res.get("recovered_decisions", [])
 
 
 if __name__ == "__main__":

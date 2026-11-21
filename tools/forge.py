@@ -31,6 +31,7 @@ import glob
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -1157,6 +1158,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
                 status TEXT NOT NULL DEFAULT 'pending',
                 expires_at REAL NOT NULL,
                 created_at REAL NOT NULL,
+                executing_started_at REAL,
                 resolved_at REAL,
                 receipt_text TEXT NOT NULL DEFAULT ''
             );
@@ -1203,6 +1205,7 @@ def init_forge_db(db_path: Path | str = FORGE_DB_PATH) -> None:
         _ensure_column(conn, "forge_chunks", "target_branch", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "forge_chunks", "tokens_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(conn, "forge_chunks", "total_tokens", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "forge_decisions", "executing_started_at", "REAL")
 
 
 # Initialize schema on import (tolerating broken symlinks or read-only mounts)
@@ -5032,7 +5035,7 @@ def evaluate_plan_approval_gate(
     Thresholds:
     - Auto-Execute Immediately (Fast Tier 2): 1 chunk, <=3 target files, touches_core_bridge=False, no >90s calibration pass.
     - Explicit Bypass:
-      1. plan['approved'] is True or plan['skip_approval'] is True.
+      1. plan['approved'] is True or plan['skip_approval'] is True ONLY when FORGE_APPROVED_CARD_EXECUTION=1.
       2. Plan is a retry: plan['is_retry'] is True or bool(str(plan.get('retry_of_build_id') or '').strip()).
       3. Active in-flight turn prompt contains '[FORGE BUILD FAILURE ENVELOPE' or matches an explicit approval directive.
       4. Recent failed build in forge_builds for the same origin_channel_id and repo updated within 7200s.
@@ -5042,7 +5045,10 @@ def evaluate_plan_approval_gate(
       3. Wide blast radius (>=4 distinct target files across chunks) or touches_core_bridge=True.
       4. Enqueued after a >90s calibration/analysis pass in the current turn.
     """
-    if plan.get("approved") is True or plan.get("skip_approval") is True:
+    if (
+        os.environ.get("FORGE_APPROVED_CARD_EXECUTION") == "1"
+        and (plan.get("approved") is True or plan.get("skip_approval") is True)
+    ):
         return False, []
 
     # Check for retry auto-start and explicit approval bypasses (unless plan explicitly requires approval)
@@ -7000,7 +7006,13 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
                 )
                 pruned_jobs += 1
 
-    return {"cleaned_worktrees": cleaned_wts, "reset_chunks": reset_chunks, "pruned_jobs": pruned_jobs}
+    recovered_decisions = recover_stale_executing_decisions(db_path=db_path)
+    return {
+        "cleaned_worktrees": cleaned_wts,
+        "reset_chunks": reset_chunks,
+        "pruned_jobs": pruned_jobs,
+        "recovered_decisions": recovered_decisions,
+    }
 
 
 MAX_PARALLEL_BUILDS_PER_AGENT = 3
@@ -9582,7 +9594,7 @@ def stage_decision(
     summary = _ensure_decision_action_clarity(summary, handler_type, payload)
     now = time.time()
     slug = re.sub(r"[^a-z0-9]+", "", category.lower())[:8] or "act"
-    decision_id = f"dec-{int(now * 1000) % 100000000}-{slug}"
+    decision_id = f"dec-{secrets.token_hex(6)}-{slug}"
 
     target_channel_id, orig_ch = _resolve_decision_channel(channel_id)
     if orig_ch is not None:
@@ -9855,6 +9867,18 @@ def _post_decision_card_rest(
     return None
 
 
+_DOCKER_COMPOSE_ALLOWED_ACTIONS: dict[str, list[str]] = {
+    "up": ["up"],
+    "up -d": ["up", "-d"],
+    "start": ["start"],
+    "stop": ["stop"],
+    "pull": ["pull"],
+    "restart": ["restart"],
+}
+_DOCKER_COMPOSE_SERVICE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+STALE_EXECUTING_DECISION_TIMEOUT_SECONDS = 900.0
+
+
 def execute_approval_card(
     decision_id: str,
     user_id: int = OWNER_USER_ID,
@@ -9865,6 +9889,7 @@ def execute_approval_card(
     if int(user_id) != OWNER_USER_ID:
         return {"ok": False, "error": "Unauthorized user ID."}
 
+    exec_start_ts = time.time()
     with get_db_connection(db_path) as conn:
         row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
         if not row:
@@ -9872,8 +9897,9 @@ def execute_approval_card(
         is_reload_card = row["handler_type"] == "bridge_reload"
         if is_reload_card and row["status"] in ("pending", "expired"):
             cur = conn.execute(
-                "UPDATE forge_decisions SET status = 'executing' WHERE id = ? AND status IN ('pending', 'expired')",
-                (decision_id,),
+                "UPDATE forge_decisions SET status = 'executing', executing_started_at = ? "
+                "WHERE id = ? AND status IN ('pending', 'expired')",
+                (exec_start_ts, decision_id),
             )
             if cur.rowcount == 0:
                 return {"ok": False, "error": f"Decision {decision_id} is already executing."}
@@ -9900,8 +9926,9 @@ def execute_approval_card(
                 }
 
             cur = conn.execute(
-                "UPDATE forge_decisions SET status = 'executing' WHERE id = ? AND status = 'pending'",
-                (decision_id,),
+                "UPDATE forge_decisions SET status = 'executing', executing_started_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (exec_start_ts, decision_id),
             )
             if cur.rowcount == 0:
                 return {"ok": False, "error": f"Decision {decision_id} is already executing."}
@@ -9939,13 +9966,33 @@ def execute_approval_card(
             receipt = f"Email dispatched to `{to_addr}`" if ok else f"send_mail failed: {proc.stderr[:160]}"
 
         elif handler == "docker_compose":
-            service = payload["service"]
-            action = payload.get("action", "up -d")
+            service = str(payload.get("service") or "").strip()
+            action = " ".join(str(payload.get("action", "up -d") or "").split())
             compose_dir = payload.get("compose_dir", "/docker")
-            cmd = f"docker compose {action} {service}".strip()
-            proc = subprocess.run(cmd, shell=True, cwd=compose_dir, env=env, capture_output=True, text=True, timeout=60)
-            ok = proc.returncode == 0
-            receipt = f"`{cmd}` succeeded" if ok else f"`{cmd}` failed: {proc.stderr[:160]}"
+            if action not in _DOCKER_COMPOSE_ALLOWED_ACTIONS:
+                ok = False
+                receipt = (
+                    f"Rejected disallowed docker_compose action `{action}` "
+                    f"(allowed: {', '.join(sorted(_DOCKER_COMPOSE_ALLOWED_ACTIONS))})"
+                )
+            elif not service or service.startswith("-") or not _DOCKER_COMPOSE_SERVICE_RE.fullmatch(service):
+                ok = False
+                receipt = f"Rejected invalid docker_compose service name `{service}`"
+            else:
+                action_tokens = _DOCKER_COMPOSE_ALLOWED_ACTIONS[action]
+                argv = ["docker", "compose", *action_tokens, service]
+                cmd_display = " ".join(argv)
+                proc = subprocess.run(
+                    argv,
+                    shell=False,
+                    cwd=compose_dir,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                ok = proc.returncode == 0
+                receipt = f"`{cmd_display}` succeeded" if ok else f"`{cmd_display}` failed: {proc.stderr[:160]}"
 
         elif handler == "gh_merge":
             pr_num = int(payload["pr_number"])
@@ -10088,11 +10135,21 @@ def dismiss_decision(
         row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
         if not row:
             return {"ok": False, "error": "Decision not found."}
-        conn.execute(
-            "UPDATE forge_decisions SET status = 'dismissed', resolved_at = ?, receipt_text = 'Dismissed by user' WHERE id = ?",
+        cur = conn.execute(
+            "UPDATE forge_decisions SET status = 'dismissed', resolved_at = ?, receipt_text = 'Dismissed by user' "
+            "WHERE id = ? AND status = 'pending'",
             (now, decision_id),
         )
         updated_row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
+        if cur.rowcount == 0:
+            cur_status = updated_row["status"] if updated_row else row["status"]
+            return {
+                "ok": False,
+                "error": f"Decision {decision_id} cannot be dismissed (current status: {cur_status}).",
+                "status": cur_status,
+                "formatted_card": format_decision_card_text(updated_row) if updated_row else "",
+                "formatted_embed": render_decision_card_embed(updated_row) if updated_row else {},
+            }
 
     return {
         "ok": True,
@@ -10103,8 +10160,57 @@ def dismiss_decision(
     }
 
 
-def expire_stale_decisions(db_path: Path | str = FORGE_DB_PATH) -> list[str]:
-    """Expire pending Decision Cards whose TTL has passed."""
+def _recover_stale_executing_decisions_in_conn(
+    conn: sqlite3.Connection,
+    now: float,
+    stale_seconds: float = STALE_EXECUTING_DECISION_TIMEOUT_SECONDS,
+) -> list[dict]:
+    """Mark decisions stuck in 'executing' longer than stale_seconds as 'failed' and return updated row dicts."""
+    cutoff = now - float(stale_seconds)
+    try:
+        stale_rows = conn.execute(
+            "SELECT * FROM forge_decisions WHERE status = 'executing' AND COALESCE(executing_started_at, created_at) < ?",
+            (cutoff,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        stale_rows = conn.execute(
+            "SELECT * FROM forge_decisions WHERE status = 'executing' AND created_at < ?",
+            (cutoff,),
+        ).fetchall()
+
+    recovered: list[dict] = []
+    receipt = "Execution interrupted or timed out (recovered from stale executing state)"
+    for r in stale_rows:
+        cur = conn.execute(
+            "UPDATE forge_decisions SET status = 'failed', resolved_at = ?, receipt_text = ? "
+            "WHERE id = ? AND status = 'executing'",
+            (now, receipt, r["id"]),
+        )
+        if cur.rowcount > 0:
+            updated_r = dict(r)
+            updated_r["status"] = "failed"
+            updated_r["resolved_at"] = now
+            updated_r["receipt_text"] = receipt
+            recovered.append(updated_r)
+    return recovered
+
+
+def recover_stale_executing_decisions(
+    db_path: Path | str = FORGE_DB_PATH,
+    stale_seconds: float = STALE_EXECUTING_DECISION_TIMEOUT_SECONDS,
+) -> list[str]:
+    """Recover Decision Cards stuck in 'executing' longer than stale_seconds (default 15 minutes)."""
+    now = time.time()
+    with get_db_connection(db_path) as conn:
+        recovered_rows = _recover_stale_executing_decisions_in_conn(conn, now=now, stale_seconds=stale_seconds)
+    return [r["id"] for r in recovered_rows]
+
+
+def expire_stale_decisions(
+    db_path: Path | str = FORGE_DB_PATH,
+    stale_executing_seconds: float = STALE_EXECUTING_DECISION_TIMEOUT_SECONDS,
+) -> list[str]:
+    """Expire pending Decision Cards whose TTL has passed and recover stale 'executing' decisions."""
     now = time.time()
     expired_ids = []
     expired_rows = []
@@ -10114,15 +10220,23 @@ def expire_stale_decisions(db_path: Path | str = FORGE_DB_PATH) -> list[str]:
             (now,),
         ).fetchall()
         for r in rows:
-            conn.execute(
-                "UPDATE forge_decisions SET status = 'expired', resolved_at = ? WHERE id = ?",
+            cur = conn.execute(
+                "UPDATE forge_decisions SET status = 'expired', resolved_at = ? WHERE id = ? AND status = 'pending'",
                 (now, r["id"]),
             )
+            if cur.rowcount > 0:
+                expired_ids.append(r["id"])
+                updated_r = dict(r)
+                updated_r["status"] = "expired"
+                updated_r["resolved_at"] = now
+                expired_rows.append(updated_r)
+
+        recovered_exec = _recover_stale_executing_decisions_in_conn(
+            conn, now=now, stale_seconds=stale_executing_seconds
+        )
+        for r in recovered_exec:
             expired_ids.append(r["id"])
-            updated_r = dict(r)
-            updated_r["status"] = "expired"
-            updated_r["resolved_at"] = now
-            expired_rows.append(updated_r)
+            expired_rows.append(r)
 
     if expired_rows:
         for r in expired_rows:
@@ -10560,8 +10674,6 @@ def main():
     p_enq.add_argument("plan_file", help="Path to ForgePlan JSON file")
     p_enq.add_argument("--no-widget", action="store_true", help="Skip posting initial #forge Discord widget")
     p_enq.add_argument("--allow-overlap", action="store_true", help="Allow enqueueing even if target_files overlap an active build")
-    p_enq.add_argument("--approved", action="store_true", help="Mark plan as pre-approved to bypass approval gate")
-    p_enq.add_argument("--skip-approval", action="store_true", help="Alias for --approved")
 
     p_st = sub.add_parser("status", help="Show FORGE queue digest or specific build status")
     p_st.add_argument("--build-id", default="", help="Specific build ID")
@@ -10620,8 +10732,6 @@ def main():
     if args.cmd == "enqueue":
         try:
             plan_data = json.loads(Path(args.plan_file).read_text(encoding="utf-8"))
-            if getattr(args, "approved", False) or getattr(args, "skip_approval", False):
-                plan_data["approved"] = True
             res = enqueue_build(
                 plan_data,
                 post_widget=not args.no_widget,

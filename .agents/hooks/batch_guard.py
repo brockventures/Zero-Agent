@@ -132,14 +132,168 @@ def _default_state(now: float = 0.0) -> dict:
 
 
 def _norm_posix(path_str: str, cwd: str = "/workspace") -> str:
-    """Normalize a path to forward-slash POSIX form, preserving leading '/' paths on Windows."""
+    """Normalize a path to forward-slash POSIX form, collapsing '..' segments and resolving symlinks when paths exist."""
     s = (path_str or "").replace("\\", "/")
     if s.startswith("/"):
-        return s
-    c = (cwd or "/workspace").replace("\\", "/")
-    if c.startswith("/"):
-        return c.rstrip("/") + "/" + s
-    return os.path.abspath(os.path.join(cwd or ".", path_str)).replace("\\", "/")
+        norm = posixpath.normpath(s)
+    else:
+        c = (cwd or "/workspace").replace("\\", "/")
+        if c.startswith("/"):
+            combined = c.rstrip("/") + "/" + s if s else c
+            norm = posixpath.normpath(combined)
+        else:
+            norm = os.path.abspath(os.path.join(cwd or ".", path_str)).replace("\\", "/")
+    if os.name != "nt" and norm.startswith("/"):
+        try:
+            if os.path.lexists(norm) or os.path.lexists(posixpath.dirname(norm)):
+                norm = os.path.realpath(norm).replace("\\", "/")
+        except Exception:
+            pass
+    return norm
+
+
+def _is_sensitive_private_path(
+    raw_path: str,
+    cwd: str = "/workspace",
+    include_channel_history: bool = False,
+) -> bool:
+    """Return True if raw_path (after '..' normalization and symlink resolution) targets /secrets, memory/private, memory/vault, .env, or channel_history.json."""
+    clean = _strip_outer_quotes(str(raw_path or "").strip())
+    if not clean:
+        return False
+    s = clean.replace("\\", "/")
+    if s.startswith("/"):
+        norm_lex = posixpath.normpath(s)
+    else:
+        c = (cwd or "/workspace").replace("\\", "/")
+        if c.startswith("/"):
+            norm_lex = posixpath.normpath(c.rstrip("/") + "/" + s)
+        else:
+            norm_lex = os.path.abspath(os.path.join(cwd or ".", clean)).replace("\\", "/")
+    candidates = [norm_lex]
+    if os.name != "nt" and norm_lex.startswith("/"):
+        try:
+            real_p = os.path.realpath(norm_lex).replace("\\", "/")
+            if real_p not in candidates:
+                candidates.append(real_p)
+        except Exception:
+            pass
+    for p in candidates:
+        p_low = p.lower()
+        if p == "/secrets" or p.startswith("/secrets/"):
+            return True
+        if p.endswith("/memory/private") or "/memory/private/" in p:
+            return True
+        if p.endswith("/memory/vault") or "/memory/vault/" in p:
+            return True
+        base = posixpath.basename(p_low.rstrip("/"))
+        if base == ".env" or (
+            base.startswith(".env.")
+            and base not in (".env.example", ".env.sample", ".env.template")
+        ):
+            return True
+        if include_channel_history and base == "channel_history.json":
+            return True
+    return False
+
+
+def _has_sensitive_path_token_in_cmd(
+    cmd: str,
+    cwd: str = "/workspace",
+    include_channel_history: bool = False,
+) -> bool:
+    """Return True if any path-like token or quoted string in cmd resolves to a sensitive private/secrets path."""
+    if not cmd:
+        return False
+    candidates = [cmd] + _extract_wrapped_shell_commands(cmd)
+    for cand in candidates:
+        for raw_tok in re.findall(r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|[^\s;|&<>()]+)", cand):
+            tok = _strip_outer_quotes(raw_tok).strip()
+            if not tok:
+                continue
+            parts_to_check = [tok]
+            # Handle curl @/path, flag=/path, or leading redirection prefixes
+            if tok.startswith("@") and len(tok) > 1:
+                parts_to_check.append(tok[1:])
+            if "=" in tok:
+                rhs = tok.split("=", 1)[1].strip()
+                if rhs:
+                    parts_to_check.append(_strip_outer_quotes(rhs))
+            # Also inspect string literals embedded inside python -c / sh -c payloads
+            for m_lit in re.finditer(r"(['\"])([^'\"]{2,})\1", tok):
+                parts_to_check.append(m_lit.group(2))
+            for candidate_path in parts_to_check:
+                if _is_sensitive_private_path(
+                    candidate_path,
+                    cwd=cwd,
+                    include_channel_history=include_channel_history,
+                ):
+                    return True
+    return False
+
+
+def _has_bare_env_or_printenv(cmd: str) -> bool:
+    """Return True if any shell segment runs `printenv` or bare `env` (dumping process environment)."""
+    if not cmd:
+        return False
+    candidates = [cmd] + _extract_wrapped_shell_commands(cmd)
+    for cand in candidates:
+        for seg in _split_unquoted_shell_segments(cand):
+            s = seg.strip()
+            if not s:
+                continue
+            if re.match(r"^(?:sudo\s+)?(?:/usr/bin/|/bin/)?printenv\b", s):
+                return True
+            m_env = re.match(r"^(?:sudo\s+)?(?:/usr/bin/|/bin/)?env\b(?P<rest>.*)$", s)
+            if m_env:
+                rest = m_env.group("rest").strip()
+                tokens = re.findall(r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S+)", rest)
+                idx = 0
+                has_subcmd = False
+                while idx < len(tokens):
+                    tok = _strip_outer_quotes(tokens[idx])
+                    if tok.startswith((">", "1>", "2>", "&>", "<")):
+                        break
+                    if tok in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
+                        idx += 2
+                        continue
+                    if tok.startswith("-"):
+                        idx += 1
+                        continue
+                    if "=" in tok and not tok.startswith("="):
+                        idx += 1
+                        continue
+                    has_subcmd = True
+                    break
+                if not has_subcmd:
+                    return True
+    return False
+
+
+def _is_outbound_curl_or_wget(cmd: str) -> bool:
+    """Return True if cmd invokes curl/wget targeting anything other than explicit loopback URLs."""
+    if not cmd:
+        return False
+    candidates = [cmd] + _extract_wrapped_shell_commands(cmd)
+    loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+    for cand in candidates:
+        for seg in _split_unquoted_shell_segments(cand):
+            if not re.search(r"\b(?:curl|wget)\b", seg):
+                continue
+            urls = re.findall(r"https?://[^\s'\"`]+", seg)
+            if not urls:
+                return True
+            for u in urls:
+                try:
+                    host = (urllib.parse.urlparse(u).hostname or "").lower().strip("[]")
+                    if host not in loopback_hosts:
+                        return True
+                except Exception:
+                    return True
+            # Also reject non-URL bare host tokens or shell variable URLs alongside loopback URLs
+            if re.search(r"\$[{(]?[A-Za-z_]", seg):
+                return True
+    return False
 
 
 def is_forge_worktree_or_exempt_path(target_file: str, cwd: str = "/workspace") -> bool:
@@ -432,9 +586,6 @@ def check_crab_cavern_airgap_guard(
         in_flight_file = IN_FLIGHT_TURN_FILE
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True, ""
-    norm_cwd = _norm_posix(cwd or "/workspace", "/")
-    if norm_cwd.startswith("/tmp/forge-wt-"):
-        return True, ""
 
     channel_id = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
     if not channel_id and in_flight_file and os.path.exists(in_flight_file):
@@ -452,9 +603,42 @@ def check_crab_cavern_airgap_guard(
         "--summary \"<Action Summary>\" --handler \"<handler_type>\" --payload '<json_payload>' --post"
     )
 
-    if name in ("view_file", "read_file", "edit_file", "replace_file_content", "write_file", "write_to_file"):
-        target_p = _norm_posix(str(args.get("AbsolutePath") or args.get("TargetFile") or args.get("Path") or ""), cwd)
-        if target_p.startswith(("/secrets/", "/workspace/memory/private/", "/workspace/memory/vault/")):
+    if name in (
+        "view_file",
+        "read_file",
+        "edit_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "write_file",
+        "write_to_file",
+    ):
+        raw_target = str(
+            args.get("AbsolutePath") or args.get("TargetFile") or args.get("Path") or args.get("path") or ""
+        ).strip()
+        if _is_sensitive_private_path(raw_target, cwd=cwd, include_channel_history=True):
+            return False, escalation_msg
+        return True, ""
+
+    if name in ("grep_search", "find_by_name"):
+        search_target = str(
+            args.get("SearchDirectory")
+            or args.get("SearchPath")
+            or args.get("Path")
+            or args.get("path")
+            or args.get("Directory")
+            or ""
+        ).strip()
+        if search_target and _is_sensitive_private_path(search_target, cwd=cwd, include_channel_history=True):
+            return False, escalation_msg
+        pattern_blob = " ".join(
+            str(args.get(k) or "")
+            for k in ("FilePattern", "Includes", "Pattern", "Query", "query")
+        )
+        if pattern_blob and re.search(
+            r"(?:/secrets(?:/|\b)|memory/(?:private|vault)\b|(?:^|[\s\"'/=,\[\]])\.env(?!(?:\.example|\.sample|\.template)\b)|\bchannel_history\.json\b)",
+            pattern_blob,
+            re.IGNORECASE,
+        ):
             return False, escalation_msg
         return True, ""
 
@@ -462,12 +646,25 @@ def check_crab_cavern_airgap_guard(
         cmd = str(args.get("CommandLine") or "").strip()
         if not cmd:
             return True, ""
-        # Allow staging the Decision Card itself via forge.py propose / stage-decision
-        if re.search(r"\bforge\.py\s+(?:propose|stage-decision)\b", cmd):
+        # Allow staging the Decision Card itself ONLY via a pure unchained forge.py propose / stage-decision call
+        if _is_pure_decision_card_staging_cmd(cmd):
             return True, ""
-        if re.search(
-            r"\b(?:ssh|scp|sftp)\b|\brun_ssh\s*\(|\bnas_config\.run_ssh\b|/secrets/|/workspace/memory/private/|/workspace/memory/vault/|home-assistant_v2\.db\b",
-            cmd,
+        if (
+            _has_sensitive_path_token_in_cmd(cmd, cwd=cwd, include_channel_history=True)
+            or _has_bare_env_or_printenv(cmd)
+            or re.search(
+                r"\b(?:ssh|scp|sftp)\b"
+                r"|\brun_ssh\s*\("
+                r"|\bnas_config\.run_ssh\b"
+                r"|/secrets(?:/|\b)"
+                r"|(?:^|[\s\"'/=])memory/(?:private|vault)(?:/|\b)"
+                r"|(?:^|[\s\"'/=])\.env(?!(?:\.example|\.sample|\.template)\b)(?:\.[A-Za-z0-9_-]+)?(?=$|[\s\"'/;|&)])"
+                r"|\bchannel_history\.json\b"
+                r"|\btranscript_index\.py\b"
+                r"|/api/search\b"
+                r"|home-assistant_v2\.db\b",
+                cmd,
+            )
         ):
             return False, escalation_msg
 
@@ -720,27 +917,8 @@ def check_hook_python_syntax(name: str, args: dict, cwd: str = "/workspace") -> 
 
 
 def _has_active_delete_approval(db_path: str = "/workspace/data/forge.db") -> bool:
-    """Return True if an approved file_delete Decision Card exists in forge.db."""
-    if not os.path.exists(db_path):
-        return False
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-        try:
-            for query in (
-                "SELECT 1 FROM forge_decisions WHERE category = 'file_delete' AND status IN ('approved', 'edited_approved') LIMIT 1",
-                "SELECT 1 FROM decision_cards WHERE action_type = 'file_delete' AND status = 'approved' LIMIT 1",
-            ):
-                try:
-                    cur = conn.execute(query)
-                    if cur.fetchone() is not None:
-                        return True
-                except Exception:
-                    continue
-            return False
-        finally:
-            conn.close()
-    except Exception:
-        return False
+    """Return True strictly when executing inside an approved FORGE Decision Card subprocess."""
+    return os.environ.get("FORGE_APPROVED_CARD_EXECUTION") == "1"
 
 
 def _is_safe_ephemeral_delete_target(token: str, cwd: str = "/workspace") -> bool:
@@ -987,8 +1165,11 @@ def _is_pure_decision_card_staging_cmd(cmd: str) -> bool:
         stripped,
     ):
         return False
+    outside_single = re.sub(r"'(?:[^']*)'", "''", stripped)
+    if re.search(r"(?<!\\)\$\(|(?<!\\)`", outside_single):
+        return False
     unquoted = re.sub(r"'(?:[^']*)'|\"(?:\\.|[^\"\\])*\"", "''", stripped)
-    if any(sep in unquoted for sep in ("&&", "||", ";", "|", "\n", "`", "$(", ">")):
+    if any(sep in unquoted for sep in ("&&", "||", ";", "|", "\n", "`", "$(", ">", "<(", "&")):
         return False
     return True
 
@@ -2661,14 +2842,17 @@ def check_web_ipi_taint_gate(
     """
     Web IPI Taint Gate:
     When a turn has ingested untrusted external web content (web_tainted=True),
-    block direct read_file/view_file/run_command access to /secrets/ and block direct send_mail.py
-    execution in the same turn (unless FORGE_WORKER_ACTIVE=1). Instructs the agent to stage a
-    human-approved Decision Card ('forge.py propose' / 'forge.py stage-decision') instead.
+    block direct read/search/shell access to /secrets/, memory/private, memory/vault, .env,
+    transcript_index.py, env/printenv, and block outbound exfiltration via send_mail.py,
+    outbox.py, curl, or wget in the same turn (unless FORGE_WORKER_ACTIVE=1).
+    Instructs the agent to stage a human-approved Decision Card via pure
+    'forge.py propose' / 'forge.py stage-decision' instead.
     """
     if os.environ.get("FORGE_WORKER_ACTIVE") == "1":
         return True, ""
 
-    is_tainted = bool(state.get("web_tainted", False))
+    already_tainted = bool(state.get("web_tainted", False))
+    is_tainted = already_tainted
     taint_source = state.get("web_taint_source", "") or "untrusted web content"
 
     # Also detect if the current tool call itself introduces untrusted web content
@@ -2681,10 +2865,18 @@ def check_web_ipi_taint_gate(
     if not is_tainted:
         return True, ""
 
-    if name in ("view_file", "read_file"):
-        target_file = args.get("AbsolutePath") or args.get("Path") or ""
+    if name in ("view_file", "read_file", "grep_search", "find_by_name"):
+        target_file = (
+            args.get("AbsolutePath")
+            or args.get("SearchDirectory")
+            or args.get("SearchPath")
+            or args.get("Path")
+            or args.get("path")
+            or args.get("Directory")
+            or ""
+        )
         clean_target = str(target_file).strip()
-        norm_target = _norm_posix(clean_target, cwd=cwd)
+        norm_target = _norm_posix(clean_target, cwd=cwd) if clean_target else ""
         if (
             "/secrets/" in norm_target
             or norm_target.startswith("/secrets")
@@ -2696,11 +2888,17 @@ def check_web_ipi_taint_gate(
                 "Direct access to /secrets/ is blocked to prevent automated prompt injection exfiltration. "
                 "Please stage a human-approved Decision Card ('forge.py propose' or 'forge.py stage-decision') instead."
             )
+        if _is_sensitive_private_path(clean_target, cwd=cwd, include_channel_history=False):
+            return False, (
+                f"Web IPI Taint Gate Triggered: Untrusted web content was ingested earlier in this turn (source: {taint_source}). "
+                "Direct access to private memory, vault, or .env files is blocked to prevent automated prompt injection exfiltration. "
+                "Please stage a human-approved Decision Card ('forge.py propose' or 'forge.py stage-decision') instead."
+            )
 
     if name == "run_command":
         cmd = args.get("CommandLine", "") or ""
-        # Allow Decision Card staging via forge.py propose / stage-decision
-        if re.search(r"\bforge\.py\s+(?:propose|stage-decision)\b", cmd):
+        # Allow Decision Card staging ONLY via a pure unchained forge.py propose / stage-decision call
+        if _is_pure_decision_card_staging_cmd(cmd):
             return True, ""
 
         if "send_mail.py" in cmd:
@@ -2710,10 +2908,36 @@ def check_web_ipi_taint_gate(
                 "Please stage a human-approved Decision Card ('forge.py propose' or 'forge.py stage-decision') instead."
             )
 
-        if "/secrets/" in cmd or "/secrets" in cmd or re.search(r"(?:^|[\s\"'/])(?:\.secrets|secrets)(?:/|\s|$)", cmd):
+        if "outbox.py" in cmd:
             return False, (
                 f"Web IPI Taint Gate Triggered: Untrusted web content was ingested earlier in this turn (source: {taint_source}). "
-                "Direct shell access to /secrets/ is blocked to prevent automated prompt injection exfiltration. "
+                "Direct dispatch via outbox.py is blocked following untrusted web ingestion. "
+                "Please stage a human-approved Decision Card ('forge.py propose' or 'forge.py stage-decision') instead."
+            )
+
+        if (
+            "/secrets/" in cmd
+            or "/secrets" in cmd
+            or re.search(r"(?:^|[\s\"'/])(?:\.secrets|secrets)(?:/|\s|$)", cmd)
+            or _has_sensitive_path_token_in_cmd(cmd, cwd=cwd, include_channel_history=False)
+            or re.search(
+                r"(?:^|[\s\"'/=])memory/(?:private|vault)(?:/|\b)"
+                r"|(?:^|[\s\"'/=])\.env(?!(?:\.example|\.sample|\.template)\b)(?:\.[A-Za-z0-9_-]+)?(?=$|[\s\"'/;|&)])"
+                r"|\btranscript_index\.py\b",
+                cmd,
+            )
+            or _has_bare_env_or_printenv(cmd)
+        ):
+            return False, (
+                f"Web IPI Taint Gate Triggered: Untrusted web content was ingested earlier in this turn (source: {taint_source}). "
+                "Direct shell access to /secrets/, private memory, vault, .env, transcript_index.py, or process environment is blocked to prevent automated prompt injection exfiltration. "
+                "Please stage a human-approved Decision Card ('forge.py propose' or 'forge.py stage-decision') instead."
+            )
+
+        if already_tainted and _is_outbound_curl_or_wget(cmd):
+            return False, (
+                f"Web IPI Taint Gate Triggered: Untrusted web content was ingested earlier in this turn (source: {taint_source}). "
+                "Direct outbound network exfiltration via curl/wget is blocked following untrusted web ingestion. "
                 "Please stage a human-approved Decision Card ('forge.py propose' or 'forge.py stage-decision') instead."
             )
 
