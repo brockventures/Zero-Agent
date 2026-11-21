@@ -286,7 +286,7 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         ),
         "scene_flavor": {
             "morning": "gritty Brooklyn elevated steel subway overpass and mural-splashed red-brick street corner, diagonal riveted iron girders casting bold hatched shadows across wet asphalt",
-            "afternoon": "high-altitude Brooklyn Bridge granite tower and suspension-cable promenade overlook, sweeping geometric web of steel cables framing the East River and lower Manhattan skyscrapers",
+            "afternoon": "scenic Brooklyn Bridge Park waterfront promenade looking up at the towering Brooklyn Bridge granite arches and sweeping geometric web of steel suspension cables across the East River and lower Manhattan skyscrapers",
             "evening": "neon-drenched Brooklyn rooftop water-tower ledge towering above an electric magenta, cyan, and acid-yellow Manhattan night skyline exploding with halftone light blooms",
         },
         "easter_eggs": {
