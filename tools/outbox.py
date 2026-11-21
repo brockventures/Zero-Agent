@@ -6,6 +6,7 @@ so Zero can dispatch messages to other channels (#lounge, #the-banana-stand, #ze
 without blocking the active turn or coupling delivery to the current execution thread.
 """
 
+import fcntl
 import os
 import sys
 import json
@@ -15,8 +16,11 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timezone
 
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
 
 DATA_DIR = Path("/workspace/data")
 OUTBOX_DIR = DATA_DIR / "outbox"
@@ -353,9 +357,17 @@ def queue_outbox_message(
         msg_record["suppressed"] = True
         return msg_record
 
-    # Atomic write to line
-    with open(PENDING_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(msg_record) + "\n")
+    # Atomic locked append so concurrent flush_pending_messages() partitioning cannot clobber writes
+    PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _pending_lock_path()
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            with open(PENDING_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(msg_record) + "\n")
+                f.flush()
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
     return msg_record
 
@@ -425,38 +437,92 @@ def get_pending_messages() -> list[dict]:
         print(f"[Outbox] Error reading pending messages: {e}", file=sys.stderr)
     return messages
 
-def flush_pending_messages() -> list[dict]:
+def _pending_lock_path() -> Path:
+    """Return the flock lockfile path adjacent to PENDING_FILE."""
+    return PENDING_FILE.parent / f".{PENDING_FILE.name}.lock"
+
+
+def flush_pending_messages(channel_filter: int | None = None) -> list[dict]:
     """
-    Atomically acquire and drain pending messages for delivery.
-    Renames pending.jsonl to .flushing.<ts> so concurrent writes aren't lost.
+    Atomically acquire and drain pending messages for delivery using an exclusive flock.
+
+    When `channel_filter` is provided, only lines matching `channel_id == int(channel_filter)`
+    are drained and returned. Unmatched raw JSONL lines are written back verbatim to
+    `pending.jsonl` via temp-file + `os.replace()` without passing through `queue_outbox_message()`,
+    preserving original message IDs, flags, and formatting while preventing cross-container races.
     """
-    if not PENDING_FILE.exists():
-        return []
-    
-    proc_file = OUTBOX_DIR / f"flushing.{int(time.time()*1000)}.{os.getpid()}.jsonl"
-    try:
-        PENDING_FILE.replace(proc_file)
-    except FileNotFoundError:
-        return []
-    except Exception as e:
-        print(f"[Outbox] Error rotating pending file: {e}", file=sys.stderr)
+    if not PENDING_FILE.parent.exists():
         return []
 
-    messages = []
+    filter_cid = int(channel_filter) if channel_filter is not None else None
+    lock_path = _pending_lock_path()
+
     try:
-        with open(proc_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
+        with open(lock_path, "a+", encoding="utf-8") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                if not PENDING_FILE.exists():
+                    return []
+
+                matched_messages: list[dict] = []
+                unmatched_raw_lines: list[str] = []
+
+                with open(PENDING_FILE, "r", encoding="utf-8") as f:
+                    for raw_line in f:
+                        stripped = raw_line.strip()
+                        if not stripped:
+                            continue
+                        try:
+                            parsed = json.loads(stripped)
+                        except Exception:
+                            continue
+
+                        if filter_cid is not None:
+                            msg_cid = parsed.get("channel_id")
+                            try:
+                                is_match = (msg_cid is not None and int(msg_cid) == filter_cid)
+                            except (ValueError, TypeError):
+                                is_match = False
+                            if is_match:
+                                matched_messages.append(parsed)
+                            else:
+                                unmatched_raw_lines.append(
+                                    raw_line if raw_line.endswith("\n") else (stripped + "\n")
+                                )
+                        else:
+                            matched_messages.append(parsed)
+
+                if filter_cid is not None and not matched_messages:
+                    return []
+
+                if unmatched_raw_lines:
+                    tmp_file = PENDING_FILE.parent / f".{PENDING_FILE.name}.tmp.{os.getpid()}.{time.time_ns()}"
                     try:
-                        messages.append(json.loads(line))
-                    except Exception:
+                        with open(tmp_file, "w", encoding="utf-8") as tf:
+                            tf.writelines(unmatched_raw_lines)
+                            tf.flush()
+                            os.fsync(tf.fileno())
+                        os.replace(tmp_file, PENDING_FILE)
+                    except Exception as write_err:
+                        try:
+                            if tmp_file.exists():
+                                tmp_file.unlink()
+                        except Exception:
+                            pass
+                        print(f"[Outbox] Error rewriting partitioned pending file: {write_err}", file=sys.stderr)
+                        return []
+                else:
+                    try:
+                        PENDING_FILE.unlink()
+                    except FileNotFoundError:
                         pass
-        proc_file.unlink()
-    except Exception as e:
-        print(f"[Outbox] Error processing flush file {proc_file}: {e}", file=sys.stderr)
 
-    return messages
+                return matched_messages
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        print(f"[Outbox] Error flushing pending messages: {e}", file=sys.stderr)
+        return []
 
 def _get_zero_fallback_token() -> str | None:
     """Retrieve Zero's Discord bot token from /opt/zero/.env or /opt/zero/secrets/env.json for upstream fallback."""

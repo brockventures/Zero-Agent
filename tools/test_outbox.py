@@ -331,5 +331,151 @@ class TestOutboxSecurityHardening(unittest.TestCase):
         self.assertEqual([b["custom_id"] for b in btns], ["choice:Deploy", "choice:Cancel"])
 
 
+class TestOutboxAtomicPartitioning(unittest.TestCase):
+    def setUp(self):
+        self.silence_patcher = patch("tools.bridge_state.is_crab_cavern_silenced", return_value=(False, ""))
+        self.silence_patcher.start()
+        self.temp_dir = tempfile.mkdtemp()
+        self.orig_data_dir = outbox.DATA_DIR
+        self.orig_outbox_dir = outbox.OUTBOX_DIR
+        self.orig_pending_file = outbox.PENDING_FILE
+        self.orig_history_file = outbox.HISTORY_FILE
+        outbox.DATA_DIR = Path(self.temp_dir)
+        outbox.OUTBOX_DIR = outbox.DATA_DIR / "outbox"
+        outbox.PENDING_FILE = outbox.OUTBOX_DIR / "pending.jsonl"
+        outbox.HISTORY_FILE = outbox.OUTBOX_DIR / "history.jsonl"
+        outbox.OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.silence_patcher.stop()
+        outbox.DATA_DIR = self.orig_data_dir
+        outbox.OUTBOX_DIR = self.orig_outbox_dir
+        outbox.PENDING_FILE = self.orig_pending_file
+        outbox.HISTORY_FILE = self.orig_history_file
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_flush_pending_messages_channel_filter_preserves_unmatched_raw_jsonl(self):
+        """Verify filtered flush extracts only matched channel and preserves unmatched raw JSONL lines verbatim."""
+        forge_cid = 1562899941595160657
+        zero_cid = 1542081375287640084
+        lounge_cid = 1534452820995080192
+
+        raw_zero = json.dumps({
+            "id": "outbox-orig-zero-1",
+            "channel": "zero-chat",
+            "channel_id": zero_cid,
+            "content": "Exact **markdown** payload with [CHOICES: A | B]",
+            "source": "orig-turn",
+            "type": "text",
+            "force": True,
+            "custom_meta": "keep-me",
+        })
+        raw_forge = json.dumps({
+            "id": "outbox-orig-forge-1",
+            "channel": "forge",
+            "channel_id": forge_cid,
+            "content": "FORGE build status update",
+            "source": "vulcan",
+            "type": "text",
+        })
+        raw_lounge = json.dumps({
+            "id": "outbox-orig-lounge-1",
+            "channel": "lounge",
+            "channel_id": lounge_cid,
+            "content": "Crab Cavern message during blackout",
+            "source": "zero",
+            "type": "text",
+            "force": True,
+        })
+        outbox.PENDING_FILE.write_text(f"{raw_zero}\n{raw_forge}\n{raw_lounge}\n", encoding="utf-8")
+
+        # Even if Crab Cavern is silenced, unmatched lines must be preserved verbatim without calling queue_outbox_message
+        self.silence_patcher.stop()
+        try:
+            with patch("tools.bridge_state.is_crab_cavern_silenced", return_value=(True, "Blackout")), \
+                 patch("tools.outbox.queue_outbox_message") as mock_queue:
+                drained_forge = outbox.flush_pending_messages(channel_filter=forge_cid)
+        finally:
+            self.silence_patcher.start()
+
+        mock_queue.assert_not_called()
+        self.assertEqual(len(drained_forge), 1)
+        self.assertEqual(drained_forge[0]["id"], "outbox-orig-forge-1")
+
+        # Unmatched raw lines must remain byte-for-byte intact in pending.jsonl
+        remaining_lines = outbox.PENDING_FILE.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(remaining_lines, [raw_zero, raw_lounge])
+
+        # Flushing a filter with no matching lines must leave pending.jsonl intact
+        self.assertEqual(outbox.flush_pending_messages(channel_filter=forge_cid), [])
+        self.assertEqual(outbox.PENDING_FILE.read_text(encoding="utf-8").splitlines(), [raw_zero, raw_lounge])
+
+        # Unfiltered flush drains all remaining messages preserving original IDs and fields
+        drained_rest = outbox.flush_pending_messages()
+        self.assertEqual([m["id"] for m in drained_rest], ["outbox-orig-zero-1", "outbox-orig-lounge-1"])
+        self.assertEqual(drained_rest[0]["custom_meta"], "keep-me")
+        self.assertFalse(outbox.PENDING_FILE.exists())
+
+    def test_flush_pending_messages_concurrent_partitioned_flushes_no_message_loss(self):
+        """Verify concurrent Vulcan/Zero partitioned flushes + writes never lose or duplicate messages."""
+        import threading
+
+        forge_cid = 1562899941595160657
+        zero_cid = 1542081375287640084
+        total_per_channel = 40
+
+        seen_forge: list[str] = []
+        seen_zero: list[str] = []
+        errors: list[Exception] = []
+        producer_done = threading.Event()
+
+        def producer():
+            try:
+                for i in range(total_per_channel):
+                    outbox.queue_outbox_message("forge", f"forge-concurrent-msg-{i}", force=True)
+                    outbox.queue_outbox_message("zero-chat", f"zero-concurrent-msg-{i}", force=True)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                producer_done.set()
+
+        def consumer(cid: int, bucket: list[str]):
+            try:
+                while not producer_done.is_set():
+                    for msg in outbox.flush_pending_messages(channel_filter=cid):
+                        bucket.append(msg["content"])
+                # Final drain after producer finishes
+                for _ in range(3):
+                    for msg in outbox.flush_pending_messages(channel_filter=cid):
+                        bucket.append(msg["content"])
+            except Exception as exc:
+                errors.append(exc)
+
+        t_prod = threading.Thread(target=producer)
+        t_forge = threading.Thread(target=consumer, args=(forge_cid, seen_forge))
+        t_zero = threading.Thread(target=consumer, args=(zero_cid, seen_zero))
+
+        t_forge.start()
+        t_zero.start()
+        t_prod.start()
+        t_prod.join(timeout=15)
+        t_forge.join(timeout=15)
+        t_zero.join(timeout=15)
+
+        self.assertEqual(errors, [])
+        # Drain any stragglers after threads exit
+        for msg in outbox.flush_pending_messages(channel_filter=forge_cid):
+            seen_forge.append(msg["content"])
+        for msg in outbox.flush_pending_messages(channel_filter=zero_cid):
+            seen_zero.append(msg["content"])
+
+        expected_forge = {f"forge-concurrent-msg-{i}" for i in range(total_per_channel)}
+        expected_zero = {f"zero-concurrent-msg-{i}" for i in range(total_per_channel)}
+        self.assertEqual(len(seen_forge), total_per_channel)
+        self.assertEqual(len(seen_zero), total_per_channel)
+        self.assertEqual(set(seen_forge), expected_forge)
+        self.assertEqual(set(seen_zero), expected_zero)
+
+
 if __name__ == "__main__":
     unittest.main()

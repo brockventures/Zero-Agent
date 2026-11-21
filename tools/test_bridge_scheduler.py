@@ -1525,6 +1525,87 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             mock_homelab.send.assert_awaited_once_with(err_msg)
             mock_turn_queue.put.assert_not_called()
 
+    def test_sync_housekeeping_includes_forge_jobs_and_descendants(self):
+        """Verify _sync_housekeeping includes active FORGE job/worker PIDs and their descendants in allowed_active_pids."""
+        scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock())
+        mock_bot = MagicMock()
+        mock_bot.is_ready.return_value = True
+        scheduler.bot = mock_bot
+
+        def fake_children(pid):
+            if pid == 55002:
+                return [55003]
+            return []
+
+        with patch("tools.bridge_state.update_gateway_heartbeat"), \
+             patch("tools.bridge_state.get_all_active_pids", return_value=[1234]), \
+             patch("tools.process_probe.get_active_forge_pids", return_value={55001, 55002}), \
+             patch("tools.process_probe.get_process_children", side_effect=fake_children), \
+             patch("tools.process_probe.reap_stale_agy_processes") as mock_reap:
+            scheduler._sync_housekeeping()
+
+        mock_reap.assert_called_once()
+        allowed = mock_reap.call_args[1]["allowed_active_pids"]
+        self.assertTrue({1234, 55001, 55002, 55003}.issubset(allowed))
+
+    async def test_outbox_flush_channel_filter_partitions_in_place_without_requeue(self):
+        """Verify flush_outbox_queue(channel_filter=...) passes channel_filter directly and never re-queues unmatched items."""
+        import tools.outbox as outbox
+
+        orig_data_dir = outbox.DATA_DIR
+        orig_outbox_dir = outbox.OUTBOX_DIR
+        orig_pending_file = outbox.PENDING_FILE
+        orig_history_file = outbox.HISTORY_FILE
+        try:
+            outbox.DATA_DIR = self.temp_path
+            outbox.OUTBOX_DIR = self.temp_path / "outbox"
+            outbox.PENDING_FILE = outbox.OUTBOX_DIR / "pending.jsonl"
+            outbox.HISTORY_FILE = outbox.OUTBOX_DIR / "history.jsonl"
+            outbox.OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+
+            forge_cid = 1562899941595160657
+            zero_cid = 1542081375287640084
+            forge_line = json.dumps({
+                "id": "outbox-forge-1",
+                "channel": "forge",
+                "channel_id": forge_cid,
+                "content": "FORGE chunk 2 complete",
+                "source": "vulcan",
+                "type": "text",
+                "is_agent_turn": False,
+                "created_at": time.time(),
+            })
+            zero_line = json.dumps({
+                "id": "outbox-zero-keep-exact-id",
+                "channel": "zero-chat",
+                "channel_id": zero_cid,
+                "content": "Zero notification must stay intact",
+                "source": "zero-sidecar",
+                "type": "text",
+                "is_agent_turn": False,
+                "force": True,
+                "created_at": time.time(),
+            })
+            outbox.PENDING_FILE.write_text(forge_line + "\n" + zero_line + "\n", encoding="utf-8")
+
+            mock_bot = MagicMock()
+            mock_forge_ch = AsyncMock()
+            mock_bot.get_channel.side_effect = lambda cid: mock_forge_ch if cid == forge_cid else None
+            scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock(), bot=mock_bot)
+
+            with patch("tools.outbox.queue_outbox_message") as mock_requeue:
+                await scheduler.flush_outbox_queue(channel_filter=forge_cid)
+
+            mock_requeue.assert_not_called()
+            mock_forge_ch.send.assert_awaited_once_with("FORGE chunk 2 complete")
+            remaining_raw = outbox.PENDING_FILE.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(remaining_raw, [zero_line])
+        finally:
+            outbox.DATA_DIR = orig_data_dir
+            outbox.OUTBOX_DIR = orig_outbox_dir
+            outbox.PENDING_FILE = orig_pending_file
+            outbox.HISTORY_FILE = orig_history_file
+
 
 if __name__ == "__main__":
     unittest.main()

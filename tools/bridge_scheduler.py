@@ -2062,9 +2062,11 @@ class BridgeScheduler:
         - Per-message error isolation so one failure never aborts or drops remaining outbox items.
         - Dead-Letter Queue (failed.jsonl) logging on unhandled delivery errors.
         """
+        if not self.bot:
+            return
         try:
             from tools.outbox import flush_pending_messages
-            pending_outbox = flush_pending_messages()
+            pending_outbox = flush_pending_messages(channel_filter=channel_filter)
             if not pending_outbox:
                 return
 
@@ -2072,20 +2074,7 @@ class BridgeScheduler:
                 omsg_id = omsg.get("id", "unknown-outbox")
                 ch_name = omsg.get("channel", "unknown")
                 target_cid = omsg.get("channel_id")
-                if not target_cid or not self.bot:
-                    continue
-
-                if channel_filter is not None and int(target_cid) != int(channel_filter):
-                    try:
-                        from tools.outbox import queue_outbox_message
-                        queue_outbox_message(
-                            channel=str(target_cid),
-                            content=omsg.get("content", ""),
-                            source_turn=omsg.get("source", "requeued"),
-                            is_agent_turn=bool(omsg.get("type") == "agent_turn" or omsg.get("is_agent_turn")),
-                        )
-                    except Exception:
-                        pass
+                if not target_cid:
                     continue
 
                 try:
@@ -2203,6 +2192,16 @@ class BridgeScheduler:
                 for w in list(daemon_manager.workers.values()):
                     if w.proc and getattr(w.proc, "pid", None):
                         allowed_pids.add(w.proc.pid)
+            except Exception:
+                pass
+            try:
+                from tools.process_probe import get_active_forge_pids
+                allowed_pids.update(get_active_forge_pids())
+            except Exception:
+                pass
+            try:
+                from tools.process_probe import expand_allowed_pids
+                allowed_pids = expand_allowed_pids(allowed_pids)
             except Exception:
                 pass
             reap_stale_agy_processes(allowed_active_pids=allowed_pids)

@@ -6,8 +6,10 @@ Identifies whether a process is wedged, why it is blocked (kernel wchan), whethe
 waiting on interactive STDIN, and extracts the exact prompt or blocking condition.
 """
 
+import fcntl
 import os
 import re
+import sqlite3
 import sys
 import time
 import signal
@@ -50,14 +52,18 @@ LOCK_WAIT_CHANNELS = {
 }
 
 
-def get_process_children(pid: int) -> List[int]:
-    """Recursively collect all descendant child PIDs for a process."""
-    children = []
+def _collect_process_children(pid: int, visited: set[int]) -> List[int]:
+    """Recursively collect descendant PIDs for `pid` with cycle protection."""
+    if pid in visited:
+        return []
+    visited.add(pid)
+
+    children: List[int] = []
     task_dir = Path(f"/proc/{pid}/task")
     if not task_dir.exists():
         return children
 
-    direct_children = set()
+    direct_children: set[int] = set()
     try:
         for tid_dir in task_dir.iterdir():
             children_file = tid_dir / "children"
@@ -91,10 +97,219 @@ def get_process_children(pid: int) -> List[int]:
             pass
 
     for cp in sorted(direct_children):
+        if cp in visited:
+            continue
         children.append(cp)
-        children.extend(get_process_children(cp))
+        children.extend(_collect_process_children(cp, visited))
 
     return sorted(list(set(children)))
+
+
+def get_process_children(pid: int) -> List[int]:
+    """Recursively collect all descendant child PIDs for a process."""
+    return _collect_process_children(pid, set())
+
+
+def expand_allowed_pids(seed_pids: set[int] | list[int] | tuple[int, ...]) -> set[int]:
+    """Recursively expand seed PIDs via get_process_children() with cycle protection."""
+    expanded: set[int] = set()
+    queue: list[int] = []
+    for p in seed_pids:
+        if isinstance(p, int) and p > 0 and p not in expanded:
+            expanded.add(p)
+            queue.append(p)
+
+    while queue:
+        cur = queue.pop()
+        try:
+            children = get_process_children(cur)
+        except Exception:
+            children = []
+        for cpid in children:
+            if isinstance(cpid, int) and cpid > 0 and cpid not in expanded:
+                expanded.add(cpid)
+                queue.append(cpid)
+
+    return expanded
+
+
+def _extract_argv(raw_cmdline: bytes | str) -> list[str]:
+    """Extract argv tokens from raw /proc/<pid>/cmdline bytes or a whitespace string."""
+    if isinstance(raw_cmdline, bytes):
+        if b"\x00" in raw_cmdline:
+            return [tok.decode("utf-8", errors="ignore") for tok in raw_cmdline.split(b"\x00") if tok]
+        text = raw_cmdline.decode("utf-8", errors="ignore").strip()
+        return text.split() if text else []
+    text = str(raw_cmdline).strip()
+    return text.split() if text else []
+
+
+def is_agy_command(cmdline: bytes | str | list[str]) -> bool:
+    """Return True iff the executable token (unwrapping env/nice/ionice wrappers) is literally 'agy'."""
+    argv = list(cmdline) if isinstance(cmdline, (list, tuple)) else _extract_argv(cmdline)
+    idx = 0
+    n = len(argv)
+    while idx < n:
+        token = argv[idx]
+        if not token:
+            idx += 1
+            continue
+        exe = Path(token).name
+        if exe == "env":
+            idx += 1
+            while idx < n:
+                tok = argv[idx]
+                if tok == "--":
+                    idx += 1
+                    break
+                if tok in ("-u", "-C", "--unset", "--chdir"):
+                    idx += 2
+                    continue
+                if tok.startswith("-"):
+                    idx += 1
+                    continue
+                if "=" in tok and not tok.startswith("/"):
+                    idx += 1
+                    continue
+                break
+            continue
+        if exe == "nice":
+            idx += 1
+            while idx < n:
+                tok = argv[idx]
+                if tok == "--":
+                    idx += 1
+                    break
+                if tok in ("-n", "--adjustment"):
+                    idx += 2
+                    continue
+                if tok.startswith("-"):
+                    idx += 1
+                    continue
+                break
+            continue
+        if exe == "ionice":
+            idx += 1
+            while idx < n:
+                tok = argv[idx]
+                if tok == "--":
+                    idx += 1
+                    break
+                if tok in ("-c", "-n", "-p", "-P", "-u", "--class", "--classdata"):
+                    idx += 2
+                    continue
+                if tok.startswith("-"):
+                    idx += 1
+                    continue
+                break
+            continue
+        return exe == "agy"
+    return False
+
+
+def _read_held_lock_pid(lock_file: Path) -> Optional[int]:
+    """Return a positive PID recorded in `lock_file` iff its flock is currently held."""
+    try:
+        with open(lock_file, "a+", encoding="utf-8") as lf:
+            try:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                lf.seek(0)
+                raw = lf.read().strip()
+                if raw:
+                    first_tok = raw.splitlines()[0].strip().split()[0]
+                    if first_tok.isdigit():
+                        val = int(first_tok)
+                        return val if val > 0 else None
+                return None
+            else:
+                try:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                return None
+    except Exception:
+        return None
+
+
+def get_active_forge_pids(forge_db_path: Path | str | None = None) -> set[int]:
+    """Collect active FORGE detached-job PIDs (worker_pid, child_pid) and active FORGE build worker PIDs.
+
+    Gracefully ignores missing DB files, schema mismatches, or import errors.
+    """
+    pids: set[int] = set()
+    db_candidates: list[Path] = []
+
+    if forge_db_path is not None:
+        db_candidates.append(Path(forge_db_path))
+    else:
+        try:
+            from tools.forge import FORGE_DB_PATH, _get_peer_forge_db_paths
+            db_candidates.append(Path(FORGE_DB_PATH))
+            for peer_p in _get_peer_forge_db_paths(FORGE_DB_PATH):
+                peer_path = Path(peer_p)
+                if peer_path not in db_candidates:
+                    db_candidates.append(peer_path)
+        except Exception:
+            db_candidates.append(Path("/workspace/data/forge.db"))
+
+    # 1. Active detached jobs from forge.db (forge_jobs WHERE status IN ('starting', 'running'))
+    seen_dbs: set[str] = set()
+    for db_p in db_candidates:
+        try:
+            if not db_p.exists():
+                continue
+            key = str(db_p.resolve())
+            if key in seen_dbs:
+                continue
+            seen_dbs.add(key)
+            conn = sqlite3.connect(str(db_p), timeout=1.0)
+            try:
+                rows = conn.execute(
+                    "SELECT worker_pid, child_pid FROM forge_jobs WHERE status IN ('starting', 'running')"
+                ).fetchall()
+                for row in rows:
+                    for col in row:
+                        if isinstance(col, int) and col > 0:
+                            pids.add(col)
+            finally:
+                conn.close()
+        except Exception:
+            continue
+
+    # 2. Active FORGE build worker subprocesses tracked by ForgeSupervisor
+    try:
+        from tools.forge import forge_supervisor
+        for proc in list(getattr(forge_supervisor, "_active_build_procs", {}).values()):
+            try:
+                if proc and proc.poll() is None:
+                    proc_pid = getattr(proc, "pid", None)
+                    if isinstance(proc_pid, int) and proc_pid > 0:
+                        pids.add(proc_pid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3. Held cross-container FORGE build worker lock files that record a worker PID
+    seen_parents: set[str] = set()
+    for db_p in db_candidates:
+        try:
+            parent_dir = db_p.parent
+            if not parent_dir.exists():
+                continue
+            pkey = str(parent_dir.resolve())
+            if pkey in seen_parents:
+                continue
+            seen_parents.add(pkey)
+            for lock_file in parent_dir.glob(".forge_build_worker_*.lock"):
+                lock_pid = _read_held_lock_pid(lock_file)
+                if lock_pid is not None:
+                    pids.add(lock_pid)
+        except Exception:
+            continue
+
+    return pids
 
 
 def inspect_single_process(pid: int) -> Dict[str, Any]:
@@ -333,32 +548,47 @@ _LAST_CPU_SAMPLES: Dict[int, Tuple[float, int]] = {}
 
 
 def is_process_making_progress(pid: int, sample_window: float = 0.05) -> bool:
-    """Check if process or its descendants are executing commands, running tools, or consuming CPU.
+    """Check if process or its descendants are actively advancing CPU ticks.
 
-    Returns True if:
-    1. The process has active running child processes (e.g. running bash, python, pytest, git).
-    2. CPU ticks have increased since last check or increase over a brief sample window.
+    Measures full process-tree CPU ticks (root + descendants) rather than treating
+    the mere presence of child processes as progress. Returns True iff CPU ticks
+    have advanced since the last sample or advance over `sample_window`.
+    Explicitly returns False if CPU ticks do not advance (including when
+    diagnose_process_tree() identifies a leaf culprit blocked on interactive STDIN
+    or a kernel futex/mutex lock).
     """
-    children = get_process_children(pid)
-    if len(children) > 0:
-        return True
-
     curr_ticks = get_process_tree_cpu_ticks(pid)
     now = time.time()
 
+    cpu_advanced = False
     if pid in _LAST_CPU_SAMPLES:
         prev_ts, prev_ticks = _LAST_CPU_SAMPLES[pid]
-        _LAST_CPU_SAMPLES[pid] = (now, curr_ticks)
         if curr_ticks > prev_ticks:
-            return True
+            cpu_advanced = True
 
-    if sample_window > 0:
+    if not cpu_advanced and sample_window > 0:
         time.sleep(sample_window)
         next_ticks = get_process_tree_cpu_ticks(pid)
         _LAST_CPU_SAMPLES[pid] = (time.time(), next_ticks)
-        return next_ticks > curr_ticks
+        cpu_advanced = next_ticks > curr_ticks
+    else:
+        _LAST_CPU_SAMPLES[pid] = (now, curr_ticks)
 
-    _LAST_CPU_SAMPLES[pid] = (now, curr_ticks)
+    if cpu_advanced:
+        return True
+
+    # Zero CPU tick advancement across the process tree: explicitly confirm
+    # blocked leaf culprits (interactive STDIN or kernel lock) return False.
+    try:
+        diag = diagnose_process_tree(pid)
+        culprit = diag.get("culprit") if isinstance(diag, dict) else None
+        if isinstance(culprit, dict) and (
+            culprit.get("is_waiting_stdin") or culprit.get("is_waiting_lock")
+        ):
+            return False
+    except Exception:
+        pass
+
     return False
 
 
@@ -370,14 +600,16 @@ def reap_stale_agy_processes(
 ) -> list[dict]:
     """Scan and forcibly terminate only true failure loops or dead wedged agy subprocesses.
 
-    Crucially, tasks making active forward progress (running tools, spawning child processes,
-    consuming CPU ticks) are NEVER terminated regardless of total wall-clock elapsed time.
+    Crucially, tasks making active forward progress (advancing process-tree CPU ticks)
+    are NEVER terminated regardless of total wall-clock elapsed time, and active FORGE
+    detached-job / build-worker PIDs plus their entire descendant trees are protected
+    from untracked-orphan reaping.
 
     Reaps ONLY:
-    1. Processes wedged on interactive console STDIN (e.g. password, confirmation prompt) for >= 60s.
-    2. Processes deadlocked on kernel futexes/locks with 0 CPU delta and 0 children for >= 120s.
-    3. Untracked orphaned processes (not in allowed/in-flight) with 0 children and 0 CPU progress for >= 300s.
-    4. Allowed processes that have experienced complete unbroken silence / stall (0 CPU delta, 0 children) for >= max_stall_seconds.
+    1. Processes wedged on interactive console STDIN (e.g. password, confirmation prompt) for >= 60s with 0 CPU delta.
+    2. Processes deadlocked on kernel futexes/locks with 0 CPU delta for >= 120s.
+    3. Untracked orphaned processes (not in allowed/in-flight/FORGE trees) with 0 CPU progress for >= 300s.
+    4. Allowed non-daemon processes exceeding the hard ceiling with 0 CPU progress.
     """
     reaped = []
     allowed = set(allowed_active_pids or set())
@@ -388,12 +620,19 @@ def reap_stale_agy_processes(
         except Exception:
             pass
 
+    try:
+        allowed.update(get_active_forge_pids())
+    except Exception:
+        pass
+
     daemon_pids = set()
     try:
         from tools.bridge_state import get_daemon_pids
         daemon_pids = set(get_daemon_pids())
     except Exception:
         pass
+
+    allowed = expand_allowed_pids(allowed)
 
     current_pid = os.getpid()
 
@@ -409,12 +648,12 @@ def reap_stale_agy_processes(
                 cmdline_file = p / "cmdline"
                 if not cmdline_file.exists():
                     continue
-                cmdline = cmdline_file.read_bytes().replace(b"\x00", b" ").decode(errors="ignore").strip()
+                raw_cmdline = cmdline_file.read_bytes()
+                cmdline = raw_cmdline.replace(b"\x00", b" ").decode(errors="ignore").strip()
                 if not cmdline:
                     continue
 
-                is_agy = ("agy" in cmdline.split()[0] if cmdline.split() else False) or ("antigravity" in cmdline) or ("agy " in cmdline)
-                if not is_agy:
+                if not is_agy_command(raw_cmdline):
                     continue
 
                 age = get_process_age(pid)
