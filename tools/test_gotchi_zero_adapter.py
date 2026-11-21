@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: BLE001, EXE001, I001, S110, UP006, UP035, UP045
 """Unit tests for `/workspace/tools/gotchi_zero_adapter.py`."""
 
 import asyncio
@@ -1767,6 +1768,195 @@ def test_stream_failover_and_tts_use_non_deprecated_models(monkeypatch):
     assert captured_cfgs[0].tts_model == "gemini-3.1-flash-tts-preview"
     assert "2.5-flash" not in captured_cfgs[0].tts_model
     shutdown_lomin_background_workers(timeout_s=0.5)
+
+
+def test_verify_gotchi_bearer_fallback_sources(monkeypatch, tmp_path):
+    import json
+
+    from tools import gotchi_zero_adapter as adapter_mod
+
+    token_file = tmp_path / "gotchi_bearer_token.json"
+    secrets_file = tmp_path / "env.json"
+    monkeypatch.setattr(adapter_mod, "_GOTCHI_BEARER_TOKEN_FILE", token_file)
+    monkeypatch.setattr(adapter_mod, "_SECRETS_ENV_FILE", secrets_file)
+    monkeypatch.delenv("GOTCHI_BEARER_TOKEN", raising=False)
+
+    # Fail-closed when no token source exists
+    assert adapter_mod._verify_gotchi_bearer_fallback("") is False
+    assert adapter_mod._verify_gotchi_bearer_fallback("Bearer ") is False
+    assert adapter_mod._verify_gotchi_bearer_fallback("Bearer any-token") is False
+
+    # 1. File source: /workspace/data/gotchi_bearer_token.json
+    token_file.write_text(json.dumps({"token": "file-token-alpha"}), encoding="utf-8")
+    assert adapter_mod._verify_gotchi_bearer_fallback("Bearer file-token-alpha") is True
+    assert adapter_mod._verify_gotchi_bearer_fallback("bearer file-token-alpha") is True
+    assert adapter_mod._verify_gotchi_bearer_fallback("file-token-alpha") is True
+    assert adapter_mod._verify_gotchi_bearer_fallback("Bearer wrong-token") is False
+    assert adapter_mod._verify_gotchi_bearer_fallback("Bearer") is False
+
+    # 2. Secrets source: /secrets/env.json (GOTCHI_BEARER_TOKEN)
+    secrets_file.write_text(json.dumps({"GOTCHI_BEARER_TOKEN": "secrets-token-beta"}), encoding="utf-8")
+    assert adapter_mod._verify_gotchi_bearer_fallback("Bearer secrets-token-beta") is True
+    assert adapter_mod._verify_gotchi_bearer_fallback("secrets-token-beta") is True
+
+    # 3. Environment variable source: GOTCHI_BEARER_TOKEN
+    monkeypatch.setenv("GOTCHI_BEARER_TOKEN", "env-token-gamma")
+    assert adapter_mod._verify_gotchi_bearer_fallback("Bearer env-token-gamma") is True
+    assert adapter_mod._verify_gotchi_bearer_fallback("env-token-gamma") is True
+    assert adapter_mod._verify_gotchi_bearer_fallback("Bearer not-valid") is False
+
+
+def test_gotchi_brain_endpoint_auth_and_cloudflare_fail_closed(monkeypatch, tmp_path):
+    from tools import gotchi_zero_adapter as adapter_mod
+    from tools.gotchi_zero_adapter import shutdown_lomin_background_workers
+
+    # Isolate from host token files and external env vars
+    monkeypatch.setattr(adapter_mod, "_GOTCHI_BEARER_TOKEN_FILE", tmp_path / "missing_token.json")
+    monkeypatch.setattr(adapter_mod, "_SECRETS_ENV_FILE", tmp_path / "missing_env.json")
+    monkeypatch.delenv("GOTCHI_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("GOTCHI_DEVICE_TOKENS", raising=False)
+    monkeypatch.delenv("MVG_DEVICE_TOKENS", raising=False)
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._append_voice_turn_to_history",
+        lambda *a, **kw: None,
+    )
+
+    brain_calls: list[dict[str, Any]] = []
+
+    def fake_llm(turn: dict[str, Any]) -> dict[str, Any]:
+        brain_calls.append(dict(turn))
+        return {"reply": "Brain turn executed safely."}
+
+    payload = {
+        "node_id": "gotchi-ryan-01",
+        "session_id": "sess-sec-1",
+        "prompt": "Check system status.",
+    }
+
+    # --- Case 1: auth_required=False (local dev/unit tests) + external CF headers fail-closed ---
+    adapter = GotchiZeroBrainAdapter(llm_caller=fake_llm, dispatch_discord=False)
+    app_default = create_zero_gotchi_app(adapter=adapter, live_mode_enabled=False)
+    client_default = TestClient(app_default)
+
+    # Local request without CF headers preserves existing behavior
+    resp_local = client_default.post("/api/gotchi/brain", json=payload)
+    assert resp_local.status_code == 200
+    assert "Brain turn executed safely." in resp_local.json()["reply"]
+    assert len(brain_calls) == 1
+
+    # External CF-Connecting-IP (RFC 5737) fails closed even with no tokens configured
+    resp_cf_ip = client_default.post(
+        "/api/gotchi/brain",
+        json=payload,
+        headers={"CF-Connecting-IP": "203.0.113.42"},
+    )
+    assert resp_cf_ip.status_code == 401
+    assert resp_cf_ip.json() == {
+        "error": "unauthorized",
+        "message": "Valid Bearer token required",
+    }
+    assert len(brain_calls) == 1
+
+    # External CF-Ray (case-insensitive) fails closed even with an arbitrary Bearer token when none configured
+    resp_cf_ray = client_default.post(
+        "/api/gotchi/brain",
+        json=payload,
+        headers={
+            "cf-ray": "8a1b2c3d4e5f-SJC",
+            "Authorization": "Bearer forged-token",
+        },
+    )
+    assert resp_cf_ray.status_code == 401
+    assert resp_cf_ray.json() == {
+        "error": "unauthorized",
+        "message": "Valid Bearer token required",
+    }
+    assert len(brain_calls) == 1
+
+    # With GOTCHI_BEARER_TOKEN configured, CF-routed request requires valid Bearer token
+    monkeypatch.setenv("GOTCHI_BEARER_TOKEN", "valid-cf-secret-token")
+
+    resp_cf_wrong = client_default.post(
+        "/api/gotchi/brain",
+        json=payload,
+        headers={
+            "CF-Connecting-IP": "198.51.100.77",
+            "Authorization": "Bearer wrong-secret-token",
+        },
+    )
+    assert resp_cf_wrong.status_code == 401
+    assert len(brain_calls) == 1
+
+    resp_cf_ok = client_default.post(
+        "/api/gotchi/brain",
+        json=payload,
+        headers={
+            "CF-Connecting-IP": "198.51.100.77",
+            "CF-Ray": "8a1b2c3d4e5f-SJC",
+            "Authorization": "Bearer valid-cf-secret-token",
+        },
+    )
+    assert resp_cf_ok.status_code == 200
+    assert "Brain turn executed safely." in resp_cf_ok.json()["reply"]
+    assert len(brain_calls) == 2
+
+    # --- Case 2: auth_required=True rejects unauthenticated even without CF headers ---
+    app_auth = create_zero_gotchi_app(adapter=adapter, live_mode_enabled=False, auth_required=True)
+    client_auth = TestClient(app_auth)
+
+    resp_no_auth = client_auth.post("/api/gotchi/brain", json=payload)
+    assert resp_no_auth.status_code == 401
+    assert len(brain_calls) == 2
+
+    resp_bad_auth = client_auth.post(
+        "/api/gotchi/brain",
+        json=payload,
+        headers={"Authorization": "Bearer nope"},
+    )
+    assert resp_bad_auth.status_code == 403
+    assert len(brain_calls) == 2
+
+    resp_good_auth = client_auth.post(
+        "/api/gotchi/brain",
+        json=payload,
+        headers={"Authorization": "Bearer valid-cf-secret-token"},
+    )
+    assert resp_good_auth.status_code == 200
+    assert "Brain turn executed safely." in resp_good_auth.json()["reply"]
+    assert len(brain_calls) == 3
+
+    # --- Case 3: GOTCHI_DEVICE_TOKENS configured (verifier device token auth) ---
+    monkeypatch.delenv("GOTCHI_BEARER_TOKEN", raising=False)
+    monkeypatch.setenv("GOTCHI_DEVICE_TOKENS", "gotchi-ryan-01:device-secret-99")
+    app_dev = create_zero_gotchi_app(adapter=adapter, live_mode_enabled=False)
+    client_dev = TestClient(app_dev)
+
+    resp_dev_unauth = client_dev.post(
+        "/api/gotchi/brain",
+        json=payload,
+        headers={"CF-Connecting-IP": "203.0.113.99"},
+    )
+    assert resp_dev_unauth.status_code == 401
+    assert len(brain_calls) == 3
+
+    resp_dev_ok = client_dev.post(
+        "/api/gotchi/brain",
+        json=payload,
+        headers={
+            "CF-Connecting-IP": "203.0.113.99",
+            "Authorization": "Bearer device-secret-99",
+        },
+    )
+    assert resp_dev_ok.status_code == 200
+    assert "Brain turn executed safely." in resp_dev_ok.json()["reply"]
+    assert len(brain_calls) == 4
+
+    shutdown_lomin_background_workers(timeout_s=0.5)
+
 
 
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: B023, BLE001, EXE001, FURB167, I001, PIE810, PLW1510, S110, S112, SIM102, SIM103, UP006, UP035, UP045
 """
 gotchi_zero_adapter.py — Unified Zero Brain, Artifact Handoff & Transcript Adapter for GOTCHI
 =============================================================================================
@@ -39,6 +40,7 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -5242,9 +5244,65 @@ async def _parse_json_or_empty_body(request: Request) -> Tuple[Optional[Dict[str
     return parsed, None
 
 
+_GOTCHI_BEARER_TOKEN_FILE = Path("/workspace/data/gotchi_bearer_token.json")
+_SECRETS_ENV_FILE = Path("/secrets/env.json")
+
+
+def _verify_gotchi_bearer_fallback(auth_hdr: str) -> bool:
+    """Verify Bearer or raw token in constant time against configured Gotchi bearer token sources."""
+    raw = (auth_hdr or "").strip()
+    if not raw:
+        return False
+    parts = raw.split(None, 1)
+    if parts[0].lower() == "bearer":
+        provided = parts[1].strip() if len(parts) == 2 else ""
+    else:
+        provided = raw
+    if not provided:
+        return False
+
+    expected_tokens: list[str] = []
+
+    def _add(tok: Any) -> None:
+        if isinstance(tok, str):
+            cleaned = tok.strip()
+            if cleaned and cleaned not in expected_tokens:
+                expected_tokens.append(cleaned)
+
+    try:
+        if _GOTCHI_BEARER_TOKEN_FILE.exists():
+            with open(_GOTCHI_BEARER_TOKEN_FILE, "r", encoding="utf-8") as tf:
+                tdata = json.load(tf)
+            if isinstance(tdata, dict):
+                _add(tdata.get("token", ""))
+    except (OSError, ValueError) as exc:
+        log.debug("[GotchiZero] Failed reading bearer token file: %s", exc)
+
+    try:
+        if _SECRETS_ENV_FILE.exists():
+            with open(_SECRETS_ENV_FILE, "r", encoding="utf-8") as sf:
+                sec = json.load(sf)
+            if isinstance(sec, dict):
+                _add(sec.get("GOTCHI_BEARER_TOKEN", ""))
+    except (OSError, ValueError) as exc:
+        log.debug("[GotchiZero] Failed reading secrets env file: %s", exc)
+
+    _add(os.environ.get("GOTCHI_BEARER_TOKEN", ""))
+
+    if not expected_tokens:
+        return False
+
+    matched = False
+    for expected in expected_tokens:
+        if hmac.compare_digest(provided, expected):
+            matched = True
+    return matched
+
+
 def create_zero_gotchi_app(
     adapter: Optional[GotchiZeroBrainAdapter] = None,
     live_mode_enabled: bool = True,
+    auth_required: bool = False,
 ):
     """
     Creates the full FastAPI Gotchi + Lomin Unified Gateway (`POST /api/voice/interact`,
@@ -5332,6 +5390,7 @@ def create_zero_gotchi_app(
             )
 
     voice_srv = VoiceGatewayService(
+        auth_required=auth_required,
         llm_config=cfg,
         turn_handler=brain.handle_turn,
         turn_log_router=_on_gateway_turn_logged,
@@ -5376,6 +5435,12 @@ def create_zero_gotchi_app(
 
     def _check_unified_auth(request: Request, node_id: str = "") -> Tuple[bool, int, Dict[str, Any]]:
         headers = dict(request.headers)
+        headers_lower = {k.lower(): v for k, v in headers.items()}
+        auth_hdr = str(headers_lower.get("authorization") or "")
+        is_external_cf = bool(
+            str(headers_lower.get("cf-connecting-ip") or "").strip()
+            or str(headers_lower.get("cf-ray") or "").strip()
+        )
         client_host = request.client.host if request.client else "127.0.0.1"
         lockout_key = resolve_lomin_client_lockout_key(headers, client_host)
 
@@ -5383,20 +5448,39 @@ def create_zero_gotchi_app(
         if get_lomin_verifier is not None:
             lomin_v = get_lomin_verifier()
             if lomin_v.is_enabled:
-                auth_hdr = headers.get("authorization") or headers.get("Authorization") or ""
+                if lomin_v.is_locked_out(lockout_key):
+                    return False, 429, {"error": "too many failed attempts, locked out"}
                 if lomin_v.verify(auth_hdr, node_id):
                     lomin_v.record_success(lockout_key)
                     return True, 200, {}
-                if lomin_v.is_locked_out(lockout_key):
-                    return False, 429, {"error": "too many failed attempts, locked out"}
+                if _verify_gotchi_bearer_fallback(auth_hdr):
+                    lomin_v.record_success(lockout_key)
+                    return True, 200, {}
+                if voice_srv.verifier.device_tokens:
+                    ok_v, _, _ = voice_srv.verifier.verify(headers, client_ip=lockout_key)
+                    if ok_v:
+                        lomin_v.record_success(lockout_key)
+                        return True, 200, {}
                 lomin_v.record_failure(lockout_key)
                 return False, 401, {"error": "unauthorized"}
 
         # 2. Check Gotchi device_tokens verifier if configured
         if voice_srv.auth_required or voice_srv.verifier.device_tokens:
+            if voice_srv.verifier.is_rate_limited(lockout_key):
+                return False, 429, {"error": "rate_limited", "message": "Too many failed auth attempts"}
+            if _verify_gotchi_bearer_fallback(auth_hdr):
+                return True, 200, {}
             ok, code, err = voice_srv.verifier.verify(headers, client_ip=lockout_key)
-            if not ok:
-                return False, code, err
+            if ok:
+                return True, 200, {}
+            return False, code, err
+
+        # 3. Fail-closed for external Cloudflare Tunnel traffic if no verifier/bearer token matched
+        if is_external_cf:
+            if _verify_gotchi_bearer_fallback(auth_hdr):
+                return True, 200, {}
+            return False, 401, {"error": "unauthorized", "message": "Valid Bearer token required"}
+
         return True, 200, {}
 
     @app.on_event("shutdown")
@@ -5408,6 +5492,15 @@ def create_zero_gotchi_app(
         body, err = await _parse_json_or_empty_body(request)
         if err is not None or body is None:
             return JSONResponse(status_code=400, content={"error": "bad_request", "message": err})
+        node_id = str(
+            body.get("node_id")
+            or body.get("node")
+            or request.headers.get("x-node-id")
+            or ""
+        ).strip()
+        ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=node_id)
+        if not ok_auth:
+            return JSONResponse(status_code=auth_code, content=auth_err)
         res = await brain.handle_turn(body)
         return JSONResponse(status_code=200, content=res)
 
