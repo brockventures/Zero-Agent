@@ -1,27 +1,125 @@
 #!/usr/bin/env python3
 """Interactive Playwright Google Photos Auth & Album Sync Daemon for Brock Hearth.
 
-Listens on 0.0.0.0:8098 so hearth-ical-bridge (/hearth-api/photos/interactive/*)
-can render a live interactive Google Sign-In session directly inside the
-ApoloSign Android tablet's WebView without X-Frame-Options restrictions.
+Listens on 127.0.0.1:8098 (configurable via HEARTH_PHOTOS_DAEMON_HOST) so
+hearth-ical-bridge (/hearth-api/photos/interactive/*) can render a live
+interactive Google Sign-In session directly inside the ApoloSign Android
+tablet's WebView without X-Frame-Options restrictions.
 """
 
 import base64
+import hmac
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 import re
 import threading
 import time
+import urllib.parse
 import urllib.request
-from playwright.sync_api import sync_playwright
 
+try:
+  from playwright.sync_api import sync_playwright
+except ImportError:  # pragma: no cover
+  sync_playwright = None
+
+SECRETS_ENV_PATH = "/secrets/env.json"
 PROFILE_DIR = "/workspace/data/hearth_gphotos_profile"
-ALBUM_URL = "https://photos.google.com/share/AF1QipP4bhMA5NcQrYuOJ9orqYIf7PDRZklHk4zMtdKaREch057I8BUy9Jwu5bsNapl-ew?key=b21uM2VDMWtaWFd4M1EtWUpINll6MzBwT3VHR3BR"
-AUTH_URL = (
-    ALBUM_URL + f"&obfsgid={os.environ.get('GOOGLE_PHOTOS_OBFSGID', '')}&email={os.environ.get('GOOGLE_PHOTOS_EMAIL', '')}"
-)
+DEFAULT_BIND_HOST = "127.0.0.1"
+DEFAULT_BIND_PORT = 8098
 HEARTH_IMPORT_URL = "http://127.0.0.1:8099/hearth-api/photos/sync"
+ALLOWED_AUTH_HOSTS = frozenset({"photos.google.com", "accounts.google.com"})
+
+
+def _load_secrets_env() -> dict:
+  try:
+    if os.path.exists(SECRETS_ENV_PATH):
+      with open(SECRETS_ENV_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+        if isinstance(data, dict):
+          return data
+  except Exception:
+    pass
+  return {}
+
+
+def _get_config(key: str, default: str = "") -> str:
+  val = os.environ.get(key)
+  if val is not None and str(val).strip():
+    return str(val).strip()
+  secrets = _load_secrets_env()
+  sval = secrets.get(key)
+  if sval is not None and str(sval).strip():
+    return str(sval).strip()
+  return default
+
+
+def _build_auth_url(album_url: str = "") -> str:
+  base = album_url or _get_config("HEARTH_GPHOTOS_ALBUM_URL", ALBUM_URL)
+  if not base:
+    return ""
+  sep = "&" if "?" in base else "?"
+  obfsgid = _get_config("GOOGLE_PHOTOS_OBFSGID", "")
+  email = _get_config("GOOGLE_PHOTOS_EMAIL", "")
+  return f"{base}{sep}obfsgid={obfsgid}&email={email}"
+
+
+def _is_allowed_auth_url(url: str) -> bool:
+  if not isinstance(url, str) or not url:
+    return False
+  if any(ch.isspace() for ch in url):
+    return False
+  try:
+    parsed = urllib.parse.urlparse(url)
+    port = parsed.port
+  except ValueError:
+    return False
+  if parsed.scheme.lower() != "https":
+    return False
+  if parsed.username is not None or parsed.password is not None:
+    return False
+  if port is not None and port != 443:
+    return False
+  hostname = (parsed.hostname or "").lower()
+  return hostname in ALLOWED_AUTH_HOSTS
+
+
+def _get_auth_tokens() -> list[str]:
+  tokens = []
+  for key in ("HEARTH_PHOTOS_AUTH_TOKEN", "ZERO_HEALTH_ADMIN_TOKEN"):
+    val = _get_config(key, "")
+    if val and val not in tokens:
+      tokens.append(val)
+  return tokens
+
+
+def _is_authorized(auth_header: str) -> bool:
+  if not isinstance(auth_header, str):
+    return False
+  parts = auth_header.strip().split(" ", 1)
+  if len(parts) != 2 or parts[0].lower() != "bearer":
+    return False
+  provided = parts[1].strip()
+  if not provided:
+    return False
+  expected_tokens = _get_auth_tokens()
+  if not expected_tokens:
+    return False
+  return any(hmac.compare_digest(provided, tok) for tok in expected_tokens)
+
+
+def get_bind_address() -> tuple[str, int]:
+  host = _get_config("HEARTH_PHOTOS_DAEMON_HOST", DEFAULT_BIND_HOST) or DEFAULT_BIND_HOST
+  try:
+    port = int(_get_config("HEARTH_PHOTOS_DAEMON_PORT", str(DEFAULT_BIND_PORT)))
+  except ValueError:
+    port = DEFAULT_BIND_PORT
+  return host, port
+
+
+ALBUM_URL = _get_config("HEARTH_GPHOTOS_ALBUM_URL", "")
+ALBUM_TITLE = _get_config("HEARTH_GPHOTOS_ALBUM_TITLE", "Family Album")
+AUTH_URL = _build_auth_url(ALBUM_URL)
 
 PHOTO_PAT = re.compile(
     r'https://lh3\.googleusercontent\.com/(?:pw|p)/[A-Za-z0-9_\-]+(?![A-Za-z0-9_\-=])'
@@ -63,10 +161,12 @@ def extract_photos_from_html(html_text: str) -> list[str]:
 
 
 def push_to_hearth(photos: list[str]) -> bool:
+  album_url = _get_config("HEARTH_GPHOTOS_ALBUM_URL", ALBUM_URL)
+  album_title = _get_config("HEARTH_GPHOTOS_ALBUM_TITLE", ALBUM_TITLE)
   payload = json.dumps({
       "photos": photos,
-      "album_url": ALBUM_URL,
-      "title": "Rosie and Isaac",
+      "album_url": album_url,
+      "title": album_title,
   }).encode("utf-8")
   req = urllib.request.Request(
       HEARTH_IMPORT_URL,
@@ -83,6 +183,8 @@ def push_to_hearth(photos: list[str]) -> bool:
 
 
 def browser_worker():
+  if sync_playwright is None:
+    raise RuntimeError("playwright is not installed")
   os.makedirs(PROFILE_DIR, exist_ok=True)
   with sync_playwright() as p:
     ctx = p.chromium.launch_persistent_context(
@@ -107,9 +209,15 @@ def browser_worker():
         action = cmd.get("action")
         try:
           if action == "start":
-            target = cmd.get("url") or AUTH_URL
-            page.goto(target, wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_timeout(1200)
+            target = cmd.get("url") or _build_auth_url() or AUTH_URL
+            if not _is_allowed_auth_url(target):
+              with state_lock:
+                latest_state["error"] = "disallowed auth URL"
+                latest_state["active"] = False
+              cmd = None
+            else:
+              page.goto(target, wait_until="domcontentloaded", timeout=25000)
+              page.wait_for_timeout(1200)
           elif action == "click":
             x = float(cmd.get("x", 450))
             y = float(cmd.get("y", 310))
@@ -172,12 +280,20 @@ class Handler(BaseHTTPRequestHandler):
     raw = json.dumps(data).encode("utf-8")
     self.send_response(code)
     self.send_header("Content-Type", "application/json")
-    self.send_header("Access-Control-Allow-Origin", "*")
     self.send_header("Content-Length", str(len(raw)))
     self.end_headers()
     self.wfile.write(raw)
 
+  def _require_auth(self) -> bool:
+    auth_header = self.headers.get("Authorization", "") if self.headers else ""
+    if not _is_authorized(auth_header):
+      self._json(401, {"error": "unauthorized"})
+      return False
+    return True
+
   def do_GET(self):
+    if not self._require_auth():
+      return
     if self.path.startswith("/status"):
       with state_lock:
         self._json(200, dict(latest_state))
@@ -185,10 +301,25 @@ class Handler(BaseHTTPRequestHandler):
     self._json(404, {"error": "not found"})
 
   def do_POST(self):
-    length = int(self.headers.get("Content-Length", "0") or "0")
-    body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+    if not self._require_auth():
+      return
+    try:
+      length = int(self.headers.get("Content-Length", "0") or "0")
+      raw_body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+      body = json.loads(raw_body or "{}")
+    except (ValueError, json.JSONDecodeError):
+      self._json(400, {"error": "invalid json"})
+      return
+    if not isinstance(body, dict):
+      self._json(400, {"error": "invalid payload"})
+      return
     if self.path.startswith("/action"):
       action = body.get("action", "start")
+      if action == "start":
+        target = body.get("url") or _build_auth_url() or AUTH_URL
+        if not _is_allowed_auth_url(target):
+          self._json(400, {"error": "disallowed auth URL"})
+          return
       with state_lock:
         if action == "start":
           latest_state["active"] = True
@@ -209,8 +340,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+  host, port = get_bind_address()
   t = threading.Thread(target=browser_worker, daemon=True)
   t.start()
-  server = HTTPServer(("0.0.0.0", 8098), Handler)
-  print("Hearth Photos Auth Daemon listening on 0.0.0.0:8098")
+  server = HTTPServer((host, port), Handler)
+  print(f"Hearth Photos Auth Daemon listening on {host}:{port}")
   server.serve_forever()

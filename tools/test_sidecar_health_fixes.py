@@ -554,3 +554,255 @@ def test_slzb_flash_stable_flow(tmp_path):
             assert "--message" in cmd
             assert "3.4.5" in " ".join(cmd)
 
+
+# ==============================================================================
+# 6. Hearth Photos Auth Daemon & Webcam Stream Proxy security hardening tests
+# ==============================================================================
+
+
+def test_hearth_photos_daemon_static_hygiene():
+    """Verify no hardcoded Google Photos capability URL, wildcard CORS, or 0.0.0.0 bind."""
+    src_path = os.path.join(REPO_ROOT, "tools", "hearth_photos_auth_daemon.py")
+    src = open(src_path, "r", encoding="utf-8").read()
+    assert "photos.google.com/share/" not in src
+    assert "?key=" not in src
+    assert "Access-Control-Allow-Origin" not in src
+    assert "0.0.0.0" not in src
+
+
+def test_hearth_photos_daemon_url_allowlist_and_config(tmp_path, monkeypatch):
+    """Verify _is_allowed_auth_url allowlist, dynamic config fallback, and 127.0.0.1 bind."""
+    from tools import hearth_photos_auth_daemon as daemon
+
+    # URL allowlist checks
+    assert daemon._is_allowed_auth_url("https://photos.google.com/share/REDACTED_TEST_ALBUM") is True
+    assert daemon._is_allowed_auth_url("https://accounts.google.com/signin/v2/identifier") is True
+
+    for bad_url in (
+        "",
+        None,
+        "http://photos.google.com/share/REDACTED_TEST_ALBUM",
+        "https://evil.example/photos.google.com",
+        "https://photos.google.com.evil.example/share/abc",
+        "https://sub.photos.google.com/share/abc",
+        "https://user:pass@photos.google.com/share/abc",
+        "https://photos.google.com:8443/share/abc",
+        "https://photos.google.com/share/abc\nmalicious",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "http://127.0.0.1:8099/hearth-api/photos/sync",
+    ):
+        assert daemon._is_allowed_auth_url(bad_url) is False, f"Should reject {bad_url!r}"
+
+    # Dynamic config loading & bind address defaults
+    secrets_file = tmp_path / "env.json"
+    secrets_file.write_text(
+        json.dumps({
+            "HEARTH_GPHOTOS_ALBUM_URL": "https://photos.google.com/share/REDACTED_FROM_SECRETS",
+            "HEARTH_GPHOTOS_ALBUM_TITLE": "Test Family Album",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(daemon, "SECRETS_ENV_PATH", str(secrets_file))
+    for k in ("HEARTH_GPHOTOS_ALBUM_URL", "HEARTH_GPHOTOS_ALBUM_TITLE", "HEARTH_PHOTOS_DAEMON_HOST"):
+        monkeypatch.delenv(k, raising=False)
+
+    assert daemon.get_bind_address() == ("127.0.0.1", 8098)
+    assert daemon._get_config("HEARTH_GPHOTOS_ALBUM_URL", "") == "https://photos.google.com/share/REDACTED_FROM_SECRETS"
+    assert daemon._get_config("HEARTH_GPHOTOS_ALBUM_TITLE", "Family Album") == "Test Family Album"
+
+    monkeypatch.setenv("HEARTH_PHOTOS_DAEMON_HOST", DOC_HOST_1)
+    assert daemon.get_bind_address() == (DOC_HOST_1, 8098)
+
+    # push_to_hearth uses dynamic title and album_url
+    captured_reqs = []
+
+    class _FakeResp:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, timeout=15):
+        captured_reqs.append(req)
+        return _FakeResp()
+
+    with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+        assert daemon.push_to_hearth(["https://lh3.googleusercontent.com/pw/sample=w1920-h1080"]) is True
+    sent_payload = json.loads(captured_reqs[0].data.decode("utf-8"))
+    assert sent_payload["album_url"] == "https://photos.google.com/share/REDACTED_FROM_SECRETS"
+    assert sent_payload["title"] == "Test Family Album"
+
+
+def test_hearth_photos_daemon_http_auth_and_url_rejection(tmp_path, monkeypatch):
+    """Verify fail-closed Bearer auth, URL rejection (400), and omitted wildcard CORS."""
+    from http.server import HTTPServer
+    import threading
+    import urllib.error
+    import urllib.request
+    from tools import hearth_photos_auth_daemon as daemon
+
+    missing_secrets = tmp_path / "missing_env.json"
+    monkeypatch.setattr(daemon, "SECRETS_ENV_PATH", str(missing_secrets))
+    for k in ("HEARTH_PHOTOS_AUTH_TOKEN", "ZERO_HEALTH_ADMIN_TOKEN", "HEARTH_GPHOTOS_ALBUM_URL"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(daemon, "ALBUM_URL", "")
+    monkeypatch.setattr(daemon, "AUTH_URL", "")
+    monkeypatch.setattr(daemon, "cmd_queue", [])
+
+    server = HTTPServer(("127.0.0.1", 0), daemon.Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def _request(method: str, path: str, body: dict | None = None, token: str | None = None):
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, dict(resp.headers), json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), json.loads(e.read().decode("utf-8"))
+
+    try:
+        # 1. Fail closed when no token is configured
+        status, headers, _ = _request("GET", "/status")
+        assert status == 401
+        assert "Access-Control-Allow-Origin" not in headers
+
+        # 2. Configure dedicated token and verify missing/wrong/valid auth
+        monkeypatch.setenv("HEARTH_PHOTOS_AUTH_TOKEN", "hearth-secret-tok-123")
+        status, headers, _ = _request("GET", "/status")
+        assert status == 401
+        status, headers, _ = _request("GET", "/status", token="wrong-token")
+        assert status == 401
+        status, headers, data = _request("GET", "/status", token="hearth-secret-tok-123")
+        assert status == 200
+        assert "Access-Control-Allow-Origin" not in headers
+        assert "active" in data
+
+        # 3. Reject disallowed auth URL with HTTP 400
+        status, _, err = _request(
+            "POST",
+            "/action",
+            body={"action": "start", "url": "https://evil.example/steal"},
+            token="hearth-secret-tok-123",
+        )
+        assert status == 400
+        assert "disallowed" in err.get("error", "").lower()
+        assert daemon.cmd_queue == []
+
+        # 4. Accept allowed Google auth URL
+        with patch.object(daemon.time, "sleep"):
+            status, _, _ = _request(
+                "POST",
+                "/action",
+                body={"action": "start", "url": "https://accounts.google.com/signin"},
+                token="hearth-secret-tok-123",
+            )
+        assert status == 200
+        assert len(daemon.cmd_queue) == 1
+
+        # 5. Fallback to ZERO_HEALTH_ADMIN_TOKEN from /secrets/env.json
+        monkeypatch.delenv("HEARTH_PHOTOS_AUTH_TOKEN", raising=False)
+        secrets_file = tmp_path / "env.json"
+        secrets_file.write_text(json.dumps({"ZERO_HEALTH_ADMIN_TOKEN": "admin-tok-456"}), encoding="utf-8")
+        monkeypatch.setattr(daemon, "SECRETS_ENV_PATH", str(secrets_file))
+        status, _, _ = _request("GET", "/status", token="admin-tok-456")
+        assert status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_webcam_stream_proxy_defaults_and_no_wildcard_cors(monkeypatch):
+    """Verify webcam_stream_proxy binds to 127.0.0.1 by default and omits wildcard CORS."""
+    from tools import webcam_stream_proxy as proxy
+
+    src_path = os.path.join(REPO_ROOT, "tools", "webcam_stream_proxy.py")
+    src = open(src_path, "r", encoding="utf-8").read()
+    assert "Access-Control-Allow-Origin" not in src
+    assert "0.0.0.0" not in src
+
+    monkeypatch.delenv("WEBCAM_PROXY_HOST", raising=False)
+    args = proxy.build_arg_parser().parse_args([])
+    assert args.host == "127.0.0.1"
+
+    monkeypatch.setenv("WEBCAM_PROXY_HOST", DOC_HOST_2)
+    args_override = proxy.build_arg_parser().parse_args([])
+    assert args_override.host == DOC_HOST_2
+
+
+def test_webcam_stream_proxy_auth_and_non_loopback_rejection(tmp_path, monkeypatch):
+    """Verify webcam_stream_proxy enforces fail-closed Bearer auth for non-loopback and configured tokens."""
+    import asyncio
+    from starlette.requests import Request
+    from tools import webcam_stream_proxy as proxy
+
+    missing_secrets = tmp_path / "missing_env.json"
+    monkeypatch.setattr(proxy, "SECRETS_ENV_PATH", missing_secrets)
+    for k in ("WEBCAM_PROXY_TOKEN", "ZERO_HEALTH_ADMIN_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+
+    def _make_request(path: str, client_host: str, token: str | None = None) -> Request:
+        headers = []
+        if token is not None:
+            headers.append((b"authorization", f"Bearer {token}".encode("latin-1")))
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": headers,
+            "client": (client_host, 54321),
+            "server": ("127.0.0.1", 3334),
+        }
+        return Request(scope)
+
+    # 1. No token configured: non-loopback client fails closed with 401
+    non_loopback_req = _make_request("/snapshot", DOC_HOST_1)
+    err = proxy._check_request_auth(non_loopback_req)
+    assert err is not None and err.status_code == 401
+
+    resp_snap = asyncio.run(proxy.handle_snapshot(non_loopback_req))
+    assert resp_snap.status_code == 401
+
+    resp_stream = asyncio.run(proxy.get_stream(_make_request("/video", DOC_HOST_1)))
+    assert resp_stream.status_code == 401
+
+    # 2. No token configured: loopback client is permitted
+    assert proxy._check_request_auth(_make_request("/status", "127.0.0.1")) is None
+    assert proxy._check_request_auth(_make_request("/status", "::1")) is None
+
+    # 3. Token configured via WEBCAM_PROXY_TOKEN: required on both loopback and non-loopback
+    monkeypatch.setenv("WEBCAM_PROXY_TOKEN", "cam-secret-789")
+    err_loopback = proxy._check_request_auth(_make_request("/status", "127.0.0.1"))
+    assert err_loopback is not None and err_loopback.status_code == 401
+    err_wrong = proxy._check_request_auth(_make_request("/status", DOC_HOST_1, token="bad-tok"))
+    assert err_wrong is not None and err_wrong.status_code == 401
+    assert proxy._check_request_auth(_make_request("/status", DOC_HOST_1, token="cam-secret-789")) is None
+    assert proxy._check_request_auth(_make_request("/status", "127.0.0.1", token="cam-secret-789")) is None
+
+    # 4. Authorized /video response omits Access-Control-Allow-Origin
+    stream_resp = asyncio.run(proxy.get_stream(_make_request("/video", DOC_HOST_1, token="cam-secret-789")))
+    assert stream_resp.status_code == 200
+    assert "access-control-allow-origin" not in {k.lower() for k in stream_resp.headers.keys()}
+
+    # 5. Fallback to ZERO_HEALTH_ADMIN_TOKEN in /secrets/env.json
+    monkeypatch.delenv("WEBCAM_PROXY_TOKEN", raising=False)
+    secrets_file = tmp_path / "env.json"
+    secrets_file.write_text(json.dumps({"ZERO_HEALTH_ADMIN_TOKEN": "admin-cam-tok"}), encoding="utf-8")
+    monkeypatch.setattr(proxy, "SECRETS_ENV_PATH", secrets_file)
+    assert proxy._check_request_auth(_make_request("/status", DOC_HOST_1, token="admin-cam-tok")) is None
+    err_missing = proxy._check_request_auth(_make_request("/status", "127.0.0.1"))
+    assert err_missing is not None and err_missing.status_code == 401
+
+

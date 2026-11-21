@@ -11,6 +11,8 @@ Intercepts stream and snapshot connections from OctoPrint and browser clients:
 
 import sys
 import os
+import hmac
+import json
 import time
 import signal
 import asyncio
@@ -21,7 +23,7 @@ from pathlib import Path
 
 import aiohttp
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -32,8 +34,77 @@ import webcam_control
 
 PID_FILE = Path("/workspace/data/3dprint/proxy.pid")
 LOG_FILE = Path("/workspace/data/3dprint/proxy.log")
+SECRETS_ENV_PATH = Path("/secrets/env.json")
+DEFAULT_BIND_HOST = "127.0.0.1"
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 
 app = FastAPI(title="Zero On-Demand Webcam Proxy", version="1.0.0")
+
+
+def _load_secrets_env() -> dict:
+    try:
+        if SECRETS_ENV_PATH.exists():
+            data = json.loads(SECRETS_ENV_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _get_config(key: str, default: str = "") -> str:
+    val = os.environ.get(key)
+    if val is not None and str(val).strip():
+        return str(val).strip()
+    secrets = _load_secrets_env()
+    sval = secrets.get(key)
+    if sval is not None and str(sval).strip():
+        return str(sval).strip()
+    return default
+
+
+def _get_auth_tokens() -> list[str]:
+    tokens: list[str] = []
+    for key in ("WEBCAM_PROXY_TOKEN", "ZERO_HEALTH_ADMIN_TOKEN"):
+        val = _get_config(key, "")
+        if val and val not in tokens:
+            tokens.append(val)
+    return tokens
+
+
+def _is_authorized(auth_header: str, tokens: Optional[list[str]] = None) -> bool:
+    if not isinstance(auth_header, str):
+        return False
+    parts = auth_header.strip().split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return False
+    provided = parts[1].strip()
+    if not provided:
+        return False
+    expected = _get_auth_tokens() if tokens is None else tokens
+    if not expected:
+        return False
+    return any(hmac.compare_digest(provided, tok) for tok in expected)
+
+
+def _check_request_auth(request: Request) -> Optional[JSONResponse]:
+    """Enforce Bearer auth when any token is configured or client is non-loopback."""
+    client_host = request.client.host if request.client else ""
+    is_loopback = client_host in LOOPBACK_HOSTS
+    tokens = _get_auth_tokens()
+    if not is_loopback or tokens:
+        auth_header = request.headers.get("authorization", "")
+        if not _is_authorized(auth_header, tokens):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    return None
+
+
+@app.middleware("http")
+async def enforce_auth_middleware(request: Request, call_next):
+    auth_error = _check_request_auth(request)
+    if auth_error is not None:
+        return auth_error
+    return await call_next(request)
 
 
 class StreamManager:
@@ -170,6 +241,10 @@ async def stream_generator(request: Request):
 @app.api_route("/webcam/", methods=["GET", "HEAD"])
 @app.api_route("/webcam/?action=stream", methods=["GET", "HEAD"])
 async def get_stream(request: Request):
+    auth_error = _check_request_auth(request)
+    if auth_error is not None:
+        return auth_error
+
     action = request.query_params.get("action", "stream")
     if action == "snapshot":
         return await handle_snapshot(request)
@@ -181,7 +256,6 @@ async def get_stream(request: Request):
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, pre-check=0, post-check=0, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
-    response.headers["Access-Control-Allow-Origin"] = "*"
     return response
 
 
@@ -190,6 +264,10 @@ async def get_stream(request: Request):
 @app.api_route("/webcam/?action=snapshot", methods=["GET", "POST", "HEAD"])
 async def handle_snapshot(request: Request):
     """Return single JPEG snapshot, waking camera if needed."""
+    auth_error = _check_request_auth(request)
+    if auth_error is not None:
+        return auth_error
+
     ok = await manager.ensure_camera_running()
     if not ok:
         return Response(status_code=503, content=b"Camera unavailable")
@@ -207,7 +285,6 @@ async def handle_snapshot(request: Request):
                     media_type="image/jpeg",
                     headers={
                         "Cache-Control": "no-cache, no-store, must-revalidate",
-                        "Access-Control-Allow-Origin": "*",
                     },
                 )
         except Exception as e:
@@ -286,14 +363,24 @@ def start_daemon(host: str, port: int, idle_timeout: float):
     return True
 
 
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
+    default_host = os.environ.get("WEBCAM_PROXY_HOST", "").strip() or DEFAULT_BIND_HOST
     parser = argparse.ArgumentParser(description="Zero On-Demand Webcam Proxy")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    parser.add_argument(
+        "--host",
+        default=default_host,
+        help="Bind address (default: 127.0.0.1 or $WEBCAM_PROXY_HOST)",
+    )
     parser.add_argument("--port", type=int, default=3334, help="Listen port (default: 3334)")
     parser.add_argument("--idle-timeout", type=float, default=30.0, help="Idle timeout in seconds (default: 30.0)")
     parser.add_argument("--daemon", action="store_true", help="Run proxy in background detached")
     parser.add_argument("--stop", action="store_true", help="Stop running proxy daemon")
     parser.add_argument("--status", action="store_true", help="Check proxy status")
+    return parser
+
+
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     if args.stop:
