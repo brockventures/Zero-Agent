@@ -494,6 +494,88 @@ NODE_SPEAKER_PROFILES: Dict[str, str] = {
     "ryan": "Ryan",
 }
 
+OWNER_GOTCHI_NODE_IDS = frozenset({
+    "gotchi-ryan-01",
+    "gotchi-v1-01",
+    "gotchi-lomin-01",
+    "ryan",
+})
+
+_OWNER_ONLY_GOTCHI_TOOLS = frozenset({
+    "run_shell_command",
+    "write_local_file",
+    "read_local_file",
+    "home_assistant_control",
+    "check_calendar",
+    "tv_and_plex_control",
+    "check_3d_printer",
+    "grocery_list_action",
+    "search_zero_memory",
+    "check_tasks_and_repos",
+    "handoff_to_zero_runtime",
+    "post_note_to_zero_chat",
+})
+
+_COLLABORATOR_ALLOWED_DISCORD_CHANNEL_IDS = frozenset({
+    "1534452820995080192",  # #lounge
+    "1561509863018856468",  # #gotchi
+    "1562246590943461429",  # #gotchi-chat
+    "1534436119888793750",  # #the-banana-stand
+    "1551465050072416286",  # #side-project
+    "1552732003076669460",  # #mirrormere
+    "1549555629222404096",  # #debug-huddle
+    "1558202642663211169",  # #agora
+    "1562544598423965856",  # #r-residentagents
+})
+
+
+def _is_private_memory_path(file_path: str) -> bool:
+    """Returns True if a file path points into private/vault/secret memory or owner-only data."""
+    low = (file_path or "").replace("\\", "/").strip().lower()
+    if not low:
+        return False
+    parts = [seg for seg in Path(low).parts if seg and seg != "/"]
+    if any(seg in ("private", "vault", "secrets", ".env", ".ssh") for seg in parts):
+        return True
+    basename = parts[-1] if parts else ""
+    if basename in ("user_ryan.md", "tasks.json", "channel_history.json", "schedule.json", "grocery_list.json"):
+        return True
+    return False
+
+
+def is_owner_gotchi_node(
+    node_id: Optional[str] = None,
+    *,
+    is_loopback: bool = False,
+) -> bool:
+    """
+    Returns True ONLY for Ryan's owner-bound Gotchi nodes (explicit owner node IDs,
+    nodes resolving strictly to Ryan in NODE_SPEAKER_PROFILES, or empty node_id ONLY on
+    loopback). Returns False for all collaborator nodes (mike, coley, alex) and any
+    unknown non-owner nodes.
+    """
+    raw = (node_id or "").strip().lower()
+    if not raw:
+        return bool(is_loopback)
+
+    # Check non-owner collaborator keys first so composite spoofs (e.g. 'gotchi-mike-ryan') fail closed
+    for key, label in NODE_SPEAKER_PROFILES.items():
+        if label.lower() != "ryan" and key in raw:
+            return False
+
+    extra_owners = {
+        item.strip().lower()
+        for item in os.environ.get("GOTCHI_OWNER_NODE_IDS", "").split(",")
+        if item.strip()
+    }
+    if raw in OWNER_GOTCHI_NODE_IDS or raw in extra_owners:
+        return True
+
+    if "ryan" in raw:
+        return True
+
+    return False
+
 
 def resolve_speaker_for_node(node_id: str = "gotchi-v1-01", speaker: Optional[str] = None) -> str:
     if speaker is not None and str(speaker).strip():
@@ -506,7 +588,9 @@ def resolve_speaker_for_node(node_id: str = "gotchi-v1-01", speaker: Optional[st
     for key, label in NODE_SPEAKER_PROFILES.items():
         if key in nid_low:
             return label
-    return "Ryan"
+    if is_owner_gotchi_node(node_id):
+        return "Ryan"
+    return "Guest"
 
 
 def format_voice_turn_prefix(node_id: str = "gotchi-v1-01", speaker: Optional[str] = None) -> str:
@@ -873,13 +957,16 @@ def fetch_live_weather(location: str = DEFAULT_HOME_LOCATION) -> Dict[str, Any]:
         }
 
 
-def _build_gotchi_tools() -> list[Any]:
+def _build_gotchi_tools(node_id: Optional[str] = "gotchi-ryan-01") -> list[Any]:
     """
     Extends `_build_live_tools()` with `request_deep_thinking`, `get_weather_forecast`,
     and updated `get_recent_discord_context` supporting Crab Cavern and Home channels.
+    For non-owner/collaborator nodes, strips owner-only tools (Home Assistant, calendar,
+    private memory, tasks, shell/file mutations, #zero-chat handoff).
     """
     from google.genai import types
 
+    is_owner = is_owner_gotchi_node(node_id)
     base_tools = _build_live_tools()
     f_decls = []
     for t in base_tools:
@@ -1171,6 +1258,10 @@ def _build_gotchi_tools() -> list[Any]:
                 ),
             )
         )
+    if not is_owner:
+        f_decls = [
+            d for d in f_decls if getattr(d, "name", None) not in _OWNER_ONLY_GOTCHI_TOOLS
+        ]
     return [types.Tool(function_declarations=f_decls)]
 
 
@@ -1198,12 +1289,20 @@ def _compute_context_cache_fingerprint(sys_prompt: str, tools_list: List[Any]) -
 _MEM_FTS_CONN: Optional[sqlite3.Connection] = None
 
 
-def prefetch_zero_memory(query: str, limit: int = 4) -> str:
+def prefetch_zero_memory(
+    query: str,
+    limit: int = 4,
+    node_id: Optional[str] = "gotchi-ryan-01",
+) -> str:
     """
     In-process SQLite FTS5 (`memory_fts`) memory recall with persistent read-only connection.
     Avoids spawning a Python subprocess on every Push-to-Talk turn.
+    Strictly gated on `is_owner_gotchi_node(node_id)` so collaborator/non-owner nodes never
+    receive Ryan's private or vault memory hits.
     """
     global _MEM_FTS_CONN
+    if not is_owner_gotchi_node(node_id):
+        return ""
     clean_q = (query or "").strip()
     if not clean_q or len(clean_q) < 4:
         return ""
@@ -1257,10 +1356,25 @@ def send_gotchi_artifact_to_zero_chat(
     Dispatches clickable hyperlinks, code snippets, local visual/CAD artifacts (`file_path`),
     or live webpage screenshots (`screenshot_url`) to `#zero-chat`
     and optionally mirrors to `#gotchi-chat`.
+    Validates `file_path` against `is_allowed_voice_read_path` before delivering any file.
     """
     clean_msg = (message or "").strip()
     resolved_file = (file_path or "").strip()
     clean_shot_url = (screenshot_url or "").strip()
+
+    if resolved_file:
+        allowed_path, reason_or_resolved = is_allowed_voice_read_path(resolved_file)
+        if not allowed_path:
+            log.warning(
+                f"[GotchiZero] Blocked artifact delivery for disallowed path {resolved_file!r}: {reason_or_resolved}"
+            )
+            return {
+                "ok": False,
+                "error": f"Blocked by artifact path allowlist: {reason_or_resolved}",
+                "file_path": resolved_file,
+                "file_delivered": False,
+            }
+        resolved_file = reason_or_resolved
 
     if clean_shot_url and not resolved_file:
         try:
@@ -1292,24 +1406,37 @@ def send_gotchi_artifact_to_zero_chat(
         pass
 
     file_delivered = False
-    if resolved_file and Path(resolved_file).exists():
-        try:
-            from tools.deliver_image import deliver_file
-
-            res_zero = deliver_file(
-                resolved_file,
-                channel_input=str(TARGET_CHANNEL_ID),
-                caption=header_msg,
+    if resolved_file:
+        allowed_deliver, resolved_deliver = is_allowed_voice_read_path(resolved_file)
+        if not allowed_deliver:
+            log.warning(
+                f"[GotchiZero] Blocked artifact delivery before upload for {resolved_file!r}: {resolved_deliver}"
             )
-            file_delivered = bool(res_zero.get("success"))
-            if mirror_gotchi_chat:
-                deliver_file(
+            return {
+                "ok": False,
+                "error": f"Blocked by artifact path allowlist: {resolved_deliver}",
+                "file_path": resolved_file,
+                "file_delivered": False,
+            }
+        resolved_file = resolved_deliver
+        if Path(resolved_file).exists():
+            try:
+                from tools.deliver_image import deliver_file
+
+                res_zero = deliver_file(
                     resolved_file,
-                    channel_input=str(GOTCHI_CHAT_CHANNEL_ID),
+                    channel_input=str(TARGET_CHANNEL_ID),
                     caption=header_msg,
                 )
-        except Exception as exc:
-            log.warning(f"[GotchiZero] deliver_file fallback to outbox: {exc}")
+                file_delivered = bool(res_zero.get("success"))
+                if mirror_gotchi_chat:
+                    deliver_file(
+                        resolved_file,
+                        channel_input=str(GOTCHI_CHAT_CHANNEL_ID),
+                        caption=header_msg,
+                    )
+            except Exception as exc:
+                log.warning(f"[GotchiZero] deliver_file fallback to outbox: {exc}")
 
     if not file_delivered:
         if not clean_msg and not resolved_file:
@@ -1610,11 +1737,33 @@ def resolve_lomin_client_lockout_key(
     return f"ip:{host_clean}"
 
 
-def build_gotchi_static_system_instruction() -> str:
+def build_gotchi_static_system_instruction(node_id: Optional[str] = "gotchi-ryan-01") -> str:
     """
     Builds the static Zero system instruction for Gotchi's direct Gemini API brain,
     suitable for explicit Gemini Context Caching (~15,000 tokens).
+    For collaborator / non-owner nodes (`not is_owner_gotchi_node(node_id)`), strictly omits
+    Ryan's private startup snapshot (`user_ryan.md`, `tasks.json`, `#zero-chat` history)
+    and private homelab/home-control instructions.
     """
+    if not is_owner_gotchi_node(node_id):
+        speaker = resolve_speaker_for_node(node_id or "")
+        return (
+            "You are Zero, an autonomous AI engineering partner collaborating in Crab Cavern.\n"
+            f"You are speaking with {speaker} through a collaborator GOTCHI hardware companion "
+            f"(node={node_id or 'unknown'}, voice `{DEFAULT_VOICE_NAME}`).\n\n"
+            "COLLABORATOR NODE PERSONA & PRIVACY ISOLATION INVARIANTS:\n"
+            "- Speak STRICTLY in English (`en-US`).\n"
+            "- Razor-sharp, capable engineering collaborator with dry wit and warm camaraderie.\n"
+            "- SPOKEN BREVITY FOR POCKET HARDWARE: Keep your spoken answer tight, punchy, and natural "
+            "(1 to 3 sentences by default) without raw markdown or raw URLs.\n"
+            "- CROSS-NODE PRIVACY ISOLATION: This is a collaborator Gotchi node. You do NOT have access "
+            "to Ryan's private memory, personal profile, tasks, calendar, Home Assistant smart home, "
+            "or private Home Discord channels (`#zero-chat`, `#finances`, `#zero-ops`, etc.). "
+            "Only use public web/Reddit search, weather (for requested locations), and Crab Cavern channels.\n"
+            "- GOTCHI V1 HARDWARE CONTROLS: Top button (`BTN_TOP`) is speaking (tap to latch, hold to talk, "
+            "press during speech to cancel); bottom button (`BTN_BOT`) is camera (short press snapshot, long press 5-frame burst).\n"
+            "- PRE-TOOL SPOKEN PREAMBLE: Before calling any tool, emit one short action-narration sentence.\n"
+        )
     snapshot = _load_startup_context_snapshot()
     return (
         "You are Zero, an autonomous AI engineering partner.\n"
@@ -1657,11 +1806,9 @@ def build_gotchi_static_system_instruction() -> str:
         "Whenever a turn requires multi-step math, architecture tradeoffs, or deep root-cause debugging, call "
         "`request_deep_thinking(spoken_preamble, reason)` on Step 0 before answering so Gotchi speaks your preamble "
         "immediately while Step 1 escalates to `HIGH` thinking.\n"
-        "- VOICE MUTATION GATE & READ ALLOWLIST: On voice turns, non-destructive shell commands (e.g. git status/diff, "
-        "ls, find, python3, curl) and new file writes in allowed roots run directly. Destructive shell commands (file deletion, "
-        "git reset/clean/force-push, container teardown, process kills) and file overwrites stage a confirmation card in "
-        "`#zero-chat` before executing. `read_local_file` is restricted to `os.path.realpath` under `/workspace/`, "
-        "`/baseball/`, and `/root/.gemini/antigravity-cli/skills/` (denying `.env`, `.ssh`, and secrets).\n"
+        "- VOICE MUTATION GATE & READ ALLOWLIST: On voice turns, all `run_shell_command` invocations and file overwrites "
+        "stage a confirmation card in `#zero-chat` before executing. `read_local_file` is restricted to `os.path.realpath` "
+        "under `/workspace/`, `/baseball/`, and `/root/.gemini/antigravity-cli/skills/` (denying `.env`, `.ssh`, `private`, `vault`, and `secrets`).\n"
         "- SKILL PLAYBOOK DISCOVERY (`load_skill_playbook`): You have access to all of Zero's specialized skills listed in "
         "the AVAILABLE ZERO SKILLS INDEX below. Call `load_skill_playbook(skill_name)` to load the full `SKILL.md` "
         "instructions for any skill in one step before executing skill-specific workflows.\n"
@@ -1671,7 +1818,7 @@ def build_gotchi_static_system_instruction() -> str:
         "speaks a crisp acknowledgment immediately while waking the full `#zero-chat` Antigravity runtime asynchronously.\n"
         "- Use `search_zero_memory` to search durable memory or past transcripts.\n"
         "- Use `check_tasks_and_repos` to inspect `/workspace/data/tasks.json` and open GitHub issues.\n"
-        "- Use `run_shell_command` to execute non-destructive commands in `/workspace` (destructive commands stage for confirmation).\n"
+        "- Use `run_shell_command` to stage shell commands for `#zero-chat` confirmation.\n"
         "- Use `read_local_file` and `write_local_file` to inspect or write files on disk (overwrites stage for confirmation).\n"
         "- Use `web_and_reddit_search` for live Reddit, Google Web (`mode='web'`), or Amazon (`mode='amazon'`) SerpApi queries.\n"
         "- Use `get_recent_discord_context` to read recent messages across Discord channels. Supports 'crab-cavern' multi-channel rollup across all Crab Cavern rooms, individual Crab Cavern channels ('lounge', 'gotchi', 'gotchi-chat', 'the-banana-stand', 'side-project', 'mirrormere', 'debug-huddle', 'agora', 'r-residentagents'), and Home channels ('zero-chat', 'zero-ops', 'homelab', 'home-assistant', 'finances', 'shopping', 'projects', '3d-print', 'steam-deck', 'baseball'). Never claim you lack access to Crab Cavern.\n"
@@ -1682,20 +1829,26 @@ def build_gotchi_static_system_instruction() -> str:
     )
 
 
-def build_gotchi_dynamic_turn_context(user_prompt: str = "", has_vision: bool = False) -> str:
+def build_gotchi_dynamic_turn_context(
+    user_prompt: str = "",
+    has_vision: bool = False,
+    node_id: Optional[str] = "gotchi-ryan-01",
+) -> str:
     """
     Builds the lightweight per-turn dynamic context (current PT time, vision note,
     and FTS5 memory hits) to pair with a cached static system instruction.
     """
     now_pt = datetime.now(PT_TZ).strftime("%A, %b %d, %Y %I:%M %p PT")
-    memory_hits = prefetch_zero_memory(user_prompt) if user_prompt else ""
+    is_owner = is_owner_gotchi_node(node_id)
+    memory_hits = prefetch_zero_memory(user_prompt, node_id=node_id) if (user_prompt and is_owner) else ""
     mem_block = (
         f"\n\n=== PRE-FETCHED ZERO MEMORY FOR THIS TURN ===\n{memory_hits}"
         if memory_hits
         else ""
     )
+    speaker_label = "Ryan" if is_owner else resolve_speaker_for_node(node_id or "")
     vision_note = (
-        "\n- Ryan attached a live camera snapshot or 5-frame burst from Gotchi's onboard camera. "
+        f"\n- {speaker_label} attached a live camera snapshot or 5-frame burst from Gotchi's onboard camera. "
         "Inspect the visual contents directly and answer with concrete, specific observations."
         if has_vision
         else ""
@@ -1703,13 +1856,17 @@ def build_gotchi_dynamic_turn_context(user_prompt: str = "", has_vision: bool = 
     return f"Current time: {now_pt}.{vision_note}{mem_block}"
 
 
-def build_gotchi_zero_system_prompt(user_prompt: str = "", has_vision: bool = False) -> str:
+def build_gotchi_zero_system_prompt(
+    user_prompt: str = "",
+    has_vision: bool = False,
+    node_id: Optional[str] = "gotchi-ryan-01",
+) -> str:
     """
     Builds the unified Zero system prompt shared with `#zero-voice`, tuned for Gotchi's
     pocket Push-to-Talk, camera snapshot/burst, and 200x200 e-paper companion UX.
     """
-    static_block = build_gotchi_static_system_instruction()
-    dynamic_block = build_gotchi_dynamic_turn_context(user_prompt, has_vision)
+    static_block = build_gotchi_static_system_instruction(node_id=node_id)
+    dynamic_block = build_gotchi_dynamic_turn_context(user_prompt, has_vision, node_id=node_id)
     return f"{static_block}\n\n{dynamic_block}"
 
 
@@ -3383,9 +3540,20 @@ async def execute_gotchi_tool_call(
     args: Dict[str, Any],
     *,
     allow_unconfirmed_mutations: bool = False,
+    node_id: Optional[str] = "gotchi-ryan-01",
 ) -> Dict[str, Any]:
-    """Executes the shared `#zero-voice` tool suite for Gotchi turns with voice security gates."""
-    log.info(f"[GotchiZero] Executing tool call: {name}({args})")
+    """Executes the shared `#zero-voice` tool suite for Gotchi turns with voice security & cross-node gates."""
+    is_owner = is_owner_gotchi_node(node_id)
+    log.info(f"[GotchiZero] Executing tool call: {name}({args}) [node_id={node_id}, owner={is_owner}]")
+
+    if not is_owner and name in _OWNER_ONLY_GOTCHI_TOOLS:
+        log.warning(
+            f"[GotchiZero] Blocked owner-only tool {name!r} for non-owner node {node_id!r}"
+        )
+        return {
+            "error": f"Blocked: tool '{name}' is restricted to Ryan's owner Gotchi nodes.",
+            "blocked": True,
+        }
 
     if name == "request_deep_thinking":
         preamble = str(args.get("spoken_preamble", "") or "").strip()
@@ -3498,7 +3666,7 @@ async def execute_gotchi_tool_call(
         if not query:
             return {"result": "Empty query."}
         if target == "memory":
-            fast_hits = await asyncio.to_thread(prefetch_zero_memory, query, 6)
+            fast_hits = await asyncio.to_thread(prefetch_zero_memory, query, 6, node_id)
             if fast_hits:
                 return {"result": fast_hits}
         try:
@@ -3553,30 +3721,23 @@ async def execute_gotchi_tool_call(
         return {"result": "\n\n".join(out_parts)[:4000]}
 
     if name == "run_shell_command":
+        if not is_owner:
+            return {
+                "error": "Blocked: run_shell_command is forbidden for non-owner Gotchi nodes.",
+                "blocked": True,
+            }
         cmd_str = str(args.get("command", "")).strip()
         if not cmd_str:
             return {"error": "Empty command"}
-        destructive, reason = is_destructive_voice_command(cmd_str)
-        if destructive and not allow_unconfirmed_mutations:
-            return await asyncio.to_thread(
-                stage_voice_mutation_confirmation,
-                "run_shell_command",
-                {"command": cmd_str, "reason": reason},
-            )
-        try:
-            res = await asyncio.to_thread(
-                subprocess.run,
-                cmd_str,
-                shell=True,
-                cwd="/workspace",
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            combined = (res.stdout or "") + ("\nSTDERR:\n" + res.stderr if res.stderr else "")
-            return {"exit_code": res.returncode, "output": combined[:4000] or "(no output)"}
-        except Exception as e:
-            return {"error": str(e)}
+        _, reason = is_destructive_voice_command(cmd_str)
+        return await asyncio.to_thread(
+            stage_voice_mutation_confirmation,
+            "run_shell_command",
+            {
+                "command": cmd_str,
+                "reason": reason or "All voice shell commands require #zero-chat Decision Card confirmation",
+            },
+        )
 
     if name == "read_local_file":
         fpath = str(args.get("file_path", "")).strip()
@@ -3665,7 +3826,8 @@ async def execute_gotchi_tool_call(
             return {"error": str(e)}
 
     if name == "get_recent_discord_context":
-        raw_ch = str(args.get("channel_name", "zero-chat") or "zero-chat")
+        default_ch = "zero-chat" if is_owner else "crab-cavern"
+        raw_ch = str(args.get("channel_name", default_ch) or default_ch)
         is_rollup, clean_ch = normalize_discord_channel_input(raw_ch)
 
         ch_file = Path("/workspace/data/channel_history.json")
@@ -3751,7 +3913,13 @@ async def execute_gotchi_tool_call(
                         cid = v
                         break
             if not cid:
-                cid = fallback_zero_chat
+                cid = fallback_zero_chat if is_owner else fallback_gotchi_chat
+
+        if not is_owner and str(cid) not in _COLLABORATOR_ALLOWED_DISCORD_CHANNEL_IDS:
+            return {
+                "error": "Blocked: non-owner Gotchi nodes may only read Crab Cavern Discord channels.",
+                "blocked": True,
+            }
 
         msgs = history_data.get(str(cid), [])[-12:]
         formatted = "\n".join(
@@ -3799,20 +3967,23 @@ def record_gotchi_turn_to_channels(
        (when camera snapshots are present) or `outbox.queue_outbox_message`.
     """
     source_tag = f"📟 {node_id}"
-    if transcript:
-        _append_voice_turn_to_history(
-            "Ryan",
-            transcript,
-            source_tag=source_tag,
-            extra_channel_ids=[GOTCHI_CHAT_CHANNEL_ID],
-        )
-    if reply:
-        _append_voice_turn_to_history(
-            "Zero",
-            reply,
-            source_tag=source_tag,
-            extra_channel_ids=[GOTCHI_CHAT_CHANNEL_ID],
-        )
+    is_owner = is_owner_gotchi_node(node_id)
+    speaker_label = "Ryan" if is_owner else resolve_speaker_for_node(node_id)
+    if is_owner:
+        if transcript:
+            _append_voice_turn_to_history(
+                "Ryan",
+                transcript,
+                source_tag=source_tag,
+                extra_channel_ids=[GOTCHI_CHAT_CHANNEL_ID],
+            )
+        if reply:
+            _append_voice_turn_to_history(
+                "Zero",
+                reply,
+                source_tag=source_tag,
+                extra_channel_ids=[GOTCHI_CHAT_CHANNEL_ID],
+            )
 
     burst_list = list(burst_images or [])
     primary_img = image_bytes or (burst_list[0] if burst_list else None)
@@ -3843,7 +4014,7 @@ def record_gotchi_turn_to_channels(
         discord_msg = f"📓 **[All-Day Journal]{img_badge}:**\n> {transcript}{timing_footer}"
     else:
         discord_msg = (
-            f"🎙️ **Ryan{img_badge}:** {transcript}\n"
+            f"🎙️ **{speaker_label}{img_badge}:** {transcript}\n"
             f"🔊 **Zero:** {reply}{timing_footer}"
         )
 
@@ -4314,6 +4485,7 @@ class GotchiZeroBrainAdapter:
         on_stage: Optional[Callable[..., Any]] = None,
         stage_callback: Optional[Callable[..., Any]] = None,
         stages_out: Optional[Dict[str, Any]] = None,
+        node_id: Optional[str] = "gotchi-ryan-01",
     ) -> Tuple[str, bool, List[str]]:
         from backend.voice_gateway import SentenceStreamSplitter
         from google.genai import types
@@ -4323,24 +4495,27 @@ class GotchiZeroBrainAdapter:
         if client is None:
             return "Zero is online, but GEMINI_API_KEY is not configured in the environment.", False, []
 
+        is_owner = is_owner_gotchi_node(node_id)
         has_vision = bool(image_bytes or burst_images)
         prompt_is_placeholder = is_placeholder_prompt(prompt)
         sys_prompt_text = "" if (audio_bytes and prompt_is_placeholder) else prompt
-        static_sys_prompt = await asyncio.to_thread(build_gotchi_static_system_instruction)
+        static_sys_prompt = await asyncio.to_thread(build_gotchi_static_system_instruction, node_id)
         dynamic_turn_ctx = await asyncio.to_thread(
-            build_gotchi_dynamic_turn_context, sys_prompt_text, has_vision
+            build_gotchi_dynamic_turn_context, sys_prompt_text, has_vision, node_id
         )
         sys_prompt = f"{static_sys_prompt}\n\n{dynamic_turn_ctx}"
 
-        tools_list = _build_gotchi_tools()
+        tools_list = _build_gotchi_tools(node_id=node_id)
         live_model = self._resolve_live_gemini_model()
-        cache_name = await asyncio.to_thread(
-            self._get_or_create_context_cache,
-            client,
-            live_model,
-            static_sys_prompt,
-            tools_list,
-        )
+        cache_name: Optional[str] = None
+        if is_owner:
+            cache_name = await asyncio.to_thread(
+                self._get_or_create_context_cache,
+                client,
+                live_model,
+                static_sys_prompt,
+                tools_list,
+            )
 
         user_parts: List[types.Part] = []
         if audio_bytes:
@@ -4557,7 +4732,7 @@ class GotchiZeroBrainAdapter:
                     )
                     step_emitted_progress = True
 
-                res_dict = await execute_gotchi_tool_call(fn_name, fn_args)
+                res_dict = await execute_gotchi_tool_call(fn_name, fn_args, node_id=node_id)
                 if fn_name in ("post_note_to_zero_chat", "handoff_to_zero_runtime") or (
                     isinstance(res_dict, dict) and res_dict.get("confirmation_required") is True
                 ):
@@ -4823,6 +4998,7 @@ class GotchiZeroBrainAdapter:
         explicitly_posted = False
         streamed_sentences: List[str] = []
         ha_matched, ha_speech, ha_meta = (False, "", {"reason": "disabled"})
+        is_owner_node = is_owner_gotchi_node(node_id)
 
         def _build_gemini_stage_kwargs() -> Dict[str, Any]:
             candidate_kw = {
@@ -4830,6 +5006,7 @@ class GotchiZeroBrainAdapter:
                 "on_stage": on_stage,
                 "stage_callback": stage_callback,
                 "stages_out": stages_out,
+                "node_id": node_id,
             }
             non_null = {k: v for k, v in candidate_kw.items() if v is not None}
             if not non_null:
@@ -4922,8 +5099,8 @@ class GotchiZeroBrainAdapter:
                         "stt_ms": stt_ms,
                     }
 
-                # 2. Home Assistant fast-path check: if matched, cancel in-flight brain_task and reply immediately
-                if raw_tx:
+                # 2. Home Assistant fast-path check: owner nodes only
+                if raw_tx and is_owner_node:
                     ha_matched, ha_speech, ha_meta = await asyncio.to_thread(
                         try_ha_conversation_fastpath,
                         raw_tx,
@@ -4972,7 +5149,7 @@ class GotchiZeroBrainAdapter:
                 buffered_live_sentences.clear()
                 raw_reply, explicitly_posted, streamed_sentences = await brain_task
         else:
-            if transcript:
+            if transcript and is_owner_node:
                 ha_matched, ha_speech, ha_meta = await asyncio.to_thread(
                     try_ha_conversation_fastpath,
                     transcript,
@@ -5080,7 +5257,7 @@ class GotchiZeroBrainAdapter:
         has_defer_in_reply = "[[defer]]" in (raw_reply or "").lower() or any(
             "[[defer]]" in (s or "").lower() for s in streamed_sentences
         )
-        if has_defer_in_reply and not explicitly_posted:
+        if has_defer_in_reply and not explicitly_posted and is_owner_node:
             defer_prompt = (transcript or raw_prompt or "Deferred voice request").strip()
             await asyncio.to_thread(
                 _queue_zero_runtime_turn,
@@ -5094,7 +5271,7 @@ class GotchiZeroBrainAdapter:
         if is_long and is_async:
             topic = extract_topic(transcript)
             spoken_reply = condense_long_answer(raw_reply, topic=topic)
-            if self.dispatch_discord:
+            if self.dispatch_discord and is_owner_node:
                 await asyncio.to_thread(
                     send_gotchi_artifact_to_zero_chat,
                     message=f"📋 **[Async Answer Breakdown]:**\n> **Prompt:** {transcript}\n\n{raw_reply}",
@@ -5110,7 +5287,7 @@ class GotchiZeroBrainAdapter:
                 raw_reply,
                 spoken_reply,
                 explicitly_posted,
-                self.dispatch_discord,
+                self.dispatch_discord and is_owner_node,
             )
 
         total_ms = int((time.monotonic() - t0) * 1000)
@@ -5487,6 +5664,16 @@ def create_zero_gotchi_app(
     async def _on_app_shutdown() -> None:
         shutdown_lomin_background_workers(timeout_s=2.0)
 
+    def _default_node_id_for_request(request: Request) -> str:
+        headers_lower = {k.lower(): v for k, v in dict(request.headers).items()}
+        is_external_cf = bool(
+            str(headers_lower.get("cf-connecting-ip") or "").strip()
+            or str(headers_lower.get("cf-ray") or "").strip()
+        )
+        client_host = (request.client.host if request.client else "").strip().lower()
+        is_loopback = client_host in ("127.0.0.1", "::1", "localhost", "testclient") and not is_external_cf
+        return "gotchi-ryan-01" if is_loopback else "unknown"
+
     @app.post("/api/gotchi/brain")
     async def gotchi_brain_endpoint(request: Request):
         body, err = await _parse_json_or_empty_body(request)
@@ -5501,7 +5688,12 @@ def create_zero_gotchi_app(
         ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=node_id)
         if not ok_auth:
             return JSONResponse(status_code=auth_code, content=auth_err)
-        res = await brain.handle_turn(body)
+        turn_body = dict(body)
+        if not node_id:
+            turn_body["node_id"] = _default_node_id_for_request(request)
+        else:
+            turn_body["node_id"] = node_id
+        res = await brain.handle_turn(turn_body)
         return JSONResponse(status_code=200, content=res)
 
     @app.post("/voice/turn")
@@ -5533,7 +5725,7 @@ def create_zero_gotchi_app(
                 return JSONResponse(status_code=400, content={"error": err or "invalid JSON body"})
             parsed_turn = dict(body_dict)
             if not parsed_turn.get("node_id"):
-                parsed_turn["node_id"] = node_hint or "gotchi-ryan-01"
+                parsed_turn["node_id"] = node_hint or _default_node_id_for_request(request)
             if not parsed_turn.get("session_id"):
                 parsed_turn["session_id"] = f"sess-{int(time.time() * 1000)}"
         else:
@@ -5549,13 +5741,13 @@ def create_zero_gotchi_app(
                             content={"error": "payload_too_large", "message": str(ve)},
                         )
             parsed_turn = {
-                "node_id": node_hint or "gotchi-ryan-01",
+                "node_id": node_hint or _default_node_id_for_request(request),
                 "session_id": qs.get("session_id") or f"sess-{int(time.time() * 1000)}",
                 "prompt": qs.get("prompt") or "",
                 "audio_bytes": audio_bytes,
             }
 
-        node_id = str(parsed_turn.get("node_id") or node_hint or "gotchi-ryan-01")
+        node_id = str(parsed_turn.get("node_id") or node_hint or _default_node_id_for_request(request))
         if node_id != node_hint:
             ok_auth2, auth_code2, auth_err2 = _check_unified_auth(request, node_id=node_id)
             if not ok_auth2:
@@ -5580,7 +5772,12 @@ def create_zero_gotchi_app(
         if err is not None or req is None:
             return JSONResponse(status_code=400, content={"error": err or "invalid JSON body"})
 
-        node_id = str(req.get("node_id") or req.get("node") or request.headers.get("x-node-id") or "gotchi-ryan-01").strip()
+        node_id = str(
+            req.get("node_id")
+            or req.get("node")
+            or request.headers.get("x-node-id")
+            or _default_node_id_for_request(request)
+        ).strip()
         ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=node_id)
         if not ok_auth:
             return JSONResponse(status_code=auth_code, content=auth_err)
@@ -5664,7 +5861,12 @@ def create_zero_gotchi_app(
         if err is not None or req is None:
             return JSONResponse(status_code=400, content={"error": err or "invalid JSON body"})
 
-        node_id = str(req.get("node_id") or req.get("node") or request.headers.get("x-node-id") or "gotchi-ryan-01").strip()
+        node_id = str(
+            req.get("node_id")
+            or req.get("node")
+            or request.headers.get("x-node-id")
+            or _default_node_id_for_request(request)
+        ).strip()
         ok_auth, auth_code, auth_err = _check_unified_auth(request, node_id=node_id)
         if not ok_auth:
             return JSONResponse(status_code=auth_code, content=auth_err)

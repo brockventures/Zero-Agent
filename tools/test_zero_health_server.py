@@ -42,11 +42,18 @@ class TestZeroHealthServer(unittest.TestCase):
         self.temp_dir.cleanup()
 
     @staticmethod
-    def _make_handler(path: str, headers: dict, body: bytes = b"", command: str = "GET"):
+    def _make_handler(
+        path: str,
+        headers: dict,
+        body: bytes = b"",
+        command: str = "GET",
+        client_address: tuple[str, int] = ("127.0.0.1", 12345),
+    ):
         h = zhealth.ZeroHealthHandler.__new__(zhealth.ZeroHealthHandler)
         h.path = path
         h.headers = headers
         h.command = command
+        h.client_address = client_address
         h.rfile = io.BytesIO(body)
         h.wfile = io.BytesIO()
         h.send_response = MagicMock()
@@ -686,6 +693,209 @@ class TestZeroHealthServer(unittest.TestCase):
         finally:
             mcp_daemon.PID_FILE = orig_pid_file
             mcp_daemon.LOCK_FILE = orig_lock_file
+
+    def test_non_loopback_non_cf_requests_require_auth(self):
+        (self.temp_path / "gotchi_bearer_token.json").write_text(json.dumps({"token": "admin-tok-001"}))
+        env_tokens = {
+            "ZERO_HEALTH_ADMIN_TOKEN": "zero-admin-tok-002",
+            "ZERO_ADMIN_TOKEN": "",
+            "GOTCHI_BEARER_TOKEN": "",
+            "GOTCHI_DEVICE_TOKENS": '{"gotchi-mike-01": "collab-tok-mike"}',
+            "MVG_DEVICE_TOKENS": "gotchi-coley-01=collab-tok-coley",
+        }
+        remote_addr = ("198.51.100.25", 54321)
+
+        with patch.dict(os.environ, env_tokens, clear=False):
+            # 1. Non-loopback request WITHOUT CF headers fails closed with 401 on Gotchi and admin routes
+            for path in ("/api/gotchi/brain", "/api/voice/logs", "/api/search?q=test", "/api/forge", "/dashboard"):
+                h_unauth = self._make_handler(
+                    path,
+                    {"Host": "198.51.100.10:8769"},
+                    command="GET",
+                    client_address=remote_addr,
+                )
+                self.assertFalse(h_unauth._is_external_cf_request())
+                self.assertFalse(h_unauth._is_loopback_client())
+                h_unauth.do_GET()
+                h_unauth.send_response.assert_called_once_with(401)
+
+            # 2. Non-loopback POST to Gotchi proxy without CF headers and without token fails closed with 401
+            h_post = self._make_handler(
+                "/api/gotchi/brain",
+                {"Host": "198.51.100.10:8769", "Content-Length": "2"},
+                body=b"{}",
+                command="POST",
+                client_address=remote_addr,
+            )
+            with patch.object(h_post, "_ensure_gotchi_gateway_up") as mock_up, \
+                 patch("http.client.HTTPConnection") as mock_conn_cls:
+                h_post.do_POST()
+                h_post.send_response.assert_called_once_with(401)
+                mock_up.assert_not_called()
+                mock_conn_cls.assert_not_called()
+
+            # 3. Collaborator device token passes Gotchi auth on non-loopback non-CF request
+            h_collab_gotchi = self._make_handler(
+                "/api/voice/logs",
+                {"Host": "198.51.100.10:8769", "Authorization": "Bearer collab-tok-mike"},
+                client_address=remote_addr,
+            )
+            self.assertTrue(h_collab_gotchi._check_gotchi_external_auth())
+
+            # 4. Loopback (127.0.0.1 and ::1) without CF headers passes admin & Gotchi auth
+            for loop_addr in (("127.0.0.1", 40001), ("::1", 40002)):
+                h_loop = self._make_handler("/api/forge", {"Host": "localhost:8769"}, client_address=loop_addr)
+                self.assertTrue(h_loop._check_admin_auth())
+                self.assertTrue(h_loop._check_gotchi_external_auth())
+
+            # 5. Public brock.ventures landing page remains public even from non-loopback
+            h_pub = self._make_handler(
+                "/",
+                {"Host": "www.brock.ventures"},
+                command="GET",
+                client_address=remote_addr,
+            )
+            h_pub.do_GET()
+            h_pub.send_response.assert_called_once_with(200)
+
+    def test_admin_token_scope_rejects_collaborator_tokens_with_403(self):
+        env_tokens = {
+            "ZERO_HEALTH_ADMIN_TOKEN": "super-admin-tok",
+            "ZERO_ADMIN_TOKEN": "alt-admin-tok",
+            "GOTCHI_BEARER_TOKEN": "owner-gotchi-tok",
+            "GOTCHI_DEVICE_TOKENS": '{"gotchi-mike-01": "collab-mike-tok"}',
+            "MVG_DEVICE_TOKENS": "gotchi-alex-01=collab-alex-tok",
+        }
+        admin_routes = (
+            "/api/search?q=ryan",
+            "/api/embed?q=ryan",
+            "/api/gif_rank?q=laugh",
+            "/api/telemetry",
+            "/api/context",
+            "/api/sessions",
+            "/api/forge",
+            "/api/vulcan",
+            "/dashboard",
+        )
+        remote_addr = ("203.0.113.42", 44444)
+
+        with patch.dict(os.environ, env_tokens, clear=False):
+            h_probe = self._make_handler("/api/search", {}, client_address=remote_addr)
+            admin_tokens = h_probe._load_admin_bearer_tokens()
+            device_tokens = h_probe._load_gotchi_device_tokens()
+            expected_tokens = h_probe._load_expected_bearer_tokens()
+
+            self.assertIn("super-admin-tok", admin_tokens)
+            self.assertIn("alt-admin-tok", admin_tokens)
+            self.assertIn("owner-gotchi-tok", admin_tokens)
+            self.assertNotIn("collab-mike-tok", admin_tokens)
+            self.assertNotIn("collab-alex-tok", admin_tokens)
+            self.assertIn("collab-mike-tok", device_tokens)
+            self.assertIn("collab-alex-tok", device_tokens)
+            self.assertIn("collab-mike-tok", expected_tokens)
+            self.assertIn("super-admin-tok", expected_tokens)
+
+            # Collaborator token -> 403 Forbidden on ALL admin/private routes (both CF and non-loopback)
+            for headers_base in (
+                {"Host": "zero.brock.ventures", "CF-Connecting-IP": "198.51.100.77"},
+                {"Host": "198.51.100.10:8769"},
+            ):
+                for collab_tok in ("collab-mike-tok", "collab-alex-tok"):
+                    hdrs = dict(headers_base)
+                    hdrs["Authorization"] = f"Bearer {collab_tok}"
+                    for route in admin_routes:
+                        h_get = self._make_handler(route, hdrs, command="GET", client_address=remote_addr)
+                        h_get.do_GET()
+                        h_get.send_response.assert_called_once_with(403)
+                        body = json.loads(h_get.wfile.getvalue().decode("utf-8"))
+                        self.assertEqual(body.get("error"), "forbidden")
+
+                    h_head = self._make_handler("/api/forge", hdrs, command="HEAD", client_address=remote_addr)
+                    h_head.do_HEAD()
+                    h_head.send_response.assert_called_once_with(403)
+                    self.assertEqual(h_head.wfile.getvalue(), b"")
+
+                # Missing or bogus token -> 401 Unauthorized on admin routes
+                for bad_hdrs in (
+                    dict(headers_base),
+                    {**headers_base, "Authorization": "Bearer totally-wrong"},
+                ):
+                    h_401 = self._make_handler("/api/search?q=test", bad_hdrs, command="GET", client_address=remote_addr)
+                    h_401.do_GET()
+                    h_401.send_response.assert_called_once_with(401)
+
+            # Admin token passes GET /api/forge and passes include_private=True
+            fake_zd = MagicMock()
+            fake_zd.get_vulcan_forge_payload.return_value = {"decisions": [], "builds": []}
+            h_ok = self._make_handler(
+                "/api/forge",
+                {
+                    "Host": "zero.brock.ventures",
+                    "CF-Connecting-IP": "198.51.100.77",
+                    "Authorization": "Bearer super-admin-tok",
+                },
+                command="GET",
+                client_address=remote_addr,
+            )
+            with patch("tools.zero_health_server._get_zero_dashboard", return_value=fake_zd):
+                h_ok.do_GET()
+            h_ok.send_response.assert_called_once_with(200)
+            fake_zd.get_vulcan_forge_payload.assert_called_once_with(limit=30, include_private=True)
+
+    def test_vulcan_forge_payload_filters_private_decisions_by_default(self):
+        import sqlite3
+
+        from tools import zero_dashboard as zdash
+
+        forge_db = self.temp_path / "forge.db"
+        now = time.time()
+        conn = sqlite3.connect(str(forge_db))
+        conn.execute("""
+            CREATE TABLE forge_decisions (
+                id TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                handler_type TEXT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER,
+                is_private INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                resolved_at REAL,
+                receipt_text TEXT NOT NULL DEFAULT ''
+            );
+        """)
+        conn.execute(
+            "INSERT INTO forge_decisions VALUES ('dec-pub', 'forge_enqueue', 'Public Card', 'Public summary', 'forge', 123, NULL, 0, 'pending', ?, ?, NULL, '')",
+            (now + 3600, now - 10),
+        )
+        conn.execute(
+            "INSERT INTO forge_decisions VALUES ('dec-priv', 'email_dispatch', 'Private Family Card', 'Confidential details', 'email', 456, NULL, 1, 'pending', ?, ?, NULL, '')",
+            (now + 3600, now),
+        )
+        conn.commit()
+        conn.close()
+
+        # Default (include_private=False): hides private Decision Cards and excludes them from pending count
+        pub_payload = zdash.get_vulcan_forge_payload(
+            limit=10,
+            forge_db_path=forge_db,
+            telemetry_db_path=self.temp_path / "missing_telemetry.db",
+        )
+        self.assertEqual(pub_payload["pending_decisions_count"], 1)
+        self.assertEqual([d["id"] for d in pub_payload["decisions"]], ["dec-pub"])
+
+        # Admin-verified (include_private=True): returns both public and private Decision Cards
+        admin_payload = zdash.get_vulcan_forge_payload(
+            limit=10,
+            forge_db_path=forge_db,
+            telemetry_db_path=self.temp_path / "missing_telemetry.db",
+            include_private=True,
+        )
+        self.assertEqual(admin_payload["pending_decisions_count"], 2)
+        self.assertEqual({d["id"] for d in admin_payload["decisions"]}, {"dec-pub", "dec-priv"})
 
 
 if __name__ == "__main__":

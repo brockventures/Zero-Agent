@@ -1010,9 +1010,15 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             return
-        if not self._is_public_liveness_or_avatar_route(clean_path, host_header):
-            if not self._check_gotchi_external_auth(send_body=False):
-                return
+        if not self._is_public_landing_host(host_header):
+            accept_header = self.headers.get("Accept", "")
+            query_str = self.path.partition("?")[2]
+            if self._is_admin_route(clean_path, host_header, accept_header, query_str):
+                if not self._check_admin_auth(send_body=False):
+                    return
+            elif not self._is_public_liveness_or_avatar_route(clean_path, host_header):
+                if not self._check_gotchi_external_auth(send_body=False):
+                    return
         if clean_path in ("/api/ivy", "/ivy"):
             code, _ = self._evaluate_ivy(strict=strict)
             content_type = "application/json"
@@ -1153,11 +1159,42 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         "/ivy_avatar.png",
     })
 
+    _ADMIN_ONLY_PATHS = frozenset({
+        "/api/search",
+        "/api/embed",
+        "/api/gif_rank",
+        "/api/telemetry",
+        "/api/context",
+        "/api/sessions",
+        "/api/forge",
+        "/api/vulcan",
+        "/dashboard",
+    })
+
     @classmethod
     def _is_public_liveness_or_avatar_route(cls, clean_path: str, host_header: str) -> bool:
         if clean_path in cls._PUBLIC_LIVENESS_AND_AVATAR_PATHS:
             return True
         if clean_path in ("", "/") and ("probe." in host_header or "status." in host_header):
+            return True
+        return False
+
+    @classmethod
+    def _is_admin_route(
+        cls,
+        clean_path: str,
+        host_header: str,
+        accept_header: str = "",
+        query_str: str = "",
+    ) -> bool:
+        if clean_path in cls._ADMIN_ONLY_PATHS:
+            return True
+        if (
+            clean_path in ("", "/", "/ivy")
+            and not ("probe." in host_header or "status." in host_header)
+            and (clean_path == "/ivy" or "text/html" in accept_header)
+            and "format=json" not in query_str
+        ):
             return True
         return False
 
@@ -1167,6 +1204,25 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             if k.lower() in ("cf-connecting-ip", "cf-ray") and v is not None and str(v).strip():
                 return True
         return False
+
+    def _is_loopback_client(self) -> bool:
+        client_addr = getattr(self, "client_address", None)
+        if client_addr is None:
+            # Synthetic unit-test handler instantiated via __new__ without a live socket.
+            # Real ThreadingHTTPServer requests always populate client_address = (ip, port).
+            return True
+        if isinstance(client_addr, (tuple, list)):
+            if not client_addr:
+                return False
+            ip = str(client_addr[0] or "").strip().lower()
+        elif isinstance(client_addr, str):
+            ip = client_addr.strip().lower()
+        else:
+            return False
+        return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def _is_trusted_loopback(self) -> bool:
+        return self._is_loopback_client() and not self._is_external_cf_request()
 
     @staticmethod
     def _parse_token_collection(raw_val) -> list[str]:
@@ -1208,13 +1264,14 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 tokens.append(item)
         return tokens
 
-    def _load_expected_bearer_tokens(self) -> list[str]:
-        expected_tokens: list[str] = []
+    def _load_admin_bearer_tokens(self) -> list[str]:
+        """Load admin-only Bearer tokens (excludes collaborator GOTCHI_DEVICE_TOKENS / MVG_DEVICE_TOKENS)."""
+        admin_tokens: list[str] = []
 
         def _add(tok: str) -> None:
             cleaned = tok.strip()
-            if cleaned and cleaned not in expected_tokens:
-                expected_tokens.append(cleaned)
+            if cleaned and cleaned not in admin_tokens:
+                admin_tokens.append(cleaned)
 
         token_paths: list[Path] = [DATA_DIR / "gotchi_bearer_token.json"]
         if FALLBACK_GOTCHI_TOKEN_FILE not in token_paths:
@@ -1232,31 +1289,62 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+        admin_keys = ("ZERO_HEALTH_ADMIN_TOKEN", "ZERO_ADMIN_TOKEN", "GOTCHI_BEARER_TOKEN")
         try:
             if SECRETS_ENV_FILE.exists():
                 with open(SECRETS_ENV_FILE, "r", encoding="utf-8") as sf:
                     sec = json.load(sf)
                 if isinstance(sec, dict):
-                    sec_tok = sec.get("GOTCHI_BEARER_TOKEN", "")
-                    if isinstance(sec_tok, str):
-                        _add(sec_tok)
+                    for key in admin_keys:
+                        sec_tok = sec.get(key, "")
+                        if isinstance(sec_tok, str):
+                            _add(sec_tok)
+        except Exception:
+            pass
+
+        for key in admin_keys:
+            env_tok = os.environ.get(key, "")
+            if env_tok:
+                _add(env_tok)
+
+        return admin_tokens
+
+    def _load_gotchi_device_tokens(self) -> list[str]:
+        """Load collaborator/device Gotchi tokens (GOTCHI_DEVICE_TOKENS, MVG_DEVICE_TOKENS)."""
+        device_tokens: list[str] = []
+
+        def _add(tok: str) -> None:
+            cleaned = tok.strip()
+            if cleaned and cleaned not in device_tokens:
+                device_tokens.append(cleaned)
+
+        try:
+            if SECRETS_ENV_FILE.exists():
+                with open(SECRETS_ENV_FILE, "r", encoding="utf-8") as sf:
+                    sec = json.load(sf)
+                if isinstance(sec, dict):
                     for key in ("GOTCHI_DEVICE_TOKENS", "MVG_DEVICE_TOKENS"):
                         for tok in self._parse_token_collection(sec.get(key)):
                             _add(tok)
         except Exception:
             pass
 
-        env_tok = os.environ.get("GOTCHI_BEARER_TOKEN", "")
-        if env_tok:
-            _add(env_tok)
         for key in ("GOTCHI_DEVICE_TOKENS", "MVG_DEVICE_TOKENS"):
             for tok in self._parse_token_collection(os.environ.get(key, "")):
                 _add(tok)
 
+        return device_tokens
+
+    def _load_expected_bearer_tokens(self) -> list[str]:
+        """Union of admin and Gotchi device tokens for backwards compatibility on Gotchi endpoints."""
+        expected_tokens: list[str] = []
+        for tok in self._load_admin_bearer_tokens() + self._load_gotchi_device_tokens():
+            if tok and tok not in expected_tokens:
+                expected_tokens.append(tok)
         return expected_tokens
 
     def _redact_external_health_payload(self, payload: dict) -> dict:
-        if not self._is_external_cf_request() or not isinstance(payload, dict):
+        if self._is_trusted_loopback() or not isinstance(payload, dict):
             return payload
         in_flight = payload.get("in_flight")
         if not in_flight:
@@ -1284,40 +1372,66 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             redacted_payload["in_flight"] = redacted_map
         return redacted_payload
 
-    def _check_gotchi_external_auth(self, send_body: bool = True) -> bool:
-        if not self._is_external_cf_request():
-            return True
-
-        expected_tokens = self._load_expected_bearer_tokens()
-
+    def _extract_bearer_token(self) -> str:
         auth_hdr = ""
         for k, v in (getattr(self, "headers", None) or {}).items():
             if k.lower() == "authorization" and isinstance(v, str):
                 auth_hdr = v.strip()
                 break
+        if not auth_hdr:
+            return ""
+        parts = auth_hdr.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1].strip()
+        if auth_hdr.lower() != "bearer":
+            return auth_hdr.strip()
+        return ""
 
-        provided = ""
-        if auth_hdr:
-            parts = auth_hdr.split(None, 1)
-            if len(parts) == 2 and parts[0].lower() == "bearer":
-                provided = parts[1].strip()
-            elif auth_hdr.lower() != "bearer":
-                provided = auth_hdr.strip()
+    @staticmethod
+    def _token_matches(provided: str, candidates: list[str]) -> bool:
+        if not provided or not candidates:
+            return False
+        provided_bytes = provided.encode("utf-8")
+        for exp in candidates:
+            if hmac.compare_digest(provided_bytes, exp.encode("utf-8")):
+                return True
+        return False
 
-        if provided and expected_tokens:
-            for exp in expected_tokens:
-                if hmac.compare_digest(provided.encode("utf-8"), exp.encode("utf-8")):
-                    return True
-
-        err_bytes = json.dumps(
-            {"ok": False, "error": "unauthorized", "message": "Valid Bearer token required"}
-        ).encode("utf-8")
-        self.send_response(401)
+    def _send_auth_error(self, status_code: int, error: str, message: str, send_body: bool = True) -> None:
+        err_bytes = json.dumps({"ok": False, "error": error, "message": message}).encode("utf-8")
+        self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(err_bytes)))
         self.end_headers()
         if send_body and getattr(self, "command", None) != "HEAD" and getattr(self, "wfile", None) is not None:
             self.wfile.write(err_bytes)
+
+    def _check_gotchi_external_auth(self, send_body: bool = True) -> bool:
+        if self._is_trusted_loopback():
+            return True
+
+        provided = self._extract_bearer_token()
+        expected_tokens = self._load_expected_bearer_tokens()
+        if self._token_matches(provided, expected_tokens):
+            return True
+
+        self._send_auth_error(401, "unauthorized", "Valid Bearer token required", send_body=send_body)
+        return False
+
+    def _check_admin_auth(self, send_body: bool = True) -> bool:
+        if self._is_trusted_loopback():
+            return True
+
+        provided = self._extract_bearer_token()
+        admin_tokens = self._load_admin_bearer_tokens()
+        if self._token_matches(provided, admin_tokens):
+            return True
+
+        if provided and self._token_matches(provided, self._load_gotchi_device_tokens()):
+            self._send_auth_error(403, "forbidden", "Admin Bearer token required", send_body=send_body)
+            return False
+
+        self._send_auth_error(401, "unauthorized", "Valid admin Bearer token required", send_body=send_body)
         return False
 
     def _proxy_to_gotchi_gateway(self, method: str) -> None:
@@ -1454,7 +1568,10 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"Not Found")
             return
 
-        if not self._is_public_liveness_or_avatar_route(clean_path, host_header):
+        if self._is_admin_route(clean_path, host_header, accept_header, query_str):
+            if not self._check_admin_auth():
+                return
+        elif not self._is_public_liveness_or_avatar_route(clean_path, host_header):
             if not self._check_gotchi_external_auth():
                 return
 
@@ -1553,7 +1670,12 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             target = channel_name or session_id
             zd = _get_zero_dashboard()
             if zd:
-                payload = zd.get_telemetry_payload(target=target, compacted_id=compacted_id, agent=agent)
+                payload = zd.get_telemetry_payload(
+                    target=target,
+                    compacted_id=compacted_id,
+                    agent=agent,
+                    include_private=True,
+                )
             else:
                 payload = {"error": "zero_dashboard module unavailable"}
             body = json.dumps(payload, indent=2).encode("utf-8")
@@ -1671,7 +1793,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 limit = 30
             zd = _get_zero_dashboard()
             if zd and hasattr(zd, "get_vulcan_forge_payload"):
-                payload = zd.get_vulcan_forge_payload(limit=limit)
+                payload = zd.get_vulcan_forge_payload(limit=limit, include_private=True)
             else:
                 payload = {"error": "zero_dashboard.get_vulcan_forge_payload unavailable"}
             body = json.dumps(payload, indent=2).encode("utf-8")

@@ -853,6 +853,7 @@ def get_vulcan_forge_payload(
     limit: int = 30,
     forge_db_path: Optional[Path | str] = None,
     telemetry_db_path: Optional[Path | str] = None,
+    include_private: bool = False,
 ) -> Dict[str, Any]:
     """Retrieve Vulcan & FORGE orchestrator telemetry, builds, detached jobs, and decisions."""
     resolved_forge_db: Optional[Path] = None
@@ -1099,21 +1100,37 @@ def get_vulcan_forge_payload(
 
             # 4. Decisions
             try:
-                fcur.execute("SELECT status, COUNT(*) as cnt FROM forge_decisions GROUP BY status;")
+                if include_private:
+                    fcur.execute("SELECT status, COUNT(*) as cnt FROM forge_decisions GROUP BY status;")
+                else:
+                    fcur.execute(
+                        "SELECT status, COUNT(*) as cnt FROM forge_decisions WHERE is_private = 0 GROUP BY status;"
+                    )
                 for row in fcur.fetchall():
                     st = str(row["status"]).lower()
                     cnt = int(row["cnt"])
                     if st in ("pending", "awaiting_approval", "open"):
                         pending_decisions_count += cnt
 
-                fcur.execute(
-                    """
-                    SELECT * FROM forge_decisions
-                    ORDER BY created_at DESC
-                    LIMIT ?;
-                    """,
-                    (limit,),
-                )
+                if include_private:
+                    fcur.execute(
+                        """
+                        SELECT * FROM forge_decisions
+                        ORDER BY created_at DESC
+                        LIMIT ?;
+                        """,
+                        (limit,),
+                    )
+                else:
+                    fcur.execute(
+                        """
+                        SELECT * FROM forge_decisions
+                        WHERE is_private = 0
+                        ORDER BY created_at DESC
+                        LIMIT ?;
+                        """,
+                        (limit,),
+                    )
                 for d in fcur.fetchall():
                     d_dict = dict(d)
                     c_at = d_dict.get("created_at")
@@ -1180,7 +1197,12 @@ def get_vulcan_forge_payload(
     return payload
 
 
-def get_telemetry_payload(target: Optional[str] = None, compacted_id: Optional[str] = None, agent: str = "zero") -> Dict[str, Any]:
+def get_telemetry_payload(
+    target: Optional[str] = None,
+    compacted_id: Optional[str] = None,
+    agent: str = "zero",
+    include_private: bool = False,
+) -> Dict[str, Any]:
     """Compile channel-centric telemetry payload presenting active and stitched compacted sessions side-by-side."""
     if agent == "ivy":
         try:
@@ -1479,7 +1501,7 @@ def get_telemetry_payload(target: Optional[str] = None, compacted_id: Optional[s
         "daemon_rollups": get_daemon_rollups(),
         "quota": live_quota,
         "quota_attribution": live_attr,
-        "vulcan": get_vulcan_forge_payload(),
+        "vulcan": get_vulcan_forge_payload(include_private=include_private),
     }
 
 

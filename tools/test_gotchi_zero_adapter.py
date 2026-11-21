@@ -25,6 +25,8 @@ from tools.gotchi_zero_adapter import (
     DEFAULT_GOTCHI_MODEL,
     GOTCHI_THINKING_TELEMETRY,
     GotchiZeroBrainAdapter,
+    _build_gotchi_tools,
+    build_gotchi_static_system_instruction,
     build_gotchi_zero_system_prompt,
     build_thinking_config,
     clean_spoken_text_for_tts,
@@ -34,6 +36,7 @@ from tools.gotchi_zero_adapter import (
     is_allowed_voice_read_path,
     is_destructive_voice_command,
     is_destructive_voice_write,
+    is_owner_gotchi_node,
     prefetch_zero_memory,
     select_thinking_budget,
     select_thinking_level,
@@ -132,24 +135,31 @@ def test_voice_security_gate_and_realpath_read_allowlist(monkeypatch, tmp_path):
         lambda ch, content, **kw: staged_msgs.append((int(ch), content)),
     )
 
-    # 1. Non-destructive shell commands execute directly without confirmation
+    # 1. ALL shell commands from owner nodes stage #zero-chat confirmation (shell=True RCE removed)
+    shell_calls: List[Any] = []
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.subprocess.run",
+        lambda *a, **kw: shell_calls.append((a, kw)),
+    )
     shell_res = asyncio.run(
         execute_gotchi_tool_call("run_shell_command", {"command": "git status -s"})
     )
-    assert shell_res.get("confirmation_required") is not True
-    assert "exit_code" in shell_res
+    assert shell_res.get("confirmation_required") is True
+    assert shell_res.get("status") == "staged_in_zero_chat"
+    assert shell_calls == []
 
     find_res = asyncio.run(
         execute_gotchi_tool_call(
             "run_shell_command",
             {"command": "find /workspace/tools -maxdepth 1 -name gotchi_zero_adapter.py"},
+            allow_unconfirmed_mutations=True,
         )
     )
-    assert find_res.get("confirmation_required") is not True
-    assert "exit_code" in find_res
-    assert "gotchi_zero_adapter.py" in find_res.get("output", "")
+    assert find_res.get("confirmation_required") is True
+    assert find_res.get("status") == "staged_in_zero_chat"
+    assert shell_calls == []
 
-    # 2. Destructive shell commands trigger stage_voice_mutation_confirmation
+    # 2. Destructive shell commands also trigger stage_voice_mutation_confirmation without subprocess.run
     destructive_cmds = [
         "rm -rf /workspace/tmp_test",
         "git reset --hard HEAD~1",
@@ -164,6 +174,7 @@ def test_voice_security_gate_and_realpath_read_allowlist(monkeypatch, tmp_path):
         assert any(
             ch == 1542081375287640084 and d_cmd in body for ch, body in staged_msgs
         )
+    assert shell_calls == []
 
     # 3. Writing a new file inside an allowed root succeeds directly
     ws_allowed = tmp_path / "workspace"
@@ -421,11 +432,17 @@ def test_explicitly_posted_to_zero_chat_scoping(monkeypatch):
         )
         return posted
 
-    # Non-destructive shell does not set explicitly_posted_to_zero_chat
+    # Read-only tool does not set explicitly_posted_to_zero_chat
+    p_read = asyncio.run(
+        run_scenario([FakeFunctionCall("read_local_file", {"file_path": "/workspace/README.md"})])
+    )
+    assert p_read is False
+
+    # All shell commands now stage confirmation in #zero-chat (setting explicitly_posted_to_zero_chat)
     p_safe = asyncio.run(
         run_scenario([FakeFunctionCall("run_shell_command", {"command": "git status -s"})])
     )
-    assert p_safe is False
+    assert p_safe is True
 
     # Destructive shell sets explicitly_posted_to_zero_chat
     p_destr = asyncio.run(
@@ -551,8 +568,14 @@ def test_extract_and_forward_artifacts_to_zero_chat(monkeypatch, tmp_path):
     assert "Zero-Chat" in updated_spoken
     assert any(ch == 1542081375287640084 and "https://example.com/switch" in body for ch, body in enqueued)
 
-    # 2. Explicit file attachment via send_gotchi_artifact_to_zero_chat
-    dummy_stl = tmp_path / "case.stl"
+    # 2. Explicit file attachment via send_gotchi_artifact_to_zero_chat (within allowed read prefix)
+    ws_art = tmp_path / "workspace_artifacts"
+    ws_art.mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._ALLOWED_VOICE_READ_PREFIXES",
+        ("/workspace/", "/baseball/", str(ws_art)),
+    )
+    dummy_stl = ws_art / "case.stl"
     dummy_stl.write_bytes(b"solid gotchi_case\nendsolid gotchi_case\n")
     res = send_gotchi_artifact_to_zero_chat(
         message="Here is the STL render and [Printables Link](<https://example.com/model>).",
@@ -1956,6 +1979,188 @@ def test_gotchi_brain_endpoint_auth_and_cloudflare_fail_closed(monkeypatch, tmp_
     assert len(brain_calls) == 4
 
     shutdown_lomin_background_workers(timeout_s=0.5)
+
+
+def test_is_owner_gotchi_node_and_cross_node_memory_and_tool_isolation(monkeypatch, tmp_path):
+    # 1. Owner vs collaborator vs unknown node classification
+    assert is_owner_gotchi_node("gotchi-ryan-01") is True
+    assert is_owner_gotchi_node("gotchi-v1-01") is True
+    assert is_owner_gotchi_node("gotchi-lomin-01") is True
+    assert is_owner_gotchi_node("ryan") is True
+    assert is_owner_gotchi_node("gotchi-ryan-desk") is True
+    assert is_owner_gotchi_node(None, is_loopback=True) is True
+    assert is_owner_gotchi_node("", is_loopback=True) is True
+
+    for non_owner in (
+        "gotchi-mike-01",
+        "mike",
+        "gotchi-coley-01",
+        "coley",
+        "gotchi-alex-01",
+        "alex",
+        "gotchi-mike-ryan",
+        "gotchi-unknown-99",
+        "esp32-guest",
+        "",
+        None,
+    ):
+        assert is_owner_gotchi_node(non_owner) is False, f"Expected non-owner: {non_owner!r}"
+
+    # 2. Collaborator nodes do NOT load Ryan's startup snapshot or prefetch_zero_memory
+    snapshot_calls: List[bool] = []
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._load_startup_context_snapshot",
+        lambda: (snapshot_calls.append(True) or "PRIVATE_USER_RYAN_MARKER tasks.json zero-chat-secret"),
+    )
+
+    owner_static = build_gotchi_static_system_instruction(node_id="gotchi-ryan-01")
+    assert "PRIVATE_USER_RYAN_MARKER" in owner_static
+    assert len(snapshot_calls) == 1
+
+    collab_static = build_gotchi_static_system_instruction(node_id="gotchi-mike-01")
+    assert "PRIVATE_USER_RYAN_MARKER" not in collab_static
+    assert "user_ryan.md" not in collab_static
+    assert "tasks.json" not in collab_static
+    assert len(snapshot_calls) == 1  # _load_startup_context_snapshot was NOT called
+
+    collab_full = build_gotchi_zero_system_prompt(
+        "What is Ryan's address and private schedule?",
+        has_vision=True,
+        node_id="gotchi-coley-01",
+    )
+    assert "PRIVATE_USER_RYAN_MARKER" not in collab_full
+    assert "PRE-FETCHED ZERO MEMORY" not in collab_full
+    assert "Dr. Coley attached a live camera snapshot" in collab_full
+
+    # prefetch_zero_memory returns empty string for collaborator/unknown nodes even if FTS DB exists
+    assert prefetch_zero_memory("gotchi hardware companion", node_id="gotchi-mike-01") == ""
+    assert prefetch_zero_memory("gotchi hardware companion", node_id="unknown-node") == ""
+
+    # 3. _build_gotchi_tools strips owner-only tools for collaborator nodes
+    collab_tools = _build_gotchi_tools(node_id="gotchi-alex-01")
+    collab_tool_names = {
+        d.name for t in collab_tools for d in (getattr(t, "function_declarations", None) or [])
+    }
+    for forbidden_tool in (
+        "run_shell_command",
+        "write_local_file",
+        "read_local_file",
+        "home_assistant_control",
+        "check_calendar",
+        "search_zero_memory",
+        "check_tasks_and_repos",
+        "post_note_to_zero_chat",
+        "handoff_to_zero_runtime",
+    ):
+        assert forbidden_tool not in collab_tool_names
+
+    # 4. execute_gotchi_tool_call deterministically rejects owner-only tools for collaborator nodes
+    shell_calls: List[Any] = []
+    ha_calls: List[Any] = []
+    cal_calls: List[Any] = []
+    monkeypatch.setattr("tools.gotchi_zero_adapter.subprocess.run", lambda *a, **kw: shell_calls.append(a))
+    monkeypatch.setattr("tools.gotchi_zero_adapter._run_home_assistant_control_sync", lambda *a, **kw: ha_calls.append(a))
+    monkeypatch.setattr("tools.gotchi_zero_adapter._run_check_calendar_sync", lambda *a, **kw: cal_calls.append(a))
+
+    for tool_name, tool_args in (
+        ("run_shell_command", {"command": "id"}),
+        ("search_zero_memory", {"query": "private vault"}),
+        ("home_assistant_control", {"action": "turn_off", "entity_id_or_query": "light.living_room"}),
+        ("check_calendar", {"days_ahead": 3}),
+        ("check_tasks_and_repos", {}),
+        ("read_local_file", {"file_path": "/workspace/data/tasks.json"}),
+        ("write_local_file", {"file_path": "/workspace/tmp.txt", "content": "x"}),
+    ):
+        res = asyncio.run(
+            execute_gotchi_tool_call(tool_name, tool_args, node_id="gotchi-mike-01")
+        )
+        assert res.get("blocked") is True
+        assert "Blocked" in str(res.get("error", ""))
+
+    assert shell_calls == []
+    assert ha_calls == []
+    assert cal_calls == []
+
+    # 5. Collaborator node cannot read #zero-chat via get_recent_discord_context
+    res_zc = asyncio.run(
+        execute_gotchi_tool_call(
+            "get_recent_discord_context",
+            {"channel_name": "zero-chat"},
+            node_id="gotchi-mike-01",
+        )
+    )
+    assert res_zc.get("blocked") is True
+
+    # 6. handle_turn skips Home Assistant fastpath for collaborator nodes
+    ha_fastpath_calls: List[Any] = []
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.try_ha_conversation_fastpath",
+        lambda *a, **kw: (ha_fastpath_calls.append(a) or (True, "Unlocked front door.", {})),
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter._append_voice_turn_to_history",
+        lambda *a, **kw: None,
+    )
+    adapter = GotchiZeroBrainAdapter(
+        llm_caller=lambda turn: {"reply": "Collaborator turn handled."},
+        dispatch_discord=False,
+        ha_conversation_enabled=True,
+    )
+    collab_turn = asyncio.run(
+        adapter.handle_turn(
+            {
+                "node_id": "gotchi-mike-01",
+                "session_id": "sess-mike-1",
+                "prompt": "Unlock the front door",
+            }
+        )
+    )
+    assert ha_fastpath_calls == []
+    assert collab_turn["ha_fastpath"] is False
+    assert "Collaborator turn handled." in collab_turn["reply"]
+
+
+def test_send_gotchi_artifact_to_zero_chat_path_allowlist_rejection(monkeypatch, tmp_path):
+    delivered: List[Any] = []
+    queued: List[Any] = []
+    monkeypatch.setattr(
+        "tools.deliver_image.deliver_file",
+        lambda path, **kw: (delivered.append(path) or {"success": True}),
+    )
+    monkeypatch.setattr(
+        "tools.gotchi_zero_adapter.outbox.queue_outbox_message",
+        lambda ch, content, **kw: queued.append((ch, content)),
+    )
+
+    outside_file = tmp_path / "secret_outside.txt"
+    outside_file.write_text("TOP SECRET")
+
+    blocked_paths = (
+        "/secrets/env.json",
+        "/workspace/.env",
+        "/workspace/gotchi/.env.local",
+        "/workspace/memory/private/user_ryan.md",
+        "/workspace/memory/vault/private_keys.md",
+        "/etc/passwd",
+        str(outside_file),
+    )
+    for bad_path in blocked_paths:
+        res = send_gotchi_artifact_to_zero_chat(
+            message="Exfil attempt",
+            file_path=bad_path,
+            mirror_gotchi_chat=True,
+        )
+        assert res["ok"] is False, f"Expected {bad_path} to be blocked"
+        assert res["file_delivered"] is False
+        assert "Blocked" in res.get("error", "")
+
+    assert delivered == []
+    assert queued == []
+
 
 
 
