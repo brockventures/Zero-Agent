@@ -31,21 +31,6 @@ def _handle_sigterm(signum, frame):
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
-def _handle_sigchld(signum, frame):
-    """Reap orphaned child processes to prevent zombies."""
-    while True:
-        try:
-            pid, status = os.waitpid(-1, os.WNOHANG)
-            if pid <= 0:
-                break
-        except (ChildProcessError, OSError):
-            break
-
-try:
-    signal.signal(signal.SIGCHLD, _handle_sigchld)
-except Exception as e:
-    print(f"[Bridge] Warning setting SIGCHLD reaper: {e}")
-
 from pathlib import Path
 _RESOLVED_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = "/workspace" if str(_RESOLVED_DIR) == "/app" else str(_RESOLVED_DIR.parent)
@@ -222,6 +207,7 @@ def _start_queue_workers():
                 button_choice_fn=_button_choice_callback,
                 quick_choice_view_cls=QuickChoiceView,
                 reload_fn=_execute_reload,
+                ext_turn_queue=ext_turn_queue,
             )
         )
     if ext_queue_worker_task is None or ext_queue_worker_task.done():
@@ -233,6 +219,7 @@ def _start_queue_workers():
                 button_choice_fn=_button_choice_callback,
                 quick_choice_view_cls=QuickChoiceView,
                 reload_fn=_execute_reload,
+                home_turn_queue=home_turn_queue,
             )
         )
 

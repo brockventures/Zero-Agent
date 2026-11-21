@@ -1085,9 +1085,17 @@ class PersistentTurnQueue:
             serializable = []
             for it in self.pending_items:
                 if isinstance(it, dict) and "prompt" in it:
+                    q_epoch = it.get("queued_at_epoch")
+                    if not isinstance(q_epoch, (int, float)) or q_epoch <= 0:
+                        q_epoch = time.time()
                     serializable.append({
                         "prompt": it["prompt"],
-                        "attachments": it.get("attachments", [])
+                        "attachments": it.get("attachments", []),
+                        "queued_at_epoch": q_epoch,
+                        "channel_id": it.get("channel_id"),
+                        "mode": it.get("mode"),
+                        "author_name": it.get("author_name", ""),
+                        "is_thread_task": bool(it.get("is_thread_task", False)),
                     })
             tmp = self.filepath.with_suffix(".tmp")
             with open(tmp, "w") as f:
@@ -1099,6 +1107,7 @@ class PersistentTurnQueue:
     async def put(self, item: dict):
         if isinstance(item, dict):
             item.setdefault("queued_at", time.perf_counter())
+            item.setdefault("queued_at_epoch", time.time())
         self.pending_items.append(item)
         self._persist()
         await self.queue.put(item)

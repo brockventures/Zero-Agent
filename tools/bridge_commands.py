@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -24,7 +25,7 @@ from typing import Callable, Optional
 import discord
 
 from tools.bridge_formatting import parse_interactive_choices
-from tools.bridge_runner import channel_active_procs
+from tools.bridge_runner import channel_active_procs, kill_process_tree
 import tools.bridge_runner as br
 from tools.bridge_state import (
     DATA_DIR,
@@ -221,7 +222,7 @@ async def execute_bridge_reload(
     # 0. Pre-Reload Git Synchronization: Auto-sync architecture changes to origin/main
     try:
         from tools.bridge_git_sync import sync_git_on_reload
-        sync_res = sync_git_on_reload(reason=reason, initiator=initiator)
+        sync_res = await asyncio.to_thread(sync_git_on_reload, reason=reason, initiator=initiator)
         if sync_res.get("synced"):
             print(f"[Bridge] 🚀 Pre-reload git sync: {sync_res.get('message')}")
         elif sync_res.get("clean"):
@@ -236,29 +237,63 @@ async def execute_bridge_reload(
     except Exception as gse:
         print(f"[Bridge] Warning during pre-reload git sync: {gse}")
 
-    # Terminate persistent daemons and active procs cleanly so they don't linger
+    # Terminate persistent daemons, warm classifier, and active child process groups cleanly
     try:
         from tools.bridge_daemons import daemon_manager
         await daemon_manager.shutdown_all()
     except Exception as dse:
         print(f"[Bridge] Warning shutting down persistent daemons: {dse}")
 
-    for cid, proc in list(channel_active_procs.items()):
-        if proc and proc.returncode is None:
+    try:
+        from tools.classifier import warm_classifier
+        await asyncio.to_thread(warm_classifier.shutdown)
+    except Exception as wce:
+        print(f"[Bridge] Warning shutting down warm classifier: {wce}")
+
+    active_procs = []
+    seen_proc_ids = set()
+    for proc in list(channel_active_procs.values()) + [br.active_proc, br.ext_active_proc]:
+        if proc is not None and getattr(proc, "returncode", None) is None:
+            if id(proc) not in seen_proc_ids:
+                seen_proc_ids.add(id(proc))
+                active_procs.append(proc)
+
+    for proc in active_procs:
+        try:
+            kill_process_tree(proc, signal.SIGTERM)
+        except Exception:
+            pass
+
+    async def _wait_proc_bounded(proc, timeout: float = 2.0):
+        wait_fn = getattr(proc, "wait", None)
+        if not callable(wait_fn):
+            return
+        try:
+            if asyncio.iscoroutinefunction(wait_fn):
+                await asyncio.wait_for(wait_fn(), timeout=timeout)
+            elif isinstance(proc, subprocess.Popen):
+                await asyncio.to_thread(wait_fn, timeout=timeout)
+            else:
+                res = wait_fn()
+                if asyncio.iscoroutine(res) or hasattr(res, "__await__"):
+                    await asyncio.wait_for(res, timeout=timeout)
+        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
             try:
-                proc.terminate()
+                kill_process_tree(proc, signal.SIGKILL)
             except Exception:
                 pass
-    if br.active_proc and br.active_proc.returncode is None:
-        try:
-            br.active_proc.terminate()
+            try:
+                if asyncio.iscoroutinefunction(wait_fn):
+                    await asyncio.wait_for(wait_fn(), timeout=0.5)
+                elif isinstance(proc, subprocess.Popen):
+                    await asyncio.to_thread(wait_fn, timeout=0.5)
+            except Exception:
+                pass
         except Exception:
             pass
-    if br.ext_active_proc and br.ext_active_proc.returncode is None:
-        try:
-            br.ext_active_proc.terminate()
-        except Exception:
-            pass
+
+    if active_procs:
+        await asyncio.gather(*(_wait_proc_bounded(p) for p in active_procs), return_exceptions=True)
 
     # Clean in-flight tracking
     if IN_FLIGHT_FILE.exists():

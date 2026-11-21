@@ -304,25 +304,40 @@ def is_bridge_busy(home_queue=None, ext_queue=None, exclude_channel_id: int | No
         reap_stale_in_flight_entries()
     except Exception:
         pass
-    home_busy = (br.active_proc is not None and br.active_proc.returncode is None) or (home_queue is not None and not home_queue.empty())
+    home_proc_busy = br.active_proc is not None and br.active_proc.returncode is None
+    home_queue_busy = home_queue is not None and not home_queue.empty()
     ext_busy = (br.ext_active_proc is not None and br.ext_active_proc.returncode is None) or (ext_queue is not None and not ext_queue.empty())
     busy = []
-    if home_busy and exclude_channel_id != TARGET_CHANNEL_ID:
+    if (home_proc_busy and (exclude_channel_id is None or str(exclude_channel_id) != str(TARGET_CHANNEL_ID))) or home_queue_busy:
         busy.append("#zero-chat")
     if ext_busy:
         busy.append("Crab Cavern")
-    for cid, t in channel_active_tasks.items():
-        if cid == exclude_channel_id:
+    for cid, t in list(channel_active_tasks.items()):
+        if exclude_channel_id is not None and str(cid) == str(exclude_channel_id):
             continue
         if t and not t.done():
-            ch_name = "#zero-chat" if cid == TARGET_CHANNEL_ID else f"channel:{cid}"
+            ch_name = "#zero-chat" if str(cid) == str(TARGET_CHANNEL_ID) else f"channel:{cid}"
             if ch_name not in busy:
                 busy.append(ch_name)
-    for cid, q in channel_queues.items():
-        if cid == exclude_channel_id and q.empty():
+    for tid, t in list(thread_active_tasks.items()):
+        if exclude_channel_id is not None and str(tid) == str(exclude_channel_id):
+            continue
+        if t and not t.done():
+            th_name = f"thread:{tid}"
+            if th_name not in busy:
+                busy.append(th_name)
+    for cid, proc in list(br.channel_active_procs.items()):
+        if exclude_channel_id is not None and str(cid) == str(exclude_channel_id):
+            continue
+        if proc is not None and getattr(proc, "returncode", None) is None:
+            ch_name = "#zero-chat" if str(cid) == str(TARGET_CHANNEL_ID) else f"channel:{cid}"
+            if ch_name not in busy:
+                busy.append(ch_name)
+    for cid, q in list(channel_queues.items()):
+        if exclude_channel_id is not None and str(cid) == str(exclude_channel_id) and q.empty():
             continue
         if not q.empty():
-            ch_name = "#zero-chat" if cid == TARGET_CHANNEL_ID else f"channel:{cid}"
+            ch_name = "#zero-chat" if str(cid) == str(TARGET_CHANNEL_ID) else f"channel:{cid}"
             if ch_name not in busy:
                 busy.append(ch_name)
     try:
@@ -474,7 +489,9 @@ async def run_channel_turn_worker(
     presence_fn=None,
     button_choice_fn=None,
     quick_choice_view_cls=QuickChoiceView,
-    reload_fn=None
+    reload_fn=None,
+    home_queue=None,
+    ext_queue=None,
 ):
     """Dedicated worker processing turns for a specific channel sequentially."""
     global active_turn_task, active_status_msg
@@ -584,7 +601,11 @@ async def run_channel_turn_worker(
             # Immediate post-turn check for reload flag (defer if neighbor channels are busy)
             reload_flag = DATA_DIR / "reload_bridge.flag"
             if reload_flag.exists():
-                other_busy = is_bridge_busy(exclude_channel_id=channel_id)
+                other_busy = is_bridge_busy(
+                    home_queue=home_queue,
+                    ext_queue=ext_queue,
+                    exclude_channel_id=channel_id,
+                )
                 if other_busy:
                     print(f"[Channel Worker {channel_id}] Post-turn reload flag detected, but bridge channels are busy ({other_busy}). Deferring reload.")
                 else:
@@ -601,25 +622,52 @@ async def run_channel_turn_worker(
     finally:
         channel_worker_tasks.pop(channel_id, None)
         channel_active_tasks.pop(channel_id, None)
+        if thread_active_tasks.get(channel_id) is asyncio.current_task():
+            thread_active_tasks.pop(channel_id, None)
 
 
-async def queue_worker(home_turn_queue, bot: discord.Client, presence_fn=None, button_choice_fn=None, quick_choice_view_cls=QuickChoiceView, reload_fn=None):
-    """Central home dispatcher routing turns to parallel per-channel workers."""
+async def queue_worker(
+    home_turn_queue,
+    bot: discord.Client,
+    presence_fn=None,
+    button_choice_fn=None,
+    quick_choice_view_cls=QuickChoiceView,
+    reload_fn=None,
+    ext_turn_queue=None,
+):
+    """Central home dispatcher routing turns to parallel per-channel/per-thread FIFO workers."""
     try:
         while True:
             item = await home_turn_queue.get()
             reply_target = item.get("reply_target")
             channel_id = item.get("channel_id", TARGET_CHANNEL_ID)
-            is_thread_task = item.get("is_thread_task", False) or (reply_target and isinstance(getattr(reply_target, "channel", None), discord.Thread))
+            is_thread_task = item.get("is_thread_task", False) or (
+                reply_target is not None
+                and (
+                    isinstance(reply_target, discord.Thread)
+                    or isinstance(getattr(reply_target, "channel", None), discord.Thread)
+                )
+            )
 
             if is_thread_task:
-                t_task = asyncio.create_task(run_thread_turn_worker(item, bot, presence_fn, button_choice_fn, quick_choice_view_cls))
-                tid = getattr(getattr(reply_target, "channel", None), "id", None) or getattr(reply_target, "id", None) or channel_id
-                thread_active_tasks[tid] = t_task
-                home_turn_queue.task_done()
-                continue
+                if isinstance(reply_target, discord.Thread):
+                    tid_raw = reply_target.id
+                else:
+                    ch_id_attr = getattr(getattr(reply_target, "channel", None), "id", None)
+                    rt_id_attr = getattr(reply_target, "id", None)
+                    if isinstance(ch_id_attr, (int, str)) and str(ch_id_attr).isdigit():
+                        tid_raw = ch_id_attr
+                    elif isinstance(rt_id_attr, (int, str)) and str(rt_id_attr).isdigit():
+                        tid_raw = rt_id_attr
+                    else:
+                        tid_raw = channel_id
+                cid = int(tid_raw) if str(tid_raw).isdigit() else tid_raw
+                item.setdefault("mode", "home")
+                item["channel_id"] = cid
+                item["is_thread_task"] = True
+            else:
+                cid = int(channel_id) if str(channel_id).isdigit() else channel_id
 
-            cid = int(channel_id) if str(channel_id).isdigit() else channel_id
             q = get_channel_queue(cid)
             await q.put(item)
             home_turn_queue.task_done()
@@ -628,17 +676,35 @@ async def queue_worker(home_turn_queue, bot: discord.Client, presence_fn=None, b
             if existing_task is None or existing_task.done():
                 t = asyncio.create_task(
                     run_channel_turn_worker(
-                        cid, q, bot, presence_fn, button_choice_fn, quick_choice_view_cls, reload_fn
+                        cid,
+                        q,
+                        bot,
+                        presence_fn,
+                        button_choice_fn,
+                        quick_choice_view_cls,
+                        reload_fn,
+                        home_queue=home_turn_queue,
+                        ext_queue=ext_turn_queue,
                     )
                 )
                 channel_worker_tasks[cid] = t
+                if is_thread_task:
+                    thread_active_tasks[cid] = t
     finally:
         for cid, t in list(channel_worker_tasks.items()):
             if t and not t.done():
                 t.cancel()
 
 
-async def external_queue_worker(ext_turn_queue, bot: discord.Client, presence_fn=None, button_choice_fn=None, quick_choice_view_cls=QuickChoiceView, reload_fn=None):
+async def external_queue_worker(
+    ext_turn_queue,
+    bot: discord.Client,
+    presence_fn=None,
+    button_choice_fn=None,
+    quick_choice_view_cls=QuickChoiceView,
+    reload_fn=None,
+    home_turn_queue=None,
+):
     """External dispatcher routing turns to parallel per-channel workers."""
     while True:
         item = await ext_turn_queue.get()
@@ -652,7 +718,15 @@ async def external_queue_worker(ext_turn_queue, bot: discord.Client, presence_fn
         if existing_task is None or existing_task.done():
             t = asyncio.create_task(
                 run_channel_turn_worker(
-                    cid, q, bot, presence_fn, button_choice_fn, quick_choice_view_cls, reload_fn
+                    cid,
+                    q,
+                    bot,
+                    presence_fn,
+                    button_choice_fn,
+                    quick_choice_view_cls,
+                    reload_fn,
+                    home_queue=home_turn_queue,
+                    ext_queue=ext_turn_queue,
                 )
             )
             channel_worker_tasks[cid] = t
@@ -795,19 +869,46 @@ async def handle_on_ready(
 
     # On initial boot, load persisted turns; on gateway reconnect, preserve active in-memory queue
     if not has_notified_ready:
-        if hasattr(turn_queue, "load_persisted"):
-            try:
-                res = turn_queue.load_persisted()
-                if asyncio.iscoroutine(res):
-                    res = await res
-                if isinstance(res, list):
-                    for item in res:
-                        if isinstance(item, dict) and item.get("prompt"):
-                            q_ts = item.get("queued_at", 0)
-                            if (time.time() - q_ts) < 900:
-                                asyncio.create_task(turn_queue.put(item))
-            except Exception as pe:
-                print(f"[Bridge] Error loading persisted turn queue: {pe}")
+        for q_obj, default_mode in ((turn_queue, "home"), (ext_turn_queue, "external")):
+            if q_obj is not None and hasattr(q_obj, "load_persisted"):
+                try:
+                    res = q_obj.load_persisted()
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                    if isinstance(res, list):
+                        for item in res:
+                            if isinstance(item, dict) and item.get("prompt"):
+                                q_ts = item.get("queued_at_epoch") or item.get("queued_at", 0)
+                                if isinstance(q_ts, (int, float)) and (time.time() - q_ts) < 900:
+                                    if not item.get("reply_target"):
+                                        raw_cid = item.get("channel_id")
+                                        if raw_cid is None and default_mode == "home":
+                                            raw_cid = TARGET_CHANNEL_ID
+                                        if raw_cid is None:
+                                            print("[Bridge] Skipping persisted external turn — missing channel_id.")
+                                            continue
+                                        cid = int(raw_cid) if str(raw_cid).isdigit() else raw_cid
+                                        target_ch = None
+                                        try:
+                                            target_ch = bot.get_channel(cid)
+                                            if target_ch is None and hasattr(bot, "fetch_channel"):
+                                                target_ch = await bot.fetch_channel(cid)
+                                        except Exception as fce:
+                                            print(f"[Bridge] Skipping persisted turn — failed fetching channel {cid}: {fce}")
+                                            target_ch = None
+                                        if target_ch is None:
+                                            print(f"[Bridge] Skipping persisted turn — channel {cid} unavailable.")
+                                            continue
+                                        item["reply_target"] = target_ch
+                                        item["channel_id"] = cid
+                                    item.setdefault("status_msg", None)
+                                    item.setdefault("attachments", [])
+                                    if not item.get("mode"):
+                                        item["mode"] = default_mode
+                                    item["queued_at"] = time.perf_counter()
+                                    await q_obj.put(item)
+                except Exception as pe:
+                    print(f"[Bridge] Error loading persisted turn queue: {pe}")
 
     if not has_notified_ready:
         has_notified_ready = True

@@ -211,6 +211,53 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(turn_q.empty())
 
+    async def test_persistent_turn_queue_epoch_and_metadata_roundtrip(self):
+        """Verify PersistentTurnQueue persists Unix epoch queued_at_epoch and routing metadata without mixing perf_counter."""
+        q_file = self.temp_path / "epoch_queue.json"
+        turn_q = bs.PersistentTurnQueue(q_file)
+
+        before_epoch = time.time()
+        item = {
+            "prompt": "Resume thread work",
+            "attachments": ["/tmp/example.png"],
+            "channel_id": 9988776655,
+            "mode": "home",
+            "author_name": "Ryan",
+            "is_thread_task": True,
+        }
+        await turn_q.put(item)
+        after_epoch = time.time()
+
+        # In-memory item maintains both monotonic queued_at and wall-clock queued_at_epoch
+        self.assertIn("queued_at", item)
+        self.assertIn("queued_at_epoch", item)
+        self.assertGreaterEqual(item["queued_at_epoch"], before_epoch - 1.0)
+        self.assertLessEqual(item["queued_at_epoch"], after_epoch + 1.0)
+
+        # Disk payload serializes Unix epoch and full routing metadata
+        with open(q_file) as f:
+            disk_items = json.load(f)
+        self.assertEqual(len(disk_items), 1)
+        saved = disk_items[0]
+        self.assertEqual(saved["prompt"], "Resume thread work")
+        self.assertEqual(saved["attachments"], ["/tmp/example.png"])
+        self.assertEqual(saved["channel_id"], 9988776655)
+        self.assertEqual(saved["mode"], "home")
+        self.assertEqual(saved["author_name"], "Ryan")
+        self.assertTrue(saved["is_thread_task"])
+        self.assertGreaterEqual(saved["queued_at_epoch"], before_epoch - 1.0)
+        self.assertLessEqual(saved["queued_at_epoch"], after_epoch + 1.0)
+
+        # Fresh queue instance simulates restart recovery via load_persisted()
+        reloaded_q = bs.PersistentTurnQueue(q_file)
+        loaded = reloaded_q.load_persisted()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["channel_id"], 9988776655)
+        self.assertEqual(loaded[0]["mode"], "home")
+        self.assertEqual(loaded[0]["author_name"], "Ryan")
+        self.assertTrue(loaded[0]["is_thread_task"])
+        self.assertLess(time.time() - loaded[0]["queued_at_epoch"], 900)
+
     def test_active_model_and_runtime_config(self):
         bs.set_active_model("claude-sonnet-4-6")
         self.assertEqual(bs.get_active_model(), "claude-sonnet-4-6")

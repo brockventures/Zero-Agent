@@ -120,6 +120,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
     async def test_handle_button_choice_reload_interception(self):
         mock_interaction = MagicMock()
         mock_interaction.id = 12345
+        mock_interaction.user.id = bs.OWNER_USER_ID
         mock_interaction.user.display_name = "Ryan"
         mock_interaction.channel.send = AsyncMock()
 
@@ -134,6 +135,7 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
     async def test_handle_button_choice_container_restart_interception(self, mock_container_restart):
         mock_interaction = MagicMock()
         mock_interaction.id = 54321
+        mock_interaction.user.id = bs.OWNER_USER_ID
         mock_interaction.user.display_name = "Ryan"
         mock_interaction.channel.send = AsyncMock()
 
@@ -146,7 +148,12 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
     async def test_handle_button_choice_turn_enqueue(self):
         mock_interaction = MagicMock()
         mock_interaction.id = 99999
+        mock_interaction.user.id = bs.OWNER_USER_ID
         mock_interaction.channel_id = 1542081375287640084
+        mock_interaction.channel.id = 1542081375287640084
+        mock_interaction.channel.category_id = None
+        mock_interaction.channel.parent_id = None
+        mock_interaction.channel.parent = None
         mock_interaction.channel.typing = MagicMock()
         mock_msg = MagicMock()
         mock_interaction.channel.send = AsyncMock(return_value=mock_msg)
@@ -1874,6 +1881,222 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
             m_forge_rec,
         ):
             self.assertIn(expected_fn, offloaded_funcs)
+
+    async def test_handle_on_ready_rehydrates_persisted_turns_and_skips_stale_or_unreachable(self):
+        """Verify handle_on_ready checks queued_at_epoch freshness, re-hydrates reply_target, and skips stale/unreachable channels."""
+        bh.has_notified_ready = False
+        q_file = self.temp_path / "persisted_home_q.json"
+        now = time.time()
+        persisted = [
+            {
+                "prompt": "Fresh thread turn",
+                "attachments": ["/tmp/a.txt"],
+                "queued_at_epoch": now - 30.0,
+                "channel_id": 555111,
+                "mode": "home",
+                "author_name": "Ryan",
+                "is_thread_task": True,
+            },
+            {
+                "prompt": "Stale turn",
+                "attachments": [],
+                "queued_at_epoch": now - 1200.0,
+                "channel_id": 555222,
+                "mode": "home",
+                "author_name": "Ryan",
+                "is_thread_task": False,
+            },
+            {
+                "prompt": "Unreachable channel turn",
+                "attachments": [],
+                "queued_at_epoch": now - 15.0,
+                "channel_id": 555333,
+                "mode": "home",
+                "author_name": "Ryan",
+                "is_thread_task": False,
+            },
+        ]
+        q_file.write_text(json.dumps(persisted))
+        turn_q = bs.PersistentTurnQueue(q_file)
+
+        rehydrated_ch = MagicMock()
+        rehydrated_ch.id = 555111
+
+        def fake_get_channel(cid):
+            return None
+
+        async def fake_fetch_channel(cid):
+            if cid == 555111:
+                return rehydrated_ch
+            raise RuntimeError("Unknown Channel")
+
+        mock_bot = MagicMock()
+        mock_bot.user = MagicMock(id=1542285964213358633)
+        mock_bot.get_channel.side_effect = fake_get_channel
+        mock_bot.fetch_channel = AsyncMock(side_effect=fake_fetch_channel)
+
+        with patch("tools.mcp_daemon.ensure_mcp_daemon_running"), \
+             patch("tools.mcp_daemon.get_status", return_value={"pid": 1, "healthy": True}), \
+             patch("tools.zero_mail_listener.ensure_mail_listener_running"), \
+             patch("tools.zero_mail_listener.get_status", return_value={"pid": 2, "target": "t"}), \
+             patch("tools.amazon_order_listener.ensure_amazon_listener_running"), \
+             patch("tools.amazon_order_listener.get_status", return_value={"pid": 3}), \
+             patch("tools.zero_health_server.ensure_health_server_running"), \
+             patch("tools.zero_health_server.get_status", return_value={"pid": 4, "port": 8080}), \
+             patch("tools.banana_watcher.ensure_banana_watcher_running"), \
+             patch("tools.banana_watcher.get_daemon_status", return_value={"pid": 5}), \
+             patch("tools.forge.reconcile_forge_on_boot", return_value={}), \
+             patch("tools.bridge_daemons.warmup_persistent_daemons", new_callable=AsyncMock), \
+             patch("tools.bridge_handlers.detect_recent_container_oom", return_value=None):
+            await bh.handle_on_ready(
+                mock_bot,
+                turn_queue=turn_q,
+                ext_turn_queue=AsyncMock(),
+                start_workers_fn=MagicMock(),
+                start_scheduler_fn=AsyncMock(),
+            )
+
+        self.assertFalse(turn_q.empty())
+        recovered = await turn_q.get()
+        turn_q.task_done(recovered)
+        self.assertEqual(recovered["prompt"], "Fresh thread turn")
+        self.assertIs(recovered["reply_target"], rehydrated_ch)
+        self.assertEqual(recovered["channel_id"], 555111)
+        self.assertTrue(recovered["is_thread_task"])
+        self.assertEqual(recovered["author_name"], "Ryan")
+        self.assertTrue(turn_q.empty())
+
+    async def test_is_bridge_busy_detects_threads_procs_and_queues_and_defers_reload(self):
+        """Verify is_bridge_busy checks thread_active_tasks, channel_active_procs, and passed queues, and defers post-turn reload."""
+        mock_thread_task = MagicMock()
+        mock_thread_task.done.return_value = False
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+
+        non_empty_home_q = MagicMock()
+        non_empty_home_q.empty.return_value = False
+        empty_q = MagicMock()
+        empty_q.empty.return_value = True
+
+        bh.thread_active_tasks[777] = mock_thread_task
+        br.channel_active_procs[888] = mock_proc
+        try:
+            busy = bh.is_bridge_busy(home_queue=empty_q, ext_queue=empty_q)
+            self.assertIn("thread:777", busy)
+            self.assertIn("channel:888", busy)
+
+            # Respects exclude_channel_id for thread_active_tasks and channel_active_procs
+            self.assertNotIn("thread:777", bh.is_bridge_busy(empty_q, empty_q, exclude_channel_id=777))
+            self.assertNotIn("channel:888", bh.is_bridge_busy(empty_q, empty_q, exclude_channel_id=888))
+
+            # Non-empty home_queue keeps bridge busy even when TARGET_CHANNEL_ID is excluded
+            busy_home_q = bh.is_bridge_busy(
+                home_queue=non_empty_home_q,
+                ext_queue=empty_q,
+                exclude_channel_id=bs.TARGET_CHANNEL_ID,
+            )
+            self.assertIn("#zero-chat", busy_home_q)
+
+            # Finished thread and exited proc are not busy
+            mock_thread_task.done.return_value = True
+            mock_proc.returncode = 0
+            self.assertEqual(bh.is_bridge_busy(empty_q, empty_q), [])
+        finally:
+            bh.thread_active_tasks.pop(777, None)
+            br.channel_active_procs.pop(888, None)
+
+        # Verify run_channel_turn_worker defers reload when ext_queue has pending turns
+        reload_flag = self.temp_path / "reload_bridge.flag"
+        reload_flag.write_text("1")
+        orig_bh_data_dir = bh.DATA_DIR
+        bh.DATA_DIR = self.temp_path
+        ch_q = asyncio.Queue()
+        await ch_q.put({"prompt": "finish turn", "reply_target": MagicMock(), "attachments": [], "mode": "home"})
+        non_empty_ext_q = MagicMock()
+        non_empty_ext_q.empty.return_value = False
+        reload_mock = AsyncMock()
+        try:
+            with patch("tools.bridge_handlers.execute_agy_turn", new_callable=AsyncMock):
+                await bh.run_channel_turn_worker(
+                    bs.TARGET_CHANNEL_ID,
+                    ch_q,
+                    MagicMock(),
+                    reload_fn=reload_mock,
+                    home_queue=empty_q,
+                    ext_queue=non_empty_ext_q,
+                )
+            reload_mock.assert_not_awaited()
+            self.assertTrue(reload_flag.exists())
+        finally:
+            bh.DATA_DIR = orig_bh_data_dir
+
+    async def test_queue_worker_serializes_thread_turns_fifo(self):
+        """Verify queue_worker routes is_thread_task items through a single per-thread FIFO worker with zero overlap."""
+        thread_id = 900001
+        events = []
+        in_flight = 0
+        max_concurrent = 0
+        second_done = asyncio.Event()
+
+        async def fake_execute(prompt, status_msg, reply_target, attachments, **kwargs):
+            nonlocal in_flight, max_concurrent
+            in_flight += 1
+            max_concurrent = max(max_concurrent, in_flight)
+            events.append(f"{prompt}:start:{kwargs.get('channel_id')}:{kwargs.get('mode')}")
+            await asyncio.sleep(0.05)
+            events.append(f"{prompt}:end")
+            in_flight -= 1
+            if prompt == "second":
+                second_done.set()
+
+        home_q = asyncio.Queue()
+        rt1 = MagicMock()
+        rt1.channel = MagicMock(id=thread_id)
+        rt2 = MagicMock()
+        rt2.channel = MagicMock(id=thread_id)
+
+        await home_q.put({
+            "prompt": "first",
+            "status_msg": None,
+            "reply_target": rt1,
+            "attachments": [],
+            "channel_id": thread_id,
+            "is_thread_task": True,
+        })
+        await home_q.put({
+            "prompt": "second",
+            "status_msg": None,
+            "reply_target": rt2,
+            "attachments": [],
+            "channel_id": thread_id,
+            "is_thread_task": True,
+        })
+
+        with patch("tools.bridge_handlers.execute_agy_turn", side_effect=fake_execute):
+            worker = asyncio.create_task(bh.queue_worker(home_turn_queue=home_q, bot=MagicMock()))
+            try:
+                await asyncio.wait_for(second_done.wait(), timeout=2.0)
+                await asyncio.sleep(0.02)
+            finally:
+                worker.cancel()
+                try:
+                    await worker
+                except asyncio.CancelledError:
+                    pass
+                bh.channel_queues.pop(thread_id, None)
+                bh.channel_worker_tasks.pop(thread_id, None)
+                bh.thread_active_tasks.pop(thread_id, None)
+
+        self.assertEqual(max_concurrent, 1)
+        self.assertEqual(
+            events,
+            [
+                f"first:start:{thread_id}:home",
+                "first:end",
+                f"second:start:{thread_id}:home",
+                "second:end",
+            ],
+        )
 
 
 if __name__ == "__main__":

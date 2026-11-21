@@ -470,6 +470,71 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    async def test_execute_bridge_reload_shuts_down_warm_classifier_kills_proc_trees_and_offloads_git_sync(self):
+        """Verify execute_bridge_reload offloads sync_git_on_reload, shuts down warm_classifier, and kills child process groups with bounded wait."""
+        import signal
+        import tools.bridge_commands as bc
+        import tools.bridge_runner as br
+
+        proc_clean = MagicMock()
+        proc_clean.returncode = None
+        proc_clean.wait = AsyncMock(return_value=0)
+
+        proc_stubborn = MagicMock()
+        proc_stubborn.returncode = None
+        proc_stubborn.wait = AsyncMock(side_effect=[asyncio.TimeoutError(), 0])
+
+        br.channel_active_procs[12345] = proc_clean
+        orig_active_proc = br.active_proc
+        orig_ext_proc = br.ext_active_proc
+        br.active_proc = proc_stubborn
+        br.ext_active_proc = None
+
+        orig_to_thread = asyncio.to_thread
+        offloaded = []
+
+        async def spy_to_thread(fn, *args, **kwargs):
+            offloaded.append(fn)
+            return await orig_to_thread(fn, *args, **kwargs)
+
+        mock_bot = MagicMock()
+        mock_bot.close = AsyncMock()
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock()
+
+        try:
+            with patch("tools.bridge_commands.record_restart_intent"), \
+                 patch("tools.bridge_git_sync.sync_git_on_reload", return_value={"clean": True, "message": "Clean"}) as mock_git_sync, \
+                 patch("tools.bridge_daemons.daemon_manager.shutdown_all", new_callable=AsyncMock) as mock_daemons_shutdown, \
+                 patch("tools.classifier.warm_classifier.shutdown") as mock_warm_shutdown, \
+                 patch("tools.bridge_commands.kill_process_tree") as mock_kill_tree, \
+                 patch("tools.bridge_commands.asyncio.to_thread", side_effect=spy_to_thread), \
+                 patch("os.execv") as mock_execv:
+                await bc.execute_bridge_reload(
+                    bot=mock_bot,
+                    channel=mock_channel,
+                    initiator="user",
+                    reason="unit test reload",
+                )
+
+            self.assertIn(mock_git_sync, offloaded)
+            mock_git_sync.assert_called_once_with(reason="unit test reload", initiator="user")
+            mock_daemons_shutdown.assert_awaited_once()
+            self.assertIn(mock_warm_shutdown, offloaded)
+            mock_warm_shutdown.assert_called_once()
+
+            kill_calls = mock_kill_tree.call_args_list
+            self.assertIn(((proc_clean, signal.SIGTERM), {}), [(c.args, c.kwargs) for c in kill_calls])
+            self.assertIn(((proc_stubborn, signal.SIGTERM), {}), [(c.args, c.kwargs) for c in kill_calls])
+            self.assertIn(((proc_stubborn, signal.SIGKILL), {}), [(c.args, c.kwargs) for c in kill_calls])
+            proc_clean.wait.assert_awaited_once()
+            mock_bot.close.assert_awaited_once()
+            mock_execv.assert_called_once()
+        finally:
+            br.channel_active_procs.pop(12345, None)
+            br.active_proc = orig_active_proc
+            br.ext_active_proc = orig_ext_proc
+
 
 if __name__ == "__main__":
     unittest.main()

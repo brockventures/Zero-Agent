@@ -247,5 +247,27 @@ class TestBridgeSlashAndButtonAuth(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(interaction.response.send_message.call_args[1].get("ephemeral"))
 
 
+class TestBridgeSignalHygiene(unittest.TestCase):
+
+    def test_no_global_sigchld_handler_registered(self):
+        """Verify tools/bridge.py does not install a global SIGCHLD reaper that races subprocess exit codes."""
+        import signal
+        import subprocess
+        import tools.bridge as bridge
+
+        self.assertFalse(hasattr(bridge, "_handle_sigchld"))
+        bridge_src = (REPO_ROOT / "tools" / "bridge.py").read_text(encoding="utf-8")
+        self.assertNotIn("SIGCHLD", bridge_src)
+        self.assertEqual(signal.getsignal(signal.SIGCHLD), signal.SIG_DFL)
+
+        # Child non-zero exit codes must be preserved without ECHILD coercion
+        res = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.exit(42)"],
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(res.returncode, 42)
+
+
 if __name__ == "__main__":
     unittest.main()
