@@ -124,7 +124,7 @@ class TestCharacterConsistencyAndPrompts:
 
         assert len({hdwa.SLOT_CHOREOGRAPHY[s] for s in ("morning", "afternoon", "evening")}) == 3
         assert "Miles Morales" in prompts["morning"]
-        assert "Spider-Gwen" in prompts["afternoon"]
+        assert "white-hooded spider-heroine" in prompts["afternoon"]
         assert "Spider-Ham" in prompts["evening"]
 
         # (b) Clothing description appears only ONCE (no duplicate 'Current weather attire' block)

@@ -286,12 +286,12 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         ),
         "scene_flavor": {
             "morning": "gritty Brooklyn elevated steel subway overpass and mural-splashed red-brick street corner, diagonal riveted iron girders casting bold hatched shadows across wet asphalt",
-            "afternoon": "high-altitude Brooklyn Bridge granite tower and suspension-cable promenade overlook, sweeping geometric web of steel cables framing the sun-blasted East River and lower Manhattan skyscrapers",
+            "afternoon": "high-altitude Brooklyn Bridge granite tower and suspension-cable promenade overlook, sweeping geometric web of steel cables framing the East River and lower Manhattan skyscrapers",
             "evening": "neon-drenched Brooklyn rooftop water-tower ledge towering above an electric magenta, cyan, and acid-yellow Manhattan night skyline exploding with halftone light blooms",
         },
         "easter_eggs": {
             "morning": "In the open LEFT 58% background, Miles Morales in his black-and-red Spider-Man suit and a red hooded puffer vest swings dynamically between elevated train girders on a crisp white comic web-line",
-            "afternoon": "In the open LEFT 58% sky across the suspension cables, Spider-Gwen in her white-hooded suit performs an acrobatic mid-air web-swing arc leaving bold graphic action lines against the halftone clouds",
+            "afternoon": "In the open LEFT 58% sky across the suspension cables, a white-hooded spider-heroine in a crisp black-and-white comic suit with magenta accents performs a dynamic mid-air web-swing arc leaving bold graphic action lines against the halftone clouds",
             "evening": "In the open LEFT 58% skyline, a fractured neon polygonal multiverse glitch portal shimmers between two skyscraper spires as Miles Morales and Spider-Ham leap in dynamic comic silhouette across a billboard",
         },
         "context_tags": ["spider-man", "spiderverse", "marvel", "comic", "animation", "plex"],
