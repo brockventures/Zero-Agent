@@ -91,16 +91,13 @@ FAMILY_CAST_SHEET: dict[str, dict[str, str]] = {
 }
 
 BASE_CHARACTER_CONSISTENCY_CLAUSE = (
-    "Three young siblings together sharing absolute family consistency: "
-    "1) Rosie: 7-year-old girl, tallest child, long flowing golden-blonde hair with soft natural waves, bright light blue-green eyes, warm friendly smile. "
-    "2) Isaac: 3-year-old toddler boy, noticeably shorter than Rosie (reaching her chest or shoulder height), tousled messy light golden-blonde hair, curious bright light blue-green eyes, playful toddler demeanor. "
-    "3) Genevieve (Eve): 3-month-old infant baby girl, tiny newborn-sized baby, fine wispy pale golden-blonde baby hair, sweet light blue-green eyes, always bundled snugly and cradled securely in an arm, chest wrap, or cushioned basket (never standing, never left alone). "
-    "MANDATORY INVARIANTS: All three children MUST share matching golden-blonde hair and light blue-green eyes. "
-    "NEGATIVE GUARDRAILS: Absolutely no dark hair, no brown hair, no black hair, no brunette characters. "
-    "No adult or teenage Genevieve; Genevieve is strictly a 3-month-old cradled infant. "
-    "COMPOSITION INVARIANT: Horizontal widescreen 16:9 aspect ratio. ALL three characters MUST be clustered together within the RIGHT 42% of the frame. "
-    "The entire LEFT 58% of the frame MUST remain open, clean atmospheric scenery and expansive landscape so left-side weather dashboard UI text never covers character faces. "
-    "ZERO-UI INVARIANT: Absolutely no text, no lettering, no numerals, no watermarks, no signatures, no weather icons, no gauges, no borders."
+    "Three siblings with matching golden-blonde hair and light blue-green eyes: "
+    "1) Rosie: 7-year-old girl, tallest, long wavy golden-blonde hair, light blue-green eyes. "
+    "2) Isaac: 3-year-old toddler boy, noticeably shorter than Rosie (chest-height), tousled golden-blonde hair, light blue-green eyes. "
+    "3) Genevieve (Eve): 3-month-old infant baby girl, tiny newborn-sized baby, wispy golden-blonde hair, light blue-green eyes, always securely cradled or in a chest wrap (never standing or alone). "
+    "ANTI-PORTRAIT RULE: Depict candid natural interaction in motion—NEVER a stiff front-facing posed family portrait staring straight into the camera. "
+    "COMPOSITION: 16:9 widescreen; cluster all three children in the RIGHT 42%, leaving the LEFT 58% open landscape free of faces. "
+    "GUARDRAILS & ZERO-UI INVARIANT: No dark hair, no brown hair, no black hair, no older Eve, no text, no watermarks, no icons, no borders."
 )
 
 CLOTHING_STATE_PROMPTS: dict[str, str] = {
@@ -140,6 +137,54 @@ SLOT_LIGHTING: dict[str, str] = {
     "afternoon": "Vibrant clear afternoon daylight, warm luminous natural sunlit ambiance, rich colorful daylight illumination, 2:00 PM sun",
     "evening": "Cozy twilight golden-hour dusk, warm amber sunset glow in the sky, soft lanterns or gentle evening twilight colors, 6:00 PM dusk",
 }
+
+SLOT_CHOREOGRAPHY: dict[str, str] = {
+    "morning": (
+        "Camera & Candid Choreography (Morning): Dynamic low-angle three-quarter candid shot from the right foreground; "
+        "toddler Isaac points excitedly across the frame toward the open left scenery while Rosie leans in beside him "
+        "laughing and securely cradling swaddled baby Genevieve (Eve), all three engaged in the world rather than looking at the lens."
+    ),
+    "afternoon": (
+        "Camera & Candid Choreography (Afternoon): Lively wide side-profile and three-quarter mid-stride exploration shot; "
+        "Rosie and toddler Isaac walk and explore actively along the right side of the path with baby Genevieve (Eve) "
+        "tucked safely in a snug front wrap or Rosie's arms, capturing spontaneous midday movement and curiosity."
+    ),
+    "evening": (
+        "Camera & Candid Choreography (Evening): Cozy elevated-angle dusk rim-lit candid moment in the right foreground; "
+        "Rosie and toddler Isaac pause together in profile and three-quarter view gazing out toward the glowing left horizon "
+        "while baby Genevieve (Eve) rests peacefully cradled against Rosie's shoulder."
+    ),
+}
+
+
+def get_slot_lighting(slot: str, condition: str, is_rain: bool) -> str:
+    """Return weather-synchronized slot lighting that avoids sunny/overcast contradictions."""
+    cond_norm = (condition or "").strip().lower()
+    if is_rain:
+        rain_lighting = {
+            "morning": "Soft diffused rainy morning light, cool wet reflections, gentle rain-washed atmosphere, 8:00 AM dawn ambiance",
+            "afternoon": "Diffused overcast rainy afternoon light, glistening wet reflections, moody silver-gray rain illumination, 2:00 PM daylight",
+            "evening": "Moody rainy twilight dusk, warm wet surface reflections against deep slate-blue clouds, gentle evening rain atmosphere, 6:00 PM dusk",
+        }
+        return rain_lighting.get(slot, rain_lighting["morning"])
+
+    if any(k in cond_norm for k in ("cloud", "overcast", "fog", "mist", "haz")):
+        if "partly" in cond_norm:
+            partly_lighting = {
+                "morning": "Dappled morning sunbreaks through drifting clouds, soft low-angle golden dawn light, fresh atmosphere, 8:00 AM dawn ambiance",
+                "afternoon": "Dappled afternoon sunbreaks through drifting clouds, warm natural daylight illumination with soft cloud shadows, 2:00 PM sun",
+                "evening": "Warm golden-hour dusk sunbreaks through drifting evening clouds, glowing amber-violet twilight sky, 6:00 PM dusk",
+            }
+            return partly_lighting.get(slot, partly_lighting["morning"])
+
+        overcast_lighting = {
+            "morning": "Soft diffused overcast morning light, gentle misty cloud illumination, shadowless silver-pearl morning atmosphere, 8:00 AM dawn ambiance",
+            "afternoon": "Soft diffused overcast afternoon daylight, even cloud-filtered illumination, atmospheric misty depth, 2:00 PM daylight",
+            "evening": "Soft cloud-diffused twilight dusk, muted violet-amber horizon glow beneath overcast skies, cozy low-contrast evening light, 6:00 PM dusk",
+        }
+        return overcast_lighting.get(slot, overcast_lighting["morning"])
+
+    return SLOT_LIGHTING.get(slot, SLOT_LIGHTING["morning"])
 
 # ---------------------------------------------------------------------------
 # 2. Art Style Vault (19+ Distinct Visual Mediums)
@@ -987,7 +1032,7 @@ def build_slot_prompt(
         precip_prob=precip_prob,
     )
     clothing_desc = CLOTHING_STATE_PROMPTS.get(clothing_state, CLOTHING_STATE_PROMPTS["morning_mild"])
-    lighting_desc = SLOT_LIGHTING.get(slot, SLOT_LIGHTING["morning"])
+    choreography_desc = SLOT_CHOREOGRAPHY.get(slot, SLOT_CHOREOGRAPHY["morning"])
 
     cond_norm = condition.lower()
     is_rain = (
@@ -995,6 +1040,7 @@ def build_slot_prompt(
         or precip > 0.04
         or precip_prob >= 40.0
     )
+    lighting_desc = get_slot_lighting(slot=slot, condition=condition, is_rain=is_rain)
     if is_rain:
         sky_desc = "overcast rain showers, wet glistening surfaces, and raindrop ripples in puddles"
     elif any(k in cond_norm for k in ("cloud", "overcast", "fog", "mist", "haz")):
@@ -1037,6 +1083,11 @@ def build_slot_prompt(
     )
 
     scene_flavor = theme.get("scene_flavor", {}).get(slot, "scenic picturesque outdoor landscape")
+    easter_egg = theme.get("easter_eggs", {}).get(slot, "").strip()
+    if easter_egg:
+        easter_egg_clause = f" {easter_egg}" if easter_egg.endswith(".") else f" {easter_egg}."
+    else:
+        easter_egg_clause = ""
     prompt_style = theme.get("prompt_style", "")
 
     # Check for Ocarina of Time special notes
@@ -1049,11 +1100,11 @@ def build_slot_prompt(
 
     full_prompt = (
         f"{prompt_style}. "
+        f"{choreography_desc} "
         f"{attire_mandate_clause} "
         f"Atmosphere: {lighting_desc}. {weather_atmosphere_clause} "
-        f"Setting: {scene_flavor}.{special_flavor} "
-        f"Characters & Attire: {BASE_CHARACTER_CONSISTENCY_CLAUSE} "
-        f"Current weather attire ({clothing_state}): {clothing_desc} "
+        f"Setting: {scene_flavor}.{easter_egg_clause}{special_flavor} "
+        f"Characters: {BASE_CHARACTER_CONSISTENCY_CLAUSE} "
         f"Composed in cinematic horizontal 16:9 widescreen with rich artistic storytelling depth."
     )
     return full_prompt

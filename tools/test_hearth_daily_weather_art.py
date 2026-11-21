@@ -95,6 +95,62 @@ class TestCharacterConsistencyAndPrompts:
         assert "zero-ui invariant" in clause.lower()
         assert "no text" in clause.lower()
         assert "no watermarks" in clause.lower()
+        assert "candid natural interaction" in clause.lower()
+        assert "never a stiff front-facing posed family portrait" in clause.lower()
+        assert len(clause) < 950
+
+    def test_build_slot_prompt_choreography_easter_eggs_and_no_duplicate_attire(self) -> None:
+        """Verify distinct per-slot choreography, Easter eggs, weather-synced lighting, and single attire block."""
+        theme = hdwa.ART_STYLE_VAULT["spiderverse_halftone"]
+        clear_weather = {"temp_f": 64.0, "condition": "sunny", "clothing_state": "warm_pants"}
+
+        prompts = {
+            slot: hdwa.build_slot_prompt(slot=slot, theme=theme, weather_info=clear_weather)
+            for slot in ("morning", "afternoon", "evening")
+        }
+
+        # (a) Distinct choreography, sub-location, and Easter egg across morning/afternoon/evening
+        for slot in ("morning", "afternoon", "evening"):
+            p = prompts[slot]
+            assert hdwa.SLOT_CHOREOGRAPHY[slot] in p
+            assert theme["scene_flavor"][slot] in p
+            assert theme["easter_eggs"][slot] in p
+            # High-signal ordering: style -> choreography -> attire -> atmosphere -> setting -> characters
+            assert p.index(theme["prompt_style"]) < p.index(hdwa.SLOT_CHOREOGRAPHY[slot])
+            assert p.index(hdwa.SLOT_CHOREOGRAPHY[slot]) < p.index("MANDATORY WEATHER-MATCHED ATTIRE")
+            assert p.index("MANDATORY WEATHER-MATCHED ATTIRE") < p.index("Atmosphere:")
+            assert p.index("Atmosphere:") < p.index("Setting:")
+            assert p.index("Setting:") < p.index("Characters:")
+
+        assert len({hdwa.SLOT_CHOREOGRAPHY[s] for s in ("morning", "afternoon", "evening")}) == 3
+        assert "Miles Morales" in prompts["morning"]
+        assert "Spider-Gwen" in prompts["afternoon"]
+        assert "Spider-Ham" in prompts["evening"]
+
+        # (b) Clothing description appears only ONCE (no duplicate 'Current weather attire' block)
+        clothing_desc = hdwa.CLOTHING_STATE_PROMPTS["warm_pants"]
+        for slot, p in prompts.items():
+            assert p.count(clothing_desc) == 1, f"Duplicate clothing_desc in {slot}"
+            assert "Current weather attire" not in p
+
+        # (c) Cloudy/rainy afternoon prompts do NOT emit 'Vibrant clear afternoon daylight'
+        cloudy_afternoon = hdwa.build_slot_prompt(
+            slot="afternoon",
+            theme=theme,
+            weather_info={"temp_f": 56.0, "condition": "cloudy", "precipitation": 0.0, "precipitation_probability": 10.0},
+        )
+        assert "Vibrant clear afternoon daylight" not in cloudy_afternoon
+        assert "2:00 PM" in cloudy_afternoon
+        assert "overcast" in cloudy_afternoon.lower()
+
+        rainy_afternoon = hdwa.build_slot_prompt(
+            slot="afternoon",
+            theme=theme,
+            weather_info={"temp_f": 54.0, "condition": "rainy", "precipitation": 0.2, "precipitation_probability": 90.0},
+        )
+        assert "Vibrant clear afternoon daylight" not in rainy_afternoon
+        assert "2:00 PM" in rainy_afternoon
+        assert "rain" in rainy_afternoon.lower()
 
     def test_build_slot_prompt_structure_and_lighting(self) -> None:
         """Verify build_slot_prompt generates cohesive prompts with correct slot lighting."""
