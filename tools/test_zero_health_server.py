@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
 """
 Unit test suite for tools/zero_health_server.py.
 Validates dynamic gateway heartbeat evaluation, degraded HTTP 503 response, and healthy HTTP 200 response.
 """
 
+import io
 import json
 import os
 import sys
@@ -11,7 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 CURRENT_DIR = Path(__file__).resolve().parent.parent
 if str(CURRENT_DIR) not in sys.path:
@@ -28,10 +28,35 @@ class TestZeroHealthServer(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.temp_path = Path(self.temp_dir.name)
+        self._orig_data_dir = zhealth.DATA_DIR
+        self._orig_fallback_token_file = zhealth.FALLBACK_GOTCHI_TOKEN_FILE
+        self._orig_secrets_env_file = zhealth.SECRETS_ENV_FILE
         zhealth.DATA_DIR = self.temp_path
+        zhealth.FALLBACK_GOTCHI_TOKEN_FILE = self.temp_path / "fallback_gotchi_bearer_token.json"
+        zhealth.SECRETS_ENV_FILE = self.temp_path / "secrets_env.json"
 
     def tearDown(self):
+        zhealth.DATA_DIR = self._orig_data_dir
+        zhealth.FALLBACK_GOTCHI_TOKEN_FILE = self._orig_fallback_token_file
+        zhealth.SECRETS_ENV_FILE = self._orig_secrets_env_file
         self.temp_dir.cleanup()
+
+    @staticmethod
+    def _make_handler(path: str, headers: dict, body: bytes = b"", command: str = "GET"):
+        h = zhealth.ZeroHealthHandler.__new__(zhealth.ZeroHealthHandler)
+        h.path = path
+        h.headers = headers
+        h.command = command
+        h.rfile = io.BytesIO(body)
+        h.wfile = io.BytesIO()
+        h.send_response = MagicMock()
+        h.send_header = MagicMock()
+        h.end_headers = MagicMock()
+        return h
+
+    @staticmethod
+    def _sent_headers(handler) -> dict[str, str]:
+        return {call.args[0].lower(): call.args[1] for call in handler.send_header.call_args_list}
 
     def test_health_evaluation_healthy(self):
         now = time.time()
@@ -242,88 +267,335 @@ class TestZeroHealthServer(unittest.TestCase):
         self.assertLess(html.index("Plex"), html.index("Shelfmark"))
         self.assertLess(html.index("Shelfmark"), html.index("Books Library"))
 
-    def test_check_gotchi_external_auth_and_strip_headers(self):
-        import io
-        from unittest.mock import MagicMock
-
+    def test_check_gotchi_external_auth_and_forward_headers(self):
         (self.temp_path / "gotchi_bearer_token.json").write_text(json.dumps({"token": "secret-gotchi-tok-123"}))
+        clean_env = {
+            "GOTCHI_BEARER_TOKEN": "",
+            "GOTCHI_DEVICE_TOKENS": "",
+            "MVG_DEVICE_TOKENS": "",
+        }
 
-        def make_handler(path: str, headers: dict):
-            h = zhealth.ZeroHealthHandler.__new__(zhealth.ZeroHealthHandler)
-            h.path = path
-            h.headers = headers
-            h.rfile = io.BytesIO(b"")
-            h.wfile = io.BytesIO()
-            h.send_response = MagicMock()
-            h.send_header = MagicMock()
-            h.end_headers = MagicMock()
-            return h
+        with patch.dict(os.environ, clean_env, clear=False):
+            # 1. Local/LAN request without CF headers passes
+            h1 = self._make_handler("/api/voice/logs", {})
+            self.assertFalse(h1._is_external_cf_request())
+            self.assertTrue(h1._check_gotchi_external_auth())
 
-        # 1. Local/LAN request without Cf-Connecting-Ip passes
-        h1 = make_handler("/api/voice/logs", {})
-        self.assertTrue(h1._check_gotchi_external_auth())
+            # 2. External request with CF-Connecting-IP and case-insensitive / whitespace-padded Bearer token passes
+            h2 = self._make_handler(
+                "/api/voice/logs",
+                {"Cf-Connecting-Ip": "198.51.100.42", "authorization": "  bEaReR   secret-gotchi-tok-123  "},
+            )
+            self.assertTrue(h2._is_external_cf_request())
+            self.assertTrue(h2._check_gotchi_external_auth())
 
-        # 2. External request with case-insensitive / whitespace-padded Bearer token passes
-        h2 = make_handler(
-            "/api/voice/logs",
-            {"Cf-Connecting-Ip": "198.51.100.42", "authorization": "  bEaReR   secret-gotchi-tok-123  "},
-        )
-        self.assertTrue(h2._check_gotchi_external_auth())
+            # 3. External request with CF-Ray only (no CF-Connecting-IP) is treated as external and requires token
+            h_ray = self._make_handler("/api/gotchi/brain", {"cf-ray": "8a1b2c3d4e5f-SJC"})
+            self.assertTrue(h_ray._is_external_cf_request())
+            self.assertFalse(h_ray._check_gotchi_external_auth())
+            h_ray.send_response.assert_called_once_with(401)
 
-        # 3. External request to /api/voice/interact, /api/gotchi/*, and /gotchi.apk passes without token
-        for exempt_path in ("/api/voice/interact", "/api/gotchi/notify?node_id=gotchi-v1", "/gotchi.apk"):
-            hx = make_handler(exempt_path, {"CF-Connecting-IP": "198.51.100.42"})
-            self.assertTrue(hx._check_gotchi_external_auth(), f"Expected {exempt_path} to pass")
+            # 4. Previously exempt paths and node_id=gotchi-* MUST fail closed with 401 without valid token
+            for protected_path in (
+                "/api/gotchi/brain",
+                "/api/voice/interact",
+                "/api/gotchi/notify?node_id=gotchi-v1",
+                "/api/config/llm?node_id=gotchi-1",
+                "/gotchi.apk",
+                "/api/app/forwarder/apk",
+                "/api/app/forwarder/apk.apk",
+            ):
+                for cf_headers in (
+                    {"CF-Connecting-IP": "198.51.100.42"},
+                    {"CF-Ray": "8a1b2c3d4e5f-LAX"},
+                    {"CF-Connecting-IP": "198.51.100.42", "Authorization": "Bearer wrong-token"},
+                ):
+                    hx = self._make_handler(protected_path, cf_headers)
+                    self.assertFalse(hx._check_gotchi_external_auth(), f"Expected {protected_path} to require auth")
+                    hx.send_response.assert_called_once_with(401)
 
-        # 4. External request to non-exempt endpoint with invalid token returns False and 401
-        h4 = make_handler(
-            "/api/config/llm",
-            {"Cf-Connecting-Ip": "198.51.100.42", "Authorization": "Bearer wrong-token"},
-        )
-        self.assertFalse(h4._check_gotchi_external_auth())
-        h4.send_response.assert_called_once_with(401)
+            # 5. _proxy_to_gotchi_gateway blocks unauthorized external requests before connecting to 127.0.0.1:8771
+            h_unauth = self._make_handler(
+                "/api/gotchi/brain",
+                {"CF-Connecting-IP": "198.51.100.42", "Content-Length": "2"},
+                body=b"{}",
+                command="POST",
+            )
+            with patch.object(h_unauth, "_ensure_gotchi_gateway_up") as mock_up, \
+                 patch("http.client.HTTPConnection") as mock_conn_cls:
+                h_unauth.do_POST()
+                h_unauth.send_response.assert_called_once_with(401)
+                mock_up.assert_not_called()
+                mock_conn_cls.assert_not_called()
 
-        # 5. _proxy_to_gotchi_gateway strips Authorization header before forwarding to 127.0.0.1:8771
-        hp = make_handler(
+            # 6. Valid Bearer token passes _proxy_to_gotchi_gateway AND forwards Authorization header to 127.0.0.1:8771
+            hp = self._make_handler(
+                "/api/gotchi/brain",
+                {
+                    "Cf-Connecting-Ip": "198.51.100.42",
+                    "Authorization": "Bearer secret-gotchi-tok-123",
+                    "Content-Type": "application/json",
+                    "Content-Length": "4",
+                },
+                body=b"test",
+                command="POST",
+            )
+            with patch.object(hp, "_ensure_gotchi_gateway_up"), patch("http.client.HTTPConnection") as mock_conn_cls:
+                mock_conn = MagicMock()
+                mock_resp = MagicMock()
+                mock_resp.status = 200
+                mock_resp.getheaders.return_value = [("Content-Type", "application/json")]
+                mock_resp.read.return_value = b'{"ok":true}'
+                mock_conn.getresponse.return_value = mock_resp
+                mock_conn_cls.return_value = mock_conn
+
+                hp.do_POST()
+
+                self.assertTrue(mock_conn.request.called)
+                _, kwargs = mock_conn.request.call_args
+                forwarded_headers = {k.lower(): v for k, v in kwargs["headers"].items()}
+                self.assertEqual(forwarded_headers.get("authorization"), "Bearer secret-gotchi-tok-123")
+                hp.send_response.assert_called_once_with(200)
+
+    def test_load_expected_bearer_tokens_sources_and_fail_closed(self):
+        clean_env = {
+            "GOTCHI_BEARER_TOKEN": "",
+            "GOTCHI_DEVICE_TOKENS": "",
+            "MVG_DEVICE_TOKENS": "",
+        }
+        # Fail closed when no tokens exist anywhere
+        with patch.dict(os.environ, clean_env, clear=False):
+            h_empty = self._make_handler(
+                "/api/gotchi/brain",
+                {"CF-Connecting-IP": "198.51.100.55", "Authorization": "Bearer any-token"},
+            )
+            self.assertEqual(h_empty._load_expected_bearer_tokens(), [])
+            self.assertFalse(h_empty._check_gotchi_external_auth())
+            h_empty.send_response.assert_called_once_with(401)
+
+        # Load tokens from DATA_DIR, fallback file, secrets/env.json, and env vars (JSON dict + node=tok CSV)
+        (self.temp_path / "gotchi_bearer_token.json").write_text(json.dumps({"token": "tok-data-dir"}))
+        zhealth.FALLBACK_GOTCHI_TOKEN_FILE.write_text(json.dumps({"token": "tok-fallback"}))
+        zhealth.SECRETS_ENV_FILE.write_text(json.dumps({
+            "GOTCHI_BEARER_TOKEN": "tok-sec-bearer",
+            "GOTCHI_DEVICE_TOKENS": {"gotchi-a": "tok-sec-dict-a"},
+            "MVG_DEVICE_TOKENS": "gotchi-b=tok-sec-csv-b==,gotchi-c=tok-sec-csv-c",
+        }))
+        env_tokens = {
+            "GOTCHI_BEARER_TOKEN": "tok-env-bearer",
+            "GOTCHI_DEVICE_TOKENS": '{"gotchi-d": "tok-env-json-d"}',
+            "MVG_DEVICE_TOKENS": "gotchi-e=tok-env-csv-e",
+        }
+        with patch.dict(os.environ, env_tokens, clear=False):
+            h = self._make_handler("/api/search", {"CF-Ray": "8f123456-SJC"})
+            loaded = h._load_expected_bearer_tokens()
+            for expected in (
+                "tok-data-dir",
+                "tok-fallback",
+                "tok-sec-bearer",
+                "tok-sec-dict-a",
+                "tok-sec-csv-b==",
+                "tok-sec-csv-c",
+                "tok-env-bearer",
+                "tok-env-json-d",
+                "tok-env-csv-e",
+            ):
+                self.assertIn(expected, loaded)
+
+            h_ok = self._make_handler(
+                "/api/search",
+                {"CF-Ray": "8f123456-SJC", "Authorization": "Bearer tok-sec-csv-b=="},
+            )
+            self.assertTrue(h_ok._check_gotchi_external_auth())
+
+    def test_external_cf_auth_enforced_across_get_and_head_routes(self):
+        (self.temp_path / "gotchi_bearer_token.json").write_text(json.dumps({"token": "valid-tok-999"}))
+        clean_env = {
+            "GOTCHI_BEARER_TOKEN": "",
+            "GOTCHI_DEVICE_TOKENS": "",
+            "MVG_DEVICE_TOKENS": "",
+        }
+        protected_get_paths = (
+            "/api/gotchi/brain",
             "/api/voice/interact",
-            {
-                "Cf-Connecting-Ip": "198.51.100.42",
-                "Authorization": "Bearer stale-phone-token",
-                "Content-Type": "multipart/form-data; boundary=abc",
-                "Content-Length": "4",
-            },
+            "/api/gotchi/notify?node_id=gotchi-v1",
+            "/api/config/llm?node_id=gotchi-1",
+            "/api/search?q=test",
+            "/api/embed?q=test",
+            "/api/gif_rank?q=test",
+            "/api/telemetry",
+            "/api/context",
+            "/api/sessions",
+            "/api/vulcan",
+            "/api/forge",
+            "/dashboard",
+            "/gotchi",
+            "/gotchi.apk",
         )
-        hp.rfile = io.BytesIO(b"test")
-        with patch.object(hp, "_ensure_gotchi_gateway_up"), patch("http.client.HTTPConnection") as mock_conn_cls:
-            mock_conn = MagicMock()
-            mock_resp = MagicMock()
-            mock_resp.status = 200
-            mock_resp.getheaders.return_value = [("Content-Type", "application/json")]
-            mock_resp.read.return_value = b'{"ok":true}'
-            mock_conn.getresponse.return_value = mock_resp
-            mock_conn_cls.return_value = mock_conn
+        with patch.dict(os.environ, clean_env, clear=False):
+            for cf_header in (
+                {"Host": "zero.brock.ventures", "CF-Connecting-IP": "198.51.100.88"},
+                {"Host": "zero.brock.ventures", "CF-Ray": "89abcdef0123-SJC"},
+            ):
+                for path in protected_get_paths:
+                    h = self._make_handler(path, cf_header, command="GET")
+                    h.do_GET()
+                    h.send_response.assert_called_once_with(401)
 
-            hp._proxy_to_gotchi_gateway("POST")
+                # HEAD /api/search must also return 401 without body
+                h_head = self._make_handler("/api/search?q=test", cf_header, command="HEAD")
+                h_head.do_HEAD()
+                h_head.send_response.assert_called_once_with(401)
+                self.assertEqual(h_head.wfile.getvalue(), b"")
 
-            self.assertTrue(mock_conn.request.called)
-            _, kwargs = mock_conn.request.call_args
-            forwarded_headers = {k.lower(): v for k, v in kwargs["headers"].items()}
-            self.assertNotIn("authorization", forwarded_headers)
+            # Valid Bearer token passes GET /api/sessions and HEAD /api/search
+            fake_zd = MagicMock()
+            fake_zd.get_sessions_list.return_value = [{"id": "s1"}]
+            h_sess = self._make_handler(
+                "/api/sessions",
+                {
+                    "Host": "zero.brock.ventures",
+                    "CF-Connecting-IP": "198.51.100.88",
+                    "Authorization": "Bearer valid-tok-999",
+                },
+                command="GET",
+            )
+            with patch("tools.zero_health_server._get_zero_dashboard", return_value=fake_zd):
+                h_sess.do_GET()
+            h_sess.send_response.assert_called_once_with(200)
+            self.assertNotIn("access-control-allow-origin", self._sent_headers(h_sess))
+
+            h_head_ok = self._make_handler(
+                "/api/search?q=test",
+                {
+                    "Host": "zero.brock.ventures",
+                    "CF-Ray": "89abcdef0123-SJC",
+                    "Authorization": "Bearer valid-tok-999",
+                },
+                command="HEAD",
+            )
+            h_head_ok.do_HEAD()
+            h_head_ok.send_response.assert_called_once_with(200)
+
+            # Public landing portal stays public on brock.ventures / www.brock.ventures
+            h_landing = self._make_handler(
+                "/",
+                {"Host": "www.brock.ventures", "CF-Connecting-IP": "198.51.100.88"},
+                command="GET",
+            )
+            h_landing.do_GET()
+            h_landing.send_response.assert_called_once_with(200)
+
+            h_landing_404 = self._make_handler(
+                "/api/search",
+                {"Host": "www.brock.ventures", "CF-Connecting-IP": "198.51.100.88"},
+                command="GET",
+            )
+            h_landing_404.do_GET()
+            h_landing_404.send_response.assert_called_once_with(404)
+
+    def test_cors_restricted_to_public_liveness_and_avatar_paths(self):
+        fake_zd = MagicMock()
+        fake_zd.get_telemetry_payload.return_value = {"ok": True}
+        fake_zd.get_sessions_list.return_value = []
+        fake_zd.get_vulcan_forge_payload.return_value = {"jobs": []}
+        fake_zd.render_dashboard_html.return_value = "<html>dashboard</html>"
+
+        # Sensitive endpoints must NOT emit Access-Control-Allow-Origin: * on GET or OPTIONS
+        sensitive_paths = (
+            "/api/telemetry",
+            "/api/context",
+            "/api/sessions",
+            "/api/vulcan",
+            "/api/forge",
+            "/dashboard",
+        )
+        for path in sensitive_paths:
+            h_get = self._make_handler(path, {"Host": "localhost:8769"}, command="GET")
+            with patch("tools.zero_health_server._get_zero_dashboard", return_value=fake_zd):
+                h_get.do_GET()
+            h_get.send_response.assert_called_once_with(200)
+            self.assertNotIn("access-control-allow-origin", self._sent_headers(h_get), f"Unexpected CORS on GET {path}")
+
+            h_opt = self._make_handler(path, {"Host": "localhost:8769"}, command="OPTIONS")
+            h_opt.do_OPTIONS()
+            h_opt.send_response.assert_called_once_with(204)
+            self.assertNotIn("access-control-allow-origin", self._sent_headers(h_opt), f"Unexpected CORS on OPTIONS {path}")
+
+        for opt_only_path in ("/api/search", "/api/embed", "/api/gif_rank", "/gotchi", "/gotchi.apk"):
+            h_opt = self._make_handler(opt_only_path, {"Host": "localhost:8769"}, command="OPTIONS")
+            h_opt.do_OPTIONS()
+            h_opt.send_response.assert_called_once_with(204)
+            self.assertNotIn(
+                "access-control-allow-origin",
+                self._sent_headers(h_opt),
+                f"Unexpected CORS on OPTIONS {opt_only_path}",
+            )
+
+        # Public liveness paths DO emit Access-Control-Allow-Origin: *
+        for pub_path, host in (
+            ("/health", "zero.brock.ventures"),
+            ("/api/health", "zero.brock.ventures"),
+            ("/status", "zero.brock.ventures"),
+            ("/api/status", "zero.brock.ventures"),
+            ("/", "probe.brock.ventures"),
+            ("/", "status.brock.ventures"),
+        ):
+            h_get = self._make_handler(pub_path, {"Host": host}, command="GET")
+            h_get.do_GET()
+            h_get.send_response.assert_called_once_with(200)
+            self.assertEqual(self._sent_headers(h_get).get("access-control-allow-origin"), "*")
+
+            h_opt = self._make_handler(pub_path, {"Host": host}, command="OPTIONS")
+            h_opt.do_OPTIONS()
+            h_opt.send_response.assert_called_once_with(204)
+            self.assertEqual(self._sent_headers(h_opt).get("access-control-allow-origin"), "*")
+
+    def test_external_health_redacts_in_flight_prompts(self):
+        now = time.time()
+        beacon_data = {
+            "gateway_heartbeat": now - 5,
+            "gateway_status": "connected",
+            "gateway_latency_ms": 25.0,
+            "state": "PROCESSING",
+        }
+        (self.temp_path / "liveness_beacon.json").write_text(json.dumps(beacon_data))
+        in_flight_data = {
+            "456": {
+                "channel_id": 456,
+                "prompt": "Private confidential user prompt",
+                "ts": now - 15,
+                "pid": os.getpid(),
+            }
+        }
+        (self.temp_path / "in_flight_turn.json").write_text(json.dumps(in_flight_data))
+
+        # Local/LAN request keeps prompt unredacted
+        h_local = self._make_handler("/api/health", {"Host": "localhost:8769"}, command="GET")
+        h_local.do_GET()
+        h_local.send_response.assert_called_once_with(200)
+        local_payload = json.loads(h_local.wfile.getvalue().decode("utf-8"))
+        self.assertEqual(local_payload["in_flight"][0]["prompt"], "Private confidential user prompt")
+
+        # External CF requests (CF-Connecting-IP and CF-Ray) redact prompt to "[redacted]"
+        for cf_headers in (
+            {"Host": "zero.brock.ventures", "CF-Connecting-IP": "198.51.100.99"},
+            {"Host": "zero.brock.ventures", "CF-Ray": "8a9b0c1d2e3f-SJC"},
+            {"Host": "probe.brock.ventures", "CF-Connecting-IP": "198.51.100.99"},
+        ):
+            req_path = "/" if cf_headers["Host"].startswith("probe.") else "/api/health"
+            h_ext = self._make_handler(req_path, cf_headers, command="GET")
+            h_ext.do_GET()
+            h_ext.send_response.assert_called_once_with(200)
+            ext_payload = json.loads(h_ext.wfile.getvalue().decode("utf-8"))
+            self.assertEqual(len(ext_payload["in_flight"]), 1)
+            self.assertEqual(ext_payload["in_flight"][0]["prompt"], "[redacted]")
 
     def test_serve_gotchi_forwarder_apk(self):
-        import io
-        from unittest.mock import MagicMock
-
         dummy_apk = self.temp_path / "dummy.apk"
         dummy_apk.write_bytes(b"PK\x03\x04dummy-apk-payload")
 
-        h = zhealth.ZeroHealthHandler.__new__(zhealth.ZeroHealthHandler)
-        h.path = "/gotchi.apk"
-        h.headers = {"Host": "gotchi.brock.ventures"}
-        h.wfile = io.BytesIO()
-        h.send_response = MagicMock()
-        h.send_header = MagicMock()
-        h.end_headers = MagicMock()
+        h = self._make_handler("/gotchi.apk", {"Host": "gotchi.brock.ventures"}, command="GET")
 
         with patch.object(zhealth.ZeroHealthHandler, "_resolve_gotchi_forwarder_apk", return_value=dummy_apk):
             h.do_GET()
@@ -332,6 +604,7 @@ class TestZeroHealthServer(unittest.TestCase):
         sent_headers = {call.args[0]: call.args[1] for call in h.send_header.call_args_list}
         self.assertEqual(sent_headers.get("Content-Type"), "application/vnd.android.package-archive")
         self.assertEqual(sent_headers.get("Content-Disposition"), 'attachment; filename="gotchi-v2.apk"')
+        self.assertNotIn("Access-Control-Allow-Origin", sent_headers)
         self.assertEqual(h.wfile.getvalue(), b"PK\x03\x04dummy-apk-payload")
 
     def test_health_components_proc_fallback_and_pid_self_healing(self):
@@ -388,28 +661,31 @@ class TestZeroHealthServer(unittest.TestCase):
             zhealth.PID_FILE = orig_pid_file
 
     def test_mcp_daemon_pid_self_healing_and_healthy_port_fallback(self):
-        import tools.mcp_daemon as mcp_daemon
+        from tools import mcp_daemon
 
         orig_pid_file = mcp_daemon.PID_FILE
+        orig_lock_file = mcp_daemon.LOCK_FILE
         try:
             mcp_daemon.PID_FILE = self.temp_path / "mcp_daemon.pid"
+            mcp_daemon.LOCK_FILE = self.temp_path / "mcp_daemon.lock"
             mcp_daemon.PID_FILE.write_text("9999994")
 
             # 1. Reconciles stale PID_FILE via /proc discovery
-            with patch("tools.mcp_daemon._discover_mcp_daemon_pid", return_value=61610):
+            with patch("tools.daemon_singleton.find_live_daemon_pids", return_value=[61610]):
                 pid = mcp_daemon.get_daemon_pid()
                 self.assertEqual(pid, 61610)
                 self.assertEqual(mcp_daemon.PID_FILE.read_text().strip(), "61610")
 
-            # 2. If PID_FILE is missing and /proc returns None, but all ports return 200 OK, get_status treats as healthy
+            # 2. If PID_FILE is missing and /proc returns empty, but all ports return 200 OK, get_status treats as healthy
             mcp_daemon.PID_FILE.unlink(missing_ok=True)
-            with patch("tools.mcp_daemon._discover_mcp_daemon_pid", return_value=None), \
+            with patch("tools.daemon_singleton.find_live_daemon_pids", return_value=[]), \
                  patch("tools.mcp_daemon.check_port_health", return_value=(True, "HTTP 200 OK")):
                 st = mcp_daemon.get_status()
                 self.assertTrue(st["running"])
                 self.assertTrue(st["healthy"])
         finally:
             mcp_daemon.PID_FILE = orig_pid_file
+            mcp_daemon.LOCK_FILE = orig_lock_file
 
 
 if __name__ == "__main__":

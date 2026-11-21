@@ -8,6 +8,7 @@ Exposes a lightweight HTTP JSON status endpoint on port 8769 for zero.brock.vent
 from __future__ import annotations
 
 import base64
+import hmac
 import importlib
 import json
 import os
@@ -65,6 +66,8 @@ except ImportError:
 PT_TZ = ZoneInfo("America/Los_Angeles")
 DATA_DIR = Path("/workspace/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+FALLBACK_GOTCHI_TOKEN_FILE = Path("/workspace/data/gotchi_bearer_token.json")
+SECRETS_ENV_FILE = Path("/secrets/env.json")
 
 PID_FILE = DATA_DIR / "zero_health_server.pid"
 LOG_FILE = DATA_DIR / "zero_health_server.log"
@@ -1007,6 +1010,9 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             return
+        if not self._is_public_liveness_or_avatar_route(clean_path, host_header):
+            if not self._check_gotchi_external_auth(send_body=False):
+                return
         if clean_path in ("/api/ivy", "/ivy"):
             code, _ = self._evaluate_ivy(strict=strict)
             content_type = "application/json"
@@ -1025,7 +1031,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         elif clean_path.startswith("/gotchi/assets/"):
             code = 200
             content_type = "image/png"
-        elif clean_path in ("/api/avatar", "/avatar.png", "/zero_avatar.png"):
+        elif clean_path in ("/api/avatar", "/avatar.png", "/zero_avatar.png", "/ivy_avatar.png"):
             code = 200
             content_type = "image/png"
         elif clean_path in ("/api/telemetry", "/api/context", "/api/sessions", "/api/vulcan", "/api/forge"):
@@ -1131,58 +1137,161 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/vnd.android.package-archive")
         self.send_header("Content-Disposition", 'attachment; filename="gotchi-v2.apk"')
         self.send_header("Content-Length", str(len(apk_bytes)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(apk_bytes)
 
-    def _check_gotchi_external_auth(self) -> bool:
-        cf_ip = None
-        for k, v in self.headers.items():
-            if k.lower() == "cf-connecting-ip" and v:
-                cf_ip = v.strip()
-                break
-        if not cf_ip:
-            return True
+    _PUBLIC_LIVENESS_AND_AVATAR_PATHS = frozenset({
+        "/health",
+        "/api/health",
+        "/status",
+        "/api/status",
+        "/api/ivy",
+        "/api/avatar",
+        "/avatar.png",
+        "/zero_avatar.png",
+        "/ivy_avatar.png",
+    })
 
-        clean_path = self.path.split("?")[0].rstrip("/")
-        if (
-            clean_path == "/api/voice/interact"
-            or clean_path.startswith("/api/gotchi/")
-            or clean_path in (
-                "/api/gotchi",
-                "/gotchi.apk",
-                "/api/app/forwarder/apk",
-                "/api/app/forwarder/apk.apk",
-            )
-            or "node_id=gotchi-" in self.path
-        ):
+    @classmethod
+    def _is_public_liveness_or_avatar_route(cls, clean_path: str, host_header: str) -> bool:
+        if clean_path in cls._PUBLIC_LIVENESS_AND_AVATAR_PATHS:
             return True
+        if clean_path in ("", "/") and ("probe." in host_header or "status." in host_header):
+            return True
+        return False
 
+    def _is_external_cf_request(self) -> bool:
+        headers = getattr(self, "headers", None) or {}
+        for k, v in headers.items():
+            if k.lower() in ("cf-connecting-ip", "cf-ray") and v is not None and str(v).strip():
+                return True
+        return False
+
+    @staticmethod
+    def _parse_token_collection(raw_val) -> list[str]:
+        tokens: list[str] = []
+        if not raw_val:
+            return tokens
+        if isinstance(raw_val, dict):
+            for val in raw_val.values():
+                if isinstance(val, str) and val.strip():
+                    tokens.append(val.strip())
+            return tokens
+        if isinstance(raw_val, (list, tuple, set)):
+            for item in raw_val:
+                if isinstance(item, str) and item.strip():
+                    tokens.append(item.strip())
+            return tokens
+        if not isinstance(raw_val, str):
+            return tokens
+        text = raw_val.strip()
+        if not text:
+            return tokens
+        if text[0] in ("{", "["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, (dict, list)):
+                    return ZeroHealthHandler._parse_token_collection(parsed)
+            except Exception:
+                pass
+        for part in text.split(","):
+            item = part.strip()
+            if not item:
+                continue
+            if "=" in item:
+                _, _, tok = item.partition("=")
+                tok = tok.strip()
+                if tok:
+                    tokens.append(tok)
+            else:
+                tokens.append(item)
+        return tokens
+
+    def _load_expected_bearer_tokens(self) -> list[str]:
         expected_tokens: list[str] = []
+
+        def _add(tok: str) -> None:
+            cleaned = tok.strip()
+            if cleaned and cleaned not in expected_tokens:
+                expected_tokens.append(cleaned)
+
+        token_paths: list[Path] = [DATA_DIR / "gotchi_bearer_token.json"]
+        if FALLBACK_GOTCHI_TOKEN_FILE not in token_paths:
+            token_paths.append(FALLBACK_GOTCHI_TOKEN_FILE)
+
+        for token_file in token_paths:
+            try:
+                if token_file.exists():
+                    with open(token_file, "r", encoding="utf-8") as tf:
+                        tdata = json.load(tf)
+                    if isinstance(tdata, dict):
+                        tok = tdata.get("token", "")
+                        if isinstance(tok, str):
+                            _add(tok)
+            except Exception:
+                pass
+
         try:
-            token_file = DATA_DIR / "gotchi_bearer_token.json"
-            if not token_file.exists():
-                token_file = Path("/workspace/data/gotchi_bearer_token.json")
-            if token_file.exists():
-                with open(token_file, "r", encoding="utf-8") as tf:
-                    tok = json.load(tf).get("token", "").strip()
-                    if tok:
-                        expected_tokens.append(tok)
-            if os.path.exists("/secrets/env.json"):
-                with open("/secrets/env.json", "r", encoding="utf-8") as sf:
-                    sec_tok = json.load(sf).get("GOTCHI_BEARER_TOKEN", "").strip()
-                    if sec_tok and sec_tok not in expected_tokens:
-                        expected_tokens.append(sec_tok)
+            if SECRETS_ENV_FILE.exists():
+                with open(SECRETS_ENV_FILE, "r", encoding="utf-8") as sf:
+                    sec = json.load(sf)
+                if isinstance(sec, dict):
+                    sec_tok = sec.get("GOTCHI_BEARER_TOKEN", "")
+                    if isinstance(sec_tok, str):
+                        _add(sec_tok)
+                    for key in ("GOTCHI_DEVICE_TOKENS", "MVG_DEVICE_TOKENS"):
+                        for tok in self._parse_token_collection(sec.get(key)):
+                            _add(tok)
         except Exception:
             pass
 
-        env_tok = os.environ.get("GOTCHI_BEARER_TOKEN", "").strip()
-        if env_tok and env_tok not in expected_tokens:
-            expected_tokens.append(env_tok)
+        env_tok = os.environ.get("GOTCHI_BEARER_TOKEN", "")
+        if env_tok:
+            _add(env_tok)
+        for key in ("GOTCHI_DEVICE_TOKENS", "MVG_DEVICE_TOKENS"):
+            for tok in self._parse_token_collection(os.environ.get(key, "")):
+                _add(tok)
+
+        return expected_tokens
+
+    def _redact_external_health_payload(self, payload: dict) -> dict:
+        if not self._is_external_cf_request() or not isinstance(payload, dict):
+            return payload
+        in_flight = payload.get("in_flight")
+        if not in_flight:
+            return payload
+        redacted_payload = dict(payload)
+        if isinstance(in_flight, list):
+            redacted_items = []
+            for item in in_flight:
+                if isinstance(item, dict) and "prompt" in item:
+                    new_item = dict(item)
+                    new_item["prompt"] = "[redacted]"
+                    redacted_items.append(new_item)
+                else:
+                    redacted_items.append(item)
+            redacted_payload["in_flight"] = redacted_items
+        elif isinstance(in_flight, dict):
+            redacted_map = {}
+            for k, v in in_flight.items():
+                if isinstance(v, dict) and "prompt" in v:
+                    new_v = dict(v)
+                    new_v["prompt"] = "[redacted]"
+                    redacted_map[k] = new_v
+                else:
+                    redacted_map[k] = v
+            redacted_payload["in_flight"] = redacted_map
+        return redacted_payload
+
+    def _check_gotchi_external_auth(self, send_body: bool = True) -> bool:
+        if not self._is_external_cf_request():
+            return True
+
+        expected_tokens = self._load_expected_bearer_tokens()
 
         auth_hdr = ""
-        for k, v in self.headers.items():
+        for k, v in (getattr(self, "headers", None) or {}).items():
             if k.lower() == "authorization" and isinstance(v, str):
                 auth_hdr = v.strip()
                 break
@@ -1192,21 +1301,23 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             parts = auth_hdr.split(None, 1)
             if len(parts) == 2 and parts[0].lower() == "bearer":
                 provided = parts[1].strip()
-            else:
+            elif auth_hdr.lower() != "bearer":
                 provided = auth_hdr.strip()
 
         if provided and expected_tokens:
-            import hmac
             for exp in expected_tokens:
                 if hmac.compare_digest(provided.encode("utf-8"), exp.encode("utf-8")):
                     return True
 
-        err_bytes = json.dumps({"ok": False, "error": "unauthorized", "message": "Valid Bearer token required"}).encode("utf-8")
+        err_bytes = json.dumps(
+            {"ok": False, "error": "unauthorized", "message": "Valid Bearer token required"}
+        ).encode("utf-8")
         self.send_response(401)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(err_bytes)))
         self.end_headers()
-        self.wfile.write(err_bytes)
+        if send_body and getattr(self, "command", None) != "HEAD" and getattr(self, "wfile", None) is not None:
+            self.wfile.write(err_bytes)
         return False
 
     def _proxy_to_gotchi_gateway(self, method: str) -> None:
@@ -1218,7 +1329,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         req_body = self.rfile.read(content_len) if content_len > 0 else b""
         fwd_headers = {
             k: v for k, v in self.headers.items()
-            if k.lower() not in ("host", "connection", "transfer-encoding", "authorization")
+            if k.lower() not in ("host", "connection", "transfer-encoding")
         }
         try:
             conn = http.client.HTTPConnection("127.0.0.1", 8771, timeout=65)
@@ -1255,10 +1366,13 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(err_bytes)
 
     def do_OPTIONS(self):
+        clean_path = self.path.split("?")[0].rstrip("/")
+        host_header = self.headers.get("Host", "").lower()
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
+        if self._is_public_liveness_or_avatar_route(clean_path, host_header):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Accept, Content-Type")
         self.end_headers()
 
     def do_POST(self):
@@ -1340,6 +1454,10 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"Not Found")
             return
 
+        if not self._is_public_liveness_or_avatar_route(clean_path, host_header):
+            if not self._check_gotchi_external_auth():
+                return
+
         is_ivy = (
             "ivy." in host_header
             or query_params.get("agent", [""])[0].lower() == "ivy"
@@ -1351,6 +1469,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
         # 1. Ivy Health Endpoint (explicit)
         if clean_path in ("/api/ivy", "/ivy") and "text/html" not in accept_header:
             status_code, payload = self._evaluate_ivy(strict=strict)
+            payload = self._redact_external_health_payload(payload)
             body = json.dumps(payload, indent=2).encode("utf-8")
             content_type = "application/json"
 
@@ -1565,6 +1684,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 status_code, payload = self._evaluate_ivy(strict=strict)
             else:
                 status_code, payload = self._evaluate_health(strict=strict)
+            payload = self._redact_external_health_payload(payload)
             body = json.dumps(payload, indent=2).encode("utf-8")
             content_type = "application/json"
 
@@ -1576,6 +1696,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                     status_code, payload = self._evaluate_ivy(strict=strict)
                 else:
                     status_code, payload = self._evaluate_health(strict=strict)
+                payload = self._redact_external_health_payload(payload)
                 body = json.dumps(payload, indent=2).encode("utf-8")
                 content_type = "application/json"
             elif (clean_path in ("/dashboard", "/ivy") or "text/html" in accept_header) and "format=json" not in query_str and not strict:
@@ -1591,6 +1712,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                         status_code, payload = self._evaluate_ivy(strict=strict)
                     else:
                         status_code, payload = self._evaluate_health(strict=strict)
+                    payload = self._redact_external_health_payload(payload)
                     body = json.dumps(payload, indent=2).encode("utf-8")
                     content_type = "application/json"
             else:
@@ -1599,6 +1721,7 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                     status_code, payload = self._evaluate_ivy(strict=strict)
                 else:
                     status_code, payload = self._evaluate_health(strict=strict)
+                payload = self._redact_external_health_payload(payload)
                 body = json.dumps(payload, indent=2).encode("utf-8")
                 content_type = "application/json"
 
@@ -1608,13 +1731,15 @@ class ZeroHealthHandler(BaseHTTPRequestHandler):
                 status_code, payload = self._evaluate_ivy(strict=strict)
             else:
                 status_code, payload = self._evaluate_health(strict=strict)
+            payload = self._redact_external_health_payload(payload)
             body = json.dumps(payload, indent=2).encode("utf-8")
             content_type = "application/json"
 
         self.send_response(status_code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if self._is_public_liveness_or_avatar_route(clean_path, host_header):
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
