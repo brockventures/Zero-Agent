@@ -77,6 +77,7 @@ from tools.bridge_state import (  # noqa: F401
     is_reload_intent,
     is_container_restart_intent,
     is_crab_cavern_silenced,
+    is_home_channel,
     parse_silence_until,
     sync_credentials,
     clear_channel_session_id,
@@ -275,16 +276,52 @@ async def on_ready():
 # Discord Slash Commands (Application Commands)
 # --------------------------------------------------------------------------
 
+def _is_interaction_in_home_channel(interaction: discord.Interaction) -> bool:
+    """Resolve whether an interaction originated in a Home operations channel."""
+    ch = getattr(interaction, "channel", None)
+    if ch is not None and isinstance(getattr(ch, "id", None), int):
+        return bool(is_home_channel(ch))
+    return bool(is_home_channel(getattr(interaction, "channel_id", None)))
+
+
+def _check_slash_authorized(interaction: discord.Interaction, require_home: bool = False) -> tuple[bool, str]:
+    """Verify slash command caller is OWNER_USER_ID and optionally in a Home channel."""
+    user = getattr(interaction, "user", None)
+    if getattr(user, "id", None) != OWNER_USER_ID:
+        return False, "🔒 Unauthorized: this command is restricted to the bot owner."
+    if require_home and not _is_interaction_in_home_channel(interaction):
+        return False, "🔒 Unauthorized: this command is restricted to Home operations channels."
+    return True, ""
+
+
+async def _send_ephemeral_denial(interaction: discord.Interaction, message: str):
+    """Reply ephemerally with an authorization error without mutating Discord state."""
+    try:
+        is_done = interaction.response.is_done()
+        if asyncio.iscoroutine(is_done):
+            is_done = await is_done
+        if is_done is True:
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as e:
+        print(f"[Bridge] Warning sending ephemeral auth denial: {e}")
+
+
 @bot.tree.command(name="new", description="Start a new threaded conversation with Zero")
 @app_commands.describe(prompt="Initial prompt or task for the new thread (optional)")
 async def slash_new(interaction: discord.Interaction, prompt: str = ""):
     """Spawn a new thread and begin a fresh conversation session."""
+    ok, err = _check_slash_authorized(interaction)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     clean_prompt = prompt.strip()
     task_title = generate_concise_thread_title(clean_prompt) if clean_prompt else "New Conversation"
 
     ch = interaction.channel
-    is_home = (ch.id == TARGET_CHANNEL_ID) or (isinstance(ch, discord.Thread) and getattr(ch, "parent_id", None) == TARGET_CHANNEL_ID)
+    is_home = _is_interaction_in_home_channel(interaction)
     selected_queue = home_turn_queue if is_home else ext_turn_queue
     mode = "home" if is_home else "external"
 
@@ -340,9 +377,13 @@ async def slash_new(interaction: discord.Interaction, prompt: str = ""):
 
 @bot.tree.command(name="reset", description="Reset the conversation session for the current channel or thread")
 async def slash_reset(interaction: discord.Interaction):
+    ok, err = _check_slash_authorized(interaction)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     ch_id = interaction.channel_id
-    is_home = (ch_id == TARGET_CHANNEL_ID) or (isinstance(interaction.channel, discord.Thread) and getattr(interaction.channel, "parent_id", None) == TARGET_CHANNEL_ID)
+    is_home = _is_interaction_in_home_channel(interaction)
     mode = "home" if is_home else "external"
     clear_channel_session_id(ch_id, mode)
     sess_key = "home" if (ch_id == TARGET_CHANNEL_ID) else str(ch_id)
@@ -360,6 +401,10 @@ async def slash_reset(interaction: discord.Interaction):
 @bot.tree.command(name="model", description="View or switch the active AI model")
 @app_commands.describe(model_name="Model name or alias (e.g. argon, argon-low, flash, sonnet, opus, 3.8-low)")
 async def slash_model(interaction: discord.Interaction, model_name: str = ""):
+    ok, err = _check_slash_authorized(interaction)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     current_model = _get_active_model()
     from tools.bridge_models import get_fallback_model, list_available_models, resolve_model, set_fallback_model
@@ -453,6 +498,10 @@ async def slash_model_autocomplete(interaction: discord.Interaction, current: st
 @bot.tree.command(name="quota", description="Check Gemini quota progress card, poll live usage, or send daily context digest")
 @app_commands.describe(action="card (default), poll, attribution, or email-digest")
 async def slash_quota(interaction: discord.Interaction, action: str = "card"):
+    ok, err = _check_slash_authorized(interaction, require_home=True)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     act = action.lower().strip()
     if act in ("poll", "poller", "quota_poller"):
@@ -494,6 +543,10 @@ async def slash_quota_autocomplete(interaction: discord.Interaction, current: st
 @bot.tree.command(name="reload", description="Reload Zero bridge in-place or restart the Docker container")
 @app_commands.describe(mode="in-place (fast execv reload) or container (full Docker restart)")
 async def slash_reload(interaction: discord.Interaction, mode: str = "in-place"):
+    ok, err = _check_slash_authorized(interaction)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     initiator_name = interaction.user.display_name or interaction.user.name
     m = mode.lower().strip()
@@ -523,6 +576,10 @@ async def slash_reload_autocomplete(interaction: discord.Interaction, current: s
     duration_mins="Optional pause duration in minutes (default: 3)"
 )
 async def slash_crab(interaction: discord.Interaction, action: str = "status", target: str = "", duration_mins: int = 3):
+    ok, err = _check_slash_authorized(interaction)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     act = action.lower().strip()
     initiator_name = interaction.user.display_name or interaction.user.name
@@ -653,6 +710,10 @@ async def slash_crab_autocomplete(interaction: discord.Interaction, current: str
 @bot.tree.command(name="run", description="Run any on-demand sidecar or operational task")
 @app_commands.describe(job="Name of the sidecar or operational job to trigger")
 async def slash_run(interaction: discord.Interaction, job: str):
+    ok, err = _check_slash_authorized(interaction, require_home=True)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     clean_job = job.strip().lower().lstrip("!/")
     cmd_key = f"/{clean_job}"
@@ -668,6 +729,7 @@ async def slash_run(interaction: discord.Interaction, job: str):
             return
 
     prompt_text = ON_DEMAND_TRIGGERS[cmd_key]
+    turn_mode = "home" if _is_interaction_in_home_channel(interaction) else "external"
     resp_msg = await interaction.followup.send(f"🚀 **Triggered `/run {clean_job}`** — queuing execution...")
     await home_turn_queue.put({
         "prompt": prompt_text,
@@ -675,7 +737,7 @@ async def slash_run(interaction: discord.Interaction, job: str):
         "reply_target": resp_msg or interaction.channel,
         "attachments": [],
         "is_steer": False,
-        "mode": "home",
+        "mode": turn_mode,
         "channel_id": interaction.channel_id,
         "queued_at": time.perf_counter(),
     })
@@ -697,6 +759,10 @@ async def slash_run_autocomplete(interaction: discord.Interaction, current: str)
 @bot.tree.command(name="logs", description="Run on-demand NAS log review across containers")
 @app_commands.describe(since="Time range to scan logs for (default: 24h)")
 async def slash_logs(interaction: discord.Interaction, since: str = "24h"):
+    ok, err = _check_slash_authorized(interaction, require_home=True)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     try:
         from tools.sidecars import run_sidecar_job, run_nas_log_review
@@ -713,6 +779,10 @@ async def slash_logs(interaction: discord.Interaction, since: str = "24h"):
 
 @bot.tree.command(name="triage", description="Run on-demand nightly agenda & inbox triage briefing")
 async def slash_triage(interaction: discord.Interaction):
+    ok, err = _check_slash_authorized(interaction, require_home=True)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     try:
         from tools.sidecars import run_sidecar_job, run_nightly_triage
@@ -729,6 +799,10 @@ async def slash_triage(interaction: discord.Interaction):
 
 @bot.tree.command(name="heartbeat", description="Run infrastructure heartbeat check")
 async def slash_heartbeat(interaction: discord.Interaction):
+    ok, err = _check_slash_authorized(interaction, require_home=True)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     try:
         from tools.sidecars import run_sidecar_job, run_heartbeat_sweep
@@ -745,6 +819,10 @@ async def slash_heartbeat(interaction: discord.Interaction):
 
 @bot.tree.command(name="tasks", description="Show active projects and task tracker")
 async def slash_tasks(interaction: discord.Interaction):
+    ok, err = _check_slash_authorized(interaction, require_home=True)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     try:
         res = await asyncio.to_thread(subprocess.run, ["python3", "/workspace/tools/task_manager.py", "summary"], capture_output=True, text=True, timeout=15)
@@ -761,6 +839,10 @@ async def slash_tasks(interaction: discord.Interaction):
 
 @bot.tree.command(name="sidecars", description="Show sidecar execution health and recent status")
 async def slash_sidecars(interaction: discord.Interaction):
+    ok, err = _check_slash_authorized(interaction, require_home=True)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     try:
         from tools.sidecars import format_sidecar_status_summary
@@ -778,6 +860,10 @@ async def slash_sidecars(interaction: discord.Interaction):
 @bot.tree.command(name="title", description="Rename the current Discord thread")
 @app_commands.describe(new_title="New title for the thread")
 async def slash_title(interaction: discord.Interaction, new_title: str):
+    ok, err = _check_slash_authorized(interaction)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     ch = interaction.channel
     if not isinstance(ch, discord.Thread):
         await interaction.response.send_message("⚠️ `/title` can only be used inside a Discord Thread.", ephemeral=True)
@@ -794,6 +880,10 @@ async def slash_title(interaction: discord.Interaction, new_title: str):
 
 @bot.tree.command(name="queue", description="Display the unified FORGE build queue, active tasks, and pending Decision Cards")
 async def slash_queue(interaction: discord.Interaction):
+    ok, err = _check_slash_authorized(interaction)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     try:
         from tools.forge import format_queue_digest
@@ -811,7 +901,15 @@ async def slash_queue(interaction: discord.Interaction):
 @bot.listen("on_interaction")
 async def on_button_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.component:
-        cid = interaction.data.get("custom_id", "")
+        cid = (interaction.data or {}).get("custom_id", "")
+        if cid.startswith(("choice:", "forge_approve:", "forge_dismiss:", "forge_edit:")):
+            user = getattr(interaction, "user", None)
+            if getattr(user, "id", None) != OWNER_USER_ID:
+                await _send_ephemeral_denial(
+                    interaction,
+                    "🔒 Unauthorized: interactive controls are restricted to the bot owner.",
+                )
+                return
         if cid.startswith("choice:"):
             choice_text = cid[7:]
             try:
@@ -954,6 +1052,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 @bot.tree.command(name="voice", description="Join, leave, or check Zero's Gemini Live voice session in #zero-voice")
 @app_commands.describe(action="join, leave, or status (default: join)", model="Optional Live model override (default: gemini-3.8-live)")
 async def slash_voice(interaction: discord.Interaction, action: str = "join", model: str = ""):
+    ok, err = _check_slash_authorized(interaction, require_home=True)
+    if not ok:
+        await _send_ephemeral_denial(interaction, err)
+        return
     await interaction.response.defer()
     from tools.bridge_voice import ZERO_VOICE_CHANNEL_ID, get_voice_manager
     mgr = get_voice_manager(bot)

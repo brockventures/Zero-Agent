@@ -22,6 +22,7 @@ from tools.bridge_commands import (
     handle_button_choice,
     handle_operator_command,
 )
+from tools.bridge_state import OWNER_USER_ID, TARGET_CHANNEL_ID
 
 
 class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
@@ -53,7 +54,12 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         turn_queue = asyncio.Queue()
         mock_interaction = MagicMock()
         mock_interaction.id = 99887766
-        mock_interaction.channel_id = 999
+        mock_interaction.user.id = OWNER_USER_ID
+        mock_interaction.channel_id = TARGET_CHANNEL_ID
+        mock_interaction.channel.id = TARGET_CHANNEL_ID
+        mock_interaction.channel.category_id = None
+        mock_interaction.channel.parent_id = None
+        mock_interaction.channel.parent = None
         mock_interaction.channel.typing = AsyncMock()
         mock_interaction.channel.send = AsyncMock()
 
@@ -62,6 +68,47 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         item = await turn_queue.get()
         self.assertEqual(item["prompt"], "Deploy Staging")
         self.assertEqual(item["mode"], "home")
+
+    async def test_handle_button_choice_non_owner_rejected(self):
+        from tools.bridge_commands import PROCESSED_INTERACTIONS
+        turn_queue = asyncio.Queue()
+        mock_interaction = MagicMock()
+        mock_interaction.id = 99887767
+        mock_interaction.user.id = 123456789  # Not OWNER_USER_ID
+        mock_interaction.channel_id = TARGET_CHANNEL_ID
+        mock_interaction.channel.id = TARGET_CHANNEL_ID
+        mock_interaction.channel.send = AsyncMock()
+        mock_interaction.response = MagicMock()
+        mock_interaction.response.is_done = MagicMock(return_value=False)
+        mock_interaction.response.send_message = AsyncMock()
+        mock_interaction.followup = MagicMock()
+        mock_interaction.followup.send = AsyncMock()
+
+        await handle_button_choice("Restart Zero", mock_interaction, turn_queue)
+        self.assertTrue(turn_queue.empty())
+        mock_interaction.channel.send.assert_not_awaited()
+        mock_interaction.response.send_message.assert_awaited_once()
+        self.assertTrue(mock_interaction.response.send_message.call_args[1].get("ephemeral"))
+        self.assertNotIn(mock_interaction.id, PROCESSED_INTERACTIONS)
+
+    async def test_handle_button_choice_external_channel_derives_external_mode(self):
+        turn_queue = asyncio.Queue()
+        mock_interaction = MagicMock()
+        mock_interaction.id = 99887768
+        mock_interaction.user.id = OWNER_USER_ID
+        mock_interaction.channel_id = 1534452820995080192  # #lounge (non-home)
+        mock_interaction.channel.id = 1534452820995080192
+        mock_interaction.channel.category_id = None
+        mock_interaction.channel.parent_id = None
+        mock_interaction.channel.parent = None
+        mock_interaction.channel.typing = AsyncMock()
+        mock_interaction.channel.send = AsyncMock()
+
+        await handle_button_choice("Continue Analysis", mock_interaction, turn_queue)
+        self.assertFalse(turn_queue.empty())
+        item = await turn_queue.get()
+        self.assertEqual(item["prompt"], "Continue Analysis")
+        self.assertEqual(item["mode"], "external")
 
     async def test_handle_operator_command_reset(self):
         msg = MagicMock()
@@ -147,6 +194,7 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
     async def test_slash_model_integration(self):
         from tools.bridge import slash_model, slash_model_autocomplete
         interaction = MagicMock()
+        interaction.user.id = OWNER_USER_ID
         interaction.response = MagicMock()
         interaction.response.defer = AsyncMock()
         interaction.followup = MagicMock()
@@ -177,7 +225,12 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
     async def test_slash_run_and_autocomplete(self):
         from tools.bridge import slash_run, slash_run_autocomplete, home_turn_queue
         interaction = MagicMock()
-        interaction.channel_id = 123
+        interaction.user.id = OWNER_USER_ID
+        interaction.channel_id = TARGET_CHANNEL_ID
+        interaction.channel.id = TARGET_CHANNEL_ID
+        interaction.channel.category_id = None
+        interaction.channel.parent_id = None
+        interaction.channel.parent = None
         interaction.response = MagicMock()
         interaction.response.defer = AsyncMock()
         interaction.followup = MagicMock()
@@ -199,11 +252,17 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
             mock_put.assert_awaited_once()
             queued = mock_put.call_args[0][0]
             self.assertIn("Run the infrastructure heartbeat check", queued["prompt"])
+            self.assertEqual(queued["mode"], "home")
 
     async def test_slash_quota_and_crab(self):
         from tools.bridge import slash_quota, slash_crab
         interaction = MagicMock()
-        interaction.channel_id = 123
+        interaction.user.id = OWNER_USER_ID
+        interaction.channel_id = TARGET_CHANNEL_ID
+        interaction.channel.id = TARGET_CHANNEL_ID
+        interaction.channel.category_id = None
+        interaction.channel.parent_id = None
+        interaction.channel.parent = None
         interaction.user.display_name = "Ryan"
         interaction.response = MagicMock()
         interaction.response.defer = AsyncMock()
@@ -217,7 +276,7 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
         interaction.followup.send.reset_mock()
         with patch("tools.agora_kill_switch.trigger_kill_switch", return_value={"message": "🛑 Agora trading halted."}) as mock_kill:
             await slash_crab.callback(interaction, "halt-agora", "", 3)
-            mock_kill.assert_called_once_with(initiator="Ryan", action="halt", channel_id=123)
+            mock_kill.assert_called_once_with(initiator="Ryan", action="halt", channel_id=TARGET_CHANNEL_ID)
             interaction.followup.send.assert_awaited_once_with("🛑 Agora trading halted.")
 
     async def test_handle_operator_command_sidecar_trigger(self):

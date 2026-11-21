@@ -216,5 +216,120 @@ class TestOutboxZeroOpsFallback(unittest.TestCase):
         mock_record.assert_called_once_with(omsg)
 
 
+class TestOutboxSecurityHardening(unittest.TestCase):
+    def setUp(self):
+        self.silence_patcher = patch("tools.bridge_state.is_crab_cavern_silenced", return_value=(False, ""))
+        self.silence_patcher.start()
+        self.temp_dir = tempfile.mkdtemp()
+        self.orig_data_dir = outbox.DATA_DIR
+        self.orig_outbox_dir = outbox.OUTBOX_DIR
+        self.orig_pending_file = outbox.PENDING_FILE
+        self.orig_history_file = outbox.HISTORY_FILE
+        outbox.DATA_DIR = Path(self.temp_dir)
+        outbox.OUTBOX_DIR = outbox.DATA_DIR / "outbox"
+        outbox.PENDING_FILE = outbox.OUTBOX_DIR / "pending.jsonl"
+        outbox.HISTORY_FILE = outbox.OUTBOX_DIR / "history.jsonl"
+
+    def tearDown(self):
+        self.silence_patcher.stop()
+        outbox.DATA_DIR = self.orig_data_dir
+        outbox.OUTBOX_DIR = self.orig_outbox_dir
+        outbox.PENDING_FILE = self.orig_pending_file
+        outbox.HISTORY_FILE = self.orig_history_file
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_queue_outbox_message_scrubs_credentials(self):
+        """Verify queue_outbox_message redacts secrets before writing to pending.jsonl."""
+        fake_gh_token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+        fake_api_key = "sk-testsecretkey1234567890abcdef"
+        rec = outbox.queue_outbox_message(
+            "lounge",
+            f"Diagnostics token={fake_gh_token} key={fake_api_key}",
+        )
+        self.assertFalse(rec.get("suppressed"))
+        self.assertNotIn(fake_gh_token, rec["content"])
+        self.assertNotIn(fake_api_key, rec["content"])
+        self.assertIn("[REDACTED_GITHUB_TOKEN]", rec["content"])
+        self.assertIn("[REDACTED_API_KEY]", rec["content"])
+
+        disk_text = outbox.PENDING_FILE.read_text(encoding="utf-8")
+        self.assertNotIn(fake_gh_token, disk_text)
+        self.assertNotIn(fake_api_key, disk_text)
+
+    @patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "test_bot_token_123"})
+    @patch("tools.outbox.record_dispatched_history")
+    def test_dispatch_via_rest_scrubs_credentials_and_suppresses_non_home_choices(self, mock_record):
+        """Verify dispatch_via_rest scrubs secrets and strips [CHOICES] without attaching buttons on non-home channels."""
+        fake_gh_token = "ghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZ999999"
+        omsg = {
+            "id": "outbox-sec-1",
+            "channel": "lounge",
+            "channel_id": 1534452820995080192,  # Crab Cavern #lounge (non-home)
+            "content": f"Status report token={fake_gh_token}\n\n[CHOICES: Deploy | Restart]",
+        }
+        sent_bodies = []
+
+        class MockResp:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+            def read(self):
+                return json.dumps({"id": "msg-nonhome-1"}).encode("utf-8")
+
+        def fake_urlopen(req, timeout=15):
+            sent_bodies.append(json.loads(req.data.decode("utf-8")))
+            return MockResp()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            ok = outbox.dispatch_via_rest(omsg)
+
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(sent_bodies), 1)
+        for body in sent_bodies:
+            self.assertNotIn(fake_gh_token, body["content"])
+            self.assertIn("[REDACTED_GITHUB_TOKEN]", body["content"])
+            self.assertNotIn("[CHOICES:", body["content"])
+            self.assertNotIn("components", body)
+
+    @patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "test_bot_token_123"})
+    @patch("tools.outbox.record_dispatched_history")
+    def test_dispatch_via_rest_allows_choices_buttons_on_home_channel(self, mock_record):
+        """Verify dispatch_via_rest still attaches choice: buttons for Home Turf channels."""
+        from tools.bridge_state import TARGET_CHANNEL_ID
+        omsg = {
+            "id": "outbox-sec-home-1",
+            "channel": "zero-chat",
+            "channel_id": TARGET_CHANNEL_ID,
+            "content": "Ready to proceed?\n\n[CHOICES: Deploy | Cancel]",
+        }
+        sent_bodies = []
+
+        class MockResp:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+            def read(self):
+                return json.dumps({"id": "msg-home-1"}).encode("utf-8")
+
+        def fake_urlopen(req, timeout=15):
+            sent_bodies.append(json.loads(req.data.decode("utf-8")))
+            return MockResp()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            ok = outbox.dispatch_via_rest(omsg)
+
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(sent_bodies), 1)
+        first_body = sent_bodies[0]
+        self.assertNotIn("[CHOICES:", first_body["content"])
+        self.assertIn("components", first_body)
+        btns = first_body["components"][0]["components"]
+        self.assertEqual([b["custom_id"] for b in btns], ["choice:Deploy", "choice:Cancel"])
+
+
 if __name__ == "__main__":
     unittest.main()

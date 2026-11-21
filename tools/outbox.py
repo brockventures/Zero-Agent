@@ -206,6 +206,26 @@ def record_dispatched_history(omsg: dict):
     except Exception as e:
         print(f"[Outbox] Warning saving history: {e}", file=sys.stderr)
 
+def _scrub_outbound_text(text: str) -> str:
+    """Scrub credentials, tokens, and private homelab IPs before queuing or sending Discord text."""
+    if not text:
+        return text
+    try:
+        from tools.bridge_safety import scrub_credentials
+        return scrub_credentials(text)
+    except Exception:
+        return text
+
+
+def _is_home_turf_channel(channel_id) -> bool:
+    """Return True strictly if channel_id belongs to Home Turf (fail-closed)."""
+    try:
+        from tools.bridge_state import is_home_channel
+        return bool(is_home_channel(channel_id))
+    except Exception:
+        return False
+
+
 def queue_outbox_message(
     channel: str,
     content: str,
@@ -241,6 +261,9 @@ def queue_outbox_message(
             content = strip_reaction_gifs(content)
     except Exception:
         pass
+
+    # Scrub credentials/secrets before queuing to disk or dispatching
+    content = _scrub_outbound_text(content)
 
     if not content:
         raise ValueError("Message content cannot be empty.")
@@ -494,6 +517,8 @@ def dispatch_via_rest(omsg: dict) -> bool:
             print(f"[Outbox] Notice: Message {omsg.get('id')} is an agent_turn; routing to turn_queue instead of REST.", file=sys.stderr)
         return False
 
+    raw_content = _scrub_outbound_text(raw_content)
+
     try:
         url = f"https://discord.com/api/v10/channels/{target_cid}/messages"
         # Banana Protocol Channel Quarantine: Strip handoff envelopes from non-banana channels
@@ -505,10 +530,11 @@ def dispatch_via_rest(omsg: dict) -> bool:
                 flags=re.DOTALL,
             ).rstrip()
         choice_components = None
+        allow_choice_buttons = (not is_banana_stand) and _is_home_turf_channel(target_cid)
         try:
             from tools.bridge_formatting import format_for_discord, chunk_text, _CODE_OR_CHOICES_RE, mask_code_spans, restore_code_spans, strip_unquoted_choices
-            formatted_content = format_for_discord(raw_content)
-            if not is_banana_stand:
+            formatted_content = _scrub_outbound_text(format_for_discord(raw_content))
+            if allow_choice_buttons:
                 masked_c, c_spans = mask_code_spans(formatted_content, prefix="\x00OUTBOX_CHOICES_")
                 matches = [m for m in _CODE_OR_CHOICES_RE.finditer(masked_c) if m.group(2) is not None]
                 parsed_choices = []
@@ -530,6 +556,9 @@ def dispatch_via_rest(omsg: dict) -> bool:
                         btn_label = (opt[:77] + "...") if len(opt) > 80 else opt
                         btns.append({"type": 2, "style": 1, "label": btn_label, "custom_id": f"choice:{btn_label}"})
                     choice_components = [{"type": 1, "components": btns}]
+            else:
+                # Non-home / external channels: strip [CHOICES: ...] tags and never attach clickable choice buttons
+                formatted_content = strip_unquoted_choices(formatted_content)
             chunks = chunk_text(formatted_content, max_len=1900)
         except Exception:
             chunks = [raw_content] if len(raw_content) <= 1900 else [raw_content[i:i+1900] for i in range(0, len(raw_content), 1900)]

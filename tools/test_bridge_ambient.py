@@ -10,11 +10,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import sys
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
+if _REPO_ROOT in sys.path:
+    sys.path.remove(_REPO_ROOT)
+sys.path.insert(0, _REPO_ROOT)
 from tools.bridge_ambient import (
     BANANA_WATCHER_BOT_ID,
     route_external_message,
@@ -334,6 +335,98 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(item["attachments"]), 1)
             self.assertTrue(item["attachments"][0].endswith("_ref_haos_thermals.jpg"))
             self.assertIn("[CRITICAL IMAGE INPUT INVARIANT]:", item["prompt"])
+
+    async def test_external_admin_commands_reject_non_owner_and_bots(self):
+        """Verify non-owner humans and peer bots cannot execute !reset, !pause, !unpause, !halt, or !resume in external channels."""
+        from tools.bridge_ambient import channel_last_bot_reply
+        bot = MagicMock()
+        bot.user.id = 1542285964213358633
+
+        cases = [
+            ("!reset", False, 111222333, "ExternalUser"),
+            ("!pause Amos 10", False, 111222333, "ExternalUser"),
+            ("!unpause Amos", False, 111222333, "ExternalUser"),
+            ("!halt", False, 111222333, "ExternalUser"),
+            ("!resume", False, 111222333, "ExternalUser"),
+            ("!halt trading right now please", True, 1468012353206354197, "PeerBot"),
+            ("!pause Amos for 10 minutes", True, OWNER_USER_ID, "SpoofedBotFlag"),
+        ]
+
+        for content, is_bot, author_id, author_name in cases:
+            channel_last_bot_reply.clear()
+            msg = MagicMock()
+            msg.guild.id = 1534436119888793740
+            msg.author.id = author_id
+            msg.author.bot = is_bot
+            msg.channel.id = 1534452820995080192  # #lounge
+            msg.channel.name = "lounge"
+            msg.content = content
+            msg.attachments = []
+            msg.reference = None
+            msg.role_mentions = []
+            msg.mentions = []
+            msg.reply = AsyncMock()
+
+            home_queue = asyncio.Queue()
+            ext_queue = asyncio.Queue()
+
+            with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
+                 patch("tools.bridge_ambient.resolve_is_reply_to_zero", return_value=True), \
+                 patch("tools.bridge_ambient.clear_channel_session_id") as mock_clear, \
+                 patch("tools.last_word_protocol.pause_bot") as mock_pause, \
+                 patch("tools.last_word_protocol.unpause_bot") as mock_unpause, \
+                 patch("tools.agora_kill_switch.trigger_kill_switch") as mock_kill:
+                handled = await route_external_message(
+                    msg, bot, content, author_name, home_queue, ext_queue
+                )
+                self.assertTrue(handled)
+                self.assertTrue(ext_queue.empty())
+                mock_clear.assert_not_called()
+                mock_pause.assert_not_called()
+                mock_unpause.assert_not_called()
+                mock_kill.assert_not_called()
+                msg.reply.assert_awaited_once()
+                self.assertIn("restricted to the bot owner", msg.reply.call_args[0][0])
+
+    async def test_external_admin_commands_allow_owner(self):
+        """Verify OWNER_USER_ID (non-bot) can still execute !reset, !pause, and !halt in external channels."""
+        bot = MagicMock()
+        bot.user.id = 1542285964213358633
+
+        msg = MagicMock()
+        msg.guild.id = 1534436119888793740
+        msg.author.id = OWNER_USER_ID
+        msg.author.bot = False
+        msg.channel.id = 1534452820995080192
+        msg.channel.name = "lounge"
+        msg.attachments = []
+        msg.reference = None
+        msg.role_mentions = []
+        msg.mentions = []
+        msg.reply = AsyncMock()
+
+        home_queue = asyncio.Queue()
+        ext_queue = asyncio.Queue()
+
+        with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
+             patch("tools.bridge_ambient.resolve_is_reply_to_zero", return_value=True), \
+             patch("tools.bridge_ambient.clear_channel_session_id") as mock_clear:
+            handled = await route_external_message(
+                msg, bot, "!reset", "Owner", home_queue, ext_queue
+            )
+            self.assertTrue(handled)
+            mock_clear.assert_called_once_with(msg.channel.id, "external")
+
+        msg.reply.reset_mock()
+        with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
+             patch("tools.bridge_ambient.resolve_is_reply_to_zero", return_value=True), \
+             patch("tools.agora_kill_switch.trigger_kill_switch", return_value={"message": "🛑 Halted"}) as mock_kill:
+            handled = await route_external_message(
+                msg, bot, "!halt", "Owner", home_queue, ext_queue
+            )
+            self.assertTrue(handled)
+            mock_kill.assert_called_once_with(initiator="Owner", action="halt", channel_id=msg.channel.id)
+            msg.reply.assert_awaited_once_with("🛑 Halted")
 
 
 if __name__ == "__main__":

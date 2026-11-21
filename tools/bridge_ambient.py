@@ -739,6 +739,9 @@ async def route_external_message(
 
     # Administrative commands in external channels
     if cleaned.lower() in ("!reset", "/reset", "!new", "/new"):
+        if msg.author.bot or msg.author.id != OWNER_USER_ID:
+            await msg.reply("⚠️ Administrative session commands are restricted to the bot owner.")
+            return True
         clear_channel_session_id(msg.channel.id, "external")
         await msg.reply("🔄 Session reset for this channel.")
         return True
@@ -749,6 +752,9 @@ async def route_external_message(
         re.IGNORECASE,
     )
     if pause_match:
+        if msg.author.bot or msg.author.id != OWNER_USER_ID:
+            await msg.reply("⚠️ Administrative bot pause commands are restricted to the bot owner.")
+            return True
         target_bot = pause_match.group(1).strip()
         mins = int(pause_match.group(2)) if pause_match.group(2) else int(rules.get("last_word_pause_minutes", 3))
         from tools.last_word_protocol import pause_bot
@@ -768,6 +774,9 @@ async def route_external_message(
         re.IGNORECASE,
     )
     if unpause_match:
+        if msg.author.bot or msg.author.id != OWNER_USER_ID:
+            await msg.reply("⚠️ Administrative bot unpause commands are restricted to the bot owner.")
+            return True
         target_bot = unpause_match.group(1).strip()
         from tools.last_word_protocol import unpause_bot
         removed = unpause_bot(msg.channel.id, target_bot)
@@ -779,6 +788,9 @@ async def route_external_message(
 
     agora_halt_match = re.search(r"^(?:!halt|/halt|!stop|/stop)(?:\s+(.*))?$", cleaned.strip(), re.IGNORECASE)
     if agora_halt_match:
+        if msg.author.bot or msg.author.id != OWNER_USER_ID:
+            await msg.reply("⚠️ Administrative Agora kill-switch commands are restricted to the bot owner.")
+            return True
         from tools.agora_kill_switch import trigger_kill_switch
         res = trigger_kill_switch(initiator=author_name, action="halt", channel_id=msg.channel.id)
         await msg.reply(res["message"])
@@ -786,20 +798,23 @@ async def route_external_message(
 
     agora_resume_match = re.search(r"^(?:!resume|/resume|!start|/start)(?:\s+(.*))?$", cleaned.strip(), re.IGNORECASE)
     if agora_resume_match:
+        if msg.author.bot or msg.author.id != OWNER_USER_ID:
+            await msg.reply("⚠️ Administrative Agora kill-switch commands are restricted to the bot owner.")
+            return True
         from tools.agora_kill_switch import trigger_kill_switch
         res = trigger_kill_switch(initiator=author_name, action="resume", channel_id=msg.channel.id)
         await msg.reply(res["message"])
         return True
 
     if is_container_restart_intent(cleaned):
-        if msg.author.id != OWNER_USER_ID:
+        if msg.author.bot or msg.author.id != OWNER_USER_ID:
             await msg.reply("⚠️ Administrative container restart commands are restricted to the bot owner.")
             return True
         await execute_container_restart(msg.channel, initiator=author_name, reason="Manual Docker container restart requested via Discord (external channel)")
         return True
 
     if is_reload_intent(cleaned):
-        if msg.author.id != OWNER_USER_ID:
+        if msg.author.bot or msg.author.id != OWNER_USER_ID:
             await msg.reply("⚠️ Administrative bridge commands are restricted to the bot owner.")
             return True
         if reload_fn:

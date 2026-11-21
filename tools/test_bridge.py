@@ -2,7 +2,7 @@
 
 import asyncio
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
 import sys
 
@@ -113,6 +113,138 @@ class TestBridgePromptAndFormatting(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(handled)
             self.assertTrue(ext_q.empty())
+
+
+class TestBridgeSlashAndButtonAuth(unittest.IsolatedAsyncioTestCase):
+
+    def _make_interaction(self, user_id: int, channel_id: int, custom_id: str = ""):
+        import discord
+        interaction = MagicMock()
+        interaction.id = 42424242
+        interaction.type = discord.InteractionType.component
+        interaction.user = MagicMock()
+        interaction.user.id = user_id
+        interaction.user.name = "Tester"
+        interaction.user.display_name = "Tester"
+        interaction.channel_id = channel_id
+        interaction.channel = MagicMock()
+        interaction.channel.id = channel_id
+        interaction.channel.category_id = None
+        interaction.channel.parent_id = None
+        interaction.channel.parent = None
+        interaction.channel.send = AsyncMock()
+        interaction.data = {"custom_id": custom_id}
+        interaction.response = MagicMock()
+        interaction.response.is_done = MagicMock(return_value=False)
+        interaction.response.send_message = AsyncMock()
+        interaction.response.send_modal = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+        interaction.message = MagicMock()
+        interaction.message.edit = AsyncMock()
+        return interaction
+
+    async def test_all_slash_commands_reject_non_owner(self):
+        """Verify every slash command in tools/bridge.py rejects non-owner callers ephemerally before defer()."""
+        import tools.bridge as bridge
+
+        non_owner_id = 999888777666
+        home_ch = bridge.TARGET_CHANNEL_ID
+        invocations = [
+            (bridge.slash_new, ("hello",)),
+            (bridge.slash_reset, ()),
+            (bridge.slash_model, ("argon",)),
+            (bridge.slash_quota, ("card",)),
+            (bridge.slash_reload, ("in-place",)),
+            (bridge.slash_crab, ("status", "", 3)),
+            (bridge.slash_run, ("heartbeat",)),
+            (bridge.slash_logs, ("24h",)),
+            (bridge.slash_triage, ()),
+            (bridge.slash_heartbeat, ()),
+            (bridge.slash_tasks, ()),
+            (bridge.slash_sidecars, ()),
+            (bridge.slash_title, ("New Thread Title",)),
+            (bridge.slash_queue, ()),
+            (bridge.slash_voice, ("status", "")),
+        ]
+        # Verify our test covers every registered slash command on bot.tree
+        registered_names = {cmd.name for cmd in bridge.bot.tree.get_commands()}
+        tested_names = {cmd.name for cmd, _ in invocations}
+        self.assertEqual(registered_names, tested_names)
+
+        for cmd, args in invocations:
+            interaction = self._make_interaction(user_id=non_owner_id, channel_id=home_ch)
+            await cmd.callback(interaction, *args)
+            interaction.response.defer.assert_not_awaited()
+            interaction.response.send_message.assert_awaited_once()
+            _, kwargs = interaction.response.send_message.call_args
+            self.assertTrue(kwargs.get("ephemeral"), f"/{cmd.name} denial must be ephemeral")
+
+    async def test_home_only_slash_commands_reject_non_home_channel_for_owner(self):
+        """Verify Home-only slash commands (/triage, /run, /logs, /tasks, /quota, /sidecars, /heartbeat, /voice) reject non-home channels even for OWNER_USER_ID."""
+        import tools.bridge as bridge
+
+        non_home_ch = 1534452820995080192  # #lounge (Crab Cavern)
+        home_only_invocations = [
+            (bridge.slash_triage, ()),
+            (bridge.slash_run, ("heartbeat",)),
+            (bridge.slash_logs, ("24h",)),
+            (bridge.slash_tasks, ()),
+            (bridge.slash_quota, ("card",)),
+            (bridge.slash_sidecars, ()),
+            (bridge.slash_heartbeat, ()),
+            (bridge.slash_voice, ("status", "")),
+        ]
+        for cmd, args in home_only_invocations:
+            interaction = self._make_interaction(user_id=bridge.OWNER_USER_ID, channel_id=non_home_ch)
+            await cmd.callback(interaction, *args)
+            interaction.response.defer.assert_not_awaited()
+            interaction.response.send_message.assert_awaited_once()
+            msg_text = interaction.response.send_message.call_args[0][0]
+            self.assertIn("Home", msg_text)
+            self.assertTrue(interaction.response.send_message.call_args[1].get("ephemeral"))
+
+    async def test_on_button_interaction_non_owner_forge_edit_no_modal_or_db_read(self):
+        """Verify non-owner clicking forge_edit: gets ephemeral denial without reading payload_json or opening ForgeDecisionEditModal."""
+        import tools.bridge as bridge
+
+        interaction = self._make_interaction(
+            user_id=999888777,
+            channel_id=bridge.TARGET_CHANNEL_ID,
+            custom_id="forge_edit:dec-1234",
+        )
+        with patch("tools.forge.get_db_connection") as mock_db, \
+             patch("tools.forge.ForgeDecisionEditModal") as mock_modal:
+            await bridge.on_button_interaction(interaction)
+            mock_db.assert_not_called()
+            mock_modal.assert_not_called()
+            interaction.response.send_modal.assert_not_awaited()
+            interaction.message.edit.assert_not_awaited()
+            interaction.response.send_message.assert_awaited_once()
+            self.assertTrue(interaction.response.send_message.call_args[1].get("ephemeral"))
+
+    async def test_on_button_interaction_non_owner_forge_approve_dismiss_choice_no_mutation(self):
+        """Verify non-owner clicking forge_approve:, forge_dismiss:, or choice: cannot disable buttons, edit embeds, or execute actions."""
+        import tools.bridge as bridge
+
+        for cid in ("forge_approve:dec-55", "forge_dismiss:dec-55", "choice:Restart Zero"):
+            interaction = self._make_interaction(
+                user_id=999888777,
+                channel_id=bridge.TARGET_CHANNEL_ID,
+                custom_id=cid,
+            )
+            with patch("tools.forge.execute_decision") as mock_exec, \
+                 patch("tools.forge.dismiss_decision") as mock_dismiss, \
+                 patch("tools.bridge._button_choice_callback", new_callable=AsyncMock) as mock_choice:
+                await bridge.on_button_interaction(interaction)
+                mock_exec.assert_not_called()
+                mock_dismiss.assert_not_called()
+                mock_choice.assert_not_awaited()
+                interaction.response.defer.assert_not_awaited()
+                interaction.message.edit.assert_not_awaited()
+                interaction.response.send_message.assert_awaited_once()
+                self.assertTrue(interaction.response.send_message.call_args[1].get("ephemeral"))
 
 
 if __name__ == "__main__":

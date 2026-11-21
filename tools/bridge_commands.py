@@ -36,6 +36,7 @@ from tools.bridge_state import (
     get_active_model,
     get_runtime_rules,
     is_container_restart_intent,
+    is_home_channel,
     is_reload_intent,
     record_restart_intent,
     set_active_model,
@@ -362,6 +363,26 @@ async def handle_button_choice(
     reload_fn: Optional[Callable] = None
 ):
     """Handle interactive choice button click from user."""
+    user = getattr(interaction, "user", None)
+    if getattr(user, "id", None) != OWNER_USER_ID:
+        try:
+            is_done = interaction.response.is_done()
+            if asyncio.iscoroutine(is_done):
+                is_done = await is_done
+            if is_done is True:
+                await interaction.followup.send(
+                    "🔒 Unauthorized: interactive choice buttons are restricted to the bot owner.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "🔒 Unauthorized: interactive choice buttons are restricted to the bot owner.",
+                    ephemeral=True,
+                )
+        except Exception as auth_err:
+            print(f"[BridgeCommands] Warning sending unauthorized button reply: {auth_err}")
+        return
+
     global PROCESSED_INTERACTIONS
     if interaction.id in PROCESSED_INTERACTIONS:
         return
@@ -369,6 +390,13 @@ async def handle_button_choice(
     if len(PROCESSED_INTERACTIONS) > 500:
         PROCESSED_INTERACTIONS.clear()
         PROCESSED_INTERACTIONS.add(interaction.id)
+
+    ch = getattr(interaction, "channel", None)
+    if ch is not None and isinstance(getattr(ch, "id", None), int):
+        ch_is_home = bool(is_home_channel(ch))
+    else:
+        ch_is_home = bool(is_home_channel(getattr(interaction, "channel_id", None)))
+    turn_mode = "home" if ch_is_home else "external"
 
     choice_lower = choice_text.strip().lower()
 
@@ -403,7 +431,7 @@ async def handle_button_choice(
     if any(k in choice_lower for k in ("reset session", "restart session", "fresh session", "new session")):
         await interaction.channel.send(f"🔘 **Selected:** `{choice_text}`")
         sess_key = "home" if (interaction.channel.id == TARGET_CHANNEL_ID) else str(interaction.channel.id)
-        clear_channel_session_id(interaction.channel.id, "home")
+        clear_channel_session_id(interaction.channel.id, turn_mode)
         br.reset_session_keys.discard(sess_key)
         try:
             bd = sys.modules.get("tools.bridge_daemons")
@@ -469,7 +497,7 @@ async def handle_button_choice(
         "reply_target": selected_msg,
         "attachments": [],
         "is_steer": False,
-        "mode": "home",
+        "mode": turn_mode,
         "channel_id": interaction.channel_id,
         "queued_at": time.perf_counter(),
     })
