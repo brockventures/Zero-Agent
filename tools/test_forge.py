@@ -1731,7 +1731,7 @@ def test_execute_chunk_in_worktree_conflict_with_advanced_main_aborts_cleanly(tm
     build_id = res["build_id"]
 
     # FakePopen simulates Vulcan editing standings.py inside wt_dir while main in repo_dir advances with a conflicting commit on attempt 1.
-    # FORGE preserves the verified commit and completes cleanly without discarding work and re-running the worker.
+    # FORGE must abort the conflicting cherry-pick cleanly WITHOUT overwriting main_advanced, then recreate the worktree from main_advanced on attempt 2.
     attempt_counter = [0]
 
     class FakePopen:
@@ -1771,8 +1771,8 @@ def test_execute_chunk_in_worktree_conflict_with_advanced_main_aborts_cleanly(tm
 
     ok = sup.execute_chunk_in_worktree(build_id, chunk_row)
     assert ok is True
-    assert attempt_counter[0] == 1
-    assert (repo_dir / "standings.py").read_text(encoding="utf-8") == "LINE = 'chunk_attempt_1'\n"
+    assert attempt_counter[0] == 2
+    assert (repo_dir / "standings.py").read_text(encoding="utf-8") == "LINE = 'chunk_attempt_2_resolved'\n"
     st = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo_dir), capture_output=True, text=True).stdout.strip()
     assert st == ""
 
@@ -5065,24 +5065,31 @@ def test_baseball_decision_card_bridge_reload_deferred_to_ivy_outbox(tmp_path, m
 
 
 def test_heartbeat_tracker_incremental_transcript_and_scandir_throttle(tmp_path, monkeypatch):
-    """Verify HeartbeatTracker scans transcript incrementally and throttles brain_dir os.scandir to 30s."""
+    """Verify HeartbeatTracker scans transcript incrementally and strictly tracks only spawned child subagent IDs without os.scandir(brain_dir)."""
     brain_root = tmp_path / "brain"
     conv_id = "conv-main"
     logs_dir = brain_root / conv_id / ".system_generated" / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     tfile = logs_dir / "transcript.jsonl"
     tfile.write_text(
-        json.dumps({"type": "USER_INPUT", "content": "hello"}) + "\n",
+        json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "hello"}) + "\n",
         encoding="utf-8",
     )
 
+    # Create spawned child subagent transcripts + an unrelated session transcript
     sub1_logs = brain_root / "conv-sub-1" / ".system_generated" / "logs"
     sub1_logs.mkdir(parents=True, exist_ok=True)
     sub1_tfile = sub1_logs / "transcript.jsonl"
     sub1_tfile.write_text('{"type": "PLANNER_RESPONSE", "content": "sub1"}\n', encoding="utf-8")
 
+    unrelated_logs = brain_root / "conv-unrelated-other" / ".system_generated" / "logs"
+    unrelated_logs.mkdir(parents=True, exist_ok=True)
+    (unrelated_logs / "transcript.jsonl").write_text('{"type": "PLANNER_RESPONSE", "content": "other"}\n', encoding="utf-8")
+
     fake_now = [1000.0]
     monkeypatch.setattr(forge_mod.time, "time", lambda: fake_now[0])
+    os.utime(sub1_tfile, (1000.0, 1000.0))
+    os.utime(unrelated_logs / "transcript.jsonl", (1000.0, 1000.0))
 
     scandir_calls = []
     real_scandir = os.scandir
@@ -5119,7 +5126,7 @@ def test_heartbeat_tracker_incremental_transcript_and_scandir_throttle(tmp_path,
         return fh
 
     with tfile.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"type": "PLANNER_RESPONSE", "content": "working"}) + "\n")
+        f.write(json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "content": "working"}) + "\n")
 
     with patch("builtins.open", side_effect=_spy_open):
         sig2 = tracker.compute_disk_signature()
@@ -5130,37 +5137,54 @@ def test_heartbeat_tracker_incremental_transcript_and_scandir_throttle(tmp_path,
     assert len(scandir_calls) == 0
     assert sig2[0] == 1
 
-    # Append invoke_subagent; triggers first os.scandir at t=1005.0
+    # Append invoke_subagent + child conv-sub-1 result; scans ONLY conv-sub-1 (never unrelated sessions or os.scandir)
     fake_now[0] = 1005.0
     with tfile.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "invoke_subagent"}]}) + "\n")
+        f.write(json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "invoke_subagent"}]}) + "\n")
+        f.write(json.dumps({
+            "step_index": 3,
+            "type": "GENERIC",
+            "content": 'Created the following subagent:\n{\n  "conversationId": "conv-sub-1"\n}\n',
+        }) + "\n")
 
     sig3 = tracker.compute_disk_signature()
     assert tracker._has_subagents is True
-    assert len(scandir_calls) == 1
-    assert sig3[0] == 2  # main transcript + sub1 transcript
+    assert tracker._subagent_conv_ids == {"conv-sub-1"}
+    assert len(scandir_calls) == 0
+    assert sig3[0] == 2  # main transcript + conv-sub-1 only (unrelated session ignored!)
 
-    # Within 30s (t=1020.0): os.scandir is throttled and cached subagent sig is reused
+    # Second child conv-sub-2 is ignored until explicitly spawned in transcript
     fake_now[0] = 1020.0
     sub2_logs = brain_root / "conv-sub-2" / ".system_generated" / "logs"
     sub2_logs.mkdir(parents=True, exist_ok=True)
-    (sub2_logs / "transcript.jsonl").write_text('{"type": "PLANNER_RESPONSE", "content": "sub2"}\n', encoding="utf-8")
+    sub2_tfile = sub2_logs / "transcript.jsonl"
+    sub2_tfile.write_text('{"type": "PLANNER_RESPONSE", "content": "sub2"}\n', encoding="utf-8")
+    os.utime(sub2_tfile, (1020.0, 1020.0))
 
     sig4 = tracker.compute_disk_signature()
-    assert len(scandir_calls) == 1
-    assert sig4[0] == 2  # still cached
+    assert len(scandir_calls) == 0
+    assert sig4[0] == 2  # conv-sub-2 not spawned by this turn yet
 
-    # Past 30s (t=1036.0): os.scandir runs again and picks up sub2
+    # Once conv-sub-2 is spawned by invoke_subagent, it IS included immediately
     fake_now[0] = 1036.0
+    with tfile.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"step_index": 4, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "invoke_subagent"}]}) + "\n")
+        f.write(json.dumps({
+            "step_index": 5,
+            "type": "GENERIC",
+            "content": 'Created the following subagent:\n{\n  "conversationId": "conv-sub-2"\n}\n',
+        }) + "\n")
     sig5 = tracker.compute_disk_signature()
-    assert len(scandir_calls) == 2
+    assert len(scandir_calls) == 0
+    assert tracker._subagent_conv_ids == {"conv-sub-1", "conv-sub-2"}
     assert sig5[0] == 3
 
-    # File shrink resets _last_transcript_offset cleanly
-    tracker._has_subagents = False
-    tfile.write_text('{"type": "USER_INPUT", "content": "reset"}\n', encoding="utf-8")
+    # File shrink resets _last_transcript_offset and subagent IDs cleanly
+    tfile.write_text('{"step_index": 0, "type": "USER_INPUT", "content": "reset"}\n', encoding="utf-8")
     tracker.compute_disk_signature()
     assert tracker._last_transcript_offset == tfile.stat().st_size
+    assert tracker._has_subagents is False
+    assert tracker._subagent_conv_ids == set()
 
 
 def test_check_runaway_tool_loop_tail_read_large_transcript(tmp_path):
@@ -5418,6 +5442,563 @@ def test_dismiss_decision_cas_guard_and_stale_executing_recovery(tmp_path):
         )
     reconcile_res = forge_mod.reconcile_forge_on_boot(db_path=db_path)
     assert d_exec["decision_id"] in reconcile_res.get("recovered_decisions", [])
+
+
+def test_rebase_conflict_never_overwrites_base_ref(tmp_path, monkeypatch):
+    """Verify rebase conflict onto an advanced base_ref aborts cleanly without overwriting sibling commits."""
+    repo = _init_test_git_repo(tmp_path / "repo")
+    db_path = tmp_path / "forge.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(forge_mod, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "sync_forge_channel_header", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_completion_to_origin", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_failure_to_origin", lambda *a, **kw: None)
+
+    plan = {
+        "id": "fg-rebase-conflict",
+        "title": "Rebase Conflict Safety",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Preserve sibling commit on base_ref"],
+        "chunks": [
+            {
+                "title": "Chunk 0",
+                "target_files": ["README.md"],
+                "instructions": "Update README.md with verified changes and ensure git history remains intact.",
+                "verification_cmd": "true",
+            },
+            {
+                "title": "Chunk 1",
+                "target_files": ["other.py"],
+                "instructions": "Implement unrelated pending chunk changes in other.py cleanly.",
+                "verification_cmd": "true",
+            },
+        ],
+    }
+    forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+    staging_ref = "forge/release-fg-rebase-conflict"
+    sibling_shas = []
+
+    class ConflictPopen:
+        def __init__(self, cmd, cwd=None, **kwargs):
+            self.cwd = Path(cwd)
+            # Advance staging_ref (simulating a parallel sibling chunk landing first) with a conflicting edit
+            sibling_wt = tmp_path / f"sib-{len(sibling_shas)}"
+            subprocess.run(["git", "worktree", "add", "--detach", str(sibling_wt), staging_ref], cwd=str(repo), check=True, capture_output=True)
+            (sibling_wt / "README.md").write_text(f"# Sibling Commit {len(sibling_shas)}\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", f"sibling {len(sibling_shas)}"], cwd=str(sibling_wt), check=True, capture_output=True)
+            sib_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(sibling_wt), check=True, capture_output=True, text=True).stdout.strip()
+            subprocess.run(["git", "branch", "-f", staging_ref, sib_sha], cwd=str(repo), check=True, capture_output=True)
+            subprocess.run(["git", "worktree", "remove", "--force", str(sibling_wt)], cwd=str(repo), check=True, capture_output=True)
+            sibling_shas.append(sib_sha)
+            # Worker writes conflicting edit on the stale worktree base
+            (self.cwd / "README.md").write_text("# Conflicting Worker Edit\n", encoding="utf-8")
+            self.stdout = iter([])
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    real_popen = subprocess.Popen
+
+    def _side_effect(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and any("/usr/local/bin/agy" in str(x) for x in cmd):
+            return ConflictPopen(cmd, *args, **kwargs)
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _side_effect)
+    sup = forge_mod.ForgeSupervisor(db_path=db_path)
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0 = conn.execute("SELECT * FROM forge_chunks WHERE id = 'fg-rebase-conflict-c0'").fetchone()
+
+    ok = sup.execute_chunk_in_worktree("fg-rebase-conflict", c0)
+    assert ok is False
+
+    # base_ref MUST still point to the latest sibling commit and MUST NOT have been overwritten
+    final_base_sha = subprocess.run(["git", "rev-parse", staging_ref], cwd=str(repo), check=True, capture_output=True, text=True).stdout.strip()
+    assert final_base_sha == sibling_shas[-1]
+    base_readme = subprocess.run(["git", "show", f"{staging_ref}:README.md"], cwd=str(repo), check=True, capture_output=True, text=True).stdout
+    assert "Sibling Commit" in base_readme
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0_after = conn.execute("SELECT status, last_error FROM forge_chunks WHERE id = 'fg-rebase-conflict-c0'").fetchone()
+        b_after = conn.execute("SELECT status FROM forge_builds WHERE id = 'fg-rebase-conflict'").fetchone()
+    assert c0_after["status"] == "failed"
+    assert "rebase" in c0_after["last_error"].lower()
+    assert b_after["status"] == "failed"
+
+
+def test_execute_chunk_fails_cleanly_on_push_rejection(tmp_path, monkeypatch):
+    """Verify non-fast-forward remote push rejection fails the chunk/build and records stderr instead of marking merged/completed."""
+    bare_remote = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+
+    local_repo = tmp_path / "local"
+    subprocess.run(["git", "clone", str(bare_remote), str(local_repo)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(local_repo), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(local_repo), check=True, capture_output=True)
+    (local_repo / "README.md").write_text("# Initial\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(local_repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Initial"], cwd=str(local_repo), check=True, capture_output=True)
+    subprocess.run(["git", "push", "origin", "main"], cwd=str(local_repo), check=True, capture_output=True)
+
+    # Prepare a peer clone to advance remote main concurrently during worker execution
+    peer_repo = tmp_path / "peer"
+    subprocess.run(["git", "clone", str(bare_remote), str(peer_repo)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Peer"], cwd=str(peer_repo), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "peer@example.com"], cwd=str(peer_repo), check=True, capture_output=True)
+
+    db_path = tmp_path / "forge.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(forge_mod, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "sync_forge_channel_header", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_completion_to_origin", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_failure_to_origin", lambda *a, **kw: None)
+
+    plan = {
+        "id": "fg-push-reject",
+        "title": "Push Rejection Guard",
+        "repo": str(local_repo),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Test push return code handling"],
+        "chunks": [
+            {
+                "title": "Edit app.py",
+                "target_files": ["app.py"],
+                "instructions": "Create app.py with constant X = 1 and verify clean git push behavior.",
+                "verification_cmd": "true",
+            }
+        ],
+    }
+    forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+
+    # Also simulate push failing by pushing a non-conflicting commit to bare_remote AFTER local_repo fetched before merge
+    orig_run = subprocess.run
+    pushed_peer = [False]
+
+    def _spy_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 3 and cmd[0] == "git" and cmd[1] == "push" and not pushed_peer[0]:
+            pushed_peer[0] = True
+            (peer_repo / "peer_only.txt").write_text("remote ahead\n", encoding="utf-8")
+            orig_run(["git", "add", "."], cwd=str(peer_repo), check=True, capture_output=True)
+            orig_run(["git", "commit", "-m", "remote advance"], cwd=str(peer_repo), check=True, capture_output=True)
+            orig_run(["git", "push", "origin", "main"], cwd=str(peer_repo), check=True, capture_output=True)
+        return orig_run(cmd, *args, **kwargs)
+
+    class WorkerPopen:
+        def __init__(self, cmd, cwd=None, **kwargs):
+            (Path(cwd) / "app.py").write_text("X = 1\n", encoding="utf-8")
+            self.stdout = iter([])
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(subprocess, "run", _spy_run)
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda cmd, *a, **kw: WorkerPopen(cmd, *a, **kw)
+        if isinstance(cmd, list) and any("/usr/local/bin/agy" in str(x) for x in cmd)
+        else real_popen(cmd, *a, **kw),
+    )
+
+    sup = forge_mod.ForgeSupervisor(db_path=db_path)
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0 = conn.execute("SELECT * FROM forge_chunks WHERE id = 'fg-push-reject-c0'").fetchone()
+
+    ok = sup.execute_chunk_in_worktree("fg-push-reject", c0)
+    assert ok is False
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0_after = conn.execute("SELECT status, last_error FROM forge_chunks WHERE id = 'fg-push-reject-c0'").fetchone()
+        b_after = conn.execute("SELECT status FROM forge_builds WHERE id = 'fg-push-reject'").fetchone()
+    assert c0_after["status"] == "failed"
+    assert "git push origin main failed" in c0_after["last_error"]
+    assert "rejected" in c0_after["last_error"].lower() or "non-fast-forward" in c0_after["last_error"].lower()
+    assert b_after["status"] == "failed"
+
+
+def test_prepare_clean_repo_never_resets_dirty_workspace(tmp_path, monkeypatch):
+    """Verify _prepare_clean_repo_and_sync_base preserves dirty WORKSPACE_DIR edits when before_merge=False even if origin/main is ahead."""
+    bare_remote = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare_remote)], check=True, capture_output=True)
+
+    ws_repo = tmp_path / "workspace"
+    subprocess.run(["git", "clone", str(bare_remote), str(ws_repo)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(ws_repo), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(ws_repo), check=True, capture_output=True)
+    (ws_repo / "README.md").write_text("# Base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(ws_repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Initial"], cwd=str(ws_repo), check=True, capture_output=True)
+    subprocess.run(["git", "push", "origin", "main"], cwd=str(ws_repo), check=True, capture_output=True)
+
+    # Advance origin/main from a peer clone
+    peer = tmp_path / "peer"
+    subprocess.run(["git", "clone", str(bare_remote), str(peer)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Peer"], cwd=str(peer), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "peer@example.com"], cwd=str(peer), check=True, capture_output=True)
+    (peer / "README.md").write_text("# Remote Newer\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-am", "Peer advance"], cwd=str(peer), check=True, capture_output=True)
+    subprocess.run(["git", "push", "origin", "main"], cwd=str(peer), check=True, capture_output=True)
+
+    # Leave uncommitted local edits in ws_repo (acting as WORKSPACE_DIR)
+    (ws_repo / "README.md").write_text("# Uncommitted Local Edit\n", encoding="utf-8")
+    monkeypatch.setattr(forge_mod, "WORKSPACE_DIR", ws_repo)
+
+    latest_ref = forge_mod._prepare_clean_repo_and_sync_base(ws_repo, "main", before_merge=False)
+    assert latest_ref == "origin/main"
+    # Local uncommitted edits MUST survive intact (no git reset --hard!)
+    assert (ws_repo / "README.md").read_text(encoding="utf-8") == "# Uncommitted Local Edit\n"
+
+
+def test_cross_container_worktree_lock_and_reconcile_preservation(tmp_path, monkeypatch):
+    """Verify _ensure_chunk_worktree locks the worktree with forge-active-<build_id> and reconcile_forge_on_boot preserves active locks under repo lock."""
+    import fcntl
+
+    repo = _init_test_git_repo(tmp_path / "repo")
+    db_path = tmp_path / "forge.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(forge_mod, "WORKSPACE_DIR", repo)
+    monkeypatch.setattr(forge_mod, "FORGE_LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(forge_mod, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "sync_forge_channel_header", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_completion_to_origin", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_failure_to_origin", lambda *a, **kw: None)
+
+    plan = {
+        "id": "fg-wt-lock-test",
+        "title": "Worktree Lock Test",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Verify worktree lock"],
+        "chunks": [
+            {
+                "title": "Chunk 0",
+                "target_files": ["README.md"],
+                "instructions": "Update README.md inside a locked FORGE worktree and verify lock cleanup.",
+                "verification_cmd": "true",
+            }
+        ],
+    }
+    forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+
+    observed_lock_reason = []
+
+    class InspectLockPopen:
+        def __init__(self, cmd, cwd=None, **kwargs):
+            wt_p = Path(cwd)
+            lock_f = repo / ".git" / "worktrees" / wt_p.name / "locked"
+            if lock_f.exists():
+                observed_lock_reason.append(lock_f.read_text(encoding="utf-8").strip())
+            (wt_p / "README.md").write_text("# Locked Worktree Edit\n", encoding="utf-8")
+            self.stdout = iter([])
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda cmd, *a, **kw: InspectLockPopen(cmd, *a, **kw)
+        if isinstance(cmd, list) and any("/usr/local/bin/agy" in str(x) for x in cmd)
+        else real_popen(cmd, *a, **kw),
+    )
+
+    sup = forge_mod.ForgeSupervisor(db_path=db_path)
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0 = conn.execute("SELECT * FROM forge_chunks WHERE id = 'fg-wt-lock-test-c0'").fetchone()
+
+    assert sup.execute_chunk_in_worktree("fg-wt-lock-test", c0) is True
+    assert observed_lock_reason == ["forge-active-fg-wt-lock-test"]
+    assert not (repo / ".git" / "worktrees" / "forge-wt-fg-wt-lock-test-c0").exists()
+
+    # Simulate Vulcan holding a locked worktree whose /tmp path does not exist in Zero's container namespace
+    active_bid = "fg-peer-active"
+    peer_wt = tmp_path / f"forge-wt-{active_bid}-c0"
+    subprocess.run(["git", "worktree", "add", "-b", f"forge/{active_bid}-c0", str(peer_wt), "main"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "worktree", "lock", "--reason", f"forge-active-{active_bid}", str(peer_wt)], cwd=str(repo), check=True, capture_output=True)
+    # Remove peer_wt directory to simulate a different container's /tmp mount namespace
+    import shutil
+    shutil.rmtree(peer_wt)
+
+    lock_calls = []
+    orig_acquire = forge_mod._acquire_repo_git_lock
+
+    def _spy_acquire(rdir):
+        lock_calls.append(Path(rdir).resolve())
+        return orig_acquire(rdir)
+
+    monkeypatch.setattr(forge_mod, "_acquire_repo_git_lock", _spy_acquire)
+
+    worker_lock_path = db_path.parent / f".forge_build_worker_{active_bid}.lock"
+    with open(worker_lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            forge_mod.reconcile_forge_on_boot(db_path=db_path)
+            assert repo.resolve() in lock_calls
+            # Locked metadata MUST survive boot reconciliation while active_bid holds its worker flock
+            assert (repo / ".git" / "worktrees" / f"forge-wt-{active_bid}-c0" / "locked").exists()
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    # Clean up simulated worktree lock after releasing worker flock
+    forge_mod.reconcile_forge_on_boot(db_path=db_path)
+    assert not (repo / ".git" / "worktrees" / f"forge-wt-{active_bid}-c0").exists()
+
+
+def test_heartbeat_tracker_missing_transcript_and_baseline_step_scoping(tmp_path):
+    """Verify HeartbeatTracker returns False when transcript is missing and ignores pre-baseline or unrelated subagents."""
+    brain_root = tmp_path / "brain"
+    conv_id = "conv-scoped"
+    conv_path = brain_root / conv_id / ".system_generated"
+    (conv_path / "logs").mkdir(parents=True, exist_ok=True)
+
+    # Pre-existing unrelated session in brain_dir
+    unrelated = brain_root / "conv-unrelated" / ".system_generated" / "logs"
+    unrelated.mkdir(parents=True, exist_ok=True)
+    (unrelated / "transcript.jsonl").write_text('{"type": "PLANNER_RESPONSE"}\n', encoding="utf-8")
+
+    # 1. Missing transcript.jsonl MUST return False (not brain_dir.exists())
+    tracker_missing = HeartbeatTracker(conv_id=conv_id, brain_dir=brain_root, baseline_step_index=5)
+    assert tracker_missing._check_transcript_has_subagents(conv_path, conv_id) is False
+    assert tracker_missing.compute_disk_signature() == (0, 0.0, 0)
+
+    # 2. Subagent spawned at step <= baseline_step_index MUST be ignored; only step > baseline_step_index is tracked
+    old_child = brain_root / "child-old" / ".system_generated" / "logs"
+    old_child.mkdir(parents=True, exist_ok=True)
+    (old_child / "transcript.jsonl").write_text('{"type": "PLANNER_RESPONSE"}\n', encoding="utf-8")
+
+    new_child = brain_root / "child-new" / ".system_generated" / "logs"
+    new_child.mkdir(parents=True, exist_ok=True)
+    (new_child / "transcript.jsonl").write_text('{"type": "PLANNER_RESPONSE"}\n', encoding="utf-8")
+
+    tfile = conv_path / "logs" / "transcript.jsonl"
+    lines = [
+        {"step_index": 2, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "invoke_subagent"}]},
+        {"step_index": 3, "type": "GENERIC", "content": 'Created the following subagent:\n{"conversationId": "child-old"}\n'},
+        {"step_index": 6, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "invoke_subagent"}]},
+        {"step_index": 7, "type": "GENERIC", "content": 'Created the following subagent:\n{"conversationId": "child-new"}\n'},
+    ]
+    tfile.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+
+    tracker = HeartbeatTracker(conv_id=conv_id, brain_dir=brain_root, baseline_step_index=5)
+    sig = tracker.compute_disk_signature()
+    assert tracker._subagent_conv_ids == {"child-new"}
+    assert sig[0] == 2  # main transcript + child-new only (child-old and conv-unrelated excluded)
+
+
+def test_run_build_pipeline_fails_on_unmet_or_cyclic_depends_on(tmp_path, monkeypatch):
+    """Verify run_build_pipeline never bypasses unmet/cyclic depends_on and marks build failed cleanly."""
+    repo = _init_test_git_repo(tmp_path / "repo")
+    db_path = tmp_path / "forge.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(forge_mod, "FORGE_LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(forge_mod, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_failure_to_origin", lambda *a, **kw: None)
+
+    plan = {
+        "id": "fg-cyclic-deps",
+        "title": "Cyclic Depends On Build",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Cyclic dep test"],
+        "chunks": [
+            {
+                "title": "Chunk 0",
+                "target_files": ["a.py"],
+                "instructions": "Implement module a.py after dependency resolution succeeds cleanly.",
+                "verification_cmd": "true",
+            },
+            {
+                "title": "Chunk 1",
+                "target_files": ["b.py"],
+                "instructions": "Implement module b.py after dependency resolution succeeds cleanly.",
+                "verification_cmd": "true",
+            },
+        ],
+    }
+    forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+    # Inject cyclic depends_on directly in SQLite: chunk 0 depends on chunk 1, chunk 1 depends on chunk 0
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute("UPDATE forge_chunks SET depends_on_json = '[1]' WHERE id = 'fg-cyclic-deps-c0'")
+        conn.execute("UPDATE forge_chunks SET depends_on_json = '[0]' WHERE id = 'fg-cyclic-deps-c1'")
+
+    executed_chunks = []
+    sup = forge_mod.ForgeSupervisor(db_path=db_path)
+    monkeypatch.setattr(sup, "execute_chunk_in_worktree", lambda bid, ch: executed_chunks.append(ch["id"]) or True)
+
+    ok = sup.run_build_pipeline("fg-cyclic-deps")
+    assert ok is False
+    assert executed_chunks == []  # Blocked chunks MUST NOT be executed out of order!
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        b_row = conn.execute("SELECT status FROM forge_builds WHERE id = 'fg-cyclic-deps'").fetchone()
+        c_rows = conn.execute("SELECT status, last_error FROM forge_chunks WHERE build_id = 'fg-cyclic-deps'").fetchall()
+    assert b_row["status"] == "failed"
+    assert all(r["status"] == "failed" for r in c_rows)
+    assert all("depends_on" in (r["last_error"] or "") for r in c_rows)
+
+
+def test_maybe_spawn_next_build_worker_closes_parent_log_fd(tmp_path, monkeypatch):
+    """Verify maybe_spawn_next_build_worker closes the parent log file handle immediately after Popen."""
+    db_path = tmp_path / "forge.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(forge_mod, "FORGE_LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(forge_mod, "is_ivy_container", lambda: False)
+
+    plan = {
+        "id": "fg-fd-leak-check",
+        "title": "FD Closure Check",
+        "repo": "/workspace",
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["FD test"],
+        "chunks": [
+            {
+                "title": "C0",
+                "target_files": ["a.py"],
+                "instructions": "Verify build worker spawning closes parent log file descriptor cleanly.",
+                "verification_cmd": "true",
+            }
+        ],
+    }
+    forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+
+    captured_stdout = []
+
+    class DummyProc:
+        pid = 999999
+
+        def poll(self):
+            return None
+
+    def _fake_popen(cmd, **kwargs):
+        captured_stdout.append(kwargs.get("stdout"))
+        return DummyProc()
+
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+    sup = forge_mod.ForgeSupervisor(db_path=db_path)
+    monkeypatch.setattr(sup, "should_execute_builds", lambda: True)
+
+    spawned = sup.maybe_spawn_next_build_worker()
+    assert spawned == "fg-fd-leak-check"
+    assert len(captured_stdout) == 1
+    assert captured_stdout[0].closed is True
+
+
+def test_run_job_worker_cancel_escalates_sigterm_to_sigkill(tmp_path, monkeypatch):
+    """Verify _run_job_worker_locked escalates SIGTERM -> wait(1.0) -> SIGKILL when a cancelled child ignores SIGTERM."""
+    import signal
+
+    db_path = tmp_path / "forge.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.setattr(forge_mod, "TASKS_DIR", tmp_path / "detached_tasks")
+    monkeypatch.setattr(forge_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(forge_mod, "_is_prod_forge_env", lambda *a, **kw: False)
+    monkeypatch.setattr(forge_mod, "sync_forge_channel_header", lambda *a, **kw: None)
+
+    task_id = "dt-cancel-escalate"
+    tdir = forge_mod._get_job_dir(task_id)
+    tdir.mkdir(parents=True, exist_ok=True)
+    log_p = tdir / "run.log"
+    meta = {
+        "task_id": task_id,
+        "name": "Stubborn Task",
+        "command": "sleep 60",
+        "channel": "zero-chat",
+        "timeout": 120,
+        "cwd": str(tmp_path),
+        "status": "running",
+        "start_time": time.time(),
+        "notify_on_success": False,
+        "synthesize": False,
+        "log_file": str(log_p),
+    }
+    forge_mod._write_job_meta(task_id, meta, db_path=db_path)
+
+    signals_sent = []
+    wait_calls = [0]
+
+    class StubbornProc:
+        pid = 424242
+
+        def wait(self, timeout=None):
+            wait_calls[0] += 1
+            if wait_calls[0] == 1:
+                # First wait slice expires -> triggers cancellation check
+                meta["status"] = "cancelled"
+                forge_mod._write_job_meta(task_id, meta, db_path=db_path)
+                raise subprocess.TimeoutExpired(cmd="sleep 60", timeout=timeout)
+            if wait_calls[0] == 2:
+                # Ignores SIGTERM during 1.0s grace wait -> must trigger SIGKILL escalation
+                assert timeout == 1.0
+                raise subprocess.TimeoutExpired(cmd="sleep 60", timeout=timeout)
+            return -9
+
+        def terminate(self):
+            signals_sent.append(("terminate", self.pid))
+
+        def kill(self):
+            signals_sent.append(("kill", self.pid))
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: StubbornProc())
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signals_sent.append((sig, pgid)))
+
+    forge_mod._run_job_worker_locked(task_id, meta, db_path=db_path)
+    assert (signal.SIGTERM, 424242) in signals_sent
+    assert (signal.SIGKILL, 424242) in signals_sent
+    assert signals_sent.index((signal.SIGTERM, 424242)) < signals_sent.index((signal.SIGKILL, 424242))
+
+
+def test_decision_edit_modal_rejects_non_owner_before_ui_mutation(tmp_path, monkeypatch):
+    """Verify ForgeDecisionEditModal.on_submit blocks unauthorized users before disabling buttons or executing."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    db_path = tmp_path / "forge.db"
+    forge_mod.init_forge_db(db_path)
+
+    exec_called = []
+    monkeypatch.setattr(forge_mod, "execute_decision", lambda *a, **kw: exec_called.append(a) or {"ok": True})
+
+    async def _run():
+        modal = forge_mod.ForgeDecisionEditModal("dec-owner-guard", {"cmd": "echo hi"}, db_path=db_path)
+        interaction = MagicMock()
+        interaction.user.id = forge_mod.OWNER_USER_ID + 12345
+        interaction.response.send_message = AsyncMock()
+        interaction.response.defer = AsyncMock()
+        interaction.message = MagicMock()
+        interaction.message.edit = AsyncMock()
+
+        await modal.on_submit(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        interaction.response.defer.assert_not_awaited()
+        interaction.message.edit.assert_not_awaited()
+        assert exec_called == []
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
