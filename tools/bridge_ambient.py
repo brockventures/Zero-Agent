@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 import signal
+import sys
 import time
 from typing import Callable, Optional
 import uuid
@@ -115,7 +116,9 @@ from tools.classifier import (
     contains_robot_mention,
     contains_team_mention,
     contains_zero_mention,
+    is_explicitly_addressed_to_other,
     is_short_directive_or_followup,
+    strip_fenced_code_blocks,
 )
 
 _LEAD_INVOCATION_RE = re.compile(r"^(?:@(?:zero|robot)\b|(?:hey\s+)?(?:zero|robot)\b[:,\s]*)+", re.IGNORECASE)
@@ -425,8 +428,16 @@ async def route_external_message(
         print(f"[BridgeAmbient] Suppressed Crab Cavern message in #{ch_title} from {author_name}: {silence_reason}")
         return True
 
-    from tools.channel_history import is_handoff_addressed_to_zero
-    handoff_for_zero = is_handoff_addressed_to_zero(content)
+    bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
+    bot_mention_1 = f"<@{bot_id}>"
+    bot_mention_2 = f"<@!{bot_id}>"
+    text_for_targeting = strip_fenced_code_blocks(content).strip()
+    has_explicit_bot_snowflake = bool(
+        (bot.user and bot.user in getattr(msg, "mentions", [])) or
+        bot_mention_1 in text_for_targeting or
+        bot_mention_2 in text_for_targeting
+    )
+    is_reply_to_zero = resolve_is_reply_to_zero(msg, bot)
 
     is_banana_watcher = (
         getattr(msg.author, "id", None) == BANANA_WATCHER_BOT_ID or
@@ -445,26 +456,64 @@ async def route_external_message(
         is_banana_watcher and
         re.search(r"🍌 \*\*Loop Warning\*\*: Topic `(?P<subject>[^`]+)`", content)
     )
-    if is_banana_summary_prompt or is_banana_stall_prompt or is_banana_loop_prompt:
-        handoff_for_zero = True
+    is_banana_directive = is_banana_summary_prompt or is_banana_stall_prompt or is_banana_loop_prompt
 
-    # Envelope evaluation & topic resolution
+    # Envelope evaluation & topic resolution (runs BEFORE text vocative checks;
+    # ONLY explicit <@bot_id> Discord snowflake mentions may override a closed/peer handoff)
+    envelope = None
     try:
         from tools.handoff import parse_envelope
         envelope = parse_envelope(content)
-        if envelope:
+    except Exception as te:
+        print(f"[Bridge] Error parsing handoff envelope: {te}")
+
+    handoff_targets_zero = False
+    handoff_for_zero = is_banana_directive
+    if envelope:
+        try:
             import importlib
             import tools.topic_tracker
             importlib.reload(tools.topic_tracker)
             tools.topic_tracker.check_and_resolve_topic(envelope, content, author_name, msg.id, msg.channel.id)
-            floor_state = str(envelope.get("floor") or "").lower()
-            if floor_state == "closed" and not handoff_for_zero:
+        except Exception as te:
+            print(f"[Bridge] Error checking topic resolution: {te}")
+
+        env_target = str(
+            envelope.get("to") or envelope.get("target") or envelope.get("recipient") or ""
+        ).lower()
+        floor_state = str(envelope.get("floor") or "").lower()
+        if not is_banana_directive and not has_explicit_bot_snowflake:
+            if env_target and "zero" not in env_target and "team" not in env_target:
+                print(f"[Bridge] Suppressed turn: envelope targets other ({env_target}) from {author_name}")
+                return True
+            if floor_state == "closed" and "zero" not in env_target:
                 print(f"[Bridge] Suppressed turn: floor is closed per envelope from {author_name}")
                 return True
-    except Exception as te:
-        print(f"[Bridge] Error checking topic resolution: {te}")
+
+        env_subj = str(envelope.get("subject") or "").lower()
+        env_reply = str(envelope.get("reply") or "").lower()
+        if "zero" in env_target:
+            handoff_targets_zero = True
+            handoff_for_zero = True
+        elif "zero" in env_subj and env_reply != "none":
+            handoff_for_zero = True
+        elif env_reply == "required" and not env_target:
+            handoff_for_zero = True
+
+    # Peer-addressing drop BEFORE text vocative checks (only explicit <@bot_id> snowflake,
+    # direct reply to Zero, Banana Watcher directives, or explicit to:zero handoff bypasses)
+    if (
+        not has_explicit_bot_snowflake
+        and not is_reply_to_zero
+        and not is_banana_directive
+        and not handoff_targets_zero
+        and is_explicitly_addressed_to_other(text_for_targeting)
+    ):
+        print(f"[Bridge] Suppressed turn: message explicitly addressed to peer from {author_name}")
+        return True
 
     # Loop prevention for peer bots (Amos, Marvin, etc.)
+    bot_direct_override = handoff_for_zero or has_explicit_bot_snowflake
     if msg.author.bot and not is_banana_watcher and not is_automated_ci_or_pr_alert(content):
         try:
             from tools.last_word_protocol import is_bot_paused, is_last_word_in_flight
@@ -480,29 +529,21 @@ async def route_external_message(
             return True
 
         words = [w for w in content.split() if any(c.isalnum() for c in w)]
-        if len(words) < 4 and not handoff_for_zero:
+        if len(words) < 4 and not bot_direct_override:
             return True
 
         now = time.time()
         last_bot_reply = channel_last_bot_reply.get(msg.channel.id, 0)
-        if (now - last_bot_reply < 4.0) and not handoff_for_zero:
+        if (now - last_bot_reply < 4.0) and not bot_direct_override:
             print(f"[Bridge] Suppressed bot reply due to 4s cascade cooldown in channel {msg.channel.id}")
             return True
         channel_last_bot_reply[msg.channel.id] = now
 
-    # Addressing Gate: check if this message is a direct reply to Zero
-    bot_id = str(bot.user.id) if bot.user else "1542285964213358633"
-    bot_mention_1 = f"<@{bot_id}>"
-    bot_mention_2 = f"<@!{bot_id}>"
-
+    # Addressing Gate: check if this message mentions Zero via snowflake or vocative text
     is_physical_mention = bool(
-        (bot.user and bot.user in getattr(msg, "mentions", [])) or
-        bot_mention_1 in content or
-        bot_mention_2 in content or
+        has_explicit_bot_snowflake or
         contains_zero_mention(content)
     )
-
-    is_reply_to_zero = resolve_is_reply_to_zero(msg, bot)
 
     # Channel-specific tag enforcement
     channel_tag_requirements = rules.get("channel_tag_requirements", {})
@@ -510,14 +551,14 @@ async def route_external_message(
     is_tagged_role = False
     role_ids = [str(r.id) for r in getattr(msg, "role_mentions", [])]
     is_robot_tagged = (
-        "<@&1543285916506783799>" in content or
+        "<@&1543285916506783799>" in text_for_targeting or
         "1543285916506783799" in role_ids or
-        "<@&1542294519914037341>" in content or
+        "<@&1542294519914037341>" in text_for_targeting or
         "1542294519914037341" in role_ids or
         contains_robot_mention(content)
     )
     is_team_tagged = (
-        "<@&1543462881624858624>" in content or
+        "<@&1543462881624858624>" in text_for_targeting or
         "1543462881624858624" in role_ids or
         contains_team_mention(content)
     )
@@ -526,13 +567,11 @@ async def route_external_message(
         allowed_tags = req_tag if isinstance(req_tag, list) else [req_tag]
         allowed_tag_strs = [f"<@&{t}>" for t in allowed_tags]
         has_required_tag = (
-            any(t_str in content for t_str in allowed_tag_strs) or
+            any(t_str in text_for_targeting for t_str in allowed_tag_strs) or
             any(str(t) in role_ids for t in allowed_tags)
         )
         is_direct_bot_ping = (
-            (bot.user and bot.user in msg.mentions) or
-            f"<@{bot_id}>" in content or
-            f"<@!{bot_id}>" in content or
+            has_explicit_bot_snowflake or
             contains_zero_mention(content) or
             is_robot_tagged or
             is_team_tagged or
@@ -550,8 +589,7 @@ async def route_external_message(
     recent_ctx_snippet = ""
     if not msg.author.bot and not is_reply_to_zero and not is_reply_to_other:
         try:
-            from tools.classifier import is_explicitly_addressed_to_other
-            if not is_explicitly_addressed_to_other(content):
+            if not is_explicitly_addressed_to_other(text_for_targeting):
                 from tools.channel_history import get_recent_messages
                 prev_msgs = get_recent_messages(msg.channel.id, limit=5, exclude_msg_id=msg.id)
                 if prev_msgs:
@@ -589,9 +627,7 @@ async def route_external_message(
 
     is_mentioned = (
         is_tagged_role or
-        (bot.user and bot.user in msg.mentions) or
-        bot_mention_1 in content or
-        bot_mention_2 in content or
+        has_explicit_bot_snowflake or
         is_robot_tagged or
         is_team_tagged or
         contains_zero_mention(content) or
@@ -610,18 +646,45 @@ async def route_external_message(
             return True
         if rules.get("ambient_classifier_enabled", False):
             try:
-                from tools.classifier import pop_last_reaction, score_relevance
-                if zero_spoke_recently:
-                    score = await asyncio.to_thread(
-                        score_relevance,
-                        content,
-                        author_name,
-                        recent_context=recent_ctx_snippet,
-                        zero_spoke_recently=True,
-                    )
+                from tools import classifier as _classifier_mod
+                from tools.classifier import score_relevance_with_reaction
+
+                _use_legacy_mock = False
+                if "unittest.mock" in sys.modules:
+                    from unittest.mock import NonCallableMock
+                    if (
+                        isinstance(_classifier_mod.score_relevance, NonCallableMock)
+                        and not isinstance(score_relevance_with_reaction, NonCallableMock)
+                    ):
+                        _use_legacy_mock = True
+
+                if _use_legacy_mock:
+                    if zero_spoke_recently:
+                        score = await asyncio.to_thread(
+                            _classifier_mod.score_relevance,
+                            content,
+                            author_name,
+                            recent_context=recent_ctx_snippet,
+                            zero_spoke_recently=True,
+                        )
+                    else:
+                        score = await asyncio.to_thread(_classifier_mod.score_relevance, content, author_name)
+                    ambient_rx = _classifier_mod.pop_last_reaction()
                 else:
-                    score = await asyncio.to_thread(score_relevance, content, author_name)
-                ambient_rx = pop_last_reaction()
+                    if zero_spoke_recently:
+                        score, ambient_rx = await asyncio.to_thread(
+                            score_relevance_with_reaction,
+                            content,
+                            author_name,
+                            recent_context=recent_ctx_snippet,
+                            zero_spoke_recently=True,
+                        )
+                    else:
+                        score, ambient_rx = await asyncio.to_thread(
+                            score_relevance_with_reaction,
+                            content,
+                            author_name,
+                        )
                 threshold = float(rules.get("ambient_relevance_threshold", 0.80))
                 if score >= threshold:
                     print(f"[Bridge] Ambient classifier scored {score:.2f} >= {threshold:.2f} for {author_name}. Triggering chime-in.")

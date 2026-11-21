@@ -21,16 +21,23 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import io
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -65,43 +72,150 @@ VAULT_REPO_DIR = WORKSPACE_DIR / "data" / "zero_vault_repo"
 VAULT_REMOTE_URL = "https://github.com/brockventures/Zero-Vault.git"
 
 
-def get_or_create_master_key(key_path: Path = MASTER_KEY_FILE) -> bytes:
-    """Load or generate the 256-bit (32-byte) AES-GCM master key."""
-    candidates = [
-        key_path,
-        Path.home() / ".gemini" / ".vault_master.key",
-        SECRETS_DIR / ".vault_master.key",
-        WORKSPACE_DIR / "secrets" / ".vault_master.key",
-        Path("/root/.gemini/.vault_master.key"),
-    ]
+def _write_secret_bytes(path: Path, data: bytes) -> None:
+    """Write sensitive file contents with 0o600 permissions enforced."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        f = os.fdopen(fd, "wb")
+    except Exception:
+        os.close(fd)
+        raise
+    with f:
+        f.write(data)
+    os.chmod(path, 0o600)
+
+
+def _run_git(
+    args: list[str],
+    cwd: Path,
+    *,
+    check: bool = False,
+    text: bool = False,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess:
+    """Run a git subprocess with stdin=DEVNULL and a bounded timeout."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=text,
+        check=check,
+        timeout=timeout,
+    )
+
+
+@contextlib.contextmanager
+def _vault_lock(repo_dir: Path):
+    """Acquire an exclusive flock lock guarding concurrent sync_vault/pull_vault operations."""
+    repo_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = repo_dir.parent / f".{repo_dir.name}.lock"
+    if fcntl is None:
+        yield
+        return
+    with open(lock_path, "a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _safe_fetch_and_sync_main(repo_dir: Path) -> bool:
+    """Fetch origin/main and update local main without discarding unpushed local commits.
+
+    Returns True if fetch succeeded, False otherwise. Never runs `git checkout -B`
+    when `git fetch` fails or when local HEAD has unpushed commits ahead of origin/main.
+    """
+    try:
+        fetch_proc = _run_git(["fetch", "origin", "main"], repo_dir, timeout=30)
+    except Exception:
+        return False
+    if fetch_proc.returncode != 0:
+        return False
+
+    try:
+        # Check whether local HEAD has unpushed commits ahead of origin/main
+        ahead_proc = _run_git(["rev-list", "--count", "origin/main..HEAD"], repo_dir, text=True, timeout=30)
+        ahead_count = 0
+        if ahead_proc.returncode == 0 and ahead_proc.stdout.strip().isdigit():
+            ahead_count = int(ahead_proc.stdout.strip())
+        if ahead_count > 0:
+            rebase_proc = _run_git(["rebase", "origin/main"], repo_dir, timeout=30)
+            if rebase_proc.returncode != 0:
+                _run_git(["rebase", "--abort"], repo_dir, timeout=30)
+        else:
+            _run_git(["checkout", "-B", "main", "origin/main"], repo_dir, check=True, timeout=30)
+    except Exception:
+        return False
+    return True
+
+
+def load_master_key(key_path: Path | None = None) -> bytes:
+    """Load the existing 256-bit (32-byte) AES-GCM master key (read-only; never creates a new key)."""
+    if key_path is not None:
+        candidates = [Path(key_path)]
+    else:
+        candidates = [
+            MASTER_KEY_FILE,
+            Path.home() / ".gemini" / ".vault_master.key",
+            SECRETS_DIR / ".vault_master.key",
+            WORKSPACE_DIR / "secrets" / ".vault_master.key",
+            Path("/root/.gemini/.vault_master.key"),
+        ]
+    seen: list[Path] = []
+    invalid_errors: list[str] = []
     for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.append(candidate)
         try:
             if candidate.exists():
                 raw = candidate.read_text(encoding="utf-8").strip()
                 key = base64.urlsafe_b64decode(raw.encode("ascii"))
                 if len(key) == 32:
                     return key
-        except OSError:
+                invalid_errors.append(f"{candidate} (expected 32 bytes, got {len(key)})")
+        except (OSError, ValueError) as e:
+            invalid_errors.append(f"{candidate} ({e})")
             continue
-    key = AESGCM.generate_key(bit_length=256)
-    encoded = base64.urlsafe_b64encode(key).decode("ascii")
+    if invalid_errors:
+        raise ValueError(f"Invalid vault master key file(s): {', '.join(invalid_errors)}")
+    searched = ", ".join(str(c) for c in seen)
+    raise FileNotFoundError(f"Vault master key (.vault_master.key) not found. Searched: {searched}")
+
+
+def get_or_create_master_key(key_path: Path | None = None) -> bytes:
+    """Load or generate the 256-bit (32-byte) AES-GCM master key (for explicit init / sync only)."""
     try:
-        key_path.parent.mkdir(parents=True, exist_ok=True)
-        key_path.write_text(encoded + "\n", encoding="utf-8")
-        os.chmod(key_path, 0o600)
+        return load_master_key(key_path=key_path)
+    except FileNotFoundError:
+        pass
+    target = Path(key_path) if key_path is not None else MASTER_KEY_FILE
+    key = AESGCM.generate_key(bit_length=256)
+    encoded = (base64.urlsafe_b64encode(key).decode("ascii") + "\n").encode("utf-8")
+    try:
+        _write_secret_bytes(target, encoded)
     except OSError:
         fallback = Path.home() / ".gemini" / ".vault_master.key"
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        fallback.write_text(encoded + "\n", encoding="utf-8")
+        _write_secret_bytes(fallback, encoded)
     return key
 
 
 def encrypt_secrets_archive(
-    secrets_dir: Path = SECRETS_DIR,
-    output_file: Path = VAULT_REPO_DIR / "secrets" / "secrets.tar.gz.enc",
-    key_path: Path = MASTER_KEY_FILE,
+    secrets_dir: Path | None = None,
+    output_file: Path | None = None,
+    key_path: Path | None = None,
 ) -> dict:
     """Pack /secrets/ into an in-memory tar.gz and encrypt with 256-bit AES-GCM."""
+    effective_secrets_dir = SECRETS_DIR if secrets_dir is None else Path(secrets_dir)
+    effective_output_file = (
+        VAULT_REPO_DIR / "secrets" / "secrets.tar.gz.enc"
+        if output_file is None
+        else Path(output_file)
+    )
+    effective_key_name = (MASTER_KEY_FILE if key_path is None else Path(key_path)).name
     key = get_or_create_master_key(key_path)
     aesgcm = AESGCM(key)
     nonce = os.urandom(12)
@@ -109,9 +223,9 @@ def encrypt_secrets_archive(
     buf = io.BytesIO()
     included_files = []
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        if secrets_dir.exists():
-            for item in sorted(secrets_dir.iterdir()):
-                if item.name == key_path.name or item.name.startswith(".vault_"):
+        if effective_secrets_dir.exists():
+            for item in sorted(effective_secrets_dir.iterdir()):
+                if item.name == effective_key_name or item.name.startswith(".vault_"):
                     continue
                 if item.is_file():
                     tar.add(str(item), arcname=item.name)
@@ -120,24 +234,29 @@ def encrypt_secrets_archive(
     plaintext_bytes = buf.getvalue()
     ciphertext = aesgcm.encrypt(nonce, plaintext_bytes, b"zero-vault-secrets-v1")
 
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    effective_output_file.parent.mkdir(parents=True, exist_ok=True)
     # File format: magic header b"ZVLT1" (5 bytes) + 12-byte nonce + ciphertext
     payload = b"ZVLT1" + nonce + ciphertext
-    output_file.write_bytes(payload)
+    effective_output_file.write_bytes(payload)
     return {
-        "encrypted_file": str(output_file),
+        "encrypted_file": str(effective_output_file),
         "included_count": len(included_files),
         "ciphertext_bytes": len(payload),
     }
 
 
 def _decrypt_archive_bytes(
-    encrypted_file: Path = VAULT_REPO_DIR / "secrets" / "secrets.tar.gz.enc",
-    key_path: Path = MASTER_KEY_FILE,
+    encrypted_file: Path | None = None,
+    key_path: Path | None = None,
 ) -> bytes:
-    """Decrypt `secrets.tar.gz.enc` and return raw tar.gz bytes."""
-    key = get_or_create_master_key(key_path)
-    raw = encrypted_file.read_bytes()
+    """Decrypt `secrets.tar.gz.enc` and return raw tar.gz bytes using read-only load_master_key()."""
+    effective_encrypted_file = (
+        VAULT_REPO_DIR / "secrets" / "secrets.tar.gz.enc"
+        if encrypted_file is None
+        else Path(encrypted_file)
+    )
+    key = load_master_key(key_path)
+    raw = effective_encrypted_file.read_bytes()
     if not raw.startswith(b"ZVLT1") or len(raw) < 18:
         raise ValueError("Invalid ZVLT1 encrypted archive header.")
     nonce = raw[5:17]
@@ -147,8 +266,8 @@ def _decrypt_archive_bytes(
 
 
 def decrypt_secrets_archive(
-    encrypted_file: Path = VAULT_REPO_DIR / "secrets" / "secrets.tar.gz.enc",
-    key_path: Path = MASTER_KEY_FILE,
+    encrypted_file: Path | None = None,
+    key_path: Path | None = None,
 ) -> list[str]:
     """Verify/decrypt `secrets.tar.gz.enc` and return list of contained member filenames."""
     plaintext = _decrypt_archive_bytes(encrypted_file=encrypted_file, key_path=key_path)
@@ -158,11 +277,11 @@ def decrypt_secrets_archive(
 
 
 def extract_secrets_archive(
-    encrypted_file: Path = VAULT_REPO_DIR / "secrets" / "secrets.tar.gz.enc",
+    encrypted_file: Path | None = None,
     target_dirs: list[Path] | None = None,
-    key_path: Path = MASTER_KEY_FILE,
+    key_path: Path | None = None,
 ) -> list[str]:
-    """Decrypt and extract `secrets.tar.gz.enc` into target secret directories."""
+    """Decrypt and extract `secrets.tar.gz.enc` into target secret directories with 0o600 permissions."""
     plaintext = _decrypt_archive_bytes(encrypted_file=encrypted_file, key_path=key_path)
     if target_dirs is None:
         target_dirs = [SECRETS_DIR]
@@ -180,7 +299,7 @@ def extract_secrets_archive(
                 fobj = tar.extractfile(member)
                 if fobj is not None:
                     out_path = dest / Path(member.name).name
-                    out_path.write_bytes(fobj.read())
+                    _write_secret_bytes(out_path, fobj.read())
                     if out_path.name not in extracted_names:
                         extracted_names.append(out_path.name)
     return extracted_names
@@ -190,10 +309,10 @@ def ensure_vault_repo_initialized(repo_dir: Path = VAULT_REPO_DIR) -> None:
     """Initialize local clone of brockventures/Zero-Vault with mandatory README.md and AGENTS.md."""
     repo_dir.mkdir(parents=True, exist_ok=True)
     if not (repo_dir / ".git").exists():
-        subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
-        subprocess.run(["git", "remote", "add", "origin", VAULT_REMOTE_URL], cwd=str(repo_dir), capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Zero Agent"], cwd=str(repo_dir), capture_output=True)
-    subprocess.run(["git", "config", "user.email", "noreply@github.com"], cwd=str(repo_dir), capture_output=True)
+        _run_git(["init", "-b", "main"], repo_dir, check=True)
+        _run_git(["remote", "add", "origin", VAULT_REMOTE_URL], repo_dir)
+    _run_git(["config", "user.name", "Zero Agent"], repo_dir)
+    _run_git(["config", "user.email", "noreply@github.com"], repo_dir)
 
     readme = repo_dir / "README.md"
     if not readme.exists():
@@ -234,11 +353,11 @@ def _get_git_file_commit_timestamps(repo_dir: Path) -> dict[str, float]:
     if not (repo_dir / ".git").exists():
         return {}
     try:
-        proc = subprocess.run(
-            ["git", "log", "--format=__COMMIT__%ct", "--name-only"],
-            cwd=str(repo_dir),
-            capture_output=True,
+        proc = _run_git(
+            ["log", "--format=__COMMIT__%ct", "--name-only"],
+            repo_dir,
             text=True,
+            timeout=30,
         )
         if proc.returncode != 0:
             return {}
@@ -296,140 +415,140 @@ def sync_vault(
     fetch_remote: bool = True,
     prune: bool = False,
     is_prime: bool | None = None,
+    key_path: Path | None = None,
+    secrets_dir: Path | None = None,
 ) -> dict:
     """Stage durable gitignored state + AES-256-GCM encrypted secrets into Zero-Vault and push."""
     if is_prime is None:
         is_prime = is_zero_prime()
 
-    ensure_vault_repo_initialized(repo_dir)
+    effective_secrets_dir = SECRETS_DIR if secrets_dir is None else Path(secrets_dir)
 
-    # 0. Fetch remote before staging if enabled and git repo exists
-    if fetch_remote and (repo_dir / ".git").exists():
-        try:
-            fetch_proc = subprocess.run(
-                ["git", "fetch", "origin", "main"],
-                cwd=str(repo_dir),
-                capture_output=True,
-                timeout=30,
-            )
-            if fetch_proc.returncode == 0:
-                subprocess.run(
-                    ["git", "checkout", "-B", "main", "origin/main"],
-                    cwd=str(repo_dir),
-                    check=True,
-                    capture_output=True,
-                    timeout=30,
-                )
-        except Exception:
-            pass
+    with _vault_lock(repo_dir):
+        ensure_vault_repo_initialized(repo_dir)
 
-    commit_timestamps = _get_git_file_commit_timestamps(repo_dir)
+        # 0. Fetch remote before staging if enabled and git repo exists
+        if fetch_remote and (repo_dir / ".git").exists():
+            _safe_fetch_and_sync_main(repo_dir)
 
-    # 1. Safe file-by-file merge of memory/
-    src_mem = workspace_dir / "memory"
-    dst_mem = repo_dir / "memory"
-    skipped_stale_files: list[str] = []
-    preserved_remote_only_files: list[str] = []
+        commit_timestamps = _get_git_file_commit_timestamps(repo_dir)
 
-    if src_mem.exists():
-        for src_file in sorted(src_mem.rglob("*")):
-            if not src_file.is_file():
-                continue
-            rel = src_file.relative_to(src_mem).as_posix()
-            dst_file = dst_mem / rel
+        # 1. Safe file-by-file merge of memory/
+        src_mem = workspace_dir / "memory"
+        dst_mem = repo_dir / "memory"
+        skipped_stale_files: list[str] = []
+        preserved_remote_only_files: list[str] = []
 
-            if dst_file.exists():
-                if src_file.read_bytes() == dst_file.read_bytes():
+        if src_mem.exists():
+            for src_file in sorted(src_mem.rglob("*")):
+                if not src_file.is_file():
                     continue
-                remote_ts = commit_timestamps.get(f"memory/{rel}", 0.0)
-                if not is_prime and remote_ts > 0.0 and (src_file.stat().st_mtime + 2.0) < remote_ts:
-                    skipped_stale_files.append(rel)
-                    shutil.copy2(dst_file, src_file)
+                rel = src_file.relative_to(src_mem).as_posix()
+                dst_file = dst_mem / rel
+
+                if dst_file.exists():
+                    if src_file.read_bytes() == dst_file.read_bytes():
+                        continue
+                    remote_ts = commit_timestamps.get(f"memory/{rel}", 0.0)
+                    if not is_prime and remote_ts > 0.0 and (src_file.stat().st_mtime + 2.0) < remote_ts:
+                        skipped_stale_files.append(rel)
+                        shutil.copy2(dst_file, src_file)
+                    else:
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst_file)
                 else:
                     dst_file.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src_file, dst_file)
-            else:
-                dst_file.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_file, dst_file)
 
-    if dst_mem.exists():
-        for dst_file in sorted(dst_mem.rglob("*")):
-            if not dst_file.is_file():
-                continue
-            rel = dst_file.relative_to(dst_mem).as_posix()
-            src_file = src_mem / rel
-            if not src_file.exists():
-                if prune and is_prime:
-                    dst_file.unlink()
-                else:
-                    preserved_remote_only_files.append(rel)
-                    src_file.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(dst_file, src_file)
+        if dst_mem.exists():
+            for dst_file in sorted(dst_mem.rglob("*")):
+                if not dst_file.is_file():
+                    continue
+                rel = dst_file.relative_to(dst_mem).as_posix()
+                src_file = src_mem / rel
+                if not src_file.exists():
+                    if prune and is_prime:
+                        dst_file.unlink()
+                    else:
+                        preserved_remote_only_files.append(rel)
+                        src_file.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(dst_file, src_file)
 
-    # 2. Mirror schedule.json
-    dst_cfg = repo_dir / "config"
-    dst_cfg.mkdir(parents=True, exist_ok=True)
-    sched_src = workspace_dir / "data" / "schedule.json"
-    if not sched_src.exists():
-        sched_src = workspace_dir / "config" / "schedule.json"
-    if sched_src.exists():
-        if is_prime or not (dst_cfg / "schedule.json").exists():
-            shutil.copy2(sched_src, dst_cfg / "schedule.json")
+        # 2. Mirror schedule.json
+        dst_cfg = repo_dir / "config"
+        dst_cfg.mkdir(parents=True, exist_ok=True)
+        sched_src = workspace_dir / "data" / "schedule.json"
+        if not sched_src.exists():
+            sched_src = workspace_dir / "config" / "schedule.json"
+        if sched_src.exists():
+            if is_prime or not (dst_cfg / "schedule.json").exists():
+                shutil.copy2(sched_src, dst_cfg / "schedule.json")
 
-    # 3. Mirror private memory tools
-    dst_tools = repo_dir / "tools"
-    dst_tools.mkdir(parents=True, exist_ok=True)
-    for tname in ("promote_memory.py", "pack_shard.py"):
-        tsrc = workspace_dir / "tools" / tname
-        if tsrc.exists():
-            shutil.copy2(tsrc, dst_tools / tname)
+        # 3. Mirror private memory tools
+        dst_tools = repo_dir / "tools"
+        dst_tools.mkdir(parents=True, exist_ok=True)
+        for tname in ("promote_memory.py", "pack_shard.py"):
+            tsrc = workspace_dir / "tools" / tname
+            if tsrc.exists():
+                shutil.copy2(tsrc, dst_tools / tname)
 
-    # 4. Encrypt /secrets/ into secrets/secrets.tar.gz.enc
-    enc_file = repo_dir / "secrets" / "secrets.tar.gz.enc"
-    enc_info = None
-    if is_prime or not enc_file.exists():
-        try:
-            enc_info = encrypt_secrets_archive(
-                secrets_dir=SECRETS_DIR,
-                output_file=enc_file,
-                key_path=MASTER_KEY_FILE,
+        # 4. Encrypt /secrets/ into secrets/secrets.tar.gz.enc
+        enc_file = repo_dir / "secrets" / "secrets.tar.gz.enc"
+        enc_info = None
+        if is_prime or not enc_file.exists():
+            try:
+                enc_info = encrypt_secrets_archive(
+                    secrets_dir=effective_secrets_dir,
+                    output_file=enc_file,
+                    key_path=key_path,
+                )
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "error": f"Secrets encryption failed: {e}",
+                    "repo_dir": str(repo_dir),
+                    "commit_sha": "error",
+                    "changed_files": 0,
+                    "encrypted_secrets": None,
+                    "skipped_stale_files_count": len(skipped_stale_files),
+                    "skipped_stale_files": skipped_stale_files,
+                    "preserved_remote_only_files_count": len(preserved_remote_only_files),
+                    "preserved_remote_only_files": preserved_remote_only_files,
+                    "preserved_local_edits_count": 0,
+                }
+
+        # 5. Stage, commit, and push
+        _run_git(["add", "-A"], repo_dir, check=True)
+        st = _run_git(["status", "--porcelain"], repo_dir, text=True)
+        changed_count = len([line for line in st.stdout.splitlines() if line.strip()])
+        sha = "clean"
+
+        if changed_count > 0:
+            now_pt = datetime.now(timezone.utc).astimezone(PT_TZ).strftime("%Y-%m-%d %I:%M:%S %p PT")
+            _run_git(
+                ["commit", "-m", f"chore(vault): sync memory, schedule, and encrypted secrets ({now_pt})"],
+                repo_dir,
+                check=True,
             )
-        except Exception:
-            pass
+            if push:
+                _run_git(["push", "-u", "origin", "main"], repo_dir, check=True, timeout=30)
 
-    # 5. Stage, commit, and push
-    subprocess.run(["git", "add", "-A"], cwd=str(repo_dir), check=True, capture_output=True)
-    st = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo_dir), capture_output=True, text=True)
-    changed_count = len([line for line in st.stdout.splitlines() if line.strip()])
-    sha = "clean"
+        rev = _run_git(["rev-parse", "--short", "HEAD"], repo_dir, text=True)
+        if rev.returncode == 0:
+            sha = rev.stdout.strip()
 
-    if changed_count > 0:
-        now_pt = datetime.now(timezone.utc).astimezone(PT_TZ).strftime("%Y-%m-%d %I:%M:%S %p PT")
-        subprocess.run(
-            ["git", "commit", "-m", f"chore(vault): sync memory, schedule, and encrypted secrets ({now_pt})"],
-            cwd=str(repo_dir),
-            check=True,
-            capture_output=True,
-        )
-        if push:
-            subprocess.run(["git", "push", "-u", "origin", "main"], cwd=str(repo_dir), check=True, capture_output=True, timeout=30)
-
-    rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(repo_dir), capture_output=True, text=True)
-    if rev.returncode == 0:
-        sha = rev.stdout.strip()
-
-    return {
-        "ok": True,
-        "repo_dir": str(repo_dir),
-        "commit_sha": sha,
-        "changed_files": changed_count,
-        "encrypted_secrets": enc_info,
-        "skipped_stale_files_count": len(skipped_stale_files),
-        "skipped_stale_files": skipped_stale_files,
-        "preserved_remote_only_files_count": len(preserved_remote_only_files),
-        "preserved_remote_only_files": preserved_remote_only_files,
-        "preserved_local_edits_count": 0,
-    }
+        return {
+            "ok": True,
+            "repo_dir": str(repo_dir),
+            "commit_sha": sha,
+            "changed_files": changed_count,
+            "encrypted_secrets": enc_info,
+            "skipped_stale_files_count": len(skipped_stale_files),
+            "skipped_stale_files": skipped_stale_files,
+            "preserved_remote_only_files_count": len(preserved_remote_only_files),
+            "preserved_remote_only_files": preserved_remote_only_files,
+            "preserved_local_edits_count": 0,
+        }
 
 
 def pull_vault(
@@ -437,96 +556,105 @@ def pull_vault(
     workspace_dir: Path = WORKSPACE_DIR,
     pull_remote: bool = True,
     preserve_newer_local: bool = True,
+    key_path: Path | None = None,
+    secrets_dir: Path | None = None,
 ) -> dict:
     """Pull Zero-Vault and hydrate memory/, config/schedule.json, private tools, and decrypted secrets."""
-    if pull_remote and (repo_dir / ".git").exists():
-        try:
-            fetch_proc = subprocess.run(["git", "fetch", "origin", "main"], cwd=str(repo_dir), capture_output=True, timeout=30)
-            if fetch_proc.returncode == 0:
-                subprocess.run(["git", "checkout", "-B", "main", "origin/main"], cwd=str(repo_dir), check=True, capture_output=True, timeout=30)
-        except Exception:
-            pass
+    effective_secrets_dir = SECRETS_DIR if secrets_dir is None else Path(secrets_dir)
 
-    last_pull_ts = _load_last_pull_ts(workspace_dir)
-    commit_timestamps = _get_git_file_commit_timestamps(repo_dir)
+    with _vault_lock(repo_dir):
+        if pull_remote and (repo_dir / ".git").exists():
+            _safe_fetch_and_sync_main(repo_dir)
 
-    # 1. Hydrate memory/
-    src_mem = repo_dir / "memory"
-    dst_mem = workspace_dir / "memory"
-    memory_files = 0
-    preserved_local_edits: list[str] = []
+        last_pull_ts = _load_last_pull_ts(workspace_dir)
+        commit_timestamps = _get_git_file_commit_timestamps(repo_dir)
 
-    if src_mem.exists():
-        for src_file in sorted(src_mem.rglob("*")):
-            if not src_file.is_file():
-                continue
-            rel = src_file.relative_to(src_mem).as_posix()
-            dst_file = dst_mem / rel
-            should_copy = True
+        # 1. Hydrate memory/
+        src_mem = repo_dir / "memory"
+        dst_mem = workspace_dir / "memory"
+        memory_files = 0
+        preserved_local_edits: list[str] = []
 
-            if dst_file.exists():
-                if src_file.read_bytes() == dst_file.read_bytes():
-                    should_copy = False
-                elif preserve_newer_local:
-                    remote_ts = commit_timestamps.get(f"memory/{rel}", 0.0)
-                    cutoff_ts = max(last_pull_ts, remote_ts)
-                    if cutoff_ts > 0.0 and dst_file.stat().st_mtime > (cutoff_ts + 2.0):
-                        preserved_local_edits.append(rel)
+        if src_mem.exists():
+            for src_file in sorted(src_mem.rglob("*")):
+                if not src_file.is_file():
+                    continue
+                rel = src_file.relative_to(src_mem).as_posix()
+                dst_file = dst_mem / rel
+                should_copy = True
+
+                if dst_file.exists():
+                    if src_file.read_bytes() == dst_file.read_bytes():
                         should_copy = False
+                    elif preserve_newer_local:
+                        remote_ts = commit_timestamps.get(f"memory/{rel}", 0.0)
+                        cutoff_ts = max(last_pull_ts, remote_ts)
+                        if cutoff_ts > 0.0 and dst_file.stat().st_mtime > (cutoff_ts + 2.0):
+                            preserved_local_edits.append(rel)
+                            should_copy = False
 
-            if should_copy:
-                dst_file.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_file, dst_file)
+                if should_copy:
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst_file)
 
-    if dst_mem.exists():
-        memory_files = sum(1 for p in dst_mem.rglob("*") if p.is_file())
+        if dst_mem.exists():
+            memory_files = sum(1 for p in dst_mem.rglob("*") if p.is_file())
 
-    # 2. Hydrate config/schedule.json (and data/schedule.json on non-Prime replicas)
-    src_sched = repo_dir / "config" / "schedule.json"
-    if src_sched.exists():
-        dst_sched = workspace_dir / "config" / "schedule.json"
-        dst_sched.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_sched, dst_sched)
-        if not is_zero_prime():
-            dst_data_sched = workspace_dir / "data" / "schedule.json"
-            dst_data_sched.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_sched, dst_data_sched)
+        # 2. Hydrate config/schedule.json (and data/schedule.json on non-Prime replicas)
+        src_sched = repo_dir / "config" / "schedule.json"
+        if src_sched.exists():
+            dst_sched = workspace_dir / "config" / "schedule.json"
+            dst_sched.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_sched, dst_sched)
+            if not is_zero_prime():
+                dst_data_sched = workspace_dir / "data" / "schedule.json"
+                dst_data_sched.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_sched, dst_data_sched)
 
-    # 3. Hydrate private memory tools
-    src_tools = repo_dir / "tools"
-    dst_tools = workspace_dir / "tools"
-    dst_tools.mkdir(parents=True, exist_ok=True)
-    for tname in ("promote_memory.py", "pack_shard.py"):
-        tsrc = src_tools / tname
-        if tsrc.exists():
-            shutil.copy2(tsrc, dst_tools / tname)
+        # 3. Hydrate private memory tools
+        src_tools = repo_dir / "tools"
+        dst_tools = workspace_dir / "tools"
+        dst_tools.mkdir(parents=True, exist_ok=True)
+        for tname in ("promote_memory.py", "pack_shard.py"):
+            tsrc = src_tools / tname
+            if tsrc.exists():
+                shutil.copy2(tsrc, dst_tools / tname)
 
-    # 4. Decrypt and extract secrets/secrets.tar.gz.enc
-    enc_file = repo_dir / "secrets" / "secrets.tar.gz.enc"
-    extracted: list[str] = []
-    if enc_file.exists():
-        try:
-            extracted = extract_secrets_archive(encrypted_file=enc_file)
-        except Exception:
-            pass
+        # 4. Decrypt and extract secrets/secrets.tar.gz.enc (read-only key load; propagate errors)
+        enc_file = repo_dir / "secrets" / "secrets.tar.gz.enc"
+        extracted: list[str] = []
+        decrypt_error: str | None = None
+        if enc_file.exists():
+            try:
+                extracted = extract_secrets_archive(
+                    encrypted_file=enc_file,
+                    target_dirs=[effective_secrets_dir] if secrets_dir is not None else None,
+                    key_path=key_path,
+                )
+            except Exception as e:
+                decrypt_error = f"Secrets decryption failed: {e}"
 
-    rev = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(repo_dir), capture_output=True, text=True)
-    sha = rev.stdout.strip() if rev.returncode == 0 else "unknown"
+        rev = _run_git(["rev-parse", "--short", "HEAD"], repo_dir, text=True)
+        sha = rev.stdout.strip() if rev.returncode == 0 else "unknown"
 
-    _save_last_pull_ts(sha=sha, file_count=memory_files, workspace_dir=workspace_dir)
+        if decrypt_error is None:
+            _save_last_pull_ts(sha=sha, file_count=memory_files, workspace_dir=workspace_dir)
 
-    return {
-        "ok": True,
-        "repo_dir": str(repo_dir),
-        "commit_sha": sha,
-        "hydrated_memory_files": memory_files,
-        "decrypted_secret_files": len(extracted),
-        "secrets_dir": str(SECRETS_DIR),
-        "preserved_local_edits_count": len(preserved_local_edits),
-        "preserved_local_edits": preserved_local_edits,
-        "skipped_stale_files_count": 0,
-        "preserved_remote_only_files_count": 0,
-    }
+        result = {
+            "ok": decrypt_error is None,
+            "repo_dir": str(repo_dir),
+            "commit_sha": sha,
+            "hydrated_memory_files": memory_files,
+            "decrypted_secret_files": len(extracted),
+            "secrets_dir": str(effective_secrets_dir),
+            "preserved_local_edits_count": len(preserved_local_edits),
+            "preserved_local_edits": preserved_local_edits,
+            "skipped_stale_files_count": 0,
+            "preserved_remote_only_files_count": 0,
+        }
+        if decrypt_error is not None:
+            result["error"] = decrypt_error
+        return result
 
 
 def auto_sync_workstation_if_stale(
@@ -553,12 +681,11 @@ def auto_sync_workstation_if_stale(
     workspace_pull_info = {}
     if (workspace_dir / ".git").exists():
         try:
-            proc = subprocess.run(
-                ["git", "pull", "--ff-only", "origin", "main"],
-                cwd=str(workspace_dir),
-                capture_output=True,
+            proc = _run_git(
+                ["pull", "--ff-only", "origin", "main"],
+                workspace_dir,
                 text=True,
-                timeout=60,
+                timeout=30,
             )
             workspace_pull_info = {
                 "returncode": proc.returncode,
@@ -570,12 +697,15 @@ def auto_sync_workstation_if_stale(
 
     vault_pull_res = pull_vault(repo_dir=repo_dir, workspace_dir=workspace_dir)
 
-    return {
-        "ok": True,
+    res = {
+        "ok": bool(vault_pull_res.get("ok", False)),
         "skipped": False,
         "workspace_pull": workspace_pull_info,
         "vault_pull": vault_pull_res,
     }
+    if not res["ok"] and vault_pull_res.get("error"):
+        res["error"] = vault_pull_res["error"]
+    return res
 
 
 def main():
@@ -599,15 +729,25 @@ def main():
             prune=getattr(args, "prune", False),
         )
         print(json.dumps(res, indent=2))
+        if not res.get("ok"):
+            sys.exit(1)
     elif args.cmd == "pull":
         res = pull_vault(pull_remote=not args.no_fetch)
         print(json.dumps(res, indent=2))
+        if not res.get("ok"):
+            sys.exit(1)
     elif args.cmd == "auto-wake":
         res = auto_sync_workstation_if_stale(max_age_hours=args.max_age_hours)
         print(json.dumps(res, indent=2))
+        if not res.get("ok"):
+            sys.exit(1)
     elif args.cmd == "verify":
-        members = decrypt_secrets_archive()
-        print(json.dumps({"ok": True, "verified_secret_files_count": len(members), "files": members}, indent=2))
+        try:
+            members = decrypt_secrets_archive()
+            print(json.dumps({"ok": True, "verified_secret_files_count": len(members), "files": members}, indent=2))
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": f"Secrets verification failed: {e}"}, indent=2))
+            sys.exit(1)
 
 
 if __name__ == "__main__":

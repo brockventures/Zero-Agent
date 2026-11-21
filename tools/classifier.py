@@ -49,13 +49,25 @@ NON_NAME_NOUNS = (
     r"trust|knowledge|defect|defects|risk|budget|drift|progress)\b"
 )
 
+_FENCED_CODE_BLOCK_RE = re.compile(
+    r"(?P<fence>`{3,}|~{3,}).*?(?:(?P=fence)|$)",
+    re.DOTALL,
+)
+
+
+def strip_fenced_code_blocks(text: str) -> str:
+    """Remove CommonMark fenced code blocks (```...``` / ~~~...~~~) and handoff envelopes."""
+    if not text:
+        return ""
+    return _FENCED_CODE_BLOCK_RE.sub("", text)
+
+
 _ZERO_VOCATIVE_RE = re.compile(
     r"(?:"
     r"@zero\b"
     r"|\b(?:hey|hi|hello|ask|tag|tell|ping|cc)\s+zero\b"
-    r"|(?:^|[\n.!?\s,;])zero\s*(?:[:,]|--?(?:\s+|$))"
+    r"|(?:^|[\n.!?])\s*zero\s*(?:[:,]|--?(?:\s+|$))"
     r"|\bzero\s*[?!]"
-    r"|(?:^|[\n.!?]\s*)zero\b(?:\s+(?!" + NON_NAME_NOUNS + r")\S+|$)"
     r")",
     re.IGNORECASE,
 )
@@ -72,25 +84,39 @@ _TEAM_VOCATIVE_RE = re.compile(
 
 
 def contains_zero_mention(text: str) -> bool:
-    """Check if text addresses Zero via @Zero, vocative greeting/punctuation, or sentence starter (excluding technical 'zero-X' compounds)."""
+    """Check if text addresses Zero via @Zero or vocative greeting/punctuation outside fenced code blocks."""
     if not text:
         return False
-    return bool(_ZERO_VOCATIVE_RE.search(text))
+    cleaned = strip_fenced_code_blocks(text)
+    if not cleaned:
+        return False
+    return bool(_ZERO_VOCATIVE_RE.search(cleaned))
 
 
 def contains_robot_mention(text: str) -> bool:
-    """Check if text addresses @robot via vocative or tag."""
+    """Check if text addresses @robot via vocative or tag outside fenced code blocks."""
     if not text:
         return False
-    return bool(_ROBOT_VOCATIVE_RE.search(text))
+    cleaned = strip_fenced_code_blocks(text)
+    if not cleaned:
+        return False
+    return bool(_ROBOT_VOCATIVE_RE.search(cleaned))
 
 
 def contains_team_mention(text: str) -> bool:
-    """Check if text addresses @team via vocative or tag."""
+    """Check if text addresses @team via vocative or tag outside fenced code blocks."""
     if not text:
         return False
-    return bool(_TEAM_VOCATIVE_RE.search(text))
+    cleaned = strip_fenced_code_blocks(text)
+    if not cleaned:
+        return False
+    return bool(_TEAM_VOCATIVE_RE.search(cleaned))
 
+
+ZERO_SNOWFLAKE_TAGS = [
+    r"<@1542285964213358633>",
+    r"<@!1542285964213358633>",
+]
 
 ZERO_TAGS = [
     r"<@1542285964213358633>",
@@ -226,6 +252,7 @@ class WarmClassifierDaemon:
         if self.proc is not None:
             if not hasattr(self.proc, "poll") or self.proc.poll() is None:
                 return
+            self._shutdown_locked()
         os.makedirs(self.work_dir, exist_ok=True)
         cmd = [
             "agy",
@@ -241,7 +268,7 @@ class WarmClassifierDaemon:
             cwd=self.work_dir,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
         )
@@ -269,6 +296,14 @@ class WarmClassifierDaemon:
                         proc.wait(timeout=1.0)
         except Exception as e:
             print(f"[ClassifierDaemon] Warning during shutdown: {e}", file=sys.stderr)
+        finally:
+            for stream_name in ("stdin", "stdout", "stderr"):
+                stream = getattr(proc, stream_name, None)
+                if stream is not None and hasattr(stream, "close"):
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
 
     def recycle(self):
         """Recycle the persistent worker process."""
@@ -431,41 +466,22 @@ def is_short_directive_or_followup(text: str) -> bool:
     return bool(_DIRECTIVE_OR_FOLLOWUP_RE.search(text.strip()))
 
 
-def score_relevance(
+def score_relevance_with_reaction(
     content: str,
     author: str = "user",
     use_warm: bool | None = None,
     recent_context: str = "",
     zero_spoke_recently: bool = False,
-) -> float:
-    """Score message relevance for Zero using ambient classifier."""
-    global _LAST_AMBIENT_REACTION
-    _LAST_AMBIENT_REACTION = None
+) -> tuple[float, str | None]:
+    """Score message relevance for Zero and return (score, optional_reaction) without global state."""
     content_clean = content.strip()
+    text_for_targeting = strip_fenced_code_blocks(content_clean).strip()
 
-    # Fast-path: Explicit Zero mentions or @Robot snowflake tags immediately score 1.0
-    if (
-        any(re.search(tag, content_clean, re.I) for tag in ZERO_TAGS)
-        or contains_zero_mention(content_clean)
-        or contains_robot_mention(content_clean)
-    ):
-        return 1.0
+    # 1. Explicit <@bot_id> Discord snowflake mentions override handoff envelopes and peer addressing
+    if any(re.search(tag, text_for_targeting, re.I) for tag in ZERO_SNOWFLAKE_TAGS):
+        return 1.0, None
 
-    words = content_clean.split()
-
-    # Pre-filtering heuristics to save model calls (bypassed when Zero spoke recently or on directive/followup starters):
-    is_directive = is_short_directive_or_followup(content_clean)
-    if (
-        len(words) < 4
-        and "?" not in content_clean
-        and "```" not in content_clean
-        and not is_directive
-        and not zero_spoke_recently
-    ):
-        print("[Classifier] Drop reason=short_non_directive", file=sys.stderr)
-        return 0.0
-
-    # Parse handoff envelope if present
+    # 2. Parse handoff envelope and enforce peer targeting / closed-floor drops BEFORE text vocative checks
     envelope = None
     try:
         from tools.handoff import parse_envelope
@@ -480,23 +496,40 @@ def score_relevance(
         ).lower()
         if target and "zero" not in target and "team" not in target:
             print(f"[Classifier] Drop reason=envelope_target_other target={target}", file=sys.stderr)
-            return 0.0
+            return 0.0, None
 
         floor_state = str(envelope.get("floor") or "").lower()
         # floor: closed is the explicit state indicating "do not reply"
         if floor_state == "closed" and "zero" not in target:
             print("[Classifier] Drop reason=envelope_floor_closed", file=sys.stderr)
-            return 0.0
+            return 0.0, None
 
-    # Strip handoff envelopes and code blocks when evaluating recipient targeting,
-    # so that sender signatures (e.g. "holder": "amos") don't trip peer targeting regexes
-    text_for_targeting = re.sub(
-        r"```(?:handoff)?.*?```", "", content_clean, flags=re.DOTALL
-    ).strip()
-
+    # 3. Peer-addressing drop BEFORE text vocative checks
     if not zero_spoke_recently and is_explicitly_addressed_to_other(text_for_targeting):
         print("[Classifier] Drop reason=addressed_to_other", file=sys.stderr)
-        return 0.0
+        return 0.0, None
+
+    # 4. Fast-path: Role mentions, vocative Zero mentions, or @Robot mentions immediately score 1.0
+    if (
+        any(re.search(tag, text_for_targeting, re.I) for tag in ZERO_TAGS)
+        or contains_zero_mention(content_clean)
+        or contains_robot_mention(content_clean)
+    ):
+        return 1.0, None
+
+    words = content_clean.split()
+
+    # 5. Pre-filtering heuristics to save model calls (bypassed when Zero spoke recently or on directive/followup starters):
+    is_directive = is_short_directive_or_followup(content_clean)
+    if (
+        len(words) < 4
+        and "?" not in content_clean
+        and "```" not in content_clean
+        and not is_directive
+        and not zero_spoke_recently
+    ):
+        print("[Classifier] Drop reason=short_non_directive", file=sys.stderr)
+        return 0.0, None
 
     # Detect open questions with reply: "optional"
     is_open_optional_question = False
@@ -516,7 +549,7 @@ def score_relevance(
     )
     prompt = CLASSIFY_PROMPT.format(author=author or "user", content=formatted_content)
 
-    # 1. Warm persistent classifier path
+    # 6a. Warm persistent classifier path
     decide_warm = use_warm if use_warm is not None else _should_use_warm_classifier()
     if decide_warm:
         try:
@@ -524,15 +557,14 @@ def score_relevance(
             if warm_resp is not None:
                 val = extract_classifier_score(warm_resp)
                 if val is not None:
-                    _LAST_AMBIENT_REACTION = extract_classifier_reaction(warm_resp)
-                    return val
+                    return val, extract_classifier_reaction(warm_resp)
                 print("[Classifier] Fallback reason=warm_parse_null", file=sys.stderr)
             else:
                 print("[Classifier] Fallback reason=warm_returned_none", file=sys.stderr)
         except Exception as we:
             print(f"[Classifier] Fallback reason=warm_error err={we}", file=sys.stderr)
 
-    # 2. Cold subprocess fallback path
+    # 6b. Cold subprocess fallback path
     try:
         res = subprocess.run(
             [
@@ -541,22 +573,42 @@ def score_relevance(
                 "--disable-slash-commands",
                 f"-p={prompt}",
             ],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=25,
         )
-        _LAST_AMBIENT_REACTION = extract_classifier_reaction(res.stdout)
         val = extract_classifier_score(res.stdout)
         if val is not None:
-            return val
+            return val, extract_classifier_reaction(res.stdout)
         print("[Classifier] Fallback reason=parse_null", file=sys.stderr)
     except Exception as e:
         print(f"[Classifier] Fallback reason=subprocess_error err={e}", file=sys.stderr)
 
     if is_open_optional_question and "?" in text_for_targeting:
         print("[Classifier] Escalating open optional question to 0.85 on fallback", file=sys.stderr)
-        return 0.85
-    return 0.0
+        return 0.85, None
+    return 0.0, None
+
+
+def score_relevance(
+    content: str,
+    author: str = "user",
+    use_warm: bool | None = None,
+    recent_context: str = "",
+    zero_spoke_recently: bool = False,
+) -> float:
+    """Score message relevance for Zero using ambient classifier (backwards-compatible wrapper)."""
+    global _LAST_AMBIENT_REACTION
+    score, reaction = score_relevance_with_reaction(
+        content=content,
+        author=author,
+        use_warm=use_warm,
+        recent_context=recent_context,
+        zero_spoke_recently=zero_spoke_recently,
+    )
+    _LAST_AMBIENT_REACTION = reaction
+    return score
 
 
 if __name__ == "__main__":

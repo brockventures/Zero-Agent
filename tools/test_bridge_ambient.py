@@ -134,7 +134,7 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
         }
 
         with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
-             patch("tools.classifier.score_relevance", return_value=0.25):
+             patch("tools.classifier.score_relevance_with_reaction", return_value=(0.25, None)):
             handled = await route_external_message(
                 msg, bot, msg.content, "Ian", home_queue, ext_queue, rules=rules
             )
@@ -168,8 +168,7 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
         }
 
         with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
-             patch("tools.classifier.score_relevance", return_value=0.30), \
-             patch("tools.classifier.pop_last_reaction", return_value="😂"):
+             patch("tools.classifier.score_relevance_with_reaction", return_value=(0.30, "😂")):
             handled = await route_external_message(
                 msg, bot, msg.content, "Ian", home_queue, ext_queue, rules=rules
             )
@@ -184,7 +183,7 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
         msg.author.bot = False
         msg.channel.id = 1551465050072416286  # #side-project
         msg.channel.name = "side-project"
-        msg.content = "Zero can you update so you respond to bare Zero text as well?"
+        msg.content = "Zero, can you update so you respond to vocative Zero text as well?"
         msg.attachments = []
         msg.reference = None
         msg.role_mentions = []
@@ -210,7 +209,7 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(handled)
             self.assertFalse(ext_queue.empty())
             item = await ext_queue.get()
-            self.assertIn("can you update so you respond to bare Zero text as well?", item["prompt"])
+            self.assertIn("can you update so you respond to vocative Zero text as well?", item["prompt"])
 
     async def test_external_group_mid_turn_steering(self):
         """Verify mid-turn steering in shared/group channels formats prompt, signals SIGINT, and enqueues steer payload."""
@@ -427,6 +426,223 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(handled)
             mock_kill.assert_called_once_with(initiator="Owner", action="halt", channel_id=msg.channel.id)
             msg.reply.assert_awaited_once_with("🛑 Halted")
+
+    async def test_warm_classifier_stderr_devnull_fd_closure_and_cold_stdin_devnull(self):
+        """Verify WarmClassifierDaemon uses stderr=DEVNULL, closes all FDs on shutdown, and cold fallback passes stdin=DEVNULL."""
+        import subprocess
+        import tempfile
+        from tools.classifier import WarmClassifierDaemon, score_relevance_with_reaction
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            daemon = WarmClassifierDaemon(work_dir=tmpdir, max_turns=4)
+            mock_proc = MagicMock()
+            mock_proc.pid = 42424
+            mock_proc.poll.return_value = None
+            mock_proc.stdin = MagicMock()
+            mock_proc.stdout = MagicMock()
+            mock_proc.stderr = MagicMock()
+            mock_proc.stdin.close.side_effect = OSError("already closed")
+
+            with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
+                daemon.start()
+                mock_popen.assert_called_once()
+                self.assertEqual(mock_popen.call_args.kwargs.get("stderr"), subprocess.DEVNULL)
+
+                daemon.shutdown()
+                mock_proc.stdin.close.assert_called_once()
+                mock_proc.stdout.close.assert_called_once()
+                mock_proc.stderr.close.assert_called_once()
+
+        with patch("subprocess.run") as mock_run:
+            res = MagicMock()
+            res.stdout = "0.42 | REACT: 🦀"
+            mock_run.return_value = res
+            score, rx = score_relevance_with_reaction(
+                "Checking how the docker bridge handles reconnects here",
+                author="Ian",
+                use_warm=False,
+            )
+            self.assertEqual(score, 0.42)
+            self.assertEqual(rx, "🦀")
+            self.assertEqual(mock_run.call_args.kwargs.get("stdin"), subprocess.DEVNULL)
+
+    async def test_concurrent_ambient_reaction_isolation(self):
+        """Verify concurrent ambient channels never steal or overwrite each other's reactions."""
+        import threading
+
+        barrier = threading.Barrier(2, timeout=5.0)
+
+        def fake_run(cmd, **kwargs):
+            prompt = cmd[-1]
+            barrier.wait()
+            res = MagicMock()
+            if "channel_alpha_payload" in prompt:
+                res.stdout = "0.30 | REACT: 🔥"
+            else:
+                res.stdout = "0.25 | REACT: 🦀"
+            return res
+
+        def make_msg(ch_id: int, content: str):
+            m = MagicMock()
+            m.id = ch_id + 1
+            m.guild.id = 1534436119888793740
+            m.author.id = 11111111
+            m.author.bot = False
+            m.channel.id = ch_id
+            m.channel.name = f"ch-{ch_id}"
+            m.content = content
+            m.attachments = []
+            m.reference = None
+            m.role_mentions = []
+            m.mentions = []
+            m.add_reaction = AsyncMock()
+            return m
+
+        msg_a = make_msg(1534452820995080192, "Thoughts on channel_alpha_payload performance today")
+        msg_b = make_msg(1534452820995080193, "Thoughts on channel_beta_payload reliability today")
+        bot = MagicMock()
+        bot.user.id = 1542285964213358633
+        rules = {
+            "ambient_classifier_enabled": True,
+            "ambient_relevance_threshold": 0.80,
+            "channel_tag_requirements": {},
+        }
+
+        with patch("tools.bridge_ambient.is_brock_guild", return_value=False), \
+             patch("tools.classifier._should_use_warm_classifier", return_value=False), \
+             patch("subprocess.run", side_effect=fake_run):
+            await asyncio.gather(
+                route_external_message(msg_a, bot, msg_a.content, "Ian", asyncio.Queue(), asyncio.Queue(), rules=rules),
+                route_external_message(msg_b, bot, msg_b.content, "Alex", asyncio.Queue(), asyncio.Queue(), rules=rules),
+            )
+
+        msg_a.add_reaction.assert_awaited_once_with("🔥")
+        msg_b.add_reaction.assert_awaited_once_with("🦀")
+
+    async def test_vocative_regex_code_blocks_and_prose_non_triggering(self):
+        """Verify fenced code blocks, mid-sentence zero commas, and prose starters like 'Zero tests failed.' do not trigger."""
+        from tools.classifier import contains_zero_mention, score_relevance_with_reaction
+
+        non_mentions = [
+            "Zero tests failed.",
+            "Zero rows returned.",
+            "if count hits zero, retry",
+            "return zero, err",
+            "value is zero: fallback to default",
+            "```python\n@zero\nZero: run tests\nhey zero\n```",
+            "~~~bash\n@zero check logs\n~~~",
+            '```handoff\n{"to": "amos", "subject": "@zero"}\n```\nAll done.',
+        ]
+        for text in non_mentions:
+            self.assertFalse(contains_zero_mention(text), f"False positive vocative match on: {text!r}")
+
+        valid_mentions = [
+            "Zero: please check the logs",
+            "Zero, please check the logs",
+            "All green. Zero: deploy when ready",
+            "hey zero, can you take a look?",
+            "@zero check this build",
+        ]
+        for text in valid_mentions:
+            self.assertTrue(contains_zero_mention(text), f"Expected vocative match on: {text!r}")
+
+        # Verify route_external_message does not enqueue on prose false positive or code block @zero
+        bot = MagicMock()
+        bot.user.id = 1542285964213358633
+        rules = {"ambient_classifier_enabled": False, "channel_tag_requirements": {}}
+
+        for text in (
+            "Zero tests failed.",
+            "if count hits zero, retry",
+            "```python\n@zero\nZero: wake up\n```",
+        ):
+            msg = MagicMock()
+            msg.id = 7777
+            msg.guild.id = 1534436119888793740
+            msg.author.id = 11111111
+            msg.author.bot = False
+            msg.channel.id = 1534452820995080192
+            msg.channel.name = "lounge"
+            msg.content = text
+            msg.attachments = []
+            msg.reference = None
+            msg.role_mentions = []
+            msg.mentions = []
+            ext_queue = asyncio.Queue()
+            with patch("tools.bridge_ambient.is_brock_guild", return_value=False):
+                handled = await route_external_message(msg, bot, text, "Ian", asyncio.Queue(), ext_queue, rules=rules)
+                self.assertTrue(handled)
+                self.assertTrue(ext_queue.empty(), f"Should not enqueue on non-vocative text: {text!r}")
+
+        # Also verify score_relevance_with_reaction does not fast-path 1.0 on 'Zero tests failed.'
+        with patch("subprocess.run") as mock_run:
+            res = MagicMock()
+            res.stdout = "0.10"
+            mock_run.return_value = res
+            score, rx = score_relevance_with_reaction("Zero tests failed.", author="Ian", use_warm=False)
+            self.assertEqual(score, 0.0)  # < 4 words non-directive drop, never 1.0
+            self.assertIsNone(rx)
+            mock_run.assert_not_called()
+
+    async def test_handoff_and_peer_precedence_over_vocative_and_snowflake_override(self):
+        """Verify floor:closed, to:other, and peer vocatives drop before Zero vocatives, while <@bot_id> overrides."""
+        from tools.classifier import score_relevance_with_reaction
+
+        closed_with_vocative = (
+            'Zero: FYI we wrapped this up.\n```handoff\n{"floor": "closed", "reply": "none"}\n```'
+        )
+        peer_env_with_vocative = (
+            '@zero mentioned in changelog.\n```handoff\n{"to": "amos", "floor": "open", "reply": "required"}\n```'
+        )
+        peer_vocative_with_zero = "Hey Amos, ask zero about that migration later"
+        closed_with_snowflake = (
+            '<@1542285964213358633> override needed.\n```handoff\n{"to": "amos", "floor": "closed", "reply": "none"}\n```'
+        )
+
+        # 1. Classifier-level precedence
+        with patch("subprocess.run") as mock_run:
+            self.assertEqual(score_relevance_with_reaction(closed_with_vocative, use_warm=False), (0.0, None))
+            self.assertEqual(score_relevance_with_reaction(peer_env_with_vocative, use_warm=False), (0.0, None))
+            self.assertEqual(score_relevance_with_reaction(peer_vocative_with_zero, use_warm=False), (0.0, None))
+            self.assertEqual(score_relevance_with_reaction(closed_with_snowflake, use_warm=False), (1.0, None))
+            mock_run.assert_not_called()
+
+        # 2. route_external_message-level precedence
+        bot = MagicMock()
+        bot.user.id = 1542285964213358633
+        rules = {"ambient_classifier_enabled": False, "channel_tag_requirements": {}}
+
+        def make_msg(content: str):
+            m = MagicMock()
+            m.id = 8888
+            m.guild.id = 1534436119888793740
+            m.author.id = 1468012353206354197
+            m.author.bot = False
+            m.channel.id = 1534436119888793750
+            m.channel.name = "the-banana-stand"
+            m.content = content
+            m.attachments = []
+            m.reference = None
+            m.role_mentions = []
+            m.mentions = []
+            return m
+
+        for suppressed_text in (closed_with_vocative, peer_env_with_vocative, peer_vocative_with_zero):
+            ext_queue = asyncio.Queue()
+            with patch("tools.bridge_ambient.is_brock_guild", return_value=False):
+                handled = await route_external_message(
+                    make_msg(suppressed_text), bot, suppressed_text, "Ian", asyncio.Queue(), ext_queue, rules=rules
+                )
+                self.assertTrue(handled)
+                self.assertTrue(ext_queue.empty(), f"Expected suppression for: {suppressed_text!r}")
+
+        override_queue = asyncio.Queue()
+        with patch("tools.bridge_ambient.is_brock_guild", return_value=False):
+            handled = await route_external_message(
+                make_msg(closed_with_snowflake), bot, closed_with_snowflake, "Ian", asyncio.Queue(), override_queue, rules=rules
+            )
+            self.assertTrue(handled)
+            self.assertFalse(override_queue.empty(), "Explicit <@bot_id> snowflake must override closed peer handoff")
 
 
 if __name__ == "__main__":
