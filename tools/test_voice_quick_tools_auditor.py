@@ -38,8 +38,17 @@ if "tools" in sys.modules:
             if _m == "tools" or _m.startswith("tools."):
                 del sys.modules[_m]
 
+for _m in list(sys.modules.keys()):
+    if _m.startswith("tools."):
+        _mf = getattr(sys.modules[_m], "__file__", "") or ""
+        if _mf and not os.path.abspath(_mf).startswith(REPO_ROOT):
+            del sys.modules[_m]
+
 import tools
 tools.__path__ = [os.path.join(REPO_ROOT, "tools")]
+
+# Pin local worktree bridge_voice before gotchi_zero_adapter imports backend.voice_gateway
+import tools.bridge_voice  # noqa: F401, E402
 
 from tools.voice_quick_tools_auditor import (
     JOB_DAY_OF_WEEK,
@@ -308,3 +317,247 @@ def test_ensure_weekly_schedule_registered_idempotent(tmp_path: Path) -> None:
     # CLI --register-schedule invocation
     rc = main(["--register-schedule", "--schedule-path", str(sched_file)])
     assert rc == 0
+
+
+def test_gemini_live_audio_sink_fails_closed_on_none_bot_and_non_owner() -> None:
+    """GeminiLiveAudioSink.write() must immediately drop packets from None, bots, or non-owners."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from tools.bridge_voice import GeminiLiveAudioSink
+
+    loop = asyncio.new_event_loop()
+    try:
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=10)
+        with patch("tools.bridge_voice.discord.opus.Decoder") as mock_decoder_cls:
+            decoder_inst = MagicMock()
+            mock_decoder_cls.return_value = decoder_inst
+            sink = GeminiLiveAudioSink(loop=loop, audio_in_queue=queue, target_user_id=999001)
+
+            fake_data = SimpleNamespace(opus=b"\x01\x02\x03\x04")
+
+            # 1. user=None MUST fail closed (never fall back to target_user_id)
+            sink.write(None, fake_data)
+            decoder_inst.decode.assert_not_called()
+
+            # 2. Bot user with matching ID MUST be dropped
+            sink.write(SimpleNamespace(id=999001, bot=True), fake_data)
+            decoder_inst.decode.assert_not_called()
+
+            # 3. Non-owner human user MUST be dropped
+            sink.write(SimpleNamespace(id=888002, bot=False), fake_data)
+            decoder_inst.decode.assert_not_called()
+
+            # 4. User object missing id attribute MUST be dropped
+            sink.write(SimpleNamespace(bot=False), fake_data)
+            decoder_inst.decode.assert_not_called()
+
+            assert sink.input_audio_seconds == 0.0
+            assert queue.empty()
+    finally:
+        loop.close()
+
+
+def test_bridge_voice_read_local_file_blocks_secrets_and_private_paths() -> None:
+    """Voice read_local_file must reject /secrets/, .env, memory/private, memory/vault, and '..'."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from tools.bridge_voice import ZeroVoiceSessionManager
+
+    mgr = ZeroVoiceSessionManager(bot=MagicMock())
+    blocked_paths = [
+        "/secrets/env.json",
+        "/workspace/.env",
+        "/workspace/.env.local",
+        "/workspace/memory/private/user_ryan.md",
+        "/workspace/memory/vault/keys.txt",
+        "/workspace/../secrets/env.json",
+        "/etc/passwd",
+    ]
+    for path in blocked_paths:
+        res = asyncio.run(
+            mgr._execute_tool_call(
+                SimpleNamespace(name="read_local_file", args={"file_path": path}),
+                notify_channel=None,
+            )
+        )
+        assert "error" in res, f"Expected read_local_file to reject {path}, got: {res}"
+        assert "Access denied" in res["error"], f"Unexpected error for {path}: {res}"
+
+
+def test_bridge_voice_run_shell_command_always_stages_decision_card() -> None:
+    """Voice run_shell_command must NEVER run subprocess.run(shell=True); always stages Decision Card."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from tools.bridge_voice import TARGET_CHANNEL_ID, ZeroVoiceSessionManager
+
+    mgr = ZeroVoiceSessionManager(bot=MagicMock())
+    staged_payload = {
+        "confirmation_required": True,
+        "status": "staged_in_zero_chat",
+        "channel_id": TARGET_CHANNEL_ID,
+        "tool": "run_shell_command",
+        "message": "Staged in #zero-chat",
+    }
+
+    with (
+        patch("tools.bridge_voice.subprocess.run") as mock_subproc,
+        patch(
+            "tools.gotchi_zero_adapter.stage_voice_mutation_confirmation",
+            return_value=staged_payload,
+        ) as mock_stage,
+    ):
+        res = asyncio.run(
+            mgr._execute_tool_call(
+                SimpleNamespace(name="run_shell_command", args={"command": "id && whoami"}),
+                notify_channel=None,
+            )
+        )
+        mock_subproc.assert_not_called()
+        mock_stage.assert_called_once_with("run_shell_command", {"command": "id && whoami"})
+        assert res["confirmation_required"] is True
+        assert res["status"] == "staged_in_zero_chat"
+
+
+def test_bridge_voice_taint_blocks_write_after_gmail_and_web_search_and_restricts_paths(
+    tmp_path: Path,
+) -> None:
+    """write_local_file enforces workspace path restrictions and stages Decision Card after Gmail/web taint."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from tools.bridge_voice import TARGET_CHANNEL_ID, ZeroVoiceSessionManager
+
+    # 1. Path restriction check (blocks /secrets/, .env, memory/private, memory/vault, .., /tmp)
+    mgr = ZeroVoiceSessionManager(bot=MagicMock())
+    for bad_path in (
+        "/secrets/pwn.json",
+        "/workspace/.env",
+        "/workspace/memory/private/pwn.md",
+        "/workspace/memory/vault/pwn.md",
+        "/workspace/scratch/../../etc/cron.d/pwn",
+        str(tmp_path / "outside_workspace.txt"),
+    ):
+        res = asyncio.run(
+            mgr._execute_tool_call(
+                SimpleNamespace(
+                    name="write_local_file",
+                    args={"file_path": bad_path, "content": "evil"},
+                ),
+                notify_channel=None,
+            )
+        )
+        assert "error" in res and "Access denied" in res["error"], f"Failed to block {bad_path}: {res}"
+
+    # 2. Taint via search_gmail blocks direct write_local_file and stages a Decision Card
+    mgr_gmail = ZeroVoiceSessionManager(bot=MagicMock())
+    assert mgr_gmail._session_tainted_by_external_data is False
+
+    with (
+        patch("tools.zero_mail_listener.get_access_token", side_effect=RuntimeError("mock-stop")),
+    ):
+        asyncio.run(
+            mgr_gmail._execute_tool_call(
+                SimpleNamespace(name="search_gmail", args={"query": "invoice"}),
+                notify_channel=None,
+            )
+        )
+    assert mgr_gmail._session_tainted_by_external_data is True
+
+    staged_write = {
+        "confirmation_required": True,
+        "status": "staged_in_zero_chat",
+        "channel_id": TARGET_CHANNEL_ID,
+        "tool": "write_local_file",
+        "message": "Staged in #zero-chat",
+    }
+    target_ws_file = "/workspace/scratch/voice_taint_test_never_written.txt"
+    with (
+        patch(
+            "tools.gotchi_zero_adapter.stage_voice_mutation_confirmation",
+            return_value=staged_write,
+        ) as mock_stage,
+        patch("pathlib.Path.write_text") as mock_write_text,
+    ):
+        res_write = asyncio.run(
+            mgr_gmail._execute_tool_call(
+                SimpleNamespace(
+                    name="write_local_file",
+                    args={"file_path": target_ws_file, "content": "prompt-injected write"},
+                ),
+                notify_channel=None,
+            )
+        )
+        mock_write_text.assert_not_called()
+        mock_stage.assert_called_once()
+        assert res_write["confirmation_required"] is True
+        assert res_write["tainted_session"] is True
+
+    # 3. Taint via web_and_reddit_search also sets taint and blocks direct write_local_file
+    mgr_web = ZeroVoiceSessionManager(bot=MagicMock())
+    assert mgr_web._session_tainted_by_external_data is False
+    fake_proc = SimpleNamespace(stdout="reddit thread", stderr="", returncode=0)
+    with patch("tools.bridge_voice.subprocess.run", return_value=fake_proc):
+        asyncio.run(
+            mgr_web._execute_tool_call(
+                SimpleNamespace(name="web_and_reddit_search", args={"query": "homelab"}),
+                notify_channel=None,
+            )
+        )
+    assert mgr_web._session_tainted_by_external_data is True
+
+    with (
+        patch(
+            "tools.gotchi_zero_adapter.stage_voice_mutation_confirmation",
+            return_value=staged_write,
+        ) as mock_stage2,
+        patch("pathlib.Path.write_text") as mock_write_text2,
+    ):
+        res_write2 = asyncio.run(
+            mgr_web._execute_tool_call(
+                SimpleNamespace(
+                    name="write_local_file",
+                    args={"file_path": target_ws_file, "content": "web-injected write"},
+                ),
+                notify_channel=None,
+            )
+        )
+        mock_write_text2.assert_not_called()
+        mock_stage2.assert_called_once()
+        assert res_write2["confirmation_required"] is True
+        assert res_write2["tainted_session"] is True
+
+
+def test_bridge_voice_post_note_hardcoded_to_zero_chat() -> None:
+    """post_note_to_zero_chat must strictly send to TARGET_CHANNEL_ID, ignoring arbitrary notify_channel."""
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tools.bridge_voice import TARGET_CHANNEL_ID, ZeroVoiceSessionManager
+
+    zero_chat_ch = MagicMock()
+    zero_chat_ch.send = AsyncMock()
+    foreign_ch = MagicMock()
+    foreign_ch.send = AsyncMock()
+
+    bot = MagicMock()
+    bot.get_channel.side_effect = lambda cid: zero_chat_ch if cid == TARGET_CHANNEL_ID else None
+
+    mgr = ZeroVoiceSessionManager(bot=bot)
+    res = asyncio.run(
+        mgr._execute_tool_call(
+            SimpleNamespace(name="post_note_to_zero_chat", args={"message": "Hello Zero Chat"}),
+            notify_channel=foreign_ch,
+        )
+    )
+    assert res == {"status": "posted to #zero-chat"}
+    bot.get_channel.assert_called_with(TARGET_CHANNEL_ID)
+    zero_chat_ch.send.assert_awaited_once()
+    foreign_ch.send.assert_not_awaited()

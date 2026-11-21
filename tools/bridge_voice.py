@@ -65,6 +65,161 @@ DEFAULT_VOICE_NAME = "Schedar"  # Even, steady, composed lower-middle male voice
 VOICE_TRANSCRIPT_FILE = Path("/workspace/data/voice_transcripts.json")
 CHANNEL_HISTORY_FILE = Path("/workspace/data/channel_history.json")
 
+_VOICE_ALLOWED_READ_ROOTS = (
+    "/workspace/",
+    "/baseball/",
+    "/root/.gemini/antigravity-cli/skills/",
+    "/root/.gemini/antigravity-cli/builtin/skills/",
+)
+_VOICE_ALLOWED_WRITE_ROOTS = ("/workspace/",)
+_VOICE_DENIED_BASENAMES = {
+    ".env",
+    ".ssh",
+    "id_rsa",
+    "id_ed25519",
+    "authorized_keys",
+    "known_hosts",
+    "credentials",
+    "credentials.json",
+    "token.json",
+    "secrets.json",
+    "pii_rules.json",
+    "env.json",
+}
+_VOICE_DENIED_SEGMENTS = {
+    ".env",
+    ".ssh",
+    "secrets",
+    "private",
+    "vault",
+}
+
+
+def _fallback_is_allowed_voice_read_path(
+    file_path: str,
+    allowed_prefixes: tuple[str, ...] = _VOICE_ALLOWED_READ_ROOTS,
+) -> tuple[bool, str]:
+    """Fail-closed voice read path validator used when gotchi_zero_adapter is unavailable."""
+    raw = str(file_path or "").strip()
+    if not raw:
+        return False, "Empty file_path"
+    if ".." in Path(raw).parts:
+        return False, "Path traversal ('..') is denied on voice turns"
+
+    resolved = os.path.realpath(raw)
+    norm_prefixes = tuple(os.path.realpath(p).rstrip("/") + "/" for p in allowed_prefixes)
+    if not any(resolved.startswith(pref) for pref in norm_prefixes):
+        return False, f"Resolved path '{resolved}' is outside allowed voice read roots"
+
+    for candidate in (raw, resolved):
+        parts = [seg.lower() for seg in Path(candidate).parts if seg and seg != "/"]
+        if not parts:
+            continue
+        basename = parts[-1]
+        if (
+            basename in _VOICE_DENIED_BASENAMES
+            or basename.startswith(".env.")
+            or basename.endswith(".pem")
+            or basename.endswith(".key")
+        ):
+            return False, f"Denied sensitive basename '{basename}' on voice turn"
+        for seg in parts:
+            if seg in _VOICE_DENIED_SEGMENTS or seg.startswith(".env."):
+                return False, f"Denied sensitive path segment '{seg}' on voice turn"
+
+    return True, resolved
+
+
+def _is_allowed_voice_read_path(file_path: str) -> tuple[bool, str]:
+    """Validate voice read_local_file paths via gotchi_zero_adapter with safe fallback."""
+    try:
+        from tools.gotchi_zero_adapter import is_allowed_voice_read_path
+
+        return is_allowed_voice_read_path(file_path)
+    except Exception:
+        return _fallback_is_allowed_voice_read_path(file_path)
+
+
+def _is_allowed_voice_write_path(file_path: str) -> tuple[bool, str]:
+    """Enforce workspace-only write restriction blocking /secrets/, .env, memory/private, memory/vault, and '..'."""
+    raw = str(file_path or "").strip()
+    if not raw:
+        return False, "Empty file_path"
+    if ".." in Path(raw).parts:
+        return False, "Path traversal ('..') is denied on voice write"
+
+    resolved = os.path.realpath(raw)
+    norm_prefixes = tuple(os.path.realpath(p).rstrip("/") + "/" for p in _VOICE_ALLOWED_WRITE_ROOTS)
+    if not any(resolved.startswith(pref) for pref in norm_prefixes):
+        return False, f"Resolved path '{resolved}' is outside /workspace/"
+
+    for candidate in (raw, resolved):
+        parts = [seg.lower() for seg in Path(candidate).parts if seg and seg != "/"]
+        if not parts:
+            continue
+        basename = parts[-1]
+        if (
+            basename in _VOICE_DENIED_BASENAMES
+            or basename.startswith(".env.")
+            or basename.endswith(".pem")
+            or basename.endswith(".key")
+        ):
+            return False, f"Denied sensitive basename '{basename}' on voice write"
+        for seg in parts:
+            if seg in _VOICE_DENIED_SEGMENTS or seg == ".git" or seg.startswith(".env."):
+                return False, f"Denied sensitive path segment '{seg}' on voice write"
+
+    return True, resolved
+
+
+def _stage_voice_mutation_confirmation(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Stage a #zero-chat Decision Card for voice shell/write mutations."""
+    try:
+        from tools.gotchi_zero_adapter import stage_voice_mutation_confirmation
+
+        return stage_voice_mutation_confirmation(tool_name, args)
+    except Exception:
+        if tool_name == "run_shell_command":
+            cmd = str(args.get("command", "")).strip()
+            summary = (
+                f"🎙️ 🔒 **[#zero-voice Security Gate — Confirm Shell Command]:**\n"
+                f"- **Tool:** `run_shell_command`\n"
+                f"- **Command:** `{cmd[:400]}`\n"
+                "Reply in `#zero-chat` to approve execution."
+            )
+        else:
+            fpath = str(args.get("file_path", "")).strip()
+            content = str(args.get("content", ""))
+            preview = content[:240].replace("`", "'")
+            summary = (
+                f"🎙️ 🔒 **[#zero-voice Security Gate — Confirm File Write]:**\n"
+                f"- **Tool:** `write_local_file`\n"
+                f"- **Path:** `{fpath}` ({len(content)} chars)\n"
+                f"- **Preview:** `{preview}`\n"
+                "Reply in `#zero-chat` to approve writing this file."
+            )
+        try:
+            from tools import outbox
+
+            outbox.queue_outbox_message(
+                str(TARGET_CHANNEL_ID),
+                summary,
+                source_turn="zero-voice-security-gate",
+                dedupe_window=5,
+            )
+        except Exception as oe:
+            log.warning(f"[ZeroVoice] Failed queuing confirmation card to outbox: {oe}")
+        return {
+            "confirmation_required": True,
+            "status": "staged_in_zero_chat",
+            "channel_id": TARGET_CHANNEL_ID,
+            "tool": tool_name,
+            "message": (
+                f"Voice security gate: staged `{tool_name}` in #zero-chat for explicit "
+                "text confirmation instead of executing directly from voice audio."
+            ),
+        }
+
 
 def _ensure_opus_loaded() -> bool:
     if discord.opus.is_loaded():
@@ -242,10 +397,12 @@ class GeminiLiveAudioSink(voice_recv.AudioSink):
         return True
 
     def write(self, user: Optional[discord.abc.User], data: voice_recv.VoiceData) -> None:
-        uid = getattr(user, "id", None) or self.target_user_id
-        if user is not None and getattr(user, "bot", False):
+        if user is None:
             return
-        if uid != self.target_user_id:
+        if getattr(user, "bot", False):
+            return
+        uid = getattr(user, "id", None)
+        if uid is None or uid != self.target_user_id:
             return
 
         opus_bytes = data.opus
@@ -630,6 +787,7 @@ class ZeroVoiceSessionManager:
         self.started_at: Optional[float] = None
         self._stop_event = asyncio.Event()
         self._lock = asyncio.Lock()
+        self._session_tainted_by_external_data: bool = False
 
     @property
     def is_active(self) -> bool:
@@ -670,6 +828,7 @@ class ZeroVoiceSessionManager:
                 self.active_model = model_override
 
             self._stop_event.clear()
+            self._session_tainted_by_external_data = False
             last_err: Optional[Exception] = None
             for attempt in range(1, 4):
                 try:
@@ -776,6 +935,7 @@ class ZeroVoiceSessionManager:
             self.audio_sink.cleanup()
             self.audio_sink = None
         self.started_at = None
+        self._session_tainted_by_external_data = False
 
     async def _execute_tool_call(self, fn_call: Any, notify_channel: Optional[discord.abc.Messageable]) -> dict[str, Any]:
         name = getattr(fn_call, "name", "")
@@ -806,6 +966,7 @@ class ZeroVoiceSessionManager:
             max_results = min(int(args.get("max_results", 4) or 4), 8)
             if not query:
                 return {"error": "Empty query."}
+            self._session_tainted_by_external_data = True
 
             def _fetch_gmail() -> str:
                 import base64
@@ -899,26 +1060,24 @@ class ZeroVoiceSessionManager:
             cmd_str = str(args.get("command", "")).strip()
             if not cmd_str:
                 return {"error": "Empty command"}
-            try:
-                res = await asyncio.to_thread(
-                    subprocess.run,
-                    cmd_str,
-                    shell=True,
-                    cwd="/workspace",
-                    capture_output=True,
-                    text=True,
-                    timeout=20,
-                )
-                combined = (res.stdout or "") + ("\nSTDERR:\n" + res.stderr if res.stderr else "")
-                return {"exit_code": res.returncode, "output": combined[:4000] or "(no output)"}
-            except Exception as e:
-                return {"error": str(e)}
+            staged = _stage_voice_mutation_confirmation(
+                "run_shell_command",
+                {"command": cmd_str},
+            )
+            if self._session_tainted_by_external_data:
+                staged = dict(staged)
+                staged["tainted_session"] = True
+            return staged
 
         if name == "read_local_file":
             fpath = str(args.get("file_path", "")).strip()
             max_chars = int(args.get("max_chars", 4000) or 4000)
+            allowed, resolved_or_reason = _is_allowed_voice_read_path(fpath)
+            if not allowed:
+                log.warning(f"[ZeroVoice] Blocked read_local_file('{fpath}'): {resolved_or_reason}")
+                return {"error": f"Access denied: {resolved_or_reason}"}
             try:
-                p = Path(fpath)
+                p = Path(resolved_or_reason)
                 if not p.exists():
                     return {"error": f"File not found: {fpath}"}
                 return {"content": p.read_text(errors="replace")[:max_chars]}
@@ -928,11 +1087,26 @@ class ZeroVoiceSessionManager:
         if name == "write_local_file":
             fpath = str(args.get("file_path", "")).strip()
             content = str(args.get("content", ""))
+            allowed, resolved_or_reason = _is_allowed_voice_write_path(fpath)
+            if not allowed:
+                log.warning(f"[ZeroVoice] Blocked write_local_file('{fpath}'): {resolved_or_reason}")
+                return {"error": f"Access denied: {resolved_or_reason}"}
+            if self._session_tainted_by_external_data:
+                log.warning(
+                    f"[ZeroVoice] Session tainted by external data; staging Decision Card for write_local_file('{resolved_or_reason}')"
+                )
+                staged = _stage_voice_mutation_confirmation(
+                    "write_local_file",
+                    {"file_path": resolved_or_reason, "content": content},
+                )
+                staged = dict(staged)
+                staged["tainted_session"] = True
+                return staged
             try:
-                p = Path(fpath)
+                p = Path(resolved_or_reason)
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(content)
-                return {"status": f"Successfully wrote {len(content)} chars to {fpath}"}
+                return {"status": f"Successfully wrote {len(content)} chars to {resolved_or_reason}"}
             except Exception as e:
                 return {"error": str(e)}
 
@@ -942,6 +1116,7 @@ class ZeroVoiceSessionManager:
             mode = str(args.get("mode", "reddit")).strip().lower()
             if not query:
                 return {"error": "Empty query"}
+            self._session_tainted_by_external_data = True
             try:
                 if mode == "amazon":
                     cmd = ["python3", "/workspace/tools/amazon_serpapi.py", query]
@@ -1002,6 +1177,13 @@ class ZeroVoiceSessionManager:
                 except Exception as se:
                     log.warning(f"[ZeroVoice] Screenshot capture failed: {se}")
 
+            if file_path:
+                allowed, resolved_or_reason = _is_allowed_voice_read_path(file_path)
+                if not allowed:
+                    log.warning(f"[ZeroVoice] Blocked post_note_to_zero_chat attachment('{file_path}'): {resolved_or_reason}")
+                    return {"error": f"Access denied for file_path: {resolved_or_reason}"}
+                file_path = resolved_or_reason
+
             if file_path and Path(file_path).exists():
                 try:
                     from tools.deliver_image import deliver_file
@@ -1018,7 +1200,7 @@ class ZeroVoiceSessionManager:
                 except Exception as de:
                     log.warning(f"[ZeroVoice] deliver_file fallback: {de}")
 
-            target_ch = notify_channel or self.bot.get_channel(TARGET_CHANNEL_ID)
+            target_ch = self.bot.get_channel(TARGET_CHANNEL_ID) if self.bot else None
             if target_ch and msg_text:
                 try:
                     from tools.bridge_formatting import format_for_discord
