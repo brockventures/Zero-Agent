@@ -169,16 +169,31 @@ class TestCharacterConsistencyAndPrompts:
         assert "quilted down puffer coats" in cold_prompt
 
     def test_all_vault_styles_have_scenes_and_mediums(self) -> None:
-        """Ensure all 19+ vault styles have required metadata and scene flavors."""
+        """Ensure all 19+ vault styles have required metadata, distinct scene flavors, and left-58% Easter eggs."""
         assert len(hdwa.ART_STYLE_VAULT) >= 19
         for key, style in hdwa.ART_STYLE_VAULT.items():
             assert "visual_medium" in style, f"Missing visual_medium in {key}"
             assert "name" in style, f"Missing name in {key}"
             assert "prompt_style" in style, f"Missing prompt_style in {key}"
             assert "scene_flavor" in style, f"Missing scene_flavor in {key}"
+            assert "easter_eggs" in style, f"Missing easter_eggs in {key}"
             assert "context_tags" in style, f"Missing context_tags in {key}"
+            assert "subtle" not in style["prompt_style"].lower(), f"Hedged 'subtle' phrasing found in {key}"
+            scenes = set()
             for slot in ("morning", "afternoon", "evening"):
                 assert slot in style["scene_flavor"], f"Missing {slot} in scene_flavor for {key}"
+                assert style["scene_flavor"][slot].strip(), f"Empty {slot} scene_flavor for {key}"
+                scenes.add(style["scene_flavor"][slot].strip())
+                assert slot in style["easter_eggs"], f"Missing {slot} in easter_eggs for {key}"
+                egg = style["easter_eggs"][slot].strip()
+                assert egg, f"Empty {slot} easter_egg for {key}"
+                assert "LEFT 58%" in egg, f"Easter egg for {key}:{slot} must target LEFT 58%"
+            assert len(scenes) == 3, f"Expected 3 distinct sub-locations in {key}"
+
+        spider_style = hdwa.ART_STYLE_VAULT["spiderverse_halftone"]["prompt_style"]
+        assert "subtle" not in spider_style.lower()
+        assert "Ben-Day halftone" in spider_style
+        assert "chromatic aberration" in spider_style
 
 
 # ===========================================================================

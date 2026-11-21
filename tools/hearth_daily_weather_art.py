@@ -149,15 +149,21 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "zelda_oot_kokiri_storybook",
         "name": "Zelda: Ocarina of Time (Kokiri Forest Storybook)",
         "prompt_style": (
-            "The Legend of Zelda: Ocarina of Time classic storybook illustration, lush Kokiri Forest "
-            "with massive ancient tree roots, mossy wooden canopy footbridges, wooden hollow-trunk cottages, "
-            "glowing winged fairy companions (Navi) leaving sparkling warm golden light trails, "
-            "Great Deku Tree emerald foliage in the distant background, warm whimsical fantasy watercolor and gouache"
+            "The Legend of Zelda: Ocarina of Time N64-era official Nintendo manual fantasy illustration, "
+            "bold opaque gouache and rich watercolor wash on toothy cold-press paper, lush Kokiri Forest "
+            "with colossal gnarled ancient tree roots, suspended mossy wooden canopy footbridges, "
+            "carved hollow-trunk cottages, glowing winged fairy companions (Navi) trailing radiant golden sparkle dust, "
+            "and the towering Great Deku Tree emerald canopy dominating the horizon"
         ),
         "scene_flavor": {
-            "morning": "dewy morning sunbeams breaking through the Great Deku Tree's ancient emerald canopy, glowing fairy Navi fluttering near the bridge, misty forest floor with blue wildflowers",
-            "afternoon": "sunlit clearing in Kokiri Forest, vibrant sunbeams dancing across wooden boardwalks and mossy hollow logs, sparkling fairy dust drifting gently",
-            "evening": "twilight amber dusk in Kokiri Forest, glowing fairy lantern light casting warm golden rings on ancient bark, deep indigo twilight sky visible through towering forest branches",
+            "morning": "elevated mossy wooden suspension bridge high in the Kokiri Forest canopy, dewy morning sunbeams slicing through the Great Deku Tree's ancient emerald branches above a misty wildflower ravine",
+            "afternoon": "sun-dappled courtyard outside Link's hollow-trunk treehouse in lower Kokiri Forest, stepped wooden boardwalks winding past carved log fences, giant emerald forest ferns, and a bubbling woodland brook",
+            "evening": "Sacred Forest Meadow stone threshold at the edge of Kokiri Forest, ancient mossy Hylian stone arches and carved totems glowing under floating fairy lanterns and a deep indigo twilight canopy",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% background, the colossal bearded wooden face of the Great Deku Tree rises above the misty ravine while a glowing blue-white winged fairy (Navi) and a friendly green-tunic Kokiri villager cross a distant log bridge",
+            "afternoon": "In the open LEFT 58% midground, a cheerful Deku Sprout and a mischievous Skull Kid silhouette perched on a mossy tree stump appear near the distant Lon Lon Ranch windmill visible through a break in the woods",
+            "evening": "In the open LEFT 58% background, Saria's wooden forest bridge and the distant turreted silhouette of Hyrule Castle and Death Mountain smoke ring glow softly beneath warm floating fairy orbs",
         },
         "context_tags": ["zelda", "ocarina of time", "oot", "nintendo", "switch", "fantasy"],
     },
@@ -165,14 +171,20 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "zelda_botw_watercolor",
         "name": "Zelda: Breath of the Wild (Painterly Watercolor)",
         "prompt_style": (
-            "The Legend of Zelda: Breath of the Wild painterly watercolor and cel-shaded concept art, "
-            "sweeping open Hyrule wilderness, rolling wind-swept golden-green hills, ancient moss-covered Guardian "
-            "stone ruins overgrown with silent princess wildflowers, vast vivid open sky with soft painterly cumulus clouds"
+            "The Legend of Zelda: Breath of the Wild open-air cel-shaded gouache and sweeping plein-air watercolor painting, "
+            "crisp anime contour accents over expressive wet-on-wet atmospheric landscape washes, vast untamed Hyrule wilderness, "
+            "wind-rippled golden-green prairie grass, weathered ancient Sheikah stone ruins overgrown with glowing Silent Princess wildflowers, "
+            "and towering painterly cumulus clouds"
         ),
         "scene_flavor": {
-            "morning": "crisp morning mountain breeze across sweeping green plateau, soft pastel dawn horizon, gentle mountain mist",
-            "afternoon": "wide expansive sunlit Hyrule hillside, gentle wind ripples through tall grass, ancient stone archway in distance",
-            "evening": "dramatic golden-hour dusk over rolling mountain peaks, warm magenta and amber twilight sky, distant ancient towers glowing faint blue",
+            "morning": "crisp cliffside overlook atop the Great Plateau stone precipice, ruined Temple of Time bell tower rising behind dewy highland grass and drifting valley mist",
+            "afternoon": "sun-drenched Hateno Village hillside path lined with half-timbered windmill cottages, terraced dye-shop banners flapping in the breeze, and rolling green pastures",
+            "evening": "dramatic golden-hour ridge above Lake Hylia and its colossal stone bridge viaduct, warm magenta twilight reflecting across the water toward twin cleft mountain peaks",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% midground, two tiny leaf-masked Koroks peek out from behind a moss-covered deactivated Guardian wreck while a distant orange-glowing Sheikah Resurrection Tower pierces the horizon",
+            "afternoon": "In the open LEFT 58% sky and valley, a lone adventurer gliding on a wooden paraglider drifts above a rustic Horse Stable tent crowned with its giant carved horse-head roof",
+            "evening": "In the open LEFT 58% distance, the bioluminescent blue-green silhouette of the Lord of the Mountain (Satori) glows beneath a cherry blossom tree on a far ridge while Vah Medoh banks high in the sunset clouds",
         },
         "context_tags": ["zelda", "botw", "breath of the wild", "totk", "hyrule", "switch"],
     },
@@ -180,14 +192,20 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "links_awakening_diorama",
         "name": "Zelda: Link's Awakening (Miniature Tilt-Shift Diorama)",
         "prompt_style": (
-            "The Legend of Zelda: Link's Awakening tilt-shift miniature toy diorama, glossy smooth clay-like "
-            "chibi figurines, handcrafted toy-box aesthetic, soft depth of field, rounded wooden trees, tiny potted shrubs, "
-            "warm ambient studio lighting with glossy reflections"
+            "The Legend of Zelda: Link's Awakening Switch remake macro tilt-shift miniature toy diorama, "
+            "high-gloss molded vinyl and glazed ceramic chibi figurines, vacuum-formed plastic foliage, "
+            "beveled wooden toy-box terrain blocks, razor-shallow macro depth-of-field bokeh, "
+            "and crisp specular studio key-light reflections (strictly physical toy-miniature photography aesthetic, never flat 2D drawing)"
         ),
         "scene_flavor": {
-            "morning": "morning sun glinting off glossy miniature ceramic houses and tiny wooden fencing in Mabe Village",
-            "afternoon": "charming sunlit toy-box beach trail with miniature palm trees and glossy sea shells along the path",
-            "evening": "miniature dusk lighting with warm glowing tabletop fairy bulbs illuminating tiny clay cottage verandas",
+            "morning": "miniature Mabe Village town square paved with glossy interlocking toy cobbles, red-roofed plastic cottages, tiny white picket fences, and a sparkling resin village well",
+            "afternoon": "sunlit Toronbo Shores miniature diorama beach made of coarse golden kinetic sand, translucent blue resin waves, glossy plastic coconut palms, and painted driftwood logs",
+            "evening": "Tal Tal Mountain Foothills stepped toy-block cliff path with miniature wooden suspension bridges, glossy gray plastic boulders, and warm LED-lit cave lanterns",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% background, a shiny black spherical toy Chain Chomp strained on a metal link chain sits outside Madam MeowMeow's kennel beside a colorful weathercock statue",
+            "afternoon": "In the open LEFT 58% horizon, the colossal pink-spotted Wind Fish Egg crowns the peak of Mount Tamaranch above a beached miniature wooden shipwreck",
+            "evening": "In the open LEFT 58% midground, a tiny sculpted owl perched on a signpost and a smiling Marin figurine holding a golden harp stand near a glowing telephone booth cottage",
         },
         "context_tags": ["zelda", "link's awakening", "mabe village", "nintendo", "toy"],
     },
@@ -195,14 +213,20 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "studio_ghibli_gouache",
         "name": "Studio Ghibli (Hand-Painted Gouache & Watercolor)",
         "prompt_style": (
-            "Hand-painted Studio Ghibli watercolor and gouache illustration with delicate warm ink linework, "
-            "lush storybook botanical and rustic architectural detail, soft luminous natural lighting, gentle film grain, "
-            "whimsical European-Japanese countryside aesthetic with floating puffy cumulus clouds"
+            "Hand-painted Studio Ghibli watercolor and gouache cel-animation background masterwork by Kazuo Oga, "
+            "opaque poster-color gouache foliage built from thousands of rich visible brushwork dabs, "
+            "delicate warm sepia ink character outlines, nostalgic European-Japanese pastoral architecture, "
+            "and towering luminous white cumulonimbus clouds"
         ),
         "scene_flavor": {
-            "morning": "sunlit garden terrace beside a mossy stone cottage wall, climbing morning glory vines, fresh morning dew",
-            "afternoon": "breezy countryside meadow overlooking distant rolling hills and a winding brick path lined with wildflowers",
-            "evening": "warm lantern-lit cottage porch at twilight, amber window glow casting soft light across a flagstone path under a violet evening sky",
+            "morning": "sunlit flagstone conservatory terrace beside an ivy-draped timber-and-stucco country house, overflowing terracotta herb pots, and a wooden water-pump well",
+            "afternoon": "breezy coastal hillside tram stop overlooking a sparkling cobalt sea harbor, red-brick clocktower rooftops, and a sunken wildflower footpath",
+            "evening": "lantern-lit wooden bathhouse footbridge spanning a misty river gorge at twilight, warm amber shoji-screen windows reflecting in the water below",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% garden background, a giant round-bellied gray Totoro silhouette holding a leaf umbrella stands quietly beside a rustic camphor tree while tiny black Soot Sprites peek from the stone wall",
+            "afternoon": "In the open LEFT 58% coastal sky, a young witch in a red bow flying on a broomstick and a retro red seaplane bank gracefully past a distant walking mechanical castle silhouette",
+            "evening": "In the open LEFT 58% midground, a grinning twelve-legged Catbus with glowing golden headlight eyes bounds silently along a wooden power-line ridge while white paper-bird spirits flutter over the bridge",
         },
         "context_tags": ["ghibli", "totoro", "kiki", "ponyo", "howl", "anime", "plex", "movie"],
     },
@@ -210,14 +234,20 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "spiderverse_halftone",
         "name": "Spider-Verse (Dynamic Halftone & Comic Animation)",
         "prompt_style": (
-            "Spider-Verse dynamic stylized comic animation art style, subtle visible Ben-Day halftone dot patterns, "
-            "crisp graphic ink contours, subtle chromatic aberration edge accents, vibrant stylized color grading, "
-            "cinematic animated concept art"
+            "Into the Spider-Verse bold graphic comic-book animation art, aggressive oversized CMYK Ben-Day halftone dot matrices, "
+            "heavy jagged black India-ink brush contours, dramatic RGB cyan-magenta chromatic aberration edge splits, "
+            "hand-drawn diagonal comic crosshatching on shadows, vivid pop-art street-graffiti color palette, "
+            "and stylized angular Spider-Verse character rendering (strictly bold graphic comic print aesthetic, never soft generic children's-book illustration)"
         ),
         "scene_flavor": {
-            "morning": "crisp morning skyline with stylized halftone clouds and sharp graphic sunbeams cutting through city rooftop gardens",
-            "afternoon": "vibrant sun-drenched rooftop terrace with expressive graphic shadows, vivid sky blues, and dynamic comic textures",
-            "evening": "dramatic twilight skyline bathed in rich magenta and electric orange, glowing halftone city lights twinkling in the background",
+            "morning": "gritty Brooklyn elevated steel subway overpass and mural-splashed red-brick street corner, diagonal riveted iron girders casting bold hatched shadows across wet asphalt",
+            "afternoon": "high-altitude Brooklyn Bridge granite tower and suspension-cable promenade overlook, sweeping geometric web of steel cables framing the sun-blasted East River and lower Manhattan skyscrapers",
+            "evening": "neon-drenched Brooklyn rooftop water-tower ledge towering above an electric magenta, cyan, and acid-yellow Manhattan night skyline exploding with halftone light blooms",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% background, Miles Morales in his black-and-red Spider-Man suit and a red hooded puffer vest swings dynamically between elevated train girders on a crisp white comic web-line",
+            "afternoon": "In the open LEFT 58% sky across the suspension cables, Spider-Gwen in her white-hooded suit performs an acrobatic mid-air web-swing arc leaving bold graphic action lines against the halftone clouds",
+            "evening": "In the open LEFT 58% skyline, a fractured neon polygonal multiverse glitch portal shimmers between two skyscraper spires as Miles Morales and Spider-Ham leap in dynamic comic silhouette across a billboard",
         },
         "context_tags": ["spider-man", "spiderverse", "marvel", "comic", "animation", "plex"],
     },
@@ -225,14 +255,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "calvin_hobbes_ink_wash",
         "name": "Calvin & Hobbes (Loose Ink & Watercolor Wash)",
         "prompt_style": (
-            "Bill Watterson Calvin and Hobbes classic Sunday comic strip watercolor illustration, "
-            "expressive energetic brush ink linework, soft luminous watercolor washes, nostalgic outdoor adventure, "
-            "whimsical natural landscape with textured foliage and loose spontaneous ink contours"
+            "Bill Watterson Calvin and Hobbes Sunday comic strip masterwork, dynamic variable-width sable-brush India ink linework "
+            "with energetic splatters and calligraphic tree bark strokes, transparent luminous pan-watercolor washes on crisp white Bristol board, "
+            "and untamed backyard woodland wonder"
         ),
         "scene_flavor": {
-            "morning": "crisp early morning woods with loose ink trees and fresh pastel watercolor wash skies",
-            "afternoon": "sunny hillside meadow with tumbling autumn leaves, loose breezy ink strokes, and warm yellow watercolor sunlight",
-            "evening": "peaceful dusk under a majestic sprawling oak tree, rich indigo and violet watercolor twilight wash with ink silhouette branches",
+            "morning": "dewy rocky creek bed winding through a gnarled hardwood forest, stepping-stone boulders, leaning fallen birch logs, and loose brush-ink cattails",
+            "afternoon": "steep windswept grassy ridge and hollow dirt ravine at the edge of the woods, crooked wooden treehouse ladder disappearing into sprawling oak branches",
+            "evening": "quiet suburban front porch stoop and twilight lawn bordered by towering ink-silhouette maples, long violet watercolor shadows, and a starry indigo wash sky",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% midground, a bright red wooden wagon sits parked near a log bridge with an orange-and-black striped stuffed tiger perched attentively in the front seat",
+            "afternoon": "In the open LEFT 58% hillside, an upside-down corrugated cardboard box labeled with scrawled transmogrifier arrows sits near a tree stump while a saucer-shaped Spaceman Spiff cloud streaks across the sky",
+            "evening": "In the open LEFT 58% twilight yard, the tall friendly silhouette of a mischievous striped tiger leans against a wooden treehouse trunk gazing up at a ringed Saturn planet hanging in the ink-wash sky",
         },
         "context_tags": ["calvin and hobbes", "comic", "strip", "adventure", "books", "humor"],
     },
@@ -240,14 +275,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "snes_pixel_storybook",
         "name": "SNES 16-Bit Pixel Storybook",
         "prompt_style": (
-            "High-definition 16-bit Super Nintendo pixel storybook art, meticulously handcrafted pixel art landscape "
-            "reminiscent of Chrono Trigger and Secret of Mana, rich vibrant color palette, nostalgic 90s RPG scenic overlook, "
-            "crisp pixel cluster shading with lush botanical details"
+            "Authentic 16-bit Super Nintendo CRT pixel art masterwork in the style of Chrono Trigger and Secret of Mana, "
+            "strict indexed 256-color palette, razor-sharp integer-scaled square pixels, hand-placed checkerboard dithering gradients, "
+            "chunky pixel-cluster foliage tiles, and parallax scrolling RPG background layers (strictly crisp visible pixel grid, never smooth vector or blurred painting)"
         ),
         "scene_flavor": {
-            "morning": "morning sun rising over a 16-bit hillside overlook, tiered pixel cliffs, gentle pixelated river cascading below",
-            "afternoon": "sunlit RPG village outskirts with colorful pixel flora, cobblestone trail, and charming wooden cottage roofs",
-            "evening": "twilight 16-bit campfire or village lantern glow under an expansive pixelated starry gradient night sky",
+            "morning": "16-bit Millennial Fair town plaza paved with tiled pixel cobblestones, fluttering pixelated pennants, a central bronze bell stall, and tiered cliff overlooks",
+            "afternoon": "sunlit Secret of Mana upper canopy waterfall sanctuary, giant emerald pixel banyan roots, wooden rope bridges, and animated-style pixel spray rainbows",
+            "evening": "twilight RPG cliffside campsite overlooking a mode-7 tiled ocean bay, crackling 16-bit pixel campfire, and a dithered purple-to-navy starry night sky",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% pixel plaza, a quirky 16-bit golden robot sprite and a frog-knight paladin stand near a glowing blue teleporter pod stall",
+            "afternoon": "In the open LEFT 58% background, the colossal pixelated Mana Tree towers above the waterfall while a white feathered Flammie dragon banks across the dithered clouds",
+            "evening": "In the open LEFT 58% twilight sky, the winged white time-machine airship Epoch streaks over a distant pixel castle silhouette and a sleeping green Rabite monster",
         },
         "context_tags": ["snes", "chrono trigger", "pixel", "rpg", "retro", "gaming"],
     },
@@ -255,13 +295,20 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "cut_paper_collage",
         "name": "Cut-Paper Layered Collage",
         "prompt_style": (
-            "Handcrafted cut-paper collage illustration, multi-layered textured paper sheets with soft physical drop shadows, "
-            "clean geometric silhouettes, tactile heavy-stock paper textures, warm ambient side-lighting creating genuine physical dimensional depth"
+            "Tactile multi-layered cut-paper shadowbox diorama in the style of Eric Carle and Eiko Ojala, "
+            "hand-cut deckle-edge heavy cotton cardstock layers, painted tissue-paper collage textures, "
+            "physical 3D foam-core spacing casting crisp real drop-shadows between every overlapping paper plane, "
+            "and studio raking side-light"
         ),
         "scene_flavor": {
-            "morning": "layered pastel paper hills and delicate cut-paper floral petals bathed in soft morning side-light",
-            "afternoon": "vibrant multi-tiered cut-paper meadow with textured cardstock trees and geometric fluffy paper clouds",
-            "evening": "deep midnight blue and warm amber paper silhouettes of rolling hills, with a luminous cut-out paper moon and stars",
+            "morning": "stepped paper-craft alpine valley with overlapping die-cut pine ridge layers, accordion-folded paper waterfall, and curled quilled-paper wildflower beds",
+            "afternoon": "vibrant paper-collage harbor boardwalk built from corrugated kraft-board planks, layered geometric paper-cut waves, and striped origami market canopies",
+            "evening": "deep indigo shadowbox village perched on tiered paper cliffs, back-lit translucent vellum cottage windows glowing warm amber beneath a suspended paper crescent moon",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% paper sky, a multicolored geometric origami hot-air balloon and a folded paper crane flock float above a layered cardstock mountain peak",
+            "afternoon": "In the open LEFT 58% harbor water, a charming folded-newsprint sailboat and a segmented green tissue-paper caterpillar crawling along a giant die-cut apple leaf appear in crisp paper relief",
+            "evening": "In the open LEFT 58% cliffside, a backlit cut-paper lighthouse projects a physical cone of translucent vellum yellow light across layered paper storm-cloud waves",
         },
         "context_tags": ["craft", "paper", "art", "collage", "geometric"],
     },
@@ -269,13 +316,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "aardman_claymation",
         "name": "Aardman Claymation Stop-Motion",
         "prompt_style": (
-            "Aardman stop-motion claymation style, handcrafted plasticine clay textures with subtle tactile fingerprint marks, "
-            "expressive sculpted clay figurines, warm tactile studio miniature-set lighting, cozy British storybook diorama aesthetic"
+            "Aardman Animations stop-motion plasticine claymation set photograph, genuine hand-sculpted oil-based clay characters "
+            "and props covered in visible thumbprints and sculpting-tool grooves, wide-mouth beaded eyes, "
+            "physical miniature wooden-and-wire set dressing, and warm tungsten tabletop studio lighting"
         ),
         "scene_flavor": {
-            "morning": "charming clay garden patch with sculpted plasticine vegetables, miniature wooden fence, and soft warm studio morning light",
-            "afternoon": "sunlit miniature cobblestone path with charming clay cottages, sculpted chimney pots, and bright plasticine flowers",
-            "evening": "cozy twilight scene outside a clay cottage with glowing yellow plasticine windows and miniature brass streetlamp",
+            "morning": "miniature British allotment vegetable garden enclosed by a crooked popsicle-stick fence, oversized sculpted plasticine marrow squashes, clay flowerpots, and a corrugated tin shed",
+            "afternoon": "cobblestone Yorkshire village high street with crooked brick-textured clay row houses, miniature round-paned shop windows, and a red plasticine pillar postbox",
+            "evening": "cozy wallpapered claymation living room and bay-window conservatory overlooking a moonlit miniature garden, glowing grain-of-wheat bulb wall sconces, and a knitted wool rug",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% garden patch, a silent clever plasticine beagle dog wearing a yellow rain hat reads a tiny clay newspaper beside a prize-winning giant carrot",
+            "afternoon": "In the open LEFT 58% cobblestone street, a flock of cheeky black-faced wool-and-clay sheep stacked atop a vintage sidecar motorcycle coast past a 'West Wallaby Street' sign",
+            "evening": "In the open LEFT 58% conservatory yard, a riveted orange sheet-metal moon rocket stands on a miniature launchpad while a villainous penguin wearing a red rubber-glove hat peeks over the garden wall",
         },
         "context_tags": ["claymation", "aardman", "wallace", "gromit", "animation"],
     },
@@ -283,13 +336,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "ukiyoe_woodblock",
         "name": "Shin-Hanga & Ukiyo-e Woodblock Print",
         "prompt_style": (
-            "Traditional Japanese Shin-Hanga and Ukiyo-e woodblock print illustration, elegant carved black key-line woodcut contours, "
-            "subtle bokashi gradient ink blending, fibrous textured washi paper surface, atmospheric nature vista with timeless botanical elegance"
+            "Authentic Japanese Edo-period Ukiyo-e and Taisho Shin-Hanga polychrome woodblock print (mokuhanga) "
+            "in the style of Hokusai and Hasui Kawase, bold hand-carved sumi-ink cherrywood keyblock outlines, "
+            "hand-rubbed bokashi Prussian-blue and vermilion pigment gradients, and visible mulberry washi paper fibers"
         ),
         "scene_flavor": {
-            "morning": "misty morning lake shore with graceful pine boughs, soft bokashi pink and gold sunrise wash on fibrous washi paper",
-            "afternoon": "crisp cedar forest path with delicate carved woodcut foliage, gentle mountain stream, and clear cobalt sky",
-            "evening": "twilight indigo woodblock vista with a crescent moon peeking through silhouetted Japanese maple branches",
+            "morning": "arched red-lacquered drum bridge over a misty koi pond and weeping willow bank, framed by gnarled black-pine boughs and morning bokashi horizon bands",
+            "afternoon": "windswept coastal bluff and stone torii gate overlooking stylized curling Prussian-blue finger waves and foam sprays beneath a towering snow-capped volcano",
+            "evening": "traditional wooden canal street of Edo at twilight, hanging paper chochin lanterns glowing crimson and gold along slatted timber teahouse facades",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% pond vista, two red-crowned tancho cranes wade near a stone kasuga lantern while a wooden sculling sampan boat glides through the mist",
+            "afternoon": "In the open LEFT 58% ocean horizon, the iconic snow-mantled cone of Mount Fuji rises behind a dramatic Hokusai-style curling wave crest and wooden fishing skiffs",
+            "evening": "In the open LEFT 58% canal sky, a silhouette flight of wild geese crosses a huge woodblock full moon above a five-story wooden pagoda roof",
         },
         "context_tags": ["japan", "woodblock", "ukiyo-e", "shin-hanga", "art"],
     },
@@ -297,13 +356,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "golden_books_gouache",
         "name": "Little Golden Books Mid-Century Gouache",
         "prompt_style": (
-            "Classic 1950s Little Golden Books gouache illustration style, bold retro-flat gouache colors, charming mid-century "
-            "children's book textured paper, Mary Blair inspired geometric whimsy, nostalgic warmth and innocent joyful storybook charm"
+            "Vintage 1950s Little Golden Books mid-century modern gouache illustration in the style of Mary Blair and Tibor Gergely, "
+            "chalky opaque designer-gouache color blocks, dry-brush crayon grain on warm cream offset-lithograph paper, "
+            "whimsical stylized geometric trees, and bold saturated turquoise, coral, mustard, and chartreuse palette"
         ),
         "scene_flavor": {
-            "morning": "bright cheerful mid-century garden with stylized gouache sunflowers, painted wooden birdhouse, and retro pastel morning sunshine",
-            "afternoon": "breezy rolling hillside with playful flat-color trees, whimsical patterned picnic blanket, and bold cheerful brushwork",
-            "evening": "cozy storybook bedroom window or twilight porch with warm golden gouache lamplight and deep stylized navy night sky",
+            "morning": "cheerful mid-century suburban railway depot with a scalloped mint-green platform canopy, stacked vintage luggage carts, and stylized geometric topiary bushes",
+            "afternoon": "whimsical 1950s children's park carousel pavilion and ice-cream parlor terrace, checkerboard paving tiles, and flat-color lollipop trees",
+            "evening": "retro mid-century harbor bay at dusk, stylized triangular sailboats moored beside a candy-striped boardwalk and glowing pastel carousel lights",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% tracks, a smiling cherry-red steam locomotive with a brass cowcatcher puffs heart-shaped white gouache smoke clouds over a trestle bridge",
+            "afternoon": "In the open LEFT 58% park lawn, a scruffy brown-and-white poky little puppy peeks out from a freshly dug hole beneath a picket fence alongside a bright red fire engine",
+            "evening": "In the open LEFT 58% harbor water, a plucky little blue tugboat with a painted smiling prow steams past a mid-century suspension bridge and geometric skyline",
         },
         "context_tags": ["golden books", "mary blair", "vintage", "mid-century", "storybook", "children"],
     },
@@ -311,13 +376,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "lofi_cozy_anime",
         "name": "Lo-Fi Cozy Chillhop Anime",
         "prompt_style": (
-            "Cozy Lo-Fi chillhop anime illustration, soft warm aesthetic, detailed nostalgic environment, "
-            "gentle atmospheric lighting, potted houseplants, warm tea cups, serene peaceful warmth, soothing pastel palette"
+            "90s cel-shaded Lo-Fi Chillhop anime background illustration in the style of Makoto Shinkai and ChilledCow aesthetics, "
+            "crisp hand-inked purple-tinted linework, VHS chromatic bloom and halation, lush hanging pothos and monstera houseplants, "
+            "nostalgic Japanese clutter, and dreamy lo-fi color grading"
         ),
         "scene_flavor": {
-            "morning": "sun-drenched morning sunroom filled with lush potted monsteras and ferns, golden dust motes floating in warm light beams",
-            "afternoon": "peaceful sunlit balcony garden overlooking leafy quiet neighborhood streets, soft pastel blue sky and gentle breeze",
-            "evening": "cozy twilight veranda with warm string fairy lights, steaming ceramic mugs, and soothing deep lavender evening sky",
+            "morning": "glass-roofed corner vinyl-record cafe and botanical conservatory, espresso machine steam, wood-slat shelves crammed with cassettes, and sun-dappled industrial windows",
+            "afternoon": "elevated Tokyo suburban commuter train platform and pedestrian overpass, vending machines, overhead catenary wires, and cherry-blossom branches overhanging the railing",
+            "evening": "cluttered attic dormer studio opening onto a tiled rooftop terrace, glowing dual-monitor desk lamp, fairy string lights wrapped around balcony railings, and a sprawling violet city basin below",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% cafe window counter, a chubby ginger tabby cat wearing oversized retro studio headphones naps beside a spinning vinyl turntable and a steaming matcha mug",
+            "afternoon": "In the open LEFT 58% background tracks, a cream-and-green vintage two-car commuter train glides over a steel truss bridge while a shiba inu in a yellow bandana waits by a retro drink vending machine",
+            "evening": "In the open LEFT 58% rooftop horizon, the illuminated red-and-white lattice spire of Tokyo Tower glows beneath a shooting star and drifting lo-fi cassette-tape clouds",
         },
         "context_tags": ["lofi", "chillhop", "anime", "cozy", "music", "coffee"],
     },
@@ -325,13 +396,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "nordic_folk_storybook",
         "name": "Nordic Scandinavian Folk Tale",
         "prompt_style": (
-            "Scandinavian Nordic folk art storybook illustration, intricate floral rosemaling patterns, stylized forest pine trees "
-            "and woodland creatures, earthy palette of deep forest green, terracotta, mustard yellow, and warm cream, Hans Christian Andersen tale aesthetic"
+            "Scandinavian Dalarna and Norwegian Rosemaling folk-art tapestry illustration in the style of John Bauer and Elsa Beskow, "
+            "ornate symmetrical scrolling acanthus vine borders, hand-stamped woodcut linen texture, stylized geometric spruce trees, "
+            "and a rich folk pigment palette of oxblood red, indigo, ochre gold, and pine green"
         ),
         "scene_flavor": {
-            "morning": "crisp boreal forest clearing bordered by stylized pine trees and lingonberry bushes, soft pale Nordic morning sun",
-            "afternoon": "charming timber cottage meadow with decorative wooden fences, patterned wildflowers, and warm amber sunshine",
-            "evening": "mystical twilight northern forest with stylized glowing lantern and twinkling stars peeking through geometric pine branches",
+            "morning": "moss-carpeted Scandinavian boreal stave-church courtyard and carved timber gate, surrounded by frost-kissed bilberry bushes and towering lichen-draped spruces",
+            "afternoon": "Falu-red Swedish timber farmhouse meadow with a turf-grass sod roof, woven split-rail fence, and a painted wooden Dala-horse weathervane",
+            "evening": "misty Nordic fjord headland at twilight, carved viking dragon-prow boathouse on the rocky shore beneath swirling emerald-and-violet aurora borealis ribbons",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% forest clearing, a friendly oversized carved-pattern red Dala Horse and a crowned golden-antlered white elk stand among giant red-and-white fly agaric toadstools",
+            "afternoon": "In the open LEFT 58% meadow wall, a bearded Nordic Tomte gnome in a tall pointed red wool cap pushes a tiny wooden wheelbarrow of apples past a rosemaling-painted barn door",
+            "evening": "In the open LEFT 58% fjord water, a friendly round-nosed John Bauer forest troll sitting on a mossy boulder watches a wooden longship sail beneath the northern lights",
         },
         "context_tags": ["nordic", "scandinavian", "folk", "storybook", "winter", "forest"],
     },
@@ -339,13 +416,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "ligne_claire_comic",
         "name": "Franco-Belgian Ligne Claire Comic",
         "prompt_style": (
-            "Franco-Belgian Ligne Claire comic illustration style reminiscent of Hergé's Tintin, crisp uniform black ink line work "
-            "of equal weight, clear flat solid color fills, meticulously detailed architectural and natural backgrounds, classic European graphic novel clarity"
+            "Classic Franco-Belgian Ligne Claire graphic novel art in the exact tradition of Hergé's Adventures of Tintin and Edgar P. Jacobs, "
+            "dead-uniform Rapidograph black ink outlines of equal weight with zero hatching or feathering, "
+            "flat unmodulated gouache color fills, and razor-sharp architectural draftsmanship"
         ),
         "scene_flavor": {
-            "morning": "pristine morning village square with detailed European stone facades, striped awnings, and crisp clean linework under clear blue sky",
-            "afternoon": "scenic coastal path or garden terrace with clear geometric sailboats on the water and immaculate clean graphic foliage",
-            "evening": "quiet charming cobblestone alley at dusk, crisp lamppost casting clean geometric shadows against warm brick walls",
+            "morning": "sunlit Brussels cobblestone grand square and antique flea-market arcade, ornate stepped-gable guildhalls, wrought-iron balconies, and striped canvas merchant stalls",
+            "afternoon": "Marlinspike Hall neoclassical chateau terrace and manicured boxwood parterre garden, limestone balustrade, gravel drive, and ornamental dolphin fountain",
+            "evening": "fog-kissed European cargo dockyard and stone quay at dusk, iron bollards, towering gantry cranes, riveted freighter hulls, and sharp geometric lamppost cones",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% market square, a wiry white fox-terrier dog sniffs a three-masted wooden model galleon display while two identical bowler-hatted detectives in dark suits peer around a kiosk",
+            "afternoon": "In the open LEFT 58% chateau lawn, the iconic red-and-white checkered moon rocket towers above the distant treeline while a vintage yellow sports coupé parks along the gravel drive",
+            "evening": "In the open LEFT 58% harbor slip, the black-and-red tramp steamer Karaboudjan sits moored below a yellow-suited deep-sea diver helmet display and a floating wooden cargo crate",
         },
         "context_tags": ["tintin", "ligne claire", "comic", "european", "belgian", "adventure"],
     },
@@ -353,13 +436,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "oil_pastel_impressionist",
         "name": "Oil Pastel & Impressionist Canvas",
         "prompt_style": (
-            "Rich oil pastel and textured impressionist oil painting, vibrant tactile pigment strokes, dappled natural sunlight "
-            "filtering through lush tree canopies, broken color technique reminiscent of Claude Monet and Mary Cassatt, warm emotional atmosphere"
+            "Heavy impasto Sennelier oil-pastel and palette-knife impressionist canvas in the tradition of Claude Monet and Mary Cassatt, "
+            "thick sculptural ridges of unblended pure pigment, vibrant optical broken-color dabs of violet, cadmium yellow, viridian, "
+            "and rose madder, and coarse unprimed linen canvas weave showing through"
         ),
         "scene_flavor": {
-            "morning": "dappled morning sunlight dancing across a wildflower garden, rich creamy oil pastel strokes of lilac, buttercup yellow, and sage",
-            "afternoon": "sunlit orchard path with vibrant textured strokes of golden light on grassy banks and apple tree boughs",
-            "evening": "glowing sunset over a tranquil pond with thick textured reflections of apricot, rose, and violet in the water",
+            "morning": "Giverny-inspired arched green wooden footbridge over a lily-pad water garden, trailing lavender wisteria garlands and shimmering pastel water reflections",
+            "afternoon": "windswept French poppy field on a chalky cliff overlooking the Normandy sea stacks, swirling impasto ribbon strokes of scarlet poppies and cobalt waves",
+            "evening": "warm gas-lit Parisian boulevard and riverside stone parapet at twilight, thick palette-knife daubs of golden cafe awning reflections on wet paving stones",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% lily pond bank, a wooden French plein-air easel with a straw boater hat hanging on its corner stands beside a white wooden rowboat among blooming water lilies",
+            "afternoon": "In the open LEFT 58% cliff horizon, the natural stone arch of Étretat and two cream-sailed wooden yachts catch thick palette-knife ridges of golden sunlight",
+            "evening": "In the open LEFT 58% river vista, the iron silhouette of the Eiffel Tower and an arched stone Seine bridge glow in vibrant pointillist dabs of amber and violet",
         },
         "context_tags": ["impressionist", "monet", "cassatt", "oil pastel", "painting", "art"],
     },
@@ -367,13 +456,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "botanical_field_guide",
         "name": "19th-Century Botanical Naturalist Field Guide",
         "prompt_style": (
-            "Vintage 19th-century naturalist field guide illustration, delicate scientific watercolor with fine sepia calligraphic ink details, "
-            "labeled botanical flora and gentle garden birds in soft marginal vignetting, aged warm ivory parchment paper background, archival plate aesthetic"
+            "19th-century Victorian copperplate botanical etching and hand-tinted naturalist specimen plate "
+            "in the style of Ernst Haeckel and Beatrix Potter, fine iron-gall sepia dip-pen crosshatching, "
+            "translucent botanical specimen watercolors on deckle-edged foxed rag vellum paper, and ornamental specimen border corners"
         ),
         "scene_flavor": {
-            "morning": "morning botanical study with dew-kissed fern fronds, flowering dogwood boughs, and delicate morning warbler in soft sepia watercolor",
-            "afternoon": "sunlit garden flora with detailed cross-sections of wildflowers, fluttering swallowtail butterflies, and warm botanical watercolor washes",
-            "evening": "twilight garden study featuring night-blooming jasmine, soft moth wings, and gentle sepia wash shadows on warm tea-stained paper",
+            "morning": "Victorian wrought-iron palm-house conservatory interior surrounded by giant Amazonian water-lily pads, hanging pitcher plants, and etched glass rib vaults",
+            "afternoon": "English Cotswold stone kitchen-garden apothecary path bordered by braided willow wattle hurdles, terracotta rhubarb cloches, and heritage rose trellises",
+            "evening": "specimen oak woodland hollow at dusk, giant shelf-fungi brackets, unfurling fiddlehead fern croziers, and bioluminescent foxfire mushrooms drawn in fine sepia ink",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% parchment margin, a scientific magnifying brass lens, a compass rose medallion, and an iridescent blue morpho butterfly specimen vignette frame the conservatory glass",
+            "afternoon": "In the open LEFT 58% garden patch, a dapper brown rabbit wearing a brass-buttoned blue waistcoat scurries past a copper watering can and a thatched straw bee skep hive",
+            "evening": "In the open LEFT 58% woodland hollow, a speckled barn owl perched on an antique leather naturalist field-journal and a lunar moth with long trailing tails appear in intricate copperplate detail",
         },
         "context_tags": ["botanical", "field guide", "nature", "vintage", "science", "flowers"],
     },
@@ -381,13 +476,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "isometric_toy_world",
         "name": "Charming Isometric Miniature Toy World",
         "prompt_style": (
-            "Charming 3D isometric miniature diorama, handcrafted wooden and ceramic miniature buildings, tiny sculpted trees, "
-            "warm golden overhead sunlight, soft tilt-shift focus, adorable tiny toy town square with cobblestone detail and cheerful miniature greenery"
+            "Precision 30-degree orthographic isometric architectural model diorama, laser-cut basswood and painted beechwood blocks, "
+            "flocked static-grass lawns, clear poured-epoxy water tiles, chamfered modular diorama base edges visible at the ground plane, "
+            "and crisp global-illumination studio softbox lighting"
         ),
         "scene_flavor": {
-            "morning": "isometric morning town square with tiny bakery cart, miniature ceramic planters, and long warm diagonal morning shadows",
-            "afternoon": "busy miniature park with tiny wooden footbridge over a clear resin pond, green felt lawn, and toy wooden benches",
-            "evening": "twilight miniature village with tiny glowing LED streetlamps casting warm puddles of light across the isometric cobblestones",
+            "morning": "modular isometric canal-lock village tile with a working miniature wooden drawbridge, stepped brick canal walls, and a tiny striped patisserie corner block",
+            "afternoon": "isometric alpine cog-railway station cut-away block with miniature pine trees, wooden switchback trestles, and a clear epoxy mountain waterfall basin",
+            "evening": "isometric harbor boardwalk and miniature amusement pier block at nightfall, glowing fiber-optic streetlamps, wooden Ferris wheel, and translucent resin waves",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% canal channel, a painted wooden toy canal barge carrying miniature cheese wheels passes a tiny clockwork windmill with rotating basswood blades",
+            "afternoon": "In the open LEFT 58% mountain track, a bright yellow wooden cog-railway funicular car climbs a 45-degree timber trestle past a tiny carved wooden mountain goat",
+            "evening": "In the open LEFT 58% pier diorama, a miniature fiber-optic lit Ferris wheel and a tiny red die-cast tugboat cast warm pinpoint reflections across the poured-epoxy harbor",
         },
         "context_tags": ["isometric", "diorama", "miniature", "toy", "craft"],
     },
@@ -395,13 +496,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "chalk_twilight",
         "name": "Soft Pastel & Twilight Chalkboard",
         "prompt_style": (
-            "Soft colored chalk and luminous pastel on dark textured paper, glowing radiant highlights, dreamy smudged edges, "
-            "magical twilight embers and fireflies, whimsical dreamy nightfall atmosphere with vibrant luminous pastels cutting through velvety dark tones"
+            "Luminous soft dry chalk-pastel drawing on jet-black sanded Wallis pastel paper, powdery fluorescent pigment dust, "
+            "bold velvety finger-smudged halos, high-contrast neon-pastel rim highlights carved directly out of the exposed black paper grain, "
+            "and sparkling stippled chalk dust"
         ),
         "scene_flavor": {
-            "morning": "soft morning chalk pastel with radiant golden and coral sunbeams breaking through misty velvety charcoal tree silhouettes",
-            "afternoon": "vibrant colorful chalk meadow with bright turquoise skies, sunlit lemon-yellow wildflowers, and tactile powdery texture",
-            "evening": "magical twilight hillside with glowing golden fireflies, luminous chalk stars, and deep velvety indigo sky with soft pink horizon glow",
+            "morning": "velvety black-paper pine ridge where radiant coral, peach, and lemon-yellow chalk sunbeams burst through charcoal-smudged morning fog over a mirror lake",
+            "afternoon": "sun-bleached chalk-cliff wildflower bluff drawn in electric turquoise, magenta, and chartreuse pastel sticks against a deep midnight-blue sky paper grain",
+            "evening": "enchanted bioluminescent willow grove on dark slate paper, cascading curtains of glowing cyan and gold chalk willow fronds above a stepping-stone stream",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% misty lake, a glowing pastel-white origami-style swan boat and a spiral constellation of golden chalk sun-wheels shimmer above the water",
+            "afternoon": "In the open LEFT 58% sky bluff, a whimsical chalk-drawn winged Pegasus constellation and swirling pastel wind spirals sweep across the dark paper grain",
+            "evening": "In the open LEFT 58% willow grove, a glowing translucent chalk-pastel spirit deer and a swirling ribbon of neon-amber fireflies illuminate a crescent-moon stone arch",
         },
         "context_tags": ["chalk", "pastel", "twilight", "fireflies", "dreamy"],
     },
@@ -409,13 +516,19 @@ ART_STYLE_VAULT: dict[str, dict[str, Any]] = {
         "visual_medium": "pixar_storybook_light",
         "name": "Modern Pixar 3D Cinematic Storybook",
         "prompt_style": (
-            "Modern Pixar animated feature 3D concept art lighting, rich cinematic volumetric rim lighting, soft subsurface scattering, "
-            "stylized appealing character proportions, warm emotional cinematic depth, lush environmental rendering with soft depth of field"
+            "Feature-film Pixar RenderMan 3D animation frame, rich physically based subsurface skin and foliage scattering, "
+            "dramatic volumetric god-rays, tactile woven fabric micro-fibers, expressive stylized 3D character sculpts, "
+            "and anamorphic cinema lens bokeh"
         ),
         "scene_flavor": {
-            "morning": "golden morning sunbeams streaming through a cozy breakfast nook window, soft volumetric dust motes, rich warm lighting",
-            "afternoon": "bright cinematic sunlit backyard lawn with lush subsurface scattering on vibrant green leaves and vivid colorful toys",
-            "evening": "cozy twilight backyard patio with warm glowing fairy light bulbs, deep cinematic blue hour atmosphere, and emotional cinematic warmth",
+            "morning": "sun-drenched Italian Riviera cobblestone piazza and stone harbor seawall inspired by Luca, pastel terracotta buildings, hanging laundry lines, and turquoise water",
+            "afternoon": "soaring tabletop tepui sandstone rock canyon and lush jungle waterfall vista inspired by Paradise Falls, giant tropical monstera leaves and rainbow mist",
+            "evening": "glowing marigold-petal stone bridge and candlelit courtyard inspired by Coco and enchanted lantern plazas, warm orange cempasúchil petals covering the ground",
+        },
+        "easter_eggs": {
+            "morning": "In the open LEFT 58% piazza corner, a yellow-and-blue Pixar Luxo ball with a red star and a vintage mint-green Vespa scooter sit beside a stone gelato fountain",
+            "afternoon": "In the open LEFT 58% canyon sky, a colorful Victorian wooden house lifted by thousands of bright helium balloons floats above the distant waterfall cliff alongside a giant rainbow-plumed tropical bird",
+            "evening": "In the open LEFT 58% courtyard background, a white Pizza Planet delivery truck topped with a glowing rocket cone is parked near a shimmering marigold-petal archway",
         },
         "context_tags": ["pixar", "3d", "cinematic", "disney", "animation", "movie"],
     },
