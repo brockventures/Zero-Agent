@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unit tests for tools/mealie_todoist_sync.py.
 
 All HTTP and Todoist API calls are mocked. Zero real network I/O or private IPs.
@@ -18,7 +17,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import tools
 import tools.mealie_todoist_sync as mts
+
+# Ensure worktree REPO_ROOT takes precedence over /workspace after mealie_todoist_sync sys.path setup
+if str(REPO_ROOT) in sys.path:
+    sys.path.remove(str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT))
+tools.__path__ = [str(REPO_ROOT / "tools")]
 
 
 class _FakeHTTPResponse:
@@ -372,3 +378,58 @@ def test_cli_json_output(capsys: pytest.CaptureFixture[str]) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True
     assert len(out["added"]) == 1
+
+
+def test_sidecar_run_mealie_todoist_sync_success_and_failure() -> None:
+    """Verify tools.sidecars.run_mealie_todoist_sync returns silent '' on success and error text on failure."""
+    from tools import sidecars
+
+    ok_res = {
+        "ok": True,
+        "added": [{"id": "1", "title": "Avocados", "normalized": "avocados", "store": "Whole Foods"}],
+        "skipped_pantry": [],
+        "skipped_duplicate": [],
+        "checked_in_mealie": 1,
+        "errors": [],
+    }
+    with patch("tools.mealie_todoist_sync.sync_mealie_to_todoist", return_value=ok_res) as mock_sync:
+        ok, msg, data = sidecars.run_mealie_todoist_sync(dry_run=True)
+
+    assert ok is True
+    assert msg == ""
+    assert data == ok_res
+    mock_sync.assert_called_once_with(dry_run=True)
+
+    fail_res = {
+        "ok": False,
+        "added": [],
+        "skipped_pantry": [],
+        "skipped_duplicate": [],
+        "checked_in_mealie": 0,
+        "errors": ["Mealie fetch failed: HTTP 502"],
+    }
+    with patch("tools.mealie_todoist_sync.sync_mealie_to_todoist", return_value=fail_res):
+        ok_err, msg_err, data_err = sidecars.run_mealie_todoist_sync()
+
+    assert ok_err is False
+    assert "Mealie fetch failed: HTTP 502" in msg_err
+    assert data_err == fail_res
+
+    with patch("tools.mealie_todoist_sync.sync_mealie_to_todoist", side_effect=RuntimeError("connection refused")):
+        ok_exc, msg_exc, data_exc = sidecars.run_mealie_todoist_sync()
+
+    assert ok_exc is False
+    assert "connection refused" in msg_exc
+    assert data_exc["ok"] is False
+
+
+def test_bridge_scheduler_registers_mealie_todoist_sync_constants() -> None:
+    """Verify SILENT_SIDECAR_JOBS and INTERNAL_SYSTEM_MAINTENANCE_JOBS include mealie_todoist_sync."""
+    import tools.bridge_scheduler as bshed
+
+    assert "Mealie to Todoist Shopping List Sync" in bshed.SILENT_SIDECAR_JOBS
+    assert "mealie_todoist_sync" in bshed.SILENT_SIDECAR_JOBS
+    assert "Mealie to Todoist Shopping List Sync" in bshed.INTERNAL_SYSTEM_MAINTENANCE_NAMES
+    assert "mealie_todoist_sync" in bshed.INTERNAL_SYSTEM_MAINTENANCE_NAMES
+    assert "mealie_todoist_sync" in bshed.INTERNAL_SYSTEM_MAINTENANCE_JOBS
+

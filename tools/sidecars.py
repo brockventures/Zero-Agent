@@ -1954,6 +1954,21 @@ def run_tasks_sync(quiet: bool = True, *args, **kwargs) -> tuple[bool, str, dict
         return False, f"⚠️ Google Tasks sync failed: {e}", {"error": str(e)}
 
 
+def run_mealie_todoist_sync(dry_run: bool = False, *args, **kwargs) -> tuple[bool, str, dict]:
+    """Execute one-way shopping list synchronization from Mealie into Todoist."""
+    try:
+        from tools.mealie_todoist_sync import sync_mealie_to_todoist
+        res = sync_mealie_to_todoist(dry_run=dry_run)
+        ok = bool(res.get("ok", True))
+        if not ok:
+            errors = res.get("errors") or []
+            err_detail = "; ".join(str(e) for e in errors) if errors else str(res.get("error") or "unknown error")
+            return False, f"⚠️ Mealie to Todoist sync failed: {err_detail}", res
+        return True, "", res
+    except Exception as e:
+        return False, f"⚠️ Mealie to Todoist sync failed: {e}", {"ok": False, "error": str(e), "errors": [str(e)]}
+
+
 def run_cubs_game_notifier(force: bool = False, test: bool = False) -> tuple[bool, str, any]:
     """Check Cubs schedule and notify ~10 minutes before first pitch."""
     try:
@@ -2929,6 +2944,24 @@ if __name__ == "__main__":
             print(rep)
         else:
             print("(nominal - all tasks in sync)")
+    elif action in ("mealie_todoist_sync", "mealie_sync"):
+        if "--dry-run" in sys.argv:
+            ok, rep, _ = run_sidecar_job(
+                "mealie_todoist_sync",
+                "Mealie to Todoist Shopping List Sync",
+                run_mealie_todoist_sync,
+                dry_run=True,
+            )
+        else:
+            ok, rep, _ = run_sidecar_job(
+                "mealie_todoist_sync",
+                "Mealie to Todoist Shopping List Sync",
+                run_mealie_todoist_sync,
+            )
+        if rep:
+            print(rep)
+        else:
+            print("(nominal - Mealie shopping list in sync)")
     elif action in ("agora_roguelike_pm", "agora_pm"):
         do_dispatch = "--dispatch" in sys.argv
         target_ch = None

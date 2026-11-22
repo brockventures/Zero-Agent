@@ -229,9 +229,13 @@ INTERNAL_SYSTEM_MAINTENANCE_NAMES = {
     "plex_audiobook_enricher",
     "Seerr Media Request Card Sync",
     "seerr_card_sync",
+    "Mealie to Todoist Shopping List Sync",
+    "mealie_todoist_sync",
     "OrcaSlicer 30-Minute Idle Auto-Stop",
     "orcaslicer_idle_reaper",
 }
+
+SILENT_SIDECAR_JOBS = INTERNAL_SYSTEM_MAINTENANCE_NAMES
 
 INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "session_rollover",
@@ -252,6 +256,7 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "resident_agents_daily_tip",
     "plex_audiobook_enricher",
     "seerr_card_sync",
+    "mealie_todoist_sync",
     "orcaslicer_idle_reaper",
 }
 
@@ -1000,6 +1005,30 @@ async def dispatch_scheduled_prompt(
                 print(f"[Scheduler] Seerr card sync checked: {out or 'nominal'} (silent).")
         except Exception as e:
             print(f"[Scheduler] Seerr card sync execution error: {e}")
+        return
+
+    # Mealie to Todoist one-way shopping list sync: silent unless errors occur
+    if (
+        job_id == "mealie_todoist_sync"
+        or "mealie_todoist_sync" in prompt
+        or "mealie_sync" in prompt
+        or job_name in ("Mealie to Todoist Shopping List Sync", "Mealie Shopping List Sync", "mealie_todoist_sync")
+    ):
+        try:
+            from tools.sidecars import run_mealie_todoist_sync
+            ok, out, _ = await _run_sidecar_job_async(
+                "mealie_todoist_sync",
+                "Mealie to Todoist Shopping List Sync",
+                run_mealie_todoist_sync,
+            )
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel()
+                if ch:
+                    await ch.send(out)
+            else:
+                print(f"[Scheduler] Mealie to Todoist sync checked: {out or 'nominal'} (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Mealie to Todoist sync execution error: {e}")
         return
 
     # Home Assistant integration & re-auth check: silent unless integrations fail
