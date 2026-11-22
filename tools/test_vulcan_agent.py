@@ -223,16 +223,16 @@ class TestVulcanAgentScoping(unittest.TestCase):
         self.assertIn("/app/bridge.py:/app/bridge.py", compose)
         self.assertIn("/app/entrypoint.sh:/app/entrypoint.sh", compose)
         self.assertIn("agents.md:/root/.gemini/AGENTS.md:ro", compose)
-        self.assertIn("/opt/docker/discord-agy-agent/gh-config:/root/.config/gh:ro", compose)
-        self.assertIn("/opt/docker/discord-agy-agent/ssh:/root/.ssh:ro", compose)
+        self.assertIn("/opt/docker/discord-agy-agent/secrets/id_ed25519:/root/.ssh/id_ed25519:ro", compose)
+        self.assertNotIn("/root/.config/gh:ro", compose)
 
         staging = pv.build_remote_staging_Payload(docker_root="/opt/docker")
         env_defaults = staging["/opt/docker/discord-vulcan-agent/.env.defaults"]
         self.assertIn("AGENT_NAME=Vulcan", env_defaults)
         self.assertIn("GIT_TERMINAL_PROMPT=0", env_defaults)
         staged_compose = staging["/opt/docker/discord-vulcan-agent/docker-compose.yml"]
-        self.assertIn("/opt/docker/discord-agy-agent/gh-config:/root/.config/gh:ro", staged_compose)
-        self.assertIn("/opt/docker/discord-agy-agent/ssh:/root/.ssh:ro", staged_compose)
+        self.assertIn("/opt/docker/discord-agy-agent/secrets/id_ed25519:/root/.ssh/id_ed25519:ro", staged_compose)
+        self.assertNotIn("/root/.config/gh:ro", staged_compose)
 
         res = pv.provision_vulcan_on_host2(dry_run=True, docker_root="/opt/docker")
         self.assertTrue(res["ok"])
@@ -246,15 +246,14 @@ class TestVulcanAgentScoping(unittest.TestCase):
             mount_git_credentials=False,
         )
         self.assertIn("GIT_TERMINAL_PROMPT=0", compose_no_creds)
-        self.assertNotIn("/root/.config/gh:ro", compose_no_creds)
-        self.assertNotIn("/root/.ssh:ro", compose_no_creds)
+        self.assertNotIn("/root/.ssh/id_ed25519:ro", compose_no_creds)
 
         staging_no_creds = pv.build_remote_staging_Payload(
             docker_root="/opt/docker",
             mount_git_credentials=False,
         )
         self.assertNotIn(
-            "/root/.config/gh:ro",
+            "/root/.ssh/id_ed25519:ro",
             staging_no_creds["/opt/docker/discord-vulcan-agent/docker-compose.yml"],
         )
         self.assertIn(

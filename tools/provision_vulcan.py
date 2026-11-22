@@ -57,10 +57,9 @@ def render_vulcan_compose_yaml(
         f"      - {vulcan_dir}/agents.md:/root/.gemini/GEMINI.md:ro",
     ]
     if mount_git_credentials:
-        volume_lines.extend([
-            f"      - {zero_dir}/gh-config:/root/.config/gh:ro",
-            f"      - {zero_dir}/ssh:/root/.ssh:ro",
-        ])
+        volume_lines.append(
+            f"      - {zero_dir}/secrets/id_ed25519:/root/.ssh/id_ed25519:ro"
+        )
     volumes_block = "\n".join(volume_lines)
 
     return f"""version: "3.8"
