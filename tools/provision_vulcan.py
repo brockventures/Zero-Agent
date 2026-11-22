@@ -39,11 +39,29 @@ You are **Vulcan** (**V**erified **U**nattended **L**abor & **C**ode **A**nvil *
 """
 
 
-def render_vulcan_compose_yaml(docker_root: Optional[str] = None) -> str:
+def render_vulcan_compose_yaml(
+    docker_root: Optional[str] = None,
+    mount_git_credentials: bool = True,
+) -> str:
     """Render the docker-compose.yml content for `discord-vulcan-agent` on Host 2."""
     d_root = (docker_root or nas_config.DOCKER_ROOT).rstrip("/")
     zero_dir = f"{d_root}/discord-agy-agent"
     vulcan_dir = f"{d_root}/{CONTAINER_NAME}"
+
+    volume_lines = [
+        f"      - {zero_dir}/workspace:/workspace",
+        f"      - {zero_dir}/secrets:/secrets",
+        f"      - {zero_dir}/app/bridge.py:/app/bridge.py",
+        f"      - {zero_dir}/app/entrypoint.sh:/app/entrypoint.sh",
+        f"      - {vulcan_dir}/agents.md:/root/.gemini/AGENTS.md:ro",
+        f"      - {vulcan_dir}/agents.md:/root/.gemini/GEMINI.md:ro",
+    ]
+    if mount_git_credentials:
+        volume_lines.extend([
+            f"      - {zero_dir}/gh-config:/root/.config/gh:ro",
+            f"      - {zero_dir}/ssh:/root/.ssh:ro",
+        ])
+    volumes_block = "\n".join(volume_lines)
 
     return f"""version: "3.8"
 
@@ -61,27 +79,27 @@ services:
       - VULCAN_BOT_USER_ID={VULCAN_USER_ID}
       - FORGE_DB_PATH=/workspace/data/forge.db
       - DISABLE_ZERO_SIDECARS=1
+      - GIT_TERMINAL_PROMPT=0
       - TZ=America/Los_Angeles
     env_file:
       - {vulcan_dir}/.env
     volumes:
-      - {zero_dir}/workspace:/workspace
-      - {zero_dir}/secrets:/secrets
-      - {zero_dir}/app/bridge.py:/app/bridge.py
-      - {zero_dir}/app/entrypoint.sh:/app/entrypoint.sh
-      - {vulcan_dir}/agents.md:/root/.gemini/AGENTS.md:ro
-      - {vulcan_dir}/agents.md:/root/.gemini/GEMINI.md:ro
+{volumes_block}
 """
 
 
 def build_remote_staging_Payload(
     docker_root: Optional[str] = None,
     discord_bot_token: Optional[str] = None,
+    mount_git_credentials: bool = True,
 ) -> dict[str, str]:
     """Build the dictionary of files to stage inside `$NAS_DOCKER_ROOT/discord-vulcan-agent/`."""
     d_root = (docker_root or nas_config.DOCKER_ROOT).rstrip("/")
     vulcan_dir = f"{d_root}/{CONTAINER_NAME}"
-    compose_yml = render_vulcan_compose_yaml(docker_root=d_root)
+    compose_yml = render_vulcan_compose_yaml(
+        docker_root=d_root,
+        mount_git_credentials=mount_git_credentials,
+    )
 
     env_lines = [
         "AGENT_ROLE=vulcan",
@@ -90,6 +108,7 @@ def build_remote_staging_Payload(
         f"VULCAN_BOT_USER_ID={VULCAN_USER_ID}",
         "FORGE_DB_PATH=/workspace/data/forge.db",
         "DISABLE_ZERO_SIDECARS=1",
+        "GIT_TERMINAL_PROMPT=0",
     ]
     if discord_bot_token:
         env_lines.append(f"DISCORD_BOT_TOKEN={discord_bot_token}")

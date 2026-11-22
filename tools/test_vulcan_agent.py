@@ -113,7 +113,10 @@ class TestVulcanAgentScoping(unittest.TestCase):
                 self.assertTrue(res["ok"])
                 self.assertEqual(res["channel_id"], fg.FORGE_CHANNEL_ID)
                 self.assertFalse(res["redirected_to_zero_chat"])
-                mock_get_token.assert_called_with(for_forge_channel=True)
+                mock_get_token.assert_called_with(
+                    for_forge_channel=True,
+                    for_channel_id=fg.FORGE_CHANNEL_ID,
+                )
                 mock_post_rest.assert_called_once()
 
     def test_is_vulcan_delegated_env_and_runtime_rules(self):
@@ -213,21 +216,51 @@ class TestVulcanAgentScoping(unittest.TestCase):
         self.assertIn("cpu_shares: 256", compose)
         self.assertIn("AGENT_ROLE=vulcan", compose)
         self.assertIn("AGENT_NAME=Vulcan", compose)
+        self.assertIn("GIT_TERMINAL_PROMPT=0", compose)
         self.assertIn(f"DISCORD_CHANNEL_ID={bs.FORGE_CHANNEL_ID}", compose)
         self.assertIn("/workspace:/workspace", compose)
         self.assertIn("/secrets:/secrets", compose)
         self.assertIn("/app/bridge.py:/app/bridge.py", compose)
         self.assertIn("/app/entrypoint.sh:/app/entrypoint.sh", compose)
         self.assertIn("agents.md:/root/.gemini/AGENTS.md:ro", compose)
+        self.assertIn("/opt/docker/discord-agy-agent/gh-config:/root/.config/gh:ro", compose)
+        self.assertIn("/opt/docker/discord-agy-agent/ssh:/root/.ssh:ro", compose)
 
         staging = pv.build_remote_staging_Payload(docker_root="/opt/docker")
-        self.assertIn("AGENT_NAME=Vulcan", staging["/opt/docker/discord-vulcan-agent/.env.defaults"])
+        env_defaults = staging["/opt/docker/discord-vulcan-agent/.env.defaults"]
+        self.assertIn("AGENT_NAME=Vulcan", env_defaults)
+        self.assertIn("GIT_TERMINAL_PROMPT=0", env_defaults)
+        staged_compose = staging["/opt/docker/discord-vulcan-agent/docker-compose.yml"]
+        self.assertIn("/opt/docker/discord-agy-agent/gh-config:/root/.config/gh:ro", staged_compose)
+        self.assertIn("/opt/docker/discord-agy-agent/ssh:/root/.ssh:ro", staged_compose)
 
         res = pv.provision_vulcan_on_host2(dry_run=True, docker_root="/opt/docker")
         self.assertTrue(res["ok"])
         self.assertTrue(res["dry_run"])
         self.assertIn("/opt/docker/discord-vulcan-agent/docker-compose.yml", res["files"])
         self.assertIn("/opt/docker/discord-vulcan-agent/agents.md", res["files"])
+
+    def test_provision_vulcan_compose_git_credentials_optional_toggle(self):
+        compose_no_creds = pv.render_vulcan_compose_yaml(
+            docker_root="/opt/docker",
+            mount_git_credentials=False,
+        )
+        self.assertIn("GIT_TERMINAL_PROMPT=0", compose_no_creds)
+        self.assertNotIn("/root/.config/gh:ro", compose_no_creds)
+        self.assertNotIn("/root/.ssh:ro", compose_no_creds)
+
+        staging_no_creds = pv.build_remote_staging_Payload(
+            docker_root="/opt/docker",
+            mount_git_credentials=False,
+        )
+        self.assertNotIn(
+            "/root/.config/gh:ro",
+            staging_no_creds["/opt/docker/discord-vulcan-agent/docker-compose.yml"],
+        )
+        self.assertIn(
+            "GIT_TERMINAL_PROMPT=0",
+            staging_no_creds["/opt/docker/discord-vulcan-agent/.env.defaults"],
+        )
 
 
 class TestVulcanSchedulerLeanMode(unittest.IsolatedAsyncioTestCase):
