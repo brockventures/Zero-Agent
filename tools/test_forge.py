@@ -6105,5 +6105,465 @@ def test_execute_approval_card_cas_fences_out_stale_worker_when_token_superseded
     assert row["receipt_text"] == ""
 
 
+def test_validate_forge_plan_heavy_verify_gate_and_exemptions(tmp_path):
+    """Verify validate_forge_plan rejects unscoped heavy local verify commands unless scoped, Modal-offloaded, or exempted."""
+    repo = _init_test_git_repo(tmp_path / "heavy_verify_repo")
+
+    def _make_plan(v_cmd, plan_allow=False, chunk_allow=False):
+        p = {
+            "title": "Heavy Verify Gate Test",
+            "repo": str(repo),
+            "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+            "context_fact_sheet": ["Verify plan-time heavy verification gate."],
+            "chunks": [
+                {
+                    "title": "Chunk 0",
+                    "target_files": ["README.md"],
+                    "instructions": "Update README.md with verified documentation details and run scoped checks.",
+                    "verification_cmd": v_cmd,
+                }
+            ],
+        }
+        if plan_allow:
+            p["allow_heavy_verify"] = True
+        if chunk_allow:
+            p["chunks"][0]["allow_heavy_verify"] = True
+        return p
+
+    for bad_cmd in (
+        "npm run lint",
+        "cd web/ui && npm run lint",
+        "npx eslint .",
+        "npx --no-install eslint --max-warnings=0 .",
+        "npm test",
+        "cd web/ui && npm run test",
+        "sh scripts/verify.sh",
+        "./scripts/verify.sh --lint-only",
+    ):
+        ok, msg = forge_mod.validate_forge_plan(_make_plan(bad_cmd))
+        assert ok is False, f"Expected heavy verify command to be rejected: {bad_cmd}"
+        assert "Heavy-Verify Gate" in msg
+
+    for good_cmd in (
+        "npx eslint web/ui/src/App.tsx",
+        "npm test -- web/ui/src/App.test.tsx",
+        "sh scripts/verify.sh --staged",
+        "python3 tools/modal_verify.py --cmd 'sh scripts/verify.sh'",
+        "python3 tools/modal_ui_webgl.py --smoke",
+    ):
+        ok, msg = forge_mod.validate_forge_plan(_make_plan(good_cmd))
+        assert ok is True, f"Expected safe/offloaded command to pass ({good_cmd}): {msg}"
+
+    # Explicit exemptions (plan-level and chunk-level)
+    ok_plan, _ = forge_mod.validate_forge_plan(_make_plan("npm run lint", plan_allow=True))
+    assert ok_plan is True
+    ok_chunk, _ = forge_mod.validate_forge_plan(_make_plan("sh scripts/verify.sh", chunk_allow=True))
+    assert ok_chunk is True
+
+
+def test_enqueue_build_respects_active_repo_builds_and_serialize_repo(tmp_path, monkeypatch):
+    """Verify enqueue_build reports active repo builds and serialize_repo holds follow-up builds cleanly in FIFO order."""
+    repo = _init_test_git_repo(tmp_path / "repo_ser")
+    (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (repo / "b.py").write_text("y = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "a.py", "b.py"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "add a and b"], cwd=str(repo), check=True, capture_output=True)
+
+    db_path = tmp_path / "forge_ser.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_LOGS_DIR", tmp_path / "logs")
+
+    plan_a = {
+        "title": "Repo Build A",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Modify a.py"],
+        "chunks": [
+            {
+                "title": "Chunk A",
+                "target_files": ["a.py"],
+                "instructions": "Update a.py with new constant and verify syntax.",
+                "verification_cmd": "python3 -m py_compile a.py",
+            }
+        ],
+    }
+    plan_b = {
+        "title": "Repo Build B",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Modify b.py"],
+        "chunks": [
+            {
+                "title": "Chunk B",
+                "target_files": ["b.py"],
+                "instructions": "Update b.py with new constant and verify syntax.",
+                "verification_cmd": "python3 -m py_compile b.py",
+            }
+        ],
+    }
+
+    res_a = forge_mod.enqueue_build(plan_a, db_path=db_path, post_widget=False)
+    assert res_a["active_repo_builds"] == []
+
+    res_b = forge_mod.enqueue_build(plan_b, db_path=db_path, post_widget=False, serialize_repo=True)
+    assert res_a["build_id"] in res_b["active_repo_builds"]
+
+    sup = forge_mod.ForgeSupervisor(db_path=db_path)
+    monkeypatch.setattr(sup, "should_execute_builds", lambda: True)
+
+    def _fake_popen(*a, **kw):
+        mp = MagicMock()
+        mp.poll.return_value = None
+        return mp
+
+    with patch("subprocess.Popen", side_effect=_fake_popen), patch("builtins.open", unittest.mock.mock_open()):
+        first_spawn = sup.maybe_spawn_next_build_worker()
+        second_spawn = sup.maybe_spawn_next_build_worker()
+
+    assert first_spawn == res_a["build_id"]
+    assert second_spawn is None
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute("UPDATE forge_builds SET status = 'completed' WHERE id = ?", (res_a["build_id"],))
+    sup._active_build_procs.pop(res_a["build_id"], None)
+
+    with patch("subprocess.Popen", side_effect=_fake_popen), patch("builtins.open", unittest.mock.mock_open()):
+        after_spawn = sup.maybe_spawn_next_build_worker()
+    assert after_spawn == res_b["build_id"]
+
+
+def test_verify_chunk_worktree_git_status_nonzero_and_bash_executable(tmp_path):
+    """Verify verify_chunk_worktree reports explicit git metadata error on non-zero git status and uses /bin/bash."""
+    broken_wt = tmp_path / "broken_wt"
+    broken_wt.mkdir()
+    (broken_wt / ".git").write_text("gitdir: /nonexistent/path/to/gitdir\n", encoding="utf-8")
+
+    ok, diff_stat, err = forge_mod.verify_chunk_worktree(
+        broken_wt,
+        verification_cmd="true",
+        require_changes=True,
+    )
+    assert ok is False
+    assert diff_stat == ""
+    assert "Worktree git metadata error (exit" in err
+    assert "zero file changes" not in err
+
+    # Verify bash-specific syntax (pipefail + [[ ... ]]) works in verify_chunk_worktree
+    good_repo = _init_test_git_repo(tmp_path / "bash_wt")
+    (good_repo / "README.md").write_text("# Bash Verify Test\n", encoding="utf-8")
+    ok_bash, _, err_bash = forge_mod.verify_chunk_worktree(
+        good_repo,
+        verification_cmd="set -o pipefail && [[ -f README.md ]] && echo ok | grep -q ok",
+        target_files=["README.md"],
+        require_changes=True,
+    )
+    assert ok_bash is True, f"Expected bash verification_cmd to pass, got: {err_bash}"
+
+
+def test_reconcile_forge_on_boot_preserves_db_active_worktrees_across_containers(tmp_path, monkeypatch):
+    """Verify reconcile_forge_on_boot protects .git/worktrees metadata for DB running/queued builds even without local flock."""
+    import shutil
+
+    repo = _init_test_git_repo(tmp_path / "cross_repo")
+    db_path = tmp_path / "forge_cross.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(forge_mod, "WORKSPACE_DIR", repo)
+
+    plan = {
+        "id": "fg-vulcan-live",
+        "title": "Vulcan Live Build",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Cross-container boot protection test"],
+        "chunks": [
+            {
+                "title": "Chunk 0",
+                "target_files": ["README.md"],
+                "instructions": "Update README.md inside Vulcan container.",
+                "verification_cmd": "true",
+            }
+        ],
+    }
+    forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute("UPDATE forge_builds SET status = 'running' WHERE id = 'fg-vulcan-live'")
+
+    # Create a locked worktree and remove its checkout dir to simulate Vulcan's separate /tmp namespace
+    peer_wt = tmp_path / "forge-wt-fg-vulcan-live-c0"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "forge/fg-vulcan-live-c0", str(peer_wt), "main"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "worktree", "lock", "--reason", "forge-active-fg-vulcan-live", str(peer_wt)],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    shutil.rmtree(peer_wt)
+
+    # Zero boots in another container with NO worker flock held: metadata MUST survive because DB status is 'running'
+    forge_mod.reconcile_forge_on_boot(db_path=db_path)
+    assert (repo / ".git" / "worktrees" / "forge-wt-fg-vulcan-live-c0" / "locked").exists()
+
+    # Once build completes, boot reconciliation cleans up the stale locked metadata
+    with forge_mod.get_db_connection(db_path) as conn:
+        conn.execute("UPDATE forge_builds SET status = 'completed' WHERE id = 'fg-vulcan-live'")
+    forge_mod.reconcile_forge_on_boot(db_path=db_path)
+    assert not (repo / ".git" / "worktrees" / "forge-wt-fg-vulcan-live-c0").exists()
+
+
+def test_execute_chunk_injects_prohibited_env_and_repairs_corrupted_worktree(tmp_path, monkeypatch):
+    """Verify execute_chunk_in_worktree injects FORGE_PROHIBITED_FILES and repairs corrupted worktree gitdir preserving target files."""
+    repo = _init_test_git_repo(tmp_path / "repair_repo")
+    (repo / "target.py").write_text("VAL = 1\n", encoding="utf-8")
+    (repo / "secret.py").write_text("KEEP = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "target.py", "secret.py"], cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init files"], cwd=str(repo), check=True, capture_output=True)
+
+    db_path = tmp_path / "forge_repair.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(forge_mod, "FORGE_LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(forge_mod, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "sync_forge_channel_header", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_completion_to_origin", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_failure_to_origin", lambda *a, **kw: None)
+
+    plan = {
+        "id": "fg-repair-test",
+        "title": "Repair & Env Test",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Verify env injection and worktree repair"],
+        "chunks": [
+            {
+                "title": "Chunk 0",
+                "target_files": ["target.py"],
+                "prohibited_files": ["secret.py"],
+                "instructions": "Update target.py without touching secret.py.",
+                "verification_cmd": "python3 -m py_compile target.py",
+            }
+        ],
+    }
+    forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+
+    observed_prohibited_envs = []
+    attempt_seen = [0]
+    preserved_seen_on_attempt2 = []
+
+    class RepairMockPopen:
+        def __init__(self, cmd, cwd=None, env=None, **kwargs):
+            attempt_seen[0] += 1
+            wt_p = Path(cwd)
+            observed_prohibited_envs.append((env or {}).get("FORGE_PROHIBITED_FILES"))
+            if attempt_seen[0] == 1:
+                # Write modified target file AND corrupt .git gitdir to trigger repair on attempt 2
+                (wt_p / "target.py").write_text("VAL = 42\n", encoding="utf-8")
+                (wt_p / ".git").write_text("gitdir: /nonexistent/corrupted/gitdir\n", encoding="utf-8")
+            else:
+                # Attempt 2 must see repaired git worktree AND preserved target.py content
+                rev = subprocess.run(
+                    ["git", "rev-parse", "--is-inside-work-tree"],
+                    cwd=str(wt_p),
+                    capture_output=True,
+                    text=True,
+                )
+                assert rev.returncode == 0 and rev.stdout.strip() == "true"
+                preserved_seen_on_attempt2.append((wt_p / "target.py").read_text(encoding="utf-8"))
+            self.stdout = iter([])
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda cmd, *a, **kw: RepairMockPopen(cmd, *a, **kw)
+        if isinstance(cmd, list) and any("/usr/local/bin/agy" in str(x) for x in cmd)
+        else real_popen(cmd, *a, **kw),
+    )
+
+    sup = forge_mod.ForgeSupervisor(db_path=db_path)
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0 = conn.execute("SELECT * FROM forge_chunks WHERE id = 'fg-repair-test-c0'").fetchone()
+
+    assert sup.execute_chunk_in_worktree("fg-repair-test", c0) is True
+    assert attempt_seen[0] == 2
+    assert json.loads(observed_prohibited_envs[0]) == ["secret.py"]
+    assert preserved_seen_on_attempt2 == ["VAL = 42\n"]
+
+
+def test_execute_chunk_cas_fencing_never_flips_merged_chunk_or_completed_build(tmp_path, monkeypatch):
+    """Verify late/duplicate chunk failure cannot overwrite an already-merged chunk or completed build."""
+    repo = _init_test_git_repo(tmp_path / "cas_repo")
+    db_path = tmp_path / "forge_cas_chunk.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(forge_mod, "FORGE_LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(forge_mod, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "sync_forge_channel_header", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_completion_to_origin", lambda *a, **kw: None)
+
+    fail_notifs = []
+    monkeypatch.setattr(forge_mod, "dispatch_build_failure_to_origin", lambda bid, **kw: fail_notifs.append(bid))
+
+    plan = {
+        "id": "fg-cas-chunk",
+        "title": "CAS Chunk Fencing Test",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Verify CAS fencing on chunk/build failure"],
+        "chunks": [
+            {
+                "title": "Chunk 0",
+                "target_files": ["README.md"],
+                "instructions": "Update README.md with verified content.",
+                "verification_cmd": "false",
+            }
+        ],
+    }
+    forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+
+    class LateWorkerPopen:
+        def __init__(self, cmd, cwd=None, **kwargs):
+            # Simulate primary worker already finishing and merging chunk + completing build
+            with forge_mod.get_db_connection(db_path) as conn:
+                conn.execute("UPDATE forge_chunks SET status = 'merged' WHERE id = 'fg-cas-chunk-c0'")
+                conn.execute("UPDATE forge_builds SET status = 'completed' WHERE id = 'fg-cas-chunk'")
+            (Path(cwd) / "README.md").write_text("# Late Edit\n", encoding="utf-8")
+            self.stdout = iter([])
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    real_popen = subprocess.Popen
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda cmd, *a, **kw: LateWorkerPopen(cmd, *a, **kw)
+        if isinstance(cmd, list) and any("/usr/local/bin/agy" in str(x) for x in cmd)
+        else real_popen(cmd, *a, **kw),
+    )
+
+    sup = forge_mod.ForgeSupervisor(db_path=db_path)
+    with forge_mod.get_db_connection(db_path) as conn:
+        c0 = conn.execute("SELECT * FROM forge_chunks WHERE id = 'fg-cas-chunk-c0'").fetchone()
+
+    assert sup.execute_chunk_in_worktree("fg-cas-chunk", c0) is False
+    with forge_mod.get_db_connection(db_path) as conn:
+        c_final = conn.execute("SELECT status FROM forge_chunks WHERE id = 'fg-cas-chunk-c0'").fetchone()
+        b_final = conn.execute("SELECT status FROM forge_builds WHERE id = 'fg-cas-chunk'").fetchone()
+    assert c_final["status"] == "merged"
+    assert b_final["status"] == "completed"
+    assert fail_notifs == []
+
+
+def test_build_git_push_args_and_env_and_preflight_auth(tmp_path, monkeypatch):
+    """Verify _build_git_push_args_and_env fallback paths, _preflight_check_remote_push_auth, and prod fast-fail."""
+    repo = _init_test_git_repo(tmp_path / "push_auth_repo")
+    subprocess.run(
+        ["git", "remote", "add", "origin", "https://github.com/octo-org/demo-repo.git"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+
+    # 1. When no git credential helper, gh not available, and SSH key exists -> SSH URL fallback + GIT_TERMINAL_PROMPT=0
+    fake_home = tmp_path / "fake_home"
+    (fake_home / ".ssh").mkdir(parents=True)
+    (fake_home / ".ssh" / "id_ed25519").write_text("dummy-test-key-placeholder\n", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+    monkeypatch.setattr(forge_mod, "_has_git_https_credential_helper", lambda rp: False)
+    monkeypatch.setattr(forge_mod.shutil, "which", lambda name: None)
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+
+    cmd_ssh, env_ssh = forge_mod._build_git_push_args_and_env(repo, remote="origin", branch="main")
+    assert env_ssh["GIT_TERMINAL_PROMPT"] == "0"
+    assert cmd_ssh == ["git", "push", "git@github.com:octo-org/demo-repo.git", "main"]
+
+    # 2. When gh is installed and authenticated -> injects gh auth git-credential
+    monkeypatch.setattr(forge_mod.shutil, "which", lambda name: "/usr/bin/gh" if name == "gh" else None)
+    real_run = subprocess.run
+
+    def _mock_gh_auth_run(cmd, *a, **kw):
+        if isinstance(cmd, list) and cmd[:3] == ["/usr/bin/gh", "auth", "status"]:
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = "Logged in"
+            m.stderr = ""
+            return m
+        return real_run(cmd, *a, **kw)
+
+    monkeypatch.setattr(forge_mod.subprocess, "run", _mock_gh_auth_run)
+    cmd_gh, env_gh = forge_mod._build_git_push_args_and_env(repo, remote="origin", branch="main")
+    assert env_gh["GIT_TERMINAL_PROMPT"] == "0"
+    assert cmd_gh == ["git", "-c", "credential.helper=!/usr/bin/gh auth git-credential", "push", "origin", "main"]
+
+    # 3. When neither credential helper, gh, nor SSH key exists -> pre-flight fails fast
+    monkeypatch.setattr(forge_mod.subprocess, "run", real_run)
+    monkeypatch.setattr(forge_mod.shutil, "which", lambda name: None)
+    (fake_home / ".ssh" / "id_ed25519").unlink()
+
+    pf_ok, pf_err = forge_mod._preflight_check_remote_push_auth(repo)
+    assert pf_ok is False
+    assert "Remote push auth pre-flight failed" in pf_err
+
+    # 4. In prod mode, run_build_pipeline fails fast before spawning chunk 0 worker
+    db_path = tmp_path / "forge_preflight.db"
+    forge_mod.init_forge_db(db_path)
+    monkeypatch.setattr(forge_mod, "FORGE_DB_PATH", db_path)
+    monkeypatch.setattr(forge_mod, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(forge_mod, "FORGE_LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(forge_mod, "_is_prod_forge_env", lambda p: True)
+    monkeypatch.setattr(forge_mod, "post_or_update_build_widget", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "sync_forge_channel_header", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "dispatch_build_failure_to_origin", lambda *a, **kw: None)
+    monkeypatch.setattr(forge_mod, "_prepare_clean_repo_and_sync_base", lambda r, b, **kw: "HEAD")
+
+    plan = {
+        "id": "fg-preflight-fail",
+        "title": "Preflight Auth Fail Fast",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.ZERO_OPS_CHANNEL_ID,
+        "context_fact_sheet": ["Verify fast-fail before chunk 0"],
+        "chunks": [
+            {
+                "title": "Chunk 0",
+                "target_files": ["README.md"],
+                "instructions": "Update README.md with release notes.",
+                "verification_cmd": "true",
+            }
+        ],
+    }
+    forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+
+    worker_called = []
+    sup = forge_mod.ForgeSupervisor(db_path=db_path)
+    monkeypatch.setattr(sup, "execute_chunk_in_worktree", lambda *a, **kw: worker_called.append(a) or True)
+
+    assert sup.run_build_pipeline("fg-preflight-fail") is False
+    assert worker_called == []
+    with forge_mod.get_db_connection(db_path) as conn:
+        b_row = conn.execute("SELECT status FROM forge_builds WHERE id = 'fg-preflight-fail'").fetchone()
+        c_row = conn.execute("SELECT status, last_error FROM forge_chunks WHERE id = 'fg-preflight-fail-c0'").fetchone()
+    assert b_row["status"] == "failed"
+    assert c_row["status"] == "failed"
+    assert "Remote push auth pre-flight failed" in c_row["last_error"]
+
+
 if __name__ == "__main__":
     unittest.main()

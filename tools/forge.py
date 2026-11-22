@@ -3260,6 +3260,50 @@ def run_goldfish_plan_preflight(plan: dict) -> tuple[bool, list[str]]:
     return len(findings) == 0, findings
 
 
+def _detect_heavy_local_verify_cmd(verification_cmd: str) -> Optional[str]:
+    """Return a reason string if `verification_cmd` invokes an unscoped whole-repo JS/web or verify.sh sweep locally."""
+    cmd = str(verification_cmd or "").strip()
+    if not cmd:
+        return None
+    low_cmd = cmd.lower()
+    if "modal_verify.py" in low_cmd or "modal_ui_webgl.py" in low_cmd:
+        return None
+
+    segments = [seg.strip() for seg in re.split(r"(?:&&|\|\||;|\n)", cmd) if seg.strip()]
+    for seg in segments:
+        # 1. Unscoped `npm run lint` (unless explicitly scoped with `-- <path>`)
+        if re.search(r"(?i)\bnpm\s+run\s+lint\b(?!\s+--\s+\S)", seg):
+            return "'npm run lint' runs an unscoped whole-repo lint sweep"
+
+        # 2. Unscoped `eslint .` or `eslint ./`
+        if re.search(r"(?i)\beslint\b[^;&|\n]*\s+\.(?:/|\s|$)", seg):
+            return "'eslint .' runs an unscoped whole-repo lint sweep"
+
+        # 3. Bare `npm test` / `npm run test` without `-- <target>` or explicit file path
+        m_test = re.search(r"(?i)\bnpm\s+(?:run\s+)?test\b(.*)$", seg)
+        if m_test:
+            tail = (m_test.group(1) or "").strip()
+            has_scoped_target = False
+            if tail:
+                if re.search(r"(?:^|\s)--\s+\S", tail):
+                    has_scoped_target = True
+                else:
+                    for tok in tail.split():
+                        if tok.startswith("-"):
+                            continue
+                        if "/" in tok or "." in tok:
+                            has_scoped_target = True
+                            break
+            if not has_scoped_target:
+                return "bare 'npm test' runs an unscoped full-repo test suite"
+
+        # 4. Raw `scripts/verify.sh` without `--staged`
+        if re.search(r"(?i)(?:^|[\s/\"'])scripts/verify\.sh\b", seg) and "--staged" not in seg:
+            return "'scripts/verify.sh' without '--staged' runs a full-repo verification sweep"
+
+    return None
+
+
 def validate_forge_plan(plan: dict) -> tuple[bool, str]:
     """Deterministically validate a ForgePlan JSON dictionary before enqueueing."""
     if not isinstance(plan, dict):
@@ -3349,6 +3393,17 @@ def validate_forge_plan(plan: dict) -> tuple[bool, str]:
                     f"Chunk-Split Gate: Chunk {idx} ('{ch_title}') packs {num_tasks} numbered tasks/workstreams "
                     f"into a single chunk (max {MAX_CHUNK_NUMBERED_TASKS}). Split independent or sequential "
                     "tasks into separate chunks (c0, c1, c2...).",
+                )
+        # Plan-time heavy-verify guard: block unscoped whole-repo JS/web sweeps and raw scripts/verify.sh
+        allow_heavy_verify = bool(plan.get("allow_heavy_verify", False)) or bool(ch.get("allow_heavy_verify", False))
+        if not allow_heavy_verify:
+            heavy_reason = _detect_heavy_local_verify_cmd(str(ch.get("verification_cmd") or ""))
+            if heavy_reason:
+                return (
+                    False,
+                    f"Heavy-Verify Gate: Chunk {idx} ('{ch_title}') verification_cmd rejected ({heavy_reason}). "
+                    "Scope to modified files (e.g. 'npx eslint <file>', 'npm test -- <file>', 'sh scripts/verify.sh --staged'), "
+                    "offload via modal_verify.py / modal_ui_webgl.py, or set 'allow_heavy_verify': true.",
                 )
         # Note: verification_cmd is now optional (auto-falls back to deterministic baseline checks)
 
@@ -5365,6 +5420,45 @@ def _is_post_offload_turn_lock_active(batch_state_path: Path | str = "/tmp/batch
     return False
 
 
+def _get_active_repo_builds(
+    plan: dict,
+    db_path: Path | str = FORGE_DB_PATH,
+) -> list[dict]:
+    """Return active (queued/running) FORGE builds targeting any of the same resolved repos as `plan`."""
+    default_repo = str(Path(str(plan.get("repo") or "/workspace").strip()).resolve())
+    planned_repos: set[str] = {default_repo}
+    for ch in plan.get("chunks", []):
+        if isinstance(ch, dict):
+            planned_repos.add(str(Path(str(ch.get("repo") or default_repo).strip()).resolve()))
+
+    active_matches: list[dict] = []
+    seen_bids: set[str] = set()
+    with get_db_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT b.id AS build_id, b.title AS build_title, b.repo AS build_repo, b.status AS build_status,
+                   c.repo AS chunk_repo
+            FROM forge_builds b
+            LEFT JOIN forge_chunks c ON c.build_id = b.id
+            WHERE b.status IN ('queued', 'running')
+            """
+        ).fetchall()
+    for r in rows:
+        bid = str(r["build_id"])
+        if bid in seen_bids:
+            continue
+        r_repo = str(Path(str(r["chunk_repo"] or r["build_repo"] or "/workspace").strip()).resolve())
+        if r_repo in planned_repos:
+            seen_bids.add(bid)
+            active_matches.append({
+                "build_id": bid,
+                "build_title": r["build_title"],
+                "repo": r_repo,
+                "status": r["build_status"],
+            })
+    return active_matches
+
+
 def enqueue_build(
     plan: dict,
     db_path: Path | str = FORGE_DB_PATH,
@@ -5373,6 +5467,7 @@ def enqueue_build(
     check_approval_gate: bool = False,
     batch_state_path: Path | str = "/tmp/batch_guard_state.json",
     in_flight_path: Path | str = DATA_DIR / "in_flight_turn.json",
+    serialize_repo: bool = False,
 ) -> dict:
     """Validate and enqueue a multi-chunk FORGE build plan with pre-enqueue target-file overlap deduplication and complexity approval gate."""
     try:
@@ -5384,6 +5479,7 @@ def enqueue_build(
             check_approval_gate=check_approval_gate,
             batch_state_path=batch_state_path,
             in_flight_path=in_flight_path,
+            serialize_repo=serialize_repo,
         )
     except BaseException:
         clear_offload_dispatched(batch_state_path)
@@ -5398,6 +5494,7 @@ def _enqueue_build_impl(
     check_approval_gate: bool = False,
     batch_state_path: Path | str = "/tmp/batch_guard_state.json",
     in_flight_path: Path | str = DATA_DIR / "in_flight_turn.json",
+    serialize_repo: bool = False,
 ) -> dict:
     if isinstance(plan, dict):
         _normalize_forge_plan_in_place(plan, from_enqueue=True)
@@ -5431,6 +5528,10 @@ def _enqueue_build_impl(
                 f"'{ov['build_id']}' ({ov['build_title']} / {ov['chunk_title']}). "
                 "Wait for the active build to complete or pass allow_overlap=True."
             )
+
+    active_repo_builds = _get_active_repo_builds(plan, db_path=db_path)
+    if serialize_repo or plan.get("serialize_repo"):
+        plan["serialize_repo"] = True
 
     now = time.time()
     slug = re.sub(r"[^a-z0-9]+", "-", plan["title"].lower()).strip("-")[:18] or "build"
@@ -5598,6 +5699,7 @@ def _enqueue_build_impl(
         "chunk_count": len(plan["chunks"]),
         "forge_channel_id": FORGE_CHANNEL_ID,
         "forge_message_id": msg_id,
+        "active_repo_builds": [b["build_id"] for b in active_repo_builds],
         "turn_action": "end_turn",
     }
 
@@ -6102,6 +6204,9 @@ def verify_chunk_worktree(
         text=True,
         timeout=15,
     )
+    if st_proc.returncode != 0:
+        st_err = (st_proc.stderr or st_proc.stdout or "").strip()
+        return False, "", f"Worktree git metadata error (exit {st_proc.returncode}): {st_err}"
     changed = [line[3:].strip().strip('"') for line in st_proc.stdout.splitlines() if len(line) > 3]
 
     if not changed and _recover_premature_worktree_commit(wt):
@@ -6112,6 +6217,9 @@ def verify_chunk_worktree(
             text=True,
             timeout=15,
         )
+        if st_proc.returncode != 0:
+            st_err = (st_proc.stderr or st_proc.stdout or "").strip()
+            return False, "", f"Worktree git metadata error (exit {st_proc.returncode}): {st_err}"
         changed = [line[3:].strip().strip('"') for line in st_proc.stdout.splitlines() if len(line) > 3]
 
     if require_changes and not changed:
@@ -6188,9 +6296,11 @@ def verify_chunk_worktree(
                 f"Verification command timed out after {int(VERIFY_CMD_TIMEOUT_SECONDS)}s:\n{combined[-1500:]}",
             )
     else:
+        bash_exec = "/bin/bash" if os.path.exists("/bin/bash") else None
         v_proc = subprocess.Popen(
             effective_cmd,
             shell=True,
+            executable=bash_exec,
             cwd=str(wt),
             env=env,
             stdin=subprocess.DEVNULL,
@@ -7018,7 +7128,28 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
         except Exception as e:
             print(f"[FORGE] consolidate_legacy_forge_db error: {e}", file=sys.stderr)
 
-    active_build_ids = _get_active_build_worker_ids(db_path) | _get_active_build_worker_ids(FORGE_DB_PATH)
+    locked_build_ids = _get_active_build_worker_ids(db_path) | _get_active_build_worker_ids(FORGE_DB_PATH)
+    db_active_build_ids: set[str] = set()
+    db_candidates: list[Path] = [Path(db_path)]
+    if _is_prod_forge_env(db_path):
+        for p_db in [FORGE_DB_PATH, *_get_peer_forge_db_paths(db_path)]:
+            if p_db not in db_candidates and p_db.exists():
+                db_candidates.append(p_db)
+    for cand_db in db_candidates:
+        if not cand_db.exists():
+            continue
+        try:
+            with get_db_connection(cand_db) as conn:
+                active_db_rows = conn.execute(
+                    "SELECT id FROM forge_builds WHERE status IN ('running', 'queued')"
+                ).fetchall()
+                for r in active_db_rows:
+                    if r["id"]:
+                        db_active_build_ids.add(str(r["id"]))
+        except Exception:
+            pass
+
+    active_build_ids = locked_build_ids | db_active_build_ids
     cleaned_wts = []
     cur_cwd = os.getcwd()
     for wt_path in glob.glob("/tmp/forge-wt-*"):
@@ -7036,6 +7167,7 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
     cur_cwd_base = os.path.basename(cur_cwd.rstrip("/"))
     for repo_cand in (
         WORKSPACE_DIR,
+        WORKSPACE_DIR / "repos" / "mirrormere",
         WORKSPACE_DIR / "market-sandbox",
         WORKSPACE_DIR / "kalshi-quant",
         WORKSPACE_DIR / "agora-roguelike",
@@ -7075,7 +7207,7 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
         running_builds = conn.execute(
             "SELECT id FROM forge_builds WHERE status IN ('running', 'queued')"
         ).fetchall()
-        stale_build_ids = [r["id"] for r in running_builds if r["id"] not in active_build_ids]
+        stale_build_ids = [r["id"] for r in running_builds if r["id"] not in locked_build_ids]
         if stale_build_ids:
             placeholders = ",".join("?" for _ in stale_build_ids)
             cur = conn.execute(
@@ -7087,7 +7219,7 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
                 f"UPDATE forge_builds SET status = 'queued', updated_at = ? WHERE status = 'running' AND id IN ({placeholders})",
                 (time.time(), *stale_build_ids),
             )
-        elif not active_build_ids:
+        elif not locked_build_ids:
             cur = conn.execute(
                 "UPDATE forge_chunks SET status = 'pending' WHERE status IN ('running', 'verifying') AND attempt_count < 3"
             )
@@ -7422,6 +7554,150 @@ def _unlock_and_remove_chunk_worktree(repo_dir: Path | str, wt_dir: Path | str) 
         shutil.rmtree(wt_meta_dir, ignore_errors=True)
 
 
+def _has_git_https_credential_helper(repo_dir: Path) -> bool:
+    """Return True if git has a non-empty credential helper configured for HTTPS GitHub pushes."""
+    for key in ("credential.https://github.com.helper", "credential.helper"):
+        try:
+            proc = subprocess.run(
+                ["git", "config", "--get-all", key],
+                cwd=str(repo_dir),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode == 0 and any(ln.strip() for ln in proc.stdout.splitlines()):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _has_ssh_private_key(env: Optional[dict[str, str]] = None) -> bool:
+    """Return True if an SSH key or explicit GIT_SSH_COMMAND is available for non-interactive SSH pushes."""
+    eff_env = env if env is not None else os.environ
+    if str(eff_env.get("GIT_SSH_COMMAND") or "").strip():
+        return True
+    ssh_dir = Path.home() / ".ssh"
+    for key_name in ("id_ed25519", "id_rsa", "id_ecdsa"):
+        if (ssh_dir / key_name).is_file():
+            return True
+    return False
+
+
+def _build_git_push_args_and_env(
+    repo_dir: Path | str,
+    remote: str = "origin",
+    branch: Optional[str] = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Build non-interactive git push args and env with GIT_TERMINAL_PROMPT=0 and GitHub HTTPS auth fallback."""
+    rp = Path(repo_dir).resolve()
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+
+    remote_url = ""
+    try:
+        url_proc = subprocess.run(
+            ["git", "remote", "get-url", remote],
+            cwd=str(rp),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if url_proc.returncode == 0:
+            remote_url = url_proc.stdout.strip()
+    except Exception:
+        remote_url = ""
+
+    cmd: list[str] = ["git", "push", remote]
+    gh_https = re.match(r"^https://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", remote_url, re.IGNORECASE)
+    if gh_https and not _has_git_https_credential_helper(rp):
+        owner, repo_name = gh_https.group(1), gh_https.group(2)
+        gh_bin = shutil.which("gh")
+        gh_authed = False
+        if gh_bin:
+            try:
+                auth_proc = subprocess.run(
+                    [gh_bin, "auth", "status"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                gh_authed = auth_proc.returncode == 0
+            except Exception:
+                gh_authed = False
+
+        if gh_authed and gh_bin:
+            cmd = ["git", "-c", f"credential.helper=!{gh_bin} auth git-credential", "push", remote]
+        elif _has_ssh_private_key(env):
+            ssh_url = f"git@github.com:{owner}/{repo_name}.git"
+            cmd = ["git", "push", ssh_url]
+
+    if branch:
+        cmd.append(branch)
+    return cmd, env
+
+
+def _preflight_check_remote_push_auth(
+    repo_dir: Path | str,
+    remote: str = "origin",
+) -> tuple[bool, str]:
+    """Run a fast pre-flight remote reachability and push-auth check before spawning chunk 0."""
+    rp = Path(repo_dir).resolve()
+    try:
+        url_proc = subprocess.run(
+            ["git", "remote", "get-url", remote],
+            cwd=str(rp),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        return False, f"Remote push auth pre-flight failed inspecting '{remote}' in {rp}: {exc}"
+
+    if url_proc.returncode != 0 or not url_proc.stdout.strip():
+        return True, ""
+
+    remote_url = url_proc.stdout.strip()
+    push_cmd, push_env = _build_git_push_args_and_env(rp, remote=remote)
+    try:
+        push_idx = push_cmd.index("push")
+    except ValueError:
+        push_idx = 1
+    git_cfg_args = push_cmd[1:push_idx]
+    target_remote = push_cmd[push_idx + 1] if len(push_cmd) > push_idx + 1 else remote
+
+    gh_https = re.match(r"^https://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", remote_url, re.IGNORECASE)
+    if gh_https and target_remote == remote and not git_cfg_args and not _has_git_https_credential_helper(rp):
+        return (
+            False,
+            f"Remote push auth pre-flight failed for {rp}: HTTPS remote '{remote_url}' has no git credential helper, "
+            "authenticated 'gh' CLI, or SSH key fallback available for non-interactive push.",
+        )
+
+    probe_cmd = ["git", *git_cfg_args, "ls-remote", "--heads", target_remote]
+    try:
+        probe_proc = subprocess.run(
+            probe_cmd,
+            cwd=str(rp),
+            env=push_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if probe_proc.returncode != 0:
+            p_err = f"{probe_proc.stdout}\n{probe_proc.stderr}".strip()
+            return (
+                False,
+                f"Remote push auth pre-flight failed for {rp} ({target_remote}, exit {probe_proc.returncode}): "
+                f"{p_err[-800:]}",
+            )
+    except Exception as exc:
+        return False, f"Remote push auth pre-flight failed/timed out for {rp} ({target_remote}): {exc}"
+
+    return True, ""
+
+
 def _propagate_build_branches(
     repo_dir: Path | str,
     target_ref: str,
@@ -7472,9 +7748,11 @@ def _propagate_build_branches(
                 propagated.append(br_name)
             if has_origin:
                 try:
+                    push_cmd, push_env = _build_git_push_args_and_env(rp, remote="origin", branch=br_name)
                     push_res = subprocess.run(
-                        ["git", "push", "origin", br_name],
+                        push_cmd,
                         cwd=str(rp),
+                        env=push_env,
                         capture_output=True,
                         text=True,
                         timeout=60,
@@ -7513,22 +7791,39 @@ def _get_build_target_pairs(
     return pairs
 
 
+def _build_has_serialize_repo(conn: sqlite3.Connection, build_id: str) -> bool:
+    """Return True if the build's persisted plan_json sets serialize_repo=True."""
+    row = conn.execute("SELECT plan_json FROM forge_builds WHERE id = ?", (build_id,)).fetchone()
+    if not row:
+        return False
+    try:
+        pdata = json.loads(row["plan_json"] or "{}")
+        return bool(isinstance(pdata, dict) and pdata.get("serialize_repo"))
+    except Exception:
+        return False
+
+
 def _build_overlaps_earlier_builds(
     cand_build_id: str,
     earlier_build_ids: set[str] | list[str],
     db_path: Path | str = FORGE_DB_PATH,
 ) -> bool:
-    """Return True if `cand_build_id` shares any `(repo, target_file)` with any build in `earlier_build_ids`."""
+    """Return True if `cand_build_id` shares any `(repo, target_file)` (or repo when `serialize_repo` is set) with any build in `earlier_build_ids`."""
     other_ids = [str(bid) for bid in earlier_build_ids if str(bid) and str(bid) != str(cand_build_id)]
     if not other_ids:
         return False
     with get_db_connection(db_path) as conn:
         cand_pairs = _get_build_target_pairs(conn, cand_build_id)
-        if not cand_pairs:
-            return False
+        cand_repos = {repo for repo, _ in cand_pairs}
+        cand_serialize = _build_has_serialize_repo(conn, cand_build_id)
         for obid in other_ids:
-            if cand_pairs & _get_build_target_pairs(conn, obid):
+            other_pairs = _get_build_target_pairs(conn, obid)
+            if cand_pairs and (cand_pairs & other_pairs):
                 return True
+            if cand_serialize or _build_has_serialize_repo(conn, obid):
+                other_repos = {repo for repo, _ in other_pairs}
+                if cand_repos & other_repos:
+                    return True
     return False
 
 
@@ -8042,6 +8337,31 @@ class ForgeSupervisor:
                     finally:
                         _release_file_lock(git_lk)
 
+                if _is_prod_forge_env(self.db_path):
+                    for r_dir in repos_seen:
+                        auth_ok, auth_err = _preflight_check_remote_push_auth(r_dir)
+                        if not auth_ok:
+                            try:
+                                FORGE_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+                                with open(FORGE_LOGS_DIR / f"build-{build_id}.log", "a", encoding="utf-8") as elf:
+                                    elf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}] {auth_err}\n")
+                            except Exception:
+                                pass
+                            now_fail = time.time()
+                            with get_db_connection(self.db_path) as conn:
+                                conn.execute(
+                                    "UPDATE forge_chunks SET status = 'failed', last_error = ?, completed_at = ? WHERE build_id = ? AND status != 'merged'",
+                                    (auth_err, now_fail, build_id),
+                                )
+                                conn.execute(
+                                    "UPDATE forge_builds SET status = 'failed', updated_at = ? WHERE id = ? AND status NOT IN ('completed', 'cancelled')",
+                                    (now_fail, build_id),
+                                )
+                            post_or_update_build_widget(build_id, db_path=self.db_path)
+                            sync_forge_channel_header(db_path=self.db_path)
+                            dispatch_build_failure_to_origin(build_id, db_path=self.db_path)
+                            return False
+
                 if _is_prod_forge_env(self.db_path) and should_run_carbon_preflight(build, chunks):
                     try:
                         self.run_carbon_preflight_review(build_id, build, chunks)
@@ -8218,10 +8538,40 @@ class ForgeSupervisor:
             except Exception:
                 pass
 
+        prohibited = json.loads(chunk_row["prohibited_files_json"] or "[]")
+        target_files = json.loads(chunk_row["target_files_json"] or "[]")
+
         def _ensure_chunk_worktree(force_recreate: bool = False) -> None:
+            preserved_files: dict[str, bytes] = {}
             if not force_recreate and wt_dir.exists() and (wt_dir / ".git").exists():
-                _ensure_worktree_ui_node_modules(wt_dir, repo_dir=repo_dir)
-                return
+                wt_ok = False
+                try:
+                    rev_chk = subprocess.run(
+                        ["git", "rev-parse", "--is-inside-work-tree"],
+                        cwd=str(wt_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    wt_ok = rev_chk.returncode == 0 and rev_chk.stdout.strip() == "true"
+                except Exception:
+                    wt_ok = False
+                if wt_ok:
+                    _ensure_worktree_ui_node_modules(wt_dir, repo_dir=repo_dir)
+                    return
+                _log_build(
+                    f"Worktree gitdir integrity check failed for {wt_dir}; recreating worktree while preserving modified target files."
+                )
+                for tf in target_files:
+                    tf_rel = str(tf or "").strip().lstrip("/")
+                    if not tf_rel:
+                        continue
+                    tf_path = wt_dir / tf_rel
+                    try:
+                        if tf_path.is_file():
+                            preserved_files[tf_rel] = tf_path.read_bytes()
+                    except OSError:
+                        pass
             git_lk = _acquire_repo_git_lock(repo_dir)
             try:
                 latest_def_ref = _prepare_clean_repo_and_sync_base(repo_dir, default_branch)
@@ -8307,13 +8657,18 @@ class ForgeSupervisor:
 
                 _record_worktree_base_head(wt_dir)
                 _ensure_worktree_ui_node_modules(wt_dir, repo_dir=repo_dir)
+                for tf_rel, raw_bytes in preserved_files.items():
+                    try:
+                        dst_path = wt_dir / tf_rel
+                        dst_path.parent.mkdir(parents=True, exist_ok=True)
+                        dst_path.write_bytes(raw_bytes)
+                    except OSError:
+                        pass
             finally:
                 _release_file_lock(git_lk)
 
         _ensure_chunk_worktree(force_recreate=True)
 
-        prohibited = json.loads(chunk_row["prohibited_files_json"] or "[]")
-        target_files = json.loads(chunk_row["target_files_json"] or "[]")
         max_attempts = 3
         rejected_models: set[str] = set()
         fallback_override_model: Optional[str] = None
@@ -8348,7 +8703,7 @@ class ForgeSupervisor:
                     )
                 with self._state_lock, get_db_connection(self.db_path) as conn:
                     conn.execute(
-                        "UPDATE forge_chunks SET attempt_count = ?, worker_model = ?, status = 'running', live_status = ? WHERE id = ?",
+                        "UPDATE forge_chunks SET attempt_count = ?, worker_model = ?, status = 'running', live_status = ? WHERE id = ? AND status != 'merged'",
                         (attempt, model, f"Booting Vulcan ({model})...", chunk_id),
                     )
                 post_or_update_build_widget(build_id, db_path=self.db_path)
@@ -8384,6 +8739,7 @@ class ForgeSupervisor:
                 try:
                     vulcan_env = os.environ.copy()
                     vulcan_env["FORGE_WORKER_ACTIVE"] = "1"
+                    vulcan_env["FORGE_PROHIBITED_FILES"] = json.dumps(prohibited)
                     proc = subprocess.Popen(
                         agy_cmd,
                         cwd=str(wt_dir),
@@ -8539,7 +8895,10 @@ class ForgeSupervisor:
                     continue
 
             with self._state_lock, get_db_connection(self.db_path) as conn:
-                conn.execute("UPDATE forge_chunks SET status = 'verifying', live_status = '' WHERE id = ?", (chunk_id,))
+                conn.execute(
+                    "UPDATE forge_chunks SET status = 'verifying', live_status = '' WHERE id = ? AND status != 'merged'",
+                    (chunk_id,),
+                )
             post_or_update_build_widget(build_id, db_path=self.db_path)
 
             v_start_ts = time.time()
@@ -8825,9 +9184,11 @@ class ForgeSupervisor:
 
                         if ch_target_branch and has_origin:
                             try:
+                                push_cmd, push_env = _build_git_push_args_and_env(repo_dir, remote="origin", branch=ch_target_branch)
                                 push_proc = subprocess.run(
-                                    ["git", "push", "origin", ch_target_branch],
+                                    push_cmd,
                                     cwd=str(repo_dir),
+                                    env=push_env,
                                     capture_output=True,
                                     text=True,
                                     timeout=60,
@@ -8845,9 +9206,11 @@ class ForgeSupervisor:
 
                         if not push_failed_err and other_unmerged == 0 and not has_stacked_branches and has_origin:
                             try:
+                                push_cmd, push_env = _build_git_push_args_and_env(repo_dir, remote="origin", branch=default_branch)
                                 push_proc = subprocess.run(
-                                    ["git", "push", "origin", default_branch],
+                                    push_cmd,
                                     cwd=str(repo_dir),
+                                    env=push_env,
                                     capture_output=True,
                                     text=True,
                                     timeout=60,
@@ -8891,17 +9254,18 @@ class ForgeSupervisor:
 
                 if push_failed_err:
                     with self._state_lock, get_db_connection(self.db_path) as conn:
-                        conn.execute(
-                            "UPDATE forge_chunks SET status = 'failed', completed_at = ?, last_error = ? WHERE id = ?",
+                        c_cur = conn.execute(
+                            "UPDATE forge_chunks SET status = 'failed', completed_at = ?, last_error = ? WHERE id = ? AND status != 'merged'",
                             (time.time(), push_failed_err, chunk_id),
                         )
-                        conn.execute(
-                            "UPDATE forge_builds SET status = 'failed', updated_at = ? WHERE id = ?",
+                        b_cur = conn.execute(
+                            "UPDATE forge_builds SET status = 'failed', updated_at = ? WHERE id = ? AND status NOT IN ('completed', 'cancelled')",
                             (time.time(), build_id),
                         )
-                    post_or_update_build_widget(build_id, db_path=self.db_path)
-                    sync_forge_channel_header(db_path=self.db_path)
-                    dispatch_build_failure_to_origin(build_id, db_path=self.db_path)
+                    if c_cur.rowcount > 0 or b_cur.rowcount > 0:
+                        post_or_update_build_widget(build_id, db_path=self.db_path)
+                        sync_forge_channel_header(db_path=self.db_path)
+                        dispatch_build_failure_to_origin(build_id, db_path=self.db_path)
                     return False
 
                 _log_build(f"Chunk {chunk_id} successfully merged into {branch_name} (diff: {diff_stat})")
@@ -8947,11 +9311,18 @@ class ForgeSupervisor:
         finally:
             _release_file_lock(git_lk)
         with self._state_lock, get_db_connection(self.db_path) as conn:
-            conn.execute("UPDATE forge_chunks SET status = 'failed', completed_at = ? WHERE id = ?", (time.time(), chunk_id))
-            conn.execute("UPDATE forge_builds SET status = 'failed', updated_at = ? WHERE id = ?", (time.time(), build_id))
-        post_or_update_build_widget(build_id, db_path=self.db_path)
-        sync_forge_channel_header(db_path=self.db_path)
-        dispatch_build_failure_to_origin(build_id, db_path=self.db_path)
+            c_cur = conn.execute(
+                "UPDATE forge_chunks SET status = 'failed', completed_at = ? WHERE id = ? AND status != 'merged'",
+                (time.time(), chunk_id),
+            )
+            b_cur = conn.execute(
+                "UPDATE forge_builds SET status = 'failed', updated_at = ? WHERE id = ? AND status NOT IN ('completed', 'cancelled')",
+                (time.time(), build_id),
+            )
+        if c_cur.rowcount > 0 or b_cur.rowcount > 0:
+            post_or_update_build_widget(build_id, db_path=self.db_path)
+            sync_forge_channel_header(db_path=self.db_path)
+            dispatch_build_failure_to_origin(build_id, db_path=self.db_path)
         return False
 
 
