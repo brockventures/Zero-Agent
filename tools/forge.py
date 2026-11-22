@@ -10245,7 +10245,7 @@ def execute_approval_card(
                 }
             if time.time() > float(row["expires_at"]):
                 conn.execute(
-                    "UPDATE forge_decisions SET status = 'expired', resolved_at = ? WHERE id = ?",
+                    "UPDATE forge_decisions SET status = 'expired', resolved_at = ? WHERE id = ? AND status = 'pending'",
                     (time.time(), decision_id),
                 )
                 fresh = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone() or row
@@ -10413,12 +10413,34 @@ def execute_approval_card(
 
     final_status = ("edited_approved" if override_payload is not None else "approved") if ok else "failed"
     now = time.time()
+    fenced_out = False
     with get_db_connection(db_path) as conn:
-        conn.execute(
-            "UPDATE forge_decisions SET status = ?, resolved_at = ?, receipt_text = ? WHERE id = ?",
-            (final_status, now, receipt, decision_id),
+        cur = conn.execute(
+            "UPDATE forge_decisions SET status = ?, resolved_at = ?, receipt_text = ? "
+            "WHERE id = ? AND status = 'executing' AND executing_started_at = ?",
+            (final_status, now, receipt, decision_id, exec_start_ts),
         )
+        fenced_out = cur.rowcount == 0
         updated_row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
+
+    if fenced_out:
+        actual_status = updated_row["status"] if updated_row else "unknown"
+        actual_receipt = updated_row["receipt_text"] if updated_row else ""
+        return {
+            "ok": False,
+            "fenced": True,
+            "decision_id": decision_id,
+            "handler_type": handler,
+            "channel_id": int(row["channel_id"]),
+            "status": actual_status,
+            "receipt": actual_receipt,
+            "error": (
+                f"Decision {decision_id} completion fenced out: state changed to '{actual_status}' "
+                f"while executing ({actual_receipt or 'recovered or superseded'})."
+            ),
+            "formatted_card": format_decision_card_text(updated_row) if updated_row else "",
+            "formatted_embed": render_decision_card_embed(updated_row) if updated_row else {},
+        }
 
     res_dict = {
         "ok": ok,
@@ -10498,12 +10520,14 @@ def _recover_stale_executing_decisions_in_conn(
 ) -> list[dict]:
     """Mark decisions stuck in 'executing' longer than stale_seconds as 'failed' and return updated row dicts."""
     cutoff = now - float(stale_seconds)
+    has_exec_started = True
     try:
         stale_rows = conn.execute(
             "SELECT * FROM forge_decisions WHERE status = 'executing' AND COALESCE(executing_started_at, created_at) < ?",
             (cutoff,),
         ).fetchall()
     except sqlite3.OperationalError:
+        has_exec_started = False
         stale_rows = conn.execute(
             "SELECT * FROM forge_decisions WHERE status = 'executing' AND created_at < ?",
             (cutoff,),
@@ -10512,11 +10536,26 @@ def _recover_stale_executing_decisions_in_conn(
     recovered: list[dict] = []
     receipt = "Execution interrupted or timed out (recovered from stale executing state)"
     for r in stale_rows:
-        cur = conn.execute(
-            "UPDATE forge_decisions SET status = 'failed', resolved_at = ?, receipt_text = ? "
-            "WHERE id = ? AND status = 'executing'",
-            (now, receipt, r["id"]),
-        )
+        if has_exec_started:
+            exec_ts = r["executing_started_at"]
+            if exec_ts is not None:
+                cur = conn.execute(
+                    "UPDATE forge_decisions SET status = 'failed', resolved_at = ?, receipt_text = ? "
+                    "WHERE id = ? AND status = 'executing' AND executing_started_at = ?",
+                    (now, receipt, r["id"], exec_ts),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE forge_decisions SET status = 'failed', resolved_at = ?, receipt_text = ? "
+                    "WHERE id = ? AND status = 'executing' AND executing_started_at IS NULL",
+                    (now, receipt, r["id"]),
+                )
+        else:
+            cur = conn.execute(
+                "UPDATE forge_decisions SET status = 'failed', resolved_at = ?, receipt_text = ? "
+                "WHERE id = ? AND status = 'executing'",
+                (now, receipt, r["id"]),
+            )
         if cur.rowcount > 0:
             updated_r = dict(r)
             updated_r["status"] = "failed"

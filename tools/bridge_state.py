@@ -6,9 +6,12 @@ atomic JSON-backed queueing, beacon status, and restart intent tracking.
 """
 
 import asyncio
+from contextlib import contextmanager
+import fcntl
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -341,79 +344,160 @@ def record_restart_intent(reason: str, initiator: str = "user"):
         print(f"[BridgeState] Error recording restart intent: {e}")
 
 
-def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, status_msg_id: int = None, pid: int = None):
-    """Atomically record an in-flight turn for a channel to survive crashes/restarts."""
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        data = {}
-        if IN_FLIGHT_FILE.exists():
+_IN_FLIGHT_THREAD_LOCK = threading.Lock()
+
+
+@contextmanager
+def _in_flight_file_lock():
+    """Acquire intra-process thread lock and cross-process fcntl.flock for in_flight_turn.json RMW."""
+    with _IN_FLIGHT_THREAD_LOCK:
+        IN_FLIGHT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = Path(f"{IN_FLIGHT_FILE}.lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock_fd:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
             try:
-                with open(IN_FLIGHT_FILE) as f:
-                    raw = json.load(f)
-                    if isinstance(raw, dict):
-                        if "channel_id" in raw and "prompt" in raw and not any(isinstance(v, dict) for v in raw.values()):
-                            data[str(raw.get("channel_id", TARGET_CHANNEL_ID))] = raw
-                        else:
-                            data = raw
-            except Exception:
-                data = {}
-        cid_str = str(channel_id)
-        prev = data.get(cid_str) or {}
-        attempts = 1
-        if isinstance(prev, dict) and prev.get("prompt") == prompt:
-            attempts = prev.get("attempts", 1) + 1
+                yield lock_fd
+            finally:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
 
-        effective_pid = pid if pid is not None else (prev.get("pid") if isinstance(prev, dict) else None)
 
-        entry = {
-            "conv_id": conv_id,
-            "status_msg_id": status_msg_id,
-            "channel_id": int(channel_id) if str(channel_id).isdigit() else channel_id,
-            "prompt": prompt,
-            "attempts": attempts,
-            "ts": time.time(),
-        }
-        if effective_pid is not None:
-            entry["pid"] = effective_pid
+def _read_in_flight_locked() -> dict:
+    """Read and normalize in_flight_turn.json into a channel-keyed dict (caller holds lock)."""
+    if not IN_FLIGHT_FILE.exists():
+        return {}
+    try:
+        with open(IN_FLIGHT_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        if "channel_id" in raw and "prompt" in raw and not any(isinstance(v, dict) for v in raw.values()):
+            return {str(raw.get("channel_id", TARGET_CHANNEL_ID)): raw}
+        return raw
+    except Exception:
+        return {}
 
-        data[cid_str] = entry
-        # Maintain top-level fields for legacy callers/tests checking single dict
-        data["prompt"] = prompt
-        data["channel_id"] = int(channel_id) if str(channel_id).isdigit() else channel_id
-        data["conv_id"] = conv_id
-        data["attempts"] = attempts
-        data["ts"] = time.time()
-        data["status_msg_id"] = status_msg_id
-        if effective_pid is not None:
-            data["pid"] = effective_pid
 
-        tmp = IN_FLIGHT_FILE.with_suffix(".tmp")
-        with open(tmp, "w") as f:
+def _write_in_flight_atomic(data: dict) -> None:
+    """Atomically persist in_flight_turn.json via a PID-unique temp file and os.replace()."""
+    tmp = Path(f"{IN_FLIGHT_FILE}.tmp.{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        tmp.replace(IN_FLIGHT_FILE)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, IN_FLIGHT_FILE)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _allocate_next_turn_seq(lock_fd, data: dict) -> int:
+    """Allocate a strictly monotonic turn_seq across turns, unlinks, and processes (caller holds lock)."""
+    persisted_seq = 0
+    try:
+        lock_fd.seek(0)
+        raw_seq = lock_fd.read().strip()
+        if raw_seq:
+            persisted_seq = int(raw_seq)
+    except Exception:
+        persisted_seq = 0
+
+    max_data_seq = 0
+    if isinstance(data, dict):
+        top_seq = data.get("turn_seq")
+        if isinstance(top_seq, int):
+            max_data_seq = max(max_data_seq, top_seq)
+        for v in data.values():
+            if isinstance(v, dict) and isinstance(v.get("turn_seq"), int):
+                max_data_seq = max(max_data_seq, v["turn_seq"])
+
+    next_seq = max(persisted_seq, max_data_seq) + 1
+    lock_fd.seek(0)
+    lock_fd.truncate(0)
+    lock_fd.write(str(next_seq))
+    lock_fd.flush()
+    return next_seq
+
+
+def _sync_top_level_in_flight_fields(data: dict, entry: dict, fallback_ts: float) -> None:
+    """Update top-level legacy mirror fields on in_flight_turn.json from a representative channel entry."""
+    data["prompt"] = entry.get("prompt", "")
+    data["channel_id"] = entry.get("channel_id", TARGET_CHANNEL_ID)
+    data["conv_id"] = entry.get("conv_id")
+    data["attempts"] = entry.get("attempts", 1)
+    data["ts"] = entry.get("ts", fallback_ts)
+    data["status_msg_id"] = entry.get("status_msg_id")
+    if entry.get("pid") is not None:
+        data["pid"] = entry["pid"]
+    else:
+        data.pop("pid", None)
+    if entry.get("turn_seq") is not None:
+        data["turn_seq"] = entry["turn_seq"]
+    else:
+        data.pop("turn_seq", None)
+
+
+def record_in_flight(channel_id: int | str, prompt: str, conv_id: str = None, status_msg_id: int = None, pid: int = None) -> int | None:
+    """Atomically record an in-flight turn with monotonic turn_seq under fcntl.flock."""
+    try:
+        with _in_flight_file_lock() as lock_fd:
+            data = _read_in_flight_locked()
+            cid_str = str(channel_id)
+            prev = data.get(cid_str) or {}
+            attempts = 1
+            if isinstance(prev, dict) and prev.get("prompt") == prompt:
+                attempts = prev.get("attempts", 1) + 1
+
+            effective_pid = pid if pid is not None else (prev.get("pid") if isinstance(prev, dict) else None)
+            turn_seq = _allocate_next_turn_seq(lock_fd, data)
+            now = time.time()
+
+            entry = {
+                "conv_id": conv_id,
+                "status_msg_id": status_msg_id,
+                "channel_id": int(channel_id) if str(channel_id).isdigit() else channel_id,
+                "prompt": prompt,
+                "attempts": attempts,
+                "ts": now,
+                "turn_seq": turn_seq,
+            }
+            if effective_pid is not None:
+                entry["pid"] = effective_pid
+
+            data[cid_str] = entry
+            # Maintain top-level fields for legacy callers/tests checking single dict
+            _sync_top_level_in_flight_fields(data, entry, now)
+            _write_in_flight_atomic(data)
+            return turn_seq
     except Exception as e:
         print(f"[BridgeState] Error recording in-flight: {e}")
+        return None
 
 
 def reap_stale_in_flight_entries(max_age_seconds: float = 1800.0) -> list[str]:
-    """Evict stale or already-completed channel entries from in_flight_turn.json."""
-    if not IN_FLIGHT_FILE.exists():
-        return []
+    """Evict stale or already-completed channel entries from in_flight_turn.json using turn_seq CAS."""
     reaped: list[str] = []
     try:
-        with open(IN_FLIGHT_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
+        with _in_flight_file_lock():
+            if not IN_FLIGHT_FILE.exists():
+                return []
+            snapshot = _read_in_flight_locked()
+        if not snapshot:
             return []
 
         now = time.time()
         has_proc = Path("/proc/1").exists()
         brain_root = Path("/root/.gemini/antigravity-cli/brain")
+        stale_candidates: dict[str, int | None] = {}
 
-        for k in list(data.keys()):
+        for k in list(snapshot.keys()):
             if not str(k).isdigit():
                 continue
-            entry = data.get(k)
+            entry = snapshot.get(k)
             if not isinstance(entry, dict):
                 continue
             ts = float(entry.get("ts") or now)
@@ -446,27 +530,32 @@ def reap_stale_in_flight_entries(max_age_seconds: float = 1800.0) -> list[str]:
                             pass
 
             if should_reap:
-                data.pop(k, None)
-                reaped.append(str(k))
+                stale_candidates[str(k)] = entry.get("turn_seq")
 
-        if reaped:
-            remaining_channels = [v for k, v in data.items() if str(k).isdigit() and isinstance(v, dict)]
-            if not remaining_channels:
-                IN_FLIGHT_FILE.unlink(missing_ok=True)
-            else:
-                latest = max(remaining_channels, key=lambda x: float(x.get("ts") or 0.0))
-                data["prompt"] = latest.get("prompt", "")
-                data["channel_id"] = latest.get("channel_id", TARGET_CHANNEL_ID)
-                data["conv_id"] = latest.get("conv_id")
-                data["attempts"] = latest.get("attempts", 1)
-                data["ts"] = latest.get("ts", now)
-                data["status_msg_id"] = latest.get("status_msg_id")
-                if latest.get("pid") is not None:
-                    data["pid"] = latest["pid"]
-                tmp = IN_FLIGHT_FILE.with_suffix(".tmp")
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2)
-                tmp.replace(IN_FLIGHT_FILE)
+        if not stale_candidates:
+            return []
+
+        with _in_flight_file_lock():
+            if not IN_FLIGHT_FILE.exists():
+                return []
+            data = _read_in_flight_locked()
+            if not data:
+                return []
+
+            for k, expected_seq in stale_candidates.items():
+                cur_entry = data.get(k)
+                if isinstance(cur_entry, dict) and cur_entry.get("turn_seq") == expected_seq:
+                    data.pop(k, None)
+                    reaped.append(k)
+
+            if reaped:
+                remaining_channels = [v for k, v in data.items() if str(k).isdigit() and isinstance(v, dict)]
+                if not remaining_channels:
+                    IN_FLIGHT_FILE.unlink(missing_ok=True)
+                else:
+                    latest = max(remaining_channels, key=lambda x: float(x.get("ts") or 0.0))
+                    _sync_top_level_in_flight_fields(data, latest, now)
+                    _write_in_flight_atomic(data)
     except Exception as e:
         print(f"[BridgeState] Warning reaping stale in-flight entries: {e}")
     return reaped
@@ -572,43 +661,46 @@ def increment_bot_messages(count: int = 1) -> int:
         return 5026
 
 
-def clear_in_flight(channel_id: int | str = None):
-    """Atomically clear in-flight turn for a channel, unlinking if all cleared."""
+def clear_in_flight(channel_id: int | str = None, expected_turn_seq: int | None = None) -> bool:
+    """Atomically clear in-flight turn for a channel under fcntl.flock, fencing on expected_turn_seq if set."""
     try:
-        if not IN_FLIGHT_FILE.exists():
-            return
-        if channel_id is None:
-            try:
-                IN_FLIGHT_FILE.unlink()
-            except Exception:
-                pass
-            return
-        with open(IN_FLIGHT_FILE) as f:
-            data = json.load(f)
-        if isinstance(data, dict):
+        with _in_flight_file_lock():
+            if not IN_FLIGHT_FILE.exists():
+                return False
+            if channel_id is None:
+                if expected_turn_seq is not None:
+                    data = _read_in_flight_locked()
+                    if data.get("turn_seq") != expected_turn_seq:
+                        return False
+                IN_FLIGHT_FILE.unlink(missing_ok=True)
+                return True
+
+            data = _read_in_flight_locked()
+            if not data:
+                return False
+
             cid_str = str(channel_id)
-            if cid_str in data:
-                del data[cid_str]
-            # Check remaining channels
+            if cid_str not in data:
+                return False
+
+            entry = data[cid_str]
+            if expected_turn_seq is not None:
+                entry_seq = entry.get("turn_seq") if isinstance(entry, dict) else None
+                if entry_seq != expected_turn_seq:
+                    return False
+
+            del data[cid_str]
             rem = [k for k, v in data.items() if isinstance(v, dict) and "prompt" in v]
             if not rem:
-                try:
-                    IN_FLIGHT_FILE.unlink()
-                except Exception:
-                    pass
+                IN_FLIGHT_FILE.unlink(missing_ok=True)
             else:
                 first = data[rem[0]]
-                data["prompt"] = first["prompt"]
-                data["channel_id"] = first["channel_id"]
-                data["conv_id"] = first["conv_id"]
-                data["ts"] = first["ts"]
-                data["status_msg_id"] = first.get("status_msg_id")
-                tmp = IN_FLIGHT_FILE.with_suffix(".tmp")
-                with open(tmp, "w") as f:
-                    json.dump(data, f, indent=2)
-                tmp.replace(IN_FLIGHT_FILE)
+                _sync_top_level_in_flight_fields(data, first, time.time())
+                _write_in_flight_atomic(data)
+            return True
     except Exception as e:
         print(f"[BridgeState] Error clearing in-flight: {e}")
+        return False
 
 
 def get_runtime_rules() -> dict:

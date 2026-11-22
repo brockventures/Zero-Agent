@@ -6001,5 +6001,109 @@ def test_decision_edit_modal_rejects_non_owner_before_ui_mutation(tmp_path, monk
     asyncio.run(_run())
 
 
+def test_execute_approval_card_cas_fences_out_late_worker_after_stale_recovery(tmp_path, monkeypatch):
+    """Verify late execute_approval_card completion cannot overwrite a decision recovered as 'failed'."""
+    db_path = tmp_path / "forge_cas_stale.db"
+    forge_mod.init_forge_db(db_path)
+
+    staged = forge_mod.stage_decision(
+        category="homelab",
+        title="Slow Approved Command",
+        summary="Simulate slow execution recovered before completion.",
+        handler_type="shell_cmd",
+        payload={"command": "echo done", "cwd": str(tmp_path)},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    decision_id = staged["decision_id"]
+
+    recovered_ids_seen = []
+
+    def _slow_subprocess_run(*args, **kwargs):
+        # While worker is running subprocess, simulate stale timeout recovery in DB
+        with forge_mod.get_db_connection(db_path) as conn:
+            row = conn.execute("SELECT executing_started_at FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
+            assert row is not None and row["executing_started_at"] is not None
+            conn.execute(
+                "UPDATE forge_decisions SET executing_started_at = ? WHERE id = ?",
+                (float(row["executing_started_at"]) - 1200.0, decision_id),
+            )
+        recovered_ids_seen.extend(
+            forge_mod.recover_stale_executing_decisions(db_path=db_path, stale_seconds=900.0)
+        )
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "late success"
+        m.stderr = ""
+        return m
+
+    monkeypatch.setattr(forge_mod.subprocess, "run", _slow_subprocess_run)
+
+    res = forge_mod.execute_approval_card(
+        decision_id,
+        user_id=forge_mod.OWNER_USER_ID,
+        db_path=db_path,
+    )
+
+    assert recovered_ids_seen == [decision_id]
+    assert res["ok"] is False
+    assert res["fenced"] is True
+    assert res["status"] == "failed"
+    assert "fenced out" in res["error"].lower()
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        final_row = conn.execute("SELECT * FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
+    assert final_row["status"] == "failed"
+    assert "recovered from stale executing state" in final_row["receipt_text"]
+
+
+def test_execute_approval_card_cas_fences_out_stale_worker_when_token_superseded(tmp_path, monkeypatch):
+    """Verify completion UPDATE checks exact executing_started_at token even if status is still 'executing'."""
+    db_path = tmp_path / "forge_cas_token.db"
+    forge_mod.init_forge_db(db_path)
+
+    staged = forge_mod.stage_decision(
+        category="homelab",
+        title="Superseded Execution",
+        summary="Verify executing_started_at mismatch fences completion.",
+        handler_type="shell_cmd",
+        payload={"command": "echo ok", "cwd": str(tmp_path)},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    decision_id = staged["decision_id"]
+    newer_exec_ts = time.time() + 50.0
+
+    def _superseded_subprocess_run(*args, **kwargs):
+        with forge_mod.get_db_connection(db_path) as conn:
+            conn.execute(
+                "UPDATE forge_decisions SET executing_started_at = ? WHERE id = ?",
+                (newer_exec_ts, decision_id),
+            )
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "stale worker done"
+        m.stderr = ""
+        return m
+
+    monkeypatch.setattr(forge_mod.subprocess, "run", _superseded_subprocess_run)
+
+    res = forge_mod.execute_approval_card(
+        decision_id,
+        user_id=forge_mod.OWNER_USER_ID,
+        db_path=db_path,
+    )
+
+    assert res["ok"] is False
+    assert res["fenced"] is True
+    assert res["status"] == "executing"
+
+    with forge_mod.get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT status, executing_started_at, receipt_text FROM forge_decisions WHERE id = ?", (decision_id,)).fetchone()
+    assert row["status"] == "executing"
+    assert row["executing_started_at"] == newer_exec_ts
+    assert row["receipt_text"] == ""
+
+
 if __name__ == "__main__":
     unittest.main()

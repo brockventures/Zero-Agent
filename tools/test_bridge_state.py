@@ -347,6 +347,108 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         bs.clear_in_flight(12345)
         self.assertFalse(bs.IN_FLIGHT_FILE.exists())
 
+    def test_in_flight_turn_seq_monotonic_and_clear_fencing(self):
+        # Monotonic turn_seq persists across clear_in_flight unlinks
+        seq1 = bs.record_in_flight(12345, "Turn 1", conv_id="conv-1")
+        seq2 = bs.record_in_flight(12345, "Turn 1", conv_id="conv-1", pid=os.getpid())
+        self.assertIsInstance(seq1, int)
+        self.assertGreater(seq2, seq1)
+
+        with open(bs.IN_FLIGHT_FILE) as f:
+            data = json.load(f)
+        self.assertEqual(data["12345"]["turn_seq"], seq2)
+        self.assertEqual(data["turn_seq"], seq2)
+
+        # Stale clear_in_flight with old expected_turn_seq must NOT evict newer turn_seq
+        self.assertFalse(bs.clear_in_flight(12345, expected_turn_seq=seq1))
+        self.assertTrue(bs.IN_FLIGHT_FILE.exists())
+        self.assertEqual(bs.get_in_flight()["12345"]["turn_seq"], seq2)
+
+        # Matching expected_turn_seq clears cleanly
+        self.assertTrue(bs.clear_in_flight(12345, expected_turn_seq=seq2))
+        self.assertFalse(bs.IN_FLIGHT_FILE.exists())
+
+        # New turn after unlink still gets strictly greater turn_seq
+        seq3 = bs.record_in_flight(12345, "Turn 2", conv_id="conv-2")
+        self.assertGreater(seq3, seq2)
+
+    def test_reap_stale_in_flight_entries_fences_out_concurrent_new_turn(self):
+        # Create a conv transcript that looks completed (PLANNER_RESPONSE DONE) and entry older than 30s
+        brain_root = Path("/root/.gemini/antigravity-cli/brain")
+        conv_id = f"test-reap-cas-{os.getpid()}-{int(time.time() * 1000)}"
+        tdir = brain_root / conv_id / ".system_generated" / "logs"
+        tdir.mkdir(parents=True, exist_ok=True)
+        tpath = tdir / "transcript.jsonl"
+        try:
+            tpath.write_text(json.dumps({"type": "PLANNER_RESPONSE", "status": "DONE"}) + "\n", encoding="utf-8")
+            old_mtime = time.time() - 60.0
+            os.utime(tpath, (old_mtime, old_mtime))
+
+            seq1 = bs.record_in_flight(777888, "Old stale prompt", conv_id=conv_id, pid=os.getpid())
+            # Backdate entry ts so age > 30s triggers transcript inspection
+            with open(bs.IN_FLIGHT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data["777888"]["ts"] = time.time() - 120.0
+            data["ts"] = data["777888"]["ts"]
+            bs.IN_FLIGHT_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+            # Inject concurrent record_in_flight while reap inspects transcript
+            orig_read_text = Path.read_text
+            injected = []
+
+            def _racy_read_text(path_obj, *args, **kwargs):
+                res = orig_read_text(path_obj, *args, **kwargs)
+                if path_obj == tpath and not injected:
+                    new_seq = bs.record_in_flight(777888, "Fresh concurrent prompt", conv_id="conv-fresh", pid=os.getpid())
+                    injected.append(new_seq)
+                return res
+
+            from unittest.mock import patch
+            with patch.object(Path, "read_text", _racy_read_text):
+                reaped = bs.reap_stale_in_flight_entries(max_age_seconds=1800.0)
+
+            self.assertEqual(len(injected), 1)
+            self.assertEqual(reaped, [])
+            cur = bs.get_in_flight()
+            self.assertIn("777888", cur)
+            self.assertEqual(cur["777888"]["turn_seq"], injected[0])
+            self.assertGreater(cur["777888"]["turn_seq"], seq1)
+            self.assertEqual(cur["777888"]["prompt"], "Fresh concurrent prompt")
+        finally:
+            shutil.rmtree(brain_root / conv_id, ignore_errors=True)
+
+    def test_in_flight_pid_unique_tmp_and_concurrent_flock_safety(self):
+        import concurrent.futures
+        from unittest.mock import patch
+
+        replaced_srcs = []
+        orig_replace = os.replace
+
+        def _spy_replace(src, dst):
+            replaced_srcs.append(str(src))
+            return orig_replace(src, dst)
+
+        with patch("tools.bridge_state.os.replace", side_effect=_spy_replace):
+            seq = bs.record_in_flight(999111, "PID temp test", conv_id="conv-pid")
+            self.assertIsNotNone(seq)
+
+        self.assertTrue(any(s.endswith(f".tmp.{os.getpid()}") for s in replaced_srcs), replaced_srcs)
+
+        # Concurrent multi-thread writes across channels must never lose entries or corrupt JSON
+        channels = [10000 + i for i in range(12)]
+
+        def _worker(ch):
+            return bs.record_in_flight(ch, f"Prompt for {ch}", conv_id=f"conv-{ch}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            seqs = list(pool.map(_worker, channels))
+
+        self.assertEqual(len(set(seqs)), len(channels))
+        final = bs.get_in_flight()
+        for ch in channels:
+            self.assertIn(str(ch), final)
+            self.assertEqual(final[str(ch)]["prompt"], f"Prompt for {ch}")
+
     def test_is_home_channel_excludes_baseball(self):
         class DummyChannel:
             def __init__(self, ch_id, cat_id=None, parent_id=None):
