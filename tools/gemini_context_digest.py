@@ -29,14 +29,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 WORKSPACE = Path("/workspace")
-if str(WORKSPACE) not in sys.path:
-    sys.path.insert(0, str(WORKSPACE))
-if str(WORKSPACE / "tools") not in sys.path:
-    sys.path.insert(0, str(WORKSPACE / "tools"))
-
-for _p in ("/workspace", "/workspace/tools"):
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+for _p in (str(_REPO_ROOT), str(_REPO_ROOT / "tools")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+for _p in ("/workspace", "/workspace/tools"):
+    if _p not in sys.path:
+        sys.path.append(_p)
 import send_mail
 import workspace_mcp
 
@@ -178,10 +177,15 @@ def gather_git_commits(hours_back: int = 24) -> list[str]:
             timeout=10,
             check=False,
         )
-        out = (res.stdout or "").strip()
-        return [line for line in out.splitlines() if line.strip()]
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError(f"git log subprocess failed: {exc}") from exc
+
+    if res.returncode != 0:
+        err_detail = (res.stderr or res.stdout or "").strip() or f"exit code {res.returncode}"
+        raise RuntimeError(f"git log failed ({res.returncode}): {err_detail}")
+
+    out = (res.stdout or "").strip()
+    return [line for line in out.splitlines() if line.strip()]
 
 
 def gather_recent_memory_updates(hours_back: int = 48) -> list[str]:
@@ -260,12 +264,17 @@ def gather_ivy_baseball_context() -> list[str]:
         cmd = (
             f"head -n 60 {nas_config.DOCKER_ROOT}/discord-ivy-agent/workspace/memory/MEMORY.md {nas_config.DOCKER_ROOT}/discord-ivy-agent/workspace/memory/sos_legacy_2026.md {nas_config.DOCKER_ROOT}/discord-ivy-agent/workspace/memory/12gm_3to_2026.md 2>/dev/null"
         )
-        code, stdout, _ = run_ssh(HOST_2_IP, cmd, timeout=10)
-        if code == 0 and stdout.strip():
-            for line in stdout.strip().splitlines()[:40]:
-                lines.append(line)
-    except Exception:
-        pass
+        code, stdout, stderr = run_ssh(HOST_2_IP, cmd, timeout=10)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to query Ivy baseball context via SSH: {exc}") from exc
+
+    if code != 0:
+        err_detail = (stderr or stdout or "").strip() or f"exit code {code}"
+        raise RuntimeError(f"SSH query for Ivy baseball context failed ({code}): {err_detail}")
+
+    if stdout.strip():
+        for line in stdout.strip().splitlines()[:40]:
+            lines.append(line)
     return lines
 
 
@@ -289,10 +298,20 @@ def build_context_digest_email(hours_back: int = 24) -> tuple[str, str]:
 
     # 2. Channel activity
     activity = gather_channel_activity(hours_back=hours_back)
-    commits = gather_git_commits(hours_back=hours_back)
+    commits_error: str | None = None
+    try:
+        commits = gather_git_commits(hours_back=hours_back)
+    except Exception as exc:
+        commits = []
+        commits_error = str(exc)
     mem_updates = gather_recent_memory_updates(hours_back=48)
     tasks, reminders = gather_active_tasks_and_reminders()
-    ivy_mem = gather_ivy_baseball_context()
+    ivy_error: str | None = None
+    try:
+        ivy_mem = gather_ivy_baseball_context()
+    except Exception as exc:
+        ivy_mem = []
+        ivy_error = str(exc)
 
     body_parts = [
         f"# Zero & Ivy — Daily Operational Context Digest ({pretty_date})",
@@ -339,7 +358,10 @@ def build_context_digest_email(hours_back: int = 24) -> tuple[str, str]:
     else:
         body_parts.append("- No new `#baseball` chat messages in the last 24 hours.")
 
-    if ivy_mem:
+    if ivy_error:
+        body_parts.append("\n### Ivy League & Valuation Reference Snapshot")
+        body_parts.append(f"- ⚠️ *Error fetching Ivy baseball context: {ivy_error}*")
+    elif ivy_mem:
         body_parts.append("\n### Ivy League & Valuation Reference Snapshot")
         body_parts.extend(ivy_mem[:25])
 
@@ -364,7 +386,12 @@ def build_context_digest_email(hours_back: int = 24) -> tuple[str, str]:
         "",
         f"## 7. Recent Code & Tooling Commits (Last {hours_back} Hours)",
     ])
-    body_parts.extend(commits if commits else ["- No new git commits in the last 24 hours."])
+    if commits_error:
+        body_parts.append(f"- ⚠️ *Error gathering git commits: {commits_error}*")
+    elif commits:
+        body_parts.extend(commits)
+    else:
+        body_parts.append(f"- No new git commits in the last {hours_back} hours.")
 
     if activity["crab_cavern"]:
         body_parts.extend([

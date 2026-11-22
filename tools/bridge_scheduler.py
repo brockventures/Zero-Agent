@@ -1856,16 +1856,45 @@ class BridgeScheduler:
         self._heartbeat_task = None
         self._active_job_tasks = set()
 
+    def _record_job_success(self, job_id: str | None, job_name: str, success_ts: float) -> None:
+        """Persist last_success_ts and last_run_ts only after a dispatched job succeeds."""
+        from tools.scheduler_tool import load_schedule, save_schedule
+
+        jobs = load_schedule()
+        success_at = datetime.fromtimestamp(success_ts, tz=PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
+        updated = False
+        for j in jobs:
+            if not isinstance(j, dict):
+                continue
+            if (job_id and j.get("id") == job_id) or (job_name and j.get("name") == job_name):
+                j["last_success_ts"] = success_ts
+                j["last_success_at"] = success_at
+                j["last_run_ts"] = success_ts
+                j["last_run_at"] = success_at
+                updated = True
+                break
+        if updated:
+            save_schedule(jobs)
+
     async def _safe_dispatch(self, prompt: str, name: str, cid: int | None, job_id: str | None = None):
         """Safely execute a single scheduled job dispatch in a decoupled background task."""
         try:
             try:
-                await self.dispatch_fn(prompt, job_name=name, channel_id=cid, job_id=job_id)
+                res = await self.dispatch_fn(prompt, job_name=name, channel_id=cid, job_id=job_id)
             except TypeError:
                 try:
-                    await self.dispatch_fn(prompt, job_name=name, channel_id=cid)
+                    res = await self.dispatch_fn(prompt, job_name=name, channel_id=cid)
                 except TypeError:
-                    await self.dispatch_fn(prompt, job_name=name)
+                    res = await self.dispatch_fn(prompt, job_name=name)
+            succeeded = not (
+                res is False
+                or (isinstance(res, tuple) and len(res) > 0 and res[0] is False)
+            )
+            if succeeded:
+                try:
+                    await asyncio.to_thread(self._record_job_success, job_id, name, time.time())
+                except Exception as rec_err:
+                    print(f"[BridgeScheduler] Warning recording success for {name}: {rec_err}")
         except asyncio.CancelledError:
             pass
         except Exception as de:
@@ -1914,8 +1943,8 @@ class BridgeScheduler:
 
                             prefix = "[BridgeScheduler Startup]" if is_startup else "[BridgeScheduler]"
                             if should_run:
-                                j["last_run_ts"] = now_ts
-                                j["last_run_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
+                                j["last_attempt_ts"] = now_ts
+                                j["last_attempt_at"] = datetime.now(PT_TZ).strftime("%Y-%m-%d %I:%M %p PT")
                                 print(f"{prefix} Triggering {j['name']} ({reason}, next: {j['next_run_ts']})")
                                 jobs_to_dispatch.append((j["prompt"], j["name"], j.get("channel_id"), j.get("id")))
                             else:

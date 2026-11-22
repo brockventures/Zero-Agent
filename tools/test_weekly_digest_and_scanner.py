@@ -309,7 +309,11 @@ class TestRedditFantasyDecisionCards:
         assert kws["category"] == "reddit_fantasy"
         assert "DynastyGuru99" in kws["title"]
         assert kws["handler_type"] == "shell"
-        assert kws["payload"]["command"] == 'python3 /workspace/tools/reddit_fantasy_scanner.py --post-draft --author "DynastyGuru99"'
+        assert kws["payload"]["command"] == (
+            "python3 /workspace/tools/reddit_fantasy_scanner.py --post-draft "
+            "--author DynastyGuru99 --thread-url https://www.reddit.com/r/fantasybaseball/comments/1abc/ "
+            "--draft 'Merrill has the safer contact floor with lower whiff risk. I'\"'\"'d lean his way.'"
+        )
         assert kws["payload"]["cwd"] == "/workspace"
         assert kws["post_to_discord"] is True
 
@@ -364,3 +368,151 @@ class TestRedditFantasyDecisionCards:
         # Legacy choices mode
         choices_card = format_draft_card(cand, draft, decision_staged=False)
         assert "[CHOICES: Post Draft to Reddit | Edit Draft | Skip Candidate]" in choices_card
+
+
+# ==============================================================================
+# 6. EXPLICIT ERROR PROPAGATION & WATERMARK SAFETY TESTS
+# ==============================================================================
+class TestDigestErrorSeparation:
+    """Tests separating fetch/subprocess/API errors from empty results across digests."""
+
+    def test_lounge_digest_gh_timeout_raises_and_preserves_watermark(self, tmp_path: Path):
+        import subprocess
+        import pytest
+        import tools.lounge_digest as ld
+
+        state_file = tmp_path / "lounge_digest_state.json"
+        queue_file = tmp_path / "lounge_digest_queue.json"
+        state_file.write_text(json.dumps({"last_digest_ts": 1000.0, "processed_prs": []}), encoding="utf-8")
+        queue_file.write_text("[]", encoding="utf-8")
+
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["gh"], timeout=15)) as mock_run:
+            with pytest.raises(ld.LoungeDigestFetchError):
+                ld.fetch_recently_merged_prs("brockventures/agora-roguelike", 1000.0)
+            assert mock_run.call_args.kwargs.get("timeout") == 15
+
+        with patch("subprocess.run", side_effect=subprocess.CalledProcessError(1, ["gh"], stderr="auth error")) as mock_run:
+            with pytest.raises(ld.LoungeDigestFetchError):
+                ld.fetch_open_in_flight_prs("brockventures/agora-roguelike")
+            assert mock_run.call_args.kwargs.get("timeout") == 15
+
+        # run_digest must NOT advance last_digest_ts when any repo fetch fails
+        with patch.object(ld, "STATE_FILE", state_file), \
+             patch.object(ld, "QUEUE_FILE", queue_file), \
+             patch("tools.bridge_state.is_crab_cavern_silenced", return_value=(False, "")), \
+             patch.object(ld, "fetch_recently_merged_prs", side_effect=[ld.LoungeDigestFetchError("timeout"), []]):
+            res = ld.run_digest(force=True)
+
+        assert res["status"] == "error"
+        assert res["errors"]
+        saved = json.loads(state_file.read_text(encoding="utf-8"))
+        assert saved["last_digest_ts"] == 1000.0
+
+    def test_lounge_digest_advances_watermark_when_repos_genuinely_empty(self, tmp_path: Path):
+        import tools.lounge_digest as ld
+
+        state_file = tmp_path / "lounge_digest_state.json"
+        queue_file = tmp_path / "lounge_digest_queue.json"
+        state_file.write_text(json.dumps({"last_digest_ts": 1000.0, "processed_prs": []}), encoding="utf-8")
+        queue_file.write_text("[]", encoding="utf-8")
+
+        with patch.object(ld, "STATE_FILE", state_file), \
+             patch.object(ld, "QUEUE_FILE", queue_file), \
+             patch("tools.bridge_state.is_crab_cavern_silenced", return_value=(False, "")), \
+             patch.object(ld, "fetch_recently_merged_prs", return_value=[]):
+            res = ld.run_digest(force=True)
+
+        assert res["status"] == "silent"
+        saved = json.loads(state_file.read_text(encoding="utf-8"))
+        assert saved["last_digest_ts"] > 1000.0
+
+    def test_plex_sonarr_failure_returns_none_and_is_full_season_false(self):
+        import tools.plex_weekly_digest as pwd
+
+        with patch.object(pwd, "SONARR_API_KEY", "test-key"), \
+             patch("urllib.request.urlopen", side_effect=TimeoutError("Sonarr timed out")):
+            sonarr_map = pwd._fetch_sonarr_season_completeness()
+
+        assert sonarr_map is None
+        assert pwd._is_full_season("Severance", 2, sonarr_map) is False
+
+    def test_plex_tautulli_failure_propagates_with_nonzero_exit(self):
+        import urllib.error
+        import pytest
+        import tools.plex_weekly_digest as pwd
+
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")):
+            with pytest.raises(pwd.TautulliFetchError):
+                pwd.generate_digest(days=7)
+            with pytest.raises(pwd.TautulliFetchError):
+                pwd.post_digest()
+            assert pwd.main(["post"]) == 1
+
+    def test_plex_tautulli_empty_returns_empty_and_zero_exit(self):
+        import tools.plex_weekly_digest as pwd
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({"response": {"result": "success", "data": {"recently_added": []}}}).encode()
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            assert pwd.generate_digest(days=7) == ""
+            assert pwd.main(["post"]) == 0
+
+    def test_gemini_context_digest_git_error_vs_empty(self):
+        import subprocess
+        import pytest
+        import tools.gemini_context_digest as gcd
+
+        err_res = MagicMock(returncode=128, stdout="", stderr="fatal: not a git repository")
+        with patch("subprocess.run", return_value=err_res):
+            with pytest.raises(RuntimeError, match="git log failed"):
+                gcd.gather_git_commits(hours_back=24)
+
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["git"], timeout=10)):
+            with pytest.raises(RuntimeError, match="git log subprocess failed"):
+                gcd.gather_git_commits(hours_back=24)
+
+        with patch.object(gcd, "gather_channel_activity", return_value={"zero": [], "ivy": [], "crab_cavern": [], "threads": []}), \
+             patch.object(gcd, "gather_git_commits", side_effect=RuntimeError("git log failed (128): bad repo")), \
+             patch.object(gcd, "gather_recent_memory_updates", return_value=[]), \
+             patch.object(gcd, "gather_active_tasks_and_reminders", return_value=([], [])), \
+             patch.object(gcd, "gather_ivy_baseball_context", return_value=[]), \
+             patch("tools.quota_card.build_quota_card", return_value=(False, "", {})):
+            _, body = gcd.build_context_digest_email(hours_back=24)
+
+        assert "No new git commits" not in body
+        assert "Error gathering git commits" in body
+        assert "bad repo" in body
+
+    def test_weekly_digest_renders_error_notes_on_calendar_and_reminders_failure(self, tmp_path: Path):
+        now = datetime(2026, 11, 15, 20, 0, tzinfo=PT)
+        with patch("tools.weekly_digest.calendar_list_events", return_value=json.dumps({"ok": False, "error": "OAuth expired"})):
+            events = get_week_ahead_events(now)
+        assert len(events) == 1
+        assert "unavailable" in events[0].lower()
+        assert "OAuth expired" in events[0]
+
+        bad_rems = tmp_path / "reminders.json"
+        bad_rems.write_text("{corrupt json", encoding="utf-8")
+
+        def path_side_effect(p):
+            if "reminders.json" in str(p):
+                return bad_rems
+            return Path(p)
+
+        with patch("tools.weekly_digest.Path", side_effect=path_side_effect), \
+             patch("tools.weekly_digest.calendar_list_events", side_effect=TimeoutError("cal timeout")):
+            renewals = get_upcoming_reminders_and_renewals(now, days=30)
+
+        assert any("Error reading reminders.json" in line for line in renewals)
+        assert any("Calendar anniversary lookup error" in line for line in renewals)
+
+        with patch("tools.weekly_digest.get_week_ahead_events", return_value=events), \
+             patch("tools.weekly_digest.get_upcoming_reminders_and_renewals", return_value=renewals):
+            report = generate_weekly_digest(now)
+
+        assert "No upcoming events scheduled" not in report
+        assert "No upcoming deadlines or renewals" not in report
+        assert "OAuth expired" in report
+

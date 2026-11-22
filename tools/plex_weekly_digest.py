@@ -12,9 +12,14 @@ API_KEY = os.environ.get("TAUTULLI_API_KEY", "")
 WEBHOOK_URL = os.environ.get("DISCORD_PLEX_WEBHOOK_URL", "")
 SONARR_API_KEY = os.environ.get("SONARR_API_KEY", "")
 
-for _p in ["/workspace", "/workspace/tools"]:
+from pathlib import Path as _Path
+_REPO_ROOT = str(_Path(__file__).resolve().parent.parent)
+for _p in [_REPO_ROOT, str(_Path(_REPO_ROOT) / "tools")]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
+for _p in ["/workspace", "/workspace/tools"]:
+    if _p not in sys.path:
+        sys.path.append(_p)
 
 try:
     from tools.nas_config import resolve_nas_config
@@ -47,8 +52,12 @@ def _norm_title(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", t)
 
 
-def _fetch_sonarr_season_completeness() -> dict[tuple[str, int], bool]:
-    """Return {(normalized_title, season_num): is_complete_full_season} from Sonarr."""
+class TautulliFetchError(RuntimeError):
+    """Raised when querying Tautulli fails."""
+
+
+def _fetch_sonarr_season_completeness() -> dict[tuple[str, int], bool] | None:
+    """Return {(normalized_title, season_num): is_complete_full_season} from Sonarr, or None on failure."""
     key = SONARR_API_KEY
     if not key:
         try:
@@ -57,7 +66,7 @@ def _fetch_sonarr_season_completeness() -> dict[tuple[str, int], bool]:
         except Exception:
             key = ""
     if not key:
-        return {}
+        return None
 
     url = f"http://{HOST_1_IP}:{SONARR_PORT}/api/v3/series"
     req = urllib.request.Request(url, headers={"X-Api-Key": key})
@@ -84,15 +93,16 @@ def _fetch_sonarr_season_completeness() -> dict[tuple[str, int], bool]:
                 for k in keys:
                     if k:
                         completeness[(k, s_num)] = is_full
-    except Exception:
-        pass
-    return completeness
+        return completeness
+    except Exception as exc:
+        print(f"[PlexDigest] Warning fetching Sonarr completeness: {exc}", file=sys.stderr)
+        return None
 
 
-def _is_full_season(show_name: str, season_num: int, sonarr_map: dict[tuple[str, int], bool]) -> bool:
+def _is_full_season(show_name: str, season_num: int, sonarr_map: dict[tuple[str, int], bool] | None) -> bool:
     """Check whether (show_name, season_num) is a verified complete season."""
     if not sonarr_map:
-        return True
+        return False
     for candidate in (_norm_title(show_name), re.sub(r"[^a-z0-9]+", "", (show_name or "").lower())):
         if (candidate, season_num) in sonarr_map:
             return sonarr_map[(candidate, season_num)]
@@ -107,9 +117,14 @@ def _fetch_tautulli_children(rating_key: str) -> list[dict]:
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
-            return data.get("response", {}).get("data", {}).get("children_list", []) or []
-    except Exception:
-        return []
+        resp_obj = data.get("response") or {}
+        if resp_obj.get("result") == "error":
+            raise TautulliFetchError(f"Tautulli API error: {resp_obj.get('message') or 'unknown error'}")
+        return resp_obj.get("data", {}).get("children_list", []) or []
+    except TautulliFetchError:
+        raise
+    except Exception as exc:
+        raise TautulliFetchError(f"Failed to fetch Tautulli children metadata for {rating_key}: {exc}") from exc
 
 
 def _format_episode_str(s_int: int, e_int: int, e_title: str) -> str:
@@ -125,9 +140,14 @@ def generate_digest(days: int = 7, tag_all: bool = False) -> str:
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=25) as resp:
             data = json.loads(resp.read().decode())
-            items = data.get("response", {}).get("data", {}).get("recently_added", [])
-    except Exception:
-        return ""
+        resp_obj = data.get("response") or {}
+        if resp_obj.get("result") == "error":
+            raise TautulliFetchError(f"Tautulli API error: {resp_obj.get('message') or 'unknown error'}")
+        items = resp_obj.get("data", {}).get("recently_added", [])
+    except TautulliFetchError:
+        raise
+    except Exception as exc:
+        raise TautulliFetchError(f"Failed to fetch Tautulli recently_added: {exc}") from exc
 
     cutoff = time.time() - (days * 86400)
     sonarr_map = _fetch_sonarr_season_completeness()
@@ -268,12 +288,23 @@ def post_digest(tag_all: bool = False):
         queue_outbox_message("server-updates", digest, source_turn="plex_weekly_digest")
         print("Weekly digest queued via outbox to #server-updates!")
     except Exception as e:
-        print(f"Failed to queue outbox message: {e}")
+        print(f"Failed to queue outbox message: {e}", file=sys.stderr)
+        raise RuntimeError(f"Failed to deliver Plex weekly digest: {e}") from e
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    tag = "--tag-all" in args
+    try:
+        if args and "post" in args:
+            post_digest(tag_all=tag)
+        else:
+            print(generate_digest(days=7, tag_all=tag) or "No new media added this week.")
+        return 0
+    except Exception as exc:
+        print(f"Plex weekly digest error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    tag = "--tag-all" in sys.argv
-    if len(sys.argv) > 1 and "post" in sys.argv:
-        post_digest(tag_all=tag)
-    else:
-        print(generate_digest(days=7, tag_all=tag) or "No new media added this week.")
+    sys.exit(main())

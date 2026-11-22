@@ -1,7 +1,10 @@
 import sys
 from pathlib import Path
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 if '/workspace' not in sys.path:
-    sys.path.insert(0, '/workspace')
+    sys.path.append('/workspace')
 #!/usr/bin/env python3
 """
 lounge_digest.py - Crab Cavern Periodic Lounge Engineering Digest
@@ -102,6 +105,14 @@ def enqueue_completed_item(
     save_queue(queue)
 
 
+class LoungeDigestFetchError(RuntimeError):
+    """Raised when one or more GitHub CLI queries fail while compiling a digest."""
+
+    def __init__(self, message: str, errors: list[str] | None = None):
+        super().__init__(message)
+        self.errors = errors or [message]
+
+
 def fetch_recently_merged_prs(repo: str, since_ts: float) -> list[dict]:
     """Fetch PRs merged since since_ts via GitHub CLI."""
     cmd = [
@@ -112,10 +123,13 @@ def fetch_recently_merged_prs(repo: str, since_ts: float) -> list[dict]:
         "--json", "number,title,mergedAt,url,headRefName"
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
         prs = json.loads(res.stdout) if res.stdout else []
-    except Exception:
-        return []
+    except Exception as exc:
+        raise LoungeDigestFetchError(
+            f"Failed to fetch merged PRs for {repo}: {exc}",
+            errors=[f"{repo} (merged): {exc}"],
+        ) from exc
 
     recent = []
     for pr in prs:
@@ -150,10 +164,13 @@ def fetch_open_in_flight_prs(repo: str) -> list[dict]:
         "--json", "number,title,url,reviewDecision"
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
         return json.loads(res.stdout) if res.stdout else []
-    except Exception:
-        return []
+    except Exception as exc:
+        raise LoungeDigestFetchError(
+            f"Failed to fetch open PRs for {repo}: {exc}",
+            errors=[f"{repo} (open): {exc}"],
+        ) from exc
 
 
 def clean_title(title: str) -> str:
@@ -179,12 +196,22 @@ def compile_digest(since_ts: float) -> tuple[str | None, list[str]]:
             processed_ids.add(q.get("id"))
 
     # 2. Auto-harvest from active GitHub repos
+    fetch_errors: list[str] = []
     for repo in ACTIVE_REPOS:
-        recent_prs = fetch_recently_merged_prs(repo, since_ts)
-        for rpr in recent_prs:
-            if rpr["id"] not in processed_ids:
-                items.append(rpr)
-                processed_ids.add(rpr["id"])
+        try:
+            recent_prs = fetch_recently_merged_prs(repo, since_ts)
+            for rpr in recent_prs:
+                if rpr["id"] not in processed_ids:
+                    items.append(rpr)
+                    processed_ids.add(rpr["id"])
+        except Exception as exc:
+            fetch_errors.extend(getattr(exc, "errors", [f"{repo} (merged): {exc}"]))
+
+    if fetch_errors:
+        raise LoungeDigestFetchError(
+            f"GitHub PR fetch failed for {len(fetch_errors)} repo(s): {'; '.join(fetch_errors)}",
+            errors=fetch_errors,
+        )
 
     if not items:
         return None, []
@@ -195,9 +222,18 @@ def compile_digest(since_ts: float) -> tuple[str | None, list[str]]:
     # Fetch currently in-flight work
     in_flight = []
     for repo in ACTIVE_REPOS:
-        open_prs = fetch_open_in_flight_prs(repo)
-        for opr in open_prs:
-            in_flight.append(opr)
+        try:
+            open_prs = fetch_open_in_flight_prs(repo)
+            for opr in open_prs:
+                in_flight.append(opr)
+        except Exception as exc:
+            fetch_errors.extend(getattr(exc, "errors", [f"{repo} (open): {exc}"]))
+
+    if fetch_errors:
+        raise LoungeDigestFetchError(
+            f"GitHub open PR fetch failed for {len(fetch_errors)} repo(s): {'; '.join(fetch_errors)}",
+            errors=fetch_errors,
+        )
 
     # Format into ELI5 digest
     lines = [
@@ -258,7 +294,14 @@ def run_digest(
 
     # Query for items completed since last digest (or past 2 hours if last digest was 0)
     query_since = last_digest_ts if last_digest_ts > 0 else (now - cooldown_seconds)
-    digest_text, processed_ids = compile_digest(query_since)
+    try:
+        digest_text, processed_ids = compile_digest(query_since)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Repo fetch failed; watermark not advanced: {exc}",
+            "errors": getattr(exc, "errors", [str(exc)]),
+        }
 
     if not digest_text:
         # Zero-Noise Invariant: No updates, do not post anything
@@ -323,6 +366,8 @@ def main():
 
     res = run_digest(dry_run=args.dry_run, force=args.force)
     print(json.dumps(res, indent=2))
+    if res.get("status") == "error":
+        sys.exit(1)
 
 
 if __name__ == "__main__":

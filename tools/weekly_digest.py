@@ -67,6 +67,7 @@ def get_upcoming_birthdays_and_anniversaries(now_pt: datetime, days: int = 30) -
                         pass
         except Exception as e:
             print(f"[WeeklyDigest] Error reading google_contacts_birthdays.csv: {e}", file=sys.stderr)
+            items.append((end_date, f"• ⚠️ *Error reading google_contacts_birthdays.csv: {e}*"))
 
     # 2. Friends and Family Master CSV (including child birthdays in notes)
     master_file = Path("/workspace/data/friends_and_family_master.csv")
@@ -108,12 +109,15 @@ def get_upcoming_birthdays_and_anniversaries(now_pt: datetime, days: int = 30) -
                             pass
         except Exception as e:
             print(f"[WeeklyDigest] Error reading friends_and_family_master.csv: {e}", file=sys.stderr)
+            items.append((end_date, f"• ⚠️ *Error reading friends_and_family_master.csv: {e}*"))
 
     # 3. Google Calendar sweep for anniversaries and gotcha days across all calendars
     try:
         t_min = now_pt.isoformat()
         t_max = (now_pt + timedelta(days=days)).isoformat()
         res = json.loads(calendar_list_events("all", t_min, t_max, max_results=50))
+        if isinstance(res, dict) and (res.get("ok") is False or res.get("error")):
+            raise RuntimeError(res.get("error") or "Calendar API returned error")
         for ev in res.get("events", []):
             summ = ev.get("summary", "").strip()
             if not summ:
@@ -133,6 +137,7 @@ def get_upcoming_birthdays_and_anniversaries(now_pt: datetime, days: int = 30) -
                         items.append((ev_date, f"• **{fmt_date}** — {summ}"))
     except Exception as e:
         print(f"[WeeklyDigest] Error scanning calendar anniversaries: {e}", file=sys.stderr)
+        items.append((end_date, f"• ⚠️ *Calendar anniversary lookup error: {e}*"))
 
     return items
 
@@ -187,6 +192,7 @@ def get_upcoming_reminders_and_renewals(now_pt: datetime, days: int = 30) -> lis
                 combined_items.append((dt, f"• **{fmt_date}** — {clean_msg.strip()}"))
         except Exception as e:
             print(f"[WeeklyDigest] Error reading reminders.json: {e}", file=sys.stderr)
+            combined_items.append((end_date, f"• ⚠️ *Error reading reminders.json: {e}*"))
 
     # 2. Birthdays and Anniversaries
     bday_items = get_upcoming_birthdays_and_anniversaries(now_pt, days=days)
@@ -324,6 +330,8 @@ def get_week_ahead_events(now_pt: datetime | None = None) -> list[str]:
     try:
         res_raw = calendar_list_events("all", min_iso, max_iso, max_results=50)
         data = json.loads(res_raw)
+        if isinstance(data, dict) and (data.get("ok") is False or data.get("error")):
+            raise RuntimeError(data.get("error") or "Calendar API returned error")
         events = data.get("events", [])
 
         for ev in events:
@@ -364,7 +372,7 @@ def get_week_ahead_events(now_pt: datetime | None = None) -> list[str]:
             lines.append(f"• **{date_badge}**{time_part} — {summary}")
     except Exception as e:
         print(f"[WeeklyDigest] Error querying calendar: {e}", file=sys.stderr)
-        lines.append("• *Calendar events temporarily unavailable.*")
+        lines.append(f"• ⚠️ *Calendar events temporarily unavailable: {e}*")
 
     return lines[:15]
 

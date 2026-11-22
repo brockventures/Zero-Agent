@@ -1231,7 +1231,7 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             if scheduler._active_job_tasks:
                 await asyncio.gather(*list(scheduler._active_job_tasks))
 
-        mock_save.assert_called_once()
+        self.assertGreaterEqual(mock_save.call_count, 1)
         self.assertEqual(jobs[0]["quiet_hours"], [0, 7])
         dispatched_ids = [c.kwargs.get("job_id") for c in dispatch_mock.await_args_list]
         self.assertIn("daily_quota_card", dispatched_ids)
@@ -1605,6 +1605,66 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
             outbox.OUTBOX_DIR = orig_outbox_dir
             outbox.PENDING_FILE = orig_pending_file
             outbox.HISTORY_FILE = orig_history_file
+
+    async def test_evaluate_and_dispatch_tracks_attempt_separately_from_success_on_error(self):
+        """Verify failed dispatch updates last_attempt_ts without advancing last_success_ts or last_run_ts."""
+        dispatch_mock = AsyncMock(side_effect=RuntimeError("dispatch blew up"))
+        scheduler = bshed.BridgeScheduler(dispatch_fn=dispatch_mock)
+        now = time.time()
+        test_job = {
+            "id": "test_fail_job",
+            "name": "Failing Job",
+            "enabled": True,
+            "schedule_type": "daily",
+            "hour_pt": 8,
+            "minute_pt": 0,
+            "next_run_ts": now - 5,
+            "last_success_ts": 500.0,
+            "last_run_ts": 500.0,
+            "prompt": "Run failing job",
+        }
+
+        with patch("tools.scheduler_tool.load_schedule", return_value=[test_job]), \
+             patch("tools.bridge_scheduler.should_run_job", return_value=(True, "on_time")), \
+             patch("tools.scheduler_tool.save_schedule") as mock_save:
+            await scheduler._evaluate_and_dispatch_jobs()
+            if scheduler._active_job_tasks:
+                await asyncio.gather(*list(scheduler._active_job_tasks))
+
+        mock_save.assert_called_once()
+        self.assertGreater(test_job["last_attempt_ts"], 500.0)
+        self.assertEqual(test_job["last_success_ts"], 500.0)
+        self.assertEqual(test_job["last_run_ts"], 500.0)
+
+    async def test_evaluate_and_dispatch_updates_last_success_ts_when_dispatch_succeeds(self):
+        """Verify successful dispatch records last_attempt_ts first and updates last_success_ts on completion."""
+        dispatch_mock = AsyncMock(return_value=None)
+        scheduler = bshed.BridgeScheduler(dispatch_fn=dispatch_mock)
+        now = time.time()
+        test_job = {
+            "id": "test_ok_job",
+            "name": "Succeeding Job",
+            "enabled": True,
+            "schedule_type": "daily",
+            "hour_pt": 8,
+            "minute_pt": 0,
+            "next_run_ts": now - 5,
+            "last_success_ts": 500.0,
+            "last_run_ts": 500.0,
+            "prompt": "Run succeeding job",
+        }
+
+        with patch("tools.scheduler_tool.load_schedule", return_value=[test_job]), \
+             patch("tools.bridge_scheduler.should_run_job", return_value=(True, "on_time")), \
+             patch("tools.scheduler_tool.save_schedule") as mock_save:
+            await scheduler._evaluate_and_dispatch_jobs()
+            if scheduler._active_job_tasks:
+                await asyncio.gather(*list(scheduler._active_job_tasks))
+
+        self.assertEqual(mock_save.call_count, 2)
+        self.assertGreater(test_job["last_attempt_ts"], 500.0)
+        self.assertGreaterEqual(test_job["last_success_ts"], test_job["last_attempt_ts"])
+        self.assertEqual(test_job["last_run_ts"], test_job["last_success_ts"])
 
 
 if __name__ == "__main__":
