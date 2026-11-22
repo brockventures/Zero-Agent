@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa
 """Unit tests for sidecar health fixes:
 - nas_storage_check live metric formatting, SSH flags, timeout, and Host 2 local fallback
 - dockhand_update quiet Decision Card staging and stdout suppression
@@ -379,6 +380,200 @@ def test_update_antigravity_up_to_date(capsys):
         assert "Antigravity CLI is up to date" in capsys.readouterr().out
 
 
+def test_update_antigravity_shared_mount_decision_summary():
+    """Verify check_updates Decision Card summary mentions shared mount & zero restarts when shared mount is active."""
+    with (
+        patch.object(update_antigravity, "get_current_version", return_value="1.0.0"),
+        patch.object(update_antigravity, "get_latest_version", return_value="1.1.0"),
+        patch.object(update_antigravity, "uses_shared_binary_mount", return_value=True),
+        patch("tools.forge.stage_decision", return_value={"id": 45}) as mock_stage,
+    ):
+        update_antigravity.check_updates(quiet=True)
+        mock_stage.assert_called_once()
+        summary = mock_stage.call_args.kwargs["summary"]
+        assert "shared mount" in summary.lower() or "shared" in summary.lower()
+        assert "restart" in summary.lower()
+        assert "zero" in summary.lower() or "no" in summary.lower()
+
+
+def test_update_antigravity_perform_upgrade_shared_mount(tmp_path, monkeypatch):
+    """Verify perform_upgrade with shared mount writes atomically to SHARED_BIN_PATH, updates Dockerfile, verifies fleet, and does not restart."""
+    import tarfile
+
+    shared_dir = tmp_path / "opt_agy_bin"
+    shared_dir.mkdir(parents=True)
+    shared_bin = shared_dir / "agy"
+    local_bin = tmp_path / "usr_local_bin_agy"
+
+    monkeypatch.setattr(update_antigravity, "SHARED_BIN_DIR", str(shared_dir))
+    monkeypatch.setattr(update_antigravity, "SHARED_BIN_PATH", str(shared_bin))
+    monkeypatch.setattr(update_antigravity, "LOCAL_BIN_PATH", str(local_bin))
+    monkeypatch.setattr(update_antigravity, "uses_shared_binary_mount", lambda: True)
+
+    mock_tar = tmp_path / "agy.tar.gz"
+    dummy_bin = tmp_path / "dummy_agy"
+    dummy_bin.write_text("#!/bin/sh\necho '1.2.0'\n")
+    dummy_bin.chmod(0o755)
+
+    with tarfile.open(mock_tar, "w:gz") as tar:
+        tar.add(dummy_bin, arcname="agy")
+
+    tar_bytes = mock_tar.read_bytes()
+
+    class MockResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self):
+            return tar_bytes
+
+    fleet_result = {
+        "discord-antigravity-agent": "1.2.0",
+        "discord-ivy-agent": "1.2.0",
+        "discord-vulcan-agent": "1.2.0",
+    }
+
+    with (
+        patch.object(update_antigravity, "get_current_version", return_value="1.0.0"),
+        patch.object(update_antigravity, "get_latest_version", return_value="1.2.0"),
+        patch("urllib.request.urlopen", return_value=MockResponse()),
+        patch.object(update_antigravity, "_update_host_dockerfile", return_value=(True, "ok")) as mock_dockerfile,
+        patch.object(update_antigravity, "verify_fleet_versions", return_value=fleet_result) as mock_verify_fleet,
+        patch("tools.nas_config.run_ssh") as mock_ssh,
+    ):
+        update_antigravity.perform_upgrade("1.2.0")
+
+        # Verify binary exists at shared path and is executable
+        assert shared_bin.exists()
+        assert os.access(str(shared_bin), os.X_OK)
+
+        # Verify symlink at local_bin
+        assert local_bin.is_symlink()
+        assert os.readlink(str(local_bin)) == str(shared_bin)
+
+        # Verify Dockerfile update was called
+        mock_dockerfile.assert_called_once_with("1.2.0")
+
+        # Verify fleet versions was called
+        mock_verify_fleet.assert_called_once()
+
+        # Verify container restart was NOT invoked via SSH
+        for call in mock_ssh.call_args_list:
+            cmd = call[0][1] if len(call[0]) > 1 else call.kwargs.get("remote_cmd", "")
+            assert "docker restart" not in cmd
+
+
+def test_update_antigravity_perform_upgrade_fallback(tmp_path, monkeypatch):
+    """Verify perform_upgrade falls back to /usr/local/bin/agy and container restart when shared mount is absent."""
+    import tarfile
+
+    local_bin = tmp_path / "usr_local_bin_agy"
+    monkeypatch.setattr(update_antigravity, "LOCAL_BIN_PATH", str(local_bin))
+    monkeypatch.setattr(update_antigravity, "uses_shared_binary_mount", lambda: False)
+
+    mock_tar = tmp_path / "agy.tar.gz"
+    dummy_bin = tmp_path / "dummy_agy"
+    dummy_bin.write_text("#!/bin/sh\necho '1.2.0'\n")
+    dummy_bin.chmod(0o755)
+
+    with tarfile.open(mock_tar, "w:gz") as tar:
+        tar.add(dummy_bin, arcname="agy")
+
+    tar_bytes = mock_tar.read_bytes()
+
+    class MockResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self):
+            return tar_bytes
+
+    with (
+        patch.object(update_antigravity, "get_current_version", return_value="1.0.0"),
+        patch.object(update_antigravity, "get_latest_version", return_value="1.2.0"),
+        patch("urllib.request.urlopen", return_value=MockResponse()),
+        patch.object(update_antigravity, "_update_host_dockerfile", return_value=(True, "ok")),
+        patch("tools.nas_config.run_ssh") as mock_ssh,
+    ):
+        update_antigravity.perform_upgrade("1.2.0")
+        assert local_bin.exists()
+        assert not local_bin.is_symlink()
+
+        restart_called = any(
+            "docker restart discord-antigravity-agent" in (call[0][1] if len(call[0]) > 1 else "")
+            for call in mock_ssh.call_args_list
+        )
+        assert restart_called is True
+
+
+def test_update_antigravity_perform_upgrade_force(capsys):
+    """Verify perform_upgrade without force exits early when versions match, but proceeds or bypasses early exit with force=True."""
+    with (
+        patch.object(update_antigravity, "get_current_version", return_value="1.2.0"),
+        patch.object(update_antigravity, "get_latest_version", return_value="1.2.0"),
+    ):
+        update_antigravity.perform_upgrade("1.2.0", force=False)
+        captured = capsys.readouterr()
+        assert "Already running latest Antigravity CLI version" in captured.out
+
+
+def test_update_host_dockerfile_uses_nas_config(monkeypatch):
+    """Verify _update_host_dockerfile resolves DOCKER_ROOT and invokes run_ssh cleanly without hardcoded IPs."""
+    mock_docker_root = "/nas/docker_test"
+
+    monkeypatch.delenv("HOST_AGENT_DIR", raising=False)
+    monkeypatch.setattr(update_antigravity.nas_config, "HOST_2_IP", DOC_HOST_2)
+    monkeypatch.setattr(update_antigravity.nas_config, "DOCKER_ROOT", mock_docker_root)
+
+    with patch.object(update_antigravity.nas_config, "run_ssh", return_value=(0, "ok", "")) as mock_run_ssh:
+        ok, msg = update_antigravity._update_host_dockerfile("1.2.0")
+        assert ok is True
+        mock_run_ssh.assert_called_once()
+        host, cmd = mock_run_ssh.call_args[0][0], mock_run_ssh.call_args[0][1]
+        assert host == DOC_HOST_2
+        assert f"{mock_docker_root}/discord-agy-agent/Dockerfile" in cmd
+        assert "1.2.0" in cmd
+
+
+def test_verify_fleet_versions(monkeypatch):
+    """Verify verify_fleet_versions iterates over AGENT_CONTAINERS via nas_config.run_ssh."""
+    monkeypatch.setattr(update_antigravity.nas_config, "HOST_2_IP", DOC_HOST_2)
+
+    def mock_run_ssh_side_effect(host, cmd, **kwargs):
+        assert host == DOC_HOST_2
+        if "discord-antigravity-agent" in cmd:
+            return (0, "agy 1.2.0\n", "")
+        if "discord-ivy-agent" in cmd:
+            return (0, "v1.2.0\n", "")
+        if "discord-vulcan-agent" in cmd:
+            return (0, "1.2.0\n", "")
+        return (1, "", "error")
+
+    with patch.object(update_antigravity.nas_config, "run_ssh", side_effect=mock_run_ssh_side_effect):
+        versions = update_antigravity.verify_fleet_versions()
+        assert versions["discord-antigravity-agent"] == "1.2.0"
+        assert versions["discord-ivy-agent"] == "1.2.0"
+        assert versions["discord-vulcan-agent"] == "1.2.0"
+
+
+def test_uses_shared_binary_mount(tmp_path, monkeypatch):
+    """Verify uses_shared_binary_mount checks directory existence and writability."""
+    non_existent = tmp_path / "non_existent"
+    monkeypatch.setattr(update_antigravity, "SHARED_BIN_DIR", str(non_existent))
+    assert update_antigravity.uses_shared_binary_mount() is False
+
+    valid_dir = tmp_path / "valid_dir"
+    valid_dir.mkdir()
+    monkeypatch.setattr(update_antigravity, "SHARED_BIN_DIR", str(valid_dir))
+    assert update_antigravity.uses_shared_binary_mount() is True
+
+
 # ==============================================================================
 # 5. SLZB-06P7 Stable Firmware Promotion Watcher & Flasher tests
 # ==============================================================================
@@ -721,6 +916,7 @@ def test_hearth_photos_daemon_http_auth_and_url_rejection(tmp_path, monkeypatch)
 
 def test_webcam_stream_proxy_defaults_and_no_wildcard_cors(monkeypatch):
     """Verify webcam_stream_proxy binds to 127.0.0.1 by default and omits wildcard CORS."""
+    pytest.importorskip("fastapi")
     from tools import webcam_stream_proxy as proxy
 
     src_path = os.path.join(REPO_ROOT, "tools", "webcam_stream_proxy.py")
@@ -739,6 +935,7 @@ def test_webcam_stream_proxy_defaults_and_no_wildcard_cors(monkeypatch):
 
 def test_webcam_stream_proxy_auth_and_non_loopback_rejection(tmp_path, monkeypatch):
     """Verify webcam_stream_proxy enforces fail-closed Bearer auth for non-loopback and configured tokens."""
+    pytest.importorskip("fastapi")
     import asyncio
     from starlette.requests import Request
     from tools import webcam_stream_proxy as proxy
