@@ -814,6 +814,22 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Antigravity CLI check execution error: {e}")
         return
 
+    # Monthly persistent virtualenv package check: silent execution unless fallback output is returned
+    if job_id == "venv_update_check" or "venv_update_check.py" in prompt or job_name == "Monthly Virtualenv Package Check":
+        try:
+            from tools.sidecars import run_venv_update_check
+            ok, out, _ = await _run_sidecar_job_async("venv_update_check", "Monthly Virtualenv Package Check", run_venv_update_check)
+            if out and out.strip() and bot:
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
+                if ch:
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    await _send_chunked_content(ch, clean_content, choice_view)
+            else:
+                print("[Scheduler] Monthly virtualenv package check: up to date or card staged (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Monthly virtualenv package check execution error: {e}")
+        return
+
     # Dockhand container image check: silent execution unless an update is available
     if "dockhand_update.py" in prompt or job_name in ("Dockhand Image Check", "Dockhand Image Update Check") or job_id == "dockhand_update":
         try:

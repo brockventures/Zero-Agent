@@ -279,3 +279,72 @@ def test_venv_perform_upgrade_safe_only_and_include_major(monkeypatch):
     ssh_installs_major = [cmd for _, cmd in ssh_calls if "install --upgrade --no-cache-dir" in cmd]
     assert "pandas" in ssh_installs_major[0]
     assert "numpy" in ssh_installs_major[0]
+
+
+# ==============================================================================
+# 3. Sidecar runner & monthly schedule wiring tests
+# ==============================================================================
+
+
+def test_sidecars_run_venv_update_check_delegates_to_script():
+    """sidecars.run_venv_update_check runs venv_update_check.py check --quiet with a 120s timeout."""
+    from tools import sidecars
+
+    # sidecars.py inserts /workspace onto sys.path at import time; restore worktree priority
+    sys.path = [p for p in sys.path if p not in ("/workspace", "/workspace/tools")]
+    sys.path.insert(0, os.path.join(REPO_ROOT, "tools"))
+    sys.path.insert(0, REPO_ROOT)
+
+    with patch.object(
+        sidecars.subprocess,
+        "run",
+        return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+    ) as mock_run:
+        ok, out = sidecars.run_venv_update_check()
+        assert ok is True
+        assert out == ""
+        mock_run.assert_called_once_with(
+            ["python3", "/workspace/tools/venv_update_check.py", "check", "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    with patch.object(
+        sidecars.subprocess,
+        "run",
+        return_value=SimpleNamespace(returncode=0, stdout="fallback notice\n", stderr=""),
+    ):
+        ok, out = sidecars.run_venv_update_check()
+        assert ok is True
+        assert out == "fallback notice"
+
+    with patch.object(
+        sidecars.subprocess,
+        "run",
+        side_effect=RuntimeError("boom"),
+    ):
+        ok, out = sidecars.run_venv_update_check()
+        assert ok is False
+        assert "boom" in out
+
+
+def test_schedule_json_contains_enabled_monthly_venv_update_check():
+    """data/schedule.json defines an enabled monthly venv_update_check entry routed to #zero-ops."""
+    schedule_path = os.path.join(REPO_ROOT, "data", "schedule.json")
+    with open(schedule_path, encoding="utf-8") as f:
+        jobs = json.load(f)
+
+    matches = [j for j in jobs if j.get("id") == "venv_update_check"]
+    assert len(matches) == 1
+    entry = matches[0]
+    assert entry["name"] == "Monthly Virtualenv Package Check"
+    assert entry["enabled"] is True
+    assert entry["schedule_type"] == "monthly"
+    assert entry["day_of_month"] == 1
+    assert entry["hour_pt"] == 10
+    assert entry["minute_pt"] == 15
+    assert entry["channel_id"] == 1544953279664889888
+    assert entry["catchup_if_missed"] is True
+    assert entry["catchup_window_seconds"] == 86400
+    assert "venv_update_check.py" in entry["prompt"]
