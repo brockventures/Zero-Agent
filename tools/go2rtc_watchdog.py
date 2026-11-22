@@ -595,7 +595,7 @@ def main():
     parser.add_argument("--test", action="store_true", help="Force output and test run")
     parser.add_argument("--quiet", action="store_true", help="Suppress output if nominal")
     parser.add_argument("--no-reap", action="store_true", help="Disable auto-reaping of zombie streams")
-    parser.add_argument("--cpu-threshold", type=float, default=DEFAULT_CPU_THRESHOLD, help="CPU % warning threshold")
+    parser.add_argument("--cpu-threshold", type=float, default=DEFAULT_CPU_THRESHOLD, help="CPU %% warning threshold")
     parser.add_argument(
         "--mem-threshold",
         type=float,
@@ -616,7 +616,7 @@ def main():
         try:
             from tools.outbox import send_message
 
-            send_message(channel_id="1542081463124881478", content=summary)
+            send_message(channel_id="1544953279664889888", content=summary)
         except Exception as e:  # noqa: BLE001
             print(f"Failed to dispatch to #zero-ops: {e}", file=sys.stderr)
 

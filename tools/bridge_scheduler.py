@@ -240,6 +240,7 @@ INTERNAL_SYSTEM_MAINTENANCE_JOBS = {
     "host2_backup",
     "bridge_watchdog",
     "pid_watchdog",
+    "go2rtc_watchdog",
     "plex_cleanup",
     "kalshi_paper_bot",
     "kalshi_midday_heating",
@@ -1120,6 +1121,21 @@ async def dispatch_scheduled_prompt(
                 print("[Scheduler] PID watchdog checked: nominal (silent).")
         except Exception as e:
             print(f"[Scheduler] PID watchdog execution error: {e}")
+        return
+
+    # Host 1 go2rtc Resource & Zombie Stream Watchdog: silent unless warning/critical
+    if job_id == "go2rtc_watchdog" or "go2rtc_watchdog" in prompt or job_name in ("Host 1 go2rtc Resource & Zombie Stream Watchdog", "go2rtc Watchdog"):
+        try:
+            from tools.sidecars import run_go2rtc_watchdog
+            ok, out, _ = await _run_sidecar_job_async("go2rtc_watchdog", "Host 1 go2rtc Resource & Zombie Stream Watchdog", run_go2rtc_watchdog)
+            if not ok and out and out.strip() and bot:
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
+                if ch:
+                    await ch.send(out)
+            else:
+                print("[Scheduler] go2rtc watchdog checked: nominal (silent).")
+        except Exception as e:
+            print(f"[Scheduler] go2rtc watchdog execution error: {e}")
         return
 
     # Bridge Liveness Watchdog: silent unless error / degraded
