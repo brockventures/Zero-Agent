@@ -1022,6 +1022,109 @@ def check_secrets_mutation_gate(target_file: str, cwd: str = "/workspace") -> tu
     return True, ""
 
 
+_FORGE_PROHIBITED_WRITE_TOOLS = frozenset(
+    {
+        "edit_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "write_file",
+        "write_to_file",
+    }
+)
+
+
+def _normalize_prohibited_rel_path(path_str: str) -> str:
+    """Normalize a relative POSIX file path for FORGE boundary comparison."""
+    s = (path_str or "").strip().replace("\\", "/")
+    if not s:
+        return ""
+    norm = posixpath.normpath(s).lstrip("/")
+    if norm in ("", "."):
+        return ""
+    return norm
+
+
+def check_forge_prohibited_file_gate(name: str, args: dict, cwd: str = "/workspace") -> tuple[bool, str]:
+    """Block FORGE workers from editing or writing files listed in FORGE_PROHIBITED_FILES."""
+    if os.environ.get("FORGE_WORKER_ACTIVE") != "1":
+        return True, ""
+    if name not in _FORGE_PROHIBITED_WRITE_TOOLS:
+        return True, ""
+    raw_prohibited = os.environ.get("FORGE_PROHIBITED_FILES", "").strip()
+    if not raw_prohibited:
+        return True, ""
+    try:
+        parsed = json.loads(raw_prohibited)
+    except Exception:
+        return True, ""
+    if not isinstance(parsed, list) or not parsed:
+        return True, ""
+
+    prohibited_set = {
+        norm_p
+        for item in parsed
+        if isinstance(item, str)
+        for norm_p in (_normalize_prohibited_rel_path(item),)
+        if norm_p
+    }
+    if not prohibited_set:
+        return True, ""
+
+    args = args or {}
+    target_file = (
+        args.get("TargetFile")
+        or args.get("AbsolutePath")
+        or args.get("Path")
+        or args.get("path")
+        or ""
+    )
+    if not target_file or not isinstance(target_file, str):
+        return True, ""
+
+    eff_cwd = cwd or "/workspace"
+    norm_cwd = _norm_posix(eff_cwd, "/")
+    norm_target = _norm_posix(target_file, eff_cwd)
+
+    candidates: list[str] = []
+    try:
+        rel = posixpath.relpath(norm_target, norm_cwd)
+        if rel not in ("", ".") and not rel.startswith("../") and rel != "..":
+            candidates.append(rel)
+    except Exception:
+        pass
+
+    lex_target = target_file.strip().replace("\\", "/")
+    if lex_target.startswith("/"):
+        lex_target_norm = posixpath.normpath(lex_target)
+    else:
+        lex_cwd = posixpath.normpath(eff_cwd.replace("\\", "/"))
+        lex_target_norm = posixpath.normpath(lex_cwd.rstrip("/") + "/" + lex_target)
+    try:
+        lex_cwd_norm = posixpath.normpath(eff_cwd.replace("\\", "/"))
+        lex_rel = posixpath.relpath(lex_target_norm, lex_cwd_norm)
+        if lex_rel not in ("", ".") and not lex_rel.startswith("../") and lex_rel != "..":
+            candidates.append(lex_rel)
+    except Exception:
+        pass
+
+    for p_cand in (norm_target, lex_target_norm):
+        m_wt = re.match(r"^/tmp/forge-wt-[^/]+/(.+)$", p_cand)
+        if m_wt:
+            candidates.append(m_wt.group(1))
+        if p_cand.startswith("/workspace/"):
+            candidates.append(p_cand[len("/workspace/"):])
+
+    for cand in candidates:
+        norm_cand = _normalize_prohibited_rel_path(cand)
+        if norm_cand in prohibited_set:
+            return False, (
+                f"FORGE Boundary Guard Triggered: '{norm_cand}' is in FORGE_PROHIBITED_FILES for this chunk "
+                f"(target: '{target_file}'). Modify ONLY your Allowed Target Files and corresponding unit tests."
+            )
+
+    return True, ""
+
+
 def _split_unquoted_shell_segments(cmd: str) -> list[str]:
     """Split shell command on unquoted ';', newline, '|', '&&', '||', '&' while preserving quoted strings."""
     joined = re.sub(r"\\\r?\n", " ", cmd)
@@ -3029,6 +3132,12 @@ def check_tool_use(
             "Schedule Tool Prohibited in Bridge Turns: Do not invoke the runtime 'schedule' timer tool to poll background tasks. "
             "Stop calling tools silently and let the background task completion notification wake you automatically."
         )
+
+    # 0-boundary. FORGE Worker Prohibited-File Boundary Guard (runs before any FORGE_WORKER_ACTIVE exemptions)
+    ok_boundary, boundary_reason = check_forge_prohibited_file_gate(name=name, args=args, cwd=cwd)
+    if not ok_boundary:
+        save_state(state, state_file)
+        return False, boundary_reason
 
     # 0a. Crab Cavern Air-Gap / SSH Sandbox Guard -> Auto-redirect to 1-click #zero-chat Decision Card
     ok_cc, cc_reason = check_crab_cavern_airgap_guard(

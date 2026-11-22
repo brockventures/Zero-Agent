@@ -18,6 +18,7 @@ from batch_guard import (
     check_batching,
     check_destructive_system_and_exposure_gate,
     check_forge_post_offload_lock,
+    check_forge_prohibited_file_gate,
     check_interactive_investigation_gate,
     check_secrets_mutation_gate,
     check_tool_use,
@@ -32,6 +33,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def isolate_forge_worker_env(monkeypatch):
     monkeypatch.delenv("FORGE_WORKER_ACTIVE", raising=False)
+    monkeypatch.delenv("FORGE_PROHIBITED_FILES", raising=False)
     monkeypatch.delenv("FORGE_APPROVED_CARD_EXECUTION", raising=False)
     monkeypatch.delenv("DISCORD_CHANNEL_ID", raising=False)
     monkeypatch.setattr("batch_guard.IN_FLIGHT_TURN_FILE", "/nonexistent_in_flight_turn.json")
@@ -2713,5 +2715,83 @@ def test_web_taint_blocks_private_memory_env_and_outbound_exfil(tmp_path, monkey
     hooks_bytes = (Path(_REPO_ROOT) / ".agents" / "hooks" / "batch_guard.py").read_bytes()
     tools_bytes = (Path(_REPO_ROOT) / "tools" / "batch_guard.py").read_bytes()
     assert hooks_bytes == tools_bytes
+
+
+def test_forge_prohibited_file_gate_blocks_prohibited_and_allows_targets(tmp_path, monkeypatch):
+    wt_cwd = "/tmp/forge-wt-fg-999-c0"
+    state_file = str(tmp_path / "forge_boundary_state.json")
+
+    monkeypatch.setenv("FORGE_WORKER_ACTIVE", "1")
+    monkeypatch.setenv(
+        "FORGE_PROHIBITED_FILES",
+        json.dumps(["tools/forge.py", "./tools/provision_vulcan.py", ".agents/skills/forge-orchestrator/SKILL.md"]),
+    )
+
+    # 1. Blocked across write/edit tool variants with relative, dotdot, worktree-absolute, and /workspace paths
+    blocked_cases = [
+        ("edit_file", {"Path": "tools/forge.py"}, wt_cwd),
+        ("edit_file", {"Path": "./tools/forge.py"}, wt_cwd),
+        ("replace_file_content", {"TargetFile": "tools/../tools/forge.py"}, wt_cwd),
+        ("multi_replace_file_content", {"TargetFile": f"{wt_cwd}/tools/forge.py"}, wt_cwd),
+        ("write_file", {"Path": f"{wt_cwd}/tools/provision_vulcan.py", "Content": "x = 1"}, "/workspace"),
+        ("write_to_file", {"TargetFile": "/workspace/tools/forge.py", "CodeContent": "x = 1"}, wt_cwd),
+        ("edit_file", {"Path": ".agents/skills/forge-orchestrator/SKILL.md"}, wt_cwd),
+    ]
+    for tool_name, tool_args, call_cwd in blocked_cases:
+        ok_direct, reason_direct = check_forge_prohibited_file_gate(tool_name, tool_args, cwd=call_cwd)
+        assert ok_direct is False, f"Expected direct gate block for {tool_name}({tool_args}) cwd={call_cwd}"
+        assert "FORGE Boundary Guard Triggered" in reason_direct
+
+        ok_e2e, reason_e2e = check_tool_use(
+            tool_name,
+            tool_args,
+            state_file=state_file,
+            cwd=call_cwd,
+            agy_pid=88888,
+        )
+        assert ok_e2e is False, f"Expected check_tool_use block for {tool_name}({tool_args}) cwd={call_cwd}"
+        assert "FORGE Boundary Guard Triggered" in reason_e2e
+
+    # 2. Allowed edits to non-prohibited target files and allowed read_file on prohibited files
+    allowed_cases = [
+        ("edit_file", {"Path": "tools/batch_guard.py"}, wt_cwd),
+        ("write_file", {"Path": f"{wt_cwd}/tools/test_batch_guard.py", "Content": "def test_ok(): pass\n"}, wt_cwd),
+        ("replace_file_content", {"TargetFile": ".agents/hooks/batch_guard.py"}, wt_cwd),
+        ("read_file", {"Path": f"{wt_cwd}/tools/forge.py"}, wt_cwd),
+    ]
+    for tool_name, tool_args, call_cwd in allowed_cases:
+        ok_direct, r_direct = check_forge_prohibited_file_gate(tool_name, tool_args, cwd=call_cwd)
+        assert ok_direct is True, f"Expected direct allow for {tool_name}({tool_args}), got: {r_direct}"
+
+        ok_e2e, r_e2e = check_tool_use(
+            tool_name,
+            tool_args,
+            state_file=state_file,
+            cwd=call_cwd,
+            agy_pid=88888,
+        )
+        assert ok_e2e is True, f"Expected check_tool_use allow for {tool_name}({tool_args}), got: {r_e2e}"
+
+
+def test_forge_prohibited_file_gate_noop_when_inactive_empty_or_invalid(monkeypatch):
+    wt_cwd = "/tmp/forge-wt-fg-999-c0"
+
+    # Inactive FORGE_WORKER_ACTIVE -> no-op even when FORGE_PROHIBITED_FILES is populated
+    monkeypatch.delenv("FORGE_WORKER_ACTIVE", raising=False)
+    monkeypatch.setenv("FORGE_PROHIBITED_FILES", json.dumps(["tools/forge.py"]))
+    ok_inactive, reason_inactive = check_forge_prohibited_file_gate("edit_file", {"Path": "tools/forge.py"}, cwd=wt_cwd)
+    assert ok_inactive is True
+    assert reason_inactive == ""
+
+    # Active worker with empty, unset, non-list, or invalid JSON FORGE_PROHIBITED_FILES -> no-op
+    monkeypatch.setenv("FORGE_WORKER_ACTIVE", "1")
+    for raw_val in (None, "", "   ", "[]", "{}", '"tools/forge.py"', "{not-valid-json"):
+        if raw_val is None:
+            monkeypatch.delenv("FORGE_PROHIBITED_FILES", raising=False)
+        else:
+            monkeypatch.setenv("FORGE_PROHIBITED_FILES", raw_val)
+        ok_noop, reason_noop = check_forge_prohibited_file_gate("edit_file", {"Path": "tools/forge.py"}, cwd=wt_cwd)
+        assert ok_noop is True, f"Expected no-op for FORGE_PROHIBITED_FILES={raw_val!r}, got: {reason_noop}"
+        assert reason_noop == ""
 
 
