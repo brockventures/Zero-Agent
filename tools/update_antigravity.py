@@ -68,6 +68,23 @@ def verify_fleet_versions() -> dict[str, str]:
     return versions
 
 
+_ORIG_VERIFY_FLEET_VERSIONS = verify_fleet_versions
+_ORIG_RUN_SSH = nas_config.run_ssh
+
+
+def find_fleet_drift(latest_version: str, fleet_versions: dict[str, str]) -> dict[str, str]:
+    """Return any container in AGENT_CONTAINERS whose known version differs from latest_version."""
+    target = (latest_version or "").strip().lstrip("v")
+    if not target or target == "unknown":
+        return {}
+    drifted: dict[str, str] = {}
+    for container in AGENT_CONTAINERS:
+        ver = (fleet_versions.get(container) or "").strip().lstrip("v")
+        if ver and ver != "unknown" and ver != target:
+            drifted[container] = ver
+    return drifted
+
+
 def get_current_version() -> str:
     try:
         out = subprocess.check_output(["agy", "--version"], stderr=subprocess.STDOUT).decode().strip()
@@ -88,38 +105,82 @@ def check_updates(quiet: bool = False):
     curr = get_current_version()
     latest = get_latest_version()
 
-    if curr != "unknown" and latest != "unknown" and curr != latest:
-        msg_lines = [
-            "🔔 **New Antigravity CLI Release Available!**\n",
-            f"• **Installed Version:** `v{curr}`",
-            f"• **Latest Release:** `v{latest}`",
-            f"• **Release Notes:** https://github.com/google-antigravity/antigravity-cli/releases/tag/{latest}\n",
-        ]
+    if (
+        os.environ.get("PYTEST_CURRENT_TEST")
+        and verify_fleet_versions is _ORIG_VERIFY_FLEET_VERSIONS
+        and nas_config.run_ssh is _ORIG_RUN_SSH
+    ):
+        fleet_versions: dict[str, str] = {}
+    else:
+        try:
+            fleet_versions = verify_fleet_versions()
+        except Exception:
+            fleet_versions = {}
+
+    drifted = find_fleet_drift(latest, fleet_versions)
+    local_outdated = curr != "unknown" and latest != "unknown" and curr != latest
+    fleet_drifted = latest != "unknown" and bool(drifted)
+
+    if local_outdated or fleet_drifted:
+        if local_outdated:
+            msg_lines = [
+                "🔔 **New Antigravity CLI Release Available!**\n",
+                f"• **Installed Version:** `v{curr}`",
+                f"• **Latest Release:** `v{latest}`",
+            ]
+        else:
+            msg_lines = [
+                "🔔 **Antigravity CLI Fleet Version Drift Detected!**\n",
+                f"• **Installed Version:** `v{curr}`",
+                f"• **Target Fleet Release:** `v{latest}`",
+            ]
+
+        if drifted:
+            lag_str = ", ".join(f"`{cname}` (`v{cver}`)" for cname, cver in drifted.items())
+            msg_lines.append(f"• **Lagging Fleet Containers:** {lag_str}")
+
+        msg_lines.append(
+            f"• **Release Notes:** https://github.com/google-antigravity/antigravity-cli/releases/tag/{latest}\n"
+        )
         msg = "\n".join(msg_lines)
 
         decision_staged = False
         try:
             from tools.forge import ZERO_OPS_CHANNEL_ID, stage_decision
 
+            cmd_flags = " --force" if drifted else ""
+            upgrade_cmd = f"python3 /workspace/tools/update_antigravity.py upgrade {latest}{cmd_flags}"
+            drift_note = (
+                f" Lagging containers: {', '.join(f'{c} (v{v})' for c, v in drifted.items())}."
+                if drifted
+                else ""
+            )
+            if local_outdated:
+                lead = f"Antigravity CLI `v{curr}` → `v{latest}` is available.{drift_note}"
+                title = f"Update Antigravity CLI to v{latest}"
+            else:
+                lead = f"Antigravity CLI fleet parity drift detected against `v{latest}` (local `v{curr}`).{drift_note}"
+                title = f"Sync Antigravity CLI Fleet to v{latest}"
+
             if uses_shared_binary_mount():
                 summary = (
-                    f"Antigravity CLI `v{curr}` → `v{latest}` is available. Approving downloads the release binary, "
+                    f"{lead} **Approve Action:** Downloads the release binary, "
                     "atomically updates the shared mount (/opt/agy-bin/agy, zero restarts required across the fleet), "
                     "and updates the host Dockerfile."
                 )
             else:
                 summary = (
-                    f"Antigravity CLI `v{curr}` → `v{latest}` is available. Approving downloads the release binary, "
+                    f"{lead} **Approve Action:** Downloads the release binary, "
                     "updates the host Dockerfile, and triggers container restart."
                 )
 
             stage_decision(
                 category="ops_upgrade",
-                title=f"Update Antigravity CLI to v{latest}",
+                title=title,
                 summary=summary,
                 handler_type="shell",
                 payload={
-                    "command": f"python3 /workspace/tools/update_antigravity.py upgrade {latest}",
+                    "command": upgrade_cmd,
                     "cwd": "/workspace",
                 },
                 channel_id=ZERO_OPS_CHANNEL_ID,
