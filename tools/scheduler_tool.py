@@ -277,7 +277,8 @@ DEFAULT_JOBS = [
         "hour_pt": 10,
         "minute_pt": 0,
         "prompt": "Check for Antigravity CLI updates using /workspace/tools/update_antigravity.py.",
-        "catchup_if_missed": False
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 14400
     },
     {
         "id": "ha_battery_check",
@@ -310,7 +311,8 @@ DEFAULT_JOBS = [
         "hour_pt": 10,
         "minute_pt": 30,
         "prompt": "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py.",
-        "catchup_if_missed": False
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 86400
     },
     {
         "id": "dockhand_update",
@@ -321,7 +323,8 @@ DEFAULT_JOBS = [
         "hour_pt": 11,
         "minute_pt": 0,
         "prompt": "Run the Dockhand container image check using /workspace/tools/dockhand_update.py.",
-        "catchup_if_missed": False
+        "catchup_if_missed": True,
+        "catchup_window_seconds": 86400
     },
     {
         "id": "weekly_proactive_digest",
@@ -806,6 +809,7 @@ SIDECAR_ALIASES = {
     "nas_storage_check": ["nas_storage", "nas_storage_check"],
     "ha_update_check": ["ha_update_check"],
     "dockhand_update": ["dockhand_check", "dockhand_update"],
+    "postgres_update_check": ["postgres_update_check", "postgres_update"],
     "weekly_proactive_digest": ["weekly_digest", "weekly_proactive_digest"],
     "plex_weekly_digest": ["plex_weekly_digest"],
     "monthly_hardcode_regex_audit": ["monthly_hardcode_regex_audit", "code_audit", "hardcode_audit", "regex_audit"],

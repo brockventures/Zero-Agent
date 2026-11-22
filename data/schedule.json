@@ -323,7 +323,8 @@
     "hour_pt": 10,
     "minute_pt": 0,
     "prompt": "Check for Antigravity CLI updates using /workspace/tools/update_antigravity.py.",
-    "catchup_if_missed": false,
+    "catchup_if_missed": true,
+    "catchup_window_seconds": 14400,
     "last_run_ts": 1795284001,
     "last_run_at": "2026-11-21 10:00 AM PT",
     "next_run_ts": 1795370400.0,
@@ -369,7 +370,8 @@
     "minute_pt": 30,
     "channel_id": 1544953275877556334,
     "prompt": "Run the Home Assistant stable update check using /workspace/tools/ha_update_check.py.",
-    "catchup_if_missed": false,
+    "catchup_if_missed": true,
+    "catchup_window_seconds": 86400,
     "last_run_ts": 1793989804,
     "last_run_at": "2026-11-06 10:30 AM PT",
     "next_run_ts": 1795804200.0
@@ -383,7 +385,8 @@
     "hour_pt": 11,
     "minute_pt": 0,
     "prompt": "Run the Dockhand container image check using /workspace/tools/dockhand_update.py.",
-    "catchup_if_missed": false,
+    "catchup_if_missed": true,
+    "catchup_window_seconds": 86400,
     "last_run_ts": 1794769212,
     "last_run_at": "2026-11-15 11:00 AM PT",
     "next_run_ts": 1795374000.0,
@@ -1076,5 +1079,18 @@
     "catchup_if_missed": true,
     "catchup_window_seconds": 86400,
     "prompt": "Check persistent agent virtualenvs for package updates using /workspace/tools/venv_update_check.py."
+  },
+  {
+    "id": "postgres_update_check",
+    "name": "Monthly Postgres Minor Patch Check",
+    "enabled": true,
+    "schedule_type": "monthly",
+    "day_of_month": 18,
+    "hour_pt": 10,
+    "minute_pt": 30,
+    "channel_id": 1544953279664889888,
+    "catchup_if_missed": true,
+    "catchup_window_seconds": 86400,
+    "prompt": "Check pinned PostgreSQL containers on Host 1 and Host 2 for minor security patches using /workspace/tools/postgres_update_check.py."
   }
 ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import importlib
 import io
 import json
 import sys
@@ -10,10 +11,26 @@ from pathlib import Path
 from unittest.mock import patch
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
+if str(_REPO_ROOT) in sys.path:
+    sys.path.remove(str(_REPO_ROOT))
+sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import postgres_update_check
+
+
+def _import_worktree_module(mod_name: str):
+    """Import `tools.<mod_name>` from this worktree even if another module prepended /workspace."""
+    root_str = str(_REPO_ROOT)
+    if root_str in sys.path:
+        sys.path.remove(root_str)
+    sys.path.insert(0, root_str)
+    full_name = f"tools.{mod_name}"
+    existing = sys.modules.get(full_name)
+    if existing is not None:
+        mod_file = getattr(existing, "__file__", "") or ""
+        if not mod_file.startswith(root_str):
+            del sys.modules[full_name]
+    return importlib.import_module(full_name)
 
 MOCK_HOST_1_IP = "198.51.100.82"
 MOCK_HOST_2_IP = "203.0.113.84"
@@ -276,3 +293,81 @@ def test_perform_upgrade_happy_path_scoped_compose_and_pg_isready(capsys):
     out = capsys.readouterr().out
     assert "PostgreSQL 15.10" in out
     assert "42M" in out
+
+
+def test_schedule_json_catchup_windows_and_postgres_monthly_job():
+    schedule_path = _REPO_ROOT / "data" / "schedule.json"
+    jobs = json.loads(schedule_path.read_text(encoding="utf-8"))
+    by_id = {job["id"]: job for job in jobs}
+
+    for jid in ("ha_update_check", "dockhand_update"):
+        assert by_id[jid]["catchup_if_missed"] is True
+        assert by_id[jid]["catchup_window_seconds"] == 86400
+
+    assert by_id["antigravity_check"]["catchup_if_missed"] is True
+    assert by_id["antigravity_check"]["catchup_window_seconds"] == 14400
+
+    pg_job = by_id["postgres_update_check"]
+    assert pg_job["enabled"] is True
+    assert pg_job["name"] == "Monthly Postgres Minor Patch Check"
+    assert pg_job["schedule_type"] == "monthly"
+    assert pg_job["day_of_month"] == 18
+    assert pg_job["hour_pt"] == 10
+    assert pg_job["minute_pt"] == 30
+    assert pg_job["channel_id"] == 1544953279664889888
+    assert pg_job["catchup_if_missed"] is True
+    assert pg_job["catchup_window_seconds"] == 86400
+    assert "postgres_update_check.py" in pg_job["prompt"]
+
+
+def test_scheduler_tool_defaults_and_aliases():
+    scheduler_tool = _import_worktree_module("scheduler_tool")
+
+    defaults = {job["id"]: job for job in scheduler_tool.DEFAULT_JOBS}
+    assert defaults["ha_update_check"]["catchup_if_missed"] is True
+    assert defaults["ha_update_check"]["catchup_window_seconds"] == 86400
+    assert defaults["dockhand_update"]["catchup_if_missed"] is True
+    assert defaults["dockhand_update"]["catchup_window_seconds"] == 86400
+    assert defaults["antigravity_check"]["catchup_if_missed"] is True
+    assert defaults["antigravity_check"]["catchup_window_seconds"] == 14400
+    assert scheduler_tool.SIDECAR_ALIASES["postgres_update_check"] == [
+        "postgres_update_check",
+        "postgres_update",
+    ]
+
+
+def test_sidecars_run_postgres_update_check_delegation():
+    from subprocess import CompletedProcess
+
+    sidecars = _import_worktree_module("sidecars")
+
+    with patch(
+        "tools.sidecars.subprocess.run",
+        return_value=CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+    ) as mock_run:
+        ok, out = sidecars.run_postgres_update_check()
+
+    assert ok is True
+    assert out == ""
+    mock_run.assert_called_once_with(
+        ["python3", "/workspace/tools/postgres_update_check.py", "check", "--quiet"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    with patch(
+        "tools.sidecars.subprocess.run",
+        return_value=CompletedProcess(args=[], returncode=0, stdout="fallback summary\n", stderr=""),
+    ):
+        ok, out = sidecars.run_postgres_update_check()
+    assert ok is True
+    assert out == "fallback summary"
+
+    with patch(
+        "tools.sidecars.subprocess.run",
+        side_effect=RuntimeError("boom"),
+    ):
+        ok, out = sidecars.run_postgres_update_check()
+    assert ok is False
+    assert "boom" in out

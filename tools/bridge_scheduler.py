@@ -846,6 +846,22 @@ async def dispatch_scheduled_prompt(
             print(f"[Scheduler] Dockhand image check execution error: {e}")
         return
 
+    # Monthly Postgres minor-patch check: silent execution unless fallback output is returned
+    if job_id == "postgres_update_check" or "postgres_update_check.py" in prompt or job_name == "Monthly Postgres Minor Patch Check":
+        try:
+            from tools.sidecars import run_postgres_update_check
+            ok, out, _ = await _run_sidecar_job_async("postgres_update_check", "Monthly Postgres Minor Patch Check", run_postgres_update_check)
+            if out and out.strip() and bot:
+                ch = await get_dest_channel(ZERO_OPS_CHANNEL_ID)
+                if ch:
+                    clean_content, choice_view = parse_interactive_choices(out, quick_choice_view_cls, button_choice_fn)
+                    await _send_chunked_content(ch, clean_content, choice_view)
+            else:
+                print("[Scheduler] Monthly Postgres minor-patch check: up to date or card staged (silent).")
+        except Exception as e:
+            print(f"[Scheduler] Monthly Postgres minor-patch check execution error: {e}")
+        return
+
     # Hearth Upstream Mirrormere Weekly Sync: silent unless not ok or an update occurred
     if job_id == "hearth_weekly_sync" or "hearth_sync" in prompt or "Hearth Upstream Mirrormere Weekly Sync" in job_name:
         try:

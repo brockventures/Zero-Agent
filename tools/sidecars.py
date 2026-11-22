@@ -1717,6 +1717,26 @@ def run_dockhand_update_check() -> tuple[bool, str]:
     except Exception as e:
         return False, f"⚠️ Dockhand update check failed: {e}"
 
+
+def run_postgres_update_check() -> tuple[bool, str]:
+    """Check pinned PostgreSQL containers on Host 1 and Host 2 for minor security patches."""
+    try:
+        res = subprocess.run(
+            ["python3", "/workspace/tools/postgres_update_check.py", "check", "--quiet"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        out = (res.stdout or "").strip()
+        rc = getattr(res, "returncode", 0)
+        if rc not in (0, None) and not out:
+            err = (getattr(res, "stderr", "") or "").strip()
+            detail = f": {err}" if err else ""
+            return False, f"⚠️ PostgreSQL update check failed (exit {rc}){detail}"
+        return True, out
+    except Exception as e:
+        return False, f"⚠️ PostgreSQL update check failed: {e}"
+
 def run_antigravity_check() -> tuple[bool, str]:
     """Check Antigravity CLI release updates."""
     try:
@@ -2930,6 +2950,9 @@ if __name__ == "__main__":
     elif action == "antigravity":
         ok, rep, _ = run_sidecar_job("update_antigravity", "Antigravity CLI Check", run_antigravity_check)
         print(rep or "Antigravity up to date.")
+    elif action in ("postgres_update", "postgres_check"):
+        ok, rep, _ = run_sidecar_job("postgres_update_check", "Monthly Postgres Minor Patch Check", run_postgres_update_check)
+        print(rep or "PostgreSQL containers up to date.")
     elif action in ("venv_update", "venv_check"):
         ok, rep, _ = run_sidecar_job("venv_update_check", "Monthly Virtualenv Package Check", run_venv_update_check)
         print(rep or "All persistent virtualenvs up to date.")
