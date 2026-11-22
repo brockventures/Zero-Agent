@@ -72,6 +72,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 EXECUTION_LOG_FILE = DATA_DIR / "sidecar_execution_log.json"
 EXECUTION_STATUS_FILE = DATA_DIR / "sidecar_status.json"
+HEARTBEAT_STATE_FILE = os.path.join(DATA_DIR, "heartbeat_state.json")
+HEARTBEAT_RETRY_DELAY_SECONDS = 5
 MAX_LOG_ENTRIES = 200
 
 # --------------------------------------------------------------------------
@@ -498,15 +500,73 @@ format_sidecar_status_report = format_sidecar_status_summary
 # --------------------------------------------------------------------------
 # 1. Heartbeat Sweep
 # --------------------------------------------------------------------------
-def run_heartbeat_sweep() -> tuple[bool, str]:
-    HOST_1_IP, HOST_2_IP, _ = _resolve_nas_config()
-    failures = []
-    now_str = datetime.now(PT).strftime("%Y-%m-%d %I:%M %p PT")
+def _load_heartbeat_state() -> dict:
+    try:
+        p = Path(HEARTBEAT_STATE_FILE)
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        log.warning("Failed to load heartbeat state file (%s): %s", HEARTBEAT_STATE_FILE, e)
+    return {
+        "degraded": False,
+        "degraded_since_ts": None,
+        "degraded_since_pt": None,
+        "last_failures": [],
+        "alert_count": 0,
+    }
+
+
+def _save_heartbeat_state(state: dict) -> None:
+    try:
+        p = Path(HEARTBEAT_STATE_FILE)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp_p = p.with_name(f"{p.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}")
+        with open(tmp_p, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        tmp_p.replace(p)
+    except Exception as e:
+        log.warning("Failed to save heartbeat state to %s: %s", HEARTBEAT_STATE_FILE, e)
+
+
+def _format_downtime(seconds: float) -> str:
+    """Format downtime duration into a concise string like '< 1m', '24m', '1h 12m'."""
+    if seconds < 60:
+        return "< 1m"
+    total_minutes = int(seconds // 60)
+    if total_minutes < 60:
+        return f"{total_minutes}m"
+    hours = total_minutes // 60
+    mins = total_minutes % 60
+    days = hours // 24
+    rem_hours = hours % 24
+    if days > 0:
+        if rem_hours > 0 and mins > 0:
+            return f"{days}d {rem_hours}h {mins}m"
+        elif rem_hours > 0:
+            return f"{days}d {rem_hours}h"
+        elif mins > 0:
+            return f"{days}d {mins}m"
+        return f"{days}d"
+    if mins > 0:
+        return f"{hours}h {mins}m"
+    return f"{hours}h"
+
+
+def is_heartbeat_recovery_report(report: str) -> bool:
+    """Return True if the report is a heartbeat recovery transition alert."""
+    return bool(report and report.startswith("🟢 **Heartbeat Recovered"))
+
+
+def _collect_heartbeat_failures(host_1_ip: str, host_2_ip: str) -> list[str]:
+    failures: list[str] = []
 
     # 1. Host1 (.82) Containers (with automatic self-heal for unhealthy containers)
-    sb_res = json.loads(nas_docker("ps", HOST_1_IP))
+    sb_res = json.loads(nas_docker("ps", host_1_ip))
     if not sb_res.get("ok"):
-        failures.append(f"Host1 ({HOST_1_IP}) Docker unreachable: {sb_res.get('error')}")
+        failures.append(f"Host1 ({host_1_ip}) Docker unreachable: {sb_res.get('error')}")
     else:
         docker_root = os.environ.get("NAS_DOCKER_ROOT", "/docker")
         for line in sb_res.get("output", "").splitlines():
@@ -517,38 +577,38 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
                 if name in SERVERBROCK_STOPPED_ALLOWLIST:
                     continue
                 if not status.startswith("Up"):
-                    failures.append(f"Host1 ({HOST_1_IP}) container `{name}` is {status}")
+                    failures.append(f"Host1 ({host_1_ip}) container `{name}` is {status}")
                 elif "(unhealthy)" in status.lower():
                     heal_res = json.loads(
                         nas_docker(
                             "compose_restart",
-                            host=HOST_1_IP,
+                            host=host_1_ip,
                             compose_dir=f"{docker_root}/appdata",
                             service=name,
                         )
                     )
                     if not heal_res.get("ok"):
                         failures.append(
-                            f"Host1 ({HOST_1_IP}) container `{name}` is {status} and self-heal failed: {heal_res.get('error')}"
+                            f"Host1 ({host_1_ip}) container `{name}` is {status} and self-heal failed: {heal_res.get('error')}"
                         )
 
     # 2. Host2 (.84) Containers
-    bs2_res = json.loads(nas_docker("ps", HOST_2_IP))
+    bs2_res = json.loads(nas_docker("ps", host_2_ip))
     if not bs2_res.get("ok"):
-        failures.append(f"Host2 ({HOST_2_IP}) Docker unreachable: {bs2_res.get('error')}")
+        failures.append(f"Host2 ({host_2_ip}) Docker unreachable: {bs2_res.get('error')}")
     else:
         running = {line.split("\t")[0].strip() for line in bs2_res.get("output", "").splitlines() if "\t" in line and "Up" in line}
         missing = SERVERBROCK2_EXPECTED_CONTAINERS - running
         if missing:
-            failures.append(f"Host2 ({HOST_2_IP}) missing expected containers: {sorted(missing)}")
+            failures.append(f"Host2 ({host_2_ip}) missing expected containers: {sorted(missing)}")
 
     # 3. Critical TCP Ports
-    if not check_tcp_port(HOST_1_IP, 8123):
-        failures.append(f"Home Assistant port `8123` unreachable on Host1 (`{HOST_1_IP}`)")
-    if not check_tcp_port(HOST_1_IP, 32400):
-        failures.append(f"Plex port `32400` unreachable on Host1 (`{HOST_1_IP}`)")
-    if not check_tcp_port(HOST_2_IP, 3866):
-        failures.append(f"Dockhand port `3866` unreachable on Host2 (`{HOST_2_IP}`)")
+    if not check_tcp_port(host_1_ip, 8123):
+        failures.append(f"Home Assistant port `8123` unreachable on Host1 (`{host_1_ip}`)")
+    if not check_tcp_port(host_1_ip, 32400):
+        failures.append(f"Plex port `32400` unreachable on Host1 (`{host_1_ip}`)")
+    if not check_tcp_port(host_2_ip, 3866):
+        failures.append(f"Dockhand port `3866` unreachable on Host2 (`{host_2_ip}`)")
 
     # 4. Home Assistant REST Liveness
     ha_res = json.loads(ha_ping())
@@ -593,14 +653,75 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
     except Exception as he:
         failures.append(f"Zero Health Server check failed: {he}")
 
+    return failures
+
+
+def run_heartbeat_sweep() -> tuple[bool, str]:
+    HOST_1_IP, HOST_2_IP, _ = _resolve_nas_config()
+    now_dt = datetime.now(PT)
+    now_str = now_dt.strftime("%Y-%m-%d %I:%M %p PT")
+
+    failures = _collect_heartbeat_failures(HOST_1_IP, HOST_2_IP)
+    if failures:
+        if HEARTBEAT_RETRY_DELAY_SECONDS > 0:
+            time.sleep(HEARTBEAT_RETRY_DELAY_SECONDS)
+        failures = _collect_heartbeat_failures(HOST_1_IP, HOST_2_IP)
+
     # 8. SLZB-06P7 Stable Firmware Promotion Watcher (non-blocking 6h sweep)
     try:
         check_slzb_stable_release(force=False)
     except Exception as se:
         log.warning("SLZB-06P7 stable firmware check non-blocking sweep warning: %s", se)
 
+    prev_state = _load_heartbeat_state()
+    prev_degraded = bool(prev_state.get("degraded", False))
+
     if not failures:
+        if prev_degraded:
+            degraded_since_ts = prev_state.get("degraded_since_ts")
+            degraded_since_pt = prev_state.get("degraded_since_pt") or "unknown"
+            if isinstance(degraded_since_ts, (int, float)) and degraded_since_ts > 0:
+                elapsed = max(0.0, time.time() - float(degraded_since_ts))
+                downtime_str = _format_downtime(elapsed)
+            else:
+                downtime_str = "unknown duration"
+
+            cleared_state = {
+                "degraded": False,
+                "degraded_since_ts": None,
+                "degraded_since_pt": None,
+                "last_failures": [],
+                "alert_count": 0,
+                "recovered_at_pt": now_str,
+            }
+            _save_heartbeat_state(cleared_state)
+
+            recovery_lines = [
+                f"🟢 **Heartbeat Recovered — Infrastructure Back Online** [{now_str}]",
+                f"Outage detected: {degraded_since_pt} (downtime: ~{downtime_str}).",
+                "All containers, ports, Home Assistant, and external monitors healthy across `.82` and `.84`.",
+            ]
+            return True, "\n".join(recovery_lines)
+
         return True, f"🟢 **Heartbeat Sweep Healthy** — {now_str}\nAll containers, ports, Home Assistant, and external monitors healthy across `.82` and `.84`."
+
+    if not prev_degraded:
+        new_state = {
+            "degraded": True,
+            "degraded_since_ts": time.time(),
+            "degraded_since_pt": now_str,
+            "alert_count": 1,
+            "last_failures": failures,
+        }
+    else:
+        new_state = {
+            "degraded": True,
+            "degraded_since_ts": prev_state.get("degraded_since_ts") or time.time(),
+            "degraded_since_pt": prev_state.get("degraded_since_pt") or now_str,
+            "alert_count": int(prev_state.get("alert_count", 0)) + 1,
+            "last_failures": failures,
+        }
+    _save_heartbeat_state(new_state)
 
     report = [f"🚨 **Heartbeat Alert — Infrastructure Degraded** [{now_str}]", ""]
     for f in failures:

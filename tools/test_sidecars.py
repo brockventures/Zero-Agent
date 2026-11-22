@@ -1,8 +1,9 @@
-#!/usr/bin/env python3
-"""Unit tests for marketing sweep, unsubscribe handler, and sidecar post context in tools/sidecars.py."""
+# ruff: noqa
+"""Unit tests for sidecars.py (marketing sweep, heartbeat sweeps, retry guards, recovery alerts)."""
 
 import json
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,7 +12,7 @@ if str(WORKTREE_ROOT) in sys.path:
     sys.path.remove(str(WORKTREE_ROOT))
 sys.path.insert(0, str(WORKTREE_ROOT))
 
-import tools.sidecars as sidecars  # noqa: E402
+import tools.sidecars as sidecars
 
 
 SAMPLE_SENDERS = [
@@ -199,3 +200,144 @@ def test_get_recent_marketing_report_context(monkeypatch, tmp_path):
     assert "1. Delta Dental <email@member-deltadental.org>" in ctx
     assert "2. GrowFit Camp <redwoodcity@growfitpe.com>" in ctx
     assert "3. Loop@stanfordalumni.org <loop@stanfordalumni.org>" in ctx
+
+
+def _setup_heartbeat_env(monkeypatch, tmp_path: Path):
+    state_file = tmp_path / "heartbeat_state.json"
+    monkeypatch.setattr(sidecars, "HEARTBEAT_STATE_FILE", str(state_file))
+    monkeypatch.setattr(sidecars, "HEARTBEAT_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        sidecars,
+        "_resolve_nas_config",
+        lambda: ("198.51.100.10", "198.51.100.11", "22"),
+    )
+    monkeypatch.setattr(sidecars, "check_slzb_stable_release", lambda force=False: {})
+    return state_file
+
+
+def test_heartbeat_transient_failure_cleared_on_retry(monkeypatch, tmp_path):
+    state_file = _setup_heartbeat_env(monkeypatch, tmp_path)
+    calls = []
+
+    def fake_collect(host_1_ip: str, host_2_ip: str):
+        calls.append((host_1_ip, host_2_ip))
+        if len(calls) == 1:
+            return [f"Host1 ({host_1_ip}) container `homeassistant` is exited"]
+        return []
+
+    monkeypatch.setattr(sidecars, "_collect_heartbeat_failures", fake_collect)
+
+    healthy, report = sidecars.run_heartbeat_sweep()
+
+    assert healthy is True
+    assert len(calls) == 2
+    assert "🟢 **Heartbeat Sweep Healthy**" in report
+    assert sidecars.is_heartbeat_recovery_report(report) is False
+
+    if state_file.exists():
+        saved = json.loads(state_file.read_text(encoding="utf-8"))
+        assert saved.get("degraded") is False
+
+
+def test_heartbeat_persistent_failure_persists_degraded(monkeypatch, tmp_path):
+    state_file = _setup_heartbeat_env(monkeypatch, tmp_path)
+    calls = []
+
+    def fake_collect(host_1_ip: str, host_2_ip: str):
+        calls.append((host_1_ip, host_2_ip))
+        return [f"Home Assistant port `8123` unreachable on Host1 (`{host_1_ip}`)"]
+
+    monkeypatch.setattr(sidecars, "_collect_heartbeat_failures", fake_collect)
+
+    healthy, report = sidecars.run_heartbeat_sweep()
+
+    assert healthy is False
+    assert len(calls) == 2
+    assert "🚨 **Heartbeat Alert — Infrastructure Degraded**" in report
+    assert "Home Assistant port `8123` unreachable on Host1 (`198.51.100.10`)" in report
+    assert sidecars.is_heartbeat_recovery_report(report) is False
+
+    assert state_file.exists()
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
+    assert saved["degraded"] is True
+    assert isinstance(saved["degraded_since_ts"], (int, float))
+    assert saved["alert_count"] == 1
+    assert "Home Assistant port `8123` unreachable on Host1 (`198.51.100.10`)" in saved["last_failures"]
+
+    # Subsequent persistent sweep increments alert_count and preserves degraded_since_ts
+    prev_ts = saved["degraded_since_ts"]
+    healthy2, report2 = sidecars.run_heartbeat_sweep()
+    assert healthy2 is False
+    assert sidecars.is_heartbeat_recovery_report(report2) is False
+    saved2 = json.loads(state_file.read_text(encoding="utf-8"))
+    assert saved2["degraded"] is True
+    assert saved2["degraded_since_ts"] == prev_ts
+    assert saved2["alert_count"] == 2
+
+
+def test_heartbeat_recovery_and_subsequent_healthy_sweep(monkeypatch, tmp_path):
+    state_file = _setup_heartbeat_env(monkeypatch, tmp_path)
+
+    past_ts = time.time() - 1440.0  # 24 minutes ago
+    initial_state = {
+        "degraded": True,
+        "degraded_since_ts": past_ts,
+        "degraded_since_pt": "2026-11-22 07:35 AM PT",
+        "last_failures": ["Home Assistant port `8123` unreachable on Host1 (`198.51.100.10`)"],
+        "alert_count": 2,
+    }
+    state_file.write_text(json.dumps(initial_state, indent=2), encoding="utf-8")
+
+    monkeypatch.setattr(sidecars, "_collect_heartbeat_failures", lambda h1, h2: [])
+
+    # c) Healthy sweep after degraded=True returns recovery report
+    healthy, report = sidecars.run_heartbeat_sweep()
+
+    assert healthy is True
+    assert sidecars.is_heartbeat_recovery_report(report) is True
+    assert "🟢 **Heartbeat Recovered — Infrastructure Back Online**" in report
+    assert "Outage detected: 2026-11-22 07:35 AM PT" in report
+    assert "24m" in report
+
+    saved = json.loads(state_file.read_text(encoding="utf-8"))
+    assert saved["degraded"] is False
+    assert saved["last_failures"] == []
+    assert saved["alert_count"] == 0
+    assert saved["recovered_at_pt"] is not None
+
+    # d) Subsequent healthy sweep returns routine healthy message where is_heartbeat_recovery_report is False
+    healthy2, report2 = sidecars.run_heartbeat_sweep()
+    assert healthy2 is True
+    assert sidecars.is_heartbeat_recovery_report(report2) is False
+    assert "🟢 **Heartbeat Sweep Healthy**" in report2
+    assert "Heartbeat Recovered" not in report2
+
+
+def test_format_downtime():
+    assert sidecars._format_downtime(0) == "< 1m"
+    assert sidecars._format_downtime(45) == "< 1m"
+    assert sidecars._format_downtime(60) == "1m"
+    assert sidecars._format_downtime(1440) == "24m"
+    assert sidecars._format_downtime(3600) == "1h"
+    assert sidecars._format_downtime(4320) == "1h 12m"
+    assert sidecars._format_downtime(86400) == "1d"
+    assert sidecars._format_downtime(90000) == "1d 1h"
+
+
+def test_heartbeat_state_corrupt_file_handling(monkeypatch, tmp_path):
+    state_file = tmp_path / "heartbeat_state.json"
+    state_file.write_text("{bad-json-syntax---", encoding="utf-8")
+    monkeypatch.setattr(sidecars, "HEARTBEAT_STATE_FILE", str(state_file))
+
+    state = sidecars._load_heartbeat_state()
+    assert state["degraded"] is False
+    assert state["alert_count"] == 0
+
+
+def test_is_heartbeat_recovery_report():
+    assert sidecars.is_heartbeat_recovery_report("🟢 **Heartbeat Recovered — Infrastructure Back Online** [2026-11-22 08:00 AM PT]") is True
+    assert sidecars.is_heartbeat_recovery_report("🟢 **Heartbeat Sweep Healthy** — 2026-11-22 08:00 AM PT") is False
+    assert sidecars.is_heartbeat_recovery_report("🚨 **Heartbeat Alert — Infrastructure Degraded**") is False
+    assert sidecars.is_heartbeat_recovery_report("") is False
+    assert sidecars.is_heartbeat_recovery_report(None) is False
+
