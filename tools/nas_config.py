@@ -735,6 +735,9 @@ def validate_remote_ssh_command(remote_cmd: str) -> Tuple[bool, str]:
     return True, ""
 
 
+_SSH_STDIN_THRESHOLD_BYTES = 65536
+
+
 def run_ssh(
     host: str,
     remote_cmd: str,
@@ -746,8 +749,13 @@ def run_ssh(
     batch_mode: bool = False,
     disable_mux: bool = False,
     retry_without_mux_on_timeout: bool = True,
+    stdin_data: str = None,
 ) -> Tuple[int, str, str]:
-    """Execute a remote command via SSH synchronously, with automatic mux eviction fallback on timeout."""
+    """Execute a remote command via SSH synchronously, with automatic mux eviction fallback on timeout.
+
+    Remote scripts exceeding _SSH_STDIN_THRESHOLD_BYTES (64 KiB) are automatically streamed over
+    stdin to `bash -s` to avoid Linux MAX_ARG_STRLEN (Errno 7: Argument list too long) failures.
+    """
     if os.environ.get("FORGE_APPROVED_CARD_EXECUTION") != "1":
         allowed, block_reason = validate_remote_ssh_command(remote_cmd)
         if not allowed:
@@ -755,9 +763,17 @@ def run_ssh(
     effective_connect_timeout = (
         connect_timeout if connect_timeout is not None else min(max(15, timeout // 2), 30)
     )
+    ssh_remote_cmd = remote_cmd
+    effective_input = stdin_data
+    if (
+        effective_input is None
+        and len(remote_cmd.encode("utf-8", errors="replace")) > _SSH_STDIN_THRESHOLD_BYTES
+    ):
+        ssh_remote_cmd = "bash -s"
+        effective_input = remote_cmd
     cmd = build_ssh_cmd(
         host,
-        remote_cmd,
+        ssh_remote_cmd,
         user=user,
         port=port,
         key=key,
@@ -768,6 +784,7 @@ def run_ssh(
     try:
         res = subprocess.run(
             cmd,
+            input=effective_input,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -793,7 +810,7 @@ def run_ssh(
             evict_ssh_mux_socket(host, user=user, port=port)
             fallback_cmd = build_ssh_cmd(
                 host,
-                remote_cmd,
+                ssh_remote_cmd,
                 user=user,
                 port=port,
                 key=key,
@@ -803,6 +820,7 @@ def run_ssh(
             )
             res = subprocess.run(
                 fallback_cmd,
+                input=effective_input,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -816,7 +834,7 @@ def run_ssh(
             if retry_without_mux_on_timeout:
                 fallback_cmd = build_ssh_cmd(
                     host,
-                    remote_cmd,
+                    ssh_remote_cmd,
                     user=user,
                     port=port,
                     key=key,
@@ -827,6 +845,7 @@ def run_ssh(
                 try:
                     res = subprocess.run(
                         fallback_cmd,
+                        input=effective_input,
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
