@@ -2160,6 +2160,17 @@ def run_pid_watchdog(force: bool = False, test: bool = False) -> tuple[bool, str
         return False, f"⚠️ PID watchdog execution failed: {e}", {"error": str(e)}
 
 
+def run_go2rtc_watchdog(force: bool = False, test: bool = False, auto_reap: bool = True) -> tuple[bool, str, dict]:
+    """Audit Host 1 go2rtc CPU, RAM, and active Nest streams, auto-reaping zombie streams."""
+    try:
+        from tools.go2rtc_watchdog import audit_go2rtc_health
+        has_issues, summary, data = audit_go2rtc_health(force=force or test, auto_reap=auto_reap)
+        msg = summary if (has_issues or force or test) else ""
+        return not has_issues, msg, data
+    except Exception as e:
+        return False, f"⚠️ go2rtc watchdog execution failed: {e}", {"error": str(e)}
+
+
 def run_orcaslicer_idle_reaper(force: bool = False, test: bool = False) -> tuple[bool, str, dict]:
     """Evaluate OrcaSlicer idle state on Host 2 and stop cleanly after 30m inactivity."""
     try:
@@ -3046,6 +3057,20 @@ if __name__ == "__main__":
         force = "--force" in sys.argv or "-f" in sys.argv
         test = "--test" in sys.argv or "-t" in sys.argv
         ok, rep, _ = run_sidecar_job("pid_watchdog", "PID & Process Headroom Watchdog", run_pid_watchdog, force=force, test=test)
+        if rep:
+            print(rep)
+    elif action in ("go2rtc_watchdog", "go2rtc_check", "go2rtc"):
+        force = "--force" in sys.argv or "-f" in sys.argv
+        test = "--test" in sys.argv or "-t" in sys.argv
+        no_reap = "--no-reap" in sys.argv
+        ok, rep, _ = run_sidecar_job(
+            "go2rtc_watchdog",
+            "Host 1 go2rtc Resource & Zombie Stream Watchdog",
+            run_go2rtc_watchdog,
+            force=force,
+            test=test,
+            auto_reap=not no_reap,
+        )
         if rep:
             print(rep)
     elif action in ("orcaslicer_idle", "orcaslicer_reaper"):
