@@ -772,6 +772,38 @@ class TestBridgeStreamEngineIntegration(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(is_retry)
 
+    def test_stream_parser_canonical_silence_and_react_preservation(self):
+        """Verify AgyStreamParser normalizes canonical SILENCE_SENTINELS and preserves [REACT: ...] tags."""
+        for sentinel in ("no_reply", "NO_OP", "reply: none", "none"):
+            parser = AgyStreamParser(conv_id="conv-silence-canon")
+            parser.process_event({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "text_delta": sentinel,
+                    "state": "DONE",
+                },
+            })
+            self.assertTrue(parser.is_explicit_silence)
+            self.assertEqual(parser.get_final_response(), "[NO_REPLY]")
+
+        # Reaction-only segment must pass through intact to deliver_turn_output
+        react_parser = AgyStreamParser(conv_id="conv-react-keep")
+        react_parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "text_delta": "[REACT: 👍]",
+                "state": "DONE",
+            },
+        })
+        self.assertFalse(react_parser.is_explicit_silence)
+        self.assertEqual(react_parser.get_final_response(), "[REACT: 👍]")
+
+        # is_aborted_stream_stub honors canonical silence sentinels
+        self.assertFalse(is_aborted_stream_stub("reply:none"))
+        self.assertFalse(is_aborted_stream_stub("no_op"))
+
 
 if __name__ == "__main__":
     unittest.main()

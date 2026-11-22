@@ -19,7 +19,13 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from tools.bridge_safety import is_internal_cli_leak, strip_internal_cli_chatter
+from tools.bridge_safety import (
+    classify_outbound_response,
+    is_internal_cli_leak,
+    is_silence_sentinel,
+    strip_internal_cli_chatter,
+    strip_trailing_silence_sentinels,
+)
 
 
 def format_command_preview(cmd_raw: str, max_len: int = 80) -> str:
@@ -55,8 +61,8 @@ def is_aborted_stream_stub(text: str) -> bool:
         return False
     if (
         stripped.startswith("[REACT:")
-        or stripped.startswith("[NO_REPLY")
-        or stripped.upper() in ("[NO_REPLY]", "[NO_OP]", "NO_REPLY", "NO_OP")
+        or stripped.upper().startswith("[NO_REPLY")
+        or is_silence_sentinel(stripped)
     ):
         return False
     if stripped.endswith((".", "!", "?", "]")):
@@ -420,7 +426,7 @@ def check_transcript_turn_status(
                             }
 
                         content = (data.get("content") or "").strip()
-                        if content == "[NO_REPLY]":
+                        if is_silence_sentinel(content):
                             return {
                                 "is_complete": True,
                                 "content": "[NO_REPLY]",
@@ -547,7 +553,7 @@ class AgyStreamParser:
     def _is_silence_or_placeholder(text: str) -> bool:
         if not text or not isinstance(text, str):
             return True
-        return is_internal_cli_leak(text)
+        return classify_outbound_response(text, mode="home").kind in ("silent", "leak")
 
     def _rotate_accumulated_segment(self, interrupted: bool = False) -> None:
         """Rotate current accumulated_segment into interrupted_draft (if interrupted) or last_substantive_response."""
@@ -660,19 +666,8 @@ class AgyStreamParser:
                 if step.get("state") == "DONE":
                     curr = "".join(self.accumulated_segment).strip()
                     if curr:
-                        if self._is_silence_or_placeholder(curr):
-                            if curr.lower() in (
-                                "[no_reply]",
-                                "no_reply",
-                                "[no_op]",
-                                "no_op",
-                                "reply:none",
-                                "reply: none",
-                                "none",
-                            ) or is_internal_cli_leak(curr):
-                                self.is_explicit_silence = True
-                        else:
-                            self.is_explicit_silence = False
+                        cls = classify_outbound_response(curr, mode="home")
+                        self.is_explicit_silence = cls.kind in ("silent", "leak")
 
         elif ev_type in ("tool", "tool_call", "tool_use"):
             self._capture_deferred_ack()
@@ -736,30 +731,16 @@ class AgyStreamParser:
             curr = re.sub(r"\[\[defer\]\]", "", curr, flags=re.IGNORECASE).strip()
 
         # Check if the current segment is an explicit silence request or internal CLI leak
-        if curr and (
-            curr.lower()
-            in (
-                "[no_reply]",
-                "no_reply",
-                "[no_op]",
-                "no_op",
-                "reply:none",
-                "reply: none",
-                "none",
-            )
-            or is_internal_cli_leak(curr)
-        ):
+        curr_cls = classify_outbound_response(curr, mode="home") if curr else None
+        if curr_cls and curr_cls.kind in ("silent", "leak"):
             if not self.last_substantive_response or self._is_silence_or_placeholder(
                 self.last_substantive_response
             ):
                 return "[NO_REPLY]"
 
         clean_curr = ""
-        if curr and not self._is_silence_or_placeholder(curr):
-            clean_curr = re.sub(
-                r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", curr, flags=re.IGNORECASE
-            ).strip()
-            clean_curr = strip_internal_cli_chatter(clean_curr)
+        if curr_cls and curr_cls.kind not in ("silent", "leak"):
+            clean_curr = strip_internal_cli_chatter(strip_trailing_silence_sentinels(curr))
             if self._is_silence_or_placeholder(clean_curr):
                 clean_curr = ""
 
@@ -768,13 +749,7 @@ class AgyStreamParser:
             prior_draft = re.sub(r"\[\[defer\]\]", "", prior_draft, flags=re.IGNORECASE).strip()
         clean_last = ""
         if prior_draft and not self._is_silence_or_placeholder(prior_draft):
-            clean_last = re.sub(
-                r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$",
-                "",
-                prior_draft,
-                flags=re.IGNORECASE,
-            ).strip()
-            clean_last = strip_internal_cli_chatter(clean_last)
+            clean_last = strip_internal_cli_chatter(strip_trailing_silence_sentinels(prior_draft))
             if self._is_silence_or_placeholder(clean_last):
                 clean_last = ""
 
@@ -803,23 +778,13 @@ class AgyStreamParser:
             if is_aborted_stream_stub(frr) or (self.interrupted_draft and frr == self.interrupted_draft.strip()):
                 return ""
         if frr:
-            if frr.lower() in (
-                "[no_reply]",
-                "no_reply",
-                "[no_op]",
-                "no_op",
-                "reply:none",
-                "reply: none",
-                "none",
-            ) or is_internal_cli_leak(frr):
+            frr_cls = classify_outbound_response(frr, mode="home")
+            if frr_cls.kind in ("silent", "leak"):
                 if not self.last_substantive_response or self._is_silence_or_placeholder(
                     self.last_substantive_response
                 ):
                     return "[NO_REPLY]"
-            clean_frr = re.sub(
-                r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", frr, flags=re.IGNORECASE
-            ).strip()
-            clean_frr = strip_internal_cli_chatter(clean_frr)
+            clean_frr = strip_internal_cli_chatter(strip_trailing_silence_sentinels(frr))
             if clean_frr and not self._is_silence_or_placeholder(clean_frr):
                 return re.sub(r"\[\[defer\]\]", "", clean_frr, flags=re.IGNORECASE).strip()
 

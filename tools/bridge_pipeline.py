@@ -36,7 +36,6 @@ from tools.bridge_formatting import (
     scrub_credentials,
     chunk_text,
     strip_reaction_gifs,
-    is_internal_cli_leak,
 )
 
 BANANA_STAND_CHANNEL_ID = 1534436119888793750
@@ -774,6 +773,50 @@ async def _send_routed_choice_card(
         print(f"[BridgePipeline] Error routing choice card to #zero-chat: {route_err}")
 
 
+async def _suppress_turn_delivery(
+    *,
+    status_msg: discord.Message | None,
+    reply_target: discord.Message | discord.TextChannel | discord.Thread,
+    mode: str,
+    channel_id: int,
+    is_home: bool,
+    is_last_word: bool,
+    last_word_bot_id: str | None,
+    last_word_bot_name: str | None,
+    last_word_streak: int,
+    timer: TurnTimer | None,
+    log_reason: str,
+) -> list[discord.Message]:
+    """Apply unified silence/leak suppression, Last Word cooldown, watermark, and status cleanup."""
+    if is_last_word and (last_word_bot_id or last_word_bot_name):
+        try:
+            from tools.last_word_protocol import pause_bot
+
+            rules = get_runtime_rules()
+            pause_sec = float(rules.get("last_word_pause_minutes", 3)) * 60.0
+            pause_bot(
+                channel_id=channel_id,
+                bot_id=last_word_bot_id,
+                bot_name=last_word_bot_name,
+                duration_seconds=pause_sec,
+                reason=f"Last Word Protocol triggered after {last_word_streak} uninterrupted messages",
+            )
+        except Exception as lwe:
+            print(f"[BridgePipeline] Error setting Last Word pause on suppression: {lwe}")
+    if status_msg:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+    print(log_reason)
+    if mode == "home" or is_home:
+        _advance_home_seen_watermark(channel_id, reply_target=reply_target, sent_messages=[])
+    if timer:
+        timer.mark_delivery_end()
+        timer.finish("NO_REPLY")
+    return []
+
+
 async def deliver_turn_output(
     output_text: str,
     status_msg: discord.Message | None,
@@ -803,13 +846,15 @@ async def deliver_turn_output(
 
     sent_messages: list[discord.Message] = []
 
-    # 0. Extract and apply any [REACT: <emoji>] / [REACTION: <emoji>] tags (ignoring inline/fenced code spans)
+    # 0. Classify outbound response and extract/apply [REACT: <emoji>] tags via canonical gate
     from tools.bridge_formatting import (
         _CODE_OR_CHOICES_RE,
-        extract_react_directives,
         strip_unquoted_choices,
     )
-    output_text_clean, reactions_to_add = extract_react_directives(output_text or "")
+    from tools.bridge_safety import classify_outbound_response
+
+    initial_cls = classify_outbound_response(output_text or "", mode=mode)
+    reactions_to_add = initial_cls.reactions
 
     target_reaction_msg = reply_target if hasattr(reply_target, "add_reaction") else (
         delivery_target if hasattr(delivery_target, "add_reaction") else None
@@ -821,21 +866,48 @@ async def deliver_turn_output(
             except Exception as rx_err:
                 print(f"[BridgePipeline] Notice adding reaction '{emoji}': {rx_err}")
 
+    reply_ch = getattr(reply_target, "channel", reply_target) if reply_target else None
+    is_home = is_home_channel(reply_ch) or is_home_channel(channel_id)
+    is_autonomous_turn = status_msg is None and not hasattr(reply_target, "reply")
+
     # If the response was purely reaction(s) with no text payload, resolve cleanly without sending empty message
-    if not output_text_clean and reactions_to_add:
+    if initial_cls.kind == "react_only":
         if status_msg:
             try:
                 await status_msg.delete()
             except Exception:
                 pass
-        if mode == "home" or is_home_channel(channel_id):
+        if mode == "home" or is_home:
             _advance_home_seen_watermark(channel_id, reply_target=reply_target, sent_messages=sent_messages)
         if timer:
             timer.mark_delivery_end()
             timer.finish("SUCCESS")
         return []
 
-    final_text = format_for_discord(output_text_clean or "*(No output from agent)*")
+    if initial_cls.kind in ("silent", "leak"):
+        if mode == "external" or not is_home or (initial_cls.kind == "silent" and is_autonomous_turn):
+            return await _suppress_turn_delivery(
+                status_msg=status_msg,
+                reply_target=reply_target,
+                mode=mode,
+                channel_id=channel_id,
+                is_home=is_home,
+                is_last_word=is_last_word,
+                last_word_bot_id=last_word_bot_id,
+                last_word_bot_name=last_word_bot_name,
+                last_word_streak=last_word_streak,
+                timer=timer,
+                log_reason=(
+                    f"[BridgePipeline] Suppressed {initial_cls.kind} response in external channel {channel_id}"
+                    if mode == "external"
+                    else "[BridgePipeline] Suppressed [NO_REPLY] in non-home or autonomous system turn"
+                ),
+            )
+        output_text_clean = "⚠️ **Turn Incomplete:** Agent process completed turn without generating text output."
+    else:
+        output_text_clean = initial_cls.text
+
+    final_text = format_for_discord(output_text_clean)
 
     if is_gif_disabled_for_channel(str(channel_id), channel_id=channel_id):
         final_text = strip_reaction_gifs(final_text)
@@ -861,9 +933,6 @@ async def deliver_turn_output(
         clean_ext_text = re.sub(r":\s*(?:\n\s*)*\[(?:CHOICES|OPTIONS):\s*(?:[^\[\]]|\[[^\]]*\])+\]\s*$", ".", final_text, flags=re.IGNORECASE).strip()
         clean_ext_text = strip_unquoted_choices(clean_ext_text)
         clean_ext_text = scrub_credentials(clean_ext_text)
-        clean_ext_text = re.sub(
-            r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", clean_ext_text, flags=re.IGNORECASE
-        ).strip()
 
         # Resolve destination channel ID early for channel-specific formatting & Banana protocol quarantine
         target_dest = delivery_target if delivery_target else reply_target
@@ -898,39 +967,22 @@ async def deliver_turn_output(
                 flags=re.DOTALL,
             ).strip()
 
-        if (
-            clean_ext_text
-            in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP", "*(No output from agent)*")
-            or not clean_ext_text
-            or is_internal_cli_leak(clean_ext_text)
-        ):
-            if is_last_word and (last_word_bot_id or last_word_bot_name):
-                try:
-                    from tools.last_word_protocol import pause_bot
-
-                    rules = get_runtime_rules()
-                    pause_sec = float(rules.get("last_word_pause_minutes", 3)) * 60.0
-                    pause_bot(
-                        channel_id=channel_id,
-                        bot_id=last_word_bot_id,
-                        bot_name=last_word_bot_name,
-                        duration_seconds=pause_sec,
-                        reason=f"Last Word Protocol triggered after {last_word_streak} uninterrupted messages",
-                    )
-                except Exception as lwe:
-                    print(f"[BridgePipeline] Error setting Last Word pause on NO_REPLY: {lwe}")
-            if status_msg:
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-            print(
-                f"[BridgePipeline] Suppressed empty, [NO_REPLY], or placeholder in external channel {channel_id}"
+        post_ext_cls = classify_outbound_response(clean_ext_text, mode=mode)
+        if post_ext_cls.kind in ("silent", "leak"):
+            return await _suppress_turn_delivery(
+                status_msg=status_msg,
+                reply_target=reply_target,
+                mode=mode,
+                channel_id=channel_id,
+                is_home=is_home,
+                is_last_word=is_last_word,
+                last_word_bot_id=last_word_bot_id,
+                last_word_bot_name=last_word_bot_name,
+                last_word_streak=last_word_streak,
+                timer=timer,
+                log_reason=f"[BridgePipeline] Suppressed empty, [NO_REPLY], or placeholder in external channel {channel_id}",
             )
-            if timer:
-                timer.mark_delivery_end()
-                timer.finish("NO_REPLY")
-            return []
+        clean_ext_text = post_ext_cls.text
 
         try:
             from tools.channel_history import record_message
@@ -1245,67 +1297,26 @@ async def deliver_turn_output(
             timer.finish(status_label)
         return sent_messages
 
-    # Strip trailing silence tags if there is other substantive content before them
-    was_explicit_silence_tag = output_text_clean.strip().upper() in (
-        "[NO_REPLY]",
-        "NO_REPLY",
-        "[NO_OP]",
-        "NO_OP",
-        "REPLY:NONE",
-        "REPLY: NONE",
-    )
-    final_text = re.sub(
-        r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$", "", final_text, flags=re.IGNORECASE
-    ).strip()
-
-    is_silence_response = (
-        was_explicit_silence_tag
-        or final_text.strip()
-        in (
-            "[NO_REPLY]",
-            "NO_REPLY",
-            "[NO_OP]",
-            "NO_OP",
-            "reply:none",
-            "reply: none",
-            "*(No output from agent)*",
-        )
-        or not final_text.strip()
-    )
-
-    # In non-home channels (e.g. public Brock channels like #baseball, #server-updates),
-    # or on autonomous background/system turns without an interactive user message placeholder,
-    # honor explicit silence tags ([NO_REPLY] / [NO_OP]) cleanly instead of emitting Turn Incomplete.
-    reply_ch = getattr(reply_target, "channel", reply_target) if reply_target else None
-    is_home = is_home_channel(reply_ch) or is_home_channel(channel_id)
-    is_autonomous_turn = status_msg is None and not hasattr(reply_target, "reply")
-    if is_silence_response and (not is_home or (is_autonomous_turn and was_explicit_silence_tag)):
-        if is_last_word and (last_word_bot_id or last_word_bot_name):
-            try:
-                from tools.last_word_protocol import pause_bot
-
-                rules = get_runtime_rules()
-                pause_sec = float(rules.get("last_word_pause_minutes", 3)) * 60.0
-                pause_bot(
-                    channel_id=channel_id,
-                    bot_id=last_word_bot_id,
-                    bot_name=last_word_bot_name,
-                    duration_seconds=pause_sec,
-                    reason=f"Last Word Protocol triggered after {last_word_streak} uninterrupted messages",
-                )
-            except Exception as lwe:
-                print(f"[BridgePipeline] Error setting Last Word pause on silence: {lwe}")
-        print("[BridgePipeline] Suppressed [NO_REPLY] in non-home or autonomous system turn")
-        if mode == "home" or is_home:
-            _advance_home_seen_watermark(channel_id, reply_target=reply_target, sent_messages=sent_messages)
-        if timer:
-            timer.mark_delivery_end()
-            timer.finish("NO_REPLY")
-        return sent_messages
-
-    # In Home Turf, silence tags, internal CLI leaks, and empty outputs are invalid - flag as incomplete turn so Ryan is never ghosted
-    if is_internal_cli_leak(final_text) or is_silence_response:
+    # Post-formatting silence/leak check (e.g. if GIF stripping emptied a GIF-only message)
+    post_home_cls = classify_outbound_response(final_text, mode=mode)
+    if post_home_cls.kind in ("silent", "leak"):
+        if not is_home or (post_home_cls.kind == "silent" and is_autonomous_turn):
+            return await _suppress_turn_delivery(
+                status_msg=status_msg,
+                reply_target=reply_target,
+                mode=mode,
+                channel_id=channel_id,
+                is_home=is_home,
+                is_last_word=is_last_word,
+                last_word_bot_id=last_word_bot_id,
+                last_word_bot_name=last_word_bot_name,
+                last_word_streak=last_word_streak,
+                timer=timer,
+                log_reason="[BridgePipeline] Suppressed [NO_REPLY] in non-home or autonomous system turn",
+            )
         final_text = "⚠️ **Turn Incomplete:** Agent process completed turn without generating text output."
+    else:
+        final_text = post_home_cls.text
 
     # Parse [CHOICES: ...] interactive buttons (ignoring inline/fenced code spans)
     from tools.bridge_safety import mask_code_spans, restore_code_spans

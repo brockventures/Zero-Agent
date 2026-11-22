@@ -15,7 +15,50 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Optional
+from typing import NamedTuple, Optional
+
+SILENCE_SENTINELS: frozenset[str] = frozenset({
+    "[no_reply]",
+    "no_reply",
+    "[no_op]",
+    "no_op",
+    "reply:none",
+    "reply: none",
+    "none",
+})
+
+EMPTY_OUTPUT_PLACEHOLDERS: frozenset[str] = frozenset({
+    "*(no output from agent)*",
+    "*(response completed, but no text output was generated)*",
+    "no content generated yet",
+    "no content generated yet.",
+})
+
+_TRAILING_SILENCE_RE = re.compile(
+    r"(?:^|\n+)\s*\[(?:NO_REPLY|NO_OP)\]\s*$",
+    re.IGNORECASE,
+)
+
+_CODE_OR_REACT_RE = re.compile(
+    r"(```[\s\S]*?```|``[^`\n]+``|`[^`\n]+`)|(\[(?:REACT|REACTION):\s*([^\[\]]+)\])",
+    re.IGNORECASE,
+)
+
+_TRANSCRIPT_RECOVERY_BANNER_RE = re.compile(
+    r"^\s*(⚠️\s*\*\(\s*Recovered from session transcript following process cutoff\s*\)\*)\s*",
+)
+
+
+class OutboundClassification(NamedTuple):
+    """Normalized classification of an outbound agent response."""
+
+    kind: str  # 'silent' | 'leak' | 'react_only' | 'text'
+    reactions: list[str]
+    text: str
+
+    @property
+    def cleaned_text(self) -> str:
+        return self.text
 
 CLI_LEAK_LINE_PATTERNS = [
     r"^\s*error:\s*interrupted\s*$",
@@ -566,31 +609,25 @@ def is_internal_cli_leak(text: str) -> bool:
     if not cleaned:
         return True
     lower = cleaned.lower().strip()
-    if lower in (
-        "[no_reply]",
-        "no_reply",
-        "[no_op]",
-        "no_op",
-        "reply:none",
-        "reply: none",
-        "none",
-        "null",
-        "}",
-        "]",
-        ")",
-        ">",
-        "{",
-        "[",
-        "(",
-        "<",
-        "}}",
-        "]}",
-        "})",
-        "*(response completed, but no text output was generated)*",
-        "no content generated yet",
-        "no content generated yet.",
-        "... [repetitive lines truncated] ...",
-        "... [repetitive output truncated] ...",
+    if (
+        lower in SILENCE_SENTINELS
+        or lower in EMPTY_OUTPUT_PLACEHOLDERS
+        or lower in (
+            "null",
+            "}",
+            "]",
+            ")",
+            ">",
+            "{",
+            "[",
+            "(",
+            "<",
+            "}}",
+            "]}",
+            "})",
+            "... [repetitive lines truncated] ...",
+            "... [repetitive output truncated] ...",
+        )
     ):
         return True
     if lower.startswith("error: interrupted") or lower == "interrupted":
@@ -779,3 +816,133 @@ def is_transient_auth_error(text: str) -> bool:
         "googleapis.com/oauth2/v2/userinfo",
         "authentication failed or timed out",
     ))
+
+
+def is_silence_sentinel(text: Optional[str]) -> bool:
+    """Return True if text is a bare canonical silence sentinel (case-insensitive)."""
+    if not text or not isinstance(text, str):
+        return False
+    return text.strip().lower() in SILENCE_SENTINELS
+
+
+def strip_trailing_silence_sentinels(text: str) -> str:
+    """Strip trailing [NO_REPLY] / [NO_OP] tags when preceded by substantive text."""
+    if not text:
+        return ""
+    return _TRAILING_SILENCE_RE.sub("", text).strip()
+
+
+def extract_react_directives(text: str) -> tuple[str, list[str]]:
+    """Extract and strip [REACT: <emoji>] / [REACTION: <emoji>] tags outside code spans.
+
+    Returns (cleaned_text, reactions_to_add). Ignores backticked prose references like
+    `[REACT: <emoji>]` so empty backticks are never left behind.
+    """
+    if not text:
+        return "", []
+    masked, spans = mask_code_spans(text, prefix="\x00REACT_SPAN_")
+    reactions: list[str] = []
+
+    def _repl(m: re.Match) -> str:
+        if m.group(1) is not None:
+            return m.group(1)
+        raw_emojis = (m.group(3) or "").strip()
+        parts = [p.strip() for p in re.split(r"[, ]+", raw_emojis) if p.strip()]
+        valid_parts = [
+            p
+            for p in parts
+            if p not in ("...", "…", "<emoji>", "<emojis>")
+            and not (p.startswith("<") and p.endswith(">") and ":" not in p)
+        ]
+        if not valid_parts:
+            return m.group(0)
+        reactions.extend(valid_parts)
+        return ""
+
+    cleaned = _CODE_OR_REACT_RE.sub(_repl, masked).strip()
+    return restore_code_spans(cleaned, spans, prefix="\x00REACT_SPAN_"), reactions
+
+
+def _strip_chatter_preserving_recovery_banner(text: str) -> str:
+    """Strip internal CLI chatter while preserving an explicit transcript-recovery banner if body is substantive."""
+    banner_match = _TRANSCRIPT_RECOVERY_BANNER_RE.match(text)
+    if not banner_match:
+        return strip_internal_cli_chatter(text)
+    banner = banner_match.group(1).strip()
+    remainder = text[banner_match.end():].strip()
+    if not remainder or is_internal_cli_leak(remainder):
+        return ""
+    cleaned_body = strip_internal_cli_chatter(remainder).strip()
+    if not cleaned_body:
+        return ""
+    return f"{banner}\n\n{cleaned_body}"
+
+
+def classify_outbound_response(
+    text: Optional[str],
+    mode: str = "home",
+) -> OutboundClassification:
+    """Classify and clean an outbound response through the canonical silence, leak, and reaction gate.
+
+    Returns OutboundClassification(kind, reactions, text) where kind is one of:
+    - 'silent': Explicit silence sentinel (SILENCE_SENTINELS), or empty/placeholder in external mode.
+    - 'leak': Internal CLI artifact, task-wait chatter, or empty/placeholder output in home mode.
+    - 'react_only': One or more [REACT: ...] directives with no remaining substantive text.
+    - 'text': Substantive user-facing text (with [REACT: ...] extracted and trailing silence tags stripped).
+    """
+    empty_kind = "silent" if mode == "external" else "leak"
+    if not text or not isinstance(text, str):
+        return OutboundClassification(kind=empty_kind, reactions=[], text="")
+
+    raw_stripped = text.strip()
+    if not raw_stripped:
+        return OutboundClassification(kind=empty_kind, reactions=[], text="")
+
+    text_no_react, reactions = extract_react_directives(raw_stripped)
+    text_no_react = text_no_react.strip()
+
+    if not text_no_react:
+        if reactions:
+            return OutboundClassification(kind="react_only", reactions=reactions, text="")
+        return OutboundClassification(kind=empty_kind, reactions=[], text="")
+
+    lower_no_react = text_no_react.lower()
+    if lower_no_react in SILENCE_SENTINELS:
+        if reactions:
+            return OutboundClassification(kind="react_only", reactions=reactions, text="")
+        return OutboundClassification(kind="silent", reactions=[], text="")
+
+    if lower_no_react in EMPTY_OUTPUT_PLACEHOLDERS:
+        if reactions:
+            return OutboundClassification(kind="react_only", reactions=reactions, text="")
+        return OutboundClassification(kind=empty_kind, reactions=[], text="")
+
+    cleaned = strip_trailing_silence_sentinels(text_no_react)
+    if not cleaned:
+        if reactions:
+            return OutboundClassification(kind="react_only", reactions=reactions, text="")
+        return OutboundClassification(kind="silent", reactions=[], text="")
+
+    lower_cleaned = cleaned.lower()
+    if lower_cleaned in SILENCE_SENTINELS:
+        if reactions:
+            return OutboundClassification(kind="react_only", reactions=reactions, text="")
+        return OutboundClassification(kind="silent", reactions=[], text="")
+
+    if lower_cleaned in EMPTY_OUTPUT_PLACEHOLDERS:
+        if reactions:
+            return OutboundClassification(kind="react_only", reactions=reactions, text="")
+        return OutboundClassification(kind=empty_kind, reactions=[], text="")
+
+    if is_internal_cli_leak(cleaned):
+        if reactions:
+            return OutboundClassification(kind="react_only", reactions=reactions, text="")
+        return OutboundClassification(kind="leak", reactions=[], text="")
+
+    chatter_cleaned = _strip_chatter_preserving_recovery_banner(cleaned).strip()
+    if not chatter_cleaned or is_internal_cli_leak(chatter_cleaned):
+        if reactions:
+            return OutboundClassification(kind="react_only", reactions=reactions, text="")
+        return OutboundClassification(kind="leak", reactions=[], text="")
+
+    return OutboundClassification(kind="text", reactions=reactions, text=chatter_cleaned)

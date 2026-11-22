@@ -17,10 +17,8 @@ import time
 from pathlib import Path as Path
 import discord
 
-from tools.bridge_formatting import (
-    extract_agent_response,
-    is_internal_cli_leak,
-)
+from tools.bridge_formatting import extract_agent_response
+from tools.bridge_safety import classify_outbound_response
 from tools.bridge_state import (
     TARGET_CHANNEL_ID,
     get_runtime_rules,
@@ -567,12 +565,8 @@ async def execute_agy_turn(
         full_raw = "".join(output_chunks).strip()
         active_cid = get_channel_session_id(channel_id, mode) or conv_id
         final_text_peek = extract_agent_response(full_raw, conv_id=active_cid)
-        has_substantive = bool(
-            final_text_peek
-            and not is_internal_cli_leak(final_text_peek)
-            and not final_text_peek.startswith("*(")
-            and final_text_peek.strip() not in ("[NO_REPLY]", "NO_REPLY", "[NO_OP]", "NO_OP")
-        )
+        peek_cls = classify_outbound_response(final_text_peek, mode=mode)
+        has_substantive = peek_cls.kind in ("text", "react_only")
 
         # Only treat auth/stall errors as retryable if the turn actually failed without producing a substantive response.
         # Never discard and retry a successfully generated turn just because tool logs contained a timeout string!

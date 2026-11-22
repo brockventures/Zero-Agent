@@ -477,5 +477,66 @@ class TestOutboxAtomicPartitioning(unittest.TestCase):
         self.assertEqual(set(seen_zero), expected_zero)
 
 
+class TestOutboxCanonicalSafetyGate(unittest.TestCase):
+    def setUp(self):
+        self.silence_patcher = patch("tools.bridge_state.is_crab_cavern_silenced", return_value=(False, ""))
+        self.silence_patcher.start()
+        self.temp_dir = tempfile.mkdtemp()
+        self.orig_data_dir = outbox.DATA_DIR
+        self.orig_outbox_dir = outbox.OUTBOX_DIR
+        self.orig_pending_file = outbox.PENDING_FILE
+        self.orig_history_file = outbox.HISTORY_FILE
+        outbox.DATA_DIR = Path(self.temp_dir)
+        outbox.OUTBOX_DIR = outbox.DATA_DIR / "outbox"
+        outbox.PENDING_FILE = outbox.OUTBOX_DIR / "pending.jsonl"
+        outbox.HISTORY_FILE = outbox.OUTBOX_DIR / "history.jsonl"
+
+    def tearDown(self):
+        self.silence_patcher.stop()
+        outbox.DATA_DIR = self.orig_data_dir
+        outbox.OUTBOX_DIR = self.orig_outbox_dir
+        outbox.PENDING_FILE = self.orig_pending_file
+        outbox.HISTORY_FILE = self.orig_history_file
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_queue_outbox_message_suppresses_silence_sentinels_and_cli_leaks(self):
+        for payload, expected_status in (
+            ("[NO_REPLY]", "silenced"),
+            ("NO_OP", "silenced"),
+            ("reply: none", "silenced"),
+            ("[REACT: 👍]", "silenced"),
+            ("Tool is running as a background task with task id: task-42", "blocked_leak"),
+            ("Waiting for task to complete.", "blocked_leak"),
+        ):
+            res = outbox.queue_outbox_message("lounge", payload, force=True)
+            self.assertTrue(res.get("suppressed"), f"Expected {payload!r} to be suppressed")
+            self.assertEqual(res.get("status"), expected_status)
+        self.assertFalse(outbox.PENDING_FILE.exists())
+
+    def test_queue_outbox_message_strips_react_and_trailing_no_reply_from_substantive_text(self):
+        res = outbox.queue_outbox_message("lounge", "[REACT: 🚀]\nBuild succeeded cleanly.\n[NO_REPLY]")
+        self.assertFalse(res.get("suppressed"))
+        self.assertEqual(res["content"], "Build succeeded cleanly.")
+
+    @patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "test_bot_token_123"})
+    def test_dispatch_via_rest_blocks_leaks_and_silence_sentinels(self):
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            ok1 = outbox.dispatch_via_rest({
+                "id": "outbox-leak-1",
+                "channel": "lounge",
+                "channel_id": 1534452820995080192,
+                "content": "Tool is running as a background task with task id: task-99",
+            })
+            ok2 = outbox.dispatch_via_rest({
+                "id": "outbox-silence-1",
+                "channel": "zero-chat",
+                "channel_id": 1542081375287640084,
+                "content": "[NO_REPLY]",
+            })
+        self.assertFalse(ok1)
+        self.assertFalse(ok2)
+        mock_urlopen.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -248,6 +248,37 @@ def queue_outbox_message(
         msg_type = "agent_turn"
     clean_name, ch_id = resolve_channel(channel)
     content = content.strip()
+    if not content:
+        raise ValueError("Message content cannot be empty.")
+
+    # Canonical outbound safety gate: block silence sentinels, reaction-only tags, and internal CLI leaks
+    if msg_type != "agent_turn":
+        try:
+            from tools.bridge_safety import classify_outbound_response
+            outbox_mode = "home" if _is_home_turf_channel(ch_id) else "external"
+            cls = classify_outbound_response(content, mode=outbox_mode)
+            if cls.kind in ("silent", "leak", "react_only"):
+                status_val = "blocked_leak" if cls.kind == "leak" else "silenced"
+                reason_val = f"Outbound safety gate suppressed {cls.kind} payload"
+                print(
+                    f"[Outbox] Outbound safety gate: Suppressed {cls.kind} message to #{clean_name}",
+                    file=sys.stderr,
+                )
+                return {
+                    "id": f"suppressed-{cls.kind}-{int(time.time()*1000)}-{os.getpid()}",
+                    "channel": clean_name,
+                    "channel_id": ch_id,
+                    "content": content,
+                    "source": source_turn,
+                    "created_at": time.time(),
+                    "created_at_iso": datetime.now(timezone.utc).isoformat(),
+                    "status": status_val,
+                    "suppressed": True,
+                    "reason": reason_val,
+                }
+            content = cls.text
+        except Exception as safety_err:
+            print(f"[Outbox] Warning running outbound safety classifier: {safety_err}", file=sys.stderr)
 
     # Format message for Discord: collapses link previews (< >), cleans broken file links, converts tables
     if msg_type == "text":
@@ -584,6 +615,20 @@ def dispatch_via_rest(omsg: dict) -> bool:
         return False
 
     raw_content = _scrub_outbound_text(raw_content)
+    if omsg.get("type") != "agent_turn" and not omsg.get("is_agent_turn"):
+        try:
+            from tools.bridge_safety import classify_outbound_response
+            rest_mode = "home" if _is_home_turf_channel(target_cid) else "external"
+            cls = classify_outbound_response(raw_content, mode=rest_mode)
+            if cls.kind in ("silent", "leak", "react_only"):
+                print(
+                    f"[Outbox] Outbound safety gate: Refused REST dispatch of {cls.kind} payload to #{ch_name or target_cid}",
+                    file=sys.stderr,
+                )
+                return False
+            raw_content = cls.text
+        except Exception:
+            pass
 
     try:
         url = f"https://discord.com/api/v10/channels/{target_cid}/messages"

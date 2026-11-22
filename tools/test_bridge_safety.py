@@ -9,19 +9,28 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import sys
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+elif sys.path[0] != _REPO_ROOT:
+    sys.path.remove(_REPO_ROOT)
+    sys.path.insert(0, _REPO_ROOT)
 if "/workspace" not in sys.path:
-    sys.path.insert(0, "/workspace")
+    sys.path.append("/workspace")
+
 from tools.bridge_safety import (
     CLI_LEAK_LINE_PATTERNS,
+    SILENCE_SENTINELS,
     _get_scrub_targets,
+    classify_outbound_response,
     dedup_repetitive_patterns,
+    extract_react_directives,
     is_internal_cli_leak,
+    is_silence_sentinel,
+    is_transient_auth_error,
     scrub_credentials,
     strip_internal_cli_chatter,
-    is_transient_auth_error,
+    strip_trailing_silence_sentinels,
 )
 
 
@@ -238,6 +247,71 @@ class TestBridgeSafety(unittest.TestCase):
         # Standalone emojis must NOT be treated as leaks
         self.assertFalse(is_internal_cli_leak("⚾"))
         self.assertEqual(strip_internal_cli_chatter("⚾"), "⚾")
+
+    def test_canonical_silence_sentinels_and_classify_outbound_response(self):
+        # Canonical silence sentinels (case-insensitive) classify as 'silent' across modes
+        for sentinel in SILENCE_SENTINELS:
+            self.assertTrue(is_silence_sentinel(sentinel))
+            self.assertTrue(is_silence_sentinel(sentinel.upper()))
+            for mode in ("home", "external"):
+                res = classify_outbound_response(f"  {sentinel.upper()}  ", mode=mode)
+                self.assertEqual(res.kind, "silent")
+                self.assertEqual(res.reactions, [])
+                self.assertEqual(res.text, "")
+
+        # Empty / placeholder differs by mode: 'silent' in external, 'leak' in home
+        for empty_val in ("", None, "   ", "*(No output from agent)*"):
+            self.assertEqual(classify_outbound_response(empty_val, mode="external").kind, "silent")
+            self.assertEqual(classify_outbound_response(empty_val, mode="home").kind, "leak")
+
+        # Internal CLI leaks classify as 'leak' in both modes
+        leak_msg = "Tool is running as a background task with task id: task-999"
+        for mode in ("home", "external"):
+            res = classify_outbound_response(leak_msg, mode=mode)
+            self.assertEqual(res.kind, "leak")
+            self.assertEqual(res.reactions, [])
+            self.assertEqual(res.text, "")
+
+        # Reaction-only responses (including paired with [NO_REPLY] or code-span mentions)
+        r_only = classify_outbound_response("[REACT: 👍]")
+        self.assertEqual(r_only.kind, "react_only")
+        self.assertEqual(r_only.reactions, ["👍"])
+        self.assertEqual(r_only.text, "")
+
+        r_silence = classify_outbound_response("[REACTION: 🚀]\n[NO_REPLY]")
+        self.assertEqual(r_silence.kind, "react_only")
+        self.assertEqual(r_silence.reactions, ["🚀"])
+        self.assertEqual(r_silence.text, "")
+
+        # Substantive text with [REACT: ...], trailing [NO_REPLY], and code-span [REACT:] preservation
+        mixed = "[REACT: 🎯, 🔥]\nUse `[REACT: 👍]` in docs.\n\n[NO_REPLY]"
+        r_text = classify_outbound_response(mixed)
+        self.assertEqual(r_text.kind, "text")
+        self.assertEqual(r_text.reactions, ["🎯", "🔥"])
+        self.assertEqual(r_text.text, "Use `[REACT: 👍]` in docs.")
+
+        # Transcript recovery banner preserved when paired with substantive body
+        recovered = "⚠️ *(Recovered from session transcript following process cutoff)*\n\nRecovered answer."
+        r_rec = classify_outbound_response(recovered, mode="home")
+        self.assertEqual(r_rec.kind, "text")
+        self.assertIn("Recovered from session transcript", r_rec.text)
+        self.assertIn("Recovered answer.", r_rec.text)
+
+        # System chatter stripped from substantive text (>= 5 words) while tiny fragments remain leaks
+        with_chatter = "<SYSTEM_MESSAGE>internal</SYSTEM_MESSAGE>\n\nClean reply with all checks passing."
+        r_clean = classify_outbound_response(with_chatter)
+        self.assertEqual(r_clean.kind, "text")
+        self.assertEqual(r_clean.text, "Clean reply with all checks passing.")
+        self.assertEqual(
+            classify_outbound_response("<SYSTEM_MESSAGE>internal</SYSTEM_MESSAGE>\n\nOk.").kind,
+            "leak",
+        )
+
+        # Direct extract_react_directives & strip_trailing_silence_sentinels checks
+        cleaned, rx = extract_react_directives("[REACT: ❤️] Done!")
+        self.assertEqual(cleaned, "Done!")
+        self.assertEqual(rx, ["❤️"])
+        self.assertEqual(strip_trailing_silence_sentinels("Line 1\n[NO_OP]"), "Line 1")
 
 
 if __name__ == "__main__":

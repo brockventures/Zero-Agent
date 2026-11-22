@@ -880,6 +880,90 @@ class TestBridgeEmojiReactions(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("[REACT", delivered_content)
         self.assertEqual(timer.status, "SUCCESS")
 
+    async def test_deliver_react_with_no_reply_resolves_as_react_only(self):
+        """Verify [REACT: 👍]\\n[NO_REPLY] applies reaction and sends no text message."""
+        status_msg = AsyncMock()
+        status_msg.delete = AsyncMock()
+        reply_target = AsyncMock()
+        reply_target.add_reaction = AsyncMock()
+        timer = TurnTimer(channel_id=1534452820995080192, channel_name="lounge")
+
+        res = await deliver_turn_output(
+            output_text="[REACT: 👍]\n[NO_REPLY]",
+            status_msg=status_msg,
+            reply_target=reply_target,
+            mode="external",
+            channel_id=1534452820995080192,
+            conv_id="conv-react-noop",
+            turn_start_time=time.time(),
+            timer=timer,
+        )
+
+        reply_target.add_reaction.assert_awaited_once_with("👍")
+        status_msg.delete.assert_awaited_once()
+        reply_target.reply.assert_not_called()
+        self.assertEqual(res, [])
+        self.assertEqual(timer.status, "SUCCESS")
+
+    async def test_deliver_canonical_silence_sentinels_unified_across_modes(self):
+        """Verify canonical silence variants ('reply: none', 'NO_OP') suppress in external/autonomous and flag Turn Incomplete in interactive home."""
+        for sentinel in ("reply: none", "NO_OP"):
+            ext_status = AsyncMock()
+            ext_reply = AsyncMock()
+            ext_timer = TurnTimer(channel_id=1534452820995080192, channel_name="lounge")
+            res = await deliver_turn_output(
+                output_text=sentinel,
+                status_msg=ext_status,
+                reply_target=ext_reply,
+                mode="external",
+                channel_id=1534452820995080192,
+                conv_id="conv-ext-canon",
+                turn_start_time=time.time(),
+                timer=ext_timer,
+            )
+            self.assertEqual(res, [])
+            ext_status.delete.assert_awaited_once()
+            ext_reply.reply.assert_not_called()
+            self.assertEqual(ext_timer.status, "NO_REPLY")
+
+            home_status = AsyncMock()
+            home_reply = AsyncMock()
+            home_timer = TurnTimer(channel_id=1542081375287640084, channel_name="zero-chat")
+            await deliver_turn_output(
+                output_text=sentinel,
+                status_msg=home_status,
+                reply_target=home_reply,
+                mode="home",
+                channel_id=1542081375287640084,
+                conv_id="conv-home-canon",
+                turn_start_time=time.time(),
+                timer=home_timer,
+            )
+            home_status.edit.assert_awaited_once()
+            self.assertIn("Turn Incomplete", home_status.edit.call_args[1]["content"])
+
+    async def test_deliver_external_handoff_only_in_non_banana_suppressed_cleanly(self):
+        """Verify handoff-only output in non-banana external channel is suppressed after envelope stripping."""
+        status_msg = AsyncMock()
+        reply_target = AsyncMock()
+        lounge_cid = 1534452820995080192
+        timer = TurnTimer(channel_id=lounge_cid, channel_name="lounge")
+
+        res = await deliver_turn_output(
+            output_text='```handoff\n{"v": 1.1, "kind": "status"}\n```',
+            status_msg=status_msg,
+            reply_target=reply_target,
+            mode="external",
+            channel_id=lounge_cid,
+            conv_id="conv-lounge-env-only",
+            turn_start_time=time.time(),
+            timer=timer,
+        )
+        self.assertEqual(res, [])
+        status_msg.delete.assert_awaited_once()
+        status_msg.edit.assert_not_called()
+        self.assertEqual(timer.status, "NO_REPLY")
+
     async def test_deliver_crab_cavern_gotchi_routes_choices_to_zero_chat(self):
         """Verify interactive choice buttons generated in #gotchi are stripped from public reply and routed to #zero-chat."""
         from tools.bridge_state import TARGET_CHANNEL_ID

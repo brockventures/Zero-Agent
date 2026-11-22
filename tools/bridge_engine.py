@@ -29,7 +29,7 @@ from typing import Any, Callable, Optional
 import discord
 
 from tools.bridge_formatting import format_for_discord, generate_concise_thread_title
-from tools.bridge_safety import is_internal_cli_leak
+from tools.bridge_safety import classify_outbound_response, is_internal_cli_leak, is_silence_sentinel
 from tools.bridge_stream import (
     AgyStreamParser,
     check_transcript_turn_status,
@@ -1026,18 +1026,12 @@ class TurnCoordinator:
             cid = cid or getattr(self.thread, "id", None)
 
         final_text = output_response or ""
+        cls = classify_outbound_response(final_text, mode=self.mode)
+        is_silence = is_silence_sentinel(final_text) or cls.kind == "silent"
         is_empty_or_placeholder = (
             not final_text or final_text.startswith("*(") or len(final_text.strip()) == 0
         )
-        is_leak = is_internal_cli_leak(final_text)
-        is_silence = final_text.strip() in (
-            "[NO_REPLY]",
-            "NO_REPLY",
-            "[NO_OP]",
-            "NO_OP",
-            "reply:none",
-            "reply: none",
-        )
+        is_leak = cls.kind == "leak"
 
         proc_rc = getattr(proc, "returncode", None) if proc else None
         is_post_result_sigterm = (
