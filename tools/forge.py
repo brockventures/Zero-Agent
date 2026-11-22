@@ -7584,6 +7584,24 @@ def _has_ssh_private_key(env: Optional[dict[str, str]] = None) -> bool:
     return False
 
 
+def _get_remote_push_url(repo_dir: Path, remote: str = "origin") -> str:
+    """Resolve the effective push URL for a git remote, preferring remote.<name>.pushurl."""
+    for cmd in (["git", "remote", "get-url", "--push", remote], ["git", "remote", "get-url", remote]):
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(repo_dir),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.strip()
+        except Exception:
+            continue
+    return ""
+
+
 def _build_git_push_args_and_env(
     repo_dir: Path | str,
     remote: str = "origin",
@@ -7594,19 +7612,7 @@ def _build_git_push_args_and_env(
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
 
-    remote_url = ""
-    try:
-        url_proc = subprocess.run(
-            ["git", "remote", "get-url", remote],
-            cwd=str(rp),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if url_proc.returncode == 0:
-            remote_url = url_proc.stdout.strip()
-    except Exception:
-        remote_url = ""
+    remote_url = _get_remote_push_url(rp, remote)
 
     cmd: list[str] = ["git", "push", remote]
     gh_https = re.match(r"^https://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", remote_url, re.IGNORECASE)
@@ -7644,21 +7650,9 @@ def _preflight_check_remote_push_auth(
 ) -> tuple[bool, str]:
     """Run a fast pre-flight remote reachability and push-auth check before spawning chunk 0."""
     rp = Path(repo_dir).resolve()
-    try:
-        url_proc = subprocess.run(
-            ["git", "remote", "get-url", remote],
-            cwd=str(rp),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except Exception as exc:
-        return False, f"Remote push auth pre-flight failed inspecting '{remote}' in {rp}: {exc}"
-
-    if url_proc.returncode != 0 or not url_proc.stdout.strip():
+    remote_url = _get_remote_push_url(rp, remote)
+    if not remote_url:
         return True, ""
-
-    remote_url = url_proc.stdout.strip()
     push_cmd, push_env = _build_git_push_args_and_env(rp, remote=remote)
     try:
         push_idx = push_cmd.index("push")

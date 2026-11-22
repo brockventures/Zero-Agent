@@ -6522,6 +6522,27 @@ def test_build_git_push_args_and_env_and_preflight_auth(tmp_path, monkeypatch):
     assert pf_ok is False
     assert "Remote push auth pre-flight failed" in pf_err
 
+    # 3b. Split pushurl (SSH fetch, HTTPS push) is inspected via --push
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "git@github.com:octo-org/demo-repo.git"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "set-url", "--push", "origin", "https://github.com/octo-org/demo-repo.git"],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    split_ok, split_err = forge_mod._preflight_check_remote_push_auth(repo)
+    assert split_ok is False
+    assert "https://github.com/octo-org/demo-repo.git" in split_err
+    (fake_home / ".ssh" / "id_ed25519").write_text("dummy-test-key-placeholder\n", encoding="utf-8")
+    cmd_split, _ = forge_mod._build_git_push_args_and_env(repo, remote="origin", branch="main")
+    assert cmd_split == ["git", "push", "git@github.com:octo-org/demo-repo.git", "main"]
+    (fake_home / ".ssh" / "id_ed25519").unlink()
+
     # 4. In prod mode, run_build_pipeline fails fast before spawning chunk 0 worker
     db_path = tmp_path / "forge_preflight.db"
     forge_mod.init_forge_db(db_path)
