@@ -13,9 +13,9 @@ PEER_SNOWFLAKE_TAGS = [
     r"<@!?1492043459618537492>",  # Marvin
     r"<@!?1542035925603713086>",  # Aerial
     r"<@!?1545924520236290198>",  # Banana Watcher
-    r"<@!?93420059858305024>",    # Mike / Arbiter
-    r"<@!?453030589914939393>",   # Ian / Moon Problem
-    r"<@!?169260920550195200>",   # Alex / Arcane
+    r"<@!?93420059858305024>",  # Mike / Arbiter
+    r"<@!?453030589914939393>",  # Ian / Moon Problem
+    r"<@!?169260920550195200>",  # Alex / Arcane
 ]
 
 PEER_NAMES = r"(?:amos|marvin|aerial|arbiter|ian|mike|alex|arcane|bananawatcher|banana\s*watcher)"
@@ -36,11 +36,9 @@ PEER_OR_OTHER_TAGS = PEER_SNOWFLAKE_TAGS + PEER_VOCATIVE_PATTERNS
 def is_explicitly_addressed_to_other(content: str) -> bool:
     """Check if the text is explicitly addressed to a peer agent or collaborator (not Zero)."""
     text = content.strip()
-    if any(re.search(p, text, re.I) for p in PEER_SNOWFLAKE_TAGS):
+    if any(re.search(p, text, re.IGNORECASE) for p in PEER_SNOWFLAKE_TAGS):
         return True
-    if any(re.search(p, text, re.I) for p in PEER_VOCATIVE_PATTERNS):
-        return True
-    return False
+    return any(re.search(p, text, re.IGNORECASE) for p in PEER_VOCATIVE_PATTERNS)
 
 
 NON_NAME_NOUNS = (
@@ -192,7 +190,9 @@ def extract_classifier_score(output: str) -> float | None:
     cleaned_output = re.sub(
         r"\s*\|?\s*\bREACT(?:ION)?:.*$", "", output, flags=re.IGNORECASE | re.MULTILINE
     )
-    lines = [line.strip() for line in cleaned_output.strip().splitlines() if line.strip()]
+    lines = [
+        line.strip() for line in cleaned_output.strip().splitlines() if line.strip()
+    ]
     # 1. Look for score on a line by itself or prefixed with 'score:' (starting from bottom)
     for line in reversed(lines):
         m = re.search(r"^(?:score:?\s*)?(0(?:\.\d+)?|1(?:\.0+)?)$", line, re.IGNORECASE)
@@ -219,7 +219,7 @@ def _should_use_warm_classifier() -> bool:
 
         if not is_persistent_daemons_enabled():
             return False
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return True
 
@@ -290,11 +290,11 @@ class WarmClassifierDaemon:
                 proc.terminate()
                 try:
                     proc.wait(timeout=2.0)
-                except Exception:
+                except (subprocess.TimeoutExpired, OSError):
                     if hasattr(proc, "kill"):
                         proc.kill()
                         proc.wait(timeout=1.0)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[ClassifierDaemon] Warning during shutdown: {e}", file=sys.stderr)
         finally:
             for stream_name in ("stdin", "stdout", "stderr"):
@@ -317,12 +317,16 @@ class WarmClassifierDaemon:
             print("[ClassifierDaemon] Lock acquire timeout", file=sys.stderr)
             return None
         try:
-            if self.proc is None or (hasattr(self.proc, "poll") and self.proc.poll() is not None):
+            if self.proc is None or (
+                hasattr(self.proc, "poll") and self.proc.poll() is not None
+            ):
                 self._start_locked()
             if self.proc is None or self.proc.stdin is None or self.proc.stdout is None:
                 return None
 
-            payload = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
+            payload = (
+                json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
+            )
             try:
                 self.proc.stdin.write(payload)
             except TypeError:
@@ -344,7 +348,7 @@ class WarmClassifierDaemon:
                     if isinstance(fno, int):
                         fd = fno
                         os.set_blocking(fd, False)
-                except Exception:
+                except (OSError, ValueError, TypeError):
                     fd = None
 
             buf = ""
@@ -352,7 +356,9 @@ class WarmClassifierDaemon:
                 elapsed = time.time() - start_time
                 remaining = timeout - elapsed
                 if remaining <= 0:
-                    print(f"[ClassifierDaemon] Timeout after {timeout}s", file=sys.stderr)
+                    print(
+                        f"[ClassifierDaemon] Timeout after {timeout}s", file=sys.stderr
+                    )
                     self._shutdown_locked()
                     return None
 
@@ -363,7 +369,7 @@ class WarmClassifierDaemon:
                         continue
                     try:
                         ev = json.loads(line)
-                    except Exception:
+                    except json.JSONDecodeError:
                         continue
 
                     ev_type = ev.get("event") or ev.get("type")
@@ -378,8 +384,15 @@ class WarmClassifierDaemon:
                         break
                     elif ev_type == "step_update" or "step_update" in ev:
                         step = ev.get("step_update", {})
-                        if isinstance(step, dict) and step.get("step_type") == "agent_response":
-                            delta = step.get("text_delta") or step.get("text") or step.get("content")
+                        if (
+                            isinstance(step, dict)
+                            and step.get("step_type") == "agent_response"
+                        ):
+                            delta = (
+                                step.get("text_delta")
+                                or step.get("text")
+                                or step.get("content")
+                            )
                             if delta and isinstance(delta, str):
                                 accumulated_deltas.append(delta)
                     elif ev_type in ("content", "message", "text", "delta"):
@@ -391,7 +404,10 @@ class WarmClassifierDaemon:
                 select_target = [self.proc.stdout] if fd is None else [fd]
                 rlist, _, _ = select.select(select_target, [], [], remaining)
                 if not rlist:
-                    print(f"[ClassifierDaemon] select timeout after {timeout}s", file=sys.stderr)
+                    print(
+                        f"[ClassifierDaemon] select timeout after {timeout}s",
+                        file=sys.stderr,
+                    )
                     self._shutdown_locked()
                     return None
 
@@ -408,7 +424,10 @@ class WarmClassifierDaemon:
                 else:
                     line = self.proc.stdout.readline()
                     if not line:
-                        print("[ClassifierDaemon] EOF or empty readline on stdout", file=sys.stderr)
+                        print(
+                            "[ClassifierDaemon] EOF or empty readline on stdout",
+                            file=sys.stderr,
+                        )
                         self._shutdown_locked()
                         return None
                     if isinstance(line, bytes):
@@ -432,11 +451,11 @@ class WarmClassifierDaemon:
                 threading.Thread(target=_do_recycle, daemon=True).start()
 
             return resp_text
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[ClassifierDaemon] Error in classify: {e}", file=sys.stderr)
             try:
                 self._shutdown_locked()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             return None
         finally:
@@ -478,7 +497,9 @@ def score_relevance_with_reaction(
     text_for_targeting = strip_fenced_code_blocks(content_clean).strip()
 
     # 1. Explicit <@bot_id> Discord snowflake mentions override handoff envelopes and peer addressing
-    if any(re.search(tag, text_for_targeting, re.I) for tag in ZERO_SNOWFLAKE_TAGS):
+    if any(
+        re.search(tag, text_for_targeting, re.IGNORECASE) for tag in ZERO_SNOWFLAKE_TAGS
+    ):
         return 1.0, None
 
     # 2. Parse handoff envelope and enforce peer targeting / closed-floor drops BEFORE text vocative checks
@@ -487,15 +508,21 @@ def score_relevance_with_reaction(
         from tools.handoff import parse_envelope
 
         envelope = parse_envelope(content_clean)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     if envelope:
         target = str(
-            envelope.get("to") or envelope.get("target") or envelope.get("recipient") or ""
+            envelope.get("to")
+            or envelope.get("target")
+            or envelope.get("recipient")
+            or ""
         ).lower()
         if target and "zero" not in target and "team" not in target:
-            print(f"[Classifier] Drop reason=envelope_target_other target={target}", file=sys.stderr)
+            print(
+                f"[Classifier] Drop reason=envelope_target_other target={target}",
+                file=sys.stderr,
+            )
             return 0.0, None
 
         floor_state = str(envelope.get("floor") or "").lower()
@@ -511,7 +538,7 @@ def score_relevance_with_reaction(
 
     # 4. Fast-path: Role mentions, vocative Zero mentions, or @Robot mentions immediately score 1.0
     if (
-        any(re.search(tag, text_for_targeting, re.I) for tag in ZERO_TAGS)
+        any(re.search(tag, text_for_targeting, re.IGNORECASE) for tag in ZERO_TAGS)
         or contains_zero_mention(content_clean)
         or contains_robot_mention(content_clean)
     ):
@@ -560,8 +587,10 @@ def score_relevance_with_reaction(
                     return val, extract_classifier_reaction(warm_resp)
                 print("[Classifier] Fallback reason=warm_parse_null", file=sys.stderr)
             else:
-                print("[Classifier] Fallback reason=warm_returned_none", file=sys.stderr)
-        except Exception as we:
+                print(
+                    "[Classifier] Fallback reason=warm_returned_none", file=sys.stderr
+                )
+        except Exception as we:  # noqa: BLE001
             print(f"[Classifier] Fallback reason=warm_error err={we}", file=sys.stderr)
 
     # 6b. Cold subprocess fallback path
@@ -577,16 +606,20 @@ def score_relevance_with_reaction(
             capture_output=True,
             text=True,
             timeout=25,
+            check=False,
         )
         val = extract_classifier_score(res.stdout)
         if val is not None:
             return val, extract_classifier_reaction(res.stdout)
         print("[Classifier] Fallback reason=parse_null", file=sys.stderr)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[Classifier] Fallback reason=subprocess_error err={e}", file=sys.stderr)
 
     if is_open_optional_question and "?" in text_for_targeting:
-        print("[Classifier] Escalating open optional question to 0.85 on fallback", file=sys.stderr)
+        print(
+            "[Classifier] Escalating open optional question to 0.85 on fallback",
+            file=sys.stderr,
+        )
         return 0.85, None
     return 0.0, None
 
@@ -609,6 +642,121 @@ def score_relevance(
     )
     _LAST_AMBIENT_REACTION = reaction
     return score
+
+
+_HANDOFF_TAGGED_BLOCK_RE = re.compile(
+    r"(?:\|\|\s*)?```handoff\b.*?```(?:\s*\|\|)?",
+    re.IGNORECASE | re.DOTALL,
+)
+_JSON_FENCED_BLOCK_RE = re.compile(
+    r"(?:\|\|\s*)?```(?:json)?\s*\n?(\{.*?\})\s*```(?:\s*\|\|)?",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_ENVELOPE_RE = re.compile(
+    r"<!--\s*(?:banana-)?envelope\b.*?-->",
+    re.IGNORECASE | re.DOTALL,
+)
+_HANDOFF_ENVELOPE_KEYS = frozenset(
+    {"v", "kind", "reply", "floor", "to", "target", "recipient", "subject"}
+)
+_LEADING_MENTIONS_RE = re.compile(
+    r"^(?:\s*(?:<@[!&]?\d+>|@[A-Za-z0-9_.-]+)\s*[,:;—–-]*\s*)+"
+)
+_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:\s*(?:[,;.!]+|[—–]+|\s+[-]+\s+|\band\b)\s*)+", re.IGNORECASE
+)
+_REACT_TAG_RE = re.compile(r"\[REACT(?:ION)?\s*:", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+_AGREEMENT_FILLER_WORDS = (
+    r"(?:yes|yep|yup|yeah|yea|ya|oh|ah|totally|definitely|absolutely|completely|"
+    r"honestly|actually|100%|\+1|agreed|right|exactly|true|fair|indeed)"
+)
+_AGREEMENT_CLAUSE_PATTERNS = (
+    r"(?:\+1|100%|\^+|[👍💯☝️👆]+)",
+    (
+        r"(?:yes|yep|yup|yeah|yea|ya|aye|totally|definitely|absolutely|completely|exactly|"
+        r"precisely|indeed|agreed|agree|same|this|true|fair|right|correct|word|ack|lgtm|sgtm|"
+        r"seconded|co-?sign|concur|ditto|facts|solid|nice)"
+    ),
+    (
+        r"(?:i\s+)?(?:totally\s+|fully\s+|completely\s+|strongly\s+|definitely\s+|100%?\s+|wholeheartedly\s+)?"
+        r"(?:agree|concur)(?:\s+with\s+(?:that|this|you|the\s+above|@?[a-z0-9_.-]+))?(?:\s+on\s+(?:this|that))?"
+    ),
+    r"(?:that\s+|this\s+|it\s+)?(?:totally\s+|really\s+|completely\s+)?makes\s+sense(?:\s+to\s+me)?",
+    r"(?:that\s+|it\s+)?checks\s+out",
+    r"(?:a\s+|very\s+)?(?:good|great|fair|solid|valid|excellent|strong)\s+(?:point|catch|call|take)",
+    r"(?:fair|good)\s+enough",
+    r"spot\s+on",
+    r"well\s+said",
+    r"(?:that\s+)?sounds\s+(?:good|right|fair|great|solid|reasonable)(?:\s+to\s+me)?",
+    r"(?:looks|seems)\s+good(?:\s+to\s+me)?",
+    r"(?:came\s+here\s+to\s+say\s+this|took\s+the\s+words\s+right\s+out\s+of\s+my\s+mouth)",
+    r"(?:nothing\s+(?:else\s+)?to\s+add|no\s+notes|no\s+objections)",
+    r"(?:i'?m\s+on\s+board|count\s+me\s+in|on\s+board|same\s+here|me\s+too)",
+    r"right\s+on",
+    r"for\s+sure",
+    r"you'?re\s+right",
+    r"so\s+true",
+)
+_AGREEMENT_CLAUSE_RE = re.compile(
+    rf"^(?:{_AGREEMENT_FILLER_WORDS}\s+)*(?:{'|'.join(_AGREEMENT_CLAUSE_PATTERNS)})(?:\s+(?:\+1|100%|[👍💯☝️👆]+))*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_handoff_envelopes(text: str) -> str:
+    """Remove handoff fenced blocks and HTML banana-envelope comments while preserving non-handoff code blocks."""
+    cleaned = _HANDOFF_TAGGED_BLOCK_RE.sub("", text)
+    cleaned = _HTML_ENVELOPE_RE.sub("", cleaned)
+
+    def _replace_json_handoff(match: re.Match) -> str:
+        try:
+            parsed = json.loads(match.group(1))
+            if isinstance(parsed, dict) and any(
+                k in parsed for k in _HANDOFF_ENVELOPE_KEYS
+            ):
+                return ""
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return match.group(0)
+
+    return _JSON_FENCED_BLOCK_RE.sub(_replace_json_handoff, cleaned)
+
+
+def is_bare_agreement_reply(text: str) -> bool:
+    """Return True if text consists purely of bare agreement or backchanneling with no new substance."""
+    if not text or not text.strip():
+        return False
+
+    working = _strip_handoff_envelopes(text).strip()
+    if not working:
+        return False
+
+    # Preserve reactions, questions, URLs, and non-handoff code blocks unconditionally.
+    if _REACT_TAG_RE.search(working) or "?" in working or _URL_RE.search(working):
+        return False
+    if "```" in working or "~~~" in working:
+        return False
+
+    working = _LEADING_MENTIONS_RE.sub("", working).strip()
+    core = working.strip(" \t\r\n.!,:;—–-")
+    if not core:
+        return False
+
+    clauses = [c.strip(" \t\r\n.!,:;—–-") for c in _CLAUSE_SPLIT_RE.split(core)]
+    clauses = [c for c in clauses if c]
+    if not clauses:
+        return False
+
+    return all(_AGREEMENT_CLAUSE_RE.match(clause) is not None for clause in clauses)
+
+
+def is_additive_reply(text: str) -> bool:
+    """Return True when a reply adds substance rather than empty text or bare agreement."""
+    if not text or not text.strip():
+        return False
+    return not is_bare_agreement_reply(text)
 
 
 if __name__ == "__main__":
