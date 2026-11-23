@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ruff: noqa: BLE001, EXE001, PIE810, PLW1510, RUF013, S110, SIM103, UP006, UP035
+# ruff: noqa: BLE001, PIE810, PLW1510, RUF013, S110, SIM103, UP006, UP035
 """
 nas_config.py — Canonical NAS topology resolver and SSH configuration for Zero.
 

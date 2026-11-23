@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# ruff: noqa: EXE001
 """
 Unit test suite for search_guard hook (PreToolUse search & command safety gate).
 """

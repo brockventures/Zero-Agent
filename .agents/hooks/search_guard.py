@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# ruff: noqa: EXE001
 """
 Hardened Search Safety Guard (Antigravity PreToolUse Hook)
 Deterministically intercepts and blocks un-scoped, root-level, and bulk-data searches

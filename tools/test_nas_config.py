@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# ruff: noqa: EXE001
 """Unit tests for tools/nas_config.py SSH ControlMaster persistence, server-side timeout, and remote du guards."""
 
 import base64
