@@ -95,15 +95,31 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-for _root_candidate in (
+for _priority_root in (
     str(Path(__file__).resolve().parents[2]),
     "/workspace",
+):
+    if Path(_priority_root).is_dir():
+        if _priority_root in sys.path:
+            sys.path.remove(_priority_root)
+        sys.path.insert(0, _priority_root)
+
+# Bind `tools` to `/workspace/tools` BEFORE adding `/workspace/gotchi/lomin` to
+# `sys.path`, because `lomin/tools/__init__.py` is a regular package and PEP 420
+# lets regular packages shadow namespace packages regardless of `sys.path` order.
+import tools as _workspace_tools  # noqa: E402
+
+if hasattr(_workspace_tools, "__path__") and Path("/workspace/tools").is_dir():
+    if "/workspace/tools" not in _workspace_tools.__path__:
+        _workspace_tools.__path__.insert(0, "/workspace/tools")
+
+for _fallback_root in (
     "/workspace/gotchi",
     "/workspace/gotchi/lomin",
     "/tmp/lomin-parity-repo",
 ):
-    if Path(_root_candidate).is_dir() and _root_candidate not in sys.path:
-        sys.path.insert(0, _root_candidate)
+    if Path(_fallback_root).is_dir() and _fallback_root not in sys.path:
+        sys.path.append(_fallback_root)
 
 from tools import gotchi_zero_adapter as _canonical_adapter  # noqa: E402
 from tools.gotchi_zero_adapter import *  # noqa: F401,F403,E402

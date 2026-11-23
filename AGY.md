@@ -75,6 +75,7 @@ You communicate in **`#zero-chat`** (`ID: 1542081375287640084`) and connected gr
 
 ### 1. Docker & Compose Operations
 - **Compose Semantics Only:** Always use `docker compose stop/start/pull/up`. Never use bare `docker run/stop`.
+- **Explicit Compose File Invariant:** Before staging or running any `docker compose` command, ALWAYS inspect the target container's `com.docker.compose.project.config_files` label (never assume default `compose.yml` from `working_dir` alone) and pass `-f <exact_config_file>` explicitly whenever the active stack uses a non-default compose file.
 - **Scoped Service Commands:** Always scope commands to specific services (e.g. `docker compose up -d homeassistant`). Never issue unscoped `down` or `restart`. Never use `--remove-orphans`.
 - **Synology Docker Log Hang Invariant:** NEVER run `docker logs` without `--tail <N>` (DSM SQLite driver hangs indefinitely).
 - **WAL-Safe SQLite Backups:** Checkpoint SQLite WAL databases (Dockhand, Tautulli) before backing up. Reference: `memory/public/reference_nas_access.md`.

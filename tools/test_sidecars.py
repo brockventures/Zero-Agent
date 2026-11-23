@@ -125,7 +125,8 @@ def test_unsubscribe_and_trash_sender_gmail_api_flow(monkeypatch):
     assert res["trashed_count"] == 2
     assert res["unsubscribe_url"] == "https://unsub.example.org/oneclick"
     assert res["unsubscribe_http_ok"] is True
-    assert res["filter_created"] is True
+    assert res["filter_created"] is False
+    assert not any("/settings/filters" in u for _, u in calls)
     assert any(m == "POST" and u == "https://unsub.example.org/oneclick" for m, u in calls)
     assert sum(1 for m, u in calls if m == "POST" and u.endswith("/trash")) == 2
 

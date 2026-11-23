@@ -1299,7 +1299,7 @@ def _extract_unsubscribe_http_url(list_unsub_header: str) -> str:
     return ""
 
 
-def _unsubscribe_and_trash_sender(addr: str, name: str = "") -> dict:
+def _unsubscribe_and_trash_sender(addr: str, name: str = "", create_filter: bool = False) -> dict:
     """Search Gmail for messages from addr, trigger List-Unsubscribe/filter, and trash messages."""
     import urllib.parse
     import urllib.request
@@ -1371,22 +1371,23 @@ def _unsubscribe_and_trash_sender(addr: str, name: str = "") -> dict:
         except Exception:
             result["unsubscribe_http_ok"] = False
 
-    # Best-effort Gmail filter creation (if settings.basic scope is authorized)
-    try:
-        filter_payload = json.dumps({
-            "criteria": {"from": addr_norm},
-            "action": {"removeLabelIds": ["INBOX"], "addLabelIds": ["TRASH"]},
-        }).encode("utf-8")
-        freq = urllib.request.Request(
-            f"{GMAIL_BASE}/settings/filters",
-            data=filter_payload,
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(freq, timeout=10) as fresp:
-            result["filter_created"] = 200 <= getattr(fresp, "status", 200) < 300
-    except Exception:
-        result["filter_created"] = False
+    # Optional Gmail filter creation (disabled by default per user directive)
+    if create_filter:
+        try:
+            filter_payload = json.dumps({
+                "criteria": {"from": addr_norm},
+                "action": {"removeLabelIds": ["INBOX"], "addLabelIds": ["TRASH"]},
+            }).encode("utf-8")
+            freq = urllib.request.Request(
+                f"{GMAIL_BASE}/settings/filters",
+                data=filter_payload,
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(freq, timeout=10) as fresp:
+                result["filter_created"] = 200 <= getattr(fresp, "status", 200) < 300
+        except Exception:
+            result["filter_created"] = False
 
     # Move matching promotional messages from this sender to Trash
     trashed = 0
