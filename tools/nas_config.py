@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: BLE001, EXE001, PIE810, PLW1510, RUF013, S110, SIM103, UP006, UP035
 """
 nas_config.py — Canonical NAS topology resolver and SSH configuration for Zero.
 
@@ -12,6 +13,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import subprocess
 import sys
 import urllib.parse
@@ -330,11 +332,31 @@ def _extract_wrapped_remote_commands(cmd: str) -> list[str]:
         if val:
             inner.append(val)
     for m_b64 in re.finditer(
-        r"\becho\s+(?:-[neE]+\s+)*['\"]?([A-Za-z0-9+/=]{8,})['\"]?\s*\|\s*base64\s+(?:-d|--decode)\s*\|\s*(?:sudo\s+)?(?:bash|sh|zsh|dash)\b",
+        r"\b(?:echo|printf)\s+(?:-[neE]+\s+|'%s'\s+)*['\"]?([A-Za-z0-9+/=]{8,})['\"]?\s*\|\s*base64\s+(?:-d|--decode)\s*\|\s*(?:sudo\s+)?(?:bash|sh|zsh|dash|python3?)\b",
         cmd,
     ):
         try:
             decoded = base64.b64decode(m_b64.group(1)).decode("utf-8", errors="ignore").strip()
+            if decoded:
+                inner.append(decoded)
+        except Exception:
+            pass
+    for m_b64_here in re.finditer(
+        r"\bbase64\s+(?:-d|--decode)\s*<<<\s*['\"]?([A-Za-z0-9+/=]{8,})['\"]?",
+        cmd,
+    ):
+        try:
+            decoded = base64.b64decode(m_b64_here.group(1)).decode("utf-8", errors="ignore").strip()
+            if decoded:
+                inner.append(decoded)
+        except Exception:
+            pass
+    for m_py_b64 in re.finditer(
+        r"base64\.b64decode\(\s*[bBrRuU]*['\"]([A-Za-z0-9+/=]{8,})['\"]\s*\)",
+        cmd,
+    ):
+        try:
+            decoded = base64.b64decode(m_py_b64.group(1)).decode("utf-8", errors="ignore").strip()
             if decoded:
                 inner.append(decoded)
         except Exception:
@@ -423,11 +445,14 @@ def _is_protected_nas_recursive_delete_target(raw_target: str, active_cwd: str |
 
 
 def _strip_command_wrappers(tokens: list[str]) -> list[str]:
-    """Strip leading sudo, env, VAR=val, nohup, nice, or command prefixes from tokenized shell segment."""
+    """Strip leading sudo, env, VAR=val, nohup, nice, timeout, or shell keyword prefixes from tokenized shell segment."""
     idx = 0
     n = len(tokens)
     while idx < n:
         tok = _strip_outer_quotes(tokens[idx])
+        if tok in ("do", "then", "else", "elif", "{"):
+            idx += 1
+            continue
         if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", tok):
             idx += 1
             continue
@@ -446,7 +471,23 @@ def _strip_command_wrappers(tokens: list[str]) -> list[str]:
                     continue
                 break
             continue
-        if tok in ("env", "nohup", "command", "builtin", "nice", "ionice"):
+        if tok == "timeout":
+            idx += 1
+            while idx < n:
+                st = _strip_outer_quotes(tokens[idx])
+                if st in ("-k", "--kill-after", "-s", "--signal"):
+                    idx += 2
+                    continue
+                if st == "--":
+                    idx += 1
+                    break
+                if st.startswith("-"):
+                    idx += 1
+                    continue
+                idx += 1
+                break
+            continue
+        if tok in ("env", "nohup", "command", "builtin", "nice", "ionice", "xargs"):
             idx += 1
             while idx < n and _strip_outer_quotes(tokens[idx]).startswith("-"):
                 idx += 1
@@ -660,6 +701,147 @@ def _is_host_power_or_synopkg_uninstall(seg: str) -> Tuple[bool, str]:
     return False, ""
 
 
+_DU_VALUE_FLAGS = {
+    "-d", "--max-depth", "-B", "--block-size", "--exclude",
+    "-X", "--exclude-from", "--time", "--time-style", "--threshold", "-t",
+}
+
+
+def _is_protected_nas_du_target(raw_target: str, active_cwd: str | None = None) -> Tuple[bool, str]:
+    """Return (True, target_label) if a `du` target walks a NAS volume root, /docker, $NAS_DOCKER_ROOT, or agent/bulk tree."""
+    clean = _strip_outer_quotes(raw_target).strip()
+    if not clean:
+        return False, ""
+
+    if active_cwd and not clean.startswith(("/", "$", "~")):
+        if clean in (".", "./"):
+            clean = active_cwd
+        else:
+            clean = active_cwd.rstrip("/") + "/" + clean
+
+    if clean in ("/", "/*") or (clean.startswith("/") and posixpath.normpath(clean) == "/"):
+        return True, raw_target
+
+    if re.search(r"/volume(?:USB)?[0-9]*", clean, re.IGNORECASE):
+        return True, raw_target
+
+    if re.search(r"\$(?:\{)?(?:NAS_)?DOCKER_ROOT(?:\})?", clean):
+        return True, raw_target
+
+    if re.search(r"(?:^|/)docker(?=/|$|\*)", clean, re.IGNORECASE):
+        return True, raw_target
+
+    if re.search(
+        r"(?:^|/|\.)(?:discord-[A-Za-z0-9_*-]*|workspace|gemini|archives|data)(?=/|$|\*)",
+        clean,
+        re.IGNORECASE,
+    ):
+        return True, raw_target
+
+    if re.search(r"(?:^|/)root(?=/|$|\*)", clean, re.IGNORECASE) or clean == "~" or clean.startswith("~/"):
+        return True, raw_target
+
+    return False, ""
+
+
+def _is_unbounded_nas_disk_walk(seg: str, active_cwd: str | None = None) -> Tuple[bool, str]:
+    """Detect recursive `du` disk-usage walks targeting NAS volumes, /docker, $NAS_DOCKER_ROOT, or agent/bulk directories."""
+    if not seg or not str(seg).strip():
+        return False, ""
+    if os.environ.get("FORGE_APPROVED_CARD_EXECUTION") == "1":
+        return False, ""
+
+    candidates = [str(seg)]
+    wrapped = _extract_wrapped_remote_commands(str(seg))
+    candidates.extend(wrapped)
+    for w in wrapped:
+        candidates.extend(_extract_wrapped_remote_commands(w))
+
+    for cand in candidates:
+        cwd = active_cwd
+        var_map: dict[str, str] = {}
+        for sub_seg in _split_unquoted_shell_segments(cand):
+            clean_seg = sub_seg.strip().lstrip("(").rstrip(")").strip()
+            if not clean_seg:
+                continue
+
+            m_assign = re.match(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.+)$", clean_seg)
+            if m_assign:
+                var_map[m_assign.group(1)] = _strip_outer_quotes(m_assign.group(2).strip())
+
+            m_for = re.match(r"^for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+(.+)$", clean_seg)
+            if m_for:
+                var_map[m_for.group(1)] = m_for.group(2).strip()
+
+            raw_tokens = re.findall(r"(?:'[^']*'|\"(?:\\.|[^\"\\])*\"|\S+)", clean_seg)
+            cmd_tokens = _strip_command_wrappers(raw_tokens)
+            if not cmd_tokens:
+                continue
+
+            first_cmd = _strip_outer_quotes(cmd_tokens[0])
+            if first_cmd == "cd" and len(cmd_tokens) >= 2:
+                cd_target = _strip_outer_quotes(cmd_tokens[1])
+                if cd_target and not cd_target.startswith("-"):
+                    cwd = cd_target
+                continue
+
+            for m_find_du in re.finditer(
+                r"\bfind\s+('[^']*'|\"[^\"]*\"|\S+)[^\n;|&]*?\s-exec\s+(?:\S+/)?du\b",
+                clean_seg,
+            ):
+                is_prot, label = _is_protected_nas_du_target(m_find_du.group(1), active_cwd=cwd)
+                if is_prot:
+                    return True, (
+                        f"Unbounded NAS disk-usage walk ('du' targeting '{label}') is prohibited to prevent spinning HDD I/O saturation. "
+                        "Use 'df -h' for filesystem capacity or targeted file metadata checks ('stat' / 'ls -lh' on specific files) instead."
+                    )
+
+            exe = posixpath.basename(first_cmd)
+            if exe != "du":
+                continue
+
+            after_double_dash = False
+            targets: list[str] = []
+            idx = 1
+            while idx < len(cmd_tokens):
+                raw_tok = cmd_tokens[idx]
+                if raw_tok.startswith((">", "2>", "&>", "1>")):
+                    break
+                tok = _strip_outer_quotes(raw_tok)
+                if not after_double_dash:
+                    if tok == "--":
+                        after_double_dash = True
+                        idx += 1
+                        continue
+                    if tok in _DU_VALUE_FLAGS:
+                        idx += 2
+                        continue
+                    if tok.startswith("-"):
+                        idx += 1
+                        continue
+                if tok:
+                    targets.append(tok)
+                idx += 1
+
+            if not targets:
+                targets.append(".")
+
+            for t in targets:
+                expanded = t
+                for v_name, v_val in var_map.items():
+                    expanded = expanded.replace(f"${{{v_name}}}", v_val).replace(f"${v_name}", v_val)
+                for candidate_target in (t, expanded):
+                    for part in candidate_target.split():
+                        is_prot, label = _is_protected_nas_du_target(part, active_cwd=cwd)
+                        if is_prot:
+                            return True, (
+                                f"Unbounded NAS disk-usage walk ('du' targeting '{label}') is prohibited to prevent spinning HDD I/O saturation. "
+                                "Use 'df -h' for filesystem capacity or targeted file metadata checks ('stat' / 'ls -lh' on specific files) instead."
+                            )
+
+    return False, ""
+
+
 def validate_remote_ssh_command(remote_cmd: str) -> Tuple[bool, str]:
     """Validate a NAS SSH remote command and block destructive operations unless FORGE_APPROVED_CARD_EXECUTION=1."""
     if not remote_cmd or not str(remote_cmd).strip():
@@ -676,6 +858,9 @@ def validate_remote_ssh_command(remote_cmd: str) -> Tuple[bool, str]:
 
     for cand in candidate_commands:
         active_cwd: str | None = None
+        is_cand_du_bad, cand_du_desc = _is_unbounded_nas_disk_walk(cand)
+        if is_cand_du_bad:
+            return False, f"NAS SSH Command Filter Blocked: {cand_du_desc} {_SSH_APPROVAL_HINT}"
         for seg in _split_unquoted_shell_segments(cand):
             clean_seg = seg.strip().lstrip("(").rstrip(")").strip()
             if not clean_seg:
@@ -691,6 +876,10 @@ def validate_remote_ssh_command(remote_cmd: str) -> Tuple[bool, str]:
             is_rm_bad, rm_desc = _check_recursive_delete_segment(seg, active_cwd=active_cwd)
             if is_rm_bad:
                 return False, f"NAS SSH Command Filter Blocked: {rm_desc}. {_SSH_APPROVAL_HINT}"
+
+            is_du_bad, du_desc = _is_unbounded_nas_disk_walk(seg, active_cwd=active_cwd)
+            if is_du_bad:
+                return False, f"NAS SSH Command Filter Blocked: {du_desc} {_SSH_APPROVAL_HINT}"
 
             if re.search(
                 r"\bdocker\b(?:\s+(?:-[Hc]\s+\S+|--(?:host|context|config)(?:=\S+|\s+\S+)|-D|--debug))*\s+volume\s+(?:rm|remove|prune)\b",
@@ -738,6 +927,19 @@ def validate_remote_ssh_command(remote_cmd: str) -> Tuple[bool, str]:
 _SSH_STDIN_THRESHOLD_BYTES = 65536
 
 
+def _wrap_remote_timeout(cmd: str, timeout: int) -> str:
+    """Wrap a remote SSH command with server-side `timeout -k 5 <N>` so orphaned remote processes terminate cleanly."""
+    if not cmd or not str(cmd).strip() or timeout is None or int(timeout) <= 0:
+        return cmd
+    stripped = cmd.lstrip()
+    if stripped.startswith("timeout "):
+        return cmd
+    t_sec = int(timeout)
+    if stripped in ("bash -s", "sh -s"):
+        return f"timeout -k 5 {t_sec} {stripped}"
+    return f"timeout -k 5 {t_sec} sh -c {shlex.quote(cmd)}"
+
+
 def run_ssh(
     host: str,
     remote_cmd: str,
@@ -748,10 +950,11 @@ def run_ssh(
     connect_timeout: int = None,
     batch_mode: bool = False,
     disable_mux: bool = False,
-    retry_without_mux_on_timeout: bool = True,
+    retry_without_mux_on_timeout: bool = False,
     stdin_data: str = None,
+    enforce_remote_timeout: bool = True,
 ) -> Tuple[int, str, str]:
-    """Execute a remote command via SSH synchronously, with automatic mux eviction fallback on timeout.
+    """Execute a remote command via SSH synchronously, with server-side timeout and exit-255 mux eviction fallback.
 
     Remote scripts exceeding _SSH_STDIN_THRESHOLD_BYTES (64 KiB) are automatically streamed over
     stdin to `bash -s` to avoid Linux MAX_ARG_STRLEN (Errno 7: Argument list too long) failures.
@@ -771,6 +974,8 @@ def run_ssh(
     ):
         ssh_remote_cmd = "bash -s"
         effective_input = remote_cmd
+    if enforce_remote_timeout and timeout and int(timeout) > 0:
+        ssh_remote_cmd = _wrap_remote_timeout(ssh_remote_cmd, int(timeout))
     cmd = build_ssh_cmd(
         host,
         ssh_remote_cmd,
@@ -794,7 +999,6 @@ def run_ssh(
         if (
             res.returncode == 255
             and not disable_mux
-            and retry_without_mux_on_timeout
             and any(
                 k in (res.stderr or "").lower()
                 for k in (
@@ -831,32 +1035,6 @@ def run_ssh(
     except subprocess.TimeoutExpired:
         if not disable_mux:
             evict_ssh_mux_socket(host, user=user, port=port)
-            if retry_without_mux_on_timeout:
-                fallback_cmd = build_ssh_cmd(
-                    host,
-                    ssh_remote_cmd,
-                    user=user,
-                    port=port,
-                    key=key,
-                    connect_timeout=effective_connect_timeout,
-                    batch_mode=batch_mode,
-                    disable_mux=True,
-                )
-                try:
-                    res = subprocess.run(
-                        fallback_cmd,
-                        input=effective_input,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=timeout,
-                    )
-                    return res.returncode, res.stdout or "", res.stderr or ""
-                except subprocess.TimeoutExpired:
-                    return -1, "", f"SSH command timed out after {timeout}s (including mux-bypass retry): {remote_cmd[:60]}"
-                except Exception as e:
-                    return -1, "", f"SSH fallback execution exception: {e}"
         return -1, "", f"SSH command timed out after {timeout}s: {remote_cmd[:60]}"
     except Exception as e:
         return -1, "", f"SSH execution exception: {e}"
