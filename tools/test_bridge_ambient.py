@@ -1,3 +1,4 @@
+# ruff: noqa: F401, I001
 """
 Unit tests for tools/bridge_ambient.py.
 Exercises Brock guild public gating, Crab Cavern ambient routing, tag gating, and Banana Watcher directives.
@@ -643,6 +644,70 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(handled)
             self.assertFalse(override_queue.empty(), "Explicit <@bot_id> snowflake must override closed peer handoff")
+
+    async def test_get_ambient_memory_context_async_to_thread_and_airgap(self):
+        """Verify get_ambient_memory_context_async runs via asyncio.to_thread off the event loop and preserves air-gap filtering."""
+        import tools.bridge_pipeline as bp
+
+        offloaded = []
+        orig_to_thread = asyncio.to_thread
+
+        async def spy_to_thread(fn, *args, **kwargs):
+            offloaded.append((fn, args, kwargs))
+            return await orig_to_thread(fn, *args, **kwargs)
+
+        fake_matches = {
+            "memory": [
+                {
+                    "file_path": "/workspace/memory/private/network_secrets.md",
+                    "file_name": "network_secrets.md",
+                    "title": "Private Topology",
+                    "category": "private",
+                    "snippet": "Strictly private internal architecture note.",
+                },
+                {
+                    "file_path": "/workspace/memory/vault/secret_keys.md",
+                    "file_name": "secret_keys.md",
+                    "title": "Vault Enclave",
+                    "category": "vault",
+                    "snippet": "Strictly isolated vault record.",
+                },
+                {
+                    "file_path": "/workspace/memory/public/shared_patterns.md",
+                    "file_name": "shared_patterns.md",
+                    "title": "Shared Patterns",
+                    "category": "public",
+                    "snippet": "Public engineering pattern safe for external channels.",
+                },
+            ]
+        }
+
+        mock_indexer = MagicMock()
+        mock_indexer.search.return_value = fake_matches
+
+        with patch("tools.transcript_index.TranscriptIndexer", return_value=mock_indexer), \
+             patch("tools.bridge_pipeline.asyncio.to_thread", side_effect=spy_to_thread):
+            ext_ctx = await bp.get_ambient_memory_context_async(
+                "How do we structure shared engineering patterns?",
+                mode="external",
+                channel_id=1534452820995080192,
+                limit=4,
+            )
+            self.assertEqual(len(offloaded), 1)
+            self.assertIs(offloaded[0][0], bp.get_ambient_memory_context)
+            self.assertIn("Shared Patterns", ext_ctx)
+            self.assertNotIn("Private Topology", ext_ctx)
+            self.assertNotIn("Vault Enclave", ext_ctx)
+
+            home_ctx = await bp.get_ambient_memory_context_async(
+                "How do we structure shared engineering patterns?",
+                mode="home",
+                channel_id=1542081375287640084,
+                limit=4,
+            )
+            self.assertEqual(len(offloaded), 2)
+            self.assertIn("Private Topology", home_ctx)
+            self.assertIn("Shared Patterns", home_ctx)
 
 
 if __name__ == "__main__":

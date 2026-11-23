@@ -33,6 +33,9 @@ import tools.bridge_runner as br
 class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
+        self.orig_testing = os.environ.get("TESTING")
+        os.environ["TESTING"] = "1"
+        bh._fastembed_warmup_task = None
         p_vulcan_bs = patch("tools.bridge_state.is_vulcan_agent", return_value=False)
         p_vulcan_bs.start()
         self.addCleanup(p_vulcan_bs.stop)
@@ -85,6 +88,11 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
         bs.IN_FLIGHT_FILE = self.orig_in_flight
         bh.IN_FLIGHT_FILE = self.orig_in_flight
         bs.RESTART_INTENT_FILE = self.orig_restart_intent
+        bh._fastembed_warmup_task = None
+        if self.orig_testing is None:
+            os.environ.pop("TESTING", None)
+        else:
+            os.environ["TESTING"] = self.orig_testing
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_choice_button_and_view(self):
@@ -2097,6 +2105,149 @@ class TestBridgeHandlers(unittest.IsolatedAsyncioTestCase):
                 "second:end",
             ],
         )
+
+    async def test_warmup_fastembed_embedder_force_and_testing_skip(self):
+        """Verify warmup_fastembed_embedder skips when TESTING=1 unless force=True, and calls get_embedding_model + embed via to_thread."""
+        with patch.dict(os.environ, {"TESTING": "1"}), \
+             patch("tools.bridge_handlers.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+            res = await bh.warmup_fastembed_embedder(force=False)
+            self.assertFalse(res)
+            mock_to_thread.assert_not_awaited()
+
+        mock_model = MagicMock()
+        mock_model.embed.return_value = iter([[0.1, 0.2, 0.3]])
+        offloaded = []
+        orig_to_thread = asyncio.to_thread
+
+        async def spy_to_thread(fn, *args, **kwargs):
+            offloaded.append(fn)
+            return await orig_to_thread(fn, *args, **kwargs)
+
+        with patch("tools.transcript_index.get_embedding_model", return_value=mock_model) as mock_get_model, \
+             patch("tools.bridge_handlers.asyncio.to_thread", side_effect=spy_to_thread):
+            res_forced = await bh.warmup_fastembed_embedder(force=True)
+            self.assertTrue(res_forced)
+            self.assertIn(bh._warm_fastembed_sync, offloaded)
+            mock_get_model.assert_called_once_with()
+            mock_model.embed.assert_called_once_with(["warmup"])
+
+    async def test_warmup_fastembed_embedder_handles_none_and_exceptions(self):
+        """Verify warmup_fastembed_embedder returns False safely when model is None or raises an exception."""
+        with patch("tools.transcript_index.get_embedding_model", return_value=None):
+            self.assertFalse(await bh.warmup_fastembed_embedder(force=True))
+
+        with patch("tools.transcript_index.get_embedding_model", side_effect=RuntimeError("ONNX load failed")):
+            self.assertFalse(await bh.warmup_fastembed_embedder(force=True))
+
+        bad_model = MagicMock()
+        bad_model.embed.side_effect = ValueError("corrupt tensor")
+        with patch("tools.transcript_index.get_embedding_model", return_value=bad_model):
+            self.assertFalse(await bh.warmup_fastembed_embedder(force=True))
+
+    async def test_handle_on_ready_schedules_fastembed_warmup_non_blocking(self):
+        """Verify handle_on_ready schedules warmup_fastembed_embedder non-blocking and deduplicates on reconnect."""
+        bh.has_notified_ready = False
+        bh._fastembed_warmup_task = None
+        if bs.RESTART_INTENT_FILE.exists():
+            bs.RESTART_INTENT_FILE.unlink()
+
+        gate = asyncio.Event()
+        warmup_calls = 0
+
+        async def fake_warmup(force: bool = False) -> bool:
+            nonlocal warmup_calls
+            warmup_calls += 1
+            await gate.wait()
+            return True
+
+        mock_channel = MagicMock()
+        mock_bot = MagicMock()
+        mock_bot.get_channel.return_value = mock_channel
+
+        with patch("tools.mcp_daemon.ensure_mcp_daemon_running"), \
+             patch("tools.mcp_daemon.get_status", return_value={"pid": 1, "healthy": True}), \
+             patch("tools.zero_mail_listener.ensure_mail_listener_running"), \
+             patch("tools.zero_mail_listener.get_status", return_value={"pid": 2, "target": "t"}), \
+             patch("tools.amazon_order_listener.ensure_amazon_listener_running"), \
+             patch("tools.amazon_order_listener.get_status", return_value={"pid": 3}), \
+             patch("tools.zero_health_server.ensure_health_server_running"), \
+             patch("tools.zero_health_server.get_status", return_value={"pid": 4, "port": 8080}), \
+             patch("tools.banana_watcher.ensure_banana_watcher_running"), \
+             patch("tools.banana_watcher.get_daemon_status", return_value={"pid": 5}), \
+             patch("tools.forge.reconcile_forge_on_boot", return_value={}), \
+             patch("tools.bridge_daemons.warmup_persistent_daemons", new_callable=AsyncMock), \
+             patch("tools.bridge_handlers.detect_recent_container_oom", return_value=None), \
+             patch("tools.bridge_handlers.warmup_fastembed_embedder", side_effect=fake_warmup):
+            # handle_on_ready must return before gate is set (non-blocking)
+            await bh.handle_on_ready(
+                mock_bot,
+                turn_queue=AsyncMock(),
+                ext_turn_queue=AsyncMock(),
+                start_workers_fn=MagicMock(),
+                start_scheduler_fn=AsyncMock(),
+            )
+            self.assertIsNotNone(bh._fastembed_warmup_task)
+            self.assertFalse(bh._fastembed_warmup_task.done())
+            await asyncio.sleep(0)
+            self.assertEqual(warmup_calls, 1)
+
+            # Reconnect while warmup is in flight -> does not spawn a second task
+            first_task = bh._fastembed_warmup_task
+            await bh.handle_on_ready(
+                mock_bot,
+                turn_queue=AsyncMock(),
+                ext_turn_queue=AsyncMock(),
+                start_workers_fn=MagicMock(),
+                start_scheduler_fn=AsyncMock(),
+            )
+            self.assertIs(bh._fastembed_warmup_task, first_task)
+            self.assertEqual(warmup_calls, 1)
+
+            gate.set()
+            await first_task
+            self.assertTrue(first_task.done())
+
+            # Reconnect after warmup succeeded -> skips re-warming
+            await bh.handle_on_ready(
+                mock_bot,
+                turn_queue=AsyncMock(),
+                ext_turn_queue=AsyncMock(),
+                start_workers_fn=MagicMock(),
+                start_scheduler_fn=AsyncMock(),
+            )
+            self.assertEqual(warmup_calls, 1)
+
+    async def test_run_channel_turn_worker_starts_typing_before_turn_execution(self):
+        """Verify run_channel_turn_worker emits initial typing heartbeat before execute_agy_turn begins."""
+        cid = bs.TARGET_CHANNEL_ID
+        q = asyncio.Queue()
+        events = []
+
+        mock_reply = MagicMock()
+        mock_reply.channel = MagicMock()
+
+        async def record_typing():
+            events.append("typing")
+
+        mock_reply.channel.typing = AsyncMock(side_effect=record_typing)
+
+        async def fake_execute(*args, **kwargs):
+            events.append("execute_agy_turn")
+
+        await q.put({
+            "prompt": "Check typing order",
+            "reply_target": mock_reply,
+            "channel_id": cid,
+            "mode": "home",
+        })
+
+        with patch("tools.bridge_handlers.execute_agy_turn", side_effect=fake_execute):
+            await bh.run_channel_turn_worker(cid, q, MagicMock())
+
+        self.assertGreaterEqual(len(events), 2)
+        self.assertEqual(events[0], "typing")
+        self.assertIn("execute_agy_turn", events)
+        self.assertLess(events.index("typing"), events.index("execute_agy_turn"))
 
 
 if __name__ == "__main__":

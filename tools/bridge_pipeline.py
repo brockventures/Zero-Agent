@@ -467,6 +467,24 @@ def get_ambient_memory_context(
         return ""
 
 
+async def get_ambient_memory_context_async(
+    prompt: str,
+    mode: str = "home",
+    channel_id: int | None = None,
+    limit: int = 4,
+    previous_user_prompt: str | None = None,
+) -> str:
+    """Execute get_ambient_memory_context off the asyncio event loop via asyncio.to_thread."""
+    return await asyncio.to_thread(
+        get_ambient_memory_context,
+        prompt,
+        mode=mode,
+        channel_id=channel_id,
+        limit=limit,
+        previous_user_prompt=previous_user_prompt,
+    )
+
+
 def _extract_message_id(target: Any, channel_id: int | str | None = None) -> int | None:
     """Return integer message ID if target represents a Discord message (not a channel/thread)."""
     if target is None:

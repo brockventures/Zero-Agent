@@ -1,4 +1,4 @@
-# ruff: noqa: ASYNC230, B023, BLE001, I001, PIE810, PLW0602, RUF013, S110, SIM102, SIM117, UP041
+# ruff: noqa: ASYNC230, B023, BLE001, I001, PIE810, PLW0602, RUF013, S110, SIM117, UP041
 """
 Zero Discord Bridge - Discord Event Handlers, Routing & Dispatcher Module
 Encapsulates all Discord bot event listeners (on_ready, on_message, on_interaction),
@@ -74,6 +74,7 @@ PROCESSED_INTERACTIONS = set()
 active_turn_task = None
 active_status_msg = None
 has_notified_ready = False
+_fastembed_warmup_task: asyncio.Task | None = None
 
 # Multi-Channel Concurrency State
 channel_queues = {}             # channel_id -> asyncio.Queue
@@ -92,8 +93,13 @@ def is_fast_lane_channel(channel_id: int | str) -> bool:
         cid = int(channel_id)
     except (ValueError, TypeError):
         return False
-    from tools.bridge_daemons import is_dedicated_channel
-    return cid == TARGET_CHANNEL_ID or cid in FAST_LANE_CHANNEL_IDS or is_dedicated_channel(channel_id)
+    from tools.bridge_daemons import BANANA_STAND_CHANNEL_ID, is_dedicated_channel
+    return (
+        cid == TARGET_CHANNEL_ID
+        or cid == BANANA_STAND_CHANNEL_ID
+        or cid in FAST_LANE_CHANNEL_IDS
+        or is_dedicated_channel(channel_id)
+    )
 
 
 def get_channel_queue(channel_id: int | str) -> asyncio.Queue:
@@ -421,6 +427,7 @@ async def resilient_typing(target: Any, interval: float = 6.0):
                     pass
 
     task = asyncio.create_task(_typing_loop())
+    await asyncio.sleep(0)
     try:
         yield
     finally:
@@ -732,6 +739,33 @@ async def external_queue_worker(
             channel_worker_tasks[cid] = t
 
 
+def _warm_fastembed_sync() -> bool:
+    """Synchronously load and run a warmup embedding pass on the shared FastEmbed ONNX model."""
+    from tools.transcript_index import get_embedding_model
+
+    model = get_embedding_model()
+    if model is None:
+        return False
+    list(model.embed(["warmup"]))
+    return True
+
+
+async def warmup_fastembed_embedder(force: bool = False) -> bool:
+    """Pre-warm FastEmbed ONNX runtime and BAAI/bge-small-en-v1.5 off the event loop at boot."""
+    if not force and os.getenv("TESTING") == "1":
+        return False
+    t0 = time.perf_counter()
+    try:
+        ok = await asyncio.to_thread(_warm_fastembed_sync)
+        if ok:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            print(f"[Antigravity] FastEmbed ONNX embedder pre-warmed in {elapsed_ms:.0f}ms.")
+        return bool(ok)
+    except Exception as e:
+        print(f"[Bridge] Warning warming FastEmbed embedder: {e}")
+        return False
+
+
 async def handle_on_ready(
     bot: discord.Client,
     turn_queue,
@@ -742,7 +776,7 @@ async def handle_on_ready(
     reload_fn=None,
 ):
     """Handle bot startup, presence restoration, credential syncing, and reboot briefings."""
-    global has_notified_ready
+    global has_notified_ready, _fastembed_warmup_task
     sync_credentials()
     update_beacon("IDLE", "")
     if presence_fn:
@@ -822,6 +856,24 @@ async def handle_on_ready(
         print("[Antigravity] Dedicated persistent daemons warmed up.")
     except Exception as dme:
         print(f"[Bridge] Warning initializing persistent daemons: {dme}")
+
+    # Pre-warm FastEmbed ONNX embedder in background without blocking bot readiness
+    try:
+        should_warm_fastembed = (
+            _fastembed_warmup_task is None
+            or (
+                _fastembed_warmup_task.done()
+                and (
+                    _fastembed_warmup_task.cancelled()
+                    or _fastembed_warmup_task.exception() is not None
+                    or not _fastembed_warmup_task.result()
+                )
+            )
+        )
+        if should_warm_fastembed:
+            _fastembed_warmup_task = asyncio.create_task(warmup_fastembed_embedder())
+    except Exception as fwe:
+        print(f"[Bridge] Warning scheduling FastEmbed warmup: {fwe}")
 
     # Clean up any zombie in-flight turn from an interrupted restart
     interrupted_prompt = None
