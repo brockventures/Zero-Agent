@@ -3496,5 +3496,16 @@ if __name__ == "__main__":
         )
         if rep:
             print(rep)
+    elif action in ("matter_watchdog", "matter_thread_watchdog"):
+        from tools.matter_thread_watchdog import run_matter_thread_watchdog
+        dry_run = "--dry-run" in sys.argv
+        ok, rep, _ = run_sidecar_job(
+            "matter_thread_watchdog",
+            "Matter-over-Thread Sensor Recovery Watchdog",
+            run_matter_thread_watchdog,
+            dry_run=dry_run,
+        )
+        if rep:
+            print(rep)
     else:
         print(f"Unknown action: {action}")
