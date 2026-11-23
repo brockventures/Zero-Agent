@@ -383,11 +383,11 @@ def build_pixel_adb_rc_script(docker_root: Optional[str] = None) -> str:
         "#!/bin/sh\n"
         'case "$1" in\n'
         '    start|"")\n'
-        "        chmod -R 666 /dev/bus/usb/* >/dev/null 2>&1 || true\n"
+        "        chmod -R a+rwX /dev/bus/usb && find /dev/bus/usb -type d -exec chmod 755 {} + >/dev/null 2>&1 || true\n"
         f"        export HOME={adb_home}\n"
         f"        export ADB_VENDOR_KEYS={adb_key}\n"
         f"        {adb_bin} kill-server >/dev/null 2>&1 || true\n"
-        f"        nohup {adb_bin} -a -P 5037 fork-server server >/tmp/adb_host.log 2>&1 &\n"
+        f"        nohup {adb_bin} -a -P 5037 fork-server server >{adb_home}/adb_host.log 2>&1 &\n"
         "        sleep 2\n"
         f"        {adb_bin} -H 127.0.0.1 -P 5037 -s {PIXEL_SERIAL} forward tcp:9223 localabstract:chrome_devtools_remote >/dev/null 2>&1 || true\n"
         "        ;;\n"
@@ -416,7 +416,7 @@ def ensure_host2_adb(host_ip: Optional[str] = None) -> dict[str, Any]:
     remote_cmd = (
         "PATH=/usr/local/bin:/usr/bin:/bin:$PATH "
         "docker run --rm --privileged -v /:/host alpine chroot /host sh -c \""
-        "chmod -R 666 /dev/bus/usb/* && "
+        "chmod -R a+rwX /dev/bus/usb && find /dev/bus/usb -type d -exec chmod 755 {} + && "
         f"echo '{b64_rc}' | base64 -d > {PIXEL_ADB_RC_PATH} && "
         f"chmod 755 {PIXEL_ADB_RC_PATH}"
         "\" && "
@@ -424,7 +424,7 @@ def ensure_host2_adb(host_ip: Optional[str] = None) -> dict[str, Any]:
         f"devs=$({adb_bin} -H 127.0.0.1 -P 5037 devices 2>/dev/null || true); "
         f"case \"$devs\" in *{PIXEL_SERIAL}*device*) ;; *) "
         f"{adb_bin} kill-server >/dev/null 2>&1 || true; "
-        f"nohup {adb_bin} -a -P 5037 fork-server server >/tmp/adb_host.log 2>&1 </dev/null & "
+        f"nohup {adb_bin} -a -P 5037 fork-server server >{adb_home}/adb_host.log 2>&1 </dev/null & "
         "sleep 2 ;; esac && "
         f"{adb_bin} -H 127.0.0.1 -P 5037 -s {PIXEL_SERIAL} forward tcp:9223 localabstract:chrome_devtools_remote 2>&1 || true; "
         f"{adb_bin} -H 127.0.0.1 -P 5037 devices -l 2>&1; "

@@ -419,7 +419,9 @@ def test_ensure_adb_updates_usb_and_rc_script():
         )
 
     rc_script = dsm_update_monitor.build_pixel_adb_rc_script(docker_root="/mock_docker")
-    assert "chmod -R 666 /dev/bus/usb/*" in rc_script
+    assert "chmod -R a+rwX /dev/bus/usb" in rc_script
+    assert "chmod 755" in rc_script
+    assert "adb_host.log" in rc_script
     assert "fork-server server" in rc_script
     assert "36261FDJG0003L" in rc_script
     assert "tcp:9223" in rc_script
@@ -435,7 +437,8 @@ def test_ensure_adb_updates_usb_and_rc_script():
         assert res["forward_active"] is True
         assert len(ssh_calls) == 1
         assert ssh_calls[0][0] == MOCK_HOST_2_IP
-        assert "chmod -R 666 /dev/bus/usb/*" in ssh_calls[0][1]
+        assert "chmod -R a+rwX /dev/bus/usb" in ssh_calls[0][1]
+        assert "adb_host.log" in ssh_calls[0][1]
         assert "/usr/local/etc/rc.d/pixel_adb.sh" in ssh_calls[0][1]
         assert "5037" in ssh_calls[0][1]
         assert "tcp:9223" in ssh_calls[0][1]
