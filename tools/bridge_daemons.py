@@ -842,6 +842,7 @@ class PersistentDaemonManager:
     def __init__(self):
         self.workers: dict[int, PersistentChannelWorker] = {}
         self.reaper_task: asyncio.Task | None = None
+        self._recycling: bool = False
         for cid, cfg in DEDICATED_CHANNEL_CONFIGS.items():
             self.workers[cid] = PersistentChannelWorker(
                 channel_id=cid,
@@ -884,12 +885,45 @@ class PersistentDaemonManager:
                 pass
         return reaped
 
+    async def rewarm_dead_always_warm_workers(self) -> list[str]:
+        """Re-warm any always_warm persistent workers whose subprocess exited unexpectedly."""
+        if not is_persistent_daemons_enabled():
+            return []
+        if getattr(self, "_recycling", False):
+            return []
+        rewarmed: list[str] = []
+        for w in self.workers.values():
+            if not getattr(w, "always_warm", w.channel_id == TARGET_CHANNEL_ID):
+                continue
+            if w.lock.locked() or w.start_lock.locked():
+                continue
+            is_dead = (
+                (not w.is_ready)
+                or (w.proc is None)
+                or (getattr(w.proc, "returncode", None) is not None)
+            )
+            if not is_dead:
+                continue
+            print(f"[BridgeDaemon] 🔄 Always-warm worker #{w.name} exited unexpectedly; re-warming...")
+            try:
+                if w.proc is not None and getattr(w.proc, "returncode", None) is None:
+                    await w.shutdown()
+                await w.start()
+                rewarmed.append(w.name)
+            except Exception as err:
+                print(f"[BridgeDaemon] ⚠️ Failed to re-warm always-warm worker #{w.name}: {err}")
+        return rewarmed
+
     async def _reaper_loop(self, interval: float = 60.0):
-        """Background periodic task that reaps idle secondary workers."""
+        """Background periodic task that reaps idle secondary workers and re-warms dead always-warm workers."""
         try:
             while True:
                 await asyncio.sleep(interval)
-                await self.reap_idle_workers()
+                try:
+                    await self.reap_idle_workers()
+                    await self.rewarm_dead_always_warm_workers()
+                except Exception as err:
+                    print(f"[BridgeDaemon] ⚠️ Error in reaper loop tick: {err}")
         except asyncio.CancelledError:
             pass
 
@@ -1014,21 +1048,25 @@ class PersistentDaemonManager:
             except Exception as err:
                 print(f"[BridgeDaemon] ⚠️ Error recycling worker #{w.name} during overnight rollover: {err}")
 
-        tasks = [_recycle_one(w) for w in self.workers.values()]
-        run_classifier = (
-            include_classifier
-            if include_classifier is not None
-            else (os.getenv("TESTING") != "1")
-        )
-        if run_classifier:
-            try:
-                from tools.classifier import warm_classifier
+        self._recycling = True
+        try:
+            tasks = [_recycle_one(w) for w in self.workers.values()]
+            run_classifier = (
+                include_classifier
+                if include_classifier is not None
+                else (os.getenv("TESTING") != "1")
+            )
+            if run_classifier:
+                try:
+                    from tools.classifier import warm_classifier
 
-                tasks.append(asyncio.to_thread(warm_classifier.recycle))
-            except Exception as err:
-                print(f"[BridgeDaemon] ⚠️ Error recycling warm_classifier during overnight rollover: {err}")
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+                    tasks.append(asyncio.to_thread(warm_classifier.recycle))
+                except Exception as err:
+                    print(f"[BridgeDaemon] ⚠️ Error recycling warm_classifier during overnight rollover: {err}")
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._recycling = False
 
 
 # Global singleton daemon manager

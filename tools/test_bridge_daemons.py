@@ -1203,6 +1203,182 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
         self.assertTrue(ext_task.cancelled())
 
+    async def test_23_rewarm_dead_always_warm_workers(self):
+        """Verify dead always_warm workers are re-warmed while healthy and non-always_warm workers are skipped."""
+        mgr = bd.PersistentDaemonManager()
+
+        dead_exited = bd.PersistentChannelWorker(
+            channel_id=bs.TARGET_CHANNEL_ID,
+            name="dead-exited",
+            mode="home",
+            sess_key="home",
+            always_warm=True,
+        )
+        dead_exited.is_ready = True
+        dead_exited.proc = MagicMock(returncode=0)
+        dead_exited.start = AsyncMock()
+        dead_exited.shutdown = AsyncMock()
+
+        dead_none = bd.PersistentChannelWorker(
+            channel_id=bd.ZERO_OPS_CHANNEL_ID,
+            name="dead-none",
+            mode="home",
+            sess_key=str(bd.ZERO_OPS_CHANNEL_ID),
+            always_warm=True,
+        )
+        dead_none.is_ready = False
+        dead_none.proc = None
+        dead_none.start = AsyncMock()
+        dead_none.shutdown = AsyncMock()
+
+        unready_with_live_proc = bd.PersistentChannelWorker(
+            channel_id=111222333,
+            name="unready-live-proc",
+            mode="home",
+            sess_key="111222333",
+            always_warm=True,
+        )
+        unready_with_live_proc.is_ready = False
+        unready_with_live_proc.proc = MagicMock(returncode=None)
+        unready_with_live_proc.start = AsyncMock()
+        unready_with_live_proc.shutdown = AsyncMock()
+
+        healthy_warm = bd.PersistentChannelWorker(
+            channel_id=bd.LOUNGE_CHANNEL_ID,
+            name="healthy-warm",
+            mode="external",
+            sess_key=str(bd.LOUNGE_CHANNEL_ID),
+            always_warm=True,
+        )
+        healthy_warm.is_ready = True
+        healthy_warm.proc = MagicMock(returncode=None)
+        healthy_warm.start = AsyncMock()
+        healthy_warm.shutdown = AsyncMock()
+
+        dead_secondary = bd.PersistentChannelWorker(
+            channel_id=444555666,
+            name="dead-secondary",
+            mode="home",
+            sess_key="444555666",
+            always_warm=False,
+        )
+        dead_secondary.is_ready = False
+        dead_secondary.proc = None
+        dead_secondary.start = AsyncMock()
+        dead_secondary.shutdown = AsyncMock()
+
+        mgr.workers = {
+            dead_exited.channel_id: dead_exited,
+            dead_none.channel_id: dead_none,
+            unready_with_live_proc.channel_id: unready_with_live_proc,
+            healthy_warm.channel_id: healthy_warm,
+            dead_secondary.channel_id: dead_secondary,
+        }
+
+        with patch("tools.bridge_daemons.is_persistent_daemons_enabled", return_value=True):
+            rewarmed = await mgr.rewarm_dead_always_warm_workers()
+
+        self.assertEqual(rewarmed, ["dead-exited", "dead-none", "unready-live-proc"])
+        dead_exited.shutdown.assert_not_awaited()
+        dead_exited.start.assert_awaited_once()
+        dead_none.shutdown.assert_not_awaited()
+        dead_none.start.assert_awaited_once()
+        unready_with_live_proc.shutdown.assert_awaited_once()
+        unready_with_live_proc.start.assert_awaited_once()
+        healthy_warm.start.assert_not_awaited()
+        dead_secondary.start.assert_not_awaited()
+
+    async def test_24_rewarm_skips_locked_disabled_and_recycling_and_reaper_loop(self):
+        """Verify rewarm skips locked workers, disabled daemons, active nightly recycle, and runs in _reaper_loop."""
+        mgr = bd.PersistentDaemonManager()
+        locked_worker = bd.PersistentChannelWorker(
+            channel_id=bs.TARGET_CHANNEL_ID,
+            name="locked-warm",
+            mode="home",
+            sess_key="home",
+            always_warm=True,
+        )
+        locked_worker.is_ready = False
+        locked_worker.proc = None
+        locked_worker.start = AsyncMock()
+
+        start_locked_worker = bd.PersistentChannelWorker(
+            channel_id=bd.ZERO_OPS_CHANNEL_ID,
+            name="start-locked-warm",
+            mode="home",
+            sess_key=str(bd.ZERO_OPS_CHANNEL_ID),
+            always_warm=True,
+        )
+        start_locked_worker.is_ready = False
+        start_locked_worker.proc = None
+        start_locked_worker.start = AsyncMock()
+
+        mgr.workers = {
+            locked_worker.channel_id: locked_worker,
+            start_locked_worker.channel_id: start_locked_worker,
+        }
+
+        # 1. Locked workers are skipped safely
+        with patch("tools.bridge_daemons.is_persistent_daemons_enabled", return_value=True):
+            async with locked_worker.lock, start_locked_worker.start_lock:
+                rewarmed = await mgr.rewarm_dead_always_warm_workers()
+        self.assertEqual(rewarmed, [])
+        locked_worker.start.assert_not_awaited()
+        start_locked_worker.start.assert_not_awaited()
+
+        # 2. Disabled persistent daemons early return
+        with patch("tools.bridge_daemons.is_persistent_daemons_enabled", return_value=False):
+            rewarmed = await mgr.rewarm_dead_always_warm_workers()
+        self.assertEqual(rewarmed, [])
+        locked_worker.start.assert_not_awaited()
+
+        # 3. Active proactive_nightly_recycle suppresses rewarm without racing
+        recycle_gate = asyncio.Event()
+        recycle_started = asyncio.Event()
+
+        async def blocked_recycle(new_conv_id=None):
+            recycle_started.set()
+            await recycle_gate.wait()
+
+        locked_worker.recycle = AsyncMock(side_effect=blocked_recycle)
+        start_locked_worker.recycle = AsyncMock()
+
+        with patch("tools.bridge_daemons.is_persistent_daemons_enabled", return_value=True), \
+             patch("tools.bridge_state.reset_session_meta"), \
+             patch("tools.bridge_state.remove_reset_session_key"):
+            recycle_task = asyncio.create_task(mgr.proactive_nightly_recycle(include_classifier=False))
+            await recycle_started.wait()
+            self.assertTrue(mgr._recycling)
+            self.assertEqual(await mgr.rewarm_dead_always_warm_workers(), [])
+            locked_worker.start.assert_not_awaited()
+            recycle_gate.set()
+            await recycle_task
+            self.assertFalse(mgr._recycling)
+
+        # 4. _reaper_loop survives transient Exception, invokes rewarm, and exits cleanly on CancelledError
+        ticks = 0
+
+        async def fake_reap():
+            nonlocal ticks
+            ticks += 1
+            if ticks == 1:
+                raise RuntimeError("transient reap failure")
+
+        rewarm_called = asyncio.Event()
+
+        async def fake_rewarm():
+            rewarm_called.set()
+            return []
+
+        with patch.object(mgr, "reap_idle_workers", side_effect=fake_reap) as mock_reap, \
+             patch.object(mgr, "rewarm_dead_always_warm_workers", side_effect=fake_rewarm) as mock_rewarm:
+            loop_task = asyncio.create_task(mgr._reaper_loop(interval=0.01))
+            await asyncio.wait_for(rewarm_called.wait(), timeout=2.0)
+            self.assertGreaterEqual(mock_reap.await_count, 2)
+            mock_rewarm.assert_awaited()
+            loop_task.cancel()
+            await loop_task
+
 
 if __name__ == "__main__":
     unittest.main()
