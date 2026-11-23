@@ -9,6 +9,7 @@ import asyncio
 from contextlib import contextmanager
 import fcntl
 import json
+import math
 import os
 import re
 import threading
@@ -946,7 +947,8 @@ def get_gif_prompt_guidance(sess_key: str, channel_id: int | str | None = None) 
 def check_compaction_needed(
     conv_id: str | None,
     current_turns: int,
-    brain_root: Path = Path("/root/.gemini/antigravity-cli/brain")
+    brain_root: Path = Path("/root/.gemini/antigravity-cli/brain"),
+    high_water_multiplier: float = 1.0,
 ) -> tuple[bool, str]:
     """Evaluate whether a session should be compacted based on turns, transcript size, step count, or age.
 
@@ -959,6 +961,14 @@ def check_compaction_needed(
     max_turns = int(rules.get("compaction_max_turns", 10))
     max_steps = int(rules.get("compaction_max_steps", 200))
     max_mb = float(rules.get("compaction_max_mb", 0.35))
+    max_age_seconds = 86400.0
+
+    mult = float(high_water_multiplier) if high_water_multiplier is not None else 1.0
+    if mult > 1.0:
+        max_turns = max(max_turns + 1, int(math.ceil(max_turns * mult)))
+        max_steps = int(math.ceil(max_steps * mult))
+        max_mb = max_mb * mult
+        max_age_seconds = 86400.0 * mult
 
     if current_turns >= max_turns:
         return True, f"turn count reached {current_turns}/{max_turns}"
@@ -988,7 +998,9 @@ def check_compaction_needed(
             if line_count >= max_steps:
                 return True, f"transcript steps ({line_count}) exceeds {max_steps}-step ceiling"
 
-            if (time.time() - st.st_mtime) > 86400:
+            if (time.time() - st.st_mtime) > max_age_seconds:
+                if mult > 1.0:
+                    return True, f"session age exceeds {max_age_seconds / 3600.0:g} hours"
                 return True, "session age exceeds 24 hours"
         except Exception as e:
             print(f"[BridgeState] Error checking transcript compaction metrics: {e}")

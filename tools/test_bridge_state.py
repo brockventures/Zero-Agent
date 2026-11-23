@@ -175,6 +175,117 @@ class TestBridgeState(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hasattr(bs, "is_thread_retitled"))
         self.assertFalse(hasattr(bs, "mark_thread_retitled"))
 
+    def test_compaction_high_water_multiplier(self):
+        from unittest.mock import patch
+
+        brain_temp = self.temp_path / "brain_hw"
+        baseline_rules = {
+            "compaction_max_turns": 10,
+            "compaction_max_steps": 200,
+            "compaction_max_mb": 0.35,
+        }
+
+        with patch("tools.bridge_state.get_runtime_rules", return_value=baseline_rules):
+            # Default 1.0 and <= 1.0 fallbacks preserve exact baseline turn threshold
+            needed, reason = bs.check_compaction_needed(None, 10)
+            self.assertTrue(needed)
+            self.assertEqual(reason, "turn count reached 10/10")
+
+            for low_mult in (1.0, 0.5, 0.0, -2.0):
+                needed, reason = bs.check_compaction_needed(
+                    None, 10, high_water_multiplier=low_mult
+                )
+                self.assertTrue(needed)
+                self.assertEqual(reason, "turn count reached 10/10")
+
+            # 1.5x scales turn threshold from 10 -> 15
+            needed, _ = bs.check_compaction_needed(None, 14, high_water_multiplier=1.5)
+            self.assertFalse(needed)
+            needed, reason = bs.check_compaction_needed(None, 15, high_water_multiplier=1.5)
+            self.assertTrue(needed)
+            self.assertEqual(reason, "turn count reached 15/15")
+
+            # Transcript MB threshold: 0.35 -> 0.525 MB at 1.5x
+            mb_dir = brain_temp / "conv-mb" / ".system_generated" / "logs"
+            mb_dir.mkdir(parents=True, exist_ok=True)
+            mb_file = mb_dir / "transcript.jsonl"
+            mb_file.write_bytes(b"x" * int(0.40 * 1024 * 1024))
+
+            needed, _ = bs.check_compaction_needed("conv-mb", 1, brain_root=brain_temp)
+            self.assertTrue(needed)
+            needed, _ = bs.check_compaction_needed(
+                "conv-mb", 1, brain_root=brain_temp, high_water_multiplier=1.5
+            )
+            self.assertFalse(needed)
+
+            mb_file.write_bytes(b"x" * int(0.55 * 1024 * 1024))
+            needed, reason = bs.check_compaction_needed(
+                "conv-mb", 1, brain_root=brain_temp, high_water_multiplier=1.5
+            )
+            self.assertTrue(needed)
+            self.assertIn("transcript size", reason)
+
+            # Transcript step threshold: 200 -> 300 at 1.5x
+            step_dir = brain_temp / "conv-steps" / ".system_generated" / "logs"
+            step_dir.mkdir(parents=True, exist_ok=True)
+            step_file = step_dir / "transcript.jsonl"
+            with open(step_file, "w", encoding="utf-8") as f:
+                for i in range(250):
+                    f.write(f'{{"step_index": {i}, "type": "USER_INPUT"}}\n')
+
+            needed, _ = bs.check_compaction_needed("conv-steps", 1, brain_root=brain_temp)
+            self.assertTrue(needed)
+            needed, _ = bs.check_compaction_needed(
+                "conv-steps", 1, brain_root=brain_temp, high_water_multiplier=1.5
+            )
+            self.assertFalse(needed)
+
+            with open(step_file, "a", encoding="utf-8") as f:
+                for i in range(250, 305):
+                    f.write(f'{{"step_index": {i}, "type": "USER_INPUT"}}\n')
+
+            needed, reason = bs.check_compaction_needed(
+                "conv-steps", 1, brain_root=brain_temp, high_water_multiplier=1.5
+            )
+            self.assertTrue(needed)
+            self.assertIn("exceeds 300-step ceiling", reason)
+
+            # Session age threshold: 24h (86400s) -> 36h (129600s) at 1.5x
+            age_dir = brain_temp / "conv-age" / ".system_generated" / "logs"
+            age_dir.mkdir(parents=True, exist_ok=True)
+            age_file = age_dir / "transcript.jsonl"
+            age_file.write_text('{"step_index": 0, "type": "USER_INPUT"}\n', encoding="utf-8")
+
+            t_30h_ago = time.time() - (30 * 3600)
+            os.utime(age_file, (t_30h_ago, t_30h_ago))
+            needed, reason = bs.check_compaction_needed("conv-age", 1, brain_root=brain_temp)
+            self.assertTrue(needed)
+            self.assertEqual(reason, "session age exceeds 24 hours")
+
+            needed, _ = bs.check_compaction_needed(
+                "conv-age", 1, brain_root=brain_temp, high_water_multiplier=1.5
+            )
+            self.assertFalse(needed)
+
+            t_37h_ago = time.time() - (37 * 3600)
+            os.utime(age_file, (t_37h_ago, t_37h_ago))
+            needed, reason = bs.check_compaction_needed(
+                "conv-age", 1, brain_root=brain_temp, high_water_multiplier=1.5
+            )
+            self.assertTrue(needed)
+            self.assertEqual(reason, "session age exceeds 36 hours")
+
+        # Verify max(max_turns + 1, ...) bump even for small max_turns=1 with small multiplier
+        with patch(
+            "tools.bridge_state.get_runtime_rules",
+            return_value={"compaction_max_turns": 1, "compaction_max_steps": 10, "compaction_max_mb": 0.1},
+        ):
+            needed, _ = bs.check_compaction_needed(None, 1, high_water_multiplier=1.01)
+            self.assertFalse(needed)
+            needed, reason = bs.check_compaction_needed(None, 2, high_water_multiplier=1.01)
+            self.assertTrue(needed)
+            self.assertEqual(reason, "turn count reached 2/2")
+
     async def test_persistent_turn_queue(self):
         q_file = self.temp_path / "test_queue.json"
         turn_q = bs.PersistentTurnQueue(q_file)
