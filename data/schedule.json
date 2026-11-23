@@ -98,9 +98,9 @@
     "interval_seconds": 7200,
     "prompt": "Run the infrastructure heartbeat check using /workspace/tools/sidecars.py heartbeat. Post only if infrastructure is degraded (silent when healthy).",
     "catchup_if_missed": false,
-    "last_run_ts": 1795437951,
-    "last_run_at": "2026-11-23 04:45 AM PT",
-    "next_run_ts": 1795445151.0,
+    "last_run_ts": 1795445168,
+    "last_run_at": "2026-11-23 06:46 AM PT",
+    "next_run_ts": 1795452368.0,
     "channel_id": 1544955535722545253,
     "last_attempt_ts": 1795423523.5018108,
     "last_attempt_at": "2026-11-23 12:45 AM PT",
@@ -271,9 +271,13 @@
     "prompt": "Display the Gemini weekly quota progress bar card using /workspace/tools/sidecars.py quota.",
     "catchup_if_missed": true,
     "catchup_window_seconds": 14400,
-    "last_run_ts": 1795359616,
-    "last_run_at": "2026-11-22 07:00 AM PT",
-    "next_run_ts": 1795446000.0
+    "last_run_ts": 1795446008.7660587,
+    "last_run_at": "2026-11-23 07:00 AM PT",
+    "next_run_ts": 1795532400.0,
+    "last_attempt_ts": 1795446001.8842976,
+    "last_attempt_at": "2026-11-23 07:00 AM PT",
+    "last_success_ts": 1795446008.7660587,
+    "last_success_at": "2026-11-23 07:00 AM PT"
   },
   {
     "id": "daily_birthday_reminder",
@@ -285,9 +289,13 @@
     "prompt": "Check for friend & family birthdays today using /workspace/tools/birthday_reminder.py --quiet. If someone has a birthday today, post the reminder with the interactive text button.",
     "catchup_if_missed": true,
     "catchup_window_seconds": 14400,
-    "last_run_ts": 1795360508,
-    "last_run_at": "2026-11-22 07:15 AM PT",
-    "next_run_ts": 1795446900.0
+    "last_run_ts": 1795446907.7789307,
+    "last_run_at": "2026-11-23 07:15 AM PT",
+    "next_run_ts": 1795533300.0,
+    "last_attempt_ts": 1795446907.66733,
+    "last_attempt_at": "2026-11-23 07:15 AM PT",
+    "last_success_ts": 1795446907.7789307,
+    "last_success_at": "2026-11-23 07:15 AM PT"
   },
   {
     "id": "weekly_social_last_seen_review",
@@ -490,14 +498,14 @@
     "interval_seconds": 300,
     "prompt": "Run the bridge liveness & gateway watchdog check using /workspace/tools/sidecars.py bridge_watchdog. Auto-heals and alerts only if degraded (silent when nominal).",
     "catchup_if_missed": false,
-    "last_run_ts": 1795444567.1619935,
-    "last_run_at": "2026-11-23 06:36 AM PT",
-    "next_run_ts": 1795444867.0,
+    "last_run_ts": 1795447366.5168946,
+    "last_run_at": "2026-11-23 07:22 AM PT",
+    "next_run_ts": 1795447666.0,
     "channel_id": 1544953279664889888,
-    "last_attempt_ts": 1795444566.9788108,
-    "last_attempt_at": "2026-11-23 06:36 AM PT",
-    "last_success_ts": 1795444567.1619935,
-    "last_success_at": "2026-11-23 06:36 AM PT"
+    "last_attempt_ts": 1795447366.3161166,
+    "last_attempt_at": "2026-11-23 07:22 AM PT",
+    "last_success_ts": 1795447366.5168946,
+    "last_success_at": "2026-11-23 07:22 AM PT"
   },
   {
     "id": "pid_watchdog",
@@ -508,13 +516,13 @@
     "channel_id": 1544953279664889888,
     "prompt": "Run the Host 2 and Host 1 PID & process headroom watchdog using /workspace/tools/sidecars.py pid_watchdog. Silent execution unless warning or critical threshold exceeded.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795444567.187258,
-    "last_run_at": "2026-11-23 06:36 AM PT",
-    "next_run_ts": 1795445467.0,
-    "last_attempt_ts": 1795444566.9788108,
-    "last_attempt_at": "2026-11-23 06:36 AM PT",
-    "last_success_ts": 1795444567.187258,
-    "last_success_at": "2026-11-23 06:36 AM PT"
+    "last_run_ts": 1795447289.0025995,
+    "last_run_at": "2026-11-23 07:21 AM PT",
+    "next_run_ts": 1795448188.0,
+    "last_attempt_ts": 1795447288.8412075,
+    "last_attempt_at": "2026-11-23 07:21 AM PT",
+    "last_success_ts": 1795447289.0025995,
+    "last_success_at": "2026-11-23 07:21 AM PT"
   },
   {
     "id": "agora_roguelike_pm",
@@ -800,13 +808,13 @@
     "interval_seconds": 1800,
     "prompt": "Run the Google Tasks two-way sync using /workspace/tools/sidecars.py tasks_sync. Silent sidecar execution (silent unless error).",
     "catchup_if_missed": false,
-    "last_run_ts": 1795444521.4757378,
-    "last_run_at": "2026-11-23 06:35 AM PT",
-    "next_run_ts": 1795446321.0,
-    "last_attempt_ts": 1795444520.5438979,
-    "last_attempt_at": "2026-11-23 06:35 AM PT",
-    "last_success_ts": 1795444521.4757378,
-    "last_success_at": "2026-11-23 06:35 AM PT"
+    "last_run_ts": 1795446331.1047823,
+    "last_run_at": "2026-11-23 07:05 AM PT",
+    "next_run_ts": 1795448131.0,
+    "last_attempt_ts": 1795446330.0721977,
+    "last_attempt_at": "2026-11-23 07:05 AM PT",
+    "last_success_ts": 1795446331.1047823,
+    "last_success_at": "2026-11-23 07:05 AM PT"
   },
   {
     "id": "quota_poller",
@@ -816,13 +824,13 @@
     "interval_seconds": 600,
     "prompt": "Run the 10-minute ground-truth quota usage poller using /workspace/tools/sidecars.py quota_poller. Captures live remaining fractions and cycle burn deltas.",
     "catchup_if_missed": false,
-    "last_run_ts": 1795444381,
-    "last_run_at": "2026-11-23 06:33 AM PT",
-    "next_run_ts": 1795444981.0,
-    "last_attempt_ts": 1795423460.9813504,
-    "last_attempt_at": "2026-11-23 12:44 AM PT",
-    "last_success_ts": 1795423464.4446208,
-    "last_success_at": "2026-11-23 12:44 AM PT"
+    "last_run_ts": 1795447432.5982978,
+    "last_run_at": "2026-11-23 07:23 AM PT",
+    "next_run_ts": 1795448032.0,
+    "last_attempt_ts": 1795447428.4967847,
+    "last_attempt_at": "2026-11-23 07:23 AM PT",
+    "last_success_ts": 1795447432.5982978,
+    "last_success_at": "2026-11-23 07:23 AM PT"
   },
   {
     "id": "personal_data_sync",
@@ -854,13 +862,13 @@
       23,
       7
     ],
-    "last_run_ts": 1795417051.7915657,
-    "last_run_at": "2026-11-22 10:57 PM PT",
-    "next_run_ts": 1795446000.0,
-    "last_attempt_ts": 1795417051.7884486,
-    "last_attempt_at": "2026-11-22 10:57 PM PT",
-    "last_success_ts": 1795417051.7915657,
-    "last_success_at": "2026-11-22 10:57 PM PT"
+    "last_run_ts": 1795447273.4179292,
+    "last_run_at": "2026-11-23 07:21 AM PT",
+    "next_run_ts": 1795447515.875533,
+    "last_attempt_ts": 1795447273.4148037,
+    "last_attempt_at": "2026-11-23 07:21 AM PT",
+    "last_success_ts": 1795447273.4179292,
+    "last_success_at": "2026-11-23 07:21 AM PT"
   },
   {
     "id": "resident_agents_daily_tip",
@@ -1097,13 +1105,13 @@
     "channel_id": 1544953279664889888,
     "prompt": "Run the Seerr media-requests card auto-sync using /workspace/tools/sidecars.py seerr_card_sync.",
     "catchup_if_missed": false,
-    "next_run_ts": 1795445163.0,
-    "last_run_ts": 1795444563.0449417,
-    "last_run_at": "2026-11-23 06:36 AM PT",
-    "last_attempt_ts": 1795444551.5407903,
-    "last_attempt_at": "2026-11-23 06:35 AM PT",
-    "last_success_ts": 1795444563.0449417,
-    "last_success_at": "2026-11-23 06:36 AM PT"
+    "next_run_ts": 1795447607.0,
+    "last_run_ts": 1795447007.8842435,
+    "last_run_at": "2026-11-23 07:16 AM PT",
+    "last_attempt_ts": 1795447001.2962291,
+    "last_attempt_at": "2026-11-23 07:16 AM PT",
+    "last_success_ts": 1795447007.8842435,
+    "last_success_at": "2026-11-23 07:16 AM PT"
   },
   {
     "id": "banana_stand_morning_recap",
