@@ -342,3 +342,169 @@ def test_is_heartbeat_recovery_report():
     assert sidecars.is_heartbeat_recovery_report("") is False
     assert sidecars.is_heartbeat_recovery_report(None) is False
 
+
+def test_summarize_heartbeat_failure_and_recovery_details(monkeypatch, tmp_path):
+    state_file = _setup_heartbeat_env(monkeypatch, tmp_path)
+
+    raw_mcp_failure = (
+        "Persistent MCP Daemon degraded or stopped: "
+        "{'google-workspace': {'running': False, 'healthy': False, 'pid': 101}, "
+        "'home-assistant': {'running': True, 'healthy': True, 'pid': 102}, "
+        "'plex': {'running': False, 'healthy': False}}"
+    )
+    assert sidecars._summarize_heartbeat_failure(raw_mcp_failure) == (
+        "Persistent MCP Daemon (google-workspace, plex)"
+    )
+    assert sidecars._summarize_heartbeat_failure("Persistent MCP Daemon degraded or stopped: {}") == (
+        "Persistent MCP Daemon degraded or stopped"
+    )
+    assert sidecars._summarize_heartbeat_failure("Persistent MCP Daemon degraded or stopped: None") == (
+        "Persistent MCP Daemon degraded or stopped"
+    )
+    assert sidecars._summarize_heartbeat_failure("Persistent MCP Daemon degraded or stopped: {broken_syntax") == (
+        "Persistent MCP Daemon degraded or stopped"
+    )
+    long_failure = "Host1 (198.51.100.10) error: " + ("x" * 200)
+    summarized_long = sidecars._summarize_heartbeat_failure(long_failure)
+    assert len(summarized_long) == 180
+    assert summarized_long.endswith("...")
+
+    past_ts = time.time() - 900.0
+    initial_state = {
+        "degraded": True,
+        "degraded_since_ts": past_ts,
+        "degraded_since_pt": "2026-11-23 05:00 AM PT",
+        "last_failures": [
+            "Home Assistant port `8123` unreachable on Host1 (`198.51.100.10`)",
+            raw_mcp_failure,
+        ],
+        "alert_count": 1,
+    }
+    state_file.write_text(json.dumps(initial_state, indent=2), encoding="utf-8")
+    monkeypatch.setattr(sidecars, "_collect_heartbeat_failures", lambda h1, h2: [])
+
+    healthy, report = sidecars.run_heartbeat_sweep()
+    assert healthy is True
+    assert sidecars.is_heartbeat_recovery_report(report) is True
+    assert "Recovered:" in report
+    assert "- Home Assistant port `8123` unreachable on Host1 (`198.51.100.10`)" in report
+    assert "- Persistent MCP Daemon (google-workspace, plex)" in report
+
+
+def test_heartbeat_update_state_false_and_nightly_triage(monkeypatch, tmp_path):
+    state_file = _setup_heartbeat_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        sidecars,
+        "_collect_heartbeat_failures",
+        lambda h1, h2: ["Dockhand port `3866` unreachable on Host2 (`198.51.100.11`)"],
+    )
+
+    healthy, report = sidecars.run_heartbeat_sweep(update_state=False)
+    assert healthy is False
+    assert "🚨 **Heartbeat Alert — Infrastructure Degraded**" in report
+    assert not state_file.exists()
+
+    # Check run_nightly_triage passes update_state=False
+    observed_kwargs = []
+
+    def fake_sweep(*args, **kwargs):
+        observed_kwargs.append(kwargs)
+        return True, "healthy"
+
+    monkeypatch.setattr(sidecars, "run_heartbeat_sweep", fake_sweep)
+    monkeypatch.setattr(sidecars, "calendar_list_events", lambda *a, **kw: json.dumps({"events": []}))
+    monkeypatch.setattr(sidecars, "gmail_search", lambda *a, **kw: json.dumps({"messages": []}))
+    monkeypatch.setattr(sidecars, "get_sidecar_health_summary", lambda **kw: {"active_failures": [], "latest_by_job": {}})
+    monkeypatch.setattr(sidecars, "nas_docker", lambda *a, **kw: json.dumps({"ok": True, "output": ""}))
+
+    sidecars.run_nightly_triage()
+    assert observed_kwargs == [{"update_state": False}]
+
+
+def test_heartbeat_duplicate_alert_suppression_and_realert(monkeypatch, tmp_path):
+    state_file = _setup_heartbeat_env(monkeypatch, tmp_path)
+    current_failures = ["Home Assistant port `8123` unreachable on Host1 (`198.51.100.10`)"]
+    monkeypatch.setattr(sidecars, "_collect_heartbeat_failures", lambda h1, h2: list(current_failures))
+
+    # 1. Initial failure alerts
+    healthy1, report1 = sidecars.run_heartbeat_sweep()
+    assert healthy1 is False
+    assert "🚨 **Heartbeat Alert — Infrastructure Degraded**" in report1
+    saved1 = json.loads(state_file.read_text(encoding="utf-8"))
+    assert saved1["alert_count"] == 1
+    first_alert_ts = saved1["last_alert_ts"]
+    assert isinstance(first_alert_ts, (int, float))
+
+    # 2. Same failure within HEARTBEAT_REPEAT_ALERT_SECONDS is suppressed
+    healthy2, report2 = sidecars.run_heartbeat_sweep()
+    assert healthy2 is False
+    assert report2 == ""
+    saved2 = json.loads(state_file.read_text(encoding="utf-8"))
+    assert saved2["alert_count"] == 2
+    assert saved2["last_alert_ts"] == first_alert_ts
+
+    # 3. Changed failure triggers immediate re-alert
+    current_failures[:] = [
+        "Home Assistant port `8123` unreachable on Host1 (`198.51.100.10`)",
+        "Plex port `32400` unreachable on Host1 (`198.51.100.10`)",
+    ]
+    healthy3, report3 = sidecars.run_heartbeat_sweep()
+    assert healthy3 is False
+    assert "Plex port `32400` unreachable" in report3
+    saved3 = json.loads(state_file.read_text(encoding="utf-8"))
+    assert saved3["alert_count"] == 3
+
+    # 4. Same failures in different order is suppressed
+    current_failures.reverse()
+    healthy4, report4 = sidecars.run_heartbeat_sweep()
+    assert healthy4 is False
+    assert report4 == ""
+
+    # 5. Elapsed repeat interval triggers re-alert
+    aged_state = json.loads(state_file.read_text(encoding="utf-8"))
+    aged_state["last_alert_ts"] = time.time() - (sidecars.HEARTBEAT_REPEAT_ALERT_SECONDS + 10)
+    state_file.write_text(json.dumps(aged_state, indent=2), encoding="utf-8")
+
+    healthy5, report5 = sidecars.run_heartbeat_sweep()
+    assert healthy5 is False
+    assert "🚨 **Heartbeat Alert — Infrastructure Degraded**" in report5
+
+
+def test_log_execution_heartbeat_degraded_recheck_cadence(monkeypatch, tmp_path):
+    try:
+        import tools.scheduler_tool as sched_mod
+    except ImportError:
+        import scheduler_tool as sched_mod
+
+    log_file = tmp_path / "sidecar_execution_log.json"
+    status_file = tmp_path / "sidecar_status.json"
+    sched_file = tmp_path / "schedule.json"
+
+    monkeypatch.setattr(sidecars, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(sidecars, "EXECUTION_LOG_FILE", log_file)
+    monkeypatch.setattr(sidecars, "EXECUTION_STATUS_FILE", status_file)
+    monkeypatch.setattr(sched_mod, "SCHEDULE_FILE", sched_file)
+
+    initial_jobs = [
+        {
+            "id": "heartbeat_sweep",
+            "name": "Heartbeat Sweep",
+            "schedule_type": "interval",
+            "interval_seconds": 7200,
+            "enabled": True,
+            "next_run_ts": 0,
+        }
+    ]
+    sched_file.write_text(json.dumps(initial_jobs, indent=2), encoding="utf-8")
+
+    # Degraded run schedules 15m (900s) recheck
+    entry_err = sidecars.log_execution("heartbeat", "Heartbeat Sweep", "error", 1.2, summary="Degraded")
+    jobs_after_err = json.loads(sched_file.read_text(encoding="utf-8"))
+    assert jobs_after_err[0]["next_run_ts"] == entry_err["timestamp_epoch"] + sidecars.HEARTBEAT_DEGRADED_RECHECK_SECONDS
+
+    # Healthy run restores normal 2h (7200s) cadence
+    entry_ok = sidecars.log_execution("heartbeat", "Heartbeat Sweep", "ok", 0.8, summary="Healthy")
+    jobs_after_ok = json.loads(sched_file.read_text(encoding="utf-8"))
+    assert jobs_after_ok[0]["next_run_ts"] == entry_ok["timestamp_epoch"] + 7200
+
+

@@ -639,7 +639,7 @@ async def dispatch_scheduled_prompt(
             import tools.sidecars
             importlib.reload(tools.sidecars)
             healthy, report, _ = await _run_sidecar_job_async("heartbeat", "Heartbeat Sweep", tools.sidecars.run_heartbeat_sweep)
-            if bot and (not healthy or tools.sidecars.is_heartbeat_recovery_report(report)):
+            if bot and report and (not healthy or tools.sidecars.is_heartbeat_recovery_report(report)):
                 ch = await get_dest_channel(HOMELAB_CHANNEL_ID)
                 if ch:
                     await ch.send(report)

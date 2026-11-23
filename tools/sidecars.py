@@ -25,6 +25,7 @@ Unified Execution Wrapper:
 - Surfaces recent failures and degraded jobs automatically in the Nightly Briefing.
 """
 
+import ast
 import email.utils
 import html
 import json
@@ -74,6 +75,8 @@ EXECUTION_LOG_FILE = DATA_DIR / "sidecar_execution_log.json"
 EXECUTION_STATUS_FILE = DATA_DIR / "sidecar_status.json"
 HEARTBEAT_STATE_FILE = os.path.join(DATA_DIR, "heartbeat_state.json")
 HEARTBEAT_RETRY_DELAY_SECONDS = 5
+HEARTBEAT_DEGRADED_RECHECK_SECONDS = 900
+HEARTBEAT_REPEAT_ALERT_SECONDS = 7200
 MAX_LOG_ENTRIES = 200
 
 # --------------------------------------------------------------------------
@@ -210,22 +213,49 @@ def log_execution(job_id: str, name: str, status: str, duration_sec: float, summ
 
     # 3. Synchronize schedule.json if BridgeScheduler tracks this sidecar
     try:
-        from scheduler_tool import SIDECAR_ALIASES, load_schedule, save_schedule, calculate_next_run
-        sched_file = DATA_DIR / "schedule.json"
-        if sched_file.exists():
-            jobs = load_schedule()
-            aliases = SIDECAR_ALIASES.get(job_id, [job_id])
-            s_updated = False
-            now_epoch = int(now_pt.timestamp())
-            for j in jobs:
-                jid = j.get("id", "")
-                if jid == job_id or jid in aliases or job_id in SIDECAR_ALIASES.get(jid, []):
-                    j["last_run_ts"] = now_epoch
-                    j["last_run_at"] = now_pt.strftime("%Y-%m-%d %I:%M %p PT")
-                    j["next_run_ts"] = calculate_next_run(j, from_ts=now_epoch)
-                    s_updated = True
-            if s_updated:
-                save_schedule(jobs)
+        sched_mod = sys.modules.get("tools.scheduler_tool") or sys.modules.get("scheduler_tool")
+        if sched_mod is None:
+            try:
+                import tools.scheduler_tool as sched_mod
+            except ImportError:
+                import scheduler_tool as sched_mod
+        SIDECAR_ALIASES = sched_mod.SIDECAR_ALIASES
+        load_schedule = sched_mod.load_schedule
+        save_schedule = sched_mod.save_schedule
+        calculate_next_run = sched_mod.calculate_next_run
+        sched_file = Path(DATA_DIR) / "schedule.json"
+        sched_mod_file = Path(getattr(sched_mod, "SCHEDULE_FILE", sched_file))
+        if sched_file.exists() or sched_mod_file.exists():
+            bs_mod = getattr(sched_mod, "bs", None)
+            orig_bs_data_dir = getattr(bs_mod, "DATA_DIR", None) if bs_mod is not None else None
+            override_bs_dir = (
+                bs_mod is not None
+                and not str(DATA_DIR).startswith("/workspace/data")
+                and str(orig_bs_data_dir).startswith("/workspace/data")
+            )
+            if override_bs_dir:
+                bs_mod.DATA_DIR = Path(DATA_DIR)
+            try:
+                jobs = load_schedule()
+                aliases = SIDECAR_ALIASES.get(job_id, [job_id])
+                s_updated = False
+                now_epoch = int(now_pt.timestamp())
+                for j in jobs:
+                    jid = j.get("id", "")
+                    if jid == job_id or jid in aliases or job_id in SIDECAR_ALIASES.get(jid, []):
+                        j["last_run_ts"] = now_epoch
+                        j["last_run_at"] = now_pt.strftime("%Y-%m-%d %I:%M %p PT")
+                        is_heartbeat = job_id in ("heartbeat", "heartbeat_sweep") or jid in ("heartbeat", "heartbeat_sweep")
+                        if is_heartbeat and status != "ok":
+                            j["next_run_ts"] = now_epoch + HEARTBEAT_DEGRADED_RECHECK_SECONDS
+                        else:
+                            j["next_run_ts"] = calculate_next_run(j, from_ts=now_epoch)
+                        s_updated = True
+                if s_updated:
+                    save_schedule(jobs)
+            finally:
+                if override_bs_dir and orig_bs_data_dir is not None:
+                    bs_mod.DATA_DIR = orig_bs_data_dir
     except Exception:
         pass
 
@@ -514,6 +544,7 @@ def _load_heartbeat_state() -> dict:
         "degraded": False,
         "degraded_since_ts": None,
         "degraded_since_pt": None,
+        "last_alert_ts": None,
         "last_failures": [],
         "alert_count": 0,
     }
@@ -558,6 +589,66 @@ def _format_downtime(seconds: float) -> str:
 def is_heartbeat_recovery_report(report: str) -> bool:
     """Return True if the report is a heartbeat recovery transition alert."""
     return bool(report and report.startswith("🟢 **Heartbeat Recovered"))
+
+
+def _extract_unhealthy_mcp_servers(servers: any) -> list[str]:
+    """Extract unhealthy MCP server names from a servers dict or collection."""
+    if not servers:
+        return []
+    if isinstance(servers, dict):
+        unhealthy: list[str] = []
+        for name, info in servers.items():
+            if isinstance(info, dict):
+                is_healthy = True
+                if "healthy" in info:
+                    is_healthy = bool(info["healthy"])
+                elif "running" in info:
+                    is_healthy = bool(info["running"])
+                elif "status" in info:
+                    is_healthy = str(info["status"]).lower() in ("ok", "healthy", "running", "up")
+                elif "error" in info:
+                    is_healthy = not bool(info["error"])
+                if not is_healthy:
+                    unhealthy.append(str(name))
+            elif isinstance(info, bool):
+                if not info:
+                    unhealthy.append(str(name))
+            elif isinstance(info, str):
+                if info.lower() not in ("ok", "healthy", "running", "up"):
+                    unhealthy.append(str(name))
+            elif not info:
+                unhealthy.append(str(name))
+        return unhealthy
+    if isinstance(servers, (list, tuple, set)):
+        items = sorted(servers) if isinstance(servers, set) else servers
+        return [str(s) for s in items if s]
+    return []
+
+
+def _summarize_heartbeat_failure(failure: str) -> str:
+    """Turn verbose failure strings into concise human-readable summaries (<= 180 chars)."""
+    text = str(failure or "").strip()
+    prefix = "Persistent MCP Daemon degraded or stopped"
+    if text.startswith(f"{prefix}:"):
+        raw_rhs = text[len(prefix) + 1 :].strip()
+        if not raw_rhs or raw_rhs == "None":
+            text = prefix
+        elif raw_rhs.startswith("{"):
+            try:
+                parsed = ast.literal_eval(raw_rhs)
+            except (ValueError, SyntaxError):
+                parsed = None
+            if isinstance(parsed, dict):
+                unhealthy = _extract_unhealthy_mcp_servers(parsed)
+                if unhealthy:
+                    text = f"Persistent MCP Daemon ({', '.join(unhealthy)})"
+                else:
+                    text = prefix
+            else:
+                text = prefix
+    if len(text) > 180:
+        text = text[:177] + "..."
+    return text
 
 
 def _collect_heartbeat_failures(host_1_ip: str, host_2_ip: str) -> list[str]:
@@ -636,7 +727,11 @@ def _collect_heartbeat_failures(host_1_ip: str, host_2_ip: str) -> list[str]:
             ensure_mcp_daemon_running()
             mcp_stat = get_status()
         if not mcp_stat.get("healthy"):
-            failures.append(f"Persistent MCP Daemon degraded or stopped: {mcp_stat.get('servers')}")
+            unhealthy_mcp = _extract_unhealthy_mcp_servers(mcp_stat.get("servers"))
+            if unhealthy_mcp:
+                failures.append(f"Persistent MCP Daemon degraded or stopped ({', '.join(unhealthy_mcp)})")
+            else:
+                failures.append("Persistent MCP Daemon degraded or stopped")
     except Exception as me:
         failures.append(f"Persistent MCP Daemon check failed: {me}")
 
@@ -656,7 +751,7 @@ def _collect_heartbeat_failures(host_1_ip: str, host_2_ip: str) -> list[str]:
     return failures
 
 
-def run_heartbeat_sweep() -> tuple[bool, str]:
+def run_heartbeat_sweep(update_state: bool = True) -> tuple[bool, str]:
     HOST_1_IP, HOST_2_IP, _ = _resolve_nas_config()
     now_dt = datetime.now(PT)
     now_str = now_dt.strftime("%Y-%m-%d %I:%M %p PT")
@@ -673,6 +768,19 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
     except Exception as se:
         log.warning("SLZB-06P7 stable firmware check non-blocking sweep warning: %s", se)
 
+    healthy_summary_msg = (
+        f"🟢 **Heartbeat Sweep Healthy** — {now_str}\n"
+        "All containers, ports, Home Assistant, and external monitors healthy across `.82` and `.84`."
+    )
+
+    if not update_state:
+        if not failures:
+            return True, healthy_summary_msg
+        report = [f"🚨 **Heartbeat Alert — Infrastructure Degraded** [{now_str}]", ""]
+        for f in failures:
+            report.append(f"- ⚠️ {f}")
+        return False, "\n".join(report)
+
     prev_state = _load_heartbeat_state()
     prev_degraded = bool(prev_state.get("degraded", False))
 
@@ -686,10 +794,13 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
             else:
                 downtime_str = "unknown duration"
 
+            prev_failures = prev_state.get("last_failures") or []
+
             cleared_state = {
                 "degraded": False,
                 "degraded_since_ts": None,
                 "degraded_since_pt": None,
+                "last_alert_ts": None,
                 "last_failures": [],
                 "alert_count": 0,
                 "recovered_at_pt": now_str,
@@ -699,29 +810,56 @@ def run_heartbeat_sweep() -> tuple[bool, str]:
             recovery_lines = [
                 f"🟢 **Heartbeat Recovered — Infrastructure Back Online** [{now_str}]",
                 f"Outage detected: {degraded_since_pt} (downtime: ~{downtime_str}).",
-                "All containers, ports, Home Assistant, and external monitors healthy across `.82` and `.84`.",
             ]
+            if prev_failures:
+                recovery_lines.append("Recovered:")
+                for pf in prev_failures:
+                    recovery_lines.append(f"- {_summarize_heartbeat_failure(str(pf))}")
+            recovery_lines.append(
+                "All containers, ports, Home Assistant, and external monitors healthy across `.82` and `.84`."
+            )
             return True, "\n".join(recovery_lines)
 
-        return True, f"🟢 **Heartbeat Sweep Healthy** — {now_str}\nAll containers, ports, Home Assistant, and external monitors healthy across `.82` and `.84`."
+        return True, healthy_summary_msg
 
+    now_ts = time.time()
     if not prev_degraded:
-        new_state = {
-            "degraded": True,
-            "degraded_since_ts": time.time(),
-            "degraded_since_pt": now_str,
-            "alert_count": 1,
-            "last_failures": failures,
-        }
+        should_alert = True
+        degraded_since_ts = now_ts
+        degraded_since_pt = now_str
+        alert_count = 1
+        last_alert_ts = now_ts
     else:
-        new_state = {
-            "degraded": True,
-            "degraded_since_ts": prev_state.get("degraded_since_ts") or time.time(),
-            "degraded_since_pt": prev_state.get("degraded_since_pt") or now_str,
-            "alert_count": int(prev_state.get("alert_count", 0)) + 1,
-            "last_failures": failures,
-        }
+        degraded_since_ts = prev_state.get("degraded_since_ts") or now_ts
+        degraded_since_pt = prev_state.get("degraded_since_pt") or now_str
+        alert_count = int(prev_state.get("alert_count", 0)) + 1
+        prev_failures = prev_state.get("last_failures") or []
+
+        raw_last_alert = prev_state.get("last_alert_ts")
+        if isinstance(raw_last_alert, (int, float)) and raw_last_alert > 0:
+            prev_alert_ts = float(raw_last_alert)
+        elif isinstance(prev_state.get("degraded_since_ts"), (int, float)) and prev_state.get("degraded_since_ts") > 0:
+            prev_alert_ts = float(prev_state["degraded_since_ts"])
+        else:
+            prev_alert_ts = 0.0
+
+        failures_changed = set(failures) != set(prev_failures)
+        repeat_due = (now_ts - prev_alert_ts) >= HEARTBEAT_REPEAT_ALERT_SECONDS
+        should_alert = failures_changed or repeat_due
+        last_alert_ts = now_ts if should_alert else prev_alert_ts
+
+    new_state = {
+        "degraded": True,
+        "degraded_since_ts": degraded_since_ts,
+        "degraded_since_pt": degraded_since_pt,
+        "last_alert_ts": last_alert_ts,
+        "alert_count": alert_count,
+        "last_failures": failures,
+    }
     _save_heartbeat_state(new_state)
+
+    if not should_alert:
+        return False, ""
 
     report = [f"🚨 **Heartbeat Alert — Infrastructure Degraded** [{now_str}]", ""]
     for f in failures:
@@ -959,7 +1097,7 @@ def run_nightly_triage() -> str:
             failure_lines.append(f"- {icon} **{f.get('name')}** (*{f.get('timestamp_pt', 'recent')}*): `{sum_snip}`")
 
     # 4. Infra & Homelab Posture
-    infra_ok, _ = run_heartbeat_sweep()
+    infra_ok, _ = run_heartbeat_sweep(update_state=False)
     sb_res = json.loads(nas_docker("ps", HOST_1_IP))
     bs2_res = json.loads(nas_docker("ps", HOST_2_IP))
     sb_up = sum(1 for line in (sb_res.get("output") or "").splitlines() if "\t" in line and "Up" in line)
