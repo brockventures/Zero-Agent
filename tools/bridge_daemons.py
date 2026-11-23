@@ -62,13 +62,13 @@ DEDICATED_CHANNEL_CONFIGS = {
         "name": "zero-ops",
         "mode": "home",
         "sess_key": str(ZERO_OPS_CHANNEL_ID),
-        "always_warm": False,
+        "always_warm": not is_vulcan_agent(),
     },
     LOUNGE_CHANNEL_ID: {
         "name": "lounge",
         "mode": "external",
         "sess_key": str(LOUNGE_CHANNEL_ID),
-        "always_warm": False,
+        "always_warm": not is_vulcan_agent(),
     },
 }
 

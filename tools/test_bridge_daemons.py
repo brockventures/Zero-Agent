@@ -86,8 +86,14 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(bd.BANANA_STAND_CHANNEL_ID, bd.DEDICATED_CHANNEL_CONFIGS)
         self.assertEqual(bd.BANANA_STAND_CHANNEL_ID, 1534436119888793750)
         self.assertTrue(bd.DEDICATED_CHANNEL_CONFIGS[bs.TARGET_CHANNEL_ID]["always_warm"])
-        self.assertFalse(bd.DEDICATED_CHANNEL_CONFIGS[bd.ZERO_OPS_CHANNEL_ID]["always_warm"])
-        self.assertFalse(bd.DEDICATED_CHANNEL_CONFIGS[bd.LOUNGE_CHANNEL_ID]["always_warm"])
+        self.assertEqual(
+            bd.DEDICATED_CHANNEL_CONFIGS[bd.ZERO_OPS_CHANNEL_ID]["always_warm"],
+            not bs.is_vulcan_agent(),
+        )
+        self.assertEqual(
+            bd.DEDICATED_CHANNEL_CONFIGS[bd.LOUNGE_CHANNEL_ID]["always_warm"],
+            not bs.is_vulcan_agent(),
+        )
 
         # Secondary home channels and random threads should NOT be dedicated
         self.assertFalse(bd.is_dedicated_channel(1544955535722545253))  # homelab
@@ -717,8 +723,8 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
         w_lounge = mgr.get_worker(bd.LOUNGE_CHANNEL_ID)
 
         self.assertTrue(w_chat.always_warm)
-        self.assertFalse(w_ops.always_warm)
-        self.assertFalse(w_lounge.always_warm)
+        self.assertEqual(w_ops.always_warm, not bs.is_vulcan_agent())
+        self.assertEqual(w_lounge.always_warm, not bs.is_vulcan_agent())
 
         # Simulate all three workers running and idle for >1200s
         for idx, w in enumerate((w_chat, w_ops, w_lounge), start=1):
@@ -732,12 +738,19 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
             w.started_at = 1000.0
             w.last_turn_at = 1000.0
 
-        # (b) #zero-chat (TARGET_CHANNEL_ID) is never reaped when idle
+        # (b) always_warm channels (#zero-chat, #zero-ops, #lounge on Zero) are never reaped when idle
         with patch("tools.bridge_daemons.get_process_children", return_value=[]), \
              patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]):
             self.assertFalse(w_chat.is_idle_reapable(now=5000.0, idle_timeout=1200.0))
             self.assertFalse(await w_chat.reap_if_idle(now=5000.0, idle_timeout=1200.0))
             self.assertIsNotNone(w_chat.proc)
+            if not bs.is_vulcan_agent():
+                self.assertFalse(w_ops.is_idle_reapable(now=5000.0, idle_timeout=1200.0))
+                self.assertFalse(w_lounge.is_idle_reapable(now=5000.0, idle_timeout=1200.0))
+
+        # Disable always_warm on secondary workers to exercise the idle reaper and safety guards
+        w_ops.always_warm = False
+        w_lounge.always_warm = False
 
         # Before timeout (e.g. 1199s elapsed), secondary worker is NOT reapable
         with patch("tools.bridge_daemons.get_process_children", return_value=[]), \
