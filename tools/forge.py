@@ -10864,7 +10864,9 @@ def execute_approval_card(
         elif handler == "docker_compose":
             service = str(payload.get("service") or "").strip()
             action = " ".join(str(payload.get("action", "up -d") or "").split())
-            compose_dir = payload.get("compose_dir", "/docker")
+            compose_dir = str(payload.get("compose_dir") or "/docker").strip() or "/docker"
+            compose_file = str(payload.get("compose_file") or "").strip()
+            requested_host = str(payload.get("host") or "").strip()
             if action not in _DOCKER_COMPOSE_ALLOWED_ACTIONS:
                 ok = False
                 receipt = (
@@ -10874,21 +10876,56 @@ def execute_approval_card(
             elif not service or service.startswith("-") or not _DOCKER_COMPOSE_SERVICE_RE.fullmatch(service):
                 ok = False
                 receipt = f"Rejected invalid docker_compose service name `{service}`"
+            elif compose_file and (compose_file.startswith("-") or any(ch in compose_file for ch in "\n\r\x00")):
+                ok = False
+                receipt = f"Rejected invalid docker_compose file path `{compose_file}`"
             else:
                 action_tokens = _DOCKER_COMPOSE_ALLOWED_ACTIONS[action]
-                argv = ["docker", "compose", *action_tokens, service]
+                compose_file_tokens = ["-f", compose_file] if compose_file else []
+                argv = ["docker", "compose", *compose_file_tokens, *action_tokens, service]
                 cmd_display = " ".join(argv)
-                proc = subprocess.run(
-                    argv,
-                    shell=False,
-                    cwd=compose_dir,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-                ok = proc.returncode == 0
-                receipt = f"`{cmd_display}` succeeded" if ok else f"`{cmd_display}` failed: {proc.stderr[:160]}"
+                use_local_docker = bool(shutil.which("docker")) and not requested_host
+                if use_local_docker:
+                    proc = subprocess.run(
+                        argv,
+                        shell=False,
+                        cwd=compose_dir,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    ok = proc.returncode == 0
+                    receipt = f"`{cmd_display}` succeeded" if ok else f"`{cmd_display}` failed: {proc.stderr[:160]}"
+                else:
+                    import shlex
+                    from tools import nas_config
+
+                    host_key = requested_host.lower()
+                    if host_key in ("host1", "host_1", "nas1"):
+                        target_host = nas_config.HOST_1_IP
+                    elif host_key in ("", "host2", "host_2", "nas2"):
+                        target_host = nas_config.HOST_2_IP
+                    else:
+                        target_host = requested_host
+
+                    quoted_argv = " ".join(shlex.quote(tok) for tok in argv)
+                    remote_cmd = f"export PATH=/usr/local/bin:$PATH && cd {shlex.quote(compose_dir)} && {quoted_argv}"
+                    prev_approved = os.environ.get("FORGE_APPROVED_CARD_EXECUTION")
+                    os.environ["FORGE_APPROVED_CARD_EXECUTION"] = "1"
+                    try:
+                        rc, _stdout, stderr = nas_config.run_ssh(target_host, remote_cmd, timeout=60)
+                    finally:
+                        if prev_approved is None:
+                            os.environ.pop("FORGE_APPROVED_CARD_EXECUTION", None)
+                        else:
+                            os.environ["FORGE_APPROVED_CARD_EXECUTION"] = prev_approved
+                    ok = rc == 0
+                    receipt = (
+                        f"`{cmd_display}` succeeded via SSH"
+                        if ok
+                        else f"`{cmd_display}` failed via SSH (exit {rc}): {(stderr or '')[:160]}"
+                    )
 
         elif handler == "gh_merge":
             pr_num = int(payload["pr_number"])

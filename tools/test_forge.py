@@ -4569,6 +4569,7 @@ def test_execute_approval_card_passes_forge_approved_card_execution_env(tmp_path
         return m
 
     monkeypatch.setattr(forge_mod.subprocess, "run", _capture_subproc_run)
+    monkeypatch.setattr(forge_mod.shutil, "which", lambda cmd: "/usr/bin/docker" if cmd == "docker" else None)
 
     d_compose = forge_mod.stage_decision(
         category="homelab",
@@ -5299,6 +5300,7 @@ def test_docker_compose_handler_rejects_shell_injection_and_uses_shell_false(tmp
         return m
 
     monkeypatch.setattr(forge_mod.subprocess, "run", _fake_run)
+    monkeypatch.setattr(forge_mod.shutil, "which", lambda cmd: "/usr/bin/docker" if cmd == "docker" else None)
 
     # 1. Legitimate allowlisted actions execute via shell=False with explicit argv list
     for action, expected_tokens in (
@@ -5349,6 +5351,65 @@ def test_docker_compose_handler_rejects_shell_injection_and_uses_shell_false(tmp
         assert res_bad["ok"] is False, f"Expected payload {bad_payload} to be rejected"
         assert res_bad["status"] == "failed"
     assert len(calls) == calls_before, "subprocess.run must never be invoked for rejected docker_compose payloads"
+
+
+def test_docker_compose_handler_falls_back_to_host2_ssh_when_docker_absent(tmp_path, monkeypatch):
+    import tools.forge as forge_mod
+    import tools.nas_config as nas_config_mod
+
+    db_path = tmp_path / "forge_dc_ssh.db"
+    forge_mod.init_forge_db(db_path)
+
+    ssh_calls = []
+
+    def _fake_run_ssh(host, remote_cmd, timeout=120, **kwargs):
+        ssh_calls.append((host, remote_cmd, timeout, os.environ.get("FORGE_APPROVED_CARD_EXECUTION")))
+        return 0, "started", ""
+
+    monkeypatch.setattr(forge_mod.shutil, "which", lambda _cmd: None)
+    monkeypatch.setattr(nas_config_mod, "HOST_2_IP", "198.51.100.84")
+    monkeypatch.setattr(nas_config_mod, "HOST_1_IP", "198.51.100.82")
+    monkeypatch.setattr(nas_config_mod, "run_ssh", _fake_run_ssh)
+
+    d_ok = forge_mod.stage_decision(
+        category="homelab",
+        title="Restart Baseball Stack",
+        summary="Approving restarts baseball worker on Host 2 via SSH fallback.",
+        handler_type="docker_compose",
+        payload={
+            "service": "baseball_worker",
+            "action": "up -d",
+            "compose_dir": "/opt/stacks/baseball",
+            "compose_file": "docker-compose.yml",
+        },
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    res_ok = forge_mod.execute_decision(d_ok["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_path)
+    assert res_ok["ok"] is True
+    assert "via SSH" in res_ok["receipt"]
+    assert os.environ.get("FORGE_APPROVED_CARD_EXECUTION") is None
+    assert len(ssh_calls) == 1
+    host_called, cmd_called, timeout_called, approved_flag = ssh_calls[0]
+    assert host_called == "198.51.100.84"
+    assert timeout_called == 60
+    assert approved_flag == "1"
+    assert "cd /opt/stacks/baseball" in cmd_called
+    assert "docker compose -f docker-compose.yml up -d baseball_worker" in cmd_called
+
+    # Disallowed actions and invalid service names must still be rejected before SSH
+    d_bad = forge_mod.stage_decision(
+        category="homelab",
+        title="Bad Compose Action",
+        summary="Approving must reject disallowed action.",
+        handler_type="docker_compose",
+        payload={"service": "baseball; id", "action": "restart", "compose_dir": "/opt/stacks/baseball"},
+        channel_id=forge_mod.ZERO_CHAT_CHANNEL_ID,
+        db_path=db_path,
+    )
+    res_bad = forge_mod.execute_decision(d_bad["decision_id"], user_id=forge_mod.OWNER_USER_ID, db_path=db_path)
+    assert res_bad["ok"] is False
+    assert len(ssh_calls) == 1
 
 
 def test_dismiss_decision_cas_guard_and_stale_executing_recovery(tmp_path):
