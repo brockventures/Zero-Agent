@@ -1769,7 +1769,7 @@ def test_stream_failover_and_tts_use_non_deprecated_models(monkeypatch):
     assert attempted_models == ["gemini-3.8-flash", "gemini-3.1-flash-lite-preview"]
     assert all("2.5-flash" not in m and "2.0-flash" not in m for m in attempted_models)
 
-    # Verify create_zero_gotchi_app defaults cfg.tts_model to gemini-3.1-flash-tts-preview
+    # Verify create_zero_gotchi_app defaults cfg.tts_model to gemini-3.8-flash-lite-tts
     monkeypatch.delenv("GOTCHI_TTS_ENGINE", raising=False)
     monkeypatch.delenv("GOTCHI_TTS_MODEL", raising=False)
     monkeypatch.delenv("MVG_TTS", raising=False)
@@ -1788,7 +1788,7 @@ def test_stream_failover_and_tts_use_non_deprecated_models(monkeypatch):
     monkeypatch.setattr(llm_cfg_mod.LLMConfig, "from_env_or_file", _wrapped_from_env)
     create_zero_gotchi_app(adapter=adapter, live_mode_enabled=False)
     assert len(captured_cfgs) == 1
-    assert captured_cfgs[0].tts_model == "gemini-3.1-flash-tts-preview"
+    assert captured_cfgs[0].tts_model == "gemini-3.8-flash-lite-tts"
     assert "2.5-flash" not in captured_cfgs[0].tts_model
     shutdown_lomin_background_workers(timeout_s=0.5)
 

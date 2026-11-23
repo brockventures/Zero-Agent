@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ruff: noqa: B023, BLE001, FURB167, I001, PIE810, PLW1510, S110, S112, SIM102, SIM103, UP006, UP035, UP045
+# ruff: noqa: B023, BLE001, EXE001, FURB167, I001, PIE810, PLW1510, S110, S112, SIM102, SIM103, UP006, UP035, UP045
 """
 gotchi_zero_adapter.py — Unified Zero Brain, Artifact Handoff & Transcript Adapter for GOTCHI
 =============================================================================================
@@ -5541,7 +5541,7 @@ def create_zero_gotchi_app(
     ):
         cfg.tts_engine = os.environ.get("MVG_TTS", "gemini") or "gemini"
         if "GOTCHI_TTS_MODEL" not in os.environ:
-            cfg.tts_model = "gemini-3.1-flash-tts-preview"
+            cfg.tts_model = "gemini-3.8-flash-lite-tts"
     if "GOTCHI_FILLER_DELAY_MS" not in os.environ:
         cfg.filler_delay_ms = 0
     if "GOTCHI_SECOND_FILLER_DELAY_MS" not in os.environ:
