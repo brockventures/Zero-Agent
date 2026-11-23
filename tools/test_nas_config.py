@@ -278,6 +278,7 @@ def test_host_docker_roots_separate_host1_vol1_and_host2_vol2(monkeypatch):
     monkeypatch.delenv("NAS_DOCKER_ROOT", raising=False)
     monkeypatch.delenv("NAS_HOST_1_DOCKER_ROOT", raising=False)
     monkeypatch.delenv("NAS_HOST_2_DOCKER_ROOT", raising=False)
+    monkeypatch.setattr(nas_config.os.path, "exists", lambda p: p != "/secrets/env.json")
     reloaded = _load_local_module("nas_config")
     expected_h1 = posixpath.join(VOL1_ROOT, "docker")
     expected_h2 = posixpath.join(VOL2_ROOT, "docker")
@@ -289,3 +290,124 @@ def test_host_docker_roots_separate_host1_vol1_and_host2_vol2(monkeypatch):
     blocked, reason = reloaded.validate_remote_ssh_command(f"rm -rf {expected_h2}")
     assert blocked is False
     assert "NAS SSH Command Filter Blocked" in reason
+
+
+def test_resolve_nas_config_env_and_secrets_precedence_with_empty_fallback(monkeypatch, tmp_path):
+    """Verify resolve_nas_config preserves 5-tuple, reads env.json, lets env override, and ignores empty strings."""
+    import json
+
+    secrets_file = tmp_path / "env.json"
+    secrets_file.write_text(
+        json.dumps(
+            {
+                "NAS_HOST_1_IP": "198.51.100.82",
+                "NAS_HOST_2_IP": "198.51.100.84",
+                "NAS_DOCKER_ROOT": posixpath.join(VOL1_ROOT, "custom-h1"),
+                "NAS_HOST_2_DOCKER_ROOT": posixpath.join(VOL2_ROOT, "custom-h2"),
+                "NAS_HOST_2_NAME": "AppHost02",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    real_exists = nas_config.os.path.exists
+    real_open = open
+
+    def _fake_exists(p):
+        if p == "/secrets/env.json":
+            return True
+        if p == "/secrets/ha.json":
+            return False
+        return real_exists(p)
+
+    def _fake_open(p, *args, **kwargs):
+        if p == "/secrets/env.json":
+            return real_open(secrets_file, *args, **kwargs)
+        return real_open(p, *args, **kwargs)
+
+    monkeypatch.setattr(nas_config.os.path, "exists", _fake_exists)
+    monkeypatch.setattr("builtins.open", _fake_open)
+    monkeypatch.setenv("NAS_HOST_1_DOCKER_ROOT", "")
+    monkeypatch.setenv("NAS_DOCKER_ROOT", "")
+    monkeypatch.setenv("NAS_HOST_2_DOCKER_ROOT", posixpath.join(VOL2_ROOT, "override-h2"))
+
+    res = nas_config.resolve_nas_config()
+    assert isinstance(res, tuple) and len(res) == 5
+    assert res[0] == "198.51.100.82"
+    assert res[1] == "198.51.100.84"
+    assert nas_config.os.environ["NAS_DOCKER_ROOT"] == posixpath.join(VOL1_ROOT, "custom-h1")
+    assert nas_config.os.environ["NAS_HOST_1_DOCKER_ROOT"] == posixpath.join(VOL1_ROOT, "custom-h1")
+    assert nas_config.os.environ["NAS_HOST_2_DOCKER_ROOT"] == posixpath.join(VOL2_ROOT, "override-h2")
+    assert nas_config.os.environ["NAS_HOST_2_NAME"] == "AppHost02"
+
+
+def test_get_docker_root_host_routing(monkeypatch):
+    """Verify get_docker_root routes Host 2 identifiers to HOST_2_DOCKER_ROOT and safely handles None/empty."""
+    h1_root = posixpath.join(VOL1_ROOT, "docker")
+    h2_root = posixpath.join(VOL2_ROOT, "docker")
+    monkeypatch.setattr(nas_config, "DOCKER_ROOT", h1_root)
+    monkeypatch.setattr(nas_config, "HOST_1_DOCKER_ROOT", h1_root)
+    monkeypatch.setattr(nas_config, "HOST_2_DOCKER_ROOT", h2_root)
+    monkeypatch.setattr(nas_config, "HOST_1_IP", "198.51.100.82")
+    monkeypatch.setattr(nas_config, "HOST_2_IP", "203.0.113.50")
+    monkeypatch.setenv("NAS_HOST_2_IP", "203.0.113.50")
+    monkeypatch.setenv("NAS_HOST_2_NAME", "AppHost02")
+
+    assert nas_config.get_docker_root(None) == h1_root
+    assert nas_config.get_docker_root("") == h1_root
+    assert nas_config.get_docker_root("   ") == h1_root
+    assert nas_config.get_docker_root("198.51.100.82") == h1_root
+    assert nas_config.get_docker_root("host1") == h1_root
+
+    assert nas_config.get_docker_root("203.0.113.50") == h2_root
+    assert nas_config.get_docker_root("198.51.100.84") == h2_root
+    assert nas_config.get_docker_root("host2") == h2_root
+    assert nas_config.get_docker_root("HOST2") == h2_root
+    assert nas_config.get_docker_root("host_2") == h2_root
+    assert nas_config.get_docker_root("apphost02") == h2_root
+
+
+def test_volume2_recursive_delete_and_du_guards(monkeypatch):
+    """Verify Volume 2 paths and Host 1/2 Docker root env vars are guarded symmetrically against rm -rf and du."""
+    monkeypatch.delenv("FORGE_APPROVED_CARD_EXECUTION", raising=False)
+    custom_h2 = posixpath.join(VOL2_ROOT, "nvme-docker")
+    monkeypatch.setenv("NAS_HOST_2_DOCKER_ROOT", custom_h2)
+
+    blocked_rm = [
+        f"rm -rf {posixpath.join(VOL2_ROOT, 'docker')}",
+        f"rm -rf {posixpath.join(VOL2_ROOT, 'docker')}/*",
+        f"rm -rf {custom_h2}",
+        "rm -rf $NAS_HOST_2_DOCKER_ROOT",
+        "rm -rf ${NAS_HOST_2_DOCKER_ROOT}/",
+        "rm -rf $NAS_HOST_2_DOCKER_ROOT/*",
+        "rm -rf $HOST_2_DOCKER_ROOT",
+        "rm -rf ${HOST_2_DOCKER_ROOT}/..",
+        "rm -rf $NAS_HOST_1_DOCKER_ROOT",
+        "rm -rf $HOST_1_DOCKER_ROOT",
+    ]
+    for cmd in blocked_rm:
+        allowed, reason = nas_config.validate_remote_ssh_command(cmd)
+        assert allowed is False, f"Expected rm -rf to be blocked: {cmd}"
+        assert "NAS SSH Command Filter Blocked" in reason
+
+    allowed_rm = [
+        f"rm -rf {posixpath.join(VOL2_ROOT, 'docker', 'hearth', 'tmp')}",
+        "rm -rf $NAS_HOST_2_DOCKER_ROOT/hearth",
+        "rm -rf ${HOST_2_DOCKER_ROOT}/discord-ivy-agent/cache",
+    ]
+    for cmd in allowed_rm:
+        allowed, reason = nas_config.validate_remote_ssh_command(cmd)
+        assert allowed is True, f"Expected safe sub-path rm -rf to be allowed: {cmd} ({reason})"
+
+    blocked_du = [
+        f"du -sh {posixpath.join(VOL2_ROOT, 'docker')}",
+        "du -sh $NAS_HOST_2_DOCKER_ROOT",
+        "du -sh ${NAS_HOST_2_DOCKER_ROOT}/discord-ivy-agent",
+        "du -sh $HOST_2_DOCKER_ROOT",
+        "du -sh $NAS_HOST_1_DOCKER_ROOT",
+        "du -sh ${HOST_1_DOCKER_ROOT}/app",
+    ]
+    for cmd in blocked_du:
+        allowed, reason = nas_config.validate_remote_ssh_command(cmd)
+        assert allowed is False, f"Expected du walk to be blocked: {cmd}"
+        assert "NAS SSH Command Filter Blocked" in reason
