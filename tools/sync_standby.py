@@ -21,7 +21,7 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT / "tools"))
 
-from nas_config import DOCKER_ROOT, HOST_2_IP as HOST2_IP, SSH_KEY, SSH_PORT, SSH_USER as HOST2_USER
+from nas_config import HOST_2_DOCKER_ROOT, HOST_2_IP as HOST2_IP, SSH_KEY, SSH_PORT, SSH_USER as HOST2_USER
 
 TIMESTAMP_FILE = WORKSPACE_ROOT / "data" / "last_standby_sync.json"
 SSH_KEY_PATH = Path(SSH_KEY)
@@ -129,14 +129,23 @@ def sync_host2_snapshot() -> int:
         return 0
 
     # Build tar command for whitelisted targets
-    # -h dereferences symlinks so local Windows receives full files
-    targets = ["memory"] + WHITELISTED_DATA_FILES
-    targets_str = " ".join(targets)
-    base_dir = f"{DOCKER_ROOT.rstrip('/')}/discord-agy-agent"
+    # -h dereferences symlinks so local Windows receives full files.
+    # Note: on Host 2, memory/ is bind-mounted separately from workspace/ into the container,
+    # so archive {base_dir}/memory alongside existing workspace data/config files.
+    data_targets_str = " ".join(WHITELISTED_DATA_FILES)
+    base_dir = f"{HOST_2_DOCKER_ROOT.rstrip('/')}/discord-agy-agent"
     tar_cmd = (
-        f"if [ -d {base_dir}/workspace/memory ]; then "
-        f"tar -czh -C {base_dir}/workspace {targets_str} 2>/dev/null; "
-        f"else tar -czh -C {base_dir} {targets_str} 2>/dev/null; fi"
+        f"args=''; "
+        f"if [ -d {base_dir}/memory ] && [ -n \"$(ls -A {base_dir}/memory 2>/dev/null)\" ]; then "
+        f"args=\"$args -C {base_dir} memory\"; "
+        f"elif [ -d {base_dir}/workspace/memory ]; then "
+        f"args=\"$args -C {base_dir}/workspace memory\"; fi; "
+        f"ws_files=''; "
+        f"for f in {data_targets_str}; do "
+        f"if [ -e \"{base_dir}/workspace/$f\" ]; then ws_files=\"$ws_files $f\"; fi; "
+        f"done; "
+        f"if [ -n \"$ws_files\" ]; then args=\"$args -C {base_dir}/workspace $ws_files\"; fi; "
+        f"if [ -n \"$args\" ]; then tar -czh $args 2>/dev/null; fi"
     )
 
     t0 = time.time()

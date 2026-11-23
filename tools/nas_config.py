@@ -8,6 +8,8 @@ or /secrets/env.json & /secrets/ha.json. Enforces default-deny IP sanitization f
 commit safety while providing reliable runtime networking.
 """
 
+from __future__ import annotations
+
 import base64
 import json
 import os
@@ -114,7 +116,18 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
 
     h1 = host_1 or "127.0.0.1"
     h2 = host_2 or "127.0.0.1"
-    docker_root = os.environ.get("NAS_DOCKER_ROOT", os.path.join("/volume1", "docker"))
+    default_h1_docker = posixpath.join("/volume1", "docker")
+    default_h2_docker = posixpath.join("/volume2", "docker")
+    host_1_docker_root = (
+        os.environ.get("NAS_HOST_1_DOCKER_ROOT")
+        or os.environ.get("NAS_DOCKER_ROOT")
+        or default_h1_docker
+    ).replace("\\", "/")
+    host_2_docker_root = (
+        os.environ.get("NAS_HOST_2_DOCKER_ROOT")
+        or default_h2_docker
+    ).replace("\\", "/")
+    docker_root = host_1_docker_root
 
     # Export to environment so any child processes spawned via subprocess inherit them automatically
     os.environ["NAS_HOST_1_IP"] = h1
@@ -123,6 +136,8 @@ def resolve_nas_config() -> Tuple[str, str, str, str, str]:
     os.environ["NAS_SSH_USER"] = ssh_user
     os.environ["NAS_SSH_KEY"] = ssh_key
     os.environ["NAS_DOCKER_ROOT"] = docker_root
+    os.environ["NAS_HOST_1_DOCKER_ROOT"] = host_1_docker_root
+    os.environ["NAS_HOST_2_DOCKER_ROOT"] = host_2_docker_root
 
     return h1, h2, ssh_port, ssh_user, ssh_key
 
@@ -133,7 +148,13 @@ def _resolve_nas_config() -> Tuple[str, str, str]:
 
 # Initialize on import
 HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
-DOCKER_ROOT = os.environ.get("NAS_DOCKER_ROOT", os.path.join("/volume1", "docker"))
+HOST_1_DOCKER_ROOT = os.environ.get(
+    "NAS_HOST_1_DOCKER_ROOT", posixpath.join("/volume1", "docker")
+).replace("\\", "/")
+HOST_2_DOCKER_ROOT = os.environ.get(
+    "NAS_HOST_2_DOCKER_ROOT", posixpath.join("/volume2", "docker")
+).replace("\\", "/")
+DOCKER_ROOT = os.environ.get("NAS_DOCKER_ROOT", HOST_1_DOCKER_ROOT).replace("\\", "/")
 
 def build_ssh_cmd(
     host: str,
@@ -414,15 +435,22 @@ def _is_protected_nas_recursive_delete_target(raw_target: str, active_cwd: str |
         return True, f"system root directory ('{raw_target}')"
 
     default_vol_docker = posixpath.join("/volume1", "docker")
+    default_vol2_docker = posixpath.join("/volume2", "docker")
     default_vol_data = posixpath.join("/volume1", "data")
     configured_docker_root = (os.environ.get("NAS_DOCKER_ROOT") or DOCKER_ROOT or default_vol_docker).strip()
+    configured_h2_docker_root = (
+        os.environ.get("NAS_HOST_2_DOCKER_ROOT") or HOST_2_DOCKER_ROOT or default_vol2_docker
+    ).strip()
     protected_top_dirs = {
         posixpath.normpath(default_vol_docker),
+        posixpath.normpath(default_vol2_docker),
         posixpath.normpath(default_vol_data),
         "/docker",
     }
     if configured_docker_root.startswith("/"):
         protected_top_dirs.add(posixpath.normpath(configured_docker_root))
+    if configured_h2_docker_root.startswith("/"):
+        protected_top_dirs.add(posixpath.normpath(configured_h2_docker_root))
 
     for droot in protected_top_dirs:
         if droot == "/":

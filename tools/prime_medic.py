@@ -32,14 +32,23 @@ TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from nas_config import DOCKER_ROOT, HOST_1_IP, HOST_2_IP, SSH_KEY, SSH_PORT, SSH_USER, run_ssh
+from nas_config import (
+    HOST_1_DOCKER_ROOT,
+    HOST_1_IP,
+    HOST_2_DOCKER_ROOT,
+    HOST_2_IP,
+    SSH_KEY,
+    SSH_PORT,
+    SSH_USER,
+    run_ssh,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-PRIME_HOST_DIR = f"{DOCKER_ROOT.rstrip('/')}/discord-agy-agent"
+PRIME_HOST_DIR = f"{HOST_2_DOCKER_ROOT.rstrip('/')}/discord-agy-agent"
 PRIME_DIR = f"{PRIME_HOST_DIR}/workspace"
 PRIME_CONTAINER = "discord-antigravity-agent"
 IVY_CONTAINER = "discord-ivy-agent"
@@ -65,8 +74,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("==========================================================")
     print("  ZERO PRIME MEDIC - LIVE TELEMETRY & DIAGNOSTIC REPORT")
     print("==========================================================")
-    print(f"Target Host 2 (Zero Prime): {HOST_2_IP}:{SSH_PORT} (user: {SSH_USER})")
-    print(f"Target Host 1 (Main NAS):   {HOST_1_IP}:{SSH_PORT}")
+    print(f"Target Host 2 (Zero Prime): {HOST_2_IP}:{SSH_PORT} (user: {SSH_USER}, docker_root: {HOST_2_DOCKER_ROOT})")
+    print(f"Target Host 1 (Main NAS):   {HOST_1_IP}:{SSH_PORT} (docker_root: {HOST_1_DOCKER_ROOT})")
     print(f"SSH Key:                    {SSH_KEY}")
 
     # 1. Host 2 SSH + Container + Queue + Disk Log Single-Shot Probe
@@ -75,7 +84,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 export PATH=/usr/local/bin:$PATH
 echo "--- UPTIME & DISK ---"
 uptime
-df -h | grep -E "volume1|$" | tail -n 2
+df -h /volume1 /volume2 2>/dev/null || df -h | grep -E "volume[12]|$" | tail -n 3
 
 echo "--- CONTAINERS ---"
 docker ps -a --filter "name=discord-" --format "{{{{.Names}}}} | {{{{.Status}}}} | {{{{.RunningFor}}}}"
@@ -189,8 +198,7 @@ def cmd_restart(args: argparse.Namespace) -> int:
     if args.compose and target == PRIME_CONTAINER:
         remote_cmd = f"""
 export PATH=/usr/local/bin:$PATH
-cd {PRIME_HOST_DIR}
-docker compose up -d --force-recreate
+docker compose -f {PRIME_HOST_DIR}/docker-compose.yml up -d --no-build --force-recreate antigravity-agent
 sleep 3
 docker inspect -f "Status={{{{.State.Status}}}} Running={{{{.State.Running}}}} StartedAt={{{{.State.StartedAt}}}}" {target}
 """

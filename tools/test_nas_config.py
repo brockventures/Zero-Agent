@@ -271,3 +271,21 @@ def test_validate_remote_ssh_command_blocks_unbounded_du_direct_and_base64(monke
     monkeypatch.setenv("FORGE_APPROVED_CARD_EXECUTION", "1")
     allowed_approved, _ = nas_config.validate_remote_ssh_command(f"du -sh {agent_dir}")
     assert allowed_approved is True
+
+
+def test_host_docker_roots_separate_host1_vol1_and_host2_vol2(monkeypatch):
+    """Verify Host 1 defaults to Volume 1 docker root while Host 2 defaults to Volume 2 docker root with POSIX slashes."""
+    monkeypatch.delenv("NAS_DOCKER_ROOT", raising=False)
+    monkeypatch.delenv("NAS_HOST_1_DOCKER_ROOT", raising=False)
+    monkeypatch.delenv("NAS_HOST_2_DOCKER_ROOT", raising=False)
+    reloaded = _load_local_module("nas_config")
+    expected_h1 = posixpath.join(VOL1_ROOT, "docker")
+    expected_h2 = posixpath.join(VOL2_ROOT, "docker")
+    assert reloaded.HOST_1_DOCKER_ROOT == expected_h1
+    assert reloaded.DOCKER_ROOT == expected_h1
+    assert reloaded.HOST_2_DOCKER_ROOT == expected_h2
+    assert "\\" not in reloaded.HOST_1_DOCKER_ROOT
+    assert "\\" not in reloaded.HOST_2_DOCKER_ROOT
+    blocked, reason = reloaded.validate_remote_ssh_command(f"rm -rf {expected_h2}")
+    assert blocked is False
+    assert "NAS SSH Command Filter Blocked" in reason
