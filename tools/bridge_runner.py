@@ -124,6 +124,7 @@ async def execute_agy_turn(
     is_physical_mention: bool = False,
     model_override: str | None = None,
     pre_settle_text: str | None = None,
+    is_ambient_chime_in: bool = False,
 ):
     """Execute a single agy CLI turn with streaming status and output delivery."""
     global active_proc, active_master_fd, ext_active_proc, ext_active_master_fd, reset_session_keys
@@ -154,6 +155,7 @@ async def execute_agy_turn(
                     is_settle_reinvocation=is_settle_reinvocation,
                     is_physical_mention=is_physical_mention,
                     pre_settle_text=pre_settle_text,
+                    is_ambient_chime_in=is_ambient_chime_in,
                 )
             except Exception as pe:
                 if channel_id in steering_channels:
@@ -674,5 +676,6 @@ async def execute_agy_turn(
         last_word_streak=last_word_streak,
         is_physical_mention=is_physical_mention,
         timer=timer,
+        is_ambient_chime_in=is_ambient_chime_in,
     )
     channel_active_reply_targets.pop(channel_id, None)

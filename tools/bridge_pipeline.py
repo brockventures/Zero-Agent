@@ -857,6 +857,7 @@ async def deliver_turn_output(
     timer: TurnTimer | None = None,
     existing_messages: list[discord.Message] | None = None,
     bot: Any = None,
+    is_ambient_chime_in: bool = False,
 ) -> list[discord.Message]:
     """Unified Discord response delivery engine across persistent daemons and dynamic turns."""
     if timer:
@@ -924,6 +925,24 @@ async def deliver_turn_output(
         output_text_clean = "⚠️ **Turn Incomplete:** Agent process completed turn without generating text output."
     else:
         output_text_clean = initial_cls.text
+
+    if mode == "external" and is_ambient_chime_in and not is_physical_mention:
+        from tools.bridge_ambient import should_suppress_ambient_reply
+
+        if should_suppress_ambient_reply(initial_cls.text, is_ambient_chime_in=True):
+            return await _suppress_turn_delivery(
+                status_msg=status_msg,
+                reply_target=reply_target,
+                mode=mode,
+                channel_id=channel_id,
+                is_home=is_home,
+                is_last_word=is_last_word,
+                last_word_bot_id=last_word_bot_id,
+                last_word_bot_name=last_word_bot_name,
+                last_word_streak=last_word_streak,
+                timer=timer,
+                log_reason=f"[BridgePipeline] Suppressed bare-agreement ambient reply in external channel {channel_id}: {initial_cls.text!r}",
+            )
 
     final_text = format_for_discord(output_text_clean)
 
@@ -1001,6 +1020,24 @@ async def deliver_turn_output(
                 log_reason=f"[BridgePipeline] Suppressed empty, [NO_REPLY], or placeholder in external channel {channel_id}",
             )
         clean_ext_text = post_ext_cls.text
+
+        if is_ambient_chime_in and not is_physical_mention:
+            from tools.bridge_ambient import should_suppress_ambient_reply
+
+            if should_suppress_ambient_reply(clean_ext_text, is_ambient_chime_in=True):
+                return await _suppress_turn_delivery(
+                    status_msg=status_msg,
+                    reply_target=reply_target,
+                    mode=mode,
+                    channel_id=channel_id,
+                    is_home=is_home,
+                    is_last_word=is_last_word,
+                    last_word_bot_id=last_word_bot_id,
+                    last_word_bot_name=last_word_bot_name,
+                    last_word_streak=last_word_streak,
+                    timer=timer,
+                    log_reason=f"[BridgePipeline] Suppressed bare-agreement ambient reply in external channel {channel_id}: {clean_ext_text!r}",
+                )
 
         try:
             from tools.channel_history import record_message

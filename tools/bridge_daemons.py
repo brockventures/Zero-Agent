@@ -490,6 +490,7 @@ class PersistentChannelWorker:
         is_settle_reinvocation: bool = False,
         is_physical_mention: bool = False,
         pre_settle_text: str | None = None,
+        is_ambient_chime_in: bool = False,
         **kwargs,
     ):
         """Execute a conversational turn on the persistent warm worker via stdin/stdout streaming."""
@@ -512,6 +513,7 @@ class PersistentChannelWorker:
                 is_settle_reinvocation=True,
                 is_physical_mention=is_physical_mention,
                 pre_settle_text=pre_settle_text,
+                is_ambient_chime_in=is_ambient_chime_in,
             )
 
         async with self.lock:
@@ -533,6 +535,7 @@ class PersistentChannelWorker:
                 is_settle_reinvocation=False,
                 is_physical_mention=is_physical_mention,
                 pre_settle_text=pre_settle_text,
+                is_ambient_chime_in=is_ambient_chime_in,
             )
         self._schedule_post_turn_compaction()
         return result
@@ -556,6 +559,7 @@ class PersistentChannelWorker:
         is_settle_reinvocation: bool = False,
         is_physical_mention: bool = False,
         pre_settle_text: str | None = None,
+        is_ambient_chime_in: bool = False,
     ):
         from tools.bridge_runner import (
             steering_channels,
@@ -832,6 +836,7 @@ class PersistentChannelWorker:
             last_word_streak=last_word_streak,
             is_physical_mention=is_physical_mention,
             timer=timer,
+            is_ambient_chime_in=is_ambient_chime_in,
         )
         return final_text
 

@@ -7,6 +7,7 @@ Exercises Brock guild public gating, Crab Cavern ambient routing, tag gating, an
 import asyncio
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,6 +24,9 @@ from tools.bridge_ambient import (
     should_suppress_ambient_reply,
     warm_channel_history,
 )
+from tools.bridge_daemons import PersistentChannelWorker
+from tools.bridge_pipeline import TurnTimer, deliver_turn_output
+from tools.bridge_runner import execute_agy_turn
 from tools.bridge_state import OWNER_USER_ID
 from datetime import UTC
 
@@ -1122,6 +1126,167 @@ class TestBridgeAmbient(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_bare_agreement_reply(""))
         self.assertFalse(is_additive_reply(""))
         self.assertFalse(should_suppress_ambient_reply("", is_ambient_chime_in=True))
+
+    async def test_deliver_turn_output_suppresses_bare_agreement_ambient_reply(self):
+        """Verify deliver_turn_output suppresses bare-agreement ambient chime-ins and cleans status."""
+        status_msg = AsyncMock()
+        reply_target = AsyncMock()
+        reply_target.channel = MagicMock()
+        reply_target.channel.name = "lounge"
+        reply_target.channel.id = 1534452820995080192
+        timer = TurnTimer(channel_id=1534452820995080192, channel_name="lounge")
+
+        with patch("tools.channel_history.record_message") as mock_record:
+            res = await deliver_turn_output(
+                output_text="Agreed.",
+                status_msg=status_msg,
+                reply_target=reply_target,
+                mode="external",
+                channel_id=1534452820995080192,
+                conv_id="conv-test",
+                turn_start_time=time.time(),
+                timer=timer,
+                is_ambient_chime_in=True,
+                is_physical_mention=False,
+            )
+            self.assertEqual(res, [])
+            status_msg.delete.assert_awaited_once()
+            status_msg.edit.assert_not_called()
+            reply_target.reply.assert_not_called()
+            reply_target.send.assert_not_called()
+            mock_record.assert_not_called()
+            self.assertEqual(timer.status, "NO_REPLY")
+
+    async def test_deliver_turn_output_allows_substantive_ambient_reply(self):
+        """Verify deliver_turn_output allows substantive ambient chime-ins and records history."""
+        status_msg = AsyncMock()
+        status_msg.edit.return_value = status_msg
+        reply_target = AsyncMock()
+        reply_target.channel = MagicMock()
+        reply_target.channel.name = "lounge"
+        reply_target.channel.id = 1534452820995080192
+        timer = TurnTimer(channel_id=1534452820995080192, channel_name="lounge")
+
+        with patch("tools.channel_history.record_message") as mock_record:
+            res = await deliver_turn_output(
+                output_text="Agreed — we should also verify the retry backoff in bridge_runner.py.",
+                status_msg=status_msg,
+                reply_target=reply_target,
+                mode="external",
+                channel_id=1534452820995080192,
+                conv_id="conv-test",
+                turn_start_time=time.time(),
+                timer=timer,
+                is_ambient_chime_in=True,
+                is_physical_mention=False,
+            )
+            self.assertEqual(res, [status_msg])
+            status_msg.delete.assert_not_called()
+            status_msg.edit.assert_awaited_once()
+            mock_record.assert_called_once()
+            self.assertEqual(timer.status, "SUCCESS")
+
+    async def test_deliver_turn_output_allows_bare_agreement_when_direct_or_physical_mention(self):
+        """Verify bare agreement replies are allowed when direct mention or physical mention is true."""
+        # Case A: is_ambient_chime_in=False (direct reply/mention)
+        status_msg_a = AsyncMock()
+        status_msg_a.edit.return_value = status_msg_a
+        reply_target_a = AsyncMock()
+        reply_target_a.channel = MagicMock()
+        reply_target_a.channel.name = "lounge"
+        reply_target_a.channel.id = 1534452820995080192
+        timer_a = TurnTimer(channel_id=1534452820995080192, channel_name="lounge")
+
+        with patch("tools.channel_history.record_message") as mock_record_a:
+            res_a = await deliver_turn_output(
+                output_text="Agreed.",
+                status_msg=status_msg_a,
+                reply_target=reply_target_a,
+                mode="external",
+                channel_id=1534452820995080192,
+                conv_id="conv-test",
+                turn_start_time=time.time(),
+                timer=timer_a,
+                is_ambient_chime_in=False,
+                is_physical_mention=False,
+            )
+            self.assertEqual(res_a, [status_msg_a])
+            status_msg_a.delete.assert_not_called()
+            status_msg_a.edit.assert_awaited_once()
+            mock_record_a.assert_called_once()
+            self.assertEqual(timer_a.status, "SUCCESS")
+
+        # Case B: is_ambient_chime_in=True but is_physical_mention=True
+        status_msg_b = AsyncMock()
+        status_msg_b.edit.return_value = status_msg_b
+        reply_target_b = AsyncMock()
+        reply_target_b.channel = MagicMock()
+        reply_target_b.channel.name = "lounge"
+        reply_target_b.channel.id = 1534452820995080192
+        timer_b = TurnTimer(channel_id=1534452820995080192, channel_name="lounge")
+
+        with patch("tools.channel_history.record_message") as mock_record_b:
+            res_b = await deliver_turn_output(
+                output_text="Agreed.",
+                status_msg=status_msg_b,
+                reply_target=reply_target_b,
+                mode="external",
+                channel_id=1534452820995080192,
+                conv_id="conv-test",
+                turn_start_time=time.time(),
+                timer=timer_b,
+                is_ambient_chime_in=True,
+                is_physical_mention=True,
+            )
+            self.assertEqual(res_b, [status_msg_b])
+            status_msg_b.delete.assert_not_called()
+            status_msg_b.edit.assert_awaited_once()
+            mock_record_b.assert_called_once()
+            self.assertEqual(timer_b.status, "SUCCESS")
+
+    async def test_execute_agy_turn_forwards_ambient_chime_in_to_worker(self):
+        """Verify execute_agy_turn forwards is_ambient_chime_in into worker.execute_turn on dedicated channels."""
+        ch_id = 1534452820995080192
+        mock_worker = AsyncMock()
+        mock_worker.execute_turn.return_value = "OK"
+
+        with (
+            patch("tools.bridge_daemons.daemon_manager.is_dedicated_channel", return_value=True),
+            patch("tools.bridge_daemons.daemon_manager.get_worker", return_value=mock_worker),
+        ):
+            await execute_agy_turn(
+                prompt="test ambient prompt",
+                status_msg=None,
+                reply_target=MagicMock(),
+                attachments=[],
+                mode="external",
+                channel_id=ch_id,
+                is_ambient_chime_in=True,
+            )
+            mock_worker.execute_turn.assert_awaited_once()
+            kwargs = mock_worker.execute_turn.call_args.kwargs
+            self.assertTrue(kwargs.get("is_ambient_chime_in"))
+
+    async def test_daemon_worker_execute_turn_forwards_ambient_chime_in(self):
+        """Verify PersistentChannelWorker.execute_turn forwards is_ambient_chime_in to _execute_turn_core."""
+        worker = PersistentChannelWorker(
+            channel_id=1534452820995080192,
+            name="lounge",
+            mode="external",
+            sess_key="1534452820995080192",
+        )
+        with patch.object(worker, "_execute_turn_core", new_callable=AsyncMock) as mock_core:
+            mock_core.return_value = "OK"
+            with patch.object(worker, "_schedule_post_turn_compaction"):
+                await worker.execute_turn(
+                    prompt="test",
+                    status_msg=None,
+                    reply_target=MagicMock(),
+                    attachments=[],
+                    is_ambient_chime_in=True,
+                )
+                mock_core.assert_awaited_once()
+                self.assertTrue(mock_core.call_args.kwargs.get("is_ambient_chime_in"))
 
 
 if __name__ == "__main__":

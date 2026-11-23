@@ -560,6 +560,7 @@ async def run_channel_turn_worker(
                         "last_word_streak": item.get("last_word_streak", 0),
                         "queued_at": item.get("queued_at"),
                         "is_physical_mention": item.get("is_physical_mention", False),
+                        "is_ambient_chime_in": item.get("is_ambient_chime_in", False),
                     }
                     if item.get("model_override"):
                         kwargs["model_override"] = item["model_override"]
