@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ruff: noqa: B023, BLE001, EXE001, FURB167, I001, PIE810, PLW1510, S110, S112, SIM102, SIM103, UP006, UP035, UP045
+# ruff: noqa: B023, BLE001, FURB167, I001, PIE810, PLW1510, S110, S112, SIM102, SIM103, UP006, UP035, UP045
 """
 gotchi_zero_adapter.py — Unified Zero Brain, Artifact Handoff & Transcript Adapter for GOTCHI
 =============================================================================================
@@ -5546,7 +5546,7 @@ def create_zero_gotchi_app(
         cfg.filler_delay_ms = 0
     if "GOTCHI_SECOND_FILLER_DELAY_MS" not in os.environ:
         cfg.second_filler_delay_ms = 0
-    if "GOTCHI_MIN_VOICED_MS" not in os.environ:
+    if "GOTCHI_MIN_VOICED_MS" not in os.environ and cfg.min_voiced_ms == 400:
         cfg.min_voiced_ms = 160
     if cfg.async_handoff_ms == 0 and "GOTCHI_ASYNC_HANDOFF_MS" not in os.environ:
         cfg.async_handoff_ms = 8000
