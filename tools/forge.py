@@ -102,7 +102,7 @@ OWNER_USER_ID = int(os.getenv("DISCORD_OWNER_ID", "179407724335988736"))
 DEFAULT_WORKER_MODEL = "gemini-4-hydrogen-high"
 ESCALATION_WORKER_MODEL = "gemini-4-neon-medium"
 FINAL_ESCALATION_WORKER_MODEL = "gemini-4-neon-high"
-PREFLIGHT_ARCHITECT_MODEL = "gemini-4-neon-high"
+PREFLIGHT_ARCHITECT_MODEL = "gemini-4-neon-medium"
 CORE_INFRA_PREFLIGHT_PATHS = (
     "tools/bridge",
     "tools/forge.py",
@@ -3823,7 +3823,7 @@ def should_run_carbon_preflight(build: sqlite3.Row | dict, chunks: list[sqlite3.
         if plan_obj.get("review_spec") is True:
             return True
 
-    if len(chunks) >= 2 or bool(_row_get(build, "touches_core_bridge", 0)):
+    if len(chunks) >= 3 or bool(_row_get(build, "touches_core_bridge", 0)):
         return True
 
     ws_prefix = f"{str(WORKSPACE_DIR).rstrip('/')}/"
@@ -3926,6 +3926,7 @@ def _build_carbon_preflight_prompt(
         "You are performing a fast read-only pre-flight architectural spec review for a FORGE build.",
         "Do NOT modify any files or run destructive commands.",
         "Audit all chunks for cross-chunk contract mismatches, missing edge cases, or verification gaps.",
+        "Return concise JSON directly from the provided plan and context without lengthy multi-step repository scans so the 90-second pre-flight budget is respected.",
         "",
         f"Build ID: {build_id}",
         f"Build Title: {build_title}",
@@ -5747,6 +5748,12 @@ def format_chunk_prompt(
     wt_path = Path(wt_str)
     objective_text = (build["objective"] if "objective" in build.keys() and build["objective"] else build["title"]).strip()
     effective_v_cmd = (target_chunk["verification_cmd"] or "").strip() or build_default_verification_cmd(target_files, wt_path)
+    repo_verify_cmd = detect_repo_verification_script(wt_path if wt_path.exists() else Path(effective_repo))
+    if repo_verify_cmd and "scripts/verify.sh" not in effective_v_cmd:
+        if effective_v_cmd and effective_v_cmd != "true":
+            effective_v_cmd = f"{effective_v_cmd} && {repo_verify_cmd}"
+        else:
+            effective_v_cmd = repo_verify_cmd
 
     lines = [
         f"# [FORGE WORKER EXECUTION CONTRACT — BUILD `{build_id}` / CHUNK {chunk_index + 1} OF {len(chunks)}]",
@@ -5782,6 +5789,11 @@ def format_chunk_prompt(
     if prohibited_files:
         lines.append(f"- **Prohibited Files (DO NOT MODIFY):** `{', '.join(prohibited_files)}`")
     lines.append(f"- **Mandatory Verification Gate:** `{effective_v_cmd}`")
+    if "--staged" in effective_v_cmd:
+        stage_targets = " ".join(target_files) if target_files else "<target_files>"
+        lines.append(
+            f"- **Staged Verification Note:** Stage your modified target files (`git add {stage_targets}`) and run formatting/lint checks before finishing so `--staged` checks verify your edits."
+        )
 
     # Pre-hydrate target_symbols AST/line-slice snippets + instruction-referenced line windows so Flash workers skip discovery reads
     hydrated_blocks: list[str] = []
@@ -6176,6 +6188,139 @@ def is_non_retryable_chunk_failure(
     return False, ""
 
 
+def _try_autofix_python_lint_format(
+    worktree_dir: Path,
+    changed_files: list[str],
+    prohibited_files: Optional[list[str]],
+    verify_output: str,
+    effective_cmd: str,
+) -> bool:
+    """Attempt one-shot safe ruff check --fix and ruff format on changed Python files.
+
+    Never passes --unsafe-fixes, never touches prohibited files, and skips ruff version-pin errors.
+    Returns True if at least one file was modified on disk.
+    """
+    ruff_bin = shutil.which("ruff")
+    if not ruff_bin:
+        return False
+
+    out_text = verify_output or ""
+    lower_out = out_text.lower()
+    if "does not match the pin" in lower_out:
+        return False
+
+    is_ruff_failure = (
+        "would be reformatted" in lower_out
+        or "[ruff]" in lower_out
+        or bool(re.search(r"\.py:\d+:\d+:\s*[A-Z]{1,4}\d{3,4}\b", out_text))
+        or bool(re.search(r"(?:^|\n)\s*[A-Z]{1,4}\d{3,4}\s+\[\*\]", out_text))
+        or ("ruff" in lower_out and bool(re.search(r"\b[A-Z]{1,4}\d{3,4}\b", out_text)))
+    )
+    if not is_ruff_failure:
+        return False
+
+    wt = Path(worktree_dir)
+    wt_resolved = wt.resolve()
+    prohibited_set = {str(p).strip().lstrip("./") for p in (prohibited_files or []) if str(p).strip()}
+
+    py_files: list[str] = []
+    for raw_f in changed_files or []:
+        rel = str(raw_f).strip().lstrip("./")
+        if not rel or not rel.endswith(".py") or rel in prohibited_set:
+            continue
+        candidate = wt / rel
+        try:
+            cand_resolved = candidate.resolve()
+            if not cand_resolved.is_file():
+                continue
+            cand_resolved.relative_to(wt_resolved)
+        except Exception:
+            continue
+        if rel not in py_files:
+            py_files.append(rel)
+
+    if not py_files:
+        return False
+
+    before_bytes: dict[str, bytes] = {}
+    for rel in py_files:
+        try:
+            before_bytes[rel] = (wt / rel).read_bytes()
+        except Exception:
+            continue
+    py_files = [rel for rel in py_files if rel in before_bytes]
+    if not py_files:
+        return False
+
+    previously_staged: set[str] = set()
+    try:
+        staged_proc = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if staged_proc.returncode == 0:
+            previously_staged = {
+                line.strip().lstrip("./") for line in staged_proc.stdout.splitlines() if line.strip()
+            }
+    except Exception:
+        pass
+
+    try:
+        subprocess.run(
+            [ruff_bin, "check", "--fix", *py_files],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        pass
+
+    try:
+        subprocess.run(
+            [ruff_bin, "format", *py_files],
+            cwd=str(wt),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        pass
+
+    modified_py: list[str] = []
+    for rel in py_files:
+        try:
+            if (wt / rel).read_bytes() != before_bytes[rel]:
+                modified_py.append(rel)
+        except Exception:
+            continue
+
+    if not modified_py:
+        return False
+
+    if "--staged" in (effective_cmd or ""):
+        files_to_stage = modified_py
+    else:
+        files_to_stage = [rel for rel in modified_py if rel in previously_staged]
+
+    if files_to_stage:
+        try:
+            subprocess.run(
+                ["git", "add", "--", *files_to_stage],
+                cwd=str(wt),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except Exception:
+            pass
+
+    return True
+
+
 def verify_chunk_worktree(
     worktree_dir: Path | str,
     verification_cmd: Optional[str] = None,
@@ -6279,23 +6424,21 @@ def verify_chunk_worktree(
     env["PYTHONPATH"] = f"{wt}:{env.get('PYTHONPATH', '')}".strip(":")
 
     modal_offload_enabled = os.environ.get("ZERO_MODAL_VERIFY_OFFLOAD", "").strip().lower() in ("1", "true", "yes")
-    if modal_offload_enabled or has_heavy_go_static_analysis(effective_cmd):
-        v_ret, v_stdout, v_stderr = run_or_offload_verify_cmd(
-            effective_cmd,
-            cwd=wt,
-            changed_files=combined_changed_files,
-            timeout=int(VERIFY_CMD_TIMEOUT_SECONDS),
-            prefer_modal=modal_offload_enabled or has_heavy_go_static_analysis(effective_cmd),
-            base_env=env,
-        )
-        if v_ret == 124 and "timed out" in v_stderr.lower():
-            combined = f"{v_stdout}\n{v_stderr}".strip()
-            return (
-                False,
-                "",
-                f"Verification command timed out after {int(VERIFY_CMD_TIMEOUT_SECONDS)}s:\n{combined[-1500:]}",
+
+    def _run_verify_once() -> tuple[int, str, str, bool]:
+        if modal_offload_enabled or has_heavy_go_static_analysis(effective_cmd):
+            ret, out, err = run_or_offload_verify_cmd(
+                effective_cmd,
+                cwd=wt,
+                changed_files=combined_changed_files,
+                timeout=int(VERIFY_CMD_TIMEOUT_SECONDS),
+                prefer_modal=modal_offload_enabled or has_heavy_go_static_analysis(effective_cmd),
+                base_env=env,
             )
-    else:
+            if ret == 124 and "timed out" in err.lower():
+                return ret, out, err, True
+            return ret, out, err, False
+
         bash_exec = "/bin/bash" if os.path.exists("/bin/bash") else None
         v_proc = subprocess.Popen(
             effective_cmd,
@@ -6311,23 +6454,44 @@ def verify_chunk_worktree(
             preexec_fn=_apply_low_priority if hasattr(os, "nice") else None,
         )
         try:
-            v_stdout, v_stderr = v_proc.communicate(timeout=VERIFY_CMD_TIMEOUT_SECONDS)
-            v_ret = v_proc.returncode
+            out, err = v_proc.communicate(timeout=VERIFY_CMD_TIMEOUT_SECONDS)
+            return v_proc.returncode, out, err, False
         except subprocess.TimeoutExpired:
             _kill_process_group(v_proc)
             try:
-                v_stdout, v_stderr = v_proc.communicate(timeout=5)
+                out, err = v_proc.communicate(timeout=5)
             except Exception:
-                v_stdout, v_stderr = "", ""
-            combined = f"{v_stdout}\n{v_stderr}".strip()
-            return (
-                False,
-                "",
-                f"Verification command timed out after {int(VERIFY_CMD_TIMEOUT_SECONDS)}s:\n{combined[-1500:]}",
-            )
+                out, err = "", ""
+            return 124, out, err, True
+
+    v_ret, v_stdout, v_stderr, v_timed_out = _run_verify_once()
+    if v_timed_out:
+        combined = f"{v_stdout}\n{v_stderr}".strip()
+        return (
+            False,
+            "",
+            f"Verification command timed out after {int(VERIFY_CMD_TIMEOUT_SECONDS)}s:\n{combined[-1500:]}",
+        )
     if v_ret != 0:
         combined = f"{v_stdout}\n{v_stderr}".strip()
-        return False, "", f"Verification command failed (exit {v_ret}):\n{combined[-1500:]}"
+        if _try_autofix_python_lint_format(
+            wt,
+            changed_files=changed,
+            prohibited_files=prohibited_files,
+            verify_output=combined,
+            effective_cmd=effective_cmd,
+        ):
+            v_ret, v_stdout, v_stderr, v_timed_out = _run_verify_once()
+            if v_timed_out:
+                combined = f"{v_stdout}\n{v_stderr}".strip()
+                return (
+                    False,
+                    "",
+                    f"Verification command timed out after {int(VERIFY_CMD_TIMEOUT_SECONDS)}s:\n{combined[-1500:]}",
+                )
+        if v_ret != 0:
+            combined = f"{v_stdout}\n{v_stderr}".strip()
+            return False, "", f"Verification command failed (exit {v_ret}):\n{combined[-1500:]}"
 
     # 3. Run commit safety scanner if present
     safety_script = wt / "tools" / "validate_commit_safety.py"

@@ -4612,7 +4612,7 @@ def test_worker_model_attempt_escalation_and_fallback_ladder():
     assert forge_mod.DEFAULT_WORKER_MODEL == "gemini-4-hydrogen-high"
     assert forge_mod.ESCALATION_WORKER_MODEL == "gemini-4-neon-medium"
     assert forge_mod.FINAL_ESCALATION_WORKER_MODEL == "gemini-4-neon-high"
-    assert forge_mod.PREFLIGHT_ARCHITECT_MODEL == "gemini-4-neon-high"
+    assert forge_mod.PREFLIGHT_ARCHITECT_MODEL == "gemini-4-neon-medium"
 
     assert forge_mod.WORKER_MODEL_FALLBACK_MAP["gemini-4-hydrogen-high"] == "gemini-4-neon-medium"
     assert forge_mod.WORKER_MODEL_FALLBACK_MAP["gemini-4-hydrogen-xhigh"] == "gemini-4-neon-medium"
@@ -4691,12 +4691,19 @@ def test_should_run_carbon_preflight_gate():
         is False
     )
 
-    # 2-chunk build returns True
+    # 2-chunk non-core build returns False; 3-chunk non-core build returns True
     two_chunks = [
         {"target_files_json": json.dumps(["docs/a.md"])},
         {"target_files_json": json.dumps(["docs/b.md"])},
     ]
-    assert forge_mod.should_run_carbon_preflight(non_core_build, two_chunks) is True
+    assert forge_mod.should_run_carbon_preflight(non_core_build, two_chunks) is False
+
+    three_chunks = [
+        {"target_files_json": json.dumps(["docs/a.md"])},
+        {"target_files_json": json.dumps(["docs/b.md"])},
+        {"target_files_json": json.dumps(["docs/c.md"])},
+    ]
+    assert forge_mod.should_run_carbon_preflight(non_core_build, three_chunks) is True
 
     # 1-chunk build with touches_core_bridge=1 or core target_files returns True
     assert (
@@ -4730,7 +4737,7 @@ def test_should_run_carbon_preflight_gate():
 
     # Explicit plan_json review_spec overrides eligibility in both directions
     override_false_build = {"touches_core_bridge": 1, "plan_json": json.dumps({"review_spec": False})}
-    assert forge_mod.should_run_carbon_preflight(override_false_build, two_chunks) is False
+    assert forge_mod.should_run_carbon_preflight(override_false_build, three_chunks) is False
     assert (
         forge_mod.should_run_carbon_preflight(
             override_false_build,
@@ -4741,6 +4748,7 @@ def test_should_run_carbon_preflight_gate():
 
     override_true_build = {"touches_core_bridge": 0, "plan_json": json.dumps({"review_spec": True})}
     assert forge_mod.should_run_carbon_preflight(override_true_build, non_core_chunk) is True
+    assert forge_mod.should_run_carbon_preflight(override_true_build, two_chunks) is True
 
 
 def test_apply_carbon_preflight_refinements(tmp_path):
@@ -6584,6 +6592,143 @@ def test_build_git_push_args_and_env_and_preflight_auth(tmp_path, monkeypatch):
     assert b_row["status"] == "failed"
     assert c_row["status"] == "failed"
     assert "Remote push auth pre-flight failed" in c_row["last_error"]
+
+
+def test_format_chunk_prompt_appends_repo_verify_script(tmp_path):
+    """format_chunk_prompt appends sh scripts/verify.sh --staged and adds staged-file guidance."""
+    repo = _init_test_git_repo(tmp_path / "repo_verify")
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    verify_sh = scripts_dir / "verify.sh"
+    verify_sh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    verify_sh.chmod(0o755)
+    (repo / "sample.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "Add verify script and sample"], cwd=str(repo), capture_output=True, check=True)
+
+    db_path = tmp_path / "forge_prompt.db"
+    forge_mod.init_forge_db(db_path)
+
+    build_id = "fg-test-prompt-repo-verify"
+    plan = {
+        "id": build_id,
+        "title": "Prompt Repo Verify Test",
+        "repo": str(repo),
+        "origin_channel_id": forge_mod.FORGE_CHANNEL_ID,
+        "context_fact_sheet": ["Keep sample.py clean."],
+        "chunks": [
+            {
+                "title": "Update sample.py",
+                "target_files": ["sample.py"],
+                "instructions": "Add multiply helper to sample.py.",
+                "verification_cmd": "python3 -m py_compile sample.py",
+            },
+            {
+                "title": "Already includes verify.sh",
+                "target_files": ["sample.py"],
+                "instructions": "Check verify.sh is not duplicated.",
+                "verification_cmd": "python3 -m py_compile sample.py && sh scripts/verify.sh --staged",
+            },
+        ],
+    }
+    enq = forge_mod.enqueue_build(plan, db_path=db_path, post_widget=False)
+    assert enq["ok"] is True
+
+    prompt_c0 = forge_mod.format_chunk_prompt(build_id, 0, db_path=db_path, worktree_dir=str(repo))
+    assert (
+        "- **Mandatory Verification Gate:** `python3 -m py_compile sample.py && sh scripts/verify.sh --staged`"
+        in prompt_c0
+    )
+    assert "git add sample.py" in prompt_c0
+    assert "--staged" in prompt_c0
+
+    prompt_c1 = forge_mod.format_chunk_prompt(build_id, 1, db_path=db_path, worktree_dir=str(repo))
+    assert (
+        "- **Mandatory Verification Gate:** `python3 -m py_compile sample.py && sh scripts/verify.sh --staged`"
+        in prompt_c1
+    )
+    assert "sh scripts/verify.sh --staged && sh scripts/verify.sh --staged" not in prompt_c1
+    assert "git add sample.py" in prompt_c1
+
+
+def test_verify_chunk_worktree_autofix_ruff_and_guards(tmp_path):
+    """verify_chunk_worktree auto-fixes safe ruff lint/format failures once, while skipping prohibited files and pin errors."""
+    if not forge_mod.shutil.which("ruff"):
+        pytest.skip("ruff not installed in test environment")
+
+    repo = _init_test_git_repo(tmp_path / "repo_autofix")
+    sample_py = repo / "sample.py"
+    sample_py.write_text("def greet(name: str) -> str:\n    return f'hello {name}'\n", encoding="utf-8")
+    secret_py = repo / "secret.py"
+    secret_py.write_text("x=1+2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial python files"], cwd=str(repo), capture_output=True, check=True)
+
+    # 1. Introduce a safe-fixable ruff lint error (unused import) + format issue
+    sample_py.write_text(
+        "import os\n\ndef greet(name: str) -> str:\n    x=1+2\n    return f'hello {name} {x}'\n",
+        encoding="utf-8",
+    )
+
+    ok, diff_stat, err = forge_mod.verify_chunk_worktree(
+        repo,
+        verification_cmd="ruff check sample.py && ruff format --check sample.py",
+        prohibited_files=["secret.py"],
+        target_files=["sample.py"],
+        require_changes=True,
+    )
+    assert ok is True, f"Expected autofix retry to pass, got error: {err}"
+    assert err == ""
+    assert diff_stat
+    fixed_src = sample_py.read_text(encoding="utf-8")
+    assert "import os" not in fixed_src
+    assert "x = 1 + 2" in fixed_src
+
+    # 2. Prohibited files must never be modified by _try_autofix_python_lint_format
+    secret_before = secret_py.read_bytes()
+    autofixed_prohibited = forge_mod._try_autofix_python_lint_format(
+        repo,
+        changed_files=["secret.py"],
+        prohibited_files=["secret.py"],
+        verify_output="1 file would be reformatted",
+        effective_cmd="ruff format --check secret.py",
+    )
+    assert autofixed_prohibited is False
+    assert secret_py.read_bytes() == secret_before
+
+    # 3. Ruff version-pin mismatch must never trigger auto-fix
+    pin_py = repo / "pin_test.py"
+    pin_py.write_text("import sys\nx=1+2\n", encoding="utf-8")
+    pin_before = pin_py.read_bytes()
+    autofixed_pin = forge_mod._try_autofix_python_lint_format(
+        repo,
+        changed_files=["pin_test.py"],
+        prohibited_files=None,
+        verify_output="[ruff] ruff version 0.1.0 does not match the pin 0.9.0; 1 file would be reformatted",
+        effective_cmd="sh scripts/verify.sh --staged",
+    )
+    assert autofixed_pin is False
+    assert pin_py.read_bytes() == pin_before
+
+    # 4. When --staged is in effective_cmd, auto-fixed files are re-staged automatically
+    subprocess.run(["git", "add", "pin_test.py"], cwd=str(repo), capture_output=True, check=True)
+    autofixed_staged = forge_mod._try_autofix_python_lint_format(
+        repo,
+        changed_files=["pin_test.py"],
+        prohibited_files=None,
+        verify_output="1 file would be reformatted",
+        effective_cmd="sh scripts/verify.sh --staged",
+    )
+    assert autofixed_staged is True
+    # After re-staging, unstaged diff for pin_test.py should be empty
+    unstaged_diff = subprocess.run(
+        ["git", "diff", "--", "pin_test.py"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert unstaged_diff.stdout.strip() == ""
 
 
 if __name__ == "__main__":
