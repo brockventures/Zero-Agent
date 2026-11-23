@@ -72,12 +72,16 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
     async def test_daily_session_rollover_dispatch(self):
         bshed.LAST_SCHEDULED_DISPATCH.clear()
         br.reset_session_keys.clear()
+        sessions_file = self.temp_path / "sessions.json"
+        sessions_file.write_text(json.dumps({"home": "conv-home-1"}), encoding="utf-8")
 
-        with patch("tools.session_summarizer.generate_summary"), \
+        with patch("tools.session_rollover.SESSIONS_FILE", sessions_file), \
+             patch("tools.session_rollover.prune_brain_sessions", return_value={"pruned_count": 0, "freed_mb": 0.0}) as mock_prune, \
              patch("tools.bridge_daemons.daemon_manager.proactive_nightly_recycle", new_callable=AsyncMock) as mock_recycle:
             await bshed.dispatch_scheduled_prompt("[INTERNAL_SESSION_ROLLOVER]", "Daily Session Rollover")
-            self.assertIn("home", br.reset_session_keys)
-            mock_recycle.assert_awaited_once()
+            self.assertNotIn("home", br.reset_session_keys)
+            mock_prune.assert_called_once_with(max_age_days=30, dry_run=False)
+            mock_recycle.assert_not_awaited()
 
     async def test_birthday_reminder_silent(self):
         bshed.LAST_SCHEDULED_DISPATCH.clear()
@@ -1666,106 +1670,60 @@ class TestBridgeScheduler(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(test_job["last_success_ts"], test_job["last_attempt_ts"])
         self.assertEqual(test_job["last_run_ts"], test_job["last_success_ts"])
 
-    async def test_vulcan_nightly_rollover_skips_outside_window(self):
-        from datetime import datetime
+    async def test_no_vulcan_nightly_rollover_and_session_rollover_preserves_active_sessions(self):
+        from tools.session_rollover import run_daily_session_rollover
 
         scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock())
-        state_file = self.temp_path / "vulcan_nightly_rollover.json"
-        non_window_times = [
-            datetime(2026, 11, 23, 2, 0, tzinfo=bs.PT_TZ),
-            datetime(2026, 11, 23, 2, 1, tzinfo=bs.PT_TZ),
-            datetime(2026, 11, 23, 3, 0, tzinfo=bs.PT_TZ),
-            datetime(2026, 11, 23, 5, 45, tzinfo=bs.PT_TZ),
-        ]
+        self.assertFalse(hasattr(scheduler, "_maybe_run_vulcan_nightly_rollover"))
+        self.assertFalse(hasattr(bshed.BridgeScheduler, "_maybe_run_vulcan_nightly_rollover"))
+        self.assertFalse(hasattr(scheduler, "_vulcan_last_rollover_date"))
 
-        with patch("tools.bridge_daemons.daemon_manager.proactive_nightly_recycle", new_callable=AsyncMock) as mock_recycle:
-            for now_pt in non_window_times:
-                ran = await scheduler._maybe_run_vulcan_nightly_rollover(now_pt=now_pt, state_file=state_file)
-                self.assertFalse(ran)
-            mock_recycle.assert_not_awaited()
-        self.assertFalse(state_file.exists())
+        now = time.time()
+        primary_key = str(next(iter(bs.DEFAULT_HOME_CHANNELS)))
+        dedicated_key = str(bs.FORGE_CHANNEL_ID)
+        active_thread_key = "999888777666555444"
+        stale_thread_key = "111222333444555666"
 
-    async def test_vulcan_nightly_rollover_defers_when_busy(self):
-        from datetime import datetime
+        sessions_file = self.temp_path / "sessions.json"
+        sessions_file.write_text(
+            json.dumps({
+                "home": "conv-home",
+                primary_key: "conv-primary",
+                dedicated_key: "conv-forge",
+                active_thread_key: "conv-thread-active",
+                stale_thread_key: "conv-thread-stale",
+            }),
+            encoding="utf-8",
+        )
 
-        scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock(), is_busy_fn=lambda: ["forge-turn"])
-        state_file = self.temp_path / "vulcan_nightly_rollover.json"
-        now_pt = datetime(2026, 11, 23, 2, 2, tzinfo=bs.PT_TZ)
+        br.reset_session_keys.clear()
+        br.reset_session_keys.add(stale_thread_key)
 
-        with patch("tools.bridge_daemons.daemon_manager.proactive_nightly_recycle", new_callable=AsyncMock) as mock_recycle, \
-             patch("tools.session_summarizer.generate_summary") as mock_summary:
-            ran = await scheduler._maybe_run_vulcan_nightly_rollover(now_pt=now_pt, state_file=state_file)
+        def fake_meta(key: str) -> dict:
+            if key == active_thread_key:
+                return {"last_active": now - 3600}
+            if key == stale_thread_key:
+                return {"last_active": now - (72 * 3600)}
+            return {}
 
-        self.assertFalse(ran)
-        mock_recycle.assert_not_awaited()
-        mock_summary.assert_not_called()
-        self.assertFalse(state_file.exists())
-        self.assertIsNone(scheduler._vulcan_last_rollover_date)
+        with patch("tools.session_rollover.SESSIONS_FILE", sessions_file), \
+             patch("tools.session_rollover.get_session_metadata", side_effect=fake_meta), \
+             patch("tools.session_rollover.clear_channel_session_id") as mock_clear, \
+             patch("tools.session_rollover.prune_brain_sessions", return_value={"pruned_count": 3, "freed_mb": 4.2}) as mock_prune:
+            ok, report, details = run_daily_session_rollover(dry_run=False)
 
-    async def test_vulcan_nightly_rollover_executes_and_dedups_per_pt_day(self):
-        from datetime import datetime, timezone
-
-        scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock(), is_busy_fn=lambda: [])
-        # Test default state_file resolution via DATA_DIR as well as corrupt initial JSON handling
-        default_state_file = self.temp_path / "vulcan_nightly_rollover.json"
-        default_state_file.write_text("{corrupt-json", encoding="utf-8")
-
-        # Pass a UTC timestamp corresponding to 2026-11-23 02:02 AM PT (10:02 UTC in PST)
-        now_utc = datetime(2026, 11, 23, 10, 2, tzinfo=timezone.utc)
-        forge_key = str(bs.FORGE_CHANNEL_ID)
-
-        with patch.object(bshed, "DATA_DIR", self.temp_path), \
-             patch("tools.bridge_state.get_channel_session_id", return_value="conv-forge-1") as mock_get_cid, \
-             patch("tools.bridge_state.get_session_metadata", return_value={}) as mock_get_meta, \
-             patch("tools.bridge_state.set_session_metadata") as mock_set_meta, \
-             patch("tools.session_summarizer.generate_summary") as mock_summary, \
-             patch("tools.bridge_daemons.daemon_manager.proactive_nightly_recycle", new_callable=AsyncMock) as mock_recycle:
-            ran_first = await scheduler._maybe_run_vulcan_nightly_rollover(now_pt=now_utc)
-            ran_same_instance = await scheduler._maybe_run_vulcan_nightly_rollover(
-                now_pt=datetime(2026, 11, 23, 2, 15, tzinfo=bs.PT_TZ),
-            )
-            fresh_scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock(), is_busy_fn=lambda: [])
-            ran_fresh_instance = await fresh_scheduler._maybe_run_vulcan_nightly_rollover(
-                now_pt=datetime(2026, 11, 23, 2, 30, tzinfo=bs.PT_TZ),
-            )
-
-        self.assertTrue(ran_first)
-        self.assertFalse(ran_same_instance)
-        self.assertFalse(ran_fresh_instance)
-        mock_get_cid.assert_called_once_with(bs.FORGE_CHANNEL_ID, "home")
-        mock_get_meta.assert_called_once_with(forge_key)
-        mock_summary.assert_called_once_with(conv_id="conv-forge-1", sess_key=forge_key)
-        mock_set_meta.assert_called_once_with(forge_key, {"parent_conv_id": "conv-forge-1"})
-        mock_recycle.assert_awaited_once()
-
-        persisted = json.loads(default_state_file.read_text(encoding="utf-8"))
-        self.assertEqual(persisted.get("last_rollover_date"), "2026-11-23")
-        self.assertEqual(scheduler._vulcan_last_rollover_date, "2026-11-23")
-        self.assertEqual(fresh_scheduler._vulcan_last_rollover_date, "2026-11-23")
-
-    async def test_vulcan_nightly_rollover_retries_after_recycle_failure(self):
-        from datetime import datetime
-
-        scheduler = bshed.BridgeScheduler(dispatch_fn=AsyncMock(), is_busy_fn=lambda: [])
-        state_file = self.temp_path / "vulcan_nightly_rollover.json"
-        now_pt = datetime(2026, 11, 23, 2, 5, tzinfo=bs.PT_TZ)
-
-        with patch("tools.bridge_state.get_channel_session_id", return_value=None), \
-             patch("tools.bridge_daemons.daemon_manager.proactive_nightly_recycle", new_callable=AsyncMock, side_effect=RuntimeError("boom")):
-            with self.assertRaises(RuntimeError):
-                await scheduler._maybe_run_vulcan_nightly_rollover(now_pt=now_pt, state_file=state_file)
-
-        self.assertFalse(state_file.exists())
-        self.assertIsNone(scheduler._vulcan_last_rollover_date)
-
-        with patch("tools.bridge_state.get_channel_session_id", return_value=None), \
-             patch("tools.bridge_daemons.daemon_manager.proactive_nightly_recycle", new_callable=AsyncMock) as mock_recycle:
-            ran = await scheduler._maybe_run_vulcan_nightly_rollover(now_pt=now_pt, state_file=state_file)
-
-        self.assertTrue(ran)
-        mock_recycle.assert_awaited_once()
-        self.assertEqual(scheduler._vulcan_last_rollover_date, "2026-11-23")
-        self.assertTrue(state_file.exists())
+        self.assertTrue(ok)
+        self.assertEqual(details["rolled_over"], [])
+        self.assertEqual(details["pruned_threads"], [stale_thread_key])
+        self.assertNotIn("home", br.reset_session_keys)
+        self.assertNotIn(primary_key, br.reset_session_keys)
+        self.assertNotIn(dedicated_key, br.reset_session_keys)
+        self.assertNotIn(active_thread_key, br.reset_session_keys)
+        self.assertNotIn(stale_thread_key, br.reset_session_keys)
+        mock_clear.assert_any_call(stale_thread_key, "home")
+        mock_clear.assert_any_call(stale_thread_key, "external")
+        mock_prune.assert_called_once_with(max_age_days=30, dry_run=False)
+        self.assertIn("Pruned **1 stale thread mapping(s)**", report)
 
 
 if __name__ == "__main__":
