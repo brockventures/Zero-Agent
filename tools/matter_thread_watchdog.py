@@ -44,6 +44,30 @@ DEFAULT_STATE_PATH = DATA_DIR / "matter_thread_watchdog_state.json"
 
 DEFAULT_FAILURE_THRESHOLD = 3
 DEFAULT_ALERT_COOLDOWN_SECONDS = 43200  # 12 hours
+DEFAULT_POKE_BACKOFF_SECONDS = 21600  # 6 hours after hitting failure threshold
+
+
+def should_attempt_poke(
+    node_state: dict[str, Any] | None,
+    now_ts: float,
+    failure_threshold: int = DEFAULT_FAILURE_THRESHOLD,
+    backoff_seconds: int = DEFAULT_POKE_BACKOFF_SECONDS,
+) -> bool:
+    """Return True if an offline node is eligible for an mDNS recovery poke.
+
+    Once a node hits ``failure_threshold`` consecutive failed recoveries, backs
+    off to poking at most once every ``backoff_seconds`` (default 6 hours) so a
+    marginal or dying battery sensor is never hammered.
+    """
+    if not isinstance(node_state, dict):
+        return True
+    failures = int(node_state.get("consecutive_failures") or 0)
+    if failures < failure_threshold:
+        return True
+    last_poke_ts = node_state.get("last_poke_ts")
+    if last_poke_ts is None:
+        return True
+    return (float(now_ts) - float(last_poke_ts)) >= backoff_seconds
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
 
@@ -192,6 +216,7 @@ def evaluate_watchdog_state(
                 "label": f"Matter Node {nid}",
                 "battery_pct": None,
                 "consecutive_failures": 0,
+                "last_poke_ts": None,
                 "last_recovered_ts": None,
                 "last_alert_ts": None,
                 "alerted": False,
@@ -214,6 +239,7 @@ def evaluate_watchdog_state(
             if item.get("recovered") or item.get("was_offline"):
                 entry["last_recovered_ts"] = float(now_ts)
             entry["consecutive_failures"] = 0
+            entry["last_poke_ts"] = None
             entry["alerted"] = False
             entry["last_alert_ts"] = None
             if was_alerted:
@@ -221,8 +247,13 @@ def evaluate_watchdog_state(
                     f"- {label}: back online ({bat_clause})."
                 )
         else:
-            failures = int(entry.get("consecutive_failures") or 0) + 1
-            entry["consecutive_failures"] = failures
+            if item.get("poked"):
+                entry["last_poke_ts"] = float(now_ts)
+            if not item.get("backoff_skipped"):
+                failures = int(entry.get("consecutive_failures") or 0) + 1
+                entry["consecutive_failures"] = failures
+            else:
+                failures = int(entry.get("consecutive_failures") or 0)
             if failures >= failure_threshold:
                 last_alert_ts = entry.get("last_alert_ts")
                 was_alerted = bool(entry.get("alerted"))
@@ -258,6 +289,7 @@ def evaluate_watchdog_state(
 def _build_remote_watchdog_script(
     cached_ipv6_by_node: dict[str, str],
     dry_run: bool = False,
+    skip_poke_node_ids: list[int] | None = None,
 ) -> str:
     """Build the Host 1 Python script executed inside a single SSH roundtrip."""
     phase1_inner = r"""
@@ -318,7 +350,9 @@ async def ws_cmd(ws, msg_id, command, args=None, timeout=25.0):
             return msg
 
 async def main():
-    dry_run = bool(json.loads(sys.stdin.read() or "{}").get("dry_run", False))
+    inp = json.loads(sys.stdin.read() or "{}")
+    dry_run = bool(inp.get("dry_run", False))
+    skip_ids = {int(x) for x in (inp.get("skip_poke_node_ids") or [])}
     async with aiohttp.ClientSession() as session:
         async with session.ws_connect("http://127.0.0.1:5580/ws", timeout=15) as ws:
             info = await ws.receive_json(timeout=15)
@@ -335,12 +369,14 @@ async def main():
                     continue
                 nid = int(nid)
                 avail = bool(node.get("available"))
-                ip_res = await ws_cmd(ws, str(seq), "get_node_ip_addresses", {"node_id": nid}, timeout=20.0)
+                ip_res = await ws_cmd(
+                    ws, str(seq), "get_node_ip_addresses", {"node_id": nid, "prefer_cache": True}, timeout=20.0
+                )
                 seq += 1
                 ipv6 = pick_ipv6(ip_res.get("result"))
-                if not avail and not ipv6 and not dry_run:
+                if not avail and not ipv6 and not dry_run and nid not in skip_ids:
                     try:
-                        await ws_cmd(ws, str(seq), "ping_node", {"node_id": nid}, timeout=25.0)
+                        await ws_cmd(ws, str(seq), "ping_node", {"node_id": nid, "attempts": 1}, timeout=25.0)
                     except Exception:
                         pass
                     seq += 1
@@ -388,8 +424,9 @@ def register_temp_mdns(targets):
                 port=5540,
                 properties={b"SII": b"5000", b"SAI": b"300", b"T": b"1"},
                 parsed_addresses=[t["ipv6"]],
+                server=f"node{t['node_id']}-poke.local.",
             )
-            zc.register_service(info)
+            zc.register_service(info, allow_name_change=True)
             infos.append(info)
         time.sleep(2.0)
     finally:
@@ -460,6 +497,7 @@ import sys
 
 CACHED_IPV6 = {json.dumps(cached_ipv6_by_node)}
 DRY_RUN = {bool(dry_run)!r}
+SKIP_POKE_IDS = {json.dumps(sorted({int(x) for x in (skip_poke_node_ids or [])}))}
 PHASE1_B64 = {base64.b64encode(phase1_inner.encode("utf-8")).decode("ascii")!r}
 PHASE2_B64 = {base64.b64encode(phase2_inner.encode("utf-8")).decode("ascii")!r}
 ANSI_RE = re.compile(r"\\x1b\\[[0-9;?]*[ -/]*[@-~]|\\x1b[@-Z\\\\-_]")
@@ -491,11 +529,11 @@ def extract_log_ipv6(logs_text, node_id):
     )
     return matches[-1] if matches else None
 
-phase1 = exec_in_matterserver(PHASE1_B64, {{"dry_run": DRY_RUN}})
+phase1 = exec_in_matterserver(PHASE1_B64, {{"dry_run": DRY_RUN, "skip_poke_node_ids": SKIP_POKE_IDS}})
 cfid = phase1.get("compressed_fabric_id")
 nodes = phase1.get("nodes") or []
 
-need_logs = [n for n in nodes if not n.get("available") and not n.get("ipv6")]
+need_logs = [n for n in nodes if not n.get("available") and not n.get("ipv6") and int(n["node_id"]) not in SKIP_POKE_IDS]
 logs_text = ""
 if need_logs:
     log_res = subprocess.run(
@@ -512,7 +550,7 @@ for n in nodes:
         log_ip = extract_log_ipv6(logs_text, n["node_id"]) if logs_text else None
         n["ipv6"] = log_ip or CACHED_IPV6.get(nid_str)
 
-offline_nodes = [n for n in nodes if not n.get("available")]
+offline_nodes = [n for n in nodes if not n.get("available") and int(n["node_id"]) not in SKIP_POKE_IDS]
 targets = []
 if cfid is not None and not DRY_RUN:
     for n in offline_nodes:
@@ -545,6 +583,7 @@ for n in nodes:
         "battery_pct": bat,
         "was_offline": was_offline,
         "poked": nid in poked_ids,
+        "backoff_skipped": was_offline and nid in SKIP_POKE_IDS,
         "available": final_avail,
         "recovered": was_offline and final_avail,
     }})
@@ -573,7 +612,16 @@ def _run_watchdog_with_details(
         if isinstance(entry, dict) and entry.get("ipv6")
     }
 
-    remote_script = _build_remote_watchdog_script(cached_ipv6, dry_run=dry_run)
+    ts = float(now_ts) if now_ts is not None else time.time()
+    skip_poke_node_ids = [
+        int(nid)
+        for nid, entry in (nodes_state or {}).items()
+        if str(nid).isdigit() and not should_attempt_poke(entry, ts)
+    ]
+
+    remote_script = _build_remote_watchdog_script(
+        cached_ipv6, dry_run=dry_run, skip_poke_node_ids=skip_poke_node_ids
+    )
     b64_payload = base64.b64encode(remote_script.encode("utf-8")).decode("ascii")
     remote_cmd = (
         "python3 -c 'import base64; "
@@ -598,7 +646,6 @@ def _run_watchdog_with_details(
     if not isinstance(results, list):
         raise TypeError("Matter Thread watchdog payload missing 'results' list")
 
-    ts = float(now_ts) if now_ts is not None else time.time()
     new_state, alert_msg = evaluate_watchdog_state(results, state, now_ts=ts)
     if not dry_run:
         save_state(new_state, resolved_state_path)

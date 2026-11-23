@@ -345,3 +345,18 @@ def test_run_matter_thread_watchdog_ssh_failure_and_sidecar_dispatch(tmp_path: P
         assert parsed["dry_run"] is True
         assert parsed["alert"] == ""
     assert not dry_state.exists()
+
+
+def test_should_attempt_poke_respects_six_hour_backoff():
+    assert mtw.should_attempt_poke(None, now_ts=10000.0) is True
+    assert mtw.should_attempt_poke(
+        {"consecutive_failures": 2, "last_poke_ts": 9900.0}, now_ts=10000.0
+    ) is True
+    # After 3 consecutive failures, skip poking until 6h (21600s) elapse
+    assert mtw.should_attempt_poke(
+        {"consecutive_failures": 3, "last_poke_ts": 10000.0}, now_ts=10000.0 + 1800.0
+    ) is False
+    assert mtw.should_attempt_poke(
+        {"consecutive_failures": 3, "last_poke_ts": 10000.0}, now_ts=10000.0 + 21600.0
+    ) is True
+
