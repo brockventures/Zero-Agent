@@ -90,6 +90,10 @@ def reconcile_step_segments(
         return l_strip
     if not l_strip:
         return e_strip
+    if is_internal_cli_leak(e_strip) and not is_internal_cli_leak(l_strip):
+        return l_strip
+    if is_internal_cli_leak(l_strip) and not is_internal_cli_leak(e_strip):
+        return e_strip
 
     # Pre-system wait stub discard
     if (len(e_strip) < 40 or len(e_strip.split()) < 6) and len(l_strip) >= 80 and len(l_strip) > len(e_strip) * 2:

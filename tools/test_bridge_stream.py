@@ -643,6 +643,66 @@ class TestBridgeStream(unittest.TestCase):
         self.assertGreater(only_full.stat().st_size, 32768)
         self.assertEqual(get_latest_transcript_step_index(conv_huge_tail, brain_base_dir=self.temp_path), 42)
 
+    def test_agy_stream_parser_drops_pre_system_message_meta_leak(self):
+        """Verify pre-system_message meta-reasoning leak is discarded and never prepended to post-task reply."""
+        parser = AgyStreamParser(conv_id="conv-meta-leak")
+        leak_text = "Testing... wait no — emit zero text! (I'm in thought block, will output nothing.)"
+        real_reply = "All 3 integration checks passed after the background job completed."
+
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "step_index": 1,
+                "text_delta": leak_text,
+                "state": "DONE",
+            },
+        })
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "system_message",
+            },
+        })
+        self.assertEqual(parser.last_substantive_response, "")
+
+        parser.process_event({
+            "event": "step_update",
+            "step_update": {
+                "step_type": "agent_response",
+                "step_index": 2,
+                "text_delta": real_reply,
+                "state": "DONE",
+            },
+        })
+        self.assertEqual(parser.get_final_response(), real_reply)
+        self.assertEqual(reconcile_step_segments(leak_text, real_reply), real_reply)
+        self.assertEqual(reconcile_step_segments(real_reply, leak_text), real_reply)
+
+    def test_check_transcript_turn_status_rejects_meta_reasoning_leak(self):
+        """Verify check_transcript_turn_status classifies meta-reasoning leak as empty_or_leak_content."""
+        conv_id = "test-conv-meta-leak-status"
+        log_dir = self.temp_path / conv_id / ".system_generated" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        transcript_file = log_dir / "transcript_full.jsonl"
+
+        steps = [
+            {"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "Run checks"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "Testing... wait no — emit zero text! (I'm in thought block, will output nothing.)",
+            },
+        ]
+        with open(transcript_file, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(s) + "\n" for s in steps)
+
+        status = check_transcript_turn_status(conv_id, brain_base_dir=self.temp_path)
+        self.assertFalse(status["is_complete"])
+        self.assertEqual(status["reason"], "empty_or_leak_content")
+        self.assertIsNone(status["content"])
+        self.assertEqual(status["step_index"], 1)
+
 
 class TestBridgeStreamEngineIntegration(unittest.IsolatedAsyncioTestCase):
     """Integration unit tests for TurnCoordinator and bridge_runner stream interruption recovery."""

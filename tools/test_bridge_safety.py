@@ -313,6 +313,39 @@ class TestBridgeSafety(unittest.TestCase):
         self.assertEqual(rx, ["❤️"])
         self.assertEqual(strip_trailing_silence_sentinels("Line 1\n[NO_OP]"), "Line 1")
 
+    def test_meta_reasoning_thought_block_and_zero_text_leaks(self):
+        leaks = [
+            "Testing... wait no — emit zero text! (I'm in thought block, will output nothing.)",
+            "Wait, I am outputting nothing while the task runs.",
+            "Need to emit no visible text until the background job finishes.",
+            "Oops, I'm in thought block right now.",
+            "In a thought block — no visible text needed.",
+            "No output required while waiting.",
+            "Let's end the turn silently.",
+        ]
+        for msg in leaks:
+            self.assertTrue(is_internal_cli_leak(msg), f"Expected leak for: {msg!r}")
+            self.assertEqual(classify_outbound_response(msg, mode="home").kind, "leak")
+
+        # Positive controls: substantive or >220-char explanations discussing this behavior must NOT be flagged
+        substantive_multi_para = (
+            "### Root Cause Analysis\n\n"
+            "When a background command detaches, the model occasionally attempts to emit zero text "
+            "or remarks that it is in a thought block before the task finishes. "
+            "Because the bridge guard filters short self-directed meta-reasoning chatter, "
+            "users only see the final verified result once the task completes."
+        )
+        self.assertFalse(is_internal_cli_leak(substantive_multi_para))
+        self.assertEqual(classify_outbound_response(substantive_multi_para, mode="home").kind, "text")
+
+        long_single_para = (
+            "In our bridge safety filter, we deliberately avoid suppressing thorough post-mortem "
+            "explanations even when they mention phrases like emit zero text or note how the "
+            "model tried to end the turn silently inside a thought block during an async wait."
+        )
+        self.assertGreater(len(long_single_para), 220)
+        self.assertFalse(is_internal_cli_leak(long_single_para))
+
 
 if __name__ == "__main__":
     unittest.main()

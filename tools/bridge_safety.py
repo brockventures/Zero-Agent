@@ -633,12 +633,33 @@ def is_internal_cli_leak(text: str) -> bool:
     if lower.startswith("error: interrupted") or lower == "interrupted":
         return True
 
+    is_substantive = len(cleaned.strip()) > 300 and ("\n\n" in cleaned or "###" in cleaned)
+
     # Agent runtime meta-reasoning leaks
     if (
         "in this agent runtime" in lower
         or "waiting silently without text output" in lower
         or "if we output visible text, the turn ends" in lower
         or "and the task finishes:" in lower
+    ):
+        return True
+    if (
+        not is_substantive
+        and len(cleaned) <= 220
+        and (
+            re.search(
+                r"\b(?:emit|output|emitting|outputting)\s+(?:zero|no)\s+(?:visible\s+)?(?:text|output)\b",
+                lower,
+            )
+            or re.search(r"\bin\s+(?:a\s+|the\s+)?thought\s+block\b", lower)
+            or re.search(r"\b(?:will\s+output|outputting)\s+nothing\b", lower)
+            or re.search(r"\bno\s+(?:visible\s+)?(?:text|output)\s+(?:needed|required)\b", lower)
+            or (
+                len(cleaned) <= 160
+                and "\n\n" not in cleaned
+                and re.search(r"\bend\s+the\s+turn\s+silently\b", lower)
+            )
+        )
     ):
         return True
 
@@ -649,7 +670,6 @@ def is_internal_cli_leak(text: str) -> bool:
         return True
 
     # Option B chatter on cleaned text (suppress only if not substantive)
-    is_substantive = len(cleaned.strip()) > 300 and ("\n\n" in cleaned or "###" in cleaned)
     if not is_substantive:
         lines_non_empty = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
         if lines_non_empty and all(
