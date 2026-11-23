@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Unit test suite for bridge_daemons.py (Persistent Channel Worker Daemons).
 Validates:
@@ -895,6 +894,314 @@ class TestBridgeDaemons(unittest.IsolatedAsyncioTestCase):
         br._fire_presence(failing_async_presence, status_override="dnd")
         br._fire_presence(failing_sync_presence)
         await asyncio.sleep(0.01)
+
+    async def test_19_post_turn_compaction_and_turn1_consumption(self):
+        """Verify (a) post-turn background compaction after reply & lock release + stashing pending_carryforward (home & external),
+        and (b) Turn 1 consuming & clearing pending_carryforward without inline recycle."""
+        # --- HOME MODE ---
+        worker = bd.PersistentChannelWorker(
+            channel_id=bs.TARGET_CHANNEL_ID,
+            name="zero-chat",
+            mode="home",
+            sess_key="home",
+        )
+        worker.conv_id = "conv-home-precompact"
+        worker.is_ready = True
+        worker.proc = MagicMock()
+        worker.proc.pid = 41001
+        worker.proc.returncode = None
+        worker.proc.stdin = MagicMock()
+        worker.proc.stdin.write = MagicMock()
+        worker.proc.stdin.drain = AsyncMock()
+        worker.proc.stdout = AsyncMock()
+
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.id = bs.TARGET_CHANNEL_ID
+
+        events_order = []
+
+        def fake_check_compaction(conv_id, current_turns, high_water_multiplier=1.0):
+            if high_water_multiplier > 1.0:
+                return (False, None)
+            return (True, "Turn limit reached (30/30)")
+
+        async def fake_deliver(**kwargs):
+            # When reply is delivered, worker.lock is still held and recycle has NOT run yet
+            self.assertTrue(worker.lock.locked())
+            self.assertEqual(worker.conv_id, "conv-home-precompact")
+            events_order.append("deliver")
+
+        async def fake_recycle(new_conv_id=None, keep_conv_id=False):
+            events_order.append("recycle")
+            worker.conv_id = "conv-home-fresh"
+
+        with patch("tools.bridge_daemons.check_compaction_needed", side_effect=fake_check_compaction), \
+             patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]), \
+             patch("tools.bridge_daemons.TurnCoordinator.execute_stream_loop", new_callable=AsyncMock, return_value="Turn 30 reply"), \
+             patch("tools.bridge_daemons.deliver_turn_output", side_effect=fake_deliver), \
+             patch.object(worker, "recycle", side_effect=fake_recycle) as mock_recycle, \
+             patch("tools.session_summarizer.generate_summary") as mock_gen_sum, \
+             patch("tools.session_summarizer.get_carryforward_context", side_effect=[None, "Stashed home milestones"]) as mock_get_cf:
+            res = await worker.execute_turn("Turn 30 prompt", None, mock_target, [])
+            self.assertEqual(res, "Turn 30 reply")
+            self.assertIsNotNone(worker._post_turn_compaction_task)
+            await worker._post_turn_compaction_task
+
+            self.assertEqual(events_order, ["deliver", "recycle"])
+            mock_recycle.assert_awaited_once_with(new_conv_id=None)
+            mock_gen_sum.assert_called_once_with(conv_id="conv-home-precompact", sess_key="home")
+            self.assertEqual(mock_get_cf.call_count, 2)
+            self.assertEqual(worker.pending_carryforward, "Stashed home milestones")
+            self.assertEqual(worker.turn_count, 0)
+            self.assertEqual(worker._last_session_turns, 0)
+            self.assertIsNone(worker._post_turn_compaction_task)
+
+        # Turn 1 on fresh session consumes pending_carryforward without inline recycle or disk re-fetch
+        with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
+             patch("tools.bridge_daemons.TurnCoordinator.execute_stream_loop", new_callable=AsyncMock, return_value="Turn 1 fresh reply"), \
+             patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock), \
+             patch.object(worker, "recycle", new_callable=AsyncMock) as mock_turn1_recycle, \
+             patch("tools.session_summarizer.get_carryforward_context") as mock_turn1_get_cf:
+            await worker.execute_turn("First prompt on fresh session", None, mock_target, [])
+            if worker._post_turn_compaction_task:
+                await worker._post_turn_compaction_task
+
+            self.assertIsNone(worker.pending_carryforward)
+            mock_turn1_recycle.assert_not_awaited()
+            mock_turn1_get_cf.assert_not_called()
+            written_bytes = worker.proc.stdin.write.call_args[0][0]
+            written_json = json.loads(written_bytes.decode("utf-8"))
+            sent_prompt = written_json["message"]["content"]
+            self.assertIn("[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\nStashed home milestones", sent_prompt)
+            self.assertIn("First prompt on fresh session", sent_prompt)
+
+        # --- EXTERNAL MODE ---
+        ext_worker = bd.PersistentChannelWorker(
+            channel_id=bd.LOUNGE_CHANNEL_ID,
+            name="lounge",
+            mode="external",
+            sess_key=str(bd.LOUNGE_CHANNEL_ID),
+        )
+        ext_worker.conv_id = "conv-ext-precompact"
+        ext_worker.is_ready = True
+        ext_worker.proc = MagicMock()
+        ext_worker.proc.pid = 41002
+        ext_worker.proc.returncode = None
+        ext_worker.proc.stdin = MagicMock()
+        ext_worker.proc.stdin.write = MagicMock()
+        ext_worker.proc.stdin.drain = AsyncMock()
+        ext_worker.proc.stdout = AsyncMock()
+        ext_worker._last_session_turns = 30
+
+        with patch("tools.bridge_daemons.check_compaction_needed", return_value=(True, "Turn limit reached (30/30)")), \
+             patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]), \
+             patch.object(ext_worker, "recycle", new_callable=AsyncMock) as mock_ext_recycle, \
+             patch("tools.session_summarizer.generate_summary") as mock_ext_gen, \
+             patch("tools.session_summarizer.get_engineering_carryforward_context", return_value="Sanitized eng delta") as mock_ext_get:
+            compacted = await ext_worker._maybe_compact_post_turn()
+            self.assertTrue(compacted)
+            mock_ext_recycle.assert_awaited_once_with(new_conv_id=None)
+            mock_ext_gen.assert_called_once_with(conv_id="conv-ext-precompact", sess_key=str(bd.LOUNGE_CHANNEL_ID))
+            mock_ext_get.assert_called_once_with(sess_key=str(bd.LOUNGE_CHANNEL_ID))
+            self.assertEqual(ext_worker.pending_eng_carryforward, "Sanitized eng delta")
+
+        # Turn 1 on external worker consumes pending_eng_carryforward without double-fetching overnight rollover
+        ext_target = MagicMock()
+        ext_target.channel = MagicMock()
+        ext_target.channel.id = bd.LOUNGE_CHANNEL_ID
+        with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
+             patch("tools.bridge_daemons.TurnCoordinator.execute_stream_loop", new_callable=AsyncMock, return_value="External reply"), \
+             patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock), \
+             patch.object(ext_worker, "recycle", new_callable=AsyncMock) as mock_ext_t1_recycle, \
+             patch("tools.session_summarizer.get_engineering_carryforward_context") as mock_ext_t1_get:
+            await ext_worker.execute_turn("Check lounge status", None, ext_target, [], author_name="Amos")
+            if ext_worker._post_turn_compaction_task:
+                await ext_worker._post_turn_compaction_task
+
+            self.assertIsNone(ext_worker.pending_eng_carryforward)
+            mock_ext_t1_recycle.assert_not_awaited()
+            mock_ext_t1_get.assert_not_called()
+            written_bytes = ext_worker.proc.stdin.write.call_args[0][0]
+            written_json = json.loads(written_bytes.decode("utf-8"))
+            sent_prompt = written_json["message"]["content"]
+            self.assertIn("[PREVIOUS SESSION ENGINEERING DELTA]:\nSanitized eng delta", sent_prompt)
+
+    async def test_20_post_turn_compaction_deferral_on_active_sdk_tasks(self):
+        """Verify (c) post-turn compaction defers when active SDK child processes or unsettled tasks exist."""
+        worker = bd.PersistentChannelWorker(
+            channel_id=bs.TARGET_CHANNEL_ID,
+            name="zero-chat",
+            mode="home",
+            sess_key="home",
+        )
+        worker.conv_id = "conv-busy-sdk"
+        worker.proc = MagicMock()
+        worker.proc.pid = 42001
+        worker.proc.returncode = None
+        worker._last_session_turns = 32
+
+        # 1. Active child process defers compaction
+        with patch("tools.bridge_daemons.get_process_children", return_value=[55001]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]), \
+             patch("tools.bridge_daemons.check_compaction_needed", return_value=(True, "Turn limit")), \
+             patch.object(worker, "recycle", new_callable=AsyncMock) as mock_recycle:
+            self.assertTrue(worker._has_active_sdk_tasks())
+            res = await worker._maybe_compact_post_turn()
+            self.assertFalse(res)
+            mock_recycle.assert_not_awaited()
+
+        # 2. Unsettled SDK background task defers compaction
+        with patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=["bg-task-99"]), \
+             patch("tools.bridge_daemons.check_compaction_needed", return_value=(True, "Turn limit")), \
+             patch.object(worker, "recycle", new_callable=AsyncMock) as mock_recycle:
+            self.assertTrue(worker._has_active_sdk_tasks())
+            res = await worker._maybe_compact_post_turn()
+            self.assertFalse(res)
+            mock_recycle.assert_not_awaited()
+
+        # 3. Probe exceptions fail open safely (returning False for _has_active_sdk_tasks)
+        with patch("tools.bridge_daemons.get_process_children", side_effect=RuntimeError("procfs error")), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", side_effect=RuntimeError("transcript error")):
+            self.assertFalse(worker._has_active_sdk_tasks())
+
+    async def test_21_emergency_high_water_and_manual_reset_inline_compaction(self):
+        """Verify (d) emergency high-water inline fallback and (e) manual reset_session_keys inline reset."""
+        from tools.bridge_runner import reset_session_keys
+
+        worker = bd.PersistentChannelWorker(
+            channel_id=bs.TARGET_CHANNEL_ID,
+            name="zero-chat",
+            mode="home",
+            sess_key="home",
+        )
+        worker.conv_id = "conv-high-water"
+        worker.is_ready = True
+        worker.proc = MagicMock()
+        worker.proc.pid = 43001
+        worker.proc.returncode = None
+        worker.proc.stdin = MagicMock()
+        worker.proc.stdin.write = MagicMock()
+        worker.proc.stdin.drain = AsyncMock()
+        worker.proc.stdout = AsyncMock()
+
+        mock_target = MagicMock()
+        mock_target.channel = MagicMock()
+        mock_target.channel.id = bs.TARGET_CHANNEL_ID
+
+        # Verify 2-arg stub compatibility in _check_high_water_compaction
+        with patch("tools.bridge_daemons.check_compaction_needed", new=lambda cid, turns: (True, "2-arg stub")):
+            self.assertEqual(worker._check_high_water_compaction(50), (False, ""))
+
+        # (d) Emergency 1.5x high-water triggers inline pre-turn recycle + summary injection
+        def high_water_check(conv_id, current_turns, high_water_multiplier=1.0):
+            if high_water_multiplier == 1.5:
+                return (True, "Turn limit reached (45/45)")
+            return (False, None)
+
+        with patch("tools.bridge_daemons.check_compaction_needed", side_effect=high_water_check), \
+             patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]), \
+             patch("tools.bridge_daemons.TurnCoordinator.execute_stream_loop", new_callable=AsyncMock, return_value="High water response"), \
+             patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock), \
+             patch.object(worker, "recycle", new_callable=AsyncMock) as mock_hw_recycle, \
+             patch("tools.session_summarizer.generate_summary") as mock_hw_gen, \
+             patch("tools.session_summarizer.get_carryforward_context", return_value="Emergency high-water summary"):
+            await worker.execute_turn("Prompt at 1.5x high water", None, mock_target, [])
+            if worker._post_turn_compaction_task:
+                await worker._post_turn_compaction_task
+
+            mock_hw_recycle.assert_awaited_once_with(new_conv_id=None)
+            mock_hw_gen.assert_called_once_with(conv_id="conv-high-water", sess_key="home")
+            written_bytes = worker.proc.stdin.write.call_args[0][0]
+            written_json = json.loads(written_bytes.decode("utf-8"))
+            self.assertIn("Emergency high-water summary", written_json["message"]["content"])
+
+        # (e) Manual reset_session_keys triggers inline pre-turn recycle even when compaction is False
+        worker.conv_id = "conv-manual-reset"
+        reset_session_keys.add("home")
+        try:
+            with patch("tools.bridge_daemons.check_compaction_needed", return_value=(False, None)), \
+                 patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+                 patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]), \
+                 patch("tools.bridge_daemons.TurnCoordinator.execute_stream_loop", new_callable=AsyncMock, return_value="Manual reset response"), \
+                 patch("tools.bridge_daemons.deliver_turn_output", new_callable=AsyncMock), \
+                 patch.object(worker, "recycle", new_callable=AsyncMock) as mock_mr_recycle, \
+                 patch("tools.session_summarizer.generate_summary") as mock_mr_gen, \
+                 patch("tools.session_summarizer.get_carryforward_context", return_value="Manual reset summary"):
+                await worker.execute_turn("Prompt after manual reset", None, mock_target, [])
+                if worker._post_turn_compaction_task:
+                    await worker._post_turn_compaction_task
+
+                self.assertNotIn("home", reset_session_keys)
+                mock_mr_recycle.assert_awaited_once_with(new_conv_id=None)
+                mock_mr_gen.assert_called_once_with(conv_id="conv-manual-reset", sess_key="home")
+                written_bytes = worker.proc.stdin.write.call_args[0][0]
+                written_json = json.loads(written_bytes.decode("utf-8"))
+                self.assertIn("Manual reset summary", written_json["message"]["content"])
+        finally:
+            reset_session_keys.discard("home")
+
+    async def test_22_no_self_cancellation_when_post_turn_compaction_calls_recycle_shutdown(self):
+        """Verify (f) _maybe_compact_post_turn calling recycle() -> shutdown() does not cancel itself,
+        while external shutdown() cancels a pending _post_turn_compaction_task."""
+        worker = bd.PersistentChannelWorker(
+            channel_id=bs.TARGET_CHANNEL_ID,
+            name="zero-chat",
+            mode="home",
+            sess_key="home",
+        )
+        worker.conv_id = "conv-self-cancel-check"
+        worker._last_session_turns = 30
+        old_proc = MagicMock()
+        old_proc.pid = 44001
+        old_proc.returncode = None
+        old_proc.wait = AsyncMock(return_value=0)
+        worker.proc = old_proc
+        worker.is_ready = True
+
+        async def fake_start():
+            new_proc = MagicMock()
+            new_proc.pid = 44002
+            new_proc.returncode = None
+            worker.proc = new_proc
+            worker.conv_id = "conv-fresh-after-shutdown"
+            worker.is_ready = True
+
+        with patch("tools.bridge_daemons.get_process_children", return_value=[]), \
+             patch("tools.bridge_daemons.get_turn_pending_tasks", return_value=[]), \
+             patch("tools.bridge_daemons.check_compaction_needed", return_value=(True, "Turn limit reached (30/30)")), \
+             patch.object(worker, "start", side_effect=fake_start) as mock_start, \
+             patch("tools.session_summarizer.generate_summary") as mock_gen, \
+             patch("tools.session_summarizer.get_carryforward_context", return_value="Summary after real shutdown"):
+            worker._schedule_post_turn_compaction()
+            task = worker._post_turn_compaction_task
+            self.assertIsNotNone(task)
+            result = await task
+            self.assertTrue(result)
+            old_proc.terminate.assert_called_once()
+            mock_start.assert_awaited_once()
+            mock_gen.assert_called_once_with(conv_id="conv-self-cancel-check", sess_key="home")
+            self.assertEqual(worker.conv_id, "conv-fresh-after-shutdown")
+            self.assertEqual(worker.pending_carryforward, "Summary after real shutdown")
+            self.assertIsNone(worker._post_turn_compaction_task)
+
+        # Verify external shutdown() cancels an in-flight _post_turn_compaction_task
+        block_gate = asyncio.Event()
+
+        async def blocked_compaction():
+            await block_gate.wait()
+
+        worker._post_turn_compaction_task = asyncio.create_task(blocked_compaction())
+        ext_task = worker._post_turn_compaction_task
+        await asyncio.sleep(0)
+        await worker.shutdown()
+        self.assertIsNone(worker._post_turn_compaction_task)
+        await asyncio.sleep(0)
+        self.assertTrue(ext_task.cancelled())
 
 
 if __name__ == "__main__":

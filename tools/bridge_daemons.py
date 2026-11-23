@@ -142,6 +142,10 @@ class PersistentChannelWorker:
         self.started_at: float = 0.0
         self.turn_count: int = 0
         self.last_turn_at: float = 0.0
+        self.pending_carryforward: str | None = None
+        self.pending_eng_carryforward: str | None = None
+        self._last_session_turns: int = 0
+        self._post_turn_compaction_task: asyncio.Task | None = None
 
     async def _drain_stderr(self):
         """Continuously drain stderr so pipe buffer never deadlocks the Go process,
@@ -270,6 +274,13 @@ class PersistentChannelWorker:
     async def shutdown(self):
         """Gracefully terminate worker process."""
         self.is_ready = False
+        if (
+            self._post_turn_compaction_task is not None
+            and not self._post_turn_compaction_task.done()
+            and self._post_turn_compaction_task is not asyncio.current_task()
+        ):
+            self._post_turn_compaction_task.cancel()
+            self._post_turn_compaction_task = None
         if self.stderr_task and not self.stderr_task.done():
             self.stderr_task.cancel()
             self.stderr_task = None
@@ -347,6 +358,117 @@ class PersistentChannelWorker:
             clear_channel_session_id(self.channel_id, self.mode)
         await self.start()
 
+    def _has_active_sdk_tasks(self) -> bool:
+        """Check whether this worker has active child processes or unsettled SDK background tasks."""
+        try:
+            if self.proc and self.proc.pid and get_process_children(self.proc.pid):
+                return True
+        except Exception:
+            pass
+        try:
+            if self.conv_id and get_turn_pending_tasks(self.conv_id):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _check_high_water_compaction(self, current_turns: int) -> tuple[bool, str]:
+        """Check emergency 1.5x high-water compaction threshold (graceful fallback for 2-arg test stubs)."""
+        try:
+            should_compact, reason = check_compaction_needed(
+                self.conv_id, current_turns, high_water_multiplier=1.5
+            )
+            return bool(should_compact), reason or ""
+        except TypeError:
+            return False, ""
+
+    def _schedule_post_turn_compaction(self):
+        """Schedule background post-turn idle compaction check if none is currently active."""
+        if self._post_turn_compaction_task is not None and not self._post_turn_compaction_task.done():
+            return
+        try:
+            self._post_turn_compaction_task = asyncio.create_task(self._maybe_compact_post_turn())
+        except RuntimeError:
+            pass
+
+    async def _maybe_compact_post_turn(self) -> bool:
+        """Run session compaction, warm worker recycle, and summary generation during post-turn idle window."""
+        from tools.bridge_runner import reset_session_keys
+
+        try:
+            async with self.lock:
+                if self._has_active_sdk_tasks():
+                    print(
+                        f"[BridgeDaemon] ⏳ Deferring post-turn compaction for #{self.name}: "
+                        f"active SDK background tasks or child processes present."
+                    )
+                    return False
+
+                should_compact, compact_reason = check_compaction_needed(
+                    self.conv_id, self._last_session_turns
+                )
+                in_reset_keys = self.sess_key in reset_session_keys
+                if not should_compact and not in_reset_keys:
+                    return False
+
+                reset_session_keys.discard(self.sess_key)
+                old_conv_id = self.conv_id
+                reset_session_meta(self.sess_key)
+                self.turn_count = 0
+                self._last_session_turns = 0
+                await self.recycle(new_conv_id=None)
+
+                if old_conv_id:
+                    if self.mode == "home":
+                        try:
+                            from tools.session_summarizer import (
+                                generate_summary,
+                                get_carryforward_context,
+                            )
+                            await asyncio.to_thread(
+                                generate_summary, conv_id=old_conv_id, sess_key=self.sess_key
+                            )
+                            carry_ctx = await asyncio.to_thread(
+                                get_carryforward_context, sess_key=self.sess_key
+                            )
+                            if carry_ctx:
+                                self.pending_carryforward = carry_ctx
+                            print(
+                                f"[BridgeDaemon] 🔄 Post-turn compacted & pre-warmed home worker #{self.name} "
+                                f"({compact_reason or 'manual reset'})."
+                            )
+                        except Exception as e:
+                            print(f"[BridgeDaemon] Error generating post-turn home carry-forward context: {e}")
+                    else:
+                        try:
+                            from tools.session_summarizer import (
+                                generate_summary,
+                                get_engineering_carryforward_context,
+                            )
+                            await asyncio.to_thread(
+                                generate_summary, conv_id=old_conv_id, sess_key=self.sess_key
+                            )
+                            eng_ctx = await asyncio.to_thread(
+                                get_engineering_carryforward_context, sess_key=self.sess_key
+                            )
+                            if eng_ctx:
+                                self.pending_eng_carryforward = eng_ctx
+                            print(
+                                f"[BridgeDaemon] 🔄 Post-turn compacted & pre-warmed external worker #{self.name} "
+                                f"({compact_reason or 'manual reset'})."
+                            )
+                        except Exception as ce:
+                            print(f"[BridgeDaemon] Error generating post-turn external carry-forward context: {ce}")
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            print(f"[BridgeDaemon] ⚠️ Error in post-turn compaction for #{self.name}: {err}")
+            return False
+        finally:
+            if self._post_turn_compaction_task is asyncio.current_task():
+                self._post_turn_compaction_task = None
+
     async def execute_turn(
         self,
         prompt: str,
@@ -393,7 +515,7 @@ class PersistentChannelWorker:
             )
 
         async with self.lock:
-            return await self._execute_turn_core(
+            result = await self._execute_turn_core(
                 prompt=prompt,
                 status_msg=status_msg,
                 reply_target=reply_target,
@@ -412,6 +534,8 @@ class PersistentChannelWorker:
                 is_physical_mention=is_physical_mention,
                 pre_settle_text=pre_settle_text,
             )
+        self._schedule_post_turn_compaction()
+        return result
 
     async def _execute_turn_core(
         self,
@@ -447,16 +571,29 @@ class PersistentChannelWorker:
 
         eng_carry_block = ""
         if not is_settle_reinvocation:
-            # 1. Compaction / Reset Check
+            # 1. Compaction / Reset Check & Pending Post-Turn Carry-Forward Consumption
             timer.mark_compaction_start()
+            if self.mode == "home" and self.pending_carryforward:
+                carry_ctx = self.pending_carryforward
+                self.pending_carryforward = None
+                prompt = f"[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:\n{carry_ctx}\n\n[CURRENT USER PROMPT]: {prompt}"
+                print(f"[BridgeDaemon] 📥 Injected stashed post-turn carry-forward context for #{self.name}.")
+            elif self.mode != "home" and self.pending_eng_carryforward:
+                eng_ctx = self.pending_eng_carryforward
+                self.pending_eng_carryforward = None
+                eng_carry_block = f"\n[PREVIOUS SESSION ENGINEERING DELTA]:\n{eng_ctx}\n\n"
+                print(f"[BridgeDaemon] 📥 Injected stashed post-turn engineering carry-forward delta for #{self.name}.")
+
             current_turns = increment_session_turn(self.sess_key)
-            should_compact, compact_reason = check_compaction_needed(self.conv_id, current_turns)
+            self._last_session_turns = current_turns
+            should_compact, compact_reason = self._check_high_water_compaction(current_turns)
 
             if should_compact or (self.sess_key in reset_session_keys):
-                if self.sess_key in reset_session_keys:
-                    reset_session_keys.remove(self.sess_key)
+                reset_session_keys.discard(self.sess_key)
                 old_conv_id = self.conv_id
                 reset_session_meta(self.sess_key)
+                self.turn_count = 0
+                self._last_session_turns = 0
                 await self.recycle(new_conv_id=None)
 
                 if old_conv_id:
@@ -482,7 +619,7 @@ class PersistentChannelWorker:
             timer.mark_compaction_end()
 
             # Ingest any pending carry-forward summaries from overnight rollover if not already injected
-            if "[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:" not in prompt and "[PREVIOUS SESSION ENGINEERING DELTA]:" not in prompt:
+            if "[PREVIOUS SESSION CARRY-FORWARD CONTEXT]:" not in prompt and not eng_carry_block:
                 if self.mode == "home":
                     try:
                         from tools.session_summarizer import get_carryforward_context
