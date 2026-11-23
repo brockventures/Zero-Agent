@@ -1932,6 +1932,7 @@ class BridgeScheduler:
         self._task = None
         self._heartbeat_task = None
         self._active_job_tasks = set()
+        self._vulcan_last_rollover_date: str | None = None
 
     def _record_job_success(self, job_id: str | None, job_name: str, success_ts: float) -> None:
         """Persist last_success_ts and last_run_ts only after a dispatched job succeeds."""
@@ -2314,6 +2315,72 @@ class BridgeScheduler:
         except Exception:
             pass
 
+    async def _maybe_run_vulcan_nightly_rollover(
+        self,
+        now_pt: datetime | None = None,
+        state_file: Path | str | None = None,
+    ) -> bool:
+        """Run once-per-Pacific-day 2:00 AM PT #forge carry-forward summary and warm daemon recycle."""
+        if now_pt is None:
+            now_pt = datetime.now(PT_TZ)
+        elif now_pt.tzinfo is not None:
+            now_pt = now_pt.astimezone(PT_TZ)
+        else:
+            now_pt = now_pt.replace(tzinfo=PT_TZ)
+
+        if not (now_pt.hour == 2 and now_pt.minute >= 2):
+            return False
+
+        today_str = now_pt.strftime("%Y-%m-%d")
+        if getattr(self, "_vulcan_last_rollover_date", None) == today_str:
+            return False
+
+        state_path = Path(state_file) if state_file is not None else (DATA_DIR / "vulcan_nightly_rollover.json")
+        if state_path.exists():
+            try:
+                saved = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(saved, dict) and saved.get("last_rollover_date") == today_str:
+                    self._vulcan_last_rollover_date = today_str
+                    return False
+            except Exception:
+                pass
+
+        if self.is_busy_fn and self.is_busy_fn():
+            return False
+
+        try:
+            from tools.bridge_state import (
+                FORGE_CHANNEL_ID,
+                get_channel_session_id,
+                get_session_metadata,
+                set_session_metadata,
+            )
+            from tools.session_summarizer import generate_summary
+
+            current_cid = get_channel_session_id(FORGE_CHANNEL_ID, "home")
+            if current_cid:
+                forge_key = str(FORGE_CHANNEL_ID)
+                if get_session_metadata(forge_key).get("parent_conv_id") != current_cid:
+                    await asyncio.to_thread(generate_summary, conv_id=current_cid, sess_key=forge_key)
+                    set_session_metadata(forge_key, {"parent_conv_id": current_cid})
+        except Exception as summary_err:
+            print(f"[BridgeScheduler] Warning: Vulcan nightly #forge summary check failed: {summary_err}")
+
+        from tools.bridge_daemons import daemon_manager
+
+        await daemon_manager.proactive_nightly_recycle()
+
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = state_path.with_name(f"{state_path.name}.tmp")
+        tmp_path.write_text(
+            json.dumps({"last_rollover_date": today_str, "completed_at": time.time()}, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(state_path)
+        self._vulcan_last_rollover_date = today_str
+        print(f"[BridgeScheduler] 🌙 Vulcan overnight #forge rollover & warm recycle complete ({today_str}).")
+        return True
+
     async def _loop(self):
         global _last_bot_status_mtime
         while self._running:
@@ -2365,6 +2432,11 @@ class BridgeScheduler:
                             print(f"[BridgeScheduler] Error during ForgeSupervisor self-heal recovery: {rec_err}")
 
                     await self.flush_outbox_queue(channel_filter=FORGE_CHANNEL_ID)
+
+                    try:
+                        await self._maybe_run_vulcan_nightly_rollover()
+                    except Exception as rollover_err:
+                        print(f"[BridgeScheduler] Warning: Vulcan nightly rollover failed: {rollover_err}")
 
                     vulcan_reload_flag = DATA_DIR / "reload_vulcan.flag"
                     if vulcan_reload_flag.exists() or hygiene_res.get("synced_files"):
