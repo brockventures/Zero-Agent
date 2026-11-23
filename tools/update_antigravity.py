@@ -36,7 +36,8 @@ def _update_host_dockerfile(target_version: str) -> tuple[bool, str]:
     """Update Dockerfile on Host 2 with the new release version pin."""
     target_version = target_version.lstrip("v")
     host_agent_dir = os.environ.get("HOST_AGENT_DIR") or os.path.join(
-        nas_config.DOCKER_ROOT, "discord-agy-agent"
+        getattr(nas_config, "HOST_2_DOCKER_ROOT", nas_config.DOCKER_ROOT),
+        "discord-agy-agent",
     )
     cmd = (
         f"sed -i -E 's|antigravity-cli/releases/download/[^/]+/|antigravity-cli/releases/download/"

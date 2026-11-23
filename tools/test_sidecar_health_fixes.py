@@ -524,12 +524,12 @@ def test_update_antigravity_perform_upgrade_force(capsys):
 
 
 def test_update_host_dockerfile_uses_nas_config(monkeypatch):
-    """Verify _update_host_dockerfile resolves DOCKER_ROOT and invokes run_ssh cleanly without hardcoded IPs."""
+    """Verify _update_host_dockerfile resolves HOST_2_DOCKER_ROOT and invokes run_ssh cleanly without hardcoded IPs."""
     mock_docker_root = "/nas/docker_test"
 
     monkeypatch.delenv("HOST_AGENT_DIR", raising=False)
     monkeypatch.setattr(update_antigravity.nas_config, "HOST_2_IP", DOC_HOST_2)
-    monkeypatch.setattr(update_antigravity.nas_config, "DOCKER_ROOT", mock_docker_root)
+    monkeypatch.setattr(update_antigravity.nas_config, "HOST_2_DOCKER_ROOT", mock_docker_root)
 
     with patch.object(update_antigravity.nas_config, "run_ssh", return_value=(0, "ok", "")) as mock_run_ssh:
         ok, msg = update_antigravity._update_host_dockerfile("1.2.0")

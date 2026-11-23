@@ -263,6 +263,54 @@ class TestZeroHealthServer(unittest.TestCase):
         self.assertEqual(code1, code2)
         self.assertEqual(payload1, payload2)
 
+    def test_ivy_probe_code_defaults_to_volume2_with_fallbacks(self):
+        v2_ivy = os.path.join(os.sep, "volume2", "docker", "discord-ivy-agent")
+        v1_ivy = os.path.join(os.sep, "volume1", "docker", "discord-ivy-agent")
+        self.assertIn("NAS_HOST_2_DOCKER_ROOT", zhealth.IVY_PROBE_CODE)
+        self.assertIn('"volume2"', zhealth.IVY_PROBE_CODE)
+        self.assertIn("/opt/docker/discord-ivy-agent", zhealth.IVY_PROBE_CODE)
+
+        def _run_probe(existing_paths, env_overrides=None):
+            env_patch = {
+                "IVY_AGENT_DIR": "",
+                "NAS_HOST_2_DOCKER_ROOT": "",
+                "NAS_DOCKER_ROOT": "",
+            }
+            if env_overrides:
+                env_patch.update(env_overrides)
+            cleaned_env = {k: v for k, v in os.environ.items() if k not in env_patch}
+            for k, v in env_patch.items():
+                if v:
+                    cleaned_env[k] = v
+
+            ns = {}
+            buf = io.StringIO()
+            with patch.dict(os.environ, cleaned_env, clear=True), \
+                 patch("os.path.exists", side_effect=lambda p: p in existing_paths), \
+                 patch("subprocess.check_output", side_effect=RuntimeError("no docker")), \
+                 patch("sys.stdout", buf):
+                exec(compile(zhealth.IVY_PROBE_CODE, "<ivy_probe>", "exec"), ns)  # noqa: S102
+            return ns["ivy_dir"], json.loads(buf.getvalue())
+
+        # 1. Defaults to Volume 2 when present and no env vars set
+        ivy_dir_v2, out_v2 = _run_probe({v2_ivy})
+        self.assertEqual(ivy_dir_v2, v2_ivy)
+        self.assertEqual(out_v2["container_status"], "offline")
+
+        # 2. Respects NAS_HOST_2_DOCKER_ROOT when set
+        custom_root = "/custom/nvme/docker"
+        custom_ivy = os.path.join(custom_root, "discord-ivy-agent")
+        ivy_dir_custom, _ = _run_probe({custom_ivy}, {"NAS_HOST_2_DOCKER_ROOT": custom_root})
+        self.assertEqual(ivy_dir_custom, custom_ivy)
+
+        # 3. Falls back to Volume 1 when Volume 2 is absent
+        ivy_dir_v1, _ = _run_probe({v1_ivy})
+        self.assertEqual(ivy_dir_v1, v1_ivy)
+
+        # 4. Falls back to /opt/docker/discord-ivy-agent when Volume 2 and Volume 1 are absent
+        ivy_dir_opt, _ = _run_probe({"/opt/docker/discord-ivy-agent"})
+        self.assertEqual(ivy_dir_opt, "/opt/docker/discord-ivy-agent")
+
     def test_public_landing_host_and_html(self):
         self.assertTrue(zhealth.ZeroHealthHandler._is_public_landing_host("brock.ventures"))
         self.assertTrue(zhealth.ZeroHealthHandler._is_public_landing_host("www.brock.ventures:443"))

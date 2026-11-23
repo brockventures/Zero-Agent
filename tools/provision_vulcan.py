@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001
 """
 provision_vulcan.py — Host 2 Container Provisioner for Vulcan (`discord-vulcan-agent`).
 
-Stages `$NAS_DOCKER_ROOT/discord-vulcan-agent/` on Host 2 using `tools/nas_config.py`
+Stages `$NAS_HOST_2_DOCKER_ROOT/discord-vulcan-agent/` on Host 2 using `tools/nas_config.py`
 with zero hardcoded IPs or topology literals.
 """
 
@@ -14,15 +15,14 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 for _p in (str(_REPO_ROOT), str(_REPO_ROOT / "tools"), "/workspace", "/workspace/tools"):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from tools import nas_config  # noqa: E402
-from tools.bridge_state import FORGE_CHANNEL_ID, VULCAN_USER_ID  # noqa: E402
+from tools import nas_config
+from tools.bridge_state import FORGE_CHANNEL_ID, VULCAN_USER_ID
 
 CONTAINER_NAME = "discord-vulcan-agent"
 IMAGE_NAME = "discord-agy-agent-antigravity-agent:latest"
@@ -40,11 +40,11 @@ You are **Vulcan** (**V**erified **U**nattended **L**abor & **C**ode **A**nvil *
 
 
 def render_vulcan_compose_yaml(
-    docker_root: Optional[str] = None,
+    docker_root: str | None = None,
     mount_git_credentials: bool = True,
 ) -> str:
     """Render the docker-compose.yml content for `discord-vulcan-agent` on Host 2."""
-    d_root = (docker_root or nas_config.DOCKER_ROOT).rstrip("/")
+    d_root = (docker_root or getattr(nas_config, "HOST_2_DOCKER_ROOT", nas_config.DOCKER_ROOT)).rstrip("/")
     zero_dir = f"{d_root}/discord-agy-agent"
     vulcan_dir = f"{d_root}/{CONTAINER_NAME}"
 
@@ -88,12 +88,12 @@ services:
 
 
 def build_remote_staging_Payload(
-    docker_root: Optional[str] = None,
-    discord_bot_token: Optional[str] = None,
+    docker_root: str | None = None,
+    discord_bot_token: str | None = None,
     mount_git_credentials: bool = True,
 ) -> dict[str, str]:
-    """Build the dictionary of files to stage inside `$NAS_DOCKER_ROOT/discord-vulcan-agent/`."""
-    d_root = (docker_root or nas_config.DOCKER_ROOT).rstrip("/")
+    """Build the dictionary of files to stage inside `$NAS_HOST_2_DOCKER_ROOT/discord-vulcan-agent/`."""
+    d_root = (docker_root or getattr(nas_config, "HOST_2_DOCKER_ROOT", nas_config.DOCKER_ROOT)).rstrip("/")
     vulcan_dir = f"{d_root}/{CONTAINER_NAME}"
     compose_yml = render_vulcan_compose_yaml(
         docker_root=d_root,
@@ -134,7 +134,7 @@ def resolve_vulcan_bot_token() -> str:
                 val = str(data.get(k) or "").strip()
                 if val:
                     return val
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     return ""
 
@@ -142,10 +142,10 @@ def resolve_vulcan_bot_token() -> str:
 def provision_vulcan_on_host2(
     dry_run: bool = False,
     start_container: bool = False,
-    docker_root: Optional[str] = None,
+    docker_root: str | None = None,
 ) -> dict:
-    """Stage `$NAS_DOCKER_ROOT/discord-vulcan-agent/` on Host 2 via `nas_config.run_ssh`."""
-    d_root = (docker_root or nas_config.DOCKER_ROOT).rstrip("/")
+    """Stage `$NAS_HOST_2_DOCKER_ROOT/discord-vulcan-agent/` on Host 2 via `nas_config.run_ssh`."""
+    d_root = (docker_root or getattr(nas_config, "HOST_2_DOCKER_ROOT", nas_config.DOCKER_ROOT)).rstrip("/")
     vulcan_dir = f"{d_root}/{CONTAINER_NAME}"
     token = resolve_vulcan_bot_token()
     files = build_remote_staging_Payload(docker_root=d_root, discord_bot_token=token)
@@ -218,7 +218,7 @@ def provision_vulcan_on_host2(
     }
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Provision discord-vulcan-agent on Host 2.")
     parser.add_argument("--dry-run", action="store_true", help="Print staged configuration without SSH execution.")
     parser.add_argument("--start", action="store_true", help="Start container via docker-compose up -d after staging.")

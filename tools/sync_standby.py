@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001
 """
 Zero Standby Replica Sync Script
 1. Pulls latest code, tools, and skills from GitHub (git pull origin main).
@@ -6,14 +7,13 @@ Zero Standby Replica Sync Script
 3. Strictly excludes .env, /secrets/, Discord bot tokens, and active SQLite DBs.
 4. Debounces execution to run at most once per 12 hours unless --force is specified.
 """
-import sys
-import os
-import io
-import time
-import json
 import argparse
+import io
+import json
 import subprocess
+import sys
 import tarfile
+import time
 from pathlib import Path
 
 # Paths
@@ -21,7 +21,9 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 if str(WORKSPACE_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT / "tools"))
 
-from nas_config import HOST_2_DOCKER_ROOT, HOST_2_IP as HOST2_IP, SSH_KEY, SSH_PORT, SSH_USER as HOST2_USER
+from nas_config import HOST_2_DOCKER_ROOT, SSH_KEY, SSH_PORT
+from nas_config import HOST_2_IP as HOST2_IP
+from nas_config import SSH_USER as HOST2_USER
 
 TIMESTAMP_FILE = WORKSPACE_ROOT / "data" / "last_standby_sync.json"
 SSH_KEY_PATH = Path(SSH_KEY)
@@ -66,7 +68,7 @@ def is_recent_sync(hours: float = 12.0) -> bool:
             data = json.load(f)
         last_ts = data.get("timestamp", 0)
         return (time.time() - last_ts) < (hours * 3600)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 def record_sync_success(file_count: int, git_pulled: bool):
@@ -91,7 +93,8 @@ def run_git_pull() -> bool:
             cwd=str(WORKSPACE_ROOT),
             capture_output=True,
             text=True,
-            timeout=15
+            timeout=15,
+            check=False,
         )
         if res.returncode == 0:
             print(f"[Sync] Git pull clean: {res.stdout.strip()}")
@@ -99,7 +102,7 @@ def run_git_pull() -> bool:
         else:
             print(f"[Sync] Git pull notice: {res.stderr.strip()}")
             return False
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[Sync] Git pull skipped: {e}")
         return False
 
@@ -123,7 +126,7 @@ def sync_host2_snapshot() -> int:
             pkey=key,
             timeout=6
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[Sync] Could not reach Host 2 ({HOST2_IP}): {e}")
         print("[Sync] Host 2 may be offline or unreachable on LAN. Standby files unchanged.")
         return 0
@@ -149,7 +152,7 @@ def sync_host2_snapshot() -> int:
     )
 
     t0 = time.time()
-    stdin, stdout, stderr = client.exec_command(tar_cmd)
+    _stdin, stdout, _stderr = client.exec_command(tar_cmd)
     raw_data = stdout.read()
     client.close()
     elapsed = time.time() - t0
@@ -208,7 +211,7 @@ def main():
         file_count = sync_host2_snapshot()
         record_sync_success(file_count, git_success)
         print(f"[Sync] Complete. Standby replica updated successfully ({file_count} files).")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[Sync] Failed during Host 2 snapshot sync: {e}")
         return 1
 

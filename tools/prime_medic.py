@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: EXE001
 """
 prime_medic.py — Zero Prime First-Responder & Recovery CLI (Workstation Shard)
 
@@ -22,7 +23,6 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import urllib.request
 from pathlib import Path
@@ -66,7 +66,7 @@ def check_http_health(host: str, port: int = 8080, path: str = "/healthz", timeo
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace").strip()
             return resp.status == 200, f"HTTP {resp.status}: {body[:200]}"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return False, f"Unreachable ({url}): {e}"
 
 
@@ -84,7 +84,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 export PATH=/usr/local/bin:$PATH
 echo "--- UPTIME & DISK ---"
 uptime
-df -h /volume1 /volume2 2>/dev/null || df -h | grep -E "volume[12]|$" | tail -n 3
+df -h /volume1 /volume2 2>/dev/null || df -h | grep -E "Filesystem|volume1|volume2"
 
 echo "--- CONTAINERS ---"
 docker ps -a --filter "name=discord-" --format "{{{{.Names}}}} | {{{{.Status}}}} | {{{{.RunningFor}}}}"
@@ -217,7 +217,7 @@ docker inspect -f "Status={{{{.State.Status}}}} Running={{{{.State.Running}}}} S
 
 
 def cmd_sync_git(args: argparse.Namespace) -> int:
-    _banner(f"Syncing Zero Prime Repository (/workspace) with origin/main")
+    _banner("Syncing Zero Prime Repository (/workspace) with origin/main")
     remote_cmd = f"""
 export PATH=/usr/local/bin:$PATH
 docker exec {PRIME_CONTAINER} bash -c "cd /workspace && git fetch origin main && git status -sb && git pull --rebase origin main && git log -n 3 --oneline"

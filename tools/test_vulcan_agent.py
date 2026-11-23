@@ -240,6 +240,11 @@ class TestVulcanAgentScoping(unittest.TestCase):
         self.assertIn("/opt/docker/discord-vulcan-agent/docker-compose.yml", res["files"])
         self.assertIn("/opt/docker/discord-vulcan-agent/agents.md", res["files"])
 
+        with patch.object(pv.nas_config, "HOST_2_DOCKER_ROOT", "/mock/nvme/docker"):
+            res_default = pv.provision_vulcan_on_host2(dry_run=True)
+            self.assertEqual(res_default["vulcan_dir"], "/mock/nvme/docker/discord-vulcan-agent")
+            self.assertIn("/mock/nvme/docker/discord-vulcan-agent/docker-compose.yml", res_default["files"])
+
     def test_provision_vulcan_compose_git_credentials_optional_toggle(self):
         compose_no_creds = pv.render_vulcan_compose_yaml(
             docker_root="/opt/docker",
