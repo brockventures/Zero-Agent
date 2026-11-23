@@ -6731,5 +6731,211 @@ def test_verify_chunk_worktree_autofix_ruff_and_guards(tmp_path):
     assert unstaged_diff.stdout.strip() == ""
 
 
+def test_unknown_exit_render_job_widget_embed(tmp_path, monkeypatch):
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    monkeypatch.setattr(forge, "TASKS_DIR", tmp_path / "detached_tasks")
+
+    start_ts = time.time() - 3600.0
+    end_ts = start_ts + 42.0
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time, duration_seconds)
+            VALUES (?, 'Interrupted Job', 'python3 worker.py', 'zero-chat', '/workspace', 60, 'unknown_exit', ?, ?, NULL)
+            """,
+            ("dt-unknown-render-1", start_ts, end_ts),
+        )
+
+    embed = forge.render_job_widget_embed("dt-unknown-render-1", db_path=db_p)
+    assert embed["title"].startswith("⚠️")
+    assert "**INTERRUPTED**" in embed["description"]
+    assert "⏱️ 42s" in embed["description"]
+    assert "Auto-clears in 1h" in embed["footer"]["text"]
+
+
+def test_unknown_exit_prune_completed_job_widgets(tmp_path):
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    now = time.time()
+
+    with forge.get_db_connection(db_p) as conn:
+        # Expired after FAILED_JOB_WIDGET_TTL_SECONDS (600s)
+        conn.execute(
+            """
+            INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time, forge_message_id)
+            VALUES (?, 'Old Interrupted', 'echo 1', 'zero-chat', '/workspace', 60, 'unknown_exit', ?, ?, 1111111111)
+            """,
+            ("dt-unknown-old", now - 800.0, now - 700.0),
+        )
+        # Recent unknown_exit in same channel, superseded by newer completed job
+        conn.execute(
+            """
+            INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time, forge_message_id)
+            VALUES (?, 'Superseded Interrupted', 'echo 2', 'lounge', '/workspace', 60, 'unknown_exit', ?, ?, 2222222222)
+            """,
+            ("dt-unknown-superseded", now - 100.0, now - 50.0),
+        )
+        conn.execute(
+            """
+            INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time, forge_message_id)
+            VALUES (?, 'Newer Completed', 'echo 3', 'lounge', '/workspace', 60, 'completed', ?, ?, NULL)
+            """,
+            ("dt-completed-newer", now - 40.0, now - 10.0),
+        )
+        # Recent unknown_exit in another channel with no newer completed job -> should NOT be pruned
+        conn.execute(
+            """
+            INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time, forge_message_id)
+            VALUES (?, 'Fresh Interrupted', 'echo 4', 'forge', '/workspace', 60, 'unknown_exit', ?, ?, 3333333333)
+            """,
+            ("dt-unknown-fresh", now - 100.0, now - 50.0),
+        )
+
+    pruned = forge.prune_completed_job_widgets(ttl_seconds=3600.0, db_path=db_p, delete_remote=False)
+    assert "dt-unknown-old" in pruned
+    assert "dt-unknown-superseded" in pruned
+    assert "dt-unknown-fresh" not in pruned
+
+
+def test_unknown_exit_sweep_stale_forge_channel_embeds(tmp_path, monkeypatch):
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    old_ts = time.time() - 700.0
+
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, start_time, end_time, forge_message_id)
+            VALUES (?, 'Stale Interrupted Job', 'python3 job.py', 'zero-chat', '/workspace', 60, 'unknown_exit', ?, ?, 1564468993128009881)
+            """,
+            ("dt-unknown-sweep-1", old_ts - 60.0, old_ts),
+        )
+
+    fake_messages = [
+        {
+            "id": "1564468993128009881",
+            "timestamp": "2026-10-27T01:00:00+00:00",
+            "embeds": [
+                {
+                    "title": "⚙️ Stale Interrupted Job",
+                    "description": "**RUNNING** · `Zero-Agent` · <#1542081375287640084> · ⏱️ 1m 0s",
+                    "footer": {"text": "dt-unknown-sweep-1 · Oct 26"},
+                }
+            ],
+        },
+        {
+            # Non-job warning embed must NOT be swept solely because of ⚠️ prefix
+            "id": "1564468993128009882",
+            "timestamp": "2026-10-27T01:00:00+00:00",
+            "embeds": [
+                {
+                    "title": "⚠️ System Warning",
+                    "description": "**NOTICE** · Non-job warning card",
+                    "footer": {"text": "Notice"},
+                }
+            ],
+        },
+    ]
+
+    deleted_urls = []
+
+    class FakeResp:
+        def __init__(self, status_code, data=None):
+            self.status_code = status_code
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    monkeypatch.setattr(forge.requests, "get", lambda url, **kw: FakeResp(200, fake_messages))
+    monkeypatch.setattr(forge.requests, "delete", lambda url, **kw: (deleted_urls.append(url), FakeResp(204))[1])
+
+    swept = forge._sweep_stale_forge_channel_embeds(
+        cutoff=time.time() - 3600.0,
+        forge_channel_id=forge.FORGE_CHANNEL_ID,
+        token="fake-token",
+        db_paths=[db_p],
+    )
+    assert "dt-unknown-sweep-1" in swept
+    assert len(deleted_urls) == 1
+    assert "1564468993128009881" in deleted_urls[0]
+
+
+def test_unknown_exit_reconcile_forge_on_boot(tmp_path, monkeypatch):
+    import tools.forge as forge
+
+    db_p = tmp_path / "forge.db"
+    forge.init_forge_db(db_p)
+    tasks_dir = tmp_path / "detached_tasks"
+    monkeypatch.setattr(forge, "TASKS_DIR", tasks_dir)
+    monkeypatch.setattr(forge, "is_ivy_container", lambda: False)
+    monkeypatch.setattr(forge, "_is_pid_running", lambda pid: False)
+    monkeypatch.setattr(forge, "_get_active_build_worker_ids", lambda *a, **kw: set())
+
+    widget_calls = []
+    monkeypatch.setattr(
+        forge,
+        "post_or_update_job_widget",
+        lambda j_id, db_path=None, **kw: widget_calls.append((j_id, Path(db_path))) or 999888777,
+    )
+
+    job_id = "dt-reap-unknown-1"
+    job_dir = tasks_dir / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    start_ts = time.time() - 120.0
+    meta_file = job_dir / "meta.json"
+    meta_file.write_text(
+        json.dumps(
+            {
+                "task_id": job_id,
+                "name": "Dead Running Job",
+                "command": "python3 run.py",
+                "channel": "zero-chat",
+                "status": "running",
+                "start_time": start_ts,
+                "end_time": None,
+                "duration_seconds": None,
+                "forge_message_id": 1564468993128009888,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    with forge.get_db_connection(db_p) as conn:
+        conn.execute(
+            """
+            INSERT INTO forge_jobs (id, name, command, channel, cwd, timeout, status, worker_pid, child_pid, log_file, start_time, forge_message_id)
+            VALUES (?, 'Dead Running Job', 'python3 run.py', 'zero-chat', '/workspace', 60, 'running', 999991, 999992, '', ?, 1564468993128009888)
+            """,
+            (job_id, start_ts),
+        )
+
+    res = forge.reconcile_forge_on_boot(db_path=db_p)
+    assert res["pruned_jobs"] >= 1
+    assert widget_calls == [(job_id, db_p)]
+
+    with forge.get_db_connection(db_p) as conn:
+        row = conn.execute(
+            "SELECT status, end_time, duration_seconds FROM forge_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+    assert row["status"] == "unknown_exit"
+    assert row["end_time"] is not None
+    assert row["duration_seconds"] is not None and row["duration_seconds"] >= 100.0
+
+    updated_meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert updated_meta["status"] == "unknown_exit"
+    assert updated_meta["end_time"] == row["end_time"]
+    assert updated_meta["duration_seconds"] is not None and updated_meta["duration_seconds"] >= 100.0
+
+
 if __name__ == "__main__":
     unittest.main()

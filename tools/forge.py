@@ -4685,6 +4685,7 @@ def render_job_widget_embed(task_id: str, db_path: Path | str = FORGE_DB_PATH) -
         "failed": ("❌", "FAILED", 0xEF4444),
         "timed_out": ("⏱️", "TIMED OUT", 0xEF4444),
         "cancelled": ("🛑", "CANCELLED", 0x6B7280),
+        "unknown_exit": ("⚠️", "INTERRUPTED", 0xEF4444),
     }
     b_emoji, b_label, color = status_meta.get(status, ("⚙️", status.upper(), 0x3B82F6))
 
@@ -4699,6 +4700,8 @@ def render_job_widget_embed(task_id: str, db_path: Path | str = FORGE_DB_PATH) -
     dur_val = meta.get("duration_seconds")
     if dur_val is not None:
         dur_str = _format_duration(dur_val)
+    elif meta.get("end_time") and meta.get("start_time"):
+        dur_str = _format_duration(max(0.0, float(meta["end_time"]) - float(meta["start_time"])))
     elif meta.get("start_time"):
         dur_str = _format_duration(time.time() - float(meta["start_time"]))
     else:
@@ -4746,7 +4749,7 @@ def render_job_widget_embed(task_id: str, db_path: Path | str = FORGE_DB_PATH) -
     desc = "\n\n".join(desc_parts)
 
     footer_time = meta.get("end_time") or meta.get("start_time") or time.time()
-    footer_suffix = " · Auto-clears in 1h" if status in ("completed", "failed", "cancelled", "timed_out") else ""
+    footer_suffix = " · Auto-clears in 1h" if status in TERMINAL_JOB_STATUSES else ""
     return {
         "title": f"{b_emoji} {meta.get('name', 'Background Task')[:220]}",
         "description": desc[:4000],
@@ -4842,7 +4845,7 @@ def post_or_update_job_widget(
 _LAST_REMOTE_CHANNEL_SWEEP_TS: float = 0.0
 REMOTE_CHANNEL_SWEEP_INTERVAL_SECONDS: float = 300.0
 FAILED_JOB_WIDGET_TTL_SECONDS: float = 600.0
-TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled", "timed_out")
+TERMINAL_JOB_STATUSES = ("completed", "failed", "cancelled", "timed_out", "unknown_exit")
 TERMINAL_BUILD_STATUSES = ("completed", "failed", "cancelled")
 
 
@@ -4852,7 +4855,7 @@ def prune_completed_job_widgets(
     forge_channel_id: int = FORGE_CHANNEL_ID,
     delete_remote: bool = True,
 ) -> list[str]:
-    """Delete Discord embed cards in #forge for terminal background jobs (`completed`, `failed`, `cancelled`, `timed_out`) older than `ttl_seconds` (or 10m for failed jobs, or immediately if `cancelled` or superseded by a newer completed job in the same channel)."""
+    """Delete Discord embed cards in #forge for terminal background jobs (`completed`, `failed`, `cancelled`, `timed_out`, `unknown_exit`) older than `ttl_seconds` (or 10m for failed/interrupted jobs, or immediately if `cancelled` or superseded by a newer completed job in the same channel)."""
     now = time.time()
     cutoff = now - float(ttl_seconds)
     failed_cutoff = now - min(float(ttl_seconds), float(FAILED_JOB_WIDGET_TTL_SECONDS))
@@ -4868,14 +4871,14 @@ def prune_completed_job_widgets(
                 rows = conn.execute(
                     """
                     SELECT id, status, forge_message_id FROM forge_jobs
-                    WHERE LOWER(status) IN ('completed', 'failed', 'cancelled', 'timed_out')
+                    WHERE LOWER(status) IN ('completed', 'failed', 'cancelled', 'timed_out', 'unknown_exit')
                       AND forge_message_id IS NOT NULL
                       AND (
                           LOWER(status) = 'cancelled'
                           OR COALESCE(end_time, start_time) <= ?
-                          OR (LOWER(status) IN ('failed', 'timed_out') AND COALESCE(end_time, start_time) <= ?)
+                          OR (LOWER(status) IN ('failed', 'timed_out', 'unknown_exit') AND COALESCE(end_time, start_time) <= ?)
                           OR (
-                              LOWER(status) IN ('failed', 'timed_out')
+                              LOWER(status) IN ('failed', 'timed_out', 'unknown_exit')
                               AND EXISTS (
                                   SELECT 1 FROM forge_jobs j2
                                   WHERE j2.channel = forge_jobs.channel
@@ -4932,7 +4935,7 @@ def _sweep_stale_forge_channel_embeds(
     token: str,
     db_paths: list[Path],
 ) -> list[str]:
-    """Channel-level sweep: delete terminal (`completed`, `failed`, `cancelled`, `timed_out`) #forge embed cards older than `cutoff`,
+    """Channel-level sweep: delete terminal (`completed`, `failed`, `cancelled`, `timed_out`, `unknown_exit`) #forge embed cards older than `cutoff`,
     immediately delete `cancelled` cards, and immediately delete duplicate or orphaned `STARTING` cards.
     """
     swept_ids: list[str] = []
@@ -4979,12 +4982,16 @@ def _sweep_stale_forge_channel_embeds(
             is_cancelled = title.startswith("🛑") or desc.startswith("**CANCELLED**")
             is_failed_dt = (
                 entity_id.startswith("dt-")
-                and (title.startswith(("❌", "⏱️")) or desc.startswith(("**FAILED**", "**TIMED OUT**")))
+                and (
+                    title.startswith(("❌", "⏱️", "⚠️"))
+                    or desc.startswith(("**FAILED**", "**TIMED OUT**", "**INTERRUPTED**", "**UNKNOWN EXIT**"))
+                )
             )
             is_terminal = (
                 is_cancelled
+                or is_failed_dt
                 or title.startswith(("✅", "❌", "⏱️"))
-                or desc.startswith(("**COMPLETED**", "**FAILED**", "**TIMED OUT**"))
+                or desc.startswith(("**COMPLETED**", "**FAILED**", "**TIMED OUT**", "**INTERRUPTED**", "**UNKNOWN EXIT**"))
             )
 
             db_ts = 0.0
@@ -5020,9 +5027,9 @@ def _sweep_stale_forge_channel_embeds(
                 if found_in_db:
                     if db_status == "cancelled":
                         is_cancelled = True
-                    if entity_id.startswith("dt-") and db_status in ("failed", "timed_out"):
+                    if entity_id.startswith("dt-") and db_status in ("failed", "timed_out", "unknown_exit"):
                         is_failed_dt = True
-                    if db_status in ("completed", "failed", "cancelled", "timed_out"):
+                    if db_status in ("completed", "failed", "cancelled", "timed_out", "unknown_exit"):
                         is_terminal = True
                 elif msg_ts > 0 and (now - msg_ts) >= 7200.0:
                     is_terminal = True
@@ -7396,8 +7403,9 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
         del_cur = conn.execute("DELETE FROM forge_jobs WHERE log_file LIKE '/tmp/%' OR id LIKE 'dt-test-%'")
         pruned_jobs += del_cur.rowcount
         active_jobs = conn.execute(
-            "SELECT id, status, channel, worker_pid, child_pid, start_time FROM forge_jobs WHERE status IN ('starting', 'running')"
+            "SELECT id, status, channel, worker_pid, child_pid, start_time, forge_message_id FROM forge_jobs WHERE status IN ('starting', 'running')"
         ).fetchall()
+        reaped_jobs: list[tuple[str, object, float, Optional[float]]] = []
         now_ts = time.time()
         in_ivy = is_ivy_container()
         for j in active_jobs:
@@ -7410,11 +7418,39 @@ def reconcile_forge_on_boot(db_path: Path | str = FORGE_DB_PATH) -> dict:
             cpid = j["child_pid"]
             alive = _is_pid_running(cpid) or _is_pid_running(wpid)
             if not alive and (now_ts - float(j["start_time"] or 0)) > 15.0:
+                dur_s = max(0.0, now_ts - float(j["start_time"])) if j["start_time"] else None
                 conn.execute(
-                    "UPDATE forge_jobs SET status = 'unknown_exit', end_time = ? WHERE id = ?",
-                    (now_ts, j["id"]),
+                    "UPDATE forge_jobs SET status = 'unknown_exit', end_time = ?, duration_seconds = COALESCE(duration_seconds, ?) WHERE id = ?",
+                    (now_ts, dur_s, j["id"]),
                 )
+                reaped_jobs.append((j["id"], j["forge_message_id"], now_ts, dur_s))
                 pruned_jobs += 1
+
+    for j_id, msg_id, end_ts, dur_s in reaped_jobs:
+        job_dir = _get_job_dir(j_id)
+        meta_file = job_dir / "meta.json"
+        if meta_file.exists():
+            try:
+                m = json.loads(meta_file.read_text(encoding="utf-8"))
+                m["status"] = "unknown_exit"
+                m["end_time"] = end_ts
+                if m.get("duration_seconds") is None and dur_s is not None:
+                    m["duration_seconds"] = dur_s
+                temp_file = job_dir / "meta.json.tmp"
+                temp_file.write_text(json.dumps(m, indent=2), encoding="utf-8")
+                temp_file.replace(meta_file)
+            except Exception:
+                pass
+        has_msg_id = False
+        try:
+            has_msg_id = int(msg_id or 0) > 0
+        except (TypeError, ValueError):
+            has_msg_id = bool(msg_id)
+        if has_msg_id:
+            try:
+                post_or_update_job_widget(j_id, db_path=db_path)
+            except Exception:
+                pass
 
     recovered_decisions = recover_stale_executing_decisions(db_path=db_path)
     return {
