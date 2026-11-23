@@ -117,8 +117,9 @@ GHIBLI_MEAL_ART_PROMPTS: dict[str, str] = {
 
 
 def get_remote_ical_bridge_dir() -> str:
-    """Return Host 2 ical-bridge deploy directory using nas_config.DOCKER_ROOT."""
-    return f"{nas_config.DOCKER_ROOT}/hearth/deploy/ical-bridge"
+    """Return Host 2 ical-bridge deploy directory using nas_config.HOST_2_DOCKER_ROOT."""
+    host2_docker_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", nas_config.DOCKER_ROOT)
+    return f"{host2_docker_root}/hearth/deploy/ical-bridge"
 
 
 def get_remote_overrides_path() -> str:

@@ -65,6 +65,21 @@ class _FakeHTTPResponse(io.BytesIO):
         return False
 
 
+def test_postgres_targets_use_split_docker_roots():
+    import os
+
+    h1 = postgres_update_check.POSTGRES_TARGETS["host1"]
+    h2 = postgres_update_check.POSTGRES_TARGETS["host2"]
+
+    assert h1["compose_dir"] == os.path.join(postgres_update_check.DOCKER_ROOT, "appdata")
+    assert h2["compose_dir"] == os.path.join(postgres_update_check.HOST_2_DOCKER_ROOT, "baseball")
+    expected_h2_backup = os.environ.get(
+        "PG_HOST2_BACKUP_DIR",
+        os.path.join(postgres_update_check.HOST_2_DOCKER_ROOT, "baseball", "backups", "postgres"),
+    )
+    assert h2["local_backup_dir"] == expected_h2_backup
+
+
 def test_get_hub_tag_digests_parses_top_level_and_amd64():
     def fake_urlopen(req, timeout=15):
         assert req.full_url.endswith("/tags/16-alpine")

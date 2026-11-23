@@ -22,9 +22,11 @@ for _p in ["/workspace", "/workspace/tools"]:
         sys.path.insert(0, _p)
 
 try:
-    from tools.nas_config import resolve_nas_config, run_ssh as _nas_run_ssh, DOCKER_ROOT
+    from tools.nas_config import HOST_2_DOCKER_ROOT, resolve_nas_config
+    from tools.nas_config import run_ssh as _nas_run_ssh
 except ImportError:
-    from nas_config import resolve_nas_config, run_ssh as _nas_run_ssh, DOCKER_ROOT
+    from nas_config import HOST_2_DOCKER_ROOT, resolve_nas_config
+    from nas_config import run_ssh as _nas_run_ssh
 
 _, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
@@ -76,14 +78,14 @@ def backup_mealie(ts: str) -> tuple[bool, str]:
     dest_tar = f"/volumeUSB1/usbshare/backups/mealie/mealie_recipes_{ts}.tar.gz"
 
     # 1. WAL-safe SQLite backup
-    cmd_db = f"sudo sqlite3 '{DOCKER_ROOT}/mealie/data/mealie.db' \".backup '{dest_db}'\""
+    cmd_db = f"sudo sqlite3 '{HOST_2_DOCKER_ROOT}/mealie/data/mealie.db' \".backup '{dest_db}'\""
     code, _, stderr = run_ssh(cmd_db, timeout=60)
     if code != 0:
         run_ssh(f"rm -f '{dest_db}'")
         return False, f"mealie sqlite backup failed: {stderr.strip()}"
 
     # 2. Recipes & config tarball
-    cmd_tar = f"sudo tar --warning=no-file-changed -czf '{dest_tar}' -C '{DOCKER_ROOT}/mealie/data' recipes .secret .session_secret"
+    cmd_tar = f"sudo tar --warning=no-file-changed -czf '{dest_tar}' -C '{HOST_2_DOCKER_ROOT}/mealie/data' recipes .secret .session_secret"
     code, _, stderr = run_ssh(cmd_tar, timeout=60)
     if code not in (0, 1) or _is_sudo_auth_error(stderr):
         run_ssh(f"rm -f '{dest_tar}'")
@@ -97,13 +99,13 @@ def backup_openmessage(ts: str) -> tuple[bool, str]:
     dest_db = f"/volumeUSB1/usbshare/backups/openmessage/messages_{ts}.db"
     dest_tar = f"/volumeUSB1/usbshare/backups/openmessage/session_{ts}.tar.gz"
 
-    cmd_db = f"sudo sqlite3 '{DOCKER_ROOT}/openmessage/data/messages.db' \".backup '{dest_db}'\""
+    cmd_db = f"sudo sqlite3 '{HOST_2_DOCKER_ROOT}/openmessage/data/messages.db' \".backup '{dest_db}'\""
     code, _, stderr = run_ssh(cmd_db, timeout=60)
     if code != 0:
         run_ssh(f"rm -f '{dest_db}'")
         return False, f"openmessage sqlite backup failed: {stderr.strip()}"
 
-    cmd_tar = f"sudo tar --warning=no-file-changed -czf '{dest_tar}' -C '{DOCKER_ROOT}/openmessage/data' session.json control.token"
+    cmd_tar = f"sudo tar --warning=no-file-changed -czf '{dest_tar}' -C '{HOST_2_DOCKER_ROOT}/openmessage/data' session.json control.token"
     code, _, stderr = run_ssh(cmd_tar, timeout=60)
     if code not in (0, 1) or _is_sudo_auth_error(stderr):
         run_ssh(f"rm -f '{dest_tar}'")
@@ -117,7 +119,7 @@ def backup_zero(ts: str) -> tuple[bool, str]:
     cmd = (
         f"sudo tar --warning=no-file-changed --exclude='backups' --exclude='*.log' --exclude='*.out' "
         f"--exclude='__pycache__' --exclude='scratch' --exclude='.git' "
-        f"-czf '{dest_tar}' -C '{DOCKER_ROOT}/discord-agy-agent' "
+        f"-czf '{dest_tar}' -C '{HOST_2_DOCKER_ROOT}/discord-agy-agent' "
         f"memory data agents.md config docker-compose.yml entrypoint.sh bridge.py"
     )
     code, _, stderr = run_ssh(cmd, timeout=120)

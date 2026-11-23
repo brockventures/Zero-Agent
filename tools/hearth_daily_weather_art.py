@@ -1122,7 +1122,8 @@ def deploy_to_host2(
     if not local_files:
         return False, "No local files provided for deployment"
 
-    remote_target_dir = remote_dir or f"{nas_config.DOCKER_ROOT}/{HEARTH_REMOTE_REL_PATH}"
+    host2_docker_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", nas_config.DOCKER_ROOT)
+    remote_target_dir = remote_dir or f"{host2_docker_root}/{HEARTH_REMOTE_REL_PATH}"
 
     # Build scp -O command line using nas_config parameters
     scp_cmd = [

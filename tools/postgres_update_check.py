@@ -37,10 +37,22 @@ for _p in [
 
 try:
     from tools import nas_config
-    from tools.nas_config import DOCKER_ROOT, HOST_1_IP, HOST_2_IP, run_ssh
+    from tools.nas_config import (
+        DOCKER_ROOT,
+        HOST_1_IP,
+        HOST_2_DOCKER_ROOT,
+        HOST_2_IP,
+        run_ssh,
+    )
 except ImportError:
     import nas_config  # type: ignore
-    from nas_config import DOCKER_ROOT, HOST_1_IP, HOST_2_IP, run_ssh  # type: ignore
+    from nas_config import (  # type: ignore
+        DOCKER_ROOT,
+        HOST_1_IP,
+        HOST_2_DOCKER_ROOT,
+        HOST_2_IP,
+        run_ssh,
+    )
 
 _ORIG_HOST_1_IP = HOST_1_IP
 _ORIG_HOST_2_IP = HOST_2_IP
@@ -72,14 +84,14 @@ POSTGRES_TARGETS: dict[str, dict[str, str]] = {
         "label": "Host 2 Baseball DB",
         "host_attr": "HOST_2_IP",
         "container": "baseball_db",
-        "compose_dir": os.path.join(DOCKER_ROOT, "baseball"),
+        "compose_dir": os.path.join(HOST_2_DOCKER_ROOT, "baseball"),
         "service": "db",
         "tag": "15",
         "pg_user": "myuser",
         "eol_date": "2027-11-11",
         "local_backup_dir": os.environ.get(
             "PG_HOST2_BACKUP_DIR",
-            os.path.join(DOCKER_ROOT, "baseball", "backups", "postgres"),
+            os.path.join(HOST_2_DOCKER_ROOT, "baseball", "backups", "postgres"),
         ),
         "usb_backup_dir": "/volumeUSB1/usbshare/backups/postgres",
         "backup_env_var": "PG_HOST2_BACKUP_DIR",

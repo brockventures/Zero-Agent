@@ -886,6 +886,32 @@ class TestDeploymentToHost2:
             assert mock_subproc.call_count == 1
             assert mock_ssh.call_count == 2
 
+    def test_deploy_to_host2_uses_host2_docker_root(self) -> None:
+        """Verify deploy_to_host2 targets nas_config.HOST_2_DOCKER_ROOT rather than DOCKER_ROOT."""
+        with TemporaryDirectory() as tmp_dir:
+            f = Path(tmp_dir) / "daily_morning.jpg"
+            f.write_text("data", encoding="utf-8")
+
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+
+            with (
+                patch.object(hdwa.nas_config, "DOCKER_ROOT", "/srv/test-h1-docker"),
+                patch.object(hdwa.nas_config, "HOST_2_DOCKER_ROOT", "/srv/test-h2-docker"),
+                patch("subprocess.run", return_value=mock_proc) as mock_subproc,
+                patch.object(hdwa.nas_config, "run_ssh", return_value=(0, "", "")) as mock_ssh,
+            ):
+                ok, _ = hdwa.deploy_to_host2([f])
+
+            assert ok is True
+            scp_dest = mock_subproc.call_args[0][0][-1]
+            assert f"/srv/test-h2-docker/{hdwa.HEARTH_REMOTE_REL_PATH}/" in scp_dest
+            assert "/srv/test-h1-docker/" not in scp_dest
+            pre_cmd = mock_ssh.call_args_list[0][0][1]
+            prune_cmd = mock_ssh.call_args_list[1][0][1]
+            assert f"/srv/test-h2-docker/{hdwa.HEARTH_REMOTE_REL_PATH}" in pre_cmd
+            assert f"/srv/test-h2-docker/{hdwa.HEARTH_REMOTE_REL_PATH}" in prune_cmd
+
 
 # ===========================================================================
 # 8. End-to-End Pipeline Execution Tests

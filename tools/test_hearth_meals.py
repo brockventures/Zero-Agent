@@ -268,6 +268,24 @@ class TestCLIRemoteOperations(unittest.TestCase):
     def tearDown(self):
         self.ssh_patcher.stop()
 
+    def test_remote_paths_use_host2_docker_root(self):
+        with (
+            patch.object(hearth_meals.nas_config, "DOCKER_ROOT", "/srv/test-h1-docker"),
+            patch.object(hearth_meals.nas_config, "HOST_2_DOCKER_ROOT", "/srv/test-h2-docker"),
+        ):
+            self.assertEqual(
+                hearth_meals.get_remote_ical_bridge_dir(),
+                "/srv/test-h2-docker/hearth/deploy/ical-bridge",
+            )
+            self.assertEqual(
+                hearth_meals.get_remote_overrides_path(),
+                "/srv/test-h2-docker/hearth/deploy/ical-bridge/meal_overrides.json",
+            )
+            self.assertEqual(
+                hearth_meals.get_remote_meal_art_dir(),
+                "/srv/test-h2-docker/hearth/deploy/ical-bridge/meal_art",
+            )
+
     def test_cli_set_leftover_days_list_and_remove(self):
         # 1. Seed Monday Nov 23 Delivery
         rc = hearth_meals.main(

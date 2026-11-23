@@ -24,7 +24,7 @@ if str(_TOOLS_DIR) not in sys.path:
 if str(_TOOLS_DIR.parent) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR.parent))
 
-import nas_config  # noqa: E402
+import nas_config
 
 DEFAULT_STATE_PATH = Path("/workspace/data/mirrormere_deploy_state.json")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
@@ -97,7 +97,8 @@ def save_deploy_state(state_path: Path, state: dict[str, Any]) -> None:
 
 def get_host2_current_sha() -> str | None:
     """Query the current deployed git HEAD SHA in the Host 2 hearth checkout."""
-    hearth_dir = f"{nas_config.DOCKER_ROOT}/hearth"
+    host2_docker_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", nas_config.DOCKER_ROOT)
+    hearth_dir = f"{host2_docker_root}/hearth"
     remote_cmd = (
         f"{REMOTE_GIT_PATH_EXPORT}; "
         f"cd {hearth_dir} && "
@@ -119,7 +120,8 @@ def deploy_hearth_on_host2(target_sha: str, dry_run: bool = False) -> dict[str, 
     if not SHA_RE.match(target_sha):
         raise ValueError(f"Invalid target_sha: {target_sha!r}")
 
-    hearth_dir = f"{nas_config.DOCKER_ROOT}/hearth"
+    host2_docker_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", nas_config.DOCKER_ROOT)
+    hearth_dir = f"{host2_docker_root}/hearth"
     deploy_dir = f"{hearth_dir}/deploy"
     compose_file = f"{deploy_dir}/compose.hearth.yaml"
     tarball_url = f"https://github.com/azylman/mirrormere/archive/{target_sha}.tar.gz"

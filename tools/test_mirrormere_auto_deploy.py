@@ -67,7 +67,7 @@ def test_sync_once_initial_seed_when_host2_matches_upstream(tmp_path: Path) -> N
 
     with (
         patch.object(mad.nas_config, "HOST_2_IP", TEST_HOST2_IP),
-        patch.object(mad.nas_config, "DOCKER_ROOT", TEST_DOCKER_ROOT),
+        patch.object(mad.nas_config, "HOST_2_DOCKER_ROOT", TEST_DOCKER_ROOT),
         patch.object(mad.subprocess, "run", return_value=ls_remote_proc),
         patch.object(mad.nas_config, "run_ssh", return_value=ssh_rev_parse) as mock_ssh,
     ):
@@ -75,6 +75,7 @@ def test_sync_once_initial_seed_when_host2_matches_upstream(tmp_path: Path) -> N
 
     assert result == {"status": "seeded", "sha": SHA_NEW}
     mock_ssh.assert_called_once()
+    assert f"cd {TEST_DOCKER_ROOT}/hearth" in mock_ssh.call_args[0][1]
     saved = mad.load_deploy_state(state_file)
     assert saved["last_deployed_sha"] == SHA_NEW
 
@@ -102,7 +103,7 @@ def test_sync_once_triggers_deploy_when_upstream_advances(tmp_path: Path) -> Non
 
     with (
         patch.object(mad.nas_config, "HOST_2_IP", TEST_HOST2_IP),
-        patch.object(mad.nas_config, "DOCKER_ROOT", TEST_DOCKER_ROOT),
+        patch.object(mad.nas_config, "HOST_2_DOCKER_ROOT", TEST_DOCKER_ROOT),
         patch.object(mad.subprocess, "run", return_value=ls_remote_proc),
         patch.object(mad.nas_config, "run_ssh", return_value=ssh_deploy_proc) as mock_ssh,
     ):
@@ -112,6 +113,7 @@ def test_sync_once_triggers_deploy_when_upstream_advances(tmp_path: Path) -> Non
     mock_ssh.assert_called_once()
     host_arg, cmd_arg = mock_ssh.call_args[0]
     assert host_arg == TEST_HOST2_IP
+    assert f"cd {TEST_DOCKER_ROOT}/hearth" in cmd_arg
     assert "/usr/local/git/bin:/volume1/@appstore/Git/bin" in cmd_arg
     assert "--exclude='deploy'" in cmd_arg
     assert f"https://github.com/azylman/mirrormere/archive/{SHA_NEW}.tar.gz" in cmd_arg
@@ -132,7 +134,7 @@ def test_sync_once_dry_run_does_not_execute_ssh_or_modify_state(tmp_path: Path) 
 
     with (
         patch.object(mad.nas_config, "HOST_2_IP", TEST_HOST2_IP),
-        patch.object(mad.nas_config, "DOCKER_ROOT", TEST_DOCKER_ROOT),
+        patch.object(mad.nas_config, "HOST_2_DOCKER_ROOT", TEST_DOCKER_ROOT),
         patch.object(mad.subprocess, "run", return_value=ls_remote_proc),
         patch.object(mad.nas_config, "run_ssh") as mock_ssh,
     ):
@@ -156,7 +158,7 @@ def test_sync_once_ssh_failure_does_not_advance_state(tmp_path: Path) -> None:
 
     with (
         patch.object(mad.nas_config, "HOST_2_IP", TEST_HOST2_IP),
-        patch.object(mad.nas_config, "DOCKER_ROOT", TEST_DOCKER_ROOT),
+        patch.object(mad.nas_config, "HOST_2_DOCKER_ROOT", TEST_DOCKER_ROOT),
         patch.object(mad.subprocess, "run", return_value=ls_remote_proc),
         patch.object(mad.nas_config, "run_ssh", return_value=ssh_fail_proc),
     ):
