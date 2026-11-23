@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: ASYNC230, BLE001, EXE001, I001, PLR1722, PLW0602, RUF013, RUF100, S110, SIM102
 """
 Zero Discord Bridge - Main Entrypoint & Bot Orchestrator
 Decomposed into isolated, testable modules:
@@ -104,7 +105,7 @@ from tools.bridge_handlers import (  # noqa: F401
     handle_message,
     handle_raw_reaction_event,
 )
-from tools.bridge_commands import ON_DEMAND_TRIGGERS  # noqa: F401
+from tools.bridge_commands import ON_DEMAND_TRIGGERS, _clear_reload_flags  # noqa: F401
 from tools.bridge_scheduler import (  # noqa: F401
     BridgeScheduler,
     dispatch_scheduled_prompt,
@@ -989,6 +990,9 @@ async def on_button_interaction(interaction: discord.Interaction):
             except Exception as exc:
                 res = {"ok": False, "error": str(exc)}
 
+            if action_prefix == "forge_approve" and res.get("ok") and res.get("handler_type") == "bridge_reload":
+                _clear_reload_flags()
+
             is_already_executing = (not res.get("ok")) and ("already executing" in str(res.get("error", "")))
             if not is_already_executing and interaction.message:
                 try:
@@ -1022,7 +1026,18 @@ async def on_button_interaction(interaction: discord.Interaction):
 
             if action_prefix == "forge_approve" and res.get("ok") and res.get("handler_type") == "bridge_reload":
                 try:
-                    await _execute_reload(interaction.channel, announce=True)
+                    _clear_reload_flags()
+                    initiator_name = str(
+                        getattr(interaction.user, "display_name", None)
+                        or getattr(interaction.user, "name", "user")
+                        or "user"
+                    )
+                    await _execute_reload(
+                        interaction.channel,
+                        initiator=initiator_name,
+                        reason=f"Approved Decision Card {decision_id}",
+                        announce=True,
+                    )
                 except Exception as re_err:
                     print(f"[Bridge] Error executing reload from Decision Card {decision_id}: {re_err}")
 

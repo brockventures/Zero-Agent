@@ -1,3 +1,4 @@
+# ruff: noqa: ASYNC221, ASYNC230, BLE001, I001, PLW0602, S110, SIM102, UP035, UP041, UP045
 """
 bridge_commands.py — Operator Commands, UI Interactivity & Lifecycle Interventions.
 
@@ -44,6 +45,34 @@ from tools.bridge_state import (
 )
 
 PROCESSED_INTERACTIONS: set[int] = set()
+_reload_in_progress: bool = False
+
+
+def _clear_reload_flags() -> None:
+    """Unlink pending reload_bridge.flag across configured and canonical data directories."""
+    import tools.bridge_state as _bs
+
+    bridge_mod = sys.modules.get("tools.bridge")
+    candidate_dirs = (
+        DATA_DIR,
+        getattr(_bs, "DATA_DIR", None),
+        getattr(bridge_mod, "DATA_DIR", None) if bridge_mod else None,
+        Path("/workspace/data"),
+    )
+    seen: set[Path] = set()
+    for base_dir in candidate_dirs:
+        if not base_dir:
+            continue
+        flag_path = Path(base_dir) / "reload_bridge.flag"
+        if flag_path in seen:
+            continue
+        seen.add(flag_path)
+        try:
+            if flag_path.exists():
+                flag_path.unlink()
+        except OSError:
+            pass
+
 
 MODEL_ALIASES: dict[str, str] = {
     "neon": "gemini-4-neon-high",
@@ -212,134 +241,130 @@ async def execute_bridge_reload(
     announce: bool = True,
 ):
     """Execute clean in-place bridge reload without deadlock."""
-    record_restart_intent(reason, initiator=initiator)
-    if channel and announce:
-        try:
-            await channel.send("🔄 Reloading Zero bridge in-place...")
-        except Exception:
-            pass
-
-    # 0. Pre-Reload Git Synchronization: Auto-sync architecture changes to origin/main
+    global _reload_in_progress
+    if _reload_in_progress:
+        print(f"[Bridge] Reload already in progress; skipping duplicate trigger (reason={reason})")
+        return
+    _reload_in_progress = True
+    _clear_reload_flags()
     try:
-        from tools.bridge_git_sync import sync_git_on_reload
-        sync_res = await asyncio.to_thread(sync_git_on_reload, reason=reason, initiator=initiator)
-        if sync_res.get("synced"):
-            print(f"[Bridge] 🚀 Pre-reload git sync: {sync_res.get('message')}")
-        elif sync_res.get("clean"):
-            print(f"[Bridge] 🟢 Pre-reload git sync: {sync_res.get('message')}")
-        elif sync_res.get("error"):
-            print(f"[Bridge] ⚠️ Pre-reload git sync notice: {sync_res.get('message')}")
-            if channel:
-                try:
-                    await channel.send(f"⚠️ **Git Sync Notice:** {sync_res.get('message')}")
-                except Exception:
-                    pass
-    except Exception as gse:
-        print(f"[Bridge] Warning during pre-reload git sync: {gse}")
-
-    # Terminate persistent daemons, warm classifier, and active child process groups cleanly
-    try:
-        from tools.bridge_daemons import daemon_manager
-        await daemon_manager.shutdown_all()
-    except Exception as dse:
-        print(f"[Bridge] Warning shutting down persistent daemons: {dse}")
-
-    try:
-        from tools.classifier import warm_classifier
-        await asyncio.to_thread(warm_classifier.shutdown)
-    except Exception as wce:
-        print(f"[Bridge] Warning shutting down warm classifier: {wce}")
-
-    active_procs = []
-    seen_proc_ids = set()
-    for proc in list(channel_active_procs.values()) + [br.active_proc, br.ext_active_proc]:
-        if proc is not None and getattr(proc, "returncode", None) is None:
-            if id(proc) not in seen_proc_ids:
-                seen_proc_ids.add(id(proc))
-                active_procs.append(proc)
-
-    for proc in active_procs:
-        try:
-            kill_process_tree(proc, signal.SIGTERM)
-        except Exception:
-            pass
-
-    async def _wait_proc_bounded(proc, timeout: float = 2.0):
-        wait_fn = getattr(proc, "wait", None)
-        if not callable(wait_fn):
-            return
-        try:
-            if asyncio.iscoroutinefunction(wait_fn):
-                await asyncio.wait_for(wait_fn(), timeout=timeout)
-            elif isinstance(proc, subprocess.Popen):
-                await asyncio.to_thread(wait_fn, timeout=timeout)
-            else:
-                res = wait_fn()
-                if asyncio.iscoroutine(res) or hasattr(res, "__await__"):
-                    await asyncio.wait_for(res, timeout=timeout)
-        except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+        record_restart_intent(reason, initiator=initiator)
+        if channel and announce:
             try:
-                kill_process_tree(proc, signal.SIGKILL)
+                await channel.send("🔄 Reloading Zero bridge in-place...")
             except Exception:
                 pass
+
+        # 0. Pre-Reload Git Synchronization: Auto-sync architecture changes to origin/main
+        try:
+            from tools.bridge_git_sync import sync_git_on_reload
+            sync_res = await asyncio.to_thread(sync_git_on_reload, reason=reason, initiator=initiator)
+            if sync_res.get("synced"):
+                print(f"[Bridge] 🚀 Pre-reload git sync: {sync_res.get('message')}")
+            elif sync_res.get("clean"):
+                print(f"[Bridge] 🟢 Pre-reload git sync: {sync_res.get('message')}")
+            elif sync_res.get("error"):
+                print(f"[Bridge] ⚠️ Pre-reload git sync notice: {sync_res.get('message')}")
+                if channel:
+                    try:
+                        await channel.send(f"⚠️ **Git Sync Notice:** {sync_res.get('message')}")
+                    except Exception:
+                        pass
+        except Exception as gse:
+            print(f"[Bridge] Warning during pre-reload git sync: {gse}")
+
+        # Terminate persistent daemons, warm classifier, and active child process groups cleanly
+        try:
+            from tools.bridge_daemons import daemon_manager
+            await daemon_manager.shutdown_all()
+        except Exception as dse:
+            print(f"[Bridge] Warning shutting down persistent daemons: {dse}")
+
+        try:
+            from tools.classifier import warm_classifier
+            await asyncio.to_thread(warm_classifier.shutdown)
+        except Exception as wce:
+            print(f"[Bridge] Warning shutting down warm classifier: {wce}")
+
+        active_procs = []
+        seen_proc_ids = set()
+        for proc in list(channel_active_procs.values()) + [br.active_proc, br.ext_active_proc]:
+            if proc is not None and getattr(proc, "returncode", None) is None:
+                if id(proc) not in seen_proc_ids:
+                    seen_proc_ids.add(id(proc))
+                    active_procs.append(proc)
+
+        for proc in active_procs:
+            try:
+                kill_process_tree(proc, signal.SIGTERM)
+            except Exception:
+                pass
+
+        async def _wait_proc_bounded(proc, timeout: float = 2.0):
+            wait_fn = getattr(proc, "wait", None)
+            if not callable(wait_fn):
+                return
             try:
                 if asyncio.iscoroutinefunction(wait_fn):
-                    await asyncio.wait_for(wait_fn(), timeout=0.5)
+                    await asyncio.wait_for(wait_fn(), timeout=timeout)
                 elif isinstance(proc, subprocess.Popen):
-                    await asyncio.to_thread(wait_fn, timeout=0.5)
+                    await asyncio.to_thread(wait_fn, timeout=timeout)
+                else:
+                    res = wait_fn()
+                    if asyncio.iscoroutine(res) or hasattr(res, "__await__"):
+                        await asyncio.wait_for(res, timeout=timeout)
+            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+                try:
+                    kill_process_tree(proc, signal.SIGKILL)
+                except Exception:
+                    pass
+                try:
+                    if asyncio.iscoroutinefunction(wait_fn):
+                        await asyncio.wait_for(wait_fn(), timeout=0.5)
+                    elif isinstance(proc, subprocess.Popen):
+                        await asyncio.to_thread(wait_fn, timeout=0.5)
+                except Exception:
+                    pass
             except Exception:
                 pass
-        except Exception:
-            pass
 
-    if active_procs:
-        await asyncio.gather(*(_wait_proc_bounded(p) for p in active_procs), return_exceptions=True)
+        if active_procs:
+            await asyncio.gather(*(_wait_proc_bounded(p) for p in active_procs), return_exceptions=True)
 
-    # Clean in-flight tracking
-    if IN_FLIGHT_FILE.exists():
-        try:
-            IN_FLIGHT_FILE.unlink()
-        except Exception:
-            pass
-
-    # Clean pending reload flag so immediate reloads do not re-trigger post-turn
-    reload_flag = DATA_DIR / "reload_bridge.flag"
-    if reload_flag.exists():
-        try:
-            reload_flag.unlink()
-        except Exception:
-            pass
-    import tools.bridge_state as _bs
-    if getattr(_bs, "DATA_DIR", None) and _bs.DATA_DIR != DATA_DIR:
-        alt_reload_flag = _bs.DATA_DIR / "reload_bridge.flag"
-        if alt_reload_flag.exists():
+        # Clean in-flight tracking
+        if IN_FLIGHT_FILE.exists():
             try:
-                alt_reload_flag.unlink()
+                IN_FLIGHT_FILE.unlink()
             except Exception:
                 pass
 
-    if bot:
+        # Clean pending reload flag so immediate reloads do not re-trigger post-turn
+        _clear_reload_flags()
+
+        if bot:
+            try:
+                await bot.close()
+            except Exception:
+                pass
+
+        # Ensure /app python modules stay synchronized with /workspace/tools before execv
         try:
-            await bot.close()
-        except Exception:
-            pass
+            ws_tools_dir = Path("/workspace/tools")
+            app_dir = Path("/app")
+            if ws_tools_dir.exists() and app_dir.exists():
+                for py_file in ws_tools_dir.glob("*.py"):
+                    target = app_dir / py_file.name
+                    if target.exists():
+                        ws_bytes = py_file.read_bytes()
+                        if target.read_bytes() != ws_bytes:
+                            target.write_bytes(ws_bytes)
+                            print(f"[Bridge] Synchronized {py_file} -> {target} before reload")
+        except Exception as se:
+            print(f"[Bridge] Notice checking /app sync: {se}")
 
-    # Ensure /app python modules stay synchronized with /workspace/tools before execv
-    try:
-        ws_tools_dir = Path("/workspace/tools")
-        app_dir = Path("/app")
-        if ws_tools_dir.exists() and app_dir.exists():
-            for py_file in ws_tools_dir.glob("*.py"):
-                target = app_dir / py_file.name
-                if target.exists():
-                    ws_bytes = py_file.read_bytes()
-                    if target.read_bytes() != ws_bytes:
-                        target.write_bytes(ws_bytes)
-                        print(f"[Bridge] Synchronized {py_file} -> {target} before reload")
-    except Exception as se:
-        print(f"[Bridge] Notice checking /app sync: {se}")
-
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    finally:
+        _reload_in_progress = False
 
 
 async def execute_container_restart(

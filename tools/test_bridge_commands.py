@@ -1,3 +1,4 @@
+# ruff: noqa: I001, SIM117, UP041
 """
 Unit tests for tools/bridge_commands.py and native Discord slash commands in tools/bridge.py.
 Exercises UI choice views, operator commands, model switching, sidecar triggers, and lifecycle hooks.
@@ -534,6 +535,165 @@ class TestBridgeCommands(unittest.IsolatedAsyncioTestCase):
             br.channel_active_procs.pop(12345, None)
             br.active_proc = orig_active_proc
             br.ext_active_proc = orig_ext_proc
+
+    async def test_execute_bridge_reload_single_flight_and_early_flag_clear(self):
+        """Verify concurrent execute_bridge_reload calls execute once, unlink reload_bridge.flag before sync_git_on_reload, and reset _reload_in_progress."""
+        import shutil
+        import tempfile
+        import tools.bridge_commands as bc
+        import tools.bridge_state as bs
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        flag_file = tmp_dir / "reload_bridge.flag"
+        in_flight_file = tmp_dir / "in_flight_turn.json"
+        flag_file.write_text("pending", encoding="utf-8")
+
+        flag_exists_during_send = []
+        flag_exists_during_git_sync = []
+        in_progress_during_git_sync = []
+
+        async def slow_send(_msg):
+            flag_exists_during_send.append(flag_file.exists())
+            await asyncio.sleep(0.05)
+
+        def check_flag_in_git_sync(**_kwargs):
+            flag_exists_during_git_sync.append(flag_file.exists())
+            in_progress_during_git_sync.append(bc._reload_in_progress)
+            return {"clean": True, "message": "Clean"}
+
+        mock_bot = MagicMock()
+        mock_bot.close = AsyncMock()
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(side_effect=slow_send)
+
+        try:
+            bc._reload_in_progress = False
+            with patch.object(bc, "DATA_DIR", tmp_dir), \
+                 patch.object(bs, "DATA_DIR", tmp_dir), \
+                 patch.object(bc, "IN_FLIGHT_FILE", in_flight_file), \
+                 patch("tools.bridge_commands.record_restart_intent") as mock_record, \
+                 patch("tools.bridge_git_sync.sync_git_on_reload", side_effect=check_flag_in_git_sync) as mock_git_sync, \
+                 patch("tools.bridge_daemons.daemon_manager.shutdown_all", new_callable=AsyncMock) as mock_daemons_shutdown, \
+                 patch("tools.classifier.warm_classifier.shutdown") as mock_warm_shutdown, \
+                 patch("os.execv") as mock_execv:
+                await asyncio.gather(
+                    bc.execute_bridge_reload(
+                        bot=mock_bot,
+                        channel=mock_channel,
+                        initiator="Ryan",
+                        reason="Approved Decision Card dec-1",
+                    ),
+                    bc.execute_bridge_reload(
+                        bot=mock_bot,
+                        channel=mock_channel,
+                        initiator="scheduler",
+                        reason="Scheduled flag reload",
+                    ),
+                )
+
+            self.assertEqual(mock_channel.send.await_count, 1)
+            self.assertEqual(mock_git_sync.call_count, 1)
+            self.assertEqual(mock_record.call_count, 1)
+            self.assertEqual(mock_daemons_shutdown.await_count, 1)
+            self.assertEqual(mock_warm_shutdown.call_count, 1)
+            self.assertEqual(mock_execv.call_count, 1)
+            self.assertEqual(flag_exists_during_send, [False])
+            self.assertEqual(flag_exists_during_git_sync, [False])
+            self.assertEqual(in_progress_during_git_sync, [True])
+            self.assertFalse(flag_file.exists())
+            self.assertFalse(bc._reload_in_progress)
+        finally:
+            bc._reload_in_progress = False
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    async def test_execute_bridge_reload_resets_guard_on_execv_exception(self):
+        """Verify _reload_in_progress resets to False in finally block even if os.execv raises."""
+        import shutil
+        import tempfile
+        import tools.bridge_commands as bc
+        import tools.bridge_state as bs
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        in_flight_file = tmp_dir / "in_flight_turn.json"
+        mock_bot = MagicMock()
+        mock_bot.close = AsyncMock()
+
+        try:
+            bc._reload_in_progress = False
+            with patch.object(bc, "DATA_DIR", tmp_dir), \
+                 patch.object(bs, "DATA_DIR", tmp_dir), \
+                 patch.object(bc, "IN_FLIGHT_FILE", in_flight_file), \
+                 patch("tools.bridge_commands.record_restart_intent"), \
+                 patch("tools.bridge_git_sync.sync_git_on_reload", return_value={"clean": True, "message": "Clean"}), \
+                 patch("tools.bridge_daemons.daemon_manager.shutdown_all", new_callable=AsyncMock), \
+                 patch("tools.classifier.warm_classifier.shutdown"), \
+                 patch("os.execv", side_effect=OSError("execv mocked failure")):
+                with self.assertRaises(OSError):
+                    await bc.execute_bridge_reload(bot=mock_bot, announce=False)
+
+            self.assertFalse(bc._reload_in_progress)
+        finally:
+            bc._reload_in_progress = False
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    async def test_on_button_interaction_bridge_reload_clears_flag_and_passes_initiator_reason(self):
+        """Verify approving a bridge_reload Decision Card clears reload_bridge.flag before message edit and passes initiator/reason to _execute_reload."""
+        import shutil
+        import tempfile
+        import discord
+        import tools.bridge as bridge_mod
+        import tools.bridge_commands as bc
+        import tools.bridge_state as bs
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        flag_file = tmp_dir / "reload_bridge.flag"
+        flag_exists_during_edit = []
+
+        def fake_execute_decision(decision_id, user_id):
+            flag_file.write_text("1", encoding="utf-8")
+            return {
+                "ok": True,
+                "handler_type": "bridge_reload",
+                "formatted_card": "Approved card",
+            }
+
+        async def fake_message_edit(**_kwargs):
+            flag_exists_during_edit.append(flag_file.exists())
+
+        interaction = MagicMock()
+        interaction.type = discord.InteractionType.component
+        interaction.data = {"custom_id": "forge_approve:dec-reload-42"}
+        interaction.user.id = OWNER_USER_ID
+        interaction.user.display_name = None
+        interaction.user.name = "Ryan"
+        interaction.channel = MagicMock()
+        interaction.response.is_done = MagicMock(return_value=True)
+        interaction.message = MagicMock()
+        interaction.message.edit = AsyncMock(side_effect=fake_message_edit)
+
+        fake_view = MagicMock()
+        fake_view.children = []
+
+        try:
+            with patch.object(bc, "DATA_DIR", tmp_dir), \
+                 patch.object(bs, "DATA_DIR", tmp_dir), \
+                 patch.object(bridge_mod, "DATA_DIR", tmp_dir), \
+                 patch("discord.ui.View.from_message", return_value=fake_view), \
+                 patch("tools.forge.execute_decision", side_effect=fake_execute_decision), \
+                 patch("tools.bridge._execute_reload", new_callable=AsyncMock) as mock_exec_reload:
+                await bridge_mod.on_button_interaction(interaction)
+
+            self.assertTrue(len(flag_exists_during_edit) >= 1)
+            self.assertTrue(all( exists is False for exists in flag_exists_during_edit ))
+            self.assertFalse(flag_file.exists())
+            mock_exec_reload.assert_awaited_once_with(
+                interaction.channel,
+                initiator="Ryan",
+                reason="Approved Decision Card dec-reload-42",
+                announce=True,
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
