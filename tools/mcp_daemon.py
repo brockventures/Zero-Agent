@@ -32,9 +32,11 @@ if str(WORKSPACE_DIR) not in sys.path:
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-PID_FILE = DATA_DIR / "mcp_daemon.pid"
-LOCK_FILE = DATA_DIR / "mcp_daemon.lock"
-LOG_FILE = DATA_DIR / "mcp_daemon.log"
+RUNTIME_DIR = Path(os.environ.get("MCP_RUNTIME_DIR", "/tmp"))
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+PID_FILE = RUNTIME_DIR / "mcp_daemon.pid"
+LOCK_FILE = RUNTIME_DIR / "mcp_daemon.lock"
+LOG_FILE = RUNTIME_DIR / "mcp_daemon.log"
 CONFIG_FILE = Path("/root/.gemini/config/mcp_config.json")
 
 try:
