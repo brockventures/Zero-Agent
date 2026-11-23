@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: BLE001, EXE001, UP006, UP035, UP045
 """Daily Token Budget Watchdog Sidecar.
 
 Monitors combined fleet token consumption (Zero + Ivy) against the 458.4M daily allocation (4x average benchmark).
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sqlite3
 import sys
 import time
@@ -27,6 +29,11 @@ if str(WORKSPACE) not in sys.path:
 _WORKSPACE = Path(__file__).resolve().parent.parent
 if str(_WORKSPACE) not in sys.path or sys.path[0] != str(_WORKSPACE):
     sys.path.insert(0, str(_WORKSPACE))
+
+try:
+    from tools import nas_config
+except ImportError:
+    import nas_config  # type: ignore
 
 from tools.ivy_telemetry import _run_host2_python
 from tools.outbox import flush_pending_messages, queue_outbox_message
@@ -152,13 +159,14 @@ def query_zero_tokens(
 
 def query_ivy_tokens(start_ts: float, end_ts: float) -> Tuple[int, int]:
     """Query Ivy's token burn from Host 2 for the time window."""
+    host2_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join(os.sep, "volume2", "docker"))
     script = f"""
 import os, glob, json, time
 from datetime import datetime
 
 start_ts = {start_ts}
 end_ts = {end_ts}
-brain_dir = os.path.join(os.sep, 'volume1', 'docker', 'discord-ivy-agent', 'gemini', 'antigravity-cli', 'brain')
+brain_dir = os.path.join({host2_root!r}, 'discord-ivy-agent', 'gemini', 'antigravity-cli', 'brain')
 
 total_turns = 0
 total_bytes = 0

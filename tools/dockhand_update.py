@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: BLE001, EXE001
 import json
 import os
 import subprocess
@@ -11,9 +12,14 @@ for _p in ["/workspace", "/workspace/tools"]:
         sys.path.append(_p)
 
 try:
+    from tools import nas_config
     from tools.nas_config import resolve_nas_config
 except ImportError:
+    import nas_config  # type: ignore
     from nas_config import resolve_nas_config
+
+DOCKER_ROOT = getattr(nas_config, "DOCKER_ROOT", os.path.join("/volume1", "docker"))
+HOST_2_DOCKER_ROOT = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join("/volume2", "docker"))
 
 HOST_1_IP, HOST_2_IP, SSH_PORT, SSH_USER, SSH_KEY = resolve_nas_config()
 
@@ -146,9 +152,9 @@ def perform_upgrade():
     # WAL-safe backup
     print("   • Backing up SQLite DB (WAL-safe)...")
     backup_dir = os.environ.get("DOCKER_BACKUP_DIR", os.path.join("/volume1", "data", "backups"))
-    appdata_dir = os.environ.get("DOCKER_APPDATA_DIR", os.path.join("/volume1", "docker", "appdata"))
-    support_dir = os.environ.get("DOCKER_SUPPORT_DIR", os.path.join("/volume1", "docker", "support", "dockhand"))
-    support_compose_dir = os.environ.get("DOCKER_SUPPORT_COMPOSE_DIR", os.path.join("/volume1", "docker", "support"))
+    appdata_dir = os.environ.get("DOCKER_APPDATA_DIR", os.path.join(DOCKER_ROOT, "appdata"))
+    support_dir = os.environ.get("DOCKER_SUPPORT_DIR", os.path.join(HOST_2_DOCKER_ROOT, "support", "dockhand"))
+    support_compose_dir = os.environ.get("DOCKER_SUPPORT_COMPOSE_DIR", os.path.join(HOST_2_DOCKER_ROOT, "support"))
 
     bak_82 = f"{backup_dir}/dockhand/dockhand.db.bak-{ts}"
     get_remote_out(

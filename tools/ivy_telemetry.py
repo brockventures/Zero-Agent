@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: BLE001, EXE001, PLW0602, S110, UP006, UP035, UP045
 """Ivy Live Context & Telemetry Dashboard Engine.
 
 Gathers telemetry, session trajectories, and token metrics for Ivy (Sabermetric AI Assistant GM)
@@ -10,12 +11,18 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from tools.nas_config import run_ssh, HOST_2_IP
+try:
+    from tools import nas_config
+    from tools.nas_config import HOST_2_IP, run_ssh
+except ImportError:
+    import nas_config  # type: ignore
+    from nas_config import HOST_2_IP, run_ssh
 
 logger = logging.getLogger("ivy_telemetry")
 PT_TZ = ZoneInfo("America/Los_Angeles")
@@ -53,11 +60,12 @@ def _run_host2_python(script_str: str) -> Optional[Dict[str, Any]]:
 
 def get_ivy_sessions_list() -> List[Dict[str, Any]]:
     """Return all available Ivy sessions, sorted by recency."""
-    script = """
+    host2_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join(os.sep, "volume2", "docker"))
+    script = f"""
 import os, json, time
 
-brain = os.path.join(os.sep, 'volume1', 'docker', 'discord-ivy-agent', 'gemini', 'antigravity-cli', 'brain')
-data_dir = os.path.join(os.sep, 'volume1', 'docker', 'discord-ivy-agent', 'workspace', 'data')
+brain = os.path.join({host2_root!r}, 'discord-ivy-agent', 'gemini', 'antigravity-cli', 'brain')
+data_dir = os.path.join({host2_root!r}, 'discord-ivy-agent', 'workspace', 'data')
 
 active_id = None
 active_file = os.path.join(data_dir, 'session.json')
@@ -78,7 +86,7 @@ if os.path.exists(brain):
             size = os.path.getsize(tpath) if os.path.exists(tpath) else 0
             
             t_struct = time.localtime(mtime)
-            sessions.append({
+            sessions.append({{
                 'conv_id': d,
                 'channel_name': 'baseball',
                 'parent_channel_name': None,
@@ -89,7 +97,7 @@ if os.path.exists(brain):
                 'grand_total': max(12000, size // 3),
                 'turn_count': 23 if (d == active_id) else max(1, size // 150000),
                 'pct_weekly': round((max(12000, size // 3) / 1025801595) * 100, 2),
-            })
+            }})
 
 sessions.sort(key=lambda s: s['last_active'], reverse=True)
 print(json.dumps(sessions))
@@ -112,12 +120,13 @@ def get_ivy_telemetry(compacted_id: Optional[str] = None) -> Dict[str, Any]:
         return _TELEMETRY_CACHE["payload"]
 
     escaped_compacted_id = repr(compacted_id)
+    host2_root = getattr(nas_config, "HOST_2_DOCKER_ROOT", os.path.join(os.sep, "volume2", "docker"))
 
     script = f"""
 import os, json, time, glob, calendar
 
-brain = os.path.join(os.sep, 'volume1', 'docker', 'discord-ivy-agent', 'gemini', 'antigravity-cli', 'brain')
-data_dir = os.path.join(os.sep, 'volume1', 'docker', 'discord-ivy-agent', 'workspace', 'data')
+brain = os.path.join({host2_root!r}, 'discord-ivy-agent', 'gemini', 'antigravity-cli', 'brain')
+data_dir = os.path.join({host2_root!r}, 'discord-ivy-agent', 'workspace', 'data')
 
 # 1. Active Session ID & Turn Count
 active_id = None

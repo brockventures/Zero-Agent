@@ -428,7 +428,7 @@ def test_ensure_adb_updates_usb_and_rc_script():
 
     with (
         patch.object(dsm_update_monitor.nas_config, "HOST_2_IP", MOCK_HOST_2_IP),
-        patch.object(dsm_update_monitor.nas_config, "DOCKER_ROOT", "/mock_docker"),
+        patch.object(dsm_update_monitor.nas_config, "HOST_2_DOCKER_ROOT", "/mock_docker"),
         patch.object(dsm_update_monitor.nas_config, "run_ssh", side_effect=fake_run_ssh),
     ):
         res = dsm_update_monitor.ensure_host2_adb()
@@ -437,6 +437,7 @@ def test_ensure_adb_updates_usb_and_rc_script():
         assert res["forward_active"] is True
         assert len(ssh_calls) == 1
         assert ssh_calls[0][0] == MOCK_HOST_2_IP
+        assert "/mock_docker/discord-agy-agent" in ssh_calls[0][1]
         assert "chmod -R a+rwX /dev/bus/usb" in ssh_calls[0][1]
         assert "adb_host.log" in ssh_calls[0][1]
         assert "/usr/local/etc/rc.d/pixel_adb.sh" in ssh_calls[0][1]

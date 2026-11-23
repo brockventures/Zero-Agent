@@ -24,14 +24,15 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-for _p in [
-    str(Path(__file__).resolve().parent.parent),
-    str(Path(__file__).resolve().parent),
-    "/workspace",
-    "/workspace/tools",
-]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+_TOOLS_DIR = str(Path(__file__).resolve().parent)
+for _p in (_TOOLS_DIR, _REPO_ROOT):
+    if _p in sys.path:
+        sys.path.remove(_p)
+    sys.path.insert(0, _p)
+for _fallback in ("/workspace", "/workspace/tools"):
+    if _fallback not in sys.path:
+        sys.path.append(_fallback)
 
 try:
     from tools import nas_config
@@ -375,7 +376,9 @@ def apply_dsm_update(host_num: int) -> dict[str, Any]:
 
 def build_pixel_adb_rc_script(docker_root: Optional[str] = None) -> str:
     """Build the canonical /usr/local/etc/rc.d/pixel_adb.sh script content for Host 2."""
-    root_dir = docker_root or getattr(nas_config, "DOCKER_ROOT", "/docker")
+    root_dir = docker_root or getattr(
+        nas_config, "HOST_2_DOCKER_ROOT", getattr(nas_config, "DOCKER_ROOT", "/docker")
+    )
     adb_home = f"{root_dir}/discord-agy-agent/workspace/data/adb"
     adb_key = f"{adb_home}/adbkey"
     adb_bin = f"{root_dir}/discord-agy-agent/workspace/tools/bin/adb"
@@ -405,7 +408,9 @@ def ensure_host2_adb(host_ip: Optional[str] = None) -> dict[str, Any]:
     start persistent Host 2 ADB server on :5037, and set tcp:9223 forward for 36261FDJG0003L.
     """
     target_ip = host_ip or getattr(nas_config, "HOST_2_IP", "127.0.0.1")
-    docker_root = getattr(nas_config, "DOCKER_ROOT", "/docker")
+    docker_root = getattr(
+        nas_config, "HOST_2_DOCKER_ROOT", getattr(nas_config, "DOCKER_ROOT", "/docker")
+    )
     adb_home = f"{docker_root}/discord-agy-agent/workspace/data/adb"
     adb_key = f"{adb_home}/adbkey"
     adb_bin = f"{docker_root}/discord-agy-agent/workspace/tools/bin/adb"
