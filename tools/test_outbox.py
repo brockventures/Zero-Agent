@@ -578,5 +578,50 @@ class TestOutboxCanonicalSafetyGate(unittest.TestCase):
         mock_urlopen.assert_not_called()
 
 
+class TestOutboxHomeTurfClassification(unittest.TestCase):
+    def test_brief_channel_in_default_home_channels_and_resolves(self):
+        from tools.bridge_state import BRIEF_CHANNEL_ID, DEFAULT_HOME_CHANNELS
+
+        self.assertEqual(BRIEF_CHANNEL_ID, 1574655816236269569)
+        self.assertIn(BRIEF_CHANNEL_ID, DEFAULT_HOME_CHANNELS)
+        self.assertIn(1542081375287640084, DEFAULT_HOME_CHANNELS)
+        self.assertEqual(outbox.resolve_channel("brief"), ("brief", 1574655816236269569))
+
+        with patch("tools.bridge_state.get_runtime_rules", return_value={}):
+            self.assertTrue(outbox._is_home_turf_channel(BRIEF_CHANNEL_ID))
+            self.assertTrue(outbox._is_home_turf_channel(str(BRIEF_CHANNEL_ID)))
+
+    def test_vulcan_mode_preserves_is_home_channel_scoping_and_outbox_home_turf(self):
+        import tools.bridge_state as bridge_state
+
+        with patch("tools.bridge_state.is_vulcan_agent", return_value=True), \
+             patch("tools.bridge_state.get_runtime_rules", return_value={}):
+            # Ambient listener scoping for Vulcan remains strictly restricted to #forge
+            self.assertFalse(bridge_state.is_home_channel(1544953279664889888))
+            self.assertTrue(bridge_state.is_home_channel(1562899941595160657))
+
+            # Outbox Home Turf recognizes all Brock Guild home channels under Vulcan
+            for home_cid in (
+                1544953279664889888,  # #zero-ops
+                1542081375287640084,  # #zero-chat
+                1574655816236269569,  # #brief
+                1548196929308065893,  # #baseball
+                1562899941595160657,  # #forge
+            ):
+                self.assertTrue(outbox._is_home_turf_channel(home_cid), f"Expected {home_cid} to be Home Turf")
+
+    def test_external_public_and_invalid_channels_fail_closed(self):
+        for non_home_cid in (
+            1534452820995080192,  # Crab Cavern #lounge
+            1534436119888793750,  # Crab Cavern #the-banana-stand
+            1330447543477338202,  # Brock public #server-updates
+            None,
+            "",
+            "not-a-channel-id",
+            True,
+        ):
+            self.assertFalse(outbox._is_home_turf_channel(non_home_cid), f"Expected {non_home_cid!r} to be False")
+
+
 if __name__ == "__main__":
     unittest.main()

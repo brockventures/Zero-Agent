@@ -58,6 +58,7 @@ KNOWN_CHANNELS = {
     "gotchi-chat": 1562246590943461429,
     "gotchi-log": 1562246590943461429,
     "r-residentagents": 1562544598423965856,
+    "brief": 1574655816236269569,
 }
 
 def resolve_channel(channel_input: str | int) -> tuple[str, int | None]:
@@ -223,19 +224,34 @@ def _scrub_outbound_text(text: str) -> str:
 
 def _is_home_turf_channel(channel_id) -> bool:
     """Return True strictly if channel_id belongs to Brock Guild Home Turf (fail-closed)."""
+    if channel_id is None or isinstance(channel_id, bool):
+        return False
     try:
         from tools.bridge_state import (
+            CRAB_CAVERN_CHANNEL_IDS,
             DEFAULT_EXCLUDED_HOME_CHANNELS,
+            DEFAULT_HOME_CHANNELS,
             FORGE_CHANNEL_ID,
+            get_runtime_rules,
             is_home_channel,
         )
+        cid = int(channel_id)
+        if cid in CRAB_CAVERN_CHANNEL_IDS:
+            return False
         if is_home_channel(channel_id):
             return True
-        cid = int(channel_id)
+        rules = get_runtime_rules() or {}
+        home_turf_ids = set(DEFAULT_HOME_CHANNELS) | set(DEFAULT_EXCLUDED_HOME_CHANNELS) | {FORGE_CHANNEL_ID}
+        for key in ("home_channel_ids", "excluded_home_channel_ids"):
+            for raw_id in (rules.get(key) or ()):
+                try:
+                    home_turf_ids.add(int(raw_id))
+                except (ValueError, TypeError):
+                    continue
         # Dedicated/delegated Brock Guild home channels (e.g. #baseball owned by Ivy,
         # #forge owned by Vulcan) are excluded from Zero's ambient listener, not external
         # Crab Cavern channels — preserve home safety mode and [CHOICES: ...] buttons.
-        return cid in DEFAULT_EXCLUDED_HOME_CHANNELS or cid == FORGE_CHANNEL_ID
+        return cid in home_turf_ids
     except Exception:
         return False
 

@@ -79,11 +79,13 @@ BROCK_HOUSE_CHANNEL_ID = 1550577908811178095  # #brock-house
 VAULT_CHANNEL_ID = 1550577910757458015        # #vault (isolated memory tier)
 FORGE_CHANNEL_ID = 1562899941595160657        # #forge (build queue & background task telemetry)
 GOTCHI_CHAT_CHANNEL_ID = 1562246590943461429  # #gotchi-chat (Ryan's private Gotchi transcript channel)
+BRIEF_CHANNEL_ID = 1574655816236269569        # #brief (personal assistant triage & approvals)
 DEFAULT_EXCLUDED_HOME_CHANNELS = {
     1548196929308065893,  # #baseball (dedicated to Ivy)
 }
 DEFAULT_HOME_CHANNELS = {
     TARGET_CHANNEL_ID,
+    1542081375287640084,  # #zero-chat (explicitly included for non-Zero containers like Vulcan/Ivy)
     1544953275877556334,  # #home-assistant
     1544953277592899615,  # #steam-deck
     1544953279664889888,  # #zero-ops / #harness-management
@@ -96,6 +98,7 @@ DEFAULT_HOME_CHANNELS = {
     VAULT_CHANNEL_ID,        # #vault
     FORGE_CHANNEL_ID,        # #forge
     GOTCHI_CHAT_CHANNEL_ID,  # #gotchi-chat
+    BRIEF_CHANNEL_ID,        # #brief
 }
 
 
